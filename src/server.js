@@ -12,15 +12,18 @@ export function createProxyServer(accountManager, config, hooks = {}) {
 
   const server = http.createServer(async (req, res) => {
     try {
-      // Auth check
+      // Auth check: accept proxy API key OR any known account credential
       const clientKey = req.headers['x-api-key'];
       if (proxyApiKey && clientKey !== proxyApiKey) {
-        res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-          type: 'error',
-          error: { type: 'authentication_error', message: 'Invalid proxy API key' },
-        }));
-        return;
+        const knownCred = accountManager.accounts.some(a => a.credential === clientKey);
+        if (!knownCred) {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            type: 'error',
+            error: { type: 'authentication_error', message: 'Invalid proxy API key' },
+          }));
+          return;
+        }
       }
 
       // Status endpoint
@@ -99,8 +102,12 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   // Build upstream request headers
   const headers = {};
   for (const [key, value] of Object.entries(req.headers)) {
-    if (HOP_BY_HOP_HEADERS.has(key.toLowerCase())) continue;
-    if (key.toLowerCase() === 'x-api-key') continue;
+    const lk = key.toLowerCase();
+    if (HOP_BY_HOP_HEADERS.has(lk)) continue;
+    if (lk === 'x-api-key') continue;
+    // Strip accept-encoding: Node fetch auto-decompresses, which would
+    // mismatch the Content-Encoding header we forward to the client
+    if (lk === 'accept-encoding') continue;
     headers[key] = value;
   }
   headers['x-api-key'] = account.credential;
@@ -135,10 +142,12 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 
     ctx.status = upstreamRes.status;
 
-    // Build response headers (skip hop-by-hop)
+    // Build response headers (skip hop-by-hop and encoding headers)
     const responseHeaders = {};
     for (const [key, value] of upstreamRes.headers.entries()) {
       if (key === 'transfer-encoding' || key === 'connection') continue;
+      // Strip content-encoding/content-length since fetch may auto-decompress
+      if (key === 'content-encoding' || key === 'content-length') continue;
       responseHeaders[key] = value;
     }
 

@@ -261,12 +261,14 @@ async function runCommand() {
   const claudeArgs = args.slice(1);
   if (claudeArgs[0] === '--') claudeArgs.shift();
 
+  // Only set ANTHROPIC_BASE_URL — Claude Code will use its own OAuth token
+  // which the proxy accepts as a known credential. Setting ANTHROPIC_API_KEY
+  // would cause an "auth conflict" warning in Claude Code.
   const child = spawn('claude', claudeArgs, {
     stdio: 'inherit',
     env: {
       ...process.env,
       ANTHROPIC_BASE_URL: `http://localhost:${config.proxy.port}`,
-      ANTHROPIC_API_KEY: config.proxy.apiKey,
     },
   });
 
