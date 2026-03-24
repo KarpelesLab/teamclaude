@@ -39,9 +39,6 @@ switch (command) {
   case 'api':
     await apiCommand();
     break;
-  case 'check':
-    await checkCommand();
-    break;
   case 'help':
   case '--help':
   case '-h':
@@ -392,74 +389,6 @@ async function accountsCommand() {
   }
 }
 
-// ── check ───────────────────────────────────────────────────
-
-async function checkCommand() {
-  const config = await loadOrCreateConfig();
-  const accounts = await resolveAccounts(config);
-
-  if (accounts.length === 0) {
-    console.error('No accounts configured');
-    process.exit(1);
-  }
-
-  const upstream = config.upstream || 'https://api.anthropic.com';
-
-  for (const acct of accounts) {
-    const credential = acct.accessToken || acct.apiKey;
-    const isOAuth = acct.type === 'oauth';
-    process.stdout.write(`  ${acct.name} ... `);
-
-    try {
-      const authHeader = isOAuth
-        ? { 'Authorization': `Bearer ${credential}` }
-        : { 'x-api-key': credential };
-      const res = await fetch(`${upstream}/v1/messages`, {
-        method: 'POST',
-        headers: {
-          ...authHeader,
-          'content-type': 'application/json',
-          'anthropic-version': '2023-06-01',
-          'anthropic-beta': 'interleaved-thinking-2025-05-14',
-        },
-        body: JSON.stringify({
-          model: 'claude-haiku-4-5-20251001',
-          max_tokens: 1,
-          messages: [{ role: 'user', content: 'x' }],
-        }),
-      });
-
-      if (res.status === 401 || res.status === 403) {
-        console.log('auth error (token expired?)');
-        continue;
-      }
-
-      const u5h = res.headers.get('anthropic-ratelimit-unified-5h-utilization');
-      const u7d = res.headers.get('anthropic-ratelimit-unified-7d-utilization');
-      const status = res.headers.get('anthropic-ratelimit-unified-status');
-
-      if (u5h != null || u7d != null) {
-        const ses = u5h != null ? (parseFloat(u5h) * 100).toFixed(1) + '%' : '-';
-        const wk = u7d != null ? (parseFloat(u7d) * 100).toFixed(1) + '%' : '-';
-        const flag = status === 'allowed_warning' ? ' (warning)' : status === 'rejected' ? ' (REJECTED)' : '';
-        console.log(`session ${ses}  weekly ${wk}${flag}`);
-      } else {
-        // Standard API rate limits
-        const tokLim = res.headers.get('anthropic-ratelimit-tokens-limit');
-        const tokRem = res.headers.get('anthropic-ratelimit-tokens-remaining');
-        if (tokLim && tokRem) {
-          const pct = ((1 - parseInt(tokRem) / parseInt(tokLim)) * 100).toFixed(1);
-          console.log(`tokens ${pct}% used`);
-        } else {
-          console.log(`ok (${res.status}, no quota headers)`);
-        }
-      }
-    } catch (err) {
-      console.log(`error: ${err.message}`);
-    }
-  }
-}
-
 // ── api ─────────────────────────────────────────────────────
 
 async function apiCommand() {
@@ -559,7 +488,6 @@ Commands:
   status              Show proxy & account status (live)
   accounts            List configured accounts
   remove <name>       Remove an account
-  check               Check quota usage for all accounts
   api <path>          Call an API endpoint with account credentials
   help                Show this help
 
