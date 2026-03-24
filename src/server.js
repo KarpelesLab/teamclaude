@@ -185,6 +185,16 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       logSections.push(`=== RESPONSE ${upstreamRes.status} ===\n${formatHeaders(upstreamRes.headers)}`);
     }
 
+    // Handle 401 — token may have expired, refresh and retry once
+    if (upstreamRes.status === 401 && account.type === 'oauth' && retryCount === 0) {
+      await upstreamRes.arrayBuffer();
+      console.log(`[TeamClaude] Got 401 for "${account.name}", refreshing token...`);
+      await accountManager.ensureTokenFresh(account.index, true);
+      if (account.status !== 'error') {
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+      }
+    }
+
     // Handle 429 — retry with next account
     if (upstreamRes.status === 429 && retryCount < maxRetries) {
       const retryAfter = parseInt(upstreamRes.headers.get('retry-after') || '60', 10);

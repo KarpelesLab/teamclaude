@@ -84,6 +84,17 @@ async function serverCommand() {
 
   const threshold = config.switchThreshold || 0.98;
   const accountManager = new AccountManager(accounts, threshold);
+
+  // Persist refreshed tokens back to config
+  accountManager.onTokenRefresh((idx, newTokens) => {
+    const cfgAcct = config.accounts[idx];
+    if (cfgAcct) {
+      cfgAcct.accessToken = newTokens.accessToken;
+      cfgAcct.refreshToken = newTokens.refreshToken;
+      cfgAcct.expiresAt = newTokens.expiresAt;
+      saveConfig(config).catch(err => console.error(`[TeamClaude] Failed to save refreshed token: ${err.message}`));
+    }
+  });
   const port = config.proxy.port;
   const useTUI = process.stdout.isTTY && process.stdin.isTTY;
 
