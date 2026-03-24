@@ -332,6 +332,7 @@ async function statusCommand() {
 
 async function accountsCommand() {
   const config = await loadOrCreateConfig();
+  const verbose = args.includes('-v') || args.includes('--verbose');
 
   if (config.accounts.length === 0) {
     console.log('No accounts configured.');
@@ -387,6 +388,17 @@ async function accountsCommand() {
     console.log(`  [${i + 1}] ${a.name} (${status}${src})`);
     if (p?.email && p.email !== a.name) console.log(`       Email: ${p.email}`);
     if (p?.orgName) console.log(`       Org:   ${p.orgName}`);
+    if (verbose && a.expiresAt) {
+      const remaining = a.expiresAt - Date.now();
+      if (remaining <= 0) {
+        console.log(`       Token: expired`);
+      } else {
+        const mins = Math.floor(remaining / 60000);
+        const hrs = Math.floor(mins / 60);
+        const expiry = hrs > 0 ? `${hrs}h ${mins % 60}m` : `${mins}m`;
+        console.log(`       Token: expires in ${expiry}`);
+      }
+    }
   }
 }
 
