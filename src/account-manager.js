@@ -71,6 +71,29 @@ export class AccountManager {
 
   _isNearQuota(account) {
     const q = account.quota;
+    const now = Date.now();
+
+    // Clear expired unified quotas
+    if (q.unified5h != null && q.unified5hReset && now >= q.unified5hReset) {
+      console.log(`[TeamClaude] Account "${account.name}" session quota reset`);
+      q.unified5h = null;
+      q.unified5hReset = null;
+    }
+    if (q.unified7d != null && q.unified7dReset && now >= q.unified7dReset) {
+      console.log(`[TeamClaude] Account "${account.name}" weekly quota reset`);
+      q.unified7d = null;
+      q.unified7dReset = null;
+      q.unifiedStatus = null;
+    }
+
+    // Clear expired standard quotas
+    if (q.resetsAt && now >= new Date(q.resetsAt).getTime()) {
+      q.tokensRemaining = null;
+      q.tokensLimit = null;
+      q.requestsRemaining = null;
+      q.requestsLimit = null;
+      q.resetsAt = null;
+    }
 
     // Unified quotas (Claude Max) — utilization is already 0-1
     if (q.unified5h != null && q.unified5h >= this.switchThreshold) return true;
