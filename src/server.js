@@ -101,6 +101,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   const account = accountManager.getActiveAccount();
   if (!account) {
     ctx.status = 429;
+    ctx.account = '(none available)';
     const status = accountManager.getStatus();
     const retryAfter = computeRetryAfter(status.accounts);
     res.writeHead(429, {
