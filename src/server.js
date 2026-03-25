@@ -118,13 +118,16 @@ async function handleTokenRefresh(req, res, accountManager, hooks) {
 
     const responseBody = await upstreamRes.text();
 
-    // Capture tokens from successful refresh
+    // Capture tokens from successful refresh — update the current account directly
     if (upstreamRes.ok) {
       try {
         const tokens = JSON.parse(responseBody);
         if (tokens.access_token) {
-          accountManager.captureClientToken(tokens.access_token, tokens.refresh_token,
-            tokens.expires_at || (Date.now() + (tokens.expires_in || 3600) * 1000));
+          accountManager.updateAccountTokens(accountManager.currentIndex, {
+            accessToken: tokens.access_token,
+            refreshToken: tokens.refresh_token,
+            expiresAt: tokens.expires_at || (Date.now() + (tokens.expires_in || 3600) * 1000),
+          });
         }
       } catch {}
     }
@@ -224,12 +227,6 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     headers['authorization'] = `Bearer ${account.credential}`;
   } else {
     headers['x-api-key'] = account.credential;
-  }
-
-  // Capture fresh Bearer tokens from the client to keep stored credentials up to date
-  const clientBearer = req.headers['authorization']?.match(/^Bearer (.+)/i)?.[1];
-  if (clientBearer) {
-    accountManager.captureClientToken(clientBearer);
   }
 
   const upstreamUrl = `${upstream}${req.url}`;
@@ -332,7 +329,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       writeRequestLog(logDir, reqId, logSections);
     }
 
-    if (retryCount < maxRetries) {
+    if (retryCount < maxRetries && !res.headersSent) {
       account.status = 'error';
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
     }
