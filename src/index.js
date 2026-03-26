@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { spawn } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath } from './config.js';
 import { AccountManager } from './account-manager.js';
@@ -299,7 +299,8 @@ async function runCommand() {
   // Only set ANTHROPIC_BASE_URL — Claude Code keeps its own OAuth token
   // which the proxy accepts from localhost. Not setting ANTHROPIC_API_KEY
   // lets Claude Code stay in subscription mode (full model access).
-  const child = spawn('claude', claudeArgs, {
+  // Use spawnSync so the Node process blocks entirely — behaves like execvp.
+  const result = spawnSync('claude', claudeArgs, {
     stdio: 'inherit',
     env: {
       ...process.env,
@@ -307,16 +308,16 @@ async function runCommand() {
     },
   });
 
-  child.on('error', (err) => {
-    if (err.code === 'ENOENT') {
+  if (result.error) {
+    if (result.error.code === 'ENOENT') {
       console.error('Claude Code not found in PATH. Install it first.');
     } else {
-      console.error(`Failed to start claude: ${err.message}`);
+      console.error(`Failed to start claude: ${result.error.message}`);
     }
     process.exit(1);
-  });
+  }
 
-  child.on('exit', (code) => process.exit(code ?? 1));
+  process.exit(result.status ?? 1);
 }
 
 // ── status ──────────────────────────────────────────────────
@@ -551,6 +552,9 @@ async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
   // Fetch profile to auto-name and deduplicate by account UUID
   const profile = await fetchProfile(creds.accessToken);
 
+  if (!profile) {
+    console.error('Warning: could not fetch account profile — credentials may be expired');
+  }
   if (!name && profile?.email) {
     name = profile.email;
     const tier = profile.hasClaudeMax ? 'Max' : profile.hasClaudePro ? 'Pro' : null;

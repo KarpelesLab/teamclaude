@@ -1,4 +1,4 @@
-import { importCredentials } from './oauth.js';
+import { importCredentials, fetchProfile } from './oauth.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -292,19 +292,58 @@ export class TUI {
 
   async _doImport() {
     try {
+      this._addLog('Importing credentials...');
       const creds = await importCredentials('~/.claude/.credentials.json');
-      const n = this.config.accounts.filter(a => a.name.startsWith('max-')).length + 1;
-      const name = `max-${n}`;
+      const profile = await fetchProfile(creds.accessToken);
+
+      if (!profile) {
+        this._addLog('Warning: could not fetch profile — credentials may be expired');
+      }
+
+      let name;
+      if (profile?.email) {
+        name = profile.email;
+        const tier = profile.hasClaudeMax ? 'Max' : profile.hasClaudePro ? 'Pro' : null;
+        if (tier) this._addLog(`Detected Claude ${tier}: ${name}`);
+      } else {
+        const n = this.config.accounts.filter(a => a.name.startsWith('account-')).length + 1;
+        name = `account-${n}`;
+      }
+
       const entry = {
-        name, type: 'oauth',
+        name, type: 'oauth', source: 'import',
+        accountUuid: profile?.accountUuid || null,
         accessToken: creds.accessToken,
         refreshToken: creds.refreshToken,
         expiresAt: creds.expiresAt,
       };
-      this.config.accounts.push(entry);
-      this.am.addAccount(entry);
+
+      // Deduplicate: match by UUID first, then by name
+      let idx = profile?.accountUuid
+        ? this.config.accounts.findIndex(a => a.accountUuid === profile.accountUuid)
+        : -1;
+      if (idx < 0) idx = this.config.accounts.findIndex(a => a.name === name);
+
+      if (idx >= 0) {
+        this.config.accounts[idx] = entry;
+        // Update the running account manager entry
+        const amAcct = this.am.accounts[idx];
+        if (amAcct) {
+          amAcct.credential = creds.accessToken;
+          amAcct.refreshToken = creds.refreshToken;
+          amAcct.expiresAt = creds.expiresAt;
+          amAcct.accountUuid = entry.accountUuid;
+          amAcct.name = name;
+          if (amAcct.status === 'error') amAcct.status = 'active';
+        }
+        this._addLog(`Updated account "${name}"`);
+      } else {
+        this.config.accounts.push(entry);
+        this.am.addAccount(entry);
+        this._addLog(`Imported account "${name}"`);
+      }
+
       await this.saveConfig(this.config);
-      this._addLog(`Imported account "${name}"`);
     } catch (e) {
       this._addLog(`Import failed: ${e.message}`);
     }
