@@ -289,6 +289,8 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       }
       console.log(`[TeamClaude] 429 on "${account.name}" — waiting ${retryAfter}s before retry`);
       await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
+      // Client may have disconnected during the wait
+      if (res.destroyed) return;
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir);
     }
 
@@ -378,6 +380,9 @@ async function streamResponse(webStream, res, accountIndex, accountManager, stre
       const { done, value } = await reader.read();
       if (done) break;
 
+      // Client disconnected — stop reading from upstream
+      if (res.destroyed) break;
+
       // Forward chunk immediately
       const ok = res.write(value);
 
@@ -395,9 +400,14 @@ async function streamResponse(webStream, res, accountIndex, accountManager, stre
         parseSSEUsage(event, accountIndex, accountManager);
       }
 
-      // Handle backpressure
+      // Handle backpressure — also bail out if client disconnects,
+      // because 'drain' will never fire on a destroyed socket
       if (!ok) {
-        await new Promise(resolve => res.once('drain', resolve));
+        await new Promise(resolve => {
+          res.once('drain', resolve);
+          res.once('close', resolve);
+        });
+        if (res.destroyed) break;
       }
     }
 
@@ -406,7 +416,9 @@ async function streamResponse(webStream, res, accountIndex, accountManager, stre
       parseSSEUsage(sseBuffer, accountIndex, accountManager);
     }
   } finally {
-    res.end();
+    // Cancel upstream reader to stop consuming data nobody needs
+    reader.cancel().catch(() => {});
+    if (!res.writableEnded) res.end();
   }
 }
 
