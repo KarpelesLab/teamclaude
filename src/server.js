@@ -352,9 +352,20 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       writeRequestLog(logDir, reqId, logSections);
     }
 
+    const isTransient = err instanceof Error &&
+      (err.message.includes('fetch failed') ||
+        err.code === 'ECONNRESET' || err.code === 'ECONNREFUSED' ||
+        err.code === 'ETIMEDOUT' || err.code === 'UND_ERR_CONNECT_TIMEOUT');
+
     if (retryCount < maxRetries && !res.headersSent) {
       account.status = 'error';
+      if (isTransient) account.errorUntil = Date.now() + 30_000;
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+    }
+    // For transient errors with no retries left, still allow auto-recovery
+    if (isTransient) {
+      account.status = 'error';
+      account.errorUntil = Date.now() + 30_000;
     }
     ctx.status = 502;
 
