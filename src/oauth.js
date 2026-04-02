@@ -106,14 +106,24 @@ export function isTokenExpiringSoon(expiresAt, thresholdMs = 5 * 60 * 1000) {
 
 /**
  * Fetch account profile for an OAuth token.
- * Returns { email, name, orgName, orgType } or null on failure.
+ * Returns { email, name, orgName, orgType, ... } on success,
+ * or { error: 'reason' } on failure.
  */
 export async function fetchProfile(accessToken) {
   try {
     const res = await fetch(PROFILE_URL, {
       headers: { 'Authorization': `Bearer ${accessToken}` },
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      let detail = '';
+      try {
+        const body = await res.json();
+        detail = body?.error?.message || JSON.stringify(body).slice(0, 200);
+      } catch {
+        detail = await res.text().catch(() => '');
+      }
+      return { error: `HTTP ${res.status}${detail ? ': ' + detail : ''}` };
+    }
     const data = await res.json();
     return {
       accountUuid: data.account?.uuid,
@@ -124,8 +134,8 @@ export async function fetchProfile(accessToken) {
       hasClaudeMax: data.account?.has_claude_max,
       hasClaudePro: data.account?.has_claude_pro,
     };
-  } catch {
-    return null;
+  } catch (err) {
+    return { error: err.message || String(err) };
   }
 }
 

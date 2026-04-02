@@ -295,9 +295,10 @@ export class TUI {
       this._addLog('Importing credentials...');
       const creds = await importCredentials('~/.claude/.credentials.json');
       const profile = await fetchProfile(creds.accessToken);
+      const profileOk = profile && !profile.error;
 
-      if (!profile) {
-        this._addLog('Warning: could not fetch profile — credentials may be expired');
+      if (!profileOk) {
+        this._addLog(`Warning: could not fetch profile — ${profile?.error || 'no token'}`);
       }
 
       let name;

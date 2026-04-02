@@ -5,7 +5,7 @@ import { createInterface } from 'node:readline';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath } from './config.js';
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
-import { importCredentials, loginOAuth, fetchProfile } from './oauth.js';
+import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import { TUI } from './tui.js';
 
 const args = process.argv.slice(2);
@@ -94,6 +94,12 @@ async function serverCommand() {
   accountManager.onTokenRefresh((idx, newTokens) => {
     const account = accountManager.accounts[idx];
     if (!account) return;
+    // Keep config.accounts in sync so TUI saveConfig doesn't clobber fresh tokens
+    if (config.accounts[idx]) {
+      config.accounts[idx].accessToken = newTokens.accessToken;
+      config.accounts[idx].refreshToken = newTokens.refreshToken;
+      config.accounts[idx].expiresAt = newTokens.expiresAt;
+    }
     atomicConfigUpdate(diskConfig => {
       // Pick up any new accounts from disk so index matching stays correct
       // (only add, don't refresh credentials — we're about to write the authoritative tokens)
@@ -125,12 +131,20 @@ async function serverCommand() {
       accountManager, config,
       saveConfig: () => atomicConfigUpdate(async diskConfig => {
         // Write in-memory accounts as the authoritative state, preserving
-        // extra disk-only fields (e.g. importFrom) where the account still exists
-        diskConfig.accounts = config.accounts.map(a => {
+        // extra disk-only fields (e.g. importFrom) where the account still exists.
+        // Use live tokens from AccountManager (not the stale config.accounts copy).
+        diskConfig.accounts = config.accounts.map((a, i) => {
+          const am = accountManager.accounts[i];
+          const live = am ? {
+            ...a,
+            accessToken: am.credential,
+            refreshToken: am.refreshToken,
+            expiresAt: am.expiresAt,
+          } : a;
           const diskAcct = diskConfig.accounts.find(
             d => (a.accountUuid && d.accountUuid === a.accountUuid) || d.name === a.name
           );
-          return diskAcct ? { ...diskAcct, ...a } : a;
+          return diskAcct ? { ...diskAcct, ...live } : live;
         });
       }),
       syncAccounts: async () => {
@@ -380,6 +394,23 @@ async function accountsCommand() {
     return;
   }
 
+  // Refresh expired tokens before fetching profiles
+  let configDirty = false;
+  await Promise.all(config.accounts.map(async (a) => {
+    if (a.type !== 'oauth' || !a.refreshToken) return;
+    if (!isTokenExpiringSoon(a.expiresAt)) return;
+    try {
+      const newTokens = await refreshAccessToken(a.refreshToken);
+      a.accessToken = newTokens.accessToken;
+      a.refreshToken = newTokens.refreshToken;
+      a.expiresAt = newTokens.expiresAt;
+      configDirty = true;
+    } catch (err) {
+      // refresh failed — fetchProfile will report the specific error
+    }
+  }));
+  if (configDirty) await saveConfig(config);
+
   // Fetch profiles in parallel for all OAuth accounts
   const profiles = await Promise.all(
     config.accounts.map(a =>
@@ -401,7 +432,7 @@ async function accountsCommand() {
       } else {
         seen.set(uuid, i);
         // Update stored UUID and name from profile
-        if (profiles[i]) {
+        if (profiles[i] && !profiles[i].error) {
           a.accountUuid = profiles[i].accountUuid;
           if (profiles[i].email) a.name = profiles[i].email;
         }
@@ -422,12 +453,13 @@ async function accountsCommand() {
     }
 
     // OAuth account
-    const tier = p?.hasClaudeMax ? 'Max' : p?.hasClaudePro ? 'Pro' : 'subscription';
-    const status = p ? `Claude ${tier}` : 'unknown (profile fetch failed)';
+    const hasProfile = p && !p.error;
+    const tier = hasProfile ? (p.hasClaudeMax ? 'Max' : p.hasClaudePro ? 'Pro' : 'subscription') : null;
+    const status = hasProfile ? `Claude ${tier}` : `unknown (${p?.error || 'no token'})`;
     const src = a.source ? `, ${a.source}` : '';
     console.log(`  [${i + 1}] ${a.name} (${status}${src})`);
-    if (p?.email && p.email !== a.name) console.log(`       Email: ${p.email}`);
-    if (p?.orgName) console.log(`       Org:   ${p.orgName}`);
+    if (hasProfile && p.email && p.email !== a.name) console.log(`       Email: ${p.email}`);
+    if (hasProfile && p.orgName) console.log(`       Org:   ${p.orgName}`);
     if (verbose && a.expiresAt) {
       const remaining = a.expiresAt - Date.now();
       if (remaining <= 0) {
@@ -558,9 +590,10 @@ Config: ${getConfigPath()}
 async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
   // Fetch profile to auto-name and deduplicate by account UUID
   const profile = await fetchProfile(creds.accessToken);
+  const profileOk = profile && !profile.error;
 
-  if (!profile) {
-    console.error('Warning: could not fetch account profile — credentials may be expired');
+  if (!profileOk) {
+    console.error(`Warning: could not fetch account profile — ${profile?.error || 'no token'}`);
   }
   if (!name && profile?.email) {
     name = profile.email;

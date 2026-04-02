@@ -1,7 +1,7 @@
 import http from 'node:http';
 import { writeFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
-import { normalizeExpiresAt } from './oauth.js';
+
 
 const HOP_BY_HOP_HEADERS = new Set([
   'host', 'connection', 'keep-alive', 'transfer-encoding',
@@ -40,9 +40,11 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         return;
       }
 
-      // Intercept token refresh requests — forward to real endpoint and capture new tokens
+      // Let client token refresh requests pass through to upstream untouched.
+      // The proxy manages its own tokens via ensureTokenFresh(); intercepting
+      // or rewriting client refreshes would cause token rotation conflicts.
       if (req.method === 'POST' && req.url === '/v1/oauth/token') {
-        await handleTokenRefresh(req, res, accountManager, hooks);
+        await relayRaw(req, res, upstream);
         return;
       }
 
@@ -84,61 +86,26 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   return server;
 }
 
-const TOKEN_ENDPOINT = 'https://platform.claude.com/v1/oauth/token';
-
 /**
- * Forward a token refresh request to the real token endpoint, capture new tokens,
- * and pass the response back to the client.
+ * Relay a request to upstream with no header rewriting — pure passthrough.
  */
-async function handleTokenRefresh(req, res, accountManager, hooks) {
+async function relayRaw(req, res, upstream) {
   const bodyChunks = [];
-  for await (const chunk of req) {
-    bodyChunks.push(chunk);
-  }
-  const rawBody = Buffer.concat(bodyChunks);
-
-  // Replace the refresh token in the request with the current account's refresh token
-  // so the renewal happens for the active account, not just the one the client knows about
-  let body = rawBody;
-  try {
-    const parsed = JSON.parse(rawBody.toString());
-    const currentAccount = accountManager.accounts[accountManager.currentIndex];
-    if (parsed.grant_type === 'refresh_token' && currentAccount?.type === 'oauth' && currentAccount.refreshToken) {
-      parsed.refresh_token = currentAccount.refreshToken;
-      body = JSON.stringify(parsed);
-      console.log(`[TeamClaude] Token refresh: substituted refresh token for account "${currentAccount.name}"`);
-    }
-  } catch {}
+  for await (const chunk of req) bodyChunks.push(chunk);
+  const body = Buffer.concat(bodyChunks);
 
   try {
-    // Forward to the real token endpoint
-    const upstreamRes = await fetch(TOKEN_ENDPOINT, {
-      method: 'POST',
+    const upstreamRes = await fetch(`${upstream}${req.url}`, {
+      method: req.method,
       headers: {
-        'Content-Type': req.headers['content-type'] || 'application/json',
-        'Accept': 'application/json, text/plain, */*',
-        'User-Agent': req.headers['user-agent'] || 'axios/1.13.6',
+        'content-type': req.headers['content-type'] || 'application/json',
+        'accept': req.headers['accept'] || 'application/json',
+        'user-agent': req.headers['user-agent'] || 'node',
       },
-      body,
+      body: body.length > 0 ? body : undefined,
     });
 
     const responseBody = await upstreamRes.text();
-
-    // Capture tokens from successful refresh — update the current account directly
-    if (upstreamRes.ok) {
-      try {
-        const tokens = JSON.parse(responseBody);
-        if (tokens.access_token) {
-          accountManager.updateAccountTokens(accountManager.currentIndex, {
-            accessToken: tokens.access_token,
-            refreshToken: tokens.refresh_token,
-            expiresAt: normalizeExpiresAt(tokens.expires_at) || (Date.now() + (tokens.expires_in || 3600) * 1000),
-          });
-        }
-      } catch {}
-    }
-
-    // Forward response to client
     const responseHeaders = {};
     for (const [key, value] of upstreamRes.headers.entries()) {
       if (key === 'transfer-encoding' || key === 'connection') continue;
@@ -147,16 +114,14 @@ async function handleTokenRefresh(req, res, accountManager, hooks) {
     res.writeHead(upstreamRes.status, responseHeaders);
     res.end(responseBody);
   } catch (err) {
-    console.error('[TeamClaude] Token refresh proxy error:', err.message);
+    console.error('[TeamClaude] Raw relay error:', err.message);
     if (!res.headersSent) {
       res.writeHead(502, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        type: 'error',
-        error: { type: 'proxy_error', message: `Token refresh failed: ${err.message}` },
-      }));
+      res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Upstream unreachable' } }));
     }
   }
 }
+
 
 function logTimestamp() {
   const d = new Date();
