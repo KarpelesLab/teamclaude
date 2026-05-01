@@ -194,6 +194,24 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     headers[key] = value;
   }
 
+  // Defend against an upstream Claude Code regression: claude-code 2.1.121+
+  // intermittently drops `oauth-2025-04-20` from `anthropic-beta` when
+  // model-level betas are merged in. The Anthropic API then returns 401 with
+  // the misleading `"OAuth authentication is currently not supported"` body.
+  // teamclaude faithfully forwards what claude-code sent, so the failure
+  // surfaces here. Refs: anthropics/claude-code#54235, OpenClaw #41444.
+  // Idempotent (no-op if header already present); gated on isOAuth so
+  // x-api-key flows are untouched.
+  if (isOAuth) {
+    const REQUIRED_OAUTH_BETA = 'oauth-2025-04-20';
+    const betaKey = Object.keys(headers).find(k => k.toLowerCase() === 'anthropic-beta');
+    const existing = betaKey ? String(headers[betaKey]).split(',').map(s => s.trim()).filter(Boolean) : [];
+    if (!existing.includes(REQUIRED_OAUTH_BETA)) {
+      existing.unshift(REQUIRED_OAUTH_BETA);
+      headers[betaKey || 'anthropic-beta'] = existing.join(',');
+    }
+  }
+
   if (isOAuth) {
     headers['authorization'] = `Bearer ${account.credential}`;
   } else {
