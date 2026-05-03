@@ -120,6 +120,25 @@ async function serverCommand() {
       }
     }).catch(err => console.error(`[TeamClaude] Failed to save refreshed token: ${err.message}`));
   });
+
+  async function persistQuotaState() {
+    await atomicConfigUpdate(diskConfig => {
+      for (const account of accountManager.accounts) {
+        const cfgIdx = findConfigAccount(diskConfig, account);
+        if (cfgIdx >= 0) {
+          diskConfig.accounts[cfgIdx].savedQuota = accountManager.exportQuota(account.index);
+        }
+      }
+    });
+  }
+
+  const quotaSaveInterval = setInterval(
+    () => persistQuotaState().catch(err =>
+      console.error(`[TeamClaude] Failed to save quota state: ${err.message}`)
+    ),
+    60_000
+  );
+
   const port = config.proxy.port;
   const useTUI = process.stdout.isTTY && process.stdin.isTTY;
 
@@ -152,7 +171,13 @@ async function serverCommand() {
         if (!diskConfig) return 0;
         return syncAccountsFromDisk(diskConfig, config, accountManager);
       },
-      onQuit: () => { server.close(() => process.exit(0)); },
+      onQuit: async () => {
+        clearInterval(quotaSaveInterval);
+        await persistQuotaState().catch(err =>
+          console.error(`[TeamClaude] Failed to save quota on quit: ${err.message}`)
+        );
+        server.close(() => process.exit(0));
+      },
     });
     hooks = {
       onRequestStart: (id, info) => tui.onRequestStart(id, info),
@@ -190,12 +215,20 @@ async function serverCommand() {
   });
 
   if (!tui) {
-    process.on('SIGINT', () => {
+    process.on('SIGINT', async () => {
       console.log('\n[TeamClaude] Shutting down...');
+      clearInterval(quotaSaveInterval);
+      await persistQuotaState().catch(err =>
+        console.error(`[TeamClaude] Failed to save quota on shutdown: ${err.message}`)
+      );
       server.close(() => process.exit(0));
     });
-    process.on('SIGTERM', () => {
+    process.on('SIGTERM', async () => {
       console.log('\n[TeamClaude] Shutting down...');
+      clearInterval(quotaSaveInterval);
+      await persistQuotaState().catch(err =>
+        console.error(`[TeamClaude] Failed to save quota on shutdown: ${err.message}`)
+      );
       server.close(() => process.exit(0));
     });
   }

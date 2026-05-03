@@ -28,7 +28,7 @@ export class AccountManager {
       refreshToken: acct.refreshToken || null,
       expiresAt: acct.expiresAt || null,
       status: 'active',
-      quota: emptyQuota(),
+      quota: acct.savedQuota ? { ...emptyQuota(), ...acct.savedQuota } : emptyQuota(),
       usage: {
         totalInputTokens: 0,
         totalOutputTokens: 0,
@@ -204,6 +204,27 @@ export class AccountManager {
           : '?';
       console.log(`[TeamClaude] Account "${account.name}" at ${pct}% usage — will switch on next request`);
     }
+  }
+
+  /**
+   * Export serializable quota state for a single account — safe to persist to config.
+   */
+  exportQuota(accountIndex) {
+    const account = this.accounts[accountIndex];
+    if (!account) return null;
+    const q = account.quota;
+    return {
+      unified5h:         q.unified5h,
+      unified7d:         q.unified7d,
+      unified5hReset:    q.unified5hReset,
+      unified7dReset:    q.unified7dReset,
+      unifiedStatus:     q.unifiedStatus,
+      tokensLimit:       q.tokensLimit,
+      tokensRemaining:   q.tokensRemaining,
+      requestsLimit:     q.requestsLimit,
+      requestsRemaining: q.requestsRemaining,
+      resetsAt:          q.resetsAt,
+    };
   }
 
   /**
