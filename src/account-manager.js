@@ -348,6 +348,24 @@ export class AccountManager {
   }
 
   /**
+   * Move an account from one index to another, updating currentIndex accordingly.
+   */
+  moveAccount(from, to) {
+    if (from === to || from < 0 || to < 0 ||
+        from >= this.accounts.length || to >= this.accounts.length) return;
+    const [account] = this.accounts.splice(from, 1);
+    this.accounts.splice(to, 0, account);
+    this.accounts.forEach((a, i) => a.index = i);
+    if (this.currentIndex === from) {
+      this.currentIndex = to;
+    } else if (from < to) {
+      if (this.currentIndex > from && this.currentIndex <= to) this.currentIndex--;
+    } else {
+      if (this.currentIndex >= to && this.currentIndex < from) this.currentIndex++;
+    }
+  }
+
+  /**
    * Return a status summary of all accounts (safe to expose, no credentials).
    */
   getStatus() {

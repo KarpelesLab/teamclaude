@@ -126,6 +126,9 @@ export class TUI {
     this.mode = 'normal';    // normal | select | add | input
     this.selAction = null;   // switch | remove
     this.selIdx = 0;
+    this.reorderGrabbed = null;
+    this.reorderOrigOrder = null;
+    this.reorderOrigCurrentIdx = null;
     this.inputPrompt = '';
     this.inputBuf = '';
     this.inputCb = null;
@@ -216,10 +219,11 @@ export class TUI {
     if (k === 'ctrl-c') { this.stop(); this.onQuit?.(); return; }
 
     switch (this.mode) {
-      case 'normal': this._keyNormal(k); break;
-      case 'select': this._keySelect(k); break;
-      case 'add':    this._keyAdd(k); break;
-      case 'input':  this._keyInput(k); break;
+      case 'normal':  this._keyNormal(k); break;
+      case 'select':  this._keySelect(k); break;
+      case 'reorder': this._keyReorder(k); break;
+      case 'add':     this._keyAdd(k); break;
+      case 'input':   this._keyInput(k); break;
     }
     this.render();
   }
@@ -234,6 +238,10 @@ export class TUI {
     }
     else if (k === 'a') { this.mode = 'add'; }
     else if (k === 'R') { this._doSync(); }
+    else if (k === 'o' && this.am.accounts.length > 1) {
+      this.mode = 'reorder'; this.selIdx = this.am.currentIndex;
+      this.reorderGrabbed = null; this.reorderOrigOrder = null;
+    }
   }
 
   _keySelect(k) {
@@ -250,6 +258,36 @@ export class TUI {
       this.mode = 'normal';
     }
     else if (k === 'esc' || k === 'q') { this.mode = 'normal'; }
+  }
+
+  _keyReorder(k) {
+    const len = this.am.accounts.length;
+    if (this.reorderGrabbed === null) {
+      if (k === 'up' || k === 'k')        this.selIdx = Math.max(0, this.selIdx - 1);
+      else if (k === 'down' || k === 'j') this.selIdx = Math.min(len - 1, this.selIdx + 1);
+      else if (k === 'enter') {
+        this.reorderGrabbed = this.selIdx;
+        this.reorderOrigOrder = [...this.am.accounts];
+        this.reorderOrigCurrentIdx = this.am.currentIndex;
+      }
+      else if (k === 'esc' || k === 'q') { this.mode = 'normal'; }
+    } else {
+      if ((k === 'up' || k === 'k') && this.selIdx > 0) {
+        this.am.moveAccount(this.selIdx, this.selIdx - 1);
+        this.selIdx--;
+      } else if ((k === 'down' || k === 'j') && this.selIdx < len - 1) {
+        this.am.moveAccount(this.selIdx, this.selIdx + 1);
+        this.selIdx++;
+      } else if (k === 'enter') {
+        this._doSaveReorder();
+        this.mode = 'normal'; this.reorderGrabbed = null; this.reorderOrigOrder = null;
+      } else if (k === 'esc' || k === 'q') {
+        this.am.accounts.splice(0, this.am.accounts.length, ...this.reorderOrigOrder);
+        this.am.accounts.forEach((a, i) => a.index = i);
+        this.am.currentIndex = this.reorderOrigCurrentIdx;
+        this.mode = 'normal'; this.reorderGrabbed = null; this.reorderOrigOrder = null;
+      }
+    }
   }
 
   _keyAdd(k) {
@@ -369,6 +407,17 @@ export class TUI {
     this._addLog(`Removed account "${name}"`);
   }
 
+  async _doSaveReorder() {
+    const reordered = this.am.accounts.map(a =>
+      this.config.accounts.find(c =>
+        (a.accountUuid && c.accountUuid === a.accountUuid) || c.name === a.name
+      )
+    ).filter(Boolean);
+    this.config.accounts = reordered;
+    await this.saveConfig(this.config);
+    this._addLog('Account order saved');
+  }
+
   // ── rendering ──────────────────────────────────────
 
   render() {
@@ -450,10 +499,11 @@ export class TUI {
   _renderAcct(idx, bw, showBoth) {
     const a = this.am.accounts[idx];
     const isCur = idx === this.am.currentIndex;
-    const isSel = this.mode === 'select' && idx === this.selIdx;
+    const isSel = (this.mode === 'select' || this.mode === 'reorder') && idx === this.selIdx;
+    const isGrabbed = this.mode === 'reorder' && this.reorderGrabbed !== null && idx === this.selIdx;
 
     // Prefix: selection marker + current marker
-    const sel = isSel ? cyan('>') : ' ';
+    const sel = isGrabbed ? cyan('↕') : isSel ? cyan('>') : ' ';
     const cur = isCur ? green('►') : ' ';
 
     // Name (bold if selected)
@@ -504,11 +554,16 @@ export class TUI {
   _renderFooter() {
     switch (this.mode) {
       case 'normal':
-        return ` ${bold('s')}witch  ${bold('a')}dd  ${bold('r')}emove  ${bold('R')}eload  ${bold('q')}uit`;
+        return ` ${bold('s')}witch  ${bold('a')}dd  ${bold('r')}emove  ${bold('o')}rder  ${bold('R')}eload  ${bold('q')}uit`;
       case 'select': {
         const act = this.selAction === 'switch' ? 'switch' : 'remove';
         return ` ${dim('↑↓')} select  ${bold('Enter')} ${act}  ${bold('Esc')} cancel`;
       }
+    case 'reorder':
+      if (this.reorderGrabbed === null) {
+        return ` ${dim('↑↓')} select  ${bold('Enter')} grab  ${bold('Esc')} cancel`;
+      }
+      return ` ${dim('↑↓')} move  ${bold('Enter')} confirm  ${bold('Esc')} cancel`;
       case 'add':
         return ` ${bold('i')}mport Claude Code  ${bold('k')} API key  ${bold('Esc')} cancel`;
       case 'input':
