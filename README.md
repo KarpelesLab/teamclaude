@@ -122,12 +122,53 @@ eval $(teamclaude env)
 claude
 ```
 
+### Transparent shim
+
+`teamclaude run` works for one-off invocations, but if you want plain `claude` to route through the proxy automatically — without prefixing every call — install the shim:
+
+```bash
+teamclaude shim install
+```
+
+This drops a small bash wrapper at `$XDG_DATA_HOME/teamclaude-shim/claude`, alongside `env` (sh / bash / zsh) and `env.fish` (fish) loaders. Each detected shell rc gets a single one-line directive sourcing the loader — same pattern rustup uses with `~/.cargo/env`. From then on, every `claude` invocation:
+
+1. Probes the proxy port locally.
+2. **Up** → applies `teamclaude env` and execs the real `claude`.
+3. **Down** → execs the real `claude` directly.
+
+The shim lives in its own directory, separate from where Claude Code's auto-updater writes its binary. So `claude` updates can come and go without disturbing the shim — same trick `rbenv`, `asdf`, and `mise` use to survive language-version updates.
+
+```bash
+teamclaude shim status     # Show install state and which rc files are wired up
+teamclaude shim uninstall  # Revert (removes shim files + cleans rc edits)
+```
+
+Shells covered:
+
+- **bash** — `~/.bashrc` and `~/.bash_profile` (handles macOS Terminal's login-shell precedence)
+- **zsh** — `~/.zshrc`
+- **POSIX sh** — `~/.profile` (login-shell baseline; helps display managers, etc.)
+- **fish** — `~/.config/fish/conf.d/teamclaude-shim.fish` (auto-loaded; no rc edit)
+
+The sourced loaders are idempotent at source time (they check whether the shim dir is already on `PATH`) so reload-after-reload is safe.
+
+Flags:
+
+- `--no-rc` — skip rc edits; print the source lines for manual install.
+- `--shim-dir PATH` — override the install directory (default `$XDG_DATA_HOME/teamclaude-shim`).
+
+Shim runtime env vars:
+
+- `CLAUDE_REAL` — force a specific real-claude binary path (skips PATH walk).
+- `TEAMCLAUDE_CONFIG` — override the teamclaude config path used to read the proxy port.
+
 ### Other commands
 
 ```bash
 teamclaude accounts          # List accounts with subscription tier and token status
 teamclaude accounts -v       # Also show token expiry times
 teamclaude status            # Show live proxy status (requires running server)
+teamclaude shim status       # Show shim installation status
 teamclaude remove <name>     # Remove an account
 teamclaude api <path>        # Call an API endpoint with account credentials
 teamclaude help              # Show all commands

@@ -7,6 +7,7 @@ import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import { TUI } from './tui.js';
+import * as shim from './shim.js';
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -44,6 +45,10 @@ switch (command) {
     break;
   case 'api':
     await apiCommand();
+    process.exit(0);
+    break;
+  case 'shim':
+    await shimCommand();
     process.exit(0);
     break;
   case 'help':
@@ -556,6 +561,34 @@ async function apiCommand() {
   }
 }
 
+// ── shim ────────────────────────────────────────────────────
+
+async function shimCommand() {
+  const sub = args[1];
+  const shimDir = argValue('--shim-dir') || undefined;
+
+  switch (sub) {
+    case 'install': {
+      const noRc = args.includes('--no-rc');
+      shim.install({ shimDir, noRc });
+      break;
+    }
+    case 'uninstall': {
+      shim.uninstall({ shimDir });
+      break;
+    }
+    case 'status':
+    case undefined: {
+      shim.status({ shimDir });
+      break;
+    }
+    default:
+      console.error(`Unknown shim action: ${sub}`);
+      console.error('Usage: teamclaude shim [install|uninstall|status] [--no-rc] [--shim-dir PATH]');
+      process.exit(1);
+  }
+}
+
 // ── remove ──────────────────────────────────────────────────
 
 async function removeCommand() {
@@ -596,6 +629,9 @@ Commands:
   accounts            List configured accounts
   remove <name>       Remove an account
   api <path>          Call an API endpoint with account credentials
+  shim <action>       Install a transparent claude shim that auto-routes
+                      through the proxy when it's running
+                      (install | uninstall | status)
   help                Show this help
 
 Options:
