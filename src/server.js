@@ -8,7 +8,7 @@ const HOP_BY_HOP_HEADERS = new Set([
   'te', 'trailer', 'upgrade', 'proxy-authorization', 'proxy-authenticate',
 ]);
 
-export function createProxyServer(accountManager, config, hooks = {}) {
+export function createProxyServer(accountManager, config, hooks = {}, admin = {}) {
   const upstream = config.upstream || 'https://api.anthropic.com';
   const proxyApiKey = config.proxy?.apiKey;
   const logDir = config.logDir || null;
@@ -37,6 +37,28 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       if (req.method === 'GET' && req.url === '/teamclaude/status') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(accountManager.getStatus(), null, 2));
+        return;
+      }
+
+      // Reload endpoint — re-sync accounts from disk config (add new, remove
+      // deleted, refresh credentials) on the running server, no restart.
+      if (req.method === 'POST' && req.url === '/teamclaude/reload') {
+        if (!admin.reload) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ type: 'error', error: { type: 'not_implemented', message: 'Reload not available' } }));
+          return;
+        }
+        // Drain any request body before responding
+        for await (const _chunk of req) { /* ignore */ }
+        try {
+          const summary = await admin.reload();
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, ...summary }, null, 2));
+        } catch (err) {
+          console.error('[TeamClaude] Reload failed:', err.message);
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ type: 'error', error: { type: 'reload_error', message: err.message } }));
+        }
         return;
       }
 

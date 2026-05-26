@@ -121,7 +121,23 @@ async function serverCommand() {
     }).catch(err => console.error(`[TeamClaude] Failed to save refreshed token: ${err.message}`));
   });
   const port = config.proxy.port;
-  const useTUI = process.stdout.isTTY && process.stdin.isTTY;
+  const headless = args.includes('--headless') || args.includes('--no-tui');
+  const useTUI = !headless && process.stdout.isTTY && process.stdin.isTTY;
+
+  // Live account reload — re-sync from disk config (add new, remove deleted,
+  // refresh credentials) without restarting. Serialized so a SIGHUP and an HTTP
+  // reload arriving together don't race on the shared account arrays.
+  let reloadChain = Promise.resolve();
+  function reloadAccounts() {
+    const run = async () => {
+      const diskConfig = await loadConfig();
+      if (!diskConfig) return { added: 0, removed: 0, refreshed: 0 };
+      return syncAccountsFromDisk(diskConfig, config, accountManager);
+    };
+    const result = reloadChain.then(run, run);
+    reloadChain = result.then(() => {}, () => {});
+    return result;
+  }
 
   let tui = null;
   let hooks = {};
@@ -161,7 +177,7 @@ async function serverCommand() {
     };
   }
 
-  const server = createProxyServer(accountManager, config, hooks);
+  const server = createProxyServer(accountManager, config, hooks, { reload: reloadAccounts });
 
   server.listen(port, () => {
     if (tui) {
@@ -197,6 +213,15 @@ async function serverCommand() {
     process.on('SIGTERM', () => {
       console.log('\n[TeamClaude] Shutting down...');
       server.close(() => process.exit(0));
+    });
+    // SIGHUP → reload accounts from config (systemd `ExecReload`, `kill -HUP`)
+    process.on('SIGHUP', async () => {
+      try {
+        const { added, removed, refreshed } = await reloadAccounts();
+        console.log(`[TeamClaude] Reloaded on SIGHUP — +${added} -${removed} accounts, ${refreshed} refreshed`);
+      } catch (err) {
+        console.error(`[TeamClaude] SIGHUP reload failed: ${err.message}`);
+      }
     });
   }
 }
@@ -300,6 +325,7 @@ async function loginApiCommand() {
   await saveConfig(config);
   console.log(`Added API key account "${name}"`);
   console.log(`Saved to ${getConfigPath()}`);
+  await notifyRunningServer(config);
 }
 
 async function loginOAuthCommand() {
@@ -581,6 +607,7 @@ async function removeCommand() {
   config.accounts.splice(idx, 1);
   await saveConfig(config);
   console.log(`Removed account "${name}"`);
+  await notifyRunningServer(config);
 }
 
 // ── help ────────────────────────────────────────────────────
@@ -609,6 +636,12 @@ Options:
   --json JSON         Import from inline JSON (import), e.g.:
                       --json '{"accessToken":"...","refreshToken":"...","expiresAt":1234}'
   --log-to DIR        Log full requests/responses to DIR (server, one file per request)
+  --headless          Run the server without the interactive TUI (for backgrounding)
+
+Account changes from import/login/remove apply live to a running server
+(no restart). The server also reloads on SIGHUP. Endpoints:
+  GET  /teamclaude/status     account status + remaining quota (JSON)
+  POST /teamclaude/reload     re-sync accounts from config (add/remove/refresh)
 
 Config: ${getConfigPath()}
 `);
@@ -660,6 +693,26 @@ async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
 
   await saveConfig(config);
   console.log(`Saved to ${getConfigPath()}`);
+  await notifyRunningServer(config);
+}
+
+/**
+ * If a server is running on the configured proxy port, ask it to live-reload
+ * accounts from the just-saved config so the change applies without a restart.
+ * Prints a hint if no server is reachable.
+ */
+async function notifyRunningServer(config) {
+  const url = `http://localhost:${config.proxy.port}/teamclaude/reload`;
+  try {
+    const res = await fetch(url, { method: 'POST', headers: { 'x-api-key': config.proxy.apiKey } });
+    if (!res.ok) return false;
+    const data = await res.json();
+    console.log(`Applied to running server (+${data.added} -${data.removed} accounts, ${data.refreshed} refreshed).`);
+    return true;
+  } catch {
+    console.log('No running server detected — change applies on next start.');
+    return false;
+  }
 }
 
 // ── config sync helpers ─────────────────────────────────────
@@ -676,12 +729,14 @@ function findConfigAccount(diskConfig, account) {
 }
 
 /**
- * Sync accounts from disk config: add new accounts and refresh credentials
- * for existing ones (handles re-imported OAuth tokens, rotated API keys, etc.).
- * Returns the number of new accounts added.
+ * Sync accounts from disk config to the running server: add new accounts,
+ * remove ones deleted from disk, and refresh credentials for existing ones
+ * (re-imported OAuth tokens, rotated API keys, etc.). Mutates both memConfig
+ * and accountManager in lockstep. Returns { added, removed, refreshed }.
  */
 async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
   let added = 0;
+  let refreshed = 0;
   for (const diskAcct of diskConfig.accounts) {
     const matchByUuid = diskAcct.accountUuid &&
       memConfig.accounts.findIndex(a => a.accountUuid === diskAcct.accountUuid);
@@ -729,15 +784,37 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
         freshCred.expiresAt < mgr.expiresAt;
       if (changed && !diskIsStaler) {
         accountManager.updateAccountTokens(mgr.index, freshCred);
+        refreshed++;
         console.log(`[TeamClaude] Refreshed credentials for "${mgr.name}"`);
       }
     } else if (freshCred.apiKey && mgr.credential !== freshCred.apiKey) {
       mgr.credential = freshCred.apiKey;
       if (mgr.status === 'error') mgr.status = 'active';
+      refreshed++;
       console.log(`[TeamClaude] Updated API key for "${mgr.name}"`);
     }
   }
-  return added;
+
+  // Removals — drop accounts no longer present on disk. Match by UUID then name
+  // (indices may differ between memConfig and accountManager), and iterate the
+  // manager backwards so removeAccount's re-indexing stays valid.
+  let removed = 0;
+  const onDisk = (acct) => diskConfig.accounts.some(d =>
+    (acct.accountUuid && d.accountUuid === acct.accountUuid) || d.name === acct.name
+  );
+  for (let i = accountManager.accounts.length - 1; i >= 0; i--) {
+    const am = accountManager.accounts[i];
+    if (onDisk(am)) continue;
+    accountManager.removeAccount(i);
+    const ci = memConfig.accounts.findIndex(a =>
+      (am.accountUuid && a.accountUuid === am.accountUuid) || a.name === am.name
+    );
+    if (ci >= 0) memConfig.accounts.splice(ci, 1);
+    removed++;
+    console.log(`[TeamClaude] Removed account "${am.name}" (deleted from config)`);
+  }
+
+  return { added, removed, refreshed };
 }
 
 // ── helpers ─────────────────────────────────────────────────
