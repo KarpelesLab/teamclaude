@@ -383,6 +383,7 @@ export class AccountManager {
         status: a.status,
         quota: { ...a.quota },
         remaining: this._remainingSummary(a.quota),
+        lastQuotaAt: a.lastQuotaAt,
         usage: { ...a.usage },
         rateLimitedUntil: a.rateLimitedUntil
           ? new Date(a.rateLimitedUntil).toISOString()

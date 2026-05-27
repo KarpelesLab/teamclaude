@@ -133,7 +133,11 @@ async function serverCommand() {
     const run = async () => {
       const diskConfig = await loadConfig();
       if (!diskConfig) return { added: 0, removed: 0, refreshed: 0 };
-      return syncAccountsFromDisk(diskConfig, config, accountManager);
+      const summary = await syncAccountsFromDisk(diskConfig, config, accountManager);
+      // Newly added accounts have no quota yet — probe them now instead of
+      // waiting up to a full poke interval, so `status` reflects them promptly.
+      if (summary.added > 0) prober.pokeStale().catch(() => {});
+      return summary;
     };
     const result = reloadChain.then(run, run);
     reloadChain = result.then(() => {}, () => {});
@@ -425,6 +429,7 @@ async function statusCommand() {
 
       console.log(`  ${acct.name} (${acct.type})${current}`);
       console.log(`    Status:   ${acct.status}`);
+      if (acct.orgName) console.log(`    Org:      ${acct.orgName}`);
 
       if (q.unified5h != null || q.unified7d != null) {
         const sesRst = formatReset(q.unified5hReset);
@@ -440,6 +445,7 @@ async function statusCommand() {
         console.log(`    Tokens:   ${tok}    Requests: ${req}`);
       }
 
+      console.log(`    Quota:    ${formatQuotaAge(acct.lastQuotaAt)}`);
       console.log(`    Total:    ${acct.usage.totalInputTokens + acct.usage.totalOutputTokens} tokens, ${acct.usage.totalRequests} requests`);
       if (acct.rateLimitedUntil) console.log(`    Throttled until: ${acct.rateLimitedUntil}`);
       console.log('');
@@ -881,6 +887,19 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
 }
 
 // ── helpers ─────────────────────────────────────────────────
+
+function formatQuotaAge(lastQuotaAt) {
+  if (!lastQuotaAt) return 'no data yet';
+  const ms = Date.now() - lastQuotaAt;
+  if (ms < 0) return 'just now';
+  const secs = Math.floor(ms / 1000);
+  if (secs < 60) return `updated ${secs}s ago`;
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) return `updated ${mins}m ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `updated ${hrs}h ago`;
+  return `updated ${Math.floor(hrs / 24)}d ago`;
+}
 
 function formatReset(resetTs) {
   if (!resetTs) return '';
