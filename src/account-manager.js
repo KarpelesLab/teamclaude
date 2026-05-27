@@ -256,6 +256,11 @@ export class AccountManager {
         account.credential = newTokens.accessToken;
         account.refreshToken = newTokens.refreshToken;
         account.expiresAt = newTokens.expiresAt;
+        // A successful refresh clears a prior error — the account is usable again.
+        if (account.status === 'error') {
+          account.status = 'active';
+          console.log(`[TeamClaude] Account "${account.name}" recovered from error after refresh`);
+        }
         console.log(`[TeamClaude] Token refreshed for account "${account.name}"`);
         this._onTokenRefresh?.(accountIndex, newTokens);
       } catch (err) {

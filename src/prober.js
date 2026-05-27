@@ -81,7 +81,16 @@ export class Prober {
     try {
       const now = Date.now();
       for (const account of this.accountManager.accounts) {
-        if (account.status === 'error' || account.status === 'exhausted') continue;
+        // Auto-heal errored OAuth accounts: a stale/rotated token leaves an
+        // account stuck in 'error' with nothing to retry it. Force a refresh;
+        // ensureTokenFresh clears 'error'→'active' on success. If it stays
+        // errored (refresh token truly dead), skip until the next tick.
+        if (account.status === 'error') {
+          if (account.type !== 'oauth' || !account.refreshToken) continue;
+          await this.accountManager.ensureTokenFresh(account.index, true).catch(() => {});
+          if (account.status === 'error') continue;
+        }
+        if (account.status === 'exhausted') continue;
         if (account.rateLimitedUntil && now < account.rateLimitedUntil) continue;
         const fresh = account.lastQuotaAt && (now - account.lastQuotaAt) < this.intervalMs;
         if (fresh) continue;
