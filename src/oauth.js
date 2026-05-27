@@ -129,6 +129,7 @@ export async function fetchProfile(accessToken) {
       accountUuid: data.account?.uuid,
       email: data.account?.email,
       name: data.account?.display_name,
+      orgUuid: data.organization?.uuid,
       orgName: data.organization?.name,
       orgType: data.organization?.organization_type,
       hasClaudeMax: data.account?.has_claude_max,

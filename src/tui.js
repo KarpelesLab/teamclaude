@@ -1,4 +1,5 @@
 import { importCredentials, fetchProfile } from './oauth.js';
+import { sameIdentity } from './identity.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -314,16 +315,16 @@ export class TUI {
       const entry = {
         name, type: 'oauth', source: 'import',
         accountUuid: profile?.accountUuid || null,
+        orgUuid: profile?.orgUuid || null,
+        orgName: profile?.orgName || null,
         accessToken: creds.accessToken,
         refreshToken: creds.refreshToken,
         expiresAt: creds.expiresAt,
       };
 
-      // Deduplicate: match by UUID first, then by name
-      let idx = profile?.accountUuid
-        ? this.config.accounts.findIndex(a => a.accountUuid === profile.accountUuid)
-        : -1;
-      if (idx < 0) idx = this.config.accounts.findIndex(a => a.name === name);
+      // Deduplicate by account+org identity (same email in a different org is
+      // a distinct account, not a dup).
+      const idx = this.config.accounts.findIndex(a => sameIdentity(a, entry));
 
       if (idx >= 0) {
         this.config.accounts[idx] = entry;
@@ -334,6 +335,8 @@ export class TUI {
           amAcct.refreshToken = creds.refreshToken;
           amAcct.expiresAt = creds.expiresAt;
           amAcct.accountUuid = entry.accountUuid;
+          amAcct.orgUuid = entry.orgUuid;
+          amAcct.orgName = entry.orgName;
           amAcct.name = name;
           if (amAcct.status === 'error') amAcct.status = 'active';
         }
