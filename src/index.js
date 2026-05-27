@@ -6,6 +6,7 @@ import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConf
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
+import { sameIdentity, orgKey } from './identity.js';
 import { TUI } from './tui.js';
 import { Prober } from './prober.js';
 
@@ -105,8 +106,7 @@ async function serverCommand() {
       // Pick up any new accounts from disk so index matching stays correct
       // (only add, don't refresh credentials — we're about to write the authoritative tokens)
       for (const diskAcct of diskConfig.accounts) {
-        const known = (diskAcct.accountUuid && config.accounts.some(a => a.accountUuid === diskAcct.accountUuid))
-          || config.accounts.some(a => a.name === diskAcct.name);
+        const known = config.accounts.some(a => sameIdentity(a, diskAcct));
         if (!known) {
           config.accounts.push(diskAcct);
           accountManager.addAccount(diskAcct);
@@ -487,31 +487,50 @@ async function accountsCommand() {
     )
   );
 
-  // Deduplicate by accountUuid — keep the last (most recently added) entry
+  // Backfill account+org identity from profiles, then deduplicate by
+  // (accountUuid, org) — the same email in a different org is NOT a duplicate.
+  // Keep the last (most recently added) entry.
+  let touched = false;
   const seen = new Map();
   let removed = 0;
   for (let i = config.accounts.length - 1; i >= 0; i--) {
     const a = config.accounts[i];
-    const uuid = profiles[i]?.accountUuid || a.accountUuid;
-    if (uuid) {
-      if (seen.has(uuid)) {
-        config.accounts.splice(i, 1);
-        profiles.splice(i, 1);
-        removed++;
-      } else {
-        seen.set(uuid, i);
-        // Update stored UUID and name from profile
-        if (profiles[i] && !profiles[i].error) {
-          a.accountUuid = profiles[i].accountUuid;
-          if (profiles[i].email) a.name = profiles[i].email;
-        }
-      }
+    const p = profiles[i];
+    if (p && !p.error) {
+      if (p.accountUuid && a.accountUuid !== p.accountUuid) { a.accountUuid = p.accountUuid; touched = true; }
+      if (p.orgUuid && a.orgUuid !== p.orgUuid) { a.orgUuid = p.orgUuid; touched = true; }
+      if (p.orgName && a.orgName !== p.orgName) { a.orgName = p.orgName; touched = true; }
+    }
+    const uuid = a.accountUuid;
+    if (!uuid) continue;
+    const key = `${uuid}::${orgKey(a) || ''}`;
+    if (seen.has(key)) {
+      config.accounts.splice(i, 1);
+      profiles.splice(i, 1);
+      removed++;
+      touched = true;
+    } else {
+      seen.set(key, i);
     }
   }
-  if (removed > 0) {
-    await saveConfig(config);
-    console.log(`Removed ${removed} duplicate account(s)\n`);
+
+  // Name accounts from their email: plain when an account has a single org,
+  // "email (org)" when the same account spans multiple orgs.
+  const orgLabel = a => a.orgName || (a.orgUuid ? a.orgUuid.slice(0, 8) : 'org');
+  const orgCount = new Map();
+  for (const a of config.accounts) {
+    if (a.accountUuid) orgCount.set(a.accountUuid, (orgCount.get(a.accountUuid) || 0) + 1);
   }
+  for (const [i, a] of config.accounts.entries()) {
+    const p = profiles[i];
+    const email = (p && !p.error && p.email) ? p.email : null;
+    if (!email) continue;
+    const newName = orgCount.get(a.accountUuid) > 1 ? `${email} (${orgLabel(a)})` : email;
+    if (a.name !== newName) { a.name = newName; touched = true; }
+  }
+
+  if (touched) await saveConfig(config);
+  if (removed > 0) console.log(`Removed ${removed} duplicate account(s)\n`);
 
   for (const [i, a] of config.accounts.entries()) {
     const p = profiles[i];
@@ -666,7 +685,8 @@ Config: ${getConfigPath()}
 // ── shared account upsert ────────────────────────────────────
 
 async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
-  // Fetch profile to auto-name and deduplicate by account UUID
+  const userNamed = !!name;
+  // Fetch profile to auto-name and deduplicate by account+org identity
   const profile = await fetchProfile(creds.accessToken);
   const profileOk = profile && !profile.error;
 
@@ -688,23 +708,40 @@ async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
     type: 'oauth',
     source,
     accountUuid: profile?.accountUuid || null,
+    orgUuid: profile?.orgUuid || null,
+    orgName: profile?.orgName || null,
     accessToken: creds.accessToken,
     refreshToken: creds.refreshToken,
     expiresAt: creds.expiresAt,
   };
 
-  // Deduplicate: match by UUID first, then by name
-  let idx = profile?.accountUuid
-    ? config.accounts.findIndex(a => a.accountUuid === profile.accountUuid)
-    : -1;
-  if (idx < 0) idx = config.accounts.findIndex(a => a.name === name);
+  // Deduplicate by account+org identity (same email in a different org is a
+  // distinct account, not a dup).
+  const idx = config.accounts.findIndex(a => sameIdentity(a, account));
 
   if (idx >= 0) {
-    config.accounts[idx] = account;
-    console.log(`Updated account "${name}"`);
+    // Same account+org: refresh credentials/org info but keep the existing
+    // display name (may already be org-disambiguated) and any importFrom.
+    const prev = config.accounts[idx];
+    config.accounts[idx] = { ...prev, ...account, name: prev.name, importFrom: prev.importFrom };
+    console.log(`Updated account "${prev.name}"`);
   } else {
+    // New org for this person. If the same account already has another org
+    // entry, the plain email is ambiguous — disambiguate both with " (org)".
+    if (!userNamed && account.accountUuid) {
+      const orgLabel = a => a.orgName || (a.orgUuid ? a.orgUuid.slice(0, 8) : 'org');
+      const collisions = config.accounts.filter(
+        a => a.accountUuid === account.accountUuid && !sameIdentity(a, account)
+      );
+      if (collisions.length > 0) {
+        for (const c of collisions) {
+          if (!c.name.includes(' (')) c.name = `${c.name} (${orgLabel(c)})`;
+        }
+        account.name = `${name} (${orgLabel(account)})`;
+      }
+    }
     config.accounts.push(account);
-    console.log(`Added account "${name}"`);
+    console.log(`Added account "${account.name}"`);
   }
 
   await saveConfig(config);
@@ -734,14 +771,12 @@ async function notifyRunningServer(config) {
 // ── config sync helpers ─────────────────────────────────────
 
 /**
- * Find a config account entry matching an in-memory account (by UUID, then name).
+ * Find a config account entry matching an in-memory account (by account+org
+ * identity, then name). Org-aware so a rotated token persists onto the exact
+ * org entry rather than the first same-email match.
  */
 function findConfigAccount(diskConfig, account) {
-  if (account.accountUuid) {
-    const idx = diskConfig.accounts.findIndex(a => a.accountUuid === account.accountUuid);
-    if (idx >= 0) return idx;
-  }
-  return diskConfig.accounts.findIndex(a => a.name === account.name);
+  return diskConfig.accounts.findIndex(a => sameIdentity(a, account));
 }
 
 /**
@@ -753,20 +788,43 @@ function findConfigAccount(diskConfig, account) {
 async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
   let added = 0;
   let refreshed = 0;
-  for (const diskAcct of diskConfig.accounts) {
-    const matchByUuid = diskAcct.accountUuid &&
-      memConfig.accounts.findIndex(a => a.accountUuid === diskAcct.accountUuid);
-    const matchByName = memConfig.accounts.findIndex(a => a.name === diskAcct.name);
-    const memIdx = (matchByUuid >= 0 ? matchByUuid : null) ?? (matchByName >= 0 ? matchByName : -1);
 
-    if (memIdx < 0) {
+  // Greedy 1:1 pairing of disk entries to in-memory accounts, account+org aware.
+  // Each disk entry claims at most one unclaimed manager account; this makes
+  // add/refresh/remove all count-correct when several entries share an email
+  // across orgs. Tracks claimed manager indices for the removal pass.
+  const claimedMgr = new Set();
+  const claimMgr = (diskAcct) => {
+    for (let i = 0; i < accountManager.accounts.length; i++) {
+      if (!claimedMgr.has(i) && sameIdentity(accountManager.accounts[i], diskAcct)) {
+        claimedMgr.add(i);
+        return i;
+      }
+    }
+    return -1;
+  };
+
+  for (const diskAcct of diskConfig.accounts) {
+    const mgrIdx = claimMgr(diskAcct);
+
+    if (mgrIdx < 0) {
       // New account discovered on disk — add to running server
       memConfig.accounts.push(diskAcct);
       accountManager.addAccount(diskAcct);
+      claimedMgr.add(accountManager.accounts.length - 1);
       added++;
       console.log(`[TeamClaude] Picked up new account "${diskAcct.name}" from config`);
       continue;
     }
+
+    const mgr = accountManager.accounts[mgrIdx];
+
+    // Backfill org identity onto the running account once disk learns it
+    // (legacy entries imported before org capture), and pick up renames
+    // (e.g. org-disambiguation applied on disk).
+    if (diskAcct.orgUuid && !mgr.orgUuid) mgr.orgUuid = diskAcct.orgUuid;
+    if (diskAcct.orgName && !mgr.orgName) mgr.orgName = diskAcct.orgName;
+    if (diskAcct.name && mgr.name !== diskAcct.name) mgr.name = diskAcct.name;
 
     // Existing account — resolve fresh credentials from disk
     let freshCred = null;
@@ -784,12 +842,6 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
     }
 
     if (!freshCred) continue;
-
-    // Find the corresponding AccountManager entry and update credentials
-    const mgr = accountManager.accounts.find(a =>
-      (diskAcct.accountUuid && a.accountUuid === diskAcct.accountUuid) || a.name === diskAcct.name
-    );
-    if (!mgr) continue;
 
     if (freshCred.accessToken) {
       const changed = mgr.credential !== freshCred.accessToken ||
@@ -811,35 +863,15 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
     }
   }
 
-  // Removals — reconcile by COUNT, not existence: disk may legitimately hold
-  // multiple entries matching by name/UUID (e.g. the same email across orgs).
-  // Each disk entry claims at most one in-memory account (UUID match preferred,
-  // then name); anything left unclaimed is gone from disk and gets removed.
-  // Iterate the manager backwards when removing so removeAccount's re-indexing
-  // stays valid — claimed holds original indices, which remain correct for the
-  // not-yet-visited lower indices.
-  const claimed = new Set();
-  const claimOne = (pred) => {
-    for (let i = 0; i < accountManager.accounts.length; i++) {
-      if (!claimed.has(i) && pred(accountManager.accounts[i])) { claimed.add(i); return true; }
-    }
-    return false;
-  };
-  for (const d of diskConfig.accounts) {
-    if (d.accountUuid && claimOne(a => a.accountUuid === d.accountUuid)) continue;
-    claimOne(a => a.name === d.name);
-  }
-
+  // Removals — any in-memory account not claimed by a disk entry is gone from
+  // disk. Iterate backwards so removeAccount's re-indexing stays valid; claimed
+  // holds original indices, correct for the not-yet-visited lower indices.
   let removed = 0;
   for (let i = accountManager.accounts.length - 1; i >= 0; i--) {
-    if (claimed.has(i)) continue;
+    if (claimedMgr.has(i)) continue;
     const am = accountManager.accounts[i];
     accountManager.removeAccount(i);
-    // Drop one matching memConfig entry to keep counts in lockstep; duplicates
-    // are indistinguishable by these keys, so removing any single match is fine.
-    const ci = memConfig.accounts.findIndex(a =>
-      (am.accountUuid && a.accountUuid === am.accountUuid) || a.name === am.name
-    );
+    const ci = memConfig.accounts.findIndex(a => sameIdentity(a, am));
     if (ci >= 0) memConfig.accounts.splice(ci, 1);
     removed++;
     console.log(`[TeamClaude] Removed account "${am.name}" (deleted from config)`);
