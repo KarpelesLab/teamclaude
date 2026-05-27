@@ -811,17 +811,32 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
     }
   }
 
-  // Removals — drop accounts no longer present on disk. Match by UUID then name
-  // (indices may differ between memConfig and accountManager), and iterate the
-  // manager backwards so removeAccount's re-indexing stays valid.
+  // Removals — reconcile by COUNT, not existence: disk may legitimately hold
+  // multiple entries matching by name/UUID (e.g. the same email across orgs).
+  // Each disk entry claims at most one in-memory account (UUID match preferred,
+  // then name); anything left unclaimed is gone from disk and gets removed.
+  // Iterate the manager backwards when removing so removeAccount's re-indexing
+  // stays valid — claimed holds original indices, which remain correct for the
+  // not-yet-visited lower indices.
+  const claimed = new Set();
+  const claimOne = (pred) => {
+    for (let i = 0; i < accountManager.accounts.length; i++) {
+      if (!claimed.has(i) && pred(accountManager.accounts[i])) { claimed.add(i); return true; }
+    }
+    return false;
+  };
+  for (const d of diskConfig.accounts) {
+    if (d.accountUuid && claimOne(a => a.accountUuid === d.accountUuid)) continue;
+    claimOne(a => a.name === d.name);
+  }
+
   let removed = 0;
-  const onDisk = (acct) => diskConfig.accounts.some(d =>
-    (acct.accountUuid && d.accountUuid === acct.accountUuid) || d.name === acct.name
-  );
   for (let i = accountManager.accounts.length - 1; i >= 0; i--) {
+    if (claimed.has(i)) continue;
     const am = accountManager.accounts[i];
-    if (onDisk(am)) continue;
     accountManager.removeAccount(i);
+    // Drop one matching memConfig entry to keep counts in lockstep; duplicates
+    // are indistinguishable by these keys, so removing any single match is fine.
     const ci = memConfig.accounts.findIndex(a =>
       (am.accountUuid && a.accountUuid === am.accountUuid) || a.name === am.name
     );
