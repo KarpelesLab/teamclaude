@@ -5,7 +5,7 @@ import { createInterface } from 'node:readline';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath } from './config.js';
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
-import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
+import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon, fetchUsage } from './oauth.js';
 import { sameIdentity, orgKey } from './identity.js';
 import { TUI } from './tui.js';
 import { Prober } from './prober.js';
@@ -753,6 +753,15 @@ async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
   await saveConfig(config);
   console.log(`Saved to ${getConfigPath()}`);
   await notifyRunningServer(config);
+
+  // Immediately verify the token works and surface current quota.
+  const usage = await fetchUsage(account.accessToken);
+  if (usage.error) {
+    console.log(`Quota: unavailable (${usage.error})`);
+  } else {
+    const pct = w => (w && typeof w.utilization === 'number') ? `${w.utilization.toFixed(0)}% used` : 'n/a';
+    console.log(`Quota: 5h ${pct(usage.data.five_hour)}, 7d ${pct(usage.data.seven_day)}`);
+  }
 }
 
 /**

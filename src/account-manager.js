@@ -215,6 +215,28 @@ export class AccountManager {
   }
 
   /**
+   * Populate quota from Anthropic's OAuth usage endpoint (fetchUsage).
+   * Maps the five_hour/seven_day windows onto the unified quota fields.
+   * Endpoint utilization is a percentage (0-100); unified* fields are 0-1.
+   */
+  applyUsageData(accountIndex, usage) {
+    const account = this.accounts[accountIndex];
+    if (!account || !usage) return;
+    const q = account.quota;
+
+    const apply = (win, utilKey, resetKey) => {
+      if (win && typeof win.utilization === 'number') {
+        q[utilKey] = win.utilization / 100;
+        q[resetKey] = win.resets_at ? new Date(win.resets_at).getTime() : null;
+      }
+    };
+    apply(usage.five_hour, 'unified5h', 'unified5hReset');
+    apply(usage.seven_day, 'unified7d', 'unified7dReset');
+
+    account.lastQuotaAt = Date.now();
+  }
+
+  /**
    * Update cumulative token usage from response body data.
    */
   updateUsage(accountIndex, inputTokens, outputTokens) {

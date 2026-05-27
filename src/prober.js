@@ -12,7 +12,8 @@
 // real traffic flowing through the proxy (recordTemplate) and replay a minimal
 // version. API-key accounts need no template.
 
-const CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
+import { fetchUsage } from './oauth.js';
+
 const FALLBACK_MODEL = 'claude-haiku-4-5-20251001';
 // Headers worth replaying from real Claude Code traffic (account-independent).
 const TEMPLATE_HEADERS = ['anthropic-version', 'anthropic-beta', 'user-agent'];
@@ -25,7 +26,6 @@ export class Prober {
     this.template = null;   // { headers, model, system } learned from live traffic
     this._timer = null;
     this._running = false;
-    this._warnedNoTemplate = false;
   }
 
   /** Learn the OAuth-acceptable request shape from a real /v1/messages request. */
@@ -103,29 +103,37 @@ export class Prober {
 
   async _poke(account) {
     const isOAuth = account.type === 'oauth';
-    if (isOAuth && !this.template) {
-      if (!this._warnedNoTemplate) {
-        console.log('[TeamClaude] Quota probe deferred for OAuth accounts until the first request establishes a template');
-        this._warnedNoTemplate = true;
-      }
-      return;
-    }
 
     await this.accountManager.ensureTokenFresh(account.index);
 
+    // OAuth (Claude subscription): read quota straight from the usage endpoint.
+    // Works cold (no Claude Code template, no message spend), so a freshly
+    // added account gets real quota immediately.
+    if (isOAuth) {
+      const usage = await fetchUsage(account.credential);
+      if (usage.error) {
+        if (usage.status === 429 && usage.retryAfterSeconds) {
+          this.accountManager.markRateLimited(account.index, usage.retryAfterSeconds);
+        } else if (usage.status === 401 || usage.status === 403) {
+          console.log(`[TeamClaude] Usage probe rejected for "${account.name}" (${usage.status})`);
+        }
+        return;
+      }
+      this.accountManager.applyUsageData(account.index, usage.data);
+      return;
+    }
+
+    // API-key accounts have no usage endpoint — probe /v1/messages to harvest
+    // the standard anthropic-ratelimit-* headers.
     const headers = { ...(this.template?.headers || {}), 'content-type': 'application/json' };
     if (!headers['anthropic-version']) headers['anthropic-version'] = '2023-06-01';
-    if (isOAuth) headers['authorization'] = `Bearer ${account.credential}`;
-    else headers['x-api-key'] = account.credential;
+    headers['x-api-key'] = account.credential;
 
     const body = {
       model: this.template?.model || FALLBACK_MODEL,
       max_tokens: 1,
       messages: [{ role: 'user', content: 'ping' }],
     };
-    if (isOAuth) {
-      body.system = this.template?.system || [{ type: 'text', text: CLAUDE_CODE_IDENTITY }];
-    }
 
     // Bound each probe so a hung upstream can't stall the whole prober
     // (pokeStale is guarded by _running and awaits probes sequentially).

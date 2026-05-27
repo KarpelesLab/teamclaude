@@ -140,6 +140,47 @@ export async function fetchProfile(accessToken) {
   }
 }
 
+const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
+const USAGE_USER_AGENT = 'claude-cli/1.0.60 (external, cli)';
+
+/**
+ * Fetch quota/usage for an OAuth (Claude subscription) account.
+ *
+ * Unlike per-request `anthropic-ratelimit-*` headers, this endpoint returns
+ * utilization + reset for each window directly and works "cold" — no Claude
+ * Code request template and no message spend — so it can populate quota the
+ * moment an account is added. Requires the `oauth-2025-04-20` beta header.
+ *
+ * Returns { data } on success, or { error, status, retryAfterSeconds } on
+ * failure. `utilization` is a percentage (0-100).
+ */
+export async function fetchUsage(accessToken) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10000);
+  try {
+    const res = await fetch(USAGE_URL, {
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'anthropic-beta': 'oauth-2025-04-20',
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        'User-Agent': USAGE_USER_AGENT,
+      },
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      const retryAfter = res.status === 429 ? parseInt(res.headers.get('retry-after'), 10) : null;
+      await res.body?.cancel();
+      return { error: `HTTP ${res.status}`, status: res.status, retryAfterSeconds: Number.isFinite(retryAfter) ? retryAfter : null };
+    }
+    return { data: await res.json() };
+  } catch (err) {
+    return { error: err.message || String(err) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // OAuth config (extracted from Claude Code)
 const OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 const OAUTH_AUTHORIZE = 'https://claude.ai/oauth/authorize';
