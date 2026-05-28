@@ -243,21 +243,45 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     }
     accountManager.updateQuota(account.index, rateLimitHeaders);
 
-    // On 429, wait the retry-after duration and retry on the same account
-    // (this is a transient rate limit, not quota exhaustion)
+    // A 429 means this account is rate-limited or out of quota. Mark it
+    // unavailable for the retry-after window and immediately fail over to the
+    // next available account, rather than holding the client connection open
+    // waiting on a dead account (for quota exhaustion retry-after can be hours).
+    // Once every account is throttled, getActiveAccount() returns null on the
+    // next pass and the client gets a 429 with a proper retry-after to back off.
     if (upstreamRes.status === 429) {
       const retryAfter = parseInt(upstreamRes.headers.get('retry-after'), 10) || 60;
       // Discard the 429 response body
       await upstreamRes.body?.cancel();
+      accountManager.markRateLimited(account.index, retryAfter);
 
       if (logDir) {
-        logSections.push(`=== RESPONSE 429 — waiting ${retryAfter}s ===\n${formatHeaders(upstreamRes.headers)}`);
+        logSections.push(`=== RESPONSE 429 — "${account.name}" rate-limited ${retryAfter}s, failing over ===\n${formatHeaders(upstreamRes.headers)}`);
       }
-      console.log(`[TeamClaude] 429 on "${account.name}" — waiting ${retryAfter}s before retry`);
-      await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
-      // Client may have disconnected during the wait
-      if (res.destroyed) return;
-      return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir);
+      console.log(`[TeamClaude] 429 on "${account.name}" — rate-limited ${retryAfter}s, failing over`);
+
+      if (retryCount < maxRetries && !res.headersSent) {
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+      }
+
+      // Retries exhausted — tell the client to back off.
+      ctx.status = 429;
+      if (logDir) writeRequestLog(logDir, reqId, logSections);
+      if (!res.headersSent) {
+        const clientRetryAfter = computeRetryAfter(accountManager.getStatus().accounts);
+        res.writeHead(429, {
+          'Content-Type': 'application/json',
+          'retry-after': String(clientRetryAfter),
+        });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: {
+            type: 'rate_limit_error',
+            message: `All ${accountManager.accounts.length} accounts rate-limited. Retry in ${clientRetryAfter}s.`,
+          },
+        }));
+      }
+      return;
     }
 
     // Log response headers
