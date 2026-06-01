@@ -91,6 +91,9 @@ export class AccountManager {
       console.log(`[TeamClaude] Account "${account.name}" session quota reset`);
       q.unified5h = null;
       q.unified5hReset = null;
+      // A 'rejected' status is almost always 5h exhaustion — clear it on the 5h
+      // reset too, so a stale rejection can't keep the account excluded.
+      if (q.unifiedStatus === 'rejected') q.unifiedStatus = null;
     }
     if (q.unified7d != null && q.unified7dReset && now >= q.unified7dReset) {
       console.log(`[TeamClaude] Account "${account.name}" weekly quota reset`);
@@ -109,6 +112,9 @@ export class AccountManager {
     }
 
     // Unified quotas (Claude Max) — utilization is already 0-1
+    // An explicit 'rejected' status means upstream is refusing this account now,
+    // even if the reported utilization hasn't crossed the threshold yet.
+    if (q.unifiedStatus === 'rejected') return true;
     if (q.unified5h != null && q.unified5h >= this.switchThreshold) return true;
     if (q.unified7d != null && q.unified7d >= this.switchThreshold) return true;
 
@@ -200,14 +206,18 @@ export class AccountManager {
       account.usage.lastUsed = new Date().toISOString();
     }
 
-    // Log when approaching quota
+    // Log when approaching quota — name the window that actually tripped (the
+    // checks mirror _isNearQuota's order, so the detail matches the trigger).
     if (this._isNearQuota(account)) {
-      const pct = account.quota.unified7d != null
-        ? (account.quota.unified7d * 100).toFixed(1)
-        : account.quota.tokensLimit
-          ? ((1 - account.quota.tokensRemaining / account.quota.tokensLimit) * 100).toFixed(1)
-          : '?';
-      console.log(`[TeamClaude] Account "${account.name}" at ${pct}% usage — will switch on next request`);
+      const q = account.quota;
+      let detail;
+      if (q.unifiedStatus === 'rejected') detail = 'status rejected';
+      else if (q.unified5h != null && q.unified5h >= this.switchThreshold) detail = `5h ${(q.unified5h * 100).toFixed(1)}%`;
+      else if (q.unified7d != null && q.unified7d >= this.switchThreshold) detail = `7d ${(q.unified7d * 100).toFixed(1)}%`;
+      else if (q.tokensLimit != null && q.tokensRemaining != null) detail = `tokens ${((1 - q.tokensRemaining / q.tokensLimit) * 100).toFixed(1)}% used`;
+      else if (q.requestsLimit != null && q.requestsRemaining != null) detail = `requests ${((1 - q.requestsRemaining / q.requestsLimit) * 100).toFixed(1)}% used`;
+      else detail = 'near limit';
+      console.log(`[TeamClaude] Account "${account.name}" near limit (${detail}) — will switch on next request`);
     }
   }
 
@@ -244,14 +254,16 @@ export class AccountManager {
   }
 
   /**
-   * Mark an account as rate-limited for a given duration.
+   * Mark an account as temporarily unavailable for a given duration. `reason`
+   * is purely for the log line (e.g. 'rate limit' for a 429, 'network error'
+   * for a failed/aborted upstream connection).
    */
-  markRateLimited(accountIndex, retryAfterSeconds) {
+  markRateLimited(accountIndex, retryAfterSeconds, reason = 'rate limit') {
     const account = this.accounts[accountIndex];
     if (!account) return;
     account.status = 'throttled';
     account.rateLimitedUntil = Date.now() + (retryAfterSeconds * 1000);
-    console.log(`[TeamClaude] Account "${account.name}" rate limited for ${retryAfterSeconds}s`);
+    console.log(`[TeamClaude] Account "${account.name}" unavailable for ${retryAfterSeconds}s (${reason})`);
   }
 
   /**
