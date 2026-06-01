@@ -185,7 +185,7 @@ async function serverCommand() {
         if (!diskConfig) return 0;
         return syncAccountsFromDisk(diskConfig, config, accountManager);
       },
-      onQuit: () => { prober.stop(); server.close(() => process.exit(0)); },
+      onQuit: () => shutdown(),
     });
     hooks = {
       onRequestStart: (id, info) => tui.onRequestStart(id, info),
@@ -199,6 +199,21 @@ async function serverCommand() {
   hooks.recordPoke = (headers, body) => prober.recordTemplate(headers, body);
 
   const server = createProxyServer(accountManager, config, hooks, { reload: reloadAccounts });
+
+  // Graceful shutdown: stop the prober, close the listener, and force-drop any
+  // in-flight connections. A hung upstream fetch would otherwise keep
+  // server.close() waiting until systemd SIGKILLs us (stop-sigterm timeout).
+  // The timer is a hard backstop in case close()'s callback never fires.
+  let shuttingDown = false;
+  function shutdown(signal) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    if (signal) console.log(`\n[TeamClaude] Shutting down (${signal})...`);
+    prober.stop();
+    server.close(() => process.exit(0));
+    server.closeAllConnections?.();
+    setTimeout(() => process.exit(0), 5000).unref();
+  }
 
   server.listen(port, () => {
     if (tui) {
@@ -228,16 +243,8 @@ async function serverCommand() {
   });
 
   if (!tui) {
-    process.on('SIGINT', () => {
-      prober.stop();
-      console.log('\n[TeamClaude] Shutting down...');
-      server.close(() => process.exit(0));
-    });
-    process.on('SIGTERM', () => {
-      prober.stop();
-      console.log('\n[TeamClaude] Shutting down...');
-      server.close(() => process.exit(0));
-    });
+    process.on('SIGINT', () => shutdown('SIGINT'));
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
     // SIGHUP → reload accounts from config (systemd `ExecReload`, `kill -HUP`)
     process.on('SIGHUP', async () => {
       try {

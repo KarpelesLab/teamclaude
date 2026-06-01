@@ -6,6 +6,7 @@
   "upstream": "https://api.anthropic.com",
   "switchThreshold": 0.98,
   "pokeIntervalMs": 600000,
+  "upstreamTimeoutMs": 60000,
   "accounts": [
     {
       "name": "primary-max",
