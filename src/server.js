@@ -310,21 +310,40 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     }
     accountManager.updateQuota(account.index, rateLimitHeaders);
 
-    // On 429, wait the retry-after duration and retry on the same account
-    // (this is a transient rate limit, not quota exhaustion)
+    // On 429 this account is rate limited. Mark it so rotation skips it until it
+    // resets, then retry on the NEXT account — that's the entire point of a
+    // multi-account proxy. We must NOT block the client's open connection waiting
+    // for retry-after: those windows can be minutes-to-hours, far past the
+    // client's own timeout, which surfaces as an "API timeout" in Claude Code.
     if (upstreamRes.status === 429) {
       const retryAfter = parseInt(upstreamRes.headers.get('retry-after'), 10) || 60;
       // Discard the 429 response body
       await upstreamRes.body?.cancel();
 
       if (logDir) {
-        logSections.push(`=== RESPONSE 429 — waiting ${retryAfter}s ===\n${formatHeaders(upstreamRes.headers)}`);
+        logSections.push(`=== RESPONSE 429 — account "${account.name}" rate limited ${retryAfter}s ===\n${formatHeaders(upstreamRes.headers)}`);
+        writeRequestLog(logDir, reqId, logSections);
       }
-      console.log(`[TeamClaude] 429 on "${account.name}" — waiting ${retryAfter}s before retry`);
-      await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
-      // Client may have disconnected during the wait
-      if (res.destroyed) return;
-      return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir);
+      console.log(`[TeamClaude] 429 on "${account.name}" — rate limited ${retryAfter}s, rotating to next account`);
+      accountManager.markRateLimited(account.index, retryAfter);
+
+      // Retry on the next available account. getActiveAccount() skips the account
+      // we just throttled; if every account is limited it returns null and the
+      // top-of-function guard responds with a 429 + retry-after for the client.
+      if (retryCount < maxRetries && !res.headersSent && !res.destroyed) {
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+      }
+
+      // Retries exhausted with everything limited — tell the client how long to wait.
+      ctx.status = 429;
+      if (!res.headersSent) {
+        res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': String(retryAfter) });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: { type: 'rate_limit_error', message: `All accounts rate limited. Retry in ${retryAfter}s.` },
+        }));
+      }
+      return;
     }
 
     // Log response headers
@@ -377,37 +396,63 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       res.end(buf);
     }
   } catch (err) {
-    console.error(`[TeamClaude] Upstream error (account "${account.name}"):`, err.message);
+    // undici wraps the real reason in err.cause (the bare TypeError just says
+    // "fetch failed"); surface it so transient failures are actually diagnosable.
+    const cause = err?.cause;
+    const causeStr = cause ? (cause.code || cause.message || String(cause)) : '';
+    console.error(`[TeamClaude] Upstream error (account "${account.name}"):`, err.message, causeStr ? `(${causeStr})` : '');
 
     if (logDir) {
-      logSections.push(`=== ERROR ===\n${err.stack || err.message}`);
+      const detail = cause ? `\nCause: ${cause.stack || causeStr}` : '';
+      logSections.push(`=== ERROR ===\n${err.stack || err.message}${detail}`);
       writeRequestLog(logDir, reqId, logSections);
     }
 
+    // The network-level error code lives on err.cause.code for fetch() failures,
+    // not on err.code — check both.
+    const code = err?.code || cause?.code;
     const isTransient = err instanceof Error &&
       (err.message.includes('fetch failed') ||
-        err.code === 'ECONNRESET' || err.code === 'ECONNREFUSED' ||
-        err.code === 'ETIMEDOUT' || err.code === 'UND_ERR_CONNECT_TIMEOUT');
+        err.message.includes('terminated') ||
+        code === 'ECONNRESET' || code === 'ECONNREFUSED' ||
+        code === 'ETIMEDOUT' || code === 'UND_ERR_CONNECT_TIMEOUT' ||
+        code === 'UND_ERR_SOCKET');
 
-    // Transient network errors: just close the connection and let the client retry
-    if (isTransient) {
-      res.destroy();
+    // If we've already started sending a response (mid-stream failure) or the
+    // client has gone away, we can't recover — just finish up.
+    if (res.headersSent || res.destroyed) {
+      if (!res.writableEnded) res.end();
       return;
     }
 
-    if (retryCount < maxRetries && !res.headersSent) {
+    // Transient connection failure (stale keep-alive socket, network blip).
+    // Retrying re-establishes a fresh connection — which is exactly what defeats
+    // a stale pooled socket — so retry the SAME account (the credential is fine,
+    // the connection wasn't). Bounded attempts with short backoff. Crucially we
+    // do NOT res.destroy() the client: dropping the socket is what Claude Code
+    // sees as an "API timeout".
+    if (isTransient && retryCount < maxRetries) {
+      const delay = Math.min(200 * 2 ** retryCount, 2000);
+      await new Promise(resolve => setTimeout(resolve, delay));
+      if (res.destroyed) return;
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+    }
+
+    // Non-transient error: this account/credential may be bad — mark it and try
+    // the next account.
+    if (!isTransient && retryCount < maxRetries) {
       account.status = 'error';
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
     }
-    ctx.status = 502;
 
-    if (!res.headersSent) {
-      res.writeHead(502, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        type: 'error',
-        error: { type: 'proxy_error', message: `Upstream error: ${err.message}` },
-      }));
-    }
+    // Retries exhausted — return a clean, retryable error. Never destroy the
+    // socket; a proper 502 lets the client retry gracefully.
+    ctx.status = 502;
+    res.writeHead(502, { 'Content-Type': 'application/json', 'retry-after': '1' });
+    res.end(JSON.stringify({
+      type: 'error',
+      error: { type: 'proxy_error', message: `Upstream error after ${retryCount + 1} attempt(s): ${err.message}` },
+    }));
   }
 }
 

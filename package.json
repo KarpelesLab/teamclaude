@@ -11,7 +11,8 @@
     "src/"
   ],
   "scripts": {
-    "start": "node src/index.js"
+    "start": "node src/index.js",
+    "test": "node --test"
   },
   "keywords": [
     "claude",
