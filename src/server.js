@@ -8,10 +8,12 @@ const HOP_BY_HOP_HEADERS = new Set([
   'te', 'trailer', 'upgrade', 'proxy-authorization', 'proxy-authenticate',
 ]);
 
-// How long to wait for the upstream to start responding (time-to-first-byte)
-// before aborting and failing over. Bounds hung connections without cutting off
-// a stream once it has started. Overridable via config.upstreamTimeoutMs.
-const DEFAULT_UPSTREAM_TIMEOUT_MS = 60000;
+// Max tolerated upstream silence, in ms. Bounds both the wait for the response
+// head (time-to-first-byte) AND the gap between chunks once a stream is flowing,
+// so a hung connection can't stall the client forever — before or after headers.
+// A healthy stream gets SSE keepalive pings well inside this window, so it only
+// trips on a dead upstream. Overridable via config.upstreamTimeoutMs.
+const DEFAULT_UPSTREAM_TIMEOUT_MS = 30000;
 // Brief cooldown applied to an account after a network-level failure (not a 429),
 // so the immediate failover retry picks a different account and the erroring one
 // auto-recovers shortly after.
@@ -363,10 +365,21 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 
     if (isStreaming) {
       const streamLog = logDir ? [] : null;
-      await streamResponse(upstreamRes.body, res, account.index, accountManager, streamLog);
+      const { upstreamFailed } = await streamResponse(
+        upstreamRes.body, res, account.index, accountManager, streamLog, controller, upstreamTimeoutMs,
+      );
       if (logDir) {
         logSections.push(`=== RESPONSE BODY (streamed) ===\n${streamLog.join('')}`);
         writeRequestLog(logDir, reqId, logSections);
+      }
+      // The stream died mid-flight (upstream reset/terminated, or went silent
+      // past the idle timeout) while the client was still connected. We can't
+      // retry the in-flight request — bytes are already committed — but cool the
+      // account down so the client's reconnect fails over to another account
+      // instead of deterministically re-selecting this same dead one.
+      if (upstreamFailed) {
+        accountManager.markRateLimited(account.index, NETWORK_ERROR_COOLDOWN_S, 'mid-stream error');
+        console.log(`[TeamClaude] Mid-stream failure on "${account.name}" — cooling down ${NETWORK_ERROR_COOLDOWN_S}s; client retry will fail over`);
       }
     } else {
       const buf = Buffer.from(await upstreamRes.arrayBuffer());
@@ -394,9 +407,11 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       writeRequestLog(logDir, reqId, logSections);
     }
 
-    // The response already started streaming — we can't safely retry on another
-    // account, so drop the connection and let the client reconnect.
+    // The response already started — we can't safely retry on another account.
+    // Drop the connection, but cool this account down first so the client's
+    // reconnect fails over instead of landing back on the same failing account.
     if (res.headersSent) {
+      accountManager.markRateLimited(account.index, NETWORK_ERROR_COOLDOWN_S, 'mid-response error');
       res.destroy();
       return;
     }
@@ -424,15 +439,36 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 
 /**
  * Stream an SSE response to the client, parsing usage data along the way.
+ *
+ * `controller` is the request's AbortController and `idleMs` the max tolerated
+ * gap between upstream chunks: if the upstream goes silent that long mid-stream,
+ * we abort the read so a hung connection surfaces as an error instead of
+ * stalling the client forever. Returns `{ upstreamFailed }` — true only when the
+ * stream broke on the upstream side while the client was still connected (so the
+ * caller can cool the account down). A client disconnect is NOT a fault.
  */
-async function streamResponse(webStream, res, accountIndex, accountManager, streamLog) {
+async function streamResponse(webStream, res, accountIndex, accountManager, streamLog, controller, idleMs) {
   const reader = webStream.getReader();
   const decoder = new TextDecoder();
   let sseBuffer = '';
+  let upstreamFailed = false;
+
+  // Idle timer rearmed around each read(): a healthy stream gets SSE pings well
+  // within idleMs, so this only fires on a dead upstream. Not armed during the
+  // backpressure wait below — that's client slowness, not upstream silence.
+  let idleTimer = null;
+  const clearIdle = () => { if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; } };
 
   try {
     while (true) {
-      const { done, value } = await reader.read();
+      if (idleMs) idleTimer = setTimeout(() => controller.abort(), idleMs);
+      let result;
+      try {
+        result = await reader.read();
+      } finally {
+        clearIdle();
+      }
+      const { done, value } = result;
       if (done) break;
 
       // Client disconnected — stop reading from upstream
@@ -470,11 +506,19 @@ async function streamResponse(webStream, res, accountIndex, accountManager, stre
     if (sseBuffer.trim()) {
       parseSSEUsage(sseBuffer, accountIndex, accountManager);
     }
+  } catch {
+    // Upstream read rejected mid-stream (reset, undici "terminated", or our own
+    // idle-timeout abort). Only a fault if the client is still here — a client
+    // disconnect can also reject the read, and that's not the account's problem.
+    if (!res.destroyed) upstreamFailed = true;
   } finally {
+    clearIdle();
     // Cancel upstream reader to stop consuming data nobody needs
     reader.cancel().catch(() => {});
     if (!res.writableEnded) res.end();
   }
+
+  return { upstreamFailed };
 }
 
 function parseSSEUsage(event, accountIndex, accountManager) {
