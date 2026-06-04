@@ -8,12 +8,19 @@ const HOP_BY_HOP_HEADERS = new Set([
   'te', 'trailer', 'upgrade', 'proxy-authorization', 'proxy-authenticate',
 ]);
 
-// Max tolerated upstream silence, in ms. Bounds both the wait for the response
-// head (time-to-first-byte) AND the gap between chunks once a stream is flowing,
-// so a hung connection can't stall the client forever — before or after headers.
-// A healthy stream gets SSE keepalive pings well inside this window, so it only
-// trips on a dead upstream. Overridable via config.upstreamTimeoutMs.
+// Max tolerated silence between SSE chunks once a stream is flowing. A healthy
+// stream gets Anthropic keepalive pings well within this window, so it only
+// trips on a dead mid-stream upstream. Overridable via config.upstreamTimeoutMs.
 const DEFAULT_UPSTREAM_TIMEOUT_MS = 30000;
+
+// Max wait for the first response byte (TTFB) — distinct from the inter-chunk
+// idle timeout above. Large-context requests (1M-token beta, multi-MB bodies)
+// can take well over 30s just for prefill before Anthropic emits the first SSE
+// event, which would wrongly trip the inter-chunk timer. This longer ceiling
+// applies only to the pre-header wait; once streaming starts the tighter
+// DEFAULT_UPSTREAM_TIMEOUT_MS governs chunk gaps. Overridable via config.ttfbTimeoutMs.
+const DEFAULT_TTFB_TIMEOUT_MS = 120000;
+
 // Brief cooldown applied to an account after a network-level failure (not a 429),
 // so the immediate failover retry picks a different account and the erroring one
 // auto-recovers shortly after.
@@ -24,6 +31,7 @@ export function createProxyServer(accountManager, config, hooks = {}, admin = {}
   const proxyApiKey = config.proxy?.apiKey;
   const logDir = config.logDir || null;
   const upstreamTimeoutMs = config.upstreamTimeoutMs ?? DEFAULT_UPSTREAM_TIMEOUT_MS;
+  const ttfbTimeoutMs = config.ttfbTimeoutMs ?? DEFAULT_TTFB_TIMEOUT_MS;
   let requestCounter = 0;
 
   if (logDir) {
@@ -95,7 +103,7 @@ export function createProxyServer(accountManager, config, hooks = {}, admin = {}
 
       const ctx = { account: null, status: null };
       try {
-        await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir, upstreamTimeoutMs);
+        await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir, upstreamTimeoutMs, ttfbTimeoutMs);
       } catch (err) {
         ctx.status = ctx.status || 502;
         console.error('[TeamClaude] Unhandled error:', err);
@@ -181,7 +189,7 @@ function formatHeaders(headers) {
   return Object.entries(headers).map(([k, v]) => `  ${k}: ${v}`).join('\n');
 }
 
-async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, upstreamTimeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS) {
+async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, upstreamTimeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS, ttfbTimeoutMs = DEFAULT_TTFB_TIMEOUT_MS) {
   const maxRetries = accountManager.accounts.length;
 
   // Select account
@@ -212,7 +220,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   // Refresh OAuth token if needed
   await accountManager.ensureTokenFresh(account.index);
   if (account.status === 'error' && retryCount < maxRetries) {
-    return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, upstreamTimeoutMs);
+    return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, upstreamTimeoutMs, ttfbTimeoutMs);
   }
 
   // Build upstream request headers
@@ -260,11 +268,15 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     }
   }
 
-  // Bound time-to-first-byte so a hung upstream can't stall the request forever
-  // (no failover, no log). Cleared the moment headers arrive, so a long stream is
-  // never cut off — only the wait for the response head is bounded.
+  // Bound time-to-first-byte. Uses ttfbTimeoutMs (default 120s), not the tighter
+  // inter-chunk idle timeout — large-context requests (1M-token beta, multi-MB
+  // bodies) can legitimately take >30s of prefill before Anthropic emits the
+  // first SSE event, so the TTFB ceiling must be more generous than the chunk
+  // gap ceiling. Cleared the moment headers arrive; only the wait for the first
+  // byte is bounded here — inter-chunk silence is bounded inside streamResponse.
   const controller = new AbortController();
-  const ttfbTimer = setTimeout(() => controller.abort(), upstreamTimeoutMs);
+  const activeTtfbMs = ttfbTimeoutMs;
+  const ttfbTimer = setTimeout(() => controller.abort(), activeTtfbMs);
 
   try {
     const upstreamRes = await fetch(upstreamUrl, {
@@ -303,7 +315,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       console.log(`[TeamClaude] 429 on "${account.name}" — rate-limited ${retryAfter}s, failing over`);
 
       if (retryCount < maxRetries && !res.headersSent) {
-        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, upstreamTimeoutMs);
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, upstreamTimeoutMs, ttfbTimeoutMs);
       }
 
       // Retries exhausted — tell the client to back off.
@@ -398,7 +410,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     clearTimeout(ttfbTimer);
     // Our own TTFB abort reads better as a timeout than as a bare "aborted".
     const reason = err?.name === 'AbortError'
-      ? `no response within ${Math.round(upstreamTimeoutMs / 1000)}s`
+      ? `no response within ${Math.round(activeTtfbMs / 1000)}s (TTFB timeout)`
       : (err?.message || 'unknown error');
     console.error(`[TeamClaude] Upstream error (account "${account.name}"): ${reason}`);
 
@@ -424,7 +436,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     if (retryCount < maxRetries) {
       accountManager.markRateLimited(account.index, NETWORK_ERROR_COOLDOWN_S, 'network error');
       console.log(`[TeamClaude] Upstream error on "${account.name}" (${reason}) — cooling down ${NETWORK_ERROR_COOLDOWN_S}s, failing over`);
-      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, upstreamTimeoutMs);
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, upstreamTimeoutMs, ttfbTimeoutMs);
     }
 
     // Every account failed — return a clean error for the client to back off on.
