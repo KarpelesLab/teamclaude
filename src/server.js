@@ -11,7 +11,7 @@ const HOP_BY_HOP_HEADERS = new Set([
 // Max tolerated silence between SSE chunks once a stream is flowing. A healthy
 // stream gets Anthropic keepalive pings well within this window, so it only
 // trips on a dead mid-stream upstream. Overridable via config.upstreamTimeoutMs.
-const DEFAULT_UPSTREAM_TIMEOUT_MS = 30000;
+const DEFAULT_UPSTREAM_TIMEOUT_MS = 600000;
 
 // Max wait for the first response byte (TTFB) — distinct from the inter-chunk
 // idle timeout above. Large-context requests (1M-token beta, multi-MB bodies)
@@ -19,7 +19,7 @@ const DEFAULT_UPSTREAM_TIMEOUT_MS = 30000;
 // event, which would wrongly trip the inter-chunk timer. This longer ceiling
 // applies only to the pre-header wait; once streaming starts the tighter
 // DEFAULT_UPSTREAM_TIMEOUT_MS governs chunk gaps. Overridable via config.ttfbTimeoutMs.
-const DEFAULT_TTFB_TIMEOUT_MS = 120000;
+const DEFAULT_TTFB_TIMEOUT_MS = 600000;
 
 // Brief cooldown applied to an account after a network-level failure (not a 429),
 // so the immediate failover retry picks a different account and the erroring one
