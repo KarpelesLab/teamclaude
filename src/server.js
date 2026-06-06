@@ -148,7 +148,16 @@ export function createProxyServer(accountManager, config, hooks = {}, admin = {}
         }
       } finally {
         const elapsedMs = Date.now() - startTime;
-        console.log(`[TeamClaude] req=${reqId} ${req.method} ${req.url} -> ${ctx.account || 'NONE'} | status=${ctx.status} | time=${elapsedMs}ms`);
+        let reqModel = '';
+        if (body.length > 0) {
+          try {
+            const parsed = JSON.parse(body.toString());
+            if (parsed.model) reqModel = ` | model=${parsed.model}`;
+          } catch (e) {
+            // Ignore parse errors if body is not JSON
+          }
+        }
+        console.log(`[TeamClaude] req=${reqId} ${req.method} ${req.url} -> ${ctx.account || 'NONE'}${reqModel} | status=${ctx.status} | time=${elapsedMs}ms`);
         hooks.onRequestEnd?.(reqId, {
           method: req.method, path: req.url,
           account: ctx.account, status: ctx.status,
