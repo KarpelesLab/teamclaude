@@ -344,6 +344,17 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       return;
     }
 
+    if (upstreamRes.status >= 500) {
+      await upstreamRes.body?.cancel();
+      accountManager.markTransientFailure(account.index, `upstream ${upstreamRes.status}`);
+      if (logDir) logSections.push(`=== RESPONSE ${upstreamRes.status} — "${account.name}" upstream error, failing over ===\n${formatHeaders(upstreamRes.headers)}`);
+
+      if (retryCount < maxRetries && !res.headersSent && Date.now() < opts.deadline) {
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, opts);
+      }
+      // If we exhaust all retries or deadline, fall through to returning the 5xx response to the client
+    }
+
     accountManager.noteUpstreamResponse(account.index);
     if (logDir) logSections.push(`=== RESPONSE ${upstreamRes.status} ===\n${formatHeaders(upstreamRes.headers)}`);
     ctx.status = upstreamRes.status;
