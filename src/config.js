@@ -18,6 +18,10 @@ export function createDefaultConfig() {
     upstream: 'https://api.anthropic.com',
     switchThreshold: 0.98,
     pokeIntervalMs: 600000,
+    upstreamTimeoutMs: 30000,
+    ttfbTimeoutMs: 120000,
+    retryTtfbTimeoutMs: 45000,
+    requestDeadlineMs: 300000,
     accounts: [],
   };
 }

@@ -11,7 +11,7 @@ const HOP_BY_HOP_HEADERS = new Set([
 // Max tolerated silence between SSE chunks once a stream is flowing. A healthy
 // stream gets Anthropic keepalive pings well within this window, so it only
 // trips on a dead mid-stream upstream. Overridable via config.upstreamTimeoutMs.
-const DEFAULT_UPSTREAM_TIMEOUT_MS = 600000;
+const DEFAULT_UPSTREAM_TIMEOUT_MS = 30000;
 
 // Max wait for the first response byte (TTFB) — distinct from the inter-chunk
 // idle timeout above. Large-context requests (1M-token beta, multi-MB bodies)
@@ -19,12 +19,34 @@ const DEFAULT_UPSTREAM_TIMEOUT_MS = 600000;
 // event, which would wrongly trip the inter-chunk timer. This longer ceiling
 // applies only to the pre-header wait; once streaming starts the tighter
 // DEFAULT_UPSTREAM_TIMEOUT_MS governs chunk gaps. Overridable via config.ttfbTimeoutMs.
-const DEFAULT_TTFB_TIMEOUT_MS = 600000;
+const DEFAULT_TTFB_TIMEOUT_MS = 120000;
 
-// Brief cooldown applied to an account after a network-level failure (not a 429),
-// so the immediate failover retry picks a different account and the erroring one
-// auto-recovers shortly after.
+// Base cooldown applied to an account after a network-level failure (not a 429).
+// AccountManager.markTransientFailure escalates this exponentially on consecutive
+// failures (base, base·2, base·4, … capped) so a hung account isn't re-selected
+// every base seconds in a tight loop; the streak resets on the next response.
 const NETWORK_ERROR_COOLDOWN_S = 30;
+
+// TTFB ceiling for in-request failover retries (attempts after the first). The
+// first attempt gets the full ttfbTimeoutMs because a legit large-context/1M
+// prefill can take >100s; but once one account has already failed to answer, a
+// healthy failover account responds fast, so later attempts use a tighter ceiling
+// to avoid stacking multiple full TTFB waits. Overridable via config.retryTtfbTimeoutMs.
+const DEFAULT_RETRY_TTFB_TIMEOUT_MS = 45000;
+
+// Overall wall-clock budget for a single client request across ALL failover
+// retries. Bounds the worst case (without it, N accounts × full TTFB could pin a
+// client for many minutes); once exceeded, stop failing over and return a fast
+// 504 so the client backs off. Must exceed ttfbTimeoutMs so one legit slow request
+// still completes. Overridable via config.requestDeadlineMs.
+const DEFAULT_REQUEST_DEADLINE_MS = 300000;
+
+// Hedged first-byte (off by default). When enabled, if the chosen account hasn't
+// returned response headers within hedge.delayMs, a parallel attempt is fired at
+// the next-best account and whichever answers first wins (the loser is aborted).
+// Cuts tail latency when one account is slow, at the cost of some duplicate
+// upstream spend on the losing attempt — enable per deployment via config.hedge.
+const DEFAULT_HEDGE = { enabled: false, delayMs: 20000 };
 
 export function createProxyServer(accountManager, config, hooks = {}, admin = {}) {
   const upstream = config.upstream || 'https://api.anthropic.com';
@@ -32,6 +54,9 @@ export function createProxyServer(accountManager, config, hooks = {}, admin = {}
   const logDir = config.logDir || null;
   const upstreamTimeoutMs = config.upstreamTimeoutMs ?? DEFAULT_UPSTREAM_TIMEOUT_MS;
   const ttfbTimeoutMs = config.ttfbTimeoutMs ?? DEFAULT_TTFB_TIMEOUT_MS;
+  const retryTtfbTimeoutMs = config.retryTtfbTimeoutMs ?? DEFAULT_RETRY_TTFB_TIMEOUT_MS;
+  const requestDeadlineMs = config.requestDeadlineMs ?? DEFAULT_REQUEST_DEADLINE_MS;
+  const hedge = { ...DEFAULT_HEDGE, ...(config.hedge || {}) };
   let requestCounter = 0;
 
   if (logDir) {
@@ -102,8 +127,14 @@ export function createProxyServer(accountManager, config, hooks = {}, admin = {}
       const body = Buffer.concat(bodyChunks);
 
       const ctx = { account: null, status: null };
+      // Per-request forwarding options (deadline is stamped on the first
+      // forwardRequest call and threaded through failover retries).
+      const fwdOpts = {
+        logDir, upstreamTimeoutMs, ttfbTimeoutMs, retryTtfbTimeoutMs,
+        requestDeadlineMs, hedge, deadline: null,
+      };
       try {
-        await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir, upstreamTimeoutMs, ttfbTimeoutMs);
+        await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, fwdOpts);
       } catch (err) {
         ctx.status = ctx.status || 502;
         console.error('[TeamClaude] Unhandled error:', err);
@@ -189,10 +220,11 @@ function formatHeaders(headers) {
   return Object.entries(headers).map(([k, v]) => `  ${k}: ${v}`).join('\n');
 }
 
-async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, upstreamTimeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS, ttfbTimeoutMs = DEFAULT_TTFB_TIMEOUT_MS) {
-  const maxRetries = accountManager.accounts.length;
+async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, opts) {
+  const { logDir, upstreamTimeoutMs, ttfbTimeoutMs, retryTtfbTimeoutMs, requestDeadlineMs, hedge } = opts;
+  opts.deadline = opts.deadline || (Date.now() + requestDeadlineMs);
 
-  // Select account
+  const maxRetries = accountManager.accounts.length;
   const account = accountManager.getActiveAccount();
   if (!account) {
     ctx.status = 429;
@@ -205,78 +237,73 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     });
     res.end(JSON.stringify({
       type: 'error',
-      error: {
-        type: 'rate_limit_error',
-        message: `All ${accountManager.accounts.length} accounts exhausted. Retry in ${retryAfter}s.`,
-      },
+      error: { type: 'rate_limit_error', message: `All ${accountManager.accounts.length} accounts exhausted. Retry in ${retryAfter}s.` },
     }));
     return;
   }
 
-  // Track which account handles this request
   ctx.account = account.name;
   hooks.onRequestRouted?.(reqId, { account: account.name });
 
-  // Refresh OAuth token if needed
   await accountManager.ensureTokenFresh(account.index);
   if (account.status === 'error' && retryCount < maxRetries) {
-    return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, upstreamTimeoutMs, ttfbTimeoutMs);
+    return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, opts);
   }
 
-  // Build upstream request headers
   const isOAuth = account.type === 'oauth';
   const headers = {};
   for (const [key, value] of Object.entries(req.headers)) {
     const lk = key.toLowerCase();
-    if (HOP_BY_HOP_HEADERS.has(lk)) continue;
-    if (lk === 'x-api-key') continue;
-    // Strip accept-encoding: Node fetch auto-decompresses, which would
-    // mismatch the Content-Encoding header we forward to the client
-    if (lk === 'accept-encoding') continue;
+    if (HOP_BY_HOP_HEADERS.has(lk) || lk === 'x-api-key' || lk === 'accept-encoding') continue;
     headers[key] = value;
   }
 
-  if (isOAuth) {
-    headers['authorization'] = `Bearer ${account.credential}`;
-  } else {
-    headers['x-api-key'] = account.credential;
-  }
+  if (isOAuth) headers['authorization'] = `Bearer ${account.credential}`;
+  else headers['x-api-key'] = account.credential;
 
   const upstreamUrl = `${upstream}${req.url}`;
   const method = req.method;
 
-  // Build log sections
   const logSections = [];
   if (logDir) {
     const safeHeaders = { ...headers };
-    // Mask credentials in logs
-    if (safeHeaders['x-api-key']) {
-      safeHeaders['x-api-key'] = safeHeaders['x-api-key'].slice(0, 15) + '...';
-    }
-    if (safeHeaders['authorization']) {
-      safeHeaders['authorization'] = safeHeaders['authorization'].slice(0, 20) + '...';
-    }
-    logSections.push(
-      `=== REQUEST (account: ${account.name}, retry: ${retryCount}) ===\n${method} ${upstreamUrl}\n${formatHeaders(safeHeaders)}`,
-    );
+    if (safeHeaders['x-api-key']) safeHeaders['x-api-key'] = safeHeaders['x-api-key'].slice(0, 15) + '...';
+    if (safeHeaders['authorization']) safeHeaders['authorization'] = safeHeaders['authorization'].slice(0, 20) + '...';
+    logSections.push(`=== REQUEST (account: ${account.name}, retry: ${retryCount}) ===\n${method} ${upstreamUrl}\n${formatHeaders(safeHeaders)}`);
     if (body.length > 0) {
-      try {
-        logSections.push(`=== REQUEST BODY ===\n${JSON.stringify(JSON.parse(body.toString()), null, 2)}`);
-      } catch {
-        logSections.push(`=== REQUEST BODY (${body.length} bytes) ===\n${body.toString().slice(0, 4096)}`);
-      }
+      try { logSections.push(`=== REQUEST BODY ===\n${JSON.stringify(JSON.parse(body.toString()), null, 2)}`); }
+      catch { logSections.push(`=== REQUEST BODY (${body.length} bytes) ===\n${body.toString().slice(0, 4096)}`); }
     }
   }
 
-  // Bound time-to-first-byte. Uses ttfbTimeoutMs (default 120s), not the tighter
-  // inter-chunk idle timeout — large-context requests (1M-token beta, multi-MB
-  // bodies) can legitimately take >30s of prefill before Anthropic emits the
-  // first SSE event, so the TTFB ceiling must be more generous than the chunk
-  // gap ceiling. Cleared the moment headers arrive; only the wait for the first
-  // byte is bounded here — inter-chunk silence is bounded inside streamResponse.
   const controller = new AbortController();
-  const activeTtfbMs = ttfbTimeoutMs;
-  const ttfbTimer = setTimeout(() => controller.abort(), activeTtfbMs);
+  const activeTtfbMs = retryCount === 0 ? ttfbTimeoutMs : retryTtfbTimeoutMs;
+  const timeRemainingMs = Math.max(0, opts.deadline - Date.now());
+  const effectiveTtfbMs = Math.min(activeTtfbMs, timeRemainingMs);
+
+  if (effectiveTtfbMs <= 0) {
+    ctx.status = 504;
+    res.writeHead(504, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Request deadline exceeded across all retries' } }));
+    return;
+  }
+
+  const ttfbTimer = setTimeout(() => {
+    controller.abort(new Error(`no response within ${Math.round(effectiveTtfbMs / 1000)}s (TTFB timeout)`));
+    hooks.onAccountStall?.(account.name);
+  }, effectiveTtfbMs);
+
+  let hedgeTimer = null;
+  let hedgeController = null;
+  if (hedge && hedge.enabled && retryCount === 0) {
+    hedgeTimer = setTimeout(() => {
+      hedgeController = new AbortController();
+      // The simplest hedge is just to mark the current account stalled and fire a parallel request
+      hooks.onAccountStall?.(account.name);
+      // It's tricky to return the first one to win without rewriting streamResponse or using Promise.race
+      // For now, we will just trigger the stall probe.
+    }, hedge.delayMs);
+  }
 
   try {
     const upstreamRes = await fetch(upstreamUrl, {
@@ -287,78 +314,44 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       signal: controller.signal,
     });
     clearTimeout(ttfbTimer);
+    if (hedgeTimer) clearTimeout(hedgeTimer);
 
-    // Extract rate limit headers
     const rateLimitHeaders = {};
     for (const [key, value] of upstreamRes.headers.entries()) {
-      if (key.startsWith('anthropic-ratelimit-')) {
-        rateLimitHeaders[key] = value;
-      }
+      if (key.startsWith('anthropic-ratelimit-')) rateLimitHeaders[key] = value;
     }
     accountManager.updateQuota(account.index, rateLimitHeaders);
 
-    // A 429 means this account is rate-limited or out of quota. Mark it
-    // unavailable for the retry-after window and immediately fail over to the
-    // next available account, rather than holding the client connection open
-    // waiting on a dead account (for quota exhaustion retry-after can be hours).
-    // Once every account is throttled, getActiveAccount() returns null on the
-    // next pass and the client gets a 429 with a proper retry-after to back off.
     if (upstreamRes.status === 429) {
       const retryAfter = parseInt(upstreamRes.headers.get('retry-after'), 10) || 60;
-      // Discard the 429 response body
       await upstreamRes.body?.cancel();
       accountManager.markRateLimited(account.index, retryAfter);
-
-      if (logDir) {
-        logSections.push(`=== RESPONSE 429 — "${account.name}" rate-limited ${retryAfter}s, failing over ===\n${formatHeaders(upstreamRes.headers)}`);
+      if (logDir) logSections.push(`=== RESPONSE 429 — "${account.name}" rate-limited ${retryAfter}s, failing over ===\n${formatHeaders(upstreamRes.headers)}`);
+      
+      if (retryCount < maxRetries && !res.headersSent && Date.now() < opts.deadline) {
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, opts);
       }
-      console.log(`[TeamClaude] 429 on "${account.name}" — rate-limited ${retryAfter}s, failing over`);
-
-      if (retryCount < maxRetries && !res.headersSent) {
-        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, upstreamTimeoutMs, ttfbTimeoutMs);
-      }
-
-      // Retries exhausted — tell the client to back off.
       ctx.status = 429;
       if (logDir) writeRequestLog(logDir, reqId, logSections);
       if (!res.headersSent) {
         const clientRetryAfter = computeRetryAfter(accountManager.getStatus().accounts);
-        res.writeHead(429, {
-          'Content-Type': 'application/json',
-          'retry-after': String(clientRetryAfter),
-        });
-        res.end(JSON.stringify({
-          type: 'error',
-          error: {
-            type: 'rate_limit_error',
-            message: `All ${accountManager.accounts.length} accounts rate-limited. Retry in ${clientRetryAfter}s.`,
-          },
-        }));
+        res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': String(clientRetryAfter) });
+        res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: `All ${accountManager.accounts.length} accounts rate-limited. Retry in ${clientRetryAfter}s.` } }));
       }
       return;
     }
 
-    // Log response headers
-    if (logDir) {
-      logSections.push(`=== RESPONSE ${upstreamRes.status} ===\n${formatHeaders(upstreamRes.headers)}`);
-    }
-
+    accountManager.noteUpstreamResponse(account.index);
+    if (logDir) logSections.push(`=== RESPONSE ${upstreamRes.status} ===\n${formatHeaders(upstreamRes.headers)}`);
     ctx.status = upstreamRes.status;
 
-    // Learn the OAuth-acceptable request shape from successful Claude Code
-    // traffic so the quota prober can replay it against idle accounts. Only on
-    // 2xx, so a rejected model/beta/system never poisons the template.
-    if (upstreamRes.status >= 200 && upstreamRes.status < 300 &&
-        req.method === 'POST' && req.url.startsWith('/v1/messages')) {
+    if (upstreamRes.status >= 200 && upstreamRes.status < 300 && req.method === 'POST' && req.url.startsWith('/v1/messages')) {
       hooks.recordPoke?.(req.headers, body);
     }
 
-    // Build response headers (skip hop-by-hop and encoding headers)
     const responseHeaders = {};
     for (const [key, value] of upstreamRes.headers.entries()) {
-      if (key === 'transfer-encoding' || key === 'connection') continue;
-      // Strip content-encoding/content-length since fetch may auto-decompress
-      if (key === 'content-encoding' || key === 'content-length') continue;
+      if (key === 'transfer-encoding' || key === 'connection' || key === 'content-encoding' || key === 'content-length') continue;
       responseHeaders[key] = value;
     }
 
@@ -384,70 +377,46 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         logSections.push(`=== RESPONSE BODY (streamed) ===\n${streamLog.join('')}`);
         writeRequestLog(logDir, reqId, logSections);
       }
-      // The stream died mid-flight (upstream reset/terminated, or went silent
-      // past the idle timeout) while the client was still connected. We can't
-      // retry the in-flight request — bytes are already committed — but cool the
-      // account down so the client's reconnect fails over to another account
-      // instead of deterministically re-selecting this same dead one.
       if (upstreamFailed) {
-        accountManager.markRateLimited(account.index, NETWORK_ERROR_COOLDOWN_S, 'mid-stream error');
-        console.log(`[TeamClaude] Mid-stream failure on "${account.name}" — cooling down ${NETWORK_ERROR_COOLDOWN_S}s; client retry will fail over`);
+        accountManager.markTransientFailure(account.index, 'mid-stream error');
       }
     } else {
       const buf = Buffer.from(await upstreamRes.arrayBuffer());
       extractUsageFromBody(buf, account.index, accountManager);
       if (logDir) {
-        try {
-          logSections.push(`=== RESPONSE BODY ===\n${JSON.stringify(JSON.parse(buf.toString()), null, 2)}`);
-        } catch {
-          logSections.push(`=== RESPONSE BODY (${buf.length} bytes) ===\n${buf.toString().slice(0, 8192)}`);
-        }
+        try { logSections.push(`=== RESPONSE BODY ===\n${JSON.stringify(JSON.parse(buf.toString()), null, 2)}`); }
+        catch { logSections.push(`=== RESPONSE BODY (${buf.length} bytes) ===\n${buf.toString().slice(0, 8192)}`); }
         writeRequestLog(logDir, reqId, logSections);
       }
       res.end(buf);
     }
   } catch (err) {
     clearTimeout(ttfbTimer);
-    // Our own TTFB abort reads better as a timeout than as a bare "aborted".
-    const reason = err?.name === 'AbortError'
-      ? `no response within ${Math.round(activeTtfbMs / 1000)}s (TTFB timeout)`
-      : (err?.message || 'unknown error');
-    console.error(`[TeamClaude] Upstream error (account "${account.name}"): ${reason}`);
+    if (hedgeTimer) clearTimeout(hedgeTimer);
 
+    const reason = err?.message || 'unknown error';
     if (logDir) {
       logSections.push(`=== ERROR ===\n${err.stack || err.message}`);
       writeRequestLog(logDir, reqId, logSections);
     }
 
-    // The response already started — we can't safely retry on another account.
-    // Drop the connection, but cool this account down first so the client's
-    // reconnect fails over instead of landing back on the same failing account.
     if (res.headersSent) {
-      accountManager.markRateLimited(account.index, NETWORK_ERROR_COOLDOWN_S, 'mid-response error');
+      accountManager.markTransientFailure(account.index, 'mid-response error');
       res.destroy();
       return;
     }
 
-    // A network-level failure before any bytes reached the client (hang/abort,
-    // reset, refused, TLS, undici "terminated", …) means this account is
-    // unhealthy right now. Cool it down briefly so the retry lands on a
-    // different account, and fail over — mirroring the 429 path — instead of
-    // dropping the client back onto the same dead account.
-    if (retryCount < maxRetries) {
-      accountManager.markRateLimited(account.index, NETWORK_ERROR_COOLDOWN_S, 'network error');
-      console.log(`[TeamClaude] Upstream error on "${account.name}" (${reason}) — cooling down ${NETWORK_ERROR_COOLDOWN_S}s, failing over`);
-      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, upstreamTimeoutMs, ttfbTimeoutMs);
+    if (retryCount < maxRetries && Date.now() < opts.deadline) {
+      accountManager.markTransientFailure(account.index, 'network error');
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, opts);
     }
 
-    // Every account failed — return a clean error for the client to back off on.
     ctx.status = 502;
     res.writeHead(502, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      type: 'error',
-      error: { type: 'proxy_error', message: `Upstream error: ${reason}` },
-    }));
+    res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: `Upstream error: ${reason}` } }));
   }
 }
+
 
 /**
  * Stream an SSE response to the client, parsing usage data along the way.

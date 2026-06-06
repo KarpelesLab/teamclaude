@@ -93,7 +93,10 @@ async function serverCommand() {
   }
 
   const threshold = config.switchThreshold || 0.98;
-  const accountManager = new AccountManager(accounts, threshold);
+  const accountManager = new AccountManager(accounts, threshold, {
+    transientCooldownBaseS: config.transientCooldownBaseS,
+    transientCooldownCapS: config.transientCooldownCapS
+  });
 
   // Persist refreshed tokens back to config (re-read from disk to avoid clobbering
   // accounts added externally, e.g. by `teamclaude import` while server is running)
@@ -197,6 +200,11 @@ async function serverCommand() {
   // Feed real /v1/messages traffic to the prober so it can learn the
   // OAuth-acceptable request shape (works in both TUI and headless modes).
   hooks.recordPoke = (headers, body) => prober.recordTemplate(headers, body);
+
+  hooks.onAccountStall = (accountName) => {
+    const idx = accountManager.accounts.findIndex(a => a.name === accountName);
+    if (idx >= 0) prober.pokeAccount(idx).catch(() => {});
+  };
 
   const server = createProxyServer(accountManager, config, hooks, { reload: reloadAccounts });
 
