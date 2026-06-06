@@ -352,6 +352,17 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       if (retryCount < maxRetries && !res.headersSent && Date.now() < opts.deadline) {
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, opts);
       }
+      
+      if (upstreamRes.status === 529 && !res.headersSent) {
+        ctx.status = 529;
+        if (logDir) writeRequestLog(logDir, reqId, logSections);
+        res.writeHead(529, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ 
+          type: 'error', 
+          error: { type: 'overloaded_error', message: 'Anthropic is overloaded (529). Your context window might be too large for the current load. Try running /compact to shrink the conversation.' } 
+        }));
+        return;
+      }
       // If we exhaust all retries or deadline, fall through to returning the 5xx response to the client
     }
 
