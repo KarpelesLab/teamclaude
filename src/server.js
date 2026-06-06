@@ -371,7 +371,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         res.writeHead(529, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ 
           type: 'error', 
-          error: { type: 'overloaded_error', message: 'Anthropic is overloaded (529). Your context window might be too large for the current load. Try running /compact to shrink the conversation and avoid these 529s.' } 
+          error: { type: 'overloaded_error', message: 'Anthropic is overloaded (529). Your context window might be too large for the current load. Try running /compact to shrink the conversation, or switch to a smaller model, to avoid these 529s.' } 
         }));
         return;
       }
