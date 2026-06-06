@@ -18,7 +18,7 @@ function emptyQuota() {
 }
 
 export class AccountManager {
-  constructor(accounts, switchThreshold = 0.98) {
+  constructor(accounts, switchThreshold = 0.98, opts = {}) {
     this.accounts = accounts.map((acct, index) => ({
       index,
       name: acct.name,
@@ -31,6 +31,7 @@ export class AccountManager {
       refreshToken: acct.refreshToken || null,
       expiresAt: acct.expiresAt || null,
       status: 'active',
+      consecutiveFailures: 0,
       quota: emptyQuota(),
       lastQuotaAt: null,
       usage: {
@@ -43,6 +44,30 @@ export class AccountManager {
     }));
     this.currentIndex = 0;
     this.switchThreshold = switchThreshold;
+    this.transientCooldownBaseS = opts.transientCooldownBaseS || 5;
+    this.transientCooldownCapS = opts.transientCooldownCapS || 60;
+  }
+
+  markTransientFailure(index, reason) {
+    const acct = this.accounts[index];
+    if (!acct) return;
+    acct.consecutiveFailures = (acct.consecutiveFailures || 0) + 1;
+    const cooldownS = Math.min(
+      this.transientCooldownCapS,
+      this.transientCooldownBaseS * Math.pow(2, acct.consecutiveFailures - 1)
+    );
+    acct.status = 'throttled';
+    acct.rateLimitedUntil = Date.now() + (cooldownS * 1000);
+    console.warn(`[TeamClaude] Transient failure on "${acct.name}" (${reason}). Cooldown: ${cooldownS}s`);
+  }
+
+  noteUpstreamResponse(index) {
+    const acct = this.accounts[index];
+    if (!acct) return;
+    if (acct.consecutiveFailures > 0) {
+      console.log(`[TeamClaude] Account "${acct.name}" recovered from transient failures`);
+      acct.consecutiveFailures = 0;
+    }
   }
 
   /**
