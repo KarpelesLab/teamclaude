@@ -350,6 +350,9 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       if (logDir) logSections.push(`=== RESPONSE ${upstreamRes.status} — "${account.name}" upstream error, failing over ===\n${formatHeaders(upstreamRes.headers)}`);
 
       if (retryCount < maxRetries && !res.headersSent && Date.now() < opts.deadline) {
+        // Add a brief backoff delay before hitting the next account to avoid bursting
+        // Anthropic with rapid-fire retries and risking an account ban.
+        await new Promise(resolve => setTimeout(resolve, 1500));
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, opts);
       }
       
