@@ -133,6 +133,7 @@ export function createProxyServer(accountManager, config, hooks = {}, admin = {}
         logDir, upstreamTimeoutMs, ttfbTimeoutMs, retryTtfbTimeoutMs,
         requestDeadlineMs, hedge, deadline: null,
       };
+      const startTime = Date.now();
       try {
         await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, fwdOpts);
       } catch (err) {
@@ -146,6 +147,8 @@ export function createProxyServer(accountManager, config, hooks = {}, admin = {}
           }));
         }
       } finally {
+        const elapsedMs = Date.now() - startTime;
+        console.log(`[TeamClaude] req=${reqId} ${req.method} ${req.url} -> ${ctx.account || 'NONE'} | status=${ctx.status} | time=${elapsedMs}ms`);
         hooks.onRequestEnd?.(reqId, {
           method: req.method, path: req.url,
           account: ctx.account, status: ctx.status,
