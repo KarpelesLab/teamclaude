@@ -51,7 +51,9 @@ const DEFAULT_HEDGE = { enabled: false, delayMs: 20000 };
 const degradedModels = new Map();
 const FALLBACK_MAP = {
   'claude-opus-4-8': 'claude-opus-4-7',
-  'claude-3-5-sonnet-20241022': 'claude-3-5-sonnet-20240620'
+  'claude-3-5-sonnet-20241022': 'claude-3-5-sonnet-20240620',
+  'claude-3-5-sonnet-20240620': 'claude-3-5-haiku-20241022',
+  'claude-3-5-haiku-20241022': 'claude-3-haiku-20240307'
 };
 
 export function createProxyServer(accountManager, config, hooks = {}, admin = {}) {
