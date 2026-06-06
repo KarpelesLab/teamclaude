@@ -203,7 +203,7 @@ async function serverCommand() {
 
   hooks.onAccountStall = (accountName) => {
     const idx = accountManager.accounts.findIndex(a => a.name === accountName);
-    if (idx >= 0) prober.pokeAccount(idx).catch(() => {});
+    if (idx >= 0) prober._poke(accountManager.accounts[idx]).catch(() => {});
   };
 
   const server = createProxyServer(accountManager, config, hooks, { reload: reloadAccounts });
