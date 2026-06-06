@@ -48,6 +48,12 @@ const DEFAULT_REQUEST_DEADLINE_MS = 300000;
 // upstream spend on the losing attempt — enable per deployment via config.hedge.
 const DEFAULT_HEDGE = { enabled: false, delayMs: 20000 };
 
+const degradedModels = new Map();
+const FALLBACK_MAP = {
+  'claude-opus-4-8': 'claude-opus-4-7',
+  'claude-3-5-sonnet-20241022': 'claude-3-5-sonnet-20240620'
+};
+
 export function createProxyServer(accountManager, config, hooks = {}, admin = {}) {
   const upstream = config.upstream || 'https://api.anthropic.com';
   const proxyApiKey = config.proxy?.apiKey;
@@ -82,6 +88,13 @@ export function createProxyServer(accountManager, config, hooks = {}, admin = {}
       if (req.method === 'GET' && req.url === '/teamclaude/status') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(accountManager.getStatus(), null, 2));
+        return;
+      }
+
+      // Models status endpoint
+      if (req.method === 'GET' && req.url === '/teamclaude/models') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(Object.fromEntries(degradedModels), null, 2));
         return;
       }
 
@@ -276,6 +289,25 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   const upstreamUrl = `${upstream}${req.url}`;
   const method = req.method;
 
+  let activeBody = body;
+  let requestedModel = null;
+  if (req.url.startsWith('/v1/messages') && body.length > 0) {
+    try {
+      const parsed = JSON.parse(body.toString());
+      requestedModel = parsed.model;
+      if (requestedModel && degradedModels.has(requestedModel)) {
+        const state = degradedModels.get(requestedModel);
+        if (state.until && Date.now() > state.until) {
+          degradedModels.delete(requestedModel);
+        } else if (FALLBACK_MAP[requestedModel]) {
+          parsed.model = FALLBACK_MAP[requestedModel];
+          activeBody = Buffer.from(JSON.stringify(parsed));
+          if (headers['content-length']) headers['content-length'] = String(activeBody.length);
+        }
+      }
+    } catch(e) {}
+  }
+
   const logSections = [];
   if (logDir) {
     const safeHeaders = { ...headers };
@@ -321,7 +353,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     const upstreamRes = await fetch(upstreamUrl, {
       method,
       headers,
-      body: ['GET', 'HEAD'].includes(method) ? undefined : body,
+      body: ['GET', 'HEAD'].includes(method) ? undefined : activeBody,
       redirect: 'manual',
       signal: controller.signal,
     });
@@ -366,6 +398,14 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       }
       
       if (upstreamRes.status === 529 && !res.headersSent) {
+        if (requestedModel && FALLBACK_MAP[requestedModel]) {
+          const strikes = (degradedModels.get(requestedModel)?.strikes || 0) + 1;
+          if (strikes >= 3) {
+            degradedModels.set(requestedModel, { strikes, until: Date.now() + 5 * 60 * 1000 });
+          } else {
+            degradedModels.set(requestedModel, { strikes });
+          }
+        }
         ctx.status = 529;
         if (logDir) writeRequestLog(logDir, reqId, logSections);
         res.writeHead(529, { 'Content-Type': 'application/json' });
