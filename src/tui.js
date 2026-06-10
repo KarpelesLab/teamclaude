@@ -303,9 +303,9 @@ export class TUI {
 
       let name;
       if (profile?.email) {
-        name = profile.email;
+        name = profile.orgName ? `${profile.email} (${profile.orgName})` : profile.email;
         const tier = profile.hasClaudeMax ? 'Max' : profile.hasClaudePro ? 'Pro' : null;
-        if (tier) this._addLog(`Detected Claude ${tier}: ${name}`);
+        if (tier) this._addLog(`Detected Claude ${tier}: ${profile.email}${profile.orgName ? ` — org "${profile.orgName}"` : ''}`);
       } else {
         const n = this.config.accounts.filter(a => a.name.startsWith('account-')).length + 1;
         name = `account-${n}`;
@@ -314,14 +314,16 @@ export class TUI {
       const entry = {
         name, type: 'oauth', source: 'import',
         accountUuid: profile?.accountUuid || null,
+        organizationUuid: profile?.orgUuid || null,
+        orgName: profile?.orgName || null,
         accessToken: creds.accessToken,
         refreshToken: creds.refreshToken,
         expiresAt: creds.expiresAt,
       };
 
-      // Deduplicate: match by UUID first, then by name
-      let idx = profile?.accountUuid
-        ? this.config.accounts.findIndex(a => a.accountUuid === profile.accountUuid)
+      // Deduplicate by (account UUID + organization UUID), then by name
+      let idx = (profile?.accountUuid && profile?.orgUuid)
+        ? this.config.accounts.findIndex(a => a.accountUuid === profile.accountUuid && a.organizationUuid === profile.orgUuid)
         : -1;
       if (idx < 0) idx = this.config.accounts.findIndex(a => a.name === name);
 
@@ -398,8 +400,8 @@ export class TUI {
       lines.push('');
       const showBoth = W >= 70;
       const bw = showBoth
-        ? Math.max(5, Math.min(20, Math.floor((W - 56) / 2)))
-        : Math.max(5, Math.min(20, W - 45));
+        ? Math.max(5, Math.min(20, Math.floor((W - 60) / 2)))
+        : Math.max(5, Math.min(20, W - 49));
 
       for (let i = 0; i < this.am.accounts.length; i++) {
         lines.push(this._renderAcct(i, bw, showBoth));
@@ -456,8 +458,11 @@ export class TUI {
     const sel = isSel ? cyan('>') : ' ';
     const cur = isCur ? green('►') : ' ';
 
-    // Name (bold if selected)
-    const rawName = a.name.slice(0, 12).padEnd(12);
+    // Label: show the ORG (what distinguishes accounts sharing one login/email).
+    // Accounts are stored as "email (Org Name)"; show the org, else the full name (API keys).
+    const orgMatch = /^(.*?) \((.+)\)$/.exec(a.name);
+    const label = orgMatch ? orgMatch[2] : a.name;
+    const rawName = label.slice(0, 16).padEnd(16);
     const name = isSel ? bold(rawName) : rawName;
 
     // Type

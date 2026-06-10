@@ -443,27 +443,33 @@ async function accountsCommand() {
   // Deduplicate by accountUuid — keep the last (most recently added) entry
   const seen = new Map();
   let removed = 0;
+  let normalized = false;
   for (let i = config.accounts.length - 1; i >= 0; i--) {
     const a = config.accounts[i];
     const uuid = profiles[i]?.accountUuid || a.accountUuid;
-    if (uuid) {
-      if (seen.has(uuid)) {
+    const orgUuid = profiles[i]?.orgUuid || a.organizationUuid || '';
+    const key = uuid ? `${uuid}::${orgUuid}` : null;
+    if (key) {
+      if (seen.has(key)) {
         config.accounts.splice(i, 1);
         profiles.splice(i, 1);
         removed++;
       } else {
-        seen.set(uuid, i);
-        // Update stored UUID and name from profile
+        seen.set(key, i);
         if (profiles[i] && !profiles[i].error) {
-          a.accountUuid = profiles[i].accountUuid;
-          if (profiles[i].email) a.name = profiles[i].email;
+          if (a.accountUuid !== profiles[i].accountUuid) { a.accountUuid = profiles[i].accountUuid; normalized = true; }
+          if (profiles[i].orgUuid && a.organizationUuid !== profiles[i].orgUuid) { a.organizationUuid = profiles[i].orgUuid; normalized = true; }
+          if (profiles[i].email) {
+            const newName = profiles[i].orgName ? `${profiles[i].email} (${profiles[i].orgName})` : profiles[i].email;
+            if (a.name !== newName) { a.name = newName; normalized = true; }
+          }
         }
       }
     }
   }
-  if (removed > 0) {
+  if (removed > 0 || normalized) {
     await saveConfig(config);
-    console.log(`Removed ${removed} duplicate account(s)\n`);
+    if (removed > 0) console.log(`Removed ${removed} duplicate account(s)\n`);
   }
 
   for (const [i, a] of config.accounts.entries()) {
@@ -480,8 +486,8 @@ async function accountsCommand() {
     const status = hasProfile ? `Claude ${tier}` : `unknown (${p?.error || 'no token'})`;
     const src = a.source ? `, ${a.source}` : '';
     console.log(`  [${i + 1}] ${a.name} (${status}${src})`);
-    if (hasProfile && p.email && p.email !== a.name) console.log(`       Email: ${p.email}`);
-    if (hasProfile && p.orgName) console.log(`       Org:   ${p.orgName}`);
+    if (hasProfile && p.email) console.log(`       Email: ${p.email}`);
+    if (hasProfile && p.orgName) console.log(`       Org:   ${p.orgName}${p.orgType ? ` (${p.orgType})` : ''}${p.rateLimitTier ? ` — ${p.rateLimitTier}` : ''}`);
     if (verbose && a.expiresAt) {
       const remaining = a.expiresAt - Date.now();
       if (remaining <= 0) {
@@ -620,9 +626,9 @@ async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
     console.error(`Warning: could not fetch account profile — ${profile?.error || 'no token'}`);
   }
   if (!name && profile?.email) {
-    name = profile.email;
+    name = profile.orgName ? `${profile.email} (${profile.orgName})` : profile.email;
     const tier = profile.hasClaudeMax ? 'Max' : profile.hasClaudePro ? 'Pro' : null;
-    if (tier) console.log(`Detected Claude ${tier} account: ${profile.email}`);
+    if (tier) console.log(`Detected Claude ${tier} account: ${profile.email}${profile.orgName ? ` — org "${profile.orgName}"` : ''}`);
   }
   if (!name) {
     const n = config.accounts.filter(a => a.name.startsWith('account-')).length + 1;
@@ -634,14 +640,15 @@ async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
     type: 'oauth',
     source,
     accountUuid: profile?.accountUuid || null,
+    organizationUuid: profile?.orgUuid || null,
     accessToken: creds.accessToken,
     refreshToken: creds.refreshToken,
     expiresAt: creds.expiresAt,
   };
 
   // Deduplicate: match by UUID first, then by name
-  let idx = profile?.accountUuid
-    ? config.accounts.findIndex(a => a.accountUuid === profile.accountUuid)
+  let idx = (profile?.accountUuid && profile?.orgUuid)
+    ? config.accounts.findIndex(a => a.accountUuid === profile.accountUuid && a.organizationUuid === profile.orgUuid)
     : -1;
   if (idx < 0) idx = config.accounts.findIndex(a => a.name === name);
 
