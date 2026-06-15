@@ -345,6 +345,7 @@ async function runCommand() {
   // Use spawnSync so the Node process blocks entirely — behaves like execvp.
   const result = spawnSync('claude', claudeArgs, {
     stdio: 'inherit',
+    shell: process.platform === 'win32',
     env: {
       ...process.env,
       ANTHROPIC_BASE_URL: `http://localhost:${config.proxy.port}`,
