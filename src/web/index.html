@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TeamClaude Dashboard</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='13' fill='none' stroke='%23c87f3a' stroke-width='2.5'/><path d='M 16 5 A 11 11 0 0 1 27 16' fill='none' stroke='%23c87f3a' stroke-width='3' stroke-linecap='round'/><circle cx='16' cy='5' r='2.5' fill='%23c87f3a'/></svg>">
+<style>
+  :root {
+    --bg: #faf7f2;
+    --panel: #ffffff;
+    --panel-border: #e8e1d4;
+    --text: #2a2520;
+    --text-dim: #7a7468;
+    --accent: #b86a1a;
+    --accent-soft: #c87f3a;
+    --good: #4a7c4e;
+    --warn: #c78a1f;
+    --bad: #b04040;
+    --bar-bg: #ece6d8;
+    --bar-good: #5a9a5e;
+    --bar-warn: #d4a035;
+    --bar-bad: #c45050;
+    --active-glow: rgba(184, 106, 26, 0.15);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1a1612;
+      --panel: #251f18;
+      --panel-border: #3a3128;
+      --text: #ebe4d6;
+      --text-dim: #8a8170;
+      --accent: #e89030;
+      --accent-soft: #d4801f;
+      --good: #6abe6f;
+      --warn: #e5b045;
+      --bad: #d46060;
+      --bar-bg: #312820;
+      --bar-good: #5a9a5e;
+      --bar-warn: #c89534;
+      --bar-bad: #b04040;
+      --active-glow: rgba(232, 144, 48, 0.18);
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    padding: clamp(0.5rem, 1.8vw, 1.75rem) clamp(0.5rem, 1.8vw, 1.5rem);
+    font-size: clamp(13px, 1.05vw, 15px);
+  }
+  .wrap {
+    max-width: 1400px;
+    margin: 0 auto;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 0.5rem 1rem;
+    margin-bottom: clamp(0.75rem, 1.5vw, 1.5rem);
+    padding-bottom: 0.75rem;
+    border-bottom: 1px solid var(--panel-border);
+  }
+  h1 {
+    margin: 0;
+    font-size: clamp(1.05rem, 2.2vw, 1.5rem);
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    line-height: 1.2;
+    min-width: 0;
+  }
+  h1 .sub {
+    color: var(--text-dim);
+    font-weight: 400;
+    font-size: clamp(0.75rem, 1.4vw, 0.95rem);
+    margin-left: 0.4rem;
+    white-space: nowrap;
+  }
+  .threshold-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: clamp(0.78rem, 1.2vw, 0.9rem);
+    flex: 1 1 auto;
+    min-width: 140px;
+    max-width: 360px;
+    justify-content: flex-end;
+  }
+  .threshold-row label {
+    color: var(--text-dim);
+    white-space: nowrap;
+  }
+  .threshold-row input[type=range] {
+    flex: 1 1 80px;
+    min-width: 70px;
+    max-width: 220px;
+    accent-color: var(--accent);
+  }
+  .threshold-row .val {
+    font-variant-numeric: tabular-nums;
+    font-weight: 600;
+    color: var(--accent);
+    min-width: 2.5rem;
+    text-align: right;
+  }
+  .cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 320px), 1fr));
+    gap: clamp(0.5rem, 1vw, 0.875rem);
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 8px;
+    padding: clamp(0.625rem, 1.2vw, 1rem) clamp(0.75rem, 1.4vw, 1.125rem);
+    display: flex;
+    flex-direction: column;
+    gap: 0.55rem;
+    transition: box-shadow 0.15s, border-color 0.15s;
+    container-type: inline-size;
+    min-width: 0;
+  }
+  .card.active {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 1px var(--accent), 0 4px 18px var(--active-glow);
+  }
+  .card .top {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    min-width: 0;
+  }
+  .card .name {
+    font-size: clamp(0.92rem, 1.4vw, 1.05rem);
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+  }
+  .card .name .name-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+  }
+  .card .name .badge {
+    font-size: 0.66rem;
+    font-weight: 500;
+    padding: 0.1rem 0.45rem;
+    border-radius: 999px;
+    background: var(--bar-bg);
+    color: var(--text-dim);
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+    flex-shrink: 0;
+  }
+  .card.active .name .badge.active-badge {
+    background: var(--accent);
+    color: #fff;
+  }
+  .card .meta {
+    color: var(--text-dim);
+    font-size: clamp(0.72rem, 1.05vw, 0.85rem);
+    font-variant-numeric: tabular-nums;
+    line-height: 1.4;
+    word-break: break-word;
+  }
+  .bars {
+    display: grid;
+    grid-template-columns: 2ch 1fr 3.2rem 3.8rem;
+    column-gap: 0.55rem;
+    row-gap: 0.35rem;
+    align-items: center;
+    font-size: clamp(0.72rem, 1.05vw, 0.8rem);
+    color: var(--text-dim);
+  }
+  .bars .lbl { letter-spacing: 0.02em; }
+  .bars .reset {
+    font-size: 0.78em;
+    color: var(--text-dim);
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+    white-space: nowrap;
+    opacity: 0.85;
+  }
+  .bars .bar {
+    height: 8px;
+    background: var(--bar-bg);
+    border-radius: 4px;
+    overflow: hidden;
+    position: relative;
+    min-width: 0;
+  }
+  .bars .bar > span {
+    display: block;
+    height: 100%;
+    background: var(--bar-good);
+    transition: width 0.3s, background 0.3s;
+    border-radius: 4px;
+  }
+  .bars .pct {
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+    color: var(--text);
+  }
+  .bars .bar.warn > span { background: var(--bar-warn); }
+  .bars .bar.bad > span { background: var(--bar-bad); }
+  button.switch {
+    background: transparent;
+    color: var(--accent);
+    border: 1px solid var(--accent);
+    border-radius: 6px;
+    padding: 0.3rem 0.7rem;
+    font-size: clamp(0.78rem, 1.15vw, 0.85rem);
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.12s, color 0.12s;
+    flex-shrink: 0;
+    white-space: nowrap;
+  }
+  button.switch:hover:not(:disabled) {
+    background: var(--accent);
+    color: #fff;
+  }
+  button.switch:disabled { display: none; }
+  /* Tighter card layout when the card itself is narrow */
+  @container (max-width: 300px) {
+    .card .name { font-size: 0.92rem; }
+    .bars { grid-template-columns: 2ch 1fr 2.6rem 3.2rem; column-gap: 0.4rem; }
+    .bars .reset { font-size: 0.72em; }
+    button.switch { width: 100%; }
+    .card .meta { font-size: 0.7rem; }
+  }
+  footer {
+    margin-top: clamp(0.75rem, 1.5vw, 1.5rem);
+    color: var(--text-dim);
+    font-size: clamp(0.7rem, 1.05vw, 0.8rem);
+    text-align: center;
+    word-break: break-word;
+  }
+  .err {
+    background: var(--bad);
+    color: #fff;
+    padding: 0.55rem 0.9rem;
+    border-radius: 6px;
+    margin-bottom: 0.75rem;
+    font-size: 0.85rem;
+    word-break: break-word;
+  }
+  .status-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--good);
+    flex-shrink: 0;
+  }
+  .status-throttled { background: var(--warn); }
+  .status-exhausted, .status-error { background: var(--bad); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>TeamClaude<span class="sub">multi-account proxy</span></h1>
+    <div class="threshold-row">
+      <label for="thr">Rotate at</label>
+      <input type="range" id="thr" min="50" max="100" step="1" value="98">
+      <span class="val" id="thrVal">98%</span>
+    </div>
+  </header>
+  <div id="errBox"></div>
+  <div class="cards" id="cards"></div>
+  <footer>
+    <span id="meta">Loading…</span>
+  </footer>
+</div>
+<script>
+  // All DOM construction below uses createElement + textContent — never innerHTML
+  // with untrusted data. Account names come from Anthropic profile API via local
+  // config, so they're effectively trusted, but defense in depth.
+  const cardsEl = document.getElementById('cards');
+  const errEl = document.getElementById('errBox');
+  const metaEl = document.getElementById('meta');
+  const thr = document.getElementById('thr');
+  const thrVal = document.getElementById('thrVal');
+  let lastThreshold = null;
+  let saveTimer = null;
+
+  function el(tag, attrs = {}, children = []) {
+    const node = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs)) {
+      if (v == null || v === false) continue;
+      if (k === 'class') node.className = v;
+      else if (k === 'style') node.style.cssText = v;
+      else if (k === 'text') node.textContent = v;
+      else if (k.startsWith('data-')) node.setAttribute(k, v);
+      else if (k === 'disabled' && v) node.disabled = true;
+      else node.setAttribute(k, v);
+    }
+    for (const child of (Array.isArray(children) ? children : [children])) {
+      if (child == null || child === false) continue;
+      node.appendChild(typeof child === 'string' ? document.createTextNode(child) : child);
+    }
+    return node;
+  }
+
+  function fmtPct(v) { return v == null ? '—' : (v * 100).toFixed(0) + '%'; }
+  function fmtNum(n) { return n.toLocaleString(); }
+  function fmtReset(ms) {
+    if (!ms) return '';
+    const now = Date.now();
+    if (ms <= now) return '';
+    const d = new Date(ms);
+    const diff = ms - now;
+    const t = diff < 24 * 3600 * 1000
+      ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+      : d.toLocaleString([], { weekday: 'short', hour: '2-digit', minute: '2-digit' });
+    return '↺ ' + t;
+  }
+  function fmtAgo(iso) {
+    if (!iso) return 'never';
+    const s = (Date.now() - new Date(iso).getTime()) / 1000;
+    if (s < 60) return Math.round(s) + 's ago';
+    if (s < 3600) return Math.round(s / 60) + 'm ago';
+    if (s < 86400) return Math.round(s / 3600) + 'h ago';
+    return Math.round(s / 86400) + 'd ago';
+  }
+  function barClass(util, threshold) {
+    if (util == null) return 'bar';
+    if (util >= threshold) return 'bar bad';
+    if (util >= threshold * 0.7) return 'bar warn';
+    return 'bar';
+  }
+
+  function makeBar(label, util, threshold, resetMs) {
+    const inner = el('span', { style: 'width:' + (util == null ? 0 : Math.min(100, util * 100)) + '%' });
+    const titleAttr = resetMs && resetMs > Date.now() ? new Date(resetMs).toLocaleString() : null;
+    return [
+      el('span', { class: 'lbl', text: label }),
+      el('div', { class: barClass(util, threshold) }, inner),
+      el('span', { class: 'pct', text: fmtPct(util) }),
+      el('span', { class: 'reset', text: fmtReset(resetMs), title: titleAttr }),
+    ];
+  }
+
+  function renderAccount(acct, isActive, threshold) {
+    const q = acct.quota;
+    const u5h = q.unified5h != null ? q.unified5h
+      : (q.tokensLimit ? 1 - q.tokensRemaining / q.tokensLimit : null);
+    const u5hReset = q.unified5h != null
+      ? q.unified5hReset
+      : (q.resetsAt ? new Date(q.resetsAt).getTime() : null);
+    const u7d = q.unified7d;
+    const u7dReset = q.unified7dReset;
+    const totalTok = acct.usage.totalInputTokens + acct.usage.totalOutputTokens;
+
+    const nameRow = el('div', { class: 'name' }, [
+      el('span', { class: 'status-dot status-' + acct.status }),
+      el('span', { class: 'name-text', text: acct.name }),
+      isActive ? el('span', { class: 'badge active-badge', text: 'active' }) : null,
+      el('span', { class: 'badge', style: 'background:transparent;color:var(--text-dim);', text: acct.type }),
+    ]);
+
+    const btn = el('button', { class: 'switch', 'data-name': acct.name, disabled: isActive, text: 'Switch' });
+
+    const top = el('div', { class: 'top' }, [nameRow, btn]);
+
+    const bars = el('div', { class: 'bars' }, [
+      ...makeBar('5h', u5h, threshold, u5hReset),
+      ...makeBar('7d', u7d, threshold, u7dReset),
+    ]);
+
+    const metaText = fmtNum(acct.usage.totalRequests) + ' requests · '
+      + fmtNum(totalTok) + ' tokens · last used ' + fmtAgo(acct.usage.lastUsed)
+      + (acct.rateLimitedUntil ? ' · throttled until ' + new Date(acct.rateLimitedUntil).toLocaleTimeString() : '');
+    const meta = el('div', { class: 'meta', text: metaText });
+
+    const card = el('div', { class: 'card' + (isActive ? ' active' : '') }, [top, bars, meta]);
+    return card;
+  }
+
+  function showErr(msg) {
+    errEl.textContent = '';
+    if (msg) errEl.appendChild(el('div', { class: 'err', text: msg }));
+  }
+
+  async function refresh() {
+    try {
+      const res = await fetch('/teamclaude/status', { cache: 'no-store' });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      showErr('');
+
+      const serverPct = Math.round(data.switchThreshold * 100);
+      if (lastThreshold !== serverPct && document.activeElement !== thr) {
+        thr.value = serverPct;
+        thrVal.textContent = serverPct + '%';
+        lastThreshold = serverPct;
+      }
+
+      cardsEl.textContent = '';
+      for (const acct of data.accounts) {
+        cardsEl.appendChild(renderAccount(acct, acct.name === data.currentAccount, data.switchThreshold));
+      }
+      metaEl.textContent = 'Active: ' + data.currentAccount + ' · refreshes every 2s · ' + new Date().toLocaleTimeString();
+    } catch (err) {
+      showErr('Cannot reach proxy: ' + err.message);
+      metaEl.textContent = 'Disconnected';
+    }
+  }
+
+  cardsEl.addEventListener('click', async (e) => {
+    const btn = e.target.closest('button.switch');
+    if (!btn || btn.disabled) return;
+    const name = btn.getAttribute('data-name');
+    btn.disabled = true;
+    try {
+      const res = await fetch('/teamclaude/switch', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ account: name }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || 'HTTP ' + res.status);
+      }
+      await refresh();
+    } catch (err) {
+      showErr('Switch failed: ' + err.message);
+      btn.disabled = false;
+    }
+  });
+
+  thr.addEventListener('input', () => { thrVal.textContent = thr.value + '%'; });
+  thr.addEventListener('change', () => {
+    clearTimeout(saveTimer);
+    const value = Number(thr.value) / 100;
+    saveTimer = setTimeout(async () => {
+      try {
+        const res = await fetch('/teamclaude/threshold', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ value }),
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.error || 'HTTP ' + res.status);
+        }
+        lastThreshold = Math.round(value * 100);
+      } catch (err) {
+        showErr('Threshold update failed: ' + err.message);
+      }
+    }, 100);
+  });
+
+  refresh();
+  setInterval(refresh, 2000);
+</script>
+</body>
+</html>

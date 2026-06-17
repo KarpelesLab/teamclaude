@@ -128,10 +128,22 @@ claude
 teamclaude accounts          # List accounts with subscription tier and token status
 teamclaude accounts -v       # Also show token expiry times
 teamclaude status            # Show live proxy status (requires running server)
+teamclaude switch <name>     # Manually pin the active account
+teamclaude threshold <val>   # Set rotation threshold ("85", "85%", or "0.85")
 teamclaude remove <name>     # Remove an account
 teamclaude api <path>        # Call an API endpoint with account credentials
 teamclaude help              # Show all commands
 ```
+
+### Web Dashboard
+
+When the proxy is running headless (e.g. as a systemd service) the TUI isn't available. The proxy serves a single-page dashboard on the same port:
+
+```
+http://localhost:3456/ui
+```
+
+Per-account quota bars (5h / 7d), the active account is highlighted, click any other account to pin it, and the threshold slider live-updates the rotation cutoff. Polls `/teamclaude/status` every 2 s. Loopback only — the same `localhost` auth-skip rule that applies to `teamclaude status` applies here.
 
 ### Request logging
 

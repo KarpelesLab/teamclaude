@@ -1,12 +1,25 @@
 import http from 'node:http';
-import { writeFile, mkdir } from 'node:fs/promises';
-import { join } from 'node:path';
+import { writeFile, mkdir, readFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const HOP_BY_HOP_HEADERS = new Set([
   'host', 'connection', 'keep-alive', 'transfer-encoding',
   'te', 'trailer', 'upgrade', 'proxy-authorization', 'proxy-authenticate',
 ]);
+
+async function readBody(req) {
+  const chunks = [];
+  for await (const c of req) chunks.push(c);
+  return Buffer.concat(chunks).toString('utf-8');
+}
+
+function json(res, status, payload) {
+  res.writeHead(status, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(payload));
+}
 
 export function createProxyServer(accountManager, config, hooks = {}) {
   const upstream = config.upstream || 'https://api.anthropic.com';
@@ -33,10 +46,61 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         return;
       }
 
+      // Parse pathname once for control-endpoint matching (ignores query string / fragment)
+      const pathname = new URL(req.url, 'http://localhost').pathname;
+
       // Status endpoint
-      if (req.method === 'GET' && req.url === '/teamclaude/status') {
+      if (req.method === 'GET' && pathname === '/teamclaude/status') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(accountManager.getStatus(), null, 2));
+        return;
+      }
+
+      // POST /teamclaude/switch — manually pin the active account
+      if (req.method === 'POST' && pathname === '/teamclaude/switch') {
+        try {
+          const { account } = JSON.parse((await readBody(req)) || '{}');
+          if (!account) { json(res, 400, { error: 'Missing "account"' }); return; }
+          const idx = accountManager.accounts.findIndex(a => a.name === account);
+          if (idx < 0) { json(res, 404, { error: `Account "${account}" not found` }); return; }
+          accountManager.currentIndex = idx;
+          console.log(`[TeamClaude] Manually switched to "${account}"`);
+          hooks.onManualSwitch?.(account);
+          json(res, 200, { currentAccount: account });
+        } catch (err) {
+          json(res, 400, { error: err.message });
+        }
+        return;
+      }
+
+      // POST /teamclaude/threshold — change the rotation threshold (0..1)
+      if (req.method === 'POST' && pathname === '/teamclaude/threshold') {
+        try {
+          const { value } = JSON.parse((await readBody(req)) || '{}');
+          const v = Number(value);
+          if (Number.isNaN(v) || v < 0 || v > 1) {
+            json(res, 400, { error: 'value must be a number between 0 and 1' });
+            return;
+          }
+          accountManager.switchThreshold = v;
+          await hooks.persistThreshold?.(v);
+          console.log(`[TeamClaude] Threshold set to ${(v * 100).toFixed(0)}%`);
+          json(res, 200, { switchThreshold: v });
+        } catch (err) {
+          json(res, 400, { error: err.message });
+        }
+        return;
+      }
+
+      // GET /ui — serve the dashboard (read from disk every request so edits are live)
+      if (req.method === 'GET' && (pathname === '/ui' || pathname === '/ui/' || pathname === '/ui/index.html')) {
+        try {
+          const html = await readFile(join(__dirname, 'web', 'index.html'), 'utf-8');
+          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+          res.end(html);
+        } catch (err) {
+          json(res, 500, { error: `Dashboard not found: ${err.message}` });
+        }
         return;
       }
 

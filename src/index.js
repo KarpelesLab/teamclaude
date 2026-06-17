@@ -34,6 +34,14 @@ switch (command) {
     await statusCommand();
     process.exit(0);
     break;
+  case 'switch':
+    await switchCommand();
+    process.exit(0);
+    break;
+  case 'threshold':
+    await thresholdCommand();
+    process.exit(0);
+    break;
   case 'accounts':
     await accountsCommand();
     process.exit(0);
@@ -126,6 +134,10 @@ async function serverCommand() {
   let tui = null;
   let hooks = {};
 
+  hooks.persistThreshold = (value) => atomicConfigUpdate(diskConfig => {
+    diskConfig.switchThreshold = value;
+  });
+
   if (useTUI) {
     tui = new TUI({
       accountManager, config,
@@ -190,14 +202,18 @@ async function serverCommand() {
   });
 
   if (!tui) {
-    process.on('SIGINT', () => {
+    const shutdown = () => {
       console.log('\n[TeamClaude] Shutting down...');
+      // Force-close in-flight connections (streaming responses, keep-alive)
+      // so systemd restarts and dev iteration don't wait minutes for the
+      // active Claude stream to drain. Clients reconnect on next request.
+      server.closeAllConnections?.();
       server.close(() => process.exit(0));
-    });
-    process.on('SIGTERM', () => {
-      console.log('\n[TeamClaude] Shutting down...');
-      server.close(() => process.exit(0));
-    });
+      // Safety net: hard exit if server.close() callback never fires
+      setTimeout(() => process.exit(0), 2000).unref();
+    };
+    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', shutdown);
   }
 }
 
@@ -404,6 +420,74 @@ async function statusCommand() {
   }
 }
 
+// ── switch ──────────────────────────────────────────────────
+
+async function switchCommand() {
+  const config = await loadOrCreateConfig();
+  const name = args[1];
+  if (!name) {
+    console.error('Usage: teamclaude switch <account-name>');
+    process.exit(1);
+  }
+  const url = `http://localhost:${config.proxy.port}/teamclaude/switch`;
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': config.proxy.apiKey },
+      body: JSON.stringify({ account: name }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      console.error(data.error || `HTTP ${res.status}`);
+      process.exit(1);
+    }
+    console.log(`Switched to "${data.currentAccount}"`);
+  } catch {
+    console.error(`Cannot connect to proxy at localhost:${config.proxy.port}`);
+    console.error('Is the server running? Start with: teamclaude server');
+    process.exit(1);
+  }
+}
+
+// ── threshold ───────────────────────────────────────────────
+
+async function thresholdCommand() {
+  const config = await loadOrCreateConfig();
+  const raw = args[1];
+  if (!raw) {
+    console.error('Usage: teamclaude threshold <0..1 fraction or 0..100 percent>');
+    console.error('Examples: teamclaude threshold 85      # 85%');
+    console.error('          teamclaude threshold 0.85   # same');
+    console.error('          teamclaude threshold 85%    # same');
+    process.exit(1);
+  }
+  // Accept "85", "85%", or "0.85"
+  let v = Number(raw.endsWith('%') ? raw.slice(0, -1) : raw);
+  if (v > 1) v = v / 100;
+  if (Number.isNaN(v) || v < 0 || v > 1) {
+    console.error('Value must be a percentage (0..100) or fraction (0..1)');
+    process.exit(1);
+  }
+  const url = `http://localhost:${config.proxy.port}/teamclaude/threshold`;
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': config.proxy.apiKey },
+      body: JSON.stringify({ value: v }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      console.error(data.error || `HTTP ${res.status}`);
+      process.exit(1);
+    }
+    console.log(`Threshold set to ${(data.switchThreshold * 100).toFixed(0)}%`);
+  } catch {
+    console.error(`Cannot connect to proxy at localhost:${config.proxy.port}`);
+    console.error('Is the server running? Start with: teamclaude server');
+    process.exit(1);
+  }
+}
+
 // ── accounts ────────────────────────────────────────────────
 
 async function accountsCommand() {
@@ -593,10 +677,15 @@ Commands:
   env                 Print env vars to use with Claude
   run [-- args...]    Run Claude Code through the proxy
   status              Show proxy & account status (live)
+  switch <name>       Manually pin the active account
+  threshold <value>   Set rotation threshold (0..1 or 0..100%)
   accounts            List configured accounts
   remove <name>       Remove an account
   api <path>          Call an API endpoint with account credentials
   help                Show this help
+
+Web dashboard:
+  Open http://localhost:<port>/ui  in a browser (default port 3456)
 
 Options:
   --name NAME         Set account name (import/login)
