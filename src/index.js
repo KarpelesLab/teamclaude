@@ -162,8 +162,17 @@ async function serverCommand() {
   }
 
   const server = createProxyServer(accountManager, config, hooks);
+  // Catch bind-time errors (e.g. EADDRINUSE) only. Once the socket is bound we
+  // remove this handler so a later runtime 'error' isn't misreported as a
+  // listen failure and exit the whole proxy.
+  const onListenError = err => handleServerListenError(err, port);
+  server.once('error', onListenError);
 
   server.listen(port, () => {
+    // Bind succeeded: stop treating errors as listen failures, but keep a
+    // benign runtime handler so a later 'error' is logged rather than thrown.
+    server.removeListener('error', onListenError);
+    server.on('error', err => console.error(`[TeamClaude] Server error: ${err.message}`));
     if (tui) {
       tui.start();
       console.log(`Listening on port ${port} with ${accounts.length} account(s)`);
@@ -764,4 +773,19 @@ async function resolveAccounts(config) {
 function argValue(flag) {
   const i = args.indexOf(flag);
   return (i >= 0 && args[i + 1]) ? args[i + 1] : null;
+}
+
+function handleServerListenError(err, port) {
+  if (err.code === 'EADDRINUSE') {
+    console.error(`[TeamClaude] Port ${port} is already in use.`);
+    console.error('Another TeamClaude proxy may already be running.');
+    console.error('Check the existing server with: teamclaude status');
+    console.error(`Find the listener with: lsof -nP -iTCP:${port} -sTCP:LISTEN`);
+  } else if (err.code === 'EACCES') {
+    console.error(`[TeamClaude] Permission denied while listening on port ${port}.`);
+    console.error('Choose a non-privileged port in the TeamClaude config.');
+  } else {
+    console.error(`[TeamClaude] Failed to listen on port ${port}: ${err.message}`);
+  }
+  process.exit(1);
 }

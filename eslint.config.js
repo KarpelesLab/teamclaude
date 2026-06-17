@@ -7,6 +7,7 @@ export default [
         console: 'readonly',
         process: 'readonly',
         setTimeout: 'readonly',
+        clearTimeout: 'readonly',
         clearInterval: 'readonly',
         setInterval: 'readonly',
         setImmediate: 'readonly',
