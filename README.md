@@ -193,6 +193,15 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 8. If all accounts are exhausted, returns 429 with the soonest reset time
 9. Client token refresh requests (`/v1/oauth/token`) are relayed to upstream untouched — the proxy and client manage their own token lifecycles independently
 
+## Security
+
+The only canonical sources for TeamClaude are this repository
+(https://github.com/KarpelesLab/teamclaude) and the
+[`@karpeleslab/teamclaude`](https://www.npmjs.com/package/@karpeleslab/teamclaude)
+npm package. TeamClaude is **never** distributed as a downloadable binary
+archive — be wary of soft-forks that bundle a `.zip` and tell you to extract and
+run it. See [SECURITY.md](SECURITY.md) for details and how to report issues.
+
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
