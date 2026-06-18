@@ -40,6 +40,26 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         return;
       }
 
+      // Reload endpoint — re-sync accounts from config without a restart. This
+      // is the headless equivalent of pressing 'R' in the TUI. Local control
+      // only (no upstream calls); the auth gate above already applies.
+      if (req.method === 'POST' && req.url === '/teamclaude/reload') {
+        if (!hooks.reload) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'reload not supported' }));
+          return;
+        }
+        try {
+          const added = await hooks.reload();
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, added: added || 0 }));
+        } catch (err) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: err.message }));
+        }
+        return;
+      }
+
       // Let client token refresh requests pass through to upstream untouched.
       // The proxy manages its own tokens via ensureTokenFresh(); intercepting
       // or rewriting client refreshes would cause token rotation conflicts.

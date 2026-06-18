@@ -154,7 +154,17 @@ async function serverCommand() {
     }).catch(err => console.error(`[TeamClaude] Failed to save refreshed token: ${err.message}`));
   });
   const port = config.proxy.port;
-  const useTUI = process.stdout.isTTY && process.stdin.isTTY;
+  const headless = args.includes('--headless') || args.includes('--no-tui');
+  const useTUI = !headless && process.stdout.isTTY && process.stdin.isTTY;
+
+  // Re-sync accounts from disk without a restart. The TUI's 'R' key, the
+  // POST /teamclaude/reload endpoint, and the CLI notify after add/change all
+  // funnel through here. Returns the number of newly added accounts.
+  const reloadAccounts = async () => {
+    const diskConfig = await loadConfig();
+    if (!diskConfig) return 0;
+    return syncAccountsFromDisk(diskConfig, config, accountManager);
+  };
 
   let tui = null;
   let hooks = {};
@@ -178,11 +188,7 @@ async function serverCommand() {
           return diskAcct ? { ...diskAcct, ...live } : live;
         });
       }),
-      syncAccounts: async () => {
-        const diskConfig = await loadConfig();
-        if (!diskConfig) return 0;
-        return syncAccountsFromDisk(diskConfig, config, accountManager);
-      },
+      syncAccounts: reloadAccounts,
       onQuit: async () => {
         if (quotaSaveInterval) clearInterval(quotaSaveInterval);
         await persistQuotaState();
@@ -195,6 +201,9 @@ async function serverCommand() {
       onRequestEnd: (id, info) => tui.onRequestEnd(id, info),
     };
   }
+
+  // Expose reload to the proxy's control endpoint (works with or without TUI).
+  hooks.reload = reloadAccounts;
 
   const server = createProxyServer(accountManager, config, hooks);
   // Catch bind-time errors (e.g. EADDRINUSE) only. Once the socket is bound we
@@ -724,6 +733,7 @@ async function priorityCommand() {
   account.priority = priority;
   await saveConfig(config);
   console.log(`Set priority of "${account.name}" to ${priority} (lower = preferred)`);
+  await notifyRunningServer(config);
 }
 
 // ── enable / disable ────────────────────────────────────────
@@ -751,9 +761,7 @@ async function setDisabledCommand(disabled) {
   }
   await saveConfig(config);
   console.log(`${disabled ? 'Disabled' : 'Enabled'} account "${account.name}"`);
-  if (!disabled) {
-    console.log('(restart or reload the running server to retry it if it was in an error state)');
-  }
+  await notifyRunningServer(config);
 }
 
 // ── help ────────────────────────────────────────────────────
@@ -764,7 +772,7 @@ function showHelp() {
 Usage: teamclaude [command] [options]
 
 Commands:
-  server              Start the proxy server (default)
+  server              Start the proxy server (default; --headless to skip the TUI)
   import              Import credentials from Claude Code
   login               OAuth login via browser
   login --api         Add an API key account
@@ -788,6 +796,10 @@ Options:
   --json JSON         Import from inline JSON (import), e.g.:
                       --json '{"accessToken":"...","refreshToken":"...","expiresAt":1234}'
   --log-to DIR        Log full requests/responses to DIR (server, one file per request)
+  --headless          Run the server without the interactive TUI (for backgrounding)
+
+A running server re-syncs accounts from config on POST /teamclaude/reload
+(local only). add/login/enable/disable/priority trigger it automatically.
 
 Config: ${getConfigPath()}
 `);
@@ -862,6 +874,7 @@ async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
 
   await saveConfig(config);
   console.log(`Saved to ${getConfigPath()}`);
+  await notifyRunningServer(config);
 }
 
 // ── config sync helpers ─────────────────────────────────────
@@ -986,6 +999,26 @@ async function resolveAccounts(config) {
 function argValue(flag) {
   const i = args.indexOf(flag);
   return (i >= 0 && args[i + 1]) ? args[i + 1] : null;
+}
+
+// Best-effort: tell a running server (if any) to re-sync accounts from config so
+// CLI changes take effect without a restart. A closed local port refuses the
+// connection immediately, so this is a no-op (and near-instant) when nothing is
+// running. Reload picks up new accounts, credential, priority, and enable/disable
+// changes; account removals still need a restart.
+async function notifyRunningServer(config) {
+  const port = config?.proxy?.port;
+  if (!port) return;
+  try {
+    const res = await fetch(`http://localhost:${port}/teamclaude/reload`, {
+      method: 'POST',
+      headers: { 'x-api-key': config.proxy?.apiKey || '' },
+    });
+    if (res.ok) {
+      const data = await res.json().catch(() => ({}));
+      console.log(`Reloaded running server${data.added ? ` (+${data.added} new account)` : ''}.`);
+    }
+  } catch { /* no server running — nothing to notify */ }
 }
 
 // Quick liveness probe: is something listening on the local proxy port?

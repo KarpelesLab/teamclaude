@@ -17,7 +17,8 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 - **Auto-retry on 429** — waits the `retry-after` duration and retries the same account; switches to the next on persistent errors
 - **Interactive TUI** — real-time dashboard with color-coded quota bars, reset countdowns, activity log, and keyboard controls
 - **OAuth token management** — automatically refreshes tokens nearing expiry and persists them to config; client token refreshes pass through untouched
-- **Hot-reload accounts** — add accounts via `import` or `login` while the server is running, press **R** to pick them up
+- **Hot-reload accounts** — add or change accounts while the server is running; press **R** in the TUI, or run headless and CLI changes auto-reload via a local control endpoint
+- **Headless mode** — run the proxy without the TUI (`--headless`) for backgrounding/services
 - **Org-aware accounts** — one email can hold multiple accounts across different organizations (e.g. corp + personal); dedup is keyed on account + org, and names disambiguate as `email (Org)`
 - **Rotation priority** — pin a preferred account order with `teamclaude priority`
 - **Enable/disable accounts** — temporarily pause an account without removing it (`teamclaude disable`/`enable`, or `d` in the TUI); re-enabling also clears a stuck error state
@@ -103,7 +104,15 @@ When running from a TTY, shows an interactive TUI with:
 - Real-time activity log with request tracking
 - Keyboard shortcuts (see below)
 
-Falls back to plain log output when not a TTY (e.g. running as a service).
+Falls back to plain log output when not a TTY (e.g. running as a service). Pass `--headless` (or `--no-tui`) to force the plain-log mode even from a terminal — useful for backgrounding the proxy.
+
+When running headless, you can re-sync accounts from the config without a restart by POSTing to the local control endpoint (the equivalent of pressing **R** in the TUI):
+
+```bash
+curl -X POST http://localhost:3456/teamclaude/reload
+```
+
+You usually don't need to call it directly: `teamclaude login`, `import`, `enable`, `disable`, and `priority` automatically notify a running server to reload. (New accounts and credential/priority/enable-disable changes are picked up live; account *removals* still require a restart.)
 
 #### TUI Keyboard Shortcuts
 
