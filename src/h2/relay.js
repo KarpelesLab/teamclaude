@@ -148,6 +148,70 @@ export function h2Relay(claude, upstream, opts = {}) {
   respCtl = link(upstream, claude, onRespData, destroyBoth);
 }
 
+/**
+ * Faithful HTTP/1.1 relay for the rare h1 case. Reads the first request head,
+ * rewrites only the auth line (via `rewriteHead`), forwards it, then tunnels
+ * both directions raw. (Real Anthropic traffic is h2; on a keep-alive h1
+ * connection only the first request's auth is rewritten — documented tradeoff.)
+ *
+ * @param opts.rewriteHead (headText) => headText
+ */
+export function h1Relay(claude, upstream, opts = {}) {
+  const rewriteHead = opts.rewriteHead || ((h) => h);
+  const destroyBoth = () => { claude.destroy(); upstream.destroy(); };
+  claude.on('error', destroyBoth);
+  upstream.on('error', destroyBoth);
+  claude.on('close', () => upstream.destroy());
+  upstream.on('close', () => claude.destroy());
+
+  let buf = Buffer.alloc(0);
+  let done = false;
+  const onData = (chunk) => {
+    buf = Buffer.concat([buf, chunk]);
+    const idx = buf.indexOf('\r\n\r\n');
+    if (idx < 0) {
+      if (buf.length > 65536) destroyBoth(); // runaway head
+      return;
+    }
+    done = true;
+    claude.removeListener('data', onData);
+    const head = rewriteHead(buf.subarray(0, idx + 4).toString('latin1'));
+    upstream.write(Buffer.from(head, 'latin1'));
+    const remainder = buf.subarray(idx + 4);
+    if (remainder.length) upstream.write(remainder);
+    claude.pipe(upstream);
+    upstream.pipe(claude);
+  };
+  claude.on('data', onData);
+  void done;
+}
+
+/** Rewrite an HTTP/1.1 request head: replace the Authorization line with
+ *  `authValue` (or set x-api-key), and drop the other client-supplied key. */
+export function rewriteH1Auth(headText, { authorization = null, apiKey = null }) {
+  const lines = headText.split('\r\n');
+  const out = [lines[0]]; // request line
+  let setAuth = false;
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (line === '') { out.push(line); continue; }
+    const lower = line.toLowerCase();
+    if (lower.startsWith('x-api-key:')) continue;
+    if (lower.startsWith('authorization:')) {
+      if (authorization) { out.push(`authorization: ${authorization}`); setAuth = true; }
+      continue;
+    }
+    out.push(line);
+  }
+  // insert our credential just before the terminating blank line if not already set
+  if (!setAuth && (authorization || apiKey)) {
+    const blank = out.lastIndexOf('');
+    const hdr = authorization ? `authorization: ${authorization}` : `x-api-key: ${apiKey}`;
+    out.splice(blank, 0, hdr);
+  }
+  return out.join('\r\n');
+}
+
 // Parse a SETTINGS payload for HEADER_TABLE_SIZE and apply it to a decoder's
 // size limit (so it stays in sync with the announcing peer's encoder).
 function applyTableSizeSetting(payload, decoder) {

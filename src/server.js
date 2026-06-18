@@ -1,7 +1,7 @@
 import http from 'node:http';
 import { writeFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
-import { ensureCerts, createConnectHandler, TEST_HOST } from './mitm.js';
+import { ensureCerts, createConnectHandler } from './mitm.js';
 
 
 const HOP_BY_HOP_HEADERS = new Set([
@@ -21,26 +21,10 @@ export function createProxyServer(accountManager, config, hooks = {}) {
 
   const requestHandler = async (req, res) => {
     try {
-      // Built-in MITM test endpoint: answer www.example.org ourselves (never
-      // forwarded) so the proxy + CA can be verified without credentials.
-      const hostHeader = (req.headers.host || '').split(':')[0];
-      if (hostHeader === TEST_HOST) {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-          teamclaude: 'mitm-proxy-ok',
-          host: TEST_HOST,
-          method: req.method,
-          path: req.url,
-        }));
-        return;
-      }
-
-      // Auth check — skip for localhost connections (and decrypted MITM streams,
-      // which originate from a localhost CONNECT and are marked trusted).
+      // Auth check — skip for localhost connections.
       const clientKey = req.headers['x-api-key'];
       const remoteAddr = req.socket.remoteAddress;
-      const isLocal = req.socket.__tcLocal === true ||
-        remoteAddr === '127.0.0.1' || remoteAddr === '::1' || remoteAddr === '::ffff:127.0.0.1';
+      const isLocal = remoteAddr === '127.0.0.1' || remoteAddr === '::1' || remoteAddr === '::ffff:127.0.0.1';
       if (proxyApiKey && clientKey !== proxyApiKey && !isLocal) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
@@ -124,20 +108,17 @@ export function createProxyServer(accountManager, config, hooks = {}) {
 
   // Forward-proxy support (always on, so multiple claude instances can use
   // either ANTHROPIC_BASE_URL or HTTPS_PROXY against the same server). A CONNECT
-  // to the upstream host is TLS-terminated and handled like a normal request
-  // (token injection happens in forwardRequest); anything else is tunneled.
-  // Certs are minted lazily on the first intercepted CONNECT.
+  // to the upstream host is a transparent MITM relay (rewrite only auth); the
+  // test host is answered locally; anything else is blind-tunneled. Certs are
+  // minted lazily on the first intercepted CONNECT.
   const mitmHost = (() => { try { return new URL(upstream).hostname; } catch { return 'api.anthropic.com'; } })();
-  const mitmServer = http.createServer(requestHandler);
   let certsPromise = null;
   const ensureLeaf = async () => {
     certsPromise ||= ensureCerts(mitmHost);
     const c = await certsPromise;
     return { key: c.leafKeyPem, cert: c.leafCertPem };
   };
-  server.on('connect', createConnectHandler({
-    interceptHosts: [mitmHost, TEST_HOST], ensureLeaf, mitmServer, log: console.error,
-  }));
+  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, log: console.error }));
 
   return server;
 }
