@@ -19,6 +19,7 @@ import { getConfigPath } from './config.js';
 import { generateCertChain } from './x509.js';
 import { h2Relay, h1Relay, rewriteH1Auth } from './h2/relay.js';
 import { AccountUuidPatcher } from './account-uuid-rewrite.js';
+import { makeMitmTap } from './request-log.js';
 
 const CA_CERT = 'teamclaude-ca.pem';
 const LEAF_CERT = 'teamclaude-leaf.pem';
@@ -108,7 +109,7 @@ export function hostMode(host, config) {
  * at the top of this file.
  * @param ensureLeaf async () => { key, cert }   // current leaf PEMs
  */
-export function createConnectHandler({ config, accountManager, ensureLeaf, upstreamTlsOptions = {}, log = () => {} }) {
+export function createConnectHandler({ config, accountManager, ensureLeaf, upstreamTlsOptions = {}, logDir = null, log = () => {} }) {
   return (req, clientSocket, head) => {
     clientSocket.on('error', () => {});
     const [host, portStr] = (req.url || '').split(':');
@@ -125,12 +126,12 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, upstr
       return;
     }
 
-    intercept({ host, port, mode, clientSocket, head, accountManager, ensureLeaf, upstreamTlsOptions, log })
+    intercept({ host, port, mode, clientSocket, head, accountManager, ensureLeaf, upstreamTlsOptions, logDir, log })
       .catch((err) => { log(`[TeamClaude] MITM ${host}: ${err.message}`); clientSocket.destroy(); });
   };
 }
 
-async function intercept({ host, port, mode, clientSocket, head, accountManager, ensureLeaf, upstreamTlsOptions, log }) {
+async function intercept({ host, port, mode, clientSocket, head, accountManager, ensureLeaf, upstreamTlsOptions, logDir, log }) {
   const { key, cert } = await ensureLeaf();
 
   if (mode === 'test') {
@@ -163,19 +164,21 @@ async function intercept({ host, port, mode, clientSocket, head, accountManager,
   const makeBodyPatcher = account.accountUuid
     ? () => new AccountUuidPatcher(account.accountUuid)
     : null;
+  const tap = makeMitmTap(logDir, account.name);
 
   if (alpn === 'h2') {
     h2Relay(claudeTls, upstreamSock, {
       rewriteRequest: makeRewriteRequest(account),
       makeBodyPatcher,
       onResponseHeaders: makeQuotaObserver(accountManager, account),
+      tap,
       log,
     });
   } else {
     const auth = account.type === 'oauth'
       ? { authorization: `Bearer ${account.credential}` }
       : { apiKey: account.credential };
-    h1Relay(claudeTls, upstreamSock, { rewriteHead: (h) => rewriteH1Auth(h, auth), makeBodyPatcher });
+    h1Relay(claudeTls, upstreamSock, { rewriteHead: (h) => rewriteH1Auth(h, auth), makeBodyPatcher, tap });
   }
 }
 

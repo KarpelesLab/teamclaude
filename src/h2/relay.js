@@ -46,6 +46,7 @@ export function h2Relay(claude, upstream, opts = {}) {
   const onResponseHeaders = opts.onResponseHeaders || (() => {});
   const makeBodyPatcher = opts.makeBodyPatcher || null; // () => { push(buf)->buf } per stream
   const bodyPatchers = makeBodyPatcher ? new Map() : null; // streamId -> patcher
+  const tap = opts.tap || null; // optional request-logging tap (per streamId)
   const log = opts.log || (() => {});
 
   const reqDec = new HpackDecoder();         // decodes claude's request blocks
@@ -91,18 +92,22 @@ export function h2Relay(claude, upstream, opts = {}) {
       if (fr.flags & FLAG.END_HEADERS) finishReqBlock();
       return;
     }
-    if (fr.type === FRAME.DATA && bodyPatchers) {
+    if (fr.type === FRAME.DATA && (bodyPatchers || tap)) {
       // Same-length in-place body patch (account_uuid) via a per-stream streaming
       // JSON state machine; re-emit the DATA frame unchanged in length/flags so
       // framing & flow control are preserved.
-      let p = bodyPatchers.get(fr.streamId);
-      if (!p) { p = makeBodyPatcher(); bodyPatchers.set(fr.streamId, p); }
-      const payload = p.push(Buffer.from(fr.payload));
+      let payload = Buffer.from(fr.payload);
+      if (bodyPatchers) {
+        let p = bodyPatchers.get(fr.streamId);
+        if (!p) { p = makeBodyPatcher(); bodyPatchers.set(fr.streamId, p); }
+        payload = p.push(payload);
+      }
+      if (tap) tap.reqData(fr.streamId, payload);
       writeBackpressured(upstream, buildFrame({ type: FRAME.DATA, flags: fr.flags, streamId: fr.streamId, payload }), reqCtl);
-      if (fr.flags & FLAG.END_STREAM) bodyPatchers.delete(fr.streamId);
+      if (fr.flags & FLAG.END_STREAM && bodyPatchers) bodyPatchers.delete(fr.streamId);
       return;
     }
-    if (fr.type === FRAME.RST_STREAM && bodyPatchers) bodyPatchers.delete(fr.streamId);
+    if (fr.type === FRAME.RST_STREAM) { if (bodyPatchers) bodyPatchers.delete(fr.streamId); tap?.end(fr.streamId); }
     if (fr.type === FRAME.SETTINGS && fr.streamId === 0 && !(fr.flags & 0x1)) {
       applyTableSizeSetting(fr.payload, respDec); // claude's setting governs response encoding
     }
@@ -114,6 +119,7 @@ export function h2Relay(claude, upstream, opts = {}) {
     asm = null;
     const fields = reqDec.decode(Buffer.concat(frags)); // keep decoder dynamic table in sync
     const rewritten = rewriteRequest(fields);
+    if (tap) tap.req(streamId, rewritten);
     const newBlock = reqEnc.encode(rewritten);
     writeBackpressured(upstream, buildHeaderBlock(streamId, newBlock, { endStream, priority }), reqCtl);
   }
@@ -137,23 +143,29 @@ export function h2Relay(claude, upstream, opts = {}) {
     if (rasm) {
       if (fr.type === FRAME.CONTINUATION && fr.streamId === rasm.streamId) {
         rasm.frags.push(Buffer.from(fr.payload));
-        if (fr.flags & FLAG.END_HEADERS) finishRespBlock();
+        if (fr.flags & FLAG.END_HEADERS) finishRespBlock(rasm.streamId);
       }
       return;
     }
     if (fr.type === FRAME.HEADERS) {
       const { block } = stripHeadersPayload(fr.payload, fr.flags);
       rasm = { streamId: fr.streamId, frags: [block] };
-      if (fr.flags & FLAG.END_HEADERS) finishRespBlock();
+      if (fr.flags & FLAG.END_HEADERS) finishRespBlock(fr.streamId);
+      if (fr.flags & FLAG.END_STREAM) tap?.end(fr.streamId);
+      return;
+    }
+    if (fr.type === FRAME.DATA) {
+      if (tap) { tap.resData(fr.streamId, Buffer.from(fr.payload)); if (fr.flags & FLAG.END_STREAM) tap.end(fr.streamId); }
     }
   }
 
-  function finishRespBlock() {
+  function finishRespBlock(streamId) {
     const { frags } = rasm;
     rasm = null;
     try {
       const fields = respDec.decode(Buffer.concat(frags));
       onResponseHeaders(fields);
+      if (tap) tap.res(streamId, fields);
     } catch (err) {
       log(`[TeamClaude] h2 response header decode failed: ${err.message}`);
     }
@@ -174,12 +186,17 @@ export function h1Relay(claude, upstream, opts = {}) {
   const rewriteHead = opts.rewriteHead || ((h) => h);
   const patcher = opts.makeBodyPatcher ? opts.makeBodyPatcher() : null;
   const rewriteData = patcher ? (b) => patcher.push(b) : (b) => b; // same-length body patch
+  const tap = opts.tap || null;
+  const SID = 1; // single logical request id for h1
   const destroyBoth = () => { claude.destroy(); upstream.destroy(); };
   claude.on('error', destroyBoth);
   upstream.on('error', destroyBoth);
   claude.on('close', () => upstream.destroy());
-  upstream.on('close', () => claude.destroy());
-  upstream.pipe(claude); // responses: verbatim
+  upstream.on('close', () => { tap?.end(SID); claude.destroy(); });
+
+  // responses: verbatim (observed for logging)
+  upstream.on('data', (c) => { if (tap) tap.resData(SID, Buffer.from(c)); claude.write(c); });
+  upstream.on('end', () => { tap?.end(SID); claude.end(); });
 
   let buf = Buffer.alloc(0);
   const onData = (chunk) => {
@@ -190,11 +207,13 @@ export function h1Relay(claude, upstream, opts = {}) {
       return;
     }
     claude.removeListener('data', onData);
-    upstream.write(Buffer.from(rewriteHead(buf.subarray(0, idx + 4).toString('latin1')), 'latin1'));
+    const head = rewriteHead(buf.subarray(0, idx + 4).toString('latin1'));
+    if (tap) tap.reqHead(SID, head);
+    upstream.write(Buffer.from(head, 'latin1'));
     const remainder = buf.subarray(idx + 4);
-    if (remainder.length) upstream.write(rewriteData(Buffer.from(remainder)));
+    if (remainder.length) { const patched = rewriteData(Buffer.from(remainder)); if (tap) tap.reqData(SID, patched); upstream.write(patched); }
     // forward (patched) request body
-    claude.on('data', (c) => upstream.write(rewriteData(Buffer.from(c))));
+    claude.on('data', (c) => { const patched = rewriteData(Buffer.from(c)); if (tap) tap.reqData(SID, patched); upstream.write(patched); });
     claude.on('end', () => upstream.end());
   };
   claude.on('data', onData);

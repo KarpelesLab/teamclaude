@@ -5,6 +5,9 @@ import net from 'node:net';
 import tls from 'node:tls';
 import http from 'node:http';
 import { once } from 'node:events';
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { generateCertChain } from '../src/x509.js';
 import { createConnectHandler } from '../src/mitm.js';
 
@@ -34,8 +37,8 @@ function connectThroughProxy(proxyPort, target, caCertPem, alpn) {
 
 const ACCOUNT_UUID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
 
-function makeProxy(upPort, caCertPem, leafCertPem, leafKeyPem, onQuota) {
-  const account = { index: 0, type: 'oauth', credential: 'REAL-TOKEN', accountUuid: ACCOUNT_UUID };
+function makeProxy(upPort, caCertPem, leafCertPem, leafKeyPem, onQuota, logDir = null) {
+  const account = { index: 0, type: 'oauth', credential: 'REAL-TOKEN', accountUuid: ACCOUNT_UUID, name: 'acct@x' };
   const accountManager = {
     getActiveAccount: () => account,
     ensureTokenFresh: async () => {},
@@ -48,6 +51,7 @@ function makeProxy(upPort, caCertPem, leafCertPem, leafKeyPem, onQuota) {
     accountManager,
     ensureLeaf: async () => ({ key: leafKeyPem, cert: leafCertPem }),
     upstreamTlsOptions: { ca: [caCertPem] },
+    logDir,
     log: () => {},
   }));
   return proxy;
@@ -127,6 +131,35 @@ test('MITM h2 rewrites body account_uuid to the injected account', async () => {
     client.close();
   } finally {
     proxy.close(); upstream.close();
+  }
+});
+
+test('MITM logs proxied requests when --log-to is set', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tc-mitmlog-'));
+  const { caCertPem, leafCertPem, leafKeyPem } = generateCertChain('localhost');
+  const upstream = http2.createSecureServer({ key: leafKeyPem, cert: leafCertPem });
+  upstream.on('stream', (s) => { s.respond({ ':status': 200 }); s.end('{"ok":true}'); });
+  const upPort = await listen(upstream);
+  const proxy = makeProxy(upPort, caCertPem, leafCertPem, leafKeyPem, () => {}, dir);
+  const proxyPort = await listen(proxy);
+
+  const tlsSock = await connectThroughProxy(proxyPort, `localhost:${upPort}`, caCertPem, ['h2', 'http/1.1']);
+  try {
+    const client = http2.connect('https://localhost', { createConnection: () => tlsSock });
+    const req = client.request({ ':method': 'POST', ':path': '/v1/messages', authorization: 'Bearer SECRET-FAKE' });
+    req.resume(); req.end('{"hi":1}');
+    await once(req, 'close');
+    await new Promise((r) => setTimeout(r, 150)); // let the async file write land
+    const files = readdirSync(dir).filter((f) => f.endsWith('.log'));
+    assert.ok(files.length >= 1, 'a log file was written');
+    const content = readFileSync(join(dir, files[0]), 'utf8');
+    assert.match(content, /\/v1\/messages/);     // request line
+    assert.match(content, /RESPONSE 200/);        // response status
+    assert.match(content, /REQUEST BODY/);        // request body section
+    assert.ok(!content.includes('SECRET-FAKE'));  // client token never logged (replaced + masked)
+    client.close();
+  } finally {
+    proxy.close(); upstream.close(); rmSync(dir, { recursive: true, force: true });
   }
 });
 
