@@ -1,15 +1,50 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { existsSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { aliasLine, rcPathForShell, installAlias, uninstallAlias } from '../src/alias.js';
+import { aliasLine, rcPathForShell, teamclaudeRef, installAlias, uninstallAlias } from '../src/alias.js';
 
-test('aliasLine uses the right syntax per shell', () => {
-  assert.equal(aliasLine('bash'), "alias claude='teamclaude run --'");
-  assert.equal(aliasLine('zsh'), "alias claude='teamclaude run --'");
-  assert.equal(aliasLine('fish'), "alias claude 'teamclaude run --'");
+test('aliasLine uses the right syntax per shell (explicit ref)', () => {
+  assert.equal(aliasLine('bash', 'teamclaude'), "alias claude='teamclaude run --'");
+  assert.equal(aliasLine('zsh', 'teamclaude'), "alias claude='teamclaude run --'");
+  assert.equal(aliasLine('fish', 'teamclaude'), "alias claude 'teamclaude run --'");
+});
+
+test('aliasLine embeds a quoted absolute path when teamclaude is not on PATH', () => {
+  assert.equal(aliasLine('bash', '"/opt/tc/index.js"'), `alias claude='"/opt/tc/index.js" run --'`);
+  assert.equal(aliasLine('fish', '"/opt/tc/index.js"'), `alias claude '"/opt/tc/index.js" run --'`);
+});
+
+test('teamclaudeRef returns the bare command when it is on PATH', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'tc-path-'));
+  const prev = process.env.PATH;
+  try {
+    const bin = join(dir, 'teamclaude');
+    writeFileSync(bin, '#!/bin/sh\n', { mode: 0o755 });
+    chmodSync(bin, 0o755);
+    process.env.PATH = dir;
+    assert.equal(teamclaudeRef(), 'teamclaude');
+  } finally {
+    process.env.PATH = prev;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('teamclaudeRef falls back to a quoted absolute path when not on PATH', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'tc-path-'));
+  const prev = process.env.PATH;
+  try {
+    process.env.PATH = dir; // empty dir → no teamclaude
+    const ref = teamclaudeRef();
+    assert.match(ref, /^".*"$/);          // quoted
+    assert.ok(ref.includes('/'));          // an absolute-ish path, not the bare command
+    assert.notEqual(ref, 'teamclaude');
+  } finally {
+    process.env.PATH = prev;
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test('rcPathForShell maps shells to their rc files', () => {
@@ -36,7 +71,8 @@ test('install adds the alias, is idempotent, and uninstall removes it cleanly', 
   try {
     installAlias({ shell: 'bash', rcPath });
     let text = await readFile(rcPath, 'utf8');
-    assert.ok(text.includes("alias claude='teamclaude run --'"));
+    assert.match(text, /alias claude=.*run --/);
+    assert.ok(text.includes('# teamclaude alias'));
     assert.ok(text.includes('# existing user content')); // preserved
 
     // Idempotent: a second install doesn't duplicate the line.
@@ -44,12 +80,29 @@ test('install adds the alias, is idempotent, and uninstall removes it cleanly', 
     text = await readFile(rcPath, 'utf8');
     assert.equal(text.match(/alias claude=/g).length, 1);
 
-    // Uninstall restores the original content (no alias, no marker).
+    // Uninstall removes our block; user content stays intact.
     uninstallAlias({ shell: 'bash', rcPath });
     text = await readFile(rcPath, 'utf8');
     assert.ok(!text.includes('alias claude='));
     assert.ok(!text.includes('# teamclaude alias'));
-    assert.ok(text.includes('export FOO=1')); // user content intact
+    assert.ok(text.includes('export FOO=1'));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('uninstall removes our block even if the embedded path differs', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'tc-alias-'));
+  const rcPath = join(dir, '.bashrc');
+  // Simulate a previously-installed alias with an absolute path that no longer
+  // matches what teamclaudeRef() would compute now.
+  await writeFile(rcPath, 'export FOO=1\n# teamclaude alias\nalias claude=\'"/old/path/index.js" run --\'\n');
+  try {
+    uninstallAlias({ shell: 'bash', rcPath });
+    const text = await readFile(rcPath, 'utf8');
+    assert.ok(!text.includes('alias claude='));
+    assert.ok(!text.includes('# teamclaude alias'));
+    assert.ok(text.includes('export FOO=1'));
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

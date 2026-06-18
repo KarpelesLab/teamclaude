@@ -8,7 +8,7 @@
 // that exec `claude` themselves). It's intentionally lighter than a PATH shim:
 // no binary shadowing, one line per rc, trivially reversible.
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync, realpathSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 
@@ -19,10 +19,33 @@ export function detectShell() {
   return (process.env.SHELL || '').split('/').pop() || 'bash';
 }
 
+/** Whether a bare command resolves on the current $PATH. */
+function commandOnPath(cmd) {
+  for (const dir of (process.env.PATH || '').split(':')) {
+    if (dir && existsSync(join(dir, cmd))) return true;
+  }
+  return false;
+}
+
+/**
+ * How the alias should invoke teamclaude. Prefer the bare `teamclaude` when it's
+ * on $PATH; otherwise embed the absolute path to this CLI (quoted) so the alias
+ * still works when teamclaude isn't installed on PATH — e.g. run from a clone.
+ */
+export function teamclaudeRef() {
+  if (commandOnPath('teamclaude')) return 'teamclaude';
+  const entry = process.argv[1];
+  if (!entry) return 'teamclaude';
+  let abs;
+  try { abs = realpathSync(entry); } catch { abs = entry; }
+  return `"${abs}"`;
+}
+
 /** The alias definition for a given shell family. */
-export function aliasLine(shell = detectShell()) {
-  if (shell === 'fish') return "alias claude 'teamclaude run --'";
-  return "alias claude='teamclaude run --'";
+export function aliasLine(shell = detectShell(), ref = teamclaudeRef()) {
+  const body = `${ref} run --`;
+  if (shell === 'fish') return `alias claude '${body}'`;
+  return `alias claude='${body}'`;
 }
 
 /** The rc file an alias for this shell should live in. */
@@ -73,11 +96,11 @@ export function uninstallAlias({ shell = detectShell(), rcPath = rcPathForShell(
     return;
   }
   const text = readFileSync(rcPath, 'utf8');
-  const line = aliasLine(shell);
-  // Strip our marked block (and tolerate a bare alias line without the marker).
-  const blockRe = new RegExp(`\\n?${escapeRe(MARKER)}\\n${escapeRe(line)}\\n?`, 'g');
+  // Strip our marked block: the marker comment + the single line after it.
+  // Matching by marker (not by exact alias text) makes this robust even if the
+  // embedded teamclaude path differs from what's computed now.
+  const blockRe = new RegExp(`\\n?${escapeRe(MARKER)}\\n[^\\n]*\\n?`, 'g');
   let cleaned = text.replace(blockRe, '\n');
-  cleaned = cleaned.replace(new RegExp(`\\n?${escapeRe(line)}\\n?`, 'g'), '\n');
   cleaned = cleaned.replace(/\n{3,}/g, '\n\n');
 
   if (cleaned === text) {
