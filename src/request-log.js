@@ -64,7 +64,7 @@ function stamp() {
 // Tracks how one direction's body is written: decide formatter-vs-raw on the
 // first chunk (event-stream → raw; otherwise pretty-print if it looks like JSON,
 // i.e. the first non-whitespace byte is { or [). Writes the section header once.
-class BodyWriter {
+export class BodyWriter {
   constructor(write, label, contentType) {
     this.write = write;
     this.label = label;
@@ -101,7 +101,10 @@ export function makeMitmTap(logDir, accountName = '') {
     let r = recs.get(id);
     if (!r) {
       r = { ws: open(), reqBody: null, resBody: null, ended: false };
-      r.write = (s) => { if (!r.ended && s) r.ws.write(s); };
+      // Write strings as latin1 so a body's original bytes (which the formatter
+      // and raw path pass through 1:1 as latin1) round-trip exactly — writing as
+      // utf8 would re-encode bytes >127 and corrupt non-ASCII content.
+      r.write = (s) => { if (!r.ended && s) r.ws.write(Buffer.from(String(s), 'latin1')); };
       recs.set(id, r);
     }
     return r;

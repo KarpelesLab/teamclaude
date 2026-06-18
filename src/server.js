@@ -1,8 +1,10 @@
 import http from 'node:http';
-import { writeFile, mkdir } from 'node:fs/promises';
+import { createWriteStream } from 'node:fs';
+import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { ensureCerts, createConnectHandler } from './mitm.js';
 import { patchAccountUuid } from './account-uuid-rewrite.js';
+import { BodyWriter } from './request-log.js';
 
 
 const HOP_BY_HOP_HEADERS = new Set([
@@ -167,15 +169,28 @@ function logTimestamp() {
   return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`;
 }
 
-async function writeRequestLog(logDir, reqId, sections) {
-  if (!logDir) return;
-  const ts = logTimestamp();
-  const filename = `${ts}_${String(reqId).padStart(5, '0')}.log`;
-  try {
-    await writeFile(join(logDir, filename), sections.join('\n\n'), 'utf-8');
-  } catch (err) {
-    console.error(`[TeamClaude] Failed to write log: ${err.message}`);
-  }
+// A per-request log that streams to disk as the request/response flow, instead
+// of buffering the whole body in memory and writing once at the end. The file
+// is opened on first write; header sections are written verbatim and bodies are
+// streamed through BodyWriter (JSON pretty-printed on the fly, SSE/other raw),
+// so even a ~1M-token response costs only the current chunk.
+function openRequestLog(logDir, reqId) {
+  const filename = `${logTimestamp()}_${String(reqId).padStart(5, '0')}.log`;
+  const ws = createWriteStream(join(logDir, filename), { flags: 'a' });
+  ws.on('error', (err) => console.error(`[TeamClaude] Failed to write log: ${err.message}`));
+  let ended = false;
+  const write = (s) => { if (!ended && s) ws.write(Buffer.from(String(s), 'latin1')); };
+  return {
+    write,
+    // Stream a complete body buffer under a section header.
+    body(label, buf, contentType) {
+      if (!buf || !buf.length) { write(`\n\n=== ${label} ===\n(empty)`); return; }
+      new BodyWriter(write, label, contentType || '').chunk(buf);
+    },
+    // A BodyWriter to append chunks incrementally (e.g. an SSE response).
+    bodyWriter(label, contentType) { return new BodyWriter(write, label, contentType || ''); },
+    end() { if (!ended) { ended = true; ws.end('\n'); } },
+  };
 }
 
 function formatHeaders(headers) {
@@ -245,28 +260,22 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   // token we're injecting (same-length patch; no-op if absent).
   const sendBody = account.accountUuid ? patchAccountUuid(body, account.accountUuid) : body;
 
-  // Build log sections
-  const logSections = [];
-  if (logDir) {
+  // Streaming request log, opened lazily on the first terminal outcome (a
+  // pure-429-then-retry attempt writes no file, matching prior behavior). The
+  // request head+body are written once, just before the response is logged.
+  let log = null;
+  let reqLogged = false;
+  const getLog = () => (logDir ? (log ||= openRequestLog(logDir, reqId)) : null);
+  const logRequestHead = () => {
+    const l = getLog();
+    if (!l || reqLogged) return;
+    reqLogged = true;
     const safeHeaders = { ...headers };
-    // Mask credentials in logs
-    if (safeHeaders['x-api-key']) {
-      safeHeaders['x-api-key'] = safeHeaders['x-api-key'].slice(0, 15) + '...';
-    }
-    if (safeHeaders['authorization']) {
-      safeHeaders['authorization'] = safeHeaders['authorization'].slice(0, 20) + '...';
-    }
-    logSections.push(
-      `=== REQUEST (account: ${account.name}, retry: ${retryCount}) ===\n${method} ${upstreamUrl}\n${formatHeaders(safeHeaders)}`,
-    );
-    if (body.length > 0) {
-      try {
-        logSections.push(`=== REQUEST BODY ===\n${JSON.stringify(JSON.parse(body.toString()), null, 2)}`);
-      } catch {
-        logSections.push(`=== REQUEST BODY (${body.length} bytes) ===\n${body.toString()}`);
-      }
-    }
-  }
+    if (safeHeaders['x-api-key']) safeHeaders['x-api-key'] = safeHeaders['x-api-key'].slice(0, 15) + '...';
+    if (safeHeaders['authorization']) safeHeaders['authorization'] = safeHeaders['authorization'].slice(0, 20) + '...';
+    l.write(`=== REQUEST (account: ${account.name}, retry: ${retryCount}) ===\n${method} ${upstreamUrl}\n${formatHeaders(safeHeaders)}`);
+    if (body.length > 0) l.body('REQUEST BODY', body, req.headers['content-type']);
+  };
 
   try {
     const upstreamRes = await fetch(upstreamUrl, {
@@ -306,15 +315,9 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       if (retryCount >= maxRetries) {
         console.log(`[TeamClaude] Persistent 429 on "${account.name}" — throttling ${retryAfter}s and re-dispatching`);
         accountManager.markRateLimited(account.index, retryAfter);
-        if (logDir) {
-          logSections.push(`=== RESPONSE 429 — capped after ${retryCount} retries, throttling account ===\n${formatHeaders(upstreamRes.headers)}`);
-        }
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
       }
 
-      if (logDir) {
-        logSections.push(`=== RESPONSE 429 — waiting ${retryAfter}s ===\n${formatHeaders(upstreamRes.headers)}`);
-      }
       console.log(`[TeamClaude] 429 on "${account.name}" — waiting ${retryAfter}s before retry`);
       await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
       // Client may have disconnected during the wait
@@ -322,10 +325,10 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
     }
 
-    // Log response headers
-    if (logDir) {
-      logSections.push(`=== RESPONSE ${upstreamRes.status} ===\n${formatHeaders(upstreamRes.headers)}`);
-    }
+    // Log the request head (once) followed by the response headers, streaming
+    // to disk from here on.
+    logRequestHead();
+    getLog()?.write(`\n\n=== RESPONSE ${upstreamRes.status} ===\n${formatHeaders(upstreamRes.headers)}`);
 
     ctx.status = upstreamRes.status;
 
@@ -341,43 +344,35 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     res.writeHead(upstreamRes.status, responseHeaders);
 
     if (!upstreamRes.body) {
-      if (logDir) {
-        logSections.push(`=== RESPONSE BODY ===\n(empty)`);
-        writeRequestLog(logDir, reqId, logSections);
-      }
+      const l = getLog();
+      if (l) { l.write('\n\n=== RESPONSE BODY ===\n(empty)'); l.end(); }
       res.end();
       return;
     }
 
-    const isStreaming = (upstreamRes.headers.get('content-type') || '').includes('text/event-stream');
+    const contentType = upstreamRes.headers.get('content-type') || '';
+    const isStreaming = contentType.includes('text/event-stream');
 
     if (isStreaming) {
-      const streamLog = logDir ? [] : null;
-      await streamResponse(upstreamRes.body, res, account.index, accountManager, streamLog);
-      if (logDir) {
-        logSections.push(`=== RESPONSE BODY (streamed) ===\n${streamLog.join('')}`);
-        writeRequestLog(logDir, reqId, logSections);
-      }
+      // Stream each chunk straight to the log as it is relayed — never hold the
+      // whole (potentially ~1M-token) SSE body in memory.
+      const l = getLog();
+      const bw = l ? l.bodyWriter('RESPONSE BODY (streamed)', contentType) : null;
+      await streamResponse(upstreamRes.body, res, account.index, accountManager, bw);
+      l?.end();
     } else {
       const buf = Buffer.from(await upstreamRes.arrayBuffer());
       extractUsageFromBody(buf, account.index, accountManager);
-      if (logDir) {
-        try {
-          logSections.push(`=== RESPONSE BODY ===\n${JSON.stringify(JSON.parse(buf.toString()), null, 2)}`);
-        } catch {
-          logSections.push(`=== RESPONSE BODY (${buf.length} bytes) ===\n${buf.toString()}`);
-        }
-        writeRequestLog(logDir, reqId, logSections);
-      }
+      const l = getLog();
+      if (l) { l.body('RESPONSE BODY', buf, contentType); l.end(); }
       res.end(buf);
     }
   } catch (err) {
     console.error(`[TeamClaude] Upstream error (account "${account.name}"):`, err.message);
 
-    if (logDir) {
-      logSections.push(`=== ERROR ===\n${err.stack || err.message}`);
-      writeRequestLog(logDir, reqId, logSections);
-    }
+    logRequestHead();
+    const l = getLog();
+    if (l) { l.write(`\n\n=== ERROR ===\n${err.stack || err.message}`); l.end(); }
 
     const isTransient = err instanceof Error &&
       (err.message.includes('fetch failed') ||
@@ -409,7 +404,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 /**
  * Stream an SSE response to the client, parsing usage data along the way.
  */
-async function streamResponse(webStream, res, accountIndex, accountManager, streamLog) {
+async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter) {
   const reader = webStream.getReader();
   const decoder = new TextDecoder();
   let sseBuffer = '';
@@ -425,10 +420,10 @@ async function streamResponse(webStream, res, accountIndex, accountManager, stre
       // Forward chunk immediately
       const ok = res.write(value);
 
-      const text = decoder.decode(value, { stream: true });
+      // Append to the log as it streams (no whole-body buffering)
+      if (bodyWriter) bodyWriter.chunk(Buffer.from(value));
 
-      // Capture for logging
-      if (streamLog) streamLog.push(text);
+      const text = decoder.decode(value, { stream: true });
 
       // Parse SSE events for usage tracking
       sseBuffer += text;
