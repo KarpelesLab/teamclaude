@@ -119,12 +119,25 @@ In selection mode, use `j`/`k` or arrow keys to navigate, `Enter` to confirm, `E
 teamclaude run
 ```
 
+`run` probes the proxy first: if it's up, Claude Code is routed through it; if it's **not** running, `claude` is launched directly so nothing breaks.
+
 Or manually set the environment:
 
 ```bash
 eval $(teamclaude env)
 claude
 ```
+
+### Routing plain `claude` automatically (alias)
+
+So you don't have to type `teamclaude run` every time, add a shell alias that makes plain `claude` go through the proxy (and fall back to direct when it's down):
+
+```bash
+teamclaude alias              # print the alias for your shell
+teamclaude alias --install    # or write it to your shell rc (--uninstall to remove)
+```
+
+This is an interactive-shell alias — it affects `claude` typed at a prompt, not `claude` spawned by editors or scripts. It's a thin passthrough to `teamclaude run`, which holds the proxy-up/down logic.
 
 ### Other commands
 
@@ -136,6 +149,7 @@ teamclaude remove <name>     # Remove an account (by name or email)
 teamclaude disable <name>    # Temporarily exclude an account from rotation
 teamclaude enable <name>     # Re-enable it (also clears a stuck error state)
 teamclaude priority <name> 1 # Set rotation priority (lower = preferred)
+teamclaude alias             # Print/install a `claude` alias that routes via the proxy
 teamclaude api <path>        # Call an API endpoint with account credentials
 teamclaude help              # Show all commands
 ```

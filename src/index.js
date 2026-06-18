@@ -2,11 +2,13 @@
 
 import { spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
+import net from 'node:net';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, loadState, saveState } from './config.js';
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import { sameIdentity, orgKey, matchAccounts } from './identity.js';
+import * as alias from './alias.js';
 import { TUI } from './tui.js';
 
 const args = process.argv.slice(2);
@@ -57,6 +59,10 @@ switch (command) {
     break;
   case 'api':
     await apiCommand();
+    process.exit(0);
+    break;
+  case 'alias':
+    aliasCommand();
     process.exit(0);
     break;
   case 'help':
@@ -381,17 +387,25 @@ async function runCommand() {
   const claudeArgs = args.slice(1);
   if (claudeArgs[0] === '--') claudeArgs.shift();
 
-  // Only set ANTHROPIC_BASE_URL — Claude Code keeps its own OAuth token
-  // which the proxy accepts from localhost. Not setting ANTHROPIC_API_KEY
-  // lets Claude Code stay in subscription mode (full model access).
+  // Route through the proxy only when it's actually up; otherwise launch claude
+  // directly so a stopped proxy doesn't break `claude`. This is what lets the
+  // shell alias (`claude='teamclaude run --'`) be a dumb passthrough.
+  const port = config.proxy.port;
+  const env = { ...process.env };
+  if (await isProxyUp(port)) {
+    // Only set ANTHROPIC_BASE_URL — Claude Code keeps its own OAuth token
+    // which the proxy accepts from localhost. Not setting ANTHROPIC_API_KEY
+    // lets Claude Code stay in subscription mode (full model access).
+    env.ANTHROPIC_BASE_URL = `http://localhost:${port}`;
+  } else {
+    console.error(`[TeamClaude] Proxy not running on port ${port} — launching claude directly (start it with: teamclaude server)`);
+  }
+
   // Use spawnSync so the Node process blocks entirely — behaves like execvp.
   const result = spawnSync('claude', claudeArgs, {
     stdio: 'inherit',
     shell: process.platform === 'win32',
-    env: {
-      ...process.env,
-      ANTHROPIC_BASE_URL: `http://localhost:${config.proxy.port}`,
-    },
+    env,
   });
 
   if (result.error) {
@@ -618,6 +632,19 @@ async function apiCommand() {
   }
 }
 
+// ── alias ───────────────────────────────────────────────────
+
+function aliasCommand() {
+  const shell = argValue('--shell') || undefined;
+  if (args.includes('--uninstall')) {
+    alias.uninstallAlias({ shell });
+  } else if (args.includes('--install')) {
+    alias.installAlias({ shell });
+  } else {
+    alias.printAlias({ shell });
+  }
+}
+
 // ── remove ──────────────────────────────────────────────────
 
 /**
@@ -742,7 +769,9 @@ Commands:
   login               OAuth login via browser
   login --api         Add an API key account
   env                 Print env vars to use with Claude
-  run [-- args...]    Run Claude Code through the proxy
+  run [-- args...]    Run Claude Code through the proxy (direct if it's down)
+  alias               Print a shell alias so plain 'claude' routes via the proxy
+                      (--install to write it to your shell rc; --uninstall to remove)
   status              Show proxy & account status (live)
   accounts            List configured accounts
   remove <name>       Remove an account (by name or email; --org to disambiguate)
@@ -957,6 +986,20 @@ async function resolveAccounts(config) {
 function argValue(flag) {
   const i = args.indexOf(flag);
   return (i >= 0 && args[i + 1]) ? args[i + 1] : null;
+}
+
+// Quick liveness probe: is something listening on the local proxy port?
+// A successful TCP connect is enough (the proxy is local). Times out fast so a
+// down proxy doesn't add noticeable latency to `claude` launches via the alias.
+function isProxyUp(port, timeout = 600) {
+  return new Promise(resolve => {
+    const socket = net.connect({ host: '127.0.0.1', port });
+    const done = up => { socket.destroy(); resolve(up); };
+    socket.setTimeout(timeout);
+    socket.once('connect', () => done(true));
+    socket.once('timeout', () => done(false));
+    socket.once('error', () => resolve(false));
+  });
 }
 
 function handleServerListenError(err, port) {
