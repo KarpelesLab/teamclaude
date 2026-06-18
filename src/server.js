@@ -263,7 +263,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       try {
         logSections.push(`=== REQUEST BODY ===\n${JSON.stringify(JSON.parse(body.toString()), null, 2)}`);
       } catch {
-        logSections.push(`=== REQUEST BODY (${body.length} bytes) ===\n${body.toString().slice(0, 4096)}`);
+        logSections.push(`=== REQUEST BODY (${body.length} bytes) ===\n${body.toString()}`);
       }
     }
   }
@@ -365,7 +365,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         try {
           logSections.push(`=== RESPONSE BODY ===\n${JSON.stringify(JSON.parse(buf.toString()), null, 2)}`);
         } catch {
-          logSections.push(`=== RESPONSE BODY (${buf.length} bytes) ===\n${buf.toString().slice(0, 8192)}`);
+          logSections.push(`=== RESPONSE BODY (${buf.length} bytes) ===\n${buf.toString()}`);
         }
         writeRequestLog(logDir, reqId, logSections);
       }

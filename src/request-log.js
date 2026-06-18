@@ -6,8 +6,6 @@
 import { writeFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 
-const REQ_CAP = 64 * 1024;
-const RES_CAP = 16 * 1024;
 let seq = 0; // module-global so filenames are unique across connections
 
 function maskValue(name, val) {
@@ -38,13 +36,12 @@ function maskHeadText(text) {
   }).join('\r\n');
 }
 
-function bodySection(label, buf, total, cap) {
+// Log the WHOLE body — AI requests can carry the full conversation (up to ~1M
+// tokens), so never truncate. JSON is pretty-printed; anything else is verbatim.
+function bodySection(label, buf) {
   if (!buf.length) return `=== ${label} ===\n(empty)`;
-  if (total <= cap) {
-    try { return `=== ${label} ===\n${JSON.stringify(JSON.parse(buf.toString()), null, 2)}`; } catch { /* not json */ }
-  }
-  const note = total > cap ? ` (${total} bytes, truncated)` : ` (${total} bytes)`;
-  return `=== ${label}${note} ===\n${buf.toString('utf-8').slice(0, cap)}`;
+  try { return `=== ${label} ===\n${JSON.stringify(JSON.parse(buf.toString()), null, 2)}`; } catch { /* not json */ }
+  return `=== ${label} (${buf.length} bytes) ===\n${buf.toString('utf-8')}`;
 }
 
 function stamp() {
@@ -59,7 +56,7 @@ export function makeMitmTap(logDir, accountName = '') {
   const recs = new Map();
   const rec = (id) => {
     let r = recs.get(id);
-    if (!r) { r = { reqFields: null, reqHead: null, reqBody: [], reqLen: 0, resFields: null, resBody: [], resLen: 0, written: false }; recs.set(id, r); }
+    if (!r) { r = { reqFields: null, reqHead: null, reqBody: [], resFields: null, resBody: [], written: false }; recs.set(id, r); }
     return r;
   };
 
@@ -72,9 +69,9 @@ export function makeMitmTap(logDir, accountName = '') {
     } else if (r.reqHead) {
       s.push(`=== REQUEST (h1${accountName ? `, account: ${accountName}` : ''}) ===\n${maskHeadText(r.reqHead).trimEnd()}`);
     }
-    if (r.reqLen) s.push(bodySection('REQUEST BODY', Buffer.concat(r.reqBody), r.reqLen, REQ_CAP));
+    if (r.reqBody.length) s.push(bodySection('REQUEST BODY', Buffer.concat(r.reqBody)));
     if (r.resFields) s.push(`=== RESPONSE ${get(r.resFields, ':status')} ===\n${fmtFields(r.resFields, { pseudo: false })}`);
-    if (r.resLen) s.push(bodySection('RESPONSE BODY', Buffer.concat(r.resBody), r.resLen, RES_CAP));
+    if (r.resBody.length) s.push(bodySection('RESPONSE BODY', Buffer.concat(r.resBody)));
     if (!s.length) return;
     const file = join(logDir, `${stamp()}_mitm_${String(++seq).padStart(5, '0')}.log`);
     writeFile(file, s.join('\n\n'), 'utf-8').catch(() => {});
@@ -83,9 +80,9 @@ export function makeMitmTap(logDir, accountName = '') {
   return {
     req(id, fields) { rec(id).reqFields = fields; },
     reqHead(id, text) { rec(id).reqHead = text; },
-    reqData(id, buf) { const r = rec(id); if (r.reqLen < REQ_CAP) { r.reqBody.push(buf); r.reqLen += buf.length; } },
+    reqData(id, buf) { rec(id).reqBody.push(buf); },
     res(id, fields) { rec(id).resFields = fields; },
-    resData(id, buf) { const r = rec(id); if (r.resLen < RES_CAP) { r.resBody.push(buf); r.resLen += buf.length; } },
+    resData(id, buf) { rec(id).resBody.push(buf); },
     end(id) { const r = recs.get(id); if (r) { recs.delete(id); write(r); } },
   };
 }
