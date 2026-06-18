@@ -1,4 +1,5 @@
 import { importCredentials, fetchProfile } from './oauth.js';
+import { sameIdentity } from './identity.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -314,34 +315,50 @@ export class TUI {
       const entry = {
         name, type: 'oauth', source: 'import',
         accountUuid: profile?.accountUuid || null,
+        orgUuid: profile?.orgUuid || null,
+        orgName: profile?.orgName || null,
         accessToken: creds.accessToken,
         refreshToken: creds.refreshToken,
         expiresAt: creds.expiresAt,
       };
 
-      // Deduplicate: match by UUID first, then by name
-      let idx = profile?.accountUuid
-        ? this.config.accounts.findIndex(a => a.accountUuid === profile.accountUuid)
-        : -1;
+      // Deduplicate by account+org identity (same email in a different org is a
+      // distinct account), then by name.
+      let idx = this.config.accounts.findIndex(a => sameIdentity(a, entry));
       if (idx < 0) idx = this.config.accounts.findIndex(a => a.name === name);
 
       if (idx >= 0) {
-        this.config.accounts[idx] = entry;
+        const prev = this.config.accounts[idx];
+        this.config.accounts[idx] = { ...prev, ...entry, name: prev.name };
         // Update the running account manager entry
-        const amAcct = this.am.accounts[idx];
+        const amAcct = this.am.accounts.find(a => sameIdentity(a, entry)) || this.am.accounts[idx];
         if (amAcct) {
           amAcct.credential = creds.accessToken;
           amAcct.refreshToken = creds.refreshToken;
           amAcct.expiresAt = creds.expiresAt;
           amAcct.accountUuid = entry.accountUuid;
-          amAcct.name = name;
+          amAcct.orgUuid = entry.orgUuid;
+          amAcct.orgName = entry.orgName;
           if (amAcct.status === 'error') amAcct.status = 'active';
         }
-        this._addLog(`Updated account "${name}"`);
+        this._addLog(`Updated account "${prev.name}"`);
       } else {
+        // New org for this person: disambiguate colliding email names with " (org)".
+        if (profile?.accountUuid) {
+          const orgLbl = a => a.orgName || (a.orgUuid ? a.orgUuid.slice(0, 8) : 'org');
+          const collisions = this.config.accounts.filter(
+            a => a.accountUuid === entry.accountUuid && !sameIdentity(a, entry)
+          );
+          if (collisions.length > 0) {
+            for (const c of collisions) {
+              if (!c.name.includes(' (')) c.name = `${c.name} (${orgLbl(c)})`;
+            }
+            entry.name = `${name} (${orgLbl(entry)})`;
+          }
+        }
         this.config.accounts.push(entry);
         this.am.addAccount(entry);
-        this._addLog(`Imported account "${name}"`);
+        this._addLog(`Imported account "${entry.name}"`);
       }
 
       await this.saveConfig(this.config);

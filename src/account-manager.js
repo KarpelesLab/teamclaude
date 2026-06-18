@@ -24,6 +24,9 @@ export class AccountManager {
       name: acct.name,
       type: acct.type,
       accountUuid: acct.accountUuid || null,
+      orgUuid: acct.orgUuid || null,
+      orgName: acct.orgName || null,
+      priority: acct.priority || 0,
       credential: acct.accessToken || acct.apiKey,
       refreshToken: acct.refreshToken || null,
       expiresAt: acct.expiresAt || null,
@@ -164,6 +167,8 @@ export class AccountManager {
     for (const acc of candidates) {
       if (acc.index === this.currentIndex) continue;
       if (!this._isAvailable(acc)) continue; // enough session & weekly quota left
+      // Don't demote to a lower-priority (higher value) account on a reset.
+      if ((acc.priority || 0) > (current.priority || 0)) continue;
       const weekly = acc.quota.unified7dReset;
       if (weekly == null) continue; // need a known weekly to compare
       if (weekly < bestWeekly) {
@@ -201,12 +206,17 @@ export class AccountManager {
   }
 
   _selectNext() {
-    // Among all available accounts, prefer the one with no known weekly limit
-    // first — using it lets us discover its quota. Otherwise prefer the account
-    // whose weekly limit expires the soonest: that quota is closest to
-    // refreshing, so spending it first preserves accounts whose weekly window
-    // resets further out.
+    // Selection order among available accounts:
+    //   1. lowest `priority` value (operator-controlled; default 0, lower = preferred)
+    //   2. then the account with no known weekly limit — using it lets us
+    //      discover its quota
+    //   3. then the account whose weekly limit expires soonest: that quota is
+    //      closest to refreshing, so spending it first preserves accounts whose
+    //      weekly window resets further out.
+    // With all priorities at the default 0, this reduces to the original
+    // weekly-reset heuristic.
     let best = null;
+    let bestPriority = Infinity;
     let bestReset = Infinity;
 
     for (let i = 0; i < this.accounts.length; i++) {
@@ -216,9 +226,12 @@ export class AccountManager {
       // is still below 98%.
       if (!this._isAvailable(account)) continue;
 
+      const priority = account.priority || 0;
       // Unknown weekly reset sorts first so we fill it in.
       const weeklyReset = account.quota.unified7dReset || -Infinity;
-      if (weeklyReset < bestReset) {
+      if (priority < bestPriority ||
+          (priority === bestPriority && weeklyReset < bestReset)) {
+        bestPriority = priority;
         bestReset = weeklyReset;
         best = account;
       }
@@ -417,6 +430,9 @@ export class AccountManager {
       name: acctData.name,
       type: acctData.type,
       accountUuid: acctData.accountUuid || null,
+      orgUuid: acctData.orgUuid || null,
+      orgName: acctData.orgName || null,
+      priority: acctData.priority || 0,
       credential: acctData.accessToken || acctData.apiKey,
       refreshToken: acctData.refreshToken || null,
       expiresAt: acctData.expiresAt || null,
@@ -454,6 +470,8 @@ export class AccountManager {
       accounts: this.accounts.map(a => ({
         name: a.name,
         type: a.type,
+        orgName: a.orgName || null,
+        priority: a.priority || 0,
         status: a.status,
         quota: { ...a.quota },
         usage: { ...a.usage },

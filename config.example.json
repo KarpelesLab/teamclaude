@@ -12,14 +12,19 @@
       "importFrom": "~/.claude/.credentials.json"
     },
     {
-      "name": "secondary-max",
+      "name": "user@example.com (Acme)",
       "type": "oauth",
+      "accountUuid": "optional-account-uuid",
+      "orgUuid": "optional-organization-uuid",
+      "orgName": "Acme",
+      "priority": 0,
       "accessToken": "sk-ant-oat01-your-access-token",
       "refreshToken": "sk-ant-ort01-your-refresh-token"
     },
     {
       "name": "api-fallback",
       "type": "apikey",
+      "priority": 10,
       "apiKey": "sk-ant-api03-your-api-key"
     }
   ]

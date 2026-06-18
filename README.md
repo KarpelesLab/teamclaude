@@ -13,7 +13,8 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 - **Interactive TUI** — real-time dashboard with color-coded quota bars, reset countdowns, activity log, and keyboard controls
 - **OAuth token management** — automatically refreshes tokens nearing expiry and persists them to config; client token refreshes pass through untouched
 - **Hot-reload accounts** — add accounts via `import` or `login` while the server is running, press **R** to pick them up
-- **Account deduplication** — detects duplicate accounts by UUID and keeps the most recent
+- **Org-aware accounts** — one email can hold multiple accounts across different organizations (e.g. corp + personal); dedup is keyed on account + org, and names disambiguate as `email (Org)`
+- **Rotation priority** — pin a preferred account order with `teamclaude priority`
 - **Request logging** — optional full request/response logging for debugging
 - **Zero dependencies** — uses only Node.js built-in modules
 
@@ -128,10 +129,17 @@ claude
 teamclaude accounts          # List accounts with subscription tier and token status
 teamclaude accounts -v       # Also show token expiry times
 teamclaude status            # Show live proxy status (requires running server)
-teamclaude remove <name>     # Remove an account
+teamclaude remove <name>     # Remove an account (by name or email)
+teamclaude priority <name> 1 # Set rotation priority (lower = preferred)
 teamclaude api <path>        # Call an API endpoint with account credentials
 teamclaude help              # Show all commands
 ```
+
+When the same email belongs to multiple organizations, accounts are named
+`email (Org)` to keep them distinct. Pass `--org <name|uuid>` to disambiguate a
+bare email, e.g. `teamclaude remove user@example.com --org Acme`. Use
+`teamclaude priority <name> --first` / `--last` to move an account to the front
+or back of the rotation order.
 
 ### Request logging
 
@@ -163,9 +171,12 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
   "switchThreshold": 0.98,
   "accounts": [
     {
-      "name": "user@example.com",
+      "name": "user@example.com (Acme)",
       "type": "oauth",
       "accountUuid": "...",
+      "orgUuid": "...",
+      "orgName": "Acme",
+      "priority": 0,
       "accessToken": "sk-ant-oat01-...",
       "refreshToken": "sk-ant-ort01-...",
       "expiresAt": 1774384968427
@@ -180,6 +191,9 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `proxy.apiKey` | API key clients use to authenticate with the proxy |
 | `upstream` | Upstream API base URL |
 | `switchThreshold` | Quota utilization (0–1) at which to switch accounts |
+| `accounts[].accountUuid` | Anthropic account (person) id; set automatically from the OAuth profile |
+| `accounts[].orgUuid` / `orgName` | Organization the account is scoped to — lets one email hold multiple org accounts |
+| `accounts[].priority` | Rotation preference, lower = preferred (default 0) |
 
 ## How It Works
 
