@@ -25,6 +25,7 @@
       "name": "api-fallback",
       "type": "apikey",
       "priority": 10,
+      "disabled": false,
       "apiKey": "sk-ant-api03-your-api-key"
     }
   ]

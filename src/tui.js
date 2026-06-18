@@ -233,6 +233,9 @@ export class TUI {
     else if (k === 'r' && this.am.accounts.length > 0) {
       this.mode = 'select'; this.selAction = 'remove'; this.selIdx = 0;
     }
+    else if (k === 'd' && this.am.accounts.length > 0) {
+      this.mode = 'select'; this.selAction = 'toggle'; this.selIdx = this.am.currentIndex;
+    }
     else if (k === 'a') { this.mode = 'add'; }
     else if (k === 'R') { this._doSync(); }
   }
@@ -245,6 +248,8 @@ export class TUI {
       if (this.selAction === 'switch') {
         this.am.currentIndex = this.selIdx;
         this._addLog(`Switched to "${this.am.accounts[this.selIdx].name}"`);
+      } else if (this.selAction === 'toggle') {
+        this._doToggleDisabled(this.selIdx);
       } else {
         this._doRemove(this.selIdx);
       }
@@ -386,6 +391,18 @@ export class TUI {
     this._addLog(`Removed account "${name}"`);
   }
 
+  async _doToggleDisabled(idx) {
+    if (idx < 0 || idx >= this.am.accounts.length) return;
+    const acct = this.am.accounts[idx];
+    const next = !acct.disabled;
+    this.am.setDisabled(idx, next); // re-enabling also clears a stuck error state
+    // Write an explicit boolean (not delete): saveConfig merges over the on-disk
+    // entry, so a `delete` would leave a stale `disabled: true` from disk intact.
+    if (this.config.accounts[idx]) this.config.accounts[idx].disabled = next;
+    await this.saveConfig(this.config);
+    this._addLog(`${next ? 'Disabled' : 'Enabled'} account "${acct.name}"`);
+  }
+
   // ── rendering ──────────────────────────────────────
 
   render() {
@@ -495,9 +512,11 @@ export class TUI {
     // Type
     const type = gray(a.type.padEnd(7));
 
-    // Status
+    // Status — a disabled account is shown as such regardless of its quota state.
     let status;
-    switch (a.status) {
+    if (a.disabled) {
+      status = gray('disabled');
+    } else switch (a.status) {
       case 'active':    status = isCur ? green('active') : 'active'; break;
       case 'throttled': status = yellow('throttled'); break;
       case 'exhausted': status = red('exhausted'); break;
@@ -536,9 +555,11 @@ export class TUI {
   _renderFooter() {
     switch (this.mode) {
       case 'normal':
-        return ` ${bold('s')}witch  ${bold('a')}dd  ${bold('r')}emove  ${bold('R')}eload  ${bold('q')}uit`;
+        return ` ${bold('s')}witch  ${bold('a')}dd  ${bold('r')}emove  ${bold('d')}isable  ${bold('R')}eload  ${bold('q')}uit`;
       case 'select': {
-        const act = this.selAction === 'switch' ? 'switch' : 'remove';
+        const act = this.selAction === 'switch' ? 'switch'
+          : this.selAction === 'toggle' ? 'enable/disable'
+          : 'remove';
         return ` ${dim('↑↓')} select  ${bold('Enter')} ${act}  ${bold('Esc')} cancel`;
       }
       case 'add':

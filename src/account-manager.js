@@ -36,6 +36,7 @@ export class AccountManager {
       orgUuid: acct.orgUuid || null,
       orgName: acct.orgName || null,
       priority: acct.priority || 0,
+      disabled: acct.disabled || false,
       credential: acct.accessToken || acct.apiKey,
       refreshToken: acct.refreshToken || null,
       expiresAt: acct.expiresAt || null,
@@ -87,6 +88,9 @@ export class AccountManager {
 
   _isAvailable(account) {
     if (!account) return false;
+
+    // Manually disabled accounts are skipped entirely until re-enabled.
+    if (account.disabled) return false;
 
     // Check rate limit expiry
     if (account.status === 'throttled' && account.rateLimitedUntil) {
@@ -361,6 +365,22 @@ export class AccountManager {
   }
 
   /**
+   * Enable or disable an account. A disabled account is skipped by rotation
+   * until re-enabled. Re-enabling also clears a stuck 'error' state (and any
+   * lingering rate-limit hold) so the account is retried immediately.
+   */
+  setDisabled(accountIndex, disabled) {
+    const account = this.accounts[accountIndex];
+    if (!account) return;
+    account.disabled = disabled;
+    if (!disabled && account.status === 'error') {
+      account.status = 'active';
+      account.rateLimitedUntil = null;
+      console.log(`[TeamClaude] Account "${account.name}" re-enabled — clearing error state`);
+    }
+  }
+
+  /**
    * Mark an account as rate-limited for a given duration.
    */
   markRateLimited(accountIndex, retryAfterSeconds) {
@@ -448,6 +468,7 @@ export class AccountManager {
       orgUuid: acctData.orgUuid || null,
       orgName: acctData.orgName || null,
       priority: acctData.priority || 0,
+      disabled: acctData.disabled || false,
       credential: acctData.accessToken || acctData.apiKey,
       refreshToken: acctData.refreshToken || null,
       expiresAt: acctData.expiresAt || null,
@@ -517,6 +538,7 @@ export class AccountManager {
         type: a.type,
         orgName: a.orgName || null,
         priority: a.priority || 0,
+        disabled: a.disabled || false,
         status: a.status,
         quota: { ...a.quota },
         usage: { ...a.usage },

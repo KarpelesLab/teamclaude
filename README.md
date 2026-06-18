@@ -15,6 +15,7 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 - **Hot-reload accounts** — add accounts via `import` or `login` while the server is running, press **R** to pick them up
 - **Org-aware accounts** — one email can hold multiple accounts across different organizations (e.g. corp + personal); dedup is keyed on account + org, and names disambiguate as `email (Org)`
 - **Rotation priority** — pin a preferred account order with `teamclaude priority`
+- **Enable/disable accounts** — temporarily pause an account without removing it (`teamclaude disable`/`enable`, or `d` in the TUI); re-enabling also clears a stuck error state
 - **Quota persistence** — observed quota survives restarts (saved to a sibling state file), so rotation state isn't lost on restart; stale windows are discarded automatically
 - **Request logging** — optional full request/response logging for debugging
 - **Zero dependencies** — uses only Node.js built-in modules
@@ -106,6 +107,7 @@ Falls back to plain log output when not a TTY (e.g. running as a service).
 | `s` | Switch active account |
 | `a` | Add account (import or API key) |
 | `r` | Remove an account |
+| `d` | Enable/disable an account |
 | `R` | Reload accounts from config |
 | `q` | Quit |
 
@@ -131,6 +133,8 @@ teamclaude accounts          # List accounts with subscription tier and token st
 teamclaude accounts -v       # Also show token expiry times
 teamclaude status            # Show live proxy status (requires running server)
 teamclaude remove <name>     # Remove an account (by name or email)
+teamclaude disable <name>    # Temporarily exclude an account from rotation
+teamclaude enable <name>     # Re-enable it (also clears a stuck error state)
 teamclaude priority <name> 1 # Set rotation priority (lower = preferred)
 teamclaude api <path>        # Call an API endpoint with account credentials
 teamclaude help              # Show all commands
@@ -197,6 +201,7 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `accounts[].accountUuid` | Anthropic account (person) id; set automatically from the OAuth profile |
 | `accounts[].orgUuid` / `orgName` | Organization the account is scoped to — lets one email hold multiple org accounts |
 | `accounts[].priority` | Rotation preference, lower = preferred (default 0) |
+| `accounts[].disabled` | If `true`, the account is excluded from rotation until re-enabled |
 
 ## How It Works
 

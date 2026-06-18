@@ -47,6 +47,14 @@ switch (command) {
     await priorityCommand();
     process.exit(0);
     break;
+  case 'disable':
+    await setDisabledCommand(true);
+    process.exit(0);
+    break;
+  case 'enable':
+    await setDisabledCommand(false);
+    process.exit(0);
+    break;
   case 'api':
     await apiCommand();
     process.exit(0);
@@ -416,7 +424,7 @@ async function statusCommand() {
       const current = acct.name === data.currentAccount ? ' *' : '';
 
       console.log(`  ${acct.name} (${acct.type})${current}`);
-      console.log(`    Status:   ${acct.status}`);
+      console.log(`    Status:   ${acct.status}${acct.disabled ? ' (disabled)' : ''}`);
 
       if (q.unified5h != null || q.unified7d != null) {
         const ses = q.unified5h != null ? (q.unified5h * 100).toFixed(1) + '%' : '-';
@@ -691,6 +699,36 @@ async function priorityCommand() {
   console.log(`Set priority of "${account.name}" to ${priority} (lower = preferred)`);
 }
 
+// ── enable / disable ────────────────────────────────────────
+
+async function setDisabledCommand(disabled) {
+  const config = await loadOrCreateConfig();
+  const name = args[1];
+  const verb = disabled ? 'disable' : 'enable';
+
+  if (!name) {
+    console.error(`Usage: teamclaude ${verb} <account-name|email> [--org <name|uuid>]`);
+    process.exit(1);
+  }
+
+  const account = resolveAccount(config.accounts, name, argValue('--org'));
+  if (!account) {
+    console.error(`Account "${name}" not found`);
+    process.exit(1);
+  }
+
+  if (disabled) {
+    account.disabled = true;
+  } else {
+    delete account.disabled;
+  }
+  await saveConfig(config);
+  console.log(`${disabled ? 'Disabled' : 'Enabled'} account "${account.name}"`);
+  if (!disabled) {
+    console.log('(restart or reload the running server to retry it if it was in an error state)');
+  }
+}
+
 // ── help ────────────────────────────────────────────────────
 
 function showHelp() {
@@ -708,6 +746,8 @@ Commands:
   status              Show proxy & account status (live)
   accounts            List configured accounts
   remove <name>       Remove an account (by name or email; --org to disambiguate)
+  disable <name>      Temporarily exclude an account from rotation
+  enable <name>       Re-enable a disabled account (also clears a stuck error)
   priority <name> <n> Set rotation priority (lower = preferred; --first/--last)
   api <path>          Call an API endpoint with account credentials
   help                Show this help
@@ -847,6 +887,9 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
     if (diskAcct.orgName && !mgr.orgName) mgr.orgName = diskAcct.orgName;
     if (diskAcct.name && mgr.name !== diskAcct.name) mgr.name = diskAcct.name;
     if (diskAcct.priority != null && mgr.priority !== diskAcct.priority) mgr.priority = diskAcct.priority;
+    // Pick up enable/disable toggles; re-enabling clears a stuck error state.
+    const wantDisabled = !!diskAcct.disabled;
+    if (mgr.disabled !== wantDisabled) accountManager.setDisabled(mgr.index, wantDisabled);
 
     // Existing account — resolve fresh credentials from disk
     let freshCred = null;
