@@ -174,49 +174,196 @@ export function h2Relay(claude, upstream, opts = {}) {
   respCtl = link(upstream, claude, onRespData, destroyBoth);
 }
 
+const MAX_HEAD = 65536; // runaway-head guard for a single request/response head
+
+// Parse an HTTP/1.1 message head: its start line + the body framing it declares.
+// `chunked` wins over content-length per RFC 7230 §3.3.3.
+function parseH1Head(headText) {
+  const lines = headText.split('\r\n');
+  let contentLength = null;
+  let chunked = false;
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (line === '') break;
+    const c = line.indexOf(':');
+    if (c < 0) continue;
+    const name = line.slice(0, c).trim().toLowerCase();
+    const value = line.slice(c + 1).trim().toLowerCase();
+    if (name === 'transfer-encoding') { if (/(^|,)\s*chunked\s*$/.test(value)) chunked = true; }
+    else if (name === 'content-length') { const n = parseInt(value, 10); if (!Number.isNaN(n)) contentLength = n; }
+  }
+  return { startLine: lines[0] || '', contentLength, chunked };
+}
+
+// A streaming body-length tracker. process(buf) returns how many leading bytes of
+// `buf` belong to the current message body and whether the body is complete; it
+// keeps internal state across calls so a body split over many chunks is tracked
+// exactly. `kind`: 'none' | 'length' | 'chunked' | 'until-close'.
+function makeBodyTracker(kind, length = 0) {
+  if (kind === 'none') return () => ({ consumed: 0, done: true });
+  if (kind === 'until-close') return (buf) => ({ consumed: buf.length, done: false });
+  if (kind === 'length') {
+    let need = length;
+    return (buf) => { const take = Math.min(need, buf.length); need -= take; return { consumed: take, done: need === 0 }; };
+  }
+  // chunked: count framing bytes (size lines, data, trailing CRLFs, trailers)
+  let phase = 'size'; // size | data | dataCRLF | trailers
+  let need = 0;       // bytes left in current chunk's data
+  let line = '';      // accumulates a CRLF-terminated control line across chunks
+  return (buf) => {
+    let i = 0;
+    while (i < buf.length) {
+      if (phase === 'size') {
+        const nl = buf.indexOf(0x0a, i);
+        if (nl < 0) { line += buf.toString('latin1', i); return { consumed: buf.length, done: false }; }
+        line += buf.toString('latin1', i, nl + 1); i = nl + 1;
+        const size = parseInt(line.trim().split(';')[0], 16); line = '';
+        if (Number.isNaN(size)) return { consumed: i, done: true };  // malformed: stop here
+        if (size === 0) phase = 'trailers'; else { need = size; phase = 'data'; }
+      } else if (phase === 'data') {
+        const take = Math.min(need, buf.length - i); i += take; need -= take;
+        if (need === 0) phase = 'dataCRLF';
+      } else if (phase === 'dataCRLF') {
+        const nl = buf.indexOf(0x0a, i);
+        if (nl < 0) return { consumed: buf.length, done: false };
+        i = nl + 1; phase = 'size';
+      } else { // trailers: read until a blank line ends the message
+        const nl = buf.indexOf(0x0a, i);
+        if (nl < 0) { line += buf.toString('latin1', i); return { consumed: buf.length, done: false }; }
+        const seg = line + buf.toString('latin1', i, nl + 1); line = ''; i = nl + 1;
+        if (seg === '\r\n' || seg === '\n') return { consumed: i, done: true };
+      }
+    }
+    return { consumed: i, done: false };
+  };
+}
+
+const methodOf = (startLine) => startLine.split(' ')[0].toUpperCase();
+const statusOf = (startLine) => parseInt(startLine.split(' ')[1], 10) || 0;
+
 /**
- * Faithful HTTP/1.1 relay for the rare h1 case. Reads the first request head,
- * rewrites only the auth line (via `rewriteHead`), forwards it, then tunnels
- * both directions raw. (Real Anthropic traffic is h2; on a keep-alive h1
- * connection only the first request's auth is rewritten — documented tradeoff.)
+ * Faithful HTTP/1.1 relay. Frames every request/response on a keep-alive
+ * connection (parsing content-length / chunked bodies), so each request's auth
+ * line is rewritten via `rewriteHead`, each request body is patched, and each
+ * exchange is logged to its own tap record. Responses are written to claude
+ * verbatim first — parsing is observation-only, so a framing miss can never
+ * corrupt the relayed stream — and matched to requests in FIFO order (HTTP/1.1
+ * guarantees in-order responses).
  *
- * @param opts.rewriteHead (headText) => headText
+ * @param opts.rewriteHead (headText) => headText      // rewrite each request head
+ * @param opts.onResponseHeaders (fields[]) => void    // observe each response's headers
  */
 export function h1Relay(claude, upstream, opts = {}) {
   const rewriteHead = opts.rewriteHead || ((h) => h);
-  const patcher = opts.makeBodyPatcher ? opts.makeBodyPatcher() : null;
-  const rewriteData = patcher ? (b) => patcher.push(b) : (b) => b; // same-length body patch
+  const makeBodyPatcher = opts.makeBodyPatcher || null;
+  const onResponseHeaders = opts.onResponseHeaders || (() => {});
   const tap = opts.tap || null;
-  const SID = 1; // single logical request id for h1
   const destroyBoth = () => { claude.destroy(); upstream.destroy(); };
   claude.on('error', destroyBoth);
   upstream.on('error', destroyBoth);
-  claude.on('close', () => upstream.destroy());
-  upstream.on('close', () => { tap?.end(SID); claude.destroy(); });
 
-  // responses: verbatim (observed for logging)
-  upstream.on('data', (c) => { if (tap) tap.resData(SID, Buffer.from(c)); claude.write(c); });
-  upstream.on('end', () => { tap?.end(SID); claude.end(); });
+  let nextId = 0;
+  const pending = []; // request ids awaiting a response head, in send order
 
-  let buf = Buffer.alloc(0);
-  const onData = (chunk) => {
-    buf = Buffer.concat([buf, chunk]);
-    const idx = buf.indexOf('\r\n\r\n');
-    if (idx < 0) {
-      if (buf.length > 65536) destroyBoth(); // runaway head
-      return;
+  // Close any tap records still open when the connection tears down.
+  const endOpen = () => { if (!tap) return; if (resId !== null) tap.end(resId); for (const p of pending) tap.end(p.id); pending.length = 0; };
+
+  // ── request direction: claude → upstream (rewrite head, patch + forward body) ──
+  let reqBuf = Buffer.alloc(0);
+  let reqPhase = 'head';
+  let reqTrack = null, reqPatcher = null, reqId = null;
+
+  const pumpReq = () => {
+    while (reqBuf.length) {
+      if (reqPhase === 'head') {
+        const idx = reqBuf.indexOf('\r\n\r\n');
+        if (idx < 0) { if (reqBuf.length > MAX_HEAD) destroyBoth(); return; }
+        const head = rewriteHead(reqBuf.subarray(0, idx + 4).toString('latin1'));
+        reqBuf = reqBuf.subarray(idx + 4);
+        const info = parseH1Head(head);
+        reqId = ++nextId;
+        pending.push({ id: reqId, method: methodOf(info.startLine) });
+        if (tap) tap.reqHead(reqId, head);
+        upstream.write(Buffer.from(head, 'latin1'));
+        const kind = info.chunked ? 'chunked' : (info.contentLength > 0 ? 'length' : 'none');
+        reqPatcher = makeBodyPatcher ? makeBodyPatcher() : null;
+        reqTrack = makeBodyTracker(kind, info.contentLength || 0);
+        reqPhase = 'body';
+      } else {
+        const { consumed, done } = reqTrack(reqBuf);
+        if (consumed > 0) {
+          let slice = Buffer.from(reqBuf.subarray(0, consumed));
+          reqBuf = reqBuf.subarray(consumed);
+          if (reqPatcher) slice = reqPatcher.push(slice); // same-length account_uuid patch
+          if (tap) tap.reqData(reqId, slice);
+          upstream.write(slice);
+        }
+        if (done) { reqPhase = 'head'; reqTrack = null; reqPatcher = null; }
+        else if (consumed === 0) return; // need more body bytes
+      }
     }
-    claude.removeListener('data', onData);
-    const head = rewriteHead(buf.subarray(0, idx + 4).toString('latin1'));
-    if (tap) tap.reqHead(SID, head);
-    upstream.write(Buffer.from(head, 'latin1'));
-    const remainder = buf.subarray(idx + 4);
-    if (remainder.length) { const patched = rewriteData(Buffer.from(remainder)); if (tap) tap.reqData(SID, patched); upstream.write(patched); }
-    // forward (patched) request body
-    claude.on('data', (c) => { const patched = rewriteData(Buffer.from(c)); if (tap) tap.reqData(SID, patched); upstream.write(patched); });
-    claude.on('end', () => upstream.end());
   };
-  claude.on('data', onData);
+  claude.on('data', (c) => { reqBuf = Buffer.concat([reqBuf, c]); pumpReq(); });
+  claude.on('end', () => upstream.end());
+  claude.on('close', () => upstream.destroy());
+
+  // ── response direction: upstream → claude (verbatim passthrough + observe) ──
+  let resBuf = Buffer.alloc(0);
+  let resPhase = 'head';
+  let resTrack = null, resId = null;
+
+  const pumpRes = () => {
+    while (resBuf.length) {
+      if (resPhase === 'head') {
+        const idx = resBuf.indexOf('\r\n\r\n');
+        if (idx < 0) { if (resBuf.length > MAX_HEAD) resBuf = resBuf.subarray(resBuf.length - MAX_HEAD); return; }
+        const head = resBuf.subarray(0, idx + 4).toString('latin1');
+        resBuf = resBuf.subarray(idx + 4);
+        const info = parseH1Head(head);
+        const status = statusOf(info.startLine);
+        if (status >= 100 && status < 200) continue; // interim (e.g. 100-continue): no body, no request consumed
+        onResponseHeaders(headFields(head));
+        const req = pending.shift();
+        resId = req ? req.id : ++nextId;
+        if (tap) tap.resHead(resId, head);
+        const bodyless = req?.method === 'HEAD' || status === 204 || status === 304;
+        const kind = bodyless ? 'none'
+          : info.chunked ? 'chunked'
+          : info.contentLength !== null ? 'length'
+          : 'until-close';
+        resTrack = makeBodyTracker(kind, info.contentLength || 0);
+        resPhase = 'body';
+      } else {
+        const { consumed, done } = resTrack(resBuf);
+        if (consumed > 0) { if (tap) tap.resData(resId, Buffer.from(resBuf.subarray(0, consumed))); resBuf = resBuf.subarray(consumed); }
+        if (done) { if (tap) tap.end(resId); resId = null; resPhase = 'head'; resTrack = null; }
+        else if (consumed === 0) return;
+      }
+    }
+  };
+  upstream.on('data', (c) => {
+    claude.write(c);                 // faithful passthrough first
+    resBuf = Buffer.concat([resBuf, c]);
+    try { pumpRes(); } catch { resBuf = Buffer.alloc(0); } // never let a parse bug break the relay
+  });
+  upstream.on('end', () => { endOpen(); claude.end(); });
+  upstream.on('close', () => { endOpen(); claude.destroy(); });
+}
+
+// Parse an HTTP/1.1 head into an h2-style [{name,value}] list (lowercased names),
+// so a response can feed the same quota observer the h2 path uses.
+function headFields(headText) {
+  const out = [];
+  const lines = headText.split('\r\n');
+  out.push({ name: ':status', value: String(statusOf(lines[0] || '')) });
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (line === '') break;
+    const c = line.indexOf(':');
+    if (c < 0) continue;
+    out.push({ name: line.slice(0, c).trim().toLowerCase(), value: line.slice(c + 1).trim() });
+  }
+  return out;
 }
 
 /** Rewrite an HTTP/1.1 request head: replace the Authorization line with

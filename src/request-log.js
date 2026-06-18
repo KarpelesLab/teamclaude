@@ -127,6 +127,12 @@ export function makeMitmTap(logDir, accountName = '') {
       r.write(`\n\n=== RESPONSE ${get(fields, ':status')} ===\n${fmtFields(fields, { pseudo: false })}`);
       r.resBody = new BodyWriter(r.write, 'RESPONSE BODY', ctOfFields(fields));
     },
+    resHead(id, text) {
+      const r = rec(id);
+      const status = (text.split('\r\n')[0].split(' ')[1]) || '';
+      r.write(`\n\n=== RESPONSE ${status} (h1) ===\n${maskHeadText(text).trimEnd()}`);
+      r.resBody = new BodyWriter(r.write, 'RESPONSE BODY', ctOfHead(text));
+    },
     resData(id, buf) { rec(id).resBody?.chunk(buf); },
     end(id) {
       const r = recs.get(id);

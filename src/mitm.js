@@ -202,7 +202,12 @@ async function intercept({ host, port, mode, clientSocket, head, accountManager,
     const auth = account.type === 'oauth'
       ? { authorization: `Bearer ${account.credential}` }
       : { apiKey: account.credential };
-    h1Relay(claudeTls, upstreamSock, { rewriteHead: (h) => rewriteH1Auth(h, auth), makeBodyPatcher, tap });
+    h1Relay(claudeTls, upstreamSock, {
+      rewriteHead: (h) => rewriteH1Auth(h, auth),
+      makeBodyPatcher,
+      onResponseHeaders: makeQuotaObserver(accountManager, account),
+      tap,
+    });
   }
 }
 

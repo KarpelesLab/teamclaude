@@ -217,6 +217,84 @@ test('MITM h1: when upstream is http/1.1, ALPN mirrors and the head auth is rewr
   }
 });
 
+// Regression (token leak / mangled logs seen in a real MITM capture): claude-cli
+// reuses ONE keep-alive h1 connection for many requests. The relay must frame
+// each request — rewrite EVERY request's auth (not just the first), log each
+// exchange to its own masked record, and observe each response's quota — instead
+// of treating everything after the first head as one giant body.
+test('MITM h1 keep-alive: every request is reframed, rewritten, masked, and quota-observed', T, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tc-h1ka-'));
+  const { caCertPem, leafCertPem, leafKeyPem } = generateCertChain('localhost');
+
+  // Raw http/1.1 upstream that stays keep-alive and echoes, per request, the auth
+  // it saw + the request path, plus a rate-limit header for quota observation.
+  const upstream = tls.createServer({ key: leafKeyPem, cert: leafCertPem, ALPNProtocols: ['http/1.1'] }, (s) => {
+    let buf = '';
+    s.on('data', (d) => {
+      buf += d;
+      let idx;
+      while ((idx = buf.indexOf('\r\n\r\n')) >= 0) {
+        const head = buf.slice(0, idx);
+        const clMatch = head.match(/content-length: (\d+)/i);
+        const need = clMatch ? parseInt(clMatch[1], 10) : 0;
+        if (buf.length < idx + 4 + need) break;          // wait for the full body
+        buf = buf.slice(idx + 4 + need);
+        const auth = (head.match(/authorization: (.*)/i) || [])[1]?.trim() || 'none';
+        const path = head.split('\r\n')[0].split(' ')[1];
+        const body = JSON.stringify({ auth, path });
+        s.write(`HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: ${Buffer.byteLength(body)}\r\nanthropic-ratelimit-unified-5h-utilization: 0.5\r\nconnection: keep-alive\r\n\r\n${body}`);
+      }
+    });
+  });
+  const upPort = await listen(upstream);
+  let quotaHits = 0;
+  const proxy = makeProxy(upPort, caCertPem, leafCertPem, leafKeyPem, () => { quotaHits++; }, dir);
+  const proxyPort = await listen(proxy);
+
+  const tlsSock = await connectThroughProxy(proxyPort, `127.0.0.1:${upPort}`, caCertPem, ['http/1.1']);
+  const readJson = () => new Promise((resolve) => {
+    let buf = '';
+    const onData = (d) => {
+      buf += d;
+      const i = buf.indexOf('\r\n\r\n');
+      if (i < 0) return;
+      const need = parseInt((buf.match(/content-length: (\d+)/i) || [])[1], 10);
+      if (buf.length < i + 4 + need) return;
+      tlsSock.removeListener('data', onData);
+      resolve(JSON.parse(buf.slice(i + 4, i + 4 + need)));
+    };
+    tlsSock.on('data', onData);
+  });
+  try {
+    tlsSock.setEncoding('utf8');
+    // First request: a small JSON body (mirrors the quota probe in the capture).
+    const p1 = readJson();
+    tlsSock.write('POST /v1/messages HTTP/1.1\r\nhost: localhost\r\nauthorization: Bearer FAKE-1\r\ncontent-type: application/json\r\ncontent-length: 9\r\n\r\n{"q":"x"}');
+    const r1 = await p1;
+    // Second request on the SAME connection — the one that used to leak + mangle.
+    const p2 = readJson();
+    tlsSock.write('POST /v1/messages HTTP/1.1\r\nhost: localhost\r\nauthorization: Bearer FAKE-2-LEAK\r\nx-api-key: sk-leak\r\ncontent-type: application/json\r\ncontent-length: 11\r\n\r\n{"hello":1}');
+    const r2 = await p2;
+
+    assert.equal(r1.auth, 'Bearer REAL-TOKEN', 'first request auth rewritten');
+    assert.equal(r2.auth, 'Bearer REAL-TOKEN', 'second request auth ALSO rewritten (was the bug)');
+    assert.equal(quotaHits, 2, 'quota observed on both h1 responses');
+
+    await new Promise((r) => setTimeout(r, 150)); // let async log writes land
+    const files = readdirSync(dir).filter((f) => f.endsWith('.log'));
+    assert.equal(files.length, 2, 'each request gets its OWN log file (was concatenated into one)');
+    const all = files.map((f) => readFileSync(join(dir, f), 'utf8'));
+    const blob = all.join('\n');
+    assert.ok(!blob.includes('FAKE-1') && !blob.includes('FAKE-2-LEAK'), 'client tokens never logged unmasked');
+    assert.ok(!blob.includes('sk-leak'), 'client x-api-key never logged');
+    assert.ok(all.every((c) => /=== REQUEST \(h1/.test(c)), 'both files have a proper request head section');
+    assert.ok(all.every((c) => /=== RESPONSE 200 \(h1\)/.test(c)), 'both files log the response head');
+    assert.ok(all.every((c) => /"auth"/.test(c)), 'response JSON body is logged (pretty)');
+  } finally {
+    tlsSock.destroy(); closeHard(proxy); closeHard(upstream); rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // Regression (the run --mitm "ConnectionRefused"): an http/1.1-only client — what
 // undici/claude offers when it tunnels through a proxy — against an upstream that
 // ALSO speaks h2. We must adopt the CLIENT's protocol (http/1.1) and mirror it
