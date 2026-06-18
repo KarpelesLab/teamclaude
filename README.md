@@ -259,7 +259,7 @@ Run claude with the `--mitm` flag:
 teamclaude run --mitm -- <claude args...>
 ```
 
-That launches claude pointed at teamclaude as an **HTTPS forward proxy** (`HTTPS_PROXY`) and trusts a locally-generated CA (`NODE_EXTRA_CA_CERTS`). teamclaude terminates TLS for the upstream host, injects the real account token, and forwards to the real Anthropic API. **Everything else is tunneled untouched.** The server accepts *both* base-URL and proxy clients at once, so instances launched with and without `--mitm` can share one server. To make plain `claude` use it, install the alias with `teamclaude alias --install --mitm`.
+That launches claude pointed at teamclaude as an **HTTPS forward proxy** (`HTTPS_PROXY`) and trusts a locally-generated CA (`NODE_EXTRA_CA_CERTS`). teamclaude terminates TLS for the upstream host, injects the real account token, and forwards to the real Anthropic API. **Everything else is tunneled untouched.** The server accepts *both* base-URL and proxy clients at once, so instances launched with and without `--mitm` can share one server.
 
 Trust model:
 - The CA is generated locally, stored in the config dir, and trusted **only** by the claude process you launch via `teamclaude run` (through `NODE_EXTRA_CA_CERTS`) — it is **never** added to your system trust store. The leaf private key is `0600`; the CA private key is never written to disk.

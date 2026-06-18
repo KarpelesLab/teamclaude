@@ -688,13 +688,12 @@ async function apiCommand() {
 
 function aliasCommand() {
   const shell = argValue('--shell') || undefined;
-  const mitm = args.includes('--mitm');
   if (args.includes('--uninstall')) {
     alias.uninstallAlias({ shell });
   } else if (args.includes('--install')) {
-    alias.installAlias({ shell, mitm });
+    alias.installAlias({ shell });
   } else {
-    alias.printAlias({ shell, mitm });
+    alias.printAlias({ shell });
   }
 }
 
