@@ -7,16 +7,21 @@ on:
     branches: [master]
 
 jobs:
-  test:
-    name: test
+  node:
+    name: node ${{ matrix.node }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Cover the whole supported range — package.json declares "node >=18".
+        node: [18, 20, 22, 24]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
-      - name: Set up Node.js
+      - name: Set up Node.js ${{ matrix.node }}
         uses: actions/setup-node@v6
         with:
-          node-version: 24
+          node-version: ${{ matrix.node }}
 
       - name: Install dependencies
         run: npm install
@@ -25,4 +30,21 @@ jobs:
         run: npm test
 
       - name: Lint
+        if: matrix.node == 24
         run: npm run lint
+
+  # Single stable status check for branch protection to require, independent of
+  # how many Node versions the matrix runs. Always runs and fails explicitly if
+  # any matrix job did not succeed (so it is never silently "skipped").
+  test:
+    name: test
+    needs: node
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check matrix result
+        if: needs.node.result != 'success'
+        run: |
+          echo "Node matrix did not pass: ${{ needs.node.result }}"
+          exit 1
+      - run: echo "All Node matrix jobs passed"
