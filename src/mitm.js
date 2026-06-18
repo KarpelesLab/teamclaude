@@ -146,7 +146,10 @@ async function intercept({ host, port, mode, clientSocket, head, accountManager,
   if (!account) { clientSocket.destroy(); return; }
   await accountManager.ensureTokenFresh(account.index);
 
-  const upstreamSock = tls.connect({ host, port, servername: host, ALPNProtocols: ['h2', 'http/1.1'], ...upstreamTlsOptions });
+  // autoSelectFamily (happy-eyeballs) is the default on Node 20+ but not 18; set
+  // it explicitly so a dual-stack upstream whose IPv6 path is unreachable falls
+  // back to IPv4 instead of hanging the connect (option ignored pre-18.13).
+  const upstreamSock = tls.connect({ host, port, servername: host, autoSelectFamily: true, ALPNProtocols: ['h2', 'http/1.1'], ...upstreamTlsOptions });
   await new Promise((resolve, reject) => {
     upstreamSock.once('secureConnect', resolve);
     upstreamSock.once('error', reject);

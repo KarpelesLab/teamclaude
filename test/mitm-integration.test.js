@@ -61,10 +61,14 @@ function makeProxy(upPort, caCertPem, leafCertPem, leafKeyPem, onQuota, logDir =
   };
   const proxy = http.createServer();
   proxy.on('connect', createConnectHandler({
-    config: { upstream: `https://localhost:${upPort}` },
+    // Address the upstream by IP (servers bind 127.0.0.1) so the test never
+    // depends on how the host resolves `localhost` — on a dual-stack box that
+    // prefers ::1, Node 18 (no happy-eyeballs) would otherwise hang the dial.
+    // SNI is pinned to the cert's name via upstreamTlsOptions.servername.
+    config: { upstream: `https://127.0.0.1:${upPort}` },
     accountManager,
     ensureLeaf: async () => ({ key: leafKeyPem, cert: leafCertPem }),
-    upstreamTlsOptions: { ca: [caCertPem] },
+    upstreamTlsOptions: { ca: [caCertPem], servername: 'localhost' },
     logDir,
     log: () => {},
   }));
@@ -91,7 +95,7 @@ test('MITM h2: ALPN mirrored, only authorization rewritten, quota observed', T, 
   const proxy = makeProxy(upPort, caCertPem, leafCertPem, leafKeyPem, (h) => { quota = h; });
   const proxyPort = await listen(proxy);
 
-  const tlsSock = await connectThroughProxy(proxyPort, `localhost:${upPort}`, caCertPem, ['h2', 'http/1.1']);
+  const tlsSock = await connectThroughProxy(proxyPort, `127.0.0.1:${upPort}`, caCertPem, ['h2', 'http/1.1']);
   try {
     assert.equal(tlsSock.alpnProtocol, 'h2'); // mirrored from the (h2) upstream
     const client = http2.connect('https://localhost', { createConnection: () => tlsSock });
@@ -132,7 +136,7 @@ test('MITM h2 rewrites body account_uuid to the injected account', T, async () =
   const proxy = makeProxy(upPort, caCertPem, leafCertPem, leafKeyPem, () => {});
   const proxyPort = await listen(proxy);
 
-  const tlsSock = await connectThroughProxy(proxyPort, `localhost:${upPort}`, caCertPem, ['h2', 'http/1.1']);
+  const tlsSock = await connectThroughProxy(proxyPort, `127.0.0.1:${upPort}`, caCertPem, ['h2', 'http/1.1']);
   try {
     const client = http2.connect('https://localhost', { createConnection: () => tlsSock });
     const req = client.request({ ':method': 'POST', ':path': '/v1/messages', authorization: 'Bearer FAKE' });
@@ -157,7 +161,7 @@ test('MITM logs proxied requests when --log-to is set', T, async () => {
   const proxy = makeProxy(upPort, caCertPem, leafCertPem, leafKeyPem, () => {}, dir);
   const proxyPort = await listen(proxy);
 
-  const tlsSock = await connectThroughProxy(proxyPort, `localhost:${upPort}`, caCertPem, ['h2', 'http/1.1']);
+  const tlsSock = await connectThroughProxy(proxyPort, `127.0.0.1:${upPort}`, caCertPem, ['h2', 'http/1.1']);
   try {
     const client = http2.connect('https://localhost', { createConnection: () => tlsSock });
     const req = client.request({ ':method': 'POST', ':path': '/v1/messages', authorization: 'Bearer SECRET-FAKE' });
@@ -197,7 +201,7 @@ test('MITM h1: when upstream is http/1.1, ALPN mirrors and the head auth is rewr
   const proxy = makeProxy(upPort, caCertPem, leafCertPem, leafKeyPem, () => {});
   const proxyPort = await listen(proxy);
 
-  const tlsSock = await connectThroughProxy(proxyPort, `localhost:${upPort}`, caCertPem, ['http/1.1']);
+  const tlsSock = await connectThroughProxy(proxyPort, `127.0.0.1:${upPort}`, caCertPem, ['http/1.1']);
   try {
     assert.equal(tlsSock.alpnProtocol, 'http/1.1'); // mirrored
     tlsSock.write('GET /v1/messages HTTP/1.1\r\nhost: localhost\r\nauthorization: Bearer FAKE\r\nx-api-key: sk-fake\r\n\r\n');

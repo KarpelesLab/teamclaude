@@ -1,10 +1,19 @@
 // Per-request logging for the MITM relay (parity with the reverse-proxy path's
 // --log-to). One tap per CONNECT/connection (h2 stream ids restart per
-// connection, so taps must not be shared); it accumulates request/response
-// headers + (capped) bodies per stream and writes one file when the stream ends.
+// connection, so taps must not be shared).
+//
+// Logs STREAM to disk as the request/response flow: the file is opened and the
+// request head written the moment headers arrive, and every body chunk is
+// appended as it is relayed. JSON bodies are pretty-printed on the fly via a
+// streaming state machine (src/json-format-stream.js) — never buffered whole,
+// so even ~1M-token bodies cost only the current chunk, and a request that
+// blocks mid-stream leaves its partial (readable) body on disk so you can see
+// exactly how far it got. Auth/x-api-key are masked. No size caps.
 
-import { writeFile, mkdir } from 'node:fs/promises';
+import { createWriteStream } from 'node:fs';
+import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
+import { JsonStreamFormatter } from './json-format-stream.js';
 
 let seq = 0; // module-global so filenames are unique across connections
 
@@ -36,12 +45,14 @@ function maskHeadText(text) {
   }).join('\r\n');
 }
 
-// Log the WHOLE body — AI requests can carry the full conversation (up to ~1M
-// tokens), so never truncate. JSON is pretty-printed; anything else is verbatim.
-function bodySection(label, buf) {
-  if (!buf.length) return `=== ${label} ===\n(empty)`;
-  try { return `=== ${label} ===\n${JSON.stringify(JSON.parse(buf.toString()), null, 2)}`; } catch { /* not json */ }
-  return `=== ${label} (${buf.length} bytes) ===\n${buf.toString('utf-8')}`;
+// content-type from an h2 field list / an h1 head text (lowercased, or '').
+function ctOfFields(fields) {
+  const f = fields.find((x) => x.name.toString().toLowerCase() === 'content-type');
+  return f ? f.value.toString().toLowerCase() : '';
+}
+function ctOfHead(text) {
+  const line = text.split('\r\n').find((l) => l.toLowerCase().startsWith('content-type:'));
+  return line ? line.slice(line.indexOf(':') + 1).trim().toLowerCase() : '';
 }
 
 function stamp() {
@@ -50,39 +61,75 @@ function stamp() {
   return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)}`;
 }
 
+// Tracks how one direction's body is written: decide formatter-vs-raw on the
+// first chunk (event-stream → raw; otherwise pretty-print if it looks like JSON,
+// i.e. the first non-whitespace byte is { or [). Writes the section header once.
+class BodyWriter {
+  constructor(write, label, contentType) {
+    this.write = write;
+    this.label = label;
+    this.isStream = /event-stream/.test(contentType);
+    this.decided = false;
+    this.fmt = null;
+    this.headerWritten = false;
+  }
+  chunk(buf) {
+    if (!buf.length) return;
+    if (!this.headerWritten) { this.write(`\n\n=== ${this.label} ===\n`); this.headerWritten = true; }
+    if (!this.decided) {
+      const first = buf.toString('latin1').trimStart()[0];
+      if (!this.isStream && (first === '{' || first === '[')) this.fmt = new JsonStreamFormatter();
+      this.decided = true;
+    }
+    this.write(this.fmt ? this.fmt.push(buf) : buf.toString('latin1'));
+  }
+}
+
 export function makeMitmTap(logDir, accountName = '') {
   if (!logDir) return null;
   mkdir(logDir, { recursive: true }).catch(() => {});
   const recs = new Map();
-  const rec = (id) => {
-    let r = recs.get(id);
-    if (!r) { r = { reqFields: null, reqHead: null, reqBody: [], resFields: null, resBody: [], written: false }; recs.set(id, r); }
-    return r;
-  };
 
-  function write(r) {
-    if (r.written) return;
-    r.written = true;
-    const s = [];
-    if (r.reqFields) {
-      s.push(`=== REQUEST (h2${accountName ? `, account: ${accountName}` : ''}) ===\n${get(r.reqFields, ':method')} ${get(r.reqFields, ':path')}\n${fmtFields(r.reqFields, { pseudo: false })}`);
-    } else if (r.reqHead) {
-      s.push(`=== REQUEST (h1${accountName ? `, account: ${accountName}` : ''}) ===\n${maskHeadText(r.reqHead).trimEnd()}`);
-    }
-    if (r.reqBody.length) s.push(bodySection('REQUEST BODY', Buffer.concat(r.reqBody)));
-    if (r.resFields) s.push(`=== RESPONSE ${get(r.resFields, ':status')} ===\n${fmtFields(r.resFields, { pseudo: false })}`);
-    if (r.resBody.length) s.push(bodySection('RESPONSE BODY', Buffer.concat(r.resBody)));
-    if (!s.length) return;
+  function open() {
     const file = join(logDir, `${stamp()}_mitm_${String(++seq).padStart(5, '0')}.log`);
-    writeFile(file, s.join('\n\n'), 'utf-8').catch(() => {});
+    const ws = createWriteStream(file, { flags: 'a' });
+    ws.on('error', () => {});
+    return ws;
+  }
+
+  function rec(id) {
+    let r = recs.get(id);
+    if (!r) {
+      r = { ws: open(), reqBody: null, resBody: null, ended: false };
+      r.write = (s) => { if (!r.ended && s) r.ws.write(s); };
+      recs.set(id, r);
+    }
+    return r;
   }
 
   return {
-    req(id, fields) { rec(id).reqFields = fields; },
-    reqHead(id, text) { rec(id).reqHead = text; },
-    reqData(id, buf) { rec(id).reqBody.push(buf); },
-    res(id, fields) { rec(id).resFields = fields; },
-    resData(id, buf) { rec(id).resBody.push(buf); },
-    end(id) { const r = recs.get(id); if (r) { recs.delete(id); write(r); } },
+    req(id, fields) {
+      const r = rec(id);
+      r.write(`=== REQUEST (h2${accountName ? `, account: ${accountName}` : ''}) ===\n${get(fields, ':method')} ${get(fields, ':path')}\n${fmtFields(fields, { pseudo: false })}`);
+      r.reqBody = new BodyWriter(r.write, 'REQUEST BODY', ctOfFields(fields));
+    },
+    reqHead(id, text) {
+      const r = rec(id);
+      r.write(`=== REQUEST (h1${accountName ? `, account: ${accountName}` : ''}) ===\n${maskHeadText(text).trimEnd()}`);
+      r.reqBody = new BodyWriter(r.write, 'REQUEST BODY', ctOfHead(text));
+    },
+    reqData(id, buf) { rec(id).reqBody?.chunk(buf); },
+    res(id, fields) {
+      const r = rec(id);
+      r.write(`\n\n=== RESPONSE ${get(fields, ':status')} ===\n${fmtFields(fields, { pseudo: false })}`);
+      r.resBody = new BodyWriter(r.write, 'RESPONSE BODY', ctOfFields(fields));
+    },
+    resData(id, buf) { rec(id).resBody?.chunk(buf); },
+    end(id) {
+      const r = recs.get(id);
+      if (!r) return;
+      recs.delete(id);
+      if (!r.ended) { r.ended = true; r.ws.end('\n'); }
+    },
   };
 }
