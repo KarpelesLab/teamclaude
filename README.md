@@ -24,6 +24,7 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 - **Enable/disable accounts** — temporarily pause an account without removing it (`teamclaude disable`/`enable`, or `d` in the TUI); re-enabling also clears a stuck error state
 - **Quota persistence** — observed quota survives restarts (saved to a sibling state file), so rotation state isn't lost on restart; stale windows are discarded automatically
 - **Optional quota probe** — off by default; when enabled, periodically refreshes idle accounts' quota from the usage endpoint (no message spend), and surfaces the Sonnet weekly bucket
+- **Optional MITM proxy mode** — off by default; routes claude via an HTTPS forward proxy with a local CA so even hardcoded `api.anthropic.com` endpoints (e.g. the Claude Design MCP) get the real token injected
 - **Request logging** — optional full request/response logging for debugging
 - **Zero dependencies** — uses only Node.js built-in modules
 
@@ -229,6 +230,7 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `upstream` | Upstream API base URL |
 | `switchThreshold` | Quota utilization (0–1) at which to switch accounts |
 | `quotaProbeSeconds` | Background quota-probe interval in seconds (`0` = off, the default) |
+| `useMitmProxy` | If `true`, `run` routes claude via an HTTPS forward proxy + local CA to also intercept hardcoded `api.anthropic.com` endpoints (off by default) |
 | `accounts[].accountUuid` | Anthropic account (person) id; set automatically from the OAuth profile |
 | `accounts[].orgUuid` / `orgName` | Organization the account is scoped to — lets one email hold multiple org accounts |
 | `accounts[].priority` | Rotation preference, lower = preferred (default 0) |
@@ -247,6 +249,30 @@ teamclaude probe        # show current setting
 ```
 
 It reads each OAuth account's utilization from Anthropic's usage endpoint (`/api/oauth/usage`), which reports quota **without consuming any message quota**. Minimum interval is 30s. Changing it takes effect on a running server immediately (no restart). When enabled, it also surfaces the **Sonnet 7-day** bucket as an extra bar in the TUI / `status` (when your plan exposes it).
+
+### MITM proxy mode (optional, off by default)
+
+The normal reverse-proxy only intercepts what `ANTHROPIC_BASE_URL` covers. Some Claude Code features (e.g. the **Claude Design MCP**) use a **hardcoded** `https://api.anthropic.com` URL that ignores that variable, so they bypass the proxy. MITM proxy mode captures those too.
+
+Enable it in the config:
+
+```json
+{ "useMitmProxy": true }
+```
+
+With it on, `teamclaude run` launches claude pointed at teamclaude as an **HTTPS forward proxy** (`HTTPS_PROXY`) and trusts a locally-generated CA (`NODE_EXTRA_CA_CERTS`). teamclaude terminates TLS for the upstream host, injects the real account token, and forwards to the real Anthropic API. **Everything else is tunneled untouched.** The server accepts *both* base-URL and proxy clients at once, so you can run multiple claude instances with different settings against one server.
+
+Trust model:
+- The CA is generated locally, stored in the config dir, and trusted **only** by the claude process you launch via `teamclaude run` (through `NODE_EXTRA_CA_CERTS`) — it is **never** added to your system trust store. The leaf private key is `0600`; the CA private key is never written to disk.
+- teamclaude still verifies the **real** Anthropic certificate on the upstream leg.
+
+Verify the proxy + CA without any credentials — the proxy always answers a built-in test host:
+
+```bash
+# (with the server running and certs generated, e.g. after one `teamclaude run`)
+curl --proxy http://localhost:3456 --cacert ~/.config/teamclaude-ca.pem https://www.example.org/
+# → {"teamclaude":"mitm-proxy-ok","host":"www.example.org",...}
+```
 
 ## How It Works
 

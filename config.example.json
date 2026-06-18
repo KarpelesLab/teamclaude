@@ -6,6 +6,7 @@
   "upstream": "https://api.anthropic.com",
   "switchThreshold": 0.98,
   "quotaProbeSeconds": 0,
+  "useMitmProxy": false,
   "accounts": [
     {
       "name": "primary-max",
