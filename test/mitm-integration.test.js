@@ -216,3 +216,44 @@ test('MITM h1: when upstream is http/1.1, ALPN mirrors and the head auth is rewr
     tlsSock.destroy(); closeHard(proxy); closeHard(upstream);
   }
 });
+
+// Regression (the run --mitm "ConnectionRefused"): an http/1.1-only client — what
+// undici/claude offers when it tunnels through a proxy — against an upstream that
+// ALSO speaks h2. We must adopt the CLIENT's protocol (http/1.1) and mirror it
+// upstream, not force the upstream's preferred h2 onto the client (which would
+// fail the TLS handshake with no_application_protocol).
+test('MITM: http/1.1-only client against a dual h2+h1 upstream negotiates http/1.1', T, async () => {
+  const { caCertPem, leafCertPem, leafKeyPem } = generateCertChain('localhost');
+
+  // Dual-protocol upstream: allowHTTP1 means it serves BOTH h2 (stream) and
+  // http/1.1 (request). It prefers h2 when offered both.
+  const upstream = http2.createSecureServer({ key: leafKeyPem, cert: leafCertPem, allowHTTP1: true });
+  upstream.on('stream', (s, h) => { // h2 path (should NOT be taken here)
+    s.respond({ ':status': 200, 'x-proto': 'h2', 'x-saw-auth': h.authorization || 'none' });
+    s.end('h2');
+  });
+  upstream.on('request', (req, res) => { // http/1.1 path
+    res.writeHead(200, { 'connection': 'close', 'x-proto': 'h1', 'x-saw-auth': req.headers.authorization || 'none', 'x-saw-xkey': req.headers['x-api-key'] || 'none' });
+    res.end('h1-ok');
+  });
+  const upPort = await listen(upstream);
+  const proxy = makeProxy(upPort, caCertPem, leafCertPem, leafKeyPem, () => {});
+  const proxyPort = await listen(proxy);
+
+  // Client offers ONLY http/1.1 — like undici tunnelling through the proxy.
+  const tlsSock = await connectThroughProxy(proxyPort, `127.0.0.1:${upPort}`, caCertPem, ['http/1.1']);
+  try {
+    assert.equal(tlsSock.alpnProtocol, 'http/1.1'); // client's choice honored, not forced to h2
+    tlsSock.write('GET /v1/messages HTTP/1.1\r\nhost: localhost\r\nauthorization: Bearer FAKE\r\nx-api-key: sk-fake\r\n\r\n');
+    let buf = '';
+    tlsSock.setEncoding('utf8');
+    tlsSock.on('data', (d) => { buf += d; });
+    await once(tlsSock, 'end');
+    assert.match(buf, /x-proto: h1/i);              // served over http/1.1 end-to-end
+    assert.match(buf, /x-saw-auth: Bearer REAL-TOKEN/i); // token injected
+    assert.match(buf, /x-saw-xkey: none/i);         // x-api-key dropped
+    assert.match(buf, /h1-ok/);
+  } finally {
+    tlsSock.destroy(); closeHard(proxy); closeHard(upstream);
+  }
+});
