@@ -8,7 +8,7 @@
 // through byte-for-byte and only *observed* (read-only HPACK decode) so we can
 // surface `:status` + rate-limit headers for quota tracking.
 
-import { readFrames, buildHeaderBlock, stripHeadersPayload, FRAME, FLAG, PREFACE } from './frames.js';
+import { readFrames, buildFrame, buildHeaderBlock, stripHeadersPayload, FRAME, FLAG, PREFACE } from './frames.js';
 import { HpackDecoder, HpackEncoder } from './hpack.js';
 
 const SETTINGS_HEADER_TABLE_SIZE = 0x1;
@@ -44,6 +44,8 @@ function writeBackpressured(dst, buf, ctl) {
 export function h2Relay(claude, upstream, opts = {}) {
   const rewriteRequest = opts.rewriteRequest || ((f) => f);
   const onResponseHeaders = opts.onResponseHeaders || (() => {});
+  const makeBodyPatcher = opts.makeBodyPatcher || null; // () => { push(buf)->buf } per stream
+  const bodyPatchers = makeBodyPatcher ? new Map() : null; // streamId -> patcher
   const log = opts.log || (() => {});
 
   const reqDec = new HpackDecoder();         // decodes claude's request blocks
@@ -89,6 +91,18 @@ export function h2Relay(claude, upstream, opts = {}) {
       if (fr.flags & FLAG.END_HEADERS) finishReqBlock();
       return;
     }
+    if (fr.type === FRAME.DATA && bodyPatchers) {
+      // Same-length in-place body patch (account_uuid) via a per-stream streaming
+      // JSON state machine; re-emit the DATA frame unchanged in length/flags so
+      // framing & flow control are preserved.
+      let p = bodyPatchers.get(fr.streamId);
+      if (!p) { p = makeBodyPatcher(); bodyPatchers.set(fr.streamId, p); }
+      const payload = p.push(Buffer.from(fr.payload));
+      writeBackpressured(upstream, buildFrame({ type: FRAME.DATA, flags: fr.flags, streamId: fr.streamId, payload }), reqCtl);
+      if (fr.flags & FLAG.END_STREAM) bodyPatchers.delete(fr.streamId);
+      return;
+    }
+    if (fr.type === FRAME.RST_STREAM && bodyPatchers) bodyPatchers.delete(fr.streamId);
     if (fr.type === FRAME.SETTINGS && fr.streamId === 0 && !(fr.flags & 0x1)) {
       applyTableSizeSetting(fr.payload, respDec); // claude's setting governs response encoding
     }
@@ -158,14 +172,16 @@ export function h2Relay(claude, upstream, opts = {}) {
  */
 export function h1Relay(claude, upstream, opts = {}) {
   const rewriteHead = opts.rewriteHead || ((h) => h);
+  const patcher = opts.makeBodyPatcher ? opts.makeBodyPatcher() : null;
+  const rewriteData = patcher ? (b) => patcher.push(b) : (b) => b; // same-length body patch
   const destroyBoth = () => { claude.destroy(); upstream.destroy(); };
   claude.on('error', destroyBoth);
   upstream.on('error', destroyBoth);
   claude.on('close', () => upstream.destroy());
   upstream.on('close', () => claude.destroy());
+  upstream.pipe(claude); // responses: verbatim
 
   let buf = Buffer.alloc(0);
-  let done = false;
   const onData = (chunk) => {
     buf = Buffer.concat([buf, chunk]);
     const idx = buf.indexOf('\r\n\r\n');
@@ -173,17 +189,15 @@ export function h1Relay(claude, upstream, opts = {}) {
       if (buf.length > 65536) destroyBoth(); // runaway head
       return;
     }
-    done = true;
     claude.removeListener('data', onData);
-    const head = rewriteHead(buf.subarray(0, idx + 4).toString('latin1'));
-    upstream.write(Buffer.from(head, 'latin1'));
+    upstream.write(Buffer.from(rewriteHead(buf.subarray(0, idx + 4).toString('latin1')), 'latin1'));
     const remainder = buf.subarray(idx + 4);
-    if (remainder.length) upstream.write(remainder);
-    claude.pipe(upstream);
-    upstream.pipe(claude);
+    if (remainder.length) upstream.write(rewriteData(Buffer.from(remainder)));
+    // forward (patched) request body
+    claude.on('data', (c) => upstream.write(rewriteData(Buffer.from(c))));
+    claude.on('end', () => upstream.end());
   };
   claude.on('data', onData);
-  void done;
 }
 
 /** Rewrite an HTTP/1.1 request head: replace the Authorization line with

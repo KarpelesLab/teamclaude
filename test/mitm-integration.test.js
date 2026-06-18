@@ -32,8 +32,10 @@ function connectThroughProxy(proxyPort, target, caCertPem, alpn) {
   });
 }
 
+const ACCOUNT_UUID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+
 function makeProxy(upPort, caCertPem, leafCertPem, leafKeyPem, onQuota) {
-  const account = { index: 0, type: 'oauth', credential: 'REAL-TOKEN' };
+  const account = { index: 0, type: 'oauth', credential: 'REAL-TOKEN', accountUuid: ACCOUNT_UUID };
   const accountManager = {
     getActiveAccount: () => account,
     ensureTokenFresh: async () => {},
@@ -89,6 +91,39 @@ test('MITM h2: ALPN mirrored, only authorization rewritten, quota observed', asy
     assert.equal(resp['x-saw-ct'], 'application/json');    // preserved
     assert.equal(body, 'upstream-ok');
     assert.ok(quota && quota['anthropic-ratelimit-unified-5h-utilization'] === '0.7');
+    client.close();
+  } finally {
+    proxy.close(); upstream.close();
+  }
+});
+
+test('MITM h2 rewrites body account_uuid to the injected account', async () => {
+  const { caCertPem, leafCertPem, leafKeyPem } = generateCertChain('localhost');
+  const upstream = http2.createSecureServer({ key: leafKeyPem, cert: leafCertPem });
+  upstream.on('stream', (s) => {
+    let body = '';
+    s.on('data', (d) => { body += d; });
+    s.on('end', () => {
+      let seen = 'none';
+      try { seen = JSON.parse(JSON.parse(body).metadata.user_id).account_uuid; } catch { /* ignore */ }
+      s.respond({ ':status': 200, 'x-seen-uuid': seen });
+      s.end('ok');
+    });
+  });
+  const upPort = await listen(upstream);
+  const proxy = makeProxy(upPort, caCertPem, leafCertPem, leafKeyPem, () => {});
+  const proxyPort = await listen(proxy);
+
+  const tlsSock = await connectThroughProxy(proxyPort, `localhost:${upPort}`, caCertPem, ['h2', 'http/1.1']);
+  try {
+    const client = http2.connect('https://localhost', { createConnection: () => tlsSock });
+    const req = client.request({ ':method': 'POST', ':path': '/v1/messages', authorization: 'Bearer FAKE' });
+    const reqBody = JSON.stringify({ metadata: { user_id: JSON.stringify({ device_id: 'd', account_uuid: '4c39e915-eb47-450d-9bf4-4cbbcd049a08' }) } });
+    let resp;
+    req.on('response', (h) => { resp = h; });
+    req.resume(); req.end(reqBody);
+    await once(req, 'close');
+    assert.equal(resp['x-seen-uuid'], ACCOUNT_UUID); // body uuid rewritten to the injected account's
     client.close();
   } finally {
     proxy.close(); upstream.close();

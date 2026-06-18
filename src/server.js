@@ -2,6 +2,7 @@ import http from 'node:http';
 import { writeFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { ensureCerts, createConnectHandler } from './mitm.js';
+import { patchAccountUuid } from './account-uuid-rewrite.js';
 
 
 const HOP_BY_HOP_HEADERS = new Set([
@@ -240,6 +241,10 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   const upstreamUrl = `${upstream}${req.url}`;
   const method = req.method;
 
+  // Align the body's account_uuid (in metadata.user_id) with the account whose
+  // token we're injecting (same-length patch; no-op if absent).
+  const sendBody = account.accountUuid ? patchAccountUuid(body, account.accountUuid) : body;
+
   // Build log sections
   const logSections = [];
   if (logDir) {
@@ -267,7 +272,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     const upstreamRes = await fetch(upstreamUrl, {
       method,
       headers,
-      body: ['GET', 'HEAD'].includes(method) ? undefined : body,
+      body: ['GET', 'HEAD'].includes(method) ? undefined : sendBody,
       redirect: 'manual',
     });
 

@@ -18,6 +18,7 @@ import tls from 'node:tls';
 import { getConfigPath } from './config.js';
 import { generateCertChain } from './x509.js';
 import { h2Relay, h1Relay, rewriteH1Auth } from './h2/relay.js';
+import { AccountUuidPatcher } from './account-uuid-rewrite.js';
 
 const CA_CERT = 'teamclaude-ca.pem';
 const LEAF_CERT = 'teamclaude-leaf.pem';
@@ -157,9 +158,16 @@ async function intercept({ host, port, mode, clientSocket, head, accountManager,
 
   await new Promise((resolve) => claudeTls.once('secure', resolve));
 
+  // Per-stream streaming body patcher: align metadata.user_id.account_uuid with
+  // the injected account (same length; no-op if the account has no UUID).
+  const makeBodyPatcher = account.accountUuid
+    ? () => new AccountUuidPatcher(account.accountUuid)
+    : null;
+
   if (alpn === 'h2') {
     h2Relay(claudeTls, upstreamSock, {
       rewriteRequest: makeRewriteRequest(account),
+      makeBodyPatcher,
       onResponseHeaders: makeQuotaObserver(accountManager, account),
       log,
     });
@@ -167,7 +175,7 @@ async function intercept({ host, port, mode, clientSocket, head, accountManager,
     const auth = account.type === 'oauth'
       ? { authorization: `Bearer ${account.credential}` }
       : { apiKey: account.credential };
-    h1Relay(claudeTls, upstreamSock, { rewriteHead: (h) => rewriteH1Auth(h, auth) });
+    h1Relay(claudeTls, upstreamSock, { rewriteHead: (h) => rewriteH1Auth(h, auth), makeBodyPatcher });
   }
 }
 
