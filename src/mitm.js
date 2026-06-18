@@ -141,26 +141,47 @@ async function intercept({ host, port, mode, clientSocket, head, accountManager,
     return;
   }
 
-  // rewrite: dial upstream first, mirror its ALPN, then terminate claude.
+  // rewrite: be a faithful ALPN mirror. We don't terminate TLS at the byte
+  // level (that's node:tls), so to avoid imposing our own protocol preference we
+  // peek the client's ClientHello, read the exact ALPN list it offers, present
+  // THAT list to the upstream, let the upstream pick, then terminate the client
+  // with whatever the upstream selected. The upstream decides — constrained to
+  // what the client can speak — so an http/1.1-only client (undici/claude) and
+  // an h2 client both negotiate end-to-end exactly as they would directly.
   const account = accountManager.getActiveAccount();
   if (!account) { clientSocket.destroy(); return; }
   await accountManager.ensureTokenFresh(account.index);
 
+  reply200Raw(clientSocket);
+  const offered = await peekClientAlpn(clientSocket, head); // client's ALPN list, or null
+
   // autoSelectFamily (happy-eyeballs) is the default on Node 20+ but not 18; set
   // it explicitly so a dual-stack upstream whose IPv6 path is unreachable falls
   // back to IPv4 instead of hanging the connect (option ignored pre-18.13).
-  const upstreamSock = tls.connect({ host, port, servername: host, autoSelectFamily: true, ALPNProtocols: ['h2', 'http/1.1'], ...upstreamTlsOptions });
+  const upstreamSock = tls.connect({
+    host, port, servername: host, autoSelectFamily: true,
+    ...(offered ? { ALPNProtocols: offered } : {}),
+    ...upstreamTlsOptions,
+  });
   await new Promise((resolve, reject) => {
     upstreamSock.once('secureConnect', resolve);
     upstreamSock.once('error', reject);
   });
-  const alpn = upstreamSock.alpnProtocol || 'http/1.1';
+  const upstreamAlpn = upstreamSock.alpnProtocol; // false if none negotiated
+  const alpn = upstreamAlpn || 'http/1.1';        // relay protocol selector
 
-  reply200Raw(clientSocket);
-  const claudeTls = termClaude(clientSocket, head, key, cert, [alpn]);
+  // Terminate the client advertising exactly what the upstream chose (a subset
+  // of what the client offered, so it always overlaps).
+  const claudeTls = new tls.TLSSocket(clientSocket, {
+    isServer: true, key, cert,
+    ...(upstreamAlpn ? { ALPNProtocols: [upstreamAlpn] } : {}),
+  });
+  claudeTls.on('error', () => { claudeTls.destroy(); upstreamSock.destroy(); });
   upstreamSock.on('error', () => claudeTls.destroy());
-
-  await new Promise((resolve) => claudeTls.once('secure', resolve));
+  await new Promise((resolve, reject) => {
+    claudeTls.once('secure', resolve);
+    claudeTls.once('error', reject);
+  });
 
   // Per-stream streaming body patcher: align metadata.user_id.account_uuid with
   // the injected account (same length; no-op if the account has no UUID).
@@ -192,6 +213,93 @@ function termClaude(clientSocket, head, key, cert, alpn) {
   const t = new tls.TLSSocket(clientSocket, { isServer: true, key, cert, ALPNProtocols: alpn });
   t.on('error', () => t.destroy());
   return t;
+}
+
+// Read the client's first TLS record (the ClientHello) to learn the ALPN
+// protocol list it offers, WITHOUT consuming it: bytes are unshifted back so the
+// real TLS handshake still sees the full ClientHello. Returns the protocol
+// string array, or null if there is no ALPN extension / it can't be parsed (in
+// which case we offer the upstream no ALPN and mirror its no-ALPN result).
+function peekClientAlpn(sock, head) {
+  return new Promise((resolve) => {
+    let buf = head && head.length ? Buffer.from(head) : Buffer.alloc(0);
+    let done = false;
+    const finish = (result) => {
+      if (done) return; done = true;
+      sock.removeListener('readable', onReadable);
+      sock.removeListener('end', onEnd);
+      sock.removeListener('error', onEnd);
+      if (buf.length) sock.unshift(buf); // put the ClientHello back for node:tls
+      resolve(result);
+    };
+    const tryParse = () => {
+      const r = parseClientHelloAlpn(buf);
+      if (r === undefined && buf.length < 16384) return false; // need more bytes
+      finish(Array.isArray(r) ? r : null);
+      return true;
+    };
+    // Read in PAUSED mode (readable/read) — never switch the socket to flowing,
+    // or the TLSSocket we hand it to afterwards won't receive the unshifted bytes.
+    const onReadable = () => {
+      let chunk;
+      while ((chunk = sock.read()) !== null) {
+        buf = Buffer.concat([buf, chunk]);
+        if (tryParse()) return;
+      }
+    };
+    const onEnd = () => finish(null);
+    sock.on('readable', onReadable);
+    sock.once('end', onEnd);
+    sock.once('error', onEnd);
+    if (tryParse()) return; // head may already contain the whole ClientHello
+    onReadable();           // drain anything already buffered
+  });
+}
+
+// Parse the ALPN protocol list out of a TLS ClientHello.
+//   returns string[]  — ALPN extension present
+//   returns null       — parsed far enough to know there is no usable ALPN
+//   returns undefined  — need more bytes to decide
+export function parseClientHelloAlpn(buf) {
+  if (buf.length < 5) return undefined;
+  if (buf[0] !== 0x16) return null;                 // not a handshake record
+  const recEnd = 5 + buf.readUInt16BE(3);
+  if (buf.length < recEnd) return undefined;        // wait for the full record
+  let p = 5;
+  if (buf[p] !== 0x01) return null;                 // not a ClientHello
+  const hsEnd = p + 4 + ((buf[p + 1] << 16) | (buf[p + 2] << 8) | buf[p + 3]);
+  const end = Math.min(hsEnd, recEnd);
+  p += 4;
+  p += 2 + 32;                                      // client_version + random
+  if (p >= end) return null;
+  p += 1 + buf[p];                                  // session_id
+  if (p + 2 > end) return null;
+  p += 2 + buf.readUInt16BE(p);                     // cipher_suites
+  if (p + 1 > end) return null;
+  p += 1 + buf[p];                                  // compression_methods
+  if (p + 2 > end) return null;
+  let extEnd = p + 2 + buf.readUInt16BE(p);
+  p += 2;
+  extEnd = Math.min(extEnd, end);
+  while (p + 4 <= extEnd) {
+    const type = buf.readUInt16BE(p);
+    const len = buf.readUInt16BE(p + 2);
+    p += 4;
+    if (type === 0x0010) {                          // application_layer_protocol_negotiation
+      let q = p + 2;                                // skip ALPN list length
+      const listEnd = Math.min(p + len, extEnd);
+      const protos = [];
+      while (q < listEnd) {
+        const l = buf[q]; q += 1;
+        if (q + l > listEnd) break;
+        protos.push(buf.toString('latin1', q, q + l));
+        q += l;
+      }
+      return protos.length ? protos : null;
+    }
+    p += len;
+  }
+  return null;                                      // no ALPN extension
 }
 
 // Rewrite only the auth field on an h2 request header list (account token in,
