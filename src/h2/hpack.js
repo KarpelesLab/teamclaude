@@ -264,6 +264,11 @@ export class HpackEncoder {
     this.table = new DynamicTable(maxSize);
     this.useHuffman = true;
     this.pendingSizeUpdate = maxSize === DEFAULT_TABLE_SIZE ? null : maxSize;
+    // When false, never insert into / reference the dynamic table — emit every
+    // field as a literal (full static matches still use the static index). This
+    // makes the encoder independent of the peer's SETTINGS_HEADER_TABLE_SIZE,
+    // which the MITM relay relies on (it doesn't track the upstream's table).
+    this.dynamicIndexing = true;
   }
   encode(fields) {
     const out = [];
@@ -281,9 +286,13 @@ export class HpackEncoder {
       return;
     }
     const m = this.table.find(name, value);
-    if (m && m.valueMatched) { encodeInt(out, m.index, 7, 0x80); return; }
-    this.#literal(out, 0x40, 6, m ? m.index : null, name, value);
-    this.table.insert(name, value);
+    if (m && m.valueMatched) { encodeInt(out, m.index, 7, 0x80); return; } // indexed (static when no indexing)
+    if (this.dynamicIndexing) {
+      this.#literal(out, 0x40, 6, m ? m.index : null, name, value); // literal w/ incremental indexing
+      this.table.insert(name, value);
+    } else {
+      this.#literal(out, 0x00, 4, m ? m.index : null, name, value); // literal without indexing; no insert
+    }
   }
   #literal(out, pattern, prefix, nameIdx, name, value) {
     if (nameIdx !== null) encodeInt(out, nameIdx, prefix, pattern);
