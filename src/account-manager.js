@@ -232,16 +232,18 @@ export class AccountManager {
     return false;
   }
 
-  _selectNext() {
-    // Selection order among available accounts:
-    //   1. lowest `priority` value (operator-controlled; default 0, lower = preferred)
-    //   2. then the account with no known weekly limit — using it lets us
-    //      discover its quota
-    //   3. then the account whose weekly limit expires soonest: that quota is
-    //      closest to refreshing, so spending it first preserves accounts whose
-    //      weekly window resets further out.
-    // With all priorities at the default 0, this reduces to the original
-    // weekly-reset heuristic.
+  /**
+   * Pick the best available account by selection order, WITHOUT mutating state:
+   *   1. lowest `priority` value (operator-controlled; default 0, lower = preferred)
+   *   2. then the account with no known weekly limit — using it lets us
+   *      discover its quota
+   *   3. then the account whose weekly limit expires soonest: that quota is
+   *      closest to refreshing, so spending it first preserves accounts whose
+   *      weekly window resets further out.
+   * With all priorities at the default 0, this reduces to the weekly-reset
+   * heuristic. Returns the account or null if none are available.
+   */
+  _pickBestAvailable() {
     let best = null;
     let bestPriority = Infinity;
     let bestReset = Infinity;
@@ -263,7 +265,31 @@ export class AccountManager {
         best = account;
       }
     }
+    return best;
+  }
 
+  /**
+   * Select the active account up front (e.g. on daemon launch, once persisted
+   * quota has been restored) so we start on the highest-priority / soonest-
+   * resetting account instead of blindly on index 0. Mirrors rotation order.
+   * Returns the chosen account, or the existing current one if none are
+   * available (the server still starts; requests 429 until a window resets).
+   */
+  selectActiveAccount() {
+    this.refreshExpiredQuotas(); // drop any restored windows that already expired
+    const best = this._pickBestAvailable();
+    if (!best) return this.accounts[this.currentIndex] || null;
+    this.currentIndex = best.index;
+    best.probing = best.quota.unified7dReset == null;
+    const wk = best.quota.unified7d != null
+      ? `${(best.quota.unified7d * 100).toFixed(1)}% weekly used`
+      : 'weekly quota unknown';
+    console.log(`[TeamClaude] Starting on account "${best.name}" (priority ${best.priority || 0}, ${wk})`);
+    return best;
+  }
+
+  _selectNext() {
+    const best = this._pickBestAvailable();
     if (best) {
       const switched = best.index !== this.currentIndex;
       this.currentIndex = best.index;

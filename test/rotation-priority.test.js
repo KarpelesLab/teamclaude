@@ -79,3 +79,65 @@ test('common case: all-equal priority leaves getActiveAccount on the healthy cur
   am.currentIndex = 2;
   assert.equal(am.getActiveAccount().name, 'c'); // unchanged — no preemption when priorities tie
 });
+
+// ── selectActiveAccount (daemon-launch up-front selection) ───────────────────
+
+test('selectActiveAccount picks the soonest-resetting weekly window, not index 0', () => {
+  const now = Date.now();
+  const am = new AccountManager([oauth('a'), oauth('b'), oauth('c')], 0.98);
+  // All same priority and available; b's weekly resets soonest → spend it first.
+  am.accounts[0].quota.unified7d = 0.5; am.accounts[0].quota.unified7dReset = now + 5 * 86400_000;
+  am.accounts[1].quota.unified7d = 0.5; am.accounts[1].quota.unified7dReset = now + 1 * 86400_000;
+  am.accounts[2].quota.unified7d = 0.5; am.accounts[2].quota.unified7dReset = now + 3 * 86400_000;
+  const chosen = am.selectActiveAccount();
+  assert.equal(chosen.name, 'b');
+  assert.equal(am.currentIndex, 1); // currentIndex actually moved off 0
+});
+
+test('selectActiveAccount honors priority over the weekly heuristic', () => {
+  const now = Date.now();
+  const am = new AccountManager([
+    oauth('a', { priority: 0 }),
+    oauth('b', { priority: 1 }), // higher-priority value = less preferred
+  ], 0.98);
+  // b resets sooner, but a has the better (lower) priority value → a wins.
+  am.accounts[0].quota.unified7d = 0.5; am.accounts[0].quota.unified7dReset = now + 5 * 86400_000;
+  am.accounts[1].quota.unified7d = 0.5; am.accounts[1].quota.unified7dReset = now + 1 * 86400_000;
+  assert.equal(am.selectActiveAccount().name, 'a');
+});
+
+test('selectActiveAccount skips an account already over the weekly threshold', () => {
+  const now = Date.now();
+  const am = new AccountManager([oauth('a'), oauth('b')], 0.98);
+  am.accounts[0].quota.unified7d = 0.99; am.accounts[0].quota.unified7dReset = now + 86400_000; // near-exhausted
+  am.accounts[1].quota.unified7d = 0.10; am.accounts[1].quota.unified7dReset = now + 5 * 86400_000;
+  assert.equal(am.selectActiveAccount().name, 'b');
+});
+
+test('selectActiveAccount restores onto the best account after an export → restore cycle', () => {
+  const now = Date.now();
+  const am1 = new AccountManager([
+    oauth('a', { accountUuid: 'p1' }),
+    oauth('b', { accountUuid: 'p2' }),
+  ], 0.98);
+  am1.accounts[0].quota.unified7d = 0.8; am1.accounts[0].quota.unified7dReset = now + 6 * 86400_000;
+  am1.accounts[1].quota.unified7d = 0.2; am1.accounts[1].quota.unified7dReset = now + 2 * 86400_000;
+
+  const am2 = new AccountManager([
+    oauth('a', { accountUuid: 'p1' }),
+    oauth('b', { accountUuid: 'p2' }),
+  ], 0.98);
+  am2.restoreQuotaState(am1.exportQuotaState());
+  // b's weekly resets sooner → start there, mirroring a real daemon launch.
+  assert.equal(am2.selectActiveAccount().name, 'b');
+});
+
+test('selectActiveAccount leaves current account when none are available', () => {
+  const am = new AccountManager([oauth('a'), oauth('b')], 0.98);
+  am.accounts[0].status = 'exhausted';
+  am.accounts[1].disabled = true;
+  am.currentIndex = 1;
+  const chosen = am.selectActiveAccount();
+  assert.equal(chosen.name, 'b');   // falls back to the existing current account
+  assert.equal(am.currentIndex, 1); // unchanged
+});

@@ -123,6 +123,10 @@ async function serverCommand() {
   });
   if (savedState?.quota) accountManager.restoreQuotaState(savedState.quota);
 
+  // With quota restored, pick the best account up front (highest priority /
+  // soonest-resetting weekly window) instead of defaulting to the first one.
+  accountManager.selectActiveAccount();
+
   // Periodically persist quota (and once more on shutdown) to the state file.
   const persistQuotaState = () =>
     saveState({ quota: accountManager.exportQuotaState() })
