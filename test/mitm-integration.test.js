@@ -13,6 +13,20 @@ import { createConnectHandler } from '../src/mitm.js';
 
 function listen(server) { return new Promise(r => server.listen(0, '127.0.0.1', () => r(server.address().port))); }
 
+// Tear a server down hard: destroy any lingering connections (CONNECT-hijacked
+// sockets are NOT closed by server.close(), which only stops accepting), then
+// close. Without this, Node 18's test runner — which, unlike Node 20+, does not
+// force-exit — keeps the event loop alive on a leaked handle and the run hangs.
+function closeHard(server) {
+  if (!server) return;
+  server.closeAllConnections?.();
+  try { server.close(); } catch { /* already closing */ }
+}
+
+// node:test per-test timeout: turn any future deadlock into a fast, located
+// failure instead of a 30-minute CI stall (option form works on Node 18).
+const T = { timeout: 30000 };
+
 // Drive a CONNECT through the proxy, then TLS over the tunnel; resolve the TLS socket.
 function connectThroughProxy(proxyPort, target, caCertPem, alpn) {
   return new Promise((resolve, reject) => {
@@ -57,7 +71,7 @@ function makeProxy(upPort, caCertPem, leafCertPem, leafKeyPem, onQuota, logDir =
   return proxy;
 }
 
-test('MITM h2: ALPN mirrored, only authorization rewritten, quota observed', async () => {
+test('MITM h2: ALPN mirrored, only authorization rewritten, quota observed', T, async () => {
   const { caCertPem, leafCertPem, leafKeyPem } = generateCertChain('localhost');
 
   const upstream = http2.createSecureServer({ key: leafKeyPem, cert: leafCertPem });
@@ -97,11 +111,11 @@ test('MITM h2: ALPN mirrored, only authorization rewritten, quota observed', asy
     assert.ok(quota && quota['anthropic-ratelimit-unified-5h-utilization'] === '0.7');
     client.close();
   } finally {
-    proxy.close(); upstream.close();
+    tlsSock.destroy(); closeHard(proxy); closeHard(upstream);
   }
 });
 
-test('MITM h2 rewrites body account_uuid to the injected account', async () => {
+test('MITM h2 rewrites body account_uuid to the injected account', T, async () => {
   const { caCertPem, leafCertPem, leafKeyPem } = generateCertChain('localhost');
   const upstream = http2.createSecureServer({ key: leafKeyPem, cert: leafCertPem });
   upstream.on('stream', (s) => {
@@ -130,11 +144,11 @@ test('MITM h2 rewrites body account_uuid to the injected account', async () => {
     assert.equal(resp['x-seen-uuid'], ACCOUNT_UUID); // body uuid rewritten to the injected account's
     client.close();
   } finally {
-    proxy.close(); upstream.close();
+    tlsSock.destroy(); closeHard(proxy); closeHard(upstream);
   }
 });
 
-test('MITM logs proxied requests when --log-to is set', async () => {
+test('MITM logs proxied requests when --log-to is set', T, async () => {
   const dir = mkdtempSync(join(tmpdir(), 'tc-mitmlog-'));
   const { caCertPem, leafCertPem, leafKeyPem } = generateCertChain('localhost');
   const upstream = http2.createSecureServer({ key: leafKeyPem, cert: leafCertPem });
@@ -159,11 +173,11 @@ test('MITM logs proxied requests when --log-to is set', async () => {
     assert.ok(!content.includes('SECRET-FAKE'));  // client token never logged (replaced + masked)
     client.close();
   } finally {
-    proxy.close(); upstream.close(); rmSync(dir, { recursive: true, force: true });
+    tlsSock.destroy(); closeHard(proxy); closeHard(upstream); rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test('MITM h1: when upstream is http/1.1, ALPN mirrors and the head auth is rewritten', async () => {
+test('MITM h1: when upstream is http/1.1, ALPN mirrors and the head auth is rewritten', T, async () => {
   const { caCertPem, leafCertPem, leafKeyPem } = generateCertChain('localhost');
 
   // http/1.1-only TLS upstream that echoes the authorization it received.
@@ -195,6 +209,6 @@ test('MITM h1: when upstream is http/1.1, ALPN mirrors and the head auth is rewr
     assert.equal(body.auth, 'Bearer REAL-TOKEN'); // rewritten
     assert.equal(body.xkey, 'none');              // dropped
   } finally {
-    proxy.close(); upstream.close();
+    tlsSock.destroy(); closeHard(proxy); closeHard(upstream);
   }
 });
