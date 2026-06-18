@@ -17,6 +17,11 @@ test('aliasLine embeds a quoted absolute path when teamclaude is not on PATH', (
   assert.equal(aliasLine('fish', '"/opt/tc/index.js"'), `alias claude '"/opt/tc/index.js" run --'`);
 });
 
+test('aliasLine with mitm:true emits `run --mitm --`', () => {
+  assert.equal(aliasLine('bash', 'teamclaude', true), "alias claude='teamclaude run --mitm --'");
+  assert.equal(aliasLine('fish', 'teamclaude', true), "alias claude 'teamclaude run --mitm --'");
+});
+
 test('teamclaudeRef returns the bare command when it is on PATH', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'tc-path-'));
   const prev = process.env.PATH;

@@ -41,9 +41,9 @@ export function teamclaudeRef() {
   return `"${abs}"`;
 }
 
-/** The alias definition for a given shell family. */
-export function aliasLine(shell = detectShell(), ref = teamclaudeRef()) {
-  const body = `${ref} run --`;
+/** The alias definition for a given shell family. Pass mitm:true for `run --mitm`. */
+export function aliasLine(shell = detectShell(), ref = teamclaudeRef(), mitm = false) {
+  const body = mitm ? `${ref} run --mitm --` : `${ref} run --`;
   if (shell === 'fish') return `alias claude '${body}'`;
   return `alias claude='${body}'`;
 }
@@ -63,19 +63,19 @@ export function rcPathForShell(shell = detectShell()) {
   }
 }
 
-export function printAlias({ shell = detectShell() } = {}) {
-  const line = aliasLine(shell);
+export function printAlias({ shell = detectShell(), mitm = false } = {}) {
+  const line = aliasLine(shell, undefined, mitm);
   console.log('# Route plain `claude` through the proxy (when it is running; direct otherwise).');
   console.log('# Add this to your shell config:');
   console.log('');
   console.log(`  ${line}`);
   console.log('');
-  console.log(`# Or install it automatically: teamclaude alias --install`);
+  console.log(`# Or install it automatically: teamclaude alias --install${mitm ? ' --mitm' : ''}`);
   console.log(`#   → writes to ${rcPathForShell(shell)} (override with --shell <bash|zsh|fish|sh>)`);
 }
 
-export function installAlias({ shell = detectShell(), rcPath = rcPathForShell(shell) } = {}) {
-  const line = aliasLine(shell);
+export function installAlias({ shell = detectShell(), rcPath = rcPathForShell(shell), mitm = false } = {}) {
+  const line = aliasLine(shell, undefined, mitm);
   mkdirSync(dirname(rcPath), { recursive: true });
   let text = existsSync(rcPath) ? readFileSync(rcPath, 'utf8') : '';
 

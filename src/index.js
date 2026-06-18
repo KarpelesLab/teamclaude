@@ -416,9 +416,13 @@ async function envCommand() {
 async function runCommand() {
   const config = await loadOrCreateConfig();
 
-  // Everything after 'run' (skip -- separator if present)
-  const claudeArgs = args.slice(1);
-  if (claudeArgs[0] === '--') claudeArgs.shift();
+  // Args after 'run'. teamclaude flags (e.g. --mitm) are recognized only before
+  // an optional `--` separator; everything after `--` goes verbatim to claude.
+  const rest = args.slice(1);
+  const sep = rest.indexOf('--');
+  const tcFlags = sep >= 0 ? rest.slice(0, sep) : rest;
+  const useMitm = tcFlags.includes('--mitm');
+  const claudeArgs = sep >= 0 ? rest.slice(sep + 1) : rest.filter(a => a !== '--mitm');
 
   // Route through the proxy only when it's actually up; otherwise launch claude
   // directly so a stopped proxy doesn't break `claude`. This is what lets the
@@ -426,7 +430,7 @@ async function runCommand() {
   const port = config.proxy.port;
   const env = { ...process.env };
   if (await isProxyUp(port)) {
-    if (config.useMitmProxy) {
+    if (useMitm) {
       // Route ALL of claude's traffic through us as an HTTPS forward proxy, so
       // even hardcoded api.anthropic.com endpoints (e.g. the design MCP) get the
       // real token injected. claude trusts our MITM leaf via NODE_EXTRA_CA_CERTS.
@@ -684,12 +688,13 @@ async function apiCommand() {
 
 function aliasCommand() {
   const shell = argValue('--shell') || undefined;
+  const mitm = args.includes('--mitm');
   if (args.includes('--uninstall')) {
     alias.uninstallAlias({ shell });
   } else if (args.includes('--install')) {
-    alias.installAlias({ shell });
+    alias.installAlias({ shell, mitm });
   } else {
-    alias.printAlias({ shell });
+    alias.printAlias({ shell, mitm });
   }
 }
 
@@ -852,7 +857,10 @@ Commands:
   login               OAuth login via browser
   login --api         Add an API key account
   env                 Print env vars to use with Claude
-  run [-- args...]    Run Claude Code through the proxy (direct if it's down)
+  run [--mitm] [-- args...]
+                      Run Claude Code through the proxy (direct if it's down);
+                      --mitm routes via an HTTPS forward proxy + local CA so even
+                      hardcoded api.anthropic.com endpoints are intercepted
   alias               Print a shell alias so plain 'claude' routes via the proxy
                       (--install to write it to your shell rc; --uninstall to remove)
   status              Show proxy & account status (live)
@@ -874,12 +882,10 @@ Options:
                       --json '{"accessToken":"...","refreshToken":"...","expiresAt":1234}'
   --log-to DIR        Log full requests/responses to DIR (server, one file per request)
   --headless          Run the server without the interactive TUI (for backgrounding)
+  --mitm              (run) route claude via the HTTPS forward proxy + local CA
 
-Config flags:
-  useMitmProxy        When true, 'run' routes claude via an HTTPS forward proxy
-                      (HTTPS_PROXY + a local CA) so even hardcoded api.anthropic.com
-                      endpoints are intercepted. Off by default. The server always
-                      accepts both base-URL and proxy/CONNECT clients.
+The server always accepts both base-URL and proxy/CONNECT clients, so instances
+launched with and without --mitm can share one server.
 
 A running server re-syncs accounts from config on POST /teamclaude/reload
 (local only). add/login/enable/disable/priority trigger it automatically.
@@ -1084,7 +1090,7 @@ function argValue(flag) {
   return (i >= 0 && args[i + 1]) ? args[i + 1] : null;
 }
 
-// Hostname of the configured upstream (the host MITM-intercepts when useMitmProxy).
+// Hostname of the configured upstream (the host MITM-intercepts under `run --mitm`).
 function upstreamHost(config) {
   try { return new URL(config.upstream || 'https://api.anthropic.com').hostname; }
   catch { return 'api.anthropic.com'; }
