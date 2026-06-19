@@ -20,6 +20,7 @@ import { generateCertChain } from './x509.js';
 import { h2Relay, h1Relay, rewriteH1Auth } from './h2/relay.js';
 import { AccountUuidPatcher } from './account-uuid-rewrite.js';
 import { makeMitmTap } from './request-log.js';
+import { tunnelTls } from './sx.js';
 
 const CA_CERT = 'teamclaude-ca.pem';
 const LEAF_CERT = 'teamclaude-leaf.pem';
@@ -109,7 +110,7 @@ export function hostMode(host, config) {
  * at the top of this file.
  * @param ensureLeaf async () => { key, cert }   // current leaf PEMs
  */
-export function createConnectHandler({ config, accountManager, ensureLeaf, upstreamTlsOptions = {}, logDir = null, log = () => {} }) {
+export function createConnectHandler({ config, accountManager, ensureLeaf, upstreamTlsOptions = {}, logDir = null, log = () => {}, sx = null }) {
   return (req, clientSocket, head) => {
     clientSocket.on('error', () => {});
     const [host, portStr] = (req.url || '').split(':');
@@ -126,12 +127,12 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, upstr
       return;
     }
 
-    intercept({ host, port, mode, clientSocket, head, accountManager, ensureLeaf, upstreamTlsOptions, logDir, log })
+    intercept({ host, port, mode, clientSocket, head, accountManager, ensureLeaf, upstreamTlsOptions, logDir, log, sx })
       .catch((err) => { log(`[TeamClaude] MITM ${host}: ${err.message}`); clientSocket.destroy(); });
   };
 }
 
-async function intercept({ host, port, mode, clientSocket, head, accountManager, ensureLeaf, upstreamTlsOptions, logDir, log }) {
+async function intercept({ host, port, mode, clientSocket, head, accountManager, ensureLeaf, upstreamTlsOptions, logDir, log, sx }) {
   const { key, cert } = await ensureLeaf();
 
   if (mode === 'test') {
@@ -155,18 +156,29 @@ async function intercept({ host, port, mode, clientSocket, head, accountManager,
   reply200Raw(clientSocket);
   const offered = await peekClientAlpn(clientSocket, head); // client's ALPN list, or null
 
+  // When sx.org is enabled, dial the upstream THROUGH its proxy (different egress
+  // IP — the IP-based-429 workaround); TLS still terminates end-to-end at the
+  // upstream, so the proxy sees only ciphertext. Otherwise connect directly.
   // autoSelectFamily (happy-eyeballs) is the default on Node 20+ but not 18; set
   // it explicitly so a dual-stack upstream whose IPv6 path is unreachable falls
   // back to IPv4 instead of hanging the connect (option ignored pre-18.13).
-  const upstreamSock = tls.connect({
-    host, port, servername: host, autoSelectFamily: true,
-    ...(offered ? { ALPNProtocols: offered } : {}),
-    ...upstreamTlsOptions,
-  });
-  await new Promise((resolve, reject) => {
-    upstreamSock.once('secureConnect', resolve);
-    upstreamSock.once('error', reject);
-  });
+  let upstreamSock;
+  if (sx?.useForConnect()) {
+    upstreamSock = await tunnelTls({
+      proxy: sx.getProxy(), targetHost: host, targetPort: port,
+      tlsOptions: { ...(offered ? { ALPNProtocols: offered } : {}), ...upstreamTlsOptions },
+    });
+  } else {
+    upstreamSock = tls.connect({
+      host, port, servername: host, autoSelectFamily: true,
+      ...(offered ? { ALPNProtocols: offered } : {}),
+      ...upstreamTlsOptions,
+    });
+    await new Promise((resolve, reject) => {
+      upstreamSock.once('secureConnect', resolve);
+      upstreamSock.once('error', reject);
+    });
+  }
   const upstreamAlpn = upstreamSock.alpnProtocol; // false if none negotiated
   const alpn = upstreamAlpn || 'http/1.1';        // relay protocol selector
 
@@ -194,7 +206,7 @@ async function intercept({ host, port, mode, clientSocket, head, accountManager,
     h2Relay(claudeTls, upstreamSock, {
       rewriteRequest: makeRewriteRequest(account),
       makeBodyPatcher,
-      onResponseHeaders: makeQuotaObserver(accountManager, account),
+      onResponseHeaders: makeQuotaObserver(accountManager, account, sx),
       tap,
       log,
     });
@@ -205,7 +217,7 @@ async function intercept({ host, port, mode, clientSocket, head, accountManager,
     h1Relay(claudeTls, upstreamSock, {
       rewriteHead: (h) => rewriteH1Auth(h, auth),
       makeBodyPatcher,
-      onResponseHeaders: makeQuotaObserver(accountManager, account),
+      onResponseHeaders: makeQuotaObserver(accountManager, account, sx),
       tap,
     });
   }
@@ -332,7 +344,7 @@ function makeRewriteRequest(account) {
   };
 }
 
-function makeQuotaObserver(accountManager, account) {
+function makeQuotaObserver(accountManager, account, sx = null) {
   return (fields) => {
     const m = {};
     for (const f of fields) m[f.name.toString().toLowerCase()] = f.value.toString();
@@ -343,7 +355,11 @@ function makeQuotaObserver(accountManager, account) {
     if (m[':status'] === '429') {
       let ra = parseInt(m['retry-after'], 10);
       if (Number.isNaN(ra)) ra = 60;
-      accountManager.markRateLimited(account.index, Math.min(Math.max(ra, 1), 300));
+      ra = Math.min(Math.max(ra, 1), 300);
+      accountManager.markRateLimited(account.index, ra);
+      // Arm sx.org sticky routing so the next MITM tunnel uses the proxy (in
+      // '429' mode); no-op in 'off'/'always'.
+      sx?.noteRateLimited(ra);
     }
   };
 }

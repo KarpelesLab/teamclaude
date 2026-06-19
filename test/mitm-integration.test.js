@@ -51,7 +51,7 @@ function connectThroughProxy(proxyPort, target, caCertPem, alpn) {
 
 const ACCOUNT_UUID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
 
-function makeProxy(upPort, caCertPem, leafCertPem, leafKeyPem, onQuota, logDir = null) {
+function makeProxy(upPort, caCertPem, leafCertPem, leafKeyPem, onQuota, logDir = null, sx = null) {
   const account = { index: 0, type: 'oauth', credential: 'REAL-TOKEN', accountUuid: ACCOUNT_UUID, name: 'acct@x' };
   const accountManager = {
     getActiveAccount: () => account,
@@ -71,8 +71,29 @@ function makeProxy(upPort, caCertPem, leafCertPem, leafKeyPem, onQuota, logDir =
     upstreamTlsOptions: { ca: [caCertPem], servername: 'localhost' },
     logDir,
     log: () => {},
+    sx,
   }));
   return proxy;
+}
+
+// A minimal HTTP CONNECT proxy that blind-tunnels to the requested target and
+// records the CONNECT line (so a test can prove the MITM dialed THROUGH it).
+function makeConnectProxy() {
+  const seen = { target: null };
+  const srv = net.createServer((client) => {
+    client.once('data', (buf) => {
+      const target = buf.toString('latin1').split('\r\n')[0].match(/^CONNECT (\S+)/)?.[1];
+      seen.target = target;
+      const [host, port] = (target || '').split(':');
+      const up = net.connect(parseInt(port, 10), host, () => {
+        client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+        up.pipe(client); client.pipe(up);
+      });
+      up.on('error', () => client.destroy());
+    });
+    client.on('error', () => {});
+  });
+  return { srv, seen };
 }
 
 test('MITM h2: ALPN mirrored, only authorization rewritten, quota observed', T, async () => {
@@ -116,6 +137,43 @@ test('MITM h2: ALPN mirrored, only authorization rewritten, quota observed', T, 
     client.close();
   } finally {
     tlsSock.destroy(); closeHard(proxy); closeHard(upstream);
+  }
+});
+
+// When sx.org is enabled the MITM must dial the upstream THROUGH the sx proxy
+// (different egress IP — the 429 workaround), while auth rewriting and end-to-end
+// TLS still work exactly as in the direct case.
+test('MITM with sx.org enabled tunnels the upstream dial through the proxy', T, async () => {
+  const { caCertPem, leafCertPem, leafKeyPem } = generateCertChain('localhost');
+  const upstream = http2.createSecureServer({ key: leafKeyPem, cert: leafCertPem });
+  upstream.on('stream', (s, h) => {
+    s.respond({ ':status': 200, 'x-saw-auth': h.authorization || 'none' });
+    s.end('via-sx');
+  });
+  const upPort = await listen(upstream);
+
+  const { srv: sxProxy, seen } = makeConnectProxy();
+  const sxPort = await listen(sxProxy);
+  const sx = { useForConnect: () => true, getProxy: () => ({ host: '127.0.0.1', port: sxPort, username: null, password: null }) };
+
+  const proxy = makeProxy(upPort, caCertPem, leafCertPem, leafKeyPem, () => {}, null, sx);
+  const proxyPort = await listen(proxy);
+
+  const tlsSock = await connectThroughProxy(proxyPort, `127.0.0.1:${upPort}`, caCertPem, ['h2', 'http/1.1']);
+  try {
+    const client = http2.connect('https://localhost', { createConnection: () => tlsSock });
+    const req = client.request({ ':method': 'POST', ':path': '/v1/messages', authorization: 'Bearer FAKE' });
+    let resp, body = '';
+    req.on('response', (h) => { resp = h; });
+    req.setEncoding('utf8'); req.on('data', (d) => { body += d; }); req.end('{}');
+    await once(req, 'close');
+
+    assert.equal(seen.target, `127.0.0.1:${upPort}`, 'MITM dialed upstream through the sx proxy');
+    assert.equal(resp['x-saw-auth'], 'Bearer REAL-TOKEN', 'auth still rewritten over the tunnel');
+    assert.equal(body, 'via-sx', 'end-to-end TLS through the tunnel works');
+    client.close();
+  } finally {
+    tlsSock.destroy(); closeHard(proxy); closeHard(upstream); closeHard(sxProxy);
   }
 });
 

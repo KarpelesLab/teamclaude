@@ -115,16 +115,18 @@ function timestamp() {
 // ── TUI class ────────────────────────────────────────────────
 
 export class TUI {
-  constructor({ accountManager, config, saveConfig, syncAccounts, onQuit }) {
+  constructor({ accountManager, config, saveConfig, syncAccounts, onQuit, sx = null }) {
     this.am = accountManager;
     this.config = config;
     this.saveConfig = saveConfig;
     this.syncAccounts = syncAccounts;
     this.onQuit = onQuit;
+    this.sx = sx;            // sx.org proxy manager (may be null)
+    this.sxBalance = null;   // last fetched sx.org balance, for the settings screen
 
     this.log = [];           // completed activity entries
     this.active = new Map(); // in-flight requests
-    this.mode = 'normal';    // normal | select | add | input
+    this.mode = 'normal';    // normal | select | add | input | settings
     this.selAction = null;   // switch | remove
     this.selIdx = 0;
     this.inputPrompt = '';
@@ -221,6 +223,7 @@ export class TUI {
       case 'select': this._keySelect(k); break;
       case 'add':    this._keyAdd(k); break;
       case 'input':  this._keyInput(k); break;
+      case 'settings': this._keySettings(k); break;
     }
     this.render();
   }
@@ -238,6 +241,19 @@ export class TUI {
     }
     else if (k === 'a') { this.mode = 'add'; }
     else if (k === 'R') { this._doSync(); }
+    else if (k === 'g' && this.sx) { this.mode = 'settings'; this._loadSxBalance(); }
+  }
+
+  _keySettings(k) {
+    if (k === 'k') {
+      this.mode = 'input';
+      this.inputPrompt = 'sx.org API key';
+      this.inputBuf = '';
+      this.inputCb = v => { if (v) this._doSetSxKey(v.trim()); };
+    }
+    else if (k === 'm') { this._doCycleSxMode(); }
+    else if (k === 'x') { this._doClearSxKey(); }
+    else if (k === 'esc' || k === 'q') { this.mode = 'normal'; }
   }
 
   _keySelect(k) {
@@ -294,6 +310,57 @@ export class TUI {
     } catch (e) {
       this._addLog(`Sync failed: ${e.message}`);
     }
+  }
+
+  // ── sx.org settings ────────────────────────────────
+
+  _loadSxBalance() {
+    this.sxBalance = null;
+    if (!this.sx?.apiKey) return;
+    this.sx.getBalance()
+      .then(b => { this.sxBalance = b; if (this.running) this.render(); })
+      .catch(() => {});
+  }
+
+  _sxModeLabel(m) { return m === 'always' ? 'always' : m === '429' ? 'on 429 only' : 'off'; }
+
+  async _doSetSxKey(key) {
+    const mode = this.config.sx?.mode || 'always';
+    this.config.sx = { apiKey: key, mode };
+    try { await this.saveConfig(this.config); }
+    catch (e) { this._addLog(`Failed to save sx.org key: ${e.message}`); }
+    this._addLog('sx.org: configuring...');
+    const r = await this.sx.configure(key, mode);
+    if (r.ok && r.proxy) this._addLog(`sx.org key saved — proxy ${r.proxy.host}:${r.proxy.port} (mode: ${this._sxModeLabel(mode)})`);
+    else if (r.ok) this._addLog(`sx.org key saved (mode: ${this._sxModeLabel(mode)})`);
+    else this._addLog(`sx.org error: ${r.error}`);
+    this._loadSxBalance();
+    this.mode = 'settings';
+    if (this.running) this.render();
+  }
+
+  // Cycle off → on-429 → always. Keeps the API key, so the user can disable
+  // sx.org without deconfiguring it.
+  async _doCycleSxMode() {
+    const order = ['off', '429', 'always'];
+    const next = order[(order.indexOf(this.sx.getMode()) + 1) % order.length];
+    this.config.sx = { ...(this.config.sx || {}), mode: next };
+    try { await this.saveConfig(this.config); }
+    catch (e) { this._addLog(`Failed to save: ${e.message}`); }
+    const r = await this.sx.setMode(next);
+    this._addLog(`sx.org mode: ${this._sxModeLabel(next)}${r.ok ? '' : ` — ${r.error}`}`);
+    if (next !== 'off') this._loadSxBalance();
+    if (this.running) this.render();
+  }
+
+  async _doClearSxKey() {
+    this.config.sx = null;
+    try { await this.saveConfig(this.config); }
+    catch (e) { this._addLog(`Failed to save: ${e.message}`); }
+    this.sx.disable();
+    this.sxBalance = null;
+    this._addLog('sx.org key cleared');
+    if (this.running) this.render();
   }
 
   async _doImport() {
@@ -439,6 +506,10 @@ export class TUI {
     lines.push(left + ' '.repeat(Math.max(1, W - vw(left) - vw(right))) + right);
     lines.push(' ' + dim('─'.repeat(W - 2)));
 
+    const footerH = 2;
+    if (this.mode === 'settings') {
+      this._renderSettings(lines);
+    } else {
     // ── Accounts
     if (this.am.accounts.length === 0) {
       lines.push('');
@@ -472,11 +543,11 @@ export class TUI {
     }
 
     // Completed log
-    const footerH = 2;
     const space = Math.max(0, H - lines.length - footerH);
     for (let i = 0; i < space && i < this.log.length; i++) {
       lines.push(`   ${gray(this.log[i].t)}  ${this.log[i].msg}`);
     }
+    } // end non-settings body
 
     // Pad to fill
     while (lines.length < H - footerH) lines.push('');
@@ -556,10 +627,41 @@ export class TUI {
     return line;
   }
 
+  _renderSettings(lines) {
+    lines.push('');
+    lines.push(bold('  sx.org proxy') + dim('  — route upstream via a residential IP (429 workaround)'));
+    lines.push('');
+    if (!this.sx) { lines.push(yellow('  Unavailable in this build.')); return; }
+    const key = this.config.sx?.apiKey;
+    const masked = key ? key.slice(0, 4) + '…' + key.slice(-4) : dim('(not set)');
+    const mode = this.sx.getMode();
+    const modeStr = mode === 'always' ? green('always')
+      : mode === '429' ? cyan('on 429 only')
+      : gray('off');
+    const p = this.sx.getProxy?.();
+    const proxyStr = mode === 'off' ? gray('—')
+      : this.sx.isProvisioned() ? green(`${p.host}:${p.port}`)
+      : key ? yellow('not provisioned')
+      : gray('no key');
+    const b = this.sxBalance;
+    lines.push(`  Mode:     ${modeStr}`);
+    lines.push(`  API key:  ${masked}`);
+    lines.push(`  Proxy:    ${proxyStr}`);
+    lines.push(`  Balance:  ${b ? green('$' + Number(b.balance).toFixed(4)) : dim('…')}`);
+    lines.push('');
+    lines.push(dim('  always    tunnel ALL upstream traffic through sx.org'));
+    lines.push(dim('  on 429    only retry through sx.org after a 429 (fresh IP)'));
+    lines.push(dim('  off       never use sx.org (API key is kept)'));
+    lines.push('');
+    lines.push(dim('  TLS stays end-to-end; residential traffic is metered by sx.org.'));
+  }
+
   _renderFooter() {
     switch (this.mode) {
       case 'normal':
-        return ` ${bold('s')}witch  ${bold('a')}dd  ${bold('r')}emove  ${bold('d')}isable  ${bold('R')}eload  ${bold('q')}uit`;
+        return ` ${bold('s')}witch  ${bold('a')}dd  ${bold('r')}emove  ${bold('d')}isable  ${bold('R')}eload  ${bold('g')} settings  ${bold('q')}uit`;
+      case 'settings':
+        return ` ${bold('m')} mode  ${bold('k')} set API key  ${bold('x')} clear key  ${bold('Esc')} back`;
       case 'select': {
         const act = this.selAction === 'switch' ? 'switch'
           : this.selAction === 'toggle' ? 'enable/disable'
