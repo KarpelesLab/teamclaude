@@ -15,7 +15,7 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 
 - **Automatic account rotation** — switches to the next account when session (5h) or weekly (7d) quota reaches the configured threshold (default 98%)
 - **Auto-retry on 429** — waits the `retry-after` duration and retries the same account; switches to the next on persistent errors
-- **Interactive TUI** — real-time dashboard with color-coded quota bars, reset countdowns, activity log, and keyboard controls
+- **Interactive TUI** — real-time dashboard with color-coded quota bars, reset countdowns, activity log, and keyboard controls; a settings screen (`g`) edits the rotation threshold, quota-probe interval, and sx.org proxy live
 - **OAuth token management** — automatically refreshes tokens nearing expiry and persists them to config; client token refreshes pass through untouched
 - **Hot-reload accounts** — add or change accounts while the server is running; press **R** in the TUI, or run headless and CLI changes auto-reload via a local control endpoint
 - **Headless mode** — run the proxy without the TUI (`--headless`) for backgrounding/services
@@ -230,8 +230,8 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `proxy.port` | Local port the proxy listens on |
 | `proxy.apiKey` | API key clients use to authenticate with the proxy |
 | `upstream` | Upstream API base URL |
-| `switchThreshold` | Quota utilization (0–1) at which to switch accounts |
-| `quotaProbeSeconds` | Background quota-probe interval in seconds (`0` = off, the default) |
+| `switchThreshold` | Quota utilization (0–1) at which to switch accounts (TUI: `g` → `t`) |
+| `quotaProbeSeconds` | Background quota-probe interval in seconds (`0` = off, the default; CLI `probe` or TUI `g` → `p`) |
 | `sx.apiKey` | [sx.org](https://sx.org) API key. When set, TeamClaude auto-provisions a residential proxy (egress-IP 429 workaround). Absent/empty = off |
 | `sx.mode` | `always` (route all upstream traffic), `429` (direct, fail over to the proxy after a 429), or `off` (keep the key but don't use it). Defaults to `always` when a key is set |
 | `accounts[].accountUuid` | Anthropic account (person) id; set automatically from the OAuth profile |
@@ -250,6 +250,8 @@ teamclaude probe 300    # refresh every 300s
 teamclaude probe off    # back to passive (default)
 teamclaude probe        # show current setting
 ```
+
+You can also set the interval live from the TUI settings screen (`g` → `p`), alongside the rotation threshold (`t`).
 
 It reads each OAuth account's utilization from Anthropic's usage endpoint (`/api/oauth/usage`), which reports quota **without consuming any message quota**. Minimum interval is 30s. Changing it takes effect on a running server immediately (no restart). When enabled, it also surfaces the **Sonnet 7-day** bucket as an extra bar in the TUI / `status` (when your plan exposes it).
 

@@ -245,7 +245,19 @@ export class TUI {
   }
 
   _keySettings(k) {
-    if (k === 'k') {
+    if (k === 't') {
+      this.mode = 'input';
+      this.inputPrompt = 'Switch threshold % (1-100)';
+      this.inputBuf = '';
+      this.inputCb = v => { if (v) this._doSetThreshold(v.trim()); };
+    }
+    else if (k === 'p') {
+      this.mode = 'input';
+      this.inputPrompt = 'Quota probe seconds (0=off, min 30)';
+      this.inputBuf = '';
+      this.inputCb = v => { if (v) this._doSetProbe(v.trim()); };
+    }
+    else if (k === 'k') {
       this.mode = 'input';
       this.inputPrompt = 'sx.org API key';
       this.inputBuf = '';
@@ -254,6 +266,38 @@ export class TUI {
     else if (k === 'm') { this._doCycleSxMode(); }
     else if (k === 'x') { this._doClearSxKey(); }
     else if (k === 'esc' || k === 'q') { this.mode = 'normal'; }
+  }
+
+  async _doSetThreshold(input) {
+    const pct = Number(input);
+    if (!Number.isFinite(pct) || pct < 1 || pct > 100) {
+      this._addLog('Invalid threshold — enter 1–100'); this.mode = 'settings'; if (this.running) this.render(); return;
+    }
+    const v = Math.round(pct) / 100;
+    this.config.switchThreshold = v;
+    this.am.switchThreshold = v; // apply to the running rotation immediately
+    try { await this.saveConfig(this.config); }
+    catch (e) { this._addLog(`Failed to save: ${e.message}`); }
+    this._addLog(`Switch threshold set to ${Math.round(v * 100)}%`);
+    this.mode = 'settings';
+    if (this.running) this.render();
+  }
+
+  async _doSetProbe(input) {
+    let secs = parseInt(input, 10);
+    if (Number.isNaN(secs) || secs < 0) {
+      this._addLog('Invalid interval — enter 0 (off) or seconds'); this.mode = 'settings'; if (this.running) this.render(); return;
+    }
+    if (secs > 0 && secs < 30) secs = 30; // match the CLI minimum (don't hammer the usage endpoint)
+    this.config.quotaProbeSeconds = secs;
+    try { await this.saveConfig(this.config); }
+    catch (e) { this._addLog(`Failed to save: ${e.message}`); }
+    // syncAccounts re-reads disk config and reschedules the running prober live.
+    try { await this.syncAccounts(); }
+    catch (e) { this._addLog(`Reload failed: ${e.message}`); }
+    this._addLog(secs > 0 ? `Quota probe every ${secs}s` : 'Quota probe disabled');
+    this.mode = 'settings';
+    if (this.running) this.render();
   }
 
   _keySelect(k) {
@@ -629,6 +673,17 @@ export class TUI {
 
   _renderSettings(lines) {
     lines.push('');
+    // ── Rotation
+    const thr = this.am.switchThreshold ?? this.config.switchThreshold ?? 0.98;
+    lines.push(bold('  Rotation') + dim('  — switch accounts when quota crosses the threshold'));
+    lines.push(`  Switch at:  ${green(`${Math.round(thr * 100)}%`)}  ${dim('utilization')}`);
+    lines.push('');
+    // ── Quota probe
+    const probe = this.config.quotaProbeSeconds || 0;
+    lines.push(bold('  Quota probe') + dim('  — refresh idle accounts from the usage endpoint'));
+    lines.push(`  Interval:   ${probe > 0 ? green(`${probe}s`) : gray('off (passive)')}`);
+    lines.push('');
+    // ── sx.org
     lines.push(bold('  sx.org proxy') + dim('  — route upstream via a residential IP (429 workaround)'));
     lines.push('');
     if (!this.sx) { lines.push(yellow('  Unavailable in this build.')); return; }
@@ -661,7 +716,7 @@ export class TUI {
       case 'normal':
         return ` ${bold('s')}witch  ${bold('a')}dd  ${bold('r')}emove  ${bold('d')}isable  ${bold('R')}eload  ${bold('g')} settings  ${bold('q')}uit`;
       case 'settings':
-        return ` ${bold('m')} mode  ${bold('k')} set API key  ${bold('x')} clear key  ${bold('Esc')} back`;
+        return ` ${bold('t')} threshold  ${bold('p')} probe  ${bold('m')} sx-mode  ${bold('k')} sx-key  ${bold('x')} clear-key  ${bold('Esc')} back`;
       case 'select': {
         const act = this.selAction === 'switch' ? 'switch'
           : this.selAction === 'toggle' ? 'enable/disable'

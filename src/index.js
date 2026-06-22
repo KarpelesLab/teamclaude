@@ -230,6 +230,9 @@ async function serverCommand() {
         });
         // Persist sx.org settings (set/cleared from the TUI settings screen).
         if (config.sx) diskConfig.sx = config.sx; else delete diskConfig.sx;
+        // Persist other runtime-tunable settings edited from the TUI.
+        if (config.switchThreshold != null) diskConfig.switchThreshold = config.switchThreshold;
+        if (config.quotaProbeSeconds != null) diskConfig.quotaProbeSeconds = config.quotaProbeSeconds;
       }),
       syncAccounts: reloadAccounts,
       onQuit: async () => {
