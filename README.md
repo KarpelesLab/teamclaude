@@ -25,6 +25,7 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 - **Quota persistence** — observed quota survives restarts (saved to a sibling state file), so rotation state isn't lost on restart; stale windows are discarded automatically
 - **Optional quota probe** — off by default; when enabled, periodically refreshes idle accounts' quota from the usage endpoint (no message spend), and surfaces the Sonnet weekly bucket
 - **Optional MITM proxy mode** — `teamclaude run --mitm` routes claude via an HTTPS forward proxy with a local CA so even hardcoded `api.anthropic.com` endpoints (e.g. the Claude Design MCP) get the real token injected
+- **Optional sx.org proxy mode** — off by default; set an [sx.org](https://sx.org) API key in the TUI settings screen (`g`) and TeamClaude auto-provisions a residential proxy to change the egress IP and work around IP-based `429`s. Three modes (`m` to cycle): **always** (route all upstream traffic), **on 429 only** (stay direct, fail over to the proxy after a 429), or **off** (keep the key but don't use it). TLS stays end-to-end with Anthropic (the proxy only relays ciphertext)
 - **Request logging** — optional full request/response logging for debugging
 - **Zero dependencies** — uses only Node.js built-in modules
 
@@ -207,6 +208,7 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
   },
   "upstream": "https://api.anthropic.com",
   "switchThreshold": 0.98,
+  "sx": { "apiKey": "your-sx-org-api-key", "mode": "always" },
   "accounts": [
     {
       "name": "user@example.com (Acme)",
@@ -230,6 +232,8 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `upstream` | Upstream API base URL |
 | `switchThreshold` | Quota utilization (0–1) at which to switch accounts |
 | `quotaProbeSeconds` | Background quota-probe interval in seconds (`0` = off, the default) |
+| `sx.apiKey` | [sx.org](https://sx.org) API key. When set, TeamClaude auto-provisions a residential proxy (egress-IP 429 workaround). Absent/empty = off |
+| `sx.mode` | `always` (route all upstream traffic), `429` (direct, fail over to the proxy after a 429), or `off` (keep the key but don't use it). Defaults to `always` when a key is set |
 | `accounts[].accountUuid` | Anthropic account (person) id; set automatically from the OAuth profile |
 | `accounts[].orgUuid` / `orgName` | Organization the account is scoped to — lets one email hold multiple org accounts |
 | `accounts[].priority` | Rotation preference, lower = preferred (default 0) |
@@ -278,6 +282,24 @@ Verify the proxy + CA without any credentials — the proxy always answers a bui
 curl --proxy http://localhost:3456 --cacert ~/.config/teamclaude-ca.pem https://www.example.org/
 # → {"teamclaude":"mitm-proxy-ok","host":"www.example.org",...}
 ```
+
+### sx.org proxy mode (optional, off by default)
+
+Some transient `429`s key on the proxy's **outbound IP**, not the account — so rotating accounts doesn't help. To work around them, TeamClaude can route upstream requests through a residential proxy from [sx.org](https://sx.org), giving a different egress IP.
+
+Open the TUI and press **`g`** for the settings screen, then **`k`** to paste your sx.org API key (stored in `config.sx.apiKey`). TeamClaude reuses an existing active proxy port on your sx.org account, or auto-creates a residential US one, and dials the upstream through it via HTTP `CONNECT` on **both** the reverse-proxy and `--mitm` paths.
+
+Press **`m`** to cycle the **mode**:
+
+| Mode | Behavior |
+|------|----------|
+| **always** | Tunnel **every** upstream request through sx.org. |
+| **on 429 only** | Connect directly; on a `429` (which is IP-based), immediately retry that request through sx.org's fresh egress IP — no wait. On the `--mitm` path, a recent `429` routes new tunnels through sx.org for a short window. |
+| **off** | Never use sx.org, but **keep the API key** so you can re-enable it instantly. |
+
+TLS is established **end-to-end with `api.anthropic.com` over the tunnel**, so the sx.org proxy only ever relays ciphertext and the real Anthropic certificate is still verified. Mode and key changes apply live (no restart). Press **`x`** to forget the key entirely.
+
+> **Cost:** in **always** mode *all* Claude traffic flows through the residential proxy, which sx.org meters by bandwidth — expect real per-GB cost. **on 429 only** uses the proxy just when you're actually being throttled, so it's the cheaper way to ride out rate limits.
 
 ## How It Works
 

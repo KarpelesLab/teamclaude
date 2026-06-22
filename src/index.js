@@ -12,6 +12,7 @@ import * as alias from './alias.js';
 import { ensureCerts } from './mitm.js';
 import { Prober } from './prober.js';
 import { TUI } from './tui.js';
+import { SxManager } from './sx.js';
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -170,6 +171,16 @@ async function serverCommand() {
   // Opt-in background quota probe (config.quotaProbeSeconds, default 0 = off).
   let prober = null;
 
+  // sx.org proxy (IP-based-429 workaround). Dormant unless an API key is set in
+  // config.sx.apiKey; when set we provision a proxy and route upstream through it.
+  const sx = new SxManager({ log: console.error });
+  if (config.sx?.apiKey) {
+    const r = await sx.configure(config.sx.apiKey, config.sx.mode);
+    if (!r.ok) console.error(`[TeamClaude] sx.org disabled: ${r.error}`);
+  } else if (config.sx?.mode) {
+    await sx.setMode(config.sx.mode);
+  }
+
   // Re-sync accounts from disk without a restart. The TUI's 'R' key, the
   // POST /teamclaude/reload endpoint, and the CLI notify after add/change all
   // funnel through here. Returns the number of newly added accounts. Also picks
@@ -178,6 +189,14 @@ async function serverCommand() {
     const diskConfig = await loadConfig();
     if (!diskConfig) return 0;
     const added = await syncAccountsFromDisk(diskConfig, config, accountManager);
+    // Apply an sx.org key/mode change made on disk (e.g. via POST /teamclaude/reload).
+    const diskSxKey = diskConfig.sx?.apiKey || null;
+    const diskSxMode = diskConfig.sx?.mode || 'always';
+    if (diskSxKey !== sx.apiKey || diskSxMode !== sx.mode) {
+      config.sx = diskConfig.sx;
+      if (diskSxKey) await sx.configure(diskSxKey, diskSxMode);
+      else { sx.disable(); await sx.setMode(diskSxMode); }
+    }
     if (prober) {
       const ms = (diskConfig.quotaProbeSeconds || 0) * 1000;
       if (ms !== prober.intervalMs) {
@@ -193,7 +212,7 @@ async function serverCommand() {
 
   if (useTUI) {
     tui = new TUI({
-      accountManager, config,
+      accountManager, config, sx,
       saveConfig: () => atomicConfigUpdate(async diskConfig => {
         // Write in-memory accounts as the authoritative state, preserving
         // extra disk-only fields (e.g. importFrom) where the account still exists.
@@ -209,6 +228,8 @@ async function serverCommand() {
           const diskAcct = diskConfig.accounts.find(d => sameIdentity(d, a));
           return diskAcct ? { ...diskAcct, ...live } : live;
         });
+        // Persist sx.org settings (set/cleared from the TUI settings screen).
+        if (config.sx) diskConfig.sx = config.sx; else delete diskConfig.sx;
       }),
       syncAccounts: reloadAccounts,
       onQuit: async () => {
@@ -228,7 +249,7 @@ async function serverCommand() {
   // Expose reload to the proxy's control endpoint (works with or without TUI).
   hooks.reload = reloadAccounts;
 
-  const server = createProxyServer(accountManager, config, hooks);
+  const server = createProxyServer(accountManager, config, hooks, sx);
   // Catch bind-time errors (e.g. EADDRINUSE) only. Once the socket is bound we
   // remove this handler so a later runtime 'error' isn't misreported as a
   // listen failure and exit the whole proxy.

@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { ensureCerts, createConnectHandler } from './mitm.js';
 import { patchAccountUuid } from './account-uuid-rewrite.js';
 import { BodyWriter } from './request-log.js';
+import { upstreamFetch } from './upstream-fetch.js';
 
 
 const HOP_BY_HOP_HEADERS = new Set([
@@ -12,7 +13,7 @@ const HOP_BY_HOP_HEADERS = new Set([
   'te', 'trailer', 'upgrade', 'proxy-authorization', 'proxy-authenticate',
 ]);
 
-export function createProxyServer(accountManager, config, hooks = {}) {
+export function createProxyServer(accountManager, config, hooks = {}, sx = null) {
   const upstream = config.upstream || 'https://api.anthropic.com';
   const proxyApiKey = config.proxy?.apiKey;
   const logDir = config.logDir || null;
@@ -68,7 +69,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       // The proxy manages its own tokens via ensureTokenFresh(); intercepting
       // or rewriting client refreshes would cause token rotation conflicts.
       if (req.method === 'POST' && req.url === '/v1/oauth/token') {
-        await relayRaw(req, res, upstream);
+        await relayRaw(req, res, upstream, sx);
         return;
       }
 
@@ -85,7 +86,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
 
       const ctx = { account: null, status: null };
       try {
-        await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
+        await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir, sx);
       } catch (err) {
         ctx.status = ctx.status || 502;
         console.error('[TeamClaude] Unhandled error:', err);
@@ -121,7 +122,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     const c = await certsPromise;
     return { key: c.leafKeyPem, cert: c.leafCertPem };
   };
-  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks, log: console.error }));
+  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks, log: console.error, sx }));
 
   return server;
 }
@@ -129,13 +130,13 @@ export function createProxyServer(accountManager, config, hooks = {}) {
 /**
  * Relay a request to upstream with no header rewriting — pure passthrough.
  */
-async function relayRaw(req, res, upstream) {
+async function relayRaw(req, res, upstream, sx) {
   const bodyChunks = [];
   for await (const chunk of req) bodyChunks.push(chunk);
   const body = Buffer.concat(bodyChunks);
 
   try {
-    const upstreamRes = await fetch(`${upstream}${req.url}`, {
+    const upstreamRes = await upstreamFetch(`${upstream}${req.url}`, {
       method: req.method,
       headers: {
         'content-type': req.headers['content-type'] || 'application/json',
@@ -143,7 +144,7 @@ async function relayRaw(req, res, upstream) {
         'user-agent': req.headers['user-agent'] || 'node',
       },
       body: body.length > 0 ? body : undefined,
-    });
+    }, sx, sx?.useByDefault());
 
     const responseBody = await upstreamRes.text();
     const responseHeaders = {};
@@ -200,8 +201,11 @@ function formatHeaders(headers) {
   return Object.entries(headers).map(([k, v]) => `  ${k}: ${v}`).join('\n');
 }
 
-async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir) {
+async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, useSx) {
   const maxRetries = accountManager.accounts.length;
+  // Whether THIS attempt dials via sx.org. Undefined on the first call → derive
+  // from the default policy ('always' routes; 'off'/'429' start direct).
+  const route = useSx === undefined ? !!(sx?.useByDefault()) : useSx;
 
   // Select account
   const account = accountManager.getActiveAccount();
@@ -231,7 +235,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   // Refresh OAuth token if needed
   await accountManager.ensureTokenFresh(account.index);
   if (account.status === 'error' && retryCount < maxRetries) {
-    return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+    return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
   }
 
   // Build upstream request headers
@@ -278,12 +282,12 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   };
 
   try {
-    const upstreamRes = await fetch(upstreamUrl, {
+    const upstreamRes = await upstreamFetch(upstreamUrl, {
       method,
       headers,
       body: ['GET', 'HEAD'].includes(method) ? undefined : sendBody,
       redirect: 'manual',
-    });
+    }, sx, route);
 
     // Extract rate limit headers
     const rateLimitHeaders = {};
@@ -307,6 +311,13 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       // Discard the 429 response body
       await upstreamRes.body?.cancel();
 
+      // sx.org failover: 429s are IP-based, so retry via the proxy's egress IP.
+      // 'always' is already on sx; '429' switches direct→sx now and skips the
+      // wait (a fresh IP isn't throttled). Also arm the sticky window for MITM.
+      const nextUseSx = !!(sx?.useOn429());
+      const switchingToSx = nextUseSx && !route;
+      sx?.noteRateLimited(retryAfter);
+
       // Bound the retries: a persistently-throttled upstream must not loop
       // forever (that would tie up the client connection indefinitely).
       // Once retries are exhausted, throttle this account and re-dispatch —
@@ -315,14 +326,18 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       if (retryCount >= maxRetries) {
         console.log(`[TeamClaude] Persistent 429 on "${account.name}" — throttling ${retryAfter}s and re-dispatching`);
         accountManager.markRateLimited(account.index, retryAfter);
-        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, nextUseSx);
       }
 
-      console.log(`[TeamClaude] 429 on "${account.name}" — waiting ${retryAfter}s before retry`);
-      await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
+      if (switchingToSx) {
+        console.log(`[TeamClaude] 429 on "${account.name}" — retrying via sx.org (fresh egress IP)`);
+      } else {
+        console.log(`[TeamClaude] 429 on "${account.name}" — waiting ${retryAfter}s before retry`);
+        await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
+      }
       // Client may have disconnected during the wait
       if (res.destroyed) return;
-      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, nextUseSx);
     }
 
     // Log the request head (once) followed by the response headers, streaming
@@ -387,7 +402,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 
     if (retryCount < maxRetries && !res.headersSent) {
       account.status = 'error';
-      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
     ctx.status = 502;
 
