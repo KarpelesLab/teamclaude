@@ -85,7 +85,7 @@ function makeConnectProxy() {
       const target = buf.toString('latin1').split('\r\n')[0].match(/^CONNECT (\S+)/)?.[1];
       seen.target = target;
       const [host, port] = (target || '').split(':');
-      const up = net.connect(parseInt(port, 10), host, () => {
+      const up = net.connect({ port: parseInt(port, 10), host, autoSelectFamily: true }, () => {
         client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
         up.pipe(client); client.pipe(up);
       });

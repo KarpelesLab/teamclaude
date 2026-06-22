@@ -15,7 +15,7 @@ function closeHard(s) { if (!s) return; s.closeAllConnections?.(); try { s.close
 // A minimal HTTP CONNECT proxy: requires Basic auth, then blind-tunnels to the
 // requested host:port. Records whether auth was seen and the CONNECT target.
 function makeConnectProxy({ requireAuth = 'user:pass' } = {}) {
-  const seen = { auth: null, target: null, plaintextBytesAfterConnect: 0 };
+  const seen = { auth: null, target: null };
   const srv = net.createServer((client) => {
     client.once('data', (buf) => {
       const head = buf.toString('latin1');
@@ -27,10 +27,11 @@ function makeConnectProxy({ requireAuth = 'user:pass' } = {}) {
       seen.auth = authLine ? Buffer.from(authLine.split(/\s+/)[2], 'base64').toString() : null;
       if (requireAuth && seen.auth !== requireAuth) { client.end('HTTP/1.1 407 Proxy Authentication Required\r\n\r\n'); return; }
       const [host, port] = m[1].split(':');
-      const up = net.connect(parseInt(port, 10), host, () => {
+      // autoSelectFamily so 'localhost' falls back to IPv4 on Node 18 (no
+      // happy-eyeballs by default) instead of hanging on an unreachable ::1.
+      // After the 200, everything is TLS ciphertext — the proxy just relays it.
+      const up = net.connect({ port: parseInt(port, 10), host, autoSelectFamily: true }, () => {
         client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-        // Everything after this point is TLS ciphertext (proxy can't read it).
-        client.on('data', (d) => { seen.plaintextBytesAfterConnect += isPrintableTls(d) ? 0 : 0; });
         up.pipe(client); client.pipe(up);
       });
       up.on('error', () => client.destroy());
@@ -39,7 +40,6 @@ function makeConnectProxy({ requireAuth = 'user:pass' } = {}) {
   });
   return { srv, seen };
 }
-function isPrintableTls() { return false; }
 
 test('connectThroughProxy + tunnelTls establish END-TO-END TLS through the proxy', T, async () => {
   const { caCertPem, leafCertPem, leafKeyPem } = generateCertChain('localhost');

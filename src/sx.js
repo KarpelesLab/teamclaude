@@ -64,7 +64,10 @@ function parsePort(p) {
  */
 export function connectThroughProxy({ proxyHost, proxyPort, auth, targetHost, targetPort, timeout = CONNECT_TIMEOUT_MS }) {
   return new Promise((resolve, reject) => {
-    const sock = net.connect(proxyPort, proxyHost);
+    // autoSelectFamily (happy-eyeballs) — default on Node 20+ but not 18; set it
+    // so a dual-stack proxy host whose IPv6 path is unreachable falls back to IPv4
+    // instead of hanging the connect (sx.org returns an IP, but be robust).
+    const sock = net.connect({ port: proxyPort, host: proxyHost, autoSelectFamily: true });
     let buf = '';
     const timer = setTimeout(() => fail(new Error(`sx.org proxy CONNECT timed out after ${timeout}ms`)), timeout);
     const cleanup = () => {
