@@ -142,3 +142,53 @@ export function makeMitmTap(logDir, accountName = '') {
     },
   };
 }
+
+let activitySeq = 0; // module-global so TUI ids are unique across MITM connections
+
+// A tap (same interface as makeMitmTap) that, instead of writing to disk,
+// translates each relayed request's lifecycle into the server's TUI hooks —
+// so MITM traffic shows up in the live activity feed like reverse-proxy traffic.
+// Relay-local ids (h2 stream ids / h1 request ids restart per connection) are
+// mapped to globally-unique string ids ("m<n>") so they never collide with the
+// reverse-proxy's numeric ids or with each other across connections.
+export function makeActivityTap(hooks, accountName = '') {
+  if (!hooks || (!hooks.onRequestStart && !hooks.onRequestEnd)) return null;
+  const ids = new Map(); // relay-local id -> { gid, method, path, status }
+
+  function start(localId, method, path) {
+    const gid = `m${++activitySeq}`;
+    ids.set(localId, { gid, method, path, status: null });
+    hooks.onRequestStart?.(gid, { method, path });
+    if (accountName) hooks.onRequestRouted?.(gid, { account: accountName });
+  }
+
+  return {
+    req(id, fields) { start(id, get(fields, ':method'), get(fields, ':path')); },
+    reqHead(id, text) {
+      const parts = text.split('\r\n')[0].split(' ');
+      start(id, (parts[0] || '').toUpperCase(), parts[1] || '');
+    },
+    reqData() {},
+    res(id, fields) { const r = ids.get(id); if (r) r.status = get(fields, ':status'); },
+    resHead(id, text) { const r = ids.get(id); if (r) r.status = text.split('\r\n')[0].split(' ')[1] || ''; },
+    resData() {},
+    end(id) {
+      const r = ids.get(id);
+      if (!r) return;
+      ids.delete(id);
+      hooks.onRequestEnd?.(r.gid, { method: r.method, path: r.path, account: accountName, status: r.status });
+    },
+  };
+}
+
+// Fan one relay's tap callbacks out to several taps (disk + TUI activity).
+// Returns null if none are live, the single tap if only one is, else a proxy.
+export function combineTaps(...taps) {
+  const live = taps.filter(Boolean);
+  if (live.length <= 1) return live[0] || null;
+  const fan = (m) => (...a) => { for (const t of live) t[m]?.(...a); };
+  return {
+    req: fan('req'), reqHead: fan('reqHead'), reqData: fan('reqData'),
+    res: fan('res'), resHead: fan('resHead'), resData: fan('resData'), end: fan('end'),
+  };
+}

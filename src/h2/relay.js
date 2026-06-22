@@ -49,12 +49,22 @@ export function h2Relay(claude, upstream, opts = {}) {
   const tap = opts.tap || null; // optional request-logging tap (per streamId)
   const log = opts.log || (() => {});
 
+  // Streams that have started (request headers seen) but not yet completed, so a
+  // mid-flight connection teardown can close their tap records instead of
+  // leaking them (e.g. a stuck "in-flight" entry in the TUI activity feed).
+  const openStreams = new Set();
+  const closeStream = (id) => { if (bodyPatchers) bodyPatchers.delete(id); tap?.end(id); openStreams.delete(id); };
+
   const reqDec = new HpackDecoder();         // decodes claude's request blocks
   const reqEnc = new HpackEncoder();         // re-encodes to upstream
   reqEnc.dynamicIndexing = false;            // independent of upstream's table size
   const respDec = new HpackDecoder();        // read-only, decodes upstream responses
 
-  const destroyBoth = () => { claude.destroy(); upstream.destroy(); };
+  const destroyBoth = () => {
+    for (const id of openStreams) tap?.end(id);
+    openStreams.clear();
+    claude.destroy(); upstream.destroy();
+  };
 
   // ── request direction: claude → upstream (rewrite HEADERS) ──
   let rbuf = Buffer.alloc(0);
@@ -107,7 +117,7 @@ export function h2Relay(claude, upstream, opts = {}) {
       if (fr.flags & FLAG.END_STREAM && bodyPatchers) bodyPatchers.delete(fr.streamId);
       return;
     }
-    if (fr.type === FRAME.RST_STREAM) { if (bodyPatchers) bodyPatchers.delete(fr.streamId); tap?.end(fr.streamId); }
+    if (fr.type === FRAME.RST_STREAM) { closeStream(fr.streamId); }
     if (fr.type === FRAME.SETTINGS && fr.streamId === 0 && !(fr.flags & 0x1)) {
       applyTableSizeSetting(fr.payload, respDec); // claude's setting governs response encoding
     }
@@ -120,6 +130,7 @@ export function h2Relay(claude, upstream, opts = {}) {
     const fields = reqDec.decode(Buffer.concat(frags)); // keep decoder dynamic table in sync
     const rewritten = rewriteRequest(fields);
     if (tap) tap.req(streamId, rewritten);
+    openStreams.add(streamId);
     const newBlock = reqEnc.encode(rewritten);
     writeBackpressured(upstream, buildHeaderBlock(streamId, newBlock, { endStream, priority }), reqCtl);
   }
@@ -151,11 +162,12 @@ export function h2Relay(claude, upstream, opts = {}) {
       const { block } = stripHeadersPayload(fr.payload, fr.flags);
       rasm = { streamId: fr.streamId, frags: [block] };
       if (fr.flags & FLAG.END_HEADERS) finishRespBlock(fr.streamId);
-      if (fr.flags & FLAG.END_STREAM) tap?.end(fr.streamId);
+      if (fr.flags & FLAG.END_STREAM) closeStream(fr.streamId);
       return;
     }
     if (fr.type === FRAME.DATA) {
-      if (tap) { tap.resData(fr.streamId, Buffer.from(fr.payload)); if (fr.flags & FLAG.END_STREAM) tap.end(fr.streamId); }
+      if (tap) tap.resData(fr.streamId, Buffer.from(fr.payload));
+      if (fr.flags & FLAG.END_STREAM) closeStream(fr.streamId);
     }
   }
 

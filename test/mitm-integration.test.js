@@ -51,7 +51,7 @@ function connectThroughProxy(proxyPort, target, caCertPem, alpn) {
 
 const ACCOUNT_UUID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
 
-function makeProxy(upPort, caCertPem, leafCertPem, leafKeyPem, onQuota, logDir = null, sx = null) {
+function makeProxy(upPort, caCertPem, leafCertPem, leafKeyPem, onQuota, logDir = null, hooks = {}, sx = null) {
   const account = { index: 0, type: 'oauth', credential: 'REAL-TOKEN', accountUuid: ACCOUNT_UUID, name: 'acct@x' };
   const accountManager = {
     getActiveAccount: () => account,
@@ -70,6 +70,7 @@ function makeProxy(upPort, caCertPem, leafCertPem, leafKeyPem, onQuota, logDir =
     ensureLeaf: async () => ({ key: leafKeyPem, cert: leafCertPem }),
     upstreamTlsOptions: { ca: [caCertPem], servername: 'localhost' },
     logDir,
+    hooks,
     log: () => {},
     sx,
   }));
@@ -156,7 +157,7 @@ test('MITM with sx.org enabled tunnels the upstream dial through the proxy', T, 
   const sxPort = await listen(sxProxy);
   const sx = { useForConnect: () => true, getProxy: () => ({ host: '127.0.0.1', port: sxPort, username: null, password: null }) };
 
-  const proxy = makeProxy(upPort, caCertPem, leafCertPem, leafKeyPem, () => {}, null, sx);
+  const proxy = makeProxy(upPort, caCertPem, leafCertPem, leafKeyPem, () => {}, null, {}, sx);
   const proxyPort = await listen(proxy);
 
   const tlsSock = await connectThroughProxy(proxyPort, `127.0.0.1:${upPort}`, caCertPem, ['h2', 'http/1.1']);
@@ -174,6 +175,45 @@ test('MITM with sx.org enabled tunnels the upstream dial through the proxy', T, 
     client.close();
   } finally {
     tlsSock.destroy(); closeHard(proxy); closeHard(upstream); closeHard(sxProxy);
+  }
+});
+
+test('MITM h2: relayed requests fire the TUI activity hooks', T, async () => {
+  const { caCertPem, leafCertPem, leafKeyPem } = generateCertChain('localhost');
+
+  const upstream = http2.createSecureServer({ key: leafKeyPem, cert: leafCertPem });
+  upstream.on('stream', (s) => { s.respond({ ':status': 201 }); s.end('ok'); });
+  const upPort = await listen(upstream);
+
+  const events = [];
+  const hooks = {
+    onRequestStart: (id, info) => events.push({ ev: 'start', id, ...info }),
+    onRequestRouted: (id, info) => events.push({ ev: 'routed', id, ...info }),
+    onRequestEnd: (id, info) => events.push({ ev: 'end', id, ...info }),
+  };
+  const proxy = makeProxy(upPort, caCertPem, leafCertPem, leafKeyPem, () => {}, null, hooks);
+  const proxyPort = await listen(proxy);
+
+  const tlsSock = await connectThroughProxy(proxyPort, `127.0.0.1:${upPort}`, caCertPem, ['h2', 'http/1.1']);
+  try {
+    const client = http2.connect('https://localhost', { createConnection: () => tlsSock });
+    const req = client.request({ ':method': 'POST', ':path': '/v1/messages', authorization: 'Bearer FAKE' });
+    req.resume(); req.end('{}');
+    await once(req, 'close');
+    client.close();
+
+    const start = events.find((e) => e.ev === 'start');
+    const routed = events.find((e) => e.ev === 'routed');
+    const end = events.find((e) => e.ev === 'end');
+    assert.ok(start, 'onRequestStart fired');
+    assert.equal(start.method, 'POST');
+    assert.equal(start.path, '/v1/messages');
+    assert.equal(routed?.account, 'acct@x');   // routed to the injected account
+    assert.ok(end, 'onRequestEnd fired');
+    assert.equal(end.id, start.id);            // same (globally-unique) id
+    assert.equal(end.status, '201');           // upstream status surfaced
+  } finally {
+    tlsSock.destroy(); closeHard(proxy); closeHard(upstream);
   }
 });
 
