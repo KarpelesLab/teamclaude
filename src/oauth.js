@@ -149,15 +149,15 @@ export async function fetchProfile(accessToken) {
 }
 
 // Normalize one usage bucket from the /api/oauth/usage payload into
-// { utilization: 0-1, resetAt: ms-epoch }. Tolerant of field-name and
-// percentage/fraction and seconds/ms variations across payload versions.
+// { utilization: 0-1, resetAt: ms-epoch }. The endpoint reports utilization
+// as a percentage in the 0-100 range, so 1 means 1%, not 100%.
 export function normalizeUsageBucket(bucket) {
   if (!bucket || typeof bucket !== 'object') return null;
 
   const rawPct = bucket.used_percentage ?? bucket.utilization ?? bucket.usedPercentage;
   const parsedPct = typeof rawPct === 'number' ? rawPct : parseFloat(rawPct);
   const utilization = Number.isFinite(parsedPct)
-    ? (parsedPct > 1 ? parsedPct / 100 : parsedPct)
+    ? parsedPct / 100
     : null;
 
   const rawReset = bucket.resets_at ?? bucket.resetsAt ?? bucket.reset_at ?? bucket.resetAt;
