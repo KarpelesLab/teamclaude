@@ -138,6 +138,12 @@ teamclaude run
 
 `run` probes the proxy first: if it's up, Claude Code is routed through it; if it's **not** running, `claude` is launched directly so nothing breaks.
 
+Since **1.1.0**, `run` defaults to [MITM forward-proxy mode](#mitm-proxy-mode-default) so even hardcoded `api.anthropic.com` endpoints (e.g. the Claude Design MCP) are intercepted. To keep the previous base-URL-only behavior, pass `--no-mitm`:
+
+```bash
+teamclaude run --no-mitm
+```
+
 Or manually set the environment:
 
 ```bash
