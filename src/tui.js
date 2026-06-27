@@ -8,6 +8,7 @@ const ESC = '\x1b[';
 const RESET = `${ESC}0m`;
 const BOLD = `${ESC}1m`;
 const DIM = `${ESC}2m`;
+const REV = `${ESC}7m`;   // reverse video — used for the BIOS-style settings cursor
 
 const bold = s => `${BOLD}${s}${RESET}`;
 const dim = s => `${DIM}${s}${RESET}`;
@@ -129,9 +130,11 @@ export class TUI {
     this.mode = 'normal';    // normal | select | add | input | settings
     this.selAction = null;   // switch | remove
     this.selIdx = 0;
+    this.setIdx = 0;         // cursor row on the settings screen (BIOS-style nav)
     this.inputPrompt = '';
     this.inputBuf = '';
     this.inputCb = null;
+    this.inputReturn = 'normal'; // mode to fall back to when an input is cancelled
     this.frame = 0;
     this.running = false;
     this.timer = null;
@@ -208,6 +211,8 @@ export class TUI {
   _onData(d) {
     if (d === '\x1b[A') return this._key('up');
     if (d === '\x1b[B') return this._key('down');
+    if (d === '\x1b[C') return this._key('right');
+    if (d === '\x1b[D') return this._key('left');
     if (d === '\x1b') return this._key('esc');
     if (d === '\r' || d === '\n') return this._key('enter');
     if (d === '\x03') return this._key('ctrl-c');
@@ -241,31 +246,116 @@ export class TUI {
     }
     else if (k === 'a') { this.mode = 'add'; }
     else if (k === 'R') { this._doSync(); }
-    else if (k === 'g' && this.sx) { this.mode = 'settings'; this._loadSxBalance(); }
+    else if (k === 'g' && this.sx) { this.mode = 'settings'; this.setIdx = 0; this._loadSxBalance(); }
+  }
+
+  // Navigable rows on the settings screen, top to bottom. Both the renderer and
+  // the key handler build this list so the cursor and the display stay in sync.
+  // Rows are conditional (sx.org rows only when that build feature is present),
+  // so always index through the returned array — never hard-code positions.
+  _settingsFields() {
+    const fields = [];
+
+    fields.push({
+      id: 'threshold',
+      label: 'Switch threshold',
+      hint: '←→ ±1%',
+      value: () => {
+        const thr = this.am.switchThreshold ?? this.config.switchThreshold ?? 0.98;
+        return green(`${Math.round(thr * 100)}%`);
+      },
+      left: () => this._nudgeThreshold(-1),
+      right: () => this._nudgeThreshold(+1),
+      enter: () => this._promptInput('Switch threshold % (1-100)', v => this._doSetThreshold(v.trim())),
+    });
+
+    fields.push({
+      id: 'probe',
+      label: 'Quota probe',
+      hint: '←→ ±30s',
+      value: () => {
+        const probe = this.config.quotaProbeSeconds || 0;
+        return probe > 0 ? green(`${probe}s`) : gray('off (passive)');
+      },
+      left: () => this._nudgeProbe(-30),
+      right: () => this._nudgeProbe(+30),
+      enter: () => this._promptInput('Quota probe seconds (0=off, min 30)', v => this._doSetProbe(v.trim())),
+    });
+
+    if (this.sx) {
+      fields.push({
+        id: 'sxmode',
+        label: 'sx.org mode',
+        hint: '←→ cycle',
+        value: () => {
+          const mode = this.sx.getMode();
+          return mode === 'always' ? green('always')
+            : mode === '429' ? cyan('on 429 only')
+            : gray('off');
+        },
+        left: () => this._cycleSxMode(-1),
+        right: () => this._cycleSxMode(+1),
+        enter: () => this._cycleSxMode(+1),
+      });
+
+      fields.push({
+        id: 'sxkey',
+        label: 'sx.org API key',
+        hint: 'Enter to set',
+        value: () => {
+          const key = this.config.sx?.apiKey;
+          return key ? key.slice(0, 4) + '…' + key.slice(-4) : dim('(not set)');
+        },
+        enter: () => this._promptInput('sx.org API key', v => this._doSetSxKey(v.trim())),
+      });
+
+      if (this.config.sx?.apiKey) {
+        fields.push({
+          id: 'sxclear',
+          label: 'Clear sx.org key',
+          hint: 'Enter to clear',
+          value: () => dim('—'),
+          enter: () => this._doClearSxKey(),
+        });
+      }
+    }
+
+    return fields;
   }
 
   _keySettings(k) {
-    if (k === 't') {
-      this.mode = 'input';
-      this.inputPrompt = 'Switch threshold % (1-100)';
-      this.inputBuf = '';
-      this.inputCb = v => { if (v) this._doSetThreshold(v.trim()); };
-    }
-    else if (k === 'p') {
-      this.mode = 'input';
-      this.inputPrompt = 'Quota probe seconds (0=off, min 30)';
-      this.inputBuf = '';
-      this.inputCb = v => { if (v) this._doSetProbe(v.trim()); };
-    }
-    else if (k === 'k') {
-      this.mode = 'input';
-      this.inputPrompt = 'sx.org API key';
-      this.inputBuf = '';
-      this.inputCb = v => { if (v) this._doSetSxKey(v.trim()); };
-    }
-    else if (k === 'm') { this._doCycleSxMode(); }
-    else if (k === 'x') { this._doClearSxKey(); }
+    const fields = this._settingsFields();
+    const n = fields.length;
+    if (n > 0 && this.setIdx >= n) this.setIdx = n - 1;
+    const f = fields[this.setIdx];
+
+    if (k === 'up' || k === 'k') this.setIdx = (this.setIdx - 1 + n) % n;
+    else if (k === 'down' || k === 'j') this.setIdx = (this.setIdx + 1) % n;
+    else if (k === 'left') f?.left?.();
+    else if (k === 'right') f?.right?.();
+    else if (k === 'enter') f?.enter?.();
     else if (k === 'esc' || k === 'q') { this.mode = 'normal'; }
+  }
+
+  // Open the text-input prompt and return to the settings screen afterward.
+  _promptInput(prompt, cb) {
+    this.mode = 'input';
+    this.inputReturn = 'settings';
+    this.inputPrompt = prompt;
+    this.inputBuf = '';
+    this.inputCb = v => { if (v) cb(v); };
+  }
+
+  _nudgeThreshold(deltaPct) {
+    const cur = Math.round((this.am.switchThreshold ?? this.config.switchThreshold ?? 0.98) * 100);
+    const next = Math.max(1, Math.min(100, cur + deltaPct));
+    if (next !== cur) this._doSetThreshold(String(next));
+  }
+
+  _nudgeProbe(deltaSec) {
+    const cur = this.config.quotaProbeSeconds || 0;
+    const next = Math.max(0, cur + deltaSec);
+    if (next !== cur) this._doSetProbe(String(next));
   }
 
   async _doSetThreshold(input) {
@@ -322,6 +412,7 @@ export class TUI {
     if (k === 'i') { this._doImport(); this.mode = 'normal'; }
     else if (k === 'k') {
       this.mode = 'input';
+      this.inputReturn = 'normal';
       this.inputPrompt = 'API key';
       this.inputBuf = '';
       this.inputCb = v => { if (v) this._doAddKey(v); };
@@ -333,10 +424,10 @@ export class TUI {
     if (k === 'enter') {
       const cb = this.inputCb;
       const v = this.inputBuf;
-      this.mode = 'normal'; this.inputCb = null; this.inputBuf = '';
+      this.mode = this.inputReturn; this.inputCb = null; this.inputBuf = '';
       cb?.(v);
     }
-    else if (k === 'esc') { this.mode = 'normal'; this.inputCb = null; this.inputBuf = ''; }
+    else if (k === 'esc') { this.mode = this.inputReturn; this.inputCb = null; this.inputBuf = ''; }
     else if (k === 'bs') { this.inputBuf = this.inputBuf.slice(0, -1); }
     else if (k.length === 1) { this.inputBuf += k; }
   }
@@ -383,11 +474,11 @@ export class TUI {
     if (this.running) this.render();
   }
 
-  // Cycle off → on-429 → always. Keeps the API key, so the user can disable
-  // sx.org without deconfiguring it.
-  async _doCycleSxMode() {
+  // Cycle off → on-429 → always (dir +1) or the reverse (dir -1). Keeps the API
+  // key, so the user can disable sx.org without deconfiguring it.
+  async _cycleSxMode(dir = 1) {
     const order = ['off', '429', 'always'];
-    const next = order[(order.indexOf(this.sx.getMode()) + 1) % order.length];
+    const next = order[(order.indexOf(this.sx.getMode()) + dir + order.length) % order.length];
     this.config.sx = { ...(this.config.sx || {}), mode: next };
     try { await this.saveConfig(this.config); }
     catch (e) { this._addLog(`Failed to save: ${e.message}`); }
@@ -672,37 +763,53 @@ export class TUI {
   }
 
   _renderSettings(lines) {
+    const fields = this._settingsFields();
+    if (this.setIdx >= fields.length) this.setIdx = Math.max(0, fields.length - 1);
+    const selId = fields[this.setIdx]?.id;
+    const byId = id => fields.find(f => f.id === id);
+
+    // Render a navigable setting row with a BIOS-style highlight bar on the
+    // cursor row. Read-only info rows pass field=null and never highlight.
+    const row = field => {
+      const selected = field && field.id === selId;
+      const label = (field ? field.label : '').padEnd(16);
+      const value = field ? field.value() : '';
+      if (selected) {
+        const hint = field.hint ? `   ${dim(field.hint)}` : '';
+        const inner = rpad(` ${label}  ${strip(value)} `, 34);
+        return `  ${cyan('▸')}${REV}${inner}${RESET}${hint}`;
+      }
+      return `    ${dim(label)}  ${value}`;
+    };
+    // A plain read-only info line (not selectable), aligned with the rows above.
+    const info = (label, value) => `    ${dim(label.padEnd(16))}  ${value}`;
+
     lines.push('');
     // ── Rotation
-    const thr = this.am.switchThreshold ?? this.config.switchThreshold ?? 0.98;
     lines.push(bold('  Rotation') + dim('  — switch accounts when quota crosses the threshold'));
-    lines.push(`  Switch at:  ${green(`${Math.round(thr * 100)}%`)}  ${dim('utilization')}`);
+    lines.push(row(byId('threshold')));
     lines.push('');
     // ── Quota probe
-    const probe = this.config.quotaProbeSeconds || 0;
     lines.push(bold('  Quota probe') + dim('  — refresh idle accounts from the usage endpoint'));
-    lines.push(`  Interval:   ${probe > 0 ? green(`${probe}s`) : gray('off (passive)')}`);
+    lines.push(row(byId('probe')));
     lines.push('');
     // ── sx.org
     lines.push(bold('  sx.org proxy') + dim('  — route upstream via a residential IP (429 workaround)'));
     lines.push('');
     if (!this.sx) { lines.push(yellow('  Unavailable in this build.')); return; }
     const key = this.config.sx?.apiKey;
-    const masked = key ? key.slice(0, 4) + '…' + key.slice(-4) : dim('(not set)');
     const mode = this.sx.getMode();
-    const modeStr = mode === 'always' ? green('always')
-      : mode === '429' ? cyan('on 429 only')
-      : gray('off');
     const p = this.sx.getProxy?.();
     const proxyStr = mode === 'off' ? gray('—')
       : this.sx.isProvisioned() ? green(`${p.host}:${p.port}`)
       : key ? yellow('not provisioned')
       : gray('no key');
     const b = this.sxBalance;
-    lines.push(`  Mode:     ${modeStr}`);
-    lines.push(`  API key:  ${masked}`);
-    lines.push(`  Proxy:    ${proxyStr}`);
-    lines.push(`  Balance:  ${b ? green('$' + Number(b.balance).toFixed(4)) : dim('…')}`);
+    lines.push(row(byId('sxmode')));
+    lines.push(row(byId('sxkey')));
+    lines.push(info('Proxy', proxyStr));
+    lines.push(info('Balance', b ? green('$' + Number(b.balance).toFixed(4)) : dim('…')));
+    if (byId('sxclear')) lines.push(row(byId('sxclear')));
     lines.push('');
     lines.push(dim('  always    tunnel ALL upstream traffic through sx.org'));
     lines.push(dim('  on 429    only retry through sx.org after a 429 (fresh IP)'));
@@ -716,7 +823,7 @@ export class TUI {
       case 'normal':
         return ` ${bold('s')}witch  ${bold('a')}dd  ${bold('r')}emove  ${bold('d')}isable  ${bold('R')}eload  ${bold('g')} settings  ${bold('q')}uit`;
       case 'settings':
-        return ` ${bold('t')} threshold  ${bold('p')} probe  ${bold('m')} sx-mode  ${bold('k')} sx-key  ${bold('x')} clear-key  ${bold('Esc')} back`;
+        return ` ${dim('↑↓')} navigate  ${dim('←→')} change  ${bold('Enter')} edit  ${bold('Esc')} back`;
       case 'select': {
         const act = this.selAction === 'switch' ? 'switch'
           : this.selAction === 'toggle' ? 'enable/disable'
