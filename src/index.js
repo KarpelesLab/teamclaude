@@ -444,13 +444,18 @@ async function envCommand() {
 async function runCommand() {
   const config = await loadOrCreateConfig();
 
-  // Args after 'run'. teamclaude flags (e.g. --mitm) are recognized only before
-  // an optional `--` separator; everything after `--` goes verbatim to claude.
+  // Args after 'run'. teamclaude flags (e.g. --no-mitm) are recognized only
+  // before an optional `--` separator; everything after `--` goes verbatim to
+  // claude. MITM forward-proxy mode is the default so hardcoded api.anthropic.com
+  // endpoints are intercepted too; --no-mitm opts back into base-URL-only routing.
+  // --mitm is still accepted (now a no-op) for backward compatibility.
   const rest = args.slice(1);
   const sep = rest.indexOf('--');
   const tcFlags = sep >= 0 ? rest.slice(0, sep) : rest;
-  const useMitm = tcFlags.includes('--mitm');
-  const claudeArgs = sep >= 0 ? rest.slice(sep + 1) : rest.filter(a => a !== '--mitm');
+  const useMitm = !tcFlags.includes('--no-mitm');
+  const claudeArgs = sep >= 0
+    ? rest.slice(sep + 1)
+    : rest.filter(a => a !== '--mitm' && a !== '--no-mitm');
 
   // Route through the proxy only when it's actually up; otherwise launch claude
   // directly so a stopped proxy doesn't break `claude`. This is what lets the
@@ -884,10 +889,11 @@ Commands:
   login               OAuth login via browser
   login --api         Add an API key account
   env                 Print env vars to use with Claude
-  run [--mitm] [-- args...]
-                      Run Claude Code through the proxy (direct if it's down);
-                      --mitm routes via an HTTPS forward proxy + local CA so even
-                      hardcoded api.anthropic.com endpoints are intercepted
+  run [--no-mitm] [-- args...]
+                      Run Claude Code through the proxy (direct if it's down).
+                      Routes via an HTTPS forward proxy + local CA by default, so
+                      even hardcoded api.anthropic.com endpoints are intercepted;
+                      --no-mitm uses base-URL routing only
   alias               Print a shell alias so plain 'claude' routes via the proxy
                       (--install to write it to your shell rc; --uninstall to remove)
   status              Show proxy & account status (live)
@@ -909,10 +915,10 @@ Options:
                       --json '{"accessToken":"...","refreshToken":"...","expiresAt":1234}'
   --log-to DIR        Log full requests/responses to DIR (server, one file per request)
   --headless          Run the server without the interactive TUI (for backgrounding)
-  --mitm              (run) route claude via the HTTPS forward proxy + local CA
+  --no-mitm           (run) skip the forward proxy; route via ANTHROPIC_BASE_URL only
 
 The server always accepts both base-URL and proxy/CONNECT clients, so instances
-launched with and without --mitm can share one server.
+launched with and without --no-mitm can share one server.
 
 A running server re-syncs accounts from config on POST /teamclaude/reload
 (local only). add/login/enable/disable/priority trigger it automatically.
@@ -1117,7 +1123,7 @@ function argValue(flag) {
   return (i >= 0 && args[i + 1]) ? args[i + 1] : null;
 }
 
-// Hostname of the configured upstream (the host MITM-intercepts under `run --mitm`).
+// Hostname of the configured upstream (the host MITM-intercepts under `run`).
 function upstreamHost(config) {
   try { return new URL(config.upstream || 'https://api.anthropic.com').hostname; }
   catch { return 'api.anthropic.com'; }

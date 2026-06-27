@@ -24,7 +24,7 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 - **Enable/disable accounts** — temporarily pause an account without removing it (`teamclaude disable`/`enable`, or `d` in the TUI); re-enabling also clears a stuck error state
 - **Quota persistence** — observed quota survives restarts (saved to a sibling state file), so rotation state isn't lost on restart; stale windows are discarded automatically
 - **Optional quota probe** — off by default; when enabled, periodically refreshes idle accounts' quota from the usage endpoint (no message spend), and surfaces the Sonnet weekly bucket
-- **Optional MITM proxy mode** — `teamclaude run --mitm` routes claude via an HTTPS forward proxy with a local CA so even hardcoded `api.anthropic.com` endpoints (e.g. the Claude Design MCP) get the real token injected
+- **MITM proxy mode (default)** — `teamclaude run` routes claude via an HTTPS forward proxy with a local CA so even hardcoded `api.anthropic.com` endpoints (e.g. the Claude Design MCP) get the real token injected; pass `--no-mitm` for base-URL routing only
 - **Optional sx.org proxy mode** — off by default; set an [sx.org](https://sx.org) API key in the TUI settings screen (`g`) and TeamClaude auto-provisions a residential proxy to change the egress IP and work around IP-based `429`s. Three modes (`m` to cycle): **always** (route all upstream traffic), **on 429 only** (stay direct, fail over to the proxy after a 429), or **off** (keep the key but don't use it). TLS stays end-to-end with Anthropic (the proxy only relays ciphertext)
 - **Request logging** — optional full request/response logging for debugging
 - **Zero dependencies** — uses only Node.js built-in modules
@@ -255,14 +255,18 @@ You can also set the interval live from the TUI settings screen (`g` → `p`), a
 
 It reads each OAuth account's utilization from Anthropic's usage endpoint (`/api/oauth/usage`), which reports quota **without consuming any message quota**. Minimum interval is 30s. Changing it takes effect on a running server immediately (no restart). When enabled, it also surfaces the **Sonnet 7-day** bucket as an extra bar in the TUI / `status` (when your plan exposes it).
 
-### MITM proxy mode (optional, off by default)
+### MITM proxy mode (default)
 
-The normal reverse-proxy only intercepts what `ANTHROPIC_BASE_URL` covers. Some Claude Code features (e.g. the **Claude Design MCP**) use a **hardcoded** `https://api.anthropic.com` URL that ignores that variable, so they bypass the proxy. MITM proxy mode captures those too.
-
-Run claude with the `--mitm` flag:
+The plain reverse-proxy only intercepts what `ANTHROPIC_BASE_URL` covers. Some Claude Code features (e.g. the **Claude Design MCP**) use a **hardcoded** `https://api.anthropic.com` URL that ignores that variable, so they bypass the proxy. MITM proxy mode captures those too, which is why it's the default for `teamclaude run` (and the shell alias):
 
 ```bash
-teamclaude run --mitm -- <claude args...>
+teamclaude run -- <claude args...>
+```
+
+To opt out and route via `ANTHROPIC_BASE_URL` only, pass `--no-mitm`:
+
+```bash
+teamclaude run --no-mitm -- <claude args...>
 ```
 
 That launches claude pointed at teamclaude as an **HTTPS forward proxy** (`HTTPS_PROXY`) and trusts a locally-generated CA (`NODE_EXTRA_CA_CERTS`). For an intercepted host, teamclaude **dials the real upstream first, mirrors its negotiated ALPN** (HTTP/2 or HTTP/1.1), then terminates TLS toward claude with the same protocol and relays the traffic **as transparently as possible** — rewriting only what it must:
@@ -271,7 +275,7 @@ That launches claude pointed at teamclaude as an **HTTPS forward proxy** (`HTTPS
 - the **`account_uuid`** inside `metadata.user_id` → the active account's UUID (so the body agrees with the injected token);
 - and it reads `anthropic-ratelimit-*` from responses for quota.
 
-Everything else is copied byte-for-byte (HTTP/2 is handled with a built-in HPACK codec so the only header changed is the auth one). Any host other than the upstream is blind-tunnelled. The server accepts *both* base-URL and proxy clients at once, so instances launched with and without `--mitm` can share one server.
+Everything else is copied byte-for-byte (HTTP/2 is handled with a built-in HPACK codec so the only header changed is the auth one). Any host other than the upstream is blind-tunnelled. The server accepts *both* base-URL and proxy clients at once, so instances launched with and without `--no-mitm` can share one server.
 
 Trust model:
 - The CA is generated locally, stored in the config dir, and trusted **only** by the claude process you launch via `teamclaude run` (through `NODE_EXTRA_CA_CERTS`) — it is **never** added to your system trust store. The leaf private key is `0600`; the CA private key is never written to disk.
