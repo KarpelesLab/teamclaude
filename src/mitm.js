@@ -327,6 +327,12 @@ export function parseClientHelloAlpn(buf) {
 function makeRewriteRequest(account) {
   const isOAuth = account.type === 'oauth';
   return (fields) => {
+    // Remote Control control channel (/v1/code/*) is bound to the session's
+    // paired claude.ai identity; injecting a rotated account's token makes the
+    // worker event stream 403 and breaks Remote Control. Pass it through so
+    // Claude's own credential reaches the server (mirror of rewriteH1Auth).
+    const pathField = fields.find((f) => f.name.toString().toLowerCase() === ':path');
+    if (pathField && pathField.value.toString().startsWith('/v1/code/')) return fields;
     let replaced = false;
     const out = [];
     for (const f of fields) {

@@ -382,6 +382,13 @@ function headFields(headText) {
  *  `authValue` (or set x-api-key), and drop the other client-supplied key. */
 export function rewriteH1Auth(headText, { authorization = null, apiKey = null }) {
   const lines = headText.split('\r\n');
+  // Claude Code's Remote Control control channel (/v1/code/*) is bound to the
+  // claude.ai identity the session is paired with. Injecting a rotated account's
+  // token makes the upstream reject the worker event stream with 403, which kills
+  // Remote Control. Pass these requests through untouched so Claude's own paired
+  // credential reaches the server (same spirit as the /v1/oauth/token passthrough).
+  const reqPath = (lines[0] || '').split(' ')[1] || '';
+  if (reqPath.startsWith('/v1/code/')) return headText;
   const out = [lines[0]]; // request line
   let setAuth = false;
   for (let i = 1; i < lines.length; i++) {
