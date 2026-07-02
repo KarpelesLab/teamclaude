@@ -55,6 +55,7 @@ function makeProxy(upPort, caCertPem, leafCertPem, leafKeyPem, onQuota, logDir =
   const account = { index: 0, type: 'oauth', credential: 'REAL-TOKEN', accountUuid: ACCOUNT_UUID, name: 'acct@x' };
   const accountManager = {
     getActiveAccount: () => account,
+    getActiveAccountFresh: async () => account,
     ensureTokenFresh: async () => {},
     updateQuota: (i, h) => onQuota(h),
     markRateLimited: () => {},
@@ -402,13 +403,15 @@ test('MITM h1 keep-alive: every request is reframed, rewritten, masked, and quot
 function makeRotatingManager(accts) {
   const state = accts.map((a, i) => ({ index: i, type: 'oauth', ...a, rateLimited: false }));
   const calls = { rateLimited: [], quota: [] };
-  return {
+  const mgr = {
     state, calls,
     getActiveAccount: () => state.find((a) => !a.rateLimited) || null,
     ensureTokenFresh: async () => {},
     updateQuota: (i, h) => calls.quota.push({ i, h }),
     markRateLimited: (i) => { state[i].rateLimited = true; calls.rateLimited.push(i); },
   };
+  mgr.getActiveAccountFresh = async () => mgr.getActiveAccount();
+  return mgr;
 }
 
 function makeProxyWith(upPort, caCertPem, leafCertPem, leafKeyPem, accountManager) {

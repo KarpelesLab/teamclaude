@@ -209,14 +209,18 @@ async function intercept({ host, port, mode, clientSocket, head, accountManager,
   // agree on one account even while different requests on this tunnel use
   // different accounts.
   const reqAccounts = new Map(); // id -> account
-  const pickFor = (id) => {
-    // Never leave a mid-tunnel request unauthenticated: if every account is over
-    // quota right now, fall back to the tunnel's initial account (its response
-    // 429 will then throttle it and the next request rolls on).
-    const account = accountManager.getActiveAccount() || initial;
+  const pickFor = async (id) => {
+    // getActiveAccountFresh blocks to refresh only if the chosen account's token
+    // has ALREADY expired (e.g. we just rotated onto an account that sat idle
+    // past its token lifetime) — so we never inject a dead token. Never leave a
+    // mid-tunnel request unauthenticated: if every account is over quota right
+    // now, fall back to the tunnel's initial account (its response 429 will then
+    // throttle it and the next request rolls on).
+    const account = (await accountManager.getActiveAccountFresh()) || initial;
     reqAccounts.set(id, account);
-    // Keep the token fresh for later requests without blocking this one — the
-    // current credential is still valid (refresh fires ~5 min before expiry).
+    // Opportunistic (non-blocking) refresh for the expiring-soon case: the
+    // current credential is still valid, so this request goes out immediately and
+    // later requests pick up the refreshed token.
     accountManager.ensureTokenFresh(account.index);
     return account;
   };
@@ -238,7 +242,9 @@ async function intercept({ host, port, mode, clientSocket, head, accountManager,
 
   if (alpn === 'h2') {
     h2Relay(claudeTls, upstreamSock, {
-      rewriteRequest: (fields, id) => makeRewriteRequest(pickFor(id))(fields),
+      // Async: pickFor may block to refresh an expired token before we inject it.
+      // The relay awaits the returned promise before forwarding the request.
+      rewriteRequest: async (fields, id) => makeRewriteRequest(await pickFor(id))(fields),
       makeBodyPatcher,
       onResponseHeaders: observer,
       onStreamClose: forget,
@@ -247,8 +253,8 @@ async function intercept({ host, port, mode, clientSocket, head, accountManager,
     });
   } else {
     h1Relay(claudeTls, upstreamSock, {
-      rewriteHead: (h, id) => {
-        const account = pickFor(id);
+      rewriteHead: async (h, id) => {
+        const account = await pickFor(id);
         const auth = account.type === 'oauth'
           ? { authorization: `Bearer ${account.credential}` }
           : { apiKey: account.credential };

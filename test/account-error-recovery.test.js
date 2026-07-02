@@ -34,6 +34,36 @@ test('excluding an account for one request never changes its persistent status',
   assert.equal(am.accounts[0].status, 'active');
 });
 
+// ── getActiveAccountFresh: block-refresh an already-expired token ───────────
+
+test('getActiveAccountFresh refreshes an ALREADY-expired token before returning', async () => {
+  // Rotating onto an account that sat idle past its token lifetime must not hand
+  // back a dead token — the selector blocks on a refresh first.
+  let calls = 0;
+  const am = new AccountManager(
+    [{ name: 'a', type: 'oauth', accessToken: 'STALE', refreshToken: 'r', expiresAt: Date.now() - 1000 }],
+    0.98,
+    { refreshFn: async () => { calls++; return { accessToken: 'FRESH', refreshToken: 'r2', expiresAt: Date.now() + 3600_000 }; } },
+  );
+  const acc = await am.getActiveAccountFresh();
+  assert.equal(acc.credential, 'FRESH', 'expired token was refreshed before use');
+  assert.equal(calls, 1, 'exactly one blocking refresh');
+});
+
+test('getActiveAccountFresh does NOT block-refresh a still-valid token', async () => {
+  // A merely "expiring soon" (still valid) token is left for the caller's
+  // opportunistic background refresh — selection must not block on it.
+  let calls = 0;
+  const am = new AccountManager(
+    [{ name: 'a', type: 'oauth', accessToken: 'GOOD', refreshToken: 'r', expiresAt: Date.now() + 3600_000 }],
+    0.98,
+    { refreshFn: async () => { calls++; return { accessToken: 'FRESH', refreshToken: 'r2', expiresAt: Date.now() + 3600_000 }; } },
+  );
+  const acc = await am.getActiveAccountFresh();
+  assert.equal(acc.credential, 'GOOD', 'valid token used as-is');
+  assert.equal(calls, 0, 'no blocking refresh for a valid token');
+});
+
 // ── refresh-failure classification (the wrongly-errored bug) ────────────────
 
 test('ensureTokenFresh marks error only on a genuine auth rejection', async () => {

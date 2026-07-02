@@ -113,6 +113,17 @@ export function isTokenExpiringSoon(expiresAt, thresholdMs = 5 * 60 * 1000) {
 }
 
 /**
+ * Check if an OAuth token has ALREADY expired (no safety margin). Used to decide
+ * when a token must be refreshed synchronously before it can be injected — a
+ * still-valid-but-expiring-soon token is fine to use now and refresh in the
+ * background, but an expired one would 401.
+ */
+export function isTokenExpired(expiresAt) {
+  if (!expiresAt) return false;
+  return Date.now() >= normalizeExpiresAt(expiresAt);
+}
+
+/**
  * Fetch account profile for an OAuth token.
  * Returns { email, name, orgName, orgType, ... } on success,
  * or { error: 'reason' } on failure.

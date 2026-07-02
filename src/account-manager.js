@@ -1,4 +1,4 @@
-import { refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
+import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired } from './oauth.js';
 import { sameIdentity } from './identity.js';
 
 // Quota fields that survive a restart: utilization levels and their reset
@@ -106,6 +106,22 @@ export class AccountManager {
     // quota (or upstream's own 429 converts soft exhaustion into a hard
     // rate-limit hold). null here means the caller emits the synthetic 429.
     return this._selectProbe(exclude);
+  }
+
+  /**
+   * Like getActiveAccount, but if the selected account's OAuth token has ALREADY
+   * expired it blocks on a refresh before returning — so a caller that injects
+   * the token immediately (the MITM relay) never sends a dead token and eats a
+   * 401. A token that is merely expiring soon (still valid) is left to the
+   * caller's opportunistic background refresh; only a hard-expired one blocks.
+   */
+  async getActiveAccountFresh(exclude = null) {
+    const account = this.getActiveAccount(exclude);
+    if (account && account.type === 'oauth' && account.refreshToken
+        && isTokenExpired(account.expiresAt)) {
+      await this.ensureTokenFresh(account.index); // coalesces with any in-flight refresh
+    }
+    return account;
   }
 
   _isProbeable(account) {
