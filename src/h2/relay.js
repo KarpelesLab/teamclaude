@@ -42,8 +42,13 @@ function writeBackpressured(dst, buf, ctl) {
  * @param opts.log
  */
 export function h2Relay(claude, upstream, opts = {}) {
+  // rewriteRequest/makeBodyPatcher/onResponseHeaders all receive the stream id so
+  // the caller can bind a DIFFERENT account per request on this one tunnel (the
+  // upstream socket is account-agnostic; the account is only the injected auth +
+  // body account_uuid). onStreamClose lets the caller drop its per-stream state.
   const rewriteRequest = opts.rewriteRequest || ((f) => f);
   const onResponseHeaders = opts.onResponseHeaders || (() => {});
+  const onStreamClose = opts.onStreamClose || (() => {});
   const makeBodyPatcher = opts.makeBodyPatcher || null; // () => { push(buf)->buf } per stream
   const bodyPatchers = makeBodyPatcher ? new Map() : null; // streamId -> patcher
   const tap = opts.tap || null; // optional request-logging tap (per streamId)
@@ -53,7 +58,8 @@ export function h2Relay(claude, upstream, opts = {}) {
   // mid-flight connection teardown can close their tap records instead of
   // leaking them (e.g. a stuck "in-flight" entry in the TUI activity feed).
   const openStreams = new Set();
-  const closeStream = (id) => { if (bodyPatchers) bodyPatchers.delete(id); tap?.end(id); openStreams.delete(id); };
+  const NO_PATCH = { push: (b) => b }; // per-stream sentinel when the chosen account has no uuid to patch
+  const closeStream = (id) => { if (bodyPatchers) bodyPatchers.delete(id); tap?.end(id); openStreams.delete(id); onStreamClose(id); };
 
   const reqDec = new HpackDecoder();         // decodes claude's request blocks
   const reqEnc = new HpackEncoder();         // re-encodes to upstream
@@ -109,7 +115,7 @@ export function h2Relay(claude, upstream, opts = {}) {
       let payload = Buffer.from(fr.payload);
       if (bodyPatchers) {
         let p = bodyPatchers.get(fr.streamId);
-        if (!p) { p = makeBodyPatcher(); bodyPatchers.set(fr.streamId, p); }
+        if (p === undefined) { p = makeBodyPatcher(fr.streamId) || NO_PATCH; bodyPatchers.set(fr.streamId, p); }
         payload = p.push(payload);
       }
       if (tap) tap.reqData(fr.streamId, payload);
@@ -128,7 +134,7 @@ export function h2Relay(claude, upstream, opts = {}) {
     const { streamId, frags, priority, endStream } = asm;
     asm = null;
     const fields = reqDec.decode(Buffer.concat(frags)); // keep decoder dynamic table in sync
-    const rewritten = rewriteRequest(fields);
+    const rewritten = rewriteRequest(fields, streamId);
     if (tap) tap.req(streamId, rewritten);
     openStreams.add(streamId);
     const newBlock = reqEnc.encode(rewritten);
@@ -176,7 +182,7 @@ export function h2Relay(claude, upstream, opts = {}) {
     rasm = null;
     try {
       const fields = respDec.decode(Buffer.concat(frags));
-      onResponseHeaders(fields);
+      onResponseHeaders(fields, streamId);
       if (tap) tap.res(streamId, fields);
     } catch (err) {
       log(`[TeamClaude] h2 response header decode failed: ${err.message}`);
@@ -266,9 +272,13 @@ const statusOf = (startLine) => parseInt(startLine.split(' ')[1], 10) || 0;
  * @param opts.onResponseHeaders (fields[]) => void    // observe each response's headers
  */
 export function h1Relay(claude, upstream, opts = {}) {
+  // rewriteHead/makeBodyPatcher/onResponseHeaders receive the per-request id so
+  // the caller can bind a different account to each request on this keep-alive
+  // connection; onRequestClose lets it drop that per-request state.
   const rewriteHead = opts.rewriteHead || ((h) => h);
   const makeBodyPatcher = opts.makeBodyPatcher || null;
   const onResponseHeaders = opts.onResponseHeaders || (() => {});
+  const onRequestClose = opts.onStreamClose || (() => {});
   const tap = opts.tap || null;
   const destroyBoth = () => { claude.destroy(); upstream.destroy(); };
   claude.on('error', destroyBoth);
@@ -290,15 +300,17 @@ export function h1Relay(claude, upstream, opts = {}) {
       if (reqPhase === 'head') {
         const idx = reqBuf.indexOf('\r\n\r\n');
         if (idx < 0) { if (reqBuf.length > MAX_HEAD) destroyBoth(); return; }
-        const head = rewriteHead(reqBuf.subarray(0, idx + 4).toString('latin1'));
+        // Assign the id BEFORE rewriting so the caller can bind this request's
+        // account (used again to attribute the response and patch the body).
+        reqId = ++nextId;
+        const head = rewriteHead(reqBuf.subarray(0, idx + 4).toString('latin1'), reqId);
         reqBuf = reqBuf.subarray(idx + 4);
         const info = parseH1Head(head);
-        reqId = ++nextId;
         pending.push({ id: reqId, method: methodOf(info.startLine) });
         if (tap) tap.reqHead(reqId, head);
         upstream.write(Buffer.from(head, 'latin1'));
         const kind = info.chunked ? 'chunked' : (info.contentLength > 0 ? 'length' : 'none');
-        reqPatcher = makeBodyPatcher ? makeBodyPatcher() : null;
+        reqPatcher = makeBodyPatcher ? makeBodyPatcher(reqId) : null;
         reqTrack = makeBodyTracker(kind, info.contentLength || 0);
         reqPhase = 'body';
       } else {
@@ -334,9 +346,11 @@ export function h1Relay(claude, upstream, opts = {}) {
         const info = parseH1Head(head);
         const status = statusOf(info.startLine);
         if (status >= 100 && status < 200) continue; // interim (e.g. 100-continue): no body, no request consumed
-        onResponseHeaders(headFields(head));
+        // Match the response to its request FIRST so quota is attributed to the
+        // account THAT request used (each request may be a different account).
         const req = pending.shift();
         resId = req ? req.id : ++nextId;
+        onResponseHeaders(headFields(head), resId);
         if (tap) tap.resHead(resId, head);
         const bodyless = req?.method === 'HEAD' || status === 204 || status === 304;
         const kind = bodyless ? 'none'
@@ -348,7 +362,7 @@ export function h1Relay(claude, upstream, opts = {}) {
       } else {
         const { consumed, done } = resTrack(resBuf);
         if (consumed > 0) { if (tap) tap.resData(resId, Buffer.from(resBuf.subarray(0, consumed))); resBuf = resBuf.subarray(consumed); }
-        if (done) { if (tap) tap.end(resId); resId = null; resPhase = 'head'; resTrack = null; }
+        if (done) { if (tap) tap.end(resId); onRequestClose(resId); resId = null; resPhase = 'head'; resTrack = null; }
         else if (consumed === 0) return;
       }
     }

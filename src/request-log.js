@@ -85,6 +85,13 @@ export class BodyWriter {
   }
 }
 
+// `accountName` may be a fixed string or, since one tunnel can now serve several
+// accounts (per-request rotation), a resolver (id) => name that names the account
+// THAT request actually used.
+function resolveName(accountName, id) {
+  return (typeof accountName === 'function' ? accountName(id) : accountName) || '';
+}
+
 export function makeMitmTap(logDir, accountName = '') {
   if (!logDir) return null;
   mkdir(logDir, { recursive: true }).catch(() => {});
@@ -113,12 +120,14 @@ export function makeMitmTap(logDir, accountName = '') {
   return {
     req(id, fields) {
       const r = rec(id);
-      r.write(`=== REQUEST (h2${accountName ? `, account: ${accountName}` : ''}) ===\n${get(fields, ':method')} ${get(fields, ':path')}\n${fmtFields(fields, { pseudo: false })}`);
+      const acct = resolveName(accountName, id);
+      r.write(`=== REQUEST (h2${acct ? `, account: ${acct}` : ''}) ===\n${get(fields, ':method')} ${get(fields, ':path')}\n${fmtFields(fields, { pseudo: false })}`);
       r.reqBody = new BodyWriter(r.write, 'REQUEST BODY', ctOfFields(fields));
     },
     reqHead(id, text) {
       const r = rec(id);
-      r.write(`=== REQUEST (h1${accountName ? `, account: ${accountName}` : ''}) ===\n${maskHeadText(text).trimEnd()}`);
+      const acct = resolveName(accountName, id);
+      r.write(`=== REQUEST (h1${acct ? `, account: ${acct}` : ''}) ===\n${maskHeadText(text).trimEnd()}`);
       r.reqBody = new BodyWriter(r.write, 'REQUEST BODY', ctOfHead(text));
     },
     reqData(id, buf) { rec(id).reqBody?.chunk(buf); },
@@ -157,9 +166,10 @@ export function makeActivityTap(hooks, accountName = '') {
 
   function start(localId, method, path) {
     const gid = `m${++activitySeq}`;
-    ids.set(localId, { gid, method, path, status: null });
+    const acct = resolveName(accountName, localId);
+    ids.set(localId, { gid, method, path, status: null, account: acct });
     hooks.onRequestStart?.(gid, { method, path });
-    if (accountName) hooks.onRequestRouted?.(gid, { account: accountName });
+    if (acct) hooks.onRequestRouted?.(gid, { account: acct });
   }
 
   return {
@@ -176,7 +186,7 @@ export function makeActivityTap(hooks, accountName = '') {
       const r = ids.get(id);
       if (!r) return;
       ids.delete(id);
-      hooks.onRequestEnd?.(r.gid, { method: r.method, path: r.path, account: accountName, status: r.status });
+      hooks.onRequestEnd?.(r.gid, { method: r.method, path: r.path, account: r.account, status: r.status });
     },
   };
 }

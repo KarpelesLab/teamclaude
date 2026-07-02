@@ -149,9 +149,16 @@ async function intercept({ host, port, mode, clientSocket, head, accountManager,
   // with whatever the upstream selected. The upstream decides — constrained to
   // what the client can speak — so an http/1.1-only client (undici/claude) and
   // an h2 client both negotiate end-to-end exactly as they would directly.
-  const account = accountManager.getActiveAccount();
-  if (!account) { clientSocket.destroy(); return; }
-  await accountManager.ensureTokenFresh(account.index);
+  // We do NOT pin one account to the tunnel. The client holds this CONNECT
+  // tunnel open (keep-alive) and sends many requests over it, and the upstream
+  // TLS socket is account-agnostic — an account is only the injected auth header
+  // plus the body account_uuid. So we choose the account PER REQUEST (below) and
+  // can roll onto a fresh one the instant the current account hits a limit, with
+  // no tunnel teardown and no restart. Here we only need SOME account to exist
+  // and warm its token for the likely-first request.
+  const initial = accountManager.getActiveAccount();
+  if (!initial) { clientSocket.destroy(); return; }
+  await accountManager.ensureTokenFresh(initial.index);
 
   reply200Raw(clientSocket);
   const offered = await peekClientAlpn(clientSocket, head); // client's ALPN list, or null
@@ -195,32 +202,61 @@ async function intercept({ host, port, mode, clientSocket, head, accountManager,
     claudeTls.once('error', reject);
   });
 
-  // Per-stream streaming body patcher: align metadata.user_id.account_uuid with
-  // the injected account (same length; no-op if the account has no UUID).
-  const makeBodyPatcher = account.accountUuid
-    ? () => new AccountUuidPatcher(account.accountUuid)
-    : null;
+  // Per-request account binding. The relay calls back at each request boundary
+  // (h2 stream / h1 message) with its id; we pick the current best account then,
+  // remember it by id, and reuse THAT account to patch the body account_uuid and
+  // to attribute the response's quota/429 — so a request and its response always
+  // agree on one account even while different requests on this tunnel use
+  // different accounts.
+  const reqAccounts = new Map(); // id -> account
+  const pickFor = (id) => {
+    // Never leave a mid-tunnel request unauthenticated: if every account is over
+    // quota right now, fall back to the tunnel's initial account (its response
+    // 429 will then throttle it and the next request rolls on).
+    const account = accountManager.getActiveAccount() || initial;
+    reqAccounts.set(id, account);
+    // Keep the token fresh for later requests without blocking this one — the
+    // current credential is still valid (refresh fires ~5 min before expiry).
+    accountManager.ensureTokenFresh(account.index);
+    return account;
+  };
+  const forget = (id) => reqAccounts.delete(id);
+
+  // Same-length streaming body patch (account_uuid) for the account THIS request
+  // was bound to; null when that account has no UUID.
+  const makeBodyPatcher = (id) => {
+    const a = reqAccounts.get(id);
+    return a?.accountUuid ? new AccountUuidPatcher(a.accountUuid) : null;
+  };
+  const observer = makeQuotaObserver(accountManager, (id) => reqAccounts.get(id), sx);
+
   // Fan request lifecycle out to the on-disk log (when configured) AND the live
-  // TUI activity feed, so MITM traffic is visible in the TUI like reverse-proxy
-  // traffic — not just on disk.
-  const tap = combineTaps(makeMitmTap(logDir, account.name), makeActivityTap(hooks, account.name));
+  // TUI activity feed. The account is resolved per request id so logs/feed show
+  // the account THAT request actually used (populated before the tap's req/head).
+  const nameFor = (id) => reqAccounts.get(id)?.name || initial.name;
+  const tap = combineTaps(makeMitmTap(logDir, nameFor), makeActivityTap(hooks, nameFor));
 
   if (alpn === 'h2') {
     h2Relay(claudeTls, upstreamSock, {
-      rewriteRequest: makeRewriteRequest(account),
+      rewriteRequest: (fields, id) => makeRewriteRequest(pickFor(id))(fields),
       makeBodyPatcher,
-      onResponseHeaders: makeQuotaObserver(accountManager, account, sx),
+      onResponseHeaders: observer,
+      onStreamClose: forget,
       tap,
       log,
     });
   } else {
-    const auth = account.type === 'oauth'
-      ? { authorization: `Bearer ${account.credential}` }
-      : { apiKey: account.credential };
     h1Relay(claudeTls, upstreamSock, {
-      rewriteHead: (h) => rewriteH1Auth(h, auth),
+      rewriteHead: (h, id) => {
+        const account = pickFor(id);
+        const auth = account.type === 'oauth'
+          ? { authorization: `Bearer ${account.credential}` }
+          : { apiKey: account.credential };
+        return rewriteH1Auth(h, auth);
+      },
       makeBodyPatcher,
-      onResponseHeaders: makeQuotaObserver(accountManager, account, sx),
+      onResponseHeaders: observer,
+      onStreamClose: forget,
       tap,
     });
   }
@@ -353,8 +389,12 @@ function makeRewriteRequest(account) {
   };
 }
 
-function makeQuotaObserver(accountManager, account, sx = null) {
-  return (fields) => {
+// `accountFor` maps a relay request id to the account that request was bound to,
+// so quota/429s land on the RIGHT account when a tunnel rotates accounts.
+function makeQuotaObserver(accountManager, accountFor, sx = null) {
+  return (fields, id) => {
+    const account = accountFor(id);
+    if (!account) return; // response with no matching request id (already forgotten / unpaired)
     const m = {};
     for (const f of fields) m[f.name.toString().toLowerCase()] = f.value.toString();
     if (!m[':status']) return;
@@ -366,6 +406,8 @@ function makeQuotaObserver(accountManager, account, sx = null) {
       if (Number.isNaN(ra)) ra = 60;
       ra = Math.min(Math.max(ra, 1), 300);
       accountManager.markRateLimited(account.index, ra);
+      // The very next request on this same tunnel will now pick a different
+      // account (this one is throttled) — no teardown needed.
       // Arm sx.org sticky routing so the next MITM tunnel uses the proxy (in
       // '429' mode); no-op in 'off'/'always'.
       sx?.noteRateLimited(ra);

@@ -393,6 +393,150 @@ test('MITM h1 keep-alive: every request is reframed, rewritten, masked, and quot
   }
 });
 
+// A CONNECT tunnel is long-lived (claude keeps it open, keep-alive) and carries
+// many requests. The account must be chosen PER REQUEST, not pinned for the
+// tunnel's life: when the account a request lands on is rate-limited, the very
+// next request on the SAME tunnel must roll onto a different account — no
+// teardown, no restart. (Before this, a pinned tunnel replayed the same limit
+// forever and only restarting teamclaude recovered.)
+function makeRotatingManager(accts) {
+  const state = accts.map((a, i) => ({ index: i, type: 'oauth', ...a, rateLimited: false }));
+  const calls = { rateLimited: [], quota: [] };
+  return {
+    state, calls,
+    getActiveAccount: () => state.find((a) => !a.rateLimited) || null,
+    ensureTokenFresh: async () => {},
+    updateQuota: (i, h) => calls.quota.push({ i, h }),
+    markRateLimited: (i) => { state[i].rateLimited = true; calls.rateLimited.push(i); },
+  };
+}
+
+function makeProxyWith(upPort, caCertPem, leafCertPem, leafKeyPem, accountManager) {
+  const proxy = http.createServer();
+  proxy.on('connect', createConnectHandler({
+    config: { upstream: `https://127.0.0.1:${upPort}` },
+    accountManager,
+    ensureLeaf: async () => ({ key: leafKeyPem, cert: leafCertPem }),
+    upstreamTlsOptions: { ca: [caCertPem], servername: 'localhost' },
+    log: () => {},
+  }));
+  return proxy;
+}
+
+test('MITM h2: a rate-limited account is replaced on the NEXT request of the same tunnel', T, async () => {
+  const { caCertPem, leafCertPem, leafKeyPem } = generateCertChain('localhost');
+
+  // Upstream 429s account A's token (with rate-limit headers) and 200s anyone
+  // else — so a tunnel that kept using A would loop on 429 forever.
+  const upstream = http2.createSecureServer({ key: leafKeyPem, cert: leafCertPem });
+  upstream.on('stream', (s, h) => {
+    const auth = h.authorization || 'none';
+    if (auth === 'Bearer TOKEN-A') {
+      s.respond({ ':status': 429, 'retry-after': '30', 'anthropic-ratelimit-unified-5h-utilization': '1.0', 'x-saw-auth': auth });
+      s.end('limited');
+    } else {
+      s.respond({ ':status': 200, 'x-saw-auth': auth });
+      s.end('ok');
+    }
+  });
+  const upPort = await listen(upstream);
+
+  const am = makeRotatingManager([
+    { name: 'A', credential: 'TOKEN-A', accountUuid: null },
+    { name: 'B', credential: 'TOKEN-B', accountUuid: null },
+  ]);
+  const proxy = makeProxyWith(upPort, caCertPem, leafCertPem, leafKeyPem, am);
+  const proxyPort = await listen(proxy);
+
+  const tlsSock = await connectThroughProxy(proxyPort, `127.0.0.1:${upPort}`, caCertPem, ['h2', 'http/1.1']);
+  try {
+    const client = http2.connect('https://localhost', { createConnection: () => tlsSock });
+    const send = () => new Promise((resolve) => {
+      const req = client.request({ ':method': 'POST', ':path': '/v1/messages', authorization: 'Bearer FAKE' });
+      let resp;
+      req.on('response', (h) => { resp = h; });
+      req.resume(); req.on('close', () => resolve(resp)); req.end('{}');
+    });
+
+    const r1 = await send(); // lands on A → 429, which throttles A
+    const r2 = await send(); // SAME tunnel → must roll onto B → 200
+
+    assert.equal(r1[':status'], 429, 'first request hit the limited account');
+    assert.equal(r1['x-saw-auth'], 'Bearer TOKEN-A', 'first request used account A');
+    assert.deepEqual(am.calls.rateLimited, [0], 'account A was marked rate-limited from its 429');
+    assert.equal(r2[':status'], 200, 'second request succeeded on the same tunnel');
+    assert.equal(r2['x-saw-auth'], 'Bearer TOKEN-B', 'second request rolled onto account B — no restart needed');
+    client.close();
+  } finally {
+    tlsSock.destroy(); closeHard(proxy); closeHard(upstream);
+  }
+});
+
+test('MITM h1 keep-alive: a rate-limited account is replaced on the next request', T, async () => {
+  const { caCertPem, leafCertPem, leafKeyPem } = generateCertChain('localhost');
+
+  // Keep-alive http/1.1 upstream: 429 (with rate-limit headers) for account A's
+  // token, 200 for anyone else; echoes the auth it saw.
+  const upstream = tls.createServer({ key: leafKeyPem, cert: leafCertPem, ALPNProtocols: ['http/1.1'] }, (s) => {
+    let buf = '';
+    s.on('data', (d) => {
+      buf += d;
+      let idx;
+      while ((idx = buf.indexOf('\r\n\r\n')) >= 0) {
+        const head = buf.slice(0, idx);
+        const need = parseInt((head.match(/content-length: (\d+)/i) || [])[1], 10) || 0;
+        if (buf.length < idx + 4 + need) break;
+        buf = buf.slice(idx + 4 + need);
+        const auth = (head.match(/authorization: (.*)/i) || [])[1]?.trim() || 'none';
+        const body = JSON.stringify({ auth });
+        const limited = auth === 'Bearer TOKEN-A';
+        const rl = limited ? 'retry-after: 30\r\nanthropic-ratelimit-unified-5h-utilization: 1.0\r\n' : '';
+        s.write(`HTTP/1.1 ${limited ? '429 Too Many Requests' : '200 OK'}\r\ncontent-type: application/json\r\ncontent-length: ${Buffer.byteLength(body)}\r\n${rl}connection: keep-alive\r\n\r\n${body}`);
+      }
+    });
+  });
+  const upPort = await listen(upstream);
+
+  const am = makeRotatingManager([
+    { name: 'A', credential: 'TOKEN-A', accountUuid: null },
+    { name: 'B', credential: 'TOKEN-B', accountUuid: null },
+  ]);
+  const proxy = makeProxyWith(upPort, caCertPem, leafCertPem, leafKeyPem, am);
+  const proxyPort = await listen(proxy);
+
+  const tlsSock = await connectThroughProxy(proxyPort, `127.0.0.1:${upPort}`, caCertPem, ['http/1.1']);
+  const readResp = () => new Promise((resolve) => {
+    let buf = '';
+    const onData = (d) => {
+      buf += d;
+      const i = buf.indexOf('\r\n\r\n');
+      if (i < 0) return;
+      const need = parseInt((buf.match(/content-length: (\d+)/i) || [])[1], 10);
+      if (buf.length < i + 4 + need) return;
+      tlsSock.removeListener('data', onData);
+      resolve({ status: buf.split(' ')[1], body: JSON.parse(buf.slice(i + 4, i + 4 + need)) });
+    };
+    tlsSock.on('data', onData);
+  });
+  try {
+    tlsSock.setEncoding('utf8');
+    const p1 = readResp();
+    tlsSock.write('POST /v1/messages HTTP/1.1\r\nhost: localhost\r\nauthorization: Bearer FAKE\r\ncontent-type: application/json\r\ncontent-length: 2\r\n\r\n{}');
+    const r1 = await p1;
+    const p2 = readResp();
+    tlsSock.write('POST /v1/messages HTTP/1.1\r\nhost: localhost\r\nauthorization: Bearer FAKE\r\ncontent-type: application/json\r\ncontent-length: 2\r\n\r\n{}');
+    const r2 = await p2;
+
+    assert.equal(r1.status, '429', 'first request hit the limited account');
+    assert.equal(r1.body.auth, 'Bearer TOKEN-A', 'first request used account A');
+    assert.deepEqual(am.calls.rateLimited, [0], 'account A throttled from its 429');
+    assert.equal(r2.status, '200', 'second request succeeded on the same keep-alive connection');
+    assert.equal(r2.body.auth, 'Bearer TOKEN-B', 'second request rolled onto account B');
+  } finally {
+    tlsSock.destroy(); closeHard(proxy); closeHard(upstream);
+  }
+});
+
 // Regression (the run --mitm "ConnectionRefused"): an http/1.1-only client — what
 // undici/claude offers when it tunnels through a proxy — against an upstream that
 // ALSO speaks h2. We must adopt the CLIENT's protocol (http/1.1) and mirror it
