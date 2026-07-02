@@ -13,6 +13,7 @@ import { ensureCerts } from './mitm.js';
 import { Prober } from './prober.js';
 import { TUI } from './tui.js';
 import { SxManager } from './sx.js';
+import { autoUpdate, checkForUpdate, currentVersion, runUpdate, installKind, PKG_NAME } from './updater.js';
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -70,6 +71,16 @@ switch (command) {
     break;
   case 'probe':
     await probeCommand();
+    process.exit(0);
+    break;
+  case 'update':
+    await updateCommand();
+    process.exit(0);
+    break;
+  case 'version':
+  case '--version':
+  case '-V':
+    console.log(currentVersion() || 'unknown');
     process.exit(0);
     break;
   case 'help':
@@ -297,6 +308,11 @@ async function serverCommand() {
   prober = new Prober(accountManager, { intervalMs: (config.quotaProbeSeconds || 0) * 1000 });
   prober.start();
 
+  // Background self-update for a backgrounded (headless) server. Skipped under
+  // the TUI, where npm's install output would corrupt the display — interactive
+  // users update via `teamclaude run` (post-session) or `teamclaude update`.
+  if (!tui) autoUpdate({ config }).catch(() => {});
+
   if (!tui) {
     const shutdown = async () => {
       console.log('\n[TeamClaude] Shutting down...');
@@ -499,6 +515,11 @@ async function runCommand() {
     }
     process.exit(1);
   }
+
+  // Session over — check for a newer teamclaude and (for a global npm install)
+  // self-update. Throttled to once/day, so this is a no-op on almost every run;
+  // it applies to the NEXT launch, never the session that just ran.
+  await autoUpdate({ config }).catch(() => {});
 
   process.exit(result.status ?? 1);
 }
@@ -766,6 +787,39 @@ async function probeCommand() {
   await notifyRunningServer(config);
 }
 
+// ── update ──────────────────────────────────────────────────
+
+async function updateCommand() {
+  const cur = currentVersion();
+  console.log(`Current version: ${cur || 'unknown'}`);
+
+  const kind = installKind();
+  if (kind === 'git') {
+    console.log('This is a git checkout — update it with `git pull`, not npm.');
+    return;
+  }
+
+  const info = await checkForUpdate({ force: true });
+  if (!info) {
+    console.error('Could not reach the npm registry to check for updates.');
+    process.exitCode = 1;
+    return;
+  }
+  if (!info.updateAvailable) {
+    console.log(`Already up to date (latest is ${info.latest}).`);
+    return;
+  }
+
+  console.log(`Updating ${info.current} → ${info.latest} …`);
+  const ok = runUpdate(info.latest);
+  if (ok) {
+    console.log(`Updated to ${info.latest}. Restart teamclaude to use the new version.`);
+  } else {
+    console.error(`Update failed. Try manually: npm install -g ${PKG_NAME}@latest`);
+    process.exitCode = 1;
+  }
+}
+
 // ── remove ──────────────────────────────────────────────────
 
 /**
@@ -905,6 +959,8 @@ Commands:
   probe [off|secs]    Opt-in background quota refresh for idle accounts
                       (off by default; reads usage endpoint, spends no quota)
   api <path>          Call an API endpoint with account credentials
+  update              Check npm for a newer teamclaude and install it
+  version             Print the installed version
   help                Show this help
 
 Options:
@@ -922,6 +978,10 @@ launched with and without --no-mitm can share one server.
 
 A running server re-syncs accounts from config on POST /teamclaude/reload
 (local only). add/login/enable/disable/priority trigger it automatically.
+
+A global npm install self-updates in the background (checked once/day, applied
+on the next launch). Disable with TEAMCLAUDE_DISABLE_AUTOUPDATE=1 or
+"autoUpdate": false in the config.
 
 Config: ${getConfigPath()}
 `);

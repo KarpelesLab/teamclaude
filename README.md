@@ -175,8 +175,22 @@ teamclaude priority <name> 1 # Set rotation priority (lower = preferred)
 teamclaude probe 300         # Enable background quota refresh (off by default)
 teamclaude alias             # Print/install a `claude` alias that routes via the proxy
 teamclaude api <path>        # Call an API endpoint with account credentials
+teamclaude update            # Check npm for a newer teamclaude and install it
+teamclaude version           # Print the installed version
 teamclaude help              # Show all commands
 ```
+
+### Auto-update
+
+When teamclaude is installed globally via npm, it self-updates in the
+background: it checks the npm registry at most once a day, and when a newer
+version is published it runs `npm install -g @karpeleslab/teamclaude@latest` and
+applies it on the next launch. The check runs after a `teamclaude run` session
+ends and when a headless server starts; a git checkout is never touched (update
+it with `git pull`). Run `teamclaude update` to update on demand.
+
+Disable auto-update with `TEAMCLAUDE_DISABLE_AUTOUPDATE=1` or `"autoUpdate": false`
+in the config.
 
 When the same email belongs to multiple organizations, accounts are named
 `email (Org)` to keep them distinct. Pass `--org <name|uuid>` to disambiguate a
