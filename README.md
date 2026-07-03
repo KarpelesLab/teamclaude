@@ -14,7 +14,7 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 ## Features
 
 - **Automatic account rotation** — switches to the next account when session (5h) or weekly (7d) quota reaches the configured threshold (default 98%)
-- **Model-aware routing** — the per-model weekly cap (e.g. Fable) is tracked separately, so an account whose Fable quota is spent is skipped **only** for Fable requests and still serves Opus/Sonnet. Requests are routed by their `model` (read exactly from the request body, including through the MITM relay)
+- **Model-aware routing** — the per-model weekly cap (e.g. Fable) is tracked separately, so an account whose Fable quota is spent is skipped **only** for Fable requests and still serves Opus/Sonnet. Requests are routed by their `model` (read exactly from the request body, in both base-URL and MITM modes)
 - **Auto-retry on 429** — waits the `retry-after` duration and retries the same account; a quota rejection (a spent weekly bucket) switches accounts immediately instead of waiting, and switches to the next on persistent errors
 - **Interactive TUI** — real-time dashboard with color-coded quota bars, reset countdowns, activity log, and keyboard controls; a settings screen (`g`) edits the rotation threshold, quota-probe interval, and sx.org proxy live
 - **OAuth token management** — automatically refreshes tokens nearing expiry and persists them to config; client token refreshes pass through untouched
@@ -290,13 +290,15 @@ To opt out and route via `ANTHROPIC_BASE_URL` only, pass `--no-mitm`:
 teamclaude run --no-mitm -- <claude args...>
 ```
 
-That launches claude pointed at teamclaude as an **HTTPS forward proxy** (`HTTPS_PROXY`) and trusts a locally-generated CA (`NODE_EXTRA_CA_CERTS`). For an intercepted host, teamclaude **dials the real upstream first, mirrors its negotiated ALPN** (HTTP/2 or HTTP/1.1), then terminates TLS toward claude with the same protocol and relays the traffic **as transparently as possible** — rewriting only what it must:
+That launches claude pointed at teamclaude as an **HTTPS forward proxy** (`HTTPS_PROXY`) and trusts a locally-generated CA (`NODE_EXTRA_CA_CERTS`). For an intercepted host, teamclaude **terminates** the tunnel with a real HTTP/2 server (HTTP/1.1 clients are handled too) presenting its local leaf, then **forwards each request with a buffering, retrying client** — the same path the base URL mode uses. On each request it:
 
-- the **`authorization`** header → the active account's real token (dropping any client `x-api-key`);
-- the **`account_uuid`** inside `metadata.user_id` → the active account's UUID (so the body agrees with the injected token);
-- and it reads `anthropic-ratelimit-*` from responses for quota.
+- injects the active account's real token as **`authorization`** (dropping any client `x-api-key`);
+- rewrites the **`account_uuid`** inside `metadata.user_id` to the active account's UUID (so the body agrees with the injected token);
+- routes by the request's **`model`** (a Fable-exhausted account is skipped for Fable but still serves other models);
+- reads `anthropic-ratelimit-*` from responses for quota; and
+- **resends the request on a different account** if one returns a quota `429`, so a "you've reached your limit" is never surfaced while another account has headroom.
 
-Everything else is copied byte-for-byte (HTTP/2 is handled with a built-in HPACK codec so the only header changed is the auth one). Any host other than the upstream is blind-tunnelled. The server accepts *both* base-URL and proxy clients at once, so instances launched with and without `--no-mitm` can share one server.
+Because the request is buffered, the retry is transparent to claude. Remote Control (`/v1/code/*`) and client token refreshes (`/v1/oauth/token`) are passed through with the client's own credential. Any host other than the upstream is blind-tunnelled. The server accepts *both* base-URL and proxy clients at once, so instances launched with and without `--no-mitm` can share one server.
 
 Trust model:
 - The CA is generated locally, stored in the config dir, and trusted **only** by the claude process you launch via `teamclaude run` (through `NODE_EXTRA_CA_CERTS`) — it is **never** added to your system trust store. The leaf private key is `0600`; the CA private key is never written to disk.

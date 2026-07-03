@@ -9,16 +9,23 @@ import { BodyWriter } from './request-log.js';
 import { upstreamFetch } from './upstream-fetch.js';
 
 
-const HOP_BY_HOP_HEADERS = new Set([
+export const HOP_BY_HOP_HEADERS = new Set([
   'host', 'connection', 'keep-alive', 'transfer-encoding',
   'te', 'trailer', 'upgrade', 'proxy-authorization', 'proxy-authenticate',
+]);
+
+// Response header names that are connection-specific and thus illegal on an
+// HTTP/2 response (Node's Http2ServerResponse.writeHead rejects them). Also
+// hop-by-hop on h1, so stripping them is correct on both paths.
+const CONNECTION_SPECIFIC_HEADERS = new Set([
+  'connection', 'keep-alive', 'transfer-encoding', 'upgrade',
+  'proxy-connection', 'te', 'trailer',
 ]);
 
 export function createProxyServer(accountManager, config, hooks = {}, sx = null) {
   const upstream = config.upstream || 'https://api.anthropic.com';
   const proxyApiKey = config.proxy?.apiKey;
   const logDir = config.logDir || null;
-  let requestCounter = 0;
 
   if (logDir) {
     mkdir(logDir, { recursive: true }).catch(() => {});
@@ -66,49 +73,13 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
         return;
       }
 
-      // Let client token refresh requests pass through to upstream untouched.
-      // The proxy manages its own tokens via ensureTokenFresh(); intercepting
-      // or rewriting client refreshes would cause token rotation conflicts.
-      if (req.method === 'POST' && req.url === '/v1/oauth/token') {
-        await relayRaw(req, res, upstream, sx);
-        return;
-      }
-
-      // Track request
-      const reqId = ++requestCounter;
-      hooks.onRequestStart?.(reqId, { method: req.method, path: req.url });
-
-      // Buffer request body (needed for retry on 429)
-      const bodyChunks = [];
-      for await (const chunk of req) {
-        bodyChunks.push(chunk);
-      }
-      const body = Buffer.concat(bodyChunks);
-
-      const ctx = { account: null, status: null, tried: new Set(), model: parseRequestModel(body) };
-      try {
-        await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir, sx);
-      } catch (err) {
-        ctx.status = ctx.status || 502;
-        console.error('[TeamClaude] Unhandled error:', err);
-        if (!res.headersSent) {
-          res.writeHead(502, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({
-            type: 'error',
-            error: { type: 'proxy_error', message: 'Internal proxy error' },
-          }));
-        }
-      } finally {
-        hooks.onRequestEnd?.(reqId, {
-          method: req.method, path: req.url,
-          account: ctx.account, status: ctx.status,
-        });
-      }
+      return forward(req, res);
     } catch (err) {
       console.error('[TeamClaude] Unhandled error:', err);
     }
   };
 
+  const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx });
   const server = http.createServer(requestHandler);
 
   // Forward-proxy support (always on, so multiple claude instances can use
@@ -126,6 +97,94 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
   server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks, log: console.error, sx }));
 
   return server;
+}
+
+/**
+ * Build the core proxy request listener — buffer the body, then forward with
+ * account selection + retry (forwardRequest). Shared by the base HTTP server and
+ * the MITM's terminating h2/h1 server, so both get identical buffering, model-
+ * aware routing, and retry-on-quota behavior. Control endpoints (status/reload)
+ * and the proxy-API-key gate live in the base server's wrapper, not here.
+ */
+export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null }) {
+  let counter = 0;
+  return async (req, res) => {
+    try {
+      // Client token refresh: pass through untouched (the proxy manages its own
+      // tokens via ensureTokenFresh; rewriting client refreshes would conflict).
+      if (req.method === 'POST' && req.url === '/v1/oauth/token') { await relayRaw(req, res, upstream, sx); return; }
+      // Remote Control (/v1/code/*) is bound to the session's paired claude.ai
+      // identity — forward with the client's OWN credential (streamed), never a
+      // rotated account token, which would 403 the worker event stream.
+      if ((req.url || '').startsWith('/v1/code/')) { await relayStream(req, res, upstream, sx); return; }
+
+      const reqId = ++counter;
+      hooks.onRequestStart?.(reqId, { method: req.method, path: req.url });
+
+      // Buffer request body (needed to resend on a different account after a 429).
+      const bodyChunks = [];
+      for await (const chunk of req) bodyChunks.push(chunk);
+      const body = Buffer.concat(bodyChunks);
+
+      const ctx = { account: null, status: null, tried: new Set(), model: parseRequestModel(body) };
+      try {
+        await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir, sx);
+      } catch (err) {
+        ctx.status = ctx.status || 502;
+        console.error('[TeamClaude] Unhandled error:', err);
+        if (!res.headersSent) {
+          res.writeHead(502, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Internal proxy error' } }));
+        }
+      } finally {
+        hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: ctx.account, status: ctx.status });
+      }
+    } catch (err) {
+      console.error('[TeamClaude] Unhandled error:', err);
+    }
+  };
+}
+
+/**
+ * Stream a request through to upstream with the client's OWN headers intact
+ * (including its authorization) and stream the response back — used for Remote
+ * Control (/v1/code/*), whose event stream must keep the paired credential and
+ * cannot be buffered.
+ */
+async function relayStream(req, res, upstream, sx) {
+  const bodyChunks = [];
+  for await (const chunk of req) bodyChunks.push(chunk);
+  const body = Buffer.concat(bodyChunks);
+
+  const headers = {};
+  for (const [key, value] of Object.entries(req.headers)) {
+    const lk = key.toLowerCase();
+    if (lk.startsWith(':') || HOP_BY_HOP_HEADERS.has(lk) || lk === 'accept-encoding') continue;
+    headers[key] = value;
+  }
+
+  try {
+    const upstreamRes = await upstreamFetch(`${upstream}${req.url}`, {
+      method: req.method, headers,
+      body: ['GET', 'HEAD'].includes(req.method) ? undefined : (body.length ? body : undefined),
+      redirect: 'manual',
+    }, sx, sx?.useByDefault());
+
+    const responseHeaders = {};
+    for (const [key, value] of upstreamRes.headers.entries()) {
+      if (CONNECTION_SPECIFIC_HEADERS.has(key) || key === 'content-encoding' || key === 'content-length') continue;
+      responseHeaders[key] = value;
+    }
+    res.writeHead(upstreamRes.status, responseHeaders);
+    if (upstreamRes.body) { for await (const chunk of upstreamRes.body) res.write(chunk); }
+    res.end();
+  } catch (err) {
+    console.error('[TeamClaude] Remote Control relay error:', err.message);
+    if (!res.headersSent) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Upstream unreachable' } }));
+    }
+  }
 }
 
 /**
@@ -202,7 +261,7 @@ function formatHeaders(headers) {
   return Object.entries(headers).map(([k, v]) => `  ${k}: ${v}`).join('\n');
 }
 
-async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, useSx) {
+export async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, useSx) {
   const maxRetries = accountManager.accounts.length;
   // Whether THIS attempt dials via sx.org. Undefined on the first call → derive
   // from the default policy ('always' routes; 'off'/'429' start direct).
@@ -247,6 +306,9 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   const headers = {};
   for (const [key, value] of Object.entries(req.headers)) {
     const lk = key.toLowerCase();
+    // HTTP/2 pseudo-headers (:method, :path, :authority, :scheme) live in
+    // req.headers on the h2 server path; fetch rejects `:`-prefixed names.
+    if (lk.startsWith(':')) continue;
     if (HOP_BY_HOP_HEADERS.has(lk)) continue;
     if (lk === 'x-api-key') continue;
     // Strip accept-encoding: Node fetch auto-decompresses, which would
@@ -377,10 +439,12 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 
     ctx.status = upstreamRes.status;
 
-    // Build response headers (skip hop-by-hop and encoding headers)
+    // Build response headers (skip hop-by-hop and encoding headers). The
+    // connection-specific names are also illegal on an HTTP/2 response — when
+    // this runs behind the MITM's h2 server, writeHead would otherwise throw.
     const responseHeaders = {};
     for (const [key, value] of upstreamRes.headers.entries()) {
-      if (key === 'transfer-encoding' || key === 'connection') continue;
+      if (CONNECTION_SPECIFIC_HEADERS.has(key)) continue;
       // Strip content-encoding/content-length since fetch may auto-decompress
       if (key === 'content-encoding' || key === 'content-length') continue;
       responseHeaders[key] = value;
