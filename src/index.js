@@ -544,11 +544,12 @@ async function statusCommand() {
       console.log(`  ${acct.name} (${acct.type})${current}`);
       console.log(`    Status:   ${acct.status}${acct.disabled ? ' (disabled)' : ''}`);
 
-      if (q.unified5h != null || q.unified7d != null || q.unified7dSonnet != null) {
+      if (q.unified5h != null || q.unified7d != null || q.unified7dSonnet != null || q.unified7dFable != null) {
         const ses = q.unified5h != null ? (q.unified5h * 100).toFixed(1) + '%' : '-';
         const wk = q.unified7d != null ? (q.unified7d * 100).toFixed(1) + '%' : '-';
         let line = `    Session:  ${ses} used    Weekly: ${wk} used`;
         if (q.unified7dSonnet != null) line += `    Sonnet7d: ${(q.unified7dSonnet * 100).toFixed(1)}% used`;
+        if (q.unified7dFable != null) line += `    Fable7d: ${(q.unified7dFable * 100).toFixed(1)}% used`;
         console.log(line);
       } else {
         const tok = q.tokensLimit ? ((1 - q.tokensRemaining / q.tokensLimit) * 100).toFixed(1) + '%' : '-';

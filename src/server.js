@@ -4,6 +4,7 @@ import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { ensureCerts, createConnectHandler } from './mitm.js';
 import { patchAccountUuid } from './account-uuid-rewrite.js';
+import { parseRequestModel } from './account-manager.js';
 import { BodyWriter } from './request-log.js';
 import { upstreamFetch } from './upstream-fetch.js';
 
@@ -84,7 +85,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
       }
       const body = Buffer.concat(bodyChunks);
 
-      const ctx = { account: null, status: null, tried: new Set() };
+      const ctx = { account: null, status: null, tried: new Set(), model: parseRequestModel(body) };
       try {
         await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir, sx);
       } catch (err) {
@@ -208,7 +209,9 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   const route = useSx === undefined ? !!(sx?.useByDefault()) : useSx;
 
   // Select account, skipping any already tried (and failed) this request.
-  const account = accountManager.getActiveAccount(ctx.tried);
+  // The model scopes availability so a Fable-exhausted account is skipped only
+  // for Fable requests (it still serves other models).
+  const account = accountManager.getActiveAccount(ctx.tried, ctx.model);
   if (!account) {
     ctx.status = 429;
     ctx.account = '(none available)';
@@ -308,9 +311,35 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       // markRateLimited would set rateLimitedUntil in the past.
       let retryAfter = parseInt(upstreamRes.headers.get('retry-after'), 10);
       if (Number.isNaN(retryAfter)) retryAfter = 60;
-      retryAfter = Math.min(Math.max(retryAfter, 1), 300);
       // Discard the 429 response body
       await upstreamRes.body?.cancel();
+
+      // Durable quota exhaustion vs. a transient rate limit. A "rejected" unified
+      // status means a quota bucket is spent, so waiting and retrying the SAME
+      // account is futile — switch to another account now (updateQuota above
+      // already recorded the spent bucket's utilization from the headers).
+      const rl = rateLimitHeaders;
+      const generalRejected = rl['anthropic-ratelimit-unified-5h-status'] === 'rejected'
+        || rl['anthropic-ratelimit-unified-7d-status'] === 'rejected';
+      const fableRejected = rl['anthropic-ratelimit-unified-7d_oi-status'] === 'rejected' && !generalRejected;
+      if ((generalRejected || fableRejected) && retryCount < maxRetries) {
+        // A Fable-only rejection leaves the account fine for other models, so we
+        // do NOT throttle it globally — the recorded Fable utilization makes
+        // selection skip it for Fable requests only. A general rejection spends a
+        // shared bucket, so hold the whole account for its reset window.
+        if (fableRejected) {
+          console.log(`[TeamClaude] Fable weekly exhausted on "${account.name}" — switching account for this Fable request`);
+        } else {
+          const hold = Math.min(Math.max(retryAfter, 1), 3600);
+          console.log(`[TeamClaude] Quota rejection (429) on "${account.name}" — throttling ${hold}s and switching account`);
+          accountManager.markRateLimited(account.index, hold);
+        }
+        ctx.tried.add(account.index);
+        if (res.destroyed) return;
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+      }
+
+      retryAfter = Math.min(Math.max(retryAfter, 1), 300);
 
       // sx.org failover: 429s are IP-based, so retry via the proxy's egress IP.
       // 'always' is already on sx; '429' switches direct→sx now and skips the

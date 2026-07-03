@@ -159,6 +159,20 @@ export async function fetchProfile(accessToken) {
   }
 }
 
+// Pull a per-model weekly limit out of the payload's `limits[]` array, which is
+// where the endpoint now reports model-scoped quota (a `weekly_scoped` entry
+// carrying `scope.model.display_name`). Returns a bucket-shaped object
+// { utilization, resets_at } ready for normalizeUsageBucket, or null if absent.
+// The legacy top-level `seven_day_<model>` keys read null on current plans.
+export function findScopedWeeklyLimit(data, modelNamePattern) {
+  const limits = Array.isArray(data?.limits) ? data.limits : [];
+  const entry = limits.find((l) =>
+    l && l.group === 'weekly' && l.scope?.model?.display_name
+    && modelNamePattern.test(l.scope.model.display_name));
+  if (!entry) return null;
+  return { utilization: entry.percent, resets_at: entry.resets_at };
+}
+
 // Normalize one usage bucket from the /api/oauth/usage payload into
 // { utilization: 0-1, resetAt: ms-epoch }. The endpoint reports utilization
 // as a percentage in the 0-100 range, so 1 means 1%, not 100%.
@@ -191,7 +205,7 @@ export function normalizeUsageBucket(bucket) {
 /**
  * Fetch OAuth subscription usage from the usage endpoint. This reports quota
  * utilization WITHOUT spending message quota, which is what makes it safe to
- * poll. Returns normalized { fiveHour, sevenDay, sevenDaySonnet } buckets, or
+ * poll. Returns normalized { fiveHour, sevenDay, sevenDaySonnet, sevenDayFable } buckets, or
  * { error, status } on failure.
  */
 export async function fetchUsage(accessToken) {
@@ -220,6 +234,7 @@ export async function fetchUsage(accessToken) {
       fiveHour: normalizeUsageBucket(data?.five_hour),
       sevenDay: normalizeUsageBucket(data?.seven_day),
       sevenDaySonnet: normalizeUsageBucket(data?.seven_day_sonnet),
+      sevenDayFable: normalizeUsageBucket(findScopedWeeklyLimit(data, /fable/i)),
     };
   } catch (err) {
     return { error: err.message || String(err), status: null };

@@ -735,7 +735,7 @@ export class TUI {
     const q = a.quota;
     let r1 = null, r2 = null, l1 = 'Ses', l2 = 'Wk ', t1 = null, t2 = null;
 
-    if (q.unified5h != null || q.unified7d != null || q.unified7dSonnet != null) {
+    if (q.unified5h != null || q.unified7d != null || q.unified7dSonnet != null || q.unified7dFable != null) {
       r1 = q.unified5h;
       r2 = q.unified7d;
       t1 = q.unified5hReset;
@@ -757,6 +757,10 @@ export class TUI {
       // Sonnet weekly bar — only shown when the usage probe has populated it.
       if (q.unified7dSonnet != null) {
         line += `  S7  ${bar(q.unified7dSonnet, bw, q.unified7dSonnetReset)}`;
+      }
+      // Fable weekly bar — only shown when the usage probe has populated it.
+      if (q.unified7dFable != null) {
+        line += `  F7  ${bar(q.unified7dFable, bw, q.unified7dFableReset)}`;
       }
     }
     return line;

@@ -91,6 +91,70 @@ test('h2 relay rewrites only authorization, drops x-api-key, observes response',
   }
 });
 
+test('h2 relay peeks the top-level model before binding (model-aware)', T, async () => {
+  // Upstream echoes the body it received and the account header the relay injected.
+  const upstream = http2.createServer();
+  const sessions = [];
+  upstream.on('session', (s) => sessions.push(s));
+  upstream.on('stream', (s, h) => {
+    let got = '';
+    s.setEncoding('utf8');
+    s.on('data', (d) => { got += d; });
+    s.on('end', () => {
+      s.respond({ ':status': 200, 'x-saw-account': h.authorization || 'none' });
+      s.end(got); // echo body back so we can assert it relayed intact
+    });
+  });
+  const upPort = await listen(upstream);
+
+  const conns = [];
+  let sawModel = 'UNSET';
+  const front = net.createServer((clientSock) => {
+    conns.push(clientSock);
+    const upSock = net.connect(upPort, '127.0.0.1', () => {
+      h2Relay(clientSock, upSock, {
+        peekModel: true,
+        // The relay passes the peeked model as the 3rd arg; route on it.
+        rewriteRequest: (fields, _id, model) => {
+          sawModel = model;
+          const account = model === 'claude-fable-5' ? 'Bearer FABLE-ACCT' : 'Bearer OTHER-ACCT';
+          return fields.map(f => f.name.toString().toLowerCase() === 'authorization'
+            ? { name: Buffer.from('authorization'), value: Buffer.from(account), sensitive: true }
+            : f);
+        },
+        makeBodyPatcher: () => null, // no account_uuid patch in this test
+        onResponseHeaders: () => {},
+      });
+    });
+    conns.push(upSock);
+  });
+  const frontPort = await listen(front);
+
+  // Body carries a decoy "model" inside message content; the real one is top-level.
+  const reqBody = JSON.stringify({
+    messages: [{ role: 'user', content: 'pasted: {"model":"DECOY"}' }],
+    model: 'claude-fable-5',
+    max_tokens: 1,
+  });
+
+  const client = http2.connect(`http://127.0.0.1:${frontPort}`);
+  try {
+    const req = client.request({ ':method': 'POST', ':path': '/v1/messages', authorization: 'Bearer FAKE' });
+    let respHeaders, body = '';
+    req.on('response', (h) => { respHeaders = h; });
+    req.setEncoding('utf8');
+    req.on('data', (d) => { body += d; });
+    req.end(reqBody);
+    await once(req, 'close');
+
+    assert.equal(sawModel, 'claude-fable-5');                 // top-level, not the decoy
+    assert.equal(respHeaders['x-saw-account'], 'Bearer FABLE-ACCT'); // routed on the peeked model
+    assert.equal(body, reqBody);                              // body relayed byte-for-byte
+  } finally {
+    teardown({ client, conns, sessions, servers: [front, upstream] });
+  }
+});
+
 test('h2 relay streams a larger body intact (backpressure path)', T, async () => {
   const upstream = http2.createServer();
   const sessions = [];

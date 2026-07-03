@@ -209,14 +209,15 @@ async function intercept({ host, port, mode, clientSocket, head, accountManager,
   // agree on one account even while different requests on this tunnel use
   // different accounts.
   const reqAccounts = new Map(); // id -> account
-  const pickFor = async (id) => {
+  const pickFor = async (id, model = null) => {
     // getActiveAccountFresh blocks to refresh only if the chosen account's token
     // has ALREADY expired (e.g. we just rotated onto an account that sat idle
-    // past its token lifetime) — so we never inject a dead token. Never leave a
-    // mid-tunnel request unauthenticated: if every account is over quota right
-    // now, fall back to the tunnel's initial account (its response 429 will then
-    // throttle it and the next request rolls on).
-    const account = (await accountManager.getActiveAccountFresh()) || initial;
+    // past its token lifetime) — so we never inject a dead token. `model` scopes
+    // the pick: a Fable-exhausted account is skipped for Fable but still serves
+    // other models. Never leave a mid-tunnel request unauthenticated: if every
+    // account is over quota right now, fall back to the tunnel's initial account
+    // (its response 429 will then throttle it and the next request rolls on).
+    const account = (await accountManager.getActiveAccountFresh(null, model)) || initial;
     reqAccounts.set(id, account);
     // Opportunistic (non-blocking) refresh for the expiring-soon case: the
     // current credential is still valid, so this request goes out immediately and
@@ -243,8 +244,10 @@ async function intercept({ host, port, mode, clientSocket, head, accountManager,
   if (alpn === 'h2') {
     h2Relay(claudeTls, upstreamSock, {
       // Async: pickFor may block to refresh an expired token before we inject it.
-      // The relay awaits the returned promise before forwarding the request.
-      rewriteRequest: async (fields, id) => makeRewriteRequest(await pickFor(id))(fields),
+      // The relay peeks the body's `model`, passes it here, and awaits the pick
+      // before forwarding — so a Fable-exhausted account is skipped for Fable.
+      rewriteRequest: async (fields, id, model) => makeRewriteRequest(await pickFor(id, model))(fields),
+      peekModel: true,
       makeBodyPatcher,
       onResponseHeaders: observer,
       onStreamClose: forget,
@@ -253,13 +256,14 @@ async function intercept({ host, port, mode, clientSocket, head, accountManager,
     });
   } else {
     h1Relay(claudeTls, upstreamSock, {
-      rewriteHead: async (h, id) => {
-        const account = await pickFor(id);
+      rewriteHead: async (h, id, model) => {
+        const account = await pickFor(id, model);
         const auth = account.type === 'oauth'
           ? { authorization: `Bearer ${account.credential}` }
           : { apiKey: account.credential };
         return rewriteH1Auth(h, auth);
       },
+      peekModel: true,
       makeBodyPatcher,
       onResponseHeaders: observer,
       onStreamClose: forget,
@@ -410,13 +414,24 @@ function makeQuotaObserver(accountManager, accountFor, sx = null) {
     if (m[':status'] === '429') {
       let ra = parseInt(m['retry-after'], 10);
       if (Number.isNaN(ra)) ra = 60;
-      ra = Math.min(Math.max(ra, 1), 300);
-      accountManager.markRateLimited(account.index, ra);
-      // The very next request on this same tunnel will now pick a different
-      // account (this one is throttled) — no teardown needed.
-      // Arm sx.org sticky routing so the next MITM tunnel uses the proxy (in
-      // '429' mode); no-op in 'off'/'always'.
-      sx?.noteRateLimited(ra);
+      // A Fable-only rejection (the `7d_oi` weekly bucket is spent while 5h/7d are
+      // fine) must NOT throttle the whole account — it still serves other models.
+      // updateQuota above recorded the spent Fable bucket, so model-aware selection
+      // skips it for Fable requests only. A general rejection spends a shared
+      // bucket, so hold the account for its real reset window (clamped) instead of
+      // the short transient clamp, otherwise it gets re-picked and 429s again.
+      const generalRejected = m['anthropic-ratelimit-unified-5h-status'] === 'rejected'
+        || m['anthropic-ratelimit-unified-7d-status'] === 'rejected';
+      const fableOnly = m['anthropic-ratelimit-unified-7d_oi-status'] === 'rejected' && !generalRejected;
+      if (!fableOnly) {
+        ra = generalRejected ? Math.min(Math.max(ra, 1), 3600) : Math.min(Math.max(ra, 1), 300);
+        accountManager.markRateLimited(account.index, ra);
+        // The very next request on this same tunnel will now pick a different
+        // account (this one is throttled) — no teardown needed. Arm sx.org sticky
+        // routing so the next MITM tunnel uses the proxy (in '429' mode); no-op in
+        // 'off'/'always'. A Fable-only rejection is quota, not IP-based, so skip it.
+        sx?.noteRateLimited(ra);
+      }
     }
   };
 }

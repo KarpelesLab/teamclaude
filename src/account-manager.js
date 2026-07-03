@@ -1,12 +1,16 @@
 import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired } from './oauth.js';
 import { sameIdentity } from './identity.js';
+import { isFableModel } from './model.js';
+
+// Re-exported for callers that already import model helpers from here.
+export { isFableModel, parseRequestModel } from './model.js';
 
 // Quota fields that survive a restart: utilization levels and their reset
 // windows, learned passively from upstream responses. Transient/derived state
 // (probing, requalify, rateLimitedUntil) is intentionally excluded.
 const PERSISTED_QUOTA_FIELDS = [
-  'unified5h', 'unified7d', 'unified7dSonnet',
-  'unified5hReset', 'unified7dReset', 'unified7dSonnetReset', 'unifiedStatus',
+  'unified5h', 'unified7d', 'unified7dSonnet', 'unified7dFable',
+  'unified5hReset', 'unified7dReset', 'unified7dSonnetReset', 'unified7dFableReset', 'unifiedStatus',
   'tokensLimit', 'tokensRemaining', 'requestsLimit', 'requestsRemaining', 'resetsAt',
 ];
 
@@ -21,9 +25,11 @@ function emptyQuota() {
     unified5h: null,            // utilization 0-1
     unified7d: null,            // utilization 0-1
     unified7dSonnet: null,      // utilization 0-1 (Sonnet-specific weekly bucket)
+    unified7dFable: null,       // utilization 0-1 (Fable-specific weekly bucket)
     unified5hReset: null,       // ms timestamp
     unified7dReset: null,       // ms timestamp
     unified7dSonnetReset: null, // ms timestamp
+    unified7dFableReset: null,  // ms timestamp
     unifiedStatus: null,        // allowed | allowed_warning | rejected
     resetsAt: null,
   };
@@ -73,12 +79,15 @@ export class AccountManager {
    * Get the best available account, rotating if the current one is near quota.
    * Returns null if all accounts are exhausted.
    */
-  getActiveAccount(exclude = null) {
+  getActiveAccount(exclude = null, model = null) {
     // Clear expired quotas across all accounts and switch proactively if a
     // session reset made a sooner-expiring account the better choice. This runs
     // on every request so the behaviour holds without the TUI render loop.
     this.refreshExpiredQuotas();
     const current = this.accounts[this.currentIndex];
+    // `model` scopes availability: an account whose Fable weekly bucket is spent
+    // is still fully usable for other models, so it is only excluded when THIS
+    // request targets Fable (see _isAvailable).
     // `exclude` is a per-request set of indices already tried this request (e.g.
     // an account that just threw a transport error). It is never a persistent
     // status change — the account stays healthy for the next request.
@@ -86,26 +95,26 @@ export class AccountManager {
     // account is best now that its limit is known.
     if (current && current.requalify) {
       current.requalify = false;
-      const next = this._selectNext(exclude);
+      const next = this._selectNext(exclude, model);
       if (next) return next;
     }
-    if (this._isAvailable(current) && !exclude?.has(current.index)) {
+    if (this._isAvailable(current, model) && !exclude?.has(current.index)) {
       // A strictly higher-priority (lower value) available account preempts a
       // healthy current one. Within the same priority tier we stay put, so the
       // common case (all accounts at the default priority 0) is unchanged and
       // never thrashes — preemption only triggers when priorities differ.
       const betterExists = this.accounts.some(a =>
-        this._isAvailable(a) && !exclude?.has(a.index) && (a.priority || 0) < (current.priority || 0));
-      return betterExists ? this._selectNext(exclude) : current;
+        this._isAvailable(a, model) && !exclude?.has(a.index) && (a.priority || 0) < (current.priority || 0));
+      return betterExists ? this._selectNext(exclude, model) : current;
     }
-    const next = this._selectNext(exclude);
+    const next = this._selectNext(exclude, model);
     if (next) return next;
     // No account is under the switch threshold. Before refusing locally, allow a
     // throttled probe so a stale/poisoned cached quota can't pin us in a
     // permanent "all exhausted" state — the probe's real response refreshes the
     // quota (or upstream's own 429 converts soft exhaustion into a hard
     // rate-limit hold). null here means the caller emits the synthetic 429.
-    return this._selectProbe(exclude);
+    return this._selectProbe(exclude, model);
   }
 
   /**
@@ -115,8 +124,8 @@ export class AccountManager {
    * 401. A token that is merely expiring soon (still valid) is left to the
    * caller's opportunistic background refresh; only a hard-expired one blocks.
    */
-  async getActiveAccountFresh(exclude = null) {
-    const account = this.getActiveAccount(exclude);
+  async getActiveAccountFresh(exclude = null, model = null) {
+    const account = this.getActiveAccount(exclude, model);
     if (account && account.type === 'oauth' && account.refreshToken
         && isTokenExpired(account.expiresAt)) {
       await this.ensureTokenFresh(account.index); // coalesces with any in-flight refresh
@@ -160,7 +169,7 @@ export class AccountManager {
    * The chosen account is the least-utilized probeable one (most likely to have
    * stale headroom), so the refreshed quota corrects the cache fastest.
    */
-  _selectProbe(exclude = null) {
+  _selectProbe(exclude = null, model = null) {
     const now = Date.now();
     if (now < this._nextProbeAt) return null;
 
@@ -170,6 +179,10 @@ export class AccountManager {
     for (const account of this.accounts) {
       if (exclude?.has(account.index)) continue;
       if (!this._isProbeable(account)) continue;
+      // A Fable-exhausted account can't serve a Fable request even as a probe —
+      // it would just 429 again — so skip it for Fable and let the caller emit
+      // the synthetic 429 when no other account is available.
+      if (isFableModel(model) && this._fableExhausted(account)) continue;
       const priority = account.priority || 0;
       const usage = this._maxUtilization(account);
       if (priority < bestPriority ||
@@ -187,7 +200,7 @@ export class AccountManager {
     return best;
   }
 
-  _isAvailable(account) {
+  _isAvailable(account, model = null) {
     if (!account) return false;
 
     // Manually disabled accounts are skipped entirely until re-enabled.
@@ -204,7 +217,19 @@ export class AccountManager {
     if (account.status === 'exhausted' || account.status === 'error') return false;
     if (this._isNearQuota(account)) return false;
 
+    // Model-scoped exhaustion: a spent Fable weekly bucket only bars Fable
+    // requests. Non-Fable requests still route here normally.
+    if (isFableModel(model) && this._fableExhausted(account)) return false;
+
     return true;
+  }
+
+  /** True when this account's Fable weekly bucket is at/over the switch
+   * threshold. The reset is cleared by refreshExpiredQuotas before selection, so
+   * a non-null value here is still live. Model-scoped: only gates Fable requests. */
+  _fableExhausted(account) {
+    const q = account.quota;
+    return q.unified7dFable != null && q.unified7dFable >= this.switchThreshold;
   }
 
   /**
@@ -238,6 +263,11 @@ export class AccountManager {
     if (q.unified7dSonnet != null && q.unified7dSonnetReset && now >= q.unified7dSonnetReset) {
       q.unified7dSonnet = null;
       q.unified7dSonnetReset = null;
+      changed = true;
+    }
+    if (q.unified7dFable != null && q.unified7dFableReset && now >= q.unified7dFableReset) {
+      q.unified7dFable = null;
+      q.unified7dFableReset = null;
       changed = true;
     }
 
@@ -341,7 +371,7 @@ export class AccountManager {
    * With all priorities at the default 0, this reduces to the weekly-reset
    * heuristic. Returns the account or null if none are available.
    */
-  _pickBestAvailable(exclude = null) {
+  _pickBestAvailable(exclude = null, model = null) {
     let best = null;
     let bestPriority = Infinity;
     let bestReset = Infinity;
@@ -352,7 +382,7 @@ export class AccountManager {
       // _isAvailable filters out accounts at/above the switch threshold, so the
       // soonest-expiring pick only ever lands on an account whose 5-hour quota
       // is still below 98%.
-      if (!this._isAvailable(account)) continue;
+      if (!this._isAvailable(account, model)) continue;
 
       const priority = account.priority || 0;
       // Unknown weekly reset sorts first so we fill it in.
@@ -387,8 +417,8 @@ export class AccountManager {
     return best;
   }
 
-  _selectNext(exclude = null) {
-    const best = this._pickBestAvailable(exclude);
+  _selectNext(exclude = null, model = null) {
+    const best = this._pickBestAvailable(exclude, model);
     if (best) {
       const switched = best.index !== this.currentIndex;
       this.currentIndex = best.index;
@@ -446,6 +476,15 @@ export class AccountManager {
     const r7d = headers['anthropic-ratelimit-unified-7d-reset'];
     if (r5h) account.quota.unified5hReset = parseInt(r5h, 10) * 1000;
     if (r7d) account.quota.unified7dReset = parseInt(r7d, 10) * 1000;
+
+    // Model-scoped weekly bucket — surfaced in headers as `7d_oi` ("7-day,
+    // overage included"). On current subscription plans this is the Fable weekly
+    // limit (it correlates with the usage endpoint's Fable-scoped weekly bucket).
+    // Utilization here is already a 0-1 fraction (can exceed 1 when in overage).
+    const u7dOi = parseFloat(headers['anthropic-ratelimit-unified-7d_oi-utilization']);
+    if (!isNaN(u7dOi)) account.quota.unified7dFable = u7dOi;
+    const r7dOi = headers['anthropic-ratelimit-unified-7d_oi-reset'];
+    if (r7dOi) account.quota.unified7dFableReset = parseInt(r7dOi, 10) * 1000;
 
     // We switched to this account to discover its weekly quota; now that we
     // know it, flag for re-evaluation so selection can pick the best account.
@@ -516,7 +555,7 @@ export class AccountManager {
 
   /**
    * Apply quota learned from the OAuth usage endpoint (the background probe).
-   * Updates utilization/reset for the 5h, 7d, and Sonnet-7d buckets WITHOUT
+   * Updates utilization/reset for the 5h, 7d, Sonnet-7d, and Fable-7d buckets WITHOUT
    * touching usage counters — a probe is not real client traffic.
    */
   applyUsageData(accountIndex, usage) {
@@ -535,6 +574,10 @@ export class AccountManager {
     if (usage.sevenDaySonnet) {
       if (usage.sevenDaySonnet.utilization != null) q.unified7dSonnet = usage.sevenDaySonnet.utilization;
       if (usage.sevenDaySonnet.resetAt != null) q.unified7dSonnetReset = usage.sevenDaySonnet.resetAt;
+    }
+    if (usage.sevenDayFable) {
+      if (usage.sevenDayFable.utilization != null) q.unified7dFable = usage.sevenDayFable.utilization;
+      if (usage.sevenDayFable.resetAt != null) q.unified7dFableReset = usage.sevenDayFable.resetAt;
     }
 
     // If we just learned this account's weekly window while probing, re-evaluate

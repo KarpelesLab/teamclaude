@@ -10,8 +10,13 @@
 
 import { readFrames, buildFrame, buildHeaderBlock, stripHeadersPayload, FRAME, FLAG, PREFACE } from './frames.js';
 import { HpackDecoder, HpackEncoder } from './hpack.js';
+import { TopLevelFieldFinder } from '../model.js';
 
 const SETTINGS_HEADER_TABLE_SIZE = 0x1;
+// How much request body to feed the model finder before binding an account. The
+// model sits near the top of the Messages JSON, so this is only ever a small
+// prefix; if it hasn't resolved within the cap we bind model-blind.
+const MODEL_PEEK_CAP = 65536;
 
 // Wire src→dst with backpressure; `onClose` fires once when either side ends.
 function link(src, dst, onData, onClose) {
@@ -51,6 +56,11 @@ export function h2Relay(claude, upstream, opts = {}) {
   const onStreamClose = opts.onStreamClose || (() => {});
   const makeBodyPatcher = opts.makeBodyPatcher || null; // () => { push(buf)->buf } per stream
   const bodyPatchers = makeBodyPatcher ? new Map() : null; // streamId -> patcher
+  // Model-aware binding: when enabled, a request with a body is held after its
+  // HEADERS until the body's top-level `model` is peeked, so rewriteRequest can
+  // pick the account from it. Off by default → HEADERS forward immediately.
+  const peekModel = !!opts.peekModel;
+  const deferred = peekModel ? new Map() : null; // streamId -> { fields, priority, chunks, finder, bodyLen }
   const tap = opts.tap || null; // optional request-logging tap (per streamId)
   const log = opts.log || (() => {});
 
@@ -132,6 +142,25 @@ export function h2Relay(claude, upstream, opts = {}) {
       if (fr.flags & FLAG.END_HEADERS) return finishReqBlock(); // may be a promise (token refresh)
       return;
     }
+    if (fr.type === FRAME.DATA && deferred) {
+      // While a stream is held for model peeking, buffer its body frames instead
+      // of forwarding them (upstream hasn't seen the HEADERS yet). Feed the finder
+      // until the top-level `model` resolves, END_STREAM arrives, or the peek cap
+      // is hit — then bind the account and flush everything in order.
+      const d = deferred.get(fr.streamId);
+      if (d) {
+        const payload = Buffer.from(fr.payload);
+        d.chunks.push({ flags: fr.flags, payload });
+        const model = d.bodyLen < MODEL_PEEK_CAP ? d.finder.push(payload) : d.finder.value;
+        d.bodyLen += payload.length;
+        const end = !!(fr.flags & FLAG.END_STREAM);
+        if (d.finder.done || end || d.bodyLen >= MODEL_PEEK_CAP) {
+          deferred.delete(fr.streamId);
+          return forwardReq(fr.streamId, d.fields, d.priority, false, d.chunks, model);
+        }
+        return; // keep buffering
+      }
+    }
     if (fr.type === FRAME.DATA && (bodyPatchers || tap)) {
       // Same-length in-place body patch (account_uuid) via a per-stream streaming
       // JSON state machine; re-emit the DATA frame unchanged in length/flags so
@@ -147,7 +176,12 @@ export function h2Relay(claude, upstream, opts = {}) {
       if (fr.flags & FLAG.END_STREAM && bodyPatchers) bodyPatchers.delete(fr.streamId);
       return;
     }
-    if (fr.type === FRAME.RST_STREAM) { closeStream(fr.streamId); }
+    if (fr.type === FRAME.RST_STREAM) {
+      // A held (not-yet-forwarded) stream: drop it without relaying the RST —
+      // upstream never saw its HEADERS, so a RST would reference an unknown stream.
+      if (deferred?.delete(fr.streamId)) { closeStream(fr.streamId); return; }
+      closeStream(fr.streamId);
+    }
     if (fr.type === FRAME.SETTINGS && fr.streamId === 0 && !(fr.flags & 0x1)) {
       applyTableSizeSetting(fr.payload, respDec); // claude's setting governs response encoding
     }
@@ -158,18 +192,39 @@ export function h2Relay(claude, upstream, opts = {}) {
     const { streamId, frags, priority, endStream } = asm;
     asm = null;
     const fields = reqDec.decode(Buffer.concat(frags)); // keep decoder dynamic table in sync
-    // Encode/forward once we have the (possibly async-rewritten) header list. The
-    // pump awaits this before the next frame, so decode & encode stay in wire
-    // order and the HPACK tables never desync even when a refresh suspends us.
-    const proceed = (rewritten) => {
-      if (tap) tap.req(streamId, rewritten);
-      openStreams.add(streamId);
-      const newBlock = reqEnc.encode(rewritten);
-      writeBackpressured(upstream, buildHeaderBlock(streamId, newBlock, { endStream, priority }), reqCtl);
-    };
-    const rewritten = rewriteRequest(fields, streamId);
-    if (rewritten && typeof rewritten.then === 'function') return rewritten.then(proceed);
-    proceed(rewritten);
+    // Model-aware binding: hold a request that has a body until its `model` is
+    // peeked (see the DATA handler). A bodyless request has no model to read, so
+    // it forwards straight away. The decode above already ran, so the HPACK
+    // decoder table stays in sync even while we defer the encode/forward.
+    if (deferred && !endStream) {
+      deferred.set(streamId, { fields, priority, chunks: [], finder: new TopLevelFieldFinder('model'), bodyLen: 0 });
+      return;
+    }
+    return forwardReq(streamId, fields, priority, endStream, null, null);
+  }
+
+  // Encode + forward a request's HEADERS (choosing the account via rewriteRequest,
+  // now that `model` is known), then flush any buffered body frames through the
+  // account-bound patcher. The pump awaits this so decode & encode stay in wire
+  // order and the HPACK tables never desync even when a token refresh suspends us.
+  async function forwardReq(streamId, fields, priority, endStream, dataChunks, model) {
+    let rewritten = rewriteRequest(fields, streamId, model);
+    if (rewritten && typeof rewritten.then === 'function') rewritten = await rewritten;
+    if (tap) tap.req(streamId, rewritten);
+    openStreams.add(streamId);
+    const newBlock = reqEnc.encode(rewritten);
+    writeBackpressured(upstream, buildHeaderBlock(streamId, newBlock, { endStream, priority }), reqCtl);
+    if (!dataChunks || !dataChunks.length) return;
+    // Bind the body patcher to the chosen account, then replay the buffered body
+    // frames (and, via bodyPatchers, any later DATA frames for this stream).
+    let patcher = NO_PATCH;
+    if (bodyPatchers) { patcher = makeBodyPatcher(streamId) || NO_PATCH; bodyPatchers.set(streamId, patcher); }
+    for (const ch of dataChunks) {
+      const payload = bodyPatchers ? patcher.push(ch.payload) : ch.payload;
+      if (tap) tap.reqData(streamId, payload);
+      writeBackpressured(upstream, buildFrame({ type: FRAME.DATA, flags: ch.flags, streamId, payload }), reqCtl);
+      if ((ch.flags & FLAG.END_STREAM) && bodyPatchers) bodyPatchers.delete(streamId);
+    }
   }
 
   reqCtl = link(claude, upstream, onReqData, destroyBoth);
@@ -311,6 +366,10 @@ export function h1Relay(claude, upstream, opts = {}) {
   const onResponseHeaders = opts.onResponseHeaders || (() => {});
   const onRequestClose = opts.onStreamClose || (() => {});
   const tap = opts.tap || null;
+  // Model-aware binding: hold a content-length request body to peek its top-level
+  // `model` before rewriteHead picks the account. Off by default; chunked and
+  // bodyless requests always bind immediately.
+  const peekModel = !!opts.peekModel;
   const destroyBoth = () => { claude.destroy(); upstream.destroy(); };
   claude.on('error', destroyBoth);
   upstream.on('error', destroyBoth);
@@ -325,6 +384,7 @@ export function h1Relay(claude, upstream, opts = {}) {
   let reqBuf = Buffer.alloc(0);
   let reqPhase = 'head';
   let reqTrack = null, reqPatcher = null, reqId = null;
+  let pend = null; // while peeking a body for `model`: { head, info, track, finder, raw[], len }
 
   // Async ONLY so a request head whose account token expired can await a refresh
   // before it is forwarded (rewriteHead returns a promise in that rare case).
@@ -343,17 +403,51 @@ export function h1Relay(claude, upstream, opts = {}) {
           // Assign the id BEFORE rewriting so the caller can bind this request's
           // account (used again to attribute the response and patch the body).
           reqId = ++nextId;
-          const rew = rewriteHead(reqBuf.subarray(0, idx + 4).toString('latin1'), reqId);
-          const head = (rew && typeof rew.then === 'function') ? await rew : rew;
+          const rawHead = reqBuf.subarray(0, idx + 4).toString('latin1');
           reqBuf = reqBuf.subarray(idx + 4);
-          const info = parseH1Head(head);
+          const info = parseH1Head(rawHead); // framing is unchanged by the auth rewrite
+          const kind = info.chunked ? 'chunked' : (info.contentLength > 0 ? 'length' : 'none');
+          // Defer a content-length body to peek `model` first; bind other requests now.
+          if (peekModel && kind === 'length') {
+            pend = { head: rawHead, info, track: makeBodyTracker('length', info.contentLength), finder: new TopLevelFieldFinder('model'), raw: [], len: 0 };
+            reqPhase = 'peek';
+            continue;
+          }
+          const rew = rewriteHead(rawHead, reqId, null);
+          const head = (rew && typeof rew.then === 'function') ? await rew : rew;
           pending.push({ id: reqId, method: methodOf(info.startLine) });
           if (tap) tap.reqHead(reqId, head);
           upstream.write(Buffer.from(head, 'latin1'));
-          const kind = info.chunked ? 'chunked' : (info.contentLength > 0 ? 'length' : 'none');
           reqPatcher = makeBodyPatcher ? makeBodyPatcher(reqId) : null;
           reqTrack = makeBodyTracker(kind, info.contentLength || 0);
           reqPhase = 'body';
+        } else if (reqPhase === 'peek') {
+          // Accumulate the body (raw, for faithful replay) and feed the finder
+          // until the top-level `model` resolves, the body ends, or the cap is hit.
+          const { consumed, done } = pend.track(reqBuf);
+          if (consumed > 0) {
+            const slice = Buffer.from(reqBuf.subarray(0, consumed));
+            reqBuf = reqBuf.subarray(consumed);
+            pend.raw.push(slice);
+            if (pend.len < MODEL_PEEK_CAP) pend.finder.push(slice);
+            pend.len += slice.length;
+          }
+          if (done || pend.finder.done || pend.len >= MODEL_PEEK_CAP) {
+            const model = pend.finder.value;
+            const rew = rewriteHead(pend.head, reqId, model);
+            const head = (rew && typeof rew.then === 'function') ? await rew : rew;
+            pending.push({ id: reqId, method: methodOf(pend.info.startLine) });
+            if (tap) tap.reqHead(reqId, head);
+            upstream.write(Buffer.from(head, 'latin1'));
+            reqPatcher = makeBodyPatcher ? makeBodyPatcher(reqId) : null;
+            let body = Buffer.concat(pend.raw);
+            if (reqPatcher) body = reqPatcher.push(body);
+            if (body.length) { if (tap) tap.reqData(reqId, body); upstream.write(body); }
+            const remaining = pend.info.contentLength - pend.len;
+            if (done) { reqPhase = 'head'; reqTrack = null; reqPatcher = null; }
+            else { reqTrack = makeBodyTracker('length', remaining); reqPhase = 'body'; }
+            pend = null;
+          } else if (consumed === 0) break; // need more body bytes
         } else {
           const { consumed, done } = reqTrack(reqBuf);
           if (consumed > 0) {

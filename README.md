@@ -14,7 +14,8 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 ## Features
 
 - **Automatic account rotation** — switches to the next account when session (5h) or weekly (7d) quota reaches the configured threshold (default 98%)
-- **Auto-retry on 429** — waits the `retry-after` duration and retries the same account; switches to the next on persistent errors
+- **Model-aware routing** — the per-model weekly cap (e.g. Fable) is tracked separately, so an account whose Fable quota is spent is skipped **only** for Fable requests and still serves Opus/Sonnet. Requests are routed by their `model` (read exactly from the request body, including through the MITM relay)
+- **Auto-retry on 429** — waits the `retry-after` duration and retries the same account; a quota rejection (a spent weekly bucket) switches accounts immediately instead of waiting, and switches to the next on persistent errors
 - **Interactive TUI** — real-time dashboard with color-coded quota bars, reset countdowns, activity log, and keyboard controls; a settings screen (`g`) edits the rotation threshold, quota-probe interval, and sx.org proxy live
 - **OAuth token management** — automatically refreshes tokens nearing expiry and persists them to config; client token refreshes pass through untouched
 - **Hot-reload accounts** — add or change accounts while the server is running; press **R** in the TUI, or run headless and CLI changes auto-reload via a local control endpoint
@@ -23,7 +24,7 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 - **Rotation priority** — pin a preferred account order with `teamclaude priority`
 - **Enable/disable accounts** — temporarily pause an account without removing it (`teamclaude disable`/`enable`, or `d` in the TUI); re-enabling also clears a stuck error state
 - **Quota persistence** — observed quota survives restarts (saved to a sibling state file), so rotation state isn't lost on restart; stale windows are discarded automatically
-- **Optional quota probe** — off by default; when enabled, periodically refreshes idle accounts' quota from the usage endpoint (no message spend), and surfaces the Sonnet weekly bucket
+- **Optional quota probe** — off by default; when enabled, periodically refreshes idle accounts' quota from the usage endpoint (no message spend), and surfaces the Sonnet and Fable weekly buckets
 - **MITM proxy mode (default)** — `teamclaude run` routes claude via an HTTPS forward proxy with a local CA so even hardcoded `api.anthropic.com` endpoints (e.g. the Claude Design MCP) get the real token injected; pass `--no-mitm` for base-URL routing only
 - **Optional sx.org proxy mode** — off by default; set an [sx.org](https://sx.org) API key in the TUI settings screen (`g`) and TeamClaude auto-provisions a residential proxy to change the egress IP and work around IP-based `429`s. Three modes (`m` to cycle): **always** (route all upstream traffic), **on 429 only** (stay direct, fail over to the proxy after a 429), or **off** (keep the key but don't use it). TLS stays end-to-end with Anthropic (the proxy only relays ciphertext)
 - **Request logging** — optional full request/response logging for debugging
@@ -273,7 +274,7 @@ teamclaude probe        # show current setting
 
 You can also set the interval live from the TUI settings screen (`g` → `p`), alongside the rotation threshold (`t`).
 
-It reads each OAuth account's utilization from Anthropic's usage endpoint (`/api/oauth/usage`), which reports quota **without consuming any message quota**. Minimum interval is 30s. Changing it takes effect on a running server immediately (no restart). When enabled, it also surfaces the **Sonnet 7-day** bucket as an extra bar in the TUI / `status` (when your plan exposes it).
+It reads each OAuth account's utilization from Anthropic's usage endpoint (`/api/oauth/usage`), which reports quota **without consuming any message quota**. Minimum interval is 30s. Changing it takes effect on a running server immediately (no restart). When enabled, it also surfaces the **Sonnet 7-day** and **Fable 7-day** buckets as extra bars in the TUI / `status` (when your plan exposes them).
 
 ### MITM proxy mode (default)
 
