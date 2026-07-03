@@ -254,6 +254,7 @@ test('MITM h2: relayed requests fire the TUI activity hooks with the injected ac
     assert.equal(routed?.account, 'acct@x');
     assert.ok(end && end.id === start.id);
     assert.equal(String(end.status), '201');
+    assert.equal(end.model, 'x'); // the requested model is reported for the query log
   } finally {
     tlsSock.destroy(); closeHard(proxy); closeHard(upstream);
   }

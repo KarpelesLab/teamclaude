@@ -196,7 +196,8 @@ export class TUI {
     this.active.delete(id);
     const dur = r ? ((Date.now() - r.started) / 1000).toFixed(1) : '?';
     const acct = info.account || r?.account || '?';
-    this._addLog(`${info.method} ${info.path} → ${acct} (${info.status}, ${dur}s)`);
+    const model = info.model ? ` (${info.model})` : ''; // shown when the request named a model
+    this._addLog(`${info.method} ${info.path}${model} → ${acct} (${info.status}, ${dur}s)`);
   }
 
   _addLog(msg) {
