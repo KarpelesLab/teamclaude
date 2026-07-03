@@ -175,52 +175,6 @@ function termClaude(clientSocket, head, key, cert, alpn) {
   return t;
 }
 
-// Parse the ALPN protocol list out of a TLS ClientHello.
-//   returns string[]  — ALPN extension present
-//   returns null       — parsed far enough to know there is no usable ALPN
-//   returns undefined  — need more bytes to decide
-export function parseClientHelloAlpn(buf) {
-  if (buf.length < 5) return undefined;
-  if (buf[0] !== 0x16) return null;                 // not a handshake record
-  const recEnd = 5 + buf.readUInt16BE(3);
-  if (buf.length < recEnd) return undefined;        // wait for the full record
-  let p = 5;
-  if (buf[p] !== 0x01) return null;                 // not a ClientHello
-  const hsEnd = p + 4 + ((buf[p + 1] << 16) | (buf[p + 2] << 8) | buf[p + 3]);
-  const end = Math.min(hsEnd, recEnd);
-  p += 4;
-  p += 2 + 32;                                      // client_version + random
-  if (p >= end) return null;
-  p += 1 + buf[p];                                  // session_id
-  if (p + 2 > end) return null;
-  p += 2 + buf.readUInt16BE(p);                     // cipher_suites
-  if (p + 1 > end) return null;
-  p += 1 + buf[p];                                  // compression_methods
-  if (p + 2 > end) return null;
-  let extEnd = p + 2 + buf.readUInt16BE(p);
-  p += 2;
-  extEnd = Math.min(extEnd, end);
-  while (p + 4 <= extEnd) {
-    const type = buf.readUInt16BE(p);
-    const len = buf.readUInt16BE(p + 2);
-    p += 4;
-    if (type === 0x0010) {                          // application_layer_protocol_negotiation
-      let q = p + 2;                                // skip ALPN list length
-      const listEnd = Math.min(p + len, extEnd);
-      const protos = [];
-      while (q < listEnd) {
-        const l = buf[q]; q += 1;
-        if (q + l > listEnd) break;
-        protos.push(buf.toString('latin1', q, q + l));
-        q += l;
-      }
-      return protos.length ? protos : null;
-    }
-    p += len;
-  }
-  return null;                                      // no ALPN extension
-}
-
 // Answer the built-in test host locally over h1 with a canned JSON response.
 function serveTest(tlsSock) {
   let buf = Buffer.alloc(0);
