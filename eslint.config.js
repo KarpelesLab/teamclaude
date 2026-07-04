@@ -17,6 +17,7 @@ export default [
         TextDecoder: 'readonly',
         fetch: 'readonly',
         AbortController: 'readonly',
+        AbortSignal: 'readonly',
       },
     },
     rules: {
