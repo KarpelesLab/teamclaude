@@ -90,16 +90,17 @@ test('sonnet + fable quota survive the persistence round-trip', () => {
 
 test('updateQuota records the Fable weekly bucket from the 7d_oi header', () => {
   const am = new AccountManager([oauth('a')], 0.98);
+  const reset = Math.floor((Date.now() + 3600_000) / 1000);
   am.updateQuota(0, {
     'anthropic-ratelimit-unified-7d-utilization': '0.56',
-    'anthropic-ratelimit-unified-7d-reset': '1783098000',
+    'anthropic-ratelimit-unified-7d-reset': String(reset),
     'anthropic-ratelimit-unified-7d_oi-utilization': '1.01',   // Fable, in overage
-    'anthropic-ratelimit-unified-7d_oi-reset': '1783098000',
+    'anthropic-ratelimit-unified-7d_oi-reset': String(reset),
   });
   const q = am.accounts[0].quota;
   assert.equal(q.unified7d, 0.56);
   assert.equal(q.unified7dFable, 1.01);                        // stored as a 0-1 fraction, can exceed 1
-  assert.equal(q.unified7dFableReset, 1783098000 * 1000);      // seconds → ms
+  assert.equal(q.unified7dFableReset, reset * 1000);           // seconds → ms
 });
 
 // ── model-aware selection: Fable exhaustion is model-scoped ───
