@@ -62,6 +62,89 @@ test('negative Retry-After is clamped and still terminates', async () => {
   assert.equal(accountStatus, 'throttled');
 });
 
+test('long upstream Retry-After is surfaced without sleeping in client request', async () => {
+  let upstreamHits = 0;
+  const upstream = http.createServer((_req, res) => {
+    upstreamHits++;
+    res.writeHead(429, { 'retry-after': '300', 'content-type': 'application/json' });
+    res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error' } }));
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager(
+    [{ name: 'a', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 }],
+    0.98,
+  );
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const started = Date.now();
+    let res;
+    try {
+      res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'x', messages: [] }),
+        signal: AbortSignal.timeout(2000),
+      });
+    } catch (err) {
+      assert.fail(`request should return 429 promptly, got ${err.name}`);
+    }
+
+    await res.text();
+    assert.equal(res.status, 429);
+    assert.equal(upstreamHits, 1, 'long Retry-After should not be retried inline');
+    assert.ok(Date.now() - started < 2000, 'request should not sleep for upstream retry window');
+    assert.equal(am.accounts[0].status, 'throttled');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('temporarily exhausted fleet waits and retries instead of surfacing synthetic 429', async () => {
+  let upstreamHits = 0;
+  const upstream = http.createServer((_req, res) => {
+    upstreamHits++;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ type: 'message', role: 'assistant', content: [] }));
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager(
+    [{ name: 'a', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 }],
+    0.98,
+  );
+  am.markRateLimited(0, 1);
+
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const started = Date.now();
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+    });
+    const text = await res.text();
+
+    assert.equal(res.status, 200, text);
+    assert.equal(upstreamHits, 1, 'request should reach upstream after throttle expires');
+    assert.ok(Date.now() - started >= 900, 'request should wait for retry window');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
 // Regression for #46: a stale/poisoned cached quota (e.g. 0.98 from before a
 // plan upgrade, with a reset still in the future) must NOT pin the proxy in a
 // permanent synthetic 429. The next request should probe upstream, succeed, and

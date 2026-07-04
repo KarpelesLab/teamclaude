@@ -13,6 +13,7 @@ export const HOP_BY_HOP_HEADERS = new Set([
   'host', 'connection', 'keep-alive', 'transfer-encoding',
   'te', 'trailer', 'upgrade', 'proxy-authorization', 'proxy-authenticate',
 ]);
+const INLINE_RETRY_AFTER_MAX_SECONDS = 15;
 
 // Response header names that are connection-specific and thus illegal on an
 // HTTP/2 response (Node's Http2ServerResponse.writeHead rejects them). Also
@@ -276,6 +277,14 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     ctx.account = '(none available)';
     const status = accountManager.getStatus();
     const retryAfter = computeRetryAfter(status.accounts);
+    const exhaustedRetries = ctx.exhaustedRetries || 0;
+    if (exhaustedRetries < 1 && retryAfter <= INLINE_RETRY_AFTER_MAX_SECONDS) {
+      ctx.exhaustedRetries = exhaustedRetries + 1;
+      console.log(`[TeamClaude] All accounts exhausted — waiting ${retryAfter}s before retry`);
+      await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
+      if (res.destroyed) return;
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
+    }
     res.writeHead(429, {
       'Content-Type': 'application/json',
       'retry-after': String(retryAfter),
@@ -418,12 +427,20 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       if (retryCount >= maxRetries) {
         console.log(`[TeamClaude] Persistent 429 on "${account.name}" — throttling ${retryAfter}s and re-dispatching`);
         accountManager.markRateLimited(account.index, retryAfter);
+        if (res.destroyed) return;
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, nextUseSx);
       }
 
-      if (switchingToSx) {
-        console.log(`[TeamClaude] 429 on "${account.name}" — retrying via sx.org (fresh egress IP)`);
-      } else {
+    if (!switchingToSx && retryAfter > INLINE_RETRY_AFTER_MAX_SECONDS) {
+      console.log(`[TeamClaude] 429 on "${account.name}" — throttling ${retryAfter}s and re-dispatching without waiting`);
+      accountManager.markRateLimited(account.index, retryAfter);
+      if (res.destroyed) return;
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, nextUseSx);
+    }
+
+    if (switchingToSx) {
+      console.log(`[TeamClaude] 429 on "${account.name}" — retrying via sx.org (fresh egress IP)`);
+    } else {
         console.log(`[TeamClaude] 429 on "${account.name}" — waiting ${retryAfter}s before retry`);
         await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
       }
