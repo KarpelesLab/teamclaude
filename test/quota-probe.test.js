@@ -184,3 +184,40 @@ test('prober retries once on a 401', async () => {
   assert.equal(calls, 2);
   assert.equal(am.accounts[0].quota.unified7d, 0.3);
 });
+test('prober status records account probe results', async () => {
+  const am = new AccountManager([oauth('a'), { name: 'k', type: 'apikey', apiKey: 'sk' }], 0.98);
+  const prober = new Prober(am, {
+    intervalMs: 300_000,
+    probeFn: async () => ({ sevenDay: { utilization: 0.3, resetAt: 5000 } }),
+    log: () => {},
+  });
+
+  await prober.probeAll();
+  const status = prober.getStatus();
+  assert.equal(status.enabled, true);
+  assert.equal(status.intervalSeconds, 300);
+  assert.equal(status.accounts[0].name, 'a');
+  assert.equal(status.accounts[0].status, 'ok');
+  assert.equal(typeof status.accounts[0].lastProbedAt, 'string');
+  assert.equal(status.accounts[1].status, 'not-applicable');
+});
+
+test('prober refreshes expired token before probing', async () => {
+  const am = new AccountManager(
+    [oauth('a', { refreshToken: 'refresh', expiresAt: Date.now() - 1000 })],
+    0.98,
+    { refreshFn: async () => ({ accessToken: 'fresh', refreshToken: 'refresh2', expiresAt: Date.now() + 3600_000 }) },
+  );
+  let token = null;
+  const prober = new Prober(am, {
+    intervalMs: 0,
+    probeFn: async credential => {
+      token = credential;
+      return { sevenDay: { utilization: 0.3, resetAt: 5000 } };
+    },
+    log: () => {},
+  });
+
+  await prober.probeAll();
+  assert.equal(token, 'fresh');
+});

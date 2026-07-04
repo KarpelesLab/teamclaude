@@ -48,8 +48,10 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
 
       // Status endpoint
       if (req.method === 'GET' && req.url === '/teamclaude/status') {
+        const status = accountManager.getStatus();
+        const extra = hooks.getStatusExtra?.() || {};
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(accountManager.getStatus(), null, 2));
+        res.end(JSON.stringify({ ...extra, ...status }, null, 2));
         return;
       }
 

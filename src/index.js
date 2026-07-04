@@ -14,6 +14,7 @@ import { Prober } from './prober.js';
 import { TUI } from './tui.js';
 import { SxManager } from './sx.js';
 import { autoUpdate, checkForUpdate, currentVersion, runUpdate, installKind, PKG_NAME } from './updater.js';
+import { renderStatus } from './status-renderer.js';
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -181,6 +182,7 @@ async function serverCommand() {
 
   // Opt-in background quota probe (config.quotaProbeSeconds, default 0 = off).
   let prober = null;
+  const serverStartedAt = Date.now();
 
   // sx.org proxy (IP-based-429 workaround). Dormant unless an API key is set in
   // config.sx.apiKey; when set we provision a proxy and route upstream through it.
@@ -262,6 +264,27 @@ async function serverCommand() {
 
   // Expose reload to the proxy's control endpoint (works with or without TUI).
   hooks.reload = reloadAccounts;
+  hooks.getStatusExtra = () => ({
+    server: {
+      startedAt: new Date(serverStartedAt).toISOString(),
+      uptimeSeconds: Math.round((Date.now() - serverStartedAt) / 1000),
+      port,
+      upstream: config.upstream || 'https://api.anthropic.com',
+    },
+    probe: prober?.getStatus() || {
+      enabled: false,
+      intervalSeconds: config.quotaProbeSeconds || 0,
+      running: false,
+      accounts: accountManager.accounts.map(account => ({
+        name: account.name,
+        status: account.type === 'oauth' ? 'never' : 'not-applicable',
+        lastProbedAt: null,
+        startedAt: null,
+        durationMs: null,
+        error: null,
+      })),
+    },
+  });
 
   const server = createProxyServer(accountManager, config, hooks, sx);
   // Catch bind-time errors (e.g. EADDRINUSE) only. Once the socket is bound we
@@ -529,41 +552,23 @@ async function runCommand() {
 async function statusCommand() {
   const config = await loadOrCreateConfig();
   const url = `http://localhost:${config.proxy.port}/teamclaude/status`;
+  const json = args.includes('--json');
+  const colorArg = argValue('--color') || args.find(arg => arg.startsWith('--color='))?.slice('--color='.length);
+  const color = colorArg === 'always'
+    || (colorArg !== 'never' && process.stdout.isTTY);
 
   try {
     const res = await fetch(url, { headers: { 'x-api-key': config.proxy.apiKey } });
     const data = await res.json();
-
-    console.log(`Active account: ${data.currentAccount}`);
-    console.log(`Switch at:      ${(data.switchThreshold * 100).toFixed(0)}% usage\n`);
-
-    for (const acct of data.accounts) {
-      const q = acct.quota;
-      const current = acct.name === data.currentAccount ? ' *' : '';
-
-      console.log(`  ${acct.name} (${acct.type})${current}`);
-      console.log(`    Status:   ${acct.status}${acct.disabled ? ' (disabled)' : ''}`);
-
-      if (q.unified5h != null || q.unified7d != null || q.unified7dSonnet != null || q.unified7dFable != null) {
-        const ses = q.unified5h != null ? (q.unified5h * 100).toFixed(1) + '%' : '-';
-        const wk = q.unified7d != null ? (q.unified7d * 100).toFixed(1) + '%' : '-';
-        let line = `    Session:  ${ses} used    Weekly: ${wk} used`;
-        if (q.unified7dSonnet != null) line += `    Sonnet7d: ${(q.unified7dSonnet * 100).toFixed(1)}% used`;
-        if (q.unified7dFable != null) line += `    Fable7d: ${(q.unified7dFable * 100).toFixed(1)}% used`;
-        console.log(line);
-      } else {
-        const tok = q.tokensLimit ? ((1 - q.tokensRemaining / q.tokensLimit) * 100).toFixed(1) + '%' : '-';
-        const req = q.requestsLimit ? ((1 - q.requestsRemaining / q.requestsLimit) * 100).toFixed(1) + '%' : '-';
-        console.log(`    Tokens:   ${tok} used    Requests: ${req} used`);
-      }
-
-      console.log(`    Total:    ${acct.usage.totalInputTokens + acct.usage.totalOutputTokens} tokens, ${acct.usage.totalRequests} requests`);
-      if (acct.rateLimitedUntil) console.log(`    Throttled until: ${acct.rateLimitedUntil}`);
-      console.log('');
+    if (json) {
+      console.log(JSON.stringify(data, null, 2));
+      return;
     }
-  } catch {
-    console.error(`Cannot connect to proxy at localhost:${config.proxy.port}`);
+    console.log(renderStatus(data, { color }));
+  } catch (err) {
+    console.error('Cannot connect to proxy at localhost:' + config.proxy.port);
     console.error('Is the server running? Start with: teamclaude server');
+    if (err?.message) console.error(`Details: ${err.message}`);
     process.exit(1);
   }
 }
@@ -951,7 +956,8 @@ Commands:
                       --no-mitm uses base-URL routing only
   alias               Print a shell alias so plain 'claude' routes via the proxy
                       (--install to write it to your shell rc; --uninstall to remove)
-  status              Show proxy & account status (live)
+  status [--json]     Show rich proxy/account/probe status (live)
+                      Use --color=always|never to control ANSI colors
   accounts            List configured accounts
   remove <name>       Remove an account (by name or email; --org to disambiguate)
   disable <name>      Temporarily exclude an account from rotation
