@@ -503,11 +503,17 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     if (l) { l.write(`\n\n=== ERROR ===\n${err.stack || err.message}`); l.end(); }
 
     const isTransient = err instanceof Error &&
-      (err.message.includes('fetch failed') ||
+      (err.code === 'TEAMCLAUDE_HEADERS_TIMEOUT' ||
+        err.name === 'TimeoutError' || err.name === 'AbortError' ||
+        err.message.includes('fetch failed') ||
         err.code === 'ECONNRESET' || err.code === 'ECONNREFUSED' ||
-        err.code === 'ETIMEDOUT' || err.code === 'UND_ERR_CONNECT_TIMEOUT');
+        err.code === 'ETIMEDOUT' || err.code === 'UND_ERR_CONNECT_TIMEOUT' ||
+        err.code === 'UND_ERR_HEADERS_TIMEOUT' || err.code === 'UND_ERR_BODY_TIMEOUT');
 
-    // Transient network errors: just close the connection and let the client retry
+    // Transient network errors (including a stale-socket headers timeout): close
+    // the connection and let the client retry. Failing over to another account
+    // would not help (the poisoned fetch pool is process-wide), but the fast
+    // failure lets Node evict the dead socket so the retry reconnects cleanly.
     if (isTransient) {
       res.destroy();
       return;
