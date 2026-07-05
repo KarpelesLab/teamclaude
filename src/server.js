@@ -334,12 +334,18 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     headers['x-api-key'] = account.credential;
   }
 
-  const upstreamUrl = `${upstream}${req.url}`;
+  const upstreamUrl = `${account.upstream || upstream}${req.url}`;
   const method = req.method;
 
   // Align the body's account_uuid (in metadata.user_id) with the account whose
   // token we're injecting (same-length patch; no-op if absent).
-  const sendBody = account.accountUuid ? patchAccountUuid(body, account.accountUuid) : body;
+  let sendBody = account.accountUuid ? patchAccountUuid(body, account.accountUuid) : body;
+  // Rewrite the model name for accounts that target a different upstream (e.g.
+  // GLM), which uses different model identifiers than Anthropic.
+  if (account.modelMap) sendBody = rewriteModel(sendBody, account.modelMap);
+  // If the body changed length (model name rewrite), update Content-Length so the
+  // upstream doesn't receive a mismatched framing and truncate or stall.
+  if (sendBody !== body) headers['content-length'] = String(sendBody.length);
 
   // Streaming request log, opened lazily on the first terminal outcome (a
   // pure-429-then-retry attempt writes no file, matching prior behavior). The
@@ -614,6 +620,20 @@ function extractUsageFromBody(buffer, accountIndex, accountManager) {
   } catch {
     // not JSON or no usage
   }
+}
+
+// Rewrite the `model` field in a JSON request body using a per-account map.
+// Returns the original buffer unchanged if the model isn't in the map or the
+// body isn't valid JSON, so non-messages endpoints pass through safely.
+function rewriteModel(body, modelMap) {
+  try {
+    const obj = JSON.parse(body.toString('utf8'));
+    if (obj.model && modelMap[obj.model]) {
+      obj.model = modelMap[obj.model];
+      return Buffer.from(JSON.stringify(obj), 'utf8');
+    }
+  } catch { /* not JSON — pass through unchanged */ }
+  return body;
 }
 
 function computeRetryAfter(accounts) {

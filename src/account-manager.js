@@ -49,6 +49,9 @@ export class AccountManager {
       orgName: acct.orgName || null,
       priority: acct.priority || 0,
       disabled: acct.disabled || false,
+      upstream: acct.upstream || null,
+      modelMap: acct.modelMap || null,
+      models: acct.models || null,
       credential: acct.accessToken || acct.apiKey,
       refreshToken: acct.refreshToken || null,
       expiresAt: acct.expiresAt || null,
@@ -221,6 +224,12 @@ export class AccountManager {
     // requests. Non-Fable requests still route here normally.
     if (isFableModel(model) && this._fableExhausted(account)) return false;
 
+    // Model-ownership routing: if any account has declared ownership of `model`
+    // via its `models` field, only those accounts are available for this request.
+    // This lets e.g. a DeepSeek account claim deepseek-* model names so those
+    // requests never land on Claude accounts (which don't recognize the model).
+    if (model && !this._accountOwnsModel(account, model)) return false;
+
     return true;
   }
 
@@ -230,6 +239,17 @@ export class AccountManager {
   _fableExhausted(account) {
     const q = account.quota;
     return q.unified7dFable != null && q.unified7dFable >= this.switchThreshold;
+  }
+
+  /** Returns true if no account claims model ownership, or this account does. */
+  _accountOwnsModel(account, model) {
+    for (const a of this.accounts) {
+      if (a.models && a.models.some(m => m === model || m.replace(/\[\d+m\]$/, '') === model)) {
+        // Some other account owns this model — this account must own it too.
+        return account.models && account.models.some(m => m === model || m.replace(/\[\d+m\]$/, '') === model);
+      }
+    }
+    return true; // no one claims ownership → any account is fine
   }
 
   /**
@@ -683,6 +703,9 @@ export class AccountManager {
       orgName: acctData.orgName || null,
       priority: acctData.priority || 0,
       disabled: acctData.disabled || false,
+      upstream: acctData.upstream || null,
+      modelMap: acctData.modelMap || null,
+      models: acctData.models || null,
       credential: acctData.accessToken || acctData.apiKey,
       refreshToken: acctData.refreshToken || null,
       expiresAt: acctData.expiresAt || null,

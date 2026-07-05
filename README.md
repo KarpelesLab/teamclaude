@@ -21,6 +21,7 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 - **Hot-reload accounts** — add or change accounts while the server is running; press **R** in the TUI, or run headless and CLI changes auto-reload via a local control endpoint
 - **Headless mode** — run the proxy without the TUI (`--headless`) for backgrounding/services
 - **Org-aware accounts** — one email can hold multiple accounts across different organizations (e.g. corp + personal); dedup is keyed on account + org, and names disambiguate as `email (Org)`
+- **Third-party backend accounts** — route requests to any Anthropic-compatible API (e.g. DeepSeek, GLM) as a fallback when Claude accounts are exhausted; a per-account `upstream` URL and `modelMap` translate model names transparently. Accounts with a `models` list are reserved for requests that explicitly name those models, enabling per-session backend selection without touching other sessions
 - **Rotation priority** — pin a preferred account order with `teamclaude priority`
 - **Enable/disable accounts** — temporarily pause an account without removing it (`teamclaude disable`/`enable`, or `d` in the TUI); re-enabling also clears a stuck error state
 - **Quota persistence** — observed quota survives restarts (saved to a sibling state file), so rotation state isn't lost on restart; stale windows are discarded automatically
@@ -259,6 +260,9 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `accounts[].orgUuid` / `orgName` | Organization the account is scoped to — lets one email hold multiple org accounts |
 | `accounts[].priority` | Rotation preference, lower = preferred (default 0) |
 | `accounts[].disabled` | If `true`, the account is excluded from rotation until re-enabled |
+| `accounts[].upstream` | Alternative upstream base URL for this account (e.g. `https://api.deepseek.com/anthropic`). Overrides the global `upstream` for this account only |
+| `accounts[].modelMap` | Object mapping Anthropic model names to this backend's model names (e.g. `{"claude-sonnet-4-6": "deepseek-v4-pro[1m]"}`). Applied automatically when requests are routed to this account |
+| `accounts[].models` | Array of model names this account exclusively handles. When any account declares a `models` list, requests for those models are routed only to accounts that list them — use this to reserve a third-party account for sessions that pass `--model <name>` explicitly |
 
 ### Quota probe (optional, off by default)
 
@@ -275,6 +279,36 @@ teamclaude probe        # show current setting
 You can also set the interval live from the TUI settings screen (`g` → `p`), alongside the rotation threshold (`t`).
 
 It reads each OAuth account's utilization from Anthropic's usage endpoint (`/api/oauth/usage`), which reports quota **without consuming any message quota**. Minimum interval is 30s. Changing it takes effect on a running server immediately (no restart). When enabled, it also surfaces the **Sonnet 7-day** and **Fable 7-day** buckets as extra bars in the TUI / `status` (when your plan exposes them).
+
+### Third-party backend accounts
+
+Any Anthropic-compatible API can be added as an account alongside your Claude accounts. Give it a higher `priority` value (lower = preferred, so use e.g. `100`) and it will be used as a fallback when all Claude accounts are exhausted.
+
+```json
+{
+  "name": "deepseek",
+  "type": "oauth",
+  "accessToken": "sk-your-deepseek-api-key",
+  "upstream": "https://api.deepseek.com/anthropic",
+  "priority": 100,
+  "modelMap": {
+    "claude-haiku-4-5-20251001": "deepseek-v4-flash",
+    "claude-sonnet-4-6": "deepseek-v4-pro[1m]"
+  },
+  "models": ["deepseek-v4-pro[1m]", "deepseek-v4-pro", "deepseek-v4-flash"]
+}
+```
+
+- **`upstream`** — base URL of the target API. Requests are sent to `upstream + /v1/messages` (etc.) for this account only.
+- **`modelMap`** — when a Claude model name arrives in the request body, it is rewritten to the mapped name before forwarding.
+- **`models`** — model names this account exclusively handles. Once any account declares a `models` list, requests for those model names are locked to matching accounts. This lets you send a specific session to a third-party backend without touching others — use `--model` on launch or `/model` inside a session:
+
+```bash
+# This session routes to DeepSeek; all other sessions still use Claude accounts.
+claude --model 'deepseek-v4-pro[1m]'
+```
+
+Note: model names with brackets (e.g. `deepseek-v4-pro[1m]`) must be quoted in the shell.
 
 ### MITM proxy mode (default)
 
