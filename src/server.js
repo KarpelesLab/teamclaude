@@ -140,6 +140,10 @@ export function resolveAccountPin(accountManager, token) {
   return null;
 }
 
+// Paths that must reach upstream with the client's own credential (never a
+// rotated account token): the Remote Control channel and attachment transfers.
+const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/files/', '/api/oauth/file_upload'];
+
 export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null }) {
   let counter = 0;
   return async (req, res) => {
@@ -150,7 +154,11 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // Remote Control (/v1/code/*) is bound to the session's paired claude.ai
       // identity — forward with the client's OWN credential (streamed), never a
       // rotated account token, which would 403 the worker event stream.
-      if ((req.url || '').startsWith('/v1/code/')) { await relayStream(req, res, upstream, sx); return; }
+      // Attachment transfers (/api/oauth/files/*, /api/oauth/file_upload) are
+      // likewise account-bound: files uploaded from claude.ai belong to the
+      // paired identity, so fetching them with a rotated token 403s and Claude
+      // Code silently drops the image from the message.
+      if (CLIENT_CREDENTIAL_PATHS.some((p) => (req.url || '').startsWith(p))) { await relayStream(req, res, upstream, sx); return; }
 
       // Account pin: a request to `/tc-acct/<name-or-index>/...` (e.g. via
       // ANTHROPIC_BASE_URL=http://host:port/tc-acct/deepseek) is forced onto that
