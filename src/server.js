@@ -683,7 +683,8 @@ function extractUsageFromBody(buffer, accountIndex, accountManager) {
 // Rewrite the `model` field in a JSON request body using a per-account map.
 // Returns the original buffer unchanged if the model isn't in the map or the
 // body isn't valid JSON, so non-messages endpoints pass through safely.
-function rewriteModel(body, modelMap) {
+// Exported for tests.
+export function rewriteModel(body, modelMap) {
   try {
     const obj = JSON.parse(body.toString('utf8'));
     if (obj.model && modelMap[obj.model]) {
