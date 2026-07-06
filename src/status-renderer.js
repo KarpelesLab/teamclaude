@@ -5,12 +5,16 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
   const paint = colors(color);
   const lines = [];
   const probe = status.probe || { enabled: false, intervalSeconds: 0, accounts: [] };
+  const warm = status.warm || { enabled: false, intervalSeconds: 0, accounts: [] };
   const accounts = status.accounts || [];
 
   lines.push(paint.bold('TeamClaude status'));
   lines.push(`${paint.dim('Active'.padEnd(12))} ${paint.cyan(status.currentAccount || 'none')}`);
   lines.push(`${paint.dim('Switch at'.padEnd(12))} ${formatPercent(status.switchThreshold)}`);
   lines.push(`${paint.dim('Probe'.padEnd(12))} ${formatProbeSummary(probe, now, paint)}`);
+  if (warm.enabled) {
+    lines.push(`${paint.dim('Keep-warm'.padEnd(12))} ${formatProbeSummary(warm, now, paint)}`);
+  }
   if (status.server?.startedAt || status.server?.uptimeSeconds != null) {
     lines.push(`${paint.dim('Server'.padEnd(12))} ${formatServerSummary(status.server, now)}`);
   }

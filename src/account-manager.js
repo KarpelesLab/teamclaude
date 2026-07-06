@@ -35,6 +35,14 @@ function emptyQuota() {
   };
 }
 
+// Does a declared `models` entry name `model`? The declared side may carry a
+// trailing [Nm] context-length suffix (e.g. "deepseek-v4-pro[1m]"); we match it
+// against a bare request too. Shared by _accountOwnsModel's two lookups so the
+// predicate can't drift.
+function modelMatches(declared, model) {
+  return declared === model || declared.replace(/\[\d+m\]$/, '') === model;
+}
+
 export class AccountManager {
   constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, throttleProbeFloorMs } = {}) {
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
@@ -200,6 +208,9 @@ export class AccountManager {
       // it would just 429 again — so skip it for Fable and let the caller emit
       // the synthetic 429 when no other account is available.
       if (isFableModel(model) && this._fableExhausted(account)) continue;
+      // Same for model-ownership: a probe for an owned model must not land on a
+      // non-owner (it would just reject the unknown model id).
+      if (model && !this._accountOwnsModel(account, model)) continue;
       const priority = account.priority || 0;
       const usage = this._maxUtilization(account);
       if (priority < bestPriority ||
@@ -263,9 +274,9 @@ export class AccountManager {
   /** Returns true if no account claims model ownership, or this account does. */
   _accountOwnsModel(account, model) {
     for (const a of this.accounts) {
-      if (a.models && a.models.some(m => m === model || m.replace(/\[\d+m\]$/, '') === model)) {
+      if (a.models && a.models.some(m => modelMatches(m, model))) {
         // Some other account owns this model — this account must own it too.
-        return account.models && account.models.some(m => m === model || m.replace(/\[\d+m\]$/, '') === model);
+        return !!(account.models && account.models.some(m => modelMatches(m, model)));
       }
     }
     return true; // no one claims ownership → any account is fine
@@ -476,6 +487,13 @@ export class AccountManager {
 
     for (const account of this.accounts) {
       if (exclude?.has(account.index)) continue;
+      // Never resurrect a hard-state account: `disabled` is an operator decision
+      // and `error` means the token is broken (needs re-login). Selecting either
+      // here would send a live request on an account that must not be used and,
+      // below, silently clear its throttle/error state. (Mirrors _isAvailable.)
+      if (account.disabled || account.status === 'error') continue;
+      // A request for an owned model must not fall back to a non-owner account.
+      if (model && !this._accountOwnsModel(account, model)) continue;
       const resetTime = account.rateLimitedUntil
         || account.quota.unified5hReset
         || account.quota.unified7dReset
@@ -752,6 +770,7 @@ export class AccountManager {
       quota: emptyQuota(),
       usage: { totalInputTokens: 0, totalOutputTokens: 0, totalRequests: 0, lastUsed: null },
       rateLimitedUntil: null,
+      throttledAt: null,
     });
     return index;
   }

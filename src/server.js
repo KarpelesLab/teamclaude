@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { timingSafeEqual } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -23,6 +24,22 @@ const CONNECTION_SPECIFIC_HEADERS = new Set([
   'proxy-connection', 'te', 'trailer',
 ]);
 
+// Constant-time proxy-API-key comparison (both the HTTP gate and the CONNECT
+// gate use it). Returns false on any type/length mismatch without leaking timing.
+export function safeKeyEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const ba = Buffer.from(a);
+  const bb = Buffer.from(b);
+  if (ba.length !== bb.length) return false;
+  return timingSafeEqual(ba, bb);
+}
+
+// True if a socket's remote address is loopback — the proxy-key gate exempts
+// localhost on both the HTTP and CONNECT paths.
+export function isLoopbackAddr(addr) {
+  return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1';
+}
+
 export function createProxyServer(accountManager, config, hooks = {}, sx = null) {
   const upstream = config.upstream || 'https://api.anthropic.com';
   const proxyApiKey = config.proxy?.apiKey;
@@ -36,9 +53,8 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
     try {
       // Auth check — skip for localhost connections.
       const clientKey = req.headers['x-api-key'];
-      const remoteAddr = req.socket.remoteAddress;
-      const isLocal = remoteAddr === '127.0.0.1' || remoteAddr === '::1' || remoteAddr === '::ffff:127.0.0.1';
-      if (proxyApiKey && clientKey !== proxyApiKey && !isLocal) {
+      const isLocal = isLoopbackAddr(req.socket.remoteAddress);
+      if (proxyApiKey && !safeKeyEqual(clientKey, proxyApiKey) && !isLocal) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           type: 'error',
@@ -93,7 +109,9 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
   const mitmHost = (() => { try { return new URL(upstream).hostname; } catch { return 'api.anthropic.com'; } })();
   let certsPromise = null;
   const ensureLeaf = async () => {
-    certsPromise ||= ensureCerts(mitmHost);
+    // Reset the memo on failure so a transient cert error doesn't wedge the MITM
+    // path permanently (a cached rejected promise would re-throw on every CONNECT).
+    certsPromise ||= ensureCerts(mitmHost).catch((err) => { certsPromise = null; throw err; });
     const c = await certsPromise;
     return { key: c.leafKeyPem, cert: c.leafCertPem };
   };
@@ -310,6 +328,20 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     ? (ctx.tried.has(ctx.pinnedIndex) ? null : accountManager.accounts[ctx.pinnedIndex])
     : accountManager.getActiveAccount(ctx.tried, ctx.model);
   if (!account) {
+    // A pinned request concerns exactly one account: don't compute a fleet-wide
+    // retry-after or sleep on other accounts' windows — return immediately.
+    if (ctx.pinnedIndex != null) {
+      ctx.status = 429;
+      ctx.account = '(pinned account unavailable)';
+      if (!res.headersSent) {
+        res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': '5' });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: { type: 'rate_limit_error', message: 'Pinned account is unavailable (rate-limited, errored, or already tried). Retry shortly.' },
+        }));
+      }
+      return;
+    }
     ctx.status = 429;
     ctx.account = '(none available)';
     const status = accountManager.getStatus();
@@ -584,6 +616,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         type: 'error',
         error: { type: 'proxy_error', message: `Upstream error: ${err.message}` },
       }));
+    } else if (!res.writableEnded) {
+      // Error after headers were already sent (mid-stream) and it wasn't
+      // classified transient: we can't send a status or fail over, and
+      // streamResponse deliberately skipped res.end(). Destroy so the client
+      // sees a broken response and retries instead of hanging on an open socket.
+      res.destroy();
     }
   }
 }
@@ -619,7 +657,11 @@ export function readWithIdleTimeout(reader, ms) {
     }, ms);
     timer.unref?.();
   });
-  return Promise.race([reader.read(), timeout]).finally(() => clearTimeout(timer));
+  const read = reader.read();
+  // If the timeout wins the race, `read` is abandoned; swallow any later
+  // rejection so it can't surface as an unhandledRejection.
+  read.catch(() => {});
+  return Promise.race([read, timeout]).finally(() => clearTimeout(timer));
 }
 
 /**
@@ -661,8 +703,12 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
       // because 'drain' will never fire on a destroyed socket
       if (!ok) {
         await new Promise(resolve => {
-          res.once('drain', resolve);
-          res.once('close', resolve);
+          // Remove BOTH listeners when either fires: otherwise the un-fired one
+          // (usually 'close') stays attached and accumulates one leaked listener
+          // per backpressure cycle over a long SSE stream to a slow client.
+          const done = () => { res.off('drain', done); res.off('close', done); resolve(); };
+          res.once('drain', done);
+          res.once('close', done);
         });
         if (res.destroyed) break;
       }

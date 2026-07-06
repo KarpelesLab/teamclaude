@@ -1,4 +1,4 @@
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, chmod } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
@@ -33,6 +33,9 @@ export async function saveState(state) {
   const path = getStatePath();
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, JSON.stringify(state, null, 2) + '\n', { mode: 0o600 });
+  // `mode` only applies when the file is CREATED; enforce 0600 on every save so
+  // a pre-existing state file (holding quota + tokens) can't linger world-readable.
+  await chmod(path, 0o600).catch(() => {});
 }
 
 export function createDefaultConfig() {
@@ -71,6 +74,9 @@ export async function saveConfig(config) {
   const path = getConfigPath();
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
+  // Enforce 0600 even if the file already existed (the proxy apiKey + account
+  // tokens live here); `mode` above is honored only on creation.
+  await chmod(path, 0o600).catch(() => {});
 }
 
 /**

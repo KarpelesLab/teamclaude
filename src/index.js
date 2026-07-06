@@ -182,6 +182,11 @@ async function serverCommand() {
     }).catch(err => console.error(`[TeamClaude] Failed to save refreshed token: ${err.message}`));
   });
   const port = config.proxy.port;
+  // Bind loopback by default so the proxy isn't reachable off-box (it injects
+  // account tokens and — via CONNECT — can relay arbitrarily). Opt into a wider
+  // bind explicitly with TEAMCLAUDE_HOST or config.proxy.host (e.g. '0.0.0.0'),
+  // in which case set proxy.apiKey so the auth gate protects remote clients.
+  const bindHost = process.env.TEAMCLAUDE_HOST || config.proxy.host || '127.0.0.1';
   const headless = args.includes('--headless') || args.includes('--no-tui');
   const useTUI = !headless && process.stdout.isTTY && process.stdin.isTTY;
 
@@ -322,7 +327,7 @@ async function serverCommand() {
   const onListenError = err => handleServerListenError(err, port);
   server.once('error', onListenError);
 
-  server.listen(port, () => {
+  server.listen(port, bindHost, () => {
     // Bind succeeded: stop treating errors as listen failures, but keep a
     // benign runtime handler so a later 'error' is logged rather than thrown.
     server.removeListener('error', onListenError);
@@ -336,7 +341,7 @@ async function serverCommand() {
       console.log(sep);
       console.log('  TeamClaude Proxy');
       console.log(sep);
-      console.log(`  Port:       ${port}`);
+      console.log(`  Bind:       ${bindHost}:${port}${bindHost === '127.0.0.1' ? ' (localhost only)' : ' (reachable off-box — ensure proxy.apiKey is set)'}`);
       console.log(`  Accounts:   ${accounts.length}`);
       console.log(`  Threshold:  ${(threshold * 100).toFixed(0)}%`);
       console.log(`  Upstream:   ${config.upstream || 'https://api.anthropic.com'}`);
@@ -375,18 +380,23 @@ async function serverCommand() {
   // users update via `teamclaude run` (post-session) or `teamclaude update`.
   if (!tui) autoUpdate({ config }).catch(() => {});
 
-  if (!tui) {
-    const shutdown = async () => {
-      console.log('\n[TeamClaude] Shutting down...');
-      prober?.stop();
-      warmer?.stop();
-      clearInterval(quotaSaveInterval);
-      await persistQuotaState();
-      server.close(() => process.exit(0));
-    };
-    process.on('SIGINT', shutdown);
-    process.on('SIGTERM', shutdown);
-  }
+  // Graceful shutdown on signals in BOTH modes. In TUI mode this previously
+  // existed only as a keypress path, so a SIGTERM (systemd/kill) bypassed it and
+  // dropped up-to-a-minute of unsaved quota state and orphaned schedulers.
+  const shutdown = async () => {
+    try { tui?.stop(); } catch { /* terminal already restored */ }
+    if (!tui) console.log('\n[TeamClaude] Shutting down...');
+    prober?.stop();
+    warmer?.stop();
+    if (quotaSaveInterval) clearInterval(quotaSaveInterval);
+    await persistQuotaState();
+    // Force-exit if open connections keep server.close from completing, so a
+    // signal can't hang the process indefinitely.
+    setTimeout(() => process.exit(0), 3000).unref?.();
+    server.close(() => process.exit(0));
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
 }
 
 // ── import ──────────────────────────────────────────────────

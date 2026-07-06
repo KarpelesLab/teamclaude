@@ -88,8 +88,11 @@ function proxiedFetch(url, opts, sx, timeoutMs) {
   const u = new URL(url);
   const proxy = sx.getProxy();
 
-  // Custom agent: every socket is a TLS connection tunneled through sx.org.
-  const agent = new https.Agent({ keepAlive: true });
+  // Custom agent: every socket is a TLS connection tunneled through sx.org. This
+  // agent is created per request (its createConnection closes over this call's
+  // target), so keep-alive would give no reuse — it would only park the tunneled
+  // socket in a soon-orphaned pool and leak an open sx.org connection per request.
+  const agent = new https.Agent({ keepAlive: false });
   agent.createConnection = (_options, cb) => {
     // sx.tlsOptions is undefined in production (system CAs verify api.anthropic.com);
     // tests inject a CA here to reach a self-signed upstream.

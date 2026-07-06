@@ -42,6 +42,7 @@ export class Warmer {
     this.log = log;
     this.timer = null;
     this._running = false;
+    this._abort = null; // AbortController for the in-flight sweep (see warmAll/stop)
     this.lastRunStartedAt = null;
     this.lastRunFinishedAt = null;
     this.nextRunAt = intervalMs > 0 ? Date.now() + intervalMs : null;
@@ -60,7 +61,9 @@ export class Warmer {
 
     if (intervalMs > 0) {
       this.nextRunAt = Date.now() + intervalMs;
-      this.warmAll().catch(() => {});
+      // Immediate sweep only on an off→on transition. Re-running it on every
+      // interval *change* would spend quota each time the interval is edited.
+      if (!wasOn) this.warmAll().catch(() => {});
       this.timer = setInterval(() => this.warmAll().catch(() => {}), intervalMs);
       this.timer.unref?.();
       this.log(`[TeamClaude] Keep-warm enabled (every ${Math.round(intervalMs / 1000)}s)`);
@@ -73,6 +76,9 @@ export class Warmer {
   stop() {
     if (this.timer) { clearInterval(this.timer); this.timer = null; }
     this.nextRunAt = null;
+    // Cancel an in-flight sweep and kill any child it spawned, so shutdown /
+    // `warmup off` doesn't block on a running warm-up or orphan a `claude`.
+    this._abort?.abort();
   }
 
   /**
@@ -99,25 +105,28 @@ export class Warmer {
   async warmAll() {
     if (this._running) return;
     this._running = true;
+    const abort = this._abort = new AbortController();
     this.lastRunStartedAt = Date.now();
     this.nextRunAt = this.intervalMs > 0 ? this.lastRunStartedAt + this.intervalMs : null;
     try {
       const targets = this.am.accounts.filter(account => this._isWarmTarget(account));
       for (const account of targets) {
-        await this.warmAccount(account);
+        if (abort.signal.aborted) break; // stopped mid-sweep (shutdown / warmup off)
+        await this.warmAccount(account, abort.signal);
       }
     } finally {
       this.lastRunFinishedAt = Date.now();
       this._running = false;
+      if (this._abort === abort) this._abort = null;
     }
   }
 
-  async warmAccount(account) {
+  async warmAccount(account, signal) {
     const startedAt = Date.now();
     this._record(account, { status: 'running', startedAt });
     try {
       await this.am.ensureTokenFresh(account.index);
-      const code = await this.spawnFn(this._spawnSpec(account));
+      const code = await this.spawnFn(this._spawnSpec(account, signal));
       const finishedAt = Date.now();
       this._record(account, {
         status: code === 0 ? 'ok' : 'error',
@@ -136,7 +145,7 @@ export class Warmer {
 
   /** The `claude` invocation for one account. Pure/deterministic so tests can
    *  assert the args and env without spawning anything. */
-  _spawnSpec(account) {
+  _spawnSpec(account, signal) {
     // Pin by INDEX (stable, and free of the spaces/parens real account names
     // carry, which would otherwise need URL-encoding).
     const baseUrl = `http://127.0.0.1:${this.port}/tc-acct/${account.index}`;
@@ -151,6 +160,7 @@ export class Warmer {
         ANTHROPIC_API_KEY: this.apiKey || 'tc-warm',
       },
       timeoutMs: this.timeoutMs,
+      signal, // aborts (and kills the child) when the warmer is stopped
     };
   }
 
@@ -189,8 +199,9 @@ export class Warmer {
 // an error) or rejecting if the binary can't launch (e.g. not on PATH) or the
 // warm-up overruns its timeout. stdio is ignored: we only care that a request
 // went through to start the timer.
-function defaultSpawn({ command, args, env, timeoutMs }) {
+function defaultSpawn({ command, args, env, timeoutMs, signal }) {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) { reject(new Error('warm-up aborted')); return; }
     let child;
     try {
       child = spawn(command, args, { env, stdio: 'ignore' });
@@ -198,13 +209,22 @@ function defaultSpawn({ command, args, env, timeoutMs }) {
       reject(err);
       return;
     }
+    const onAbort = () => child.kill('SIGKILL');
+    signal?.addEventListener('abort', onAbort, { once: true });
     const timer = setTimeout(() => {
       child.kill('SIGKILL');
       reject(new Error(`warm-up timed out after ${timeoutMs}ms`));
     }, timeoutMs);
     timer.unref?.();
-    child.once('error', (err) => { clearTimeout(timer); reject(err); });
-    child.once('exit', (code) => { clearTimeout(timer); resolve(code ?? 0); });
+    const cleanup = () => { clearTimeout(timer); signal?.removeEventListener('abort', onAbort); };
+    child.once('error', (err) => { cleanup(); reject(err); });
+    child.once('exit', (code, sigName) => {
+      cleanup();
+      // A signal-killed child (OOM, external kill, our own abort) did NOT
+      // complete a warm-up — report it as an error, not a success (code null).
+      if (sigName) { reject(new Error(`claude terminated by ${sigName}`)); return; }
+      resolve(code ?? 0);
+    });
   });
 }
 

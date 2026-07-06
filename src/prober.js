@@ -36,7 +36,9 @@ export class Prober {
 
     if (intervalMs > 0) {
       this.nextRunAt = Date.now() + intervalMs;
-      this.probeAll().catch(() => {});
+      // Immediate probe only on an off→on transition — not on every interval
+      // change (mirrors warmer.js; avoids an extra burst when the interval is edited).
+      if (!wasOn) this.probeAll().catch(() => {});
       this.timer = setInterval(() => this.probeAll().catch(() => {}), intervalMs);
       this.timer.unref?.();
       this.log(`[TeamClaude] Quota probe enabled (every ${Math.round(intervalMs / 1000)}s)`);

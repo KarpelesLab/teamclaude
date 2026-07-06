@@ -20,7 +20,7 @@ import tls from 'node:tls';
 import http2 from 'node:http2';
 import { getConfigPath } from './config.js';
 import { generateCertChain } from './x509.js';
-import { createProxyRequestListener } from './server.js';
+import { createProxyRequestListener, safeKeyEqual, isLoopbackAddr } from './server.js';
 
 const CA_CERT = 'teamclaude-ca.pem';
 const LEAF_CERT = 'teamclaude-leaf.pem';
@@ -112,6 +112,7 @@ export function hostMode(host, config) {
  */
 export function createConnectHandler({ config, accountManager, ensureLeaf, logDir = null, hooks = {}, log = () => {}, sx = null }) {
   const upstream = config.upstream || 'https://api.anthropic.com';
+  const proxyApiKey = config.proxy?.apiKey;
   const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx });
 
   // One terminating h2/h1 server, minted lazily on the first intercepted CONNECT.
@@ -128,10 +129,30 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
     srv.on('sessionError', (e) => log(`[TeamClaude] MITM session error: ${e.message}`));
     srv.on('clientError', (e, sock) => { try { sock.destroy(); } catch { /* already gone */ } });
     return srv;
-  })());
+  })().catch((err) => {
+    // Don't let a transient cert/disk failure poison the memo forever: reset it
+    // so the next intercepted CONNECT retries instead of re-awaiting a cached
+    // rejection (which would leave the MITM path dead until a restart).
+    serverPromise = null;
+    throw err;
+  }));
 
   return (req, clientSocket, head) => {
     clientSocket.on('error', () => {});
+
+    // Auth gate — mirror the HTTP path: loopback is exempt, everything else must
+    // present the proxy apiKey via Proxy-Authorization. Without this, a remote
+    // client can CONNECT api.anthropic.com and have a rotated ACCOUNT TOKEN
+    // injected (token theft), or blind-tunnel to arbitrary hosts (open relay /
+    // SSRF) — the HTTP path already blocks the equivalent for remote clients.
+    if (!connectAuthorized(req, clientSocket, proxyApiKey)) {
+      try {
+        clientSocket.write('HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="teamclaude"\r\nConnection: close\r\n\r\n');
+      } catch { /* client already gone */ }
+      clientSocket.destroy();
+      return;
+    }
+
     const [host, portStr] = (req.url || '').split(':');
     const port = parseInt(portStr, 10) || 443;
     const mode = hostMode(host, config);
@@ -142,7 +163,12 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
         if (head && head.length) up.write(head);
         up.pipe(clientSocket); clientSocket.pipe(up);
       });
-      up.on('error', () => clientSocket.destroy());
+      // Tear down BOTH sockets when either errors or closes, so a one-sided
+      // failure can't leave the paired socket lingering (FD leak).
+      const teardown = () => { up.destroy(); clientSocket.destroy(); };
+      up.on('error', teardown); up.on('close', teardown);
+      clientSocket.on('close', teardown);
+      up.setTimeout(30_000, teardown); // bound a stalled connect/idle tunnel
       return;
     }
 
@@ -164,6 +190,26 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
       srv.emit('connection', clientSocket);
     }).catch((err) => { log(`[TeamClaude] MITM ${host}: ${err.message}`); clientSocket.destroy(); });
   };
+}
+
+// Authorize a CONNECT: no key configured → open (matches the HTTP path); a
+// loopback client is exempt; otherwise the proxy apiKey must be presented via
+// `Proxy-Authorization` (Bearer <key>, or Basic where the key is the username
+// or password — so `--proxy http://<key>@host:port` works). Exported for tests.
+export function connectAuthorized(req, socket, proxyApiKey) {
+  if (!proxyApiKey) return true;
+  if (isLoopbackAddr(socket?.remoteAddress)) return true;
+  const m = /^\s*(basic|bearer)\s+(.+?)\s*$/i.exec(req?.headers?.['proxy-authorization'] || '');
+  if (!m) return false;
+  let presented = m[2];
+  if (m[1].toLowerCase() === 'basic') {
+    const dec = Buffer.from(m[2], 'base64').toString('utf8'); // "user:pass"
+    const i = dec.indexOf(':');
+    const user = i >= 0 ? dec.slice(0, i) : dec;
+    const pass = i >= 0 ? dec.slice(i + 1) : '';
+    presented = pass || user;
+  }
+  return safeKeyEqual(presented, proxyApiKey);
 }
 
 function reply200Raw(sock) { sock.write('HTTP/1.1 200 Connection Established\r\n\r\n'); }

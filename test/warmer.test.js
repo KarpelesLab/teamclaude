@@ -130,3 +130,35 @@ test('overlapping warm cycles are skipped while one is running', async () => {
   await warmer.warmAll();              // must be a no-op
   assert.equal(warmer.lastRunStartedAt, null);
 });
+
+test('stop() aborts an in-flight sweep (kills the warm child, skips the rest)', async () => {
+  const am = new AccountManager([oauth('a'), oauth('b')], 0.98);
+  let aborts = 0;
+  let started = 0;
+  // A spawner that hangs until its abort signal fires (models a live `claude`).
+  const spawnFn = (spec) => new Promise((_resolve, reject) => {
+    started += 1;
+    spec.signal.addEventListener('abort', () => { aborts += 1; reject(new Error('aborted')); }, { once: true });
+  });
+  const warmer = makeWarmer(am, spawnFn);
+
+  const sweep = warmer.warmAll();          // don't await — it's mid-flight
+  await new Promise(r => setTimeout(r, 10));
+  warmer.stop();                           // must abort the hanging child
+  await sweep;
+
+  assert.equal(aborts, 1, 'the in-flight child was aborted');
+  assert.equal(started, 1, 'the second account was not started after stop()');
+});
+
+test('reschedule to a new interval does NOT trigger an extra (quota-spending) sweep', async () => {
+  const am = new AccountManager([oauth('a')], 0.98);
+  const spawn = fakeSpawner();
+  const warmer = makeWarmer(am, spawn, { intervalMs: 600_000 });
+  warmer.start();                          // off→on: one immediate sweep
+  await new Promise(r => setTimeout(r, 5));
+  const afterStart = spawn.calls.length;
+  warmer.reschedule(300_000);              // interval CHANGE, already on
+  await new Promise(r => setTimeout(r, 5));
+  assert.equal(spawn.calls.length, afterStart, 'no extra sweep on an interval change');
+});
