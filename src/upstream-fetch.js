@@ -15,17 +15,30 @@ import { tunnelTls } from './sx.js';
 
 // Time to wait for RESPONSE HEADERS before treating the upstream socket as dead.
 // This is NOT a limit on the response body (SSE completions can stream for
-// minutes); the deadline is cleared the instant headers arrive. Its job is to
-// convert an indefinite hang on a half-dead pooled socket (e.g. after the host's
-// network drops and reconnects, leaving Node's global fetch pool holding stale
-// keep-alive connections) into a fast, retryable failure. Without it a reused
-// dead socket hangs until Node's 300s default, long past the point the client
-// gave up, and only a full process restart clears the poisoned pool. Each
-// aborted request evicts one dead socket, so a burst of stale connections drains
-// over the next few retries rather than all at once. Override with
-// TEAMCLAUDE_UPSTREAM_HEADERS_TIMEOUT_MS (or per-call opts) if a legitimate slow
-// first-byte ever trips it.
-const DEFAULT_HEADERS_TIMEOUT_MS = 60_000;
+// minutes); the deadline is cleared the instant headers arrive, so a slow, long
+// answer is never cut. It measures time-to-first-byte only, which streaming
+// delivers within seconds, and its job is to convert an indefinite hang on a
+// half-dead pooled socket (e.g. after the host's network drops and reconnects,
+// leaving Node's global fetch pool holding stale keep-alive connections) into a
+// fast, retryable failure. Without it a reused dead socket hangs until Node's
+// 300s default, long past the point the client gave up, and only a full process
+// restart clears the poisoned pool. Each aborted request evicts one dead socket,
+// so a burst of stale connections drains over the next few retries.
+//
+// We abort ONLY in the pre-headers window and clear the timer once the body
+// starts, so we never abort mid-stream. That matters: an AbortSignal fired after
+// data has started leaves the socket occupied and leaks a "zombie" connection
+// that drains the pool over time; aborting before the first byte lets undici
+// destroy the socket cleanly instead. The textbook fix is dispatcher-level
+// timeouts via undici's setGlobalDispatcher(new Agent({ headersTimeout,
+// keepAliveTimeout })); we stay zero-dependency, so this reactive guard is the
+// stand-in.
+//
+// Default is generous (well above Claude's realistic first-byte, even when
+// queued or under load) so a slow-but-legitimate response is never mistaken for
+// a dead socket. Override with TEAMCLAUDE_UPSTREAM_HEADERS_TIMEOUT_MS (or
+// per-call opts).
+const DEFAULT_HEADERS_TIMEOUT_MS = 120_000;
 
 function resolveHeadersTimeout(perCall) {
   if (perCall != null) return perCall;
