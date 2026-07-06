@@ -375,6 +375,11 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     }
     accountManager.updateQuota(account.index, rateLimitHeaders);
 
+    // Any non-429 response is live proof a rate-limit hold no longer binds —
+    // this is what lets a revalidation probe (a throttled account selected by
+    // _selectProbe) clear its own hold and return the fleet to service.
+    if (upstreamRes.status !== 429) accountManager.clearRateLimited(account.index);
+
     // On 429, wait the retry-after duration and retry on the same account
     // (this is a transient rate limit, not quota exhaustion).
     if (upstreamRes.status === 429) {

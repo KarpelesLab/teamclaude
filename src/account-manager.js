@@ -36,7 +36,7 @@ function emptyQuota() {
 }
 
 export class AccountManager {
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, throttleProbeFloorMs } = {}) {
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
     // OAuth token refresh.
     this._refreshFn = refreshFn;
@@ -64,6 +64,7 @@ export class AccountManager {
         lastUsed: null,
       },
       rateLimitedUntil: null,
+      throttledAt: null,
     }));
     this.currentIndex = 0;
     this.switchThreshold = switchThreshold;
@@ -73,6 +74,11 @@ export class AccountManager {
     // often to refresh the cached quota. See _selectProbe.
     this.probeIntervalMs = 60_000;
     this._nextProbeAt = 0;
+    // Minimum time a 429 hold is respected verbatim before a throttled account
+    // becomes probe-eligible (see _isProbeable). Long enough to honor a genuine
+    // retry-after, short enough that a stale hold cannot pin the fleet.
+    this.throttleProbeFloorMs = throttleProbeFloorMs
+      ?? (Number(process.env.TEAMCLAUDE_THROTTLE_PROBE_FLOOR_MS) || 60_000);
   }
 
   /**
@@ -135,13 +141,21 @@ export class AccountManager {
 
   _isProbeable(account) {
     if (!account) return false;
-    // Never probe an account the operator has taken out of rotation, one whose
-    // token is broken, or one upstream has explicitly rate-limited — those are
-    // hard states, not stale soft-quota guesses.
+    // Never probe an account the operator has taken out of rotation or one
+    // whose token is broken — those are hard states, not stale guesses.
     if (account.disabled) return false;
     if (account.status === 'error' || account.status === 'exhausted') return false;
+    // A 429 hold is respected verbatim at first, but a hold is a snapshot: the
+    // 429 that armed it may itself have been transient (e.g. the retry burst
+    // after a network flap), and while it lasts NOTHING revalidates it — so a
+    // stale hold pins the fleet in synthetic 429s for up to an hour and only a
+    // restart (which wipes the in-memory hold) recovers. After the floor, let
+    // the account be probed: the probe's real response either clears the hold
+    // (any non-429 → clearRateLimited) or re-arms it with a fresh retry-after.
     if (account.status === 'throttled' && account.rateLimitedUntil
-        && Date.now() < account.rateLimitedUntil) return false;
+        && Date.now() < account.rateLimitedUntil) {
+      return Date.now() >= (account.throttledAt || 0) + this.throttleProbeFloorMs;
+    }
     return true;
   }
 
@@ -196,7 +210,11 @@ export class AccountManager {
 
     this._nextProbeAt = now + this.probeIntervalMs;
     this.currentIndex = best.index;
-    console.log(`[TeamClaude] All accounts over threshold — probing "${best.name}" to refresh quota`);
+    if (best.status === 'throttled') {
+      console.log(`[TeamClaude] All accounts unavailable — revalidating throttled "${best.name}" with a live request`);
+    } else {
+      console.log(`[TeamClaude] All accounts over threshold — probing "${best.name}" to refresh quota`);
+    }
     return best;
   }
 
@@ -211,6 +229,7 @@ export class AccountManager {
       if (Date.now() < account.rateLimitedUntil) return false;
       account.status = 'active';
       account.rateLimitedUntil = null;
+      account.throttledAt = null;
       console.log(`[TeamClaude] Account "${account.name}" rate limit expired, marking active`);
     }
 
@@ -596,7 +615,25 @@ export class AccountManager {
     if (!account) return;
     account.status = 'throttled';
     account.rateLimitedUntil = Date.now() + (retryAfterSeconds * 1000);
+    // Marks when the hold was (re-)armed: a revalidation probe is allowed only
+    // after throttleProbeFloorMs from here, so a probe that 429s again pushes
+    // the next probe out by a full floor rather than hammering upstream.
+    account.throttledAt = Date.now();
     console.log(`[TeamClaude] Account "${account.name}" rate limited for ${retryAfterSeconds}s`);
+  }
+
+  /**
+   * Clear a rate-limit hold after live proof it no longer binds: any non-429
+   * upstream response on a throttled account (a revalidation probe reaching
+   * here, or a hold armed moments before traffic resumed). No-op otherwise.
+   */
+  clearRateLimited(accountIndex) {
+    const account = this.accounts[accountIndex];
+    if (!account || account.status !== 'throttled') return;
+    account.status = 'active';
+    account.rateLimitedUntil = null;
+    account.throttledAt = null;
+    console.log(`[TeamClaude] Account "${account.name}" revalidated — rate limit no longer applies, back in rotation`);
   }
 
   /**
