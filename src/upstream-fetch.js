@@ -13,14 +13,78 @@ import https from 'node:https';
 import { Readable } from 'node:stream';
 import { tunnelTls } from './sx.js';
 
-// `useProxy` is decided by the caller (it varies per attempt — e.g. direct first,
-// then via sx after a 429). With it false, or sx unprovisioned, this is plain fetch.
-export function upstreamFetch(url, opts = {}, sx = null, useProxy = false) {
-  if (!sx || !useProxy || !sx.isProvisioned()) return fetch(url, opts);
-  return proxiedFetch(url, opts, sx);
+// Time to wait for RESPONSE HEADERS before treating the upstream socket as dead.
+// This is NOT a limit on the response body (SSE completions can stream for
+// minutes); the deadline is cleared the instant headers arrive, so a slow, long
+// answer is never cut. It measures time-to-first-byte only, which streaming
+// delivers within seconds, and its job is to convert an indefinite hang on a
+// half-dead pooled socket (e.g. after the host's network drops and reconnects,
+// leaving Node's global fetch pool holding stale keep-alive connections) into a
+// fast, retryable failure. Without it a reused dead socket hangs until Node's
+// 300s default, long past the point the client gave up, and only a full process
+// restart clears the poisoned pool. Each aborted request evicts one dead socket,
+// so a burst of stale connections drains over the next few retries.
+//
+// NOTE (non-streaming requests): for a request without `stream: true`, the whole
+// response arrives as the "headers+body" unit, so first-byte ≈ full generation.
+// Claude Code's completions stream, so this is safe in practice, but a very long
+// non-streaming generation could trip this — raise it per-call or via the env var
+// for such callers. Mid-stream stalls (a drop AFTER headers) are handled
+// separately by the body-idle watchdog in server.js's streamResponse.
+//
+// We abort ONLY in the pre-headers window and clear the timer once the body
+// starts, so we never abort mid-stream. That matters: an AbortSignal fired after
+// data has started leaves the socket occupied and leaks a "zombie" connection
+// that drains the pool over time; aborting before the first byte lets undici
+// destroy the socket cleanly instead. The textbook fix is dispatcher-level
+// timeouts via undici's setGlobalDispatcher(new Agent({ headersTimeout,
+// keepAliveTimeout })); we stay zero-dependency, so this reactive guard is the
+// stand-in.
+//
+// Default is generous (well above Claude's realistic first-byte, even when
+// queued or under load) so a slow-but-legitimate response is never mistaken for
+// a dead socket. Override with TEAMCLAUDE_UPSTREAM_HEADERS_TIMEOUT_MS (or
+// per-call opts).
+const DEFAULT_HEADERS_TIMEOUT_MS = 120_000;
+
+function resolveHeadersTimeout(perCall) {
+  if (perCall != null) return perCall;
+  const env = Number(process.env.TEAMCLAUDE_UPSTREAM_HEADERS_TIMEOUT_MS);
+  return env > 0 ? env : DEFAULT_HEADERS_TIMEOUT_MS;
 }
 
-function proxiedFetch(url, opts, sx) {
+function headersTimeoutError(ms) {
+  const err = new Error(`upstream response headers timed out after ${ms}ms`);
+  // Recognized by server.js isTransient → fail fast + let the client retry, so
+  // Node's fetch pool evicts the stale connection instead of wedging.
+  err.code = 'TEAMCLAUDE_HEADERS_TIMEOUT';
+  return err;
+}
+
+// `useProxy` is decided by the caller (it varies per attempt — e.g. direct first,
+// then via sx after a 429). With it false, or sx unprovisioned, this is plain fetch
+// (plus the headers-timeout guard).
+export function upstreamFetch(url, opts = {}, sx = null, useProxy = false) {
+  const { headersTimeoutMs, ...fetchOpts } = opts;
+  const timeoutMs = resolveHeadersTimeout(headersTimeoutMs);
+  if (!sx || !useProxy || !sx.isProvisioned()) return directFetch(url, fetchOpts, timeoutMs);
+  return proxiedFetch(url, fetchOpts, sx, timeoutMs);
+}
+
+// Global fetch driven by our own AbortController so we can arm a headers-only
+// deadline and disarm it the moment headers arrive (letting the body stream with
+// no deadline). AbortSignal.timeout can't do this — it would also kill the body.
+function directFetch(url, opts, timeoutMs) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(headersTimeoutError(timeoutMs)), timeoutMs);
+  timer.unref?.();
+  return fetch(url, { ...opts, signal: ctrl.signal }).then(
+    (res) => { clearTimeout(timer); return res; },
+    (err) => { clearTimeout(timer); throw err; },
+  );
+}
+
+function proxiedFetch(url, opts, sx, timeoutMs) {
   const u = new URL(url);
   const proxy = sx.getProxy();
 
@@ -36,12 +100,19 @@ function proxiedFetch(url, opts, sx) {
   };
 
   return new Promise((resolve, reject) => {
+    // Headers-only deadline (same as the direct path): fires before headers
+    // arrive and tears the tunneled request down; cleared once the response
+    // starts. `req` is created BEFORE the timer so a synchronous https.request
+    // throw (e.g. an invalid client header) can't leave a scheduled timer that
+    // fires later and dereferences an uninitialized binding.
     const req = https.request(
       u,
       { method: opts.method || 'GET', headers: opts.headers || {}, agent },
-      (res) => resolve(makeResponse(res)),
+      (res) => { clearTimeout(timer); resolve(makeResponse(res)); },
     );
-    req.once('error', reject);
+    const timer = setTimeout(() => req.destroy(headersTimeoutError(timeoutMs)), timeoutMs);
+    timer.unref?.();
+    req.once('error', (err) => { clearTimeout(timer); reject(err); });
 
     const body = opts.body;
     const method = (opts.method || 'GET').toUpperCase();
