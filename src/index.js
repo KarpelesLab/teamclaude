@@ -510,7 +510,7 @@ async function runCommand() {
       const { caPath } = await ensureCerts(host);
       const proxyUrl = `http://127.0.0.1:${port}`;
       env.HTTPS_PROXY = env.HTTP_PROXY = env.https_proxy = env.http_proxy = proxyUrl;
-      env.NO_PROXY = env.no_proxy = ''; // ensure nothing (esp. the upstream host) bypasses us
+      env.NO_PROXY = env.no_proxy = 'localhost,127.0.0.1,::1';
       env.NODE_EXTRA_CA_CERTS = caPath;
       delete env.ANTHROPIC_BASE_URL;
     } else {
