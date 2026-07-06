@@ -11,6 +11,7 @@ import { sameIdentity, orgKey, matchAccounts } from './identity.js';
 import * as alias from './alias.js';
 import { ensureCerts } from './mitm.js';
 import { Prober } from './prober.js';
+import { Warmer } from './warmer.js';
 import { TUI } from './tui.js';
 import { SxManager } from './sx.js';
 import { autoUpdate, checkForUpdate, currentVersion, runUpdate, installKind, PKG_NAME } from './updater.js';
@@ -72,6 +73,10 @@ switch (command) {
     break;
   case 'probe':
     await probeCommand();
+    process.exit(0);
+    break;
+  case 'warmup':
+    await warmupCommand();
     process.exit(0);
     break;
   case 'update':
@@ -182,6 +187,8 @@ async function serverCommand() {
 
   // Opt-in background quota probe (config.quotaProbeSeconds, default 0 = off).
   let prober = null;
+  // Opt-in keep-warm scheduler (config.warmupSeconds, default 0 = off).
+  let warmer = null;
   const serverStartedAt = Date.now();
 
   // sx.org proxy (IP-based-429 workaround). Dormant unless an API key is set in
@@ -217,6 +224,13 @@ async function serverCommand() {
         prober.reschedule(ms);
       }
     }
+    if (warmer) {
+      const ms = (diskConfig.warmupSeconds || 0) * 1000;
+      if (ms !== warmer.intervalMs) {
+        config.warmupSeconds = diskConfig.warmupSeconds || 0;
+        warmer.reschedule(ms);
+      }
+    }
     return added;
   };
 
@@ -246,10 +260,12 @@ async function serverCommand() {
         // Persist other runtime-tunable settings edited from the TUI.
         if (config.switchThreshold != null) diskConfig.switchThreshold = config.switchThreshold;
         if (config.quotaProbeSeconds != null) diskConfig.quotaProbeSeconds = config.quotaProbeSeconds;
+        if (config.warmupSeconds != null) diskConfig.warmupSeconds = config.warmupSeconds;
       }),
       syncAccounts: reloadAccounts,
       onQuit: async () => {
         prober?.stop();
+        warmer?.stop();
         if (quotaSaveInterval) clearInterval(quotaSaveInterval);
         await persistQuotaState();
         server.close(() => process.exit(0));
@@ -279,6 +295,19 @@ async function serverCommand() {
         name: account.name,
         status: account.type === 'oauth' ? 'never' : 'not-applicable',
         lastProbedAt: null,
+        startedAt: null,
+        durationMs: null,
+        error: null,
+      })),
+    },
+    warm: warmer?.getStatus() || {
+      enabled: false,
+      intervalSeconds: config.warmupSeconds || 0,
+      running: false,
+      accounts: accountManager.accounts.map(account => ({
+        name: account.name,
+        status: (account.type === 'oauth' && !account.upstream) ? 'never' : 'not-applicable',
+        lastWarmedAt: null,
         startedAt: null,
         durationMs: null,
         error: null,
@@ -331,6 +360,16 @@ async function serverCommand() {
   prober = new Prober(accountManager, { intervalMs: (config.quotaProbeSeconds || 0) * 1000 });
   prober.start();
 
+  // Start the opt-in keep-warm scheduler (no-op when warmupSeconds is 0). It
+  // spawns a minimal `claude` per idle account through this proxy, pinned via
+  // /tc-acct/<index>, so needs our own port and proxy key.
+  warmer = new Warmer(accountManager, {
+    intervalMs: (config.warmupSeconds || 0) * 1000,
+    port,
+    apiKey: config.proxy?.apiKey,
+  });
+  warmer.start();
+
   // Background self-update for a backgrounded (headless) server. Skipped under
   // the TUI, where npm's install output would corrupt the display — interactive
   // users update via `teamclaude run` (post-session) or `teamclaude update`.
@@ -340,6 +379,7 @@ async function serverCommand() {
     const shutdown = async () => {
       console.log('\n[TeamClaude] Shutting down...');
       prober?.stop();
+      warmer?.stop();
       clearInterval(quotaSaveInterval);
       await persistQuotaState();
       server.close(() => process.exit(0));
@@ -793,6 +833,44 @@ async function probeCommand() {
   await notifyRunningServer(config);
 }
 
+// ── warmup ──────────────────────────────────────────────────
+
+async function warmupCommand() {
+  const config = await loadOrCreateConfig();
+  const arg = args[1];
+
+  if (arg === undefined) {
+    const cur = config.warmupSeconds || 0;
+    console.log(cur > 0 ? `Keep-warm: every ${cur}s` : 'Keep-warm: off');
+    console.log('Set with: teamclaude warmup <off|seconds>   e.g. teamclaude warmup 600');
+    console.log('Note: warming spawns a minimal `claude` per idle account and DOES spend a little quota');
+    console.log('(unlike the passive quota probe). It only warms accounts whose 5h window is idle.');
+    return;
+  }
+
+  let seconds;
+  if (arg === 'off' || arg === '0') {
+    seconds = 0;
+  } else {
+    seconds = parseInt(arg, 10);
+    if (Number.isNaN(seconds) || seconds < 0) {
+      console.error('Usage: teamclaude warmup <off|seconds>');
+      process.exit(1);
+    }
+    if (seconds > 0 && seconds < 60) {
+      console.error('Minimum keep-warm interval is 60s.');
+      process.exit(1);
+    }
+  }
+
+  config.warmupSeconds = seconds;
+  await saveConfig(config);
+  console.log(seconds > 0
+    ? `Keep-warm set to every ${seconds}s (spawns a minimal \`claude\` per idle account; spends a little quota).`
+    : 'Keep-warm disabled.');
+  await notifyRunningServer(config);
+}
+
 // ── update ──────────────────────────────────────────────────
 
 async function updateCommand() {
@@ -965,6 +1043,9 @@ Commands:
   priority <name> <n> Set rotation priority (lower = preferred; --first/--last)
   probe [off|secs]    Opt-in background quota refresh for idle accounts
                       (off by default; reads usage endpoint, spends no quota)
+  warmup [off|secs]   Opt-in: keep idle accounts' 5h timers running by sending
+                      a minimal claude request to each (off by default; spends
+                      a little quota, unlike probe)
   api <path>          Call an API endpoint with account credentials
   update              Check npm for a newer teamclaude and install it
   version             Print the installed version

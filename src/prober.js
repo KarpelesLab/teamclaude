@@ -3,7 +3,9 @@
 // DISABLED BY DEFAULT. When enabled (config.quotaProbeSeconds > 0), periodically
 // reads an OAuth account's quota zero-spend /api/oauth/usage endpoint so idle
 // accounts' utilization/reset stay fresh without waiting to rotate onto them.
-// This is the one sanctioned active-upstream feature; proxy otherwise passive.
+// A sanctioned active-upstream feature (the other is the opt-in keep-warm
+// scheduler, warmer.js); the proxy is otherwise passive. Unlike keep-warm, this
+// probe reads a zero-spend endpoint and never consumes message quota.
 
 import { fetchUsage } from './oauth.js';
 

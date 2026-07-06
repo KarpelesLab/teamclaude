@@ -26,6 +26,8 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 - **Enable/disable accounts** — temporarily pause an account without removing it (`teamclaude disable`/`enable`, or `d` in the TUI); re-enabling also clears a stuck error state
 - **Quota persistence** — observed quota survives restarts (saved to a sibling state file), so rotation state isn't lost on restart; stale windows are discarded automatically
 - **Optional quota probe** — off by default; when enabled, periodically refreshes idle accounts' quota from the usage endpoint (no message spend), and surfaces the Sonnet and Fable weekly buckets
+- **Optional keep-warm** — off by default; when enabled, periodically starts idle accounts' 5h session timers with a minimal request (`teamclaude warmup`) so the next account isn't cold when rotation reaches it (spends a little quota, unlike the probe)
+- **Account pinning** — force a request onto one account via an `ANTHROPIC_BASE_URL=.../tc-acct/<name>` prefix, bypassing rotation
 - **MITM proxy mode (default)** — `teamclaude run` routes claude via an HTTPS forward proxy with a local CA so even hardcoded `api.anthropic.com` endpoints (e.g. the Claude Design MCP) get the real token injected; pass `--no-mitm` for base-URL routing only
 - **Optional sx.org proxy mode** — off by default; set an [sx.org](https://sx.org) API key in the TUI settings screen (`g`) and TeamClaude auto-provisions a residential proxy to change the egress IP and work around IP-based `429`s. Three modes (`m` to cycle): **always** (route all upstream traffic), **on 429 only** (stay direct, fail over to the proxy after a 429), or **off** (keep the key but don't use it). TLS stays end-to-end with Anthropic (the proxy only relays ciphertext)
 - **Request logging** — optional full request/response logging for debugging
@@ -264,6 +266,7 @@ After a host network drop and reconnect, Node's shared connection pool can hold 
 | `upstream` | Upstream API base URL |
 | `switchThreshold` | Quota utilization (0–1) at which to switch accounts (TUI: `g` → `t`) |
 | `quotaProbeSeconds` | Background quota-probe interval in seconds (`0` = off, the default; CLI `probe` or TUI `g` → `p`) |
+| `warmupSeconds` | Keep-warm interval in seconds (`0` = off, the default; CLI `warmup`). Spawns a minimal `claude` per idle account to start its 5h timer — **spends a little quota**, unlike the probe |
 | `sx.apiKey` | [sx.org](https://sx.org) API key. When set, TeamClaude auto-provisions a residential proxy (egress-IP 429 workaround). Absent/empty = off |
 | `sx.mode` | `always` (route all upstream traffic), `429` (direct, fail over to the proxy after a 429), or `off` (keep the key but don't use it). Defaults to `always` when a key is set |
 | `accounts[].accountUuid` | Anthropic account (person) id; set automatically from the OAuth profile |
@@ -289,6 +292,31 @@ teamclaude probe        # show current setting
 You can also set the interval live from the TUI settings screen (`g` → `p`), alongside the rotation threshold (`t`).
 
 It reads each OAuth account's utilization from Anthropic's usage endpoint (`/api/oauth/usage`), which reports quota **without consuming any message quota**. Minimum interval is 30s. Changing it takes effect on a running server immediately (no restart). When enabled, it also surfaces the **Sonnet 7-day** and **Fable 7-day** buckets as extra bars in the TUI / `status` (when your plan exposes them).
+
+### Keep-warm: start idle accounts' 5h timers (optional, off by default)
+
+The rolling **5-hour session window** only starts once an account sends a real message. So when your active account runs out and rotation moves to a cold account, that account's 5h window starts *then* — right when you need its full headroom. Keep-warm ([#76](https://github.com/KarpelesLab/teamclaude/issues/76)) starts the timer on idle accounts ahead of time, so the next account is already partway (or fully) through a fresh window when it's needed.
+
+```bash
+teamclaude warmup 600    # warm idle accounts every 600s
+teamclaude warmup off    # disabled (default)
+teamclaude warmup        # show current setting
+```
+
+> ⚠️ **This spends a little quota — unlike the passive quota probe.** The 5h timer can't be started by a read-only call, so keep-warm sends a real (minimal) message: for each eligible idle account it spawns a one-shot `claude -p --bare --model haiku "hi"` pointed at this proxy, pinned to that account (see below). It only warms accounts whose 5h window is **not already running**, skips disabled/throttled/errored and third-party-backend accounts, and uses the cheapest model — but it does consume a few tokens and a slice of the 5h/weekly buckets per account per window. Requires the `claude` CLI on `PATH`. Minimum interval 60s; changes apply live (no restart). Status shows under `warm` in `teamclaude status --json`.
+
+### Pin a request to a specific account
+
+`ANTHROPIC_BASE_URL` with a `/tc-acct/<name-or-index>` prefix forces every request onto **one** account, bypassing rotation (and never failing over to another). This is what keep-warm uses internally, and it doubles as a manual way to exercise a specific account:
+
+```bash
+# Route this whole claude session to the account named "work (Acme)" (index also works)
+ANTHROPIC_BASE_URL='http://127.0.0.1:3456/tc-acct/1' \
+ANTHROPIC_API_KEY='<your teamclaude proxy key>' \
+  claude -p --bare 'say hi'
+```
+
+The `<name>` matches an account's display name exactly (URL-encode spaces/parens), or a numeric rotation index. An unknown pin returns `404`. The prefix is stripped before the request is forwarded upstream.
 
 ### Third-party backend accounts
 

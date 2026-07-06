@@ -109,6 +109,19 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
  * aware routing, and retry-on-quota behavior. Control endpoints (status/reload)
  * and the proxy-API-key gate live in the base server's wrapper, not here.
  */
+// Resolve an account-pin token (from a `/tc-acct/<token>` URL) to an account
+// index, or null if it matches nothing. Matches by exact account name first,
+// then by numeric index. Exported for tests.
+export function resolveAccountPin(accountManager, token) {
+  const byName = accountManager.accounts.findIndex(a => a.name === token);
+  if (byName >= 0) return byName;
+  if (/^\d+$/.test(token)) {
+    const i = Number(token);
+    if (i >= 0 && i < accountManager.accounts.length) return i;
+  }
+  return null;
+}
+
 export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null }) {
   let counter = 0;
   return async (req, res) => {
@@ -121,6 +134,23 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // rotated account token, which would 403 the worker event stream.
       if ((req.url || '').startsWith('/v1/code/')) { await relayStream(req, res, upstream, sx); return; }
 
+      // Account pin: a request to `/tc-acct/<name-or-index>/...` (e.g. via
+      // ANTHROPIC_BASE_URL=http://host:port/tc-acct/deepseek) is forced onto that
+      // one account, bypassing rotation. Used by the keep-warm scheduler and for
+      // manual per-account testing. The prefix is stripped before forwarding.
+      let pinnedIndex = null;
+      const pin = (req.url || '').match(/^\/tc-acct\/([^/]+)(\/.*)$/);
+      if (pin) {
+        const token = decodeURIComponent(pin[1]);
+        pinnedIndex = resolveAccountPin(accountManager, token);
+        if (pinnedIndex == null) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: `Unknown account pin "${token}"` } }));
+          return;
+        }
+        req.url = pin[2];
+      }
+
       const reqId = ++counter;
       hooks.onRequestStart?.(reqId, { method: req.method, path: req.url });
 
@@ -129,7 +159,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       for await (const chunk of req) bodyChunks.push(chunk);
       const body = Buffer.concat(bodyChunks);
 
-      const ctx = { account: null, status: null, tried: new Set(), model: parseRequestModel(body) };
+      const ctx = { account: null, status: null, tried: new Set(), model: parseRequestModel(body), pinnedIndex };
       try {
         await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir, sx);
       } catch (err) {
@@ -273,7 +303,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // Select account, skipping any already tried (and failed) this request.
   // The model scopes availability so a Fable-exhausted account is skipped only
   // for Fable requests (it still serves other models).
-  const account = accountManager.getActiveAccount(ctx.tried, ctx.model);
+  // A pinned request (via /tc-acct/<name>) forces one exact account and never
+  // rotates or fails over: once that account has been tried, `account` is null
+  // and the caller gets the exhausted response rather than leaking to another.
+  const account = ctx.pinnedIndex != null
+    ? (ctx.tried.has(ctx.pinnedIndex) ? null : accountManager.accounts[ctx.pinnedIndex])
+    : accountManager.getActiveAccount(ctx.tried, ctx.model);
   if (!account) {
     ctx.status = 429;
     ctx.account = '(none available)';
