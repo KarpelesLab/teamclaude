@@ -503,11 +503,19 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     if (l) { l.write(`\n\n=== ERROR ===\n${err.stack || err.message}`); l.end(); }
 
     const isTransient = err instanceof Error &&
-      (err.message.includes('fetch failed') ||
+      (err.code === 'TEAMCLAUDE_HEADERS_TIMEOUT' || err.code === 'TEAMCLAUDE_BODY_TIMEOUT' ||
+        err.name === 'TimeoutError' || err.name === 'AbortError' ||
+        err.message.includes('fetch failed') ||
         err.code === 'ECONNRESET' || err.code === 'ECONNREFUSED' ||
-        err.code === 'ETIMEDOUT' || err.code === 'UND_ERR_CONNECT_TIMEOUT');
+        err.code === 'ETIMEDOUT' || err.code === 'UND_ERR_CONNECT_TIMEOUT' ||
+        err.code === 'UND_ERR_HEADERS_TIMEOUT' || err.code === 'UND_ERR_BODY_TIMEOUT');
 
-    // Transient network errors: just close the connection and let the client retry
+    // Transient network errors (including a stale-socket headers/body timeout):
+    // close the connection and let the client retry. Failing over to another
+    // account would not help (the poisoned fetch pool is process-wide), but the
+    // fast failure lets Node evict the dead socket so the retry reconnects
+    // cleanly. If headers were already sent (a mid-stream body timeout), destroy
+    // is the only option — the client sees a broken response and retries.
     if (isTransient) {
       res.destroy();
       return;
@@ -534,17 +542,53 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   }
 }
 
+// Idle deadline for the RESPONSE BODY, complementing the headers timeout in
+// upstream-fetch.js. The headers guard only covers time-to-first-byte; once
+// headers arrive it is disarmed, so a network drop AFTER the stream starts would
+// otherwise hang the read forever (the SSE completion just goes silent mid-way).
+// This watchdog resets on every chunk, so a long but healthy stream is never
+// cut — it fires only when the socket produces nothing for the whole window,
+// converting a mid-stream hang into a fast failure that evicts the dead socket
+// (reader.cancel destroys the underlying connection on both the direct-fetch and
+// the sx-tunnel path, since both hand back a web ReadableStream). Override with
+// TEAMCLAUDE_UPSTREAM_BODY_TIMEOUT_MS.
+const DEFAULT_BODY_IDLE_TIMEOUT_MS = 120_000;
+
+function resolveBodyIdleTimeout() {
+  const env = Number(process.env.TEAMCLAUDE_UPSTREAM_BODY_TIMEOUT_MS);
+  return env > 0 ? env : DEFAULT_BODY_IDLE_TIMEOUT_MS;
+}
+
+// Race a single reader.read() against an inactivity deadline. Resolves to the
+// read result, or rejects with a transient TEAMCLAUDE_BODY_TIMEOUT if no chunk
+// arrives within `ms`. The pending read is abandoned on timeout; the caller
+// cancels the reader (evicting the socket) in its finally block.
+export function readWithIdleTimeout(reader, ms) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const err = new Error(`upstream stream idle for ${ms}ms`);
+      err.code = 'TEAMCLAUDE_BODY_TIMEOUT';
+      reject(err);
+    }, ms);
+    timer.unref?.();
+  });
+  return Promise.race([reader.read(), timeout]).finally(() => clearTimeout(timer));
+}
+
 /**
  * Stream an SSE response to the client, parsing usage data along the way.
  */
 async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter) {
   const reader = webStream.getReader();
+  const idleMs = resolveBodyIdleTimeout();
   const decoder = new TextDecoder();
   let sseBuffer = '';
+  let errored = false;
 
   try {
     while (true) {
-      const { done, value } = await reader.read();
+      const { done, value } = await readWithIdleTimeout(reader, idleMs);
       if (done) break;
 
       // Client disconnected — stop reading from upstream
@@ -582,10 +626,19 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
     if (sseBuffer.trim()) {
       parseSSEUsage(sseBuffer, accountIndex, accountManager);
     }
+  } catch (err) {
+    // A mid-stream idle timeout (or any read error) means the upstream went
+    // silent after headers. Rethrow to the caller's transient handler, which
+    // destroys the client connection so the truncated stream is NOT ended
+    // cleanly (a clean res.end() would look like a complete response and
+    // suppress the client's retry). reader.cancel() in finally evicts the socket.
+    errored = true;
+    throw err;
   } finally {
-    // Cancel upstream reader to stop consuming data nobody needs
+    // Cancel upstream reader to stop consuming data nobody needs (and, on the
+    // timeout path, to destroy the dead socket so the pool drops it).
     reader.cancel().catch(() => {});
-    if (!res.writableEnded) res.end();
+    if (!errored && !res.writableEnded) res.end();
   }
 }
 

@@ -36,6 +36,11 @@ const DEFAULT_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_ENDPOINT) {
   const maxRetries = 2;
   const baseDelayMs = 500;
+  // Bound each attempt so a dead pooled socket (after a network drop/reconnect)
+  // can't hang the refresh forever. A hung refresh is especially harmful here:
+  // ensureTokenFresh coalesces callers into a single _refreshPromise, so one
+  // stuck refresh wedges every request for that account until a restart.
+  const timeoutMs = Number(process.env.TEAMCLAUDE_REFRESH_TIMEOUT_MS) || 30_000;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
@@ -56,6 +61,7 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
           refresh_token: refreshToken,
           client_id: DEFAULT_CLIENT_ID,
         }),
+        signal: AbortSignal.timeout(timeoutMs),
       });
 
       if (!res.ok) {
@@ -81,7 +87,8 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
       };
     } catch (err) {
       const isNetworkError = err instanceof Error &&
-        (err.message.includes('fetch failed') ||
+        (err.name === 'TimeoutError' || err.name === 'AbortError' ||
+          err.message.includes('fetch failed') ||
           (err.code === 'ECONNRESET' || err.code === 'ECONNREFUSED' ||
            err.code === 'ETIMEDOUT' || err.code === 'UND_ERR_CONNECT_TIMEOUT'));
 
