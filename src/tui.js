@@ -666,9 +666,13 @@ export class TUI {
     lines.push(' ' + dim('─'.repeat(W - 2)));
 
     const footerH = 2;
-    if (this.mode === 'settings') {
+    // While a prompt is open (mode 'input') keep showing the screen it was
+    // launched from, so e.g. adding a route stays on the routes screen rather
+    // than flashing back to the main dashboard with just the footer prompt.
+    const view = this.mode === 'input' ? this.inputReturn : this.mode;
+    if (view === 'settings') {
       this._renderSettings(lines);
-    } else if (this.mode === 'routes') {
+    } else if (view === 'routes') {
       this._renderRoutes(lines);
     } else {
     // ── Accounts
