@@ -445,6 +445,19 @@ TLS is established **end-to-end with `api.anthropic.com` over the tunnel**, so t
 8. If all accounts are exhausted, returns 429 with the soonest reset time
 9. Client token refresh requests (`/v1/oauth/token`) are relayed to upstream untouched — the proxy and client manage their own token lifecycles independently
 
+## Prompt caching & rotation
+
+Rotation is transparent to your Claude Code session — but it is worth knowing how it interacts with Anthropic's prompt cache.
+
+- **Conversation context is never lost.** Claude Code keeps the full transcript client-side and resends it every turn, so whichever account serves a request sees the complete history. TeamClaude also rewrites the request's `metadata.user_id` `account_uuid` to match the injected token (see [`src/account-uuid-rewrite.js`](src/account-uuid-rewrite.js)), so a mid-session switch stays invisible to the client. Your work continues seamlessly across a rotation.
+- **The prompt cache does not carry across accounts.** Anthropic's [prompt cache](https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching) is scoped to the account/organization that created it (and expires after a few minutes). A different account is a different organization, so the first request after a rotation is a full cache **miss** — that turn is reprocessed uncached (slower and more expensive), after which the new account warms its own cache. This is a property of the API, not something a proxy can share.
+
+In practice rotation only happens near a quota boundary, so most of a session stays on one warm account and you pay the miss only at each switch. To minimise it:
+
+- **Keep switches rare** — the default `98%` threshold already delays rotation until an account is nearly spent.
+- **Prefer a stable account** — pin a preferred order with `teamclaude priority` so one account serves a session until it is actually exhausted, instead of round-robining early.
+- **Avoid cold starts** — [keep-warm](#keep-warm-start-idle-accounts-5h-timers-optional-off-by-default) starts idle accounts' 5h timers ahead of time so the next account isn't cold when rotation reaches it. Note this warms the *session timer*, not the prompt cache — the first real turn on a freshly-rotated account is still a cache miss.
+
 ## Security
 
 The only canonical sources for TeamClaude are this repository
