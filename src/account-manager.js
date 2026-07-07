@@ -1,9 +1,9 @@
 import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired } from './oauth.js';
 import { sameIdentity } from './identity.js';
-import { isFableModel } from './model.js';
+import { weeklyBucketForModel, modelGlobMatches } from './model.js';
 
 // Re-exported for callers that already import model helpers from here.
-export { isFableModel, parseRequestModel } from './model.js';
+export { isFableModel, modelFamily, parseRequestModel, weeklyBucketForModel, modelGlobMatches } from './model.js';
 
 // Quota fields that survive a restart: utilization levels and their reset
 // windows, learned passively from upstream responses. Transient/derived state
@@ -44,7 +44,7 @@ function modelMatches(declared, model) {
 }
 
 export class AccountManager {
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, throttleProbeFloorMs } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, throttleProbeFloorMs, routes } = {}) {
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
     // OAuth token refresh.
     this._refreshFn = refreshFn;
@@ -79,6 +79,7 @@ export class AccountManager {
     }));
     this.currentIndex = 0;
     this.switchThreshold = switchThreshold;
+    this.setRoutes(routes);
     // When every account reads as over-quota we would otherwise refuse locally
     // forever (a stale cached utilization is never re-validated because no
     // request is ever sent). Instead, allow one real upstream probe at most this
@@ -170,13 +171,16 @@ export class AccountManager {
     return true;
   }
 
-  /** Highest utilization across all known quota dimensions (0-1), used to pick
-   * the least-exhausted probe target. Mirrors the ratios in _isNearQuota. */
-  _maxUtilization(account) {
+  /** Highest utilization across the quota dimensions that govern `model` (0-1),
+   * used to pick the least-exhausted probe target. Mirrors _isNearQuota: the
+   * shared 5-hour bucket plus the model's governing weekly bucket. With no model
+   * it falls back to the shared weekly. */
+  _maxUtilization(account, model = null) {
     const q = account.quota;
     let max = 0;
     if (q.unified5h != null) max = Math.max(max, q.unified5h);
-    if (q.unified7d != null) max = Math.max(max, q.unified7d);
+    const weeklyVal = this._governingWeekly(account, model);
+    if (weeklyVal != null) max = Math.max(max, weeklyVal);
     if (q.tokensLimit != null && q.tokensRemaining != null) {
       max = Math.max(max, 1 - q.tokensRemaining / q.tokensLimit);
     }
@@ -184,6 +188,37 @@ export class AccountManager {
       max = Math.max(max, 1 - q.requestsRemaining / q.requestsLimit);
     }
     return max;
+  }
+
+  /** Utilization (0-1) of the weekly bucket that governs `model` on this account:
+   * unified7dFable for Fable, unified7dSonnet for Sonnet, unified7d otherwise.
+   * Falls back to the shared unified7d when a family-specific bucket isn't
+   * reported. Returns null when nothing is known. */
+  _governingWeekly(account, model) {
+    const q = account.quota;
+    const key = this._weeklyBucketFor(model);
+    if (q[key] != null) return q[key];
+    return key !== 'unified7d' ? q.unified7d : null;
+  }
+
+  /** Reset timestamp (ms) of the weekly bucket that governs `model`, falling back
+   * to the shared weekly reset. Used to spend the soonest-expiring quota first. */
+  _governingWeeklyReset(account, model) {
+    const q = account.quota;
+    const key = this._weeklyBucketFor(model);
+    return q[`${key}Reset`] || q.unified7dReset || null;
+  }
+
+  /** True when the family-specific weekly bucket that governs `model` is spent.
+   * Unlike _isNearQuota this ignores the shared 5h/weekly caps — it is only used
+   * to skip an account for a probe of a model it definitely can't serve. Returns
+   * false for families without a dedicated bucket (they share unified7d, already
+   * covered by _isNearQuota). */
+  _modelWeeklyExhausted(account, model) {
+    const q = account.quota;
+    const key = this._weeklyBucketFor(model);
+    if (key === 'unified7d') return false;
+    return q[key] != null && q[key] >= this.switchThreshold;
   }
 
   /**
@@ -204,15 +239,15 @@ export class AccountManager {
     for (const account of this.accounts) {
       if (exclude?.has(account.index)) continue;
       if (!this._isProbeable(account)) continue;
-      // A Fable-exhausted account can't serve a Fable request even as a probe —
-      // it would just 429 again — so skip it for Fable and let the caller emit
+      // A family-exhausted account can't serve that family even as a probe — it
+      // would just 429 again — so skip it (Fable/Sonnet) and let the caller emit
       // the synthetic 429 when no other account is available.
-      if (isFableModel(model) && this._fableExhausted(account)) continue;
-      // Same for model-ownership: a probe for an owned model must not land on a
-      // non-owner (it would just reject the unknown model id).
-      if (model && !this._accountOwnsModel(account, model)) continue;
+      if (model && this._modelWeeklyExhausted(account, model)) continue;
+      // Same for routing/ownership: a probe for a routed or owned model must not
+      // land on an ineligible account (it would just reject the unknown model id).
+      if (model && !this._routeAllows(account, model)) continue;
       const priority = account.priority || 0;
-      const usage = this._maxUtilization(account);
+      const usage = this._maxUtilization(account, model);
       if (priority < bestPriority ||
           (priority === bestPriority && usage < bestUsage)) {
         bestPriority = priority;
@@ -248,27 +283,58 @@ export class AccountManager {
     }
 
     if (account.status === 'exhausted' || account.status === 'error') return false;
-    if (this._isNearQuota(account)) return false;
+    // Model-scoped: _isNearQuota checks the shared 5h bucket plus only the weekly
+    // bucket that governs this model, so a spent Fable/Sonnet bucket bars just
+    // that family — the account still serves every other model normally.
+    if (this._isNearQuota(account, model)) return false;
 
-    // Model-scoped exhaustion: a spent Fable weekly bucket only bars Fable
-    // requests. Non-Fable requests still route here normally.
-    if (isFableModel(model) && this._fableExhausted(account)) return false;
-
-    // Model-ownership routing: if any account has declared ownership of `model`
-    // via its `models` field, only those accounts are available for this request.
-    // This lets e.g. a DeepSeek account claim deepseek-* model names so those
-    // requests never land on Claude accounts (which don't recognize the model).
-    if (model && !this._accountOwnsModel(account, model)) return false;
+    // Route/ownership restriction: a configured route can pin a model pattern to
+    // an exclusive set of accounts; failing that, a per-account `models` claim
+    // restricts an owned model to its owners. Either way an account not eligible
+    // for this model is skipped so the request never lands somewhere it can't run.
+    if (model && !this._routeAllows(account, model)) return false;
 
     return true;
   }
 
-  /** True when this account's Fable weekly bucket is at/over the switch
-   * threshold. The reset is cleared by refreshExpiredQuotas before selection, so
-   * a non-null value here is still live. Model-scoped: only gates Fable requests. */
-  _fableExhausted(account) {
-    const q = account.quota;
-    return q.unified7dFable != null && q.unified7dFable >= this.switchThreshold;
+  /**
+   * Normalize and store the configurable routing table. A route pins a set of
+   * model globs to an exclusive set of accounts (and may override the governing
+   * quota bucket). Called from the constructor and on config reload.
+   *   { name, match: string|string[], accounts?: (name|index)[], bucket? }
+   */
+  setRoutes(routes) {
+    this.routes = (Array.isArray(routes) ? routes : []).map((r, i) => ({
+      name: r.name || `route-${i + 1}`,
+      match: (Array.isArray(r.match) ? r.match : [r.match]).filter(g => typeof g === 'string' && g),
+      accounts: Array.isArray(r.accounts) ? r.accounts.map(String) : [],
+      bucket: r.bucket || null,
+    })).filter(r => r.match.length);
+  }
+
+  /** The first configured route whose globs match `model`, or null. */
+  _routeForModel(model) {
+    if (!model || !this.routes?.length) return null;
+    return this.routes.find(r => r.match.some(g => modelGlobMatches(g, model))) || null;
+  }
+
+  /** The weekly quota bucket that governs `model` — a matching route's `bucket`
+   * override wins, otherwise the model family's default bucket. */
+  _weeklyBucketFor(model) {
+    const route = this._routeForModel(model);
+    return route?.bucket || weeklyBucketForModel(model);
+  }
+
+  /** Whether `account` may serve `model`. A matching route with an `accounts`
+   * list is exclusive (only listed accounts, by name or index). With no matching
+   * route — or a route that lists no accounts — it falls back to the per-account
+   * `models` ownership claim so PR #74 configs keep working. */
+  _routeAllows(account, model) {
+    const route = this._routeForModel(model);
+    if (route && route.accounts.length) {
+      return route.accounts.includes(account.name) || route.accounts.includes(String(account.index));
+    }
+    return this._accountOwnsModel(account, model);
   }
 
   /** Returns true if no account claims model ownership, or this account does. */
@@ -280,6 +346,46 @@ export class AccountManager {
       }
     }
     return true; // no one claims ownership → any account is fine
+  }
+
+  /**
+   * The routing table for display: every configured route plus an ephemeral,
+   * auto-created route for each model family that some account meters with its
+   * own weekly bucket but no configured route already covers. Auto-created routes
+   * carry `autocreated: true` and are never persisted — they simply surface the
+   * per-model quota the server already respects. Each route lists the accounts it
+   * can use with a live eligibility flag.
+   */
+  getRoutes() {
+    const out = this.routes.map(r => ({
+      name: r.name, match: r.match, bucket: r.bucket, autocreated: false,
+      accounts: this._routeAccountsView(r),
+    }));
+
+    const detected = [];
+    if (this.accounts.some(a => a.quota.unified7dFable != null)) {
+      detected.push({ name: 'fable', match: ['*fable*'], sample: 'claude-fable-5' });
+    }
+    if (this.accounts.some(a => a.quota.unified7dSonnet != null)) {
+      detected.push({ name: 'sonnet', match: ['*sonnet*'], sample: 'claude-sonnet-4-6' });
+    }
+    for (const d of detected) {
+      if (this._routeForModel(d.sample)) continue; // already covered by a configured route
+      out.push({
+        name: d.name, match: d.match, bucket: null, autocreated: true,
+        accounts: this.accounts.map(a => ({ name: a.name, eligible: this._isAvailable(a, d.sample) })),
+      });
+    }
+    return out;
+  }
+
+  /** Accounts a configured route can use (all accounts when it lists none), each
+   * with a live eligibility flag for a representative model of the route. */
+  _routeAccountsView(route) {
+    const sample = route.match[0].replace(/\*/g, '') || 'model';
+    const inRoute = a => !route.accounts.length
+      || route.accounts.includes(a.name) || route.accounts.includes(String(a.index));
+    return this.accounts.filter(inRoute).map(a => ({ name: a.name, eligible: this._isAvailable(a, sample) }));
   }
 
   /**
@@ -388,13 +494,20 @@ export class AccountManager {
     }
   }
 
-  _isNearQuota(account) {
+  _isNearQuota(account, model = null) {
     const q = account.quota;
     this._clearExpiredQuotas(account);
 
-    // Unified quotas (Claude Max) — utilization is already 0-1
+    // Shared 5-hour bucket gates every request regardless of model.
     if (q.unified5h != null && q.unified5h >= this.switchThreshold) return true;
-    if (q.unified7d != null && q.unified7d >= this.switchThreshold) return true;
+
+    // Only the weekly bucket that GOVERNS this model is checked: Fable and Sonnet
+    // meter their own weekly quota, so a spent Fable bucket must not bar an Opus
+    // or Sonnet request (and vice versa). When the family bucket isn't reported
+    // (e.g. the plan doesn't expose it), fall back to the shared weekly so an
+    // account over its overall cap is still treated as near-quota.
+    const weeklyVal = this._governingWeekly(account, model);
+    if (weeklyVal != null && weeklyVal >= this.switchThreshold) return true;
 
     // Standard quotas (API key accounts)
     if (q.tokensLimit != null && q.tokensRemaining != null) {
@@ -435,8 +548,11 @@ export class AccountManager {
       if (!this._isAvailable(account, model)) continue;
 
       const priority = account.priority || 0;
-      // Unknown weekly reset sorts first so we fill it in.
-      const weeklyReset = account.quota.unified7dReset || -Infinity;
+      // Rank by the reset of the weekly bucket that governs THIS model (Fable and
+      // Sonnet have their own), so a Fable request spends the account whose Fable
+      // window refreshes soonest while preserving accounts that reset later for
+      // Opus/Sonnet. Unknown reset sorts first so we probe and fill it in.
+      const weeklyReset = this._governingWeeklyReset(account, model) || -Infinity;
       if (priority < bestPriority ||
           (priority === bestPriority && weeklyReset < bestReset)) {
         bestPriority = priority;
@@ -492,8 +608,8 @@ export class AccountManager {
       // here would send a live request on an account that must not be used and,
       // below, silently clear its throttle/error state. (Mirrors _isAvailable.)
       if (account.disabled || account.status === 'error') continue;
-      // A request for an owned model must not fall back to a non-owner account.
-      if (model && !this._accountOwnsModel(account, model)) continue;
+      // A routed/owned model must not fall back to an ineligible account.
+      if (model && !this._routeAllows(account, model)) continue;
       const resetTime = account.rateLimitedUntil
         || account.quota.unified5hReset
         || account.quota.unified7dReset
@@ -826,6 +942,7 @@ export class AccountManager {
     return {
       currentAccount: this.accounts[this.currentIndex]?.name,
       switchThreshold: this.switchThreshold,
+      routes: this.getRoutes(),
       accounts: this.accounts.map(a => ({
         name: a.name,
         type: a.type,

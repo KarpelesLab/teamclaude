@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { ensureCerts, createConnectHandler } from './mitm.js';
 import { patchAccountUuid } from './account-uuid-rewrite.js';
 import { parseRequestModel } from './account-manager.js';
+import { TopLevelFieldFinder } from './model.js';
 import { BodyWriter } from './request-log.js';
 import { upstreamFetch } from './upstream-fetch.js';
 
@@ -173,11 +174,22 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       hooks.onRequestStart?.(reqId, { method: req.method, path: req.url });
 
       // Buffer request body (needed to resend on a different account after a 429).
+      // Peek the top-level `model` field incrementally as chunks arrive so the
+      // TUI can show it the instant it appears in the stream — usually the first
+      // frame — rather than waiting for the whole body and the request to finish.
       const bodyChunks = [];
-      for await (const chunk of req) bodyChunks.push(chunk);
+      const modelFinder = new TopLevelFieldFinder('model');
+      for await (const chunk of req) {
+        bodyChunks.push(chunk);
+        if (!modelFinder.done) {
+          const found = modelFinder.push(chunk);
+          if (found) hooks.onRequestModel?.(reqId, { model: found });
+        }
+      }
       const body = Buffer.concat(bodyChunks);
 
-      const ctx = { account: null, status: null, tried: new Set(), model: parseRequestModel(body), pinnedIndex };
+      const model = modelFinder.done ? modelFinder.value : parseRequestModel(body);
+      const ctx = { account: null, status: null, tried: new Set(), model, pinnedIndex };
       try {
         await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir, sx);
       } catch (err) {

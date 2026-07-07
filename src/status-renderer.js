@@ -20,11 +20,15 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
   }
   lines.push('');
 
+  for (const line of routingLines(status.routes, paint)) lines.push(line);
+
   for (const account of accounts) {
     lines.push(renderAccountHeader(account, status.currentAccount, paint, now));
     for (const quotaLine of quotaLines(account, now, paint)) {
       lines.push(`  ${quotaLine}`);
     }
+    const routing = modelRoutingLine(account, status.switchThreshold, now, paint);
+    if (routing) lines.push(`  ${routing}`);
     lines.push(`  ${paint.dim('Usage'.padEnd(8))} ${formatUsage(account.usage, now)}`);
     lines.push(`  ${paint.dim('Probe'.padEnd(8))} ${formatAccountProbe(account.name, probe, now, paint)}`);
     lines.push('');
@@ -45,6 +49,24 @@ function colors(enabled) {
     red: wrap(31),
     cyan: wrap(36),
   };
+}
+
+// The routing table: one line per route (configured first, then auto-detected),
+// listing the model globs it matches and the accounts it can use, each colored
+// by live eligibility. Auto-created routes (a family metered separately with no
+// configured route) are tagged (auto); a bucket override shows in [brackets].
+function routingLines(routes, paint) {
+  if (!Array.isArray(routes) || routes.length === 0) return [];
+  const lines = [paint.bold('Routing')];
+  for (const route of routes) {
+    const match = (route.match || []).join(', ');
+    const accounts = (route.accounts || [])
+      .map(a => (a.eligible ? paint.green(a.name) : paint.red(a.name))).join(' ') || paint.gray('(none)');
+    const tag = route.autocreated ? paint.dim(' (auto)') : route.bucket ? paint.dim(` [${route.bucket}]`) : '';
+    lines.push(`  ${match.padEnd(16)} ${paint.dim('→')} ${accounts}${tag}`);
+  }
+  lines.push('');
+  return lines;
 }
 
 function renderAccountHeader(account, currentAccount, paint, now) {
@@ -76,6 +98,33 @@ function formatAccountStatus(account, now, paint) {
   }
 
   return parts.join(' / ');
+}
+
+// Per-account, per-family eligibility — the "some accounts are disabled for
+// specific models" view. Only rendered for accounts that meter a family
+// separately (a Sonnet or Fable weekly bucket), since that is the only case
+// where a request's model changes where it can route. A family reads ✗ when the
+// shared 5h bucket is spent (blocks everything) or when its own weekly bucket is
+// over the switch threshold; the reset is shown when the family bucket is the
+// blocker so it's clear when that model becomes available on this account again.
+function modelRoutingLine(account, threshold, now, paint) {
+  const q = account.quota || {};
+  if (q.unified7dSonnet == null && q.unified7dFable == null) return null;
+  const t = Number(threshold);
+  const fiveOver = q.unified5h != null && !Number.isNaN(t) && q.unified5h >= t;
+
+  const cell = (label, weekly, reset) => {
+    const weeklyOver = weekly != null && !Number.isNaN(t) && weekly >= t;
+    const mark = fiveOver || weeklyOver ? paint.red('✗') : paint.green('✓');
+    const resetTs = parseTs(reset);
+    const when = weeklyOver && resetTs && resetTs > now ? paint.dim(` ${formatDuration(resetTs - now)}`) : '';
+    return `${label} ${mark}${when}`;
+  };
+
+  const cells = [cell('Opus', q.unified7d, q.unified7dReset)];
+  if (q.unified7dSonnet != null) cells.push(cell('Sonnet', q.unified7dSonnet, q.unified7dSonnetReset));
+  if (q.unified7dFable != null) cells.push(cell('Fable', q.unified7dFable, q.unified7dFableReset));
+  return `${paint.dim('Models'.padEnd(8))} ${cells.join('   ')}`;
 }
 
 function quotaLines(account, now, paint) {

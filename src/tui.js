@@ -28,6 +28,12 @@ function rpad(s, w) {
   return gap > 0 ? s + ' '.repeat(gap) : s;
 }
 
+// Split a comma-separated input (route globs / account names) into trimmed,
+// non-empty tokens. Shared by the routes editor prompts.
+function splitCsv(value) {
+  return (value || '').split(',').map(s => s.trim()).filter(Boolean);
+}
+
 /** Truncate a string with ANSI codes to exactly w visible characters, then reset. */
 function truncate(s, w) {
   let visible = 0;
@@ -186,6 +192,11 @@ export class TUI {
     this.render();
   }
 
+  onRequestModel(id, info) {
+    const r = this.active.get(id);
+    if (r && info.model) { r.model = info.model; this.render(); }
+  }
+
   onRequestRouted(id, info) {
     const r = this.active.get(id);
     if (r) r.account = info.account;
@@ -230,6 +241,7 @@ export class TUI {
       case 'add':    this._keyAdd(k); break;
       case 'input':  this._keyInput(k); break;
       case 'settings': this._keySettings(k); break;
+      case 'routes': this._keyRoutes(k); break;
     }
     this.render();
   }
@@ -247,7 +259,7 @@ export class TUI {
     }
     else if (k === 'a') { this.mode = 'add'; }
     else if (k === 'R') { this._doSync(); }
-    else if (k === 'g' && this.sx) { this.mode = 'settings'; this.setIdx = 0; this._loadSxBalance(); }
+    else if (k === 'g') { this.mode = 'settings'; this.setIdx = 0; this._loadSxBalance(); }
   }
 
   // Navigable rows on the settings screen, top to bottom. Both the renderer and
@@ -281,6 +293,17 @@ export class TUI {
       left: () => this._nudgeProbe(-30),
       right: () => this._nudgeProbe(+30),
       enter: () => this._promptInput('Quota probe seconds (0=off, min 30)', v => this._doSetProbe(v.trim())),
+    });
+
+    fields.push({
+      id: 'routes',
+      label: 'Manage routing',
+      hint: 'Enter to open',
+      value: () => {
+        const n = (this.config.routes || []).length;
+        return n ? green(`${n} route${n === 1 ? '' : 's'}`) : gray('none');
+      },
+      enter: () => { this.mode = 'routes'; this.routeIdx = 0; },
     });
 
     if (this.sx) {
@@ -645,6 +668,8 @@ export class TUI {
     const footerH = 2;
     if (this.mode === 'settings') {
       this._renderSettings(lines);
+    } else if (this.mode === 'routes') {
+      this._renderRoutes(lines);
     } else {
     // ── Accounts
     if (this.am.accounts.length === 0) {
@@ -662,6 +687,18 @@ export class TUI {
       }
     }
 
+    // ── Routing (configured + auto-detected routes, when any exist)
+    const routes = this.am.getRoutes();
+    if (routes.length) {
+      lines.push('');
+      lines.push(dim(' Routing'));
+      for (const r of routes) {
+        const accts = r.accounts.map(a => (a.eligible ? green(a.name) : red(a.name))).join(' ') || gray('(none)');
+        const tag = r.autocreated ? dim(' (auto)') : r.bucket ? dim(` [${r.bucket}]`) : '';
+        lines.push(`   ${cyan(r.match.join(','))} ${dim('→')} ${accts}${tag}`);
+      }
+    }
+
     // ── Activity header
     lines.push('');
     const ac = this.active.size;
@@ -674,8 +711,9 @@ export class TUI {
     for (const [, r] of this.active) {
       const el = ((now - r.started) / 1000).toFixed(1);
       const sp = cyan(SPINNER[this.frame]);
+      const m = r.model ? dim(` (${r.model})`) : ''; // filled in as soon as the model is peeked from the stream
       const a = r.account ? ` → ${r.account}` : '';
-      lines.push(` ${sp} ${gray(r.t)}  ${r.method} ${r.path}${a} ${dim(`(${el}s...)`)}`);
+      lines.push(` ${sp} ${gray(r.t)}  ${r.method} ${r.path}${m}${a} ${dim(`(${el}s...)`)}`);
     }
 
     // Completed log
@@ -764,6 +802,15 @@ export class TUI {
         line += `  F7  ${bar(q.unified7dFable, bw, q.unified7dFableReset)}`;
       }
     }
+    // Explicit "disabled for these models" tag (issue #85): a family whose own
+    // weekly bucket is over the switch threshold can't serve that model even
+    // while the account is otherwise active. A spent shared 5h blocks everything
+    // and is already conveyed by the Ses bar + status, so it's not repeated here.
+    const th = this.am.switchThreshold;
+    const blocked = [];
+    if (q.unified7dSonnet != null && q.unified7dSonnet >= th) blocked.push('Sonnet');
+    if (q.unified7dFable != null && q.unified7dFable >= th) blocked.push('Fable');
+    if (blocked.length) line += `  ${red('⊘ ' + blocked.join(' '))}`;
     return line;
   }
 
@@ -798,6 +845,10 @@ export class TUI {
     lines.push(bold('  Quota probe') + dim('  — refresh idle accounts from the usage endpoint'));
     lines.push(row(byId('probe')));
     lines.push('');
+    // ── Routing
+    lines.push(bold('  Routing') + dim('  — pin model families to specific accounts'));
+    lines.push(row(byId('routes')));
+    lines.push('');
     // ── sx.org
     lines.push(bold('  sx.org proxy') + dim('  — route upstream via a residential IP (429 workaround)'));
     lines.push('');
@@ -823,12 +874,126 @@ export class TUI {
     lines.push(dim('  TLS stays end-to-end; residential traffic is metered by sx.org.'));
   }
 
+  // ── routes editor ──────────────────────────────────
+
+  _keyRoutes(k) {
+    const routes = this.config.routes || [];
+    const n = routes.length;
+    if (this.routeIdx >= n) this.routeIdx = Math.max(0, n - 1);
+    if ((k === 'up' || k === 'k') && n) this.routeIdx = (this.routeIdx - 1 + n) % n;
+    else if ((k === 'down' || k === 'j') && n) this.routeIdx = (this.routeIdx + 1) % n;
+    else if (k === 'a') this._routeEdit(null);
+    else if (k === 'e' && n) this._routeEdit(routes[this.routeIdx]);
+    else if (k === 'd' && n) this._routeDelete(this.routeIdx);
+    else if (k === 'esc' || k === 'q') { this.mode = 'settings'; this.setIdx = 0; }
+  }
+
+  // Prompt for one route field, prefilled, returning to the routes screen.
+  // Unlike _promptInput this passes empty values through (so optional fields can
+  // be left blank) and lets the caller chain the next prompt.
+  _routePrompt(label, prefill, cb) {
+    this.mode = 'input';
+    this.inputReturn = 'routes';
+    this.inputPrompt = label;
+    this.inputBuf = prefill || '';
+    this.inputCb = v => cb((v || '').trim());
+  }
+
+  // Guided add/edit: name → glob(s) → accounts → bucket → save. `orig` is the
+  // existing route being edited, or null when adding.
+  _routeEdit(orig) {
+    const draft = {
+      match: (orig ? (Array.isArray(orig.match) ? orig.match : [orig.match]) : []).join(', '),
+      accounts: (orig?.accounts || []).join(', '),
+      bucket: orig?.bucket || '',
+    };
+    this._routePrompt('Route name', orig?.name || '', name => {
+      if (!name) { this._addLog('Route name required — cancelled'); this.mode = 'routes'; return; }
+      draft.name = name;
+      this._routePrompt('Model glob(s), comma-separated (e.g. *fable*)', draft.match, match => {
+        if (!match) { this._addLog('At least one glob required — cancelled'); this.mode = 'routes'; return; }
+        draft.match = match;
+        const names = this.am.accounts.map(a => a.name).join(', ');
+        this._routePrompt(`Accounts (comma; blank = all) [${names}]`, draft.accounts, accts => {
+          draft.accounts = accts;
+          this._routePrompt('Quota bucket override (blank = auto)', draft.bucket, bucket => {
+            draft.bucket = bucket;
+            this._routeSave(draft, orig);
+          });
+        });
+      });
+    });
+  }
+
+  async _routeSave(draft, orig) {
+    const route = { name: draft.name, match: splitCsv(draft.match) };
+    const accounts = splitCsv(draft.accounts);
+    if (accounts.length) route.accounts = accounts;
+    if (draft.bucket) route.bucket = draft.bucket;
+
+    this.config.routes = this.config.routes || [];
+    const at = orig ? this.config.routes.indexOf(orig)
+      : this.config.routes.findIndex(r => r.name === route.name);
+    if (at >= 0) this.config.routes[at] = route; else this.config.routes.push(route);
+
+    this.am.setRoutes(this.config.routes); // apply to the running rotation immediately
+    try { await this.saveConfig(this.config); this._addLog(`Route "${route.name}" saved`); }
+    catch (e) { this._addLog(`Failed to save route: ${e.message}`); }
+    this.mode = 'routes';
+    this.routeIdx = at >= 0 ? at : this.config.routes.length - 1;
+    if (this.running) this.render();
+  }
+
+  async _routeDelete(idx) {
+    const routes = this.config.routes || [];
+    const r = routes[idx];
+    if (!r) return;
+    routes.splice(idx, 1);
+    this.am.setRoutes(routes);
+    try { await this.saveConfig(this.config); this._addLog(`Route "${r.name}" deleted`); }
+    catch (e) { this._addLog(`Failed to save: ${e.message}`); }
+    this.routeIdx = Math.max(0, Math.min(idx, routes.length - 1));
+    if (this.running) this.render();
+  }
+
+  _renderRoutes(lines) {
+    const routes = this.config.routes || [];
+    lines.push('');
+    lines.push(bold('  Routes') + dim('  — pin model globs to specific accounts (first match wins)'));
+    lines.push('');
+    if (!routes.length) {
+      lines.push(gray('    No routes configured. Press [a] to add one.'));
+    } else {
+      routes.forEach((r, i) => {
+        const sel = i === this.routeIdx;
+        const cursor = sel ? cyan('▸') : ' ';
+        const match = (Array.isArray(r.match) ? r.match : [r.match]).join(', ');
+        const accts = (r.accounts && r.accounts.length) ? r.accounts.join(' ') : dim('(all accounts)');
+        const bucket = r.bucket ? dim(`  [${r.bucket}]`) : '';
+        const name = rpad(r.name || '(unnamed)', 14);
+        lines.push(`   ${cursor} ${sel ? bold(name) : name} ${cyan(rpad(match, 22))} ${dim('→')} ${accts}${bucket}`);
+      });
+    }
+    // Auto-detected routes (read-only) for context — a family metered separately
+    // with no configured route. Pin one by adding a route with the same glob.
+    const auto = this.am.getRoutes().filter(r => r.autocreated);
+    if (auto.length) {
+      lines.push('');
+      lines.push(dim('  Auto-detected (not saved):'));
+      for (const r of auto) {
+        lines.push(dim(`     ${r.match.join(', ')} → ${r.accounts.map(a => a.name).join(' ')}`));
+      }
+    }
+  }
+
   _renderFooter() {
     switch (this.mode) {
       case 'normal':
         return ` ${bold('s')}witch  ${bold('a')}dd  ${bold('r')}emove  ${bold('d')}isable  ${bold('R')}eload  ${bold('g')} settings  ${bold('q')}uit`;
       case 'settings':
         return ` ${dim('↑↓')} navigate  ${dim('←→')} change  ${bold('Enter')} edit  ${bold('Esc')} back`;
+      case 'routes':
+        return ` ${dim('↑↓')} select  ${bold('a')}dd  ${bold('e')}dit  ${bold('d')}elete  ${bold('Esc')} back`;
       case 'select': {
         const act = this.selAction === 'switch' ? 'switch'
           : this.selAction === 'toggle' ? 'enable/disable'

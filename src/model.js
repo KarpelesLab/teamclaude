@@ -9,6 +9,49 @@ export function isFableModel(model) {
   return typeof model === 'string' && /fable/i.test(model);
 }
 
+// The model "family" a request belongs to. Anthropic meters some families with
+// their own weekly quota bucket (Fable, Sonnet) on top of the shared 5-hour and
+// weekly buckets, so the family decides which bucket governs a given request —
+// letting an account whose Fable bucket is spent keep serving Opus/Sonnet.
+// Returns a stable lowercase tag; unknown ids fall back to 'other'.
+export function modelFamily(model) {
+  if (typeof model !== 'string' || !model) return 'other';
+  if (/fable/i.test(model)) return 'fable';
+  if (/sonnet/i.test(model)) return 'sonnet';
+  if (/opus/i.test(model)) return 'opus';
+  if (/haiku/i.test(model)) return 'haiku';
+  return 'other';
+}
+
+// Quota buckets on an account (see AccountManager emptyQuota). The shared 5-hour
+// bucket applies to every request; the weekly bucket depends on the family.
+// A family with no dedicated weekly bucket falls back to the shared 'unified7d'.
+const FAMILY_WEEKLY_BUCKET = {
+  fable: 'unified7dFable',
+  sonnet: 'unified7dSonnet',
+};
+
+// The weekly quota bucket key that governs a model, e.g. a Fable request is
+// gated by 'unified7dFable' rather than the shared 'unified7d'. Used by account
+// selection so a spent family bucket only bars that family's requests.
+export function weeklyBucketForModel(model) {
+  return FAMILY_WEEKLY_BUCKET[modelFamily(model)] || 'unified7d';
+}
+
+// Match a shell-style glob against a model id. Only `*` is special (matches any
+// run of characters, including none); every other character is literal. The
+// comparison is case-insensitive. Used by configurable routes so a pattern like
+// `*fable*` or `claude-opus-*` selects the models a route handles.
+export function modelGlobMatches(glob, model) {
+  if (typeof glob !== 'string' || typeof model !== 'string') return false;
+  const re = '^' + glob.split('*').map(escapeRegExp).join('.*') + '$';
+  return new RegExp(re, 'i').test(model);
+}
+
+function escapeRegExp(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 // Streaming, byte-exact locator for a TOP-LEVEL string field of a JSON object,
 // fed incrementally. It tracks JSON structure (container stack, key/value,
 // string/escape) so it ONLY matches the field at depth 1 of the root object —

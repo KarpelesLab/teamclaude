@@ -14,7 +14,7 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 ## Features
 
 - **Automatic account rotation** — switches to the next account when session (5h) or weekly (7d) quota reaches the configured threshold (default 98%)
-- **Model-aware routing** — the per-model weekly cap (e.g. Fable) is tracked separately, so an account whose Fable quota is spent is skipped **only** for Fable requests and still serves Opus/Sonnet. Requests are routed by their `model` (read exactly from the request body, in both base-URL and MITM modes)
+- **Model-aware routing** — the per-model weekly cap (e.g. Fable) is tracked separately, so an account whose Fable quota is spent is skipped **only** for Fable requests and still serves Opus/Sonnet. Requests are routed by their `model` (read exactly from the request body, in both base-URL and MITM modes). Optional **[model routes](#model-routes)** pin model patterns to a specific set of accounts (config, `teamclaude route`, or the TUI settings screen → Manage routing)
 - **Auto-retry on 429** — waits the `retry-after` duration and retries the same account; a quota rejection (a spent weekly bucket) switches accounts immediately instead of waiting, and switches to the next on persistent errors
 - **Interactive TUI** — real-time dashboard with color-coded quota bars, reset countdowns, activity log, and keyboard controls; a settings screen (`g`) edits the rotation threshold, quota-probe interval, and sx.org proxy live
 - **OAuth token management** — automatically refreshes tokens nearing expiry and persists them to config; client token refreshes pass through untouched
@@ -176,6 +176,7 @@ teamclaude remove <name>     # Remove an account (by name or email)
 teamclaude disable <name>    # Temporarily exclude an account from rotation
 teamclaude enable <name>     # Re-enable it (also clears a stuck error state)
 teamclaude priority <name> 1 # Set rotation priority (lower = preferred)
+teamclaude route list        # Manage per-model routes (add/rm); see Model routes
 teamclaude probe 300         # Enable background quota refresh (off by default)
 teamclaude alias             # Print/install a `claude` alias that routes via the proxy
 teamclaude api <path>        # Call an API endpoint with account credentials
@@ -277,6 +278,35 @@ After a host network drop and reconnect, Node's shared connection pool can hold 
 | `accounts[].upstream` | Alternative upstream base URL for this account (e.g. `https://api.deepseek.com/anthropic`). Overrides the global `upstream` for this account only |
 | `accounts[].modelMap` | Object mapping Anthropic model names to this backend's model names (e.g. `{"claude-sonnet-4-6": "deepseek-v4-pro[1m]"}`). Applied automatically when requests are routed to this account |
 | `accounts[].models` | Array of model names this account exclusively handles. When any account declares a `models` list, requests for those models are routed only to accounts that list them — use this to reserve a third-party account for sessions that pass `--model <name>` explicitly |
+| `routes` | Optional list of routing rules that pin model patterns to specific accounts — see [Model routes](#model-routes) |
+
+### Model routes
+
+By default every request routes through the same pool, and per-model quota is respected automatically: a family with its own weekly bucket (Fable, Sonnet) only blocks that family, so an account whose Fable quota is spent still serves Opus/Sonnet. `teamclaude status` shows this per account (a `Models` line) and any families it detects appear as **auto** routes.
+
+To go further you can pin model patterns to an **exclusive** set of accounts with a `routes` table. Each route matches the request's `model` id against shell-style globs (`*` is the only wildcard) and, on the **first matching** route, restricts the request to the listed accounts:
+
+```json
+"routes": [
+  { "name": "fable", "match": ["*fable*"], "accounts": ["personal-max"] },
+  { "name": "bulk",  "match": ["*opus*", "*sonnet*"], "accounts": ["corp-1", "corp-2"] }
+]
+```
+
+- **`match`** — one or more model globs; the first route whose globs match wins.
+- **`accounts`** — account names (or indices) that may serve matching models. **Exclusive**: only these are used (and they 429/rotate among themselves when spent). Omit to route to all accounts — e.g. to only set a `bucket` override.
+- **`bucket`** — optional: force which quota bucket governs eligibility (`unified7dFable`, `unified7dSonnet`, `unified7d`), for the rare case the family can't be inferred from the model id.
+
+Manage routes from the shell (changes apply to a running server immediately):
+
+```bash
+teamclaude route list
+teamclaude route add fable --match '*fable*' --accounts personal-max
+teamclaude route add bulk  --match '*opus*,*sonnet*' --accounts corp-1,corp-2
+teamclaude route rm fable
+```
+
+…or interactively in the TUI: open settings (**`g`**) → **Manage routing**, then `a` add / `e` edit / `d` delete. The routes table (configured + auto-detected) is shown in both the TUI and `teamclaude status`.
 
 ### Quota probe (optional, off by default)
 

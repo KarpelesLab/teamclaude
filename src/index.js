@@ -79,6 +79,11 @@ switch (command) {
     await warmupCommand();
     process.exit(0);
     break;
+  case 'route':
+  case 'routes':
+    await routeCommand();
+    process.exit(0);
+    break;
   case 'update':
     await updateCommand();
     process.exit(0);
@@ -130,7 +135,7 @@ async function serverCommand() {
   }
 
   const threshold = config.switchThreshold || 0.98;
-  const accountManager = new AccountManager(accounts, threshold);
+  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes });
 
   // Restore quota observed in a previous run so a restart doesn't lose rotation
   // state (passive — we never call the API to re-learn it). Stale windows are
@@ -214,6 +219,9 @@ async function serverCommand() {
     const diskConfig = await loadConfig();
     if (!diskConfig) return 0;
     const added = await syncAccountsFromDisk(diskConfig, config, accountManager);
+    // Pick up route table edits (teamclaude route …, TUI editor, or a hand edit).
+    config.routes = diskConfig.routes || [];
+    accountManager.setRoutes(config.routes);
     // Apply an sx.org key/mode change made on disk (e.g. via POST /teamclaude/reload).
     const diskSxKey = diskConfig.sx?.apiKey || null;
     const diskSxMode = diskConfig.sx?.mode || 'always';
@@ -266,6 +274,8 @@ async function serverCommand() {
         if (config.switchThreshold != null) diskConfig.switchThreshold = config.switchThreshold;
         if (config.quotaProbeSeconds != null) diskConfig.quotaProbeSeconds = config.quotaProbeSeconds;
         if (config.warmupSeconds != null) diskConfig.warmupSeconds = config.warmupSeconds;
+        // Persist the route table (edited from the TUI routes screen).
+        if (config.routes != null) diskConfig.routes = config.routes;
       }),
       syncAccounts: reloadAccounts,
       onQuit: async () => {
@@ -278,6 +288,7 @@ async function serverCommand() {
     });
     hooks = {
       onRequestStart: (id, info) => tui.onRequestStart(id, info),
+      onRequestModel: (id, info) => tui.onRequestModel(id, info),
       onRequestRouted: (id, info) => tui.onRequestRouted(id, info),
       onRequestEnd: (id, info) => tui.onRequestEnd(id, info),
     };
@@ -955,6 +966,77 @@ async function removeCommand() {
   console.log(`Removed account "${account.name}"`);
 }
 
+// ── route ───────────────────────────────────────────────────
+
+const ROUTE_USAGE = [
+  'Usage: teamclaude route [list]',
+  '       teamclaude route add <name> --match "<glob>[,<glob>]" [--accounts "<name-or-index>[,...]"] [--bucket <quota-bucket>]',
+  '       teamclaude route rm <name>',
+  '',
+  'A route pins model ids matching its globs to an exclusive set of accounts.',
+  'Omit --accounts to route to all accounts (e.g. just to override --bucket).',
+  'First matching route wins. Changes apply to a running server immediately.',
+].join('\n');
+
+function splitList(value) {
+  return (value || '').split(',').map(s => s.trim()).filter(Boolean);
+}
+
+async function routeCommand() {
+  const sub = args[1] || 'list';
+  const config = await loadOrCreateConfig();
+  config.routes = Array.isArray(config.routes) ? config.routes : [];
+
+  if (sub === 'list') {
+    if (!config.routes.length) { console.log('No routes configured.'); return; }
+    for (const r of config.routes) {
+      const match = (Array.isArray(r.match) ? r.match : [r.match]).join(', ');
+      const accts = (r.accounts && r.accounts.length) ? r.accounts.join(', ') : '(all accounts)';
+      const bucket = r.bucket ? `  bucket=${r.bucket}` : '';
+      console.log(`${r.name || '(unnamed)'}: ${match} → ${accts}${bucket}`);
+    }
+    return;
+  }
+
+  if (sub === 'add') {
+    const name = args[2] && !args[2].startsWith('--') ? args[2] : null;
+    const match = splitList(argValue('--match'));
+    const accounts = splitList(argValue('--accounts'));
+    const bucket = argValue('--bucket');
+    if (!name || !match.length) {
+      console.error(ROUTE_USAGE);
+      process.exit(1);
+    }
+    const known = new Set(config.accounts.map(a => a.name));
+    for (const a of accounts) {
+      if (!known.has(a) && !/^\d+$/.test(a)) console.error(`Warning: no account named "${a}" (yet)`);
+    }
+    const route = { name, match };
+    if (accounts.length) route.accounts = accounts;
+    if (bucket) route.bucket = bucket;
+    const at = config.routes.findIndex(r => r.name === name);
+    if (at >= 0) { config.routes[at] = route; console.log(`Updated route "${name}"`); }
+    else { config.routes.push(route); console.log(`Added route "${name}"`); }
+    await saveConfig(config);
+    await notifyRunningServer(config);
+    return;
+  }
+
+  if (sub === 'rm' || sub === 'remove' || sub === 'delete') {
+    const name = args[2];
+    const before = config.routes.length;
+    config.routes = config.routes.filter(r => r.name !== name);
+    if (config.routes.length === before) { console.error(`Route "${name}" not found`); process.exit(1); }
+    await saveConfig(config);
+    await notifyRunningServer(config);
+    console.log(`Removed route "${name}"`);
+    return;
+  }
+
+  console.error(ROUTE_USAGE);
+  process.exit(1);
+}
+
 // ── priority ────────────────────────────────────────────────
 
 async function priorityCommand() {
@@ -1051,6 +1133,8 @@ Commands:
   disable <name>      Temporarily exclude an account from rotation
   enable <name>       Re-enable a disabled account (also clears a stuck error)
   priority <name> <n> Set rotation priority (lower = preferred; --first/--last)
+  route [list|add|rm] Per-model routing: pin model globs to specific accounts
+                      (add <name> --match "<glob>" [--accounts "<name>"] [--bucket <b>])
   probe [off|secs]    Opt-in background quota refresh for idle accounts
                       (off by default; reads usage endpoint, spends no quota)
   warmup [off|secs]   Opt-in: keep idle accounts' 5h timers running by sending

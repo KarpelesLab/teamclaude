@@ -46,6 +46,45 @@ test('renderStatus colors active accounts and bars', () => {
   assert.ok(cells.at(-1)[0] > cells.at(-1)[1], 'bar should end red');
 });
 
+test('renderStatus shows per-model eligibility when a family is metered separately', () => {
+  const status = sampleStatus();
+  // Shared 5h has headroom, general/Opus weekly is fine, but the Fable weekly is
+  // spent: Fable should read ✗ (with its reset) while Opus stays ✓ — the
+  // "some accounts are disabled for specific models" view of issue #85.
+  status.accounts[0].quota = {
+    unified5h: 0.2, unified5hReset: now + 60_000,
+    unified7d: 0.3, unified7dReset: now + 600_000,
+    unified7dFable: 1.0, unified7dFableReset: now + 86_400_000,
+  };
+  const output = renderStatus(status, { color: false, now });
+  assert.match(output, /Models\s+Opus ✓/);
+  assert.match(output, /Fable ✗ 1d/);
+});
+
+test('renderStatus omits the Models line for accounts with no family-specific bucket', () => {
+  const output = renderStatus(sampleStatus(), { color: false, now });
+  assert.doesNotMatch(output, /Models/);
+});
+
+test('renderStatus prints the routing table with configured and auto routes', () => {
+  const status = sampleStatus();
+  status.routes = [
+    { name: 'fable', match: ['*fable*'], autocreated: false, bucket: null,
+      accounts: [{ name: 'personal', eligible: true }, { name: 'a', eligible: false }] },
+    { name: 'sonnet', match: ['*sonnet*'], autocreated: true, bucket: null,
+      accounts: [{ name: 'a', eligible: true }] },
+  ];
+  const output = renderStatus(status, { color: false, now });
+  assert.match(output, /Routing/);
+  assert.match(output, /\*fable\*\s+→ personal a/);
+  assert.match(output, /\*sonnet\*\s+→ a \(auto\)/);
+});
+
+test('renderStatus omits the routing table when there are no routes', () => {
+  const output = renderStatus(sampleStatus(), { color: false, now });
+  assert.doesNotMatch(output, /Routing/);
+});
+
 test('renderStatus sanitizes probe errors', () => {
   const status = sampleStatus();
   status.probe.accounts[0] = {
