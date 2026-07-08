@@ -16,6 +16,7 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 - **Automatic account rotation** — switches to the next account when session (5h) or weekly (7d) quota reaches the configured threshold (default 98%)
 - **Model-aware routing** — the per-model weekly cap (e.g. Fable) is tracked separately, so an account whose Fable quota is spent is skipped **only** for Fable requests and still serves Opus/Sonnet. Requests are routed by their `model` (read exactly from the request body, in both base-URL and MITM modes). Optional **[model routes](#model-routes)** pin model patterns to a specific set of accounts (config, `teamclaude route`, or the TUI settings screen → Manage routing)
 - **Auto-retry on 429** — waits the `retry-after` duration and retries the same account; a quota rejection (a spent weekly bucket) switches accounts immediately instead of waiting, and switches to the next on persistent errors
+- **Storm control** — when many agents fail over to a fresh account at once, requests are [paced onto it](#storm-control-switchover-ramp-up) with a short ramp-up so the herd doesn't instantly throttle it and cascade down the fleet
 - **Interactive TUI** — real-time dashboard with color-coded quota bars, reset countdowns, activity log, and keyboard controls; a settings screen (`g`) edits the rotation threshold, quota-probe interval, and sx.org proxy live
 - **OAuth token management** — automatically refreshes tokens nearing expiry and persists them to config; client token refreshes pass through untouched
 - **Hot-reload accounts** — add or change accounts while the server is running; press **R** in the TUI, or run headless and CLI changes auto-reload via a local control endpoint
@@ -233,6 +234,23 @@ After a host network drop and reconnect, Node's shared connection pool can hold 
 | `TEAMCLAUDE_UPSTREAM_BODY_TIMEOUT_MS` | `120000` | Max **idle** gap between response-body chunks. Resets on every chunk, so a slow-but-healthy stream is fine; it fires only when the socket goes silent mid-stream (a drop after headers), turning a hang into a fast, retryable failure. |
 | `TEAMCLAUDE_REFRESH_TIMEOUT_MS` | `30000` | Max wait for an OAuth token refresh. A hung refresh is coalesced across all callers, so it would otherwise wedge every request for that account. |
 
+### Storm control (switchover ramp-up)
+
+When you run many agents at once and the active account runs out, every in-flight request fails over to the next account **at the same instant** — a thundering herd that can spend a big chunk of the fresh account's quota (large contexts) and instantly throttle it, cascading down the fleet ([#84](https://github.com/KarpelesLab/teamclaude/issues/84)).
+
+To prevent this, requests onto a **just-switched-to account** are paced: concurrency starts at 1 and the cap ramps up over a few seconds, then lifts. The first request or two reveal whether the new account is also near-exhausted **before** the whole herd commits to it, so a cascade is broken up hop by hop. The gate is **fail-open** — a request never blocks longer than the ramp window, and a client that disconnects while waiting just drops out — and the slot is held only until response headers arrive, so streaming replies don't tie up concurrency.
+
+On by default. Tune or disable via `stormRamp` in the config:
+
+```json
+"stormRamp": { "enabled": true, "startConc": 1, "stepConc": 1, "stepMs": 250, "windowMs": 30000 }
+```
+
+- **`startConc`** — concurrent requests allowed the instant a switch happens (default 1).
+- **`stepConc` / `stepMs`** — the cap grows by `stepConc` every `stepMs` (default +1 every 250ms ≈ 4 req/s).
+- **`windowMs`** — after this long, pacing stops entirely (default 30s).
+- **`enabled: false`** — turn storm control off (send the full burst immediately, pre-#84 behavior).
+
 ### Config format
 
 ```json
@@ -269,6 +287,7 @@ After a host network drop and reconnect, Node's shared connection pool can hold 
 | `switchThreshold` | Quota utilization (0–1) at which to switch accounts (TUI: `g` → `t`) |
 | `quotaProbeSeconds` | Background quota-probe interval in seconds (`0` = off, the default; CLI `probe` or TUI `g` → `p`) |
 | `warmupSeconds` | Keep-warm interval in seconds (`0` = off, the default; CLI `warmup`). Spawns a minimal `claude` per idle account to start its 5h timer — **spends a little quota**, unlike the probe |
+| `stormRamp` | Optional storm-control tuning (on by default) — see [Storm control](#storm-control-switchover-ramp-up). Object: `{ enabled, startConc, stepConc, stepMs, windowMs }` |
 | `sx.apiKey` | [sx.org](https://sx.org) API key. When set, TeamClaude auto-provisions a residential proxy (egress-IP 429 workaround). Absent/empty = off |
 | `sx.mode` | `always` (route all upstream traffic), `429` (direct, fail over to the proxy after a 429), or `off` (keep the key but don't use it). Defaults to `always` when a key is set |
 | `accounts[].accountUuid` | Anthropic account (person) id; set automatically from the OAuth profile |

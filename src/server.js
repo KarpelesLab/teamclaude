@@ -452,12 +452,23 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   };
 
   try {
-    const upstreamRes = await upstreamFetch(upstreamUrl, {
-      method,
-      headers,
-      body: ['GET', 'HEAD'].includes(method) ? undefined : sendBody,
-      redirect: 'manual',
-    }, sx, route);
+    // Storm control: pace requests onto a freshly-switched account so a failover
+    // burst doesn't slam it all at once and cascade (issue #84). The slot is held
+    // only until the response headers arrive — long enough to stagger the burst,
+    // then released so streaming bodies don't tie up concurrency. Fail-open: a
+    // client that disconnects while waiting just drops out.
+    if (!await accountManager.admit(account.index, () => res.destroyed)) return;
+    let upstreamRes;
+    try {
+      upstreamRes = await upstreamFetch(upstreamUrl, {
+        method,
+        headers,
+        body: ['GET', 'HEAD'].includes(method) ? undefined : sendBody,
+        redirect: 'manual',
+      }, sx, route);
+    } finally {
+      accountManager.release(account.index);
+    }
 
     // Extract rate limit headers
     const rateLimitHeaders = {};

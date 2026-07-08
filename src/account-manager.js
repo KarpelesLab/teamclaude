@@ -44,7 +44,7 @@ function modelMatches(declared, model) {
 }
 
 export class AccountManager {
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, throttleProbeFloorMs, routes } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, throttleProbeFloorMs, routes, ramp } = {}) {
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
     // OAuth token refresh.
     this._refreshFn = refreshFn;
@@ -76,10 +76,29 @@ export class AccountManager {
       },
       rateLimitedUntil: null,
       throttledAt: null,
+      // Storm control (see admit/release): in-flight upstream requests and the
+      // time this account last became the current one (starts a ramp window).
+      inFlight: 0,
+      rampStartedAt: null,
     }));
     this.currentIndex = 0;
     this.switchThreshold = switchThreshold;
     this.setRoutes(routes);
+    // Storm control: when rotation switches to a fresh account, a burst of
+    // in-flight requests (e.g. dozens of agents failing over together) would all
+    // hit it at once and instantly throttle it — cascading down the fleet
+    // (issue #84). admit() caps concurrent requests to a just-switched account
+    // and ramps the cap up over a short window, so the first few reveal whether
+    // it's also near-exhausted before the whole herd commits.
+    this.ramp = {
+      enabled: true,
+      startConc: 1,       // concurrent requests allowed at the instant of a switch
+      stepConc: 1,        // cap increase per stepMs
+      stepMs: 250,        // → +stepConc every 250ms (default ramps ~4 req/s)
+      windowMs: 30_000,   // after this, pacing stops entirely (cap = Infinity)
+      pollMs: 50,         // how often a waiting request re-checks the cap
+      ...ramp,
+    };
     // When every account reads as over-quota we would otherwise refuse locally
     // forever (a stale cached utilization is never re-validated because no
     // request is ever sent). Instead, allow one real upstream probe at most this
@@ -91,6 +110,44 @@ export class AccountManager {
     // retry-after, short enough that a stale hold cannot pin the fleet.
     this.throttleProbeFloorMs = throttleProbeFloorMs
       ?? (Number(process.env.TEAMCLAUDE_THROTTLE_PROBE_FLOOR_MS) || 60_000);
+  }
+
+  /** Start (or restart) the ramp window for an account that just became current,
+   * so a failover burst is paced onto it rather than all landing at once. */
+  _beginRamp(account) {
+    if (account && this.ramp.enabled) account.rampStartedAt = Date.now();
+  }
+
+  /** Max concurrent upstream requests allowed to `account` right now. Infinity
+   * once the ramp window has elapsed (or ramping is off / never started). */
+  _rampCap(account, now = Date.now()) {
+    if (!this.ramp.enabled || account.rampStartedAt == null) return Infinity;
+    const elapsed = now - account.rampStartedAt;
+    if (elapsed >= this.ramp.windowMs) { account.rampStartedAt = null; return Infinity; }
+    return this.ramp.startConc + Math.floor(elapsed / this.ramp.stepMs) * this.ramp.stepConc;
+  }
+
+  /**
+   * Reserve a concurrency slot on `account` before sending upstream, waiting
+   * while the account is over its current ramp cap. Fail-open: returns true once
+   * a slot is taken (always eventually, since the cap grows and the window
+   * expires), or false if `isAborted()` reports the client went away while
+   * waiting. Pair every `true` with a `release(index)`.
+   */
+  async admit(index, isAborted) {
+    const account = this.accounts[index];
+    if (!account || !this.ramp.enabled) { if (account) account.inFlight++; return true; }
+    while (true) {
+      if (isAborted?.()) return false;
+      if (account.inFlight < this._rampCap(account)) { account.inFlight++; return true; }
+      await new Promise(r => setTimeout(r, this.ramp.pollMs));
+    }
+  }
+
+  /** Release a slot taken by admit(). Safe to call once per successful admit. */
+  release(index) {
+    const account = this.accounts[index];
+    if (account && account.inFlight > 0) account.inFlight--;
   }
 
   /**
@@ -259,6 +316,7 @@ export class AccountManager {
 
     this._nextProbeAt = now + this.probeIntervalMs;
     this.currentIndex = best.index;
+    this._beginRamp(best);
     if (best.status === 'throttled') {
       console.log(`[TeamClaude] All accounts unavailable — revalidating throttled "${best.name}" with a live request`);
     } else {
@@ -490,6 +548,7 @@ export class AccountManager {
 
     if (best) {
       this.currentIndex = best.index;
+      this._beginRamp(best);
       console.log(`[TeamClaude] Account "${best.name}" session quota reset and weekly expires sooner — switching to it`);
     }
   }
@@ -575,6 +634,7 @@ export class AccountManager {
     const best = this._pickBestAvailable();
     if (!best) return this.accounts[this.currentIndex] || null;
     this.currentIndex = best.index;
+    this._beginRamp(best);
     best.probing = best.quota.unified7dReset == null;
     const wk = best.quota.unified7d != null
       ? `${(best.quota.unified7d * 100).toFixed(1)}% weekly used`
@@ -592,6 +652,7 @@ export class AccountManager {
       // it so we re-evaluate once that quota is learned (see updateQuota).
       best.probing = best.quota.unified7dReset == null;
       if (switched) {
+        this._beginRamp(best);
         console.log(`[TeamClaude] Switched to account "${best.name}"`);
       }
       return best;
@@ -625,6 +686,7 @@ export class AccountManager {
       soonestAccount.status = 'active';
       soonestAccount.rateLimitedUntil = null;
       this.currentIndex = soonestAccount.index;
+      this._beginRamp(soonestAccount);
       console.log(`[TeamClaude] Account "${soonestAccount.name}" reset, switching to it`);
       return soonestAccount;
     }
