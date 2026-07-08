@@ -79,14 +79,30 @@ export async function saveConfig(config) {
   await chmod(path, 0o600).catch(() => {});
 }
 
+// Serialize config updates. atomicConfigUpdate is a read-modify-write, so two
+// concurrent callers can both read the same config and then save in turn, and
+// the later save silently drops the earlier caller's change. This bites hardest
+// on startup, when several OAuth accounts refresh their tokens at once: only the
+// last writer's rotated refresh token persists, and the other accounts keep a
+// token that was just rotated away, so they fail on the next restart with
+// invalid_grant and need a re-login. Chaining the updates keeps every write.
+let configUpdateChain = Promise.resolve();
+
 /**
  * Atomically update the config: re-reads from disk, calls updater(config),
  * then saves. Returns the updated config. This prevents overwriting changes
- * made by other processes (e.g. `teamclaude import` while the server runs).
+ * made by other processes (e.g. `teamclaude import` while the server runs), and
+ * serializes concurrent callers so simultaneous updates queue instead of
+ * clobbering one another.
  */
-export async function atomicConfigUpdate(updater) {
-  const config = await loadConfig() || createDefaultConfig();
-  await updater(config);
-  await saveConfig(config);
-  return config;
+export function atomicConfigUpdate(updater) {
+  const run = async () => {
+    const config = await loadConfig() || createDefaultConfig();
+    await updater(config);
+    await saveConfig(config);
+    return config;
+  };
+  const result = configUpdateChain.then(run, run);
+  configUpdateChain = result.then(() => {}, () => {});
+  return result;
 }
