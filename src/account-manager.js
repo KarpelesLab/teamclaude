@@ -127,7 +127,11 @@ export class AccountManager {
    * once the ramp window has elapsed (or ramping is off / never started). */
   _rampCap(account, now = Date.now()) {
     if (!this.ramp.enabled || account.rampStartedAt == null) return Infinity;
-    const elapsed = now - account.rampStartedAt;
+    // Clamp to 0: pauseAccount arms rampStartedAt in the FUTURE (pause-end), so a
+    // call during the pause would otherwise yield a negative elapsed → negative
+    // cap. admit()'s pause branch already guards this, but keep _rampCap sound on
+    // its own — a future start simply means "cap is at its floor (startConc)".
+    const elapsed = Math.max(0, now - account.rampStartedAt);
     if (elapsed >= this.ramp.windowMs) { account.rampStartedAt = null; return Infinity; }
     return this.ramp.startConc + Math.floor(elapsed / this.ramp.stepMs) * this.ramp.stepConc;
   }

@@ -490,13 +490,14 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // _selectProbe) clear its own hold and return the fleet to service.
     if (upstreamRes.status !== 429) accountManager.clearRateLimited(account.index);
 
-    // On 429, wait the retry-after duration and retry on the same account
-    // (this is a transient rate limit, not quota exhaustion).
+    // Two kinds of 429 are handled differently below: a quota rejection rotates
+    // to another account; a transient rate-limit throttle pauses + retries the
+    // same account (never rotates — see #84).
     if (upstreamRes.status === 429) {
       // Clamp Retry-After to a sane window: missing/invalid falls back to 60s,
       // and out-of-range values are bounded to [1, 300]. A negative value would
-      // otherwise bypass the retry cap — setTimeout returns immediately and
-      // markRateLimited would set rateLimitedUntil in the past.
+      // otherwise bypass the wait cap — setTimeout returns immediately and a
+      // pause/hold would be armed in the past.
       let retryAfter = parseInt(upstreamRes.headers.get('retry-after'), 10);
       if (Number.isNaN(retryAfter)) retryAfter = 60;
       // Discard the 429 response body
@@ -547,7 +548,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       accountManager.pauseAccount(account.index, Math.min(retryAfter, RATE_LIMIT_ABSORB_MAX_SECONDS));
 
       // sx fresh-IP retry (still the same account) takes precedence over waiting.
-      if (switchingToSx) {
+      // Bounded by retryCount like the inline-wait path below, so a persistently
+      // 429ing upstream can't loop forever through sx.
+      if (switchingToSx && retryCount < maxRetries) {
         console.log(`[TeamClaude] 429 on "${account.name}" — retrying via sx.org (fresh egress IP)`);
         if (res.destroyed) return;
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, nextUseSx);
