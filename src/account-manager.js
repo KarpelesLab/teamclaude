@@ -2,8 +2,8 @@ import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired } from './oauth
 import { sameIdentity } from './identity.js';
 import { weeklyBucketForModel, modelGlobMatches } from './model.js';
 
-// Re-exported for callers that already import model helpers from here.
-export { isFableModel, modelFamily, parseRequestModel, weeklyBucketForModel, modelGlobMatches } from './model.js';
+// Re-exported for callers that import these model helpers from here.
+export { isFableModel, parseRequestModel } from './model.js';
 
 // Quota fields that survive a restart: utilization levels and their reset
 // windows, learned passively from upstream responses. Transient/derived state
@@ -35,6 +35,51 @@ function emptyQuota() {
   };
 }
 
+// Build a fresh in-memory account record from a config/disk account object.
+// Shared by the constructor and addAccount() so the field set can never drift
+// between startup accounts and runtime-added ones (a divergence here once left
+// runtime-added accounts without `inFlight`, hanging every request in admit()).
+function makeAccount(acct, index) {
+  return {
+    index,
+    name: acct.name,
+    type: acct.type,
+    accountUuid: acct.accountUuid || null,
+    orgUuid: acct.orgUuid || null,
+    orgName: acct.orgName || null,
+    priority: acct.priority || 0,
+    disabled: acct.disabled || false,
+    upstream: acct.upstream || null,
+    modelMap: acct.modelMap || null,
+    models: acct.models || null,
+    credential: acct.accessToken || acct.apiKey,
+    refreshToken: acct.refreshToken || null,
+    expiresAt: acct.expiresAt || null,
+    status: 'active',
+    // No quota is known at startup, so start probing: the first response for
+    // an account reveals its weekly limit and triggers re-evaluation.
+    probing: true,
+    quota: emptyQuota(),
+    usage: {
+      totalInputTokens: 0,
+      totalOutputTokens: 0,
+      totalRequests: 0,
+      lastUsed: null,
+    },
+    rateLimitedUntil: null,
+    throttledAt: null,
+    // Storm control (see admit/release): in-flight upstream requests and the
+    // time this account last became the current one (starts a ramp window).
+    inFlight: 0,
+    rampStartedAt: null,
+    // Rate-limit pause (see pauseAccount): a short window during which new
+    // requests wait in admit() rather than flooding — set from a 429's
+    // retry-after. Distinct from `throttled`/rateLimitedUntil: it does NOT
+    // make the account unavailable, so selection never rotates away from it.
+    pausedUntil: null,
+  };
+}
+
 // Does a declared `models` entry name `model`? The declared side may carry a
 // trailing [Nm] context-length suffix (e.g. "deepseek-v4-pro[1m]"); we match it
 // against a bare request too. Shared by _accountOwnsModel's two lookups so the
@@ -48,44 +93,7 @@ export class AccountManager {
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
     // OAuth token refresh.
     this._refreshFn = refreshFn;
-    this.accounts = accounts.map((acct, index) => ({
-      index,
-      name: acct.name,
-      type: acct.type,
-      accountUuid: acct.accountUuid || null,
-      orgUuid: acct.orgUuid || null,
-      orgName: acct.orgName || null,
-      priority: acct.priority || 0,
-      disabled: acct.disabled || false,
-      upstream: acct.upstream || null,
-      modelMap: acct.modelMap || null,
-      models: acct.models || null,
-      credential: acct.accessToken || acct.apiKey,
-      refreshToken: acct.refreshToken || null,
-      expiresAt: acct.expiresAt || null,
-      status: 'active',
-      // No quota is known at startup, so start probing: the first response for
-      // an account reveals its weekly limit and triggers re-evaluation.
-      probing: true,
-      quota: emptyQuota(),
-      usage: {
-        totalInputTokens: 0,
-        totalOutputTokens: 0,
-        totalRequests: 0,
-        lastUsed: null,
-      },
-      rateLimitedUntil: null,
-      throttledAt: null,
-      // Storm control (see admit/release): in-flight upstream requests and the
-      // time this account last became the current one (starts a ramp window).
-      inFlight: 0,
-      rampStartedAt: null,
-      // Rate-limit pause (see pauseAccount): a short window during which new
-      // requests wait in admit() rather than flooding — set from a 429's
-      // retry-after. Distinct from `throttled`/rateLimitedUntil: it does NOT
-      // make the account unavailable, so selection never rotates away from it.
-      pausedUntil: null,
-    }));
+    this.accounts = accounts.map((acct, index) => makeAccount(acct, index));
     this.currentIndex = 0;
     this.switchThreshold = switchThreshold;
     this.setRoutes(routes);
@@ -966,29 +974,7 @@ export class AccountManager {
    */
   addAccount(acctData) {
     const index = this.accounts.length;
-    this.accounts.push({
-      index,
-      name: acctData.name,
-      type: acctData.type,
-      accountUuid: acctData.accountUuid || null,
-      orgUuid: acctData.orgUuid || null,
-      orgName: acctData.orgName || null,
-      priority: acctData.priority || 0,
-      disabled: acctData.disabled || false,
-      upstream: acctData.upstream || null,
-      modelMap: acctData.modelMap || null,
-      models: acctData.models || null,
-      credential: acctData.accessToken || acctData.apiKey,
-      refreshToken: acctData.refreshToken || null,
-      expiresAt: acctData.expiresAt || null,
-      status: 'active',
-      // Unknown quota until the first response — probe it like startup accounts.
-      probing: true,
-      quota: emptyQuota(),
-      usage: { totalInputTokens: 0, totalOutputTokens: 0, totalRequests: 0, lastUsed: null },
-      rateLimitedUntil: null,
-      throttledAt: null,
-    });
+    this.accounts.push(makeAccount(acctData, index));
     return index;
   }
 
