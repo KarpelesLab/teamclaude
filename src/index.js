@@ -4,7 +4,7 @@ import { spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import net from 'node:net';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, loadState, saveState } from './config.js';
-import { AccountManager } from './account-manager.js';
+import { AccountRouter } from './account-router.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import { sameIdentity, orgKey, matchAccounts } from './identity.js';
@@ -136,7 +136,10 @@ async function serverCommand() {
   }
 
   const threshold = config.switchThreshold || 0.98;
-  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp });
+  // One pool per provider (default: a single Anthropic pool). The router is a
+  // drop-in for AccountManager here — it exposes the same lifecycle surface and
+  // resolves the per-request pool by host inside the server.
+  const accountManager = new AccountRouter(accounts, threshold, { routes: config.routes, ramp: config.stormRamp });
 
   // Restore quota observed in a previous run so a restart doesn't lose rotation
   // state (passive — we never call the API to re-learn it). Stale windows are

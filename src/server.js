@@ -9,7 +9,7 @@ import { TopLevelFieldFinder } from './model.js';
 import { BodyWriter } from './request-log.js';
 import { upstreamFetch } from './upstream-fetch.js';
 import { anthropic } from './providers/anthropic.js';
-import { providerForUpstream } from './providers/index.js';
+import { providerForUpstream, providerForHost } from './providers/index.js';
 
 // Re-exported so `import { rewriteModel } from './server.js'` (and its tests)
 // keep working now that the implementation lives in the provider module.
@@ -172,6 +172,15 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // Code silently drops the image from the message.
       if (CLIENT_CREDENTIAL_PATHS.some((p) => (req.url || '').startsWith(p))) { await relayStream(req, res, upstream, sx); return; }
 
+      // Resolve which account pool + provider serve this request by its target
+      // host. In MITM mode the terminated request carries the CONNECT host in
+      // :authority; in reverse-proxy mode there's only our own host, so we fall
+      // back to the configured upstream's provider. Duck-typed: a bare
+      // AccountManager (as tests pass) is treated as the single pool for any host.
+      const host = (req.headers[':authority'] || req.headers['host'] || '').split(':')[0];
+      const accountPool = accountManager.managerFor ? accountManager.managerFor(host) : accountManager;
+      const provider = providerForHost(host) || providerForUpstream(upstream) || anthropic;
+
       // Account pin: a request to `/tc-acct/<name-or-index>/...` (e.g. via
       // ANTHROPIC_BASE_URL=http://host:port/tc-acct/deepseek) is forced onto that
       // one account, bypassing rotation. Used by the keep-warm scheduler and for
@@ -180,7 +189,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       const pin = (req.url || '').match(/^\/tc-acct\/([^/]+)(\/.*)$/);
       if (pin) {
         const token = decodeURIComponent(pin[1]);
-        pinnedIndex = resolveAccountPin(accountManager, token);
+        pinnedIndex = resolveAccountPin(accountPool, token);
         if (pinnedIndex == null) {
           res.writeHead(404, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: `Unknown account pin "${token}"` } }));
@@ -208,12 +217,9 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       const body = Buffer.concat(bodyChunks);
 
       const model = modelFinder.done ? modelFinder.value : parseRequestModel(body);
-      // The provider that owns this pool's upstream (Anthropic today). Once the
-      // account router lands this becomes the request's resolved-by-host provider.
-      const provider = providerForUpstream(upstream) || anthropic;
       const ctx = { account: null, status: null, tried: new Set(), model, pinnedIndex, provider };
       try {
-        await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir, sx);
+        await forwardRequest(req, res, body, accountPool, upstream, 0, hooks, reqId, ctx, logDir, sx);
       } catch (err) {
         ctx.status = ctx.status || 502;
         console.error('[TeamClaude] Unhandled error:', err);
