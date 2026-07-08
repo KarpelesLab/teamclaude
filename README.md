@@ -336,6 +336,17 @@ teamclaude warmup        # show current setting
 
 > ⚠️ **This spends a little quota — unlike the passive quota probe.** The 5h timer can't be started by a read-only call, so keep-warm sends a real (minimal) message: for each eligible idle account it spawns a one-shot `claude -p --bare --model haiku "hi"` pointed at this proxy, pinned to that account (see below). It only warms accounts whose 5h window is **not already running**, skips disabled/throttled/errored and third-party-backend accounts, and uses the cheapest model — but it does consume a few tokens and a slice of the 5h/weekly buckets per account per window. Requires the `claude` CLI on `PATH`. Minimum interval 60s; changes apply live (no restart). Status shows under `warm` in `teamclaude status --json`.
 
+### Prompt caching across rotation
+
+Rotation is transparent to your Claude Code session, but it's worth knowing how it interacts with Anthropic's [prompt cache](https://docs.claude.com/en/docs/build-with-claude/prompt-caching).
+
+- **Your context is never lost.** Claude Code resends the full transcript every turn, and TeamClaude rewrites the request's `account_uuid` to match the injected token, so whichever account serves a turn sees the complete history — a mid-session switch is invisible to the client.
+- **The cache doesn't carry across accounts.** The prompt cache is scoped to the account/organization that created it and expires after a few minutes, so the first turn after a switch is a cache **miss** — that turn is processed without the cache discount, after which the new account warms its own cache. No proxy can share a cache across organizations.
+
+In practice this rarely bites, because **TeamClaude prefers to keep you on one account**: it stays on the current account and only rotates when that account nears the switch threshold (default `98%`); when it does pick, it prefers the account whose weekly quota resets soonest — so a single account tends to serve a whole session and switches are infrequent. Pin an explicit order with `teamclaude priority` to lean on one account even harder.
+
+> Keep-warm (above) is unrelated to this — it starts an idle account's **5h session timer**, not its prompt cache. A freshly-rotated account still takes a one-turn cache miss regardless.
+
 ### Pin a request to a specific account
 
 `ANTHROPIC_BASE_URL` with a `/tc-acct/<name-or-index>` prefix forces every request onto **one** account, bypassing rotation (and never failing over to another). This is what keep-warm uses internally, and it doubles as a manual way to exercise a specific account:
