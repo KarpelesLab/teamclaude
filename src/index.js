@@ -278,13 +278,10 @@ async function serverCommand() {
         if (config.routes != null) diskConfig.routes = config.routes;
       }),
       syncAccounts: reloadAccounts,
-      onQuit: async () => {
-        prober?.stop();
-        warmer?.stop();
-        if (quotaSaveInterval) clearInterval(quotaSaveInterval);
-        await persistQuotaState();
-        server.close(() => process.exit(0));
-      },
+      // ctrl-c / q from the TUI: funnel through the same idempotent shutdown as
+      // POSIX signals (defined below). In raw mode ctrl-c never reaches the OS as
+      // a signal, so without this the process would only tear down via keypress.
+      onQuit: () => shutdown(),
     });
     hooks = {
       onRequestStart: (id, info) => tui.onRequestStart(id, info),
@@ -391,21 +388,29 @@ async function serverCommand() {
   // users update via `teamclaude run` (post-session) or `teamclaude update`.
   if (!tui) autoUpdate({ config }).catch(() => {});
 
-  // Graceful shutdown on signals in BOTH modes. In TUI mode this previously
-  // existed only as a keypress path, so a SIGTERM (systemd/kill) bypassed it and
-  // dropped up-to-a-minute of unsaved quota state and orphaned schedulers.
-  const shutdown = async () => {
+  // One idempotent shutdown funnel for BOTH modes and BOTH triggers: POSIX
+  // signals (SIGINT/SIGTERM) and the TUI's ctrl-c / q keypress (which in raw mode
+  // never reaches the OS as a signal). Guards re-entry: a second ctrl-c — an
+  // impatient user, or a signal racing the keypress — forces an immediate exit
+  // instead of re-running teardown, which would re-arm server.close() and leak a
+  // 'close' listener on the server each time (MaxListenersExceededWarning).
+  let shuttingDown = false;
+  async function shutdown() {
+    if (shuttingDown) process.exit(0); // second ctrl-c: stop waiting, just go
+    shuttingDown = true;
     try { tui?.stop(); } catch { /* terminal already restored */ }
     if (!tui) console.log('\n[TeamClaude] Shutting down...');
     prober?.stop();
     warmer?.stop();
     if (quotaSaveInterval) clearInterval(quotaSaveInterval);
     await persistQuotaState();
-    // Force-exit if open connections keep server.close from completing, so a
-    // signal can't hang the process indefinitely.
-    setTimeout(() => process.exit(0), 3000).unref?.();
+    // Don't linger waiting on keep-alive / streaming connections: actively
+    // destroy them so server.close() can complete promptly, and hard-exit after a
+    // short grace period in case anything still hangs.
+    setTimeout(() => process.exit(0), 2000).unref?.();
+    server.closeAllConnections?.();
     server.close(() => process.exit(0));
-  };
+  }
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
 }
