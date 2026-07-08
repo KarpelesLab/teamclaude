@@ -140,3 +140,23 @@ test('pauseAccount arms the ramp at pause-end so held requests release staggered
   assert.equal(am._rampCap(acct, acct.pausedUntil), 1);
   assert.equal(am._rampCap(acct, acct.pausedUntil + 250), 2);
 });
+
+test('addAccount initializes storm-control fields so a runtime-added account can admit/release', async () => {
+  const am = new AccountManager([oauth('a')], 0.98, {
+    ramp: { startConc: 1, stepConc: 1, stepMs: 10_000, windowMs: 60_000, pollMs: 5 },
+  });
+  const idx = am.addAccount(oauth('b'));
+  const acct = am.accounts[idx];
+
+  // Regression: addAccount once omitted inFlight/rampStartedAt/pausedUntil, so
+  // `undefined < cap` in admit() was always false and every request routed to a
+  // runtime-added account hung forever (and release() was a silent no-op).
+  assert.equal(acct.inFlight, 0);
+  assert.equal(acct.rampStartedAt, null);
+  assert.equal(acct.pausedUntil, null);
+
+  assert.equal(await am.admit(idx), true, 'a fresh added account admits immediately (no ramp started yet)');
+  assert.equal(acct.inFlight, 1);
+  am.release(idx);
+  assert.equal(acct.inFlight, 0, 'release frees the slot on a runtime-added account');
+});

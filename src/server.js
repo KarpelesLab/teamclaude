@@ -127,13 +127,6 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
   return server;
 }
 
-/**
- * Build the core proxy request listener — buffer the body, then forward with
- * account selection + retry (forwardRequest). Shared by the base HTTP server and
- * the MITM's terminating h2/h1 server, so both get identical buffering, model-
- * aware routing, and retry-on-quota behavior. Control endpoints (status/reload)
- * and the proxy-API-key gate live in the base server's wrapper, not here.
- */
 // Resolve an account-pin token (from a `/tc-acct/<token>` URL) to an account
 // index, or null if it matches nothing. Matches by exact account name first,
 // then by numeric index. Exported for tests.
@@ -151,6 +144,13 @@ export function resolveAccountPin(accountManager, token) {
 // rotated account token): the Remote Control channel and attachment transfers.
 const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/files/', '/api/oauth/file_upload'];
 
+/**
+ * Build the core proxy request listener — buffer the body, then forward with
+ * account selection + retry (forwardRequest). Shared by the base HTTP server and
+ * the MITM's terminating h2/h1 server, so both get identical buffering, model-
+ * aware routing, and retry-on-quota behavior. Control endpoints (status/reload)
+ * and the proxy-API-key gate live in the base server's wrapper, not here.
+ */
 export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null }) {
   let counter = 0;
   return async (req, res) => {
@@ -286,7 +286,11 @@ async function relayRaw(req, res, upstream, sx) {
     const responseBody = await upstreamRes.text();
     const responseHeaders = {};
     for (const [key, value] of upstreamRes.headers.entries()) {
-      if (key === 'transfer-encoding' || key === 'connection') continue;
+      // `.text()` already decompressed the body, so drop content-encoding and
+      // the now-stale content-length (both refer to the compressed bytes) — else
+      // a gzip'd upstream response reaches the client mis-framed / truncated.
+      if (key === 'transfer-encoding' || key === 'connection' ||
+          key === 'content-encoding' || key === 'content-length') continue;
       responseHeaders[key] = value;
     }
     res.writeHead(upstreamRes.status, responseHeaders);

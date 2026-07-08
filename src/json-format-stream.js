@@ -18,7 +18,6 @@ export class JsonStreamFormatter {
     this.inStr = false;
     this.esc = false;
     this.freshContainer = false; // just opened { or [ — first element needs a newline+indent
-    this.started = false;
   }
 
   nl(depth) { return '\n' + this.pad.repeat(depth); }
@@ -59,7 +58,6 @@ export class JsonStreamFormatter {
       if (ch === '"') { this.inStr = true; out += ch; continue; }
       out += ch; // number / true / false / null character
     }
-    this.started = this.started || out.length > 0;
     return out;
   }
 }

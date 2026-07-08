@@ -248,10 +248,9 @@ export async function fetchUsage(accessToken) {
   }
 }
 
-// OAuth config (extracted from Claude Code)
-const OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
+// OAuth config (extracted from Claude Code). Client id + token endpoint are
+// shared with the refresh path — see DEFAULT_CLIENT_ID / DEFAULT_TOKEN_ENDPOINT.
 const OAUTH_AUTHORIZE = 'https://claude.ai/oauth/authorize';
-const OAUTH_TOKEN = 'https://platform.claude.com/v1/oauth/token';
 const OAUTH_SCOPES = 'org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload';
 
 /**
@@ -271,7 +270,7 @@ export async function loginOAuth() {
   // Build authorization URL
   const authUrl = new URL(OAUTH_AUTHORIZE);
   authUrl.searchParams.set('code', 'true');
-  authUrl.searchParams.set('client_id', OAUTH_CLIENT_ID);
+  authUrl.searchParams.set('client_id', DEFAULT_CLIENT_ID);
   authUrl.searchParams.set('response_type', 'code');
   authUrl.searchParams.set('redirect_uri', redirectUri);
   authUrl.searchParams.set('scope', OAUTH_SCOPES);
@@ -294,14 +293,14 @@ export async function loginOAuth() {
 
   // Exchange code for tokens
   console.log('Exchanging authorization code for tokens...');
-  const tokenRes = await fetch(OAUTH_TOKEN, {
+  const tokenRes = await fetch(DEFAULT_TOKEN_ENDPOINT, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       code,
       state,
       grant_type: 'authorization_code',
-      client_id: OAUTH_CLIENT_ID,
+      client_id: DEFAULT_CLIENT_ID,
       redirect_uri: redirectUri,
       code_verifier: codeVerifier,
     }),

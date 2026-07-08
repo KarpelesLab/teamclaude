@@ -131,11 +131,14 @@ function quotaLines(account, now, paint) {
   const quota = account.quota || {};
   const lines = [];
 
-  if (quota.unified5h != null || quota.unified7d != null || quota.unified7dSonnet != null) {
+  if (quota.unified5h != null || quota.unified7d != null || quota.unified7dSonnet != null || quota.unified7dFable != null) {
     lines.push(formatQuotaLine('Session', quota.unified5h, quota.unified5hReset, now, paint));
     lines.push(formatQuotaLine('Weekly', quota.unified7d, quota.unified7dReset, now, paint));
     if (quota.unified7dSonnet != null) {
       lines.push(formatQuotaLine('Sonnet', quota.unified7dSonnet, quota.unified7dSonnetReset, now, paint));
+    }
+    if (quota.unified7dFable != null) {
+      lines.push(formatQuotaLine('Fable', quota.unified7dFable, quota.unified7dFableReset, now, paint));
     }
     return lines;
   }
