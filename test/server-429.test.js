@@ -36,30 +36,38 @@ async function runAgainstThrottlingUpstream(retryAfterHeader) {
       body: JSON.stringify({ model: 'x', messages: [] }),
     });
     await res.text();
-    return { status: res.status, upstreamHits, accountStatus: am.accounts[0].status };
+    return {
+      status: res.status, upstreamHits,
+      accountStatus: am.accounts[0].status,
+      paused: am.accounts[0].pausedUntil != null && am.accounts[0].pausedUntil > Date.now(),
+    };
   } finally {
     proxy.close();
     upstream.close();
   }
 }
 
-// Regression: a persistently-throttled upstream must terminate (bounded retries),
-// not loop forever tying up the client connection.
+// Regression: a persistently rate-limited upstream must terminate (bounded
+// retries), not loop forever tying up the client connection. A rate-limit 429
+// does NOT rotate/throttle the account (#84) — it pauses it (so concurrent
+// requests wait) and retries the same account, then surfaces a 429.
 test('persistent upstream 429 terminates with a bounded number of retries', async () => {
-  const { status, upstreamHits, accountStatus } = await runAgainstThrottlingUpstream('1');
+  const { status, upstreamHits, accountStatus, paused } = await runAgainstThrottlingUpstream('1');
   assert.equal(status, 429);                                   // returns 429 instead of hanging
   assert.ok(upstreamHits >= 1 && upstreamHits <= 4, `expected bounded retries, got ${upstreamHits}`);
-  assert.equal(accountStatus, 'throttled');                    // account throttled, not retried forever
+  assert.equal(accountStatus, 'active');                       // NOT throttled — no rotation on a rate-limit 429
+  assert.ok(paused, 'account should be paused, so concurrent requests wait');
 });
 
 // A negative (or otherwise out-of-range) Retry-After must not bypass the cap:
-// it would make setTimeout return immediately and mark the account rate-limited
-// in the past, reactivating it instantly.
+// it would make setTimeout return immediately (and previously mark the account
+// rate-limited in the past, reactivating it instantly).
 test('negative Retry-After is clamped and still terminates', async () => {
-  const { status, upstreamHits, accountStatus } = await runAgainstThrottlingUpstream('-1');
+  const { status, upstreamHits, accountStatus, paused } = await runAgainstThrottlingUpstream('-1');
   assert.equal(status, 429);
   assert.ok(upstreamHits >= 1 && upstreamHits <= 4, `expected bounded retries, got ${upstreamHits}`);
-  assert.equal(accountStatus, 'throttled');
+  assert.equal(accountStatus, 'active');
+  assert.ok(paused);
 });
 
 test('long upstream Retry-After is surfaced without sleeping in client request', async () => {
@@ -99,7 +107,87 @@ test('long upstream Retry-After is surfaced without sleeping in client request',
     assert.equal(res.status, 429);
     assert.equal(upstreamHits, 1, 'long Retry-After should not be retried inline');
     assert.ok(Date.now() - started < 2000, 'request should not sleep for upstream retry window');
-    assert.equal(am.accounts[0].status, 'throttled');
+    assert.equal(am.accounts[0].status, 'active', 'rate-limit 429 must not throttle/rotate the account');
+    assert.ok(am.accounts[0].pausedUntil > Date.now(), 'account should be paused so concurrent requests wait');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+// A rate-limit 429 (no quota-rejected status) must NOT rotate to another
+// account — every retry stays on the same one (#84: rotating just moves the
+// burst and drops the KV cache).
+test('a rate-limit 429 never rotates to another account', async () => {
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    seen.push(req.headers.authorization);
+    res.writeHead(429, { 'retry-after': '1', 'content-type': 'application/json' });
+    res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error' } }));
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager([
+    { name: 'a', type: 'oauth', accessToken: 't-a', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+    { name: 'b', type: 'oauth', accessToken: 't-b', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+  ], 0.98);
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+    });
+    await res.text();
+    assert.equal(res.status, 429);
+    const accounts = new Set(seen);
+    assert.equal(accounts.size, 1, `all hits should be on one account, saw ${[...accounts]}`);
+    assert.equal(am.accounts[0].status, 'active', 'current account not throttled');
+    assert.equal(am.accounts[1].status, 'active');
+    assert.equal(am.accounts[1].pausedUntil, null, 'the other account is untouched — no rotation');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+// A quota-rejection 429 (unified status "rejected") is durable exhaustion, so it
+// DOES rotate — account a is throttled and the request succeeds on account b.
+test('a quota-rejection 429 rotates to the next account', async () => {
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    seen.push(req.headers.authorization);
+    if (req.headers.authorization === 'Bearer t-a') {
+      res.writeHead(429, {
+        'retry-after': '60',
+        'anthropic-ratelimit-unified-5h-status': 'rejected',
+        'content-type': 'application/json',
+      });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error' } }));
+    } else {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ type: 'message', role: 'assistant', content: [] }));
+    }
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager([
+    { name: 'a', type: 'oauth', accessToken: 't-a', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+    { name: 'b', type: 'oauth', accessToken: 't-b', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+  ], 0.98);
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+    });
+    await res.text();
+    assert.equal(res.status, 200, 'should succeed on the second account');
+    assert.equal(am.accounts[0].status, 'throttled', 'exhausted account is throttled (rotated away)');
+    assert.ok(seen.includes('Bearer t-b'), 'request rotated to account b');
   } finally {
     proxy.close();
     upstream.close();

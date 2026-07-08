@@ -81,3 +81,62 @@ test('release never drives inFlight negative', () => {
   am.release(0);
   assert.equal(am.accounts[0].inFlight, 0);
 });
+
+// ── rate-limit pause (no-switch on 429) ───────────────────────
+
+test('pauseAccount pauses without throttling — account stays selectable (no rotation)', () => {
+  const am = new AccountManager([oauth('a')], 0.98, { ramp: { pollMs: 5 } });
+  am.pauseAccount(0, 30);
+  const acct = am.accounts[0];
+  assert.ok(acct.pausedUntil > Date.now(), 'pausedUntil set');
+  assert.notEqual(acct.status, 'throttled', 'pause must not throttle');
+  assert.equal(acct.rateLimitedUntil, null, 'pause is not a rate-limit hold');
+  assert.equal(am._isAvailable(acct, 'claude-opus-4-6'), true, 'account stays available → selection never rotates away');
+});
+
+test('pauseAccount extends an existing pause, never shortens it', () => {
+  const am = new AccountManager([oauth('a')], 0.98);
+  am.pauseAccount(0, 30);
+  const long = am.accounts[0].pausedUntil;
+  am.pauseAccount(0, 1); // shorter — must not shorten
+  assert.equal(am.accounts[0].pausedUntil, long);
+});
+
+test('admit holds a request during a pause, then admits once it lifts', async () => {
+  const am = new AccountManager([oauth('a')], 0.98, {
+    ramp: { startConc: 10, stepConc: 1, stepMs: 10, windowMs: 60_000, pollMs: 5 },
+  });
+  am.accounts[0].pausedUntil = Date.now() + 120; // ~120ms pause
+
+  const start = Date.now();
+  const admitted = await am.admit(0);
+  const waited = Date.now() - start;
+
+  assert.equal(admitted, true);
+  assert.ok(waited >= 100, `admit should wait out the pause, waited ${waited}ms`);
+  assert.equal(am.accounts[0].inFlight, 1);
+});
+
+test('admit aborts (returns false) if the client disconnects during a pause', async () => {
+  const am = new AccountManager([oauth('a')], 0.98, { ramp: { pollMs: 5 } });
+  am.accounts[0].pausedUntil = Date.now() + 10_000; // long pause
+  let gone = false;
+  const p = am.admit(0, () => gone);
+  await sleep(20);
+  gone = true;
+  assert.equal(await p, false, 'aborted admit returns false');
+  assert.equal(am.accounts[0].inFlight, 0, 'no slot taken');
+});
+
+test('pauseAccount arms the ramp at pause-end so held requests release staggered', () => {
+  const am = new AccountManager([oauth('a')], 0.98, {
+    ramp: { startConc: 1, stepConc: 1, stepMs: 250, windowMs: 30_000, pollMs: 5 },
+  });
+  am.pauseAccount(0, 30);
+  const acct = am.accounts[0];
+  // Ramp is armed to begin exactly when the pause lifts.
+  assert.equal(acct.rampStartedAt, acct.pausedUntil);
+  // At the instant the pause lifts, the cap starts low (staggered release).
+  assert.equal(am._rampCap(acct, acct.pausedUntil), 1);
+  assert.equal(am._rampCap(acct, acct.pausedUntil + 250), 2);
+});

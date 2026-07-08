@@ -16,6 +16,12 @@ export const HOP_BY_HOP_HEADERS = new Set([
   'te', 'trailer', 'upgrade', 'proxy-authorization', 'proxy-authenticate',
 ]);
 const INLINE_RETRY_AFTER_MAX_SECONDS = 15;
+// How long the proxy will absorb a rate-limit 429's retry-after inline (waiting
+// on the SAME account) before surfacing a 429 + retry-after to the client. A
+// rate-limit 429 never rotates accounts (that just moves the burst); it pauses
+// the account so concurrent requests wait, then retries the same account.
+const RATE_LIMIT_ABSORB_MAX_SECONDS =
+  Number(process.env.TEAMCLAUDE_RATE_LIMIT_ABSORB_MAX_SECONDS) || 60;
 
 // Response header names that are connection-specific and thus illegal on an
 // HTTP/2 response (Node's Http2ServerResponse.writeHead rejects them). Also
@@ -530,34 +536,43 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       const switchingToSx = nextUseSx && !route;
       sx?.noteRateLimited(retryAfter);
 
-      // Bound the retries: a persistently-throttled upstream must not loop
-      // forever (that would tie up the client connection indefinitely).
-      // Once retries are exhausted, throttle this account and re-dispatch —
-      // getActiveAccount then picks another account, or returns 429 to the
-      // client if every account is throttled.
-      if (retryCount >= maxRetries) {
-        console.log(`[TeamClaude] Persistent 429 on "${account.name}" — throttling ${retryAfter}s and re-dispatching`);
-        accountManager.markRateLimited(account.index, retryAfter);
+      // This is a rate-limit 429 (per-minute throttle), NOT quota exhaustion —
+      // quota rejection is handled above and is the only thing that rotates.
+      // Do NOT switch accounts here: moving the burst to the next account just
+      // throttles it too (thundering herd, #84) and discards this account's KV
+      // cache. Instead PAUSE this account so concurrent requests wait in admit()
+      // (capped, then released through a fresh ramp) instead of piling on, and
+      // retry the SAME account. The pause never marks the account throttled, so
+      // selection keeps choosing it.
+      accountManager.pauseAccount(account.index, Math.min(retryAfter, RATE_LIMIT_ABSORB_MAX_SECONDS));
+
+      // sx fresh-IP retry (still the same account) takes precedence over waiting.
+      if (switchingToSx) {
+        console.log(`[TeamClaude] 429 on "${account.name}" — retrying via sx.org (fresh egress IP)`);
         if (res.destroyed) return;
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, nextUseSx);
       }
 
-    if (!switchingToSx && retryAfter > INLINE_RETRY_AFTER_MAX_SECONDS) {
-      console.log(`[TeamClaude] 429 on "${account.name}" — throttling ${retryAfter}s and re-dispatching without waiting`);
-      accountManager.markRateLimited(account.index, retryAfter);
-      if (res.destroyed) return;
-      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, nextUseSx);
-    }
-
-    if (switchingToSx) {
-      console.log(`[TeamClaude] 429 on "${account.name}" — retrying via sx.org (fresh egress IP)`);
-    } else {
-        console.log(`[TeamClaude] 429 on "${account.name}" — waiting ${retryAfter}s before retry`);
+      // Absorb short waits inline on the same account — the client never sees the
+      // 429. Bounded by retryCount (maxRetries = account count) so a persistently
+      // rate-limited account can't loop forever tying up the connection.
+      if (retryAfter <= RATE_LIMIT_ABSORB_MAX_SECONDS && retryCount < maxRetries) {
+        console.log(`[TeamClaude] Rate-limit 429 on "${account.name}" — waiting ${retryAfter}s, retrying same account (no switch)`);
         await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
+        if (res.destroyed) return;
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, nextUseSx);
       }
-      // Client may have disconnected during the wait
-      if (res.destroyed) return;
-      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, nextUseSx);
+
+      // Longer retry-after (or retries exhausted): don't hold the connection and
+      // don't rotate — surface the 429 with retry-after so the client backs off.
+      // The pause above keeps other requests off this account meanwhile.
+      console.log(`[TeamClaude] Rate-limit 429 on "${account.name}" — retry-after ${retryAfter}s over inline cap; returning 429 to client (no switch)`);
+      ctx.status = 429;
+      if (!res.headersSent && !res.destroyed) {
+        res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': String(retryAfter) });
+        res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: `Rate limited; retry in ${retryAfter}s.` } }));
+      }
+      return;
     }
 
     // Log the request head (once) followed by the response headers, streaming

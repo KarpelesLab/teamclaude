@@ -80,6 +80,11 @@ export class AccountManager {
       // time this account last became the current one (starts a ramp window).
       inFlight: 0,
       rampStartedAt: null,
+      // Rate-limit pause (see pauseAccount): a short window during which new
+      // requests wait in admit() rather than flooding — set from a 429's
+      // retry-after. Distinct from `throttled`/rateLimitedUntil: it does NOT
+      // make the account unavailable, so selection never rotates away from it.
+      pausedUntil: null,
     }));
     this.currentIndex = 0;
     this.switchThreshold = switchThreshold;
@@ -128,18 +133,28 @@ export class AccountManager {
   }
 
   /**
-   * Reserve a concurrency slot on `account` before sending upstream, waiting
-   * while the account is over its current ramp cap. Fail-open: returns true once
-   * a slot is taken (always eventually, since the cap grows and the window
-   * expires), or false if `isAborted()` reports the client went away while
-   * waiting. Pair every `true` with a `release(index)`.
+   * Reserve a concurrency slot on `account` before sending upstream. Waits while
+   * the account is in a rate-limit pause (a 429's retry-after window) and while
+   * it is over its current ramp cap. Fail-open: returns true once a slot is taken
+   * (always eventually — the pause ends and the ramp cap grows), or false if
+   * `isAborted()` reports the client went away while waiting. Pair every `true`
+   * with a `release(index)`.
    */
   async admit(index, isAborted) {
     const account = this.accounts[index];
-    if (!account || !this.ramp.enabled) { if (account) account.inFlight++; return true; }
+    if (!account) return true;
     while (true) {
       if (isAborted?.()) return false;
-      if (account.inFlight < this._rampCap(account)) { account.inFlight++; return true; }
+      const now = Date.now();
+      // Rate-limit pause: hold new requests off this account until the window
+      // passes instead of flooding it (which would deepen the 429). Not a
+      // rotation trigger — the account stays selectable the whole time.
+      if (account.pausedUntil && now < account.pausedUntil) {
+        await new Promise(r => setTimeout(r, Math.min(account.pausedUntil - now, this.ramp.pollMs * 4)));
+        continue;
+      }
+      const cap = this.ramp.enabled ? this._rampCap(account, now) : Infinity;
+      if (account.inFlight < cap) { account.inFlight++; return true; }
       await new Promise(r => setTimeout(r, this.ramp.pollMs));
     }
   }
@@ -148,6 +163,26 @@ export class AccountManager {
   release(index) {
     const account = this.accounts[index];
     if (account && account.inFlight > 0) account.inFlight--;
+  }
+
+  /**
+   * Pause an account after a rate-limit (non-quota) 429 so concurrent requests
+   * wait in admit() instead of piling on. Unlike markRateLimited this does NOT
+   * set `throttled`/rateLimitedUntil, so _isAvailable still returns true and
+   * selection never rotates away — rotation is reserved for quota exhaustion.
+   * When the pause lifts, the held requests are released through a fresh ramp
+   * window (storm control) so they trickle out rather than flood. Extends an
+   * existing pause rather than shortening it.
+   */
+  pauseAccount(index, seconds) {
+    const account = this.accounts[index];
+    if (!account) return;
+    const until = Date.now() + Math.max(0, seconds) * 1000;
+    account.pausedUntil = Math.max(account.pausedUntil || 0, until);
+    // Arm the ramp to begin when the pause ends: while paused, admit() holds on
+    // the pause branch; once it lifts, _rampCap counts from here and releases the
+    // backlog gradually (startConc, then +stepConc per step).
+    if (this.ramp.enabled) account.rampStartedAt = account.pausedUntil;
   }
 
   /**
@@ -1016,6 +1051,9 @@ export class AccountManager {
         usage: { ...a.usage },
         rateLimitedUntil: a.rateLimitedUntil
           ? new Date(a.rateLimitedUntil).toISOString()
+          : null,
+        pausedUntil: a.pausedUntil && a.pausedUntil > Date.now()
+          ? new Date(a.pausedUntil).toISOString()
           : null,
       })),
     };

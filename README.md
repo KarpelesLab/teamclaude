@@ -15,7 +15,7 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 
 - **Automatic account rotation** — switches to the next account when session (5h) or weekly (7d) quota reaches the configured threshold (default 98%)
 - **Model-aware routing** — the per-model weekly cap (e.g. Fable) is tracked separately, so an account whose Fable quota is spent is skipped **only** for Fable requests and still serves Opus/Sonnet. Requests are routed by their `model` (read exactly from the request body, in both base-URL and MITM modes). Optional **[model routes](#model-routes)** pin model patterns to a specific set of accounts (config, `teamclaude route`, or the TUI settings screen → Manage routing)
-- **Auto-retry on 429** — waits the `retry-after` duration and retries the same account; a quota rejection (a spent weekly bucket) switches accounts immediately instead of waiting, and switches to the next on persistent errors
+- **Auto-retry on 429** — distinguishes the two kinds of 429: a **quota rejection** (a spent 5h/weekly bucket, `unified-…-status: rejected`) switches accounts immediately; a **rate-limit 429** (the per-minute throttle) does **not** switch — it [pauses the account](#storm-control-switchover-ramp-up) so concurrent requests wait instead of flooding, retries the same account (absorbing short `retry-after`s inline), and only surfaces a 429 to the client for longer waits. Rotating on a rate-limit 429 would just move the burst to the next account and throw away the first account's cache
 - **Storm control** — when many agents fail over to a fresh account at once, requests are [paced onto it](#storm-control-switchover-ramp-up) with a short ramp-up so the herd doesn't instantly throttle it and cascade down the fleet
 - **Interactive TUI** — real-time dashboard with color-coded quota bars, reset countdowns, activity log, and keyboard controls; a settings screen (`g`) edits the rotation threshold, quota-probe interval, and sx.org proxy live
 - **OAuth token management** — automatically refreshes tokens nearing expiry and persists them to config; client token refreshes pass through untouched
@@ -250,6 +250,8 @@ On by default. Tune or disable via `stormRamp` in the config:
 - **`stepConc` / `stepMs`** — the cap grows by `stepConc` every `stepMs` (default +1 every 250ms ≈ 4 req/s).
 - **`windowMs`** — after this long, pacing stops entirely (default 30s).
 - **`enabled: false`** — turn storm control off (send the full burst immediately, pre-#84 behavior).
+
+The same gate handles **rate-limit 429s** (the per-minute throttle, not quota exhaustion): teamclaude pauses the account for the `retry-after` window so new queries wait instead of piling on, then releases the held queries through a fresh ramp (staggered, not all at once). It **never rotates** on a rate-limit 429 — that would just move the burst to the next account and drop the first account's cache. Short waits are absorbed inline on the same account (default ≤ 60s, `TEAMCLAUDE_RATE_LIMIT_ABSORB_MAX_SECONDS`); longer ones return a 429 + `retry-after` so the client backs off. Only a **quota rejection** (`unified-…-status: rejected`) rotates.
 
 ### Config format
 
