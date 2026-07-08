@@ -309,25 +309,30 @@ To go further you can pin model patterns to an **exclusive** set of accounts wit
 
 ```json
 "routes": [
-  { "name": "fable", "match": ["*fable*"], "accounts": ["personal-max"] },
-  { "name": "bulk",  "match": ["*opus*", "*sonnet*"], "accounts": ["corp-1", "corp-2"] }
+  { "name": "fable", "match": ["*fable*"], "accounts": ["personal-max"], "color": "magenta" },
+  { "name": "bulk",  "match": ["*opus*", "*sonnet*"], "accounts": ["corp-1", "corp-2"], "color": "blue" }
 ]
 ```
 
 - **`match`** — one or more model globs; the first route whose globs match wins.
 - **`accounts`** — account names (or indices) that may serve matching models. **Exclusive**: only these are used (and they 429/rotate among themselves when spent). Omit to route to all accounts — e.g. to only set a `bucket` override.
 - **`bucket`** — optional: force which quota bucket governs eligibility (`unified7dFable`, `unified7dSonnet`, `unified7d`), for the rare case the family can't be inferred from the model id.
+- **`color`** — optional: `red`/`green`/`yellow`/`blue`/`magenta`/`cyan`, tinting this route's inline marker in the TUI (see below). Display only.
 
 Manage routes from the shell (changes apply to a running server immediately):
 
 ```bash
 teamclaude route list
-teamclaude route add fable --match '*fable*' --accounts personal-max
+teamclaude route add fable --match '*fable*' --accounts personal-max --color magenta
 teamclaude route add bulk  --match '*opus*,*sonnet*' --accounts corp-1,corp-2
 teamclaude route rm fable
 ```
 
-…or interactively in the TUI: open settings (**`g`**) → **Manage routing**, then `a` add / `e` edit / `d` delete. The routes table (configured + auto-detected) is shown in both the TUI and `teamclaude status`.
+…or interactively in the TUI: open settings (**`g`**) → **Manage routing**, then `a` add / `e` edit / `d` delete (the editor prompts for a marker color too).
+
+**Inline markers (TUI).** Instead of a separate list, each route surfaces on the account rows as a colored `►`: next to the **`F7`/`S7`** bar for a Fable/Sonnet route, or at the **start of the row** for a general route (one fixed column per route so its position is stable). The marker is bold on the account a route is pinned to, dim when that account is currently ineligible. `teamclaude status` (the CLI text dump) still prints the routes as a list, now colored and annotated with any pin.
+
+**Manual per-route switching (TUI).** Press **`s`** to switch accounts, then **`Tab`** to choose *what* you're switching: the global **default** account, or a specific **route**. Pick an account with `↑/↓` and **`Enter`** to pin that route to it; `Enter` again on the current pin clears it. Pins are a **runtime preference** — not saved to config — and routing **falls back** to normal best-available selection whenever the pinned account is throttled or over quota, so a pin never stalls requests.
 
 ### Quota probe (optional, off by default)
 

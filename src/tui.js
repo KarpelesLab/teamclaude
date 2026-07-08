@@ -19,6 +19,38 @@ const red = s => fg(31, s);
 const cyan = s => fg(36, s);
 const gray = s => fg(90, s);
 
+// Named foreground colors selectable per route (config `color`). Bright variants
+// let a user distinguish several routes at a glance.
+const NAMED_FG = {
+  red: 31, green: 32, yellow: 33, blue: 34, magenta: 35, cyan: 36, white: 37,
+  brightred: 91, brightgreen: 92, brightyellow: 93, brightblue: 94,
+  brightmagenta: 95, brightcyan: 96,
+};
+// Ordered list of the plain names, offered in the editor prompt / help.
+const ROUTE_COLOR_NAMES = ['red', 'green', 'yellow', 'blue', 'magenta', 'cyan'];
+const isRouteColor = name => Object.prototype.hasOwnProperty.call(NAMED_FG, String(name || '').toLowerCase());
+// A paint function for a route's color, falling back to cyan for blank/unknown.
+const routeColorFn = name => {
+  const code = NAMED_FG[String(name || '').toLowerCase()];
+  return code ? (s => fg(code, s)) : cyan;
+};
+
+// Which quota-family bar (F7/S7) a route binds to, or null for a general route.
+// Auto routes are named 'fable'/'sonnet'; a configured route is classified by its
+// globs so e.g. `*fable*` sits next to the F7 bar.
+const routeFamily = route => {
+  const hay = `${route.name} ${(route.match || []).join(' ')}`.toLowerCase();
+  if (/fable/.test(hay)) return 'fable';
+  if (/sonnet/.test(hay)) return 'sonnet';
+  return null;
+};
+
+// The inline ► for a route on an account: bold when it's the route's manual pin,
+// plain when an eligible member, dim when the member is currently ineligible. The
+// route's own color is kept in every case so the marker stays identifiable.
+const routeGlyph = (paint, eligible, pinned) =>
+  pinned ? bold(paint('►')) : eligible ? paint('►') : dim(paint('►'));
+
 const ANSI_RE = /\x1b\[[0-9;]*m/g;
 const strip = s => s.replace(ANSI_RE, '');
 const vw = s => strip(s).length;
@@ -134,8 +166,9 @@ export class TUI {
     this.log = [];           // completed activity entries
     this.active = new Map(); // in-flight requests
     this.mode = 'normal';    // normal | select | add | input | settings
-    this.selAction = null;   // switch | remove
+    this.selAction = null;   // switch | remove | toggle
     this.selIdx = 0;
+    this.selRoute = null;    // in switch mode: null = global default, else a getRoutes() entry to pin
     this.setIdx = 0;         // cursor row on the settings screen (BIOS-style nav)
     this.inputPrompt = '';
     this.inputBuf = '';
@@ -227,6 +260,7 @@ export class TUI {
     if (d === '\x1b[D') return this._key('left');
     if (d === '\x1b') return this._key('esc');
     if (d === '\r' || d === '\n') return this._key('enter');
+    if (d === '\t') return this._key('tab');
     if (d === '\x03') return this._key('ctrl-c');
     if (d === '\x7f' || d === '\x08') return this._key('bs');
     if (d.length === 1 && d >= ' ') return this._key(d);
@@ -249,7 +283,7 @@ export class TUI {
   _keyNormal(k) {
     if (k === 'q') { this.stop(); this.onQuit?.(); }
     else if (k === 's' && this.am.accounts.length > 0) {
-      this.mode = 'select'; this.selAction = 'switch'; this.selIdx = this.am.currentIndex;
+      this.mode = 'select'; this.selAction = 'switch'; this.selIdx = this.am.currentIndex; this.selRoute = null;
     }
     else if (k === 'r' && this.am.accounts.length > 0) {
       this.mode = 'select'; this.selAction = 'remove'; this.selIdx = 0;
@@ -418,18 +452,53 @@ export class TUI {
     const len = this.am.accounts.length;
     if (k === 'up' || k === 'k') this.selIdx = Math.max(0, this.selIdx - 1);
     else if (k === 'down' || k === 'j') this.selIdx = Math.min(len - 1, this.selIdx + 1);
+    // Tab (switch only): cycle which route the pick applies to. null = the global
+    // default account; each getRoutes() entry = a per-route manual pin.
+    else if (k === 'tab' && this.selAction === 'switch') {
+      const routes = this.am.getRoutes();
+      const cycle = [null, ...routes];
+      const at = this.selRoute ? routes.findIndex(r => r.name === this.selRoute.name) + 1 : 0;
+      this.selRoute = cycle[(at + 1) % cycle.length];
+    }
     else if (k === 'enter') {
       if (this.selAction === 'switch') {
-        this.am.currentIndex = this.selIdx;
-        this._addLog(`Switched to "${this.am.accounts[this.selIdx].name}"`);
+        this._doSwitchSelection();
       } else if (this.selAction === 'toggle') {
         this._doToggleDisabled(this.selIdx);
       } else {
         this._doRemove(this.selIdx);
       }
-      this.mode = 'normal';
+      if (this.mode === 'select') this.mode = 'normal';
     }
     else if (k === 'esc' || k === 'q') { this.mode = 'normal'; }
+  }
+
+  // Apply an Enter in switch mode: with no route selected this sets the global
+  // default account; with a route selected it pins/unpins that route to the
+  // highlighted account. On a rejected pin we stay in select mode so the user can
+  // retry, rather than silently returning to normal.
+  _doSwitchSelection() {
+    const acct = this.am.accounts[this.selIdx];
+    if (this.selRoute === null) {
+      this.am.currentIndex = this.selIdx;
+      this._addLog(`Switched to "${acct.name}"`);
+      this.mode = 'normal';
+      return;
+    }
+    const name = this.selRoute.name;
+    if (this.am.getRoutePin(name) === acct) {
+      this.am.clearRoutePin(name); // Enter on the current pin toggles it off
+      this._addLog(`Unpinned route "${name}"`);
+      this.mode = 'normal';
+      return;
+    }
+    const res = this.am.setRoutePin(name, this.selIdx);
+    if (res.ok) {
+      this._addLog(`Pinned "${acct.name}" for route "${name}"`);
+      this.mode = 'normal';
+    } else {
+      this._addLog(`Can't pin: ${res.reason}`); // stay in select mode to retry
+    }
   }
 
   _keyAdd(k) {
@@ -686,22 +755,18 @@ export class TUI {
         ? Math.max(5, Math.min(20, Math.floor((W - 56) / 2)))
         : Math.max(5, Math.min(20, W - 45));
 
+      // Routes drive the inline markers; general (non-family) routes get a stable
+      // column each at the row start so the marker's position identifies the route.
+      const routes = this.am.getRoutes();
+      const genRoutes = routes.filter(r => routeFamily(r) === null);
       for (let i = 0; i < this.am.accounts.length; i++) {
-        lines.push(this._renderAcct(i, bw, showBoth));
+        lines.push(this._renderAcct(i, bw, showBoth, routes, genRoutes));
       }
     }
 
-    // ── Routing (configured + auto-detected routes, when any exist)
-    const routes = this.am.getRoutes();
-    if (routes.length) {
-      lines.push('');
-      lines.push(dim(' Routing'));
-      for (const r of routes) {
-        const accts = r.accounts.map(a => (a.eligible ? green(a.name) : red(a.name))).join(' ') || gray('(none)');
-        const tag = r.autocreated ? dim(' (auto)') : r.bucket ? dim(` [${r.bucket}]`) : '';
-        lines.push(`   ${cyan(r.match.join(','))} ${dim('→')} ${accts}${tag}`);
-      }
-    }
+    // Routing is surfaced inline on each account row (see _renderAcct): a colored
+    // ► marks a route the account serves — next to the F7/S7 bar for a Fable/Sonnet
+    // route, at the row start for a general route — bold when it's the route's pin.
 
     // ── Activity header
     lines.push('');
@@ -745,7 +810,7 @@ export class TUI {
     process.stdout.write(buf);
   }
 
-  _renderAcct(idx, bw, showBoth) {
+  _renderAcct(idx, bw, showBoth, routes = this.am.getRoutes(), genRoutes = routes.filter(r => routeFamily(r) === null)) {
     const a = this.am.accounts[idx];
     const isCur = idx === this.am.currentIndex;
     const isSel = this.mode === 'select' && idx === this.selIdx;
@@ -753,6 +818,25 @@ export class TUI {
     // Prefix: selection marker + current marker
     const sel = isSel ? cyan('>') : ' ';
     const cur = isCur ? green('►') : ' ';
+
+    // General-route markers: one fixed column per general route (stable order), so
+    // the same route always sits in the same slot across accounts. A member shows
+    // its colored ►, others a blank. Family routes (fable/sonnet) are drawn by the
+    // F7/S7 bars below instead.
+    const memberOf = (route) => route.accounts.find(x => x.name === a.name);
+    const startCells = genRoutes.map(r => {
+      const m = memberOf(r);
+      return m ? routeGlyph(routeColorFn(r.color), m.eligible, r.pinned === a.name) : ' ';
+    });
+    const startSlot = genRoutes.length ? `${startCells.join('')} ` : '';
+
+    // Family-route markers for this account's F7/S7 bars.
+    const familyMark = (fam) => {
+      const r = routes.find(x => routeFamily(x) === fam && memberOf(x));
+      if (!r) return ' ';
+      const m = memberOf(r);
+      return routeGlyph(routeColorFn(r.color), m.eligible, r.pinned === a.name);
+    };
 
     // Name (bold if selected)
     const rawName = a.name.slice(0, 12).padEnd(12);
@@ -794,16 +878,17 @@ export class TUI {
       t2 = t1;
     }
 
-    let line = ` ${sel}${cur} ${name} ${type} ${status} ${l1} ${bar(r1, bw, t1)}`;
+    let line = ` ${sel}${cur} ${startSlot}${name} ${type} ${status} ${l1} ${bar(r1, bw, t1)}`;
     if (showBoth) {
       line += `  ${l2} ${bar(r2, bw, t2)}`;
-      // Sonnet weekly bar — only shown when the usage probe has populated it.
+      // Sonnet weekly bar — only shown when the usage probe has populated it. A
+      // leading ► (in place of a padding space) marks a Sonnet route on this account.
       if (q.unified7dSonnet != null) {
-        line += `  S7  ${bar(q.unified7dSonnet, bw, q.unified7dSonnetReset)}`;
+        line += ` ${familyMark('sonnet')}S7  ${bar(q.unified7dSonnet, bw, q.unified7dSonnetReset)}`;
       }
       // Fable weekly bar — only shown when the usage probe has populated it.
       if (q.unified7dFable != null) {
-        line += `  F7  ${bar(q.unified7dFable, bw, q.unified7dFableReset)}`;
+        line += ` ${familyMark('fable')}F7  ${bar(q.unified7dFable, bw, q.unified7dFableReset)}`;
       }
     }
     // Explicit "disabled for these models" tag (issue #85): a family whose own
@@ -910,6 +995,7 @@ export class TUI {
       match: (orig ? (Array.isArray(orig.match) ? orig.match : [orig.match]) : []).join(', '),
       accounts: (orig?.accounts || []).join(', '),
       bucket: orig?.bucket || '',
+      color: orig?.color || '',
     };
     this._routePrompt('Route name', orig?.name || '', name => {
       if (!name) { this._addLog('Route name required — cancelled'); this.mode = 'routes'; return; }
@@ -922,7 +1008,10 @@ export class TUI {
           draft.accounts = accts;
           this._routePrompt('Quota bucket override (blank = auto)', draft.bucket, bucket => {
             draft.bucket = bucket;
-            this._routeSave(draft, orig);
+            this._routePrompt(`Marker color (${ROUTE_COLOR_NAMES.join('/')}, blank = default)`, draft.color, color => {
+              draft.color = color;
+              this._routeSave(draft, orig);
+            });
           });
         });
       });
@@ -934,6 +1023,10 @@ export class TUI {
     const accounts = splitCsv(draft.accounts);
     if (accounts.length) route.accounts = accounts;
     if (draft.bucket) route.bucket = draft.bucket;
+    if (draft.color) {
+      if (isRouteColor(draft.color)) route.color = draft.color.toLowerCase();
+      else this._addLog(`Unknown color "${draft.color}" — using default`);
+    }
 
     this.config.routes = this.config.routes || [];
     const at = orig ? this.config.routes.indexOf(orig)
@@ -999,9 +1092,13 @@ export class TUI {
       case 'routes':
         return ` ${dim('↑↓')} select  ${bold('a')}dd  ${bold('e')}dit  ${bold('d')}elete  ${bold('Esc')} back`;
       case 'select': {
-        const act = this.selAction === 'switch' ? 'switch'
-          : this.selAction === 'toggle' ? 'enable/disable'
-          : 'remove';
+        if (this.selAction === 'switch') {
+          const target = this.selRoute
+            ? routeColorFn(this.selRoute.color)(`route ${this.selRoute.name}`)
+            : 'default';
+          return ` ${dim('↑↓')} select  ${bold('Tab')} target: ${target}  ${bold('Enter')} pin  ${bold('Esc')} cancel`;
+        }
+        const act = this.selAction === 'toggle' ? 'enable/disable' : 'remove';
         return ` ${dim('↑↓')} select  ${bold('Enter')} ${act}  ${bold('Esc')} cancel`;
       }
       case 'add':

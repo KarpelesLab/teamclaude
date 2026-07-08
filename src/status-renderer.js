@@ -47,8 +47,17 @@ function colors(enabled) {
     green: wrap(32),
     yellow: wrap(33),
     red: wrap(31),
+    blue: wrap(34),
+    magenta: wrap(35),
     cyan: wrap(36),
   };
+}
+
+// Paint a route's name/globs in its configured color, defaulting to cyan.
+const ROUTE_COLORS = ['red', 'green', 'yellow', 'blue', 'magenta', 'cyan'];
+function paintRoute(paint, color, value) {
+  const fn = ROUTE_COLORS.includes(String(color || '').toLowerCase()) ? paint[color.toLowerCase()] : paint.cyan;
+  return fn(value);
 }
 
 // The routing table: one line per route (configured first, then auto-detected),
@@ -63,7 +72,10 @@ function routingLines(routes, paint) {
     const accounts = (route.accounts || [])
       .map(a => (a.eligible ? paint.green(a.name) : paint.red(a.name))).join(' ') || paint.gray('(none)');
     const tag = route.autocreated ? paint.dim(' (auto)') : route.bucket ? paint.dim(` [${route.bucket}]`) : '';
-    lines.push(`  ${match.padEnd(16)} ${paint.dim('→')} ${accounts}${tag}`);
+    const pin = route.pinned ? paint.dim(` [pinned: ${route.pinned}]`) : '';
+    // padEnd on the raw text, color after, so ANSI codes don't throw off alignment.
+    const label = paintRoute(paint, route.color, match.padEnd(16));
+    lines.push(`  ${label} ${paint.dim('→')} ${accounts}${tag}${pin}`);
   }
   lines.push('');
   return lines;

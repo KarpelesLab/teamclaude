@@ -95,6 +95,11 @@ export class AccountManager {
     this._refreshFn = refreshFn;
     this.accounts = accounts.map((acct, index) => makeAccount(acct, index));
     this.currentIndex = 0;
+    // Ephemeral per-route manual pins (routeName → account index). Not persisted:
+    // like the global manual switch (currentIndex) these are runtime overrides that
+    // bias selection for a route's models and reset on restart. A pinned account
+    // that becomes ineligible is skipped — routing falls back to best-available.
+    this.routePins = new Map();
     this.switchThreshold = switchThreshold;
     this.setRoutes(routes);
     // Storm control: when rotation switches to a fresh account, a burst of
@@ -206,6 +211,11 @@ export class AccountManager {
     // session reset made a sooner-expiring account the better choice. This runs
     // on every request so the behaviour holds without the TUI render loop.
     this.refreshExpiredQuotas();
+    // A manual per-route pin biases selection for that route's models (independent
+    // of the global currentIndex). Honored only while eligible — otherwise we fall
+    // through to normal best-available selection so requests keep flowing.
+    const pinned = this._pinnedAccountForModel(model);
+    if (pinned && this._isAvailable(pinned, model) && !exclude?.has(pinned.index)) return pinned;
     const current = this.accounts[this.currentIndex];
     // `model` scopes availability: an account whose Fable weekly bucket is spent
     // is still fully usable for other models, so it is only excluded when THIS
@@ -414,7 +424,15 @@ export class AccountManager {
       match: (Array.isArray(r.match) ? r.match : [r.match]).filter(g => typeof g === 'string' && g),
       accounts: Array.isArray(r.accounts) ? r.accounts.map(String) : [],
       bucket: r.bucket || null,
+      color: r.color || null, // display-only accent for the route's inline marker
     })).filter(r => r.match.length);
+    // Drop pins for routes that no longer exist after a reload.
+    if (this.routePins?.size) {
+      const names = new Set(this.routes.map(r => r.name));
+      for (const name of [...this.routePins.keys()]) {
+        if (name !== 'fable' && name !== 'sonnet' && !names.has(name)) this.routePins.delete(name);
+      }
+    }
   }
 
   /** The first configured route whose globs match `model`, or null. */
@@ -463,7 +481,8 @@ export class AccountManager {
    */
   getRoutes() {
     const out = this.routes.map(r => ({
-      name: r.name, match: r.match, bucket: r.bucket, autocreated: false,
+      name: r.name, match: r.match, bucket: r.bucket, color: r.color || null, autocreated: false,
+      pinned: this._pinnedName(r.name),
       accounts: this._routeAccountsView(r),
     }));
 
@@ -477,11 +496,18 @@ export class AccountManager {
     for (const d of detected) {
       if (this._routeForModel(d.sample)) continue; // already covered by a configured route
       out.push({
-        name: d.name, match: d.match, bucket: null, autocreated: true,
+        name: d.name, match: d.match, bucket: null, color: null, autocreated: true,
+        pinned: this._pinnedName(d.name),
         accounts: this.accounts.map(a => ({ name: a.name, eligible: this._isAvailable(a, d.sample) })),
       });
     }
     return out;
+  }
+
+  /** The name of the account this route is manually pinned to, or null. */
+  _pinnedName(routeName) {
+    const idx = this.routePins.get(routeName);
+    return idx == null ? null : (this.accounts[idx]?.name ?? null);
   }
 
   /** Accounts a configured route can use (all accounts when it lists none), each
@@ -491,6 +517,60 @@ export class AccountManager {
     const inRoute = a => !route.accounts.length
       || route.accounts.includes(a.name) || route.accounts.includes(String(a.index));
     return this.accounts.filter(inRoute).map(a => ({ name: a.name, eligible: this._isAvailable(a, sample) }));
+  }
+
+  /** A representative model id for a route name (configured or auto fable/sonnet),
+   * used to test route-allowance when pinning. Null for an unknown route. */
+  _routeSample(routeName) {
+    const r = this.routes.find(x => x.name === routeName);
+    if (r) return r.match[0]?.replace(/\*/g, '') || 'model';
+    if (routeName === 'fable') return 'claude-fable-5';
+    if (routeName === 'sonnet') return 'claude-sonnet-4-6';
+    return null;
+  }
+
+  /**
+   * Manually pin a route to an account (ephemeral runtime override). Rejects an
+   * account the route's exclusivity/ownership rules disallow. Pinning an account
+   * that is merely near-quota/throttled is allowed — it acts as a preference and
+   * routing falls back to best-available until the pinned account is eligible.
+   * Returns { ok, reason? }.
+   */
+  setRoutePin(routeName, accountIndex) {
+    const account = this.accounts[accountIndex];
+    if (!account) return { ok: false, reason: 'no such account' };
+    const sample = this._routeSample(routeName);
+    if (sample && !this._routeAllows(account, sample)) {
+      return { ok: false, reason: `route "${routeName}" does not allow "${account.name}"` };
+    }
+    this.routePins.set(routeName, accountIndex);
+    return { ok: true };
+  }
+
+  clearRoutePin(routeName) { this.routePins.delete(routeName); }
+
+  /** The account a route is pinned to, or null. */
+  getRoutePin(routeName) {
+    const idx = this.routePins.get(routeName);
+    return idx == null ? null : (this.accounts[idx] || null);
+  }
+
+  /** The manually-pinned account governing `model`, if any: a configured route's
+   * pin wins, else an auto fable/sonnet family pin (only when no configured route
+   * covers the model). Returns null when nothing is pinned for this model. */
+  _pinnedAccountForModel(model) {
+    if (!model || !this.routePins.size) return null;
+    const route = this._routeForModel(model);
+    if (route) {
+      const idx = this.routePins.get(route.name);
+      return idx == null ? null : (this.accounts[idx] || null);
+    }
+    for (const name of ['fable', 'sonnet']) {
+      if (this.routePins.has(name) && modelGlobMatches(`*${name}*`, model)) {
+        return this.accounts[this.routePins.get(name)] || null;
+      }
+    }
+    return null;
   }
 
   /**
@@ -989,6 +1069,12 @@ export class AccountManager {
       this.currentIndex = Math.max(0, this.accounts.length - 1);
     } else if (this.currentIndex > index) {
       this.currentIndex--;
+    }
+    // Keep route pins pointing at the right account after the index shift: drop a
+    // pin on the removed account, decrement pins that sat above it.
+    for (const [name, idx] of [...this.routePins.entries()]) {
+      if (idx === index) this.routePins.delete(name);
+      else if (idx > index) this.routePins.set(name, idx - 1);
     }
   }
 

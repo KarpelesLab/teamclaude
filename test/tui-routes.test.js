@@ -5,14 +5,18 @@ import { TUI } from '../src/tui.js';
 // Minimal AccountManager stand-in for the routes editor: it only needs the
 // surface the editor touches (accounts, setRoutes). render() is stubbed out so
 // these tests exercise the editor state machine, not the terminal renderer.
-function makeTUI() {
+function makeTUI({ routes = [] } = {}) {
   const applied = { routes: null };
+  const pins = { calls: [], byName: new Map() };
   const am = {
     accounts: [{ name: 'a', index: 0 }, { name: 'b', index: 1 }],
     currentIndex: 0,
     switchThreshold: 0.98,
     setRoutes(r) { applied.routes = r; },
-    getRoutes() { return []; },
+    getRoutes() { return routes; },
+    setRoutePin(name, idx) { pins.calls.push(['set', name, idx]); pins.byName.set(name, this.accounts[idx]); return { ok: true }; },
+    clearRoutePin(name) { pins.calls.push(['clear', name]); pins.byName.delete(name); },
+    getRoutePin(name) { return pins.byName.get(name) || null; },
   };
   const saved = { routes: null };
   const config = { proxy: { port: 1 }, routes: [] };
@@ -22,7 +26,7 @@ function makeTUI() {
     syncAccounts: async () => 0, onQuit: () => {},
   });
   tui.render = () => {}; // bypass terminal rendering
-  return { tui, config, applied, saved };
+  return { tui, config, applied, saved, pins };
 }
 
 const type = (tui, s) => { for (const ch of s) tui._key(ch); };
@@ -51,7 +55,9 @@ test('TUI routes editor: add walks name → glob → accounts → bucket and per
   assert.match(tui.inputPrompt, /Accounts/);
   type(tui, 'b'); tui._key('enter');
   assert.match(tui.inputPrompt, /bucket/i);
-  tui._key('enter'); // blank bucket → save
+  tui._key('enter'); // blank bucket → color prompt
+  assert.match(tui.inputPrompt, /color/i);
+  tui._key('enter'); // blank color → save
   await settle();
 
   assert.deepEqual(config.routes, [{ name: 'fable', match: ['*fable*'], accounts: ['b'] }]);
@@ -81,11 +87,65 @@ test('TUI routes editor: edit prefills, and backspace clears a field before rety
   assert.equal(tui.inputBuf, 'b');               // accounts prefilled
   tui._key('bs'); type(tui, 'a,b'); tui._key('enter');
   type(tui, 'unified7dFable'); tui._key('enter');
+  type(tui, 'magenta'); tui._key('enter'); // color
   await settle();
 
   assert.deepEqual(config.routes, [
-    { name: 'fable', match: ['*fable*'], accounts: ['a', 'b'], bucket: 'unified7dFable' },
+    { name: 'fable', match: ['*fable*'], accounts: ['a', 'b'], bucket: 'unified7dFable', color: 'magenta' },
   ]);
+});
+
+test('TUI routes editor: an unknown color is dropped (route still saves)', async () => {
+  const { tui, config } = makeTUI();
+  openRoutes(tui); tui._key('a');
+  type(tui, 'r'); tui._key('enter');           // name
+  type(tui, '*opus*'); tui._key('enter');      // glob
+  tui._key('enter');                            // accounts (all)
+  tui._key('enter');                            // bucket (auto)
+  type(tui, 'chartreuse'); tui._key('enter');   // unknown color
+  await settle();
+  assert.deepEqual(config.routes, [{ name: 'r', match: ['*opus*'] }]); // no color key
+});
+
+test('TUI switch mode: Tab targets a route and Enter pins the highlighted account', () => {
+  const routes = [{
+    name: 'fable', match: ['*fable*'], color: 'red', autocreated: true, pinned: null,
+    accounts: [{ name: 'a', eligible: true }, { name: 'b', eligible: true }],
+  }];
+  const { tui, pins } = makeTUI({ routes });
+
+  tui._key('s');                       // enter switch mode (selRoute = null = default)
+  assert.equal(tui.mode, 'select');
+  assert.equal(tui.selRoute, null);
+  tui._key('tab');                     // cycle to the fable route
+  assert.equal(tui.selRoute?.name, 'fable');
+  tui._key('down');                    // highlight account b (index 1)
+  tui._key('enter');
+  assert.deepEqual(pins.calls, [['set', 'fable', 1]]);
+  assert.equal(tui.mode, 'normal');
+});
+
+test('TUI switch mode: Enter on the current pin clears it (toggle off)', () => {
+  const routes = [{
+    name: 'fable', match: ['*fable*'], color: 'red', autocreated: true, pinned: 'a',
+    accounts: [{ name: 'a', eligible: true }, { name: 'b', eligible: true }],
+  }];
+  const { tui, pins } = makeTUI({ routes });
+  pins.byName.set('fable', tui.am.accounts[0]); // a is already pinned
+
+  tui._key('s');
+  tui._key('tab');                     // target fable
+  tui._key('enter');                   // Enter on account a (the current pin)
+  assert.deepEqual(pins.calls, [['clear', 'fable']]);
+  assert.equal(tui.mode, 'normal');
+});
+
+test('TUI switch mode: Tab is inert for remove/toggle actions', () => {
+  const routes = [{ name: 'fable', match: ['*fable*'], accounts: [{ name: 'a', eligible: true }] }];
+  const { tui } = makeTUI({ routes });
+  tui._key('r');                       // remove action
+  tui._key('tab');
+  assert.equal(tui.selRoute, null);    // unchanged — Tab only cycles in switch mode
 });
 
 test('TUI routes editor: delete removes the selected route', async () => {

@@ -80,6 +80,20 @@ test('renderStatus prints the routing table with configured and auto routes', ()
   assert.match(output, /\*sonnet\*\s+→ a \(auto\)/);
 });
 
+test('renderStatus shows a route color and pinned account', () => {
+  const status = sampleStatus();
+  status.routes = [
+    { name: 'fable', match: ['*fable*'], autocreated: false, bucket: null, color: 'magenta', pinned: 'personal',
+      accounts: [{ name: 'personal', eligible: true }, { name: 'a', eligible: true }] },
+  ];
+  // Plain text: the pin annotation is visible.
+  const plain = renderStatus(status, { color: false, now });
+  assert.match(plain, /\*fable\*\s+→ personal a \[pinned: personal\]/);
+  // Colored: the magenta SGR code (35) wraps the route label.
+  const colored = renderStatus(status, { color: true, now });
+  assert.match(colored, /\x1b\[35m\*fable\*/);
+});
+
 test('renderStatus omits the routing table when there are no routes', () => {
   const output = renderStatus(sampleStatus(), { color: false, now });
   assert.doesNotMatch(output, /Routing/);

@@ -30,5 +30,13 @@
       "disabled": false,
       "apiKey": "sk-ant-api03-your-api-key"
     }
+  ],
+  "routes": [
+    {
+      "name": "fable",
+      "match": ["*fable*"],
+      "accounts": ["primary-max"],
+      "color": "magenta"
+    }
   ]
 }

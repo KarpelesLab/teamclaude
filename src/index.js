@@ -975,13 +975,16 @@ async function removeCommand() {
 
 const ROUTE_USAGE = [
   'Usage: teamclaude route [list]',
-  '       teamclaude route add <name> --match "<glob>[,<glob>]" [--accounts "<name-or-index>[,...]"] [--bucket <quota-bucket>]',
+  '       teamclaude route add <name> --match "<glob>[,<glob>]" [--accounts "<name-or-index>[,...]"] [--bucket <quota-bucket>] [--color <name>]',
   '       teamclaude route rm <name>',
   '',
   'A route pins model ids matching its globs to an exclusive set of accounts.',
   'Omit --accounts to route to all accounts (e.g. just to override --bucket).',
+  '--color (red/green/yellow/blue/magenta/cyan) tints the route\'s inline marker in the TUI.',
   'First matching route wins. Changes apply to a running server immediately.',
 ].join('\n');
+
+const ROUTE_COLORS = ['red', 'green', 'yellow', 'blue', 'magenta', 'cyan'];
 
 function splitList(value) {
   return (value || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -998,7 +1001,8 @@ async function routeCommand() {
       const match = (Array.isArray(r.match) ? r.match : [r.match]).join(', ');
       const accts = (r.accounts && r.accounts.length) ? r.accounts.join(', ') : '(all accounts)';
       const bucket = r.bucket ? `  bucket=${r.bucket}` : '';
-      console.log(`${r.name || '(unnamed)'}: ${match} → ${accts}${bucket}`);
+      const color = r.color ? `  color=${r.color}` : '';
+      console.log(`${r.name || '(unnamed)'}: ${match} → ${accts}${bucket}${color}`);
     }
     return;
   }
@@ -1008,8 +1012,13 @@ async function routeCommand() {
     const match = splitList(argValue('--match'));
     const accounts = splitList(argValue('--accounts'));
     const bucket = argValue('--bucket');
+    const color = argValue('--color');
     if (!name || !match.length) {
       console.error(ROUTE_USAGE);
+      process.exit(1);
+    }
+    if (color && !ROUTE_COLORS.includes(color.toLowerCase())) {
+      console.error(`Unknown color "${color}" — expected one of: ${ROUTE_COLORS.join(', ')}`);
       process.exit(1);
     }
     const known = new Set(config.accounts.map(a => a.name));
@@ -1019,6 +1028,7 @@ async function routeCommand() {
     const route = { name, match };
     if (accounts.length) route.accounts = accounts;
     if (bucket) route.bucket = bucket;
+    if (color) route.color = color.toLowerCase();
     const at = config.routes.findIndex(r => r.name === name);
     if (at >= 0) { config.routes[at] = route; console.log(`Updated route "${name}"`); }
     else { config.routes.push(route); console.log(`Added route "${name}"`); }
