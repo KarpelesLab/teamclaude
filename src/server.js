@@ -4,12 +4,16 @@ import { createWriteStream } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { ensureCerts, createConnectHandler } from './mitm.js';
-import { patchAccountUuid } from './account-uuid-rewrite.js';
 import { parseRequestModel } from './account-manager.js';
 import { TopLevelFieldFinder } from './model.js';
 import { BodyWriter } from './request-log.js';
 import { upstreamFetch } from './upstream-fetch.js';
 import { anthropic } from './providers/anthropic.js';
+import { providerForUpstream } from './providers/index.js';
+
+// Re-exported so `import { rewriteModel } from './server.js'` (and its tests)
+// keep working now that the implementation lives in the provider module.
+export { rewriteModel } from './providers/anthropic.js';
 
 
 export const HOP_BY_HOP_HEADERS = new Set([
@@ -204,7 +208,10 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       const body = Buffer.concat(bodyChunks);
 
       const model = modelFinder.done ? modelFinder.value : parseRequestModel(body);
-      const ctx = { account: null, status: null, tried: new Set(), model, pinnedIndex };
+      // The provider that owns this pool's upstream (Anthropic today). Once the
+      // account router lands this becomes the request's resolved-by-host provider.
+      const provider = providerForUpstream(upstream) || anthropic;
+      const ctx = { account: null, status: null, tried: new Set(), model, pinnedIndex, provider };
       try {
         await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir, sx);
       } catch (err) {
@@ -410,8 +417,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
   }
 
+  const provider = ctx.provider;
+
   // Build upstream request headers
-  const isOAuth = account.type === 'oauth';
   const headers = {};
   for (const [key, value] of Object.entries(req.headers)) {
     const lk = key.toLowerCase();
@@ -426,21 +434,14 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     headers[key] = value;
   }
 
-  if (isOAuth) {
-    headers['authorization'] = `Bearer ${account.credential}`;
-  } else {
-    headers['x-api-key'] = account.credential;
-  }
+  // Inject the account's credential the way this provider expects.
+  provider.injectAuth(headers, account);
 
   const upstreamUrl = `${account.upstream || upstream}${req.url}`;
   const method = req.method;
 
-  // Align the body's account_uuid (in metadata.user_id) with the account whose
-  // token we're injecting (same-length patch; no-op if absent).
-  let sendBody = account.accountUuid ? patchAccountUuid(body, account.accountUuid) : body;
-  // Rewrite the model name for accounts that target a different upstream (e.g.
-  // GLM), which uses different model identifiers than Anthropic.
-  if (account.modelMap) sendBody = rewriteModel(sendBody, account.modelMap);
+  // Align the body with the injected account (account_uuid patch, model remap).
+  const sendBody = provider.rewriteBody(body, account);
   // If the body changed length (model name rewrite), update Content-Length so the
   // upstream doesn't receive a mismatched framing and truncate or stall.
   if (sendBody !== body) headers['content-length'] = String(sendBody.length);
@@ -481,13 +482,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       accountManager.release(account.index);
     }
 
-    // Extract rate limit headers
-    const rateLimitHeaders = {};
-    for (const [key, value] of upstreamRes.headers.entries()) {
-      if (key.startsWith('anthropic-ratelimit-')) {
-        rateLimitHeaders[key] = value;
-      }
-    }
+    // Extract this provider's rate-limit headers and learn utilization from them.
+    const rateLimitHeaders = provider.rateLimitHeaders(upstreamRes.headers);
     accountManager.updateQuota(account.index, rateLimitHeaders);
 
     // Any non-429 response is live proof a rate-limit hold no longer binds —
@@ -508,21 +504,19 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // Discard the 429 response body
       await upstreamRes.body?.cancel();
 
-      // Durable quota exhaustion vs. a transient rate limit. A "rejected" unified
-      // status means a quota bucket is spent, so waiting and retrying the SAME
-      // account is futile — switch to another account now (updateQuota above
-      // already recorded the spent bucket's utilization from the headers).
-      const rl = rateLimitHeaders;
-      const generalRejected = rl['anthropic-ratelimit-unified-5h-status'] === 'rejected'
-        || rl['anthropic-ratelimit-unified-7d-status'] === 'rejected';
-      const fableRejected = rl['anthropic-ratelimit-unified-7d_oi-status'] === 'rejected' && !generalRejected;
-      if ((generalRejected || fableRejected) && retryCount < maxRetries) {
-        // A Fable-only rejection leaves the account fine for other models, so we
-        // do NOT throttle it globally — the recorded Fable utilization makes
-        // selection skip it for Fable requests only. A general rejection spends a
-        // shared bucket, so hold the whole account for its reset window.
-        if (fableRejected) {
-          console.log(`[TeamClaude] Fable weekly exhausted on "${account.name}" — switching account for this Fable request`);
+      // Durable quota exhaustion vs. a transient rate limit. A quota rejection
+      // means a bucket is spent, so waiting and retrying the SAME account is
+      // futile — switch to another account now (updateQuota above already
+      // recorded the spent bucket's utilization from the headers).
+      const { quotaExhausted, modelScoped } = provider.classify429(rateLimitHeaders);
+      if (quotaExhausted && retryCount < maxRetries) {
+        // A model-scoped rejection (e.g. Fable weekly) leaves the account fine for
+        // other models, so we do NOT throttle it globally — the recorded
+        // utilization makes selection skip it for that model only. A general
+        // rejection spends a shared bucket, so hold the whole account for its
+        // reset window.
+        if (modelScoped) {
+          console.log(`[TeamClaude] Model-scoped weekly exhausted on "${account.name}" — switching account for this request`);
         } else {
           const hold = Math.min(Math.max(retryAfter, 1), 3600);
           console.log(`[TeamClaude] Quota rejection (429) on "${account.name}" — throttling ${hold}s and switching account`);
@@ -618,11 +612,11 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // whole (potentially ~1M-token) SSE body in memory.
       const l = getLog();
       const bw = l ? l.bodyWriter('RESPONSE BODY (streamed)', contentType) : null;
-      await streamResponse(upstreamRes.body, res, account.index, accountManager, bw);
+      await streamResponse(upstreamRes.body, res, account.index, accountManager, bw, provider);
       l?.end();
     } else {
       const buf = Buffer.from(await upstreamRes.arrayBuffer());
-      extractUsageFromBody(buf, account.index, accountManager);
+      extractUsageFromBody(buf, account.index, accountManager, provider);
       const l = getLog();
       if (l) { l.body('RESPONSE BODY', buf, contentType); l.end(); }
       res.end(buf);
@@ -721,7 +715,7 @@ export function readWithIdleTimeout(reader, ms) {
 /**
  * Stream an SSE response to the client, parsing usage data along the way.
  */
-async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter) {
+async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter, provider) {
   const reader = webStream.getReader();
   const idleMs = resolveBodyIdleTimeout();
   const decoder = new TextDecoder();
@@ -750,7 +744,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
       sseBuffer = events.pop(); // keep incomplete event
 
       for (const event of events) {
-        parseSSEUsage(event, accountIndex, accountManager);
+        parseSSEUsage(event, accountIndex, accountManager, provider);
       }
 
       // Handle backpressure — also bail out if client disconnects,
@@ -770,7 +764,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
 
     // Parse any remaining buffer
     if (sseBuffer.trim()) {
-      parseSSEUsage(sseBuffer, accountIndex, accountManager);
+      parseSSEUsage(sseBuffer, accountIndex, accountManager, provider);
     }
   } catch (err) {
     // A mid-stream idle timeout (or any read error) means the upstream went
@@ -788,46 +782,25 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
   }
 }
 
-function parseSSEUsage(event, accountIndex, accountManager) {
+function parseSSEUsage(event, accountIndex, accountManager, provider) {
   const dataLine = event.split('\n').find(l => l.startsWith('data: '));
   if (!dataLine) return;
 
   try {
-    const data = JSON.parse(dataLine.slice(6));
-    if (data.type === 'message_start' && data.message?.usage) {
-      accountManager.updateUsage(accountIndex, data.message.usage.input_tokens, 0);
-    } else if (data.type === 'message_delta' && data.usage) {
-      accountManager.updateUsage(accountIndex, 0, data.usage.output_tokens);
-    }
+    const usage = provider.parseUsageEvent(JSON.parse(dataLine.slice(6)));
+    if (usage) accountManager.updateUsage(accountIndex, usage.input, usage.output);
   } catch {
     // not valid JSON, skip
   }
 }
 
-function extractUsageFromBody(buffer, accountIndex, accountManager) {
+function extractUsageFromBody(buffer, accountIndex, accountManager, provider) {
   try {
-    const json = JSON.parse(buffer.toString());
-    if (json.usage) {
-      accountManager.updateUsage(accountIndex, json.usage.input_tokens, json.usage.output_tokens);
-    }
+    const usage = provider.parseUsageBody(JSON.parse(buffer.toString()));
+    if (usage) accountManager.updateUsage(accountIndex, usage.input, usage.output);
   } catch {
     // not JSON or no usage
   }
-}
-
-// Rewrite the `model` field in a JSON request body using a per-account map.
-// Returns the original buffer unchanged if the model isn't in the map or the
-// body isn't valid JSON, so non-messages endpoints pass through safely.
-// Exported for tests.
-export function rewriteModel(body, modelMap) {
-  try {
-    const obj = JSON.parse(body.toString('utf8'));
-    if (obj.model && modelMap[obj.model]) {
-      obj.model = modelMap[obj.model];
-      return Buffer.from(JSON.stringify(obj), 'utf8');
-    }
-  } catch { /* not JSON — pass through unchanged */ }
-  return body;
 }
 
 function computeRetryAfter(accounts) {

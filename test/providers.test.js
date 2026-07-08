@@ -33,3 +33,60 @@ test('providerForHost / providerForUpstream resolve by host', () => {
   assert.equal(providerForUpstream('https://api.anthropic.com'), anthropic);
   assert.equal(providerForUpstream('not a url'), null);
 });
+
+test('injectAuth uses Bearer for oauth and x-api-key for api-key accounts', () => {
+  const h1 = {};
+  anthropic.injectAuth(h1, { type: 'oauth', credential: 'tok' });
+  assert.equal(h1['authorization'], 'Bearer tok');
+  assert.equal(h1['x-api-key'], undefined);
+
+  const h2 = {};
+  anthropic.injectAuth(h2, { type: 'apikey', credential: 'sk-123' });
+  assert.equal(h2['x-api-key'], 'sk-123');
+  assert.equal(h2['authorization'], undefined);
+});
+
+test('rewriteBody returns the same buffer instance when nothing applies', () => {
+  const body = Buffer.from(JSON.stringify({ model: 'claude-x', hi: 1 }));
+  assert.equal(anthropic.rewriteBody(body, { type: 'oauth' }), body);
+});
+
+test('rewriteBody remaps the model when the account has a modelMap', () => {
+  const body = Buffer.from(JSON.stringify({ model: 'claude-x' }));
+  const out = anthropic.rewriteBody(body, { modelMap: { 'claude-x': 'glm-4' } });
+  assert.notEqual(out, body);
+  assert.equal(JSON.parse(out).model, 'glm-4');
+});
+
+test('rateLimitHeaders keeps only anthropic-ratelimit-* headers', () => {
+  const headers = new Map([
+    ['anthropic-ratelimit-unified-5h-status', 'allowed'],
+    ['content-type', 'application/json'],
+    ['anthropic-ratelimit-unified-7d-status', 'rejected'],
+  ]);
+  const out = anthropic.rateLimitHeaders(headers);
+  assert.deepEqual(out, {
+    'anthropic-ratelimit-unified-5h-status': 'allowed',
+    'anthropic-ratelimit-unified-7d-status': 'rejected',
+  });
+});
+
+test('classify429 distinguishes general vs model-scoped exhaustion', () => {
+  assert.deepEqual(
+    anthropic.classify429({ 'anthropic-ratelimit-unified-5h-status': 'rejected' }),
+    { quotaExhausted: true, modelScoped: false });
+  assert.deepEqual(
+    anthropic.classify429({ 'anthropic-ratelimit-unified-7d_oi-status': 'rejected' }),
+    { quotaExhausted: true, modelScoped: true });
+  assert.deepEqual(
+    anthropic.classify429({ 'anthropic-ratelimit-unified-5h-status': 'allowed' }),
+    { quotaExhausted: false, modelScoped: false });
+});
+
+test('parseUsageEvent / parseUsageBody extract token deltas', () => {
+  assert.deepEqual(anthropic.parseUsageEvent({ type: 'message_start', message: { usage: { input_tokens: 10 } } }), { input: 10, output: 0 });
+  assert.deepEqual(anthropic.parseUsageEvent({ type: 'message_delta', usage: { output_tokens: 5 } }), { input: 0, output: 5 });
+  assert.equal(anthropic.parseUsageEvent({ type: 'ping' }), null);
+  assert.deepEqual(anthropic.parseUsageBody({ usage: { input_tokens: 3, output_tokens: 7 } }), { input: 3, output: 7 });
+  assert.equal(anthropic.parseUsageBody({ ok: true }), null);
+});

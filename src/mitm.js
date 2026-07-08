@@ -22,6 +22,7 @@ import { getConfigPath } from './config.js';
 import { generateCertChain } from './x509.js';
 import { createProxyRequestListener, safeKeyEqual, isLoopbackAddr } from './server.js';
 import { anthropic } from './providers/anthropic.js';
+import { providerForHost } from './providers/index.js';
 
 const CA_CERT = 'teamclaude-ca.pem';
 const LEAF_CERT = 'teamclaude-leaf.pem';
@@ -102,7 +103,10 @@ function upstreamHostOf(config) {
 /** Per-CONNECT behavior: 'rewrite' (intercept + token inject), 'test', or 'tunnel'. */
 export function hostMode(host, config) {
   if (host === TEST_HOST) return 'test';
-  if (host === upstreamHostOf(config)) return 'rewrite';
+  // Rewrite the configured upstream host (covers custom/self-hosted upstreams)
+  // as well as any known provider host — the latter is what lets a second
+  // provider's traffic (e.g. chatgpt.com) be intercepted once it's registered.
+  if (host === upstreamHostOf(config) || providerForHost(host)) return 'rewrite';
   return 'tunnel';
 }
 
