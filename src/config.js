@@ -2,6 +2,7 @@ import { readFile, writeFile, mkdir, chmod } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
+import { anthropic } from './providers/anthropic.js';
 
 export function getConfigPath() {
   if (process.env.TEAMCLAUDE_CONFIG) return process.env.TEAMCLAUDE_CONFIG;
@@ -44,7 +45,7 @@ export function createDefaultConfig() {
       port: 3456,
       apiKey: 'tc-' + randomBytes(24).toString('base64url'),
     },
-    upstream: 'https://api.anthropic.com',
+    upstream: anthropic.upstreamBase,
     switchThreshold: 0.98,
     accounts: [],
   };

@@ -9,6 +9,7 @@ import { parseRequestModel } from './account-manager.js';
 import { TopLevelFieldFinder } from './model.js';
 import { BodyWriter } from './request-log.js';
 import { upstreamFetch } from './upstream-fetch.js';
+import { anthropic } from './providers/anthropic.js';
 
 
 export const HOP_BY_HOP_HEADERS = new Set([
@@ -48,7 +49,7 @@ export function isLoopbackAddr(addr) {
 }
 
 export function createProxyServer(accountManager, config, hooks = {}, sx = null) {
-  const upstream = config.upstream || 'https://api.anthropic.com';
+  const upstream = config.upstream || anthropic.upstreamBase;
   const proxyApiKey = config.proxy?.apiKey;
   const logDir = config.logDir || null;
 
@@ -113,7 +114,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
   // to the upstream host is a transparent MITM relay (rewrite only auth); the
   // test host is answered locally; anything else is blind-tunneled. Certs are
   // minted lazily on the first intercepted CONNECT.
-  const mitmHost = (() => { try { return new URL(upstream).hostname; } catch { return 'api.anthropic.com'; } })();
+  const mitmHost = (() => { try { return new URL(upstream).hostname; } catch { return anthropic.hosts[0]; } })();
   let certsPromise = null;
   const ensureLeaf = async () => {
     // Reset the memo on failure so a transient cert error doesn't wedge the MITM

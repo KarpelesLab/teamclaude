@@ -16,6 +16,7 @@ import { TUI } from './tui.js';
 import { SxManager } from './sx.js';
 import { autoUpdate, checkForUpdate, currentVersion, runUpdate, installKind, PKG_NAME } from './updater.js';
 import { renderStatus } from './status-renderer.js';
+import { anthropic } from './providers/anthropic.js';
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -298,7 +299,7 @@ async function serverCommand() {
       startedAt: new Date(serverStartedAt).toISOString(),
       uptimeSeconds: Math.round((Date.now() - serverStartedAt) / 1000),
       port,
-      upstream: config.upstream || 'https://api.anthropic.com',
+      upstream: config.upstream || anthropic.upstreamBase,
     },
     probe: prober?.getStatus() || {
       enabled: false,
@@ -352,7 +353,7 @@ async function serverCommand() {
       console.log(`  Bind:       ${bindHost}:${port}${bindHost === '127.0.0.1' ? ' (localhost only)' : ' (reachable off-box — ensure proxy.apiKey is set)'}`);
       console.log(`  Accounts:   ${accounts.length}`);
       console.log(`  Threshold:  ${(threshold * 100).toFixed(0)}%`);
-      console.log(`  Upstream:   ${config.upstream || 'https://api.anthropic.com'}`);
+      console.log(`  Upstream:   ${config.upstream || anthropic.upstreamBase}`);
       console.log('');
       accounts.forEach((a, i) => {
         console.log(`  [${i + 1}] ${a.name} (${a.type})`);
@@ -779,7 +780,7 @@ async function apiCommand() {
 
   const credential = account.accessToken || account.apiKey;
   const isOAuth = account.type === 'oauth';
-  const upstream = config.upstream || 'https://api.anthropic.com';
+  const upstream = config.upstream || anthropic.upstreamBase;
   const url = path.startsWith('http') ? path : `${upstream}${path}`;
 
   const headers = isOAuth
@@ -1382,8 +1383,8 @@ function argValue(flag) {
 
 // Hostname of the configured upstream (the host MITM-intercepts under `run`).
 function upstreamHost(config) {
-  try { return new URL(config.upstream || 'https://api.anthropic.com').hostname; }
-  catch { return 'api.anthropic.com'; }
+  try { return new URL(config.upstream || anthropic.upstreamBase).hostname; }
+  catch { return anthropic.hosts[0]; }
 }
 
 // Best-effort: tell a running server (if any) to re-sync accounts from config so

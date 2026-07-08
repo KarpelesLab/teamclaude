@@ -4,6 +4,7 @@ import { randomBytes, createHash } from 'node:crypto';
 import { exec } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import http from 'node:http';
+import { anthropic } from './providers/anthropic.js';
 
 /**
  * Import OAuth credentials from a Claude Code credentials file.
@@ -23,11 +24,19 @@ export async function importCredentials(filePath) {
   };
 }
 
-const PROFILE_URL = 'https://api.anthropic.com/api/oauth/profile';
-const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
+// Anthropic-specific endpoints + OAuth config live in the provider definition
+// (single source of truth). Aliased to the existing local names to keep the diff
+// minimal and the call sites unchanged.
+const {
+  profileUrl: PROFILE_URL,
+  usageUrl: USAGE_URL,
+  tokenUrl: DEFAULT_TOKEN_ENDPOINT,
+  clientId: DEFAULT_CLIENT_ID,
+  authorizeUrl: OAUTH_AUTHORIZE,
+  scopes: OAUTH_SCOPES,
+  successRedirect: OAUTH_SUCCESS_REDIRECT,
+} = anthropic.oauth;
 const OAUTH_USAGE_BETA = 'oauth-2025-04-20';
-const DEFAULT_TOKEN_ENDPOINT = 'https://platform.claude.com/v1/oauth/token';
-const DEFAULT_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 
 /**
  * Refresh an expired OAuth access token using the refresh token.
@@ -248,11 +257,6 @@ export async function fetchUsage(accessToken) {
   }
 }
 
-// OAuth config (extracted from Claude Code). Client id + token endpoint are
-// shared with the refresh path — see DEFAULT_CLIENT_ID / DEFAULT_TOKEN_ENDPOINT.
-const OAUTH_AUTHORIZE = 'https://claude.ai/oauth/authorize';
-const OAUTH_SCOPES = 'org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload';
-
 /**
  * Perform OAuth login via browser with PKCE flow.
  * Opens the user's browser, waits for the callback, exchanges the code for tokens.
@@ -395,7 +399,7 @@ function startCallbackServer(expectedState) {
         }
 
         if (code) {
-          res.writeHead(302, { 'Location': 'https://platform.claude.com/oauth/code/success?app=claude-code' });
+          res.writeHead(302, { 'Location': OAUTH_SUCCESS_REDIRECT });
           res.end();
           resolveCode(code);
           return;
