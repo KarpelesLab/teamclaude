@@ -4,7 +4,7 @@ import { spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import net from 'node:net';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, loadState, saveState } from './config.js';
-import { AccountManager } from './account-manager.js';
+import { AccountRouter } from './account-router.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import { sameIdentity, orgKey, matchAccounts } from './identity.js';
@@ -16,6 +16,7 @@ import { TUI } from './tui.js';
 import { SxManager } from './sx.js';
 import { autoUpdate, checkForUpdate, currentVersion, runUpdate, installKind, PKG_NAME } from './updater.js';
 import { renderStatus } from './status-renderer.js';
+import { anthropic } from './providers/anthropic.js';
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -135,7 +136,10 @@ async function serverCommand() {
   }
 
   const threshold = config.switchThreshold || 0.98;
-  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp });
+  // One pool per provider (default: a single Anthropic pool). The router is a
+  // drop-in for AccountManager here — it exposes the same lifecycle surface and
+  // resolves the per-request pool by host inside the server.
+  const accountManager = new AccountRouter(accounts, threshold, { routes: config.routes, ramp: config.stormRamp });
 
   // Restore quota observed in a previous run so a restart doesn't lose rotation
   // state (passive — we never call the API to re-learn it). Stale windows are
@@ -298,7 +302,7 @@ async function serverCommand() {
       startedAt: new Date(serverStartedAt).toISOString(),
       uptimeSeconds: Math.round((Date.now() - serverStartedAt) / 1000),
       port,
-      upstream: config.upstream || 'https://api.anthropic.com',
+      upstream: config.upstream || anthropic.upstreamBase,
     },
     probe: prober?.getStatus() || {
       enabled: false,
@@ -352,7 +356,7 @@ async function serverCommand() {
       console.log(`  Bind:       ${bindHost}:${port}${bindHost === '127.0.0.1' ? ' (localhost only)' : ' (reachable off-box — ensure proxy.apiKey is set)'}`);
       console.log(`  Accounts:   ${accounts.length}`);
       console.log(`  Threshold:  ${(threshold * 100).toFixed(0)}%`);
-      console.log(`  Upstream:   ${config.upstream || 'https://api.anthropic.com'}`);
+      console.log(`  Upstream:   ${config.upstream || anthropic.upstreamBase}`);
       console.log('');
       accounts.forEach((a, i) => {
         console.log(`  [${i + 1}] ${a.name} (${a.type})`);
@@ -779,7 +783,7 @@ async function apiCommand() {
 
   const credential = account.accessToken || account.apiKey;
   const isOAuth = account.type === 'oauth';
-  const upstream = config.upstream || 'https://api.anthropic.com';
+  const upstream = config.upstream || anthropic.upstreamBase;
   const url = path.startsWith('http') ? path : `${upstream}${path}`;
 
   const headers = isOAuth
@@ -1382,8 +1386,8 @@ function argValue(flag) {
 
 // Hostname of the configured upstream (the host MITM-intercepts under `run`).
 function upstreamHost(config) {
-  try { return new URL(config.upstream || 'https://api.anthropic.com').hostname; }
-  catch { return 'api.anthropic.com'; }
+  try { return new URL(config.upstream || anthropic.upstreamBase).hostname; }
+  catch { return anthropic.hosts[0]; }
 }
 
 // Best-effort: tell a running server (if any) to re-sync accounts from config so
