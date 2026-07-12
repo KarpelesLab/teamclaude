@@ -5,7 +5,7 @@ import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { ensureCerts, createConnectHandler } from './mitm.js';
 import { patchAccountUuid } from './account-uuid-rewrite.js';
-import { parseRequestModel } from './account-manager.js';
+import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
 import { TopLevelFieldFinder } from './model.js';
 import { BodyWriter } from './request-log.js';
 import { upstreamFetch } from './upstream-fetch.js';
@@ -203,7 +203,11 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       const body = Buffer.concat(bodyChunks);
 
       const model = modelFinder.done ? modelFinder.value : parseRequestModel(body);
-      const ctx = { account: null, status: null, tried: new Set(), model, pinnedIndex };
+      // An advisor request (Claude Code's advisor tool) carries a SECOND model
+      // nested in tools[]; the advisor sub-inference runs on the selected
+      // account, so selection must be eligible for it too (issue #98).
+      const advisorModel = parseAdvisorModel(body);
+      const ctx = { account: null, status: null, tried: new Set(), model, advisorModel, pinnedIndex };
       try {
         await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir, sx);
       } catch (err) {
@@ -356,7 +360,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // and the caller gets the exhausted response rather than leaking to another.
   const account = ctx.pinnedIndex != null
     ? (ctx.tried.has(ctx.pinnedIndex) ? null : accountManager.accounts[ctx.pinnedIndex])
-    : accountManager.getActiveAccount(ctx.tried, ctx.model);
+    : accountManager.getActiveAccount(ctx.tried, ctx.model, ctx.advisorModel);
   if (!account) {
     // A pinned request concerns exactly one account: don't compute a fleet-wide
     // retry-after or sleep on other accounts' windows — return immediately.

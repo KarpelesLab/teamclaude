@@ -133,3 +133,110 @@ export function parseRequestModel(body) {
     return new TopLevelFieldFinder('model').push(buf);
   } catch { return null; }
 }
+
+// Byte-exact locator for the SECOND model an advisor request carries: Claude
+// Code's advisor tool (`anthropic-beta: advisor-tool-…`) keeps the executor in
+// the top-level `model` field and nests the advisor's model inside the tools
+// array — `tools: [{ type: "advisor_20260301", name: "advisor", model: "…" }]`.
+// The advisor sub-inference runs on the same account and spends that model's
+// quota bucket, so account selection must see it (issue #98).
+//
+// Same byte-machine discipline as TopLevelFieldFinder: it walks the container
+// stack and only reads `type`/`model` strings that are DIRECT fields of an
+// object element of the ROOT object's `tools` array — a "model" inside a tool's
+// input_schema or inside conversation text is deeper (or under another root
+// key) and never matches. Elements are judged when they close, so field order
+// within the tool object doesn't matter.
+export class AdvisorModelFinder {
+  constructor() {
+    this.stack = [];                  // frames: {isObj, key, awaitingKey}
+    this.inStr = false;
+    this.esc = false;
+    this.reading = null;              // 'key' | 'type' | 'model' while in a string
+    this.buf = [];
+    this.toolType = null;             // fields of the tools[] element being read
+    this.toolModel = null;
+    this.value = null;                // the advisor model, once found
+    this.done = false;
+  }
+
+  /** Feed a chunk (Buffer). Returns the found value so far (string) or null. */
+  push(chunk) {
+    if (this.done) return this.value;
+    for (let i = 0; i < chunk.length && !this.done; i++) this.#byte(chunk[i]);
+    return this.value;
+  }
+
+  // The stack is exactly [root object (last key "tools"), array, element object].
+  #inToolElement() {
+    const s = this.stack;
+    return s.length === 3 && s[0].isObj && s[0].key === 'tools' && !s[1].isObj && s[2].isObj;
+  }
+
+  #byte(b) {
+    if (this.inStr) {
+      if (this.esc) { this.esc = false; if (this.reading) this.buf.push(b); return; }
+      if (b === 0x5c) { this.esc = true; if (this.reading) this.buf.push(b); return; } // backslash
+      if (b === 0x22) {                                            // closing quote
+        this.inStr = false;
+        if (this.reading) {
+          const text = Buffer.from(this.buf).toString('utf8');
+          if (this.reading === 'key') this.stack[this.stack.length - 1].key = text;
+          else if (this.reading === 'type') this.toolType = text;
+          else this.toolModel = text;
+          this.reading = null;
+          this.buf = [];
+        }
+        return;
+      }
+      if (this.reading) this.buf.push(b);
+      return;
+    }
+
+    switch (b) {
+      case 0x7b:                                                   // {
+        this.stack.push({ isObj: true, key: null, awaitingKey: true });
+        if (this.#inToolElement()) { this.toolType = null; this.toolModel = null; }
+        break;
+      case 0x5b: this.stack.push({ isObj: false, key: null, awaitingKey: false }); break; // [
+      case 0x7d:                                                   // }
+        if (this.#inToolElement()
+            && typeof this.toolType === 'string' && /^advisor/i.test(this.toolType)
+            && this.toolModel) {
+          this.value = this.toolModel;
+          this.done = true;
+        }
+        // fall through: pop like ]
+      case 0x5d:                                                   // ]
+        this.stack.pop();
+        if (this.stack.length === 0) this.done = true;             // root closed → absent
+        break;
+      case 0x3a: { const t = this.stack[this.stack.length - 1]; if (t?.isObj) t.awaitingKey = false; break; } // :
+      case 0x2c: { const t = this.stack[this.stack.length - 1]; if (t?.isObj) t.awaitingKey = true; break; }  // ,
+      case 0x22: {                                                 // string begins
+        const t = this.stack[this.stack.length - 1];
+        if (t?.isObj && t.awaitingKey) this.reading = 'key';
+        else if (this.#inToolElement() && (t.key === 'type' || t.key === 'model')) this.reading = t.key;
+        else this.reading = null;                                  // uninteresting string: skip bytes
+        this.buf = [];
+        this.inStr = true;
+        this.esc = false;
+        break;
+      }
+      default: break;                                              // scalars / whitespace
+    }
+  }
+}
+
+// Extract the advisor model from a JSON request body, or null when the request
+// carries no advisor tool. Gated on a cheap byte search for "advisor" so the
+// full structural scan only runs on bodies that could possibly contain one —
+// for everything else this is a single Buffer.includes.
+export function parseAdvisorModel(body) {
+  if (!body) return null;
+  try {
+    const buf = Buffer.isBuffer(body) ? body : Buffer.from(String(body), 'utf8');
+    if (!buf.includes('advisor')) return null;
+    return new AdvisorModelFinder().push(buf);
+  } catch { return null; }
+}

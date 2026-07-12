@@ -3,7 +3,7 @@ import { sameIdentity } from './identity.js';
 import { weeklyBucketForModel, modelGlobMatches } from './model.js';
 
 // Re-exported for callers that import these model helpers from here.
-export { isFableModel, parseRequestModel } from './model.js';
+export { isFableModel, parseRequestModel, parseAdvisorModel } from './model.js';
 
 // Quota fields that survive a restart: utilization levels and their reset
 // windows, learned passively from upstream responses. Transient/derived state
@@ -205,17 +205,41 @@ export class AccountManager {
   /**
    * Get the best available account, rotating if the current one is near quota.
    * Returns null if all accounts are exhausted.
+   *
+   * `advisorModel` is the second model an advisor request carries (Claude Code's
+   * advisor tool, nested in tools[] — see parseAdvisorModel): the advisor
+   * sub-inference runs on the SAME account and spends that model's family
+   * bucket, so the account must be eligible for both models. When no account
+   * satisfies both, selection degrades to executor-only routing so the main
+   * request keeps flowing (upstream then fails just the advisor call).
    */
-  getActiveAccount(exclude = null, model = null) {
+  getActiveAccount(exclude = null, model = null, advisorModel = null) {
     // Clear expired quotas across all accounts and switch proactively if a
     // session reset made a sooner-expiring account the better choice. This runs
     // on every request so the behaviour holds without the TUI render loop.
     this.refreshExpiredQuotas();
+    if (advisorModel) {
+      const account = this._select(exclude, model, advisorModel, false);
+      if (account) return account;
+      // Throttled so a busy advisor session doesn't flood the activity log.
+      if (Date.now() >= (this._advisorDegradeLogAt || 0)) {
+        this._advisorDegradeLogAt = Date.now() + 60_000;
+        console.log(`[TeamClaude] No account eligible for advisor model "${advisorModel}" — routing by request model only`);
+      }
+    }
+    return this._select(exclude, model, null, true);
+  }
+
+  /** The selection walk getActiveAccount runs: manual pin → current account →
+   * best-available. `allowProbe` gates the exhausted-fleet probe fallback so the
+   * advisor-constrained pass can fail soft (degrade to executor-only) instead of
+   * burning the throttled probe slot on the stricter constraint. */
+  _select(exclude, model, advisorModel, allowProbe) {
     // A manual per-route pin biases selection for that route's models (independent
     // of the global currentIndex). Honored only while eligible — otherwise we fall
     // through to normal best-available selection so requests keep flowing.
-    const pinned = this._pinnedAccountForModel(model);
-    if (pinned && this._isAvailable(pinned, model) && !exclude?.has(pinned.index)) return pinned;
+    const pinned = this._pinnedAccountForModel(model, advisorModel);
+    if (pinned && this._isAvailable(pinned, model, advisorModel) && !exclude?.has(pinned.index)) return pinned;
     const current = this.accounts[this.currentIndex];
     // `model` scopes availability: an account whose Fable weekly bucket is spent
     // is still fully usable for other models, so it is only excluded when THIS
@@ -226,27 +250,30 @@ export class AccountManager {
     // We just learned a probed account's weekly quota — re-evaluate which
     // account is best now that its limit is known.
     if (current && current.requalify) {
-      current.requalify = false;
-      const next = this._selectNext(exclude, model);
-      if (next) return next;
+      // Consume the flag on the final pass; the advisor-constrained pass leaves
+      // it set unless it actually switches, so the requalification isn't lost
+      // when that pass comes up empty and selection degrades.
+      if (allowProbe) current.requalify = false;
+      const next = this._selectNext(exclude, model, advisorModel);
+      if (next) { current.requalify = false; return next; }
     }
-    if (this._isAvailable(current, model) && !exclude?.has(current.index)) {
+    if (this._isAvailable(current, model, advisorModel) && !exclude?.has(current.index)) {
       // A strictly higher-priority (lower value) available account preempts a
       // healthy current one. Within the same priority tier we stay put, so the
       // common case (all accounts at the default priority 0) is unchanged and
       // never thrashes — preemption only triggers when priorities differ.
       const betterExists = this.accounts.some(a =>
-        this._isAvailable(a, model) && !exclude?.has(a.index) && (a.priority || 0) < (current.priority || 0));
-      return betterExists ? this._selectNext(exclude, model) : current;
+        this._isAvailable(a, model, advisorModel) && !exclude?.has(a.index) && (a.priority || 0) < (current.priority || 0));
+      return betterExists ? this._selectNext(exclude, model, advisorModel) : current;
     }
-    const next = this._selectNext(exclude, model);
+    const next = this._selectNext(exclude, model, advisorModel);
     if (next) return next;
     // No account is under the switch threshold. Before refusing locally, allow a
     // throttled probe so a stale/poisoned cached quota can't pin us in a
     // permanent "all exhausted" state — the probe's real response refreshes the
     // quota (or upstream's own 429 converts soft exhaustion into a hard
     // rate-limit hold). null here means the caller emits the synthetic 429.
-    return this._selectProbe(exclude, model);
+    return allowProbe ? this._selectProbe(exclude, model) : null;
   }
 
   /**
@@ -256,8 +283,8 @@ export class AccountManager {
    * 401. A token that is merely expiring soon (still valid) is left to the
    * caller's opportunistic background refresh; only a hard-expired one blocks.
    */
-  async getActiveAccountFresh(exclude = null, model = null) {
-    const account = this.getActiveAccount(exclude, model);
+  async getActiveAccountFresh(exclude = null, model = null, advisorModel = null) {
+    const account = this.getActiveAccount(exclude, model, advisorModel);
     if (account && account.type === 'oauth' && account.refreshToken
         && isTokenExpired(account.expiresAt)) {
       await this.ensureTokenFresh(account.index); // coalesces with any in-flight refresh
@@ -406,7 +433,7 @@ export class AccountManager {
     return best;
   }
 
-  _isAvailable(account, model = null) {
+  _isAvailable(account, model = null, advisorModel = null) {
     if (!account) return false;
 
     // Manually disabled accounts are skipped entirely until re-enabled.
@@ -432,6 +459,15 @@ export class AccountManager {
     // restricts an owned model to its owners. Either way an account not eligible
     // for this model is skipped so the request never lands somewhere it can't run.
     if (model && !this._routeAllows(account, model)) return false;
+
+    // An advisor request additionally needs the account to serve the ADVISOR's
+    // model: its family bucket must have headroom (the shared buckets were
+    // already checked above for the executor) and any route/ownership rule for
+    // it must allow this account.
+    if (advisorModel) {
+      if (this._modelWeeklyExhausted(account, advisorModel)) return false;
+      if (!this._routeAllows(account, advisorModel)) return false;
+    }
 
     return true;
   }
@@ -581,8 +617,15 @@ export class AccountManager {
 
   /** The manually-pinned account governing `model`, if any: a configured route's
    * pin wins, else an auto fable/sonnet family pin (only when no configured route
-   * covers the model). Returns null when nothing is pinned for this model. */
-  _pinnedAccountForModel(model) {
+   * covers the model). For an advisor request the executor's pin wins (it is the
+   * bulk of the spend); the advisor model's pin applies only when nothing pins
+   * the executor. Returns null when nothing is pinned for this model. */
+  _pinnedAccountForModel(model, advisorModel = null) {
+    return this._pinnedFor(model)
+      || (advisorModel ? this._pinnedFor(advisorModel) : null);
+  }
+
+  _pinnedFor(model) {
     if (!model || !this.routePins.size) return null;
     const route = this._routeForModel(model);
     if (route) {
@@ -744,7 +787,7 @@ export class AccountManager {
    * With all priorities at the default 0, this reduces to the weekly-reset
    * heuristic. Returns the account or null if none are available.
    */
-  _pickBestAvailable(exclude = null, model = null) {
+  _pickBestAvailable(exclude = null, model = null, advisorModel = null) {
     let best = null;
     let bestPriority = Infinity;
     let bestReset = Infinity;
@@ -755,7 +798,7 @@ export class AccountManager {
       // _isAvailable filters out accounts at/above the switch threshold, so the
       // soonest-expiring pick only ever lands on an account whose 5-hour quota
       // is still below 98%.
-      if (!this._isAvailable(account, model)) continue;
+      if (!this._isAvailable(account, model, advisorModel)) continue;
 
       const priority = account.priority || 0;
       // Rank by the reset of the weekly bucket that governs THIS model (Fable and
@@ -794,8 +837,8 @@ export class AccountManager {
     return best;
   }
 
-  _selectNext(exclude = null, model = null) {
-    const best = this._pickBestAvailable(exclude, model);
+  _selectNext(exclude = null, model = null, advisorModel = null) {
+    const best = this._pickBestAvailable(exclude, model, advisorModel);
     if (best) {
       const switched = best.index !== this.currentIndex;
       this.currentIndex = best.index;
@@ -820,8 +863,10 @@ export class AccountManager {
       // here would send a live request on an account that must not be used and,
       // below, silently clear its throttle/error state. (Mirrors _isAvailable.)
       if (account.disabled || account.status === 'error') continue;
-      // A routed/owned model must not fall back to an ineligible account.
+      // A routed/owned model must not fall back to an ineligible account —
+      // neither the executor's nor an advisor's.
       if (model && !this._routeAllows(account, model)) continue;
+      if (advisorModel && !this._routeAllows(account, advisorModel)) continue;
       const resetTime = account.rateLimitedUntil
         || account.quota.unified5hReset
         || account.quota.unified7dReset
