@@ -154,7 +154,7 @@ function timestamp() {
 // ── TUI class ────────────────────────────────────────────────
 
 export class TUI {
-  constructor({ accountManager, config, saveConfig, syncAccounts, onQuit, sx = null }) {
+  constructor({ accountManager, config, saveConfig, syncAccounts, onQuit, sx = null, probeQuota = null }) {
     this.am = accountManager;
     this.config = config;
     this.saveConfig = saveConfig;
@@ -162,6 +162,7 @@ export class TUI {
     this.onQuit = onQuit;
     this.sx = sx;            // sx.org proxy manager (may be null)
     this.sxBalance = null;   // last fetched sx.org balance, for the settings screen
+    this.probeQuota = probeQuota; // on-demand fleet-wide quota refresh (may be null)
 
     this.log = [];           // completed activity entries
     this.active = new Map(); // in-flight requests
@@ -169,6 +170,7 @@ export class TUI {
     this.selAction = null;   // switch | remove | toggle
     this.selIdx = 0;
     this.selRoute = null;    // in switch mode: null = global default, else a getRoutes() entry to pin
+    this.selReturn = 'normal'; // mode to fall back to when select mode closes
     this.setIdx = 0;         // cursor row on the settings screen (BIOS-style nav)
     this.inputPrompt = '';
     this.inputBuf = '';
@@ -283,15 +285,12 @@ export class TUI {
   _keyNormal(k) {
     if (k === 'q') { this.stop(); this.onQuit?.(); }
     else if (k === 's' && this.am.accounts.length > 0) {
-      this.mode = 'select'; this.selAction = 'switch'; this.selIdx = this.am.currentIndex; this.selRoute = null;
-    }
-    else if (k === 'r' && this.am.accounts.length > 0) {
-      this.mode = 'select'; this.selAction = 'remove'; this.selIdx = 0;
+      this.mode = 'select'; this.selAction = 'switch'; this.selIdx = this.am.currentIndex; this.selRoute = null; this.selReturn = 'normal';
     }
     else if (k === 'd' && this.am.accounts.length > 0) {
-      this.mode = 'select'; this.selAction = 'toggle'; this.selIdx = this.am.currentIndex;
+      this.mode = 'select'; this.selAction = 'toggle'; this.selIdx = this.am.currentIndex; this.selReturn = 'normal';
     }
-    else if (k === 'a') { this.mode = 'add'; }
+    else if (k === 'p' && this.am.accounts.length > 0) { this._doProbe(); }
     else if (k === 'R') { this._doSync(); }
     else if (k === 'g') { this.mode = 'settings'; this.setIdx = 0; this._loadSxBalance(); }
   }
@@ -339,6 +338,27 @@ export class TUI {
       },
       enter: () => { this.mode = 'routes'; this.routeIdx = 0; },
     });
+
+    fields.push({
+      id: 'addAccount',
+      label: 'Add account',
+      hint: 'Enter to open',
+      value: () => {
+        const n = this.am.accounts.length;
+        return n ? green(`${n} account${n === 1 ? '' : 's'}`) : gray('none');
+      },
+      enter: () => { this.mode = 'add'; },
+    });
+
+    if (this.am.accounts.length > 0) {
+      fields.push({
+        id: 'removeAccount',
+        label: 'Remove account',
+        hint: 'Enter to pick',
+        value: () => dim('—'),
+        enter: () => { this.mode = 'select'; this.selAction = 'remove'; this.selIdx = 0; this.selReturn = 'settings'; },
+      });
+    }
 
     if (this.sx) {
       fields.push({
@@ -468,9 +488,9 @@ export class TUI {
       } else {
         this._doRemove(this.selIdx);
       }
-      if (this.mode === 'select') this.mode = 'normal';
+      if (this.mode === 'select') this.mode = this.selReturn;
     }
-    else if (k === 'esc' || k === 'q') { this.mode = 'normal'; }
+    else if (k === 'esc' || k === 'q') { this.mode = this.selReturn; }
   }
 
   // Apply an Enter in switch mode: with no route selected this sets the global
@@ -501,16 +521,18 @@ export class TUI {
     }
   }
 
+  // The add chooser is opened from the settings screen (g → Add account), so
+  // every exit path returns there.
   _keyAdd(k) {
-    if (k === 'i') { this._doImport(); this.mode = 'normal'; }
+    if (k === 'i') { this._doImport(); this.mode = 'settings'; }
     else if (k === 'k') {
       this.mode = 'input';
-      this.inputReturn = 'normal';
+      this.inputReturn = 'settings';
       this.inputPrompt = 'API key';
       this.inputBuf = '';
       this.inputCb = v => { if (v) this._doAddKey(v); };
     }
-    else if (k === 'esc' || k === 'q') { this.mode = 'normal'; }
+    else if (k === 'esc' || k === 'q') { this.mode = 'settings'; }
   }
 
   _keyInput(k) {
@@ -526,6 +548,26 @@ export class TUI {
   }
 
   // ── account operations ─────────────────────────────
+
+  // On-demand fleet-wide quota refresh (the `p` key): probe every OAuth
+  // account's zero-spend usage endpoint once, whether or not the periodic
+  // probe is enabled. Fire-and-forget; progress lands in the activity log.
+  async _doProbe() {
+    if (!this.probeQuota) { this._addLog('Quota probe unavailable'); return; }
+    if (this._probing) return; // one refresh at a time
+    const n = this.am.accounts.filter(a => a.type === 'oauth' && a.credential).length;
+    if (n === 0) { this._addLog('No OAuth accounts to probe'); return; }
+    this._probing = true;
+    this._addLog(`Refreshing quota on ${n} account${n === 1 ? '' : 's'}...`);
+    try {
+      await this.probeQuota();
+      this._addLog('Quota refresh complete');
+    } catch (e) {
+      this._addLog(`Quota refresh failed: ${e.message}`);
+    } finally {
+      this._probing = false;
+    }
+  }
 
   async _doSync() {
     try {
@@ -738,7 +780,12 @@ export class TUI {
     // While a prompt is open (mode 'input') keep showing the screen it was
     // launched from, so e.g. adding a route stays on the routes screen rather
     // than flashing back to the main dashboard with just the footer prompt.
-    const view = this.mode === 'input' ? this.inputReturn : this.mode;
+    // The add-account chooser is a settings flow, so it keeps the settings
+    // screen behind its footer too (select-to-remove, by contrast, needs the
+    // dashboard: the account table IS the selection UI).
+    const view = this.mode === 'input' ? this.inputReturn
+      : this.mode === 'add' ? 'settings'
+      : this.mode;
     if (view === 'settings') {
       this._renderSettings(lines);
     } else if (view === 'routes') {
@@ -747,7 +794,7 @@ export class TUI {
     // ── Accounts
     if (this.am.accounts.length === 0) {
       lines.push('');
-      lines.push(yellow('  No accounts configured. Press [a] to add one.'));
+      lines.push(yellow('  No accounts configured. Press [g] → Add account.'));
     } else {
       lines.push('');
       const showBoth = W >= 70;
@@ -952,6 +999,11 @@ export class TUI {
     lines.push(bold('  Routing') + dim('  — pin model families to specific accounts'));
     lines.push(row(byId('routes')));
     lines.push('');
+    // ── Accounts
+    lines.push(bold('  Accounts') + dim('  — add (import / API key) or remove an account'));
+    lines.push(row(byId('addAccount')));
+    if (byId('removeAccount')) lines.push(row(byId('removeAccount')));
+    lines.push('');
     // ── sx.org
     lines.push(bold('  sx.org proxy') + dim('  — route upstream via a residential IP (429 workaround)'));
     lines.push('');
@@ -1100,7 +1152,7 @@ export class TUI {
   _renderFooter() {
     switch (this.mode) {
       case 'normal':
-        return ` ${bold('s')}witch  ${bold('a')}dd  ${bold('r')}emove  ${bold('d')}isable  ${bold('R')}eload  ${bold('g')} settings  ${bold('q')}uit`;
+        return ` ${bold('s')}witch  ${bold('d')}isable  ${bold('p')}robe quota  ${bold('R')}eload  ${bold('g')} settings  ${bold('q')}uit`;
       case 'settings':
         return ` ${dim('↑↓')} navigate  ${dim('←→')} change  ${bold('Enter')} edit  ${bold('Esc')} back`;
       case 'routes':

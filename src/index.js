@@ -278,6 +278,9 @@ async function serverCommand() {
         if (config.routes != null) diskConfig.routes = config.routes;
       }),
       syncAccounts: reloadAccounts,
+      // `p` key: on-demand fleet-wide quota refresh. The prober is constructed
+      // after the TUI, so this is a thunk over the closure variable.
+      probeQuota: () => prober?.probeAll(),
       // ctrl-c / q from the TUI: funnel through the same idempotent shutdown as
       // POSIX signals (defined below). In raw mode ctrl-c never reaches the OS as
       // a signal, so without this the process would only tear down via keypress.

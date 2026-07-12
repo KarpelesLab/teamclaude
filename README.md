@@ -17,7 +17,7 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 - **Model-aware routing** — the per-model weekly cap (e.g. Fable) is tracked separately, so an account whose Fable quota is spent is skipped **only** for Fable requests and still serves Opus/Sonnet. Requests are routed by their `model` (read exactly from the request body, in both base-URL and MITM modes). Optional **[model routes](#model-routes)** pin model patterns to a specific set of accounts (config, `teamclaude route`, or the TUI settings screen → Manage routing)
 - **Auto-retry on 429** — distinguishes the two kinds of 429: a **quota rejection** (a spent 5h/weekly bucket, `unified-…-status: rejected`) switches accounts immediately; a **rate-limit 429** (the per-minute throttle) does **not** switch — it [pauses the account](#storm-control-switchover-ramp-up) so concurrent requests wait instead of flooding, retries the same account (absorbing short `retry-after`s inline), and only surfaces a 429 to the client for longer waits. Rotating on a rate-limit 429 would just move the burst to the next account and throw away the first account's cache
 - **Storm control** — when many agents fail over to a fresh account at once, requests are [paced onto it](#storm-control-switchover-ramp-up) with a short ramp-up so the herd doesn't instantly throttle it and cascade down the fleet
-- **Interactive TUI** — real-time dashboard with color-coded quota bars, reset countdowns, activity log, and keyboard controls; a settings screen (`g`) edits the rotation threshold, quota-probe interval, and sx.org proxy live
+- **Interactive TUI** — real-time dashboard with color-coded quota bars, reset countdowns, activity log, and keyboard controls; a settings screen (`g`) edits the rotation threshold, quota-probe interval, routing, accounts (add/remove), and sx.org proxy live, and `p` refreshes every account's quota on demand
 - **OAuth token management** — automatically refreshes tokens nearing expiry and persists them to config; client token refreshes pass through untouched
 - **Hot-reload accounts** — add or change accounts while the server is running; press **R** in the TUI, or run headless and CLI changes auto-reload via a local control endpoint
 - **Headless mode** — run the proxy without the TUI (`--headless`) for backgrounding/services
@@ -127,13 +127,13 @@ You usually don't need to call it directly: `teamclaude login`, `import`, `enabl
 | Key | Action |
 |-----|--------|
 | `s` | Switch active account |
-| `a` | Add account (import or API key) |
-| `r` | Remove an account |
 | `d` | Enable/disable an account |
+| `p` | Refresh quota on all accounts (one-shot probe of the zero-spend usage endpoint) |
 | `R` | Reload accounts from config |
+| `g` | Settings (threshold, quota probe, routing, **add/remove accounts**, sx.org) |
 | `q` | Quit |
 
-In selection mode, use `j`/`k` or arrow keys to navigate, `Enter` to confirm, `Esc` to cancel.
+In selection mode, use `j`/`k` or arrow keys to navigate, `Enter` to confirm, `Esc` to cancel. Adding and removing accounts lives on the settings screen: `g` → **Add account** (import from Claude Code or paste an API key) / **Remove account**.
 
 ### Run Claude Code through the proxy
 
