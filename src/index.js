@@ -561,13 +561,15 @@ async function runCommand() {
   const sep = rest.indexOf('--');
   const tcFlags = sep >= 0 ? rest.slice(0, sep) : rest;
   const useMitm = !tcFlags.includes('--no-mitm');
+  const autoFallback = tcFlags.includes('--auto-fallback');
   const claudeArgs = sep >= 0
     ? rest.slice(sep + 1)
-    : rest.filter(a => a !== '--mitm' && a !== '--no-mitm');
+    : rest.filter(a => a !== '--mitm' && a !== '--no-mitm' && a !== '--auto-fallback');
 
-  // Route through the proxy only when it's actually up; otherwise launch claude
-  // directly so a stopped proxy doesn't break `claude`. This is what lets the
-  // shell alias (`claude='teamclaude run --'`) be a dumb passthrough.
+  // Route through the proxy when it's up. When it's down we refuse by default —
+  // silently launching claude directly hides that requests are bypassing the
+  // proxy (no rotation, spending the user's own quota). Pass --auto-fallback to
+  // opt back into the transparent direct launch (e.g. for a dumb shell alias).
   const port = config.proxy.port;
   const env = { ...process.env };
   if (await isProxyUp(port)) {
@@ -588,8 +590,13 @@ async function runCommand() {
       // lets Claude Code stay in subscription mode (full model access).
       env.ANTHROPIC_BASE_URL = `http://localhost:${port}`;
     }
+  } else if (autoFallback) {
+    console.error(`[TeamClaude] Proxy not running on port ${port} — launching claude directly (--auto-fallback; start it with: teamclaude server)`);
   } else {
-    console.error(`[TeamClaude] Proxy not running on port ${port} — launching claude directly (start it with: teamclaude server)`);
+    console.error(`[TeamClaude] Proxy not running on port ${port}.`);
+    console.error('Start it with: teamclaude server');
+    console.error('Or pass --auto-fallback to launch claude directly (bypassing the proxy) when it is down.');
+    process.exit(1);
   }
 
   // Use spawnSync so the Node process blocks entirely — behaves like execvp.
@@ -1137,8 +1144,9 @@ Commands:
   login               OAuth login via browser
   login --api         Add an API key account
   env                 Print env vars to use with Claude
-  run [--no-mitm] [-- args...]
-                      Run Claude Code through the proxy (direct if it's down).
+  run [--no-mitm] [--auto-fallback] [-- args...]
+                      Run Claude Code through the proxy (errors if it's down,
+                      unless --auto-fallback launches claude directly instead).
                       Routes via an HTTPS forward proxy + local CA by default, so
                       even hardcoded api.anthropic.com endpoints are intercepted;
                       --no-mitm uses base-URL routing only
@@ -1172,6 +1180,8 @@ Options:
   --log-to DIR        Log full requests/responses to DIR (server, one file per request)
   --headless          Run the server without the interactive TUI (for backgrounding)
   --no-mitm           (run) skip the forward proxy; route via ANTHROPIC_BASE_URL only
+  --auto-fallback     (run) if the proxy is down, launch claude directly instead
+                      of erroring out (bypasses the proxy: no rotation)
 
 The server always accepts both base-URL and proxy/CONNECT clients, so instances
 launched with and without --no-mitm can share one server.

@@ -141,7 +141,11 @@ In selection mode, use `j`/`k` or arrow keys to navigate, `Enter` to confirm, `E
 teamclaude run
 ```
 
-`run` probes the proxy first: if it's up, Claude Code is routed through it; if it's **not** running, `claude` is launched directly so nothing breaks.
+`run` probes the proxy first: if it's up, Claude Code is routed through it; if it's **not** running, `run` errors out rather than silently bypassing the proxy (which would spend your own quota with no rotation). Pass `--auto-fallback` to launch `claude` directly when the proxy is down instead:
+
+```bash
+teamclaude run --auto-fallback
+```
 
 Since **1.1.0**, `run` defaults to [MITM forward-proxy mode](#mitm-proxy-mode-default) so even hardcoded `api.anthropic.com` endpoints (e.g. the Claude Design MCP) are intercepted. To keep the previous base-URL-only behavior, pass `--no-mitm`:
 
@@ -158,7 +162,7 @@ claude
 
 ### Routing plain `claude` automatically (alias)
 
-So you don't have to type `teamclaude run` every time, add a shell alias that makes plain `claude` go through the proxy (and fall back to direct when it's down):
+So you don't have to type `teamclaude run` every time, add a shell alias that makes plain `claude` go through the proxy (it errors if the proxy is down rather than silently bypassing it — add `--auto-fallback` to launch claude directly instead):
 
 ```bash
 teamclaude alias              # print the alias for your shell

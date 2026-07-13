@@ -1,8 +1,9 @@
 // `claude` shell alias — print or install/uninstall.
 //
-// The alias simply routes plain `claude` through `teamclaude run`, which itself
-// probes the proxy and falls back to launching claude directly when it's down.
-// So the alias stays a dumb passthrough and all the smarts live in `run`.
+// The alias simply routes plain `claude` through `teamclaude run`, which probes
+// the proxy and, when it's down, errors out rather than silently bypassing the
+// proxy. All the smarts live in `run`; add `--auto-fallback` to the alias if you
+// want plain `claude` to launch directly when the proxy is down instead.
 //
 // This only affects interactive shells (aliases aren't seen by editors/scripts
 // that exec `claude` themselves). It's intentionally lighter than a PATH shim:
@@ -65,7 +66,8 @@ export function rcPathForShell(shell = detectShell()) {
 
 export function printAlias({ shell = detectShell() } = {}) {
   const line = aliasLine(shell);
-  console.log('# Route plain `claude` through the proxy (when it is running; direct otherwise).');
+  console.log('# Route plain `claude` through the proxy (errors if the proxy is down;');
+  console.log('# append --auto-fallback before `--` to launch claude directly instead).');
   console.log('# Add this to your shell config:');
   console.log('');
   console.log(`  ${line}`);
