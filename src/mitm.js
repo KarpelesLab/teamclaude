@@ -158,17 +158,39 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
     const mode = hostMode(host, config);
 
     if (mode === 'tunnel') {
+      // Until the upstream connects we still owe the client a CONNECT status
+      // line. If we tore the socket down on an upstream failure without one,
+      // the client reports "Proxy connection ended before receiving CONNECT
+      // response" — so before the tunnel is live, surface failures as a real
+      // proxy error status instead of a silent drop.
+      let established = false, closed = false;
+      // Tear down BOTH sockets when either errors or closes, so a one-sided
+      // failure can't leave the paired socket lingering (FD leak). The `closed`
+      // guard makes it idempotent (error+close both fire) and ensures we write
+      // at most one status line.
+      const teardown = (statusLine) => {
+        if (closed) return;
+        closed = true;
+        if (!established && statusLine) {
+          try { clientSocket.write(`HTTP/1.1 ${statusLine}\r\nConnection: close\r\n\r\n`); } catch { /* client already gone */ }
+        }
+        up.destroy(); clientSocket.destroy();
+      };
       const up = net.connect(port, host, () => {
+        established = true;
         reply200Raw(clientSocket);
         if (head && head.length) up.write(head);
         up.pipe(clientSocket); clientSocket.pipe(up);
       });
-      // Tear down BOTH sockets when either errors or closes, so a one-sided
-      // failure can't leave the paired socket lingering (FD leak).
-      const teardown = () => { up.destroy(); clientSocket.destroy(); };
-      up.on('error', teardown); up.on('close', teardown);
-      clientSocket.on('close', teardown);
-      up.setTimeout(30_000, teardown); // bound a stalled connect/idle tunnel
+      up.on('error', (err) => {
+        if (!established) log(`[TeamClaude] tunnel ${host}:${port} failed: ${err.message}`);
+        teardown('502 Bad Gateway');
+      });
+      // A FIN before the tunnel is live (no preceding 'error') is still a failed
+      // dial from the client's view — surface a 502 rather than a silent drop.
+      up.on('close', () => teardown('502 Bad Gateway'));
+      clientSocket.on('close', () => teardown()); // client gone: nothing to write
+      up.setTimeout(30_000, () => teardown('504 Gateway Timeout')); // bound a stalled connect/idle tunnel
       return;
     }
 
@@ -177,18 +199,21 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
       ensureLeaf().then(({ key, cert }) => {
         reply200Raw(clientSocket);
         serveTest(termClaude(clientSocket, head, key, cert, ['http/1.1']));
-      }).catch((err) => { log(`[TeamClaude] MITM ${host}: ${err.message}`); clientSocket.destroy(); });
+      }).catch((err) => { log(`[TeamClaude] MITM ${host}: ${err.message}`); reply502Raw(clientSocket); clientSocket.destroy(); });
       return;
     }
 
     // rewrite: terminate the tunnel and forward each request with buffering +
     // retry. Reply 200, hand the raw socket (ClientHello and all) to the h2/h1
-    // server, which does TLS + protocol negotiation itself.
+    // server, which does TLS + protocol negotiation itself. If the terminating
+    // server can't be minted (cert/disk/TLS-init failure) we haven't replied yet
+    // — send a 502 so the client sees a real proxy error instead of "Proxy
+    // connection ended before receiving CONNECT response".
     getServer().then((srv) => {
       reply200Raw(clientSocket);
       if (head && head.length) clientSocket.unshift(head);
       srv.emit('connection', clientSocket);
-    }).catch((err) => { log(`[TeamClaude] MITM ${host}: ${err.message}`); clientSocket.destroy(); });
+    }).catch((err) => { log(`[TeamClaude] MITM ${host}: ${err.message}`); reply502Raw(clientSocket); clientSocket.destroy(); });
   };
 }
 
@@ -213,6 +238,7 @@ export function connectAuthorized(req, socket, proxyApiKey) {
 }
 
 function reply200Raw(sock) { sock.write('HTTP/1.1 200 Connection Established\r\n\r\n'); }
+function reply502Raw(sock) { try { sock.write('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n'); } catch { /* client already gone */ } }
 
 function termClaude(clientSocket, head, key, cert, alpn) {
   if (head && head.length) clientSocket.unshift(head);

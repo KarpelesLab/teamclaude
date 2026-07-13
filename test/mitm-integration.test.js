@@ -289,3 +289,33 @@ test('MITM logs proxied requests when a log dir is set', T, async () => {
     rmSync(logDir, { recursive: true, force: true });
   }
 });
+
+// Regression: a tunnel-mode CONNECT whose upstream connect FAILS must return a
+// proper proxy error status line, not a silent socket drop. Dropping it made
+// the client report "Proxy connection ended before receiving CONNECT response".
+test('tunnel: upstream connect failure returns 502, not a silent drop', T, async () => {
+  const { caCertPem, leafCertPem, leafKeyPem } = generateCertChain('localhost');
+  // Grab a port, then free it so a connect there is refused deterministically.
+  const dead = http.createServer();
+  const deadPort = await listen(dead);
+  await new Promise((r) => dead.close(r));
+
+  // config.upstream host is 127.0.0.1, so `CONNECT localhost:<port>` is tunnel mode.
+  const am = new AccountManager([oauthAccount('acct@x', 'T')], 0.98);
+  const proxy = makeProxy(am, 65500, { caCertPem, leafCertPem, leafKeyPem });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const status = await new Promise((resolve, reject) => {
+      const raw = net.connect(proxyPort, '127.0.0.1');
+      raw.once('error', reject);
+      raw.once('connect', () => raw.write(`CONNECT localhost:${deadPort} HTTP/1.1\r\nHost: localhost:${deadPort}\r\n\r\n`));
+      let buf = '';
+      raw.on('data', (d) => { buf += d.toString('latin1'); if (buf.includes('\r\n\r\n')) resolve(buf.split('\r\n')[0]); });
+      raw.on('close', () => { if (!buf) reject(new Error('socket closed with no CONNECT response')); });
+    });
+    assert.match(status, /^HTTP\/1\.1 502/, `expected a 502 status line, got: ${status}`);
+  } finally {
+    closeHard(proxy);
+  }
+});
