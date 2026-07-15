@@ -5,6 +5,7 @@ import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { ensureCerts, createConnectHandler } from './mitm.js';
 import { patchAccountUuid } from './account-uuid-rewrite.js';
+import { sanitizeToolPairs } from './tool-pair-sanitize.js';
 import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
 import { TopLevelFieldFinder } from './model.js';
 import { BodyWriter } from './request-log.js';
@@ -438,14 +439,19 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   const upstreamUrl = `${account.upstream || upstream}${req.url}`;
   const method = req.method;
 
+  // Strip orphaned tool_use / tool_result blocks so a client that compacted or
+  // interrupted a turn can't wedge the session with Anthropic's non-retryable
+  // 400 ("tool_use ids were found without tool_result blocks"). No-op (same
+  // Buffer) for a well-formed body.
+  let sendBody = sanitizeToolPairs(body, req.url, req.headers['content-type']);
   // Align the body's account_uuid (in metadata.user_id) with the account whose
   // token we're injecting (same-length patch; no-op if absent).
-  let sendBody = account.accountUuid ? patchAccountUuid(body, account.accountUuid) : body;
+  if (account.accountUuid) sendBody = patchAccountUuid(sendBody, account.accountUuid);
   // Rewrite the model name for accounts that target a different upstream (e.g.
   // GLM), which uses different model identifiers than Anthropic.
   if (account.modelMap) sendBody = rewriteModel(sendBody, account.modelMap);
-  // If the body changed length (model name rewrite), update Content-Length so the
-  // upstream doesn't receive a mismatched framing and truncate or stall.
+  // If the body changed length (sanitize or model rewrite), update Content-Length
+  // so the upstream doesn't receive a mismatched framing and truncate or stall.
   if (sendBody !== body) headers['content-length'] = String(sendBody.length);
 
   // Streaming request log, opened lazily on the first terminal outcome (a
