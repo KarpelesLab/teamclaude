@@ -6,12 +6,16 @@
 //   immediately after: toolu_XXXX. Each `tool_use` block must have a
 //   corresponding `tool_result` block in the next message.
 //
-// Anthropic requires every tool_use block to be answered by a matching
-// tool_result in the next message. When a client summarizes ("compacts") a long
-// conversation or an in-flight tool call is interrupted, the slice can split
-// that pair, leaving a tool_use with no result (or a tool_result whose tool_use
-// was cut). Anthropic then rejects the whole conversation and every follow-up in
-// that session fails too, so the session is stuck until the client is rewound.
+// Anthropic enforces this POSITIONALLY: every tool_use block in an assistant
+// message must be answered by a matching tool_result in the IMMEDIATELY FOLLOWING
+// message, and every tool_result must be grounded by a tool_use in the message
+// right before it. A client that summarizes ("compacts") a long conversation or
+// gets an in-flight tool call interrupted can break that in two ways:
+//   1. the counterpart is dropped entirely (a tool_use with no result), or
+//   2. the pair is SEPARATED — both blocks survive but other messages slip
+//      between them, so the result is no longer "immediately after".
+// Whole-body pairing (does the id exist somewhere?) misses case 2 — that is the
+// bug that let the 400 through. This checks the true neighbor instead.
 //
 // The proxy already buffers and rewrites the body (account_uuid, model map), so
 // it is the natural single place to normalize this for every client that routes
@@ -30,6 +34,28 @@ function isMessagesRequest(url, contentType) {
   return true;
 }
 
+// Ids of the tool_use blocks in a message (empty for a non-array / absent message).
+function toolUseIds(msg) {
+  const ids = new Set();
+  if (msg && Array.isArray(msg.content)) {
+    for (const b of msg.content) {
+      if (b && typeof b === 'object' && b.type === 'tool_use' && typeof b.id === 'string') ids.add(b.id);
+    }
+  }
+  return ids;
+}
+
+// tool_use_ids referenced by the tool_result blocks in a message.
+function toolResultIds(msg) {
+  const ids = new Set();
+  if (msg && Array.isArray(msg.content)) {
+    for (const b of msg.content) {
+      if (b && typeof b === 'object' && b.type === 'tool_result' && typeof b.tool_use_id === 'string') ids.add(b.tool_use_id);
+    }
+  }
+  return ids;
+}
+
 // Normalize a message's `content` to a block array so same-role messages can be
 // merged losslessly. Anthropic accepts a single-text-block array as equivalent
 // to a plain string, so this never changes meaning. Returns null for shapes we
@@ -40,11 +66,10 @@ function toBlocks(content) {
   return null;
 }
 
-// After whole messages are dropped, two same-role messages can end up adjacent
-// (e.g. a user turn that held only an orphaned tool_result is removed, leaving
-// the assistant turns on either side touching). Anthropic requires roles to
-// alternate, so coalesce any same-role neighbors by concatenating their content.
-// This is a no-op when nothing is adjacent, so it is always safe to run.
+// When pruning empties whole messages, two same-role messages can end up adjacent
+// (a user turn that held only an orphaned tool_result is removed, leaving the
+// assistant turns on either side touching). Anthropic requires roles to alternate,
+// so coalesce same-role neighbors by concatenating their content.
 function coalesceSameRole(messages) {
   const out = [];
   for (const msg of messages) {
@@ -62,59 +87,67 @@ function coalesceSameRole(messages) {
   return out;
 }
 
-// Returns a new messages array with orphans pruned, or null if nothing changed.
-function pruneOrphans(messages) {
-  // Whole-body pairing. In practice the only breakage clients produce is a
-  // MISSING counterpart (an interrupted tail, or a compaction slice that split a
-  // pair), never a reordered one, so pairing across the whole body catches every
-  // real orphan class without ever un-pairing a valid adjacent pair.
-  const useIds = new Set(); // ids of every tool_use block present
-  const resultIds = new Set(); // tool_use_ids referenced by every tool_result
-  for (const msg of messages) {
-    if (!msg || !Array.isArray(msg.content)) continue;
-    for (const block of msg.content) {
-      if (!block || typeof block !== 'object') continue;
-      if (block.type === 'tool_use' && typeof block.id === 'string') useIds.add(block.id);
-      else if (block.type === 'tool_result' && typeof block.tool_use_id === 'string') resultIds.add(block.tool_use_id);
-    }
-  }
+// One pruning pass over the array. Strips positionally-unpaired blocks, drops any
+// message it empties, and (only when it dropped something) coalesces same-role
+// neighbors so roles still alternate. Returns the possibly-new array plus whether
+// it changed anything. Mutates the `content` arrays of the (already-cloned) input.
+function pruneOnce(messages) {
+  let changed = false;
 
-  let mutated = false;
-  let droppedMessage = false;
-  const out = [];
-  for (const msg of messages) {
-    if (!msg || !Array.isArray(msg.content)) {
-      out.push(msg);
-      continue;
-    }
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    if (!msg || !Array.isArray(msg.content)) continue;
+    const answeredByNext = toolResultIds(messages[i + 1]); // results that answer THIS msg's tool_use
+    const groundedByPrev = toolUseIds(messages[i - 1]); // tool_use that grounds THIS msg's tool_result
     const kept = [];
-    for (const block of msg.content) {
-      if (block && typeof block === 'object') {
-        // Drop a tool_use whose result is nowhere in the body.
-        if (block.type === 'tool_use' && typeof block.id === 'string' && !resultIds.has(block.id)) {
-          mutated = true;
+    for (const b of msg.content) {
+      if (b && typeof b === 'object') {
+        // A tool_use whose result is not in the immediately following message.
+        if (b.type === 'tool_use' && typeof b.id === 'string' && !answeredByNext.has(b.id)) {
+          changed = true;
           continue;
         }
-        // Drop a tool_result whose tool_use is nowhere in the body.
-        if (block.type === 'tool_result' && typeof block.tool_use_id === 'string' && !useIds.has(block.tool_use_id)) {
-          mutated = true;
+        // A tool_result whose tool_use is not in the immediately preceding message.
+        if (b.type === 'tool_result' && typeof b.tool_use_id === 'string' && !groundedByPrev.has(b.tool_use_id)) {
+          changed = true;
           continue;
         }
       }
-      kept.push(block);
+      kept.push(b);
     }
-    if (kept.length === 0) {
-      // The message held only orphan block(s); an all-orphan message is itself
-      // orphaned and Anthropic rejects empty content, so drop the whole message.
-      mutated = true;
-      droppedMessage = true;
-      continue;
-    }
-    out.push(kept.length !== msg.content.length ? { ...msg, content: kept } : msg);
+    if (kept.length !== msg.content.length) msg.content = kept;
   }
 
-  if (!mutated) return null;
-  return droppedMessage ? coalesceSameRole(out) : out;
+  let droppedAny = false;
+  const kept = [];
+  for (const msg of messages) {
+    if (msg && Array.isArray(msg.content) && msg.content.length === 0) {
+      changed = true;
+      droppedAny = true;
+      continue;
+    }
+    kept.push(msg);
+  }
+
+  const result = droppedAny ? coalesceSameRole(kept) : kept;
+  if (result.length !== kept.length) changed = true;
+  return { messages: result, changed };
+}
+
+// Repeat pruning to a fixed point: dropping a message shifts adjacency, which can
+// expose a new positional orphan (the cascade), so one pass is not enough. Each
+// pass only removes, so this terminates. Returns the new array, or null if the
+// body was already valid (so the caller can forward the original bytes untouched).
+function pruneOrphans(messages) {
+  let current = messages;
+  let everChanged = false;
+  for (let guard = 0; guard < 1000; guard++) {
+    const { messages: next, changed } = pruneOnce(current);
+    current = next;
+    if (!changed) break;
+    everChanged = true;
+  }
+  return everChanged ? current : null;
 }
 
 /**

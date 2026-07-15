@@ -8,19 +8,27 @@ const buf = (obj) => Buffer.from(JSON.stringify(obj), 'utf8');
 const parse = (b) => JSON.parse(b.toString('utf8'));
 const run = (obj, url = MESSAGES, ct = JSON_CT) => sanitizeToolPairs(buf(obj), url, ct);
 
-// True when no tool_use lacks a result and no tool_result lacks a use — the exact
-// invariant Anthropic enforces (whole-body pairing).
+// True when the body satisfies Anthropic's ACTUAL rule: every tool_use is answered
+// by a matching tool_result in the IMMEDIATELY FOLLOWING message, and every
+// tool_result is grounded by a tool_use in the message right before it. (Whole-body
+// "does the id exist anywhere" is too lenient — it was the bug.)
+function idsOf(msg, type, key) {
+  const ids = new Set();
+  for (const b of Array.isArray(msg?.content) ? msg.content : []) {
+    if (b?.type === type && typeof b[key] === 'string') ids.add(b[key]);
+  }
+  return ids;
+}
 function isPaired(body) {
-  const uses = new Set();
-  const results = new Set();
-  for (const m of body.messages ?? []) {
-    for (const b of Array.isArray(m.content) ? m.content : []) {
-      if (b?.type === 'tool_use') uses.add(b.id);
-      else if (b?.type === 'tool_result') results.add(b.tool_use_id);
+  const msgs = body.messages ?? [];
+  for (let i = 0; i < msgs.length; i++) {
+    const next = idsOf(msgs[i + 1], 'tool_result', 'tool_use_id');
+    const prev = idsOf(msgs[i - 1], 'tool_use', 'id');
+    for (const b of Array.isArray(msgs[i]?.content) ? msgs[i].content : []) {
+      if (b?.type === 'tool_use' && !next.has(b.id)) return false;
+      if (b?.type === 'tool_result' && !prev.has(b.tool_use_id)) return false;
     }
   }
-  for (const id of uses) if (!results.has(id)) return false;
-  for (const id of results) if (!uses.has(id)) return false;
   return true;
 }
 
@@ -124,4 +132,43 @@ test('also covers /v1/messages/count_tokens', () => {
     '/v1/messages/count_tokens',
   );
   assert.ok(isPaired(parse(out)));
+});
+
+test('strips a SEPARATED pair — result present but not immediately after (the messages.2 case)', () => {
+  // A compaction that keeps a tool_use at messages[2] but moves its tool_result to
+  // messages[4] instead of [3]. The id still exists in the body, so whole-body
+  // pairing would keep it and Anthropic still 400s. Positional pairing must strip it.
+  const out = run({
+    model: 'claude',
+    messages: [
+      { role: 'user', content: 'start' },
+      { role: 'assistant', content: [{ type: 'text', text: 'ok' }] },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_gap', name: 'noop', input: {} }] },
+      { role: 'user', content: 'unrelated next turn' },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_gap', content: 'late' }] },
+    ],
+  });
+  const body = parse(out);
+  assert.ok(isPaired(body));
+  assert.ok(rolesAlternate(body));
+  assert.ok(!JSON.stringify(body).includes('toolu_gap'));
+});
+
+test('cascade: dropping one turn exposes the next orphan, valid pair is preserved', () => {
+  const out = run({
+    model: 'claude',
+    messages: [
+      { role: 'user', content: 'go' },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_A', name: 'a', input: {} }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_A', content: 'ra' }] },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_B', name: 'b', input: {} }] },
+      { role: 'user', content: 'chatter' },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_B', content: 'rb late' }] },
+    ],
+  });
+  const body = parse(out);
+  assert.ok(isPaired(body));
+  assert.ok(rolesAlternate(body));
+  assert.ok(JSON.stringify(body).includes('toolu_A'));
+  assert.ok(!JSON.stringify(body).includes('toolu_B'));
 });
