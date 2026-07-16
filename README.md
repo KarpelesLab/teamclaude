@@ -26,6 +26,7 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 - **Rotation priority** — pin a preferred account order with `teamclaude priority`
 - **Enable/disable accounts** — temporarily pause an account without removing it (`teamclaude disable`/`enable`, or `d` in the TUI); re-enabling also clears a stuck error state
 - **Quota persistence** — observed quota survives restarts (saved to a sibling state file), so rotation state isn't lost on restart; stale windows are discarded automatically
+- **Hold on exhaustion** — when all accounts are spent, `holdSeconds` keeps the HTTP connection open and polls silently until quota resets, so long-running Claude Code tasks continue automatically instead of aborting with a 429
 - **Optional quota probe** — off by default; when enabled, periodically refreshes idle accounts' quota from the usage endpoint (no message spend), and surfaces the Sonnet and Fable weekly buckets
 - **Optional keep-warm** — off by default; when enabled, periodically starts idle accounts' 5h session timers with a minimal request (`teamclaude warmup`) so the next account isn't cold when rotation reaches it (spends a little quota, unlike the probe)
 - **Account pinning** — force a request onto one account via an `ANTHROPIC_BASE_URL=.../tc-acct/<name>` prefix, bypassing rotation
@@ -257,6 +258,20 @@ On by default. Tune or disable via `stormRamp` in the config:
 
 The same gate handles **rate-limit 429s** (the per-minute throttle, not quota exhaustion): teamclaude pauses the account for the `retry-after` window so new queries wait instead of piling on, then releases the held queries through a fresh ramp (staggered, not all at once). It **never rotates** on a rate-limit 429 — that would just move the burst to the next account and drop the first account's cache. Short waits are absorbed inline on the same account (default ≤ 60s, `TEAMCLAUDE_RATE_LIMIT_ABSORB_MAX_SECONDS`); longer ones return a 429 + `retry-after` so the client backs off. Only a **quota rejection** (`unified-…-status: rejected`) rotates.
 
+### Hold on quota exhaustion (holdSeconds, off by default)
+
+By default, when all accounts are exhausted teamclaude returns a `429` immediately, which causes Claude Code to abort the current task. With `holdSeconds` set, the proxy **holds the HTTP connection open** instead and polls silently every ~60 seconds; the instant any account's quota resets, the request is forwarded and Claude Code resumes — the interruption never happens.
+
+Set it in the config file (`~/.config/teamclaude.json`):
+
+```json
+"holdSeconds": 3600
+```
+
+`teamclaude run` automatically raises `API_TIMEOUT_MS` on the spawned Claude Code process to `holdSeconds + 60` seconds so the client-side timeout covers the full hold window — no manual configuration of Claude Code is needed.
+
+Useful for overnight or unattended runs: rather than waking up to a stopped task, the session resumes silently once a quota window opens.
+
 ### Config format
 
 ```json
@@ -293,6 +308,7 @@ The same gate handles **rate-limit 429s** (the per-minute throttle, not quota ex
 | `switchThreshold` | Quota utilization (0–1) at which to switch accounts (TUI: `g` → `t`) |
 | `quotaProbeSeconds` | Background quota-probe interval in seconds (`0` = off, the default; CLI `probe` or TUI `g` → `p`) |
 | `warmupSeconds` | Keep-warm interval in seconds (`0` = off, the default; CLI `warmup`). Spawns a minimal `claude` per idle account to start its 5h timer — **spends a little quota**, unlike the probe |
+| `holdSeconds` | Maximum seconds to hold the connection when all accounts are exhausted, polling silently until one recovers (`0` = return 429 immediately, the default). `teamclaude run` raises `API_TIMEOUT_MS` automatically to match |
 | `stormRamp` | Optional storm-control tuning (on by default) — see [Storm control](#storm-control-switchover-ramp-up). Object: `{ enabled, startConc, stepConc, stepMs, windowMs }` |
 | `sx.apiKey` | [sx.org](https://sx.org) API key. When set, TeamClaude auto-provisions a residential proxy (egress-IP 429 workaround). Absent/empty = off |
 | `sx.mode` | `always` (route all upstream traffic), `429` (direct, fail over to the proxy after a 429), or `off` (keep the key but don't use it). Defaults to `always` when a key is set |
@@ -483,7 +499,7 @@ TLS is established **end-to-end with `api.anthropic.com` over the tunnel**, so t
 5. When usage reaches the threshold, the proxy switches to the next available account via round-robin
 6. On 429 responses, the proxy waits the `retry-after` duration and retries; on persistent errors, it switches accounts
 7. Transient network errors (connection reset, timeout) drop the connection so the client can retry
-8. If all accounts are exhausted, returns 429 with the soonest reset time
+8. If all accounts are exhausted, returns 429 with the soonest reset time — or, with `holdSeconds` set, holds the connection open and retries silently until an account recovers
 9. Client token refresh requests (`/v1/oauth/token`) are relayed to upstream untouched — the proxy and client manage their own token lifecycles independently
 
 ## Security

@@ -51,6 +51,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
   const upstream = config.upstream || 'https://api.anthropic.com';
   const proxyApiKey = config.proxy?.apiKey;
   const logDir = config.logDir || null;
+  const holdMs = (config.holdSeconds || 0) * 1000;
 
   if (logDir) {
     mkdir(logDir, { recursive: true }).catch(() => {});
@@ -105,7 +106,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
     }
   };
 
-  const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx });
+  const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs });
   const server = http.createServer(requestHandler);
 
   // Forward-proxy support (always on, so multiple claude instances can use
@@ -151,7 +152,7 @@ const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/files/', '/api/oauth/f
  * aware routing, and retry-on-quota behavior. Control endpoints (status/reload)
  * and the proxy-API-key gate live in the base server's wrapper, not here.
  */
-export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null }) {
+export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0 }) {
   let counter = 0;
   return async (req, res) => {
     try {
@@ -207,7 +208,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // nested in tools[]; the advisor sub-inference runs on the selected
       // account, so selection must be eligible for it too (issue #98).
       const advisorModel = parseAdvisorModel(body);
-      const ctx = { account: null, status: null, tried: new Set(), model, advisorModel, pinnedIndex };
+      const ctx = { account: null, status: null, tried: new Set(), model, advisorModel, pinnedIndex, holdBudgetMs: holdMs };
       try {
         await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir, sx);
       } catch (err) {
@@ -380,6 +381,23 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     ctx.account = '(none available)';
     const status = accountManager.getStatus();
     const retryAfter = computeRetryAfter(status.accounts);
+
+    // Long-hold mode: hold the HTTP connection and poll until an account
+    // recovers or the budget (holdSeconds) runs out. Claude Code waits for
+    // the first response byte, so this is transparent to the client as long
+    // as API_TIMEOUT_MS on the Claude Code side is large enough.
+    if (ctx.holdBudgetMs > 0) {
+      // Cap the per-poll sleep to 60s so a newly-available account (e.g. one
+      // manually enabled or whose quota reset early) is picked up within a
+      // minute instead of sleeping the full retryAfter (often 3600s).
+      const waitMs = Math.min(retryAfter * 1000, ctx.holdBudgetMs, 60_000);
+      ctx.holdBudgetMs -= waitMs;
+      console.log(`[TeamClaude] All accounts exhausted — holding connection, retry in ${Math.ceil(waitMs / 1000)}s (${Math.ceil(ctx.holdBudgetMs / 1000)}s budget left)`);
+      await new Promise(resolve => setTimeout(resolve, waitMs));
+      if (res.destroyed) return;
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
+    }
+
     const exhaustedRetries = ctx.exhaustedRetries || 0;
     if (exhaustedRetries < 1 && retryAfter <= INLINE_RETRY_AFTER_MAX_SECONDS) {
       ctx.exhaustedRetries = exhaustedRetries + 1;
