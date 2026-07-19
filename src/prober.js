@@ -76,12 +76,27 @@ export class Prober {
       let usage = await this._withTimeout(this.probeFn(account.credential));
       if (usage?.status === 401) {
         // Token rejected: force refresh and retry once.
-        await this.am.ensureTokenFresh(account.index, true);
+        const refresh = await this.am.ensureTokenFresh(account.index, true);
+        if (!refresh?.ok && refresh?.classification === 'authentication') {
+          const finishedAt = Date.now();
+          this._recordAccount(account, {
+            status: 'error',
+            error: 'authentication rejected',
+            startedAt,
+            finishedAt,
+            durationMs: finishedAt - startedAt,
+          });
+          return { ok: false, classification: 'authentication' };
+        }
         usage = await this._withTimeout(this.probeFn(account.credential));
       }
 
       if (!usage || usage.error) {
         const finishedAt = Date.now();
+        const classification = usage?.status === 401 ? 'authentication' : 'transient';
+        if (classification === 'authentication') {
+          this.am.markAuthenticationFailed(account.index);
+        }
         this._recordAccount(account, {
           status: usage?.error ? 'error' : 'timeout',
           error: usage?.error || 'probe timed out',
@@ -89,7 +104,7 @@ export class Prober {
           finishedAt,
           durationMs: finishedAt - startedAt,
         });
-        return;
+        return { ok: false, classification };
       }
 
       this.am.applyUsageData(account.index, usage);
@@ -101,6 +116,7 @@ export class Prober {
         finishedAt,
         durationMs: finishedAt - startedAt,
       });
+      return { ok: true, classification: 'active' };
     } catch (err) {
       const finishedAt = Date.now();
       this._recordAccount(account, {
@@ -110,6 +126,7 @@ export class Prober {
         finishedAt,
         durationMs: finishedAt - startedAt,
       });
+      return { ok: false, classification: 'transient' };
     }
   }
 

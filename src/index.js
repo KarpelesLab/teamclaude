@@ -215,7 +215,7 @@ async function serverCommand() {
   // POST /teamclaude/reload endpoint, and the CLI notify after add/change all
   // funnel through here. Returns the number of newly added accounts. Also picks
   // up a changed probe interval so `teamclaude probe` applies live.
-  const reloadAccounts = async () => {
+  const reloadAccounts = async (revalidateConfigIndex = null) => {
     const diskConfig = await loadConfig();
     if (!diskConfig) return 0;
     const added = await syncAccountsFromDisk(diskConfig, config, accountManager);
@@ -244,6 +244,42 @@ async function serverCommand() {
         warmer.reschedule(ms);
       }
     }
+
+    let revalidated = null;
+    if (Number.isSafeInteger(revalidateConfigIndex)) {
+      const diskAccount = diskConfig.accounts[revalidateConfigIndex];
+      const managerIndex = diskAccount
+        ? accountManager.accounts.findIndex(account => sameIdentity(account, diskAccount))
+        : -1;
+      const account = managerIndex >= 0 ? accountManager.accounts[managerIndex] : null;
+      if (!account) {
+        revalidated = { requested: true, status: 'missing' };
+      } else if (account.disabled) {
+        revalidated = { requested: true, status: 'disabled' };
+      } else if (account.type === 'oauth' && !account.refreshToken) {
+        account.status = 'error';
+        revalidated = { requested: true, status: 'authentication' };
+      } else {
+        // Consume fresh provider truth at the command boundary. A credential
+        // refresh alone cannot retire stale quota, while the zero-spend usage
+        // endpoint updates the exact fields used by selection.
+        const validation = prober
+          ? await prober.probeAccount(account)
+          : await accountManager.ensureTokenFresh(managerIndex, true);
+        revalidated = {
+          requested: true,
+          status: validation?.ok
+            ? (accountManager._isAvailable(account) ? 'active' : 'quota')
+            : (validation?.classification || 'transient'),
+        };
+      }
+    }
+
+    // Re-evaluate the active account after every config sync. Priority changes
+    // take effect immediately, while a failed validation leaves the target out
+    // of rotation and selects the next requestable account.
+    accountManager.selectActiveAccount();
+    if (revalidated) return { added, revalidated };
     return added;
   };
 
@@ -1100,7 +1136,11 @@ async function priorityCommand() {
   account.priority = priority;
   await saveConfig(config);
   console.log(`Set priority of "${account.name}" to ${priority} (lower = preferred)`);
-  await notifyRunningServer(config);
+  const reload = await notifyRunningServer(config, config.accounts.indexOf(account));
+  if (reload?.revalidated && reload.revalidated.status !== 'active') {
+    console.error(`Priority saved, but the target is not requestable (${reload.revalidated.status}). The running server selected another healthy account.`);
+    process.exitCode = 2;
+  }
 }
 
 // ── enable / disable ────────────────────────────────────────
@@ -1127,8 +1167,15 @@ async function setDisabledCommand(disabled) {
     delete account.disabled;
   }
   await saveConfig(config);
+  const reload = await notifyRunningServer(
+    config,
+    disabled ? null : config.accounts.indexOf(account),
+  );
   console.log(`${disabled ? 'Disabled' : 'Enabled'} account "${account.name}"`);
-  await notifyRunningServer(config);
+  if (!disabled && reload?.revalidated && reload.revalidated.status !== 'active') {
+    console.error(`Account enabled in config but not requestable (${reload.revalidated.status}). Credential repair is required.`);
+    process.exitCode = 2;
+  }
 }
 
 // ── help ────────────────────────────────────────────────────
@@ -1404,19 +1451,25 @@ function upstreamHost(config) {
 // connection immediately, so this is a no-op (and near-instant) when nothing is
 // running. Reload picks up new accounts, credential, priority, and enable/disable
 // changes; account removals still need a restart.
-async function notifyRunningServer(config) {
+async function notifyRunningServer(config, revalidateIndex = null) {
   const port = config?.proxy?.port;
-  if (!port) return;
+  if (!port) return null;
   try {
+    const headers = { 'x-api-key': config.proxy?.apiKey || '' };
+    if (Number.isSafeInteger(revalidateIndex) && revalidateIndex >= 0) {
+      headers['x-teamclaude-revalidate-index'] = String(revalidateIndex);
+    }
     const res = await fetch(`http://localhost:${port}/teamclaude/reload`, {
       method: 'POST',
-      headers: { 'x-api-key': config.proxy?.apiKey || '' },
+      headers,
     });
     if (res.ok) {
       const data = await res.json().catch(() => ({}));
       console.log(`Reloaded running server${data.added ? ` (+${data.added} new account)` : ''}.`);
+      return data;
     }
   } catch { /* no server running — nothing to notify */ }
+  return null;
 }
 
 // Quick liveness probe: is something listening on the local proxy port?

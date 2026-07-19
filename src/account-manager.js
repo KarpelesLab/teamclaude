@@ -473,6 +473,49 @@ export class AccountManager {
   }
 
   /**
+   * Explain why each account is or is not requestable without exposing account
+   * identities. The server uses these mutually-exclusive counts to avoid
+   * collapsing authentication failures, quota exhaustion, transient throttles,
+   * routing exclusions, and per-request failures into one synthetic message.
+   */
+  getAvailabilitySummary(exclude = null, model = null, advisorModel = null) {
+    const counts = {
+      available: 0,
+      authentication: 0,
+      quota: 0,
+      temporary: 0,
+      disabled: 0,
+      route: 0,
+      excluded: 0,
+    };
+
+    for (const account of this.accounts) {
+      if (account.disabled) {
+        counts.disabled++;
+        continue;
+      }
+      if ((model && !this._routeAllows(account, model))
+          || (advisorModel && !this._routeAllows(account, advisorModel))) {
+        counts.route++;
+        continue;
+      }
+      if (!this._isAvailable(account, model, advisorModel)) {
+        if (account.status === 'error') counts.authentication++;
+        else if (account.status === 'exhausted' || this._isNearQuota(account, model)) counts.quota++;
+        else if (account.status === 'throttled') counts.temporary++;
+        else counts.quota++;
+        continue;
+      }
+      // Preserve persistent state evidence above. `excluded` is only for an
+      // otherwise-requestable account that failed earlier in this request.
+      if (exclude?.has(account.index)) counts.excluded++;
+      else counts.available++;
+    }
+
+    return { total: this.accounts.length, counts };
+  }
+
+  /**
    * Normalize and store the configurable routing table. A route pins a set of
    * model globs to an exclusive set of accounts (and may override the governing
    * quota bucket). Called from the constructor and on config reload.
@@ -977,10 +1020,13 @@ export class AccountManager {
     const account = this.accounts[accountIndex];
     if (!account) return;
     account.disabled = disabled;
-    if (!disabled && account.status === 'error') {
+    if (!disabled && ['error', 'throttled', 'exhausted'].includes(account.status)) {
       account.status = 'active';
       account.rateLimitedUntil = null;
-      console.log(`[TeamClaude] Account "${account.name}" re-enabled — clearing error state`);
+      account.throttledAt = null;
+      account.pausedUntil = null;
+      account.requalify = true;
+      console.log(`[TeamClaude] Account "${account.name}" re-enabled — clearing cached unavailable state`);
     }
   }
 
@@ -1009,6 +1055,14 @@ export class AccountManager {
     if (usage.sevenDayFable) {
       if (usage.sevenDayFable.utilization != null) q.unified7dFable = usage.sevenDayFable.utilization;
       if (usage.sevenDayFable.resetAt != null) q.unified7dFableReset = usage.sevenDayFable.resetAt;
+    }
+
+    // A successful usage response is live evidence. Retire the legacy hard
+    // `exhausted` state once the governing quota is below the live threshold;
+    // the quota values remain authoritative and still gate selection normally.
+    if (account.status === 'exhausted' && !this._isNearQuota(account)) {
+      account.status = 'active';
+      account.requalify = true;
     }
 
     // If we just learned this account's weekly window while probing, re-evaluate
@@ -1049,15 +1103,35 @@ export class AccountManager {
   }
 
   /**
+   * Quarantine one account after live upstream proof that its credential is
+   * rejected. Authentication state is account-local: it must never poison the
+   * rest of the pool or be collapsed into quota exhaustion.
+   */
+  markAuthenticationFailed(accountIndex) {
+    const account = this.accounts[accountIndex];
+    if (!account) return;
+    account.status = 'error';
+    account.rateLimitedUntil = null;
+    account.throttledAt = null;
+    account.pausedUntil = null;
+    account.requalify = false;
+    console.error(`[TeamClaude] Account "${account.name}" rejected authentication — isolated from rotation`);
+  }
+
+  /**
    * Ensure an OAuth account's token is fresh, refreshing if needed.
    * Pass force=true to refresh regardless of expiry (e.g. after a 401).
    * Concurrent calls for the same account coalesce into a single refresh.
    */
   async ensureTokenFresh(accountIndex, force = false) {
     const account = this.accounts[accountIndex];
-    if (!account || account.type !== 'oauth' || !account.refreshToken) return;
+    if (!account || account.type !== 'oauth' || !account.refreshToken) {
+      return { ok: true, classification: 'not-applicable' };
+    }
 
-    if (!force && !isTokenExpiringSoon(account.expiresAt)) return;
+    if (!force && !isTokenExpiringSoon(account.expiresAt)) {
+      return { ok: true, classification: 'fresh' };
+    }
 
     // Coalesce concurrent refreshes
     if (account._refreshPromise) return account._refreshPromise;
@@ -1069,8 +1143,10 @@ export class AccountManager {
         account.credential = newTokens.accessToken;
         account.refreshToken = newTokens.refreshToken;
         account.expiresAt = newTokens.expiresAt;
+        if (account.status === 'error') account.status = 'active';
         console.log(`[TeamClaude] Token refreshed for account "${account.name}"`);
         this._onTokenRefresh?.(accountIndex, newTokens);
+        return { ok: true, classification: 'refreshed' };
       } catch (err) {
         console.error(`[TeamClaude] Token refresh failed for "${account.name}": ${err.message}`);
         // Reserve 'error' (which drops the account from rotation until re-login)
@@ -1083,7 +1159,9 @@ export class AccountManager {
         if (isAuthRejection) {
           account.status = 'error';
           console.error(`[TeamClaude] Account "${account.name}" needs re-login (refresh token rejected) — run: teamclaude login`);
+          return { ok: false, classification: 'authentication' };
         }
+        return { ok: false, classification: 'transient' };
       } finally {
         account._refreshPromise = null;
       }

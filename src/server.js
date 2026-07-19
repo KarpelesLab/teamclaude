@@ -89,9 +89,18 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
           return;
         }
         try {
-          const added = await hooks.reload();
+          const rawIndex = req.headers['x-teamclaude-revalidate-index'];
+          const parsedIndex = typeof rawIndex === 'string' && /^\d+$/.test(rawIndex)
+            ? Number(rawIndex) : null;
+          const revalidateIndex = parsedIndex != null
+            && Number.isSafeInteger(parsedIndex) && parsedIndex >= 0 && parsedIndex < 10_000
+            ? parsedIndex : null;
+          const result = await hooks.reload(revalidateIndex);
+          const payload = typeof result === 'number'
+            ? { added: result }
+            : (result && typeof result === 'object' ? result : { added: 0 });
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: true, added: added || 0 }));
+          res.end(JSON.stringify({ ok: true, ...payload, added: payload.added || 0 }));
         } catch (err) {
           res.writeHead(500, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: err.message }));
@@ -380,23 +389,40 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     ctx.account = '(none available)';
     const status = accountManager.getStatus();
     const retryAfter = computeRetryAfter(status.accounts);
+    const availability = accountManager.getAvailabilitySummary(ctx.tried, ctx.model, ctx.advisorModel);
+    const counts = availability.counts;
+    const quotaOnly = counts.quota > 0
+      && counts.authentication === 0 && counts.temporary === 0 && counts.excluded === 0;
+    const temporaryOnly = counts.temporary > 0
+      && counts.authentication === 0 && counts.quota === 0 && counts.excluded === 0;
     const exhaustedRetries = ctx.exhaustedRetries || 0;
-    if (exhaustedRetries < 1 && retryAfter <= INLINE_RETRY_AFTER_MAX_SECONDS) {
+    if ((quotaOnly || temporaryOnly)
+        && exhaustedRetries < 1 && retryAfter <= INLINE_RETRY_AFTER_MAX_SECONDS) {
       ctx.exhaustedRetries = exhaustedRetries + 1;
-      console.log(`[TeamClaude] All accounts exhausted — waiting ${retryAfter}s before retry`);
+      console.log(`[TeamClaude] Pool unavailable (${quotaOnly ? 'quota' : 'temporary'}) — waiting ${retryAfter}s before retry`);
       await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
       if (res.destroyed) return;
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
     }
-    res.writeHead(429, {
+    const responseStatus = quotaOnly || temporaryOnly ? 429 : 503;
+    const code = quotaOnly ? 'all_quota_exhausted'
+      : temporaryOnly ? 'temporary_rate_limited' : 'mixed_pool_unavailable';
+    const message = quotaOnly
+      ? `All ${counts.quota} eligible accounts are at usage limits. Retry in ${retryAfter}s.`
+      : temporaryOnly
+        ? `All ${counts.temporary} eligible accounts are temporarily rate limited. Retry in ${retryAfter}s.`
+        : `TeamClaude pool unavailable: ${counts.authentication} authentication-invalid, ${counts.quota} quota-limited, ${counts.temporary} temporarily-limited, ${counts.excluded} failed-this-request.`;
+    ctx.status = responseStatus;
+    res.writeHead(responseStatus, {
       'Content-Type': 'application/json',
       'retry-after': String(retryAfter),
     });
     res.end(JSON.stringify({
       type: 'error',
       error: {
-        type: 'rate_limit_error',
-        message: `All ${accountManager.accounts.length} accounts exhausted. Retry in ${retryAfter}s.`,
+        type: responseStatus === 429 ? 'rate_limit_error' : 'service_unavailable_error',
+        code,
+        message,
       },
     }));
     return;
@@ -497,6 +523,38 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // this is what lets a revalidation probe (a throttled account selected by
     // _selectProbe) clear its own hold and return the fleet to service.
     if (upstreamRes.status !== 429) accountManager.clearRateLimited(account.index);
+
+    // A live 401 is account-local authentication evidence, never a fleet-wide
+    // quota state. OAuth gets one forced refresh per account per request; a
+    // second 401 after refreshed credentials (or an API-key 401) quarantines
+    // only that account and fails over within the existing bounded retry walk.
+    if (upstreamRes.status === 401) {
+      await upstreamRes.body?.cancel();
+      ctx.authRefreshTried ||= new Set();
+      let validation = null;
+      if (account.type === 'oauth' && account.refreshToken
+          && !ctx.authRefreshTried.has(account.index)) {
+        ctx.authRefreshTried.add(account.index);
+        validation = await accountManager.ensureTokenFresh(account.index, true);
+        if (validation?.ok && retryCount < maxRetries) {
+          console.log(`[TeamClaude] Authentication rejected for "${account.name}" — retrying once with refreshed credentials`);
+          if (res.destroyed) return;
+          return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
+        }
+      }
+
+      // A transient refresh transport failure is not proof the refresh token is
+      // bad. Exclude the account only for this request; all definitive cases are
+      // quarantined until a credential update or explicit re-enable revalidates.
+      if (validation?.classification !== 'transient') {
+        accountManager.markAuthenticationFailed(account.index);
+      }
+      ctx.tried.add(account.index);
+      if (retryCount < maxRetries) {
+        if (res.destroyed) return;
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+      }
+    }
 
     // Two kinds of 429 are handled differently below: a quota rejection rotates
     // to another account; a transient rate-limit throttle pauses + retries the
