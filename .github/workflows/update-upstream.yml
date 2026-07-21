@@ -1,0 +1,112 @@
+name: Update Upstream
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Refresh the flake lock even when upstream has not moved
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    - cron: '17 4 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: update-upstream-master
+  cancel-in-progress: false
+
+jobs:
+  watcher:
+    name: watcher
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.check.outputs.changed }}
+      upstream_sha: ${{ steps.check.outputs.upstream_sha }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Check upstream
+        id: check
+        env:
+          FORCE_UPDATE: ${{ github.event_name == 'workflow_dispatch' && inputs.force == true }}
+        run: |
+          git remote add upstream https://github.com/KarpelesLab/teamclaude.git || \
+            git remote set-url upstream https://github.com/KarpelesLab/teamclaude.git
+          git fetch --no-tags upstream master
+
+          upstream_sha="$(git rev-parse upstream/master)"
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+
+          if [ "$FORCE_UPDATE" = "true" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Force update requested for upstream $upstream_sha"
+          elif git merge-base --is-ancestor "$upstream_sha" HEAD; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Already contains upstream $upstream_sha"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Upstream has new commits at $upstream_sha"
+          fi
+
+  updater:
+    name: updater
+    needs: watcher
+    if: needs.watcher.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: write
+    env:
+      UPSTREAM_SHA: ${{ needs.watcher.outputs.upstream_sha }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Merge pinned upstream commit and refresh flake lock
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream https://github.com/KarpelesLab/teamclaude.git || \
+            git remote set-url upstream https://github.com/KarpelesLab/teamclaude.git
+          git fetch --no-tags upstream master
+          git cat-file -e "$UPSTREAM_SHA^{commit}"
+          git merge --no-edit "$UPSTREAM_SHA"
+
+          nix flake update
+
+      - name: Verify package
+        run: |
+          nix build .#teamclaude
+          nix run .#teamclaude -- help
+
+      - name: Commit flake lock updates
+        run: |
+          if git diff --quiet -- flake.lock; then
+            echo "No flake.lock changes."
+          else
+            git add flake.lock
+            git commit -m "Update Nix flake lock"
+          fi
+
+      - name: Push update branch
+        run: git push origin HEAD:master
+
+      - name: Start CI for updated branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref master
