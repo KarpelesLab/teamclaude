@@ -18,6 +18,7 @@ import { SxManager } from './sx.js';
 import { autoUpdate, checkForUpdate, currentVersion, runUpdate, installKind, PKG_NAME } from './updater.js';
 import { renderStatus } from './status-renderer.js';
 import { buildClaudeEnvLines } from './claude-env.js';
+import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -409,6 +410,10 @@ async function serverCommand() {
     }
   });
 
+  // Reflect the active account in the terminal title so a backgrounded/tabbed
+  // server is glanceable. Works in both TUI and headless modes.
+  const stopTitle = startTerminalTitleUpdater(accountManager);
+
   // Persist quota every minute; unref so it never keeps the process alive.
   quotaSaveInterval = setInterval(persistQuotaState, 60_000);
   quotaSaveInterval.unref?.();
@@ -443,6 +448,7 @@ async function serverCommand() {
     if (shuttingDown) process.exit(0); // second ctrl-c: stop waiting, just go
     shuttingDown = true;
     try { tui?.stop(); } catch { /* terminal already restored */ }
+    stopTitle();
     if (!tui) console.log('\n[TeamClaude] Shutting down...');
     prober?.stop();
     warmer?.stop();
@@ -1484,6 +1490,41 @@ function argValue(flag) {
 function upstreamHost(config) {
   try { return new URL(config.upstream || 'https://api.anthropic.com').hostname; }
   catch { return 'api.anthropic.com'; }
+}
+
+// Keep the terminal title in sync with the active account (e.g. "teamclaude 2/4
+// work") so a backgrounded or tabbed `teamclaude server` is glanceable. TTY-only
+// — never emit escapes into a pipe, a `--log-to` redirect, or a systemd journal;
+// opt out entirely with TEAMCLAUDE_NO_TITLE. Polls (rather than hooking every
+// currentIndex mutation) and writes only when the title actually changes.
+// Returns an idempotent stop() that restores the shell's previous title.
+function startTerminalTitleUpdater(accountManager) {
+  const out = process.stdout;
+  if (!out.isTTY || process.env.TEAMCLAUDE_NO_TITLE) return () => {};
+
+  let last = null;
+  const render = () => {
+    const total = accountManager.accounts.length;
+    const index = Math.min(accountManager.currentIndex || 0, Math.max(0, total - 1));
+    const name = accountManager.accounts[index]?.name || null;
+    const title = formatTerminalTitle({ index, total, name });
+    if (title !== last) { last = title; out.write(titleSequence(title)); }
+  };
+
+  out.write(TITLE_STACK_PUSH); // save whatever title the shell had
+  render();
+  const timer = setInterval(render, 2000);
+  timer.unref?.();
+
+  let stopped = false;
+  const stop = () => {
+    if (stopped) return;
+    stopped = true;
+    clearInterval(timer);
+    try { out.write(TITLE_STACK_POP); } catch { /* terminal gone */ }
+  };
+  process.on('exit', stop); // backstop for exits that bypass shutdown()
+  return stop;
 }
 
 // Best-effort: tell a running server (if any) to re-sync accounts from config so
