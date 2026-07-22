@@ -36,6 +36,21 @@ const routeColorFn = name => {
   return code ? (s => fg(code, s)) : cyan;
 };
 
+// Per-session coloring for the activity log: a stable color derived from the
+// session id lets you tell concurrent sessions apart at a glance. Palette avoids
+// red (error) and gray (timestamps); includes bright variants for separation.
+const SESSION_FG = [36, 35, 34, 33, 94, 95, 96, 93, 92];
+const SESSION_ID_LEN = 6; // first 6 hex chars — plenty to distinguish a handful
+function sessionColorCode(sid) {
+  let h = 0;
+  for (let i = 0; i < sid.length; i++) h = (h * 31 + sid.charCodeAt(i)) >>> 0;
+  return SESSION_FG[h % SESSION_FG.length];
+}
+// Fixed-width colored short id (blank-padded when there's no session, e.g. a
+// telemetry request), so the activity column stays aligned.
+const sessionTag = sid =>
+  sid ? fg(sessionColorCode(sid), sid.slice(0, SESSION_ID_LEN)) : ' '.repeat(SESSION_ID_LEN);
+
 // Which quota-family bar (F7/S7) a route binds to, or null for a general route.
 // Auto routes are named 'fable'/'sonnet'; a configured route is classified by its
 // globs so e.g. `*fable*` sits next to the F7 bar.
@@ -255,7 +270,8 @@ export class TUI {
     const dur = r ? ((Date.now() - r.started) / 1000).toFixed(1) : '?';
     const acct = info.account || r?.account || '?';
     const model = info.model ? ` (${info.model})` : ''; // shown when the request named a model
-    this._addLog(`${info.method} ${info.path}${model} → ${acct} (${info.status}, ${dur}s)`);
+    const sid = info.sessionId || r?.sessionId || null;
+    this._addLog(`${sessionTag(sid)} ${info.method} ${info.path}${model} → ${acct} (${info.status}, ${dur}s)`);
   }
 
   _addLog(msg) {
@@ -856,7 +872,7 @@ export class TUI {
       const sp = cyan(SPINNER[this.frame]);
       const m = r.model ? dim(` (${r.model})`) : ''; // filled in as soon as the model is peeked from the stream
       const a = r.account ? ` → ${r.account}` : '';
-      lines.push(` ${sp} ${gray(r.t)}  ${r.method} ${r.path}${m}${a} ${dim(`(${el}s...)`)}`);
+      lines.push(` ${sp} ${gray(r.t)}  ${sessionTag(r.sessionId)} ${r.method} ${r.path}${m}${a} ${dim(`(${el}s...)`)}`);
     }
 
     // Completed log

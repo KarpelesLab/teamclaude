@@ -194,7 +194,11 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       }
 
       const reqId = ++counter;
-      hooks.onRequestStart?.(reqId, { method: req.method, path: req.url });
+      // Claude Code tags each session's requests with this header (present on
+      // /v1/messages and count_tokens). Read from headers up front so it drives
+      // session-aware routing (issue #109) and colors the TUI activity stream.
+      const sessionId = req.headers['x-claude-code-session-id'] || null;
+      hooks.onRequestStart?.(reqId, { method: req.method, path: req.url, sessionId });
 
       // Buffer request body (needed to resend on a different account after a 429).
       // Peek the top-level `model` field incrementally as chunks arrive so the
@@ -216,10 +220,6 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // nested in tools[]; the advisor sub-inference runs on the selected
       // account, so selection must be eligible for it too (issue #98).
       const advisorModel = parseAdvisorModel(body);
-      // Claude Code tags each session's requests with this header (present on
-      // /v1/messages and count_tokens). Drives session-aware routing + the
-      // running-sessions readout (issue #109).
-      const sessionId = req.headers['x-claude-code-session-id'] || null;
       const ctx = { account: null, status: null, tried: new Set(), model, advisorModel, pinnedIndex, holdBudgetMs: holdMs, sessionId };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
@@ -236,7 +236,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         }
       } finally {
         accountManager.endSession(sessionId);
-        hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model });
+        hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, sessionId });
       }
     } catch (err) {
       console.error('[TeamClaude] Unhandled error:', err);
