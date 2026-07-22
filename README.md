@@ -39,7 +39,7 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 
 ## Quick Start
 
-Requires Node.js 18+.
+Requires Node.js 20+.
 
 ```bash
 # Install

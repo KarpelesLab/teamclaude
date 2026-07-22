@@ -13,8 +13,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Cover the whole supported range — package.json declares "node >=18".
-        node: [18, 20, 22, 24]
+        # Cover the whole supported range — package.json declares "node >=20".
+        node: [20, 22, 24]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
