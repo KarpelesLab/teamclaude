@@ -221,6 +221,10 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // running-sessions readout (issue #109).
       const sessionId = req.headers['x-claude-code-session-id'] || null;
       const ctx = { account: null, status: null, tried: new Set(), model, advisorModel, pinnedIndex, holdBudgetMs: holdMs, sessionId };
+      // Hold the session "in flight" across the WHOLE request (incl. retries and
+      // a multi-minute streaming completion) so it stays counted as active and
+      // never expires mid-request.
+      accountManager.beginSession(sessionId);
       try {
         await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir, sx);
       } catch (err) {
@@ -231,6 +235,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
           res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Internal proxy error' } }));
         }
       } finally {
+        accountManager.endSession(sessionId);
         hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model });
       }
     } catch (err) {

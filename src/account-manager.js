@@ -353,6 +353,17 @@ export class AccountManager {
     if (sessionId) this.sessionTracker.touch(sessionId, accountIndex);
   }
 
+  /** Mark a session request as in flight / finished. Paired around the whole
+   * client request (including retries) so a long streaming completion keeps the
+   * session counted as active for its full duration. */
+  beginSession(sessionId) {
+    if (sessionId) this.sessionTracker.beginRequest(sessionId);
+  }
+
+  endSession(sessionId) {
+    if (sessionId) this.sessionTracker.endRequest(sessionId);
+  }
+
   /** { known, active, perAccount } session counts for status/TUI. */
   sessionStats() {
     return this.sessionTracker.stats();

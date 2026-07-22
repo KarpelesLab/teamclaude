@@ -17,7 +17,7 @@ const SWEEP_INTERVAL_MS = 60 * 1000; // bound growth without an external timer
 
 export class SessionTracker {
   constructor({ knownTtlMs, activeTtlMs, now } = {}) {
-    // id -> { accountIndex, firstSeen, lastSeen, count }
+    // id -> { accountIndex, firstSeen, lastSeen, count, inFlight }
     this.sessions = new Map();
     this.knownTtlMs = knownTtlMs ?? SESSION_KNOWN_TTL_MS;
     this.activeTtlMs = activeTtlMs ?? SESSION_ACTIVE_TTL_MS;
@@ -31,11 +31,7 @@ export class SessionTracker {
   // even in a headless server that never renders status.
   touch(sessionId, accountIndex = null, now = this._now()) {
     if (!sessionId) return null;
-    let s = this.sessions.get(sessionId);
-    if (!s) {
-      s = { accountIndex, firstSeen: now, lastSeen: now, count: 0 };
-      this.sessions.set(sessionId, s);
-    }
+    const s = this._ensure(sessionId, now);
     s.lastSeen = now;
     s.count += 1;
     if (accountIndex != null) s.accountIndex = accountIndex;
@@ -43,12 +39,52 @@ export class SessionTracker {
     return s;
   }
 
+  // Mark a request for this session as started. A session with any request in
+  // flight counts as active (and non-expirable) for the whole request, however
+  // long it streams — a 5-minute completion must not drop out of "active" or the
+  // load balancer would under-count that account. Paired with endRequest.
+  beginRequest(sessionId, now = this._now()) {
+    if (!sessionId) return null;
+    const s = this._ensure(sessionId, now);
+    s.inFlight += 1;
+    s.lastSeen = now;
+    return s;
+  }
+
+  // Mark a request as finished (refreshes recency; releases the in-flight hold).
+  endRequest(sessionId, now = this._now()) {
+    const s = sessionId && this.sessions.get(sessionId);
+    if (!s) return;
+    s.inFlight = Math.max(0, s.inFlight - 1);
+    s.lastSeen = now;
+  }
+
+  _ensure(sessionId, now) {
+    let s = this.sessions.get(sessionId);
+    if (!s) {
+      s = { accountIndex: null, firstSeen: now, lastSeen: now, count: 0, inFlight: 0 };
+      this.sessions.set(sessionId, s);
+    }
+    return s;
+  }
+
+  // Active = a request in flight now, or one seen within the active window.
+  _isActive(s, now) {
+    return s.inFlight > 0 || now - s.lastSeen <= this.activeTtlMs;
+  }
+
+  // Expired = idle past the known window AND nothing in flight (a long-running
+  // request keeps the session alive no matter how old lastSeen is).
+  _isExpired(s, now) {
+    return s.inFlight === 0 && now - s.lastSeen > this.knownTtlMs;
+  }
+
   // The account a known (non-expired) session is pinned to, or null if the
   // session is unknown/forgotten. Expired-on-read entries are dropped.
   pinnedAccount(sessionId, now = this._now()) {
     const s = sessionId && this.sessions.get(sessionId);
     if (!s) return null;
-    if (now - s.lastSeen > this.knownTtlMs) {
+    if (this._isExpired(s, now)) {
       this.sessions.delete(sessionId);
       return null;
     }
@@ -56,20 +92,21 @@ export class SessionTracker {
   }
 
   // Active sessions currently pinned to `accountIndex` — the load metric used to
-  // spread new sessions across accounts.
+  // spread new sessions across accounts. Counts in-flight sessions regardless of
+  // how long their request has been streaming.
   activeCountFor(accountIndex, now = this._now()) {
     let n = 0;
     for (const s of this.sessions.values()) {
-      if (s.accountIndex === accountIndex && now - s.lastSeen <= this.activeTtlMs) n += 1;
+      if (s.accountIndex === accountIndex && this._isActive(s, now)) n += 1;
     }
     return n;
   }
 
-  // Drop sessions idle longer than the known window.
+  // Drop sessions idle longer than the known window (but never one still in flight).
   sweep(now = this._now()) {
     this._lastSweep = now;
     for (const [id, s] of this.sessions) {
-      if (now - s.lastSeen > this.knownTtlMs) this.sessions.delete(id);
+      if (this._isExpired(s, now)) this.sessions.delete(id);
     }
   }
 
@@ -81,13 +118,12 @@ export class SessionTracker {
     let active = 0;
     const perAccount = {};
     for (const [id, s] of this.sessions) {
-      const idle = now - s.lastSeen;
-      if (idle > this.knownTtlMs) {
+      if (this._isExpired(s, now)) {
         this.sessions.delete(id);
         continue;
       }
       known += 1;
-      if (idle <= this.activeTtlMs) {
+      if (this._isActive(s, now)) {
         active += 1;
         if (s.accountIndex != null) perAccount[s.accountIndex] = (perAccount[s.accountIndex] || 0) + 1;
       }

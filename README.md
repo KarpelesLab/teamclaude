@@ -292,7 +292,7 @@ Useful for overnight or unattended runs: rather than waking up to a stopped task
 
 ### Session-aware routing (distributeSessions, off by default)
 
-teamclaude always tracks running Claude Code sessions by their `x-claude-code-session-id` header — the TUI header and `teamclaude status` show how many are **active** (a request in the last ~2 min) and **known** (seen in the last hour; sessions are forgotten after an hour idle, the maximum prompt-cache extension window). This is passive: it observes, it doesn't change routing.
+teamclaude always tracks running Claude Code sessions by their `x-claude-code-session-id` header — the TUI header and `teamclaude status` show how many are **active** (a request in flight right now, or seen in the last ~2 min) and **known** (seen in the last hour; sessions are forgotten after an hour idle, the maximum prompt-cache extension window). A long streaming request keeps its session active and non-expirable for its whole duration, so a multi-minute completion still counts as load. This is passive: it observes, it doesn't change routing.
 
 Default rotation is purely quota-driven, so many parallel sessions all pile onto the *current* account while equal-priority siblings sit idle — one account queues behind its upstream concurrency ceiling while others do nothing ([#109](https://github.com/KarpelesLab/teamclaude/issues/109)). Enable `distributeSessions` to fix that:
 
