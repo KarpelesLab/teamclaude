@@ -639,6 +639,19 @@ async function runCommand() {
     process.exit(1);
   }
 
+  // If holdSeconds is set, ensure API_TIMEOUT_MS on the Claude Code side is
+  // large enough for the hold to complete. Add 60s padding (one extra poll
+  // cycle) so the client doesn't time out while we're still waiting.
+  // Claude Code defaults API_TIMEOUT_MS to 600000ms (10 min) when unset, so
+  // use that as the baseline to avoid accidentally lowering the timeout.
+  const holdMs = (config.holdSeconds || 0) * 1000;
+  if (holdMs > 0) {
+    const needed = holdMs + 60_000;
+    const API_TIMEOUT_DEFAULT_MS = 600_000;
+    const current = parseInt(env.API_TIMEOUT_MS || '0', 10) || API_TIMEOUT_DEFAULT_MS;
+    if (current < needed) env.API_TIMEOUT_MS = String(needed);
+  }
+
   // Use spawnSync so the Node process blocks entirely — behaves like execvp.
   const result = spawnSync('claude', claudeArgs, {
     stdio: 'inherit',
