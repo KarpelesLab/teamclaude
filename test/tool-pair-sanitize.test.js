@@ -54,6 +54,17 @@ test('strips a tail tool_use that has no tool_result and drops the emptied turn'
   assert.equal(body.messages[0].role, 'user');
 });
 
+test('a tool-free body is a same-Buffer no-op via the fast path (never parsed)', () => {
+  const original = buf({
+    model: 'claude',
+    messages: [
+      { role: 'user', content: 'just a plain question' },
+      { role: 'assistant', content: [{ type: 'text', text: 'a plain answer' }] },
+    ],
+  });
+  assert.equal(sanitizeToolPairs(original, MESSAGES, JSON_CT), original);
+});
+
 test('well-formed body is returned as the same Buffer instance (no reserialize)', () => {
   const original = buf({
     model: 'claude',

@@ -26,6 +26,15 @@
 
 const MESSAGES_PATH = '/v1/messages';
 
+// A tool_use / tool_result block type can only appear in the body as one of
+// these exact JSON substrings. If NEITHER is present there is nothing this pass
+// could ever prune, so we can skip the (potentially multi-hundred-KB) JSON.parse
+// and tree walk entirely — a cheap Buffer scan on the hot path instead. A false
+// positive (the literal text appearing inside some string content) only costs an
+// unnecessary parse that still returns the same Buffer, so it stays correct.
+const TOOL_USE_MARKER = Buffer.from('"tool_use"');
+const TOOL_RESULT_MARKER = Buffer.from('"tool_result"');
+
 // Is this a JSON /v1/messages (or /v1/messages/count_tokens) request we can
 // reason about? Everything else (token refreshes, GETs, non-JSON) is left alone.
 function isMessagesRequest(url, contentType) {
@@ -162,6 +171,8 @@ function pruneOrphans(messages) {
 export function sanitizeToolPairs(body, url, contentType) {
   if (!Buffer.isBuffer(body) || body.length === 0) return body;
   if (!isMessagesRequest(url, contentType)) return body;
+  // Fast path: no tool block markers at all → nothing to prune, skip the parse.
+  if (!body.includes(TOOL_USE_MARKER) && !body.includes(TOOL_RESULT_MARKER)) return body;
 
   let payload;
   try {
