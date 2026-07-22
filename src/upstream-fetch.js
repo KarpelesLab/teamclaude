@@ -9,9 +9,27 @@
 // `status`, `headers.get()/.entries()`, `text()`, `arrayBuffer()`, and `body`
 // (a web ReadableStream, so streamResponse()'s getReader()/cancel() is untouched).
 
+import http from 'node:http';
 import https from 'node:https';
 import { Readable } from 'node:stream';
 import { tunnelTls } from './sx.js';
+
+// Pooled keep-alive agents for the direct (non-sx) path. Node's global fetch
+// multiplexes ALL requests to an origin over a SINGLE HTTP/2 connection; under
+// many concurrent large uploads (Claude Code POSTs ~1MB of context per turn)
+// that one connection serializes on HTTP/2's shared flow-control windows —
+// api.anthropic.com advertises maxConcurrentStreams=100 (not the limit) but only
+// a 64KB initial window, so concurrent uploads queue behind WINDOW_UPDATEs and a
+// trivial request can wait minutes for headers (issue #106). Independent HTTP/1.1
+// connections have no application-layer flow control: each upload fills its own
+// socket at TCP speed, exactly like N direct Claude Code processes. keep-alive
+// reuses idle sockets (Node unrefs them, so they don't hold the process open);
+// maxSockets is per-origin and bounds the fan-out. Escape hatch:
+// TEAMCLAUDE_UPSTREAM_GLOBAL_FETCH=1 reverts to the old global-fetch path.
+const MAX_SOCKETS = Number(process.env.TEAMCLAUDE_UPSTREAM_MAX_SOCKETS) || 256;
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: MAX_SOCKETS });
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: MAX_SOCKETS });
+const USE_GLOBAL_FETCH = /^(1|true|yes|on)$/i.test(process.env.TEAMCLAUDE_UPSTREAM_GLOBAL_FETCH || '');
 
 // Time to wait for RESPONSE HEADERS before treating the upstream socket as dead.
 // This is NOT a limit on the response body (SSE completions can stream for
@@ -67,13 +85,22 @@ function headersTimeoutError(ms) {
 export function upstreamFetch(url, opts = {}, sx = null, useProxy = false) {
   const { headersTimeoutMs, ...fetchOpts } = opts;
   const timeoutMs = resolveHeadersTimeout(headersTimeoutMs);
-  if (!sx || !useProxy || !sx.isProvisioned()) return directFetch(url, fetchOpts, timeoutMs);
-  return proxiedFetch(url, fetchOpts, sx, timeoutMs);
+  if (sx && useProxy && sx.isProvisioned()) return proxiedFetch(url, fetchOpts, sx, timeoutMs);
+  return USE_GLOBAL_FETCH ? directFetch(url, fetchOpts, timeoutMs) : pooledFetch(url, fetchOpts, timeoutMs);
 }
 
-// Global fetch driven by our own AbortController so we can arm a headers-only
-// deadline and disarm it the moment headers arrive (letting the body stream with
-// no deadline). AbortSignal.timeout can't do this — it would also kill the body.
+// Default direct path: HTTP/1.1 over a pooled keep-alive agent, so N concurrent
+// requests use N connections instead of serializing over one h2 connection (#106).
+function pooledFetch(url, opts, timeoutMs) {
+  const u = new URL(url);
+  const isHttp = u.protocol === 'http:';
+  return nodeRequest(u, opts, timeoutMs, { transport: isHttp ? http : https, agent: isHttp ? httpAgent : httpsAgent });
+}
+
+// Legacy direct path (escape hatch): Node global fetch, driven by our own
+// AbortController so we can arm a headers-only deadline and disarm it the moment
+// headers arrive (letting the body stream with no deadline). AbortSignal.timeout
+// can't do this — it would also kill the body.
 function directFetch(url, opts, timeoutMs) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(headersTimeoutError(timeoutMs)), timeoutMs);
@@ -84,14 +111,13 @@ function directFetch(url, opts, timeoutMs) {
   );
 }
 
+// sx path: every socket is a fresh TLS connection tunneled through sx.org. The
+// agent is created per request (its createConnection closes over this call's
+// target), so keep-alive would give no reuse — it would only park the tunneled
+// socket in a soon-orphaned pool and leak an open sx.org connection per request.
 function proxiedFetch(url, opts, sx, timeoutMs) {
   const u = new URL(url);
   const proxy = sx.getProxy();
-
-  // Custom agent: every socket is a TLS connection tunneled through sx.org. This
-  // agent is created per request (its createConnection closes over this call's
-  // target), so keep-alive would give no reuse — it would only park the tunneled
-  // socket in a soon-orphaned pool and leak an open sx.org connection per request.
   const agent = new https.Agent({ keepAlive: false });
   agent.createConnection = (_options, cb) => {
     // sx.tlsOptions is undefined in production (system CAs verify api.anthropic.com);
@@ -101,14 +127,18 @@ function proxiedFetch(url, opts, sx, timeoutMs) {
       .catch((err) => cb(err));
     return undefined; // socket delivered asynchronously via cb
   };
+  return nodeRequest(u, opts, timeoutMs, { transport: https, agent });
+}
 
+// Shared node:http(s) request → the fetch-Response subset server.js uses, with
+// the headers-only deadline: it fires before headers arrive and tears the request
+// down; it is cleared the instant the response starts, so a body that streams for
+// minutes is never cut. `req` is created BEFORE the timer so a synchronous
+// throw (e.g. an invalid client header) can't leave a scheduled timer that later
+// fires against an uninitialized binding.
+function nodeRequest(u, opts, timeoutMs, { transport, agent }) {
   return new Promise((resolve, reject) => {
-    // Headers-only deadline (same as the direct path): fires before headers
-    // arrive and tears the tunneled request down; cleared once the response
-    // starts. `req` is created BEFORE the timer so a synchronous https.request
-    // throw (e.g. an invalid client header) can't leave a scheduled timer that
-    // fires later and dereferences an uninitialized binding.
-    const req = https.request(
+    const req = transport.request(
       u,
       { method: opts.method || 'GET', headers: opts.headers || {}, agent },
       (res) => { clearTimeout(timer); resolve(makeResponse(res)); },

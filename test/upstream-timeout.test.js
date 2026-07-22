@@ -91,46 +91,59 @@ test('does not cut a slow body once headers have arrived', async () => {
 // one chunk then goes silent; the second read must fail fast with a transient
 // TEAMCLAUDE_BODY_TIMEOUT (which server.js treats as retryable) rather than hang.
 test('body watchdog fails fast when the stream goes silent mid-body', async () => {
-  const stream = new ReadableStream({
-    start(controller) {
-      controller.enqueue(new TextEncoder().encode('event: ping\n\n'));
-      // never enqueue again and never close — a mid-stream network drop
-    },
-  });
-  const reader = stream.getReader();
+  // readWithIdleTimeout's watchdog is unref'd (in production the listening socket
+  // keeps the loop alive; here this test has no socket of its own), so hold a
+  // ref'd handle for the test's duration or the loop can drain before it fires.
+  const alive = setInterval(() => {}, 60_000);
+  try {
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('event: ping\n\n'));
+        // never enqueue again and never close — a mid-stream network drop
+      },
+    });
+    const reader = stream.getReader();
 
-  // First chunk is already buffered: resolves immediately, no timeout.
-  const first = await readWithIdleTimeout(reader, 200);
-  assert.equal(first.done, false);
-  assert.equal(new TextDecoder().decode(first.value), 'event: ping\n\n');
+    // First chunk is already buffered: resolves immediately, no timeout.
+    const first = await readWithIdleTimeout(reader, 200);
+    assert.equal(first.done, false);
+    assert.equal(new TextDecoder().decode(first.value), 'event: ping\n\n');
 
-  // Second read: the stream is silent, so the watchdog fires fast.
-  const start = Date.now();
-  await assert.rejects(
-    () => readWithIdleTimeout(reader, 200),
-    (err) => err.code === 'TEAMCLAUDE_BODY_TIMEOUT',
-  );
-  const elapsed = Date.now() - start;
-  assert.ok(elapsed < 2000, `expected fast body-timeout, took ${elapsed}ms`);
+    // Second read: the stream is silent, so the watchdog fires fast.
+    const start = Date.now();
+    await assert.rejects(
+      () => readWithIdleTimeout(reader, 200),
+      (err) => err.code === 'TEAMCLAUDE_BODY_TIMEOUT',
+    );
+    const elapsed = Date.now() - start;
+    assert.ok(elapsed < 2000, `expected fast body-timeout, took ${elapsed}ms`);
+  } finally {
+    clearInterval(alive);
+  }
 });
 
 // The watchdog must not fire on a healthy-but-slow stream: a chunk that arrives
 // within the window resets nothing artificially — it simply resolves.
 test('body watchdog does not fire when chunks keep arriving', async () => {
-  let pushed = false;
-  const stream = new ReadableStream({
-    pull(controller) {
-      if (pushed) { controller.close(); return; }
-      pushed = true;
-      return new Promise((resolve) => setTimeout(() => {
-        controller.enqueue(new TextEncoder().encode('event: ok\n\n'));
-        resolve();
-      }, 100));
-    },
-  });
-  const reader = stream.getReader();
+  const alive = setInterval(() => {}, 60_000); // see note above: keep the loop alive
+  try {
+    let pushed = false;
+    const stream = new ReadableStream({
+      pull(controller) {
+        if (pushed) { controller.close(); return; }
+        pushed = true;
+        return new Promise((resolve) => setTimeout(() => {
+          controller.enqueue(new TextEncoder().encode('event: ok\n\n'));
+          resolve();
+        }, 100));
+      },
+    });
+    const reader = stream.getReader();
 
-  const r = await readWithIdleTimeout(reader, 500); // 100ms chunk < 500ms window
-  assert.equal(r.done, false);
-  assert.match(new TextDecoder().decode(r.value), /ok/);
+    const r = await readWithIdleTimeout(reader, 500); // 100ms chunk < 500ms window
+    assert.equal(r.done, false);
+    assert.match(new TextDecoder().decode(r.value), /ok/);
+  } finally {
+    clearInterval(alive);
+  }
 });
