@@ -20,7 +20,7 @@ import tls from 'node:tls';
 import http2 from 'node:http2';
 import { getConfigPath } from './config.js';
 import { generateCertChain } from './x509.js';
-import { createProxyRequestListener, safeKeyEqual, isLoopbackAddr } from './server.js';
+import { createProxyRequestListener, safeKeyEqual, isLoopbackAddr, relayUpgrade } from './server.js';
 
 const CA_CERT = 'teamclaude-ca.pem';
 const LEAF_CERT = 'teamclaude-leaf.pem';
@@ -126,6 +126,11 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
     const { key, cert } = await ensureLeaf();
     const srv = http2.createSecureServer({ key, cert, allowHTTP1: true });
     srv.on('request', forward);
+    // Remote Control's real-time channel is a WebSocket (Upgrade handshake),
+    // which never fires 'request' — only 'upgrade', with a raw socket instead
+    // of a response object (h1-only; falls back to blind h2 passthrough is not
+    // needed since WS clients negotiate h1 for the handshake).
+    srv.on('upgrade', (req, socket, head) => relayUpgrade(req, socket, head, upstream, sx));
     srv.on('sessionError', (e) => log(`[TeamClaude] MITM session error: ${e.message}`));
     srv.on('clientError', (e, sock) => { try { sock.destroy(); } catch { /* already gone */ } });
     return srv;

@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_dispatch:
   push:
     branches: [master]
   pull_request:
@@ -33,18 +34,37 @@ jobs:
         if: matrix.node == 24
         run: npm run lint
 
+  nix:
+    name: nix package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Flake check (package build + NixOS module VM test)
+        run: nix flake check --no-update-lock-file -L
+
+      - name: Smoke test the CLI wrapper
+        run: nix run --no-update-lock-file .#teamclaude -- help
+
   # Single stable status check for branch protection to require, independent of
-  # how many Node versions the matrix runs. Always runs and fails explicitly if
-  # any matrix job did not succeed (so it is never silently "skipped").
+  # how many implementation jobs run. Always runs and fails explicitly if any
+  # required job did not succeed (so it is never silently "skipped").
   test:
     name: test
-    needs: node
+    needs: [node, nix]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: Check matrix result
-        if: needs.node.result != 'success'
+      - name: Check job results
+        if: needs.node.result != 'success' || needs.nix.result != 'success'
         run: |
-          echo "Node matrix did not pass: ${{ needs.node.result }}"
+          echo "Node job result: ${{ needs.node.result }}"
+          echo "Nix package result: ${{ needs.nix.result }}"
           exit 1
-      - run: echo "All Node matrix jobs passed"
+      - run: echo "All required jobs passed"

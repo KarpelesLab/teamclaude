@@ -1,14 +1,17 @@
 import http from 'node:http';
+import https from 'node:https';
 import { timingSafeEqual } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { ensureCerts, createConnectHandler } from './mitm.js';
 import { patchAccountUuid } from './account-uuid-rewrite.js';
+import { sanitizeToolPairs } from './tool-pair-sanitize.js';
 import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
 import { TopLevelFieldFinder } from './model.js';
 import { BodyWriter } from './request-log.js';
 import { upstreamFetch } from './upstream-fetch.js';
+import { tunnelTls } from './sx.js';
 
 
 export const HOP_BY_HOP_HEADERS = new Set([
@@ -123,6 +126,11 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
     return { key: c.leafKeyPem, cert: c.leafCertPem };
   };
   server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks, log: console.error, sx }));
+  // Remote Control's real-time channel is a WebSocket, not a request/response
+  // call — Node fires 'upgrade' for that handshake, never 'request', so it
+  // needs its own listener (base-URL routing path; the MITM path wires the
+  // same relayUpgrade onto its own terminating server in mitm.js).
+  server.on('upgrade', (req, socket, head) => relayUpgrade(req, socket, head, upstream, sx));
 
   return server;
 }
@@ -226,17 +234,31 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
   };
 }
 
-/**
- * Stream a request through to upstream with the client's OWN headers intact
- * (including its authorization) and stream the response back — used for Remote
- * Control (/v1/code/*), whose event stream must keep the paired credential and
- * cannot be buffered.
- */
-async function relayStream(req, res, upstream, sx) {
-  const bodyChunks = [];
-  for await (const chunk of req) bodyChunks.push(chunk);
-  const body = Buffer.concat(bodyChunks);
+// Per-request https.Agent tunneled through sx.org — one-shot (no keep-alive
+// reuse, matching upstream-fetch.js's proxiedFetch), so a fresh sx tunnel is
+// dialed for this connection only.
+function sxAgent(sx, targetHost) {
+  const proxy = sx.getProxy();
+  const agent = new https.Agent({ keepAlive: false });
+  agent.createConnection = (_options, cb) => {
+    tunnelTls({ proxy, targetHost, targetPort: 443, tlsOptions: sx.tlsOptions || {} })
+      .then((sock) => cb(null, sock))
+      .catch((err) => cb(err));
+    return undefined;
+  };
+  return agent;
+}
 
+/**
+ * Relay a request to upstream with the client's OWN headers intact (including
+ * its authorization) — used for Remote Control (/v1/code/*), whose event
+ * stream is a long-poll: the client keeps the request open indefinitely and
+ * the upstream may withhold response headers for minutes between events. No
+ * buffering, no timeout, no reconstruction — just pipe bytes both ways as they
+ * arrive, exactly like a transparent proxy would.
+ */
+function relayStream(req, res, upstream, sx) {
+  const target = new URL(`${upstream}${req.url}`);
   const headers = {};
   for (const [key, value] of Object.entries(req.headers)) {
     const lk = key.toLowerCase();
@@ -244,28 +266,89 @@ async function relayStream(req, res, upstream, sx) {
     headers[key] = value;
   }
 
-  try {
-    const upstreamRes = await upstreamFetch(`${upstream}${req.url}`, {
-      method: req.method, headers,
-      body: ['GET', 'HEAD'].includes(req.method) ? undefined : (body.length ? body : undefined),
-      redirect: 'manual',
-    }, sx, sx?.useByDefault());
+  const useProxy = !!(sx?.useByDefault() && sx.isProvisioned());
+  const agent = useProxy ? sxAgent(sx, target.hostname) : undefined;
+  const transport = target.protocol === 'http:' ? http : https;
 
+  const upstreamReq = transport.request(target, { method: req.method, headers, agent }, (upstreamRes) => {
     const responseHeaders = {};
-    for (const [key, value] of upstreamRes.headers.entries()) {
+    for (const [key, value] of Object.entries(upstreamRes.headers)) {
       if (CONNECTION_SPECIFIC_HEADERS.has(key) || key === 'content-encoding' || key === 'content-length') continue;
       responseHeaders[key] = value;
     }
-    res.writeHead(upstreamRes.status, responseHeaders);
-    if (upstreamRes.body) { for await (const chunk of upstreamRes.body) res.write(chunk); }
-    res.end();
-  } catch (err) {
+    res.writeHead(upstreamRes.statusCode, responseHeaders);
+    upstreamRes.pipe(res);
+  });
+
+  upstreamReq.on('error', (err) => {
     console.error('[TeamClaude] Remote Control relay error:', err.message);
     if (!res.headersSent) {
       res.writeHead(502, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Upstream unreachable' } }));
     }
+  });
+  // Client disconnected (e.g. Claude Code closed the channel): tear down the
+  // upstream side too instead of leaking an open connection.
+  res.on('close', () => upstreamReq.destroy());
+
+  if (['GET', 'HEAD'].includes(req.method)) upstreamReq.end();
+  else req.pipe(upstreamReq);
+}
+
+/**
+ * Relay a WebSocket upgrade (e.g. Remote Control's real-time
+ * `/v1/session_ingress/ws/*` channel) to upstream with the client's own
+ * headers intact. An HTTP server never emits 'request' for an Upgrade
+ * handshake — only 'upgrade', with a raw socket instead of a response object —
+ * so this needs its own relay rather than going through relayStream/res.
+ * Reuses Node's http(s) client, which already knows how to speak the Upgrade
+ * handshake (emits its own 'upgrade' event on a 101); once that fires it's
+ * just two raw sockets spliced together.
+ */
+export function relayUpgrade(req, socket, head, upstream, sx) {
+  const target = new URL(`${upstream}${req.url}`);
+  const headers = {};
+  for (const [key, value] of Object.entries(req.headers)) {
+    const lk = key.toLowerCase();
+    // Unlike relayStream, do NOT strip 'upgrade'/'connection' here — they ARE
+    // the handshake. Only 'host' (the client transport reconstructs it from
+    // `target`) and h2 pseudo-headers are dropped.
+    if (lk.startsWith(':') || lk === 'host') continue;
+    headers[key] = value;
   }
+
+  const useProxy = !!(sx?.useByDefault() && sx.isProvisioned());
+  const agent = useProxy ? sxAgent(sx, target.hostname) : undefined;
+  const transport = target.protocol === 'http:' ? http : https;
+
+  const upstreamReq = transport.request(target, { method: req.method, headers, agent });
+
+  upstreamReq.on('upgrade', (upstreamRes, upstreamSocket, upstreamHead) => {
+    const headerLines = Object.entries(upstreamRes.headers)
+      .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(', ') : v}`).join('\r\n');
+    socket.write(`HTTP/1.1 ${upstreamRes.statusCode} ${upstreamRes.statusMessage}\r\n${headerLines}\r\n\r\n`);
+    if (upstreamHead?.length) socket.write(upstreamHead);
+    if (head?.length) upstreamSocket.write(head);
+    socket.pipe(upstreamSocket);
+    upstreamSocket.pipe(socket);
+    // An upgraded socket defaults to half-open: the peer's FIN only ends the
+    // READABLE side ('end'), it does NOT destroy the socket or fire 'close' —
+    // so without this, one side hanging up (dropped wifi, killed CLI) leaves
+    // the other socket open forever. destroy() is idempotent, so reacting to
+    // both 'end' and 'close' on each side is a safe, redundant backstop.
+    socket.on('end', () => upstreamSocket.destroy());
+    upstreamSocket.on('end', () => socket.destroy());
+    socket.on('close', () => upstreamSocket.destroy());
+    upstreamSocket.on('close', () => socket.destroy());
+  });
+
+  upstreamReq.on('error', (err) => {
+    console.error('[TeamClaude] Remote Control WebSocket relay error:', err.message);
+    socket.destroy();
+  });
+  socket.on('error', () => upstreamReq.destroy());
+
+  upstreamReq.end();
 }
 
 /**
@@ -438,14 +521,19 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   const upstreamUrl = `${account.upstream || upstream}${req.url}`;
   const method = req.method;
 
+  // Strip orphaned tool_use / tool_result blocks so a client that compacted or
+  // interrupted a turn can't wedge the session with Anthropic's non-retryable
+  // 400 ("tool_use ids were found without tool_result blocks"). No-op (same
+  // Buffer) for a well-formed body.
+  let sendBody = sanitizeToolPairs(body, req.url, req.headers['content-type']);
   // Align the body's account_uuid (in metadata.user_id) with the account whose
   // token we're injecting (same-length patch; no-op if absent).
-  let sendBody = account.accountUuid ? patchAccountUuid(body, account.accountUuid) : body;
+  if (account.accountUuid) sendBody = patchAccountUuid(sendBody, account.accountUuid);
   // Rewrite the model name for accounts that target a different upstream (e.g.
   // GLM), which uses different model identifiers than Anthropic.
   if (account.modelMap) sendBody = rewriteModel(sendBody, account.modelMap);
-  // If the body changed length (model name rewrite), update Content-Length so the
-  // upstream doesn't receive a mismatched framing and truncate or stall.
+  // If the body changed length (sanitize or model rewrite), update Content-Length
+  // so the upstream doesn't receive a mismatched framing and truncate or stall.
   if (sendBody !== body) headers['content-length'] = String(sendBody.length);
 
   // Streaming request log, opened lazily on the first terminal outcome (a
