@@ -8,7 +8,7 @@ import { ensureCerts, createConnectHandler } from './mitm.js';
 import { patchAccountUuid } from './account-uuid-rewrite.js';
 import { sanitizeToolPairs } from './tool-pair-sanitize.js';
 import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
-import { TopLevelFieldFinder } from './model.js';
+import { TopLevelFieldFinder, modelGlobMatches } from './model.js';
 import { BodyWriter } from './request-log.js';
 import { upstreamFetch } from './upstream-fetch.js';
 import { tunnelTls } from './sx.js';
@@ -286,6 +286,22 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // nested in tools[]; the advisor sub-inference runs on the selected
       // account, so selection must be eligible for it too (issue #98).
       const advisorModel = parseAdvisorModel(body);
+
+      // Model blocklist (issue #116): reject a request for a blocked model right
+      // here instead of forwarding it. A model no account can serve (e.g. Fable
+      // once it left base plans) otherwise gets rate-limited upstream and hangs
+      // the pipeline; a fast, non-retryable 400 lets the client move on. Read
+      // live from the shared config so the TUI editor takes effect immediately.
+      const blockedBy = model ? (config?.blockedModels || []).find((p) => modelGlobMatches(p, model)) : null;
+      if (blockedBy) {
+        if (!res.headersSent) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: `Model "${model}" is blocked by teamclaude (matched "${blockedBy}").` } }));
+        }
+        hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: '(blocked)', status: 400, model, sessionId });
+        return;
+      }
+
       const ctx = { account: null, status: null, tried: new Set(), model, advisorModel, pinnedIndex, holdBudgetMs: holdMs, sessionId };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and

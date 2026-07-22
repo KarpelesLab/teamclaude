@@ -139,6 +139,38 @@ test('Event logging setting cycles show → hide → block and writes config', a
   assert.equal(config.eventLogging, 'block');
 });
 
+test('Blocked models editor: add a glob then delete it, persisting each change', async () => {
+  const { tui, config } = makeTUI();
+  openSettingsRow(tui, 'blocklist');
+  assert.equal(tui.mode, 'blocklist');
+
+  tui._key('a'); // add
+  assert.equal(tui.mode, 'input');
+  type(tui, '*fable*');
+  tui._key('enter');
+  await settle();
+  assert.deepEqual(config.blockedModels, ['*fable*']);
+  assert.equal(tui.mode, 'blocklist');
+
+  tui._key('d'); // delete the selected entry
+  await settle();
+  assert.deepEqual(config.blockedModels, []);
+
+  tui._key('esc');
+  assert.equal(tui.mode, 'settings');
+});
+
+test('Blocked models editor: a duplicate glob is not added twice', async () => {
+  const { tui, config } = makeTUI();
+  config.blockedModels = ['*fable*'];
+  openSettingsRow(tui, 'blocklist');
+  tui._key('a');
+  type(tui, '*fable*');
+  tui._key('enter');
+  await settle();
+  assert.deepEqual(config.blockedModels, ['*fable*']);
+});
+
 test('select mode entered from the dashboard still returns to normal', () => {
   const { tui } = makeTUI();
   tui._key('d'); // enable/disable selector from normal mode

@@ -190,6 +190,7 @@ export class TUI {
     this.selRoute = null;    // in switch mode: null = global default, else a getRoutes() entry to pin
     this.selReturn = 'normal'; // mode to fall back to when select mode closes
     this.setIdx = 0;         // cursor row on the settings screen (BIOS-style nav)
+    this.blockIdx = 0;       // cursor row on the blocked-models editor
     this.inputPrompt = '';
     this.inputBuf = '';
     this.inputCb = null;
@@ -308,6 +309,7 @@ export class TUI {
       case 'input':  this._keyInput(k); break;
       case 'settings': this._keySettings(k); break;
       case 'routes': this._keyRoutes(k); break;
+      case 'blocklist': this._keyBlocklist(k); break;
     }
     this.render();
   }
@@ -382,6 +384,17 @@ export class TUI {
         return n ? green(`${n} route${n === 1 ? '' : 's'}`) : gray('none');
       },
       enter: () => { this.mode = 'routes'; this.routeIdx = 0; },
+    });
+
+    fields.push({
+      id: 'blocklist',
+      label: 'Blocked models',
+      hint: 'Enter to edit',
+      value: () => {
+        const n = (this.config.blockedModels || []).length;
+        return n ? red(`${n} blocked`) : gray('none');
+      },
+      enter: () => { this.mode = 'blocklist'; this.blockIdx = 0; },
     });
 
     fields.push({
@@ -851,6 +864,8 @@ export class TUI {
       this._renderSettings(lines);
     } else if (view === 'routes') {
       this._renderRoutes(lines);
+    } else if (view === 'blocklist') {
+      this._renderBlocklist(lines);
     } else {
     // ── Accounts
     if (this.am.accounts.length === 0) {
@@ -1180,6 +1195,64 @@ export class TUI {
     if (this.running) this.render();
   }
 
+  _keyBlocklist(k) {
+    const list = this.config.blockedModels || [];
+    const n = list.length;
+    if (this.blockIdx >= n) this.blockIdx = Math.max(0, n - 1);
+    if ((k === 'up' || k === 'k') && n) this.blockIdx = (this.blockIdx - 1 + n) % n;
+    else if ((k === 'down' || k === 'j') && n) this.blockIdx = (this.blockIdx + 1) % n;
+    else if (k === 'a') this._blocklistAdd();
+    else if (k === 'd' && n) this._blocklistDelete(this.blockIdx);
+    else if (k === 'esc' || k === 'q') { this.mode = 'settings'; this.setIdx = 0; }
+  }
+
+  // Prompt for a model glob and add it to the blocklist, staying on the editor.
+  _blocklistAdd() {
+    this.mode = 'input';
+    this.inputReturn = 'blocklist';
+    this.inputPrompt = 'Block model glob (e.g. *fable*)';
+    this.inputBuf = '';
+    this.inputCb = v => this._doBlocklistAdd((v || '').trim());
+  }
+
+  async _doBlocklistAdd(pat) {
+    if (!pat) { this._addLog('Blocklist add cancelled'); return; }
+    this.config.blockedModels = this.config.blockedModels || [];
+    if (this.config.blockedModels.includes(pat)) { this._addLog(`"${pat}" already blocked`); return; }
+    this.config.blockedModels.push(pat);
+    this.blockIdx = this.config.blockedModels.length - 1;
+    try { await this.saveConfig(this.config); this._addLog(`Blocked model "${pat}"`); }
+    catch (e) { this._addLog(`Failed to save: ${e.message}`); }
+    if (this.running) this.render();
+  }
+
+  async _blocklistDelete(idx) {
+    const list = this.config.blockedModels || [];
+    const pat = list[idx];
+    if (pat == null) return;
+    list.splice(idx, 1);
+    this.blockIdx = Math.max(0, Math.min(idx, list.length - 1));
+    try { await this.saveConfig(this.config); this._addLog(`Unblocked "${pat}"`); }
+    catch (e) { this._addLog(`Failed to save: ${e.message}`); }
+    if (this.running) this.render();
+  }
+
+  _renderBlocklist(lines) {
+    const list = this.config.blockedModels || [];
+    lines.push('');
+    lines.push(bold('  Blocked models') + dim('  — requests whose model matches a glob are rejected, not forwarded'));
+    lines.push('');
+    if (!list.length) {
+      lines.push(gray('    Nothing blocked. Press [a] to add a glob (e.g. *fable*).'));
+    } else {
+      list.forEach((pat, i) => {
+        const sel = i === this.blockIdx;
+        const cursor = sel ? cyan('▸') : ' ';
+        lines.push(`   ${cursor} ${red('✗')} ${sel ? bold(pat) : pat}`);
+      });
+    }
+  }
+
   _renderRoutes(lines) {
     const routes = this.config.routes || [];
     lines.push('');
@@ -1218,6 +1291,8 @@ export class TUI {
         return ` ${dim('↑↓')} navigate  ${dim('←→')} change  ${bold('Enter')} edit  ${bold('Esc')} back`;
       case 'routes':
         return ` ${dim('↑↓')} select  ${bold('a')}dd  ${bold('e')}dit  ${bold('d')}elete  ${bold('Esc')} back`;
+      case 'blocklist':
+        return ` ${dim('↑↓')} select  ${bold('a')}dd  ${bold('d')}elete  ${bold('Esc')} back`;
       case 'select': {
         if (this.selAction === 'switch') {
           const target = this.selRoute

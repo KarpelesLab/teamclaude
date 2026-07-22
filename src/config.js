@@ -49,6 +49,7 @@ export function createDefaultConfig() {
     holdSeconds: 0,
     distributeSessions: false,
     eventLogging: 'hide',
+    blockedModels: [],
     accounts: [],
   };
 }
