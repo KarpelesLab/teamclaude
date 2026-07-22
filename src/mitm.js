@@ -114,7 +114,7 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
   const upstream = config.upstream || 'https://api.anthropic.com';
   const proxyApiKey = config.proxy?.apiKey;
   const holdMs = (config.holdSeconds || 0) * 1000;
-  const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs });
+  const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config });
 
   // One terminating h2/h1 server, minted lazily on the first intercepted CONNECT.
   // TLS uses our leaf; ALPN negotiates h2 or http/1.1 (allowHTTP1) with whatever

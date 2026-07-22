@@ -109,7 +109,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
     }
   };
 
-  const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs });
+  const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config });
   const server = http.createServer(requestHandler);
 
   // Forward-proxy support (always on, so multiple claude instances can use
@@ -160,10 +160,23 @@ const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/files/', '/api/oauth/f
  * aware routing, and retry-on-quota behavior. Control endpoints (status/reload)
  * and the proxy-API-key gate live in the base server's wrapper, not here.
  */
-export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0 }) {
+export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {} }) {
   let counter = 0;
   return async (req, res) => {
     try {
+      // Claude Code's telemetry (`/api/event_logging/*`) is high-volume noise in
+      // the activity log. `config.eventLogging` (read live so the TUI toggle takes
+      // effect immediately): 'show' forwards + displays; 'hide' (default) forwards
+      // but suppresses the activity entry; 'block' answers 200 locally without
+      // forwarding (no upstream round-trip, no account/token spent).
+      const eventLogging = config?.eventLogging || 'hide';
+      const isEventLog = (req.url || '').startsWith('/api/event_logging');
+      if (isEventLog && eventLogging === 'block') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end('{}');
+        return;
+      }
+      const hideActivity = isEventLog && eventLogging !== 'show';
       // Client token refresh: pass through untouched (the proxy manages its own
       // tokens via ensureTokenFresh; rewriting client refreshes would conflict).
       if (req.method === 'POST' && req.url === '/v1/oauth/token') { await relayRaw(req, res, upstream, sx); return; }
@@ -198,7 +211,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // /v1/messages and count_tokens). Read from headers up front so it drives
       // session-aware routing (issue #109) and colors the TUI activity stream.
       const sessionId = req.headers['x-claude-code-session-id'] || null;
-      hooks.onRequestStart?.(reqId, { method: req.method, path: req.url, sessionId });
+      if (!hideActivity) hooks.onRequestStart?.(reqId, { method: req.method, path: req.url, sessionId });
 
       // Buffer request body (needed to resend on a different account after a 429).
       // Peek the top-level `model` field incrementally as chunks arrive so the
@@ -210,7 +223,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         bodyChunks.push(chunk);
         if (!modelFinder.done) {
           const found = modelFinder.push(chunk);
-          if (found) hooks.onRequestModel?.(reqId, { model: found });
+          if (found && !hideActivity) hooks.onRequestModel?.(reqId, { model: found });
         }
       }
       const body = Buffer.concat(bodyChunks);
@@ -236,7 +249,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         }
       } finally {
         accountManager.endSession(sessionId);
-        hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, sessionId });
+        if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, sessionId });
       }
     } catch (err) {
       console.error('[TeamClaude] Unhandled error:', err);

@@ -36,10 +36,11 @@ const type = (tui, s) => { for (const ch of s) tui._key(ch); };
 const settle = () => new Promise(r => setTimeout(r, 5)); // let async save finish
 
 // Routing lives under the settings screen (g → "Manage routing"): open settings,
-// move the cursor to the routes row (threshold, probe, routes), press Enter.
+// move the cursor to the routes row by id (robust to added fields), press Enter.
 function openRoutes(tui) {
   tui._key('g');
-  tui._key('down'); tui._key('down');
+  const idx = tui._settingsFields().findIndex(f => f.id === 'routes');
+  for (let i = 0; i < idx; i++) tui._key('down');
   tui._key('enter');
 }
 

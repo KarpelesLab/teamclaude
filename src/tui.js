@@ -359,6 +359,21 @@ export class TUI {
     });
 
     fields.push({
+      id: 'eventlog',
+      label: 'Event logging',
+      hint: '←→ cycle',
+      value: () => {
+        const m = this.config.eventLogging || 'hide';
+        return m === 'show' ? green('show')
+          : m === 'block' ? red('block')
+          : gray('hide');
+      },
+      left: () => this._cycleEventLogging(-1),
+      right: () => this._cycleEventLogging(+1),
+      enter: () => this._cycleEventLogging(+1),
+    });
+
+    fields.push({
       id: 'routes',
       label: 'Manage routing',
       hint: 'Enter to open',
@@ -650,6 +665,18 @@ export class TUI {
     const r = await this.sx.setMode(next);
     this._addLog(`sx.org mode: ${this._sxModeLabel(next)}${r.ok ? '' : ` — ${r.error}`}`);
     if (next !== 'off') this._loadSxBalance();
+    if (this.running) this.render();
+  }
+
+  async _cycleEventLogging(dir = 1) {
+    // Claude Code telemetry display/handling: show → hide → block → show.
+    const order = ['show', 'hide', 'block'];
+    const cur = this.config.eventLogging || 'hide';
+    const next = order[(order.indexOf(cur) + dir + order.length) % order.length];
+    this.config.eventLogging = next; // shared config object; the server reads it live
+    try { await this.saveConfig(this.config); }
+    catch (e) { this._addLog(`Failed to save: ${e.message}`); }
+    this._addLog(`Event logging: ${next}`);
     if (this.running) this.render();
   }
 
