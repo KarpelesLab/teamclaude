@@ -74,6 +74,12 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
         return;
       }
 
+      // Forward-proxy request (HTTP_PROXY): an absolute-form URL means a tool
+      // running alongside teamclaude (gh, curl, npm…) is proxying plain HTTP to a
+      // third-party host. Blind-relay it there — Anthropic traffic is never
+      // absolute-form here, so this only ever sees third-party hosts.
+      if (/^https?:\/\//i.test(req.url || '')) { relayHttpForward(req, res); return; }
+
       // Status endpoint
       if (req.method === 'GET' && req.url === '/teamclaude/status') {
         const status = accountManager.getStatus();
@@ -151,6 +157,50 @@ export function resolveAccountPin(accountManager, token) {
 
 // Paths that must reach upstream with the client's own credential (never a
 // rotated account token): the Remote Control channel and attachment transfers.
+// A plain-HTTP forward-proxy request (via HTTP_PROXY) arrives in ABSOLUTE form —
+// `GET http://host/path` — whereas an Anthropic request is always origin-form
+// (`/v1/messages`, via ANTHROPIC_BASE_URL or a CONNECT tunnel). teamclaude is a
+// general forward proxy for tools running alongside it (gh, curl, npm…); the
+// HTTPS equivalent is the CONNECT tunnel in mitm.js. Blind-relay it to its target
+// with the client's own headers — no account selection, no token injection, and
+// content-encoding passed through untouched (a transparent proxy).
+export function relayHttpForward(req, res) {
+  let target;
+  try { target = new URL(req.url); } catch {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'Malformed forward-proxy URL' } }));
+    return;
+  }
+  const transport = target.protocol === 'http:' ? http : https;
+  const headers = {};
+  for (const [key, value] of Object.entries(req.headers)) {
+    const lk = key.toLowerCase();
+    // Drop hop-by-hop + proxy-control headers; `host` is reset from the target.
+    if (lk.startsWith(':') || HOP_BY_HOP_HEADERS.has(lk) || lk === 'proxy-connection') continue;
+    headers[key] = value;
+  }
+
+  const upstreamReq = transport.request(target, { method: req.method, headers }, (upstreamRes) => {
+    const responseHeaders = {};
+    for (const [key, value] of Object.entries(upstreamRes.headers)) {
+      if (CONNECTION_SPECIFIC_HEADERS.has(key)) continue;
+      responseHeaders[key] = value;
+    }
+    res.writeHead(upstreamRes.statusCode, responseHeaders);
+    upstreamRes.pipe(res);
+  });
+  upstreamReq.on('error', (err) => {
+    console.error(`[TeamClaude] HTTP forward to ${target.host} failed:`, err.message);
+    if (!res.headersSent) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Upstream unreachable' } }));
+    }
+  });
+  res.on('close', () => upstreamReq.destroy());
+  if (['GET', 'HEAD'].includes(req.method)) upstreamReq.end();
+  else req.pipe(upstreamReq);
+}
+
 const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/files/', '/api/oauth/file_upload'];
 
 /**
