@@ -786,7 +786,11 @@ export class TUI {
     // ── Header
     const left = bold(' TeamClaude');
     const port = this.config.proxy?.port || 3456;
-    const right = `Port ${port} ${green('▲')} `;
+    const sess = this.am.sessionStats();
+    const sessStr = (sess.active || sess.known)
+      ? `${sess.active} sess${this.am.distributeSessions ? green(' dist') : ''}  `
+      : '';
+    const right = `${sessStr}Port ${port} ${green('▲')} `;
     lines.push(left + ' '.repeat(Math.max(1, W - vw(left) - vw(right))) + right);
     lines.push(' ' + dim('─'.repeat(W - 2)));
 

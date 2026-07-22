@@ -216,7 +216,11 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // nested in tools[]; the advisor sub-inference runs on the selected
       // account, so selection must be eligible for it too (issue #98).
       const advisorModel = parseAdvisorModel(body);
-      const ctx = { account: null, status: null, tried: new Set(), model, advisorModel, pinnedIndex, holdBudgetMs: holdMs };
+      // Claude Code tags each session's requests with this header (present on
+      // /v1/messages and count_tokens). Drives session-aware routing + the
+      // running-sessions readout (issue #109).
+      const sessionId = req.headers['x-claude-code-session-id'] || null;
+      const ctx = { account: null, status: null, tried: new Set(), model, advisorModel, pinnedIndex, holdBudgetMs: holdMs, sessionId };
       try {
         await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir, sx);
       } catch (err) {
@@ -444,7 +448,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // and the caller gets the exhausted response rather than leaking to another.
   const account = ctx.pinnedIndex != null
     ? (ctx.tried.has(ctx.pinnedIndex) ? null : accountManager.accounts[ctx.pinnedIndex])
-    : accountManager.getActiveAccount(ctx.tried, ctx.model, ctx.advisorModel);
+    : accountManager.getActiveAccount(ctx.tried, ctx.model, ctx.advisorModel, ctx.sessionId);
   if (!account) {
     // A pinned request concerns exactly one account: don't compute a fleet-wide
     // retry-after or sleep on other accounts' windows — return immediately.
@@ -505,6 +509,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
 
   // Track which account handles this request
   ctx.account = account.name;
+  // Pin this session to the serving account (for affinity) and keep it "active"
+  // in the running-sessions readout. Passive when distribution is off.
+  accountManager.recordSession(ctx.sessionId, account.index);
   hooks.onRequestRouted?.(reqId, { account: account.name });
 
   // Refresh OAuth token if needed

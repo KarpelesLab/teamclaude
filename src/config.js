@@ -47,6 +47,7 @@ export function createDefaultConfig() {
     upstream: 'https://api.anthropic.com',
     switchThreshold: 0.98,
     holdSeconds: 0,
+    distributeSessions: false,
     accounts: [],
   };
 }

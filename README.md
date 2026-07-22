@@ -27,6 +27,7 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 - **Enable/disable accounts** — temporarily pause an account without removing it (`teamclaude disable`/`enable`, or `d` in the TUI); re-enabling also clears a stuck error state
 - **Quota persistence** — observed quota survives restarts (saved to a sibling state file), so rotation state isn't lost on restart; stale windows are discarded automatically
 - **Hold on exhaustion** — when all accounts are spent, `holdSeconds` keeps the HTTP connection open and polls silently until quota resets, so long-running Claude Code tasks continue automatically instead of aborting with a 429
+- **Session awareness** — tracks running Claude Code sessions (by their session id) and shows how many are active; opt into `distributeSessions` to spread concurrent sessions across accounts while keeping each one pinned for cache reuse
 - **Optional quota probe** — off by default; when enabled, periodically refreshes idle accounts' quota from the usage endpoint (no message spend), and surfaces the Sonnet and Fable weekly buckets
 - **Optional keep-warm** — off by default; when enabled, periodically starts idle accounts' 5h session timers with a minimal request (`teamclaude warmup`) so the next account isn't cold when rotation reaches it (spends a little quota, unlike the probe)
 - **Account pinning** — force a request onto one account via an `ANTHROPIC_BASE_URL=.../tc-acct/<name>` prefix, bypassing rotation
@@ -289,6 +290,18 @@ Set it in the config file (`~/.config/teamclaude.json`):
 
 Useful for overnight or unattended runs: rather than waking up to a stopped task, the session resumes silently once a quota window opens.
 
+### Session-aware routing (distributeSessions, off by default)
+
+teamclaude always tracks running Claude Code sessions by their `x-claude-code-session-id` header — the TUI header and `teamclaude status` show how many are **active** (a request in the last ~2 min) and **known** (seen in the last hour; sessions are forgotten after an hour idle, the maximum prompt-cache extension window). This is passive: it observes, it doesn't change routing.
+
+Default rotation is purely quota-driven, so many parallel sessions all pile onto the *current* account while equal-priority siblings sit idle — one account queues behind its upstream concurrency ceiling while others do nothing ([#109](https://github.com/KarpelesLab/teamclaude/issues/109)). Enable `distributeSessions` to fix that:
+
+```json
+"distributeSessions": true
+```
+
+When on, teamclaude routes each **new** session to the least-loaded eligible account (fewest active sessions, then fewest in-flight) and **pins** it there, so a session keeps hitting the same account and preserves its prompt cache — while different sessions spread across accounts instead of funnelling onto one. Account **priority still wins** (a higher-priority account is never skipped to balance load), and a session whose account becomes exhausted re-routes automatically. Off by default; single-session use is unaffected either way.
+
 ### Config format
 
 ```json
@@ -326,6 +339,7 @@ Useful for overnight or unattended runs: rather than waking up to a stopped task
 | `quotaProbeSeconds` | Background quota-probe interval in seconds (`0` = off, the default; CLI `probe` or TUI `g` → `p`) |
 | `warmupSeconds` | Keep-warm interval in seconds (`0` = off, the default; CLI `warmup`). Spawns a minimal `claude` per idle account to start its 5h timer — **spends a little quota**, unlike the probe |
 | `holdSeconds` | Maximum seconds to hold the connection when all accounts are exhausted, polling silently until one recovers (`0` = return 429 immediately, the default). `teamclaude run` raises `API_TIMEOUT_MS` automatically to match |
+| `distributeSessions` | Spread concurrent Claude Code sessions across equal-priority accounts, each session pinned to one account for cache reuse (`false` = quota-driven rotation only, the default). Session tracking/readout is always on regardless — see [Session-aware routing](#session-aware-routing-distributesessions-off-by-default) |
 | `stormRamp` | Optional storm-control tuning (on by default) — see [Storm control](#storm-control-switchover-ramp-up). Object: `{ enabled, startConc, stepConc, stepMs, windowMs }` |
 | `sx.apiKey` | [sx.org](https://sx.org) API key. When set, TeamClaude auto-provisions a residential proxy (egress-IP 429 workaround). Absent/empty = off |
 | `sx.mode` | `always` (route all upstream traffic), `429` (direct, fail over to the proxy after a 429), or `off` (keep the key but don't use it). Defaults to `always` when a key is set |

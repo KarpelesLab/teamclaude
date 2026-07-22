@@ -11,6 +11,9 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
   lines.push(paint.bold('TeamClaude status'));
   lines.push(`${paint.dim('Active'.padEnd(12))} ${paint.cyan(status.currentAccount || 'none')}`);
   lines.push(`${paint.dim('Switch at'.padEnd(12))} ${formatPercent(status.switchThreshold)}`);
+  if (status.sessions) {
+    lines.push(`${paint.dim('Sessions'.padEnd(12))} ${formatSessions(status.sessions, paint)}`);
+  }
   lines.push(`${paint.dim('Probe'.padEnd(12))} ${formatProbeSummary(probe, now, paint)}`);
   if (warm.enabled) {
     lines.push(`${paint.dim('Keep-warm'.padEnd(12))} ${formatProbeSummary(warm, now, paint)}`);
@@ -87,7 +90,16 @@ function renderAccountHeader(account, currentAccount, paint, now) {
   const name = current ? paint.bold(account.name) : account.name;
   const status = formatAccountStatus(account, now, paint);
   const org = account.orgName ? ` ${paint.dim(account.orgName)}` : '';
-  return `${marker} ${name} ${paint.dim(`(${account.type}, prio ${account.priority || 0})`)} ${status}${org}`;
+  const sess = account.sessions ? ` ${paint.dim(`${account.sessions} sess`)}` : '';
+  return `${marker} ${name} ${paint.dim(`(${account.type}, prio ${account.priority || 0})`)} ${status}${org}${sess}`;
+}
+
+// "2 active / 3 known · distributing" — the running-sessions readout.
+function formatSessions(sessions, paint) {
+  const active = sessions.active || 0;
+  const known = sessions.known || 0;
+  const mode = sessions.distribute ? paint.green('distributing') : paint.dim('single-account');
+  return `${active} active / ${known} known ${paint.dim('·')} ${mode}`;
 }
 
 function formatAccountStatus(account, now, paint) {

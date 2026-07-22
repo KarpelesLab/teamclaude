@@ -1,6 +1,7 @@
 import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired } from './oauth.js';
 import { sameIdentity } from './identity.js';
 import { weeklyBucketForModel, modelGlobMatches } from './model.js';
+import { SessionTracker } from './session-tracker.js';
 
 // Re-exported for callers that import these model helpers from here.
 export { isFableModel, parseRequestModel, parseAdvisorModel } from './model.js';
@@ -89,12 +90,19 @@ function modelMatches(declared, model) {
 }
 
 export class AccountManager {
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, throttleProbeFloorMs, routes, ramp } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, throttleProbeFloorMs, routes, ramp, distributeSessions = false, sessionTracker } = {}) {
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
     // OAuth token refresh.
     this._refreshFn = refreshFn;
     this.accounts = accounts.map((acct, index) => makeAccount(acct, index));
     this.currentIndex = 0;
+    // Session awareness (issue #109). The tracker is always on (passive — it just
+    // observes the x-claude-code-session-id header for the status readout).
+    // `distributeSessions` gates the behavioural change: keep each session on its
+    // account for cache reuse, but spread NEW sessions across equal-priority
+    // accounts by load instead of funnelling them all onto the current one.
+    this.sessionTracker = sessionTracker || new SessionTracker();
+    this.distributeSessions = !!distributeSessions;
     // Ephemeral per-route manual pins (routeName → account index). Not persisted:
     // like the global manual switch (currentIndex) these are runtime overrides that
     // bias selection for a route's models and reset on restart. A pinned account
@@ -213,11 +221,20 @@ export class AccountManager {
    * satisfies both, selection degrades to executor-only routing so the main
    * request keeps flowing (upstream then fails just the advisor call).
    */
-  getActiveAccount(exclude = null, model = null, advisorModel = null) {
+  getActiveAccount(exclude = null, model = null, advisorModel = null, sessionId = null) {
     // Clear expired quotas across all accounts and switch proactively if a
     // session reset made a sooner-expiring account the better choice. This runs
     // on every request so the behaviour holds without the TUI render loop.
     this.refreshExpiredQuotas();
+    // Session-affinity distribution (opt-in): keep a session on its pinned
+    // account for cache reuse, and route a new session to the least-loaded
+    // account. Only when enabled, only for a real session, and only outside a
+    // manual route pin (which must still win). Falls through to the normal walk
+    // if nothing session-eligible is found (e.g. the whole tier is exhausted).
+    if (this.distributeSessions && sessionId && !this._pinnedAccountForModel(model, advisorModel)) {
+      const acc = this._selectForSession(sessionId, exclude, model, advisorModel);
+      if (acc) return acc;
+    }
     if (advisorModel) {
       const account = this._select(exclude, model, advisorModel, false);
       if (account) return account;
@@ -276,6 +293,71 @@ export class AccountManager {
     return allowProbe ? this._selectProbe(exclude, model) : null;
   }
 
+  /** Session-affinity selection (opt-in, issue #109). Honor a known session's
+   * pin when that account is still eligible and not preempted by a
+   * higher-priority one; otherwise route the session to the least-loaded
+   * eligible account. Returns null if nothing is eligible, so the caller falls
+   * back to the normal quota-driven walk. Does NOT record the pin — that happens
+   * on the actual route (recordSession), so retries/failover re-pin naturally. */
+  _selectForSession(sessionId, exclude, model, advisorModel) {
+    const pinIdx = this.sessionTracker.pinnedAccount(sessionId);
+    if (pinIdx != null) {
+      const pinned = this.accounts[pinIdx];
+      if (pinned && this._isAvailable(pinned, model, advisorModel) && !exclude?.has(pinIdx)) {
+        // Mirror _select's priority preemption so an operator's priority order
+        // still wins over a session's stickiness.
+        const betterExists = this.accounts.some(a =>
+          this._isAvailable(a, model, advisorModel) && !exclude?.has(a.index) && (a.priority || 0) < (pinned.priority || 0));
+        if (!betterExists) return pinned;
+      }
+    }
+    return this._pickLeastLoaded(exclude, model, advisorModel);
+  }
+
+  /** Best-available biased toward the fewest active sessions, so new sessions
+   * spread across equal-priority accounts instead of funnelling onto one. Order:
+   * priority → fewest active sessions → fewest in-flight → soonest weekly reset
+   * (the existing tiebreak). */
+  _pickLeastLoaded(exclude = null, model = null, advisorModel = null) {
+    const now = Date.now();
+    let best = null;
+    let bestPriority = Infinity;
+    let bestSessions = Infinity;
+    let bestInFlight = Infinity;
+    let bestReset = Infinity;
+    for (const account of this.accounts) {
+      if (exclude?.has(account.index)) continue;
+      if (!this._isAvailable(account, model, advisorModel)) continue;
+      const priority = account.priority || 0;
+      const sessions = this.sessionTracker.activeCountFor(account.index, now);
+      const inFlight = account.inFlight || 0;
+      const reset = this._governingWeeklyReset(account, model) || -Infinity;
+      if (priority < bestPriority
+        || (priority === bestPriority && sessions < bestSessions)
+        || (priority === bestPriority && sessions === bestSessions && inFlight < bestInFlight)
+        || (priority === bestPriority && sessions === bestSessions && inFlight === bestInFlight && reset < bestReset)) {
+        best = account;
+        bestPriority = priority;
+        bestSessions = sessions;
+        bestInFlight = inFlight;
+        bestReset = reset;
+      }
+    }
+    return best;
+  }
+
+  /** Record that a session's request was served by an account (always on, even
+   * when distribution is off — the readout is passive). This is what pins a
+   * session for future affinity. */
+  recordSession(sessionId, accountIndex) {
+    if (sessionId) this.sessionTracker.touch(sessionId, accountIndex);
+  }
+
+  /** { known, active, perAccount } session counts for status/TUI. */
+  sessionStats() {
+    return this.sessionTracker.stats();
+  }
+
   /**
    * Like getActiveAccount, but if the selected account's OAuth token has ALREADY
    * expired it blocks on a refresh before returning — so a caller that injects
@@ -283,8 +365,8 @@ export class AccountManager {
    * 401. A token that is merely expiring soon (still valid) is left to the
    * caller's opportunistic background refresh; only a hard-expired one blocks.
    */
-  async getActiveAccountFresh(exclude = null, model = null, advisorModel = null) {
-    const account = this.getActiveAccount(exclude, model, advisorModel);
+  async getActiveAccountFresh(exclude = null, model = null, advisorModel = null, sessionId = null) {
+    const account = this.getActiveAccount(exclude, model, advisorModel, sessionId);
     if (account && account.type === 'oauth' && account.refreshToken
         && isTokenExpired(account.expiresAt)) {
       await this.ensureTokenFresh(account.index); // coalesces with any in-flight refresh
@@ -1181,10 +1263,12 @@ export class AccountManager {
    * Return a status summary of all accounts (safe to expose, no credentials).
    */
   getStatus() {
+    const sessions = this.sessionTracker.stats();
     return {
       currentAccount: this.accounts[this.currentIndex]?.name,
       switchThreshold: this.switchThreshold,
       routes: this.getRoutes(),
+      sessions: { ...sessions, distribute: this.distributeSessions },
       accounts: this.accounts.map(a => ({
         name: a.name,
         type: a.type,
@@ -1192,6 +1276,7 @@ export class AccountManager {
         priority: a.priority || 0,
         disabled: a.disabled || false,
         status: a.status,
+        sessions: sessions.perAccount[a.index] || 0,
         quota: { ...a.quota },
         usage: { ...a.usage },
         rateLimitedUntil: a.rateLimitedUntil

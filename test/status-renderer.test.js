@@ -35,6 +35,20 @@ test('renderStatus prints core status', () => {
   assert.match(output, /2 req, 1.5k tok/);
 });
 
+test('renderStatus shows the sessions line and per-account session count when present', () => {
+  const status = sampleStatus();
+  status.sessions = { known: 3, active: 2, perAccount: { 0: 2 }, distribute: true };
+  status.accounts[0].sessions = 2;
+  const output = renderStatus(status, { color: false, now });
+  assert.match(output, /Sessions\s+2 active \/ 3 known · distributing/);
+  assert.match(output, /a \(oauth, prio 0\).*2 sess/);
+});
+
+test('renderStatus omits the sessions line when the status has no sessions field', () => {
+  const output = renderStatus(sampleStatus(), { color: false, now });
+  assert.doesNotMatch(output, /Sessions\s/);
+});
+
 test('renderStatus colors active accounts and bars', () => {
   const output = renderStatus(sampleStatus(), { color: true, now });
 
