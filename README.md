@@ -154,12 +154,29 @@ Since **1.1.0**, `run` defaults to [MITM forward-proxy mode](#mitm-proxy-mode-de
 teamclaude run --no-mitm
 ```
 
-Or manually set the environment:
+Or set the environment yourself with `teamclaude env`, which prints the same
+export lines `run` uses — MITM forward-proxy by default (`--no-mitm` for
+base-URL only):
 
 ```bash
-eval $(teamclaude env)
+eval "$(teamclaude env)"           # MITM: HTTPS_PROXY + NODE_EXTRA_CA_CERTS
+eval "$(teamclaude env --no-mitm)" # base-URL: ANTHROPIC_BASE_URL only
 claude
 ```
+
+Only the export lines go to stdout (so `eval` is safe); a short summary and any
+hints go to stderr. No `ANTHROPIC_API_KEY` is emitted — loopback clients are
+exempt from the proxy key gate, and setting it would drop Claude Code out of
+subscription mode. A remote (non-loopback) client must add the proxy key itself.
+
+**Using an agent multiplexer or a tool that spawns `claude` itself?** Point it at
+the proxy by exporting this env in the process that launches those `claude`
+instances — e.g. `eval "$(teamclaude env)"` in the shell you start the
+multiplexer from. That gives every spawned `claude` the same routing (and MITM
+interception of hardcoded endpoints like the Claude Design MCP) without going
+through `teamclaude run`. The trade-off: `run`'s proxy-up/down guard only applies
+when you launch via `run`, so start the server (`teamclaude server`) before the
+multiplexer.
 
 ### Routing plain `claude` automatically (alias)
 

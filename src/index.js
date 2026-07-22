@@ -17,6 +17,7 @@ import { TUI } from './tui.js';
 import { SxManager } from './sx.js';
 import { autoUpdate, checkForUpdate, currentVersion, runUpdate, installKind, PKG_NAME } from './updater.js';
 import { renderStatus } from './status-renderer.js';
+import { buildClaudeEnvLines } from './claude-env.js';
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -581,10 +582,39 @@ async function loginOAuthCommand() {
 
 // ── env ─────────────────────────────────────────────────────
 
+// `teamclaude env [--no-mitm]` — print the export lines that point Claude Code
+// at the proxy, for `eval "$(teamclaude env)"`. Mirrors `teamclaude run`'s
+// environment (MITM forward-proxy by default; --no-mitm for base-URL only) so a
+// tool that spawns claude itself — an agent multiplexer, a CI job, a manual
+// shell — gets the same routing without going through `run`. Only the export
+// lines go to stdout; all guidance goes to stderr so the output stays eval-safe.
 async function envCommand() {
-  const config = await loadOrCreateConfig();
-  console.log(`export ANTHROPIC_BASE_URL=http://localhost:${config.proxy.port}`);
-  console.log(`export ANTHROPIC_API_KEY=${config.proxy.apiKey}`);
+  // Use loadConfig (not loadOrCreateConfig): a query command must never write to
+  // stdout — creating a config prints "Created config at …", which would poison
+  // `eval "$(teamclaude env)"` — nor silently create config as a side effect.
+  const config = await loadConfig();
+  if (!config) {
+    process.stderr.write(`No config found at ${getConfigPath()}. Add an account first: teamclaude login\n`);
+    process.exit(1);
+  }
+  const port = config.proxy.port;
+  const useMitm = !args.slice(1).includes('--no-mitm');
+
+  let caPath = null;
+  if (useMitm) ({ caPath } = await ensureCerts(upstreamHost(config)));
+
+  const lines = buildClaudeEnvLines({ port, useMitm, caPath, holdSeconds: config.holdSeconds });
+  process.stdout.write(`${lines.join('\n')}\n`);
+
+  const mode = useMitm ? 'MITM forward-proxy' : 'base-URL';
+  process.stderr.write(`# TeamClaude env: ${mode} mode, localhost:${port}\n`);
+  process.stderr.write(`# apply to this shell:  eval "$(teamclaude env${useMitm ? '' : ' --no-mitm'})"\n`);
+  if (!(await isProxyUp(port))) {
+    process.stderr.write(`# note: proxy not running on port ${port} — start it with: teamclaude server\n`);
+  }
+  if (config.proxy?.apiKey) {
+    process.stderr.write(`# remote (non-loopback) clients must also present the proxy key: ANTHROPIC_API_KEY=<proxy.apiKey> (base-URL), or http://<key>@host:${port} (MITM)\n`);
+  }
 }
 
 // ── run ─────────────────────────────────────────────────────
@@ -1196,7 +1226,10 @@ Commands:
   import              Import credentials from Claude Code
   login               OAuth login via browser
   login --api         Add an API key account
-  env                 Print env vars to use with Claude
+  env [--no-mitm]     Print export lines to point Claude Code at the proxy, for
+                      'eval "$(teamclaude env)"' (MITM forward-proxy by default;
+                      --no-mitm for base-URL only). Handy for agent multiplexers
+                      that spawn claude themselves instead of via 'teamclaude run'
   run [--no-mitm] [--auto-fallback] [-- args...]
                       Run Claude Code through the proxy (errors if it's down,
                       unless --auto-fallback launches claude directly instead).
