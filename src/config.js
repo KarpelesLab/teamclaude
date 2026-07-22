@@ -48,6 +48,7 @@ export function createDefaultConfig() {
     switchThreshold: 0.98,
     holdSeconds: 0,
     distributeSessions: false,
+    eventLogging: 'hide',
     accounts: [],
   };
 }
