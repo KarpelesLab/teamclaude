@@ -53,6 +53,9 @@
         teamclaude = {
           type = "app";
           program = "${self.packages.${system}.teamclaude}/bin/teamclaude";
+          meta = {
+            inherit (self.packages.${system}.teamclaude.meta) description;
+          };
         };
         default = self.apps.${system}.teamclaude;
       });
