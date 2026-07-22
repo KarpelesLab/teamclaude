@@ -11,7 +11,7 @@
 
 import http from 'node:http';
 import https from 'node:https';
-import { Readable } from 'node:stream';
+import { ReadableStream } from 'node:stream/web';
 import { tunnelTls } from './sx.js';
 
 // Pooled keep-alive agents for the direct (non-sx) path. Node's global fetch
@@ -22,9 +22,8 @@ import { tunnelTls } from './sx.js';
 // a 64KB initial window, so concurrent uploads queue behind WINDOW_UPDATEs and a
 // trivial request can wait minutes for headers (issue #106). Independent HTTP/1.1
 // connections have no application-layer flow control: each upload fills its own
-// socket at TCP speed, exactly like N direct Claude Code processes. keep-alive
-// reuses idle sockets (Node unrefs them, so they don't hold the process open);
-// maxSockets is per-origin and bounds the fan-out. Escape hatch:
+// socket at TCP speed, exactly like N direct Claude Code processes. maxSockets is
+// per-origin and bounds the fan-out. Escape hatch:
 // TEAMCLAUDE_UPSTREAM_GLOBAL_FETCH=1 reverts to the old global-fetch path.
 const MAX_SOCKETS = Number(process.env.TEAMCLAUDE_UPSTREAM_MAX_SOCKETS) || 256;
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: MAX_SOCKETS });
@@ -155,9 +154,41 @@ function nodeRequest(u, opts, timeoutMs, { transport, agent }) {
   });
 }
 
+// Adapt a Node IncomingMessage to a web ReadableStream. Done by hand rather than
+// Readable.toWeb because that adapter double-closes the controller on Node 18
+// (ERR_INVALID_STATE "Controller is already closed" when the socket's 'close'
+// fires after 'end'), which crashes the process. The `closed` guard makes close
+// idempotent; backpressure via pause/resume so a slow consumer doesn't buffer the
+// whole (possibly minutes-long) stream in memory.
+function nodeToWeb(res) {
+  let closed = false;
+  const close = (controller) => {
+    if (closed) return;
+    closed = true;
+    try { controller.close(); } catch { /* already closed / consumer gone */ }
+  };
+  return new ReadableStream({
+    start(controller) {
+      res.on('data', (chunk) => {
+        try { controller.enqueue(chunk); } catch { return; }
+        if (controller.desiredSize != null && controller.desiredSize <= 0) res.pause();
+      });
+      res.on('end', () => close(controller));
+      res.on('close', () => close(controller));
+      res.on('error', (err) => {
+        if (closed) return;
+        closed = true;
+        try { controller.error(err); } catch { /* consumer gone */ }
+      });
+    },
+    pull() { res.resume(); },
+    cancel() { res.destroy(); },
+  });
+}
+
 // Wrap a Node IncomingMessage as the subset of a fetch Response that server.js uses.
 function makeResponse(res) {
-  const web = Readable.toWeb(res); // single web stream — one consumer either way
+  const web = nodeToWeb(res); // single web stream — one consumer either way
   const collect = async () => {
     const chunks = [];
     const reader = web.getReader();
