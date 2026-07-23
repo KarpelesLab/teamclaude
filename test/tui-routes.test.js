@@ -56,12 +56,20 @@ test('TUI routes editor: add walks name → glob → accounts → bucket and per
   type(tui, 'fable'); tui._key('enter');
   assert.match(tui.inputPrompt, /glob/);
   type(tui, '*fable*'); tui._key('enter');
-  assert.match(tui.inputPrompt, /Accounts/);
-  type(tui, 'b'); tui._key('enter');
-  assert.match(tui.inputPrompt, /bucket/i);
-  tui._key('enter'); // blank bucket → color prompt
-  assert.match(tui.inputPrompt, /color/i);
-  tui._key('enter'); // blank color → save
+
+  // accounts: a checklist now — highlight b (index 1), toggle it on, confirm
+  assert.equal(tui.mode, 'pick');
+  assert.equal(tui.pick.multi, true);
+  tui._key('down'); tui._key(' '); tui._key('enter');
+
+  // bucket: single-select, default "auto" (blank) → Enter keeps it
+  assert.equal(tui.mode, 'pick');
+  assert.equal(tui.pick.multi, false);
+  tui._key('enter');
+
+  // color: single-select, default → Enter keeps it, then saves
+  assert.equal(tui.mode, 'pick');
+  tui._key('enter');
   await settle();
 
   assert.deepEqual(config.routes, [{ name: 'fable', match: ['*fable*'], accounts: ['b'] }]);
@@ -79,7 +87,7 @@ test('TUI routes editor: a blank name cancels without creating a route', async (
   assert.equal(tui.mode, 'routes');
 });
 
-test('TUI routes editor: edit prefills, and backspace clears a field before retyping', async () => {
+test('TUI routes editor: edit prefills the pickers from the existing route', async () => {
   const { tui, config } = makeTUI();
   config.routes = [{ name: 'fable', match: ['*fable*'], accounts: ['b'] }];
 
@@ -88,10 +96,20 @@ test('TUI routes editor: edit prefills, and backspace clears a field before rety
   tui._key('enter');
   assert.equal(tui.inputBuf, '*fable*');         // glob prefilled
   tui._key('enter');
-  assert.equal(tui.inputBuf, 'b');               // accounts prefilled
-  tui._key('bs'); type(tui, 'a,b'); tui._key('enter');
-  type(tui, 'unified7dFable'); tui._key('enter');
-  type(tui, 'magenta'); tui._key('enter'); // color
+
+  // accounts picker preselects the current member (b); add a too
+  assert.equal(tui.mode, 'pick');
+  assert.deepEqual([...tui.pick.sel], ['b']);
+  tui._key(' ');                                 // toggle a (highlighted first) on
+  tui._key('enter');
+
+  // bucket picker → choose unified7dFable (index 2)
+  tui._key('down'); tui._key('down'); tui._key('enter');
+
+  // color picker → choose magenta
+  const ci = tui.pick.items.findIndex(it => it.value === 'magenta');
+  for (let i = 0; i < ci; i++) tui._key('down');
+  tui._key('enter');
   await settle();
 
   assert.deepEqual(config.routes, [
@@ -99,16 +117,16 @@ test('TUI routes editor: edit prefills, and backspace clears a field before rety
   ]);
 });
 
-test('TUI routes editor: an unknown color is dropped (route still saves)', async () => {
+test('TUI routes editor: defaults (all accounts, auto bucket, no color) omit those keys', async () => {
   const { tui, config } = makeTUI();
   openRoutes(tui); tui._key('a');
   type(tui, 'r'); tui._key('enter');           // name
   type(tui, '*opus*'); tui._key('enter');      // glob
-  tui._key('enter');                            // accounts (all)
-  tui._key('enter');                            // bucket (auto)
-  type(tui, 'chartreuse'); tui._key('enter');   // unknown color
+  tui._key('enter');                            // accounts: none selected → all
+  tui._key('enter');                            // bucket: auto
+  tui._key('enter');                            // color: default
   await settle();
-  assert.deepEqual(config.routes, [{ name: 'r', match: ['*opus*'] }]); // no color key
+  assert.deepEqual(config.routes, [{ name: 'r', match: ['*opus*'] }]); // no accounts/bucket/color keys
 });
 
 test('TUI switch mode: Tab targets a route and Enter pins the highlighted account', () => {

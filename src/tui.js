@@ -184,7 +184,9 @@ export class TUI {
 
     this.log = [];           // completed activity entries
     this.active = new Map(); // in-flight requests
-    this.mode = 'normal';    // normal | select | add | input | settings
+    this.mode = 'normal';    // normal | select | add | input | settings | pick
+    this.pick = null;        // active list picker (routes editor accounts/bucket/color)
+    this.pickReturn = 'routes'; // mode to fall back to when the picker closes
     this.selAction = null;   // switch | remove | toggle
     this.selIdx = 0;
     this.selRoute = null;    // in switch mode: null = global default, else a getRoutes() entry to pin
@@ -309,6 +311,7 @@ export class TUI {
       case 'input':  this._keyInput(k); break;
       case 'settings': this._keySettings(k); break;
       case 'routes': this._keyRoutes(k); break;
+      case 'pick': this._keyPick(k); break;
       case 'blocklist': this._keyBlocklist(k); break;
     }
     this.render();
@@ -864,6 +867,8 @@ export class TUI {
       this._renderSettings(lines);
     } else if (view === 'routes') {
       this._renderRoutes(lines);
+    } else if (view === 'pick') {
+      this._renderPick(lines);
     } else if (view === 'blocklist') {
       this._renderBlocklist(lines);
     } else {
@@ -1130,6 +1135,107 @@ export class TUI {
     this.inputCb = v => cb((v || '').trim());
   }
 
+  // A modal list picker used by the routes editor so fixed-choice fields are
+  // selected rather than typed. `multi` gives a checkbox multi-select (Space
+  // toggles, Enter confirms the set); otherwise it's single-select (Enter picks
+  // the highlighted row). `cb` receives the chosen value(s). Esc/q cancels
+  // without calling cb — which, like the text prompts, abandons the whole edit.
+  _openPicker({ title, hint, items, multi, selected, cb }) {
+    this.mode = 'pick';
+    this.pickReturn = 'routes';
+    this.pick = {
+      title, hint, items, multi, cb,
+      idx: multi ? 0 : Math.max(0, items.findIndex(it => it.value === (selected || ''))),
+      sel: new Set(multi ? (selected || []) : []),
+    };
+  }
+
+  // Checklist of the loaded accounts. Preselects the route's current members;
+  // selecting none means "all accounts" (route.accounts is then omitted).
+  _pickAccounts(preselected, cb) {
+    this._openPicker({
+      title: 'Route accounts',
+      hint: 'Space toggles — none selected = all accounts',
+      multi: true,
+      selected: preselected,
+      items: this.am.accounts.map(a => ({ label: a.name, value: a.name })),
+      cb,
+    });
+  }
+
+  // Which weekly quota bucket meters the route (auto = pick by model family).
+  _pickBucket(current, cb) {
+    this._openPicker({
+      title: 'Quota bucket',
+      hint: 'weekly bucket this route is metered against',
+      multi: false,
+      selected: current,
+      items: [
+        { label: 'auto (by model family)', value: '' },
+        { label: 'unified7d (shared weekly)', value: 'unified7d' },
+        { label: 'unified7dFable', value: 'unified7dFable' },
+        { label: 'unified7dSonnet', value: 'unified7dSonnet' },
+      ],
+      cb,
+    });
+  }
+
+  // The dashboard marker color for the route (default = plain cyan).
+  _pickColor(current, cb) {
+    this._openPicker({
+      title: 'Marker color',
+      hint: 'highlights this route on the dashboard',
+      multi: false,
+      selected: current,
+      items: [
+        { label: 'default', value: '' },
+        ...ROUTE_COLOR_NAMES.map(c => ({ label: c, value: c, paint: routeColorFn(c) })),
+      ],
+      cb,
+    });
+  }
+
+  _keyPick(k) {
+    const p = this.pick;
+    if (!p) { this.mode = this.pickReturn; return; }
+    const len = p.items.length;
+    if (k === 'up' || k === 'k') p.idx = Math.max(0, p.idx - 1);
+    else if (k === 'down' || k === 'j') p.idx = Math.min(len - 1, p.idx + 1);
+    else if (p.multi && (k === ' ' || k === 'x')) {
+      const v = p.items[p.idx]?.value;
+      if (v != null) { p.sel.has(v) ? p.sel.delete(v) : p.sel.add(v); }
+    }
+    else if (k === 'enter') {
+      const cb = p.cb;
+      this.pick = null;
+      this.mode = this.pickReturn;
+      if (p.multi) cb?.(p.items.filter(it => p.sel.has(it.value)).map(it => it.value));
+      else cb?.(p.items[p.idx]?.value ?? '');
+    }
+    else if (k === 'esc' || k === 'q') { this.pick = null; this.mode = this.pickReturn; }
+  }
+
+  _renderPick(lines) {
+    const p = this.pick;
+    if (!p) return;
+    lines.push('');
+    lines.push(bold('  ' + p.title) + (p.hint ? dim('  — ' + p.hint) : ''));
+    lines.push('');
+    if (!p.items.length) {
+      lines.push(gray('    (no accounts loaded — a route with none set serves all)'));
+      return;
+    }
+    p.items.forEach((it, i) => {
+      const cur = i === p.idx;
+      const cursor = cur ? cyan('▸') : ' ';
+      const mark = p.multi
+        ? (p.sel.has(it.value) ? green('[x]') : dim('[ ]'))
+        : (cur ? cyan('◉') : dim('◯'));
+      const paint = it.paint || (s => s);
+      lines.push(`   ${cursor} ${mark} ${paint(cur ? bold(it.label) : it.label)}`);
+    });
+  }
+
   // Guided add/edit: name → glob(s) → accounts → bucket → save. `orig` is the
   // existing route being edited, or null when adding.
   _routeEdit(orig) {
@@ -1145,12 +1251,15 @@ export class TUI {
       this._routePrompt('Model glob(s), comma-separated (e.g. *fable*)', draft.match, match => {
         if (!match) { this._addLog('At least one glob required — cancelled'); this.mode = 'routes'; return; }
         draft.match = match;
-        const names = this.am.accounts.map(a => a.name).join(', ');
-        this._routePrompt(`Accounts (comma; blank = all) [${names}]`, draft.accounts, accts => {
-          draft.accounts = accts;
-          this._routePrompt('Quota bucket override (blank = auto)', draft.bucket, bucket => {
+        // Accounts, bucket and color are all fixed-choice, so they're pickers
+        // rather than typed fields — no free text, and no giant account-name hint
+        // that used to spill off the footer (issue #130). Only name and glob stay
+        // typed, since those are arbitrary strings.
+        this._pickAccounts(splitCsv(draft.accounts), accts => {
+          draft.accounts = accts.join(', ');
+          this._pickBucket(draft.bucket, bucket => {
             draft.bucket = bucket;
-            this._routePrompt(`Marker color (${ROUTE_COLOR_NAMES.join('/')}, blank = default)`, draft.color, color => {
+            this._pickColor(draft.color, color => {
               draft.color = color;
               this._routeSave(draft, orig);
             });
@@ -1291,6 +1400,10 @@ export class TUI {
         return ` ${dim('↑↓')} navigate  ${dim('←→')} change  ${bold('Enter')} edit  ${bold('Esc')} back`;
       case 'routes':
         return ` ${dim('↑↓')} select  ${bold('a')}dd  ${bold('e')}dit  ${bold('d')}elete  ${bold('Esc')} back`;
+      case 'pick':
+        return this.pick?.multi
+          ? ` ${dim('↑↓')} move  ${bold('Space')} toggle  ${bold('Enter')} confirm  ${bold('Esc')} cancel`
+          : ` ${dim('↑↓')} move  ${bold('Enter')} select  ${bold('Esc')} cancel`;
       case 'blocklist':
         return ` ${dim('↑↓')} select  ${bold('a')}dd  ${bold('d')}elete  ${bold('Esc')} back`;
       case 'select': {
