@@ -274,7 +274,8 @@ export class TUI {
     const acct = info.account || r?.account || '?';
     const model = info.model ? ` (${info.model})` : ''; // shown when the request named a model
     const sid = info.sessionId || r?.sessionId || null;
-    this._addLog(`${sessionTag(sid)} ${info.method} ${info.path}${model} → ${acct} (${info.status}, ${dur}s)`);
+    const pin = (info.pinned || r?.pinned) ? dim(' [pin]') : '';
+    this._addLog(`${sessionTag(sid)} ${info.method} ${info.path}${model} → ${acct}${pin} (${info.status}, ${dur}s)`);
   }
 
   _addLog(msg) {
@@ -918,7 +919,8 @@ export class TUI {
       const el = ((now - r.started) / 1000).toFixed(1);
       const sp = cyan(SPINNER[this.frame]);
       const m = r.model ? dim(` (${r.model})`) : ''; // filled in as soon as the model is peeked from the stream
-      const a = r.account ? ` → ${r.account}` : '';
+      const pin = r.pinned ? dim(' [pin]') : '';
+      const a = r.account ? ` → ${r.account}${pin}` : '';
       lines.push(` ${sp} ${gray(r.t)}  ${sessionTag(r.sessionId)} ${r.method} ${r.path}${m}${a} ${dim(`(${el}s...)`)}`);
     }
 

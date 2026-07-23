@@ -327,7 +327,8 @@ async function serverCommand() {
       const acct = info.account || r?.account || '?';
       const model = info.model ? ` (${info.model})` : '';
       const sid = info.sessionId ? `${info.sessionId.slice(0, 6)} ` : '';
-      writeActivity(`${sid}${info.method} ${info.path}${model} → ${acct} (${info.status}, ${dur}s)`);
+      const pin = (info.pinned || r?.pinned) ? ' [pin]' : '';
+      writeActivity(`${sid}${info.method} ${info.path}${model} → ${acct}${pin} (${info.status}, ${dur}s)`);
     };
     // Tee console output to the activity log as well
     const origLog = console.log;
@@ -665,7 +666,14 @@ async function runCommand() {
       // Only set ANTHROPIC_BASE_URL — Claude Code keeps its own OAuth token
       // which the proxy accepts from localhost. Not setting ANTHROPIC_API_KEY
       // lets Claude Code stay in subscription mode (full model access).
-      env.ANTHROPIC_BASE_URL = `http://localhost:${port}`;
+      // If the caller already set ANTHROPIC_BASE_URL to a /tc-acct/<pin> URL
+      // pointing at this proxy, preserve it so the account pin takes effect.
+      const existingBase = process.env.ANTHROPIC_BASE_URL || '';
+      const tcAcctPrefix = `http://localhost:${port}/tc-acct/`;
+      const tcAcctPrefix2 = `http://127.0.0.1:${port}/tc-acct/`;
+      if (!existingBase.startsWith(tcAcctPrefix) && !existingBase.startsWith(tcAcctPrefix2)) {
+        env.ANTHROPIC_BASE_URL = `http://localhost:${port}`;
+      }
     }
   } else if (autoFallback) {
     console.error(`[TeamClaude] Proxy not running on port ${port} — launching claude directly (--auto-fallback; start it with: teamclaude server)`);

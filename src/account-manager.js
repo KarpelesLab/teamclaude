@@ -604,7 +604,7 @@ export class AccountManager {
   /** Whether `account` may serve `model`. A matching route with an `accounts`
    * list is exclusive (only listed accounts, by name or index). With no matching
    * route — or a route that lists no accounts — it falls back to the per-account
-   * `models` ownership claim so PR #74 configs keep working. */
+   * `models` ownership claim (deprecated — use `routes` instead). */
   _routeAllows(account, model) {
     const route = this._routeForModel(model);
     if (route && route.accounts.length) {
@@ -613,7 +613,8 @@ export class AccountManager {
     return this._accountOwnsModel(account, model);
   }
 
-  /** Returns true if no account claims model ownership, or this account does. */
+  /** @deprecated Use `routes` with an `accounts` list instead.
+   *  Returns true if no account claims model ownership, or this account does. */
   _accountOwnsModel(account, model) {
     for (const a of this.accounts) {
       if (a.models && a.models.some(m => modelMatches(m, model))) {

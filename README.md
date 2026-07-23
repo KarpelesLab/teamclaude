@@ -22,7 +22,7 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 - **Hot-reload accounts** — add or change accounts while the server is running; press **R** in the TUI, or run headless and CLI changes auto-reload via a local control endpoint
 - **Headless mode** — run the proxy without the TUI (`--headless`) for backgrounding/services
 - **Org-aware accounts** — one email can hold multiple accounts across different organizations (e.g. corp + personal); dedup is keyed on account + org, and names disambiguate as `email (Org)`
-- **Third-party backend accounts** — route requests to any Anthropic-compatible API (e.g. DeepSeek, GLM) as a fallback when Claude accounts are exhausted; a per-account `upstream` URL and `modelMap` translate model names transparently. Accounts with a `models` list are reserved for requests that explicitly name those models, enabling per-session backend selection without touching other sessions
+- **Third-party backend accounts** — route requests to any Anthropic-compatible API (e.g. DeepSeek, GLM) as a fallback when Claude accounts are exhausted; a per-account `upstream` URL and `modelMap` translate model names transparently. Use [model routes](#model-routes) to reserve a third-party account for sessions that explicitly name its models
 - **Model blocklist** — reject requests for unwanted models (glob patterns, e.g. `*fable*`) with a fast `400` instead of forwarding them; a model no account can serve otherwise gets rate-limited upstream and hangs the pipeline. Edit live in the TUI settings screen (`g` → Blocked models)
 - **Rotation priority** — pin a preferred account order with `teamclaude priority`
 - **Enable/disable accounts** — temporarily pause an account without removing it (`teamclaude disable`/`enable`, or `d` in the TUI); re-enabling also clears a stuck error state
@@ -356,7 +356,7 @@ When on, teamclaude routes each **new** session to the least-loaded eligible acc
 | `accounts[].disabled` | If `true`, the account is excluded from rotation until re-enabled |
 | `accounts[].upstream` | Alternative upstream base URL for this account (e.g. `https://api.deepseek.com/anthropic`). Overrides the global `upstream` for this account only |
 | `accounts[].modelMap` | Object mapping Anthropic model names to this backend's model names (e.g. `{"claude-sonnet-4-6": "deepseek-v4-pro[1m]"}`). Applied automatically when requests are routed to this account |
-| `accounts[].models` | Array of model names this account exclusively handles. When any account declares a `models` list, requests for those models are routed only to accounts that list them — use this to reserve a third-party account for sessions that pass `--model <name>` explicitly |
+| `accounts[].models` | **Deprecated** — use a [`routes`](#model-routes) entry with `match` and `accounts` instead. Array of model names this account exclusively handles; kept for backward compatibility with pre-routes configs. |
 | `routes` | Optional list of routing rules that pin model patterns to specific accounts — see [Model routes](#model-routes) |
 
 ### Model routes
@@ -465,7 +465,13 @@ Any Anthropic-compatible API can be added as an account alongside your Claude ac
 
 - **`upstream`** — base URL of the target API. Requests are sent to `upstream + /v1/messages` (etc.) for this account only.
 - **`modelMap`** — when a Claude model name arrives in the request body, it is rewritten to the mapped name before forwarding.
-- **`models`** — model names this account exclusively handles. Once any account declares a `models` list, requests for those model names are locked to matching accounts. This lets you send a specific session to a third-party backend without touching others — use `--model` on launch or `/model` inside a session:
+- **`models`** — **Deprecated.** Use a [`routes`](#model-routes) entry instead:
+  ```json
+  { "name": "deepseek", "match": ["deepseek-*"], "accounts": ["deepseek"] }
+  ```
+  Routes are more flexible (glob matching, multiple accounts, bucket override) and are the recommended way to pin model patterns to specific accounts. The `models` field is kept for backward compatibility but may be removed in a future version.
+
+To send a specific session to a third-party backend without touching others, define a route for its model patterns and use `--model` on launch or `/model` inside a session:
 
 ```bash
 # This session routes to DeepSeek; all other sessions still use Claude accounts.
