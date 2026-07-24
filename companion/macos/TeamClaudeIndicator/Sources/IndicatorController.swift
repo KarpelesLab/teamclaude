@@ -44,6 +44,7 @@ final class IndicatorController {
     private var cancellables = Set<AnyCancellable>()
 
     func start() {
+        windowLocator.requestAccessibilityPermissionIfNeeded()
         tick(forceLookup: true)
         timer = Timer.scheduledTimer(withTimeInterval: 0.85, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.tick() }
@@ -112,10 +113,26 @@ final class IndicatorController {
 
     private func position(claudeFrame: NSRect) {
         let size = NSSize(width: 356, height: model.expanded ? 220 : 42)
-        let origin = NSPoint(
-            x: claudeFrame.maxX - size.width - 22,
-            y: claudeFrame.minY + 78
-        )
-        panel.setFrame(NSRect(origin: origin, size: size), display: true, animate: panel.isVisible)
+        let origin: NSPoint
+        if let usageFrame = windowLocator.usageControlFrame() {
+            // Visually dock to Claude's real usage control. The expanded card
+            // grows upward from the same anchor instead of drifting around the
+            // virtual desktop.
+            origin = NSPoint(
+                x: usageFrame.maxX - size.width,
+                y: usageFrame.maxY + 8
+            )
+        } else {
+            // Permission-free fallback, now using correctly converted Claude
+            // window coordinates on multi-monitor setups.
+            origin = NSPoint(
+                x: claudeFrame.maxX - size.width - 22,
+                y: claudeFrame.minY + 78
+            )
+        }
+        let nextFrame = NSRect(origin: origin, size: size)
+        guard !NSEqualRects(panel.frame, nextFrame) else { return }
+        let isResize = panel.frame.size != nextFrame.size
+        panel.setFrame(nextFrame, display: true, animate: panel.isVisible && isResize)
     }
 }

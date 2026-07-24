@@ -23,5 +23,7 @@ open ".build/TeamClaude Indicator.app"
 ```
 
 The app is a menu-bar accessory. It appears only while Claude is frontmost and
-the focused task uses the `dev` SSH host. Click the pill to expand the three
-quota bars.
+the focused task uses the `dev` SSH host. It requests macOS Accessibility
+permission so it can dock to Claude's real Usage control across multiple
+monitors; without permission it falls back to Claude's window edge. Click the
+pill to expand the three quota bars.
