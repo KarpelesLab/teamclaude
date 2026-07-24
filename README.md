@@ -180,6 +180,28 @@ through `teamclaude run`. The trade-off: `run`'s proxy-up/down guard only applie
 when you launch via `run`, so start the server (`teamclaude server`) before the
 multiplexer.
 
+### Claude Desktop SSH sessions
+
+Claude Desktop installs and launches its own Claude Code binary on the remote
+host, so a shell alias and `teamclaude run` do not affect it. Route that
+app-managed process through TeamClaude by putting the output of:
+
+```bash
+teamclaude env --ssh
+```
+
+inside the dedicated Claude Desktop `Host` block in the **client**
+`~/.ssh/config`. The command emits OpenSSH `SetEnv` directives for the local
+proxy, CA certificate, and optional hold timeout. The remote sshd must allow
+those names; the command prints the matching `AcceptEnv` directive to stderr.
+Use a Desktop-specific SSH alias when possible so ordinary SSH sessions are
+unchanged.
+
+After changing either SSH config, start a **new** Desktop SSH session—the
+environment of an already-running remote Claude process cannot be changed.
+Keep TeamClaude bound to loopback on the remote host; neither its proxy nor its
+OAuth credentials need to be exposed over the network.
+
 ### Routing plain `claude` automatically (alias)
 
 So you don't have to type `teamclaude run` every time, add a shell alias that makes plain `claude` go through the proxy (it errors if the proxy is down rather than silently bypassing it — add `--auto-fallback` to launch claude directly instead):
@@ -305,7 +327,13 @@ Default rotation is purely quota-driven, so many parallel sessions all pile onto
 "distributeSessions": true
 ```
 
-When on, teamclaude routes each **new** session to the least-loaded eligible account (fewest active sessions, then fewest in-flight) and **pins** it there, so a session keeps hitting the same account and preserves its prompt cache — while different sessions spread across accounts instead of funnelling onto one. Account **priority still wins** (a higher-priority account is never skipped to balance load), and a session whose account becomes exhausted re-routes automatically. Off by default; single-session use is unaffected either way.
+When on, teamclaude routes each **new** session to the least-loaded eligible account (fewest active sessions, then fewest in-flight) and **pins** it there, so a session keeps hitting the same account and preserves its prompt cache — while different sessions spread across accounts instead of funnelling onto one. Account **priority still wins** (a higher-priority account is never skipped to balance load), and a session whose account becomes exhausted re-routes automatically.
+
+Known session pins are saved beside quota state and restored across clean
+restarts and crashes. The persisted rows contain only the Claude Code session
+id, timestamps/counters, and stable account identity—never OAuth credentials or
+prompt contents. Pins still expire after the one-hour cache-affinity window.
+Off by default; single-session use is unaffected either way.
 
 ### Config format
 

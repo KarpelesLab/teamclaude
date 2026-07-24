@@ -110,6 +110,63 @@ export class SessionTracker {
     }
   }
 
+  // Serialize only cache-affinity state. In-flight requests cannot survive a
+  // process restart, so they are deliberately omitted and restore as zero.
+  // Callers are responsible for replacing accountIndex with a stable account
+  // identity before writing this to disk.
+  exportState(now = this._now()) {
+    this.sweep(now);
+    const saved = [];
+    for (const [sessionId, s] of this.sessions) {
+      if (s.accountIndex == null) continue;
+      saved.push({
+        sessionId,
+        accountIndex: s.accountIndex,
+        firstSeen: s.firstSeen,
+        lastSeen: s.lastSeen,
+        count: s.count,
+      });
+    }
+    return saved;
+  }
+
+  // Restore entries previously returned by exportState. Invalid and expired
+  // rows are ignored rather than poisoning startup. A future lastSeen (clock
+  // moved backwards between runs) is clamped to now so it cannot live forever.
+  restoreState(saved, now = this._now()) {
+    if (!Array.isArray(saved)) return;
+    for (const row of saved) {
+      if (typeof row?.sessionId !== 'string' || !row.sessionId) continue;
+      if (!Number.isInteger(row.accountIndex) || row.accountIndex < 0) continue;
+      if (!Number.isFinite(row.lastSeen)) continue;
+      const lastSeen = Math.min(row.lastSeen, now);
+      if (now - lastSeen > this.knownTtlMs) continue;
+      const firstSeen = Number.isFinite(row.firstSeen)
+        ? Math.min(row.firstSeen, lastSeen)
+        : lastSeen;
+      const count = Number.isInteger(row.count) && row.count >= 0 ? row.count : 0;
+      const existing = this.sessions.get(row.sessionId);
+      if (existing && existing.lastSeen > lastSeen) continue;
+      this.sessions.set(row.sessionId, {
+        accountIndex: row.accountIndex,
+        firstSeen,
+        lastSeen,
+        count,
+        inFlight: 0,
+      });
+    }
+    this._lastSweep = now;
+  }
+
+  // AccountManager uses array indices internally. Keep existing pins correct
+  // when an account is removed: drop pins to it and shift higher indices down.
+  removeAccountIndex(removedIndex) {
+    for (const [sessionId, s] of this.sessions) {
+      if (s.accountIndex === removedIndex) this.sessions.delete(sessionId);
+      else if (s.accountIndex > removedIndex) s.accountIndex -= 1;
+    }
+  }
+
   // { known, active, perAccount: { [index]: activeCount } } — for status/TUI.
   // Sweeps as it goes so a long-lived headless server stays bounded.
   stats(now = this._now()) {

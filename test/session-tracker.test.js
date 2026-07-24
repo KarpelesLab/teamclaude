@@ -128,3 +128,60 @@ test('stats sweeps forgotten sessions out of the map', () => {
   assert.equal(st.sessions.has('old'), false);
   assert.equal(st.sessions.has('new'), true);
 });
+
+test('exportState persists affinity metadata but not in-flight process state', () => {
+  const { clock, now } = fixedClock();
+  const st = new SessionTracker({ now });
+  st.beginRequest('s1', clock.t);
+  st.touch('s1', 2, clock.t);
+
+  assert.deepEqual(st.exportState(clock.t), [{
+    sessionId: 's1',
+    accountIndex: 2,
+    firstSeen: clock.t,
+    lastSeen: clock.t,
+    count: 1,
+  }]);
+});
+
+test('restoreState restores valid pins with no requests in flight', () => {
+  const { clock, now } = fixedClock();
+  const st = new SessionTracker({ now });
+  st.restoreState([{
+    sessionId: 's1',
+    accountIndex: 1,
+    firstSeen: clock.t - 100,
+    lastSeen: clock.t - 50,
+    count: 7,
+  }], clock.t);
+
+  assert.equal(st.pinnedAccount('s1', clock.t), 1);
+  assert.equal(st.sessions.get('s1').inFlight, 0);
+  assert.equal(st.sessions.get('s1').count, 7);
+});
+
+test('restoreState ignores malformed and expired entries', () => {
+  const { clock, now } = fixedClock();
+  const st = new SessionTracker({ now });
+  st.restoreState([
+    { sessionId: '', accountIndex: 0, lastSeen: clock.t },
+    { sessionId: 'bad-index', accountIndex: -1, lastSeen: clock.t },
+    { sessionId: 'bad-time', accountIndex: 0, lastSeen: 'yesterday' },
+    { sessionId: 'expired', accountIndex: 0, lastSeen: clock.t - SESSION_KNOWN_TTL_MS - 1 },
+  ], clock.t);
+  assert.equal(st.stats(clock.t).known, 0);
+});
+
+test('removeAccountIndex drops removed pins and shifts higher account indices', () => {
+  const { clock, now } = fixedClock();
+  const st = new SessionTracker({ now });
+  st.touch('below', 0, clock.t);
+  st.touch('removed', 1, clock.t);
+  st.touch('above', 2, clock.t);
+
+  st.removeAccountIndex(1);
+
+  assert.equal(st.pinnedAccount('below', clock.t), 0);
+  assert.equal(st.pinnedAccount('removed', clock.t), null);
+  assert.equal(st.pinnedAccount('above', clock.t), 1);
+});

@@ -1,4 +1,4 @@
-import { readFile, writeFile, mkdir, chmod } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, chmod, rename } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
@@ -32,9 +32,12 @@ export async function loadState() {
 export async function saveState(state) {
   const path = getStatePath();
   await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, JSON.stringify(state, null, 2) + '\n', { mode: 0o600 });
-  // `mode` only applies when the file is CREATED; enforce 0600 on every save so
-  // a pre-existing state file (holding quota + tokens) can't linger world-readable.
+  const tmp = `${path}.tmp-${process.pid}-${randomBytes(4).toString('hex')}`;
+  await writeFile(tmp, JSON.stringify(state, null, 2) + '\n', { mode: 0o600 });
+  await chmod(tmp, 0o600).catch(() => {});
+  await rename(tmp, path);
+  // Enforce 0600 on every save so session IDs and runtime account state cannot
+  // linger world-readable if a pre-existing file had broader permissions.
   await chmod(path, 0o600).catch(() => {});
 }
 

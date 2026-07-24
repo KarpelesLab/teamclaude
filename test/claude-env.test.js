@@ -1,6 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildClaudeEnvLines } from '../src/claude-env.js';
+import {
+  buildClaudeEnvLines,
+  buildClaudeSshSetEnvLines,
+  CLAUDE_SSH_ACCEPT_ENV,
+} from '../src/claude-env.js';
 
 test('MITM mode (default) emits proxy vars + CA cert, and clears ANTHROPIC_BASE_URL', () => {
   const lines = buildClaudeEnvLines({ port: 3456, caPath: '/home/u/.config/teamclaude-ca.pem' });
@@ -43,4 +47,23 @@ test('holdSeconds > 0 adds API_TIMEOUT_MS = holdSeconds + 60s, in both modes', (
 test('holdSeconds 0 / unset adds no API_TIMEOUT_MS', () => {
   const lines = buildClaudeEnvLines({ port: 3456, useMitm: false });
   assert.ok(!lines.some((l) => l.startsWith('export API_TIMEOUT_MS')));
+});
+
+test('SSH mode emits OpenSSH SetEnv directives for Desktop-launched remote processes', () => {
+  assert.deepEqual(buildClaudeSshSetEnvLines({
+    port: 3456,
+    caPath: '/home/u/.config/teamclaude-ca.pem',
+    holdSeconds: 3600,
+  }), [
+    '  SetEnv HTTPS_PROXY=http://127.0.0.1:3456 HTTP_PROXY=http://127.0.0.1:3456 https_proxy=http://127.0.0.1:3456 http_proxy=http://127.0.0.1:3456 NO_PROXY=localhost,127.0.0.1,::1 no_proxy=localhost,127.0.0.1,::1 NODE_EXTRA_CA_CERTS=/home/u/.config/teamclaude-ca.pem API_TIMEOUT_MS=3660000',
+  ]);
+});
+
+test('SSH mode and sshd AcceptEnv names stay in sync', () => {
+  const emitted = buildClaudeSshSetEnvLines({ port: 3456, caPath: '/x', holdSeconds: 1 })[0]
+    .trim()
+    .replace(/^SetEnv /, '')
+    .split(' ')
+    .map(pair => pair.split('=')[0]);
+  assert.deepEqual(emitted, CLAUDE_SSH_ACCEPT_ENV);
 });

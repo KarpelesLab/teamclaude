@@ -103,6 +103,7 @@ export class AccountManager {
     // accounts by load instead of funnelling them all onto the current one.
     this.sessionTracker = sessionTracker || new SessionTracker();
     this.distributeSessions = !!distributeSessions;
+    this._onSessionChange = null;
     // Ephemeral per-route manual pins (routeName → account index). Not persisted:
     // like the global manual switch (currentIndex) these are runtime overrides that
     // bias selection for a route's models and reset on restart. A pinned account
@@ -350,7 +351,9 @@ export class AccountManager {
    * when distribution is off — the readout is passive). This is what pins a
    * session for future affinity. */
   recordSession(sessionId, accountIndex) {
-    if (sessionId) this.sessionTracker.touch(sessionId, accountIndex);
+    if (!sessionId) return;
+    this.sessionTracker.touch(sessionId, accountIndex);
+    this._onSessionChange?.();
   }
 
   /** Mark a session request as in flight / finished. Paired around the whole
@@ -367,6 +370,11 @@ export class AccountManager {
   /** { known, active, perAccount } session counts for status/TUI. */
   sessionStats() {
     return this.sessionTracker.stats();
+  }
+
+  /** Register a callback used by the server to debounce runtime-state saves. */
+  onSessionChange(callback) {
+    this._onSessionChange = callback;
   }
 
   /**
@@ -1227,6 +1235,8 @@ export class AccountManager {
     if (index < 0 || index >= this.accounts.length) return;
     this.accounts.splice(index, 1);
     this.accounts.forEach((a, i) => a.index = i);
+    this.sessionTracker.removeAccountIndex(index);
+    this._onSessionChange?.();
     if (this.currentIndex >= this.accounts.length) {
       this.currentIndex = Math.max(0, this.accounts.length - 1);
     } else if (this.currentIndex > index) {
@@ -1268,6 +1278,48 @@ export class AccountManager {
       // We already know this account's weekly window, so it isn't "probing".
       if (account.quota.unified7dReset != null) account.probing = false;
     }
+  }
+
+  /**
+   * Serialize session affinity without credentials. SessionTracker uses array
+   * indices at runtime; the persisted representation replaces each index with
+   * stable account identity so config reordering cannot misroute a session.
+   */
+  exportSessionState() {
+    const saved = [];
+    for (const row of this.sessionTracker.exportState()) {
+      const account = this.accounts[row.accountIndex];
+      if (!account) continue;
+      const session = { ...row };
+      delete session.accountIndex;
+      saved.push({
+        ...session,
+        account: {
+          accountUuid: account.accountUuid,
+          orgUuid: account.orgUuid,
+          orgName: account.orgName,
+          name: account.name,
+        },
+      });
+    }
+    return saved;
+  }
+
+  /**
+   * Restore persisted affinity, resolving saved account identities against the
+   * current config. Missing/removed accounts are ignored.
+   */
+  restoreSessionState(saved) {
+    if (!Array.isArray(saved)) return;
+    const remapped = [];
+    for (const row of saved) {
+      const identity = row?.account;
+      if (!identity) continue;
+      const accountIndex = this.accounts.findIndex(account => sameIdentity(identity, account));
+      if (accountIndex < 0) continue;
+      remapped.push({ ...row, accountIndex });
+    }
+    this.sessionTracker.restoreState(remapped);
   }
 
   /**

@@ -10,7 +10,10 @@ import { fileURLToPath } from 'node:url';
 const cliPath = fileURLToPath(new URL('../src/index.js', import.meta.url));
 
 function listen(server) {
-  return new Promise(resolve => server.listen(0, () => resolve(server.address().port)));
+  // TeamClaude binds 127.0.0.1 by default. Bind the occupying server to the
+  // same address explicitly: on platforms where an IPv6 :: listener is
+  // v6-only, occupying :: would not conflict and this test would hang.
+  return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
 }
 
 function close(server) {

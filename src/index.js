@@ -17,7 +17,7 @@ import { TUI } from './tui.js';
 import { SxManager } from './sx.js';
 import { autoUpdate, checkForUpdate, currentVersion, runUpdate, installKind, PKG_NAME } from './updater.js';
 import { renderStatus } from './status-renderer.js';
-import { buildClaudeEnvLines } from './claude-env.js';
+import { buildClaudeEnvLines, buildClaudeSshSetEnvLines, CLAUDE_SSH_ACCEPT_ENV } from './claude-env.js';
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
 
 const args = process.argv.slice(2);
@@ -143,24 +143,46 @@ async function serverCommand() {
   const threshold = config.switchThreshold || 0.98;
   const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp, distributeSessions: config.distributeSessions });
 
-  // Restore quota observed in a previous run so a restart doesn't lose rotation
-  // state (passive — we never call the API to re-learn it). Stale windows are
-  // cleared automatically on first use by _clearExpiredQuotas.
+  // Restore runtime state observed in a previous run. Quota windows are cleared
+  // automatically on first use when stale; session pins are restored only while
+  // they remain inside SessionTracker's cache-affinity window.
   const savedState = await loadState().catch(err => {
     console.error(`[TeamClaude] Could not read saved state: ${err.message}`);
     return null;
   });
   if (savedState?.quota) accountManager.restoreQuotaState(savedState.quota);
+  if (savedState?.sessions) accountManager.restoreSessionState(savedState.sessions);
 
   // With quota restored, pick the best account up front (highest priority /
   // soonest-resetting weekly window) instead of defaulting to the first one.
   accountManager.selectActiveAccount();
 
-  // Periodically persist quota (and once more on shutdown) to the state file.
-  const persistQuotaState = () =>
-    saveState({ quota: accountManager.exportQuotaState() })
-      .catch(err => console.error(`[TeamClaude] Failed to save quota state: ${err.message}`));
-  let quotaSaveInterval = null;
+  // Persist quota and cache-affinity state together so concurrent writers cannot
+  // overwrite one another's half of the state file. Writes are serialized, and
+  // session traffic requests a short debounced save so a crash in the first
+  // minute of a new session does not usually lose its pin.
+  let stateSaveChain = Promise.resolve();
+  const persistRuntimeState = () => {
+    const snapshot = {
+      quota: accountManager.exportQuotaState(),
+      sessions: accountManager.exportSessionState(),
+    };
+    const result = stateSaveChain.then(() => saveState(snapshot));
+    stateSaveChain = result.catch(() => {});
+    return result.catch(err =>
+      console.error(`[TeamClaude] Failed to save runtime state: ${err.message}`));
+  };
+  let stateSaveInterval = null;
+  let sessionSaveTimer = null;
+  const scheduleSessionStateSave = () => {
+    if (sessionSaveTimer) return;
+    sessionSaveTimer = setTimeout(() => {
+      sessionSaveTimer = null;
+      persistRuntimeState();
+    }, 250);
+    sessionSaveTimer.unref?.();
+  };
+  accountManager.onSessionChange(scheduleSessionStateSave);
 
   // Persist refreshed tokens back to config (re-read from disk to avoid clobbering
   // accounts added externally, e.g. by `teamclaude import` while server is running)
@@ -415,9 +437,10 @@ async function serverCommand() {
   // server is glanceable. Works in both TUI and headless modes.
   const stopTitle = startTerminalTitleUpdater(accountManager);
 
-  // Persist quota every minute; unref so it never keeps the process alive.
-  quotaSaveInterval = setInterval(persistQuotaState, 60_000);
-  quotaSaveInterval.unref?.();
+  // Persist all runtime state every minute as a backstop; unref so it never
+  // keeps the process alive.
+  stateSaveInterval = setInterval(persistRuntimeState, 60_000);
+  stateSaveInterval.unref?.();
 
   // Start the opt-in quota probe (no-op when quotaProbeSeconds is 0).
   prober = new Prober(accountManager, { intervalMs: (config.quotaProbeSeconds || 0) * 1000 });
@@ -453,8 +476,9 @@ async function serverCommand() {
     if (!tui) console.log('\n[TeamClaude] Shutting down...');
     prober?.stop();
     warmer?.stop();
-    if (quotaSaveInterval) clearInterval(quotaSaveInterval);
-    await persistQuotaState();
+    if (stateSaveInterval) clearInterval(stateSaveInterval);
+    if (sessionSaveTimer) clearTimeout(sessionSaveTimer);
+    await persistRuntimeState();
     // Don't linger waiting on keep-alive / streaming connections: actively
     // destroy them so server.close() can complete promptly, and hard-exit after a
     // short grace period in case anything still hangs.
@@ -606,12 +630,27 @@ async function envCommand() {
   }
   const port = config.proxy.port;
   const useMitm = !args.slice(1).includes('--no-mitm');
+  const useSshSetEnv = args.slice(1).includes('--ssh');
+
+  if (useSshSetEnv && !useMitm) {
+    process.stderr.write('The --ssh and --no-mitm options cannot be combined; Claude Desktop SSH requires MITM mode.\n');
+    process.exit(1);
+  }
 
   let caPath = null;
   if (useMitm) ({ caPath } = await ensureCerts(upstreamHost(config)));
 
-  const lines = buildClaudeEnvLines({ port, useMitm, caPath, holdSeconds: config.holdSeconds });
+  const lines = useSshSetEnv
+    ? buildClaudeSshSetEnvLines({ port, caPath, holdSeconds: config.holdSeconds })
+    : buildClaudeEnvLines({ port, useMitm, caPath, holdSeconds: config.holdSeconds });
   process.stdout.write(`${lines.join('\n')}\n`);
+
+  if (useSshSetEnv) {
+    process.stderr.write('# TeamClaude env: OpenSSH SetEnv mode for Claude Desktop remote sessions\n');
+    process.stderr.write('# place these lines inside the Claude Desktop Host block in the client ~/.ssh/config\n');
+    process.stderr.write(`# remote sshd must allow them: AcceptEnv ${CLAUDE_SSH_ACCEPT_ENV.join(' ')}\n`);
+    return;
+  }
 
   const mode = useMitm ? 'MITM forward-proxy' : 'base-URL';
   process.stderr.write(`# TeamClaude env: ${mode} mode, localhost:${port}\n`);
@@ -1237,6 +1276,8 @@ Commands:
                       'eval "$(teamclaude env)"' (MITM forward-proxy by default;
                       --no-mitm for base-URL only). Handy for agent multiplexers
                       that spawn claude themselves instead of via 'teamclaude run'
+  env --ssh           Print OpenSSH SetEnv lines for a Claude Desktop SSH Host
+                      block (requires matching AcceptEnv names on the remote sshd)
   run [--no-mitm] [--auto-fallback] [-- args...]
                       Run Claude Code through the proxy (errors if it's down,
                       unless --auto-fallback launches claude directly instead).
