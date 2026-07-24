@@ -42,11 +42,27 @@ export function buildClaudeEnvLines({ port, useMitm = true, caPath = null, holdS
   return lines;
 }
 
-// OpenSSH client-config equivalent of MITM mode, for applications such as
-// Claude Desktop that launch Claude Code themselves on a remote SSH host. These
-// lines belong inside the relevant `Host` block in ~/.ssh/config. The remote
-// sshd must accept the listed variables (see `teamclaude env --ssh` guidance).
+// OpenSSH client-config equivalent of MITM mode for SSH launchers that preserve
+// forwarded environment values. These lines belong inside the relevant `Host`
+// block in ~/.ssh/config. The remote sshd must accept the listed variables (see
+// `teamclaude env --ssh` guidance). Claude Desktop should prefer settings mode.
 export function buildClaudeSshSetEnvLines({ port, caPath = null, holdSeconds = 0 }) {
+  const values = buildClaudeProxyEnvEntries({ port, caPath, holdSeconds });
+  // ssh_config uses the first value obtained for a keyword. Put every
+  // assignment on one SetEnv directive; repeated SetEnv lines would leave only
+  // the first variable in the effective configuration.
+  return [`  SetEnv ${values.map(([name, value]) => `${name}=${value}`).join(' ')}`];
+}
+
+// Claude Desktop's SSH daemon rebuilds the environment before it spawns
+// `ccd-cli`, so arbitrary OpenSSH SetEnv values may not survive even when sshd
+// accepts them. Claude Code's supported settings.json `env` block is loaded by
+// the CLI itself and therefore works for app-managed SSH sessions.
+export function buildClaudeSettingsEnv({ port, caPath = null, holdSeconds = 0 }) {
+  return Object.fromEntries(buildClaudeProxyEnvEntries({ port, caPath, holdSeconds }));
+}
+
+function buildClaudeProxyEnvEntries({ port, caPath = null, holdSeconds = 0 }) {
   const proxyUrl = `http://127.0.0.1:${port}`;
   const values = [
     ['HTTPS_PROXY', proxyUrl],
@@ -59,10 +75,7 @@ export function buildClaudeSshSetEnvLines({ port, caPath = null, holdSeconds = 0
   if (caPath) values.push(['NODE_EXTRA_CA_CERTS', caPath]);
   const holdMs = (holdSeconds || 0) * 1000;
   if (holdMs > 0) values.push(['API_TIMEOUT_MS', String(holdMs + 60_000)]);
-  // ssh_config uses the first value obtained for a keyword. Put every
-  // assignment on one SetEnv directive; repeated SetEnv lines would leave only
-  // the first variable in the effective configuration.
-  return [`  SetEnv ${values.map(([name, value]) => `${name}=${value}`).join(' ')}`];
+  return values;
 }
 
 export const CLAUDE_SSH_ACCEPT_ENV = [

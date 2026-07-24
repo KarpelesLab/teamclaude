@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   buildClaudeEnvLines,
+  buildClaudeSettingsEnv,
   buildClaudeSshSetEnvLines,
   CLAUDE_SSH_ACCEPT_ENV,
 } from '../src/claude-env.js';
@@ -66,4 +67,30 @@ test('SSH mode and sshd AcceptEnv names stay in sync', () => {
     .split(' ')
     .map(pair => pair.split('=')[0]);
   assert.deepEqual(emitted, CLAUDE_SSH_ACCEPT_ENV);
+});
+
+test('Claude settings mode emits the supported env block for Desktop SSH sessions', () => {
+  assert.deepEqual(buildClaudeSettingsEnv({
+    port: 3456,
+    caPath: '/home/u/.config/teamclaude-ca.pem',
+    holdSeconds: 3600,
+  }), {
+    HTTPS_PROXY: 'http://127.0.0.1:3456',
+    HTTP_PROXY: 'http://127.0.0.1:3456',
+    https_proxy: 'http://127.0.0.1:3456',
+    http_proxy: 'http://127.0.0.1:3456',
+    NO_PROXY: 'localhost,127.0.0.1,::1',
+    no_proxy: 'localhost,127.0.0.1,::1',
+    NODE_EXTRA_CA_CERTS: '/home/u/.config/teamclaude-ca.pem',
+    API_TIMEOUT_MS: '3660000',
+  });
+});
+
+test('Claude settings and SSH modes emit the same variable names', () => {
+  const settingsNames = Object.keys(buildClaudeSettingsEnv({
+    port: 3456,
+    caPath: '/x',
+    holdSeconds: 1,
+  }));
+  assert.deepEqual(settingsNames, CLAUDE_SSH_ACCEPT_ENV);
 });

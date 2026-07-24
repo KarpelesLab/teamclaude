@@ -17,7 +17,7 @@ import { TUI } from './tui.js';
 import { SxManager } from './sx.js';
 import { autoUpdate, checkForUpdate, currentVersion, runUpdate, installKind, PKG_NAME } from './updater.js';
 import { renderStatus } from './status-renderer.js';
-import { buildClaudeEnvLines, buildClaudeSshSetEnvLines, CLAUDE_SSH_ACCEPT_ENV } from './claude-env.js';
+import { buildClaudeEnvLines, buildClaudeSettingsEnv, buildClaudeSshSetEnvLines, CLAUDE_SSH_ACCEPT_ENV } from './claude-env.js';
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
 
 const args = process.argv.slice(2);
@@ -631,14 +631,28 @@ async function envCommand() {
   const port = config.proxy.port;
   const useMitm = !args.slice(1).includes('--no-mitm');
   const useSshSetEnv = args.slice(1).includes('--ssh');
+  const useClaudeSettings = args.slice(1).includes('--claude-settings');
 
-  if (useSshSetEnv && !useMitm) {
-    process.stderr.write('The --ssh and --no-mitm options cannot be combined; Claude Desktop SSH requires MITM mode.\n');
+  if ((useSshSetEnv || useClaudeSettings) && !useMitm) {
+    process.stderr.write('The --ssh/--claude-settings modes cannot be combined with --no-mitm; Claude Desktop SSH requires MITM mode.\n');
+    process.exit(1);
+  }
+  if (useSshSetEnv && useClaudeSettings) {
+    process.stderr.write('Choose only one output mode: --ssh or --claude-settings.\n');
     process.exit(1);
   }
 
   let caPath = null;
   if (useMitm) ({ caPath } = await ensureCerts(upstreamHost(config)));
+
+  if (useClaudeSettings) {
+    const env = buildClaudeSettingsEnv({ port, caPath, holdSeconds: config.holdSeconds });
+    process.stdout.write(`${JSON.stringify({ env }, null, 2)}\n`);
+    process.stderr.write('# TeamClaude env: Claude Code settings.json mode for Desktop SSH sessions\n');
+    process.stderr.write('# merge the printed env object into the remote ~/.claude/settings.json, then start a new Desktop task\n');
+    process.stderr.write('# remove any ANTHROPIC_BASE_URL entry from that env object so MITM and base-URL modes do not stack\n');
+    return;
+  }
 
   const lines = useSshSetEnv
     ? buildClaudeSshSetEnvLines({ port, caPath, holdSeconds: config.holdSeconds })
@@ -1277,7 +1291,10 @@ Commands:
                       --no-mitm for base-URL only). Handy for agent multiplexers
                       that spawn claude themselves instead of via 'teamclaude run'
   env --ssh           Print OpenSSH SetEnv lines for a Claude Desktop SSH Host
-                      block (requires matching AcceptEnv names on the remote sshd)
+                      block (fallback; Desktop may sanitize forwarded variables)
+  env --claude-settings
+                      Print the supported settings.json env object for a Claude
+                      Desktop SSH host (recommended)
   run [--no-mitm] [--auto-fallback] [-- args...]
                       Run Claude Code through the proxy (errors if it's down,
                       unless --auto-fallback launches claude directly instead).

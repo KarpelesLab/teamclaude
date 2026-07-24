@@ -184,20 +184,26 @@ multiplexer.
 
 Claude Desktop installs and launches its own Claude Code binary on the remote
 host, so a shell alias and `teamclaude run` do not affect it. Route that
-app-managed process through TeamClaude by putting the output of:
+app-managed process through TeamClaude using Claude Code's supported user-level
+`env` setting. On the remote host, run:
 
 ```bash
-teamclaude env --ssh
+teamclaude env --claude-settings
 ```
 
-inside the dedicated Claude Desktop `Host` block in the **client**
-`~/.ssh/config`. The command emits OpenSSH `SetEnv` directives for the local
-proxy, CA certificate, and optional hold timeout. The remote sshd must allow
-those names; the command prints the matching `AcceptEnv` directive to stderr.
-Use a Desktop-specific SSH alias when possible so ordinary SSH sessions are
-unchanged.
+Merge the printed `env` object into the remote `~/.claude/settings.json`. Keep
+the rest of that file unchanged, and remove any `ANTHROPIC_BASE_URL` entry from
+the same `env` object so base-URL and MITM modes do not stack. This is the
+reliable path for Desktop SSH because its remote daemon rebuilds the process
+environment before launching `ccd-cli`; Claude Code then reads the user settings
+inside that managed process.
 
-After changing either SSH config, start a **new** Desktop SSH session—the
+`teamclaude env --ssh` still emits a single OpenSSH `SetEnv` directive for
+SSH-based launchers that preserve forwarded environment values. It requires the
+matching `AcceptEnv` names on the remote sshd, but should be treated as a
+fallback for Claude Desktop itself.
+
+After changing the settings, start a **new** Desktop SSH session—the
 environment of an already-running remote Claude process cannot be changed.
 Keep TeamClaude bound to loopback on the remote host; neither its proxy nor its
 OAuth credentials need to be exposed over the network.
