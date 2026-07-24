@@ -46,6 +46,10 @@ switch (command) {
     await statusCommand();
     process.exit(0);
     break;
+  case 'session':
+    await sessionCommand();
+    process.exit(0);
+    break;
   case 'accounts':
     await accountsCommand();
     process.exit(0);
@@ -792,6 +796,37 @@ async function statusCommand() {
   }
 }
 
+// ── session ─────────────────────────────────────────────────
+
+async function sessionCommand() {
+  const sessionId = args[1];
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sessionId || '')) {
+    console.error('Usage: teamclaude session <claude-code-session-uuid> [--json]');
+    process.exit(1);
+  }
+  const config = await loadOrCreateConfig();
+  const url = `http://localhost:${config.proxy.port}/teamclaude/session/${encodeURIComponent(sessionId)}`;
+  try {
+    const res = await fetch(url, { headers: { 'x-api-key': config.proxy.apiKey } });
+    const data = await res.json();
+    if (!res.ok) {
+      console.error(data.error || `Session lookup failed (${res.status})`);
+      process.exit(1);
+    }
+    if (args.includes('--json')) {
+      console.log(JSON.stringify(data, null, 2));
+      return;
+    }
+    const pct = value => value == null ? '—' : `${Math.round(value * 100)}%`;
+    const label = String(data.account.name || '').replace(/@.*$/, '') || 'unknown';
+    console.log(`${label} · 5h ${pct(data.limits.fiveHour.utilization)} · weekly ${pct(data.limits.weekly.utilization)} · Fable ${pct(data.limits.fable.utilization)}`);
+  } catch (err) {
+    console.error('Cannot connect to proxy at localhost:' + config.proxy.port);
+    if (err?.message) console.error(`Details: ${err.message}`);
+    process.exit(1);
+  }
+}
+
 // ── accounts ────────────────────────────────────────────────
 
 async function accountsCommand() {
@@ -1305,6 +1340,9 @@ Commands:
                       (--install to write it to your shell rc; --uninstall to remove)
   status [--json]     Show rich proxy/account/probe status (live)
                       Use --color=always|never to control ANSI colors
+  session <uuid> [--json]
+                      Show the account and quota windows pinned to one Claude
+                      Code session (safe read-only companion-UI endpoint)
   accounts            List configured accounts
   remove <name>       Remove an account (by name or email; --org to disambiguate)
   disable <name>      Temporarily exclude an account from rotation

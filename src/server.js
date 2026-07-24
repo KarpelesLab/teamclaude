@@ -84,8 +84,32 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
       if (req.method === 'GET' && req.url === '/teamclaude/status') {
         const status = accountManager.getStatus();
         const extra = hooks.getStatusExtra?.() || {};
-        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
         res.end(JSON.stringify({ ...extra, ...status }, null, 2));
+        return;
+      }
+
+      // Read one known session's account + quota for a local companion UI.
+      // UUID-only addressing keeps the control surface narrow; the response is
+      // intentionally credential-free and never exposes the complete session
+      // map. The normal proxy-key/loopback gate above applies.
+      const sessionMatch = (req.url || '').match(/^\/teamclaude\/session\/([^/?]+)$/);
+      if (req.method === 'GET' && sessionMatch) {
+        let sessionId;
+        try { sessionId = decodeURIComponent(sessionMatch[1]); } catch { sessionId = ''; }
+        if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sessionId)) {
+          res.writeHead(400, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+          res.end(JSON.stringify({ error: 'invalid session id' }));
+          return;
+        }
+        const status = accountManager.getSessionStatus(sessionId);
+        if (!status) {
+          res.writeHead(404, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+          res.end(JSON.stringify({ error: 'session not found' }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify(status, null, 2));
         return;
       }
 

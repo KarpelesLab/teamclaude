@@ -24,6 +24,26 @@ test('a later touch re-pins the session (failover moves it)', () => {
   assert.equal(st.pinnedAccount('s1', clock.t), 3);
 });
 
+test('details returns a safe copy with active state and expires on read', () => {
+  const { clock, now } = fixedClock();
+  const st = new SessionTracker({ now });
+  st.touch('s1', 2, clock.t);
+  const detail = st.details('s1', clock.t);
+  assert.deepEqual(detail, {
+    accountIndex: 2,
+    firstSeen: clock.t,
+    lastSeen: clock.t,
+    count: 1,
+    inFlight: 0,
+    active: true,
+  });
+  detail.accountIndex = 99;
+  assert.equal(st.pinnedAccount('s1', clock.t), 2, 'returned object is not tracker state');
+  clock.t += SESSION_KNOWN_TTL_MS + 1;
+  assert.equal(st.details('s1', clock.t), null);
+  assert.equal(st.sessions.has('s1'), false);
+});
+
 test('touch with no session id is a no-op', () => {
   const st = new SessionTracker();
   assert.equal(st.touch(null, 1), null);

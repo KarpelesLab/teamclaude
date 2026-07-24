@@ -91,6 +91,27 @@ export class SessionTracker {
     return s.accountIndex ?? null;
   }
 
+  // Safe read-only view for control/status consumers. Returns a copy so callers
+  // cannot mutate the tracker, and expires stale entries exactly like
+  // pinnedAccount(). The companion UI uses this to resolve one selected Claude
+  // task without exposing the complete session map.
+  details(sessionId, now = this._now()) {
+    const s = sessionId && this.sessions.get(sessionId);
+    if (!s) return null;
+    if (this._isExpired(s, now)) {
+      this.sessions.delete(sessionId);
+      return null;
+    }
+    return {
+      accountIndex: s.accountIndex,
+      firstSeen: s.firstSeen,
+      lastSeen: s.lastSeen,
+      count: s.count,
+      inFlight: s.inFlight,
+      active: this._isActive(s, now),
+    };
+  }
+
   // Active sessions currently pinned to `accountIndex` — the load metric used to
   // spread new sessions across accounts. Counts in-flight sessions regardless of
   // how long their request has been streaming.

@@ -372,6 +372,37 @@ export class AccountManager {
     return this.sessionTracker.stats();
   }
 
+  /** Safe per-session readout for the local control API. Deliberately exposes
+   * only the selected account label and quota windows — never credentials,
+   * account UUIDs, request bodies, or the rest of the session map. */
+  getSessionStatus(sessionId, now = Date.now()) {
+    const session = this.sessionTracker.details(sessionId, now);
+    if (!session || session.accountIndex == null) return null;
+    const account = this.accounts[session.accountIndex];
+    if (!account) return null;
+    const limit = (utilization, resetAt) => ({
+      utilization: Number.isFinite(utilization) ? utilization : null,
+      resetsAt: Number.isFinite(resetAt) ? new Date(resetAt).toISOString() : null,
+    });
+    return {
+      sessionId,
+      active: session.active,
+      firstSeen: new Date(session.firstSeen).toISOString(),
+      lastSeen: new Date(session.lastSeen).toISOString(),
+      requestCount: session.count,
+      account: {
+        name: account.name,
+        status: account.status,
+      },
+      limits: {
+        fiveHour: limit(account.quota.unified5h, account.quota.unified5hReset),
+        weekly: limit(account.quota.unified7d, account.quota.unified7dReset),
+        sonnet: limit(account.quota.unified7dSonnet, account.quota.unified7dSonnetReset),
+        fable: limit(account.quota.unified7dFable, account.quota.unified7dFableReset),
+      },
+    };
+  }
+
   /** Register a callback used by the server to debounce runtime-state saves. */
   onSessionChange(callback) {
     this._onSessionChange = callback;
