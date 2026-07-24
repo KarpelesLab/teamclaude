@@ -302,7 +302,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         return;
       }
 
-      const ctx = { account: null, status: null, tried: new Set(), model, advisorModel, pinnedIndex, holdBudgetMs: holdMs, sessionId };
+      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, holdBudgetMs: holdMs, sessionId };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -784,6 +784,28 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: `Rate limited; retry in ${retryAfter}s.` } }));
       }
       return;
+    }
+
+    // A 401 means the credential we injected was rejected. For an OAuth account
+    // that usually means the access token was revoked BEFORE its clock expiry —
+    // something else refreshed the same token family, so upstream reports it
+    // revoked while it still looks fresh locally. ensureTokenFresh's expiry
+    // check cannot see that (it only compares the clock), so the account would
+    // otherwise keep serving a dead token until the token aged out, and every
+    // request in between would surface a 401 to the client with no recovery.
+    // Force one refresh and retry. If the refresh is itself rejected the refresh
+    // token is dead too: ensureTokenFresh marks the account errored, and the
+    // retry's status check rotates to another account. Bounded to one re-auth
+    // per account per request, so a genuinely dead credential surfaces the 401
+    // instead of looping.
+    if (upstreamRes.status === 401 && account.type === 'oauth' && account.refreshToken
+        && retryCount < maxRetries && !ctx.reauthed.has(account.index)) {
+      ctx.reauthed.add(account.index);
+      await upstreamRes.body?.cancel();
+      console.log(`[TeamClaude] 401 on "${account.name}" — token rejected; forcing refresh and retrying`);
+      await accountManager.ensureTokenFresh(account.index, true);
+      if (res.destroyed) return;
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
 
     // Log the request head (once) followed by the response headers, streaming
