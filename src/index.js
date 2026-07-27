@@ -9,6 +9,7 @@ import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import { sameIdentity, orgKey, matchAccounts } from './identity.js';
+import { resolveAccounts } from './resolve-accounts.js';
 import * as alias from './alias.js';
 import { ensureCerts } from './mitm.js';
 import { Prober } from './prober.js';
@@ -145,8 +146,8 @@ async function serverCommand() {
   // override — and, unlike `models`, they don't silently change eligibility
   // fleet-wide the moment one account declares a list (see _accountOwnsModel).
   // Behaviour is unchanged; this only tells pre-#86 configs what to migrate to
-  // before the field goes away. Read from config.accounts, not the resolved
-  // list: resolveAccounts rebuilds importFrom entries and drops the field.
+  // before the field goes away. Reported against config.accounts so the notice
+  // names what is actually written on disk, whatever resolution does with it.
   for (const acct of config.accounts) {
     if (!acct.models?.length) continue;
     const route = { name: acct.name, match: acct.models, accounts: [acct.name] };
@@ -1482,30 +1483,6 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
 }
 
 // ── helpers ─────────────────────────────────────────────────
-
-async function resolveAccounts(config) {
-  const accounts = [];
-  for (const acct of config.accounts) {
-    if (acct.type === 'oauth') {
-      if (acct.importFrom) {
-        try {
-          const creds = await importCredentials(acct.importFrom);
-          accounts.push({ name: acct.name, type: 'oauth', ...creds });
-          console.log(`Imported "${acct.name}" from ${acct.importFrom}`);
-        } catch (err) {
-          console.error(`Failed to import "${acct.name}": ${err.message}`);
-        }
-      } else if (acct.accessToken) {
-        accounts.push(acct);
-      } else {
-        console.error(`No token for "${acct.name}", skipping`);
-      }
-    } else if (acct.type === 'apikey' && acct.apiKey) {
-      accounts.push(acct);
-    }
-  }
-  return accounts;
-}
 
 // Is `url` a /tc-acct/<name> account pin aimed at OUR proxy? Parsed rather than
 // prefix-matched so every local spelling counts (localhost, 127.0.0.1, [::1]),
