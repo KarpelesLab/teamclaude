@@ -396,7 +396,7 @@ teamclaude route rm fable
 
 **Inline markers (TUI).** Instead of a separate list, each route surfaces on the account rows as a colored `►`: next to the **`F7`/`S7`** bar for a Fable/Sonnet route, or at the **start of the row** for a general route (one fixed column per route so its position is stable). The marker is bold on the account a route is pinned to, dim when that account is currently ineligible. `teamclaude status` (the CLI text dump) still prints the routes as a list, now colored and annotated with any pin.
 
-**Manual per-route switching (TUI).** Press **`s`** to switch accounts, then **`Tab`** to choose *what* you're switching: the global **default** account, or a specific **route**. Pick an account with `↑/↓` and **`Enter`** to pin that route to it; `Enter` again on the current pin clears it. Pins are a **runtime preference** — not saved to config — and routing **falls back** to normal best-available selection whenever the pinned account is throttled or over quota, so a pin never stalls requests.
+**Manual per-route switching (TUI).** Press **`s`** to switch accounts, then **`←`/`→`** (or **`Tab`**) to choose *what* you're switching: the global **default** account, or a specific **route**. Pick an account with `↑/↓` and **`Enter`** to pin that route to it; `Enter` again on the current pin clears it. Pins are a **runtime preference** — not saved to config — and routing **falls back** to normal best-available selection whenever the pinned account is throttled or over quota, so a pin never stalls requests.
 
 ### Quota probe (optional, off by default)
 

@@ -170,6 +170,37 @@ test('TUI switch mode: Tab is inert for remove/toggle actions', () => {
   assert.equal(tui.selRoute, null);    // unchanged — Tab only cycles in switch mode
 });
 
+test('TUI switch mode: ←→ cycle the pin target both ways and wrap', () => {
+  const mk = n => ({
+    name: n, match: [`*${n}*`], color: 'red', autocreated: true, pinned: null,
+    accounts: [{ name: 'a', eligible: true }, { name: 'b', eligible: true }],
+  });
+  const { tui } = makeTUI({ routes: [mk('fable'), mk('sonnet')] });
+
+  tui._key('s');
+  assert.equal(tui.selRoute, null);     // default
+  tui._key('right');
+  assert.equal(tui.selRoute?.name, 'fable');
+  tui._key('right');
+  assert.equal(tui.selRoute?.name, 'sonnet');
+  tui._key('right');
+  assert.equal(tui.selRoute, null);     // wraps forward to the default
+  tui._key('left');
+  assert.equal(tui.selRoute?.name, 'sonnet'); // wraps backward to the last route
+  tui._key('left');
+  assert.equal(tui.selRoute?.name, 'fable');
+  tui._key('left');
+  assert.equal(tui.selRoute, null);
+});
+
+test('TUI switch mode: ←→ are inert for remove/toggle actions', () => {
+  const routes = [{ name: 'fable', match: ['*fable*'], accounts: [{ name: 'a', eligible: true }] }];
+  const { tui } = makeTUI({ routes });
+  tui._key('d');                       // toggle action
+  tui._key('right'); tui._key('left');
+  assert.equal(tui.selRoute, null);
+});
+
 test('TUI: the F7 (Fable) marker sits on exactly one account — the routing target', () => {
   const future = Date.now() + 7 * 24 * 3600_000;
   const oauth = n => ({ name: n, type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: future });

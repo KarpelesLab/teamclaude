@@ -534,14 +534,11 @@ export class TUI {
     const len = this.am.accounts.length;
     if (k === 'up' || k === 'k') this.selIdx = Math.max(0, this.selIdx - 1);
     else if (k === 'down' || k === 'j') this.selIdx = Math.min(len - 1, this.selIdx + 1);
-    // Tab (switch only): cycle which route the pick applies to. null = the global
-    // default account; each getRoutes() entry = a per-route manual pin.
-    else if (k === 'tab' && this.selAction === 'switch') {
-      const routes = this.am.getRoutes();
-      const cycle = [null, ...routes];
-      const at = this.selRoute ? routes.findIndex(r => r.name === this.selRoute.name) + 1 : 0;
-      this.selRoute = cycle[(at + 1) % cycle.length];
-    }
+    // Tab / ←→ (switch only): cycle which route the pick applies to. null = the
+    // global default account; each getRoutes() entry = a per-route manual pin.
+    // ↑↓ move within the account list, so ←→ are free to move across targets.
+    else if ((k === 'tab' || k === 'right') && this.selAction === 'switch') this._cycleSelRoute(+1);
+    else if (k === 'left' && this.selAction === 'switch') this._cycleSelRoute(-1);
     else if (k === 'enter') {
       if (this.selAction === 'switch') {
         this._doSwitchSelection();
@@ -553,6 +550,18 @@ export class TUI {
       if (this.mode === 'select') this.mode = this.selReturn;
     }
     else if (k === 'esc' || k === 'q') { this.mode = this.selReturn; }
+  }
+
+  // Step the switch-mode pin target by `dir` through [default, ...routes],
+  // wrapping at both ends. A route that vanished between renders (an autocreated
+  // family route whose quota expired) leaves us at the default rather than
+  // stranding the cursor.
+  _cycleSelRoute(dir) {
+    const routes = this.am.getRoutes();
+    const cycle = [null, ...routes];
+    const at = this.selRoute ? routes.findIndex(r => r.name === this.selRoute.name) + 1 : 0;
+    const from = at < 1 ? 0 : at; // findIndex -1 → 0 → treat as the default entry
+    this.selRoute = cycle[(from + dir + cycle.length) % cycle.length];
   }
 
   // Apply an Enter in switch mode: with no route selected this sets the global
@@ -1413,7 +1422,7 @@ export class TUI {
           const target = this.selRoute
             ? routeColorFn(this.selRoute.color)(`route ${this.selRoute.name}`)
             : 'default';
-          return ` ${dim('↑↓')} select  ${bold('Tab')} target: ${target}  ${bold('Enter')} pin  ${bold('Esc')} cancel`;
+          return ` ${dim('↑↓')} select  ${dim('←→')} target: ${target}  ${bold('Enter')} pin  ${bold('Esc')} cancel`;
         }
         const act = this.selAction === 'toggle' ? 'enable/disable' : 'remove';
         return ` ${dim('↑↓')} select  ${bold('Enter')} ${act}  ${bold('Esc')} cancel`;
