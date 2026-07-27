@@ -469,7 +469,7 @@ Any Anthropic-compatible API can be added as an account alongside your Claude ac
   ```json
   { "name": "deepseek", "match": ["deepseek-*"], "accounts": ["deepseek"] }
   ```
-  Routes are more flexible (glob matching, multiple accounts, bucket override) and are the recommended way to pin model patterns to specific accounts. The `models` field is kept for backward compatibility but may be removed in a future version.
+  Routes are more flexible (glob matching, multiple accounts, bucket override) and are the recommended way to pin model patterns to specific accounts. They are also less surprising: a `models` list changes eligibility across the *whole fleet* — once any account claims a model, every account that doesn't claim it is skipped for that model. The field is kept for backward compatibility, but the server prints a deprecation notice at startup naming the route to replace it with, and it may be removed in a future version.
 
 To send a specific session to a third-party backend without touching others, define a route for its model patterns and use `--model` on launch or `/model` inside a session:
 
