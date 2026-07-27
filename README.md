@@ -31,7 +31,7 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 - **Session awareness** — tracks running Claude Code sessions (by their session id) and shows how many are active; opt into `distributeSessions` to spread concurrent sessions across accounts while keeping each one pinned for cache reuse
 - **Optional quota probe** — off by default; when enabled, periodically refreshes idle accounts' quota from the usage endpoint (no message spend), and surfaces the Sonnet and Fable weekly buckets
 - **Optional keep-warm** — off by default; when enabled, periodically starts idle accounts' 5h session timers with a minimal request (`teamclaude warmup`) so the next account isn't cold when rotation reaches it (spends a little quota, unlike the probe)
-- **Account pinning** — force a request onto one account via an `ANTHROPIC_BASE_URL=.../tc-acct/<name>` prefix, bypassing rotation
+- **Account pinning** — `TC_ACCT=<name>` pins a whole session to one account, bypassing rotation; works in both MITM and base-URL modes, and is stripped from the environment before claude starts
 - **MITM proxy mode (default)** — `teamclaude run` routes claude via an HTTPS forward proxy with a local CA so even hardcoded `api.anthropic.com` endpoints (e.g. the Claude Design MCP) get the real token injected; pass `--no-mitm` for base-URL routing only
 - **Optional sx.org proxy mode** — off by default; set an [sx.org](https://sx.org) API key in the TUI settings screen (`g`) and TeamClaude auto-provisions a residential proxy to change the egress IP and work around IP-based `429`s. Three modes (`m` to cycle): **always** (route all upstream traffic), **on 429 only** (stay direct, fail over to the proxy after a 429), or **off** (keep the key but don't use it). TLS stays end-to-end with Anthropic (the proxy only relays ciphertext)
 - **Request logging** — optional full request/response logging for debugging
@@ -431,18 +431,37 @@ In practice this rarely bites, because **TeamClaude prefers to keep you on one a
 
 > Keep-warm (above) is unrelated to this — it starts an idle account's **5h session timer**, not its prompt cache. A freshly-rotated account still takes a one-turn cache miss regardless.
 
-### Pin a request to a specific account
+### Pin a session to a specific account
 
-`ANTHROPIC_BASE_URL` with a `/tc-acct/<name-or-index>` prefix forces every request onto **one** account, bypassing rotation (and never failing over to another). This is what keep-warm uses internally, and it doubles as a manual way to exercise a specific account:
+`TC_ACCT` forces every request onto **one** account, bypassing rotation (and never failing over to another). It works in **both** modes — MITM (the default) and `--no-mitm`:
 
 ```bash
-# Route this whole claude session to the account named "work (Acme)" (index also works)
-ANTHROPIC_BASE_URL='http://127.0.0.1:3456/tc-acct/1' \
-ANTHROPIC_API_KEY='<your teamclaude proxy key>' \
-  claude -p --bare 'say hi'
+# Route this whole claude session to the account named "work (Acme)"
+TC_ACCT='work (Acme)' teamclaude run
+
+# A numeric rotation index works too
+TC_ACCT=1 teamclaude run
 ```
 
-The `<name>` matches an account's display name exactly (URL-encode spaces/parens), or a numeric rotation index. An unknown pin returns `404`. The prefix is stripped before the request is forwarded upstream.
+`TC_ACCT` is read by `teamclaude run` and **removed from the environment before claude is launched** — it never reaches the client or anything it spawns. Under `--no-mitm` teamclaude builds the pinned base URL itself; under MITM it travels as the proxy credential on each `CONNECT`, which is the only pin channel an `HTTPS_PROXY` URL can carry. Either way you don't hand-write a URL.
+
+The value matches an account's display name exactly (no escaping needed — spaces, `@` and parens are handled for you), or a numeric rotation index. An unknown account is refused up front rather than quietly served by whichever account rotation picked.
+
+<details>
+<summary>Pinning without <code>teamclaude run</code></summary>
+
+Talking to the proxy directly, the pin is a `/tc-acct/<name-or-index>` path prefix. This is what keep-warm uses internally, and it's handy for exercising one account from a script:
+
+```bash
+curl -s http://127.0.0.1:3456/tc-acct/1/v1/messages \
+  -H 'content-type: application/json' \
+  -H 'x-api-key: <your teamclaude proxy key>' \
+  -d '{"model":"claude-sonnet-4-6","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}'
+```
+
+URL-encode spaces and parens in a name here. An unknown pin returns `404`. The prefix is stripped before the request is forwarded upstream.
+
+</details>
 
 ### Third-party backend accounts
 

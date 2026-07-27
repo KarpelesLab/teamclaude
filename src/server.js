@@ -213,7 +213,7 @@ const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/files/', '/api/oauth/f
  * aware routing, and retry-on-quota behavior. Control endpoints (status/reload)
  * and the proxy-API-key gate live in the base server's wrapper, not here.
  */
-export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {} }) {
+export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null }) {
   let counter = 0;
   return async (req, res) => {
     try {
@@ -260,6 +260,24 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
           return;
         }
         req.url = pin[2];
+      }
+
+      // MITM-mode pin. A CONNECT carrying `Proxy-Authorization: Basic <acct>:…`
+      // has no URL to hang a `/tc-acct/` prefix on — the path inside the tunnel
+      // is the real Anthropic one — so the pin arrives as a listener bound to
+      // that account (see createConnectHandler). Resolved per request rather
+      // than at CONNECT time: a hot reload can renumber accounts while a tunnel
+      // is open, and a name outliving an index is the safer half of that race.
+      if (pinnedIndex == null && forcedPin != null) {
+        pinnedIndex = resolveAccountPin(accountManager, forcedPin);
+        if (pinnedIndex == null) {
+          const reqId = ++counter;
+          const sessionId = req.headers['x-claude-code-session-id'] || null;
+          if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(unknown pin: "${forcedPin}")`, status: 404, model: null, sessionId, pinned: false });
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: `Unknown account pin "${forcedPin}" (from TC_ACCT)` } }));
+          return;
+        }
       }
 
       const reqId = ++counter;

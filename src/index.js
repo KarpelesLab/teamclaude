@@ -664,10 +664,15 @@ async function runCommand() {
   // opt back into the transparent direct launch (e.g. for a dumb shell alias).
   const port = config.proxy.port;
   const env = { ...process.env };
-  // A caller-supplied ANTHROPIC_BASE_URL of http://<this proxy>/tc-acct/<name>
-  // pins the session to one account. Detected up front so BOTH modes can act on
-  // it: base-URL mode preserves it, MITM mode says it is ignoring it. Dropping
-  // it silently is what made the documented shell alias look broken by default.
+  // TC_ACCT pins this session to one account, in either mode. It is teamclaude's
+  // own knob, so it never reaches the child: claude has no use for it, and an
+  // account name is not something to leak into a subprocess environment that
+  // gets inherited by every tool and MCP server claude spawns.
+  const tcAcct = (process.env.TC_ACCT || '').trim();
+  delete env.TC_ACCT;
+  // Legacy: a caller-supplied ANTHROPIC_BASE_URL of http://<this proxy>/tc-acct/…
+  // also pins (shipped in 1.1.10). TC_ACCT is the supported way now — it works in
+  // MITM mode too, and keeps the pin out of the API path.
   const pinnedBase = isLocalAccountPin(process.env.ANTHROPIC_BASE_URL, port);
   if (await isProxyUp(port)) {
     if (useMitm) {
@@ -676,22 +681,37 @@ async function runCommand() {
       // real token injected. claude trusts our MITM leaf via NODE_EXTRA_CA_CERTS.
       const host = upstreamHost(config);
       const { caPath } = await ensureCerts(host);
-      const proxyUrl = `http://127.0.0.1:${port}`;
+      // The pin rides in the proxy URL's userinfo, which the client forwards as
+      // `Proxy-Authorization: Basic <acct>:<key>` on each CONNECT — the only pin
+      // channel an HTTPS_PROXY env var can express. The password slot keeps the
+      // proxy apiKey, matching the existing `--proxy http://<key>@host:port`
+      // form, so auth and pinning coexist in one URL.
+      const userinfo = tcAcct
+        ? `${encodeURIComponent(tcAcct)}:${encodeURIComponent(config.proxy?.apiKey || '')}@`
+        : '';
+      const proxyUrl = `http://${userinfo}127.0.0.1:${port}`;
       env.HTTPS_PROXY = env.HTTP_PROXY = env.https_proxy = env.http_proxy = proxyUrl;
       env.NO_PROXY = env.no_proxy = 'localhost,127.0.0.1,::1';
       env.NODE_EXTRA_CA_CERTS = caPath;
-      if (pinnedBase) {
-        console.error('[TeamClaude] Account pin in ANTHROPIC_BASE_URL ignored: MITM mode intercepts api.anthropic.com directly and does not use a base URL.');
-        console.error('[TeamClaude] Re-run with --no-mitm for the pin to take effect.');
+      if (tcAcct) console.error(`[TeamClaude] Pinned to account "${tcAcct}" (TC_ACCT)`);
+      else if (pinnedBase) {
+        console.error('[TeamClaude] Account pin in ANTHROPIC_BASE_URL ignored: MITM mode does not use a base URL.');
+        console.error('[TeamClaude] Use TC_ACCT=<account> instead — it pins in both modes.');
       }
       delete env.ANTHROPIC_BASE_URL;
     } else {
       // Only set ANTHROPIC_BASE_URL — Claude Code keeps its own OAuth token
       // which the proxy accepts from localhost. Not setting ANTHROPIC_API_KEY
       // lets Claude Code stay in subscription mode (full model access).
-      // If the caller already set ANTHROPIC_BASE_URL to a /tc-acct/<pin> URL
-      // pointing at this proxy, preserve it so the account pin takes effect.
-      if (!pinnedBase) env.ANTHROPIC_BASE_URL = `http://localhost:${port}`;
+      // TC_ACCT wins; teamclaude builds the pinned URL itself rather than making
+      // the caller hand-write one. Otherwise an existing /tc-acct/ base URL
+      // pointing at this proxy is preserved for configs written against 1.1.10.
+      if (tcAcct) {
+        env.ANTHROPIC_BASE_URL = `http://localhost:${port}/tc-acct/${encodeURIComponent(tcAcct)}`;
+        console.error(`[TeamClaude] Pinned to account "${tcAcct}" (TC_ACCT)`);
+      } else if (!pinnedBase) {
+        env.ANTHROPIC_BASE_URL = `http://localhost:${port}`;
+      }
     }
   } else if (autoFallback) {
     console.error(`[TeamClaude] Proxy not running on port ${port} — launching claude directly (--auto-fallback; start it with: teamclaude server)`);
