@@ -895,6 +895,8 @@ async function accountsCommand() {
     console.log(`  [${i + 1}] ${a.name} (${status}${src})`);
     if (hasProfile && p.email && p.email !== a.name) console.log(`       Email: ${p.email}`);
     if (hasProfile && p.orgName) console.log(`       Org:   ${p.orgName}`);
+    // The stable pin identity (TC_ACCT), unlike the display name above.
+    if (a.accountUuid) console.log(`       ID:    ${a.accountUuid}`);
     if (verbose && a.expiresAt) {
       const remaining = a.expiresAt - Date.now();
       if (remaining <= 0) {
@@ -1338,12 +1340,15 @@ Options:
                       of erroring out (bypasses the proxy: no rotation)
 
 Environment:
-  TC_ACCT             Pin a session to ONE account, bypassing rotation. Accepts
-                      an account name or rotation index, and works in both modes:
-                        TC_ACCT='work (Acme)' teamclaude run
-                      Read by 'run' and 'env', then removed from the environment
-                      so it never reaches claude or the tools it spawns. An
-                      unknown account is refused rather than silently rotated.
+  TC_ACCT             Pin a session to ONE account, bypassing rotation. Works in
+                      both modes. Accepts accountUuid, orgUuid,
+                      accountUuid/orgUuid, or a display name/email:
+                        TC_ACCT=me@example.com teamclaude run
+                      Prefer a UUID for anything scripted: display names are
+                      rewritten when an email gains a second org. Read by 'run'
+                      and 'env', then removed from the environment so it never
+                      reaches claude or the tools it spawns. An unknown account
+                      is refused rather than silently rotated.
   TEAMCLAUDE_CONFIG   Path to the config file (default below)
   TEAMCLAUDE_DISABLE_AUTOUPDATE=1
                       Skip the background self-update check

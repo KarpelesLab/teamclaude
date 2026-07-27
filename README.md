@@ -31,7 +31,7 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 - **Session awareness** — tracks running Claude Code sessions (by their session id) and shows how many are active; opt into `distributeSessions` to spread concurrent sessions across accounts while keeping each one pinned for cache reuse
 - **Optional quota probe** — off by default; when enabled, periodically refreshes idle accounts' quota from the usage endpoint (no message spend), and surfaces the Sonnet and Fable weekly buckets
 - **Optional keep-warm** — off by default; when enabled, periodically starts idle accounts' 5h session timers with a minimal request (`teamclaude warmup`) so the next account isn't cold when rotation reaches it (spends a little quota, unlike the probe)
-- **Account pinning** — `TC_ACCT=<name>` pins a whole session to one account, bypassing rotation; works in both MITM and base-URL modes, and is stripped from the environment before claude starts
+- **Account pinning** — `TC_ACCT=<uuid-or-name>` pins a whole session to one account, bypassing rotation; works in both MITM and base-URL modes, and is stripped from the environment before claude starts
 - **MITM proxy mode (default)** — `teamclaude run` routes claude via an HTTPS forward proxy with a local CA so even hardcoded `api.anthropic.com` endpoints (e.g. the Claude Design MCP) get the real token injected; pass `--no-mitm` for base-URL routing only
 - **Optional sx.org proxy mode** — off by default; set an [sx.org](https://sx.org) API key in the TUI settings screen (`g`) and TeamClaude auto-provisions a residential proxy to change the egress IP and work around IP-based `429`s. Three modes (`m` to cycle): **always** (route all upstream traffic), **on 429 only** (stay direct, fail over to the proxy after a 429), or **off** (keep the key but don't use it). TLS stays end-to-end with Anthropic (the proxy only relays ciphertext)
 - **Request logging** — optional full request/response logging for debugging
@@ -246,7 +246,7 @@ Volatile runtime state (observed quota) is written separately to `teamclaude.sta
 
 | Variable | Effect |
 | --- | --- |
-| `TC_ACCT` | Pin a session to **one** account, bypassing rotation — see [Pin a session to a specific account](#pin-a-session-to-a-specific-account). Accepts a name or rotation index. Read by `teamclaude run` and `teamclaude env`, then removed from the environment so it never reaches claude |
+| `TC_ACCT` | Pin a session to **one** account, bypassing rotation — see [Pin a session to a specific account](#pin-a-session-to-a-specific-account). Accepts `accountUuid`, `orgUuid`, `accountUuid/orgUuid`, or a display name/email. Read by `teamclaude run` and `teamclaude env`, then removed from the environment so it never reaches claude |
 | `TEAMCLAUDE_CONFIG` | Path to the config file (default `~/.config/teamclaude.json`) |
 | `TEAMCLAUDE_DISABLE_AUTOUPDATE` | Set to `1` to skip the background self-update check |
 
@@ -442,11 +442,11 @@ In practice this rarely bites, because **TeamClaude prefers to keep you on one a
 `TC_ACCT` forces every request onto **one** account, bypassing rotation (and never failing over to another). It works in **both** modes — MITM (the default) and `--no-mitm`:
 
 ```bash
-# Route this whole claude session to the account named "work (Acme)"
-TC_ACCT='work (Acme)' teamclaude run
+# By email — what you'll normally use
+TC_ACCT=me@example.com teamclaude run
 
-# A numeric rotation index works too
-TC_ACCT=1 teamclaude run
+# By accountUuid — stable across renames; `teamclaude accounts` prints it
+TC_ACCT=a1b2c3d4-… teamclaude run
 ```
 
 `TC_ACCT` is read by `teamclaude run` and **removed from the environment before claude is launched** — it never reaches the client or anything it spawns. Under `--no-mitm` teamclaude builds the pinned base URL itself; under MITM it travels as the proxy credential on each `CONNECT`, which is the only pin channel an `HTTPS_PROXY` URL can carry. Either way you don't hand-write a URL.
@@ -454,15 +454,21 @@ TC_ACCT=1 teamclaude run
 `teamclaude env` honours it identically, so a tool that spawns claude itself gets the same pin:
 
 ```bash
-TC_ACCT='work (Acme)' eval "$(teamclaude env)"
+TC_ACCT=me@example.com eval "$(teamclaude env)"
 ```
 
-The value matches an account's display name exactly (no escaping needed — spaces, `@` and parens are handled for you), or a numeric rotation index. An unknown account is refused up front rather than quietly served by whichever account rotation picked.
+The value matches an `accountUuid`, an `orgUuid`, or a display name/email — first match wins. No escaping needed; spaces, `@` and parens are handled for you. An unknown value is refused up front rather than quietly served by whichever account rotation picked.
+
+Prefer the `accountUuid` (printed by `teamclaude accounts`) for anything scripted: display names are rewritten in place, since an account is named by its email and gains an ` (Org)` suffix the moment that email holds a second org.
+
+The rotation index is **not** accepted — it is array position, so deleting an account would silently repoint every later pin at a *different* account.
+
+> If you hold the *same* account in two orgs, a bare uuid or email matches the first one. `TC_ACCT=<accountUuid>/<orgUuid>` picks a specific one — rarely needed.
 
 <details>
-<summary>Pinning without <code>teamclaude run</code></summary>
+<summary>Pinning without <code>teamclaude run</code> (<code>/tc-acct/</code>, deprecated)</summary>
 
-Talking to the proxy directly, the pin is a `/tc-acct/<name-or-index>` path prefix. This is what keep-warm uses internally, and it's handy for exercising one account from a script:
+**Deprecated** — use `TC_ACCT` instead. The path-prefix form cannot work in MITM mode (inside a CONNECT tunnel the path is the real upstream one), so it only covers half the product. It still works for keep-warm's internal use and for calling the proxy directly:
 
 ```bash
 curl -s http://127.0.0.1:3456/tc-acct/1/v1/messages \
@@ -471,7 +477,7 @@ curl -s http://127.0.0.1:3456/tc-acct/1/v1/messages \
   -d '{"model":"claude-sonnet-4-6","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}'
 ```
 
-URL-encode spaces and parens in a name here. An unknown pin returns `404`. The prefix is stripped before the request is forwarded upstream.
+URL-encode spaces and parens in a name here. The fully-qualified `accountUuid/orgUuid` form is **not** expressible in a path (the `/` is the delimiter) — use `TC_ACCT` for that. An unknown pin returns `404`. The prefix is stripped before the request is forwarded upstream.
 
 </details>
 

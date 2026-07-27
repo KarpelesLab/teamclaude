@@ -255,12 +255,11 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
 // carry a `/tc-acct/` prefix — inside the tunnel the path is the real upstream
 // one). Clients send this preemptively on every CONNECT.
 export function connectPinToken(req) {
-  const m = /^\s*basic\s+(.+?)\s*$/i.exec(req?.headers?.['proxy-authorization'] || '');
-  if (!m) return null;
-  const dec = Buffer.from(m[1], 'base64').toString('utf8'); // "user:pass"
-  const i = dec.indexOf(':');
-  const user = i >= 0 ? dec.slice(0, i) : dec;
-  return user || null;
+  const header = (req?.headers?.['proxy-authorization'] || '').trim();
+  if (!header.toLowerCase().startsWith('basic ')) return null;
+  const dec = Buffer.from(header.slice('basic '.length).trim(), 'base64').toString('utf8'); // "user:pass"
+  const colon = dec.indexOf(':');
+  return (colon >= 0 ? dec.slice(0, colon) : dec) || null;
 }
 
 /**

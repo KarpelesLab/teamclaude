@@ -18,6 +18,8 @@ export const HOP_BY_HOP_HEADERS = new Set([
   'host', 'connection', 'keep-alive', 'transfer-encoding',
   'te', 'trailer', 'upgrade', 'proxy-authorization', 'proxy-authenticate',
 ]);
+// Path prefix for the deprecated URL-based account pin (superseded by TC_ACCT).
+const PIN_PREFIX = '/tc-acct/';
 const INLINE_RETRY_AFTER_MAX_SECONDS = 15;
 // How long the proxy will absorb a rate-limit 429's retry-after inline (waiting
 // on the SAME account) before surfacing a 429 + retry-after to the client. A
@@ -142,16 +144,42 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
   return server;
 }
 
-// Resolve an account-pin token (from a `/tc-acct/<token>` URL) to an account
-// index, or null if it matches nothing. Matches by exact account name first,
-// then by numeric index. Exported for tests.
+/**
+ * Resolve an account pin to an index, or null.
+ *
+ * Accepted forms, first match wins:
+ *   - `accountUuid/orgUuid` — fully qualified, the only form that distinguishes
+ *     one person's accounts across several orgs
+ *   - `accountUuid`
+ *   - `orgUuid`
+ *   - the display name (`email` or `email (Org)`), or the bare email
+ *
+ * UUIDs are the identity to use for anything scripted or long-lived: display
+ * names are rewritten in place when an email gains a second org (see
+ * accountsCommand), so a name is a convenience, not an identifier.
+ *
+ * The rotation index is deliberately NOT accepted. It is array position, so
+ * deleting an account would silently repoint every later pin at a DIFFERENT
+ * account — a wrong-account misroute rather than an honest failure.
+ */
 export function resolveAccountPin(accountManager, token) {
-  const byName = accountManager.accounts.findIndex(a => a.name === token);
-  if (byName >= 0) return byName;
-  if (/^\d+$/.test(token)) {
-    const i = Number(token);
-    if (i >= 0 && i < accountManager.accounts.length) return i;
-  }
+  const accounts = accountManager.accounts || [];
+  const norm = (s) => (s || '').trim().toLowerCase();
+  const t = norm(token);
+  if (!t) return null;
+
+  const at = (pick) => accounts.findIndex(a => norm(pick(a)) === t);
+  const qualified = accounts.findIndex(a => a.accountUuid && a.orgUuid
+    && `${norm(a.accountUuid)}/${norm(a.orgUuid)}` === t);
+
+  for (const i of [
+    qualified,
+    at(a => a.accountUuid),
+    at(a => a.orgUuid),
+    at(a => a.name),
+    at(a => (a.name || '').split(' (')[0]), // display name minus the org suffix
+  ]) if (i >= 0) return i;
+
   return null;
 }
 
@@ -247,9 +275,17 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // one account, bypassing rotation. Used by the keep-warm scheduler and for
       // manual per-account testing. The prefix is stripped before forwarding.
       let pinnedIndex = null;
-      const pin = (req.url || '').match(/^\/tc-acct\/([^/]+)(\/.*)$/);
-      if (pin) {
-        const token = decodeURIComponent(pin[1]);
+      // DEPRECATED: the path-prefix pin. Superseded by TC_ACCT, which works in
+      // MITM mode too (this form cannot — inside a CONNECT tunnel the path is
+      // the real upstream one). Kept for the warmer and for direct API callers.
+      // One segment only, so the fully-qualified `accountUuid/orgUuid` form is
+      // not expressible here; use TC_ACCT for that.
+      const url = req.url || '';
+      const afterPrefix = url.startsWith(PIN_PREFIX) ? url.slice(PIN_PREFIX.length) : null;
+      // The token runs to the next '/', which also begins the real request path.
+      const tokenEnd = afterPrefix == null ? -1 : afterPrefix.indexOf('/');
+      if (tokenEnd > 0) {
+        const token = decodeURIComponent(afterPrefix.slice(0, tokenEnd));
         pinnedIndex = resolveAccountPin(accountManager, token);
         if (pinnedIndex == null) {
           const reqId = ++counter;
@@ -259,7 +295,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
           res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: `Unknown account pin "${token}"` } }));
           return;
         }
-        req.url = pin[2];
+        req.url = afterPrefix.slice(tokenEnd);
       }
 
       // MITM-mode pin. A CONNECT carrying `Proxy-Authorization: Basic <acct>:…`

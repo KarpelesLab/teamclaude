@@ -19,6 +19,7 @@
 // exactly the account we want to warm.
 
 import { spawn } from 'node:child_process';
+import { encodePinComponent } from './claude-env.js';
 
 export class Warmer {
   constructor(accountManager, {
@@ -146,9 +147,12 @@ export class Warmer {
   /** The `claude` invocation for one account. Pure/deterministic so tests can
    *  assert the args and env without spawning anything. */
   _spawnSpec(account, signal) {
-    // Pin by INDEX (stable, and free of the spaces/parens real account names
-    // carry, which would otherwise need URL-encoding).
-    const baseUrl = `http://127.0.0.1:${this.port}/tc-acct/${account.index}`;
+    // Pin by accountUuid — a stable identity. The rotation index is NOT usable:
+    // it is array position, so removing an account would repoint this at a
+    // different one. Fall back to the display name when the uuid isn't known
+    // yet (e.g. an API-key account, or before the first profile fetch).
+    const pin = encodePinComponent(account.accountUuid || account.name);
+    const baseUrl = `http://127.0.0.1:${this.port}/tc-acct/${pin}`;
     return {
       command: 'claude',
       // `--bare -p`: minimal, non-interactive, auth strictly via ANTHROPIC_API_KEY

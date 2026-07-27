@@ -95,8 +95,8 @@ test('the Basic username selects the account', () => {
   assert.deepEqual(resolveConnectPin({ headers: { 'proxy-authorization': basic('work:k') } }, am, 'k'), { pin: 'work', error: null });
   // No key configured — username alone still pins.
   assert.deepEqual(resolveConnectPin({ headers: { 'proxy-authorization': basic('personal:') } }, am, null), { pin: 'personal', error: null });
-  // Numeric index, same as the /tc-acct/ form accepts.
-  assert.deepEqual(resolveConnectPin({ headers: { 'proxy-authorization': basic('1:') } }, am, null), { pin: '1', error: null });
+  // A rotation index is not a pin form — array position moves under deletion.
+  assert.deepEqual(resolveConnectPin({ headers: { 'proxy-authorization': basic('1:') } }, am, null), { pin: null, error: 'Unknown account pin "1"' });
 });
 
 // The documented remote form is `--proxy http://<key>@host:port`, which puts the

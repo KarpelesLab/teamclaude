@@ -14,24 +14,51 @@ function oauth(name) {
 
 // ── resolveAccountPin (unit) ─────────────────────────────────────────────────
 
-test('resolveAccountPin matches by exact name, then by numeric index', () => {
-  const am = new AccountManager([oauth('alpha'), oauth('beta')], 0.98);
-  assert.equal(resolveAccountPin(am, 'alpha'), 0);
-  assert.equal(resolveAccountPin(am, 'beta'), 1);
-  assert.equal(resolveAccountPin(am, '0'), 0);
-  assert.equal(resolveAccountPin(am, '1'), 1);
+const withIds = (name, accountUuid, orgUuid) => ({ ...oauth(name), accountUuid, orgUuid });
+
+test('resolveAccountPin matches by accountUuid, orgUuid, name and email', () => {
+  const am = new AccountManager([
+    withIds('me@x.com (Acme)', 'AAA', 'O1'),
+    withIds('me@x.com (Beta)', 'AAA', 'O2'),
+    withIds('other@x.com', 'BBB', 'O3'),
+  ], 0.98);
+  assert.equal(resolveAccountPin(am, 'BBB'), 2);              // accountUuid
+  assert.equal(resolveAccountPin(am, 'O2'), 1);               // orgUuid
+  assert.equal(resolveAccountPin(am, 'me@x.com (Beta)'), 1);  // display name
+  assert.equal(resolveAccountPin(am, 'other@x.com'), 2);      // bare email
+  assert.equal(resolveAccountPin(am, 'BbB'), 2);              // case-insensitive
 });
 
-test('resolveAccountPin returns null for an unknown name or out-of-range index', () => {
+// One account across several orgs shares an accountUuid, so the qualified form
+// is the only way to name the second one; a bare uuid takes the first match.
+test('accountUuid/orgUuid selects one account among an org set', () => {
+  const am = new AccountManager([
+    withIds('me@x.com (Acme)', 'AAA', 'O1'),
+    withIds('me@x.com (Beta)', 'AAA', 'O2'),
+  ], 0.98);
+  assert.equal(resolveAccountPin(am, 'AAA/O2'), 1);
+  assert.equal(resolveAccountPin(am, 'AAA/O1'), 0);
+  assert.equal(resolveAccountPin(am, 'AAA'), 0);       // first match wins
+  assert.equal(resolveAccountPin(am, 'me@x.com'), 0);  // ditto for the email
+});
+
+// The rotation index is array position: deleting an account would repoint every
+// later pin at a DIFFERENT account, so it is not an accepted pin form.
+test('resolveAccountPin does not accept a rotation index', () => {
+  const am = new AccountManager([oauth('alpha'), oauth('beta')], 0.98);
+  assert.equal(resolveAccountPin(am, '0'), null);
+  assert.equal(resolveAccountPin(am, '1'), null);
+});
+
+test('resolveAccountPin returns null for an unknown token', () => {
   const am = new AccountManager([oauth('alpha')], 0.98);
   assert.equal(resolveAccountPin(am, 'nope'), null);
+  assert.equal(resolveAccountPin(am, ''), null);
   assert.equal(resolveAccountPin(am, '9'), null);
-  assert.equal(resolveAccountPin(am, '-1'), null); // not matched by \d+
 });
 
-test('a name that looks numeric is matched as a name before falling back to index', () => {
+test('an account literally named "0" still resolves by name', () => {
   const am = new AccountManager([oauth('x'), { ...oauth('y'), name: '0' }], 0.98);
-  // The account literally named "0" (index 1) wins over index 0.
   assert.equal(resolveAccountPin(am, '0'), 1);
 });
 
@@ -82,7 +109,7 @@ test('a /tc-acct/<name> request is routed to that exact account, prefix stripped
 
 test('pinning by numeric index also works', async () => {
   await withProxy(async ({ proxyPort, seen }) => {
-    const res = await post(`http://127.0.0.1:${proxyPort}/tc-acct/0/v1/messages`);
+    const res = await post(`http://127.0.0.1:${proxyPort}/tc-acct/alpha/v1/messages`);
     await res.text();
     assert.equal(res.status, 200);
     assert.equal(seen[0].auth, 'Bearer t-alpha');

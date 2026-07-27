@@ -41,7 +41,7 @@ test('warms only healthy, idle Anthropic OAuth accounts with no live 5h window',
   await makeWarmer(am, spawn).warmAll();
 
   assert.equal(spawn.calls.length, 1, 'exactly one account warmed');
-  assert.match(spawn.calls[0].env.ANTHROPIC_BASE_URL, /\/tc-acct\/0$/, 'pinned the idle account (index 0)');
+  assert.ok(spawn.calls[0].env.ANTHROPIC_BASE_URL.endsWith('/tc-acct/idle'), spawn.calls[0].env.ANTHROPIC_BASE_URL);
 });
 
 test('an expired 5h window is a warm target again (keeps the timer going)', async () => {
@@ -71,7 +71,7 @@ test('the spawn invocation is a minimal non-interactive claude pinned to the acc
   const spec = spawn.calls[0];
   assert.equal(spec.command, 'claude');
   assert.deepEqual(spec.args, ['-p', '--bare', '--model', 'haiku', '--output-format', 'text', 'hi']);
-  assert.equal(spec.env.ANTHROPIC_BASE_URL, 'http://127.0.0.1:9999/tc-acct/0');
+  assert.equal(spec.env.ANTHROPIC_BASE_URL, 'http://127.0.0.1:9999/tc-acct/a');
   assert.equal(spec.env.ANTHROPIC_API_KEY, 'tc-secret');
 });
 
