@@ -6,6 +6,12 @@ import { SessionTracker } from './session-tracker.js';
 // Re-exported for callers that import these model helpers from here.
 export { isFableModel, parseRequestModel, parseAdvisorModel } from './model.js';
 
+// How long after a successful token refresh a forced (post-401) refresh is
+// suppressed. Long enough to cover the 401s from requests already in flight
+// when the token turned over, short enough that a genuinely bad new token
+// recovers on the next request rather than staying stuck.
+const FORCED_REFRESH_FLOOR_MS = 10_000;
+
 // Quota fields that survive a restart: utilization levels and their reset
 // windows, learned passively from upstream responses. Transient/derived state
 // (probing, requalify, rateLimitedUntil) is intentionally excluded.
@@ -78,6 +84,10 @@ function makeAccount(acct, index) {
     // retry-after. Distinct from `throttled`/rateLimitedUntil: it does NOT
     // make the account unavailable, so selection never rotates away from it.
     pausedUntil: null,
+    // When this account's token was last successfully refreshed. Gates forced
+    // (post-401) refreshes so a burst of stale in-flight requests can't rotate
+    // the refresh-token family once per request — see ensureTokenFresh.
+    _lastRefreshAt: null,
   };
 }
 
@@ -90,7 +100,9 @@ function modelMatches(declared, model) {
 }
 
 export class AccountManager {
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, throttleProbeFloorMs, routes, ramp, distributeSessions = false, sessionTracker } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, throttleProbeFloorMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, sessionTracker } = {}) {
+    // How long a just-minted token is trusted against a forced refresh.
+    this._forcedRefreshFloorMs = forcedRefreshFloorMs;
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
     // OAuth token refresh.
     this._refreshFn = refreshFn;
@@ -1153,6 +1165,21 @@ export class AccountManager {
 
     if (!force && !isTokenExpiringSoon(account.expiresAt)) return;
 
+    // A forced refresh answers a 401, but 401s arrive in bursts: every request
+    // already in flight when the token went bad comes back rejected, and each
+    // one would force its own refresh. Coalescing only covers refreshes that
+    // OVERLAP — these arrive staggered, so they would rotate the refresh-token
+    // family once per request and make the proxy the very "other holder
+    // rotating the family" that causes this failure in the first place. A 401
+    // for a token minted moments ago is stale news from a request sent before
+    // the refresh landed, so trust the new token and let the caller retry with
+    // it. Only an expiry-driven refresh (force=false) bypasses this — it isn't
+    // reacting to a response and can't stampede.
+    if (force && account._lastRefreshAt !== null
+        && Date.now() - account._lastRefreshAt < this._forcedRefreshFloorMs) {
+      return;
+    }
+
     // Coalesce concurrent refreshes
     if (account._refreshPromise) return account._refreshPromise;
 
@@ -1163,6 +1190,7 @@ export class AccountManager {
         account.credential = newTokens.accessToken;
         account.refreshToken = newTokens.refreshToken;
         account.expiresAt = newTokens.expiresAt;
+        account._lastRefreshAt = Date.now();
         console.log(`[TeamClaude] Token refreshed for account "${account.name}"`);
         this._onTokenRefresh?.(accountIndex, newTokens);
       } catch (err) {

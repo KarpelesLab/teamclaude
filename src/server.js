@@ -526,6 +526,10 @@ function formatHeaders(headers) {
 
 export async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, useSx) {
   const maxRetries = accountManager.accounts.length;
+  // This function is exported, so a caller may hand us a ctx built elsewhere.
+  // The 401 path reads ctx.reauthed on every response; default it here rather
+  // than trusting every construction site to include it.
+  ctx.reauthed ??= new Set();
   // Whether THIS attempt dials via sx.org. Undefined on the first call → derive
   // from the default policy ('always' routes; 'off'/'429' start direct).
   const route = useSx === undefined ? !!(sx?.useByDefault()) : useSx;
