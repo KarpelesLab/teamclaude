@@ -18,7 +18,7 @@ import { TUI } from './tui.js';
 import { SxManager } from './sx.js';
 import { autoUpdate, checkForUpdate, currentVersion, runUpdate, installKind, PKG_NAME } from './updater.js';
 import { renderStatus } from './status-renderer.js';
-import { buildClaudeEnvLines } from './claude-env.js';
+import { buildClaudeEnvLines, encodePinComponent } from './claude-env.js';
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
 
 const args = process.argv.slice(2);
@@ -625,11 +625,24 @@ async function envCommand() {
   let caPath = null;
   if (useMitm) ({ caPath } = await ensureCerts(upstreamHost(config)));
 
-  const lines = buildClaudeEnvLines({ port, useMitm, caPath, holdSeconds: config.holdSeconds });
+  // Same pin as `teamclaude run`, so `eval "$(teamclaude env)"` and `run` agree.
+  const account = (process.env.TC_ACCT || '').trim();
+  const lines = buildClaudeEnvLines({
+    port, useMitm, caPath, holdSeconds: config.holdSeconds,
+    account, proxyApiKey: config.proxy?.apiKey || '',
+  });
   process.stdout.write(`${lines.join('\n')}\n`);
 
   const mode = useMitm ? 'MITM forward-proxy' : 'base-URL';
   process.stderr.write(`# TeamClaude env: ${mode} mode, localhost:${port}\n`);
+  if (account) {
+    process.stderr.write(`# pinned to account "${account}" (TC_ACCT)\n`);
+    // Warn, don't fail: the account list can change before the shell is used,
+    // and this command must stay eval-safe.
+    if (!(config.accounts || []).some((a, i) => a.name === account || String(i) === account)) {
+      process.stderr.write(`# warning: no account named "${account}" in the config — the proxy will refuse this pin\n`);
+    }
+  }
   process.stderr.write(`# apply to this shell:  eval "$(teamclaude env${useMitm ? '' : ' --no-mitm'})"\n`);
   if (!(await isProxyUp(port))) {
     process.stderr.write(`# note: proxy not running on port ${port} — start it with: teamclaude server\n`);
@@ -687,7 +700,7 @@ async function runCommand() {
       // proxy apiKey, matching the existing `--proxy http://<key>@host:port`
       // form, so auth and pinning coexist in one URL.
       const userinfo = tcAcct
-        ? `${encodeURIComponent(tcAcct)}:${encodeURIComponent(config.proxy?.apiKey || '')}@`
+        ? `${encodePinComponent(tcAcct)}:${encodePinComponent(config.proxy?.apiKey || '')}@`
         : '';
       const proxyUrl = `http://${userinfo}127.0.0.1:${port}`;
       env.HTTPS_PROXY = env.HTTP_PROXY = env.https_proxy = env.http_proxy = proxyUrl;
@@ -707,7 +720,7 @@ async function runCommand() {
       // the caller hand-write one. Otherwise an existing /tc-acct/ base URL
       // pointing at this proxy is preserved for configs written against 1.1.10.
       if (tcAcct) {
-        env.ANTHROPIC_BASE_URL = `http://localhost:${port}/tc-acct/${encodeURIComponent(tcAcct)}`;
+        env.ANTHROPIC_BASE_URL = `http://localhost:${port}/tc-acct/${encodePinComponent(tcAcct)}`;
         console.error(`[TeamClaude] Pinned to account "${tcAcct}" (TC_ACCT)`);
       } else if (!pinnedBase) {
         env.ANTHROPIC_BASE_URL = `http://localhost:${port}`;
@@ -1288,7 +1301,8 @@ Commands:
                       unless --auto-fallback launches claude directly instead).
                       Routes via an HTTPS forward proxy + local CA by default, so
                       even hardcoded api.anthropic.com endpoints are intercepted;
-                      --no-mitm uses base-URL routing only
+                      --no-mitm uses base-URL routing only. Set TC_ACCT to pin
+                      the session to one account (see Environment below)
   alias               Print a shell alias so plain 'claude' routes via the proxy
                       (--install to write it to your shell rc; --uninstall to remove)
   status [--json]     Show rich proxy/account/probe status (live)
@@ -1322,6 +1336,17 @@ Options:
   --no-mitm           (run) skip the forward proxy; route via ANTHROPIC_BASE_URL only
   --auto-fallback     (run) if the proxy is down, launch claude directly instead
                       of erroring out (bypasses the proxy: no rotation)
+
+Environment:
+  TC_ACCT             Pin a session to ONE account, bypassing rotation. Accepts
+                      an account name or rotation index, and works in both modes:
+                        TC_ACCT='work (Acme)' teamclaude run
+                      Read by 'run' and 'env', then removed from the environment
+                      so it never reaches claude or the tools it spawns. An
+                      unknown account is refused rather than silently rotated.
+  TEAMCLAUDE_CONFIG   Path to the config file (default below)
+  TEAMCLAUDE_DISABLE_AUTOUPDATE=1
+                      Skip the background self-update check
 
 The server always accepts both base-URL and proxy/CONNECT clients, so instances
 launched with and without --no-mitm can share one server.

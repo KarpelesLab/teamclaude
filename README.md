@@ -242,7 +242,13 @@ Config is stored at `~/.config/teamclaude.json` (or `$XDG_CONFIG_HOME/teamclaude
 
 Volatile runtime state (observed quota) is written separately to `teamclaude.state.json` alongside the config, so the config file stays clean and hand-editable. The state file is safe to delete — quota is simply re-learned from traffic.
 
-Override the config path with `TEAMCLAUDE_CONFIG`:
+### Environment variables
+
+| Variable | Effect |
+| --- | --- |
+| `TC_ACCT` | Pin a session to **one** account, bypassing rotation — see [Pin a session to a specific account](#pin-a-session-to-a-specific-account). Accepts a name or rotation index. Read by `teamclaude run` and `teamclaude env`, then removed from the environment so it never reaches claude |
+| `TEAMCLAUDE_CONFIG` | Path to the config file (default `~/.config/teamclaude.json`) |
+| `TEAMCLAUDE_DISABLE_AUTOUPDATE` | Set to `1` to skip the background self-update check |
 
 ```bash
 TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
@@ -444,6 +450,12 @@ TC_ACCT=1 teamclaude run
 ```
 
 `TC_ACCT` is read by `teamclaude run` and **removed from the environment before claude is launched** — it never reaches the client or anything it spawns. Under `--no-mitm` teamclaude builds the pinned base URL itself; under MITM it travels as the proxy credential on each `CONNECT`, which is the only pin channel an `HTTPS_PROXY` URL can carry. Either way you don't hand-write a URL.
+
+`teamclaude env` honours it identically, so a tool that spawns claude itself gets the same pin:
+
+```bash
+TC_ACCT='work (Acme)' eval "$(teamclaude env)"
+```
 
 The value matches an account's display name exactly (no escaping needed — spaces, `@` and parens are handled for you), or a numeric rotation index. An unknown account is refused up front rather than quietly served by whichever account rotation picked.
 

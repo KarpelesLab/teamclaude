@@ -44,3 +44,50 @@ test('holdSeconds 0 / unset adds no API_TIMEOUT_MS', () => {
   const lines = buildClaudeEnvLines({ port: 3456, useMitm: false });
   assert.ok(!lines.some((l) => l.startsWith('export API_TIMEOUT_MS')));
 });
+
+// TC_ACCT parity with `teamclaude run`: the pin must be carried by the routing
+// itself, in whichever form the mode uses, and must not survive into the child.
+test('an account pin rides in the proxy userinfo under MITM', () => {
+  const lines = buildClaudeEnvLines({ port: 3456, account: 'work (Acme)', proxyApiKey: 'secret' });
+  const url = 'http://work%20%28Acme%29:secret@127.0.0.1:3456';
+  assert.ok(lines.includes(`export HTTPS_PROXY=${url}`), lines.join('\n'));
+  assert.ok(lines.includes(`export http_proxy=${url}`));
+  assert.ok(lines.includes('unset TC_ACCT'));
+});
+
+test('an account pin becomes a /tc-acct/ prefix under --no-mitm', () => {
+  const lines = buildClaudeEnvLines({ port: 8080, useMitm: false, account: 'work (Acme)' });
+  assert.deepEqual(lines, [
+    'export ANTHROPIC_BASE_URL=http://localhost:8080/tc-acct/work%20%28Acme%29',
+    'unset TC_ACCT',
+  ]);
+});
+
+// An email-style name must survive the round trip: encodeURIComponent escapes
+// the @, and the client percent-decodes userinfo before base64 (verified against
+// Claude Code 2.1.220), so the proxy sees the name exactly as configured.
+test('an email-style account name is encoded in the proxy URL', () => {
+  const lines = buildClaudeEnvLines({ port: 3456, account: 'me@example.com', proxyApiKey: '' });
+  assert.ok(lines.includes('export HTTPS_PROXY=http://me%40example.com:@127.0.0.1:3456'), lines.join('\n'));
+});
+
+test('no pin leaves the environment exactly as before', () => {
+  assert.deepEqual(
+    buildClaudeEnvLines({ port: 8080, useMitm: false }),
+    ['export ANTHROPIC_BASE_URL=http://localhost:8080'],
+  );
+  const mitm = buildClaudeEnvLines({ port: 3456, caPath: '/x' });
+  assert.ok(mitm.includes('export HTTPS_PROXY=http://127.0.0.1:3456'));
+  assert.ok(!mitm.some((l) => l.includes('TC_ACCT')));
+});
+
+// These lines are eval'd by a shell. encodeURIComponent leaves ( ) ' ! * alone,
+// which would make `export HTTPS_PROXY=http://work%20(Acme)@...` a syntax error.
+test('a pinned line is shell-safe: no unquoted metacharacters survive', () => {
+  for (const name of ["work (Acme)", "o'brien", "a!b", "x*y"]) {
+    for (const useMitm of [true, false]) {
+      const lines = buildClaudeEnvLines({ port: 3456, useMitm, account: name, caPath: '/x' });
+      for (const l of lines) assert.ok(!/[()'!*]/.test(l), `${l} (from ${name})`);
+    }
+  }
+});
