@@ -140,6 +140,19 @@ async function serverCommand() {
     process.exit(1);
   }
 
+  // `accounts[].models` (#74) is superseded by the `routes` table (#86). Routes
+  // do the same job with glob matching, several accounts per rule and a bucket
+  // override — and, unlike `models`, they don't silently change eligibility
+  // fleet-wide the moment one account declares a list (see _accountOwnsModel).
+  // Behaviour is unchanged; this only tells pre-#86 configs what to migrate to
+  // before the field goes away. Read from config.accounts, not the resolved
+  // list: resolveAccounts rebuilds importFrom entries and drops the field.
+  for (const acct of config.accounts) {
+    if (!acct.models?.length) continue;
+    const route = { name: acct.name, match: acct.models, accounts: [acct.name] };
+    console.error(`[TeamClaude] Deprecated: account "${acct.name}" uses "models" — replace it with a routes entry: ${JSON.stringify(route)}`);
+  }
+
   const threshold = config.switchThreshold || 0.98;
   const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp, distributeSessions: config.distributeSessions });
 
@@ -327,7 +340,8 @@ async function serverCommand() {
       const acct = info.account || r?.account || '?';
       const model = info.model ? ` (${info.model})` : '';
       const sid = info.sessionId ? `${info.sessionId.slice(0, 6)} ` : '';
-      writeActivity(`${sid}${info.method} ${info.path}${model} → ${acct} (${info.status}, ${dur}s)`);
+      const pin = (info.pinned || r?.pinned) ? ' [pin]' : '';
+      writeActivity(`${sid}${info.method} ${info.path}${model} → ${acct}${pin} (${info.status}, ${dur}s)`);
     };
     // Tee console output to the activity log as well
     const origLog = console.log;
@@ -649,6 +663,11 @@ async function runCommand() {
   // opt back into the transparent direct launch (e.g. for a dumb shell alias).
   const port = config.proxy.port;
   const env = { ...process.env };
+  // A caller-supplied ANTHROPIC_BASE_URL of http://<this proxy>/tc-acct/<name>
+  // pins the session to one account. Detected up front so BOTH modes can act on
+  // it: base-URL mode preserves it, MITM mode says it is ignoring it. Dropping
+  // it silently is what made the documented shell alias look broken by default.
+  const pinnedBase = isLocalAccountPin(process.env.ANTHROPIC_BASE_URL, port);
   if (await isProxyUp(port)) {
     if (useMitm) {
       // Route ALL of claude's traffic through us as an HTTPS forward proxy, so
@@ -660,12 +679,18 @@ async function runCommand() {
       env.HTTPS_PROXY = env.HTTP_PROXY = env.https_proxy = env.http_proxy = proxyUrl;
       env.NO_PROXY = env.no_proxy = 'localhost,127.0.0.1,::1';
       env.NODE_EXTRA_CA_CERTS = caPath;
+      if (pinnedBase) {
+        console.error('[TeamClaude] Account pin in ANTHROPIC_BASE_URL ignored: MITM mode intercepts api.anthropic.com directly and does not use a base URL.');
+        console.error('[TeamClaude] Re-run with --no-mitm for the pin to take effect.');
+      }
       delete env.ANTHROPIC_BASE_URL;
     } else {
       // Only set ANTHROPIC_BASE_URL — Claude Code keeps its own OAuth token
       // which the proxy accepts from localhost. Not setting ANTHROPIC_API_KEY
       // lets Claude Code stay in subscription mode (full model access).
-      env.ANTHROPIC_BASE_URL = `http://localhost:${port}`;
+      // If the caller already set ANTHROPIC_BASE_URL to a /tc-acct/<pin> URL
+      // pointing at this proxy, preserve it so the account pin takes effect.
+      if (!pinnedBase) env.ANTHROPIC_BASE_URL = `http://localhost:${port}`;
     }
   } else if (autoFallback) {
     console.error(`[TeamClaude] Proxy not running on port ${port} — launching claude directly (--auto-fallback; start it with: teamclaude server)`);
@@ -1480,6 +1505,21 @@ async function resolveAccounts(config) {
     }
   }
   return accounts;
+}
+
+// Is `url` a /tc-acct/<name> account pin aimed at OUR proxy? Parsed rather than
+// prefix-matched so every local spelling counts (localhost, 127.0.0.1, [::1]),
+// while a pin URL for a different host/port is not ours to honour.
+function isLocalAccountPin(url, port) {
+  if (!url) return false;
+  let u;
+  try { u = new URL(url); } catch { return false; }
+  const host = u.hostname.replace(/^\[|\]$/g, '');
+  const isLocal = host === 'localhost' || host === '127.0.0.1' || host === '::1';
+  // An omitted port means the scheme default, which still matches a proxy that
+  // happens to run on 80/443.
+  const urlPort = u.port || (u.protocol === 'https:' ? '443' : '80');
+  return isLocal && urlPort === String(port) && u.pathname.startsWith('/tc-acct/');
 }
 
 function argValue(flag) {
