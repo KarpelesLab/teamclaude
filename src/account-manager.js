@@ -1145,6 +1145,10 @@ export class AccountManager {
     if (!disabled && account.status === 'error') {
       account.status = 'active';
       account.rateLimitedUntil = null;
+      // Operator escape hatch: re-enabling is an explicit "try this again", so
+      // drop the dead-token guard too — otherwise the account would come back
+      // active but never attempt a refresh (see ensureTokenFresh).
+      account._deadRefreshToken = null;
       console.log(`[TeamClaude] Account "${account.name}" re-enabled — clearing error state`);
     }
   }
@@ -1222,6 +1226,17 @@ export class AccountManager {
     const account = this.accounts[accountIndex];
     if (!account || account.type !== 'oauth' || !account.refreshToken) return;
 
+    // Dead-token guard: a refresh token upstream already rejected (invalid_grant)
+    // will be rejected every time, so retrying it only floods the OAuth endpoint
+    // — observed live: 287 identical invalid_grant calls after two accounts' tokens
+    // were invalidated (a `/login` elsewhere rotates the token and kills the copy
+    // teamclaude holds). Paths that bypass availability checks keep calling this
+    // (warmup/probe pin an account by name via /tc-acct, skipping _isAvailable),
+    // so marking the account 'error' alone does not stop the retries. Keyed on the
+    // token VALUE, not the status: the moment a DIFFERENT refresh token arrives
+    // (re-login, config reload, updateAccountTokens) the guard lifts on its own.
+    if (account._deadRefreshToken && account._deadRefreshToken === account.refreshToken) return;
+
     if (!force && !isTokenExpiringSoon(account.expiresAt)) return;
 
     // A forced refresh answers a 401, but 401s arrive in bursts: every request
@@ -1250,6 +1265,7 @@ export class AccountManager {
         account.refreshToken = newTokens.refreshToken;
         account.expiresAt = newTokens.expiresAt;
         account._lastRefreshAt = Date.now();
+        account._deadRefreshToken = null; // this token works; clear any stale guard
         console.log(`[TeamClaude] Token refreshed for account "${account.name}"`);
         this._onTokenRefresh?.(accountIndex, newTokens);
       } catch (err) {
@@ -1263,6 +1279,10 @@ export class AccountManager {
         const isAuthRejection = err.status === 400 || err.status === 401 || err.status === 403;
         if (isAuthRejection) {
           account.status = 'error';
+          // Remember WHICH token was rejected so we stop re-sending it (see the
+          // dead-token guard above). A transient failure deliberately does not
+          // arm this — that token may still be good.
+          account._deadRefreshToken = account.refreshToken;
           console.error(`[TeamClaude] Account "${account.name}" needs re-login (refresh token rejected) — run: teamclaude login`);
         }
       } finally {
