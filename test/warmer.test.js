@@ -71,7 +71,7 @@ test('the spawn invocation is a minimal non-interactive claude pinned to the acc
   const spec = spawn.calls[0];
   assert.equal(spec.command, 'claude');
   assert.deepEqual(spec.args, ['-p', '--bare', '--model', 'haiku', '--output-format', 'text', 'hi']);
-  assert.equal(spec.env.ANTHROPIC_BASE_URL, 'http://127.0.0.1:9999/tc-acct/a');
+  assert.equal(spec.env.ANTHROPIC_BASE_URL, 'http://127.0.0.1:9999/tc-acct/solo');
   assert.equal(spec.env.ANTHROPIC_API_KEY, 'tc-secret');
 });
 
