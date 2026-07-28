@@ -1,0 +1,92 @@
+# Configuration
+
+## Where it lives
+
+Config is stored at `~/.config/teamclaude.json` (or `$XDG_CONFIG_HOME/teamclaude.json`). A random proxy API key is generated on first use.
+
+Volatile runtime state (observed quota) is written separately to `teamclaude.state.json` alongside the config, so the config file stays clean and hand-editable. The state file is safe to delete — quota is simply re-learned from traffic.
+
+## Format
+
+```json
+{
+  "proxy": {
+    "port": 3456,
+    "apiKey": "tc-auto-generated-key"
+  },
+  "upstream": "https://api.anthropic.com",
+  "switchThreshold": 0.98,
+  "sx": { "apiKey": "your-sx-org-api-key", "mode": "always" },
+  "accounts": [
+    {
+      "name": "user@example.com (Acme)",
+      "type": "oauth",
+      "accountUuid": "...",
+      "orgUuid": "...",
+      "orgName": "Acme",
+      "priority": 0,
+      "accessToken": "sk-ant-oat01-...",
+      "refreshToken": "sk-ant-ort01-...",
+      "expiresAt": 1774384968427
+    }
+  ]
+}
+```
+
+## Fields
+
+| Field | Description |
+| --- | --- |
+| `proxy.port` | Local port the proxy listens on |
+| `proxy.host` | Interface to bind. Defaults to `127.0.0.1` (localhost only). Set to `0.0.0.0` (or override with env `TEAMCLAUDE_HOST`) to accept off-box clients — in which case **set `proxy.apiKey`**, since remote clients must present it (via `x-api-key`, or `Proxy-Authorization` for CONNECT/HTTPS-proxy usage); loopback is always exempt |
+| `proxy.apiKey` | API key clients use to authenticate with the proxy (required for any non-loopback client; the proxy injects real account tokens, so an unauthenticated open port would leak them) |
+| `upstream` | Upstream API base URL |
+| `switchThreshold` | Quota utilization (0–1) at which to switch accounts (TUI: `g` → `t`) |
+| `quotaProbeSeconds` | Background [quota-probe](quota.md#quota-probe) interval in seconds (`0` = off, the default; CLI `probe` or TUI `g` → `p`) |
+| `warmupSeconds` | [Keep-warm](quota.md#keep-warm) interval in seconds (`0` = off, the default; CLI `warmup`). Spawns a minimal `claude` per idle account to start its 5h timer — **spends a little quota**, unlike the probe |
+| `holdSeconds` | Maximum seconds to [hold the connection](quota.md#hold-on-exhaustion) when all accounts are exhausted, polling silently until one recovers (`0` = return 429 immediately, the default). `teamclaude run` raises `API_TIMEOUT_MS` automatically to match |
+| `distributeSessions` | Spread concurrent Claude Code sessions across equal-priority accounts, each session pinned to one account for cache reuse (`false` = quota-driven rotation only, the default). Session tracking and readout is always on regardless — see [Session-aware routing](routing.md#session-aware-routing) |
+| `eventLogging` | How to handle Claude Code's telemetry (`/api/event_logging/*`), which is high-volume activity-log noise: `hide` (default) forwards it but keeps it out of the activity log; `block` answers `200` locally without forwarding (no upstream round-trip); `show` forwards and displays it. Toggle live in the TUI settings screen (`g` → Event logging) |
+| `blockedModels` | Array of model glob patterns (e.g. `["*fable*"]`) whose requests are rejected with a fast, non-retryable `400` instead of being forwarded — avoids a model no account can serve getting rate-limited upstream and hanging the pipeline. Edit live in the TUI settings screen (`g` → Blocked models). Empty (the default) blocks nothing |
+| `stormRamp` | Optional [storm-control](routing.md#storm-control) tuning (on by default). Object: `{ enabled, startConc, stepConc, stepMs, windowMs }` |
+| `routes` | Optional list of [routing rules](routing.md#model-routes) that pin model patterns to specific accounts |
+| `autoUpdate` | Set to `false` to disable the background [self-update](usage.md#auto-update) check |
+| `sx.apiKey` | [sx.org](https://sx.org) API key. When set, TeamClaude auto-provisions a residential proxy (egress-IP 429 workaround). Absent/empty = off — see [sx.org proxy mode](proxy-modes.md#sxorg-proxy-mode) |
+| `sx.mode` | `always` (route all upstream traffic), `429` (direct, fail over to the proxy after a 429), or `off` (keep the key but don't use it). Defaults to `always` when a key is set |
+| `accounts[].accountUuid` | Anthropic account (person) id; set automatically from the OAuth profile |
+| `accounts[].orgUuid` / `orgName` | Organization the account is scoped to — lets one email hold multiple org accounts |
+| `accounts[].priority` | Rotation preference, lower = preferred (default 0) |
+| `accounts[].disabled` | If `true`, the account is excluded from rotation until re-enabled |
+| `accounts[].upstream` | Alternative upstream base URL for this account (e.g. `https://api.deepseek.com/anthropic`). Overrides the global `upstream` for this account only — see [third-party backends](accounts.md#third-party-backend-accounts) |
+| `accounts[].modelMap` | Object mapping Anthropic model names to this backend's model names (e.g. `{"claude-sonnet-4-6": "deepseek-v4-pro[1m]"}`). Applied automatically when requests are routed to this account |
+| `accounts[].models` | **Deprecated** — use a [`routes`](routing.md#model-routes) entry with `match` and `accounts` instead. Array of model names this account exclusively handles; kept for backward compatibility with pre-routes configs |
+
+## Environment variables
+
+| Variable | Effect |
+| --- | --- |
+| `TC_ACCT` | [Pin a session](routing.md#pin-a-session-to-one-account) to **one** account, bypassing rotation. Accepts `accountUuid`, `orgUuid`, `accountUuid/orgUuid`, or a display name/email. Read by `teamclaude run` and `teamclaude env`, then removed from the environment so it never reaches claude |
+| `TEAMCLAUDE_CONFIG` | Path to the config file (default `~/.config/teamclaude.json`) |
+| `TEAMCLAUDE_HOST` | Override `proxy.host` |
+| `TEAMCLAUDE_DISABLE_AUTOUPDATE` | Set to `1` to skip the background self-update check |
+
+```bash
+TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
+```
+
+## Network resilience
+
+After a host network drop and reconnect, Node's shared connection pool can hold dead keep-alive sockets. Because a request has no default time limit, a retry can land on a dead socket and hang forever — every account and every retry keeps hitting the same poison, so the proxy appears wedged until you restart it. TeamClaude bounds each stage so a stuck request fails fast instead: the failure lets Node evict the dead socket, the client retries, and the next request connects fresh — no restart needed. Recovery is per-socket, so after a flap it can take a few failed-then-retried requests to fully drain, but it always converges.
+
+**Connection pooling under concurrency.** Upstream requests go over a pooled **HTTP/1.1** transport (`node:https`), so each concurrent request gets its own connection. Node's global `fetch` instead multiplexes every request to `api.anthropic.com` over a **single HTTP/2 connection**; under many concurrent large uploads (Claude Code POSTs ~1&nbsp;MB of context per turn) that one connection serializes on HTTP/2's shared flow-control windows, and a trivial request can wait minutes for headers ([#106](https://github.com/KarpelesLab/teamclaude/issues/106)). Independent H1 connections have no such contention — each upload fills its own socket at TCP speed, matching what N direct Claude Code processes do.
+
+The defaults are meant to be left alone; these exist for the rare case where they aren't right for you.
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `TEAMCLAUDE_UPSTREAM_HEADERS_TIMEOUT_MS` | `120000` | Max wait for upstream **response headers** (time-to-first-byte). Cleared the instant headers arrive, so a long streaming body is never cut. Streamed completions deliver first byte in seconds; a non-streaming (`stream:false`) request that legitimately generates for longer than this could trip it — raise it for such callers |
+| `TEAMCLAUDE_UPSTREAM_BODY_TIMEOUT_MS` | `120000` | Max **idle** gap between response-body chunks. Resets on every chunk, so a slow-but-healthy stream is fine; it fires only when the socket goes silent mid-stream (a drop after headers), turning a hang into a fast, retryable failure |
+| `TEAMCLAUDE_UPSTREAM_MAX_SOCKETS` | `256` | Max concurrent upstream connections **per origin** in the pooled path. Requests beyond this queue (raise it if you run more concurrent sessions than this against one host) |
+| `TEAMCLAUDE_UPSTREAM_GLOBAL_FETCH` | _(off)_ | Set to `1` to route upstream requests through Node's global `fetch` (single HTTP/2 connection) instead of the pooled H1 transport — an escape hatch, not recommended under concurrency |
+| `TEAMCLAUDE_REFRESH_TIMEOUT_MS` | `30000` | Max wait for an OAuth token refresh. A hung refresh is coalesced across all callers, so it would otherwise wedge every request for that account |
+| `TEAMCLAUDE_RATE_LIMIT_ABSORB_MAX_SECONDS` | `60` | Longest `retry-after` absorbed inline on the same account before a rate-limit 429 is surfaced to the client — see [the two kinds of 429](routing.md#the-two-kinds-of-429) |
