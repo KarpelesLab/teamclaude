@@ -18,7 +18,7 @@ Headless, you can re-sync accounts from the config without a restart by POSTing 
 curl -X POST http://localhost:3456/teamclaude/reload
 ```
 
-You usually don't need to call it directly — `login`, `import`, `enable`, `disable`, and `priority` notify a running server themselves.
+You usually don't need to call it directly. `login`, `import`, `enable`, `disable`, `priority`, `route`, `probe` and `warmup` notify a running server themselves.
 
 ### TUI keyboard shortcuts
 
@@ -28,10 +28,12 @@ You usually don't need to call it directly — `login`, `import`, `enable`, `dis
 | `d` | Enable/disable an account |
 | `p` | Refresh quota on all accounts (one-shot probe of the zero-spend usage endpoint) |
 | `R` | Reload accounts from config |
-| `g` | Settings (threshold, quota probe, routing, add/remove accounts, blocked models, event logging, sx.org) |
+| `g` | Settings (threshold, quota probe, routing, add/remove accounts, sx.org) |
 | `q` | Quit |
 
 In selection mode, use `j`/`k` or the arrow keys to navigate, `Enter` to confirm, `Esc` to cancel.
+
+The settings screen is a list, not a set of letter shortcuts: `↑`/`↓` move between rows, `←`/`→` change the value in place (threshold by 1%, probe by 30s, modes cycle), `Enter` opens a row that needs typing or a sub-screen, `Esc` goes back.
 
 ## Run Claude Code through the proxy
 

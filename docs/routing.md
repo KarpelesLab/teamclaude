@@ -8,7 +8,7 @@ How TeamClaude decides which account serves a request, and what it does when tha
 2. The proxy selects the active account and forwards requests with that account's credentials.
 3. OAuth tokens expiring within 5 minutes are automatically refreshed and persisted to config.
 4. Rate limit headers from the API (`anthropic-ratelimit-unified-*`) track session (5h) and weekly (7d) quota utilization.
-5. When usage reaches the threshold, the proxy switches to the next available account via round-robin.
+5. When usage reaches the threshold, the proxy switches to the best available account (see [Choosing an account](#choosing-an-account)).
 6. On 429 responses, the proxy waits the `retry-after` duration and retries; on persistent errors, it switches accounts.
 7. Transient network errors (connection reset, timeout) drop the connection so the client can retry.
 8. If all accounts are exhausted, returns 429 with the soonest reset time — or, with [`holdSeconds`](quota.md#hold-on-exhaustion) set, holds the connection open and retries silently until an account recovers.
@@ -16,7 +16,9 @@ How TeamClaude decides which account serves a request, and what it does when tha
 
 ## Choosing an account
 
-TeamClaude prefers to keep you on one account. It stays on the current one and only rotates when that account nears `switchThreshold` (default `0.98`); when it does pick, it prefers the eligible account whose weekly quota resets soonest. Priority always wins: a lower `priority` number is never skipped in favour of load balancing. Set an explicit order with `teamclaude priority <name> <n>`, or `--first` / `--last`.
+TeamClaude prefers to keep you on one account. It stays on the current one and only rotates when that account nears `switchThreshold` (default `0.98`).
+
+When it does have to pick, ranking is: lowest `priority` number first, then, among accounts of equal priority, the one whose governing weekly bucket resets soonest. Spending the account closest to its refresh preserves the ones whose window resets further out. A model with its own weekly bucket (Fable, Sonnet) is ranked by that bucket rather than the shared one. Set an explicit order with `teamclaude priority <name> <n>`, or `--first` / `--last`.
 
 ## The two kinds of 429
 
@@ -117,7 +119,7 @@ TC_ACCT=a1b2c3d4-… teamclaude run
 TC_ACCT=me@example.com eval "$(teamclaude env)"
 ```
 
-The value matches an `accountUuid`, an `orgUuid`, or a display name/email — first match wins. No escaping needed; spaces, `@` and parens are handled for you. An unknown value is refused up front rather than quietly served by whichever account rotation picked.
+The value matches an `accountUuid`, an `orgUuid`, or a display name/email, first match wins. No escaping needed; spaces, `@` and parens are handled for you. An unknown value is refused by the proxy with a `404` rather than quietly served by whichever account rotation picked. That refusal happens on the first request, not at launch, so a typo shows up as a failing claude rather than a wrong account.
 
 Prefer the `accountUuid` (printed by `teamclaude accounts`) for anything scripted: display names are rewritten in place, since an account is named by its email and gains an ` (Org)` suffix the moment that email holds a second org.
 

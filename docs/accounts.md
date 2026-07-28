@@ -58,7 +58,7 @@ teamclaude priority <name> --first
 teamclaude priority <name> --last
 ```
 
-`login`, `import`, `enable`, `disable`, and `priority` notify a running server to reload, so credential, priority, and enable/disable changes are picked up live. Account **removals** still need a restart.
+`login`, `import`, `enable`, `disable` and `priority` notify a running server to reload, so credential, priority and enable/disable changes are picked up live. Account **removals** still need a restart.
 
 Accounts can also be added and removed from the TUI settings screen: **`g`** → **Add account** / **Remove account**.
 
