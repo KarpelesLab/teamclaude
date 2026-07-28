@@ -1087,9 +1087,14 @@ export class TUI {
     lines.push(bold('  Quota probe') + dim('  — refresh idle accounts from the usage endpoint'));
     lines.push(row(byId('probe')));
     lines.push('');
+    // ── Activity log
+    lines.push(bold('  Activity log') + dim('  — what to do with Claude Code\'s telemetry'));
+    lines.push(row(byId('eventlog')));
+    lines.push('');
     // ── Routing
-    lines.push(bold('  Routing') + dim('  — pin model families to specific accounts'));
+    lines.push(bold('  Routing') + dim('  — pin model families to specific accounts, or block them outright'));
     lines.push(row(byId('routes')));
+    lines.push(row(byId('blocklist')));
     lines.push('');
     // ── Accounts
     lines.push(bold('  Accounts') + dim('  — add (import / API key) or remove an account'));
