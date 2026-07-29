@@ -19,6 +19,7 @@ import { SxManager } from './sx.js';
 import { autoUpdate, checkForUpdate, currentVersion, runUpdate, installKind, PKG_NAME } from './updater.js';
 import { renderStatus } from './status-renderer.js';
 import { buildClaudeEnvLines, encodePinComponent } from './claude-env.js';
+import { serviceKind, installService, uninstallService, serviceStatus, renderService, logPath } from './service.js';
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
 
 const args = process.argv.slice(2);
@@ -73,6 +74,10 @@ switch (command) {
     break;
   case 'alias':
     aliasCommand();
+    process.exit(0);
+    break;
+  case 'service':
+    await serviceCommand();
     process.exit(0);
     break;
   case 'probe':
@@ -984,6 +989,50 @@ function aliasCommand() {
   }
 }
 
+// ── service ─────────────────────────────────────────────────
+
+async function serviceCommand() {
+  const sub = args[1] || 'status';
+  const kind = serviceKind();
+  if (!kind) {
+    console.error(`teamclaude service: no service integration for ${process.platform}`);
+    console.error('Run the proxy yourself with: teamclaude server --headless');
+    process.exit(1);
+  }
+  // Carry an explicit config path into the unit: a service started by launchd or
+  // systemd does not inherit the shell's TEAMCLAUDE_CONFIG, so a non-default
+  // config would silently be ignored and the service would serve a different
+  // (or empty) account list than the CLI does.
+  const configPath = process.env.TEAMCLAUDE_CONFIG || null;
+
+  switch (sub) {
+    case 'install': {
+      const res = await installService({ configPath });
+      if (!res.ok) { console.error(`teamclaude service install failed: ${res.error}`); process.exit(1); }
+      break;
+    }
+    case 'uninstall': {
+      const res = await uninstallService();
+      if (!res.ok) { console.error(`teamclaude service uninstall failed: ${res.error}`); process.exit(1); }
+      break;
+    }
+    case 'print':
+      process.stdout.write(renderService({ configPath }));
+      break;
+    case 'status': {
+      const s = await serviceStatus();
+      console.log(`Service:   ${s.installed ? s.file : 'not installed'}`);
+      console.log(`State:     ${s.running ? `running${s.pid ? ` (pid ${s.pid})` : ''}` : s.detail}`);
+      if (kind === 'launchd') console.log(`Logs:      ${logPath()}`);
+      else console.log('Logs:      journalctl --user --unit teamclaude.service');
+      break;
+    }
+    default:
+      console.error('Usage: teamclaude service <install|uninstall|status|print>');
+      process.exit(1);
+  }
+}
+
 // ── probe ───────────────────────────────────────────────────
 
 async function probeCommand() {
@@ -1307,6 +1356,10 @@ Commands:
                       the session to one account (see Environment below)
   alias               Print a shell alias so plain 'claude' routes via the proxy
                       (--install to write it to your shell rc; --uninstall to remove)
+  service <sub>       Run the proxy as a user service that starts at login and
+                      restarts on its own: install | uninstall | status | print
+                      (LaunchAgent on macOS, systemd --user unit on Linux;
+                      'print' writes the unit to stdout without touching anything)
   status [--json]     Show rich proxy/account/probe status (live)
                       Use --color=always|never to control ANSI colors
   accounts            List configured accounts
