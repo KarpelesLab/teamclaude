@@ -604,6 +604,22 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     ? (ctx.tried.has(ctx.pinnedIndex) ? null : accountManager.accounts[ctx.pinnedIndex])
     : accountManager.getActiveAccount(ctx.tried, ctx.model, ctx.advisorModel, ctx.sessionId);
   if (!account) {
+    // Every candidate was refused by upstream (403). Waiting will not help — the
+    // account needs attention, not a retry — so say so plainly rather than
+    // reporting a rate limit. Not a 403 either: the client's own credential is
+    // fine, and a 403 would make it drop its login over someone else's problem.
+    if (ctx.credentialRejected) {
+      ctx.status = 502;
+      ctx.account = `(${ctx.credentialRejected} refused)`;
+      if (!res.headersSent) {
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: { type: 'proxy_error', message: `Upstream refused the credential for account "${ctx.credentialRejected}" (403). Check the account, then re-add it with: teamclaude login` },
+        }));
+      }
+      return;
+    }
     // A pinned request concerns exactly one account: don't compute a fleet-wide
     // retry-after or sleep on other accounts' windows — return immediately.
     if (ctx.pinnedIndex != null) {
@@ -865,6 +881,21 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // retry's status check rotates to another account. Bounded to one re-auth
     // per account per request, so a genuinely dead credential surfaces the 401
     // instead of looping.
+    // A 403 ("Request not allowed") is upstream refusing THIS account outright —
+    // not a stale token a refresh could fix, and not anything the client sent.
+    // The client never sees the credential we inject, so it cannot act on the
+    // rejection; Claude Code reads a 403 as "your session is dead", drops its
+    // own login and asks for a re-login over an account problem it has no part
+    // in. Skip the account for the rest of this request and fail over. With no
+    // account left, the no-account branch reports a proxy error instead.
+    if (upstreamRes.status === 403 && !res.headersSent) {
+      await upstreamRes.body?.cancel();
+      ctx.credentialRejected = account.name;
+      ctx.tried.add(account.index);
+      console.error(`[TeamClaude] 403 on "${account.name}" — upstream refused the account credential`);
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+    }
+
     if (upstreamRes.status === 401 && account.type === 'oauth' && account.refreshToken
         && retryCount < maxRetries && !ctx.reauthed.has(account.index)) {
       ctx.reauthed.add(account.index);
