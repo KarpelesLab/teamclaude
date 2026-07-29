@@ -12,6 +12,7 @@ import { TopLevelFieldFinder, modelGlobMatches } from './model.js';
 import { BodyWriter } from './request-log.js';
 import { upstreamFetch } from './upstream-fetch.js';
 import { tunnelTls } from './sx.js';
+import { createEgressGuard } from './egress-guard.js';
 
 
 export const HOP_BY_HOP_HEADERS = new Set([
@@ -117,7 +118,10 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
     }
   };
 
-  const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config });
+  // Opt-in egress pin: null unless config.egress.pin is set, and then shared by
+  // the base listener and the MITM one so both honour the same hold.
+  const egress = createEgressGuard(config, console.error);
+  const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, egress });
   const server = http.createServer(requestHandler);
 
   // Forward-proxy support (always on, so multiple claude instances can use
@@ -134,7 +138,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
     const c = await certsPromise;
     return { key: c.leafKeyPem, cert: c.leafCertPem };
   };
-  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks, log: console.error, sx }));
+  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks, log: console.error, sx, egress }));
   // Remote Control's real-time channel is a WebSocket, not a request/response
   // call — Node fires 'upgrade' for that handshake, never 'request', so it
   // needs its own listener (base-URL routing path; the MITM path wires the
@@ -241,7 +245,7 @@ const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/files/', '/api/oauth/f
  * aware routing, and retry-on-quota behavior. Control endpoints (status/reload)
  * and the proxy-API-key gate live in the base server's wrapper, not here.
  */
-export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null }) {
+export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null, egress = null }) {
   let counter = 0;
   return async (req, res) => {
     try {
@@ -258,6 +262,27 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         return;
       }
       const hideActivity = isEventLog && eventLogging !== 'show';
+      // Egress pin (opt-in): with the exit IP off the pinned one — a VPN that
+      // dropped — hold rather than send. Upstream answers a request from an
+      // unexpected region with a 403 that Claude Code reports as a dead session,
+      // so sending it costs a re-login while waiting costs latency. Checked here
+      // rather than per-account: it is a property of the connection, and this is
+      // the one path every request takes, MITM included.
+      if (egress?.enabled()) {
+        const state = await egress.waitUntilPinned({ isAborted: () => res.destroyed });
+        if (res.destroyed) return;
+        if (!state.ok) {
+          res.writeHead(503, { 'Content-Type': 'application/json', 'retry-after': '30' });
+          res.end(JSON.stringify({
+            type: 'error',
+            error: {
+              type: 'proxy_error',
+              message: `Egress is ${state.ip || 'unknown'}, not the pinned ${state.expected.join(', ')} — not sending this request. Check the VPN.`,
+            },
+          }));
+          return;
+        }
+      }
       // Client token refresh: pass through untouched (the proxy manages its own
       // tokens via ensureTokenFresh; rewriting client refreshes would conflict).
       if (req.method === 'POST' && req.url === '/v1/oauth/token') { await relayRaw(req, res, upstream, sx); return; }

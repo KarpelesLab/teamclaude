@@ -1359,6 +1359,14 @@ launched with and without --no-mitm can share one server.
 A running server re-syncs accounts from config on POST /teamclaude/reload
 (local only). add/login/enable/disable/priority trigger it automatically.
 
+Egress pin (opt-in, off unless configured). Set "egress": { "pin": "auto" } to
+hold requests whenever the exit IP is not the pinned one — a VPN that dropped
+mid-session otherwise sends the request from an unexpected region, and upstream
+answers 403, which Claude Code reports as a dead session and demands a re-login.
+"auto" pins whatever address the server sees first; an explicit IP (or a list of
+them) pins those. Held requests wait up to holdSeconds (default 120), then get a
+503. See config.example.json.
+
 A global npm install self-updates in the background (checked once/day, applied
 on the next launch). Disable with TEAMCLAUDE_DISABLE_AUTOUPDATE=1 or
 "autoUpdate": false in the config.
