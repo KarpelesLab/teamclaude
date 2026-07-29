@@ -37,6 +37,37 @@ export function sameIdentity(a, b) {
   return a?.name === b?.name;
 }
 
+/**
+ * Are these two records definitely NOT the same account? True only when both
+ * sides are fully identified and point at different account+org pairs — an
+ * unknown UUID or org on either side means "cannot tell", never "different".
+ */
+export function distinctAccounts(a, b) {
+  if (!a?.accountUuid || !b?.accountUuid) return false;
+  if (a.accountUuid !== b.accountUuid) return true;
+  const ka = orgKey(a);
+  const kb = orgKey(b);
+  return !!(ka && kb && ka !== kb);
+}
+
+/**
+ * Index of the config entry an incoming login should UPDATE, or -1 to add it as
+ * a new one.
+ *
+ * Identity decides first: the same account+org is the same entry. A bare display
+ * name match is accepted only when nothing contradicts it — one person's two
+ * organizations share an email, and the display name is derived from that email,
+ * so treating equal names as one account overwrites the other org's entry and
+ * silently drops an account from the config. The account keeps working until the
+ * process that still holds it in memory restarts, which is what makes the loss
+ * hard to trace back to the login that caused it.
+ */
+export function findUpsertTarget(accounts, incoming) {
+  const byIdentity = accounts.findIndex(a => sameIdentity(a, incoming));
+  if (byIdentity >= 0) return byIdentity;
+  return accounts.findIndex(a => a.name === incoming.name && !distinctAccounts(a, incoming));
+}
+
 /** The email portion of a display name, stripping any " (org)" suffix. */
 export function emailOf(acct) {
   return (acct?.name || '').replace(/ \(.*\)$/, '');
