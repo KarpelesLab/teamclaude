@@ -178,3 +178,38 @@ test('select mode entered from the dashboard still returns to normal', () => {
   tui._key('esc');
   assert.equal(tui.mode, 'normal');
 });
+
+// Importing the credentials of a second organization must not swallow the first.
+// Both entries are named from the same email, so matching on the name alone drops
+// one from the config and — worse here — rewrites the surviving in-memory
+// account's accountUuid/orgUuid, collapsing two live accounts into one without
+// even a restart.
+test('importing a second org adds an account instead of overwriting the first', async () => {
+  const accounts = [{ name: 'a@x.com', index: 0, type: 'oauth', credential: 'old', accountUuid: 'u1', orgUuid: 'o-personal', orgName: 'Personal' }];
+  const { tui, am, config, calls } = makeTUI({ accounts });
+  config.accounts = [{ name: 'a@x.com', type: 'oauth', accountUuid: 'u1', orgUuid: 'o-personal', orgName: 'Personal' }];
+  tui._readCredentials = async () => ({ accessToken: 'new', refreshToken: 'r', expiresAt: Date.now() + 3600_000 });
+  tui._readProfile = async () => ({ email: 'a@x.com', accountUuid: 'u1', orgUuid: 'o-acme', orgName: 'Acme' });
+
+  await tui._doImport();
+
+  assert.equal(config.accounts.length, 2);
+  assert.equal(calls.added.length, 1);
+  assert.equal(am.accounts[0].orgUuid, 'o-personal');       // the running account kept its identity
+  assert.equal(am.accounts[0].credential, 'old');           // and its own token
+  assert.deepEqual(config.accounts.map(a => a.name), ['a@x.com (Personal)', 'a@x.com (Acme)']);
+});
+
+test('re-importing the same account+org still updates in place', async () => {
+  const accounts = [{ name: 'a@x.com', index: 0, type: 'oauth', credential: 'old', accountUuid: 'u1', orgUuid: 'o-acme', orgName: 'Acme' }];
+  const { tui, am, config, calls } = makeTUI({ accounts });
+  config.accounts = [{ name: 'a@x.com', type: 'oauth', accountUuid: 'u1', orgUuid: 'o-acme', orgName: 'Acme' }];
+  tui._readCredentials = async () => ({ accessToken: 'fresh', refreshToken: 'r2', expiresAt: Date.now() + 3600_000 });
+  tui._readProfile = async () => ({ email: 'a@x.com', accountUuid: 'u1', orgUuid: 'o-acme', orgName: 'Acme' });
+
+  await tui._doImport();
+
+  assert.equal(config.accounts.length, 1);
+  assert.equal(calls.added.length, 0);
+  assert.equal(am.accounts[0].credential, 'fresh');
+});
