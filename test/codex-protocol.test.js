@@ -5,9 +5,6 @@ import {
   isStreamingRequest,
   codexUrlForPath,
   codexHeaders,
-  claudeRequestToCodex,
-  createCodexStreamTranslator,
-  codexResponseToClaude,
   CODEX_BASE_URL,
 } from '../src/codex/protocol.js';
 import { AccountManager } from '../src/account-manager.js';
@@ -74,14 +71,6 @@ test('isStreamingRequest is safe on empty and malformed bodies', () => {
 test('isStreamingRequest ignores a nested stream key', () => {
   // A `stream` inside message content must not be mistaken for the request flag.
   assert.equal(isStreamingRequest(Buffer.from('{"messages":[{"stream":true}]}')), false);
-});
-
-test('the body translators are declared but not yet implemented', () => {
-  // Milestone 1 wires the seam; the translators land in milestone 2. These
-  // assertions exist so the stubs cannot be mistaken for working code.
-  assert.throws(() => claudeRequestToCodex(Buffer.from('{}'), 'm'), { notImplemented: true });
-  assert.throws(() => createCodexStreamTranslator(), { notImplemented: true });
-  assert.throws(() => codexResponseToClaude(Buffer.from('{}')), { notImplemented: true });
 });
 
 // ── account manager integration ─────────────────────────────

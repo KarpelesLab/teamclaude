@@ -1,0 +1,2324 @@
+{
+  "_generator": "CLIProxyAPI (github.com/router-for-me/CLIProxyAPI) via cmd/tc_oracle",
+  "_note": "Golden output. Regenerate only against a known-good CLIProxyAPI revision.",
+  "_cliproxyapi_revision": "bc71c77",
+  "_model": "gpt-5.6-sol",
+  "cases": [
+    {
+      "name": "plain text with system",
+      "request": {
+        "model": "claude-fable-5",
+        "max_tokens": 1024,
+        "system": "You are terse.",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ]
+      },
+      "want": {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "developer",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "You are terse."
+              }
+            ]
+          },
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "hi"
+              }
+            ]
+          }
+        ],
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": [
+          "reasoning.encrypted_content"
+        ]
+      }
+    },
+    {
+      "name": "system as content-block array",
+      "request": {
+        "model": "claude-fable-5",
+        "max_tokens": 1024,
+        "system": [
+          {
+            "type": "text",
+            "text": "Part one."
+          },
+          {
+            "type": "text",
+            "text": "Part two."
+          }
+        ],
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ]
+      },
+      "want": {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "developer",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "Part one."
+              },
+              {
+                "type": "input_text",
+                "text": "Part two."
+              }
+            ]
+          },
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "hi"
+              }
+            ]
+          }
+        ],
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": [
+          "reasoning.encrypted_content"
+        ]
+      }
+    },
+    {
+      "name": "system with billing attribution dropped",
+      "request": {
+        "model": "claude-fable-5",
+        "max_tokens": 1024,
+        "system": [
+          {
+            "type": "text",
+            "text": "x-anthropic-billing-header: acct=1"
+          },
+          {
+            "type": "text",
+            "text": "Real instruction."
+          }
+        ],
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ]
+      },
+      "want": {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "developer",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "Real instruction."
+              }
+            ]
+          },
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "hi"
+              }
+            ]
+          }
+        ],
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": [
+          "reasoning.encrypted_content"
+        ]
+      }
+    },
+    {
+      "name": "multi-turn conversation",
+      "request": {
+        "model": "claude-fable-5",
+        "max_tokens": 1024,
+        "messages": [
+          {
+            "role": "user",
+            "content": "first"
+          },
+          {
+            "role": "assistant",
+            "content": "reply"
+          },
+          {
+            "role": "user",
+            "content": "second"
+          }
+        ]
+      },
+      "want": {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "first"
+              }
+            ]
+          },
+          {
+            "type": "message",
+            "role": "assistant",
+            "content": [
+              {
+                "type": "output_text",
+                "text": "reply"
+              }
+            ]
+          },
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "second"
+              }
+            ]
+          }
+        ],
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": [
+          "reasoning.encrypted_content"
+        ]
+      }
+    },
+    {
+      "name": "assistant content array becomes output_text",
+      "request": {
+        "model": "claude-fable-5",
+        "max_tokens": 1024,
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "q"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "a"
+              }
+            ]
+          }
+        ]
+      },
+      "want": {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "q"
+              }
+            ]
+          },
+          {
+            "type": "message",
+            "role": "assistant",
+            "content": [
+              {
+                "type": "output_text",
+                "text": "a"
+              }
+            ]
+          }
+        ],
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": [
+          "reasoning.encrypted_content"
+        ]
+      }
+    },
+    {
+      "name": "mid-conversation system reminder",
+      "request": {
+        "model": "claude-fable-5",
+        "max_tokens": 1024,
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          },
+          {
+            "role": "system",
+            "content": [
+              {
+                "type": "text",
+                "text": "be brief"
+              }
+            ]
+          }
+        ]
+      },
+      "want": {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "hi"
+              }
+            ]
+          },
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "<system-reminder>\nbe brief\n</system-reminder>"
+              }
+            ]
+          }
+        ],
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": [
+          "reasoning.encrypted_content"
+        ]
+      }
+    },
+    {
+      "name": "image input",
+      "request": {
+        "model": "claude-fable-5",
+        "max_tokens": 1024,
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "what is this"
+              },
+              {
+                "type": "image",
+                "source": {
+                  "type": "base64",
+                  "media_type": "image/png",
+                  "data": "iVBORw0KGgo="
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "want": {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "what is this"
+              },
+              {
+                "type": "input_image",
+                "image_url": "data:image/png;base64,iVBORw0KGgo="
+              }
+            ]
+          }
+        ],
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": [
+          "reasoning.encrypted_content"
+        ]
+      }
+    },
+    {
+      "name": "image with mime_type spelling",
+      "request": {
+        "model": "claude-fable-5",
+        "max_tokens": 1024,
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "image",
+                "source": {
+                  "base64": "QUJD",
+                  "mime_type": "image/jpeg"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "want": {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_image",
+                "image_url": "data:image/jpeg;base64,QUJD"
+              }
+            ]
+          }
+        ],
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": [
+          "reasoning.encrypted_content"
+        ]
+      }
+    },
+    {
+      "name": "image with no media type",
+      "request": {
+        "model": "claude-fable-5",
+        "max_tokens": 1024,
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "image",
+                "source": {
+                  "data": "QUJD"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "want": {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_image",
+                "image_url": "data:application/octet-stream;base64,QUJD"
+              }
+            ]
+          }
+        ],
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": [
+          "reasoning.encrypted_content"
+        ]
+      }
+    },
+    {
+      "name": "tools declared",
+      "request": {
+        "model": "claude-fable-5",
+        "max_tokens": 1024,
+        "messages": [
+          {
+            "role": "user",
+            "content": "weather?"
+          }
+        ],
+        "tools": [
+          {
+            "name": "get_weather",
+            "description": "Get weather",
+            "input_schema": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "city"
+              ]
+            }
+          }
+        ]
+      },
+      "want": {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "weather?"
+              }
+            ]
+          }
+        ],
+        "tool_choice": "auto",
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": [
+          "reasoning.encrypted_content"
+        ],
+        "tools": [
+          {
+            "name": "get_weather",
+            "description": "Get weather",
+            "type": "function",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "city"
+              ]
+            },
+            "strict": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "tool with empty schema normalized",
+      "request": {
+        "model": "claude-fable-5",
+        "max_tokens": 1024,
+        "messages": [
+          {
+            "role": "user",
+            "content": "x"
+          }
+        ],
+        "tools": [
+          {
+            "name": "noop",
+            "description": "nothing",
+            "input_schema": {}
+          }
+        ]
+      },
+      "want": {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "x"
+              }
+            ]
+          }
+        ],
+        "tool_choice": "auto",
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": [
+          "reasoning.encrypted_content"
+        ],
+        "tools": [
+          {
+            "name": "noop",
+            "description": "nothing",
+            "type": "function",
+            "parameters": {
+              "type": "object",
+              "properties": {}
+            },
+            "strict": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "tool schema carrying $schema is stripped",
+      "request": {
+        "model": "claude-fable-5",
+        "max_tokens": 1024,
+        "messages": [
+          {
+            "role": "user",
+            "content": "x"
+          }
+        ],
+        "tools": [
+          {
+            "name": "noop",
+            "description": "nothing",
+            "input_schema": {
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "type": "object",
+              "properties": {}
+            }
+          }
+        ]
+      },
+      "want": {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "x"
+              }
+            ]
+          }
+        ],
+        "tool_choice": "auto",
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": [
+          "reasoning.encrypted_content"
+        ],
+        "tools": [
+          {
+            "name": "noop",
+            "description": "nothing",
+            "type": "function",
+            "parameters": {
+              "type": "object",
+              "properties": {}
+            },
+            "strict": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "tool with cache_control stripped",
+      "request": {
+        "model": "claude-fable-5",
+        "max_tokens": 1024,
+        "messages": [
+          {
+            "role": "user",
+            "content": "x"
+          }
+        ],
+        "tools": [
+          {
+            "name": "noop",
+            "description": "d",
+            "input_schema": {
+              "type": "object",
+              "properties": {}
+            },
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          }
+        ]
+      },
+      "want": {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "x"
+              }
+            ]
+          }
+        ],
+        "tool_choice": "auto",
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": [
+          "reasoning.encrypted_content"
+        ],
+        "tools": [
+          {
+            "name": "noop",
+            "description": "d",
+            "type": "function",
+            "parameters": {
+              "type": "object",
+              "properties": {}
+            },
+            "strict": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "long mcp tool names shortened uniquely",
+      "request": {
+        "model": "claude-fable-5",
+        "max_tokens": 1024,
+        "messages": [
+          {
+            "role": "user",
+            "content": "x"
+          }
+        ],
+        "tools": [
+          {
+            "name": "mcp__some-really-long-server-name__a_tool_with_a_very_long_name_indeed",
+            "description": "a",
+            "input_schema": {
+              "type": "object",
+              "properties": {}
+            }
+          },
+          {
+            "name": "mcp__some-really-long-server-name__a_tool_with_a_very_long_name_also_x",
+            "description": "b",
+            "input_schema": {
+              "type": "object",
+              "properties": {}
+            }
+          }
+        ]
+      },
+      "want": {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "x"
+              }
+            ]
+          }
+        ],
+        "tool_choice": "auto",
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": [
+          "reasoning.encrypted_content"
+        ],
+        "tools": [
+          {
+            "name": "mcp__a_tool_with_a_very_long_name_indeed",
+            "description": "a",
+            "type": "function",
+            "parameters": {
+              "type": "object",
+              "properties": {}
+            },
+            "strict": false
+          },
+          {
+            "name": "mcp__a_tool_with_a_very_long_name_also_x",
+            "description": "b",
+            "type": "function",
+            "parameters": {
+              "type": "object",
+              "properties": {}
+            },
+            "strict": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "tool_use and tool_result round trip",
+      "request": {
+        "model": "claude-fable-5",
+        "max_tokens": 1024,
+        "messages": [
+          {
+            "role": "user",
+            "content": "weather in NYC?"
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "Let me check."
+              },
+              {
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "get_weather",
+                "input": {
+                  "city": "NYC"
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "toolu_1",
+                "content": "Sunny, 72F"
+              }
+            ]
+          }
+        ],
+        "tools": [
+          {
+            "name": "get_weather",
+            "description": "w",
+            "input_schema": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "want": {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "weather in NYC?"
+              }
+            ]
+          },
+          {
+            "type": "message",
+            "role": "assistant",
+            "content": [
+              {
+                "type": "output_text",
+                "text": "Let me check."
+              }
+            ]
+          },
+          {
+            "type": "function_call",
+            "call_id": "toolu_1",
+            "name": "get_weather",
+            "arguments": "{\"city\":\"NYC\"}"
+          },
+          {
+            "type": "function_call_output",
+            "call_id": "toolu_1",
+            "output": "Sunny, 72F"
+          }
+        ],
+        "tool_choice": "auto",
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": [
+          "reasoning.encrypted_content"
+        ],
+        "tools": [
+          {
+            "name": "get_weather",
+            "description": "w",
+            "type": "function",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              }
+            },
+            "strict": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "parallel tool calls in one assistant turn",
+      "request": {
+        "model": "claude-fable-5",
+        "max_tokens": 1024,
+        "messages": [
+          {
+            "role": "user",
+            "content": "compare"
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "toolu_a",
+                "name": "get_weather",
+                "input": {
+                  "city": "NYC"
+                }
+              },
+              {
+                "type": "tool_use",
+                "id": "toolu_b",
+                "name": "get_weather",
+                "input": {
+                  "city": "LA"
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "toolu_a",
+                "content": "Sunny"
+              },
+              {
+                "type": "tool_result",
+                "tool_use_id": "toolu_b",
+                "content": "Cloudy"
+              }
+            ]
+          }
+        ],
+        "tools": [
+          {
+            "name": "get_weather",
+            "description": "w",
+            "input_schema": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "want": {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "compare"
+              }
+            ]
+          },
+          {
+            "type": "function_call",
+            "call_id": "toolu_a",
+            "name": "get_weather",
+            "arguments": "{\"city\":\"NYC\"}"
+          },
+          {
+            "type": "function_call",
+            "call_id": "toolu_b",
+            "name": "get_weather",
+            "arguments": "{\"city\":\"LA\"}"
+          },
+          {
+            "type": "function_call_output",
+            "call_id": "toolu_a",
+            "output": "Sunny"
+          },
+          {
+            "type": "function_call_output",
+            "call_id": "toolu_b",
+            "output": "Cloudy"
+          }
+        ],
+        "tool_choice": "auto",
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": [
+          "reasoning.encrypted_content"
+        ],
+        "tools": [
+          {
+            "name": "get_weather",
+            "description": "w",
+            "type": "function",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              }
+            },
+            "strict": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "tool_result with structured content blocks",
+      "request": {
+        "model": "claude-fable-5",
+        "max_tokens": 1024,
+        "messages": [
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "shot",
+                "input": {}
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "toolu_1",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "here"
+                  },
+                  {
+                    "type": "image",
+                    "source": {
+                      "media_type": "image/png",
+                      "data": "QUJD"
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        ],
+        "tools": [
+          {
+            "name": "shot",
+            "description": "s",
+            "input_schema": {
+              "type": "object",
+              "properties": {}
+            }
+          }
+        ]
+      },
+      "want": {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "function_call",
+            "call_id": "toolu_1",
+            "name": "shot",
+            "arguments": "{}"
+          },
+          {
+            "type": "function_call_output",
+            "call_id": "toolu_1",
+            "output": [
+              {
+                "type": "input_text",
+                "text": "here"
+              },
+              {
+                "type": "input_image",
+                "image_url": "data:image/png;base64,QUJD"
+              }
+            ]
+          }
+        ],
+        "tool_choice": "auto",
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": [
+          "reasoning.encrypted_content"
+        ],
+        "tools": [
+          {
+            "name": "shot",
+            "description": "s",
+            "type": "function",
+            "parameters": {
+              "type": "object",
+              "properties": {}
+            },
+            "strict": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "long tool_use id shortened",
+      "request": {
+        "model": "claude-fable-5",
+        "max_tokens": 1024,
+        "messages": [
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "toolu_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "name": "noop",
+                "input": {}
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "toolu_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "content": "ok"
+              }
+            ]
+          }
+        ],
+        "tools": [
+          {
+            "name": "noop",
+            "description": "n",
+            "input_schema": {
+              "type": "object",
+              "properties": {}
+            }
+          }
+        ]
+      },
+      "want": {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "function_call",
+            "call_id": "toolu_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_41a82204edcd94fe",
+            "name": "noop",
+            "arguments": "{}"
+          },
+          {
+            "type": "function_call_output",
+            "call_id": "toolu_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_41a82204edcd94fe",
+            "output": "ok"
+          }
+        ],
+        "tool_choice": "auto",
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": [
+          "reasoning.encrypted_content"
+        ],
+        "tools": [
+          {
+            "name": "noop",
+            "description": "n",
+            "type": "function",
+            "parameters": {
+              "type": "object",
+              "properties": {}
+            },
+            "strict": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "thinking block replayed with valid gpt signature",
+      "request": {
+        "model": "claude-fable-5",
+        "max_tokens": 1024,
+        "messages": [
+          {
+            "role": "user",
+            "content": "think"
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "thinking",
+                "thinking": "hmm",
+                "signature": "gAAAAAAAAAAACQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1g"
+              },
+              {
+                "type": "text",
+                "text": "done"
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": "more"
+          }
+        ]
+      },
+      "want": {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "think"
+              }
+            ]
+          },
+          {
+            "type": "reasoning",
+            "summary": [],
+            "content": null,
+            "encrypted_content": "gAAAAAAAAAAACQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1g"
+          },
+          {
+            "type": "message",
+            "role": "assistant",
+            "content": [
+              {
+                "type": "output_text",
+                "text": "done"
+              }
+            ]
+          },
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "more"
+              }
+            ]
+          }
+        ],
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": [
+          "reasoning.encrypted_content"
+        ]
+      }
+    },
+    {
+      "name": "thinking block with malformed signature is dropped",
+      "request": {
+        "model": "claude-fable-5",
+        "max_tokens": 1024,
+        "messages": [
+          {
+            "role": "user",
+            "content": "think"
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "thinking",
+                "thinking": "hmm",
+                "signature": "gAAAAABtooshort"
+              },
+              {
+                "type": "text",
+                "text": "done"
+              }
+            ]
+          }
+        ]
+      },
+      "want": {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "think"
+              }
+            ]
+          },
+          {
+            "type": "message",
+            "role": "assistant",
+            "content": [
+              {
+                "type": "output_text",
+                "text": "done"
+              }
+            ]
+          }
+        ],
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": [
+          "reasoning.encrypted_content"
+        ]
+      }
+    },
+    {
+      "name": "anthropic-issued thinking signature is dropped",
+      "request": {
+        "model": "claude-fable-5",
+        "max_tokens": 1024,
+        "messages": [
+          {
+            "role": "user",
+            "content": "think"
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "thinking",
+                "thinking": "hmm",
+                "signature": "ErUBCkYIBxgCKkDxV3nOSignedByAnthropic=="
+              },
+              {
+                "type": "text",
+                "text": "done"
+              }
+            ]
+          }
+        ]
+      },
+      "want": {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "think"
+              }
+            ]
+          },
+          {
+            "type": "message",
+            "role": "assistant",
+            "content": [
+              {
+                "type": "output_text",
+                "text": "done"
+              }
+            ]
+          }
+        ],
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": [
+          "reasoning.encrypted_content"
+        ]
+      }
+    },
+    {
+      "name": "thinking block with no signature is dropped",
+      "request": {
+        "model": "claude-fable-5",
+        "max_tokens": 1024,
+        "messages": [
+          {
+            "role": "user",
+            "content": "think"
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "thinking",
+                "thinking": "hmm"
+              },
+              {
+                "type": "text",
+                "text": "done"
+              }
+            ]
+          }
+        ]
+      },
+      "want": {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "think"
+              }
+            ]
+          },
+          {
+            "type": "message",
+            "role": "assistant",
+            "content": [
+              {
+                "type": "output_text",
+                "text": "done"
+              }
+            ]
+          }
+        ],
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": [
+          "reasoning.encrypted_content"
+        ]
+      }
+    },
+    {
+      "name": "thinking on a user turn is ignored",
+      "request": {
+        "model": "claude-fable-5",
+        "max_tokens": 1024,
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "thinking",
+                "thinking": "x",
+                "signature": "gAAAAAAAAAAACQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0BBQkNERUZHSA"
+              }
+            ]
+          }
+        ]
+      },
+      "want": {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": [],
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": [
+          "reasoning.encrypted_content"
+        ]
+      }
+    },
+    {
+      "name": "thinking budget low",
+      "request": {
+        "model": "claude-fable-5",
+        "max_tokens": 4096,
+        "thinking": {
+          "type": "enabled",
+          "budget_tokens": 1024
+        },
+        "messages": [
+          {
+            "role": "user",
+            "content": "x"
+          }
+        ]
+      },
+      "want": {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "x"
+              }
+            ]
+          }
+        ],
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "low"
+        },
+        "stream": true,
+        "store": false,
+        "include": [
+          "reasoning.encrypted_content"
+        ]
+      }
+    },
+    {
+      "name": "thinking budget high",
+      "request": {
+        "model": "claude-fable-5",
+        "max_tokens": 32000,
+        "thinking": {
+          "type": "enabled",
+          "budget_tokens": 20000
+        },
+        "messages": [
+          {
+            "role": "user",
+            "content": "x"
+          }
+        ]
+      },
+      "want": {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "x"
+              }
+            ]
+          }
+        ],
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "high"
+        },
+        "stream": true,
+        "store": false,
+        "include": [
+          "reasoning.encrypted_content"
+        ]
+      }
+    },
+    {
+      "name": "thinking budget xhigh",
+      "request": {
+        "model": "claude-fable-5",
+        "max_tokens": 64000,
+        "thinking": {
+          "type": "enabled",
+          "budget_tokens": 50000
+        },
+        "messages": [
+          {
+            "role": "user",
+            "content": "x"
+          }
+        ]
+      },
+      "want": {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "x"
+              }
+            ]
+          }
+        ],
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "xhigh"
+        },
+        "stream": true,
+        "store": false,
+        "include": [
+          "reasoning.encrypted_content"
+        ]
+      }
+    },
+    {
+      "name": "thinking minimal",
+      "request": {
+        "model": "claude-fable-5",
+        "max_tokens": 1024,
+        "thinking": {
+          "type": "enabled",
+          "budget_tokens": 256
+        },
+        "messages": [
+          {
+            "role": "user",
+            "content": "x"
+          }
+        ]
+      },
+      "want": {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "x"
+              }
+            ]
+          }
+        ],
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "minimal"
+        },
+        "stream": true,
+        "store": false,
+        "include": [
+          "reasoning.encrypted_content"
+        ]
+      }
+    },
+    {
+      "name": "thinking disabled",
+      "request": {
+        "model": "claude-fable-5",
+        "max_tokens": 1024,
+        "thinking": {
+          "type": "disabled"
+        },
+        "messages": [
+          {
+            "role": "user",
+            "content": "x"
+          }
+        ]
+      },
+      "want": {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "x"
+              }
+            ]
+          }
+        ],
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "none"
+        },
+        "stream": true,
+        "store": false,
+        "include": [
+          "reasoning.encrypted_content"
+        ]
+      }
+    },
+    {
+      "name": "thinking adaptive",
+      "request": {
+        "model": "claude-fable-5",
+        "max_tokens": 1024,
+        "thinking": {
+          "type": "adaptive"
+        },
+        "messages": [
+          {
+            "role": "user",
+            "content": "x"
+          }
+        ]
+      },
+      "want": {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "x"
+              }
+            ]
+          }
+        ],
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "xhigh"
+        },
+        "stream": true,
+        "store": false,
+        "include": [
+          "reasoning.encrypted_content"
+        ]
+      }
+    },
+    {
+      "name": "thinking adaptive with explicit effort",
+      "request": {
+        "model": "claude-fable-5",
+        "max_tokens": 1024,
+        "thinking": {
+          "type": "adaptive"
+        },
+        "output_config": {
+          "effort": "Low"
+        },
+        "messages": [
+          {
+            "role": "user",
+            "content": "x"
+          }
+        ]
+      },
+      "want": {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "x"
+              }
+            ]
+          }
+        ],
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "low"
+        },
+        "stream": true,
+        "store": false,
+        "include": [
+          "reasoning.encrypted_content"
+        ]
+      }
+    },
+    {
+      "name": "tool_choice auto",
+      "request": {
+        "model": "claude-fable-5",
+        "max_tokens": 1024,
+        "tool_choice": {
+          "type": "auto"
+        },
+        "messages": [
+          {
+            "role": "user",
+            "content": "x"
+          }
+        ],
+        "tools": [
+          {
+            "name": "noop",
+            "description": "n",
+            "input_schema": {
+              "type": "object",
+              "properties": {}
+            }
+          }
+        ]
+      },
+      "want": {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "x"
+              }
+            ]
+          }
+        ],
+        "tool_choice": "auto",
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": [
+          "reasoning.encrypted_content"
+        ],
+        "tools": [
+          {
+            "name": "noop",
+            "description": "n",
+            "type": "function",
+            "parameters": {
+              "type": "object",
+              "properties": {}
+            },
+            "strict": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "tool_choice any",
+      "request": {
+        "model": "claude-fable-5",
+        "max_tokens": 1024,
+        "tool_choice": {
+          "type": "any"
+        },
+        "messages": [
+          {
+            "role": "user",
+            "content": "x"
+          }
+        ],
+        "tools": [
+          {
+            "name": "noop",
+            "description": "n",
+            "input_schema": {
+              "type": "object",
+              "properties": {}
+            }
+          }
+        ]
+      },
+      "want": {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "x"
+              }
+            ]
+          }
+        ],
+        "tool_choice": "required",
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": [
+          "reasoning.encrypted_content"
+        ],
+        "tools": [
+          {
+            "name": "noop",
+            "description": "n",
+            "type": "function",
+            "parameters": {
+              "type": "object",
+              "properties": {}
+            },
+            "strict": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "tool_choice none",
+      "request": {
+        "model": "claude-fable-5",
+        "max_tokens": 1024,
+        "tool_choice": {
+          "type": "none"
+        },
+        "messages": [
+          {
+            "role": "user",
+            "content": "x"
+          }
+        ],
+        "tools": [
+          {
+            "name": "noop",
+            "description": "n",
+            "input_schema": {
+              "type": "object",
+              "properties": {}
+            }
+          }
+        ]
+      },
+      "want": {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "x"
+              }
+            ]
+          }
+        ],
+        "tool_choice": "none",
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": [
+          "reasoning.encrypted_content"
+        ],
+        "tools": [
+          {
+            "name": "noop",
+            "description": "n",
+            "type": "function",
+            "parameters": {
+              "type": "object",
+              "properties": {}
+            },
+            "strict": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "tool_choice specific tool",
+      "request": {
+        "model": "claude-fable-5",
+        "max_tokens": 1024,
+        "tool_choice": {
+          "type": "tool",
+          "name": "noop"
+        },
+        "messages": [
+          {
+            "role": "user",
+            "content": "x"
+          }
+        ],
+        "tools": [
+          {
+            "name": "noop",
+            "description": "n",
+            "input_schema": {
+              "type": "object",
+              "properties": {}
+            }
+          }
+        ]
+      },
+      "want": {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "x"
+              }
+            ]
+          }
+        ],
+        "tool_choice": {
+          "type": "function",
+          "name": "noop"
+        },
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": [
+          "reasoning.encrypted_content"
+        ],
+        "tools": [
+          {
+            "name": "noop",
+            "description": "n",
+            "type": "function",
+            "parameters": {
+              "type": "object",
+              "properties": {}
+            },
+            "strict": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "tool_choice disabling parallel tool use",
+      "request": {
+        "model": "claude-fable-5",
+        "max_tokens": 1024,
+        "tool_choice": {
+          "type": "auto",
+          "disable_parallel_tool_use": true
+        },
+        "messages": [
+          {
+            "role": "user",
+            "content": "x"
+          }
+        ],
+        "tools": [
+          {
+            "name": "noop",
+            "description": "n",
+            "input_schema": {
+              "type": "object",
+              "properties": {}
+            }
+          }
+        ]
+      },
+      "want": {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "x"
+              }
+            ]
+          }
+        ],
+        "tool_choice": "auto",
+        "parallel_tool_calls": false,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": [
+          "reasoning.encrypted_content"
+        ],
+        "tools": [
+          {
+            "name": "noop",
+            "description": "n",
+            "type": "function",
+            "parameters": {
+              "type": "object",
+              "properties": {}
+            },
+            "strict": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "web search tool",
+      "request": {
+        "model": "claude-fable-5",
+        "max_tokens": 1024,
+        "messages": [
+          {
+            "role": "user",
+            "content": "search"
+          }
+        ],
+        "tools": [
+          {
+            "type": "web_search_20250305",
+            "name": "web_search",
+            "allowed_domains": [
+              "example.com"
+            ]
+          }
+        ]
+      },
+      "want": {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "search"
+              }
+            ]
+          }
+        ],
+        "tool_choice": "auto",
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": [
+          "reasoning.encrypted_content"
+        ],
+        "tools": [
+          {
+            "type": "web_search",
+            "filters": {
+              "allowed_domains": [
+                "example.com"
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "service tier priority via speed",
+      "request": {
+        "model": "claude-fable-5",
+        "max_tokens": 1024,
+        "speed": "fast",
+        "messages": [
+          {
+            "role": "user",
+            "content": "x"
+          }
+        ]
+      },
+      "want": {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "x"
+              }
+            ]
+          }
+        ],
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "service_tier": "priority",
+        "stream": true,
+        "store": false,
+        "include": [
+          "reasoning.encrypted_content"
+        ]
+      }
+    },
+    {
+      "name": "no system, no tools",
+      "request": {
+        "model": "claude-fable-5",
+        "max_tokens": 1024,
+        "messages": [
+          {
+            "role": "user",
+            "content": "bare"
+          }
+        ]
+      },
+      "want": {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "bare"
+              }
+            ]
+          }
+        ],
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": [
+          "reasoning.encrypted_content"
+        ]
+      }
+    }
+  ]
+}
