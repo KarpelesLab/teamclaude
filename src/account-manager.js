@@ -1,4 +1,5 @@
 import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired } from './oauth.js';
+import { refreshCodexToken } from './codex/oauth.js';
 import { sameIdentity } from './identity.js';
 import { weeklyBucketForModel, modelGlobMatches } from './model.js';
 import { SessionTracker } from './session-tracker.js';
@@ -51,6 +52,15 @@ function makeAccount(acct, index) {
     index,
     name: acct.name,
     type: acct.type,
+    // Wire protocol this account speaks. 'anthropic' (the default) forwards the
+    // client's Messages API request essentially untouched; 'codex' translates it
+    // to the OpenAI Responses API. Everything outside the forwarding path —
+    // rotation, priority, routes, disable/enable, TC_ACCT pinning — is
+    // protocol-agnostic and must stay that way.
+    protocol: acct.protocol || 'anthropic',
+    // ChatGPT account id, sent as the chatgpt-account-id header on every codex
+    // request. Null for anthropic accounts.
+    accountId: acct.accountId || null,
     accountUuid: acct.accountUuid || null,
     orgUuid: acct.orgUuid || null,
     orgName: acct.orgName || null,
@@ -100,12 +110,13 @@ function modelMatches(declared, model) {
 }
 
 export class AccountManager {
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, throttleProbeFloorMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, sessionTracker } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, throttleProbeFloorMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, sessionTracker } = {}) {
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
-    // OAuth token refresh.
+    // OAuth token refresh. Separate refreshers per protocol — see ensureTokenFresh.
     this._refreshFn = refreshFn;
+    this._codexRefreshFn = codexRefreshFn;
     this.accounts = accounts.map((acct, index) => makeAccount(acct, index));
     this.currentIndex = 0;
     // Session awareness (issue #109). The tracker is always on (passive — it just
@@ -1186,10 +1197,20 @@ export class AccountManager {
     account._refreshPromise = (async () => {
       console.log(`[TeamClaude] Refreshing token for account "${account.name}"...`);
       try {
-        const newTokens = await this._refreshFn(account.refreshToken);
+        // Dispatch on protocol: codex accounts refresh against OpenAI's token
+        // endpoint with a different client id and wire format. Both refreshers
+        // share an error contract (err.status set on HTTP failures) so the
+        // auth-rejection handling below works identically for either.
+        const refreshFn = account.protocol === 'codex' ? this._codexRefreshFn : this._refreshFn;
+        const newTokens = await refreshFn(account.refreshToken);
         account.credential = newTokens.accessToken;
         account.refreshToken = newTokens.refreshToken;
         account.expiresAt = newTokens.expiresAt;
+        // A codex refresh re-derives the account id from the fresh id_token, so
+        // a server-side account migration is picked up instead of staying
+        // pinned to whatever was imported. Guard against a null so a partial
+        // response can't erase a working id.
+        if (newTokens.accountId) account.accountId = newTokens.accountId;
         account._lastRefreshAt = Date.now();
         console.log(`[TeamClaude] Token refreshed for account "${account.name}"`);
         this._onTokenRefresh?.(accountIndex, newTokens);
