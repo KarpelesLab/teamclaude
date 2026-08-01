@@ -29,7 +29,7 @@ const d = obj => `event: ${obj.type}\ndata: ${JSON.stringify(obj)}\n\n`;
  * so against the real thing it buffered the SSE and dumped it raw. Setting a
  * header the real server omits is how a mock hides a bug — leave this alone.
  */
-async function startFakeCodex(events, { status = 200, contentType = null } = {}) {
+async function startFakeCodex(events, { status = 200, contentType = null, quotaHeaders = null } = {}) {
   const received = [];
   const server = http.createServer((req, res) => {
     let body = '';
@@ -37,11 +37,11 @@ async function startFakeCodex(events, { status = 200, contentType = null } = {})
     req.on('end', () => {
       received.push({ url: req.url, method: req.method, headers: req.headers, body });
       if (status !== 200) {
-        res.writeHead(status, { 'content-type': 'application/json' });
+        res.writeHead(status, { 'content-type': 'application/json', ...(quotaHeaders || {}) });
         res.end(JSON.stringify({ error: { type: 'server_error', message: 'boom' } }));
         return;
       }
-      res.writeHead(200, contentType ? { 'content-type': contentType } : {});
+      res.writeHead(200, { ...(contentType ? { 'content-type': contentType } : {}), ...(quotaHeaders || {}) });
       for (const e of events) res.write(e);
       res.end();
     });
@@ -282,6 +282,58 @@ test('a codex response that does declare event-stream still works', async () => 
       messages: [{ role: 'user', content: 'hi' }],
     });
     assert.match(res.body, /event: message_start/);
+  } finally {
+    proxy.server.close();
+    codex.server.close();
+  }
+});
+
+test('codex quota headers are recorded from a normal response', async () => {
+  // Quota rides in on every response, which is what makes rotation predictive:
+  // the account's headroom is known before the next request is routed.
+  const codex = await startFakeCodex(SCRIPT, {
+    quotaHeaders: {
+      'x-codex-plan-type': 'plus',
+      'x-codex-primary-window-minutes': '10080',
+      'x-codex-primary-used-percent': '73.5',
+      'x-codex-primary-reset-at': String(Math.floor(Date.now() / 1000) + 86400),
+    },
+  });
+  const proxy = await startProxy(codexAccount({ upstream: codex.url }));
+
+  try {
+    await request(proxy.url, {
+      model: 'claude-fable-5', max_tokens: 100, stream: true,
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    const acct = proxy.am.accounts[0];
+    assert.equal(acct.quota.unified7d, 0.735);
+    assert.equal(acct.planType, 'plus');
+    // Still below the switch threshold, so it keeps serving.
+    assert.equal(proxy.am._isAvailable(acct), true);
+  } finally {
+    proxy.server.close();
+    codex.server.close();
+  }
+});
+
+test('a spent codex account is skipped on the next request', async () => {
+  const codex = await startFakeCodex(SCRIPT, {
+    quotaHeaders: {
+      'x-codex-primary-window-minutes': '10080',
+      'x-codex-primary-used-percent': '100',
+      'x-codex-primary-reset-at': String(Math.floor(Date.now() / 1000) + 86400),
+    },
+  });
+  const proxy = await startProxy(codexAccount({ upstream: codex.url }));
+
+  try {
+    await request(proxy.url, {
+      model: 'claude-fable-5', max_tokens: 100, stream: true,
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    // Learned from the response, before any 429 was ever seen.
+    assert.equal(proxy.am._isAvailable(proxy.am.accounts[0]), false);
   } finally {
     proxy.server.close();
     codex.server.close();

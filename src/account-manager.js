@@ -1,5 +1,6 @@
 import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired } from './oauth.js';
 import { refreshCodexToken } from './codex/oauth.js';
+import { parseCodexQuota } from './codex/quota.js';
 import { sameIdentity } from './identity.js';
 import { weeklyBucketForModel, modelGlobMatches } from './model.js';
 import { SessionTracker } from './session-tracker.js';
@@ -1014,6 +1015,14 @@ export class AccountManager {
     const account = this.accounts[accountIndex];
     if (!account) return;
 
+    // Codex reports quota in its own header family. It is normalized onto the
+    // same unified5h/unified7d fields so selection, the switch threshold,
+    // status rendering and state persistence need no protocol awareness.
+    if (account.protocol === 'codex') {
+      this._updateCodexQuota(account, headers);
+      return;
+    }
+
     // Unified rate limits (Claude Max)
     const u5h = parseFloat(headers['anthropic-ratelimit-unified-5h-utilization']);
     const u7d = parseFloat(headers['anthropic-ratelimit-unified-7d-utilization']);
@@ -1070,6 +1079,44 @@ export class AccountManager {
         ? (account.quota.unified7d * 100).toFixed(1)
         : account.quota.tokensLimit
           ? ((1 - account.quota.tokensRemaining / account.quota.tokensLimit) * 100).toFixed(1)
+          : '?';
+      console.log(`[TeamClaude] Account "${account.name}" at ${pct}% usage — will switch on next request`);
+    }
+  }
+
+  /**
+   * Record quota for a codex account from its x-codex-* response headers.
+   *
+   * Mirrors the bookkeeping the Anthropic branch does — request counter, probe
+   * clearing, near-quota warning — so a codex account behaves identically to
+   * its peers everywhere downstream.
+   */
+  _updateCodexQuota(account, headers) {
+    const parsed = parseCodexQuota(headers);
+
+    if (parsed.unified5h !== undefined) account.quota.unified5h = parsed.unified5h;
+    if (parsed.unified5hReset !== undefined) account.quota.unified5hReset = parsed.unified5hReset;
+    if (parsed.unified7d !== undefined) account.quota.unified7d = parsed.unified7d;
+    if (parsed.unified7dReset !== undefined) account.quota.unified7dReset = parsed.unified7dReset;
+    if (parsed.planType) account.planType = parsed.planType;
+
+    // Same trigger as the Anthropic path: the account was selected partly to
+    // discover its quota, and now that a real limit is known, selection should
+    // re-evaluate rather than stay on it by inertia.
+    if (account.probing && account.quota.unified7dReset != null) {
+      account.probing = false;
+      account.requalify = true;
+      console.log(`[TeamClaude] Learned weekly quota for "${account.name}", re-evaluating selection`);
+    }
+
+    account.usage.totalRequests++;
+    account.usage.lastUsed = new Date().toISOString();
+
+    if (this._isNearQuota(account)) {
+      const pct = account.quota.unified7d != null
+        ? (account.quota.unified7d * 100).toFixed(1)
+        : account.quota.unified5h != null
+          ? (account.quota.unified5h * 100).toFixed(1)
           : '?';
       console.log(`[TeamClaude] Account "${account.name}" at ${pct}% usage — will switch on next request`);
     }

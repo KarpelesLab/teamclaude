@@ -15,6 +15,7 @@ import { tunnelTls } from './sx.js';
 import { isCodexAccount, codexHeaders, codexUrlForPath, isStreamingRequest, CODEX_BASE_URL } from './codex/protocol.js';
 import { claudeRequestToCodex } from './codex/request-translate.js';
 import { createCodexStreamTranslator, aggregateAnthropicStream } from './codex/response-translate.js';
+import { CODEX_HEADER_PREFIX, isCodexQuotaExhausted, codexResetAfterSeconds } from './codex/quota.js';
 
 
 export const HOP_BY_HOP_HEADERS = new Set([
@@ -799,10 +800,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       accountManager.release(account.index);
     }
 
-    // Extract rate limit headers
+    // Extract rate limit headers. Each protocol reports quota in its own header
+    // family; updateQuota normalizes both onto the same fields.
+    const quotaPrefix = isCodex ? CODEX_HEADER_PREFIX : 'anthropic-ratelimit-';
     const rateLimitHeaders = {};
     for (const [key, value] of upstreamRes.headers.entries()) {
-      if (key.startsWith('anthropic-ratelimit-')) {
+      if (key.startsWith(quotaPrefix)) {
         rateLimitHeaders[key] = value;
       }
     }
@@ -831,9 +834,25 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // account is futile — switch to another account now (updateQuota above
       // already recorded the spent bucket's utilization from the headers).
       const rl = rateLimitHeaders;
-      const generalRejected = rl['anthropic-ratelimit-unified-5h-status'] === 'rejected'
+      // Codex reports no per-bucket status, so a spent bucket has to be inferred
+      // from its utilization instead. Without this a codex 429 would read as a
+      // transient throttle and the proxy would keep retrying an account whose
+      // weekly limit is gone until its reset — for a 7-day window, that is a
+      // very long time to be stuck.
+      const codexExhausted = isCodex && isCodexQuotaExhausted(rl);
+      const generalRejected = codexExhausted
+        || rl['anthropic-ratelimit-unified-5h-status'] === 'rejected'
         || rl['anthropic-ratelimit-unified-7d-status'] === 'rejected';
       const fableRejected = rl['anthropic-ratelimit-unified-7d_oi-status'] === 'rejected' && !generalRejected;
+      if (codexExhausted) {
+        // Prefer the bucket's own reset over Retry-After. The hold below is
+        // still capped at an hour, so this does not keep a week-long exhaustion
+        // held for a week — the recorded utilization is what actually bars the
+        // account (selection skips anything past the switch threshold until the
+        // reset clears it). This just stops the hold being shorter than needed.
+        const resetIn = codexResetAfterSeconds(rl);
+        if (resetIn !== null) retryAfter = resetIn;
+      }
       if ((generalRejected || fableRejected) && retryCount < maxRetries) {
         // A Fable-only rejection leaves the account fine for other models, so we
         // do NOT throttle it globally — the recorded Fable utilization makes
