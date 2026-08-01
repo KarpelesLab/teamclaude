@@ -8,6 +8,7 @@ import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConf
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
+import { importCodexCredentials, refreshCodexToken, CODEX_DEFAULT_AUTH_PATH } from './codex/oauth.js';
 import { sameIdentity, orgKey, matchAccounts } from './identity.js';
 import { resolveAccounts } from './resolve-accounts.js';
 import * as alias from './alias.js';
@@ -186,6 +187,9 @@ async function serverCommand() {
       config.accounts[idx].accessToken = newTokens.accessToken;
       config.accounts[idx].refreshToken = newTokens.refreshToken;
       config.accounts[idx].expiresAt = newTokens.expiresAt;
+      // Codex refreshes re-derive the account id; persist it so a migrated
+      // account survives a restart. Absent for anthropic accounts.
+      if (newTokens.accountId) config.accounts[idx].accountId = newTokens.accountId;
     }
     atomicConfigUpdate(diskConfig => {
       // Pick up any new accounts from disk so index matching stays correct
@@ -203,6 +207,7 @@ async function serverCommand() {
         diskConfig.accounts[cfgIdx].accessToken = newTokens.accessToken;
         diskConfig.accounts[cfgIdx].refreshToken = newTokens.refreshToken;
         diskConfig.accounts[cfgIdx].expiresAt = newTokens.expiresAt;
+        if (newTokens.accountId) diskConfig.accounts[cfgIdx].accountId = newTokens.accountId;
       }
     }).catch(err => console.error(`[TeamClaude] Failed to save refreshed token: ${err.message}`));
   });
@@ -486,6 +491,11 @@ async function serverCommand() {
 async function importCommand() {
   const config = await loadOrCreateConfig();
 
+  if (args.includes('--codex')) {
+    await importCodexCommand(config);
+    return;
+  }
+
   let name = argValue('--name');
   const jsonStr = argValue('--json');
 
@@ -520,6 +530,73 @@ async function importCommand() {
   }
 
   await upsertOAuthAccount(config, name, creds, 'import');
+}
+
+// ── codex import ────────────────────────────────────────────
+
+async function importCodexCommand(config) {
+  const name = argValue('--name');
+  const fromPath = argValue('--from') || CODEX_DEFAULT_AUTH_PATH;
+
+  let creds;
+  try {
+    creds = await importCodexCredentials(fromPath);
+  } catch (err) {
+    console.error(`Failed to import Codex credentials from ${fromPath}: ${err.message}`);
+    process.exit(1);
+  }
+
+  await upsertCodexAccount(config, name, creds, fromPath);
+}
+
+/**
+ * Add or update a codex-protocol account.
+ *
+ * Identity is the ChatGPT account id: unlike Anthropic accounts there is no
+ * org dimension, and the email can change without the account changing.
+ */
+async function upsertCodexAccount(config, name, creds, fromPath) {
+  if (!name) name = creds.email || `codex-${creds.accountId.slice(0, 8)}`;
+
+  const account = {
+    name,
+    type: 'oauth',
+    protocol: 'codex',
+    source: 'import --codex',
+    accountId: creds.accountId,
+    // Display-only, refreshed on each import. Not read from the live token
+    // because the id_token isn't persisted.
+    planType: creds.planType || null,
+    accessToken: creds.accessToken,
+    refreshToken: creds.refreshToken,
+    expiresAt: creds.expiresAt,
+  };
+
+  let idx = config.accounts.findIndex(a => a.protocol === 'codex' && a.accountId === creds.accountId);
+  if (idx < 0) idx = config.accounts.findIndex(a => a.name === name);
+
+  if (idx >= 0) {
+    const prev = config.accounts[idx];
+    config.accounts[idx] = { ...prev, ...account, name: prev.name };
+    console.log(`Updated codex account "${prev.name}"`);
+  } else {
+    config.accounts.push(account);
+    console.log(`Added codex account "${account.name}"${creds.planType ? ` (ChatGPT ${creds.planType})` : ''}`);
+  }
+
+  await saveConfig(config);
+  console.log(`Saved to ${getConfigPath()}`);
+
+  // OpenAI rotates the refresh token on every refresh, so this credential and
+  // the Codex CLI's copy are now two holders of one rotating family: whichever
+  // refreshes second gets invalidated. Worth stating plainly at import time —
+  // the failure mode otherwise shows up much later as a confusing re-login prompt.
+  console.log('');
+  console.log(`Note: ${fromPath} holds the same refresh token. OpenAI rotates it on each`);
+  console.log('refresh, so running the Codex CLI and TeamClaude side by side can invalidate');
+  console.log("one of them. Re-run this import after a `codex login` to resync.");
+
+  await notifyRunningServer(config);
 }
 
 // ── login ───────────────────────────────────────────────────
@@ -816,10 +893,12 @@ async function accountsCommand() {
     if (a.type !== 'oauth' || !a.refreshToken) return;
     if (!isTokenExpiringSoon(a.expiresAt)) return;
     try {
-      const newTokens = await refreshAccessToken(a.refreshToken);
+      const refresh = a.protocol === 'codex' ? refreshCodexToken : refreshAccessToken;
+      const newTokens = await refresh(a.refreshToken);
       a.accessToken = newTokens.accessToken;
       a.refreshToken = newTokens.refreshToken;
       a.expiresAt = newTokens.expiresAt;
+      if (newTokens.accountId) a.accountId = newTokens.accountId;
       configDirty = true;
     } catch {
       // refresh failed — fetchProfile will report the specific error
@@ -827,10 +906,12 @@ async function accountsCommand() {
   }));
   if (configDirty) await saveConfig(config);
 
-  // Fetch profiles in parallel for all OAuth accounts
+  // Fetch profiles in parallel for all OAuth accounts. Codex accounts are
+  // skipped: fetchProfile talks to Anthropic's OAuth profile endpoint, which
+  // rejects a ChatGPT token and would render every codex account as a 401.
   const profiles = await Promise.all(
     config.accounts.map(a =>
-      a.type === 'oauth' && a.accessToken ? fetchProfile(a.accessToken) : null
+      a.type === 'oauth' && a.accessToken && a.protocol !== 'codex' ? fetchProfile(a.accessToken) : null
     )
   );
 
@@ -884,6 +965,15 @@ async function accountsCommand() {
 
     if (a.type === 'apikey') {
       console.log(`  [${i + 1}] ${a.name} (apikey)  ${a.apiKey?.slice(0, 15)}...`);
+      continue;
+    }
+
+    if (a.protocol === 'codex') {
+      // No Anthropic profile for these; describe them from what import recorded.
+      const label = a.planType ? `ChatGPT ${a.planType}` : 'ChatGPT Codex';
+      const src = a.source ? `, ${a.source}` : '';
+      console.log(`  [${i + 1}] ${a.name} (${label}${src})`);
+      if (a.accountId) console.log(`       ID:    ${a.accountId}`);
       continue;
     }
 
@@ -1292,6 +1382,7 @@ Usage: teamclaude [command] [options]
 Commands:
   server              Start the proxy server (default; --headless to skip the TUI)
   import              Import credentials from Claude Code
+  import --codex      Import ChatGPT Codex credentials (~/.codex/auth.json)
   login               OAuth login via browser
   login --api         Add an API key account
   env [--no-mitm]     Print export lines to point Claude Code at the proxy, for
@@ -1329,7 +1420,8 @@ Commands:
 Options:
   --name NAME         Set account name (import/login)
   --org NAME|UUID     Disambiguate when an email spans multiple orgs (remove/priority/api)
-  --from PATH         Credentials path (import, default: ~/.claude/.credentials.json)
+  --from PATH         Credentials path (import, default: ~/.claude/.credentials.json;
+                      with --codex, default: ~/.codex/auth.json)
   --json JSON         Import from inline JSON (import), e.g.:
                       --json '{"accessToken":"...","refreshToken":"...","expiresAt":1234}'
   --log-to DIR        Log full requests/responses to DIR (server, one file per request)
