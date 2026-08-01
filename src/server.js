@@ -12,6 +12,7 @@ import { TopLevelFieldFinder, modelGlobMatches } from './model.js';
 import { BodyWriter } from './request-log.js';
 import { upstreamFetch } from './upstream-fetch.js';
 import { tunnelTls } from './sx.js';
+import { isCodexAccount, codexHeaders, codexUrlForPath, isStreamingRequest, CODEX_BASE_URL } from './codex/protocol.js';
 
 
 export const HOP_BY_HOP_HEADERS = new Set([
@@ -670,28 +671,54 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   }
 
   // Build upstream request headers
+  const isCodex = isCodexAccount(account);
   const isOAuth = account.type === 'oauth';
-  const headers = {};
-  for (const [key, value] of Object.entries(req.headers)) {
-    const lk = key.toLowerCase();
-    // HTTP/2 pseudo-headers (:method, :path, :authority, :scheme) live in
-    // req.headers on the h2 server path; fetch rejects `:`-prefixed names.
-    if (lk.startsWith(':')) continue;
-    if (HOP_BY_HOP_HEADERS.has(lk)) continue;
-    if (lk === 'x-api-key') continue;
-    // Strip accept-encoding: Node fetch auto-decompresses, which would
-    // mismatch the Content-Encoding header we forward to the client
-    if (lk === 'accept-encoding') continue;
-    headers[key] = value;
-  }
+  let headers = {};
+  let upstreamUrl;
 
-  if (isOAuth) {
-    headers['authorization'] = `Bearer ${account.credential}`;
+  if (isCodex) {
+    // Codex accounts speak the OpenAI Responses API. Headers are built from
+    // scratch rather than forwarded: the inbound set is Anthropic-specific and
+    // the backend expects the Codex CLI's identity (see codexHeaders).
+    upstreamUrl = codexUrlForPath(req.url, account.upstream || CODEX_BASE_URL);
+    if (!upstreamUrl) {
+      // Only /v1/messages has a Responses-API equivalent. Fail loudly instead of
+      // forwarding an Anthropic-only endpoint (e.g. count_tokens) to a backend
+      // that would answer it wrongly or not at all.
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        type: 'error',
+        error: { type: 'not_found_error', message: `No codex equivalent for ${req.url}` },
+      }));
+      return;
+    }
+    headers = codexHeaders(account, {
+      stream: isStreamingRequest(body),
+      sessionId: req.headers['x-claude-code-session-id'] || null,
+    });
   } else {
-    headers['x-api-key'] = account.credential;
+    for (const [key, value] of Object.entries(req.headers)) {
+      const lk = key.toLowerCase();
+      // HTTP/2 pseudo-headers (:method, :path, :authority, :scheme) live in
+      // req.headers on the h2 server path; fetch rejects `:`-prefixed names.
+      if (lk.startsWith(':')) continue;
+      if (HOP_BY_HOP_HEADERS.has(lk)) continue;
+      if (lk === 'x-api-key') continue;
+      // Strip accept-encoding: Node fetch auto-decompresses, which would
+      // mismatch the Content-Encoding header we forward to the client
+      if (lk === 'accept-encoding') continue;
+      headers[key] = value;
+    }
+
+    if (isOAuth) {
+      headers['authorization'] = `Bearer ${account.credential}`;
+    } else {
+      headers['x-api-key'] = account.credential;
+    }
+
+    upstreamUrl = `${account.upstream || upstream}${req.url}`;
   }
 
-  const upstreamUrl = `${account.upstream || upstream}${req.url}`;
   const method = req.method;
 
   // Strip orphaned tool_use / tool_result blocks so a client that compacted or
