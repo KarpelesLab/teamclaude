@@ -13,6 +13,8 @@ import { BodyWriter } from './request-log.js';
 import { upstreamFetch } from './upstream-fetch.js';
 import { tunnelTls } from './sx.js';
 import { isCodexAccount, codexHeaders, codexUrlForPath, isStreamingRequest, CODEX_BASE_URL } from './codex/protocol.js';
+import { claudeRequestToCodex } from './codex/request-translate.js';
+import { createCodexStreamTranslator, aggregateAnthropicStream } from './codex/response-translate.js';
 
 
 export const HOP_BY_HOP_HEADERS = new Set([
@@ -673,6 +675,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // Build upstream request headers
   const isCodex = isCodexAccount(account);
   const isOAuth = account.type === 'oauth';
+  // The codex request translator always asks for a stream (the Responses API is
+  // streaming-first here), so what the CLIENT asked for is tracked separately
+  // and the response is folded back into a Messages object when it wanted one.
+  const clientWantsStream = isStreamingRequest(body);
   let headers = {};
   let upstreamUrl;
 
@@ -693,7 +699,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       return;
     }
     headers = codexHeaders(account, {
-      stream: isStreamingRequest(body),
+      stream: true,
       sessionId: req.headers['x-claude-code-session-id'] || null,
     });
   } else {
@@ -732,8 +738,29 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // Rewrite the model name for accounts that target a different upstream (e.g.
   // GLM), which uses different model identifiers than Anthropic.
   if (account.modelMap) sendBody = rewriteModel(sendBody, account.modelMap);
-  // If the body changed length (sanitize or model rewrite), update Content-Length
-  // so the upstream doesn't receive a mismatched framing and truncate or stall.
+
+  // Codex accounts need the body converted to the Responses API, not just
+  // relabelled. Done after the model rewrite so modelMap still selects which
+  // upstream model the translated request names.
+  let codexRequest = null;
+  if (isCodex) {
+    try {
+      codexRequest = JSON.parse(sendBody.toString('utf-8'));
+      sendBody = claudeRequestToCodex(codexRequest, codexRequest.model);
+    } catch (err) {
+      console.error(`[TeamClaude] Codex request translation failed (account "${account.name}"): ${err.message}`);
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        type: 'error',
+        error: { type: 'invalid_request_error', message: `codex translation failed: ${err.message}` },
+      }));
+      return;
+    }
+  }
+
+  // If the body changed length (sanitize, model rewrite or codex translation),
+  // update Content-Length so the upstream doesn't receive a mismatched framing
+  // and truncate or stall.
   if (sendBody !== body) headers['content-length'] = String(sendBody.length);
 
   // Streaming request log, opened lazily on the first terminal outcome (a
@@ -914,6 +941,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       responseHeaders[key] = value;
     }
 
+    // A codex request is always sent as a stream, so upstream answers
+    // text/event-stream even when the client asked for a plain response. Correct
+    // the content type before the headers go out, or the client would try to
+    // parse a JSON body as SSE.
+    if (isCodex && !clientWantsStream) responseHeaders['content-type'] = 'application/json';
+
     res.writeHead(upstreamRes.status, responseHeaders);
 
     if (!upstreamRes.body) {
@@ -931,7 +964,15 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // whole (potentially ~1M-token) SSE body in memory.
       const l = getLog();
       const bw = l ? l.bodyWriter('RESPONSE BODY (streamed)', contentType) : null;
-      await streamResponse(upstreamRes.body, res, account.index, accountManager, bw);
+      // Codex answers in the Responses API's SSE dialect; translate it back to
+      // Anthropic events on the way through. Usage accounting reads the
+      // translated frames, so quota tracking works unchanged.
+      const translator = isCodex ? createCodexStreamTranslator(codexRequest) : null;
+      if (translator && !clientWantsStream) {
+        await collectTranslatedResponse(upstreamRes.body, res, account.index, accountManager, bw, translator);
+      } else {
+        await streamResponse(upstreamRes.body, res, account.index, accountManager, bw, translator);
+      }
       l?.end();
     } else {
       const buf = Buffer.from(await upstreamRes.arrayBuffer());
@@ -1034,7 +1075,20 @@ export function readWithIdleTimeout(reader, ms) {
 /**
  * Stream an SSE response to the client, parsing usage data along the way.
  */
-async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter) {
+/**
+ * Feed one complete upstream SSE event through a codex translator, returning the
+ * Anthropic frames to forward. Codex frames carry an `event:` line alongside the
+ * `data:` line; the translator only reads the latter.
+ */
+function translateSSEEvent(event, translator) {
+  const out = [];
+  for (const line of event.split('\n')) {
+    if (line.startsWith('data:')) out.push(...translator.push(line));
+  }
+  return out;
+}
+
+async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter, translator = null) {
   const reader = webStream.getReader();
   const idleMs = resolveBodyIdleTimeout();
   const decoder = new TextDecoder();
@@ -1049,10 +1103,14 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
       // Client disconnected — stop reading from upstream
       if (res.destroyed) break;
 
-      // Forward chunk immediately
-      const ok = res.write(value);
+      // Without a translator the chunk is relayed verbatim and immediately. A
+      // codex stream cannot be: an event has to arrive whole before it can be
+      // translated, so forwarding is driven by the parsed events below.
+      let ok = true;
+      if (!translator) ok = res.write(value);
 
-      // Append to the log as it streams (no whole-body buffering)
+      // Append to the log as it streams (no whole-body buffering). This records
+      // the raw upstream body, which is what a translation bug is diagnosed from.
       if (bodyWriter) bodyWriter.chunk(Buffer.from(value));
 
       const text = decoder.decode(value, { stream: true });
@@ -1063,7 +1121,17 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
       sseBuffer = events.pop(); // keep incomplete event
 
       for (const event of events) {
-        parseSSEUsage(event, accountIndex, accountManager);
+        if (translator) {
+          const frames = translateSSEEvent(event, translator);
+          for (const frame of frames) {
+            ok = res.write(frame);
+            // Usage is read off the translated frames, so quota accounting works
+            // the same for both protocols.
+            parseSSEUsage(frame, accountIndex, accountManager);
+          }
+        } else {
+          parseSSEUsage(event, accountIndex, accountManager);
+        }
       }
 
       // Handle backpressure — also bail out if client disconnects,
@@ -1083,7 +1151,19 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
 
     // Parse any remaining buffer
     if (sseBuffer.trim()) {
-      parseSSEUsage(sseBuffer, accountIndex, accountManager);
+      if (translator) {
+        for (const frame of translateSSEEvent(sseBuffer, translator)) {
+          res.write(frame);
+          parseSSEUsage(frame, accountIndex, accountManager);
+        }
+      } else {
+        parseSSEUsage(sseBuffer, accountIndex, accountManager);
+      }
+    }
+    // Close any block the upstream left open, so a stream that ends without a
+    // terminal event doesn't leave the client waiting on an unfinished block.
+    if (translator && !res.destroyed) {
+      for (const frame of translator.end()) res.write(frame);
     }
   } catch (err) {
     // A mid-stream idle timeout (or any read error) means the upstream went
@@ -1098,6 +1178,57 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
     // timeout path, to destroy the dead socket so the pool drops it).
     reader.cancel().catch(() => {});
     if (!errored && !res.writableEnded) res.end();
+  }
+}
+
+/**
+ * Consume a codex SSE stream, translate it, and answer with a single Messages
+ * response. Used when the client asked for a non-streaming reply — the codex
+ * request is sent as a stream regardless, so the events are folded back into
+ * the object the client expected.
+ */
+async function collectTranslatedResponse(webStream, res, accountIndex, accountManager, bodyWriter, translator) {
+  const reader = webStream.getReader();
+  const idleMs = resolveBodyIdleTimeout();
+  const decoder = new TextDecoder();
+  let sseBuffer = '';
+  const frames = [];
+  let errored = false;
+
+  try {
+    while (true) {
+      const { done, value } = await readWithIdleTimeout(reader, idleMs);
+      if (done) break;
+      if (res.destroyed) break;
+
+      if (bodyWriter) bodyWriter.chunk(Buffer.from(value));
+      sseBuffer += decoder.decode(value, { stream: true });
+      const events = sseBuffer.split('\n\n');
+      sseBuffer = events.pop();
+
+      for (const event of events) {
+        for (const frame of translateSSEEvent(event, translator)) {
+          frames.push(frame);
+          parseSSEUsage(frame, accountIndex, accountManager);
+        }
+      }
+    }
+
+    if (sseBuffer.trim()) {
+      for (const frame of translateSSEEvent(sseBuffer, translator)) {
+        frames.push(frame);
+        parseSSEUsage(frame, accountIndex, accountManager);
+      }
+    }
+    frames.push(...translator.end());
+  } catch (err) {
+    errored = true;
+    throw err;
+  } finally {
+    reader.cancel().catch(() => {});
+    if (!errored && !res.writableEnded) {
+      res.end(JSON.stringify(aggregateAnthropicStream(frames)));
+    }
   }
 }
 

@@ -77,51 +77,6 @@ export function isStreamingRequest(body) {
   }
 }
 
-class NotImplemented extends Error {
-  constructor(what) {
-    super(`${what} is not implemented yet (codex protocol translator, milestone 2)`);
-    this.name = 'NotImplemented';
-    this.notImplemented = true;
-  }
-}
-
-/**
- * Translate an Anthropic Messages API request body into an OpenAI Responses API
- * request body.
- *
- * Shape of the work (see CLIProxyAPI internal/translator/codex/claude for a
- * reference implementation): `system` becomes a developer-role input message,
- * each Anthropic content block (text / image / tool_use / tool_result) maps to a
- * Responses input item, Anthropic tool schemas become function declarations, and
- * `thinking` maps onto `reasoning`.
- *
- * @param {Buffer} body - raw Anthropic request body
- * @param {string} model - upstream model name, already mapped via account.modelMap
- * @returns {Buffer} raw Responses API request body
- */
-export function claudeRequestToCodex(body, model) { // eslint-disable-line no-unused-vars
-  throw new NotImplemented('claudeRequestToCodex');
-}
-
-/**
- * Create a stateful translator that converts a Codex SSE stream into an
- * Anthropic SSE stream.
- *
- * Stateful because the two event models do not line up one-to-one: Anthropic
- * requires content blocks to be opened and closed with monotonically increasing
- * indices, while Codex emits output items that can interleave reasoning, text,
- * and tool calls. The translator owns that block bookkeeping across the stream.
- *
- * @returns {{ push(chunk: Buffer): Buffer[], end(): Buffer[] }}
- */
-export function createCodexStreamTranslator() {
-  throw new NotImplemented('createCodexStreamTranslator');
-}
-
-/**
- * Translate a complete (non-streaming) Codex response body into an Anthropic
- * Messages response body.
- */
-export function codexResponseToClaude(body) { // eslint-disable-line no-unused-vars
-  throw new NotImplemented('codexResponseToClaude');
-}
+// The body translators live in ./request-translate.js and ./response-translate.js;
+// this module stays limited to transport concerns (URL, headers, account shape)
+// so the translation layer can be tested without a server.
