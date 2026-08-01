@@ -603,8 +603,23 @@ async function upsertCodexAccount(config, name, creds, fromPath) {
     expiresAt: creds.expiresAt,
   };
 
+  // Match only within the codex protocol. The name fallback used to be
+  // unscoped, copied from the Anthropic upsert where every account is the same
+  // protocol — here it meant a codex login whose email happened to equal an
+  // existing Claude account's name silently merged codex fields over that
+  // account and destroyed its credential. One person's Claude and ChatGPT
+  // accounts routinely share an email, so this was the common case, not an edge.
   let idx = config.accounts.findIndex(a => a.protocol === 'codex' && a.accountId === creds.accountId);
-  if (idx < 0) idx = config.accounts.findIndex(a => a.name === name);
+  if (idx < 0) idx = config.accounts.findIndex(a => a.protocol === 'codex' && a.name === name);
+
+  // The default name is derived from the email, so it can collide with an
+  // account of another protocol. Names are the user-facing key for
+  // remove/priority/TC_ACCT, so they have to stay unique — disambiguate rather
+  // than let two entries answer to the same name.
+  if (idx < 0 && config.accounts.some(a => a.name === name)) {
+    name = `${name} (codex)`;
+    account.name = name;
+  }
 
   if (idx >= 0) {
     const prev = config.accounts[idx];
