@@ -941,11 +941,13 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       responseHeaders[key] = value;
     }
 
-    // A codex request is always sent as a stream, so upstream answers
-    // text/event-stream even when the client asked for a plain response. Correct
-    // the content type before the headers go out, or the client would try to
-    // parse a JSON body as SSE.
-    if (isCodex && !clientWantsStream) responseHeaders['content-type'] = 'application/json';
+    // Codex sends no content-type of its own, so set the one that matches what
+    // this proxy is about to emit: SSE when the client asked to stream, JSON
+    // when the frames are folded back into a Messages object. Without this the
+    // client has to guess, and guesses wrong.
+    if (isCodex) {
+      responseHeaders['content-type'] = clientWantsStream ? 'text/event-stream' : 'application/json';
+    }
 
     res.writeHead(upstreamRes.status, responseHeaders);
 
@@ -957,7 +959,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     }
 
     const contentType = upstreamRes.headers.get('content-type') || '';
-    const isStreaming = contentType.includes('text/event-stream');
+    // Codex sends its SSE responses with no content-type header at all, so the
+    // upstream header cannot decide this. A codex request is always sent with
+    // stream:true and accept: text/event-stream, so its response is always SSE.
+    const isStreaming = isCodex || contentType.includes('text/event-stream');
 
     if (isStreaming) {
       // Stream each chunk straight to the log as it is relayed — never hold the

@@ -20,8 +20,16 @@ function codexAccount(extra = {}) {
 
 const d = obj => `event: ${obj.type}\ndata: ${JSON.stringify(obj)}\n\n`;
 
-/** A fake Codex backend that records what it received and replays a script. */
-async function startFakeCodex(events, { status = 200 } = {}) {
+/**
+ * A fake Codex backend that records what it received and replays a script.
+ *
+ * It deliberately sends NO content-type, because the real backend doesn't. An
+ * earlier version of this mock set `text/event-stream` and passed while the
+ * live backend failed: the proxy decided "is this a stream?" from that header,
+ * so against the real thing it buffered the SSE and dumped it raw. Setting a
+ * header the real server omits is how a mock hides a bug — leave this alone.
+ */
+async function startFakeCodex(events, { status = 200, contentType = null } = {}) {
   const received = [];
   const server = http.createServer((req, res) => {
     let body = '';
@@ -33,7 +41,7 @@ async function startFakeCodex(events, { status = 200 } = {}) {
         res.end(JSON.stringify({ error: { type: 'server_error', message: 'boom' } }));
         return;
       }
-      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.writeHead(200, contentType ? { 'content-type': contentType } : {});
       for (const e of events) res.write(e);
       res.end();
     });
@@ -237,6 +245,43 @@ test('an endpoint with no Responses equivalent is refused, not forwarded', async
     assert.equal(JSON.parse(res.body).error.type, 'not_found_error');
     // Nothing reached the backend.
     assert.equal(codex.received.length, 0);
+  } finally {
+    proxy.server.close();
+    codex.server.close();
+  }
+});
+
+test('a codex response with no content-type is still treated as a stream', async () => {
+  // Regression: the live backend omits content-type entirely. Deciding
+  // "is this SSE?" from that header made the proxy buffer the whole stream and
+  // return raw Responses-API events to the client.
+  const codex = await startFakeCodex(SCRIPT); // no content-type, like the real one
+  const proxy = await startProxy(codexAccount({ upstream: codex.url }));
+
+  try {
+    const res = await request(proxy.url, {
+      model: 'claude-fable-5', max_tokens: 100, stream: true,
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    assert.match(res.headers['content-type'], /text\/event-stream/);
+    assert.match(res.body, /event: message_start/);
+    assert.doesNotMatch(res.body, /response\.output_text\.delta/);
+  } finally {
+    proxy.server.close();
+    codex.server.close();
+  }
+});
+
+test('a codex response that does declare event-stream still works', async () => {
+  const codex = await startFakeCodex(SCRIPT, { contentType: 'text/event-stream' });
+  const proxy = await startProxy(codexAccount({ upstream: codex.url }));
+
+  try {
+    const res = await request(proxy.url, {
+      model: 'claude-fable-5', max_tokens: 100, stream: true,
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    assert.match(res.body, /event: message_start/);
   } finally {
     proxy.server.close();
     codex.server.close();
