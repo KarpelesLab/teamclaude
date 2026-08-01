@@ -1,13 +1,24 @@
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { randomBytes, createHash } from 'node:crypto';
+import { exec } from 'node:child_process';
+import http from 'node:http';
 
 // OAuth configuration for ChatGPT-backed Codex accounts. The client id is the
 // public one the Codex CLI ships with: these credentials authenticate a ChatGPT
 // subscription, not a platform API key, so there is no secret to protect here.
 const TOKEN_URL = 'https://auth.openai.com/oauth/token';
+const AUTH_URL = 'https://auth.openai.com/oauth/authorize';
 const CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
 const SCOPE = 'openid profile email';
+
+// The authorization flow needs offline_access to be issued a refresh token at
+// all. The redirect URI is fixed: it is registered against the Codex CLI's
+// client id, so the callback listener has to bind this exact port.
+const LOGIN_SCOPE = 'openid email profile offline_access';
+const REDIRECT_PORT = 1455;
+const REDIRECT_URI = `http://localhost:${REDIRECT_PORT}/auth/callback`;
 
 // The account id lives in a namespaced claim on the id_token rather than a
 // plain field. It is required on every upstream call (as chatgpt-account-id),
@@ -153,6 +164,165 @@ export async function refreshCodexToken(refreshToken) {
       throw err;
     }
   }
+}
+
+function openBrowser(url) {
+  const cmd = process.platform === 'darwin' ? 'open'
+    : process.platform === 'win32' ? 'start'
+    : 'xdg-open';
+  exec(`${cmd} ${JSON.stringify(url)}`, () => {});
+}
+
+/**
+ * Listen for the OAuth redirect.
+ *
+ * Unlike the Anthropic flow this cannot take an ephemeral port: the redirect
+ * URI is registered against the Codex CLI's client id, so the callback must
+ * arrive on exactly REDIRECT_PORT. A busy port therefore means something else
+ * is mid-login (most likely the Codex CLI), which is worth saying plainly
+ * rather than surfacing as a bare EADDRINUSE.
+ */
+function startCodexCallbackServer(expectedState) {
+  return new Promise((resolve, reject) => {
+    let resolveCode, rejectCode;
+    const codePromise = new Promise((res, rej) => { resolveCode = res; rejectCode = rej; });
+
+    const server = http.createServer((req, res) => {
+      const url = new URL(req.url, 'http://localhost');
+      if (url.pathname !== '/auth/callback') {
+        res.writeHead(404);
+        res.end('Not found');
+        return;
+      }
+
+      const done = (message) => {
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end(`<html><body style="font-family:system-ui;padding:3rem"><h2>${message}</h2><p>You can close this tab.</p></body></html>`);
+      };
+
+      const error = url.searchParams.get('error');
+      if (error) {
+        done('Authentication failed');
+        rejectCode(new Error(`OAuth error: ${error} — ${url.searchParams.get('error_description') || ''}`));
+        return;
+      }
+      if (url.searchParams.get('state') !== expectedState) {
+        done('Authentication failed');
+        rejectCode(new Error('OAuth state mismatch'));
+        return;
+      }
+      const code = url.searchParams.get('code');
+      if (code) {
+        done('Signed in to TeamClaude');
+        resolveCode(code);
+      }
+    });
+
+    server.listen(REDIRECT_PORT, () => resolve({ codePromise, server }));
+    server.on('error', err => {
+      reject(err.code === 'EADDRINUSE'
+        ? new Error(`Port ${REDIRECT_PORT} is in use — close any running \`codex login\` and try again.`)
+        : err);
+    });
+
+    const timer = setTimeout(() => {
+      rejectCode(new Error('Timed out waiting for the OAuth callback'));
+      server.close();
+    }, 5 * 60_000);
+    timer.unref?.();
+  });
+}
+
+/**
+ * Log in to ChatGPT and obtain a Codex credential of our own.
+ *
+ * This is the alternative to `import --codex`, and the reason to prefer it: an
+ * imported credential is a COPY of the Codex CLI's, so both hold one refresh
+ * token, and since OpenAI rotates it on every refresh whichever party refreshes
+ * second is left holding a dead one. A separate authorization mints an
+ * independent refresh-token lineage, so teamclaude and the CLI can refresh on
+ * their own schedules without invalidating each other.
+ *
+ * `prompt=login` forces a fresh authorization rather than silently reusing an
+ * existing session, which is what makes the grant independent.
+ */
+export function buildCodexAuthUrl({ state, codeChallenge }) {
+  const authUrl = new URL(AUTH_URL);
+  authUrl.searchParams.set('client_id', CLIENT_ID);
+  authUrl.searchParams.set('response_type', 'code');
+  authUrl.searchParams.set('redirect_uri', REDIRECT_URI);
+  // offline_access is what gets a refresh token issued at all.
+  authUrl.searchParams.set('scope', LOGIN_SCOPE);
+  authUrl.searchParams.set('state', state);
+  authUrl.searchParams.set('code_challenge', codeChallenge);
+  authUrl.searchParams.set('code_challenge_method', 'S256');
+  // Forces a fresh authorization instead of silently reusing an existing
+  // session. This is the parameter that makes the resulting grant — and so the
+  // refresh-token lineage — independent of the Codex CLI's.
+  authUrl.searchParams.set('prompt', 'login');
+  authUrl.searchParams.set('id_token_add_organizations', 'true');
+  authUrl.searchParams.set('codex_cli_simplified_flow', 'true');
+  return authUrl.toString();
+}
+
+export async function loginCodex() {
+  const codeVerifier = randomBytes(64).toString('base64url');
+  const codeChallenge = createHash('sha256').update(codeVerifier).digest('base64url');
+  const state = randomBytes(32).toString('base64url');
+
+  const { codePromise, server } = await startCodexCallbackServer(state);
+  const authUrl = new URL(buildCodexAuthUrl({ state, codeChallenge }));
+
+  console.log('Opening browser to sign in to ChatGPT...');
+  console.log(`If it doesn't open, visit:\n  ${authUrl.toString()}\n`);
+  openBrowser(authUrl.toString());
+
+  let code;
+  try {
+    code = await codePromise;
+  } finally {
+    server.close();
+  }
+
+  console.log('Exchanging authorization code for tokens...');
+  const res = await fetch(TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
+    body: new URLSearchParams({
+      grant_type: 'authorization_code',
+      client_id: CLIENT_ID,
+      code,
+      redirect_uri: REDIRECT_URI,
+      code_verifier: codeVerifier,
+    }).toString(),
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    const err = new Error(`Codex token exchange failed (${res.status}): ${text}`);
+    err.status = res.status;
+    throw err;
+  }
+
+  const data = await res.json();
+  const accountId = extractAccountId(data.id_token);
+  if (!accountId) {
+    throw new Error('Sign-in succeeded but the response carried no ChatGPT account id.');
+  }
+
+  return {
+    protocol: 'codex',
+    type: 'oauth',
+    accessToken: data.access_token,
+    refreshToken: data.refresh_token,
+    idToken: data.id_token || null,
+    accountId,
+    expiresAt: data.expires_in
+      ? Date.now() + data.expires_in * 1000
+      : expiryFromToken(data.access_token),
+    email: extractEmail(data.id_token),
+    planType: extractPlanType(data.id_token),
+  };
 }
 
 /**

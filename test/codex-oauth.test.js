@@ -10,6 +10,7 @@ import {
   extractEmail,
   expiryFromToken,
   importCodexCredentials,
+  buildCodexAuthUrl,
 } from '../src/codex/oauth.js';
 
 const ACCOUNT_CLAIM = 'https://api.openai.com/auth';
@@ -110,4 +111,40 @@ test('importCodexCredentials rejects a file with no derivable account id', async
     tokens: { access_token: jwt({ exp: 1 }), refresh_token: 'rt.1.abc', id_token: jwt({ sub: 'u' }) },
   });
   await assert.rejects(importCodexCredentials(path), /Could not determine the ChatGPT account id/);
+});
+
+// ── independent login flow ──────────────────────────────────
+//
+// `import --codex` copies the Codex CLI's credential, so both hold one refresh
+// token and — since OpenAI rotates it on every refresh — whichever refreshes
+// second is left with a dead one. A login performs its own authorization,
+// which mints a separate refresh-token lineage. These assertions pin the
+// parameters that make that separation real.
+
+test('the authorize URL requests offline_access so a refresh token is issued', () => {
+  const url = new URL(buildCodexAuthUrl({ state: 's', codeChallenge: 'c' }));
+  assert.ok(url.searchParams.get('scope').split(' ').includes('offline_access'));
+});
+
+test('the authorize URL forces a fresh authorization', () => {
+  // Without prompt=login the provider may reuse the existing session and hand
+  // back a grant tied to it, which is exactly the sharing we are avoiding.
+  const url = new URL(buildCodexAuthUrl({ state: 's', codeChallenge: 'c' }));
+  assert.equal(url.searchParams.get('prompt'), 'login');
+});
+
+test('the authorize URL carries a PKCE S256 challenge and state', () => {
+  const url = new URL(buildCodexAuthUrl({ state: 'st8', codeChallenge: 'chal' }));
+  assert.equal(url.searchParams.get('code_challenge'), 'chal');
+  assert.equal(url.searchParams.get('code_challenge_method'), 'S256');
+  assert.equal(url.searchParams.get('state'), 'st8');
+  assert.equal(url.searchParams.get('response_type'), 'code');
+});
+
+test('the authorize URL targets the registered redirect and OpenAI host', () => {
+  // The redirect URI is registered against the Codex CLI client id, so it is
+  // not free to change — the callback listener must bind this exact port.
+  const url = new URL(buildCodexAuthUrl({ state: 's', codeChallenge: 'c' }));
+  assert.equal(url.origin, 'https://auth.openai.com');
+  assert.equal(url.searchParams.get('redirect_uri'), 'http://localhost:1455/auth/callback');
 });
