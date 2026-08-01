@@ -1216,12 +1216,17 @@ export class AccountManager {
    * Ensure an OAuth account's token is fresh, refreshing if needed.
    * Pass force=true to refresh regardless of expiry (e.g. after a 401).
    * Concurrent calls for the same account coalesce into a single refresh.
+   *
+   * `thresholdMs` widens what counts as "expiring soon". The default suits the
+   * request path, where a token only has to survive the request about to be
+   * sent. A scheduled refresher passes a larger window so it can renew a token
+   * well before expiry rather than at the last moment.
    */
-  async ensureTokenFresh(accountIndex, force = false) {
+  async ensureTokenFresh(accountIndex, force = false, thresholdMs = undefined) {
     const account = this.accounts[accountIndex];
     if (!account || account.type !== 'oauth' || !account.refreshToken) return;
 
-    if (!force && !isTokenExpiringSoon(account.expiresAt)) return;
+    if (!force && !isTokenExpiringSoon(account.expiresAt, thresholdMs)) return;
 
     // A forced refresh answers a 401, but 401s arrive in bursts: every request
     // already in flight when the token went bad comes back rejected, and each

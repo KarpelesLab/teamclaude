@@ -15,6 +15,7 @@ import * as alias from './alias.js';
 import { ensureCerts } from './mitm.js';
 import { Prober } from './prober.js';
 import { Warmer } from './warmer.js';
+import { CodexTokenRefresher } from './codex/token-refresher.js';
 import { TUI } from './tui.js';
 import { SxManager } from './sx.js';
 import { autoUpdate, checkForUpdate, currentVersion, runUpdate, installKind, PKG_NAME } from './updater.js';
@@ -224,6 +225,8 @@ async function serverCommand() {
   let prober = null;
   // Opt-in keep-warm scheduler (config.warmupSeconds, default 0 = off).
   let warmer = null;
+  // Scheduled codex token refresh (on by default — nothing else renews them).
+  let codexTokenRefresher = null;
   const serverStartedAt = Date.now();
 
   // sx.org proxy (IP-based-429 workaround). Dormant unless an API key is set in
@@ -453,6 +456,15 @@ async function serverCommand() {
   });
   warmer.start();
 
+  // Keep codex tokens fresh. Unlike the two schedulers above this is on by
+  // default and spends no quota: codex accounts are excluded from both of them,
+  // so nothing else renews their token while the proxy is idle.
+  codexTokenRefresher = new CodexTokenRefresher(accountManager, {
+    intervalMs: (config.codexTokenCheckSeconds ?? 60) * 1000,
+    refreshAheadMs: (config.codexRefreshAheadSeconds ?? 1800) * 1000,
+  });
+  codexTokenRefresher.start();
+
   // Background self-update for a backgrounded (headless) server. Skipped under
   // the TUI, where npm's install output would corrupt the display — interactive
   // users update via `teamclaude run` (post-session) or `teamclaude update`.
@@ -473,6 +485,7 @@ async function serverCommand() {
     if (!tui) console.log('\n[TeamClaude] Shutting down...');
     prober?.stop();
     warmer?.stop();
+    codexTokenRefresher?.stop();
     if (quotaSaveInterval) clearInterval(quotaSaveInterval);
     await persistQuotaState();
     // Don't linger waiting on keep-alive / streaming connections: actively
