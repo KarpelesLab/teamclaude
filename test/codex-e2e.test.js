@@ -362,3 +362,90 @@ test('a truncated codex stream still closes its content block', async () => {
     codex.server.close();
   }
 });
+
+test('an upstream error body reaches the client instead of being swallowed', async () => {
+  // Regression: codex responses were forced down the SSE path regardless of
+  // status, so a JSON error body was fed to the stream translator, which found
+  // no events and emitted nothing. The client saw "400 (no body)" and the
+  // message explaining the failure was destroyed.
+  const codex = await startFakeCodex([], { status: 400 });
+  const proxy = await startProxy(codexAccount({ upstream: codex.url }));
+
+  try {
+    const res = await request(proxy.url, {
+      model: 'claude-fable-5', max_tokens: 100, stream: true,
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+
+    assert.equal(res.status, 400);
+    assert.notEqual(res.body.trim(), '', 'the error body must not be empty');
+    assert.match(res.body, /server_error/);
+    assert.match(res.headers['content-type'], /application\/json/);
+  } finally {
+    proxy.server.close();
+    codex.server.close();
+  }
+});
+
+test('an anthropic-only endpoint fails over to an account that can serve it', async () => {
+  // Claude Code calls bootstrap/usage/mcp_servers alongside /v1/messages.
+  // Rotation landing on codex used to 404 them outright.
+  const anthropic = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, path: req.url }));
+  });
+  anthropic.listen(0, '127.0.0.1');
+  await once(anthropic, 'listening');
+  const anthropicUrl = `http://127.0.0.1:${anthropic.address().port}`;
+
+  const codex = await startFakeCodex(SCRIPT);
+  const am = new AccountManager([
+    codexAccount({ name: 'codex-1', upstream: codex.url }),
+    { name: 'claude-1', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+  ], 0.98);
+  const server = createProxyServer(am, { proxy: { port: 0 }, upstream: anthropicUrl });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const res = await new Promise((resolve, reject) => {
+      const r = http.request(`http://127.0.0.1:${server.address().port}/api/oauth/usage`, { method: 'GET' }, resp => {
+        let body = '';
+        resp.on('data', c => { body += c; });
+        resp.on('end', () => resolve({ status: resp.statusCode, body }));
+      });
+      r.on('error', reject);
+      r.end();
+    });
+
+    assert.equal(res.status, 200, 'must be served by the anthropic account, not 404ed');
+    assert.equal(JSON.parse(res.body).ok, true);
+    assert.equal(codex.received.length, 0, 'nothing should have reached codex');
+  } finally {
+    server.close();
+    codex.server.close();
+    anthropic.close();
+  }
+});
+
+test('an unservable path still 404s when every account is codex', async () => {
+  const codex = await startFakeCodex(SCRIPT);
+  const proxy = await startProxy(codexAccount({ upstream: codex.url }));
+
+  try {
+    const res = await new Promise((resolve, reject) => {
+      const r = http.request(`${proxy.url}/api/oauth/usage`, { method: 'GET' }, resp => {
+        let body = '';
+        resp.on('data', c => { body += c; });
+        resp.on('end', () => resolve({ status: resp.statusCode, body }));
+      });
+      r.on('error', reject);
+      r.end();
+    });
+    assert.equal(res.status, 404);
+    assert.equal(JSON.parse(res.body).error.type, 'not_found_error');
+  } finally {
+    proxy.server.close();
+    codex.server.close();
+  }
+});

@@ -689,9 +689,22 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // the backend expects the Codex CLI's identity (see codexHeaders).
     upstreamUrl = codexUrlForPath(req.url, account.upstream || CODEX_BASE_URL);
     if (!upstreamUrl) {
-      // Only /v1/messages has a Responses-API equivalent. Fail loudly instead of
-      // forwarding an Anthropic-only endpoint (e.g. count_tokens) to a backend
-      // that would answer it wrongly or not at all.
+      // Only /v1/messages has a Responses-API equivalent. Claude Code also calls
+      // a set of Anthropic-only endpoints (bootstrap, oauth/usage, mcp_servers,
+      // count_tokens); a codex account cannot answer those, so hand the request
+      // to an account that can rather than failing it. Answering 404 here broke
+      // those features outright whenever rotation happened to land on codex.
+      //
+      // Only retry when some non-codex account could actually take it. Retrying
+      // regardless would exhaust the rotation and surface as a 429 — "rate
+      // limited", which is the wrong diagnosis for "no account speaks this API".
+      const hasAnthropicAccount = accountManager.accounts.some(
+        a => a.protocol !== 'codex' && !a.disabled && a.status !== 'error');
+      if (hasAnthropicAccount && retryCount < maxRetries) {
+        ctx.tried.add(account.index);
+        if (res.destroyed) return;
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+      }
       res.writeHead(404, { 'content-type': 'application/json' });
       res.end(JSON.stringify({
         type: 'error',
@@ -962,11 +975,19 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       responseHeaders[key] = value;
     }
 
-    // Codex sends no content-type of its own, so set the one that matches what
-    // this proxy is about to emit: SSE when the client asked to stream, JSON
-    // when the frames are folded back into a Messages object. Without this the
-    // client has to guess, and guesses wrong.
-    if (isCodex) {
+    // Codex answers with SSE only when the request succeeded; an error comes
+    // back as a plain JSON body with its own content-type. Scoping this to 200
+    // matters: forcing the streaming path on an error fed the error body to the
+    // SSE translator, which found no events in it and emitted nothing, so the
+    // client saw a bare "400 (no body)" and the actual message — the reason the
+    // request failed — was destroyed.
+    const codexStreaming = isCodex && upstreamRes.status === 200;
+
+    // Codex sends no content-type of its own on success, so set the one that
+    // matches what this proxy is about to emit: SSE when the client asked to
+    // stream, JSON when the frames are folded into a Messages object. On an
+    // error the upstream content-type is already correct and is left alone.
+    if (codexStreaming) {
       responseHeaders['content-type'] = clientWantsStream ? 'text/event-stream' : 'application/json';
     }
 
@@ -981,9 +1002,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
 
     const contentType = upstreamRes.headers.get('content-type') || '';
     // Codex sends its SSE responses with no content-type header at all, so the
-    // upstream header cannot decide this. A codex request is always sent with
-    // stream:true and accept: text/event-stream, so its response is always SSE.
-    const isStreaming = isCodex || contentType.includes('text/event-stream');
+    // upstream header cannot decide this for a successful codex response. Errors
+    // do carry a content-type and must NOT take the streaming path (see above).
+    const isStreaming = codexStreaming || contentType.includes('text/event-stream');
 
     if (isStreaming) {
       // Stream each chunk straight to the log as it is relayed — never hold the
@@ -993,7 +1014,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // Codex answers in the Responses API's SSE dialect; translate it back to
       // Anthropic events on the way through. Usage accounting reads the
       // translated frames, so quota tracking works unchanged.
-      const translator = isCodex ? createCodexStreamTranslator(codexRequest) : null;
+      const translator = codexStreaming ? createCodexStreamTranslator(codexRequest) : null;
       if (translator && !clientWantsStream) {
         await collectTranslatedResponse(upstreamRes.body, res, account.index, accountManager, bw, translator);
       } else {
