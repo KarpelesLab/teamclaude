@@ -13,7 +13,7 @@ import { BodyWriter } from './request-log.js';
 import { upstreamFetch } from './upstream-fetch.js';
 import { tunnelTls } from './sx.js';
 import { isCodexAccount, codexHeaders, codexUrlForPath, isStreamingRequest, CODEX_BASE_URL } from './codex/protocol.js';
-import { claudeRequestToCodex } from './codex/request-translate.js';
+import { claudeRequestToCodex, applyCodexEffortSupport } from './codex/request-translate.js';
 import { createCodexStreamTranslator, aggregateAnthropicStream } from './codex/response-translate.js';
 import { CODEX_HEADER_PREFIX, isCodexQuotaExhausted, codexResetAfterSeconds } from './codex/quota.js';
 
@@ -747,7 +747,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   if (isCodex) {
     try {
       codexRequest = JSON.parse(sendBody.toString('utf-8'));
-      sendBody = claudeRequestToCodex(codexRequest, codexRequest.model);
+      // Clamp after translating: the translator mirrors CLIProxyAPI exactly,
+      // and this is the equivalent of the clamping it does in a later stage.
+      sendBody = applyCodexEffortSupport(claudeRequestToCodex(codexRequest, codexRequest.model));
     } catch (err) {
       console.error(`[TeamClaude] Codex request translation failed (account "${account.name}"): ${err.message}`);
       res.writeHead(400, { 'content-type': 'application/json' });

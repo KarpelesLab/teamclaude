@@ -119,6 +119,40 @@ export function normalizeToolParameters(schema) {
   return out;
 }
 
+// Reasoning levels the Codex backend accepts. Reported verbatim by a live 400:
+// "Unsupported value: 'minimal' is not supported with the 'gpt-5.6-sol' model.
+//  Supported values are: 'none', 'low', 'medium', 'high', 'xhigh', and 'max'."
+const CODEX_SUPPORTED_EFFORTS = new Set(['none', 'low', 'medium', 'high', 'xhigh', 'max']);
+
+// Anthropic's budget bands include levels Codex has no equivalent for. Map each
+// onto the nearest level that preserves intent: `minimal` means "think a
+// little", so it becomes `low` rather than `none`, which would switch reasoning
+// off entirely. `auto` means "you decide", which is what `medium` (the API
+// default) expresses.
+const EFFORT_SUBSTITUTES = { minimal: 'low', auto: 'medium' };
+
+/**
+ * Force a translated request's reasoning effort onto a level Codex accepts.
+ *
+ * Kept OUT of claudeRequestToCodex on purpose. That function is held
+ * byte-identical to CLIProxyAPI's translator and verified against it by
+ * fixtures; CLIProxyAPI does its own clamping in a later pipeline stage
+ * (ApplyThinking), which the fixtures do not capture. Folding the clamp into
+ * the translator would make those fixtures disagree with ground truth for a
+ * reason that has nothing to do with translation being wrong.
+ *
+ * Without this a thinking budget of 512 or less produced effort `minimal` and
+ * the backend rejected the whole request with a 400.
+ */
+export function applyCodexEffortSupport(body) {
+  const request = Buffer.isBuffer(body) ? JSON.parse(body.toString('utf-8')) : body;
+  const effort = request?.reasoning?.effort;
+  if (!effort || CODEX_SUPPORTED_EFFORTS.has(effort)) return body;
+
+  request.reasoning.effort = EFFORT_SUBSTITUTES[effort] ?? 'medium';
+  return Buffer.from(JSON.stringify(request), 'utf-8');
+}
+
 function dataUrlFromSource(source) {
   if (!source) return null;
   const data = source.data || source.base64;

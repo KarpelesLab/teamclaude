@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { claudeRequestToCodex, shortenName, shortenCallId, buildShortNameMap, normalizeToolParameters, budgetToEffort } from '../src/codex/request-translate.js';
+import { claudeRequestToCodex, applyCodexEffortSupport, shortenName, shortenCallId, buildShortNameMap, normalizeToolParameters, budgetToEffort } from '../src/codex/request-translate.js';
 import { createCodexStreamTranslator, mapStopReason, extractUsage, sanitizeToolId } from '../src/codex/response-translate.js';
 import { isValidGptReasoningSignature, compatibleGptSignature, splitProviderPrefix } from '../src/codex/signature.js';
 
@@ -231,4 +231,58 @@ test('end() on a clean stream emits nothing', () => {
   t.push('data: ' + JSON.stringify({ type: 'response.created', response: { id: 'r' } }));
   t.push('data: ' + JSON.stringify({ type: 'response.completed', response: { id: 'r', usage: {} } }));
   assert.deepEqual(t.end(), []);
+});
+
+// ── reasoning effort support ────────────────────────────────
+//
+// Found live, not by fixture: a thinking budget of 512 or less translated to
+// effort "minimal", and the backend rejected the whole request —
+//   "Unsupported value: 'minimal' is not supported with the 'gpt-5.6-sol'
+//    model. Supported values are: 'none', 'low', 'medium', 'high', 'xhigh',
+//    and 'max'."
+// The differential fixtures could not catch this: they pin the translator
+// against CLIProxyAPI's translator, and CLIProxyAPI clamps in a separate
+// pipeline stage the fixtures never exercised.
+
+test('minimal effort is raised to the nearest supported level', () => {
+  // Not "none" — that would switch reasoning off rather than reduce it.
+  const out = JSON.parse(applyCodexEffortSupport(
+    Buffer.from(JSON.stringify({ reasoning: { effort: 'minimal' } }))).toString());
+  assert.equal(out.reasoning.effort, 'low');
+});
+
+test('auto effort becomes the backend default', () => {
+  const out = JSON.parse(applyCodexEffortSupport(
+    Buffer.from(JSON.stringify({ reasoning: { effort: 'auto' } }))).toString());
+  assert.equal(out.reasoning.effort, 'medium');
+});
+
+test('an unrecognized effort falls back rather than reaching the backend', () => {
+  const out = JSON.parse(applyCodexEffortSupport(
+    Buffer.from(JSON.stringify({ reasoning: { effort: 'ludicrous' } }))).toString());
+  assert.equal(out.reasoning.effort, 'medium');
+});
+
+test('every supported level passes through untouched', () => {
+  for (const effort of ['none', 'low', 'medium', 'high', 'xhigh', 'max']) {
+    const out = JSON.parse(applyCodexEffortSupport(
+      Buffer.from(JSON.stringify({ reasoning: { effort } }))).toString());
+    assert.equal(out.reasoning.effort, effort);
+  }
+});
+
+test('a body with no reasoning block is returned unchanged', () => {
+  const body = Buffer.from(JSON.stringify({ model: 'm' }));
+  assert.equal(applyCodexEffortSupport(body), body);
+});
+
+test('a small thinking budget survives translation and clamping end to end', () => {
+  // The exact shape that produced the live 400.
+  const translated = claudeRequestToCodex({
+    model: 'claude-fable-5', max_tokens: 1024,
+    thinking: { type: 'enabled', budget_tokens: 256 },
+    messages: [{ role: 'user', content: 'x' }],
+  }, 'gpt-5.6-sol');
+  assert.equal(JSON.parse(translated.toString()).reasoning.effort, 'minimal');
+  assert.equal(JSON.parse(applyCodexEffortSupport(translated).toString()).reasoning.effort, 'low');
 });
