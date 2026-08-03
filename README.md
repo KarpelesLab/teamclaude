@@ -23,6 +23,7 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 - **Headless mode** — run the proxy without the TUI (`--headless`) for backgrounding/services
 - **Org-aware accounts** — one email can hold multiple accounts across different organizations (e.g. corp + personal); dedup is keyed on account + org, and names disambiguate as `email (Org)`
 - **Third-party backend accounts** — route requests to any Anthropic-compatible API (e.g. DeepSeek, GLM) as a fallback when Claude accounts are exhausted; a per-account `upstream` URL and `modelMap` translate model names transparently. Use [model routes](#model-routes) to reserve a third-party account for sessions that explicitly name its models
+- **ChatGPT Codex accounts** — use a ChatGPT subscription as a backend alongside Claude accounts (`teamclaude login --codex`). Unlike the Anthropic-compatible backends above, Codex speaks the OpenAI Responses API, so requests and streamed responses are translated in both directions; quota is read from its own `x-codex-*` headers so rotation stays predictive. See [ChatGPT Codex](#chatgpt-codex)
 - **Model blocklist** — reject requests for unwanted models (glob patterns, e.g. `*fable*`) with a fast `400` instead of forwarding them; a model no account can serve otherwise gets rate-limited upstream and hangs the pipeline. Edit live in the TUI settings screen (`g` → Blocked models)
 - **Rotation priority** — pin a preferred account order with `teamclaude priority`
 - **Enable/disable accounts** — temporarily pause an account without removing it (`teamclaude disable`/`enable`, or `d` in the TUI); re-enabling also clears a stuck error state
@@ -101,6 +102,50 @@ For Anthropic API key accounts (billed via Console):
 ```bash
 teamclaude login --api
 ```
+
+### ChatGPT Codex
+
+A ChatGPT subscription can serve requests alongside Claude accounts:
+
+```bash
+teamclaude login --codex
+```
+
+This performs its own OAuth authorization, so TeamClaude holds a credential
+independent of the Codex CLI's. Prefer it over importing:
+
+```bash
+# Copies ~/.codex/auth.json — both then hold ONE refresh token, and since
+# OpenAI rotates it on every refresh, whichever refreshes second is left with
+# a dead one. Use only when you need to reuse an existing credential.
+teamclaude import --codex
+```
+
+Codex accounts need a `modelMap`, since the backend rejects Claude model
+names, and usually a high `priority` so they act as a fallback:
+
+```json
+{
+  "name": "me@example.com",
+  "type": "oauth",
+  "protocol": "codex",
+  "priority": 100,
+  "modelMap": {
+    "claude-opus-4-6": "gpt-5.6-sol",
+    "claude-sonnet-4-6": "gpt-5.6-sol"
+  }
+}
+```
+
+Notes and limits:
+
+- Only `/v1/messages` has a Responses-API equivalent. Anthropic-only endpoints
+  (`count_tokens`, `oauth/usage`, `bootstrap`, `mcp_servers`) fail over to a
+  Claude account, so keep at least one in the fleet.
+- Reasoning effort is mapped onto the levels Codex accepts; `minimal` and
+  `auto` have no equivalent and are clamped to `low` and `medium`.
+- Reasoning summaries are not requested, so responses carry no thinking blocks.
+- A ChatGPT plan without Codex access (e.g. free) is rejected by the backend.
 
 ## Usage
 
