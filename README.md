@@ -121,13 +121,28 @@ independent of the Codex CLI's. Prefer it over importing:
 teamclaude import --codex
 ```
 
-Codex models are offered directly in Claude Code's own model picker. Set
-`CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` and Claude Code reads
-`/v1/models` from the proxy at startup; TeamClaude answers with the Claude
-catalog **and** every codex account's, so selecting `gpt-5.6-sol` is a
-first-class choice. Requests naming a Codex model route to a codex account
-automatically — no `modelMap` needed, and a Claude account is never picked for
-one (or vice versa).
+Codex models are offered directly in Claude Code's own model picker:
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:3456
+export ANTHROPIC_AUTH_TOKEN=$(jq -r '.proxy.apiKey' ~/.config/teamclaude.json)
+export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
+claude    # discovery runs at startup, so this must be a fresh session
+```
+
+TeamClaude answers `/v1/models` with the Codex catalog, and requests naming a
+Codex model route to a codex account automatically — no `modelMap` needed, and
+a Claude account is never picked for one (or vice versa).
+
+Two details worth knowing. Claude Code **drops any listed model whose id does
+not start with `claude-`**, so ids are encoded into claude-prefixed ones and
+decoded again on the way in; the picker still shows the real display name
+(`GPT-5.6-Sol`). This mirrors CLIProxyAPI's encoding exactly, so a setup
+written for one behaves the same on the other. And the listing carries only
+what TeamClaude *adds* — Claude Code already knows its own models, so echoing
+Anthropic's catalog back would just duplicate every entry in the picker. Set
+`"modelDiscovery": {"includeAnthropic": true}` if a client needs the full
+list.
 
 A `modelMap` is only needed for the other direction: making a codex account
 answer to Claude model names, so it can stand in as a fallback when Claude

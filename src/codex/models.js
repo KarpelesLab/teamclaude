@@ -32,6 +32,49 @@ export function isCodexNativeModel(model) {
   return typeof model === 'string' && NATIVE_MODEL_PATTERN.test(model.trim());
 }
 
+// Claude Code drops any model from a gateway listing whose id does not start
+// with `claude-`, so a GPT id offered as-is never reaches its picker. Encoding
+// the real id inside a claude-prefixed one is how CLIProxyAPI gets around that
+// (internal/client/claude/models, EnsureClaudeModelIDPrefix), and this mirrors
+// it byte-for-byte so a config written for one works with the other.
+//
+// The id is reversed rather than appended plainly so the result cannot collide
+// with, or be mistaken for, a real Anthropic model name.
+const CLOAK_PREFIX = 'claude-fable-5-dd-';
+
+const reverse = s => [...s].reverse().join('');
+
+/** Encode a model id so Claude Code's picker will accept it. */
+export function cloakModelId(id) {
+  if (!id || id.startsWith('claude-')) return id;
+  return CLOAK_PREFIX + reverse(id);
+}
+
+/**
+ * Decode a cloaked id back to the real model name.
+ *
+ * Any thinking suffix in `model(value)` form is preserved, matching the
+ * reference implementation — the suffix is not part of the encoded id.
+ */
+export function uncloakModelId(id) {
+  if (typeof id !== 'string' || !id) return id;
+
+  let base = id;
+  let suffix = null;
+  const open = id.lastIndexOf('(');
+  if (open !== -1 && id.endsWith(')')) {
+    base = id.slice(0, open);
+    suffix = id.slice(open + 1, -1);
+  }
+
+  if (!base.startsWith(CLOAK_PREFIX)) return id;
+  const encoded = base.slice(CLOAK_PREFIX.length);
+  if (!encoded) return id;
+
+  const resolved = reverse(encoded);
+  return suffix === null ? resolved : `${resolved}(${suffix})`;
+}
+
 /**
  * Translate one catalog entry into an Anthropic /v1/models entry.
  *

@@ -16,7 +16,7 @@ import { isCodexAccount, codexHeaders, codexUrlForPath, isStreamingRequest, CODE
 import { claudeRequestToCodex, applyCodexEffortSupport } from './codex/request-translate.js';
 import { createCodexStreamTranslator, aggregateAnthropicStream } from './codex/response-translate.js';
 import { CODEX_HEADER_PREFIX, isCodexQuotaExhausted, codexResetAfterSeconds } from './codex/quota.js';
-import { fetchCodexModels } from './codex/models.js';
+import { fetchCodexModels, cloakModelId, uncloakModelId } from './codex/models.js';
 
 
 export const HOP_BY_HOP_HEADERS = new Set([
@@ -97,7 +97,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
       // nothing to add and the request should reach Anthropic untouched.
       if (req.method === 'GET' && (req.url || '').split('?')[0] === '/v1/models'
           && accountManager.accounts.some(a => a.protocol === 'codex' && !a.disabled)) {
-        await handleModelsRequest(req, res, accountManager, upstream, sx);
+        await handleModelsRequest(req, res, accountManager, upstream, sx, config?.modelDiscovery?.includeAnthropic === true);
         return;
       }
 
@@ -355,9 +355,20 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
           if (found && !hideActivity) hooks.onRequestModel?.(reqId, { model: found });
         }
       }
-      const body = Buffer.concat(bodyChunks);
+      let body = Buffer.concat(bodyChunks);
 
-      const model = modelFinder.done ? modelFinder.value : parseRequestModel(body);
+      let model = modelFinder.done ? modelFinder.value : parseRequestModel(body);
+      // A model picked from the discovery listing comes back cloaked (Claude
+      // Code only accepts claude-prefixed ids there). Decode it here, before
+      // anything else reads the model: blocklists, routing, quota buckets and
+      // the activity log should all see the real name, and upstream must
+      // receive it rather than an id no backend knows.
+      const realModel = uncloakModelId(model);
+      if (realModel !== model) {
+        body = rewriteModel(body, { [model]: realModel });
+        model = realModel;
+        if (!hideActivity) hooks.onRequestModel?.(reqId, { model });
+      }
       // An advisor request (Claude Code's advisor tool) carries a SECOND model
       // nested in tools[]; the advisor sub-inference runs on the selected
       // account, so selection must be eligible for it too (issue #98).
@@ -1320,8 +1331,8 @@ async function collectTranslatedResponse(webStream, res, accountIndex, accountMa
  * problem, whereas failing the whole request leaves the client with no models
  * at all and no explanation.
  */
-async function handleModelsRequest(req, res, accountManager, upstream, sx) {
-  const anthropicAccount = accountManager.accounts.find(
+async function handleModelsRequest(req, res, accountManager, upstream, sx, includeAnthropic = false) {
+  const anthropicAccount = includeAnthropic && accountManager.accounts.find(
     a => a.protocol !== 'codex' && !a.disabled && a.status !== 'error' && a.credential);
 
   let anthropicModels = [];
@@ -1359,7 +1370,13 @@ async function handleModelsRequest(req, res, accountManager, upstream, sx) {
     codexModels.push(model);
   }
 
-  const data = [...anthropicModels, ...codexModels];
+  // Claude Code discards any listed model whose id does not begin with
+  // `claude-`, so a GPT id offered as-is never reaches its picker. Encode it
+  // into a claude-prefixed one; the request path decodes it back before routing.
+  const data = [...anthropicModels, ...codexModels].map(m => (
+    m.id === cloakModelId(m.id) ? m : { ...m, id: cloakModelId(m.id) }
+  ));
+
   res.writeHead(200, { 'content-type': 'application/json' });
   res.end(JSON.stringify({
     data,
