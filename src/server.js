@@ -379,7 +379,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         }
       } finally {
         accountManager.endSession(sessionId);
-        if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, sessionId, pinned: ctx.pinnedIndex != null });
+        if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, upstreamModel: ctx.upstreamModel, sessionId, pinned: ctx.pinnedIndex != null });
       }
     } catch (err) {
       console.error('[TeamClaude] Unhandled error:', err);
@@ -663,7 +663,22 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   ctx.account = account.name;
   // Pin this session to the serving account (for affinity) and keep it "active"
   // in the running-sessions readout. Passive when distribution is off.
-  accountManager.recordSession(ctx.sessionId, account.index);
+  //
+  // Also record what will actually answer. The client only ever knows the model
+  // it asked for, so once modelMap redirects a request to another provider this
+  // is the sole record of which model really ran — which is what a status line
+  // needs to show "you asked for opus, this came from gpt".
+  const requestedModel = ctx.model || null;
+  const upstreamModel = (requestedModel && account.modelMap?.[requestedModel]) || requestedModel;
+  // Surfaced in the activity log so a glance shows which model actually ran.
+  ctx.upstreamModel = upstreamModel !== requestedModel ? upstreamModel : null;
+  accountManager.recordSession(ctx.sessionId, account.index, requestedModel ? {
+    account: account.name,
+    protocol: account.protocol || 'anthropic',
+    requestedModel,
+    upstreamModel,
+    translated: upstreamModel !== requestedModel,
+  } : null);
   hooks.onRequestRouted?.(reqId, { account: account.name });
 
   // Refresh OAuth token if needed
