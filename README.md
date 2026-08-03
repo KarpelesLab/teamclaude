@@ -193,6 +193,11 @@ Notes and limits:
 - Reasoning effort is mapped onto the levels Codex accepts (`none`, `low`,
   `medium`, `high`, `xhigh`, `max`). `minimal`, `ultra` and `auto` have no
   equivalent and are clamped to `low`, `max` and `medium` respectively.
+- Prompt caching is scoped by a key derived from the session, sub-agent and
+  model, so it survives across a conversation's turns. On a 3k-token prompt
+  that caches ~93% of the input from the second turn onward. Cache reads and
+  writes are reported as `cache_read_input_tokens` /
+  `cache_creation_input_tokens`.
 - Reasoning summaries are not requested, so responses carry no thinking blocks.
 - A ChatGPT plan without Codex access (e.g. free) is rejected by the backend.
 

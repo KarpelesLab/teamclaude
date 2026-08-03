@@ -120,16 +120,16 @@ test('extractUsage subtracts cached tokens from the input total', () => {
   // Codex counts cached tokens inside input_tokens; Anthropic reports them
   // alongside, so forwarding both unchanged would double-count.
   assert.deepEqual(extractUsage({ input_tokens: 100, output_tokens: 20, input_tokens_details: { cached_tokens: 60 } }),
-    { input: 40, output: 20, cached: 60 });
+    { input: 40, output: 20, cached: 60, cacheWrite: 0 });
 });
 
 test('extractUsage clamps when cached exceeds input', () => {
   assert.deepEqual(extractUsage({ input_tokens: 10, output_tokens: 1, input_tokens_details: { cached_tokens: 50 } }),
-    { input: 0, output: 1, cached: 50 });
+    { input: 0, output: 1, cached: 50, cacheWrite: 0 });
 });
 
 test('extractUsage handles a missing usage object', () => {
-  assert.deepEqual(extractUsage(null), { input: 0, output: 0, cached: 0 });
+  assert.deepEqual(extractUsage(null), { input: 0, output: 0, cached: 0, cacheWrite: 0 });
 });
 
 test('sanitizeToolId replaces characters Anthropic tool ids disallow', () => {

@@ -5,6 +5,7 @@ import {
   isStreamingRequest,
   codexUrlForPath,
   codexHeaders,
+  codexPromptCacheKey,
   CODEX_BASE_URL,
 } from '../src/codex/protocol.js';
 import { AccountManager } from '../src/account-manager.js';
@@ -36,10 +37,11 @@ test('codexUrlForPath honours a per-account upstream override', () => {
 });
 
 test('codexHeaders carries the credential, account id and CLI identity', () => {
-  const h = codexHeaders({ credential: 'tok', accountId: 'acct-1' }, { sessionId: 'sess-1' });
+  const h = codexHeaders({ credential: 'tok', accountId: 'acct-1' }, { cacheKey: 'ck-1' });
   assert.equal(h['authorization'], 'Bearer tok');
   assert.equal(h['chatgpt-account-id'], 'acct-1');
-  assert.equal(h['session_id'], 'sess-1');
+  // Session_id doubles as the prompt cache scope, so it carries the derived key.
+  assert.equal(h['session_id'], 'ck-1');
   assert.equal(h['originator'], 'codex-tui');
   assert.match(h['user-agent'], /^codex-tui\//);
   assert.equal(h['content-type'], 'application/json');
@@ -51,7 +53,7 @@ test('codexHeaders sets the accept header from the stream flag', () => {
   assert.equal(codexHeaders(acct, { stream: false })['accept'], 'application/json');
 });
 
-test('codexHeaders mints a session id when the client did not supply one', () => {
+test('codexHeaders mints a session id only when no cache key was derived', () => {
   const h = codexHeaders({ credential: 't', accountId: 'a' }, {});
   assert.match(h['session_id'], /^[0-9a-f-]{36}$/);
 });
@@ -139,4 +141,56 @@ test('codex and anthropic accounts rotate as peers in one fleet', () => {
   am.setDisabled(0, true);
   assert.equal(am.getActiveAccount().name, 'codex-1');
   assert.equal(am.getActiveAccount().protocol, 'codex');
+});
+
+// ── prompt cache key ────────────────────────────────────────
+//
+// Codex caches on a prompt prefix but scopes it by this key, so the key must be
+// stable across a conversation's turns. Measured against the live backend on a
+// 3k-token prompt: a stable key caches 2816 of 3016 input tokens from the
+// second turn on; a fresh key each request caches nothing at all.
+
+test('the same session yields the same cache key across turns', () => {
+  const acct = { accountId: 'acct-1', name: 'cx' };
+  const a = codexPromptCacheKey(acct, { sessionId: 's1', model: 'gpt-5.6-sol' });
+  const b = codexPromptCacheKey(acct, { sessionId: 's1', model: 'gpt-5.6-sol' });
+  assert.equal(a, b);
+  assert.match(a, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+});
+
+test('different sessions get different cache keys', () => {
+  const acct = { accountId: 'acct-1' };
+  assert.notEqual(
+    codexPromptCacheKey(acct, { sessionId: 's1', model: 'm' }),
+    codexPromptCacheKey(acct, { sessionId: 's2', model: 'm' }));
+});
+
+test('a sub-agent gets its own cache key within one session', () => {
+  // Sub-agents run a different prompt prefix, so sharing the parent's key would
+  // mean two prefixes competing for one cache scope.
+  const acct = { accountId: 'acct-1' };
+  assert.notEqual(
+    codexPromptCacheKey(acct, { sessionId: 's1', model: 'm' }),
+    codexPromptCacheKey(acct, { sessionId: 's1', agentId: 'sub-1', model: 'm' }));
+});
+
+test('a client sending no session id still gets a stable key', () => {
+  // The regression this fixes: such a caller previously got a fresh UUID per
+  // request and therefore never cached anything.
+  const acct = { accountId: 'acct-1' };
+  const a = codexPromptCacheKey(acct, { model: 'gpt-5.6-sol' });
+  const b = codexPromptCacheKey(acct, { model: 'gpt-5.6-sol' });
+  assert.equal(a, b);
+});
+
+test('two accounts do not share a cache key when neither sends a session', () => {
+  assert.notEqual(
+    codexPromptCacheKey({ accountId: 'acct-1' }, { model: 'm' }),
+    codexPromptCacheKey({ accountId: 'acct-2' }, { model: 'm' }));
+});
+
+test('the raw session id never reaches the backend', () => {
+  // The key is hashed, so a session identifier is not sent in the clear.
+  const key = codexPromptCacheKey({ accountId: 'a' }, { sessionId: 'secret-session', model: 'm' });
+  assert.ok(!key.includes('secret'));
 });

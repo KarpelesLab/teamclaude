@@ -247,7 +247,7 @@ function resolveReasoningEffort(request) {
  * @param {string} model - upstream model name, already resolved through modelMap
  * @returns {Buffer} the Responses API request body
  */
-export function claudeRequestToCodex(body, model) {
+export function claudeRequestToCodex(body, model, { promptCacheKey = null } = {}) {
   const request = typeof body === 'object' && !Buffer.isBuffer(body)
     ? body
     : JSON.parse(Buffer.isBuffer(body) ? body.toString('utf-8') : String(body));
@@ -419,6 +419,11 @@ export function claudeRequestToCodex(body, model) {
   out.store = false;
   // Reasoning must come back encrypted so it can be replayed on the next turn.
   out.include = ['reasoning.encrypted_content'];
+
+  // Scope the prompt cache explicitly. The backend will fall back to echoing the
+  // Session_id header when this is absent, but that is undocumented behaviour to
+  // depend on, and naming the key here is what CLIProxyAPI does.
+  if (promptCacheKey) out.prompt_cache_key = promptCacheKey;
 
   return Buffer.from(JSON.stringify(out), 'utf-8');
 }

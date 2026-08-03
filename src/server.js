@@ -12,7 +12,7 @@ import { TopLevelFieldFinder, modelGlobMatches } from './model.js';
 import { BodyWriter } from './request-log.js';
 import { upstreamFetch } from './upstream-fetch.js';
 import { tunnelTls } from './sx.js';
-import { isCodexAccount, codexHeaders, codexUrlForPath, isStreamingRequest, CODEX_BASE_URL } from './codex/protocol.js';
+import { isCodexAccount, codexHeaders, codexUrlForPath, isStreamingRequest, codexPromptCacheKey, SESSION_HEADER, AGENT_HEADER, CODEX_BASE_URL } from './codex/protocol.js';
 import { claudeRequestToCodex, applyCodexEffortSupport } from './codex/request-translate.js';
 import { createCodexStreamTranslator, aggregateAnthropicStream } from './codex/response-translate.js';
 import { CODEX_HEADER_PREFIX, isCodexQuotaExhausted, codexResetAfterSeconds } from './codex/quota.js';
@@ -726,6 +726,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   const clientWantsStream = isStreamingRequest(body);
   let headers = {};
   let upstreamUrl;
+  let codexCacheKey = null;
 
   if (isCodex) {
     // Codex accounts speak the OpenAI Responses API. Headers are built from
@@ -756,10 +757,14 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       }));
       return;
     }
-    headers = codexHeaders(account, {
-      stream: true,
-      sessionId: req.headers['x-claude-code-session-id'] || null,
+    // One derived key scopes the prompt cache for this conversation. It must be
+    // stable across turns or nothing is cached — see codexPromptCacheKey.
+    codexCacheKey = codexPromptCacheKey(account, {
+      sessionId: req.headers[SESSION_HEADER] || null,
+      agentId: req.headers[AGENT_HEADER] || null,
+      model: ctx.model || null,
     });
+    headers = codexHeaders(account, { stream: true, cacheKey: codexCacheKey });
   } else {
     for (const [key, value] of Object.entries(req.headers)) {
       const lk = key.toLowerCase();
@@ -806,7 +811,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       codexRequest = JSON.parse(sendBody.toString('utf-8'));
       // Clamp after translating: the translator mirrors CLIProxyAPI exactly,
       // and this is the equivalent of the clamping it does in a later stage.
-      sendBody = applyCodexEffortSupport(claudeRequestToCodex(codexRequest, codexRequest.model));
+      sendBody = applyCodexEffortSupport(
+        claudeRequestToCodex(codexRequest, codexRequest.model, { promptCacheKey: codexCacheKey }));
     } catch (err) {
       console.error(`[TeamClaude] Codex request translation failed (account "${account.name}"): ${err.message}`);
       res.writeHead(400, { 'content-type': 'application/json' });

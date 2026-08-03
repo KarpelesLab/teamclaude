@@ -77,12 +77,17 @@ function mapStopReason(stopReason, hasToolCall) {
  * subtracted out to avoid double-counting.
  */
 function extractUsage(usage) {
-  if (!usage || typeof usage !== 'object') return { input: 0, output: 0, cached: 0 };
+  if (!usage || typeof usage !== 'object') return { input: 0, output: 0, cached: 0, cacheWrite: 0 };
   let input = usage.input_tokens ?? 0;
   const output = usage.output_tokens ?? 0;
-  const cached = usage.input_tokens_details?.cached_tokens ?? 0;
+  const details = usage.input_tokens_details || {};
+  const cached = details.cached_tokens ?? 0;
+  // Tokens written INTO the cache on this turn. Anthropic reports these
+  // separately as cache_creation_input_tokens; dropping them made a
+  // cache-priming turn look cheaper than it was. Codex has used both spellings.
+  const cacheWrite = details.cache_write_tokens ?? details.cache_creation_tokens ?? 0;
   if (cached > 0) input = input >= cached ? input - cached : 0;
-  return { input, output, cached };
+  return { input, output, cached, cacheWrite };
 }
 
 function errorFrame(event) {
@@ -459,7 +464,7 @@ class CodexStreamTranslator {
         this.#finalizeThinking(out);
         this.#stopText(out);
 
-        const { input, output, cached } = extractUsage(response.usage);
+        const { input, output, cached, cacheWrite } = extractUsage(response.usage);
         const delta = {
           stop_reason: mapStopReason(codexStopReason(response), this.hasEmittedToolUse),
           stop_sequence: null,
@@ -467,6 +472,7 @@ class CodexStreamTranslator {
         if (response.stop_sequence) delta.stop_sequence = response.stop_sequence;
         const usage = { input_tokens: input, output_tokens: output };
         if (cached > 0) usage.cache_read_input_tokens = cached;
+        if (cacheWrite > 0) usage.cache_creation_input_tokens = cacheWrite;
 
         out.push(sse('message_delta', { type: 'message_delta', delta, usage }));
         out.push(sse('message_stop', { type: 'message_stop' }));
