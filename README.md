@@ -132,18 +132,32 @@ names, and usually a high `priority` so they act as a fallback:
   "priority": 100,
   "modelMap": {
     "claude-opus-4-6": "gpt-5.6-sol",
-    "claude-sonnet-4-6": "gpt-5.6-sol"
+    "claude-sonnet-4-6": "gpt-5.6-terra",
+    "claude-haiku-4-5-20251001": "gpt-5.6-luna"
   }
 }
 ```
+
+The Codex models available to a ChatGPT plan, roughly strongest first — all
+three verified against the live backend:
+
+| Model | Description | Default effort |
+|---|---|---|
+| `gpt-5.6-sol` | Latest frontier agentic coding model | `low` |
+| `gpt-5.6-terra` | Balanced agentic coding model for everyday work | `medium` |
+| `gpt-5.6-luna` | Fast and affordable agentic coding model | `medium` |
+
+`modelMap` matches the model string exactly, so include every id your client
+sends — Claude Code may append a `[1m]` context suffix.
 
 Notes and limits:
 
 - Only `/v1/messages` has a Responses-API equivalent. Anthropic-only endpoints
   (`count_tokens`, `oauth/usage`, `bootstrap`, `mcp_servers`) fail over to a
   Claude account, so keep at least one in the fleet.
-- Reasoning effort is mapped onto the levels Codex accepts; `minimal` and
-  `auto` have no equivalent and are clamped to `low` and `medium`.
+- Reasoning effort is mapped onto the levels Codex accepts (`none`, `low`,
+  `medium`, `high`, `xhigh`, `max`). `minimal`, `ultra` and `auto` have no
+  equivalent and are clamped to `low`, `max` and `medium` respectively.
 - Reasoning summaries are not requested, so responses carry no thinking blocks.
 - A ChatGPT plan without Codex access (e.g. free) is rejected by the backend.
 

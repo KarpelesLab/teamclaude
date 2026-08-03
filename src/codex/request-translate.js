@@ -119,17 +119,24 @@ export function normalizeToolParameters(schema) {
   return out;
 }
 
-// Reasoning levels the Codex backend accepts. Reported verbatim by a live 400:
-// "Unsupported value: 'minimal' is not supported with the 'gpt-5.6-sol' model.
-//  Supported values are: 'none', 'low', 'medium', 'high', 'xhigh', and 'max'."
+// Reasoning levels the Codex backend accepts, established by probing it: every
+// value below returns 200 on gpt-5.6-sol/terra/luna, and everything else 400s.
+//
+// Two traps here. The API's own enum message advertises `minimal`, but sending
+// it draws a model-specific rejection ("'minimal' is not supported with the
+// 'gpt-5.6-sol' model"), so the documented enum is wider than any model accepts.
+// And the Codex CLI's model cache lists `ultra` as a supported level for sol and
+// terra, but the API rejects it outright — that cache describes the CLI's own
+// menu, not the wire contract. Neither source is trustworthy alone; this set is
+// what the backend actually answered.
 const CODEX_SUPPORTED_EFFORTS = new Set(['none', 'low', 'medium', 'high', 'xhigh', 'max']);
 
-// Anthropic's budget bands include levels Codex has no equivalent for. Map each
-// onto the nearest level that preserves intent: `minimal` means "think a
-// little", so it becomes `low` rather than `none`, which would switch reasoning
-// off entirely. `auto` means "you decide", which is what `medium` (the API
-// default) expresses.
-const EFFORT_SUBSTITUTES = { minimal: 'low', auto: 'medium' };
+// Levels with no equivalent, mapped to the nearest neighbour that preserves
+// intent: `minimal` means "think a little", so it becomes `low` rather than
+// `none`, which would switch reasoning off entirely; `ultra` sits above `max`,
+// so it lands on `max` rather than falling all the way to the default; `auto`
+// means "you decide", which is what `medium` (the API default) expresses.
+const EFFORT_SUBSTITUTES = { minimal: 'low', ultra: 'max', auto: 'medium' };
 
 /**
  * Force a translated request's reasoning effort onto a level Codex accepts.

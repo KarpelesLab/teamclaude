@@ -251,6 +251,16 @@ test('minimal effort is raised to the nearest supported level', () => {
   assert.equal(out.reasoning.effort, 'low');
 });
 
+test('ultra effort falls to max, not to the default', () => {
+  // The Codex CLI's model cache lists `ultra` for sol/terra, but the API
+  // rejects it — that cache describes the CLI's menu, not the wire contract.
+  // `max` is its nearest accepted neighbour, so dropping to `medium` would
+  // discard far more of the caller's intent than necessary.
+  const out = JSON.parse(applyCodexEffortSupport(
+    Buffer.from(JSON.stringify({ reasoning: { effort: 'ultra' } }))).toString());
+  assert.equal(out.reasoning.effort, 'max');
+});
+
 test('auto effort becomes the backend default', () => {
   const out = JSON.parse(applyCodexEffortSupport(
     Buffer.from(JSON.stringify({ reasoning: { effort: 'auto' } }))).toString());
