@@ -23,6 +23,7 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 - **Headless mode** — run the proxy without the TUI (`--headless`) for backgrounding/services
 - **Org-aware accounts** — one email can hold multiple accounts across different organizations (e.g. corp + personal); dedup is keyed on account + org, and names disambiguate as `email (Org)`
 - **Third-party backend accounts** — route requests to any Anthropic-compatible API (e.g. DeepSeek, GLM) as a fallback when Claude accounts are exhausted; a per-account `upstream` URL and `modelMap` translate model names transparently. Use [model routes](#model-routes) to reserve a third-party account for sessions that explicitly name its models
+- **ChatGPT Codex accounts** — use a ChatGPT subscription as a backend alongside Claude accounts (`teamclaude login --codex`), with its models offered directly in Claude Code's picker via gateway model discovery. Unlike the Anthropic-compatible backends above, Codex speaks the OpenAI Responses API, so requests and streamed responses are translated in both directions; quota is read from its own `x-codex-*` headers so rotation stays predictive. See [ChatGPT Codex](#chatgpt-codex)
 - **Model blocklist** — reject requests for unwanted models (glob patterns, e.g. `*fable*`) with a fast `400` instead of forwarding them; a model no account can serve otherwise gets rate-limited upstream and hangs the pipeline. Edit live in the TUI settings screen (`g` → Blocked models)
 - **Rotation priority** — pin a preferred account order with `teamclaude priority`
 - **Enable/disable accounts** — temporarily pause an account without removing it (`teamclaude disable`/`enable`, or `d` in the TUI); re-enabling also clears a stuck error state
@@ -101,6 +102,104 @@ For Anthropic API key accounts (billed via Console):
 ```bash
 teamclaude login --api
 ```
+
+### ChatGPT Codex
+
+A ChatGPT subscription can serve requests alongside Claude accounts:
+
+```bash
+teamclaude login --codex
+```
+
+This performs its own OAuth authorization, so TeamClaude holds a credential
+independent of the Codex CLI's. Prefer it over importing:
+
+```bash
+# Copies ~/.codex/auth.json — both then hold ONE refresh token, and since
+# OpenAI rotates it on every refresh, whichever refreshes second is left with
+# a dead one. Use only when you need to reuse an existing credential.
+teamclaude import --codex
+```
+
+Codex models are offered directly in Claude Code's own model picker:
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:3456
+export ANTHROPIC_AUTH_TOKEN=$(jq -r '.proxy.apiKey' ~/.config/teamclaude.json)
+export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
+claude    # discovery runs at startup, so this must be a fresh session
+```
+
+TeamClaude answers `/v1/models` with the Codex catalog, and requests naming a
+Codex model route to a codex account automatically — no `modelMap` needed, and
+a Claude account is never picked for one (or vice versa).
+
+Two details worth knowing. Claude Code **drops any listed model whose id does
+not start with `claude-`**, so ids are encoded into claude-prefixed ones and
+decoded again on the way in; the picker still shows the real display name
+(`GPT-5.6-Sol`). This mirrors CLIProxyAPI's encoding exactly, so a setup
+written for one behaves the same on the other. And the listing carries only
+what TeamClaude *adds* — Claude Code already knows its own models, so echoing
+Anthropic's catalog back would just duplicate every entry in the picker. Set
+`"modelDiscovery": {"includeAnthropic": true}` if a client needs the full
+list.
+
+Models in `blockedModels` are left out of the listing —
+advertising a model the proxy would reject with a `400` just puts a choice in
+the picker that fails the moment it is used. Patterns anchor at both ends, so
+trim older generations explicitly or with a wildcard:
+
+```json
+"blockedModels": ["gpt-5.4", "gpt-5.4-mini", "gpt-5.5"]
+```
+
+A `modelMap` is only needed for the other direction: making a codex account
+answer to Claude model names, so it can stand in as a fallback when Claude
+quota runs out. Pair it with a high `priority` so it stays a fallback:
+
+```json
+{
+  "name": "me@example.com",
+  "type": "oauth",
+  "protocol": "codex",
+  "priority": 100,
+  "modelMap": {
+    "claude-opus-4-6": "gpt-5.6-sol",
+    "claude-sonnet-4-6": "gpt-5.6-terra",
+    "claude-haiku-4-5-20251001": "gpt-5.6-luna"
+  }
+}
+```
+
+The catalog is read live from Codex, so it stays current as models come and
+go. On a ChatGPT Plus plan today, all verified end to end:
+
+| Model | Description | Default effort |
+|---|---|---|
+| `gpt-5.6-sol` | Latest frontier agentic coding model | `low` |
+| `gpt-5.6-terra` | Balanced agentic coding model for everyday work | `medium` |
+| `gpt-5.6-luna` | Fast and affordable agentic coding model | `medium` |
+| `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini` | Previous generations | `medium` |
+| `codex-auto-review` | Review-oriented alias | `medium` |
+
+`modelMap` matches the model string exactly, so include every id your client
+sends — Claude Code may append a `[1m]` context suffix.
+
+Notes and limits:
+
+- Only `/v1/messages` has a Responses-API equivalent. Anthropic-only endpoints
+  (`count_tokens`, `oauth/usage`, `bootstrap`, `mcp_servers`) fail over to a
+  Claude account, so keep at least one in the fleet.
+- Reasoning effort is mapped onto the levels Codex accepts (`none`, `low`,
+  `medium`, `high`, `xhigh`, `max`). `minimal`, `ultra` and `auto` have no
+  equivalent and are clamped to `low`, `max` and `medium` respectively.
+- Prompt caching is scoped by a key derived from the session, sub-agent and
+  model, so it survives across a conversation's turns. On a 3k-token prompt
+  that caches ~93% of the input from the second turn onward. Cache reads and
+  writes are reported as `cache_read_input_tokens` /
+  `cache_creation_input_tokens`.
+- Reasoning summaries are not requested, so responses carry no thinking blocks.
+- A ChatGPT plan without Codex access (e.g. free) is rejected by the backend.
 
 ## Usage
 
@@ -352,7 +451,7 @@ When on, teamclaude routes each **new** session to the least-loaded eligible acc
 | `holdSeconds` | Maximum seconds to hold the connection when all accounts are exhausted, polling silently until one recovers (`0` = return 429 immediately, the default). `teamclaude run` raises `API_TIMEOUT_MS` automatically to match |
 | `distributeSessions` | Spread concurrent Claude Code sessions across equal-priority accounts, each session pinned to one account for cache reuse (`false` = quota-driven rotation only, the default). Session tracking/readout is always on regardless — see [Session-aware routing](#session-aware-routing-distributesessions-off-by-default) |
 | `eventLogging` | How to handle Claude Code's telemetry (`/api/event_logging/*`), which is high-volume activity-log noise: `hide` (default) forwards it but keeps it out of the activity log; `block` answers `200` locally without forwarding (no upstream round-trip); `show` forwards and displays it. Toggle live in the TUI settings screen (`g` → Event logging). |
-| `blockedModels` | Array of model glob patterns (e.g. `["*fable*"]`) whose requests are rejected with a fast, non-retryable `400` instead of being forwarded — avoids a model no account can serve getting rate-limited upstream and hanging the pipeline (issue #116). Edit live in the TUI settings screen (`g` → Blocked models). Empty (the default) blocks nothing. |
+| `blockedModels` | Array of model glob patterns (e.g. `["*fable*"]`) whose requests are rejected with a fast, non-retryable `400` instead of being forwarded — avoids a model no account can serve getting rate-limited upstream and hanging the pipeline (issue #116). Blocked models are also left out of the [`/v1/models`](#chatgpt-codex) discovery listing, so the picker never offers a model the proxy would refuse. Edit live in the TUI settings screen (`g` → Blocked models). Empty (the default) blocks nothing. |
 | `stormRamp` | Optional storm-control tuning (on by default) — see [Storm control](#storm-control-switchover-ramp-up). Object: `{ enabled, startConc, stepConc, stepMs, windowMs }` |
 | `sx.apiKey` | [sx.org](https://sx.org) API key. When set, TeamClaude auto-provisions a residential proxy (egress-IP 429 workaround). Absent/empty = off |
 | `sx.mode` | `always` (route all upstream traffic), `429` (direct, fail over to the proxy after a 429), or `off` (keep the key but don't use it). Defaults to `always` when a key is set |

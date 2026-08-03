@@ -1,4 +1,7 @@
 import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired } from './oauth.js';
+import { refreshCodexToken } from './codex/oauth.js';
+import { parseCodexQuota } from './codex/quota.js';
+import { isCodexNativeModel } from './codex/models.js';
 import { sameIdentity } from './identity.js';
 import { weeklyBucketForModel, modelGlobMatches } from './model.js';
 import { SessionTracker } from './session-tracker.js';
@@ -51,6 +54,15 @@ function makeAccount(acct, index) {
     index,
     name: acct.name,
     type: acct.type,
+    // Wire protocol this account speaks. 'anthropic' (the default) forwards the
+    // client's Messages API request essentially untouched; 'codex' translates it
+    // to the OpenAI Responses API. Everything outside the forwarding path —
+    // rotation, priority, routes, disable/enable, TC_ACCT pinning — is
+    // protocol-agnostic and must stay that way.
+    protocol: acct.protocol || 'anthropic',
+    // ChatGPT account id, sent as the chatgpt-account-id header on every codex
+    // request. Null for anthropic accounts.
+    accountId: acct.accountId || null,
     accountUuid: acct.accountUuid || null,
     orgUuid: acct.orgUuid || null,
     orgName: acct.orgName || null,
@@ -100,12 +112,13 @@ function modelMatches(declared, model) {
 }
 
 export class AccountManager {
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, throttleProbeFloorMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, sessionTracker } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, throttleProbeFloorMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, sessionTracker } = {}) {
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
-    // OAuth token refresh.
+    // OAuth token refresh. Separate refreshers per protocol — see ensureTokenFresh.
     this._refreshFn = refreshFn;
+    this._codexRefreshFn = codexRefreshFn;
     this.accounts = accounts.map((acct, index) => makeAccount(acct, index));
     this.currentIndex = 0;
     // Session awareness (issue #109). The tracker is always on (passive — it just
@@ -361,8 +374,8 @@ export class AccountManager {
   /** Record that a session's request was served by an account (always on, even
    * when distribution is off — the readout is passive). This is what pins a
    * session for future affinity. */
-  recordSession(sessionId, accountIndex) {
-    if (sessionId) this.sessionTracker.touch(sessionId, accountIndex);
+  recordSession(sessionId, accountIndex, served = null) {
+    if (sessionId) this.sessionTracker.touch(sessionId, accountIndex, undefined, served);
   }
 
   /** Mark a session request as in flight / finished. Paired around the whole
@@ -559,6 +572,12 @@ export class AccountManager {
     // that family — the account still serves every other model normally.
     if (this._isNearQuota(account, model)) return false;
 
+    // Protocol capability: an account can only be picked for a model its
+    // backend actually serves. Without this a request naming a GPT model could
+    // land on a Claude account (and vice versa) and fail upstream, which is how
+    // a codex account with no modelMap used to 400 on every claude-* request.
+    if (model && !this._protocolServesModel(account, model)) return false;
+
     // Route/ownership restriction: a configured route can pin a model pattern to
     // an exclusive set of accounts; failing that, a per-account `models` claim
     // restricts an owned model to its owners. Either way an account not eligible
@@ -617,6 +636,20 @@ export class AccountManager {
    * list is exclusive (only listed accounts, by name or index). With no matching
    * route — or a route that lists no accounts — it falls back to the per-account
    * `models` ownership claim (deprecated — use `routes` instead). */
+  /**
+   * Can this account's backend serve `model` at all?
+   *
+   * A codex account serves models Codex knows natively, plus anything its
+   * modelMap redirects onto one. An Anthropic account serves everything else —
+   * it has no way to answer a GPT model name, so it must not be selected for one
+   * even when it is the only account left.
+   */
+  _protocolServesModel(account, model) {
+    const native = isCodexNativeModel(model);
+    if (account.protocol === 'codex') return native || !!account.modelMap?.[model];
+    return !native;
+  }
+
   _routeAllows(account, model) {
     const route = this._routeForModel(model);
     if (route && route.accounts.length) {
@@ -1003,6 +1036,14 @@ export class AccountManager {
     const account = this.accounts[accountIndex];
     if (!account) return;
 
+    // Codex reports quota in its own header family. It is normalized onto the
+    // same unified5h/unified7d fields so selection, the switch threshold,
+    // status rendering and state persistence need no protocol awareness.
+    if (account.protocol === 'codex') {
+      this._updateCodexQuota(account, headers);
+      return;
+    }
+
     // Unified rate limits (Claude Max)
     const u5h = parseFloat(headers['anthropic-ratelimit-unified-5h-utilization']);
     const u7d = parseFloat(headers['anthropic-ratelimit-unified-7d-utilization']);
@@ -1059,6 +1100,44 @@ export class AccountManager {
         ? (account.quota.unified7d * 100).toFixed(1)
         : account.quota.tokensLimit
           ? ((1 - account.quota.tokensRemaining / account.quota.tokensLimit) * 100).toFixed(1)
+          : '?';
+      console.log(`[TeamClaude] Account "${account.name}" at ${pct}% usage — will switch on next request`);
+    }
+  }
+
+  /**
+   * Record quota for a codex account from its x-codex-* response headers.
+   *
+   * Mirrors the bookkeeping the Anthropic branch does — request counter, probe
+   * clearing, near-quota warning — so a codex account behaves identically to
+   * its peers everywhere downstream.
+   */
+  _updateCodexQuota(account, headers) {
+    const parsed = parseCodexQuota(headers);
+
+    if (parsed.unified5h !== undefined) account.quota.unified5h = parsed.unified5h;
+    if (parsed.unified5hReset !== undefined) account.quota.unified5hReset = parsed.unified5hReset;
+    if (parsed.unified7d !== undefined) account.quota.unified7d = parsed.unified7d;
+    if (parsed.unified7dReset !== undefined) account.quota.unified7dReset = parsed.unified7dReset;
+    if (parsed.planType) account.planType = parsed.planType;
+
+    // Same trigger as the Anthropic path: the account was selected partly to
+    // discover its quota, and now that a real limit is known, selection should
+    // re-evaluate rather than stay on it by inertia.
+    if (account.probing && account.quota.unified7dReset != null) {
+      account.probing = false;
+      account.requalify = true;
+      console.log(`[TeamClaude] Learned weekly quota for "${account.name}", re-evaluating selection`);
+    }
+
+    account.usage.totalRequests++;
+    account.usage.lastUsed = new Date().toISOString();
+
+    if (this._isNearQuota(account)) {
+      const pct = account.quota.unified7d != null
+        ? (account.quota.unified7d * 100).toFixed(1)
+        : account.quota.unified5h != null
+          ? (account.quota.unified5h * 100).toFixed(1)
           : '?';
       console.log(`[TeamClaude] Account "${account.name}" at ${pct}% usage — will switch on next request`);
     }
@@ -1158,12 +1237,17 @@ export class AccountManager {
    * Ensure an OAuth account's token is fresh, refreshing if needed.
    * Pass force=true to refresh regardless of expiry (e.g. after a 401).
    * Concurrent calls for the same account coalesce into a single refresh.
+   *
+   * `thresholdMs` widens what counts as "expiring soon". The default suits the
+   * request path, where a token only has to survive the request about to be
+   * sent. A scheduled refresher passes a larger window so it can renew a token
+   * well before expiry rather than at the last moment.
    */
-  async ensureTokenFresh(accountIndex, force = false) {
+  async ensureTokenFresh(accountIndex, force = false, thresholdMs = undefined) {
     const account = this.accounts[accountIndex];
     if (!account || account.type !== 'oauth' || !account.refreshToken) return;
 
-    if (!force && !isTokenExpiringSoon(account.expiresAt)) return;
+    if (!force && !isTokenExpiringSoon(account.expiresAt, thresholdMs)) return;
 
     // A forced refresh answers a 401, but 401s arrive in bursts: every request
     // already in flight when the token went bad comes back rejected, and each
@@ -1186,10 +1270,20 @@ export class AccountManager {
     account._refreshPromise = (async () => {
       console.log(`[TeamClaude] Refreshing token for account "${account.name}"...`);
       try {
-        const newTokens = await this._refreshFn(account.refreshToken);
+        // Dispatch on protocol: codex accounts refresh against OpenAI's token
+        // endpoint with a different client id and wire format. Both refreshers
+        // share an error contract (err.status set on HTTP failures) so the
+        // auth-rejection handling below works identically for either.
+        const refreshFn = account.protocol === 'codex' ? this._codexRefreshFn : this._refreshFn;
+        const newTokens = await refreshFn(account.refreshToken);
         account.credential = newTokens.accessToken;
         account.refreshToken = newTokens.refreshToken;
         account.expiresAt = newTokens.expiresAt;
+        // A codex refresh re-derives the account id from the fresh id_token, so
+        // a server-side account migration is picked up instead of staying
+        // pinned to whatever was imported. Guard against a null so a partial
+        // response can't erase a working id.
+        if (newTokens.accountId) account.accountId = newTokens.accountId;
         account._lastRefreshAt = Date.now();
         console.log(`[TeamClaude] Token refreshed for account "${account.name}"`);
         this._onTokenRefresh?.(accountIndex, newTokens);

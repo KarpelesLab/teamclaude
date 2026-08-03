@@ -60,7 +60,13 @@ export class Prober {
     this.lastRunStartedAt = Date.now();
     this.nextRunAt = this.intervalMs > 0 ? this.lastRunStartedAt + this.intervalMs : null;
     try {
-      const accounts = this.am.accounts.filter(account => account.type === 'oauth' && account.credential);
+      // Codex accounts are excluded: probeFn reads Anthropic's OAuth usage
+      // endpoint, which rejects a ChatGPT token, so probing one would 401, force
+      // a needless token refresh, 401 again and record a permanent error. They
+      // need no probe anyway — codex quota rides in on every response header,
+      // so it is always as fresh as the account's last request.
+      const accounts = this.am.accounts.filter(
+        account => account.type === 'oauth' && account.credential && account.protocol !== 'codex');
       await Promise.all(accounts.map(account => this.probeAccount(account)));
     } finally {
       this.lastRunFinishedAt = Date.now();

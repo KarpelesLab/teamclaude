@@ -94,6 +94,11 @@ export class Warmer {
    */
   _isWarmTarget(account) {
     if (account.type !== 'oauth' || !account.credential) return false;
+    // Warming exists to keep an idle account's 5-hour session timer running, a
+    // Claude subscription concept. The observed codex plan has only a rolling
+    // weekly window with no session to hold open, so a warm request would spend
+    // real quota to accomplish nothing.
+    if (account.protocol === 'codex') return false;
     if (account.upstream) return false;
     if (account.disabled) return false;
     if (account.status === 'error' || account.status === 'exhausted' || account.status === 'throttled') return false;
@@ -178,7 +183,7 @@ export class Warmer {
       nextRunAt: iso(this.nextRunAt),
       accounts: this.am.accounts.map(account => {
         const status = this.accountStatus.get(account.name);
-        const applicable = account.type === 'oauth' && !account.upstream;
+        const applicable = account.type === 'oauth' && !account.upstream && account.protocol !== 'codex';
         return {
           name: account.name,
           status: applicable ? (status?.status || 'never') : 'not-applicable',

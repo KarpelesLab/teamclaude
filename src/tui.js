@@ -272,7 +272,11 @@ export class TUI {
     this.active.delete(id);
     const dur = r ? ((Date.now() - r.started) / 1000).toFixed(1) : '?';
     const acct = info.account || r?.account || '?';
-    const model = info.model ? ` (${info.model})` : ''; // shown when the request named a model
+    // Show the redirect when modelMap sent the request to a different model, so
+    // "asked for opus, answered by gpt" is visible without reading a log file.
+    const model = info.model
+      ? ` (${info.model}${info.upstreamModel ? ` → ${info.upstreamModel}` : ''})`
+      : '';
     const sid = info.sessionId || r?.sessionId || null;
     const pin = (info.pinned || r?.pinned) ? dim(' [pin]') : '';
     this._addLog(`${sessionTag(sid)} ${info.method} ${info.path}${model} → ${acct}${pin} (${info.status}, ${dur}s)`);

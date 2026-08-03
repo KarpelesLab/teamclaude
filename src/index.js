@@ -8,12 +8,14 @@ import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConf
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
+import { importCodexCredentials, refreshCodexToken, loginCodex, CODEX_DEFAULT_AUTH_PATH } from './codex/oauth.js';
 import { sameIdentity, orgKey, matchAccounts } from './identity.js';
 import { resolveAccounts } from './resolve-accounts.js';
 import * as alias from './alias.js';
 import { ensureCerts } from './mitm.js';
 import { Prober } from './prober.js';
 import { Warmer } from './warmer.js';
+import { CodexTokenRefresher } from './codex/token-refresher.js';
 import { TUI } from './tui.js';
 import { SxManager } from './sx.js';
 import { autoUpdate, checkForUpdate, currentVersion, runUpdate, installKind, PKG_NAME } from './updater.js';
@@ -186,6 +188,9 @@ async function serverCommand() {
       config.accounts[idx].accessToken = newTokens.accessToken;
       config.accounts[idx].refreshToken = newTokens.refreshToken;
       config.accounts[idx].expiresAt = newTokens.expiresAt;
+      // Codex refreshes re-derive the account id; persist it so a migrated
+      // account survives a restart. Absent for anthropic accounts.
+      if (newTokens.accountId) config.accounts[idx].accountId = newTokens.accountId;
     }
     atomicConfigUpdate(diskConfig => {
       // Pick up any new accounts from disk so index matching stays correct
@@ -203,6 +208,7 @@ async function serverCommand() {
         diskConfig.accounts[cfgIdx].accessToken = newTokens.accessToken;
         diskConfig.accounts[cfgIdx].refreshToken = newTokens.refreshToken;
         diskConfig.accounts[cfgIdx].expiresAt = newTokens.expiresAt;
+        if (newTokens.accountId) diskConfig.accounts[cfgIdx].accountId = newTokens.accountId;
       }
     }).catch(err => console.error(`[TeamClaude] Failed to save refreshed token: ${err.message}`));
   });
@@ -219,6 +225,8 @@ async function serverCommand() {
   let prober = null;
   // Opt-in keep-warm scheduler (config.warmupSeconds, default 0 = off).
   let warmer = null;
+  // Scheduled codex token refresh (on by default — nothing else renews them).
+  let codexTokenRefresher = null;
   const serverStartedAt = Date.now();
 
   // sx.org proxy (IP-based-429 workaround). Dormant unless an API key is set in
@@ -448,6 +456,15 @@ async function serverCommand() {
   });
   warmer.start();
 
+  // Keep codex tokens fresh. Unlike the two schedulers above this is on by
+  // default and spends no quota: codex accounts are excluded from both of them,
+  // so nothing else renews their token while the proxy is idle.
+  codexTokenRefresher = new CodexTokenRefresher(accountManager, {
+    intervalMs: (config.codexTokenCheckSeconds ?? 60) * 1000,
+    refreshAheadMs: (config.codexRefreshAheadSeconds ?? 1800) * 1000,
+  });
+  codexTokenRefresher.start();
+
   // Background self-update for a backgrounded (headless) server. Skipped under
   // the TUI, where npm's install output would corrupt the display — interactive
   // users update via `teamclaude run` (post-session) or `teamclaude update`.
@@ -468,6 +485,7 @@ async function serverCommand() {
     if (!tui) console.log('\n[TeamClaude] Shutting down...');
     prober?.stop();
     warmer?.stop();
+    codexTokenRefresher?.stop();
     if (quotaSaveInterval) clearInterval(quotaSaveInterval);
     await persistQuotaState();
     // Don't linger waiting on keep-alive / streaming connections: actively
@@ -485,6 +503,11 @@ async function serverCommand() {
 
 async function importCommand() {
   const config = await loadOrCreateConfig();
+
+  if (args.includes('--codex')) {
+    await importCodexCommand(config);
+    return;
+  }
 
   let name = argValue('--name');
   const jsonStr = argValue('--json');
@@ -522,9 +545,117 @@ async function importCommand() {
   await upsertOAuthAccount(config, name, creds, 'import');
 }
 
+// ── codex import ────────────────────────────────────────────
+
+async function loginCodexCommand() {
+  const config = await loadOrCreateConfig();
+  let creds;
+  try {
+    creds = await loginCodex();
+  } catch (err) {
+    console.error(`Codex login failed: ${err.message}`);
+    process.exit(1);
+  }
+  // Credentials from a login are teamclaude's own grant, so unlike an import
+  // there is no shared refresh token to warn about.
+  await upsertCodexAccount(config, argValue('--name'), creds, null);
+}
+
+async function importCodexCommand(config) {
+  const name = argValue('--name');
+  const fromPath = argValue('--from') || CODEX_DEFAULT_AUTH_PATH;
+
+  let creds;
+  try {
+    creds = await importCodexCredentials(fromPath);
+  } catch (err) {
+    console.error(`Failed to import Codex credentials from ${fromPath}: ${err.message}`);
+    process.exit(1);
+  }
+
+  await upsertCodexAccount(config, name, creds, fromPath);
+}
+
+/**
+ * Add or update a codex-protocol account.
+ *
+ * Identity is the ChatGPT account id: unlike Anthropic accounts there is no
+ * org dimension, and the email can change without the account changing.
+ *
+ * `fromPath` is the credential file an import copied from, or null when the
+ * credential came from our own login. It decides whether the shared-refresh-token
+ * warning applies — a login has its own grant and shares nothing.
+ */
+async function upsertCodexAccount(config, name, creds, fromPath) {
+  if (!name) name = creds.email || `codex-${creds.accountId.slice(0, 8)}`;
+
+  const account = {
+    name,
+    type: 'oauth',
+    protocol: 'codex',
+    source: fromPath ? 'import --codex' : 'login --codex',
+    accountId: creds.accountId,
+    // Display-only, refreshed on each import. Not read from the live token
+    // because the id_token isn't persisted.
+    planType: creds.planType || null,
+    accessToken: creds.accessToken,
+    refreshToken: creds.refreshToken,
+    expiresAt: creds.expiresAt,
+  };
+
+  // Match only within the codex protocol. The name fallback used to be
+  // unscoped, copied from the Anthropic upsert where every account is the same
+  // protocol — here it meant a codex login whose email happened to equal an
+  // existing Claude account's name silently merged codex fields over that
+  // account and destroyed its credential. One person's Claude and ChatGPT
+  // accounts routinely share an email, so this was the common case, not an edge.
+  let idx = config.accounts.findIndex(a => a.protocol === 'codex' && a.accountId === creds.accountId);
+  if (idx < 0) idx = config.accounts.findIndex(a => a.protocol === 'codex' && a.name === name);
+
+  // The default name is derived from the email, so it can collide with an
+  // account of another protocol. Names are the user-facing key for
+  // remove/priority/TC_ACCT, so they have to stay unique — disambiguate rather
+  // than let two entries answer to the same name.
+  if (idx < 0 && config.accounts.some(a => a.name === name)) {
+    name = `${name} (codex)`;
+    account.name = name;
+  }
+
+  if (idx >= 0) {
+    const prev = config.accounts[idx];
+    config.accounts[idx] = { ...prev, ...account, name: prev.name };
+    console.log(`Updated codex account "${prev.name}"`);
+  } else {
+    config.accounts.push(account);
+    console.log(`Added codex account "${account.name}"${creds.planType ? ` (ChatGPT ${creds.planType})` : ''}`);
+  }
+
+  await saveConfig(config);
+  console.log(`Saved to ${getConfigPath()}`);
+
+  // An IMPORT copies the Codex CLI's credential, so both hold one refresh token.
+  // OpenAI rotates it on every refresh, meaning whichever party refreshes second
+  // is left with a dead one. Say so plainly here — otherwise the failure surfaces
+  // much later as a baffling re-login prompt — and point at the flow that avoids
+  // it entirely. A login has its own grant and shares nothing, so it says nothing.
+  if (fromPath) {
+    console.log('');
+    console.log(`Note: ${fromPath} holds the same refresh token. OpenAI rotates it on each`);
+    console.log('refresh, so running the Codex CLI and TeamClaude side by side can invalidate');
+    console.log('one of them. Re-run this import after a `codex login` to resync, or use');
+    console.log('`teamclaude login --codex` to get an independent credential instead.');
+  }
+
+  await notifyRunningServer(config);
+}
+
 // ── login ───────────────────────────────────────────────────
 
 async function loginCommand() {
+  if (args.includes('--codex')) {
+    await loginCodexCommand();
+    return;
+  }
   if (args.includes('--api')) {
     await loginApiCommand();
     return;
@@ -816,10 +947,12 @@ async function accountsCommand() {
     if (a.type !== 'oauth' || !a.refreshToken) return;
     if (!isTokenExpiringSoon(a.expiresAt)) return;
     try {
-      const newTokens = await refreshAccessToken(a.refreshToken);
+      const refresh = a.protocol === 'codex' ? refreshCodexToken : refreshAccessToken;
+      const newTokens = await refresh(a.refreshToken);
       a.accessToken = newTokens.accessToken;
       a.refreshToken = newTokens.refreshToken;
       a.expiresAt = newTokens.expiresAt;
+      if (newTokens.accountId) a.accountId = newTokens.accountId;
       configDirty = true;
     } catch {
       // refresh failed — fetchProfile will report the specific error
@@ -827,10 +960,12 @@ async function accountsCommand() {
   }));
   if (configDirty) await saveConfig(config);
 
-  // Fetch profiles in parallel for all OAuth accounts
+  // Fetch profiles in parallel for all OAuth accounts. Codex accounts are
+  // skipped: fetchProfile talks to Anthropic's OAuth profile endpoint, which
+  // rejects a ChatGPT token and would render every codex account as a 401.
   const profiles = await Promise.all(
     config.accounts.map(a =>
-      a.type === 'oauth' && a.accessToken ? fetchProfile(a.accessToken) : null
+      a.type === 'oauth' && a.accessToken && a.protocol !== 'codex' ? fetchProfile(a.accessToken) : null
     )
   );
 
@@ -884,6 +1019,15 @@ async function accountsCommand() {
 
     if (a.type === 'apikey') {
       console.log(`  [${i + 1}] ${a.name} (apikey)  ${a.apiKey?.slice(0, 15)}...`);
+      continue;
+    }
+
+    if (a.protocol === 'codex') {
+      // No Anthropic profile for these; describe them from what import recorded.
+      const label = a.planType ? `ChatGPT ${a.planType}` : 'ChatGPT Codex';
+      const src = a.source ? `, ${a.source}` : '';
+      console.log(`  [${i + 1}] ${a.name} (${label}${src})`);
+      if (a.accountId) console.log(`       ID:    ${a.accountId}`);
       continue;
     }
 
@@ -1292,6 +1436,10 @@ Usage: teamclaude [command] [options]
 Commands:
   server              Start the proxy server (default; --headless to skip the TUI)
   import              Import credentials from Claude Code
+  import --codex      Import ChatGPT Codex credentials (~/.codex/auth.json).
+                      Shares a refresh token with the Codex CLI — prefer
+                      'login --codex' unless you need the existing credential
+  login --codex       Sign in to ChatGPT for an independent Codex credential
   login               OAuth login via browser
   login --api         Add an API key account
   env [--no-mitm]     Print export lines to point Claude Code at the proxy, for
@@ -1329,7 +1477,8 @@ Commands:
 Options:
   --name NAME         Set account name (import/login)
   --org NAME|UUID     Disambiguate when an email spans multiple orgs (remove/priority/api)
-  --from PATH         Credentials path (import, default: ~/.claude/.credentials.json)
+  --from PATH         Credentials path (import, default: ~/.claude/.credentials.json;
+                      with --codex, default: ~/.codex/auth.json)
   --json JSON         Import from inline JSON (import), e.g.:
                       --json '{"accessToken":"...","refreshToken":"...","expiresAt":1234}'
   --log-to DIR        Log full requests/responses to DIR (server, one file per request)

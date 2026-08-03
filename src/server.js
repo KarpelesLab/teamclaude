@@ -12,6 +12,11 @@ import { TopLevelFieldFinder, modelGlobMatches } from './model.js';
 import { BodyWriter } from './request-log.js';
 import { upstreamFetch } from './upstream-fetch.js';
 import { tunnelTls } from './sx.js';
+import { isCodexAccount, codexHeaders, codexUrlForPath, isStreamingRequest, codexPromptCacheKey, SESSION_HEADER, AGENT_HEADER, CODEX_BASE_URL } from './codex/protocol.js';
+import { claudeRequestToCodex, applyCodexEffortSupport } from './codex/request-translate.js';
+import { createCodexStreamTranslator, aggregateAnthropicStream } from './codex/response-translate.js';
+import { CODEX_HEADER_PREFIX, isCodexQuotaExhausted, codexResetAfterSeconds } from './codex/quota.js';
+import { fetchCodexModels, cloakModelId, uncloakModelId } from './codex/models.js';
 
 
 export const HOP_BY_HOP_HEADERS = new Set([
@@ -81,6 +86,23 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
       // manage (the Anthropic upstream, which is HTTPS-only and never arrives
       // this way); forward anything else transparently instead of hijacking it.
       if (/^https?:\/\//i.test(req.url || '')) { relayHttpForward(req, res); return; }
+
+      // Model discovery. Claude Code reads /v1/models from the gateway at
+      // startup when CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY is set and
+      // offers whatever comes back in its picker, so serving the Codex catalog
+      // here makes a GPT model a first-class choice instead of something that
+      // has to be disguised as a Claude model via modelMap.
+      //
+      // Only intercepted when a codex account is present: otherwise there is
+      // nothing to add and the request should reach Anthropic untouched.
+      if (req.method === 'GET' && (req.url || '').split('?')[0] === '/v1/models'
+          && accountManager.accounts.some(a => a.protocol === 'codex' && !a.disabled)) {
+        await handleModelsRequest(req, res, accountManager, upstream, sx, {
+          includeAnthropic: config?.modelDiscovery?.includeAnthropic === true,
+          blockedModels: config?.blockedModels || [],
+        });
+        return;
+      }
 
       // Status endpoint
       if (req.method === 'GET' && req.url === '/teamclaude/status') {
@@ -336,9 +358,20 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
           if (found && !hideActivity) hooks.onRequestModel?.(reqId, { model: found });
         }
       }
-      const body = Buffer.concat(bodyChunks);
+      let body = Buffer.concat(bodyChunks);
 
-      const model = modelFinder.done ? modelFinder.value : parseRequestModel(body);
+      let model = modelFinder.done ? modelFinder.value : parseRequestModel(body);
+      // A model picked from the discovery listing comes back cloaked (Claude
+      // Code only accepts claude-prefixed ids there). Decode it here, before
+      // anything else reads the model: blocklists, routing, quota buckets and
+      // the activity log should all see the real name, and upstream must
+      // receive it rather than an id no backend knows.
+      const realModel = uncloakModelId(model);
+      if (realModel !== model) {
+        body = rewriteModel(body, { [model]: realModel });
+        model = realModel;
+        if (!hideActivity) hooks.onRequestModel?.(reqId, { model });
+      }
       // An advisor request (Claude Code's advisor tool) carries a SECOND model
       // nested in tools[]; the advisor sub-inference runs on the selected
       // account, so selection must be eligible for it too (issue #98).
@@ -375,7 +408,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         }
       } finally {
         accountManager.endSession(sessionId);
-        if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, sessionId, pinned: ctx.pinnedIndex != null });
+        if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, upstreamModel: ctx.upstreamModel, sessionId, pinned: ctx.pinnedIndex != null });
       }
     } catch (err) {
       console.error('[TeamClaude] Unhandled error:', err);
@@ -659,7 +692,22 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   ctx.account = account.name;
   // Pin this session to the serving account (for affinity) and keep it "active"
   // in the running-sessions readout. Passive when distribution is off.
-  accountManager.recordSession(ctx.sessionId, account.index);
+  //
+  // Also record what will actually answer. The client only ever knows the model
+  // it asked for, so once modelMap redirects a request to another provider this
+  // is the sole record of which model really ran — which is what a status line
+  // needs to show "you asked for opus, this came from gpt".
+  const requestedModel = ctx.model || null;
+  const upstreamModel = (requestedModel && account.modelMap?.[requestedModel]) || requestedModel;
+  // Surfaced in the activity log so a glance shows which model actually ran.
+  ctx.upstreamModel = upstreamModel !== requestedModel ? upstreamModel : null;
+  accountManager.recordSession(ctx.sessionId, account.index, requestedModel ? {
+    account: account.name,
+    protocol: account.protocol || 'anthropic',
+    requestedModel,
+    upstreamModel,
+    translated: upstreamModel !== requestedModel,
+  } : null);
   hooks.onRequestRouted?.(reqId, { account: account.name });
 
   // Refresh OAuth token if needed
@@ -670,28 +718,76 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   }
 
   // Build upstream request headers
+  const isCodex = isCodexAccount(account);
   const isOAuth = account.type === 'oauth';
-  const headers = {};
-  for (const [key, value] of Object.entries(req.headers)) {
-    const lk = key.toLowerCase();
-    // HTTP/2 pseudo-headers (:method, :path, :authority, :scheme) live in
-    // req.headers on the h2 server path; fetch rejects `:`-prefixed names.
-    if (lk.startsWith(':')) continue;
-    if (HOP_BY_HOP_HEADERS.has(lk)) continue;
-    if (lk === 'x-api-key') continue;
-    // Strip accept-encoding: Node fetch auto-decompresses, which would
-    // mismatch the Content-Encoding header we forward to the client
-    if (lk === 'accept-encoding') continue;
-    headers[key] = value;
-  }
+  // The codex request translator always asks for a stream (the Responses API is
+  // streaming-first here), so what the CLIENT asked for is tracked separately
+  // and the response is folded back into a Messages object when it wanted one.
+  const clientWantsStream = isStreamingRequest(body);
+  let headers = {};
+  let upstreamUrl;
+  let codexCacheKey = null;
 
-  if (isOAuth) {
-    headers['authorization'] = `Bearer ${account.credential}`;
+  if (isCodex) {
+    // Codex accounts speak the OpenAI Responses API. Headers are built from
+    // scratch rather than forwarded: the inbound set is Anthropic-specific and
+    // the backend expects the Codex CLI's identity (see codexHeaders).
+    upstreamUrl = codexUrlForPath(req.url, account.upstream || CODEX_BASE_URL);
+    if (!upstreamUrl) {
+      // Only /v1/messages has a Responses-API equivalent. Claude Code also calls
+      // a set of Anthropic-only endpoints (bootstrap, oauth/usage, mcp_servers,
+      // count_tokens); a codex account cannot answer those, so hand the request
+      // to an account that can rather than failing it. Answering 404 here broke
+      // those features outright whenever rotation happened to land on codex.
+      //
+      // Only retry when some non-codex account could actually take it. Retrying
+      // regardless would exhaust the rotation and surface as a 429 — "rate
+      // limited", which is the wrong diagnosis for "no account speaks this API".
+      const hasAnthropicAccount = accountManager.accounts.some(
+        a => a.protocol !== 'codex' && !a.disabled && a.status !== 'error');
+      if (hasAnthropicAccount && retryCount < maxRetries) {
+        ctx.tried.add(account.index);
+        if (res.destroyed) return;
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+      }
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        type: 'error',
+        error: { type: 'not_found_error', message: `No codex equivalent for ${req.url}` },
+      }));
+      return;
+    }
+    // One derived key scopes the prompt cache for this conversation. It must be
+    // stable across turns or nothing is cached — see codexPromptCacheKey.
+    codexCacheKey = codexPromptCacheKey(account, {
+      sessionId: req.headers[SESSION_HEADER] || null,
+      agentId: req.headers[AGENT_HEADER] || null,
+      model: ctx.model || null,
+    });
+    headers = codexHeaders(account, { stream: true, cacheKey: codexCacheKey });
   } else {
-    headers['x-api-key'] = account.credential;
+    for (const [key, value] of Object.entries(req.headers)) {
+      const lk = key.toLowerCase();
+      // HTTP/2 pseudo-headers (:method, :path, :authority, :scheme) live in
+      // req.headers on the h2 server path; fetch rejects `:`-prefixed names.
+      if (lk.startsWith(':')) continue;
+      if (HOP_BY_HOP_HEADERS.has(lk)) continue;
+      if (lk === 'x-api-key') continue;
+      // Strip accept-encoding: Node fetch auto-decompresses, which would
+      // mismatch the Content-Encoding header we forward to the client
+      if (lk === 'accept-encoding') continue;
+      headers[key] = value;
+    }
+
+    if (isOAuth) {
+      headers['authorization'] = `Bearer ${account.credential}`;
+    } else {
+      headers['x-api-key'] = account.credential;
+    }
+
+    upstreamUrl = `${account.upstream || upstream}${req.url}`;
   }
 
-  const upstreamUrl = `${account.upstream || upstream}${req.url}`;
   const method = req.method;
 
   // Strip orphaned tool_use / tool_result blocks so a client that compacted or
@@ -705,8 +801,32 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // Rewrite the model name for accounts that target a different upstream (e.g.
   // GLM), which uses different model identifiers than Anthropic.
   if (account.modelMap) sendBody = rewriteModel(sendBody, account.modelMap);
-  // If the body changed length (sanitize or model rewrite), update Content-Length
-  // so the upstream doesn't receive a mismatched framing and truncate or stall.
+
+  // Codex accounts need the body converted to the Responses API, not just
+  // relabelled. Done after the model rewrite so modelMap still selects which
+  // upstream model the translated request names.
+  let codexRequest = null;
+  if (isCodex) {
+    try {
+      codexRequest = JSON.parse(sendBody.toString('utf-8'));
+      // Clamp after translating: the translator mirrors CLIProxyAPI exactly,
+      // and this is the equivalent of the clamping it does in a later stage.
+      sendBody = applyCodexEffortSupport(
+        claudeRequestToCodex(codexRequest, codexRequest.model, { promptCacheKey: codexCacheKey }));
+    } catch (err) {
+      console.error(`[TeamClaude] Codex request translation failed (account "${account.name}"): ${err.message}`);
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        type: 'error',
+        error: { type: 'invalid_request_error', message: `codex translation failed: ${err.message}` },
+      }));
+      return;
+    }
+  }
+
+  // If the body changed length (sanitize, model rewrite or codex translation),
+  // update Content-Length so the upstream doesn't receive a mismatched framing
+  // and truncate or stall.
   if (sendBody !== body) headers['content-length'] = String(sendBody.length);
 
   // Streaming request log, opened lazily on the first terminal outcome (a
@@ -745,10 +865,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       accountManager.release(account.index);
     }
 
-    // Extract rate limit headers
+    // Extract rate limit headers. Each protocol reports quota in its own header
+    // family; updateQuota normalizes both onto the same fields.
+    const quotaPrefix = isCodex ? CODEX_HEADER_PREFIX : 'anthropic-ratelimit-';
     const rateLimitHeaders = {};
     for (const [key, value] of upstreamRes.headers.entries()) {
-      if (key.startsWith('anthropic-ratelimit-')) {
+      if (key.startsWith(quotaPrefix)) {
         rateLimitHeaders[key] = value;
       }
     }
@@ -777,9 +899,25 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // account is futile — switch to another account now (updateQuota above
       // already recorded the spent bucket's utilization from the headers).
       const rl = rateLimitHeaders;
-      const generalRejected = rl['anthropic-ratelimit-unified-5h-status'] === 'rejected'
+      // Codex reports no per-bucket status, so a spent bucket has to be inferred
+      // from its utilization instead. Without this a codex 429 would read as a
+      // transient throttle and the proxy would keep retrying an account whose
+      // weekly limit is gone until its reset — for a 7-day window, that is a
+      // very long time to be stuck.
+      const codexExhausted = isCodex && isCodexQuotaExhausted(rl);
+      const generalRejected = codexExhausted
+        || rl['anthropic-ratelimit-unified-5h-status'] === 'rejected'
         || rl['anthropic-ratelimit-unified-7d-status'] === 'rejected';
       const fableRejected = rl['anthropic-ratelimit-unified-7d_oi-status'] === 'rejected' && !generalRejected;
+      if (codexExhausted) {
+        // Prefer the bucket's own reset over Retry-After. The hold below is
+        // still capped at an hour, so this does not keep a week-long exhaustion
+        // held for a week — the recorded utilization is what actually bars the
+        // account (selection skips anything past the switch threshold until the
+        // reset clears it). This just stops the hold being shorter than needed.
+        const resetIn = codexResetAfterSeconds(rl);
+        if (resetIn !== null) retryAfter = resetIn;
+      }
       if ((generalRejected || fableRejected) && retryCount < maxRetries) {
         // A Fable-only rejection leaves the account fine for other models, so we
         // do NOT throttle it globally — the recorded Fable utilization makes
@@ -887,6 +1025,22 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       responseHeaders[key] = value;
     }
 
+    // Codex answers with SSE only when the request succeeded; an error comes
+    // back as a plain JSON body with its own content-type. Scoping this to 200
+    // matters: forcing the streaming path on an error fed the error body to the
+    // SSE translator, which found no events in it and emitted nothing, so the
+    // client saw a bare "400 (no body)" and the actual message — the reason the
+    // request failed — was destroyed.
+    const codexStreaming = isCodex && upstreamRes.status === 200;
+
+    // Codex sends no content-type of its own on success, so set the one that
+    // matches what this proxy is about to emit: SSE when the client asked to
+    // stream, JSON when the frames are folded into a Messages object. On an
+    // error the upstream content-type is already correct and is left alone.
+    if (codexStreaming) {
+      responseHeaders['content-type'] = clientWantsStream ? 'text/event-stream' : 'application/json';
+    }
+
     res.writeHead(upstreamRes.status, responseHeaders);
 
     if (!upstreamRes.body) {
@@ -897,14 +1051,25 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     }
 
     const contentType = upstreamRes.headers.get('content-type') || '';
-    const isStreaming = contentType.includes('text/event-stream');
+    // Codex sends its SSE responses with no content-type header at all, so the
+    // upstream header cannot decide this for a successful codex response. Errors
+    // do carry a content-type and must NOT take the streaming path (see above).
+    const isStreaming = codexStreaming || contentType.includes('text/event-stream');
 
     if (isStreaming) {
       // Stream each chunk straight to the log as it is relayed — never hold the
       // whole (potentially ~1M-token) SSE body in memory.
       const l = getLog();
       const bw = l ? l.bodyWriter('RESPONSE BODY (streamed)', contentType) : null;
-      await streamResponse(upstreamRes.body, res, account.index, accountManager, bw);
+      // Codex answers in the Responses API's SSE dialect; translate it back to
+      // Anthropic events on the way through. Usage accounting reads the
+      // translated frames, so quota tracking works unchanged.
+      const translator = codexStreaming ? createCodexStreamTranslator(codexRequest) : null;
+      if (translator && !clientWantsStream) {
+        await collectTranslatedResponse(upstreamRes.body, res, account.index, accountManager, bw, translator);
+      } else {
+        await streamResponse(upstreamRes.body, res, account.index, accountManager, bw, translator);
+      }
       l?.end();
     } else {
       const buf = Buffer.from(await upstreamRes.arrayBuffer());
@@ -1007,7 +1172,20 @@ export function readWithIdleTimeout(reader, ms) {
 /**
  * Stream an SSE response to the client, parsing usage data along the way.
  */
-async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter) {
+/**
+ * Feed one complete upstream SSE event through a codex translator, returning the
+ * Anthropic frames to forward. Codex frames carry an `event:` line alongside the
+ * `data:` line; the translator only reads the latter.
+ */
+function translateSSEEvent(event, translator) {
+  const out = [];
+  for (const line of event.split('\n')) {
+    if (line.startsWith('data:')) out.push(...translator.push(line));
+  }
+  return out;
+}
+
+async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter, translator = null) {
   const reader = webStream.getReader();
   const idleMs = resolveBodyIdleTimeout();
   const decoder = new TextDecoder();
@@ -1022,10 +1200,14 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
       // Client disconnected — stop reading from upstream
       if (res.destroyed) break;
 
-      // Forward chunk immediately
-      const ok = res.write(value);
+      // Without a translator the chunk is relayed verbatim and immediately. A
+      // codex stream cannot be: an event has to arrive whole before it can be
+      // translated, so forwarding is driven by the parsed events below.
+      let ok = true;
+      if (!translator) ok = res.write(value);
 
-      // Append to the log as it streams (no whole-body buffering)
+      // Append to the log as it streams (no whole-body buffering). This records
+      // the raw upstream body, which is what a translation bug is diagnosed from.
       if (bodyWriter) bodyWriter.chunk(Buffer.from(value));
 
       const text = decoder.decode(value, { stream: true });
@@ -1036,7 +1218,17 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
       sseBuffer = events.pop(); // keep incomplete event
 
       for (const event of events) {
-        parseSSEUsage(event, accountIndex, accountManager);
+        if (translator) {
+          const frames = translateSSEEvent(event, translator);
+          for (const frame of frames) {
+            ok = res.write(frame);
+            // Usage is read off the translated frames, so quota accounting works
+            // the same for both protocols.
+            parseSSEUsage(frame, accountIndex, accountManager);
+          }
+        } else {
+          parseSSEUsage(event, accountIndex, accountManager);
+        }
       }
 
       // Handle backpressure — also bail out if client disconnects,
@@ -1056,7 +1248,19 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
 
     // Parse any remaining buffer
     if (sseBuffer.trim()) {
-      parseSSEUsage(sseBuffer, accountIndex, accountManager);
+      if (translator) {
+        for (const frame of translateSSEEvent(sseBuffer, translator)) {
+          res.write(frame);
+          parseSSEUsage(frame, accountIndex, accountManager);
+        }
+      } else {
+        parseSSEUsage(sseBuffer, accountIndex, accountManager);
+      }
+    }
+    // Close any block the upstream left open, so a stream that ends without a
+    // terminal event doesn't leave the client waiting on an unfinished block.
+    if (translator && !res.destroyed) {
+      for (const frame of translator.end()) res.write(frame);
     }
   } catch (err) {
     // A mid-stream idle timeout (or any read error) means the upstream went
@@ -1072,6 +1276,130 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
     reader.cancel().catch(() => {});
     if (!errored && !res.writableEnded) res.end();
   }
+}
+
+/**
+ * Consume a codex SSE stream, translate it, and answer with a single Messages
+ * response. Used when the client asked for a non-streaming reply — the codex
+ * request is sent as a stream regardless, so the events are folded back into
+ * the object the client expected.
+ */
+async function collectTranslatedResponse(webStream, res, accountIndex, accountManager, bodyWriter, translator) {
+  const reader = webStream.getReader();
+  const idleMs = resolveBodyIdleTimeout();
+  const decoder = new TextDecoder();
+  let sseBuffer = '';
+  const frames = [];
+  let errored = false;
+
+  try {
+    while (true) {
+      const { done, value } = await readWithIdleTimeout(reader, idleMs);
+      if (done) break;
+      if (res.destroyed) break;
+
+      if (bodyWriter) bodyWriter.chunk(Buffer.from(value));
+      sseBuffer += decoder.decode(value, { stream: true });
+      const events = sseBuffer.split('\n\n');
+      sseBuffer = events.pop();
+
+      for (const event of events) {
+        for (const frame of translateSSEEvent(event, translator)) {
+          frames.push(frame);
+          parseSSEUsage(frame, accountIndex, accountManager);
+        }
+      }
+    }
+
+    if (sseBuffer.trim()) {
+      for (const frame of translateSSEEvent(sseBuffer, translator)) {
+        frames.push(frame);
+        parseSSEUsage(frame, accountIndex, accountManager);
+      }
+    }
+    frames.push(...translator.end());
+  } catch (err) {
+    errored = true;
+    throw err;
+  } finally {
+    reader.cancel().catch(() => {});
+    if (!errored && !res.writableEnded) {
+      res.end(JSON.stringify(aggregateAnthropicStream(frames)));
+    }
+  }
+}
+
+/**
+ * Serve /v1/models as the union of Anthropic's catalog and every codex
+ * account's.
+ *
+ * The Anthropic half is fetched with a real Claude account's credential rather
+ * than synthesised, so the list stays correct as models come and go. If that
+ * fetch fails — no Claude account, expired token — the codex models are still
+ * returned: a picker missing its Claude entries is a visible, recoverable
+ * problem, whereas failing the whole request leaves the client with no models
+ * at all and no explanation.
+ */
+async function handleModelsRequest(req, res, accountManager, upstream, sx, { includeAnthropic = false, blockedModels = [] } = {}) {
+  const anthropicAccount = includeAnthropic && accountManager.accounts.find(
+    a => a.protocol !== 'codex' && !a.disabled && a.status !== 'error' && a.credential);
+
+  let anthropicModels = [];
+  if (anthropicAccount) {
+    try {
+      await accountManager.ensureTokenFresh(anthropicAccount.index);
+      const headers = { 'anthropic-version': req.headers['anthropic-version'] || '2023-06-01', accept: 'application/json' };
+      if (anthropicAccount.type === 'oauth') headers.authorization = `Bearer ${anthropicAccount.credential}`;
+      else headers['x-api-key'] = anthropicAccount.credential;
+
+      const res2 = await upstreamFetch(`${anthropicAccount.upstream || upstream}${req.url}`, {
+        method: 'GET', headers, signal: AbortSignal.timeout(10_000),
+      }, sx);
+      // upstreamFetch returns a shim, not a WHATWG Response: it exposes
+      // status/headers/text() but no `ok` and no `json()`. Treating it like a
+      // real Response silently dropped every Claude model from this listing.
+      if (res2.status >= 200 && res2.status < 300) {
+        const body = JSON.parse(await res2.text());
+        if (Array.isArray(body?.data)) anthropicModels = body.data;
+      } else {
+        await res2.body?.cancel?.();
+      }
+    } catch { /* fall through with codex models only */ }
+  }
+
+  const codexAccounts = accountManager.accounts.filter(a => a.protocol === 'codex' && !a.disabled);
+  const catalogs = await Promise.all(codexAccounts.map(a => fetchCodexModels(a)));
+
+  // Two accounts on the same plan report the same catalog; list each model once.
+  const seen = new Set(anthropicModels.map(m => m.id));
+  const codexModels = [];
+  for (const model of catalogs.flat()) {
+    if (seen.has(model.id)) continue;
+    seen.add(model.id);
+    codexModels.push(model);
+  }
+
+  // Don't advertise a model this proxy would refuse to serve: blockedModels
+  // already rejects such a request with a 400, so listing it would put a choice
+  // in the picker that fails the moment it is used. Matched on the real id,
+  // before cloaking, so a pattern reads the way a user wrote it.
+  const listed = [...anthropicModels, ...codexModels].filter(
+    m => !blockedModels.some(p => modelGlobMatches(p, m.id)));
+
+  // Claude Code discards any listed model whose id does not begin with
+  // `claude-`, so a GPT id offered as-is never reaches its picker. Encode it
+  // into a claude-prefixed one; the request path decodes it back before routing.
+  const data = listed.map(m => (
+    m.id === cloakModelId(m.id) ? m : { ...m, id: cloakModelId(m.id) }
+  ));
+
+  res.writeHead(200, { 'content-type': 'application/json' });
+  res.end(JSON.stringify({
+    data,
+    has_more: false,
+    first_id: data[0]?.id ?? null,
+    last_id: data[data.length - 1]?.id ?? null,
+  }));
 }
 
 function parseSSEUsage(event, accountIndex, accountManager) {

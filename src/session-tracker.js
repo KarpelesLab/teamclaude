@@ -29,12 +29,16 @@ export class SessionTracker {
   // lastSeen (keeping the session "active"/"known") and, when an account is
   // given, (re)pins the session to it. Throttled sweep keeps the map bounded
   // even in a headless server that never renders status.
-  touch(sessionId, accountIndex = null, now = this._now()) {
+  touch(sessionId, accountIndex = null, now = this._now(), served = null) {
     if (!sessionId) return null;
     const s = this._ensure(sessionId, now);
     s.lastSeen = now;
     s.count += 1;
     if (accountIndex != null) s.accountIndex = accountIndex;
+    // What actually answered this session's last request. The client only knows
+    // the model it asked for, so when a request is translated to another
+    // provider this is the only record of which model really ran.
+    if (served) s.served = served;
     if (now - this._lastSweep > SWEEP_INTERVAL_MS) this.sweep(now);
     return s;
   }
@@ -117,17 +121,21 @@ export class SessionTracker {
     let known = 0;
     let active = 0;
     const perAccount = {};
+    // Keyed by session id so a caller holding one (a status line, say) can ask
+    // what served ITS session rather than guessing from fleet-wide state.
+    const byId = {};
     for (const [id, s] of this.sessions) {
       if (this._isExpired(s, now)) {
         this.sessions.delete(id);
         continue;
       }
       known += 1;
+      if (s.served) byId[id] = { ...s.served, accountIndex: s.accountIndex ?? null };
       if (this._isActive(s, now)) {
         active += 1;
         if (s.accountIndex != null) perAccount[s.accountIndex] = (perAccount[s.accountIndex] || 0) + 1;
       }
     }
-    return { known, active, perAccount };
+    return { known, active, perAccount, byId };
   }
 }
