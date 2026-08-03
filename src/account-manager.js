@@ -1,6 +1,7 @@
 import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired } from './oauth.js';
 import { refreshCodexToken } from './codex/oauth.js';
 import { parseCodexQuota } from './codex/quota.js';
+import { isCodexNativeModel } from './codex/models.js';
 import { sameIdentity } from './identity.js';
 import { weeklyBucketForModel, modelGlobMatches } from './model.js';
 import { SessionTracker } from './session-tracker.js';
@@ -571,6 +572,12 @@ export class AccountManager {
     // that family — the account still serves every other model normally.
     if (this._isNearQuota(account, model)) return false;
 
+    // Protocol capability: an account can only be picked for a model its
+    // backend actually serves. Without this a request naming a GPT model could
+    // land on a Claude account (and vice versa) and fail upstream, which is how
+    // a codex account with no modelMap used to 400 on every claude-* request.
+    if (model && !this._protocolServesModel(account, model)) return false;
+
     // Route/ownership restriction: a configured route can pin a model pattern to
     // an exclusive set of accounts; failing that, a per-account `models` claim
     // restricts an owned model to its owners. Either way an account not eligible
@@ -629,6 +636,20 @@ export class AccountManager {
    * list is exclusive (only listed accounts, by name or index). With no matching
    * route — or a route that lists no accounts — it falls back to the per-account
    * `models` ownership claim (deprecated — use `routes` instead). */
+  /**
+   * Can this account's backend serve `model` at all?
+   *
+   * A codex account serves models Codex knows natively, plus anything its
+   * modelMap redirects onto one. An Anthropic account serves everything else —
+   * it has no way to answer a GPT model name, so it must not be selected for one
+   * even when it is the only account left.
+   */
+  _protocolServesModel(account, model) {
+    const native = isCodexNativeModel(model);
+    if (account.protocol === 'codex') return native || !!account.modelMap?.[model];
+    return !native;
+  }
+
   _routeAllows(account, model) {
     const route = this._routeForModel(model);
     if (route && route.accounts.length) {

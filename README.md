@@ -23,7 +23,7 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 - **Headless mode** — run the proxy without the TUI (`--headless`) for backgrounding/services
 - **Org-aware accounts** — one email can hold multiple accounts across different organizations (e.g. corp + personal); dedup is keyed on account + org, and names disambiguate as `email (Org)`
 - **Third-party backend accounts** — route requests to any Anthropic-compatible API (e.g. DeepSeek, GLM) as a fallback when Claude accounts are exhausted; a per-account `upstream` URL and `modelMap` translate model names transparently. Use [model routes](#model-routes) to reserve a third-party account for sessions that explicitly name its models
-- **ChatGPT Codex accounts** — use a ChatGPT subscription as a backend alongside Claude accounts (`teamclaude login --codex`). Unlike the Anthropic-compatible backends above, Codex speaks the OpenAI Responses API, so requests and streamed responses are translated in both directions; quota is read from its own `x-codex-*` headers so rotation stays predictive. See [ChatGPT Codex](#chatgpt-codex)
+- **ChatGPT Codex accounts** — use a ChatGPT subscription as a backend alongside Claude accounts (`teamclaude login --codex`), with its models offered directly in Claude Code's picker via gateway model discovery. Unlike the Anthropic-compatible backends above, Codex speaks the OpenAI Responses API, so requests and streamed responses are translated in both directions; quota is read from its own `x-codex-*` headers so rotation stays predictive. See [ChatGPT Codex](#chatgpt-codex)
 - **Model blocklist** — reject requests for unwanted models (glob patterns, e.g. `*fable*`) with a fast `400` instead of forwarding them; a model no account can serve otherwise gets rate-limited upstream and hangs the pipeline. Edit live in the TUI settings screen (`g` → Blocked models)
 - **Rotation priority** — pin a preferred account order with `teamclaude priority`
 - **Enable/disable accounts** — temporarily pause an account without removing it (`teamclaude disable`/`enable`, or `d` in the TUI); re-enabling also clears a stuck error state
@@ -121,8 +121,17 @@ independent of the Codex CLI's. Prefer it over importing:
 teamclaude import --codex
 ```
 
-Codex accounts need a `modelMap`, since the backend rejects Claude model
-names, and usually a high `priority` so they act as a fallback:
+Codex models are offered directly in Claude Code's own model picker. Set
+`CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` and Claude Code reads
+`/v1/models` from the proxy at startup; TeamClaude answers with the Claude
+catalog **and** every codex account's, so selecting `gpt-5.6-sol` is a
+first-class choice. Requests naming a Codex model route to a codex account
+automatically — no `modelMap` needed, and a Claude account is never picked for
+one (or vice versa).
+
+A `modelMap` is only needed for the other direction: making a codex account
+answer to Claude model names, so it can stand in as a fallback when Claude
+quota runs out. Pair it with a high `priority` so it stays a fallback:
 
 ```json
 {
@@ -138,14 +147,16 @@ names, and usually a high `priority` so they act as a fallback:
 }
 ```
 
-The Codex models available to a ChatGPT plan, roughly strongest first — all
-three verified against the live backend:
+The catalog is read live from Codex, so it stays current as models come and
+go. On a ChatGPT Plus plan today, all verified end to end:
 
 | Model | Description | Default effort |
 |---|---|---|
 | `gpt-5.6-sol` | Latest frontier agentic coding model | `low` |
 | `gpt-5.6-terra` | Balanced agentic coding model for everyday work | `medium` |
 | `gpt-5.6-luna` | Fast and affordable agentic coding model | `medium` |
+| `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini` | Previous generations | `medium` |
+| `codex-auto-review` | Review-oriented alias | `medium` |
 
 `modelMap` matches the model string exactly, so include every id your client
 sends — Claude Code may append a `[1m]` context suffix.

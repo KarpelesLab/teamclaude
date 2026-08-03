@@ -16,6 +16,7 @@ import { isCodexAccount, codexHeaders, codexUrlForPath, isStreamingRequest, CODE
 import { claudeRequestToCodex, applyCodexEffortSupport } from './codex/request-translate.js';
 import { createCodexStreamTranslator, aggregateAnthropicStream } from './codex/response-translate.js';
 import { CODEX_HEADER_PREFIX, isCodexQuotaExhausted, codexResetAfterSeconds } from './codex/quota.js';
+import { fetchCodexModels } from './codex/models.js';
 
 
 export const HOP_BY_HOP_HEADERS = new Set([
@@ -85,6 +86,20 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
       // manage (the Anthropic upstream, which is HTTPS-only and never arrives
       // this way); forward anything else transparently instead of hijacking it.
       if (/^https?:\/\//i.test(req.url || '')) { relayHttpForward(req, res); return; }
+
+      // Model discovery. Claude Code reads /v1/models from the gateway at
+      // startup when CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY is set and
+      // offers whatever comes back in its picker, so serving the Codex catalog
+      // here makes a GPT model a first-class choice instead of something that
+      // has to be disguised as a Claude model via modelMap.
+      //
+      // Only intercepted when a codex account is present: otherwise there is
+      // nothing to add and the request should reach Anthropic untouched.
+      if (req.method === 'GET' && (req.url || '').split('?')[0] === '/v1/models'
+          && accountManager.accounts.some(a => a.protocol === 'codex' && !a.disabled)) {
+        await handleModelsRequest(req, res, accountManager, upstream, sx);
+        return;
+      }
 
       // Status endpoint
       if (req.method === 'GET' && req.url === '/teamclaude/status') {
@@ -1292,6 +1307,66 @@ async function collectTranslatedResponse(webStream, res, accountIndex, accountMa
       res.end(JSON.stringify(aggregateAnthropicStream(frames)));
     }
   }
+}
+
+/**
+ * Serve /v1/models as the union of Anthropic's catalog and every codex
+ * account's.
+ *
+ * The Anthropic half is fetched with a real Claude account's credential rather
+ * than synthesised, so the list stays correct as models come and go. If that
+ * fetch fails — no Claude account, expired token — the codex models are still
+ * returned: a picker missing its Claude entries is a visible, recoverable
+ * problem, whereas failing the whole request leaves the client with no models
+ * at all and no explanation.
+ */
+async function handleModelsRequest(req, res, accountManager, upstream, sx) {
+  const anthropicAccount = accountManager.accounts.find(
+    a => a.protocol !== 'codex' && !a.disabled && a.status !== 'error' && a.credential);
+
+  let anthropicModels = [];
+  if (anthropicAccount) {
+    try {
+      await accountManager.ensureTokenFresh(anthropicAccount.index);
+      const headers = { 'anthropic-version': req.headers['anthropic-version'] || '2023-06-01', accept: 'application/json' };
+      if (anthropicAccount.type === 'oauth') headers.authorization = `Bearer ${anthropicAccount.credential}`;
+      else headers['x-api-key'] = anthropicAccount.credential;
+
+      const res2 = await upstreamFetch(`${anthropicAccount.upstream || upstream}${req.url}`, {
+        method: 'GET', headers, signal: AbortSignal.timeout(10_000),
+      }, sx);
+      // upstreamFetch returns a shim, not a WHATWG Response: it exposes
+      // status/headers/text() but no `ok` and no `json()`. Treating it like a
+      // real Response silently dropped every Claude model from this listing.
+      if (res2.status >= 200 && res2.status < 300) {
+        const body = JSON.parse(await res2.text());
+        if (Array.isArray(body?.data)) anthropicModels = body.data;
+      } else {
+        await res2.body?.cancel?.();
+      }
+    } catch { /* fall through with codex models only */ }
+  }
+
+  const codexAccounts = accountManager.accounts.filter(a => a.protocol === 'codex' && !a.disabled);
+  const catalogs = await Promise.all(codexAccounts.map(a => fetchCodexModels(a)));
+
+  // Two accounts on the same plan report the same catalog; list each model once.
+  const seen = new Set(anthropicModels.map(m => m.id));
+  const codexModels = [];
+  for (const model of catalogs.flat()) {
+    if (seen.has(model.id)) continue;
+    seen.add(model.id);
+    codexModels.push(model);
+  }
+
+  const data = [...anthropicModels, ...codexModels];
+  res.writeHead(200, { 'content-type': 'application/json' });
+  res.end(JSON.stringify({
+    data,
+    has_more: false,
+    first_id: data[0]?.id ?? null,
+    last_id: data[data.length - 1]?.id ?? null,
+  }));
 }
 
 function parseSSEUsage(event, accountIndex, accountManager) {
