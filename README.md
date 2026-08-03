@@ -144,6 +144,15 @@ Anthropic's catalog back would just duplicate every entry in the picker. Set
 `"modelDiscovery": {"includeAnthropic": true}` if a client needs the full
 list.
 
+Models in `blockedModels` are left out of the listing —
+advertising a model the proxy would reject with a `400` just puts a choice in
+the picker that fails the moment it is used. Patterns anchor at both ends, so
+trim older generations explicitly or with a wildcard:
+
+```json
+"blockedModels": ["gpt-5.4", "gpt-5.4-mini", "gpt-5.5"]
+```
+
 A `modelMap` is only needed for the other direction: making a codex account
 answer to Claude model names, so it can stand in as a fallback when Claude
 quota runs out. Pair it with a high `priority` so it stays a fallback:
@@ -437,7 +446,7 @@ When on, teamclaude routes each **new** session to the least-loaded eligible acc
 | `holdSeconds` | Maximum seconds to hold the connection when all accounts are exhausted, polling silently until one recovers (`0` = return 429 immediately, the default). `teamclaude run` raises `API_TIMEOUT_MS` automatically to match |
 | `distributeSessions` | Spread concurrent Claude Code sessions across equal-priority accounts, each session pinned to one account for cache reuse (`false` = quota-driven rotation only, the default). Session tracking/readout is always on regardless — see [Session-aware routing](#session-aware-routing-distributesessions-off-by-default) |
 | `eventLogging` | How to handle Claude Code's telemetry (`/api/event_logging/*`), which is high-volume activity-log noise: `hide` (default) forwards it but keeps it out of the activity log; `block` answers `200` locally without forwarding (no upstream round-trip); `show` forwards and displays it. Toggle live in the TUI settings screen (`g` → Event logging). |
-| `blockedModels` | Array of model glob patterns (e.g. `["*fable*"]`) whose requests are rejected with a fast, non-retryable `400` instead of being forwarded — avoids a model no account can serve getting rate-limited upstream and hanging the pipeline (issue #116). Edit live in the TUI settings screen (`g` → Blocked models). Empty (the default) blocks nothing. |
+| `blockedModels` | Array of model glob patterns (e.g. `["*fable*"]`) whose requests are rejected with a fast, non-retryable `400` instead of being forwarded — avoids a model no account can serve getting rate-limited upstream and hanging the pipeline (issue #116). Blocked models are also left out of the [`/v1/models`](#chatgpt-codex) discovery listing, so the picker never offers a model the proxy would refuse. Edit live in the TUI settings screen (`g` → Blocked models). Empty (the default) blocks nothing. |
 | `stormRamp` | Optional storm-control tuning (on by default) — see [Storm control](#storm-control-switchover-ramp-up). Object: `{ enabled, startConc, stepConc, stepMs, windowMs }` |
 | `sx.apiKey` | [sx.org](https://sx.org) API key. When set, TeamClaude auto-provisions a residential proxy (egress-IP 429 workaround). Absent/empty = off |
 | `sx.mode` | `always` (route all upstream traffic), `429` (direct, fail over to the proxy after a 429), or `off` (keep the key but don't use it). Defaults to `always` when a key is set |

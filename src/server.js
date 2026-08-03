@@ -97,7 +97,10 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
       // nothing to add and the request should reach Anthropic untouched.
       if (req.method === 'GET' && (req.url || '').split('?')[0] === '/v1/models'
           && accountManager.accounts.some(a => a.protocol === 'codex' && !a.disabled)) {
-        await handleModelsRequest(req, res, accountManager, upstream, sx, config?.modelDiscovery?.includeAnthropic === true);
+        await handleModelsRequest(req, res, accountManager, upstream, sx, {
+          includeAnthropic: config?.modelDiscovery?.includeAnthropic === true,
+          blockedModels: config?.blockedModels || [],
+        });
         return;
       }
 
@@ -1331,7 +1334,7 @@ async function collectTranslatedResponse(webStream, res, accountIndex, accountMa
  * problem, whereas failing the whole request leaves the client with no models
  * at all and no explanation.
  */
-async function handleModelsRequest(req, res, accountManager, upstream, sx, includeAnthropic = false) {
+async function handleModelsRequest(req, res, accountManager, upstream, sx, { includeAnthropic = false, blockedModels = [] } = {}) {
   const anthropicAccount = includeAnthropic && accountManager.accounts.find(
     a => a.protocol !== 'codex' && !a.disabled && a.status !== 'error' && a.credential);
 
@@ -1370,10 +1373,17 @@ async function handleModelsRequest(req, res, accountManager, upstream, sx, inclu
     codexModels.push(model);
   }
 
+  // Don't advertise a model this proxy would refuse to serve: blockedModels
+  // already rejects such a request with a 400, so listing it would put a choice
+  // in the picker that fails the moment it is used. Matched on the real id,
+  // before cloaking, so a pattern reads the way a user wrote it.
+  const listed = [...anthropicModels, ...codexModels].filter(
+    m => !blockedModels.some(p => modelGlobMatches(p, m.id)));
+
   // Claude Code discards any listed model whose id does not begin with
   // `claude-`, so a GPT id offered as-is never reaches its picker. Encode it
   // into a claude-prefixed one; the request path decodes it back before routing.
-  const data = [...anthropicModels, ...codexModels].map(m => (
+  const data = listed.map(m => (
     m.id === cloakModelId(m.id) ? m : { ...m, id: cloakModelId(m.id) }
   ));
 

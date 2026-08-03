@@ -319,3 +319,95 @@ test('a thinking suffix survives decoding', () => {
 test('a bare prefix with no payload is not treated as cloaked', () => {
   assert.equal(uncloakModelId('claude-fable-5-dd-'), 'claude-fable-5-dd-');
 });
+
+// ── blocked models are not advertised ───────────────────────
+
+test('a blocked model is left out of the listing', async () => {
+  // blockedModels already rejects such a request with a 400, so listing it
+  // would put a choice in the picker that fails the moment it is used.
+  clearCodexModelCache();
+  const upstream = await startUpstream([]);
+  const am = new AccountManager([codexAcct({ upstream: upstream.url })], 0.98);
+  await fetchCodexModels(am.accounts[0], {
+    fetchImpl: async () => ({
+      ok: true, status: 200,
+      json: async () => ({ models: [CATALOG_ENTRY, { slug: 'gpt-5.4', display_name: 'GPT-5.4' }] }),
+    }),
+  });
+
+  const proxy = createProxyServer(am, {
+    proxy: { port: 0 }, upstream: upstream.url, blockedModels: ['gpt-5.4'],
+  });
+  proxy.listen(0, '127.0.0.1');
+  await once(proxy, 'listening');
+
+  try {
+    const { body } = await getModels(proxy.address().port);
+    const ids = body.data.map(m => uncloakModelId(m.id));
+    assert.deepEqual(ids, ['gpt-5.6-sol']);
+  } finally {
+    proxy.close();
+    upstream.server.close();
+  }
+});
+
+test('a blocklist glob does not over-match a longer model name', async () => {
+  // Patterns anchor at both ends, so `gpt-5.4` must not also remove
+  // `gpt-5.4-mini` — a user blocking one generation should say so explicitly.
+  clearCodexModelCache();
+  const upstream = await startUpstream([]);
+  const am = new AccountManager([codexAcct({ upstream: upstream.url })], 0.98);
+  await fetchCodexModels(am.accounts[0], {
+    fetchImpl: async () => ({
+      ok: true, status: 200,
+      json: async () => ({ models: [
+        { slug: 'gpt-5.4', display_name: 'GPT-5.4' },
+        { slug: 'gpt-5.4-mini', display_name: 'GPT-5.4-Mini' },
+      ] }),
+    }),
+  });
+
+  const proxy = createProxyServer(am, {
+    proxy: { port: 0 }, upstream: upstream.url, blockedModels: ['gpt-5.4'],
+  });
+  proxy.listen(0, '127.0.0.1');
+  await once(proxy, 'listening');
+
+  try {
+    const { body } = await getModels(proxy.address().port);
+    assert.deepEqual(body.data.map(m => uncloakModelId(m.id)), ['gpt-5.4-mini']);
+  } finally {
+    proxy.close();
+    upstream.server.close();
+  }
+});
+
+test('a wildcard blocks a whole generation', async () => {
+  clearCodexModelCache();
+  const upstream = await startUpstream([]);
+  const am = new AccountManager([codexAcct({ upstream: upstream.url })], 0.98);
+  await fetchCodexModels(am.accounts[0], {
+    fetchImpl: async () => ({
+      ok: true, status: 200,
+      json: async () => ({ models: [
+        CATALOG_ENTRY,
+        { slug: 'gpt-5.4', display_name: 'GPT-5.4' },
+        { slug: 'gpt-5.4-mini', display_name: 'GPT-5.4-Mini' },
+      ] }),
+    }),
+  });
+
+  const proxy = createProxyServer(am, {
+    proxy: { port: 0 }, upstream: upstream.url, blockedModels: ['gpt-5.4*'],
+  });
+  proxy.listen(0, '127.0.0.1');
+  await once(proxy, 'listening');
+
+  try {
+    const { body } = await getModels(proxy.address().port);
+    assert.deepEqual(body.data.map(m => uncloakModelId(m.id)), ['gpt-5.6-sol']);
+  } finally {
+    proxy.close();
+    upstream.server.close();
+  }
+});
