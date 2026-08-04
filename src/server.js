@@ -608,14 +608,26 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // account needs attention, not a retry — so say so plainly rather than
     // reporting a rate limit. Not a 403 either: the client's own credential is
     // fine, and a 403 would make it drop its login over someone else's problem.
-    if (ctx.credentialRejected) {
+    //
+    // Only when the refusals are the WHOLE story, though. If some accounts were
+    // refused and others are merely out of quota, a reset will still serve this
+    // request — so fall through to the retry-after/hold path below rather than
+    // failing fast on the strength of one bad credential. Reporting 502 there
+    // would turn a recoverable exhaustion into a hard error, and silently skip
+    // the holdSeconds wait an unattended run depends on.
+    const rejected = ctx.credentialRejected;
+    const allRefused = rejected?.size > 0 && (ctx.pinnedIndex != null
+      ? rejected.has(accountManager.accounts[ctx.pinnedIndex]?.name)
+      : rejected.size === accountManager.accounts.length);
+    if (allRefused) {
+      const names = [...rejected].map(n => `"${n}"`).join(', ');
       ctx.status = 502;
-      ctx.account = `(${ctx.credentialRejected} refused)`;
+      ctx.account = `(${[...rejected].join(', ')} refused)`;
       if (!res.headersSent) {
         res.writeHead(502, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           type: 'error',
-          error: { type: 'proxy_error', message: `Upstream refused the credential for account "${ctx.credentialRejected}" (403). Check the account, then re-add it with: teamclaude login` },
+          error: { type: 'proxy_error', message: `Upstream refused the credential for account ${names} (403). Check the account, then re-add it with: teamclaude login` },
         }));
       }
       return;
@@ -890,7 +902,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // account left, the no-account branch reports a proxy error instead.
     if (upstreamRes.status === 403 && !res.headersSent) {
       await upstreamRes.body?.cancel();
-      ctx.credentialRejected = account.name;
+      // A set, not a name: the no-account branch needs to tell "every account was
+      // refused" (fail fast, nothing to wait for) from "this one was, others are
+      // just out of quota" (still worth holding for a reset).
+      (ctx.credentialRejected ??= new Set()).add(account.name);
       ctx.tried.add(account.index);
       console.error(`[TeamClaude] 403 on "${account.name}" — upstream refused the account credential`);
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);

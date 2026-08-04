@@ -94,3 +94,74 @@ test('a 403 fails over to another account', async () => {
     upstream.close();
   }
 });
+
+// Two dead credentials and nothing else: there is genuinely nothing to wait for,
+// so fail fast and name both rather than inventing a retry-after.
+test('with every account refused the error names all of them', async () => {
+  const { server: upstream } = forbiddingUpstream(new Set());
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager(
+    [
+      { name: 'a', type: 'oauth', accessToken: 'ta', refreshToken: 'ra', expiresAt: Date.now() + HOUR },
+      { name: 'b', type: 'oauth', accessToken: 'tb', refreshToken: 'rb', expiresAt: Date.now() + HOUR },
+    ],
+    0.98,
+    { refreshFn: async () => { throw new Error('must not refresh on a 403'); } },
+  );
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const { status, body } = await post(proxyPort);
+    assert.equal(status, 502);
+    assert.match(body, /\\"a\\"/);                     // quotes are JSON-escaped in the body
+    assert.match(body, /\\"b\\"/);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+// The mixed fleet: one credential is refused, the other account is merely out of
+// quota. A reset will still serve this request, so the refusal must not short —
+// circuit the exhaustion path — otherwise one bad credential turns every
+// recoverable exhaustion into a hard 502 and skips the holdSeconds wait that an
+// unattended run depends on.
+test('a refusal alongside a merely-exhausted account still reports exhaustion', async () => {
+  const upstream = http.createServer((req, res) => {
+    if (req.headers.authorization === 'Bearer ta') {
+      res.writeHead(403, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'permission_error', message: 'Request not allowed' } }));
+      return;
+    }
+    // Durable quota rejection, far enough out that no inline retry absorbs it.
+    res.writeHead(429, {
+      'retry-after': '300',
+      'anthropic-ratelimit-unified-5h-status': 'rejected',
+      'content-type': 'application/json',
+    });
+    res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error' } }));
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager(
+    [
+      { name: 'a', type: 'oauth', accessToken: 'ta', refreshToken: 'ra', expiresAt: Date.now() + HOUR },
+      { name: 'b', type: 'oauth', accessToken: 'tb', refreshToken: 'rb', expiresAt: Date.now() + HOUR },
+    ],
+    0.98,
+    { refreshFn: async () => { throw new Error('must not refresh on a 403'); } },
+  );
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const { status, body } = await post(proxyPort);
+    assert.equal(status, 429, 'quota exhaustion, not a hard credential error');
+    assert.match(body, /rate_limit_error/);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
