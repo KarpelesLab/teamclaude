@@ -12,6 +12,7 @@ import { TopLevelFieldFinder, modelGlobMatches } from './model.js';
 import { BodyWriter } from './request-log.js';
 import { upstreamFetch } from './upstream-fetch.js';
 import { tunnelTls } from './sx.js';
+import { createEgressGuard } from './egress-guard.js';
 
 
 export const HOP_BY_HOP_HEADERS = new Set([
@@ -117,7 +118,10 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
     }
   };
 
-  const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config });
+  // Opt-in egress pin: null unless config.egress.pin is set, and then shared by
+  // the base listener and the MITM one so both honour the same hold.
+  const egress = createEgressGuard(config, console.error);
+  const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, egress });
   const server = http.createServer(requestHandler);
 
   // Forward-proxy support (always on, so multiple claude instances can use
@@ -134,7 +138,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
     const c = await certsPromise;
     return { key: c.leafKeyPem, cert: c.leafCertPem };
   };
-  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks, log: console.error, sx }));
+  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks, log: console.error, sx, egress }));
   // Remote Control's real-time channel is a WebSocket, not a request/response
   // call — Node fires 'upgrade' for that handshake, never 'request', so it
   // needs its own listener (base-URL routing path; the MITM path wires the
@@ -241,7 +245,7 @@ const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/files/', '/api/oauth/f
  * aware routing, and retry-on-quota behavior. Control endpoints (status/reload)
  * and the proxy-API-key gate live in the base server's wrapper, not here.
  */
-export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null }) {
+export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null, egress = null }) {
   let counter = 0;
   return async (req, res) => {
     try {
@@ -258,6 +262,27 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         return;
       }
       const hideActivity = isEventLog && eventLogging !== 'show';
+      // Egress pin (opt-in): with the exit IP off the pinned one — a VPN that
+      // dropped — hold rather than send. Upstream answers a request from an
+      // unexpected region with a 403 that Claude Code reports as a dead session,
+      // so sending it costs a re-login while waiting costs latency. Checked here
+      // rather than per-account: it is a property of the connection, and this is
+      // the one path every request takes, MITM included.
+      if (egress?.enabled()) {
+        const state = await egress.waitUntilPinned({ isAborted: () => res.destroyed });
+        if (res.destroyed) return;
+        if (!state.ok) {
+          res.writeHead(503, { 'Content-Type': 'application/json', 'retry-after': '30' });
+          res.end(JSON.stringify({
+            type: 'error',
+            error: {
+              type: 'proxy_error',
+              message: `Egress is ${state.ip || 'unknown'}, not the pinned ${state.expected.join(', ')} — not sending this request. Check the VPN.`,
+            },
+          }));
+          return;
+        }
+      }
       // Client token refresh: pass through untouched (the proxy manages its own
       // tokens via ensureTokenFresh; rewriting client refreshes would conflict).
       if (req.method === 'POST' && req.url === '/v1/oauth/token') { await relayRaw(req, res, upstream, sx); return; }
@@ -604,6 +629,34 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     ? (ctx.tried.has(ctx.pinnedIndex) ? null : accountManager.accounts[ctx.pinnedIndex])
     : accountManager.getActiveAccount(ctx.tried, ctx.model, ctx.advisorModel, ctx.sessionId);
   if (!account) {
+    // Every candidate was refused by upstream (403). Waiting will not help — the
+    // account needs attention, not a retry — so say so plainly rather than
+    // reporting a rate limit. Not a 403 either: the client's own credential is
+    // fine, and a 403 would make it drop its login over someone else's problem.
+    //
+    // Only when the refusals are the WHOLE story, though. If some accounts were
+    // refused and others are merely out of quota, a reset will still serve this
+    // request — so fall through to the retry-after/hold path below rather than
+    // failing fast on the strength of one bad credential. Reporting 502 there
+    // would turn a recoverable exhaustion into a hard error, and silently skip
+    // the holdSeconds wait an unattended run depends on.
+    const rejected = ctx.credentialRejected;
+    const allRefused = rejected?.size > 0 && (ctx.pinnedIndex != null
+      ? rejected.has(accountManager.accounts[ctx.pinnedIndex]?.name)
+      : rejected.size === accountManager.accounts.length);
+    if (allRefused) {
+      const names = [...rejected].map(n => `"${n}"`).join(', ');
+      ctx.status = 502;
+      ctx.account = `(${[...rejected].join(', ')} refused)`;
+      if (!res.headersSent) {
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: { type: 'proxy_error', message: `Upstream refused the credential for account ${names} (403). Check the account, then re-add it with: teamclaude login` },
+        }));
+      }
+      return;
+    }
     // A pinned request concerns exactly one account: don't compute a fleet-wide
     // retry-after or sleep on other accounts' windows — return immediately.
     if (ctx.pinnedIndex != null) {
@@ -865,6 +918,24 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // retry's status check rotates to another account. Bounded to one re-auth
     // per account per request, so a genuinely dead credential surfaces the 401
     // instead of looping.
+    // A 403 ("Request not allowed") is upstream refusing THIS account outright —
+    // not a stale token a refresh could fix, and not anything the client sent.
+    // The client never sees the credential we inject, so it cannot act on the
+    // rejection; Claude Code reads a 403 as "your session is dead", drops its
+    // own login and asks for a re-login over an account problem it has no part
+    // in. Skip the account for the rest of this request and fail over. With no
+    // account left, the no-account branch reports a proxy error instead.
+    if (upstreamRes.status === 403 && !res.headersSent) {
+      await upstreamRes.body?.cancel();
+      // A set, not a name: the no-account branch needs to tell "every account was
+      // refused" (fail fast, nothing to wait for) from "this one was, others are
+      // just out of quota" (still worth holding for a reset).
+      (ctx.credentialRejected ??= new Set()).add(account.name);
+      ctx.tried.add(account.index);
+      console.error(`[TeamClaude] 403 on "${account.name}" — upstream refused the account credential`);
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+    }
+
     if (upstreamRes.status === 401 && account.type === 'oauth' && account.refreshToken
         && retryCount < maxRetries && !ctx.reauthed.has(account.index)) {
       ctx.reauthed.add(account.index);

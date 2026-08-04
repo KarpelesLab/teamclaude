@@ -4,7 +4,8 @@ import { spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { createWriteStream } from 'node:fs';
 import net from 'node:net';
-import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, loadState, saveState } from './config.js';
+import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, loadState, saveState } from './config.js';
+import { installCrashHandlers } from './crash-log.js';
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
@@ -19,6 +20,7 @@ import { SxManager } from './sx.js';
 import { autoUpdate, checkForUpdate, currentVersion, runUpdate, installKind, PKG_NAME } from './updater.js';
 import { renderStatus } from './status-renderer.js';
 import { buildClaudeEnvLines, encodePinComponent } from './claude-env.js';
+import { serviceKind, installService, uninstallService, serviceStatus, renderService, logPath } from './service.js';
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
 
 const args = process.argv.slice(2);
@@ -75,6 +77,10 @@ switch (command) {
     aliasCommand();
     process.exit(0);
     break;
+  case 'service':
+    await serviceCommand();
+    process.exit(0);
+    break;
   case 'probe':
     await probeCommand();
     process.exit(0);
@@ -117,6 +123,13 @@ switch (command) {
 // ── server ──────────────────────────────────────────────────
 
 async function serverCommand() {
+  // Installed first: the server is the long-lived process, it runs under a TUI
+  // that repaints over anything Node prints on the way out, and a crash here
+  // takes every routed session with it. Without this, a proxy that vanished
+  // overnight leaves nothing behind to explain why.
+  const crashLog = getCrashLogPath();
+  installCrashHandlers(crashLog);
+
   const config = await loadOrCreateConfig();
 
   // --log-to <dir>
@@ -984,6 +997,50 @@ function aliasCommand() {
   }
 }
 
+// ── service ─────────────────────────────────────────────────
+
+async function serviceCommand() {
+  const sub = args[1] || 'status';
+  const kind = serviceKind();
+  if (!kind) {
+    console.error(`teamclaude service: no service integration for ${process.platform}`);
+    console.error('Run the proxy yourself with: teamclaude server --headless');
+    process.exit(1);
+  }
+  // Carry an explicit config path into the unit: a service started by launchd or
+  // systemd does not inherit the shell's TEAMCLAUDE_CONFIG, so a non-default
+  // config would silently be ignored and the service would serve a different
+  // (or empty) account list than the CLI does.
+  const configPath = process.env.TEAMCLAUDE_CONFIG || null;
+
+  switch (sub) {
+    case 'install': {
+      const res = await installService({ configPath });
+      if (!res.ok) { console.error(`teamclaude service install failed: ${res.error}`); process.exit(1); }
+      break;
+    }
+    case 'uninstall': {
+      const res = await uninstallService();
+      if (!res.ok) { console.error(`teamclaude service uninstall failed: ${res.error}`); process.exit(1); }
+      break;
+    }
+    case 'print':
+      process.stdout.write(renderService({ configPath }));
+      break;
+    case 'status': {
+      const s = await serviceStatus();
+      console.log(`Service:   ${s.installed ? s.file : 'not installed'}`);
+      console.log(`State:     ${s.running ? `running${s.pid ? ` (pid ${s.pid})` : ''}` : s.detail}`);
+      if (kind === 'launchd') console.log(`Logs:      ${logPath()}`);
+      else console.log('Logs:      journalctl --user --unit teamclaude.service');
+      break;
+    }
+    default:
+      console.error('Usage: teamclaude service <install|uninstall|status|print>');
+      process.exit(1);
+  }
+}
+
 // ── probe ───────────────────────────────────────────────────
 
 async function probeCommand() {
@@ -1307,6 +1364,10 @@ Commands:
                       the session to one account (see Environment below)
   alias               Print a shell alias so plain 'claude' routes via the proxy
                       (--install to write it to your shell rc; --uninstall to remove)
+  service <sub>       Run the proxy as a user service that starts at login and
+                      restarts on its own: install | uninstall | status | print
+                      (LaunchAgent on macOS, systemd --user unit on Linux;
+                      'print' writes the unit to stdout without touching anything)
   status [--json]     Show rich proxy/account/probe status (live)
                       Use --color=always|never to control ANSI colors
   accounts            List configured accounts
@@ -1359,11 +1420,20 @@ launched with and without --no-mitm can share one server.
 A running server re-syncs accounts from config on POST /teamclaude/reload
 (local only). add/login/enable/disable/priority trigger it automatically.
 
+Egress pin (opt-in, off unless configured). Set "egress": { "pin": "auto" } to
+hold requests whenever the exit IP is not the pinned one — a VPN that dropped
+mid-session otherwise sends the request from an unexpected region, and upstream
+answers 403, which Claude Code reports as a dead session and demands a re-login.
+"auto" pins whatever address the server sees first; an explicit IP (or a list of
+them) pins those. Held requests wait up to holdSeconds (default 120), then get a
+503. See config.example.json.
+
 A global npm install self-updates in the background (checked once/day, applied
 on the next launch). Disable with TEAMCLAUDE_DISABLE_AUTOUPDATE=1 or
 "autoUpdate": false in the config.
 
 Config: ${getConfigPath()}
+Crash log: ${getCrashLogPath()} (server; written when the process dies unexpectedly)
 `);
 }
 
