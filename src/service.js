@@ -149,6 +149,7 @@ const guiDomain = (uid = process.getuid?.() ?? 0) => `gui/${uid}`;
 export async function installService({
   kind = serviceKind(), home = homedir(), platform = process.platform,
   exec = resolveExec(), run = runCommand, configPath = null, log = console.log,
+  xdgConfig = process.env.XDG_CONFIG_HOME,
 } = {}) {
   if (!kind) return { ok: false, error: `No service integration for ${platform}` };
   const logFile = logPath(home, platform);
@@ -170,7 +171,7 @@ export async function installService({
     return { ok: true, file: plist, logFile };
   }
 
-  const unit = systemdUnitPath(home);
+  const unit = systemdUnitPath(home, xdgConfig);
   await mkdir(dirname(unit), { recursive: true });
   await writeFile(unit, renderSystemdUnit({ ...exec, path, configPath }), { mode: 0o644 });
   run('systemctl', ['--user', 'daemon-reload']);
@@ -186,6 +187,7 @@ export async function installService({
 
 export async function uninstallService({
   kind = serviceKind(), home = homedir(), run = runCommand, log = console.log,
+  xdgConfig = process.env.XDG_CONFIG_HOME,
 } = {}) {
   if (!kind) return { ok: false, error: 'No service integration for this platform' };
   if (kind === 'launchd') {
@@ -195,7 +197,7 @@ export async function uninstallService({
     log(`[TeamClaude] Service removed: ${plist}`);
     return { ok: true, file: plist };
   }
-  const unit = systemdUnitPath(home);
+  const unit = systemdUnitPath(home, xdgConfig);
   run('systemctl', ['--user', 'disable', '--now', UNIT_NAME]);
   await rm(unit, { force: true });
   run('systemctl', ['--user', 'daemon-reload']);
@@ -203,7 +205,10 @@ export async function uninstallService({
   return { ok: true, file: unit };
 }
 
-export async function serviceStatus({ kind = serviceKind(), home = homedir(), run = runCommand } = {}) {
+export async function serviceStatus({
+  kind = serviceKind(), home = homedir(), run = runCommand,
+  xdgConfig = process.env.XDG_CONFIG_HOME,
+} = {}) {
   if (!kind) return { installed: false, running: false, detail: 'unsupported platform' };
   if (kind === 'launchd') {
     const plist = launchAgentPath(home);
@@ -212,7 +217,7 @@ export async function serviceStatus({ kind = serviceKind(), home = homedir(), ru
     const pid = /\bpid = (\d+)/.exec(r.stdout)?.[1] || null;
     return { installed, running: r.code === 0 && !!pid, pid, file: plist, detail: r.code === 0 ? 'loaded' : 'not loaded' };
   }
-  const unit = systemdUnitPath(home);
+  const unit = systemdUnitPath(home, xdgConfig);
   const r = run('systemctl', ['--user', 'is-active', UNIT_NAME]);
   return { installed: existsSync(unit), running: r.stdout.trim() === 'active', file: unit, detail: r.stdout.trim() || r.stderr.trim() };
 }
@@ -227,8 +232,10 @@ export function renderService({ kind = serviceKind(), home = homedir(), platform
 }
 
 /** Read back what is installed, for diffing against what we would write now. */
-export async function readInstalled({ kind = serviceKind(), home = homedir() } = {}) {
+export async function readInstalled({
+  kind = serviceKind(), home = homedir(), xdgConfig = process.env.XDG_CONFIG_HOME,
+} = {}) {
   if (!kind) return null;
-  const file = kind === 'launchd' ? launchAgentPath(home) : systemdUnitPath(home);
+  const file = kind === 'launchd' ? launchAgentPath(home) : systemdUnitPath(home, xdgConfig);
   return readFile(file, 'utf8').catch(() => null);
 }

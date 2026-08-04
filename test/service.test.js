@@ -153,8 +153,12 @@ test('installing on systemd reloads the daemon before enabling', async () => {
   const home = await mkdtemp(join(tmpdir(), 'tc-svc-'));
   try {
     const { run, calls } = recorder();
+    // xdgConfig: null keeps the unit under `home`. Without it the call honours
+    // the ambient XDG_CONFIG_HOME — set on CI and on plenty of desktops — and
+    // the test would write a real unit file into the developer's own config dir
+    // while asserting against a temp path that was never written.
     const res = await installService({
-      kind: 'systemd', home, platform: 'linux', run, log: () => {},
+      kind: 'systemd', home, platform: 'linux', run, log: () => {}, xdgConfig: null,
       exec: { node: '/usr/bin/node', entry: '/usr/bin/teamclaude' },
     });
     assert.equal(res.ok, true);
@@ -163,6 +167,26 @@ test('installing on systemd reloads the daemon before enabling', async () => {
       'systemctl --user daemon-reload',
       'systemctl --user enable --now teamclaude.service',
     ]);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+// XDG_CONFIG_HOME wins over ~/.config for the unit's location — that is where a
+// systemd --user unit belongs on a machine that sets it. Asserted explicitly
+// because the same knob decides whether a test can reach the real config dir.
+test('the systemd unit follows XDG_CONFIG_HOME when one is set', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'tc-svc-'));
+  try {
+    const xdg = join(home, 'xdg');
+    const { run } = recorder();
+    const res = await installService({
+      kind: 'systemd', home, platform: 'linux', run, log: () => {}, xdgConfig: xdg,
+      exec: { node: '/usr/bin/node', entry: '/usr/bin/teamclaude' },
+    });
+    assert.equal(res.ok, true);
+    assert.equal(res.file, join(xdg, 'systemd', 'user', 'teamclaude.service'));
+    assert.match(await readFile(res.file, 'utf8'), /ExecStart=/);
   } finally {
     await rm(home, { recursive: true, force: true });
   }
