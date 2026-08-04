@@ -1,6 +1,6 @@
 import { createWriteStream } from 'node:fs';
 import { importCredentials, fetchProfile } from './oauth.js';
-import { sameIdentity } from './identity.js';
+import { sameIdentity, findUpsertTarget } from './identity.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -170,7 +170,10 @@ function timestamp() {
 // ── TUI class ────────────────────────────────────────────────
 
 export class TUI {
-  constructor({ accountManager, config, saveConfig, syncAccounts, onQuit, sx = null, probeQuota = null, activityLogPath = null }) {
+  constructor({ accountManager, config, saveConfig, syncAccounts, onQuit, sx = null, probeQuota = null, activityLogPath = null,
+    // Injectable so the import path can be exercised without a real credentials
+    // file or a live profile call.
+    readCredentials = importCredentials, readProfile = fetchProfile }) {
     this.am = accountManager;
     this.config = config;
     this.saveConfig = saveConfig;
@@ -180,6 +183,8 @@ export class TUI {
     this.sxBalance = null;   // last fetched sx.org balance, for the settings screen
     this.probeQuota = probeQuota; // on-demand fleet-wide quota refresh (may be null)
     this.activityLogPath = activityLogPath;
+    this._readCredentials = readCredentials;
+    this._readProfile = readProfile;
     this._activityStream = null;
 
     this.log = [];           // completed activity entries
@@ -719,8 +724,8 @@ export class TUI {
   async _doImport() {
     try {
       this._addLog('Importing credentials...');
-      const creds = await importCredentials('~/.claude/.credentials.json');
-      const profile = await fetchProfile(creds.accessToken);
+      const creds = await this._readCredentials('~/.claude/.credentials.json');
+      const profile = await this._readProfile(creds.accessToken);
       const profileOk = profile && !profile.error;
 
       if (!profileOk) {
@@ -747,10 +752,11 @@ export class TUI {
         expiresAt: creds.expiresAt,
       };
 
-      // Deduplicate by account+org identity (same email in a different org is a
-      // distinct account), then by name.
-      let idx = this.config.accounts.findIndex(a => sameIdentity(a, entry));
-      if (idx < 0) idx = this.config.accounts.findIndex(a => a.name === name);
+      // Same rule as the login path: a name match counts only where it is not
+      // standing in for a different account+org. Both organizations of one person
+      // carry the same email-derived name, and overwriting on that match drops an
+      // account here AND rewrites the running one's identity below.
+      const idx = findUpsertTarget(this.config.accounts, entry);
 
       if (idx >= 0) {
         const prev = this.config.accounts[idx];
@@ -1087,9 +1093,14 @@ export class TUI {
     lines.push(bold('  Quota probe') + dim('  — refresh idle accounts from the usage endpoint'));
     lines.push(row(byId('probe')));
     lines.push('');
+    // ── Activity log
+    lines.push(bold('  Activity log') + dim('  — what to do with Claude Code\'s telemetry'));
+    lines.push(row(byId('eventlog')));
+    lines.push('');
     // ── Routing
-    lines.push(bold('  Routing') + dim('  — pin model families to specific accounts'));
+    lines.push(bold('  Routing') + dim('  — pin model families to specific accounts, or block them outright'));
     lines.push(row(byId('routes')));
+    lines.push(row(byId('blocklist')));
     lines.push('');
     // ── Accounts
     lines.push(bold('  Accounts') + dim('  — add (import / API key) or remove an account'));
