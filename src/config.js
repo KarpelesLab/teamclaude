@@ -20,6 +20,15 @@ export function getStatePath() {
   return cfg.endsWith('.json') ? cfg.replace(/\.json$/, '.state.json') : cfg + '.state';
 }
 
+/**
+ * Path to the crash log (a sibling of the config), where a fatal error is
+ * recorded before the process exits.
+ */
+export function getCrashLogPath() {
+  const cfg = getConfigPath();
+  return cfg.endsWith('.json') ? cfg.replace(/\.json$/, '-crash.log') : cfg + '-crash.log';
+}
+
 export async function loadState() {
   try {
     return JSON.parse(await readFile(getStatePath(), 'utf-8'));
