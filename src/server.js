@@ -489,6 +489,12 @@ export function relayUpgrade(req, socket, head, upstream, sx) {
     upstreamSocket.on('end', () => socket.destroy());
     socket.on('close', () => upstreamSocket.destroy());
     upstreamSocket.on('close', () => socket.destroy());
+    // The 101 detaches this socket from upstreamReq, so the request's 'error'
+    // listener no longer covers it. A link that flaps mid-session then raises
+    // 'error' (write EPIPE / read ECONNRESET) on a socket nobody listens to,
+    // which Node escalates to an uncaught exception — one dropped WebSocket
+    // would kill the proxy for every other session. Close the pair instead.
+    upstreamSocket.on('error', () => socket.destroy());
   });
 
   upstreamReq.on('error', (err) => {

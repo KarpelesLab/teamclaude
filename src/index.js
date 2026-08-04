@@ -8,7 +8,7 @@ import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConf
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
-import { sameIdentity, orgKey, matchAccounts } from './identity.js';
+import { sameIdentity, orgKey, matchAccounts, findUpsertTarget } from './identity.js';
 import { resolveAccounts } from './resolve-accounts.js';
 import * as alias from './alias.js';
 import { ensureCerts } from './mitm.js';
@@ -1406,9 +1406,9 @@ async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
   };
 
   // Deduplicate by account+org identity (same email in a different org is a
-  // distinct account), then by name.
-  let idx = config.accounts.findIndex(a => sameIdentity(a, account));
-  if (idx < 0) idx = config.accounts.findIndex(a => a.name === name);
+  // distinct account), then by name — but only where the name is not standing in
+  // for a different account+org, which is exactly the multi-org case below.
+  const idx = findUpsertTarget(config.accounts, account);
 
   if (idx >= 0) {
     // Same account+org: refresh credentials and org info, but keep the existing

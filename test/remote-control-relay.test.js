@@ -124,3 +124,48 @@ test('relays a WebSocket Upgrade handshake and echoes bytes both ways', async ()
   proxy.close();
   upstream.close();
 });
+
+// Once the 101 fires, Node detaches the upgraded socket from the ClientRequest,
+// so upstreamReq's 'error' listener no longer covers it. A dropped link then
+// surfaces as an 'error' on that bare socket (write EPIPE / read ECONNRESET) —
+// with nothing listening, Node turns an unhandled 'error' event into an
+// uncaught exception and the whole proxy dies, taking every other session with
+// it. A flapping connection must close one relay, not the process.
+test('an upstream socket that dies mid-relay tears down the pair instead of crashing the proxy', async () => {
+  const { server: upstream, port: upstreamPort } = await listen(() => {});
+  upstream.on('upgrade', (req, socket) => {
+    socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n');
+    // RST rather than FIN: what a dropped link looks like to the relay.
+    setTimeout(() => socket.resetAndDestroy(), 10);
+  });
+
+  const proxy = http.createServer();
+  proxy.on('upgrade', (req, socket, head) => relayUpgrade(req, socket, head, `http://127.0.0.1:${upstreamPort}`, null));
+  proxy.listen(0);
+  await once(proxy, 'listening');
+  const port = proxy.address().port;
+
+  const client = net.connect(port, '127.0.0.1');
+  await once(client, 'connect');
+  client.on('error', () => {}); // the client end goes away too; that part is expected
+  client.write(
+    'GET /v1/session_ingress/ws/abc HTTP/1.1\r\n' +
+    'Host: 127.0.0.1\r\n' +
+    'Upgrade: websocket\r\n' +
+    'Connection: Upgrade\r\n' +
+    '\r\n',
+  );
+
+  const [handshake] = await once(client, 'data');
+  assert.match(handshake.toString(), /101 Switching Protocols/);
+
+  // Keep writing into the now-dead relay: this is the EPIPE path.
+  const writer = setInterval(() => client.write('ping'), 5);
+  await once(client, 'close');
+  clearInterval(writer);
+
+  // Still alive and still serving — the proxy survived the upstream's death.
+  assert.equal(proxy.listening, true);
+  proxy.close();
+  upstream.close();
+});

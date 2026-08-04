@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { orgKey, sameIdentity, emailOf, matchAccounts } from '../src/identity.js';
+import { orgKey, sameIdentity, emailOf, matchAccounts, findUpsertTarget, distinctAccounts } from '../src/identity.js';
 
 test('orgKey prefers orgUuid, falls back to orgName, else null', () => {
   assert.equal(orgKey({ orgUuid: 'u1', orgName: 'Acme' }), 'u1');
@@ -103,4 +103,51 @@ test('matchAccounts: unique email needs no org', () => {
 
 test('matchAccounts: no match returns empty', () => {
   assert.equal(matchAccounts(ACCTS, 'nobody@z.com').length, 0);
+});
+
+// The failure this guards against: one person, two organizations. Both entries
+// are auto-named from the same email, so a name match is not evidence that the
+// incoming login is the same account — and taking it as such overwrites the
+// other org's entry. The account disappears from the config while the running
+// server still holds it in memory, so the loss only becomes visible at the next
+// restart, far from the login that caused it.
+test('findUpsertTarget: a second org of the same person is a NEW entry, not an overwrite', () => {
+  const accounts = [
+    { name: 'a@x.com', accountUuid: 'u1', orgUuid: 'o-personal', orgName: 'Personal' },
+  ];
+  const incoming = { name: 'a@x.com', accountUuid: 'u1', orgUuid: 'o-acme', orgName: 'Acme' };
+  assert.equal(findUpsertTarget(accounts, incoming), -1);
+});
+
+test('findUpsertTarget: the same account+org updates in place', () => {
+  const accounts = [
+    { name: 'a@x.com (Personal)', accountUuid: 'u1', orgUuid: 'o-personal' },
+    { name: 'a@x.com (Acme)', accountUuid: 'u1', orgUuid: 'o-acme' },
+  ];
+  assert.equal(findUpsertTarget(accounts, { name: 'a@x.com', accountUuid: 'u1', orgUuid: 'o-acme' }), 1);
+});
+
+// A legacy entry predating stored org UUIDs must still be backfilled rather than
+// duplicated — "org unknown" means cannot tell, not different.
+test('findUpsertTarget: an entry with no org backfills instead of duplicating', () => {
+  const accounts = [{ name: 'a@x.com', accountUuid: 'u1' }];
+  assert.equal(findUpsertTarget(accounts, { name: 'a@x.com', accountUuid: 'u1', orgUuid: 'o-acme' }), 0);
+});
+
+test('findUpsertTarget: matches by name when neither side carries a UUID', () => {
+  const accounts = [{ name: 'a@x.com' }];
+  assert.equal(findUpsertTarget(accounts, { name: 'a@x.com', accountUuid: null }), 0);
+});
+
+// Two different people whose entries somehow share a display name must not
+// collapse into one either.
+test('findUpsertTarget: a different person with the same name is a new entry', () => {
+  const accounts = [{ name: 'shared', accountUuid: 'u1', orgUuid: 'o1' }];
+  assert.equal(findUpsertTarget(accounts, { name: 'shared', accountUuid: 'u2', orgUuid: 'o2' }), -1);
+});
+
+test('distinctAccounts: unknown identity on either side is never "different"', () => {
+  assert.equal(distinctAccounts({ name: 'a' }, { name: 'a', accountUuid: 'u1' }), false);
+  assert.equal(distinctAccounts({ accountUuid: 'u1' }, { accountUuid: 'u1', orgUuid: 'o1' }), false);
+  assert.equal(distinctAccounts({ accountUuid: 'u1', orgUuid: 'o1' }, { accountUuid: 'u1', orgUuid: 'o2' }), true);
 });
