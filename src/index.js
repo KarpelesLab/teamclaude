@@ -4,7 +4,8 @@ import { spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { createWriteStream } from 'node:fs';
 import net from 'node:net';
-import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, loadState, saveState } from './config.js';
+import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, loadState, saveState } from './config.js';
+import { installCrashHandlers } from './crash-log.js';
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
@@ -122,6 +123,13 @@ switch (command) {
 // ── server ──────────────────────────────────────────────────
 
 async function serverCommand() {
+  // Installed first: the server is the long-lived process, it runs under a TUI
+  // that repaints over anything Node prints on the way out, and a crash here
+  // takes every routed session with it. Without this, a proxy that vanished
+  // overnight leaves nothing behind to explain why.
+  const crashLog = getCrashLogPath();
+  installCrashHandlers(crashLog);
+
   const config = await loadOrCreateConfig();
 
   // --log-to <dir>
@@ -1412,11 +1420,20 @@ launched with and without --no-mitm can share one server.
 A running server re-syncs accounts from config on POST /teamclaude/reload
 (local only). add/login/enable/disable/priority trigger it automatically.
 
+Egress pin (opt-in, off unless configured). Set "egress": { "pin": "auto" } to
+hold requests whenever the exit IP is not the pinned one — a VPN that dropped
+mid-session otherwise sends the request from an unexpected region, and upstream
+answers 403, which Claude Code reports as a dead session and demands a re-login.
+"auto" pins whatever address the server sees first; an explicit IP (or a list of
+them) pins those. Held requests wait up to holdSeconds (default 120), then get a
+503. See config.example.json.
+
 A global npm install self-updates in the background (checked once/day, applied
 on the next launch). Disable with TEAMCLAUDE_DISABLE_AUTOUPDATE=1 or
 "autoUpdate": false in the config.
 
 Config: ${getConfigPath()}
+Crash log: ${getCrashLogPath()} (server; written when the process dies unexpectedly)
 `);
 }
 

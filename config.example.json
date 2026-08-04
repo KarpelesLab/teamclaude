@@ -38,5 +38,11 @@
       "accounts": ["primary-max"],
       "color": "magenta"
     }
-  ]
+  ],
+  "egress": {
+    "pin": "auto",
+    "checkUrl": "https://api.ipify.org",
+    "ttlSeconds": 30,
+    "holdSeconds": 120
+  }
 }
