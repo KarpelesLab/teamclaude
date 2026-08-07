@@ -126,7 +126,7 @@ function formatReset(resetTs) {
  * Render a progress bar using background colors with text overlaid.
  * The label (e.g. "Ses 2h30m" or "45%") is drawn on top of the bar.
  */
-function bar(ratio, w = 10, resetTs) {
+export function bar(ratio, w = 10, resetTs) {
   const rst = formatReset(resetTs);
 
   if (ratio == null || isNaN(ratio)) {
@@ -157,8 +157,13 @@ function bar(ratio, w = 10, resetTs) {
   const filled = chars.slice(0, f);
   const empty = chars.slice(f);
 
+  // Black label on green/yellow: terminal themes commonly render those
+  // backgrounds light, and bright-white text disappears on them. White stays
+  // on red, which is dark in practically every palette.
+  const fgc = bg === 41 ? 97 : 30;
+
   let out = '';
-  if (filled) out += `${ESC}${bg};97m${filled}`;
+  if (filled) out += `${ESC}${bg};${fgc}m${filled}`;
   if (empty) out += `${ESC}100;37m${empty}`;
   out += RESET;
   return out;
