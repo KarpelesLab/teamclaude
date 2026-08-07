@@ -1399,7 +1399,8 @@ Commands:
 Options:
   --name NAME         Set account name (import/login)
   --org NAME|UUID     Disambiguate when an email spans multiple orgs (remove/priority/api)
-  --from PATH         Credentials path (import, default: ~/.claude/.credentials.json)
+  --from PATH         Credentials path (import, default: ~/.claude/.credentials.json;
+                      on macOS the default falls back to the Keychain)
   --json JSON         Import from inline JSON (import), e.g.:
                       --json '{"accessToken":"...","refreshToken":"...","expiresAt":1234}'
   --log-to DIR        Log full requests/responses to DIR (server, one file per request)
