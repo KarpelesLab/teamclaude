@@ -9,8 +9,12 @@ import { fileURLToPath } from 'node:url';
 
 const cliPath = fileURLToPath(new URL('../src/index.js', import.meta.url));
 
+// Occupy the port on the exact address the spawned server binds (127.0.0.1).
+// A bare listen(0) binds the [::] dual-stack wildcard instead, and on macOS a
+// specific-address bind succeeds alongside a wildcard held by another socket —
+// the port would not actually be "in use" for the child there.
 function listen(server) {
-  return new Promise(resolve => server.listen(0, () => resolve(server.address().port)));
+  return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
 }
 
 function close(server) {
