@@ -1,17 +1,46 @@
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { randomBytes, createHash } from 'node:crypto';
-import { exec } from 'node:child_process';
+import { exec, execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { createInterface } from 'node:readline';
 import http from 'node:http';
 import { proxyFetch } from './upstream-fetch.js';
 
+const execFileAsync = promisify(execFile);
+
+const DEFAULT_CREDENTIALS_PATH = '~/.claude/.credentials.json';
+const KEYCHAIN_SERVICE = 'Claude Code-credentials';
+
+/**
+ * Read Claude Code credentials from the macOS Keychain, where Claude Code
+ * stores them on darwin (there is no ~/.claude/.credentials.json on macOS).
+ */
+async function readKeychainCredentials() {
+  const { stdout } = await execFileAsync('security', ['find-generic-password', '-s', KEYCHAIN_SERVICE, '-w']);
+  return JSON.parse(stdout.trim());
+}
+
 /**
  * Import OAuth credentials from a Claude Code credentials file.
+ * On macOS the default credentials location is the Keychain, not a file, so
+ * when the default path is missing the Keychain is tried before giving up.
  */
-export async function importCredentials(filePath) {
-  const resolvedPath = filePath.replace(/^~/, homedir());
-  const raw = JSON.parse(await readFile(resolvedPath, 'utf-8'));
+export async function importCredentials(filePath, {
+  home = homedir(), platform = process.platform, readKeychain = readKeychainCredentials } = {}) {
+  const resolvedPath = filePath.replace(/^~/, home);
+  let raw;
+  try {
+    raw = JSON.parse(await readFile(resolvedPath, 'utf-8'));
+  } catch (err) {
+    const isDefaultPath = resolvedPath === DEFAULT_CREDENTIALS_PATH.replace(/^~/, home);
+    if (err.code !== 'ENOENT' || platform !== 'darwin' || !isDefaultPath) throw err;
+    try {
+      raw = await readKeychain();
+    } catch (kcErr) {
+      throw new Error(`${err.message}; macOS Keychain lookup for "${KEYCHAIN_SERVICE}" also failed: ${kcErr.message}`);
+    }
+  }
 
   // Claude Code stores credentials nested under "claudeAiOauth"
   const data = raw.claudeAiOauth || raw;
