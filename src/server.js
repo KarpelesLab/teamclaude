@@ -1446,8 +1446,18 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // Rewrite the model name for accounts that target a different upstream (e.g.
   // GLM), which uses different model identifiers than Anthropic.
   if (account.modelMap) sendBody = rewriteModel(sendBody, account.modelMap);
-  // If the body changed length (sanitize or model rewrite), update Content-Length
-  // so the upstream doesn't receive a mismatched framing and truncate or stall.
+  // Third-party upstreams (e.g. OpenCode Zen, GLM) implement the Anthropic
+  // message API but reject fields Claude Code legitimately sends — observed:
+  // `context_management` -> 400 "Extra inputs are not permitted", which breaks
+  // EVERY request once such an account is selected. Drop the configured fields
+  // for those accounts only; Anthropic accounts are untouched. Content-Length is
+  // refreshed below because the body shrinks.
+  if (Array.isArray(account.stripRequestFields) && account.stripRequestFields.length) {
+    sendBody = stripBodyFields(sendBody, account.stripRequestFields);
+  }
+  // If the body changed length (sanitize, model rewrite, or field strip), update
+  // Content-Length so the upstream doesn't receive a mismatched framing and
+  // truncate or stall.
   if (sendBody !== body) headers['content-length'] = String(sendBody.length);
 
   // Streaming request log, opened lazily on the first terminal outcome (a
@@ -1955,6 +1965,21 @@ function extractUsageFromBody(buffer, accountIndex, accountManager, onUsage = nu
 // Returns the original buffer unchanged if the model isn't in the map or the
 // body isn't valid JSON, so non-messages endpoints pass through safely.
 // Exported for tests.
+// Remove top-level fields from a JSON request body (see stripRequestFields).
+// Returns the original buffer when nothing changed or the body isn't JSON, so
+// non-messages endpoints pass through untouched. Exported for tests.
+export function stripBodyFields(body, fields) {
+  try {
+    const obj = JSON.parse(body.toString('utf8'));
+    let changed = false;
+    for (const f of fields) {
+      if (Object.prototype.hasOwnProperty.call(obj, f)) { delete obj[f]; changed = true; }
+    }
+    if (changed) return Buffer.from(JSON.stringify(obj), 'utf8');
+  } catch { /* not JSON — pass through unchanged */ }
+  return body;
+}
+
 export function rewriteModel(body, modelMap) {
   try {
     const obj = JSON.parse(body.toString('utf8'));

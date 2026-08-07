@@ -98,6 +98,9 @@ function makeAccount(acct, index) {
     disabled: acct.disabled || false,
     upstream: acct.upstream || null,
     modelMap: acct.modelMap || null,
+    // Fields to drop from request bodies for this account (third-party upstreams
+    // that reject e.g. `context_management`). See server.js stripBodyFields.
+    stripRequestFields: acct.stripRequestFields || null,
     models: acct.models || null,
     credential: acct.accessToken || acct.apiKey,
     refreshToken: acct.refreshToken || null,
