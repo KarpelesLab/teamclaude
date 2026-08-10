@@ -18,13 +18,20 @@ export class RemoteControl {
   }
 
   /** The current status payload (the same one `teamclaude status` renders). */
-  status() {
-    return this._call('GET', '/teamclaude/status');
+  async status() {
+    const payload = await this._call('GET', '/teamclaude/status');
+    // A status reply always carries an accounts array, even when it is empty.
+    // Anything else answered on this port is not this control plane, and calling
+    // that "connected with no accounts" would diagnose the wrong problem.
+    if (!Array.isArray(payload?.accounts)) {
+      throw new Error('unexpected reply — this is not a teamclaude status endpoint');
+    }
+    return payload;
   }
 
   /** Re-read config and refresh credentials on the running server. */
   reload() {
-    return this._call('POST', '/teamclaude/reload');
+    return this._action('POST', '/teamclaude/reload');
   }
 
   /**
@@ -39,13 +46,28 @@ export class RemoteControl {
    */
   async switchAccount(name) {
     try {
-      return await this._call('POST', '/teamclaude/switch', { account: name });
+      return await this._action('POST', '/teamclaude/switch', { account: name });
     } catch (err) {
       if (!err.answered && (err.status === 404 || err.status === 501)) {
         throw new Error('this server does not support switching accounts');
       }
       throw err;
     }
+  }
+
+  /**
+   * A call that changes something on the server.
+   *
+   * The control plane confirms an applied action with `ok: true`. A 200 carrying
+   * anything else did not perform it — the configured port may well be answering
+   * from some other service, which will happily 200 an unknown POST — and
+   * reporting success from a bare status code would invent a switch that never
+   * happened.
+   */
+  async _action(method, path, body) {
+    const payload = await this._call(method, path, body);
+    if (payload?.ok !== true) throw new Error('unexpected reply — this is not a teamclaude control endpoint');
+    return payload;
   }
 
   async _call(method, path, body) {
@@ -66,7 +88,12 @@ export class RemoteControl {
       // anything else reached a handler that is not ours (an old server forwards
       // unknown paths upstream, and Anthropic's error body looks nothing like it).
       const answered = payload?.ok === false && typeof payload.error === 'string';
-      const err = new Error(answered ? payload.error : `HTTP ${res.status}`);
+      // A rejected key needs a different fix from an unreachable server, so it is
+      // worth naming: the config's proxy.apiKey does not match the running one.
+      const auth = !answered && (res.status === 401 || res.status === 403);
+      const err = new Error(auth
+        ? `the server rejected the proxy API key (HTTP ${res.status})`
+        : answered ? payload.error : `HTTP ${res.status}`);
       err.status = res.status;
       err.answered = answered;
       throw err;
@@ -99,7 +126,16 @@ export class RemoteAccountManager {
 
   applyStatus(status) {
     const accounts = Array.isArray(status?.accounts) ? status.accounts : [];
-    this.accounts = accounts.map((a, index) => ({ ...a, index, quota: { ...(a.quota || {}) } }));
+    // The payload crosses a process boundary, and the renderer calls string
+    // methods on name/type unguarded: a malformed reply (wrong port, older or
+    // newer server) should read as unknown, not take the dashboard down.
+    this.accounts = accounts.map((a, index) => ({
+      ...a,
+      index,
+      name: a.name || '(unnamed)',
+      type: a.type || '?',
+      quota: { ...(a.quota || {}) },
+    }));
     // -1 when the payload names an account that is no longer listed: nothing is
     // marked current, which is the truth, rather than defaulting to the first row.
     this.currentIndex = this.accounts.findIndex(a => a.name === status?.currentAccount);

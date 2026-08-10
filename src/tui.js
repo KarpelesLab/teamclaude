@@ -657,8 +657,9 @@ export class TUI {
   // retry, rather than silently returning to normal.
   _doSwitchSelection() {
     const acct = this.am.accounts[this.selIdx];
-    // The list can shrink under the cursor between polls in attach mode.
-    if (!acct) return;
+    // The list can shrink under the cursor between polls in attach mode. Say so
+    // rather than swallowing the keypress.
+    if (!acct) { this.mode = 'normal'; this._addLog('That account is no longer listed'); return; }
     // Attach mode: the rotation lives in another process, so this is a request
     // whose result the next poll reflects, not a local assignment.
     if (this.applySwitch) { this.mode = 'normal'; this._doSwitchRemote(acct); return; }
@@ -1039,7 +1040,11 @@ export class TUI {
     // ── Accounts
     if (this.am.accounts.length === 0) {
       lines.push('');
-      lines.push(yellow('  No accounts configured. Press [g] → Add account.'));
+      // Attach mode cannot add an account, and pointing at a key that does
+      // nothing here would be worse than saying only what is known.
+      lines.push(yellow(this.remote
+        ? '  The server reports no accounts.'
+        : '  No accounts configured. Press [g] → Add account.'));
     } else {
       lines.push('');
       const showBoth = W >= 70;

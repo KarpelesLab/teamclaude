@@ -141,6 +141,33 @@ test('an unresolvable account is reported by reason, not as a missing feature', 
   await assert.rejects(() => control.switchAccount('ghost'), /no such account "ghost"/);
 });
 
+// Something else listening on the configured port answers 200 to anything. A
+// bare 200 is not evidence that an account was switched.
+test('a 200 from something that is not this control plane is not a switch', async (t) => {
+  const { control } = await makeSession(t, {
+    routes: {
+      'GET /teamclaude/status': json(statusFixture()),
+      'POST /teamclaude/switch': (req, res) => {
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end('<html>hello</html>');
+      },
+    },
+  });
+  await assert.rejects(() => control.switchAccount('alpha'), /not a teamclaude control endpoint/);
+});
+
+test('a rejected proxy API key is named, not reported as an outage', async (t) => {
+  const { control } = await makeSession(t, {
+    routes: {
+      'GET /teamclaude/status': (req, res) => {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ type: 'error', error: { type: 'authentication_error', message: 'Invalid proxy API key' } }));
+      },
+    },
+  });
+  await assert.rejects(() => control.status(), /API key/);
+});
+
 test('a rejection reported with 200 is still a rejection', async (t) => {
   const { control } = await makeSession(t, {
     routes: {
@@ -197,6 +224,39 @@ test('a status payload with no routes and no quota data renders nothing rather t
   assert.deepEqual(am.accounts[0].quota, {});
   assert.deepEqual(am.sessionStats(), { active: 0, known: 0, perAccount: {} });
   am.refreshExpiredQuotas(); // server-side concern; must be a harmless no-op here
+});
+
+// The payload comes from another process over a port the user configured, so a
+// reply can be JSON and still not be the status this dashboard expects.
+test('a payload missing the fields the renderer formats reads as unknown, not a crash', async (t) => {
+  const { am, tui } = await makeSession(t);
+  am.applyStatus({ accounts: [{ status: 'active' }, {}] });
+  assert.deepEqual(am.accounts.map(a => [a.name, a.type]), [['(unnamed)', '?'], ['(unnamed)', '?']]);
+  const out = renderToString(tui);
+  assert.match(out, /\(unnamed\)/);
+});
+
+// "Connected, no accounts" would send the user looking at their account list;
+// the actual problem is that the port answers from something else entirely.
+test('a reply that is not a status payload is a connection problem, not an empty fleet', async (t) => {
+  const { session, am, tui } = await makeSession(t, {
+    routes: { 'GET /teamclaude/status': json({ hello: 'this is some other service' }) },
+  });
+  await session.poll();
+  assert.equal(am.connected, false);
+  assert.match(tui.log[0].msg, /not a teamclaude status endpoint/);
+  assert.deepEqual(am.accounts, []);
+});
+
+test('an empty but genuine fleet is reported as such, without pointing at dead keys', async (t) => {
+  const { session, am, tui } = await makeSession(t, {
+    routes: { 'GET /teamclaude/status': json({ accounts: [], switchThreshold: 0.98 }) },
+  });
+  await session.poll();
+  assert.equal(am.connected, true);
+  const out = renderToString(tui);
+  assert.match(out, /server reports no accounts/);
+  assert.doesNotMatch(out, /\[g\]/); // never point at a key attach mode ignores
 });
 
 test('a lost connection keeps the last snapshot and says it is stale', async (t) => {
@@ -320,6 +380,20 @@ test('a rejected switch is reported and leaves the view alone', async (t) => {
   await settle();
   assert.equal(tui.mode, 'normal');
   assert.match(tui.log[0].msg, /switch failed/i);
+});
+
+test('a row that vanished between polls reports that nothing happened', async (t) => {
+  const { tui, am, seen } = await makeSession(t);
+  am.applyStatus(statusFixture());
+  tui._key('s');
+  tui._key('down'); // cursor on the second account
+  am.applyStatus(statusFixture({ accounts: [statusFixture().accounts[0]] })); // it goes away
+  tui._key('enter');
+  await settle();
+
+  assert.equal(tui.mode, 'normal');
+  assert.match(tui.log[0].msg, /no longer listed/i);
+  assert.deepEqual(seen, []); // and nothing was asked of the server
 });
 
 test('route pinning is not offered in attach mode', async (t) => {
