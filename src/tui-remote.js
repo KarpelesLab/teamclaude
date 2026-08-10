@@ -28,16 +28,20 @@ export class RemoteControl {
   }
 
   /**
-   * Point the running server's default route at `name`.
+   * Make the running server prefer `name`.
    *
-   * A server predating the endpoint answers 404 — reported as such rather than
-   * swallowed, so the dashboard never shows a switch that did not happen.
+   * The endpoint answers 404 for an account it cannot resolve, and a server
+   * predating the endpoint has no handler for the path at all — two different
+   * failures behind one status code. The control endpoints always answer with
+   * `ok: false` plus a reason, so a 404 without that came from somewhere else
+   * and means the feature is missing. Either way it is reported, never swallowed:
+   * the dashboard must not show a switch that did not happen.
    */
   async switchAccount(name) {
     try {
       return await this._call('POST', '/teamclaude/switch', { account: name });
     } catch (err) {
-      if (err.status === 404 || err.status === 501) {
+      if (!err.answered && (err.status === 404 || err.status === 501)) {
         throw new Error('this server does not support switching accounts');
       }
       throw err;
@@ -58,8 +62,13 @@ export class RemoteControl {
     try { payload = text ? JSON.parse(text) : null; } catch { /* not JSON — the status carries the meaning */ }
 
     if (!res.ok) {
-      const err = new Error(payload?.error ? `HTTP ${res.status}: ${payload.error}` : `HTTP ${res.status}`);
+      // `ok: false` + a string reason is this control plane's own error shape;
+      // anything else reached a handler that is not ours (an old server forwards
+      // unknown paths upstream, and Anthropic's error body looks nothing like it).
+      const answered = payload?.ok === false && typeof payload.error === 'string';
+      const err = new Error(answered ? payload.error : `HTTP ${res.status}`);
       err.status = res.status;
+      err.answered = answered;
       throw err;
     }
     // A 200 body can still report failure (the reload endpoint does this).

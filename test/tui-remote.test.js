@@ -125,6 +125,32 @@ test('a server without the switch endpoint says so instead of reporting success'
   await assert.rejects(() => control.switchAccount('alpha'), /does not support/i);
 });
 
+// The endpoint answers 404 for an account it cannot resolve, which is a
+// different failure from the path not existing at all — and the only thing
+// separating them is the control plane's own { ok: false, error } shape.
+test('an unresolvable account is reported by reason, not as a missing feature', async (t) => {
+  const { control } = await makeSession(t, {
+    routes: {
+      'GET /teamclaude/status': json(statusFixture()),
+      'POST /teamclaude/switch': (req, res) => {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'no such account "ghost"', accounts: ['alpha', 'bravo'] }));
+      },
+    },
+  });
+  await assert.rejects(() => control.switchAccount('ghost'), /no such account "ghost"/);
+});
+
+test('a rejection reported with 200 is still a rejection', async (t) => {
+  const { control } = await makeSession(t, {
+    routes: {
+      'GET /teamclaude/status': json(statusFixture()),
+      'POST /teamclaude/reload': json({ ok: false, error: 'reload not supported' }),
+    },
+  });
+  await assert.rejects(() => control.reload(), /reload not supported/);
+});
+
 // ── status → account-manager adapter ─────────────────────────
 
 test('a status payload fills the read surface the dashboard renders from', async (t) => {

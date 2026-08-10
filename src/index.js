@@ -16,6 +16,7 @@ import { ensureCerts } from './mitm.js';
 import { Prober } from './prober.js';
 import { Warmer } from './warmer.js';
 import { TUI } from './tui.js';
+import { RemoteControl, createAttachSession } from './tui-remote.js';
 import { SxManager } from './sx.js';
 import { autoUpdate, checkForUpdate, currentVersion, runUpdate, installKind, PKG_NAME } from './updater.js';
 import { renderStatus } from './status-renderer.js';
@@ -48,6 +49,10 @@ switch (command) {
     break;
   case 'status':
     await statusCommand();
+    process.exit(0);
+    break;
+  case 'attach':
+    await attachCommand();
     process.exit(0);
     break;
   case 'accounts':
@@ -824,6 +829,38 @@ async function statusCommand() {
   }
 }
 
+// ── attach ──────────────────────────────────────────────────
+
+// The interactive dashboard against a server that is ALREADY running. A proxy
+// installed as a background service has no foreground TUI, so this is the only
+// way to watch and steer it live; it renders from polled status and can only do
+// what the control plane exposes (switch, reload).
+async function attachCommand() {
+  const config = await loadOrCreateConfig();
+  const port = config.proxy.port;
+
+  // Checked before connecting: the dashboard needs raw-mode input, and failing
+  // on that after a successful poll would be a confusing order to report it in.
+  if (!process.stdin.isTTY) {
+    console.error('teamclaude attach needs a terminal. For a one-shot readout use: teamclaude status');
+    process.exit(1);
+  }
+
+  const control = new RemoteControl({ port, apiKey: config.proxy.apiKey });
+  try {
+    await control.status(); // fail here, with a usable message, not inside the TUI
+  } catch (err) {
+    console.error('Cannot connect to proxy at localhost:' + port);
+    console.error('Is the server running? Start with: teamclaude server');
+    if (err?.message) console.error(`Details: ${err.message}`);
+    process.exit(1);
+  }
+
+  await new Promise(resolve => {
+    createAttachSession({ control, config, onQuit: resolve }).start();
+  });
+}
+
 // ── switch ──────────────────────────────────────────────────
 
 // Manual account switch against a RUNNING server — the headless equivalent of
@@ -1456,6 +1493,8 @@ Commands:
                       'print' writes the unit to stdout without touching anything)
   status [--json]     Show rich proxy/account/probe status (live)
                       Use --color=always|never to control ANSI colors
+  attach              Open the live dashboard against a running server; s
+                      switches account, R reloads config, q leaves it running
   accounts            List configured accounts
   switch [NAME]       Make the running server prefer one account (as 's' in the
                       TUI does); with no NAME, list accounts and mark the current

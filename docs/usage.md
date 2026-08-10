@@ -113,6 +113,7 @@ teamclaude env               # Print export lines for routing claude yourself
 teamclaude alias             # Print/install a `claude` alias that routes via the proxy
 teamclaude accounts          # List accounts with subscription tier and token status
 teamclaude status            # Show live proxy status (requires running server)
+teamclaude attach            # Open the live dashboard against a running server
 teamclaude switch [name]     # Prefer an account; no name lists them (needs server)
 teamclaude remove <name>     # Remove an account (by name or email)
 teamclaude disable <name>    # Temporarily exclude an account from rotation
@@ -128,6 +129,8 @@ teamclaude help              # Show all commands
 ```
 
 `teamclaude status` prints the same picture as the TUI, once, as text. Handy over SSH or in a script; `--json` for machine-readable output.
+
+`teamclaude attach` opens the dashboard itself against a server that is already running, which is how you get interactive control back when the proxy runs as a background service. It polls the same status endpoint every second and can do the two things the control plane exposes: `s` switches account, `R` reloads config. Settings editing, quota probing and the request activity stream stay in the server's own TUI — they need state that only that process has. When contact with the server drops, the header marker turns from `▲` to `▼` and what is on screen is the last snapshot, not the current state.
 
 ![teamclaude status output](assets/status-redacted.png)
 
