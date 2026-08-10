@@ -147,6 +147,60 @@ test('switching to a usable account reports it as eligible', async () => {
   });
 });
 
+// Unavailability is not the only way a switch gets undone. A perfectly healthy
+// account is dropped just as fast when another available account outranks it on
+// priority, so "eligible" has to answer the real question — would a request go
+// here — rather than only "is this account usable at all".
+test('a switch that priority will immediately override is reported as ineligible', async () => {
+  const am = new AccountManager([
+    { name: 'high@example.com', type: 'apikey', apiKey: 'k1', priority: 0 },
+    { name: 'low@example.com', type: 'apikey', apiKey: 'k2', priority: 1 },
+  ], 0.98);
+  const proxy = createProxyServer(am, CONFIG, {});
+  const port = await listen(proxy);
+  try {
+    const res = await post(port, JSON.stringify({ account: 'low@example.com' }));
+    assert.equal(res.status, 200);
+    assert.equal(res.body.ok, true, 'the switch is still recorded');
+    assert.equal(res.body.eligible, false, 'a preempted target is not where traffic will go');
+    assert.match(res.body.reason, /priority/i);
+    assert.match(res.body.reason, /high@example\.com/, 'name the account that wins');
+    assert.equal(am.currentIndex, 1, 'currentIndex still moves');
+    // Proof the report is not pedantic: selection hands it straight back.
+    assert.equal(am.getActiveAccount().name, 'high@example.com');
+  } finally {
+    proxy.close();
+  }
+});
+
+test('switching to the highest-priority account is eligible', async () => {
+  const am = new AccountManager([
+    { name: 'high@example.com', type: 'apikey', apiKey: 'k1', priority: 0 },
+    { name: 'low@example.com', type: 'apikey', apiKey: 'k2', priority: 1 },
+  ], 0.98);
+  const proxy = createProxyServer(am, CONFIG, {});
+  const port = await listen(proxy);
+  try {
+    am.currentIndex = 1;
+    const res = await post(port, JSON.stringify({ account: 'high@example.com' }));
+    assert.equal(res.body.eligible, true);
+    assert.equal(res.body.reason, undefined);
+    assert.equal(am.getActiveAccount().name, 'high@example.com');
+  } finally {
+    proxy.close();
+  }
+});
+
+// Equal priority must NOT read as preemption, or every default fleet would
+// report its own current account as ineligible.
+test('accounts at the same priority do not preempt each other', async () => {
+  await withServer(async (am, port) => {
+    const res = await post(port, JSON.stringify({ account: 'bob@example.com (Acme)' }));
+    assert.equal(res.body.eligible, true);
+    assert.equal(am.getActiveAccount().name, 'bob@example.com (Acme)');
+  });
+});
+
 test('an over-limit body is refused as 413 without echoing parser internals', async () => {
   await withServer(async (am, port) => {
     const res = await post(port, JSON.stringify({ account: 'a'.repeat(70_000) }));

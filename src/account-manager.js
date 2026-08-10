@@ -287,12 +287,7 @@ export class AccountManager {
       if (next) { current.requalify = false; return next; }
     }
     if (this._isAvailable(current, model, advisorModel) && !exclude?.has(current.index)) {
-      // A strictly higher-priority (lower value) available account preempts a
-      // healthy current one. Within the same priority tier we stay put, so the
-      // common case (all accounts at the default priority 0) is unchanged and
-      // never thrashes — preemption only triggers when priorities differ.
-      const betterExists = this.accounts.some(a =>
-        this._isAvailable(a, model, advisorModel) && !exclude?.has(a.index) && (a.priority || 0) < (current.priority || 0));
+      const betterExists = this._preemptedBy(current, model, advisorModel, exclude);
       return betterExists ? this._selectNext(exclude, model, advisorModel) : current;
     }
     const next = this._selectNext(exclude, model, advisorModel);
@@ -578,26 +573,48 @@ export class AccountManager {
   }
 
   /**
-   * Whether requests would actually route to an account right now, with a short
-   * reason when they would not. The public counterpart of the internal
-   * availability check: a caller that records a manual choice (the control
+   * The available account that would preempt `account` under the priority rule,
+   * or null. A strictly lower priority value wins; within the same tier we stay
+   * put, so the common case (every account at the default priority 0) never
+   * thrashes. Shared by _select, which enforces it, and eligibility(), which
+   * reports it — one predicate so the answer cannot drift from the behaviour.
+   */
+  _preemptedBy(account, model = null, advisorModel = null, exclude = null) {
+    return this.accounts.find(a => this._isAvailable(a, model, advisorModel)
+      && !exclude?.has(a.index)
+      && (a.priority || 0) < (account.priority || 0)) || null;
+  }
+
+  /**
+   * Whether a request right now would actually route to an account, with a short
+   * reason when it would not. A caller that records a manual choice (the control
    * plane's switch endpoint) needs to report whether that choice will take
-   * effect, not merely that it was stored — selection skips an unavailable
-   * account on the very next request.
+   * effect, not merely that it was stored: selection drops the choice on the very
+   * next request both when the account cannot serve traffic and when another
+   * available account outranks it on priority. Both are asked here through the
+   * same helpers _select uses, so the flag cannot promise more than the selector
+   * delivers.
    * @returns {{eligible: boolean, reason?: string}}
    */
   eligibility(accountIndex) {
     const account = this.accounts[accountIndex];
     if (!account) return { eligible: false, reason: 'no such account' };
-    // Ask the real predicate rather than re-deriving it, so the two can't drift.
-    // It also clears an expired throttle, which is why the reasons below are
-    // only consulted once it has said no.
-    if (this._isAvailable(account)) return { eligible: true };
-    if (account.disabled) return { eligible: false, reason: 'disabled' };
-    if (account.status === 'error') return { eligible: false, reason: 'in an error state and needs a re-login' };
-    if (account.status === 'exhausted') return { eligible: false, reason: 'out of quota' };
-    if (account.status === 'throttled') return { eligible: false, reason: 'rate-limited' };
-    return { eligible: false, reason: 'at or above the switch threshold' };
+    // _isAvailable also clears an expired throttle, so the specific reasons below
+    // are only consulted once it has actually said no.
+    if (!this._isAvailable(account)) {
+      if (account.disabled) return { eligible: false, reason: 'disabled' };
+      if (account.status === 'error') return { eligible: false, reason: 'in an error state and needs a re-login' };
+      if (account.status === 'exhausted') return { eligible: false, reason: 'out of quota' };
+      if (account.status === 'throttled') return { eligible: false, reason: 'rate-limited' };
+      return { eligible: false, reason: 'at or above the switch threshold' };
+    }
+    // Healthy, but a higher-priority account preempts it on the next selection.
+    // Phrased to read correctly after "<name> is ..." in the caller's message.
+    const preemptor = this._preemptedBy(account);
+    if (preemptor) {
+      return { eligible: false, reason: `outranked by higher-priority account "${preemptor.name}"` };
+    }
+    return { eligible: true };
   }
 
   /**
