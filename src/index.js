@@ -54,6 +54,10 @@ switch (command) {
     await accountsCommand();
     process.exit(0);
     break;
+  case 'switch':
+    await switchCommand();
+    process.exit(0);
+    break;
   case 'remove':
     await removeCommand();
     process.exit(0);
@@ -820,6 +824,58 @@ async function statusCommand() {
   }
 }
 
+// ── switch ──────────────────────────────────────────────────
+
+// Manual account switch against a RUNNING server — the headless equivalent of
+// pressing 's' in the TUI, which is unreachable when the proxy runs as a
+// background service. Nothing is written to the config: like the TUI's switch
+// this is a runtime preference that dies with the process, so the server is the
+// only place that can answer or apply it.
+async function switchCommand() {
+  const config = await loadOrCreateConfig();
+  const port = config.proxy.port;
+  const headers = { 'x-api-key': config.proxy.apiKey };
+  const name = args[1] && !args[1].startsWith('-') ? args[1] : null;
+
+  try {
+    if (!name) {
+      const res = await fetch(`http://localhost:${port}/teamclaude/status`, { headers });
+      const data = await res.json();
+      const accounts = data.accounts || [];
+      if (!accounts.length) {
+        console.log('No accounts configured.');
+        return;
+      }
+      for (const a of accounts) {
+        console.log(`${a.name === data.currentAccount ? '*' : ' '} ${a.name}`);
+      }
+      console.log('\nSwitch with: teamclaude switch <name>');
+      return;
+    }
+
+    const res = await fetch(`http://localhost:${port}/teamclaude/switch`, {
+      method: 'POST',
+      headers: { ...headers, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ account: name }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      console.error(data.error || `Switch failed (HTTP ${res.status})`);
+      if (data.accounts?.length) {
+        console.error('Known accounts:');
+        for (const n of data.accounts) console.error(`  ${n}`);
+      }
+      process.exit(1);
+    }
+    console.log(`Switched to "${data.account}"`);
+  } catch (err) {
+    console.error('Cannot connect to proxy at localhost:' + port);
+    console.error('Is the server running? Start with: teamclaude server');
+    if (err?.message) console.error(`Details: ${err.message}`);
+    process.exit(1);
+  }
+}
+
 // ── accounts ────────────────────────────────────────────────
 
 async function accountsCommand() {
@@ -1380,6 +1436,8 @@ Commands:
   status [--json]     Show rich proxy/account/probe status (live)
                       Use --color=always|never to control ANSI colors
   accounts            List configured accounts
+  switch [NAME]       Make the running server prefer one account (as 's' in the
+                      TUI does); with no NAME, list accounts and mark the current
   remove <name>       Remove an account (by name or email; --org to disambiguate)
   disable <name>      Temporarily exclude an account from rotation
   enable <name>       Re-enable a disabled account (also clears a stuck error)
@@ -1428,6 +1486,8 @@ launched with and without --no-mitm can share one server.
 
 A running server re-syncs accounts from config on POST /teamclaude/reload
 (local only). add/login/enable/disable/priority trigger it automatically.
+POST /teamclaude/switch {"account": "<name>"} makes one account the preferred
+one, which is what 'teamclaude switch' calls.
 
 Upstream proxy. On a host with no direct route to the internet, set
 "upstreamProxy": "http://user:pass@host:3128" (or just "host:3128") and every
