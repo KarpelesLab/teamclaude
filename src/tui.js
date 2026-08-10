@@ -689,8 +689,15 @@ export class TUI {
   // dashboard never implies a switch that the server refused.
   async _doSwitchRemote(acct) {
     try {
-      await this.applySwitch(acct.name);
-      this._addLog(`Switched to "${acct.name}"`);
+      const res = await this.applySwitch(acct.name);
+      // The server resolves the name it was given and echoes what it settled on;
+      // prefer that over what was highlighted here. `eligible: false` means the
+      // switch applied to an account that cannot currently serve requests, which
+      // the row already shows but is worth stating at the moment it is chosen.
+      const name = res?.account || acct.name;
+      this._addLog(res?.eligible === false
+        ? `Switched to "${name}" — it cannot serve requests right now`
+        : `Switched to "${name}"`);
     } catch (e) {
       this._addLog(`Switch failed: ${e.message}`);
     }

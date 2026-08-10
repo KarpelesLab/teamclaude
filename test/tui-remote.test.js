@@ -370,6 +370,38 @@ test('s switches the running server to the selected account', async (t) => {
   assert.match(tui.log[0].msg, /alpha/);
 });
 
+// The server applies a switch to a disabled account and says so with
+// eligible:false. The row already carries the disabled marker, but the moment of
+// choosing is where it matters.
+test('switching to an account that cannot serve says so', async (t) => {
+  const { tui, am } = await makeSession(t, {
+    routes: {
+      'GET /teamclaude/status': json(statusFixture()),
+      'POST /teamclaude/switch': json({ ok: true, account: 'alpha', eligible: false }),
+    },
+  });
+  am.applyStatus(statusFixture());
+  tui._key('s');
+  tui._key('enter');
+  await settle();
+  assert.match(tui.log[0].msg, /cannot serve requests/);
+});
+
+test('a switch reports the name the server settled on', async (t) => {
+  const { tui, am } = await makeSession(t, {
+    routes: {
+      'GET /teamclaude/status': json(statusFixture()),
+      // resolveAccountPin canonicalises what it is given; the echo is the truth.
+      'POST /teamclaude/switch': json({ ok: true, account: 'bravo (Acme)' }),
+    },
+  });
+  am.applyStatus(statusFixture());
+  tui._key('s');
+  tui._key('enter');
+  await settle();
+  assert.match(tui.log[0].msg, /Switched to "bravo \(Acme\)"/);
+});
+
 test('a rejected switch is reported and leaves the view alone', async (t) => {
   const { tui, am } = await makeSession(t, {
     routes: { 'GET /teamclaude/status': json(statusFixture()) }, // no switch route
