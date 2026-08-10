@@ -578,6 +578,29 @@ export class AccountManager {
   }
 
   /**
+   * Whether requests would actually route to an account right now, with a short
+   * reason when they would not. The public counterpart of the internal
+   * availability check: a caller that records a manual choice (the control
+   * plane's switch endpoint) needs to report whether that choice will take
+   * effect, not merely that it was stored — selection skips an unavailable
+   * account on the very next request.
+   * @returns {{eligible: boolean, reason?: string}}
+   */
+  eligibility(accountIndex) {
+    const account = this.accounts[accountIndex];
+    if (!account) return { eligible: false, reason: 'no such account' };
+    // Ask the real predicate rather than re-deriving it, so the two can't drift.
+    // It also clears an expired throttle, which is why the reasons below are
+    // only consulted once it has said no.
+    if (this._isAvailable(account)) return { eligible: true };
+    if (account.disabled) return { eligible: false, reason: 'disabled' };
+    if (account.status === 'error') return { eligible: false, reason: 'in an error state and needs a re-login' };
+    if (account.status === 'exhausted') return { eligible: false, reason: 'out of quota' };
+    if (account.status === 'throttled') return { eligible: false, reason: 'rate-limited' };
+    return { eligible: false, reason: 'at or above the switch threshold' };
+  }
+
+  /**
    * Normalize and store the configurable routing table. A route pins a set of
    * model globs to an exclusive set of accounts (and may override the governing
    * quota bucket). Called from the constructor and on config reload.

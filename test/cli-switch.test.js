@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
+import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -111,6 +112,105 @@ test('an unknown name exits 1 and prints the valid names', async () => {
     assert.match(res.stderr, /bob@example\.com \(Acme\)/);
     assert.equal(am.currentIndex, 0, 'a refused switch must not move the current account');
   });
+});
+
+// Same rule as the endpoint: the switch is recorded, but a caller must not be
+// told plainly that it worked when no request will ever reach that account.
+async function withDisabled(fn) {
+  const accts = [
+    { name: 'alice@example.com', type: 'apikey', apiKey: 'k1' },
+    { name: 'off@example.com', type: 'apikey', apiKey: 'k2', disabled: true },
+  ];
+  const am = new AccountManager(accts, 0.98);
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'tc-test' }, upstream: 'https://api.anthropic.com' }, {});
+  const port = await listen(proxy);
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-switch-'));
+  const path = join(dir, 'config.json');
+  await writeFile(path, JSON.stringify({
+    proxy: { port, apiKey: 'tc-test' }, upstream: 'https://api.anthropic.com',
+    upstreamProxy: false, switchThreshold: 0.98, accounts: accts,
+  }));
+  try {
+    await fn(am, path);
+  } finally {
+    proxy.close();
+  }
+}
+
+test('switching to a disabled account warns instead of reporting a clean success', async () => {
+  await withDisabled(async (am, configPath) => {
+    const res = await runCli(configPath, ['switch', 'off@example.com']);
+    assert.equal(res.code, 0, 'the switch is still recorded, so this is not a failure');
+    const all = res.stdout + res.stderr;
+    assert.match(all, /off@example\.com/);
+    assert.match(all, /disabled/i, `expected a warning naming the reason: ${all}`);
+    assert.match(all, /will not route|not be used|until/i, `expected the consequence spelled out: ${all}`);
+  });
+});
+
+test('the listing marks a disabled account', async () => {
+  await withDisabled(async (am, configPath) => {
+    const res = await runCli(configPath, ['switch']);
+    assert.equal(res.code, 0, res.stderr);
+    const off = res.stdout.split('\n').find(l => l.includes('off@example.com'));
+    const alice = res.stdout.split('\n').find(l => l.includes('alice@example.com'));
+    assert.match(off, /disabled/i, `expected the disabled account flagged: ${res.stdout}`);
+    assert.doesNotMatch(alice, /disabled/i, `expected a healthy account left unflagged: ${res.stdout}`);
+  });
+});
+
+// A reply from something that is not our proxy, or from a version that predates
+// the endpoint, must not be reported as "no server" or as an empty account list.
+test('an unexpected reply is reported as such, not as a down server', async () => {
+  const impostor = http.createServer((_req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end('<html>not teamclaude</html>');
+  });
+  const port = await listen(impostor);
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-switch-'));
+  const path = join(dir, 'config.json');
+  await writeFile(path, JSON.stringify({
+    proxy: { port, apiKey: 'tc-test' }, upstream: 'https://api.anthropic.com',
+    upstreamProxy: false, switchThreshold: 0.98, accounts: ACCTS,
+  }));
+  try {
+    const res = await runCli(path, ['switch']);
+    assert.equal(res.code, 1);
+    assert.doesNotMatch(res.stderr, /Is the server running\?/, 'something answered, so this is not a down server');
+    assert.doesNotMatch(res.stdout, /No accounts configured/, 'an unparseable reply is not an empty fleet');
+    assert.match(res.stderr, /unexpected|not a teamclaude|invalid/i, res.stderr);
+  } finally {
+    impostor.close();
+  }
+});
+
+// An old server has no /teamclaude/switch, so the request falls through to the
+// proxy path and Anthropic answers with an error OBJECT. Printing it raw yields
+// "[object Object]", which tells the user nothing.
+test('a non-string error field does not print as [object Object]', async () => {
+  const oldServer = http.createServer((req, res) => {
+    if (req.url === '/teamclaude/status') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ currentAccount: 'alice@example.com', accounts: [{ name: 'alice@example.com' }] }));
+      return;
+    }
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'nope' } }));
+  });
+  const port = await listen(oldServer);
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-switch-'));
+  const path = join(dir, 'config.json');
+  await writeFile(path, JSON.stringify({
+    proxy: { port, apiKey: 'tc-test' }, upstream: 'https://api.anthropic.com',
+    upstreamProxy: false, switchThreshold: 0.98, accounts: ACCTS,
+  }));
+  try {
+    const res = await runCli(path, ['switch', 'alice@example.com']);
+    assert.equal(res.code, 1);
+    assert.doesNotMatch(res.stderr, /\[object Object\]/, res.stderr);
+  } finally {
+    oldServer.close();
+  }
 });
 
 test('a down server exits 1 with the same hint as status', async () => {

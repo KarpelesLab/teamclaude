@@ -840,14 +840,25 @@ async function switchCommand() {
   try {
     if (!name) {
       const res = await fetch(`http://localhost:${port}/teamclaude/status`, { headers });
-      const data = await res.json();
-      const accounts = data.accounts || [];
-      if (!accounts.length) {
+      // Something answered on the port. Whether it is our proxy is a separate
+      // question, and getting it wrong would blame a down server for a reply we
+      // simply could not read — or report an unreadable reply as an empty fleet.
+      const data = res.ok ? await res.json().catch(() => null) : null;
+      if (!data || !Array.isArray(data.accounts)) {
+        console.error(`Unexpected reply from localhost:${port} (HTTP ${res.status}) — no account list in it.`);
+        console.error('Something is listening there, but it does not answer like this teamclaude version.');
+        process.exit(1);
+      }
+      if (!data.accounts.length) {
         console.log('No accounts configured.');
         return;
       }
-      for (const a of accounts) {
-        console.log(`${a.name === data.currentAccount ? '*' : ' '} ${a.name}`);
+      for (const a of data.accounts) {
+        // Flag what would stop traffic reaching an account. The TUI shows this in
+        // its table, so leaving it out here would make the headless half of the
+        // feature the only place a disabled account looks switchable.
+        const state = a.disabled ? 'disabled' : (a.status && a.status !== 'active' ? a.status : null);
+        console.log(`${a.name === data.currentAccount ? '*' : ' '} ${a.name}${state ? `  (${state})` : ''}`);
       }
       console.log('\nSwitch with: teamclaude switch <name>');
       return;
@@ -860,7 +871,12 @@ async function switchCommand() {
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
-      console.error(data.error || `Switch failed (HTTP ${res.status})`);
+      // Our own errors are strings. A server too old to know this endpoint
+      // forwards the request upstream instead, and Anthropic's error is an
+      // object — printing that raw gives the user "[object Object]".
+      const detail = typeof data.error === 'string' ? data.error : null;
+      console.error(detail || `Switch failed: unexpected reply from localhost:${port} (HTTP ${res.status}).`);
+      if (!detail) console.error('An older server without this endpoint answers this way; restart it to pick up the new version.');
       if (data.accounts?.length) {
         console.error('Known accounts:');
         for (const n of data.accounts) console.error(`  ${n}`);
@@ -868,6 +884,11 @@ async function switchCommand() {
       process.exit(1);
     }
     console.log(`Switched to "${data.account}"`);
+    // Recorded is not the same as in effect: rotation skips an account it cannot
+    // use on the very next request, so saying nothing here would be a quiet lie.
+    if (data.eligible === false) {
+      console.error(`Warning: "${data.account}" is ${data.reason || 'not currently eligible'}, so requests will not route to it until that changes.`);
+    }
   } catch (err) {
     console.error('Cannot connect to proxy at localhost:' + port);
     console.error('Is the server running? Start with: teamclaude server');

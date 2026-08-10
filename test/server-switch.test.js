@@ -110,6 +110,76 @@ test('a malformed body is a 400, not a crash', async () => {
   });
 });
 
+// A switch that cannot take effect must not report a bare success. currentIndex
+// still moves (that is the TUI's behaviour), but selection skips an unavailable
+// account on the very next request, so the answer says whether traffic will
+// actually follow the choice.
+test('switching to a disabled account succeeds but reports it as ineligible', async () => {
+  const am = new AccountManager([
+    { name: 'live@example.com', type: 'apikey', apiKey: 'k1' },
+    { name: 'off@example.com', type: 'apikey', apiKey: 'k2', disabled: true },
+  ], 0.98);
+  const proxy = createProxyServer(am, CONFIG, {});
+  const port = await listen(proxy);
+  try {
+    const res = await post(port, JSON.stringify({ account: 'off@example.com' }));
+    assert.equal(res.status, 200);
+    assert.equal(res.body.ok, true, 'the switch is still recorded, as in the TUI');
+    assert.equal(res.body.account, 'off@example.com');
+    assert.equal(res.body.eligible, false);
+    assert.match(res.body.reason, /disabled/);
+    assert.equal(am.currentIndex, 1, 'currentIndex moves even when ineligible');
+    // Proof the report is not pedantic: the next selection abandons the choice.
+    assert.equal(am.getActiveAccount().name, 'live@example.com');
+  } finally {
+    proxy.close();
+  }
+});
+
+test('switching to a usable account reports it as eligible', async () => {
+  await withServer(async (am, port) => {
+    const res = await post(port, JSON.stringify({ account: 'bob@example.com (Acme)' }));
+    assert.equal(res.body.eligible, true);
+    assert.equal(res.body.reason, undefined, 'no reason when nothing is wrong');
+    assert.equal(am.getActiveAccount().name, 'bob@example.com (Acme)');
+  });
+});
+
+test('an over-limit body is refused as 413 without echoing parser internals', async () => {
+  await withServer(async (am, port) => {
+    const res = await post(port, JSON.stringify({ account: 'a'.repeat(70_000) }));
+    assert.equal(res.status, 413);
+    assert.equal(res.body.ok, false);
+    assert.match(res.body.error, /too large/);
+    assert.equal(am.currentIndex, 0);
+  });
+});
+
+// The log line is the only record of a manual switch on a headless server, so a
+// refactor that drops it must fail something.
+test('a successful switch is logged, and says so when the target is ineligible', async () => {
+  const am = new AccountManager([
+    { name: 'live@example.com', type: 'apikey', apiKey: 'k1' },
+    { name: 'off@example.com', type: 'apikey', apiKey: 'k2', disabled: true },
+  ], 0.98);
+  const proxy = createProxyServer(am, CONFIG, {});
+  const port = await listen(proxy);
+  const lines = [];
+  const origLog = console.log;
+  console.log = (...a) => lines.push(a.join(' '));
+  try {
+    await post(port, JSON.stringify({ account: 'live@example.com' }));
+    await post(port, JSON.stringify({ account: 'off@example.com' }));
+  } finally {
+    console.log = origLog;
+    proxy.close();
+  }
+  assert.ok(lines.some(l => l.includes('live@example.com') && /switch/i.test(l)), lines.join(' | '));
+  const offLine = lines.find(l => l.includes('off@example.com'));
+  assert.ok(offLine, lines.join(' | '));
+  assert.match(offLine, /disabled/, 'the log must not claim a clean switch to an unusable account');
+});
+
 // Loopback is exempt from the proxy-key gate (that is what makes the fetch-based
 // tests above work), so the gate itself has to be exercised with a remote peer.
 function remoteRequest(server, { headers = {}, body = '{}' } = {}) {

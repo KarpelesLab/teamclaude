@@ -125,8 +125,11 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
           const raw = await readControlBody(req);
           target = JSON.parse(raw || '{}')?.account;
         } catch (err) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: false, error: `invalid request body: ${err.message}` }));
+          // Say which of the two it was, but never echo the parser's own message
+          // back to a caller — that is our internals, not their input.
+          const tooLarge = err.message === 'body too large';
+          res.writeHead(tooLarge ? 413 : 400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: tooLarge ? 'request body too large' : 'invalid request body' }));
           return;
         }
         if (typeof target !== 'string' || !target.trim()) {
@@ -141,14 +144,22 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
           return;
         }
         accountManager.currentIndex = index;
+        const name = accountManager.accounts[index].name;
+        // Recording the choice and the choice taking effect are two different
+        // things: selection skips an account it cannot use on the very next
+        // request, so a bare "ok" would be a lie for a disabled or spent target.
+        // The switch still happens (that is the TUI's behaviour) and the answer
+        // says whether traffic will follow it.
+        const { eligible, reason } = accountManager.eligibility(index);
         // Leave a trace where every other account change already leaves one: the
         // TUI swaps console.log for its activity pane and headless mode tees it
         // to the activity log, so this one line covers both. Without it a manual
         // switch is the only account change that happens invisibly — on exactly
         // the background-service deployment this endpoint exists for.
-        console.log(`[TeamClaude] Switched to account "${accountManager.accounts[index].name}" (manual)`);
+        console.log(`[TeamClaude] Switched to account "${name}" (manual)`
+          + (eligible ? '' : ` — ${reason}, so rotation will not use it`));
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, account: accountManager.accounts[index].name }));
+        res.end(JSON.stringify({ ok: true, account: name, eligible, ...(reason ? { reason } : {}) }));
         return;
       }
 
