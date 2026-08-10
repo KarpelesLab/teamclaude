@@ -152,6 +152,7 @@ export class RemoteAccountManager {
 export function createAttachSession({ control, config, onQuit, pollMs = DEFAULT_POLL_MS }) {
   const am = new RemoteAccountManager();
   let timer = null;
+  let polling = false;
 
   const stop = () => {
     if (timer) { clearInterval(timer); timer = null; }
@@ -170,6 +171,10 @@ export function createAttachSession({ control, config, onQuit, pollMs = DEFAULT_
   });
 
   const poll = async () => {
+    // A server that accepts the connection and then never answers would other-
+    // wise collect one pending request per tick, for as long as it stays wedged.
+    if (polling) return;
+    polling = true;
     try {
       const status = await control.status();
       const recovered = !am.connected && am.lastError != null;
@@ -181,6 +186,8 @@ export function createAttachSession({ control, config, onQuit, pollMs = DEFAULT_
         tui._addLog(`Lost contact with the server: ${err.message}`);
       }
       am.markDisconnected(err);
+    } finally {
+      polling = false;
     }
     tui.render();
   };

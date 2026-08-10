@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { RemoteControl, RemoteAccountManager, createAttachSession } from '../src/tui-remote.js';
+import { RemoteControl, createAttachSession } from '../src/tui-remote.js';
 
 // Attach mode: a dashboard driven by polled /teamclaude/status instead of a live
 // AccountManager. The control plane here is a real HTTP server serving canned
@@ -238,6 +238,31 @@ test('a poll applies the payload; a failing poll flags the header and logs once'
 
   await session.poll(); // still down — do not repeat the message every second
   assert.equal(tui.log.filter(l => /lost|503/i.test(l.msg)).length, 1);
+});
+
+test('a wedged server does not collect one pending request per tick', async (t) => {
+  let release;
+  const held = new Promise(resolve => { release = resolve; });
+  const { session, seen } = await makeSession(t, {
+    routes: {
+      'GET /teamclaude/status': async (req, res) => {
+        await held; // accepted, answered only when the test lets go
+        json(statusFixture())(req, res);
+      },
+    },
+  });
+
+  const first = session.poll();
+  await settle(); // let that one reach the server, where it now hangs
+  await session.poll(); // a tick landing while the first is still in flight
+  await session.poll();
+  assert.equal(seen.length, 1);
+
+  release();
+  await first;
+  assert.equal(seen.length, 1);
+  await session.poll(); // the door reopens once the outstanding call finishes
+  assert.equal(seen.length, 2);
 });
 
 // ── keys ─────────────────────────────────────────────────────
