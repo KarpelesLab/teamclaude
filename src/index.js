@@ -838,6 +838,12 @@ async function statusCommand() {
 async function attachCommand() {
   const config = await loadOrCreateConfig();
   const port = config.proxy.port;
+  // Reach the server where it actually binds (see serverCommand): a host set in
+  // the config or the environment is not reachable as localhost, and reporting
+  // "not running" for a server that is plainly up is the worst of the answers.
+  // A wildcard bind is not an address to dial, so dial this machine instead.
+  const bound = process.env.TEAMCLAUDE_HOST || config.proxy.host || '127.0.0.1';
+  const host = (bound === '0.0.0.0' || bound === '::') ? '127.0.0.1' : bound;
 
   // Checked before connecting: the dashboard needs raw-mode input, and failing
   // on that after a successful poll would be a confusing order to report it in.
@@ -846,18 +852,23 @@ async function attachCommand() {
     process.exit(1);
   }
 
-  const control = new RemoteControl({ port, apiKey: config.proxy.apiKey });
+  const control = new RemoteControl({ port, host, apiKey: config.proxy.apiKey });
+  let first;
   try {
-    await control.status(); // fail here, with a usable message, not inside the TUI
+    first = await control.status(); // fail here, with a usable message, not inside the TUI
   } catch (err) {
-    console.error('Cannot connect to proxy at localhost:' + port);
+    console.error(`Cannot connect to proxy at ${host}:${port}`);
     console.error('Is the server running? Start with: teamclaude server');
     if (err?.message) console.error(`Details: ${err.message}`);
     process.exit(1);
   }
 
   await new Promise(resolve => {
-    createAttachSession({ control, config, onQuit: resolve }).start();
+    const session = createAttachSession({ control, config, onQuit: resolve });
+    // The status just fetched is the first frame: without it the alt-screen opens
+    // on a disconnected, empty dashboard until the first poll lands.
+    session.am.applyStatus(first);
+    session.start();
   });
 }
 
