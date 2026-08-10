@@ -27,7 +27,14 @@ teamclaude switch                 # list accounts, marking the current one
 teamclaude switch me@example.com  # make that account the preferred one
 ```
 
-Both forms need a running server: the choice is runtime state and is never written to the config, so there is nothing to apply on a later restart. The command wraps `POST /teamclaude/switch` with a `{"account": "<name>"}` body, and the account can be given as its display name, its bare email, its `accountUuid` or its `orgUuid`. The rotation index is deliberately not accepted — it is array position, so a script pinned to `1` would silently follow a different account after a removal. As in the TUI this sets a preference rather than a lock: rotation still moves off the account once it stops being eligible.
+Both forms need a running server: the choice is runtime state and is never written to the config, so there is nothing to apply on a later restart. The command wraps `POST /teamclaude/switch` with a `{"account": "<name>"}` body, and the account can be given as its display name, its bare email, its `accountUuid`, its `orgUuid`, or the fully qualified `accountUuid/orgUuid` — the last being the only form that tells apart one email that holds accounts in several orgs. The rotation index is deliberately not accepted — it is array position, so a script pinned to `1` would silently follow a different account after a removal.
+
+As in the TUI, the choice is a weak preference rather than a lock, and it is worth knowing both ways it gets dropped. Rotation abandons it once the account becomes unusable (disabled, spent, throttled), and also whenever any available account carries a strictly lower `priority` value, since a higher-priority account preempts a healthy current one. A switch onto an account that cannot take traffic at all is still recorded, exactly as in the TUI, but the command says so instead of reporting a clean success:
+
+```text
+Switched to "me@example.com"
+Warning: "me@example.com" is disabled, so requests will not route to it until that changes.
+```
 
 ### TUI keyboard shortcuts
 
@@ -104,7 +111,7 @@ teamclaude env               # Print export lines for routing claude yourself
 teamclaude alias             # Print/install a `claude` alias that routes via the proxy
 teamclaude accounts          # List accounts with subscription tier and token status
 teamclaude status            # Show live proxy status (requires running server)
-teamclaude switch [name]     # Prefer one account (no name lists them)
+teamclaude switch [name]     # Prefer an account; no name lists them (needs server)
 teamclaude remove <name>     # Remove an account (by name or email)
 teamclaude disable <name>    # Temporarily exclude an account from rotation
 teamclaude enable <name>     # Re-enable it (also clears a stuck error state)

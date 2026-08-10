@@ -41,8 +41,10 @@ async function writeConfig(port) {
   await writeFile(path, JSON.stringify({
     proxy: { port, apiKey: 'tc-test' },
     upstream: 'https://api.anthropic.com',
-    // Ignore any proxy in the environment: the CLI only ever talks to localhost
-    // here, and an inherited HTTPS_PROXY would make the run machine-dependent.
+    // Belt and braces, not load-bearing: Node's global fetch ignores proxy env
+    // vars unless NODE_USE_ENV_PROXY is set, so an inherited HTTPS_PROXY does not
+    // reach these localhost calls today. Pinned anyway so the test does not start
+    // depending on that default.
     upstreamProxy: false,
     switchThreshold: 0.98,
     accounts: ACCTS,

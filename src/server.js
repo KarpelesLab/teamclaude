@@ -114,10 +114,13 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
 
       // Switch endpoint — make one account the preferred one, the headless
       // equivalent of picking it with 's' in the TUI. Both do the same single
-      // thing: move currentIndex. It is a preference, not a lock — rotation
-      // still moves off an account that stops being eligible. Body:
-      // {"account": "<name|email|accountUuid|orgUuid>"}. Local control only
-      // (no upstream calls); the auth gate above already applies.
+      // thing: move currentIndex. That is a preference, and a weak one: _select
+      // abandons it as soon as the account is unavailable, and also whenever any
+      // available account carries a strictly lower priority value. So the answer
+      // reports whether the choice will actually take effect rather than only
+      // that it was recorded. Body:
+      // {"account": "<name|email|accountUuid|accountUuid/orgUuid|orgUuid>"}.
+      // Local control only (no upstream calls); the auth gate above applies.
       if (req.method === 'POST' && req.url === '/teamclaude/switch') {
         const names = () => (accountManager.accounts || []).map(a => a.name);
         let target;

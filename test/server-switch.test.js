@@ -7,7 +7,9 @@ import { createProxyServer } from '../src/server.js';
 // POST /teamclaude/switch is the headless equivalent of picking an account with
 // 's' in the TUI: both only move the manager's currentIndex. The TUI is not
 // reachable when the proxy runs as a background service, which is what this
-// endpoint exists for.
+// endpoint exists for. currentIndex is a weak preference — selection drops it
+// when the account is unavailable and also when an available account has a
+// lower priority value — so "recorded" and "in effect" are tested separately.
 
 function listen(server) {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
