@@ -60,7 +60,10 @@ async function fakeServer(t, routes = {}) {
     });
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-  t.after(() => new Promise(resolve => server.close(resolve)));
+  // fetch() pools keep-alive sockets, and server.close() waits for them: without
+  // dropping them explicitly the teardown lingers and leaves sockets behind for
+  // whatever runs next.
+  t.after(() => new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }));
   return { server, seen, port: server.address().port };
 }
 
