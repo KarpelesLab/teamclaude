@@ -99,6 +99,14 @@ function modelMatches(declared, model) {
   return declared === model || declared.replace(/\[\d+m\]$/, '') === model;
 }
 
+// A representative model for a route's own globs, used to report what that route
+// does right now (which accounts may serve it, and which one it would pick).
+// Taken from the route object rather than looked up by name, so two routes
+// sharing a name are still each described by their own globs.
+function sampleModelFor(route) {
+  return route.match[0].replace(/\*/g, '') || 'model';
+}
+
 export class AccountManager {
   constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, throttleProbeFloorMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, sessionTracker } = {}) {
     // How long a just-minted token is trusted against a forced refresh.
@@ -692,7 +700,7 @@ export class AccountManager {
       name: r.name, match: r.match, bucket: r.bucket, color: r.color || null, autocreated: false,
       pinned: this._pinnedName(r.name),
       accounts: this._routeAccountsView(r),
-      target: this._routeTarget(this._routeSample(r.name)),
+      target: this._routeTarget(sampleModelFor(r)),
     }));
 
     const detected = [];
@@ -730,7 +738,7 @@ export class AccountManager {
   /** Accounts a configured route can use (all accounts when it lists none), each
    * with a live eligibility flag for a representative model of the route. */
   _routeAccountsView(route) {
-    const sample = route.match[0].replace(/\*/g, '') || 'model';
+    const sample = sampleModelFor(route);
     const inRoute = a => !route.accounts.length
       || route.accounts.includes(a.name) || route.accounts.includes(String(a.index));
     return this.accounts.filter(inRoute).map(a => ({ name: a.name, eligible: this._isAvailable(a, sample) }));
