@@ -141,6 +141,12 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
           return;
         }
         accountManager.currentIndex = index;
+        // Leave a trace where every other account change already leaves one: the
+        // TUI swaps console.log for its activity pane and headless mode tees it
+        // to the activity log, so this one line covers both. Without it a manual
+        // switch is the only account change that happens invisibly — on exactly
+        // the background-service deployment this endpoint exists for.
+        console.log(`[TeamClaude] Switched to account "${accountManager.accounts[index].name}" (manual)`);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true, account: accountManager.accounts[index].name }));
         return;
