@@ -20,6 +20,15 @@ curl -X POST http://localhost:3456/teamclaude/reload
 
 You usually don't need to call it directly. `login`, `import`, `enable`, `disable`, `priority`, `route`, `probe` and `warmup` notify a running server themselves.
 
+Switching the account by hand has the same headless path — the equivalent of pressing **s** in the TUI and confirming with the default target selected:
+
+```bash
+teamclaude switch                 # list accounts, marking the current one
+teamclaude switch me@example.com  # make that account the preferred one
+```
+
+Both forms need a running server: the choice is runtime state and is never written to the config, so there is nothing to apply on a later restart. The command wraps `POST /teamclaude/switch` with a `{"account": "<name>"}` body, and the account can be given as its display name, its bare email, its `accountUuid` or its `orgUuid`. The rotation index is deliberately not accepted — it is array position, so a script pinned to `1` would silently follow a different account after a removal. As in the TUI this sets a preference rather than a lock: rotation still moves off the account once it stops being eligible.
+
 ### TUI keyboard shortcuts
 
 | Key | Action |
@@ -95,6 +104,7 @@ teamclaude env               # Print export lines for routing claude yourself
 teamclaude alias             # Print/install a `claude` alias that routes via the proxy
 teamclaude accounts          # List accounts with subscription tier and token status
 teamclaude status            # Show live proxy status (requires running server)
+teamclaude switch [name]     # Prefer one account (no name lists them)
 teamclaude remove <name>     # Remove an account (by name or email)
 teamclaude disable <name>    # Temporarily exclude an account from rotation
 teamclaude enable <name>     # Re-enable it (also clears a stuck error state)
