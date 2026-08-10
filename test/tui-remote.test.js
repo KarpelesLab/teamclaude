@@ -84,6 +84,10 @@ async function fakeServer(t, routes = {}) {
   return { server, seen, port: server.address().port };
 }
 
+// The three members _call reads off a fetch reply. Cheaper than a real Response,
+// and it keeps these tests free of fetch globals.
+const reply = (status, body) => ({ ok: status >= 200 && status < 300, status, text: async () => body });
+
 const json = payload => (req, res) => {
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify(payload));
@@ -174,18 +178,6 @@ test('a 200 from something that is not this control plane is not a switch', asyn
     },
   });
   await assert.rejects(() => control.switchAccount('alpha'), /not a teamclaude control endpoint/);
-});
-
-test('a rejected proxy API key is named, not reported as an outage', async (t) => {
-  const { control } = await makeSession(t, {
-    routes: {
-      'GET /teamclaude/status': (req, res) => {
-        res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ type: 'error', error: { type: 'authentication_error', message: 'Invalid proxy API key' } }));
-      },
-    },
-  });
-  await assert.rejects(() => control.status(), /API key/);
 });
 
 test('a rejection reported with 200 is still a rejection', async (t) => {
@@ -343,6 +335,82 @@ test('a wedged server does not collect one pending request per tick', async (t) 
   assert.equal(seen.length, 1);
   await session.poll(); // the door reopens once the outstanding call finishes
   assert.equal(seen.length, 2);
+});
+
+// A server that accepts the connection and then goes silent — SIGSTOPped, or the
+// laptop suspended mid-request — must read as lost contact. Without a deadline the
+// dashboard sits on a frozen snapshot under a green marker for minutes.
+test('a poll that never gets an answer becomes a lost connection, not a live view', async (t) => {
+  const never = new Promise(() => {});
+  const fake = await fakeServer(t, { 'GET /teamclaude/status': async () => { await never; } });
+  const control = new RemoteControl({ port: fake.port, apiKey: 'secret', timeoutMs: 60 });
+  const session = createAttachSession({ control, config: { proxy: { port: fake.port } }, onQuit: () => {} });
+  session.tui.render = () => {};
+
+  await session.am.applyStatus(statusFixture()); // start from a good snapshot
+  await session.poll();
+
+  assert.equal(session.am.connected, false);
+  assert.match(session.tui.log[0].msg, /no reply within/);
+  assert.deepEqual(session.am.accounts.map(a => a.name), ['alpha', 'bravo']); // snapshot kept, marked stale
+  session.stop();
+});
+
+test('the poll deadline is derived from the poll interval', async (t) => {
+  const fake = await fakeServer(t, { 'GET /teamclaude/status': json(statusFixture()) });
+  const control = new RemoteControl({ port: fake.port });
+  const session = createAttachSession({ control, config: { proxy: { port: fake.port } }, onQuit: () => {}, pollMs: 4000 });
+  assert.equal(control.timeoutMs, 12_000);
+  session.stop();
+
+  const fixed = new RemoteControl({ port: fake.port, timeoutMs: 250 });
+  createAttachSession({ control: fixed, config: {}, onQuit: () => {}, pollMs: 4000 }).stop();
+  assert.equal(fixed.timeoutMs, 250); // an explicit deadline is not overridden
+});
+
+// A general (non-family) route is drawn as a marker column on every account row,
+// which reaches into route.accounts. The payload is not ours to trust.
+test('a general route renders, and a half-specified one does not take the dashboard down', async (t) => {
+  const { tui, am } = await makeSession(t);
+  const status = statusFixture();
+  status.routes = [
+    { name: 'bulk', match: ['*opus*'], color: 'green', autocreated: false, pinned: 'alpha', target: 'alpha',
+      accounts: [{ name: 'alpha', eligible: true }] },
+    { name: 'broken' }, // no match, no accounts, no target
+  ];
+  am.applyStatus(status);
+
+  assert.deepEqual(am.getRoutes().map(r => r.accounts), [[{ name: 'alpha', eligible: true }], []]);
+  assert.deepEqual(am.getRoutes()[1].match, []);
+  const out = renderToString(tui);
+  assert.match(out, /alpha/);
+  assert.match(out, /bravo/);
+  assert.equal(am.previewRouteIndex('claude-opus-4'), 0); // the general route still resolves
+});
+
+test('the control client talks to the host it was given', async () => {
+  const calls = [];
+  const control = new RemoteControl({
+    port: 3456, host: '192.0.2.10',
+    fetchImpl: async url => { calls.push(url); return reply(200, '{"accounts":[]}'); },
+  });
+  await control.status();
+  assert.deepEqual(calls, ['http://192.0.2.10:3456/teamclaude/status']);
+});
+
+test('on loopback a 401 blames the port, not the key the server never checks', async (t) => {
+  const unauthorized = (req, res) => { res.writeHead(401); res.end('nope'); };
+  const local = await fakeServer(t, { 'GET /teamclaude/status': unauthorized });
+  await assert.rejects(
+    () => new RemoteControl({ port: local.port, host: '127.0.0.1', apiKey: 'k' }).status(),
+    /something other than teamclaude/i,
+  );
+  // A non-loopback server DOES gate on the key, so there the key is the suspect.
+  const remote = new RemoteControl({
+    port: 3456, host: '192.0.2.10', apiKey: 'k',
+    fetchImpl: async () => reply(401, 'nope'),
+  });
+  await assert.rejects(() => remote.status(), /rejected the proxy API key/i);
 });
 
 // ── keys ─────────────────────────────────────────────────────

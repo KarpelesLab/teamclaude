@@ -7,13 +7,21 @@ import { modelGlobMatches } from './model.js';
 // to a status snapshot polled over the localhost control plane.
 
 const DEFAULT_POLL_MS = 1000;
+const DEFAULT_TIMEOUT_MS = 5000;
+
+// Addresses that reach this machine. A server bound to one of these exempts
+// loopback clients from the proxy-key gate, which changes what a 401 can mean.
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1', 'localhost']);
 
 /** Client for the server's control endpoints. */
 export class RemoteControl {
-  constructor({ port, apiKey = null, host = '127.0.0.1', fetchImpl = fetch }) {
+  constructor({ port, apiKey = null, host = '127.0.0.1', fetchImpl = fetch, timeoutMs = null }) {
     this.port = port;
     this.apiKey = apiKey;
     this.host = host;
+    // null = unset, so a caller that knows its own cadence (the attach poller)
+    // can derive one; DEFAULT_TIMEOUT_MS covers the one-shot callers.
+    this.timeoutMs = timeoutMs;
     this._fetch = fetchImpl;
   }
 
@@ -71,14 +79,27 @@ export class RemoteControl {
   }
 
   async _call(method, path, body) {
+    const deadline = this.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const headers = {};
     if (this.apiKey) headers['x-api-key'] = this.apiKey;
     if (body !== undefined) headers['content-type'] = 'application/json';
 
-    const res = await this._fetch(`http://${this.host}:${this.port}${path}`, {
-      method, headers,
-      body: body === undefined ? undefined : JSON.stringify(body),
-    });
+    let res;
+    try {
+      res = await this._fetch(`http://${this.host}:${this.port}${path}`, {
+        method, headers,
+        body: body === undefined ? undefined : JSON.stringify(body),
+        // A socket that is open but silent — the server stopped, the laptop
+        // suspended mid-request — would otherwise hold this call for minutes
+        // while the dashboard showed a live marker over a frozen snapshot.
+        signal: AbortSignal.timeout(deadline),
+      });
+    } catch (err) {
+      if (err?.name === 'TimeoutError' || err?.name === 'AbortError') {
+        throw new Error(`no reply within ${deadline}ms`);
+      }
+      throw err;
+    }
     const text = await res.text();
     let payload = null;
     try { payload = text ? JSON.parse(text) : null; } catch { /* not JSON — the status carries the meaning */ }
@@ -88,11 +109,15 @@ export class RemoteControl {
       // anything else reached a handler that is not ours (an old server forwards
       // unknown paths upstream, and Anthropic's error body looks nothing like it).
       const answered = payload?.ok === false && typeof payload.error === 'string';
-      // A rejected key needs a different fix from an unreachable server, so it is
-      // worth naming: the config's proxy.apiKey does not match the running one.
+      // 401/403 needs a different fix from an unreachable server — but which fix
+      // depends on where we are pointed. A teamclaude server exempts loopback
+      // clients from the key gate, so a 401 from there cannot be about the key
+      // and blaming it would send the operator to edit a config that is fine.
       const auth = !answered && (res.status === 401 || res.status === 403);
       const err = new Error(auth
-        ? `the server rejected the proxy API key (HTTP ${res.status})`
+        ? (LOOPBACK_HOSTS.has(this.host)
+          ? `something other than teamclaude is answering on port ${this.port} (HTTP ${res.status})`
+          : `the server rejected the proxy API key (HTTP ${res.status})`)
         : answered ? payload.error : `HTTP ${res.status}`);
       err.status = res.status;
       err.answered = answered;
@@ -148,7 +173,14 @@ export class RemoteAccountManager {
       perAccount: sessions.perAccount || {},
     };
     this.distributeSessions = !!sessions.distribute;
-    this.routes = Array.isArray(status?.routes) ? status.routes : [];
+    // Same rule as the accounts above, and for the same reason: the renderer
+    // walks route.accounts and route.match directly, so a route the payload
+    // leaves half-specified would take the whole dashboard down mid-frame.
+    this.routes = (Array.isArray(status?.routes) ? status.routes : []).map(r => ({
+      ...r,
+      match: Array.isArray(r?.match) ? r.match : [],
+      accounts: Array.isArray(r?.accounts) ? r.accounts : [],
+    }));
     this.status = status;
     this.connected = true;
     this.lastError = null;
@@ -189,6 +221,10 @@ export function createAttachSession({ control, config, onQuit, pollMs = DEFAULT_
   const am = new RemoteAccountManager();
   let timer = null;
   let polling = false;
+  // A poll still outstanding after a few intervals is not going to arrive, and
+  // holding it hides an outage behind the last good frame. An explicitly
+  // configured deadline wins.
+  control.timeoutMs ??= Math.max(2000, pollMs * 3);
 
   const stop = () => {
     if (timer) { clearInterval(timer); timer = null; }
