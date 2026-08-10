@@ -695,9 +695,18 @@ export class TUI {
       // switch applied to an account that cannot currently serve requests, which
       // the row already shows but is worth stating at the moment it is chosen.
       const name = res?.account || acct.name;
-      this._addLog(res?.eligible === false
-        ? `Switched to "${name}" — it cannot serve requests right now`
-        : `Switched to "${name}"`);
+      if (res?.eligible === false) {
+        // The server knows WHY — disabled, out of quota, outranked by a
+        // higher-priority account — so quote it rather than restating the
+        // generic case. Control characters and length are clamped: this string
+        // arrives over the wire and is drawn into a fixed-width frame.
+        // The server's reasons are phrased to follow "<name> is ...", so they are
+        // composed that way here too.
+        const given = typeof res.reason === 'string' ? res.reason.replace(/\p{C}/gu, ' ').trim().slice(0, 60) : '';
+        this._addLog(`Switched to "${name}" — ${given ? `it is ${given}` : 'it cannot serve requests right now'}`);
+      } else {
+        this._addLog(`Switched to "${name}"`);
+      }
     } catch (e) {
       this._addLog(`Switch failed: ${e.message}`);
     }

@@ -8,7 +8,24 @@ import { RemoteControl, createAttachSession } from '../src/tui-remote.js';
 // status payloads, so the client is exercised over the wire it actually uses.
 
 const stripAnsi = s => s.replace(/\x1b\[[0-9;]*m/g, '');
-const settle = () => new Promise(r => setTimeout(r, 5));
+
+// Every action here crosses a real socket, so wait for the thing to have
+// happened rather than for a duration: a fixed sleep is a race that a loaded
+// machine loses, and these tests run alongside the rest of the suite.
+async function waitFor(predicate, what, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise(r => setTimeout(r, 2));
+  }
+  assert.fail(`timed out waiting for ${what}`);
+}
+
+const logged = tui => waitFor(() => tui.log.length > 0, 'a message in the pane');
+const reached = seen => waitFor(() => seen.length > 0, 'a request to reach the server');
+// Only for asserting that nothing happens: there is no condition to wait on, so
+// this has to be a duration, and it is generous on purpose.
+const nothingHappens = () => new Promise(r => setTimeout(r, 50));
 
 const HOUR = 3600_000;
 
@@ -316,7 +333,7 @@ test('a wedged server does not collect one pending request per tick', async (t) 
   });
 
   const first = session.poll();
-  await settle(); // let that one reach the server, where it now hangs
+  await reached(seen); // let that one reach the server, where it now hangs
   await session.poll(); // a tick landing while the first is still in flight
   await session.poll();
   assert.equal(seen.length, 1);
@@ -334,7 +351,7 @@ test('keys that would need write endpoints are inert in attach mode', async (t) 
   const { tui, am, seen } = await makeSession(t);
   am.applyStatus(statusFixture());
   for (const k of ['g', 'd', 'p', 'a', 'r']) tui._key(k);
-  await settle();
+  await nothingHappens();
   assert.equal(tui.mode, 'normal');
   assert.deepEqual(tui.log, []);
   assert.deepEqual(seen, []); // nothing was sent to the server
@@ -343,7 +360,7 @@ test('keys that would need write endpoints are inert in attach mode', async (t) 
 test('R reloads the running server and reports the outcome', async (t) => {
   const { tui, seen } = await makeSession(t);
   tui._key('R');
-  await settle();
+  await logged(tui);
   assert.deepEqual(seen.map(r => [r.method, r.url]), [['POST', '/teamclaude/reload']]);
   assert.equal(tui.log.length, 1);
   assert.match(tui.log[0].msg, /reload/i);
@@ -354,7 +371,7 @@ test('R reports a failed reload instead of pretending it worked', async (t) => {
     routes: { 'GET /teamclaude/status': json(statusFixture()) }, // no reload route
   });
   tui._key('R');
-  await settle();
+  await logged(tui);
   assert.match(tui.log[0].msg, /failed/i);
 });
 
@@ -366,7 +383,7 @@ test('s switches the running server to the selected account', async (t) => {
   assert.equal(tui.mode, 'select');
   tui._key('up'); // from "bravo" (current) to "alpha"
   tui._key('enter');
-  await settle();
+  await logged(tui);
 
   assert.equal(tui.mode, 'normal');
   assert.deepEqual(JSON.parse(seen.at(-1).body), { account: 'alpha' });
@@ -386,8 +403,48 @@ test('switching to an account that cannot serve says so', async (t) => {
   am.applyStatus(statusFixture());
   tui._key('s');
   tui._key('enter');
-  await settle();
+  await logged(tui);
   assert.match(tui.log[0].msg, /cannot serve requests/);
+});
+
+test('the server\'s own reason for ineligibility is what gets shown', async (t) => {
+  const { tui, am } = await makeSession(t, {
+    routes: {
+      'GET /teamclaude/status': json(statusFixture()),
+      'POST /teamclaude/switch': json({
+        ok: true, account: 'alpha', eligible: false,
+        reason: 'outranked by higher-priority account "bravo"',
+      }),
+    },
+  });
+  am.applyStatus(statusFixture());
+  tui._key('s');
+  tui._key('enter');
+  await logged(tui);
+  assert.match(tui.log[0].msg, /it is outranked by higher-priority account "bravo"/);
+});
+
+// The reason crosses the wire and is drawn into a fixed-width frame.
+test('a reason carrying control characters cannot corrupt the frame', async (t) => {
+  const { tui, am } = await makeSession(t, {
+    routes: {
+      'GET /teamclaude/status': json(statusFixture()),
+      'POST /teamclaude/switch': json({
+        ok: true, account: 'alpha', eligible: false,
+        reason: `disabled\x1b[2J\r\n${'x'.repeat(200)}`,
+      }),
+    },
+  });
+  am.applyStatus(statusFixture());
+  tui._key('s');
+  tui._key('enter');
+  await logged(tui);
+
+  const msg = tui.log[0].msg;
+  assert.doesNotMatch(msg, /\x1b/);
+  assert.doesNotMatch(msg, /[\r\n]/);
+  assert.ok(msg.length < 120, `reason should be clamped, got ${msg.length} chars`);
+  assert.match(msg, /disabled/);
 });
 
 test('a switch reports the name the server settled on', async (t) => {
@@ -401,7 +458,7 @@ test('a switch reports the name the server settled on', async (t) => {
   am.applyStatus(statusFixture());
   tui._key('s');
   tui._key('enter');
-  await settle();
+  await logged(tui);
   assert.match(tui.log[0].msg, /Switched to "bravo \(Acme\)"/);
 });
 
@@ -412,7 +469,7 @@ test('a rejected switch is reported and leaves the view alone', async (t) => {
   am.applyStatus(statusFixture());
   tui._key('s');
   tui._key('enter');
-  await settle();
+  await logged(tui);
   assert.equal(tui.mode, 'normal');
   assert.match(tui.log[0].msg, /switch failed/i);
 });
@@ -424,7 +481,7 @@ test('a row that vanished between polls reports that nothing happened', async (t
   tui._key('down'); // cursor on the second account
   am.applyStatus(statusFixture({ accounts: [statusFixture().accounts[0]] })); // it goes away
   tui._key('enter');
-  await settle();
+  await logged(tui);
 
   assert.equal(tui.mode, 'normal');
   assert.match(tui.log[0].msg, /no longer listed/i);
@@ -445,7 +502,7 @@ test('switching with nothing marked current starts at the first account', async 
   am.applyStatus(statusFixture({ currentAccount: 'gone' }));
   tui._key('s');
   tui._key('enter');
-  await settle();
+  await logged(tui);
   assert.deepEqual(JSON.parse(seen.at(-1).body), { account: 'alpha' });
 });
 
