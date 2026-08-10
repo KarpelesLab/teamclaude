@@ -112,6 +112,40 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
         return;
       }
 
+      // Switch endpoint — make one account the preferred one, the headless
+      // equivalent of picking it with 's' in the TUI. Both do the same single
+      // thing: move currentIndex. It is a preference, not a lock — rotation
+      // still moves off an account that stops being eligible. Body:
+      // {"account": "<name|email|accountUuid|orgUuid>"}. Local control only
+      // (no upstream calls); the auth gate above already applies.
+      if (req.method === 'POST' && req.url === '/teamclaude/switch') {
+        const names = () => (accountManager.accounts || []).map(a => a.name);
+        let target;
+        try {
+          const raw = await readControlBody(req);
+          target = JSON.parse(raw || '{}')?.account;
+        } catch (err) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: `invalid request body: ${err.message}` }));
+          return;
+        }
+        if (typeof target !== 'string' || !target.trim()) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'missing "account"', accounts: names() }));
+          return;
+        }
+        const index = resolveAccountPin(accountManager, target);
+        if (index == null) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: `no such account "${target}"`, accounts: names() }));
+          return;
+        }
+        accountManager.currentIndex = index;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, account: accountManager.accounts[index].name }));
+        return;
+      }
+
       return forward(req, res);
     } catch (err) {
       console.error('[TeamClaude] Unhandled error:', err);
@@ -146,6 +180,20 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
   server.on('upgrade', (req, socket, head) => relayUpgrade(req, socket, head, upstream, sx));
 
   return server;
+}
+
+// Read a control-endpoint body as text. Capped, unlike the proxied request path:
+// these endpoints carry a couple of fields, so anything larger is a mistake or an
+// attack and buffering it whole would be the wrong answer either way.
+async function readControlBody(req, limit = 64 * 1024) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > limit) throw new Error('body too large');
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks).toString('utf8');
 }
 
 /**
