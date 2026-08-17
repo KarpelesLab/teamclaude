@@ -16,6 +16,7 @@ import { ensureCerts } from './mitm.js';
 import { Prober } from './prober.js';
 import { Warmer } from './warmer.js';
 import { TUI } from './tui.js';
+import { RemoteControl, createAttachSession } from './tui-remote.js';
 import { SxManager } from './sx.js';
 import { autoUpdate, checkForUpdate, currentVersion, runUpdate, installKind, PKG_NAME } from './updater.js';
 import { renderStatus } from './status-renderer.js';
@@ -50,8 +51,16 @@ switch (command) {
     await statusCommand();
     process.exit(0);
     break;
+  case 'attach':
+    await attachCommand();
+    process.exit(0);
+    break;
   case 'accounts':
     await accountsCommand();
+    process.exit(0);
+    break;
+  case 'switch':
+    await switchCommand();
     process.exit(0);
     break;
   case 'remove':
@@ -369,6 +378,10 @@ async function serverCommand() {
   // Expose reload to the proxy's control endpoint (works with or without TUI).
   hooks.reload = reloadAccounts;
   hooks.getStatusExtra = () => ({
+    // Read live from the shared config (not a startup snapshot) so the TUI's
+    // blocklist editor shows up in `status` immediately, the same way the
+    // per-request gate in server.js picks it up.
+    blockedModels: [...(config.blockedModels || [])],
     server: {
       startedAt: new Date(serverStartedAt).toISOString(),
       uptimeSeconds: Math.round((Date.now() - serverStartedAt) / 1000),
@@ -814,6 +827,122 @@ async function statusCommand() {
     console.log(renderStatus(data, { color }));
   } catch (err) {
     console.error('Cannot connect to proxy at localhost:' + config.proxy.port);
+    console.error('Is the server running? Start with: teamclaude server');
+    if (err?.message) console.error(`Details: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+// ── attach ──────────────────────────────────────────────────
+
+// The interactive dashboard against a server that is ALREADY running. A proxy
+// installed as a background service has no foreground TUI, so this is the only
+// way to watch and steer it live; it renders from polled status and can only do
+// what the control plane exposes (switch, reload).
+async function attachCommand() {
+  const config = await loadOrCreateConfig();
+  const port = config.proxy.port;
+  // Reach the server where it actually binds (see serverCommand): a host set in
+  // the config or the environment is not reachable as localhost, and reporting
+  // "not running" for a server that is plainly up is the worst of the answers.
+  // A wildcard bind is not an address to dial, so dial this machine instead.
+  const bound = process.env.TEAMCLAUDE_HOST || config.proxy.host || '127.0.0.1';
+  const host = (bound === '0.0.0.0' || bound === '::') ? '127.0.0.1' : bound;
+
+  // Checked before connecting: the dashboard needs raw-mode input, and failing
+  // on that after a successful poll would be a confusing order to report it in.
+  if (!process.stdin.isTTY) {
+    console.error('teamclaude attach needs a terminal. For a one-shot readout use: teamclaude status');
+    process.exit(1);
+  }
+
+  const control = new RemoteControl({ port, host, apiKey: config.proxy.apiKey });
+  let first;
+  try {
+    first = await control.status(); // fail here, with a usable message, not inside the TUI
+  } catch (err) {
+    console.error(`Cannot connect to proxy at ${host}:${port}`);
+    console.error('Is the server running? Start with: teamclaude server');
+    if (err?.message) console.error(`Details: ${err.message}`);
+    process.exit(1);
+  }
+
+  await new Promise(resolve => {
+    const session = createAttachSession({ control, config, onQuit: resolve });
+    // The status just fetched is the first frame: without it the alt-screen opens
+    // on a disconnected, empty dashboard until the first poll lands.
+    session.am.applyStatus(first);
+    session.start();
+  });
+}
+
+// ── switch ──────────────────────────────────────────────────
+
+// Manual account switch against a RUNNING server — the headless equivalent of
+// pressing 's' in the TUI, which is unreachable when the proxy runs as a
+// background service. Nothing is written to the config: like the TUI's switch
+// this is a runtime preference that dies with the process, so the server is the
+// only place that can answer or apply it.
+async function switchCommand() {
+  const config = await loadOrCreateConfig();
+  const port = config.proxy.port;
+  const headers = { 'x-api-key': config.proxy.apiKey };
+  const name = args[1] && !args[1].startsWith('-') ? args[1] : null;
+
+  try {
+    if (!name) {
+      const res = await fetch(`http://localhost:${port}/teamclaude/status`, { headers });
+      // Something answered on the port. Whether it is our proxy is a separate
+      // question, and getting it wrong would blame a down server for a reply we
+      // simply could not read — or report an unreadable reply as an empty fleet.
+      const data = res.ok ? await res.json().catch(() => null) : null;
+      if (!data || !Array.isArray(data.accounts)) {
+        console.error(`Unexpected reply from localhost:${port} (HTTP ${res.status}) — no account list in it.`);
+        console.error('Something is listening there, but it does not answer like this teamclaude version.');
+        process.exit(1);
+      }
+      if (!data.accounts.length) {
+        console.log('No accounts configured.');
+        return;
+      }
+      for (const a of data.accounts) {
+        // Flag what would stop traffic reaching an account. The TUI shows this in
+        // its table, so leaving it out here would make the headless half of the
+        // feature the only place a disabled account looks switchable.
+        const state = a.disabled ? 'disabled' : (a.status && a.status !== 'active' ? a.status : null);
+        console.log(`${a.name === data.currentAccount ? '*' : ' '} ${a.name}${state ? `  (${state})` : ''}`);
+      }
+      console.log('\nSwitch with: teamclaude switch <name>');
+      return;
+    }
+
+    const res = await fetch(`http://localhost:${port}/teamclaude/switch`, {
+      method: 'POST',
+      headers: { ...headers, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ account: name }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      // Our own errors are strings. A server too old to know this endpoint
+      // forwards the request upstream instead, and Anthropic's error is an
+      // object — printing that raw gives the user "[object Object]".
+      const detail = typeof data.error === 'string' ? data.error : null;
+      console.error(detail || `Switch failed: unexpected reply from localhost:${port} (HTTP ${res.status}).`);
+      if (!detail) console.error('An older server without this endpoint answers this way; restart it to pick up the new version.');
+      if (data.accounts?.length) {
+        console.error('Known accounts:');
+        for (const n of data.accounts) console.error(`  ${n}`);
+      }
+      process.exit(1);
+    }
+    console.log(`Switched to "${data.account}"`);
+    // Recorded is not the same as in effect: rotation skips an account it cannot
+    // use on the very next request, so saying nothing here would be a quiet lie.
+    if (data.eligible === false) {
+      console.error(`Warning: "${data.account}" is ${data.reason || 'not currently eligible'}, so requests will not route to it until that changes.`);
+    }
+  } catch (err) {
+    console.error('Cannot connect to proxy at localhost:' + port);
     console.error('Is the server running? Start with: teamclaude server');
     if (err?.message) console.error(`Details: ${err.message}`);
     process.exit(1);
@@ -1379,7 +1508,11 @@ Commands:
                       'print' writes the unit to stdout without touching anything)
   status [--json]     Show rich proxy/account/probe status (live)
                       Use --color=always|never to control ANSI colors
+  attach              Open the live dashboard against a running server; s
+                      switches account, R reloads config, q leaves it running
   accounts            List configured accounts
+  switch [NAME]       Make the running server prefer one account (as 's' in the
+                      TUI does); with no NAME, list accounts and mark the current
   remove <name>       Remove an account (by name or email; --org to disambiguate)
   disable <name>      Temporarily exclude an account from rotation
   enable <name>       Re-enable a disabled account (also clears a stuck error)
@@ -1429,6 +1562,8 @@ launched with and without --no-mitm can share one server.
 
 A running server re-syncs accounts from config on POST /teamclaude/reload
 (local only). add/login/enable/disable/priority trigger it automatically.
+POST /teamclaude/switch {"account": "<name>"} makes one account the preferred
+one, which is what 'teamclaude switch' calls.
 
 Upstream proxy. On a host with no direct route to the internet, set
 "upstreamProxy": "http://user:pass@host:3128" (or just "host:3128") and every

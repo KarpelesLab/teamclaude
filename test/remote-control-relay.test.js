@@ -35,19 +35,25 @@ test('a GET to /v1/code/* forwards the client credential and streams the respons
     res.end();
   });
 
-  const accountManager = { getActiveAccount() { throw new Error('must not rotate Remote Control'); } };
-  const listener = createProxyRequestListener({
-    accountManager, upstream: `http://127.0.0.1:${upstreamPort}`,
-  });
+  // Cleanup lives in finally throughout this file: a failed assertion must not
+  // leave servers listening — leaked handles keep the child's event loop alive
+  // and hang the whole `node --test` run, not just this file.
+  try {
+    const accountManager = { getActiveAccount() { throw new Error('must not rotate Remote Control'); } };
+    const listener = createProxyRequestListener({
+      accountManager, upstream: `http://127.0.0.1:${upstreamPort}`,
+    });
 
-  const { status, text } = await requestThrough(listener, {
-    path: '/v1/code/sessions/abc/worker/events/stream',
-    headers: { authorization: 'Bearer client-own-token' },
-  });
+    const { status, text } = await requestThrough(listener, {
+      path: '/v1/code/sessions/abc/worker/events/stream',
+      headers: { authorization: 'Bearer client-own-token' },
+    });
 
-  assert.equal(status, 200);
-  assert.match(text, /event: ping/);
-  upstream.close();
+    assert.equal(status, 200);
+    assert.match(text, /event: ping/);
+  } finally {
+    upstream.close();
+  }
 });
 
 // The whole point of the rewrite: relayStream must not wait for the request (or
@@ -68,16 +74,21 @@ test('does not wait for the request to end before the response can start streami
   const { server: proxy, port } = await listen(listener);
 
   const controller = new AbortController();
-  const res = await fetch(`http://127.0.0.1:${port}/v1/code/sessions/abc/worker/events/stream`, {
-    signal: controller.signal,
-  });
-  const reader = res.body.getReader();
-  const { value } = await reader.read();
-  assert.match(Buffer.from(value).toString(), /event: hello/);
-
-  controller.abort();
-  proxy.close();
-  upstream.close();
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/v1/code/sessions/abc/worker/events/stream`, {
+      signal: controller.signal,
+    });
+    const reader = res.body.getReader();
+    const { value } = await reader.read();
+    assert.match(Buffer.from(value).toString(), /event: hello/);
+  } finally {
+    controller.abort();
+    proxy.close();
+    upstream.close();
+    // The upstream deliberately never end()s its response, so close() alone
+    // would wait on that live connection forever.
+    upstream.closeAllConnections();
+  }
 });
 
 // Remote Control's real-time channel is a WebSocket
@@ -103,26 +114,29 @@ test('relays a WebSocket Upgrade handshake and echoes bytes both ways', async ()
   const port = proxy.address().port;
 
   const client = net.connect(port, '127.0.0.1');
-  await once(client, 'connect');
-  client.write(
-    'GET /v1/session_ingress/ws/abc HTTP/1.1\r\n' +
-    'Host: 127.0.0.1\r\n' +
-    'Upgrade: websocket\r\n' +
-    'Connection: Upgrade\r\n' +
-    'authorization: Bearer client-own-token\r\n' +
-    '\r\n',
-  );
+  try {
+    await once(client, 'connect');
+    client.write(
+      'GET /v1/session_ingress/ws/abc HTTP/1.1\r\n' +
+      'Host: 127.0.0.1\r\n' +
+      'Upgrade: websocket\r\n' +
+      'Connection: Upgrade\r\n' +
+      'authorization: Bearer client-own-token\r\n' +
+      '\r\n',
+    );
 
-  const [handshake] = await once(client, 'data');
-  assert.match(handshake.toString(), /101 Switching Protocols/);
+    const [handshake] = await once(client, 'data');
+    assert.match(handshake.toString(), /101 Switching Protocols/);
 
-  client.write('ping');
-  const [echoed] = await once(client, 'data');
-  assert.equal(echoed.toString(), 'ping');
-
-  client.destroy();
-  proxy.close();
-  upstream.close();
+    client.write('ping');
+    const [echoed] = await once(client, 'data');
+    assert.equal(echoed.toString(), 'ping');
+  } finally {
+    client.destroy();
+    proxy.close();
+    upstream.close();
+    upstream.closeAllConnections();
+  }
 });
 
 // Once the 101 fires, Node detaches the upgraded socket from the ClientRequest,
@@ -146,26 +160,35 @@ test('an upstream socket that dies mid-relay tears down the pair instead of cras
   const port = proxy.address().port;
 
   const client = net.connect(port, '127.0.0.1');
-  await once(client, 'connect');
   client.on('error', () => {}); // the client end goes away too; that part is expected
-  client.write(
-    'GET /v1/session_ingress/ws/abc HTTP/1.1\r\n' +
-    'Host: 127.0.0.1\r\n' +
-    'Upgrade: websocket\r\n' +
-    'Connection: Upgrade\r\n' +
-    '\r\n',
-  );
+  let writer;
+  try {
+    await once(client, 'connect');
+    client.write(
+      'GET /v1/session_ingress/ws/abc HTTP/1.1\r\n' +
+      'Host: 127.0.0.1\r\n' +
+      'Upgrade: websocket\r\n' +
+      'Connection: Upgrade\r\n' +
+      '\r\n',
+    );
 
-  const [handshake] = await once(client, 'data');
-  assert.match(handshake.toString(), /101 Switching Protocols/);
+    const [handshake] = await once(client, 'data');
+    assert.match(handshake.toString(), /101 Switching Protocols/);
 
-  // Keep writing into the now-dead relay: this is the EPIPE path.
-  const writer = setInterval(() => client.write('ping'), 5);
-  await once(client, 'close');
-  clearInterval(writer);
+    // Keep writing into the now-dead relay: this is the EPIPE path. Waiting
+    // for 'close' via events.once would reject on the ECONNRESET the dying
+    // relay is EXPECTED to surface (once() rejects whenever 'error' fires
+    // first) — that race is exactly what used to abandon the test mid-flight.
+    const closed = new Promise(resolve => client.once('close', resolve));
+    writer = setInterval(() => client.write('ping'), 5);
+    await closed;
 
-  // Still alive and still serving — the proxy survived the upstream's death.
-  assert.equal(proxy.listening, true);
-  proxy.close();
-  upstream.close();
+    // Still alive and still serving — the proxy survived the upstream's death.
+    assert.equal(proxy.listening, true);
+  } finally {
+    clearInterval(writer);
+    client.destroy();
+    proxy.close();
+    upstream.close();
+  }
 });

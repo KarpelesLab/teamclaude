@@ -77,6 +77,30 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
         return;
       }
 
+      // Control-plane mutations are refused when the request was issued by a web
+      // page. The gate above exempts loopback from the API key, so without this
+      // any site the operator happens to visit can POST here cross-origin: a
+      // `fetch(..., {mode:'no-cors', body})` with a text/plain content type is a
+      // CORS "simple request", so no preflight is sent and the request lands.
+      // The page cannot read the reply, but the side effect is the point —
+      // forcing the whole fleet onto one named account is a targeted quota
+      // drain, and reload is reachable the same way.
+      //
+      // Origin (and Sec-Fetch-Site) are set by the browser and cannot be
+      // forged from page JavaScript, while curl and the CLI send neither — so
+      // this costs legitimate callers nothing. Deliberately not a content-type
+      // requirement, which would also close the hole but would break the
+      // documented `curl -X POST .../teamclaude/reload` that sends no body.
+      if (req.method === 'POST' && (req.url || '').startsWith('/teamclaude/')
+          && !isSameOriginControlRequest(req)) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          ok: false,
+          error: 'cross-origin request refused: the control plane is not reachable from a web page',
+        }));
+        return;
+      }
+
       // Forward-proxy request (HTTP_PROXY): an absolute-form URL is a tool
       // proxying plain HTTP to some host. Account logic is only for hosts we
       // manage (the Anthropic upstream, which is HTTPS-only and never arrives
@@ -109,6 +133,60 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
           res.writeHead(500, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: err.message }));
         }
+        return;
+      }
+
+      // Switch endpoint — make one account the preferred one, the headless
+      // equivalent of picking it with 's' in the TUI. Both do the same single
+      // thing: move currentIndex. That is a preference, and a weak one: _select
+      // abandons it as soon as the account is unavailable, and also whenever any
+      // available account carries a strictly lower priority value. So the answer
+      // reports whether the choice will actually take effect rather than only
+      // that it was recorded. Body:
+      // {"account": "<name|email|accountUuid|accountUuid/orgUuid|orgUuid>"}.
+      // Local control only (no upstream calls); the auth gate above applies.
+      if (req.method === 'POST' && req.url === '/teamclaude/switch') {
+        const names = () => (accountManager.accounts || []).map(a => a.name);
+        let target;
+        try {
+          const raw = await readControlBody(req);
+          target = JSON.parse(raw || '{}')?.account;
+        } catch (err) {
+          // Say which of the two it was, but never echo the parser's own message
+          // back to a caller — that is our internals, not their input.
+          const tooLarge = err.message === 'body too large';
+          res.writeHead(tooLarge ? 413 : 400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: tooLarge ? 'request body too large' : 'invalid request body' }));
+          return;
+        }
+        if (typeof target !== 'string' || !target.trim()) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'missing "account"', accounts: names() }));
+          return;
+        }
+        const index = resolveAccountPin(accountManager, target);
+        if (index == null) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: `no such account "${target}"`, accounts: names() }));
+          return;
+        }
+        accountManager.currentIndex = index;
+        const name = accountManager.accounts[index].name;
+        // Recording the choice and the choice taking effect are two different
+        // things: selection skips an account it cannot use on the very next
+        // request, so a bare "ok" would be a lie for a disabled or spent target.
+        // The switch still happens (that is the TUI's behaviour) and the answer
+        // says whether traffic will follow it.
+        const { eligible, reason } = accountManager.eligibility(index);
+        // Leave a trace where every other account change already leaves one: the
+        // TUI swaps console.log for its activity pane and headless mode tees it
+        // to the activity log, so this one line covers both. Without it a manual
+        // switch is the only account change that happens invisibly — on exactly
+        // the background-service deployment this endpoint exists for.
+        console.log(`[TeamClaude] Switched to account "${name}" (manual)`
+          + (eligible ? '' : ` — ${reason}, so rotation will not use it`));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, account: name, eligible, ...(reason ? { reason } : {}) }));
         return;
       }
 
@@ -146,6 +224,41 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
   server.on('upgrade', (req, socket, head) => relayUpgrade(req, socket, head, upstream, sx));
 
   return server;
+}
+
+/**
+ * Whether a control-plane POST did NOT come from a web page.
+ *
+ * Both headers are browser-set and unforgeable from page JavaScript:
+ *   - `Sec-Fetch-Site` is the explicit answer where it exists (Chrome, Safari,
+ *     Firefox). Anything but `same-origin` / `none` is a page reaching across.
+ *   - `Origin` is the fallback for browsers that send no Sec-Fetch-Site. Its
+ *     mere presence on a POST to a local control endpoint means a page issued
+ *     it; matching it against our own host would mean guessing which of
+ *     localhost / 127.0.0.1 / [::1] / a LAN address the caller used, and a
+ *     browser-issued same-origin call is not a thing worth supporting here.
+ *
+ * Non-browser callers (curl, the CLI, `teamclaude attach`) send neither and are
+ * unaffected.
+ */
+export function isSameOriginControlRequest(req) {
+  const site = req.headers['sec-fetch-site'];
+  if (site) return site === 'same-origin' || site === 'none';
+  return !req.headers.origin;
+}
+
+// Read a control-endpoint body as text. Capped, unlike the proxied request path:
+// these endpoints carry a couple of fields, so anything larger is a mistake or an
+// attack and buffering it whole would be the wrong answer either way.
+async function readControlBody(req, limit = 64 * 1024) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > limit) throw new Error('body too large');
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks).toString('utf8');
 }
 
 /**

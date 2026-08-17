@@ -12,7 +12,7 @@
   ],
   "scripts": {
     "start": "node src/index.js",
-    "test": "node --test",
+    "test": "node --test --test-timeout=120000",
     "lint": "eslint ."
   },
   "keywords": [

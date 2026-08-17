@@ -6,6 +6,21 @@ import { parseProxyUrl, proxyToUrl, describeProxy, resolveUpstreamProxy, setUpst
 // ── ANSI helpers ─────────────────────────────────────────────
 
 const SPINNER = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'.split('');
+
+// Repaint cadence.
+//
+// The spinner is drawn only alongside in-flight requests, so animating it while
+// the proxy is idle wakes the process twice a second to redraw a frame nobody
+// can tell apart from the last one. On a laptop that is enough to keep the
+// machine from going to sleep (#134), which is a poor trade for animating
+// nothing. Tick fast only while there is something to animate; otherwise tick
+// slowly, just often enough that elapsed times and quota countdowns stay honest.
+const SPIN_MS = 500;
+const IDLE_TICK_MS = 5_000;
+// Even when the composed frame is unchanged, repaint occasionally: the terminal
+// is shared state, and anything that writes over it (a stray warning, a resumed
+// job) would otherwise leave the screen corrupted until the next real change.
+const FORCE_REPAINT_MS = 60_000;
 const ESC = '\x1b[';
 const RESET = `${ESC}0m`;
 const BOLD = `${ESC}1m`;
@@ -126,7 +141,7 @@ function formatReset(resetTs) {
  * Render a progress bar using background colors with text overlaid.
  * The label (e.g. "Ses 2h30m" or "45%") is drawn on top of the bar.
  */
-function bar(ratio, w = 10, resetTs) {
+export function bar(ratio, w = 10, resetTs) {
   const rst = formatReset(resetTs);
 
   if (ratio == null || isNaN(ratio)) {
@@ -157,8 +172,13 @@ function bar(ratio, w = 10, resetTs) {
   const filled = chars.slice(0, f);
   const empty = chars.slice(f);
 
+  // Black label on green/yellow: terminal themes commonly render those
+  // backgrounds light, and bright-white text disappears on them. White stays
+  // on red, which is dark in practically every palette.
+  const fgc = bg === 41 ? 97 : 30;
+
   let out = '';
-  if (filled) out += `${ESC}${bg};97m${filled}`;
+  if (filled) out += `${ESC}${bg};${fgc}m${filled}`;
   if (empty) out += `${ESC}100;37m${empty}`;
   out += RESET;
   return out;
@@ -172,10 +192,16 @@ function timestamp() {
 
 export class TUI {
   constructor({ accountManager, config, saveConfig, syncAccounts, onQuit, sx = null, probeQuota = null, activityLogPath = null,
+    // Attach mode: the accounts belong to a server in another process, reached
+    // over its control plane. Everything that would mutate local state is off,
+    // and a switch becomes a request (applySwitch) instead of an assignment.
+    remote = false, applySwitch = null,
     // Injectable so the import path can be exercised without a real credentials
     // file or a live profile call.
     readCredentials = importCredentials, readProfile = fetchProfile }) {
     this.am = accountManager;
+    this.remote = remote;
+    this.applySwitch = applySwitch;
     this.config = config;
     this.saveConfig = saveConfig;
     this.syncAccounts = syncAccounts;
@@ -206,6 +232,9 @@ export class TUI {
     this.frame = 0;
     this.running = false;
     this.timer = null;
+    // Injectable so a test can drive the repaint tick by hand instead of
+    // sleeping through real 500ms/5s intervals.
+    this._setTimeout = setTimeout;
     this._origLog = null;
     this._origErr = null;
   }
@@ -227,7 +256,9 @@ export class TUI {
     process.stdin.resume();
     process.stdin.setEncoding('utf8');
     this._dataHandler = d => this._onData(d);
-    this._resizeHandler = () => this.render();
+    // A resize reflows the terminal itself, so the cached frame says nothing
+    // about what is on screen — always repaint.
+    this._resizeHandler = () => this.render({ force: true });
     process.stdin.on('data', this._dataHandler);
     process.stdout.on('resize', this._resizeHandler);
 
@@ -237,16 +268,41 @@ export class TUI {
     console.log = (...a) => this._addLog(a.join(' '));
     console.error = (...a) => this._addLog(a.join(' '));
 
+    this._lastFrame = null;   // entering the alt screen always paints
     this.render();
-    this.timer = setInterval(() => {
-      this.frame = (this.frame + 1) % SPINNER.length;
+    this._scheduleTick();
+  }
+
+  /** Fast while something is animating, slow when there is nothing to animate. */
+  _tickDelay() { return this.active.size > 0 ? SPIN_MS : IDLE_TICK_MS; }
+
+  _scheduleTick() {
+    if (!this.running) return;
+    this.timer = this._setTimeout(() => {
+      if (!this.running) return;
+      // Only advance the spinner when it is actually on screen; otherwise the
+      // frame counter would change every tick and defeat the repaint dedupe.
+      if (this.active.size > 0) this.frame = (this.frame + 1) % SPINNER.length;
       this.render();
-    }, 500);
+      this._scheduleTick();
+    }, this._tickDelay());
+    this.timer.unref?.();
+  }
+
+  /**
+   * Re-arm the tick after the animating/idle state changes, so a request
+   * arriving during an idle tick starts animating now rather than up to
+   * IDLE_TICK_MS later.
+   */
+  _retick() {
+    if (!this.running) return;
+    if (this.timer) clearTimeout(this.timer);
+    this._scheduleTick();
   }
 
   stop() {
     this.running = false;
-    if (this.timer) { clearInterval(this.timer); this.timer = null; }
+    if (this.timer) { clearTimeout(this.timer); this.timer = null; }
     if (this._origLog) { console.log = this._origLog; console.error = this._origErr; }
     if (this._activityStream) { this._activityStream.end(); this._activityStream = null; }
     process.stdin.removeListener('data', this._dataHandler);
@@ -261,6 +317,7 @@ export class TUI {
   onRequestStart(id, info) {
     this.active.set(id, { ...info, t: timestamp(), started: Date.now(), account: null });
     this.render();
+    if (this.active.size === 1) this._retick();   // idle → animating
   }
 
   onRequestModel(id, info) {
@@ -282,6 +339,7 @@ export class TUI {
     const sid = info.sessionId || r?.sessionId || null;
     const pin = (info.pinned || r?.pinned) ? dim(' [pin]') : '';
     this._addLog(`${sessionTag(sid)} ${info.method} ${info.path}${model} → ${acct}${pin} (${info.status}, ${dur}s)`);
+    if (this.active.size === 0) this._retick();   // animating → idle
   }
 
   _addLog(msg) {
@@ -327,13 +385,18 @@ export class TUI {
   _keyNormal(k) {
     if (k === 'q') { this.stop(); this.onQuit?.(); }
     else if (k === 's' && this.am.accounts.length > 0) {
-      this.mode = 'select'; this.selAction = 'switch'; this.selIdx = this.am.currentIndex; this.selRoute = null; this.selReturn = 'normal';
+      // currentIndex is -1 when nothing is marked current (attach mode, when the
+      // server names an account that has since gone); start at the top instead.
+      this.mode = 'select'; this.selAction = 'switch'; this.selIdx = Math.max(0, this.am.currentIndex); this.selRoute = null; this.selReturn = 'normal';
     }
+    else if (k === 'R') { this._doSync(); }
+    // The keys below all edit local state or call out to Anthropic, neither of
+    // which attach mode can do — the server owns both.
+    else if (this.remote) { /* nothing else is available here */ }
     else if (k === 'd' && this.am.accounts.length > 0) {
       this.mode = 'select'; this.selAction = 'toggle'; this.selIdx = this.am.currentIndex; this.selReturn = 'normal';
     }
     else if (k === 'p' && this.am.accounts.length > 0) { this._doProbe(); }
-    else if (k === 'R') { this._doSync(); }
     else if (k === 'g') { this.mode = 'settings'; this.setIdx = 0; this._loadSxBalance(); }
   }
 
@@ -559,8 +622,10 @@ export class TUI {
     // Tab / ←→ (switch only): cycle which route the pick applies to. null = the
     // global default account; each getRoutes() entry = a per-route manual pin.
     // ↑↓ move within the account list, so ←→ are free to move across targets.
-    else if ((k === 'tab' || k === 'right') && this.selAction === 'switch') this._cycleSelRoute(+1);
-    else if (k === 'left' && this.selAction === 'switch') this._cycleSelRoute(-1);
+    // Pins are runtime state of the server's rotation, so attach mode — which
+    // can only ask for the default account — leaves these keys alone.
+    else if ((k === 'tab' || k === 'right') && this.selAction === 'switch' && !this.remote) this._cycleSelRoute(+1);
+    else if (k === 'left' && this.selAction === 'switch' && !this.remote) this._cycleSelRoute(-1);
     else if (k === 'enter') {
       if (this.selAction === 'switch') {
         this._doSwitchSelection();
@@ -592,6 +657,12 @@ export class TUI {
   // retry, rather than silently returning to normal.
   _doSwitchSelection() {
     const acct = this.am.accounts[this.selIdx];
+    // The list can shrink under the cursor between polls in attach mode. Say so
+    // rather than swallowing the keypress.
+    if (!acct) { this.mode = 'normal'; this._addLog('That account is no longer listed'); return; }
+    // Attach mode: the rotation lives in another process, so this is a request
+    // whose result the next poll reflects, not a local assignment.
+    if (this.applySwitch) { this.mode = 'normal'; this._doSwitchRemote(acct); return; }
     if (this.selRoute === null) {
       this.am.currentIndex = this.selIdx;
       this._addLog(`Switched to "${acct.name}"`);
@@ -612,6 +683,34 @@ export class TUI {
     } else {
       this._addLog(`Can't pin: ${res.reason}`); // stay in select mode to retry
     }
+  }
+
+  // Ask the running server to switch. A failure is reported as one, so the
+  // dashboard never implies a switch that the server refused.
+  async _doSwitchRemote(acct) {
+    try {
+      const res = await this.applySwitch(acct.name);
+      // The server resolves the name it was given and echoes what it settled on;
+      // prefer that over what was highlighted here. `eligible: false` means the
+      // switch applied to an account that cannot currently serve requests, which
+      // the row already shows but is worth stating at the moment it is chosen.
+      const name = res?.account || acct.name;
+      if (res?.eligible === false) {
+        // The server knows WHY — disabled, out of quota, outranked by a
+        // higher-priority account — so quote it rather than restating the
+        // generic case. Control characters and length are clamped: this string
+        // arrives over the wire and is drawn into a fixed-width frame.
+        // The server's reasons are phrased to follow "<name> is ...", so they are
+        // composed that way here too.
+        const given = typeof res.reason === 'string' ? res.reason.replace(/\p{C}/gu, ' ').trim().slice(0, 60) : '';
+        this._addLog(`Switched to "${name}" — ${given ? `it is ${given}` : 'it cannot serve requests right now'}`);
+      } else {
+        this._addLog(`Switched to "${name}"`);
+      }
+    } catch (e) {
+      this._addLog(`Switch failed: ${e.message}`);
+    }
+    if (this.running) this.render();
   }
 
   // The add chooser is opened from the settings screen (g → Add account), so
@@ -881,20 +980,33 @@ export class TUI {
 
   // ── rendering ──────────────────────────────────────
 
-  render() {
+  render({ force = false } = {}) {
     if (!this.running) return;
     // Guard against re-entry: clearing an expired quota logs, and _addLog calls
     // render() again — without this the nested call would render twice.
     if (this._rendering) return;
     this._rendering = true;
     try {
-      this._render();
+      this._render(force);
     } finally {
       this._rendering = false;
     }
   }
 
-  _render() {
+  /**
+   * Write `buf` to the terminal unless it is byte-identical to what is already
+   * there. An idle proxy composes the same screen every tick, and writing it
+   * again costs a wake-up and a terminal round trip to change nothing.
+   */
+  _paint(buf, force) {
+    const stale = Date.now() - (this._lastPaintAt || 0) >= FORCE_REPAINT_MS;
+    if (!force && !stale && buf === this._lastFrame) return;
+    this._lastFrame = buf;
+    this._lastPaintAt = Date.now();
+    process.stdout.write(buf);
+  }
+
+  _render(force = false) {
     // Reset the display the instant a quota window (e.g. 5-hour session) expires,
     // instead of waiting for the next request to clear it.
     this.am.refreshExpiredQuotas();
@@ -902,7 +1014,7 @@ export class TUI {
     const H = process.stdout.rows || 24;
 
     if (W < 40 || H < 8) {
-      process.stdout.write(`${ESC}H${ESC}2JTerminal too small (need 40x8+)\r\n`);
+      this._paint(`${ESC}H${ESC}2JTerminal too small (need 40x8+)\r\n`, force);
       return;
     }
 
@@ -915,7 +1027,10 @@ export class TUI {
     const sessStr = (sess.active || sess.known)
       ? `${sess.active} sess${this.am.distributeSessions ? green(' dist') : ''}  `
       : '';
-    const right = `${sessStr}Port ${port} ${green('▲')} `;
+    // ▼ marks a dashboard that lost contact with the server it polls (attach
+    // mode): what is on screen is the last snapshot, not the current state.
+    const live = this.am.connected === false ? red('▼') : green('▲');
+    const right = `${sessStr}Port ${port} ${live} `;
     lines.push(left + ' '.repeat(Math.max(1, W - vw(left) - vw(right))) + right);
     lines.push(' ' + dim('─'.repeat(W - 2)));
 
@@ -941,7 +1056,11 @@ export class TUI {
     // ── Accounts
     if (this.am.accounts.length === 0) {
       lines.push('');
-      lines.push(yellow('  No accounts configured. Press [g] → Add account.'));
+      // Attach mode cannot add an account, and pointing at a key that does
+      // nothing here would be worse than saying only what is known.
+      lines.push(yellow(this.remote
+        ? '  The server reports no accounts.'
+        : '  No accounts configured. Press [g] → Add account.'));
     } else {
       lines.push('');
       const showBoth = W >= 70;
@@ -971,11 +1090,13 @@ export class TUI {
     // ► marks a route the account serves — next to the F7/S7 bar for a Fable/Sonnet
     // route, at the row start for a general route — bold when it's the route's pin.
 
-    // ── Activity header
+    // ── Activity header. Attach mode sees no request traffic — the server logs
+    // that in its own process — so the pane is named for what it does hold:
+    // messages from the actions taken here.
     lines.push('');
     const ac = this.active.size;
     const acTag = ac > 0 ? `  ${cyan(ac + ' active')}` : '';
-    const aHdr = ` Activity${acTag} `;
+    const aHdr = this.remote ? ' Messages ' : ` Activity${acTag} `;
     lines.push(aHdr + dim('─'.repeat(Math.max(1, W - vw(aHdr)))));
 
     // Active requests
@@ -1011,7 +1132,7 @@ export class TUI {
     }
     // Show cursor only in input mode
     buf += this.mode === 'input' ? `${ESC}?25h` : `${ESC}?25l`;
-    process.stdout.write(buf);
+    this._paint(buf, force);
   }
 
   _renderAcct(idx, bw, showBoth, routes = this.am.getRoutes(), genRoutes = routes.filter(r => routeFamily(r) === null), familyTarget = {}) {
@@ -1476,7 +1597,9 @@ export class TUI {
   _renderFooter() {
     switch (this.mode) {
       case 'normal':
-        return ` ${bold('s')}witch  ${bold('d')}isable  ${bold('p')}robe quota  ${bold('R')}eload  ${bold('g')} settings  ${bold('q')}uit`;
+        return this.remote
+          ? ` ${bold('s')}witch  ${bold('R')}eload  ${bold('q')}uit`
+          : ` ${bold('s')}witch  ${bold('d')}isable  ${bold('p')}robe quota  ${bold('R')}eload  ${bold('g')} settings  ${bold('q')}uit`;
       case 'settings':
         return ` ${dim('↑↓')} navigate  ${dim('←→')} change  ${bold('Enter')} edit  ${bold('Esc')} back`;
       case 'routes':
@@ -1488,6 +1611,9 @@ export class TUI {
       case 'blocklist':
         return ` ${dim('↑↓')} select  ${bold('a')}dd  ${bold('d')}elete  ${bold('Esc')} back`;
       case 'select': {
+        if (this.selAction === 'switch' && this.remote) {
+          return ` ${dim('↑↓')} select  ${bold('Enter')} switch  ${bold('Esc')} cancel`;
+        }
         if (this.selAction === 'switch') {
           const target = this.selRoute
             ? routeColorFn(this.selRoute.color)(`route ${this.selRoute.name}`)
