@@ -44,16 +44,12 @@ test('the tick is slow while idle and fast only while something is animating', (
   assert.equal(tui._tickDelay(), idle, 'falls back to the idle cadence once nothing is in flight');
 });
 
-// Run exactly one real tick by capturing the callback _scheduleTick arms.
+// Run exactly one real tick, driving the scheduler's own callback rather than a
+// hand-rolled copy of its body.
 function runOneTick(tui) {
-  const realSetTimeout = global.setTimeout;
   let captured = null;
-  global.setTimeout = (fn) => { captured = fn; return { unref() {} }; };
-  try {
-    tui._scheduleTick();
-  } finally {
-    global.setTimeout = realSetTimeout;
-  }
+  tui._setTimeout = (fn) => { captured = fn; return { unref() {} }; };
+  tui._scheduleTick();
   assert.ok(captured, '_scheduleTick armed no timer');
   // Stop it re-arming forever when we invoke it.
   const rearm = tui._scheduleTick;

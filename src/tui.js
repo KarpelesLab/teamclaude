@@ -221,6 +221,9 @@ export class TUI {
     this.frame = 0;
     this.running = false;
     this.timer = null;
+    // Injectable so a test can drive the repaint tick by hand instead of
+    // sleeping through real 500ms/5s intervals.
+    this._setTimeout = setTimeout;
     this._origLog = null;
     this._origErr = null;
   }
@@ -264,7 +267,7 @@ export class TUI {
 
   _scheduleTick() {
     if (!this.running) return;
-    this.timer = setTimeout(() => {
+    this.timer = this._setTimeout(() => {
       if (!this.running) return;
       // Only advance the spinner when it is actually on screen; otherwise the
       // frame counter would change every tick and defeat the repaint dedupe.
