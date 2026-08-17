@@ -52,19 +52,6 @@ function escapeRegExp(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-// The `blockedModels` pattern that takes a model FAMILY out of service, or null.
-//
-// The blocklist is written against concrete model ids (`*fable*`,
-// `claude-fable-5`) but the status view reasons in families (`Fable`), so a
-// direct glob match is not enough: `claude-fable-5` never matches the literal
-// string `Fable`. Both spellings are checked so the two natural ways to block a
-// family light up the same row — the glob (via modelGlobMatches, which also
-// makes a bare `*` block everything) and a concrete id (via substring).
-//
-// Deliberately advisory: this drives display only. The authoritative gate is the
-// per-request check in server.js, which matches the real model id. A pattern
-// that names no family (say `claude-3-*`) simply lights up no row, and the
-// header list still shows it verbatim.
 // Do two model globs describe any model in common? Used to tell whether a route
 // is fully shadowed by the blocklist. Exact glob intersection is not decidable
 // in general, so this compares literal cores (the pattern with `*` removed) in
@@ -79,6 +66,19 @@ export function modelGlobOverlaps(a, b) {
   return ca.includes(cb) || cb.includes(ca);
 }
 
+// The `blockedModels` pattern that takes a model FAMILY out of service, or null.
+//
+// The blocklist is written against concrete model ids (`*fable*`,
+// `claude-fable-5`) but the status view reasons in families (`Fable`), so a
+// direct glob match is not enough: `claude-fable-5` never matches the literal
+// string `Fable`. Both spellings are checked so the two natural ways to block a
+// family light up the same row — the glob (via modelGlobMatches, which also
+// makes a bare `*` block everything) and a concrete id (via substring).
+//
+// Deliberately advisory: this drives display only. The authoritative gate is the
+// per-request check in server.js, which matches the real model id. A pattern
+// that names no family (say `claude-3-*`) simply lights up no row, and the
+// header list still shows it verbatim.
 export function findFamilyBlock(patterns, family) {
   if (!Array.isArray(patterns) || !family) return null;
   const key = String(family).toLowerCase();
