@@ -1,3 +1,5 @@
+import { findFamilyBlock, modelGlobOverlaps } from './model.js';
+
 const ESC = '\x1b[';
 const RESET = `${ESC}0m`;
 
@@ -7,10 +9,18 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
   const probe = status.probe || { enabled: false, intervalSeconds: 0, accounts: [] };
   const warm = status.warm || { enabled: false, intervalSeconds: 0, accounts: [] };
   const accounts = status.accounts || [];
+  const blocked = (status.blockedModels || []).filter(p => typeof p === 'string' && p.length);
 
   lines.push(paint.bold('TeamClaude status'));
   lines.push(`${paint.dim('Active'.padEnd(12))} ${paint.cyan(status.currentAccount || 'none')}`);
   lines.push(`${paint.dim('Switch at'.padEnd(12))} ${formatPercent(status.switchThreshold)}`);
+  // Only when something is blocked: a always-visible "Blocked" row would be
+  // noise for the common case, but its ABSENCE is what made a blocked model
+  // read as available — the per-account Models row reports quota headroom and
+  // knows nothing about the blocklist.
+  if (blocked.length) {
+    lines.push(`${paint.dim('Blocked'.padEnd(12))} ${paint.red(blocked.join(', '))}`);
+  }
   if (status.sessions) {
     lines.push(`${paint.dim('Sessions'.padEnd(12))} ${formatSessions(status.sessions, paint)}`);
   }
@@ -23,14 +33,14 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
   }
   lines.push('');
 
-  for (const line of routingLines(status.routes, paint)) lines.push(line);
+  for (const line of routingLines(status.routes, blocked, paint)) lines.push(line);
 
   for (const account of accounts) {
     lines.push(renderAccountHeader(account, status.currentAccount, paint, now));
     for (const quotaLine of quotaLines(account, now, paint)) {
       lines.push(`  ${quotaLine}`);
     }
-    const routing = modelRoutingLine(account, status.switchThreshold, now, paint);
+    const routing = modelRoutingLine(account, status.switchThreshold, blocked, now, paint);
     if (routing) lines.push(`  ${routing}`);
     lines.push(`  ${paint.dim('Usage'.padEnd(8))} ${formatUsage(account.usage, now)}`);
     lines.push(`  ${paint.dim('Probe'.padEnd(8))} ${formatAccountProbe(account.name, probe, now, paint)}`);
@@ -67,13 +77,20 @@ function paintRoute(paint, color, value) {
 // listing the model globs it matches and the accounts it can use, each colored
 // by live eligibility. Auto-created routes (a family metered separately with no
 // configured route) are tagged (auto); a bucket override shows in [brackets].
-function routingLines(routes, paint) {
+function routingLines(routes, blocked, paint) {
   if (!Array.isArray(routes) || routes.length === 0) return [];
   const lines = [paint.bold('Routing')];
   for (const route of routes) {
-    const match = (route.match || []).join(', ');
-    const accounts = (route.accounts || [])
-      .map(a => (a.eligible ? paint.green(a.name) : paint.red(a.name))).join(' ') || paint.gray('(none)');
+    const globs = route.match || [];
+    const match = globs.join(', ');
+    // A route every one of whose globs is blocked can carry no traffic at all —
+    // say so, rather than listing eligible accounts it will never reach.
+    const routeBlocked = globs.length > 0
+      && globs.every(g => blocked.some(p => modelGlobOverlaps(p, g)));
+    const accounts = routeBlocked
+      ? paint.red('blocked')
+      : (route.accounts || [])
+        .map(a => (a.eligible ? paint.green(a.name) : paint.red(a.name))).join(' ') || paint.gray('(none)');
     const tag = route.autocreated ? paint.dim(' (auto)') : route.bucket ? paint.dim(` [${route.bucket}]`) : '';
     const pin = route.pinned ? paint.dim(` [pinned: ${route.pinned}]`) : '';
     // padEnd on the raw text, color after, so ANSI codes don't throw off alignment.
@@ -131,13 +148,19 @@ function formatAccountStatus(account, now, paint) {
 // shared 5h bucket is spent (blocks everything) or when its own weekly bucket is
 // over the switch threshold; the reset is shown when the family bucket is the
 // blocker so it's clear when that model becomes available on this account again.
-function modelRoutingLine(account, threshold, now, paint) {
+function modelRoutingLine(account, threshold, blocked, now, paint) {
   const q = account.quota || {};
   if (q.unified7dSonnet == null && q.unified7dFable == null) return null;
   const t = Number(threshold);
   const fiveOver = q.unified5h != null && !Number.isNaN(t) && q.unified5h >= t;
 
   const cell = (label, weekly, reset) => {
+    // The blocklist outranks quota: a blocked family cannot be served however
+    // much headroom the account has, so it must not read ✓. Reporting quota
+    // alone is what made a fully-blocked model look available.
+    if (findFamilyBlock(blocked, label)) {
+      return `${label} ${paint.red('⊘')}${paint.dim(' blocked')}`;
+    }
     const weeklyOver = weekly != null && !Number.isNaN(t) && weekly >= t;
     const mark = fiveOver || weeklyOver ? paint.red('✗') : paint.green('✓');
     const resetTs = parseTs(reset);

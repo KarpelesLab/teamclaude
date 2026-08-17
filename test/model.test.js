@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { isFableModel, parseRequestModel, TopLevelFieldFinder } from '../src/model.js';
+import { findFamilyBlock, isFableModel, modelGlobOverlaps, parseRequestModel, TopLevelFieldFinder } from '../src/model.js';
 
 test('isFableModel matches the Fable family only', () => {
   assert.equal(isFableModel('claude-fable-5'), true);
@@ -52,4 +52,24 @@ test('TopLevelFieldFinder marks done (absent) once the root object closes', () =
   const finder = new TopLevelFieldFinder('model');
   assert.equal(finder.push(Buffer.from('{"max_tokens":1}')), null);
   assert.equal(finder.done, true); // root closed without the field → stop early
+});
+
+test('findFamilyBlock matches a family by glob, by concrete id, and by catch-all', () => {
+  assert.equal(findFamilyBlock(['*fable*'], 'Fable'), '*fable*');
+  assert.equal(findFamilyBlock(['claude-fable-5'], 'Fable'), 'claude-fable-5');
+  assert.equal(findFamilyBlock(['*'], 'Fable'), '*');
+  assert.equal(findFamilyBlock(['*opus*'], 'Fable'), null);
+  assert.equal(findFamilyBlock([], 'Fable'), null);
+  assert.equal(findFamilyBlock(['*fable*'], ''), null);
+  assert.equal(findFamilyBlock(null, 'Fable'), null);
+  assert.equal(findFamilyBlock([null, 42, '*fable*'], 'Fable'), '*fable*');
+});
+
+test('modelGlobOverlaps compares literal cores in both directions', () => {
+  assert.equal(modelGlobOverlaps('*fable*', '*fable*'), true);
+  assert.equal(modelGlobOverlaps('claude-fable-5', '*fable*'), true);
+  assert.equal(modelGlobOverlaps('*fable*', 'claude-fable-5'), true);
+  assert.equal(modelGlobOverlaps('*', '*fable*'), true);
+  assert.equal(modelGlobOverlaps('*opus*', '*fable*'), false);
+  assert.equal(modelGlobOverlaps(undefined, '*fable*'), false);
 });
