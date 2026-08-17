@@ -6,6 +6,21 @@ import { parseProxyUrl, proxyToUrl, describeProxy, resolveUpstreamProxy, setUpst
 // ── ANSI helpers ─────────────────────────────────────────────
 
 const SPINNER = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'.split('');
+
+// Repaint cadence.
+//
+// The spinner is drawn only alongside in-flight requests, so animating it while
+// the proxy is idle wakes the process twice a second to redraw a frame nobody
+// can tell apart from the last one. On a laptop that is enough to keep the
+// machine from going to sleep (#134), which is a poor trade for animating
+// nothing. Tick fast only while there is something to animate; otherwise tick
+// slowly, just often enough that elapsed times and quota countdowns stay honest.
+const SPIN_MS = 500;
+const IDLE_TICK_MS = 5_000;
+// Even when the composed frame is unchanged, repaint occasionally: the terminal
+// is shared state, and anything that writes over it (a stray warning, a resumed
+// job) would otherwise leave the screen corrupted until the next real change.
+const FORCE_REPAINT_MS = 60_000;
 const ESC = '\x1b[';
 const RESET = `${ESC}0m`;
 const BOLD = `${ESC}1m`;
@@ -227,7 +242,9 @@ export class TUI {
     process.stdin.resume();
     process.stdin.setEncoding('utf8');
     this._dataHandler = d => this._onData(d);
-    this._resizeHandler = () => this.render();
+    // A resize reflows the terminal itself, so the cached frame says nothing
+    // about what is on screen — always repaint.
+    this._resizeHandler = () => this.render({ force: true });
     process.stdin.on('data', this._dataHandler);
     process.stdout.on('resize', this._resizeHandler);
 
@@ -237,16 +254,41 @@ export class TUI {
     console.log = (...a) => this._addLog(a.join(' '));
     console.error = (...a) => this._addLog(a.join(' '));
 
+    this._lastFrame = null;   // entering the alt screen always paints
     this.render();
-    this.timer = setInterval(() => {
-      this.frame = (this.frame + 1) % SPINNER.length;
+    this._scheduleTick();
+  }
+
+  /** Fast while something is animating, slow when there is nothing to animate. */
+  _tickDelay() { return this.active.size > 0 ? SPIN_MS : IDLE_TICK_MS; }
+
+  _scheduleTick() {
+    if (!this.running) return;
+    this.timer = setTimeout(() => {
+      if (!this.running) return;
+      // Only advance the spinner when it is actually on screen; otherwise the
+      // frame counter would change every tick and defeat the repaint dedupe.
+      if (this.active.size > 0) this.frame = (this.frame + 1) % SPINNER.length;
       this.render();
-    }, 500);
+      this._scheduleTick();
+    }, this._tickDelay());
+    this.timer.unref?.();
+  }
+
+  /**
+   * Re-arm the tick after the animating/idle state changes, so a request
+   * arriving during an idle tick starts animating now rather than up to
+   * IDLE_TICK_MS later.
+   */
+  _retick() {
+    if (!this.running) return;
+    if (this.timer) clearTimeout(this.timer);
+    this._scheduleTick();
   }
 
   stop() {
     this.running = false;
-    if (this.timer) { clearInterval(this.timer); this.timer = null; }
+    if (this.timer) { clearTimeout(this.timer); this.timer = null; }
     if (this._origLog) { console.log = this._origLog; console.error = this._origErr; }
     if (this._activityStream) { this._activityStream.end(); this._activityStream = null; }
     process.stdin.removeListener('data', this._dataHandler);
@@ -261,6 +303,7 @@ export class TUI {
   onRequestStart(id, info) {
     this.active.set(id, { ...info, t: timestamp(), started: Date.now(), account: null });
     this.render();
+    if (this.active.size === 1) this._retick();   // idle → animating
   }
 
   onRequestModel(id, info) {
@@ -282,6 +325,7 @@ export class TUI {
     const sid = info.sessionId || r?.sessionId || null;
     const pin = (info.pinned || r?.pinned) ? dim(' [pin]') : '';
     this._addLog(`${sessionTag(sid)} ${info.method} ${info.path}${model} → ${acct}${pin} (${info.status}, ${dur}s)`);
+    if (this.active.size === 0) this._retick();   // animating → idle
   }
 
   _addLog(msg) {
@@ -881,20 +925,33 @@ export class TUI {
 
   // ── rendering ──────────────────────────────────────
 
-  render() {
+  render({ force = false } = {}) {
     if (!this.running) return;
     // Guard against re-entry: clearing an expired quota logs, and _addLog calls
     // render() again — without this the nested call would render twice.
     if (this._rendering) return;
     this._rendering = true;
     try {
-      this._render();
+      this._render(force);
     } finally {
       this._rendering = false;
     }
   }
 
-  _render() {
+  /**
+   * Write `buf` to the terminal unless it is byte-identical to what is already
+   * there. An idle proxy composes the same screen every tick, and writing it
+   * again costs a wake-up and a terminal round trip to change nothing.
+   */
+  _paint(buf, force) {
+    const stale = Date.now() - (this._lastPaintAt || 0) >= FORCE_REPAINT_MS;
+    if (!force && !stale && buf === this._lastFrame) return;
+    this._lastFrame = buf;
+    this._lastPaintAt = Date.now();
+    process.stdout.write(buf);
+  }
+
+  _render(force = false) {
     // Reset the display the instant a quota window (e.g. 5-hour session) expires,
     // instead of waiting for the next request to clear it.
     this.am.refreshExpiredQuotas();
@@ -902,7 +959,7 @@ export class TUI {
     const H = process.stdout.rows || 24;
 
     if (W < 40 || H < 8) {
-      process.stdout.write(`${ESC}H${ESC}2JTerminal too small (need 40x8+)\r\n`);
+      this._paint(`${ESC}H${ESC}2JTerminal too small (need 40x8+)\r\n`, force);
       return;
     }
 
@@ -1011,7 +1068,7 @@ export class TUI {
     }
     // Show cursor only in input mode
     buf += this.mode === 'input' ? `${ESC}?25h` : `${ESC}?25l`;
-    process.stdout.write(buf);
+    this._paint(buf, force);
   }
 
   _renderAcct(idx, bw, showBoth, routes = this.am.getRoutes(), genRoutes = routes.filter(r => routeFamily(r) === null), familyTarget = {}) {
