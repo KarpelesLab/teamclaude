@@ -123,6 +123,27 @@ function fitLine(s, w) {
   return s;
 }
 
+// Account-table column widths for terminal width W. The name column grows to
+// fit the longest name when there is room and never drops below NAME_MIN, so a
+// wide terminal shows full names while a narrow one renders as before; the bars
+// take the rest, capped at BAR_MAX. familyBars is how many S7/F7 weekly bars a
+// row can carry (0-2, only in the showBoth layout); they share the bar width and
+// each adds a fixed label+gap, so counting them keeps a row with S7/F7 from
+// overflowing the terminal. chrome is the fixed cost of the other columns
+// (markers, type, status, labels, inter-column gaps) and mirrors the row
+// template in _renderAcct: it must move with that template.
+export function columnLayout(W, showBoth, genRouteCount, longestName, familyBars = 0) {
+  const NAME_MIN = 12, BAR_MIN = 5, BAR_MAX = 20;
+  const routeSlot = genRouteCount ? genRouteCount + 1 : 0;
+  const fam = showBoth ? familyBars : 0;
+  const chrome = 4 + routeSlot + 24 + (showBoth ? 6 : 0) + fam * 6;
+  const bars = (showBoth ? 2 : 1) + fam;
+  const budget = Math.max(0, W - chrome);
+  const bw = Math.max(BAR_MIN, Math.min(BAR_MAX, Math.floor((budget - NAME_MIN) / bars)));
+  const nameW = Math.max(NAME_MIN, Math.min(Math.max(NAME_MIN, longestName), budget - bars * bw));
+  return { nameW, bw };
+}
+
 function formatReset(resetTs) {
   if (!resetTs) return '';
   const ms = resetTs - Date.now();
@@ -1095,25 +1116,27 @@ export class TUI {
     } else {
       lines.push('');
       const showBoth = W >= 70;
-      const bw = showBoth
-        ? Math.max(5, Math.min(20, Math.floor((W - 56) / 2)))
-        : Math.max(5, Math.min(20, W - 45));
 
       // Routes drive the inline markers; general (non-family) routes get a stable
       // column each at the row start so the marker's position identifies the route.
       const routes = this.am.getRoutes();
       const genRoutes = routes.filter(r => routeFamily(r) === null);
+
       // The single account each secondary bucket currently routes to (null = none
       // can serve it right now). Marked next to that account's F7/S7 bar — the
       // secondary-quota analogue of ► marking the default route's current account.
       const anyFable = this.am.accounts.some(a => a.quota.unified7dFable != null);
       const anySonnet = this.am.accounts.some(a => a.quota.unified7dSonnet != null);
+
+      const longestName = Math.max(0, ...this.am.accounts.map(a => vw(a.name)));
+      const familyBars = (anySonnet ? 1 : 0) + (anyFable ? 1 : 0);
+      const { nameW, bw } = columnLayout(W, showBoth, genRoutes.length, longestName, familyBars);
       const familyTarget = {
         fable: anyFable ? this.am.previewRouteIndex('claude-fable-5') : null,
         sonnet: anySonnet ? this.am.previewRouteIndex('claude-sonnet-4-6') : null,
       };
       for (let i = 0; i < this.am.accounts.length; i++) {
-        lines.push(this._renderAcct(i, bw, showBoth, routes, genRoutes, familyTarget));
+        lines.push(this._renderAcct(i, bw, showBoth, routes, genRoutes, familyTarget, nameW));
       }
     }
 
@@ -1166,7 +1189,7 @@ export class TUI {
     this._paint(buf, force);
   }
 
-  _renderAcct(idx, bw, showBoth, routes = this.am.getRoutes(), genRoutes = routes.filter(r => routeFamily(r) === null), familyTarget = {}) {
+  _renderAcct(idx, bw, showBoth, routes = this.am.getRoutes(), genRoutes = routes.filter(r => routeFamily(r) === null), familyTarget = {}, nameW = 12) {
     const a = this.am.accounts[idx];
     const isCur = idx === this.am.currentIndex;
     const isSel = this.mode === 'select' && idx === this.selIdx;
@@ -1200,7 +1223,7 @@ export class TUI {
     };
 
     // Name (bold if selected)
-    const rawName = a.name.slice(0, 12).padEnd(12);
+    const rawName = a.name.slice(0, nameW).padEnd(nameW);
     const name = isSel ? bold(rawName) : rawName;
 
     // Type
