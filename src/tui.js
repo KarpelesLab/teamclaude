@@ -123,6 +123,27 @@ function fitLine(s, w) {
   return s;
 }
 
+// Account-table column widths for terminal width W. The name column grows to
+// fit the longest name when there is room and never drops below NAME_MIN, so a
+// wide terminal shows full names while a narrow one renders as before; the bars
+// take the rest, capped at BAR_MAX. familyBars is how many S7/F7 weekly bars a
+// row can carry (0-2, only in the showBoth layout); they share the bar width and
+// each adds a fixed label+gap, so counting them keeps a row with S7/F7 from
+// overflowing the terminal. chrome is the fixed cost of the other columns
+// (markers, type, status, labels, inter-column gaps) and mirrors the row
+// template in _renderAcct: it must move with that template.
+export function columnLayout(W, showBoth, genRouteCount, longestName, familyBars = 0) {
+  const NAME_MIN = 12, BAR_MIN = 5, BAR_MAX = 20;
+  const routeSlot = genRouteCount ? genRouteCount + 1 : 0;
+  const fam = showBoth ? familyBars : 0;
+  const chrome = 4 + routeSlot + 24 + (showBoth ? 6 : 0) + fam * 6;
+  const bars = (showBoth ? 2 : 1) + fam;
+  const budget = Math.max(0, W - chrome);
+  const bw = Math.max(BAR_MIN, Math.min(BAR_MAX, Math.floor((budget - NAME_MIN) / bars)));
+  const nameW = Math.max(NAME_MIN, Math.min(Math.max(NAME_MIN, longestName), budget - bars * bw));
+  return { nameW, bw };
+}
+
 function formatReset(resetTs) {
   if (!resetTs) return '';
   const ms = resetTs - Date.now();
@@ -137,11 +158,48 @@ function formatReset(resetTs) {
   return rh > 0 ? `${days}d${rh}h` : `${days}d`;
 }
 
+// Rolling-window lengths for the Claude Max buckets, used to color a bar by
+// burn rate rather than raw fill (see barColor). The five-hour session bucket
+// and the seven-day weekly buckets (unified, Sonnet, Fable) reset on these.
+const FIVE_HOUR_MS = 5 * 60 * 60 * 1000;
+const SEVEN_DAY_MS = 7 * 24 * 60 * 60 * 1000;
+
+// { bg, fg } SGR params per severity. White label on red (dark everywhere),
+// black on the lighter green/yellow/orange (bright-white would vanish on the
+// light backgrounds many terminal themes render for them).
+const BAR_GREEN = { bg: '42', fg: '30' };
+const BAR_YELLOW = { bg: '43', fg: '30' };
+const BAR_ORANGE = { bg: '48;5;208', fg: '30' };
+const BAR_RED = { bg: '41', fg: '97' };
+
+/**
+ * Pick a bar color. With a known window, color by burn rate: how far usage is
+ * ahead of the share of the window already elapsed, so a bucket that is 80%
+ * spent with the week nearly over reads calm, not alarming. Without a window
+ * (API-key token/request bars, whose reset cadence is unknown), fall back to
+ * raw utilization.
+ */
+function barColor(ratio, resetTs, windowMs) {
+  if (windowMs && resetTs) {
+    const remaining = Math.max(0, resetTs - Date.now());
+    const elapsed = Math.max(0, windowMs - remaining);
+    const timePct = (elapsed / windowMs) * 100;
+    const diff = ratio * 100 - timePct;
+    if (diff <= 0) return BAR_GREEN;
+    if (diff <= 5) return BAR_YELLOW;
+    if (diff <= 15) return BAR_ORANGE;
+    return BAR_RED;
+  }
+  return ratio < 0.7 ? BAR_GREEN : ratio < 0.9 ? BAR_YELLOW : BAR_RED;
+}
+
 /**
  * Render a progress bar using background colors with text overlaid.
  * The label (e.g. "Ses 2h30m" or "45%") is drawn on top of the bar.
+ * windowMs is the bucket's rolling-window length; when known, the color tracks
+ * burn rate instead of raw fill.
  */
-export function bar(ratio, w = 10, resetTs) {
+export function bar(ratio, w = 10, resetTs, windowMs) {
   const rst = formatReset(resetTs);
 
   if (ratio == null || isNaN(ratio)) {
@@ -156,8 +214,7 @@ export function bar(ratio, w = 10, resetTs) {
 
   ratio = Math.max(0, Math.min(1, ratio));
   const f = Math.round(ratio * w);
-  // Background colors: 42=green, 43=yellow, 41=red; 100=bright black (gray) for empty
-  const bg = ratio < 0.7 ? 42 : ratio < 0.9 ? 43 : 41;
+  const { bg, fg } = barColor(ratio, resetTs, windowMs);
 
   // Build the label to overlay: show reset time if available, else percentage
   const pct = (ratio * 100).toFixed(0) + '%';
@@ -172,13 +229,8 @@ export function bar(ratio, w = 10, resetTs) {
   const filled = chars.slice(0, f);
   const empty = chars.slice(f);
 
-  // Black label on green/yellow: terminal themes commonly render those
-  // backgrounds light, and bright-white text disappears on them. White stays
-  // on red, which is dark in practically every palette.
-  const fgc = bg === 41 ? 97 : 30;
-
   let out = '';
-  if (filled) out += `${ESC}${bg};${fgc}m${filled}`;
+  if (filled) out += `${ESC}${bg};${fg}m${filled}`;
   if (empty) out += `${ESC}100;37m${empty}`;
   out += RESET;
   return out;
@@ -1064,25 +1116,27 @@ export class TUI {
     } else {
       lines.push('');
       const showBoth = W >= 70;
-      const bw = showBoth
-        ? Math.max(5, Math.min(20, Math.floor((W - 56) / 2)))
-        : Math.max(5, Math.min(20, W - 45));
 
       // Routes drive the inline markers; general (non-family) routes get a stable
       // column each at the row start so the marker's position identifies the route.
       const routes = this.am.getRoutes();
       const genRoutes = routes.filter(r => routeFamily(r) === null);
+
       // The single account each secondary bucket currently routes to (null = none
       // can serve it right now). Marked next to that account's F7/S7 bar — the
       // secondary-quota analogue of ► marking the default route's current account.
       const anyFable = this.am.accounts.some(a => a.quota.unified7dFable != null);
       const anySonnet = this.am.accounts.some(a => a.quota.unified7dSonnet != null);
+
+      const longestName = Math.max(0, ...this.am.accounts.map(a => vw(a.name)));
+      const familyBars = (anySonnet ? 1 : 0) + (anyFable ? 1 : 0);
+      const { nameW, bw } = columnLayout(W, showBoth, genRoutes.length, longestName, familyBars);
       const familyTarget = {
         fable: anyFable ? this.am.previewRouteIndex('claude-fable-5') : null,
         sonnet: anySonnet ? this.am.previewRouteIndex('claude-sonnet-4-6') : null,
       };
       for (let i = 0; i < this.am.accounts.length; i++) {
-        lines.push(this._renderAcct(i, bw, showBoth, routes, genRoutes, familyTarget));
+        lines.push(this._renderAcct(i, bw, showBoth, routes, genRoutes, familyTarget, nameW));
       }
     }
 
@@ -1135,7 +1189,7 @@ export class TUI {
     this._paint(buf, force);
   }
 
-  _renderAcct(idx, bw, showBoth, routes = this.am.getRoutes(), genRoutes = routes.filter(r => routeFamily(r) === null), familyTarget = {}) {
+  _renderAcct(idx, bw, showBoth, routes = this.am.getRoutes(), genRoutes = routes.filter(r => routeFamily(r) === null), familyTarget = {}, nameW = 12) {
     const a = this.am.accounts[idx];
     const isCur = idx === this.am.currentIndex;
     const isSel = this.mode === 'select' && idx === this.selIdx;
@@ -1169,7 +1223,7 @@ export class TUI {
     };
 
     // Name (bold if selected)
-    const rawName = a.name.slice(0, 12).padEnd(12);
+    const rawName = a.name.slice(0, nameW).padEnd(nameW);
     const name = isSel ? bold(rawName) : rawName;
 
     // Type
@@ -1190,13 +1244,15 @@ export class TUI {
 
     // Quota ratios — prefer unified (Claude Max), fall back to standard (API key)
     const q = a.quota;
-    let r1 = null, r2 = null, l1 = 'Ses', l2 = 'Wk ', t1 = null, t2 = null;
+    let r1 = null, r2 = null, l1 = 'Ses', l2 = 'Wk ', t1 = null, t2 = null, w1 = null, w2 = null;
 
     if (q.unified5h != null || q.unified7d != null || q.unified7dSonnet != null || q.unified7dFable != null) {
       r1 = q.unified5h;
       r2 = q.unified7d;
       t1 = q.unified5hReset;
       t2 = q.unified7dReset;
+      w1 = FIVE_HOUR_MS;
+      w2 = SEVEN_DAY_MS;
     } else {
       l1 = 'Tok';
       l2 = 'Req';
@@ -1208,17 +1264,17 @@ export class TUI {
       t2 = t1;
     }
 
-    let line = ` ${sel}${cur} ${startSlot}${name} ${type} ${status} ${l1} ${bar(r1, bw, t1)}`;
+    let line = ` ${sel}${cur} ${startSlot}${name} ${type} ${status} ${l1} ${bar(r1, bw, t1, w1)}`;
     if (showBoth) {
-      line += `  ${l2} ${bar(r2, bw, t2)}`;
+      line += `  ${l2} ${bar(r2, bw, t2, w2)}`;
       // Sonnet weekly bar — only shown when the usage probe has populated it. A
       // leading ► (in place of a padding space) marks a Sonnet route on this account.
       if (q.unified7dSonnet != null) {
-        line += ` ${familyMark('sonnet')}S7  ${bar(q.unified7dSonnet, bw, q.unified7dSonnetReset)}`;
+        line += ` ${familyMark('sonnet')}S7  ${bar(q.unified7dSonnet, bw, q.unified7dSonnetReset, SEVEN_DAY_MS)}`;
       }
       // Fable weekly bar — only shown when the usage probe has populated it.
       if (q.unified7dFable != null) {
-        line += ` ${familyMark('fable')}F7  ${bar(q.unified7dFable, bw, q.unified7dFableReset)}`;
+        line += ` ${familyMark('fable')}F7  ${bar(q.unified7dFable, bw, q.unified7dFableReset, SEVEN_DAY_MS)}`;
       }
     }
     // Explicit "disabled for these models" tag (issue #85): a family whose own
