@@ -193,6 +193,9 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
       return forward(req, res);
     } catch (err) {
       console.error('[TeamClaude] Unhandled error:', err);
+      // The window above throws for real: `getStatusExtra` is a hook the
+      // application installs, and reload/switch reach the account manager.
+      answerUnhandled(res);
     }
   };
 
@@ -423,14 +426,23 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // The token runs to the next '/', which also begins the real request path.
       const tokenEnd = afterPrefix == null ? -1 : afterPrefix.indexOf('/');
       if (tokenEnd > 0) {
-        const token = decodeURIComponent(afterPrefix.slice(0, tokenEnd));
-        pinnedIndex = resolveAccountPin(accountManager, token);
+        // The escaping of this segment is the CLIENT's, so a malformed one
+        // ("/tc-acct/%/v1/messages") makes decodeURIComponent throw URIError.
+        // That is an ordinary bad request, not an internal error: decode
+        // defensively and fall through to the unknown-pin 404 below, which is
+        // what a pin nobody can resolve already means. An undecodable token is
+        // reported as it arrived, since there is no decoded form to name.
+        const raw = afterPrefix.slice(0, tokenEnd);
+        let token = null;
+        try { token = decodeURIComponent(raw); } catch { token = null; }
+        pinnedIndex = token == null ? null : resolveAccountPin(accountManager, token);
         if (pinnedIndex == null) {
+          const shown = token ?? raw;
           const reqId = ++counter;
           const sessionId = req.headers['x-claude-code-session-id'] || null;
-          if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(unknown pin: "${token}")`, status: 404, model: null, sessionId, pinned: false });
+          if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(unknown pin: "${shown}")`, status: 404, model: null, sessionId, pinned: false });
           res.writeHead(404, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: `Unknown account pin "${token}"` } }));
+          res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: `Unknown account pin "${shown}"` } }));
           return;
         }
         req.url = afterPrefix.slice(tokenEnd);
@@ -517,8 +529,33 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       }
     } catch (err) {
       console.error('[TeamClaude] Unhandled error:', err);
+      // The code above the inner try (the egress hold, the pin parsing, body
+      // buffering, the activity hooks) runs outside the 502 that guards
+      // forwardRequest, and the inner `finally` calls onRequestEnd after the
+      // response has streamed.
+      answerUnhandled(res);
     }
   };
+}
+
+/**
+ * The last response an outer catch can send. Three states:
+ *
+ *   - Nothing written yet: send a 502. Guarded on headersSent, because a second
+ *     writeHead raises ERR_HTTP_HEADERS_SENT from inside the catch.
+ *   - Headers sent, body unfinished: destroy. There is no status left to send,
+ *     and end() would present the truncated bytes as a complete reply.
+ *   - Response already ended: leave it alone, the client has its answer.
+ *
+ * `forwardRequest`'s own catch already carries the same pair of arms.
+ */
+function answerUnhandled(res) {
+  if (!res.headersSent && !res.destroyed) {
+    res.writeHead(502, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Internal proxy error' } }));
+  } else if (!res.writableEnded) {
+    res.destroy();
+  }
 }
 
 // Per-request https.Agent tunneled through sx.org — one-shot (no keep-alive
