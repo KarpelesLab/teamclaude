@@ -1,7 +1,7 @@
 import http from 'node:http';
 import https from 'node:https';
 import { timingSafeEqual } from 'node:crypto';
-import { createWriteStream } from 'node:fs';
+import { createWriteStream, writeSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { ensureCerts, createConnectHandler } from './mitm.js';
@@ -192,7 +192,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
 
       return forward(req, res);
     } catch (err) {
-      console.error('[TeamClaude] Unhandled error:', err);
+      reportFailure('[TeamClaude] Unhandled error:', err);
       // The window above throws for real: `getStatusExtra` is a hook the
       // application installs, and reload/switch reach the account manager.
       answerUnhandled(res);
@@ -364,6 +364,12 @@ const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/files/', '/api/oauth/f
 export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null, egress = null }) {
   let counter = 0;
   return async (req, res) => {
+    // The activity entry this request opened, while it is still open. Every
+    // consumer holds the row until it is told the request ended, so exactly one
+    // path must close it. Each closing site clears this first, which is how the
+    // outer catch tells an entry it still has to account for from one that is
+    // already closed.
+    let openEntry = null;
     try {
       // Claude Code's telemetry (`/api/event_logging/*`) is high-volume noise in
       // the activity log. `config.eventLogging` (read live so the TUI toggle takes
@@ -471,7 +477,15 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // /v1/messages and count_tokens). Read from headers up front so it drives
       // session-aware routing (issue #109) and colors the TUI activity stream.
       const sessionId = req.headers['x-claude-code-session-id'] || null;
-      if (!hideActivity) hooks.onRequestStart?.(reqId, { method: req.method, path: req.url, sessionId, pinned: pinnedIndex != null });
+      if (!hideActivity) {
+        // Marked open BEFORE the hook runs. The shipped TUI hook registers its
+        // row and then renders, and the render can rethrow, so a hook that
+        // throws part way through has already opened a row that something must
+        // close. The cost of this order is one spurious close if the hook threw
+        // before registering anything, which every consumer already tolerates.
+        openEntry = { reqId, sessionId };
+        hooks.onRequestStart?.(reqId, { method: req.method, path: req.url, sessionId, pinned: pinnedIndex != null });
+      }
 
       // Buffer request body (needed to resend on a different account after a 429).
       // Peek the top-level `model` field incrementally as chunks arrive so the
@@ -505,6 +519,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: `Model "${model}" is blocked by teamclaude (matched "${blockedBy}").` } }));
         }
+        openEntry = null;   // this path owns the close below; the outer catch must not repeat it
         hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: '(blocked)', status: 400, model, sessionId });
         return;
       }
@@ -518,17 +533,53 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir, sx);
       } catch (err) {
         ctx.status = ctx.status || 502;
-        console.error('[TeamClaude] Unhandled error:', err);
+        // Same rule as the two outer catches: a recovery path does not report
+        // through a console that may be the thing that failed. Here it also
+        // decides which error gets reported at all, since a throw from the
+        // report would carry the render failure outward in place of this one.
+        reportFailure('[TeamClaude] Unhandled error:', err);
         if (!res.headersSent) {
           res.writeHead(502, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Internal proxy error' } }));
         }
       } finally {
         accountManager.endSession(sessionId);
+        // Cleared BEFORE the hook, because the hook can throw: leaving the entry
+        // marked open would send the outer catch to call that same throwing hook
+        // a second time for one request.
+        openEntry = null;
         if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, sessionId, pinned: ctx.pinnedIndex != null });
       }
     } catch (err) {
-      console.error('[TeamClaude] Unhandled error:', err);
+      reportFailure('[TeamClaude] Unhandled error:', err);
+      // Close the activity entry. Only the inner path has a `finally`, so a
+      // throw above it opens a row that nothing else will ever close, and every
+      // consumer holds an open row indefinitely: the TUI keeps it in `active`
+      // and never idles its animation, a headless consumer's in-flight count
+      // grows by one. The ordinary trigger is not exotic. `for await (const
+      // chunk of req)` rejects when a client cancels mid-body, which Ctrl+C in
+      // Claude Code does, on a daemon that runs for weeks.
+      if (openEntry) {
+        // 499 when nothing was sent and nothing will be, either because the
+        // client is gone or because the response is past the point of saying
+        // anything; 502 is what the answer below is about to write.
+        const status = res.headersSent || res.destroyed ? 499 : 502;
+        const entry = openEntry;
+        openEntry = null;
+        // Guarded, because the throw that landed here may BE this hook. Escaping
+        // this catch means escaping an async request listener with nothing above
+        // it, which is an unhandled rejection, and crash-log.js turns that into
+        // exit(1). A broken activity hook must not take the daemon down, and it
+        // must not cost the socket its answer below either.
+        try {
+          hooks.onRequestEnd?.(entry.reqId, {
+            method: req.method, path: req.url, account: null, status,
+            model: null, sessionId: entry.sessionId, pinned: false,
+          });
+        } catch (hookErr) {
+          reportFailure('[TeamClaude] activity hook failed while closing a request:', hookErr);
+        }
+      }
       // The code above the inner try (the egress hold, the pin parsing, body
       // buffering, the activity hooks) runs outside the 502 that guards
       // forwardRequest, and the inner `finally` calls onRequestEnd after the
@@ -536,6 +587,34 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       answerUnhandled(res);
     }
   };
+}
+
+/**
+ * Report a failure without depending on the console to survive it.
+ *
+ * Under the TUI the console IS the TUI: `console.error` appends to the activity
+ * log and repaints, so a render that throws makes `console.error` throw. That
+ * matters because these reports are the FIRST statement of the paths that
+ * recover from a throw, and the throw being recovered from is often the same
+ * broken render. An unguarded report there skips the whole recovery.
+ *
+ * Falls back to stderr rather than swallowing, so a render bug still leaves a
+ * diagnostic. The TUI already does this when its own activity stream fails.
+ *
+ * `writeSync` rather than `process.stderr.write`, because the fallback has to
+ * fail the way this function promises to. A closed stderr makes the stream
+ * surface EPIPE asynchronously, as an error event no `try` around the call can
+ * see, and this daemon treats an uncaught EPIPE as fatal. `writeSync` throws
+ * where it is called, so the catch below is real.
+ */
+function reportFailure(...args) {
+  try {
+    console.error(...args);
+  } catch {
+    try {
+      writeSync(2, `${args.map(a => a?.stack || String(a)).join(' ')}\n`);
+    } catch { /* nothing left to report with */ }
+  }
 }
 
 /**
