@@ -423,14 +423,23 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // The token runs to the next '/', which also begins the real request path.
       const tokenEnd = afterPrefix == null ? -1 : afterPrefix.indexOf('/');
       if (tokenEnd > 0) {
-        const token = decodeURIComponent(afterPrefix.slice(0, tokenEnd));
-        pinnedIndex = resolveAccountPin(accountManager, token);
+        // The escaping of this segment is the CLIENT's, so a malformed one
+        // ("/tc-acct/%/v1/messages") makes decodeURIComponent throw URIError.
+        // That is an ordinary bad request, not an internal error: decode
+        // defensively and fall through to the unknown-pin 404 below, which is
+        // what a pin nobody can resolve already means. An undecodable token is
+        // reported as it arrived, since there is no decoded form to name.
+        const raw = afterPrefix.slice(0, tokenEnd);
+        let token = null;
+        try { token = decodeURIComponent(raw); } catch { token = null; }
+        pinnedIndex = token == null ? null : resolveAccountPin(accountManager, token);
         if (pinnedIndex == null) {
+          const shown = token ?? raw;
           const reqId = ++counter;
           const sessionId = req.headers['x-claude-code-session-id'] || null;
-          if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(unknown pin: "${token}")`, status: 404, model: null, sessionId, pinned: false });
+          if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(unknown pin: "${shown}")`, status: 404, model: null, sessionId, pinned: false });
           res.writeHead(404, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: `Unknown account pin "${token}"` } }));
+          res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: `Unknown account pin "${shown}"` } }));
           return;
         }
         req.url = afterPrefix.slice(tokenEnd);
