@@ -193,6 +193,9 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
       return forward(req, res);
     } catch (err) {
       console.error('[TeamClaude] Unhandled error:', err);
+      // The window above throws for real: `getStatusExtra` is a hook the
+      // application installs, and reload/switch reach the account manager.
+      answerUnhandled(res);
     }
   };
 
@@ -526,8 +529,33 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       }
     } catch (err) {
       console.error('[TeamClaude] Unhandled error:', err);
+      // The code above the inner try (the egress hold, the pin parsing, body
+      // buffering, the activity hooks) runs outside the 502 that guards
+      // forwardRequest, and the inner `finally` calls onRequestEnd after the
+      // response has streamed.
+      answerUnhandled(res);
     }
   };
+}
+
+/**
+ * The last response an outer catch can send. Three states:
+ *
+ *   - Nothing written yet: send a 502. Guarded on headersSent, because a second
+ *     writeHead raises ERR_HTTP_HEADERS_SENT from inside the catch.
+ *   - Headers sent, body unfinished: destroy. There is no status left to send,
+ *     and end() would present the truncated bytes as a complete reply.
+ *   - Response already ended: leave it alone, the client has its answer.
+ *
+ * `forwardRequest`'s own catch already carries the same pair of arms.
+ */
+function answerUnhandled(res) {
+  if (!res.headersSent && !res.destroyed) {
+    res.writeHead(502, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Internal proxy error' } }));
+  } else if (!res.writableEnded) {
+    res.destroy();
+  }
 }
 
 // Per-request https.Agent tunneled through sx.org — one-shot (no keep-alive
