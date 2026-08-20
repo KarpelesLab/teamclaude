@@ -391,8 +391,8 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // rather than per-account: it is a property of the connection, and this is
       // the one path every request takes, MITM included.
       if (egress?.enabled()) {
-        const state = await egress.waitUntilPinned({ isAborted: () => res.destroyed });
-        if (res.destroyed) return;
+        const state = await egress.waitUntilPinned({ isAborted: () => clientGone(res) });
+        if (clientGone(res)) return;
         if (!state.ok) {
           res.writeHead(503, { 'Content-Type': 'application/json', 'retry-after': '30' });
           res.end(JSON.stringify({
@@ -563,7 +563,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         // 499 when nothing was sent and nothing will be, either because the
         // client is gone or because the response is past the point of saying
         // anything; 502 is what the answer below is about to write.
-        const status = res.headersSent || res.destroyed ? 499 : 502;
+        const status = res.headersSent || clientGone(res) ? 499 : 502;
         const entry = openEntry;
         openEntry = null;
         // Guarded, because the throw that landed here may BE this hook. Escaping
@@ -618,6 +618,32 @@ function reportFailure(...args) {
 }
 
 /**
+ * Has the client gone away?
+ *
+ * `res.destroyed` answers that on the base HTTP/1 listener and not on the MITM
+ * one: `Http2ServerResponse` has no `destroyed` property at all, so the read is
+ * `undefined` and the question is answered "no" for every h2 request, on the
+ * path that carries most of the traffic. The h2 equivalent lives on the
+ * underlying stream.
+ *
+ * Asked wherever the answer decides whether to spend something the client will
+ * never receive. On the retry ladder that is an upstream call and a slice of an
+ * account's weekly quota per rung, which is the opposite of what rotation is
+ * for. In practice the ladder is cut short by the abort probe handed to
+ * `admit()`, which is polled while a request waits for a concurrency slot; the
+ * reads on the individual rungs are the backstop for a request that never
+ * waited.
+ *
+ * In `streamResponse` the cost is the handler itself. Writing to a cancelled
+ * stream returns false, and the backpressure wait below then listens for a
+ * `drain` or a `close` that has already happened and will not happen again, so
+ * the handler never returns and its activity entry never closes.
+ */
+function clientGone(res) {
+  return !!res.destroyed || !!res.stream?.destroyed;
+}
+
+/**
  * The last response an outer catch can send. Three states:
  *
  *   - Nothing written yet: send a 502. Guarded on headersSent, because a second
@@ -629,7 +655,7 @@ function reportFailure(...args) {
  * `forwardRequest`'s own catch already carries the same pair of arms.
  */
 function answerUnhandled(res) {
-  if (!res.headersSent && !res.destroyed) {
+  if (!res.headersSent && !clientGone(res)) {
     res.writeHead(502, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Internal proxy error' } }));
   } else if (!res.writableEnded) {
@@ -917,7 +943,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       ctx.holdBudgetMs -= waitMs;
       console.log(`[TeamClaude] All accounts exhausted — holding connection, retry in ${Math.ceil(waitMs / 1000)}s (${Math.ceil(ctx.holdBudgetMs / 1000)}s budget left)`);
       await new Promise(resolve => setTimeout(resolve, waitMs));
-      if (res.destroyed) return;
+      if (clientGone(res)) return;
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
     }
 
@@ -926,7 +952,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       ctx.exhaustedRetries = exhaustedRetries + 1;
       console.log(`[TeamClaude] All accounts exhausted — waiting ${retryAfter}s before retry`);
       await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
-      if (res.destroyed) return;
+      if (clientGone(res)) return;
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
     }
     res.writeHead(429, {
@@ -1020,7 +1046,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // only until the response headers arrive — long enough to stagger the burst,
     // then released so streaming bodies don't tie up concurrency. Fail-open: a
     // client that disconnects while waiting just drops out.
-    if (!await accountManager.admit(account.index, () => res.destroyed)) return;
+    if (!await accountManager.admit(account.index, () => clientGone(res))) return;
     let upstreamRes;
     try {
       upstreamRes = await upstreamFetch(upstreamUrl, {
@@ -1081,7 +1107,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
           accountManager.markRateLimited(account.index, hold);
         }
         ctx.tried.add(account.index);
-        if (res.destroyed) return;
+        if (clientGone(res)) return;
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
       }
 
@@ -1109,7 +1135,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // 429ing upstream can't loop forever through sx.
       if (switchingToSx && retryCount < maxRetries) {
         console.log(`[TeamClaude] 429 on "${account.name}" — retrying via sx.org (fresh egress IP)`);
-        if (res.destroyed) return;
+        if (clientGone(res)) return;
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, nextUseSx);
       }
 
@@ -1119,7 +1145,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       if (retryAfter <= RATE_LIMIT_ABSORB_MAX_SECONDS && retryCount < maxRetries) {
         console.log(`[TeamClaude] Rate-limit 429 on "${account.name}" — waiting ${retryAfter}s, retrying same account (no switch)`);
         await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
-        if (res.destroyed) return;
+        if (clientGone(res)) return;
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, nextUseSx);
       }
 
@@ -1128,7 +1154,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // The pause above keeps other requests off this account meanwhile.
       console.log(`[TeamClaude] Rate-limit 429 on "${account.name}" — retry-after ${retryAfter}s over inline cap; returning 429 to client (no switch)`);
       ctx.status = 429;
-      if (!res.headersSent && !res.destroyed) {
+      if (!res.headersSent && !clientGone(res)) {
         res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': String(retryAfter) });
         res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: `Rate limited; retry in ${retryAfter}s.` } }));
       }
@@ -1171,7 +1197,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       await upstreamRes.body?.cancel();
       console.log(`[TeamClaude] 401 on "${account.name}" — token rejected; forcing refresh and retrying`);
       await accountManager.ensureTokenFresh(account.index, true);
-      if (res.destroyed) return;
+      if (clientGone(res)) return;
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
 
@@ -1326,7 +1352,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
       if (done) break;
 
       // Client disconnected — stop reading from upstream
-      if (res.destroyed) break;
+      if (clientGone(res)) break;
 
       // Forward chunk immediately
       const ok = res.write(value);
@@ -1356,7 +1382,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
           res.once('drain', done);
           res.once('close', done);
         });
-        if (res.destroyed) break;
+        if (clientGone(res)) break;
       }
     }
 
