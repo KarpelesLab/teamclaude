@@ -300,6 +300,30 @@ export function resolveAccountPin(accountManager, token) {
   return null;
 }
 
+/**
+ * What actually went wrong on a failed connect, as a string worth printing.
+ *
+ * Node's happy-eyeballs dialer (`autoSelectFamily`, on by default across the
+ * versions this package supports; `package.json` declares `node >=20`, measured
+ * here on 24) reports a connect where every address failed as an AggregateError.
+ * Node builds that error with an empty `message`; the per-address reasons are in
+ * `.errors`. Any multi-address host reaches this, and the upstream is one, so
+ * `err.message` prints nothing for the failure operators most need to read.
+ *
+ * Looked for one level down as well, because `TEAMCLAUDE_UPSTREAM_GLOBAL_FETCH`
+ * routes through global fetch, which wraps the same failure in a TypeError whose
+ * own message is the equally unhelpful "fetch failed".
+ *
+ * The `err.message` fallback is required: with `autoSelectFamily` off, and on
+ * every single-address failure, the reason arrives as a plain Error in
+ * `message`. It also covers a wrapper whose `.cause` carries no reasons.
+ */
+export function describeConnectError(err) {
+  const reasons = (e) => (Array.isArray(e?.errors) ? e.errors.map(c => c?.message).filter(Boolean) : []);
+  const own = reasons(err);
+  return (own.length ? own : reasons(err?.cause)).join('; ') || err?.message;
+}
+
 // Paths that must reach upstream with the client's own credential (never a
 // rotated account token): the Remote Control channel and attachment transfers.
 // teamclaude applies its account logic (rotation, exhaustion, token injection)
@@ -338,7 +362,7 @@ export function relayHttpForward(req, res) {
     upstreamRes.pipe(res);
   });
   upstreamReq.on('error', (err) => {
-    console.error(`[TeamClaude] HTTP forward to ${target.host} failed:`, err.message);
+    console.error(`[TeamClaude] HTTP forward to ${target.host} failed:`, describeConnectError(err));
     if (!res.headersSent) {
       res.writeHead(502, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Upstream unreachable' } }));
@@ -568,7 +592,7 @@ function relayStream(req, res, upstream, sx) {
   });
 
   upstreamReq.on('error', (err) => {
-    console.error('[TeamClaude] Remote Control relay error:', err.message);
+    console.error('[TeamClaude] Remote Control relay error:', describeConnectError(err));
     if (!res.headersSent) {
       res.writeHead(502, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Upstream unreachable' } }));
@@ -636,7 +660,7 @@ export function relayUpgrade(req, socket, head, upstream, sx) {
   });
 
   upstreamReq.on('error', (err) => {
-    console.error('[TeamClaude] Remote Control WebSocket relay error:', err.message);
+    console.error('[TeamClaude] Remote Control WebSocket relay error:', describeConnectError(err));
     socket.destroy();
   });
   socket.on('error', () => upstreamReq.destroy());
@@ -676,7 +700,7 @@ async function relayRaw(req, res, upstream, sx) {
     res.writeHead(upstreamRes.status, responseHeaders);
     res.end(responseBody);
   } catch (err) {
-    console.error('[TeamClaude] Raw relay error:', err.message);
+    console.error('[TeamClaude] Raw relay error:', describeConnectError(err));
     if (!res.headersSent) {
       res.writeHead(502, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Upstream unreachable' } }));
@@ -1104,7 +1128,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       res.end(buf);
     }
   } catch (err) {
-    console.error(`[TeamClaude] Upstream error (account "${account.name}"):`, err.message);
+    console.error(`[TeamClaude] Upstream error (account "${account.name}"):`, describeConnectError(err));
 
     logRequestHead();
     const l = getLog();
@@ -1144,7 +1168,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       res.writeHead(502, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         type: 'error',
-        error: { type: 'proxy_error', message: `Upstream error: ${err.message}` },
+        error: { type: 'proxy_error', message: `Upstream error: ${describeConnectError(err)}` },
       }));
     } else if (!res.writableEnded) {
       // Error after headers were already sent (mid-stream) and it wasn't
