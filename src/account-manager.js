@@ -315,7 +315,11 @@ export class AccountManager {
    * back to the normal quota-driven walk. Does NOT record the pin — that happens
    * on the actual route (recordSession), so retries/failover re-pin naturally. */
   _selectForSession(sessionId, exclude, model, advisorModel) {
-    const pinIdx = this.sessionTracker.pinnedAccount(sessionId);
+    // The pin is per governing bucket, and this request is bound by the
+    // EXECUTOR's: one request goes to one account, so the executor's affinity is
+    // what binds it and the advisor's model is a constraint on that choice
+    // (_isAvailable, below) rather than a second key.
+    const pinIdx = this.sessionTracker.pinnedAccount(sessionId, this._weeklyBucketFor(model));
     if (pinIdx != null) {
       const pinned = this.accounts[pinIdx];
       if (pinned && this._isAvailable(pinned, model, advisorModel) && !exclude?.has(pinIdx)) {
@@ -363,9 +367,18 @@ export class AccountManager {
 
   /** Record that a session's request was served by an account (always on, even
    * when distribution is off — the readout is passive). This is what pins a
-   * session for future affinity. */
-  recordSession(sessionId, accountIndex) {
-    if (sessionId) this.sessionTracker.touch(sessionId, accountIndex);
+   * session for future affinity, for the weekly bucket this request spent.
+   *
+   * The executor's bucket only. An advisor sub-inference runs on the SAME
+   * account and spends its family's quota there too, but selection degrades to
+   * executor-only when no account is eligible for both models, and upstream
+   * then drops the advisor call — so the account may or may not have served
+   * that family, and only selection knows which. Claiming it here on a request
+   * that was degraded would pin a family to an account that never served it,
+   * quite possibly one that cannot. Unclaimed means the session routes that
+   * family afresh next request, which is what it did before it had a pin. */
+  recordSession(sessionId, accountIndex, model = null) {
+    if (sessionId) this.sessionTracker.touch(sessionId, accountIndex, this._weeklyBucketFor(model));
   }
 
   /** Mark a session request as in flight / finished. Paired around the whole
@@ -1326,6 +1339,9 @@ export class AccountManager {
       if (idx === index) this.routePins.delete(name);
       else if (idx > index) this.routePins.set(name, idx - 1);
     }
+    // Session pins are positions in the same list and shift the same way.
+    this.sessionTracker.remapAccounts(idx =>
+      (idx === index ? null : idx > index ? idx - 1 : idx));
   }
 
   /**

@@ -97,7 +97,9 @@ Default rotation is purely quota-driven, so many parallel sessions all pile onto
 "distributeSessions": true
 ```
 
-When on, TeamClaude routes each **new** session to the least-loaded eligible account (fewest active sessions, then fewest in-flight) and **pins** it there, so a session keeps hitting the same account and preserves its prompt cache — while different sessions spread across accounts instead of funnelling onto one. Account **priority still wins** (a higher-priority account is never skipped to balance load), and a session whose account becomes exhausted re-routes automatically. Off by default; single-session use is unaffected either way.
+When on, TeamClaude routes each **new** session to the least-loaded eligible account (fewest active sessions, then fewest in-flight) and **pins** it there for the model family's weekly quota bucket, so a session keeps hitting the same account for that family and preserves its prompt cache — while different sessions spread across accounts instead of funnelling onto one. Account **priority still wins** (a higher-priority account is never skipped to balance load), and a session whose account becomes exhausted re-routes automatically. Off by default; single-session use is unaffected either way.
+
+More precisely, a session holds **one pin per weekly quota bucket**, not one overall, because eligibility is decided per bucket: an account whose Fable weekly is spent still serves Opus. So a Fable request that has to divert elsewhere leaves the session's Opus pin where it is, and each family keeps its own cache affinity. The consequence is that a session using two families commonly sits on two accounts, and the per-account session counts in `teamclaude status` can therefore add up to more than the number of active sessions.
 
 ## Pin a session to one account
 

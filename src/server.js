@@ -829,9 +829,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
 
   // Track which account handles this request
   ctx.account = account.name;
-  // Pin this session to the serving account (for affinity) and keep it "active"
-  // in the running-sessions readout. Passive when distribution is off.
-  accountManager.recordSession(ctx.sessionId, account.index);
+  // Pin this session to the serving account for the model's weekly bucket (for
+  // affinity) and keep it "active" in the running-sessions readout. Passive when
+  // distribution is off.
+  accountManager.recordSession(ctx.sessionId, account.index, ctx.model);
   hooks.onRequestRouted?.(reqId, { account: account.name });
 
   // Refresh OAuth token if needed
