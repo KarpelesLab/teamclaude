@@ -1,6 +1,6 @@
 import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired } from './oauth.js';
 import { sameIdentity } from './identity.js';
-import { weeklyBucketForModel, modelGlobMatches, modelFamily } from './model.js';
+import { weeklyBucketForModel, modelGlobMatches, modelFamily, gatingUtilization } from './model.js';
 import { SessionTracker } from './session-tracker.js';
 
 // Re-exported for callers that import these model helpers from here.
@@ -642,8 +642,9 @@ export class AccountManager {
 
   /** Highest utilization across the quota dimensions that govern `model` (0-1),
    * used to pick the least-exhausted probe target. Mirrors _isNearQuota: the
-   * shared 5-hour bucket plus the model's governing weekly bucket. With no model
-   * it falls back to the shared weekly. */
+   * shared 5-hour bucket plus the weekly value that gates the model, which is
+   * the higher of its family bucket and the shared weekly one. With no model it
+   * falls back to the shared weekly. */
   _maxUtilization(account, model = null) {
     const q = account.quota;
     let max = 0;
@@ -659,14 +660,20 @@ export class AccountManager {
     return max;
   }
 
-  /** Utilization (0-1) of the weekly bucket that governs `model` on this account:
-   * unified7dFable for Fable, unified7dSonnet for Sonnet, unified7d otherwise.
-   * Falls back to the shared unified7d when a family-specific bucket isn't
-   * reported. Returns null when nothing is known. */
+  /** Weekly utilization (0-1) that gates `model` on this account: the higher of
+   * the bucket that governs the model (unified7dFable for Fable,
+   * unified7dSonnet for Sonnet, unified7d otherwise) and the shared unified7d,
+   * since family spend meters into both. Null when neither reports — see
+   * `gatingUtilization` for why that stays null rather than becoming 0. */
   _governingWeekly(account, model) {
     const q = account.quota;
     const key = this._weeklyBucketFor(model);
-    if (key !== 'unified7d') return q[key] != null ? q[key] : q.unified7d;
+    // A dedicated family bucket does NOT stand alone: family spend meters into
+    // the shared weekly too, so an account under its Fable cap can be over the
+    // shared one. Gating on the family bucket alone is a one-way ratchet —
+    // once the shared weekly caps, family requests are the only ones still
+    // admitted, and each one pushes it further over (#175).
+    if (key !== 'unified7d') return gatingUtilization(q, key);
     // No dedicated field for this family — but the usage endpoint may still
     // report a weekly bucket scoped to it (upstream adds these over time). Gate
     // on the tighter of that bucket and the shared weekly, so a family with its
@@ -686,7 +693,15 @@ export class AccountManager {
   }
 
   /** Reset timestamp (ms) of the weekly bucket that governs `model`, falling back
-   * to the shared weekly reset. Used to spend the soonest-expiring quota first. */
+   * to the shared weekly reset. Used to spend the soonest-expiring quota first.
+   *
+   * THE RESET DOES NOT TAKE THE MAXIMUM the value above takes, so the two can
+   * name different buckets. Both callers (`_pickBestAvailable`,
+   * `_pickLeastLoaded`) use it as a ranking tiebreak among accounts that have
+   * already passed `_isAvailable`, and nothing here divides a headroom by it.
+   * Maxing it would be the error of pairing one bucket's level with another
+   * bucket's clock; keeping it on the governing window preserves the existing
+   * "spend the family quota that refreshes soonest" heuristic. */
   _governingWeeklyReset(account, model) {
     const q = account.quota;
     const key = this._weeklyBucketFor(model);
@@ -694,10 +709,26 @@ export class AccountManager {
   }
 
   /** True when the family-specific weekly bucket that governs `model` is spent.
-   * Unlike _isNearQuota this ignores the shared 5h/weekly caps — it is only used
-   * to skip an account for a probe of a model it definitely can't serve. Returns
-   * false for families without a dedicated bucket (they share unified7d, already
-   * covered by _isNearQuota). */
+   * Unlike _isNearQuota this ignores the shared 5h/weekly caps. Two call sites:
+   * the probe filter in _selectProbe, which skips an account for a probe of a
+   * model it definitely can't serve, and the advisor arm of _isAvailable, which
+   * asks whether the account can serve the advisor's family as well as the
+   * executor's. Returns false for families without a dedicated bucket (they
+   * share unified7d, already covered by _isNearQuota).
+   *
+   * FAMILY-ONLY ON PURPOSE, and it does NOT take the maximum `_governingWeekly`
+   * takes. The two answer different questions: this one asks "can this account
+   * serve this family at all", the gate asks "is this account near any cap that
+   * binds this request". Both call sites want the narrow one. The probe filter
+   * wants it because folding the shared bucket in here would skip accounts for
+   * probes they could still have served, and a probe is how a stale cached
+   * utilization gets corrected, so it would harden the state it exists to
+   * escape. The advisor arm wants it because _isNearQuota has already applied
+   * the maximum to the executor's model a few lines above, so an account over
+   * its shared weekly is refused there and never reaches this line: the shared
+   * bucket governs the advisor decision by composition rather than by being
+   * folded in twice. A reader seeing two similar helpers diverge may wonder
+   * whether one was missed: it was not. */
   _modelWeeklyExhausted(account, model) {
     const q = account.quota;
     const key = this._weeklyBucketFor(model);
@@ -1327,11 +1358,13 @@ export class AccountManager {
     // Shared 5-hour bucket gates every request regardless of model.
     if (q.unified5h != null && q.unified5h >= this.thresholdFor('unified5h')) return true;
 
-    // Only the weekly bucket that GOVERNS this model is checked: Fable and Sonnet
-    // meter their own weekly quota, so a spent Fable bucket must not bar an Opus
-    // or Sonnet request (and vice versa). When the family bucket isn't reported
-    // (e.g. the plan doesn't expose it), fall back to the shared weekly so an
-    // account over its overall cap is still treated as near-quota.
+    // The HIGHER of the weekly bucket that GOVERNS this model and the shared
+    // weekly one. Fable and Sonnet meter their own quota, so a spent Fable
+    // bucket still bars only Fable and never an Opus or Sonnet request. But
+    // family spend also meters into the shared bucket, so an account over its
+    // overall cap is barred from the families too, which is what stops it
+    // ratcheting further past that cap. When the family bucket isn't reported
+    // (e.g. the plan doesn't expose it) the shared one answers alone.
     const weeklyVal = this._governingWeekly(account, model);
     if (weeklyVal != null && weeklyVal >= this.thresholdFor(this._weeklyBucketFor(model))) return true;
 

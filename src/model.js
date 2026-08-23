@@ -38,6 +38,39 @@ export function weeklyBucketForModel(model) {
   return FAMILY_WEEKLY_BUCKET[modelFamily(model)] || 'unified7d';
 }
 
+/**
+ * The weekly utilization that GATES a request whose governing bucket is
+ * `bucketKey`: the higher of that bucket and the shared `unified7d`, or null
+ * when neither is reported.
+ *
+ * WHY A MAXIMUM. Family spend meters twice, once in the family bucket and once
+ * in the shared one, so the two are not independent (issue #175 measured the
+ * coupling at [+1.14e-4, +5.21e-4] on the shared bucket per Fable request).
+ * Reading the family bucket alone let an account sitting at `unified7d` 1.00
+ * with `unified7dFable` 0.20 keep serving Fable, and each such request pushed
+ * the shared bucket further past its cap. Once the shared bucket is spent,
+ * family requests are the only ones still admitted, which makes it a one-way
+ * ratchet rather than a bounded overshoot.
+ *
+ * NULL IS UNREPORTED AND NEVER ZERO. `Math.max` coerces null to 0, and 0 reads
+ * as "empty" — the opposite of "unknown", and in the direction that keeps an
+ * account serving. Both absent cases are answered before the maximum rather
+ * than falling into it.
+ *
+ * ONE DEFINITION, because the gate and every display of it answer the SAME
+ * question: can this account serve this family right now. A second derivation
+ * of one question is a copy that drifts.
+ */
+export function gatingUtilization(quota, bucketKey) {
+  const own = quota?.[bucketKey] ?? null;
+  // Already the shared bucket: max(x, x) is x.
+  if (bucketKey === 'unified7d') return own;
+  const shared = quota?.unified7d ?? null;
+  if (own == null) return shared;
+  if (shared == null) return own;
+  return Math.max(own, shared);
+}
+
 // Match a shell-style glob against a model id. Only `*` is special (matches any
 // run of characters, including none); every other character is literal. The
 // comparison is case-insensitive. Used by configurable routes so a pattern like

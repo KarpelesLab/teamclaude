@@ -1,4 +1,4 @@
-import { findFamilyBlock, modelGlobOverlaps } from './model.js';
+import { findFamilyBlock, modelGlobOverlaps, gatingUtilization } from './model.js';
 import { safeLine } from './safe-text.js';
 
 const ESC = '\x1b[';
@@ -197,32 +197,65 @@ function formatAccountStatus(account, now, paint) {
 // specific models" view. Only rendered for accounts that meter a family
 // separately (a Sonnet or Fable weekly bucket), since that is the only case
 // where a request's model changes where it can route. A family reads ✗ when the
-// shared 5h bucket is spent (blocks everything) or when its own weekly bucket is
-// over the switch threshold; the reset is shown when the family bucket is the
-// blocker so it's clear when that model becomes available on this account again.
+// shared 5h bucket is spent (blocks everything) or when the utilization that
+// GATES it is over the switch threshold, which is the higher of its own weekly
+// bucket and the shared weekly one, since family spend meters into both.
+//
+// That gating value comes from `gatingUtilization`, the same function the router
+// gates on, rather than being recomputed here: this row DISPLAYS a routing
+// decision, so a second derivation of it is a copy that drifts. Reading the
+// family bucket alone printed `Fable ✓` on an account the router had already
+// refused, in one render.
 function modelRoutingLine(account, threshold, blocked, now, paint) {
   const q = account.quota || {};
   if (q.unified7dSonnet == null && q.unified7dFable == null) return null;
   const t = Number(threshold);
   const fiveOver = q.unified5h != null && !Number.isNaN(t) && q.unified5h >= t;
 
-  const cell = (label, weekly, reset) => {
+  const cell = (label, bucketKey, reset) => {
     // The blocklist outranks quota: a blocked family cannot be served however
     // much headroom the account has, so it must not read ✓. Reporting quota
     // alone is what made a fully-blocked model look available.
     if (findFamilyBlock(blocked, label)) {
       return `${label} ${paint.red('⊘')}${paint.dim(' blocked')}`;
     }
-    const weeklyOver = weekly != null && !Number.isNaN(t) && weekly >= t;
+    const gating = gatingUtilization(q, bucketKey);
+    const weeklyOver = gating != null && !Number.isNaN(t) && gating >= t;
     const mark = fiveOver || weeklyOver ? paint.red('✗') : paint.green('✓');
-    const resetTs = parseTs(reset);
+    // The recovery time is the LATEST reset among the two WEEKLY buckets
+    // currently over the threshold, not this bucket's. The weekly half of the
+    // mark comes from a maximum, so it only clears once BOTH weekly blockers
+    // have rolled; showing the family reset beside a ✗ the shared weekly
+    // produced told an operator that a week-long block clears tomorrow. An
+    // unreported reset among the blockers means the recovery time is unknown,
+    // and a known-but-earlier one would understate it, so say nothing rather
+    // than name a time that is not when this clears.
+    //
+    // The shared 5h bucket is deliberately NOT in this set, and that is a known
+    // gap rather than an oversight. It can raise the mark through `fiveOver`
+    // while contributing no candidate reset, so an account blocked longer by 5h
+    // than by its weekly buckets still shows the weekly clearing time. Stock
+    // renders the identical line, so this is not a regression, and it is narrow:
+    // it needs the 5h reset to fall later than the blocking weekly reset, which
+    // only happens while the weekly window is within about five hours of
+    // rolling. Closing it means restructuring the cell rather than adding a
+    // third candidate, since the whole `when` clause is gated on `weeklyOver`
+    // and a 5h-only block suppresses the time entirely.
+    const over = [];
+    if (!Number.isNaN(t)) {
+      if (q[bucketKey] != null && q[bucketKey] >= t) over.push(parseTs(reset));
+      if (bucketKey !== 'unified7d' && q.unified7d != null && q.unified7d >= t) {
+        over.push(parseTs(q.unified7dReset));
+      }
+    }
+    const resetTs = over.length && over.every(Boolean) ? Math.max(...over) : null;
     const when = weeklyOver && resetTs && resetTs > now ? paint.dim(` ${formatDuration(resetTs - now)}`) : '';
     return `${label} ${mark}${when}`;
   };
 
-  const cells = [cell('Opus', q.unified7d, q.unified7dReset)];
-  if (q.unified7dSonnet != null) cells.push(cell('Sonnet', q.unified7dSonnet, q.unified7dSonnetReset));
-  if (q.unified7dFable != null) cells.push(cell('Fable', q.unified7dFable, q.unified7dFableReset));
+  const cells = [cell('Opus', 'unified7d', q.unified7dReset)];
+  if (q.unified7dSonnet != null) cells.push(cell('Sonnet', 'unified7dSonnet', q.unified7dSonnetReset));
+  if (q.unified7dFable != null) cells.push(cell('Fable', 'unified7dFable', q.unified7dFableReset));
   return `${paint.dim('Models'.padEnd(8))} ${cells.join('   ')}`;
 }
 

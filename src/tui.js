@@ -1,4 +1,5 @@
 import { createWriteStream } from 'node:fs';
+import { gatingUtilization } from './model.js';
 import { importCredentials, fetchProfile } from './oauth.js';
 import {
   sameIdentity,
@@ -190,8 +191,16 @@ const NAME_MIN = 12;
 export function blockedFamilies(quota, threshold) {
   const at = typeof threshold === 'function' ? threshold : () => threshold;
   const out = [];
-  if (quota.unified7dSonnet != null && quota.unified7dSonnet >= at('unified7dSonnet')) out.push('Sonnet');
-  if (quota.unified7dFable != null && quota.unified7dFable >= at('unified7dFable')) out.push('Fable');
+  for (const [label, key] of [['Sonnet', 'unified7dSonnet'], ['Fable', 'unified7dFable']]) {
+    if (quota[key] == null) continue;      // family not metered separately here
+    // Compared against gatingUtilization — the value the ROUTER gates on — not
+    // against the family bucket alone. Family spend meters into the shared
+    // weekly too, so an account under its family cap can be over the shared one
+    // and unable to serve that family at all (#175). This tag displays a routing
+    // decision, so deriving it a second way here would be a copy that drifts.
+    const gating = gatingUtilization(quota, key);
+    if (gating != null && gating >= at(key)) out.push(label);
+  }
   return out;
 }
 
@@ -1485,10 +1494,10 @@ export class TUI {
         line += ` ${familyMark('fable')}F7  ${bar(q.unified7dFable, bw, q.unified7dFableReset, SEVEN_DAY_MS, thFor('unified7dFable'))}`;
       }
     }
-    // Explicit "disabled for these models" tag (issue #85): a family whose own
-    // weekly bucket is over the switch threshold can't serve that model even
-    // while the account is otherwise active. A spent shared 5h blocks everything
-    // and is already conveyed by the Ses bar + status, so it's not repeated here.
+    // Explicit "disabled for these models" tag (issue #85): a family the account
+    // can't serve even while it is otherwise active. A spent shared 5h blocks
+    // everything and is already conveyed by the Ses bar + status, so it's not
+    // repeated here.
     const blocked = blockedFamilies(q, key => this.am.thresholdFor(key));
     if (blocked.length) line += `  ${red('⊘ ' + blocked.join(' '))}`;
     return line;
