@@ -1,3 +1,5 @@
+import { WindowWatcher } from './window-watcher.js';
+
 // Tracks Claude Code sessions by their `x-claude-code-session-id` header so
 // teamclaude can (a) report how many sessions are running and (b) optionally
 // keep each session pinned to one account while spreading NEW sessions across
@@ -26,7 +28,8 @@ const SWEEP_INTERVAL_MS = 60 * 1000; // bound growth without an external timer
 
 export class SessionTracker {
   constructor({ knownTtlMs, activeTtlMs, now } = {}) {
-    // id -> { pins: Map<bucketKey, { idx, at }>, firstSeen, lastSeen, count, inFlight }
+    // id -> { pins: Map<bucketKey, { idx, at }>, windows, firstSeen, lastSeen,
+    //         count, inFlight }
     this.sessions = new Map();
     this.knownTtlMs = knownTtlMs ?? SESSION_KNOWN_TTL_MS;
     this.activeTtlMs = activeTtlMs ?? SESSION_ACTIVE_TTL_MS;
@@ -85,9 +88,13 @@ export class SessionTracker {
   // the one a session making requests in sequence just touched. Two concurrent
   // requests on different families can still refresh the wrong one, which is the
   // same limit the in-flight arm has.
+  //
+  // Returns the session record so the caller can act on the moment it goes
+  // quiescent — `inFlight === 0` is when nothing is left that could still move
+  // this session, which is the only point at which where it ended up is final.
   endRequest(sessionId, now = this._now()) {
     const s = sessionId && this.sessions.get(sessionId);
-    if (!s) return;
+    if (!s) return null;
     s.inFlight = Math.max(0, s.inFlight - 1);
     if (s.inFlight === 0) {
       let newest = null;
@@ -95,15 +102,43 @@ export class SessionTracker {
       if (newest) newest.at = now;
     }
     s.lastSeen = now;
+    return s;
   }
 
   _ensure(sessionId, now) {
     let s = this.sessions.get(sessionId);
     if (!s) {
-      s = { pins: new Map(), firstSeen: now, lastSeen: now, count: 0, inFlight: 0 };
+      s = { pins: new Map(), windows: null, firstSeen: now, lastSeen: now, count: 0, inFlight: 0 };
       this.sessions.set(sessionId, s);
     }
     return s;
+  }
+
+  // The record for a session that is still known, or null — dropping it if it
+  // has idled past the known window. Shared by every read that must not answer
+  // for a forgotten session.
+  _live(sessionId, now = this._now()) {
+    const s = sessionId && this.sessions.get(sessionId);
+    if (!s) return null;
+    if (this._isExpired(s, now)) {
+      this.sessions.delete(sessionId);
+      return null;
+    }
+    return s;
+  }
+
+  // The rollover baselines for a session's pins, created on demand. They live on
+  // the session record rather than in a map of their own so they get exactly one
+  // lifetime and one eviction policy — the pin's. A parallel map would need its
+  // own bound (session ids are client-supplied) and its own expiry, and the two
+  // would drift: baselines outliving their pin describe an account the session
+  // is no longer on. Null for a session that is unknown or forgotten, and for a
+  // known one until a caller asks to create them.
+  windowsFor(sessionId, create = false, now = this._now()) {
+    const s = this._live(sessionId, now);
+    if (!s) return null;
+    if (!s.windows && create) s.windows = new WindowWatcher();
+    return s.windows || null;
   }
 
   // Active = a request in flight now, or one seen within the active window.
@@ -124,13 +159,7 @@ export class SessionTracker {
   // this session on" is precisely the question with no single answer, and
   // answering it anyway is what used to move a session wholesale.
   pinnedAccount(sessionId, bucket, now = this._now()) {
-    const s = sessionId && this.sessions.get(sessionId);
-    if (!s) return null;
-    if (this._isExpired(s, now)) {
-      this.sessions.delete(sessionId);
-      return null;
-    }
-    return s.pins.get(bucket)?.idx ?? null;
+    return this._live(sessionId, now)?.pins.get(bucket)?.idx ?? null;
   }
 
   // Re-point every pin through `mapFn` after the account list is renumbered (see
@@ -146,6 +175,10 @@ export class SessionTracker {
         if (moved == null) s.pins.delete(bucket);
         else pin.idx = moved;
       }
+      // The baselines name accounts by the same positions the pins do, so a
+      // removal shifts them identically. A watcher left holding nothing is
+      // dropped rather than kept empty.
+      if (s.windows && !s.windows.remap(mapFn)) s.windows = null;
     }
   }
 
