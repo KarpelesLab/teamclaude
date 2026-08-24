@@ -170,7 +170,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
           res.end(JSON.stringify({ ok: false, error: `no such account "${target}"`, accounts: names() }));
           return;
         }
-        accountManager.currentIndex = index;
+        accountManager.setCurrentAccount(index);
         const name = accountManager.accounts[index].name;
         // Recording the choice and the choice taking effect are two different
         // things: selection skips an account it cannot use on the very next
@@ -738,9 +738,14 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // A pinned request (via /tc-acct/<name>) forces one exact account and never
   // rotates or fails over: once that account has been tried, `account` is null
   // and the caller gets the exhausted response rather than leaking to another.
+  // What THIS attempt's selection did, for the bookkeeping that runs after it.
+  // Reset per attempt rather than carried on ctx across retries: a retry runs a
+  // fresh selection walk, and the account it is finally served by is the one
+  // whose decision governs.
+  ctx.decision = {};
   const account = ctx.pinnedIndex != null
     ? (ctx.tried.has(ctx.pinnedIndex) ? null : accountManager.accounts[ctx.pinnedIndex])
-    : accountManager.getActiveAccount(ctx.tried, ctx.model, ctx.advisorModel, ctx.sessionId);
+    : accountManager.getActiveAccount(ctx.tried, ctx.model, ctx.advisorModel, ctx.sessionId, ctx.decision);
   if (!account) {
     // Every candidate was refused by upstream (403). Waiting will not help — the
     // account needs attention, not a retry — so say so plainly rather than
@@ -829,9 +834,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
 
   // Track which account handles this request
   ctx.account = account.name;
-  // Pin this session to the serving account (for affinity) and keep it "active"
-  // in the running-sessions readout. Passive when distribution is off.
-  accountManager.recordSession(ctx.sessionId, account.index);
+  // Pin this session to the serving account for the model's weekly bucket (for
+  // affinity) and keep it "active" in the running-sessions readout. Passive when
+  // distribution is off.
+  accountManager.recordSession(ctx.sessionId, account.index, ctx.model);
   hooks.onRequestRouted?.(reqId, { account: account.name });
 
   // Refresh OAuth token if needed
@@ -1058,6 +1064,13 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       if (res.destroyed) return;
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
+
+    // Past every branch that retries: this response is the one the client gets,
+    // so the account that produced it is the account this request was served by.
+    // Routing needs that confirmation, not merely the selection — a rollover
+    // preemption that re-routed and then failed back onto the original account
+    // must stay pending rather than bank a move that never happened.
+    accountManager.confirmRouted(ctx.sessionId, account.index, ctx.model, ctx.decision);
 
     // Log the request head (once) followed by the response headers, streaming
     // to disk from here on.

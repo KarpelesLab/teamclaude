@@ -1,7 +1,18 @@
+import { WindowWatcher } from './window-watcher.js';
+
 // Tracks Claude Code sessions by their `x-claude-code-session-id` header so
 // teamclaude can (a) report how many sessions are running and (b) optionally
 // keep each session pinned to one account while spreading NEW sessions across
 // accounts (the opt-in fix for concurrency funnelling — issue #109).
+//
+// A session pins PER WEEKLY QUOTA BUCKET, not once overall. Quota and
+// eligibility are already decided per bucket — an account whose Fable weekly is
+// spent still serves Opus perfectly well — so a single pin per session lets a
+// decision taken for one family relocate the whole session:
+// a Fable request diverted off the pinned account re-pins the session there,
+// and the next Opus request follows it onto an account that was never evaluated
+// for Opus and whose Opus cache is cold. Keying each pin by the weekly bucket
+// that governs the request keeps the families' affinities independent.
 //
 // Two windows:
 //   - KNOWN: a session is remembered until it goes idle for this long, then
@@ -17,7 +28,8 @@ const SWEEP_INTERVAL_MS = 60 * 1000; // bound growth without an external timer
 
 export class SessionTracker {
   constructor({ knownTtlMs, activeTtlMs, now } = {}) {
-    // id -> { accountIndex, firstSeen, lastSeen, count, inFlight }
+    // id -> { pins: Map<bucketKey, { idx, at }>, windows, firstSeen, lastSeen,
+    //         count, inFlight }
     this.sessions = new Map();
     this.knownTtlMs = knownTtlMs ?? SESSION_KNOWN_TTL_MS;
     this.activeTtlMs = activeTtlMs ?? SESSION_ACTIVE_TTL_MS;
@@ -25,16 +37,26 @@ export class SessionTracker {
     this._lastSweep = 0;
   }
 
-  // Record that `sessionId` made a request served by `accountIndex`. Refreshes
-  // lastSeen (keeping the session "active"/"known") and, when an account is
-  // given, (re)pins the session to it. Throttled sweep keeps the map bounded
-  // even in a headless server that never renders status.
-  touch(sessionId, accountIndex = null, now = this._now()) {
+  // Record that `sessionId` made a request served by `accountIndex`, spending
+  // the weekly quota `bucket`. Refreshes lastSeen (keeping the session
+  // "active"/"known") and re-pins ONLY that bucket — the session's affinity for
+  // a family this request did not touch is none of this request's business.
+  // Throttled sweep keeps the map bounded even in a headless server that never
+  // renders status.
+  //
+  // A pin needs both an account and a bucket key to mean anything, so a call
+  // missing either records the visit and pins nothing. The caller derives the
+  // key from operator-supplied routing config and does not validate it, and a
+  // key that is not a string names no quota field there either: the session
+  // simply keeps re-routing rather than the request path throwing.
+  touch(sessionId, accountIndex = null, bucket = null, now = this._now()) {
     if (!sessionId) return null;
     const s = this._ensure(sessionId, now);
     s.lastSeen = now;
     s.count += 1;
-    if (accountIndex != null) s.accountIndex = accountIndex;
+    if (accountIndex != null && typeof bucket === 'string' && bucket) {
+      s.pins.set(bucket, { idx: accountIndex, at: now });
+    }
     if (now - this._lastSweep > SWEEP_INTERVAL_MS) this.sweep(now);
     return s;
   }
@@ -52,20 +74,71 @@ export class SessionTracker {
   }
 
   // Mark a request as finished (refreshes recency; releases the in-flight hold).
+  //
+  // Finishing also ages the pin the request was spending up to now. `pin.at` is
+  // stamped when a request is ROUTED, while `lastSeen` moves again when it ends,
+  // so without this a session that has just finished stays inside its active
+  // window carrying a pin that aged out during the request: the account that did
+  // the work drops out of `activeCountFor` and `perAccount` for as long as the
+  // request took, up to the active window. Under-counting an account that just
+  // finished work is the funnelling this metric exists to prevent.
+  //
+  // The newest pin, and only once nothing is left outstanding. Which pin a given
+  // request was spending is not recorded (see `_pinCounts`), and the newest is
+  // the one a session making requests in sequence just touched. Two concurrent
+  // requests on different families can still refresh the wrong one, which is the
+  // same limit the in-flight arm has.
+  //
+  // Returns the session record so the caller can act on the moment it goes
+  // quiescent — `inFlight === 0` is when nothing is left that could still move
+  // this session, which is the only point at which where it ended up is final.
   endRequest(sessionId, now = this._now()) {
     const s = sessionId && this.sessions.get(sessionId);
-    if (!s) return;
+    if (!s) return null;
     s.inFlight = Math.max(0, s.inFlight - 1);
+    if (s.inFlight === 0) {
+      let newest = null;
+      for (const pin of s.pins.values()) if (!newest || pin.at > newest.at) newest = pin;
+      if (newest) newest.at = now;
+    }
     s.lastSeen = now;
+    return s;
   }
 
   _ensure(sessionId, now) {
     let s = this.sessions.get(sessionId);
     if (!s) {
-      s = { accountIndex: null, firstSeen: now, lastSeen: now, count: 0, inFlight: 0 };
+      s = { pins: new Map(), windows: null, firstSeen: now, lastSeen: now, count: 0, inFlight: 0 };
       this.sessions.set(sessionId, s);
     }
     return s;
+  }
+
+  // The record for a session that is still known, or null — dropping it if it
+  // has idled past the known window. Shared by every read that must not answer
+  // for a forgotten session.
+  _live(sessionId, now = this._now()) {
+    const s = sessionId && this.sessions.get(sessionId);
+    if (!s) return null;
+    if (this._isExpired(s, now)) {
+      this.sessions.delete(sessionId);
+      return null;
+    }
+    return s;
+  }
+
+  // The rollover baselines for a session's pins, created on demand. They live on
+  // the session record rather than in a map of their own so they get exactly one
+  // lifetime and one eviction policy — the pin's. A parallel map would need its
+  // own bound (session ids are client-supplied) and its own expiry, and the two
+  // would drift: baselines outliving their pin describe an account the session
+  // is no longer on. Null for a session that is unknown or forgotten, and for a
+  // known one until a caller asks to create them.
+  windowsFor(sessionId, create = false, now = this._now()) {
+    const s = this._live(sessionId, now);
+    if (!s) return null;
+    if (!s.windows && create) s.windows = new WindowWatcher();
+    return s.windows || null;
   }
 
   // Active = a request in flight now, or one seen within the active window.
@@ -79,25 +152,72 @@ export class SessionTracker {
     return s.inFlight === 0 && now - s.lastSeen > this.knownTtlMs;
   }
 
-  // The account a known (non-expired) session is pinned to, or null if the
-  // session is unknown/forgotten. Expired-on-read entries are dropped.
-  pinnedAccount(sessionId, now = this._now()) {
-    const s = sessionId && this.sessions.get(sessionId);
-    if (!s) return null;
-    if (this._isExpired(s, now)) {
-      this.sessions.delete(sessionId);
-      return null;
+  // The account a known (non-expired) session is pinned to for `bucket` — the
+  // weekly quota bucket governing the request being routed — or null when the
+  // session is unknown/forgotten or has no pin for that bucket yet.
+  // Expired-on-read entries are dropped. A bucket is required: "which account is
+  // this session on" is precisely the question with no single answer, and
+  // answering it anyway is what used to move a session wholesale.
+  pinnedAccount(sessionId, bucket, now = this._now()) {
+    return this._live(sessionId, now)?.pins.get(bucket)?.idx ?? null;
+  }
+
+  // Re-point every pin through `mapFn` after the account list is renumbered (see
+  // AccountManager.removeAccount). A pin is a bare position in that list, so a
+  // removal one slot below silently hands the session to a different account;
+  // returning null drops the pin instead, and that bucket re-routes on the
+  // session's next request. Every bucket is mapped, since a session may hold
+  // pins on several accounts and the removal shifts all of them.
+  remapAccounts(mapFn) {
+    for (const s of this.sessions.values()) {
+      for (const [bucket, pin] of [...s.pins]) {
+        const moved = mapFn(pin.idx);
+        if (moved == null) s.pins.delete(bucket);
+        else pin.idx = moved;
+      }
+      // The baselines name accounts by the same positions the pins do, so a
+      // removal shifts them identically. A watcher left holding nothing is
+      // dropped rather than kept empty.
+      if (s.windows && !s.windows.remap(mapFn)) s.windows = null;
     }
-    return s.accountIndex ?? null;
+  }
+
+  // Does this pin count as load on `accountIndex` right now? A pin outlives the
+  // active window by design — it holds the cache affinity for the whole known
+  // hour — so freshness is asked of the PIN and not of the session: one diverted
+  // Fable request half an hour ago is not load on that account for the rest of
+  // the hour, and counting it there skews the very signal that spreads new
+  // sessions. A request in flight keeps the session's pins counted however long
+  // it streams, since a 5-minute completion must not read as idle.
+  _pinCounts(s, pin, accountIndex, now) {
+    return pin.idx === accountIndex && (now - pin.at <= this.activeTtlMs || s.inFlight > 0);
+  }
+
+  _pinsInclude(s, accountIndex, now) {
+    for (const pin of s.pins.values()) {
+      if (this._pinCounts(s, pin, accountIndex, now)) return true;
+    }
+    return false;
+  }
+
+  // The accounts a session counts as load on right now — at most once each,
+  // however many of its buckets point at the same one.
+  _loadedAccounts(s, now) {
+    const out = new Set();
+    for (const pin of s.pins.values()) {
+      if (this._pinCounts(s, pin, pin.idx, now)) out.add(pin.idx);
+    }
+    return out;
   }
 
   // Active sessions currently pinned to `accountIndex` — the load metric used to
   // spread new sessions across accounts. Counts in-flight sessions regardless of
-  // how long their request has been streaming.
+  // how long their request has been streaming. A session spending two accounts
+  // is load on both: it counts once per account, not once overall.
   activeCountFor(accountIndex, now = this._now()) {
     let n = 0;
     for (const s of this.sessions.values()) {
-      if (s.accountIndex === accountIndex && this._isActive(s, now)) n += 1;
+      if (this._isActive(s, now) && this._pinsInclude(s, accountIndex, now)) n += 1;
     }
     return n;
   }
@@ -125,7 +245,11 @@ export class SessionTracker {
       known += 1;
       if (this._isActive(s, now)) {
         active += 1;
-        if (s.accountIndex != null) perAccount[s.accountIndex] = (perAccount[s.accountIndex] || 0) + 1;
+        // Once per account, on every account this session is currently
+        // spending, so the per-account counts can sum to more than `active`.
+        for (const idx of this._loadedAccounts(s, now)) {
+          perAccount[idx] = (perAccount[idx] || 0) + 1;
+        }
       }
     }
     return { known, active, perAccount };
