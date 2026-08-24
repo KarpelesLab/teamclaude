@@ -45,7 +45,7 @@ const PAGE = `<!doctype html>
   .badge.throttled { color: var(--warn); border-color: var(--warn); }
   .badge.error, .badge.exhausted { color: var(--bad); border-color: var(--bad); }
   .badge.current { color: var(--accent); border-color: var(--accent); }
-  .quota { display: grid; grid-template-columns: 64px 1fr 110px; gap: 8px; align-items: center; margin-top: 6px; }
+  .quota { display: grid; grid-template-columns: 64px 1fr 170px; gap: 8px; align-items: center; margin-top: 6px; }
   .quota .lbl { color: var(--dim); font-size: 12px; }
   .quota .val { color: var(--dim); font-size: 12px; text-align: right; font-variant-numeric: tabular-nums; }
   .bar { height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; }
@@ -108,8 +108,18 @@ const PAGE = `<!doctype html>
     return String(n);
   }
 
-  function fmtAgo(iso) {
-    var t = Date.parse(iso);
+  // Status timestamps arrive in both shapes: epoch milliseconds (account
+  // quota resets, account usage.lastUsed) and ISO strings (client lastUsed).
+  // Date.parse() only handles strings, so numbers must pass through as-is —
+  // feeding it a number silently yields NaN and the field just never renders.
+  function parseTs(v) {
+    if (v == null) return NaN;
+    if (typeof v === 'number') return v;
+    return Date.parse(v);
+  }
+
+  function fmtAgo(ts) {
+    var t = parseTs(ts);
     if (isNaN(t)) return '';
     var s = Math.max(0, Math.round((Date.now() - t) / 1000));
     if (s < 60) return s + 's ago';
@@ -126,7 +136,18 @@ const PAGE = `<!doctype html>
     return (s / 86400).toFixed(1) + 'd';
   }
 
-  function quotaRow(label, ratio, resetIso) {
+  // Absolute wall-clock of a future timestamp: "17:30" today, "Wed 09:00"
+  // beyond 24h — the countdown says how long, this says when.
+  function fmtClock(ts) {
+    var d = new Date(ts);
+    var time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    if (ts - Date.now() >= 86400000) {
+      return d.toLocaleDateString([], { weekday: 'short' }) + ' ' + time;
+    }
+    return time;
+  }
+
+  function quotaRow(label, ratio, resetAt) {
     var row = el('div', 'quota');
     row.appendChild(el('span', 'lbl', label));
     var bar = el('div', 'bar');
@@ -137,8 +158,10 @@ const PAGE = `<!doctype html>
     else if (pct != null && pct >= 0.7) fill.className = 'warn';
     bar.appendChild(fill);
     row.appendChild(bar);
-    var resetTs = resetIso ? Date.parse(resetIso) : NaN;
-    var reset = !isNaN(resetTs) && resetTs > Date.now() ? ' · ' + fmtIn((resetTs - Date.now()) / 1000) : '';
+    var resetTs = parseTs(resetAt);
+    var reset = !isNaN(resetTs) && resetTs > Date.now()
+      ? ' · ' + fmtIn((resetTs - Date.now()) / 1000) + ' · ' + fmtClock(resetTs)
+      : '';
     row.appendChild(el('span', 'val', (pct == null ? '?' : Math.round(pct * 100) + '%') + reset));
     return row;
   }
