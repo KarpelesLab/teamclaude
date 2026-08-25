@@ -29,6 +29,14 @@ Reacting the wrong way to either one makes things worse, so they are handled sep
 
 Rotating on a rate-limit 429 would just move the burst to the next account and throw away the first account's prompt cache.
 
+## OAuth entitlement denials
+
+A `403` whose structured error code is `error.details.error_code: oauth_not_allowed_for_organization` means the selected account's organization does not permit OAuth authentication. TeamClaude fails the current request over to another account and keeps the denied account out of automatic rotation for five minutes. The cooldown is shared by later requests, is not persisted, and expires automatically so an organization policy change can recover without restarting the proxy. Other `403` responses still fail over for that request but do not quarantine the account.
+
+An explicit [`TC_ACCT` pin](#pin-a-session-to-one-account) continues to target exactly the requested account and never fails over, even while that account is excluded from automatic rotation.
+
+Every terminal upstream response includes `x-teamclaude-account`, containing the URI-encoded display name of the account that actually served it. Decode the value with `decodeURIComponent` or an equivalent URI decoder. TeamClaude sets the header after copying upstream headers, so it cannot describe an earlier failed attempt or be spoofed by an upstream response. Synthetic TeamClaude errors with no serving upstream account omit it.
+
 ## Storm control
 
 When you run many agents at once and the active account runs out, every in-flight request fails over to the next account **at the same instant** — a thundering herd that can spend a big chunk of the fresh account's quota (large contexts) and instantly throttle it, cascading down the fleet ([#84](https://github.com/KarpelesLab/teamclaude/issues/84)).
