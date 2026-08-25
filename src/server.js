@@ -804,13 +804,24 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       : rejected.size === accountManager.accounts.length);
     if (allRefused) {
       const names = [...rejected].map(n => `"${n}"`).join(', ');
+      const entitlementDenied = ctx.entitlementDenied;
+      const allEntitlementDenied = entitlementDenied?.size === rejected.size
+        && [...rejected].every(name => entitlementDenied.has(name));
+      let message;
+      if (allEntitlementDenied && ctx.pinnedIndex != null) {
+        message = `No account served this request. The pinned account ${names} returned OAuth entitlement denial (${OAUTH_ENTITLEMENT_ERROR_CODE}). An explicit pin targets that account exactly; choose a different eligible account or change its organization's OAuth policy.`;
+      } else if (allEntitlementDenied) {
+        message = `No account served this request. Every configured account returned OAuth entitlement denial (${OAUTH_ENTITLEMENT_ERROR_CODE}): ${names}. TeamClaude temporarily removed them from automatic rotation; retry after the cooldown or pin a different eligible account.`;
+      } else {
+        message = `Upstream refused the credential for account ${names} (403). Check the account, then re-add it with: teamclaude login`;
+      }
       ctx.status = 502;
       ctx.account = `(${[...rejected].join(', ')} refused)`;
       if (!res.headersSent) {
         res.writeHead(502, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           type: 'error',
-          error: { type: 'proxy_error', message: `Upstream refused the credential for account ${names} (403). Check the account, then re-add it with: teamclaude login` },
+          error: { type: 'proxy_error', message },
         }));
       }
       return;
@@ -1104,6 +1115,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // refused" (fail fast, nothing to wait for) from "this one was, others are
       // just out of quota" (still worth holding for a reset).
       (ctx.credentialRejected ??= new Set()).add(account.name);
+      if (entitlementDenied) (ctx.entitlementDenied ??= new Set()).add(account.name);
       ctx.tried.add(account.index);
       const cooldown = deniedUntil
         ? `; OAuth entitlement cooldown until ${new Date(deniedUntil).toISOString()}`

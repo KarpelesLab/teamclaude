@@ -97,6 +97,7 @@ test('a 403 on the injected credential reaches the client as a proxy error, not 
     assert.equal(status, 502);
     assert.match(body, /proxy_error/);
     assert.match(body, /account \\"a\\"/);             // names the account that was rejected
+    assert.match(body, /teamclaude login/);            // a generic credential refusal still recommends re-auth
     assert.equal(seen.length, 1);                      // no other account to try
   } finally {
     proxy.close();
@@ -329,6 +330,39 @@ test('a fully cooling fleet reports the entitlement re-admission time', async ()
     assert.ok(retryAfter > 60);
     assert.ok(retryAfter <= 300);
     assert.deepEqual(seen, ['only-token']);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('an all-entitlement-denied 502 diagnoses policy instead of recommending login', async () => {
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    seen.push((req.headers.authorization || '').replace(/^Bearer /, ''));
+    res.writeHead(403, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(entitlementError()));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(twoAccounts(), 0.98);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const result = await post(proxyPort);
+    assert.equal(result.status, 502);
+    const message = JSON.parse(result.body).error.message;
+    assert.match(message, /No account served this request/);
+    assert.match(message, /Every configured account returned OAuth entitlement denial/);
+    assert.match(message, /oauth_not_allowed_for_organization/);
+    assert.match(message, /"a account"/);
+    assert.match(message, /"b account"/);
+    assert.doesNotMatch(message, /teamclaude login/);
+    assert.equal(result.headers.get('x-teamclaude-account'), null);
+    assert.deepEqual(seen, ['a-token', 'b-token']);
   } finally {
     proxy.close();
     upstream.close();

@@ -33,6 +33,8 @@ Rotating on a rate-limit 429 would just move the burst to the next account and t
 
 A `403` whose structured error code is `error.details.error_code: oauth_not_allowed_for_organization` means the selected account's organization does not permit OAuth authentication. TeamClaude fails the current request over to another account and keeps the denied account out of automatic rotation for five minutes. The cooldown is shared by later requests, is not persisted, and expires automatically so an organization policy change can recover without restarting the proxy. Other `403` responses still fail over for that request but do not quarantine the account.
 
+If every configured account returns that exact denial, TeamClaude's terminal `502` says that no account served the request, names the denied accounts and error code, and recommends waiting for automatic re-admission or pinning a different eligible account. It does not recommend `teamclaude login`, which remains the diagnostic for a generic credential refusal.
+
 An explicit [`TC_ACCT` pin](#pin-a-session-to-one-account) continues to target exactly the requested account and never fails over, even while that account is excluded from automatic rotation.
 
 Every terminal upstream response includes `x-teamclaude-account`, containing the URI-encoded display name of the account that actually served it. Decode the value with `decodeURIComponent` or an equivalent URI decoder. TeamClaude sets the header after copying upstream headers, so it cannot describe an earlier failed attempt or be spoofed by an upstream response. Synthetic TeamClaude errors with no serving upstream account omit it.
