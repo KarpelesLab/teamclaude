@@ -1719,6 +1719,13 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
     if (diskAcct.orgName && !mgr.orgName) mgr.orgName = diskAcct.orgName;
     if (diskAcct.name && mgr.name !== diskAcct.name) mgr.name = diskAcct.name;
     if (diskAcct.priority != null && mgr.priority !== diskAcct.priority) mgr.priority = diskAcct.priority;
+    // Third-party-backend bindings are read per request off this object
+    // (`account.upstream || upstream`, `account.modelMap` in server.js), so a
+    // disk edit must land here to take effect on reload. `|| null` mirrors the
+    // constructor's normalization, letting a removal on disk revert the account
+    // to the fleet default instead of sticking on the old value.
+    mgr.upstream = diskAcct.upstream || null;
+    mgr.modelMap = diskAcct.modelMap || null;
     // Pick up enable/disable toggles; re-enabling clears a stuck error state.
     const wantDisabled = !!diskAcct.disabled;
     if (mgr.disabled !== wantDisabled) accountManager.setDisabled(mgr.index, wantDisabled);
