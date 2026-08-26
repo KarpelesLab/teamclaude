@@ -1726,6 +1726,17 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
     // to the fleet default instead of sticking on the old value.
     mgr.upstream = diskAcct.upstream || null;
     mgr.modelMap = diskAcct.modelMap || null;
+    // Mirror onto the memConfig entry: the TUI save stencil rebuilds
+    // diskConfig.accounts from config.accounts as `{ ...diskAcct, ...live }`,
+    // so a stale key there would win the spread and silently overwrite this
+    // disk edit on the next save — and the following reload would then revert
+    // the running account too. Delete-on-absence keeps the saved JSON clean,
+    // the same shape a hand edit produces.
+    const cfgAcct = memConfig.accounts.find(a => sameIdentity(a, diskAcct));
+    if (cfgAcct) {
+      if (diskAcct.upstream) cfgAcct.upstream = diskAcct.upstream; else delete cfgAcct.upstream;
+      if (diskAcct.modelMap) cfgAcct.modelMap = diskAcct.modelMap; else delete cfgAcct.modelMap;
+    }
     // Pick up enable/disable toggles; re-enabling clears a stuck error state.
     const wantDisabled = !!diskAcct.disabled;
     if (mgr.disabled !== wantDisabled) accountManager.setDisabled(mgr.index, wantDisabled);
