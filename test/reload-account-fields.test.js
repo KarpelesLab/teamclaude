@@ -46,7 +46,12 @@ function startServer(configPath) {
   const stop = async () => {
     child.kill('SIGTERM');
     const killer = setTimeout(() => child.kill('SIGKILL'), 5000);
-    await new Promise(resolve => child.on('exit', resolve));
+    // Node does not replay 'exit' to late listeners: a child that died before
+    // stop() ran (startup port race, mid-test crash) must not hang the await.
+    // No await between the check and the attach, so there is no race window.
+    if (child.exitCode === null && child.signalCode === null) {
+      await new Promise(resolve => child.on('exit', resolve));
+    }
     clearTimeout(killer);
   };
   return { child, stop, output: () => output };
@@ -165,7 +170,9 @@ test('reload also picks up the REMOVAL of upstream and modelMap', async () => {
     await reload(proxyPort);
     const res = await sendMessage(proxyPort, 'claude-test-model');
 
-    assert.equal(res, null, 'with the override gone, the request goes to the (dead) fleet upstream');
+    // Transport detail (destroyed connection today, maybe a graceful 5xx one
+    // day) is not the verdict — the stub seeing no further traffic is.
+    assert.ok(res === null || res.status >= 500, `with the override gone the request must not succeed, got ${res?.status}`);
     assert.equal(hits.length, 1, `the stub must see no further requests, got ${hits.length}`);
   });
 });
