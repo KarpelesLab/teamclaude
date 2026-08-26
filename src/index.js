@@ -25,6 +25,23 @@ import { serviceKind, installService, uninstallService, serviceStatus, renderSer
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
 import { getUpstreamProxy, describeProxy } from './upstream-proxy.js';
 
+// These constants are referenced by routeCommand, which the dispatch below
+// reaches through a top-level `await`. The await suspends module evaluation at
+// the switch, so a const declared under the switch is still in the temporal
+// dead zone when the command body runs — keep them above the dispatch.
+const ROUTE_USAGE = [
+  'Usage: teamclaude route [list]',
+  '       teamclaude route add <name> --match "<glob>[,<glob>]" [--accounts "<name-or-index>[,...]"] [--bucket <quota-bucket>] [--color <name>]',
+  '       teamclaude route rm <name>',
+  '',
+  'A route pins model ids matching its globs to an exclusive set of accounts.',
+  'Omit --accounts to route to all accounts (e.g. just to override --bucket).',
+  '--color (red/green/yellow/blue/magenta/cyan) tints the route\'s inline marker in the TUI.',
+  'First matching route wins. Changes apply to a running server immediately.',
+].join('\n');
+
+const ROUTE_COLORS = ['red', 'green', 'yellow', 'blue', 'magenta', 'cyan'];
+
 const args = process.argv.slice(2);
 const command = args[0];
 
@@ -1328,19 +1345,6 @@ async function removeCommand() {
 }
 
 // ── route ───────────────────────────────────────────────────
-
-const ROUTE_USAGE = [
-  'Usage: teamclaude route [list]',
-  '       teamclaude route add <name> --match "<glob>[,<glob>]" [--accounts "<name-or-index>[,...]"] [--bucket <quota-bucket>] [--color <name>]',
-  '       teamclaude route rm <name>',
-  '',
-  'A route pins model ids matching its globs to an exclusive set of accounts.',
-  'Omit --accounts to route to all accounts (e.g. just to override --bucket).',
-  '--color (red/green/yellow/blue/magenta/cyan) tints the route\'s inline marker in the TUI.',
-  'First matching route wins. Changes apply to a running server immediately.',
-].join('\n');
-
-const ROUTE_COLORS = ['red', 'green', 'yellow', 'blue', 'magenta', 'cyan'];
 
 function splitList(value) {
   return (value || '').split(',').map(s => s.trim()).filter(Boolean);
