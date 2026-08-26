@@ -128,6 +128,13 @@ export class AccountManager {
     // bias selection for a route's models and reset on restart. A pinned account
     // that becomes ineligible is skipped — routing falls back to best-available.
     this.routePins = new Map();
+    // Selection cursor per route (routeName → account index; '' when no route
+    // matches). A single global cursor reads traffic that alternates between
+    // routes as a rotation: the cursor sits on the other route's account, that
+    // account fails this model's route check, and selection "switches" away from
+    // it. Each such switch arms the ramp below, so steady interleaved traffic
+    // holds both accounts at the ramp floor while nothing has failed over.
+    this.routeCursors = new Map();
     this.switchThreshold = switchThreshold;
     this.setRoutes(routes);
     // Storm control: when rotation switches to a fresh account, a burst of
@@ -242,6 +249,16 @@ export class AccountManager {
    * request keeps flowing (upstream then fails just the advisor call).
    */
   getActiveAccount(exclude = null, model = null, advisorModel = null, sessionId = null) {
+    const account = this._pickActiveAccount(exclude, model, advisorModel, sessionId);
+    // Record where this route now sits, whatever path chose it — the steady-state
+    // path returns the account the cursor already names and never reaches the
+    // rotation code, so recording there alone would leave the cursor unset and
+    // the next real failover unpaced.
+    if (account) this.routeCursors.set(this._cursorKey(model), account.index);
+    return account;
+  }
+
+  _pickActiveAccount(exclude, model, advisorModel, sessionId) {
     // Clear expired quotas across all accounts and switch proactively if a
     // session reset made a sooner-expiring account the better choice. This runs
     // on every request so the behaviour holds without the TUI render loop.
@@ -646,6 +663,29 @@ export class AccountManager {
         if (name !== 'fable' && name !== 'sonnet' && !names.has(name)) this.routePins.delete(name);
       }
     }
+    // A reload can rename or drop a route, stranding its cursor under a key
+    // nothing resolves to. Clearing them costs one extra best-available walk per
+    // route and keeps no state that outlives the table it belonged to.
+    this.routeCursors?.clear();
+  }
+
+  /** Cursor key for a model: its route's name, or '' when no route matches. */
+  _cursorKey(model) {
+    return this._routeForModel(model)?.name || '';
+  }
+
+  /** The account this route was serving from before the current selection, or
+   * null when it has none — used to tell a rotation from ordinary routing.
+   *
+   * Before a route has its own cursor, the global one stands in, but only when
+   * it names an account the route could have used: a cursor left on another
+   * route's account was never this route's position, so moving off it is not a
+   * rotation. */
+  _previousCursor(model) {
+    const recorded = this.routeCursors.get(this._cursorKey(model));
+    if (recorded != null) return recorded;
+    const current = this.accounts[this.currentIndex];
+    return current && this._routeAllows(current, model) ? current.index : null;
   }
 
   /** The first configured route whose globs match `model`, or null. */
@@ -1005,7 +1045,8 @@ export class AccountManager {
   _selectNext(exclude = null, model = null, advisorModel = null) {
     const best = this._pickBestAvailable(exclude, model, advisorModel);
     if (best) {
-      const switched = best.index !== this.currentIndex;
+      const previous = this._previousCursor(model);
+      const switched = previous != null && previous !== best.index;
       this.currentIndex = best.index;
       // If we switched to an account whose weekly quota is still unknown, flag
       // it so we re-evaluate once that quota is learned (see updateQuota).
@@ -1325,6 +1366,12 @@ export class AccountManager {
     for (const [name, idx] of [...this.routePins.entries()]) {
       if (idx === index) this.routePins.delete(name);
       else if (idx > index) this.routePins.set(name, idx - 1);
+    }
+    // Same for the selection cursors: a cursor on the removed account is dropped
+    // so the route re-picks, and one above it follows the shift.
+    for (const [name, idx] of [...this.routeCursors.entries()]) {
+      if (idx === index) this.routeCursors.delete(name);
+      else if (idx > index) this.routeCursors.set(name, idx - 1);
     }
   }
 
