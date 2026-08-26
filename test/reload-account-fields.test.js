@@ -45,10 +45,9 @@ function startServer(configPath) {
   child.stderr.on('data', c => { output += c; });
   const stop = async () => {
     child.kill('SIGTERM');
-    await Promise.race([
-      new Promise(resolve => child.on('exit', resolve)),
-      new Promise(resolve => setTimeout(resolve, 5000)).then(() => child.kill('SIGKILL')),
-    ]);
+    const killer = setTimeout(() => child.kill('SIGKILL'), 5000);
+    await new Promise(resolve => child.on('exit', resolve));
+    clearTimeout(killer);
   };
   return { child, stop, output: () => output };
 }
