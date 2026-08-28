@@ -625,6 +625,13 @@ export class AccountManager {
     return { eligible: true };
   }
 
+  /** Session-distribution toggle (issue #109), applied live on config reload.
+   *  Existing session pins survive a toggle: the flag gates only how NEW
+   *  sessions are routed. */
+  setDistributeSessions(enabled) {
+    this.distributeSessions = !!enabled;
+  }
+
   /**
    * Normalize and store the configurable routing table. A route pins a set of
    * model globs to an exclusive set of accounts (and may override the governing
