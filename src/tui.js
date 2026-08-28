@@ -1,6 +1,11 @@
 import { createWriteStream } from 'node:fs';
 import { importCredentials, fetchProfile } from './oauth.js';
-import { sameIdentity, findUpsertTarget } from './identity.js';
+import {
+  sameIdentity,
+  findUpsertTarget,
+  canUpsertOAuthAccount,
+  oauthIdentityFields,
+} from './identity.js';
 import { parseProxyUrl, proxyToUrl, describeProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy } from './upstream-proxy.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
@@ -875,10 +880,10 @@ export class TUI {
       this._addLog('Importing credentials...');
       const creds = await this._readCredentials('~/.claude/.credentials.json');
       const profile = await this._readProfile(creds.accessToken);
-      const profileOk = profile && !profile.error;
 
-      if (!profileOk) {
-        this._addLog(`Warning: could not fetch profile — ${profile?.error || 'no token'}`);
+      if (!canUpsertOAuthAccount(profile, false)) {
+        this._addLog(`Import refused: could not identify OAuth account — ${profile?.error || 'profile unavailable'}`);
+        return;
       }
 
       let name;
@@ -893,9 +898,7 @@ export class TUI {
 
       const entry = {
         name, type: 'oauth', source: 'import',
-        accountUuid: profile?.accountUuid || null,
-        orgUuid: profile?.orgUuid || null,
-        orgName: profile?.orgName || null,
+        ...oauthIdentityFields(profile),
         accessToken: creds.accessToken,
         refreshToken: creds.refreshToken,
         expiresAt: creds.expiresAt,
@@ -916,9 +919,9 @@ export class TUI {
           amAcct.credential = creds.accessToken;
           amAcct.refreshToken = creds.refreshToken;
           amAcct.expiresAt = creds.expiresAt;
-          amAcct.accountUuid = entry.accountUuid;
-          amAcct.orgUuid = entry.orgUuid;
-          amAcct.orgName = entry.orgName;
+          if (entry.accountUuid) amAcct.accountUuid = entry.accountUuid;
+          if (entry.orgUuid) amAcct.orgUuid = entry.orgUuid;
+          if (entry.orgName) amAcct.orgName = entry.orgName;
           if (amAcct.status === 'error') amAcct.status = 'active';
         }
         this._addLog(`Updated account "${prev.name}"`);
