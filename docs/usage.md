@@ -117,7 +117,9 @@ eval "$(teamclaude env --no-mitm)" # base-URL: ANTHROPIC_BASE_URL only
 claude
 ```
 
-Only the export lines go to stdout (so `eval` is safe); a short summary and any hints go to stderr. No `ANTHROPIC_API_KEY` is emitted — loopback clients are exempt from the proxy key gate, and setting it would drop Claude Code out of subscription mode. A remote (non-loopback) client must add the proxy key itself.
+Only the export lines go to stdout (so `eval` is safe); a short summary and any hints go to stderr. When local Claude OAuth is valid, no `ANTHROPIC_API_KEY` is emitted and Claude Code stays in subscription mode. When local OAuth is missing or expired, TeamClaude switches to proxy credential mode and emits a harmless local bootstrap key so Claude Code can start; the proxy replaces it with the selected account credential for normal API requests.
+
+The bootstrap mode does not authenticate the passthrough endpoints used by Remote Control and claude.ai file transfers, which intentionally retain the client's own headers. Run `claude /login` if those features are needed. A remote (non-loopback) client must override the bootstrap key with the real proxy key.
 
 **Using an agent multiplexer or a tool that spawns `claude` itself?** Export this environment in the process that launches those `claude` instances — e.g. `eval "$(teamclaude env)"` in the shell you start the multiplexer from. Every spawned `claude` then gets the same routing (and MITM interception of hardcoded endpoints) without going through `teamclaude run`. The trade-off: `run`'s proxy-up/down guard only applies when you launch via `run`, so start the server before the multiplexer.
 

@@ -25,6 +25,11 @@ teamclaude run       # in another terminal: Claude Code through the proxy
 
 Already logged into Claude Code? `teamclaude import` takes its credentials instead of a fresh OAuth round. API keys, and one email holding accounts in several orgs, are covered in [docs/accounts.md](docs/accounts.md).
 
+`teamclaude run` does not require a separate Claude Code login for normal API
+requests. When local Claude OAuth is unavailable or expired, proxy credential
+mode supplies a local-only bootstrap key; the proxy replaces that placeholder
+with the selected TeamClaude account credential before forwarding.
+
 ## What it does
 
 - Rotates to the next account when the 5h session or 7d weekly bucket reaches the threshold (98% by default), preferring the account whose weekly quota resets soonest.

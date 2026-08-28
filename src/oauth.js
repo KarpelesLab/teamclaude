@@ -9,7 +9,7 @@ import { proxyFetch } from './upstream-fetch.js';
 
 const execFileAsync = promisify(execFile);
 
-const DEFAULT_CREDENTIALS_PATH = '~/.claude/.credentials.json';
+export const DEFAULT_CREDENTIALS_PATH = '~/.claude/.credentials.json';
 const KEYCHAIN_SERVICE = 'Claude Code-credentials';
 
 /** The login name whose Keychain item to prefer, or null where there isn't one. */
@@ -202,6 +202,12 @@ export function isTokenExpiringSoon(expiresAt, thresholdMs = 5 * 60 * 1000) {
 export function isTokenExpired(expiresAt) {
   if (!expiresAt) return false;
   return Date.now() >= normalizeExpiresAt(expiresAt);
+}
+
+export function needsProxyClientCredential(credentials, now = Date.now()) {
+  if (!credentials?.accessToken) return true;
+  if (!credentials.expiresAt) return false;
+  return normalizeExpiresAt(credentials.expiresAt) <= now;
 }
 
 /**

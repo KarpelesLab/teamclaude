@@ -8,6 +8,10 @@ export function encodePinComponent(s) {
   return encodeURIComponent(s).replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
 }
 
+function shellQuote(value) {
+  return `'${String(value).replaceAll("'", "'\"'\"'")}'`;
+}
+
 // Build the shell `export` lines that point Claude Code — or any tool that
 // spawns it, e.g. an agent multiplexer — at the proxy. This is the same
 // environment `teamclaude run` sets up, but emitted for `eval "$(teamclaude
@@ -20,17 +24,25 @@ export function encodePinComponent(s) {
 // NODE_EXTRA_CA_CERTS. base-URL mode only redirects the Anthropic base URL and
 // leaves other hosts alone.
 //
-// No ANTHROPIC_API_KEY is emitted: loopback clients are exempt from the proxy's
-// key gate, and setting it would drop Claude Code out of subscription mode (and
-// its full model access). Remote clients that aren't on loopback must add the
-// proxy key themselves.
+// A client bootstrap key is emitted only when the caller determined that local
+// Claude OAuth is unavailable. It gets Claude Code past its startup auth check;
+// the proxy replaces it for normal API requests. Remote clients that are not on
+// loopback must replace it with the real proxy key.
 // `account` pins the session to one account (TC_ACCT), exactly as `teamclaude
 // run` does: in MITM mode it rides in the proxy URL's userinfo and reaches the
 // proxy as the CONNECT's Basic username; in base-URL mode it becomes a
 // `/tc-acct/` prefix. TC_ACCT itself is then unset, so the pin does not leak
 // into claude or anything it spawns — same reasoning as `run` deleting it from
 // the child environment.
-export function buildClaudeEnvLines({ port, useMitm = true, caPath = null, holdSeconds = 0, account = null, proxyApiKey = '' }) {
+export function buildClaudeEnvLines({
+  port,
+  useMitm = true,
+  caPath = null,
+  holdSeconds = 0,
+  account = null,
+  proxyApiKey = '',
+  clientApiKey = null,
+}) {
   const lines = [];
   const pin = (account || '').trim();
 
@@ -55,6 +67,10 @@ export function buildClaudeEnvLines({ port, useMitm = true, caPath = null, holdS
 
   // The pin is now carried by the routing itself; keep it out of the child.
   if (pin) lines.push('unset TC_ACCT');
+  if (clientApiKey) {
+    lines.push('unset ANTHROPIC_AUTH_TOKEN');
+    lines.push(`export ANTHROPIC_API_KEY=${shellQuote(clientApiKey)}`);
+  }
 
   // Parity with `run`: if the proxy may hold the connection on exhaustion, raise
   // the client-side timeout so it doesn't give up mid-hold.

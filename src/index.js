@@ -8,7 +8,16 @@ import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConf
 import { installCrashHandlers } from './crash-log.js';
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
-import { importCredentials, loginOAuth, loginOAuthWithPastedCode, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
+import {
+  DEFAULT_CREDENTIALS_PATH,
+  importCredentials,
+  loginOAuth,
+  loginOAuthWithPastedCode,
+  fetchProfile,
+  refreshAccessToken,
+  isTokenExpiringSoon,
+  needsProxyClientCredential,
+} from './oauth.js';
 import {
   sameIdentity,
   orgKey,
@@ -58,6 +67,7 @@ const ROUTE_COLORS = ['red', 'green', 'yellow', 'blue', 'magenta', 'cyan'];
 
 const args = process.argv.slice(2);
 const command = args[0];
+const LOCAL_PROXY_API_KEY = 'teamclaude-local';
 
 switch (command) {
   case 'server':
@@ -727,14 +737,21 @@ async function envCommand() {
 
   // Same pin as `teamclaude run`, so `eval "$(teamclaude env)"` and `run` agree.
   const account = (process.env.TC_ACCT || '').trim();
+  const clientApiKey = (
+    !process.env.ANTHROPIC_AUTH_TOKEN
+    && await needsLocalProxyClientCredential()
+  ) ? LOCAL_PROXY_API_KEY : null;
   const lines = buildClaudeEnvLines({
     port, useMitm, caPath, holdSeconds: config.holdSeconds,
-    account, proxyApiKey: config.proxy?.apiKey || '',
+    account, proxyApiKey: config.proxy?.apiKey || '', clientApiKey,
   });
   process.stdout.write(`${lines.join('\n')}\n`);
 
   const mode = useMitm ? 'MITM forward-proxy' : 'base-URL';
   process.stderr.write(`# TeamClaude env: ${mode} mode, localhost:${port}\n`);
+  if (clientApiKey) {
+    process.stderr.write('# local Claude OAuth unavailable; using proxy credential mode\n');
+  }
   if (account) {
     process.stderr.write(`# pinned to account "${account}" (TC_ACCT)\n`);
     // Warn, don't fail: the account list can change before the shell is used,
@@ -788,6 +805,11 @@ async function runCommand() {
   // MITM mode too, and keeps the pin out of the API path.
   const pinnedBase = isLocalAccountPin(process.env.ANTHROPIC_BASE_URL, port);
   if (await isProxyUp(port)) {
+    if (!env.ANTHROPIC_AUTH_TOKEN && await needsLocalProxyClientCredential()) {
+      delete env.ANTHROPIC_AUTH_TOKEN;
+      env.ANTHROPIC_API_KEY = LOCAL_PROXY_API_KEY;
+      console.error('[TeamClaude] Local Claude OAuth unavailable — using proxy credential mode');
+    }
     if (useMitm) {
       // Route ALL of claude's traffic through us as an HTTPS forward proxy, so
       // even hardcoded api.anthropic.com endpoints (e.g. the design MCP) get the
@@ -813,9 +835,10 @@ async function runCommand() {
       }
       delete env.ANTHROPIC_BASE_URL;
     } else {
-      // Only set ANTHROPIC_BASE_URL — Claude Code keeps its own OAuth token
-      // which the proxy accepts from localhost. Not setting ANTHROPIC_API_KEY
-      // lets Claude Code stay in subscription mode (full model access).
+      // Set ANTHROPIC_BASE_URL and preserve subscription mode while local OAuth
+      // is usable. When it is unavailable, the harmless bootstrap key above
+      // gets Claude Code past its startup auth check; the proxy replaces it
+      // with the selected account credential before forwarding.
       // TC_ACCT wins; teamclaude builds the pinned URL itself rather than making
       // the caller hand-write one. Otherwise an existing /tc-acct/ base URL
       // pointing at this proxy is preserved for configs written against 1.1.10.
@@ -870,6 +893,17 @@ async function runCommand() {
   await autoUpdate({ config }).catch(() => {});
 
   process.exit(result.status ?? 1);
+}
+
+async function needsLocalProxyClientCredential() {
+  try {
+    return needsProxyClientCredential(await importCredentials(DEFAULT_CREDENTIALS_PATH));
+  } catch (error) {
+    if (error?.code !== 'ENOENT') {
+      console.error(`[TeamClaude] Could not read local Claude OAuth — using proxy credential mode: ${error.message}`);
+    }
+    return true;
+  }
 }
 
 // ── status ──────────────────────────────────────────────────

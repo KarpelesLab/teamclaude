@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { buildClaudeEnvLines } from '../src/claude-env.js';
 
 test('MITM mode (default) emits proxy vars + CA cert, and clears ANTHROPIC_BASE_URL', () => {
@@ -27,7 +28,7 @@ test('--no-mitm (base-URL) mode emits only ANTHROPIC_BASE_URL, no proxy/cert var
   assert.deepEqual(lines, ['export ANTHROPIC_BASE_URL=http://localhost:8080']);
 });
 
-test('no ANTHROPIC_API_KEY is ever emitted (loopback is auth-exempt; keeps subscription mode)', () => {
+test('client bootstrap key remains absent unless requested', () => {
   const mitm = buildClaudeEnvLines({ port: 3456, useMitm: true, caPath: '/x' });
   const base = buildClaudeEnvLines({ port: 3456, useMitm: false });
   for (const l of [...mitm, ...base]) assert.ok(!l.includes('ANTHROPIC_API_KEY'), l);
@@ -90,4 +91,26 @@ test('a pinned line is shell-safe: no unquoted metacharacters survive', () => {
       for (const l of lines) assert.ok(!/[()'!*]/.test(l), `${l} (from ${name})`);
     }
   }
+});
+
+test('emits a client bootstrap key when requested', () => {
+  const lines = buildClaudeEnvLines({
+    port: 3456,
+    useMitm: false,
+    clientApiKey: 'teamclaude-local',
+  });
+
+  assert.ok(lines.includes('unset ANTHROPIC_AUTH_TOKEN'));
+  assert.ok(lines.includes("export ANTHROPIC_API_KEY='teamclaude-local'"));
+});
+
+test('client bootstrap key is shell-quoted for eval safety', () => {
+  const clientApiKey = "key'; printf injected; #";
+  const lines = buildClaudeEnvLines({ port: 3456, useMitm: false, clientApiKey });
+  const result = spawnSync('/bin/sh', ['-c', `${lines.join('\n')}\nprintf %s "$ANTHROPIC_API_KEY"`], {
+    encoding: 'utf8',
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, clientApiKey);
 });
