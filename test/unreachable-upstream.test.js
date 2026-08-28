@@ -126,12 +126,13 @@ test('a fleet whose hosts are all unresolvable closes rather than reporting exha
     `two names that would not resolve were reported to the client as exhausted quota: ${got.outcome}`);
 });
 
-// The shape that makes ECONNREFUSED unsafe to route through the condition.
-// `otherHostAvailable` scans the raw account list, while selection goes through
-// its own availability check, so an account selection can never choose still
-// counts toward "another host is available", and nothing removes it: it is never
-// selected, so it never enters the tried set. A disabled account carrying its
-// own upstream is the cheapest instance.
+// The shape that made ECONNREFUSED unsafe to route through the condition while
+// the other-host scan read the raw account list: a disabled account carrying
+// its own upstream was never selected, never entered the tried set, and counted
+// toward "another host is available" indefinitely. The scan now gates on
+// selection's own eligibility predicate, which closes that instance — this test
+// pins ECONNREFUSED as unconditional so any future gap in the condition stays a
+// non-regression instead of a fleet walk.
 //
 // A refused port here on purpose. This is about a code that must stay
 // unconditional, so the test has to use one.

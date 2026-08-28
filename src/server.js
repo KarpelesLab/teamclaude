@@ -730,10 +730,12 @@ function formatHeaders(headers) {
 // ECONNREFUSED sits here despite being arguably a property of the host. It is
 // already unconditionally transient, so making it conditional converts every gap
 // in that condition into a regression instead of leaving an unfixed case. One
-// such gap is measurable: a disabled account carrying its own `upstream` is
-// never selected, so it never enters `ctx.tried`, and the condition below then
-// reads as satisfied indefinitely. Wired that way, a four-account fleet spent
-// three accounts on a refused connection and answered rate_limit_error.
+// such gap was measurable before the other-host scan gated on selection's own
+// eligibility predicate: a disabled account carrying its own `upstream` was
+// never selected, never entered `ctx.tried`, and satisfied the condition
+// indefinitely — a four-account fleet spent three accounts on a refused
+// connection and answered rate_limit_error. That instance is closed; keeping
+// ECONNREFUSED unconditional means any future gap stays a non-regression.
 const SOCKET_TRANSIENT = new Set([
   'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EPIPE',
   'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT',
@@ -1179,9 +1181,35 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // Would failing over dial anywhere else? Only an untried account pointing at
     // a different `upstream` makes that true, and it is what decides whether a
     // name-resolution failure is worth retrying elsewhere.
-    const thisHost = account.upstream || upstream;
-    const otherHostAvailable = accountManager.accounts.some(a =>
-      a.index !== account.index && !ctx.tried.has(a.index) && (a.upstream || upstream) !== thisHost);
+    //
+    // "Anywhere else" means an account that could actually serve THIS request:
+    // selection gates on routes and the disabled flag, so a different-host
+    // account this request can never legally route to gives failover nothing to
+    // reach. The check reuses the manager's own eligibility predicate rather
+    // than restating route logic — and deliberately not getActiveAccount, which
+    // can arm the probe cooldown as a side effect. Hosts are compared by
+    // hostname, so a port or path difference does not masquerade as a second
+    // host.
+    //
+    // A pinned request never fails over at all: once the pinned account has
+    // been tried, selection returns null and the caller sends the informative
+    // pinned-unavailable 429. Counting a pin as "somewhere else to go" keeps a
+    // host failure on that path instead of a bare reset.
+    //
+    // The advisor model is deliberately NOT part of the eligibility check:
+    // when no account satisfies both models, getActiveAccount degrades to
+    // executor-only routing, so failover reaches every executor-eligible
+    // account. Gating on the advisor here would call a reachable healthy host
+    // "nowhere to go" and reset a request that selection would have served.
+    // The scan is deliberately blind to the probe fallback (a soft-exhausted
+    // other-host account it rejects could still be probed) — conservative, and
+    // self-healing: probes from other requests refresh the stale quota.
+    const hostOf = (u) => { try { return new URL(u).hostname; } catch { return u; } };
+    const thisHost = hostOf(account.upstream || upstream);
+    const otherHostAvailable = ctx.pinnedIndex != null || accountManager.accounts.some(a =>
+      a.index !== account.index && !ctx.tried.has(a.index) &&
+      hostOf(a.upstream || upstream) !== thisHost &&
+      accountManager._isAvailable(a, ctx.model));
     const isTransient = isTransientUpstreamError(err, { otherHostAvailable });
 
     // Transient network errors (including a stale-socket headers/body timeout):
