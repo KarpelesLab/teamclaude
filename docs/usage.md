@@ -34,9 +34,10 @@ A session with none of these keeps the first six hex characters of its id. So do
 session header: a bare SDK or API client reaches the proxy anonymously, and no file names it.
 
 Each label is read once and re-read at most every 30 seconds, off the render path, so a `/rename` reaches the
-log without a restart and no frame waits on the disk. Set `sessionTitles.width` to change the columns the
-label gets, or `sessionTitles.enabled: false` to show ids only. See
-[configuration](configuration.md).
+log without a restart and no frame waits on the disk.
+
+Press **g** → **Session titles** to turn the labels off and back on while the proxy runs. Set
+`sessionTitles.width` to change the columns the label gets. See [configuration](configuration.md).
 
 Headless, you can re-sync accounts from the config without a restart by POSTing to the local control endpoint (the equivalent of pressing **R** in the TUI):
 

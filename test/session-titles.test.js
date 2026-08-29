@@ -309,3 +309,66 @@ test('attach mode names its message log from the same on-disk titles', async () 
   session.tui.onRequestEnd(1, { method: 'POST', path: '/v1/messages', account: 'a@b.c', status: 200, sessionId: SID });
   assert.match(plain(session.tui.log[0].msg), /emmy-merge/);
 });
+
+// --- settings screen -------------------------------------------------------
+
+// The settings screen is driven by a shared config object the server reads
+// live, so a toggle must change the store AND persist, not one or the other.
+function settingsTui({ enabled = true } = {}) {
+  const dir = '/nonexistent-projects';
+  const saved = [];
+  const am = {
+    accounts: [{ name: 'a', index: 0, type: 'oauth', credential: 't' }],
+    currentIndex: 0,
+    switchThreshold: 0.98,
+    getRoutes() { return []; },
+  };
+  const config = {
+    proxy: { port: 1 }, accounts: [{ name: 'a', type: 'oauth' }], routes: [], blockedModels: [],
+    sessionTitles: { enabled, width: 18, projectsDir: dir },
+  };
+  const titles = new SessionTitles(config.sessionTitles);
+  const tui = new TUI({
+    accountManager: am, config, sx: null, sessionTitles: titles,
+    saveConfig: async (c) => { saved.push({ ...c.sessionTitles }); },
+    syncAccounts: async () => 0, onQuit: () => {},
+  });
+  tui.render = () => {};
+  return { tui, titles, config, saved };
+}
+
+const field = (tui) => tui._settingsFields().find((f) => f.id === 'sessionTitles');
+
+test('settings: the session-titles row reports the state in force', () => {
+  assert.match(plain(field(settingsTui({ enabled: true }).tui).value()), /on/);
+  assert.match(plain(field(settingsTui({ enabled: false }).tui).value()), /off/);
+});
+
+test('settings: toggling stops the lookups without a restart', async () => {
+  const { tui, titles } = settingsTui({ enabled: true });
+  await field(tui).right();
+  assert.equal(titles.enabled, false);
+  assert.match(plain(field(tui).value()), /off/);
+});
+
+test('settings: toggling persists the change', async () => {
+  const { tui, saved } = settingsTui({ enabled: true });
+  await field(tui).right();
+  assert.deepEqual(saved.at(-1)?.enabled, false);
+});
+
+test('settings: toggling back turns the lookups on again', async () => {
+  const { tui, titles } = settingsTui({ enabled: false });
+  await field(tui).enter();
+  assert.equal(titles.enabled, true);
+  assert.match(plain(field(tui).value()), /on/);
+});
+
+test('settings: the toggle keeps the configured width', async () => {
+  const { tui, titles, saved } = settingsTui({ enabled: true });
+  titles.configure({ enabled: true, width: 24 });
+  await field(tui).right();
+  await field(tui).right();
+  assert.equal(titles.width, 24);
+  assert.equal(saved.at(-1)?.width, 24);
+});

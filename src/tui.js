@@ -534,6 +534,18 @@ export class TUI {
       enter: () => this._cycleEventLogging(+1),
     });
 
+    if (this.sessionTitles) {
+      fields.push({
+        id: 'sessionTitles',
+        label: 'Session titles',
+        hint: '←→ toggle',
+        value: () => (this.sessionTitles.enabled ? green('on') : gray('off')),
+        left: () => this._toggleSessionTitles(),
+        right: () => this._toggleSessionTitles(),
+        enter: () => this._toggleSessionTitles(),
+      });
+    }
+
     fields.push({
       id: 'routes',
       label: 'Manage routing',
@@ -935,6 +947,17 @@ export class TUI {
     const r = await this.sx.setMode(next);
     this._addLog(`sx.org mode: ${this._sxModeLabel(next)}${r.ok ? '' : ` — ${r.error}`}`);
     if (next !== 'off') this._loadSxBalance();
+    if (this.running) this.render();
+  }
+
+  async _toggleSessionTitles() {
+    const next = { ...this.sessionTitles.settings(), enabled: !this.sessionTitles.enabled };
+    this.sessionTitles.configure(next);
+    // The shared config object is what a save writes and a reload re-applies.
+    this.config.sessionTitles = { ...this.config.sessionTitles, ...next };
+    try { await this.saveConfig(this.config); }
+    catch (e) { this._addLog(`Failed to save: ${e.message}`); }
+    this._addLog(`Session titles: ${next.enabled ? 'on' : 'off'}`);
     if (this.running) this.render();
   }
 
@@ -1374,6 +1397,7 @@ export class TUI {
     // ── Activity log
     lines.push(bold('  Activity log') + dim('  — what to do with Claude Code\'s telemetry'));
     lines.push(row(byId('eventlog')));
+    if (byId('sessionTitles')) lines.push(row(byId('sessionTitles')));
     lines.push('');
     // ── Routing
     lines.push(bold('  Routing') + dim('  — pin model families to specific accounts, or block them outright'));
