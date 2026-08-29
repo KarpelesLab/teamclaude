@@ -12,6 +12,32 @@ From a TTY this shows the interactive TUI: an account table with session/weekly 
 
 It falls back to plain log output when stdout is not a TTY (e.g. running as a service). Pass `--headless` (or `--no-tui`) to force plain-log mode from a terminal — useful for backgrounding the proxy.
 
+### Session titles in the activity log
+
+Claude Code sends `x-claude-code-session-id` with each request, so every activity row belongs to a known
+session. The row is labelled with that session's name:
+
+```
+ ⠋ 17:42:57  adv-review-rewrite POST /v1/messages (claude-opus-5) → claude@rikbrown.co.uk (1.9s...)
+ ⠋ 17:42:57  emmy-merge         POST /v1/messages (claude-opus-5) → claude@rikbrown.co.uk (0.4s...)
+ ⠋ 17:42:57                     POST /v1/messages?beta=true (claude-opus-5) → claude@rikbrown.co.uk (1.1s...)
+```
+
+The name comes from Claude Code's own files under `~/.claude/projects`, in this order:
+
+1. `<session-id>/custom-title.json`, written by `/rename`.
+2. A `custom-title` record in the session transcript, which is the only copy for a session renamed before
+   that file existed.
+3. An `ai-title` record, the title Claude Code generates. Most sessions have one without a rename.
+
+A session with none of these keeps the first six hex characters of its id. So does a request that carries no
+session header: a bare SDK or API client reaches the proxy anonymously, and no file names it.
+
+Each label is read once and re-read at most every 30 seconds, off the render path, so a `/rename` reaches the
+log without a restart and no frame waits on the disk. Set `sessionTitles.width` to change the columns the
+label gets, or `sessionTitles.enabled: false` to show ids only. See
+[configuration](configuration.md).
+
 Headless, you can re-sync accounts from the config without a restart by POSTing to the local control endpoint (the equivalent of pressing **R** in the TUI):
 
 ```bash
