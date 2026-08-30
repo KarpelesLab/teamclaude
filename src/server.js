@@ -565,6 +565,14 @@ function relayStream(req, res, upstream, sx) {
     }
     res.writeHead(upstreamRes.statusCode, responseHeaders);
     upstreamRes.pipe(res);
+    // pipe() only propagates 'end'. If the upstream leg dies mid-response
+    // (network blip, upstream restart), upstreamRes emits 'aborted'/'error'
+    // and the pipe just stops — the client's long-poll stays open forever and
+    // the CLI keeps waiting on a channel that can no longer deliver events.
+    // Destroying res closes the client socket, which is the one signal its
+    // reconnect logic reacts to.
+    upstreamRes.on('aborted', () => res.destroy());
+    upstreamRes.on('error', () => res.destroy());
   });
 
   upstreamReq.on('error', (err) => {
@@ -572,6 +580,12 @@ function relayStream(req, res, upstream, sx) {
     if (!res.headersSent) {
       res.writeHead(502, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Upstream unreachable' } }));
+    } else {
+      // Headers already went out (the long-poll was live), so a 502 body can't
+      // be written anymore. Close the client socket instead of leaving it
+      // half-dead: seen in production as a `socket hang up` logged here while
+      // the CLI's Remote Control stream silently waited on it for 45+ minutes.
+      res.destroy();
     }
   });
   // Client disconnected (e.g. Claude Code closed the channel): tear down the
