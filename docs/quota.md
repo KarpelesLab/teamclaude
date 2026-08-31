@@ -8,6 +8,20 @@ TeamClaude is **passive** by default: it reads `anthropic-ratelimit-unified-*` h
 
 Observed quota is persisted to `teamclaude.state.json` next to the config, so rotation state survives a restart. Stale windows are discarded automatically, and the file is safe to delete — quota is simply re-learned from traffic.
 
+## Fleet quota endpoint
+
+`GET /teamclaude/quota` returns the quota data intended for lightweight consumers such as a Claude Code status line. It includes every account's observed limits plus tier-weighted fleet aggregates for the shared 5-hour window, shared weekly window, Sonnet weekly window, and Fable weekly window. Sonnet and Fable fall back to the shared weekly bucket on accounts where Anthropic does not report a dedicated bucket.
+
+Subscription capacity is weighted relative to Claude Pro: Pro and Team Standard are `1`, Max 5x and Team tier 1 are `5`, and Max 20x and Team tier 2 are `20`. TeamClaude reads the organization and seat tier from the OAuth profile. An unrecognized tier remains visible under `accounts` and `unknownTiers` but is excluded from the aggregate instead of being assigned a guessed weight. API-key token and request limits remain per-account because their units cannot be combined with subscription utilization.
+
+Remote callers authenticate exactly like the other control endpoints:
+
+```bash
+curl -H "x-api-key: $TEAMCLAUDE_API_KEY" https://proxy.example.com/teamclaude/quota
+```
+
+The optional quota probe also fills missing tier metadata on its first successful refresh. Tier metadata is persisted with observed quota in `teamclaude.state.json`, so it survives subsequent restarts.
+
 ## Quota probe
 
 If you'd rather keep idle accounts' quota fresh, enable the background probe:

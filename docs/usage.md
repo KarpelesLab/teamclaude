@@ -52,6 +52,8 @@ You usually don't need to call it directly. `login`, `import`, `enable`, `disabl
 
 Control-plane **writes** (`reload`, `switch`) are refused when the request carries a browser `Origin` or a cross-site `Sec-Fetch-Site`. Loopback is exempt from the proxy API key so the CLI needs no configuration, but that exemption also covers any web page you happen to visit: a page can POST to `127.0.0.1` cross-origin without a preflight, and while it cannot read the reply, the write would still land. `curl` and the CLI send neither header and are unaffected. Reads (`status`) are not restricted — the same-origin policy already stops a page from seeing the response.
 
+`GET /teamclaude/quota` is the compact read endpoint for status-line integrations. It returns tier-weighted fleet aggregates and the underlying per-account limits; see [Fleet quota endpoint](quota.md#fleet-quota-endpoint).
+
 Switching the account by hand has the same headless path — the equivalent of pressing **s** in the TUI and confirming with the default target selected:
 
 ```bash

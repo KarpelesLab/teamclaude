@@ -534,7 +534,10 @@ async function serverCommand() {
   quotaSaveInterval.unref?.();
 
   // Start the opt-in quota probe (no-op when quotaProbeSeconds is 0).
-  prober = new Prober(accountManager, { intervalMs: (config.quotaProbeSeconds || 0) * 1000 });
+  prober = new Prober(accountManager, {
+    intervalMs: (config.quotaProbeSeconds || 0) * 1000,
+    profileFn: fetchProfile,
+  });
   prober.start();
 
   // Start the opt-in keep-warm scheduler (no-op when warmupSeconds is 0). It
@@ -1066,6 +1069,9 @@ async function accountsCommand() {
       if (p.accountUuid && a.accountUuid !== p.accountUuid) { a.accountUuid = p.accountUuid; touched = true; }
       if (p.orgUuid && a.orgUuid !== p.orgUuid) { a.orgUuid = p.orgUuid; touched = true; }
       if (p.orgName && a.orgName !== p.orgName) { a.orgName = p.orgName; touched = true; }
+      for (const field of ['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro']) {
+        if (p[field] != null && a[field] !== p[field]) { a[field] = p[field]; touched = true; }
+      }
     }
     const uuid = a.accountUuid;
     if (!uuid) continue;
@@ -1684,6 +1690,11 @@ async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
     type: 'oauth',
     source,
     ...oauthIdentityFields(profile),
+    organizationType: profile?.organizationType || null,
+    rateLimitTier: profile?.rateLimitTier || creds.rateLimitTier || null,
+    seatTier: profile?.seatTier || null,
+    hasClaudeMax: profile?.hasClaudeMax ?? null,
+    hasClaudePro: profile?.hasClaudePro ?? null,
     accessToken: creds.accessToken,
     refreshToken: creds.refreshToken,
     expiresAt: creds.expiresAt,
