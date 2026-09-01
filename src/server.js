@@ -2,7 +2,7 @@ import http from 'node:http';
 import https from 'node:https';
 import { timingSafeEqual } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
-import { mkdir } from 'node:fs/promises';
+import { mkdir, readdir, stat, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { ensureCerts, createConnectHandler } from './mitm.js';
 import { patchAccountUuid } from './account-uuid-rewrite.js';
@@ -201,6 +201,27 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
   const egress = createEgressGuard(config, console.error);
   const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, egress });
   const server = http.createServer(requestHandler);
+
+  // What bounds a directory of one-shot dumps is deleting the expired ones, not
+  // rotating a growing file. Swept once at startup, because a backlog is usually
+  // already sitting behind the restart that enables this, then on a timer. The
+  // interval is unref'd so it never holds the process open.
+  if (logDir) {
+    const sweep = () => {
+      // The message names the setting that stops it: the proxy self-updates, so
+      // the first sweep can arrive with a release the operator never read about.
+      const hours = resolveLogRetentionHours(config);
+      return sweepRequestLogs(logDir, hours)
+        .then((n) => {
+          if (n) console.log(`[TeamClaude] Removed ${n} expired request log(s) from ${logDir} (logRetentionHours=${hours}, set 0 to keep them)`);
+        })
+        .catch(() => {});
+    };
+    sweep();
+    const sweepTimer = setInterval(sweep, LOG_SWEEP_INTERVAL_MS);
+    sweepTimer.unref();
+    server.on('close', () => clearInterval(sweepTimer));
+  }
 
   // Forward-proxy support (always on, so multiple claude instances can use
   // either ANTHROPIC_BASE_URL or HTTPS_PROXY against the same server). A CONNECT
@@ -717,6 +738,75 @@ export function resolveLogMaxBodyBytes(config) {
   const max = typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : raw;
   if (max === 0) return 0;
   return Number.isFinite(max) && max > 0 ? max : DEFAULT_LOG_MAX_BODY_BYTES;
+}
+
+// The names openRequestLog writes, and nothing else. Deletion keys off this
+// pattern rather than off mtime so a file the logger did not create cannot
+// match: the directory is one the operator named, and may hold anything.
+const LOG_FILE_RE = /^(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})\.(\d{3})_\d{5,}\.log$/;
+const LOG_SWEEP_INTERVAL_MS = 10 * 60_000;
+const DEFAULT_LOG_RETENTION_HOURS = 72;
+
+export function resolveLogRetentionHours(config) {
+  const raw = config?.logRetentionHours;
+  // Strings only, and it matters most here: this is the setting that deletes.
+  // A quoted "0" must mean "keep everything" rather than falling back to the
+  // default and deleting, and a quoted "720" must not silently become 72. A
+  // blank string means "unset" and reaches the default, since Number('') is 0.
+  // Number() on null or true would instead read as 0 and 1.
+  const hours = typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : raw;
+  if (hours === 0) return 0;
+  return Number.isFinite(hours) && hours > 0 ? hours : DEFAULT_LOG_RETENTION_HOURS;
+}
+
+/**
+ * Delete expired request logs from `logDir`, returning how many were removed.
+ *
+ * Candidates come from the filename, which openRequestLog stamps in local time,
+ * so the scan costs one readdir and no stat for everything it skips — it has to
+ * stay cheap over a directory holding tens of thousands of files. Anything that
+ * is not a file, not name-matched, or inside a subdirectory is left alone.
+ *
+ * Only names already past the cutoff are stat'd, and mtime has to agree before
+ * the unlink. The name's clock is local, so a machine that changes timezone (a
+ * laptop does it by itself) can age a file by hours; mtime is absolute. Every
+ * disagreement between the two therefore keeps the file, which is the bias this
+ * operation needs — including for a file still being appended to, whose mtime
+ * is fresh however old its name looks.
+ */
+export async function sweepRequestLogs(logDir, retentionHours, now = Date.now()) {
+  if (!(retentionHours > 0)) return 0;
+  const cutoff = now - retentionHours * 3600_000;
+  let entries;
+  try {
+    entries = await readdir(logDir, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  let removed = 0;
+  for (const entry of entries) {
+    if (!entry.isFile()) continue;
+    const m = LOG_FILE_RE.exec(entry.name);
+    if (!m) continue;
+    const started = new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6], +m[7]).getTime();
+    // Negated so anything not definitively older than the cutoff is skipped.
+    // The pattern admits only digits and Date rolls every such combination into
+    // a real time, so this cannot be indeterminate today; the shape keeps the
+    // bias toward skipping if the pattern is ever loosened.
+    if (!(started < cutoff)) continue;
+    const path = join(logDir, entry.name);
+    try {
+      const { mtimeMs } = await stat(path);
+      if (!(mtimeMs < cutoff)) continue;
+    } catch {
+      continue;
+    }
+    try {
+      await unlink(path);
+      removed++;
+    } catch { /* already gone, or a concurrent sweep won the race */ }
+  }
+  return removed;
 }
 
 // A per-request log that streams to disk as the request/response flow, instead
