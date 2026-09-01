@@ -142,7 +142,7 @@ Disable it with `TEAMCLAUDE_DISABLE_AUTOUPDATE=1` or `"autoUpdate": false` in th
 
 ## Request logging
 
-Log full request/response details to a directory, one file per request:
+Log request/response details to a directory, one file per logged request:
 
 ```bash
 teamclaude server --log-to /tmp/requests

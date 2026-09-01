@@ -9,7 +9,7 @@ import { patchAccountUuid } from './account-uuid-rewrite.js';
 import { sanitizeToolPairs } from './tool-pair-sanitize.js';
 import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
 import { TopLevelFieldFinder, modelGlobMatches } from './model.js';
-import { BodyWriter } from './request-log.js';
+import { BodyWriter, truncationNote } from './request-log.js';
 import { upstreamFetch } from './upstream-fetch.js';
 import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
@@ -497,7 +497,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         return;
       }
 
-      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, holdBudgetMs: holdMs, sessionId, logLevel: resolveLogLevel(config) };
+      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, holdBudgetMs: holdMs, sessionId, logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -702,12 +702,29 @@ export function resolveLogLevel(config) {
   return LOG_LEVELS.has(level) ? level : DEFAULT_LOG_LEVEL;
 }
 
+// Bodies are what make the log large, and a cap bounds nothing unless it
+// actually applies: at 256 KiB the kept head and tail are each larger than
+// anyone reads by eye, while a request log stops scaling with the context the
+// request carried. 0 opts out, as with the other bounding settings.
+const DEFAULT_LOG_MAX_BODY_BYTES = 262_144;
+
+export function resolveLogMaxBodyBytes(config) {
+  const raw = config?.logMaxBodyBytes;
+  // A quoted number in hand-edited JSON is a common slip, so read it. A blank
+  // string is not a number and means "unset", which must reach the default:
+  // Number('') is 0, and 0 here would be the unbounded logging this bounds.
+  // Number() on null or true would likewise read as 0 and 1 rather than junk.
+  const max = typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : raw;
+  if (max === 0) return 0;
+  return Number.isFinite(max) && max > 0 ? max : DEFAULT_LOG_MAX_BODY_BYTES;
+}
+
 // A per-request log that streams to disk as the request/response flow, instead
 // of buffering the whole body in memory and writing once at the end. The file
 // is opened on first write; header sections are written verbatim and bodies are
 // streamed through BodyWriter (JSON pretty-printed on the fly, SSE/other raw),
 // so even a ~1M-token response costs only the current chunk.
-function openRequestLog(logDir, reqId, { level = DEFAULT_LOG_LEVEL } = {}) {
+function openRequestLog(logDir, reqId, { level = DEFAULT_LOG_LEVEL, maxBodyBytes = DEFAULT_LOG_MAX_BODY_BYTES } = {}) {
   const filename = `${logTimestamp()}_${String(reqId).padStart(5, '0')}.log`;
   const ws = createWriteStream(join(logDir, filename), { flags: 'a' });
   ws.on('error', (err) => console.error(`[TeamClaude] Failed to write log: ${err.message}`));
@@ -719,12 +736,33 @@ function openRequestLog(logDir, reqId, { level = DEFAULT_LOG_LEVEL } = {}) {
     body(label, buf, contentType) {
       if (level === 'headers') return;
       if (!buf || !buf.length) { write(`\n\n=== ${label} ===\n(empty)`); return; }
-      new BodyWriter(write, label, contentType || '').chunk(buf);
+      if (maxBodyBytes > 0) {
+        // A complete body is already held whole, so keeping its tail costs no
+        // extra memory — and the tail is where the newest message and the latest
+        // tool result sit, which is usually what the log was opened for.
+        const half = Math.max(1, Math.floor(maxBodyBytes / 2));
+        const dropped = buf.length - 2 * half;
+        if (dropped > 0) {
+          // The tail goes in raw. Replaying it through the head's formatter would
+          // carry that formatter's depth and in-string state across the gap: the
+          // indentation would be wrong, and once the tail's closing brackets
+          // outnumber the depth it throws on a negative repeat count.
+          const head = new BodyWriter(write, label, contentType || '');
+          head.chunk(buf.subarray(0, half));
+          head.end();
+          write(`\n${truncationNote(dropped)}\n`);
+          write(buf.subarray(buf.length - half).toString('latin1'));
+          return;
+        }
+      }
+      const whole = new BodyWriter(write, label, contentType || '');
+      whole.chunk(buf);
+      whole.end();
     },
     // A BodyWriter to append chunks incrementally (e.g. an SSE response), or
     // null when the level records no bodies — streamResponse takes either.
     bodyWriter(label, contentType) {
-      return level === 'headers' ? null : new BodyWriter(write, label, contentType || '');
+      return level === 'headers' ? null : new BodyWriter(write, label, contentType || '', maxBodyBytes);
     },
     end() { if (!ended) { ended = true; ws.end('\n'); } },
   };
@@ -745,6 +783,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   ctx.reauthed ??= new Set();
   // Same reason: a ctx built by an external caller carries no log settings.
   ctx.logLevel ??= DEFAULT_LOG_LEVEL;
+  ctx.logMaxBodyBytes ??= DEFAULT_LOG_MAX_BODY_BYTES;
   // Whether THIS attempt dials via sx.org. Undefined on the first call → derive
   // from the default policy ('always' routes; 'off'/'429' start direct).
   const route = useSx === undefined ? !!(sx?.useByDefault()) : useSx;
@@ -904,7 +943,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   let log = null;
   let reqLogged = false;
   const getLog = () => (logDir && ctx.logLevel !== 'off'
-    ? (log ||= openRequestLog(logDir, reqId, { level: ctx.logLevel }))
+    ? (log ||= openRequestLog(logDir, reqId, { level: ctx.logLevel, maxBodyBytes: ctx.logMaxBodyBytes }))
     : null);
   const logRequestHead = () => {
     const l = getLog();
@@ -1113,7 +1152,13 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // whole (potentially ~1M-token) SSE body in memory.
       const l = getLog();
       const bw = l ? l.bodyWriter('RESPONSE BODY (streamed)', contentType) : null;
-      await streamResponse(upstreamRes.body, res, account.index, accountManager, bw);
+      try {
+        await streamResponse(upstreamRes.body, res, account.index, accountManager, bw);
+      } finally {
+        // Also on the failure path: without the note a capped body reads as a
+        // stream that simply stopped, which is the other thing that happens here.
+        bw?.end();
+      }
       l?.end();
     } else {
       const buf = Buffer.from(await upstreamRes.arrayBuffer());
