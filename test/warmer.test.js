@@ -162,3 +162,115 @@ test('reschedule to a new interval does NOT trigger an extra (quota-spending) sw
   await new Promise(r => setTimeout(r, 5));
   assert.equal(spawn.calls.length, afterStart, 'no extra sweep on an interval change');
 });
+
+test('reset schedule waits for the next wall-clock warm-up without running immediately', async () => {
+  const am = new AccountManager([oauth('a')], 0.98);
+  const spawn = fakeSpawner();
+  let now = Date.parse('2026-09-01T06:00:00.000Z');
+  const timers = [];
+  const warmer = makeWarmer(am, spawn, {
+    schedule: { resetTime: '15:30', timezone: 'Europe/Moscow' },
+    nowFn: () => now,
+    setTimeoutFn: (fn, delay) => {
+      const timer = { fn, delay, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeoutFn: () => {},
+  });
+
+  warmer.start();
+
+  assert.equal(spawn.calls.length, 0, 'a scheduled warm-up must not run at startup');
+  assert.equal(timers[0].delay, 90 * 60 * 1000);
+  assert.equal(warmer.getStatus().nextWarmupAt, '2026-09-01T07:30:00.000Z');
+
+  now = Date.parse('2026-09-01T07:30:00.001Z');
+  await timers[0].fn();
+
+  assert.equal(spawn.calls.length, 1);
+  assert.equal(timers[1].delay, 24 * 60 * 60 * 1000 - 1);
+  assert.equal(warmer.getStatus().nextWarmupAt, '2026-09-02T07:30:00.000Z');
+});
+
+test('a reset timer that fires after its cron minute skips the missed warm-up', async () => {
+  const am = new AccountManager([oauth('a')], 0.98);
+  const spawn = fakeSpawner();
+  let now = Date.parse('2026-09-01T06:00:00.000Z');
+  const timers = [];
+  const warmer = makeWarmer(am, spawn, {
+    schedule: { resetTime: '15:30', timezone: 'Europe/Moscow' },
+    nowFn: () => now,
+    setTimeoutFn: (fn, delay) => {
+      const timer = { fn, delay, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeoutFn: () => {},
+  });
+  warmer.start();
+
+  now = Date.parse('2026-09-01T07:31:00.000Z');
+  await timers[0].fn();
+
+  assert.equal(spawn.calls.length, 0);
+  assert.equal(timers.length, 2);
+  assert.equal(warmer.getStatus().nextWarmupAt, '2026-09-02T07:30:00.000Z');
+});
+
+test('a timer from a replaced reset schedule cannot warm or rearm', async () => {
+  const am = new AccountManager([oauth('a')], 0.98);
+  const spawn = fakeSpawner();
+  const timers = [];
+  const warmer = makeWarmer(am, spawn, {
+    schedule: { resetTime: '15:30', timezone: 'Europe/Moscow' },
+    nowFn: () => Date.parse('2026-09-01T06:00:00.000Z'),
+    setTimeoutFn: (fn, delay) => {
+      const timer = { fn, delay, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeoutFn: () => {},
+  });
+  warmer.start();
+  warmer.rescheduleSchedule({ resetTime: '16:30', timezone: 'Europe/Moscow' });
+
+  await timers[0].fn();
+
+  assert.equal(spawn.calls.length, 0);
+  assert.equal(timers.length, 2);
+  assert.equal(warmer.getStatus().resetTime, '16:30');
+});
+
+test('a schedule replaced during warm-up cannot create an orphan timer', async () => {
+  const am = new AccountManager([oauth('a')], 0.98);
+  let finishSpawn;
+  const spawnFn = spec => {
+    spawnFn.calls.push(spec);
+    return new Promise(resolve => { finishSpawn = resolve; });
+  };
+  spawnFn.calls = [];
+  let now = Date.parse('2026-09-01T06:00:00.000Z');
+  const timers = [];
+  const warmer = makeWarmer(am, spawnFn, {
+    schedule: { resetTime: '15:30', timezone: 'Europe/Moscow' },
+    nowFn: () => now,
+    setTimeoutFn: (fn, delay) => {
+      const timer = { fn, delay, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeoutFn: () => {},
+  });
+  warmer.start();
+  now = Date.parse('2026-09-01T07:30:00.001Z');
+  const oldRun = timers[0].fn();
+  await new Promise(resolve => setImmediate(resolve));
+  warmer.rescheduleSchedule({ resetTime: '16:30', timezone: 'Europe/Moscow' });
+  finishSpawn(0);
+  await oldRun;
+
+  assert.equal(spawnFn.calls.length, 1);
+  assert.equal(timers.length, 2, 'only the replacement schedule owns a timer');
+  assert.equal(warmer.getStatus().resetTime, '16:30');
+});

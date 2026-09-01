@@ -226,8 +226,9 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // Claude Code status line. Unlike /teamclaude/status this omits routing,
       // usage counters and server diagnostics, and never reaches upstream.
       if (req.method === 'GET' && req.url === '/teamclaude/quota') {
+        const extra = hooks.getQuotaExtra?.() || {};
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(accountManager.getQuotaSummary(), null, 2));
+        res.end(JSON.stringify({ ...accountManager.getQuotaSummary(), ...extra }, null, 2));
         return;
       }
 

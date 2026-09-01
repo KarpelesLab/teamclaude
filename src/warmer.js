@@ -20,10 +20,12 @@
 
 import { spawn } from 'node:child_process';
 import { encodePinComponent } from './claude-env.js';
+import { resolveWarmupSchedule } from './warmup-schedule.js';
 
 export class Warmer {
   constructor(accountManager, {
     intervalMs = 0,
+    schedule = null,
     port,
     apiKey = null,
     model = 'haiku',
@@ -31,9 +33,13 @@ export class Warmer {
     spawnFn = defaultSpawn,
     timeoutMs = 120_000,
     log = console.log,
+    nowFn = Date.now,
+    setTimeoutFn = setTimeout,
+    clearTimeoutFn = clearTimeout,
   } = {}) {
     this.am = accountManager;
     this.intervalMs = intervalMs;
+    this.schedule = schedule;
     this.port = port;
     this.apiKey = apiKey;
     this.model = model;
@@ -41,27 +47,39 @@ export class Warmer {
     this.spawnFn = spawnFn;
     this.timeoutMs = timeoutMs;
     this.log = log;
+    this.nowFn = nowFn;
+    this.setTimeoutFn = setTimeoutFn;
+    this.clearTimeoutFn = clearTimeoutFn;
     this.timer = null;
+    this._stopped = false;
+    this._scheduleGeneration = 0;
     this._running = false;
     this._abort = null; // AbortController for the in-flight sweep (see warmAll/stop)
     this.lastRunStartedAt = null;
     this.lastRunFinishedAt = null;
-    this.nextRunAt = intervalMs > 0 ? Date.now() + intervalMs : null;
+    this.nextRunAt = intervalMs > 0 ? this.nowFn() + intervalMs : null;
+    this.scheduleStatus = null;
     this.accountStatus = new Map();
   }
 
   start() {
-    if (this.intervalMs > 0) this.reschedule(this.intervalMs);
+    this._stopped = false;
+    if (this.schedule) this.rescheduleSchedule(this.schedule);
+    else if (this.intervalMs > 0) this.reschedule(this.intervalMs);
   }
 
   /** Change interval at runtime (0 = off). Warms once immediately when turned on. */
   reschedule(intervalMs) {
-    const wasOn = this.intervalMs > 0 && this.timer;
+    const wasOn = !this.schedule && this.intervalMs > 0 && this.timer;
+    this._scheduleGeneration += 1;
+    this._stopped = false;
+    this.schedule = null;
+    this.scheduleStatus = null;
     this.intervalMs = intervalMs;
-    if (this.timer) { clearInterval(this.timer); this.timer = null; }
+    if (this.timer) { this.clearTimeoutFn(this.timer); this.timer = null; }
 
     if (intervalMs > 0) {
-      this.nextRunAt = Date.now() + intervalMs;
+      this.nextRunAt = this.nowFn() + intervalMs;
       // Immediate sweep only on an off→on transition. Re-running it on every
       // interval *change* would spend quota each time the interval is edited.
       if (!wasOn) this.warmAll().catch(() => {});
@@ -74,8 +92,50 @@ export class Warmer {
     }
   }
 
+  /** Change to a daily reset-target schedule without replaying missed runs. */
+  rescheduleSchedule(schedule) {
+    const scheduleStatus = schedule ? resolveWarmupSchedule(schedule, this.nowFn()) : null;
+    const generation = ++this._scheduleGeneration;
+    this._stopped = false;
+    this.intervalMs = 0;
+    this.schedule = schedule;
+    if (this.timer) { this.clearTimeoutFn(this.timer); this.timer = null; }
+    if (!schedule) {
+      this.scheduleStatus = null;
+      this.nextRunAt = null;
+      return;
+    }
+    this._armSchedule(generation, scheduleStatus);
+  }
+
+  _armSchedule(generation, scheduleStatus = null) {
+    if (generation !== this._scheduleGeneration || this._stopped || !this.schedule) return;
+    this.scheduleStatus = scheduleStatus || resolveWarmupSchedule(this.schedule, this.nowFn());
+    this.nextRunAt = Date.parse(this.scheduleStatus.nextWarmupAt);
+    const delay = Math.max(0, this.nextRunAt - this.nowFn());
+    const intendedAt = this.nextRunAt;
+    const timer = this.setTimeoutFn(async () => {
+      if (generation !== this._scheduleGeneration || this._stopped || !this.schedule) return;
+      if (this.timer === timer) this.timer = null;
+      const firedAt = this.nowFn();
+      if (firedAt < intendedAt || firedAt >= intendedAt + 60_000) {
+        this._armSchedule(generation);
+        return;
+      }
+      await this.warmAll();
+      if (generation === this._scheduleGeneration && !this._stopped && this.schedule) {
+        this._armSchedule(generation);
+      }
+    }, delay);
+    this.timer = timer;
+    this.timer.unref?.();
+    this.log(`[TeamClaude] Keep-warm scheduled for ${this.scheduleStatus.nextWarmupAt}`);
+  }
+
   stop() {
-    if (this.timer) { clearInterval(this.timer); this.timer = null; }
+    this._scheduleGeneration += 1;
+    this._stopped = true;
+    if (this.timer) { this.clearTimeoutFn(this.timer); this.timer = null; }
     this.nextRunAt = null;
     // Cancel an in-flight sweep and kill any child it spawned, so shutdown /
     // `warmup off` doesn't block on a running warm-up or orphan a `claude`.
@@ -169,9 +229,12 @@ export class Warmer {
   }
 
   getStatus() {
+    const schedule = this.scheduleStatus || null;
     return {
-      enabled: this.intervalMs > 0,
+      enabled: !!this.schedule || this.intervalMs > 0,
+      mode: this.schedule ? 'reset' : (this.intervalMs > 0 ? 'interval' : 'off'),
       intervalSeconds: Math.round(this.intervalMs / 1000),
+      ...(schedule || {}),
       running: this._running,
       lastRunStartedAt: iso(this.lastRunStartedAt),
       lastRunFinishedAt: iso(this.lastRunFinishedAt),

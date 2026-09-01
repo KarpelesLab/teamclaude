@@ -281,11 +281,13 @@ function gradientColor(index, width) {
 
 function formatProbeSummary(probe, now, paint) {
   if (!probe.enabled) return paint.gray('off (passive only)');
-  const bits = [`on every ${formatDuration((probe.intervalSeconds || 0) * 1000)}`];
+  const bits = probe.mode === 'reset'
+    ? [`daily ${probe.warmupTime} ${probe.timezone} → reset ${probe.resetTime}`]
+    : [`on every ${formatDuration((probe.intervalSeconds || 0) * 1000)}`];
   if (probe.running) bits.push(paint.yellow('running'));
   const last = parseTs(probe.lastRunFinishedAt);
   if (last) bits.push(`last ${formatAgo(last, now)}`);
-  const next = parseTs(probe.nextRunAt);
+  const next = parseTs(probe.nextWarmupAt || probe.nextRunAt);
   if (next && next > now) bits.push(`next ${formatDuration(next - now)}`);
   return bits.join(', ');
 }

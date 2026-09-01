@@ -154,6 +154,8 @@ teamclaude priority <name> 1 # Set rotation priority (lower = preferred)
 teamclaude route list        # Manage per-model routes (add/rm)
 teamclaude probe 300         # Enable background quota refresh (off by default)
 teamclaude warmup 600        # Enable keep-warm (off by default, spends quota)
+teamclaude warmup reset 15:30 --timezone Europe/Moscow
+                             # Schedule warm-up for a daily target reset
 teamclaude api <path>        # Call an API endpoint with account credentials
 teamclaude update            # Check npm for a newer teamclaude and install it
 teamclaude version           # Print the installed version

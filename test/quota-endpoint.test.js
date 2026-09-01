@@ -24,6 +24,20 @@ test('GET /teamclaude/quota returns the fleet quota without reaching upstream', 
   const proxy = createProxyServer(am, {
     proxy: { apiKey: 'tc-test' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
+  }, {
+    getQuotaExtra: () => ({
+      warmup: {
+        enabled: true,
+        mode: 'reset',
+        timezone: 'Europe/Moscow',
+        resetTime: '15:30',
+        warmupTime: '10:30',
+        windowSeconds: 18_000,
+        nextWarmupAt: '2026-09-02T07:30:00.000Z',
+        nextTargetResetAt: '2026-09-02T12:30:00.000Z',
+        missedRunPolicy: 'skip',
+      },
+    }),
   });
   const port = await listen(proxy);
 
@@ -36,9 +50,44 @@ test('GET /teamclaude/quota returns the fleet quota without reaching upstream', 
     assert.equal(body.accounts[0].tier.weight, 1);
     assert.equal(body.aggregate.fiveHour.remaining, 0.75);
     assert.equal(body.aggregate.weeklySonnet.remaining, 0.95);
+    assert.deepEqual(body.warmup, {
+      enabled: true,
+      mode: 'reset',
+      timezone: 'Europe/Moscow',
+      resetTime: '15:30',
+      warmupTime: '10:30',
+      windowSeconds: 18_000,
+      nextWarmupAt: '2026-09-02T07:30:00.000Z',
+      nextTargetResetAt: '2026-09-02T12:30:00.000Z',
+      missedRunPolicy: 'skip',
+    });
     assert.equal(upstreamRequests, 0);
   } finally {
     proxy.close();
     upstream.close();
+  }
+});
+
+test('GET /teamclaude/quota returns 500 when its live metadata cannot be built', async () => {
+  const am = new AccountManager([{
+    name: 'team', type: 'oauth', accessToken: 'token',
+  }], 0.98);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: 'https://api.anthropic.com',
+  }, {
+    getQuotaExtra: () => { throw new Error('bad warm-up schedule'); },
+  });
+  const port = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/teamclaude/quota`, {
+      signal: AbortSignal.timeout(1000),
+    });
+    const body = await res.json();
+    assert.equal(res.status, 500);
+    assert.deepEqual(body, { error: 'internal server error' });
+  } finally {
+    proxy.close();
   }
 });
