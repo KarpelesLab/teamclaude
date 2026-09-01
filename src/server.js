@@ -497,7 +497,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         return;
       }
 
-      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, holdBudgetMs: holdMs, sessionId };
+      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, holdBudgetMs: holdMs, sessionId, logLevel: resolveLogLevel(config) };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -691,12 +691,23 @@ function logTimestamp() {
   return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`;
 }
 
+// How much of each request the `logDir` log records. 'body' is what the logger
+// has always done; 'headers' drops both body sections, which is the difference
+// between a kilobyte and a megabyte per request.
+const LOG_LEVELS = new Set(['off', 'headers', 'body']);
+const DEFAULT_LOG_LEVEL = 'body';
+
+export function resolveLogLevel(config) {
+  const level = config?.logLevel;
+  return LOG_LEVELS.has(level) ? level : DEFAULT_LOG_LEVEL;
+}
+
 // A per-request log that streams to disk as the request/response flow, instead
 // of buffering the whole body in memory and writing once at the end. The file
 // is opened on first write; header sections are written verbatim and bodies are
 // streamed through BodyWriter (JSON pretty-printed on the fly, SSE/other raw),
 // so even a ~1M-token response costs only the current chunk.
-function openRequestLog(logDir, reqId) {
+function openRequestLog(logDir, reqId, { level = DEFAULT_LOG_LEVEL } = {}) {
   const filename = `${logTimestamp()}_${String(reqId).padStart(5, '0')}.log`;
   const ws = createWriteStream(join(logDir, filename), { flags: 'a' });
   ws.on('error', (err) => console.error(`[TeamClaude] Failed to write log: ${err.message}`));
@@ -706,11 +717,15 @@ function openRequestLog(logDir, reqId) {
     write,
     // Stream a complete body buffer under a section header.
     body(label, buf, contentType) {
+      if (level === 'headers') return;
       if (!buf || !buf.length) { write(`\n\n=== ${label} ===\n(empty)`); return; }
       new BodyWriter(write, label, contentType || '').chunk(buf);
     },
-    // A BodyWriter to append chunks incrementally (e.g. an SSE response).
-    bodyWriter(label, contentType) { return new BodyWriter(write, label, contentType || ''); },
+    // A BodyWriter to append chunks incrementally (e.g. an SSE response), or
+    // null when the level records no bodies — streamResponse takes either.
+    bodyWriter(label, contentType) {
+      return level === 'headers' ? null : new BodyWriter(write, label, contentType || '');
+    },
     end() { if (!ended) { ended = true; ws.end('\n'); } },
   };
 }
@@ -728,6 +743,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // The 401 path reads ctx.reauthed on every response; default it here rather
   // than trusting every construction site to include it.
   ctx.reauthed ??= new Set();
+  // Same reason: a ctx built by an external caller carries no log settings.
+  ctx.logLevel ??= DEFAULT_LOG_LEVEL;
   // Whether THIS attempt dials via sx.org. Undefined on the first call → derive
   // from the default policy ('always' routes; 'off'/'429' start direct).
   const route = useSx === undefined ? !!(sx?.useByDefault()) : useSx;
@@ -886,7 +903,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // request head+body are written once, just before the response is logged.
   let log = null;
   let reqLogged = false;
-  const getLog = () => (logDir ? (log ||= openRequestLog(logDir, reqId)) : null);
+  const getLog = () => (logDir && ctx.logLevel !== 'off'
+    ? (log ||= openRequestLog(logDir, reqId, { level: ctx.logLevel }))
+    : null);
   const logRequestHead = () => {
     const l = getLog();
     if (!l || reqLogged) return;
@@ -1081,7 +1100,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
 
     if (!upstreamRes.body) {
       const l = getLog();
-      if (l) { l.write('\n\n=== RESPONSE BODY ===\n(empty)'); l.end(); }
+      if (l) { l.body('RESPONSE BODY', null); l.end(); }
       res.end();
       return;
     }
