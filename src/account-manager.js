@@ -11,6 +11,11 @@ export { isFableModel, parseRequestModel, parseAdvisorModel } from './model.js';
 // when the token turned over, short enough that a genuinely bad new token
 // recovers on the next request rather than staying stuck.
 const FORCED_REFRESH_FLOOR_MS = 10_000;
+// An organization-level OAuth policy denial is not repaired by an immediate
+// retry. Keep the account out of automatic rotation long enough for other
+// members to serve, then re-admit it so an administrator's policy change is
+// discovered without a restart.
+const ENTITLEMENT_DENIAL_COOLDOWN_SECONDS = 5 * 60;
 
 // Quota fields that survive a restart: utilization levels and their reset
 // windows, learned passively from upstream responses. Transient/derived state
@@ -57,6 +62,14 @@ function emptyQuota() {
   };
 }
 
+// One level deeper than a spread, for the per-bucket usage split. Each bucket's
+// counters are a flat object, so this is the whole depth of the structure.
+function copyBuckets(byBucket) {
+  const out = {};
+  for (const [bucket, counters] of Object.entries(byBucket)) out[bucket] = { ...counters };
+  return out;
+}
+
 // Build a fresh in-memory account record from a config/disk account object.
 // Shared by the constructor and addAccount() so the field set can never drift
 // between startup accounts and runtime-added ones (a divergence here once left
@@ -85,11 +98,27 @@ function makeAccount(acct, index) {
     usage: {
       totalInputTokens: 0,
       totalOutputTokens: 0,
+      // The two cache fields upstream reports alongside `input_tokens` and that
+      // nothing read until now. `totalInputTokens` counts uncached input only,
+      // so on its own it understates what a request cost this account by
+      // whatever the cache served, which on a Claude Code turn is nearly all of
+      // it: across 873012 sampled usage objects these two carry 99.95% of the
+      // input side.
+      totalCacheReadTokens: 0,
+      totalCacheCreationTokens: 0,
+      // The same two totals split by weekly bucket. Fable meters into its own
+      // weekly, so what a point there costs is its own question, and a sum
+      // across families cannot be taken apart afterwards.
+      byBucket: {},
       totalRequests: 0,
       lastUsed: null,
     },
     rateLimitedUntil: null,
     throttledAt: null,
+    // Organization policy can reject OAuth while the credential itself remains
+    // valid. This cross-request cooldown is intentionally ephemeral: unlike
+    // quota, it is a live routing observation and is re-learned after restart.
+    entitlementDeniedUntil: null,
     // Storm control (see admit/release): in-flight upstream requests and the
     // time this account last became the current one (starts a ramp window).
     inFlight: 0,
@@ -262,6 +291,35 @@ export class AccountManager {
     if (this.ramp.enabled) account.rampStartedAt = account.pausedUntil;
   }
 
+  /** Keep an OAuth-policy-denied account out of automatic rotation temporarily.
+   * Extend an existing cooldown, never shorten it. Returns the expiry timestamp,
+   * or null when the account is missing or the cooldown is disabled. */
+  markEntitlementDenied(index, seconds = ENTITLEMENT_DENIAL_COOLDOWN_SECONDS) {
+    const account = this.accounts[index];
+    if (!account) return null;
+    const duration = Number(seconds);
+    if (!Number.isFinite(duration) || duration <= 0) return null;
+    const until = Date.now() + duration * 1000;
+    account.entitlementDeniedUntil = Math.max(account.entitlementDeniedUntil || 0, until);
+    return account.entitlementDeniedUntil;
+  }
+
+  /** True while an account is in its OAuth entitlement cooldown. Expiry is
+   * consumed lazily so selection immediately re-admits it without a timer. */
+  _entitlementDenied(account, now = Date.now()) {
+    if (!account?.entitlementDeniedUntil) return false;
+    if (now < account.entitlementDeniedUntil) return true;
+    account.entitlementDeniedUntil = null;
+    console.log(`[TeamClaude] Account "${account.name}" entitlement cooldown expired, marking available`);
+    return false;
+  }
+
+  /** Public form used by the request path to re-check an account after waiting
+   * in storm-control admission. */
+  isEntitlementDenied(index, now = Date.now()) {
+    return this._entitlementDenied(this.accounts[index], now);
+  }
+
   /**
    * Get the best available account, rotating if the current one is near quota.
    * Returns null if all accounts are exhausted.
@@ -357,16 +415,31 @@ export class AccountManager {
    * back to the normal quota-driven walk. Does NOT record the pin — that happens
    * on the actual route (recordSession), so retries/failover re-pin naturally. */
   _selectForSession(sessionId, exclude, model, advisorModel) {
-    const pinIdx = this.sessionTracker.pinnedAccount(sessionId);
-    if (pinIdx != null) {
-      const pinned = this.accounts[pinIdx];
-      if (pinned && this._isAvailable(pinned, model, advisorModel) && !exclude?.has(pinIdx)) {
-        // Mirror _select's priority preemption so an operator's priority order
-        // still wins over a session's stickiness.
-        const betterExists = this.accounts.some(a =>
-          this._isAvailable(a, model, advisorModel) && !exclude?.has(a.index) && (a.priority || 0) < (pinned.priority || 0));
-        if (!betterExists) return pinned;
-      }
+    // The pin is per governing bucket, and this request is bound by the
+    // EXECUTOR's: one request goes to one account, so the executor's affinity is
+    // what binds it and the advisor's model is a constraint on that choice
+    // (_isAvailable, below) rather than a second key.
+    const pinIdx = this.sessionTracker.pinnedAccount(sessionId, this._weeklyBucketFor(model));
+    // The bucket's own pin first. Failing that, any account the session already
+    // sits on for another family: one session stays on one account unless that
+    // account cannot serve the request (the README's "pins it there"). Without
+    // this, a session's first request of a second family would go to
+    // _pickLeastLoaded, which counts the session's own pin as load and pushes
+    // the new family onto a sibling — splitting every mixed-model session
+    // across two accounts by construction, not only on a real diversion.
+    const candidates = [];
+    if (pinIdx != null) candidates.push(pinIdx);
+    for (const idx of this.sessionTracker.pinnedAccounts(sessionId)) {
+      if (!candidates.includes(idx)) candidates.push(idx);
+    }
+    for (const idx of candidates) {
+      const pinned = this.accounts[idx];
+      if (!pinned || !this._isAvailable(pinned, model, advisorModel) || exclude?.has(idx)) continue;
+      // Mirror _select's priority preemption so an operator's priority order
+      // still wins over a session's stickiness.
+      const betterExists = this.accounts.some(a =>
+        this._isAvailable(a, model, advisorModel) && !exclude?.has(a.index) && (a.priority || 0) < (pinned.priority || 0));
+      if (!betterExists) return pinned;
     }
     return this._pickLeastLoaded(exclude, model, advisorModel);
   }
@@ -405,9 +478,18 @@ export class AccountManager {
 
   /** Record that a session's request was served by an account (always on, even
    * when distribution is off — the readout is passive). This is what pins a
-   * session for future affinity. */
-  recordSession(sessionId, accountIndex) {
-    if (sessionId) this.sessionTracker.touch(sessionId, accountIndex);
+   * session for future affinity, for the weekly bucket this request spent.
+   *
+   * The executor's bucket only. An advisor sub-inference runs on the SAME
+   * account and spends its family's quota there too, but selection degrades to
+   * executor-only when no account is eligible for both models, and upstream
+   * then drops the advisor call — so the account may or may not have served
+   * that family, and only selection knows which. Claiming it here on a request
+   * that was degraded would pin a family to an account that never served it,
+   * quite possibly one that cannot. Unclaimed means the session routes that
+   * family afresh next request, which is what it did before it had a pin. */
+  recordSession(sessionId, accountIndex, model = null) {
+    if (sessionId) this.sessionTracker.touch(sessionId, accountIndex, this._weeklyBucketFor(model));
   }
 
   /** Mark a session request as in flight / finished. Paired around the whole
@@ -472,6 +554,9 @@ export class AccountManager {
     // whose token is broken — those are hard states, not stale guesses.
     if (account.disabled) return false;
     if (account.status === 'error' || account.status === 'exhausted') return false;
+    // A live entitlement cooldown is evidence, not a stale quota estimate. Do
+    // not let the all-unavailable probe path defeat it immediately.
+    if (this._entitlementDenied(account)) return false;
     // A 429 hold is respected verbatim at first, but a hold is a snapshot: the
     // 429 that armed it may itself have been transient (e.g. the retry burst
     // after a network flap), and while it lasts NOTHING revalidates it — so a
@@ -588,6 +673,10 @@ export class AccountManager {
 
     // Manually disabled accounts are skipped entirely until re-enabled.
     if (account.disabled) return false;
+
+    // A structured organization-policy 403 means this account cannot serve OAuth
+    // requests right now. Skip it across requests until the short cooldown ends.
+    if (this._entitlementDenied(account)) return false;
 
     // Check rate limit expiry
     if (account.status === 'throttled' && account.rateLimitedUntil) {
@@ -1246,6 +1335,47 @@ export class AccountManager {
   }
 
   /**
+   * Record one upstream usage report against the account that served it and the
+   * session that asked for it.
+   *
+   * Separate from `updateUsage` rather than folded into it: that one is on the
+   * path every existing caller and test already drives, and this adds a second
+   * scope (the session) whose lifetime is not the account's. Keeping them apart
+   * means nothing that reads the account totals changes behaviour here.
+   *
+   * Nothing routes on any of this. Both the account totals and the per-session
+   * ones are published for an operator to read and are not consulted by
+   * selection.
+   */
+  recordTokenUsage(accountIndex, sessionId, model, usage) {
+    if (!usage) return;
+    // The same resolver routing uses, so a token total and a routing decision
+    // agree about which family a request belonged to. Resolved here rather than
+    // at the call sites: they parse a wire format and have no business knowing
+    // about quota buckets.
+    //
+    // It follows that `unified7d` is not "Opus": it is the shared weekly bucket,
+    // so Opus, Haiku and any model this cannot classify (absent, empty or
+    // unrecognised) all land there together, exactly as they are all gated
+    // there. A per-family figure is only as separable as the quota is.
+    const bucket = this._weeklyBucketFor(model);
+    const account = this.accounts[accountIndex];
+    if (account) {
+      const read = Number.isFinite(usage.cache_read_input_tokens) ? usage.cache_read_input_tokens : 0;
+      const creation = Number.isFinite(usage.cache_creation_input_tokens) ? usage.cache_creation_input_tokens : 0;
+      account.usage.totalCacheReadTokens += read;
+      account.usage.totalCacheCreationTokens += creation;
+      const per = account.usage.byBucket[bucket]
+        || (account.usage.byBucket[bucket] = { cacheReadTokens: 0, cacheCreationTokens: 0 });
+      per.cacheReadTokens += read;
+      per.cacheCreationTokens += creation;
+    }
+    // A request with no session id (or one the tracker has forgotten) is still a
+    // real spend by the account, so the two scopes are recorded independently.
+    this.sessionTracker.recordTokens(sessionId, bucket, usage);
+  }
+
+  /**
    * Enable or disable an account. A disabled account is skipped by rotation
    * until re-enabled. Re-enabling also clears a stuck 'error' state (and any
    * lingering rate-limit hold) so the account is retried immediately.
@@ -1489,6 +1619,9 @@ export class AccountManager {
       if (idx === index) this.routeCursors.delete(name);
       else if (idx > index) this.routeCursors.set(name, idx - 1);
     }
+    // Session pins are positions in the same list and shift the same way.
+    this.sessionTracker.remapAccounts(idx =>
+      (idx === index ? null : idx > index ? idx - 1 : idx));
   }
 
   /**
@@ -1540,12 +1673,22 @@ export class AccountManager {
         status: a.status,
         sessions: sessions.perAccount[a.index] || 0,
         quota: { ...a.quota },
-        usage: { ...a.usage },
+        // `byBucket` is the one nested value under `usage`, so the shallow copy
+        // that covers every flat counter beside it would hand the caller a live
+        // reference into the account, leaving the payload half snapshot and half
+        // window: its per-family figures would keep moving while every other
+        // number on the same object stayed put. Every in-process reader today
+        // serialises it straight away, so this holds a property rather than
+        // fixing a live defect.
+        usage: { ...a.usage, byBucket: copyBuckets(a.usage.byBucket) },
         rateLimitedUntil: a.rateLimitedUntil
           ? new Date(a.rateLimitedUntil).toISOString()
           : null,
         pausedUntil: a.pausedUntil && a.pausedUntil > Date.now()
           ? new Date(a.pausedUntil).toISOString()
+          : null,
+        entitlementDeniedUntil: a.entitlementDeniedUntil && a.entitlementDeniedUntil > Date.now()
+          ? new Date(a.entitlementDeniedUntil).toISOString()
           : null,
       })),
     };

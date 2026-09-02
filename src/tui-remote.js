@@ -1,4 +1,5 @@
 import { TUI } from './tui.js';
+import { SessionTitles } from './session-titles.js';
 import { modelGlobMatches } from './model.js';
 
 // Attach mode — the dashboard against a server running somewhere else (a
@@ -234,6 +235,10 @@ export function createAttachSession({ control, config, onQuit, pollMs = DEFAULT_
     accountManager: am,
     config,
     remote: true,
+    // Titles come from this machine's Claude Code sessions. Attaching to a
+    // server on another host leaves the ids unresolved, which shows the short
+    // id rather than a wrong name.
+    sessionTitles: new SessionTitles(config?.sessionTitles),
     // Every screen that writes config is unreachable in attach mode; if one ever
     // becomes reachable, this fails loudly instead of silently dropping a save.
     saveConfig: async () => { throw new Error('attach mode cannot write config'); },
