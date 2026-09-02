@@ -33,7 +33,7 @@ import { ClientUsageTracker } from './client-usage.js';
 import { buildClaudeEnvLines, encodePinComponent } from './claude-env.js';
 import { serviceKind, installService, uninstallService, serviceStatus, renderService, logPath } from './service.js';
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
-import { getUpstreamProxy, describeProxy } from './upstream-proxy.js';
+import { getUpstreamProxy, describeProxy, describeSelfProxy } from './upstream-proxy.js';
 
 // These constants are referenced by routeCommand, which the dispatch below
 // reaches through a top-level `await`. The await suspends module evaluation at
@@ -495,6 +495,10 @@ async function serverCommand() {
     if (egressProxy.proxy) {
       const via = egressProxy.source.startsWith('env:') ? ` (from ${egressProxy.source.slice(4)})` : '';
       console.log(`[TeamClaude] Upstream proxy: ${describeProxy(egressProxy.proxy)}${via}`);
+    } else if (egressProxy.source === 'self') {
+      // Almost always a shell that ran `eval "$(teamclaude env)"` before starting
+      // the server. Silently going direct is right; saying nothing is not.
+      console.log(`[TeamClaude] Upstream proxy: direct — ${describeSelfProxy(egressProxy)}`);
     }
     if (tui) {
       tui.start();
