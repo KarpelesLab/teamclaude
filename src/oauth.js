@@ -254,6 +254,33 @@ export function findScopedWeeklyLimit(data, modelNamePattern) {
   return { utilization: entry.percent, resets_at: entry.resets_at };
 }
 
+/**
+ * Every model-scoped weekly limit the usage payload reports, keyed by the family
+ * name the endpoint itself uses (`scope.model.display_name`, lowercased).
+ *
+ * The set of these buckets is upstream's to decide and it moves: alongside the
+ * Fable one, a payload carries slots like seven_day_opus / seven_day_sonnet /
+ * seven_day_cowork / seven_day_omelette and others that come and go. Reading the
+ * names out of the response instead of hard-coding them means a family added
+ * upstream is metered correctly without a release — where a hard-coded list
+ * silently meters it against the SHARED weekly bucket and overshoots its cap.
+ *
+ * Returns { [family]: { utilization, resetAt } } — normalized, so an entry is
+ * only present when the payload actually reported that bucket.
+ */
+export function scopedWeeklyLimits(data) {
+  const limits = Array.isArray(data?.limits) ? data.limits : [];
+  const out = {};
+  for (const l of limits) {
+    if (!l || l.group !== 'weekly') continue;
+    const name = l.scope?.model?.display_name;
+    if (typeof name !== 'string' || !name.trim()) continue;
+    const bucket = normalizeUsageBucket({ utilization: l.percent, resets_at: l.resets_at });
+    if (bucket) out[name.trim().toLowerCase()] = bucket;
+  }
+  return out;
+}
+
 // Normalize one usage bucket from the /api/oauth/usage payload into
 // { utilization: 0-1, resetAt: ms-epoch }. The endpoint reports utilization
 // as a percentage in the 0-100 range, so 1 means 1%, not 100%.
@@ -286,8 +313,9 @@ export function normalizeUsageBucket(bucket) {
 /**
  * Fetch OAuth subscription usage from the usage endpoint. This reports quota
  * utilization WITHOUT spending message quota, which is what makes it safe to
- * poll. Returns normalized { fiveHour, sevenDay, sevenDaySonnet, sevenDayFable } buckets, or
- * { error, status } on failure.
+ * poll. Returns normalized { fiveHour, sevenDay, sevenDaySonnet, sevenDayFable } buckets
+ * plus scopedWeeklyListed (whether the payload enumerated its model-scoped
+ * weekly caps), or { error, status } on failure.
  */
 export async function fetchUsage(accessToken) {
   try {
@@ -310,22 +338,122 @@ export async function fetchUsage(accessToken) {
       return { error: `HTTP ${res.status}${detail ? ': ' + detail : ''}`, status: res.status };
     }
 
-    const data = await res.json();
-    return {
-      fiveHour: normalizeUsageBucket(data?.five_hour),
-      sevenDay: normalizeUsageBucket(data?.seven_day),
-      sevenDaySonnet: normalizeUsageBucket(data?.seven_day_sonnet),
-      sevenDayFable: normalizeUsageBucket(findScopedWeeklyLimit(data, /fable/i)),
-    };
+    return normalizeUsagePayload(await res.json());
   } catch (err) {
     return { error: err.message || String(err), status: null };
   }
+}
+
+/**
+ * Map a /api/oauth/usage payload to the buckets the quota model tracks. Pure, so
+ * the mapping is testable without a network round trip.
+ */
+export function normalizeUsagePayload(data) {
+  // Every model-scoped weekly cap the payload enumerated, keyed by the family
+  // name upstream used. The two families with dedicated fields are read from
+  // the same enumeration (the legacy seven_day_<model> keys read null on
+  // current plans, so a family sourced from them alone is indistinguishable
+  // from a family with no cap); `scopedWeekly` carries these and every other
+  // family the payload named, so one upstream adds is metered without a release.
+  const scopedWeekly = scopedWeeklyLimits(data);
+  return {
+    fiveHour: normalizeUsageBucket(data?.five_hour),
+    sevenDay: normalizeUsageBucket(data?.seven_day),
+    sevenDaySonnet: normalizeUsageBucket(data?.seven_day_sonnet) || scopedWeekly.sonnet || null,
+    sevenDayFable: scopedWeekly.fable || null,
+    scopedWeekly,
+    // True when the payload carried that enumeration. It is what makes a
+    // MISSING family meaningful: upstream listed this account's scoped weekly
+    // caps and that family was not among them. Without the list, a missing
+    // family is our own ignorance and nothing may be concluded from it.
+    scopedWeeklyListed: Array.isArray(data?.limits),
+  };
 }
 
 // OAuth config (extracted from Claude Code). Client id + token endpoint are
 // shared with the refresh path — see DEFAULT_CLIENT_ID / DEFAULT_TOKEN_ENDPOINT.
 const OAUTH_AUTHORIZE = 'https://claude.ai/oauth/authorize';
 const OAUTH_SCOPES = 'org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload';
+const MANUAL_LOGIN_REDIRECT_URI = 'https://console.anthropic.com/oauth/code/callback';
+
+/**
+ * Exchange an OAuth authorization code for access/refresh tokens.
+ * Shared by both browser-callback and manual/paste login paths.
+ */
+async function exchangeCodeForTokens(code, state, codeVerifier, redirectUri, tokenEndpoint = DEFAULT_TOKEN_ENDPOINT) {
+  const tokenRes = await proxyFetch(tokenEndpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      code,
+      state,
+      grant_type: 'authorization_code',
+      client_id: DEFAULT_CLIENT_ID,
+      redirect_uri: redirectUri,
+      code_verifier: codeVerifier,
+    }),
+  });
+
+  if (!tokenRes.ok) {
+    const text = await tokenRes.text();
+    throw new Error(`Token exchange failed (${tokenRes.status}): ${text}`);
+  }
+
+  const tokens = await tokenRes.json();
+  return {
+    accessToken: tokens.access_token,
+    refreshToken: tokens.refresh_token,
+    expiresAt: normalizeExpiresAt(tokens.expires_at) || (Date.now() + (tokens.expires_in || 3600) * 1000),
+  };
+}
+
+/**
+ * Parse an authorization code from user input.
+ * Accepts either:
+ * 1. A full callback URL with ?code= and ?state= parameters
+ * 2. A code#state format (manual login success page)
+ * 3. A raw authorization code (falls back to using expectedState if provided)
+ *
+ * A bare code carries no state, so the state check cannot run for that shape:
+ * the code is sent with `expectedState` unchecked. PKCE still binds the
+ * exchange to this process's code verifier, so a code obtained elsewhere is
+ * useless to it. Exported for tests.
+ */
+export function parseAuthCode(input, expectedState) {
+  const trimmed = input.trim();
+  if (!trimmed) return null;
+
+  // Try to parse as a URL with ?code= parameter
+  try {
+    const url = new URL(trimmed);
+    const code = url.searchParams.get('code');
+    const state = url.searchParams.get('state');
+    if (code) {
+      if (expectedState && state && state !== expectedState) {
+        throw new Error('OAuth state mismatch');
+      }
+      return { code, state: state || expectedState };
+    }
+  } catch (e) {
+    if (e.message === 'OAuth state mismatch') throw e;
+  }
+
+  // Try to parse as code#state format (manual login)
+  if (trimmed.includes('#')) {
+    const parts = trimmed.split('#');
+    const code = parts[0].trim();
+    const state = parts[1]?.trim();
+    if (code) {
+      if (expectedState && state && state !== expectedState) {
+        throw new Error('OAuth state mismatch');
+      }
+      return { code, state: state || expectedState };
+    }
+  }
+
+  // Treat as raw authorization code
+  return { code: trimmed, state: expectedState };
+}
 
 /**
  * Perform OAuth login via browser with PKCE flow.
@@ -367,30 +495,58 @@ export async function loginOAuth() {
 
   // Exchange code for tokens
   console.log('Exchanging authorization code for tokens...');
-  const tokenRes = await proxyFetch(DEFAULT_TOKEN_ENDPOINT, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      code,
-      state,
-      grant_type: 'authorization_code',
-      client_id: DEFAULT_CLIENT_ID,
-      redirect_uri: redirectUri,
-      code_verifier: codeVerifier,
-    }),
-  });
+  return exchangeCodeForTokens(code, state, codeVerifier, redirectUri);
+}
 
-  if (!tokenRes.ok) {
-    const text = await tokenRes.text();
-    throw new Error(`Token exchange failed (${tokenRes.status}): ${text}`);
+/**
+ * Perform OAuth login via manual copy/paste (no local callback server).
+ * User opens the authorization URL on any device, logs in, and pastes back
+ * the authorization code shown on the success page. Useful for headless
+ * machines, remote servers, or when localhost callbacks are unavailable.
+ */
+export async function loginOAuthWithPastedCode() {
+  // Generate PKCE
+  const codeVerifier = randomBytes(32).toString('base64url');
+  const codeChallenge = createHash('sha256').update(codeVerifier).digest('base64url');
+  const state = randomBytes(32).toString('base64url');
+  const redirectUri = MANUAL_LOGIN_REDIRECT_URI;
+
+  // Build authorization URL
+  const authUrl = new URL(OAUTH_AUTHORIZE);
+  authUrl.searchParams.set('code', 'true');
+  authUrl.searchParams.set('client_id', DEFAULT_CLIENT_ID);
+  authUrl.searchParams.set('response_type', 'code');
+  authUrl.searchParams.set('redirect_uri', redirectUri);
+  authUrl.searchParams.set('scope', OAUTH_SCOPES);
+  authUrl.searchParams.set('code_challenge', codeChallenge);
+  authUrl.searchParams.set('code_challenge_method', 'S256');
+  authUrl.searchParams.set('state', state);
+
+  // Display the authorization URL
+  console.log('Authorization URL:');
+  console.log(`  ${authUrl.toString()}\n`);
+  console.log('Steps:');
+  console.log('  1. Open the URL above in a browser (on any device)');
+  console.log('  2. Log in to your Claude account');
+  console.log('  3. Copy the authorization code shown on the success page');
+  console.log('  4. Paste it below\n');
+
+  // Prompt for manual paste
+  const rl = createInterface({ input: process.stdin, output: process.stderr });
+  const input = await new Promise(resolve => {
+    rl.question('Paste authorization code (or full callback URL): ', resolve);
+  });
+  rl.close();
+
+  // Parse the input
+  const parsed = parseAuthCode(input, state);
+  if (!parsed || !parsed.code) {
+    throw new Error('No authorization code provided');
   }
 
-  const tokens = await tokenRes.json();
-  return {
-    accessToken: tokens.access_token,
-    refreshToken: tokens.refresh_token,
-    expiresAt: normalizeExpiresAt(tokens.expires_at) || (Date.now() + (tokens.expires_in || 3600) * 1000),
-  };
+  // Exchange code for tokens
+  console.log('Exchanging authorization code for tokens...');
+  return exchangeCodeForTokens(parsed.code, parsed.state, codeVerifier, redirectUri);
 }
 
 /**
@@ -412,26 +568,16 @@ function raceWithStdinCode(callbackPromise, expectedState) {
     };
 
     rl.question('Paste authorization code here (or wait for browser callback): ', answer => {
-      const trimmed = answer.trim();
-      if (!trimmed) return; // empty input, keep waiting for callback
+      if (!answer.trim()) return; // empty input, keep waiting for callback
 
-      // Try to parse as a URL with ?code= parameter
       try {
-        const url = new URL(trimmed);
-        const code = url.searchParams.get('code');
-        const state = url.searchParams.get('state');
-        if (code) {
-          if (expectedState && state && state !== expectedState) {
-            settle(reject, new Error('OAuth state mismatch'));
-          } else {
-            settle(resolve, code);
-          }
-          return;
+        const parsed = parseAuthCode(answer, expectedState);
+        if (parsed?.code) {
+          settle(resolve, parsed.code);
         }
-      } catch {}
-
-      // Treat raw input as the authorization code
-      settle(resolve, trimmed);
+      } catch (err) {
+        settle(reject, err);
+      }
     });
 
     callbackPromise.then(

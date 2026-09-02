@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { normalizeUsageBucket, findScopedWeeklyLimit } from '../src/oauth.js';
+import { normalizeUsageBucket, findScopedWeeklyLimit, normalizeUsagePayload } from '../src/oauth.js';
 import { AccountManager, isFableModel, parseRequestModel } from '../src/account-manager.js';
 import { Prober } from '../src/prober.js';
 
@@ -84,6 +84,121 @@ test('sonnet + fable quota survive the persistence round-trip', () => {
   assert.equal(am2.accounts[0].quota.unified7dSonnetReset, 999);
   assert.equal(am2.accounts[0].quota.unified7dFable, 0.3);
   assert.equal(am2.accounts[0].quota.unified7dFableReset, 888);
+});
+
+// ── normalizeUsagePayload: what a probe can conclude ──────────
+
+// Shape copied from a real Max payload: the account has a Fable cap it has not
+// touched (percent 0, no window started) and no Sonnet cap at all.
+const USAGE_PAYLOAD = {
+  five_hour: { utilization: 15, resets_at: '2026-09-02T13:59:59Z' },
+  seven_day: { utilization: 6, resets_at: '2026-09-04T03:59:59Z' },
+  seven_day_sonnet: null,
+  limits: [
+    { kind: 'session', group: 'session', percent: 15, scope: null },
+    { kind: 'weekly_all', group: 'weekly', percent: 6, scope: null },
+    { kind: 'weekly_scoped', group: 'weekly', percent: 0, resets_at: null,
+      scope: { model: { id: null, display_name: 'Fable' } } },
+  ],
+};
+
+test('a listed-but-unused family reads as zero with no window', () => {
+  const u = normalizeUsagePayload(USAGE_PAYLOAD);
+  assert.equal(u.sevenDayFable.utilization, 0);
+  assert.equal(u.sevenDayFable.resetAt, null);   // the window has not started
+  assert.equal(u.sevenDaySonnet, null);          // this account has no Sonnet cap
+  assert.equal(u.scopedWeeklyListed, true);      // …and upstream said so explicitly
+});
+
+test('Sonnet is read from the enumeration too, not only the legacy key', () => {
+  const u = normalizeUsagePayload({ limits: [
+    { kind: 'weekly_scoped', group: 'weekly', percent: 40, resets_at: '2026-09-04T03:59:59Z',
+      scope: { model: { display_name: 'Sonnet' } } },
+  ]});
+  assert.equal(u.sevenDaySonnet.utilization, 0.4);
+  // The legacy top-level key still wins where a plan still reports it.
+  assert.equal(normalizeUsagePayload({ seven_day_sonnet: { utilization: 70 }, limits: [] }).sevenDaySonnet.utilization, 0.7);
+});
+
+test('a payload with no enumeration concludes nothing about families', () => {
+  const u = normalizeUsagePayload({ five_hour: { utilization: 3 } });
+  assert.equal(u.sevenDayFable, null);
+  assert.equal(u.sevenDaySonnet, null);
+  assert.equal(u.scopedWeeklyListed, false);
+});
+
+// ── applyUsageData: the probe revalidates family buckets ──────
+
+// Put an account in the state #167 described: a spent family reading whose own
+// reset is days out, so nothing expires it and selection refuses the family.
+function sealFable(am, { utilization = 0.99 } = {}) {
+  const q = am.accounts[0].quota;
+  q.unified7dFable = utilization;
+  q.unified7dFableReset = Date.now() + 7 * 24 * 3600_000;
+  q.unified7dFableSeenAt = Date.now() - 60_000;
+  return q;
+}
+
+test('a probe that reports the family available breaks the seal', () => {
+  const am = new AccountManager([oauth('a')], 0.98);
+  const q = sealFable(am);
+  assert.equal(am.getActiveAccount(null, 'claude-fable-5'), null);   // refusing Fable
+
+  am.applyUsageData(0, normalizeUsagePayload(USAGE_PAYLOAD));
+
+  assert.equal(q.unified7dFable, 0);
+  // The stale reset went with it: it was the shared weekly window, copied in by
+  // the header path, and keeping it would misdate the bar and misrank selection.
+  assert.equal(q.unified7dFableReset, null);
+  assert.ok(q.unified7dFableSeenAt > Date.now() - 5000);             // freshly confirmed
+  assert.equal(am.getActiveAccount(null, 'claude-fable-5').name, 'a');
+});
+
+test('a family missing from an enumeration is cleared, not kept', () => {
+  const am = new AccountManager([oauth('a')], 0.98);
+  const q = sealFable(am);
+  // Upstream listed this account's scoped weekly caps and Fable was not among
+  // them — the cap is gone, so the family falls back to the shared weekly gate.
+  am.applyUsageData(0, normalizeUsagePayload({ limits: [
+    { kind: 'weekly_all', group: 'weekly', percent: 6, scope: null },
+  ]}));
+  assert.equal(q.unified7dFable, null);
+  assert.equal(q.unified7dFableReset, null);
+  assert.equal(q.unified7dFableSeenAt, null);
+  assert.equal(am.getActiveAccount(null, 'claude-fable-5').name, 'a');
+});
+
+test('a payload that enumerates nothing leaves the reading alone', () => {
+  const am = new AccountManager([oauth('a')], 0.98);
+  const q = sealFable(am);
+  const reset = q.unified7dFableReset;
+  // No enumeration: the family is missing because we cannot see it, not because
+  // upstream says it is gone. Clearing here would drop a real cap and overspend.
+  am.applyUsageData(0, normalizeUsagePayload({ five_hour: { utilization: 3 } }));
+  assert.equal(q.unified7dFable, 0.99);
+  assert.equal(q.unified7dFableReset, reset);
+  // The staleness floor still frees it later; that path is unchanged.
+});
+
+test('a failed probe is not evidence', () => {
+  const am = new AccountManager([oauth('a')], 0.98);
+  const q = sealFable(am);
+  am.applyUsageData(0, { error: 'HTTP 503', status: 503 });
+  assert.equal(q.unified7dFable, 0.99);
+  assert.equal(am.getActiveAccount(null, 'claude-fable-5'), null);
+});
+
+test('a probe that reports the family still spent keeps it spent', () => {
+  const am = new AccountManager([oauth('a')], 0.98);
+  const q = sealFable(am);
+  const at = Date.parse('2026-09-04T10:00:00Z');
+  am.applyUsageData(0, normalizeUsagePayload({ limits: [
+    { kind: 'weekly_scoped', group: 'weekly', percent: 99, resets_at: '2026-09-04T10:00:00Z',
+      scope: { model: { display_name: 'Fable' } } },
+  ]}));
+  assert.equal(q.unified7dFable, 0.99);
+  assert.equal(q.unified7dFableReset, at);        // now dated by its OWN window
+  assert.equal(am.getActiveAccount(null, 'claude-fable-5'), null);
 });
 
 // ── updateQuota: Fable weekly from response headers ───────────

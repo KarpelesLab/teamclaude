@@ -1,7 +1,11 @@
 {
   "proxy": {
     "port": 3456,
-    "apiKey": "tc-change-me-to-a-secret"
+    "apiKey": "tc-change-me-to-a-secret",
+    "clientKeys": [
+      { "name": "alice", "key": "tc-alice-own-secret" },
+      { "name": "bob", "key": "tc-bob-own-secret" }
+    ]
   },
   "upstream": "https://api.anthropic.com",
   "switchThreshold": 0.98,
