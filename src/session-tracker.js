@@ -1,4 +1,3 @@
-import { WindowWatcher } from './window-watcher.js';
 // Tracks Claude Code sessions by their `x-claude-code-session-id` header so
 // teamclaude can (a) report how many sessions are running and (b) optionally
 // keep each session pinned to one account while spreading NEW sessions across
@@ -71,8 +70,9 @@ function setAndReturn(map, key, value) {
 
 export class SessionTracker {
   constructor({ knownTtlMs, activeTtlMs, now } = {}) {
-    // id -> { pins: Map<bucketKey, { idx, at }>, windows, firstSeen, lastSeen,
-    //         count, inFlight, tokens: Map<bucketKey, ...> }
+    // id -> { pins: Map<bucketKey, { idx, at }>,
+    //         refs: Map<bucketKey, { idx, windows: Map<window, reset> }>,
+    //         firstSeen, lastSeen, count, inFlight, tokens: Map<bucketKey, ...> }
     this.sessions = new Map();
     this.knownTtlMs = knownTtlMs ?? SESSION_KNOWN_TTL_MS;
     this.activeTtlMs = activeTtlMs ?? SESSION_ACTIVE_TTL_MS;
@@ -209,7 +209,7 @@ export class SessionTracker {
     let s = this.sessions.get(sessionId);
     if (!s) {
       s = {
-        pins: new Map(), windows: null, firstSeen: now, lastSeen: now, count: 0, inFlight: 0,
+        pins: new Map(), refs: new Map(), firstSeen: now, lastSeen: now, count: 0, inFlight: 0,
         // bucket -> emptyTokens(). On the session's own record rather than in a
         // map beside it, so there is one lifetime and one eviction policy for
         // everything scoped to a session: a second map keyed by session id would
@@ -221,20 +221,6 @@ export class SessionTracker {
       this.sessions.set(sessionId, s);
     }
     return s;
-  }
-
-  // The rollover baselines for a session's pins, created on demand. They live on
-  // the session record rather than in a map of their own so they get exactly one
-  // lifetime and one eviction policy — the pin's. A parallel map would need its
-  // own bound (session ids are client-supplied) and its own expiry, and the two
-  // would drift: baselines outliving their pin describe an account the session
-  // has left. Null for a session that is unknown or forgotten, and for a
-  // known one until a caller asks to create them.
-  windowsFor(sessionId, create = false, now = this._now()) {
-    const s = this._live(sessionId, now);
-    if (!s) return null;
-    if (!s.windows && create) s.windows = new WindowWatcher();
-    return s.windows || null;
   }
 
   // Active = a request in flight now, or one seen within the active window.
@@ -264,6 +250,28 @@ export class SessionTracker {
     return s.pins.get(bucket)?.idx ?? null;
   }
 
+  // The rollover reference this session holds for `bucket`: { idx, windows } —
+  // the account this bucket last sat STILL on, and what its windows read then.
+  // Created on demand; null for a session that is unknown or forgotten, and for
+  // a known one until a caller asks to create it.
+  //
+  // Kept beside the pin rather than on it, because it deliberately outlives a
+  // relocation: a pin that has just been moved off an account is not evidence
+  // about that account, and the reference has to survive the move to still be
+  // there if the traffic comes back. It dies with the session, which is the
+  // outer bound on the pin it belongs to.
+  refsFor(sessionId, bucket, create = false, now = this._now()) {
+    const s = sessionId && this.sessions.get(sessionId);
+    if (!s) return null;
+    if (this._isExpired(s, now)) {
+      this.sessions.delete(sessionId);
+      return null;
+    }
+    let ref = s.refs.get(bucket);
+    if (!ref && create) s.refs.set(bucket, ref = { idx: null, windows: new Map() });
+    return ref || null;
+  }
+
   // Every account a known session is pinned to across its buckets, most recent
   // pin first — what selection falls back to when a request's own bucket has no
   // pin yet, so the session stays where it already is. Empty for an unknown or
@@ -291,10 +299,15 @@ export class SessionTracker {
         if (moved == null) s.pins.delete(bucket);
         else pin.idx = moved;
       }
-      // The baselines name accounts by the same positions the pins do, so a
-      // removal shifts them identically. A watcher left holding nothing is
-      // dropped rather than kept empty.
-      if (s.windows && !s.windows.remap(mapFn)) s.windows = null;
+      // A reference names its account by the same position, so it follows the
+      // same shift. One naming the account that went away is dropped whole: its
+      // numbers describe a window nothing can route to any more, and left behind
+      // they would be read against whatever account inherits the slot.
+      for (const [bucket, ref] of [...s.refs]) {
+        const moved = ref.idx == null ? null : mapFn(ref.idx);
+        if (ref.idx != null && moved == null) s.refs.delete(bucket);
+        else ref.idx = moved;
+      }
     }
   }
 

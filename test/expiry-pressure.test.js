@@ -210,8 +210,31 @@ test('every reader and the WRITER agree with a table nobody derived from them', 
     // The WRITER: making the account current must leave the watcher holding
     // exactly this window at exactly this reset, under this name.
     am._setCurrent(a);
-    assert.equal(am._currentSeen.windows.get(c.window)?.get(0), c.resetAt,
+    assert.equal(am._currentRef.windows.get(c.window), c.resetAt,
       `${c.label}: writer stored the wrong reset under ${c.window}`);
+  }
+});
+
+test('equally spent windows are governed by the one that resets sooner', () => {
+  // Two candidate windows equally spent: the number cannot choose and the clock
+  // must. Taking the longer one prices the account on quota it will lose before
+  // it can spend.
+  const now = Date.now();
+  const cases = [
+    ['scoped resets sooner', now + 10 * H, now + 100 * H, 'scoped:opus', now + 10 * H],
+    ['shared resets sooner', now + 100 * H, now + 10 * H, 'unified7d', now + 10 * H],
+  ];
+  for (const [label, scopedAt, sharedAt, window, resetAt] of cases) {
+    const am = mgr(['a'], { expiry: ON });
+    Object.assign(am.accounts[0].quota, {
+      unified7d: 0.50, unified7dReset: sharedAt,
+      scopedWeekly: { opus: { utilization: 0.50, resetAt: scopedAt } },
+    });
+    const win = am._governingWindow(am.accounts[0], OPUS);
+    assert.equal(win.window, window, `${label}: window`);
+    assert.equal(win.resetAt, resetAt, `${label}: reset`);
+    // The gate reads the same utilization either way — the tie is real.
+    assert.equal(am._governingWeekly(am.accounts[0], OPUS), 0.50, `${label}: gate`);
   }
 });
 
