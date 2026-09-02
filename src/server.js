@@ -1689,7 +1689,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       const l = getLog();
       const bw = l ? l.bodyWriter('RESPONSE BODY (streamed)', contentType) : null;
       try {
-        await streamResponse(upstreamRes.body, res, account.index, accountManager, bw, ctx.onUsage);
+        await streamResponse(upstreamRes.body, res, account.index, accountManager, bw, ctx.onUsage, ctx.sessionId, ctx.model);
       } finally {
         // Also on the failure path: without the note a capped body reads as a
         // stream that simply stopped, which is the other thing that happens here.
@@ -1698,7 +1698,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       l?.end();
     } else {
       const buf = Buffer.from(await upstreamRes.arrayBuffer());
-      extractUsageFromBody(buf, account.index, accountManager, ctx.onUsage);
+      extractUsageFromBody(buf, account.index, accountManager, ctx.onUsage, ctx.sessionId, ctx.model);
       const l = getLog();
       if (l) { l.body('RESPONSE BODY', buf, contentType); l.end(); }
       res.end(buf);
@@ -1823,12 +1823,14 @@ export function readWithIdleTimeout(reader, ms) {
 /**
  * Stream an SSE response to the client, parsing usage data along the way.
  */
-async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter, onUsage = null) {
+async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter, onUsage = null, sessionId = null, model = null) {
   const reader = webStream.getReader();
   const idleMs = resolveBodyIdleTimeout();
   const decoder = new TextDecoder();
   let sseBuffer = '';
   let errored = false;
+  // The message's usage, merged across its two reports and recorded once below.
+  const merged = {};
 
   try {
     while (true) {
@@ -1857,7 +1859,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
       sseBuffer = events.pop(); // keep incomplete event
 
       for (const event of events) {
-        parseSSEUsage(event, accountIndex, accountManager, onUsage);
+        parseSSEUsage(event, accountIndex, accountManager, onUsage, merged);
       }
 
       // Handle backpressure — also bail out if client disconnects,
@@ -1877,7 +1879,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
 
     // Parse any remaining buffer
     if (sseBuffer.trim()) {
-      parseSSEUsage(sseBuffer, accountIndex, accountManager, onUsage);
+      parseSSEUsage(sseBuffer, accountIndex, accountManager, onUsage, merged);
     }
   } catch (err) {
     // A mid-stream idle timeout (or any read error) means the upstream went
@@ -1888,6 +1890,15 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
     errored = true;
     throw err;
   } finally {
+    // Record the message once, on every exit path. A stream that died after
+    // `message_start` still spent the input it reported, so the merge is written
+    // even when no `message_delta` ever arrived. An empty merge is written
+    // nowhere rather than written as zeroes: plenty of streams carry no usage at
+    // all (a ping and some text deltas, or an upstream error after the headers),
+    // and recording those would report an observation that never happened.
+    if (Object.keys(merged).length) {
+      accountManager.recordTokenUsage(accountIndex, sessionId, model, merged);
+    }
     // Cancel upstream reader to stop consuming data nobody needs (and, on the
     // timeout path, to destroy the dead socket so the pool drops it).
     reader.cancel().catch(() => {});
@@ -1895,7 +1906,19 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
   }
 }
 
-function parseSSEUsage(event, accountIndex, accountManager, onUsage = null) {
+// A streaming response reports its usage twice. `message_start` carries the
+// input side, including the two cache fields, with an output figure that is only
+// a placeholder. `message_delta` then reports figures that are cumulative for
+// the whole message, so every field it carries supersedes the earlier one rather
+// than adding to it.
+//
+// The two counters therefore consume the stream differently. `updateUsage` is
+// incremental, so it takes each side at the event that settles it: input at
+// `message_start`, output at `message_delta`. `merged` instead accumulates the
+// message's final figures for a single `recordTokenUsage` once the stream is
+// over. One record per message is what makes double counting unrepresentable
+// rather than merely avoided.
+function parseSSEUsage(event, accountIndex, accountManager, onUsage = null, merged = null) {
   const dataLine = event.split('\n').find(l => l.startsWith('data: '));
   if (!dataLine) return;
 
@@ -1904,21 +1927,24 @@ function parseSSEUsage(event, accountIndex, accountManager, onUsage = null) {
     if (data.type === 'message_start' && data.message?.usage) {
       accountManager.updateUsage(accountIndex, data.message.usage.input_tokens, 0);
       onUsage?.(data.message.usage.input_tokens || 0, 0);
+      if (merged) Object.assign(merged, data.message.usage);
     } else if (data.type === 'message_delta' && data.usage) {
       accountManager.updateUsage(accountIndex, 0, data.usage.output_tokens);
       onUsage?.(0, data.usage.output_tokens || 0);
+      if (merged) Object.assign(merged, data.usage);
     }
   } catch {
     // not valid JSON, skip
   }
 }
 
-function extractUsageFromBody(buffer, accountIndex, accountManager, onUsage = null) {
+function extractUsageFromBody(buffer, accountIndex, accountManager, onUsage = null, sessionId = null, model = null) {
   try {
     const json = JSON.parse(buffer.toString());
     if (json.usage) {
       accountManager.updateUsage(accountIndex, json.usage.input_tokens, json.usage.output_tokens);
       onUsage?.(json.usage.input_tokens || 0, json.usage.output_tokens || 0);
+      accountManager.recordTokenUsage(accountIndex, sessionId, model, json.usage);
     }
   } catch {
     // not JSON or no usage

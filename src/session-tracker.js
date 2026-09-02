@@ -24,9 +24,54 @@ export const SESSION_ACTIVE_TTL_MS = 2 * 60 * 1000; // 2min idle → no longer "
 
 const SWEEP_INTERVAL_MS = 60 * 1000; // bound growth without an external timer
 
+// Per-session token totals, kept per weekly bucket rather than once per session.
+// Fable meters into its own weekly bucket, so how much capacity a point there
+// costs is a per-family quantity by construction; totals summed across families
+// cannot be taken apart again afterwards, and the distinction is gone before
+// anything can use it.
+//
+// The names map one-to-one onto the fields upstream reports in its `usage`
+// object, so a reader can line them up with the wire:
+// `cache_read_input_tokens`, `cache_creation_input_tokens`, `input_tokens`,
+// `output_tokens`.
+//
+// `context` is the odd one out and is not a sum. It is the size of the last
+// context upstream reported reading, which is what one request on this session
+// costs to serve; summing it would answer a question nobody asks. The sums,
+// read against `firstSeen` and `lastSeen`, give the session's burn rate.
+//
+// `reports` counts the usage objects that contributed, so a reader can tell "no
+// tokens because the session is idle" from "no tokens because nothing was ever
+// observed": two states that otherwise look identical at zero.
+function emptyTokens() {
+  return { cacheRead: 0, cacheCreation: 0, input: 0, output: 0, context: 0, reports: 0 };
+}
+
+// The counters in an aggregate sum over KNOWN sessions; the cached footprint
+// only over ACTIVE ones. Two populations in one object, so the footprint is
+// named for its scope. `context / reports` would otherwise read as an average
+// and be a ratio of different denominators.
+const COUNTERS = ['cacheRead', 'cacheCreation', 'input', 'output', 'reports'];
+function emptyAggregate() {
+  return { cacheRead: 0, cacheCreation: 0, input: 0, output: 0, reports: 0, activeContext: 0 };
+}
+
+// Upstream omits a field it has nothing to say about, and has been seen to send
+// null. Anything that is not a finite number contributes zero, so one malformed
+// report cannot turn a running total into NaN and keep it there.
+function num(v) {
+  return Number.isFinite(v) ? v : 0;
+}
+
+function setAndReturn(map, key, value) {
+  map.set(key, value);
+  return value;
+}
+
 export class SessionTracker {
   constructor({ knownTtlMs, activeTtlMs, now } = {}) {
-    // id -> { pins: Map<bucketKey, { idx, at }>, firstSeen, lastSeen, count, inFlight }
+    // id -> { pins: Map<bucketKey, { idx, at }>, firstSeen, lastSeen, count,
+    //         inFlight, tokens: Map<bucketKey, ...> }
     this.sessions = new Map();
     this.knownTtlMs = knownTtlMs ?? SESSION_KNOWN_TTL_MS;
     this.activeTtlMs = activeTtlMs ?? SESSION_ACTIVE_TTL_MS;
@@ -97,10 +142,76 @@ export class SessionTracker {
     s.lastSeen = now;
   }
 
+  /**
+   * Add one upstream usage report to a session's running totals, under the
+   * weekly quota bucket the request was governed by.
+   *
+   * Records only what the report carries. A streaming response splits its usage
+   * across two events, and the caller merges those into one object before
+   * getting here, so this is called once per upstream message however many
+   * events that message took to arrive.
+   *
+   * Four cases this deliberately does NOT special-case, because the tokens were
+   * spent upstream whether or not the request finished:
+   *
+   *   - a stream that fails after `message_start`: the context read happened and
+   *     was charged, so it stays counted;
+   *   - a request the client abandoned: same, the client leaving does not refund
+   *     anything;
+   *   - an advisor request: one report covers the whole request, and the
+   *     advisor's sub-inference is not separable from the executor's inside it,
+   *     so it lands on the executing model's bucket. Splitting it across the two
+   *     buckets a request can touch would be inventing a division upstream did
+   *     not report;
+   *   - a session the tracker has already forgotten: its totals went with its
+   *     record, and this will NOT resurrect one. The id is a client-supplied
+   *     header, so creating records here would let usage reports repopulate a
+   *     map the idle window exists to drain. A report for a session that is gone
+   *     is dropped.
+   */
+  recordTokens(sessionId, bucket, usage, now = this._now()) {
+    const s = this._live(sessionId, now);
+    if (!s || !usage || !bucket) return null;
+    const t = s.tokens.get(bucket) || setAndReturn(s.tokens, bucket, emptyTokens());
+    const read = num(usage.cache_read_input_tokens);
+    const creation = num(usage.cache_creation_input_tokens);
+    const input = num(usage.input_tokens);
+    t.cacheRead += read;
+    t.cacheCreation += creation;
+    t.input += input;
+    t.output += num(usage.output_tokens);
+    // Only a report that carries the input side describes a context. A
+    // `message_delta` carries output alone and would otherwise reset this to 0.
+    if (read || creation || input) t.context = read + creation + input;
+    t.reports += 1;
+    return t;
+  }
+
+  // A known, non-expired session's record, or null. Never creates one, and
+  // drops an expired one on read like pinnedAccount does.
+  _live(sessionId, now) {
+    const s = sessionId && this.sessions.get(sessionId);
+    if (!s) return null;
+    if (this._isExpired(s, now)) {
+      this.sessions.delete(sessionId);
+      return null;
+    }
+    return s;
+  }
+
   _ensure(sessionId, now) {
     let s = this.sessions.get(sessionId);
     if (!s) {
-      s = { pins: new Map(), firstSeen: now, lastSeen: now, count: 0, inFlight: 0 };
+      s = {
+        pins: new Map(), firstSeen: now, lastSeen: now, count: 0, inFlight: 0,
+        // bucket -> emptyTokens(). On the session's own record rather than in a
+        // map beside it, so there is one lifetime and one eviction policy for
+        // everything scoped to a session: a second map keyed by session id would
+        // need its own bound and its own sweep to stay in step with this one.
+        // The same key space as `pins`, so a family's spend and the account it
+        // is pinned to are looked up by one bucket key.
+        tokens: new Map(),
+      };
       this.sessions.set(sessionId, s);
     }
     return s;
@@ -211,19 +322,37 @@ export class SessionTracker {
     }
   }
 
-  // { known, active, perAccount: { [index]: activeCount } } — for status/TUI.
-  // Sweeps as it goes so a long-lived headless server stays bounded.
+  // { known, active, perAccount: { [index]: activeCount }, tokens } — for
+  // status/TUI. Sweeps as it goes so a long-lived headless server stays bounded.
+  // The token totals come out of the walk this already does: the status endpoint
+  // is read on every TUI frame, so nothing here may add a second pass.
+  //
+  // `tokens` sums the sessions still KNOWN, while `activeContext` beside it sums
+  // only the ACTIVE ones, because the two answer different questions: what this
+  // fleet has spent, and what it is carrying now. `byBucket` is the same pair
+  // per weekly family, which is the only view in which a fleet spending its Opus
+  // and its Fable windows at different rates is visible at all.
   stats(now = this._now()) {
     this._lastSweep = now;
     let known = 0;
     let active = 0;
     const perAccount = {};
+    const tokens = emptyAggregate();
+    const byBucket = {};
+    let activeContext = 0;
     for (const [id, s] of this.sessions) {
       if (this._isExpired(s, now)) {
         this.sessions.delete(id);
         continue;
       }
       known += 1;
+      for (const [bucket, t] of s.tokens) {
+        const per = byBucket[bucket] || (byBucket[bucket] = emptyAggregate());
+        for (const k of COUNTERS) {
+          tokens[k] += t[k];
+          per[k] += t[k];
+        }
+      }
       if (this._isActive(s, now)) {
         active += 1;
         // Once per account, on every account this session is currently
@@ -231,8 +360,17 @@ export class SessionTracker {
         for (const idx of this._loadedAccounts(s, now)) {
           perAccount[idx] = (perAccount[idx] || 0) + 1;
         }
+        // The live cached footprint, per family and in total. A session holding
+        // a big Opus context and a small Fable one contributes to both.
+        for (const [bucket, t] of s.tokens) {
+          const per = byBucket[bucket] || (byBucket[bucket] = emptyAggregate());
+          per.activeContext += t.context;
+          activeContext += t.context;
+        }
       }
     }
-    return { known, active, perAccount };
+    tokens.activeContext = activeContext;
+    tokens.byBucket = byBucket;
+    return { known, active, perAccount, tokens };
   }
 }

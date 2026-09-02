@@ -62,6 +62,14 @@ function emptyQuota() {
   };
 }
 
+// One level deeper than a spread, for the per-bucket usage split. Each bucket's
+// counters are a flat object, so this is the whole depth of the structure.
+function copyBuckets(byBucket) {
+  const out = {};
+  for (const [bucket, counters] of Object.entries(byBucket)) out[bucket] = { ...counters };
+  return out;
+}
+
 // Build a fresh in-memory account record from a config/disk account object.
 // Shared by the constructor and addAccount() so the field set can never drift
 // between startup accounts and runtime-added ones (a divergence here once left
@@ -90,6 +98,18 @@ function makeAccount(acct, index) {
     usage: {
       totalInputTokens: 0,
       totalOutputTokens: 0,
+      // The two cache fields upstream reports alongside `input_tokens` and that
+      // nothing read until now. `totalInputTokens` counts uncached input only,
+      // so on its own it understates what a request cost this account by
+      // whatever the cache served, which on a Claude Code turn is nearly all of
+      // it: across 873012 sampled usage objects these two carry 99.95% of the
+      // input side.
+      totalCacheReadTokens: 0,
+      totalCacheCreationTokens: 0,
+      // The same two totals split by weekly bucket. Fable meters into its own
+      // weekly, so what a point there costs is its own question, and a sum
+      // across families cannot be taken apart afterwards.
+      byBucket: {},
       totalRequests: 0,
       lastUsed: null,
     },
@@ -1315,6 +1335,47 @@ export class AccountManager {
   }
 
   /**
+   * Record one upstream usage report against the account that served it and the
+   * session that asked for it.
+   *
+   * Separate from `updateUsage` rather than folded into it: that one is on the
+   * path every existing caller and test already drives, and this adds a second
+   * scope (the session) whose lifetime is not the account's. Keeping them apart
+   * means nothing that reads the account totals changes behaviour here.
+   *
+   * Nothing routes on any of this. Both the account totals and the per-session
+   * ones are published for an operator to read and are not consulted by
+   * selection.
+   */
+  recordTokenUsage(accountIndex, sessionId, model, usage) {
+    if (!usage) return;
+    // The same resolver routing uses, so a token total and a routing decision
+    // agree about which family a request belonged to. Resolved here rather than
+    // at the call sites: they parse a wire format and have no business knowing
+    // about quota buckets.
+    //
+    // It follows that `unified7d` is not "Opus": it is the shared weekly bucket,
+    // so Opus, Haiku and any model this cannot classify (absent, empty or
+    // unrecognised) all land there together, exactly as they are all gated
+    // there. A per-family figure is only as separable as the quota is.
+    const bucket = this._weeklyBucketFor(model);
+    const account = this.accounts[accountIndex];
+    if (account) {
+      const read = Number.isFinite(usage.cache_read_input_tokens) ? usage.cache_read_input_tokens : 0;
+      const creation = Number.isFinite(usage.cache_creation_input_tokens) ? usage.cache_creation_input_tokens : 0;
+      account.usage.totalCacheReadTokens += read;
+      account.usage.totalCacheCreationTokens += creation;
+      const per = account.usage.byBucket[bucket]
+        || (account.usage.byBucket[bucket] = { cacheReadTokens: 0, cacheCreationTokens: 0 });
+      per.cacheReadTokens += read;
+      per.cacheCreationTokens += creation;
+    }
+    // A request with no session id (or one the tracker has forgotten) is still a
+    // real spend by the account, so the two scopes are recorded independently.
+    this.sessionTracker.recordTokens(sessionId, bucket, usage);
+  }
+
+  /**
    * Enable or disable an account. A disabled account is skipped by rotation
    * until re-enabled. Re-enabling also clears a stuck 'error' state (and any
    * lingering rate-limit hold) so the account is retried immediately.
@@ -1612,7 +1673,14 @@ export class AccountManager {
         status: a.status,
         sessions: sessions.perAccount[a.index] || 0,
         quota: { ...a.quota },
-        usage: { ...a.usage },
+        // `byBucket` is the one nested value under `usage`, so the shallow copy
+        // that covers every flat counter beside it would hand the caller a live
+        // reference into the account, leaving the payload half snapshot and half
+        // window: its per-family figures would keep moving while every other
+        // number on the same object stayed put. Every in-process reader today
+        // serialises it straight away, so this holds a property rather than
+        // fixing a live defect.
+        usage: { ...a.usage, byBucket: copyBuckets(a.usage.byBucket) },
         rateLimitedUntil: a.rateLimitedUntil
           ? new Date(a.rateLimitedUntil).toISOString()
           : null,
