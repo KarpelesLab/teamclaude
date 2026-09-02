@@ -12,6 +12,10 @@ Opens your browser and uses the same OAuth flow as Claude Code. Auto-detects the
 
 Run it once per account. You can add accounts while the server is running — press **R** in the TUI to reload.
 
+If the profile cannot be identified, login stops without adding a placeholder
+account. Retry after confirming the credential is valid, or pass
+`teamclaude login --name <name>` to add it without profile detection.
+
 ## Import from Claude Code
 
 If you already have Claude Code set up, import its credentials directly:
@@ -26,6 +30,11 @@ Re-importing the same account updates its credentials. You can also import from 
 ```bash
 teamclaude import --from /path/to/credentials.json
 ```
+
+Automatic naming requires a successful profile lookup. If credentials are
+invalid or the profile cannot be identified, the import stops without adding a
+placeholder account. Pass `--name <name>` to explicitly import without profile
+detection.
 
 ## API key
 
@@ -58,7 +67,7 @@ teamclaude priority <name> --first
 teamclaude priority <name> --last
 ```
 
-`login`, `import`, `enable`, `disable` and `priority` notify a running server to reload, so credential, priority and enable/disable changes are picked up live. Account **removals** still need a restart.
+`login`, `import`, `enable`, `disable` and `priority` notify a running server to reload, so credential, priority and enable/disable changes are picked up live; the same reload (POST `/teamclaude/reload`, or **R** in the TUI) also applies hand edits to an account's `upstream`/`modelMap`. Account **removals** still need a restart.
 
 Accounts can also be added and removed from the TUI settings screen: **`g`** → **Add account** / **Remove account**.
 

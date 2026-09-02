@@ -1,6 +1,12 @@
 import { createWriteStream } from 'node:fs';
 import { importCredentials, fetchProfile } from './oauth.js';
-import { sameIdentity, findUpsertTarget } from './identity.js';
+import {
+  sameIdentity,
+  findUpsertTarget,
+  canUpsertOAuthAccount,
+  oauthIdentityFields,
+} from './identity.js';
+import { formatPercent } from './status-renderer.js';
 import { parseProxyUrl, proxyToUrl, describeProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy } from './upstream-proxy.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
@@ -461,13 +467,10 @@ export class TUI {
       id: 'threshold',
       label: 'Switch threshold',
       hint: '←→ ±1%',
-      value: () => {
-        const thr = this.am.switchThreshold ?? this.config.switchThreshold ?? 0.98;
-        return green(`${Math.round(thr * 100)}%`);
-      },
+      value: () => green(formatPercent(this.am.switchThreshold ?? this.config.switchThreshold ?? 0.98)),
       left: () => this._nudgeThreshold(-1),
       right: () => this._nudgeThreshold(+1),
-      enter: () => this._promptInput('Switch threshold % (1-100)', v => this._doSetThreshold(v.trim())),
+      enter: () => this._promptInput('Switch threshold % (1-100, tenths allowed)', v => this._doSetThreshold(v.trim())),
     });
 
     fields.push({
@@ -622,9 +625,11 @@ export class TUI {
   }
 
   _nudgeThreshold(deltaPct) {
-    const cur = Math.round((this.am.switchThreshold ?? this.config.switchThreshold ?? 0.98) * 100);
+    // Stepping from the exact percent, not a rounded one, so a threshold set to
+    // a tenth keeps its fraction instead of snapping to the nearest whole.
+    const cur = (this.am.switchThreshold ?? this.config.switchThreshold ?? 0.98) * 100;
     const next = Math.max(1, Math.min(100, cur + deltaPct));
-    if (next !== cur) this._doSetThreshold(String(next));
+    if (next !== cur) return this._doSetThreshold(String(next));
   }
 
   _nudgeProbe(deltaSec) {
@@ -638,12 +643,14 @@ export class TUI {
     if (!Number.isFinite(pct) || pct < 1 || pct > 100) {
       this._addLog('Invalid threshold — enter 1–100'); this.mode = 'settings'; if (this.running) this.render(); return;
     }
-    const v = Math.round(pct) / 100;
+    // Tenths of a percent are kept; anything finer is quantised so the stored
+    // value is the one the screen shows.
+    const v = Math.round(pct * 10) / 1000;
     this.config.switchThreshold = v;
     this.am.switchThreshold = v; // apply to the running rotation immediately
     try { await this.saveConfig(this.config); }
     catch (e) { this._addLog(`Failed to save: ${e.message}`); }
-    this._addLog(`Switch threshold set to ${Math.round(v * 100)}%`);
+    this._addLog(`Switch threshold set to ${formatPercent(v)}`);
     this.mode = 'settings';
     if (this.running) this.render();
   }
@@ -925,10 +932,10 @@ export class TUI {
       this._addLog('Importing credentials...');
       const creds = await this._readCredentials('~/.claude/.credentials.json');
       const profile = await this._readProfile(creds.accessToken);
-      const profileOk = profile && !profile.error;
 
-      if (!profileOk) {
-        this._addLog(`Warning: could not fetch profile — ${profile?.error || 'no token'}`);
+      if (!canUpsertOAuthAccount(profile, false)) {
+        this._addLog(`Import refused: could not identify OAuth account — ${profile?.error || 'profile unavailable'}`);
+        return;
       }
 
       let name;
@@ -943,9 +950,7 @@ export class TUI {
 
       const entry = {
         name, type: 'oauth', source: 'import',
-        accountUuid: profile?.accountUuid || null,
-        orgUuid: profile?.orgUuid || null,
-        orgName: profile?.orgName || null,
+        ...oauthIdentityFields(profile),
         accessToken: creds.accessToken,
         refreshToken: creds.refreshToken,
         expiresAt: creds.expiresAt,
@@ -966,9 +971,9 @@ export class TUI {
           amAcct.credential = creds.accessToken;
           amAcct.refreshToken = creds.refreshToken;
           amAcct.expiresAt = creds.expiresAt;
-          amAcct.accountUuid = entry.accountUuid;
-          amAcct.orgUuid = entry.orgUuid;
-          amAcct.orgName = entry.orgName;
+          if (entry.accountUuid) amAcct.accountUuid = entry.accountUuid;
+          if (entry.orgUuid) amAcct.orgUuid = entry.orgUuid;
+          if (entry.orgName) amAcct.orgName = entry.orgName;
           if (amAcct.status === 'error') amAcct.status = 'active';
         }
         this._addLog(`Updated account "${prev.name}"`);
