@@ -28,6 +28,46 @@ const INLINE_RETRY_AFTER_MAX_SECONDS = 15;
 // the account so concurrent requests wait, then retries the same account.
 const RATE_LIMIT_ABSORB_MAX_SECONDS =
   Number(process.env.TEAMCLAUDE_RATE_LIMIT_ABSORB_MAX_SECONDS) || 60;
+const OAUTH_ENTITLEMENT_ERROR_CODE = 'oauth_not_allowed_for_organization';
+const ERROR_BODY_INSPECTION_LIMIT = 64 * 1024;
+
+/** Classify only the structured organization-policy denial observed upstream.
+ * Message text and generic permission errors are deliberately not enough. */
+export function isOAuthEntitlementDenied(body) {
+  try {
+    const parsed = JSON.parse(Buffer.from(body).toString('utf8'));
+    return parsed?.error?.details?.error_code === OAUTH_ENTITLEMENT_ERROR_CODE;
+  } catch {
+    return false;
+  }
+}
+
+// Error payloads are normally tiny, but an alternate upstream is configurable.
+// Bound the diagnostic read so a hostile chunked 403 cannot make the proxy buffer
+// an arbitrary response merely to decide whether it should quarantine an account.
+async function readErrorBody(body, limit = ERROR_BODY_INSPECTION_LIMIT) {
+  if (!body) return Buffer.alloc(0);
+  const reader = body.getReader();
+  const chunks = [];
+  let length = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) return Buffer.concat(chunks, length);
+      length += value.byteLength;
+      if (length > limit) {
+        await reader.cancel();
+        return null;
+      }
+      chunks.push(Buffer.from(value));
+    }
+  } catch {
+    await reader.cancel().catch(() => {});
+    return null;
+  } finally {
+    reader.releaseLock();
+  }
+}
 
 // Response header names that are connection-specific and thus illegal on an
 // HTTP/2 response (Node's Http2ServerResponse.writeHead rejects them). Also
@@ -1209,13 +1249,24 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       : rejected.size === accountManager.accounts.length);
     if (allRefused) {
       const names = [...rejected].map(n => `"${n}"`).join(', ');
+      const entitlementDenied = ctx.entitlementDenied;
+      const allEntitlementDenied = entitlementDenied?.size === rejected.size
+        && [...rejected].every(name => entitlementDenied.has(name));
+      let message;
+      if (allEntitlementDenied && ctx.pinnedIndex != null) {
+        message = `No account served this request. The pinned account ${names} returned OAuth entitlement denial (${OAUTH_ENTITLEMENT_ERROR_CODE}). An explicit pin targets that account exactly; choose a different eligible account or change its organization's OAuth policy.`;
+      } else if (allEntitlementDenied) {
+        message = `No account served this request. Every configured account returned OAuth entitlement denial (${OAUTH_ENTITLEMENT_ERROR_CODE}): ${names}. TeamClaude temporarily removed them from automatic rotation; retry after the cooldown or pin a different eligible account.`;
+      } else {
+        message = `Upstream refused the credential for account ${names} (403). Check the account, then re-add it with: teamclaude login`;
+      }
       ctx.status = 502;
       ctx.account = `(${[...rejected].join(', ')} refused)`;
       if (!res.headersSent) {
         res.writeHead(502, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           type: 'error',
-          error: { type: 'proxy_error', message: `Upstream refused the credential for account ${names} (403). Check the account, then re-add it with: teamclaude login` },
+          error: { type: 'proxy_error', message },
         }));
       }
       return;
@@ -1361,6 +1412,15 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // then released so streaming bodies don't tie up concurrency. Fail-open: a
     // client that disconnects while waiting just drops out.
     if (!await accountManager.admit(account.index, () => clientGone(res))) return;
+    // This request may have selected the account before another in-flight request
+    // observed an entitlement denial. Re-check after admission, when the queued
+    // request is about to send, so the cooldown also drains that preselected
+    // backlog. Explicit caller pins still target exactly the requested account.
+    if (ctx.pinnedIndex == null && retryCount < maxRetries && accountManager.isEntitlementDenied(account.index)) {
+      accountManager.release(account.index);
+      ctx.tried.add(account.index);
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+    }
     let upstreamRes;
     try {
       upstreamRes = await upstreamFetch(upstreamUrl, {
@@ -1495,13 +1555,23 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // in. Skip the account for the rest of this request and fail over. With no
     // account left, the no-account branch reports a proxy error instead.
     if (upstreamRes.status === 403 && !res.headersSent) {
-      await upstreamRes.body?.cancel();
+      const responseBody = await readErrorBody(upstreamRes.body);
+      const entitlementDenied = account.type === 'oauth'
+        && responseBody != null
+        && isOAuthEntitlementDenied(responseBody);
+      const deniedUntil = entitlementDenied
+        ? accountManager.markEntitlementDenied(account.index)
+        : null;
       // A set, not a name: the no-account branch needs to tell "every account was
       // refused" (fail fast, nothing to wait for) from "this one was, others are
       // just out of quota" (still worth holding for a reset).
       (ctx.credentialRejected ??= new Set()).add(account.name);
+      if (entitlementDenied) (ctx.entitlementDenied ??= new Set()).add(account.name);
       ctx.tried.add(account.index);
-      console.error(`[TeamClaude] 403 on "${account.name}" — upstream refused the account credential`);
+      const cooldown = deniedUntil
+        ? `; OAuth entitlement cooldown until ${new Date(deniedUntil).toISOString()}`
+        : '';
+      console.error(`[TeamClaude] 403 on "${account.name}"; upstream refused the account credential${cooldown}`);
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
 
@@ -1802,8 +1872,9 @@ export function rewriteModel(body, modelMap) {
 function computeRetryAfter(accounts) {
   let soonest = Infinity;
   for (const acct of accounts) {
-    const reset = acct.rateLimitedUntil || acct.quota.resetsAt;
-    if (reset) {
+    const resets = [acct.rateLimitedUntil, acct.entitlementDeniedUntil, acct.quota.resetsAt]
+      .filter(Boolean);
+    for (const reset of resets) {
       const ms = new Date(reset).getTime() - Date.now();
       if (ms < soonest) soonest = ms;
     }

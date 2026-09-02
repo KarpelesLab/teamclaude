@@ -138,6 +138,11 @@ function formatAccountStatus(account, now, paint) {
     parts.push(`throttle ${formatDuration(throttleAt - now)}`);
   }
 
+  const entitlementAt = parseTs(account.entitlementDeniedUntil);
+  if (entitlementAt && entitlementAt > now) {
+    parts.push(paint.yellow(`entitlement cooldown ${formatDuration(entitlementAt - now)}`));
+  }
+
   return parts.join(' / ');
 }
 
