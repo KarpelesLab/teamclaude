@@ -44,6 +44,20 @@ test('renderStatus shows the sessions line and per-account session count when pr
   assert.match(output, /a \(oauth, prio 0\).*2 sess/);
 });
 
+test('renderStatus reports a draining distribution toggle instead of single-account', () => {
+  const status = sampleStatus();
+  status.sessions = { known: 3, active: 2, perAccount: { 0: 2 }, distribute: false, draining: 2 };
+  const output = renderStatus(status, { color: false, now });
+  assert.match(output, /Sessions\s+2 active \/ 3 known · draining 2/);
+});
+
+test('renderStatus says single-account once the drain has finished', () => {
+  const status = sampleStatus();
+  status.sessions = { known: 3, active: 2, perAccount: { 0: 2 }, distribute: false, draining: 0 };
+  const output = renderStatus(status, { color: false, now });
+  assert.match(output, /Sessions\s+2 active \/ 3 known · single-account/);
+});
+
 test('renderStatus omits the sessions line when the status has no sessions field', () => {
   const output = renderStatus(sampleStatus(), { color: false, now });
   assert.doesNotMatch(output, /Sessions\s/);

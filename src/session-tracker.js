@@ -102,6 +102,19 @@ export class SessionTracker {
     return n;
   }
 
+  // Ids of every known (non-expired) session that carries a pin. Snapshotted when
+  // session distribution is turned off, so those sessions can be drained on their
+  // existing accounts while new ones route by plain rotation. Expired-on-read
+  // entries are dropped, same as pinnedAccount.
+  pinnedSessionIds(now = this._now()) {
+    const ids = [];
+    for (const [id, s] of this.sessions) {
+      if (this._isExpired(s, now)) { this.sessions.delete(id); continue; }
+      if (s.accountIndex != null) ids.push(id);
+    }
+    return ids;
+  }
+
   // Drop sessions idle longer than the known window (but never one still in flight).
   sweep(now = this._now()) {
     this._lastSweep = now;

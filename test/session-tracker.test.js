@@ -128,3 +128,22 @@ test('stats sweeps forgotten sessions out of the map', () => {
   assert.equal(st.sessions.has('old'), false);
   assert.equal(st.sessions.has('new'), true);
 });
+
+test('pinnedSessionIds lists pinned sessions and skips unpinned ones', () => {
+  const { clock, now } = fixedClock();
+  const st = new SessionTracker({ now });
+  st.touch('pinned-a', 0, clock.t);
+  st.touch('pinned-b', 1, clock.t);
+  st.beginRequest('no-pin', clock.t); // seen, but never served by an account
+  assert.deepEqual(st.pinnedSessionIds(clock.t).sort(), ['pinned-a', 'pinned-b']);
+});
+
+test('pinnedSessionIds drops forgotten sessions as it reads', () => {
+  const { clock, now } = fixedClock();
+  const st = new SessionTracker({ now });
+  st.touch('old', 0, clock.t);
+  clock.t += SESSION_KNOWN_TTL_MS + 1;
+  st.touch('fresh', 1, clock.t);
+  assert.deepEqual(st.pinnedSessionIds(clock.t), ['fresh']);
+  assert.equal(st.sessions.has('old'), false);
+});

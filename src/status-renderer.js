@@ -111,11 +111,17 @@ function renderAccountHeader(account, currentAccount, paint, now) {
   return `${marker} ${name} ${paint.dim(`(${account.type}, prio ${account.priority || 0})`)} ${status}${org}${sess}`;
 }
 
-// "2 active / 3 known · distributing" — the running-sessions readout.
+// "2 active / 3 known · distributing" — the running-sessions readout. While a
+// distribution toggle drains, say so and how many sessions are left to finish,
+// so "single-account" is not claimed before it is actually true.
 function formatSessions(sessions, paint) {
   const active = sessions.active || 0;
   const known = sessions.known || 0;
-  const mode = sessions.distribute ? paint.green('distributing') : paint.dim('single-account');
+  const draining = sessions.draining || 0;
+  let mode;
+  if (sessions.distribute) mode = paint.green('distributing');
+  else if (draining) mode = paint.yellow(`draining ${draining}`);
+  else mode = paint.dim('single-account');
   return `${active} active / ${known} known ${paint.dim('·')} ${mode}`;
 }
 

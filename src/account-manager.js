@@ -141,6 +141,9 @@ export class AccountManager {
     // accounts by load instead of funnelling them all onto the current one.
     this.sessionTracker = sessionTracker || new SessionTracker();
     this.distributeSessions = !!distributeSessions;
+    // Sessions still being drained after distribution was turned off (see
+    // setDistributeSessions). null = not draining; a Set of session ids otherwise.
+    this._drainingSessions = null;
     // Ephemeral per-route manual pins (routeName → account index). Not persisted:
     // like the global manual switch (currentIndex) these are runtime overrides that
     // bias selection for a route's models and reset on restart. A pinned account
@@ -293,9 +296,17 @@ export class AccountManager {
     // account. Only when enabled, only for a real session, and only outside a
     // manual route pin (which must still win). Falls through to the normal walk
     // if nothing session-eligible is found (e.g. the whole tier is exhausted).
-    if (this.distributeSessions && sessionId && !this._pinnedAccountForModel(model, advisorModel)) {
-      const acc = this._selectForSession(sessionId, exclude, model, advisorModel);
-      if (acc) return acc;
+    if (sessionId && !this._pinnedAccountForModel(model, advisorModel)) {
+      if (this.distributeSessions) {
+        const acc = this._selectForSession(sessionId, exclude, model, advisorModel);
+        if (acc) return acc;
+      } else if (this._isDrainingSession(sessionId)) {
+        // Distribution was just turned off. Sessions that already existed keep
+        // their account so the prompt cache they built there survives; everything
+        // else falls through to the normal quota-driven walk below.
+        const acc = this._selectDrainingSession(sessionId, exclude, model, advisorModel);
+        if (acc) return acc;
+      }
     }
     if (advisorModel) {
       const account = this._select(exclude, model, advisorModel, false);
@@ -423,7 +434,7 @@ export class AccountManager {
 
   /** { known, active, perAccount } session counts for status/TUI. */
   sessionStats() {
-    return this.sessionTracker.stats();
+    return { ...this.sessionTracker.stats(), draining: this.drainingCount() };
   }
 
   /**
@@ -668,10 +679,83 @@ export class AccountManager {
   }
 
   /** Session-distribution toggle (issue #109), applied live on config reload.
-   *  Existing session pins survive a toggle: the flag gates only how NEW
-   *  sessions are routed. */
-  setDistributeSessions(enabled) {
-    this.distributeSessions = !!enabled;
+   *
+   *  Turning it OFF drains rather than cuts. A hard flip moves every distributed
+   *  session to the current account on its very next request: each one loses the
+   *  prompt cache it built on its old account, and they all arrive at one account
+   *  together. So the sessions that exist at the flip are snapshotted and keep
+   *  their accounts, while new sessions route by plain rotation — affinity winds
+   *  down as those sessions finish. Pass { drain: false } for an immediate cut.
+   *
+   *  Turning it ON cancels any drain in progress. */
+  setDistributeSessions(enabled, { drain = true } = {}) {
+    const on = !!enabled;
+    if (on) {
+      this.distributeSessions = true;
+      this._drainingSessions = null;
+      return;
+    }
+    // Only a true → false transition drains; re-applying "off" (every config
+    // reload while it is already off) must not resurrect affinity for sessions
+    // that have since been routed by plain rotation.
+    if (this.distributeSessions && drain) {
+      const ids = this.sessionTracker.pinnedSessionIds();
+      this._drainingSessions = ids.length ? new Set(ids) : null;
+    } else if (!drain) {
+      this._drainingSessions = null;
+    }
+    this.distributeSessions = false;
+  }
+
+  /** Is this session one of the ones still being drained onto its old account? */
+  _isDrainingSession(sessionId) {
+    this._pruneDrain();
+    return !!this._drainingSessions?.has(sessionId);
+  }
+
+  /** Drop sessions the tracker has forgotten, and end the drain once it empties,
+   *  so the manager returns to a plain "off" state without needing a restart.
+   *  Unthrottled on purpose: the set only exists during a transient drain and is
+   *  bounded by the number of live sessions. */
+  _pruneDrain() {
+    if (!this._drainingSessions) return;
+    for (const id of this._drainingSessions) {
+      // pinnedAccount() returns null for a forgotten session (and evicts it).
+      if (this.sessionTracker.pinnedAccount(id) == null) this._dropDraining(id);
+    }
+  }
+
+  /** Let one session out of the drain, ending the drain when it was the last. */
+  _dropDraining(sessionId) {
+    if (!this._drainingSessions) return;
+    this._drainingSessions.delete(sessionId);
+    if (this._drainingSessions.size === 0) this._drainingSessions = null;
+  }
+
+  /** Honour a draining session's existing pin — and only that. Unlike
+   *  _selectForSession there is no least-loaded fallback: distribution is being
+   *  wound down, so a session that cannot stay put rejoins the normal walk. */
+  _selectDrainingSession(sessionId, exclude, model, advisorModel) {
+    const pinIdx = this.sessionTracker.pinnedAccount(sessionId);
+    if (pinIdx != null) {
+      const pinned = this.accounts[pinIdx];
+      if (pinned && this._isAvailable(pinned, model, advisorModel) && !exclude?.has(pinIdx)) {
+        // Mirror _select's priority preemption, as _selectForSession does.
+        const betterExists = this.accounts.some(a =>
+          this._isAvailable(a, model, advisorModel) && !exclude?.has(a.index) && (a.priority || 0) < (pinned.priority || 0));
+        if (!betterExists) return pinned;
+      }
+    }
+    // The pin is gone or no longer usable: this session has to move anyway, so
+    // let it out of the drain now instead of re-checking a dead pin every request.
+    this._dropDraining(sessionId);
+    return null;
+  }
+
+  /** How many sessions are still draining (0 when not draining). */
+  drainingCount() {
+    this._pruneDrain();
+    return this._drainingSessions?.size || 0;
   }
 
   /**
@@ -1530,7 +1614,7 @@ export class AccountManager {
       currentAccount: this.accounts[this.currentIndex]?.name,
       switchThreshold: this.switchThreshold,
       routes: this.getRoutes(),
-      sessions: { ...sessions, distribute: this.distributeSessions },
+      sessions: { ...sessions, distribute: this.distributeSessions, draining: this.drainingCount() },
       accounts: this.accounts.map(a => ({
         name: a.name,
         type: a.type,
