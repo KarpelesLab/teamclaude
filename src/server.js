@@ -1,7 +1,7 @@
 import http from 'node:http';
 import https from 'node:https';
 import { timingSafeEqual } from 'node:crypto';
-import { createWriteStream } from 'node:fs';
+import { createWriteStream, writeSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { ensureCerts, createConnectHandler } from './mitm.js';
@@ -192,7 +192,10 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
 
       return forward(req, res);
     } catch (err) {
-      console.error('[TeamClaude] Unhandled error:', err);
+      reportFailure('[TeamClaude] Unhandled error:', err);
+      // The window above throws for real: `getStatusExtra` is a hook the
+      // application installs, and reload/switch reach the account manager.
+      answerUnhandled(res);
     }
   };
 
@@ -300,6 +303,30 @@ export function resolveAccountPin(accountManager, token) {
   return null;
 }
 
+/**
+ * What actually went wrong on a failed connect, as a string worth printing.
+ *
+ * Node's happy-eyeballs dialer (`autoSelectFamily`, on by default across the
+ * versions this package supports; `package.json` declares `node >=20`, measured
+ * here on 24) reports a connect where every address failed as an AggregateError.
+ * Node builds that error with an empty `message`; the per-address reasons are in
+ * `.errors`. Any multi-address host reaches this, and the upstream is one, so
+ * `err.message` prints nothing for the failure operators most need to read.
+ *
+ * Looked for one level down as well, because `TEAMCLAUDE_UPSTREAM_GLOBAL_FETCH`
+ * routes through global fetch, which wraps the same failure in a TypeError whose
+ * own message is the equally unhelpful "fetch failed".
+ *
+ * The `err.message` fallback is required: with `autoSelectFamily` off, and on
+ * every single-address failure, the reason arrives as a plain Error in
+ * `message`. It also covers a wrapper whose `.cause` carries no reasons.
+ */
+export function describeConnectError(err) {
+  const reasons = (e) => (Array.isArray(e?.errors) ? e.errors.map(c => c?.message).filter(Boolean) : []);
+  const own = reasons(err);
+  return (own.length ? own : reasons(err?.cause)).join('; ') || err?.message;
+}
+
 // Paths that must reach upstream with the client's own credential (never a
 // rotated account token): the Remote Control channel and attachment transfers.
 // teamclaude applies its account logic (rotation, exhaustion, token injection)
@@ -338,7 +365,7 @@ export function relayHttpForward(req, res) {
     upstreamRes.pipe(res);
   });
   upstreamReq.on('error', (err) => {
-    console.error(`[TeamClaude] HTTP forward to ${target.host} failed:`, err.message);
+    console.error(`[TeamClaude] HTTP forward to ${target.host} failed:`, describeConnectError(err));
     if (!res.headersSent) {
       res.writeHead(502, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Upstream unreachable' } }));
@@ -361,6 +388,12 @@ const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/files/', '/api/oauth/f
 export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null, egress = null }) {
   let counter = 0;
   return async (req, res) => {
+    // The activity entry this request opened, while it is still open. Every
+    // consumer holds the row until it is told the request ended, so exactly one
+    // path must close it. Each closing site clears this first, which is how the
+    // outer catch tells an entry it still has to account for from one that is
+    // already closed.
+    let openEntry = null;
     try {
       // Claude Code's telemetry (`/api/event_logging/*`) is high-volume noise in
       // the activity log. `config.eventLogging` (read live so the TUI toggle takes
@@ -382,8 +415,8 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // rather than per-account: it is a property of the connection, and this is
       // the one path every request takes, MITM included.
       if (egress?.enabled()) {
-        const state = await egress.waitUntilPinned({ isAborted: () => res.destroyed });
-        if (res.destroyed) return;
+        const state = await egress.waitUntilPinned({ isAborted: () => clientGone(res) });
+        if (clientGone(res)) return;
         if (!state.ok) {
           res.writeHead(503, { 'Content-Type': 'application/json', 'retry-after': '30' });
           res.end(JSON.stringify({
@@ -423,14 +456,23 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // The token runs to the next '/', which also begins the real request path.
       const tokenEnd = afterPrefix == null ? -1 : afterPrefix.indexOf('/');
       if (tokenEnd > 0) {
-        const token = decodeURIComponent(afterPrefix.slice(0, tokenEnd));
-        pinnedIndex = resolveAccountPin(accountManager, token);
+        // The escaping of this segment is the CLIENT's, so a malformed one
+        // ("/tc-acct/%/v1/messages") makes decodeURIComponent throw URIError.
+        // That is an ordinary bad request, not an internal error: decode
+        // defensively and fall through to the unknown-pin 404 below, which is
+        // what a pin nobody can resolve already means. An undecodable token is
+        // reported as it arrived, since there is no decoded form to name.
+        const raw = afterPrefix.slice(0, tokenEnd);
+        let token = null;
+        try { token = decodeURIComponent(raw); } catch { token = null; }
+        pinnedIndex = token == null ? null : resolveAccountPin(accountManager, token);
         if (pinnedIndex == null) {
+          const shown = token ?? raw;
           const reqId = ++counter;
           const sessionId = req.headers['x-claude-code-session-id'] || null;
-          if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(unknown pin: "${token}")`, status: 404, model: null, sessionId, pinned: false });
+          if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(unknown pin: "${shown}")`, status: 404, model: null, sessionId, pinned: false });
           res.writeHead(404, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: `Unknown account pin "${token}"` } }));
+          res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: `Unknown account pin "${shown}"` } }));
           return;
         }
         req.url = afterPrefix.slice(tokenEnd);
@@ -459,7 +501,15 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // /v1/messages and count_tokens). Read from headers up front so it drives
       // session-aware routing (issue #109) and colors the TUI activity stream.
       const sessionId = req.headers['x-claude-code-session-id'] || null;
-      if (!hideActivity) hooks.onRequestStart?.(reqId, { method: req.method, path: req.url, sessionId, pinned: pinnedIndex != null });
+      if (!hideActivity) {
+        // Marked open BEFORE the hook runs. The shipped TUI hook registers its
+        // row and then renders, and the render can rethrow, so a hook that
+        // throws part way through has already opened a row that something must
+        // close. The cost of this order is one spurious close if the hook threw
+        // before registering anything, which every consumer already tolerates.
+        openEntry = { reqId, sessionId };
+        hooks.onRequestStart?.(reqId, { method: req.method, path: req.url, sessionId, pinned: pinnedIndex != null });
+      }
 
       // Buffer request body (needed to resend on a different account after a 429).
       // Peek the top-level `model` field incrementally as chunks arrive so the
@@ -493,6 +543,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: `Model "${model}" is blocked by teamclaude (matched "${blockedBy}").` } }));
         }
+        openEntry = null;   // this path owns the close below; the outer catch must not repeat it
         hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: '(blocked)', status: 400, model, sessionId });
         return;
       }
@@ -506,19 +557,134 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir, sx);
       } catch (err) {
         ctx.status = ctx.status || 502;
-        console.error('[TeamClaude] Unhandled error:', err);
+        // Same rule as the two outer catches: a recovery path does not report
+        // through a console that may be the thing that failed. Here it also
+        // decides which error gets reported at all, since a throw from the
+        // report would carry the render failure outward in place of this one.
+        reportFailure('[TeamClaude] Unhandled error:', err);
         if (!res.headersSent) {
           res.writeHead(502, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Internal proxy error' } }));
         }
       } finally {
         accountManager.endSession(sessionId);
+        // Cleared BEFORE the hook, because the hook can throw: leaving the entry
+        // marked open would send the outer catch to call that same throwing hook
+        // a second time for one request.
+        openEntry = null;
         if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, sessionId, pinned: ctx.pinnedIndex != null });
       }
     } catch (err) {
-      console.error('[TeamClaude] Unhandled error:', err);
+      reportFailure('[TeamClaude] Unhandled error:', err);
+      // Close the activity entry. Only the inner path has a `finally`, so a
+      // throw above it opens a row that nothing else will ever close, and every
+      // consumer holds an open row indefinitely: the TUI keeps it in `active`
+      // and never idles its animation, a headless consumer's in-flight count
+      // grows by one. `for await (const chunk of req)` rejects when a client
+      // cancels mid-body, which Ctrl+C in Claude Code does, on a daemon that
+      // runs for weeks.
+      if (openEntry) {
+        // 499 when nothing was sent and nothing will be, either because the
+        // client is gone or because the response is past the point of saying
+        // anything; 502 is what the answer below is about to write.
+        const status = res.headersSent || clientGone(res) ? 499 : 502;
+        const entry = openEntry;
+        openEntry = null;
+        // Guarded, because the throw that landed here may be this hook. Escaping
+        // this catch means escaping an async request listener with nothing above
+        // it, which is an unhandled rejection, and crash-log.js turns that into
+        // exit(1). A broken activity hook must not take the daemon down, and it
+        // must not cost the socket its answer below either.
+        try {
+          hooks.onRequestEnd?.(entry.reqId, {
+            method: req.method, path: req.url, account: null, status,
+            model: null, sessionId: entry.sessionId, pinned: false,
+          });
+        } catch (hookErr) {
+          reportFailure('[TeamClaude] activity hook failed while closing a request:', hookErr);
+        }
+      }
+      // The code above the inner try (the egress hold, the pin parsing, body
+      // buffering, the activity hooks) runs outside the 502 that guards
+      // forwardRequest, and the inner `finally` calls onRequestEnd after the
+      // response has streamed.
+      answerUnhandled(res);
     }
   };
+}
+
+/**
+ * Report a failure without depending on the console to survive it.
+ *
+ * Under the TUI the console is the TUI: `console.error` appends to the activity
+ * log and repaints, so a render that throws makes `console.error` throw. That
+ * matters because these reports are the FIRST statement of the paths that
+ * recover from a throw, and the throw being recovered from is often the same
+ * broken render. An unguarded report there skips the whole recovery.
+ *
+ * Falls back to stderr rather than swallowing, so a render bug still leaves a
+ * diagnostic. The TUI already does this when its own activity stream fails.
+ *
+ * `writeSync` rather than `process.stderr.write`, because the fallback has to
+ * fail the way this function promises to. A closed stderr makes the stream
+ * surface EPIPE asynchronously, as an error event no `try` around the call can
+ * see, and this daemon treats an uncaught EPIPE as fatal. `writeSync` throws
+ * where it is called, so the catch below is real.
+ */
+function reportFailure(...args) {
+  try {
+    console.error(...args);
+  } catch {
+    try {
+      writeSync(2, `${args.map(a => a?.stack || String(a)).join(' ')}\n`);
+    } catch { /* nothing left to report with */ }
+  }
+}
+
+/**
+ * Has the client gone away?
+ *
+ * `res.destroyed` answers that on the base HTTP/1 listener and not on the MITM
+ * one: `Http2ServerResponse` has no `destroyed` property at all, so the read is
+ * `undefined` and the question is answered "no" for every h2 request, on the
+ * path that carries most of the traffic. The h2 equivalent lives on the
+ * underlying stream.
+ *
+ * Asked wherever the answer decides whether to spend something the client will
+ * never receive. On the retry ladder that is an upstream call and a slice of an
+ * account's weekly quota per rung, which is the opposite of what rotation is
+ * for. In practice the ladder is cut short by the abort probe handed to
+ * `admit()`, which is polled while a request waits for a concurrency slot; the
+ * reads on the individual rungs are the backstop for a request that never
+ * waited.
+ *
+ * In `streamResponse` the cost is the handler itself. Writing to a cancelled
+ * stream returns false, and the backpressure wait below then listens for a
+ * `drain` or a `close` that has already happened and will not happen again, so
+ * the handler never returns and its activity entry never closes.
+ */
+function clientGone(res) {
+  return !!res.destroyed || !!res.stream?.destroyed;
+}
+
+/**
+ * The last response an outer catch can send. Three states:
+ *
+ *   - Nothing written yet: send a 502. Guarded on headersSent, because a second
+ *     writeHead raises ERR_HTTP_HEADERS_SENT from inside the catch.
+ *   - Headers sent, body unfinished: destroy. There is no status left to send,
+ *     and end() would present the truncated bytes as a complete reply.
+ *   - Response already ended: leave it alone, the client has its answer.
+ *
+ * `forwardRequest`'s own catch already carries the same pair of arms.
+ */
+function answerUnhandled(res) {
+  if (!res.headersSent && !clientGone(res)) {
+    res.writeHead(502, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Internal proxy error' } }));
+  } else if (!res.writableEnded) {
+    res.destroy();
+  }
 }
 
 // Per-request https.Agent tunneled through sx.org — one-shot (no keep-alive
@@ -565,13 +731,27 @@ function relayStream(req, res, upstream, sx) {
     }
     res.writeHead(upstreamRes.statusCode, responseHeaders);
     upstreamRes.pipe(res);
+    // pipe() only propagates 'end'. If the upstream leg dies mid-response
+    // (network blip, upstream restart), upstreamRes emits 'aborted'/'error'
+    // and the pipe just stops — the client's long-poll stays open forever and
+    // the CLI keeps waiting on a channel that can no longer deliver events.
+    // Destroying res closes the client socket, which is the one signal its
+    // reconnect logic reacts to.
+    upstreamRes.on('aborted', () => res.destroy());
+    upstreamRes.on('error', () => res.destroy());
   });
 
   upstreamReq.on('error', (err) => {
-    console.error('[TeamClaude] Remote Control relay error:', err.message);
+    console.error('[TeamClaude] Remote Control relay error:', describeConnectError(err));
     if (!res.headersSent) {
       res.writeHead(502, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Upstream unreachable' } }));
+    } else {
+      // Headers already went out (the long-poll was live), so a 502 body can't
+      // be written anymore. Close the client socket instead of leaving it
+      // half-dead: seen in production as a `socket hang up` logged here while
+      // the CLI's Remote Control stream silently waited on it for 45+ minutes.
+      res.destroy();
     }
   });
   // Client disconnected (e.g. Claude Code closed the channel): tear down the
@@ -636,7 +816,7 @@ export function relayUpgrade(req, socket, head, upstream, sx) {
   });
 
   upstreamReq.on('error', (err) => {
-    console.error('[TeamClaude] Remote Control WebSocket relay error:', err.message);
+    console.error('[TeamClaude] Remote Control WebSocket relay error:', describeConnectError(err));
     socket.destroy();
   });
   socket.on('error', () => upstreamReq.destroy());
@@ -676,7 +856,7 @@ async function relayRaw(req, res, upstream, sx) {
     res.writeHead(upstreamRes.status, responseHeaders);
     res.end(responseBody);
   } catch (err) {
-    console.error('[TeamClaude] Raw relay error:', err.message);
+    console.error('[TeamClaude] Raw relay error:', describeConnectError(err));
     if (!res.headersSent) {
       res.writeHead(502, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Upstream unreachable' } }));
@@ -869,7 +1049,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       ctx.holdBudgetMs -= waitMs;
       console.log(`[TeamClaude] All accounts exhausted — holding connection, retry in ${Math.ceil(waitMs / 1000)}s (${Math.ceil(ctx.holdBudgetMs / 1000)}s budget left)`);
       await new Promise(resolve => setTimeout(resolve, waitMs));
-      if (res.destroyed) return;
+      if (clientGone(res)) return;
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
     }
 
@@ -878,7 +1058,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       ctx.exhaustedRetries = exhaustedRetries + 1;
       console.log(`[TeamClaude] All accounts exhausted — waiting ${retryAfter}s before retry`);
       await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
-      if (res.destroyed) return;
+      if (clientGone(res)) return;
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
     }
     res.writeHead(429, {
@@ -972,7 +1152,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // only until the response headers arrive — long enough to stagger the burst,
     // then released so streaming bodies don't tie up concurrency. Fail-open: a
     // client that disconnects while waiting just drops out.
-    if (!await accountManager.admit(account.index, () => res.destroyed)) return;
+    if (!await accountManager.admit(account.index, () => clientGone(res))) return;
     let upstreamRes;
     try {
       upstreamRes = await upstreamFetch(upstreamUrl, {
@@ -1033,7 +1213,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
           accountManager.markRateLimited(account.index, hold);
         }
         ctx.tried.add(account.index);
-        if (res.destroyed) return;
+        if (clientGone(res)) return;
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
       }
 
@@ -1061,7 +1241,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // 429ing upstream can't loop forever through sx.
       if (switchingToSx && retryCount < maxRetries) {
         console.log(`[TeamClaude] 429 on "${account.name}" — retrying via sx.org (fresh egress IP)`);
-        if (res.destroyed) return;
+        if (clientGone(res)) return;
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, nextUseSx);
       }
 
@@ -1071,7 +1251,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       if (retryAfter <= RATE_LIMIT_ABSORB_MAX_SECONDS && retryCount < maxRetries) {
         console.log(`[TeamClaude] Rate-limit 429 on "${account.name}" — waiting ${retryAfter}s, retrying same account (no switch)`);
         await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
-        if (res.destroyed) return;
+        if (clientGone(res)) return;
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, nextUseSx);
       }
 
@@ -1080,7 +1260,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // The pause above keeps other requests off this account meanwhile.
       console.log(`[TeamClaude] Rate-limit 429 on "${account.name}" — retry-after ${retryAfter}s over inline cap; returning 429 to client (no switch)`);
       ctx.status = 429;
-      if (!res.headersSent && !res.destroyed) {
+      if (!res.headersSent && !clientGone(res)) {
         res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': String(retryAfter) });
         res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: `Rate limited; retry in ${retryAfter}s.` } }));
       }
@@ -1123,7 +1303,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       await upstreamRes.body?.cancel();
       console.log(`[TeamClaude] 401 on "${account.name}" — token rejected; forcing refresh and retrying`);
       await accountManager.ensureTokenFresh(account.index, true);
-      if (res.destroyed) return;
+      if (clientGone(res)) return;
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
 
@@ -1172,7 +1352,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       res.end(buf);
     }
   } catch (err) {
-    console.error(`[TeamClaude] Upstream error (account "${account.name}"):`, err.message);
+    console.error(`[TeamClaude] Upstream error (account "${account.name}"):`, describeConnectError(err));
 
     logRequestHead();
     const l = getLog();
@@ -1238,7 +1418,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       res.writeHead(502, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         type: 'error',
-        error: { type: 'proxy_error', message: `Upstream error: ${err.message}` },
+        error: { type: 'proxy_error', message: `Upstream error: ${describeConnectError(err)}` },
       }));
     } else if (!res.writableEnded) {
       // Error after headers were already sent (mid-stream) and it wasn't
@@ -1304,7 +1484,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
       if (done) break;
 
       // Client disconnected — stop reading from upstream
-      if (res.destroyed) break;
+      if (clientGone(res)) break;
 
       // Forward chunk immediately
       const ok = res.write(value);
@@ -1334,7 +1514,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
           res.once('drain', done);
           res.once('close', done);
         });
-        if (res.destroyed) break;
+        if (clientGone(res)) break;
       }
     }
 
