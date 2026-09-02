@@ -1,6 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { orgKey, sameIdentity, emailOf, matchAccounts, findUpsertTarget, distinctAccounts } from '../src/identity.js';
+import {
+  orgKey,
+  sameIdentity,
+  emailOf,
+  matchAccounts,
+  findUpsertTarget,
+  distinctAccounts,
+  canUpsertOAuthAccount,
+  oauthIdentityFields,
+} from '../src/identity.js';
 
 test('orgKey prefers orgUuid, falls back to orgName, else null', () => {
   assert.equal(orgKey({ orgUuid: 'u1', orgName: 'Acme' }), 'u1');
@@ -150,4 +159,33 @@ test('distinctAccounts: unknown identity on either side is never "different"', (
   assert.equal(distinctAccounts({ name: 'a' }, { name: 'a', accountUuid: 'u1' }), false);
   assert.equal(distinctAccounts({ accountUuid: 'u1' }, { accountUuid: 'u1', orgUuid: 'o1' }), false);
   assert.equal(distinctAccounts({ accountUuid: 'u1', orgUuid: 'o1' }, { accountUuid: 'u1', orgUuid: 'o2' }), true);
+});
+
+test('anonymous OAuth upsert requires an identifiable profile', () => {
+  assert.equal(canUpsertOAuthAccount(null, false), false);
+  assert.equal(canUpsertOAuthAccount({ error: 'expired token' }, false), false);
+  assert.equal(canUpsertOAuthAccount({}, false), false);
+  assert.equal(canUpsertOAuthAccount({ email: 'account@example.com' }, false), true);
+  assert.equal(canUpsertOAuthAccount({ accountUuid: 'account-uuid' }, false), true);
+});
+
+test('explicitly named OAuth upsert remains available without a profile', () => {
+  assert.equal(canUpsertOAuthAccount(null, true), true);
+  assert.equal(canUpsertOAuthAccount({ error: 'offline' }, true), true);
+});
+
+test('unavailable profile fields do not erase stored OAuth identity', () => {
+  const stored = { accountUuid: 'account-uuid', orgUuid: 'org-uuid', orgName: 'Example' };
+
+  assert.deepEqual({ ...stored, ...oauthIdentityFields({ error: 'offline' }) }, stored);
+  assert.deepEqual({ ...stored, ...oauthIdentityFields({ email: 'account@example.com' }) }, stored);
+  assert.deepEqual(oauthIdentityFields({
+    accountUuid: 'new-account',
+    orgUuid: 'new-org',
+    orgName: 'New Example',
+  }), {
+    accountUuid: 'new-account',
+    orgUuid: 'new-org',
+    orgName: 'New Example',
+  });
 });

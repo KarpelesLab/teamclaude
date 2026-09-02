@@ -213,3 +213,53 @@ test('re-importing the same account+org still updates in place', async () => {
   assert.equal(calls.added.length, 0);
   assert.equal(am.accounts[0].credential, 'fresh');
 });
+
+test('import with an unidentified profile adds no placeholder account', async () => {
+  const { tui, am, config, calls } = makeTUI();
+  tui._readCredentials = async () => ({
+    accessToken: 'invalid',
+    refreshToken: 'invalid-refresh',
+    expiresAt: Date.now() - 1,
+  });
+  tui._readProfile = async () => ({ error: 'expired token' });
+
+  await tui._doImport();
+
+  assert.equal(config.accounts.length, 1);
+  assert.equal(am.accounts.length, 1);
+  assert.equal(calls.added.length, 0);
+  assert.ok(tui.log.some(l => /Import refused: could not identify OAuth account/.test(l.msg)));
+});
+
+test('email-only profile re-import preserves known running identity', async () => {
+  const accounts = [{
+    name: 'a@x.com',
+    index: 0,
+    type: 'oauth',
+    credential: 'old',
+    accountUuid: 'u1',
+    orgUuid: 'o1',
+    orgName: 'Example',
+  }];
+  const { tui, am, config } = makeTUI({ accounts });
+  config.accounts = [{
+    name: 'a@x.com',
+    type: 'oauth',
+    accountUuid: 'u1',
+    orgUuid: 'o1',
+    orgName: 'Example',
+  }];
+  tui._readCredentials = async () => ({
+    accessToken: 'fresh',
+    refreshToken: 'fresh-refresh',
+    expiresAt: Date.now() + 3600_000,
+  });
+  tui._readProfile = async () => ({ email: 'a@x.com' });
+
+  await tui._doImport();
+
+  assert.equal(am.accounts[0].accountUuid, 'u1');
+  assert.equal(am.accounts[0].orgUuid, 'o1');
+  assert.equal(am.accounts[0].orgName, 'Example');
+  assert.equal(am.accounts[0].credential, 'fresh');
+});

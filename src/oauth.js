@@ -1,5 +1,5 @@
 import { readFile } from 'node:fs/promises';
-import { homedir } from 'node:os';
+import { homedir, userInfo } from 'node:os';
 import { randomBytes, createHash } from 'node:crypto';
 import { exec, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -12,13 +12,57 @@ const execFileAsync = promisify(execFile);
 const DEFAULT_CREDENTIALS_PATH = '~/.claude/.credentials.json';
 const KEYCHAIN_SERVICE = 'Claude Code-credentials';
 
+/** The login name whose Keychain item to prefer, or null where there isn't one. */
+function currentUsername() {
+  try { return userInfo().username || null; } catch { return null; }
+}
+
+/** Whether a Keychain payload actually carries a usable token. */
+function hasToken(raw) {
+  return Boolean(raw?.claudeAiOauth?.accessToken || raw?.accessToken);
+}
+
 /**
  * Read Claude Code credentials from the macOS Keychain, where Claude Code
  * stores them on darwin (there is no ~/.claude/.credentials.json on macOS).
+ *
+ * The service name is not unique. Claude Code has been observed leaving a stray
+ * `acct="unknown"` item that holds only `mcpOAuth` alongside the real
+ * `acct="<login name>"` one, and `find-generic-password -s NAME -w` returns
+ * whichever the Keychain yields first. Reading the stray item makes a machine
+ * with a perfectly good login look like it has no credentials at all, and the
+ * import fails with a "Keychain lookup failed" that sends people off to
+ * re-authenticate something that was never broken.
+ *
+ * So ask for the current user's item first, fall back to the service-only
+ * lookup, and take the first payload that actually carries a token — a present
+ * but blank `claudeAiOauth` (left behind by a logout) is skipped the same way.
  */
-async function readKeychainCredentials() {
-  const { stdout } = await execFileAsync('security', ['find-generic-password', '-s', KEYCHAIN_SERVICE, '-w']);
-  return JSON.parse(stdout.trim());
+export async function readKeychainCredentials({ exec = execFileAsync, username = currentUsername() } = {}) {
+  const base = ['find-generic-password', '-s', KEYCHAIN_SERVICE];
+  const lookups = username ? [[...base, '-a', username, '-w'], [...base, '-w']] : [[...base, '-w']];
+
+  let firstParsed = null;
+  let firstErr = null;
+
+  for (const args of lookups) {
+    let parsed;
+    try {
+      const { stdout } = await exec('security', args);
+      parsed = JSON.parse(stdout.trim());
+    } catch (err) {
+      firstErr ??= err;
+      continue;
+    }
+    if (hasToken(parsed)) return parsed;
+    firstParsed ??= parsed;
+  }
+
+  // Nothing had a token. Hand back whatever parsed so the caller's own
+  // "no credentials" reporting stays in charge, and only throw if every
+  // lookup failed outright.
+  if (firstParsed) return firstParsed;
+  throw firstErr ?? new Error(`no "${KEYCHAIN_SERVICE}" item found in the Keychain`);
 }
 
 /**
@@ -321,8 +365,13 @@ async function exchangeCodeForTokens(code, state, codeVerifier, redirectUri, tok
  * 1. A full callback URL with ?code= and ?state= parameters
  * 2. A code#state format (manual login success page)
  * 3. A raw authorization code (falls back to using expectedState if provided)
+ *
+ * A bare code carries no state, so the state check cannot run for that shape:
+ * the code is sent with `expectedState` unchecked. PKCE still binds the
+ * exchange to this process's code verifier, so a code obtained elsewhere is
+ * useless to it. Exported for tests.
  */
-function parseAuthCode(input, expectedState) {
+export function parseAuthCode(input, expectedState) {
   const trimmed = input.trim();
   if (!trimmed) return null;
 
