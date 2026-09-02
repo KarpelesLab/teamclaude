@@ -11,6 +11,11 @@ export { isFableModel, parseRequestModel, parseAdvisorModel } from './model.js';
 // when the token turned over, short enough that a genuinely bad new token
 // recovers on the next request rather than staying stuck.
 const FORCED_REFRESH_FLOOR_MS = 10_000;
+// An organization-level OAuth policy denial is not repaired by an immediate
+// retry. Keep the account out of automatic rotation long enough for other
+// members to serve, then re-admit it so an administrator's policy change is
+// discovered without a restart.
+const ENTITLEMENT_DENIAL_COOLDOWN_SECONDS = 5 * 60;
 
 // Quota fields that survive a restart: utilization levels and their reset
 // windows, learned passively from upstream responses. Transient/derived state
@@ -90,6 +95,10 @@ function makeAccount(acct, index) {
     },
     rateLimitedUntil: null,
     throttledAt: null,
+    // Organization policy can reject OAuth while the credential itself remains
+    // valid. This cross-request cooldown is intentionally ephemeral: unlike
+    // quota, it is a live routing observation and is re-learned after restart.
+    entitlementDeniedUntil: null,
     // Storm control (see admit/release): in-flight upstream requests and the
     // time this account last became the current one (starts a ramp window).
     inFlight: 0,
@@ -262,6 +271,35 @@ export class AccountManager {
     if (this.ramp.enabled) account.rampStartedAt = account.pausedUntil;
   }
 
+  /** Keep an OAuth-policy-denied account out of automatic rotation temporarily.
+   * Extend an existing cooldown, never shorten it. Returns the expiry timestamp,
+   * or null when the account is missing or the cooldown is disabled. */
+  markEntitlementDenied(index, seconds = ENTITLEMENT_DENIAL_COOLDOWN_SECONDS) {
+    const account = this.accounts[index];
+    if (!account) return null;
+    const duration = Number(seconds);
+    if (!Number.isFinite(duration) || duration <= 0) return null;
+    const until = Date.now() + duration * 1000;
+    account.entitlementDeniedUntil = Math.max(account.entitlementDeniedUntil || 0, until);
+    return account.entitlementDeniedUntil;
+  }
+
+  /** True while an account is in its OAuth entitlement cooldown. Expiry is
+   * consumed lazily so selection immediately re-admits it without a timer. */
+  _entitlementDenied(account, now = Date.now()) {
+    if (!account?.entitlementDeniedUntil) return false;
+    if (now < account.entitlementDeniedUntil) return true;
+    account.entitlementDeniedUntil = null;
+    console.log(`[TeamClaude] Account "${account.name}" entitlement cooldown expired, marking available`);
+    return false;
+  }
+
+  /** Public form used by the request path to re-check an account after waiting
+   * in storm-control admission. */
+  isEntitlementDenied(index, now = Date.now()) {
+    return this._entitlementDenied(this.accounts[index], now);
+  }
+
   /**
    * Get the best available account, rotating if the current one is near quota.
    * Returns null if all accounts are exhausted.
@@ -357,16 +395,31 @@ export class AccountManager {
    * back to the normal quota-driven walk. Does NOT record the pin — that happens
    * on the actual route (recordSession), so retries/failover re-pin naturally. */
   _selectForSession(sessionId, exclude, model, advisorModel) {
-    const pinIdx = this.sessionTracker.pinnedAccount(sessionId);
-    if (pinIdx != null) {
-      const pinned = this.accounts[pinIdx];
-      if (pinned && this._isAvailable(pinned, model, advisorModel) && !exclude?.has(pinIdx)) {
-        // Mirror _select's priority preemption so an operator's priority order
-        // still wins over a session's stickiness.
-        const betterExists = this.accounts.some(a =>
-          this._isAvailable(a, model, advisorModel) && !exclude?.has(a.index) && (a.priority || 0) < (pinned.priority || 0));
-        if (!betterExists) return pinned;
-      }
+    // The pin is per governing bucket, and this request is bound by the
+    // EXECUTOR's: one request goes to one account, so the executor's affinity is
+    // what binds it and the advisor's model is a constraint on that choice
+    // (_isAvailable, below) rather than a second key.
+    const pinIdx = this.sessionTracker.pinnedAccount(sessionId, this._weeklyBucketFor(model));
+    // The bucket's own pin first. Failing that, any account the session already
+    // sits on for another family: one session stays on one account unless that
+    // account cannot serve the request (the README's "pins it there"). Without
+    // this, a session's first request of a second family would go to
+    // _pickLeastLoaded, which counts the session's own pin as load and pushes
+    // the new family onto a sibling — splitting every mixed-model session
+    // across two accounts by construction, not only on a real diversion.
+    const candidates = [];
+    if (pinIdx != null) candidates.push(pinIdx);
+    for (const idx of this.sessionTracker.pinnedAccounts(sessionId)) {
+      if (!candidates.includes(idx)) candidates.push(idx);
+    }
+    for (const idx of candidates) {
+      const pinned = this.accounts[idx];
+      if (!pinned || !this._isAvailable(pinned, model, advisorModel) || exclude?.has(idx)) continue;
+      // Mirror _select's priority preemption so an operator's priority order
+      // still wins over a session's stickiness.
+      const betterExists = this.accounts.some(a =>
+        this._isAvailable(a, model, advisorModel) && !exclude?.has(a.index) && (a.priority || 0) < (pinned.priority || 0));
+      if (!betterExists) return pinned;
     }
     return this._pickLeastLoaded(exclude, model, advisorModel);
   }
@@ -405,9 +458,18 @@ export class AccountManager {
 
   /** Record that a session's request was served by an account (always on, even
    * when distribution is off — the readout is passive). This is what pins a
-   * session for future affinity. */
-  recordSession(sessionId, accountIndex) {
-    if (sessionId) this.sessionTracker.touch(sessionId, accountIndex);
+   * session for future affinity, for the weekly bucket this request spent.
+   *
+   * The executor's bucket only. An advisor sub-inference runs on the SAME
+   * account and spends its family's quota there too, but selection degrades to
+   * executor-only when no account is eligible for both models, and upstream
+   * then drops the advisor call — so the account may or may not have served
+   * that family, and only selection knows which. Claiming it here on a request
+   * that was degraded would pin a family to an account that never served it,
+   * quite possibly one that cannot. Unclaimed means the session routes that
+   * family afresh next request, which is what it did before it had a pin. */
+  recordSession(sessionId, accountIndex, model = null) {
+    if (sessionId) this.sessionTracker.touch(sessionId, accountIndex, this._weeklyBucketFor(model));
   }
 
   /** Mark a session request as in flight / finished. Paired around the whole
@@ -472,6 +534,9 @@ export class AccountManager {
     // whose token is broken — those are hard states, not stale guesses.
     if (account.disabled) return false;
     if (account.status === 'error' || account.status === 'exhausted') return false;
+    // A live entitlement cooldown is evidence, not a stale quota estimate. Do
+    // not let the all-unavailable probe path defeat it immediately.
+    if (this._entitlementDenied(account)) return false;
     // A 429 hold is respected verbatim at first, but a hold is a snapshot: the
     // 429 that armed it may itself have been transient (e.g. the retry burst
     // after a network flap), and while it lasts NOTHING revalidates it — so a
@@ -588,6 +653,10 @@ export class AccountManager {
 
     // Manually disabled accounts are skipped entirely until re-enabled.
     if (account.disabled) return false;
+
+    // A structured organization-policy 403 means this account cannot serve OAuth
+    // requests right now. Skip it across requests until the short cooldown ends.
+    if (this._entitlementDenied(account)) return false;
 
     // Check rate limit expiry
     if (account.status === 'throttled' && account.rateLimitedUntil) {
@@ -1489,6 +1558,9 @@ export class AccountManager {
       if (idx === index) this.routeCursors.delete(name);
       else if (idx > index) this.routeCursors.set(name, idx - 1);
     }
+    // Session pins are positions in the same list and shift the same way.
+    this.sessionTracker.remapAccounts(idx =>
+      (idx === index ? null : idx > index ? idx - 1 : idx));
   }
 
   /**
@@ -1546,6 +1618,9 @@ export class AccountManager {
           : null,
         pausedUntil: a.pausedUntil && a.pausedUntil > Date.now()
           ? new Date(a.pausedUntil).toISOString()
+          : null,
+        entitlementDeniedUntil: a.entitlementDeniedUntil && a.entitlementDeniedUntil > Date.now()
+          ? new Date(a.entitlementDeniedUntil).toISOString()
           : null,
       })),
     };

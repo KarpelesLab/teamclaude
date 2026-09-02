@@ -28,6 +28,46 @@ const INLINE_RETRY_AFTER_MAX_SECONDS = 15;
 // the account so concurrent requests wait, then retries the same account.
 const RATE_LIMIT_ABSORB_MAX_SECONDS =
   Number(process.env.TEAMCLAUDE_RATE_LIMIT_ABSORB_MAX_SECONDS) || 60;
+const OAUTH_ENTITLEMENT_ERROR_CODE = 'oauth_not_allowed_for_organization';
+const ERROR_BODY_INSPECTION_LIMIT = 64 * 1024;
+
+/** Classify only the structured organization-policy denial observed upstream.
+ * Message text and generic permission errors are deliberately not enough. */
+export function isOAuthEntitlementDenied(body) {
+  try {
+    const parsed = JSON.parse(Buffer.from(body).toString('utf8'));
+    return parsed?.error?.details?.error_code === OAUTH_ENTITLEMENT_ERROR_CODE;
+  } catch {
+    return false;
+  }
+}
+
+// Error payloads are normally tiny, but an alternate upstream is configurable.
+// Bound the diagnostic read so a hostile chunked 403 cannot make the proxy buffer
+// an arbitrary response merely to decide whether it should quarantine an account.
+async function readErrorBody(body, limit = ERROR_BODY_INSPECTION_LIMIT) {
+  if (!body) return Buffer.alloc(0);
+  const reader = body.getReader();
+  const chunks = [];
+  let length = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) return Buffer.concat(chunks, length);
+      length += value.byteLength;
+      if (length > limit) {
+        await reader.cancel();
+        return null;
+      }
+      chunks.push(Buffer.from(value));
+    }
+  } catch {
+    await reader.cancel().catch(() => {});
+    return null;
+  } finally {
+    reader.releaseLock();
+  }
+}
 
 // Response header names that are connection-specific and thus illegal on an
 // HTTP/2 response (Node's Http2ServerResponse.writeHead rejects them). Also
@@ -53,9 +93,56 @@ export function isLoopbackAddr(addr) {
   return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1';
 }
 
-export function createProxyServer(accountManager, config, hooks = {}, sx = null) {
+/**
+ * Which identity a presented key authenticates as, checked against the shared
+ * `proxy.apiKey` and every `proxy.clientKeys` entry ({ name, key }).
+ *
+ * Returns { ok, client }: ok=false → reject; `client` is the matching entry's
+ * name (per-client usage is booked against it), or null for the shared key —
+ * the shared key predates client identities and stays unattributed rather than
+ * inventing one. With no keys configured at all the gate is open (unchanged
+ * behavior), also unattributed.
+ *
+ * Client keys are checked first so a clientKeys entry that duplicates the
+ * shared key still yields its name. Every candidate uses the constant-time
+ * compare; the key count is operator-controlled and small, so scanning all of
+ * them leaks nothing useful.
+ */
+// Config arrays already checked for shape, so the warnings below fire once per
+// loaded list (a reload hands over a new array) rather than once per request.
+const checkedClientKeys = new WeakSet();
+function usableClientKeys(clientKeys) {
+  if (!checkedClientKeys.has(clientKeys)) {
+    checkedClientKeys.add(clientKeys);
+    const seen = new Set();
+    for (const entry of clientKeys) {
+      const name = typeof entry?.name === 'string' ? entry.name.trim() : '';
+      if (!name || !entry?.key) {
+        console.error('[TeamClaude] proxy.clientKeys: an entry without a name and a key is ignored (usage is attributed by name)');
+      } else if (seen.has(name)) {
+        console.error(`[TeamClaude] proxy.clientKeys: duplicate name "${name}" — its keys share one usage counter`);
+      }
+      seen.add(name);
+    }
+  }
+  return clientKeys.filter(e => typeof e?.name === 'string' && e.name.trim() && e.key);
+}
+
+export function resolveClientAuth(proxyConfig, presented) {
+  const shared = proxyConfig?.apiKey;
+  const clientKeys = Array.isArray(proxyConfig?.clientKeys) ? usableClientKeys(proxyConfig.clientKeys) : [];
+  if (!shared && clientKeys.length === 0) return { ok: true, client: null };
+  for (const entry of clientKeys) {
+    if (safeKeyEqual(presented, entry.key)) {
+      return { ok: true, client: entry.name.trim() };
+    }
+  }
+  if (shared && safeKeyEqual(presented, shared)) return { ok: true, client: null };
+  return { ok: false, client: null };
+}
+
+export function createProxyServer(accountManager, config, hooks = {}, sx = null, clientUsage = null) {
   const upstream = config.upstream || 'https://api.anthropic.com';
-  const proxyApiKey = config.proxy?.apiKey;
   const holdMs = (config.holdSeconds || 0) * 1000;
 
   // The log directory is made up front and synchronously, so a path that
@@ -76,10 +163,14 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
 
   const requestHandler = async (req, res) => {
     try {
-      // Auth check — skip for localhost connections.
+      // Auth check — skip for localhost connections. `config.proxy` is read per
+      // request (not captured at creation) so a reload that edits clientKeys
+      // applies to a running server, matching how eventLogging/blockedModels
+      // are read live further down the pipeline.
       const clientKey = req.headers['x-api-key'];
       const isLocal = isLoopbackAddr(req.socket.remoteAddress);
-      if (proxyApiKey && !safeKeyEqual(clientKey, proxyApiKey) && !isLocal) {
+      const auth = resolveClientAuth(config.proxy, clientKey);
+      if (!auth.ok && !isLocal) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           type: 'error',
@@ -87,6 +178,10 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
         }));
         return;
       }
+      // Client identity for per-client usage. A loopback caller that presented
+      // a valid client key is attributed like any other; loopback without one
+      // passed only via the exemption and stays unattributed.
+      req.tcClient = auth.ok ? auth.client : null;
 
       // Control-plane mutations are refused when the request was issued by a web
       // page. The gate above exempts loopback from the API key, so without this
@@ -213,7 +308,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
   // Opt-in egress pin: null unless config.egress.pin is set, and then shared by
   // the base listener and the MITM one so both honour the same hold.
   const egress = createEgressGuard(config, console.error);
-  const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, egress });
+  const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, egress, clientUsage });
   const server = http.createServer(requestHandler);
 
   // What bounds a directory of one-shot dumps is deleting the expired ones, not
@@ -251,7 +346,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
     const c = await certsPromise;
     return { key: c.leafKeyPem, cert: c.leafCertPem };
   };
-  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks, log: console.error, sx, egress }));
+  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks, log: console.error, sx, egress, clientUsage }));
   // Remote Control's real-time channel is a WebSocket, not a request/response
   // call — Node fires 'upgrade' for that handshake, never 'request', so it
   // needs its own listener (base-URL routing path; the MITM path wires the
@@ -420,7 +515,7 @@ const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/files/', '/api/oauth/f
  * aware routing, and retry-on-quota behavior. Control endpoints (status/reload)
  * and the proxy-API-key gate live in the base server's wrapper, not here.
  */
-export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null, egress = null }) {
+export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null, egress = null, clientUsage = null, forcedClient = null }) {
   let counter = 0;
   return async (req, res) => {
     // The activity entry this request opened, while it is still open. Every
@@ -543,7 +638,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         // close. The cost of this order is one spurious close if the hook threw
         // before registering anything, which every consumer already tolerates.
         openEntry = { reqId, sessionId };
-        hooks.onRequestStart?.(reqId, { method: req.method, path: req.url, sessionId, pinned: pinnedIndex != null });
+        hooks.onRequestStart?.(reqId, { method: req.method, path: req.url, sessionId, pinned: pinnedIndex != null, client: req.tcClient ?? forcedClient ?? null });
       }
 
       // Buffer request body (needed to resend on a different account after a 429).
@@ -583,7 +678,19 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         return;
       }
 
-      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, holdBudgetMs: holdMs, sessionId, logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
+      // Per-client attribution: the base server stamps req.tcClient from the
+      // key that authenticated; the MITM terminating server has no per-request
+      // key (auth happened at CONNECT time) and carries it as forcedClient
+      // instead — the same split as the account pin. onUsage lets the usage
+      // extraction deep in the response path book tokens against the client
+      // without threading the name through every layer.
+      const client = req.tcClient ?? forcedClient ?? null;
+      const onUsage = (client && clientUsage)
+        ? (inputTokens, outputTokens) => clientUsage.record(client, { inputTokens, outputTokens })
+        : null;
+      if (client && clientUsage) clientUsage.record(client, { requests: 1 });
+
+      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, holdBudgetMs: holdMs, sessionId, client, onUsage, logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -607,7 +714,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         // marked open would send the outer catch to call that same throwing hook
         // a second time for one request.
         openEntry = null;
-        if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, sessionId, pinned: ctx.pinnedIndex != null });
+        if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, sessionId, pinned: ctx.pinnedIndex != null, client });
       }
     } catch (err) {
       reportFailure('[TeamClaude] Unhandled error:', err);
@@ -1209,13 +1316,24 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       : rejected.size === accountManager.accounts.length);
     if (allRefused) {
       const names = [...rejected].map(n => `"${n}"`).join(', ');
+      const entitlementDenied = ctx.entitlementDenied;
+      const allEntitlementDenied = entitlementDenied?.size === rejected.size
+        && [...rejected].every(name => entitlementDenied.has(name));
+      let message;
+      if (allEntitlementDenied && ctx.pinnedIndex != null) {
+        message = `No account served this request. The pinned account ${names} returned OAuth entitlement denial (${OAUTH_ENTITLEMENT_ERROR_CODE}). An explicit pin targets that account exactly; choose a different eligible account or change its organization's OAuth policy.`;
+      } else if (allEntitlementDenied) {
+        message = `No account served this request. Every configured account returned OAuth entitlement denial (${OAUTH_ENTITLEMENT_ERROR_CODE}): ${names}. TeamClaude temporarily removed them from automatic rotation; retry after the cooldown or pin a different eligible account.`;
+      } else {
+        message = `Upstream refused the credential for account ${names} (403). Check the account, then re-add it with: teamclaude login`;
+      }
       ctx.status = 502;
       ctx.account = `(${[...rejected].join(', ')} refused)`;
       if (!res.headersSent) {
         res.writeHead(502, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           type: 'error',
-          error: { type: 'proxy_error', message: `Upstream refused the credential for account ${names} (403). Check the account, then re-add it with: teamclaude login` },
+          error: { type: 'proxy_error', message },
         }));
       }
       return;
@@ -1279,9 +1397,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
 
   // Track which account handles this request
   ctx.account = account.name;
-  // Pin this session to the serving account (for affinity) and keep it "active"
-  // in the running-sessions readout. Passive when distribution is off.
-  accountManager.recordSession(ctx.sessionId, account.index);
+  // Pin this session to the serving account for the model's weekly bucket (for
+  // affinity) and keep it "active" in the running-sessions readout. Passive when
+  // distribution is off.
+  accountManager.recordSession(ctx.sessionId, account.index, ctx.model);
   hooks.onRequestRouted?.(reqId, { account: account.name });
 
   // Refresh OAuth token if needed
@@ -1361,6 +1480,15 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // then released so streaming bodies don't tie up concurrency. Fail-open: a
     // client that disconnects while waiting just drops out.
     if (!await accountManager.admit(account.index, () => clientGone(res))) return;
+    // This request may have selected the account before another in-flight request
+    // observed an entitlement denial. Re-check after admission, when the queued
+    // request is about to send, so the cooldown also drains that preselected
+    // backlog. Explicit caller pins still target exactly the requested account.
+    if (ctx.pinnedIndex == null && retryCount < maxRetries && accountManager.isEntitlementDenied(account.index)) {
+      accountManager.release(account.index);
+      ctx.tried.add(account.index);
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+    }
     let upstreamRes;
     try {
       upstreamRes = await upstreamFetch(upstreamUrl, {
@@ -1495,13 +1623,23 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // in. Skip the account for the rest of this request and fail over. With no
     // account left, the no-account branch reports a proxy error instead.
     if (upstreamRes.status === 403 && !res.headersSent) {
-      await upstreamRes.body?.cancel();
+      const responseBody = await readErrorBody(upstreamRes.body);
+      const entitlementDenied = account.type === 'oauth'
+        && responseBody != null
+        && isOAuthEntitlementDenied(responseBody);
+      const deniedUntil = entitlementDenied
+        ? accountManager.markEntitlementDenied(account.index)
+        : null;
       // A set, not a name: the no-account branch needs to tell "every account was
       // refused" (fail fast, nothing to wait for) from "this one was, others are
       // just out of quota" (still worth holding for a reset).
       (ctx.credentialRejected ??= new Set()).add(account.name);
+      if (entitlementDenied) (ctx.entitlementDenied ??= new Set()).add(account.name);
       ctx.tried.add(account.index);
-      console.error(`[TeamClaude] 403 on "${account.name}" — upstream refused the account credential`);
+      const cooldown = deniedUntil
+        ? `; OAuth entitlement cooldown until ${new Date(deniedUntil).toISOString()}`
+        : '';
+      console.error(`[TeamClaude] 403 on "${account.name}"; upstream refused the account credential${cooldown}`);
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
 
@@ -1551,7 +1689,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       const l = getLog();
       const bw = l ? l.bodyWriter('RESPONSE BODY (streamed)', contentType) : null;
       try {
-        await streamResponse(upstreamRes.body, res, account.index, accountManager, bw);
+        await streamResponse(upstreamRes.body, res, account.index, accountManager, bw, ctx.onUsage);
       } finally {
         // Also on the failure path: without the note a capped body reads as a
         // stream that simply stopped, which is the other thing that happens here.
@@ -1560,7 +1698,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       l?.end();
     } else {
       const buf = Buffer.from(await upstreamRes.arrayBuffer());
-      extractUsageFromBody(buf, account.index, accountManager);
+      extractUsageFromBody(buf, account.index, accountManager, ctx.onUsage);
       const l = getLog();
       if (l) { l.body('RESPONSE BODY', buf, contentType); l.end(); }
       res.end(buf);
@@ -1685,7 +1823,7 @@ export function readWithIdleTimeout(reader, ms) {
 /**
  * Stream an SSE response to the client, parsing usage data along the way.
  */
-async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter) {
+async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter, onUsage = null) {
   const reader = webStream.getReader();
   const idleMs = resolveBodyIdleTimeout();
   const decoder = new TextDecoder();
@@ -1719,7 +1857,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
       sseBuffer = events.pop(); // keep incomplete event
 
       for (const event of events) {
-        parseSSEUsage(event, accountIndex, accountManager);
+        parseSSEUsage(event, accountIndex, accountManager, onUsage);
       }
 
       // Handle backpressure — also bail out if client disconnects,
@@ -1739,7 +1877,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
 
     // Parse any remaining buffer
     if (sseBuffer.trim()) {
-      parseSSEUsage(sseBuffer, accountIndex, accountManager);
+      parseSSEUsage(sseBuffer, accountIndex, accountManager, onUsage);
     }
   } catch (err) {
     // A mid-stream idle timeout (or any read error) means the upstream went
@@ -1757,7 +1895,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
   }
 }
 
-function parseSSEUsage(event, accountIndex, accountManager) {
+function parseSSEUsage(event, accountIndex, accountManager, onUsage = null) {
   const dataLine = event.split('\n').find(l => l.startsWith('data: '));
   if (!dataLine) return;
 
@@ -1765,19 +1903,22 @@ function parseSSEUsage(event, accountIndex, accountManager) {
     const data = JSON.parse(dataLine.slice(6));
     if (data.type === 'message_start' && data.message?.usage) {
       accountManager.updateUsage(accountIndex, data.message.usage.input_tokens, 0);
+      onUsage?.(data.message.usage.input_tokens || 0, 0);
     } else if (data.type === 'message_delta' && data.usage) {
       accountManager.updateUsage(accountIndex, 0, data.usage.output_tokens);
+      onUsage?.(0, data.usage.output_tokens || 0);
     }
   } catch {
     // not valid JSON, skip
   }
 }
 
-function extractUsageFromBody(buffer, accountIndex, accountManager) {
+function extractUsageFromBody(buffer, accountIndex, accountManager, onUsage = null) {
   try {
     const json = JSON.parse(buffer.toString());
     if (json.usage) {
       accountManager.updateUsage(accountIndex, json.usage.input_tokens, json.usage.output_tokens);
+      onUsage?.(json.usage.input_tokens || 0, json.usage.output_tokens || 0);
     }
   } catch {
     // not JSON or no usage
@@ -1802,8 +1943,9 @@ export function rewriteModel(body, modelMap) {
 function computeRetryAfter(accounts) {
   let soonest = Infinity;
   for (const acct of accounts) {
-    const reset = acct.rateLimitedUntil || acct.quota.resetsAt;
-    if (reset) {
+    const resets = [acct.rateLimitedUntil, acct.entitlementDeniedUntil, acct.quota.resetsAt]
+      .filter(Boolean);
+    for (const reset of resets) {
       const ms = new Date(reset).getTime() - Date.now();
       if (ms < soonest) soonest = ms;
     }
