@@ -11,6 +11,11 @@ export { isFableModel, parseRequestModel, parseAdvisorModel } from './model.js';
 // when the token turned over, short enough that a genuinely bad new token
 // recovers on the next request rather than staying stuck.
 const FORCED_REFRESH_FLOOR_MS = 10_000;
+// An organization-level OAuth policy denial is not repaired by an immediate
+// retry. Keep the account out of automatic rotation long enough for other
+// members to serve, then re-admit it so an administrator's policy change is
+// discovered without a restart.
+const ENTITLEMENT_DENIAL_COOLDOWN_SECONDS = 5 * 60;
 
 // Quota fields that survive a restart: utilization levels and their reset
 // windows, learned passively from upstream responses. Transient/derived state
@@ -18,7 +23,17 @@ const FORCED_REFRESH_FLOOR_MS = 10_000;
 const PERSISTED_QUOTA_FIELDS = [
   'unified5h', 'unified7d', 'unified7dSonnet', 'unified7dFable',
   'unified5hReset', 'unified7dReset', 'unified7dSonnetReset', 'unified7dFableReset', 'unifiedStatus',
+  'unified7dSonnetSeenAt', 'unified7dFableSeenAt',
   'tokensLimit', 'tokensRemaining', 'requestsLimit', 'requestsRemaining', 'resetsAt',
+];
+
+// The family (Fable/Sonnet) weekly buckets and the field holding when each was
+// last confirmed by upstream. See _clearExpiredQuotas: a SPENT family reading is
+// only trusted while it is fresh, because nothing but a request of that family
+// can refresh it.
+const FAMILY_WEEKLY_BUCKETS = [
+  { key: 'unified7dFable', label: 'Fable' },
+  { key: 'unified7dSonnet', label: 'Sonnet' },
 ];
 
 function emptyQuota() {
@@ -37,6 +52,11 @@ function emptyQuota() {
     unified7dReset: null,       // ms timestamp
     unified7dSonnetReset: null, // ms timestamp
     unified7dFableReset: null,  // ms timestamp
+    // When each family bucket was last confirmed by upstream (ms timestamp).
+    // Only these two buckets need it: they are the ones a spent reading can seal
+    // itself into, since selection stops sending the family that would refresh them.
+    unified7dSonnetSeenAt: null,
+    unified7dFableSeenAt: null,
     unifiedStatus: null,        // allowed | allowed_warning | rejected
     resetsAt: null,
   };
@@ -75,6 +95,10 @@ function makeAccount(acct, index) {
     },
     rateLimitedUntil: null,
     throttledAt: null,
+    // Organization policy can reject OAuth while the credential itself remains
+    // valid. This cross-request cooldown is intentionally ephemeral: unlike
+    // quota, it is a live routing observation and is re-learned after restart.
+    entitlementDeniedUntil: null,
     // Storm control (see admit/release): in-flight upstream requests and the
     // time this account last became the current one (starts a ramp window).
     inFlight: 0,
@@ -88,6 +112,9 @@ function makeAccount(acct, index) {
     // (post-401) refreshes so a burst of stale in-flight requests can't rotate
     // the refresh-token family once per request — see ensureTokenFresh.
     _lastRefreshAt: null,
+    // The refresh token upstream last rejected as invalid, if it is still the
+    // one we hold — see the dead-token guard in ensureTokenFresh.
+    _deadRefreshToken: null,
   };
 }
 
@@ -108,7 +135,7 @@ function sampleModelFor(route) {
 }
 
 export class AccountManager {
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, throttleProbeFloorMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, sessionTracker } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, throttleProbeFloorMs, familyStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, sessionTracker } = {}) {
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
@@ -128,6 +155,13 @@ export class AccountManager {
     // bias selection for a route's models and reset on restart. A pinned account
     // that becomes ineligible is skipped — routing falls back to best-available.
     this.routePins = new Map();
+    // Selection cursor per route (routeName → account index; '' when no route
+    // matches). A single global cursor reads traffic that alternates between
+    // routes as a rotation: the cursor sits on the other route's account, that
+    // account fails this model's route check, and selection "switches" away from
+    // it. Each such switch arms the ramp below, so steady interleaved traffic
+    // holds both accounts at the ramp floor while nothing has failed over.
+    this.routeCursors = new Map();
     this.switchThreshold = switchThreshold;
     this.setRoutes(routes);
     // Storm control: when rotation switches to a fresh account, a burst of
@@ -156,6 +190,13 @@ export class AccountManager {
     // retry-after, short enough that a stale hold cannot pin the fleet.
     this.throttleProbeFloorMs = throttleProbeFloorMs
       ?? (Number(process.env.TEAMCLAUDE_THROTTLE_PROBE_FLOOR_MS) || 60_000);
+    // How long a SPENT family (Fable/Sonnet) weekly reading is trusted before it
+    // is cleared for revalidation (see _clearExpiredQuotas). Long enough that a
+    // genuinely spent bucket costs at most one rejected request per account per
+    // window, short enough that a stale reading cannot lock a family out for the
+    // rest of the weekly window.
+    this.familyStaleMs = familyStaleMs
+      ?? (Number(process.env.TEAMCLAUDE_FAMILY_STALE_MS) || 30 * 60_000);
   }
 
   /** Start (or restart) the ramp window for an account that just became current,
@@ -230,6 +271,35 @@ export class AccountManager {
     if (this.ramp.enabled) account.rampStartedAt = account.pausedUntil;
   }
 
+  /** Keep an OAuth-policy-denied account out of automatic rotation temporarily.
+   * Extend an existing cooldown, never shorten it. Returns the expiry timestamp,
+   * or null when the account is missing or the cooldown is disabled. */
+  markEntitlementDenied(index, seconds = ENTITLEMENT_DENIAL_COOLDOWN_SECONDS) {
+    const account = this.accounts[index];
+    if (!account) return null;
+    const duration = Number(seconds);
+    if (!Number.isFinite(duration) || duration <= 0) return null;
+    const until = Date.now() + duration * 1000;
+    account.entitlementDeniedUntil = Math.max(account.entitlementDeniedUntil || 0, until);
+    return account.entitlementDeniedUntil;
+  }
+
+  /** True while an account is in its OAuth entitlement cooldown. Expiry is
+   * consumed lazily so selection immediately re-admits it without a timer. */
+  _entitlementDenied(account, now = Date.now()) {
+    if (!account?.entitlementDeniedUntil) return false;
+    if (now < account.entitlementDeniedUntil) return true;
+    account.entitlementDeniedUntil = null;
+    console.log(`[TeamClaude] Account "${account.name}" entitlement cooldown expired, marking available`);
+    return false;
+  }
+
+  /** Public form used by the request path to re-check an account after waiting
+   * in storm-control admission. */
+  isEntitlementDenied(index, now = Date.now()) {
+    return this._entitlementDenied(this.accounts[index], now);
+  }
+
   /**
    * Get the best available account, rotating if the current one is near quota.
    * Returns null if all accounts are exhausted.
@@ -242,6 +312,16 @@ export class AccountManager {
    * request keeps flowing (upstream then fails just the advisor call).
    */
   getActiveAccount(exclude = null, model = null, advisorModel = null, sessionId = null) {
+    const account = this._pickActiveAccount(exclude, model, advisorModel, sessionId);
+    // Record where this route now sits, whatever path chose it — the steady-state
+    // path returns the account the cursor already names and never reaches the
+    // rotation code, so recording there alone would leave the cursor unset and
+    // the next real failover unpaced.
+    if (account) this.routeCursors.set(this._cursorKey(model), account.index);
+    return account;
+  }
+
+  _pickActiveAccount(exclude, model, advisorModel, sessionId) {
     // Clear expired quotas across all accounts and switch proactively if a
     // session reset made a sooner-expiring account the better choice. This runs
     // on every request so the behaviour holds without the TUI render loop.
@@ -320,15 +400,26 @@ export class AccountManager {
     // what binds it and the advisor's model is a constraint on that choice
     // (_isAvailable, below) rather than a second key.
     const pinIdx = this.sessionTracker.pinnedAccount(sessionId, this._weeklyBucketFor(model));
-    if (pinIdx != null) {
-      const pinned = this.accounts[pinIdx];
-      if (pinned && this._isAvailable(pinned, model, advisorModel) && !exclude?.has(pinIdx)) {
-        // Mirror _select's priority preemption so an operator's priority order
-        // still wins over a session's stickiness.
-        const betterExists = this.accounts.some(a =>
-          this._isAvailable(a, model, advisorModel) && !exclude?.has(a.index) && (a.priority || 0) < (pinned.priority || 0));
-        if (!betterExists) return pinned;
-      }
+    // The bucket's own pin first. Failing that, any account the session already
+    // sits on for another family: one session stays on one account unless that
+    // account cannot serve the request (the README's "pins it there"). Without
+    // this, a session's first request of a second family would go to
+    // _pickLeastLoaded, which counts the session's own pin as load and pushes
+    // the new family onto a sibling — splitting every mixed-model session
+    // across two accounts by construction, not only on a real diversion.
+    const candidates = [];
+    if (pinIdx != null) candidates.push(pinIdx);
+    for (const idx of this.sessionTracker.pinnedAccounts(sessionId)) {
+      if (!candidates.includes(idx)) candidates.push(idx);
+    }
+    for (const idx of candidates) {
+      const pinned = this.accounts[idx];
+      if (!pinned || !this._isAvailable(pinned, model, advisorModel) || exclude?.has(idx)) continue;
+      // Mirror _select's priority preemption so an operator's priority order
+      // still wins over a session's stickiness.
+      const betterExists = this.accounts.some(a =>
+        this._isAvailable(a, model, advisorModel) && !exclude?.has(a.index) && (a.priority || 0) < (pinned.priority || 0));
+      if (!betterExists) return pinned;
     }
     return this._pickLeastLoaded(exclude, model, advisorModel);
   }
@@ -443,6 +534,9 @@ export class AccountManager {
     // whose token is broken — those are hard states, not stale guesses.
     if (account.disabled) return false;
     if (account.status === 'error' || account.status === 'exhausted') return false;
+    // A live entitlement cooldown is evidence, not a stale quota estimate. Do
+    // not let the all-unavailable probe path defeat it immediately.
+    if (this._entitlementDenied(account)) return false;
     // A 429 hold is respected verbatim at first, but a hold is a snapshot: the
     // 429 that armed it may itself have been transient (e.g. the retry burst
     // after a network flap), and while it lasts NOTHING revalidates it — so a
@@ -560,6 +654,10 @@ export class AccountManager {
     // Manually disabled accounts are skipped entirely until re-enabled.
     if (account.disabled) return false;
 
+    // A structured organization-policy 403 means this account cannot serve OAuth
+    // requests right now. Skip it across requests until the short cooldown ends.
+    if (this._entitlementDenied(account)) return false;
+
     // Check rate limit expiry
     if (account.status === 'throttled' && account.rateLimitedUntil) {
       if (Date.now() < account.rateLimitedUntil) return false;
@@ -638,6 +736,13 @@ export class AccountManager {
     return { eligible: true };
   }
 
+  /** Session-distribution toggle (issue #109), applied live on config reload.
+   *  Existing session pins survive a toggle: the flag gates only how NEW
+   *  sessions are routed. */
+  setDistributeSessions(enabled) {
+    this.distributeSessions = !!enabled;
+  }
+
   /**
    * Normalize and store the configurable routing table. A route pins a set of
    * model globs to an exclusive set of accounts (and may override the governing
@@ -659,6 +764,29 @@ export class AccountManager {
         if (name !== 'fable' && name !== 'sonnet' && !names.has(name)) this.routePins.delete(name);
       }
     }
+    // A reload can rename or drop a route, stranding its cursor under a key
+    // nothing resolves to. Clearing them costs one extra best-available walk per
+    // route and keeps no state that outlives the table it belonged to.
+    this.routeCursors?.clear();
+  }
+
+  /** Cursor key for a model: its route's name, or '' when no route matches. */
+  _cursorKey(model) {
+    return this._routeForModel(model)?.name || '';
+  }
+
+  /** The account this route was serving from before the current selection, or
+   * null when it has none — used to tell a rotation from ordinary routing.
+   *
+   * Before a route has its own cursor, the global one stands in, but only when
+   * it names an account the route could have used: a cursor left on another
+   * route's account was never this route's position, so moving off it is not a
+   * rotation. */
+  _previousCursor(model) {
+    const recorded = this.routeCursors.get(this._cursorKey(model));
+    if (recorded != null) return recorded;
+    const current = this.accounts[this.currentIndex];
+    return current && this._routeAllows(current, model) ? current.index : null;
   }
 
   /** The first configured route whose globs match `model`, or null. */
@@ -849,11 +977,44 @@ export class AccountManager {
     if (q.unified7dSonnet != null && q.unified7dSonnetReset && now >= q.unified7dSonnetReset) {
       q.unified7dSonnet = null;
       q.unified7dSonnetReset = null;
+      q.unified7dSonnetSeenAt = null;
       changed = true;
     }
     if (q.unified7dFable != null && q.unified7dFableReset && now >= q.unified7dFableReset) {
       q.unified7dFable = null;
       q.unified7dFableReset = null;
+      q.unified7dFableSeenAt = null;
+      changed = true;
+    }
+
+    // A family bucket is refreshed ONLY by upstream evidence for that family:
+    // the `7d_oi` headers ride on Fable responses (they are absent from every
+    // other model's response), and the Sonnet bucket comes from the usage
+    // endpoint — an opt-in probe that is off by default. So once such a bucket
+    // reads spent, selection stops sending that family to the account, which is
+    // also the only thing that could have corrected the reading: it seals itself
+    // in until its cached reset passes, up to a week of lockout on an account
+    // whose real family quota reset long ago (issue #167).
+    //
+    // A spent family reading is therefore trusted only while it is fresh. Past
+    // the staleness floor it is cleared, the family falls back to the shared
+    // weekly bucket, and the next request of that family re-establishes the
+    // truth from real headers — a 429 re-arms the gate with a fresh reading and
+    // a fresh timestamp, so a genuinely spent bucket costs one rejected request
+    // per account per window and no more. A reading with headroom is left alone:
+    // it gates nothing, so it cannot seal anything in.
+    for (const { key, label } of FAMILY_WEEKLY_BUCKETS) {
+      if (q[key] == null || q[key] < this.switchThreshold) continue;
+      const seenField = `${key}SeenAt`;
+      // Unknown age (restored from an older state file, or set by a path that
+      // predates the stamp): start the clock now rather than clearing at once,
+      // so a reading is never discarded before it has had a window to prove out.
+      if (!q[seenField]) { q[seenField] = now; continue; }
+      if (now < q[seenField] + this.familyStaleMs) continue;
+      console.log(`[TeamClaude] Account "${account.name}" ${label} weekly reading is stale — revalidating on the next ${label} request`);
+      q[key] = null;
+      q[`${key}Reset`] = null;
+      q[seenField] = null;
       changed = true;
     }
 
@@ -1018,7 +1179,8 @@ export class AccountManager {
   _selectNext(exclude = null, model = null, advisorModel = null) {
     const best = this._pickBestAvailable(exclude, model, advisorModel);
     if (best) {
-      const switched = best.index !== this.currentIndex;
+      const previous = this._previousCursor(model);
+      const switched = previous != null && previous !== best.index;
       this.currentIndex = best.index;
       // If we switched to an account whose weekly quota is still unknown, flag
       // it so we re-evaluate once that quota is learned (see updateQuota).
@@ -1090,8 +1252,14 @@ export class AccountManager {
     // overage included"). On current subscription plans this is the Fable weekly
     // limit (it correlates with the usage endpoint's Fable-scoped weekly bucket).
     // Utilization here is already a 0-1 fraction (can exceed 1 when in overage).
+    // These headers ride on Fable responses only, so stamp when the reading was
+    // taken: that timestamp is what lets a spent reading be revalidated instead
+    // of sealing the account out of the family forever (see _clearExpiredQuotas).
     const u7dOi = parseFloat(headers['anthropic-ratelimit-unified-7d_oi-utilization']);
-    if (!isNaN(u7dOi)) account.quota.unified7dFable = u7dOi;
+    if (!isNaN(u7dOi)) {
+      account.quota.unified7dFable = u7dOi;
+      account.quota.unified7dFableSeenAt = Date.now();
+    }
     const r7dOi = headers['anthropic-ratelimit-unified-7d_oi-reset'];
     if (r7dOi) account.quota.unified7dFableReset = parseInt(r7dOi, 10) * 1000;
 
@@ -1158,6 +1326,10 @@ export class AccountManager {
     if (!disabled && account.status === 'error') {
       account.status = 'active';
       account.rateLimitedUntil = null;
+      // Operator escape hatch: re-enabling is an explicit "try this again", so
+      // drop the dead-token guard too — otherwise the account would come back
+      // active but never attempt a refresh (see ensureTokenFresh).
+      account._deadRefreshToken = null;
       console.log(`[TeamClaude] Account "${account.name}" re-enabled — clearing error state`);
     }
   }
@@ -1180,12 +1352,23 @@ export class AccountManager {
       if (usage.sevenDay.utilization != null) q.unified7d = usage.sevenDay.utilization;
       if (usage.sevenDay.resetAt != null) q.unified7dReset = usage.sevenDay.resetAt;
     }
+    // The family buckets carry a "last confirmed" stamp (see _clearExpiredQuotas).
+    // A probe is upstream evidence just like a response header, so it refreshes
+    // the stamp — this is the one path that can correct a spent family reading
+    // without spending quota, which is why enabling the probe sidesteps the
+    // staleness problem entirely.
     if (usage.sevenDaySonnet) {
-      if (usage.sevenDaySonnet.utilization != null) q.unified7dSonnet = usage.sevenDaySonnet.utilization;
+      if (usage.sevenDaySonnet.utilization != null) {
+        q.unified7dSonnet = usage.sevenDaySonnet.utilization;
+        q.unified7dSonnetSeenAt = Date.now();
+      }
       if (usage.sevenDaySonnet.resetAt != null) q.unified7dSonnetReset = usage.sevenDaySonnet.resetAt;
     }
     if (usage.sevenDayFable) {
-      if (usage.sevenDayFable.utilization != null) q.unified7dFable = usage.sevenDayFable.utilization;
+      if (usage.sevenDayFable.utilization != null) {
+        q.unified7dFable = usage.sevenDayFable.utilization;
+        q.unified7dFableSeenAt = Date.now();
+      }
       if (usage.sevenDayFable.resetAt != null) q.unified7dFableReset = usage.sevenDayFable.resetAt;
     }
 
@@ -1235,6 +1418,31 @@ export class AccountManager {
     const account = this.accounts[accountIndex];
     if (!account || account.type !== 'oauth' || !account.refreshToken) return;
 
+    // Dead-token guard: a refresh token upstream already rejected (invalid_grant)
+    // will be rejected every time, so retrying it only floods the OAuth endpoint
+    // — observed live: 287 identical invalid_grant calls after two accounts' tokens
+    // were invalidated (a `/login` elsewhere rotates the token and kills the copy
+    // teamclaude holds). Paths that bypass availability checks keep calling this
+    // (the quota prober refreshes every OAuth account regardless of status, and a
+    // pinned request reaches here without _isAvailable), so marking the account
+    // 'error' alone does not stop the retries. Keyed on the token VALUE, not the
+    // status: the moment a DIFFERENT refresh token arrives (re-login, config
+    // reload, updateAccountTokens) the guard lifts on its own.
+    //
+    // While it holds, the account must also READ as needing a re-login. A
+    // re-import can hand updateAccountTokens a new access token alongside the
+    // same dead refresh token; that path resets status to 'active', so without
+    // this the access token's 401 would force a refresh that silently does
+    // nothing here and the retry would relay the 401 to the client instead of
+    // rotating to another account.
+    if (account._deadRefreshToken && account._deadRefreshToken === account.refreshToken) {
+      if (account.status !== 'error') {
+        account.status = 'error';
+        console.error(`[TeamClaude] Account "${account.name}" still holds a rejected refresh token — run: teamclaude login`);
+      }
+      return;
+    }
+
     if (!force && !isTokenExpiringSoon(account.expiresAt)) return;
 
     // A forced refresh answers a 401, but 401s arrive in bursts: every request
@@ -1263,6 +1471,7 @@ export class AccountManager {
         account.refreshToken = newTokens.refreshToken;
         account.expiresAt = newTokens.expiresAt;
         account._lastRefreshAt = Date.now();
+        account._deadRefreshToken = null; // this token works; clear any stale guard
         console.log(`[TeamClaude] Token refreshed for account "${account.name}"`);
         this._onTokenRefresh?.(accountIndex, newTokens);
       } catch (err) {
@@ -1276,6 +1485,10 @@ export class AccountManager {
         const isAuthRejection = err.status === 400 || err.status === 401 || err.status === 403;
         if (isAuthRejection) {
           account.status = 'error';
+          // Remember WHICH token was rejected so we stop re-sending it (see the
+          // dead-token guard above). A transient failure deliberately does not
+          // arm this — that token may still be good.
+          account._deadRefreshToken = account.refreshToken;
           console.error(`[TeamClaude] Account "${account.name}" needs re-login (refresh token rejected) — run: teamclaude login`);
         }
       } finally {
@@ -1339,6 +1552,12 @@ export class AccountManager {
       if (idx === index) this.routePins.delete(name);
       else if (idx > index) this.routePins.set(name, idx - 1);
     }
+    // Same for the selection cursors: a cursor on the removed account is dropped
+    // so the route re-picks, and one above it follows the shift.
+    for (const [name, idx] of [...this.routeCursors.entries()]) {
+      if (idx === index) this.routeCursors.delete(name);
+      else if (idx > index) this.routeCursors.set(name, idx - 1);
+    }
     // Session pins are positions in the same list and shift the same way.
     this.sessionTracker.remapAccounts(idx =>
       (idx === index ? null : idx > index ? idx - 1 : idx));
@@ -1399,6 +1618,9 @@ export class AccountManager {
           : null,
         pausedUntil: a.pausedUntil && a.pausedUntil > Date.now()
           ? new Date(a.pausedUntil).toISOString()
+          : null,
+        entitlementDeniedUntil: a.entitlementDeniedUntil && a.entitlementDeniedUntil > Date.now()
+          ? new Date(a.entitlementDeniedUntil).toISOString()
           : null,
       })),
     };

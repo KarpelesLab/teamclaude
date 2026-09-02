@@ -182,3 +182,34 @@ test('getStatus exposes session counts (known/active/perAccount) and the mode fl
   assert.equal(status.accounts[0].sessions, 1);
   assert.equal(status.accounts[1].sessions, 1);
 });
+
+test('setDistributeSessions applies a config change live', () => {
+  const am = mgr(['a', 'b']); // off: both sessions funnel onto the current account
+  const s1 = am.getActiveAccount(null, null, null, 'sess-1');
+  am.recordSession('sess-1', s1.index);
+  assert.equal(am.getActiveAccount(null, null, null, 'sess-2').name, 'a');
+  am.setDistributeSessions(true);
+  assert.equal(am.getActiveAccount(null, null, null, 'sess-2').name, 'b');
+  am.setDistributeSessions(false); // reload with the field removed disables it
+  assert.equal(am.getActiveAccount(null, null, null, 'sess-3').name, 'a');
+});
+
+test('a session\'s first request of a second family stays on the account it already uses', () => {
+  const am = mgr(['a', 'b'], { distributeSessions: true });
+  const SONNET = 'claude-sonnet-5';
+  const first = am.getActiveAccount(null, OPUS, null, 's1');
+  am.recordSession('s1', first.index, OPUS);
+  // No Sonnet pin yet. Least-loaded would count s1's own Opus pin as load on
+  // `first` and send Sonnet to the sibling; the session must stay put instead.
+  assert.equal(am.getActiveAccount(null, SONNET, null, 's1').name, first.name);
+});
+
+test('the fallback pin is skipped when that account cannot serve the family', () => {
+  const am = mgr(['a', 'b'], { distributeSessions: true });
+  const first = am.getActiveAccount(null, OPUS, null, 's1');
+  am.recordSession('s1', first.index, OPUS);
+  // Fable is spent on the pinned account; the request must go elsewhere.
+  first.quota.unified7dFable = 0.99;
+  first.quota.unified7dFableReset = Date.now() + 24 * H;
+  assert.notEqual(am.getActiveAccount(null, FABLE, null, 's1').name, first.name);
+});

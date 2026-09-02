@@ -138,6 +138,11 @@ function formatAccountStatus(account, now, paint) {
     parts.push(`throttle ${formatDuration(throttleAt - now)}`);
   }
 
+  const entitlementAt = parseTs(account.entitlementDeniedUntil);
+  if (entitlementAt && entitlementAt > now) {
+    parts.push(paint.yellow(`entitlement cooldown ${formatDuration(entitlementAt - now)}`));
+  }
+
   return parts.join(' / ');
 }
 
@@ -276,9 +281,12 @@ function formatServerSummary(server, now) {
   return started ? `up ${formatDuration(now - started)}` : 'unknown';
 }
 
-function formatPercent(value) {
+export function formatPercent(value) {
   if (value == null || Number.isNaN(Number(value))) return '-';
-  return `${Math.round(Number(value) * 100)}%`;
+  // The switch threshold can be set to a tenth of a percent, so rounding to a
+  // whole one would print a value that was never stored. Reported utilization
+  // arrives on a whole-percent grid, so bars are unaffected.
+  return `${Math.round(Number(value) * 1000) / 10}%`;
 }
 
 function formatNumber(value) {

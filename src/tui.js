@@ -1,6 +1,12 @@
 import { createWriteStream } from 'node:fs';
 import { importCredentials, fetchProfile } from './oauth.js';
-import { sameIdentity, findUpsertTarget } from './identity.js';
+import {
+  sameIdentity,
+  findUpsertTarget,
+  canUpsertOAuthAccount,
+  oauthIdentityFields,
+} from './identity.js';
+import { formatPercent } from './status-renderer.js';
 import { parseProxyUrl, proxyToUrl, describeProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy } from './upstream-proxy.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
@@ -85,7 +91,44 @@ const routeGlyph = (paint, eligible, pinned) =>
 
 const ANSI_RE = /\x1b\[[0-9;]*m/g;
 const strip = s => s.replace(ANSI_RE, '');
-const vw = s => strip(s).length;
+
+// Terminal display width of one code point: 0 for combining and zero-width
+// marks, 2 for East Asian wide/fullwidth characters and emoji, 1 otherwise.
+// A compact subset of Unicode's East_Asian_Width and combining ranges, enough
+// to keep the account table aligned for CJK and accented names without a full
+// property database. It does not resolve emoji ZWJ sequences, so a multi-part
+// emoji is counted per component; names rarely contain those.
+function charWidth(cp) {
+  if (cp === 0) return 0;
+  if (
+    (cp >= 0x0300 && cp <= 0x036f) || (cp >= 0x0483 && cp <= 0x0489) ||
+    (cp >= 0x0591 && cp <= 0x05bd) || (cp >= 0x0610 && cp <= 0x061a) ||
+    (cp >= 0x064b && cp <= 0x065f) || (cp >= 0x0e31 && cp <= 0x0e3a) ||
+    cp === 0x200b || (cp >= 0x200d && cp <= 0x200f) ||
+    (cp >= 0x20d0 && cp <= 0x20ff) || (cp >= 0xfe00 && cp <= 0xfe0f)
+  ) return 0;
+  if (
+    (cp >= 0x1100 && cp <= 0x115f) || (cp >= 0x2e80 && cp <= 0x303e) ||
+    (cp >= 0x3041 && cp <= 0x33ff) || (cp >= 0x3400 && cp <= 0x4dbf) ||
+    (cp >= 0x4e00 && cp <= 0x9fff) || (cp >= 0xa000 && cp <= 0xa4cf) ||
+    (cp >= 0xac00 && cp <= 0xd7a3) || (cp >= 0xf900 && cp <= 0xfaff) ||
+    (cp >= 0xfe30 && cp <= 0xfe4f) || (cp >= 0xff00 && cp <= 0xff60) ||
+    (cp >= 0xffe0 && cp <= 0xffe6) || (cp >= 0x1f300 && cp <= 0x1faff) ||
+    (cp >= 0x20000 && cp <= 0x3fffd)
+  ) return 2;
+  return 1;
+}
+
+// Visible terminal width of a string: ANSI escapes stripped, then each code
+// point measured by charWidth. Replaces a bare .length, which miscounts CJK
+// (1 unit, 2 columns) and combining marks (1 unit, 0 columns) and so would
+// misalign the table for non-ASCII names.
+export function displayWidth(s) {
+  let w = 0;
+  for (const ch of strip(s)) w += charWidth(ch.codePointAt(0));
+  return w;
+}
+const vw = displayWidth;
 
 function rpad(s, w) {
   const gap = w - vw(s);
@@ -98,27 +141,56 @@ function splitCsv(value) {
   return (value || '').split(',').map(s => s.trim()).filter(Boolean);
 }
 
-/** Truncate a string with ANSI codes to exactly w visible characters, then reset. */
-function truncate(s, w) {
-  let visible = 0;
+/** Truncate a string with ANSI codes to at most w display columns, then reset. */
+export function truncate(s, w) {
+  let width = 0;
   let out = '';
   let i = 0;
-  while (i < s.length && visible < w) {
+  while (i < s.length) {
     if (s[i] === '\x1b') {
       const end = s.indexOf('m', i);
       if (end >= 0) { out += s.slice(i, end + 1); i = end + 1; continue; }
     }
-    out += s[i];
-    visible++;
-    i++;
+    const cp = s.codePointAt(i);
+    const cw = charWidth(cp);
+    // A wide glyph that would cross the limit is dropped whole rather than split;
+    // the one leftover column is filled by the caller's padding.
+    if (width + cw > w) break;
+    const len = cp > 0xffff ? 2 : 1;
+    out += s.slice(i, i + len);
+    width += cw;
+    i += len;
   }
   return out + RESET;
 }
 
-/** Fit a line to exactly w columns: truncate if too long, pad if too short. */
-function fitLine(s, w) {
+// Quota bar width bounds: narrow enough that a `2d14h` label still fits, wide
+// enough that a very wide terminal doesn't turn the row into one long bar.
+const BAR_MIN = 5;
+const BAR_MAX = 20;
+
+// Families this account can't serve right now: a family whose own weekly bucket
+// is over the switch threshold is barred from that model while the account is
+// otherwise active. Shared by the row renderer (which draws the `⊘` tag) and the
+// column layout (which reserves the width that tag needs).
+export function blockedFamilies(quota, threshold) {
+  const out = [];
+  if (quota.unified7dSonnet != null && quota.unified7dSonnet >= threshold) out.push('Sonnet');
+  if (quota.unified7dFable != null && quota.unified7dFable >= threshold) out.push('Fable');
+  return out;
+}
+
+/** Fit a line to exactly w columns: truncate if too long, pad if too short.
+ *  Truncation drops a wide glyph that would straddle the limit, so the result
+ *  can come up one column short; pad that too — the frame is repainted in
+ *  place, and a line narrower than the terminal leaves the previous frame's
+ *  last cell visible. */
+export function fitLine(s, w) {
   const v = vw(s);
-  if (v > w) return truncate(s, w);
+  if (v > w) {
+    const t = truncate(s, w);
+    return t + ' '.repeat(Math.max(0, w - vw(t)));
+  }
   if (v < w) return s + ' '.repeat(w - v);
   return s;
 }
@@ -411,13 +483,10 @@ export class TUI {
       id: 'threshold',
       label: 'Switch threshold',
       hint: '←→ ±1%',
-      value: () => {
-        const thr = this.am.switchThreshold ?? this.config.switchThreshold ?? 0.98;
-        return green(`${Math.round(thr * 100)}%`);
-      },
+      value: () => green(formatPercent(this.am.switchThreshold ?? this.config.switchThreshold ?? 0.98)),
       left: () => this._nudgeThreshold(-1),
       right: () => this._nudgeThreshold(+1),
-      enter: () => this._promptInput('Switch threshold % (1-100)', v => this._doSetThreshold(v.trim())),
+      enter: () => this._promptInput('Switch threshold % (1-100, tenths allowed)', v => this._doSetThreshold(v.trim())),
     });
 
     fields.push({
@@ -572,9 +641,11 @@ export class TUI {
   }
 
   _nudgeThreshold(deltaPct) {
-    const cur = Math.round((this.am.switchThreshold ?? this.config.switchThreshold ?? 0.98) * 100);
+    // Stepping from the exact percent, not a rounded one, so a threshold set to
+    // a tenth keeps its fraction instead of snapping to the nearest whole.
+    const cur = (this.am.switchThreshold ?? this.config.switchThreshold ?? 0.98) * 100;
     const next = Math.max(1, Math.min(100, cur + deltaPct));
-    if (next !== cur) this._doSetThreshold(String(next));
+    if (next !== cur) return this._doSetThreshold(String(next));
   }
 
   _nudgeProbe(deltaSec) {
@@ -588,12 +659,14 @@ export class TUI {
     if (!Number.isFinite(pct) || pct < 1 || pct > 100) {
       this._addLog('Invalid threshold — enter 1–100'); this.mode = 'settings'; if (this.running) this.render(); return;
     }
-    const v = Math.round(pct) / 100;
+    // Tenths of a percent are kept; anything finer is quantised so the stored
+    // value is the one the screen shows.
+    const v = Math.round(pct * 10) / 1000;
     this.config.switchThreshold = v;
     this.am.switchThreshold = v; // apply to the running rotation immediately
     try { await this.saveConfig(this.config); }
     catch (e) { this._addLog(`Failed to save: ${e.message}`); }
-    this._addLog(`Switch threshold set to ${Math.round(v * 100)}%`);
+    this._addLog(`Switch threshold set to ${formatPercent(v)}`);
     this.mode = 'settings';
     if (this.running) this.render();
   }
@@ -875,10 +948,10 @@ export class TUI {
       this._addLog('Importing credentials...');
       const creds = await this._readCredentials('~/.claude/.credentials.json');
       const profile = await this._readProfile(creds.accessToken);
-      const profileOk = profile && !profile.error;
 
-      if (!profileOk) {
-        this._addLog(`Warning: could not fetch profile — ${profile?.error || 'no token'}`);
+      if (!canUpsertOAuthAccount(profile, false)) {
+        this._addLog(`Import refused: could not identify OAuth account — ${profile?.error || 'profile unavailable'}`);
+        return;
       }
 
       let name;
@@ -893,9 +966,7 @@ export class TUI {
 
       const entry = {
         name, type: 'oauth', source: 'import',
-        accountUuid: profile?.accountUuid || null,
-        orgUuid: profile?.orgUuid || null,
-        orgName: profile?.orgName || null,
+        ...oauthIdentityFields(profile),
         accessToken: creds.accessToken,
         refreshToken: creds.refreshToken,
         expiresAt: creds.expiresAt,
@@ -916,9 +987,9 @@ export class TUI {
           amAcct.credential = creds.accessToken;
           amAcct.refreshToken = creds.refreshToken;
           amAcct.expiresAt = creds.expiresAt;
-          amAcct.accountUuid = entry.accountUuid;
-          amAcct.orgUuid = entry.orgUuid;
-          amAcct.orgName = entry.orgName;
+          if (entry.accountUuid) amAcct.accountUuid = entry.accountUuid;
+          if (entry.orgUuid) amAcct.orgUuid = entry.orgUuid;
+          if (entry.orgName) amAcct.orgName = entry.orgName;
           if (amAcct.status === 'error') amAcct.status = 'active';
         }
         this._addLog(`Updated account "${prev.name}"`);
@@ -1064,25 +1135,47 @@ export class TUI {
     } else {
       lines.push('');
       const showBoth = W >= 70;
-      const bw = showBoth
-        ? Math.max(5, Math.min(20, Math.floor((W - 56) / 2)))
-        : Math.max(5, Math.min(20, W - 45));
 
       // Routes drive the inline markers; general (non-family) routes get a stable
       // column each at the row start so the marker's position identifies the route.
       const routes = this.am.getRoutes();
       const genRoutes = routes.filter(r => routeFamily(r) === null);
+      const anyFable = this.am.accounts.some(a => a.quota.unified7dFable != null);
+      const anySonnet = this.am.accounts.some(a => a.quota.unified7dSonnet != null);
+
+      // Bar width. The budget must count every column the widest row actually
+      // draws, or the row overruns the terminal and fitLine cuts the tail off —
+      // which is how the S7/F7 bars lost the reset countdown they carry. Three
+      // parts beyond the bars themselves:
+      //   - the fixed prefix (marker, name, type, status, first bar label),
+      //   - the route-marker cells, one per general route,
+      //   - 6 columns of label for each bar past the first (`  Wk `, ` ►F7  `).
+      // The `⊘ Sonnet Fable` tag is reserved for only when some account is
+      // actually blocked; the common case where nothing is spends those columns
+      // on the bars instead of leaving the row short of the edge.
+      const tagW = this.am.accounts.reduce((w, a) => {
+        const names = blockedFamilies(a.quota, this.am.switchThreshold);
+        return names.length ? Math.max(w, 4 + vw(names.join(' '))) : w;
+      }, 0);
+      const fixed = 40 + (genRoutes.length ? genRoutes.length + 1 : 0) + tagW;
+      const roomFor = n => fixed + 6 * (n - 1) + n * BAR_MIN <= W;
+      // The family bars are the first thing to go: below the width where they
+      // fit even at BAR_MIN they would push the row past the edge, and a row cut
+      // mid-bar reads worse than one that simply doesn't draw them (the `⊘` tag
+      // still says which family is barred).
+      const showFamily = showBoth && (anyFable || anySonnet) && roomFor(2 + (anyFable ? 1 : 0) + (anySonnet ? 1 : 0));
+      const nbars = (showBoth ? 2 : 1) + (showFamily ? (anyFable ? 1 : 0) + (anySonnet ? 1 : 0) : 0);
+      const bw = Math.max(BAR_MIN, Math.min(BAR_MAX, Math.floor((W - fixed - 6 * (nbars - 1)) / nbars)));
+
       // The single account each secondary bucket currently routes to (null = none
       // can serve it right now). Marked next to that account's F7/S7 bar — the
       // secondary-quota analogue of ► marking the default route's current account.
-      const anyFable = this.am.accounts.some(a => a.quota.unified7dFable != null);
-      const anySonnet = this.am.accounts.some(a => a.quota.unified7dSonnet != null);
       const familyTarget = {
         fable: anyFable ? this.am.previewRouteIndex('claude-fable-5') : null,
         sonnet: anySonnet ? this.am.previewRouteIndex('claude-sonnet-4-6') : null,
       };
       for (let i = 0; i < this.am.accounts.length; i++) {
-        lines.push(this._renderAcct(i, bw, showBoth, routes, genRoutes, familyTarget));
+        lines.push(this._renderAcct(i, bw, showBoth, routes, genRoutes, familyTarget, showFamily));
       }
     }
 
@@ -1135,7 +1228,7 @@ export class TUI {
     this._paint(buf, force);
   }
 
-  _renderAcct(idx, bw, showBoth, routes = this.am.getRoutes(), genRoutes = routes.filter(r => routeFamily(r) === null), familyTarget = {}) {
+  _renderAcct(idx, bw, showBoth, routes = this.am.getRoutes(), genRoutes = routes.filter(r => routeFamily(r) === null), familyTarget = {}, showFamily = true) {
     const a = this.am.accounts[idx];
     const isCur = idx === this.am.currentIndex;
     const isSel = this.mode === 'select' && idx === this.selIdx;
@@ -1213,11 +1306,11 @@ export class TUI {
       line += `  ${l2} ${bar(r2, bw, t2)}`;
       // Sonnet weekly bar — only shown when the usage probe has populated it. A
       // leading ► (in place of a padding space) marks a Sonnet route on this account.
-      if (q.unified7dSonnet != null) {
+      if (showFamily && q.unified7dSonnet != null) {
         line += ` ${familyMark('sonnet')}S7  ${bar(q.unified7dSonnet, bw, q.unified7dSonnetReset)}`;
       }
       // Fable weekly bar — only shown when the usage probe has populated it.
-      if (q.unified7dFable != null) {
+      if (showFamily && q.unified7dFable != null) {
         line += ` ${familyMark('fable')}F7  ${bar(q.unified7dFable, bw, q.unified7dFableReset)}`;
       }
     }
@@ -1225,10 +1318,7 @@ export class TUI {
     // weekly bucket is over the switch threshold can't serve that model even
     // while the account is otherwise active. A spent shared 5h blocks everything
     // and is already conveyed by the Ses bar + status, so it's not repeated here.
-    const th = this.am.switchThreshold;
-    const blocked = [];
-    if (q.unified7dSonnet != null && q.unified7dSonnet >= th) blocked.push('Sonnet');
-    if (q.unified7dFable != null && q.unified7dFable >= th) blocked.push('Fable');
+    const blocked = blockedFamilies(q, this.am.switchThreshold);
     if (blocked.length) line += `  ${red('⊘ ' + blocked.join(' '))}`;
     return line;
   }

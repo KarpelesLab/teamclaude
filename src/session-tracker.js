@@ -133,6 +133,20 @@ export class SessionTracker {
     return s.pins.get(bucket)?.idx ?? null;
   }
 
+  // Every account a known session is pinned to across its buckets, most recent
+  // pin first — what selection falls back to when a request's own bucket has no
+  // pin yet, so the session stays where it already is. Empty for an unknown or
+  // expired session (expired-on-read entries are dropped).
+  pinnedAccounts(sessionId, now = this._now()) {
+    const s = sessionId && this.sessions.get(sessionId);
+    if (!s) return [];
+    if (this._isExpired(s, now)) {
+      this.sessions.delete(sessionId);
+      return [];
+    }
+    return [...s.pins.values()].sort((a, b) => b.at - a.at).map(p => p.idx);
+  }
+
   // Re-point every pin through `mapFn` after the account list is renumbered (see
   // AccountManager.removeAccount). A pin is a bare position in that list, so a
   // removal one slot below silently hands the session to a different account;

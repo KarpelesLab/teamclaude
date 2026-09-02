@@ -41,7 +41,10 @@ export class JsonStreamFormatter {
       if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r') continue;
 
       if (ch === '}' || ch === ']') {
-        this.depth--;
+        // Floor at zero: the input is whatever a client or upstream sent, and a
+        // body with more closers than openers would otherwise drive the depth
+        // negative and make nl() throw on a negative repeat count.
+        this.depth = Math.max(0, this.depth - 1);
         // Empty container: emit "{}" / "[]" with no inner newline.
         if (this.freshContainer) { this.freshContainer = false; out += ch; }
         else out += this.nl(this.depth) + ch;
