@@ -142,11 +142,13 @@ Disable it with `TEAMCLAUDE_DISABLE_AUTOUPDATE=1` or `"autoUpdate": false` in th
 
 ## Request logging
 
-Log full request/response details to a directory, one file per request:
+Log request/response details to a directory, one file per logged request:
 
 ```bash
 teamclaude server --log-to /tmp/requests
 ```
+
+Bodies are truncated past a size cap, and files older than the retention window are deleted — see [`logLevel`, `logMaxBodyBytes` and `logRetentionHours`](configuration.md#fields) to widen or disable them. The first start after upgrading sweeps whatever in that directory is already older than the window.
 
 `--activity-log FILE` appends the TUI activity lines to a file instead, and works in headless mode too.
 

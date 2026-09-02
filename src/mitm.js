@@ -20,7 +20,7 @@ import tls from 'node:tls';
 import http2 from 'node:http2';
 import { getConfigPath } from './config.js';
 import { generateCertChain } from './x509.js';
-import { createProxyRequestListener, safeKeyEqual, isLoopbackAddr, relayUpgrade, resolveAccountPin } from './server.js';
+import { createProxyRequestListener, safeKeyEqual, isLoopbackAddr, relayUpgrade, resolveAccountPin, describeConnectError } from './server.js';
 
 const CA_CERT = 'teamclaude-ca.pem';
 const LEAF_CERT = 'teamclaude-leaf.pem';
@@ -201,7 +201,7 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
         up.pipe(clientSocket); clientSocket.pipe(up);
       });
       up.on('error', (err) => {
-        if (!established) log(`[TeamClaude] tunnel ${host}:${port} failed: ${err.message}`);
+        if (!established) log(`[TeamClaude] tunnel ${host}:${port} failed: ${describeConnectError(err)}`);
         teardown('502 Bad Gateway');
       });
       // A FIN before the tunnel is live (no preceding 'error') is still a failed
