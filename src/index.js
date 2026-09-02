@@ -9,7 +9,14 @@ import { installCrashHandlers } from './crash-log.js';
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
-import { sameIdentity, orgKey, matchAccounts, findUpsertTarget } from './identity.js';
+import {
+  sameIdentity,
+  orgKey,
+  matchAccounts,
+  findUpsertTarget,
+  canUpsertOAuthAccount,
+  oauthIdentityFields,
+} from './identity.js';
 import { resolveAccounts } from './resolve-accounts.js';
 import { syncAccountsFromDisk } from './sync-accounts.js';
 import * as alias from './alias.js';
@@ -1613,8 +1620,14 @@ async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
   const profile = await fetchProfile(creds.accessToken);
   const profileOk = profile && !profile.error;
 
+  if (!canUpsertOAuthAccount(profile, userNamed)) {
+    console.error(`Could not identify OAuth account — ${profile?.error || 'profile unavailable'}`);
+    console.error('Retry with valid credentials, or pass --name to add the account without profile detection.');
+    process.exit(1);
+  }
+
   if (!profileOk) {
-    console.error(`Warning: could not fetch account profile — ${profile?.error || 'no token'}`);
+    console.error(`Warning: importing named account without profile detection — ${profile?.error || 'profile unavailable'}`);
   }
   if (!name && profile?.email) {
     name = profile.email;
@@ -1630,9 +1643,7 @@ async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
     name,
     type: 'oauth',
     source,
-    accountUuid: profile?.accountUuid || null,
-    orgUuid: profile?.orgUuid || null,
-    orgName: profile?.orgName || null,
+    ...oauthIdentityFields(profile),
     accessToken: creds.accessToken,
     refreshToken: creds.refreshToken,
     expiresAt: creds.expiresAt,
