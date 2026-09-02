@@ -113,7 +113,9 @@ test('distribution on: a Fable diversion does not move the session\'s Opus pin',
 // The advisor sub-inference spends its family's quota on the serving account,
 // but selection degrades to executor-only when no account can serve both models
 // and upstream then drops the advisor call. Which happened is not visible here,
-// so the family stays unclaimed and routes on its own merits next request.
+// so the family is left unclaimed: no Fable pin is recorded. The session's next
+// Fable request still stays on the account the session already uses (the
+// existing-pin fallback), and moves only once that account cannot serve it.
 test('distribution on: an advisor sub-inference does not pin its own family', () => {
   const am = mgr(['a', 'b'], { distributeSessions: true });
   weekly(am, 0, [0.1, 50], [0.1, 50]);
@@ -122,9 +124,14 @@ test('distribution on: an advisor sub-inference does not pin its own family', ()
   const acc = am.getActiveAccount(null, OPUS, FABLE, 's1');
   am.recordSession('s1', acc.index, OPUS);
   assert.equal(acc.name, 'a');
-  // Load 'a' up so plain load-balancing sends a new Fable request elsewhere.
+  assert.equal(am.sessionTracker.pinnedAccount('s1', 'unified7dFable'), null, 'the advisor family is not claimed');
+  // Load 'a' up: load-balancing alone would send Fable elsewhere, but the
+  // session already sits on 'a' and 'a' can serve Fable, so it stays.
   am.recordSession('other-1', 0, FABLE);
   am.recordSession('other-2', 0, FABLE);
+  assert.equal(am.getActiveAccount(null, FABLE, null, 's1').name, 'a');
+  // Once 'a' cannot serve Fable the unclaimed family routes on its own merits.
+  weekly(am, 0, [0.1, 50], [0.99, 50]);
   assert.equal(am.getActiveAccount(null, FABLE, null, 's1').name, 'b');
 });
 
