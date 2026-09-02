@@ -172,6 +172,11 @@ export function truncate(s, w) {
 const BAR_MIN = 5;
 const BAR_MAX = 20;
 
+// Floor for the account name column. It grows past this toward the longest name
+// when the row has width to spare, but never drops below it, so a narrow
+// terminal lays the table out exactly as it did before the column could grow.
+const NAME_MIN = 12;
+
 // Families this account can't serve right now: a family whose own weekly bucket
 // is over the switch threshold is barred from that model while the account is
 // otherwise active. Shared by the row renderer (which draws the `⊘` tag) and the
@@ -212,11 +217,56 @@ function formatReset(resetTs) {
   return rh > 0 ? `${days}d${rh}h` : `${days}d`;
 }
 
+// Rolling-window lengths for the Claude Max buckets, used to color a bar by
+// burn rate rather than raw fill (see barColor). The five-hour session bucket
+// and the seven-day weekly buckets (unified, Sonnet, Fable) reset on these.
+const FIVE_HOUR_MS = 5 * 60 * 60 * 1000;
+const SEVEN_DAY_MS = 7 * 24 * 60 * 60 * 1000;
+
+// { bg, fg } SGR params per severity. White label on red (dark everywhere),
+// black on the lighter green/yellow/orange (bright-white would vanish on the
+// light backgrounds many terminal themes render for them).
+const BAR_GREEN = { bg: '42', fg: '30' };
+const BAR_YELLOW = { bg: '43', fg: '30' };
+const BAR_ORANGE = { bg: '48;5;208', fg: '30' };
+const BAR_RED = { bg: '41', fg: '97' };
+
+/**
+ * Pick a bar color. A bucket at or above `threshold` is red whatever its pace:
+ * that is the point where the rotation stops routing to it — eligibility()
+ * calls the account out as "at or above the switch threshold", and the row's
+ * `⊘` tag comes off the same comparison in blockedFamilies — so a green bar
+ * would contradict the rest of the row. Below it, and with a window still
+ * running, color by burn rate: how far usage is ahead of the share of the window
+ * already elapsed, so a bucket that is 80% spent with the week nearly over
+ * reads calm, not alarming. Fall back to raw utilization when there is no pace
+ * to measure — no window at all (API-key token/request bars, whose reset
+ * cadence is unknown), or a window whose reset has passed, which says nothing
+ * about the fill still being reported against it.
+ */
+function barColor(ratio, resetTs, windowMs, threshold) {
+  if (threshold != null && ratio >= threshold) return BAR_RED;
+  const remaining = resetTs ? resetTs - Date.now() : 0;
+  if (windowMs && remaining > 0) {
+    const elapsed = Math.max(0, windowMs - remaining);
+    const timePct = (elapsed / windowMs) * 100;
+    const diff = ratio * 100 - timePct;
+    if (diff <= 0) return BAR_GREEN;
+    if (diff <= 5) return BAR_YELLOW;
+    if (diff <= 15) return BAR_ORANGE;
+    return BAR_RED;
+  }
+  return ratio < 0.7 ? BAR_GREEN : ratio < 0.9 ? BAR_YELLOW : BAR_RED;
+}
+
 /**
  * Render a progress bar using background colors with text overlaid.
  * The label (e.g. "Ses 2h30m" or "45%") is drawn on top of the bar.
+ * windowMs is the bucket's rolling-window length; when known, the color tracks
+ * burn rate instead of raw fill. threshold is the routing switch threshold, at
+ * or above which the bar goes red regardless of pace.
  */
-export function bar(ratio, w = 10, resetTs) {
+export function bar(ratio, w = 10, resetTs, windowMs, threshold) {
   const rst = formatReset(resetTs);
 
   if (ratio == null || isNaN(ratio)) {
@@ -231,8 +281,7 @@ export function bar(ratio, w = 10, resetTs) {
 
   ratio = Math.max(0, Math.min(1, ratio));
   const f = Math.round(ratio * w);
-  // Background colors: 42=green, 43=yellow, 41=red; 100=bright black (gray) for empty
-  const bg = ratio < 0.7 ? 42 : ratio < 0.9 ? 43 : 41;
+  const { bg, fg } = barColor(ratio, resetTs, windowMs, threshold);
 
   // Build the label to overlay: show reset time if available, else percentage
   const pct = (ratio * 100).toFixed(0) + '%';
@@ -247,13 +296,8 @@ export function bar(ratio, w = 10, resetTs) {
   const filled = chars.slice(0, f);
   const empty = chars.slice(f);
 
-  // Black label on green/yellow: terminal themes commonly render those
-  // backgrounds light, and bright-white text disappears on them. White stays
-  // on red, which is dark in practically every palette.
-  const fgc = bg === 41 ? 97 : 30;
-
   let out = '';
-  if (filled) out += `${ESC}${bg};${fgc}m${filled}`;
+  if (filled) out += `${ESC}${bg};${fg}m${filled}`;
   if (empty) out += `${ESC}100;37m${empty}`;
   out += RESET;
   return out;
@@ -1199,7 +1243,7 @@ export class TUI {
         const names = blockedFamilies(a.quota, this.am.switchThreshold);
         return names.length ? Math.max(w, 4 + vw(names.join(' '))) : w;
       }, 0);
-      const fixed = 40 + (genRoutes.length ? genRoutes.length + 1 : 0) + tagW;
+      const fixed = 28 + NAME_MIN + (genRoutes.length ? genRoutes.length + 1 : 0) + tagW;
       const roomFor = n => fixed + 6 * (n - 1) + n * BAR_MIN <= W;
       // The family bars are the first thing to go: below the width where they
       // fit even at BAR_MIN they would push the row past the edge, and a row cut
@@ -1209,6 +1253,16 @@ export class TUI {
       const nbars = (showBoth ? 2 : 1) + (showFamily ? (anyFable ? 1 : 0) + (anySonnet ? 1 : 0) : 0);
       const bw = Math.max(BAR_MIN, Math.min(BAR_MAX, Math.floor((W - fixed - 6 * (nbars - 1)) / nbars)));
 
+      // Whatever the chrome and the capped bars leave over goes to the name
+      // column, up to the longest name in the fleet, so a wide terminal shows
+      // whole addresses instead of `a-considerab`. `fixed` already reserves
+      // NAME_MIN, so only the surplus past it is spent here: the row stays
+      // inside the budget above, and a terminal with no surplus keeps the
+      // twelve-column cell it had.
+      const longestName = Math.max(0, ...this.am.accounts.map(a => vw(a.name)));
+      const slack = Math.max(0, W - fixed - 6 * (nbars - 1) - nbars * bw);
+      const nameW = Math.max(NAME_MIN, Math.min(longestName, NAME_MIN + slack));
+
       // The single account each secondary bucket currently routes to (null = none
       // can serve it right now). Marked next to that account's F7/S7 bar — the
       // secondary-quota analogue of ► marking the default route's current account.
@@ -1217,7 +1271,7 @@ export class TUI {
         sonnet: anySonnet ? this.am.previewRouteIndex('claude-sonnet-4-6') : null,
       };
       for (let i = 0; i < this.am.accounts.length; i++) {
-        lines.push(this._renderAcct(i, bw, showBoth, routes, genRoutes, familyTarget, showFamily));
+        lines.push(this._renderAcct(i, bw, showBoth, routes, genRoutes, familyTarget, showFamily, nameW));
       }
     }
 
@@ -1270,7 +1324,7 @@ export class TUI {
     this._paint(buf, force);
   }
 
-  _renderAcct(idx, bw, showBoth, routes = this.am.getRoutes(), genRoutes = routes.filter(r => routeFamily(r) === null), familyTarget = {}, showFamily = true) {
+  _renderAcct(idx, bw, showBoth, routes = this.am.getRoutes(), genRoutes = routes.filter(r => routeFamily(r) === null), familyTarget = {}, showFamily = true, nameW = NAME_MIN) {
     const a = this.am.accounts[idx];
     const isCur = idx === this.am.currentIndex;
     const isSel = this.mode === 'select' && idx === this.selIdx;
@@ -1303,8 +1357,13 @@ export class TUI {
       return routeGlyph(routeColorFn(r?.color), true, pinned);
     };
 
-    // Name (bold if selected)
-    const rawName = a.name.slice(0, 12).padEnd(12);
+    // Name (bold if selected), cut and padded in display columns. A
+    // slice/padEnd pair counts UTF-16 units instead, so a six-character CJK
+    // name keeps all six characters and still collects six columns of padding,
+    // shifting everything after it. truncate stops a column short of the limit
+    // when it drops a wide glyph that would straddle it, so rpad finishes the
+    // cell.
+    const rawName = rpad(truncate(a.name, nameW), nameW);
     const name = isSel ? bold(rawName) : rawName;
 
     // Type
@@ -1325,13 +1384,15 @@ export class TUI {
 
     // Quota ratios — prefer unified (Claude Max), fall back to standard (API key)
     const q = a.quota;
-    let r1 = null, r2 = null, l1 = 'Ses', l2 = 'Wk ', t1 = null, t2 = null;
+    let r1 = null, r2 = null, l1 = 'Ses', l2 = 'Wk ', t1 = null, t2 = null, w1 = null, w2 = null;
 
     if (q.unified5h != null || q.unified7d != null || q.unified7dSonnet != null || q.unified7dFable != null) {
       r1 = q.unified5h;
       r2 = q.unified7d;
       t1 = q.unified5hReset;
       t2 = q.unified7dReset;
+      w1 = FIVE_HOUR_MS;
+      w2 = SEVEN_DAY_MS;
     } else {
       l1 = 'Tok';
       l2 = 'Req';
@@ -1343,17 +1404,21 @@ export class TUI {
       t2 = t1;
     }
 
-    let line = ` ${sel}${cur} ${startSlot}${name} ${type} ${status} ${l1} ${bar(r1, bw, t1)}`;
+    // The live routing threshold, so a bucket the rotation already refuses to
+    // use reads red however healthy its pace looks.
+    const th = this.am.switchThreshold;
+
+    let line = ` ${sel}${cur} ${startSlot}${name} ${type} ${status} ${l1} ${bar(r1, bw, t1, w1, th)}`;
     if (showBoth) {
-      line += `  ${l2} ${bar(r2, bw, t2)}`;
+      line += `  ${l2} ${bar(r2, bw, t2, w2, th)}`;
       // Sonnet weekly bar — only shown when the usage probe has populated it. A
       // leading ► (in place of a padding space) marks a Sonnet route on this account.
       if (showFamily && q.unified7dSonnet != null) {
-        line += ` ${familyMark('sonnet')}S7  ${bar(q.unified7dSonnet, bw, q.unified7dSonnetReset)}`;
+        line += ` ${familyMark('sonnet')}S7  ${bar(q.unified7dSonnet, bw, q.unified7dSonnetReset, SEVEN_DAY_MS, th)}`;
       }
       // Fable weekly bar — only shown when the usage probe has populated it.
       if (showFamily && q.unified7dFable != null) {
-        line += ` ${familyMark('fable')}F7  ${bar(q.unified7dFable, bw, q.unified7dFableReset)}`;
+        line += ` ${familyMark('fable')}F7  ${bar(q.unified7dFable, bw, q.unified7dFableReset, SEVEN_DAY_MS, th)}`;
       }
     }
     // Explicit "disabled for these models" tag (issue #85): a family whose own

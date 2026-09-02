@@ -8,7 +8,7 @@ import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConf
 import { installCrashHandlers } from './crash-log.js';
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
-import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
+import { importCredentials, loginOAuth, loginOAuthWithPastedCode, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import {
   sameIdentity,
   orgKey,
@@ -624,6 +624,10 @@ async function loginCommand() {
     await loginApiCommand();
     return;
   }
+  if (args.includes('--token')) {
+    await loginOAuthCommand({ pasteOnly: true });
+    return;
+  }
   if (args.includes('--oauth')) {
     await loginOAuthCommand();
     return;
@@ -677,14 +681,14 @@ async function loginApiCommand() {
   console.log(`Saved to ${getConfigPath()}`);
 }
 
-async function loginOAuthCommand() {
+async function loginOAuthCommand({ pasteOnly = false } = {}) {
   const config = await loadOrCreateConfig();
   let name = argValue('--name');
 
   console.log('Starting OAuth login...');
   let creds;
   try {
-    creds = await loginOAuth();
+    creds = pasteOnly ? await loginOAuthWithPastedCode() : await loginOAuth();
   } catch (err) {
     console.error(`OAuth login failed: ${err.message}`);
     console.error('');
@@ -1535,6 +1539,7 @@ Commands:
   server              Start the proxy server (default; --headless to skip the TUI)
   import              Import credentials from Claude Code
   login               OAuth login via browser
+  login --token       OAuth login via copy/paste (no local callback; for headless/remote)
   login --api         Add an API key account
   env [--no-mitm]     Print export lines to point Claude Code at the proxy, for
                       'eval "$(teamclaude env)"' (MITM forward-proxy by default;
