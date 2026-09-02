@@ -286,8 +286,9 @@ export function normalizeUsageBucket(bucket) {
 /**
  * Fetch OAuth subscription usage from the usage endpoint. This reports quota
  * utilization WITHOUT spending message quota, which is what makes it safe to
- * poll. Returns normalized { fiveHour, sevenDay, sevenDaySonnet, sevenDayFable } buckets, or
- * { error, status } on failure.
+ * poll. Returns normalized { fiveHour, sevenDay, sevenDaySonnet, sevenDayFable } buckets
+ * plus scopedWeeklyListed (whether the payload enumerated its model-scoped
+ * weekly caps), or { error, status } on failure.
  */
 export async function fetchUsage(accessToken) {
   try {
@@ -310,16 +311,32 @@ export async function fetchUsage(accessToken) {
       return { error: `HTTP ${res.status}${detail ? ': ' + detail : ''}`, status: res.status };
     }
 
-    const data = await res.json();
-    return {
-      fiveHour: normalizeUsageBucket(data?.five_hour),
-      sevenDay: normalizeUsageBucket(data?.seven_day),
-      sevenDaySonnet: normalizeUsageBucket(data?.seven_day_sonnet),
-      sevenDayFable: normalizeUsageBucket(findScopedWeeklyLimit(data, /fable/i)),
-    };
+    return normalizeUsagePayload(await res.json());
   } catch (err) {
     return { error: err.message || String(err), status: null };
   }
+}
+
+/**
+ * Map a /api/oauth/usage payload to the buckets the quota model tracks. Pure, so
+ * the mapping is testable without a network round trip.
+ */
+export function normalizeUsagePayload(data) {
+  return {
+    fiveHour: normalizeUsageBucket(data?.five_hour),
+    sevenDay: normalizeUsageBucket(data?.seven_day),
+    // Both families are read from limits[], where upstream enumerates the
+    // model-scoped weekly caps this account actually has. The legacy
+    // seven_day_<model> keys read null on current plans, so a family sourced
+    // from them alone is indistinguishable from a family with no cap.
+    sevenDaySonnet: normalizeUsageBucket(data?.seven_day_sonnet ?? findScopedWeeklyLimit(data, /sonnet/i)),
+    sevenDayFable: normalizeUsageBucket(findScopedWeeklyLimit(data, /fable/i)),
+    // True when the payload carried that enumeration. It is what makes a
+    // MISSING family meaningful: upstream listed this account's scoped weekly
+    // caps and that family was not among them. Without the list, a missing
+    // family is our own ignorance and nothing may be concluded from it.
+    scopedWeeklyListed: Array.isArray(data?.limits),
+  };
 }
 
 // OAuth config (extracted from Claude Code). Client id + token endpoint are

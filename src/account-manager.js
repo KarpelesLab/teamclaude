@@ -27,8 +27,8 @@ const PERSISTED_QUOTA_FIELDS = [
 // only trusted while it is fresh, because nothing but a request of that family
 // can refresh it.
 const FAMILY_WEEKLY_BUCKETS = [
-  { key: 'unified7dFable', label: 'Fable' },
-  { key: 'unified7dSonnet', label: 'Sonnet' },
+  { key: 'unified7dFable', label: 'Fable', usageKey: 'sevenDayFable' },
+  { key: 'unified7dSonnet', label: 'Sonnet', usageKey: 'sevenDaySonnet' },
 ];
 
 function emptyQuota() {
@@ -1272,7 +1272,9 @@ export class AccountManager {
    */
   applyUsageData(accountIndex, usage) {
     const account = this.accounts[accountIndex];
-    if (!account || !usage) return;
+    // A failed probe carries no readings. Treating one as data would let a
+    // transient HTTP error clear a bucket below.
+    if (!account || !usage || usage.error) return;
     const q = account.quota;
 
     if (usage.fiveHour) {
@@ -1283,24 +1285,44 @@ export class AccountManager {
       if (usage.sevenDay.utilization != null) q.unified7d = usage.sevenDay.utilization;
       if (usage.sevenDay.resetAt != null) q.unified7dReset = usage.sevenDay.resetAt;
     }
+
     // The family buckets carry a "last confirmed" stamp (see _clearExpiredQuotas).
     // A probe is upstream evidence just like a response header, so it refreshes
     // the stamp — this is the one path that can correct a spent family reading
     // without spending quota, which is why enabling the probe sidesteps the
     // staleness problem entirely.
-    if (usage.sevenDaySonnet) {
-      if (usage.sevenDaySonnet.utilization != null) {
-        q.unified7dSonnet = usage.sevenDaySonnet.utilization;
-        q.unified7dSonnetSeenAt = Date.now();
+    //
+    // For that to hold, a probe has to be able to say "no such cap" as well as
+    // "this much of it is spent". A successful probe that reports a family it
+    // once reported is upstream retiring that cap (or the window never having
+    // started), and leaving the old number in place would keep gating on a limit
+    // that is no longer there — the exact seal-in #167 described, surviving in
+    // the path meant to be its escape hatch. So a family MISSING from a payload
+    // that enumerated this account's scoped weekly caps is cleared. A payload
+    // that carried no such enumeration proves nothing and changes nothing.
+    //
+    // The reported reset is taken verbatim, null included: an unstarted window
+    // has no reset, and keeping a stale one (copied from the shared weekly
+    // bucket by the header path) both misdates the bar and misranks the account.
+    const now = Date.now();
+    for (const { key, label, usageKey } of FAMILY_WEEKLY_BUCKETS) {
+      const bucket = usage[usageKey];
+      const wasSpent = q[key] != null && q[key] >= this.switchThreshold;
+      if (bucket && bucket.utilization != null) {
+        q[key] = bucket.utilization;
+        q[`${key}Reset`] = bucket.resetAt ?? null;
+        q[`${key}SeenAt`] = now;
+      } else if (!bucket && usage.scopedWeeklyListed) {
+        q[key] = null;
+        q[`${key}Reset`] = null;
+        q[`${key}SeenAt`] = null;
+      } else {
+        continue;
       }
-      if (usage.sevenDaySonnet.resetAt != null) q.unified7dSonnetReset = usage.sevenDaySonnet.resetAt;
-    }
-    if (usage.sevenDayFable) {
-      if (usage.sevenDayFable.utilization != null) {
-        q.unified7dFable = usage.sevenDayFable.utilization;
-        q.unified7dFableSeenAt = Date.now();
+      // Worth a line: the account was refusing this family and is not any more.
+      if (wasSpent && !(q[key] != null && q[key] >= this.switchThreshold)) {
+        console.log(`[TeamClaude] Account "${account.name}" ${label} weekly quota confirmed available by probe`);
       }
-      if (usage.sevenDayFable.resetAt != null) q.unified7dFableReset = usage.sevenDayFable.resetAt;
     }
 
     // If we just learned this account's weekly window while probing, re-evaluate
