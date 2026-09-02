@@ -98,3 +98,13 @@ test('scoped buckets survive a restart', () => {
   restored.restoreQuotaState(am.exportQuotaState());
   assert.equal(restored._isAvailable(restored.accounts[0], 'claude-opus-5'), false);
 });
+
+test('a scoped bucket whose window has passed stops gating without a new probe', () => {
+  const am = new AccountManager([oauth('a')], 0.98);
+  am.applyUsageData(0, {
+    sevenDay: { utilization: 0.2, resetAt: Date.now() + 3 * 24 * 3600_000 },
+    scopedWeekly: { opus: { utilization: 0.99, resetAt: Date.now() - 1 } }, // window already over
+  });
+  assert.equal(am._isAvailable(am.accounts[0], 'claude-opus-5'), true);
+  assert.equal(am.accounts[0].quota.scopedWeekly.opus, undefined, 'the expired entry is dropped');
+});
