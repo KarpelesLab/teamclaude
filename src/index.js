@@ -265,6 +265,10 @@ async function serverCommand() {
     // Pick up route table edits (teamclaude route …, TUI editor, or a hand edit).
     config.routes = diskConfig.routes || [];
     accountManager.setRoutes(config.routes);
+    // Pick up a distributeSessions change (hand edit or another writer) the same
+    // way routes, sx, probe and warmup are picked up below.
+    config.distributeSessions = !!diskConfig.distributeSessions;
+    accountManager.setDistributeSessions(config.distributeSessions);
     // Apply an sx.org key/mode change made on disk (e.g. via POST /teamclaude/reload).
     const diskSxKey = diskConfig.sx?.apiKey || null;
     const diskSxMode = diskConfig.sx?.mode || 'always';
