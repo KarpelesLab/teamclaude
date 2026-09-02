@@ -80,6 +80,62 @@ test('a family with no bucket of its own falls back to the shared weekly', () =>
     am._expiryPressure(am.accounts[0], OPUS, now));
 });
 
+test('a LEARNED family bucket is read, not the shared weekly it hides behind', () => {
+  // Upstream meters some families with a weekly bucket the family table has
+  // never heard of, reported scoped to the family and learned at runtime
+  // (#231). The gate takes the tighter of that and the shared weekly; pressure
+  // must read the same one, or an account with 10% of its Opus quota left is
+  // credited with the shared window's 90% headroom and ranks first.
+  const am = mgr(['a', 'b'], { expiry: ON });
+  const now = Date.now();
+  bucket(am, 0, 'unified7d', 0.10, 48, now);
+  bucket(am, 1, 'unified7d', 0.50, 48, now);
+  am.accounts[0].quota.scopedWeekly = { opus: { utilization: 0.90, resetAt: now + 48 * H } };
+
+  assert.equal(am._governingWeekly(am.accounts[0], OPUS), 0.90);
+  near(am._expiryPressure(am.accounts[0], OPUS, now), 0.10 / (48 * 3600), 'scoped headroom');
+  assert.ok(am._expiryPressure(am.accounts[0], OPUS, now) < am._expiryPressure(am.accounts[1], OPUS, now),
+    'the scoped-spent account must not outrank the one with real headroom');
+  assert.deepEqual(am._topPressureBand(am.accounts, OPUS).map(a => a.name), ['b']);
+
+  // A family the scoped map says nothing about still reads the shared weekly.
+  near(am._expiryPressure(am.accounts[0], FABLE, now), 0.90 / (48 * 3600), 'unscoped family');
+});
+
+test('the gate and the ranking read the same number, however the bucket resolves', () => {
+  // The scoped reading answers for the REQUEST's bucket, not for whichever
+  // window that bucket fell back to. A family bucket the account does not
+  // report, and a route override naming a field nothing fills, both collapse
+  // onto the shared window — and the gate reads the shared number plainly in
+  // both. Following the collapse into scopedWeekly would disagree with it in
+  // exactly the cases it does not consult.
+  const now = Date.now();
+  const scoped = { opus: { utilization: 0.90, resetAt: now + 12 * H } };
+  const cases = [
+    ['scoped binds', OPUS, q => Object.assign(q, { unified7d: 0.10, scopedWeekly: scoped })],
+    ['shared binds', OPUS, q => Object.assign(q, { unified7d: 0.95, scopedWeekly: scoped })],
+    ['no scoped map', OPUS, q => Object.assign(q, { unified7d: 0.40, scopedWeekly: {} })],
+    ['malformed entry', OPUS, q => Object.assign(q, { unified7d: 0.40, scopedWeekly: { opus: 7 } })],
+    ['family bucket absent', FABLE, q => Object.assign(q, { unified7d: 0.10, scopedWeekly: { fable: { utilization: 0.95, resetAt: now + 5 * H } } })],
+    ['family bucket present', FABLE, q => Object.assign(q, { unified7d: 0.10, unified7dFable: 0.55, scopedWeekly: { fable: { utilization: 0.95, resetAt: now + 5 * H } } })],
+  ];
+  for (const [label, model, fill] of cases) {
+    const am = mgr(['a'], { expiry: ON });
+    fill(am.accounts[0].quota);
+    assert.equal(am._governingWindow(am.accounts[0], model).utilization,
+      am._governingWeekly(am.accounts[0], model), label);
+  }
+  // And with a route override, whether or not the override bucket is reported.
+  for (const reported of [false, true]) {
+    const am = mgr(['a'], { expiry: ON });
+    am.setRoutes([{ name: 'r', match: ['claude-opus-*'], bucket: 'unified7dCustom' }]);
+    Object.assign(am.accounts[0].quota, { unified7d: 0.10, scopedWeekly: scoped });
+    if (reported) am.accounts[0].quota.unified7dCustom = 0.70;
+    assert.equal(am._governingWindow(am.accounts[0], OPUS).utilization,
+      am._governingWeekly(am.accounts[0], OPUS), `route override, reported=${reported}`);
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Ordering, and the drained-account guard
 // ---------------------------------------------------------------------------

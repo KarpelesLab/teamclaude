@@ -1201,6 +1201,42 @@ export class AccountManager {
   }
 
   /**
+   * That bucket's actual reading: how spent the governing window is and when it
+   * resets, both from the one window, which is what makes their ratio a rate
+   * rather than a mixture of two clocks.
+   *
+   * A family with no dedicated bucket may still be metered by a weekly bucket
+   * upstream reports scoped to it, learned at runtime rather than named in the
+   * family table (#231). `_governingWeekly` gates on the tighter of that and the
+   * shared weekly, so the reading pressure ranks on has to resolve the same way:
+   * crediting such an account with the shared window's headroom would rank it on
+   * quota the gate has already decided it does not have, and send that family's
+   * traffic to the account most spent on it — the very substitution the paired
+   * read exists to prevent, arriving by a route the family table cannot see.
+   *
+   * The scoped bucket carries its own reset, so when it is the binding one both
+   * halves still come from it. Only the shared weekly has a dedicated `Reset`
+   * field, which is why this returns the pair rather than a bucket name.
+   *
+   * The scoped reading is consulted on the REQUEST's bucket, not on the window
+   * that bucket fell back to. A family bucket the account does not report, and a
+   * route `bucket` override naming a field nothing fills, both collapse onto the
+   * shared window — and `_governingWeekly` reads the shared number plainly in
+   * both cases. Following the collapse here instead would answer from a family's
+   * scoped bucket in exactly the cases the gate does not, which is the same
+   * disagreement in the other direction.
+   */
+  _governingWindow(account, model) {
+    const key = this._governingBucket(account, model);
+    const flat = { utilization: account.quota[key], resetAt: account.quota[`${key}Reset`] };
+    if (this._weeklyBucketFor(model) !== 'unified7d') return flat;
+    const scoped = this._scopedWeekly(account, model);
+    if (scoped?.utilization == null) return flat;
+    if (flat.utilization != null && flat.utilization >= scoped.utilization) return flat;
+    return { utilization: scoped.utilization, resetAt: scoped.resetAt };
+  }
+
+  /**
    * Expiry pressure of `account` for `model`: headroom in the governing weekly
    * bucket per second until that bucket resets. Headroom alone ignores expiry
    * and reset time alone steers into nearly-drained accounts; the ratio captures
@@ -1277,14 +1313,9 @@ export class AccountManager {
 
   /**
    * The band decision's view of a candidate set. Reads the accounts and the
-   * config; the decision itself reads neither. `now` is passed in rather than
-   * taken here so that a caller can ask what the band decides at any instant, and
-   * so the pure layer stays drivable from a test.
-   *
-   * Both halves of each account's ratio come from the ONE bucket
-   * `_governingBucket` names. A family bucket reporting a utilization but no
-   * window makes that account unknown rather than borrowing the shared window's
-   * horizon.
+   * config; the decision itself reads neither. `now` is an argument so a caller
+   * can ask what the band makes of some other instant. Both halves of each
+   * account's ratio come from the ONE window `_governingWindow` resolves.
    */
   _bandSnapshot(candidates, model, now) {
     return {
@@ -1292,9 +1323,7 @@ export class AccountManager {
       enabled: !!this.expiryRouting.enabled,
       tolerance: this.expiryRouting.tolerance,
       accounts: candidates.map(a => {
-        const key = this._governingBucket(a, model);
-        const used = a.quota[key];
-        const reset = a.quota[`${key}Reset`];
+        const { utilization: used, resetAt: reset } = this._governingWindow(a, model);
         return {
           index: a.index,
           priority: a.priority || 0,
