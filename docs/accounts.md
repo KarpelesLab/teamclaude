@@ -81,6 +81,12 @@ teamclaude priority <name> --last
 
 Accounts can also be added and removed from the TUI settings screen: **`g`** → **Add account** / **Remove account**.
 
+## The `id` field
+
+Every account entry carries an `id`, added the first time the config is read and written back on the next save. It is what ties an entry to the running account built from it: entries without a usable credential are skipped at startup, so an entry's place in the file is not the account's place in the fleet, and a token refreshed for one account would otherwise be recorded against another.
+
+Hand edits are fine. Leave the `id` alone and it keeps working; delete it and a new one is issued on the next read. If you copy an account block to make a second entry, the duplicated `id` is spotted on the next read and the later of the two gets a fresh one.
+
 ## Third-party backend accounts
 
 Any Anthropic-compatible API can be added as an account alongside your Claude accounts. Give it a higher `priority` value (lower = preferred, so use e.g. `100`) and it will be used as a fallback when all Claude accounts are exhausted.

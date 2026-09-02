@@ -6,6 +6,7 @@ import {
   emailOf,
   matchAccounts,
   findUpsertTarget,
+  updateAccountEntry,
   distinctAccounts,
   canUpsertOAuthAccount,
   oauthIdentityFields,
@@ -188,4 +189,28 @@ test('unavailable profile fields do not erase stored OAuth identity', () => {
     orgUuid: 'new-org',
     orgName: 'New Example',
   });
+});
+
+// The merge applied at a findUpsertTarget hit. Both the CLI login/import path
+// and the TUI's import go through it, and the id it pins is what a running
+// server uses to find the account built from this entry: reissue it and that
+// account has no entry to be saved onto, so the next token it refreshes is
+// dropped instead of persisted, and the account fails on the following start
+// with a credential that was already rotated away.
+test('an upsert keeps the existing entry\'s id and name', () => {
+  const prev = { id: 'entry-0', name: 'chosen-name', type: 'oauth', accessToken: 'old', importFrom: '~/creds.json' };
+  const incoming = { name: 'profile@example.com', type: 'oauth', accessToken: 'fresh', accountUuid: 'u1' };
+
+  const merged = updateAccountEntry(prev, incoming);
+
+  assert.equal(merged.id, 'entry-0');
+  assert.equal(merged.name, 'chosen-name');
+  assert.equal(merged.accessToken, 'fresh', 'the credential is what an upsert is for');
+  assert.equal(merged.accountUuid, 'u1', 'and freshly learned identity lands too');
+  assert.equal(merged.importFrom, '~/creds.json', 'a disk-only field survives');
+});
+
+test('an upsert keeps the existing id even when the incoming record carries one', () => {
+  const merged = updateAccountEntry({ id: 'entry-0', name: 'a' }, { id: 'minted-elsewhere', name: 'a' });
+  assert.equal(merged.id, 'entry-0');
 });

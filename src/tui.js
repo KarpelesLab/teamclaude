@@ -3,9 +3,12 @@ import { importCredentials, fetchProfile } from './oauth.js';
 import {
   sameIdentity,
   findUpsertTarget,
+  updateAccountEntry,
   canUpsertOAuthAccount,
   oauthIdentityFields,
 } from './identity.js';
+import { configIndexFor, managerAccountFor } from './account-pairing.js';
+import { mintAccountId } from './account-id.js';
 import { formatPercent } from './status-renderer.js';
 import { parseProxyUrl, proxyToUrl, describeProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy } from './upstream-proxy.js';
 
@@ -980,9 +983,16 @@ export class TUI {
 
       if (idx >= 0) {
         const prev = this.config.accounts[idx];
-        this.config.accounts[idx] = { ...prev, ...entry, name: prev.name };
-        // Update the running account manager entry
-        const amAcct = this.am.accounts.find(a => sameIdentity(a, entry)) || this.am.accounts[idx];
+        this.config.accounts[idx] = updateAccountEntry(prev, entry);
+        // The account to update is the one built from this entry. Identity cannot
+        // answer that: the entry may have matched on a bare name while carrying no
+        // UUID, and then no account matches the freshly profiled identity at all.
+        // Falling back to `accounts[idx]` there applied a CONFIG index to this
+        // list and wrote the new credential and the new UUID onto whichever
+        // account sat at that position — a different person's, once
+        // resolveAccounts has dropped anything ahead of it. An entry with no
+        // running account now updates nothing, which is what there is to do.
+        const amAcct = managerAccountFor(this.am.accounts, prev);
         if (amAcct) {
           amAcct.credential = creds.accessToken;
           amAcct.refreshToken = creds.refreshToken;
@@ -1007,6 +1017,9 @@ export class TUI {
             entry.name = `${name} (${orgLbl(entry)})`;
           }
         }
+        // One object into both lists, so the account is built carrying its
+        // entry's id and the two pair from the moment they exist.
+        entry.id = mintAccountId();
         this.config.accounts.push(entry);
         this.am.addAccount(entry);
         this._addLog(`Imported account "${entry.name}"`);
@@ -1021,8 +1034,11 @@ export class TUI {
   async _doAddKey(apiKey) {
     const n = this.config.accounts.filter(a => a.name.startsWith('api-')).length + 1;
     const name = `api-${n}`;
-    this.config.accounts.push({ name, type: 'apikey', apiKey });
-    this.am.addAccount({ name, type: 'apikey', apiKey });
+    // One object, not two equal literals: the account has to be built from the
+    // entry itself to carry its id, which is what pairs the two afterwards.
+    const entry = { id: mintAccountId(), name, type: 'apikey', apiKey };
+    this.config.accounts.push(entry);
+    this.am.addAccount(entry);
     await this.saveConfig(this.config);
     this._addLog(`Added API key account "${name}"`);
   }
@@ -1030,8 +1046,14 @@ export class TUI {
   async _doRemove(idx) {
     if (idx < 0 || idx >= this.am.accounts.length) return;
     const name = this.am.accounts[idx].name;
+    // Resolved before removeAccount, which splices this list and renumbers it.
+    // The selected row is a manager index; applying it to the config list
+    // deleted whichever entry sat at that position instead — the credential-less
+    // one resolveAccounts dropped, or a neighbour, either of which leaves the
+    // fleet running an account whose entry is gone.
+    const cfgIdx = configIndexFor(this.config.accounts, this.am.accounts, idx);
     this.am.removeAccount(idx);
-    this.config.accounts.splice(idx, 1);
+    if (cfgIdx >= 0) this.config.accounts.splice(cfgIdx, 1);
     if (this.selIdx >= this.am.accounts.length) this.selIdx = Math.max(0, this.am.accounts.length - 1);
     await this.saveConfig(this.config);
     this._addLog(`Removed account "${name}"`);
@@ -1041,10 +1063,15 @@ export class TUI {
     if (idx < 0 || idx >= this.am.accounts.length) return;
     const acct = this.am.accounts[idx];
     const next = !acct.disabled;
+    const cfgIdx = configIndexFor(this.config.accounts, this.am.accounts, idx);
     this.am.setDisabled(idx, next); // re-enabling also clears a stuck error state
     // Write an explicit boolean (not delete): saveConfig merges over the on-disk
     // entry, so a `delete` would leave a stale `disabled: true` from disk intact.
-    if (this.config.accounts[idx]) this.config.accounts[idx].disabled = next;
+    // Onto this account's own entry: a manager index is not a config index, so
+    // the flag used to land on a neighbour and the next save persisted it there,
+    // leaving one account disabled on disk while the operator watched another go
+    // grey on screen.
+    if (cfgIdx >= 0) this.config.accounts[cfgIdx].disabled = next;
     await this.saveConfig(this.config);
     this._addLog(`${next ? 'Disabled' : 'Enabled'} account "${acct.name}"`);
   }

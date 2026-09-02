@@ -68,6 +68,22 @@ export function findUpsertTarget(accounts, incoming) {
   return accounts.findIndex(a => a.name === incoming.name && !distinctAccounts(a, incoming));
 }
 
+/**
+ * The entry to store at a `findUpsertTarget` hit: `incoming` over `prev`, with
+ * two of the existing entry's fields pinned.
+ *
+ * `name` because a login should not rename an account the operator named. `id`
+ * because a running server holds an account built from this entry and finds it
+ * again by that id (see account-pairing.js) — reissuing it here would strand
+ * that account with no entry to be saved onto, and the token it refreshes next
+ * would be dropped instead of persisted. An `incoming` record carrying neither
+ * field already leaves both alone; pinning them says so, and keeps saying so if
+ * one day it carries them.
+ */
+export function updateAccountEntry(prev, incoming) {
+  return { ...prev, ...incoming, name: prev.name, id: prev.id };
+}
+
 /** The email portion of a display name, stripping any " (org)" suffix. */
 export function emailOf(acct) {
   return (acct?.name || '').replace(/ \(.*\)$/, '');

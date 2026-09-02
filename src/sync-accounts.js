@@ -1,5 +1,6 @@
 import { importCredentials } from './oauth.js';
 import { sameIdentity } from './identity.js';
+import { ensureAccountIds } from './account-id.js';
 
 /**
  * Sync accounts from disk config: add new accounts and refresh credentials
@@ -43,8 +44,13 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     const mgrIdx = claim(diskAcct);
 
     if (mgrIdx < 0) {
-      // New account discovered on disk — add to running server
+      // New account discovered on disk — add to running server. Both lists take
+      // the same object, so the account is built carrying its entry's id and the
+      // two pair from the moment they exist. ensureAccountIds runs between the
+      // two: a hand-copied section arrives holding an id this list already uses,
+      // and re-minting it before the account is built keeps the pair correct.
       memConfig.accounts.push(diskAcct);
+      ensureAccountIds(memConfig.accounts);
       accountManager.addAccount(diskAcct);
       claimed.add(accountManager.accounts.length - 1);
       cfgClaimed.add(memConfig.accounts.length - 1);

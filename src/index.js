@@ -14,11 +14,14 @@ import {
   orgKey,
   matchAccounts,
   findUpsertTarget,
+  updateAccountEntry,
   canUpsertOAuthAccount,
   oauthIdentityFields,
 } from './identity.js';
 import { resolveAccounts } from './resolve-accounts.js';
 import { syncAccountsFromDisk } from './sync-accounts.js';
+import { mergeAccountsForSave, syncRefreshedTokens } from './account-pairing.js';
+import { ensureAccountIds } from './account-id.js';
 import * as alias from './alias.js';
 import { ensureCerts } from './mitm.js';
 import { Prober } from './prober.js';
@@ -229,19 +232,22 @@ async function serverCommand() {
   accountManager.onTokenRefresh((idx, newTokens) => {
     const account = accountManager.accounts[idx];
     if (!account) return;
-    // Keep config.accounts in sync so TUI saveConfig doesn't clobber fresh tokens
-    if (config.accounts[idx]) {
-      config.accounts[idx].accessToken = newTokens.accessToken;
-      config.accounts[idx].refreshToken = newTokens.refreshToken;
-      config.accounts[idx].expiresAt = newTokens.expiresAt;
-    }
+    // Keep config.accounts in sync so the TUI save does not clobber fresh tokens.
+    // A -1 means no config entry pairs with this account and the in-memory copy
+    // keeps what it had; the disk write below is unaffected either way, since it
+    // resolves its own row through findConfigAccount rather than this pairing.
+    syncRefreshedTokens(config.accounts, accountManager.accounts, idx, newTokens);
     atomicConfigUpdate(diskConfig => {
-      // Pick up any new accounts from disk so index matching stays correct
+      // Pick up any new accounts from disk so the running fleet serves them
       // (only add, don't refresh credentials — we're about to write the authoritative tokens)
       for (const diskAcct of diskConfig.accounts) {
         const known = config.accounts.some(a => sameIdentity(a, diskAcct));
         if (!known) {
+          // Same object into both lists, so the account carries its entry's id;
+          // ensureAccountIds first, in case the entry brought in one this list
+          // already uses. See the matching add in sync-accounts.js.
           config.accounts.push(diskAcct);
+          ensureAccountIds(config.accounts);
           accountManager.addAccount(diskAcct);
         }
       }
@@ -326,20 +332,7 @@ async function serverCommand() {
     tui = new TUI({
       accountManager, config, sx, activityLogPath,
       saveConfig: () => atomicConfigUpdate(async diskConfig => {
-        // Write in-memory accounts as the authoritative state, preserving
-        // extra disk-only fields (e.g. importFrom) where the account still exists.
-        // Use live tokens from AccountManager (not the stale config.accounts copy).
-        diskConfig.accounts = config.accounts.map((a, i) => {
-          const am = accountManager.accounts[i];
-          const live = am ? {
-            ...a,
-            accessToken: am.credential,
-            refreshToken: am.refreshToken,
-            expiresAt: am.expiresAt,
-          } : a;
-          const diskAcct = diskConfig.accounts.find(d => sameIdentity(d, a));
-          return diskAcct ? { ...diskAcct, ...live } : live;
-        });
+        diskConfig.accounts = mergeAccountsForSave(config.accounts, accountManager.accounts, diskConfig.accounts);
         // Persist sx.org settings (set/cleared from the TUI settings screen).
         if (config.sx) diskConfig.sx = config.sx; else delete diskConfig.sx;
         // Persist other runtime-tunable settings edited from the TUI.
@@ -1661,9 +1654,9 @@ async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
 
   if (idx >= 0) {
     // Same account+org: refresh credentials and org info, but keep the existing
-    // display name and any disk-only fields (e.g. importFrom).
+    // display name, entry id, and any disk-only fields (e.g. importFrom).
     const prev = config.accounts[idx];
-    config.accounts[idx] = { ...prev, ...account, name: prev.name };
+    config.accounts[idx] = updateAccountEntry(prev, account);
     console.log(`Updated account "${prev.name}"`);
   } else {
     // New org for this person: if another entry shares the accountUuid, the bare

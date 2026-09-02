@@ -64,6 +64,10 @@ function emptyQuota() {
 function makeAccount(acct, index) {
   return {
     index,
+    // The entry this account was built from. `index` is a position in this list
+    // and says nothing about the config list, which drops credential-less
+    // entries and is therefore a different shape — see account-pairing.js.
+    id: acct.id || null,
     name: acct.name,
     type: acct.type,
     accountUuid: acct.accountUuid || null,

@@ -16,7 +16,16 @@ function makeTUI({ accounts = [{ name: 'a', index: 0, type: 'oauth', credential:
     addAccount(entry) { calls.added.push(entry); this.accounts.push({ ...entry, index: this.accounts.length }); },
     removeAccount(idx) { calls.removed.push(this.accounts[idx]?.name); this.accounts.splice(idx, 1); },
   };
-  const config = { proxy: { port: 1 }, accounts: accounts.map(a => ({ name: a.name, type: a.type })), routes: [] };
+  // An account carries the id of the config entry it was built from, which is
+  // what pairs the two lists (see account-id.js). The harness stands in for the
+  // startup path that assigns them, so it has to assign them too — the ids are
+  // fixed rather than minted only because a test reads better that way.
+  accounts.forEach((a, i) => { a.id = a.id || `entry-${i}`; });
+  const config = {
+    proxy: { port: 1 },
+    accounts: accounts.map(a => ({ id: a.id, name: a.name, type: a.type })),
+    routes: [],
+  };
   const tui = new TUI({
     accountManager: am, config, sx: null,
     saveConfig: async () => {},
@@ -187,7 +196,7 @@ test('select mode entered from the dashboard still returns to normal', () => {
 test('importing a second org adds an account instead of overwriting the first', async () => {
   const accounts = [{ name: 'a@x.com', index: 0, type: 'oauth', credential: 'old', accountUuid: 'u1', orgUuid: 'o-personal', orgName: 'Personal' }];
   const { tui, am, config, calls } = makeTUI({ accounts });
-  config.accounts = [{ name: 'a@x.com', type: 'oauth', accountUuid: 'u1', orgUuid: 'o-personal', orgName: 'Personal' }];
+  config.accounts = [{ id: accounts[0].id, name: 'a@x.com', type: 'oauth', accountUuid: 'u1', orgUuid: 'o-personal', orgName: 'Personal' }];
   tui._readCredentials = async () => ({ accessToken: 'new', refreshToken: 'r', expiresAt: Date.now() + 3600_000 });
   tui._readProfile = async () => ({ email: 'a@x.com', accountUuid: 'u1', orgUuid: 'o-acme', orgName: 'Acme' });
 
@@ -203,7 +212,7 @@ test('importing a second org adds an account instead of overwriting the first', 
 test('re-importing the same account+org still updates in place', async () => {
   const accounts = [{ name: 'a@x.com', index: 0, type: 'oauth', credential: 'old', accountUuid: 'u1', orgUuid: 'o-acme', orgName: 'Acme' }];
   const { tui, am, config, calls } = makeTUI({ accounts });
-  config.accounts = [{ name: 'a@x.com', type: 'oauth', accountUuid: 'u1', orgUuid: 'o-acme', orgName: 'Acme' }];
+  config.accounts = [{ id: accounts[0].id, name: 'a@x.com', type: 'oauth', accountUuid: 'u1', orgUuid: 'o-acme', orgName: 'Acme' }];
   tui._readCredentials = async () => ({ accessToken: 'fresh', refreshToken: 'r2', expiresAt: Date.now() + 3600_000 });
   tui._readProfile = async () => ({ email: 'a@x.com', accountUuid: 'u1', orgUuid: 'o-acme', orgName: 'Acme' });
 
@@ -243,6 +252,7 @@ test('email-only profile re-import preserves known running identity', async () =
   }];
   const { tui, am, config } = makeTUI({ accounts });
   config.accounts = [{
+    id: accounts[0].id,
     name: 'a@x.com',
     type: 'oauth',
     accountUuid: 'u1',
