@@ -114,3 +114,14 @@ test('the status view spells the reason out for an operator', () => {
   assert.match(unavailableLine({ unavailable: 'quota' }, paint), /local switch threshold/);
   assert.equal(unavailableLine({ unavailable: null }, paint), null, 'a healthy account gets no line');
 });
+
+test('a rejection does not outlive the 5-hour window that produced it', () => {
+  const am = manager();
+  healthy(am.accounts[0]);
+  am.accounts[0].quota.unified5hReset = Date.now() + 1000;
+  am.updateQuota(0, { 'anthropic-ratelimit-unified-status': 'rejected' });
+  assert.equal(am._isAvailable(am.accounts[0]), false);
+  am.accounts[0].quota.unified5hReset = Date.now() - 1; // the session window rolled over
+  assert.equal(am._isAvailable(am.accounts[0]), true, 'the rejection went with the window');
+  assert.equal(am.accounts[0].quota.unifiedStatus, null);
+});

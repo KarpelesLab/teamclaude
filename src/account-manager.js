@@ -1015,6 +1015,10 @@ export class AccountManager {
       console.log(`[TeamClaude] Account "${account.name}" session quota reset`);
       q.unified5h = null;
       q.unified5hReset = null;
+      // `rejected` describes the shared buckets and this is one of them: a
+      // 5-hour rejection must not outlive the 5-hour window it was about.
+      q.unifiedStatus = null;
+      q.unifiedStatusSeenAt = null;
       changed = true;
       session = true;
     }
