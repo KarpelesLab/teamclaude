@@ -1,6 +1,6 @@
 import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired } from './oauth.js';
 import { sameIdentity } from './identity.js';
-import { weeklyBucketForModel, modelGlobMatches } from './model.js';
+import { weeklyBucketForModel, modelGlobMatches, modelFamily } from './model.js';
 import { SessionTracker } from './session-tracker.js';
 
 // Re-exported for callers that import these model helpers from here.
@@ -20,6 +20,7 @@ const PERSISTED_QUOTA_FIELDS = [
   'unified5hReset', 'unified7dReset', 'unified7dSonnetReset', 'unified7dFableReset', 'unifiedStatus',
   'unified7dSonnetSeenAt', 'unified7dFableSeenAt',
   'tokensLimit', 'tokensRemaining', 'requestsLimit', 'requestsRemaining', 'resetsAt',
+  'scopedWeekly',
 ];
 
 // The family (Fable/Sonnet) weekly buckets and the field holding when each was
@@ -53,6 +54,11 @@ function emptyQuota() {
     unified7dSonnetSeenAt: null,
     unified7dFableSeenAt: null,
     unifiedStatus: null,        // allowed | allowed_warning | rejected
+    // Every model-scoped weekly bucket the usage endpoint named, keyed by its
+    // own display_name (lowercased): { fable: { utilization, resetAt }, ... }.
+    // Upstream owns this list and it changes, so it is learned rather than
+    // declared — a family with no dedicated field above is still metered.
+    scopedWeekly: {},
     resetsAt: null,
   };
 }
@@ -512,8 +518,23 @@ export class AccountManager {
   _governingWeekly(account, model) {
     const q = account.quota;
     const key = this._weeklyBucketFor(model);
-    if (q[key] != null) return q[key];
-    return key !== 'unified7d' ? q.unified7d : null;
+    if (key !== 'unified7d') return q[key] != null ? q[key] : q.unified7d;
+    // No dedicated field for this family — but the usage endpoint may still
+    // report a weekly bucket scoped to it (upstream adds these over time). Gate
+    // on the tighter of that bucket and the shared weekly, so a family with its
+    // own cap can't overshoot it just because the code predates the family.
+    const scoped = this._scopedWeekly(account, model)?.utilization;
+    const known = [q.unified7d, scoped].filter(v => v != null);
+    return known.length ? Math.max(...known) : null;
+  }
+
+  /** The learned scoped weekly bucket governing `model`, or null. Keyed by the
+   * family name the usage endpoint reports, which is what modelFamily derives. */
+  _scopedWeekly(account, model) {
+    const scoped = account.quota.scopedWeekly;
+    if (!scoped || typeof scoped !== 'object') return null;
+    const family = modelFamily(model);
+    return family === 'other' ? null : (scoped[family] || null);
   }
 
   /** Reset timestamp (ms) of the weekly bucket that governs `model`, falling back
@@ -521,7 +542,7 @@ export class AccountManager {
   _governingWeeklyReset(account, model) {
     const q = account.quota;
     const key = this._weeklyBucketFor(model);
-    return q[`${key}Reset`] || q.unified7dReset || null;
+    return q[`${key}Reset`] || this._scopedWeekly(account, model)?.resetAt || q.unified7dReset || null;
   }
 
   /** True when the family-specific weekly bucket that governs `model` is spent.
@@ -1302,6 +1323,11 @@ export class AccountManager {
       }
       if (usage.sevenDayFable.resetAt != null) q.unified7dFableReset = usage.sevenDayFable.resetAt;
     }
+    // Families beyond the two with dedicated fields. Replaced wholesale rather
+    // than merged: a bucket that has dropped out of the payload no longer
+    // applies, and keeping a remembered copy would gate on a limit that upstream
+    // has stopped reporting.
+    if (usage.scopedWeekly) q.scopedWeekly = { ...usage.scopedWeekly };
 
     // If we just learned this account's weekly window while probing, re-evaluate
     // selection (same path as learning it from a live response).

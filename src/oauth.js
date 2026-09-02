@@ -254,6 +254,33 @@ export function findScopedWeeklyLimit(data, modelNamePattern) {
   return { utilization: entry.percent, resets_at: entry.resets_at };
 }
 
+/**
+ * Every model-scoped weekly limit the usage payload reports, keyed by the family
+ * name the endpoint itself uses (`scope.model.display_name`, lowercased).
+ *
+ * The set of these buckets is upstream's to decide and it moves: alongside the
+ * Fable one, a payload carries slots like seven_day_opus / seven_day_sonnet /
+ * seven_day_cowork / seven_day_omelette and others that come and go. Reading the
+ * names out of the response instead of hard-coding them means a family added
+ * upstream is metered correctly without a release — where a hard-coded list
+ * silently meters it against the SHARED weekly bucket and overshoots its cap.
+ *
+ * Returns { [family]: { utilization, resetAt } } — normalized, so an entry is
+ * only present when the payload actually reported that bucket.
+ */
+export function scopedWeeklyLimits(data) {
+  const limits = Array.isArray(data?.limits) ? data.limits : [];
+  const out = {};
+  for (const l of limits) {
+    if (!l || l.group !== 'weekly') continue;
+    const name = l.scope?.model?.display_name;
+    if (typeof name !== 'string' || !name.trim()) continue;
+    const bucket = normalizeUsageBucket({ utilization: l.percent, resets_at: l.resets_at });
+    if (bucket) out[name.trim().toLowerCase()] = bucket;
+  }
+  return out;
+}
+
 // Normalize one usage bucket from the /api/oauth/usage payload into
 // { utilization: 0-1, resetAt: ms-epoch }. The endpoint reports utilization
 // as a percentage in the 0-100 range, so 1 means 1%, not 100%.
@@ -311,11 +338,18 @@ export async function fetchUsage(accessToken) {
     }
 
     const data = await res.json();
+    const scopedWeekly = scopedWeeklyLimits(data);
     return {
       fiveHour: normalizeUsageBucket(data?.five_hour),
       sevenDay: normalizeUsageBucket(data?.seven_day),
-      sevenDaySonnet: normalizeUsageBucket(data?.seven_day_sonnet),
-      sevenDayFable: normalizeUsageBucket(findScopedWeeklyLimit(data, /fable/i)),
+      // The two families with dedicated fields keep them, so the S7/F7 bars and
+      // the persisted quota shape are unchanged; `scopedWeekly` carries these
+      // and every other family the payload named. Sonnet has a top-level slot
+      // as well as a scoped entry, so prefer whichever the payload actually
+      // filled in.
+      sevenDaySonnet: normalizeUsageBucket(data?.seven_day_sonnet) || scopedWeekly.sonnet || null,
+      sevenDayFable: scopedWeekly.fable || null,
+      scopedWeekly,
     };
   } catch (err) {
     return { error: err.message || String(err), status: null };
