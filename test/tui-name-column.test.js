@@ -60,9 +60,13 @@ const WIDE_NAME = '帳號名字中文帳號名字';
 const COMBINING_NAME = 'señor@example.com';
 const PLAIN_NAME = 'ascii@example.com';
 
-// The showBoth cutoff, a couple of half-screen terminals, and wide — a sweep so
-// the cell is exercised at several widths rather than one lucky one.
-const WIDTHS = [60, 70, 76, 80, 86, 100, 120, 160];
+// Every width across the single-bar layout, the showBoth cutoff and a grown
+// name column, plus a few wide ones. Contiguous rather than a handful of chosen
+// widths because the interesting case is decided by arithmetic the test should
+// not have to predict: a cell one column narrower than the name needs makes
+// truncate drop a wide glyph and stop a column short, which only rpad closes.
+// A hand-picked list lands on even cells and misses that path entirely.
+const WIDTHS = [...Array(101).keys()].map(i => i + 55).concat([140, 160, 200]);
 
 test('a name measured in columns keeps every row the same width', () => {
   for (const w of WIDTHS) {
@@ -72,4 +76,35 @@ test('a name measured in columns keeps every row the same width', () => {
       `W=${w}: rows should all be one width, got ${widths.join(', ')}`);
     assert.ok(widths[0] <= w, `W=${w}: row is ${widths[0]} columns`);
   }
+});
+
+// A name long enough that no terminal in the sweep below can show it whole, so
+// the growth and the floor are both observable.
+const LONG_NAME = 'a-considerably-longer-name@example.com';
+
+test('the name column grows to the longest name when the row has slack', () => {
+  const rows = renderRows(160, [PLAIN_NAME, LONG_NAME]);
+  assert.ok(rows.some(r => r.includes(LONG_NAME)),
+    'the longest name is drawn whole, not cut to the floor');
+  assert.ok(rows.some(r => r.includes(PLAIN_NAME)),
+    'a shorter name is not cut either');
+  assert.ok(Math.max(...rows.map(displayWidth)) <= 160, 'the grown column stays inside the terminal');
+});
+
+test('a narrow terminal keeps the twelve-column name it had before', () => {
+  const rows = renderRows(70, [PLAIN_NAME, LONG_NAME]);
+  assert.ok(rows.some(r => r.includes(LONG_NAME.slice(0, 12))), 'twelve columns of the name survive');
+  assert.ok(!rows.some(r => r.includes(LONG_NAME.slice(0, 13))), 'and no more than twelve');
+});
+
+test('a short fleet gets the floor, not a cell stretched to the terminal', () => {
+  // Every name here is well under twelve columns. The cell must not collapse
+  // onto them, and the spare width must not inflate it either — a name cell
+  // wider than the longest name just pushes the type and status columns off to
+  // the right for nothing. Pinned by where the type column starts.
+  const rows = renderRows(120, ['ann', 'bob']);
+  assert.ok(rows.some(r => r.includes(`${'ann'.padEnd(12)} oauth`)),
+    `the name cell is twelve columns wide: ${JSON.stringify(rows[0])}`);
+  assert.ok(rows.some(r => r.includes(`${'bob'.padEnd(12)} oauth`)),
+    `the name cell is twelve columns wide: ${JSON.stringify(rows[1])}`);
 });

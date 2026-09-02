@@ -169,6 +169,11 @@ export function truncate(s, w) {
 const BAR_MIN = 5;
 const BAR_MAX = 20;
 
+// Floor for the account name column. It grows past this toward the longest name
+// when the row has width to spare, but never drops below it, so a narrow
+// terminal lays the table out exactly as it did before the column could grow.
+const NAME_MIN = 12;
+
 // Families this account can't serve right now: a family whose own weekly bucket
 // is over the switch threshold is barred from that model while the account is
 // otherwise active. Shared by the row renderer (which draws the `⊘` tag) and the
@@ -1196,7 +1201,7 @@ export class TUI {
         const names = blockedFamilies(a.quota, this.am.switchThreshold);
         return names.length ? Math.max(w, 4 + vw(names.join(' '))) : w;
       }, 0);
-      const fixed = 40 + (genRoutes.length ? genRoutes.length + 1 : 0) + tagW;
+      const fixed = 28 + NAME_MIN + (genRoutes.length ? genRoutes.length + 1 : 0) + tagW;
       const roomFor = n => fixed + 6 * (n - 1) + n * BAR_MIN <= W;
       // The family bars are the first thing to go: below the width where they
       // fit even at BAR_MIN they would push the row past the edge, and a row cut
@@ -1206,6 +1211,16 @@ export class TUI {
       const nbars = (showBoth ? 2 : 1) + (showFamily ? (anyFable ? 1 : 0) + (anySonnet ? 1 : 0) : 0);
       const bw = Math.max(BAR_MIN, Math.min(BAR_MAX, Math.floor((W - fixed - 6 * (nbars - 1)) / nbars)));
 
+      // Whatever the chrome and the capped bars leave over goes to the name
+      // column, up to the longest name in the fleet, so a wide terminal shows
+      // whole addresses instead of `a-considerab`. `fixed` already reserves
+      // NAME_MIN, so only the surplus past it is spent here: the row stays
+      // inside the budget above, and a terminal with no surplus keeps the
+      // twelve-column cell it had.
+      const longestName = Math.max(0, ...this.am.accounts.map(a => vw(a.name)));
+      const slack = Math.max(0, W - fixed - 6 * (nbars - 1) - nbars * bw);
+      const nameW = Math.max(NAME_MIN, Math.min(longestName, NAME_MIN + slack));
+
       // The single account each secondary bucket currently routes to (null = none
       // can serve it right now). Marked next to that account's F7/S7 bar — the
       // secondary-quota analogue of ► marking the default route's current account.
@@ -1214,7 +1229,7 @@ export class TUI {
         sonnet: anySonnet ? this.am.previewRouteIndex('claude-sonnet-4-6') : null,
       };
       for (let i = 0; i < this.am.accounts.length; i++) {
-        lines.push(this._renderAcct(i, bw, showBoth, routes, genRoutes, familyTarget, showFamily));
+        lines.push(this._renderAcct(i, bw, showBoth, routes, genRoutes, familyTarget, showFamily, nameW));
       }
     }
 
@@ -1267,7 +1282,7 @@ export class TUI {
     this._paint(buf, force);
   }
 
-  _renderAcct(idx, bw, showBoth, routes = this.am.getRoutes(), genRoutes = routes.filter(r => routeFamily(r) === null), familyTarget = {}, showFamily = true) {
+  _renderAcct(idx, bw, showBoth, routes = this.am.getRoutes(), genRoutes = routes.filter(r => routeFamily(r) === null), familyTarget = {}, showFamily = true, nameW = NAME_MIN) {
     const a = this.am.accounts[idx];
     const isCur = idx === this.am.currentIndex;
     const isSel = this.mode === 'select' && idx === this.selIdx;
@@ -1306,7 +1321,7 @@ export class TUI {
     // shifting everything after it. truncate stops a column short of the limit
     // when it drops a wide glyph that would straddle it, so rpad finishes the
     // cell.
-    const rawName = rpad(truncate(a.name, 12), 12);
+    const rawName = rpad(truncate(a.name, nameW), nameW);
     const name = isSel ? bold(rawName) : rawName;
 
     // Type
