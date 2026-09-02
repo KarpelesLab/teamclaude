@@ -173,10 +173,13 @@ const BAR_MAX = 20;
 // is over the switch threshold is barred from that model while the account is
 // otherwise active. Shared by the row renderer (which draws the `⊘` tag) and the
 // column layout (which reserves the width that tag needs).
+// `threshold` is a number, or a per-bucket lookup (bucket → number) so a family
+// is judged against its OWN configured threshold rather than the global one.
 export function blockedFamilies(quota, threshold) {
+  const at = typeof threshold === 'function' ? threshold : () => threshold;
   const out = [];
-  if (quota.unified7dSonnet != null && quota.unified7dSonnet >= threshold) out.push('Sonnet');
-  if (quota.unified7dFable != null && quota.unified7dFable >= threshold) out.push('Fable');
+  if (quota.unified7dSonnet != null && quota.unified7dSonnet >= at('unified7dSonnet')) out.push('Sonnet');
+  if (quota.unified7dFable != null && quota.unified7dFable >= at('unified7dFable')) out.push('Fable');
   return out;
 }
 
@@ -479,11 +482,20 @@ export class TUI {
   _settingsFields() {
     const fields = [];
 
-    fields.push({
+    // A per-bucket table can't be edited from a single ±1% control, and writing
+    // a plain number over it would silently discard the operator's per-bucket
+    // values. So the row shows the table and sends them to the config file.
+    const perBucket = this._perBucketThresholds();
+    fields.push(perBucket ? {
+      id: 'threshold',
+      label: 'Switch threshold',
+      hint: 'per-bucket — edit config',
+      value: () => green(perBucket),
+    } : {
       id: 'threshold',
       label: 'Switch threshold',
       hint: '←→ ±1%',
-      value: () => green(formatPercent(this.am.switchThreshold ?? this.config.switchThreshold ?? 0.98)),
+      value: () => green(formatPercent(this.am.effectiveThreshold ?? this.config.switchThreshold ?? 0.98)),
       left: () => this._nudgeThreshold(-1),
       right: () => this._nudgeThreshold(+1),
       enter: () => this._promptInput('Switch threshold % (1-100, tenths allowed)', v => this._doSetThreshold(v.trim())),
@@ -643,9 +655,21 @@ export class TUI {
   _nudgeThreshold(deltaPct) {
     // Stepping from the exact percent, not a rounded one, so a threshold set to
     // a tenth keeps its fraction instead of snapping to the nearest whole.
-    const cur = (this.am.switchThreshold ?? this.config.switchThreshold ?? 0.98) * 100;
+    const cur = (this.am.effectiveThreshold ?? this.config.switchThreshold ?? 0.98) * 100;
     const next = Math.max(1, Math.min(100, cur + deltaPct));
     if (next !== cur) return this._doSetThreshold(String(next));
+  }
+
+  /** A one-line rendering of a per-bucket threshold table, or null when the
+   * threshold is a single number. */
+  _perBucketThresholds() {
+    const t = this.am.switchThreshold ?? this.config.switchThreshold;
+    if (!t || typeof t !== 'object') return null;
+    const pct = v => `${Math.round(v * 100)}%`;
+    return Object.entries(t)
+      .filter(([, v]) => typeof v === 'number' && Number.isFinite(v))
+      .map(([k, v]) => `${k}:${pct(v)}`)
+      .join(' ');
   }
 
   _nudgeProbe(deltaSec) {
@@ -1154,7 +1178,7 @@ export class TUI {
       // actually blocked; the common case where nothing is spends those columns
       // on the bars instead of leaving the row short of the edge.
       const tagW = this.am.accounts.reduce((w, a) => {
-        const names = blockedFamilies(a.quota, this.am.switchThreshold);
+        const names = blockedFamilies(a.quota, key => this.am.thresholdFor(key));
         return names.length ? Math.max(w, 4 + vw(names.join(' '))) : w;
       }, 0);
       const fixed = 40 + (genRoutes.length ? genRoutes.length + 1 : 0) + tagW;
@@ -1318,7 +1342,7 @@ export class TUI {
     // weekly bucket is over the switch threshold can't serve that model even
     // while the account is otherwise active. A spent shared 5h blocks everything
     // and is already conveyed by the Ses bar + status, so it's not repeated here.
-    const blocked = blockedFamilies(q, this.am.switchThreshold);
+    const blocked = blockedFamilies(q, key => this.am.thresholdFor(key));
     if (blocked.length) line += `  ${red('⊘ ' + blocked.join(' '))}`;
     return line;
   }
