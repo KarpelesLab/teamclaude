@@ -20,7 +20,7 @@ import tls from 'node:tls';
 import http2 from 'node:http2';
 import { getConfigPath } from './config.js';
 import { generateCertChain } from './x509.js';
-import { createProxyRequestListener, safeKeyEqual, isLoopbackAddr, relayUpgrade, resolveAccountPin, describeConnectError } from './server.js';
+import { createProxyRequestListener, resolveClientAuth, isLoopbackAddr, relayUpgrade, resolveAccountPin, describeConnectError } from './server.js';
 
 const CA_CERT = 'teamclaude-ca.pem';
 const LEAF_CERT = 'teamclaude-leaf.pem';
@@ -110,9 +110,8 @@ export function hostMode(host, config) {
  * the top of this file.
  * @param ensureLeaf async () => { key, cert }   // current leaf PEMs
  */
-export function createConnectHandler({ config, accountManager, ensureLeaf, logDir = null, hooks = {}, log = () => {}, sx = null, egress = null }) {
+export function createConnectHandler({ config, accountManager, ensureLeaf, logDir = null, hooks = {}, log = () => {}, sx = null, egress = null, clientUsage = null }) {
   const upstream = config.upstream || 'https://api.anthropic.com';
-  const proxyApiKey = config.proxy?.apiKey;
   const holdMs = (config.holdSeconds || 0) * 1000;
 
   // One terminating h2/h1 server per pin, minted lazily on the first intercepted
@@ -127,15 +126,19 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
   // inside the tunnel. The alternative — tagging the raw socket and reading it
   // back from the request — means digging through a TLSSocket and, under h2, a
   // Proxy over the session socket. A listener bound to the account is the same
-  // information with none of that. The map is bounded by the account count.
+  // information with none of that. The client identity from the CONNECT's
+  // Proxy-Authorization rides the same mechanism (a listener bound to the
+  // client), for the same reason. The map is bounded by accounts × client keys,
+  // both operator-controlled.
   const serverPromises = new Map();
-  const getServer = (pin = '') => {
-    let p = serverPromises.get(pin);
+  const getServer = (pin = '', client = null) => {
+    const mapKey = `${pin}\u0000${client || ''}`;
+    let p = serverPromises.get(mapKey);
     if (p) return p;
     p = (async () => {
     const { key, cert } = await ensureLeaf();
     const srv = http2.createSecureServer({ key, cert, allowHTTP1: true });
-    srv.on('request', createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, forcedPin: pin || null, egress }));
+    srv.on('request', createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, forcedPin: pin || null, egress, clientUsage, forcedClient: client }));
     // Remote Control's real-time channel is a WebSocket (Upgrade handshake),
     // which never fires 'request' — only 'upgrade', with a raw socket instead
     // of a response object (h1-only; falls back to blind h2 passthrough is not
@@ -148,10 +151,10 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
       // Don't let a transient cert/disk failure poison the memo forever: drop it
       // so the next intercepted CONNECT retries instead of re-awaiting a cached
       // rejection (which would leave the MITM path dead until a restart).
-      serverPromises.delete(pin);
+      serverPromises.delete(mapKey);
       throw err;
     });
-    serverPromises.set(pin, p);
+    serverPromises.set(mapKey, p);
     return p;
   };
 
@@ -159,11 +162,14 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
     clientSocket.on('error', () => {});
 
     // Auth gate — mirror the HTTP path: loopback is exempt, everything else must
-    // present the proxy apiKey via Proxy-Authorization. Without this, a remote
-    // client can CONNECT api.anthropic.com and have a rotated ACCOUNT TOKEN
-    // injected (token theft), or blind-tunnel to arbitrary hosts (open relay /
-    // SSRF) — the HTTP path already blocks the equivalent for remote clients.
-    if (!connectAuthorized(req, clientSocket, proxyApiKey)) {
+    // present the proxy apiKey (or a clientKeys entry) via Proxy-Authorization.
+    // Without this, a remote client can CONNECT api.anthropic.com and have a
+    // rotated ACCOUNT TOKEN injected (token theft), or blind-tunnel to arbitrary
+    // hosts (open relay / SSRF) — the HTTP path already blocks the equivalent
+    // for remote clients. config.proxy is read per CONNECT so a reload that
+    // edits clientKeys applies to a running server, matching the HTTP gate.
+    const auth = resolveConnectAuth(req, clientSocket, config.proxy);
+    if (!auth.ok) {
       try {
         clientSocket.write('HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="teamclaude"\r\nConnection: close\r\n\r\n');
       } catch { /* client already gone */ }
@@ -231,7 +237,7 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
     // Proxy-Authorization on EVERY CONNECT, including blind-tunneled third-party
     // hosts, where an account pin is meaningless — rejecting there would take
     // down unrelated traffic over a typo meant for Anthropic.
-    const { pin, error } = resolveConnectPin(req, accountManager, proxyApiKey);
+    const { pin, error } = resolveConnectPin(req, accountManager, config.proxy);
     if (error) {
       log(`[TeamClaude] CONNECT ${host}: ${error}`);
       try {
@@ -241,7 +247,7 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
       return;
     }
 
-    getServer(pin || '').then((srv) => {
+    getServer(pin || '', auth.client).then((srv) => {
       reply200Raw(clientSocket);
       if (head && head.length) clientSocket.unshift(head);
       srv.emit('connection', clientSocket);
@@ -276,34 +282,60 @@ export function connectPinToken(req) {
  *
  * @returns {{pin: string|null, error: string|null}}
  */
-export function resolveConnectPin(req, accountManager, proxyApiKey) {
+export function resolveConnectPin(req, accountManager, proxyConfig) {
+  // Historically this took the bare apiKey string; accept both so existing
+  // callers/tests keep working while the handler passes the full proxy config
+  // (needed to recognize clientKeys entries in the username slot).
+  const proxy = typeof proxyConfig === 'string' ? { apiKey: proxyConfig } : proxyConfig;
   const token = connectPinToken(req);
   if (!token) return { pin: null, error: null };
-  if (proxyApiKey && safeKeyEqual(token, proxyApiKey)) return { pin: null, error: null };
+  if (resolveClientAuth(proxy, token).ok && (proxy?.apiKey || proxy?.clientKeys?.length)) {
+    return { pin: null, error: null };
+  }
   if (resolveAccountPin(accountManager, token) == null) {
     return { pin: null, error: `Unknown account pin "${token}"` };
   }
   return { pin: token, error: null };
 }
 
-// Authorize a CONNECT: no key configured → open (matches the HTTP path); a
-// loopback client is exempt; otherwise the proxy apiKey must be presented via
-// `Proxy-Authorization` (Bearer <key>, or Basic where the key is the username
-// or password — so `--proxy http://<key>@host:port` works). Exported for tests.
-export function connectAuthorized(req, socket, proxyApiKey) {
-  if (!proxyApiKey) return true;
-  if (isLoopbackAddr(socket?.remoteAddress)) return true;
+/**
+ * Authorize a CONNECT and resolve which client identity it carries — the
+ * CONNECT-side counterpart of server.js's resolveClientAuth, sharing its
+ * semantics: no keys configured → open; loopback exempt (both unattributed);
+ * otherwise the proxy apiKey or a clientKeys entry must be presented via
+ * `Proxy-Authorization` (Bearer <key>, or Basic where the key is the username
+ * or password — so `--proxy http://<key>@host:port` works).
+ * Returns { ok, client }.
+ */
+export function resolveConnectAuth(req, socket, proxyConfig) {
+  const hasKeys = !!(proxyConfig?.apiKey || (Array.isArray(proxyConfig?.clientKeys) && proxyConfig.clientKeys.length));
+  if (!hasKeys) return { ok: true, client: null };
   const m = /^\s*(basic|bearer)\s+(.+?)\s*$/i.exec(req?.headers?.['proxy-authorization'] || '');
-  if (!m) return false;
-  let presented = m[2];
-  if (m[1].toLowerCase() === 'basic') {
-    const dec = Buffer.from(m[2], 'base64').toString('utf8'); // "user:pass"
-    const i = dec.indexOf(':');
-    const user = i >= 0 ? dec.slice(0, i) : dec;
-    const pass = i >= 0 ? dec.slice(i + 1) : '';
-    presented = pass || user;
+  let auth = { ok: false, client: null };
+  if (m) {
+    let presented = m[2];
+    if (m[1].toLowerCase() === 'basic') {
+      const dec = Buffer.from(m[2], 'base64').toString('utf8'); // "user:pass"
+      const i = dec.indexOf(':');
+      const user = i >= 0 ? dec.slice(0, i) : dec;
+      const pass = i >= 0 ? dec.slice(i + 1) : '';
+      // Try both slots: the documented remote form carries the key in either.
+      auth = resolveClientAuth(proxyConfig, pass || user);
+      if (!auth.ok && pass && user) auth = resolveClientAuth(proxyConfig, user);
+    } else {
+      auth = resolveClientAuth(proxyConfig, presented);
+    }
   }
-  return safeKeyEqual(presented, proxyApiKey);
+  // Loopback is exempt from the key requirement, but a valid key it DID present
+  // still names it (matching the HTTP gate, where a local caller with a client
+  // key is attributed like any other).
+  if (!auth.ok && isLoopbackAddr(socket?.remoteAddress)) return { ok: true, client: null };
+  return auth;
+}
+
+// Boolean back-compat wrapper (pre-clientKeys signature). Exported for tests.
+export function connectAuthorized(req, socket, proxyApiKey) {
+  return resolveConnectAuth(req, socket, { apiKey: proxyApiKey }).ok;
 }
 
 function reply200Raw(sock) { sock.write('HTTP/1.1 200 Connection Established\r\n\r\n'); }
