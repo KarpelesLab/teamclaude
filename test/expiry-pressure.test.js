@@ -155,8 +155,8 @@ test('every reader and the WRITER agree with a table nobody derived from them', 
   // of the helpers under test: asserting `_governingWeekly(a) ===
   // _governingWindow(a).utilization` compares one function with itself and
   // cannot fail. Every number below is independently
-  // constructed, and the WRITER (_setCurrent, through the watcher's own state)
-  // is checked alongside the readers.
+  // constructed, and the WRITER (_setCurrent, through the reference it
+  // establishes) is checked alongside the readers.
   const now = Date.now();
   const SHARED = now + 40 * H;
   const SCOPED = now + 12 * H;
@@ -207,7 +207,7 @@ test('every reader and the WRITER agree with a table nobody derived from them', 
     assert.equal(snap.utilization, c.utilization, `${c.label}: band utilization`);
     assert.equal(snap.resetAt, c.resetAt, `${c.label}: band reset`);
 
-    // The WRITER: making the account current must leave the watcher holding
+    // The WRITER: making the account current must leave the reference holding
     // exactly this window at exactly this reset, under this name.
     am._setCurrent(a);
     assert.equal(am._currentRef.windows.get(c.window), c.resetAt,

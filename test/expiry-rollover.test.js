@@ -152,13 +152,19 @@ test('a preemption that fails back onto the rolled account stays owed', () => {
   assert.equal(serve(am, 's1', OPUS).index, other);
 });
 
-test('two requests in flight leave the rollover owed, in either finishing order', () => {
+test('two requests in flight leave the rollover owed, whichever selects first', () => {
   // The concurrency half of preempt-exactly-once, and why preemption is a
   // comparison rather than an event. One request is preempted off the rolled
   // account; a sibling has its only destination excluded and comes back to it.
-  // Neither SETTLES the traffic anywhere, so neither prices the account, and
-  // which response lands first cannot change what the next selection sees.
-  for (const order of ['moved-last', 'moved-first']) {
+  // Neither SETTLES the traffic anywhere, so neither prices the account.
+  //
+  // The scheduling freedom two concurrent requests actually have is which of
+  // them runs first, not whether a selection can be separated from the record
+  // that follows it: server.js awaits nothing between getActiveAccount and
+  // recordSession, so each request's pair is indivisible and this sweeps the
+  // pairs. Responses land in either order too and are swept with them, though
+  // nothing a response does reaches the manager — which is the property.
+  for (const order of ['moved-first', 'back-first']) {
     const am = pinnedFleet(ON);
     const first = serve(am, 's1', OPUS);
     const other = 1 - first.index;
@@ -166,16 +172,24 @@ test('two requests in flight leave the rollover owed, in either finishing order'
 
     am.beginSession('s1');
     am.beginSession('s1');
-    const a1 = am.getActiveAccount(null, OPUS, null, 's1');
-    assert.equal(a1.index, other, 'the rollover did not preempt');
-    const a2 = am.getActiveAccount(new Set([other]), OPUS, null, 's1');
-    assert.equal(a2.index, first.index, 'the sibling did not fall back');
+    // The preempted request, and the sibling whose only destination is already
+    // in its own tried set — each selecting and recording as one step.
+    const moved = () => {
+      const a = am.getActiveAccount(null, OPUS, null, 's1');
+      assert.equal(a.index, other, `order ${order}: the rollover did not preempt`);
+      am.recordSession('s1', a.index, OPUS);
+    };
+    const back = () => {
+      const a = am.getActiveAccount(new Set([other]), OPUS, null, 's1');
+      assert.equal(a.index, first.index, `order ${order}: the sibling did not fall back`);
+      am.recordSession('s1', a.index, OPUS);
+    };
+    for (const step of (order === 'moved-first' ? [moved, back] : [back, moved])) step();
+    am.endSession('s1');
+    am.endSession('s1');
 
-    const moved = () => { am.recordSession('s1', a1.index, OPUS); am.endSession('s1'); };
-    const back = () => { am.recordSession('s1', a2.index, OPUS); am.endSession('s1'); };
-    for (const t of (order === 'moved-last' ? [back, moved] : [moved, back])) t();
-
-    assert.equal(serve(am, 's1', OPUS).index, other, `order ${order}: the rollover was forgotten`);
+    assert.notEqual(serve(am, 's1', OPUS).index, first.index,
+      `order ${order}: the rollover was forgotten`);
   }
 });
 
@@ -367,12 +381,10 @@ function scoped(am, index, family, used, hours, base = Date.now()) {
 }
 
 test('a rollover of the SCOPED governing window moves a pinned session', () => {
-  // Ranking reads the scoped bucket when it is the one that binds. If the
-  // rollover watcher still identifies the window by the shared weekly, the
-  // scoped window can gain a full week with no event at all — and the session
-  // pinned there goes on spending exactly the quota this feature exists to
-  // preserve. Same window for the gate, the ranking and the event, or the
-  // feature contradicts itself.
+  // Ranking reads the scoped bucket when it is the one that binds. Identify the
+  // window by the shared weekly instead and the scoped window can gain a full
+  // week with no event at all, while the session pinned there goes on spending
+  // the quota this feature exists to preserve.
   const am = mgr(['a', 'b'], ON, { distributeSessions: true });
   const now = Date.now();
   bucket(am, 0, 'unified7d', 0.10, 300, now);
@@ -475,7 +487,7 @@ test('a session re-pinned to an account it left is not preempted by the old roll
 });
 
 // ---------------------------------------------------------------------------
-// The watcher's vocabulary is the named window, on the write side too
+// The reference's vocabulary is the named window, on the write side too
 // ---------------------------------------------------------------------------
 
 test('the current account\'s baseline is written under the window selection used', () => {
@@ -581,9 +593,11 @@ test('staying put through an absence keeps the reference, so a real roll still s
 // A terminal that settled nothing decides nothing
 // ---------------------------------------------------------------------------
 
-// Two requests whose selections straddle a rollover and whose responses land in
-// a caller-chosen order. Both selections preempt; neither settles the traffic
-// anywhere, so the two runs differ by scheduling alone.
+// Two requests straddling a rollover, running in a caller-chosen order. Each
+// selects and records as one step, because server.js does: R1 is preempted off
+// the rolled account, R2 has that destination in its own tried set and falls
+// back. Neither settles the traffic anywhere, so the two runs differ by
+// scheduling alone.
 function twoInFlight(order) {
   const am = mgr(['a', 'b'], ON, { distributeSessions: true });
   bucket(am, 0, 'unified7d', 0.4, 10);
@@ -591,32 +605,36 @@ function twoInFlight(order) {
   assert.equal(serve(am, 's1', OPUS).name, 'a');
   rollWindow(am, 0);
 
-  // R1 selects first, detects the rollover, and is sent off a. Still in flight.
   am.beginSession('s1');
-  const r1 = am.getActiveAccount(null, OPUS, null, 's1');
-  assert.equal(r1.name, 'b', 'R1 should have been preempted off the rolled account');
-
-  // R2 selects later and fails over to b, so it retries with b excluded and
-  // lands back on a — the fallback that leaves the rollover owed.
   am.beginSession('s1');
-  const r2 = am.getActiveAccount(new Set([1]), OPUS, null, 's1');
-  assert.equal(r2.name, 'a', 'R2 should have fallen back onto the rolled account');
-
-  const t1 = () => { am.recordSession('s1', r1.index, OPUS); am.endSession('s1'); };
-  const t2 = () => { am.recordSession('s1', r2.index, OPUS); am.endSession('s1'); };
-  for (const t of (order === 'r1-last' ? [t2, t1] : [t1, t2])) t();
+  // R1 detects the rollover and is sent off a.
+  const r1 = () => {
+    const a = am.getActiveAccount(null, OPUS, null, 's1');
+    assert.equal(a.name, 'b', 'R1 should have been preempted off the rolled account');
+    am.recordSession('s1', a.index, OPUS);
+  };
+  // R2 already failed over to b, so it retries with b excluded and lands back
+  // on a — the fall-back that leaves the rollover owed.
+  const r2 = () => {
+    const a = am.getActiveAccount(new Set([1]), OPUS, null, 's1');
+    assert.equal(a.name, 'a', 'R2 should have fallen back onto the rolled account');
+    am.recordSession('s1', a.index, OPUS);
+  };
+  for (const step of (order === 'r1-last' ? [r2, r1] : [r1, r2])) step();
+  am.endSession('s1');
+  am.endSession('s1');
   return am;
 }
 
-test('a response from an attempt that settled nothing cannot forget the rollover', () => {
-  // Where a request was SERVED is not where selection settled it. A response
-  // from an attempt that was preempted, or from one that failed back onto the
-  // rolled account, says nothing about that window having become acceptable —
-  // and which of them lands first cannot change what the next selection sees.
+test('an attempt that settled nothing decides nothing, in either scheduling', () => {
+  // Where a request was SENT is not where selection settled it. An attempt that
+  // was preempted, or one that failed back onto the rolled account, says nothing
+  // about that window having become acceptable — and which of them runs first
+  // cannot change what the next selection sees.
   for (const order of ['r2-last', 'r1-last']) {
     const am = twoInFlight(order);
     assert.notEqual(serve(am, 's1', OPUS).name, 'a',
-      `terminal order ${order}: a response that settled nothing forgot the rollover`);
+      `scheduling ${order}: an attempt that settled nothing forgot the rollover`);
   }
 });
 
@@ -643,8 +661,34 @@ test('removing an account renumbers the baselines rather than aiming them elsewh
   assert.equal(serve(am, 's2', OPUS).name, 'c');
 });
 
+test('removing an account renumbers an aim as well as a settled baseline', () => {
+  // A preemption's aim names its destination by the same bare position the pins
+  // do, and it is read by the very next request on that session. Left behind
+  // across a removal it is compared against whatever account inherited the slot,
+  // which is what renumbering the pins prevents — so the enumeration is both
+  // halves of the reference, not just the settled one.
+  const am = mgr(['a', 'b', 'c', 'd'], ON, { distributeSessions: true });
+  for (const i of [0, 1, 2, 3]) bucket(am, i, 'unified7d', 0.4, 10 + i * 10);
+  assert.equal(serve(am, 's1', OPUS).name, 'a');
+  rollWindow(am, 0);
+  // The preemption aims at b and the session lands there, with no settle yet:
+  // b's reading exists only as the aim.
+  assert.equal(serve(am, 's1', OPUS).name, 'b');
+
+  // 'a' is removed, so b/c/d each shift down one slot and the aim's index is
+  // stale by exactly one.
+  am.removeAccount(0);
+  assert.equal(am.accounts.find(a => a.name === 'b').index, 0, 'b did not move down');
+
+  // b's own window rolls. Read through a renumbered aim that is a genuine
+  // rollover; read through a stale one it is a comparison against c.
+  am.accounts[0].quota.unified7dReset += WEEK;
+  assert.notEqual(serve(am, 's1', OPUS).name, 'b',
+    'the aim did not follow its account down a slot');
+});
+
 test('removing an account renumbers the CURRENT account\'s baselines too', () => {
-  // The current account keeps its own watcher, which no session owns and so no
+  // The current account keeps its own reference, which no session owns and so no
   // session's renumbering reaches. Left behind, its baseline names a slot that
   // now holds a different account and the next roll reads as a first sight.
   const am = mgr(['a', 'b', 'c'], ON);
@@ -729,4 +773,169 @@ test('two windows rolling on one account are two log lines, not a duplicate', ()
   assert.equal(held.length, 2, `expected one line per window, got: ${JSON.stringify(held)}`);
   assert.ok(held.some(l => /scoped:opus window/.test(l)), 'the scoped window was never named');
   assert.ok(held.some(l => /unified7d window/.test(l)), 'the shared window was never named');
+});
+
+// ---------------------------------------------------------------------------
+// A retry is the same request, and a destination it could not use settles nothing
+// ---------------------------------------------------------------------------
+
+// ONE client request that has to fail over, in the order server.js runs it: the
+// account is selected, the pin is recorded IMMEDIATELY (server.js:1403, before
+// the destination's token is refreshed and long before the upstream fetch), and
+// only then does the destination turn out to be unusable — a dead refresh token,
+// a 401, a 429, a transport error, all of which add it to the request's tried
+// set and re-enter selection. Both selections and both records belong to one
+// request, and nothing else has run in between.
+//
+// The suite's other fail-back fixtures select twice before recording either
+// attempt. Two requests cannot interleave that way — nothing awaits between
+// selection and recordSession — so that order can only come from a single
+// request, where it is exactly backwards.
+function serveFailingOver(am, sessionId, model, dead) {
+  am.beginSession(sessionId);
+  const first = am.getActiveAccount(null, model, null, sessionId);
+  if (first) am.recordSession(sessionId, first.index, model);
+  const retry = am.getActiveAccount(new Set([dead]), model, null, sessionId);
+  if (retry) am.recordSession(sessionId, retry.index, model);
+  am.endSession(sessionId);
+  return { first, retry };
+}
+
+test('a retry that falls back onto the rolled account leaves the rollover owed', () => {
+  const am = pinnedFleet(ON);
+  const first = serve(am, 's1', OPUS);
+  const other = 1 - first.index;
+  rollWindow(am, first.index);
+
+  const { first: moved, retry } = serveFailingOver(am, 's1', OPUS, other);
+  assert.equal(moved.index, other, 'the rollover did not preempt');
+  assert.equal(retry.index, first.index, 'the retry did not fall back onto the rolled account');
+
+  // The request came back because its destination was unusable, not because the
+  // session settled onto the window that just gained a full week.
+  assert.equal(serve(am, 's1', OPUS).index, other,
+    'the failed fail-back priced the rolled account');
+});
+
+test('a retry that bounces back to the rolled current account leaves it owed', () => {
+  // The same cascade on the path that is live by default: distributeSessions is
+  // off, so current-account stickiness is what an operator gets by turning on
+  // expiry routing alone.
+  const am = mgr(['a', 'b'], ON);
+  bucket(am, 0, 'unified7d', 0.4, 10);
+  bucket(am, 1, 'unified7d', 0.4, 10);
+  assert.equal(serve(am, null, OPUS).name, 'a');
+  rollWindow(am, 0);
+
+  const { first, retry } = serveFailingOver(am, null, OPUS, 1);
+  assert.equal(first.name, 'b', 'the rollover did not preempt');
+  assert.equal(retry.name, 'a', 'the retry did not bounce back onto the rolled account');
+
+  assert.equal(serve(am, null, OPUS).name, 'b',
+    'the bounce first-sighted the rolled reset');
+});
+
+test('a destination that rolls after the move is not adopted post-roll', () => {
+  // A successful preemption is an arrival, and what the destination's window read
+  // on arrival is what its own next roll has to be measured against. Read at the
+  // following request instead, a roll in between is adopted as the starting point
+  // and disappears — the session parks on the account that just gained a week
+  // while sooner-expiring quota goes on expiring.
+  const am = mgr(['a', 'b', 'c'], ON, { distributeSessions: true });
+  bucket(am, 0, 'unified7d', 0.4, 10);
+  bucket(am, 1, 'unified7d', 0.4, 20);
+  bucket(am, 2, 'unified7d', 0.4, 30);
+  assert.equal(serve(am, 's1', OPUS).name, 'a');
+  rollWindow(am, 0);
+  assert.equal(serve(am, 's1', OPUS).name, 'b', 'the rollover did not move the pin to b');
+  rollWindow(am, 1);
+  assert.equal(serve(am, 's1', OPUS).name, 'c',
+    'the destination\'s own rollover was consumed by the arrival');
+});
+
+test('a current account that rolls after the move is not adopted post-roll', () => {
+  // The reading comes from the aim on this path, and the property has to survive
+  // that: remove the aim and this is the test that says so.
+  const am = mgr(['a', 'b', 'c'], ON);
+  bucket(am, 0, 'unified7d', 0.4, 10);
+  bucket(am, 1, 'unified7d', 0.4, 20);
+  bucket(am, 2, 'unified7d', 0.4, 30);
+  assert.equal(serve(am, null, OPUS).name, 'a');
+  rollWindow(am, 0);
+  assert.equal(serve(am, null, OPUS).name, 'b', 'the rollover did not move the current account');
+  rollWindow(am, 1);
+  assert.equal(serve(am, null, OPUS).name, 'c',
+    'the destination\'s own rollover was consumed by the arrival');
+});
+
+// ---------------------------------------------------------------------------
+// Turning the feature on mid-flight
+// ---------------------------------------------------------------------------
+
+test('hot-enabling the feature ends a drain a rollover should have ended', () => {
+  // index.js applies distributeSessions before expiryRouting, so one reload can
+  // put every live session into the drain and then turn preemption on. A drain
+  // is bounded by nothing but a rollover, and a session that entered it without
+  // an observation can never acquire one: the drain's honored path takes none.
+  const am = mgr(['a', 'b'], undefined, { distributeSessions: true });
+  bucket(am, 0, 'unified7d', 0.4, 10);
+  bucket(am, 1, 'unified7d', 0.4, 10);
+  // As the daemon does at startup, and for the reason the drain test above
+  // gives: leaving the drain hands the session to the ordinary walk, which
+  // measures against the current account's reference rather than the pin's.
+  am.selectActiveAccount();
+  const first = serve(am, 's1', OPUS);
+  am.setDistributeSessions(false);
+  am.setExpiryRouting(ON);
+  assert.equal(am.drainingCount(), 1, 'the fixture must leave s1 draining');
+  rollWindow(am, first.index);
+  assert.notEqual(serve(am, 's1', OPUS).index, first.index,
+    'the draining session never saw the roll that bounds its drain');
+});
+
+test('hot-enabling the feature does not miss the first rollover after it', () => {
+  const am = mgr(['a', 'b'], undefined, { distributeSessions: true });
+  bucket(am, 0, 'unified7d', 0.4, 10);
+  bucket(am, 1, 'unified7d', 0.4, 10);
+  const first = serve(am, 's1', OPUS);
+  am.setExpiryRouting(ON);
+  rollWindow(am, first.index);
+  assert.notEqual(serve(am, 's1', OPUS).index, first.index,
+    'the first roll after the knob went on was read as a first sight');
+});
+
+test('re-applying the same setting does not re-read what is already being watched', () => {
+  // Only the OFF → ON transition takes a reading. Every config reload while the
+  // feature is already on re-applies the same object, and a server notified once
+  // a minute would otherwise re-read every reference each time — leaving nothing
+  // a roll could ever be measured against, and no rollover ever detected.
+  const am = mgr(['a', 'b'], ON, { distributeSessions: true });
+  bucket(am, 0, 'unified7d', 0.4, 10);
+  bucket(am, 1, 'unified7d', 0.4, 10);
+  const first = serve(am, 's1', OPUS);
+  rollWindow(am, first.index);
+  // A reload lands between the roll and the request that should act on it.
+  am.setExpiryRouting({ enabled: true, preempt: true });
+  assert.notEqual(serve(am, 's1', OPUS).index, first.index,
+    'a reload re-read the reference and swallowed the roll it was owed');
+});
+
+// ---------------------------------------------------------------------------
+// The status view and the next selection name the same account
+// ---------------------------------------------------------------------------
+
+test('the preview names the account the next request would actually get', () => {
+  // previewRouteIndex is what the TUI and the status JSON show. It mirrors the
+  // priority preemption but not the rollover one, so after a roll an operator
+  // watching the feature fire sees the parked account until some other request
+  // moves the cursor.
+  const am = mgr(['a', 'b'], ON);
+  bucket(am, 0, 'unified7d', 0.4, 10);
+  bucket(am, 1, 'unified7d', 0.4, 10);
+  assert.equal(serve(am, null, OPUS).name, 'a');
+  rollWindow(am, 0);
+  const preview = am.previewRouteIndex(OPUS);
+  const actual = am.getActiveAccount(null, OPUS);
+  assert.equal(preview, actual.index,
+    'the status view and the next selection disagree across a rollover');
 });

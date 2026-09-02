@@ -250,8 +250,10 @@ export class SessionTracker {
     return s.pins.get(bucket)?.idx ?? null;
   }
 
-  // The rollover reference this session holds for `bucket`: { idx, windows } —
-  // the account this bucket last sat STILL on, and what its windows read then.
+  // The rollover reference this session holds for `bucket`:
+  // { idx, windows, moved } — the account this bucket last SETTLED on and what
+  // its windows read then, plus the same reading for an account a preemption has
+  // aimed it at since (AccountManager._priceOn spells out why both are needed).
   // Created on demand; null for a session that is unknown or forgotten, and for
   // a known one until a caller asks to create it.
   //
@@ -268,8 +270,22 @@ export class SessionTracker {
       return null;
     }
     let ref = s.refs.get(bucket);
-    if (!ref && create) s.refs.set(bucket, ref = { idx: null, windows: new Map() });
+    if (!ref && create) s.refs.set(bucket, ref = { idx: null, windows: new Map(), moved: null });
     return ref || null;
+  }
+
+  // Every pin a live session holds, as { sessionId, bucket, idx }. Expired
+  // sessions are dropped on the way past, as every other read here does.
+  livePins(now = this._now()) {
+    const out = [];
+    for (const [sessionId, s] of [...this.sessions]) {
+      if (this._isExpired(s, now)) {
+        this.sessions.delete(sessionId);
+        continue;
+      }
+      for (const [bucket, pin] of s.pins) out.push({ sessionId, bucket, idx: pin.idx });
+    }
+    return out;
   }
 
   // Every account a known session is pinned to across its buckets, most recent
@@ -299,14 +315,27 @@ export class SessionTracker {
         if (moved == null) s.pins.delete(bucket);
         else pin.idx = moved;
       }
-      // A reference names its account by the same position, so it follows the
-      // same shift. One naming the account that went away is dropped whole: its
-      // numbers describe a window nothing can route to any more, and left behind
-      // they would be read against whatever account inherits the slot.
+      // A reference names its accounts by the same position, so they follow the
+      // same shift. One naming the account that went away is dropped: its numbers
+      // describe a window nothing can route to any more, and left behind they
+      // would be read against whatever account inherits the slot. BOTH halves are
+      // mapped — the settled account and the aim beside it are positions in the
+      // same list, and an aim left behind would be compared against the account
+      // that inherited its slot.
       for (const [bucket, ref] of [...s.refs]) {
+        if (ref.moved) {
+          const aim = mapFn(ref.moved.idx);
+          if (aim == null) ref.moved = null;
+          else ref.moved.idx = aim;
+        }
         const moved = ref.idx == null ? null : mapFn(ref.idx);
-        if (ref.idx != null && moved == null) s.refs.delete(bucket);
-        else ref.idx = moved;
+        if (ref.idx != null && moved == null) {
+          // The settled half went away. The aim, if it survived, is still a
+          // reading this session may be asked about, so the reference stays with
+          // that half alone rather than being dropped whole.
+          if (!ref.moved) s.refs.delete(bucket);
+          else { ref.idx = null; ref.windows = new Map(); }
+        } else ref.idx = moved;
       }
     }
   }

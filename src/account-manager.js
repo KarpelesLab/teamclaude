@@ -205,12 +205,13 @@ export class AccountManager {
     // quota is ample AND expires soon, so the quota closest to being lost is
     // spent first. See _topPressureBand for the ranking and the reasoning.
     this.setExpiryRouting(expiryRouting);
-    // The reference the CURRENT account's rollover comparison is made against:
-    // one reset per named window, for one account. Replaced wholesale when a
-    // different account becomes current, which is what a tenure is. A session's
-    // pins keep their own references on the pin itself, so they are created,
-    // renumbered and evicted with the pin that owns them.
-    this._currentRef = { idx: null, windows: new Map() };
+    // The reference the CURRENT account's rollover comparison is made against —
+    // see _priceOn for what the two halves mean. `windows` is one reset per named
+    // window for the account this route SETTLED on; `moved` is the same reading
+    // for the account a preemption last aimed at, taken as it aimed. A session's
+    // pins keep their own reference of the same shape, created, renumbered and
+    // evicted with the session that owns it.
+    this._currentRef = { idx: null, windows: new Map(), moved: null };
     // Throttle for the held-rollover line, keyed by what it describes —
     // (account index, WINDOW, reason) — so two genuinely different held events
     // are both reported while one busy session cannot repeat either. Keyed by
@@ -320,6 +321,18 @@ export class AccountManager {
    * since the rerank hands the same account back and would otherwise refresh
    * away the very comparison that fired.
    *
+   * `preempting` says this move is a rollover pushing the traffic OFF the
+   * account the reference names, and it is the one move that does not start a
+   * tenure. The cursor goes to the destination either way — that is where the
+   * request is being sent — but the destination is only where this route is
+   * ABOUT to be, and a request that never gets served there comes straight back
+   * (the token refresh at server.js:1407 fails, or the fetch after it does) to
+   * a cursor pointing somewhere it never was. Establishing there would hand the
+   * bounce a reference naming the destination, and the bounce would then be read
+   * as a fresh tenure on the rolled account and priced on its post-roll window.
+   * What the destination reads as we aim at it is still recorded, in `moved`,
+   * because that is the only moment we hold it: see _priceOn.
+   *
    * Replacing whole is also why an absent window is not a deletion. The new
    * reference simply has no entry for a window this account is not reporting,
    * and an absent entry is a first sight when it returns rather than a stale
@@ -332,10 +345,14 @@ export class AccountManager {
    * no reference, which costs one selection pass rather than a week, because the
    * first honored request records one.
    */
-  _setCurrent(account) {
+  _setCurrent(account, { preempting = false } = {}) {
     this.currentIndex = account.index;
     if (this._currentRef.idx === account.index) return;
-    this._currentRef = { idx: account.index, windows: new Map(Object.entries(this._accountWindows(account))) };
+    if (preempting) {
+      this._currentRef.moved = { idx: account.index, windows: new Map(Object.entries(this._accountWindows(account))) };
+      return;
+    }
+    this._establishOn(this._currentRef, account);
   }
 
   /**
@@ -553,7 +570,11 @@ export class AccountManager {
       const rolled = this.expiryRouting.enabled && this.expiryRouting.preempt
         && this._currentRolledOver(current, model);
       if (rolled) {
-        const next = this._selectNext(exclude, model, advisorModel);
+        // `preempting` so the cursor moves without starting a tenure on the
+        // destination: this walk is being pushed OFF the account the reference
+        // names, and a request that never reaches the destination bounces back
+        // to a cursor pointing somewhere it never was (_setCurrent).
+        const next = this._selectNext(exclude, model, advisorModel, { preempting: true });
         // _selectNext re-ranks, and both ways of not moving end up here: it
         // found nothing eligible, or it handed back the very account we are
         // trying to move off because that account still ranks best. Neither is
@@ -568,9 +589,9 @@ export class AccountManager {
       }
       const betterExists = this._preemptedBy(current, model, advisorModel, exclude);
       if (betterExists) return this._selectNext(exclude, model, advisorModel);
-      // Staying put IS the honored path, and the only one that advances the
+      // Staying put IS the settled path, and the only one that advances the
       // reference.
-      this._noteCurrentHonored(current, model);
+      this._noteCurrentSettled(current, model);
       return current;
     }
     const next = this._selectNext(exclude, model, advisorModel);
@@ -614,21 +635,29 @@ export class AccountManager {
       // on rolled over its governing window, so it is now the freshest AND
       // furthest-dated account — staying would burn the window that just gained
       // a full week while sooner-expiring quota goes unspent. This is the ONLY
-      // pressure-driven force on a pin; drain never preempts (see
-      // _pinRolledOver). One cache miss per pinned session per rollover.
+      // pressure-driven force on a pin; a draining session leaves the drain on a
+      // roll rather than being re-routed in place (see _selectDrainingSession).
+      // One cache miss per pinned session per rollover.
       //
       // Asked of each candidate as it is considered, not of the bucket's pin
       // alone: a session sitting on another family's account is just as stuck
-      // there. A candidate that is not this bucket's own pin carries no
-      // reference for it and so cannot have rolled — it is a first sight, and
-      // the reference is recorded when the request is honored there. A rollover
-      // re-ranks rather than falling through to the next candidate; the next
-      // candidate is another sticky choice, and the point is to let pressure
-      // pick the destination.
+      // there. A candidate nothing has read for this bucket cannot have rolled —
+      // it is a first sight, and its reading is taken when the traffic settles
+      // there or when a preemption aims at it. A rollover re-ranks rather than
+      // falling through to the next candidate; the next candidate is another
+      // sticky choice, and the point is to let pressure pick the destination.
       if (this.expiryRouting.enabled && this.expiryRouting.preempt
           && this._pinRolledOver(sessionId, pinned, model)) {
         const next = this._pickLeastLoaded(exclude, model, advisorModel);
         if (next && next.index !== idx) {
+          // The destination is where this session is ABOUT to be, not where it
+          // has settled, so the aim is recorded and the pin's own reading is
+          // left alone — a request that never reaches the destination has to
+          // come back to a rollover as owed as it was. Taken here because the
+          // aim is the only moment this reading exists: read at the next request
+          // instead, a roll in between is adopted as the starting point and the
+          // week it gained is spent unnoticed.
+          this._notePreemptedTo(sessionId, next, model);
           // A fleet-wide rollover moves every session pinned to that account at
           // once, so the destination gets the same failover burst any other
           // switch would send it — pace it (issue #84).
@@ -647,7 +676,7 @@ export class AccountManager {
       const betterExists = this.accounts.some(a =>
         this._isAvailable(a, model, advisorModel) && !exclude?.has(a.index) && (a.priority || 0) < (pinned.priority || 0));
       if (!betterExists) {
-        this._notePinHonored(sessionId, pinned, model);
+        this._notePinSettled(sessionId, pinned, model);
         return pinned;
       }
     }
@@ -655,9 +684,11 @@ export class AccountManager {
     // session is going to sit. Priced for the same reason an honored pin is:
     // the only selection that does NOT price is one that preempted, because a
     // preemption is the session being pushed off a window, not settling onto
-    // one.
+    // one. A placement that lands back on an account this session is still owed
+    // a rollover on is the failed excursion, not a new tenure, and _priceOn is
+    // where the two are told apart.
     const placed = this._pickLeastLoaded(exclude, model, advisorModel);
-    if (placed) this._notePinHonored(sessionId, placed, model);
+    if (placed) this._notePinSettled(sessionId, placed, model);
     return placed;
   }
 
@@ -716,13 +747,18 @@ export class AccountManager {
   recordSession(sessionId, accountIndex, model = null) {
     if (!sessionId) return;
     const bucket = this._weeklyBucketFor(model);
-    // The tracker keeps the pin's rollover references when the account is
-    // unchanged and drops them when it is not, so recording where a request was
-    // served is the whole of the bookkeeping. Nothing here decides a preemption;
-    // the comparison that does reads these references at selection time.
+    // The pin alone. The session's rollover reference is kept beside the pin and
+    // deliberately outlives a move (session-tracker.refsFor), so recording where
+    // a request was served is the whole of the bookkeeping here. Nothing here
+    // decides a preemption; the comparison that does reads that reference at
+    // selection time.
     this.sessionTracker.touch(sessionId, accountIndex, bucket);
-    // Nothing is priced here. Where a request was SERVED is not where selection
-    // decided it should sit — a retry lands wherever it can — and pricing an
+    // Nothing is priced here, and the pin moving is not evidence that anything
+    // settled. This runs at server.js:1403 — before the destination's token is
+    // refreshed and long before the upstream fetch — so the account named here
+    // is the one this request is being SENT to, which a failed refresh, a 401, a
+    // 429 or a transport error all turn back into a retry somewhere else. Where
+    // a request was sent is not where selection settled it, and pricing an
     // account a request was preempted off would erase the comparison that sent
     // it, on the very move it caused. Selection prices its own outcome.
   }
@@ -762,11 +798,14 @@ export class AccountManager {
   /**
    * Read-only: the index of the account a request for `model` would be served by
    * right now — the same decision getActiveAccount makes (manual pin → the global
-   * current account if it can serve the model → best-available), but WITHOUT
-   * mutating currentIndex and without the exhausted-fleet probe fallback. Returns
-   * null when nothing can serve `model` at the moment. The TUI uses this to mark
-   * the single account each secondary bucket (Fable/Sonnet) currently routes to —
-   * the F7/S7 analogue of the ► that marks the default route's current account.
+   * current account if it can serve the model AND nothing preempts it →
+   * best-available), but WITHOUT mutating currentIndex and without the
+   * exhausted-fleet probe fallback. Returns null when nothing can serve `model`
+   * at the moment. The TUI uses this to mark the single account each secondary
+   * bucket (Fable/Sonnet) currently routes to — the F7/S7 analogue of the ► that
+   * marks the default route's current account. It mirrors every discriminator
+   * `_select` uses, so its answer cannot disagree with the next selection, and
+   * it decides nothing: no reading is taken and no cursor moves.
    */
   previewRouteIndex(model) {
     const pinned = this._pinnedAccountForModel(model);
@@ -777,7 +816,9 @@ export class AccountManager {
       // available account wins over a healthy current one; same tier stays put.
       const better = this.accounts.some(a =>
         this._isAvailable(a, model) && (a.priority || 0) < (current.priority || 0));
-      if (!better) return current.index;
+      const rolled = this.expiryRouting.enabled && this.expiryRouting.preempt
+        && this._currentRolledOver(current, model);
+      if (!better && !rolled) return current.index;
     }
     const best = this._pickBestAvailable(null, model);
     return best ? best.index : null;
@@ -1174,6 +1215,7 @@ export class AccountManager {
    */
   setExpiryRouting(cfg) {
     const c = cfg || {};
+    const wasPreempting = !!(this.expiryRouting?.enabled && this.expiryRouting?.preempt);
     this.expiryRouting = {
       enabled: c.enabled === true,
       tolerance: typeof c.tolerance === 'number' && Number.isFinite(c.tolerance)
@@ -1181,6 +1223,42 @@ export class AccountManager {
         : 1.5,
       preempt: typeof c.preempt === 'boolean' ? c.preempt : true,
     };
+    if (!wasPreempting && this.expiryRouting.enabled && this.expiryRouting.preempt) {
+      this._seedSessionReferences();
+    }
+  }
+
+  /**
+   * Give every live session pin a reading, because preemption has just been
+   * switched ON and until now nothing was taking them.
+   *
+   * A session reference is only ever written while the knob is on (unlike the
+   * current account's, which is one reading for one account and is kept
+   * regardless — see _setCurrent). So a fleet that turns the knob on mid-flight
+   * has pins with nothing to compare against, and each one's first roll reads as
+   * a first sight: the very roll the operator turned the knob on to catch.
+   *
+   * Worse for a session that is DRAINING when the switch happens, and that is
+   * the ordinary shape rather than a corner — index.js applies distributeSessions
+   * before expiryRouting, so one reload can put every live session into the drain
+   * and then enable preemption. The drain honours a pin without ever settling on
+   * it, so it never writes a reading of its own; a rollover is the only thing
+   * that bounds a drain, and an active session renews its own idle window
+   * forever. Without a reading there is no rollover to find, and the session
+   * rides one account for as long as it keeps talking.
+   *
+   * Seeded from what each pinned account presents NOW, which is the honest
+   * reading: nothing was watching while the knob was off, so a window that
+   * rolled during that time is not a jump this fleet can claim to have seen. It
+   * is a first sight, and the next roll after it is the first one detected.
+   */
+  _seedSessionReferences() {
+    for (const { sessionId, bucket, idx } of this.sessionTracker.livePins()) {
+      const account = this.accounts[idx];
+      if (!account) continue;
+      const ref = this.sessionTracker.refsFor(sessionId, bucket, true);
+      if (ref) this._establishOn(ref, account);
+    }
   }
 
   /**
@@ -1354,72 +1432,122 @@ export class AccountManager {
    *   sees depends only on where the pin ended up and what that account's
    *   window says now.
    *
-   *   SELF-LIMITING. The reference advances only when the pin is HONORED — see
-   *   _notePinHonored. A preemption that fires and cannot move the traffic
-   *   leaves the reference where it was, so the next request compares against
-   *   the same pre-roll reset and preempts again. "Still owed" is not a flag; it
-   *   is the absence of a reason to move the reference.
+   *   SELF-LIMITING. The reference advances only where the traffic SETTLES —
+   *   see _priceOn. A preemption that fires and cannot move the traffic leaves
+   *   the reference where it was, so the next request compares against the same
+   *   pre-roll reset and preempts again. "Still owed" is not a flag; it is the
+   *   absence of a reason to move the reference.
    *
    * Scoped to the window `_governingWindow` names, so one family's roll is not
-   * read from another's clock, and to the pin's own account: a reference
-   * describing a different account is not evidence about this one.
+   * read from another's clock, and to an account: a reading taken on one account
+   * is not evidence about another. The reference holds a reading for the two
+   * accounts a sticky choice can be asked about — the one it settled on and the
+   * one a preemption has aimed it at (see _priceOn) — and the comparison uses
+   * whichever of them this request is actually about.
    */
-  _pinRolledOver(sessionId, pinned, model) {
-    const ref = this.sessionTracker.refsFor(sessionId, this._weeklyBucketFor(model));
-    if (!ref || ref.idx !== pinned.index) return false;
-    return this._jumped(ref.windows, this._governingWindow(pinned, model));
+  _readingFor(ref, account) {
+    if (!ref) return null;
+    if (ref.idx === account.index) return ref.windows;
+    if (ref.moved?.idx === account.index) return ref.moved.windows;
+    return null;
   }
 
-  /** As _pinRolledOver, for the global current account. Its reference is one
-   * per named window, replaced wholesale when a DIFFERENT account becomes
-   * current (see _setCurrent) — that is the tenure, and re-selecting the same
-   * account is not a new one. */
+  _pinRolledOver(sessionId, pinned, model) {
+    const ref = this.sessionTracker.refsFor(sessionId, this._weeklyBucketFor(model));
+    return this._jumped(this._readingFor(ref, pinned), this._governingWindow(pinned, model));
+  }
+
+  /** As _pinRolledOver, for the global current account. */
   _currentRolledOver(current, model) {
-    if (this._currentRef.idx !== current.index) return false;
-    return this._jumped(this._currentRef.windows, this._governingWindow(current, model));
+    return this._jumped(this._readingFor(this._currentRef, current), this._governingWindow(current, model));
   }
 
   /** The comparison itself. Absent on either side is not a jump: a window
-   * nothing has priced yet has no reference, and one the account is not
-   * reporting right now (the cleared-window gap) has no current value to
-   * compare — and neither may be mistaken for a reset that moved. */
-  _jumped(refs, win) {
-    const ref = refs.get(win.window);
-    if (ref == null || win.resetAt == null) return false;
-    return win.resetAt - ref > ROLLOVER_MIN_JUMP_MS;
+   * nothing has read yet has no entry, an account nothing has read at all has
+   * no reading, and one the account is not reporting right now (the cleared-
+   * window gap) has no current value to compare — none of the three may be
+   * mistaken for a reset that moved. */
+  _jumped(reading, win) {
+    if (!reading) return false;
+    const seen = reading.get(win.window);
+    if (seen == null || win.resetAt == null) return false;
+    return win.resetAt - seen > ROLLOVER_MIN_JUMP_MS;
   }
 
   /**
-   * The pin was HONORED — this request is staying on it — so the window it is
-   * being spent on becomes the reference the next request compares against.
+   * The pin SETTLED here — this request is staying on it, or was placed on it
+   * because no pin was usable — so the window it is being spent on becomes the
+   * reference the next request compares against.
    *
-   * Only the honored path writes. A preemption that fires leaves the reference
-   * alone whether or not it found anywhere to go, which is what keeps a
-   * preemption that fails back onto the rolled account owed without any owed
-   * state to keep. A window the account is not currently reporting is left
-   * alone rather than dropped: absent is not the same as stale, and the gap
-   * before upstream re-reports a window must not erase what it was worth.
+   * A preemption never comes through here: it is the traffic being pushed off a
+   * window, not settling onto one, and the account it was pushed off must keep
+   * the reading that sent it. What the DESTINATION reads is recorded separately
+   * as the preemption aims at it (_notePreemptedTo), because the aim is the only
+   * moment that reading exists to be taken.
    */
-  _notePinHonored(sessionId, pinned, model) {
+  _notePinSettled(sessionId, pinned, model) {
     if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) return;
     const ref = this.sessionTracker.refsFor(sessionId, this._weeklyBucketFor(model), true);
     if (ref) this._priceOn(ref, pinned, model);
   }
 
-  /** As _notePinHonored, for the current account — and, when the reference names
+  /** As _notePinSettled, for the current account — and, when the reference names
    * some other account, the place the current one is adopted. `currentIndex`
    * starts at 0 without anyone calling _setCurrent, and removeAccount can clamp
-   * it onto an account that was never chosen, so the first honored request is
+   * it onto an account that was never chosen, so the first settled request is
    * what prices whichever account the walk actually found itself on. */
-  _noteCurrentHonored(current, model) {
+  _noteCurrentSettled(current, model) {
     if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) return;
     this._priceOn(this._currentRef, current, model);
   }
 
   /**
-   * Price a reference on the account a sticky choice is sitting still on.
+   * A rollover preemption is sending this session's traffic to `next`. Record
+   * what `next`'s windows read as we aim at it — see _priceOn for why the aim
+   * and the settle are two different writes.
+   */
+  _notePreemptedTo(sessionId, next, model) {
+    const ref = this.sessionTracker.refsFor(sessionId, this._weeklyBucketFor(model), true);
+    if (ref) ref.moved = { idx: next.index, windows: new Map(Object.entries(this._accountWindows(next))) };
+  }
+
+  /** Establish a reference on `account` from every window it presents now, and
+   *  void any aim it was holding: the traffic has settled, so where a preemption
+   *  was pointing is not a place this choice might be. */
+  _establishOn(ref, account) {
+    ref.idx = account.index;
+    ref.windows = new Map(Object.entries(this._accountWindows(account)));
+    ref.moved = null;
+  }
+
+  /**
+   * Price a reference on the account a sticky choice has SETTLED on.
    *
-   * Naming a DIFFERENT account than the reference held replaces it whole, from
+   * A sticky choice has two places it can be, and the reference holds a reading
+   * for both, because until the traffic settles again either one can be the
+   * account the next request asks about:
+   *
+   *   `windows` — what the account it settled on read when it settled there.
+   *   `moved`   — what the account a preemption aimed it at read as it aimed.
+   *
+   * Two readings rather than one, because a single slot cannot answer both
+   * questions this feature has to ask. Keep only the origin's and a destination
+   * that rolls after the move is adopted at its post-roll reset, silently
+   * spending the week the move was made to preserve. Keep only the
+   * destination's and a request that never reaches it — the token refresh at
+   * server.js:1407 fails, or the fetch after it does — comes back to an origin
+   * whose owed rollover has been overwritten by the aim, and every later request
+   * honours the account that just gained a full week. Which of the two a request
+   * is about is not knowable when the preemption fires; it is knowable when the
+   * traffic settles, and that is here.
+   *
+   * PROMOTING the aim is what a settle on the destination means: the traffic
+   * went where it was sent, so the reading taken as we aimed becomes the reading
+   * this tenure is measured from — taken at the move rather than at the next
+   * request, which is the difference between seeing the destination's own next
+   * roll and adopting it.
+   *
+   * Naming an account NEITHER half describes replaces the reference whole, from
    * what that account reports now: the old numbers describe somewhere this
    * traffic has left, and a tenure elsewhere is not evidence about it.
    * Replacing whole rather than merging is also why an absent window is not a
@@ -1427,18 +1555,33 @@ export class AccountManager {
    * is not reporting, and an absent entry is a first sight when it returns
    * rather than a stale value read as a jump.
    *
-   * Naming the SAME account advances the one window this request was governed
-   * by, and only when the account is reporting it. The others are left as they
-   * were, because this request is not evidence about them.
+   * Naming an account a half DOES describe advances the one window this request
+   * was governed by, and only when the account is reporting it. The others are
+   * left as they were, because this request is not evidence about them.
+   *
+   * AND NEVER ACROSS A ROLL THIS READING STILL OWES. Advancing over a jump is
+   * exactly erasing an unresolved rollover, and the request that would do it is
+   * always a request that had nowhere better to be: the preemption already fired
+   * and could not move the traffic, or it moved it and the move came back. Both
+   * leave the roll as owed as it was, so the next request asks again. This is
+   * the only thing standing between a failed fail-back and a week spent on the
+   * window the feature exists to preserve, and it costs an ordinary settle
+   * nothing — a settle only reaches here when no roll was detected.
    */
   _priceOn(ref, account, model) {
     if (ref.idx !== account.index) {
+      if (ref.moved?.idx !== account.index) {
+        this._establishOn(ref, account);
+        return;
+      }
       ref.idx = account.index;
-      ref.windows = new Map(Object.entries(this._accountWindows(account)));
-      return;
+      ref.windows = ref.moved.windows;
     }
+    ref.moved = null;
     const win = this._governingWindow(account, model);
-    if (win.resetAt != null) ref.windows.set(win.window, win.resetAt);
+    if (win.resetAt == null) return;
+    if (this._jumped(ref.windows, win)) return;
+    ref.windows.set(win.window, win.resetAt);
   }
 
   /**
@@ -1491,21 +1634,12 @@ export class AccountManager {
   }
 
   /**
-   * Every named window this account currently presents, as { windowName: reset }
-   * — the watcher's whole view of the account, and what a tenure establishes.
-   *
-   * Enumerated over both spaces a window name can come from, because neither
-   * alone is complete: the request BUCKETS (each resolving to its own field or
-   * collapsing onto the shared weekly), and the FAMILIES upstream has learned a
-   * scoped bucket for. A bucket-only walk cannot name `scoped:opus`, since no
-   * bucket is named for Opus; that omission is how a writer came to store the
-   * flat window while the selection that chose the account had used the scoped
-   * one, leaving the baseline describing a window nothing was spending.
-   *
-   * Scoped windows are recorded whether or not they currently BIND. Binding
-   * decides which window a request resolves to, not whether the window exists,
-   * and a window that starts binding later needs the baseline it would otherwise
-   * have to first-sight on the very request that should have caught it rolling.
+   * Every named window this account presents, as { windowName: reset }. Both
+   * spaces are walked because neither alone is complete: a bucket-only walk
+   * cannot name `scoped:opus`, since no bucket is named for Opus. Scoped windows
+   * are recorded whether or not they currently bind, because one that starts
+   * binding later would otherwise be first-sighted on the very request that
+   * should have caught it rolling.
    */
   _accountWindows(account) {
     const out = {};
@@ -1973,12 +2107,12 @@ export class AccountManager {
     return best;
   }
 
-  _selectNext(exclude = null, model = null, advisorModel = null) {
+  _selectNext(exclude = null, model = null, advisorModel = null, { preempting = false } = {}) {
     const best = this._pickBestAvailable(exclude, model, advisorModel);
     if (best) {
       const previous = this._previousCursor(model);
       const switched = previous != null && previous !== best.index;
-      this._setCurrent(best);
+      this._setCurrent(best, { preempting });
       // If we switched to an account whose weekly quota is still unknown, flag
       // it so we re-evaluate once that quota is learned (see updateQuota).
       best.probing = best.quota.unified7dReset == null;
@@ -2430,11 +2564,16 @@ export class AccountManager {
     // are the rollover baselines hanging off them and off the current account.
     const remap = idx => (idx === index ? null : idx > index ? idx - 1 : idx);
     this.sessionTracker.remapAccounts(remap);
-    // The reference names its account by index too, so it follows the shift or
-    // goes away with the account it described.
+    // The reference names its accounts by index too, so each half follows the
+    // shift or goes away with the account it described. The aim is renumbered
+    // beside the settled account for the same reason the session references are:
+    // left behind it would be read against whoever inherits the slot.
+    const aim = this._currentRef.moved;
+    const movedAim = aim == null ? null : remap(aim.idx);
+    const moved = movedAim == null ? null : { idx: movedAim, windows: aim.windows };
     const movedRef = this._currentRef.idx == null ? null : remap(this._currentRef.idx);
-    this._currentRef = movedRef == null ? { idx: null, windows: new Map() }
-      : { idx: movedRef, windows: this._currentRef.windows };
+    this._currentRef = movedRef == null ? { idx: null, windows: new Map(), moved }
+      : { idx: movedRef, windows: this._currentRef.windows, moved };
     // A throttle key names an account by index, so the shift would point a live
     // entry at a different account. Not worth renumbering: the entries expire in
     // a minute and dropping them can only make the next held event report sooner.
