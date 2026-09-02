@@ -511,6 +511,137 @@ test('a session re-pinned to an account it left is not preempted by the old roll
 });
 
 // ---------------------------------------------------------------------------
+// The watcher's vocabulary is the named window, on the write side too
+// ---------------------------------------------------------------------------
+
+test('the current account\'s baseline is written under the window selection used', () => {
+  // The writer once established from the request bucket with no model, so every
+  // window took the flat branch: selection chose the account on its scoped
+  // window and stored the shared one, leaving the baseline describing a window
+  // nothing was spending. A scoped reset could then return without ever reading
+  // as a jump.
+  const am = mgr(['a', 'b'], ON);
+  const now = Date.now();
+  bucket(am, 0, 'unified7d', 0.10, 300, now);
+  bucket(am, 1, 'unified7d', 0.10, 300, now);
+  scoped(am, 0, 'opus', 0.50, 10, now);
+  scoped(am, 1, 'opus', 0.50, 10, now);
+  am.selectActiveAccount();
+  assert.equal(am._currentSeen.windows.get('scoped:opus')?.get(0), now + 10 * H,
+    'the scoped window was not written on becoming current');
+  assert.equal(serve(am, null, OPUS).name, 'a');
+  am.accounts[0].quota.scopedWeekly.opus.resetAt += WEEK;
+  assert.equal(serve(am, null, OPUS).name, 'b');
+});
+
+test('an Opus rollover is not consumed by Haiku traffic', () => {
+  // Opus and Haiku share the static request bucket `unified7d` while resolving
+  // to different windows the moment either is metered by a scoped bucket. Keyed
+  // by the bucket, the event owed on one is spent by the other: an unrelated
+  // family pays the cache-miss move while the family that rolled keeps riding
+  // the window that just gained a week.
+  const HAIKU = 'claude-haiku-4-5';
+  const am = mgr(['a', 'b'], ON);
+  const now = Date.now();
+  // b is the better account for Haiku, so Haiku stays on a only because the
+  // sticky current account holds it there. Anything that re-ranks Haiku moves
+  // it, which is what makes a spurious preemption visible rather than absorbed.
+  bucket(am, 0, 'unified7d', 0.10, 300, now);
+  bucket(am, 1, 'unified7d', 0.10, 20, now);
+  scoped(am, 0, 'opus', 0.50, 10, now);
+  scoped(am, 1, 'opus', 0.50, 10, now);
+  assert.equal(serve(am, null, OPUS).name, 'a');
+  assert.equal(serve(am, null, HAIKU).name, 'a');
+
+  // Only the Opus-scoped window rolls, and the event is DETECTED AND HELD —
+  // owed, not yet settled, which is the state the two families shared a key in.
+  am.accounts[0].quota.scopedWeekly.opus.resetAt += WEEK;
+  assert.equal(am._currentRolledOver(am.accounts[0], OPUS), true, 'the Opus roll was not detected');
+
+  // Haiku is governed by the shared weekly, which did not move. It must not be
+  // preempted by an event owed on a window it does not spend.
+  assert.equal(serve(am, null, HAIKU).name, 'a', 'Haiku paid for a window that never rolled');
+  // And the Opus event is still there to be acted on by Opus traffic.
+  assert.equal(serve(am, null, OPUS).name, 'b', 'the Opus rollover was consumed elsewhere');
+});
+
+test('a tenure drops a baseline for a window the account no longer presents', () => {
+  // A scoped entry is deleted outright once its reset passes, so a tenure that
+  // begins during the gap mentions nothing for that window. Merely moving the
+  // mentioned baselines forward leaves an earlier tenure's value in place, and
+  // the reset reads as a fresh rollover the moment upstream reports it again.
+  const am = mgr(['a', 'b'], ON);
+  const now = Date.now();
+  bucket(am, 0, 'unified7d', 0.10, 300, now);
+  bucket(am, 1, 'unified7d', 0.10, 300, now);
+  scoped(am, 0, 'opus', 0.50, 10, now);
+  am.selectActiveAccount();
+  assert.equal(am._currentSeen.windows.get('scoped:opus')?.get(0), now + 10 * H);
+
+  // The scoped window goes absent, and a tenure begins in the gap.
+  delete am.accounts[0].quota.scopedWeekly.opus;
+  am._setCurrent(am.accounts[0]);
+  assert.equal(am._currentSeen.windows.get('scoped:opus')?.get(0), undefined,
+    'the absent window kept its previous tenure\'s baseline');
+
+  // Upstream reports it again, well past its earlier value. That is a first
+  // sight in this tenure, not a rollover.
+  scoped(am, 0, 'opus', 0.50, 200, now);
+  assert.equal(serve(am, null, OPUS).name, 'a', 'a reappearing window read as a rollover');
+});
+
+// ---------------------------------------------------------------------------
+// Evidence must postdate the event it clears
+// ---------------------------------------------------------------------------
+
+// Two requests whose selections straddle a rollover and whose terminal responses
+// land in a caller-chosen order. The session's final pin is a either way, so the
+// two runs differ by scheduling alone.
+function twoInFlight(order) {
+  const am = mgr(['a', 'b'], ON, { distributeSessions: true });
+  bucket(am, 0, 'unified7d', 0.4, 10);
+  bucket(am, 1, 'unified7d', 0.4, 10);
+  assert.equal(serve(am, 's1', OPUS).name, 'a');
+  rollWindow(am, 0);
+
+  // R1 selects first, detects the rollover, and is sent off a. Still in flight.
+  am.beginSession('s1');
+  const d1 = {};
+  const r1 = am.getActiveAccount(null, OPUS, null, 's1', d1);
+  assert.equal(r1.name, 'b', 'R1 should have been preempted off the rolled account');
+  am.recordSession('s1', r1.index, OPUS);
+
+  // R2 selects later and fails over to b, so it retries with b excluded and
+  // lands back on a — the fallback that leaves the event owed. It re-pins there,
+  // so a is the session's account whichever way the terminals land.
+  am.beginSession('s1');
+  const d2 = {};
+  const r2 = am.getActiveAccount(new Set([1]), OPUS, null, 's1', d2);
+  assert.equal(r2.name, 'a', 'R2 should have fallen back onto the rolled account');
+  am.recordSession('s1', r2.index, OPUS);
+
+  const t1 = () => { am.confirmRouted('s1', r1.index, OPUS, d1); am.endSession('s1'); };
+  const t2 = () => { am.confirmRouted('s1', r2.index, OPUS, d2); am.endSession('s1'); };
+  for (const t of (order === 'r1-last' ? [t2, t1] : [t1, t2])) t();
+  assert.equal(am.sessionTracker.pinnedAccount('s1', 'unified7d'), 0,
+    'the fixture must leave the session pinned to a in both orders');
+  return am;
+}
+
+test('a slow success from before the rollover does not settle it, in either order', () => {
+  // Selection mutates the pin when it runs; a terminal arrives whenever it
+  // arrives. A success from an attempt issued BEFORE the event was detected
+  // says where traffic was going before anyone knew, and clearing on it banks a
+  // move a later request has already fallen back from. The two runs below
+  // differ only in which terminal lands last.
+  for (const order of ['r2-last', 'r1-last']) {
+    const am = twoInFlight(order);
+    assert.notEqual(serve(am, 's1', OPUS).name, 'a',
+      `terminal order ${order}: the rollover was settled by evidence older than itself`);
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Bookkeeping lifetime
 // ---------------------------------------------------------------------------
 

@@ -217,6 +217,11 @@ export class AccountManager {
     // are both reported while one busy session cannot repeat either. Keyed by
     // session id it would be unbounded: that id is a client-supplied header.
     this._rolloverHeldLogAt = new Map();
+    // Monotonic position of each selection, so a rollover and the evidence that
+    // clears it can be ordered against each other. Terminal responses arrive in
+    // whatever order the network and upstream produce; selections happen in one
+    // order, and it is the one that matters here.
+    this._selectionSeq = 0;
     // Storm control: when rotation switches to a fresh account, a burst of
     // in-flight requests (e.g. dozens of agents failing over together) would all
     // hit it at once and instantly throttle it — cascading down the fleet
@@ -335,7 +340,7 @@ export class AccountManager {
    */
   _setCurrent(account) {
     this.currentIndex = account.index;
-    this._currentSeen.establish(account.index, this._bucketWindows(account));
+    this._currentSeen.establish(account.index, this._accountWindows(account));
   }
 
   /**
@@ -460,17 +465,31 @@ export class AccountManager {
    * request keeps flowing (upstream then fails just the advisor call).
    *
    * `decision` is an optional out-object recording what this selection actually
-   * did, for the bookkeeping that runs after it. It carries one field:
+   * did, for the bookkeeping that runs after it. It carries two fields.
+   *
    * `viaCurrent`, true when the sticky current-account walk produced this
    * account. Only such a request may settle that walk's pending rollover — a
    * session pin and a /tc-acct/ pin never consult `currentIndex`, so confirming
-   * one of those would swallow an event nothing acted on. Hand the same object
-   * to confirmRouted. Deriving the answer there instead would be re-deriving it
-   * from state that has moved on; absent, it reads as "cannot tell", which is
-   * the safe direction — the event stays owed rather than being consumed
-   * wrongly.
+   * one of those would swallow an event nothing acted on.
+   *
+   * `seq`, this selection's position in the order selections ran. Terminal
+   * responses do not arrive in that order, and a success from an attempt issued
+   * before a rollover was detected must not clear it — by then a later request
+   * may have fallen back onto the rolled account, and settling on the older
+   * evidence banks a move the fleet has undone. Stamped at selection because
+   * that is the moment being ordered; read at confirmRouted.
+   *
+   * Hand the same object to confirmRouted. Deriving either answer there instead
+   * would be re-deriving it from state that has moved on; absent, it reads as
+   * "cannot tell", which is the safe direction — the event stays owed rather
+   * than being consumed wrongly.
    */
   getActiveAccount(exclude = null, model = null, advisorModel = null, sessionId = null, decision = null) {
+    // Allocated for every selection, carried out only by one that asked for a
+    // decision: the ordering has to be dense to be an ordering, and a caller
+    // that does not read it still consumes its place in the sequence.
+    const seq = ++this._selectionSeq;
+    if (decision) decision.seq = seq;
     const account = this._pickActiveAccount(exclude, model, advisorModel, sessionId, decision);
     // Record where this route now sits, whatever path chose it — the steady-state
     // path returns the account the cursor already names and never reaches the
@@ -1210,47 +1229,12 @@ export class AccountManager {
   }
 
   /**
-   * THE resolution of "which weekly window governs `model` on this account, how
-   * spent is it, and when does it reset". Every reader goes through here — the
-   * availability gate (`_governingWeekly`), the pressure ratio and the band
-   * (`_bandSnapshot`), the equal-pressure tiebreak (`_rankedReset`) and the
-   * rollover baseline (`_bucketWindows`) — so that no two of them can answer it
-   * differently.
-   *
-   * Separately, the gate refuses an account on its scoped bucket while pressure
-   * credits it with the shared window's headroom, and the baseline watches a
-   * window the ranking is not spending, so a scoped window can gain a full week
-   * with no rollover event at all. Both halves come from one window, and one
-   * window is named once.
-   *
-   * A family with no dedicated bucket may still be metered by a weekly bucket
-   * upstream reports scoped to it, learned at runtime rather than named in the
-   * family table (#231). Gating on the tighter of that and the shared weekly is
-   * upstream's rule; crediting such an account with the shared window's headroom
-   * would rank it on quota the gate has already decided it does not have, and
-   * send that family's traffic to the account most spent on it — the very
-   * substitution the paired read exists to prevent, arriving by a route the
-   * family table cannot see.
-   *
-   * The scoped bucket carries its own reset, so when it is the binding one both
-   * halves still come from it. Only the shared weekly has a dedicated `Reset`
-   * field, which is why this returns the pair rather than a bucket name.
-   *
-   * The scoped reading is consulted on the REQUEST's bucket, not on the window
-   * that bucket fell back to. A family bucket the account does not report, and a
-   * route `bucket` override naming a field nothing fills, both collapse onto the
-   * shared window — and `_governingWeekly` reads the shared number plainly in
-   * both cases. Following the collapse here instead would answer from a family's
-   * scoped bucket in exactly the cases the gate does not, which is the same
-   * disagreement in the other direction.
-   *
-   * `window` NAMES the window the pair came from, so the rollover detector can
-   * key a baseline on the same window the gate and the ranking used. A scoped
-   * bucket has no field of its own to name, so it is named for its family. Two
-   * families sharing `unified7d` therefore get separate baselines under it,
-   * which is what the detector's per-window slots are for: their windows really
-   * are different windows, and comparing one family's reset against another's
-   * would report a jump that never happened.
+   * One resolution of which weekly window governs `model`, how spent it is and
+   * when it resets, read by the gate, the ratio, the band, the tiebreak and the
+   * rollover baseline so no two answer differently. A family with no dedicated
+   * bucket may be metered by a scoped one upstream learned for it (#231), which
+   * carries its own reset — so the pair travels together, named by `window` so
+   * that two families sharing `unified7d` keep separate rollover baselines.
    */
   _governingWindow(account, model) {
     const key = this._governingBucket(account, model);
@@ -1392,12 +1376,13 @@ export class AccountManager {
   _pinRolledOver(sessionId, pinned, model) {
     const seen = this.sessionTracker.windowsFor(sessionId, true);
     if (!seen) return false;
-    const bucket = this._weeklyBucketFor(model);
-    // Only THIS bucket is seeded from the pinned account. The session's other
-    // buckets are pinned to whatever account serves them, so recording this
-    // account's windows under them would overwrite a baseline belonging to a
-    // different account — and lose the rollover it was there to catch.
-    return seen.rolledOver(pinned.index, bucket, this._bucketWindows(pinned, [bucket], model));
+    const seq = this._selectionSeq;
+    // Only THIS request's window is seeded from the pinned account. The
+    // session's other pins name whatever account serves them, so recording this
+    // account's other windows would write a baseline against an account those
+    // pins are not on — and lose the rollover it was there to catch.
+    const win = this._governingWindow(pinned, model);
+    return seen.rolledOver(pinned.index, win.window, { [win.window]: win.resetAt }, seq);
   }
 
   /** As _pinRolledOver, for the global current account — which, unlike a
@@ -1406,8 +1391,8 @@ export class AccountManager {
    * request that should have caught it rolling). */
   _currentRolledOver(current, model) {
     return this._currentSeen.rolledOver(
-      current.index, this._weeklyBucketFor(model),
-      this._bucketWindows(current, this._windowKeys(), model));
+      current.index, this._governingWindow(current, model).window,
+      this._accountWindows(current), this._selectionSeq);
   }
 
   /**
@@ -1481,8 +1466,8 @@ export class AccountManager {
    * For a session this only RECORDS where the traffic went; the event settles
    * when the session goes quiescent (see endSession). A sibling request for the
    * same session can be served off the rolled account while a slower one is
-   * still failing back onto it, and whichever finishes last is the one that says
-   * where the session ended up.
+   * still failing back onto it, and the LATEST SELECTION — not the last
+   * response — is the one that says where the session ended up.
    *
    * The current account's own event is settled only when `decision` says this
    * request came from the walk that owns it. A session's pin and a /tc-acct/ pin
@@ -1490,11 +1475,22 @@ export class AccountManager {
    * confirm it would consume an event that walk never acted on — leaving
    * `current` parked on the account that just gained a full week until the next
    * roll.
+   *
+   * Evidence without a `seq` is not recorded at all. A request that never went
+   * through selection — a /tc-acct/ pin resolves before getActiveAccount is
+   * called — cannot be placed in the order the events are in, and evidence that
+   * cannot be shown to postdate an event must not clear it. Silence is the safe
+   * reading: the event stays owed and the next selection preempts again.
    */
   confirmRouted(sessionId, accountIndex, model = null, decision = null) {
-    const buckets = [this._weeklyBucketFor(model)];
-    if (decision?.viaCurrent) this._currentSeen.commitOn(accountIndex, buckets);
-    if (sessionId) this.sessionTracker.windowsFor(sessionId)?.noteServed(accountIndex, buckets);
+    const seq = decision?.seq;
+    if (seq == null) return;
+    // Every window name this model resolves to anywhere in the fleet. The event
+    // is keyed on the window as the OWING account resolved it, and the account
+    // that ended up serving may resolve the same model to a different one.
+    const windows = new Set(this.accounts.map(a => this._governingWindow(a, model).window));
+    if (decision.viaCurrent) this._currentSeen.commitOn(accountIndex, windows, seq);
+    if (sessionId) this.sessionTracker.windowsFor(sessionId)?.noteServed(accountIndex, windows, seq);
   }
 
   /** The window a request bucket actually resolves to on this account: its own
@@ -1518,45 +1514,34 @@ export class AccountManager {
   }
 
   /**
-   * The baseline a rollover is measured against, as
-   * { requestBucket: { window, reset } } — one entry per bucket this account
-   * currently resolves a reset for. Every bucket is named, including two that
-   * resolve to the same window: the bucket is what a pin, an event and a
-   * preemption are each about, and merging two of them under their shared window
-   * loses one of the two rollovers.
+   * Every named window this account currently presents, as { windowName: reset }
+   * — the watcher's whole view of the account, and what a tenure establishes.
    *
-   * The window rides along because it is what makes the reset meaningful: two
-   * resets are comparable only when they are the same window's, and the window a
-   * bucket resolves to changes the first time its account reports that family's
-   * own utilization.
+   * Enumerated over both spaces a window name can come from, because neither
+   * alone is complete: the request BUCKETS (each resolving to its own field or
+   * collapsing onto the shared weekly), and the FAMILIES upstream has learned a
+   * scoped bucket for. A bucket-only walk cannot name `scoped:opus`, since no
+   * bucket is named for Opus; that omission is how a writer came to store the
+   * flat window while the selection that chose the account had used the scoped
+   * one, leaving the baseline describing a window nothing was spending.
    *
-   * `model` names the request's own bucket, and THAT bucket resolves exactly as
-   * the gate and the ranking resolve it — through `_governingWindow`, scoped
-   * reading included. A window good enough to price a sticky choice has to be
-   * the window whose roll releases it: ranking on a learned scoped bucket while
-   * watching the shared weekly lets the scoped window gain a full week with no
-   * event at all, and the session pinned there goes on spending the one thing
-   * this feature exists to preserve.
-   *
-   * The other buckets — the hedge that stops a later first request of another
-   * family first-sighting its window on the very pass that should have caught it
-   * rolling — keep the flat resolution, because their family is not known here.
-   * That is safe in the one direction that matters: when such a request does
-   * arrive and resolves to a scoped window, that window has no baseline yet, so
-   * it is a first sight rather than a jump.
+   * Scoped windows are recorded whether or not they currently BIND. Binding
+   * decides which window a request resolves to, not whether the window exists,
+   * and a window that starts binding later needs the baseline it would otherwise
+   * have to first-sight on the very request that should have caught it rolling.
    */
-  _bucketWindows(account, buckets = this._windowKeys(), model = null) {
-    const governing = model == null ? null : this._weeklyBucketFor(model);
+  _accountWindows(account) {
     const out = {};
-    for (const bucket of buckets) {
-      let window, reset;
-      if (bucket === governing) {
-        ({ window, resetAt: reset } = this._governingWindow(account, model));
-      } else {
-        window = this._windowForBucket(account, bucket);
-        reset = account.quota[`${window}Reset`];
+    for (const bucket of this._windowKeys()) {
+      const window = this._windowForBucket(account, bucket);
+      const reset = account.quota[`${window}Reset`];
+      if (reset != null) out[window] = reset;
+    }
+    const scoped = account.quota.scopedWeekly;
+    if (scoped && typeof scoped === 'object') {
+      for (const [family, b] of Object.entries(scoped)) {
+        if (b?.resetAt != null) out[`scoped:${family}`] = b.resetAt;
       }
-      if (reset != null) out[bucket] = { window, reset };
     }
     return out;
   }
@@ -1600,8 +1585,17 @@ export class AccountManager {
     if (!account) return;
     const seen = this.sessionTracker.windowsFor(sessionId, true);
     if (!seen) return;
-    const windows = this._bucketWindows(account, buckets, model);
-    if (moved) seen.establish(accountIndex, windows);
+    // The window this request resolved, by the same resolution the selection
+    // used — not the request bucket it was filed under, which names a different
+    // window the moment a family is metered by a learned scoped bucket.
+    const win = this._governingWindow(account, model);
+    const windows = { [win.window]: win.resetAt };
+    // A pin naming a new account begins a tenure there, and a tenure is
+    // authoritative about what THAT account presents — every window of it, so a
+    // window it stops reporting loses its stale baseline rather than waiting to
+    // reappear and read as a jump. Other accounts are untouched: establish is
+    // scoped to one index, which is what leaves this session's other pins alone.
+    if (moved) seen.establish(accountIndex, { ...this._accountWindows(account), ...windows });
     else seen.seed(accountIndex, windows);
   }
 

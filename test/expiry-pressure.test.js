@@ -150,30 +150,68 @@ test('the gate and the ranking read the same number, however the bucket resolves
   }
 });
 
-test('every reader of the governing window answers from the one resolution', () => {
-  // The gate, the pressure ratio, the tiebreak and the rollover baseline are
-  // four readings of one question, so the agreement is asserted on the readers
-  // themselves rather than on the helper they share.
+test('every reader and the WRITER agree with a table nobody derived from them', () => {
+  // Expected values written out by hand from the quota shape, not read back out
+  // of the helpers under test: asserting `_governingWeekly(a) ===
+  // _governingWindow(a).utilization` compares one function with itself and
+  // cannot fail. Every number below is independently
+  // constructed, and the WRITER (_setCurrent, through the watcher's own state)
+  // is checked alongside the readers.
   const now = Date.now();
+  const SHARED = now + 40 * H;
+  const SCOPED = now + 12 * H;
+  const FABLE_R = now + 30 * H;
   const cases = [
-    ['scoped binds', { unified7d: 0.10, unified7dReset: now + 40 * H, scopedWeekly: { opus: { utilization: 0.90, resetAt: now + 12 * H } } }],
-    ['shared binds', { unified7d: 0.95, unified7dReset: now + 40 * H, scopedWeekly: { opus: { utilization: 0.20, resetAt: now + 12 * H } } }],
-    ['scoped, no shared reading', { unified7dReset: now + 40 * H, scopedWeekly: { opus: { utilization: 0.30, resetAt: now + 12 * H } } }],
-    ['nothing scoped', { unified7d: 0.40, unified7dReset: now + 40 * H, scopedWeekly: {} }],
+    {
+      label: 'scoped binds — the learned window is spent past the shared one',
+      quota: { unified7d: 0.10, unified7dReset: SHARED, scopedWeekly: { opus: { utilization: 0.90, resetAt: SCOPED } } },
+      model: OPUS,
+      window: 'scoped:opus', utilization: 0.90, resetAt: SCOPED,
+    },
+    {
+      label: 'shared binds — the learned window has more headroom',
+      quota: { unified7d: 0.95, unified7dReset: SHARED, scopedWeekly: { opus: { utilization: 0.20, resetAt: SCOPED } } },
+      model: OPUS,
+      window: 'unified7d', utilization: 0.95, resetAt: SHARED,
+    },
+    {
+      label: 'no scoped map at all',
+      quota: { unified7d: 0.40, unified7dReset: SHARED, scopedWeekly: {} },
+      model: OPUS,
+      window: 'unified7d', utilization: 0.40, resetAt: SHARED,
+    },
+    {
+      label: 'a family with its own field is never scoped-resolved',
+      quota: { unified7d: 0.10, unified7dReset: SHARED, unified7dFable: 0.55, unified7dFableReset: FABLE_R, scopedWeekly: { fable: { utilization: 0.95, resetAt: SCOPED } } },
+      model: FABLE,
+      window: 'unified7dFable', utilization: 0.55, resetAt: FABLE_R,
+    },
+    {
+      label: 'a family whose field is absent collapses onto the shared window',
+      quota: { unified7d: 0.10, unified7dReset: SHARED, scopedWeekly: {} },
+      model: FABLE,
+      window: 'unified7d', utilization: 0.10, resetAt: SHARED,
+    },
   ];
-  for (const [label, quota] of cases) {
+
+  for (const c of cases) {
     const am = mgr(['a'], { expiry: ON });
-    Object.assign(am.accounts[0].quota, quota);
+    Object.assign(am.accounts[0].quota, c.quota);
     const a = am.accounts[0];
-    const win = am._governingWindow(a, OPUS);
-    // The gate reads the same number...
-    assert.equal(am._governingWeekly(a, OPUS), win.utilization ?? null, `${label}: gate`);
-    // ...the tiebreak reads the same clock...
-    assert.equal(am._rankedReset(a, OPUS), win.resetAt || -Infinity, `${label}: tiebreak`);
-    // ...and the rollover baseline watches the same window, by name.
-    const seen = am._bucketWindows(a, [am._weeklyBucketFor(OPUS)], OPUS);
-    assert.equal(seen[am._weeklyBucketFor(OPUS)].window, win.window, `${label}: baseline window`);
-    assert.equal(seen[am._weeklyBucketFor(OPUS)].reset, win.resetAt, `${label}: baseline reset`);
+
+    // Readers, each against the hand-written value.
+    assert.equal(am._governingWeekly(a, c.model), c.utilization, `${c.label}: gate`);
+    assert.equal(am._rankedReset(a, c.model), c.resetAt, `${c.label}: tiebreak`);
+    assert.equal(am._governingWindow(a, c.model).window, c.window, `${c.label}: window name`);
+    const [snap] = am._bandSnapshot([a], c.model, now).accounts;
+    assert.equal(snap.utilization, c.utilization, `${c.label}: band utilization`);
+    assert.equal(snap.resetAt, c.resetAt, `${c.label}: band reset`);
+
+    // The WRITER: making the account current must leave the watcher holding
+    // exactly this window at exactly this reset, under this name.
+    am._setCurrent(a);
+    assert.equal(am._currentSeen.windows.get(c.window)?.get(0), c.resetAt,
+      `${c.label}: writer stored the wrong reset under ${c.window}`);
   }
 });
 
