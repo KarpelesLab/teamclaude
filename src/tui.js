@@ -1,6 +1,12 @@
 import { createWriteStream } from 'node:fs';
 import { importCredentials, fetchProfile } from './oauth.js';
-import { sameIdentity, findUpsertTarget } from './identity.js';
+import {
+  sameIdentity,
+  findUpsertTarget,
+  canUpsertOAuthAccount,
+  oauthIdentityFields,
+} from './identity.js';
+import { formatPercent } from './status-renderer.js';
 import { parseProxyUrl, proxyToUrl, describeProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy } from './upstream-proxy.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
@@ -85,7 +91,44 @@ const routeGlyph = (paint, eligible, pinned) =>
 
 const ANSI_RE = /\x1b\[[0-9;]*m/g;
 const strip = s => s.replace(ANSI_RE, '');
-const vw = s => strip(s).length;
+
+// Terminal display width of one code point: 0 for combining and zero-width
+// marks, 2 for East Asian wide/fullwidth characters and emoji, 1 otherwise.
+// A compact subset of Unicode's East_Asian_Width and combining ranges, enough
+// to keep the account table aligned for CJK and accented names without a full
+// property database. It does not resolve emoji ZWJ sequences, so a multi-part
+// emoji is counted per component; names rarely contain those.
+function charWidth(cp) {
+  if (cp === 0) return 0;
+  if (
+    (cp >= 0x0300 && cp <= 0x036f) || (cp >= 0x0483 && cp <= 0x0489) ||
+    (cp >= 0x0591 && cp <= 0x05bd) || (cp >= 0x0610 && cp <= 0x061a) ||
+    (cp >= 0x064b && cp <= 0x065f) || (cp >= 0x0e31 && cp <= 0x0e3a) ||
+    cp === 0x200b || (cp >= 0x200d && cp <= 0x200f) ||
+    (cp >= 0x20d0 && cp <= 0x20ff) || (cp >= 0xfe00 && cp <= 0xfe0f)
+  ) return 0;
+  if (
+    (cp >= 0x1100 && cp <= 0x115f) || (cp >= 0x2e80 && cp <= 0x303e) ||
+    (cp >= 0x3041 && cp <= 0x33ff) || (cp >= 0x3400 && cp <= 0x4dbf) ||
+    (cp >= 0x4e00 && cp <= 0x9fff) || (cp >= 0xa000 && cp <= 0xa4cf) ||
+    (cp >= 0xac00 && cp <= 0xd7a3) || (cp >= 0xf900 && cp <= 0xfaff) ||
+    (cp >= 0xfe30 && cp <= 0xfe4f) || (cp >= 0xff00 && cp <= 0xff60) ||
+    (cp >= 0xffe0 && cp <= 0xffe6) || (cp >= 0x1f300 && cp <= 0x1faff) ||
+    (cp >= 0x20000 && cp <= 0x3fffd)
+  ) return 2;
+  return 1;
+}
+
+// Visible terminal width of a string: ANSI escapes stripped, then each code
+// point measured by charWidth. Replaces a bare .length, which miscounts CJK
+// (1 unit, 2 columns) and combining marks (1 unit, 0 columns) and so would
+// misalign the table for non-ASCII names.
+export function displayWidth(s) {
+  let w = 0;
+  for (const ch of strip(s)) w += charWidth(ch.codePointAt(0));
+  return w;
+}
+const vw = displayWidth;
 
 function rpad(s, w) {
   const gap = w - vw(s);
@@ -98,27 +141,40 @@ function splitCsv(value) {
   return (value || '').split(',').map(s => s.trim()).filter(Boolean);
 }
 
-/** Truncate a string with ANSI codes to exactly w visible characters, then reset. */
-function truncate(s, w) {
-  let visible = 0;
+/** Truncate a string with ANSI codes to at most w display columns, then reset. */
+export function truncate(s, w) {
+  let width = 0;
   let out = '';
   let i = 0;
-  while (i < s.length && visible < w) {
+  while (i < s.length) {
     if (s[i] === '\x1b') {
       const end = s.indexOf('m', i);
       if (end >= 0) { out += s.slice(i, end + 1); i = end + 1; continue; }
     }
-    out += s[i];
-    visible++;
-    i++;
+    const cp = s.codePointAt(i);
+    const cw = charWidth(cp);
+    // A wide glyph that would cross the limit is dropped whole rather than split;
+    // the one leftover column is filled by the caller's padding.
+    if (width + cw > w) break;
+    const len = cp > 0xffff ? 2 : 1;
+    out += s.slice(i, i + len);
+    width += cw;
+    i += len;
   }
   return out + RESET;
 }
 
-/** Fit a line to exactly w columns: truncate if too long, pad if too short. */
-function fitLine(s, w) {
+/** Fit a line to exactly w columns: truncate if too long, pad if too short.
+ *  Truncation drops a wide glyph that would straddle the limit, so the result
+ *  can come up one column short; pad that too — the frame is repainted in
+ *  place, and a line narrower than the terminal leaves the previous frame's
+ *  last cell visible. */
+export function fitLine(s, w) {
   const v = vw(s);
-  if (v > w) return truncate(s, w);
+  if (v > w) {
+    const t = truncate(s, w);
+    return t + ' '.repeat(Math.max(0, w - vw(t)));
+  }
   if (v < w) return s + ' '.repeat(w - v);
   return s;
 }
@@ -411,13 +467,10 @@ export class TUI {
       id: 'threshold',
       label: 'Switch threshold',
       hint: '←→ ±1%',
-      value: () => {
-        const thr = this.am.switchThreshold ?? this.config.switchThreshold ?? 0.98;
-        return green(`${Math.round(thr * 100)}%`);
-      },
+      value: () => green(formatPercent(this.am.switchThreshold ?? this.config.switchThreshold ?? 0.98)),
       left: () => this._nudgeThreshold(-1),
       right: () => this._nudgeThreshold(+1),
-      enter: () => this._promptInput('Switch threshold % (1-100)', v => this._doSetThreshold(v.trim())),
+      enter: () => this._promptInput('Switch threshold % (1-100, tenths allowed)', v => this._doSetThreshold(v.trim())),
     });
 
     fields.push({
@@ -572,9 +625,11 @@ export class TUI {
   }
 
   _nudgeThreshold(deltaPct) {
-    const cur = Math.round((this.am.switchThreshold ?? this.config.switchThreshold ?? 0.98) * 100);
+    // Stepping from the exact percent, not a rounded one, so a threshold set to
+    // a tenth keeps its fraction instead of snapping to the nearest whole.
+    const cur = (this.am.switchThreshold ?? this.config.switchThreshold ?? 0.98) * 100;
     const next = Math.max(1, Math.min(100, cur + deltaPct));
-    if (next !== cur) this._doSetThreshold(String(next));
+    if (next !== cur) return this._doSetThreshold(String(next));
   }
 
   _nudgeProbe(deltaSec) {
@@ -588,12 +643,14 @@ export class TUI {
     if (!Number.isFinite(pct) || pct < 1 || pct > 100) {
       this._addLog('Invalid threshold — enter 1–100'); this.mode = 'settings'; if (this.running) this.render(); return;
     }
-    const v = Math.round(pct) / 100;
+    // Tenths of a percent are kept; anything finer is quantised so the stored
+    // value is the one the screen shows.
+    const v = Math.round(pct * 10) / 1000;
     this.config.switchThreshold = v;
     this.am.switchThreshold = v; // apply to the running rotation immediately
     try { await this.saveConfig(this.config); }
     catch (e) { this._addLog(`Failed to save: ${e.message}`); }
-    this._addLog(`Switch threshold set to ${Math.round(v * 100)}%`);
+    this._addLog(`Switch threshold set to ${formatPercent(v)}`);
     this.mode = 'settings';
     if (this.running) this.render();
   }
@@ -875,10 +932,10 @@ export class TUI {
       this._addLog('Importing credentials...');
       const creds = await this._readCredentials('~/.claude/.credentials.json');
       const profile = await this._readProfile(creds.accessToken);
-      const profileOk = profile && !profile.error;
 
-      if (!profileOk) {
-        this._addLog(`Warning: could not fetch profile — ${profile?.error || 'no token'}`);
+      if (!canUpsertOAuthAccount(profile, false)) {
+        this._addLog(`Import refused: could not identify OAuth account — ${profile?.error || 'profile unavailable'}`);
+        return;
       }
 
       let name;
@@ -893,9 +950,7 @@ export class TUI {
 
       const entry = {
         name, type: 'oauth', source: 'import',
-        accountUuid: profile?.accountUuid || null,
-        orgUuid: profile?.orgUuid || null,
-        orgName: profile?.orgName || null,
+        ...oauthIdentityFields(profile),
         accessToken: creds.accessToken,
         refreshToken: creds.refreshToken,
         expiresAt: creds.expiresAt,
@@ -916,9 +971,9 @@ export class TUI {
           amAcct.credential = creds.accessToken;
           amAcct.refreshToken = creds.refreshToken;
           amAcct.expiresAt = creds.expiresAt;
-          amAcct.accountUuid = entry.accountUuid;
-          amAcct.orgUuid = entry.orgUuid;
-          amAcct.orgName = entry.orgName;
+          if (entry.accountUuid) amAcct.accountUuid = entry.accountUuid;
+          if (entry.orgUuid) amAcct.orgUuid = entry.orgUuid;
+          if (entry.orgName) amAcct.orgName = entry.orgName;
           if (amAcct.status === 'error') amAcct.status = 'active';
         }
         this._addLog(`Updated account "${prev.name}"`);

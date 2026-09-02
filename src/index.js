@@ -9,8 +9,16 @@ import { installCrashHandlers } from './crash-log.js';
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
-import { sameIdentity, orgKey, matchAccounts, findUpsertTarget } from './identity.js';
+import {
+  sameIdentity,
+  orgKey,
+  matchAccounts,
+  findUpsertTarget,
+  canUpsertOAuthAccount,
+  oauthIdentityFields,
+} from './identity.js';
 import { resolveAccounts } from './resolve-accounts.js';
+import { syncAccountsFromDisk } from './sync-accounts.js';
 import * as alias from './alias.js';
 import { ensureCerts } from './mitm.js';
 import { Prober } from './prober.js';
@@ -24,6 +32,23 @@ import { buildClaudeEnvLines, encodePinComponent } from './claude-env.js';
 import { serviceKind, installService, uninstallService, serviceStatus, renderService, logPath } from './service.js';
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
 import { getUpstreamProxy, describeProxy } from './upstream-proxy.js';
+
+// These constants are referenced by routeCommand, which the dispatch below
+// reaches through a top-level `await`. The await suspends module evaluation at
+// the switch, so a const declared under the switch is still in the temporal
+// dead zone when the command body runs — keep them above the dispatch.
+const ROUTE_USAGE = [
+  'Usage: teamclaude route [list]',
+  '       teamclaude route add <name> --match "<glob>[,<glob>]" [--accounts "<name-or-index>[,...]"] [--bucket <quota-bucket>] [--color <name>]',
+  '       teamclaude route rm <name>',
+  '',
+  'A route pins model ids matching its globs to an exclusive set of accounts.',
+  'Omit --accounts to route to all accounts (e.g. just to override --bucket).',
+  '--color (red/green/yellow/blue/magenta/cyan) tints the route\'s inline marker in the TUI.',
+  'First matching route wins. Changes apply to a running server immediately.',
+].join('\n');
+
+const ROUTE_COLORS = ['red', 'green', 'yellow', 'blue', 'magenta', 'cyan'];
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -265,6 +290,10 @@ async function serverCommand() {
     // Pick up route table edits (teamclaude route …, TUI editor, or a hand edit).
     config.routes = diskConfig.routes || [];
     accountManager.setRoutes(config.routes);
+    // Pick up a distributeSessions change (hand edit or another writer) the same
+    // way routes, sx, probe and warmup are picked up below.
+    config.distributeSessions = !!diskConfig.distributeSessions;
+    accountManager.setDistributeSessions(config.distributeSessions);
     // Apply an sx.org key/mode change made on disk (e.g. via POST /teamclaude/reload).
     const diskSxKey = diskConfig.sx?.apiKey || null;
     const diskSxMode = diskConfig.sx?.mode || 'always';
@@ -317,6 +346,11 @@ async function serverCommand() {
         if (config.switchThreshold != null) diskConfig.switchThreshold = config.switchThreshold;
         if (config.quotaProbeSeconds != null) diskConfig.quotaProbeSeconds = config.quotaProbeSeconds;
         if (config.warmupSeconds != null) diskConfig.warmupSeconds = config.warmupSeconds;
+        // The telemetry mode and the model blocklist are edited from the settings
+        // screen too; the server reads them live from `config`, but without this
+        // the edit never reached disk and was silently undone by the next start.
+        if (config.eventLogging != null) diskConfig.eventLogging = config.eventLogging;
+        if (config.blockedModels != null) diskConfig.blockedModels = config.blockedModels;
         // Persist the route table (edited from the TUI routes screen).
         if (config.routes != null) diskConfig.routes = config.routes;
       }),
@@ -1329,19 +1363,6 @@ async function removeCommand() {
 
 // ── route ───────────────────────────────────────────────────
 
-const ROUTE_USAGE = [
-  'Usage: teamclaude route [list]',
-  '       teamclaude route add <name> --match "<glob>[,<glob>]" [--accounts "<name-or-index>[,...]"] [--bucket <quota-bucket>] [--color <name>]',
-  '       teamclaude route rm <name>',
-  '',
-  'A route pins model ids matching its globs to an exclusive set of accounts.',
-  'Omit --accounts to route to all accounts (e.g. just to override --bucket).',
-  '--color (red/green/yellow/blue/magenta/cyan) tints the route\'s inline marker in the TUI.',
-  'First matching route wins. Changes apply to a running server immediately.',
-].join('\n');
-
-const ROUTE_COLORS = ['red', 'green', 'yellow', 'blue', 'magenta', 'cyan'];
-
 function splitList(value) {
   return (value || '').split(',').map(s => s.trim()).filter(Boolean);
 }
@@ -1536,7 +1557,7 @@ Options:
                       on macOS the default falls back to the Keychain)
   --json JSON         Import from inline JSON (import), e.g.:
                       --json '{"accessToken":"...","refreshToken":"...","expiresAt":1234}'
-  --log-to DIR        Log full requests/responses to DIR (server, one file per request)
+  --log-to DIR        Log requests/responses to DIR (server, one file per request)
   --activity-log FILE Append TUI activity lines to FILE (server; works in headless mode too)
   --headless          Run the server without the interactive TUI (for backgrounding)
   --no-mitm           (run) skip the forward proxy; route via ANTHROPIC_BASE_URL only
@@ -1604,8 +1625,14 @@ async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
   const profile = await fetchProfile(creds.accessToken);
   const profileOk = profile && !profile.error;
 
+  if (!canUpsertOAuthAccount(profile, userNamed)) {
+    console.error(`Could not identify OAuth account — ${profile?.error || 'profile unavailable'}`);
+    console.error('Retry with valid credentials, or pass --name to add the account without profile detection.');
+    process.exit(1);
+  }
+
   if (!profileOk) {
-    console.error(`Warning: could not fetch account profile — ${profile?.error || 'no token'}`);
+    console.error(`Warning: importing named account without profile detection — ${profile?.error || 'profile unavailable'}`);
   }
   if (!name && profile?.email) {
     name = profile.email;
@@ -1621,9 +1648,7 @@ async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
     name,
     type: 'oauth',
     source,
-    accountUuid: profile?.accountUuid || null,
-    orgUuid: profile?.orgUuid || null,
-    orgName: profile?.orgName || null,
+    ...oauthIdentityFields(profile),
     accessToken: creds.accessToken,
     refreshToken: creds.refreshToken,
     expiresAt: creds.expiresAt,
@@ -1670,90 +1695,6 @@ async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
  */
 function findConfigAccount(diskConfig, account) {
   return diskConfig.accounts.findIndex(a => sameIdentity(a, account));
-}
-
-/**
- * Sync accounts from disk config: add new accounts and refresh credentials
- * for existing ones (handles re-imported OAuth tokens, rotated API keys, etc.).
- * Returns the number of new accounts added.
- */
-async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
-  let added = 0;
-  // Greedy 1:1 pairing of disk entries to in-memory accounts, account+org aware.
-  // Each disk entry claims at most one unclaimed manager account, so multiple
-  // same-person/different-org entries pair correctly instead of all matching the
-  // first one with that accountUuid.
-  const claimed = new Set();
-  const claim = (diskAcct) => {
-    for (let i = 0; i < accountManager.accounts.length; i++) {
-      if (!claimed.has(i) && sameIdentity(accountManager.accounts[i], diskAcct)) {
-        claimed.add(i);
-        return i;
-      }
-    }
-    return -1;
-  };
-
-  for (const diskAcct of diskConfig.accounts) {
-    const mgrIdx = claim(diskAcct);
-
-    if (mgrIdx < 0) {
-      // New account discovered on disk — add to running server
-      memConfig.accounts.push(diskAcct);
-      accountManager.addAccount(diskAcct);
-      claimed.add(accountManager.accounts.length - 1);
-      added++;
-      console.log(`[TeamClaude] Picked up new account "${diskAcct.name}" from config`);
-      continue;
-    }
-
-    const mgr = accountManager.accounts[mgrIdx];
-
-    // Backfill org identity and pick up renames/priority onto the running
-    // account (e.g. after disk-side org disambiguation or a `priority` change).
-    if (diskAcct.orgUuid && !mgr.orgUuid) mgr.orgUuid = diskAcct.orgUuid;
-    if (diskAcct.orgName && !mgr.orgName) mgr.orgName = diskAcct.orgName;
-    if (diskAcct.name && mgr.name !== diskAcct.name) mgr.name = diskAcct.name;
-    if (diskAcct.priority != null && mgr.priority !== diskAcct.priority) mgr.priority = diskAcct.priority;
-    // Pick up enable/disable toggles; re-enabling clears a stuck error state.
-    const wantDisabled = !!diskAcct.disabled;
-    if (mgr.disabled !== wantDisabled) accountManager.setDisabled(mgr.index, wantDisabled);
-
-    // Existing account — resolve fresh credentials from disk
-    let freshCred = null;
-    if (diskAcct.type === 'oauth' && diskAcct.importFrom) {
-      try {
-        const creds = await importCredentials(diskAcct.importFrom);
-        freshCred = { accessToken: creds.accessToken, refreshToken: creds.refreshToken, expiresAt: creds.expiresAt };
-      } catch (err) {
-        console.error(`[TeamClaude] Re-import failed for "${diskAcct.name}": ${err.message}`);
-      }
-    } else if (diskAcct.type === 'oauth' && diskAcct.accessToken) {
-      freshCred = { accessToken: diskAcct.accessToken, refreshToken: diskAcct.refreshToken, expiresAt: diskAcct.expiresAt };
-    } else if (diskAcct.type === 'apikey' && diskAcct.apiKey) {
-      freshCred = { apiKey: diskAcct.apiKey };
-    }
-
-    if (!freshCred) continue;
-
-    if (freshCred.accessToken) {
-      const changed = mgr.credential !== freshCred.accessToken ||
-        mgr.refreshToken !== freshCred.refreshToken;
-      // Don't overwrite in-memory credentials with staler ones from disk
-      // (e.g. after a TUI import updated the AM before saveConfig wrote to disk)
-      const diskIsStaler = freshCred.expiresAt && mgr.expiresAt &&
-        freshCred.expiresAt < mgr.expiresAt;
-      if (changed && !diskIsStaler) {
-        accountManager.updateAccountTokens(mgr.index, freshCred);
-        console.log(`[TeamClaude] Refreshed credentials for "${mgr.name}"`);
-      }
-    } else if (freshCred.apiKey && mgr.credential !== freshCred.apiKey) {
-      mgr.credential = freshCred.apiKey;
-      if (mgr.status === 'error') mgr.status = 'active';
-      console.log(`[TeamClaude] Updated API key for "${mgr.name}"`);
-    }
-  }
-  return added;
 }
 
 // ── helpers ─────────────────────────────────────────────────

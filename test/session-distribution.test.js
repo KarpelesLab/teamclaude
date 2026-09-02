@@ -86,3 +86,14 @@ test('getStatus exposes session counts (known/active/perAccount) and the mode fl
   assert.equal(status.accounts[0].sessions, 1);
   assert.equal(status.accounts[1].sessions, 1);
 });
+
+test('setDistributeSessions applies a config change live', () => {
+  const am = mgr(['a', 'b']); // off: both sessions funnel onto the current account
+  const s1 = am.getActiveAccount(null, null, null, 'sess-1');
+  am.recordSession('sess-1', s1.index);
+  assert.equal(am.getActiveAccount(null, null, null, 'sess-2').name, 'a');
+  am.setDistributeSessions(true);
+  assert.equal(am.getActiveAccount(null, null, null, 'sess-2').name, 'b');
+  am.setDistributeSessions(false); // reload with the field removed disables it
+  assert.equal(am.getActiveAccount(null, null, null, 'sess-3').name, 'a');
+});

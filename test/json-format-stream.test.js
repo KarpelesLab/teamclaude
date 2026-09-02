@@ -46,3 +46,13 @@ test('pre-existing whitespace in the input is normalized away', () => {
   const f = new JsonStreamFormatter();
   assert.equal(f.push(Buffer.from(messy)), JSON.stringify({ a: 1, b: [2, 3] }, null, 2));
 });
+
+test('more closers than openers never throws (depth floors at zero)', () => {
+  // The formatter sees whatever a client or upstream sent; on master this made
+  // nl() throw a RangeError and failed the request the log was describing.
+  const f = new JsonStreamFormatter();
+  let out;
+  assert.doesNotThrow(() => { out = f.push(Buffer.from('{"a":1}}}]')); });
+  assert.equal(f.depth, 0);
+  assert.match(out, /"a": 1/);
+});

@@ -94,3 +94,27 @@ export function matchAccounts(accounts, query, orgFilter) {
   }
   return matches;
 }
+
+/**
+ * Automatic naming is safe only when the profile identifies the account.
+ * An explicit name is the caller's opt-in to importing without detection.
+ */
+export function canUpsertOAuthAccount(profile, userNamed) {
+  return Boolean(
+    userNamed
+    || (profile && !profile.error && (profile.accountUuid || profile.email))
+  );
+}
+
+/**
+ * Copy only known profile identity fields. Omitting unavailable fields keeps a
+ * named re-import from erasing identity already stored on the account.
+ */
+export function oauthIdentityFields(profile) {
+  if (!profile || profile.error) return {};
+  return Object.fromEntries(
+    ['accountUuid', 'orgUuid', 'orgName']
+      .filter(key => profile[key])
+      .map(key => [key, profile[key]])
+  );
+}
