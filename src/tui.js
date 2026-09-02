@@ -595,7 +595,7 @@ export class TUI {
     this.am.switchThreshold = v; // apply to the running rotation immediately
     try { await this.saveConfig(this.config); }
     catch (e) { this._addLog(`Failed to save: ${e.message}`); }
-    this._addLog(`Switch threshold set to ${Math.round(v * 100)}%`);
+    this._addLog(`Switch threshold set to ${formatPercent(v)}`);
     this.mode = 'settings';
     if (this.running) this.render();
   }

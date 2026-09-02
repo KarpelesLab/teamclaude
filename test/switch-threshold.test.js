@@ -40,6 +40,8 @@ test('a fraction of a percent survives instead of rounding to the nearest whole'
   await tui._doSetThreshold('99.5');
   assert.equal(am.switchThreshold, 0.995);
   assert.equal(shown(tui), '99.5%');
+  // The confirmation line must report the value that was stored, not a rounded one.
+  assert.ok(tui.log.some((l) => /Switch threshold set to 99\.5%/.test(l.msg)), JSON.stringify(tui.log));
 });
 
 test('a whole percent shows no decimal point', async () => {
