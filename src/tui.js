@@ -7,7 +7,7 @@ import {
   oauthIdentityFields,
 } from './identity.js';
 import { formatPercent } from './status-renderer.js';
-import { parseProxyUrl, proxyToUrl, describeProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy } from './upstream-proxy.js';
+import { parseProxyUrl, proxyToUrl, describeProxy, describeSelfProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy } from './upstream-proxy.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -181,10 +181,13 @@ const NAME_MIN = 12;
 // is over the switch threshold is barred from that model while the account is
 // otherwise active. Shared by the row renderer (which draws the `⊘` tag) and the
 // column layout (which reserves the width that tag needs).
+// `threshold` is a number, or a per-bucket lookup (bucket → number) so a family
+// is judged against its OWN configured threshold rather than the global one.
 export function blockedFamilies(quota, threshold) {
+  const at = typeof threshold === 'function' ? threshold : () => threshold;
   const out = [];
-  if (quota.unified7dSonnet != null && quota.unified7dSonnet >= threshold) out.push('Sonnet');
-  if (quota.unified7dFable != null && quota.unified7dFable >= threshold) out.push('Fable');
+  if (quota.unified7dSonnet != null && quota.unified7dSonnet >= at('unified7dSonnet')) out.push('Sonnet');
+  if (quota.unified7dFable != null && quota.unified7dFable >= at('unified7dFable')) out.push('Fable');
   return out;
 }
 
@@ -541,11 +544,20 @@ export class TUI {
   _settingsFields() {
     const fields = [];
 
-    fields.push({
+    // A per-bucket table can't be edited from a single ±1% control, and writing
+    // a plain number over it would silently discard the operator's per-bucket
+    // values. So the row shows the table and sends them to the config file.
+    const perBucket = this._perBucketThresholds();
+    fields.push(perBucket ? {
+      id: 'threshold',
+      label: 'Switch threshold',
+      hint: 'per-bucket — edit config',
+      value: () => green(perBucket),
+    } : {
       id: 'threshold',
       label: 'Switch threshold',
       hint: '←→ ±1%',
-      value: () => green(formatPercent(this.am.switchThreshold ?? this.config.switchThreshold ?? 0.98)),
+      value: () => green(formatPercent(this.am.effectiveThreshold ?? this.config.switchThreshold ?? 0.98)),
       left: () => this._nudgeThreshold(-1),
       right: () => this._nudgeThreshold(+1),
       enter: () => this._promptInput('Switch threshold % (1-100, tenths allowed)', v => this._doSetThreshold(v.trim())),
@@ -639,8 +651,11 @@ export class TUI {
       label: 'Upstream proxy',
       hint: 'Enter to set',
       value: () => {
-        const { proxy, source } = getUpstreamProxy();
-        if (!proxy) return dim('(direct)');
+        const resolved = getUpstreamProxy();
+        const { proxy, source } = resolved;
+        // A dropped self-proxy reads as "(direct)" too, and the operator would
+        // have no way to tell that a value they set is not in force.
+        if (!proxy) return source === 'self' ? dim('(direct) ') + gray(describeSelfProxy(resolved)) : dim('(direct)');
         // Name the environment when that is where it came from: a value the
         // operator did not put in the config, silently in force, is exactly the
         // thing that is hard to account for later.
@@ -717,9 +732,21 @@ export class TUI {
   _nudgeThreshold(deltaPct) {
     // Stepping from the exact percent, not a rounded one, so a threshold set to
     // a tenth keeps its fraction instead of snapping to the nearest whole.
-    const cur = (this.am.switchThreshold ?? this.config.switchThreshold ?? 0.98) * 100;
+    const cur = (this.am.effectiveThreshold ?? this.config.switchThreshold ?? 0.98) * 100;
     const next = Math.max(1, Math.min(100, cur + deltaPct));
     if (next !== cur) return this._doSetThreshold(String(next));
+  }
+
+  /** A one-line rendering of a per-bucket threshold table, or null when the
+   * threshold is a single number. */
+  _perBucketThresholds() {
+    const t = this.am.switchThreshold ?? this.config.switchThreshold;
+    if (!t || typeof t !== 'object') return null;
+    const pct = v => `${Math.round(v * 100)}%`;
+    return Object.entries(t)
+      .filter(([, v]) => typeof v === 'number' && Number.isFinite(v))
+      .map(([k, v]) => `${k}:${pct(v)}`)
+      .join(' ');
   }
 
   _nudgeProbe(deltaSec) {
@@ -950,6 +977,7 @@ export class TUI {
 
     const resolved = setUpstreamProxy(resolveUpstreamProxy(this.config));
     if (resolved.proxy) this._addLog(`Upstream proxy set to ${describeProxy(resolved.proxy)}`);
+    else if (resolved.source === 'self') this._addLog(`Connecting directly — ${describeSelfProxy(resolved)}`);
     else this._addLog('Upstream proxy cleared — connecting directly');
     this.mode = 'settings';
   }
@@ -1241,7 +1269,7 @@ export class TUI {
       // actually blocked; the common case where nothing is spends those columns
       // on the bars instead of leaving the row short of the edge.
       const tagW = this.am.accounts.reduce((w, a) => {
-        const names = blockedFamilies(a.quota, this.am.switchThreshold);
+        const names = blockedFamilies(a.quota, key => this.am.thresholdFor(key));
         return names.length ? Math.max(w, 4 + vw(names.join(' '))) : w;
       }, 0);
       const fixed = 28 + NAME_MIN + (genRoutes.length ? genRoutes.length + 1 : 0) + tagW;
@@ -1407,26 +1435,31 @@ export class TUI {
 
     // The live routing threshold, so a bucket the rotation already refuses to
     // use reads red however healthy its pace looks.
-    const th = this.am.switchThreshold;
+    // Each bar reddens at ITS bucket's threshold (a per-bucket table may set
+    // the weekly one lower than the 5-hour one); the attach-mode manager
+    // mirrors thresholdFor, so both dashboards agree with the gate.
+    const thFor = (k) => (typeof this.am.thresholdFor === 'function' ? this.am.thresholdFor(k) : this.am.switchThreshold);
+    const th1 = thFor(r1 === q.unified5h ? 'unified5h' : 'tokens');
+    const th2 = thFor(r2 === q.unified7d ? 'unified7d' : 'requests');
 
-    let line = ` ${sel}${cur} ${startSlot}${name} ${type} ${status} ${l1} ${bar(r1, bw, t1, w1, th)}`;
+    let line = ` ${sel}${cur} ${startSlot}${name} ${type} ${status} ${l1} ${bar(r1, bw, t1, w1, th1)}`;
     if (showBoth) {
-      line += `  ${l2} ${bar(r2, bw, t2, w2, th)}`;
+      line += `  ${l2} ${bar(r2, bw, t2, w2, th2)}`;
       // Sonnet weekly bar — only shown when the usage probe has populated it. A
       // leading ► (in place of a padding space) marks a Sonnet route on this account.
       if (showFamily && q.unified7dSonnet != null) {
-        line += ` ${familyMark('sonnet')}S7  ${bar(q.unified7dSonnet, bw, q.unified7dSonnetReset, SEVEN_DAY_MS, th)}`;
+        line += ` ${familyMark('sonnet')}S7  ${bar(q.unified7dSonnet, bw, q.unified7dSonnetReset, SEVEN_DAY_MS, thFor('unified7dSonnet'))}`;
       }
       // Fable weekly bar — only shown when the usage probe has populated it.
       if (showFamily && q.unified7dFable != null) {
-        line += ` ${familyMark('fable')}F7  ${bar(q.unified7dFable, bw, q.unified7dFableReset, SEVEN_DAY_MS, th)}`;
+        line += ` ${familyMark('fable')}F7  ${bar(q.unified7dFable, bw, q.unified7dFableReset, SEVEN_DAY_MS, thFor('unified7dFable'))}`;
       }
     }
     // Explicit "disabled for these models" tag (issue #85): a family whose own
     // weekly bucket is over the switch threshold can't serve that model even
     // while the account is otherwise active. A spent shared 5h blocks everything
     // and is already conveyed by the Ses bar + status, so it's not repeated here.
-    const blocked = blockedFamilies(q, this.am.switchThreshold);
+    const blocked = blockedFamilies(q, key => this.am.thresholdFor(key));
     if (blocked.length) line += `  ${red('⊘ ' + blocked.join(' '))}`;
     return line;
   }

@@ -42,6 +42,8 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
     }
     const routing = modelRoutingLine(account, status.switchThreshold, blocked, now, paint);
     if (routing) lines.push(`  ${routing}`);
+    const why = unavailableLine(account, paint);
+    if (why) lines.push(`  ${why}`);
     lines.push(`  ${paint.dim('Usage'.padEnd(8))} ${formatUsage(account.usage, now)}`);
     lines.push(`  ${paint.dim('Probe'.padEnd(8))} ${formatAccountProbe(account.name, probe, now, paint)}`);
     lines.push('');
@@ -63,6 +65,29 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
   }
 
   return lines.join('\n').trimEnd();
+}
+
+// Why an account is out of rotation, in the operator's terms. Reading
+// `unifiedStatus: allowed` next to an account that refuses everything used to
+// leave no way to tell whether the refusal was upstream's or the proxy's own
+// threshold policy (#166); this says which.
+const UNAVAILABLE_TEXT = {
+  disabled: 'disabled by operator',
+  throttled: 'upstream 429 hold',
+  exhausted: 'marked exhausted',
+  error: 'account error (see logs)',
+  'upstream-rejected': 'upstream reports quota rejected',
+  quota: 'local switch threshold reached',
+  route: 'no route allows this account',
+  'advisor-quota': "advisor model's weekly bucket spent",
+  'advisor-route': 'no route allows the advisor model',
+};
+
+export function unavailableLine(account, paint) {
+  const reason = account?.unavailable;
+  if (!reason) return null;
+  const text = UNAVAILABLE_TEXT[reason] || reason;
+  return `${paint.dim('Blocked'.padEnd(8))} ${paint.yellow(text)}`;
 }
 
 function colors(enabled) {
