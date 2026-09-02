@@ -506,7 +506,16 @@ export function relayHttpForward(req, res) {
   else req.pipe(upstreamReq);
 }
 
-const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/files/', '/api/oauth/file_upload'];
+// Paths relayed with the CLIENT's own credential, never a rotated account token.
+// Everything under /api/oauth/ is the client's identity/control plane — profile
+// ("who am I"), file uploads, and whatever Claude Code adds next — not inference.
+// Injecting a fleet token here makes Claude Code believe it IS the rotated
+// account: the cached oauthAccount profile gets overwritten with a stranger's
+// identity, the Claude-in-Chrome extension refuses to pair ("token belongs to a
+// different account than the one you're logged in as"), Remote Control binds to
+// the wrong account, and artifacts get published under it. Observed on a live
+// fleet; the whole prefix is the fix, not a growing allowlist of sub-paths.
+const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/'];
 
 /**
  * Build the core proxy request listener — buffer the body, then forward with
