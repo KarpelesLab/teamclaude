@@ -188,6 +188,22 @@ const NAME_MIN = 12;
 // column layout (which reserves the width that tag needs).
 // `threshold` is a number, or a per-bucket lookup (bucket → number) so a family
 // is judged against its OWN configured threshold rather than the global one.
+/**
+ * Short row tag for an account that bills real money past its plan limits:
+ * `$!` once something has actually been billed, `$` while it merely can be,
+ * '' when it cannot. ASCII on purpose — the row is width-budgeted to the cell,
+ * and a glyph whose width varies by terminal would push it past the edge.
+ *
+ * Deliberately not shown for an account that spent earlier and has since been
+ * switched off: the row reports what rotating onto this account costs now, and
+ * the status screen carries the fuller history.
+ */
+export function spendTag(quota) {
+  const spend = quota?.spend;
+  if (!spend?.enabled) return '';
+  return (spend.usedMinor || 0) > 0 ? '$!' : '$';
+}
+
 export function blockedFamilies(quota, threshold) {
   const at = typeof threshold === 'function' ? threshold : () => threshold;
   const out = [];
@@ -1311,7 +1327,14 @@ export class TUI {
         const names = blockedFamilies(a.quota, key => this.am.thresholdFor(key));
         return names.length ? Math.max(w, 4 + vw(names.join(' '))) : w;
       }, 0);
-      const fixed = 28 + NAME_MIN + (genRoutes.length ? genRoutes.length + 1 : 0) + tagW;
+      // Same rule for the `$`/`$!` money tag: a column the row can draw is a
+      // column the budget has to know about, or the row overflows exactly the
+      // way #228 fixed.
+      const spendW = this.am.accounts.reduce((w, a) => {
+        const tag = spendTag(a.quota);
+        return tag ? Math.max(w, 2 + vw(tag)) : w;
+      }, 0);
+      const fixed = 28 + NAME_MIN + (genRoutes.length ? genRoutes.length + 1 : 0) + tagW + spendW;
       const roomFor = n => fixed + 6 * (n - 1) + n * BAR_MIN <= W;
       // The family bars are the first thing to go: below the width where they
       // fit even at BAR_MIN they would push the row past the edge, and a row cut
@@ -1500,6 +1523,10 @@ export class TUI {
     // repeated here.
     const blocked = blockedFamilies(q, key => this.am.thresholdFor(key));
     if (blocked.length) line += `  ${red('⊘ ' + blocked.join(' '))}`;
+    // Money tag last, so it sits at the end of the row where the eye lands after
+    // the bars. Red once real money has moved, yellow while it only could.
+    const money = spendTag(q);
+    if (money) line += `  ${(money === '$!' ? red : yellow)(money)}`;
     return line;
   }
 

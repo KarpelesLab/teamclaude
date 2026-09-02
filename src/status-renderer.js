@@ -1,3 +1,4 @@
+import { formatMoney } from './oauth.js';
 import { findFamilyBlock, modelGlobOverlaps, gatingUtilization } from './model.js';
 import { safeLine } from './safe-text.js';
 
@@ -45,6 +46,8 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
     if (routing) lines.push(`  ${routing}`);
     const why = unavailableLine(account, paint);
     if (why) lines.push(`  ${why}`);
+    const spend = spendLine(account, paint);
+    if (spend) lines.push(`  ${spend}`);
     lines.push(`  ${paint.dim('Usage'.padEnd(8))} ${formatUsage(account.usage, now)}`);
     lines.push(`  ${paint.dim('Probe'.padEnd(8))} ${formatAccountProbe(account.name, probe, now, paint)}`);
     lines.push('');
@@ -83,6 +86,40 @@ const UNAVAILABLE_TEXT = {
   'advisor-quota': "advisor model's weekly bucket spent",
   'advisor-route': 'no route allows the advisor model',
 };
+
+/**
+ * The paid-overage warning line, or null when this account cannot bill and
+ * never has. Rendered separately from the quota bars on purpose: those all
+ * measure a plan allowance that simply runs out, while this one says that
+ * running out is billable here. An operator scanning the bars has no other way
+ * to see that rotation onto this account spends money rather than quota.
+ *
+ * Shown whenever billing is possible OR anything has already been billed — an
+ * account that spent this month and has since been switched off is still a
+ * fact about where the money went.
+ */
+export function spendLine(account, paint) {
+  const spend = account?.quota?.spend;
+  if (!spend) return null;
+  const spent = (spend.usedMinor || 0) > 0;
+  if (!spend.enabled && !spent) return null;
+
+  const amount = formatMoney(spend);
+  if (spend.enabled) {
+    // Already billing is the louder of the two: red, and named as money rather
+    // than as a percentage, so it cannot be mistaken for another quota bar.
+    const text = spent
+      ? `billing real money — ${amount} used this month`
+      : `can bill real money past its plan limits — ${amount} used`;
+    return `${paint.dim('Spend'.padEnd(8))} ${(spent ? paint.red : paint.yellow)(`\u26a0 ${text}`)}`;
+  }
+  // Not enabled, but money was spent this month. Say why it is off now, since
+  // "out_of_credits" and "the member turned it off" have different futures.
+  const why = spend.userDisabled ? 'now disabled by the account holder'
+    : spend.disabledReason ? `now off (${spend.disabledReason})`
+    : 'now off';
+  return `${paint.dim('Spend'.padEnd(8))} ${paint.yellow(`${amount} spent this month, ${why}`)}`;
+}
 
 export function unavailableLine(account, paint) {
   const reason = account?.unavailable;

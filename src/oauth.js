@@ -287,6 +287,85 @@ export function scopedWeeklyLimits(data) {
   return out;
 }
 
+/**
+ * Normalize the paid-overage ("extra usage") portion of a /api/oauth/usage
+ * payload into { enabled, usedMinor, limitMinor, currency, exponent,
+ * userDisabled, disabledReason }, or null when the payload said nothing about
+ * spend at all.
+ *
+ * This is the one part of the usage payload that is not about quota. Every
+ * other bucket answers "how much of the plan is left"; this answers "does
+ * running out of plan stop this account, or start charging for it". An account
+ * with `is_enabled` true does not refuse at its weekly limit — it keeps serving
+ * and bills, so the quota bars alone cannot tell an operator that rotation onto
+ * it costs money.
+ *
+ * `extra_usage.is_enabled` is the authority on whether billing can happen, not
+ * `spend.enabled` and not the profile endpoint's `has_extra_usage_enabled`:
+ * an org can have overage provisioned while the account itself cannot draw on
+ * it (out of credits, or switched off by the member), and only this field
+ * accounts for both. The amounts come from `spend`, which states its own
+ * currency and exponent rather than assuming cents or USD.
+ */
+export function normalizeSpend(data) {
+  const extra = data?.extra_usage;
+  const spend = data?.spend;
+  if ((!extra || typeof extra !== 'object') && (!spend || typeof spend !== 'object')) return null;
+
+  const money = (m) => {
+    if (!m || typeof m !== 'object') return null;
+    const minor = typeof m.amount_minor === 'number' ? m.amount_minor : parseFloat(m.amount_minor);
+    return Number.isFinite(minor) ? minor : null;
+  };
+
+  const usedMinor = money(spend?.used);
+  const limitMinor = money(spend?.limit);
+  // Prefer the currency/exponent the amounts were quoted in; fall back to the
+  // extra_usage block, which describes the same wallet in its own vocabulary.
+  const currency = spend?.used?.currency || spend?.limit?.currency || extra?.currency || null;
+  const rawExp = spend?.used?.exponent ?? spend?.limit?.exponent ?? extra?.decimal_places;
+  const exponent = Number.isFinite(rawExp) ? rawExp : 2;
+
+  return {
+    enabled: extra?.is_enabled === true,
+    usedMinor,
+    limitMinor,
+    currency,
+    exponent,
+    // Distinguishes "the member turned this off" from "upstream will not allow
+    // it" (no credits left, spend cap reached). Both read as not-enabled, but
+    // only the first is something the operator chose and can undo.
+    userDisabled: extra?.user_disabled === true,
+    disabledReason: typeof extra?.disabled_reason === 'string' ? extra.disabled_reason : null,
+  };
+}
+
+/**
+ * Render a normalized spend record's used (and, when known, capped) amount as
+ * text: "$12.34 of $10,000.00". Minor units and the exponent come from the
+ * payload, so a currency that is not two-decimal formats correctly rather than
+ * being silently divided by 100.
+ */
+export function formatMoney(spend) {
+  if (!spend) return 'unknown';
+  const sym = { USD: '$', EUR: '\u20ac', GBP: '\u00a3', JPY: '\u00a5' }[spend.currency] || '';
+  const unit = (minor) => {
+    if (minor == null) return null;
+    const v = minor / (10 ** (spend.exponent ?? 2));
+    const text = v.toLocaleString('en-US', {
+      minimumFractionDigits: spend.exponent ?? 2,
+      maximumFractionDigits: spend.exponent ?? 2,
+    });
+    // Suffix the code when there is no symbol for it, so an unfamiliar currency
+    // is still identifiable rather than rendering as a bare number.
+    return sym ? `${sym}${text}` : `${text}${spend.currency ? ' ' + spend.currency : ''}`;
+  };
+  const used = unit(spend.usedMinor);
+  const limit = unit(spend.limitMinor);
+  if (used == null) return limit == null ? 'unknown' : `cap ${limit}`;
+  return limit == null ? used : `${used} of ${limit}`;
+}
+
 // Normalize one usage bucket from the /api/oauth/usage payload into
 // { utilization: 0-1, resetAt: ms-epoch }. The endpoint reports utilization
 // as a percentage in the 0-100 range, so 1 means 1%, not 100%.
@@ -368,6 +447,10 @@ export function normalizeUsagePayload(data) {
     sevenDaySonnet: normalizeUsageBucket(data?.seven_day_sonnet) || scopedWeekly.sonnet || null,
     sevenDayFable: scopedWeekly.fable || null,
     scopedWeekly,
+    // Whether this account bills real money past its plan limits, and how
+    // much it already has. Carried beside the quota buckets because it comes
+    // from the same zero-spend probe response.
+    spend: normalizeSpend(data),
     // True when the payload carried that enumeration. It is what makes a
     // MISSING family meaningful: upstream listed this account's scoped weekly
     // caps and that family was not among them. Without the list, a missing

@@ -1,4 +1,4 @@
-import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired } from './oauth.js';
+import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired, formatMoney } from './oauth.js';
 import { providerOf, DEFAULT_PROVIDER } from './provider.js';
 import { refreshCodexToken } from './codex-auth.js';
 import { parseCodexQuota, parseCodexPlanType } from './codex-quota.js';
@@ -73,6 +73,10 @@ function emptyQuota() {
     // Upstream owns this list and it changes, so it is learned rather than
     // declared — a family with no dedicated field above is still metered.
     scopedWeekly: {},
+    // Paid-overage state from the usage probe: null until a probe reports it.
+    // Not a quota — it says whether exceeding the quotas above costs money
+    // on this account rather than stopping it.
+    spend: null,
     resetsAt: null,
   };
 }
@@ -1798,6 +1802,21 @@ export class AccountManager {
     // applies, and keeping a remembered copy would gate on a limit that upstream
     // has stopped reporting.
     if (usage.scopedWeekly) q.scopedWeekly = { ...usage.scopedWeekly };
+
+    // Paid overage. Replaced wholesale like the buckets above, and announced
+    // once on the transition into billing: an account that starts drawing real
+    // money is the one usage change an operator cannot infer from the bars.
+    if (usage.spend) {
+      const was = q.spend;
+      q.spend = { ...usage.spend };
+      if (q.spend.enabled && !was?.enabled) {
+        console.log(`[TeamClaude] Account "${account.name}" can bill real money past its plan limits (extra usage is enabled upstream)`);
+      }
+      const spentNow = (q.spend.usedMinor || 0) > 0;
+      if (spentNow && !((was?.usedMinor || 0) > 0)) {
+        console.log(`[TeamClaude] Account "${account.name}" has started spending real money: ${formatMoney(q.spend)}`);
+      }
+    }
 
     // If we just learned this account's weekly window while probing, re-evaluate
     // selection (same path as learning it from a live response).
