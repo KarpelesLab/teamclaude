@@ -47,6 +47,21 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
     lines.push('');
   }
 
+  // Per-client usage (proxy.clientKeys) — only when something was attributed,
+  // so deployments without client keys see no empty section.
+  const clients = Object.entries(status.clients || {});
+  if (clients.length) {
+    lines.push(paint.bold('Clients'));
+    clients.sort(([, a], [, b]) => ((b.inputTokens || 0) + (b.outputTokens || 0)) - ((a.inputTokens || 0) + (a.outputTokens || 0)));
+    for (const [name, c] of clients) {
+      const tokens = `${formatNumber(c.inputTokens)} in / ${formatNumber(c.outputTokens)} out`;
+      const last = parseTs(c.lastUsed);
+      const lastText = last ? `, last ${formatAgo(last, now)}` : '';
+      lines.push(`  ${paint.cyan(safeLine(name).padEnd(20))} ${c.requests || 0} req, ${tokens}${lastText}`);
+    }
+    lines.push('');
+  }
+
   return lines.join('\n').trimEnd();
 }
 

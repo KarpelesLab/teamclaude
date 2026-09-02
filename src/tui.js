@@ -68,10 +68,13 @@ function sessionColorCode(sid) {
   for (let i = 0; i < sid.length; i++) h = (h * 31 + sid.charCodeAt(i)) >>> 0;
   return SESSION_FG[h % SESSION_FG.length];
 }
-// Fixed-width colored short id (blank-padded when there's no session, e.g. a
-// telemetry request), so the activity column stays aligned.
-const sessionTag = sid =>
-  sid ? fg(sessionColorCode(sid), sid.slice(0, SESSION_ID_LEN)) : ' '.repeat(SESSION_ID_LEN);
+// Fixed-width colored session label: the name Claude Code holds on disk for the
+// session (see session-titles.js), else the short id. Blank-padded when there's
+// no session (e.g. a telemetry request). One width for every row, named or not,
+// keeps the columns after it aligned. Measured in display columns, not UTF-16
+// units, so a CJK title takes the same room as an ASCII one.
+const sessionTag = (sid, title = null, width = SESSION_ID_LEN) =>
+  sid ? fg(sessionColorCode(sid), rpad(truncate(title || sid.slice(0, SESSION_ID_LEN), width), width)) : ' '.repeat(width);
 
 // Which quota-family bar (F7/S7) a route binds to, or null for a general route.
 // Auto routes are named 'fable'/'sonnet'; a configured route is classified by its
@@ -270,7 +273,10 @@ export class TUI {
     remote = false, applySwitch = null,
     // Injectable so the import path can be exercised without a real credentials
     // file or a live profile call.
-    readCredentials = importCredentials, readProfile = fetchProfile }) {
+    readCredentials = importCredentials, readProfile = fetchProfile,
+    // Names the activity column against the session id the client sent. Absent
+    // or disabled leaves every row showing the short id.
+    sessionTitles = null }) {
     this.am = accountManager;
     this.remote = remote;
     this.applySwitch = applySwitch;
@@ -285,6 +291,7 @@ export class TUI {
     this._readCredentials = readCredentials;
     this._readProfile = readProfile;
     this._activityStream = null;
+    this.sessionTitles = sessionTitles;
 
     this.log = [];           // completed activity entries
     this.active = new Map(); // in-flight requests
@@ -384,9 +391,20 @@ export class TUI {
     process.stdin.pause();
   }
 
+  // A title lookup costs a directory scan and a file read, so it stays off the
+  // render path: this returns what is cached and schedules the rest.
+  _sessionTag(sid) {
+    const titles = this.sessionTitles;
+    if (!titles?.enabled) return sessionTag(sid);
+    return sessionTag(sid, titles.get(sid), titles.width);
+  }
+
   // ── server hooks ───────────────────────────────────
 
   onRequestStart(id, info) {
+    // Start the lookup now, so the title is cached by the time the request ends
+    // and its log line is composed.
+    this._sessionTag(info.sessionId);
     this.active.set(id, { ...info, t: timestamp(), started: Date.now(), account: null });
     this.render();
     if (this.active.size === 1) this._retick();   // idle → animating
@@ -410,7 +428,7 @@ export class TUI {
     const model = info.model ? ` (${info.model})` : ''; // shown when the request named a model
     const sid = info.sessionId || r?.sessionId || null;
     const pin = (info.pinned || r?.pinned) ? dim(' [pin]') : '';
-    this._addLog(`${sessionTag(sid)} ${info.method} ${info.path}${model} → ${acct}${pin} (${info.status}, ${dur}s)`);
+    this._addLog(`${this._sessionTag(sid)} ${info.method} ${info.path}${model} → ${acct}${pin} (${info.status}, ${dur}s)`);
     if (this.active.size === 0) this._retick();   // animating → idle
   }
 
@@ -516,6 +534,18 @@ export class TUI {
       right: () => this._cycleEventLogging(+1),
       enter: () => this._cycleEventLogging(+1),
     });
+
+    if (this.sessionTitles) {
+      fields.push({
+        id: 'sessionTitles',
+        label: 'Session titles',
+        hint: '←→ toggle',
+        value: () => (this.sessionTitles.enabled ? green('on') : gray('off')),
+        left: () => this._toggleSessionTitles(),
+        right: () => this._toggleSessionTitles(),
+        enter: () => this._toggleSessionTitles(),
+      });
+    }
 
     fields.push({
       id: 'routes',
@@ -921,6 +951,18 @@ export class TUI {
     if (this.running) this.render();
   }
 
+  async _toggleSessionTitles() {
+    // The shared config object is what a save writes and a reload re-applies,
+    // so it is the record; the store is configured from it, never the reverse.
+    const enabled = !this.sessionTitles.enabled;
+    this.config.sessionTitles = { ...this.config.sessionTitles, enabled };
+    this.sessionTitles.configure(this.config.sessionTitles);
+    try { await this.saveConfig(this.config); }
+    catch (e) { this._addLog(`Failed to save: ${e.message}`); }
+    this._addLog(`Session titles: ${enabled ? 'on' : 'off'}`);
+    if (this.running) this.render();
+  }
+
   async _cycleEventLogging(dir = 1) {
     // Claude Code telemetry display/handling: show → hide → block → show.
     const order = ['show', 'hide', 'block'];
@@ -1200,7 +1242,7 @@ export class TUI {
       const m = r.model ? dim(` (${r.model})`) : ''; // filled in as soon as the model is peeked from the stream
       const pin = r.pinned ? dim(' [pin]') : '';
       const a = r.account ? ` → ${r.account}${pin}` : '';
-      lines.push(` ${sp} ${gray(r.t)}  ${sessionTag(r.sessionId)} ${r.method} ${r.path}${m}${a} ${dim(`(${el}s...)`)}`);
+      lines.push(` ${sp} ${gray(r.t)}  ${this._sessionTag(r.sessionId)} ${r.method} ${r.path}${m}${a} ${dim(`(${el}s...)`)}`);
     }
 
     // Completed log
@@ -1357,6 +1399,7 @@ export class TUI {
     // ── Activity log
     lines.push(bold('  Activity log') + dim('  — what to do with Claude Code\'s telemetry'));
     lines.push(row(byId('eventlog')));
+    if (byId('sessionTitles')) lines.push(row(byId('sessionTitles')));
     lines.push('');
     // ── Routing
     lines.push(bold('  Routing') + dim('  — pin model families to specific accounts, or block them outright'));
