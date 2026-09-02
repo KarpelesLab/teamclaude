@@ -7,7 +7,7 @@ import {
   oauthIdentityFields,
 } from './identity.js';
 import { formatPercent } from './status-renderer.js';
-import { parseProxyUrl, proxyToUrl, describeProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy } from './upstream-proxy.js';
+import { parseProxyUrl, proxyToUrl, describeProxy, describeSelfProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy } from './upstream-proxy.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -639,8 +639,11 @@ export class TUI {
       label: 'Upstream proxy',
       hint: 'Enter to set',
       value: () => {
-        const { proxy, source } = getUpstreamProxy();
-        if (!proxy) return dim('(direct)');
+        const resolved = getUpstreamProxy();
+        const { proxy, source } = resolved;
+        // A dropped self-proxy reads as "(direct)" too, and the operator would
+        // have no way to tell that a value they set is not in force.
+        if (!proxy) return source === 'self' ? dim('(direct) ') + gray(describeSelfProxy(resolved)) : dim('(direct)');
         // Name the environment when that is where it came from: a value the
         // operator did not put in the config, silently in force, is exactly the
         // thing that is hard to account for later.
@@ -950,6 +953,7 @@ export class TUI {
 
     const resolved = setUpstreamProxy(resolveUpstreamProxy(this.config));
     if (resolved.proxy) this._addLog(`Upstream proxy set to ${describeProxy(resolved.proxy)}`);
+    else if (resolved.source === 'self') this._addLog(`Connecting directly — ${describeSelfProxy(resolved)}`);
     else this._addLog('Upstream proxy cleared — connecting directly');
     this.mode = 'settings';
   }
