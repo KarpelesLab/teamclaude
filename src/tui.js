@@ -1300,8 +1300,13 @@ export class TUI {
       return routeGlyph(routeColorFn(r?.color), true, pinned);
     };
 
-    // Name (bold if selected)
-    const rawName = a.name.slice(0, 12).padEnd(12);
+    // Name (bold if selected), cut and padded in display columns. A
+    // slice/padEnd pair counts UTF-16 units instead, so a six-character CJK
+    // name keeps all six characters and still collects six columns of padding,
+    // shifting everything after it. truncate stops a column short of the limit
+    // when it drops a wide glyph that would straddle it, so rpad finishes the
+    // cell.
+    const rawName = rpad(truncate(a.name, 12), 12);
     const name = isSel ? bold(rawName) : rawName;
 
     // Type
