@@ -22,8 +22,9 @@ const ENTITLEMENT_DENIAL_COOLDOWN_SECONDS = 5 * 60;
 // (probing, requalify, rateLimitedUntil) is intentionally excluded.
 const PERSISTED_QUOTA_FIELDS = [
   'unified5h', 'unified7d', 'unified7dSonnet', 'unified7dFable',
-  'unified5hReset', 'unified7dReset', 'unified7dSonnetReset', 'unified7dFableReset', 'unifiedStatus',
+  'unified5hReset', 'unified7dReset', 'unified7dSonnetReset', 'unified7dFableReset',
   'unified7dSonnetSeenAt', 'unified7dFableSeenAt',
+  'unifiedStatus', 'unifiedStatusSeenAt',
   'tokensLimit', 'tokensRemaining', 'requestsLimit', 'requestsRemaining', 'resetsAt',
 ];
 
@@ -58,6 +59,7 @@ function emptyQuota() {
     unified7dSonnetSeenAt: null,
     unified7dFableSeenAt: null,
     unifiedStatus: null,        // allowed | allowed_warning | rejected
+    unifiedStatusSeenAt: null,  // ms timestamp of the response that reported it
     resetsAt: null,
   };
 }
@@ -155,7 +157,7 @@ function sampleModelFor(route) {
 }
 
 export class AccountManager {
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, throttleProbeFloorMs, familyStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, sessionTracker } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, sessionTracker } = {}) {
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
@@ -217,6 +219,12 @@ export class AccountManager {
     // rest of the weekly window.
     this.familyStaleMs = familyStaleMs
       ?? (Number(process.env.TEAMCLAUDE_FAMILY_STALE_MS) || 30 * 60_000);
+    // Same discipline for the upstream `unified-status`: it is a snapshot of one
+    // response, not a subscription, so nothing revalidates it while the account
+    // sits idle and acting on an old `rejected` would bar an account whose quota
+    // reset hours ago. Past this it is dropped and the local buckets decide.
+    this.statusStaleMs = statusStaleMs
+      ?? (Number(process.env.TEAMCLAUDE_STATUS_STALE_MS) || 30 * 60_000);
   }
 
   /** Start (or restart) the ramp window for an account that just became current,
@@ -669,10 +677,24 @@ export class AccountManager {
   }
 
   _isAvailable(account, model = null, advisorModel = null) {
-    if (!account) return false;
+    return this.unavailableReason(account, model, advisorModel) === null;
+  }
+
+  /**
+   * Why `account` cannot serve `model` right now, or null when it can. Naming the
+   * reason is what lets status output tell a LOCAL threshold decision apart from
+   * an UPSTREAM rejection — the two used to be indistinguishable, so an operator
+   * seeing `unifiedStatus: allowed` next to a refusing account had no way to know
+   * the refusal was the proxy's own doing (issue #166).
+   *
+   * Returns one of: 'disabled', 'throttled', 'error', 'exhausted',
+   * 'upstream-rejected', 'quota', 'route', 'advisor-quota', 'advisor-route'.
+   */
+  unavailableReason(account, model = null, advisorModel = null) {
+    if (!account) return 'error';
 
     // Manually disabled accounts are skipped entirely until re-enabled.
-    if (account.disabled) return false;
+    if (account.disabled) return 'disabled';
 
     // A structured organization-policy 403 means this account cannot serve OAuth
     // requests right now. Skip it across requests until the short cooldown ends.
@@ -680,35 +702,44 @@ export class AccountManager {
 
     // Check rate limit expiry
     if (account.status === 'throttled' && account.rateLimitedUntil) {
-      if (Date.now() < account.rateLimitedUntil) return false;
+      if (Date.now() < account.rateLimitedUntil) return 'throttled';
       account.status = 'active';
       account.rateLimitedUntil = null;
       account.throttledAt = null;
       console.log(`[TeamClaude] Account "${account.name}" rate limit expired, marking active`);
     }
 
-    if (account.status === 'exhausted' || account.status === 'error') return false;
+    if (account.status === 'exhausted') return 'exhausted';
+    if (account.status === 'error') return 'error';
     // Model-scoped: _isNearQuota checks the shared 5h bucket plus only the weekly
     // bucket that governs this model, so a spent Fable/Sonnet bucket bars just
-    // that family — the account still serves every other model normally.
-    if (this._isNearQuota(account, model)) return false;
+    // that family — the account still serves every other model normally. It also
+    // expires stale windows, so run it before reading unifiedStatus below.
+    if (this._isNearQuota(account, model)) return 'quota';
+
+    // Upstream's own verdict. `rejected` means a shared bucket is spent, so the
+    // next request would 429 whatever the local counters say — believing it
+    // rotates one request earlier instead of spending a rejection to learn the
+    // same thing. Only while fresh (see _clearExpiredQuotas), and only for the
+    // shared buckets it describes: a family bucket has its own signal.
+    if (account.quota.unifiedStatus === 'rejected') return 'upstream-rejected';
 
     // Route/ownership restriction: a configured route can pin a model pattern to
     // an exclusive set of accounts; failing that, a per-account `models` claim
     // restricts an owned model to its owners. Either way an account not eligible
     // for this model is skipped so the request never lands somewhere it can't run.
-    if (model && !this._routeAllows(account, model)) return false;
+    if (model && !this._routeAllows(account, model)) return 'route';
 
     // An advisor request additionally needs the account to serve the ADVISOR's
     // model: its family bucket must have headroom (the shared buckets were
     // already checked above for the executor) and any route/ownership rule for
     // it must allow this account.
     if (advisorModel) {
-      if (this._modelWeeklyExhausted(account, advisorModel)) return false;
-      if (!this._routeAllows(account, advisorModel)) return false;
+      if (this._modelWeeklyExhausted(account, advisorModel)) return 'advisor-quota';
+      if (!this._routeAllows(account, advisorModel)) return 'advisor-route';
     }
 
-    return true;
+    return null;
   }
 
   /**
@@ -984,6 +1015,10 @@ export class AccountManager {
       console.log(`[TeamClaude] Account "${account.name}" session quota reset`);
       q.unified5h = null;
       q.unified5hReset = null;
+      // `rejected` describes the shared buckets and this is one of them: a
+      // 5-hour rejection must not outlive the 5-hour window it was about.
+      q.unifiedStatus = null;
+      q.unifiedStatusSeenAt = null;
       changed = true;
       session = true;
     }
@@ -992,6 +1027,7 @@ export class AccountManager {
       q.unified7d = null;
       q.unified7dReset = null;
       q.unifiedStatus = null;
+      q.unifiedStatusSeenAt = null;
       changed = true;
     }
     if (q.unified7dSonnet != null && q.unified7dSonnetReset && now >= q.unified7dSonnetReset) {
@@ -1036,6 +1072,20 @@ export class AccountManager {
       q[`${key}Reset`] = null;
       q[seenField] = null;
       changed = true;
+    }
+
+    // The upstream `unified-status` is a snapshot of the last response, and
+    // nothing revalidates it while the account is idle — it is cleared with the
+    // weekly bucket above, but that window can be a week out. Acting on a
+    // `rejected` that old would bar an account whose quota reset hours ago, so
+    // the signal expires on its own and the local buckets decide from there.
+    if (q.unifiedStatus != null) {
+      if (!q.unifiedStatusSeenAt) q.unifiedStatusSeenAt = now;
+      else if (now >= q.unifiedStatusSeenAt + this.statusStaleMs) {
+        q.unifiedStatus = null;
+        q.unifiedStatusSeenAt = null;
+        changed = true;
+      }
     }
 
     // Clear expired standard quotas
@@ -1292,7 +1342,10 @@ export class AccountManager {
     }
 
     const uStatus = headers['anthropic-ratelimit-unified-status'];
-    if (uStatus) account.quota.unifiedStatus = uStatus;
+    if (uStatus) {
+      account.quota.unifiedStatus = uStatus;
+      account.quota.unifiedStatusSeenAt = Date.now();
+    }
 
     // Standard rate limits (API key accounts)
     const tokensLimit = parseInt(headers['anthropic-ratelimit-tokens-limit'], 10);
@@ -1693,6 +1746,10 @@ export class AccountManager {
         priority: a.priority || 0,
         disabled: a.disabled || false,
         status: a.status,
+        // Why the account is out of rotation right now (null = it can serve).
+        // Distinguishes a local threshold decision from an upstream rejection —
+        // without it the two are indistinguishable in status output (#166).
+        unavailable: this.unavailableReason(a),
         sessions: sessions.perAccount[a.index] || 0,
         quota: { ...a.quota },
         // `byBucket` is the one nested value under `usage`, so the shallow copy
