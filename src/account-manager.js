@@ -1082,7 +1082,7 @@ export class AccountManager {
     // per account per window and no more. A reading with headroom is left alone:
     // it gates nothing, so it cannot seal anything in.
     for (const { key, label } of FAMILY_WEEKLY_BUCKETS) {
-      if (q[key] == null || q[key] < this.switchThreshold) continue;
+      if (q[key] == null || q[key] < this.thresholdFor(key)) continue;
       const seenField = `${key}SeenAt`;
       // Unknown age (restored from an older state file, or set by a path that
       // predates the stamp): start the clock now rather than clearing at once,
@@ -1505,7 +1505,7 @@ export class AccountManager {
     const now = Date.now();
     for (const { key, label, usageKey } of FAMILY_WEEKLY_BUCKETS) {
       const bucket = usage[usageKey];
-      const wasSpent = q[key] != null && q[key] >= this.switchThreshold;
+      const wasSpent = q[key] != null && q[key] >= this.thresholdFor(key);
       if (bucket && bucket.utilization != null) {
         q[key] = bucket.utilization;
         q[`${key}Reset`] = bucket.resetAt ?? null;
@@ -1518,7 +1518,7 @@ export class AccountManager {
         continue;
       }
       // Worth a line: the account was refusing this family and is not any more.
-      if (wasSpent && !(q[key] != null && q[key] >= this.switchThreshold)) {
+      if (wasSpent && !(q[key] != null && q[key] >= this.thresholdFor(key))) {
         console.log(`[TeamClaude] Account "${account.name}" ${label} weekly quota confirmed available by probe`);
       }
     }
