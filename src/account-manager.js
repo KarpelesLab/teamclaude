@@ -736,9 +736,18 @@ export class AccountManager {
    * the token immediately (the MITM relay) never sends a dead token and eats a
    * 401. A token that is merely expiring soon (still valid) is left to the
    * caller's opportunistic background refresh; only a hard-expired one blocks.
+   *
+   * `decision` is getActiveAccount's, passed straight through. Nothing in-tree
+   * routes through here today, so nothing would notice it missing — which is
+   * exactly why it is threaded now rather than when something does. A caller
+   * that selects here and then calls confirmRouted would hand it no decision at
+   * all, and a rollover on the current account can only ever be settled by the
+   * walk that owns it: this would silently become the one entry point on which
+   * a rollover fires every request and is never resolved. That failure is a
+   * routing decision quietly repeating itself, not an error anything raises.
    */
-  async getActiveAccountFresh(exclude = null, model = null, advisorModel = null, sessionId = null) {
-    const account = this.getActiveAccount(exclude, model, advisorModel, sessionId);
+  async getActiveAccountFresh(exclude = null, model = null, advisorModel = null, sessionId = null, decision = null) {
+    const account = this.getActiveAccount(exclude, model, advisorModel, sessionId, decision);
     if (account && account.type === 'oauth' && account.refreshToken
         && isTokenExpired(account.expiresAt)) {
       await this.ensureTokenFresh(account.index); // coalesces with any in-flight refresh

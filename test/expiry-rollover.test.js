@@ -238,6 +238,26 @@ test('a request that never consulted currentIndex may not settle its rollover', 
   assert.equal(serve(am, null, OPUS).name, 'b');
 });
 
+test('getActiveAccountFresh carries the decision, so a rollover can settle through it', async () => {
+  // Nothing in-tree selects here yet. A caller that did, and then confirmed
+  // without a decision, would be the one entry point where the current
+  // account's rollover fires on every request and never resolves — a routing
+  // decision quietly repeating itself, which nothing raises.
+  const am = mgr(['a', 'b'], ON);
+  bucket(am, 0, 'unified7d', 0.4, 10);
+  bucket(am, 1, 'unified7d', 0.4, 10);
+  assert.equal((await am.getActiveAccountFresh(null, OPUS)).name, 'a');
+  rollWindow(am, 0);
+  const decision = {};
+  const moved = await am.getActiveAccountFresh(null, OPUS, null, null, decision);
+  assert.equal(moved.name, 'b');
+  assert.equal(decision.viaCurrent, true);
+  am.confirmRouted(null, moved.index, OPUS, decision);
+  // Settled: the event was consumed by the walk that acted on it, so the next
+  // request stays put rather than preempting the same rollover again.
+  assert.equal((await am.getActiveAccountFresh(null, OPUS)).name, 'b');
+});
+
 test('a manual switch takes a baseline with it, so its next roll is still seen', () => {
   // Parked on an account established without one, the fleet reads that
   // account's next weekly roll as a first sight and never preempts off it.
