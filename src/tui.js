@@ -115,6 +115,22 @@ function truncate(s, w) {
   return out + RESET;
 }
 
+// Quota bar width bounds: narrow enough that a `2d14h` label still fits, wide
+// enough that a very wide terminal doesn't turn the row into one long bar.
+const BAR_MIN = 5;
+const BAR_MAX = 20;
+
+// Families this account can't serve right now: a family whose own weekly bucket
+// is over the switch threshold is barred from that model while the account is
+// otherwise active. Shared by the row renderer (which draws the `⊘` tag) and the
+// column layout (which reserves the width that tag needs).
+export function blockedFamilies(quota, threshold) {
+  const out = [];
+  if (quota.unified7dSonnet != null && quota.unified7dSonnet >= threshold) out.push('Sonnet');
+  if (quota.unified7dFable != null && quota.unified7dFable >= threshold) out.push('Fable');
+  return out;
+}
+
 /** Fit a line to exactly w columns: truncate if too long, pad if too short. */
 function fitLine(s, w) {
   const v = vw(s);
@@ -1064,25 +1080,47 @@ export class TUI {
     } else {
       lines.push('');
       const showBoth = W >= 70;
-      const bw = showBoth
-        ? Math.max(5, Math.min(20, Math.floor((W - 56) / 2)))
-        : Math.max(5, Math.min(20, W - 45));
 
       // Routes drive the inline markers; general (non-family) routes get a stable
       // column each at the row start so the marker's position identifies the route.
       const routes = this.am.getRoutes();
       const genRoutes = routes.filter(r => routeFamily(r) === null);
+      const anyFable = this.am.accounts.some(a => a.quota.unified7dFable != null);
+      const anySonnet = this.am.accounts.some(a => a.quota.unified7dSonnet != null);
+
+      // Bar width. The budget must count every column the widest row actually
+      // draws, or the row overruns the terminal and fitLine cuts the tail off —
+      // which is how the S7/F7 bars lost the reset countdown they carry. Three
+      // parts beyond the bars themselves:
+      //   - the fixed prefix (marker, name, type, status, first bar label),
+      //   - the route-marker cells, one per general route,
+      //   - 6 columns of label for each bar past the first (`  Wk `, ` ►F7  `).
+      // The `⊘ Sonnet Fable` tag is reserved for only when some account is
+      // actually blocked; the common case where nothing is spends those columns
+      // on the bars instead of leaving the row short of the edge.
+      const tagW = this.am.accounts.reduce((w, a) => {
+        const names = blockedFamilies(a.quota, this.am.switchThreshold);
+        return names.length ? Math.max(w, 4 + vw(names.join(' '))) : w;
+      }, 0);
+      const fixed = 40 + (genRoutes.length ? genRoutes.length + 1 : 0) + tagW;
+      const roomFor = n => fixed + 6 * (n - 1) + n * BAR_MIN <= W;
+      // The family bars are the first thing to go: below the width where they
+      // fit even at BAR_MIN they would push the row past the edge, and a row cut
+      // mid-bar reads worse than one that simply doesn't draw them (the `⊘` tag
+      // still says which family is barred).
+      const showFamily = showBoth && (anyFable || anySonnet) && roomFor(2 + (anyFable ? 1 : 0) + (anySonnet ? 1 : 0));
+      const nbars = (showBoth ? 2 : 1) + (showFamily ? (anyFable ? 1 : 0) + (anySonnet ? 1 : 0) : 0);
+      const bw = Math.max(BAR_MIN, Math.min(BAR_MAX, Math.floor((W - fixed - 6 * (nbars - 1)) / nbars)));
+
       // The single account each secondary bucket currently routes to (null = none
       // can serve it right now). Marked next to that account's F7/S7 bar — the
       // secondary-quota analogue of ► marking the default route's current account.
-      const anyFable = this.am.accounts.some(a => a.quota.unified7dFable != null);
-      const anySonnet = this.am.accounts.some(a => a.quota.unified7dSonnet != null);
       const familyTarget = {
         fable: anyFable ? this.am.previewRouteIndex('claude-fable-5') : null,
         sonnet: anySonnet ? this.am.previewRouteIndex('claude-sonnet-4-6') : null,
       };
       for (let i = 0; i < this.am.accounts.length; i++) {
-        lines.push(this._renderAcct(i, bw, showBoth, routes, genRoutes, familyTarget));
+        lines.push(this._renderAcct(i, bw, showBoth, routes, genRoutes, familyTarget, showFamily));
       }
     }
 
@@ -1135,7 +1173,7 @@ export class TUI {
     this._paint(buf, force);
   }
 
-  _renderAcct(idx, bw, showBoth, routes = this.am.getRoutes(), genRoutes = routes.filter(r => routeFamily(r) === null), familyTarget = {}) {
+  _renderAcct(idx, bw, showBoth, routes = this.am.getRoutes(), genRoutes = routes.filter(r => routeFamily(r) === null), familyTarget = {}, showFamily = true) {
     const a = this.am.accounts[idx];
     const isCur = idx === this.am.currentIndex;
     const isSel = this.mode === 'select' && idx === this.selIdx;
@@ -1213,11 +1251,11 @@ export class TUI {
       line += `  ${l2} ${bar(r2, bw, t2)}`;
       // Sonnet weekly bar — only shown when the usage probe has populated it. A
       // leading ► (in place of a padding space) marks a Sonnet route on this account.
-      if (q.unified7dSonnet != null) {
+      if (showFamily && q.unified7dSonnet != null) {
         line += ` ${familyMark('sonnet')}S7  ${bar(q.unified7dSonnet, bw, q.unified7dSonnetReset)}`;
       }
       // Fable weekly bar — only shown when the usage probe has populated it.
-      if (q.unified7dFable != null) {
+      if (showFamily && q.unified7dFable != null) {
         line += ` ${familyMark('fable')}F7  ${bar(q.unified7dFable, bw, q.unified7dFableReset)}`;
       }
     }
@@ -1225,10 +1263,7 @@ export class TUI {
     // weekly bucket is over the switch threshold can't serve that model even
     // while the account is otherwise active. A spent shared 5h blocks everything
     // and is already conveyed by the Ses bar + status, so it's not repeated here.
-    const th = this.am.switchThreshold;
-    const blocked = [];
-    if (q.unified7dSonnet != null && q.unified7dSonnet >= th) blocked.push('Sonnet');
-    if (q.unified7dFable != null && q.unified7dFable >= th) blocked.push('Fable');
+    const blocked = blockedFamilies(q, this.am.switchThreshold);
     if (blocked.length) line += `  ${red('⊘ ' + blocked.join(' '))}`;
     return line;
   }
