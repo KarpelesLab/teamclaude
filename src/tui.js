@@ -838,7 +838,7 @@ export class TUI {
     // whose result the next poll reflects, not a local assignment.
     if (this.applySwitch) { this.mode = 'normal'; this._doSwitchRemote(acct); return; }
     if (this.selRoute === null) {
-      this.am.currentIndex = this.selIdx;
+      this.am.setCurrentAccount(this.selIdx);
       this._addLog(`Switched to "${acct.name}"`);
       this.mode = 'normal';
       return;

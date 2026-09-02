@@ -11,6 +11,11 @@
   "switchThreshold": 0.98,
   "quotaProbeSeconds": 0,
   "autoUpdate": true,
+  "expiryRouting": {
+    "enabled": false,
+    "tolerance": 1.5,
+    "preempt": true
+  },
   "accounts": [
     {
       "name": "primary-max",
