@@ -128,6 +128,13 @@ export class AccountManager {
     // bias selection for a route's models and reset on restart. A pinned account
     // that becomes ineligible is skipped — routing falls back to best-available.
     this.routePins = new Map();
+    // Selection cursor per route (routeName → account index; '' when no route
+    // matches). A single global cursor reads traffic that alternates between
+    // routes as a rotation: the cursor sits on the other route's account, that
+    // account fails this model's route check, and selection "switches" away from
+    // it. Each such switch arms the ramp below, so steady interleaved traffic
+    // holds both accounts at the ramp floor while nothing has failed over.
+    this.routeCursors = new Map();
     this.switchThreshold = switchThreshold;
     this.setRoutes(routes);
     // Storm control: when rotation switches to a fresh account, a burst of
@@ -242,6 +249,16 @@ export class AccountManager {
    * request keeps flowing (upstream then fails just the advisor call).
    */
   getActiveAccount(exclude = null, model = null, advisorModel = null, sessionId = null) {
+    const account = this._pickActiveAccount(exclude, model, advisorModel, sessionId);
+    // Record where this route now sits, whatever path chose it — the steady-state
+    // path returns the account the cursor already names and never reaches the
+    // rotation code, so recording there alone would leave the cursor unset and
+    // the next real failover unpaced.
+    if (account) this.routeCursors.set(this._cursorKey(model), account.index);
+    return account;
+  }
+
+  _pickActiveAccount(exclude, model, advisorModel, sessionId) {
     // Clear expired quotas across all accounts and switch proactively if a
     // session reset made a sooner-expiring account the better choice. This runs
     // on every request so the behaviour holds without the TUI render loop.
@@ -625,6 +642,13 @@ export class AccountManager {
     return { eligible: true };
   }
 
+  /** Session-distribution toggle (issue #109), applied live on config reload.
+   *  Existing session pins survive a toggle: the flag gates only how NEW
+   *  sessions are routed. */
+  setDistributeSessions(enabled) {
+    this.distributeSessions = !!enabled;
+  }
+
   /**
    * Normalize and store the configurable routing table. A route pins a set of
    * model globs to an exclusive set of accounts (and may override the governing
@@ -646,6 +670,29 @@ export class AccountManager {
         if (name !== 'fable' && name !== 'sonnet' && !names.has(name)) this.routePins.delete(name);
       }
     }
+    // A reload can rename or drop a route, stranding its cursor under a key
+    // nothing resolves to. Clearing them costs one extra best-available walk per
+    // route and keeps no state that outlives the table it belonged to.
+    this.routeCursors?.clear();
+  }
+
+  /** Cursor key for a model: its route's name, or '' when no route matches. */
+  _cursorKey(model) {
+    return this._routeForModel(model)?.name || '';
+  }
+
+  /** The account this route was serving from before the current selection, or
+   * null when it has none — used to tell a rotation from ordinary routing.
+   *
+   * Before a route has its own cursor, the global one stands in, but only when
+   * it names an account the route could have used: a cursor left on another
+   * route's account was never this route's position, so moving off it is not a
+   * rotation. */
+  _previousCursor(model) {
+    const recorded = this.routeCursors.get(this._cursorKey(model));
+    if (recorded != null) return recorded;
+    const current = this.accounts[this.currentIndex];
+    return current && this._routeAllows(current, model) ? current.index : null;
   }
 
   /** The first configured route whose globs match `model`, or null. */
@@ -1005,7 +1052,8 @@ export class AccountManager {
   _selectNext(exclude = null, model = null, advisorModel = null) {
     const best = this._pickBestAvailable(exclude, model, advisorModel);
     if (best) {
-      const switched = best.index !== this.currentIndex;
+      const previous = this._previousCursor(model);
+      const switched = previous != null && previous !== best.index;
       this.currentIndex = best.index;
       // If we switched to an account whose weekly quota is still unknown, flag
       // it so we re-evaluate once that quota is learned (see updateQuota).
@@ -1145,6 +1193,10 @@ export class AccountManager {
     if (!disabled && account.status === 'error') {
       account.status = 'active';
       account.rateLimitedUntil = null;
+      // Operator escape hatch: re-enabling is an explicit "try this again", so
+      // drop the dead-token guard too — otherwise the account would come back
+      // active but never attempt a refresh (see ensureTokenFresh).
+      account._deadRefreshToken = null;
       console.log(`[TeamClaude] Account "${account.name}" re-enabled — clearing error state`);
     }
   }
@@ -1222,6 +1274,17 @@ export class AccountManager {
     const account = this.accounts[accountIndex];
     if (!account || account.type !== 'oauth' || !account.refreshToken) return;
 
+    // Dead-token guard: a refresh token upstream already rejected (invalid_grant)
+    // will be rejected every time, so retrying it only floods the OAuth endpoint
+    // — observed live: 287 identical invalid_grant calls after two accounts' tokens
+    // were invalidated (a `/login` elsewhere rotates the token and kills the copy
+    // teamclaude holds). Paths that bypass availability checks keep calling this
+    // (warmup/probe pin an account by name via /tc-acct, skipping _isAvailable),
+    // so marking the account 'error' alone does not stop the retries. Keyed on the
+    // token VALUE, not the status: the moment a DIFFERENT refresh token arrives
+    // (re-login, config reload, updateAccountTokens) the guard lifts on its own.
+    if (account._deadRefreshToken && account._deadRefreshToken === account.refreshToken) return;
+
     if (!force && !isTokenExpiringSoon(account.expiresAt)) return;
 
     // A forced refresh answers a 401, but 401s arrive in bursts: every request
@@ -1250,6 +1313,7 @@ export class AccountManager {
         account.refreshToken = newTokens.refreshToken;
         account.expiresAt = newTokens.expiresAt;
         account._lastRefreshAt = Date.now();
+        account._deadRefreshToken = null; // this token works; clear any stale guard
         console.log(`[TeamClaude] Token refreshed for account "${account.name}"`);
         this._onTokenRefresh?.(accountIndex, newTokens);
       } catch (err) {
@@ -1263,6 +1327,10 @@ export class AccountManager {
         const isAuthRejection = err.status === 400 || err.status === 401 || err.status === 403;
         if (isAuthRejection) {
           account.status = 'error';
+          // Remember WHICH token was rejected so we stop re-sending it (see the
+          // dead-token guard above). A transient failure deliberately does not
+          // arm this — that token may still be good.
+          account._deadRefreshToken = account.refreshToken;
           console.error(`[TeamClaude] Account "${account.name}" needs re-login (refresh token rejected) — run: teamclaude login`);
         }
       } finally {
@@ -1325,6 +1393,12 @@ export class AccountManager {
     for (const [name, idx] of [...this.routePins.entries()]) {
       if (idx === index) this.routePins.delete(name);
       else if (idx > index) this.routePins.set(name, idx - 1);
+    }
+    // Same for the selection cursors: a cursor on the removed account is dropped
+    // so the route re-picks, and one above it follows the shift.
+    for (const [name, idx] of [...this.routeCursors.entries()]) {
+      if (idx === index) this.routeCursors.delete(name);
+      else if (idx > index) this.routeCursors.set(name, idx - 1);
     }
   }
 
