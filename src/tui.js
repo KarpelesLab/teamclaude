@@ -158,10 +158,17 @@ export function truncate(s, w) {
   return out + RESET;
 }
 
-/** Fit a line to exactly w columns: truncate if too long, pad if too short. */
-function fitLine(s, w) {
+/** Fit a line to exactly w columns: truncate if too long, pad if too short.
+ *  Truncation drops a wide glyph that would straddle the limit, so the result
+ *  can come up one column short; pad that too — the frame is repainted in
+ *  place, and a line narrower than the terminal leaves the previous frame's
+ *  last cell visible. */
+export function fitLine(s, w) {
   const v = vw(s);
-  if (v > w) return truncate(s, w);
+  if (v > w) {
+    const t = truncate(s, w);
+    return t + ' '.repeat(Math.max(0, w - vw(t)));
+  }
   if (v < w) return s + ' '.repeat(w - v);
   return s;
 }

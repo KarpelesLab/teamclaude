@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { displayWidth, truncate } from '../src/tui.js';
+import { displayWidth, truncate, fitLine } from '../src/tui.js';
 
 const strip = s => s.replace(/\x1b\[[0-9;]*m/g, '');
 
@@ -42,4 +42,17 @@ test('truncate stops before a wide glyph that would overflow', () => {
 
 test('truncate keeps a wide glyph that fits exactly', () => {
   assert.equal(strip(truncate('中文', 4)), '中文');
+});
+
+test('fitLine pads the column a dropped wide glyph leaves empty', () => {
+  // Budget 3: '中' (2 cols) fits, the next '文' would overflow and is dropped,
+  // so the line must be padded back to exactly 3 columns.
+  const out = fitLine('中文中', 3);
+  assert.equal(displayWidth(out), 3);
+  assert.equal(strip(out), '中 ');
+});
+
+test('fitLine leaves an exact-width line alone and pads a short one', () => {
+  assert.equal(strip(fitLine('ab', 2)), 'ab');
+  assert.equal(strip(fitLine('中', 4)), '中  ');
 });
