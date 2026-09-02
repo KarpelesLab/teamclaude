@@ -212,11 +212,11 @@ export class AccountManager {
     // the pin it belongs to; the global current account, which no session owns,
     // keeps its own here.
     this._currentSeen = new WindowWatcher();
-    // Throttle for the stuck-rollover line, keyed by the event it describes —
-    // (account index, bucket) — so two genuinely different stuck events are both
-    // reported while one busy session cannot repeat either. Keyed by session id
-    // it would be unbounded: that id is a client-supplied header.
-    this._rolloverStuckLogAt = new Map();
+    // Throttle for the held-rollover line, keyed by the event it describes —
+    // (account index, bucket, reason) — so two genuinely different held events
+    // are both reported while one busy session cannot repeat either. Keyed by
+    // session id it would be unbounded: that id is a client-supplied header.
+    this._rolloverHeldLogAt = new Map();
     // Storm control: when rotation switches to a fresh account, a burst of
     // in-flight requests (e.g. dozens of agents failing over together) would all
     // hit it at once and instantly throttle it — cascading down the fleet
@@ -560,10 +560,13 @@ export class AccountManager {
         && this._currentRolledOver(current, model);
       if (allowProbe && rolled) {
         const next = this._selectNext(exclude, model, advisorModel);
-        // _selectNext re-ranks; it may well hand back the account we are trying
-        // to move off, and "nothing else was eligible" is the stuck case, not a
-        // preemption. Nothing else in the log distinguishes the two.
-        if (!next || next.index === current.index) this._noteStuckRollover(current, model);
+        // _selectNext re-ranks, and both ways of not moving end up here: it
+        // found nothing eligible, or it handed back the very account we are
+        // trying to move off because that account still ranks best. Neither is
+        // a preemption, and only one of them is the feature stuck — the note
+        // tells them apart. Nothing else in the log distinguishes either from a
+        // window that never rolled at all.
+        if (!next || next.index === current.index) this._noteHeldRollover(current, model, advisorModel, exclude);
         if (next) return next;
       }
       const betterExists = this._preemptedBy(current, model, advisorModel, exclude);
@@ -630,7 +633,9 @@ export class AccountManager {
           console.log(`[TeamClaude] Session pin on "${pinned.name}" released — its weekly window rolled over; re-routing to "${next.name}"`);
           return next;
         }
-        this._noteStuckRollover(pinned, model);
+        // Same two cases as the current-account walk: nothing eligible at all,
+        // or the re-rank came back to the account the pin already names.
+        this._noteHeldRollover(pinned, model, advisorModel, exclude);
         return pinned;
       }
       // Mirror _select's priority preemption so an operator's priority order
@@ -1328,21 +1333,60 @@ export class AccountManager {
   }
 
   /**
-   * A rollover fired and moved nothing: every eligible destination was ruled
-   * out, so the request stays on the account that just gained a full week.
-   * Without this the log reads identically whether nothing rolled over or a
-   * rollover is stuck, which is the one failure this feature can have that looks
-   * exactly like it working. Throttled like the advisor-degrade line so a busy
-   * session cannot flood the log, but per event rather than globally: two
-   * accounts stuck at once are two things an operator has to know.
+   * A rollover fired and the request stayed where it was. Without a line here
+   * the log reads identically whether nothing rolled over or a rollover cannot
+   * resolve, which is the one failure this feature can have that looks exactly
+   * like it working.
+   *
+   * Two different things end here and an operator must be able to tell them
+   * apart, so the reason is decided from whether this request had anywhere else
+   * to go at all rather than from which of the re-rank's two ways of saying
+   * "stay" it used. Those are different questions, and the difference is not
+   * academic. A one-account fleet takes the same branch a crowded one does —
+   * the re-rank hands back the only account there is — and it is genuinely
+   * stuck, so reading "the same account came back" as "the ordering chose to
+   * stay" would report the one fleet that can never resolve a rollover as
+   * working correctly. Eligibility is also the wider test: an account can be
+   * barred with no threshold behind it at all, as upstream's own `rejected`
+   * verdict bars one, and a fleet held up by that is as stuck as a fleet held
+   * up by spent quota.
+   *
+   * `none-eligible` is the feature stuck: no other account could serve this
+   * request, so the sooner-expiring quota elsewhere goes on expiring and only a
+   * change in eligibility will free it. `ranks-best` is the ordering running
+   * against real alternatives and answering that this account is still the
+   * right one — the feature working, which must not be reported as a fault.
+   * Reporting both as "no eligible account can take that traffic" sends an
+   * operator looking for a fleet-wide eligibility problem that does not exist.
+   *
+   * Deciding it here rather than at each call site is what keeps the two sticky
+   * paths from drifting apart on a question neither of them asks differently.
+   *
+   * Throttled like the advisor-degrade line so a busy session cannot flood the
+   * log, but per event rather than globally: two accounts held this way at once
+   * are two things an operator has to know. The reason is part of the key, so an
+   * event that changes from one to the other says so at once rather than waiting
+   * out a throttle armed by an answer it has stopped giving.
    */
-  _noteStuckRollover(account, model) {
+  _noteHeldRollover(account, model, advisorModel = null, exclude = null) {
     const bucket = this._weeklyBucketFor(model);
-    const key = `${account.index}:${bucket}`;
+    const elsewhere = this.accounts.some(a => a.index !== account.index
+      && !exclude?.has(a.index) && this._isAvailable(a, model, advisorModel));
+    const reason = elsewhere ? 'ranks-best' : 'none-eligible';
+    const key = `${account.index}:${bucket}:${reason}`;
     const now = Date.now();
-    if (now < (this._rolloverStuckLogAt.get(key) || 0)) return;
-    this._rolloverStuckLogAt.set(key, now + 60_000);
-    console.log(`[TeamClaude] Account "${account.name}" rolled over its ${bucket} window but no eligible account can take that traffic — still routing there`);
+    if (now < (this._rolloverHeldLogAt.get(key) || 0)) return;
+    this._rolloverHeldLogAt.set(key, now + 60_000);
+    console.log(`[TeamClaude] Account "${account.name}" rolled over its ${bucket} window ${this._heldRolloverReason(reason)}`);
+  }
+
+  /** The half of the held-rollover line that says which of the two cases it is. */
+  _heldRolloverReason(reason) {
+    switch (reason) {
+      case 'none-eligible': return 'but no eligible account can take that traffic — still routing there';
+      case 'ranks-best': return 'and still ranks best for it — staying there';
+      default: return assertNever(reason, '_noteHeldRollover');
+    }
   }
 
   /**
@@ -2353,11 +2397,10 @@ export class AccountManager {
     const remap = idx => (idx === index ? null : idx > index ? idx - 1 : idx);
     this.sessionTracker.remapAccounts(remap);
     this._currentSeen.remap(remap);
-    // A stuck-rollover throttle names an account by index in its key, so the
-    // shift would point a live entry at a different account. There is nothing to
-    // renumber that is worth renumbering: the entries expire in a minute and
-    // dropping them can only make the next stuck event report sooner.
-    this._rolloverStuckLogAt.clear();
+    // A throttle key names an account by index, so the shift would point a live
+    // entry at a different account. Not worth renumbering: the entries expire in
+    // a minute and dropping them can only make the next held event report sooner.
+    this._rolloverHeldLogAt.clear();
   }
 
   /**

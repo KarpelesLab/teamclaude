@@ -267,6 +267,55 @@ test('a rollover with nowhere to go says so instead of looking like success', ()
     `expected a stuck-rollover line, got: ${JSON.stringify(lines)}`);
 });
 
+test('an alternative blocked for a NON-quota reason still reads as stuck', () => {
+  // The question is whether anything else could take the traffic, not whether
+  // anything else is under a threshold. Upstream's own `rejected` verdict bars
+  // an account with no threshold behind it, and a fleet held up by that is as
+  // stuck as one held up by spent quota.
+  const am = mgr(['a', 'b'], ON);
+  bucket(am, 0, 'unified7d', 0.4, 10);
+  bucket(am, 1, 'unified7d', 0.4, 10);
+  serve(am, null, OPUS);
+  am.accounts[1].quota.unifiedStatus = 'rejected';
+  am.accounts[1].quota.unifiedStatusSeenAt = Date.now();
+  rollWindow(am, 0);
+  const lines = [];
+  const real = console.log;
+  console.log = msg => lines.push(String(msg));
+  try {
+    assert.equal(serve(am, null, OPUS).name, 'a');
+  } finally {
+    console.log = real;
+  }
+  const held = lines.filter(l => /rolled over its unified7d window/.test(l));
+  assert.equal(held.length, 1, `expected one held-rollover line, got: ${JSON.stringify(lines)}`);
+  assert.match(held[0], /no eligible account/);
+});
+
+test('a rollover the re-rank answers by staying does not report a stuck fleet', () => {
+  // Two eligible accounts, and the one that rolled is still the better pick on
+  // every term — so the re-rank hands it straight back. That is the ordering
+  // agreeing with the sticky choice, not the fleet having nowhere to put the
+  // traffic, and an operator must not be sent looking for the second.
+  const am = mgr(['a', 'b'], ON);
+  bucket(am, 0, 'unified7d', 0.1, 10);
+  bucket(am, 1, 'unified7d', 0.9, 200);
+  assert.equal(serve(am, null, OPUS).name, 'a');
+  rollWindow(am, 0);
+  const lines = [];
+  const real = console.log;
+  console.log = msg => lines.push(String(msg));
+  try {
+    assert.equal(serve(am, null, OPUS).name, 'a');
+  } finally {
+    console.log = real;
+  }
+  const held = lines.filter(l => /rolled over its unified7d window/.test(l));
+  assert.equal(held.length, 1, `expected one held-rollover line, got: ${JSON.stringify(lines)}`);
+  assert.match(held[0], /and still ranks best for it — staying there/);
+  assert.doesNotMatch(held[0], /no eligible account/);
+});
+
 // ---------------------------------------------------------------------------
 // Bookkeeping lifetime
 // ---------------------------------------------------------------------------
