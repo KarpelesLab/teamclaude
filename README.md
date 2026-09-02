@@ -74,7 +74,7 @@ Step-by-step lifecycle: [docs/routing.md](docs/routing.md#request-lifecycle).
 | [Accounts](docs/accounts.md) | OAuth login, import, API keys, multiple orgs, third-party backends |
 | [Usage](docs/usage.md) | Server and TUI, running Claude Code, shell alias, command reference, logging |
 | [Routing](docs/routing.md) | Rotation, the two kinds of 429, storm control, model routes, session spreading, pinning, prompt cache |
-| [Quota](docs/quota.md) | Quota probe, keep-warm, holding on exhaustion |
+| [Quota](docs/quota.md) | Quota probe (on by default), keep-warm, holding on exhaustion |
 | [Configuration](docs/configuration.md) | Config format, every field, environment variables, network tuning |
 | [Proxy modes](docs/proxy-modes.md) | MITM forward proxy, sx.org residential egress |
 | [Compliance](docs/compliance.md) | Terms of service notes |

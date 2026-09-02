@@ -48,6 +48,20 @@ export async function saveState(state) {
   await chmod(path, 0o600).catch(() => {});
 }
 
+// Default background quota-probe interval, in seconds. The probe reads the
+// zero-spend /api/oauth/usage endpoint, so unlike keep-warm it costs no message
+// quota — and it is the only path that can refresh a family (Fable/Sonnet)
+// weekly bucket without sending a request of that family, or read a bucket that
+// has no response header at all (Sonnet). An explicit 0 in the config still
+// turns it off; only an ABSENT setting takes this default.
+export const DEFAULT_QUOTA_PROBE_SECONDS = 300;
+
+/** The probe interval a config asks for: an explicit value (0 = off) wins, an
+ * absent one takes the default. */
+export function quotaProbeSeconds(config) {
+  return config?.quotaProbeSeconds ?? DEFAULT_QUOTA_PROBE_SECONDS;
+}
+
 export function createDefaultConfig() {
   return {
     proxy: {
@@ -56,6 +70,7 @@ export function createDefaultConfig() {
     },
     upstream: 'https://api.anthropic.com',
     switchThreshold: 0.98,
+    quotaProbeSeconds: DEFAULT_QUOTA_PROBE_SECONDS,
     holdSeconds: 0,
     distributeSessions: false,
     eventLogging: 'hide',

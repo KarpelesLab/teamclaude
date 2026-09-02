@@ -8,6 +8,7 @@ import {
 } from './identity.js';
 import { formatPercent } from './status-renderer.js';
 import { parseProxyUrl, proxyToUrl, describeProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy } from './upstream-proxy.js';
+import { quotaProbeSeconds } from './config.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -494,7 +495,7 @@ export class TUI {
       label: 'Quota probe',
       hint: '←→ ±30s',
       value: () => {
-        const probe = this.config.quotaProbeSeconds || 0;
+        const probe = quotaProbeSeconds(this.config);
         return probe > 0 ? green(`${probe}s`) : gray('off (passive)');
       },
       left: () => this._nudgeProbe(-30),
@@ -649,7 +650,7 @@ export class TUI {
   }
 
   _nudgeProbe(deltaSec) {
-    const cur = this.config.quotaProbeSeconds || 0;
+    const cur = quotaProbeSeconds(this.config);
     const next = Math.max(0, cur + deltaSec);
     if (next !== cur) this._doSetProbe(String(next));
   }

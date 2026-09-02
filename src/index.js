@@ -4,7 +4,7 @@ import { spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { createWriteStream } from 'node:fs';
 import net from 'node:net';
-import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, loadState, saveState } from './config.js';
+import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, loadState, saveState, quotaProbeSeconds } from './config.js';
 import { installCrashHandlers } from './crash-log.js';
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
@@ -263,7 +263,7 @@ async function serverCommand() {
   const headless = args.includes('--headless') || args.includes('--no-tui');
   const useTUI = !headless && process.stdout.isTTY && process.stdin.isTTY;
 
-  // Opt-in background quota probe (config.quotaProbeSeconds, default 0 = off).
+  // Background quota probe (config.quotaProbeSeconds; on by default, 0 = off).
   let prober = null;
   // Opt-in keep-warm scheduler (config.warmupSeconds, default 0 = off).
   let warmer = null;
@@ -303,9 +303,9 @@ async function serverCommand() {
       else { sx.disable(); await sx.setMode(diskSxMode); }
     }
     if (prober) {
-      const ms = (diskConfig.quotaProbeSeconds || 0) * 1000;
+      const ms = quotaProbeSeconds(diskConfig) * 1000;
       if (ms !== prober.intervalMs) {
-        config.quotaProbeSeconds = diskConfig.quotaProbeSeconds || 0;
+        config.quotaProbeSeconds = quotaProbeSeconds(diskConfig);
         prober.reschedule(ms);
       }
     }
@@ -424,7 +424,7 @@ async function serverCommand() {
     },
     probe: prober?.getStatus() || {
       enabled: false,
-      intervalSeconds: config.quotaProbeSeconds || 0,
+      intervalSeconds: quotaProbeSeconds(config),
       running: false,
       accounts: accountManager.accounts.map(account => ({
         name: account.name,
@@ -503,8 +503,8 @@ async function serverCommand() {
   quotaSaveInterval = setInterval(persistQuotaState, 60_000);
   quotaSaveInterval.unref?.();
 
-  // Start the opt-in quota probe (no-op when quotaProbeSeconds is 0).
-  prober = new Prober(accountManager, { intervalMs: (config.quotaProbeSeconds || 0) * 1000 });
+  // Start the quota probe (no-op when quotaProbeSeconds is an explicit 0).
+  prober = new Prober(accountManager, { intervalMs: quotaProbeSeconds(config) * 1000 });
   prober.start();
 
   // Start the opt-in keep-warm scheduler (no-op when warmupSeconds is 0). It
@@ -1220,7 +1220,7 @@ async function probeCommand() {
   const arg = args[1];
 
   if (arg === undefined) {
-    const cur = config.quotaProbeSeconds || 0;
+    const cur = quotaProbeSeconds(config);
     console.log(cur > 0 ? `Quota probe: every ${cur}s` : 'Quota probe: off (passive only)');
     console.log('Set with: teamclaude probe <off|seconds>   e.g. teamclaude probe 300');
     return;

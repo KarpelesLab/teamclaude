@@ -10,17 +10,17 @@ Observed quota is persisted to `teamclaude.state.json` next to the config, so ro
 
 ## Quota probe
 
-If you'd rather keep idle accounts' quota fresh, enable the background probe:
+The background probe keeps idle accounts' quota fresh. It is **on by default**, every 300s:
 
 ```bash
-teamclaude probe 300    # refresh every 300s
-teamclaude probe off    # back to passive (default)
+teamclaude probe 300    # refresh every 300s (the default)
+teamclaude probe off    # passive only
 teamclaude probe        # show current setting
 ```
 
 The **Quota probe** row on the TUI settings screen (`g`) does the same thing, and `p` on the main screen is a one-shot refresh of every account.
 
-It reads each OAuth account's utilization from Anthropic's usage endpoint (`/api/oauth/usage`), which reports quota **without consuming any message quota**. API-key and third-party accounts are skipped. Minimum interval is 30s. Changing it takes effect on a running server immediately.
+It reads each OAuth account's utilization from Anthropic's usage endpoint (`/api/oauth/usage`), which reports quota **without consuming any message quota** — which is why it is on by default while [keep-warm](#keep-warm), which does spend a little, is not. API-key and third-party accounts are skipped. Minimum interval is 30s. Changing it takes effect on a running server immediately.
 
 The probe is also the only source for the **Sonnet 7-day** bucket, when your plan exposes it. The Fable weekly bucket arrives passively in the response headers (`anthropic-ratelimit-unified-7d_oi-*`), so Fable-aware routing works without turning the probe on.
 
