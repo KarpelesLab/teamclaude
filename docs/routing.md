@@ -37,8 +37,6 @@ If every configured account returns that exact denial, TeamClaude's terminal `50
 
 An explicit [`TC_ACCT` pin](#pin-a-session-to-one-account) continues to target exactly the requested account and never fails over, even while that account is excluded from automatic rotation.
 
-Every terminal upstream response includes `x-teamclaude-account`, containing the URI-encoded display name of the account that actually served it. Decode the value with `decodeURIComponent` or an equivalent URI decoder. TeamClaude sets the header after copying upstream headers, so it cannot describe an earlier failed attempt or be spoofed by an upstream response. Synthetic TeamClaude errors with no serving upstream account omit it.
-
 ## Storm control
 
 When you run many agents at once and the active account runs out, every in-flight request fails over to the next account **at the same instant** — a thundering herd that can spend a big chunk of the fresh account's quota (large contexts) and instantly throttle it, cascading down the fleet ([#84](https://github.com/KarpelesLab/teamclaude/issues/84)).

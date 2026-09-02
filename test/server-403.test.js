@@ -217,7 +217,6 @@ test('an OAuth entitlement denial quarantines the account across requests', asyn
     const first = await post(proxyPort);
     assert.equal(first.status, 200);
     assert.deepEqual(seen, ['a-token', 'b-token']);
-    assert.equal(decodeURIComponent(first.headers.get('x-teamclaude-account')), 'b account');
     assert.ok(am.accounts[0].entitlementDeniedUntil > Date.now());
 
     am.currentIndex = 0;
@@ -361,7 +360,6 @@ test('an all-entitlement-denied 502 diagnoses policy instead of recommending log
     assert.match(message, /"a account"/);
     assert.match(message, /"b account"/);
     assert.doesNotMatch(message, /teamclaude login/);
-    assert.equal(result.headers.get('x-teamclaude-account'), null);
     assert.deepEqual(seen, ['a-token', 'b-token']);
   } finally {
     proxy.close();
@@ -417,7 +415,7 @@ test('an oversized 403 body is not buffered or used to quarantine', async () => 
   }
 });
 
-test('a caller-pinned request reports the account it targeted', async () => {
+test('a caller-pinned request goes to exactly the account it targeted', async () => {
   const { server: upstream, seen } = entitlementUpstream();
   const upstreamPort = await listen(upstream);
   const am = new AccountManager(twoAccounts(), 0.98);
@@ -431,61 +429,6 @@ test('a caller-pinned request reports the account it targeted', async () => {
     const result = await post(proxyPort, '/tc-acct/b%20account/v1/messages');
     assert.equal(result.status, 200);
     assert.deepEqual(seen, ['b-token']);
-    assert.equal(decodeURIComponent(result.headers.get('x-teamclaude-account')), 'b account');
-  } finally {
-    proxy.close();
-    upstream.close();
-  }
-});
-
-test('a forwarded upstream error overrides spoofed attribution with a safe account name', async () => {
-  const upstream = http.createServer((_req, res) => {
-    res.writeHead(400, {
-      'content-type': 'application/json',
-      'x-teamclaude-account': 'spoofed',
-    });
-    res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error' } }));
-  });
-  const upstreamPort = await listen(upstream);
-  const accountName = 'tést account 🌟\ud800';
-  const am = new AccountManager([
-    { name: accountName, type: 'oauth', accessToken: 'token', refreshToken: 'r', expiresAt: Date.now() + HOUR },
-  ]);
-  const proxy = createProxyServer(am, {
-    proxy: { apiKey: 'k' },
-    upstream: `http://127.0.0.1:${upstreamPort}`,
-  });
-  const proxyPort = await listen(proxy);
-
-  try {
-    const result = await post(proxyPort);
-    assert.equal(result.status, 400);
-    assert.equal(
-      decodeURIComponent(result.headers.get('x-teamclaude-account')),
-      accountName.toWellFormed(),
-    );
-  } finally {
-    proxy.close();
-    upstream.close();
-  }
-});
-
-test('synthetic proxy errors do not claim a serving account', async () => {
-  const { server: upstream } = entitlementUpstream({ deniedToken: 'only-token' });
-  const upstreamPort = await listen(upstream);
-  const am = new AccountManager([
-    { name: 'only', type: 'oauth', accessToken: 'only-token', refreshToken: 'r', expiresAt: Date.now() + HOUR },
-  ]);
-  const proxy = createProxyServer(am, {
-    proxy: { apiKey: 'k' },
-    upstream: `http://127.0.0.1:${upstreamPort}`,
-  });
-  const proxyPort = await listen(proxy);
-
-  try {
-    const result = await post(proxyPort);
-    assert.equal(result.status, 502);
-    assert.equal(result.headers.get('x-teamclaude-account'), null);
   } finally {
     proxy.close();
     upstream.close();
