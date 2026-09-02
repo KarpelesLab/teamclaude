@@ -15,7 +15,7 @@ It falls back to plain log output when stdout is not a TTY (e.g. running as a se
 ### Session titles in the activity log
 
 Claude Code sends `x-claude-code-session-id` with each request, so every activity row belongs to a known
-session. The row is labelled with that session's name:
+session. With `sessionTitles.enabled` set, the row is labelled with that session's name:
 
 ```
  ⠋ 17:42:57  adv-review-rewrite POST /v1/messages (claude-opus-5) → claude@rikbrown.co.uk (1.9s...)
@@ -34,10 +34,13 @@ A session with none of these keeps the first six hex characters of its id. So do
 session header: a bare SDK or API client reaches the proxy anonymously, and no file names it.
 
 Each label is read once and re-read at most every 30 seconds, off the render path, so a `/rename` reaches the
-log without a restart and no frame waits on the disk.
+log without a restart and no frame waits on the disk. Only a session id shaped like a UUID is looked up, and a
+title is printed with its control characters removed, since both arrive from outside the proxy.
 
-Press **g** → **Session titles** to turn the labels off and back on while the proxy runs. Set
-`sessionTitles.width` to change the columns the label gets. See [configuration](configuration.md).
+This is off by default: it reads the tail of every visible session's transcript, which is further than the
+proxy reaches for anything else unless asked. Press **g** → **Session titles** to turn the labels on and off
+while the proxy runs. Set `sessionTitles.width` to change the columns the label gets. See
+[configuration](configuration.md).
 
 Headless, you can re-sync accounts from the config without a restart by POSTing to the local control endpoint (the equivalent of pressing **R** in the TUI):
 

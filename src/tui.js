@@ -71,9 +71,10 @@ function sessionColorCode(sid) {
 // Fixed-width colored session label: the name Claude Code holds on disk for the
 // session (see session-titles.js), else the short id. Blank-padded when there's
 // no session (e.g. a telemetry request). One width for every row, named or not,
-// keeps the columns after it aligned.
+// keeps the columns after it aligned. Measured in display columns, not UTF-16
+// units, so a CJK title takes the same room as an ASCII one.
 const sessionTag = (sid, title = null, width = SESSION_ID_LEN) =>
-  sid ? fg(sessionColorCode(sid), (title || sid.slice(0, SESSION_ID_LEN)).slice(0, width).padEnd(width)) : ' '.repeat(width);
+  sid ? fg(sessionColorCode(sid), rpad(truncate(title || sid.slice(0, SESSION_ID_LEN), width), width)) : ' '.repeat(width);
 
 // Which quota-family bar (F7/S7) a route binds to, or null for a general route.
 // Auto routes are named 'fable'/'sonnet'; a configured route is classified by its
@@ -951,13 +952,14 @@ export class TUI {
   }
 
   async _toggleSessionTitles() {
-    const next = { ...this.sessionTitles.settings(), enabled: !this.sessionTitles.enabled };
-    this.sessionTitles.configure(next);
-    // The shared config object is what a save writes and a reload re-applies.
-    this.config.sessionTitles = { ...this.config.sessionTitles, ...next };
+    // The shared config object is what a save writes and a reload re-applies,
+    // so it is the record; the store is configured from it, never the reverse.
+    const enabled = !this.sessionTitles.enabled;
+    this.config.sessionTitles = { ...this.config.sessionTitles, enabled };
+    this.sessionTitles.configure(this.config.sessionTitles);
     try { await this.saveConfig(this.config); }
     catch (e) { this._addLog(`Failed to save: ${e.message}`); }
-    this._addLog(`Session titles: ${next.enabled ? 'on' : 'off'}`);
+    this._addLog(`Session titles: ${enabled ? 'on' : 'off'}`);
     if (this.running) this.render();
   }
 

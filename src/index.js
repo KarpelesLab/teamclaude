@@ -358,6 +358,7 @@ async function serverCommand() {
         // the edit never reached disk and was silently undone by the next start.
         if (config.eventLogging != null) diskConfig.eventLogging = config.eventLogging;
         if (config.blockedModels != null) diskConfig.blockedModels = config.blockedModels;
+        if (config.sessionTitles != null) diskConfig.sessionTitles = config.sessionTitles;
         // Persist the route table (edited from the TUI routes screen).
         if (config.routes != null) diskConfig.routes = config.routes;
       }),
