@@ -91,3 +91,27 @@ test('a successful refresh clears any stale guard', async () => {
   await m.ensureTokenFresh(0);            // token still expiring → tries again freely
   assert.strictEqual(calls, before + 1, 'no lingering guard after a success');
 });
+
+// A re-import can supply a NEW access token with the SAME dead refresh token
+// (updateAccountTokens resets status to 'active'). The guard still blocks the
+// refresh, so the account must read as errored again or the access token's 401
+// would be relayed to the client instead of rotating.
+test('a re-imported access token with the same dead refresh token reads as errored, not retried', async () => {
+  let calls = 0;
+  const m = mgr(async () => { calls++; throw authError(400); });
+  await m.ensureTokenFresh(0);
+  assert.strictEqual(m.accounts[0].status, 'error');
+
+  m.updateAccountTokens(0, { accessToken: 'at-reimported', refreshToken: 'rt-dead', expiresAt: Date.now() - 1000 });
+  assert.strictEqual(m.accounts[0].status, 'active', 'updateAccountTokens clears the error state');
+
+  await m.ensureTokenFresh(0, true);      // the 401 path forces a refresh
+  assert.strictEqual(calls, 1, 'the dead token is still not re-sent');
+  assert.strictEqual(m.accounts[0].status, 'error', 'but the account is sidelined so the request rotates');
+});
+
+test('the dead-token field is part of the account record from construction', () => {
+  const m = mgr(async () => { throw authError(400); });
+  assert.ok('_deadRefreshToken' in m.accounts[0]);
+  assert.strictEqual(m.accounts[0]._deadRefreshToken, null);
+});

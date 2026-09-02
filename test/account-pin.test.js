@@ -90,10 +90,11 @@ async function withProxy(run) {
   }
 }
 
-const post = (url) => fetch(url, {
+const post = (url, signal) => fetch(url, {
   method: 'POST',
   headers: { 'content-type': 'application/json' },
   body: JSON.stringify({ model: 'x', messages: [] }),
+  signal,
 });
 
 test('a /tc-acct/<name> request is routed to that exact account, prefix stripped', async () => {
@@ -142,5 +143,38 @@ test('a normal (unpinned) request still rotates as before', async () => {
     assert.equal(res.status, 200);
     assert.equal(seen[0].path, '/v1/messages');
     assert.equal(seen[0].auth, 'Bearer t-alpha'); // default rotation → first account
+  });
+});
+
+// The escaping of a `/tc-acct/` segment is the CLIENT's, so a malformed one is
+// an ordinary bad request rather than something the proxy should choke on:
+// decodeURIComponent throws URIError on '%', '%zz' and a truncated '%E0%A4'.
+// The request is raced against a timer, so "never answered" is a failed
+// assertion rather than a run that never finishes.
+async function postWithin(url, ms = 4000) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), ms);
+  try {
+    const res = await post(url, ac.signal);
+    await res.text();
+    return res.status;
+  } catch (err) {
+    if (err.name === 'AbortError') return 'HUNG';
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+test('a /tc-acct/ pin with a malformed escape is answered, not left hanging', async () => {
+  await withProxy(async ({ proxyPort, seen }) => {
+    for (const pin of ['%', '%zz', '%E0%A4']) {
+      assert.equal(await postWithin(`http://127.0.0.1:${proxyPort}/tc-acct/${pin}/v1/messages`), 404,
+        `a pin of "${pin}" left the client waiting on a request nobody will answer`);
+    }
+    // A well-formed but unresolvable pin is the same answer, which is the point:
+    // an undecodable pin is an unusable pin, not an internal error.
+    assert.equal(await postWithin(`http://127.0.0.1:${proxyPort}/tc-acct/%67%68/v1/messages`), 404);
+    assert.equal(seen.length, 0, 'an unresolvable pin reached upstream');
   });
 });

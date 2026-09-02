@@ -18,7 +18,17 @@ const FORCED_REFRESH_FLOOR_MS = 10_000;
 const PERSISTED_QUOTA_FIELDS = [
   'unified5h', 'unified7d', 'unified7dSonnet', 'unified7dFable',
   'unified5hReset', 'unified7dReset', 'unified7dSonnetReset', 'unified7dFableReset', 'unifiedStatus',
+  'unified7dSonnetSeenAt', 'unified7dFableSeenAt',
   'tokensLimit', 'tokensRemaining', 'requestsLimit', 'requestsRemaining', 'resetsAt',
+];
+
+// The family (Fable/Sonnet) weekly buckets and the field holding when each was
+// last confirmed by upstream. See _clearExpiredQuotas: a SPENT family reading is
+// only trusted while it is fresh, because nothing but a request of that family
+// can refresh it.
+const FAMILY_WEEKLY_BUCKETS = [
+  { key: 'unified7dFable', label: 'Fable' },
+  { key: 'unified7dSonnet', label: 'Sonnet' },
 ];
 
 function emptyQuota() {
@@ -37,6 +47,11 @@ function emptyQuota() {
     unified7dReset: null,       // ms timestamp
     unified7dSonnetReset: null, // ms timestamp
     unified7dFableReset: null,  // ms timestamp
+    // When each family bucket was last confirmed by upstream (ms timestamp).
+    // Only these two buckets need it: they are the ones a spent reading can seal
+    // itself into, since selection stops sending the family that would refresh them.
+    unified7dSonnetSeenAt: null,
+    unified7dFableSeenAt: null,
     unifiedStatus: null,        // allowed | allowed_warning | rejected
     resetsAt: null,
   };
@@ -88,6 +103,9 @@ function makeAccount(acct, index) {
     // (post-401) refreshes so a burst of stale in-flight requests can't rotate
     // the refresh-token family once per request — see ensureTokenFresh.
     _lastRefreshAt: null,
+    // The refresh token upstream last rejected as invalid, if it is still the
+    // one we hold — see the dead-token guard in ensureTokenFresh.
+    _deadRefreshToken: null,
   };
 }
 
@@ -108,7 +126,7 @@ function sampleModelFor(route) {
 }
 
 export class AccountManager {
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, throttleProbeFloorMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, sessionTracker } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, throttleProbeFloorMs, familyStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, sessionTracker } = {}) {
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
@@ -163,6 +181,13 @@ export class AccountManager {
     // retry-after, short enough that a stale hold cannot pin the fleet.
     this.throttleProbeFloorMs = throttleProbeFloorMs
       ?? (Number(process.env.TEAMCLAUDE_THROTTLE_PROBE_FLOOR_MS) || 60_000);
+    // How long a SPENT family (Fable/Sonnet) weekly reading is trusted before it
+    // is cleared for revalidation (see _clearExpiredQuotas). Long enough that a
+    // genuinely spent bucket costs at most one rejected request per account per
+    // window, short enough that a stale reading cannot lock a family out for the
+    // rest of the weekly window.
+    this.familyStaleMs = familyStaleMs
+      ?? (Number(process.env.TEAMCLAUDE_FAMILY_STALE_MS) || 30 * 60_000);
   }
 
   /** Start (or restart) the ramp window for an account that just became current,
@@ -642,6 +667,13 @@ export class AccountManager {
     return { eligible: true };
   }
 
+  /** Session-distribution toggle (issue #109), applied live on config reload.
+   *  Existing session pins survive a toggle: the flag gates only how NEW
+   *  sessions are routed. */
+  setDistributeSessions(enabled) {
+    this.distributeSessions = !!enabled;
+  }
+
   /**
    * Normalize and store the configurable routing table. A route pins a set of
    * model globs to an exclusive set of accounts (and may override the governing
@@ -876,11 +908,44 @@ export class AccountManager {
     if (q.unified7dSonnet != null && q.unified7dSonnetReset && now >= q.unified7dSonnetReset) {
       q.unified7dSonnet = null;
       q.unified7dSonnetReset = null;
+      q.unified7dSonnetSeenAt = null;
       changed = true;
     }
     if (q.unified7dFable != null && q.unified7dFableReset && now >= q.unified7dFableReset) {
       q.unified7dFable = null;
       q.unified7dFableReset = null;
+      q.unified7dFableSeenAt = null;
+      changed = true;
+    }
+
+    // A family bucket is refreshed ONLY by upstream evidence for that family:
+    // the `7d_oi` headers ride on Fable responses (they are absent from every
+    // other model's response), and the Sonnet bucket comes from the usage
+    // endpoint — an opt-in probe that is off by default. So once such a bucket
+    // reads spent, selection stops sending that family to the account, which is
+    // also the only thing that could have corrected the reading: it seals itself
+    // in until its cached reset passes, up to a week of lockout on an account
+    // whose real family quota reset long ago (issue #167).
+    //
+    // A spent family reading is therefore trusted only while it is fresh. Past
+    // the staleness floor it is cleared, the family falls back to the shared
+    // weekly bucket, and the next request of that family re-establishes the
+    // truth from real headers — a 429 re-arms the gate with a fresh reading and
+    // a fresh timestamp, so a genuinely spent bucket costs one rejected request
+    // per account per window and no more. A reading with headroom is left alone:
+    // it gates nothing, so it cannot seal anything in.
+    for (const { key, label } of FAMILY_WEEKLY_BUCKETS) {
+      if (q[key] == null || q[key] < this.switchThreshold) continue;
+      const seenField = `${key}SeenAt`;
+      // Unknown age (restored from an older state file, or set by a path that
+      // predates the stamp): start the clock now rather than clearing at once,
+      // so a reading is never discarded before it has had a window to prove out.
+      if (!q[seenField]) { q[seenField] = now; continue; }
+      if (now < q[seenField] + this.familyStaleMs) continue;
+      console.log(`[TeamClaude] Account "${account.name}" ${label} weekly reading is stale — revalidating on the next ${label} request`);
+      q[key] = null;
+      q[`${key}Reset`] = null;
+      q[seenField] = null;
       changed = true;
     }
 
@@ -1118,8 +1183,14 @@ export class AccountManager {
     // overage included"). On current subscription plans this is the Fable weekly
     // limit (it correlates with the usage endpoint's Fable-scoped weekly bucket).
     // Utilization here is already a 0-1 fraction (can exceed 1 when in overage).
+    // These headers ride on Fable responses only, so stamp when the reading was
+    // taken: that timestamp is what lets a spent reading be revalidated instead
+    // of sealing the account out of the family forever (see _clearExpiredQuotas).
     const u7dOi = parseFloat(headers['anthropic-ratelimit-unified-7d_oi-utilization']);
-    if (!isNaN(u7dOi)) account.quota.unified7dFable = u7dOi;
+    if (!isNaN(u7dOi)) {
+      account.quota.unified7dFable = u7dOi;
+      account.quota.unified7dFableSeenAt = Date.now();
+    }
     const r7dOi = headers['anthropic-ratelimit-unified-7d_oi-reset'];
     if (r7dOi) account.quota.unified7dFableReset = parseInt(r7dOi, 10) * 1000;
 
@@ -1212,12 +1283,23 @@ export class AccountManager {
       if (usage.sevenDay.utilization != null) q.unified7d = usage.sevenDay.utilization;
       if (usage.sevenDay.resetAt != null) q.unified7dReset = usage.sevenDay.resetAt;
     }
+    // The family buckets carry a "last confirmed" stamp (see _clearExpiredQuotas).
+    // A probe is upstream evidence just like a response header, so it refreshes
+    // the stamp — this is the one path that can correct a spent family reading
+    // without spending quota, which is why enabling the probe sidesteps the
+    // staleness problem entirely.
     if (usage.sevenDaySonnet) {
-      if (usage.sevenDaySonnet.utilization != null) q.unified7dSonnet = usage.sevenDaySonnet.utilization;
+      if (usage.sevenDaySonnet.utilization != null) {
+        q.unified7dSonnet = usage.sevenDaySonnet.utilization;
+        q.unified7dSonnetSeenAt = Date.now();
+      }
       if (usage.sevenDaySonnet.resetAt != null) q.unified7dSonnetReset = usage.sevenDaySonnet.resetAt;
     }
     if (usage.sevenDayFable) {
-      if (usage.sevenDayFable.utilization != null) q.unified7dFable = usage.sevenDayFable.utilization;
+      if (usage.sevenDayFable.utilization != null) {
+        q.unified7dFable = usage.sevenDayFable.utilization;
+        q.unified7dFableSeenAt = Date.now();
+      }
       if (usage.sevenDayFable.resetAt != null) q.unified7dFableReset = usage.sevenDayFable.resetAt;
     }
 
@@ -1272,11 +1354,25 @@ export class AccountManager {
     // — observed live: 287 identical invalid_grant calls after two accounts' tokens
     // were invalidated (a `/login` elsewhere rotates the token and kills the copy
     // teamclaude holds). Paths that bypass availability checks keep calling this
-    // (warmup/probe pin an account by name via /tc-acct, skipping _isAvailable),
-    // so marking the account 'error' alone does not stop the retries. Keyed on the
-    // token VALUE, not the status: the moment a DIFFERENT refresh token arrives
-    // (re-login, config reload, updateAccountTokens) the guard lifts on its own.
-    if (account._deadRefreshToken && account._deadRefreshToken === account.refreshToken) return;
+    // (the quota prober refreshes every OAuth account regardless of status, and a
+    // pinned request reaches here without _isAvailable), so marking the account
+    // 'error' alone does not stop the retries. Keyed on the token VALUE, not the
+    // status: the moment a DIFFERENT refresh token arrives (re-login, config
+    // reload, updateAccountTokens) the guard lifts on its own.
+    //
+    // While it holds, the account must also READ as needing a re-login. A
+    // re-import can hand updateAccountTokens a new access token alongside the
+    // same dead refresh token; that path resets status to 'active', so without
+    // this the access token's 401 would force a refresh that silently does
+    // nothing here and the retry would relay the 401 to the client instead of
+    // rotating to another account.
+    if (account._deadRefreshToken && account._deadRefreshToken === account.refreshToken) {
+      if (account.status !== 'error') {
+        account.status = 'error';
+        console.error(`[TeamClaude] Account "${account.name}" still holds a rejected refresh token — run: teamclaude login`);
+      }
+      return;
+    }
 
     if (!force && !isTokenExpiringSoon(account.expiresAt)) return;
 
