@@ -192,3 +192,46 @@ test('an upstream socket that dies mid-relay tears down the pair instead of cras
     upstream.close();
   }
 });
+
+// Production failure mode (2026-08-30): the upstream leg of a live long-poll
+// died ("socket hang up" logged by the relay), but the client's response was
+// left open — the CLI's Remote Control stream waited on a channel that could
+// never deliver another event, and every message queued silently for 45+
+// minutes. Once headers have gone out, the only way to tell the client is to
+// close its socket; this proves a mid-stream upstream death propagates instead
+// of stranding the client.
+test('destroys the client stream when the upstream leg dies mid-response', async () => {
+  const { server: upstream, port: upstreamPort } = await listen((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('event: hello\n\n');
+    // Yank the transport mid-stream — an abrupt FIN/RST, not a clean end().
+    setTimeout(() => res.socket.destroy(), 20);
+  });
+
+  const accountManager = { getActiveAccount() { throw new Error('must not rotate'); } };
+  const listener = createProxyRequestListener({
+    accountManager, upstream: `http://127.0.0.1:${upstreamPort}`,
+  });
+  const { server: proxy, port } = await listen(listener);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/v1/code/sessions/abc/worker/events/stream`);
+    assert.equal(res.status, 200);
+    const reader = res.body.getReader();
+    const { value } = await reader.read();
+    assert.match(Buffer.from(value).toString(), /event: hello/);
+
+    // Without the fix this read never settles: the proxy keeps the client
+    // socket open after the upstream is gone. The race makes the regression
+    // fail fast instead of hanging the whole test run.
+    const outcome = await Promise.race([
+      reader.read().then(({ done }) => (done ? 'closed' : 'data'), () => 'closed'),
+      new Promise((resolve) => setTimeout(() => resolve('stranded'), 2000)),
+    ]);
+    assert.equal(outcome, 'closed');
+  } finally {
+    proxy.close();
+    upstream.close();
+    upstream.closeAllConnections();
+  }
+});
