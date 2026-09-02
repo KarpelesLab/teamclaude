@@ -104,36 +104,111 @@ test('a LEARNED family bucket is read, not the shared weekly it hides behind', (
 
 test('the gate and the ranking read the same number, however the bucket resolves', () => {
   // The scoped reading answers for the REQUEST's bucket, not for whichever
-  // window that bucket fell back to. A family bucket the account does not
-  // report, and a route override naming a field nothing fills, both collapse
-  // onto the shared window — and the gate reads the shared number plainly in
-  // both. Following the collapse into scopedWeekly would disagree with it in
-  // exactly the cases it does not consult.
+  // window that bucket fell back to: following the collapse into scopedWeekly
+  // would disagree with the gate in exactly the cases it does not consult.
+  // Both halves are checked, not just the number — the ratio is only a rate
+  // when one window supplies both of its terms.
   const now = Date.now();
-  const scoped = { opus: { utilization: 0.90, resetAt: now + 12 * H } };
+  const SC = now + 12 * H;
+  const SH = now + 40 * H;
+  const FB = now + 30 * H;
+  const scoped = { opus: { utilization: 0.90, resetAt: SC } };
+  const fableScoped = { fable: { utilization: 0.95, resetAt: now + 5 * H } };
   const cases = [
-    ['scoped binds', OPUS, q => Object.assign(q, { unified7d: 0.10, scopedWeekly: scoped })],
-    ['shared binds', OPUS, q => Object.assign(q, { unified7d: 0.95, scopedWeekly: scoped })],
-    ['no scoped map', OPUS, q => Object.assign(q, { unified7d: 0.40, scopedWeekly: {} })],
-    ['malformed entry', OPUS, q => Object.assign(q, { unified7d: 0.40, scopedWeekly: { opus: 7 } })],
-    ['family bucket absent', FABLE, q => Object.assign(q, { unified7d: 0.10, scopedWeekly: { fable: { utilization: 0.95, resetAt: now + 5 * H } } })],
-    ['family bucket present', FABLE, q => Object.assign(q, { unified7d: 0.10, unified7dFable: 0.55, scopedWeekly: { fable: { utilization: 0.95, resetAt: now + 5 * H } } })],
+    ['scoped binds', OPUS, SC,
+      q => Object.assign(q, { unified7d: 0.10, unified7dReset: SH, scopedWeekly: scoped })],
+    ['shared binds', OPUS, SH,
+      q => Object.assign(q, { unified7d: 0.95, unified7dReset: SH, scopedWeekly: scoped })],
+    ['no scoped map', OPUS, SH,
+      q => Object.assign(q, { unified7d: 0.40, unified7dReset: SH, scopedWeekly: {} })],
+    ['malformed entry', OPUS, SH,
+      q => Object.assign(q, { unified7d: 0.40, unified7dReset: SH, scopedWeekly: { opus: 7 } })],
+    ['family bucket absent', FABLE, SH,
+      q => Object.assign(q, { unified7d: 0.10, unified7dReset: SH, scopedWeekly: fableScoped })],
+    ['family bucket present', FABLE, FB,
+      q => Object.assign(q, { unified7d: 0.10, unified7dReset: SH, unified7dFable: 0.55, unified7dFableReset: FB, scopedWeekly: fableScoped })],
   ];
-  for (const [label, model, fill] of cases) {
+  for (const [label, model, expectedReset, fill] of cases) {
     const am = mgr(['a'], { expiry: ON });
     fill(am.accounts[0].quota);
-    assert.equal(am._governingWindow(am.accounts[0], model).utilization,
-      am._governingWeekly(am.accounts[0], model), label);
+    const win = am._governingWindow(am.accounts[0], model);
+    assert.equal(win.utilization, am._governingWeekly(am.accounts[0], model), `${label}: utilization`);
+    assert.equal(win.resetAt, expectedReset, `${label}: resetAt came from another window`);
   }
   // And with a route override, whether or not the override bucket is reported.
   for (const reported of [false, true]) {
     const am = mgr(['a'], { expiry: ON });
     am.setRoutes([{ name: 'r', match: ['claude-opus-*'], bucket: 'unified7dCustom' }]);
-    Object.assign(am.accounts[0].quota, { unified7d: 0.10, scopedWeekly: scoped });
-    if (reported) am.accounts[0].quota.unified7dCustom = 0.70;
-    assert.equal(am._governingWindow(am.accounts[0], OPUS).utilization,
-      am._governingWeekly(am.accounts[0], OPUS), `route override, reported=${reported}`);
+    Object.assign(am.accounts[0].quota, { unified7d: 0.10, unified7dReset: SH, scopedWeekly: scoped });
+    if (reported) {
+      am.accounts[0].quota.unified7dCustom = 0.70;
+      am.accounts[0].quota.unified7dCustomReset = now + 60 * H;
+    }
+    const win = am._governingWindow(am.accounts[0], OPUS);
+    assert.equal(win.utilization, am._governingWeekly(am.accounts[0], OPUS), `route override, reported=${reported}`);
+    assert.equal(win.resetAt, reported ? now + 60 * H : SH, `route override reset, reported=${reported}`);
   }
+});
+
+test('every reader of the governing window answers from the one resolution', () => {
+  // The gate, the pressure ratio, the tiebreak and the rollover baseline are
+  // four readings of one question, so the agreement is asserted on the readers
+  // themselves rather than on the helper they share.
+  const now = Date.now();
+  const cases = [
+    ['scoped binds', { unified7d: 0.10, unified7dReset: now + 40 * H, scopedWeekly: { opus: { utilization: 0.90, resetAt: now + 12 * H } } }],
+    ['shared binds', { unified7d: 0.95, unified7dReset: now + 40 * H, scopedWeekly: { opus: { utilization: 0.20, resetAt: now + 12 * H } } }],
+    ['scoped, no shared reading', { unified7dReset: now + 40 * H, scopedWeekly: { opus: { utilization: 0.30, resetAt: now + 12 * H } } }],
+    ['nothing scoped', { unified7d: 0.40, unified7dReset: now + 40 * H, scopedWeekly: {} }],
+  ];
+  for (const [label, quota] of cases) {
+    const am = mgr(['a'], { expiry: ON });
+    Object.assign(am.accounts[0].quota, quota);
+    const a = am.accounts[0];
+    const win = am._governingWindow(a, OPUS);
+    // The gate reads the same number...
+    assert.equal(am._governingWeekly(a, OPUS), win.utilization ?? null, `${label}: gate`);
+    // ...the tiebreak reads the same clock...
+    assert.equal(am._rankedReset(a, OPUS), win.resetAt || -Infinity, `${label}: tiebreak`);
+    // ...and the rollover baseline watches the same window, by name.
+    const seen = am._bucketWindows(a, [am._weeklyBucketFor(OPUS)], OPUS);
+    assert.equal(seen[am._weeklyBucketFor(OPUS)].window, win.window, `${label}: baseline window`);
+    assert.equal(seen[am._weeklyBucketFor(OPUS)].reset, win.resetAt, `${label}: baseline reset`);
+  }
+});
+
+test('an equal-pressure tie breaks on the governing window\'s clock, not another', () => {
+  // Identical scoped windows on both accounts, so the pressures are computed
+  // from identical inputs and the tie is exact rather than nearly so — the next
+  // sort key is what decides the pick. The SHARED weekly disagrees and points
+  // the other way, and it is a clock neither the gate nor the ratio consulted.
+  const now = Date.now();
+  const fleet = expiry => {
+    const am = mgr(['a', 'b'], { expiry });
+    for (const i of [0, 1]) {
+      Object.assign(am.accounts[i].quota, {
+        unified5h: 0.1,
+        unified7d: 0.10,
+        scopedWeekly: { opus: { utilization: 0.80, resetAt: now + 20 * H } },
+      });
+      am.accounts[i].probing = false;
+    }
+    am.accounts[0].quota.unified7dReset = now + 100 * H;
+    am.accounts[1].quota.unified7dReset = now + 5 * H;
+    return am;
+  };
+
+  const on = fleet(ON);
+  assert.equal(on._expiryPressure(on.accounts[0], OPUS, now),
+    on._expiryPressure(on.accounts[1], OPUS, now), 'the fixture must tie exactly');
+  assert.equal(on._pickBestAvailable(null, OPUS).name, 'a');
+  assert.equal(on._pickLeastLoaded(null, OPUS).name, 'a');
+
+  // With the knob off the older tiebreak is untouched, shared clock and all:
+  // the off switch is that this feature's terms go inert.
+  const off = fleet(OFF);
+  assert.equal(off._pickBestAvailable(null, OPUS).name, 'b');
+  assert.equal(off._pickLeastLoaded(null, OPUS).name, 'b');
 });
 
 // ---------------------------------------------------------------------------

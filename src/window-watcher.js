@@ -128,6 +128,34 @@ export class WindowWatcher {
   }
 
   /**
+   * Begin a TENURE on account `idx`: take `resets` as the baseline outright,
+   * replacing whatever an earlier tenure left there.
+   *
+   * A baseline answers "what was this window when we chose this account", and
+   * that question is asked afresh every time the account is chosen. Kept from
+   * an earlier tenure it answers a different one — what the window was the last
+   * time traffic sat here, which for an account that rolled while traffic was
+   * elsewhere is a roll already spent. Selecting it again then reads that roll as
+   * new and moves straight back off: an operator's manual switch does not survive
+   * its own next request, and a session forced back onto an account is preempted
+   * off it again immediately — the extra cache-miss move the whole design exists
+   * to avoid.
+   *
+   * Seeding is the opposite act and stays seed-only: it records what a window was
+   * the first time anything looked, and overwriting there would erase a jump
+   * nothing has acted on yet. This overwrites deliberately, and can do so safely
+   * because a rollover already DETECTED lives in `pending`, which rolledOver
+   * consults before it ever reads a baseline. An owed event survives a new
+   * tenure; a spent one does not haunt it.
+   */
+  establish(idx, resets) {
+    for (const [bucket, seen] of Object.entries(resets)) {
+      if (!seen || seen.reset == null) continue;
+      windowSlot(this.windows, bucket, idx).set(seen.window, seen.reset);
+    }
+  }
+
+  /**
    * Has the window governing `bucket` on account `idx` rolled over since we last
    * looked? `resets` is every bucket this account currently resolves, as
    * { requestBucket: { window, reset } } — all of them are seeded, not just the

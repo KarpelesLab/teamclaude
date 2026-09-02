@@ -337,6 +337,180 @@ test('a rollover the re-rank answers by staying does not report a stuck fleet', 
 });
 
 // ---------------------------------------------------------------------------
+// The rollover is acted on by whichever pass actually decides the request
+// ---------------------------------------------------------------------------
+
+// One complete ADVISOR request: the executor model plus the second model an
+// advisor request carries. That pass returns as soon as it succeeds, so for
+// this request it is the final selection and not a rehearsal for a later one.
+function serveAdvisor(am, sessionId, model, advisorModel) {
+  const decision = {};
+  am.beginSession(sessionId);
+  const account = am.getActiveAccount(null, model, advisorModel, sessionId, decision);
+  if (account) {
+    am.recordSession(sessionId, account.index, model);
+    am.confirmRouted(sessionId, account.index, model, decision);
+  }
+  am.endSession(sessionId);
+  return account;
+}
+
+test('an advisor request re-ranks off a rolled current account', () => {
+  // The advisor-constrained pass returns its account straight to the caller, so
+  // it IS the final selection. An all-advisor workload that never re-ranks would
+  // sit on the account that just gained a full week for as long as it lasts.
+  const am = mgr(['a', 'b'], ON);
+  bucket(am, 0, 'unified7d', 0.4, 10);
+  bucket(am, 1, 'unified7d', 0.4, 10);
+  assert.equal(serveAdvisor(am, null, OPUS, FABLE).name, 'a');
+  rollWindow(am, 0);
+  assert.equal(serveAdvisor(am, null, OPUS, FABLE).name, 'b');
+  // And it stays there, exactly as the plain walk does.
+  assert.equal(serveAdvisor(am, null, OPUS, FABLE).name, 'b');
+});
+
+test('an advisor request with nowhere to go still says the rollover is stuck', () => {
+  // The instrument that reports a stuck rollover must not be behind the same
+  // gate as the action it reports on, or the one path that cannot move is also
+  // the one path that cannot say so.
+  const am = mgr(['a'], ON);
+  bucket(am, 0, 'unified7d', 0.4, 10);
+  serveAdvisor(am, null, OPUS, FABLE);
+  rollWindow(am, 0);
+  const lines = [];
+  const real = console.log;
+  console.log = msg => lines.push(String(msg));
+  try {
+    assert.equal(serveAdvisor(am, null, OPUS, FABLE).name, 'a');
+  } finally {
+    console.log = real;
+  }
+  assert.ok(lines.some(l => /rolled over its unified7d window but no eligible account/.test(l)),
+    `expected a stuck-rollover line on the advisor path, got: ${JSON.stringify(lines)}`);
+});
+
+// ---------------------------------------------------------------------------
+// The window that prices a choice is the window whose roll moves it
+// ---------------------------------------------------------------------------
+
+// A learned, model-scoped weekly bucket — the kind upstream reports for a family
+// the static table has never heard of.
+function scoped(am, index, family, used, hours, base = Date.now()) {
+  am.accounts[index].quota.scopedWeekly = {
+    ...(am.accounts[index].quota.scopedWeekly || {}),
+    [family]: { utilization: used, resetAt: base + hours * H },
+  };
+}
+
+test('a rollover of the SCOPED governing window moves a pinned session', () => {
+  // Ranking reads the scoped bucket when it is the one that binds. If the
+  // rollover watcher still identifies the window by the shared weekly, the
+  // scoped window can gain a full week with no event at all — and the session
+  // pinned there goes on spending exactly the quota this feature exists to
+  // preserve. Same window for the gate, the ranking and the event, or the
+  // feature contradicts itself.
+  const am = mgr(['a', 'b'], ON, { distributeSessions: true });
+  const now = Date.now();
+  bucket(am, 0, 'unified7d', 0.10, 300, now);
+  bucket(am, 1, 'unified7d', 0.10, 300, now);
+  scoped(am, 0, 'opus', 0.50, 10, now);
+  scoped(am, 1, 'opus', 0.50, 10, now);
+  assert.equal(serve(am, 's1', OPUS).name, 'a');
+  // a's scoped window rolls a full week forward; the shared weekly does not move.
+  am.accounts[0].quota.scopedWeekly.opus.resetAt += WEEK;
+  assert.equal(serve(am, 's1', OPUS).name, 'b');
+});
+
+test('a rollover of the scoped window moves the sticky current account too', () => {
+  const am = mgr(['a', 'b'], ON);
+  const now = Date.now();
+  bucket(am, 0, 'unified7d', 0.10, 300, now);
+  bucket(am, 1, 'unified7d', 0.10, 300, now);
+  scoped(am, 0, 'opus', 0.50, 10, now);
+  scoped(am, 1, 'opus', 0.50, 10, now);
+  assert.equal(serve(am, null, OPUS).name, 'a');
+  am.accounts[0].quota.scopedWeekly.opus.resetAt += WEEK;
+  assert.equal(serve(am, null, OPUS).name, 'b');
+});
+
+// ---------------------------------------------------------------------------
+// A drain is bounded by the window that priced it
+// ---------------------------------------------------------------------------
+
+test('a draining session rejoins the ordinary walk when its window rolls', () => {
+  // The drain keeps a session on its account to preserve the cache it built
+  // there. That trade is priced against the window the account had; when that
+  // window rolls a week forward the account is the one the fleet should be
+  // spending LAST, and an active session renews its own idle timer forever, so
+  // nothing else ends the drain.
+  const am = mgr(['a', 'b'], ON, { distributeSessions: true });
+  bucket(am, 0, 'unified7d', 0.4, 10);
+  bucket(am, 1, 'unified7d', 0.4, 10);
+  // The daemon establishes the current account at startup (index.js), which is
+  // what gives the ordinary walk a baseline to measure against. Session traffic
+  // alone never reaches that walk, so without this the session would leave the
+  // drain correctly and then first-sight the rolled window.
+  am.selectActiveAccount();
+  assert.equal(serve(am, 's1', OPUS).name, 'a');
+  am.setDistributeSessions(false);
+  assert.equal(am.sessionStats().draining, 1, 'the session should be draining');
+  // While the window holds, the drain does its job: the session stays put.
+  assert.equal(serve(am, 's1', OPUS).name, 'a');
+  rollWindow(am, 0);
+  assert.notEqual(serve(am, 's1', OPUS).name, 'a',
+    'a draining session rode its account through a rollover');
+});
+
+// ---------------------------------------------------------------------------
+// An observation describes the stay it was taken in
+// ---------------------------------------------------------------------------
+
+test('an operator\'s manual switch survives its own next request', () => {
+  // An observation kept across stays compares the account's window against what
+  // it was the last time traffic sat here, which for an account that rolled
+  // while traffic was elsewhere is a rollover already spent. Selecting it again
+  // then reads that old roll as new and moves straight back off, so the switch
+  // never takes effect. b is the sooner-expiring account once a has rolled, so a false
+  // rollover has somewhere to go and this asserts more than "nothing moved".
+  const am = mgr(['a', 'b'], ON);
+  bucket(am, 0, 'unified7d', 0.4, 10);
+  bucket(am, 1, 'unified7d', 0.4, 20);
+  assert.equal(serve(am, null, OPUS).name, 'a');
+  // Traffic moves to b, and a rolls unobserved while it is away.
+  assert.equal(am.setCurrentAccount(1), true);
+  assert.equal(serve(am, null, OPUS).name, 'b');
+  rollWindow(am, 0);
+  // The operator puts it back on a. That is a new stay, priced on a's window as
+  // it stands now.
+  assert.equal(am.setCurrentAccount(0), true);
+  assert.equal(serve(am, null, OPUS).name, 'a', 'the manual switch was undone by a spent rollover');
+  assert.equal(serve(am, null, OPUS).name, 'a');
+});
+
+test('a session re-pinned to an account it left is not preempted by the old roll', () => {
+  // The session leaves a because a cannot serve it, not because anything rolled,
+  // so nothing banks a's window. a rolls while the session is away, and the
+  // session is later forced back. The re-pin is a new stay; the roll it was not
+  // there for belongs to the old one and has no claim on this traffic.
+  const am = mgr(['a', 'b'], ON, { distributeSessions: true });
+  bucket(am, 0, 'unified7d', 0.4, 10);
+  bucket(am, 1, 'unified7d', 0.4, 20);
+  assert.equal(serve(am, 's1', OPUS).name, 'a');
+
+  am.setDisabled(0, true);
+  assert.equal(serve(am, 's1', OPUS).name, 'b', 'the session should divert while a is out');
+  rollWindow(am, 0);
+  am.setDisabled(0, false);
+
+  // b goes out in turn, so the session is forced back onto a and re-pinned there.
+  am.setDisabled(1, true);
+  assert.equal(serve(am, 's1', OPUS).name, 'a');
+  am.setDisabled(1, false);
+
+  assert.equal(serve(am, 's1', OPUS).name, 'a', 'the prior tenure\'s roll preempted the new one');
+});
+
+// ---------------------------------------------------------------------------
 // Bookkeeping lifetime
 // ---------------------------------------------------------------------------
 
