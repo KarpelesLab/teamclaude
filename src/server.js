@@ -1,8 +1,8 @@
 import http from 'node:http';
 import https from 'node:https';
 import { timingSafeEqual } from 'node:crypto';
-import { createWriteStream, writeSync } from 'node:fs';
-import { mkdir, readdir, stat, unlink } from 'node:fs/promises';
+import { createWriteStream, mkdirSync, writeSync } from 'node:fs';
+import { readdir, stat, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { ensureCerts, createConnectHandler } from './mitm.js';
 import { patchAccountUuid } from './account-uuid-rewrite.js';
@@ -56,11 +56,22 @@ export function isLoopbackAddr(addr) {
 export function createProxyServer(accountManager, config, hooks = {}, sx = null) {
   const upstream = config.upstream || 'https://api.anthropic.com';
   const proxyApiKey = config.proxy?.apiKey;
-  const logDir = config.logDir || null;
   const holdMs = (config.holdSeconds || 0) * 1000;
 
+  // The log directory is made up front and synchronously, so a path that
+  // cannot be a directory (a file sitting there, no permission) is reported
+  // ONCE here and logging is switched off — instead of the server looking
+  // healthy while every request discovers the failure on its own. Never fatal:
+  // a broken log directory is no reason to refuse traffic. 0700 because the
+  // files hold full prompts and responses; an existing directory keeps its mode.
+  let logDir = config.logDir || null;
   if (logDir) {
-    mkdir(logDir, { recursive: true }).catch(() => {});
+    try {
+      mkdirSync(logDir, { recursive: true, mode: 0o700 });
+    } catch (err) {
+      console.error(`[TeamClaude] Request logging disabled: cannot create logDir ${logDir}: ${err.message}`);
+      logDir = null;
+    }
   }
 
   const requestHandler = async (req, res) => {
@@ -345,7 +356,10 @@ export function resolveAccountPin(accountManager, token) {
 export function describeConnectError(err) {
   const reasons = (e) => (Array.isArray(e?.errors) ? e.errors.map(c => c?.message).filter(Boolean) : []);
   const own = reasons(err);
-  return (own.length ? own : reasons(err?.cause)).join('; ') || err?.message;
+  // A wrapper with a non-aggregated cause (global fetch's TypeError('fetch
+  // failed') around a single-address connect error) still says only 'fetch
+  // failed' by itself; the cause's message is the reason.
+  return (own.length ? own : reasons(err?.cause)).join('; ') || err?.cause?.message || err?.message;
 }
 
 // Paths that must reach upstream with the client's own credential (never a
@@ -994,16 +1008,52 @@ export async function sweepRequestLogs(logDir, retentionHours, now = Date.now())
 // is opened on first write; header sections are written verbatim and bodies are
 // streamed through BodyWriter (JSON pretty-printed on the fly, SSE/other raw),
 // so even a ~1M-token response costs only the current chunk.
-function openRequestLog(logDir, reqId, { level = DEFAULT_LOG_LEVEL, maxBodyBytes = DEFAULT_LOG_MAX_BODY_BYTES } = {}) {
-  const filename = `${logTimestamp()}_${String(reqId).padStart(5, '0')}.log`;
-  const ws = createWriteStream(join(logDir, filename), { flags: 'a' });
-  ws.on('error', (err) => console.error(`[TeamClaude] Failed to write log: ${err.message}`));
+// Process-wide sequence for log file names. The per-request id is per
+// listener (the base server and each MITM pin server count from zero), so two
+// listeners could open the same "<ms-timestamp>_<id>" name in one millisecond
+// and interleave two requests in one file. A single counter cannot collide.
+let logFileSeq = 0;
+
+function openRequestLog(logDir, _reqId, { level = DEFAULT_LOG_LEVEL, maxBodyBytes = DEFAULT_LOG_MAX_BODY_BYTES } = {}) {
+  const filename = `${logTimestamp()}_${String(++logFileSeq).padStart(5, '0')}.log`;
+  // 0600: the file holds the full request and response bodies.
+  const ws = createWriteStream(join(logDir, filename), { flags: 'a', mode: 0o600 });
   let ended = false;
-  const write = (s) => { if (!ended && s) ws.write(Buffer.from(String(s), 'latin1')); };
+  let failed = false;
+  // Whether the last write was queued rather than flushed. The streaming path
+  // asks drain() so a disk that cannot keep up with upstream pauses the relay
+  // instead of the body piling up in the stream's buffer — the "only the
+  // current chunk in memory" promise has to hold for the socket underneath the
+  // formatter too.
+  let backlogged = false;
+  const fail = (err) => {
+    if (failed) return;
+    failed = true;
+    console.error(`[TeamClaude] Request log ${filename} abandoned: ${err.message}`);
+  };
+  ws.on('error', fail);
+  const write = (s) => {
+    if (ended || failed || !s) return;
+    backlogged = !ws.write(Buffer.from(String(s), 'latin1'));
+  };
+  // Logging must never fail the request it describes. The formatter runs on
+  // whatever bytes the client or upstream produced, so a throw here is a log
+  // problem, not a request problem: record it once and go on relaying.
+  const guarded = (fn) => { try { return fn(); } catch (err) { fail(err); return undefined; } };
+  const drain = () => {
+    if (!backlogged || ended || failed || ws.destroyed) return null;
+    return new Promise((resolve) => {
+      const done = () => { ws.off('drain', done); ws.off('close', done); ws.off('error', done); backlogged = false; resolve(); };
+      ws.once('drain', done);
+      ws.once('close', done);
+      ws.once('error', done);
+    });
+  };
   return {
     write,
     // Stream a complete body buffer under a section header.
-    body(label, buf, contentType) {
+    body(label, buf, contentType) { guarded(() => this._body(label, buf, contentType)); },
+    _body(label, buf, contentType) {
       if (level === 'headers') return;
       if (!buf || !buf.length) { write(`\n\n=== ${label} ===\n(empty)`); return; }
       if (maxBodyBytes > 0) {
@@ -1032,9 +1082,15 @@ function openRequestLog(logDir, reqId, { level = DEFAULT_LOG_LEVEL, maxBodyBytes
     // A BodyWriter to append chunks incrementally (e.g. an SSE response), or
     // null when the level records no bodies — streamResponse takes either.
     bodyWriter(label, contentType) {
-      return level === 'headers' ? null : new BodyWriter(write, label, contentType || '', maxBodyBytes);
+      if (level === 'headers') return null;
+      const bw = new BodyWriter(write, label, contentType || '', maxBodyBytes);
+      return {
+        chunk: (buf) => guarded(() => bw.chunk(buf)),
+        end: () => guarded(() => bw.end()),
+        drain,
+      };
     },
-    end() { if (!ended) { ended = true; ws.end('\n'); } },
+    end() { if (!ended) { ended = true; if (!failed) ws.end('\n'); else ws.destroy(); } },
   };
 }
 
@@ -1291,7 +1347,11 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     if (safeHeaders['x-api-key']) safeHeaders['x-api-key'] = safeHeaders['x-api-key'].slice(0, 15) + '...';
     if (safeHeaders['authorization']) safeHeaders['authorization'] = safeHeaders['authorization'].slice(0, 20) + '...';
     l.write(`=== REQUEST (account: ${account.name}, retry: ${retryCount}) ===\n${method} ${upstreamUrl}\n${formatHeaders(safeHeaders)}`);
-    if (body.length > 0) l.body('REQUEST BODY', body, req.headers['content-type']);
+    // The body that went upstream, not the one the client sent: they differ
+    // exactly when the proxy rewrote it (tool-pair sanitising, account_uuid,
+    // modelMap), which is the first thing to check when upstream rejects it.
+    if (sendBody !== body) l.write(`\n(body rewritten by the proxy before sending: ${body.length} → ${sendBody.length} bytes; the upstream copy follows)`);
+    if (sendBody.length > 0) l.body('REQUEST BODY', sendBody, req.headers['content-type']);
   };
 
   try {
@@ -1645,6 +1705,11 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
 
       // Append to the log as it streams (no whole-body buffering)
       if (bodyWriter) bodyWriter.chunk(Buffer.from(value));
+      // ...and let the log's disk keep up: a write the file stream had to queue
+      // pauses the relay until it drains, so a slow disk bounds memory instead
+      // of the stream's buffer absorbing the body. Resolves on error/close too.
+      const logPending = bodyWriter?.drain?.();
+      if (logPending) await logPending;
 
       const text = decoder.decode(value, { stream: true });
 

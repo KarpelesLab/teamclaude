@@ -70,6 +70,15 @@ test('a connect failure that is not aggregated is described by its message', asy
   assert.equal(describeConnectError(err), err.message);
 });
 
+test('a wrapper around a single-address cause is described by the cause', () => {
+  // Global fetch wraps a plain (non-aggregated) connect error in
+  // TypeError('fetch failed'); the reason lives on `cause`.
+  const cause = new Error('connect ECONNREFUSED 127.0.0.1:1');
+  cause.code = 'ECONNREFUSED';
+  const err = new TypeError('fetch failed', { cause });
+  assert.equal(describeConnectError(err), 'connect ECONNREFUSED 127.0.0.1:1');
+});
+
 test('describeConnectError leaves nothing to print only when there is nothing', () => {
   assert.equal(describeConnectError(undefined), undefined);
   assert.equal(describeConnectError(new Error('boom')), 'boom');

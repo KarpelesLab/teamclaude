@@ -346,6 +346,11 @@ async function serverCommand() {
         if (config.switchThreshold != null) diskConfig.switchThreshold = config.switchThreshold;
         if (config.quotaProbeSeconds != null) diskConfig.quotaProbeSeconds = config.quotaProbeSeconds;
         if (config.warmupSeconds != null) diskConfig.warmupSeconds = config.warmupSeconds;
+        // The telemetry mode and the model blocklist are edited from the settings
+        // screen too; the server reads them live from `config`, but without this
+        // the edit never reached disk and was silently undone by the next start.
+        if (config.eventLogging != null) diskConfig.eventLogging = config.eventLogging;
+        if (config.blockedModels != null) diskConfig.blockedModels = config.blockedModels;
         // Persist the route table (edited from the TUI routes screen).
         if (config.routes != null) diskConfig.routes = config.routes;
       }),

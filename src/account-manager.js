@@ -88,6 +88,9 @@ function makeAccount(acct, index) {
     // (post-401) refreshes so a burst of stale in-flight requests can't rotate
     // the refresh-token family once per request — see ensureTokenFresh.
     _lastRefreshAt: null,
+    // The refresh token upstream last rejected as invalid, if it is still the
+    // one we hold — see the dead-token guard in ensureTokenFresh.
+    _deadRefreshToken: null,
   };
 }
 
@@ -1279,11 +1282,25 @@ export class AccountManager {
     // — observed live: 287 identical invalid_grant calls after two accounts' tokens
     // were invalidated (a `/login` elsewhere rotates the token and kills the copy
     // teamclaude holds). Paths that bypass availability checks keep calling this
-    // (warmup/probe pin an account by name via /tc-acct, skipping _isAvailable),
-    // so marking the account 'error' alone does not stop the retries. Keyed on the
-    // token VALUE, not the status: the moment a DIFFERENT refresh token arrives
-    // (re-login, config reload, updateAccountTokens) the guard lifts on its own.
-    if (account._deadRefreshToken && account._deadRefreshToken === account.refreshToken) return;
+    // (the quota prober refreshes every OAuth account regardless of status, and a
+    // pinned request reaches here without _isAvailable), so marking the account
+    // 'error' alone does not stop the retries. Keyed on the token VALUE, not the
+    // status: the moment a DIFFERENT refresh token arrives (re-login, config
+    // reload, updateAccountTokens) the guard lifts on its own.
+    //
+    // While it holds, the account must also READ as needing a re-login. A
+    // re-import can hand updateAccountTokens a new access token alongside the
+    // same dead refresh token; that path resets status to 'active', so without
+    // this the access token's 401 would force a refresh that silently does
+    // nothing here and the retry would relay the 401 to the client instead of
+    // rotating to another account.
+    if (account._deadRefreshToken && account._deadRefreshToken === account.refreshToken) {
+      if (account.status !== 'error') {
+        account.status = 'error';
+        console.error(`[TeamClaude] Account "${account.name}" still holds a rejected refresh token — run: teamclaude login`);
+      }
+      return;
+    }
 
     if (!force && !isTokenExpiringSoon(account.expiresAt)) return;
 

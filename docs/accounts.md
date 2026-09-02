@@ -36,6 +36,16 @@ invalid or the profile cannot be identified, the import stops without adding a
 placeholder account. Pass `--name <name>` to explicitly import without profile
 detection.
 
+## Delegating credentials to a file (`importFrom`)
+
+Instead of storing an OAuth account's tokens in `teamclaude.json`, an account entry can name the file to read them from:
+
+```json
+{ "name": "me@example.com", "type": "oauth", "importFrom": "~/.claude/.credentials.json" }
+```
+
+The tokens (`accessToken`, `refreshToken`, `expiresAt`) are read from that file at startup and again on every config reload, so a login refreshed by Claude Code itself is picked up without re-running `teamclaude import`. Every other field on the entry (`priority`, `disabled`, `upstream`, `modelMap`, …) is kept as written. A file with no token skips the account with a message rather than sending an empty credential upstream. `teamclaude import` is the alternative: it copies the tokens into the config once.
+
 ## API key
 
 For Anthropic API key accounts (billed via Console):
