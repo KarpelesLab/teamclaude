@@ -96,6 +96,7 @@ function makeAccount(acct, index) {
     orgName: acct.orgName || null,
     priority: acct.priority || 0,
     disabled: acct.disabled || false,
+    maxUsage: acct.maxUsage ?? null,
     upstream: acct.upstream || null,
     modelMap: acct.modelMap || null,
     models: acct.models || null,
@@ -271,6 +272,95 @@ export class AccountManager {
    * places that show one (status header, TUI settings row). */
   get effectiveThreshold() {
     return this.thresholdFor('default');
+  }
+
+  /**
+   * A per-account usage cap, or null when that bucket is uncapped.
+   *
+   * `switchThreshold` is a rotation preference: at that level the fleet PREFERS
+   * another account, but the all-exhausted probe path deliberately overrides it,
+   * because a threshold decision can rest on a stale reading and refusing
+   * forever is worse than one revalidating request. A budget is not that. An
+   * operator who says "this account stops at 60% of its weekly" wants zero
+   * requests past 60%, so `accounts[].maxUsage` is a separate, harder setting —
+   * see capExceeded.
+   *
+   * Same shapes as switchThreshold, per account:
+   *
+   *   "maxUsage": 0.6
+   *   "maxUsage": { "unified5h": 0.6, "unified7d": 0.6, "unified7dFable": 0.8 }
+   *
+   * Bucket keys are the quota field names (unified5h, unified7d, unified7dFable,
+   * unified7dSonnet, tokens, requests). A bare number caps every bucket; in the
+   * map form, a bucket that is neither listed nor covered by `default` is
+   * uncapped, so a cap is only ever what was asked for.
+   */
+  capFor(bucket, account) {
+    const m = account?.maxUsage;
+    if (typeof m === 'number' && Number.isFinite(m)) return m;
+    if (m && typeof m === 'object') {
+      const v = m[bucket] ?? m.default;
+      if (typeof v === 'number' && Number.isFinite(v)) return v;
+    }
+    return null;
+  }
+
+  /**
+   * The bucket that has reached this account's cap for `model`, or null.
+   *
+   * The shared buckets (unified5h, unified7d) cap every request; a family bucket
+   * caps only the family it meters, so a Fable cap stops Fable and leaves Opus
+   * alone. Both apply: a Fable request is capped by whichever binds first.
+   */
+  capExceeded(account, model = null) {
+    if (!account?.maxUsage) return null;
+    const q = account.quota;
+    // Same reason _isNearQuota does this first: a window that has already reset
+    // must not read as capped on a value that no longer applies.
+    this._clearExpiredQuotas(account);
+
+    const cap5h = this.capFor('unified5h', account);
+    if (cap5h != null && q.unified5h != null && q.unified5h >= cap5h) return 'unified5h';
+
+    // The shared weekly bucket caps every request, family requests included:
+    // family spend meters into BOTH its own bucket and the shared one (#175), so
+    // a budget written against the shared weekly is one that Fable can overrun
+    // if only the governing bucket is checked. This is not _isNearQuota's rule —
+    // a threshold gates on the governing bucket alone — but a threshold is a
+    // preference and a cap is a total.
+    const capWeekly = this.capFor('unified7d', account);
+    if (capWeekly != null && q.unified7d != null && q.unified7d >= capWeekly) return 'unified7d';
+
+    // …and on top of it, the family bucket that meters THIS model, when the
+    // family has one. A Fable cap stops Fable and leaves Opus alone.
+    const familyKey = this._weeklyBucketFor(model);
+    if (familyKey !== 'unified7d') {
+      const familyCap = this.capFor(familyKey, account);
+      const familyVal = q[familyKey];
+      if (familyCap != null && familyVal != null && familyVal >= familyCap) return familyKey;
+    }
+
+    const tokensCap = this.capFor('tokens', account);
+    if (tokensCap != null && q.tokensLimit != null && q.tokensRemaining != null
+      && 1 - q.tokensRemaining / q.tokensLimit >= tokensCap) return 'tokens';
+
+    const requestsCap = this.capFor('requests', account);
+    if (requestsCap != null && q.requestsLimit != null && q.requestsRemaining != null
+      && 1 - q.requestsRemaining / q.requestsLimit >= requestsCap) return 'requests';
+
+    return null;
+  }
+
+  /** The family weekly bucket that has reached its cap for `model`, or null.
+   * The advisor check needs this narrower form: the shared buckets were already
+   * decided for the executor model, and only the advisor's own family is new. */
+  _familyCapExceeded(account, model) {
+    if (!account?.maxUsage) return null;
+    const key = this._weeklyBucketFor(model);
+    if (key === 'unified7d') return null;
+    const cap = this.capFor(key, account);
+    const val = account.quota[key];
+    return cap != null && val != null && val >= cap ? key : null;
   }
 
   /** Start (or restart) the ramp window for an account that just became current,
@@ -720,6 +810,10 @@ export class AccountManager {
       // would just 429 again — so skip it (Fable/Sonnet) and let the caller emit
       // the synthetic 429 when no other account is available.
       if (model && this._modelWeeklyExhausted(account, model)) continue;
+      // A cap is the operator's own decision, not a reading that a live request
+      // might refresh, so the exhausted-fleet probe does not get to override it.
+      // Checked here rather than in _isProbeable because a cap is model-scoped.
+      if (this.capExceeded(account, model)) continue;
       // Same for routing/ownership: a probe for a routed or owned model must not
       // land on an ineligible account (it would just reject the unknown model id).
       if (model && !this._routeAllows(account, model)) continue;
@@ -765,6 +859,12 @@ export class AccountManager {
     // Manually disabled accounts are skipped entirely until re-enabled.
     if (account.disabled) return 'disabled';
 
+    // An operator budget cap. Checked here, above every transient state, because
+    // it is a decision rather than an estimate — and unlike the switch threshold
+    // nothing overrides it: _selectProbe skips a capped account too, so an
+    // account at its cap receives no requests at all.
+    if (this.capExceeded(account, model)) return 'capped';
+
     // A structured organization-policy 403 means this account cannot serve OAuth
     // requests right now. Skip it across requests until the short cooldown ends.
     if (this._entitlementDenied(account)) return false;
@@ -804,6 +904,7 @@ export class AccountManager {
     // already checked above for the executor) and any route/ownership rule for
     // it must allow this account.
     if (advisorModel) {
+      if (this._familyCapExceeded(account, advisorModel)) return 'advisor-capped';
       if (this._modelWeeklyExhausted(account, advisorModel)) return 'advisor-quota';
       if (!this._routeAllows(account, advisorModel)) return 'advisor-route';
     }
@@ -1911,6 +2012,7 @@ export class AccountManager {
         orgName: a.orgName || null,
         priority: a.priority || 0,
         disabled: a.disabled || false,
+        maxUsage: a.maxUsage ?? null,
         status: a.status,
         // Why the account is out of rotation right now (null = it can serve).
         // Distinguishes a local threshold decision from an upstream rejection —
