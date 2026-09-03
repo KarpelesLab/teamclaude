@@ -87,6 +87,18 @@ At the cap, that account receives **nothing**:
 
 Caps are model-scoped exactly like thresholds. `unified5h` and `unified7d` stop every model; `unified7dFable` stops only Fable, so the example above keeps serving Opus and Sonnet from the same account after Fable is done. The cap binds at the level you set (`>=`), and a window that has reset is never capped on the old reading.
 
+A cap shows on the status screen before it binds — marked on the bar it applies to, named in percent beside it, and reflected in the `Models` row:
+
+```
+  Session  [██░░░░░░░░░┃░░░░░░] 10% cap 60%
+  Weekly   [███████████┃░░░░░░] 62% cap 60%
+  Fable    [██░░░░░░░░░░░░┃░░░] 10% cap 80%
+  Models   Opus ✗   Fable ✗
+  Blocked  account usage cap reached (maxUsage)
+```
+
+The mark stays inside the bar rather than widening it, so capped and uncapped rows still line up. In the TUI the bar reddens at the cap instead of at the switch threshold.
+
 Edits apply live on config reload — no restart.
 
 ## Hold on exhaustion

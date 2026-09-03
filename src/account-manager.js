@@ -1,6 +1,6 @@
 import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired } from './oauth.js';
 import { sameIdentity } from './identity.js';
-import { weeklyBucketForModel, modelGlobMatches, modelFamily } from './model.js';
+import { weeklyBucketForModel, modelGlobMatches, modelFamily, resolveMaxUsage } from './model.js';
 import { SessionTracker } from './session-tracker.js';
 
 // Re-exported for callers that import these model helpers from here.
@@ -296,13 +296,7 @@ export class AccountManager {
    * uncapped, so a cap is only ever what was asked for.
    */
   capFor(bucket, account) {
-    const m = account?.maxUsage;
-    if (typeof m === 'number' && Number.isFinite(m)) return m;
-    if (m && typeof m === 'object') {
-      const v = m[bucket] ?? m.default;
-      if (typeof v === 'number' && Number.isFinite(v)) return v;
-    }
-    return null;
+    return resolveMaxUsage(account?.maxUsage, bucket);
   }
 
   /**

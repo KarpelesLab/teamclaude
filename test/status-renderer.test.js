@@ -221,3 +221,61 @@ test('renderStatus still lists accounts for a route the blocklist does not cover
   const output = renderStatus(status, { color: false, now });
   assert.match(output, /\*sonnet\*\s+→ a \(auto\)/);
 });
+
+// ── per-account usage caps (accounts[].maxUsage) ──────────────
+
+function cappedStatus(quota, maxUsage) {
+  return {
+    currentAccount: 'a',
+    switchThreshold: 0.98,
+    accounts: [{
+      name: 'a', type: 'oauth', priority: 0, status: 'active',
+      quota, maxUsage, usage: {},
+    }],
+  };
+}
+
+test('renderStatus marks the cap on the bar and names it', () => {
+  const out = renderStatus(cappedStatus({ unified5h: 0.1, unified7d: 0.1 },
+    { unified5h: 0.6, unified7d: 0.6 }), { color: false, now });
+  // The mark sits where the bar may not pass, and the number says which percent
+  // it is — one cell is ~6%, so the mark alone cannot tell 60% from 61%.
+  assert.match(out, /Session\s+\[██░░░░░░░░░┃░░░░░░\] 10% cap 60%/);
+});
+
+test('a capped bar is the same width as an uncapped one', () => {
+  const capped = renderStatus(cappedStatus({ unified7d: 0.1 }, { unified7d: 0.6 }), { color: false, now });
+  const plain = renderStatus(cappedStatus({ unified7d: 0.1 }, null), { color: false, now });
+  const width = out => out.match(/Weekly\s+\[([^\]]*)\]/)[1].length;
+  assert.equal(width(capped), width(plain));   // rows still line up
+  assert.doesNotMatch(plain, /cap /);          // and nothing is drawn without a cap
+});
+
+test('an uncapped bucket on a capped account is left alone', () => {
+  const out = renderStatus(cappedStatus({ unified5h: 0.1, unified7d: 0.1 },
+    { unified7d: 0.6 }), { color: false, now });
+  assert.match(out, /Session\s+\[██░░░░░░░░░░░░░░░░\] 10%$/m);
+  assert.match(out, /Weekly\s+.*cap 60%/);
+});
+
+test('a family over its cap reads ✗ while the others keep serving', () => {
+  const out = renderStatus(cappedStatus(
+    { unified5h: 0.1, unified7d: 0.1, unified7dFable: 0.85 },
+    { unified7d: 0.6, unified7dFable: 0.8 }), { color: false, now });
+  assert.match(out, /Models\s+Opus ✓\s+Fable ✗/);
+});
+
+// The shared weekly bucket meters family spend too, so a cap on it stops every
+// family — the Models line must not advertise one as available.
+test('a shared weekly cap marks every family unavailable', () => {
+  const out = renderStatus(cappedStatus(
+    { unified5h: 0.1, unified7d: 0.62, unified7dFable: 0.1 },
+    { unified7d: 0.6, unified7dFable: 0.8 }), { color: false, now });
+  assert.match(out, /Models\s+Opus ✗\s+Fable ✗/);
+});
+
+test('the blocked line names the cap as the reason', () => {
+  const status = cappedStatus({ unified7d: 0.7 }, { unified7d: 0.6 });
+  status.accounts[0].unavailable = 'capped';
+  assert.match(renderStatus(status, { color: false, now }), /Blocked\s+account usage cap reached \(maxUsage\)/);
+});

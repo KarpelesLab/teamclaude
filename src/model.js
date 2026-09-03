@@ -31,6 +31,20 @@ const FAMILY_WEEKLY_BUCKET = {
   sonnet: 'unified7dSonnet',
 };
 
+// A per-account usage cap (accounts[].maxUsage) for one quota bucket, or null
+// when that bucket is uncapped. Shapes mirror switchThreshold: a bare number
+// caps every bucket, a table caps the buckets it lists, and `default` covers the
+// rest. Lives here, beside the bucket keys, so the status renderer can draw a
+// cap without importing the account manager (it renders remote JSON too).
+export function resolveMaxUsage(maxUsage, bucket) {
+  if (typeof maxUsage === 'number' && Number.isFinite(maxUsage)) return maxUsage;
+  if (maxUsage && typeof maxUsage === 'object') {
+    const v = maxUsage[bucket] ?? maxUsage.default;
+    if (typeof v === 'number' && Number.isFinite(v)) return v;
+  }
+  return null;
+}
+
 // The weekly quota bucket key that governs a model, e.g. a Fable request is
 // gated by 'unified7dFable' rather than the shared 'unified7d'. Used by account
 // selection so a spent family bucket only bars that family's requests.
