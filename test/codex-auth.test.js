@@ -55,3 +55,50 @@ test('a file with no tokens yields no access token, so the account is skipped', 
   const creds = await importCodexCredentials('~/.codex/auth.json', { home });
   assert.equal(creds.accessToken, undefined);
 });
+
+// ── Browser login ───────────────────────────────────────────────────────────
+
+import { buildCodexAuthUrl, credentialsFromTokenResponse } from '../src/codex-auth.js';
+
+test('the authorize URL carries the parameters OpenAI requires', () => {
+  const url = new URL(buildCodexAuthUrl({ state: 'st', codeChallenge: 'cc' }));
+  assert.equal(url.origin + url.pathname, 'https://auth.openai.com/oauth/authorize');
+  assert.equal(url.searchParams.get('response_type'), 'code');
+  assert.equal(url.searchParams.get('client_id'), 'app_EMoamEEZ73f0CkXaXp7hrann');
+  // `api` here is rejected live with invalid_scope — this client may not
+  // request it, so the assertion pins the scope set that actually works.
+  assert.equal(url.searchParams.get('scope'), 'openid profile email offline_access');
+  assert.equal(url.searchParams.get('originator'), 'codex_cli_rs');
+  assert.equal(url.searchParams.get('codex_cli_simplified_flow'), 'true');
+  assert.equal(url.searchParams.get('state'), 'st');
+  assert.equal(url.searchParams.get('code_challenge'), 'cc');
+  // PKCE must be S256: a public client has no secret, so `plain` would leave
+  // the exchange bound to nothing.
+  assert.equal(url.searchParams.get('code_challenge_method'), 'S256');
+  // OpenAI registered exactly one redirect for this client.
+  assert.equal(url.searchParams.get('redirect_uri'), 'http://localhost:1455/auth/callback');
+});
+
+test('a token response becomes the same credential shape as an import', () => {
+  const creds = credentialsFromTokenResponse({
+    access_token: 'at',
+    refresh_token: 'rt',
+    expires_in: 600,
+    id_token: jwt({
+      email: 'user@example.com',
+      'https://api.openai.com/auth': { chatgpt_account_id: 'acct-1', chatgpt_plan_type: 'pro' },
+    }),
+  });
+  assert.equal(creds.accessToken, 'at');
+  assert.equal(creds.refreshToken, 'rt');
+  assert.equal(creds.accountId, 'acct-1');
+  assert.equal(creds.email, 'user@example.com');
+  assert.equal(creds.planType, 'pro');
+  assert.ok(creds.expiresAt > Date.now());
+});
+
+test('a token response with no id_token still yields usable credentials', () => {
+  const creds = credentialsFromTokenResponse({ access_token: 'at', refresh_token: 'rt' });
+  assert.equal(creds.accessToken, 'at');
+  assert.equal(creds.accountId, undefined);
+});

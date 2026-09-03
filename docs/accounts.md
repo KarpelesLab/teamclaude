@@ -89,15 +89,34 @@ Hand edits are fine. Leave the `id` alone and it keeps working; delete it and a 
 
 ## Codex accounts (experimental)
 
-An OpenAI Codex subscription can be pooled alongside your Claude accounts. Add
-an account with `"provider": "codex"` and TeamClaude reads the login the Codex
-CLI already stores in `~/.codex/auth.json`:
+An OpenAI Codex subscription can be pooled alongside your Claude accounts.
+
+```bash
+teamclaude login --codex     # browser sign-in, repeat per account
+```
+
+Add `--no-browser` to print the URL instead of opening one, and `--name` to
+label the account yourself (it defaults to the email on the login).
+
+To pool a login you already have, or to add one without a browser, point an
+account at the Codex CLI's own credentials file instead — it defaults to
+`~/.codex/auth.json`:
 
 ```json
 { "name": "me@example.com", "type": "oauth", "provider": "codex" }
 ```
 
-Point another `importFrom` at a different file to pool several Codex logins.
+The Codex CLI honours `CODEX_HOME`, so several logins can be kept side by side
+and pooled with `importFrom`:
+
+```bash
+CODEX_HOME=~/.codex-second codex login
+```
+
+```json
+{ "name": "second", "type": "oauth", "provider": "codex",
+  "importFrom": "~/.codex-second/auth.json" }
+```
 
 Then tell Codex to reach TeamClaude instead of OpenAI, in `~/.codex/config.toml`:
 
@@ -139,13 +158,22 @@ and one TUI.
   translation layer: TeamClaude never converts between the Anthropic and OpenAI
   protocols.
 
-### Current limits
+### Quota
 
-Codex accounts rotate on upstream rejection, the same way a third-party backend
-does. The quota-driven parts of rotation — the switch threshold, reset
-countdowns and the TUI's quota bars — are Anthropic-only for now, because they
-read `anthropic-ratelimit-unified-*` response headers. Codex reports its own
-`primary`/`secondary` windows, so wiring those in is a natural follow-up.
+Codex reports its limits on every response, and TeamClaude normalises them into
+the same fields the Anthropic path fills — so the switch threshold, reset
+countdowns and the TUI's quota bars work for Codex accounts too, and rotation
+happens *before* upstream refuses rather than after a 429.
+
+Two details are worth knowing if you read the raw headers:
+
+- Limits arrive in families. The unnamed one is the account-wide limit; a family
+  carrying `-limit-name` is model-scoped, the counterpart of Anthropic's Fable
+  weekly bucket.
+- `primary` and `secondary` are positions, not durations — the account-wide
+  family can put its 7-day window in `primary` while a model-scoped family puts
+  a 5-hour window there. Windows are classified by their stated
+  `window-minutes`, never by position.
 
 ## Third-party backend accounts
 

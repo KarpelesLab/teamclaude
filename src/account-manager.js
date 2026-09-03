@@ -1,6 +1,7 @@
 import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired } from './oauth.js';
 import { providerOf, DEFAULT_PROVIDER } from './provider.js';
 import { refreshCodexToken } from './codex-auth.js';
+import { parseCodexQuota, parseCodexPlanType } from './codex-quota.js';
 import { sameIdentity } from './identity.js';
 import { weeklyBucketForModel, modelGlobMatches, modelFamily } from './model.js';
 import { SessionTracker } from './session-tracker.js';
@@ -1499,9 +1500,65 @@ export class AccountManager {
   /**
    * Update an account's quota tracking from upstream response headers.
    */
+  /**
+   * Apply a Codex response's rate-limit headers.
+   *
+   * Only fields the response actually stated are assigned: a reading that a
+   * given response did not carry must not blank what we already knew, and the
+   * catalog fetch carries none at all.
+   */
+  _updateCodexQuota(account, headers) {
+    const parsed = parseCodexQuota(headers);
+    const plan = parseCodexPlanType(headers);
+    if (plan) account.quota.planType = plan;
+
+    if (parsed.unified5h != null) account.quota.unified5h = parsed.unified5h;
+    if (parsed.unified7d != null) account.quota.unified7d = parsed.unified7d;
+    if (parsed.unified5hReset != null) account.quota.unified5hReset = parsed.unified5hReset;
+    if (parsed.unified7dReset != null) account.quota.unified7dReset = parsed.unified7dReset;
+
+    // A model-scoped weekly bucket is the counterpart of Anthropic's `7d_oi`
+    // Fable bucket: it rides only on responses for that model, so stamp when
+    // the reading was taken. That timestamp is what lets a spent bucket be
+    // revalidated instead of sealing the account out of the family forever.
+    for (const bucket of parsed.modelBuckets || []) {
+      (account.quota.codexModelBuckets ??= {})[bucket.slug] = {
+        name: bucket.name,
+        utilization: bucket.utilization,
+        resetAt: bucket.resetAt,
+        seenAt: Date.now(),
+      };
+    }
+
+    // Same handshake as the Anthropic path: the first response that reveals a
+    // weekly limit ends probing and asks selection to re-evaluate.
+    if (account.probing && account.quota.unified7dReset != null) {
+      account.probing = false;
+      account.requalify = true;
+      console.log(`[TeamClaude] Learned weekly quota for "${account.name}", re-evaluating selection`);
+    }
+
+    account.usage.totalRequests++;
+    account.usage.lastUsed = new Date().toISOString();
+
+    if (this._isNearQuota(account)) {
+      const pct = account.quota.unified7d != null ? Math.round(account.quota.unified7d * 100) : null;
+      console.log(`[TeamClaude] "${account.name}" near weekly quota${pct == null ? '' : ` (${pct}%)`}`);
+    }
+  }
+
   updateQuota(accountIndex, headers) {
     const account = this.accounts[accountIndex];
     if (!account) return;
+
+    // Codex reports the same information under its own header names, so it is
+    // normalised into the very fields the Anthropic path fills. Everything
+    // downstream — the switch threshold, reset countdowns, the TUI bars — then
+    // works unchanged rather than needing a parallel Codex-shaped path.
+    if (providerOf(account) === 'codex') {
+      this._updateCodexQuota(account, headers);
+      return;
+    }
 
     // Unified rate limits (Claude Max)
     const u5h = parseFloat(headers['anthropic-ratelimit-unified-5h-utilization']);

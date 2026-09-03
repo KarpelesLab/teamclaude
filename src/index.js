@@ -19,6 +19,7 @@ import {
   oauthIdentityFields,
 } from './identity.js';
 import { resolveAccounts } from './resolve-accounts.js';
+import { loginCodex } from './codex-auth.js';
 import { syncAccountsFromDisk } from './sync-accounts.js';
 import { mergeAccountsForSave, syncRefreshedTokens } from './account-pairing.js';
 import { ensureAccountIds } from './account-id.js';
@@ -620,6 +621,64 @@ async function importCommand() {
 
 // ── login ───────────────────────────────────────────────────
 
+/**
+ * `teamclaude login --codex` — browser OAuth against OpenAI, then store the
+ * account.
+ *
+ * Deliberately simpler than the Anthropic path: that one calls the profile
+ * endpoint to discover identity, whereas a Codex id_token already carries the
+ * email and the ChatGPT account id, so there is nothing further to fetch.
+ */
+async function loginCodexCommand() {
+  // loadOrCreateConfig, not loadConfig: `login` is a first-run entry point and
+  // must work before any config file exists.
+  const config = await loadOrCreateConfig();
+  let creds;
+  try {
+    creds = await loginCodex({ noBrowser: args.includes('--no-browser') });
+  } catch (err) {
+    console.error(`Codex login failed: ${err.message}`);
+    console.error('');
+    console.error('Alternative: sign in with the Codex CLI and import that login instead —');
+    console.error('  CODEX_HOME=~/.codex-second codex login');
+    console.error('  then add: { "name": "...", "type": "oauth", "provider": "codex", "importFrom": "~/.codex-second/auth.json" }');
+    process.exit(1);
+  }
+
+  const name = argValue('--name') || creds.email
+    || `codex-${config.accounts.filter(a => a.provider === 'codex').length + 1}`;
+
+  const account = {
+    name,
+    type: 'oauth',
+    provider: 'codex',
+    source: 'login',
+    accountId: creds.accountId,
+    accessToken: creds.accessToken,
+    refreshToken: creds.refreshToken,
+    expiresAt: creds.expiresAt,
+  };
+
+  // Identity for a Codex account is its ChatGPT account id; fall back to the
+  // display name when upstream did not supply one.
+  const idx = config.accounts.findIndex(a => (
+    a.provider === 'codex' && (
+      (account.accountId && a.accountId === account.accountId) || a.name === account.name
+    )
+  ));
+  if (idx >= 0) {
+    const prev = config.accounts[idx];
+    config.accounts[idx] = { ...prev, ...account, name: prev.name };
+    console.log(`Updated account "${prev.name}"`);
+  } else {
+    config.accounts.push(account);
+    console.log(`Added account "${account.name}"${creds.planType ? ` (${creds.planType})` : ''}`);
+  }
+
+  await saveConfig(config);
+  console.log(`Saved to ${getConfigPath()}`);
+}
+
 async function loginCommand() {
   if (args.includes('--api')) {
     await loginApiCommand();
@@ -631,6 +690,10 @@ async function loginCommand() {
   }
   if (args.includes('--oauth')) {
     await loginOAuthCommand();
+    return;
+  }
+  if (args.includes('--codex')) {
+    await loginCodexCommand();
     return;
   }
 
@@ -645,11 +708,13 @@ async function loginCommand() {
   console.log('Select login method:\n');
   console.log('  1. Claude subscription  (Pro, Max, Team, Enterprise)');
   console.log('  2. Anthropic API key    (Console API billing)');
+  console.log('  3. Codex subscription   (ChatGPT Plus, Pro, Team)');
   console.log('');
   const choice = await new Promise(resolve => rl.question('Choice [1]: ', resolve));
   rl.close();
 
   switch (choice.trim() || '1') {
+    case '3': await loginCodexCommand(); break;
     case '1': await loginOAuthCommand(); break;
     case '2': await loginApiCommand(); break;
     default:
