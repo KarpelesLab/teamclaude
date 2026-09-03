@@ -110,7 +110,7 @@ export function hostMode(host, config) {
  * the top of this file.
  * @param ensureLeaf async () => { key, cert }   // current leaf PEMs
  */
-export function createConnectHandler({ config, accountManager, ensureLeaf, logDir = null, hooks = {}, log = () => {}, sx = null, egress = null, clientUsage = null }) {
+export function createConnectHandler({ config, accountManager, ensureLeaf, logDir = null, hooks = {}, log = () => {}, sx = null, egress = null, clientUsage = null, dimensionUsage = null }) {
   const upstream = config.upstream || 'https://api.anthropic.com';
   const holdMs = (config.holdSeconds || 0) * 1000;
 
@@ -138,7 +138,7 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
     p = (async () => {
     const { key, cert } = await ensureLeaf();
     const srv = http2.createSecureServer({ key, cert, allowHTTP1: true });
-    srv.on('request', createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, forcedPin: pin || null, egress, clientUsage, forcedClient: client }));
+    srv.on('request', createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, forcedPin: pin || null, egress, clientUsage, forcedClient: client, dimensionUsage }));
     // Remote Control's real-time channel is a WebSocket (Upgrade handshake),
     // which never fires 'request' — only 'upgrade', with a raw socket instead
     // of a response object (h1-only; falls back to blind h2 passthrough is not

@@ -557,8 +557,8 @@ export class AccountManager {
   /** Mark a session request as in flight / finished. Paired around the whole
    * client request (including retries) so a long streaming completion keeps the
    * session counted as active for its full duration. */
-  beginSession(sessionId) {
-    if (sessionId) this.sessionTracker.beginRequest(sessionId);
+  beginSession(sessionId, metadata = null) {
+    if (sessionId) this.sessionTracker.beginRequest(sessionId, undefined, metadata);
   }
 
   endSession(sessionId) {
@@ -1894,8 +1894,12 @@ export class AccountManager {
   /**
    * Return a status summary of all accounts (safe to expose, no credentials).
    */
-  getStatus() {
-    const sessions = this.sessionTracker.stats();
+  // `sessionDetail` adds the per-session `sessions.items` array. Off unless the
+  // operator turns on proxy.sessionDetail: the rows name every session id,
+  // client and dimension value to anyone who can read status, and on a shared
+  // proxy that is every key holder.
+  getStatus({ sessionDetail = false } = {}) {
+    const sessions = this.sessionTracker.stats(undefined, { detail: sessionDetail });
     return {
       currentAccount: this.accounts[this.currentIndex]?.name,
       switchThreshold: this.effectiveThreshold,

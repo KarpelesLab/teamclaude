@@ -54,17 +54,37 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
   const clients = Object.entries(status.clients || {});
   if (clients.length) {
     lines.push(paint.bold('Clients'));
-    clients.sort(([, a], [, b]) => ((b.inputTokens || 0) + (b.outputTokens || 0)) - ((a.inputTokens || 0) + (a.outputTokens || 0)));
-    for (const [name, c] of clients) {
-      const tokens = `${formatNumber(c.inputTokens)} in / ${formatNumber(c.outputTokens)} out`;
-      const last = parseTs(c.lastUsed);
-      const lastText = last ? `, last ${formatAgo(last, now)}` : '';
-      lines.push(`  ${paint.cyan(safeLine(name).padEnd(20))} ${c.requests || 0} req, ${tokens}${lastText}`);
-    }
+    renderUsageEntries(lines, clients, paint, now);
+    lines.push('');
+  }
+
+  // One section per configured usage dimension (proxy.usageDimensions). The
+  // dimension list is operator config and each tracker is key-capped, so the
+  // size of this output is bounded by the config file, not by caller traffic.
+  for (const [dimension, entries] of Object.entries(status.usageDimensions || {})) {
+    const rows = Object.entries(entries || {});
+    if (!rows.length) continue;
+    lines.push(paint.bold(usageDimensionTitle(dimension)));
+    renderUsageEntries(lines, rows, paint, now);
     lines.push('');
   }
 
   return lines.join('\n').trimEnd();
+}
+
+function renderUsageEntries(lines, entries, paint, now) {
+  entries.sort(([, a], [, b]) => ((b.inputTokens || 0) + (b.outputTokens || 0)) - ((a.inputTokens || 0) + (a.outputTokens || 0)));
+  for (const [name, c] of entries) {
+    const tokens = `${formatNumber(c.inputTokens)} in / ${formatNumber(c.outputTokens)} out`;
+    const last = parseTs(c.lastUsed);
+    const lastText = last ? `, last ${formatAgo(last, now)}` : '';
+    lines.push(`  ${paint.cyan(safeLine(name).padEnd(20))} ${c.requests || 0} req, ${tokens}${lastText}`);
+  }
+}
+
+function usageDimensionTitle(name) {
+  const safe = safeLine(name);
+  return `${safe.charAt(0).toUpperCase()}${safe.slice(1)} usage`;
 }
 
 // Why an account is out of rotation, in the operator's terms. Reading

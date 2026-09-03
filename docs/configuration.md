@@ -41,6 +41,8 @@ Volatile runtime state (observed quota) is written separately to `teamclaude.sta
 | `proxy.host` | Interface to bind. Defaults to `127.0.0.1` (localhost only). Set to `0.0.0.0` (or override with env `TEAMCLAUDE_HOST`) to accept off-box clients — in which case **set `proxy.apiKey`**, since remote clients must present it (via `x-api-key`, or `Proxy-Authorization` for CONNECT/HTTPS-proxy usage); loopback is always exempt |
 | `proxy.apiKey` | API key clients use to authenticate with the proxy (required for any non-loopback client; the proxy injects real account tokens, so an unauthenticated open port would leak them) |
 | `proxy.clientKeys` | Optional per-client keys: `[{ "name": "alice", "key": "tc-…" }, …]`. Each entry authenticates exactly like `proxy.apiKey`, and the tokens its responses report are booked against `name` — per-client usage shows up under `clients` in `/teamclaude/status`, in `teamclaude status`, and (with `--activity-log`) as a `[name]` prefix on each request line. Counters persist in the state file. Traffic on the shared `proxy.apiKey` or the loopback exemption stays unattributed, so give every consumer their own entry when you want complete stats. Edits apply live via `POST /teamclaude/reload` |
+| `proxy.usageDimensions` | Optional request-header usage dimensions: `[{ "name": "project", "header": "x-teamclaude-project" }, …]`. For each request the proxy reads the configured headers and books the response tokens against their sanitized values, shown under `usageDimensions` in `/teamclaude/status`, `teamclaude status`, and the dashboard. A request that omits a header is simply unattributed for that dimension. Counters persist in the state file, and each dimension is capped at 500 distinct values — further values are summed into `(other)` rather than evicting existing rows. Edits apply live via `POST /teamclaude/reload` |
+| `proxy.sessionDetail` | Adds a per-session breakdown (`sessions.items`) to `/teamclaude/status` and the dashboard: one row per session with its id, client, dimension values, pinned accounts, and the tokens it spent per weekly bucket. **Off by default** — any holder of any proxy key can read status, so on a shared proxy this shows every consumer what every other consumer is working on. The aggregate `sessions` counts are unaffected and always present |
 | `upstream` | Upstream API base URL |
 | `switchThreshold` | Quota utilization (0–1) at which to switch accounts (TUI settings screen: **Switch threshold**). The screen accepts tenths of a percent, e.g. `99.5`, which is stored as `0.995`. Reported OAuth utilization arrives on a whole-percent grid, so a fraction only changes the outcome for an API-key account, whose used share is continuous |
 | `quotaProbeSeconds` | Background [quota-probe](quota.md#quota-probe) interval in seconds (`0` = off, the default; CLI `probe`, or the **Quota probe** row on the TUI settings screen) |
@@ -83,6 +85,49 @@ Volatile runtime state (observed quota) is written separately to `teamclaude.sta
 ```bash
 TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 ```
+
+## Usage Dimensions
+
+Usage dimensions answer which project, branch, pull request, or CI job spent the tokens, without a TeamClaude change for every new grouping. `proxy.clientKeys` names WHO spent them; a dimension names what they were spent ON, which one shared CI key cannot express on its own.
+
+Configure the dimensions once on the proxy:
+
+```json
+{
+  "proxy": {
+    "usageDimensions": [
+      { "name": "project", "header": "x-teamclaude-project" },
+      { "name": "ref", "header": "x-teamclaude-ref" }
+    ]
+  }
+}
+```
+
+Developers set a project identity per repository in `.claude/settings.json`:
+
+```json
+{
+  "env": {
+    "ANTHROPIC_CUSTOM_HEADERS": "X-Teamclaude-Project: KarpelesLab/teamclaude"
+  }
+}
+```
+
+CI can set several dimensions with newline-separated custom headers:
+
+```bash
+export ANTHROPIC_CUSTOM_HEADERS=$'X-Teamclaude-Project: KarpelesLab/teamclaude\nX-Teamclaude-Ref: pull/123'
+```
+
+Use stable, low-cardinality values such as `org/repo`, `pull/123`, or a branch name — a dimension is capped at 500 distinct values, and everything past the cap is summed into an `(other)` row. Header values are client-supplied: they are sanitized on ingest and length-capped before they reach any status output.
+
+A configured dimension header is **consumed by the proxy and not forwarded upstream** — it labels traffic for this proxy, so your internal project and branch names stay on your own infrastructure. It is still not a place for secrets: the values are persisted to the state file and readable by any proxy-key holder.
+
+Header names the proxy refuses to use as a dimension, because it or the client already relies on them: `authorization`, `proxy-authorization`, `cookie`, `x-api-key`, `x-app`, `x-claude-code-session-id`, `x-claude-code-agent-id`, `x-claude-code-parent-agent-id`, `x-anthropic-additional-protection`.
+
+### Per-session cost
+
+Per-session token cost is **not** a usage dimension. The session tracker already meters what each session's responses reported — cache reads and cache creation included — per weekly bucket, and that is the number that matters: a sum of `input_tokens` and `output_tokens` understates a cached Claude Code session by orders of magnitude. Set `proxy.sessionDetail` to surface it per session.
 
 ## Network resilience
 

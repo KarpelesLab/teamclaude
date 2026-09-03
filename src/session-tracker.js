@@ -107,11 +107,18 @@ export class SessionTracker {
   // flight counts as active (and non-expirable) for the whole request, however
   // long it streams — a 5-minute completion must not drop out of "active" or the
   // load balancer would under-count that account. Paired with endRequest.
-  beginRequest(sessionId, now = this._now()) {
+  //
+  // `metadata` (`{ client, dimensions }`) labels the session with who asked and
+  // under which usage dimensions, for the per-session readout. It is attached
+  // here rather than in touch() or recordSession() because this is the one call
+  // that runs once per CLIENT request, with the request headers still in scope;
+  // the other two run per forward attempt and per route decision.
+  beginRequest(sessionId, now = this._now(), metadata = null) {
     if (!sessionId) return null;
     const s = this._ensure(sessionId, now);
     s.inFlight += 1;
     s.lastSeen = now;
+    applyMetadata(s, metadata);
     return s;
   }
 
@@ -211,6 +218,9 @@ export class SessionTracker {
         // The same key space as `pins`, so a family's spend and the account it
         // is pinned to are looked up by one bucket key.
         tokens: new Map(),
+        // Labels from the request that opened the session (see beginRequest).
+        client: null,
+        dimensions: null,
       };
       this.sessions.set(sessionId, s);
     }
@@ -345,13 +355,18 @@ export class SessionTracker {
   // fleet has spent, and what it is carrying now. `byBucket` is the same pair
   // per weekly family, which is the only view in which a fleet spending its Opus
   // and its Fable windows at different rates is visible at all.
-  stats(now = this._now()) {
+  //
+  // `items` is the same walk, per session instead of summed — off unless the
+  // operator asks for it (see `stats({ detail: true })`), because it names every
+  // session id, client and project value to whoever reads status.
+  stats(now = this._now(), { detail = false } = {}) {
     this._lastSweep = now;
     let known = 0;
     let active = 0;
     const perAccount = {};
     const tokens = emptyAggregate();
     const byBucket = {};
+    const items = detail ? [] : null;
     let activeContext = 0;
     for (const [id, s] of this.sessions) {
       if (this._isExpired(s, now)) {
@@ -359,6 +374,7 @@ export class SessionTracker {
         continue;
       }
       known += 1;
+      if (items) items.push(sessionItem(id, s, this._isActive(s, now)));
       for (const [bucket, t] of s.tokens) {
         const per = byBucket[bucket] || (byBucket[bucket] = emptyAggregate());
         for (const k of COUNTERS) {
@@ -384,6 +400,43 @@ export class SessionTracker {
     }
     tokens.activeContext = activeContext;
     tokens.byBucket = byBucket;
-    return { known, active, perAccount, tokens };
+    // Newest first: a per-session table is read top-down for what is happening
+    // now, and the list is capped by the same TTLs as the map behind it.
+    if (items) items.sort((a, b) => b.lastSeen - a.lastSeen);
+    return items ? { known, active, perAccount, tokens, items } : { known, active, perAccount, tokens };
+  }
+}
+
+// One row of the per-session readout. `pins` replaces what used to be a single
+// accountIndex: a session holds one pin per weekly bucket, so a session
+// spending two families is served by two accounts at once and naming only one
+// of them would be wrong rather than merely incomplete.
+function sessionItem(id, s, active) {
+  return {
+    id,
+    active,
+    inFlight: s.inFlight,
+    requests: s.count,
+    firstSeen: s.firstSeen,
+    lastSeen: s.lastSeen,
+    client: s.client,
+    dimensions: s.dimensions ? { ...s.dimensions } : null,
+    pins: Object.fromEntries([...s.pins].map(([bucket, p]) => [bucket, p.idx])),
+    // #192's numbers, per weekly bucket: what the responses actually reported,
+    // cache included. An input+output sum understates a cached session by
+    // orders of magnitude, which is why this is not counted from request headers.
+    tokens: Object.fromEntries([...s.tokens].map(([bucket, t]) => [bucket, { ...t }])),
+  };
+}
+
+// Labels are last-write-wins: a session is one client's, and a caller that
+// changes the project mid-session means the new one. Absent fields leave the
+// existing label alone, so a request without the header does not erase it.
+function applyMetadata(s, metadata) {
+  if (!metadata || typeof metadata !== 'object') return;
+  if (typeof metadata.client === 'string' && metadata.client) s.client = metadata.client;
+  const dims = metadata.dimensions;
+  if (dims && typeof dims === 'object' && Object.keys(dims).length) {
+    s.dimensions = { ...(s.dimensions || {}), ...dims };
   }
 }
