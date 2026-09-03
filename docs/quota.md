@@ -75,6 +75,31 @@ teamclaude threshold unified7d=default  # drop it again
 
 A running server picks the change up on the reload the command sends it. This is the only way to edit a per-bucket table in place: the TUI shows it read-only, and the single-number form there would flatten it.
 
+## Per-account usage caps
+
+`switchThreshold` is fleet-wide, and it is a *preference*: at that level rotation prefers another account, but when every account is over it the proxy still sends one revalidating request, because a threshold decision can rest on a stale reading and refusing forever is worse. That makes it the wrong tool for "this account may spend only part of its quota".
+
+`accounts[].maxUsage` is that tool. Same shapes, per account:
+
+```json
+{
+  "name": "spare@example.com",
+  "maxUsage": { "unified5h": 0.6, "unified7d": 0.6, "unified7dFable": 0.8 }
+}
+```
+
+A bare number caps every bucket. Keys are the same quota field names as `switchThreshold`, and `default` covers the ones a table does not list — but a bucket that is neither listed nor covered by `default` is **uncapped**, so a cap is only ever what you asked for.
+
+At the cap, that account receives **nothing**:
+
+- rotation skips it, reporting `capped` (or `advisor-capped`) in `teamclaude status`;
+- the all-exhausted revalidation probe skips it, unlike a `switchThreshold` decision;
+- a pinned request (`TC_ACCT`, `/tc-acct/<name>`) gets the exhausted answer rather than spending past the cap. A pin still never leaks to another account.
+
+Caps are model-scoped exactly like thresholds. `unified5h` and `unified7d` stop every model; `unified7dFable` stops only Fable, so the example above keeps serving Opus and Sonnet from the same account after Fable is done. The cap binds at the level you set (`>=`), and a window that has reset is never capped on the old reading.
+
+Edits apply live on config reload — no restart.
+
 ## Hold on exhaustion
 
 By default, when all accounts are exhausted TeamClaude returns a `429` immediately, which causes Claude Code to abort the current task. With `holdSeconds` set, the proxy **holds the HTTP connection open** instead and polls silently every ~60 seconds; the instant any account's quota resets, the request is forwarded and Claude Code resumes — the interruption never happens.

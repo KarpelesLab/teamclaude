@@ -67,6 +67,10 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     if (diskAcct.orgName && !mgr.orgName) mgr.orgName = diskAcct.orgName;
     if (diskAcct.name && mgr.name !== diskAcct.name) mgr.name = diskAcct.name;
     if (diskAcct.priority != null && mgr.priority !== diskAcct.priority) mgr.priority = diskAcct.priority;
+    // A cap edit applies live for the same reason priority does: it is an
+    // operator decision about a running fleet, and waiting for a restart to
+    // honour a budget defeats the budget.
+    mgr.maxUsage = diskAcct.maxUsage ?? null;
     // Third-party-backend bindings are read per request off this object
     // (`account.upstream || upstream`, `account.modelMap` in server.js), so a
     // disk edit must land here to take effect on reload. `|| null` mirrors the
@@ -84,6 +88,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     if (cfgAcct) {
       if (diskAcct.upstream) cfgAcct.upstream = diskAcct.upstream; else delete cfgAcct.upstream;
       if (diskAcct.modelMap) cfgAcct.modelMap = diskAcct.modelMap; else delete cfgAcct.modelMap;
+      if (diskAcct.maxUsage != null) cfgAcct.maxUsage = diskAcct.maxUsage; else delete cfgAcct.maxUsage;
     }
     // Pick up enable/disable toggles; re-enabling clears a stuck error state.
     const wantDisabled = !!diskAcct.disabled;

@@ -1321,8 +1321,15 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // A pinned request (via /tc-acct/<name>) forces one exact account and never
   // rotates or fails over: once that account has been tried, `account` is null
   // and the caller gets the exhausted response rather than leaking to another.
+  // A cap outranks the pin. Rotation checks it through unavailableReason, but a
+  // pinned request never reaches that walk, and a budget a pin can spend past is
+  // not a budget. The request gets the exhausted response, exactly as it would
+  // for an already-tried pin — it still never leaks to another account.
+  const pinned = ctx.pinnedIndex != null && !ctx.tried.has(ctx.pinnedIndex)
+    ? accountManager.accounts[ctx.pinnedIndex]
+    : null;
   const account = ctx.pinnedIndex != null
-    ? (ctx.tried.has(ctx.pinnedIndex) ? null : accountManager.accounts[ctx.pinnedIndex])
+    ? (pinned && !accountManager.capExceeded(pinned, ctx.model) ? pinned : null)
     : accountManager.getActiveAccount(ctx.tried, ctx.model, ctx.advisorModel, ctx.sessionId, ctx.provider);
   if (!account) {
     // Every candidate was refused by upstream (403). Waiting will not help — the
