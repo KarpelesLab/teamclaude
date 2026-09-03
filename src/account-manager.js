@@ -1562,7 +1562,22 @@ export class AccountManager {
   /** Record the rollover `origin` owes this request on `window`, priced at the
    *  reading that fired it. The earliest debt on a window is the one kept: a
    *  chain returning to an account it was pushed off is owed what pushed it,
-   *  not what the window has become since. */
+   *  not what the window has become since.
+   *
+   *  ACCUMULATING IS NOT SEPARATELY GATED, and the reason is worth stating
+   *  rather than leaving for someone to rediscover. Every preemption is off the
+   *  account the traffic is on, so a debt after the FIRST is always on an
+   *  account this request was sent to — which already holds an arrival reading
+   *  of the same window at the same value. That looks like redundancy — collapse
+   *  this back to one debt and the chain still answers,
+   *  through the arrival instead. The two differ only for the first origin,
+   *  which has no arrival because the request began there, and that difference
+   *  IS gated.
+   *
+   *  It stays because that argument is an enumeration of today's two selection
+   *  paths rather than a proof — a third way of being pushed off an account the
+   *  request never arrived at would be owed something nothing else holds, and
+   *  the cost of keeping this is one map entry per account in a chain. */
   _noteOwed(carried, origin, window, reading) {
     if (!carried) return;
     const seen = reading?.get(window);
@@ -1658,6 +1673,14 @@ export class AccountManager {
     const win = this._governingWindow(account, model);
     if (held?.owed) {
       for (const [window, reset] of held.windows) ref.windows.set(window, reset);
+      // Returning here is not what stops the debt advancing — the guard below
+      // does that, since a reading recorded because it had jumped is still
+      // jumped when the request comes back, and a window's reset does not move
+      // backwards. What this does suppress is advancing a governing window the
+      // debt is NOT about, which can only happen if the account stops reporting
+      // the owed window while the request is in flight and the governing read
+      // falls back to another. Nothing here reaches that, so no arm gates this
+      // line.
       return;
     }
     if (held) {

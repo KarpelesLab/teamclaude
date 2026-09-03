@@ -447,13 +447,62 @@ test('the exhausted-fleet probe prices the account it makes current', async () =
   }
 });
 
-// NOT GATED, AND SAID SO RATHER THAN IMPLIED: the arrival reading a request
-// holds for the account it was SENT to has no arm that reds when it is removed.
-// The construction it needs — shared state stops describing the destination,
-// the destination rolls, and the retry still chooses it — does not discriminate:
-// by the time the retry re-selects, the establish on a different account plus
-// the never-advance guard already produce the same answer, so deleting the
-// arrival restore changes nothing observable.
+test('a retry reads a destination it was never pushed off from what it read on arrival', async () => {
+  // THE ARRIVAL READING ON ITS OWN, with no debt covering the same account.
+  //
+  // Every other arm here works on an account the request was both sent to AND
+  // pushed off, where the reading it arrived with and the reading it is owed are
+  // the same number — so either one alone answers and neither can be shown to
+  // matter. This is the case where only the arrival exists: b is a destination
+  // that rolls under the request without ever being an origin.
+  //
+  // The shared reference is moved off b by an operator switch while the request
+  // hangs there, so nothing shared remembers what b read; c is taken out of
+  // service so the retry has to come back to b; and c returns afterwards so the
+  // re-rank has somewhere better to go than b, which is what makes the answer
+  // visible in the routing rather than only in the log.
+  const reached = deferred();
+  const held = deferred();
+  let throttled = 0;
+  let am;
+
+  const handle = await fleet(['a', 'b', 'c'], async (name, res) => {
+    if (name === 'b' && throttled === 0) {
+      throttled++;
+      reached.resolve();
+      await held.promise;
+      res.writeHead(429, { 'retry-after': '1', 'content-type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error' } }));
+      return;
+    }
+    return serves(res, name);
+  }, { hours: [10, 20, 30] });
+  ({ am } = handle);
+  const { send, close } = handle;
+
+  try {
+    assert.equal(await send(), 'a', 'the fixture must start on a');
+    am.accounts[0].quota.unified7dReset = Date.now() + 500 * H;
+
+    const first = send().catch(() => null);
+    await reached.promise;
+
+    assert.equal(am.setCurrentAccount(2), true);       // shared state stops describing b
+    am.accounts[1].quota.unified7dReset = Date.now() + 400 * H;   // b rolls under the request
+    am.accounts[2].quota.unified7d = 0.99;             // and c cannot take the retry
+
+    held.resolve();
+    assert.equal(await first, 'b', 'the retry should have come back to b');
+
+    // c returns, so the re-rank has a better account than b to move to.
+    am.accounts[2].quota.unified7d = 0.4;
+    assert.notEqual(await send(), 'b',
+      'the retry priced b from shared state instead of from what it read on arrival');
+  } finally {
+    held.resolve();
+    await close();
+  }
+});
 
 test('a roll that happens while the knob is off is still owed when it comes on', async () => {
   // The current account's reading is kept whether or not the knob is on, which
