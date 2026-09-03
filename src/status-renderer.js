@@ -71,7 +71,7 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
 // `unifiedStatus: allowed` next to an account that refuses everything used to
 // leave no way to tell whether the refusal was upstream's or the proxy's own
 // threshold policy (#166); this says which.
-const UNAVAILABLE_TEXT = {
+export const UNAVAILABLE_TEXT = {
   disabled: 'disabled by operator',
   throttled: 'upstream 429 hold',
   exhausted: 'marked exhausted',
