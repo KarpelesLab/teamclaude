@@ -68,7 +68,7 @@ test('GET /teamclaude/quota returns the fleet quota without reaching upstream', 
   }
 });
 
-test('GET /teamclaude/quota returns 500 when its live metadata cannot be built', async () => {
+test('GET /teamclaude/quota uses the standard proxy error when its live metadata cannot be built', async () => {
   const am = new AccountManager([{
     name: 'team', type: 'oauth', accessToken: 'token',
   }], 0.98);
@@ -85,8 +85,11 @@ test('GET /teamclaude/quota returns 500 when its live metadata cannot be built',
       signal: AbortSignal.timeout(1000),
     });
     const body = await res.json();
-    assert.equal(res.status, 500);
-    assert.deepEqual(body, { error: 'internal server error' });
+    assert.equal(res.status, 502);
+    assert.deepEqual(body, {
+      type: 'error',
+      error: { type: 'proxy_error', message: 'Internal proxy error' },
+    });
   } finally {
     proxy.close();
   }
