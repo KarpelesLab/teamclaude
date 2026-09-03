@@ -62,6 +62,25 @@ test('warmup reset rejects an invalid timezone without changing config', async (
   });
 });
 
+test('warmup rolling saves a restart-stable five-hour reset anchor', async () => {
+  await withConfig(async configPath => {
+    const before = Date.now();
+    const result = runCli(configPath, ['warmup', 'rolling', '15:30', '--timezone', 'Europe/Moscow']);
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /Reset anchor:\s+\d{4}-\d{2}-\d{2} 15:30 Europe\/Moscow \(UTC\+03:00; .*Z\)/);
+    assert.match(result.stdout, /Cadence:\s+every 5 hours/);
+    assert.match(result.stdout, /Missed runs:\s+skipped/);
+
+    const config = JSON.parse(await readFile(configPath, 'utf8'));
+    assert.equal(config.warmupSchedule.mode, 'rolling');
+    assert.equal(config.warmupSchedule.resetTime, '15:30');
+    assert.equal(config.warmupSchedule.timezone, 'Europe/Moscow');
+    assert.ok(Date.parse(config.warmupSchedule.anchorResetAt) > before);
+    assert.equal(config.warmupSeconds, 0);
+  });
+});
+
 test('warmup off clears both reset and interval modes', async () => {
   await withConfig(async configPath => {
     const config = JSON.parse(await readFile(configPath, 'utf8'));

@@ -92,7 +92,7 @@ export class Warmer {
     }
   }
 
-  /** Change to a daily reset-target schedule without replaying missed runs. */
+  /** Change to a reset-target schedule without replaying missed runs. */
   rescheduleSchedule(schedule) {
     const scheduleStatus = schedule ? resolveWarmupSchedule(schedule, this.nowFn()) : null;
     const generation = ++this._scheduleGeneration;

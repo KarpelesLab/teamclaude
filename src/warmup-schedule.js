@@ -84,6 +84,9 @@ function normalizeSchedule(schedule) {
   } catch {
     throw new Error(`invalid IANA timezone: ${schedule.timezone}`);
   }
+  if (schedule.mode != null && schedule.mode !== 'rolling') {
+    throw new Error(`unknown warm-up schedule mode: ${schedule.mode}`);
+  }
   return {
     resetTime: `${match[1]}:${match[2]}`,
     resetHour: Number(match[1]),
@@ -92,9 +95,58 @@ function normalizeSchedule(schedule) {
   };
 }
 
+/** Create a persisted rolling schedule anchored to the next attainable reset. */
+export function createRollingWarmupSchedule(schedule, now = Date.now()) {
+  const normalized = normalizeSchedule(schedule);
+  const today = localParts(now, normalized.timezone);
+  for (let dayOffset = 0; dayOffset < 370; dayOffset++) {
+    const date = addCalendarDays(today, dayOffset);
+    const resetAt = localInstant({
+      ...date,
+      hour: normalized.resetHour,
+      minute: normalized.resetMinute,
+    }, normalized.timezone);
+    if (resetAt == null || resetAt - WINDOW_MS <= now) continue;
+    return {
+      mode: 'rolling',
+      resetTime: normalized.resetTime,
+      timezone: normalized.timezone,
+      anchorResetAt: new Date(resetAt).toISOString(),
+    };
+  }
+  throw new Error('could not resolve the rolling reset anchor');
+}
+
 /** Resolve a persisted reset target into the next future warm-up occurrence. */
 export function resolveWarmupSchedule(schedule, now = Date.now()) {
   const normalized = normalizeSchedule(schedule);
+  if (schedule.mode === 'rolling') {
+    const anchorResetAt = Date.parse(schedule.anchorResetAt || '');
+    if (!Number.isFinite(anchorResetAt)) throw new Error('rolling schedule requires a valid anchorResetAt');
+    const anchorLocal = localParts(anchorResetAt, normalized.timezone);
+    if (anchorLocal.hour !== normalized.resetHour
+      || anchorLocal.minute !== normalized.resetMinute
+      || anchorLocal.second !== 0
+      || anchorResetAt % 60_000 !== 0) {
+      throw new Error(`anchorResetAt must match ${normalized.resetTime} ${normalized.timezone}`);
+    }
+    const anchorWarmupAt = anchorResetAt - WINDOW_MS;
+    const elapsed = now - anchorWarmupAt;
+    const steps = elapsed < 0 ? 0 : Math.floor(elapsed / WINDOW_MS) + 1;
+    const nextWarmupAt = anchorWarmupAt + steps * WINDOW_MS;
+    return {
+      enabled: true,
+      mode: 'rolling',
+      timezone: normalized.timezone,
+      resetTime: normalized.resetTime,
+      anchorResetAt: new Date(anchorResetAt).toISOString(),
+      cadenceSeconds: WINDOW_MS / 1000,
+      windowSeconds: WINDOW_MS / 1000,
+      nextWarmupAt: new Date(nextWarmupAt).toISOString(),
+      nextTargetResetAt: new Date(nextWarmupAt + WINDOW_MS).toISOString(),
+      missedRunPolicy: 'skip',
+    };
+  }
   const today = localParts(now, normalized.timezone);
 
   for (let dayOffset = 0; dayOffset < 370; dayOffset++) {
@@ -136,11 +188,26 @@ function localDateTime(epochMs, timezone) {
   return `${p.year}-${String(p.month).padStart(2, '0')}-${String(p.day).padStart(2, '0')} ${formatTime(epochMs, timezone)}`;
 }
 
+function zonedInstant(epochMs, timezone) {
+  return `${localDateTime(epochMs, timezone)} ${timezone} (${timezoneLabel(epochMs, timezone)}; ${new Date(epochMs).toISOString()})`;
+}
+
 /** Format the saved schedule using its local timezone and absolute UTC instants. */
 export function formatWarmupScheduleConfirmation(schedule, now = Date.now()) {
   const resolved = resolveWarmupSchedule(schedule, now);
   const warmupAt = Date.parse(resolved.nextWarmupAt);
   const resetAt = Date.parse(resolved.nextTargetResetAt);
+  if (resolved.mode === 'rolling') {
+    const anchorResetAt = Date.parse(resolved.anchorResetAt);
+    return [
+      'Rolling warm-up schedule saved',
+      `Reset anchor:   ${zonedInstant(anchorResetAt, resolved.timezone)}`,
+      'Cadence:        every 5 hours (Anthropic-defined)',
+      `Next warm-up:   ${zonedInstant(warmupAt, resolved.timezone)}`,
+      `Expected reset: ${zonedInstant(resetAt, resolved.timezone)}`,
+      'Missed runs:    skipped',
+    ].join('\n');
+  }
   const warmupUtc = `${String(new Date(warmupAt).getUTCHours()).padStart(2, '0')}:${String(new Date(warmupAt).getUTCMinutes()).padStart(2, '0')}`;
   return [
     'Warm-up schedule saved',

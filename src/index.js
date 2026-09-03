@@ -23,7 +23,7 @@ import * as alias from './alias.js';
 import { ensureCerts } from './mitm.js';
 import { Prober } from './prober.js';
 import { Warmer } from './warmer.js';
-import { formatWarmupScheduleConfirmation, resolveWarmupConfig, resolveWarmupSchedule } from './warmup-schedule.js';
+import { createRollingWarmupSchedule, formatWarmupScheduleConfirmation, resolveWarmupConfig, resolveWarmupSchedule } from './warmup-schedule.js';
 import { TUI } from './tui.js';
 import { SessionTitles } from './session-titles.js';
 import { RemoteControl, createAttachSession } from './tui-remote.js';
@@ -551,7 +551,7 @@ async function serverCommand() {
   prober.start();
 
   // Start the opt-in keep-warm scheduler. Interval mode runs relative to server
-  // startup; reset mode restores its next wall-clock occurrence from config.
+  // startup; reset-target modes restore their next occurrence from config.
   warmer = new Warmer(accountManager, {
     intervalMs: (config.warmupSeconds || 0) * 1000,
     schedule: config.warmupSchedule || null,
@@ -1314,26 +1314,31 @@ async function warmupCommand() {
     console.log(cur > 0 ? `Keep-warm: every ${cur}s` : 'Keep-warm: off');
     console.log('Set with: teamclaude warmup <off|seconds>');
     console.log('          teamclaude warmup reset HH:MM --timezone Area/City');
+    console.log('          teamclaude warmup rolling HH:MM --timezone Area/City');
     console.log('Note: warming spawns a minimal `claude` per idle account and DOES spend a little quota');
     console.log('(unlike the passive quota probe). It only warms accounts whose 5h window is idle.');
     return;
   }
 
-  if (arg === 'reset') {
+  if (arg === 'reset' || arg === 'rolling') {
     const resetTime = args[2];
     const timezoneFlag = args.indexOf('--timezone', 3);
     const timezone = timezoneFlag >= 0 ? args[timezoneFlag + 1] : null;
     if (!resetTime || !timezone || args.length !== 5 || timezoneFlag !== 3) {
-      console.error('Usage: teamclaude warmup reset HH:MM --timezone Area/City');
+      console.error(`Usage: teamclaude warmup ${arg} HH:MM --timezone Area/City`);
       process.exit(1);
     }
     const schedule = { resetTime, timezone };
     try {
-      const resolved = resolveWarmupSchedule(schedule);
-      config.warmupSchedule = {
-        resetTime: resolved.resetTime,
-        timezone: resolved.timezone,
-      };
+      if (arg === 'rolling') {
+        config.warmupSchedule = createRollingWarmupSchedule(schedule);
+      } else {
+        const resolved = resolveWarmupSchedule(schedule);
+        config.warmupSchedule = {
+          resetTime: resolved.resetTime,
+          timezone: resolved.timezone,
+        };
+      }
     } catch (err) {
       console.error(err.message);
       process.exit(1);
@@ -1629,6 +1634,8 @@ Commands:
                       a minimal claude request to each (spends a little quota)
   warmup reset HH:MM --timezone Area/City
                       Schedule daily warm-up for a target reset in an IANA zone
+  warmup rolling HH:MM --timezone Area/City
+                      Anchor a continuous five-hour reset cadence in an IANA zone
   api <path>          Call an API endpoint with account credentials
   update              Check npm for a newer teamclaude and install it
   version             Print the installed version

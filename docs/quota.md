@@ -10,7 +10,7 @@ Observed quota is persisted to `teamclaude.state.json` next to the config, so ro
 
 ## Fleet quota endpoint
 
-`GET /teamclaude/quota` returns the quota data intended for lightweight consumers such as a Claude Code status line. It includes every account's observed limits plus tier-weighted fleet aggregates for the shared 5-hour window, shared weekly window, Sonnet weekly window, and Fable weekly window. Sonnet and Fable fall back to the shared weekly bucket on accounts where Anthropic does not report a dedicated bucket. Its top-level `warmup` object reports whether keep-warm is off, interval-based, or scheduled for a daily reset target, including the configured timezone and next warm-up/reset timestamps.
+`GET /teamclaude/quota` returns the quota data intended for lightweight consumers such as a Claude Code status line. It includes every account's observed limits plus tier-weighted fleet aggregates for the shared 5-hour window, shared weekly window, Sonnet weekly window, and Fable weekly window. Sonnet and Fable fall back to the shared weekly bucket on accounts where Anthropic does not report a dedicated bucket. Its top-level `warmup` object reports whether keep-warm is off, interval-based, scheduled for a daily reset target, or running on an anchored five-hour cadence. Scheduled modes include the configured timezone, missed-run policy, and next warm-up/reset timestamps; rolling mode also includes `anchorResetAt` and `cadenceSeconds`.
 
 Subscription capacity is weighted relative to Claude Pro: Pro and Team Standard are `1`, Max 5x and Team tier 1 are `5`, and Max 20x and Team tier 2 are `20`. TeamClaude reads the organization and seat tier from the OAuth profile. An unrecognized tier remains visible under `accounts` and `unknownTiers` but is excluded from the aggregate instead of being assigned a guessed weight. API-key token and request limits remain per-account because their units cannot be combined with subscription utilization.
 
@@ -55,6 +55,7 @@ The rolling **5-hour session window** only starts once an account sends a real m
 ```bash
 teamclaude warmup 600                                      # warm idle accounts every 600s
 teamclaude warmup reset 15:30 --timezone Europe/Moscow     # target a daily 15:30 reset
+teamclaude warmup rolling 15:30 --timezone Europe/Moscow   # anchor resets at 15:30, then every 5h
 teamclaude warmup off                                      # disable either mode
 teamclaude warmup                                          # show current setting
 ```
@@ -62,6 +63,8 @@ teamclaude warmup                                          # show current settin
 > ⚠️ **This spends a little quota — unlike the passive quota probe.** The 5h timer can't be started by a read-only call, so keep-warm sends a real (minimal) message: for each eligible idle account it spawns a one-shot `claude -p --bare --model haiku --output-format text "hi"` pointed at this proxy, pinned to that account. It only warms accounts whose 5h window is **not already running**, skips disabled/throttled/errored and third-party-backend accounts, and uses the cheapest model — but it does consume a few tokens and a slice of the 5h/weekly buckets per account per window. Requires the `claude` CLI on `PATH`. Minimum interval 60s; changes apply live. Status shows under `warm` in `teamclaude status --json`.
 
 Reset mode stores the target wall time and IANA timezone in the config, then subtracts Anthropic's fixed five-hour window to find each warm-up. It recalculates the next calendar occurrence after startup, config reload, and every run, so daylight-saving changes do not drift the schedule. It follows cron semantics: if TeamClaude was stopped at the scheduled time, that run is skipped and the server waits for the next future occurrence. The CLI confirmation prints the resolved local time, UTC time, timezone offset, and next occurrence.
+
+Rolling mode uses the requested local time to save the next reset whose warm-up time has not passed, then schedules warm-ups on the same absolute five-hour cadence indefinitely. The saved anchor keeps the phase stable across service restarts and config reloads. Missed slots are skipped with no catch-up request; TeamClaude waits for the next point on the original cadence. Because 24 hours is not divisible by 5, only the anchor reset occurs at the requested wall time: later reset times move around the local clock, and daylight-saving changes can shift their displayed local time as well. The CLI prints each rolling instant with its own UTC offset and ISO timestamp so repeated DST wall times remain unambiguous. This is best effort: an account with a live five-hour window or an ineligible state is skipped at that slot.
 
 Keep-warm has nothing to do with the prompt cache — see [Prompt caching across rotation](routing.md#prompt-caching-across-rotation).
 

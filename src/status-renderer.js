@@ -281,9 +281,14 @@ function gradientColor(index, width) {
 
 function formatProbeSummary(probe, now, paint) {
   if (!probe.enabled) return paint.gray('off (passive only)');
-  const bits = probe.mode === 'reset'
-    ? [`daily ${probe.warmupTime} ${probe.timezone} → reset ${probe.resetTime}`]
-    : [`on every ${formatDuration((probe.intervalSeconds || 0) * 1000)}`];
+  let bits;
+  if (probe.mode === 'reset') {
+    bits = [`daily ${probe.warmupTime} ${probe.timezone} → reset ${probe.resetTime}`];
+  } else if (probe.mode === 'rolling') {
+    bits = [`rolling every ${formatDuration(probe.cadenceSeconds * 1000)}, reset anchor ${probe.resetTime} ${probe.timezone}`];
+  } else {
+    bits = [`on every ${formatDuration((probe.intervalSeconds || 0) * 1000)}`];
+  }
   if (probe.running) bits.push(paint.yellow('running'));
   const last = parseTs(probe.lastRunFinishedAt);
   if (last) bits.push(`last ${formatAgo(last, now)}`);

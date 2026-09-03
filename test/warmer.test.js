@@ -218,6 +218,107 @@ test('a reset timer that fires after its cron minute skips the missed warm-up', 
   assert.equal(warmer.getStatus().nextWarmupAt, '2026-09-02T07:30:00.000Z');
 });
 
+test('a rolling schedule rearms exactly five hours after each warm-up', async () => {
+  const am = new AccountManager([oauth('a')], 0.98);
+  const spawn = fakeSpawner();
+  let now = Date.parse('2026-09-01T06:00:00.000Z');
+  const timers = [];
+  const warmer = makeWarmer(am, spawn, {
+    schedule: {
+      mode: 'rolling',
+      resetTime: '15:30',
+      timezone: 'Europe/Moscow',
+      anchorResetAt: '2026-09-01T12:30:00.000Z',
+    },
+    nowFn: () => now,
+    setTimeoutFn: (fn, delay) => {
+      const timer = { fn, delay, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeoutFn: () => {},
+  });
+
+  warmer.start();
+  assert.equal(warmer.getStatus().nextWarmupAt, '2026-09-01T07:30:00.000Z');
+
+  now = Date.parse('2026-09-01T07:30:00.001Z');
+  await timers[0].fn();
+
+  assert.equal(spawn.calls.length, 1);
+  assert.equal(timers[1].delay, 5 * 60 * 60 * 1000 - 1);
+  assert.equal(warmer.getStatus().nextWarmupAt, '2026-09-01T12:30:00.000Z');
+  assert.equal(warmer.getStatus().nextTargetResetAt, '2026-09-01T17:30:00.000Z');
+});
+
+test('a late rolling timer skips to the next five-hour lattice point', async () => {
+  const am = new AccountManager([oauth('a')], 0.98);
+  const spawn = fakeSpawner();
+  let now = Date.parse('2026-09-01T06:00:00.000Z');
+  const timers = [];
+  const warmer = makeWarmer(am, spawn, {
+    schedule: {
+      mode: 'rolling',
+      resetTime: '15:30',
+      timezone: 'Europe/Moscow',
+      anchorResetAt: '2026-09-01T12:30:00.000Z',
+    },
+    nowFn: () => now,
+    setTimeoutFn: (fn, delay) => {
+      const timer = { fn, delay, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeoutFn: () => {},
+  });
+  warmer.start();
+
+  now = Date.parse('2026-09-01T07:31:00.000Z');
+  await timers[0].fn();
+
+  assert.equal(spawn.calls.length, 0);
+  assert.equal(timers.length, 2);
+  assert.equal(warmer.getStatus().nextWarmupAt, '2026-09-01T12:30:00.000Z');
+});
+
+test('restoring a rolling schedule preserves its original phase', () => {
+  const schedule = {
+    mode: 'rolling',
+    resetTime: '15:30',
+    timezone: 'Europe/Moscow',
+    anchorResetAt: '2026-09-01T12:30:00.000Z',
+  };
+  const firstTimers = [];
+  const first = makeWarmer(new AccountManager([oauth('a')], 0.98), fakeSpawner(), {
+    schedule,
+    nowFn: () => Date.parse('2026-09-01T06:00:00.000Z'),
+    setTimeoutFn: (fn, delay) => {
+      const timer = { fn, delay, unref() {} };
+      firstTimers.push(timer);
+      return timer;
+    },
+    clearTimeoutFn: () => {},
+  });
+  first.start();
+  first.stop();
+
+  const restoredTimers = [];
+  const restored = makeWarmer(new AccountManager([oauth('a')], 0.98), fakeSpawner(), {
+    schedule,
+    nowFn: () => Date.parse('2026-09-01T08:00:00.000Z'),
+    setTimeoutFn: (fn, delay) => {
+      const timer = { fn, delay, unref() {} };
+      restoredTimers.push(timer);
+      return timer;
+    },
+    clearTimeoutFn: () => {},
+  });
+  restored.start();
+
+  assert.equal(restored.getStatus().nextWarmupAt, '2026-09-01T12:30:00.000Z');
+  assert.equal(restoredTimers[0].delay, 4.5 * 60 * 60 * 1000);
+});
+
 test('a timer from a replaced reset schedule cannot warm or rearm', async () => {
   const am = new AccountManager([oauth('a')], 0.98);
   const spawn = fakeSpawner();

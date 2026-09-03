@@ -61,6 +61,26 @@ test('renderStatus describes a timezone-aware reset warm-up schedule', () => {
   assert.doesNotMatch(output, /on every 0s/);
 });
 
+test('renderStatus describes a rolling five-hour warm-up schedule', () => {
+  const status = sampleStatus();
+  status.warm = {
+    enabled: true,
+    mode: 'rolling',
+    timezone: 'Europe/Moscow',
+    resetTime: '15:30',
+    anchorResetAt: '2026-07-03T12:30:00Z',
+    cadenceSeconds: 18_000,
+    nextWarmupAt: '2026-07-03T12:30:00Z',
+    nextTargetResetAt: '2026-07-03T17:30:00Z',
+    accounts: [],
+  };
+
+  const output = renderStatus(status, { color: false, now });
+
+  assert.match(output, /Keep-warm\s+rolling every 5h, reset anchor 15:30 Europe\/Moscow, next/);
+  assert.doesNotMatch(output, /on every 0s/);
+});
+
 test('renderStatus shows the sessions line and per-account session count when present', () => {
   const status = sampleStatus();
   status.sessions = { known: 3, active: 2, perAccount: { 0: 2 }, distribute: true };
