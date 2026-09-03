@@ -314,28 +314,35 @@ export class AccountManager {
    * The cursor naming an account the reference does not describe is exactly the
    * state in which the next request first-sights that account's roll, so the
    * rule is about the pairing rather than about which function does the writing.
-   * There are seven callers and they take one of two forms:
+   * There are SIX callers, in two forms:
    *
-   *   SETTLE, through _priceOn — every path that is routing a request, whether
-   *   or not that request carries provenance: rotation and the exhausted-reset
-   *   branch inside _selectNext, and the exhausted-fleet probe. A request being
-   *   sent somewhere settles like one, and _priceOn is where what it carries
-   *   decides what the write means.
+   *   SETTLE, through _priceOn — four of them: rotation and the exhausted-reset
+   *   branch inside _selectNext, the exhausted-fleet probe, and the quota-reset
+   *   switch. The first three are routing a request; the fourth runs off an
+   *   upstream header and carries none, which changes what _priceOn is given and
+   *   not which call it is.
    *
-   *   ESTABLISH, through _establishOn — the paths that are not routing anything
-   *   and so have nothing to carry: startup, the operator's switch, and the
-   *   quota-reset switch that runs off an upstream header rather than a request.
+   *   ESTABLISH, through _establishOn — two: startup, and the operator's switch.
+   *   Neither is routing anything, neither can be owed anything, and there is no
+   *   reading to preserve because nothing was reading before them.
+   *
+   * THE QUOTA-RESET SWITCH SETTLES, AND MOVING IT TO ESTABLISH WOULD BE A
+   * REGRESSION rather than a tidy-up. It runs when an account's session quota
+   * resets, which is a moment its weekly window may have rolled at too; settling
+   * puts that write through the never-advance guard, and establishing would walk
+   * the reading forward over a roll nothing has answered for. The asymmetry is
+   * load-bearing: carrying nothing is not the same as having nothing to lose.
    *
    * The reference is otherwise written in one further place, and it is not a
    * cursor move at all: _seedSessionReferences, which supplies SESSION readings
    * on the knob's off-to-on transition and never touches this one.
    *
-   * The only assignments to currentIndex outside this method are
-   * removeAccount's, which renumbers the reference's index alongside the pins.
-   * Removing the CURRENT account names a different one by either branch there,
-   * and neither is routed through here; the clamp can land on an account with
-   * no reference, which costs one selection pass rather than a week, because the
-   * first settled request records one.
+   * currentIndex is assigned outside this method twice, and neither is a route:
+   * the constructor starts it at 0 before anything has been selected, and
+   * removeAccount's clamp renumbers it alongside the pins. Removing the CURRENT
+   * account names a different one by either branch there; the clamp can land on
+   * an account with no reference, which costs one selection pass rather than a
+   * week, because the first settled request records one.
    */
   _setCurrent(account) {
     this.currentIndex = account.index;
@@ -499,7 +506,7 @@ export class AccountManager {
         // Distribution was just turned off. Sessions that already existed keep
         // their account so the prompt cache they built there survives; everything
         // else falls through to the normal quota-driven walk below.
-        const acc = this._selectDrainingSession(sessionId, exclude, model, advisorModel);
+        const acc = this._selectDrainingSession(sessionId, exclude, model, advisorModel, carried);
         if (acc) return acc;
       }
     }
@@ -1129,7 +1136,7 @@ export class AccountManager {
   /** Honour a draining session's existing pin — and only that. Unlike
    *  _selectForSession there is no least-loaded fallback: distribution is being
    *  wound down, so a session that cannot stay put rejoins the normal walk. */
-  _selectDrainingSession(sessionId, exclude, model, advisorModel) {
+  _selectDrainingSession(sessionId, exclude, model, advisorModel, carried = null) {
     // Same candidate order as _selectForSession: the request's own bucket pin,
     // then any account the session already sits on for another family.
     const pinIdx = this.sessionTracker.pinnedAccount(sessionId, this._weeklyBucketFor(model));
@@ -1148,8 +1155,20 @@ export class AccountManager {
       // window, so nothing else here is a bound. Leaving the drain rather than
       // re-routing in place hands it to the ordinary walk, which is where every
       // other preemption already lives.
+      //
+      // THIS IS A PREEMPTION, so the request is told what it is owed before it
+      // goes anywhere — the same thing the other two walks do, and for the same
+      // reason. Handing it to the ordinary walk is not enough on its own: that
+      // walk measures the CURRENT account, and a session pin is commonly not the
+      // cursor, because the session walk never moves it. Then nothing speaks for
+      // this roll, and a request that fails back onto the pin settles on the week
+      // it just gained.
       if (this.expiryRouting.enabled && this.expiryRouting.preempt
-          && this._pinRolledOver(sessionId, pinned, model)) break;
+          && this._pinRolledOver(sessionId, pinned, model)) {
+        this._noteOwed(carried, pinned, this._governingWindow(pinned, model).window,
+          this.sessionTracker.refsFor(sessionId, this._weeklyBucketFor(model))?.windows);
+        break;
+      }
       // Mirror _select's priority preemption, as _selectForSession does.
       const betterExists = this.accounts.some(a =>
         this._isAvailable(a, model, advisorModel) && !exclude?.has(a.index) && (a.priority || 0) < (pinned.priority || 0));
@@ -1261,33 +1280,37 @@ export class AccountManager {
    * claim to have seen. It is a first sight, and the next roll after it is the
    * first one detected.
    *
-   * THREE STATES, NOT TWO, and the predicate has to separate all of them:
+   * WHAT IS COMPARED IS THE TENURE, NOT THE SLOT. A question about WHERE the pin
+   * points is not a question about WHICH STAY the reading describes, and only the
+   * second one is asked here:
    *
-   *   ABSENT — no reading at all. Seed it. Nothing was watching while the knob
-   *   was off, so what the account presents now is the honest first sight.
+   *   IS THIS READING FROM THE STAY THE PIN IS IN NOW? If it is, leave it — a
+   *   roll measured against it may be owed RIGHT NOW, and re-taking it answers
+   *   a question nobody asked and spends the rollover in silence, which is the
+   *   failure this feature exists to prevent. If it is not, seed it: it
+   *   describes a stay that is over, and every window it names belongs to that
+   *   stay rather than to this one.
    *
-   *   STALE, NAMING THIS PIN'S ACCOUNT — a reading taken when the knob was last
-   *   on, for the account the pin still names. LEAVE IT. A roll measured against
-   *   it may be owed RIGHT NOW, and re-taking it answers a question nobody asked
-   *   and spends the rollover in silence, which is the failure this feature
-   *   exists to prevent.
-   *
-   *   NAMING A DIFFERENT ACCOUNT — the session moved while the knob was off, so
-   *   the reading describes a tenure that is over. Seed it. Left alone it is not
-   *   a comparison at all: _readingFor matches on the account, finds a mismatch
-   *   and returns nothing, so the account the session is ACTUALLY on gets its
-   *   next roll first-sighted. Treating this as "an existing reading" is how the
-   *   fix for the second state turned into the inverse of itself.
+   * That covers the three states an index comparison can express — no reading, a
+   * reading naming another account, a reading naming this one — and the one it
+   * cannot: a session that left an account and came back while nothing was
+   * watching. It returns to a matching INDEX and a different TENURE, so a reading
+   * from the first stay reads as continuous, and a roll that happened while the
+   * session was elsewhere is charged to a stay it was not present for: a false
+   * preemption that costs the cache it exists to protect. An index is not an
+   * identity.
    *
    * Nor does this reach what an in-flight request is owed: that lives on the
    * request, so a knob toggled while a preemption is in the air cannot touch it.
    */
   _seedSessionReferences() {
-    for (const { sessionId, bucket, idx } of this.sessionTracker.livePins()) {
+    for (const { sessionId, bucket, idx, tenure } of this.sessionTracker.livePins()) {
       const account = this.accounts[idx];
       if (!account) continue;
       const ref = this.sessionTracker.refsFor(sessionId, bucket, true);
-      if (ref && ref.idx !== account.index) this._establishOn(ref, account);
+      if (!ref || ref.tenure === tenure) continue;
+      this._establishOn(ref, account);
+      ref.tenure = tenure;
     }
   }
 
@@ -1498,8 +1521,17 @@ export class AccountManager {
    */
   _notePinSettled(sessionId, pinned, model, carried = null) {
     if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) return;
-    const ref = this.sessionTracker.refsFor(sessionId, this._weeklyBucketFor(model), true);
-    if (ref) this._priceOn(ref, pinned, model, carried);
+    const bucket = this._weeklyBucketFor(model);
+    const ref = this.sessionTracker.refsFor(sessionId, bucket, true);
+    if (!ref) return;
+    this._priceOn(ref, pinned, model, carried);
+    // Stamp the tenure this reading was taken in, so a later stay on the same
+    // account is not mistaken for a continuation of this one. The pin is read
+    // rather than assumed: this settlement may be establishing a reference for
+    // an account the pin has not moved to yet, and the stamp then belongs to the
+    // tenure that pin is about to start — which is the one the next request will
+    // compare against.
+    ref.tenure = this.sessionTracker.pinTenure(sessionId, bucket, pinned.index);
   }
 
   /** As _notePinSettled, for the current account — and, when the reference names
@@ -1566,26 +1598,47 @@ export class AccountManager {
    *
    *  ACCUMULATING IS NOT SEPARATELY GATED, and the reason is worth stating
    *  rather than leaving for someone to rediscover. Every preemption is off the
-   *  account the traffic is on, so a debt after the FIRST is always on an
+   *  account the traffic is on, so a debt after the FIRST is normally on an
    *  account this request was sent to — which already holds an arrival reading
    *  of the same window at the same value. That looks like redundancy — collapse
    *  this back to one debt and the chain still answers,
-   *  through the arrival instead. The two differ only for the first origin,
-   *  which has no arrival because the request began there, and that difference
-   *  IS gated.
+   *  through the arrival instead. The two differ for an origin with no arrival,
+   *  which is where the request BEGAN, and that difference IS gated.
    *
-   *  It stays because that argument is an enumeration of today's two selection
-   *  paths rather than a proof — a third way of being pushed off an account the
-   *  request never arrived at would be owed something nothing else holds, and
-   *  the cost of keeping this is one map entry per account in a chain. */
+   *  The claim is an invariant with the search that checks it rather than a count
+   *  that ages:
+   *
+   *    EVERY SITE THAT DETECTS A ROLLOVER EITHER RECORDS THE DEBT OR MOVES NO
+   *    TRAFFIC. The sites are the callers of _pinRolledOver and
+   *    _currentRolledOver; today there are four. Three route — the current walk,
+   *    the session walk, the drain walk — and each calls _noteOwed before it
+   *    moves anything. The fourth is previewRouteIndex, which answers a question
+   *    for the status view and neither moves the cursor nor takes a reading, so
+   *    it has nothing to be owed.
+   *
+   *  That is still a search rather than a proof, and it sits beside the sentence
+   *  so the next reader re-runs it rather than trusting the number: a walk added
+   *  later is a fifth caller, and this paragraph is wrong the moment one exists
+   *  without a _noteOwed above it. The cost of keeping accumulation meanwhile is
+   *  one map entry per account in a chain. */
   _noteOwed(carried, origin, window, reading) {
     if (!carried) return;
     const seen = reading?.get(window);
     if (seen == null) return;
     const readings = (carried.readings ??= new Map());
     const held = readings.get(origin);
-    const windows = held ? held.windows : new Map();
-    if (!(held?.owed && windows.has(window))) windows.set(window, seen);
+    // A DEBT DOES NOT INHERIT AN ARRIVAL'S WINDOWS. The two entries answer
+    // different questions about the same account: an arrival is what every
+    // window read when this request got here, kept so a return can be measured
+    // from it, and a debt is the one window that rolled and what it read when it
+    // did. A request that settles on an account and is later pushed off it — the
+    // same-account retry after a roll in flight — holds both in turn, and
+    // starting the debt from the arrival would mark every window owed and write
+    // them all back on fail-back, over whatever a sibling settled in between.
+    // Only an existing DEBT carries forward, because a chain can be owed two
+    // windows on one account and both are its own.
+    const windows = held?.owed ? held.windows : new Map();
+    if (!windows.has(window)) windows.set(window, seen);
     readings.set(origin, { windows, owed: true });
   }
 

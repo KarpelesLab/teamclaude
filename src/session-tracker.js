@@ -98,7 +98,16 @@ export class SessionTracker {
     s.lastSeen = now;
     s.count += 1;
     if (accountIndex != null && typeof bucket === 'string' && bucket) {
-      s.pins.set(bucket, { idx: accountIndex, at: now });
+      // `tenure` identifies THIS pinning rather than the slot it sits in, and it
+      // changes only when the account does. A session that leaves an account and
+      // comes back returns to a matching index but a different tenure, and a
+      // reading taken in the earlier one describes a stay this session was not
+      // on the far side of — an index is not an identity, so the two have to be
+      // distinguishable. Monotonic per session, so a tenure number is never
+      // reused within the record it belongs to; nothing outside compares them.
+      const prior = s.pins.get(bucket);
+      const tenure = prior && prior.idx === accountIndex ? prior.tenure : ++s.tenures;
+      s.pins.set(bucket, { idx: accountIndex, at: now, tenure });
     }
     if (now - this._lastSweep > SWEEP_INTERVAL_MS) this.sweep(now);
     return s;
@@ -210,6 +219,8 @@ export class SessionTracker {
     if (!s) {
       s = {
         pins: new Map(), refs: new Map(), firstSeen: now, lastSeen: now, count: 0, inFlight: 0,
+        // Hands out tenure numbers for this session's pins (see touch).
+        tenures: 0,
         // bucket -> emptyTokens(). On the session's own record rather than in a
         // map beside it, so there is one lifetime and one eviction policy for
         // everything scoped to a session: a second map keyed by session id would
@@ -274,8 +285,22 @@ export class SessionTracker {
     return ref || null;
   }
 
-  // Every pin a live session holds, as { sessionId, bucket, idx }. Expired
-  // sessions are dropped on the way past, as every other read here does.
+  // The tenure number a reading taken for `accountIndex` on this bucket belongs
+  // to. The pin's own when it already names that account; otherwise the number
+  // the NEXT pinning there will get, because a settlement can establish a
+  // reference for an account the pin has not moved to yet and the reading
+  // describes the stay that is about to begin. Null for a session that is
+  // unknown or forgotten, which is also what an unstamped reference reads as.
+  pinTenure(sessionId, bucket, accountIndex, now = this._now()) {
+    const s = this._live(sessionId, now);
+    if (!s) return null;
+    const pin = s.pins.get(bucket);
+    return pin && pin.idx === accountIndex ? pin.tenure : s.tenures + 1;
+  }
+
+  // Every pin a live session holds, as { sessionId, bucket, idx, tenure } — what a
+  // caller needs to visit each pinned (session, bucket) once. Expired sessions
+  // are dropped on the way past, as every other read here does.
   livePins(now = this._now()) {
     const out = [];
     for (const [sessionId, s] of [...this.sessions]) {
@@ -283,7 +308,7 @@ export class SessionTracker {
         this.sessions.delete(sessionId);
         continue;
       }
-      for (const [bucket, pin] of s.pins) out.push({ sessionId, bucket, idx: pin.idx });
+      for (const [bucket, pin] of s.pins) out.push({ sessionId, bucket, idx: pin.idx, tenure: pin.tenure });
     }
     return out;
   }

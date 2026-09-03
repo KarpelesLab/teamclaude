@@ -403,6 +403,44 @@ test('a draining session rejoins the ordinary walk when its window rolls', () =>
     'a draining session rode its account through a rollover');
 });
 
+test('a draining session whose pin is not the current account still owes its roll', () => {
+  // THE FIXTURE ABOVE IS BLIND, and this is the same scenario with the blindness
+  // removed. It leaves currentIndex on the pin, so when the drain releases the
+  // session into the ordinary walk that walk sees the same jump and records the
+  // debt the drain path itself never recorded. The session walk never calls
+  // _setCurrent, so on any fleet that has been distributing, the cursor is
+  // commonly somewhere else — and then nothing records it at all.
+  const am = mgr(['a', 'b', 'c'], ON, { distributeSessions: true });
+  bucket(am, 0, 'unified7d', 0.4, 10);
+  bucket(am, 1, 'unified7d', 0.4, 20);
+  bucket(am, 2, 'unified7d', 0.4, 30);
+  am.selectActiveAccount();
+  assert.equal(serve(am, 's1', OPUS).name, 'a', 'the fixture must pin s1 to a');
+  // The cursor moves off the pin, which is what session traffic alone cannot do.
+  assert.equal(am.setCurrentAccount(1), true);
+  am.setDistributeSessions(false);
+  assert.equal(am.sessionStats().draining, 1, 'the session should be draining');
+
+  rollWindow(am, 0);
+  // The drain releases the session; the ordinary walk is on b, which has not
+  // rolled, so the request settles there and nothing has spoken for a's roll.
+  const carried = {};
+  am.beginSession('s1');
+  const first = am.getActiveAccount(null, OPUS, null, 's1', carried);
+  assert.equal(first.name, 'b', 'the released session should have taken the cursor\'s account');
+  am.recordSession('s1', first.index, OPUS);
+  // b is refused and c is over threshold, so the retry falls back onto a.
+  am.accounts[2].quota.unified7d = 0.99;
+  const retry = am.getActiveAccount(new Set([first.index]), OPUS, null, 's1', carried);
+  assert.equal(retry.name, 'a', 'the retry should have fallen back onto the rolled account');
+  am.recordSession('s1', retry.index, OPUS);
+  am.endSession('s1');
+
+  am.accounts[2].quota.unified7d = 0.4;
+  assert.notEqual(serve(am, 's1', OPUS).name, 'a',
+    'the drain walk released the session without recording the roll it was owed');
+});
+
 // ---------------------------------------------------------------------------
 // An observation describes the stay it was taken in
 // ---------------------------------------------------------------------------
@@ -890,6 +928,83 @@ test('re-applying the same setting does not re-read what is already being watche
   am.setExpiryRouting({ enabled: true, preempt: true });
   assert.notEqual(serve(am, 's1', OPUS).index, first.index,
     'a reload re-read the reference and swallowed the roll it was owed');
+});
+
+test('a session that leaves an account and comes back while off is a new tenure', () => {
+  // AN INDEX IS NOT AN IDENTITY, here for the third time. The seed asked whether
+  // the reference names the account the pin now names, and A→B→A returns to a
+  // matching index — so a reference from the FIRST stay on a reads as continuous,
+  // and a roll that happened while the session was away is treated as newly owed.
+  // The session pays a cache-breaking preemption for a rollover that belongs to a
+  // tenure it was not there for.
+  //
+  // What has to match is not the slot but THIS pinning: any new tenure, on the
+  // same account or another, cannot be described by a reference taken in an
+  // earlier one.
+  const am = mgr(['a', 'b'], ON, { distributeSessions: true });
+  bucket(am, 0, 'unified7d', 0.4, 10);
+  bucket(am, 1, 'unified7d', 0.4, 20);
+  assert.equal(serve(am, 's1', OPUS).name, 'a', 'the fixture must pin s1 to a');
+
+  am.setExpiryRouting({ enabled: false });
+  // The session is forced to b and back to a, all while nothing is watching, and
+  // a's window rolls while the session is away.
+  am.setDisabled(0, true);
+  assert.equal(serve(am, 's1', OPUS).name, 'b', 'the session should have moved to b');
+  rollWindow(am, 0);
+  am.setDisabled(0, false);
+  am.setDisabled(1, true);
+  assert.equal(serve(am, 's1', OPUS).name, 'a', 'the session should have returned to a');
+  am.setDisabled(1, false);
+
+  am.setExpiryRouting(ON);
+  assert.equal(serve(am, 's1', OPUS).name, 'a',
+    'a roll from a tenure the session was not present for forced a preemption');
+});
+
+test('an arrival is not a debt, so a rollover owes only the window that rolled', () => {
+  // A request that SETTLES on an account records what every window there read —
+  // that is what an arrival is, and it is how the account is measured if the
+  // request comes back to it. A request PUSHED OFF an account records the one
+  // window that rolled. When the same request does both, in that order, the debt
+  // must not inherit the arrival's other windows: it did not price them as a
+  // rollover, and restoring them on fail-back rewinds whatever a sibling settled
+  // on them in between.
+  //
+  // The production shape is the same-account retry — a short-wait 429 re-enters
+  // selection with the tried set untouched — after a roll in flight.
+  const am = mgr(['a', 'b', 'c'], ON);
+  const now = Date.now();
+  bucket(am, 0, 'unified7d', 0.10, 300, now);
+  bucket(am, 1, 'unified7d', 0.10, 20, now);
+  bucket(am, 2, 'unified7d', 0.10, 30, now);
+  scoped(am, 0, 'opus', 0.90, 15, now);
+  assert.equal(am.setCurrentAccount(0), true);
+
+  // An Opus request settles on a, recording an arrival for BOTH of a's windows.
+  const carried = {};
+  am.getActiveAccount(null, OPUS, null, null, carried);
+  assert.equal(am._governingWindow(am.accounts[0], OPUS).window, 'scoped:opus',
+    'the fixture must have the scoped window governing Opus on a');
+
+  // a's Opus window rolls under the request, and the same-account retry — the
+  // tried set is empty, so selection is free to look again — is pushed off a.
+  am.accounts[0].quota.scopedWeekly.opus.resetAt += WEEK;
+  const moved = am.getActiveAccount(null, OPUS, null, null, carried);
+  assert.notEqual(moved.name, 'a', 'the retry should have been pushed off a');
+
+  // A sibling settles a's SHARED window at a new value while the request is away.
+  const siblingAt = now + 500 * H;
+  am.accounts[0].quota.unified7dReset = siblingAt;
+  assert.equal(am.setCurrentAccount(0), true);
+  assert.equal(am._currentRef.windows.get('unified7d'), siblingAt,
+    'the fixture must have the sibling\'s reading settled on a');
+
+  // The Opus request fails back onto a. It is owed a's scoped window and nothing
+  // else, so the sibling's shared reading stands.
+  am.getActiveAccount(new Set([moved.index]), OPUS, null, null, carried);
+  assert.equal(am._currentRef.windows.get('unified7d'), siblingAt,
+    'the debt inherited the arrival\'s windows and rewound the sibling');
 });
 
 test('a knob switched off and back on does not re-read a roll already owed', () => {
