@@ -166,7 +166,9 @@ teamclaude help              # Show all commands
 
 ## Status dashboard (browser)
 
-`GET /teamclaude/dashboard` serves a self-contained HTML page rendering the same data as `teamclaude status`: per-account quota bars (session/weekly, plus Sonnet/Fable buckets where present), rotation state, active sessions — refreshed every few seconds.
+`GET /teamclaude/dashboard` serves a self-contained HTML page rendering the same data as `teamclaude status`: per-account quota bars (session and weekly, plus one bar per model-scoped weekly bucket upstream reports), rotation state, and active sessions — refreshed every few seconds.
+
+With `proxy.usageDimensions` configured, each dimension gets its own sortable table. With `proxy.sessionDetail` on, a per-session table shows each session's client, project, serving accounts, and what it actually spent per weekly bucket — cache reads and cache creation included — filterable by project or client. That table is off by default; see [Configuration](configuration.md#usage-dimensions).
 
 ```
 http://localhost:3456/teamclaude/dashboard

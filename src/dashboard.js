@@ -54,7 +54,69 @@ export function accountTokens(usage) {
     + (u.totalCacheReadTokens || 0) + (u.totalCacheCreationTokens || 0);
 }
 
-const SHARED_HELPERS = [scopedWeeklyRows, accountTokens].map(fn => fn.toString()).join('\n\n');
+// One row per session, from `sessions.items` (proxy.sessionDetail). The token
+// columns are #192's numbers — what each response actually reported, cache
+// included — summed across the weekly buckets the session touched. `pins` is a
+// bucket→account map rather than one index, because a session spending two
+// model families is served by two accounts at the same time.
+export function sessionRows(sessions) {
+  var items = (sessions && sessions.items) || [];
+  return items.map(function (s) {
+    var buckets = s.tokens || {};
+    var row = {
+      id: s.id,
+      client: s.client || '',
+      project: (s.dimensions || {}).project || '',
+      active: !!s.active,
+      requests: s.requests || 0,
+      cacheRead: 0, cacheCreation: 0, input: 0, output: 0, context: 0,
+      accounts: Object.keys(s.pins || {}).map(function (b) { return s.pins[b]; }).join(', '),
+      lastSeen: s.lastSeen || 0,
+    };
+    Object.keys(buckets).forEach(function (b) {
+      var t = buckets[b] || {};
+      row.cacheRead += t.cacheRead || 0;
+      row.cacheCreation += t.cacheCreation || 0;
+      row.input += t.input || 0;
+      row.output += t.output || 0;
+      row.context += t.context || 0;
+    });
+    row.total = row.cacheRead + row.cacheCreation + row.input + row.output;
+    return row;
+  });
+}
+
+export function filterSessionRows(rows, filters) {
+  var f = filters || {};
+  return (rows || []).filter(function (r) {
+    if (f.project && r.project !== f.project) return false;
+    if (f.client && r.client !== f.client) return false;
+    return true;
+  });
+}
+
+// Text sorts alphabetically, numbers numerically. A missing value sorts as
+// empty/zero rather than dropping the row.
+export function sortRows(rows, key, dir) {
+  var sign = dir === 'asc' ? 1 : -1;
+  return (rows || []).slice().sort(function (a, b) {
+    var x = a[key], y = b[key];
+    if (typeof x === 'string' || typeof y === 'string') {
+      return sign * String(x == null ? '' : x).localeCompare(String(y == null ? '' : y));
+    }
+    return sign * ((x || 0) - (y || 0));
+  });
+}
+
+export function uniqSorted(values) {
+  var seen = Object.create(null);
+  (values || []).forEach(function (v) { if (v) seen[v] = true; });
+  return Object.keys(seen).sort();
+}
+
+const SHARED_HELPERS = [
+  scopedWeeklyRows, accountTokens, sessionRows, filterSessionRows, sortRows, uniqSorted,
+].map(fn => fn.toString()).join('\n\n');
 
 const PAGE = `<!doctype html>
 <html lang="en">
@@ -99,6 +161,13 @@ const PAGE = `<!doctype html>
   td.num, th.num { text-align: right; }
   .usage { color: var(--dim); font-size: 12px; margin-top: 6px; }
   .blocked { color: var(--warn); font-size: 12px; margin-top: 6px; }
+  .filters { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+  .filters label { color: var(--dim); font-size: 12px; display: flex; align-items: center; gap: 6px; }
+  .filters select { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; color: var(--text); font: inherit; font-size: 12px; padding: 4px 8px; }
+  .hint { color: var(--dim); font-size: 12px; margin-left: auto; }
+  th.sortable { cursor: pointer; user-select: none; }
+  th.sortable:hover { color: var(--text); }
+  td.dim { color: var(--dim); }
   #err { color: var(--bad); margin: 12px 0; display: none; }
   #keybox { display: none; margin: 40px auto; max-width: 420px; text-align: center; }
   #keybox input { width: 100%; padding: 10px 12px; margin: 12px 0; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; color: var(--text); font: inherit; }
@@ -124,6 +193,18 @@ const PAGE = `<!doctype html>
       <h2>Clients</h2>
       <div class="card" style="padding:4px 6px"><table id="clients"></table></div>
     </div>
+    <div id="dimensionsWrap"></div>
+    <div id="sessionsWrap" style="display:none">
+      <h2>Sessions</h2>
+      <div class="card" style="padding:0">
+        <div class="filters">
+          <label>Project <select id="fProject"></select></label>
+          <label>Client <select id="fClient"></select></label>
+          <span class="hint" id="sessionCount"></span>
+        </div>
+        <div style="padding:4px 6px"><table id="sessions"></table></div>
+      </div>
+    </div>
     <footer id="foot"></footer>
   </div>
 </main>
@@ -133,6 +214,9 @@ const PAGE = `<!doctype html>
   var KEY = 'teamclaude-dashboard-key';
   var POLL_MS = 5000;
   var timer = null;
+  var lastStatus = null;
+  var sessionFilters = { project: '', client: '' };
+  var sortState = { sessions: { key: 'lastSeen', dir: 'desc' } };
   var UNAVAILABLE_TEXT = ${JSON.stringify(UNAVAILABLE_TEXT)};
 
 ${SHARED_HELPERS}
@@ -266,7 +350,132 @@ ${SHARED_HELPERS}
     });
   }
 
+  // Header cells that re-sort in place. The sort is state, not a re-fetch, so
+  // it survives the 5s poll: re-rendering re-reads sortState below.
+  function addSortableHeader(tr, table, label, key, numeric) {
+    var th = el('th', (numeric ? 'num ' : '') + 'sortable', label + (sortState[table].key === key ? (sortState[table].dir === 'asc' ? ' ▲' : ' ▼') : ''));
+    th.addEventListener('click', function () {
+      var st = sortState[table];
+      if (st.key === key) st.dir = st.dir === 'asc' ? 'desc' : 'asc';
+      else { st.key = key; st.dir = numeric ? 'desc' : 'asc'; }
+      if (lastStatus) render(lastStatus);
+    });
+    tr.appendChild(th);
+  }
+
+  var SESSION_COLUMNS = [
+    { key: 'id', label: 'Session' },
+    { key: 'client', label: 'Client' },
+    { key: 'project', label: 'Project' },
+    { key: 'accounts', label: 'Accounts' },
+    { key: 'requests', label: 'Req', num: true },
+    { key: 'cacheRead', label: 'Cache read', num: true },
+    { key: 'cacheCreation', label: 'Cache write', num: true },
+    { key: 'input', label: 'Input', num: true },
+    { key: 'output', label: 'Output', num: true },
+    { key: 'context', label: 'Context', num: true },
+    { key: 'lastSeen', label: 'Last seen', num: true },
+  ];
+
+  function renderSessions(sessions) {
+    var wrap = document.getElementById('sessionsWrap');
+    // Absent unless proxy.sessionDetail is on — the aggregate counts in the
+    // summary line stay either way.
+    if (!sessions || !sessions.items) { wrap.style.display = 'none'; return; }
+    wrap.style.display = '';
+
+    var all = sessionRows(sessions);
+    var projectSel = document.getElementById('fProject');
+    var clientSel = document.getElementById('fClient');
+    fillFilter(projectSel, uniqSorted(all.map(function (r) { return r.project; })), sessionFilters.project);
+    fillFilter(clientSel, uniqSorted(all.map(function (r) { return r.client; })), sessionFilters.client);
+    sessionFilters.project = projectSel.value;
+    sessionFilters.client = clientSel.value;
+
+    var rows = sortRows(filterSessionRows(all, sessionFilters), sortState.sessions.key, sortState.sessions.dir);
+    document.getElementById('sessionCount').textContent = rows.length + ' of ' + all.length + ' sessions';
+
+    var table = document.getElementById('sessions');
+    table.textContent = '';
+    var hr = el('tr');
+    SESSION_COLUMNS.forEach(function (c) { addSortableHeader(hr, 'sessions', c.label, c.key, !!c.num); });
+    table.appendChild(hr);
+    rows.forEach(function (r) {
+      var tr = el('tr');
+      tr.appendChild(el('td', r.active ? '' : 'dim', r.id));
+      tr.appendChild(el('td', '', r.client || '—'));
+      tr.appendChild(el('td', '', r.project || '—'));
+      tr.appendChild(el('td', '', r.accounts || '—'));
+      ['requests', 'cacheRead', 'cacheCreation', 'input', 'output', 'context'].forEach(function (k) {
+        tr.appendChild(el('td', 'num', fmtNum(r[k])));
+      });
+      tr.appendChild(el('td', 'num', r.lastSeen ? fmtAgo(r.lastSeen) : '—'));
+      table.appendChild(tr);
+    });
+  }
+
+  function fillFilter(select, values, value) {
+    select.textContent = '';
+    var all = el('option', '', 'All');
+    all.value = '';
+    select.appendChild(all);
+    values.forEach(function (v) {
+      var option = el('option', '', v);
+      option.value = v;
+      select.appendChild(option);
+    });
+    select.value = values.indexOf(value) === -1 ? '' : value;
+  }
+
+  // One table per configured usage dimension (proxy.usageDimensions).
+  function renderDimensions(dimensions) {
+    var wrap = document.getElementById('dimensionsWrap');
+    wrap.textContent = '';
+    Object.keys(dimensions || {}).forEach(function (name) {
+      var entries = dimensions[name] || {};
+      var rows = Object.keys(entries).map(function (key) {
+        var e = entries[key] || {};
+        return {
+          name: key,
+          requests: e.requests || 0,
+          inputTokens: e.inputTokens || 0,
+          outputTokens: e.outputTokens || 0,
+          lastUsed: e.lastUsed ? Date.parse(e.lastUsed) : 0,
+        };
+      });
+      if (!rows.length) return;
+      sortState[name] = sortState[name] || { key: 'inputTokens', dir: 'desc' };
+      rows = sortRows(rows, sortState[name].key, sortState[name].dir);
+
+      wrap.appendChild(el('h2', '', name.charAt(0).toUpperCase() + name.slice(1)));
+      var card = el('div', 'card');
+      card.style.padding = '4px 6px';
+      var table = el('table');
+      var hr = el('tr');
+      [{ key: 'name', label: name.charAt(0).toUpperCase() + name.slice(1) },
+        { key: 'requests', label: 'Req', num: true },
+        { key: 'inputTokens', label: 'Input tok', num: true },
+        { key: 'outputTokens', label: 'Output tok', num: true },
+        { key: 'lastUsed', label: 'Last used', num: true }].forEach(function (c) {
+        addSortableHeader(hr, name, c.label, c.key, !!c.num);
+      });
+      table.appendChild(hr);
+      rows.forEach(function (r) {
+        var tr = el('tr');
+        tr.appendChild(el('td', '', r.name));
+        tr.appendChild(el('td', 'num', fmtNum(r.requests)));
+        tr.appendChild(el('td', 'num', fmtNum(r.inputTokens)));
+        tr.appendChild(el('td', 'num', fmtNum(r.outputTokens)));
+        tr.appendChild(el('td', 'num', r.lastUsed ? fmtAgo(r.lastUsed) : '—'));
+        table.appendChild(tr);
+      });
+      card.appendChild(table);
+      wrap.appendChild(card);
+    });
+  }
+
   function render(s) {
+    lastStatus = s;
     var sess = s.sessions || {};
     var up = s.server && s.server.uptimeSeconds != null ? 'up ' + fmtIn(s.server.uptimeSeconds) : '';
     var sum = document.getElementById('summary');
@@ -278,6 +487,8 @@ ${SHARED_HELPERS}
     acc.textContent = '';
     (s.accounts || []).forEach(function (a) { acc.appendChild(renderAccount(a, s.currentAccount)); });
     renderClients(s.clients);
+    renderDimensions(s.usageDimensions);
+    renderSessions(s.sessions);
     document.getElementById('foot').textContent = 'refreshes every ' + (POLL_MS / 1000) + 's · ' + new Date().toLocaleTimeString();
   }
 
@@ -322,6 +533,13 @@ ${SHARED_HELPERS}
   });
   document.getElementById('key').addEventListener('keydown', function (e) {
     if (e.key === 'Enter') document.getElementById('go').click();
+  });
+
+  ['fProject', 'fClient'].forEach(function (id) {
+    document.getElementById(id).addEventListener('change', function () {
+      sessionFilters[id === 'fProject' ? 'project' : 'client'] = this.value;
+      if (lastStatus) render(lastStatus);
+    });
   });
 
   if (localStorage.getItem(KEY)) start(); else showKeybox();
