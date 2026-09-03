@@ -110,6 +110,15 @@ export async function loadOrCreateConfig() {
     config = createDefaultConfig();
     await saveConfig(config);
     console.log(`Created config at ${getConfigPath()}`);
+    // loadConfig applies this only when a file already existed — it returns
+    // early on ENOENT. Without it here, the FIRST run of a network command
+    // (`login` on a fresh install) leaves the process-wide setting unset, and
+    // the lazy fallback resolves it from the environment against an EMPTY
+    // config. That fallback has no listener to compare against, so the
+    // self-proxy guard cannot fire: an operator whose HTTPS_PROXY points at
+    // their own TeamClaude gets a CONNECT back into the proxy and a timeout,
+    // on the one run where there is no config to explain it.
+    applyUpstreamProxy(config);
   }
   return config;
 }
