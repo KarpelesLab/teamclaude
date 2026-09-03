@@ -151,8 +151,10 @@ export function decideBand(snapshot) {
   tier.forEach((account, i) => {
     const pressure = pressures[i];
     switch (pressure.kind) {
-      // An unknown account stays in: using it is how its quota is discovered,
-      // and banding it out would make the unknown permanent.
+      // An unknown account stays in, bounded or not: using it is how its quota
+      // is discovered, and its window is exactly what using it reports. An
+      // account its bound disqualifies is held off by the RANKING, in
+      // `_belowBandFloor`.
       case 'absent': keep.push(account.index); break;
       case 'known': if (pressure.value >= floor) keep.push(account.index); break;
       default: assertNever(pressure, 'decideBand');

@@ -326,12 +326,17 @@ export class AccountManager {
    *   Neither is routing anything, neither can be owed anything, and there is no
    *   reading to preserve because nothing was reading before them.
    *
-   * THE QUOTA-RESET SWITCH SETTLES, AND MOVING IT TO ESTABLISH WOULD BE A
-   * REGRESSION rather than a tidy-up. It runs when an account's session quota
-   * resets, which is a moment its weekly window may have rolled at too; settling
-   * puts that write through the never-advance guard, and establishing would walk
-   * the reading forward over a roll nothing has answered for. The asymmetry is
-   * load-bearing: carrying nothing is not the same as having nothing to lose.
+   * THE QUOTA-RESET SWITCH SETTLES, AND THE NEVER-ADVANCE GUARD IS NOT THE
+   * REASON: the reference names the account being left, so _priceOn establishes
+   * on the destination too and the guard never refuses there.
+   *
+   * Settling consults what the REQUEST already holds about the destination — a
+   * debt it is owed there, or the reading it took on arriving there earlier in
+   * the same chain. Establishing would discard both and take the account's
+   * current numbers, which is right for startup and an operator's switch,
+   * because no request is in flight to hold anything. What protects the account
+   * being LEFT is not this choice at all: it is the _noteOwedOnLeaving above the
+   * move, which is where every mover discharges the same obligation.
    *
    * The reference is otherwise written in one further place, and it is not a
    * cursor move at all: _seedSessionReferences, which supplies SESSION readings
@@ -491,8 +496,10 @@ export class AccountManager {
   _pickActiveAccount(exclude, model, advisorModel, sessionId, carried) {
     // Clear expired quotas across all accounts and switch proactively if a
     // session reset made a sooner-expiring account the better choice. This runs
-    // on every request so the behaviour holds without the TUI render loop.
-    this.refreshExpiredQuotas();
+    // on every request so the behaviour holds without the TUI render loop, and
+    // it is given this request's model and carrier because the switch it may
+    // perform is a mover like any other.
+    this.refreshExpiredQuotas(model, carried);
     // Session-affinity distribution (opt-in): keep a session on its pinned
     // account for cache reuse, and route a new session to the least-loaded
     // account. Only when enabled, only for a real session, and only outside a
@@ -546,6 +553,11 @@ export class AccountManager {
       // it set unless it actually switches, so the requalification isn't lost
       // when that pass comes up empty and selection degrades.
       if (allowProbe) current.requalify = false;
+      // A MOVER, AND IT RETURNS BEFORE THE ROLLOVER BRANCH BELOW EVER RUNS. The
+      // response that taught us this account's quota can be the same response
+      // that reveals its window rolled a week forward, and this rerank then
+      // moves the request off it without the walk ever asking. Ask here.
+      this._noteOwedOnLeaving(carried, current, model, this._currentRef);
       const next = this._selectNext(exclude, model, advisorModel, carried);
       if (next) { current.requalify = false; return next; }
     }
@@ -576,8 +588,7 @@ export class AccountManager {
         // this point nothing another request does to the shared reference can
         // spend it, and the settlement below — wherever the re-rank lands, and
         // wherever the server's retries land after it — answers for it.
-        this._noteOwed(carried, current, this._governingWindow(current, model).window,
-          this._currentRef.windows);
+        this._noteOwedOnLeaving(carried, current, model, this._currentRef);
         const next = this._selectNext(exclude, model, advisorModel, carried);
         // _selectNext re-ranks, and both ways of not moving end up here: it
         // found nothing eligible, or it handed back the very account we are
@@ -656,8 +667,8 @@ export class AccountManager {
         // fired: from here this REQUEST is owed the roll, so nothing another
         // request does to the shared reference while this one is in flight can
         // spend it, however many destinations it has to try.
-        this._noteOwed(carried, pinned, this._governingWindow(pinned, model).window,
-          this.sessionTracker.refsFor(sessionId, this._weeklyBucketFor(model))?.windows);
+        this._noteOwedOnLeaving(carried, pinned, model,
+          this.sessionTracker.refsFor(sessionId, this._weeklyBucketFor(model)));
         const next = this._pickLeastLoaded(exclude, model, advisorModel);
         if (next && next.index !== idx) {
           // A fleet-wide rollover moves every session pinned to that account at
@@ -707,25 +718,34 @@ export class AccountManager {
     // nears its reset, so scoring two accounts at different instants decides an
     // exact tie on the microseconds between two Date.now() reads.
     const pressures = this._rankedPressures(candidates, model, now);
+    // Ahead of the load terms, because it is the one thing load must not
+    // override: an account the tree knows is nearly spent (see _belowBandFloor).
+    const spent = this._belowBandFloor(candidates, model, now);
     let best = null;
     let bestPriority = Infinity;
+    let bestSpent = Infinity;
     let bestSessions = Infinity;
     let bestInFlight = Infinity;
     let bestPressure = Infinity;
     let bestReset = Infinity;
     candidates.forEach((account, i) => {
       const priority = account.priority || 0;
+      const heldOff = spent[i];
       const sessions = this.sessionTracker.activeCountFor(account.index, now);
       const inFlight = account.inFlight || 0;
       const pressure = pressures[i];
       const reset = this._rankedReset(account, model);
+      const samePriority = priority === bestPriority;
+      const sameSpend = samePriority && heldOff === bestSpent;
       if (priority < bestPriority
-        || (priority === bestPriority && sessions < bestSessions)
-        || (priority === bestPriority && sessions === bestSessions && inFlight < bestInFlight)
-        || (priority === bestPriority && sessions === bestSessions && inFlight === bestInFlight && pressure < bestPressure)
-        || (priority === bestPriority && sessions === bestSessions && inFlight === bestInFlight && pressure === bestPressure && reset < bestReset)) {
+        || (samePriority && heldOff < bestSpent)
+        || (sameSpend && sessions < bestSessions)
+        || (sameSpend && sessions === bestSessions && inFlight < bestInFlight)
+        || (sameSpend && sessions === bestSessions && inFlight === bestInFlight && pressure < bestPressure)
+        || (sameSpend && sessions === bestSessions && inFlight === bestInFlight && pressure === bestPressure && reset < bestReset)) {
         best = account;
         bestPriority = priority;
+        bestSpent = heldOff;
         bestSessions = sessions;
         bestInFlight = inFlight;
         bestPressure = pressure;
@@ -1165,8 +1185,8 @@ export class AccountManager {
       // it just gained.
       if (this.expiryRouting.enabled && this.expiryRouting.preempt
           && this._pinRolledOver(sessionId, pinned, model)) {
-        this._noteOwed(carried, pinned, this._governingWindow(pinned, model).window,
-          this.sessionTracker.refsFor(sessionId, this._weeklyBucketFor(model))?.windows);
+        this._noteOwedOnLeaving(carried, pinned, model,
+          this.sessionTracker.refsFor(sessionId, this._weeklyBucketFor(model)));
         break;
       }
       // Mirror _select's priority preemption, as _selectForSession does.
@@ -1302,6 +1322,12 @@ export class AccountManager {
    *
    * Nor does this reach what an in-flight request is owed: that lives on the
    * request, so a knob toggled while a preemption is in the air cannot touch it.
+   *
+   * THIS PREDICATE IS NOT SEPARATELY GATED. The READER asks the same tenure
+   * question (_pinRolledOver), so deleting either leaves the other answering and
+   * no arm can tell them apart. Seeding stays because it is the cheaper half: it
+   * settles the reference once at a transition, where the reader would otherwise
+   * refuse to answer on every request for the rest of the session.
    */
   _seedSessionReferences() {
     for (const { sessionId, bucket, idx, tenure } of this.sessionTracker.livePins()) {
@@ -1392,6 +1418,26 @@ export class AccountManager {
     }
     return this._bandSnapshot(candidates, model, now).accounts
       .map(a => pressureRank(pressureOf(a, now)));
+  }
+
+  /**
+   * Which of these candidates is known to be nearly spent, as a leading sort
+   * term. A bounded absence is not an unknown: its spend is reported, and
+   * admitting it as discovery would let an account measured at 95% spent win on
+   * having fewer sessions, since load is compared before pressure. It is still
+   * selected when nothing above the floor is available, which keeps its window
+   * discoverable, and an account with no reading at all is never held off.
+   */
+  _belowBandFloor(candidates, model, now) {
+    if (!this.expiryRouting.enabled) return candidates.map(() => 0);
+    const snapshot = this._bandSnapshot(candidates, model, now);
+    const decision = decideBand(snapshot);
+    if (decision.kind !== 'banded') return candidates.map(() => 0);
+    return snapshot.accounts.map(a => {
+      const pressure = pressureOf(a, now);
+      const bound = pressure.kind === 'absent' ? pressure.lowerBound : null;
+      return bound != null && bound < decision.floor ? 1 : 0;
+    });
   }
 
   /**
@@ -1491,8 +1537,25 @@ export class AccountManager {
     return ref && ref.idx === account.index ? ref.windows : null;
   }
 
+  /**
+   * A SESSION reading is evidence only about the stay it was taken in. The
+   * account matching is not enough on its own: a session that left an account
+   * and came back is on the same index in a different tenure, and the seed only
+   * reconciles that at the knob's off-to-on transition. Every other boundary —
+   * distribution being re-enabled is the one that was found — leaves a stamped
+   * reference in place across a move, and reading it as current turns a roll the
+   * session was not present for into a preemption it pays for now.
+   *
+   * So the reader asks what the seed asks: is this reading from the stay the pin
+   * is in now. An unstamped reference (taken before tenures existed on this
+   * record, or by a path that does not stamp) reads as belonging to no stay and
+   * so answers nothing, which is the same safe direction as an absent reading.
+   */
   _pinRolledOver(sessionId, pinned, model) {
-    const ref = this.sessionTracker.refsFor(sessionId, this._weeklyBucketFor(model));
+    const bucket = this._weeklyBucketFor(model);
+    const ref = this.sessionTracker.refsFor(sessionId, bucket);
+    if (!ref || ref.tenure == null) return false;
+    if (ref.tenure !== this.sessionTracker.pinTenure(sessionId, bucket, pinned.index)) return false;
     return this._jumped(this._readingFor(ref, pinned), this._governingWindow(pinned, model));
   }
 
@@ -1605,22 +1668,30 @@ export class AccountManager {
    *  through the arrival instead. The two differ for an origin with no arrival,
    *  which is where the request BEGAN, and that difference IS gated.
    *
-   *  The claim is an invariant with the search that checks it rather than a count
-   *  that ages:
+   *  TWO VERSIONS OF THIS PARAGRAPH HAVE NOW BEEN FALSIFIED WHERE THEY SAID
+   *  THEY WOULD BE. The first counted two selection paths and named a third as
+   *  its falsifier; there was one. The second ranged over sites that DETECT a
+   *  rollover — and detection was the wrong unit, because a path can move a
+   *  request off an account it is owed a rollover on WITHOUT ever asking whether
+   *  one happened, which satisfies that wording while doing the exact harm it
+   *  exists to prevent. Three such paths existed.
    *
-   *    EVERY SITE THAT DETECTS A ROLLOVER EITHER RECORDS THE DEBT OR MOVES NO
-   *    TRAFFIC. The sites are the callers of _pinRolledOver and
-   *    _currentRolledOver; today there are four. Three route — the current walk,
-   *    the session walk, the drain walk — and each calls _noteOwed before it
-   *    moves anything. The fourth is previewRouteIndex, which answers a question
-   *    for the status view and neither moves the cursor nor takes a reading, so
-   *    it has nothing to be owed.
+   *  So the predicate is now MOVEMENT, which is what the harm is made of:
    *
-   *  That is still a search rather than a proof, and it sits beside the sentence
-   *  so the next reader re-runs it rather than trusting the number: a walk added
-   *  later is a fifth caller, and this paragraph is wrong the moment one exists
-   *  without a _noteOwed above it. The cost of keeping accumulation meanwhile is
-   *  one map entry per account in a chain. */
+   *    EVERY SITE THAT MOVES A REQUEST OFF AN ACCOUNT EITHER RECORDS WHAT THAT
+   *    ACCOUNT WAS OWED OR ESTABLISHES THAT IT WAS OWED NOTHING. The movers are
+   *    the writers of the cursor and of a session pin, and _noteOwedOnLeaving is
+   *    how all of them discharge it — it asks the rollover question itself, so a
+   *    mover cannot satisfy this by not asking.
+   *
+   *  The search is `grep -n '_setCurrent(' src/account-manager.js` (six callers,
+   *  enumerated at _setCurrent) plus the three session walks. It is a strictly
+   *  larger and better-defined set than the callers of two predicates, and it is
+   *  mechanically checkable: a SEVENTH cursor write, or a fourth session walk,
+   *  without a _noteOwedOnLeaving above it falsifies this paragraph. That is
+   *  still a search rather than a proof and it ships beside the sentence so the
+   *  next reader re-runs it. The cost of keeping accumulation meanwhile is one
+   *  map entry per account in a chain. */
   _noteOwed(carried, origin, window, reading) {
     if (!carried) return;
     const seen = reading?.get(window);
@@ -1640,6 +1711,25 @@ export class AccountManager {
     const windows = held?.owed ? held.windows : new Map();
     if (!windows.has(window)) windows.set(window, seen);
     readings.set(origin, { windows, owed: true });
+  }
+
+  /**
+   * A request is about to be MOVED OFF `leaving`. Discharge the invariant: ask
+   * whether that account owes this request a rollover and record it if it does.
+   *
+   * Every mover goes through here rather than each deciding for itself whether
+   * the question applies, because a mover that decides for itself can satisfy the
+   * rule by never asking. Asking is free and the answer is usually no.
+   *
+   * `ref` is the reading the mover is measuring against: the current account's
+   * for a cursor write, the session's for a pin. A mover with neither has
+   * nothing to leave.
+   */
+  _noteOwedOnLeaving(carried, leaving, model, ref) {
+    if (!carried || !leaving || !ref) return;
+    const win = this._governingWindow(leaving, model);
+    if (!this._jumped(this._readingFor(ref, leaving), win)) return;
+    this._noteOwed(carried, leaving, win.window, ref.windows);
   }
 
   /** Record what `account` read as this request arrived there. Never over a
@@ -2000,6 +2090,9 @@ export class AccountManager {
       q.unifiedStatusSeenAt = null;
       changed = true;
       session = true;
+      // The other half of this transition is the switch, and it is owed whoever
+      // routes next rather than whoever cleared. See refreshExpiredQuotas.
+      account.sessionResetPending = true;
     }
     if (q.unified7d != null && q.unified7dReset && now >= q.unified7dReset) {
       console.log(`[TeamClaude] Account "${account.name}" weekly quota reset`);
@@ -2100,15 +2193,26 @@ export class AccountManager {
    * account's (and it still has weekly quota), so we spend the quota closest to
    * refreshing first.
    */
-  refreshExpiredQuotas() {
+  refreshExpiredQuotas(model = null, carried = null) {
     let changed = false;
-    const sessionReset = [];
     for (const account of this.accounts) {
-      const r = this._clearExpiredQuotas(account);
-      if (r.changed) changed = true;
-      if (r.session) sessionReset.push(account);
+      if (this._clearExpiredQuotas(account).changed) changed = true;
     }
-    if (sessionReset.length) this._switchOnSessionReset(sessionReset);
+    // The switch is driven by a PENDING MARK rather than by whoever happened to
+    // observe the clear. Clearing and switching are two halves of one
+    // transition, and any reader that touches quota — the status preview's
+    // availability check reaches _clearExpiredQuotas the same way selection
+    // does — can otherwise perform the first half and silently cancel the
+    // second, leaving the fleet on an account the reset should move it off.
+    // Marking makes the halves independent of who runs first: an observer may
+    // clear, and the transition still completes on the next routing pass.
+    const sessionReset = this.accounts.filter(a => a.sessionResetPending);
+    if (sessionReset.length) {
+      // Cleared whether or not the switch takes: the reset has been considered,
+      // and a mark left standing would re-ask the same question every request.
+      for (const a of sessionReset) a.sessionResetPending = false;
+      this._switchOnSessionReset(sessionReset, model, carried);
+    }
     return changed;
   }
 
@@ -2117,7 +2221,7 @@ export class AccountManager {
    * weekly limit expires soonest — but only if that is sooner than the current
    * account's weekly limit and the account still has weekly quota to spend.
    */
-  _switchOnSessionReset(candidates) {
+  _switchOnSessionReset(candidates, model = null, carried = null) {
     const current = this.accounts[this.currentIndex];
     // Need a known weekly reset on the current account to compare against;
     // if it is unknown we are still probing it, so leave it alone.
@@ -2166,12 +2270,18 @@ export class AccountManager {
     // that got us here, and with expiry routing off every rank is absent and
     // equal, so this cannot fire at all.
     if (rankOf.get(best.index) > rankOf.get(current.index)) return;
+    // A MOVER THAT NEVER ASKS ABOUT ROLLOVERS AT ALL, and that was the hole: it
+    // runs from refreshExpiredQuotas at the head of selection, so it can take a
+    // request off a current account whose weekly window has just rolled a week
+    // forward — before the walk below has looked at it even once. Nothing in
+    // this body mentions a rollover, which is exactly why an invariant ranging
+    // over rollover CHECKS could not see it. Ask on the way out.
+    this._noteOwedOnLeaving(carried, current, model, this._currentRef);
     this._setCurrent(best);
-    // No request is being routed here — this runs off a quota update — so there
-    // is no provenance to carry and nothing to be owed. It still settles: the
-    // cursor has moved, and an account the cursor names with no reading behind
-    // it first-sights its next roll.
-    this._noteCurrentSettled(best, null);
+    // Settling rather than establishing, because a request often IS being routed
+    // through here — this runs inside selection — and what it carries decides
+    // what the write means.
+    this._noteCurrentSettled(best, model, carried);
     this._beginRamp(best);
     console.log(`[TeamClaude] Account "${best.name}" session quota reset and weekly expires sooner — switching to it`);
   }

@@ -1054,6 +1054,150 @@ test('a reading naming an account the session has left is re-taken on enable', (
     'the seed kept a reading naming the account the session had left');
 });
 
+test('re-enabling distribution does not revive a debt from an old tenure', () => {
+  // The tenure stamp is only reconciled at the knob's off-to-on transition, and
+  // this is a different boundary: distribution being turned back on. The pin has
+  // moved twice since the reference was stamped, so a reading from the FIRST
+  // stay was being read as current debt and the session paid a preemption for a
+  // roll that happened while it was somewhere else.
+  //
+  // The reader asks the question the seed asks, so a stamp from a finished stay
+  // answers nothing wherever it is read.
+  const am = mgr(['a', 'b'], ON, { distributeSessions: true });
+  bucket(am, 0, 'unified7d', 0.4, 10);
+  bucket(am, 1, 'unified7d', 0.4, 20);
+  assert.equal(serve(am, 's1', OPUS).name, 'a', 'the fixture must pin s1 to a');
+
+  // Distribution off: the session drains, is forced to b, and comes back to a,
+  // so its pin is in its third tenure while the reference still names the first.
+  am.setDistributeSessions(false);
+  am.setDisabled(0, true);
+  assert.equal(serve(am, 's1', OPUS).name, 'b', 'the session should have moved to b');
+  rollWindow(am, 0);
+  am.setDisabled(0, false);
+  am.setDisabled(1, true);
+  assert.equal(serve(am, 's1', OPUS).name, 'a', 'the session should have returned to a');
+  am.setDisabled(1, false);
+
+  am.setDistributeSessions(true);
+  assert.equal(serve(am, 's1', OPUS).name, 'a',
+    'a reading from a finished tenure was read as current debt');
+});
+
+test('an account known to be nearly spent does not win on having fewer sessions', () => {
+  // Admission is unconditional: using an account is how its missing window gets
+  // reported. But a bounded absence is not an unknown, and admitting it as a
+  // discovery would let a 95%-spent account into the band and then win on load,
+  // because load is compared before pressure.
+  const am = mgr(['spent-clockless', 'ample-expiring'], ON, { distributeSessions: true });
+  const q = am.accounts[0].quota;
+  q.unified7dFable = 0.95;        // measured, and nearly gone
+  q.unified7dFableReset = null;   // with no clock
+  q.unified7d = 0.10;
+  q.unified7dReset = Date.now() + 200 * H;
+  am.accounts[0].probing = false;
+  bucket(am, 1, 'unified7dFable', 0.05, 1);
+  bucket(am, 1, 'unified7d', 0.10, 200);
+
+  // The ample account carries a session; the spent one carries none, which is
+  // the whole of its advantage under a load-first comparison.
+  am.beginSession('s1');
+  am.recordSession('s1', 1, FABLE);
+
+  assert.equal(am._pickLeastLoaded(null, FABLE).name, 'ample-expiring',
+    'a measured 95%-spent account won on session count');
+  // Still admitted, because being used is how its window gets reported.
+  assert.deepEqual(am._bandedCandidates(null, FABLE).map(a => a.name),
+    ['spent-clockless', 'ample-expiring']);
+  am.endSession('s1');
+});
+
+// ---------------------------------------------------------------------------
+// Every site that MOVES a request off an account answers for what it was owed
+// ---------------------------------------------------------------------------
+
+test('the 5h session-reset switch records what the account it leaves was owed', () => {
+  // A MOVER THAT NEVER ASKS ABOUT ROLLOVERS. It runs from refreshExpiredQuotas
+  // at the head of selection, so it can take a request off a current account
+  // whose weekly window has just rolled — before the walk has looked at it once.
+  // Nothing in its body mentions a rollover, which is exactly why an invariant
+  // ranging over rollover CHECKS could not see it.
+  const am = mgr(['a', 'b', 'c'], ON);
+  bucket(am, 0, 'unified7d', 0.4, 10);
+  bucket(am, 1, 'unified7d', 0.4, 20);
+  bucket(am, 2, 'unified7d', 0.4, 30);
+  assert.equal(am.setCurrentAccount(0), true);
+  assert.equal(serve(am, null, OPUS).name, 'a', 'the fixture must start on a');
+
+  // a's weekly rolls, and b's 5h window expires in the same instant — so the
+  // reset switch moves the request to b before the walk sees a's jump.
+  rollWindow(am, 0);
+  am.accounts[1].quota.unified5h = 0.5;
+  am.accounts[1].quota.unified5hReset = Date.now() - 1000;
+
+  const carried = {};
+  const first = am.getActiveAccount(null, OPUS, null, null, carried);
+  assert.equal(first.name, 'b', 'the session reset should have moved the request to b');
+
+  // b is refused and c is over threshold, so the retry falls back onto a.
+  am.accounts[2].quota.unified7d = 0.99;
+  const retry = am.getActiveAccount(new Set([first.index]), OPUS, null, null, carried);
+  assert.equal(retry.name, 'a', 'the retry should have fallen back onto the rolled account');
+  am.accounts[2].quota.unified7d = 0.4;
+
+  assert.notEqual(serve(am, null, OPUS).name, 'a',
+    'the reset switch moved the request off a rolled account without recording the debt');
+});
+
+test('the requalification rerank records what the account it leaves was owed', () => {
+  // A SECOND MOVER THAT IS NOT A DETECTOR: it reranks and RETURNS before the
+  // rollover branch runs, so the response that teaches an account's quota can be
+  // the same response that reveals its window rolled, and the move is made with
+  // nothing captured. `requalify` is what updateQuota sets when a probed
+  // account's weekly limit becomes known.
+  const am = mgr(['a', 'b', 'c'], ON);
+  bucket(am, 0, 'unified7d', 0.4, 10);
+  bucket(am, 1, 'unified7d', 0.4, 20);
+  bucket(am, 2, 'unified7d', 0.4, 30);
+  assert.equal(am.setCurrentAccount(0), true);
+  assert.equal(serve(am, null, OPUS).name, 'a', 'the fixture must start on a');
+
+  rollWindow(am, 0);
+  am.accounts[0].requalify = true;
+
+  const carried = {};
+  const first = am.getActiveAccount(null, OPUS, null, null, carried);
+  assert.notEqual(first.name, 'a', 'the rerank should have moved the request off a');
+
+  am.accounts[2].quota.unified7d = 0.99;
+  const retry = am.getActiveAccount(new Set([first.index]), OPUS, null, null, carried);
+  assert.equal(retry.name, 'a', 'the retry should have fallen back onto the rolled account');
+  am.accounts[2].quota.unified7d = 0.4;
+
+  assert.notEqual(serve(am, null, OPUS).name, 'a',
+    'the rerank moved the request off a rolled account without recording the debt');
+});
+
+test('the preview observes a session reset without consuming it', () => {
+  // AN OBSERVER THAT CONSUMES THE EVENT IS NOT AN OBSERVER. The preview's
+  // availability check reaches _clearExpiredQuotas, which performs half the reset
+  // transition — clearing the expired window. With the switch that is its other
+  // half running only for whoever observed the clear, a TUI render cancels the
+  // switch the next real request is owed.
+  const am = mgr(['a', 'b'], ON);
+  bucket(am, 0, 'unified7d', 0.4, 100);
+  bucket(am, 1, 'unified7d', 0.4, 10);
+  assert.equal(am.setCurrentAccount(0), true);
+  am.accounts[1].quota.unified5h = 0.5;
+  am.accounts[1].quota.unified5hReset = Date.now() - 1000;
+
+  // The status view asks its question. It must answer without deciding anything.
+  am.previewRouteIndex(OPUS);
+
+  assert.equal(serve(am, null, OPUS).name, 'b',
+    'the preview consumed the reset and suppressed the switch it belonged to');
+});
+
 test('a knob toggled while a preemption is in flight cannot spend it', () => {
   // The reload arrives mid-request, between the preemption and the retry its
   // destination forced. What the request is owed is not in the tracker for a
