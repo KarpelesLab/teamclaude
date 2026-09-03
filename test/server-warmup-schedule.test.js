@@ -112,6 +112,8 @@ test('server restores a persisted rolling schedule and exposes its cadence throu
     assert.equal(body.warmup.anchorResetAt, '2030-09-01T12:30:00.000Z');
     assert.equal(body.warmup.cadenceSeconds, 18_000);
     assert.equal(body.warmup.windowSeconds, 18_000);
+    assert.equal(body.warmup.nearResetToleranceSeconds, 120);
+    assert.equal(body.warmup.postResetBufferSeconds, 10);
     assert.equal(body.warmup.missedRunPolicy, 'skip');
     assert.equal(Date.parse(body.warmup.nextTargetResetAt) - Date.parse(body.warmup.nextWarmupAt), 18_000_000);
   } finally {

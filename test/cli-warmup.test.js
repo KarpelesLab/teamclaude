@@ -70,6 +70,7 @@ test('warmup rolling saves a restart-stable five-hour reset anchor', async () =>
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /Reset anchor:\s+\d{4}-\d{2}-\d{2} 15:30 Europe\/Moscow \(UTC\+03:00; .*Z\)/);
     assert.match(result.stdout, /Cadence:\s+every 5 hours/);
+    assert.match(result.stdout, /Near reset:\s+wait up to 2 minutes; warm 10s after reset/);
     assert.match(result.stdout, /Missed runs:\s+skipped/);
 
     const config = JSON.parse(await readFile(configPath, 'utf8'));

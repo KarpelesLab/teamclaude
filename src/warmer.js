@@ -20,7 +20,13 @@
 
 import { spawn } from 'node:child_process';
 import { encodePinComponent } from './claude-env.js';
-import { resolveWarmupSchedule } from './warmup-schedule.js';
+import {
+  ROLLING_NEAR_RESET_TOLERANCE_MS,
+  ROLLING_POST_RESET_BUFFER_MS,
+  resolveWarmupSchedule,
+} from './warmup-schedule.js';
+
+const SCHEDULE_TIMER_GRACE_MS = 60_000;
 
 export class Warmer {
   constructor(accountManager, {
@@ -54,7 +60,9 @@ export class Warmer {
     this._stopped = false;
     this._scheduleGeneration = 0;
     this._running = false;
+    this._runFinished = null;
     this._abort = null; // AbortController for the in-flight sweep (see warmAll/stop)
+    this._deferredWarmups = new Map();
     this.lastRunStartedAt = null;
     this.lastRunFinishedAt = null;
     this.nextRunAt = intervalMs > 0 ? this.nowFn() + intervalMs : null;
@@ -77,6 +85,8 @@ export class Warmer {
     this.scheduleStatus = null;
     this.intervalMs = intervalMs;
     if (this.timer) { this.clearTimeoutFn(this.timer); this.timer = null; }
+    this._clearDeferredWarmups();
+    this._abort?.abort();
 
     if (intervalMs > 0) {
       this.nextRunAt = this.nowFn() + intervalMs;
@@ -100,6 +110,8 @@ export class Warmer {
     this.intervalMs = 0;
     this.schedule = schedule;
     if (this.timer) { this.clearTimeoutFn(this.timer); this.timer = null; }
+    this._clearDeferredWarmups();
+    this._abort?.abort();
     if (!schedule) {
       this.scheduleStatus = null;
       this.nextRunAt = null;
@@ -118,7 +130,7 @@ export class Warmer {
       if (generation !== this._scheduleGeneration || this._stopped || !this.schedule) return;
       if (this.timer === timer) this.timer = null;
       const firedAt = this.nowFn();
-      if (firedAt < intendedAt || firedAt >= intendedAt + 60_000) {
+      if (firedAt < intendedAt || firedAt >= intendedAt + SCHEDULE_TIMER_GRACE_MS) {
         this._armSchedule(generation);
         return;
       }
@@ -136,6 +148,7 @@ export class Warmer {
     this._scheduleGeneration += 1;
     this._stopped = true;
     if (this.timer) { this.clearTimeoutFn(this.timer); this.timer = null; }
+    this._clearDeferredWarmups();
     this.nextRunAt = null;
     // Cancel an in-flight sweep and kill any child it spawned, so shutdown /
     // `warmup off` doesn't block on a running warm-up or orphan a `claude`.
@@ -152,41 +165,147 @@ export class Warmer {
    *  - accounts with a live 5h window — already warm, so warming again only burns
    *    quota for nothing.
    */
-  _isWarmTarget(account) {
+  _isWarmCandidate(account) {
     if (account.type !== 'oauth' || !account.credential) return false;
     if (account.upstream) return false;
     if (account.disabled) return false;
     if (account.status === 'error' || account.status === 'exhausted' || account.status === 'throttled') return false;
+    return true;
+  }
+
+  _isWarmTarget(account, now = this.nowFn()) {
+    if (!this._isWarmCandidate(account)) return false;
     const reset = account.quota?.unified5hReset;
-    return !(reset && Date.now() < reset); // a future reset ⇒ session already running
+    return !(reset && now < reset); // a future reset ⇒ session already running
   }
 
   /** Warm every eligible account once. Overlapping cycles are skipped. Sequential
    *  on purpose: one subprocess at a time keeps load and the quota burst gentle. */
   async warmAll() {
     if (this._running) return;
+    const now = this.nowFn();
+    const generation = this._scheduleGeneration;
+    const targets = [];
+    const deferred = [];
+    for (const account of this.am.accounts) {
+      if (!this._isWarmCandidate(account)) continue;
+      const resetAt = Number(account.quota?.unified5hReset);
+      const resetRemaining = resetAt - now;
+      if (this.schedule?.mode === 'rolling'
+        && Number.isFinite(resetAt)
+        && resetRemaining > 0
+        && resetRemaining <= ROLLING_NEAR_RESET_TOLERANCE_MS) {
+        deferred.push({ account, runAt: resetAt + ROLLING_POST_RESET_BUFFER_MS });
+      } else if (this._isWarmTarget(account, now)) {
+        targets.push(account);
+      }
+    }
+
+    await this._warmTargets(targets, { generation });
+    for (const item of deferred) {
+      this._deferWarmAccount(item.account, item.runAt, generation);
+    }
+  }
+
+  async _warmTargets(targets, {
+    generation = this._scheduleGeneration,
+    waitForRunning = false,
+    deadline = null,
+  } = {}) {
+    while (this._running) {
+      if (!waitForRunning) return false;
+      await this._runFinished;
+    }
+    if (generation !== this._scheduleGeneration || this._stopped) return false;
+    if (deadline !== null && this.nowFn() >= deadline) return false;
     this._running = true;
+    let finishRun;
+    const runFinished = new Promise(resolve => { finishRun = resolve; });
+    this._runFinished = runFinished;
     const abort = this._abort = new AbortController();
     this.lastRunStartedAt = Date.now();
-    this.nextRunAt = this.intervalMs > 0 ? this.lastRunStartedAt + this.intervalMs : null;
+    if (this.intervalMs > 0) this.nextRunAt = this.lastRunStartedAt + this.intervalMs;
     try {
-      const targets = this.am.accounts.filter(account => this._isWarmTarget(account));
       for (const account of targets) {
-        if (abort.signal.aborted) break; // stopped mid-sweep (shutdown / warmup off)
-        await this.warmAccount(account, abort.signal);
+        const canContinue = () => generation === this._scheduleGeneration
+          && !this._stopped
+          && (deadline === null || this.nowFn() < deadline);
+        if (abort.signal.aborted || !canContinue()) break;
+        const isStillEligible = () => this._isWarmTarget(account);
+        if (!isStillEligible()) continue;
+        await this.warmAccount(
+          account,
+          abort.signal,
+          canContinue,
+          isStillEligible,
+        );
       }
+      return true;
     } finally {
       this.lastRunFinishedAt = Date.now();
       this._running = false;
       if (this._abort === abort) this._abort = null;
+      if (this._runFinished === runFinished) this._runFinished = null;
+      finishRun();
     }
   }
 
-  async warmAccount(account, signal) {
+  _deferWarmAccount(account, runAt, generation) {
+    if (generation !== this._scheduleGeneration || this._stopped || this.schedule?.mode !== 'rolling') return;
+    if (this._deferredWarmups.has(account)) return;
+    const delay = Math.max(0, runAt - this.nowFn());
+    const timer = this.setTimeoutFn(async () => {
+      if (this._deferredWarmups.get(account) === timer) this._deferredWarmups.delete(account);
+      if (generation !== this._scheduleGeneration || this._stopped || this.schedule?.mode !== 'rolling') return;
+      const remaining = runAt - this.nowFn();
+      if (remaining > 0) {
+        this._deferWarmAccount(account, runAt, generation);
+        return;
+      }
+      const deadline = runAt + SCHEDULE_TIMER_GRACE_MS;
+      if (this.nowFn() >= deadline) return;
+      if (!this._isWarmTarget(account)) return;
+      await this._warmTargets([account], {
+        generation,
+        waitForRunning: true,
+        deadline,
+      });
+    }, delay);
+    this._deferredWarmups.set(account, timer);
+    timer.unref?.();
+    this.log(`[TeamClaude] Keep-warm delaying "${account.name}" until ${new Date(runAt).toISOString()} (5h reset within 2m)`);
+  }
+
+  _clearDeferredWarmups() {
+    for (const timer of this._deferredWarmups.values()) this.clearTimeoutFn(timer);
+    this._deferredWarmups.clear();
+  }
+
+  async warmAccount(account, signal, shouldContinue = () => true, isStillEligible = () => true) {
     const startedAt = Date.now();
+    const previousStatus = this.accountStatus.get(account.name);
     this._record(account, { status: 'running', startedAt });
     try {
       await this.am.ensureTokenFresh(account.index);
+      if (signal?.aborted || !shouldContinue()) {
+        if (previousStatus) this.accountStatus.set(account.name, previousStatus);
+        else this.accountStatus.delete(account.name);
+        return;
+      }
+      if (account.status === 'error') {
+        const finishedAt = Date.now();
+        this._record(account, {
+          status: 'error',
+          error: 'token refresh rejected; re-login required',
+          startedAt, finishedAt, durationMs: finishedAt - startedAt,
+        });
+        return;
+      }
+      if (!isStillEligible()) {
+        if (previousStatus) this.accountStatus.set(account.name, previousStatus);
+        else this.accountStatus.delete(account.name);
+        return;
+      }
       const code = await this.spawnFn(this._spawnSpec(account, signal));
       const finishedAt = Date.now();
       this._record(account, {

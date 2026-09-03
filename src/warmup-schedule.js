@@ -1,4 +1,6 @@
 const WINDOW_MS = 5 * 60 * 60 * 1000;
+export const ROLLING_NEAR_RESET_TOLERANCE_MS = 2 * 60 * 1000;
+export const ROLLING_POST_RESET_BUFFER_MS = 10 * 1000;
 const formatterCache = new Map();
 
 function formatter(timezone) {
@@ -142,6 +144,8 @@ export function resolveWarmupSchedule(schedule, now = Date.now()) {
       anchorResetAt: new Date(anchorResetAt).toISOString(),
       cadenceSeconds: WINDOW_MS / 1000,
       windowSeconds: WINDOW_MS / 1000,
+      nearResetToleranceSeconds: ROLLING_NEAR_RESET_TOLERANCE_MS / 1000,
+      postResetBufferSeconds: ROLLING_POST_RESET_BUFFER_MS / 1000,
       nextWarmupAt: new Date(nextWarmupAt).toISOString(),
       nextTargetResetAt: new Date(nextWarmupAt + WINDOW_MS).toISOString(),
       missedRunPolicy: 'skip',
@@ -203,6 +207,7 @@ export function formatWarmupScheduleConfirmation(schedule, now = Date.now()) {
       'Rolling warm-up schedule saved',
       `Reset anchor:   ${zonedInstant(anchorResetAt, resolved.timezone)}`,
       'Cadence:        every 5 hours (Anthropic-defined)',
+      `Near reset:     wait up to ${resolved.nearResetToleranceSeconds / 60} minutes; warm ${resolved.postResetBufferSeconds}s after reset`,
       `Next warm-up:   ${zonedInstant(warmupAt, resolved.timezone)}`,
       `Expected reset: ${zonedInstant(resetAt, resolved.timezone)}`,
       'Missed runs:    skipped',

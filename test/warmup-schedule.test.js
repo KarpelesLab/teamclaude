@@ -64,6 +64,8 @@ test('rolling schedule advances from its persisted anchor in absolute five-hour 
     anchorResetAt: '2026-09-01T12:30:00.000Z',
     cadenceSeconds: 18_000,
     windowSeconds: 18_000,
+    nearResetToleranceSeconds: 120,
+    postResetBufferSeconds: 10,
     nextWarmupAt: '2026-09-02T08:30:00.000Z',
     nextTargetResetAt: '2026-09-02T13:30:00.000Z',
     missedRunPolicy: 'skip',
