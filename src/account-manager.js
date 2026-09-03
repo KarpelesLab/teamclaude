@@ -1,4 +1,6 @@
 import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired } from './oauth.js';
+import { providerOf, DEFAULT_PROVIDER } from './provider.js';
+import { refreshCodexToken } from './codex-auth.js';
 import { sameIdentity } from './identity.js';
 import { weeklyBucketForModel, modelGlobMatches, modelFamily } from './model.js';
 import { SessionTracker } from './session-tracker.js';
@@ -95,6 +97,13 @@ function makeAccount(acct, index) {
     id: acct.id || null,
     name: acct.name,
     type: acct.type,
+    // Which backend this account talks to. Absent means Anthropic, so configs
+    // written before providers existed keep working untouched.
+    provider: providerOf(acct),
+    // Codex scopes a token to one ChatGPT account via a request header; this is
+    // that id. The Anthropic counterpart is `accountUuid`, which is patched
+    // into the request body instead.
+    accountId: acct.accountId || null,
     accountUuid: acct.accountUuid || null,
     orgUuid: acct.orgUuid || null,
     orgName: acct.orgName || null,
@@ -174,12 +183,13 @@ function sampleModelFor(route) {
 }
 
 export class AccountManager {
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, sessionTracker } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, sessionTracker } = {}) {
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
     // OAuth token refresh.
     this._refreshFn = refreshFn;
+    this._codexRefreshFn = codexRefreshFn;
     this.accounts = accounts.map((acct, index) => makeAccount(acct, index));
     this.currentIndex = 0;
     // Session awareness (issue #109). The tracker is always on (passive — it just
@@ -392,14 +402,36 @@ export class AccountManager {
    * satisfies both, selection degrades to executor-only routing so the main
    * request keeps flowing (upstream then fails just the advisor call).
    */
-  getActiveAccount(exclude = null, model = null, advisorModel = null, sessionId = null) {
-    const account = this._pickActiveAccount(exclude, model, advisorModel, sessionId);
+  getActiveAccount(exclude = null, model = null, advisorModel = null, sessionId = null, provider = DEFAULT_PROVIDER) {
+    const account = this._pickActiveAccount(this._excludeOtherProviders(exclude, provider), model, advisorModel, sessionId);
     // Record where this route now sits, whatever path chose it — the steady-state
     // path returns the account the cursor already names and never reaches the
     // rotation code, so recording there alone would leave the cursor unset and
     // the next real failover unpaced.
     if (account) this.routeCursors.set(this._cursorKey(model), account.index);
     return account;
+  }
+
+  /**
+   * Widen a request's exclude set to every account that belongs to a different
+   * provider.
+   *
+   * A provider partition is absolute — an Anthropic account cannot serve an
+   * OpenAI Responses request at all — so it is expressed as exclusion rather
+   * than threaded through the rotation logic. Everything downstream already
+   * reads `exclude`, so cursors, pinning, session affinity, probing and
+   * preemption keep working unchanged, and a config with no Codex accounts
+   * produces the identical set it did before.
+   *
+   * Returns the caller's own set untouched when nothing needs excluding, so
+   * the common single-provider case allocates nothing.
+   */
+  _excludeOtherProviders(exclude, provider) {
+    const foreign = this.accounts.filter(a => providerOf(a) !== provider);
+    if (foreign.length === 0) return exclude;
+    const combined = new Set(exclude || []);
+    for (const account of foreign) combined.add(account.index);
+    return combined;
   }
 
   _pickActiveAccount(exclude, model, advisorModel, sessionId) {
@@ -1771,7 +1803,13 @@ export class AccountManager {
     account._refreshPromise = (async () => {
       console.log(`[TeamClaude] Refreshing token for account "${account.name}"...`);
       try {
-        const newTokens = await this._refreshFn(account.refreshToken);
+        // Each provider mints tokens at its own endpoint with its own client
+        // id, so the grant is dispatched by provider. Both return the same
+        // { accessToken, refreshToken, expiresAt } shape, which is what lets
+        // everything downstream stay provider-agnostic.
+        const newTokens = await (providerOf(account) === 'codex'
+          ? this._codexRefreshFn(account.refreshToken)
+          : this._refreshFn(account.refreshToken));
         account.credential = newTokens.accessToken;
         account.refreshToken = newTokens.refreshToken;
         account.expiresAt = newTokens.expiresAt;

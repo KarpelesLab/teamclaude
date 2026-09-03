@@ -87,6 +87,66 @@ Every account entry carries an `id`, added the first time the config is read and
 
 Hand edits are fine. Leave the `id` alone and it keeps working; delete it and a new one is issued on the next read. If you copy an account block to make a second entry, the duplicated `id` is spotted on the next read and the later of the two gets a fresh one.
 
+## Codex accounts (experimental)
+
+An OpenAI Codex subscription can be pooled alongside your Claude accounts. Add
+an account with `"provider": "codex"` and TeamClaude reads the login the Codex
+CLI already stores in `~/.codex/auth.json`:
+
+```json
+{ "name": "me@example.com", "type": "oauth", "provider": "codex" }
+```
+
+Point another `importFrom` at a different file to pool several Codex logins.
+
+Then tell Codex to reach TeamClaude instead of OpenAI, in `~/.codex/config.toml`:
+
+```toml
+model_provider = "teamclaude"
+
+[model_providers.teamclaude]
+name = "teamclaude"
+base_url = "http://127.0.0.1:3456/backend-api/codex"
+wire_api = "responses"
+```
+
+`OPENAI_BASE_URL` does **not** work for this — a ChatGPT-authenticated Codex
+ignores it. `model_providers` is the supported redirect.
+
+The `/backend-api/codex` suffix matters. A Codex subscription authenticates
+against the ChatGPT backend, not the OpenAI API platform — pointed at
+`api.openai.com` the same token is refused with `Missing scopes:
+api.responses.write`. Codex appends `/responses` and `/models` to `base_url`,
+so this suffix makes it emit exactly the paths the ChatGPT backend expects and
+TeamClaude forwards them verbatim.
+
+### How it shares the port with Claude
+
+One listener serves both CLIs, because the request path says which pool of
+accounts is eligible: Claude Code posts to `/v1/messages`, Codex posts to
+`/backend-api/codex/responses`. An Anthropic account is never offered a Codex
+request and vice versa, so the two rotate independently on one port, one config
+and one TUI.
+
+### What differs from a Claude account
+
+- The credential is injected as `Authorization: Bearer`, plus a
+  `ChatGPT-Account-Id` header. That header is OpenAI's counterpart to the
+  `account_uuid` TeamClaude patches into an Anthropic request body — so the
+  Codex path performs no body rewrite at all.
+- Tokens refresh against `auth.openai.com` using the Codex CLI's own client id.
+- The request body is forwarded untouched. This is a passthrough, not a
+  translation layer: TeamClaude never converts between the Anthropic and OpenAI
+  protocols.
+
+### Current limits
+
+Codex accounts rotate on upstream rejection, the same way a third-party backend
+does. The quota-driven parts of rotation — the switch threshold, reset
+countdowns and the TUI's quota bars — are Anthropic-only for now, because they
+read `anthropic-ratelimit-unified-*` response headers. Codex reports its own
+`primary`/`secondary` windows, so wiring those in is a natural follow-up.
+
 ## Third-party backend accounts
 
 Any Anthropic-compatible API can be added as an account alongside your Claude accounts. Give it a higher `priority` value (lower = preferred, so use e.g. `100`) and it will be used as a fallback when all Claude accounts are exhausted.

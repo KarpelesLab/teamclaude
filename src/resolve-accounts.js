@@ -1,4 +1,6 @@
 import { importCredentials } from './oauth.js';
+import { importCodexCredentials, DEFAULT_CODEX_CREDENTIALS_PATH } from './codex-auth.js';
+import { providerOf } from './provider.js';
 
 /**
  * Turn configured accounts into the objects the AccountManager is built from:
@@ -15,18 +17,24 @@ export async function resolveAccounts(config) {
   const accounts = [];
   for (const acct of config.accounts) {
     if (acct.type === 'oauth') {
-      if (acct.importFrom) {
+      if (acct.importFrom || providerOf(acct) === 'codex') {
+        // A Codex account defaults to the Codex CLI's own credentials file, so
+        // `{ "name": "...", "type": "oauth", "provider": "codex" }` is enough
+        // to pool an already-signed-in Codex login.
+        const isCodex = providerOf(acct) === 'codex';
+        const from = acct.importFrom || (isCodex ? DEFAULT_CODEX_CREDENTIALS_PATH : null);
+        if (!from) { console.error(`No token for "${acct.name}", skipping`); continue; }
         try {
-          const creds = await importCredentials(acct.importFrom);
+          const creds = isCodex ? await importCodexCredentials(from) : await importCredentials(from);
           // A readable file with no token is as unusable as a missing one; the
           // non-import branch below already refuses that case, and pushing it
           // anyway would send `Bearer undefined` upstream on every request.
           if (!creds.accessToken) {
-            console.error(`No token in ${acct.importFrom} for "${acct.name}", skipping`);
+            console.error(`No token in ${from} for "${acct.name}", skipping`);
             continue;
           }
           accounts.push({ ...acct, ...creds });
-          console.log(`Imported "${acct.name}" from ${acct.importFrom}`);
+          console.log(`Imported "${acct.name}" from ${from}`);
         } catch (err) {
           console.error(`Failed to import "${acct.name}": ${err.message}`);
         }

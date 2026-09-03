@@ -11,6 +11,7 @@ import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
 import { TopLevelFieldFinder, modelGlobMatches } from './model.js';
 import { BodyWriter, truncationNote } from './request-log.js';
 import { upstreamFetch } from './upstream-fetch.js';
+import { applyAuthHeaders, upstreamFor, rewritesBody, providerForPath } from './provider.js';
 import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
 import { safeLine } from './safe-text.js';
@@ -702,7 +703,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         : null;
       if (client && clientUsage) clientUsage.record(client, { requests: 1 });
 
-      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, holdBudgetMs: holdMs, sessionId, client, onUsage, logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
+      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, provider: providerForPath(req.url), holdBudgetMs: holdMs, sessionId, client, onUsage, logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -1309,7 +1310,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // and the caller gets the exhausted response rather than leaking to another.
   const account = ctx.pinnedIndex != null
     ? (ctx.tried.has(ctx.pinnedIndex) ? null : accountManager.accounts[ctx.pinnedIndex])
-    : accountManager.getActiveAccount(ctx.tried, ctx.model, ctx.advisorModel, ctx.sessionId);
+    : accountManager.getActiveAccount(ctx.tried, ctx.model, ctx.advisorModel, ctx.sessionId, ctx.provider);
   if (!account) {
     // Every candidate was refused by upstream (403). Waiting will not help — the
     // account needs attention, not a retry — so say so plainly rather than
@@ -1423,7 +1424,6 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   }
 
   // Build upstream request headers
-  const isOAuth = account.type === 'oauth';
   const headers = {};
   for (const [key, value] of Object.entries(req.headers)) {
     const lk = key.toLowerCase();
@@ -1438,23 +1438,29 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     headers[key] = value;
   }
 
-  if (isOAuth) {
-    headers['authorization'] = `Bearer ${account.credential}`;
-  } else {
-    headers['x-api-key'] = account.credential;
-  }
+  // Credential presentation is provider-specific: Anthropic OAuth and Codex
+  // both use a bearer token, Anthropic API keys use x-api-key, and Codex also
+  // needs ChatGPT-Account-Id to scope the token to one account.
+  applyAuthHeaders(headers, account);
 
-  const upstreamUrl = `${account.upstream || upstream}${req.url}`;
+  const upstreamUrl = `${upstreamFor(account, upstream)}${req.url}`;
   const method = req.method;
 
-  // Strip orphaned tool_use / tool_result blocks so a client that compacted or
-  // interrupted a turn can't wedge the session with Anthropic's non-retryable
-  // 400 ("tool_use ids were found without tool_result blocks"). No-op (same
-  // Buffer) for a well-formed body.
-  let sendBody = sanitizeToolPairs(body, req.url, req.headers['content-type']);
-  // Align the body's account_uuid (in metadata.user_id) with the account whose
-  // token we're injecting (same-length patch; no-op if absent).
-  if (account.accountUuid) sendBody = patchAccountUuid(sendBody, account.accountUuid);
+  let sendBody = body;
+  // The body rewrites below are Anthropic-shaped and must not touch another
+  // provider's payload: a Responses API body has no metadata.user_id to patch
+  // and no Anthropic tool-pairing rule to repair, so running them would at
+  // best waste a pass and at worst corrupt a valid request.
+  if (rewritesBody(account)) {
+    // Strip orphaned tool_use / tool_result blocks so a client that compacted or
+    // interrupted a turn can't wedge the session with Anthropic's non-retryable
+    // 400 ("tool_use ids were found without tool_result blocks"). No-op (same
+    // Buffer) for a well-formed body.
+    sendBody = sanitizeToolPairs(body, req.url, req.headers['content-type']);
+    // Align the body's account_uuid (in metadata.user_id) with the account whose
+    // token we're injecting (same-length patch; no-op if absent).
+    if (account.accountUuid) sendBody = patchAccountUuid(sendBody, account.accountUuid);
+  }
   // Rewrite the model name for accounts that target a different upstream (e.g.
   // GLM), which uses different model identifiers than Anthropic.
   if (account.modelMap) sendBody = rewriteModel(sendBody, account.modelMap);

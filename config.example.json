@@ -28,6 +28,12 @@
       "refreshToken": "sk-ant-ort01-your-refresh-token"
     },
     {
+      "name": "codex@example.com",
+      "type": "oauth",
+      "provider": "codex",
+      "priority": 0
+    },
+    {
       "name": "api-fallback",
       "type": "apikey",
       "priority": 10,
