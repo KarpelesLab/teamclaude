@@ -13,9 +13,48 @@
 // rendering uses textContent — status fields (account names, client names) are
 // operator/OAuth-derived, but they still never reach innerHTML.
 
+import { UNAVAILABLE_TEXT } from './status-renderer.js';
+
 export function renderDashboardHtml() {
   return PAGE;
 }
+
+// The page's pure logic lives here, not in the script string: these functions
+// close over nothing and touch no DOM, so they are serialized into the page
+// with toString() below AND exported for the test suite. One implementation,
+// tested and served — a test against the string would only be a source grep.
+
+// Model-scoped weekly buckets, one row per family upstream actually metered.
+// `scopedWeekly` is learned from the usage payload's `limits` array, so it is
+// the complete list when present; the two dedicated fields are the fallback for
+// a payload that reported `seven_day_sonnet` without a `limits` array.
+export function scopedWeeklyRows(quota) {
+  var q = quota || {};
+  var scoped = q.scopedWeekly || {};
+  var rows = [];
+  Object.keys(scoped).forEach(function (family) {
+    var b = scoped[family] || {};
+    rows.push({ family: family, label: family.charAt(0).toUpperCase() + family.slice(1), utilization: b.utilization, resetAt: b.resetAt });
+  });
+  [{ family: 'fable', label: 'Fable', u: q.unified7dFable, r: q.unified7dFableReset },
+    { family: 'sonnet', label: 'Sonnet', u: q.unified7dSonnet, r: q.unified7dSonnetReset }].forEach(function (f) {
+    if (Object.prototype.hasOwnProperty.call(scoped, f.family) || f.u == null) return;
+    rows.push({ family: f.family, label: f.label, utilization: f.u, resetAt: f.r });
+  });
+  rows.sort(function (a, b) { return a.family < b.family ? -1 : a.family > b.family ? 1 : 0; });
+  return rows;
+}
+
+// What an account has spent, cache included. `totalInputTokens` counts uncached
+// input only, which on Claude Code traffic is ~0.05% of the input side — a
+// total without the cache fields understates the account by orders of magnitude.
+export function accountTokens(usage) {
+  var u = usage || {};
+  return (u.totalInputTokens || 0) + (u.totalOutputTokens || 0)
+    + (u.totalCacheReadTokens || 0) + (u.totalCacheCreationTokens || 0);
+}
+
+const SHARED_HELPERS = [scopedWeeklyRows, accountTokens].map(fn => fn.toString()).join('\n\n');
 
 const PAGE = `<!doctype html>
 <html lang="en">
@@ -59,6 +98,7 @@ const PAGE = `<!doctype html>
   tr:last-child td { border-bottom: none; }
   td.num, th.num { text-align: right; }
   .usage { color: var(--dim); font-size: 12px; margin-top: 6px; }
+  .blocked { color: var(--warn); font-size: 12px; margin-top: 6px; }
   #err { color: var(--bad); margin: 12px 0; display: none; }
   #keybox { display: none; margin: 40px auto; max-width: 420px; text-align: center; }
   #keybox input { width: 100%; padding: 10px 12px; margin: 12px 0; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; color: var(--text); font: inherit; }
@@ -93,6 +133,9 @@ const PAGE = `<!doctype html>
   var KEY = 'teamclaude-dashboard-key';
   var POLL_MS = 5000;
   var timer = null;
+  var UNAVAILABLE_TEXT = ${JSON.stringify(UNAVAILABLE_TEXT)};
+
+${SHARED_HELPERS}
 
   function el(tag, cls, text) {
     var e = document.createElement(tag);
@@ -175,21 +218,23 @@ const PAGE = `<!doctype html>
     head.appendChild(el('span', 'badge ' + (a.status || ''), a.disabled ? 'disabled' : (a.status || 'unknown')));
     if (a.sessions) head.appendChild(el('span', 'tag', a.sessions + ' active session' + (a.sessions > 1 ? 's' : '')));
     card.appendChild(head);
+    if (a.unavailable) card.appendChild(el('div', 'blocked', 'blocked: ' + (UNAVAILABLE_TEXT[a.unavailable] || a.unavailable)));
     var q = a.quota || {};
     if (q.unified5h != null || q.unified7d != null) {
       card.appendChild(quotaRow('Session', q.unified5h, q.unified5hReset));
       card.appendChild(quotaRow('Weekly', q.unified7d, q.unified7dReset));
-      if (q.unified7dSonnet != null) card.appendChild(quotaRow('Sonnet', q.unified7dSonnet, q.unified7dSonnetReset));
-      if (q.unified7dFable != null) card.appendChild(quotaRow('Fable', q.unified7dFable, q.unified7dFableReset));
+      // Model-scoped weekly buckets are learned from the usage endpoint rather
+      // than declared, so hard-coding the two families that have dedicated
+      // fields drew an incomplete picture the moment upstream metered a third.
+      scopedWeeklyRows(q).forEach(function (r) { card.appendChild(quotaRow(r.label, r.utilization, r.resetAt)); });
     } else if (q.tokensLimit != null && q.tokensRemaining != null) {
       card.appendChild(quotaRow('Tokens', 1 - q.tokensRemaining / q.tokensLimit, q.resetsAt));
     } else {
       card.appendChild(el('div', 'usage', 'quota unknown (no traffic observed yet)'));
     }
     var u = a.usage || {};
-    var tok = (u.totalInputTokens || 0) + (u.totalOutputTokens || 0);
     var last = u.lastUsed ? ' · last ' + fmtAgo(u.lastUsed) : '';
-    card.appendChild(el('div', 'usage', (u.totalRequests || 0) + ' req · ' + fmtNum(tok) + ' tok' + last));
+    card.appendChild(el('div', 'usage', (u.totalRequests || 0) + ' req · ' + fmtNum(accountTokens(u)) + ' tok' + last));
     return card;
   }
 
