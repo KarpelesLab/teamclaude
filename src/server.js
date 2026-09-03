@@ -1295,9 +1295,18 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // A pinned request (via /tc-acct/<name>) forces one exact account and never
   // rotates or fails over: once that account has been tried, `account` is null
   // and the caller gets the exhausted response rather than leaking to another.
+  //
+  // `ctx.preemption` is this request's own scratch space for the rollover it may
+  // be owed, and it is handed to every selection this request makes — including
+  // the ones the recursive retries below make after a refusal. It belongs beside
+  // `ctx.tried` for the same reason: both describe THIS attempt at THIS request,
+  // and both have to survive the awaits and recursions in between. Defaulted
+  // here rather than at the ctx construction site because this function is
+  // exported and a caller may hand us a ctx built elsewhere.
+  ctx.preemption ??= {};
   const account = ctx.pinnedIndex != null
     ? (ctx.tried.has(ctx.pinnedIndex) ? null : accountManager.accounts[ctx.pinnedIndex])
-    : accountManager.getActiveAccount(ctx.tried, ctx.model, ctx.advisorModel, ctx.sessionId);
+    : accountManager.getActiveAccount(ctx.tried, ctx.model, ctx.advisorModel, ctx.sessionId, ctx.preemption);
   if (!account) {
     // Every candidate was refused by upstream (403). Waiting will not help — the
     // account needs attention, not a retry — so say so plainly rather than

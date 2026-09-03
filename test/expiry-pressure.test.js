@@ -155,8 +155,13 @@ test('every reader and the WRITER agree with a table nobody derived from them', 
   // of the helpers under test: asserting `_governingWeekly(a) ===
   // _governingWindow(a).utilization` compares one function with itself and
   // cannot fail. Every number below is independently
-  // constructed, and the WRITER (_setCurrent, through the reference it
-  // establishes) is checked alongside the readers.
+  // constructed, and the WRITER is checked alongside the readers.
+  //
+  // The writer is reached through `setCurrentAccount` — the operator's switch,
+  // which is a real caller rather than an internal — because `_setCurrent` only
+  // moves the cursor, and what a request reads is established at its settlement.
+  // Following the writer is the point of the guard; asserting against a method
+  // that does not hold it would measure nothing.
   const now = Date.now();
   const SHARED = now + 40 * H;
   const SCOPED = now + 12 * H;
@@ -209,9 +214,17 @@ test('every reader and the WRITER agree with a table nobody derived from them', 
 
     // The WRITER: making the account current must leave the reference holding
     // exactly this window at exactly this reset, under this name.
-    am._setCurrent(a);
+    assert.equal(am.setCurrentAccount(a.index), true);
     assert.equal(am._currentRef.windows.get(c.window), c.resetAt,
       `${c.label}: writer stored the wrong reset under ${c.window}`);
+
+    // And the writer a REQUEST reaches, which is the one every routed request
+    // goes through: settling on the account must store the same window at the
+    // same reset. Two writers, one table.
+    am._currentRef = { idx: null, windows: new Map() };
+    am._noteCurrentSettled(a, c.model);
+    assert.equal(am._currentRef.windows.get(c.window), c.resetAt,
+      `${c.label}: the settlement writer stored the wrong reset under ${c.window}`);
   }
 });
 

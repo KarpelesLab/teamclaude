@@ -24,11 +24,17 @@ function bucket(am, index, key, used, hours) {
   am.accounts[index].probing = false;
 }
 
-// One complete request for `sessionId`: select, record where it was served, and
+// One complete request for `sessionId`: select, record where it was sent, and
 // end — the order the server does it in.
-function serve(am, sessionId, model, { exclude = null } = {}) {
+//
+// The scratch object is the request itself. server.js keeps one per client
+// request on its ctx and hands it to every selection that request makes, so a
+// fixture that models a request has to model that too: it is where the rollover
+// a preemption owes is carried while the request is in flight. A `carried`
+// passed in is a fixture driving several selections through ONE request.
+function serve(am, sessionId, model, { exclude = null, carried = {} } = {}) {
   am.beginSession(sessionId);
-  const account = am.getActiveAccount(exclude, model, null, sessionId);
+  const account = am.getActiveAccount(exclude, model, null, sessionId, carried);
   if (account) am.recordSession(sessionId, account.index, model);
   am.endSession(sessionId);
   return account;
@@ -152,46 +158,6 @@ test('a preemption that fails back onto the rolled account stays owed', () => {
   assert.equal(serve(am, 's1', OPUS).index, other);
 });
 
-test('two requests in flight leave the rollover owed, whichever selects first', () => {
-  // The concurrency half of preempt-exactly-once, and why preemption is a
-  // comparison rather than an event. One request is preempted off the rolled
-  // account; a sibling has its only destination excluded and comes back to it.
-  // Neither SETTLES the traffic anywhere, so neither prices the account.
-  //
-  // The scheduling freedom two concurrent requests actually have is which of
-  // them runs first, not whether a selection can be separated from the record
-  // that follows it: server.js awaits nothing between getActiveAccount and
-  // recordSession, so each request's pair is indivisible and this sweeps the
-  // pairs. Responses land in either order too and are swept with them, though
-  // nothing a response does reaches the manager — which is the property.
-  for (const order of ['moved-first', 'back-first']) {
-    const am = pinnedFleet(ON);
-    const first = serve(am, 's1', OPUS);
-    const other = 1 - first.index;
-    rollWindow(am, first.index);
-
-    am.beginSession('s1');
-    am.beginSession('s1');
-    // The preempted request, and the sibling whose only destination is already
-    // in its own tried set — each selecting and recording as one step.
-    const moved = () => {
-      const a = am.getActiveAccount(null, OPUS, null, 's1');
-      assert.equal(a.index, other, `order ${order}: the rollover did not preempt`);
-      am.recordSession('s1', a.index, OPUS);
-    };
-    const back = () => {
-      const a = am.getActiveAccount(new Set([other]), OPUS, null, 's1');
-      assert.equal(a.index, first.index, `order ${order}: the sibling did not fall back`);
-      am.recordSession('s1', a.index, OPUS);
-    };
-    for (const step of (order === 'moved-first' ? [moved, back] : [back, moved])) step();
-    am.endSession('s1');
-    am.endSession('s1');
-
-    assert.notEqual(serve(am, 's1', OPUS).index, first.index,
-      `order ${order}: the rollover was forgotten`);
-  }
-});
 
 test('preempt: false leaves the pin where it is across a rollover', () => {
   const am = pinnedFleet({ enabled: true, preempt: false });
@@ -593,11 +559,13 @@ test('staying put through an absence keeps the reference, so a real roll still s
 // A terminal that settled nothing decides nothing
 // ---------------------------------------------------------------------------
 
-// Two requests straddling a rollover, running in a caller-chosen order. Each
-// selects and records as one step, because server.js does: R1 is preempted off
-// the rolled account, R2 has that destination in its own tried set and falls
-// back. Neither settles the traffic anywhere, so the two runs differ by
-// scheduling alone.
+// A preempted request whose destination refuses it, and an ordinary sibling
+// selected while it is still in the air, running in a caller-chosen order.
+//
+// The sibling did nothing wrong: it arrives, finds the pin on the destination
+// and settles there. What it must not be able to do is answer for a rollover it
+// never incurred — the debt belongs to the request that was sent, and only that
+// request comes back to it.
 function twoInFlight(order) {
   const am = mgr(['a', 'b'], ON, { distributeSessions: true });
   bucket(am, 0, 'unified7d', 0.4, 10);
@@ -605,33 +573,40 @@ function twoInFlight(order) {
   assert.equal(serve(am, 's1', OPUS).name, 'a');
   rollWindow(am, 0);
 
+  const sent = {};
+  const sibling = {};
   am.beginSession('s1');
   am.beginSession('s1');
-  // R1 detects the rollover and is sent off a.
-  const r1 = () => {
-    const a = am.getActiveAccount(null, OPUS, null, 's1');
-    assert.equal(a.name, 'b', 'R1 should have been preempted off the rolled account');
+
+  // The rollover fires and sends this request to b, which pins it there.
+  const dest = am.getActiveAccount(null, OPUS, null, 's1', sent);
+  assert.equal(dest.name, 'b', 'the rollover should have sent the request off a');
+  am.recordSession('s1', dest.index, OPUS);
+
+  const stayPut = () => {
+    const a = am.getActiveAccount(null, OPUS, null, 's1', sibling);
+    assert.equal(a.name, 'b', 'the sibling should have been served by b');
     am.recordSession('s1', a.index, OPUS);
   };
-  // R2 already failed over to b, so it retries with b excluded and lands back
-  // on a — the fall-back that leaves the rollover owed.
-  const r2 = () => {
-    const a = am.getActiveAccount(new Set([1]), OPUS, null, 's1');
-    assert.equal(a.name, 'a', 'R2 should have fallen back onto the rolled account');
+  const failBack = () => {
+    // b refused it, so the same request retries with b in its own tried set.
+    const a = am.getActiveAccount(new Set([dest.index]), OPUS, null, 's1', sent);
+    assert.equal(a.name, 'a', 'the refused request should have fallen back onto a');
     am.recordSession('s1', a.index, OPUS);
   };
-  for (const step of (order === 'r1-last' ? [r2, r1] : [r1, r2])) step();
+  for (const step of (order === 'sibling-last' ? [failBack, stayPut] : [stayPut, failBack])) step();
   am.endSession('s1');
   am.endSession('s1');
   return am;
 }
 
 test('an attempt that settled nothing decides nothing, in either scheduling', () => {
-  // Where a request was SENT is not where selection settled it. An attempt that
-  // was preempted, or one that failed back onto the rolled account, says nothing
-  // about that window having become acceptable — and which of them runs first
-  // cannot change what the next selection sees.
-  for (const order of ['r2-last', 'r1-last']) {
+  // Where a request was SENT is not where it settled. A request that was
+  // refused by its destination says nothing about the window it was pushed off
+  // having become acceptable, and neither does a sibling that happened to be
+  // served there — so which of them runs first cannot change what the next
+  // selection sees.
+  for (const order of ['sibling-last', 'sibling-first']) {
     const am = twoInFlight(order);
     assert.notEqual(serve(am, 's1', OPUS).name, 'a',
       `scheduling ${order}: an attempt that settled nothing forgot the rollover`);
@@ -779,23 +754,20 @@ test('two windows rolling on one account are two log lines, not a duplicate', ()
 // A retry is the same request, and a destination it could not use settles nothing
 // ---------------------------------------------------------------------------
 
-// ONE client request that has to fail over, in the order server.js runs it: the
-// account is selected, the pin is recorded IMMEDIATELY (server.js:1403, before
-// the destination's token is refreshed and long before the upstream fetch), and
-// only then does the destination turn out to be unusable — a dead refresh token,
-// a 401, a 429, a transport error, all of which add it to the request's tried
-// set and re-enter selection. Both selections and both records belong to one
-// request, and nothing else has run in between.
-//
-// The suite's other fail-back fixtures select twice before recording either
-// attempt. Two requests cannot interleave that way — nothing awaits between
-// selection and recordSession — so that order can only come from a single
-// request, where it is exactly backwards.
+// One client request that has to fail over, in the order server.js runs it: the
+// account is selected, the pin is recorded before the destination's token is
+// refreshed and long before the upstream fetch, and only then does the
+// destination turn out to be unusable, which adds it to the request's tried set
+// and re-enters selection. Nothing runs between the two selections here, while
+// in production a refresh and a fetch are awaited in that gap and other requests
+// are selected inside them; those interleavings are gated in
+// expiry-rollover-server.test.js.
 function serveFailingOver(am, sessionId, model, dead) {
+  const carried = {};
   am.beginSession(sessionId);
-  const first = am.getActiveAccount(null, model, null, sessionId);
+  const first = am.getActiveAccount(null, model, null, sessionId, carried);
   if (first) am.recordSession(sessionId, first.index, model);
-  const retry = am.getActiveAccount(new Set([dead]), model, null, sessionId);
+  const retry = am.getActiveAccount(new Set([dead]), model, null, sessionId, carried);
   if (retry) am.recordSession(sessionId, retry.index, model);
   am.endSession(sessionId);
   return { first, retry };
@@ -918,6 +890,54 @@ test('re-applying the same setting does not re-read what is already being watche
   am.setExpiryRouting({ enabled: true, preempt: true });
   assert.notEqual(serve(am, 's1', OPUS).index, first.index,
     'a reload re-read the reference and swallowed the roll it was owed');
+});
+
+test('a knob switched off and back on does not re-read a roll already owed', () => {
+  // The destructive direction of the same rule, and the one a control that only
+  // re-applies ON never reaches. ABSENT and STALE are different states: a pin
+  // with no reading has none because nothing was watching when it was made, and
+  // seeding it is the honest first sight. A pin that HAS one holds it from when
+  // the knob was last on, has not moved since, and may be owed a rollover right
+  // now — re-taking it answers a question nobody asked and spends the debt in
+  // silence, which is the failure this feature exists to prevent.
+  const am = mgr(['a', 'b'], ON, { distributeSessions: true });
+  bucket(am, 0, 'unified7d', 0.4, 10);
+  bucket(am, 1, 'unified7d', 0.4, 10);
+  const first = serve(am, 's1', OPUS);
+  rollWindow(am, first.index);
+  am.setExpiryRouting({ enabled: false });
+  am.setExpiryRouting(ON);
+  assert.notEqual(serve(am, 's1', OPUS).index, first.index,
+    'the seed re-read a window the session was still owed a rollover on');
+});
+
+test('a knob toggled while a preemption is in flight cannot spend it', () => {
+  // The reload arrives mid-request, between the preemption and the retry its
+  // destination forced. What the request is owed is not in the tracker for a
+  // seed to reach — it is on the request — so seeding cannot answer for it.
+  const am = mgr(['a', 'b'], ON, { distributeSessions: true });
+  bucket(am, 0, 'unified7d', 0.4, 10);
+  bucket(am, 1, 'unified7d', 0.4, 10);
+  const first = serve(am, 's1', OPUS);
+  const other = 1 - first.index;
+  rollWindow(am, first.index);
+
+  const carried = {};
+  am.beginSession('s1');
+  const sent = am.getActiveAccount(null, OPUS, null, 's1', carried);
+  assert.equal(sent.index, other, 'the rollover did not preempt');
+  am.recordSession('s1', sent.index, OPUS);
+
+  am.setExpiryRouting({ enabled: false });
+  am.setExpiryRouting(ON);
+
+  const retry = am.getActiveAccount(new Set([other]), OPUS, null, 's1', carried);
+  assert.equal(retry.index, first.index, 'the retry did not fall back');
+  am.recordSession('s1', retry.index, OPUS);
+  am.endSession('s1');
+
+  assert.equal(serve(am, 's1', OPUS).index, other,
+    'a reload mid-flight spent the rollover the request was carrying');
 });
 
 // ---------------------------------------------------------------------------
