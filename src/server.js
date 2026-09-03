@@ -13,6 +13,8 @@ import { BodyWriter, truncationNote } from './request-log.js';
 import { upstreamFetch } from './upstream-fetch.js';
 import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
+import { renderDashboardHtml } from './dashboard.js';
+import { createUsageRecorder, resolveUsageDimensions, usageDimensionHeaderNames } from './client-usage.js';
 
 
 export const HOP_BY_HOP_HEADERS = new Set([
@@ -141,7 +143,7 @@ export function resolveClientAuth(proxyConfig, presented) {
   return { ok: false, client: null };
 }
 
-export function createProxyServer(accountManager, config, hooks = {}, sx = null, clientUsage = null) {
+export function createProxyServer(accountManager, config, hooks = {}, sx = null, clientUsage = null, dimensionUsage = null) {
   const upstream = config.upstream || 'https://api.anthropic.com';
   const holdMs = (config.holdSeconds || 0) * 1000;
 
@@ -163,6 +165,18 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
 
   const requestHandler = async (req, res) => {
     try {
+      // Dashboard page — served BEFORE the auth gate on purpose. The page is a
+      // static asset containing no data: everything it shows comes from
+      // /teamclaude/status, which stays behind the gate and is fetched by the
+      // page's own script with the key. A browser address bar cannot send
+      // x-api-key, so gating the asset would just 401 every remote browser
+      // without protecting anything.
+      if (req.method === 'GET' && req.url === '/teamclaude/dashboard') {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+        res.end(renderDashboardHtml());
+        return;
+      }
+
       // Auth check — skip for localhost connections. `config.proxy` is read per
       // request (not captured at creation) so a reload that edits clientKeys
       // applies to a running server, matching how eventLogging/blockedModels
@@ -215,7 +229,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
 
       // Status endpoint
       if (req.method === 'GET' && req.url === '/teamclaude/status') {
-        const status = accountManager.getStatus();
+        const status = accountManager.getStatus({ sessionDetail: config.proxy?.sessionDetail === true });
         const extra = hooks.getStatusExtra?.() || {};
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ...extra, ...status }, null, 2));
@@ -308,7 +322,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
   // Opt-in egress pin: null unless config.egress.pin is set, and then shared by
   // the base listener and the MITM one so both honour the same hold.
   const egress = createEgressGuard(config, console.error);
-  const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, egress, clientUsage });
+  const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, egress, clientUsage, dimensionUsage });
   const server = http.createServer(requestHandler);
 
   // What bounds a directory of one-shot dumps is deleting the expired ones, not
@@ -346,7 +360,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
     const c = await certsPromise;
     return { key: c.leafKeyPem, cert: c.leafCertPem };
   };
-  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks, log: console.error, sx, egress, clientUsage }));
+  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks, log: console.error, sx, egress, clientUsage, dimensionUsage }));
   // Remote Control's real-time channel is a WebSocket, not a request/response
   // call — Node fires 'upgrade' for that handshake, never 'request', so it
   // needs its own listener (base-URL routing path; the MITM path wires the
@@ -515,7 +529,7 @@ const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/files/', '/api/oauth/f
  * aware routing, and retry-on-quota behavior. Control endpoints (status/reload)
  * and the proxy-API-key gate live in the base server's wrapper, not here.
  */
-export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null, egress = null, clientUsage = null, forcedClient = null }) {
+export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null, egress = null, clientUsage = null, forcedClient = null, dimensionUsage = null }) {
   let counter = 0;
   return async (req, res) => {
     // The activity entry this request opened, while it is still open. Every
@@ -684,17 +698,29 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // instead — the same split as the account pin. onUsage lets the usage
       // extraction deep in the response path book tokens against the client
       // without threading the name through every layer.
+      //
+      // Usage dimensions (proxy.usageDimensions) ride the same hook: each
+      // configured header the caller sent becomes one more counter the response
+      // tokens are booked against, so one CI key can still be split by project.
       const client = req.tcClient ?? forcedClient ?? null;
-      const onUsage = (client && clientUsage)
-        ? (inputTokens, outputTokens) => clientUsage.record(client, { inputTokens, outputTokens })
-        : null;
-      if (client && clientUsage) clientUsage.record(client, { requests: 1 });
+      const usageDimensions = resolveUsageDimensions(config.proxy, req.headers);
+      const usageRecorder = createUsageRecorder({ client, clientUsage, dimensions: usageDimensions, dimensionUsage });
+      usageRecorder.recordRequest();
 
-      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, holdBudgetMs: holdMs, sessionId, client, onUsage, logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
+      // The dimension headers are ours, not upstream's: they exist to label
+      // traffic for this proxy. Forwarding them would leak an operator's
+      // internal project and branch names to Anthropic for no benefit, so they
+      // are dropped with the other proxy-control headers.
+      const stripHeaders = usageDimensionHeaderNames(config.proxy);
+
+      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, holdBudgetMs: holdMs, sessionId, client, onUsage: usageRecorder.onUsage, stripHeaders, logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
-      accountManager.beginSession(sessionId);
+      accountManager.beginSession(sessionId, {
+        client,
+        dimensions: Object.fromEntries(usageDimensions.map(d => [d.name, d.key])),
+      });
       try {
         await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir, sx);
       } catch (err) {
@@ -1423,6 +1449,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // Strip accept-encoding: Node fetch auto-decompresses, which would
     // mismatch the Content-Encoding header we forward to the client
     if (lk === 'accept-encoding') continue;
+    // Headers configured as usage dimensions are addressed to this proxy and
+    // carry the operator's own labels (project, branch, team). They are
+    // consumed here, so they do not travel upstream.
+    if (ctx.stripHeaders?.has(lk)) continue;
     headers[key] = value;
   }
 

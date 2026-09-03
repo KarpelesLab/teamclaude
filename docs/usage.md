@@ -164,6 +164,18 @@ teamclaude help              # Show all commands
 
 ![teamclaude status output](assets/status-redacted.png)
 
+## Status dashboard (browser)
+
+`GET /teamclaude/dashboard` serves a self-contained HTML page rendering the same data as `teamclaude status`: per-account quota bars (session and weekly, plus one bar per model-scoped weekly bucket upstream reports), rotation state, and active sessions — refreshed every few seconds.
+
+With `proxy.usageDimensions` configured, each dimension gets its own sortable table. With `proxy.sessionDetail` on, a per-session table shows each session's client, project, serving accounts, and what it actually spent per weekly bucket — cache reads and cache creation included — filterable by project or client. That table is off by default; see [Configuration](configuration.md#usage-dimensions).
+
+```
+http://localhost:3456/teamclaude/dashboard
+```
+
+The page is a static asset and loads without a key; the data does not — its script fetches `/teamclaude/status` with the proxy key, which it asks for once and keeps in the browser's localStorage (a 401 after a key rotation brings the prompt back). Loopback browsers are key-exempt as everywhere else. On deployments that put the proxy behind TLS this works remotely too: `https://your-proxy.example.com/teamclaude/dashboard`.
+
 ## Auto-update
 
 When TeamClaude is installed globally via npm, it self-updates in the background: it checks the npm registry at most once a day, and when a newer version is published it runs `npm install -g @karpeleslab/teamclaude@latest` and applies it on the next launch. The check runs after a `teamclaude run` session ends and when a headless server starts. A git checkout is never touched — update that with `git pull`. Run `teamclaude update` to update on demand.

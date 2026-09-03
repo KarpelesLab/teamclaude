@@ -5,7 +5,12 @@
     "clientKeys": [
       { "name": "alice", "key": "tc-alice-own-secret" },
       { "name": "bob", "key": "tc-bob-own-secret" }
-    ]
+    ],
+    "usageDimensions": [
+      { "name": "project", "header": "x-teamclaude-project" },
+      { "name": "ref", "header": "x-teamclaude-ref" }
+    ],
+    "sessionDetail": false
   },
   "upstream": "https://api.anthropic.com",
   "switchThreshold": 0.98,

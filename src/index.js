@@ -29,7 +29,7 @@ import { RemoteControl, createAttachSession } from './tui-remote.js';
 import { SxManager } from './sx.js';
 import { autoUpdate, checkForUpdate, currentVersion, runUpdate, installKind, PKG_NAME } from './updater.js';
 import { renderStatus } from './status-renderer.js';
-import { ClientUsageTracker } from './client-usage.js';
+import { ClientUsageTracker, UsageDimensionTracker } from './client-usage.js';
 import { buildClaudeEnvLines, encodePinComponent } from './claude-env.js';
 import { serviceKind, installService, uninstallService, serviceStatus, renderService, logPath } from './service.js';
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
@@ -224,6 +224,8 @@ async function serverCommand() {
   // per-client counters survive a restart the same way rotation state does.
   const clientUsage = new ClientUsageTracker();
   if (savedState?.clients) clientUsage.restore(savedState.clients);
+  const dimensionUsage = new UsageDimensionTracker();
+  if (savedState?.usageDimensions) dimensionUsage.restore(savedState.usageDimensions);
 
   // With quota restored, pick the best account up front (highest priority /
   // soonest-resetting weekly window) instead of defaulting to the first one.
@@ -231,7 +233,7 @@ async function serverCommand() {
 
   // Periodically persist quota (and once more on shutdown) to the state file.
   const persistQuotaState = () =>
-    saveState({ quota: accountManager.exportQuotaState(), clients: clientUsage.export() })
+    saveState({ quota: accountManager.exportQuotaState(), clients: clientUsage.export(), usageDimensions: dimensionUsage.export() })
       .catch(err => console.error(`[TeamClaude] Failed to save quota state: ${err.message}`));
   let quotaSaveInterval = null;
 
@@ -303,6 +305,10 @@ async function serverCommand() {
     // key add/rotate/revoke needs — no restart).
     if (config.proxy && diskConfig.proxy) {
       config.proxy.clientKeys = diskConfig.proxy.clientKeys;
+      // Dimensions are resolved per request from this same object, so a
+      // reload adds or drops one without a restart.
+      config.proxy.usageDimensions = diskConfig.proxy.usageDimensions;
+      config.proxy.sessionDetail = diskConfig.proxy.sessionDetail;
       // The shared key is read per request too, so a rotated key on disk
       // takes effect on reload the same way.
       config.proxy.apiKey = diskConfig.proxy.apiKey;
@@ -442,6 +448,8 @@ async function serverCommand() {
     blockedModels: [...(config.blockedModels || [])],
     // Per-client usage (proxy.clientKeys) — empty object when unconfigured.
     clients: clientUsage.export(),
+    // Per-dimension usage (proxy.usageDimensions) — empty when unconfigured.
+    usageDimensions: dimensionUsage.export(),
     server: {
       startedAt: new Date(serverStartedAt).toISOString(),
       uptimeSeconds: Math.round((Date.now() - serverStartedAt) / 1000),
@@ -476,7 +484,7 @@ async function serverCommand() {
     },
   });
 
-  const server = createProxyServer(accountManager, config, hooks, sx, clientUsage);
+  const server = createProxyServer(accountManager, config, hooks, sx, clientUsage, dimensionUsage);
   // Catch bind-time errors (e.g. EADDRINUSE) only. Once the socket is bound we
   // remove this handler so a later runtime 'error' isn't misreported as a
   // listen failure and exit the whole proxy.
