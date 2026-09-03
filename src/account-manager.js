@@ -3,7 +3,7 @@ import { providerOf, DEFAULT_PROVIDER } from './provider.js';
 import { refreshCodexToken } from './codex-auth.js';
 import { parseCodexQuota, parseCodexPlanType } from './codex-quota.js';
 import { sameIdentity } from './identity.js';
-import { weeklyBucketForModel, modelGlobMatches, modelFamily, gatingUtilization } from './model.js';
+import { weeklyBucketForModel, modelGlobMatches, modelFamily, gatingUtilization, resolveMaxUsage } from './model.js';
 import { SessionTracker } from './session-tracker.js';
 
 // Re-exported for callers that import these model helpers from here.
@@ -318,13 +318,7 @@ export class AccountManager {
    * uncapped, so a cap is only ever what was asked for.
    */
   capFor(bucket, account) {
-    const m = account?.maxUsage;
-    if (typeof m === 'number' && Number.isFinite(m)) return m;
-    if (m && typeof m === 'object') {
-      const v = m[bucket] ?? m.default;
-      if (typeof v === 'number' && Number.isFinite(v)) return v;
-    }
-    return null;
+    return resolveMaxUsage(account?.maxUsage, bucket);
   }
 
   /**

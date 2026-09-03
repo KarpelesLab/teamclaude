@@ -1,5 +1,5 @@
 import { formatMoney } from './oauth.js';
-import { findFamilyBlock, modelGlobOverlaps, gatingUtilization } from './model.js';
+import { findFamilyBlock, modelGlobOverlaps, gatingUtilization, resolveMaxUsage } from './model.js';
 import { safeLine } from './safe-text.js';
 
 const ESC = '\x1b[';
@@ -249,7 +249,19 @@ function modelRoutingLine(account, threshold, blocked, now, paint) {
   const q = account.quota || {};
   if (q.unified7dSonnet == null && q.unified7dFable == null) return null;
   const t = Number(threshold);
-  const fiveOver = q.unified5h != null && !Number.isNaN(t) && q.unified5h >= t;
+  const overThreshold = v => v != null && !Number.isNaN(t) && v >= t;
+  // A per-account cap is the other ceiling a family can be over. Without it a
+  // capped family reads ✓ on the very line that exists to say where a model can
+  // still run, right beside the Blocked line saying it cannot.
+  const overCap = (v, bucket) => {
+    const cap = resolveMaxUsage(account.maxUsage, bucket);
+    return cap != null && v != null && v >= cap;
+  };
+  // Blocks every family: the shared 5-hour bucket, and the shared weekly at its
+  // CAP — family spend meters into the shared bucket, so a cap written against
+  // it stops the families too (see AccountManager.capExceeded).
+  const sharedOver = overThreshold(q.unified5h) || overCap(q.unified5h, 'unified5h')
+    || overCap(q.unified7d, 'unified7d');
 
   const cell = (label, bucketKey, reset) => {
     // The blocklist outranks quota: a blocked family cannot be served however
@@ -258,9 +270,19 @@ function modelRoutingLine(account, threshold, blocked, now, paint) {
     if (findFamilyBlock(blocked, label)) {
       return `${label} ${paint.red('⊘')}${paint.dim(' blocked')}`;
     }
+    // Two different ceilings, deliberately read from two different values —
+    // this row mirrors routing, and routing does not treat them alike:
+    //   - the THRESHOLD gates on the governing value, the max of this family's
+    //     bucket and the shared weekly (#175), which is what _governingWeekly
+    //     hands the selector;
+    //   - the CAP is compared against the family's OWN spend, because that is
+    //     what AccountManager.capExceeded does. The shared weekly's own cap is
+    //     folded into `sharedOver` instead, so a family still inherits it.
+    // Using the governing value for the cap would redden Fable because Opus
+    // spent the shared weekly, which is not a decision the router made.
     const gating = gatingUtilization(q, bucketKey);
-    const weeklyOver = gating != null && !Number.isNaN(t) && gating >= t;
-    const mark = fiveOver || weeklyOver ? paint.red('✗') : paint.green('✓');
+    const weeklyOver = overThreshold(gating) || overCap(q[bucketKey] ?? null, bucketKey);
+    const mark = sharedOver || weeklyOver ? paint.red('✗') : paint.green('✓');
     // The recovery time is the LATEST reset among the two WEEKLY buckets
     // currently over the threshold, not this bucket's. The weekly half of the
     // mark comes from a maximum, so it only clears once BOTH weekly blockers
@@ -302,46 +324,64 @@ function quotaLines(account, now, paint) {
   const quota = account.quota || {};
   const lines = [];
 
+  // A configured cap (accounts[].maxUsage) is drawn on the bucket it caps, so the
+  // budget is visible before it binds rather than only as a Blocked line after.
+  const cap = bucket => resolveMaxUsage(account.maxUsage, bucket);
+
   if (quota.unified5h != null || quota.unified7d != null || quota.unified7dSonnet != null || quota.unified7dFable != null) {
-    lines.push(formatQuotaLine('Session', quota.unified5h, quota.unified5hReset, now, paint));
-    lines.push(formatQuotaLine('Weekly', quota.unified7d, quota.unified7dReset, now, paint));
+    lines.push(formatQuotaLine('Session', quota.unified5h, quota.unified5hReset, now, paint, cap('unified5h')));
+    lines.push(formatQuotaLine('Weekly', quota.unified7d, quota.unified7dReset, now, paint, cap('unified7d')));
     if (quota.unified7dSonnet != null) {
-      lines.push(formatQuotaLine('Sonnet', quota.unified7dSonnet, quota.unified7dSonnetReset, now, paint));
+      lines.push(formatQuotaLine('Sonnet', quota.unified7dSonnet, quota.unified7dSonnetReset, now, paint, cap('unified7dSonnet')));
     }
     if (quota.unified7dFable != null) {
-      lines.push(formatQuotaLine('Fable', quota.unified7dFable, quota.unified7dFableReset, now, paint));
+      lines.push(formatQuotaLine('Fable', quota.unified7dFable, quota.unified7dFableReset, now, paint, cap('unified7dFable')));
     }
     return lines;
   }
 
   if (quota.tokensLimit != null && quota.tokensRemaining != null) {
     const ratio = 1 - quota.tokensRemaining / quota.tokensLimit;
-    lines.push(formatQuotaLine('Tokens', ratio, quota.resetsAt, now, paint));
+    lines.push(formatQuotaLine('Tokens', ratio, quota.resetsAt, now, paint, cap('tokens')));
   }
   if (quota.requestsLimit != null && quota.requestsRemaining != null) {
     const ratio = 1 - quota.requestsRemaining / quota.requestsLimit;
-    lines.push(formatQuotaLine('Requests', ratio, quota.resetsAt, now, paint));
+    lines.push(formatQuotaLine('Requests', ratio, quota.resetsAt, now, paint, cap('requests')));
   }
   if (lines.length === 0) lines.push(`${paint.dim('Quota'.padEnd(8))} ${paint.gray('unknown')}`);
   return lines;
 }
 
-function formatQuotaLine(label, ratio, resetAt, now, paint) {
+function formatQuotaLine(label, ratio, resetAt, now, paint, cap = null) {
   const resetTs = parseTs(resetAt);
   const reset = resetTs && resetTs > now ? ` reset ${formatDuration(resetTs - now)}` : '';
-  return `${paint.dim(label.padEnd(8))} ${usageBar(ratio, paint)} ${formatPercent(ratio)}${reset}`;
+  // Name the cap in words as well as marking it on the bar: one bar cell is ~6%,
+  // so the mark alone cannot say 60% rather than 61%.
+  const reached = cap != null && ratio != null && Number(ratio) >= cap;
+  const capText = cap == null ? ''
+    : ` ${(reached ? paint.red : paint.yellow)(`cap ${formatPercent(cap)}`)}`;
+  return `${paint.dim(label.padEnd(8))} ${usageBar(ratio, paint, cap)} ${formatPercent(ratio)}${capText}${reset}`;
 }
 
-function usageBar(ratio, paint) {
+const BAR_WIDTH = 18;
+
+function usageBar(ratio, paint, cap = null) {
   if (ratio == null || Number.isNaN(Number(ratio))) return `[${paint.gray('??????????????????')}]`;
-  const width = 18;
+  const width = BAR_WIDTH;
   const safeRatio = Math.max(0, Math.min(1, Number(ratio)));
   const full = Math.round(safeRatio * width);
-  const fill = Array.from({ length: full }, (_, i) => {
+  const cells = Array.from({ length: width }, (_, i) => {
+    if (i >= full) return paint.gray('░');
     const [r, g, b] = gradientColor(i, width);
     return paint.rgb(r, g, b, '█');
-  }).join('');
-  return `[${fill}${paint.gray('░'.repeat(width - full))}]`;
+  });
+  // The cap sits where the bar may not pass. Drawn INSIDE the bar rather than
+  // inserted, so a capped row still lines up with an uncapped one.
+  if (cap != null && cap > 0 && cap < 1) {
+    const at = Math.min(width - 1, Math.round(cap * width));
+    cells[at] = (safeRatio >= cap ? paint.red : paint.yellow)('┃');
+  }
+  return `[${cells.join('')}]`;
 }
 
 function gradientColor(index, width) {

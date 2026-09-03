@@ -11,6 +11,7 @@ import {
 import { configIndexFor, managerAccountFor } from './account-pairing.js';
 import { mintAccountId } from './account-id.js';
 import { formatPercent } from './status-renderer.js';
+import { resolveMaxUsage } from './model.js';
 import { parseProxyUrl, proxyToUrl, describeProxy, describeSelfProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy } from './upstream-proxy.js';
 import { sanitizeText } from './safe-text.js';
 
@@ -1501,8 +1502,18 @@ export class TUI {
     // the weekly one lower than the 5-hour one); the attach-mode manager
     // mirrors thresholdFor, so both dashboards agree with the gate.
     const thFor = (k) => (typeof this.am.thresholdFor === 'function' ? this.am.thresholdFor(k) : this.am.switchThreshold);
-    const th1 = thFor(r1 === q.unified5h ? 'unified5h' : 'tokens');
-    const th2 = thFor(r2 === q.unified7d ? 'unified7d' : 'requests');
+    // A per-account cap (accounts[].maxUsage) is the lower ceiling when it is
+    // set, and it is the harder one — past it the account is sent nothing at
+    // all. Reddening at the cap keeps the bar honest about where this account
+    // actually stops. Read straight off the account so the attached dashboard,
+    // which has the payload but no AccountManager, agrees with the server.
+    const limFor = (k) => {
+      const cap = resolveMaxUsage(a.maxUsage, k);
+      const th = thFor(k);
+      return cap == null ? th : (typeof th === 'number' ? Math.min(th, cap) : cap);
+    };
+    const th1 = limFor(r1 === q.unified5h ? 'unified5h' : 'tokens');
+    const th2 = limFor(r2 === q.unified7d ? 'unified7d' : 'requests');
 
     let line = ` ${sel}${cur} ${startSlot}${name} ${type} ${status} ${l1} ${bar(r1, bw, t1, w1, th1)}`;
     if (showBoth) {
@@ -1510,18 +1521,22 @@ export class TUI {
       // Sonnet weekly bar — only shown when the usage probe has populated it. A
       // leading ► (in place of a padding space) marks a Sonnet route on this account.
       if (showFamily && q.unified7dSonnet != null) {
-        line += ` ${familyMark('sonnet')}S7  ${bar(q.unified7dSonnet, bw, q.unified7dSonnetReset, SEVEN_DAY_MS, thFor('unified7dSonnet'))}`;
+        line += ` ${familyMark('sonnet')}S7  ${bar(q.unified7dSonnet, bw, q.unified7dSonnetReset, SEVEN_DAY_MS, limFor('unified7dSonnet'))}`;
       }
       // Fable weekly bar — only shown when the usage probe has populated it.
       if (showFamily && q.unified7dFable != null) {
-        line += ` ${familyMark('fable')}F7  ${bar(q.unified7dFable, bw, q.unified7dFableReset, SEVEN_DAY_MS, thFor('unified7dFable'))}`;
+        line += ` ${familyMark('fable')}F7  ${bar(q.unified7dFable, bw, q.unified7dFableReset, SEVEN_DAY_MS, limFor('unified7dFable'))}`;
       }
     }
     // Explicit "disabled for these models" tag (issue #85): a family the account
     // can't serve even while it is otherwise active. A spent shared 5h blocks
     // everything and is already conveyed by the Ses bar + status, so it's not
     // repeated here.
-    const blocked = blockedFamilies(q, key => this.am.thresholdFor(key));
+    //
+    // limFor, not thresholdFor: it is min(per-bucket threshold, per-account cap),
+    // so the tag covers both ceilings and still judges each family against its
+    // OWN configured threshold.
+    const blocked = blockedFamilies(q, limFor);
     if (blocked.length) line += `  ${red('⊘ ' + blocked.join(' '))}`;
     // Money tag last, so it sits at the end of the row where the eye lands after
     // the bars. Red once real money has moved, yellow while it only could.
