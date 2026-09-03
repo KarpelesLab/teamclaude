@@ -310,11 +310,25 @@ export class AccountManager {
    * the token refresh at server.js:1407 fails, or the fetch after it does — and
    * it then comes back to a cursor pointing somewhere it never was.
    *
-   * So the reference is written by _priceOn and nowhere else, at the settlement
-   * of the request that carries the provenance. Every caller here follows the
-   * move with a settlement: rotation through _selectNext, and the two operator
-   * paths (selectActiveAccount, setCurrentAccount) which establish outright
-   * because an operator's choice carries no request and answers to nothing.
+   * NO CALLER OF THIS METHOD IS EXEMPT FROM FOLLOWING THE MOVE WITH A WRITE.
+   * The cursor naming an account the reference does not describe is exactly the
+   * state in which the next request first-sights that account's roll, so the
+   * rule is about the pairing rather than about which function does the writing.
+   * There are seven callers and they take one of two forms:
+   *
+   *   SETTLE, through _priceOn — every path that is routing a request, whether
+   *   or not that request carries provenance: rotation and the exhausted-reset
+   *   branch inside _selectNext, and the exhausted-fleet probe. A request being
+   *   sent somewhere settles like one, and _priceOn is where what it carries
+   *   decides what the write means.
+   *
+   *   ESTABLISH, through _establishOn — the paths that are not routing anything
+   *   and so have nothing to carry: startup, the operator's switch, and the
+   *   quota-reset switch that runs off an upstream header rather than a request.
+   *
+   * The reference is otherwise written in one further place, and it is not a
+   * cursor move at all: _seedSessionReferences, which supplies SESSION readings
+   * on the knob's off-to-on transition and never touches this one.
    *
    * The only assignments to currentIndex outside this method are
    * removeAccount's, which renumbers the reference's index alongside the pins.
@@ -555,7 +569,8 @@ export class AccountManager {
         // this point nothing another request does to the shared reference can
         // spend it, and the settlement below — wherever the re-rank lands, and
         // wherever the server's retries land after it — answers for it.
-        this._noteOwed(carried, current, this._currentRef.windows);
+        this._noteOwed(carried, current, this._governingWindow(current, model).window,
+          this._currentRef.windows);
         const next = this._selectNext(exclude, model, advisorModel, carried);
         // _selectNext re-ranks, and both ways of not moving end up here: it
         // found nothing eligible, or it handed back the very account we are
@@ -583,7 +598,7 @@ export class AccountManager {
     // permanent "all exhausted" state — the probe's real response refreshes the
     // quota (or upstream's own 429 converts soft exhaustion into a hard
     // rate-limit hold). null here means the caller emits the synthetic 429.
-    return allowProbe ? this._selectProbe(exclude, model) : null;
+    return allowProbe ? this._selectProbe(exclude, model, carried) : null;
   }
 
   /** Session-affinity selection (opt-in, issue #109). Honor a known session's
@@ -634,7 +649,7 @@ export class AccountManager {
         // fired: from here this REQUEST is owed the roll, so nothing another
         // request does to the shared reference while this one is in flight can
         // spend it, however many destinations it has to try.
-        this._noteOwed(carried, pinned,
+        this._noteOwed(carried, pinned, this._governingWindow(pinned, model).window,
           this.sessionTracker.refsFor(sessionId, this._weeklyBucketFor(model))?.windows);
         const next = this._pickLeastLoaded(exclude, model, advisorModel);
         if (next && next.index !== idx) {
@@ -901,7 +916,7 @@ export class AccountManager {
    * The chosen account is the least-utilized probeable one (most likely to have
    * stale headroom), so the refreshed quota corrects the cache fastest.
    */
-  _selectProbe(exclude = null, model = null) {
+  _selectProbe(exclude = null, model = null, carried = null) {
     const now = Date.now();
     if (now < this._nextProbeAt) return null;
 
@@ -931,6 +946,12 @@ export class AccountManager {
 
     this._nextProbeAt = now + this.probeIntervalMs;
     this._setCurrent(best);
+    // A probe is a request being sent somewhere, so it settles like one. Left
+    // unpriced, the account the cursor now names has no reading, and the first
+    // roll after it becomes usable is first-sighted rather than owed — the
+    // reference would describe the account the cursor left while the traffic is
+    // here.
+    this._noteCurrentSettled(best, model, carried);
     this._beginRamp(best);
     if (best.status === 'throttled') {
       console.log(`[TeamClaude] All accounts unavailable — revalidating throttled "${best.name}" with a live request`);
@@ -1240,14 +1261,23 @@ export class AccountManager {
    * claim to have seen. It is a first sight, and the next roll after it is the
    * first one detected.
    *
-   * ONLY where there is none. ABSENT and STALE are different states, and it is
-   * easy to read one as the other: a pin that already holds a reading has
-   * one because the knob was on when it was taken, the pin has not moved since,
-   * and a roll measured against it may be owed RIGHT NOW. Re-taking it would
-   * answer a question nobody asked — the off interval is evidence about pins
-   * that acquired none, and about nothing else — and would spend the rollover
-   * silently, which is the failure this whole feature exists to prevent. A
-   * reference is never cleared here, only supplied.
+   * THREE STATES, NOT TWO, and the predicate has to separate all of them:
+   *
+   *   ABSENT — no reading at all. Seed it. Nothing was watching while the knob
+   *   was off, so what the account presents now is the honest first sight.
+   *
+   *   STALE, NAMING THIS PIN'S ACCOUNT — a reading taken when the knob was last
+   *   on, for the account the pin still names. LEAVE IT. A roll measured against
+   *   it may be owed RIGHT NOW, and re-taking it answers a question nobody asked
+   *   and spends the rollover in silence, which is the failure this feature
+   *   exists to prevent.
+   *
+   *   NAMING A DIFFERENT ACCOUNT — the session moved while the knob was off, so
+   *   the reading describes a tenure that is over. Seed it. Left alone it is not
+   *   a comparison at all: _readingFor matches on the account, finds a mismatch
+   *   and returns nothing, so the account the session is ACTUALLY on gets its
+   *   next roll first-sighted. Treating this as "an existing reading" is how the
+   *   fix for the second state turned into the inverse of itself.
    *
    * Nor does this reach what an in-flight request is owed: that lives on the
    * request, so a knob toggled while a preemption is in the air cannot touch it.
@@ -1257,7 +1287,7 @@ export class AccountManager {
       const account = this.accounts[idx];
       if (!account) continue;
       const ref = this.sessionTracker.refsFor(sessionId, bucket, true);
-      if (ref && ref.idx == null) this._establishOn(ref, account);
+      if (ref && ref.idx !== account.index) this._establishOn(ref, account);
     }
   }
 
@@ -1490,15 +1520,27 @@ export class AccountManager {
   }
 
   /**
-   * THIS REQUEST IS OWED A ROLLOVER. Called the moment a preemption fires, with
-   * the account it is being pushed off and the reading that pushed it — which is
-   * the shared reference as it stands right now, before this selection or any
-   * other has had a chance to move it.
+   * WHAT THIS REQUEST HOLDS, per account it has been sent to. One entry per
+   * account, each a few window readings, so the whole thing is bounded by the
+   * length of the request's own failover chain and dies with the request.
    *
-   * Copied, not referenced: the whole point is that it survives whatever happens
-   * to the shared state while this request is in flight. And recorded ONCE per
-   * request: a chain that preempts again later is still owed the roll that
-   * started it, not the one it most recently noticed.
+   * An entry is either OWED — a rollover was detected on that account's window
+   * and this request was pushed off it — or an ARRIVAL, which is what the
+   * account's windows read when this request was sent there. The difference is
+   * what a settlement may do with it: a debt is restored and never advanced, an
+   * arrival is restored and then advanced normally.
+   *
+   * ONE ENTRY PER ACCOUNT, NOT ONE PER REQUEST. A chain can be owed more than
+   * one rollover — pushed off A, sent to B, B rolls under it, refused by C, back
+   * to B — and a single slot keeps only the first, which is the whole shape this
+   * feature keeps failing in: a property true exactly as far as the structure
+   * holding it extends. Accumulating means the chain reaches as far as the chain.
+   *
+   * ONE WINDOW, NOT THE WHOLE MAP. A debt is about the window that rolled, and
+   * nothing else on that account. Snapshotting every window and restoring the
+   * lot rewinds whatever a sibling legitimately settled on an unrelated window
+   * while this request was suspended, and the next request reads that as a
+   * rollover that never happened.
    *
    * A caller that carries nothing — an internal consumer, a probe, a test
    * driving the manager directly — records nothing, and a request with no
@@ -1513,9 +1555,32 @@ export class AccountManager {
    * exactly what it always matched, and an account that has been removed can
    * never be selected again so it simply stops matching.
    */
-  _noteOwed(carried, origin, reading) {
-    if (!carried || !reading) return;
-    carried.owed ??= { account: origin, windows: new Map(reading) };
+  _held(carried, account) {
+    return carried?.readings?.get(account) || null;
+  }
+
+  /** Record the rollover `origin` owes this request on `window`, priced at the
+   *  reading that fired it. The earliest debt on a window is the one kept: a
+   *  chain returning to an account it was pushed off is owed what pushed it,
+   *  not what the window has become since. */
+  _noteOwed(carried, origin, window, reading) {
+    if (!carried) return;
+    const seen = reading?.get(window);
+    if (seen == null) return;
+    const readings = (carried.readings ??= new Map());
+    const held = readings.get(origin);
+    const windows = held ? held.windows : new Map();
+    if (!(held?.owed && windows.has(window))) windows.set(window, seen);
+    readings.set(origin, { windows, owed: true });
+  }
+
+  /** Record what `account` read as this request arrived there. Never over a
+   *  debt: being sent somewhere again does not discharge what it is owed. */
+  _noteArrival(carried, account, windows) {
+    if (!carried) return;
+    const readings = (carried.readings ??= new Map());
+    if (readings.get(account)?.owed) return;
+    readings.set(account, { windows: new Map(windows), owed: false });
   }
 
   /** Establish a reference on `account` from every window it presents now. */
@@ -1538,54 +1603,68 @@ export class AccountManager {
    * incurred; match it to the request, and none of it can.
    *
    * So `carried` — the request's provenance, threaded from the server's own
-   * per-request context — decides what this settlement means:
+   * per-request context — decides what this settlement means. The reference is
+   * first brought onto this account if it named another, which is what supplies
+   * every window the request has nothing to say about; then what the request
+   * DOES hold about this account is put back, and only that:
    *
-   *   ON THE ACCOUNT IT WAS PREEMPTED OFF. The request has come back: the
+   *   AN ACCOUNT IT WAS PREEMPTED OFF. The request has come back: the
    *   destination refused it, or its token would not refresh, or the chain ran
    *   out of anywhere else to go. It did not settle here by choosing to, so the
-   *   reading it was pushed by is restored exactly, whatever any sibling has
-   *   written meanwhile, and nothing advances. The debt is as owed as it was and
-   *   the next request asks again. This is the whole of "still owed": no flag,
-   *   no event, no clearing — the request that holds the debt is the only thing
-   *   that can answer for it, and it answers by putting the reading back.
+   *   window it was pushed by is restored to the reading that pushed it,
+   *   whatever any sibling has written meanwhile, and nothing advances. The debt
+   *   is as owed as it was and the next request asks again. This is the whole of
+   *   "still owed": no flag, no event, no clearing — the request that holds the
+   *   debt is the only thing that can answer for it, and it answers by putting
+   *   that one reading back. ANY of them, not the first: a chain can be owed
+   *   rollovers on several accounts and each is answered where it is met.
    *
-   *   ON THE ACCOUNT IT WAS AIMED AT. The request went where it was sent, so the
-   *   reading taken as it aimed becomes the one this account is measured from —
-   *   taken at the aim rather than at the next request, which is the difference
-   *   between seeing the destination's own next roll and adopting it.
+   *   AN ACCOUNT IT WAS SENT TO. The request went where it was sent, so the
+   *   governing window is measured from what it read on arrival rather than from
+   *   what the account says now — which is the difference between seeing that
+   *   account's own next roll and adopting it, and it survives a sibling having
+   *   overwritten the shared reference in between.
    *
    *   ANYWHERE ELSE. A new destination for this request, or an ordinary settle
-   *   by a request that was never preempted. The reference is replaced whole
-   *   from what that account reports now, and a request carrying a debt records
-   *   it as its new aim — which is what lets a chain of any length keep going
-   *   without the shape running out: the chain carries its own provenance, so it
-   *   reaches exactly as far as the chain does.
+   *   by a request that was never preempted. The reference is established from
+   *   what that account reports now and the request records that as its arrival
+   *   — which is what lets a chain of any length keep going without the shape
+   *   running out: the chain carries its own provenance, so it reaches exactly
+   *   as far as the chain does.
    *
-   * Replacing whole rather than merging is why an absent window is not a
-   * deletion: the new reference simply has no entry for a window this account is
-   * not reporting, and an absent entry is a first sight when it returns rather
-   * than a stale value read as a jump. Staying on the same account advances only
-   * the one window this request was governed by; the others are left as they
-   * were, because this request is not evidence about them.
+   * ONLY THE WINDOWS THIS REQUEST PRICED, in every case. Everything else on the
+   * account belongs to whoever wrote it last, which may be a sibling that
+   * legitimately settled a different family while this request was suspended;
+   * restoring a whole snapshot over it rewinds that sibling's work and the next
+   * request reads the rewind as a rollover that never happened.
+   *
+   * Establishing whole when the reference names another account is why an absent
+   * window is not a deletion: the new reference simply has no entry for a window
+   * this account is not reporting, and an absent entry is a first sight when it
+   * returns rather than a stale value read as a jump. Staying on the same
+   * account advances only the one window this request was governed by; the
+   * others are left as they were, because this request is not evidence about them.
    *
    * AND NEVER ACROSS A ROLL THIS READING STILL OWES. Advancing over a jump is
-   * exactly erasing an unresolved rollover. It is the guard on the only path
-   * that writes shared state.
+   * exactly erasing an unresolved rollover. It is reached — the requalify
+   * re-rank hands back a current account whose window has jumped before the
+   * rollover branch has run, and every settle made while the knob is off gets
+   * here with no carrier at all, which is what keeps a roll that happened during
+   * that time owed when the knob comes back on.
    */
   _priceOn(ref, account, model, carried = null) {
-    if (carried?.owed?.account === account) {
-      ref.idx = account.index;
-      ref.windows = new Map(carried.owed.windows);
+    const held = this._held(carried, account);
+    if (ref.idx !== account.index) this._establishOn(ref, account);
+    const win = this._governingWindow(account, model);
+    if (held?.owed) {
+      for (const [window, reset] of held.windows) ref.windows.set(window, reset);
       return;
     }
-    if (carried?.aim?.account === account) {
-      ref.idx = account.index;
-      ref.windows = new Map(carried.aim.windows);
-    } else if (ref.idx !== account.index) {
-      this._establishOn(ref, account);
-      if (carried?.owed) carried.aim = { account, windows: new Map(ref.windows) };
+    if (held) {
+      if (held.windows.has(win.window)) ref.windows.set(win.window, held.windows.get(win.window));
+    } else {
+      this._noteArrival(carried, account, ref.windows);
     }
-    const win = this._governingWindow(account, model);
     if (win.resetAt == null) return;
     if (this._jumped(ref.windows, win)) return;
     ref.windows.set(win.window, win.resetAt);
@@ -2012,6 +2091,11 @@ export class AccountManager {
     // equal, so this cannot fire at all.
     if (rankOf.get(best.index) > rankOf.get(current.index)) return;
     this._setCurrent(best);
+    // No request is being routed here — this runs off a quota update — so there
+    // is no provenance to carry and nothing to be owed. It still settles: the
+    // cursor has moved, and an account the cursor names with no reading behind
+    // it first-sights its next roll.
+    this._noteCurrentSettled(best, null);
     this._beginRamp(best);
     console.log(`[TeamClaude] Account "${best.name}" session quota reset and weekly expires sooner — switching to it`);
   }
@@ -2169,6 +2253,10 @@ export class AccountManager {
       soonestAccount.status = 'active';
       soonestAccount.rateLimitedUntil = null;
       this._setCurrent(soonestAccount);
+      // This IS the request's selection — the fleet was exhausted and this
+      // account's window just reset — so it settles with the request's own
+      // provenance like every other selection.
+      this._noteCurrentSettled(soonestAccount, model, carried);
       this._beginRamp(soonestAccount);
       console.log(`[TeamClaude] Account "${soonestAccount.name}" reset, switching to it`);
       return soonestAccount;

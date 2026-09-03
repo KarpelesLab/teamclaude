@@ -57,10 +57,10 @@ async function fleet(names, handler, { distribute = false, hours = null, refresh
 
   // The name the upstream answered with — i.e. the account that actually served
   // the client, after every failover the server performed on the way.
-  const send = (session = null) => fetch(`http://127.0.0.1:${port}/v1/messages`, {
+  const send = (session = null, model = OPUS) => fetch(`http://127.0.0.1:${port}/v1/messages`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', ...(session ? { 'x-claude-code-session-id': session } : {}) },
-    body: JSON.stringify({ model: OPUS, messages: [] }),
+    body: JSON.stringify({ model, messages: [] }),
   }).then(async r => (await r.json()).account);
 
   return {
@@ -83,10 +83,6 @@ const serves = (res, name) => {
   res.end(JSON.stringify({ account: name }));
 };
 
-// Upstream refusing THIS account for THIS request. server.js:1625 adds it to
-// the request's tried set and fails over, and — unlike a quota or transport
-// verdict — leaves the account healthy for every later request, which is what
-// lets these tests ask where the NEXT request goes.
 // The two upstream verdicts that make the server retry WITHOUT adding the
 // account to the request's tried set, so selection is free to hand the same
 // account straight back. `seen` records that the path was actually taken —
@@ -133,6 +129,10 @@ const SAME_ACCOUNT_RETRIES = [
   },
 ];
 
+// Upstream refusing THIS account for THIS request. The server adds it to the
+// request's tried set and fails over, and — unlike a quota or transport verdict
+// — leaves the account healthy for every later request, which is what lets these
+// tests ask where the NEXT request goes.
 const refuses = res => {
   res.writeHead(403, { 'content-type': 'application/json' });
   res.end(JSON.stringify({ type: 'error', error: { type: 'permission_error', message: 'no' } }));
@@ -288,4 +288,195 @@ for (const distribute of [false, true]) {
       }
     });
   }
+
+  // A CHAIN CAN BE OWED MORE THAN ONE ROLLOVER. The request is pushed off a,
+  // sent to b, b rolls under it and throttles, it is pushed off b to c, c
+  // refuses it, and the only account left is b. Keep one debt and the return to
+  // b adopts the week b just gained; keep them per account and each is answered
+  // where it is met.
+  //
+  // The two rolls land the windows far apart on purpose, so that once both have
+  // moved b is still the better of the two and the return to b is the ranking's
+  // own choice rather than a contrivance. A roll is a jump, not a fixed step —
+  // what makes it one is the distance, which is why these are set rather than
+  // incremented.
+  test(`${path} path: a chain owed two rollovers answers both`, async () => {
+    const seen = [];
+    let am;
+    const handle = await fleet(['a', 'b', 'c'], async (name, res) => {
+      if (name === 'b' && !seen.includes('b')) {
+        seen.push('b');
+        am.accounts[1].quota.unified7dReset = Date.now() + 400 * H;  // b rolls under the request
+        res.writeHead(429, { 'retry-after': '1', 'content-type': 'application/json' });
+        res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error' } }));
+        return;
+      }
+      if (name === 'c' && !seen.includes('c')) {
+        seen.push('c');
+        return refuses(res);
+      }
+      return serves(res, name);
+    }, { distribute, hours: [10, 20, 30] });
+    ({ am } = handle);
+    const { send, close } = handle;
+
+    try {
+      assert.equal(await send(sid), 'a', 'the fixture must start on a');
+      am.accounts[0].quota.unified7dReset = Date.now() + 500 * H;
+
+      assert.equal(await send(sid), 'b', 'the chain should have come back to b');
+      assert.deepEqual(seen, ['b', 'c'], 'the chain must have gone a -> b -> c -> b');
+
+      // b's own roll was detected when the chain was pushed off it, so returning
+      // there does not settle onto the week it gained.
+      assert.notEqual(await send(sid), 'b',
+        'the second rollover in the chain was lost when the first was kept');
+    } finally {
+      await close();
+    }
+  });
 }
+
+// ---------------------------------------------------------------------------
+// What a request restores is only what it priced
+// ---------------------------------------------------------------------------
+
+const HAIKU = 'claude-haiku-4-5';
+
+test('returning to the origin does not rewind a window a sibling settled', async () => {
+  // Two families on one account. The Opus request is pushed off a by a roll of
+  // a's SCOPED Opus window and suspends on b. While it hangs there, a's shared
+  // weekly rolls too and a Haiku request — which is governed by that shared
+  // window — settles the new reading legitimately. Then b refuses the Opus
+  // request and it falls back to a.
+  //
+  // It is owed a's scoped Opus window and nothing else. Restoring a snapshot of
+  // every window a had when it left puts the Haiku sibling's reading back to
+  // what it was before the shared window rolled, and the next Haiku request
+  // reads that as a rollover that never happened and moves off a for nothing.
+  const reached = deferred();
+  const held = deferred();
+  let refused = 0;
+  let am;
+
+  const handle = await fleet(['a', 'b', 'c'], async (name, res) => {
+    if (name === 'b' && refused === 0) {
+      refused++;
+      reached.resolve();
+      await held.promise;
+      return refuses(res);
+    }
+    return serves(res, name);
+  }, { hours: [10, 20, 30] });
+  ({ am } = handle);
+  const { send, close } = handle;
+
+  try {
+    // a is current and carries a scoped Opus window alongside the shared weekly.
+    // Spent further than the shared one so it is the window that BINDS for Opus
+    // — the governing read takes the tighter of the two, and a scoped window
+    // that does not bind is not the window an Opus roll would be measured on.
+    am.accounts[0].quota.scopedWeekly = { opus: { utilization: 0.9, resetAt: Date.now() + 15 * H } };
+    assert.equal(am.setCurrentAccount(0), true);
+    assert.equal(await send(null, HAIKU), 'a', 'the fixture must start Haiku on a');
+    assert.equal(am._governingWindow(am.accounts[0], OPUS).window, 'scoped:opus',
+      'the fixture must have the scoped window governing Opus on a');
+
+    // The Opus window rolls; the Opus request is pushed off a and hangs on b.
+    am.accounts[0].quota.scopedWeekly.opus.resetAt += WEEK;
+    const opus = send(null, OPUS).catch(() => null);
+    await reached.promise;
+
+    // b holds the cursor and c is the only other candidate, so take both out of
+    // Haiku's reach — the sibling has to reach a for this to be about a's
+    // windows at all.
+    am.accounts[1].quota.unified7d = 0.99;
+    am.accounts[2].quota.unified7d = 0.99;
+    // a's SHARED window rolls, and a Haiku request — governed by that window and
+    // owed nothing — settles the new reading on a. A different window, a
+    // different request.
+    am.accounts[0].quota.unified7dReset += WEEK;
+    assert.equal(await send(null, HAIKU), 'a', 'the sibling must have settled on a');
+    const settled = am._currentRef.windows.get('unified7d');
+    assert.equal(settled, am.accounts[0].quota.unified7dReset,
+      'the fixture must have left a\'s shared window settled at its new reset');
+
+    held.resolve();
+    await opus;
+
+    // The Opus request was owed a's SCOPED window and nothing else.
+    assert.equal(am._currentRef.windows.get('unified7d'), settled,
+      'the origin restore rewound a window the request was never owed');
+  } finally {
+    held.resolve();
+    await close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The paths that move the cursor without routing a request
+// ---------------------------------------------------------------------------
+
+test('the exhausted-fleet probe prices the account it makes current', async () => {
+  // Every account over threshold, so selection falls through to the probe. It
+  // moves the cursor without taking a reading, so until a request rests on the
+  // probed account its first roll is first-sighted and the traffic parks on the
+  // week it gained.
+  const { am, send, close } = await fleet(['a', 'b'], async (name, res) => serves(res, name),
+    { hours: [10, 20] });
+
+  try {
+    assert.equal(await send(), 'a', 'the fixture must start on a');
+    // Both accounts over the switch threshold: nothing is selectable and the
+    // probe is the only thing that answers. b is the less spent of the two, so
+    // the probe picks it — the cursor has to MOVE for this to be about the move.
+    am.accounts[0].quota.unified7d = 0.99;
+    am.accounts[1].quota.unified7d = 0.985;
+    const probed = await send();
+    assert.equal(probed, 'b', 'the probe should have moved the cursor to b');
+
+    // The probe learned real quota, and later that account's window rolls.
+    am.accounts[am.currentIndex].quota.unified7d = 0.4;
+    am.accounts[1 - am.currentIndex].quota.unified7d = 0.4;
+    am.accounts[am.currentIndex].quota.unified7dReset += WEEK;
+
+    assert.notEqual(await send(), probed,
+      'the probe moved the cursor without pricing it, so the roll was first-sighted');
+  } finally {
+    await close();
+  }
+});
+
+// NOT GATED, AND SAID SO RATHER THAN IMPLIED: the arrival reading a request
+// holds for the account it was SENT to has no arm that reds when it is removed.
+// The construction it needs — shared state stops describing the destination,
+// the destination rolls, and the retry still chooses it — does not discriminate:
+// by the time the retry re-selects, the establish on a different account plus
+// the never-advance guard already produce the same answer, so deleting the
+// arrival restore changes nothing observable.
+
+test('a roll that happens while the knob is off is still owed when it comes on', async () => {
+  // The current account's reading is kept whether or not the knob is on, which
+  // is why it needs no seeding on the transition. The never-advance guard is
+  // what makes that worth anything: with the knob off every settle reaches it
+  // carrying nothing, and without it each one would walk the reading forward
+  // over the roll, so the operator who turns preemption on to catch exactly this
+  // would find it already spent.
+  const { am, send, close } = await fleet(['a', 'b'], async (name, res) => serves(res, name),
+    { hours: [10, 20] });
+
+  try {
+    am.setExpiryRouting({ enabled: false });
+    assert.equal(await send(), 'a', 'the fixture must start on a');
+    am.accounts[0].quota.unified7dReset += WEEK;
+    // Traffic keeps flowing across the roll with the feature off.
+    assert.equal(await send(), 'a');
+    assert.equal(await send(), 'a');
+
+    am.setExpiryRouting({ enabled: true, preempt: true });
+    assert.notEqual(await send(), 'a',
+      'the roll was walked forward while the knob was off and is no longer owed');
+  } finally {
+    await close();
+  }
+});

@@ -911,6 +911,34 @@ test('a knob switched off and back on does not re-read a roll already owed', () 
     'the seed re-read a window the session was still owed a rollover on');
 });
 
+test('a reading naming an account the session has left is re-taken on enable', () => {
+  // The third state. A reading that is merely STALE — same account, taken when
+  // the knob was last on — may be owed a rollover right now and must be left
+  // alone. A reading naming a DIFFERENT account is not that: the session moved
+  // while nothing was watching, so it describes a tenure that is over and is not
+  // a comparison at all — the reading is matched on the account, finds a
+  // mismatch, and the account the session is actually on gets its next roll
+  // first-sighted.
+  const am = mgr(['a', 'b'], ON, { distributeSessions: true });
+  bucket(am, 0, 'unified7d', 0.4, 10);
+  bucket(am, 1, 'unified7d', 0.4, 20);
+  const first = serve(am, 's1', OPUS);
+  assert.equal(first.name, 'a');
+
+  // The knob goes off, a goes out of service, and the session moves to b. No
+  // reading is taken for b: session references are only written while the knob
+  // is on, so the one in the tracker still names a.
+  am.setExpiryRouting({ enabled: false });
+  am.setDisabled(0, true);
+  assert.equal(serve(am, 's1', OPUS).name, 'b', 'the session should have moved to b');
+  am.setDisabled(0, false);
+
+  am.setExpiryRouting(ON);
+  rollWindow(am, 1);
+  assert.notEqual(serve(am, 's1', OPUS).name, 'b',
+    'the seed kept a reading naming the account the session had left');
+});
+
 test('a knob toggled while a preemption is in flight cannot spend it', () => {
   // The reload arrives mid-request, between the preemption and the retry its
   // destination forced. What the request is owed is not in the tracker for a
