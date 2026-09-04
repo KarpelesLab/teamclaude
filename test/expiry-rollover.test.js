@@ -111,6 +111,52 @@ test('a window CLEARED and re-reported at the same instant is not a rollover', (
   assert.equal(serve(am, 's1', OPUS).index, first.index, 're-reporting the window moved the pin');
 });
 
+test('a window re-reported slightly LATER is not a rollover either', () => {
+  // The forward half of the same drift, and the half ROLLOVER_MIN_JUMP_MS is
+  // for. The two writers of a reset disagree on precision, so one instant
+  // arrives as two values up to a second apart. Backward is not a jump under any
+  // rule; FORWARD is, unless the comparison has a floor.
+  const am = pinnedFleet(ON);
+  const first = serve(am, 's1', OPUS);
+  const q = am.accounts[first.index].quota;
+  for (const drift of [500, 60_000, 30 * 60_000]) {
+    q.unified7dReset += drift;
+    assert.equal(serve(am, 's1', OPUS).index, first.index,
+      `a ${drift}ms forward drift read as a rollover`);
+  }
+  // And a real week still does move it, so the floor is a floor and not a mute.
+  rollWindow(am, first.index);
+  assert.notEqual(serve(am, 's1', OPUS).index, first.index,
+    'the floor swallowed a genuine weekly roll');
+});
+
+test('a reading taken on one account is not evidence about another', () => {
+  // The comparison is scoped to the account the observation NAMES. Two accounts'
+  // weeks are unrelated numbers, so without that check the fleet would preempt
+  // off whichever account held the further-dated window every single request.
+  const am = mgr(['a', 'b'], ON);
+  const now = Date.now();
+  bucket(am, 0, 'unified7d', 0.4, 10, now);
+  bucket(am, 1, 'unified7d', 0.4, 10, now);
+  assert.equal(serve(am, null, OPUS).name, 'a');
+  assert.equal(am._currentObs.idx, 0, 'the fixture must have the reading on a');
+  // b's window is a full week further out than the reading held for a. Compared
+  // against a's number that is a jump; compared as what it is — a different
+  // account's clock, which nothing has read — it is nothing at all.
+  am.accounts[1].quota.unified7dReset = now + 10 * H + WEEK;
+  assert.equal(am._currentRolledOver(am.accounts[1], OPUS), false,
+    'a\'s reading was read as evidence about b');
+
+  // The same for a session's pin.
+  const am2 = mgr(['a', 'b'], ON, { distributeSessions: true });
+  bucket(am2, 0, 'unified7d', 0.4, 10, now);
+  bucket(am2, 1, 'unified7d', 0.4, 10, now);
+  assert.equal(serve(am2, 's1', OPUS).name, 'a');
+  am2.accounts[1].quota.unified7dReset = now + 10 * H + WEEK;
+  assert.equal(am2._pinRolledOver('s1', am2.accounts[1], OPUS), false,
+    'the pin\'s reading of a was read as evidence about b');
+});
+
 test('a rollover is tracked per bucket, so alternating models see no false jump', () => {
   // A session sending Opus turns and Fable turns holds two pins. Comparing one
   // bucket's reset against the other's would read as a jump every time the

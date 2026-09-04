@@ -1149,6 +1149,10 @@ export class AccountManager {
       this.sessionTracker.clearObservations();
       return;
     }
+    // Re-applying the same setting, which every config reload does, must not
+    // re-read anything. Redundant with _firstSightOn's own refusal to overwrite
+    // an existing reading, and kept because the two say different things: "only
+    // the transition seeds" and "an aim never overwrites".
     if (wasWatching) return;
     const current = this.accounts[this.currentIndex];
     if (current) this._firstSightOn(this._currentObs ??= { idx: null, windows: new Map() }, current);
@@ -1397,14 +1401,18 @@ export class AccountManager {
       return;
     }
     const win = this._governingWindow(account, model);
+    // Redundant with _jumped's own null check, and kept because "there is
+    // nothing to record" says something different from "what was recorded is
+    // unusable".
     if (win.resetAt == null) return;
     // NEVER FORWARD OVER A ROLL THIS CHOICE HAS NOT ESCAPED. The window has
     // jumped since the reading was taken, so the preemption did not stick.
     // Advancing would adopt the week the account just gained and park the fleet
     // on its furthest-dated account. Leave it, and the next request asks again.
     if (this._jumped(obs.windows, win)) return;
-    // Only the window this request was governed by is ADVANCED. The others are
-    // left as they were, because this request is not evidence about them.
+    // Only the window this request was governed by is ADVANCED; this request is
+    // not evidence about the others. A reading that never freshens still detects
+    // the next roll, measured from a value further back rather than a wrong one.
     obs.windows.set(win.window, win.resetAt);
     // A window with no entry at all is different: it has appeared on the account
     // since the reading was taken, most often a learned scoped bucket upstream
@@ -1467,6 +1475,9 @@ export class AccountManager {
    *  observe, and one whose pin this request has already tried is looking at a
    *  failed attempt rather than a resting place. */
   _restOnPin(sessionId, bucket, exclude, model) {
+    // Ungated on its own, because recordSession's guard already stops a
+    // client-supplied session id growing state nothing will read. Two guards on
+    // one property, and neither is the other's proof.
     if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) return;
     const pinIdx = this.sessionTracker.pinnedAccount(sessionId, bucket);
     if (pinIdx == null || exclude?.has(pinIdx)) return;
@@ -1498,10 +1509,10 @@ export class AccountManager {
   }
 
   /** The comparison itself. Absent on either side is not a jump: a window
-   * nothing has read yet has no entry, an account nothing has read at all has
-   * no observation, and one the account is not reporting right now (the cleared-
-   * window gap) has no current value to compare — none of the three may be
-   * mistaken for a reset that moved. */
+   * nothing has read yet, an account with no observation, and one the account is
+   * not reporting right now are three different absences, which is why each is
+   * checked rather than left to a NaN comparison. The threshold is not redundant
+   * either: a window re-reported slightly later has not rolled. */
   _jumped(reading, win) {
     if (!reading) return false;
     const seen = reading.get(win.window);
