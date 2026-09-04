@@ -98,16 +98,7 @@ export class SessionTracker {
     s.lastSeen = now;
     s.count += 1;
     if (accountIndex != null && typeof bucket === 'string' && bucket) {
-      // `tenure` identifies THIS pinning rather than the slot it sits in, and it
-      // changes only when the account does. A session that leaves an account and
-      // comes back returns to a matching index but a different tenure, and a
-      // reading taken in the earlier one describes a stay this session was not
-      // on the far side of — an index is not an identity, so the two have to be
-      // distinguishable. Monotonic per session, so a tenure number is never
-      // reused within the record it belongs to; nothing outside compares them.
-      const prior = s.pins.get(bucket);
-      const tenure = prior && prior.idx === accountIndex ? prior.tenure : ++s.tenures;
-      s.pins.set(bucket, { idx: accountIndex, at: now, tenure });
+      s.pins.set(bucket, { idx: accountIndex, at: now });
     }
     if (now - this._lastSweep > SWEEP_INTERVAL_MS) this.sweep(now);
     return s;
@@ -140,13 +131,9 @@ export class SessionTracker {
   // the one a session making requests in sequence just touched. Two concurrent
   // requests on different families can still refresh the wrong one, which is the
   // same limit the in-flight arm has.
-  //
-  // Returns the session record so the caller can act on the moment it goes
-  // quiescent — `inFlight === 0` is when nothing is left that could still move
-  // this session, which is the only point at which where it ended up is final.
   endRequest(sessionId, now = this._now()) {
     const s = sessionId && this.sessions.get(sessionId);
-    if (!s) return null;
+    if (!s) return;
     s.inFlight = Math.max(0, s.inFlight - 1);
     if (s.inFlight === 0) {
       let newest = null;
@@ -154,7 +141,6 @@ export class SessionTracker {
       if (newest) newest.at = now;
     }
     s.lastSeen = now;
-    return s;
   }
 
   /**
@@ -219,8 +205,6 @@ export class SessionTracker {
     if (!s) {
       s = {
         pins: new Map(), refs: new Map(), firstSeen: now, lastSeen: now, count: 0, inFlight: 0,
-        // Hands out tenure numbers for this session's pins (see touch).
-        tenures: 0,
         // bucket -> emptyTokens(). On the session's own record rather than in a
         // map beside it, so there is one lifetime and one eviction policy for
         // everything scoped to a session: a second map keyed by session id would
@@ -261,18 +245,12 @@ export class SessionTracker {
     return s.pins.get(bucket)?.idx ?? null;
   }
 
-  // The rollover reference this session holds for `bucket`: { idx, windows } —
-  // the account this bucket last SETTLED on and what its windows read then. What
-  // an in-flight request is OWED, and where it has been aimed, is not here: it
-  // belongs to the request that carries it (AccountManager._priceOn).
-  // Created on demand; null for a session that is unknown or forgotten, and for
-  // a known one until a caller asks to create it.
-  //
-  // Kept beside the pin rather than on it, because it deliberately outlives a
-  // relocation: a pin that has just been moved off an account is not evidence
-  // about that account, and the reference has to survive the move to still be
-  // there if the traffic comes back. It dies with the session, which is the
-  // outer bound on the pin it belongs to.
+    // The rollover observation this session holds for `bucket`: the account
+    // traffic was last found resting on and what its windows read then. Kept
+    // beside the pin rather than on it because it outlives a relocation — a pin
+    // just moved off an account is not evidence about that account, and the
+    // observation has to still be there when the traffic comes back. It dies
+    // with the session.
   refsFor(sessionId, bucket, create = false, now = this._now()) {
     const s = sessionId && this.sessions.get(sessionId);
     if (!s) return null;
@@ -285,22 +263,8 @@ export class SessionTracker {
     return ref || null;
   }
 
-  // The tenure number a reading taken for `accountIndex` on this bucket belongs
-  // to. The pin's own when it already names that account; otherwise the number
-  // the NEXT pinning there will get, because a settlement can establish a
-  // reference for an account the pin has not moved to yet and the reading
-  // describes the stay that is about to begin. Null for a session that is
-  // unknown or forgotten, which is also what an unstamped reference reads as.
-  pinTenure(sessionId, bucket, accountIndex, now = this._now()) {
-    const s = this._live(sessionId, now);
-    if (!s) return null;
-    const pin = s.pins.get(bucket);
-    return pin && pin.idx === accountIndex ? pin.tenure : s.tenures + 1;
-  }
-
-  // Every pin a live session holds, as { sessionId, bucket, idx, tenure } — what a
-  // caller needs to visit each pinned (session, bucket) once. Expired sessions
-  // are dropped on the way past, as every other read here does.
+  // Every pin a live session holds, as { sessionId, bucket, idx }. Expired
+  // sessions are dropped on the way past, as every other read here does.
   livePins(now = this._now()) {
     const out = [];
     for (const [sessionId, s] of [...this.sessions]) {
@@ -308,9 +272,25 @@ export class SessionTracker {
         this.sessions.delete(sessionId);
         continue;
       }
-      for (const [bucket, pin] of s.pins) out.push({ sessionId, bucket, idx: pin.idx, tenure: pin.tenure });
+      for (const [bucket, pin] of s.pins) out.push({ sessionId, bucket, idx: pin.idx });
     }
     return out;
+  }
+
+  // How many of this session's requests are in flight right now, the caller's
+  // own included. More than one means a sibling is still out and could yet move
+  // this session's pin, so where it currently points is an aim rather than a
+  // resting place (AccountManager._restOn). Zero for an unknown session.
+  inFlightFor(sessionId) {
+    const s = sessionId && this.sessions.get(sessionId);
+    return s ? s.inFlight : 0;
+  }
+
+  // Drop every session's rollover observations, leaving the pins alone. None may
+  // survive an interval in which nothing was watching, which is what switching
+  // preemption off creates (AccountManager.setExpiryRouting).
+  clearObservations() {
+    for (const s of this.sessions.values()) s.refs.clear();
   }
 
   // Every account a known session is pinned to across its buckets, most recent
@@ -340,16 +320,9 @@ export class SessionTracker {
         if (moved == null) s.pins.delete(bucket);
         else pin.idx = moved;
       }
-      // A reference names its account by the same position, so it follows the
-      // same shift. One naming the account that went away is dropped whole: its
-      // numbers describe a window nothing can route to any more, and left behind
-      // they would be read against whatever account inherits the slot.
-      //
-      // An in-flight request's own provenance is not reachable from here and
-      // needs no renumbering: it names accounts by the account itself rather
-      // than by a position in this list (AccountManager._noteOwed), so a removal
-      // mid-flight leaves it matching exactly what it always matched, and the
-      // account that went away simply never matches again.
+      // An observation names its account by the same position, so it follows the
+      // same shift. One naming the account that went away is dropped whole:
+      // left behind, it would be read against whatever inherits the slot.
       for (const [bucket, ref] of [...s.refs]) {
         const moved = ref.idx == null ? null : mapFn(ref.idx);
         if (ref.idx != null && moved == null) s.refs.delete(bucket);

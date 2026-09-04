@@ -25,16 +25,12 @@ function bucket(am, index, key, used, hours) {
 }
 
 // One complete request for `sessionId`: select, record where it was sent, and
-// end — the order the server does it in.
-//
-// The scratch object is the request itself. server.js keeps one per client
-// request on its ctx and hands it to every selection that request makes, so a
-// fixture that models a request has to model that too: it is where the rollover
-// a preemption owes is carried while the request is in flight. A `carried`
-// passed in is a fixture driving several selections through ONE request.
-function serve(am, sessionId, model, { exclude = null, carried = {} } = {}) {
+// end — the order the server does it in. A request carries no rollover state of
+// its own; what a fixture models instead is the TRIED SET, which is what makes
+// several selections one request rather than several (see serveFailingOver).
+function serve(am, sessionId, model, { exclude = null } = {}) {
   am.beginSession(sessionId);
-  const account = am.getActiveAccount(exclude, model, null, sessionId, carried);
+  const account = am.getActiveAccount(exclude, model, null, sessionId);
   if (account) am.recordSession(sessionId, account.index, model);
   am.endSession(sessionId);
   return account;
@@ -145,13 +141,14 @@ test('only the family whose window rolled is re-routed', () => {
   assert.equal(serve(am, 's1', OPUS).index, opus.index, 'the Opus pin moved on another family\'s roll');
 });
 
-test('a preemption that fails back onto the rolled account stays owed', () => {
+test('a preemption with nowhere to go leaves the roll where the next request finds it', () => {
   const am = pinnedFleet(ON);
   const first = serve(am, 's1', OPUS);
   const other = 1 - first.index;
   rollWindow(am, first.index);
   // The only destination is excluded, so this request comes back to the account
-  // it was trying to leave. Nothing moved, so nothing may be banked.
+  // it was trying to leave. The traffic did not move, so the reading does not
+  // advance over the jump.
   assert.equal(serve(am, 's1', OPUS, { exclude: new Set([other]) }).index, first.index);
   // The next unconstrained request preempts again rather than having settled on
   // the account that just gained a full week.
@@ -189,11 +186,11 @@ test('a rollover on the current account re-ranks instead of staying parked', () 
   assert.equal(serve(am, null, OPUS).name, 'b');
 });
 
-test('a route-pinned request does not advance the current account\'s reference', () => {
-  // A manual route pin routes without ever consulting currentIndex, so it is
-  // not the sticky walk sitting still on its account and must not price it.
-  // Refreshing there would let traffic that never asked the question answer it,
-  // and the rollover the walk owes would go quiet without anything moving.
+test('a route-pinned request does not advance the current account\'s reading over its roll', () => {
+  // A manual route pin routes without ever consulting currentIndex. The reading
+  // is still taken — the cursor is where the last request left it either way —
+  // but it cannot advance over a jump, so a roll the sticky walk has not
+  // answered for is still there when that walk next runs.
   const am = mgr(['a', 'b'], ON);
   bucket(am, 0, 'unified7d', 0.4, 10);
   bucket(am, 1, 'unified7d', 0.4, 10);
@@ -206,16 +203,30 @@ test('a route-pinned request does not advance the current account\'s reference',
   assert.equal(serve(am, null, OPUS).name, 'b');
 });
 
-test('a manual switch takes a baseline with it, so its next roll is still seen', () => {
-  // Parked on an account established without one, the fleet reads that
-  // account's next weekly roll as a first sight and never preempts off it.
+test('a manual switch takes a FIRST reading, and never overwrites one', () => {
+  // An operator's switch is an aim, and an aim may take a reading only where
+  // there is none to lose. Parked on an account nothing has ever read, the fleet
+  // would first-sight its next roll for no reason; parked on one whose roll is
+  // outstanding, overwriting would spend it. Both are checked here.
   const am = mgr(['a', 'b'], ON);
   bucket(am, 0, 'unified7d', 0.4, 10);
   bucket(am, 1, 'unified7d', 0.4, 10);
   assert.equal(am.setCurrentAccount(1), true);
+  assert.equal(am._currentObs.idx, 1, 'the switch left the cursor unread');
   rollWindow(am, 1);
-  assert.equal(serve(am, null, OPUS).name, 'a');
+  assert.equal(serve(am, null, OPUS).name, 'a', 'the roll after the switch was not caught');
   assert.equal(am.setCurrentAccount(9), false);
+
+  // And the other half: a switch onto an account that still owes a roll must not
+  // wipe it. Here b has rolled and the cursor is already reading b.
+  const am2 = mgr(['a', 'b'], ON);
+  bucket(am2, 0, 'unified7d', 0.4, 20);
+  bucket(am2, 1, 'unified7d', 0.4, 10);
+  assert.equal(am2.setCurrentAccount(1), true);
+  assert.equal(serve(am2, null, OPUS).name, 'b');
+  rollWindow(am2, 1);
+  assert.equal(am2.setCurrentAccount(1), true, 're-switching to the same account');
+  assert.equal(serve(am2, null, OPUS).name, 'a', 'the switch overwrote an outstanding roll');
 });
 
 test('a rollover with nowhere to go says so instead of looking like success', () => {
@@ -403,13 +414,11 @@ test('a draining session rejoins the ordinary walk when its window rolls', () =>
     'a draining session rode its account through a rollover');
 });
 
-test('a draining session whose pin is not the current account still owes its roll', () => {
-  // THE FIXTURE ABOVE IS BLIND, and this is the same scenario with the blindness
-  // removed. It leaves currentIndex on the pin, so when the drain releases the
-  // session into the ordinary walk that walk sees the same jump and records the
-  // debt the drain path itself never recorded. The session walk never calls
-  // _setCurrent, so on any fleet that has been distributing, the cursor is
-  // commonly somewhere else — and then nothing records it at all.
+test('a draining session whose pin is not the current account keeps its roll', () => {
+  // The same scenario with the cursor moved off the pin. The session walk never
+  // calls _setCurrent, so on any fleet that has been distributing the cursor is
+  // commonly somewhere else, and then only the session's own observation speaks
+  // for the pin's window.
   const am = mgr(['a', 'b', 'c'], ON, { distributeSessions: true });
   bucket(am, 0, 'unified7d', 0.4, 10);
   bucket(am, 1, 'unified7d', 0.4, 20);
@@ -437,8 +446,19 @@ test('a draining session whose pin is not the current account still owes its rol
   am.endSession('s1');
 
   am.accounts[2].quota.unified7d = 0.4;
-  assert.notEqual(serve(am, 's1', OPUS).name, 'a',
-    'the drain walk released the session without recording the roll it was owed');
+  // The session's own observation still holds a's pre-roll reading — the drain
+  // walk skipping its pin, and the fail-back landing on it, both wrote nothing.
+  assert.equal(am._pinRolledOver('s1', am.accounts[0], OPUS), true,
+    'the drain walk spent the roll of the pin it released');
+
+  // AND HERE IS THE BOUNDARY. Releasing the drain ends this session's affinity:
+  // it is ordinary traffic from now on, governed by the CURSOR's observation,
+  // which has never read a. So the fail-back onto a is a first sight for the
+  // walk that now routes this session, and the fleet stays there. Nothing
+  // available to a per-choice observation separates that fail-back from a
+  // legitimate return: the two differ only in what the request has already
+  // tried, which is the request's own history.
+  assert.equal(serve(am, 's1', OPUS).name, 'a');
 });
 
 // ---------------------------------------------------------------------------
@@ -494,12 +514,11 @@ test('a session re-pinned to an account it left is not preempted by the old roll
 // The reference's vocabulary is the named window, on the write side too
 // ---------------------------------------------------------------------------
 
-test('the current account\'s baseline is written under the window selection used', () => {
-  // The writer once established from the request bucket with no model, so every
-  // window took the flat branch: selection chose the account on its scoped
-  // window and stored the shared one, leaving the baseline describing a window
-  // nothing was spending. A scoped reset could then return without ever reading
-  // as a jump.
+test('the current account\'s reading is written under the window selection used', () => {
+  // Establishing from the request bucket alone would take the flat branch for
+  // every window: selection chooses the account on its scoped window and stores
+  // the shared one, leaving the reading describing a window nothing is spending,
+  // and a scoped reset then returns without ever reading as a jump.
   const am = mgr(['a', 'b'], ON);
   const now = Date.now();
   bucket(am, 0, 'unified7d', 0.10, 300, now);
@@ -507,8 +526,8 @@ test('the current account\'s baseline is written under the window selection used
   scoped(am, 0, 'opus', 0.50, 10, now);
   scoped(am, 1, 'opus', 0.50, 10, now);
   am.selectActiveAccount();
-  assert.equal(am._currentRef.windows.get('scoped:opus'), now + 10 * H,
-    'the scoped window was not written on becoming current');
+  assert.equal(am._currentObs.windows.get('scoped:opus'), now + 10 * H,
+    'the scoped window was not written under its own name');
   assert.equal(serve(am, null, OPUS).name, 'a');
   am.accounts[0].quota.scopedWeekly.opus.resetAt += WEEK;
   assert.equal(serve(am, null, OPUS).name, 'b');
@@ -545,45 +564,49 @@ test('an Opus rollover is not consumed by Haiku traffic', () => {
   assert.equal(serve(am, null, OPUS).name, 'b', 'the Opus rollover was consumed elsewhere');
 });
 
-test('a tenure drops a baseline for a window the account no longer presents', () => {
-  // A scoped entry is deleted outright once its reset passes, so a tenure that
-  // begins during the gap mentions nothing for that window. Merely moving the
-  // mentioned baselines forward leaves an earlier tenure's value in place, and
-  // the reset reads as a fresh rollover the moment upstream reports it again.
+test('a reading re-established elsewhere and back drops a window the account no longer presents', () => {
+  // A scoped entry is deleted outright once its reset passes, so a reading taken
+  // during the gap mentions nothing for that window. Merely moving the mentioned
+  // windows forward would leave the earlier value in place, and the reset would
+  // read as a fresh rollover the moment upstream reported it again. The
+  // establish branch writes the account WHOLE for exactly this reason.
   const am = mgr(['a', 'b'], ON);
   const now = Date.now();
   bucket(am, 0, 'unified7d', 0.10, 300, now);
   bucket(am, 1, 'unified7d', 0.10, 300, now);
   scoped(am, 0, 'opus', 0.50, 10, now);
-  am.selectActiveAccount();
-  assert.equal(am._currentRef.windows.get('scoped:opus'), now + 10 * H);
+  assert.equal(serve(am, null, OPUS).name, 'a');
+  assert.equal(am._currentObs.windows.get('scoped:opus'), now + 10 * H);
 
-  // The scoped window goes absent, and a tenure begins elsewhere and comes back
-  // — the account is re-chosen while it is reporting nothing for that window.
+  // The scoped window goes absent, and the traffic goes elsewhere and comes back
+  // — the account is read again while it is reporting nothing for that window.
   delete am.accounts[0].quota.scopedWeekly.opus;
   assert.equal(am.setCurrentAccount(1), true);
+  assert.equal(serve(am, null, OPUS).name, 'b');
   assert.equal(am.setCurrentAccount(0), true);
-  assert.equal(am._currentRef.windows.get('scoped:opus'), undefined,
-    'the absent window kept its previous tenure\'s reference');
+  assert.equal(serve(am, null, OPUS).name, 'a');
+  assert.equal(am._currentObs.windows.get('scoped:opus'), undefined,
+    'the absent window kept a value from an earlier stay');
 
-  // Upstream reports it again, well past its earlier value. That is a first
-  // sight in this tenure, not a rollover.
+  // Upstream reports it again, well past where it last stood. That is a first
+  // sight, not a rollover.
   scoped(am, 0, 'opus', 0.50, 200, now);
   assert.equal(serve(am, null, OPUS).name, 'a', 'a reappearing window read as a rollover');
 });
 
-test('staying put through an absence keeps the reference, so a real roll still shows', () => {
+test('staying put through an absence keeps the reading, so a real roll still shows', () => {
   // The other half of the same rule. An account the traffic never left is not a
-  // new tenure just because upstream stopped reporting one of its windows, so
-  // the reference survives the gap — otherwise a window could roll behind a
-  // cleared reading and arrive looking brand new.
+  // fresh start just because upstream stopped reporting one of its windows: the
+  // same-account branch advances only the window this request was governed by,
+  // so the reading survives the gap and a window cannot roll behind a cleared
+  // reading and arrive looking brand new.
   const am = mgr(['a', 'b'], ON);
   const now = Date.now();
   bucket(am, 0, 'unified7d', 0.10, 300, now);
   bucket(am, 1, 'unified7d', 0.10, 20, now);
   scoped(am, 0, 'opus', 0.50, 10, now);
   serve(am, null, OPUS);
-  assert.equal(am._currentRef.windows.get('scoped:opus'), now + 10 * H);
+  assert.equal(am._currentObs.windows.get('scoped:opus'), now + 10 * H);
 
   // The window goes absent and comes back a full week on, with the account
   // current throughout.
@@ -601,9 +624,10 @@ test('staying put through an absence keeps the reference, so a real roll still s
 // selected while it is still in the air, running in a caller-chosen order.
 //
 // The sibling did nothing wrong: it arrives, finds the pin on the destination
-// and settles there. What it must not be able to do is answer for a rollover it
-// never incurred — the debt belongs to the request that was sent, and only that
-// request comes back to it.
+// and is served there. What it must not do is take a READING there — the pin
+// names the destination because a request was AIMED at it, and that request is
+// still out and may yet come back. Both requests are begun before either
+// selects, which is what the session's in-flight count is for.
 function twoInFlight(order) {
   const am = mgr(['a', 'b'], ON, { distributeSessions: true });
   bucket(am, 0, 'unified7d', 0.4, 10);
@@ -611,24 +635,22 @@ function twoInFlight(order) {
   assert.equal(serve(am, 's1', OPUS).name, 'a');
   rollWindow(am, 0);
 
-  const sent = {};
-  const sibling = {};
   am.beginSession('s1');
   am.beginSession('s1');
 
   // The rollover fires and sends this request to b, which pins it there.
-  const dest = am.getActiveAccount(null, OPUS, null, 's1', sent);
+  const dest = am.getActiveAccount(null, OPUS, null, 's1');
   assert.equal(dest.name, 'b', 'the rollover should have sent the request off a');
   am.recordSession('s1', dest.index, OPUS);
 
   const stayPut = () => {
-    const a = am.getActiveAccount(null, OPUS, null, 's1', sibling);
+    const a = am.getActiveAccount(null, OPUS, null, 's1');
     assert.equal(a.name, 'b', 'the sibling should have been served by b');
     am.recordSession('s1', a.index, OPUS);
   };
   const failBack = () => {
     // b refused it, so the same request retries with b in its own tried set.
-    const a = am.getActiveAccount(new Set([dest.index]), OPUS, null, 's1', sent);
+    const a = am.getActiveAccount(new Set([dest.index]), OPUS, null, 's1');
     assert.equal(a.name, 'a', 'the refused request should have fallen back onto a');
     am.recordSession('s1', a.index, OPUS);
   };
@@ -639,15 +661,15 @@ function twoInFlight(order) {
 }
 
 test('an attempt that settled nothing decides nothing, in either scheduling', () => {
-  // Where a request was SENT is not where it settled. A request that was
-  // refused by its destination says nothing about the window it was pushed off
-  // having become acceptable, and neither does a sibling that happened to be
-  // served there — so which of them runs first cannot change what the next
-  // selection sees.
+  // Where a request was SENT is not where it came to rest. A request refused by
+  // its destination says nothing about the window it was pushed off having
+  // become acceptable, and neither does a sibling served there while the first
+  // is still in the air — so which of them runs first cannot change what the
+  // next selection sees.
   for (const order of ['sibling-last', 'sibling-first']) {
     const am = twoInFlight(order);
     assert.notEqual(serve(am, 's1', OPUS).name, 'a',
-      `scheduling ${order}: an attempt that settled nothing forgot the rollover`);
+      `scheduling ${order}: an attempt that settled nothing took a reading anyway`);
   }
 });
 
@@ -674,30 +696,31 @@ test('removing an account renumbers the baselines rather than aiming them elsewh
   assert.equal(serve(am, 's2', OPUS).name, 'c');
 });
 
-test('removing an account renumbers an aim as well as a settled baseline', () => {
-  // A preemption's aim names its destination by the same bare position the pins
-  // do, and it is read by the very next request on that session. Left behind
-  // across a removal it is compared against whatever account inherited the slot,
-  // which is what renumbering the pins prevents — so the enumeration is both
-  // halves of the reference, not just the settled one.
+test('removing an account renumbers a reading taken after a preemption', () => {
+  // The same renumbering, for the reading a session takes on the account a
+  // rollover moved it to. It names its account by the same bare position the
+  // pins do, and left behind across a removal it is compared against whatever
+  // account inherited the slot.
   const am = mgr(['a', 'b', 'c', 'd'], ON, { distributeSessions: true });
   for (const i of [0, 1, 2, 3]) bucket(am, i, 'unified7d', 0.4, 10 + i * 10);
   assert.equal(serve(am, 's1', OPUS).name, 'a');
   rollWindow(am, 0);
-  // The preemption aims at b and the session lands there, with no settle yet:
-  // b's reading exists only as the aim.
+  assert.equal(serve(am, 's1', OPUS).name, 'b', 'the rollover did not move the pin to b');
+  // The next request finds the pin on b and reads it there.
   assert.equal(serve(am, 's1', OPUS).name, 'b');
+  assert.equal(am.sessionTracker.refsFor('s1', 'unified7d').idx, 1,
+    'the reading should name b');
 
-  // 'a' is removed, so b/c/d each shift down one slot and the aim's index is
+  // 'a' is removed, so b/c/d each shift down one slot and the reading's index is
   // stale by exactly one.
   am.removeAccount(0);
   assert.equal(am.accounts.find(a => a.name === 'b').index, 0, 'b did not move down');
 
-  // b's own window rolls. Read through a renumbered aim that is a genuine
+  // b's own window rolls. Read through a renumbered reading that is a genuine
   // rollover; read through a stale one it is a comparison against c.
   am.accounts[0].quota.unified7dReset += WEEK;
   assert.notEqual(serve(am, 's1', OPUS).name, 'b',
-    'the aim did not follow its account down a slot');
+    'the reading did not follow its account down a slot');
 });
 
 test('removing an account renumbers the CURRENT account\'s baselines too', () => {
@@ -715,8 +738,8 @@ test('removing an account renumbers the CURRENT account\'s baselines too', () =>
   assert.equal(serve(am, null, OPUS).name, 'b');
 });
 
-test('references are not accumulated when the knob cannot use them', () => {
-  // A reference exists to answer a preemption question. With the feature off
+test('observations are not accumulated when the knob cannot use them', () => {
+  // An observation exists to answer a preemption question. With the feature off
   // there is no question, and a client-supplied session id must not be able to
   // grow state that nothing will ever read.
   const off = mgr(['a', 'b'], undefined, { distributeSessions: true });
@@ -801,11 +824,14 @@ test('two windows rolling on one account are two log lines, not a duplicate', ()
 // are selected inside them; those interleavings are gated in
 // expiry-rollover-server.test.js.
 function serveFailingOver(am, sessionId, model, dead) {
-  const carried = {};
   am.beginSession(sessionId);
-  const first = am.getActiveAccount(null, model, null, sessionId, carried);
+  const first = am.getActiveAccount(null, model, null, sessionId);
   if (first) am.recordSession(sessionId, first.index, model);
-  const retry = am.getActiveAccount(new Set([dead]), model, null, sessionId, carried);
+  // The growing tried set is what makes this the SAME request. It is also what
+  // tells the reading apart from a fresh arrival: a sticky choice naming an
+  // account this request has already tried is a failed attempt, so no reading is
+  // taken and the roll it was pushed off is still there to be found.
+  const retry = am.getActiveAccount(new Set([dead]), model, null, sessionId);
   if (retry) am.recordSession(sessionId, retry.index, model);
   am.endSession(sessionId);
   return { first, retry };
@@ -845,12 +871,10 @@ test('a retry that bounces back to the rolled current account leaves it owed', (
     'the bounce first-sighted the rolled reset');
 });
 
-test('a destination that rolls after the move is not adopted post-roll', () => {
-  // A successful preemption is an arrival, and what the destination's window read
-  // on arrival is what its own next roll has to be measured against. Read at the
-  // following request instead, a roll in between is adopted as the starting point
-  // and disappears — the session parks on the account that just gained a week
-  // while sooner-expiring quota goes on expiring.
+test('a destination is measured from the first request that rests on it', () => {
+  // A preemption aims at b and takes no reading there, so a roll on b before any
+  // request has rested there is a first sight — the same as for an account a
+  // brand-new session is placed on. That cost is asserted here, not hidden.
   const am = mgr(['a', 'b', 'c'], ON, { distributeSessions: true });
   bucket(am, 0, 'unified7d', 0.4, 10);
   bucket(am, 1, 'unified7d', 0.4, 20);
@@ -858,14 +882,16 @@ test('a destination that rolls after the move is not adopted post-roll', () => {
   assert.equal(serve(am, 's1', OPUS).name, 'a');
   rollWindow(am, 0);
   assert.equal(serve(am, 's1', OPUS).name, 'b', 'the rollover did not move the pin to b');
+  // The next request rests on b and reads it.
+  assert.equal(serve(am, 's1', OPUS).name, 'b');
+  // From here b's own roll is caught.
   rollWindow(am, 1);
   assert.equal(serve(am, 's1', OPUS).name, 'c',
-    'the destination\'s own rollover was consumed by the arrival');
+    'the destination\'s own rollover was not caught once it had been read');
 });
 
-test('a current account that rolls after the move is not adopted post-roll', () => {
-  // The reading comes from the aim on this path, and the property has to survive
-  // that: remove the aim and this is the test that says so.
+test('the current account is measured from the first request that rests on it', () => {
+  // The same on the path that is live by default.
   const am = mgr(['a', 'b', 'c'], ON);
   bucket(am, 0, 'unified7d', 0.4, 10);
   bucket(am, 1, 'unified7d', 0.4, 20);
@@ -873,9 +899,10 @@ test('a current account that rolls after the move is not adopted post-roll', () 
   assert.equal(serve(am, null, OPUS).name, 'a');
   rollWindow(am, 0);
   assert.equal(serve(am, null, OPUS).name, 'b', 'the rollover did not move the current account');
+  assert.equal(serve(am, null, OPUS).name, 'b');
   rollWindow(am, 1);
   assert.equal(serve(am, null, OPUS).name, 'c',
-    'the destination\'s own rollover was consumed by the arrival');
+    'the destination\'s own rollover was not caught once it had been read');
 });
 
 // ---------------------------------------------------------------------------
@@ -930,17 +957,10 @@ test('re-applying the same setting does not re-read what is already being watche
     'a reload re-read the reference and swallowed the roll it was owed');
 });
 
-test('a session that leaves an account and comes back while off is a new tenure', () => {
-  // AN INDEX IS NOT AN IDENTITY, here for the third time. The seed asked whether
-  // the reference names the account the pin now names, and A→B→A returns to a
-  // matching index — so a reference from the FIRST stay on a reads as continuous,
-  // and a roll that happened while the session was away is treated as newly owed.
-  // The session pays a cache-breaking preemption for a rollover that belongs to a
-  // tenure it was not there for.
-  //
-  // What has to match is not the slot but THIS pinning: any new tenure, on the
-  // same account or another, cannot be described by a reference taken in an
-  // earlier one.
+test('a session that leaves an account and comes back while OFF is measured afresh', () => {
+  // The same A→B→A shape with the knob off for the excursion: the knob going off
+  // drops the observation outright, so there is nothing from the first stay for
+  // the return to be measured against.
   const am = mgr(['a', 'b'], ON, { distributeSessions: true });
   bucket(am, 0, 'unified7d', 0.4, 10);
   bucket(am, 1, 'unified7d', 0.4, 20);
@@ -959,120 +979,89 @@ test('a session that leaves an account and comes back while off is a new tenure'
 
   am.setExpiryRouting(ON);
   assert.equal(serve(am, 's1', OPUS).name, 'a',
-    'a roll from a tenure the session was not present for forced a preemption');
+    'a roll from a stay the session was not present for forced a preemption');
 });
 
-test('an arrival is not a debt, so a rollover owes only the window that rolled', () => {
-  // A request that SETTLES on an account records what every window there read —
-  // that is what an arrival is, and it is how the account is measured if the
-  // request comes back to it. A request PUSHED OFF an account records the one
-  // window that rolled. When the same request does both, in that order, the debt
-  // must not inherit the arrival's other windows: it did not price them as a
-  // rollover, and restoring them on fail-back rewinds whatever a sibling settled
-  // on them in between.
-  //
-  // The production shape is the same-account retry — a short-wait 429 re-enters
-  // selection with the tried set untouched — after a roll in flight.
-  const am = mgr(['a', 'b', 'c'], ON);
-  const now = Date.now();
-  bucket(am, 0, 'unified7d', 0.10, 300, now);
-  bucket(am, 1, 'unified7d', 0.10, 20, now);
-  bucket(am, 2, 'unified7d', 0.10, 30, now);
-  scoped(am, 0, 'opus', 0.90, 15, now);
-  assert.equal(am.setCurrentAccount(0), true);
 
-  // An Opus request settles on a, recording an arrival for BOTH of a's windows.
-  const carried = {};
-  am.getActiveAccount(null, OPUS, null, null, carried);
-  assert.equal(am._governingWindow(am.accounts[0], OPUS).window, 'scoped:opus',
-    'the fixture must have the scoped window governing Opus on a');
-
-  // a's Opus window rolls under the request, and the same-account retry — the
-  // tried set is empty, so selection is free to look again — is pushed off a.
-  am.accounts[0].quota.scopedWeekly.opus.resetAt += WEEK;
-  const moved = am.getActiveAccount(null, OPUS, null, null, carried);
-  assert.notEqual(moved.name, 'a', 'the retry should have been pushed off a');
-
-  // A sibling settles a's SHARED window at a new value while the request is away.
-  const siblingAt = now + 500 * H;
-  am.accounts[0].quota.unified7dReset = siblingAt;
-  assert.equal(am.setCurrentAccount(0), true);
-  assert.equal(am._currentRef.windows.get('unified7d'), siblingAt,
-    'the fixture must have the sibling\'s reading settled on a');
-
-  // The Opus request fails back onto a. It is owed a's scoped window and nothing
-  // else, so the sibling's shared reading stands.
-  am.getActiveAccount(new Set([moved.index]), OPUS, null, null, carried);
-  assert.equal(am._currentRef.windows.get('unified7d'), siblingAt,
-    'the debt inherited the arrival\'s windows and rewound the sibling');
-});
-
-test('a knob switched off and back on does not re-read a roll already owed', () => {
-  // The destructive direction of the same rule, and the one a control that only
-  // re-applies ON never reaches. ABSENT and STALE are different states: a pin
-  // with no reading has none because nothing was watching when it was made, and
-  // seeding it is the honest first sight. A pin that HAS one holds it from when
-  // the knob was last on, has not moved since, and may be owed a rollover right
-  // now — re-taking it answers a question nobody asked and spends the debt in
-  // silence, which is the failure this feature exists to prevent.
+test('nothing survives the knob being off, so a roll from that interval is a first sight', () => {
+  // The lifetime is the guarantee: switching off drops every observation, so an
+  // interval in which nothing was watching leaves nothing behind, and the first
+  // request after the knob comes back takes an honest first sight. The cost is
+  // one roll per off/on cycle, a roll nobody was watching for; the gain is that
+  // "off means inert" needs no reader to remember it.
   const am = mgr(['a', 'b'], ON, { distributeSessions: true });
   bucket(am, 0, 'unified7d', 0.4, 10);
   bucket(am, 1, 'unified7d', 0.4, 10);
   const first = serve(am, 's1', OPUS);
+  assert.equal(am.sessionTracker.refsFor('s1', 'unified7d').idx, first.index);
   rollWindow(am, first.index);
   am.setExpiryRouting({ enabled: false });
+  assert.equal(am.sessionTracker.refsFor('s1', 'unified7d'), null,
+    'an observation survived the knob going off');
+  assert.equal(am._currentObs, null, 'the current observation survived the knob going off');
   am.setExpiryRouting(ON);
+  assert.equal(serve(am, 's1', OPUS).index, first.index,
+    'a roll nothing was watching for was charged to the session anyway');
+  // And the next roll AFTER the knob came back is caught, so the clear is a
+  // reset rather than a silencing.
+  rollWindow(am, first.index);
   assert.notEqual(serve(am, 's1', OPUS).index, first.index,
-    'the seed re-read a window the session was still owed a rollover on');
+    'the first roll after the knob came back was missed');
 });
 
-test('a reading naming an account the session has left is re-taken on enable', () => {
-  // The third state. A reading that is merely STALE — same account, taken when
-  // the knob was last on — may be owed a rollover right now and must be left
-  // alone. A reading naming a DIFFERENT account is not that: the session moved
-  // while nothing was watching, so it describes a tenure that is over and is not
-  // a comparison at all — the reading is matched on the account, finds a
-  // mismatch, and the account the session is actually on gets its next roll
-  // first-sighted.
+test('turning preemption off alone also drops the observations', () => {
+  // `preempt: false` leaves the band on and the comparison off, so the same
+  // reasoning applies: nothing reads an observation, so none may be kept.
   const am = mgr(['a', 'b'], ON, { distributeSessions: true });
   bucket(am, 0, 'unified7d', 0.4, 10);
-  bucket(am, 1, 'unified7d', 0.4, 20);
-  const first = serve(am, 's1', OPUS);
-  assert.equal(first.name, 'a');
-
-  // The knob goes off, a goes out of service, and the session moves to b. No
-  // reading is taken for b: session references are only written while the knob
-  // is on, so the one in the tracker still names a.
-  am.setExpiryRouting({ enabled: false });
-  am.setDisabled(0, true);
-  assert.equal(serve(am, 's1', OPUS).name, 'b', 'the session should have moved to b');
-  am.setDisabled(0, false);
-
-  am.setExpiryRouting(ON);
-  rollWindow(am, 1);
-  assert.notEqual(serve(am, 's1', OPUS).name, 'b',
-    'the seed kept a reading naming the account the session had left');
+  bucket(am, 1, 'unified7d', 0.4, 10);
+  serve(am, 's1', OPUS);
+  am.setExpiryRouting({ enabled: true, preempt: false });
+  assert.equal(am.sessionTracker.refsFor('s1', 'unified7d'), null);
+  assert.equal(am._currentObs, null);
 });
 
-test('re-enabling distribution does not revive a debt from an old tenure', () => {
-  // The tenure stamp is only reconciled at the knob's off-to-on transition, and
-  // this is a different boundary: distribution being turned back on. The pin has
-  // moved twice since the reference was stamped, so a reading from the FIRST
-  // stay was being read as current debt and the session paid a preemption for a
-  // roll that happened while it was somewhere else.
-  //
-  // The reader asks the question the seed asks, so a stamp from a finished stay
-  // answers nothing wherever it is read.
+test('a session that leaves an account and comes back is measured from the stay it is in', () => {
+  // AN INDEX IS NOT AN IDENTITY. The session leaves a and returns to it, and a
+  // rolls while it is away; a reading from the FIRST stay would read as
+  // continuous and charge the session a cache-breaking preemption for a roll it
+  // was not there for. No counter is needed to tell the two apart: the session
+  // came to REST on b, and resting elsewhere is what retires the observation of
+  // a, so the return to a is read from what a presents then.
   const am = mgr(['a', 'b'], ON, { distributeSessions: true });
   bucket(am, 0, 'unified7d', 0.4, 10);
   bucket(am, 1, 'unified7d', 0.4, 20);
   assert.equal(serve(am, 's1', OPUS).name, 'a', 'the fixture must pin s1 to a');
 
-  // Distribution off: the session drains, is forced to b, and comes back to a,
-  // so its pin is in its third tenure while the reference still names the first.
+  am.setDisabled(0, true);
+  assert.equal(serve(am, 's1', OPUS).name, 'b', 'the session should have moved to b');
+  // A second request on b, which is what makes it a stay rather than an aim.
+  assert.equal(serve(am, 's1', OPUS).name, 'b');
+  rollWindow(am, 0);
+  am.setDisabled(0, false);
+
+  // b goes out in turn, so the session is forced back onto a.
+  am.setDisabled(1, true);
+  assert.equal(serve(am, 's1', OPUS).name, 'a');
+  am.setDisabled(1, false);
+
+  assert.equal(serve(am, 's1', OPUS).name, 'a',
+    'a roll from a stay the session was not present for preempted it anyway');
+});
+
+test('re-enabling distribution does not revive a roll from a finished stay', () => {
+  // The same property at a different boundary, distribution being turned back
+  // on. There is no transition to reconcile at: the observation moved when the
+  // session came to rest on b, and every boundary reads the same state.
+  const am = mgr(['a', 'b'], ON, { distributeSessions: true });
+  bucket(am, 0, 'unified7d', 0.4, 10);
+  bucket(am, 1, 'unified7d', 0.4, 20);
+  assert.equal(serve(am, 's1', OPUS).name, 'a', 'the fixture must pin s1 to a');
+
   am.setDistributeSessions(false);
   am.setDisabled(0, true);
   assert.equal(serve(am, 's1', OPUS).name, 'b', 'the session should have moved to b');
+  assert.equal(serve(am, 's1', OPUS).name, 'b');
   rollWindow(am, 0);
   am.setDisabled(0, false);
   am.setDisabled(1, true);
@@ -1081,7 +1070,7 @@ test('re-enabling distribution does not revive a debt from an old tenure', () =>
 
   am.setDistributeSessions(true);
   assert.equal(serve(am, 's1', OPUS).name, 'a',
-    'a reading from a finished tenure was read as current debt');
+    'a reading from a finished stay was read as a current roll');
 });
 
 test('an account known to be nearly spent does not win on having fewer sessions', () => {
@@ -1119,13 +1108,12 @@ test('an account known to be nearly spent does not win on having fewer sessions'
 // and would be a false gate. The claim is differential by nature and is measured
 // that way, by flagoff-sweep.mjs over generated fleets.
 
-test('a repaint does not consume the mark a request is owed', () => {
+test('a repaint takes no reading, so it cannot spend the roll of the account it leaves', () => {
   // TUI._render calls the refresh with no request arguments, every few seconds
-  // idle and twice a second under load. Consuming the mark there completes the
-  // transition at a moment no request asked for — and the discharge on that path
-  // reaches the mover carrying nothing, which is compliant to every search and
-  // discharges nothing: satisfy-by-not-asking became satisfy-by-asking-with-
-  // nothing. Only a mover moving a request may redeem a mark.
+  // idle and twice a second under load, and the 5h switch inside it can move the
+  // cursor, as it does with the knob off. What it must not do is take a READING,
+  // because nothing arrived anywhere: a paint is not a place a reading is taken
+  // from.
   const am = mgr(['a', 'b', 'c'], ON);
   bucket(am, 0, 'unified7d', 0.4, 10);
   bucket(am, 1, 'unified7d', 0.4, 20);
@@ -1137,25 +1125,22 @@ test('a repaint does not consume the mark a request is owed', () => {
   am.accounts[1].quota.unified5h = 0.5;
   am.accounts[1].quota.unified5hReset = Date.now() - 1000;
 
-  // The paint the TUI makes before any of this reaches a request.
+  // The paint the TUI makes before any of this reaches a request. It may move
+  // the cursor; it may not touch what the cursor was reading.
+  const before = am._currentObs.windows.get('unified7d');
   am.refreshExpiredQuotas();
-
-  const carried = {};
-  const first = am.getActiveAccount(null, OPUS, null, null, carried);
-  assert.equal(first.name, 'b', 'the request should still have been moved by the reset');
-  am.accounts[2].quota.unified7d = 0.99;
-  const retry = am.getActiveAccount(new Set([first.index]), OPUS, null, null, carried);
-  assert.equal(retry.name, 'a', 'the retry should have fallen back onto the rolled account');
-  am.accounts[2].quota.unified7d = 0.4;
-
-  assert.notEqual(serve(am, null, OPUS).name, 'a',
-    'a repaint spent the mark, so the request that moved was owed nothing');
+  assert.equal(am._currentObs.idx, 0, 'the paint re-read the account it switched to');
+  assert.equal(am._currentObs.windows.get('unified7d'), before,
+    'the paint advanced the reading of the account it left');
+  // And the roll is still there for the next request to find.
+  assert.equal(am._currentRolledOver(am.accounts[0], OPUS), true,
+    'the paint spent the roll of the account it moved off');
 });
 
-test('leaving because an account is unavailable still asks what it was owed', () => {
-  // The availability gate sat BEFORE the rollover question, so a sticky account
-  // that rolled while temporarily spent was left without a discharge. Why a
-  // request leaves does not change what the account is owed.
+test('leaving because an account is unavailable does not spend its roll', () => {
+  // The availability gate sits BEFORE the rollover question, and there is
+  // nothing to discharge: skipping an unavailable account writes nothing, and
+  // the reading is still there when the traffic returns.
   const am = mgr(['a', 'b', 'c'], ON);
   bucket(am, 0, 'unified7d', 0.4, 10);
   bucket(am, 1, 'unified7d', 0.4, 20);
@@ -1168,19 +1153,18 @@ test('leaving because an account is unavailable still asks what it was owed', ()
   rollWindow(am, 0);
   am.accounts[0].quota.unified5h = 0.99;
 
-  const carried = {};
-  const first = am.getActiveAccount(null, OPUS, null, null, carried);
+  const first = am.getActiveAccount(null, OPUS);
   assert.notEqual(first.name, 'a', 'the unavailable account should have been left');
 
   // a becomes usable again and the retry falls back onto it.
   am.accounts[0].quota.unified5h = 0.1;
   am.accounts[2].quota.unified7d = 0.99;
-  const retry = am.getActiveAccount(new Set([first.index]), OPUS, null, null, carried);
+  const retry = am.getActiveAccount(new Set([first.index]), OPUS);
   assert.equal(retry.name, 'a', 'the retry should have fallen back onto the rolled account');
   am.accounts[2].quota.unified7d = 0.4;
 
   assert.notEqual(serve(am, null, OPUS).name, 'a',
-    'leaving on availability discharged nothing, so the roll was spent');
+    'the fail-back onto the rolled account adopted its new week');
 });
 
 test('the session-reset switch routes by the request\'s own window', () => {
@@ -1200,9 +1184,43 @@ test('the session-reset switch routes by the request\'s own window', () => {
   am.accounts[1].quota.unified5hReset = now - 1000;
 
   // A Fable request drives the refresh, so the switch is asked about Fable.
-  am.refreshExpiredQuotas(FABLE, {}, true);
+  am.refreshExpiredQuotas(FABLE);
   assert.equal(am.accounts[am.currentIndex].name, 'cur',
     'the switch installed an account the Fable picker excludes');
+});
+
+test('with the knob OFF the switch is handed no model, whatever the request carries', () => {
+  // THE CHEAPEST CONTROL FOR THE DEFAULT-OFF PROMISE, and it needs no base tree:
+  // with the knob off the model argument cannot change anything, because the
+  // switch is handed none. Threading a request's model through would make its
+  // candidate filter `_isAvailable(acc, model)` where base's is
+  // `_isAvailable(acc)`, a live routing change on the path that promises none.
+  const build = () => {
+    const am = mgr(['cur', 'reset'], undefined);
+    const now = Date.now();
+    bucket(am, 0, 'unified7dFable', 0.10, 50, now);
+    bucket(am, 0, 'unified7d', 0.50, 50, now);
+    // The reset candidate is spent for FABLE and healthy on the shared weekly,
+    // which is the only shape in which the two filters can disagree.
+    bucket(am, 1, 'unified7dFable', 0.99, 40, now);
+    bucket(am, 1, 'unified7d', 0.10, 40, now);
+    assert.equal(am.setCurrentAccount(0), true);
+    am.accounts[1].quota.unified5h = 0.5;
+    am.accounts[1].quota.unified5hReset = now - 1000;
+    return am;
+  };
+  const cursorAfter = model => {
+    const am = build();
+    am.refreshExpiredQuotas(model);
+    return am.accounts[am.currentIndex].name;
+  };
+  assert.equal(cursorAfter(undefined), cursorAfter(FABLE),
+    'the knob-off switch behaved differently for a Fable request than for none');
+  assert.equal(cursorAfter(null), cursorAfter(FABLE),
+    'the knob-off switch consulted the model it was handed');
+  // And it agrees with the knob-off behaviour: the switch takes the account
+  // whose weekly expires sooner, unfiltered by family.
+  assert.equal(cursorAfter(FABLE), 'reset');
 });
 
 test('an all-clockless fleet still ranks by the discovery bias, not by load', () => {
@@ -1231,12 +1249,12 @@ test('an all-clockless fleet still ranks by the discovery bias, not by load', ()
 // Every site that MOVES a request off an account answers for what it was owed
 // ---------------------------------------------------------------------------
 
-test('the 5h session-reset switch records what the account it leaves was owed', () => {
-  // A MOVER THAT NEVER ASKS ABOUT ROLLOVERS. It runs from refreshExpiredQuotas
-  // at the head of selection, so it can take a request off a current account
-  // whose weekly window has just rolled — before the walk has looked at it once.
-  // Nothing in its body mentions a rollover, which is exactly why an invariant
-  // ranging over rollover CHECKS could not see it.
+test('the 5h session-reset switch cannot spend the roll of the account it leaves', () => {
+  // A MOVER THAT NEVER MENTIONS A ROLLOVER. It runs from refreshExpiredQuotas at
+  // the head of selection, so it can take a request off a current account whose
+  // weekly window has just rolled, before the walk has looked at it once. It is
+  // an aim: the reading was taken at the top of this pass, before the switch
+  // ran, and the switch does not touch it.
   const am = mgr(['a', 'b', 'c'], ON);
   bucket(am, 0, 'unified7d', 0.4, 10);
   bucket(am, 1, 'unified7d', 0.4, 20);
@@ -1250,26 +1268,24 @@ test('the 5h session-reset switch records what the account it leaves was owed', 
   am.accounts[1].quota.unified5h = 0.5;
   am.accounts[1].quota.unified5hReset = Date.now() - 1000;
 
-  const carried = {};
-  const first = am.getActiveAccount(null, OPUS, null, null, carried);
+  const first = am.getActiveAccount(null, OPUS);
   assert.equal(first.name, 'b', 'the session reset should have moved the request to b');
 
   // b is refused and c is over threshold, so the retry falls back onto a.
   am.accounts[2].quota.unified7d = 0.99;
-  const retry = am.getActiveAccount(new Set([first.index]), OPUS, null, null, carried);
+  const retry = am.getActiveAccount(new Set([first.index]), OPUS);
   assert.equal(retry.name, 'a', 'the retry should have fallen back onto the rolled account');
   am.accounts[2].quota.unified7d = 0.4;
 
   assert.notEqual(serve(am, null, OPUS).name, 'a',
-    'the reset switch moved the request off a rolled account without recording the debt');
+    'the reset switch spent the roll of the account it moved the request off');
 });
 
-test('the requalification rerank records what the account it leaves was owed', () => {
+test('the requalification rerank cannot spend the roll of the account it leaves', () => {
   // A SECOND MOVER THAT IS NOT A DETECTOR: it reranks and RETURNS before the
-  // rollover branch runs, so the response that teaches an account's quota can be
-  // the same response that reveals its window rolled, and the move is made with
-  // nothing captured. `requalify` is what updateQuota sets when a probed
-  // account's weekly limit becomes known.
+  // rollover branch runs, so the response that teaches an account its quota can
+  // be the same response that reveals its window rolled. `requalify` is what
+  // updateQuota sets when a probed account's weekly limit becomes known.
   const am = mgr(['a', 'b', 'c'], ON);
   bucket(am, 0, 'unified7d', 0.4, 10);
   bucket(am, 1, 'unified7d', 0.4, 20);
@@ -1280,43 +1296,26 @@ test('the requalification rerank records what the account it leaves was owed', (
   rollWindow(am, 0);
   am.accounts[0].requalify = true;
 
-  const carried = {};
-  const first = am.getActiveAccount(null, OPUS, null, null, carried);
+  const first = am.getActiveAccount(null, OPUS);
   assert.notEqual(first.name, 'a', 'the rerank should have moved the request off a');
 
   am.accounts[2].quota.unified7d = 0.99;
-  const retry = am.getActiveAccount(new Set([first.index]), OPUS, null, null, carried);
+  const retry = am.getActiveAccount(new Set([first.index]), OPUS);
   assert.equal(retry.name, 'a', 'the retry should have fallen back onto the rolled account');
   am.accounts[2].quota.unified7d = 0.4;
 
   assert.notEqual(serve(am, null, OPUS).name, 'a',
-    'the rerank moved the request off a rolled account without recording the debt');
+    'the rerank spent the roll of the account it moved the request off');
 });
 
-test('the preview observes a session reset without consuming it', () => {
-  // AN OBSERVER THAT CONSUMES THE EVENT IS NOT AN OBSERVER. The preview's
-  // availability check reaches _clearExpiredQuotas, which performs half the reset
-  // transition — clearing the expired window. With the switch that is its other
-  // half running only for whoever observed the clear, a TUI render cancels the
-  // switch the next real request is owed.
-  const am = mgr(['a', 'b'], ON);
-  bucket(am, 0, 'unified7d', 0.4, 100);
-  bucket(am, 1, 'unified7d', 0.4, 10);
-  assert.equal(am.setCurrentAccount(0), true);
-  am.accounts[1].quota.unified5h = 0.5;
-  am.accounts[1].quota.unified5hReset = Date.now() - 1000;
 
-  // The status view asks its question. It must answer without deciding anything.
-  am.previewRouteIndex(OPUS);
-
-  assert.equal(serve(am, null, OPUS).name, 'b',
-    'the preview consumed the reset and suppressed the switch it belonged to');
-});
-
-test('a knob toggled while a preemption is in flight cannot spend it', () => {
-  // The reload arrives mid-request, between the preemption and the retry its
-  // destination forced. What the request is owed is not in the tracker for a
-  // seed to reach — it is on the request — so seeding cannot answer for it.
+test('a knob toggled mid-request cannot leave a roll half-answered', () => {
+  // The reload arrives between the preemption and the retry its destination
+  // forced. Turning the knob off drops every observation, so the retry and the
+  // request after it are measured from what the accounts present when the knob
+  // comes back rather than from a reading nothing was watching over. Nothing
+  // travels with a request, so the toggle resets the comparison and the traffic
+  // stays where the retry left it.
   const am = mgr(['a', 'b'], ON, { distributeSessions: true });
   bucket(am, 0, 'unified7d', 0.4, 10);
   bucket(am, 1, 'unified7d', 0.4, 10);
@@ -1324,22 +1323,29 @@ test('a knob toggled while a preemption is in flight cannot spend it', () => {
   const other = 1 - first.index;
   rollWindow(am, first.index);
 
-  const carried = {};
   am.beginSession('s1');
-  const sent = am.getActiveAccount(null, OPUS, null, 's1', carried);
+  const sent = am.getActiveAccount(null, OPUS, null, 's1');
   assert.equal(sent.index, other, 'the rollover did not preempt');
   am.recordSession('s1', sent.index, OPUS);
 
   am.setExpiryRouting({ enabled: false });
   am.setExpiryRouting(ON);
 
-  const retry = am.getActiveAccount(new Set([other]), OPUS, null, 's1', carried);
+  const retry = am.getActiveAccount(new Set([other]), OPUS, null, 's1');
   assert.equal(retry.index, first.index, 'the retry did not fall back');
   am.recordSession('s1', retry.index, OPUS);
   am.endSession('s1');
 
+  // No observation survived the toggle, so the next request takes a first sight
+  // of the account it finds the pin on and stays there. It does NOT thrash, and
+  // it does not act on a roll it has no record of.
+  assert.equal(serve(am, 's1', OPUS).index, first.index,
+    'a roll no observation remembered moved the traffic anyway');
+  // The next roll after the knob came back is caught, so the toggle reset the
+  // comparison rather than silencing it.
+  rollWindow(am, first.index);
   assert.equal(serve(am, 's1', OPUS).index, other,
-    'a reload mid-flight spent the rollover the request was carrying');
+    'the first roll after the toggle was missed');
 });
 
 // ---------------------------------------------------------------------------

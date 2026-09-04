@@ -151,17 +151,11 @@ test('the gate and the ranking read the same number, however the bucket resolves
 });
 
 test('every reader and the WRITER agree with a table nobody derived from them', () => {
-  // Expected values written out by hand from the quota shape, not read back out
-  // of the helpers under test: asserting `_governingWeekly(a) ===
-  // _governingWindow(a).utilization` compares one function with itself and
-  // cannot fail. Every number below is independently
-  // constructed, and the WRITER is checked alongside the readers.
-  //
-  // The writer is reached through `setCurrentAccount` — the operator's switch,
-  // which is a real caller rather than an internal — because `_setCurrent` only
-  // moves the cursor, and what a request reads is established at its settlement.
-  // Following the writer is the point of the guard; asserting against a method
-  // that does not hold it would measure nothing.
+  // Expected values are written out by hand from the quota shape rather than
+  // read back out of the helpers under test, which would compare a function with
+  // itself. The WRITER is checked alongside the readers, and it has one site: a
+  // request arriving to find the cursor already on an account takes the reading.
+  // So the guard drives an ordinary selection and reads what it left behind.
   const now = Date.now();
   const SHARED = now + 40 * H;
   const SCOPED = now + 12 * H;
@@ -212,19 +206,14 @@ test('every reader and the WRITER agree with a table nobody derived from them', 
     assert.equal(snap.utilization, c.utilization, `${c.label}: band utilization`);
     assert.equal(snap.resetAt, c.resetAt, `${c.label}: band reset`);
 
-    // The WRITER: making the account current must leave the reference holding
-    // exactly this window at exactly this reset, under this name.
-    assert.equal(am.setCurrentAccount(a.index), true);
-    assert.equal(am._currentRef.windows.get(c.window), c.resetAt,
-      `${c.label}: writer stored the wrong reset under ${c.window}`);
-
-    // And the writer a REQUEST reaches, which is the one every routed request
-    // goes through: settling on the account must store the same window at the
-    // same reset. Two writers, one table.
-    am._currentRef = { idx: null, windows: new Map() };
-    am._noteCurrentSettled(a, c.model);
-    assert.equal(am._currentRef.windows.get(c.window), c.resetAt,
-      `${c.label}: the settlement writer stored the wrong reset under ${c.window}`);
+    // The WRITER, reached the only way anything reaches it: a request arrives,
+    // finds the cursor on this account, and takes its reading. That reading must
+    // hold exactly this window at exactly this reset, under this name.
+    assert.equal(am.currentIndex, a.index, `${c.label}: the fixture must start on a`);
+    am.getActiveAccount(null, c.model);
+    assert.equal(am._currentObs.idx, a.index, `${c.label}: the reading named another account`);
+    assert.equal(am._currentObs.windows.get(c.window), c.resetAt,
+      `${c.label}: the writer stored the wrong reset under ${c.window}`);
   }
 });
 

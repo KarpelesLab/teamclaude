@@ -21,9 +21,25 @@ function listen(server) {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
 }
 
-function deferred() {
-  let resolve;
-  return { promise: new Promise(r => { resolve = r; }), resolve: (...a) => resolve(...a) };
+// A one-shot signal with a DEADLINE, and the deadline is the point.
+//
+// These tests wait for the upstream to be reached before releasing it, and an
+// unbounded wait turns "the request never got there" into a hung process rather
+// than a failed assertion: the body never reaches its expectations, the
+// `finally` never runs, the listeners stay open, and the whole file outlives the
+// runner's own timeout. Rejecting inside the test body makes it an ordinary red.
+function deferred(what, ms = 5000) {
+  let resolve, reject, timer;
+  const promise = new Promise((res, rej) => {
+    resolve = v => { clearTimeout(timer); res(v); };
+    reject = rej;
+    timer = setTimeout(() => rej(new Error(`timed out after ${ms}ms waiting for: ${what}`)), ms);
+    timer.unref?.();
+  });
+  // Nothing awaits the rejection until the body does, and an unobserved
+  // rejection would take the process down before the assertion can report it.
+  promise.catch(() => {});
+  return { promise, resolve, reject };
 }
 
 // A live proxy in front of a live upstream. `handler(name, res)` decides what
@@ -145,8 +161,8 @@ for (const distribute of [false, true]) {
   const sid = distribute ? 's1' : null;
 
   test(`${path} path: a request selected inside the preemption's suspension cannot spend its rollover`, async () => {
-    const reached = deferred();
-    const held = deferred();
+    const reached = deferred('the upstream to be reached');
+    const held = deferred('the suspension to be released');
     let refusals = 0;
 
     const { am, send, close } = await fleet(['a', 'b'], async (name, res) => {
@@ -250,15 +266,13 @@ for (const distribute of [false, true]) {
     });
 
     // The same path with the destination rolling WHILE the request to it is in
-    // flight. The arm above cannot fail on its own — nothing moves underneath
-    // it, so every reading of the destination is the same number and any way of
-    // arriving at one passes. Rolling the window in between makes the retry's
-    // selection answerable: it re-prices the destination against what was
-    // recorded when the preemption sent the request there, so the week gained
-    // under the request is a rollover and the retry leaves rather than settling
-    // on the freshest account in the fleet. Removing the write that records the
-    // destination at the preemption turns both of these red.
-    test(`${path} path: ${retry.name} sees a destination that rolled while in flight`, async () => {
+    // flight, and THIS IS WHERE THE AIM WINDOW SHOWS. The preemption AIMS at b
+    // and takes no reading there, because the request may never arrive; the
+    // reading is taken by the first request that finds the choice resting on b.
+    // A roll landing inside that gap has never been read, so it is a first sight
+    // and the retry stays. What is gated is the half that does hold: once a
+    // request HAS rested on b, b's roll moves the traffic.
+    test(`${path} path: ${retry.name} first-sights a roll that lands inside the aim window`, async () => {
       const seen = [];
       let am;
       const fleetHandle = await fleet(['a', 'b'], async (name, res) => {
@@ -276,31 +290,32 @@ for (const distribute of [false, true]) {
         assert.equal(await send(sid), 'a', 'the fixture must start on a');
         am.accounts[0].quota.unified7dReset += WEEK;
 
-        // b rolled under the request. Measured against what was recorded when
-        // the preemption sent the request there, that is a rollover, so the
-        // retry leaves b. Measured against b as it stands at the retry it is
-        // nothing at all, and the request parks on the week b just gained.
-        assert.notEqual(await send(sid), 'b',
-          'the retry priced b on what it reads now instead of what was recorded when it was sent there');
+        // Nothing read b before it rolled, so the retry has nothing to measure
+        // the week it gained against and stays.
+        assert.equal(await send(sid), 'b',
+          'a roll nothing had read moved the traffic anyway');
         retry.assertReached(seen);
+
+        // And the gap closes: this request rests on b and reads it, so b's NEXT
+        // roll is caught.
+        assert.equal(await send(sid), 'b');
+        am.accounts[1].quota.unified7dReset += WEEK;
+        assert.notEqual(await send(sid), 'b',
+          'b was never read, so its roll after the aim window was missed too');
       } finally {
         await close();
       }
     });
   }
 
-  // A CHAIN CAN BE OWED MORE THAN ONE ROLLOVER. The request is pushed off a,
-  // sent to b, b rolls under it and throttles, it is pushed off b to c, c
-  // refuses it, and the only account left is b. Keep one debt and the return to
-  // b adopts the week b just gained; keep them per account and each is answered
-  // where it is met.
-  //
-  // The two rolls land the windows far apart on purpose, so that once both have
-  // moved b is still the better of the two and the return to b is the ranking's
-  // own choice rather than a contrivance. A roll is a jump, not a fixed step —
-  // what makes it one is the distance, which is why these are set rather than
-  // incremented.
-  test(`${path} path: a chain owed two rollovers answers both`, async () => {
+  // A CHAIN THAT RETURNS TO A DESTINATION IT ROLLED UNDER. The request is pushed
+  // off a, sent to b, b rolls under it and throttles, it is pushed off b to c, c
+  // refuses it, and the only account left is b. Nothing rides the request and
+  // nothing had read b before it rolled, so the return to b is a first sight.
+  // What is gated is that the chain still answers the roll it STARTED with: a is
+  // not where it ends up, and b's own later roll is caught once b has been
+  // rested on.
+  test(`${path} path: a chain answers the roll that started it`, async () => {
     const seen = [];
     let am;
     const handle = await fleet(['a', 'b', 'c'], async (name, res) => {
@@ -324,13 +339,18 @@ for (const distribute of [false, true]) {
       assert.equal(await send(sid), 'a', 'the fixture must start on a');
       am.accounts[0].quota.unified7dReset = Date.now() + 500 * H;
 
-      assert.equal(await send(sid), 'b', 'the chain should have come back to b');
-      assert.deepEqual(seen, ['b', 'c'], 'the chain must have gone a -> b -> c -> b');
+      assert.equal(await send(sid), 'b', 'the chain should have ended on b');
+      // The roll landed inside the aim window and is a first sight, so the
+      // throttle's retry stays on b: the chain is a -> b -> b, c never reached.
+      assert.deepEqual(seen, ['b'], 'the chain must have gone a -> b -> b');
 
-      // b's own roll was detected when the chain was pushed off it, so returning
-      // there does not settle onto the week it gained.
-      assert.notEqual(await send(sid), 'b',
-        'the second rollover in the chain was lost when the first was kept');
+      // The roll that started the chain is answered: the traffic left a and did
+      // not drift back to it.
+      assert.notEqual(await send(sid), 'a',
+        'the chain settled back onto the account its rollover pushed it off');
+      // And b, now that a request has rested on it, is measured from here on.
+      am.accounts[1].quota.unified7dReset += WEEK;
+      assert.notEqual(await send(sid), 'b', 'b was never read once the chain settled there');
     } finally {
       await close();
     }
@@ -354,8 +374,8 @@ test('returning to the origin does not rewind a window a sibling settled', async
   // every window a had when it left puts the Haiku sibling's reading back to
   // what it was before the shared window rolled, and the next Haiku request
   // reads that as a rollover that never happened and moves off a for nothing.
-  const reached = deferred();
-  const held = deferred();
+  const reached = deferred('the upstream to be reached');
+  const held = deferred('the suspension to be released');
   let refused = 0;
   let am;
 
@@ -397,16 +417,20 @@ test('returning to the origin does not rewind a window a sibling settled', async
     // different request.
     am.accounts[0].quota.unified7dReset += WEEK;
     assert.equal(await send(null, HAIKU), 'a', 'the sibling must have settled on a');
-    const settled = am._currentRef.windows.get('unified7d');
+    const settled = am._currentObs.windows.get('unified7d');
     assert.equal(settled, am.accounts[0].quota.unified7dReset,
       'the fixture must have left a\'s shared window settled at its new reset');
 
     held.resolve();
     await opus;
 
-    // The Opus request was owed a's SCOPED window and nothing else.
-    assert.equal(am._currentRef.windows.get('unified7d'), settled,
-      'the origin restore rewound a window the request was never owed');
+    // NOTHING A REQUEST HOLDS IS WRITTEN BACK, so a return to the origin cannot
+    // rewind a window another request settled — there is nothing to write back
+    // with. This held by construction rather than by a rule, and it is checked
+    // anyway because "true by construction" is what three of this feature's
+    // shipped sentences claimed while a probe said otherwise.
+    assert.equal(am._currentObs.windows.get('unified7d'), settled,
+      'the return to the origin rewound a window a sibling had settled');
   } finally {
     held.resolve();
     await close();
@@ -447,70 +471,12 @@ test('the exhausted-fleet probe prices the account it makes current', async () =
   }
 });
 
-test('a retry reads a destination it was never pushed off from what it read on arrival', async () => {
-  // THE ARRIVAL READING ON ITS OWN, with no debt covering the same account.
-  //
-  // Every other arm here works on an account the request was both sent to AND
-  // pushed off, where the reading it arrived with and the reading it is owed are
-  // the same number — so either one alone answers and neither can be shown to
-  // matter. This is the case where only the arrival exists: b is a destination
-  // that rolls under the request without ever being an origin.
-  //
-  // The shared reference is moved off b by an operator switch while the request
-  // hangs there, so nothing shared remembers what b read; c is taken out of
-  // service so the retry has to come back to b; and c returns afterwards so the
-  // re-rank has somewhere better to go than b, which is what makes the answer
-  // visible in the routing rather than only in the log.
-  const reached = deferred();
-  const held = deferred();
-  let throttled = 0;
-  let am;
-
-  const handle = await fleet(['a', 'b', 'c'], async (name, res) => {
-    if (name === 'b' && throttled === 0) {
-      throttled++;
-      reached.resolve();
-      await held.promise;
-      res.writeHead(429, { 'retry-after': '1', 'content-type': 'application/json' });
-      res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error' } }));
-      return;
-    }
-    return serves(res, name);
-  }, { hours: [10, 20, 30] });
-  ({ am } = handle);
-  const { send, close } = handle;
-
-  try {
-    assert.equal(await send(), 'a', 'the fixture must start on a');
-    am.accounts[0].quota.unified7dReset = Date.now() + 500 * H;
-
-    const first = send().catch(() => null);
-    await reached.promise;
-
-    assert.equal(am.setCurrentAccount(2), true);       // shared state stops describing b
-    am.accounts[1].quota.unified7dReset = Date.now() + 400 * H;   // b rolls under the request
-    am.accounts[2].quota.unified7d = 0.99;             // and c cannot take the retry
-
-    held.resolve();
-    assert.equal(await first, 'b', 'the retry should have come back to b');
-
-    // c returns, so the re-rank has a better account than b to move to.
-    am.accounts[2].quota.unified7d = 0.4;
-    assert.notEqual(await send(), 'b',
-      'the retry priced b from shared state instead of from what it read on arrival');
-  } finally {
-    held.resolve();
-    await close();
-  }
-});
-
-test('a roll that happens while the knob is off is still owed when it comes on', async () => {
-  // The current account's reading is kept whether or not the knob is on, which
-  // is why it needs no seeding on the transition. The never-advance guard is
-  // what makes that worth anything: with the knob off every settle reaches it
-  // carrying nothing, and without it each one would walk the reading forward
-  // over the roll, so the operator who turns preemption on to catch exactly this
-  // would find it already spent.
+test('a roll that happens while the knob is OFF is not owed when it comes on', async () => {
+  // Off means there is no state at all: the readings are dropped when preemption
+  // stops, none is written while it is off, and the transition back on takes a
+  // fresh first sight. The cost is the one roll nobody was watching for; the
+  // gain is that "off is inert" is a lifetime rather than a rule every reader
+  // has to remember.
   const { am, send, close } = await fleet(['a', 'b'], async (name, res) => serves(res, name),
     { hours: [10, 20] });
 
@@ -523,8 +489,14 @@ test('a roll that happens while the knob is off is still owed when it comes on',
     assert.equal(await send(), 'a');
 
     am.setExpiryRouting({ enabled: true, preempt: true });
+    assert.equal(await send(), 'a',
+      'a roll nothing was watching for moved the traffic when the knob came on');
+
+    // And the first roll AFTER the knob came on IS caught, so the transition is
+    // a reset rather than a silencing.
+    am.accounts[0].quota.unified7dReset += WEEK;
     assert.notEqual(await send(), 'a',
-      'the roll was walked forward while the knob was off and is no longer owed');
+      'the first roll after the knob came on was missed');
   } finally {
     await close();
   }
