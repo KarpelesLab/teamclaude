@@ -19,7 +19,7 @@ const ENTITLEMENT_DENIAL_COOLDOWN_SECONDS = 5 * 60;
 
 // Fallback when a per-bucket threshold table names neither the bucket nor a
 // `default` — the same value the single-number form has always used.
-const DEFAULT_SWITCH_THRESHOLD = 0.98;
+export const DEFAULT_SWITCH_THRESHOLD = 0.98;
 
 // Quota fields that survive a restart: utilization levels and their reset
 // windows, learned passively from upstream responses. Transient/derived state

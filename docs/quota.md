@@ -64,6 +64,17 @@ That conflates two different risks, though: 98% of a 5-hour window that refills 
 
 Keys are the quota field names — `unified5h`, `unified7d`, `unified7dFable`, `unified7dSonnet`, `tokens`, `requests`. Anything unlisted takes `default`, and a bare number behaves exactly as before. The TUI's ±1% control edits the single-number form; when a table is configured the settings row shows it read-only, so the ± control can't silently flatten your per-bucket values.
 
+Either form can be set without a terminal attached:
+
+```bash
+teamclaude threshold                  # show the effective table
+teamclaude threshold 90               # one number for every bucket
+teamclaude threshold unified7d=90     # add or change one bucket
+teamclaude threshold unified7d=default  # drop it again
+```
+
+A running server picks the change up on the reload the command sends it. This is the only way to edit a per-bucket table in place: the TUI shows it read-only, and the single-number form there would flatten it.
+
 ## Hold on exhaustion
 
 By default, when all accounts are exhausted TeamClaude returns a `429` immediately, which causes Claude Code to abort the current task. With `holdSeconds` set, the proxy **holds the HTTP connection open** instead and polls silently every ~60 seconds; the instant any account's quota resets, the request is forwarded and Claude Code resumes — the interruption never happens.
