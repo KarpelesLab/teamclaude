@@ -509,7 +509,11 @@ test('path 3: a band member with strictly worse pressure is still refused', () =
   // assertion below would pass without the switch ever having been considered.
   assert.deepEqual(build()._bandedCandidates().map(a => a.name), ['cur', 'b']);
   const am = build();
-  am.refreshExpiredQuotas();
+  // The ROUTING shape of the call. A repaint clears windows and leaves the
+  // switch for whoever routes next, so driving these through the bare form
+  // would let both of the refusals below pass without the switch ever having
+  // been considered — the same way the twin above avoids consuming the reset.
+  am.refreshExpiredQuotas(null, null, true);
   assert.equal(am.accounts[am.currentIndex].name, 'cur');
 });
 
@@ -529,7 +533,11 @@ test('path 3: a switch onto an account the band excluded is refused too', () => 
   };
   assert.deepEqual(build()._bandedCandidates().map(a => a.name), ['hot']);
   const am = build();
-  am.refreshExpiredQuotas();
+  // The ROUTING shape of the call. A repaint clears windows and leaves the
+  // switch for whoever routes next, so driving these through the bare form
+  // would let both of the refusals below pass without the switch ever having
+  // been considered — the same way the twin above avoids consuming the reset.
+  am.refreshExpiredQuotas(null, null, true);
   assert.equal(am.accounts[am.currentIndex].name, 'cur');
 });
 
@@ -539,7 +547,7 @@ test('path 3 still switches when the sooner-resetting account is the better one'
   bucket(am, 1, 'unified7d', 0.1, 10);
   am.accounts[1].quota.unified5h = 0.5;
   am.accounts[1].quota.unified5hReset = Date.now() - 1000;
-  am.refreshExpiredQuotas();
+  am.refreshExpiredQuotas(null, null, true);
   assert.equal(am.accounts[am.currentIndex].name, 'b');
 });
 

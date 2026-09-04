@@ -1307,6 +1307,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   const account = ctx.pinnedIndex != null
     ? (ctx.tried.has(ctx.pinnedIndex) ? null : accountManager.accounts[ctx.pinnedIndex])
     : accountManager.getActiveAccount(ctx.tried, ctx.model, ctx.advisorModel, ctx.sessionId, ctx.preemption);
+  // A pinned route skips the walk that asks what the account this session is on
+  // is owed — and then recordSession below moves the pin anyway. Bypassing
+  // selection is not bypassing the obligation.
+  if (account && ctx.pinnedIndex != null) {
+    accountManager.notePinnedRoute(ctx.sessionId, account, ctx.model, ctx.preemption);
+  }
   if (!account) {
     // Every candidate was refused by upstream (403). Waiting will not help — the
     // account needs attention, not a retry — so say so plainly rather than

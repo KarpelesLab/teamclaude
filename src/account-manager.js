@@ -499,7 +499,7 @@ export class AccountManager {
     // on every request so the behaviour holds without the TUI render loop, and
     // it is given this request's model and carrier because the switch it may
     // perform is a mover like any other.
-    this.refreshExpiredQuotas(model, carried);
+    this.refreshExpiredQuotas(model, carried, true);
     // Session-affinity distribution (opt-in): keep a session on its pinned
     // account for cache reuse, and route a new session to the least-loaded
     // account. Only when enabled, only for a real session, and only outside a
@@ -561,6 +561,14 @@ export class AccountManager {
       const next = this._selectNext(exclude, model, advisorModel, carried);
       if (next) { current.requalify = false; return next; }
     }
+    // ASKED BEFORE THE GATE, NOT INSIDE IT. Why a request leaves an account does
+    // not change what that account is owed: a window that rolled while the
+    // account was temporarily unavailable — spent for five hours, rate-limited,
+    // already tried this request — is owed exactly as much as one that rolled
+    // while it was serving. Inside the availability branch, leaving for any of
+    // those reasons discharges nothing and a fail-back inside the same request
+    // prices the post-roll week.
+    this._noteOwedOnLeaving(carried, current, model, this._currentRef);
     if (this._isAvailable(current, model, advisorModel) && !exclude?.has(current.index)) {
       // Rollover preemption (expiry routing): the current account's governing
       // window rolled over, making it the freshest and furthest-dated choice —
@@ -645,7 +653,14 @@ export class AccountManager {
     }
     for (const idx of candidates) {
       const pinned = this.accounts[idx];
-      if (!pinned || !this._isAvailable(pinned, model, advisorModel) || exclude?.has(idx)) continue;
+      if (!pinned) continue;
+      // Before the gate, for the reason the current walk gives: a pin whose
+      // window rolled while the account was unavailable is owed that roll just
+      // as much as one that rolled while it was serving, and skipping it here
+      // is a way of leaving without asking.
+      this._noteOwedOnLeaving(carried, pinned, model,
+        this.sessionTracker.refsFor(sessionId, this._weeklyBucketFor(model)));
+      if (!this._isAvailable(pinned, model, advisorModel) || exclude?.has(idx)) continue;
       // Rollover preemption (expiry routing): the candidate we are about to stay
       // on rolled over its governing window, so it is now the freshest AND
       // furthest-dated account — staying would burn the window that just gained
@@ -1432,12 +1447,20 @@ export class AccountManager {
     if (!this.expiryRouting.enabled) return candidates.map(() => 0);
     const snapshot = this._bandSnapshot(candidates, model, now);
     const decision = decideBand(snapshot);
-    if (decision.kind !== 'banded') return candidates.map(() => 0);
-    return snapshot.accounts.map(a => {
+    const bounds = snapshot.accounts.map(a => {
       const pressure = pressureOf(a, now);
-      const bound = pressure.kind === 'absent' ? pressure.lowerBound : null;
-      return bound != null && bound < decision.floor ? 1 : 0;
+      return pressure.kind === 'absent' ? pressure.lowerBound ?? null : null;
     });
+    // Unknown is not zero: the band returns passthrough when no account has a
+    // measured pressure, and reading that as "nothing to hold off" would zero
+    // the term on a fleet where every account is clockless. With no band floor
+    // the best bound is the bar instead, so an account measured below it waits
+    // behind the ones that are not.
+    const floor = decision.kind === 'banded'
+      ? decision.floor
+      : Math.max(...bounds.filter(b => b != null), -Infinity);
+    if (!Number.isFinite(floor)) return candidates.map(() => 0);
+    return bounds.map(b => (b != null && b < floor ? 1 : 0));
   }
 
   /**
@@ -1668,30 +1691,33 @@ export class AccountManager {
    *  through the arrival instead. The two differ for an origin with no arrival,
    *  which is where the request BEGAN, and that difference IS gated.
    *
-   *  TWO VERSIONS OF THIS PARAGRAPH HAVE NOW BEEN FALSIFIED WHERE THEY SAID
-   *  THEY WOULD BE. The first counted two selection paths and named a third as
-   *  its falsifier; there was one. The second ranged over sites that DETECT a
-   *  rollover — and detection was the wrong unit, because a path can move a
-   *  request off an account it is owed a rollover on WITHOUT ever asking whether
-   *  one happened, which satisfies that wording while doing the exact harm it
-   *  exists to prevent. Three such paths existed.
+   *  AN ENUMERATION OF SITES IS FALSIFIED BY ANY BEHAVIOUR THAT PRODUCES THE HARM
+   *  WITHOUT MATCHING THE PATTERN: a path that moves a request off an account
+   *  without ever asking satisfies a rule ranging over rollover DETECTIONS, and a
+   *  new caller of a write that already has a discharge lexically above it
+   *  satisfies a grep over WRITE SITES. So the range is closed at the CHOKE POINT
+   *  instead, where no search has to find every site:
    *
-   *  So the predicate is now MOVEMENT, which is what the harm is made of:
+   *    A REQUEST IS MOVED OFF AN ACCOUNT ONLY THROUGH A PATH THAT HAS ASKED
+   *    WHAT THAT ACCOUNT WAS OWED. Every mover reaches _noteOwedOnLeaving, and
+   *    that helper asks the rollover question itself and REFUSES when a mover
+   *    cannot say what it is leaving. Satisfy-by-not-asking and
+   *    satisfy-by-asking-with-nothing both fail loudly rather than silently.
    *
-   *    EVERY SITE THAT MOVES A REQUEST OFF AN ACCOUNT EITHER RECORDS WHAT THAT
-   *    ACCOUNT WAS OWED OR ESTABLISHES THAT IT WAS OWED NOTHING. The movers are
-   *    the writers of the cursor and of a session pin, and _noteOwedOnLeaving is
-   *    how all of them discharge it — it asks the rollover question itself, so a
-   *    mover cannot satisfy this by not asking.
+   *  The search that checks it is over the CALL GRAPH rather than the write
+   *  sites, because a new caller of an old write matches no pattern over the
+   *  writes themselves:
    *
-   *  The search is `grep -n '_setCurrent(' src/account-manager.js` (six callers,
-   *  enumerated at _setCurrent) plus the three session walks. It is a strictly
-   *  larger and better-defined set than the callers of two predicates, and it is
-   *  mechanically checkable: a SEVENTH cursor write, or a fourth session walk,
-   *  without a _noteOwedOnLeaving above it falsifies this paragraph. That is
-   *  still a search rather than a proof and it ships beside the sentence so the
-   *  next reader re-runs it. The cost of keeping accumulation meanwhile is one
-   *  map entry per account in a chain. */
+   *    grep -n '_setCurrent(\|sessionTracker.touch(' src/account-manager.js
+   *    then walk OUTWARD from each enclosing method to its callers, to the entry
+   *    points, and ask of every entry: does this route a request? A write reached
+   *    while nothing is routed is the case a write-site search cannot name.
+   *
+   *  IT IS STILL NOT A PROOF. The falsifier is an entry point that DOES route a
+   *  request but supplies no carrier: it passes the walk and defeats the choke
+   *  point, because the server supplies the carrier by convention rather than by
+   *  construction. The cost of keeping accumulation meanwhile is one map entry
+   *  per account in a chain. */
   _noteOwed(carried, origin, window, reading) {
     if (!carried) return;
     const seen = reading?.get(window);
@@ -1722,14 +1748,70 @@ export class AccountManager {
    * rule by never asking. Asking is free and the answer is usually no.
    *
    * `ref` is the reading the mover is measuring against: the current account's
-   * for a cursor write, the session's for a pin. A mover with neither has
-   * nothing to leave.
+   * for a cursor write, the session's for a pin.
+   *
+   * THE THREE ABSENCES ARE NOT THE SAME ABSENCE, and collapsing them into one
+   * `return` is what made this the new form of the old evasion: a mover reaching
+   * here with nothing looked compliant to every search while discharging
+   * nothing — satisfy-by-not-asking became satisfy-by-asking-with-nothing, and a
+   * repaint found it first. So each is answered on its own terms.
+   *
+   *   NO CARRIER — no request is being routed, so nothing can be owed. Real and
+   *   common: startup, an operator's switch. What keeps a PAINT from arriving
+   *   here in that state is not this line but refreshExpiredQuotas, which lets
+   *   only a mover consume the mark; a repaint never reaches a mover at all.
+   *
+   *   NO ACCOUNT TO LEAVE — a mover that cannot say what it is leaving. There is
+   *   no correct answer to give it, and returning one quietly is how a caller
+   *   ships broken and reads as compliant, so it REFUSES.
+   *
+   *   NO READING — nothing has been read for this choice yet. That is a first
+   *   sight rather than a missing argument, and the honest answer is that
+   *   nothing is owed.
    */
   _noteOwedOnLeaving(carried, leaving, model, ref) {
-    if (!carried || !leaving || !ref) return;
+    if (!carried) return;
+    if (!leaving) {
+      throw new Error('_noteOwedOnLeaving: a mover must name the account it is leaving');
+    }
+    if (!ref) return;
+    // ONLY WHEN THE WINDOW HAS ACTUALLY JUMPED. Recording an unjumped reading is
+    // a no-op twice over — the restore puts back what the reference already
+    // holds, and the never-advance guard declines to move it — so the condition
+    // looks like complexity with no witness. Its witness is indirect: with the
+    // debt recorded unconditionally, almost every account a request touches is
+    // owed rather than arrived-at, and the arrival/debt split, the
+    // restore-only-what-was-priced rule and two of the walks' own discharges all
+    // stop being distinguishable. This is what keeps a debt rare enough for the
+    // rest of the mechanism to be measurable at all.
     const win = this._governingWindow(leaving, model);
     if (!this._jumped(this._readingFor(ref, leaving), win)) return;
     this._noteOwed(carried, leaving, win.window, ref.windows);
+  }
+
+  /**
+   * A route chosen OUTSIDE the selection walk: an explicit `/tc-acct/` or
+   * `TC_ACCT` pin, and the advisor fallback that names an account directly.
+   * Neither goes through a walk, so neither reached the choke point — but the
+   * server still moves the session's pin afterwards, which makes both movers.
+   * A destination reached this way is priced here; unpriced, its first roll is
+   * first-sighted, with the reference still stamped for an earlier tenure.
+   *
+   * Public because the caller is the server rather than a walk in this file.
+   * That is the shape the call-graph search is for: a mover can live in another
+   * module, and only walking outward from the writes finds it.
+   */
+  notePinnedRoute(sessionId, account, model = null, carried = null) {
+    if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) return;
+    if (!account) return;
+    const bucket = this._weeklyBucketFor(model);
+    const pinIdx = this.sessionTracker.pinnedAccount(sessionId, bucket);
+    const leaving = pinIdx == null ? null : this.accounts[pinIdx];
+    if (leaving && leaving.index !== account.index) {
+      this._noteOwedOnLeaving(carried, leaving, model,
+        this.sessionTracker.refsFor(sessionId, bucket));
+    }
+    this._notePinSettled(sessionId, account, model, carried);
   }
 
   /** Record what `account` read as this request arrived there. Never over a
@@ -2092,7 +2174,13 @@ export class AccountManager {
       session = true;
       // The other half of this transition is the switch, and it is owed whoever
       // routes next rather than whoever cleared. See refreshExpiredQuotas.
-      account.sessionResetPending = true;
+      //
+      // ONLY WHILE THE FEATURE IS ON. This mark is mechanism state, and with the
+      // knob off there must be none of it: routing then has to be the old
+      // routing, byte for byte, and a mark that outlives the call that set it
+      // lets an observer change a later decision. Off, the switch keeps its
+      // original same-pass shape.
+      if (this.expiryRouting.enabled) account.sessionResetPending = true;
     }
     if (q.unified7d != null && q.unified7dReset && now >= q.unified7dReset) {
       console.log(`[TeamClaude] Account "${account.name}" weekly quota reset`);
@@ -2193,19 +2281,40 @@ export class AccountManager {
    * account's (and it still has weekly quota), so we spend the quota closest to
    * refreshing first.
    */
-  refreshExpiredQuotas(model = null, carried = null) {
+  refreshExpiredQuotas(model = null, carried = null, routing = false) {
     let changed = false;
+    const clearedHere = [];
     for (const account of this.accounts) {
-      if (this._clearExpiredQuotas(account).changed) changed = true;
+      const r = this._clearExpiredQuotas(account);
+      if (r.changed) changed = true;
+      if (r.session) clearedHere.push(account);
     }
-    // The switch is driven by a PENDING MARK rather than by whoever happened to
-    // observe the clear. Clearing and switching are two halves of one
-    // transition, and any reader that touches quota — the status preview's
-    // availability check reaches _clearExpiredQuotas the same way selection
-    // does — can otherwise perform the first half and silently cancel the
-    // second, leaving the fleet on an account the reset should move it off.
-    // Marking makes the halves independent of who runs first: an observer may
-    // clear, and the transition still completes on the next routing pass.
+
+    // WITH THE FEATURE OFF THIS IS THE OLD FUNCTION, and it has to be: the knob
+    // -off promise is that routing is byte-identical to what the router does
+    // without this feature, which switches on the resets THIS pass observed. No
+    // marks exist to consider (none are set), and none outlive the call, so an
+    // observer that clears a window cannot change a decision a later request
+    // makes. That is the one property the whole feature is allowed to keep.
+    if (!this.expiryRouting.enabled) {
+      if (clearedHere.length) this._switchOnSessionReset(clearedHere, model, carried);
+      return changed;
+    }
+
+    // With it on, the switch is driven by a PENDING MARK rather than by whoever
+    // happened to observe the clear. Clearing and switching are two halves of
+    // one transition, and any reader that touches quota — the status preview's
+    // availability check reaches _clearExpiredQuotas the same way selection does
+    // — performed the first half and silently cancelled the second, leaving the
+    // fleet on an account the reset was supposed to move it off.
+    //
+    // ONLY A MOVER CONSUMES A MARK. A paint is not routing anything, so it may
+    // clear and mark and must not switch: the TUI repaints every few seconds and
+    // twice a second under load, and letting a repaint move the cursor is the
+    // same observer hole in the other direction — the transition completing at a
+    // moment no request asked for, with nothing to be owed and nothing to owe it
+    // to. The mark waits for a request.
+    if (!routing) return changed;
     const sessionReset = this.accounts.filter(a => a.sessionResetPending);
     if (sessionReset.length) {
       // Cleared whether or not the switch takes: the reset has been considered,
@@ -2234,7 +2343,10 @@ export class AccountManager {
     const eligible = [];
     for (const acc of candidates) {
       if (acc.index === this.currentIndex) continue;
-      if (!this._isAvailable(acc)) continue; // enough session & weekly quota left
+      // Model-scoped, because the request being routed has one: an account whose
+      // Fable weekly is spent is still fully usable for Opus, and a switch that
+      // ignores the model can install one the model's own picker would refuse.
+      if (!this._isAvailable(acc, model)) continue; // enough session & weekly quota left
       // Don't demote to a lower-priority (higher value) account on a reset.
       if ((acc.priority || 0) > (current.priority || 0)) continue;
       const weekly = acc.quota.unified7dReset;
@@ -2247,7 +2359,7 @@ export class AccountManager {
     // _pickLeastLoaded.
     const now = Date.now();
     const field = eligible.concat(current);
-    const ranks = this._rankedPressures(field, null, now);
+    const ranks = this._rankedPressures(field, model, now);
     const rankOf = new Map(field.map((a, i) => [a.index, ranks[i]]));
 
     let best = null;
@@ -2265,7 +2377,7 @@ export class AccountManager {
     // membership says the account is worth spending at all. The rank comparison
     // says this switch leaves no strictly better account behind, which
     // membership does not claim once a lower tier passes through unbanded.
-    if (this.expiryRouting.enabled && !this._bandedCandidates().includes(best)) return;
+    if (this.expiryRouting.enabled && !this._bandedCandidates(null, model).includes(best)) return;
     // Strictly worse than what we are on: stay. Equal keeps the reset tiebreak
     // that got us here, and with expiry routing off every rank is absent and
     // equal, so this cannot fire at all.
@@ -2371,7 +2483,7 @@ export class AccountManager {
    * available (the server still starts; requests 429 until a window resets).
    */
   selectActiveAccount() {
-    this.refreshExpiredQuotas(); // drop any restored windows that already expired
+    this.refreshExpiredQuotas(null, null, true); // drop any restored windows that already expired
     const best = this._pickBestAvailable();
     if (!best) return this.accounts[this.currentIndex] || null;
     this._setCurrent(best);

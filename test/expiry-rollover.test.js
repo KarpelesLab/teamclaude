@@ -1112,6 +1112,121 @@ test('an account known to be nearly spent does not win on having fewer sessions'
   am.endSession('s1');
 });
 
+// THE DEFAULT-OFF GUARANTEE IS NOT A UNIT TEST. The promise in docs/routing.md
+// is byte-identity with the behaviour the knob is off for, and that behaviour
+// also lets a status preview consume a session reset and suppress the switch. So
+// an arm asserting "the preview changes nothing" fails with the knob off too,
+// and would be a false gate. The claim is differential by nature and is measured
+// that way, by flagoff-sweep.mjs over generated fleets.
+
+test('a repaint does not consume the mark a request is owed', () => {
+  // TUI._render calls the refresh with no request arguments, every few seconds
+  // idle and twice a second under load. Consuming the mark there completes the
+  // transition at a moment no request asked for — and the discharge on that path
+  // reaches the mover carrying nothing, which is compliant to every search and
+  // discharges nothing: satisfy-by-not-asking became satisfy-by-asking-with-
+  // nothing. Only a mover moving a request may redeem a mark.
+  const am = mgr(['a', 'b', 'c'], ON);
+  bucket(am, 0, 'unified7d', 0.4, 10);
+  bucket(am, 1, 'unified7d', 0.4, 20);
+  bucket(am, 2, 'unified7d', 0.4, 30);
+  assert.equal(am.setCurrentAccount(0), true);
+  assert.equal(serve(am, null, OPUS).name, 'a', 'the fixture must start on a');
+
+  rollWindow(am, 0);
+  am.accounts[1].quota.unified5h = 0.5;
+  am.accounts[1].quota.unified5hReset = Date.now() - 1000;
+
+  // The paint the TUI makes before any of this reaches a request.
+  am.refreshExpiredQuotas();
+
+  const carried = {};
+  const first = am.getActiveAccount(null, OPUS, null, null, carried);
+  assert.equal(first.name, 'b', 'the request should still have been moved by the reset');
+  am.accounts[2].quota.unified7d = 0.99;
+  const retry = am.getActiveAccount(new Set([first.index]), OPUS, null, null, carried);
+  assert.equal(retry.name, 'a', 'the retry should have fallen back onto the rolled account');
+  am.accounts[2].quota.unified7d = 0.4;
+
+  assert.notEqual(serve(am, null, OPUS).name, 'a',
+    'a repaint spent the mark, so the request that moved was owed nothing');
+});
+
+test('leaving because an account is unavailable still asks what it was owed', () => {
+  // The availability gate sat BEFORE the rollover question, so a sticky account
+  // that rolled while temporarily spent was left without a discharge. Why a
+  // request leaves does not change what the account is owed.
+  const am = mgr(['a', 'b', 'c'], ON);
+  bucket(am, 0, 'unified7d', 0.4, 10);
+  bucket(am, 1, 'unified7d', 0.4, 20);
+  bucket(am, 2, 'unified7d', 0.4, 30);
+  assert.equal(am.setCurrentAccount(0), true);
+  assert.equal(serve(am, null, OPUS).name, 'a', 'the fixture must start on a');
+
+  // a rolls AND goes over its 5h gate in the same instant, so the walk skips it
+  // on availability before it ever asks about the roll.
+  rollWindow(am, 0);
+  am.accounts[0].quota.unified5h = 0.99;
+
+  const carried = {};
+  const first = am.getActiveAccount(null, OPUS, null, null, carried);
+  assert.notEqual(first.name, 'a', 'the unavailable account should have been left');
+
+  // a becomes usable again and the retry falls back onto it.
+  am.accounts[0].quota.unified5h = 0.1;
+  am.accounts[2].quota.unified7d = 0.99;
+  const retry = am.getActiveAccount(new Set([first.index]), OPUS, null, null, carried);
+  assert.equal(retry.name, 'a', 'the retry should have fallen back onto the rolled account');
+  am.accounts[2].quota.unified7d = 0.4;
+
+  assert.notEqual(serve(am, null, OPUS).name, 'a',
+    'leaving on availability discharged nothing, so the roll was spent');
+});
+
+test('the session-reset switch routes by the request\'s own window', () => {
+  // `model` has to be consulted at every one of the switch's decision points —
+  // availability, ranking and band membership — or a Fable request is handed an
+  // account the Fable picker excludes. Threading a parameter is not using it.
+  const am = mgr(['cur', 'reset'], ON);
+  const now = Date.now();
+  // cur is fine for Fable. The account whose 5h just reset is NOT: its Fable
+  // weekly is spent, though its shared weekly looks the better buy.
+  bucket(am, 0, 'unified7dFable', 0.10, 50, now);
+  bucket(am, 0, 'unified7d', 0.50, 50, now);
+  bucket(am, 1, 'unified7dFable', 0.99, 40, now);
+  bucket(am, 1, 'unified7d', 0.10, 40, now);
+  assert.equal(am.setCurrentAccount(0), true);
+  am.accounts[1].quota.unified5h = 0.5;
+  am.accounts[1].quota.unified5hReset = now - 1000;
+
+  // A Fable request drives the refresh, so the switch is asked about Fable.
+  am.refreshExpiredQuotas(FABLE, {}, true);
+  assert.equal(am.accounts[am.currentIndex].name, 'cur',
+    'the switch installed an account the Fable picker excludes');
+});
+
+test('an all-clockless fleet still ranks by the discovery bias, not by load', () => {
+  // The band returns passthrough when nothing has a measured pressure, and
+  // reading that as "nothing to hold off" would zero the whole term, letting the
+  // 95%-spent account win on session count by the one route that empties the
+  // band rather than filling it.
+  const am = mgr(['spent-clockless', 'ample-clockless'], ON, { distributeSessions: true });
+  for (const i of [0, 1]) {
+    am.accounts[i].quota.unified7d = 0.10;
+    am.accounts[i].quota.unified7dReset = null;   // no clock anywhere in the fleet
+    am.accounts[i].quota.unified5h = 0.1;
+    am.accounts[i].probing = false;
+  }
+  am.accounts[0].quota.unified7dFable = 0.95;
+  am.accounts[1].quota.unified7dFable = 0.05;
+
+  am.beginSession('s1');
+  am.recordSession('s1', 1, FABLE);
+  assert.equal(am._pickLeastLoaded(null, FABLE).name, 'ample-clockless',
+    'a measured 95%-spent account won on session count with no clock in the fleet');
+  am.endSession('s1');
+});
+
 // ---------------------------------------------------------------------------
 // Every site that MOVES a request off an account answers for what it was owed
 // ---------------------------------------------------------------------------
