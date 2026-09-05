@@ -30,7 +30,7 @@ import {
 import { resolveAccounts } from './resolve-accounts.js';
 import { loginCodex } from './codex-auth.js';
 import { syncAccountsFromDisk } from './sync-accounts.js';
-import { mergeAccountsForSave, syncRefreshedTokens } from './account-pairing.js';
+import { mergeAccountsForSave, syncRefreshedTokens, removedAccountIds, clearRemovedAccountIds } from './account-pairing.js';
 import { ensureAccountIds } from './account-id.js';
 import * as alias from './alias.js';
 import { ensureCerts } from './mitm.js';
@@ -415,7 +415,13 @@ async function serverCommand() {
     tui = new TUI({
       accountManager, config, sx, activityLogPath, sessionTitles,
       saveConfig: () => atomicConfigUpdate(async diskConfig => {
-        diskConfig.accounts = mergeAccountsForSave(config.accounts, accountManager.accounts, diskConfig.accounts);
+        diskConfig.accounts = mergeAccountsForSave(
+          config.accounts, accountManager.accounts, diskConfig.accounts, removedAccountIds(config),
+        );
+        // The written list omits them, so they are gone from disk too and there
+        // is nothing left to re-adopt. Holding the ids any longer would only
+        // refuse an account the operator re-adds later.
+        clearRemovedAccountIds(config);
         // Persist sx.org settings (set/cleared from the TUI settings screen).
         if (config.sx) diskConfig.sx = config.sx; else delete diskConfig.sx;
         // Persist other runtime-tunable settings edited from the TUI.
@@ -2069,9 +2075,25 @@ async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
 // ── config sync helpers ─────────────────────────────────────
 
 /**
- * Find a config account entry matching an in-memory account by account+org identity.
+ * Find the config entry a running account came from.
+ *
+ * By entry id first. Identity is the fallback, and it is not one-to-one:
+ * sameIdentity compares organization only when BOTH records carry one and falls
+ * back to the name otherwise, so for one person holding accounts in two
+ * organizations — the case the identity module exists for — both rows match and
+ * the first one wins. Resolving a token write that way records one account's
+ * refresh-token family against another account's row (#203).
+ *
+ * The id is exact and survives the refresh that rewrites the credential, which
+ * is the one field that might otherwise have separated two records of one
+ * person. loadConfig gives every entry an id, so the fallback is only for a disk
+ * row written before the field existed and not yet saved back.
  */
 function findConfigAccount(diskConfig, account) {
+  if (account?.id) {
+    const byId = diskConfig.accounts.findIndex(a => a?.id === account.id);
+    if (byId >= 0) return byId;
+  }
   return diskConfig.accounts.findIndex(a => sameIdentity(a, account));
 }
 
