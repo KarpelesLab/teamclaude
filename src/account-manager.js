@@ -1424,38 +1424,36 @@ export class AccountManager {
   }
 
   /**
-   * THE ONE WRITE AN AIM MAY MAKE, and the rule is that it must discard nothing.
-   *
-   * Establishing over an observation is what loses a roll, which is why the
-   * ordinary case waits for a rest. But there are two states in which there is
-   * nothing to lose, and refusing in either costs a rollover for no reason:
-   *
-   *   NO READING AT ALL. A choice that has never named an account has no roll to
-   *   forget. Refusing here first-sights a choice's opening window one request
-   *   LATE — the request that places a session, or moves the cursor, names the
-   *   account, and only the NEXT one arrives to find it there.
-   *
-   *   A READING WITH NOTHING OUTSTANDING. The account it describes has not
-   *   rolled since it was taken, so moving the reading forfeits no event. This is
-   *   the ordinary rotation, the operator's switch, and the exhausted-fleet
-   *   probe: the traffic is going somewhere new and nothing is owed where it came
-   *   from.
-   *
-   * What is refused is the case the whole design turns on: a reading whose
-   * account HAS rolled and whose traffic has not yet come to rest anywhere else.
-   * That one is the fail-back's only protection, and an aim may not touch it.
+   * The one write an aim may make, and it must discard nothing: a choice that
+   * has never named an account has no roll to forget, and a reading whose
+   * account has not rolled forfeits no event by moving. Refused is the case the
+   * design turns on — a reading whose account HAS rolled while its traffic has
+   * not come to rest elsewhere, the fail-back's only protection. The test is
+   * whether ANY window rolled, since an aim discards the whole reading at once.
    */
-  _firstSightOn(obs, account, model) {
+  _firstSightOn(obs, account) {
     if (!obs || !account) return;
     if (obs.idx != null && obs.idx !== account.index) {
-      const leaving = this.accounts[obs.idx];
-      if (leaving && this._jumped(obs.windows, this._governingWindow(leaving, model))) return;
+      if (this._anyJumped(obs.windows, this.accounts[obs.idx])) return;
     } else if (obs.idx != null) {
       return;
     }
     obs.idx = account.index;
     obs.windows = new Map(Object.entries(this._accountWindows(account)));
   }
+
+  /** Has ANY window this reading holds rolled over on the account it was taken
+   * on? Enumerated over what the ACCOUNT presents now rather than what the
+   * reading holds: a window gained since the reading was taken has no entry to
+   * compare and is a first sight, which `_jumped` reports as no jump. */
+  _anyJumped(reading, account) {
+    if (!reading || !account) return false;
+    for (const [window, resetAt] of Object.entries(this._accountWindows(account))) {
+      if (this._jumped(reading, { window, resetAt })) return true;
+    }
+    return false;
+  }
+
 
   /** The reading for the sticky CURRENT account, taken at the top of a selection
    *  pass, before anything in that pass can move the cursor. */

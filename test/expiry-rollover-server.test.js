@@ -358,22 +358,19 @@ for (const distribute of [false, true]) {
 }
 
 // ---------------------------------------------------------------------------
-// What a request restores is only what it priced
+// What an excursion off an account may do to the reading it leaves behind
 // ---------------------------------------------------------------------------
 
 const HAIKU = 'claude-haiku-4-5';
 
-test('returning to the origin does not rewind a window a sibling settled', async () => {
-  // Two families on one account. The Opus request is pushed off a by a roll of
-  // a's SCOPED Opus window and suspends on b. While it hangs there, a's shared
-  // weekly rolls too and a Haiku request — which is governed by that shared
-  // window — settles the new reading legitimately. Then b refuses the Opus
-  // request and it falls back to a.
-  //
-  // It is owed a's scoped Opus window and nothing else. Restoring a snapshot of
-  // every window a had when it left puts the Haiku sibling's reading back to
-  // what it was before the shared window rolled, and the next Haiku request
-  // reads that as a rollover that never happened and moves off a for nothing.
+test('a fail-back onto a rolled SCOPED window still finds the roll owed', async () => {
+  // Two families on one account, and the roll is on the window only ONE of them
+  // is governed by. The Opus request is pushed off a by a roll of a's scoped Opus
+  // window and suspends on b; while it hangs there a's shared weekly rolls too
+  // and a Haiku request, governed by that shared window, is routed to a. Then b
+  // refuses and it falls back to a. Nothing in that excursion may spend a's roll:
+  // the comparison is over every window the reading holds, so which family rolled
+  // cannot decide whether the aim may discard it.
   const reached = deferred('the upstream to be reached');
   const held = deferred('the suspension to be released');
   let refused = 0;
@@ -401,6 +398,7 @@ test('returning to the origin does not rewind a window a sibling settled', async
     assert.equal(await send(null, HAIKU), 'a', 'the fixture must start Haiku on a');
     assert.equal(am._governingWindow(am.accounts[0], OPUS).window, 'scoped:opus',
       'the fixture must have the scoped window governing Opus on a');
+    const readOnA = new Map(am._currentObs.windows);
 
     // The Opus window rolls; the Opus request is pushed off a and hangs on b.
     am.accounts[0].quota.scopedWeekly.opus.resetAt += WEEK;
@@ -412,25 +410,24 @@ test('returning to the origin does not rewind a window a sibling settled', async
     // windows at all.
     am.accounts[1].quota.unified7d = 0.99;
     am.accounts[2].quota.unified7d = 0.99;
-    // a's SHARED window rolls, and a Haiku request — governed by that window and
-    // owed nothing — settles the new reading on a. A different window, a
-    // different request.
+    // a's SHARED window rolls too, and a Haiku request — governed by that window
+    // — is routed back to a while the Opus request is still suspended on b. A
+    // different window, a different request, and neither of them evidence that
+    // the traffic came to rest anywhere.
     am.accounts[0].quota.unified7dReset += WEEK;
-    assert.equal(await send(null, HAIKU), 'a', 'the sibling must have settled on a');
-    const settled = am._currentObs.windows.get('unified7d');
-    assert.equal(settled, am.accounts[0].quota.unified7dReset,
-      'the fixture must have left a\'s shared window settled at its new reset');
+    assert.equal(await send(null, HAIKU), 'a', 'the sibling must have reached a');
 
     held.resolve();
     await opus;
 
-    // NOTHING A REQUEST HOLDS IS WRITTEN BACK, so a return to the origin cannot
-    // rewind a window another request settled — there is nothing to write back
-    // with. This held by construction rather than by a rule, and it is checked
-    // anyway because "true by construction" is what three of this feature's
-    // shipped sentences claimed while a probe said otherwise.
-    assert.equal(am._currentObs.windows.get('unified7d'), settled,
-      'the return to the origin rewound a window a sibling had settled');
+    // THE ROLL IS STILL OWED: the reading is the one taken on a before either
+    // window moved, so the next Opus request moves off a rather than settling
+    // onto the week it just gained.
+    assert.equal(am._currentObs.idx, 0, 'the reading no longer describes a');
+    assert.deepEqual(am._currentObs.windows, readOnA,
+      'the excursion rewrote the reading taken on a');
+    assert.equal(am._currentRolledOver(am.accounts[0], OPUS), true,
+      'the aim at b spent the scoped Opus rollover');
   } finally {
     held.resolve();
     await close();

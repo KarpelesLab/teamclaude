@@ -917,6 +917,45 @@ test('a retry that bounces back to the rolled current account leaves it owed', (
     'the bounce first-sighted the rolled reset');
 });
 
+test('a fail-back onto a FAMILY roll leaves the rollover owed', () => {
+  // Every fail-back arm above rolls `unified7d`. An aim consulting only that
+  // window would find the shared weekly still and replace the whole reading, so
+  // the fail-back would first-sight the week a family bucket had just gained.
+  // Which window rolled is not a fact about whether an aim may discard the
+  // reading.
+  const am = pinnedFleet(ON);
+  bucket(am, 0, 'unified7dFable', 0.4, 10);
+  bucket(am, 1, 'unified7dFable', 0.4, 10);
+  const first = serve(am, 's1', FABLE);
+  const other = 1 - first.index;
+  rollWindow(am, first.index, 'unified7dFable');
+
+  const { first: moved, retry } = serveFailingOver(am, 's1', FABLE, other);
+  assert.equal(moved.index, other, 'the family rollover did not preempt');
+  assert.equal(retry.index, first.index, 'the retry did not fall back onto the rolled account');
+
+  assert.equal(serve(am, 's1', FABLE).index, other,
+    'the aim spent the family rollover the shared window said nothing about');
+});
+
+test('the same family fail-back on the current account', () => {
+  // The path that is live by default, and the one the aim at _setCurrent takes.
+  const am = mgr(['a', 'b'], ON);
+  for (const i of [0, 1]) {
+    bucket(am, i, 'unified7d', 0.4, 10);
+    bucket(am, i, 'unified7dFable', 0.4, 10);
+  }
+  assert.equal(serve(am, null, FABLE).name, 'a');
+  rollWindow(am, 0, 'unified7dFable');
+
+  const { first, retry } = serveFailingOver(am, null, FABLE, 1);
+  assert.equal(first.name, 'b', 'the family rollover did not preempt');
+  assert.equal(retry.name, 'a', 'the retry did not bounce back onto the rolled account');
+
+  assert.equal(serve(am, null, FABLE).name, 'b',
+    'the aim spent the family rollover the shared window said nothing about');
+});
+
 test('a destination is measured from the first request that rests on it', () => {
   // A preemption aims at b and takes no reading there, so a roll on b before any
   // request has rested there is a first sight — the same as for an account a
