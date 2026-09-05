@@ -58,10 +58,34 @@ export function configIndexFor(configAccounts, managerAccounts, mgrIdx) {
  * its own and read another's credential a restart later. Pairing by id does not
  * reach this axis.
  */
+/**
+ * Whether this entry's OAuth token belongs in `config.json` at all.
+ *
+ * The save used to write `accessToken: am.credential` onto EVERY entry, which
+ * is right for an ordinary oauth account and wrong for the other two kinds:
+ *
+ *   - an API-KEY account's credential is its `apiKey`, so the save mirrored the
+ *     same secret into `accessToken` — and makeAccount reads
+ *     `acct.accessToken || acct.apiKey`, preferring the mirror. Rotating the key
+ *     in config.json was then ignored on the next cold start, while a running
+ *     server picked it up, so the failure looked like the provider rejecting a
+ *     key that reads correctly in the file (#202).
+ *   - an `importFrom` account delegates to a credentials file on purpose. One
+ *     save materialised the token into config.json, and from then on the copy
+ *     won over re-reading the file, so the entry stopped delegating in practice
+ *     (#204).
+ *
+ * Refreshed tokens for ordinary oauth entries still persist — that is the case
+ * this write exists for.
+ */
+function ownsInlineToken(entry) {
+  return entry?.type === 'oauth' && !entry.importFrom;
+}
+
 export function mergeAccountsForSave(configAccounts, managerAccounts, diskAccounts) {
   return configAccounts.map(a => {
     const am = managerAccountFor(managerAccounts, a);
-    const live = am ? {
+    const live = am && ownsInlineToken(a) ? {
       ...a,
       accessToken: am.credential,
       refreshToken: am.refreshToken,
