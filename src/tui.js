@@ -1329,7 +1329,6 @@ export class TUI {
         : '  No accounts configured. Press [g] → Add account.'));
     } else {
       lines.push('');
-      const showBoth = W >= 70;
 
       // Routes drive the inline markers; general (non-family) routes get a stable
       // column each at the row start so the marker's position identifies the route.
@@ -1365,9 +1364,22 @@ export class TUI {
       // fit even at BAR_MIN they would push the row past the edge, and a row cut
       // mid-bar reads worse than one that simply doesn't draw them (the `⊘` tag
       // still says which family is barred).
+      // The second shared bar answers to roomFor too, not just to a width
+      // threshold. `W >= 70` alone let the reservations (a 16-column blocked-family
+      // tag on two families, plus route cells) leave less than BAR_MIN per bar,
+      // and the floor below then overrode the budget: two accounts blocked on both
+      // families drew 72 columns at W=70, which fitLine silently cut (#234).
+      const showBoth = W >= 70 && roomFor(2);
       const showFamily = showBoth && (anyFable || anySonnet) && roomFor(2 + (anyFable ? 1 : 0) + (anySonnet ? 1 : 0));
       const nbars = (showBoth ? 2 : 1) + (showFamily ? (anyFable ? 1 : 0) + (anySonnet ? 1 : 0) : 0);
-      const bw = Math.max(BAR_MIN, Math.min(BAR_MAX, Math.floor((W - fixed - 6 * (nbars - 1)) / nbars)));
+      // Backstop for the case no count of bars can fix: when even one bar at
+      // BAR_MIN overruns the row, the floor has to yield. A narrow bar reads
+      // worse than a wide one; a row cut mid-bar loses the reset countdown its
+      // tail carries, and does it without saying so.
+      const avail = Math.floor((W - fixed - 6 * (nbars - 1)) / nbars);
+      const bw = avail < BAR_MIN
+        ? Math.max(1, avail)
+        : Math.min(BAR_MAX, avail);
 
       // Whatever the chrome and the capped bars leave over goes to the name
       // column, up to the longest name in the fleet, so a wide terminal shows

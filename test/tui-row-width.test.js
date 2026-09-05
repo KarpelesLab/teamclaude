@@ -17,9 +17,9 @@ function oauth(name) {
 
 /** Render the dashboard at `width` and return the account rows, ANSI stripped,
  * exactly as _renderAcct produced them (before fitLine pads or truncates). */
-function renderRows(width, { fable = [], sonnet = [], accounts = 6 } = {}) {
+function renderRows(width, { fable = [], sonnet = [], accounts = 6, routes = [] } = {}) {
   const names = Array.from({ length: accounts }, (_, i) => `acct${i}@example.com`);
-  const am = new AccountManager(names.map(oauth), 0.98);
+  const am = new AccountManager(names.map(oauth), 0.98, routes.length ? { routes } : {});
   const h = 3600_000;
   am.accounts.forEach((a, i) => {
     a.quota.unified5h = 0.4;
@@ -37,7 +37,7 @@ function renderRows(width, { fable = [], sonnet = [], accounts = 6 } = {}) {
   });
 
   const tui = new TUI({
-    accountManager: am, config: { proxy: { port: 1 }, accounts: [], routes: [] }, sx: null,
+    accountManager: am, config: { proxy: { port: 1 }, accounts: [], routes }, sx: null,
     saveConfig: async () => {}, syncAccounts: async () => 0, onQuit: () => {}, probeQuota: () => {},
   });
 
@@ -122,4 +122,47 @@ test('blockedFamilies reports the families barred by their own weekly bucket', (
   assert.deepEqual(blockedFamilies({ unified7dFable: 0.99, unified7dSonnet: 1 }, 0.98), ['Sonnet', 'Fable']);
   assert.deepEqual(blockedFamilies({ unified7dFable: 0.5 }, 0.98), []);
   assert.deepEqual(blockedFamilies({}, 0.98), []);
+});
+
+// The `⊘ Sonnet Fable` tag is 16 columns, and until #234 nothing checked that
+// what the reservations left could still afford BAR_MIN per bar: `showBoth` was
+// a bare `W >= 70`, and the bar-width floor then overrode the budget. The
+// fixtures above never produce this because every family bucket in them is far
+// below the threshold — they only ever draw the 9-column `⊘ Fable`.
+const SPENT = 0.99;   // over the 0.98 switch threshold, so the family is barred
+
+test('a row blocked on BOTH families does not overflow', () => {
+  // #234's first repro: two accounts, no routes, W=70 drew 72 columns.
+  for (const w of [70, 72, 73, 76, 80, 100]) {
+    const rows = renderRows(w, {
+      accounts: 2,
+      fable: [SPENT, SPENT],
+      sonnet: [SPENT, SPENT],
+    });
+    assert.ok(widest(rows) <= w, `W=${w}: widest row is ${widest(rows)} columns`);
+  }
+});
+
+test('a blocked row with general routes does not overflow', () => {
+  // #234's second repro: two accounts, three shared routes, W=73 drew 76.
+  const routes = [
+    { match: ['claude-opus-*'], accounts: ['acct0@example.com'] },
+    { match: ['claude-haiku-*'], accounts: ['acct1@example.com'] },
+    { match: ['claude-3-*'], accounts: ['acct0@example.com'] },
+  ];
+  for (const w of [70, 73, 76, 80, 90, 120]) {
+    const rows = renderRows(w, {
+      accounts: 2, routes,
+      fable: [SPENT, SPENT],
+      sonnet: [SPENT, SPENT],
+    });
+    assert.ok(widest(rows) <= w, `W=${w}: widest row is ${widest(rows)} columns`);
+  }
+});
+
+// The blocked tag is the point of the row at that moment, so dropping a bar to
+// make room must not drop the tag with it.
+test('the blocked tag survives the narrowing', () => {
+  const rows = renderRows(70, { accounts: 2, fable: [SPENT, SPENT], sonnet: [SPENT, SPENT] });
+  assert.ok(rows.some(r => r.includes('⊘')), 'the blocked tag was dropped to fit');
 });
