@@ -36,7 +36,10 @@ test('the reason survives into getStatus rather than reading as available', () =
 test('status prints a line for it, which is the whole point of the reason', () => {
   const am = denied();
   const status = am.getStatus();
-  const line = unavailableLine(status.accounts[0], { red: s => s, dim: s => s });
+  // A pass-through paint: renderStatus's real one exposes a colour per role, and
+  // a stub missing one fails as a TypeError rather than an assertion.
+  const paint = new Proxy({}, { get: () => (v => String(v)) });
+  const line = unavailableLine(status.accounts[0], paint);
   assert.ok(line, 'a refusal with a reason must render a line');
   assert.match(line, /organization/i);
 
