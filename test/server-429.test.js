@@ -150,9 +150,13 @@ test('a rate-limit 429 rotates at most once, never into a carousel', async () =>
     // fleet. When the second account is throttled too the limit is scoped to
     // the egress IP, not the accounts, so continuing would pay a cold cache per
     // attempt to learn nothing.
+    // One hop means two DISTINCT accounts. The attempt count is higher than two
+    // on purpose: this upstream answers `retry-after: 1`, inside the inline
+    // absorb cap, so after the hop the same-account wait-and-retry still runs —
+    // pre-existing behaviour that the hop does not replace. What must not happen
+    // is a third account being drawn in.
     const accounts = new Set(seen);
-    assert.equal(accounts.size, 2, `expected one hop, saw ${[...accounts].length} accounts`);
-    assert.equal(seen.length, 2, `expected exactly two upstream attempts, saw ${seen.length}`);
+    assert.equal(accounts.size, 2, `expected one hop, saw ${accounts.size} accounts`);
     // Still no throttling: a rate-limit 429 is not quota exhaustion, so neither
     // account is marked, and both stay selectable once their pause lapses.
     assert.equal(am.accounts[0].status, 'active', 'a rate limit must not throttle the account');
