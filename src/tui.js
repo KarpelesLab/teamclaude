@@ -397,16 +397,32 @@ export class TUI {
 
   // ── lifecycle ──────────────────────────────────────
 
+  /**
+   * Open the activity log, if one is configured.
+   *
+   * Split out of start() so it can be exercised without entering the alt screen
+   * or putting stdin in raw mode — neither of which a test process can do.
+   *
+   * 0600 like every sibling (config, state, request log and its directory): the
+   * activity log names which client made each call, so on a shared host it is
+   * the record that says who was working on what and when (#259). Mode applies
+   * on creation only, so a file the operator already placed keeps the
+   * permissions they chose rather than being chmod'ed underneath them.
+   */
+  _openActivityLog() {
+    if (!this.activityLogPath) return null;
+    this._activityStream = createWriteStream(this.activityLogPath, { flags: 'a', mode: 0o600 });
+    this._activityStream.on('error', err => {
+      // Swallow write errors — can't log them to the TUI without recursion
+      this._activityStream = null;
+      process.stderr.write(`[TeamClaude] activity log error: ${err.message}\n`);
+    });
+    return this._activityStream;
+  }
+
   start() {
     this.running = true;
-    if (this.activityLogPath) {
-      this._activityStream = createWriteStream(this.activityLogPath, { flags: 'a' });
-      this._activityStream.on('error', err => {
-        // Swallow write errors — can't log them to the TUI without recursion
-        this._activityStream = null;
-        process.stderr.write(`[TeamClaude] activity log error: ${err.message}\n`);
-      });
-    }
+    this._openActivityLog();
     process.stdout.write(`${ESC}?1049h${ESC}?25l`);
     process.stdin.setRawMode(true);
     process.stdin.resume();

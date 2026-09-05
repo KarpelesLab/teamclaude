@@ -450,7 +450,8 @@ async function serverCommand() {
 
   // In headless mode, wire activity-log writes directly via hooks + console.
   if (!tui && activityLogPath) {
-    const aStream = createWriteStream(activityLogPath, { flags: 'a' });
+    // 0600, matching the request log and the config (see tui.js for why).
+    const aStream = createWriteStream(activityLogPath, { flags: 'a', mode: 0o600 });
     aStream.on('error', err => process.stderr.write(`[TeamClaude] activity log error: ${err.message}\n`));
     const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
     const writeActivity = msg => {
