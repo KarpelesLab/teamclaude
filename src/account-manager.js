@@ -446,6 +446,14 @@ export class AccountManager {
    * window (storm control) so they trickle out rather than flood. Extends an
    * existing pause rather than shortening it.
    */
+  /** True while an account is inside a rate-limit pause (see pauseAccount). The
+   * pause deliberately does NOT mark the account throttled, so selection still
+   * offers it — a caller choosing a failover target has to ask. */
+  isPaused(index, now = Date.now()) {
+    const account = this.accounts[index];
+    return !!(account?.pausedUntil && now < account.pausedUntil);
+  }
+
   pauseAccount(index, seconds) {
     const account = this.accounts[index];
     if (!account) return;

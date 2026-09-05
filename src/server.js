@@ -1647,6 +1647,48 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // selection keeps choosing it.
       accountManager.pauseAccount(account.index, Math.min(retryAfter, RATE_LIMIT_ABSORB_MAX_SECONDS));
 
+      // ONE bounded failover hop to an idle sibling (#137, #165, #156).
+      //
+      // #84's argument against rotating on a rate-limit 429 is that moving a
+      // shared burst to the next account just throttles that one too and throws
+      // away this account's KV cache. That holds under load. It does not hold
+      // when a sibling is sitting idle, which is the case every reporter hit: a
+      // three-account fleet stalling for 60s at a time on one throttled account
+      // while another was at 9% weekly.
+      //
+      // So the hop is deliberately not a rotation policy: at most once per
+      // request, never onto an account already tried, and never onto one inside
+      // its own 429 pause — pauseAccount does not mark an account throttled, so
+      // selection would otherwise happily hand back an account that is itself
+      // waiting out a 429.
+      //
+      // The budget is one hop for a specific reason. If the SECOND account is
+      // rate-limited too, the limit is almost certainly scoped to the egress IP
+      // rather than to either account: every account leaves from the same
+      // address, which is the premise the sx.org path below is built on. Hopping
+      // further would prove nothing and pay a cold cache each time. After the
+      // hop ctx.rateLimitHopped is set, this branch does not run again for this
+      // request, and the sx fresh-IP retry and the inline wait take over —
+      // which is the right response to an IP-scoped limit.
+      if (!ctx.rateLimitHopped && retryCount < maxRetries) {
+        const alt = accountManager.getActiveAccount(
+          new Set([...ctx.tried, account.index]), ctx.model, ctx.advisorModel, ctx.sessionId, ctx.provider,
+        );
+        if (alt && !accountManager.isPaused(alt.index)) {
+          ctx.rateLimitHopped = true;
+          ctx.tried.add(account.index);
+          console.log(`[TeamClaude] Rate-limit 429 on "${account.name}" — failing over once to idle account "${alt.name}"`);
+          if (clientGone(res)) return;
+          return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+        }
+      } else if (ctx.rateLimitHopped) {
+        // Second 429 this request, on a different account. Say so once: the
+        // operator chasing "why is my fleet throttled" is looking for exactly
+        // this, and it points at the egress IP rather than at the accounts.
+        console.log('[TeamClaude] Second account rate-limited too — the limit looks IP-scoped, not per-account'
+          + (sx?.useOn429() ? '' : ' (sx.org mode "429" would retry from a fresh egress IP)'));
+      }
+
       // sx fresh-IP retry (still the same account) takes precedence over waiting.
       // Bounded by retryCount like the inline-wait path below, so a persistently
       // 429ing upstream can't loop forever through sx.
@@ -1690,6 +1732,31 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // retry's status check rotates to another account. Bounded to one re-auth
     // per account per request, so a genuinely dead credential surfaces the 401
     // instead of looping.
+    // Upstream 5xx — 529 "Overloaded" above all (#156). This is the provider
+    // saying it cannot serve right now, not anything about this account'"'"'s quota,
+    // so surfacing it to the client turns a provider-side transient into a
+    // client-visible failure — and Claude Code'"'"'s own retry loop then re-piles the
+    // same load onto the same account.
+    //
+    // One hop, on the same budget and for the same reason as the 429 path above:
+    // if a second account is overloaded too, it is the provider that is
+    // overloaded, not the account, and walking the fleet would just spend every
+    // account'"'"'s cache discovering that. After the hop the response goes to the
+    // client as it does today, with its own retry-after intact.
+    if (upstreamRes.status >= 500 && !res.headersSent && !ctx.serverErrorHopped && retryCount < maxRetries) {
+      const alt = accountManager.getActiveAccount(
+        new Set([...ctx.tried, account.index]), ctx.model, ctx.advisorModel, ctx.sessionId, ctx.provider,
+      );
+      if (alt && !accountManager.isPaused(alt.index)) {
+        await upstreamRes.body?.cancel();
+        ctx.serverErrorHopped = true;
+        ctx.tried.add(account.index);
+        console.log(`[TeamClaude] Upstream ${upstreamRes.status} on "${account.name}" — failing over once to "${alt.name}"`);
+        if (clientGone(res)) return;
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+      }
+    }
+
     // A 403 ("Request not allowed") is upstream refusing THIS account outright —
     // not a stale token a refresh could fix, and not anything the client sent.
     // The client never sees the credential we inject, so it cannot act on the
