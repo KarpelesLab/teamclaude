@@ -1444,6 +1444,18 @@ export class AccountManager {
    * account's (and it still has weekly quota), so we spend the quota closest to
    * refreshing first.
    */
+  /**
+   * Clear windows whose reset has passed, WITHOUT the session-reset switch.
+   *
+   * For read paths. refreshExpiredQuotas() also runs _switchOnSessionReset,
+   * which moves currentIndex — so calling that from getStatus would let a GET
+   * on /teamclaude/status rotate the fleet as a side effect of being read, and
+   * a polling dashboard would quietly drive routing.
+   */
+  sweepExpiredQuotas() {
+    for (const account of this.accounts) this._clearExpiredQuotas(account);
+  }
+
   refreshExpiredQuotas() {
     let changed = false;
     const sessionReset = [];
@@ -2173,6 +2185,12 @@ export class AccountManager {
   // client and dimension value to anyone who can read status, and on a shared
   // proxy that is every key holder.
   getStatus({ sessionDetail = false } = {}) {
+    // Sweep first: nothing else on the read path does, so an idle server kept
+    // reporting a window whose reset had already passed — at its old percentage,
+    // with a timestamp in the past — to `status --json`, anything scripted
+    // against the endpoint, and the attached TUI, whose own refresh is a no-op
+    // precisely because it trusts the server to have done this (#237).
+    this.sweepExpiredQuotas();
     const sessions = this.sessionTracker.stats(undefined, { detail: sessionDetail });
     return {
       currentAccount: this.accounts[this.currentIndex]?.name,
