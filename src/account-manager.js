@@ -942,7 +942,13 @@ export class AccountManager {
 
     // A structured organization-policy 403 means this account cannot serve OAuth
     // requests right now. Skip it across requests until the short cooldown ends.
-    if (this._entitlementDenied(account)) return false;
+    //
+    // A reason string, not `false`: this function's contract is "a reason, or
+    // null when it can serve", and getStatus surfaces the value verbatim. `false`
+    // read as available against that contract and, being falsy, made
+    // unavailableLine drop the row — so the one state added to make a refusal
+    // explainable was the only one that printed no explanation (#258).
+    if (this._entitlementDenied(account)) return 'entitlement';
 
     // Check rate limit expiry
     if (account.status === 'throttled' && account.rateLimitedUntil) {

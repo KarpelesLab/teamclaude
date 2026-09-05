@@ -104,6 +104,7 @@ export const UNAVAILABLE_TEXT = {
   quota: 'local switch threshold reached',
   capped: 'account usage cap reached (maxUsage)',
   'advisor-capped': "advisor model's usage cap reached (maxUsage)",
+  entitlement: 'upstream refused this account for the organization (cooldown)',
   route: 'no route allows this account',
   'advisor-quota': "advisor model's weekly bucket spent",
   'advisor-route': 'no route allows the advisor model',
