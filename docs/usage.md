@@ -48,7 +48,7 @@ Headless, you can re-sync accounts from the config without a restart by POSTing 
 curl -X POST http://localhost:3456/teamclaude/reload
 ```
 
-You usually don't need to call it directly. `login`, `import`, `enable`, `disable`, `priority`, `route`, `probe` and `warmup` notify a running server themselves.
+You usually don't need to call it directly. `login`, `import`, `enable`, `disable`, `priority`, `route`, `threshold`, `distribute`, `probe` and `warmup` notify a running server themselves.
 
 Control-plane **writes** (`reload`, `switch`) are refused when the request carries a browser `Origin` or a cross-site `Sec-Fetch-Site`. Loopback is exempt from the proxy API key so the CLI needs no configuration, but that exemption also covers any web page you happen to visit: a page can POST to `127.0.0.1` cross-origin without a preflight, and while it cannot read the reply, the write would still land. `curl` and the CLI send neither header and are unaffected. Reads (`status`) are not restricted — the same-origin policy already stops a page from seeing the response.
 
@@ -150,6 +150,8 @@ teamclaude disable <name>    # Temporarily exclude an account from rotation
 teamclaude enable <name>     # Re-enable it (also clears a stuck error state)
 teamclaude priority <name> 1 # Set rotation priority (lower = preferred)
 teamclaude route list        # Manage per-model routes (add/rm)
+teamclaude threshold 90      # Utilization at which rotation leaves an account
+teamclaude distribute on     # Spread new sessions across equal-priority accounts
 teamclaude probe 300         # Enable background quota refresh (off by default)
 teamclaude warmup 600        # Enable keep-warm (off by default, spends quota)
 teamclaude api <path>        # Call an API endpoint with account credentials

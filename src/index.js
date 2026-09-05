@@ -6,7 +6,7 @@ import { createWriteStream } from 'node:fs';
 import net from 'node:net';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, loadState, saveState } from './config.js';
 import { installCrashHandlers } from './crash-log.js';
-import { AccountManager } from './account-manager.js';
+import { AccountManager, DEFAULT_SWITCH_THRESHOLD } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, loginOAuthWithPastedCode, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import {
@@ -31,7 +31,7 @@ import { SessionTitles } from './session-titles.js';
 import { RemoteControl, createAttachSession } from './tui-remote.js';
 import { SxManager } from './sx.js';
 import { autoUpdate, checkForUpdate, currentVersion, runUpdate, installKind, PKG_NAME } from './updater.js';
-import { renderStatus } from './status-renderer.js';
+import { renderStatus, formatPercent } from './status-renderer.js';
 import { sanitizeText } from './safe-text.js';
 import { ClientUsageTracker } from './client-usage.js';
 import { buildClaudeEnvLines, encodePinComponent } from './claude-env.js';
@@ -55,6 +55,24 @@ const ROUTE_USAGE = [
 ].join('\n');
 
 const ROUTE_COLORS = ['red', 'green', 'yellow', 'blue', 'magenta', 'cyan'];
+
+const THRESHOLD_USAGE = [
+  'Usage: teamclaude threshold                 (show the current thresholds)',
+  '       teamclaude threshold <1-100>         (one number for every bucket)',
+  '       teamclaude threshold <bucket>=<1-100> [...]',
+  '       teamclaude threshold <bucket>=default (drop that bucket)',
+  '',
+  'The utilization at which rotation stops sending work to an account. Tenths of',
+  'a percent are kept, as on the TUI settings screen. Changes apply to a running',
+  'server immediately.',
+].join('\n');
+
+// The buckets a threshold can be keyed by: the quota windows the manager asks
+// thresholdFor() about. An unknown key would be accepted by the config and then
+// never consulted, so the CLI refuses it rather than storing a typo.
+const QUOTA_BUCKETS = ['unified5h', 'unified7d', 'unified7dSonnet', 'unified7dFable', 'tokens', 'requests'];
+
+const DISTRIBUTE_USAGE = 'Usage: teamclaude distribute <on|off>';
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -128,6 +146,14 @@ switch (command) {
     break;
   case 'warmup':
     await warmupCommand();
+    process.exit(0);
+    break;
+  case 'threshold':
+    await thresholdCommand();
+    process.exit(0);
+    break;
+  case 'distribute':
+    await distributeCommand();
     process.exit(0);
     break;
   case 'route':
@@ -321,6 +347,14 @@ async function serverCommand() {
     // way routes, sx, probe and warmup are picked up below.
     config.distributeSessions = !!diskConfig.distributeSessions;
     accountManager.setDistributeSessions(config.distributeSessions);
+    // Pick up a switchThreshold change the same way (teamclaude threshold, the
+    // TUI settings screen, or a hand edit). thresholdFor() reads it off the
+    // manager on every decision, so assigning it is the whole application —
+    // and without this a change from outside the TUI waited for a restart.
+    if (diskConfig.switchThreshold != null) {
+      config.switchThreshold = diskConfig.switchThreshold;
+      accountManager.switchThreshold = diskConfig.switchThreshold;
+    }
     config.sessionTitles = diskConfig.sessionTitles;
     sessionTitles.configure(config.sessionTitles);
     // Apply an sx.org key/mode change made on disk (e.g. via POST /teamclaude/reload).
@@ -1318,6 +1352,145 @@ async function warmupCommand() {
   await notifyRunningServer(config);
 }
 
+// ── threshold ───────────────────────────────────────────────
+
+/** The stored form of a percentage: a 0–1 ratio quantised to tenths of a
+ *  percent, so a value set here reads back identically on the settings screen
+ *  (tui.js quantises the same way). Returns null when the input is not a
+ *  percentage this setting accepts. */
+function thresholdRatio(text) {
+  const pct = Number(text);
+  if (!Number.isFinite(pct) || pct < 1 || pct > 100) return null;
+  return Math.round(pct * 10) / 1000;
+}
+
+/** The threshold table as `{ default, ...buckets }`, whatever shape it is
+ *  stored in — a bare number is the default with no bucket overrides. */
+function thresholdTable(value) {
+  if (value && typeof value === 'object') {
+    return { default: DEFAULT_SWITCH_THRESHOLD, ...value };
+  }
+  return { default: typeof value === 'number' ? value : DEFAULT_SWITCH_THRESHOLD };
+}
+
+function printThresholds(value) {
+  const table = thresholdTable(value);
+  console.log(`Switch threshold: ${formatPercent(table.default)}`);
+  for (const [bucket, ratio] of Object.entries(table)) {
+    if (bucket !== 'default' && typeof ratio === 'number') {
+      console.log(`  ${bucket}: ${formatPercent(ratio)}`);
+    }
+  }
+}
+
+async function thresholdCommand() {
+  const config = await loadOrCreateConfig();
+  const rest = args.slice(1);
+
+  if (!rest.length) {
+    printThresholds(config.switchThreshold);
+    console.log('Set with: teamclaude threshold <1-100>   e.g. teamclaude threshold 90');
+    console.log('Per bucket: teamclaude threshold unified7d=90   (=default drops it again)');
+    return;
+  }
+
+  const keyed = rest.filter(arg => arg.includes('='));
+  if (keyed.length && keyed.length !== rest.length) {
+    console.error(THRESHOLD_USAGE);
+    process.exit(1);
+  }
+
+  // One number: the plain form the setting has always had, and it replaces any
+  // per-bucket table rather than hiding one behind the number now in effect.
+  if (!keyed.length) {
+    if (rest.length > 1) {
+      console.error(THRESHOLD_USAGE);
+      process.exit(1);
+    }
+    const ratio = thresholdRatio(rest[0]);
+    if (ratio === null) {
+      console.error(THRESHOLD_USAGE);
+      process.exit(1);
+    }
+    const dropped = Object.keys(thresholdTable(config.switchThreshold)).filter(b => b !== 'default');
+    config.switchThreshold = ratio;
+    await saveConfig(config);
+    if (dropped.length) {
+      console.log(`Dropped the per-bucket thresholds (${dropped.join(', ')}) — one number governs every bucket.`);
+    }
+    console.log(`Switch threshold set to ${formatPercent(ratio)}.`);
+    await notifyRunningServer(config);
+    return;
+  }
+
+  const table = thresholdTable(config.switchThreshold);
+  for (const pair of keyed) {
+    const at = pair.indexOf('=');
+    const bucket = pair.slice(0, at);
+    const value = pair.slice(at + 1);
+    if (bucket !== 'default' && !QUOTA_BUCKETS.includes(bucket)) {
+      console.error(`Unknown quota bucket "${bucket}" — expected one of: default, ${QUOTA_BUCKETS.join(', ')}`);
+      process.exit(1);
+    }
+    if (value === 'default') {
+      if (bucket === 'default') {
+        console.error('The default threshold is the fallback — set it to a number instead of dropping it.');
+        process.exit(1);
+      }
+      delete table[bucket];
+      continue;
+    }
+    const ratio = thresholdRatio(value);
+    if (ratio === null) {
+      console.error(THRESHOLD_USAGE);
+      process.exit(1);
+    }
+    table[bucket] = ratio;
+  }
+
+  // Back to the plain form once the last override is gone: an object holding
+  // only `default` is the same setting written the long way.
+  const overrides = Object.keys(table).filter(b => b !== 'default');
+  config.switchThreshold = overrides.length ? table : table.default;
+  await saveConfig(config);
+  printThresholds(config.switchThreshold);
+  await notifyRunningServer(config);
+}
+
+// ── distribute ──────────────────────────────────────────────
+
+async function distributeCommand() {
+  const config = await loadOrCreateConfig();
+  const arg = args[1];
+  const current = !!config.distributeSessions;
+
+  if (arg === undefined) {
+    console.log(`Session distribution: ${current ? 'on' : 'off'}`);
+    console.log('Set with: teamclaude distribute <on|off>');
+    console.log('On: each session stays on its account for cache reuse, and new sessions spread');
+    console.log('across equal-priority accounts by load. Off: quota-driven rotation only.');
+    return;
+  }
+
+  const on = ['on', 'true', 'yes', '1'].includes(arg);
+  if (!on && !['off', 'false', 'no', '0'].includes(arg)) {
+    console.error(DISTRIBUTE_USAGE);
+    process.exit(1);
+  }
+
+  // An unchanged setting is not rewritten — the config file is a
+  // read-modify-write shared with the running server — but the server is still
+  // notified, so a config that already says `on` can be made to take effect.
+  if (on !== current) {
+    config.distributeSessions = on;
+    await saveConfig(config);
+  }
+  console.log(on
+    ? 'Session distribution on — new sessions spread across equal-priority accounts, each pinned to its own for cache reuse.'
+    : 'Session distribution off — sessions already running keep their accounts and drain; new ones rotate by quota.');
+  await notifyRunningServer(config);
+}
+
 // ── update ──────────────────────────────────────────────────
 
 async function updateCommand() {
@@ -1572,6 +1745,10 @@ Commands:
   priority <name> <n> Set rotation priority (lower = preferred; --first/--last)
   route [list|add|rm] Per-model routing: pin model globs to specific accounts
                       (add <name> --match "<glob>" [--accounts "<name>"] [--bucket <b>])
+  threshold [pct]     Utilization at which rotation leaves an account (1-100);
+                      per bucket with 'unified7d=90', and '=default' drops one
+  distribute [on|off] Spread new sessions across equal-priority accounts, each
+                      pinned to its own for cache reuse (off by default)
   probe [off|secs]    Opt-in background quota refresh for idle accounts
                       (off by default; reads usage endpoint, spends no quota)
   warmup [off|secs]   Opt-in: keep idle accounts' 5h timers running by sending
