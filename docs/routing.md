@@ -37,6 +37,32 @@ If every configured account returns that exact denial, TeamClaude's terminal `50
 
 An explicit [`TC_ACCT` pin](#pin-a-session-to-one-account) continues to target exactly the requested account and never fails over, even while that account is excluded from automatic rotation.
 
+## One failover hop on a rate limit
+
+A **quota rejection** (a 429 carrying `...unified-*-status: rejected`) is durable
+exhaustion and rotates, as it always has. A plain **rate-limit 429** does not
+rotate as a policy — moving a shared burst to the next account just throttles
+that one too and discards the first account's prompt cache.
+
+That reasoning holds under load. It does not hold when a sibling is sitting
+idle, which is the common shape for a small fleet of personal subscriptions: one
+account throttled, another at 9% weekly, and the whole proxy stalling for 60s at
+a time.
+
+So a rate-limit 429 takes **one** failover hop, onto an account that is not
+already tried and not inside its own 429 pause. The same single hop applies to
+an upstream **5xx** (`529 Overloaded` above all), which is the provider
+declining to serve rather than anything about the account.
+
+One hop, not a walk of the fleet, and the reason is worth knowing: **if the
+second account is rate-limited too, the limit is almost certainly scoped to the
+egress IP rather than to either account** — every account leaves from the same
+address. Continuing to rotate would prove nothing and pay a cold cache for each
+attempt. After the hop the existing behaviour takes over: the sx.org fresh-IP
+retry if `sx.mode` is `429`, otherwise the inline wait, otherwise a 429 to the
+client with its `retry-after`. An IP-scoped limit is logged as such, since that
+is what an operator chasing a fleet-wide throttle is looking for.
+
 ## Storm control
 
 When you run many agents at once and the active account runs out, every in-flight request fails over to the next account **at the same instant** — a thundering herd that can spend a big chunk of the fresh account's quota (large contexts) and instantly throttle it, cascading down the fleet ([#84](https://github.com/KarpelesLab/teamclaude/issues/84)).
