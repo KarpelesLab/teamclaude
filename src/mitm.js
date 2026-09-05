@@ -137,13 +137,40 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
     if (p) return p;
     p = (async () => {
     const { key, cert } = await ensureLeaf();
-    const srv = http2.createSecureServer({ key, cert, allowHTTP1: true });
+    // ALPN. Remote Control's real-time channel is a WebSocket, and a WebSocket
+    // over HTTP/2 needs RFC 8441 extended CONNECT, which Node does not offer
+    // here — so a client that negotiates h2 has no way to open one and the
+    // handshake is dropped with no error on either side. That is exactly the
+    // reported symptom: the session syncs one way and messages from the phone
+    // stay grey forever, while the desktop still reports bridge_state:
+    // connected (#164).
+    //
+    // `mitm.http1Only` forces http/1.1 so the Upgrade reaches 'upgrade' below.
+    // The cost is client→proxy multiplexing on a loopback hop, which is not
+    // where throughput is won; upstream is already pooled HTTP/1.1 (#106).
+    const http1Only = config.mitm?.http1Only === true;
+    const srv = http2.createSecureServer({
+      key, cert, allowHTTP1: true,
+      ...(http1Only ? { ALPNProtocols: ['http/1.1'] } : {}),
+    });
     srv.on('request', createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, forcedPin: pin || null, egress, clientUsage, forcedClient: client, dimensionUsage }));
     // Remote Control's real-time channel is a WebSocket (Upgrade handshake),
     // which never fires 'request' — only 'upgrade', with a raw socket instead
     // of a response object (h1-only; falls back to blind h2 passthrough is not
     // needed since WS clients negotiate h1 for the handshake).
     srv.on('upgrade', (req, socket, head) => relayUpgrade(req, socket, head, upstream, sx));
+    // Make the h2-WebSocket dead end audible. Without this the only evidence is
+    // a message that never arrives, which is what made #164 cost a day to
+    // isolate rather than a minute.
+    if (!http1Only) {
+      srv.on('stream', (stream, headers) => {
+        if (headers[':method'] === 'CONNECT' || headers[':protocol']) {
+          log('[TeamClaude] A client tried to open a WebSocket over HTTP/2, which this proxy cannot relay. '
+            + 'Remote Control will appear connected and silently deliver nothing. '
+            + 'Set "mitm": { "http1Only": true } in the config to force HTTP/1.1 (see #164).');
+        }
+      });
+    }
     srv.on('sessionError', (e) => log(`[TeamClaude] MITM session error: ${e.message}`));
     srv.on('clientError', (e, sock) => { try { sock.destroy(); } catch { /* already gone */ } });
     return srv;
