@@ -19,6 +19,8 @@
 //   - ACTIVE: a session counts as "active" (and toward per-account load) if it
 //     made a request this recently. Short, so load-balancing reacts to what is
 //     actually running now rather than to sessions merely lingering in the hour.
+import { remapHeld } from './rollover.js';
+
 export const SESSION_KNOWN_TTL_MS = 60 * 60 * 1000; // 1h idle → forgotten
 export const SESSION_ACTIVE_TTL_MS = 2 * 60 * 1000; // 2min idle → no longer "active"
 
@@ -71,7 +73,8 @@ function setAndReturn(map, key, value) {
 export class SessionTracker {
   constructor({ knownTtlMs, activeTtlMs, now } = {}) {
     // id -> { pins: Map<bucketKey, { idx, at }>,
-    //         refs: Map<bucketKey, { idx, windows: Map<window, reset> }>,
+    //         refs: Map<bucketKey, { idx, windows: Map<window, reset>,
+    //                                unescaped: { idx, windows } | null }>,
     //         firstSeen, lastSeen, count, inFlight, tokens: Map<bucketKey, ...> }
     this.sessions = new Map();
     this.knownTtlMs = knownTtlMs ?? SESSION_KNOWN_TTL_MS;
@@ -259,7 +262,7 @@ export class SessionTracker {
       return null;
     }
     let ref = s.refs.get(bucket);
-    if (!ref && create) s.refs.set(bucket, ref = { idx: null, windows: new Map() });
+    if (!ref && create) s.refs.set(bucket, ref = { idx: null, windows: new Map(), unescaped: null });
     return ref || null;
   }
 
@@ -275,15 +278,6 @@ export class SessionTracker {
       for (const [bucket, pin] of s.pins) out.push({ sessionId, bucket, idx: pin.idx });
     }
     return out;
-  }
-
-  // How many of this session's requests are in flight right now, the caller's
-  // own included. More than one means a sibling is still out and could yet move
-  // this session's pin, so where it currently points is an aim rather than a
-  // resting place (AccountManager._restOn). Zero for an unknown session.
-  inFlightFor(sessionId) {
-    const s = sessionId && this.sessions.get(sessionId);
-    return s ? s.inFlight : 0;
   }
 
   // Drop every session's rollover observations, leaving the pins alone. None may
@@ -325,8 +319,9 @@ export class SessionTracker {
       // left behind, it would be read against whatever inherits the slot.
       for (const [bucket, ref] of [...s.refs]) {
         const moved = ref.idx == null ? null : mapFn(ref.idx);
-        if (ref.idx != null && moved == null) s.refs.delete(bucket);
-        else ref.idx = moved;
+        if (ref.idx != null && moved == null) { s.refs.delete(bucket); continue; }
+        ref.idx = moved;
+        ref.unescaped = remapHeld(ref.unescaped, mapFn);
       }
     }
   }

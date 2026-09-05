@@ -956,6 +956,96 @@ test('the same family fail-back on the current account', () => {
     'the aim spent the family rollover the shared window said nothing about');
 });
 
+test('a retry that never left the destination does not spend the origin roll', () => {
+  // A short-wait 429 and a 401 retry the SAME account, and the server releases
+  // its in-flight slot before recursing into selection with the tried set
+  // untouched. So the retry arrives looking exactly like a fresh request finding
+  // the traffic at rest on the preemption's destination — and it is not one:
+  // nothing was served there, and this one goes on to be refused.
+  const am = mgr(['a', 'b'], ON);
+  bucket(am, 0, 'unified7d', 0.4, 10);
+  bucket(am, 1, 'unified7d', 0.4, 10);
+  assert.equal(serve(am, null, OPUS).name, 'a');
+  rollWindow(am, 0);
+
+  assert.equal(am.getActiveAccount(null, OPUS, null, null).name, 'b',
+    'the rollover did not preempt');
+  // The retry: same request, same account, an empty tried set either way.
+  assert.equal(am.getActiveAccount(null, OPUS, null, null).name, 'b',
+    'the retry did not stay on the account it was aimed at');
+  // Then that account refuses outright and the request falls back.
+  assert.equal(am.getActiveAccount(new Set([1]), OPUS, null, null).name, 'a',
+    'the refusal did not fall back onto the rolled account');
+
+  assert.equal(serve(am, null, OPUS).name, 'b',
+    'the retry was read as a completed stay and spent the roll');
+});
+
+test('a stay a second request confirms releases the roll it was pushed off', () => {
+  // The held roll is the fail-back's protection and nothing more. Once a second
+  // request has found the traffic where the last one left it, the move stuck and
+  // the origin's roll is escaped — holding it any longer would preempt off that
+  // account every time the fleet came back to it, for a rollover it has already
+  // been moved off once.
+  const am = mgr(['a', 'b'], ON);
+  bucket(am, 0, 'unified7d', 0.4, 10);
+  bucket(am, 1, 'unified7d', 0.4, 10);
+  assert.equal(serve(am, null, OPUS).name, 'a');
+  rollWindow(am, 0);
+
+  assert.equal(serve(am, null, OPUS).name, 'b', 'the rollover did not preempt');
+  // The preemption AIMED at b; the next request is the first to rest there, and
+  // the one after it is the second to find the traffic where the last one left
+  // it. That is the confirmation.
+  assert.equal(serve(am, null, OPUS).name, 'b', 'the first request did not rest on b');
+  assert.equal(serve(am, null, OPUS).name, 'b', 'the second request did not confirm the stay');
+
+  // b is out of the way, so the traffic comes back to a on its own.
+  assert.equal(serve(am, null, OPUS, { exclude: new Set([1]) }).name, 'a');
+  assert.equal(am._currentRolledOver(am.accounts[0], OPUS), false,
+    'a roll the fleet already moved off was charged a second time');
+  assert.equal(serve(am, null, OPUS).name, 'a',
+    'the return to an escaped roll preempted off it again');
+});
+
+test('removing an account renumbers a session pin\'s held roll too', () => {
+  // The pin's observation holds one the same way the cursor's does, and it is
+  // renumbered by a different function in a different module — so it gets its
+  // own arm rather than resting on the cursor's.
+  const am = mgr(['a', 'b', 'c', 'd'], ON, { distributeSessions: true });
+  for (const i of [0, 1, 2, 3]) bucket(am, i, 'unified7d', 0.4, 10 + i * 10);
+  assert.equal(serve(am, 's1', OPUS).name, 'a');
+  rollWindow(am, 0);
+  assert.equal(serve(am, 's1', OPUS).name, 'b', 'the rollover did not move the pin to b');
+  // One request rests on b, which holds a's roll without confirming the stay.
+  assert.equal(serve(am, 's1', OPUS).name, 'b');
+  assert.equal(am.sessionTracker.refsFor('s1', 'unified7d').unescaped?.idx, 0,
+    'the fixture must have held a\'s roll on the pin');
+
+  am.removeAccount(0);
+  assert.equal(am.sessionTracker.refsFor('s1', 'unified7d').unescaped, null,
+    'the pin\'s held roll outlived the account it was taken on');
+});
+
+test('removing an account renumbers a held roll rather than aiming it elsewhere', () => {
+  // The held reading names its account by index like every other, so the shift
+  // reaches it too: left behind, it would be handed back on the next fail-back to
+  // whichever account inherited the slot.
+  const am = mgr(['a', 'b', 'c'], ON);
+  for (const i of [0, 1, 2]) bucket(am, i, 'unified7d', 0.4, 10 + i * 10);
+  assert.equal(serve(am, null, OPUS).name, 'a');
+  rollWindow(am, 0);
+  // The roll preempts to b, and one arrival there holds a's roll without
+  // confirming the stay.
+  assert.equal(am.getActiveAccount(null, OPUS, null, null).name, 'b');
+  assert.equal(am.getActiveAccount(null, OPUS, null, null).name, 'b');
+  assert.equal(am._currentObs.unescaped?.idx, 0, 'the fixture must have held a\'s roll');
+
+  am.removeAccount(0);
+  assert.equal(am._currentObs.unescaped, null,
+    'the held roll outlived the account it was taken on');
+});
+
 test('a destination is measured from the first request that rests on it', () => {
   // A preemption aims at b and takes no reading there, so a roll on b before any
   // request has rested there is a first sight — the same as for an account a

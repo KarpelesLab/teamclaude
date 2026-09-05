@@ -2,7 +2,7 @@ import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired } from './oauth
 import { sameIdentity } from './identity.js';
 import { weeklyBucketForModel, modelGlobMatches, modelFamily, WEEKLY_BUCKET_KEYS } from './model.js';
 import { SessionTracker } from './session-tracker.js';
-import { ROLLOVER_MIN_JUMP_MS } from './rollover.js';
+import { ROLLOVER_MIN_JUMP_MS, remapHeld } from './rollover.js';
 import { decideBand, pressureOf, pressureRank, assertNever } from './band-decision.js';
 
 // Re-exported for callers that import these model helpers from here.
@@ -301,7 +301,7 @@ export class AccountManager {
   _setCurrent(account) {
     this.currentIndex = account.index;
     if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) return;
-    this._firstSightOn(this._currentObs ??= { idx: null, windows: new Map() }, account);
+    this._firstSightOn(this._currentObs ??= { idx: null, windows: new Map(), unescaped: null }, account);
   }
 
   /**
@@ -1155,7 +1155,7 @@ export class AccountManager {
     // the transition seeds" and "an aim never overwrites".
     if (wasWatching) return;
     const current = this.accounts[this.currentIndex];
-    if (current) this._firstSightOn(this._currentObs ??= { idx: null, windows: new Map() }, current);
+    if (current) this._firstSightOn(this._currentObs ??= { idx: null, windows: new Map(), unescaped: null }, current);
     for (const { sessionId, bucket, idx } of this.sessionTracker.livePins()) {
       this._firstSightOn(this.sessionTracker.refsFor(sessionId, bucket, true), this.accounts[idx]);
     }
@@ -1342,64 +1342,37 @@ export class AccountManager {
   }
 
   /**
-   * PREEMPTION IS A COMPARISON, AND THE ONLY STATE IT NEEDS IS ONE OBSERVATION
-   * PER STICKY CHOICE.
-   *
-   * Has the governing window of a sticky choice rolled over since traffic was
-   * last found resting on it? One subtraction against one remembered reset, made
-   * at selection time. Reading is free and changes nothing, so every pass may
-   * ask and a pass that cannot act costs nothing.
-   *
-   * THE WHOLE OF THE MECHANISM IS AIM VERSUS REST.
-   *
-   *   AIM is a selection sending a request somewhere: a preemption's
-   *   destination, a rotation, a placement, the exhausted-fleet probe, the
-   *   quota-reset switch, an operator's switch, startup, a repaint, an explicit
-   *   `/tc-acct/` pin. It writes NOTHING. A request that is aimed somewhere may
-   *   never arrive — the token refresh fails, the fetch fails, upstream refuses
-   *   — and a reading taken at the aim describes a place the traffic never was.
-   *
-   *   REST is a request arriving to find this sticky choice already on an
-   *   account, with that account not in the request's own tried set. That is the
-   *   one write site, and it is where the comparison is read.
-   *
-   * The reading is therefore taken at the START of a request, from wherever the
-   * request before it left the cursor or the pin — which is the only evidence
-   * that traffic actually came to rest anywhere, and it costs nothing to collect
-   * because selection has to look there anyway.
-   *
-   * THE TRIED SET IS WHAT SEPARATES THE TWO CASES THAT MATTER, and it is the
-   * request's own failover state rather than anything this mechanism adds. A
-   * fail-back re-enters selection with the sticky choice naming an account it has
-   * already tried, and takes no reading; an ordinary request arrives with an
-   * empty tried set and takes one.
+   * Has the governing window of this sticky choice rolled over since a request
+   * was last found resting on it? A reading is written only where a request
+   * ARRIVES to find the choice on an account outside its own tried set; a
+   * selection that merely sends a request somewhere writes nothing, because the
+   * aimed request may never arrive. A same-account retry (short-wait 429, 401)
+   * re-enters with the tried set untouched and looks like a fresh arrival, so the
+   * roll it was pushed off is held until a second request confirms the stay; a
+   * one-request stay followed by a return preempts once more.
    */
-  _restOn(obs, account, model, settled) {
+  _restOn(obs, account, model) {
     if (obs.idx !== account.index) {
-      // A DIFFERENT ACCOUNT, SO THE TRAFFIC MOVED — BUT ONLY IF NOTHING IS
-      // STILL IN FLIGHT. This is the one branch that DISCARDS: it declares the
-      // observation's roll escaped and takes a fresh reading here. That is right
-      // once the traffic has genuinely come to rest somewhere else, and wrong
-      // while a request that was AIMED here is still out, because that request
-      // may yet fail back onto the account the observation names. A sibling
-      // arriving inside that suspension sees the aim and would read it as a
-      // rest. The tracker already names the moment: nothing in flight is the
-      // only point at which where the traffic ended up is final.
-      //
-      // Skipping is the safe direction and it self-heals — the choice simply
-      // holds the reading it has, which can only fail to detect a roll on the
-      // new account, never invent one — and the next quiet request takes it.
-      //
-      // A choice that has NEVER been read is not this case at all: there is no
-      // roll to discard, so it is taken whenever it is offered (see
-      // _firstSightOn, which is why this is rarely the branch that creates one).
-      if (obs.idx != null && !settled) return;
+      // The traffic has moved, so this takes the reading that makes this
+      // account's rolls visible while holding the roll it was pushed off:
+      // `_firstSightOn` hands that back, and every cursor or pin move goes
+      // through `_setCurrent` or `recordSession`, so a fail-back has been
+      // offered it before any request reaches here.
+      const leaving = obs.idx == null ? null : this.accounts[obs.idx];
+      if (leaving && this._anyJumped(obs.windows, leaving)) {
+        obs.unescaped = { idx: obs.idx, windows: obs.windows };
+      }
       // Established whole, from every window the account presents, so a window
       // that comes back is a first sight rather than a stale value read as a jump.
       obs.idx = account.index;
       obs.windows = new Map(Object.entries(this._accountWindows(account)));
       return;
     }
+    // A second request has found the choice where the last one left it, the only
+    // evidence that traffic came to rest here. Whatever roll it was pushed off
+    // is escaped: holding it longer would preempt off an account traffic has
+    // already left and returned to.
+    obs.unescaped = null;
     const win = this._governingWindow(account, model);
     // Redundant with _jumped's own null check, and kept because "there is
     // nothing to record" says something different from "what was recorded is
@@ -1434,6 +1407,16 @@ export class AccountManager {
   _firstSightOn(obs, account) {
     if (!obs || !account) return;
     if (obs.idx != null && obs.idx !== account.index) {
+      // A fail-back reaches its origin through a cursor move rather than a rest:
+      // the pass returning the traffic finds the cursor still on the account
+      // that refused it, so _restOn never sees the arrival. The held roll is
+      // given back here, to the account that still owes it.
+      if (obs.unescaped?.idx === account.index) {
+        obs.idx = account.index;
+        obs.windows = obs.unescaped.windows;
+        obs.unescaped = null;
+        return;
+      }
       if (this._anyJumped(obs.windows, this.accounts[obs.idx])) return;
     } else if (obs.idx != null) {
       return;
@@ -1454,28 +1437,21 @@ export class AccountManager {
     return false;
   }
 
-
   /** The reading for the sticky CURRENT account, taken at the top of a selection
    *  pass, before anything in that pass can move the cursor. */
   _restOnCurrent(exclude, model) {
     if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) return;
     const resting = this.accounts[this.currentIndex];
     if (!resting || exclude?.has(resting.index)) return;
-    this._currentObs ??= { idx: null, windows: new Map() };
-    // Anything upstream anywhere in the fleet can still fail back and re-enter
-    // selection, so any of it could still move this cursor.
-    const settled = !this.accounts.some(a => a.inFlight > 0);
-    this._restOn(this._currentObs, resting, model, settled);
+    this._currentObs ??= { idx: null, windows: new Map(), unescaped: null };
+    this._restOn(this._currentObs, resting, model);
   }
 
   /** The same reading for a SESSION's pin on the bucket this request is governed
-   *  by. Created on demand: a session that has never been pinned has nothing to
-   *  observe, and one whose pin this request has already tried is looking at a
-   *  failed attempt rather than a resting place. */
+   *  by, by the same rule. Created on demand: a session that has never been
+   *  pinned has nothing to observe, and one whose pin this request has already
+   *  tried is looking at a failed attempt rather than a resting place. */
   _restOnPin(sessionId, bucket, exclude, model) {
-    // Ungated on its own, because recordSession's guard already stops a
-    // client-supplied session id growing state nothing will read. Two guards on
-    // one property, and neither is the other's proof.
     if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) return;
     const pinIdx = this.sessionTracker.pinnedAccount(sessionId, bucket);
     if (pinIdx == null || exclude?.has(pinIdx)) return;
@@ -1483,10 +1459,7 @@ export class AccountManager {
     if (!account) return;
     const obs = this.sessionTracker.refsFor(sessionId, bucket, true);
     if (!obs) return;
-    // A pin is moved only by its own session's requests, so the tighter question
-    // is the right one: this request, and nothing else of this session's.
-    const settled = this.sessionTracker.inFlightFor(sessionId) <= 1;
-    this._restOn(obs, account, model, settled);
+    this._restOn(obs, account, model);
   }
 
   /** Has this session's pin rolled over since traffic was last found resting on
@@ -2510,12 +2483,14 @@ export class AccountManager {
     // are the rollover observations hanging off them and off the current account.
     const remap = idx => (idx === index ? null : idx > index ? idx - 1 : idx);
     this.sessionTracker.remapAccounts(remap);
-    // The observation names its account by index too, so it follows the shift or
-    // goes away with the account it described — an observation of a removed
-    // account would otherwise be read against whichever account inherited the
-    // slot.
+    // The observation names its account by index, so it follows the shift or
+    // goes away with the account it described. Left behind, it would be read
+    // against whichever account inherited the slot; its held roll the same.
     const moved = this._currentObs?.idx == null ? null : remap(this._currentObs.idx);
-    if (this._currentObs) this._currentObs = moved == null ? null : { idx: moved, windows: this._currentObs.windows };
+    if (this._currentObs) {
+      this._currentObs = moved == null ? null
+        : { idx: moved, windows: this._currentObs.windows, unescaped: remapHeld(this._currentObs.unescaped, remap) };
+    }
     // A throttle key names an account by index, so the shift would point a live
     // entry at a different account. Not worth renumbering: the entries expire in
     // a minute and dropping them can only make the next held event report sooner.
