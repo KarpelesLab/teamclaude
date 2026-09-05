@@ -8,7 +8,7 @@ import {
   canUpsertOAuthAccount,
   oauthIdentityFields,
 } from './identity.js';
-import { configIndexFor, managerAccountFor } from './account-pairing.js';
+import { configIndexFor, managerAccountFor, markAccountRemoved } from './account-pairing.js';
 import { mintAccountId } from './account-id.js';
 import { formatPercent } from './status-renderer.js';
 import { resolveMaxUsage } from './model.js';
@@ -1220,7 +1220,14 @@ export class TUI {
     // fleet running an account whose entry is gone.
     const cfgIdx = configIndexFor(this.config.accounts, this.am.accounts, idx);
     this.am.removeAccount(idx);
-    if (cfgIdx >= 0) this.config.accounts.splice(cfgIdx, 1);
+    if (cfgIdx >= 0) {
+      // Record the id before the row goes: the save adopts rows that are on disk
+      // and not in memory (an account added by another process since the last
+      // reload), and removal is itself a save — so without this the entry being
+      // deleted would be read back off disk and written straight out again.
+      markAccountRemoved(this.config, this.config.accounts[cfgIdx]?.id);
+      this.config.accounts.splice(cfgIdx, 1);
+    }
     if (this.selIdx >= this.am.accounts.length) this.selIdx = Math.max(0, this.am.accounts.length - 1);
     await this.saveConfig(this.config);
     this._addLog(`Removed account "${name}"`);

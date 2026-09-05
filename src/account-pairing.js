@@ -82,8 +82,44 @@ function ownsInlineToken(entry) {
   return entry?.type === 'oauth' && !entry.importFrom;
 }
 
-export function mergeAccountsForSave(configAccounts, managerAccounts, diskAccounts) {
-  return configAccounts.map(a => {
+// Entries the operator removed in this process, by id.
+//
+// The save has to tell two things apart that look identical on disk: a row that
+// appeared since the last reload (`teamclaude login` while the server runs —
+// keep it) and a row the operator just deleted (drop it). Both are "on disk but
+// not in memory", and removal is itself a save, so adopting disk-only rows
+// without this would resurrect the account the operator was in the middle of
+// deleting.
+//
+// Held on the config object and non-enumerable, so it never reaches JSON.
+const REMOVED = Symbol('removedAccountIds');
+
+/** Record that `id` was deliberately removed, so a save does not adopt it back. */
+export function markAccountRemoved(config, id) {
+  if (!config || !id) return;
+  if (!config[REMOVED]) {
+    Object.defineProperty(config, REMOVED, { value: new Set(), enumerable: false, writable: true });
+  }
+  config[REMOVED].add(id);
+}
+
+/** The ids removed so far. */
+export function removedAccountIds(config) {
+  return config?.[REMOVED] || new Set();
+}
+
+/**
+ * Forget the removals, once a save has written a list that omits them. After
+ * that the rows are gone from disk too, so there is nothing left to re-adopt
+ * and keeping the ids would only strand them if the operator re-added the same
+ * account later.
+ */
+export function clearRemovedAccountIds(config) {
+  if (config?.[REMOVED]) config[REMOVED].clear();
+}
+
+export function mergeAccountsForSave(configAccounts, managerAccounts, diskAccounts, removedIds = new Set()) {
+  const merged = configAccounts.map(a => {
     const am = managerAccountFor(managerAccounts, a);
     const live = am && ownsInlineToken(a) ? {
       ...a,
@@ -94,6 +130,24 @@ export function mergeAccountsForSave(configAccounts, managerAccounts, diskAccoun
     const diskAcct = diskAccounts.find(d => sameIdentity(d, a));
     return diskAcct ? { ...diskAcct, ...live } : live;
   });
+
+  // Carry over rows that exist on disk and not in memory. The list used to be
+  // exactly as long as the in-memory one, so an account added by another
+  // process since the last reload — `teamclaude login` or `import` while the
+  // server runs — was silently dropped by the next save (#205). The refresh
+  // handler already re-reads disk for this reason; the save had no equivalent.
+  //
+  // Except the ones the operator removed: removal is itself a save, so without
+  // that check this would resurrect the account being deleted, on the very
+  // write that was meant to delete it.
+  const keptIds = new Set(merged.map(a => a?.id).filter(Boolean));
+  for (const diskAcct of diskAccounts) {
+    if (!diskAcct?.id) continue;                 // pre-id row; identity above covers it
+    if (keptIds.has(diskAcct.id)) continue;
+    if (removedIds.has(diskAcct.id)) continue;
+    merged.push(diskAcct);
+  }
+  return merged;
 }
 
 /**

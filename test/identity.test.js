@@ -245,3 +245,22 @@ test('findUpsertTarget still adds a genuinely new account', () => {
   const accounts = [{ name: 'a@x.com', accountUuid: 'u1', orgUuid: 'o1' }];
   assert.equal(findUpsertTarget(accounts, { name: 'b@x.com', accountUuid: 'u2', orgUuid: 'o2' }), -1);
 });
+
+// findConfigAccount used to take the first sameIdentity hit, and sameIdentity
+// compares organization only when both records carry one — so for one person
+// holding accounts in two orgs, both rows matched and a refreshed token was
+// written to whichever came first, recording one account's refresh-token family
+// against another account's row (#203). The entry id is exact.
+test('a token write resolves the right row for one person in two orgs', async () => {
+  const { AccountManager } = await import('../src/account-manager.js');
+  const rows = [
+    { id: 'i-personal', name: 'a@x.com', type: 'oauth', accountUuid: 'u1', orgUuid: 'o-personal', accessToken: 'p' },
+    { id: 'i-acme', name: 'a@x.com', type: 'oauth', accountUuid: 'u1', orgUuid: 'o-acme', accessToken: 'a' },
+  ];
+  const am = new AccountManager(rows, 0.98);
+  const acme = am.accounts.find(a => a.orgUuid === 'o-acme');
+  assert.equal(acme.id, 'i-acme', 'the account must carry its entry id');
+  // The row the write should land on is the one whose id matches, not the first
+  // identity match (which would be the personal row).
+  assert.equal(rows.findIndex(r => r.id === acme.id), 1);
+});
