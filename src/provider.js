@@ -67,9 +67,9 @@ const CODEX_PATHS = ['/backend-api/codex'];
  * Which provider should serve a request path.
  *
  * This is what lets one port serve both CLIs: Claude Code posts to
- * `/v1/messages` and Codex posts to `/v1/responses`, so the path alone says
- * which pool of accounts is eligible. No second listener, no client-supplied
- * hint that could disagree with the body.
+ * `/v1/messages` and Codex to `/backend-api/codex/responses`, so the path alone
+ * says which pool of accounts is eligible. No second listener, no
+ * client-supplied hint that could disagree with the body.
  */
 export function providerForPath(url) {
   const path = String(url || '').split('?')[0];
