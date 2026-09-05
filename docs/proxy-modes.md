@@ -64,6 +64,13 @@ restart.
   silently in force.
 - `NO_PROXY` (or `noProxy`) exempts hosts by suffix; `"upstreamProxy": false`
   ignores the environment entirely.
+- **A proxy that is this server is refused.** `teamclaude env` exports
+  `HTTPS_PROXY` pointing at TeamClaude, so a server or CLI started from that
+  shell would inherit itself as its egress proxy — every upstream call would
+  re-enter the proxy and be answered for whichever account it selected, silently
+  (a usage probe would then store that one account's quota under all of them).
+  A value whose address is our own listener is dropped, whether it came from the
+  environment or the config, and the startup line and the TUI row say so.
 - **TLS stays end-to-end.** The tunnel is a plain `CONNECT`; the proxy sees
   ciphertext only, and certificate verification is unchanged. A proxy that
   intercepts TLS needs its CA in `NODE_EXTRA_CA_CERTS`.

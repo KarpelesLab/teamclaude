@@ -10,7 +10,8 @@ import {
 import { configIndexFor, managerAccountFor } from './account-pairing.js';
 import { mintAccountId } from './account-id.js';
 import { formatPercent } from './status-renderer.js';
-import { parseProxyUrl, proxyToUrl, describeProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy } from './upstream-proxy.js';
+import { parseProxyUrl, proxyToUrl, describeProxy, describeSelfProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy } from './upstream-proxy.js';
+import { sanitizeText } from './safe-text.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -71,10 +72,13 @@ function sessionColorCode(sid) {
   for (let i = 0; i < sid.length; i++) h = (h * 31 + sid.charCodeAt(i)) >>> 0;
   return SESSION_FG[h % SESSION_FG.length];
 }
-// Fixed-width colored short id (blank-padded when there's no session, e.g. a
-// telemetry request), so the activity column stays aligned.
-const sessionTag = sid =>
-  sid ? fg(sessionColorCode(sid), sid.slice(0, SESSION_ID_LEN)) : ' '.repeat(SESSION_ID_LEN);
+// Fixed-width colored session label: the name Claude Code holds on disk for the
+// session (see session-titles.js), else the short id. Blank-padded when there's
+// no session (e.g. a telemetry request). One width for every row, named or not,
+// keeps the columns after it aligned. Measured in display columns, not UTF-16
+// units, so a CJK title takes the same room as an ASCII one.
+const sessionTag = (sid, title = null, width = SESSION_ID_LEN) =>
+  sid ? fg(sessionColorCode(sid), rpad(truncate(title || sid.slice(0, SESSION_ID_LEN), width), width)) : ' '.repeat(width);
 
 // Which quota-family bar (F7/S7) a route binds to, or null for a general route.
 // Auto routes are named 'fable'/'sonnet'; a configured route is classified by its
@@ -172,14 +176,22 @@ export function truncate(s, w) {
 const BAR_MIN = 5;
 const BAR_MAX = 20;
 
+// Floor for the account name column. It grows past this toward the longest name
+// when the row has width to spare, but never drops below it, so a narrow
+// terminal lays the table out exactly as it did before the column could grow.
+const NAME_MIN = 12;
+
 // Families this account can't serve right now: a family whose own weekly bucket
 // is over the switch threshold is barred from that model while the account is
 // otherwise active. Shared by the row renderer (which draws the `⊘` tag) and the
 // column layout (which reserves the width that tag needs).
+// `threshold` is a number, or a per-bucket lookup (bucket → number) so a family
+// is judged against its OWN configured threshold rather than the global one.
 export function blockedFamilies(quota, threshold) {
+  const at = typeof threshold === 'function' ? threshold : () => threshold;
   const out = [];
-  if (quota.unified7dSonnet != null && quota.unified7dSonnet >= threshold) out.push('Sonnet');
-  if (quota.unified7dFable != null && quota.unified7dFable >= threshold) out.push('Fable');
+  if (quota.unified7dSonnet != null && quota.unified7dSonnet >= at('unified7dSonnet')) out.push('Sonnet');
+  if (quota.unified7dFable != null && quota.unified7dFable >= at('unified7dFable')) out.push('Fable');
   return out;
 }
 
@@ -212,11 +224,56 @@ function formatReset(resetTs) {
   return rh > 0 ? `${days}d${rh}h` : `${days}d`;
 }
 
+// Rolling-window lengths for the Claude Max buckets, used to color a bar by
+// burn rate rather than raw fill (see barColor). The five-hour session bucket
+// and the seven-day weekly buckets (unified, Sonnet, Fable) reset on these.
+const FIVE_HOUR_MS = 5 * 60 * 60 * 1000;
+const SEVEN_DAY_MS = 7 * 24 * 60 * 60 * 1000;
+
+// { bg, fg } SGR params per severity. White label on red (dark everywhere),
+// black on the lighter green/yellow/orange (bright-white would vanish on the
+// light backgrounds many terminal themes render for them).
+const BAR_GREEN = { bg: '42', fg: '30' };
+const BAR_YELLOW = { bg: '43', fg: '30' };
+const BAR_ORANGE = { bg: '48;5;208', fg: '30' };
+const BAR_RED = { bg: '41', fg: '97' };
+
+/**
+ * Pick a bar color. A bucket at or above `threshold` is red whatever its pace:
+ * that is the point where the rotation stops routing to it — eligibility()
+ * calls the account out as "at or above the switch threshold", and the row's
+ * `⊘` tag comes off the same comparison in blockedFamilies — so a green bar
+ * would contradict the rest of the row. Below it, and with a window still
+ * running, color by burn rate: how far usage is ahead of the share of the window
+ * already elapsed, so a bucket that is 80% spent with the week nearly over
+ * reads calm, not alarming. Fall back to raw utilization when there is no pace
+ * to measure — no window at all (API-key token/request bars, whose reset
+ * cadence is unknown), or a window whose reset has passed, which says nothing
+ * about the fill still being reported against it.
+ */
+function barColor(ratio, resetTs, windowMs, threshold) {
+  if (threshold != null && ratio >= threshold) return BAR_RED;
+  const remaining = resetTs ? resetTs - Date.now() : 0;
+  if (windowMs && remaining > 0) {
+    const elapsed = Math.max(0, windowMs - remaining);
+    const timePct = (elapsed / windowMs) * 100;
+    const diff = ratio * 100 - timePct;
+    if (diff <= 0) return BAR_GREEN;
+    if (diff <= 5) return BAR_YELLOW;
+    if (diff <= 15) return BAR_ORANGE;
+    return BAR_RED;
+  }
+  return ratio < 0.7 ? BAR_GREEN : ratio < 0.9 ? BAR_YELLOW : BAR_RED;
+}
+
 /**
  * Render a progress bar using background colors with text overlaid.
  * The label (e.g. "Ses 2h30m" or "45%") is drawn on top of the bar.
+ * windowMs is the bucket's rolling-window length; when known, the color tracks
+ * burn rate instead of raw fill. threshold is the routing switch threshold, at
+ * or above which the bar goes red regardless of pace.
  */
-export function bar(ratio, w = 10, resetTs) {
+export function bar(ratio, w = 10, resetTs, windowMs, threshold) {
   const rst = formatReset(resetTs);
 
   if (ratio == null || isNaN(ratio)) {
@@ -231,8 +288,7 @@ export function bar(ratio, w = 10, resetTs) {
 
   ratio = Math.max(0, Math.min(1, ratio));
   const f = Math.round(ratio * w);
-  // Background colors: 42=green, 43=yellow, 41=red; 100=bright black (gray) for empty
-  const bg = ratio < 0.7 ? 42 : ratio < 0.9 ? 43 : 41;
+  const { bg, fg } = barColor(ratio, resetTs, windowMs, threshold);
 
   // Build the label to overlay: show reset time if available, else percentage
   const pct = (ratio * 100).toFixed(0) + '%';
@@ -247,13 +303,8 @@ export function bar(ratio, w = 10, resetTs) {
   const filled = chars.slice(0, f);
   const empty = chars.slice(f);
 
-  // Black label on green/yellow: terminal themes commonly render those
-  // backgrounds light, and bright-white text disappears on them. White stays
-  // on red, which is dark in practically every palette.
-  const fgc = bg === 41 ? 97 : 30;
-
   let out = '';
-  if (filled) out += `${ESC}${bg};${fgc}m${filled}`;
+  if (filled) out += `${ESC}${bg};${fg}m${filled}`;
   if (empty) out += `${ESC}100;37m${empty}`;
   out += RESET;
   return out;
@@ -273,7 +324,10 @@ export class TUI {
     remote = false, applySwitch = null,
     // Injectable so the import path can be exercised without a real credentials
     // file or a live profile call.
-    readCredentials = importCredentials, readProfile = fetchProfile }) {
+    readCredentials = importCredentials, readProfile = fetchProfile,
+    // Names the activity column against the session id the client sent. Absent
+    // or disabled leaves every row showing the short id.
+    sessionTitles = null }) {
     this.am = accountManager;
     this.remote = remote;
     this.applySwitch = applySwitch;
@@ -288,6 +342,7 @@ export class TUI {
     this._readCredentials = readCredentials;
     this._readProfile = readProfile;
     this._activityStream = null;
+    this.sessionTitles = sessionTitles;
 
     this.log = [];           // completed activity entries
     this.active = new Map(); // in-flight requests
@@ -387,9 +442,20 @@ export class TUI {
     process.stdin.pause();
   }
 
+  // A title lookup costs a directory scan and a file read, so it stays off the
+  // render path: this returns what is cached and schedules the rest.
+  _sessionTag(sid) {
+    const titles = this.sessionTitles;
+    if (!titles?.enabled) return sessionTag(sid);
+    return sessionTag(sid, titles.get(sid), titles.width);
+  }
+
   // ── server hooks ───────────────────────────────────
 
   onRequestStart(id, info) {
+    // Start the lookup now, so the title is cached by the time the request ends
+    // and its log line is composed.
+    this._sessionTag(info.sessionId);
     this.active.set(id, { ...info, t: timestamp(), started: Date.now(), account: null });
     this.render();
     if (this.active.size === 1) this._retick();   // idle → animating
@@ -413,7 +479,7 @@ export class TUI {
     const model = info.model ? ` (${info.model})` : ''; // shown when the request named a model
     const sid = info.sessionId || r?.sessionId || null;
     const pin = (info.pinned || r?.pinned) ? dim(' [pin]') : '';
-    this._addLog(`${sessionTag(sid)} ${info.method} ${info.path}${model} → ${acct}${pin} (${info.status}, ${dur}s)`);
+    this._addLog(`${this._sessionTag(sid)} ${info.method} ${info.path}${model} → ${acct}${pin} (${info.status}, ${dur}s)`);
     if (this.active.size === 0) this._retick();   // animating → idle
   }
 
@@ -422,7 +488,9 @@ export class TUI {
     const t = timestamp();
     this.log.unshift({ t, msg });
     if (this.log.length > 200) this.log.length = 200;
-    if (this._activityStream) this._activityStream.write(`${t}  ${strip(msg)}\n`);
+    // sanitizeText, not `strip`: the latter removes SGR colour only, so an
+    // erase or cursor-move sequence reached the file, as did a newline.
+    if (this._activityStream) this._activityStream.write(`${t}  ${sanitizeText(msg)}\n`);
     if (this.running) this.render();
   }
 
@@ -482,11 +550,20 @@ export class TUI {
   _settingsFields() {
     const fields = [];
 
-    fields.push({
+    // A per-bucket table can't be edited from a single ±1% control, and writing
+    // a plain number over it would silently discard the operator's per-bucket
+    // values. So the row shows the table and sends them to the config file.
+    const perBucket = this._perBucketThresholds();
+    fields.push(perBucket ? {
+      id: 'threshold',
+      label: 'Switch threshold',
+      hint: 'per-bucket — edit config',
+      value: () => green(perBucket),
+    } : {
       id: 'threshold',
       label: 'Switch threshold',
       hint: '←→ ±1%',
-      value: () => green(formatPercent(this.am.switchThreshold ?? this.config.switchThreshold ?? 0.98)),
+      value: () => green(formatPercent(this.am.effectiveThreshold ?? this.config.switchThreshold ?? 0.98)),
       left: () => this._nudgeThreshold(-1),
       right: () => this._nudgeThreshold(+1),
       enter: () => this._promptInput('Switch threshold % (1-100, tenths allowed)', v => this._doSetThreshold(v.trim())),
@@ -519,6 +596,18 @@ export class TUI {
       right: () => this._cycleEventLogging(+1),
       enter: () => this._cycleEventLogging(+1),
     });
+
+    if (this.sessionTitles) {
+      fields.push({
+        id: 'sessionTitles',
+        label: 'Session titles',
+        hint: '←→ toggle',
+        value: () => (this.sessionTitles.enabled ? green('on') : gray('off')),
+        left: () => this._toggleSessionTitles(),
+        right: () => this._toggleSessionTitles(),
+        enter: () => this._toggleSessionTitles(),
+      });
+    }
 
     fields.push({
       id: 'routes',
@@ -568,8 +657,11 @@ export class TUI {
       label: 'Upstream proxy',
       hint: 'Enter to set',
       value: () => {
-        const { proxy, source } = getUpstreamProxy();
-        if (!proxy) return dim('(direct)');
+        const resolved = getUpstreamProxy();
+        const { proxy, source } = resolved;
+        // A dropped self-proxy reads as "(direct)" too, and the operator would
+        // have no way to tell that a value they set is not in force.
+        if (!proxy) return source === 'self' ? dim('(direct) ') + gray(describeSelfProxy(resolved)) : dim('(direct)');
         // Name the environment when that is where it came from: a value the
         // operator did not put in the config, silently in force, is exactly the
         // thing that is hard to account for later.
@@ -646,9 +738,21 @@ export class TUI {
   _nudgeThreshold(deltaPct) {
     // Stepping from the exact percent, not a rounded one, so a threshold set to
     // a tenth keeps its fraction instead of snapping to the nearest whole.
-    const cur = (this.am.switchThreshold ?? this.config.switchThreshold ?? 0.98) * 100;
+    const cur = (this.am.effectiveThreshold ?? this.config.switchThreshold ?? 0.98) * 100;
     const next = Math.max(1, Math.min(100, cur + deltaPct));
     if (next !== cur) return this._doSetThreshold(String(next));
+  }
+
+  /** A one-line rendering of a per-bucket threshold table, or null when the
+   * threshold is a single number. */
+  _perBucketThresholds() {
+    const t = this.am.switchThreshold ?? this.config.switchThreshold;
+    if (!t || typeof t !== 'object') return null;
+    const pct = v => `${Math.round(v * 100)}%`;
+    return Object.entries(t)
+      .filter(([, v]) => typeof v === 'number' && Number.isFinite(v))
+      .map(([k, v]) => `${k}:${pct(v)}`)
+      .join(' ');
   }
 
   _nudgeProbe(deltaSec) {
@@ -879,6 +983,7 @@ export class TUI {
 
     const resolved = setUpstreamProxy(resolveUpstreamProxy(this.config));
     if (resolved.proxy) this._addLog(`Upstream proxy set to ${describeProxy(resolved.proxy)}`);
+    else if (resolved.source === 'self') this._addLog(`Connecting directly — ${describeSelfProxy(resolved)}`);
     else this._addLog('Upstream proxy cleared — connecting directly');
     this.mode = 'settings';
   }
@@ -921,6 +1026,18 @@ export class TUI {
     const r = await this.sx.setMode(next);
     this._addLog(`sx.org mode: ${this._sxModeLabel(next)}${r.ok ? '' : ` — ${r.error}`}`);
     if (next !== 'off') this._loadSxBalance();
+    if (this.running) this.render();
+  }
+
+  async _toggleSessionTitles() {
+    // The shared config object is what a save writes and a reload re-applies,
+    // so it is the record; the store is configured from it, never the reverse.
+    const enabled = !this.sessionTitles.enabled;
+    this.config.sessionTitles = { ...this.config.sessionTitles, enabled };
+    this.sessionTitles.configure(this.config.sessionTitles);
+    try { await this.saveConfig(this.config); }
+    catch (e) { this._addLog(`Failed to save: ${e.message}`); }
+    this._addLog(`Session titles: ${enabled ? 'on' : 'off'}`);
     if (this.running) this.render();
   }
 
@@ -1123,7 +1240,8 @@ export class TUI {
     const port = this.config.proxy?.port || 3456;
     const sess = this.am.sessionStats();
     const sessStr = (sess.active || sess.known)
-      ? `${sess.active} sess${this.am.distributeSessions ? green(' dist') : ''}  `
+      ? `${sess.active} sess${this.am.distributeSessions ? green(' dist')
+        : (sess.draining ? yellow(` drain ${sess.draining}`) : '')}  `
       : '';
     // ▼ marks a dashboard that lost contact with the server it polls (attach
     // mode): what is on screen is the last snapshot, not the current state.
@@ -1181,10 +1299,10 @@ export class TUI {
       // actually blocked; the common case where nothing is spends those columns
       // on the bars instead of leaving the row short of the edge.
       const tagW = this.am.accounts.reduce((w, a) => {
-        const names = blockedFamilies(a.quota, this.am.switchThreshold);
+        const names = blockedFamilies(a.quota, key => this.am.thresholdFor(key));
         return names.length ? Math.max(w, 4 + vw(names.join(' '))) : w;
       }, 0);
-      const fixed = 40 + (genRoutes.length ? genRoutes.length + 1 : 0) + tagW;
+      const fixed = 28 + NAME_MIN + (genRoutes.length ? genRoutes.length + 1 : 0) + tagW;
       const roomFor = n => fixed + 6 * (n - 1) + n * BAR_MIN <= W;
       // The family bars are the first thing to go: below the width where they
       // fit even at BAR_MIN they would push the row past the edge, and a row cut
@@ -1194,6 +1312,16 @@ export class TUI {
       const nbars = (showBoth ? 2 : 1) + (showFamily ? (anyFable ? 1 : 0) + (anySonnet ? 1 : 0) : 0);
       const bw = Math.max(BAR_MIN, Math.min(BAR_MAX, Math.floor((W - fixed - 6 * (nbars - 1)) / nbars)));
 
+      // Whatever the chrome and the capped bars leave over goes to the name
+      // column, up to the longest name in the fleet, so a wide terminal shows
+      // whole addresses instead of `a-considerab`. `fixed` already reserves
+      // NAME_MIN, so only the surplus past it is spent here: the row stays
+      // inside the budget above, and a terminal with no surplus keeps the
+      // twelve-column cell it had.
+      const longestName = Math.max(0, ...this.am.accounts.map(a => vw(a.name)));
+      const slack = Math.max(0, W - fixed - 6 * (nbars - 1) - nbars * bw);
+      const nameW = Math.max(NAME_MIN, Math.min(longestName, NAME_MIN + slack));
+
       // The single account each secondary bucket currently routes to (null = none
       // can serve it right now). Marked next to that account's F7/S7 bar — the
       // secondary-quota analogue of ► marking the default route's current account.
@@ -1202,7 +1330,7 @@ export class TUI {
         sonnet: anySonnet ? this.am.previewRouteIndex('claude-sonnet-4-6') : null,
       };
       for (let i = 0; i < this.am.accounts.length; i++) {
-        lines.push(this._renderAcct(i, bw, showBoth, routes, genRoutes, familyTarget, showFamily));
+        lines.push(this._renderAcct(i, bw, showBoth, routes, genRoutes, familyTarget, showFamily, nameW));
       }
     }
 
@@ -1227,7 +1355,7 @@ export class TUI {
       const m = r.model ? dim(` (${r.model})`) : ''; // filled in as soon as the model is peeked from the stream
       const pin = r.pinned ? dim(' [pin]') : '';
       const a = r.account ? ` → ${r.account}${pin}` : '';
-      lines.push(` ${sp} ${gray(r.t)}  ${sessionTag(r.sessionId)} ${r.method} ${r.path}${m}${a} ${dim(`(${el}s...)`)}`);
+      lines.push(` ${sp} ${gray(r.t)}  ${this._sessionTag(r.sessionId)} ${r.method} ${r.path}${m}${a} ${dim(`(${el}s...)`)}`);
     }
 
     // Completed log
@@ -1255,7 +1383,7 @@ export class TUI {
     this._paint(buf, force);
   }
 
-  _renderAcct(idx, bw, showBoth, routes = this.am.getRoutes(), genRoutes = routes.filter(r => routeFamily(r) === null), familyTarget = {}, showFamily = true) {
+  _renderAcct(idx, bw, showBoth, routes = this.am.getRoutes(), genRoutes = routes.filter(r => routeFamily(r) === null), familyTarget = {}, showFamily = true, nameW = NAME_MIN) {
     const a = this.am.accounts[idx];
     const isCur = idx === this.am.currentIndex;
     const isSel = this.mode === 'select' && idx === this.selIdx;
@@ -1288,8 +1416,13 @@ export class TUI {
       return routeGlyph(routeColorFn(r?.color), true, pinned);
     };
 
-    // Name (bold if selected)
-    const rawName = a.name.slice(0, 12).padEnd(12);
+    // Name (bold if selected), cut and padded in display columns. A
+    // slice/padEnd pair counts UTF-16 units instead, so a six-character CJK
+    // name keeps all six characters and still collects six columns of padding,
+    // shifting everything after it. truncate stops a column short of the limit
+    // when it drops a wide glyph that would straddle it, so rpad finishes the
+    // cell.
+    const rawName = rpad(truncate(a.name, nameW), nameW);
     const name = isSel ? bold(rawName) : rawName;
 
     // Type
@@ -1310,13 +1443,15 @@ export class TUI {
 
     // Quota ratios — prefer unified (Claude Max), fall back to standard (API key)
     const q = a.quota;
-    let r1 = null, r2 = null, l1 = 'Ses', l2 = 'Wk ', t1 = null, t2 = null;
+    let r1 = null, r2 = null, l1 = 'Ses', l2 = 'Wk ', t1 = null, t2 = null, w1 = null, w2 = null;
 
     if (q.unified5h != null || q.unified7d != null || q.unified7dSonnet != null || q.unified7dFable != null) {
       r1 = q.unified5h;
       r2 = q.unified7d;
       t1 = q.unified5hReset;
       t2 = q.unified7dReset;
+      w1 = FIVE_HOUR_MS;
+      w2 = SEVEN_DAY_MS;
     } else {
       l1 = 'Tok';
       l2 = 'Req';
@@ -1328,24 +1463,33 @@ export class TUI {
       t2 = t1;
     }
 
-    let line = ` ${sel}${cur} ${startSlot}${name} ${type} ${status} ${l1} ${bar(r1, bw, t1)}`;
+    // The live routing threshold, so a bucket the rotation already refuses to
+    // use reads red however healthy its pace looks.
+    // Each bar reddens at ITS bucket's threshold (a per-bucket table may set
+    // the weekly one lower than the 5-hour one); the attach-mode manager
+    // mirrors thresholdFor, so both dashboards agree with the gate.
+    const thFor = (k) => (typeof this.am.thresholdFor === 'function' ? this.am.thresholdFor(k) : this.am.switchThreshold);
+    const th1 = thFor(r1 === q.unified5h ? 'unified5h' : 'tokens');
+    const th2 = thFor(r2 === q.unified7d ? 'unified7d' : 'requests');
+
+    let line = ` ${sel}${cur} ${startSlot}${name} ${type} ${status} ${l1} ${bar(r1, bw, t1, w1, th1)}`;
     if (showBoth) {
-      line += `  ${l2} ${bar(r2, bw, t2)}`;
+      line += `  ${l2} ${bar(r2, bw, t2, w2, th2)}`;
       // Sonnet weekly bar — only shown when the usage probe has populated it. A
       // leading ► (in place of a padding space) marks a Sonnet route on this account.
       if (showFamily && q.unified7dSonnet != null) {
-        line += ` ${familyMark('sonnet')}S7  ${bar(q.unified7dSonnet, bw, q.unified7dSonnetReset)}`;
+        line += ` ${familyMark('sonnet')}S7  ${bar(q.unified7dSonnet, bw, q.unified7dSonnetReset, SEVEN_DAY_MS, thFor('unified7dSonnet'))}`;
       }
       // Fable weekly bar — only shown when the usage probe has populated it.
       if (showFamily && q.unified7dFable != null) {
-        line += ` ${familyMark('fable')}F7  ${bar(q.unified7dFable, bw, q.unified7dFableReset)}`;
+        line += ` ${familyMark('fable')}F7  ${bar(q.unified7dFable, bw, q.unified7dFableReset, SEVEN_DAY_MS, thFor('unified7dFable'))}`;
       }
     }
     // Explicit "disabled for these models" tag (issue #85): a family whose own
     // weekly bucket is over the switch threshold can't serve that model even
     // while the account is otherwise active. A spent shared 5h blocks everything
     // and is already conveyed by the Ses bar + status, so it's not repeated here.
-    const blocked = blockedFamilies(q, this.am.switchThreshold);
+    const blocked = blockedFamilies(q, key => this.am.thresholdFor(key));
     if (blocked.length) line += `  ${red('⊘ ' + blocked.join(' '))}`;
     return line;
   }
@@ -1384,6 +1528,7 @@ export class TUI {
     // ── Activity log
     lines.push(bold('  Activity log') + dim('  — what to do with Claude Code\'s telemetry'));
     lines.push(row(byId('eventlog')));
+    if (byId('sessionTitles')) lines.push(row(byId('sessionTitles')));
     lines.push('');
     // ── Routing
     lines.push(bold('  Routing') + dim('  — pin model families to specific accounts, or block them outright'));

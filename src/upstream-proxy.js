@@ -102,6 +102,65 @@ export function bypassesProxy(hostname, noProxy) {
   return false;
 }
 
+// ── Self-proxy guard ─────────────────────────────────────────
+//
+// TeamClaude honours HTTPS_PROXY for its own egress, and `teamclaude env`
+// exports HTTPS_PROXY pointing AT TeamClaude (that is how MITM mode aims the
+// client). So a server or CLI started from a shell already set up for MITM
+// inherits ITSELF as its egress proxy.
+//
+// Nothing errors, which is what makes it expensive: the request is answered by
+// our own listener, which rewrites the Authorization header to whichever
+// account is currently selected. Every call then reports on that one account.
+// A `/api/oauth/usage` probe reads the active account's quota and stores it
+// under every account, so the whole fleet's quota state is overwritten with one
+// account's numbers — and the readings look plausible, so nothing flags them.
+// Forwarding a completion is worse: the request re-enters the proxy, which
+// forwards it again.
+//
+// Sending our own egress to our own listener is never what anyone meant, so a
+// proxy that IS this listener is dropped and reported, whatever set it.
+
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '0:0:0:0:0:0:0:1']);
+// A wildcard bind accepts connections on every local address, loopback included.
+const WILDCARD_BINDS = new Set(['0.0.0.0', '::', '*']);
+
+/** Lowercase, unbracket (`[::1]`) and drop a root dot, so two spellings of one host compare equal. */
+function normalizeHost(host) {
+  return String(host ?? '').trim().toLowerCase().replace(/^\[/, '').replace(/\]$/, '').replace(/\.$/, '');
+}
+
+/** True for any spelling of this machine's loopback interface. */
+function isLoopbackHost(host) {
+  return LOOPBACK_HOSTS.has(host) || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
+}
+
+/**
+ * The address this process's own proxy listens on, built from the same
+ * expression the server binds with (see serverCommand). Null when the config
+ * carries no port — a caller that never loaded one cannot recognise itself, and
+ * guessing a default would drop a legitimate proxy that happens to sit on 3456.
+ */
+export function localListener(config = {}, env = process.env) {
+  const port = Number(config?.proxy?.port);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+  return { host: env.TEAMCLAUDE_HOST || config?.proxy?.host || '127.0.0.1', port };
+}
+
+/** True when `proxy` addresses `listener` — sending through it comes straight back. */
+export function isSelfProxy(proxy, listener) {
+  if (!proxy || !listener) return false;
+  if (proxy.port !== listener.port) return false;
+  const target = normalizeHost(proxy.host);
+  const bind = normalizeHost(listener.host);
+  if (target === bind) return true;
+  if (WILDCARD_BINDS.has(bind)) return isLoopbackHost(target);
+  // Otherwise loopback-for-loopback only: 127.0.0.2 and localhost are the same
+  // listener as 127.0.0.1, while calling a LAN address ours would be a claim
+  // about this host's interfaces that nothing here has established.
+  return isLoopbackHost(target) && isLoopbackHost(bind);
+}
+
 /**
  * Where the proxy setting comes from, in precedence order: the config file
  * first (explicit and persistent), then the conventional environment variables.
@@ -111,23 +170,39 @@ export function bypassesProxy(hostname, noProxy) {
  * also what every other CLI on that machine does. `config.upstreamProxy: false`
  * opts out entirely, for a host where the variables are set for other tools but
  * must not apply here.
+ *
+ * A candidate that resolves to this server's own listener is reported as
+ * `source: 'self'` with the rejected value under `ignored`, so the startup line
+ * and the TUI can say what was dropped instead of showing a bare "(direct)".
  */
 export function resolveUpstreamProxy(config = {}, env = process.env) {
   if (config.upstreamProxy === false) return { proxy: null, source: 'disabled', noProxy: null };
 
   const noProxy = config.noProxy ?? env.NO_PROXY ?? env.no_proxy ?? null;
+  const listener = localListener(config, env);
+  const use = (proxy, source) => (isSelfProxy(proxy, listener)
+    ? { proxy: null, source: 'self', noProxy, ignored: { proxy, source } }
+    : { proxy, source, noProxy });
 
   if (config.upstreamProxy) {
-    return { proxy: parseProxyUrl(config.upstreamProxy), source: 'config', noProxy };
+    return use(parseProxyUrl(config.upstreamProxy), 'config');
   }
   const candidates = [
     ['HTTPS_PROXY', env.HTTPS_PROXY], ['https_proxy', env.https_proxy],
     ['ALL_PROXY', env.ALL_PROXY], ['all_proxy', env.all_proxy],
   ];
   for (const [name, value] of candidates) {
-    if (value) return { proxy: parseProxyUrl(value), source: `env:${name}`, noProxy };
+    if (value) return use(parseProxyUrl(value), `env:${name}`);
   }
   return { proxy: null, source: 'none', noProxy };
+}
+
+/** How a dropped self-proxy reads in a log line or the TUI. */
+export function describeSelfProxy(resolved) {
+  if (!resolved || resolved.source !== 'self') return null;
+  const { proxy, source } = resolved.ignored;
+  const from = source.startsWith('env:') ? source.slice(4) : 'the config';
+  return `ignored ${describeProxy(proxy)} from ${from} — that address is this server`;
 }
 
 // ── Process-wide state ───────────────────────────────────────

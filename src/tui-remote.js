@@ -1,4 +1,5 @@
 import { TUI } from './tui.js';
+import { SessionTitles } from './session-titles.js';
 import { modelGlobMatches } from './model.js';
 
 // Attach mode — the dashboard against a server running somewhere else (a
@@ -141,12 +142,30 @@ export class RemoteAccountManager {
     this.accounts = [];
     this.currentIndex = -1;
     this.switchThreshold = 0.98;
+    // The per-bucket table when the server sent one, so the attached dashboard
+    // marks the same families blocked as the server's own TUI does.
+    this.switchThresholds = null;
     this.distributeSessions = false;
     this.routes = [];
     this.sessions = { active: 0, known: 0, perAccount: {} };
     this.connected = false;   // false ⇒ the view is a stale snapshot
     this.lastError = null;
     this.status = null;
+  }
+
+  /** Per-bucket threshold lookup, mirroring AccountManager.thresholdFor so the
+   * shared renderer works against either. */
+  thresholdFor(bucket) {
+    const t = this.switchThresholds;
+    if (t && typeof t === 'object') {
+      const v = t[bucket] ?? t.default;
+      if (typeof v === 'number' && Number.isFinite(v)) return v;
+    }
+    return typeof this.switchThreshold === 'number' ? this.switchThreshold : 0.98;
+  }
+
+  get effectiveThreshold() {
+    return this.thresholdFor('default');
   }
 
   applyStatus(status) {
@@ -165,6 +184,7 @@ export class RemoteAccountManager {
     // marked current, which is the truth, rather than defaulting to the first row.
     this.currentIndex = this.accounts.findIndex(a => a.name === status?.currentAccount);
     if (status?.switchThreshold != null) this.switchThreshold = status.switchThreshold;
+    this.switchThresholds = status?.switchThresholds || null;
 
     const sessions = status?.sessions || {};
     this.sessions = {
@@ -234,6 +254,10 @@ export function createAttachSession({ control, config, onQuit, pollMs = DEFAULT_
     accountManager: am,
     config,
     remote: true,
+    // Titles come from this machine's Claude Code sessions. Attaching to a
+    // server on another host leaves the ids unresolved, which shows the short
+    // id rather than a wrong name.
+    sessionTitles: new SessionTitles(config?.sessionTitles),
     // Every screen that writes config is unreachable in attach mode; if one ever
     // becomes reachable, this fails loudly instead of silently dropping a save.
     saveConfig: async () => { throw new Error('attach mode cannot write config'); },

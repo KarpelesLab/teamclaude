@@ -35,6 +35,14 @@ test('renderStatus prints core status', () => {
   assert.match(output, /2 req, 1.5k tok/);
 });
 
+test('renderStatus shows an OAuth entitlement cooldown separately from account status', () => {
+  const status = sampleStatus();
+  status.accounts[0].entitlementDeniedUntil = new Date(now + 4 * 60_000).toISOString();
+  const output = renderStatus(status, { color: false, now });
+
+  assert.match(output, /active \/ entitlement cooldown 4m/);
+});
+
 test('renderStatus shows the sessions line and per-account session count when present', () => {
   const status = sampleStatus();
   status.sessions = { known: 3, active: 2, perAccount: { 0: 2 }, distribute: true };
@@ -42,6 +50,20 @@ test('renderStatus shows the sessions line and per-account session count when pr
   const output = renderStatus(status, { color: false, now });
   assert.match(output, /Sessions\s+2 active \/ 3 known · distributing/);
   assert.match(output, /a \(oauth, prio 0\).*2 sess/);
+});
+
+test('renderStatus reports a draining distribution toggle instead of single-account', () => {
+  const status = sampleStatus();
+  status.sessions = { known: 3, active: 2, perAccount: { 0: 2 }, distribute: false, draining: 2 };
+  const output = renderStatus(status, { color: false, now });
+  assert.match(output, /Sessions\s+2 active \/ 3 known · draining 2/);
+});
+
+test('renderStatus says single-account once the drain has finished', () => {
+  const status = sampleStatus();
+  status.sessions = { known: 3, active: 2, perAccount: { 0: 2 }, distribute: false, draining: 0 };
+  const output = renderStatus(status, { color: false, now });
+  assert.match(output, /Sessions\s+2 active \/ 3 known · single-account/);
 });
 
 test('renderStatus omits the sessions line when the status has no sessions field', () => {

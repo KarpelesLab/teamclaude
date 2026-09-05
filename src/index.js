@@ -8,7 +8,7 @@ import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConf
 import { installCrashHandlers } from './crash-log.js';
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
-import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
+import { importCredentials, loginOAuth, loginOAuthWithPastedCode, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import {
   sameIdentity,
   orgKey,
@@ -27,14 +27,17 @@ import { ensureCerts } from './mitm.js';
 import { Prober } from './prober.js';
 import { Warmer } from './warmer.js';
 import { TUI } from './tui.js';
+import { SessionTitles } from './session-titles.js';
 import { RemoteControl, createAttachSession } from './tui-remote.js';
 import { SxManager } from './sx.js';
 import { autoUpdate, checkForUpdate, currentVersion, runUpdate, installKind, PKG_NAME } from './updater.js';
 import { renderStatus } from './status-renderer.js';
+import { sanitizeText } from './safe-text.js';
+import { ClientUsageTracker } from './client-usage.js';
 import { buildClaudeEnvLines, encodePinComponent } from './claude-env.js';
 import { serviceKind, installService, uninstallService, serviceStatus, renderService, logPath } from './service.js';
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
-import { getUpstreamProxy, describeProxy } from './upstream-proxy.js';
+import { getUpstreamProxy, describeProxy, describeSelfProxy } from './upstream-proxy.js';
 
 // These constants are referenced by routeCommand, which the dispatch below
 // reaches through a top-level `await`. The await suspends module evaluation at
@@ -207,6 +210,10 @@ async function serverCommand() {
 
   const threshold = config.switchThreshold || 0.98;
   const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp, distributeSessions: config.distributeSessions });
+  // Names the activity log's session column from Claude Code's own on-disk
+  // session titles. Built whether or not the TUI runs, so a reload has one
+  // object to reconfigure.
+  const sessionTitles = new SessionTitles(config.sessionTitles);
 
   // Restore quota observed in a previous run so a restart doesn't lose rotation
   // state (passive — we never call the API to re-learn it). Stale windows are
@@ -217,13 +224,18 @@ async function serverCommand() {
   });
   if (savedState?.quota) accountManager.restoreQuotaState(savedState.quota);
 
+  // Per-client usage (proxy.clientKeys). Restored alongside quota so the
+  // per-client counters survive a restart the same way rotation state does.
+  const clientUsage = new ClientUsageTracker();
+  if (savedState?.clients) clientUsage.restore(savedState.clients);
+
   // With quota restored, pick the best account up front (highest priority /
   // soonest-resetting weekly window) instead of defaulting to the first one.
   accountManager.selectActiveAccount();
 
   // Periodically persist quota (and once more on shutdown) to the state file.
   const persistQuotaState = () =>
-    saveState({ quota: accountManager.exportQuotaState() })
+    saveState({ quota: accountManager.exportQuotaState(), clients: clientUsage.export() })
       .catch(err => console.error(`[TeamClaude] Failed to save quota state: ${err.message}`));
   let quotaSaveInterval = null;
 
@@ -293,6 +305,15 @@ async function serverCommand() {
     const diskConfig = await loadConfig();
     if (!diskConfig) return 0;
     const added = await syncAccountsFromDisk(diskConfig, config, accountManager);
+    // Pick up client-key edits (proxy.clientKeys is read live by both auth
+    // gates through the shared config object, so refreshing it here is all a
+    // key add/rotate/revoke needs — no restart).
+    if (config.proxy && diskConfig.proxy) {
+      config.proxy.clientKeys = diskConfig.proxy.clientKeys;
+      // The shared key is read per request too, so a rotated key on disk
+      // takes effect on reload the same way.
+      config.proxy.apiKey = diskConfig.proxy.apiKey;
+    }
     // Pick up route table edits (teamclaude route …, TUI editor, or a hand edit).
     config.routes = diskConfig.routes || [];
     accountManager.setRoutes(config.routes);
@@ -300,6 +321,8 @@ async function serverCommand() {
     // way routes, sx, probe and warmup are picked up below.
     config.distributeSessions = !!diskConfig.distributeSessions;
     accountManager.setDistributeSessions(config.distributeSessions);
+    config.sessionTitles = diskConfig.sessionTitles;
+    sessionTitles.configure(config.sessionTitles);
     // Apply an sx.org key/mode change made on disk (e.g. via POST /teamclaude/reload).
     const diskSxKey = diskConfig.sx?.apiKey || null;
     const diskSxMode = diskConfig.sx?.mode || 'always';
@@ -330,7 +353,7 @@ async function serverCommand() {
 
   if (useTUI) {
     tui = new TUI({
-      accountManager, config, sx, activityLogPath,
+      accountManager, config, sx, activityLogPath, sessionTitles,
       saveConfig: () => atomicConfigUpdate(async diskConfig => {
         diskConfig.accounts = mergeAccountsForSave(config.accounts, accountManager.accounts, diskConfig.accounts);
         // Persist sx.org settings (set/cleared from the TUI settings screen).
@@ -344,6 +367,7 @@ async function serverCommand() {
         // the edit never reached disk and was silently undone by the next start.
         if (config.eventLogging != null) diskConfig.eventLogging = config.eventLogging;
         if (config.blockedModels != null) diskConfig.blockedModels = config.blockedModels;
+        if (config.sessionTitles != null) diskConfig.sessionTitles = config.sessionTitles;
         // Persist the route table (edited from the TUI routes screen).
         if (config.routes != null) diskConfig.routes = config.routes;
       }),
@@ -370,8 +394,11 @@ async function serverCommand() {
     aStream.on('error', err => process.stderr.write(`[TeamClaude] activity log error: ${err.message}\n`));
     const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
     const writeActivity = msg => {
-      // Strip [TeamClaude] prefix to match TUI behaviour
-      aStream.write(`${ts()}  ${msg.replace(/^\[TeamClaude\]\s*/, '')}\n`);
+      // Strip [TeamClaude] prefix to match TUI behaviour. Sanitized because a
+      // log line is one line: a value carrying a newline would otherwise write
+      // a second entry that reads as genuine, and this file is what deployments
+      // join against to attribute traffic to a person.
+      aStream.write(`${ts()}  ${sanitizeText(msg.replace(/^\[TeamClaude\]\s*/, ''))}\n`);
     };
     // Capture request completions via the hook
     const inFlight = new Map();
@@ -391,8 +418,9 @@ async function serverCommand() {
       const acct = info.account || r?.account || '?';
       const model = info.model ? ` (${info.model})` : '';
       const sid = info.sessionId ? `${info.sessionId.slice(0, 6)} ` : '';
+      const client = (info.client || r?.client) ? `[${info.client || r.client}] ` : '';
       const pin = (info.pinned || r?.pinned) ? ' [pin]' : '';
-      writeActivity(`${sid}${info.method} ${info.path}${model} → ${acct}${pin} (${info.status}, ${dur}s)`);
+      writeActivity(`${client}${sid}${info.method} ${info.path}${model} → ${acct}${pin} (${info.status}, ${dur}s)`);
     };
     // Tee console output to the activity log as well
     const origLog = console.log;
@@ -409,6 +437,8 @@ async function serverCommand() {
     // blocklist editor shows up in `status` immediately, the same way the
     // per-request gate in server.js picks it up.
     blockedModels: [...(config.blockedModels || [])],
+    // Per-client usage (proxy.clientKeys) — empty object when unconfigured.
+    clients: clientUsage.export(),
     server: {
       startedAt: new Date(serverStartedAt).toISOString(),
       uptimeSeconds: Math.round((Date.now() - serverStartedAt) / 1000),
@@ -443,7 +473,7 @@ async function serverCommand() {
     },
   });
 
-  const server = createProxyServer(accountManager, config, hooks, sx);
+  const server = createProxyServer(accountManager, config, hooks, sx, clientUsage);
   // Catch bind-time errors (e.g. EADDRINUSE) only. Once the socket is bound we
   // remove this handler so a later runtime 'error' isn't misreported as a
   // listen failure and exit the whole proxy.
@@ -462,6 +492,10 @@ async function serverCommand() {
     if (egressProxy.proxy) {
       const via = egressProxy.source.startsWith('env:') ? ` (from ${egressProxy.source.slice(4)})` : '';
       console.log(`[TeamClaude] Upstream proxy: ${describeProxy(egressProxy.proxy)}${via}`);
+    } else if (egressProxy.source === 'self') {
+      // Almost always a shell that ran `eval "$(teamclaude env)"` before starting
+      // the server. Silently going direct is right; saying nothing is not.
+      console.log(`[TeamClaude] Upstream proxy: direct — ${describeSelfProxy(egressProxy)}`);
     }
     if (tui) {
       tui.start();
@@ -591,6 +625,10 @@ async function loginCommand() {
     await loginApiCommand();
     return;
   }
+  if (args.includes('--token')) {
+    await loginOAuthCommand({ pasteOnly: true });
+    return;
+  }
   if (args.includes('--oauth')) {
     await loginOAuthCommand();
     return;
@@ -644,14 +682,14 @@ async function loginApiCommand() {
   console.log(`Saved to ${getConfigPath()}`);
 }
 
-async function loginOAuthCommand() {
+async function loginOAuthCommand({ pasteOnly = false } = {}) {
   const config = await loadOrCreateConfig();
   let name = argValue('--name');
 
   console.log('Starting OAuth login...');
   let creds;
   try {
-    creds = await loginOAuth();
+    creds = pasteOnly ? await loginOAuthWithPastedCode() : await loginOAuth();
   } catch (err) {
     console.error(`OAuth login failed: ${err.message}`);
     console.error('');
@@ -1502,6 +1540,7 @@ Commands:
   server              Start the proxy server (default; --headless to skip the TUI)
   import              Import credentials from Claude Code
   login               OAuth login via browser
+  login --token       OAuth login via copy/paste (no local callback; for headless/remote)
   login --api         Add an API key account
   env [--no-mitm]     Print export lines to point Claude Code at the proxy, for
                       'eval "$(teamclaude env)"' (MITM forward-proxy by default;

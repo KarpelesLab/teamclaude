@@ -1,4 +1,5 @@
 import { findFamilyBlock, modelGlobOverlaps } from './model.js';
+import { safeLine } from './safe-text.js';
 
 const ESC = '\x1b[';
 const RESET = `${ESC}0m`;
@@ -42,12 +43,52 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
     }
     const routing = modelRoutingLine(account, status.switchThreshold, blocked, now, paint);
     if (routing) lines.push(`  ${routing}`);
+    const why = unavailableLine(account, paint);
+    if (why) lines.push(`  ${why}`);
     lines.push(`  ${paint.dim('Usage'.padEnd(8))} ${formatUsage(account.usage, now)}`);
     lines.push(`  ${paint.dim('Probe'.padEnd(8))} ${formatAccountProbe(account.name, probe, now, paint)}`);
     lines.push('');
   }
 
+  // Per-client usage (proxy.clientKeys) — only when something was attributed,
+  // so deployments without client keys see no empty section.
+  const clients = Object.entries(status.clients || {});
+  if (clients.length) {
+    lines.push(paint.bold('Clients'));
+    clients.sort(([, a], [, b]) => ((b.inputTokens || 0) + (b.outputTokens || 0)) - ((a.inputTokens || 0) + (a.outputTokens || 0)));
+    for (const [name, c] of clients) {
+      const tokens = `${formatNumber(c.inputTokens)} in / ${formatNumber(c.outputTokens)} out`;
+      const last = parseTs(c.lastUsed);
+      const lastText = last ? `, last ${formatAgo(last, now)}` : '';
+      lines.push(`  ${paint.cyan(safeLine(name).padEnd(20))} ${c.requests || 0} req, ${tokens}${lastText}`);
+    }
+    lines.push('');
+  }
+
   return lines.join('\n').trimEnd();
+}
+
+// Why an account is out of rotation, in the operator's terms. Reading
+// `unifiedStatus: allowed` next to an account that refuses everything used to
+// leave no way to tell whether the refusal was upstream's or the proxy's own
+// threshold policy (#166); this says which.
+const UNAVAILABLE_TEXT = {
+  disabled: 'disabled by operator',
+  throttled: 'upstream 429 hold',
+  exhausted: 'marked exhausted',
+  error: 'account error (see logs)',
+  'upstream-rejected': 'upstream reports quota rejected',
+  quota: 'local switch threshold reached',
+  route: 'no route allows this account',
+  'advisor-quota': "advisor model's weekly bucket spent",
+  'advisor-route': 'no route allows the advisor model',
+};
+
+export function unavailableLine(account, paint) {
+  const reason = account?.unavailable;
+  if (!reason) return null;
+  const text = UNAVAILABLE_TEXT[reason] || reason;
+  return `${paint.dim('Blocked'.padEnd(8))} ${paint.yellow(text)}`;
 }
 
 function colors(enabled) {
@@ -111,11 +152,17 @@ function renderAccountHeader(account, currentAccount, paint, now) {
   return `${marker} ${name} ${paint.dim(`(${account.type}, prio ${account.priority || 0})`)} ${status}${org}${sess}`;
 }
 
-// "2 active / 3 known · distributing" — the running-sessions readout.
+// "2 active / 3 known · distributing" — the running-sessions readout. While a
+// distribution toggle drains, say so and how many sessions are left to finish,
+// so "single-account" is not claimed before it is actually true.
 function formatSessions(sessions, paint) {
   const active = sessions.active || 0;
   const known = sessions.known || 0;
-  const mode = sessions.distribute ? paint.green('distributing') : paint.dim('single-account');
+  const draining = sessions.draining || 0;
+  let mode;
+  if (sessions.distribute) mode = paint.green('distributing');
+  else if (draining) mode = paint.yellow(`draining ${draining}`);
+  else mode = paint.dim('single-account');
   return `${active} active / ${known} known ${paint.dim('·')} ${mode}`;
 }
 
@@ -136,6 +183,11 @@ function formatAccountStatus(account, now, paint) {
   const throttleAt = parseTs(account.rateLimitedUntil);
   if (throttleAt && throttleAt > now) {
     parts.push(`throttle ${formatDuration(throttleAt - now)}`);
+  }
+
+  const entitlementAt = parseTs(account.entitlementDeniedUntil);
+  if (entitlementAt && entitlementAt > now) {
+    parts.push(paint.yellow(`entitlement cooldown ${formatDuration(entitlementAt - now)}`));
   }
 
   return parts.join(' / ');
@@ -256,10 +308,6 @@ function formatAccountProbe(accountName, probe, now, paint) {
   const duration = typeof row.durationMs === 'number' ? `, ${Math.round(row.durationMs)}ms` : '';
   const error = row.error ? `, ${safeLine(row.error)}` : '';
   return `${status}${when}${duration}${error}`;
-}
-
-function safeLine(value) {
-  return String(value).replace(/\x1b\[[0-?]*[ -/]*[@-~]|\p{C}/gu, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
 }
 
 function formatUsage(usage = {}, now) {
