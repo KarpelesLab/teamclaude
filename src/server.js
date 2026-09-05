@@ -1961,10 +1961,6 @@ function extractUsageFromBody(buffer, accountIndex, accountManager, onUsage = nu
   }
 }
 
-// Rewrite the `model` field in a JSON request body using a per-account map.
-// Returns the original buffer unchanged if the model isn't in the map or the
-// body isn't valid JSON, so non-messages endpoints pass through safely.
-// Exported for tests.
 // Remove top-level fields from a JSON request body (see stripRequestFields).
 // Returns the original buffer when nothing changed or the body isn't JSON, so
 // non-messages endpoints pass through untouched. Exported for tests.
@@ -1980,6 +1976,10 @@ export function stripBodyFields(body, fields) {
   return body;
 }
 
+// Rewrite the `model` field in a JSON request body using a per-account map.
+// Returns the original buffer unchanged if the model isn't in the map or the
+// body isn't valid JSON, so non-messages endpoints pass through safely.
+// Exported for tests.
 export function rewriteModel(body, modelMap) {
   try {
     const obj = JSON.parse(body.toString('utf8'));

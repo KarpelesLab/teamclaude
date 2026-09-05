@@ -67,6 +67,7 @@ Volatile runtime state (observed quota) is written separately to `teamclaude.sta
 | `accounts[].disabled` | If `true`, the account is excluded from rotation until re-enabled |
 | `accounts[].upstream` | Alternative upstream base URL for this account (e.g. `https://api.deepseek.com/anthropic`). Overrides the global `upstream` for this account only — see [third-party backends](accounts.md#third-party-backend-accounts) |
 | `accounts[].modelMap` | Object mapping Anthropic model names to this backend's model names (e.g. `{"claude-sonnet-4-6": "deepseek-v4-pro[1m]"}`). Applied automatically when requests are routed to this account |
+| `accounts[].stripRequestFields` | Array of **top-level** request-body fields to drop before forwarding to this account. For third-party upstreams that implement the Anthropic message API but reject fields Claude Code sends (e.g. `["context_management"]`, which some return a `400 Extra inputs are not permitted` for — breaking every request once that account is selected). Applies to this account only; Anthropic accounts are untouched |
 | `accounts[].models` | **Deprecated** — use a [`routes`](routing.md#model-routes) entry with `match` and `accounts` instead. Array of model names this account exclusively handles; kept for backward compatibility with pre-routes configs |
 
 ## Environment variables
