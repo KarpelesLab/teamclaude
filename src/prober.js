@@ -10,10 +10,11 @@
 import { fetchUsage } from './oauth.js';
 
 export class Prober {
-  constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, timeoutMs = 10_000, log = console.log } = {}) {
+  constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, profileFn = null, timeoutMs = 10_000, log = console.log } = {}) {
     this.am = accountManager;
     this.intervalMs = intervalMs;
     this.probeFn = probeFn;
+    this.profileFn = profileFn;
     this.timeoutMs = timeoutMs;
     this.log = log;
     this.timer = null;
@@ -93,6 +94,12 @@ export class Prober {
       }
 
       this.am.applyUsageData(account.index, usage);
+      const missingTier = !account.rateLimitTier && !account.seatTier
+        && account.hasClaudeMax == null && account.hasClaudePro == null;
+      if (missingTier && this.profileFn) {
+        const profile = await this._withTimeout(this.profileFn(account.credential));
+        this.am.applyProfileData(account.index, profile);
+      }
       const finishedAt = Date.now();
       this._recordAccount(account, {
         status: 'ok',

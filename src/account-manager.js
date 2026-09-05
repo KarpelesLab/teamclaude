@@ -2,6 +2,7 @@ import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired } from './oauth
 import { sameIdentity } from './identity.js';
 import { weeklyBucketForModel, modelGlobMatches, modelFamily, gatingUtilization } from './model.js';
 import { SessionTracker } from './session-tracker.js';
+import { buildQuotaSummary } from './quota-summary.js';
 
 // Re-exported for callers that import these model helpers from here.
 export { isFableModel, parseRequestModel, parseAdvisorModel } from './model.js';
@@ -98,6 +99,11 @@ function makeAccount(acct, index) {
     accountUuid: acct.accountUuid || null,
     orgUuid: acct.orgUuid || null,
     orgName: acct.orgName || null,
+    organizationType: acct.organizationType || null,
+    rateLimitTier: acct.rateLimitTier || null,
+    seatTier: acct.seatTier || null,
+    hasClaudeMax: acct.hasClaudeMax ?? null,
+    hasClaudePro: acct.hasClaudePro ?? null,
     priority: acct.priority || 0,
     disabled: acct.disabled || false,
     upstream: acct.upstream || null,
@@ -1718,6 +1724,15 @@ export class AccountManager {
     }
   }
 
+  /** Apply subscription metadata learned from the OAuth profile endpoint. */
+  applyProfileData(accountIndex, profile) {
+    const account = this.accounts[accountIndex];
+    if (!account || !profile || profile.error) return;
+    for (const field of ['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro']) {
+      if (profile[field] != null) account[field] = profile[field];
+    }
+  }
+
   /**
    * Mark an account as rate-limited for a given duration.
    */
@@ -1909,7 +1924,14 @@ export class AccountManager {
     return this.accounts.map(a => {
       const quota = {};
       for (const f of PERSISTED_QUOTA_FIELDS) quota[f] = a.quota[f];
-      return { accountUuid: a.accountUuid, orgUuid: a.orgUuid, orgName: a.orgName, name: a.name, quota };
+      const profile = {
+        organizationType: a.organizationType,
+        rateLimitTier: a.rateLimitTier,
+        seatTier: a.seatTier,
+        hasClaudeMax: a.hasClaudeMax,
+        hasClaudePro: a.hasClaudePro,
+      };
+      return { accountUuid: a.accountUuid, orgUuid: a.orgUuid, orgName: a.orgName, name: a.name, profile, quota };
     });
   }
 
@@ -1925,6 +1947,9 @@ export class AccountManager {
       if (!match || !match.quota) continue;
       for (const f of PERSISTED_QUOTA_FIELDS) {
         if (match.quota[f] != null) account.quota[f] = match.quota[f];
+      }
+      for (const field of ['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro']) {
+        if (match.profile?.[field] != null) account[field] = match.profile[field];
       }
       // We already know this account's weekly window, so it isn't "probing".
       if (account.quota.unified7dReset != null) account.probing = false;
@@ -1977,5 +2002,11 @@ export class AccountManager {
           : null,
       })),
     };
+  }
+
+  /** Return per-account quota and fleet aggregates for status clients. */
+  getQuotaSummary() {
+    this.refreshExpiredQuotas();
+    return buildQuotaSummary(this.accounts);
   }
 }

@@ -26,6 +26,7 @@ import * as alias from './alias.js';
 import { ensureCerts } from './mitm.js';
 import { Prober } from './prober.js';
 import { Warmer } from './warmer.js';
+import { createRollingWarmupSchedule, formatWarmupScheduleConfirmation, resolveWarmupConfig, resolveWarmupSchedule } from './warmup-schedule.js';
 import { TUI } from './tui.js';
 import { SessionTitles } from './session-titles.js';
 import { RemoteControl, createAttachSession } from './tui-remote.js';
@@ -283,7 +284,7 @@ async function serverCommand() {
 
   // Opt-in background quota probe (config.quotaProbeSeconds, default 0 = off).
   let prober = null;
-  // Opt-in keep-warm scheduler (config.warmupSeconds, default 0 = off).
+  // Opt-in keep-warm scheduler (interval or persisted reset-target schedule).
   let warmer = null;
   const serverStartedAt = Date.now();
 
@@ -339,10 +340,18 @@ async function serverCommand() {
       }
     }
     if (warmer) {
+      const diskSchedule = diskConfig.warmupSchedule || null;
       const ms = (diskConfig.warmupSeconds || 0) * 1000;
-      if (ms !== warmer.intervalMs) {
-        config.warmupSeconds = diskConfig.warmupSeconds || 0;
+      if (diskSchedule) {
+        // Validate and arm before publishing the disk value to live readers. A
+        // bad hand edit leaves the prior schedule intact and makes reload fail.
+        warmer.rescheduleSchedule(diskSchedule);
+        config.warmupSchedule = diskSchedule;
+        config.warmupSeconds = 0;
+      } else if (config.warmupSchedule || ms !== warmer.intervalMs) {
         warmer.reschedule(ms);
+        delete config.warmupSchedule;
+        config.warmupSeconds = diskConfig.warmupSeconds || 0;
       }
     }
     return added;
@@ -472,6 +481,7 @@ async function serverCommand() {
       })),
     },
   });
+  hooks.getQuotaExtra = () => ({ warmup: resolveWarmupConfig(config) });
 
   const server = createProxyServer(accountManager, config, hooks, sx, clientUsage);
   // Catch bind-time errors (e.g. EADDRINUSE) only. Once the socket is bound we
@@ -531,14 +541,17 @@ async function serverCommand() {
   quotaSaveInterval.unref?.();
 
   // Start the opt-in quota probe (no-op when quotaProbeSeconds is 0).
-  prober = new Prober(accountManager, { intervalMs: (config.quotaProbeSeconds || 0) * 1000 });
+  prober = new Prober(accountManager, {
+    intervalMs: (config.quotaProbeSeconds || 0) * 1000,
+    profileFn: fetchProfile,
+  });
   prober.start();
 
-  // Start the opt-in keep-warm scheduler (no-op when warmupSeconds is 0). It
-  // spawns a minimal `claude` per idle account through this proxy, pinned via
-  // /tc-acct/<index>, so needs our own port and proxy key.
+  // Start the opt-in keep-warm scheduler. Interval mode runs relative to server
+  // startup; reset-target modes restore their next occurrence from config.
   warmer = new Warmer(accountManager, {
     intervalMs: (config.warmupSeconds || 0) * 1000,
+    schedule: config.warmupSchedule || null,
     port,
     apiKey: config.proxy?.apiKey,
   });
@@ -1063,6 +1076,9 @@ async function accountsCommand() {
       if (p.accountUuid && a.accountUuid !== p.accountUuid) { a.accountUuid = p.accountUuid; touched = true; }
       if (p.orgUuid && a.orgUuid !== p.orgUuid) { a.orgUuid = p.orgUuid; touched = true; }
       if (p.orgName && a.orgName !== p.orgName) { a.orgName = p.orgName; touched = true; }
+      for (const field of ['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro']) {
+        if (p[field] != null && a[field] !== p[field]) { a[field] = p[field]; touched = true; }
+      }
     }
     const uuid = a.accountUuid;
     if (!uuid) continue;
@@ -1287,11 +1303,47 @@ async function warmupCommand() {
   const arg = args[1];
 
   if (arg === undefined) {
+    if (config.warmupSchedule) {
+      console.log(formatWarmupScheduleConfirmation(config.warmupSchedule));
+      return;
+    }
     const cur = config.warmupSeconds || 0;
     console.log(cur > 0 ? `Keep-warm: every ${cur}s` : 'Keep-warm: off');
-    console.log('Set with: teamclaude warmup <off|seconds>   e.g. teamclaude warmup 600');
+    console.log('Set with: teamclaude warmup <off|seconds>');
+    console.log('          teamclaude warmup reset HH:MM --timezone Area/City');
+    console.log('          teamclaude warmup rolling HH:MM --timezone Area/City');
     console.log('Note: warming spawns a minimal `claude` per idle account and DOES spend a little quota');
     console.log('(unlike the passive quota probe). It only warms accounts whose 5h window is idle.');
+    return;
+  }
+
+  if (arg === 'reset' || arg === 'rolling') {
+    const resetTime = args[2];
+    const timezoneFlag = args.indexOf('--timezone', 3);
+    const timezone = timezoneFlag >= 0 ? args[timezoneFlag + 1] : null;
+    if (!resetTime || !timezone || args.length !== 5 || timezoneFlag !== 3) {
+      console.error(`Usage: teamclaude warmup ${arg} HH:MM --timezone Area/City`);
+      process.exit(1);
+    }
+    const schedule = { resetTime, timezone };
+    try {
+      if (arg === 'rolling') {
+        config.warmupSchedule = createRollingWarmupSchedule(schedule);
+      } else {
+        const resolved = resolveWarmupSchedule(schedule);
+        config.warmupSchedule = {
+          resetTime: resolved.resetTime,
+          timezone: resolved.timezone,
+        };
+      }
+    } catch (err) {
+      console.error(err.message);
+      process.exit(1);
+    }
+    config.warmupSeconds = 0;
+    await saveConfig(config);
+    console.log(formatWarmupScheduleConfirmation(config.warmupSchedule));
+    await notifyRunningServer(config);
     return;
   }
 
@@ -1311,6 +1363,7 @@ async function warmupCommand() {
   }
 
   config.warmupSeconds = seconds;
+  delete config.warmupSchedule;
   await saveConfig(config);
   console.log(seconds > 0
     ? `Keep-warm set to every ${seconds}s (spawns a minimal \`claude\` per idle account; spends a little quota).`
@@ -1575,8 +1628,11 @@ Commands:
   probe [off|secs]    Opt-in background quota refresh for idle accounts
                       (off by default; reads usage endpoint, spends no quota)
   warmup [off|secs]   Opt-in: keep idle accounts' 5h timers running by sending
-                      a minimal claude request to each (off by default; spends
-                      a little quota, unlike probe)
+                      a minimal claude request to each (spends a little quota)
+  warmup reset HH:MM --timezone Area/City
+                      Schedule daily warm-up for a target reset in an IANA zone
+  warmup rolling HH:MM --timezone Area/City
+                      Anchor a continuous five-hour reset cadence in an IANA zone
   api <path>          Call an API endpoint with account credentials
   update              Check npm for a newer teamclaude and install it
   version             Print the installed version
@@ -1681,6 +1737,11 @@ async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
     type: 'oauth',
     source,
     ...oauthIdentityFields(profile),
+    organizationType: profile?.organizationType || null,
+    rateLimitTier: profile?.rateLimitTier || creds.rateLimitTier || null,
+    seatTier: profile?.seatTier || null,
+    hasClaudeMax: profile?.hasClaudeMax ?? null,
+    hasClaudePro: profile?.hasClaudePro ?? null,
     accessToken: creds.accessToken,
     refreshToken: creds.refreshToken,
     expiresAt: creds.expiresAt,

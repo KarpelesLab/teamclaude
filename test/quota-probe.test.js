@@ -279,6 +279,26 @@ test('prober probes oauth accounts and applies the usage data', async () => {
   assert.equal(am.accounts[0].quota.unified7d, 0.2);
 });
 
+test('prober learns missing quota tier metadata with the first quota refresh', async () => {
+  const am = new AccountManager([oauth('a')], 0.98);
+  const prober = new Prober(am, {
+    intervalMs: 0,
+    probeFn: async () => ({ sevenDay: { utilization: 0.2, resetAt: 2000 } }),
+    profileFn: async () => ({
+      organizationType: 'claude_team', rateLimitTier: 'default_raven',
+      seatTier: 'team_standard', hasClaudeMax: true, hasClaudePro: false,
+    }),
+    log: () => {},
+  });
+
+  await prober.probeAll();
+
+  assert.equal(am.accounts[0].organizationType, 'claude_team');
+  assert.equal(am.accounts[0].rateLimitTier, 'default_raven');
+  assert.equal(am.accounts[0].seatTier, 'team_standard');
+  assert.equal(am.getQuotaSummary().accounts[0].tier.weight, 1);
+});
+
 test('prober skips API-key accounts', async () => {
   const am = new AccountManager([{ name: 'k', type: 'apikey', apiKey: 'sk' }], 0.98);
   let calls = 0;

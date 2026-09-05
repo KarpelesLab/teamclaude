@@ -1096,6 +1096,11 @@ export class TUI {
       const entry = {
         name, type: 'oauth', source: 'import',
         ...oauthIdentityFields(profile),
+        organizationType: profile?.organizationType || null,
+        rateLimitTier: profile?.rateLimitTier || creds.rateLimitTier || null,
+        seatTier: profile?.seatTier || null,
+        hasClaudeMax: profile?.hasClaudeMax ?? null,
+        hasClaudePro: profile?.hasClaudePro ?? null,
         accessToken: creds.accessToken,
         refreshToken: creds.refreshToken,
         expiresAt: creds.expiresAt,
@@ -1126,6 +1131,9 @@ export class TUI {
           if (entry.accountUuid) amAcct.accountUuid = entry.accountUuid;
           if (entry.orgUuid) amAcct.orgUuid = entry.orgUuid;
           if (entry.orgName) amAcct.orgName = entry.orgName;
+          for (const field of ['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro']) {
+            amAcct[field] = entry[field];
+          }
           if (amAcct.status === 'error') amAcct.status = 'active';
         }
         this._addLog(`Updated account "${prev.name}"`);

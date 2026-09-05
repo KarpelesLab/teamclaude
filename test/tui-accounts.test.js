@@ -273,3 +273,24 @@ test('email-only profile re-import preserves known running identity', async () =
   assert.equal(am.accounts[0].orgName, 'Example');
   assert.equal(am.accounts[0].credential, 'fresh');
 });
+
+test('import stores quota tier metadata returned by the OAuth profile', async () => {
+  const { tui, config } = makeTUI({ accounts: [] });
+  const expiresAt = 1_900_000_000_000;
+  tui._readCredentials = async () => ({ accessToken: 'fresh', refreshToken: 'r', expiresAt });
+  tui._readProfile = async () => ({
+    email: 'team@x.com', accountUuid: 'u1', orgUuid: 'o1', orgName: 'Team',
+    organizationType: 'claude_team', rateLimitTier: 'default_raven', seatTier: 'team_standard',
+    hasClaudeMax: true, hasClaudePro: false,
+  });
+
+  await tui._doImport();
+
+  assert.deepEqual(config.accounts[0], {
+    name: 'team@x.com', type: 'oauth', source: 'import',
+    accountUuid: 'u1', orgUuid: 'o1', orgName: 'Team',
+    organizationType: 'claude_team', rateLimitTier: 'default_raven', seatTier: 'team_standard',
+    hasClaudeMax: true, hasClaudePro: false,
+    accessToken: 'fresh', refreshToken: 'r', expiresAt,
+  });
+});
