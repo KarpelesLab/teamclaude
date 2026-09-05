@@ -210,6 +210,22 @@ export function needsProxyClientCredential(credentials, now = Date.now()) {
   return normalizeExpiresAt(credentials.expiresAt) <= now;
 }
 
+/** Normalize the OAuth profile fields TeamClaude persists and exposes. */
+export function normalizeProfile(data) {
+  return {
+    accountUuid: data.account?.uuid,
+    email: data.account?.email,
+    name: data.account?.display_name,
+    orgUuid: data.organization?.uuid,
+    orgName: data.organization?.name,
+    organizationType: data.organization?.organization_type,
+    rateLimitTier: data.organization?.rate_limit_tier,
+    seatTier: data.organization?.seat_tier,
+    hasClaudeMax: data.account?.has_claude_max,
+    hasClaudePro: data.account?.has_claude_pro,
+  };
+}
+
 /**
  * Fetch account profile for an OAuth token.
  * Returns { email, name, orgName, orgType, ... } on success,
@@ -231,16 +247,7 @@ export async function fetchProfile(accessToken) {
       return { error: `HTTP ${res.status}${detail ? ': ' + detail : ''}` };
     }
     const data = await res.json();
-    return {
-      accountUuid: data.account?.uuid,
-      email: data.account?.email,
-      name: data.account?.display_name,
-      orgUuid: data.organization?.uuid,
-      orgName: data.organization?.name,
-      orgType: data.organization?.organization_type,
-      hasClaudeMax: data.account?.has_claude_max,
-      hasClaudePro: data.account?.has_claude_pro,
-    };
+    return normalizeProfile(data);
   } catch (err) {
     return { error: err.message || String(err) };
   }

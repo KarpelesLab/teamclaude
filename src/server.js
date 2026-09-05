@@ -238,6 +238,16 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         return;
       }
 
+      // Tier-weighted fleet quota for lightweight consumers such as a shell or
+      // Claude Code status line. Unlike /teamclaude/status this omits routing,
+      // usage counters and server diagnostics, and never reaches upstream.
+      if (req.method === 'GET' && req.url === '/teamclaude/quota') {
+        const extra = hooks.getQuotaExtra?.() || {};
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ...accountManager.getQuotaSummary(), ...extra }, null, 2));
+        return;
+      }
+
       // Reload endpoint — re-sync accounts from config without a restart. This
       // is the headless equivalent of pressing 'R' in the TUI. Local control
       // only (no upstream calls); the auth gate above already applies.

@@ -273,3 +273,29 @@ test('email-only profile re-import preserves known running identity', async () =
   assert.equal(am.accounts[0].orgName, 'Example');
   assert.equal(am.accounts[0].credential, 'fresh');
 });
+
+test('import stores quota tier metadata returned by the OAuth profile', async () => {
+  const { tui, config } = makeTUI({ accounts: [] });
+  const expiresAt = 1_900_000_000_000;
+  tui._readCredentials = async () => ({ accessToken: 'fresh', refreshToken: 'r', expiresAt });
+  tui._readProfile = async () => ({
+    email: 'team@x.com', accountUuid: 'u1', orgUuid: 'o1', orgName: 'Team',
+    organizationType: 'claude_team', rateLimitTier: 'default_raven', seatTier: 'team_standard',
+    hasClaudeMax: true, hasClaudePro: false,
+  });
+
+  await tui._doImport();
+
+  // The entry id is minted per entry and is not a tier field (#199), so it is
+  // checked for shape and set aside rather than pinned to a value the test
+  // cannot know. Everything else is compared exactly.
+  const { id, ...entry } = config.accounts[0];
+  assert.match(id, /^[0-9a-f-]{36}$/, 'a new entry is given an id');
+  assert.deepEqual(entry, {
+    name: 'team@x.com', type: 'oauth', source: 'import',
+    accountUuid: 'u1', orgUuid: 'o1', orgName: 'Team',
+    organizationType: 'claude_team', rateLimitTier: 'default_raven', seatTier: 'team_standard',
+    hasClaudeMax: true, hasClaudePro: false,
+    accessToken: 'fresh', refreshToken: 'r', expiresAt,
+  });
+});
