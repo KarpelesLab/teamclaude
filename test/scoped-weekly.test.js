@@ -30,7 +30,8 @@ test('every scoped weekly limit is read, keyed by the name upstream used', () =>
   assert.deepEqual(Object.keys(scoped).sort(), ['fable', 'opus']);
   assert.equal(scoped.fable.utilization, 0);
   assert.equal(scoped.opus.utilization, 0.95, 'percent is normalized to a 0-1 fraction');
-  assert.ok(scoped.opus.resetAt > Date.now(), 'reset parses to a timestamp');
+  assert.equal(scoped.opus.resetAt, Date.parse('2026-09-05T00:00:00Z'),
+    'reset parses to a timestamp');
 });
 
 test('unscoped and non-weekly entries are not mistaken for family buckets', () => {
