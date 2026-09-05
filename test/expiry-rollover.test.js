@@ -1364,6 +1364,37 @@ test('the session-reset switch routes by the request\'s own window', () => {
     'the switch installed an account the Fable picker excludes');
 });
 
+test('the session-reset switch admits on the order the pick uses', () => {
+  // Model-scoped availability beside an admission test and a tiebreak reading
+  // the raw shared weekly would admit or refuse a Fable request on a clock
+  // nothing else in the decision consulted. Here the Fable order is the same in
+  // both runs and only the shared clocks differ; a model-aware switch cannot
+  // tell them apart.
+  function fleetWith(sharedOnReset) {
+    const am = mgr(['cur', 'reset'], ON);
+    const now = Date.now();
+    // cur's shared weekly expires EARLY and its Fable weekly LATE; the candidate
+    // is the other way round, so the two clocks order the pair oppositely.
+    bucket(am, 0, 'unified7d', 0.5, 100, now);
+    bucket(am, 0, 'unified7dFable', 0.5, 300, now);
+    bucket(am, 1, 'unified7d', 0.5, sharedOnReset, now);
+    bucket(am, 1, 'unified7dFable', 0.5, 10, now);
+    assert.equal(am.setCurrentAccount(0), true);
+    am.accounts[1].quota.unified5h = 0.5;
+    am.accounts[1].quota.unified5hReset = now - 1000;
+    assert.equal(am._rankedReset(am.accounts[1], FABLE) < am._rankedReset(am.accounts[0], FABLE), true,
+      'the fixture must have the candidate ranking first for Fable');
+    am.refreshExpiredQuotas(FABLE);
+    return am.accounts[am.currentIndex].name;
+  }
+
+  // 200h: the candidate's SHARED weekly expires later than cur's, which is the
+  // only thing that differs from the run below.
+  assert.equal(fleetWith(200), 'reset',
+    'the switch refused a candidate its own ranking puts first');
+  assert.equal(fleetWith(50), 'reset', 'the aligned control did not switch');
+});
+
 test('with the knob OFF the switch is handed no model, whatever the request carries', () => {
   // THE CHEAPEST CONTROL FOR THE DEFAULT-OFF PROMISE, and it needs no base tree:
   // with the knob off the model argument cannot change anything, because the

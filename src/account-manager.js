@@ -1278,8 +1278,20 @@ export class AccountManager {
    * consulted. With the knob off it is `_governingWeeklyReset` unconditionally.
    */
   _rankedReset(account, model) {
-    if (!this.expiryRouting.enabled) return this._governingWeeklyReset(account, model) || -Infinity;
-    return this._governingWindow(account, model).resetAt || -Infinity;
+    return this._rankingReset(account, model) || -Infinity;
+  }
+
+  /**
+   * The same order, before the unknown-sorts-first coercion. The session-reset
+   * switch needs the order and not the coercion: it treats an account whose
+   * weekly it has never read as ineligible rather than as the soonest, the
+   * opposite of the probe bias a selection tiebreak wants. Both callers come
+   * through here so the two cannot rank on different clocks. Null means "not
+   * known here", never "resets at the epoch".
+   */
+  _rankingReset(account, model) {
+    if (!this.expiryRouting.enabled) return this._governingWeeklyReset(account, model);
+    return this._governingWindow(account, model).resetAt ?? null;
   }
 
   /**
@@ -1871,8 +1883,11 @@ export class AccountManager {
   _switchOnSessionReset(candidates, model = null) {
     const current = this.accounts[this.currentIndex];
     // Need a known weekly reset on the current account to compare against;
-    // if it is unknown we are still probing it, so leave it alone.
-    if (!current || current.quota.unified7dReset == null) return;
+    // if it is unknown we are still probing it, so leave it alone. Read through
+    // the ranking so the account is compared on the window that governs THIS
+    // request; with the knob off that is the shared weekly.
+    const currentReset = current && this._rankingReset(current, model);
+    if (!current || currentReset == null) return;
 
     // Only accounts whose weekly expires sooner than the current one's are
     // candidates: the "and weekly expires sooner" half of what this function is
@@ -1887,9 +1902,9 @@ export class AccountManager {
       if (!this._isAvailable(acc, model)) continue; // enough session & weekly quota left
       // Don't demote to a lower-priority (higher value) account on a reset.
       if ((acc.priority || 0) > (current.priority || 0)) continue;
-      const weekly = acc.quota.unified7dReset;
+      const weekly = this._rankingReset(acc, model);
       if (weekly == null) continue; // need a known weekly to compare
-      if (weekly < current.quota.unified7dReset) eligible.push(acc);
+      if (weekly < currentReset) eligible.push(acc);
     }
     if (!eligible.length) return;
 
@@ -1905,10 +1920,11 @@ export class AccountManager {
       if (!best) { best = acc; continue; }
       const mine = rankOf.get(acc.index);
       const theirs = rankOf.get(best.index);
-      // Highest pressure, then soonest reset — the same order the pick uses, so
-      // the two cannot disagree about which of two accounts is worth more.
+      // Highest pressure, then soonest reset — the same order the pick uses,
+      // through the same function, so the two cannot disagree about which of two
+      // accounts is worth more.
       if (mine < theirs
-        || (mine === theirs && acc.quota.unified7dReset < best.quota.unified7dReset)) best = acc;
+        || (mine === theirs && this._rankedReset(acc, model) < this._rankedReset(best, model))) best = acc;
     }
 
     // TWO guards, different properties, neither implying the other. Band
