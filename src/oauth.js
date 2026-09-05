@@ -67,22 +67,48 @@ export async function readKeychainCredentials({ exec = execFileAsync, username =
 
 /**
  * Import OAuth credentials from a Claude Code credentials file.
- * On macOS the default credentials location is the Keychain, not a file, so
- * when the default path is missing the Keychain is tried before giving up.
+ *
+ * On macOS Claude Code keeps its live login in the Keychain, and
+ * ~/.claude/.credentials.json — when it exists at all — is a snapshot from an
+ * earlier login that Claude Code never refreshes. So for the default path on
+ * darwin the Keychain is asked first, and the file is only the fallback for a
+ * Keychain that carries no token or cannot be read. Reading the file first made
+ * a days-old snapshot look like an expired login while Claude Code itself was
+ * still signed in. Any other path is a plain file read.
  */
 export async function importCredentials(filePath, {
   home = homedir(), platform = process.platform, readKeychain = readKeychainCredentials } = {}) {
   const resolvedPath = filePath.replace(/^~/, home);
-  let raw;
-  try {
-    raw = JSON.parse(await readFile(resolvedPath, 'utf-8'));
-  } catch (err) {
-    const isDefaultPath = resolvedPath === DEFAULT_CREDENTIALS_PATH.replace(/^~/, home);
-    if (err.code !== 'ENOENT' || platform !== 'darwin' || !isDefaultPath) throw err;
+  const isDefaultPath = resolvedPath === DEFAULT_CREDENTIALS_PATH.replace(/^~/, home);
+  const useKeychain = platform === 'darwin' && isDefaultPath;
+
+  let raw = null;
+  let keychainBlank = null; // a Keychain payload that parsed but carried no token
+  let keychainErr = null;
+  if (useKeychain) {
     try {
-      raw = await readKeychain();
-    } catch (kcErr) {
-      throw new Error(`${err.message}; macOS Keychain lookup for "${KEYCHAIN_SERVICE}" also failed: ${kcErr.message}`);
+      const payload = await readKeychain();
+      if (hasToken(payload)) raw = payload;
+      else keychainBlank = payload;
+    } catch (err) {
+      keychainErr = err;
+    }
+  }
+
+  if (!raw) {
+    try {
+      raw = JSON.parse(await readFile(resolvedPath, 'utf-8'));
+    } catch (err) {
+      if (!useKeychain || err.code !== 'ENOENT') throw err;
+      // No file either. A token-less Keychain payload still goes back to the
+      // caller, whose own "no credentials" reporting stays in charge; only a
+      // Keychain that could not be read at all is an error here.
+      if (keychainBlank) {
+        raw = keychainBlank;
+      } else {
+        const detail = keychainErr ? keychainErr.message : 'no item carried a token';
+        throw new Error(`${err.message}; macOS Keychain lookup for "${KEYCHAIN_SERVICE}" also failed: ${detail}`);
+      }
     }
   }
 
@@ -92,6 +118,9 @@ export async function importCredentials(filePath, {
     accessToken: data.accessToken,
     refreshToken: data.refreshToken,
     expiresAt: data.expiresAt,
+    // Only Claude Code's own store carries this; leave the key out rather than
+    // put an undefined one on every imported account.
+    ...(data.refreshTokenExpiresAt != null && { refreshTokenExpiresAt: data.refreshTokenExpiresAt }),
     subscriptionType: data.subscriptionType,
     rateLimitTier: data.rateLimitTier,
   };
@@ -204,10 +233,23 @@ export function isTokenExpired(expiresAt) {
   return Date.now() >= normalizeExpiresAt(expiresAt);
 }
 
+/**
+ * Whether Claude Code has to start in proxy credential mode (on the bootstrap
+ * key) because it has no usable OAuth of its own.
+ *
+ * "Usable" is deliberately loose. An access token that has already expired is
+ * fine as long as a refresh token is there: Claude Code refreshes the pair
+ * itself at startup, and the proxy relays that refresh untouched. Counting an
+ * expired access token as "no OAuth" put Claude Code into API-key mode — which
+ * drops subscription mode and disables Claude in Chrome — whenever the
+ * credentials it read were a stale snapshot. Only a missing, or itself
+ * expired, refresh token means Claude Code cannot sign in on its own.
+ */
 export function needsProxyClientCredential(credentials, now = Date.now()) {
-  if (!credentials?.accessToken) return true;
-  if (!credentials.expiresAt) return false;
-  return normalizeExpiresAt(credentials.expiresAt) <= now;
+  if (!credentials) return true;
+  const { accessToken, expiresAt, refreshToken, refreshTokenExpiresAt } = credentials;
+  const live = (token, expiry) => Boolean(token) && (!expiry || normalizeExpiresAt(expiry) > now);
+  return !live(accessToken, expiresAt) && !live(refreshToken, refreshTokenExpiresAt);
 }
 
 /** Normalize the OAuth profile fields TeamClaude persists and exposes. */

@@ -119,7 +119,7 @@ eval "$(teamclaude env --no-mitm)" # base-URL: ANTHROPIC_BASE_URL only
 claude
 ```
 
-Only the export lines go to stdout (so `eval` is safe); a short summary and any hints go to stderr. When local Claude OAuth is valid, no `ANTHROPIC_API_KEY` is emitted and Claude Code stays in subscription mode. When local OAuth is missing or expired, TeamClaude switches to proxy credential mode and emits a harmless local bootstrap key so Claude Code can start; the proxy replaces it with the selected account credential for normal API requests.
+Only the export lines go to stdout (so `eval` is safe); a short summary and any hints go to stderr. When local Claude OAuth is usable, no `ANTHROPIC_API_KEY` is emitted and Claude Code stays in subscription mode. An access token that has merely expired still counts as usable while its refresh token is valid, because Claude Code refreshes it itself at startup. Only when there is no local OAuth at all — no tokens, or a refresh token that has expired too — does TeamClaude switch to proxy credential mode and emit a harmless local bootstrap key so Claude Code can start; the proxy replaces it with the selected account credential for normal API requests. On macOS the Keychain (Claude Code's live store) is consulted before `~/.claude/.credentials.json`, which can be a stale snapshot from an earlier login.
 
 The bootstrap mode does not authenticate the passthrough endpoints used by Remote Control and claude.ai file transfers, which intentionally retain the client's own headers. Run `claude /login` if those features are needed. A remote (non-loopback) client must override the bootstrap key with the real proxy key.
 
