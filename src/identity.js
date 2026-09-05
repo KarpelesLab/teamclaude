@@ -63,6 +63,20 @@ export function distinctAccounts(a, b) {
  * hard to trace back to the login that caused it.
  */
 export function findUpsertTarget(accounts, incoming) {
+  // A UUID match is evidence; a name match is a guess, and sameIdentity makes
+  // both in one pass — it compares UUIDs only when BOTH records carry one and
+  // falls back to the name otherwise. So an entry with no UUID matched any
+  // incoming record sharing its name, and if it sat earlier in the list it won
+  // over the entry whose account+org actually matched, landing the credential on
+  // the namesake row (#236). Two entries with one name where the earlier has no
+  // UUID is just a hand-added entry beside a logged-in one, or an account added
+  // before its first probe.
+  //
+  // So look for the evidence before accepting the guess.
+  if (incoming?.accountUuid) {
+    const byUuid = accounts.findIndex(a => a?.accountUuid && sameIdentity(a, incoming));
+    if (byUuid >= 0) return byUuid;
+  }
   const byIdentity = accounts.findIndex(a => sameIdentity(a, incoming));
   if (byIdentity >= 0) return byIdentity;
   return accounts.findIndex(a => a.name === incoming.name && !distinctAccounts(a, incoming));

@@ -214,3 +214,34 @@ test('an upsert keeps the existing id even when the incoming record carries one'
   const merged = updateAccountEntry({ id: 'entry-0', name: 'a' }, { id: 'minted-elsewhere', name: 'a' });
   assert.equal(merged.id, 'entry-0');
 });
+
+// A UUID match is evidence; a name match is a guess. sameIdentity makes both in
+// one pass, so a namesake entry carrying no UUID used to win purely by sitting
+// earlier in the list — and the incoming credential landed on it (#236).
+test('findUpsertTarget prefers the UUID match over an earlier namesake', () => {
+  const accounts = [
+    { name: 'a@x.com' },                                  // hand-added, no UUID
+    { name: 'a@x.com', accountUuid: 'u1', orgUuid: 'o1' }, // the real one
+  ];
+  assert.equal(findUpsertTarget(accounts, { name: 'a@x.com', accountUuid: 'u1', orgUuid: 'o1' }), 1);
+});
+
+test('findUpsertTarget still backfills a namesake when nothing contradicts it', () => {
+  // No UUID anywhere else to prefer, so the bare name match remains the answer —
+  // this is the legacy-entry backfill, which must keep working.
+  const accounts = [{ name: 'a@x.com' }];
+  assert.equal(findUpsertTarget(accounts, { name: 'a@x.com', accountUuid: 'u1', orgUuid: 'o1' }), 0);
+});
+
+test('findUpsertTarget does not let a UUID match cross organizations', () => {
+  const accounts = [
+    { name: 'a@x.com', accountUuid: 'u1', orgUuid: 'o-personal' },
+    { name: 'a@x.com', accountUuid: 'u1', orgUuid: 'o-acme' },
+  ];
+  assert.equal(findUpsertTarget(accounts, { name: 'a@x.com', accountUuid: 'u1', orgUuid: 'o-acme' }), 1);
+});
+
+test('findUpsertTarget still adds a genuinely new account', () => {
+  const accounts = [{ name: 'a@x.com', accountUuid: 'u1', orgUuid: 'o1' }];
+  assert.equal(findUpsertTarget(accounts, { name: 'b@x.com', accountUuid: 'u2', orgUuid: 'o2' }), -1);
+});
