@@ -1325,6 +1325,39 @@ export function isTransientUpstreamError(err, { otherHostAvailable = false } = {
   return false;
 }
 
+/**
+ * The message behind the synthetic 429, when no account can serve the request.
+ *
+ * The old wording — `All N accounts exhausted. Retry in 60s.` — was wrong in
+ * three ways at once, and each one pushed the operator somewhere unhelpful
+ * (#168):
+ *
+ *   - N counted every configured account, including ones the operator had
+ *     disabled. An account deliberately out of rotation is not capacity that
+ *     ran out.
+ *   - it never named the model, so a family-specific refusal (Fable spent,
+ *     Opus fine) read as the whole proxy being out of capacity.
+ *   - "exhausted" reads terminal while "retry in 60s" reads transient, so the
+ *     operator retried by hand instead of looking at what was actually blocked.
+ *
+ * Counts only the accounts that were candidates, names the model when the
+ * request carried one, and says plainly that the wait is until a window resets.
+ */
+export function exhaustedMessage(accountManager, model, retryAfter) {
+  const accounts = accountManager.accounts || [];
+  const eligible = accounts.filter(a => !a.disabled);
+  const disabled = accounts.length - eligible.length;
+
+  const scope = model ? ` for ${model}` : '';
+  const pool = eligible.length === 1 ? '1 account' : `${eligible.length} accounts`;
+  const aside = disabled ? ` (${disabled} more disabled)` : '';
+  const when = retryAfter > 0
+    ? ` Quota resets in ${retryAfter}s.`
+    : ' Retry shortly.';
+
+  return `No account can serve this request${scope}: all ${pool}${aside} are at their quota or rate limit.${when}`;
+}
+
 export async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, useSx) {
   const maxRetries = accountManager.accounts.length;
   // This function is exported, so a caller may hand us a ctx built elsewhere.
@@ -1445,7 +1478,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       type: 'error',
       error: {
         type: 'rate_limit_error',
-        message: `All ${accountManager.accounts.length} accounts exhausted. Retry in ${retryAfter}s.`,
+        message: exhaustedMessage(accountManager, ctx.model, retryAfter),
       },
     }));
     return;
