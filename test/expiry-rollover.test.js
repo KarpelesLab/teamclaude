@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
+import { TUI } from '../src/tui.js';
 
 const H = 3600_000;
 const WEEK = 7 * 24 * H;
@@ -1282,6 +1283,42 @@ test('an account known to be nearly spent does not win on having fewer sessions'
 // an arm asserting "the preview changes nothing" fails with the knob off too,
 // and would be a false gate. The claim is differential by nature and is measured
 // that way, by flagoff-sweep.mjs over generated fleets.
+
+test('the real paint performs the 5h switch; only the status preview skips it', () => {
+  // The docs record the skipped switch as a limitation of the two surfaces, and
+  // it holds for one: _render calls the combined clear-AND-switch, so the paint
+  // IS the switch, while the preview path clears the window through the
+  // availability read and never reaches the switch at all. The sentence
+  // describing that is gated here rather than left to be read against the code.
+  function fleet() {
+    const am = mgr(['cur', 'reset'], ON);
+    const now = Date.now();
+    bucket(am, 0, 'unified7d', 0.5, 200, now);
+    bucket(am, 1, 'unified7d', 0.5, 20, now);   // its weekly expires sooner
+    assert.equal(am.setCurrentAccount(0), true);
+    am.accounts[1].quota.unified5h = 0.5;
+    am.accounts[1].quota.unified5hReset = now - 1000;   // the reset the switch acts on
+    return am;
+  }
+
+  const painted = fleet();
+  const tui = new TUI({
+    accountManager: painted, config: { accounts: [], routes: [], blockedModels: [], proxy: { port: 1 } },
+    saveConfig: async () => {}, syncAccounts: async () => 0, onQuit: () => {},
+  });
+  const write = process.stdout.write.bind(process.stdout);
+  process.stdout.write = () => true;
+  try { tui._render(true); } finally { process.stdout.write = write; }
+  assert.equal(painted.accounts[painted.currentIndex].name, 'reset',
+    'the paint did not run the switch its own refresh call performs');
+  assert.equal(painted.accounts[1].quota.unified5h, null, 'the paint did not clear the expired window');
+
+  const previewed = fleet();
+  for (const a of previewed.accounts) previewed._isNearQuota(a, null);
+  assert.equal(previewed.accounts[previewed.currentIndex].name, 'cur',
+    'the preview ran a switch the documented limitation says it skips');
+  assert.equal(previewed.accounts[1].quota.unified5h, null, 'the preview did not clear the expired window');
+});
 
 test('a repaint takes no reading, so it cannot spend the roll of the account it leaves', () => {
   // TUI._render calls the refresh with no request arguments, every few seconds
