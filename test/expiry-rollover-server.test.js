@@ -312,7 +312,13 @@ for (const distribute of [false, true]) {
   test(`${path} path: a chain answers the roll that started it`, async () => {
     const seen = [];
     let am;
-    const handle = await fleet(['a', 'b', 'c'], async (name, res) => {
+    // Four accounts, not three. #271 spends one more of them than this fixture
+    // was built for: the 429 on b is now a bounded hop rather than a same-account
+    // retry, so it reaches c, and c refusing once used to leave a as the only
+    // account left — which is the very thing the assertion below forbids. `d`
+    // gives the chain somewhere legitimate to land so the invariant is testable
+    // rather than arithmetically impossible.
+    const handle = await fleet(['a', 'b', 'c', 'd'], async (name, res) => {
       if (name === 'b' && !seen.includes('b')) {
         seen.push('b');
         am.accounts[1].quota.unified7dReset = Date.now() + 400 * H;  // b rolls under the request
@@ -325,7 +331,7 @@ for (const distribute of [false, true]) {
         return refuses(res);
       }
       return serves(res, name);
-    }, { distribute, hours: [10, 20, 30] });
+    }, { distribute, hours: [10, 20, 30, 40] });
     ({ am } = handle);
     const { send, close } = handle;
 
