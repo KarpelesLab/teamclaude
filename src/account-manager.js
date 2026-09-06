@@ -2340,6 +2340,10 @@ export class AccountManager {
     const sessions = this.sessionTracker.stats(undefined, { detail: sessionDetail });
     return {
       currentAccount: this.accounts[this.currentIndex]?.name,
+      // Where a request no route claims lands right now — the same derivation
+      // as each route's `target`, so a status reader need not assume "the
+      // current account" when that account is blocked or outranked.
+      defaultTarget: this._routeTarget(null),
       switchThreshold: this.effectiveThreshold,
       // The full table when one is configured, so status output can show the
       // per-bucket values rather than only the representative number.
