@@ -420,8 +420,10 @@ export class AccountManager {
   /**
    * Move the cursor, and only the cursor. A reading is taken where a request
    * finds traffic resting, never where a selection aims it, so no caller of
-   * this method owes one. The single write here is `_firstSightOn`'s, taken
-   * only where the cursor has never been read at all, and it discards nothing.
+   * this method owes one. The single write here is `_firstSightOn`'s: an aim
+   * first-sights its destination only where the observation names no account, or
+   * where the account it names has rolled no window it recorded, and it discards
+   * nothing.
    */
   _setCurrent(account) {
     this.currentIndex = account.index;
