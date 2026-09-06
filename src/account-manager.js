@@ -933,9 +933,12 @@ export class AccountManager {
    * exhausted-fleet probe fallback. Returns null when nothing can serve `model`
    * at the moment. The TUI uses this to mark the single account each secondary
    * bucket (Fable/Sonnet) currently routes to — the F7/S7 analogue of the ► that
-   * marks the default route's current account. It mirrors every discriminator
-   * `_select` uses, so its answer cannot disagree with the next selection, and
-   * it decides nothing: no reading is taken and no cursor moves.
+   * marks the default route's current account. The walk it mirrors is the
+   * non-session one — manual pin, then the current account where neither
+   * priority nor a rollover displaces it, then best-available — and a session
+   * pin resolves ahead of that walk without being consulted here, so a
+   * distributed session can be routed somewhere this does not name. It decides
+   * nothing: no reading is taken and no cursor moves.
    */
   previewRouteIndex(model) {
     const pinned = this._pinnedAccountForModel(model);

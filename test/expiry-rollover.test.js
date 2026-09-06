@@ -1657,11 +1657,24 @@ test('a knob toggled mid-request cannot leave a roll half-answered', () => {
 // The status view and the next selection name the same account
 // ---------------------------------------------------------------------------
 
+test('the preview does not mirror the session walk it never consults', () => {
+  // A session pin resolves ahead of the non-session walk the preview mirrors, so
+  // with distribution on the two can name different accounts. The cursor is
+  // moved off the pin because that is what makes them disagree.
+  const am = mgr(['a', 'b'], ON, { distributeSessions: true });
+  bucket(am, 0, 'unified7d', 0.4, 10);
+  bucket(am, 1, 'unified7d', 0.4, 10);
+  assert.equal(serve(am, 's1', OPUS).name, 'a', 'the fixture must pin s1 to a');
+  assert.equal(am.setCurrentAccount(1), true, 'the fixture must move the cursor off the pin');
+  assert.notEqual(am.previewRouteIndex(OPUS), am.getActiveAccount(null, OPUS, null, 's1').index,
+    'the preview answered for a session walk it does not consult');
+});
+
 test('the preview names the account the next request would actually get', () => {
-  // previewRouteIndex is what the TUI and the status JSON show. It mirrors the
-  // priority preemption but not the rollover one, so after a roll an operator
-  // watching the feature fire sees the parked account until some other request
-  // moves the cursor.
+  // previewRouteIndex is what the TUI and the status JSON show, and it mirrors
+  // both preemptions the non-session walk makes — priority and rollover — so an
+  // operator watching the feature fire is shown the account a request of this
+  // shape is actually given.
   const am = mgr(['a', 'b'], ON);
   bucket(am, 0, 'unified7d', 0.4, 10);
   bucket(am, 1, 'unified7d', 0.4, 10);
