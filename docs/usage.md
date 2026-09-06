@@ -178,7 +178,7 @@ teamclaude help              # Show all commands
 
 `GET /teamclaude/dashboard` serves a self-contained HTML page rendering the same data as `teamclaude status`: per-account quota bars (session and weekly, plus one bar per model-scoped weekly bucket upstream reports), rotation state, and active sessions — refreshed every few seconds.
 
-With `proxy.usageDimensions` configured, each dimension gets its own sortable table. With `proxy.sessionDetail` on, a per-session table shows each session's client, project, serving accounts, and what it actually spent per weekly bucket — cache reads and cache creation included — filterable by project or client. That table is off by default; see [Configuration](configuration.md#usage-dimensions).
+With `proxy.usageDimensions` configured, each dimension gets its own sortable table. With `proxy.sessionDetail` on, a per-session table shows each session's client, project, serving accounts, and what it actually spent per weekly bucket — cache reads and cache creation included — filterable by project or client. Each account card has a **switch** button that makes that account the current one (the same `POST /teamclaude/switch` the CLI uses). It is a nudge, not a pin: normal rotation resumes from there, and sessions already pinned to another account keep it until they go idle, so the badge moves before the traffic does. The response says whether rotation will actually use the target — a spent or disabled account is still switched to, but the page says so rather than reporting a bare "done". That table is off by default; see [Configuration](configuration.md#usage-dimensions).
 
 ```
 http://localhost:3456/teamclaude/dashboard

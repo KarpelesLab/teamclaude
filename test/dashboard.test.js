@@ -6,6 +6,7 @@ import { createProxyServer } from '../src/server.js';
 import {
   renderDashboardHtml, scopedWeeklyRows, accountTokens,
   sessionRows, filterSessionRows, sortRows, uniqSorted,
+  switchRequest, switchOutcome,
 } from '../src/dashboard.js';
 
 function listen(server) {
@@ -127,11 +128,54 @@ test('filter options are unique, sorted, and drop the unlabelled', () => {
   assert.deepEqual(uniqSorted(null), []);
 });
 
+test('switchOutcome separates the choice being recorded from traffic following it', () => {
+  assert.deepEqual(switchOutcome({ ok: true, account: 'b', eligible: true }), { kind: 'ok', text: 'switched to b' });
+  // A spent or disabled target is still switched to (that is the TUI's behaviour),
+  // but saying "done" would hide that rotation skips it on the very next request.
+  assert.deepEqual(
+    switchOutcome({ ok: true, account: 'b', eligible: false, reason: 'disabled by operator' }),
+    { kind: 'warn', text: 'switched to b, but rotation will not use it: disabled by operator' },
+  );
+  assert.deepEqual(switchOutcome({ ok: false, error: 'no such account "x"' }), { kind: 'error', text: 'switch failed: no such account "x"' });
+  assert.deepEqual(switchOutcome(null), { kind: 'error', text: 'switch failed' });
+});
+
+test('the switch button\'s request passes the same-origin gate and moves the current account', async () => {
+  const am = new AccountManager([
+    { name: 'a', type: 'api_key', apiKey: 'sk-a' },
+    { name: 'b', type: 'api_key', apiKey: 'sk-b' },
+  ], 0.98);
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'secret' }, upstream: 'http://127.0.0.1:9' });
+  const port = await listen(proxy);
+  const origin = `http://127.0.0.1:${port}`;
+  const status = async () => (await fetch(`${origin}/teamclaude/status`, { headers: { 'x-api-key': 'secret' } })).json();
+  try {
+    assert.equal((await status()).currentAccount, 'a');
+
+    // Exactly what the page sends, plus the two headers a browser adds to a
+    // same-origin fetch. Mutating control routes are CSRF-gated, so this is the
+    // property the button actually depends on.
+    const r = switchRequest('b', 'secret');
+    const ok = await fetch(origin + r.url, { ...r.init, headers: { ...r.init.headers, origin, 'sec-fetch-site': 'same-origin' } });
+    assert.equal(ok.status, 200);
+    assert.deepEqual(await ok.json(), { ok: true, account: 'b', eligible: true });
+    assert.equal((await status()).currentAccount, 'b');
+
+    // The same request from another site is refused — a page the operator
+    // happens to visit cannot drive the button.
+    const evil = await fetch(origin + r.url, { ...r.init, headers: { ...r.init.headers, origin: 'https://evil.example', 'sec-fetch-site': 'cross-site' } });
+    assert.notEqual(evil.status, 200);
+    assert.equal((await status()).currentAccount, 'b', 'unchanged');
+  } finally {
+    proxy.close();
+  }
+});
+
 test('the page ships the same helper implementations it is tested against', () => {
   // The serialization is the contract: if a helper stops being self-contained
   // (closes over module scope), the page would silently ReferenceError.
   const html = renderDashboardHtml();
-  for (const fn of [scopedWeeklyRows, accountTokens, sessionRows, filterSessionRows, sortRows, uniqSorted]) {
+  for (const fn of [scopedWeeklyRows, accountTokens, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
