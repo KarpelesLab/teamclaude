@@ -1722,8 +1722,8 @@ export class AccountManager {
    * a held roll: a retry that re-enters with the tried set untouched — a 401's
    * forced refresh, a short-wait 429 with no idle sibling to hop to — looks like
    * a fresh arrival, and so does a second client request at a destination
-   * refusing every one of them. The roll is held until a request that carries
-   * the generation this observation was stamped with completes there; a stay so
+   * refusing every one of them. The roll is held until an attempt that carries
+   * the generation this observation was stamped with is SERVED there; a stay so
    * confirmed, followed by a return, preempts once more.
    */
   _restOn(obs, account, model) {
@@ -1838,8 +1838,10 @@ export class AccountManager {
   }
 
   /**
-   * Release the roll a preemption pushed traffic off, on the evidence that a
-   * request COMPLETED where it was sent.
+   * Release the roll a preemption pushed traffic off, on the evidence that the
+   * destination SERVED a request sent there — upstream answered it with a status
+   * below 400, so the account did not refuse it. What the client makes of the
+   * body afterwards is a question about the response, not about the account.
    *
    * Arriving is not that evidence. Several requests can start at a destination
    * that goes on to refuse every one of them, and a retry re-entering selection
