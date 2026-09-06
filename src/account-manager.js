@@ -1403,6 +1403,14 @@ export class AccountManager {
     // Clear expired unified quotas
     if (q.unified5h != null && q.unified5hReset && now >= q.unified5hReset) {
       console.log(`[TeamClaude] Account "${account.name}" session quota reset`);
+      // Recorded on the account, not just returned. _clearExpiredQuotas is
+      // reached from two directions — refreshExpiredQuotas on the request path,
+      // which runs the session-reset switch rule, and _isNearQuota via
+      // unavailableReason, which getStatus calls for every account on every
+      // read. Whichever noticed first used to consume the event, so with a
+      // dashboard polling every 5s the rule almost never ran (#275). The flag
+      // outlives the observation; only the request path clears it.
+      account.sessionResetPending = true;
       q.unified5h = null;
       q.unified5hReset = null;
       // `rejected` describes the shared buckets and this is one of them: a
@@ -1529,7 +1537,13 @@ export class AccountManager {
     for (const account of this.accounts) {
       const r = this._clearExpiredQuotas(account);
       if (r.changed) changed = true;
-      if (r.session) sessionReset.push(account);
+      // The flag, not r.session: a status read may have cleared the window
+      // seconds earlier, and the rule still has to run. Cleared here because
+      // this is the only path that acts on it.
+      if (account.sessionResetPending) {
+        account.sessionResetPending = false;
+        sessionReset.push(account);
+      }
     }
     if (sessionReset.length) this._switchOnSessionReset(sessionReset);
     return changed;
