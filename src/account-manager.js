@@ -2287,9 +2287,9 @@ export class AccountManager {
 
   refreshExpiredQuotas(model = null, exclude = null) {
     let changed = false;
-    // Gated once, up here, because the flag below is now read against it too:
-    // with the feature off nothing is excluded from anything and every reset is
-    // consumed on sight, which is the fleet the disabled path has always seen.
+    // Gated here rather than at the switch call below, because the pending flag
+    // is read against it too: with the feature off nothing is excluded from
+    // anything, and every reset is consumed on sight.
     const scope = this.expiryRouting.enabled ? exclude : null;
     const sessionReset = [];
     for (const account of this.accounts) {
