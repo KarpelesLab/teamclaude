@@ -540,18 +540,16 @@ test('path 3: the reset switch is drawn over what the request can be sent to', (
     bucket(am, 0, 'unified7d', 0.50, 50);
     bucket(am, 1, 'unified7d', 0.10, 10);
     if (withCodex) bucket(am, 2, 'unified7d', 0.00, 1);
-    // Every account but the incumbent has an expired 5h window, so the foreign
-    // one arrives at the switch as a candidate too. Triggering on the challenger
-    // alone leaves the eligible loop nothing to walk past, and the arm then
-    // rests on the band guard by itself.
-    for (const i of withCodex ? [1, 2] : [1]) {
-      am.accounts[i].quota.unified5h = 0.5;
-      am.accounts[i].quota.unified5hReset = Date.now() - 1000;
-    }
+    // Only the challenger's 5h window has expired, so it alone is what the
+    // switch is triggered by.
+    am.accounts[1].quota.unified5h = 0.5;
+    am.accounts[1].quota.unified5hReset = Date.now() - 1000;
     return am;
   };
-  // Asked of a TWIN, as elsewhere in this file: reading eligibility clears the
-  // expired window the switch is triggered by.
+  // Asked of a TWIN, as elsewhere in this file. Not because reading eligibility
+  // spends what the switch is triggered by — since #275 the reset is recorded on
+  // the account and only the request path clears it — but because these read the
+  // band on a fleet whose cursor the checks below are about to move.
   const twin = build(ON, true);
   assert.deepEqual(twin._bandedCandidates(null, OPUS).map(a => a.name), ['codex'],
     'the fixture must give the Codex account the band on its own');
@@ -567,11 +565,8 @@ test('path 3: the reset switch is drawn over what the request can be sent to', (
     'an account the request cannot be sent to vetoed the switch');
 
   // codex's other two controls: the same fleet without the foreign account, and
-  // the same fleet with the knob off. Both end on the account the request can
-  // use, so neither the foreign account nor the feature alone accounts for the
-  // divergence. The knob-off one gets there through the walk, because the
-  // unfiltered switch installs the foreign account first — master's own
-  // behaviour, and what the arm below asserts directly.
+  // the same fleet with the knob off. Both switch, so neither the foreign
+  // account nor the feature alone accounts for the divergence.
   const without = build(ON, false);
   without.getActiveAccount(null, OPUS);
   assert.equal(without.accounts[without.currentIndex].name, 'reset');
@@ -579,6 +574,32 @@ test('path 3: the reset switch is drawn over what the request can be sent to', (
   const off = build(OFF, true);
   off.getActiveAccount(null, OPUS);
   assert.equal(off.accounts[off.currentIndex].name, 'reset');
+});
+
+test('path 3: the reset switch skips an excluded account that also reset', () => {
+  // The exclusion has to reach the eligible loop, not only the band guard that
+  // vetoes what the loop picked: an account on another provider whose own
+  // session window has expired arrives at the switch as a candidate in its own
+  // right. Read at the switch rather than at the end of a request, because
+  // `_select` corrects the cursor a moment later on the same exclusions and
+  // would hide the switch's own answer.
+  const am = mgr([oauth('cur'), oauth('reset'), oauth('codex', { provider: 'codex' })], { expiry: ON });
+  bucket(am, 0, 'unified7d', 0.50, 50);
+  bucket(am, 1, 'unified7d', 0.10, 10);
+  bucket(am, 2, 'unified7d', 0.00, 1);
+  // Both challengers reset, so the foreign account is a candidate the loop has
+  // to walk past; unrefused it wins outright, on no reported utilization at all.
+  for (const i of [1, 2]) {
+    am.accounts[i].quota.unified5h = 0.5;
+    am.accounts[i].quota.unified5hReset = Date.now() - 1000;
+  }
+  am.refreshExpiredQuotas(OPUS, am._excludeOtherProviders(null, DEFAULT_PROVIDER));
+  // Names the account rather than only ruling out the foreign one: with the
+  // loop's refusal gone the band guard still vetoes that pick, so the switch
+  // makes no move at all, and "not codex" would pass on a cursor that never
+  // moved.
+  assert.equal(am.accounts[am.currentIndex].name, 'reset',
+    'the switch let an account the request cannot be sent to decide where it goes');
 });
 
 test('path 3: the knob-off switch sees the fleet master shows it', () => {
