@@ -3,9 +3,11 @@ import { providerOf, DEFAULT_PROVIDER, isSubscriptionAccount } from './provider.
 import { refreshCodexToken } from './codex-auth.js';
 import { parseCodexQuota, parseCodexPlanType } from './codex-quota.js';
 import { sameIdentity } from './identity.js';
-import { weeklyBucketForModel, modelGlobMatches, modelFamily, gatingUtilization, resolveMaxUsage } from './model.js';
+import { weeklyBucketForModel, modelGlobMatches, modelFamily, gatingUtilization, resolveMaxUsage, WEEKLY_BUCKET_KEYS } from './model.js';
 import { SessionTracker } from './session-tracker.js';
 import { buildQuotaSummary } from './quota-summary.js';
+import { ROLLOVER_MIN_JUMP_MS, remapHeld } from './rollover.js';
+import { decideBand, pressureOf, pressureRank, assertNever } from './band-decision.js';
 
 // Re-exported for callers that import these model helpers from here.
 export { isFableModel, parseRequestModel, parseAdvisorModel } from './model.js';
@@ -195,7 +197,7 @@ function sampleModelFor(route) {
 }
 
 export class AccountManager {
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, sessionTracker } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, sessionTracker, expiryRouting } = {}) {
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
@@ -237,6 +239,17 @@ export class AccountManager {
     this.providerCursors = new Map();
     this.switchThreshold = switchThreshold;
     this.setRoutes(routes);
+    this.setExpiryRouting(expiryRouting);
+    // The rollover mechanism's whole state for the sticky current account: one
+    // observation, { idx, windows: name → reset }, of the account traffic was
+    // resting on when a request last arrived to find it there. Null while the
+    // knob is off: nothing writes one then and none survives the transition.
+    this._currentObs = null;
+    // Throttle for the held-rollover line, keyed by (account index, WINDOW,
+    // reason). Keying by the request bucket would let two windows that share one
+    // bucket silence each other; keying by session id is unbounded, since that
+    // id is a client-supplied header.
+    this._rolloverHeldLogAt = new Map();
     // Storm control: when rotation switches to a fresh account, a burst of
     // in-flight requests (e.g. dozens of agents failing over together) would all
     // hit it at once and instantly throttle it — cascading down the fleet
@@ -398,6 +411,29 @@ export class AccountManager {
    * so a failover burst is paced onto it rather than all landing at once. */
   _beginRamp(account) {
     if (account && this.ramp.enabled) account.rampStartedAt = Date.now();
+  }
+
+  /**
+   * Move the cursor, and only the cursor. A reading is taken where a request
+   * finds traffic resting, never where a selection aims it, so no caller of
+   * this method owes one. The single write here is `_firstSightOn`'s, taken
+   * only where the cursor has never been read at all, and it discards nothing.
+   */
+  _setCurrent(account) {
+    this.currentIndex = account.index;
+    if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) return;
+    this._firstSightOn(this._currentObs ??= { idx: null, windows: new Map(), unescaped: null }, account);
+  }
+
+  /**
+   * Make the account at `index` current on an operator's say-so: the TUI's 's'
+   * and the /teamclaude/switch endpoint are the same act by two routes.
+   */
+  setCurrentAccount(index) {
+    const account = this.accounts[index];
+    if (!account) return false;
+    this._setCurrent(account);
+    return true;
   }
 
   /** Max concurrent upstream requests allowed to `account` right now. Infinity
@@ -584,10 +620,23 @@ export class AccountManager {
   }
 
   _pickActiveAccount(exclude, model, advisorModel, sessionId) {
+    // Taken before anything in this pass can move the cursor: the quota-reset
+    // switch below moves it, and treating its destination as a resting place
+    // prices an account the request was only aimed at. Not taken for an account
+    // this request has already tried, which is a failed attempt coming back
+    // through selection rather than a place the traffic rested.
+    this._restOnCurrent(exclude, model);
+    // Here rather than inside the session walks, because a pin is maintained
+    // whether or not those walks run: `recordSession` is always on. Read only
+    // where the walks read it, a session routed while distribution is off would
+    // freeze its observation at the last walk and miss the stays in between.
+    if (sessionId) {
+      this._restOnPin(sessionId, this._weeklyBucketFor(model), exclude, model);
+    }
     // Clear expired quotas across all accounts and switch proactively if a
     // session reset made a sooner-expiring account the better choice. This runs
     // on every request so the behaviour holds without the TUI render loop.
-    this.refreshExpiredQuotas();
+    this.refreshExpiredQuotas(model);
     // Session-affinity distribution (opt-in): keep a session on its pinned
     // account for cache reuse, and route a new session to the least-loaded
     // account. Only when enabled, only for a real session, and only outside a
@@ -645,8 +694,26 @@ export class AccountManager {
       if (next) { current.requalify = false; return next; }
     }
     if (this._isAvailable(current, model, advisorModel) && !exclude?.has(current.index)) {
+      // Rollover preemption (expiry routing): the current account's governing
+      // window rolled over, so it is now the freshest and furthest-dated choice.
+      // Re-rank rather than stay parked on it until a switch threshold that
+      // low-utilization fleets never reach. Every pass reaching here decides the
+      // request, the advisor-constrained one included; `allowProbe` gates the
+      // exhausted-fleet probe, not which pass is final.
+      const rolled = this.expiryRouting.enabled && this.expiryRouting.preempt
+        && this._currentRolledOver(current, model);
+      if (rolled) {
+        const next = this._selectNext(exclude, model, advisorModel);
+        // Both ways of not moving end here: nothing eligible, or the re-rank
+        // handing back the account being moved off. Neither refreshes the
+        // observation, so the next request compares against the same pre-roll
+        // reset and asks again.
+        if (!next || next.index === current.index) this._noteHeldRollover(current, model, advisorModel, exclude);
+        if (next) return next;
+      }
       const betterExists = this._preemptedBy(current, model, advisorModel, exclude);
-      return betterExists ? this._selectNext(exclude, model, advisorModel) : current;
+      if (betterExists) return this._selectNext(exclude, model, advisorModel);
+      return current;
     }
     // Barred for this request only: keep the family where it was diverted.
     // Barred outright (disabled, throttled, spent): rotate, as before.
@@ -674,7 +741,8 @@ export class AccountManager {
     // EXECUTOR's: one request goes to one account, so the executor's affinity is
     // what binds it and the advisor's model is a constraint on that choice
     // (_isAvailable, below) rather than a second key.
-    const pinIdx = this.sessionTracker.pinnedAccount(sessionId, this._weeklyBucketFor(model));
+    const bucket = this._weeklyBucketFor(model);
+    const pinIdx = this.sessionTracker.pinnedAccount(sessionId, bucket);
     // The bucket's own pin first. Failing that, any account the session already
     // sits on for another family: one session stays on one account unless that
     // account cannot serve the request (the README's "pins it there"). Without
@@ -689,45 +757,91 @@ export class AccountManager {
     }
     for (const idx of candidates) {
       const pinned = this.accounts[idx];
-      if (!pinned || !this._isAvailable(pinned, model, advisorModel) || exclude?.has(idx)) continue;
+      if (!pinned) continue;
+      // Skipping writes nothing and destroys nothing, so a window that rolled
+      // while this account was out of reach is still there to be found when
+      // traffic returns to it.
+      if (!this._isAvailable(pinned, model, advisorModel) || exclude?.has(idx)) continue;
+      // Rollover preemption (expiry routing): this candidate rolled over its
+      // governing window, so staying would burn the week it just gained while
+      // sooner-expiring quota goes unspent — the only pressure-driven force on a
+      // pin, at one cache miss per pinned session per rollover. Asked of every
+      // candidate rather than the bucket's pin alone, since a session sitting on
+      // another family's account is just as stuck, and a rollover re-ranks so
+      // that pressure picks the destination.
+      if (this.expiryRouting.enabled && this.expiryRouting.preempt
+          && this._pinRolledOver(sessionId, pinned, model)) {
+        const next = this._pickLeastLoaded(exclude, model, advisorModel);
+        if (next && next.index !== idx) {
+          // A fleet-wide rollover moves every session pinned to that account at
+          // once, so the destination gets the same failover burst any other
+          // switch would send it — pace it (issue #84).
+          this._beginRamp(next);
+          console.log(`[TeamClaude] Session pin on "${pinned.name}" released — its weekly window rolled over; re-routing to "${next.name}"`);
+          return next;
+        }
+        // The traffic did not move, so the observation is left where it is and
+        // the next request asks again.
+        this._noteHeldRollover(pinned, model, advisorModel, exclude);
+        return pinned;
+      }
       // Mirror _select's priority preemption so an operator's priority order
       // still wins over a session's stickiness.
       const betterExists = this.accounts.some(a =>
         this._isAvailable(a, model, advisorModel) && !exclude?.has(a.index) && (a.priority || 0) < (pinned.priority || 0));
       if (!betterExists) return pinned;
     }
+    // No pin was usable, so this is a placement. Placing is aiming: it takes no
+    // reading, and the next request to find the pin here takes it.
     return this._pickLeastLoaded(exclude, model, advisorModel);
   }
 
   /** Best-available biased toward the fewest active sessions, so new sessions
    * spread across equal-priority accounts instead of funnelling onto one. Order:
-   * priority → fewest active sessions → fewest in-flight → soonest weekly reset
-   * (the existing tiebreak). */
+   * priority → [top pressure band, when expiry routing is on] → fewest active
+   * sessions → fewest in-flight → highest expiry pressure (inert when expiry
+   * routing is off) → soonest weekly reset (the existing tiebreak). */
   _pickLeastLoaded(exclude = null, model = null, advisorModel = null) {
     const now = Date.now();
+    const candidates = this._bandedCandidates(exclude, model, advisorModel);
+    // One clock for every candidate: pressure rises continuously as a window
+    // nears its reset, so scoring two accounts at different instants decides an
+    // exact tie on the microseconds between two Date.now() reads.
+    const pressures = this._rankedPressures(candidates, model, now);
+    // Ahead of the load terms, because it is the one thing load must not
+    // override: an account the tree knows is nearly spent (see _belowBandFloor).
+    const spent = this._belowBandFloor(candidates, model, now);
     let best = null;
     let bestPriority = Infinity;
+    let bestSpent = Infinity;
     let bestSessions = Infinity;
     let bestInFlight = Infinity;
+    let bestPressure = Infinity;
     let bestReset = Infinity;
-    for (const account of this.accounts) {
-      if (exclude?.has(account.index)) continue;
-      if (!this._isAvailable(account, model, advisorModel)) continue;
+    candidates.forEach((account, i) => {
       const priority = account.priority || 0;
+      const heldOff = spent[i];
       const sessions = this.sessionTracker.activeCountFor(account.index, now);
       const inFlight = account.inFlight || 0;
-      const reset = this._governingWeeklyReset(account, model) || -Infinity;
+      const pressure = pressures[i];
+      const reset = this._rankedReset(account, model);
+      const samePriority = priority === bestPriority;
+      const sameSpend = samePriority && heldOff === bestSpent;
       if (priority < bestPriority
-        || (priority === bestPriority && sessions < bestSessions)
-        || (priority === bestPriority && sessions === bestSessions && inFlight < bestInFlight)
-        || (priority === bestPriority && sessions === bestSessions && inFlight === bestInFlight && reset < bestReset)) {
+        || (samePriority && heldOff < bestSpent)
+        || (sameSpend && sessions < bestSessions)
+        || (sameSpend && sessions === bestSessions && inFlight < bestInFlight)
+        || (sameSpend && sessions === bestSessions && inFlight === bestInFlight && pressure < bestPressure)
+        || (sameSpend && sessions === bestSessions && inFlight === bestInFlight && pressure === bestPressure && reset < bestReset)) {
         best = account;
         bestPriority = priority;
+        bestSpent = heldOff;
         bestSessions = sessions;
         bestInFlight = inFlight;
+        bestPressure = pressure;
         bestReset = reset;
       }
-    }
+    });
     return best;
   }
 
@@ -744,7 +858,19 @@ export class AccountManager {
    * quite possibly one that cannot. Unclaimed means the session routes that
    * family afresh next request, which is what it did before it had a pin. */
   recordSession(sessionId, accountIndex, model = null) {
-    if (sessionId) this.sessionTracker.touch(sessionId, accountIndex, this._weeklyBucketFor(model));
+    if (!sessionId) return;
+    const bucket = this._weeklyBucketFor(model);
+    // The pin alone: this runs before the destination's token is refreshed and
+    // long before the upstream fetch, so it names where the request is being
+    // SENT, and being sent somewhere is not arriving there. The observation is
+    // taken where the evidence is, at the start of the NEXT request from
+    // wherever this one left the pin (see _restOn).
+    this.sessionTracker.touch(sessionId, accountIndex, bucket);
+    // Except the FIRST one, which discards nothing: otherwise a session's
+    // opening window is first-sighted a request late (see _firstSightOn).
+    if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) return;
+    this._firstSightOn(this.sessionTracker.refsFor(sessionId, bucket, true),
+      this.accounts[accountIndex]);
   }
 
   /** Mark a session request as in flight / finished. Paired around the whole
@@ -782,11 +908,14 @@ export class AccountManager {
   /**
    * Read-only: the index of the account a request for `model` would be served by
    * right now — the same decision getActiveAccount makes (manual pin → the global
-   * current account if it can serve the model → best-available), but WITHOUT
-   * mutating currentIndex and without the exhausted-fleet probe fallback. Returns
-   * null when nothing can serve `model` at the moment. The TUI uses this to mark
-   * the single account each secondary bucket (Fable/Sonnet) currently routes to —
-   * the F7/S7 analogue of the ► that marks the default route's current account.
+   * current account if it can serve the model AND nothing preempts it →
+   * best-available), but WITHOUT mutating currentIndex and without the
+   * exhausted-fleet probe fallback. Returns null when nothing can serve `model`
+   * at the moment. The TUI uses this to mark the single account each secondary
+   * bucket (Fable/Sonnet) currently routes to — the F7/S7 analogue of the ► that
+   * marks the default route's current account. It mirrors every discriminator
+   * `_select` uses, so its answer cannot disagree with the next selection, and
+   * it decides nothing: no reading is taken and no cursor moves.
    */
   previewRouteIndex(model) {
     const pinned = this._pinnedAccountForModel(model);
@@ -797,7 +926,9 @@ export class AccountManager {
       // available account wins over a healthy current one; same tier stays put.
       const better = this.accounts.some(a =>
         this._isAvailable(a, model) && (a.priority || 0) < (current.priority || 0));
-      if (!better) return current.index;
+      const rolled = this.expiryRouting.enabled && this.expiryRouting.preempt
+        && this._currentRolledOver(current, model);
+      if (!better && !rolled) return current.index;
     }
     // Mirror _select's diversion cursor, so the preview names the account a
     // diverted family will actually land on rather than the one a fresh walk
@@ -874,6 +1005,27 @@ export class AccountManager {
     const scoped = this._scopedWeekly(account, model)?.utilization;
     const known = [q.unified7d, scoped].filter(v => v != null);
     return known.length ? Math.max(...known) : null;
+
+  /**
+   * WHY THIS IS NOT `_governingWindow(...).utilization`.
+   *
+   * The two answer different questions and must be allowed to differ.
+   *
+   * This one is the GATE: can the account serve this family at all. Family spend
+   * meters into the family bucket AND the shared weekly, so the answer is the
+   * higher of the two (#175) — otherwise an account at `unified7d` 1.00 with
+   * `unified7dFable` 0.20 keeps serving Fable and pushes the shared bucket
+   * further past its cap on every request.
+   *
+   * `_governingWindow` is the RATIO's input: headroom per second until that same
+   * window resets. There the value and the clock must come from ONE bucket, as
+   * its own comment on `_governingWeeklyReset` insists — pairing one bucket's
+   * headroom with another's clock prices the account on quota it will lose
+   * before it can spend it.
+   *
+   * So collapsing them would either revert #175 or misprice the pressure. They
+   * stay separate on purpose.
+   */
   }
 
   /** The learned scoped weekly bucket governing `model`, or null. Keyed by the
@@ -970,7 +1122,7 @@ export class AccountManager {
     if (!best) return null;
 
     this._nextProbeAt = now + this.probeIntervalMs;
-    this.currentIndex = best.index;
+    this._setCurrent(best);
     this._beginRamp(best);
     if (best.status === 'throttled') {
       console.log(`[TeamClaude] All accounts unavailable — revalidating throttled "${best.name}" with a live request`);
@@ -1164,7 +1316,10 @@ export class AccountManager {
   _selectDrainingSession(sessionId, exclude, model, advisorModel) {
     // Same candidate order as _selectForSession: the request's own bucket pin,
     // then any account the session already sits on for another family.
-    const pinIdx = this.sessionTracker.pinnedAccount(sessionId, this._weeklyBucketFor(model));
+    const bucket = this._weeklyBucketFor(model);
+    const pinIdx = this.sessionTracker.pinnedAccount(sessionId, bucket);
+    // The reading was taken at the head of this pass, so this walk writes
+    // nothing and cannot spend a roll however it leaves.
     const candidates = pinIdx != null ? [pinIdx] : [];
     for (const idx of this.sessionTracker.pinnedAccounts(sessionId)) {
       if (!candidates.includes(idx)) candidates.push(idx);
@@ -1172,6 +1327,12 @@ export class AccountManager {
     for (const idx of candidates) {
       const pinned = this.accounts[idx];
       if (!pinned || !this._isAvailable(pinned, model, advisorModel) || exclude?.has(idx)) continue;
+      // A governing-window rollover ends the drain, which trades expiring quota
+      // for a warm cache priced on the window the account had when it started
+      // and is otherwise unbounded: an active session renews its own idle
+      // window. Breaking hands the session to the ordinary walk, which aims.
+      if (this.expiryRouting.enabled && this.expiryRouting.preempt
+          && this._pinRolledOver(sessionId, pinned, model)) break;
       // Mirror _select's priority preemption, as _selectForSession does.
       const betterExists = this.accounts.some(a =>
         this._isAvailable(a, model, advisorModel) && !exclude?.has(a.index) && (a.priority || 0) < (pinned.priority || 0));
@@ -1283,6 +1444,461 @@ export class AccountManager {
     if (recorded != null) return recorded;
     const current = this.accounts[this.currentIndex];
     return current && this._routeAllows(current, model) ? current.index : null;
+  }
+
+  /**
+   * The config key is provisional: #176 proposes a `routingStrategy` enum for
+   * the adjacent drain-concentration problem, and a value such as `"expiry"` is
+   * a plausible home for this behaviour. Enabling changes which accounts
+   * selection considers, so only a literal `true` turns it on and a hand-edited
+   * `"false"` reads as off. `tolerance` is not coerced, because an explicit 0 is
+   * a meaningful setting that clamps to 1, the strictest band.
+   */
+  setExpiryRouting(cfg) {
+    const c = cfg || {};
+    const wasWatching = !!(this.expiryRouting?.enabled && this.expiryRouting?.preempt);
+    this.expiryRouting = {
+      enabled: c.enabled === true,
+      tolerance: typeof c.tolerance === 'number' && Number.isFinite(c.tolerance)
+        ? Math.max(1, c.tolerance)
+        : 1.5,
+      preempt: typeof c.preempt === 'boolean' ? c.preempt : true,
+    };
+    // Nothing survives the knob being off: every observation is dropped when
+    // preemption stops and none is written while it is off, so no mechanism
+    // state outlives a disabled interval. Turning it back on takes a first
+    // reading for everything the fleet is sticky on, which can discard nothing
+    // and buys the roll between the reload and the fleet's next request.
+    if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) {
+      this._currentObs = null;
+      this.sessionTracker.clearObservations();
+      return;
+    }
+    // Re-applying the same setting, which every config reload does, must not
+    // re-read anything. Redundant with _firstSightOn's own refusal to overwrite
+    // an existing reading, and kept because the two say different things: "only
+    // the transition seeds" and "an aim never overwrites".
+    if (wasWatching) return;
+    const current = this.accounts[this.currentIndex];
+    if (current) this._firstSightOn(this._currentObs ??= { idx: null, windows: new Map(), unescaped: null }, current);
+    for (const { sessionId, bucket, idx } of this.sessionTracker.livePins()) {
+      this._firstSightOn(this.sessionTracker.refsFor(sessionId, bucket, true), this.accounts[idx]);
+    }
+  }
+
+  /**
+   * The weekly bucket whose utilization and reset are read together for `model`
+   * on this account: the family's own when it reports one, the shared weekly
+   * otherwise, decided by presence of the utilization and only that. Not wired
+   * into `_governingWeeklyReset`, whose own shared-weekly fallback is the
+   * tiebreak's behaviour with the feature off; `_rankedReset` picks between them.
+   */
+  _governingBucket(account, model) {
+    return this._windowForBucket(account, this._weeklyBucketFor(model));
+  }
+
+  /**
+   * One resolution of which weekly window governs `model`, how spent it is and
+   * when it resets, read by the gate, the ratio, the band, the tiebreak and the
+   * rollover baseline so no two answer differently. A family with no dedicated
+   * bucket may be metered by a scoped one upstream learned for it (#231), which
+   * carries its own reset — so the pair travels together, named by `window` so
+   * that two families sharing `unified7d` keep separate rollover baselines.
+   */
+  _governingWindow(account, model) {
+    const key = this._governingBucket(account, model);
+    const flat = { window: key, utilization: account.quota[key], resetAt: account.quota[`${key}Reset`] };
+    if (this._weeklyBucketFor(model) !== 'unified7d') return flat;
+    const scoped = this._scopedWeekly(account, model);
+    if (scoped?.utilization == null) return flat;
+    const scopedWin = { window: `scoped:${modelFamily(model)}`, utilization: scoped.utilization, resetAt: scoped.resetAt };
+    if (flat.utilization == null) return scopedWin;
+    if (flat.utilization > scoped.utilization) return flat;
+    if (flat.utilization < scoped.utilization) return scopedWin;
+    // Equally spent, so the clock must choose: the window resetting SOONER runs
+    // out first and is the constraint a request meets. Taking the longer one
+    // prices the account on quota it will lose before it can spend. Unknown
+    // clocks lose to known ones, as everywhere else in the ranking.
+    if (flat.resetAt == null) return scopedWin;
+    if (scopedWin.resetAt == null) return flat;
+    return scopedWin.resetAt < flat.resetAt ? scopedWin : flat;
+  }
+
+  /**
+   * Expiry pressure of `account` for `model`: headroom in the governing weekly
+   * bucket per second until that bucket resets. Headroom alone ignores expiry
+   * and reset time alone steers into nearly-drained accounts; the ratio captures
+   * both. Weekly only — a 5h denominator is ~30x smaller and would numerically
+   * drown the weekly horizons this ordering exists to respect, so the 5h bucket
+   * stays an availability gate (`_isNearQuota`). Null when either half is unknown.
+   */
+  _expiryPressure(account, model = null, now = Date.now()) {
+    const pressure = this._pressureVariant(account, model, now);
+    switch (pressure.kind) {
+      case 'known': return pressure.value;
+      case 'absent': return null;
+      default: return assertNever(pressure, '_expiryPressure');
+    }
+  }
+
+  /**
+   * The same pressure in the decision layer's own encoding, absence and all.
+   * `_expiryPressure` publishes `null` where this says `absent`, because the
+   * status payload's `pressure` field is a number. One implementation, so the
+   * published figure and the routing decision cannot define the word differently.
+   */
+  _pressureVariant(account, model = null, now = Date.now()) {
+    const [snapshotAccount] = this._bandSnapshot([account], model, now).accounts;
+    return pressureOf(snapshotAccount, now);
+  }
+
+  /**
+   * Each candidate's pressure as a sort key, positionally aligned with
+   * `candidates`. With the knob off the term is absent for every account, so it
+   * is inert rather than special-cased: the disabled path is the plain term
+   * order and not a branch someone has to keep correct.
+   */
+  _rankedPressures(candidates, model, now) {
+    if (!this.expiryRouting.enabled) {
+      return candidates.map(() => pressureRank({ kind: 'absent', reason: 'expiry-routing-off' }));
+    }
+    return this._bandSnapshot(candidates, model, now).accounts
+      .map(a => pressureRank(pressureOf(a, now)));
+  }
+
+  /**
+   * Which of these candidates is known to be nearly spent, as a leading sort
+   * term. A bounded absence is not an unknown: its spend is reported, and
+   * admitting it as discovery would let an account measured at 95% spent win on
+   * having fewer sessions, since load is compared before pressure. It is still
+   * selected when nothing above the floor is available, which keeps its window
+   * discoverable, and an account with no reading at all is never held off.
+   */
+  _belowBandFloor(candidates, model, now) {
+    if (!this.expiryRouting.enabled) return candidates.map(() => 0);
+    const snapshot = this._bandSnapshot(candidates, model, now);
+    const decision = decideBand(snapshot);
+    const bounds = snapshot.accounts.map(a => {
+      const pressure = pressureOf(a, now);
+      return pressure.kind === 'absent' ? pressure.lowerBound ?? null : null;
+    });
+    // Unknown is not zero: the band returns passthrough when no account has a
+    // measured pressure, and reading that as "nothing to hold off" would zero
+    // the term on a fleet where every account is clockless. With no band floor
+    // the best bound is the bar instead, so an account measured below it waits
+    // behind the ones that are not.
+    const floor = decision.kind === 'banded'
+      ? decision.floor
+      : Math.max(...bounds.filter(b => b != null), -Infinity);
+    if (!Number.isFinite(floor)) return candidates.map(() => 0);
+    return bounds.map(b => (b != null && b < floor ? 1 : 0));
+  }
+
+  /**
+   * The reset both selection loops break an otherwise-exact tie on, and unknown
+   * sorts first either way. With expiry routing on it is the governing window's
+   * own reset, the one the gate and the ratio just used: `_governingWeeklyReset`
+   * prefers the named `${bucket}Reset`, which for a family metered by a learned
+   * scoped bucket is the shared weekly — a clock nothing else in the decision
+   * consulted. With the knob off it is `_governingWeeklyReset` unconditionally.
+   */
+  _rankedReset(account, model) {
+    return this._rankingReset(account, model) || -Infinity;
+  }
+
+  /**
+   * The same order, before the unknown-sorts-first coercion. The session-reset
+   * switch needs the order and not the coercion: it treats an account whose
+   * weekly it has never read as ineligible rather than as the soonest, the
+   * opposite of the probe bias a selection tiebreak wants. Both callers come
+   * through here so the two cannot rank on different clocks. Null means "not
+   * known here", never "resets at the epoch".
+   */
+  _rankingReset(account, model) {
+    if (!this.expiryRouting.enabled) return this._governingWeeklyReset(account, model);
+    return this._governingWindow(account, model).resetAt ?? null;
+  }
+
+  /**
+   * The accounts a selection pass may choose from: everything eligible for this
+   * request, narrowed to the top pressure band when expiry routing is on.
+   * `_isAvailable` excludes accounts at or above the switch threshold. Shared by
+   * both selection loops so they cannot disagree on the candidate set.
+   */
+  _bandedCandidates(exclude = null, model = null, advisorModel = null) {
+    return this._topPressureBand(
+      this.accounts.filter(a => !exclude?.has(a.index) && this._isAvailable(a, model, advisorModel)),
+      model);
+  }
+
+  /**
+   * The accounts selection may choose from when expiry routing is on: those
+   * within `tolerance` (a ratio, >= 1) of the best pressure in the top priority
+   * tier. Band membership rather than a raw sort keeps the comparison
+   * transitive, lets distributeSessions spread load across the admitted set
+   * (#109), and gives hysteresis for free. A non-empty input never bands to
+   * empty.
+   */
+  _topPressureBand(candidates, model = null) {
+    // One clock for the whole band, as in _pickLeastLoaded.
+    const decision = decideBand(this._bandSnapshot(candidates, model, Date.now()));
+    switch (decision.kind) {
+      case 'passthrough': return candidates;
+      case 'banded': {
+        const byIndex = new Map(candidates.map(a => [a.index, a]));
+        return decision.keep.map(i => byIndex.get(i)).filter(Boolean);
+      }
+      default: return assertNever(decision, '_topPressureBand');
+    }
+  }
+
+  /**
+   * The band decision's view of a candidate set. Reads the accounts and the
+   * config; the decision itself reads neither. `now` is an argument so a caller
+   * can ask what the band makes of some other instant. Both halves of each
+   * account's ratio come from the ONE window `_governingWindow` resolves.
+   */
+  _bandSnapshot(candidates, model, now) {
+    return {
+      now,
+      enabled: !!this.expiryRouting.enabled,
+      tolerance: this.expiryRouting.tolerance,
+      accounts: candidates.map(a => {
+        const { utilization: used, resetAt: reset } = this._governingWindow(a, model);
+        return {
+          index: a.index,
+          priority: a.priority || 0,
+          // Present but not a number passes through as NaN so `pressureOf` can
+          // name it `utilization-not-finite`; coercing to null would report it
+          // as a window nobody has reported yet, which wants a different action.
+          utilization: typeof used === 'number' ? used : (used == null ? null : NaN),
+          resetAt: typeof reset === 'number' && reset ? reset : null,
+        };
+      }),
+    };
+  }
+
+  /**
+   * Has the governing window of this sticky choice rolled over since a request
+   * was last found resting on it? A reading is written only where a request
+   * ARRIVES to find the choice on an account outside its own tried set; a
+   * selection that merely sends a request somewhere writes nothing, because the
+   * aimed request may never arrive. A same-account retry (short-wait 429, 401)
+   * re-enters with the tried set untouched and looks like a fresh arrival, so the
+   * roll it was pushed off is held until a second request confirms the stay; a
+   * one-request stay followed by a return preempts once more.
+   */
+  _restOn(obs, account, model) {
+    if (obs.idx !== account.index) {
+      // The traffic has moved, so this takes the reading that makes this
+      // account's rolls visible while holding the roll it was pushed off:
+      // `_firstSightOn` hands that back, and every cursor or pin move goes
+      // through `_setCurrent` or `recordSession`, so a fail-back has been
+      // offered it before any request reaches here.
+      const leaving = obs.idx == null ? null : this.accounts[obs.idx];
+      if (leaving && this._anyJumped(obs.windows, leaving)) {
+        obs.unescaped = { idx: obs.idx, windows: obs.windows };
+      }
+      // Established whole, from every window the account presents, so a window
+      // that comes back is a first sight rather than a stale value read as a jump.
+      obs.idx = account.index;
+      obs.windows = new Map(Object.entries(this._accountWindows(account)));
+      return;
+    }
+    // A second request has found the choice where the last one left it, the only
+    // evidence that traffic came to rest here. Whatever roll it was pushed off
+    // is escaped: holding it longer would preempt off an account traffic has
+    // already left and returned to.
+    obs.unescaped = null;
+    const win = this._governingWindow(account, model);
+    // Redundant with _jumped's own null check, and kept because "there is
+    // nothing to record" says something different from "what was recorded is
+    // unusable".
+    if (win.resetAt == null) return;
+    // NEVER FORWARD OVER A ROLL THIS CHOICE HAS NOT ESCAPED. The window has
+    // jumped since the reading was taken, so the preemption did not stick.
+    // Advancing would adopt the week the account just gained and park the fleet
+    // on its furthest-dated account. Leave it, and the next request asks again.
+    if (this._jumped(obs.windows, win)) return;
+    // Only the window this request was governed by is ADVANCED; this request is
+    // not evidence about the others. A reading that never freshens still detects
+    // the next roll, measured from a value further back rather than a wrong one.
+    obs.windows.set(win.window, win.resetAt);
+    // A window with no entry at all is different: it has appeared on the account
+    // since the reading was taken, most often a learned scoped bucket upstream
+    // has just reported. Taking it now discards nothing, and is the difference
+    // between seeing that window's first roll and never seeing it.
+    for (const [window, reset] of Object.entries(this._accountWindows(account))) {
+      if (!obs.windows.has(window)) obs.windows.set(window, reset);
+    }
+  }
+
+  /**
+   * The one write an aim may make, and it must discard nothing: a choice that
+   * has never named an account has no roll to forget, and a reading whose
+   * account has not rolled forfeits no event by moving. Refused is the case the
+   * design turns on — a reading whose account HAS rolled while its traffic has
+   * not come to rest elsewhere, the fail-back's only protection. The test is
+   * whether ANY window rolled, since an aim discards the whole reading at once.
+   */
+  _firstSightOn(obs, account) {
+    if (!obs || !account) return;
+    if (obs.idx != null && obs.idx !== account.index) {
+      // A fail-back reaches its origin through a cursor move rather than a rest:
+      // the pass returning the traffic finds the cursor still on the account
+      // that refused it, so _restOn never sees the arrival. The held roll is
+      // given back here, to the account that still owes it.
+      if (obs.unescaped?.idx === account.index) {
+        obs.idx = account.index;
+        obs.windows = obs.unescaped.windows;
+        obs.unescaped = null;
+        return;
+      }
+      if (this._anyJumped(obs.windows, this.accounts[obs.idx])) return;
+    } else if (obs.idx != null) {
+      return;
+    }
+    obs.idx = account.index;
+    obs.windows = new Map(Object.entries(this._accountWindows(account)));
+  }
+
+  /** Has ANY window this reading holds rolled over on the account it was taken
+   * on? Enumerated over what the ACCOUNT presents now rather than what the
+   * reading holds: a window gained since the reading was taken has no entry to
+   * compare and is a first sight, which `_jumped` reports as no jump. */
+  _anyJumped(reading, account) {
+    if (!reading || !account) return false;
+    for (const [window, resetAt] of Object.entries(this._accountWindows(account))) {
+      if (this._jumped(reading, { window, resetAt })) return true;
+    }
+    return false;
+  }
+
+  /** The reading for the sticky CURRENT account, taken at the top of a selection
+   *  pass, before anything in that pass can move the cursor. */
+  _restOnCurrent(exclude, model) {
+    if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) return;
+    const resting = this.accounts[this.currentIndex];
+    if (!resting || exclude?.has(resting.index)) return;
+    this._currentObs ??= { idx: null, windows: new Map(), unescaped: null };
+    this._restOn(this._currentObs, resting, model);
+  }
+
+  /** The same reading for a SESSION's pin on the bucket this request is governed
+   *  by, by the same rule. Created on demand: a session that has never been
+   *  pinned has nothing to observe, and one whose pin this request has already
+   *  tried is looking at a failed attempt rather than a resting place. */
+  _restOnPin(sessionId, bucket, exclude, model) {
+    if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) return;
+    const pinIdx = this.sessionTracker.pinnedAccount(sessionId, bucket);
+    if (pinIdx == null || exclude?.has(pinIdx)) return;
+    const account = this.accounts[pinIdx];
+    if (!account) return;
+    const obs = this.sessionTracker.refsFor(sessionId, bucket, true);
+    if (!obs) return;
+    this._restOn(obs, account, model);
+  }
+
+  /** Has this session's pin rolled over since traffic was last found resting on
+   *  it? Scoped to the window `_governingWindow` names, so one family's roll is
+   *  not read from another's clock, and to the account the observation names: a
+   *  reading taken on one account is not evidence about another. */
+  _pinRolledOver(sessionId, pinned, model) {
+    const obs = this.sessionTracker.refsFor(sessionId, this._weeklyBucketFor(model));
+    if (!obs || obs.idx !== pinned.index) return false;
+    return this._jumped(obs.windows, this._governingWindow(pinned, model));
+  }
+
+  /** As _pinRolledOver, for the global current account. */
+  _currentRolledOver(current, model) {
+    const obs = this._currentObs;
+    if (!obs || obs.idx !== current.index) return false;
+    return this._jumped(obs.windows, this._governingWindow(current, model));
+  }
+
+  /** The comparison itself. Absent on either side is not a jump: a window
+   * nothing has read yet, an account with no observation, and one the account is
+   * not reporting right now are three different absences, which is why each is
+   * checked rather than left to a NaN comparison. The threshold is not redundant
+   * either: a window re-reported slightly later has not rolled. */
+  _jumped(reading, win) {
+    if (!reading) return false;
+    const seen = reading.get(win.window);
+    if (seen == null || win.resetAt == null) return false;
+    return win.resetAt - seen > ROLLOVER_MIN_JUMP_MS;
+  }
+
+  /**
+   * A rollover fired and the request stayed. Without a line the log reads the
+   * same whether nothing rolled over or a rollover cannot resolve, the one
+   * failure this feature can have that looks like it working. The reason comes
+   * from eligibility, not from which of the re-rank's two ways of saying "stay"
+   * it took: an account can be barred with no threshold behind it. This map is
+   * log-grade and never decides a preemption.
+   */
+  _noteHeldRollover(account, model, advisorModel = null, exclude = null) {
+    const window = this._governingWindow(account, model).window;
+    const elsewhere = this.accounts.some(a => a.index !== account.index
+      && !exclude?.has(a.index) && this._isAvailable(a, model, advisorModel));
+    const reason = elsewhere ? 'ranks-best' : 'none-eligible';
+    const key = `${account.index}:${window}:${reason}`;
+    const now = Date.now();
+    if (now < (this._rolloverHeldLogAt.get(key) || 0)) return;
+    this._rolloverHeldLogAt.set(key, now + 60_000);
+    console.log(`[TeamClaude] Account "${account.name}" rolled over its ${window} window ${this._heldRolloverReason(reason)}`);
+  }
+
+  /** The half of the held-rollover line that says which of the two cases it is. */
+  _heldRolloverReason(reason) {
+    switch (reason) {
+      case 'none-eligible': return 'but no eligible account can take that traffic — still routing there';
+      case 'ranks-best': return 'and still ranks best for it — staying there';
+      default: return assertNever(reason, '_noteHeldRollover');
+    }
+  }
+
+  /** The window a request bucket actually resolves to on this account: its own
+   * when the account reports that family's utilization, the shared weekly
+   * otherwise. Presence of the utilization decides it, matching _governingWeekly's
+   * fallback, so the baseline a rollover is measured against names the window
+   * the pressure was read from. */
+  _windowForBucket(account, bucket) {
+    if (bucket === 'unified7d') return bucket;
+    return account.quota[bucket] == null ? 'unified7d' : bucket;
+  }
+
+  /** Every bucket a request could be governed by here: the model families' own
+   * weekly buckets and the shared one, plus whatever a configured route's
+   * `bucket` override names — an override can make _weeklyBucketFor return a
+   * bucket the family table never mentions. */
+  _windowKeys() {
+    const keys = new Set(WEEKLY_BUCKET_KEYS);
+    for (const route of this.routes) if (route.bucket) keys.add(route.bucket);
+    return keys;
+  }
+
+  /**
+   * Every named window this account presents, as { windowName: reset }. Both
+   * spaces are walked because neither alone is complete: a bucket-only walk
+   * cannot name `scoped:opus`, since no bucket is named for Opus. Scoped windows
+   * are recorded whether or not they currently bind, because one that starts
+   * binding later would otherwise be first-sighted on the very request that
+   * should have caught it rolling.
+   */
+  _accountWindows(account) {
+    const out = {};
+    for (const bucket of this._windowKeys()) {
+      const window = this._windowForBucket(account, bucket);
+      const reset = account.quota[`${window}Reset`];
+      if (reset != null) out[window] = reset;
+    }
+    const scoped = account.quota.scopedWeekly;
+    if (scoped && typeof scoped === 'object') {
+      for (const [family, b] of Object.entries(scoped)) {
+        if (b?.resetAt != null) out[`scoped:${family}`] = b.resetAt;
+      }
+    }
+    return out;
   }
 
   /** The first configured route whose globs match `model`, or null. */
@@ -1586,7 +2202,7 @@ export class AccountManager {
     for (const account of this.accounts) this._clearExpiredQuotas(account);
   }
 
-  refreshExpiredQuotas() {
+  refreshExpiredQuotas(model = null) {
     let changed = false;
     const sessionReset = [];
     for (const account of this.accounts) {
@@ -1600,7 +2216,13 @@ export class AccountManager {
         sessionReset.push(account);
       }
     }
-    if (sessionReset.length) this._switchOnSessionReset(sessionReset);
+    // The model reaches the switch only while the feature is on. Handed no
+    // model, the switch runs the same `_isAvailable(acc)` it does with the knob
+    // off: threading one in would make the disabled path's candidate filter
+    // model-scoped, a live routing change on the path that promises none.
+    if (sessionReset.length) {
+      this._switchOnSessionReset(sessionReset, this.expiryRouting.enabled ? model : null);
+    }
     return changed;
   }
 
@@ -1609,32 +2231,68 @@ export class AccountManager {
    * weekly limit expires soonest — but only if that is sooner than the current
    * account's weekly limit and the account still has weekly quota to spend.
    */
-  _switchOnSessionReset(candidates) {
+  _switchOnSessionReset(candidates, model = null) {
     const current = this.accounts[this.currentIndex];
     // Need a known weekly reset on the current account to compare against;
-    // if it is unknown we are still probing it, so leave it alone.
-    if (!current || current.quota.unified7dReset == null) return;
+    // if it is unknown we are still probing it, so leave it alone. Read through
+    // the ranking so the account is compared on the window that governs THIS
+    // request; with the knob off that is the shared weekly.
+    const currentReset = current && this._rankingReset(current, model);
+    if (!current || currentReset == null) return;
 
-    let best = null;
-    let bestWeekly = current.quota.unified7dReset;
+    // Only accounts whose weekly expires sooner than the current one's are
+    // candidates: the "and weekly expires sooner" half of what this function is
+    // for. Kept separate from the ranking, so the ranking can change without
+    // moving the trigger.
+    const eligible = [];
     for (const acc of candidates) {
       if (acc.index === this.currentIndex) continue;
-      if (!this._isAvailable(acc)) continue; // enough session & weekly quota left
+      // Model-scoped, because the request being routed has one: an account whose
+      // Fable weekly is spent is still fully usable for Opus, and a switch that
+      // ignores the model can install one the model's own picker would refuse.
+      if (!this._isAvailable(acc, model)) continue; // enough session & weekly quota left
       // Don't demote to a lower-priority (higher value) account on a reset.
       if ((acc.priority || 0) > (current.priority || 0)) continue;
-      const weekly = acc.quota.unified7dReset;
+      const weekly = this._rankingReset(acc, model);
       if (weekly == null) continue; // need a known weekly to compare
-      if (weekly < bestWeekly) {
-        bestWeekly = weekly;
-        best = acc;
-      }
+      if (weekly < currentReset) eligible.push(acc);
+    }
+    if (!eligible.length) return;
+
+    // One clock for every account compared, the incumbent included, as in
+    // _pickLeastLoaded.
+    const now = Date.now();
+    const field = eligible.concat(current);
+    const ranks = this._rankedPressures(field, model, now);
+    const rankOf = new Map(field.map((a, i) => [a.index, ranks[i]]));
+
+    let best = null;
+    for (const acc of eligible) {
+      if (!best) { best = acc; continue; }
+      const mine = rankOf.get(acc.index);
+      const theirs = rankOf.get(best.index);
+      // Highest pressure, then soonest reset — the same order the pick uses,
+      // through the same function, so the two cannot disagree about which of two
+      // accounts is worth more.
+      if (mine < theirs
+        || (mine === theirs && this._rankedReset(acc, model) < this._rankedReset(best, model))) best = acc;
     }
 
-    if (best) {
-      this.currentIndex = best.index;
-      this._beginRamp(best);
-      console.log(`[TeamClaude] Account "${best.name}" session quota reset and weekly expires sooner — switching to it`);
-    }
+    // TWO guards, different properties, neither implying the other. Band
+    // membership says the account is worth spending at all. The rank comparison
+    // says this switch leaves no strictly better account behind, which
+    // membership does not claim once a lower tier passes through unbanded.
+    if (this.expiryRouting.enabled && !this._bandedCandidates(null, model).includes(best)) return;
+    // Strictly worse than what we are on: stay. Equal keeps the reset tiebreak
+    // that got us here, and with expiry routing off every rank is absent and
+    // equal, so this cannot fire at all.
+    if (rankOf.get(best.index) > rankOf.get(current.index)) return;
+    // Aiming, like every other cursor move: the reading was taken before this
+    // function ran and is left where it is, so a request pushed off here and
+    // failed back onto the same account still finds the roll waiting.
+    this._setCurrent(best);
+    this._beginRamp(best);
+    console.log(`[TeamClaude] Account "${best.name}" session quota reset and weekly expires sooner — switching to it`);
   }
 
   _isNearQuota(account, model = null) {
@@ -1673,38 +2331,46 @@ export class AccountManager {
    *   1. lowest `priority` value (operator-controlled; default 0, lower = preferred)
    *   2. then the account with no known weekly limit — using it lets us
    *      discover its quota
-   *   3. then the account whose weekly limit expires soonest: that quota is
+   *   3. then the account with the most expiring quota (headroom per second
+   *      until its window resets), when expiry routing is on
+   *   4. then the account whose weekly limit expires soonest: that quota is
    *      closest to refreshing, so spending it first preserves accounts whose
    *      weekly window resets further out.
-   * With all priorities at the default 0, this reduces to the weekly-reset
-   * heuristic. Returns the account or null if none are available.
+   * With expiry routing off, step 3 is absent for every account and this reduces
+   * to the weekly-reset heuristic. Returns the account or null if none are
+   * available. Step 3 generalises step 4: at equal headroom soonest reset is
+   * highest pressure, and the two part only where a timestamp alone would rank a
+   * nearly-drained account resetting in an hour over one holding 20x the quota
+   * that expires in ten.
    */
   _pickBestAvailable(exclude = null, model = null, advisorModel = null) {
     let best = null;
     let bestPriority = Infinity;
+    let bestPressure = Infinity;
     let bestReset = Infinity;
 
-    for (let i = 0; i < this.accounts.length; i++) {
-      const account = this.accounts[i];
-      if (exclude?.has(account.index)) continue;
-      // _isAvailable filters out accounts at/above the switch threshold, so the
-      // soonest-expiring pick only ever lands on an account whose 5-hour quota
-      // is still below 98%.
-      if (!this._isAvailable(account, model, advisorModel)) continue;
-
+    const candidates = this._bandedCandidates(exclude, model, advisorModel);
+    // One clock for every candidate, as in _pickLeastLoaded.
+    const now = Date.now();
+    const pressures = this._rankedPressures(candidates, model, now);
+    candidates.forEach((account, i) => {
       const priority = account.priority || 0;
-      // Rank by the reset of the weekly bucket that governs THIS model (Fable and
-      // Sonnet have their own), so a Fable request spends the account whose Fable
-      // window refreshes soonest while preserving accounts that reset later for
+      const pressure = pressures[i];
+      // Rank by the reset of the weekly window that governs THIS model (Fable and
+      // Sonnet have their own, and a family can be metered by a learned scoped
+      // bucket), so a Fable request spends the account whose Fable window
+      // refreshes soonest while preserving accounts that reset later for
       // Opus/Sonnet. Unknown reset sorts first so we probe and fill it in.
-      const weeklyReset = this._governingWeeklyReset(account, model) || -Infinity;
-      if (priority < bestPriority ||
-          (priority === bestPriority && weeklyReset < bestReset)) {
+      const weeklyReset = this._rankedReset(account, model);
+      if (priority < bestPriority
+          || (priority === bestPriority && pressure < bestPressure)
+          || (priority === bestPriority && pressure === bestPressure && weeklyReset < bestReset)) {
         bestPriority = priority;
+        bestPressure = pressure;
         bestReset = weeklyReset;
         best = account;
       }
-    }
+    });
     return best;
   }
 
@@ -1719,7 +2385,7 @@ export class AccountManager {
     this.refreshExpiredQuotas(); // drop any restored windows that already expired
     const best = this._pickBestAvailable();
     if (!best) return this.accounts[this.currentIndex] || null;
-    this.currentIndex = best.index;
+    this._setCurrent(best);
     this._beginRamp(best);
     best.probing = best.quota.unified7dReset == null;
     const wk = best.quota.unified7d != null
@@ -1740,9 +2406,11 @@ export class AccountManager {
       // chosen, often by hand for a weekly window about to lapse, to be spent by
       // what it can serve, and moving the whole fleet off it for one family's
       // sake undid that on the next request (#276).
-      const current = this.accounts[this.currentIndex];
+      //
+      // Through _setCurrent, so a move that DOES happen still records the
+      // rollover baseline and ramp bookkeeping the expiry machinery reads.
       const scoped = this._currentBarredOnlyFor(model, advisorModel, exclude);
-      if (!scoped) this.currentIndex = best.index;
+      if (!scoped) this._setCurrent(best);
       // If we switched to an account whose weekly quota is still unknown, flag
       // it so we re-evaluate once that quota is learned (see updateQuota).
       best.probing = best.quota.unified7dReset == null;
@@ -1784,7 +2452,7 @@ export class AccountManager {
     if (soonestAccount && soonestTime <= Date.now()) {
       soonestAccount.status = 'active';
       soonestAccount.rateLimitedUntil = null;
-      this.currentIndex = soonestAccount.index;
+      this._setCurrent(soonestAccount);
       this._beginRamp(soonestAccount);
       console.log(`[TeamClaude] Account "${soonestAccount.name}" reset, switching to it`);
       return soonestAccount;
@@ -2278,9 +2946,22 @@ export class AccountManager {
       if (idx === index) this.routeCursors.delete(name);
       else if (idx > index) this.routeCursors.set(name, idx - 1);
     }
-    // Session pins are positions in the same list and shift the same way.
-    this.sessionTracker.remapAccounts(idx =>
-      (idx === index ? null : idx > index ? idx - 1 : idx));
+    // Session pins are positions in the same list and shift the same way, and so
+    // are the rollover observations hanging off them and off the current account.
+    const remap = idx => (idx === index ? null : idx > index ? idx - 1 : idx);
+    this.sessionTracker.remapAccounts(remap);
+    // The observation names its account by index, so it follows the shift or
+    // goes away with the account it described. Left behind, it would be read
+    // against whichever account inherited the slot; its held roll the same.
+    const moved = this._currentObs?.idx == null ? null : remap(this._currentObs.idx);
+    if (this._currentObs) {
+      this._currentObs = moved == null ? null
+        : { idx: moved, windows: this._currentObs.windows, unescaped: remapHeld(this._currentObs.unescaped, remap) };
+    }
+    // A throttle key names an account by index, so the shift would point a live
+    // entry at a different account. Not worth renumbering: the entries expire in
+    // a minute and dropping them can only make the next held event report sooner.
+    this._rolloverHeldLogAt.clear();
   }
 
   /**
@@ -2349,6 +3030,9 @@ export class AccountManager {
       // per-bucket values rather than only the representative number.
       switchThresholds: typeof this.switchThreshold === 'object' && this.switchThreshold
         ? { ...this.switchThreshold } : null,
+      // The knob as the server resolved it, defaults and clamps applied, so an
+      // operator reading status sees the configuration the router is using.
+      expiryRouting: { ...this.expiryRouting },
       routes: this.getRoutes(),
       sessions: { ...sessions, distribute: this.distributeSessions, draining: this.drainingCount() },
       accounts: this.accounts.map(a => ({
@@ -2364,6 +3048,11 @@ export class AccountManager {
         // without it the two are indistinguishable in status output (#166).
         unavailable: this.unavailableReason(a),
         sessions: sessions.perAccount[a.index] || 0,
+        // Shared-weekly pressure (model-agnostic), so the ordering the router
+        // works from can be read off the payload. Computed whether or not the
+        // knob is on: a measurement of the fleet, not a report of the feature's
+        // state.
+        pressure: this._expiryPressure(a),
         quota: { ...a.quota },
         // `byBucket` is the one nested value under `usage`, so the shallow copy
         // that covers every flat counter beside it would hand the caller a live

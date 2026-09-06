@@ -85,6 +85,12 @@ export function gatingUtilization(quota, bucketKey) {
   return Math.max(own, shared);
 }
 
+// Every bucket weeklyBucketForModel can name: the family-specific ones plus the
+// shared bucket the rest fall back to. Exported so a caller that must cover all
+// of them at once does not keep a second copy of the list.
+export const WEEKLY_BUCKET_KEYS = Object.freeze(
+  [...new Set([...Object.values(FAMILY_WEEKLY_BUCKET), 'unified7d'])]);
+
 // Match a shell-style glob against a model id. Only `*` is special (matches any
 // run of characters, including none); every other character is literal. The
 // comparison is case-insensitive. Used by configurable routes so a pattern like
