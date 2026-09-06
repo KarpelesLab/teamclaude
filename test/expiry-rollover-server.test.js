@@ -103,22 +103,16 @@ const serves = (res, name) => {
 // account to the request's tried set, so selection is free to hand the same
 // account straight back. `seen` records that the path was actually taken —
 // an arm covering a branch has to prove it reached it.
+// NOTE: 'a rate-limit 429' used to be an arm here, on the grounds that the
+// server "pauses the account, absorbs the wait inline and retries it, never
+// rotating". #271 changed that deliberately: a rate-limit 429 now takes one
+// bounded failover hop to an idle sibling, because never rotating also stalls a
+// fleet whose sibling is idle (#137, #156, #165). It is therefore no longer a
+// same-account retry, and the fixtures below — which assert the request stays
+// on the account it was retried against — cannot describe it. Its own
+// behaviour, including that the hop is bounded to one, is covered by
+// test/bounded-failover.test.js.
 const SAME_ACCOUNT_RETRIES = [
-  {
-    name: 'a rate-limit 429',
-    options: () => ({}),
-    reject(seen, res) {
-      seen.push('429');
-      // No `anthropic-ratelimit-*-status: rejected`, so this is the transient
-      // throttle rather than a quota rejection: the server pauses the account,
-      // absorbs the wait inline and retries it, never rotating.
-      res.writeHead(429, { 'retry-after': '1', 'content-type': 'application/json' });
-      res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error' } }));
-    },
-    assertReached(seen) {
-      assert.deepEqual(seen, ['429'], 'the fixture must have throttled b exactly once');
-    },
-  },
   {
     name: 'a 401',
     // A refresh that succeeds and mints the same access token, so the retry is

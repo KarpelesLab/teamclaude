@@ -480,14 +480,13 @@ test('a draining session whose pin is not the current account keeps its roll', (
   rollWindow(am, 0);
   // The drain releases the session; the ordinary walk is on b, which has not
   // rolled, so the request settles there and nothing has spoken for a's roll.
-  const carried = {};
   am.beginSession('s1');
-  const first = am.getActiveAccount(null, OPUS, null, 's1', carried);
+  const first = am.getActiveAccount(null, OPUS, null, 's1');
   assert.equal(first.name, 'b', 'the released session should have taken the cursor\'s account');
   am.recordSession('s1', first.index, OPUS);
   // b is refused and c is over threshold, so the retry falls back onto a.
   am.accounts[2].quota.unified7d = 0.99;
-  const retry = am.getActiveAccount(new Set([first.index]), OPUS, null, 's1', carried);
+  const retry = am.getActiveAccount(new Set([first.index]), OPUS, null, 's1');
   assert.equal(retry.name, 'a', 'the retry should have fallen back onto the rolled account');
   am.recordSession('s1', retry.index, OPUS);
   am.endSession('s1');
