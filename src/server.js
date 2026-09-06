@@ -4,7 +4,7 @@ import { timingSafeEqual } from 'node:crypto';
 import { createWriteStream, mkdirSync, writeSync } from 'node:fs';
 import { readdir, stat, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
-import { ensureCerts, createConnectHandler } from './mitm.js';
+import { ensureCerts, createConnectHandler, mitmHosts } from './mitm.js';
 import { patchAccountUuid } from './account-uuid-rewrite.js';
 import { sanitizeToolPairs } from './tool-pair-sanitize.js';
 import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
@@ -363,12 +363,15 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
   // to the upstream host is a transparent MITM relay (rewrite only auth); the
   // test host is answered locally; anything else is blind-tunneled. Certs are
   // minted lazily on the first intercepted CONNECT.
-  const mitmHost = (() => { try { return new URL(upstream).hostname; } catch { return 'api.anthropic.com'; } })();
+  // Every host the leaf must cover, not just the Anthropic upstream: a Codex
+  // account is reached on chatgpt.com, and MITM cannot intercept a host its
+  // certificate does not name.
+  const mitmHostList = mitmHosts(config);
   let certsPromise = null;
   const ensureLeaf = async () => {
     // Reset the memo on failure so a transient cert error doesn't wedge the MITM
     // path permanently (a cached rejected promise would re-throw on every CONNECT).
-    certsPromise ||= ensureCerts(mitmHost).catch((err) => { certsPromise = null; throw err; });
+    certsPromise ||= ensureCerts(mitmHostList).catch((err) => { certsPromise = null; throw err; });
     const c = await certsPromise;
     return { key: c.leafKeyPem, cert: c.leafCertPem };
   };

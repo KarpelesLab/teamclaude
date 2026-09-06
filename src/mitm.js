@@ -21,6 +21,7 @@ import http2 from 'node:http2';
 import { getConfigPath } from './config.js';
 import { generateCertChain } from './x509.js';
 import { createProxyRequestListener, resolveClientAuth, isLoopbackAddr, relayUpgrade, resolveAccountPin, describeConnectError } from './server.js';
+import { interceptHostsFor, isNeverIntercepted } from './provider.js';
 
 const CA_CERT = 'teamclaude-ca.pem';
 const LEAF_CERT = 'teamclaude-leaf.pem';
@@ -71,7 +72,9 @@ function leafCovers(caCertPem, leafCertPem, hosts) {
  * Returns { caPath, caCertPem, leafCertPem, leafKeyPem }.
  */
 export async function ensureCerts(host) {
-  const hosts = host === TEST_HOST ? [TEST_HOST] : [host, TEST_HOST];
+  const named = Array.isArray(host) ? host : [host];
+  const hosts = [...new Set(named.filter(Boolean))];
+  if (!hosts.includes(TEST_HOST)) hosts.push(TEST_HOST);
   const [caCertPem, leafCertPem, leafKeyPem] = await Promise.all([
     readIf(fpath(CA_CERT)), readIf(fpath(LEAF_CERT)), readIf(fpath(LEAF_KEY)),
   ]);
@@ -98,10 +101,23 @@ function upstreamHostOf(config) {
   catch { return 'api.anthropic.com'; }
 }
 
+/** Every host the MITM leaf must be valid for, given this config. */
+export function mitmHosts(config) {
+  return [...new Set([upstreamHostOf(config), ...interceptHostsFor(config?.accounts || [])])];
+}
+
 /** Per-CONNECT behavior: 'rewrite' (intercept + token inject), 'test', or 'tunnel'. */
 export function hostMode(host, config) {
   if (host === TEST_HOST) return 'test';
+  // Explicitly never intercepted, even though it sits under a provider's domain
+  // — checked before anything else so no later rule can claim it.
+  if (isNeverIntercepted(host)) return 'tunnel';
   if (host === upstreamHostOf(config)) return 'rewrite';
+  // A second provider's host, and only when an account actually uses that
+  // provider. MITM is the mode that works without the client cooperating — a
+  // CLI that honours only HTTPS_PROXY has no base URL to redirect — so refusing
+  // to intercept here is the same as not supporting the provider at all.
+  if (interceptHostsFor(config?.accounts || []).includes(host)) return 'rewrite';
   return 'tunnel';
 }
 

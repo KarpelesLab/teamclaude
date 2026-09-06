@@ -33,7 +33,7 @@ import { syncAccountsFromDisk } from './sync-accounts.js';
 import { mergeAccountsForSave, syncRefreshedTokens, removedAccountIds, clearRemovedAccountIds } from './account-pairing.js';
 import { ensureAccountIds } from './account-id.js';
 import * as alias from './alias.js';
-import { ensureCerts } from './mitm.js';
+import { ensureCerts, mitmHosts } from './mitm.js';
 import { Prober } from './prober.js';
 import { Warmer } from './warmer.js';
 import { createRollingWarmupSchedule, formatWarmupScheduleConfirmation, resolveWarmupConfig, resolveWarmupSchedule } from './warmup-schedule.js';
@@ -863,7 +863,9 @@ async function envCommand() {
   const useMitm = !args.slice(1).includes('--no-mitm');
 
   let caPath = null;
-  if (useMitm) ({ caPath } = await ensureCerts(upstreamHost(config)));
+  // The leaf has to name every host MITM will intercept, or the CONNECT for
+  // a second provider fails the handshake instead of being served.
+  if (useMitm) ({ caPath } = await ensureCerts(mitmHosts(config)));
 
   // Same pin as `teamclaude run`, so `eval "$(teamclaude env)"` and `run` agree.
   const account = (process.env.TC_ACCT || '').trim();
@@ -944,8 +946,7 @@ async function runCommand() {
       // Route ALL of claude's traffic through us as an HTTPS forward proxy, so
       // even hardcoded api.anthropic.com endpoints (e.g. the design MCP) get the
       // real token injected. claude trusts our MITM leaf via NODE_EXTRA_CA_CERTS.
-      const host = upstreamHost(config);
-      const { caPath } = await ensureCerts(host);
+      const { caPath } = await ensureCerts(mitmHosts(config));
       // The pin rides in the proxy URL's userinfo, which the client forwards as
       // `Proxy-Authorization: Basic <acct>:<key>` on each CONNECT — the only pin
       // channel an HTTPS_PROXY env var can express. The password slot keeps the
@@ -2120,12 +2121,6 @@ function isLocalAccountPin(url, port) {
 function argValue(flag) {
   const i = args.indexOf(flag);
   return (i >= 0 && args[i + 1]) ? args[i + 1] : null;
-}
-
-// Hostname of the configured upstream (the host MITM-intercepts under `run`).
-function upstreamHost(config) {
-  try { return new URL(config.upstream || 'https://api.anthropic.com').hostname; }
-  catch { return 'api.anthropic.com'; }
 }
 
 // Keep the terminal title in sync with the active account (e.g. "teamclaude 2/4
