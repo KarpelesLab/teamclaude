@@ -1009,29 +1009,13 @@ export class AccountManager {
     return max;
   }
 
-  /** Weekly utilization (0-1) that gates `model` on this account: the higher of
+  /**
+   * Weekly utilization (0-1) that gates `model` on this account: the higher of
    * the bucket that governs the model (unified7dFable for Fable,
    * unified7dSonnet for Sonnet, unified7d otherwise) and the shared unified7d,
    * since family spend meters into both. Null when neither reports — see
-   * `gatingUtilization` for why that stays null rather than becoming 0. */
-  _governingWeekly(account, model) {
-    const q = account.quota;
-    const key = this._weeklyBucketFor(model);
-    // A dedicated family bucket does NOT stand alone: family spend meters into
-    // the shared weekly too, so an account under its Fable cap can be over the
-    // shared one. Gating on the family bucket alone is a one-way ratchet —
-    // once the shared weekly caps, family requests are the only ones still
-    // admitted, and each one pushes it further over (#175).
-    if (key !== 'unified7d') return gatingUtilization(q, key);
-    // No dedicated field for this family — but the usage endpoint may still
-    // report a weekly bucket scoped to it (upstream adds these over time). Gate
-    // on the tighter of that bucket and the shared weekly, so a family with its
-    // own cap can't overshoot it just because the code predates the family.
-    const scoped = this._scopedWeekly(account, model)?.utilization;
-    const known = [q.unified7d, scoped].filter(v => v != null);
-    return known.length ? Math.max(...known) : null;
-
-  /**
+   * `gatingUtilization` for why that stays null rather than becoming 0.
+   *
    * WHY THIS IS NOT `_governingWindow(...).utilization`.
    *
    * The two answer different questions and must be allowed to differ.
@@ -1051,6 +1035,22 @@ export class AccountManager {
    * So collapsing them would either revert #175 or misprice the pressure. They
    * stay separate on purpose.
    */
+  _governingWeekly(account, model) {
+    const q = account.quota;
+    const key = this._weeklyBucketFor(model);
+    // A dedicated family bucket does NOT stand alone: family spend meters into
+    // the shared weekly too, so an account under its Fable cap can be over the
+    // shared one. Gating on the family bucket alone is a one-way ratchet —
+    // once the shared weekly caps, family requests are the only ones still
+    // admitted, and each one pushes it further over (#175).
+    if (key !== 'unified7d') return gatingUtilization(q, key);
+    // No dedicated field for this family — but the usage endpoint may still
+    // report a weekly bucket scoped to it (upstream adds these over time). Gate
+    // on the tighter of that bucket and the shared weekly, so a family with its
+    // own cap can't overshoot it just because the code predates the family.
+    const scoped = this._scopedWeekly(account, model)?.utilization;
+    const known = [q.unified7d, scoped].filter(v => v != null);
+    return known.length ? Math.max(...known) : null;
   }
 
   /** The learned scoped weekly bucket governing `model`, or null. Keyed by the
