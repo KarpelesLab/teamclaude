@@ -550,7 +550,7 @@ export class AccountManager {
    * satisfies both, selection degrades to executor-only routing so the main
    * request keeps flowing (upstream then fails just the advisor call).
    */
-  getActiveAccount(exclude = null, model = null, advisorModel = null, sessionId = null, provider = DEFAULT_PROVIDER) {
+  getActiveAccount(exclude = null, model = null, advisorModel = null, sessionId = null, provider = DEFAULT_PROVIDER, decision = null) {
     // Selection reads this.currentIndex as "where the fleet is". With more than
     // one provider that is a single slot for several fleets, so a request whose
     // provider does not own it borrows the slot for the walk and hands it back.
@@ -571,10 +571,17 @@ export class AccountManager {
     // the alternative is a provider argument on six private methods that exist
     // to answer a different question.
     this._selectingProvider = provider;
+    // Somewhere to record WHY this walk moved, for a caller that has to act on
+    // it later. Scoped like the provider above, and for the same reason: the
+    // walk is synchronous, so nothing can interleave. It cannot be an instance
+    // field the caller reads afterwards — the failover hop runs after an
+    // upstream round trip, by which time another request has selected.
+    this._selectionDecision = decision;
     try {
       account = this._pickActiveAccount(this._excludeOtherProviders(exclude, provider), model, advisorModel, sessionId);
     } finally {
       this._selectingProvider = null;
+      this._selectionDecision = null;
       // Hand the slot back before anything can observe it moved. Only the
       // provider that owns currentIndex gets to change it.
       if (borrowed) this.currentIndex = saved;
@@ -704,6 +711,15 @@ export class AccountManager {
         && this._currentRolledOver(current, model);
       if (rolled) {
         const next = this._selectNext(exclude, model, advisorModel);
+        // Tell the caller which account this walk deliberately routed away from.
+        // A later availability hop (a rate-limit 429, an upstream 5xx) must not
+        // undo it: that account was never *tried* upstream, so it is absent from
+        // the request's tried set, and the hop would otherwise hand the request
+        // straight back to the window the rollover moved it off — inside the
+        // same request, and invisibly.
+        if (next && next.index !== current.index && this._selectionDecision) {
+          (this._selectionDecision.rolledOff ??= new Set()).add(current.index);
+        }
         // Both ways of not moving end here: nothing eligible, or the re-rank
         // handing back the account being moved off. Neither refreshes the
         // observation, so the next request compares against the same pre-roll
