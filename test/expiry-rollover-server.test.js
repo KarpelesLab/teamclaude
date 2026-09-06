@@ -333,10 +333,16 @@ for (const distribute of [false, true]) {
       assert.equal(await send(sid), 'a', 'the fixture must start on a');
       am.accounts[0].quota.unified7dReset = Date.now() + 500 * H;
 
-      assert.equal(await send(sid), 'b', 'the chain should have ended on b');
-      // The roll landed inside the aim window and is a first sight, so the
-      // throttle's retry stays on b: the chain is a -> b -> b, c never reached.
-      assert.deepEqual(seen, ['b'], 'the chain must have gone a -> b -> b');
+      // The chain's exact shape is #271's business now: a rate-limit 429 takes
+      // one bounded failover hop rather than retrying the same account, so
+      // `a -> b -> b` is no longer reachable and that shape is covered by
+      // bounded-failover.test.js. What this test is for is the invariant below —
+      // the roll that started the chain is answered, and the hop does not undo
+      // it — so it asserts that and leaves the shape alone.
+      const landed = await send(sid);
+      assert.notEqual(landed, 'a',
+        'the chain settled back onto the account its rollover pushed it off');
+      assert.ok(seen.includes('b'), 'the chain must have reached b');
 
       // The roll that started the chain is answered: the traffic left a and did
       // not drift back to it.
