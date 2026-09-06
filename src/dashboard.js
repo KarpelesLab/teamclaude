@@ -145,22 +145,46 @@ export function switchOutcome(res) {
 // is where it is.
 export function routeRows(status) {
   var s = status || {};
+  var blockedModels = s.blockedModels || [];
   var rows = (s.routes || []).map(function (r) {
     var accounts = r.accounts || [];
     var name = r.name || '';
+    var match = r.match || [];
+    var target = r.target || null;
+    var pinned = r.pinned || null;
     return {
+      kind: 'route',
       name: name,
       label: name.charAt(0).toUpperCase() + name.slice(1),
-      match: (r.match || []).join(', '),
-      target: r.target || null,
-      pinned: r.pinned || null,
+      match: match.join(', '),
+      target: target,
+      pinned: pinned,
+      // A pin the server is not honouring (its account cannot serve the
+      // family right now): routing went elsewhere, and the row must say so
+      // rather than let "pinned" read as "this is the pin".
+      pinMismatch: !!pinned && pinned !== target,
+      // The blocklist answers 400 before selection, so a route whose every
+      // glob is blocked has a target no request will reach. A literal glob
+      // comparison covers the common case; the server's overlap logic is not
+      // shipped to the page.
+      blocked: match.length > 0 && match.every(function (g) { return blockedModels.indexOf(g) !== -1; }),
       autocreated: !!r.autocreated,
       eligible: accounts.filter(function (a) { return a.eligible; }).map(function (a) { return a.name; }),
       ineligible: accounts.filter(function (a) { return !a.eligible; }).map(function (a) { return a.name; }),
     };
   });
   if (rows.length) {
-    rows.push({ name: '', label: 'Everything else', match: '', target: s.currentAccount || null, pinned: null, autocreated: false, eligible: [], ineligible: [] });
+    // The default row is the server's answer too (`defaultTarget`), not an
+    // assumption that unrouted traffic lands on the current account: a
+    // blocked or outranked current account is skipped by the next request.
+    var current = s.currentAccount || null;
+    var cur = (s.accounts || []).filter(function (a) { return a.name === current; })[0];
+    rows.push({
+      kind: 'default', name: '', label: 'Everything else', match: '',
+      target: s.defaultTarget || current, current: current,
+      currentUnavailable: (cur && cur.unavailable) || null,
+      pinned: null, pinMismatch: false, blocked: false, autocreated: false, eligible: [], ineligible: [],
+    });
   }
   return rows;
 }
@@ -228,6 +252,8 @@ const PAGE = `<!doctype html>
   .ok { color: var(--ok); }
   .no { color: var(--dim); text-decoration: line-through; }
   .pin { color: var(--accent); font-size: 12px; }
+  .warnt { color: var(--warn); font-size: 12px; }
+  .badt { color: var(--bad); }
   #err { color: var(--bad); margin: 12px 0; display: none; }
   #keybox { display: none; margin: 40px auto; max-width: 420px; text-align: center; }
   #keybox input { width: 100%; padding: 10px 12px; margin: 12px 0; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; color: var(--text); font: inherit; }
@@ -563,15 +589,22 @@ ${SHARED_HELPERS}
       var fam = el('td', '', r.label + (r.match ? ' ' : ''));
       if (r.match) fam.appendChild(el('span', 'tag', r.match));
       tr.appendChild(fam);
-      var to = el('td', '', r.target || '—');
-      if (r.pinned) to.appendChild(el('span', 'pin', ' · pinned'));
+      var to = el('td', r.blocked ? 'badt' : '', r.blocked ? 'blocked' : (r.target || '—'));
+      if (r.pinned) to.appendChild(el('span', 'pin', ' · pinned to ' + r.pinned));
+      if (r.pinMismatch) to.appendChild(el('span', 'warnt', ' (not eligible)'));
+      if (r.kind === 'default' && r.target !== r.current) {
+        to.appendChild(el('span', 'warnt', r.currentUnavailable
+          ? ' · current account ' + r.current + ' is blocked: ' + (UNAVAILABLE_TEXT[r.currentUnavailable] || r.currentUnavailable)
+          : ' · outranks the current account ' + r.current));
+      }
       tr.appendChild(to);
-      var can = el('td', r.match ? '' : 'dim');
-      if (!r.match) can.textContent = 'current account';
+      var can = el('td', r.kind === 'default' ? 'dim' : '');
+      if (r.kind === 'default') can.textContent = 'no route of its own';
+      else if (r.blocked) can.textContent = '—';
       else if (!r.eligible.length && !r.ineligible.length) can.textContent = '—';
       else {
-        can.appendChild(el('span', 'ok', r.eligible.length + ' of ' + (r.eligible.length + r.ineligible.length)));
-        if (r.ineligible.length) can.appendChild(el('span', 'no', ' ' + r.ineligible.join(', ')));
+        can.appendChild(el('span', 'ok', r.eligible.length + ' of ' + (r.eligible.length + r.ineligible.length) + (r.ineligible.length ? ' ' : '')));
+        if (r.ineligible.length) can.appendChild(el('span', 'no', r.ineligible.join(', ')));
       }
       tr.appendChild(can);
       table.appendChild(tr);

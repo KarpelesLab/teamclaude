@@ -200,10 +200,55 @@ test('route rows say where each family goes, why, and where everything else goes
   assert.deepEqual({ label: rest.label, target: rest.target, match: rest.match }, { label: 'Everything else', target: 'a', match: '' });
 });
 
-test('a pinned route carries its pin, and a fleet with no routes renders no section', () => {
-  const pinned = routeRows({ ...ROUTED, routes: [{ ...ROUTED.routes[0], pinned: 'c', target: 'c' }] });
-  assert.equal(pinned[0].pinned, 'c');
-  assert.equal(pinned[0].target, 'c');
+test('a pinned route carries its pin, and says when routing is not honouring it', () => {
+  const honoured = routeRows({ ...ROUTED, routes: [{ ...ROUTED.routes[0], pinned: 'c', target: 'c' }] })[0];
+  assert.deepEqual({ pinned: honoured.pinned, target: honoured.target, mismatch: honoured.pinMismatch }, { pinned: 'c', target: 'c', mismatch: false });
+  // The server skips a pin whose account cannot serve the family; "b · pinned"
+  // would read as b being the pin. The row must carry both names.
+  const skipped = routeRows({ ...ROUTED, routes: [{ ...ROUTED.routes[0], pinned: 'c', target: 'b' }] })[0];
+  assert.deepEqual({ pinned: skipped.pinned, target: skipped.target, mismatch: skipped.pinMismatch }, { pinned: 'c', target: 'b', mismatch: true });
+});
+
+test('the default row is the server\'s defaultTarget, and says why when it is not the current account', () => {
+  const blocked = { ...ROUTED, defaultTarget: 'b', accounts: [{ name: 'a', unavailable: 'throttled' }, { name: 'b', unavailable: null }] };
+  const row = routeRows(blocked)[1];
+  assert.equal(row.kind, 'default');
+  assert.equal(row.target, 'b', 'not the current account');
+  assert.equal(row.current, 'a');
+  assert.equal(row.currentUnavailable, 'throttled');
+  // Without defaultTarget (an older server) the row falls back to the current account.
+  assert.equal(routeRows(ROUTED)[1].target, 'a');
+});
+
+test('a route whose every glob is blocked has no reachable target', () => {
+  assert.equal(routeRows({ ...ROUTED, blockedModels: ['*fable*'] })[0].blocked, true);
+  assert.equal(routeRows({ ...ROUTED, blockedModels: ['*opus*'] })[0].blocked, false);
+  assert.equal(routeRows(ROUTED)[0].blocked, false);
+  const empty = routeRows({ ...ROUTED, routes: [{ ...ROUTED.routes[0], target: null, accounts: [] }] })[0];
+  assert.deepEqual({ target: empty.target, eligible: empty.eligible, ineligible: empty.ineligible }, { target: null, eligible: [], ineligible: [] });
+});
+
+test('route rows read the shape a real AccountManager reports', () => {
+  const am = new AccountManager([
+    { name: 'a', type: 'api_key', apiKey: 'sk-a' },
+    { name: 'b', type: 'api_key', apiKey: 'sk-b' },
+  ], 0.98);
+  const H = 3600_000;
+  Object.assign(am.accounts[0].quota, { unified7d: 0.3, unified7dReset: Date.now() + 4 * H, unified7dFable: 0.99, unified7dFableReset: Date.now() + 4 * H });
+  Object.assign(am.accounts[1].quota, { unified7d: 0.1, unified7dReset: Date.now() + 90 * H, unified7dFable: 0.1, unified7dFableReset: Date.now() + 90 * H });
+  const rows = routeRows(am.getStatus());
+  const fable = rows.find(r => r.name === 'fable');
+  assert.ok(fable, 'the server autocreates a Fable route once an account meters it');
+  assert.deepEqual({ target: fable.target, ineligible: fable.ineligible }, { target: 'b', ineligible: ['a'] });
+  assert.deepEqual({ target: rows[rows.length - 1].target, current: rows[rows.length - 1].current }, { target: 'a', current: 'a' });
+  // The current account becomes unusable: the default row follows the server,
+  // not the stale current name.
+  am.setDisabled(0, true);
+  const after = routeRows(am.getStatus())[rows.length - 1];
+  assert.deepEqual({ target: after.target, current: after.current, why: after.currentUnavailable }, { target: 'b', current: 'a', why: 'disabled' });
+});
+
+test('a fleet with no routes renders no section', () => {
   // Without a metered family there is nothing to route: the summary line
   // already names the current account, so no redundant one-row table.
   assert.deepEqual(routeRows({ currentAccount: 'a', routes: [] }), []);
