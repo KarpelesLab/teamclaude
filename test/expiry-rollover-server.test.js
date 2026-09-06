@@ -399,9 +399,9 @@ for (const distribute of [false, true]) {
       assert.deepEqual(await Promise.all([first, second, third]), ['a', 'a', 'a'],
         'every refused request should have fallen back onto a');
 
-      // Nothing completed at b, so a is still owed the roll it was pushed off.
+      // Nothing was served at b, so a is still owed the roll it was pushed off.
       assert.equal(await send(sid), 'b',
-        'a stay no request completed released the roll the preemption held');
+        'a destination that served none of them released the roll the preemption held');
     } finally {
       await close();
     }

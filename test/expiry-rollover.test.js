@@ -1041,12 +1041,12 @@ test('a retry that never left the destination does not spend the origin roll', (
     'the refusal did not fall back onto the rolled account');
 
   assert.equal(serve(am, null, OPUS).name, 'b',
-    'the retry was read as a completed stay and spent the roll');
+    'the retry was read as a confirmed stay and spent the roll');
 });
 
 test('a stay a second request confirms releases the roll it was pushed off', () => {
   // The held roll is the fail-back's protection and nothing more. Once a request
-  // has found the traffic where the last one left it AND completed there, the
+  // has found the traffic where the last one left it AND been served there, the
   // move stuck and the origin's roll is escaped — holding it any longer would
   // preempt off that account every time the fleet came back to it, for a
   // rollover it has already been moved off once.
@@ -1058,9 +1058,9 @@ test('a stay a second request confirms releases the roll it was pushed off', () 
 
   assert.equal(serve(am, null, OPUS).name, 'b', 'the rollover did not preempt');
   // The preemption AIMED at b; the next request is the first to rest there. The
-  // one after it finds the traffic already at rest and completes, which is the
-  // confirmation — `serve()` drives no upstream response, so the completion the
-  // server reports on an accepted status is spelled out here. The generation is
+  // one after it finds the traffic already at rest and is served, which is the
+  // confirmation — `serve()` drives no upstream response, so the confirmation
+  // the server makes on an accepted status is spelled out here. The generation is
   // read before that request's own selection, because a selection that moves the
   // observation is the traffic arriving rather than being found at rest.
   assert.equal(serve(am, null, OPUS).name, 'b', 'the first request did not rest on b');
