@@ -2409,6 +2409,9 @@ export class AccountManager {
       //
       // Through _setCurrent, so a move that DOES happen still records the
       // rollover baseline and ramp bookkeeping the expiry machinery reads.
+      // Read before the move: the diversion log names the account being diverted
+      // FROM, and _setCurrent would already have changed it.
+      const current = this.accounts[this.currentIndex];
       const scoped = this._currentBarredOnlyFor(model, advisorModel, exclude);
       if (!scoped) this._setCurrent(best);
       // If we switched to an account whose weekly quota is still unknown, flag
