@@ -302,7 +302,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           res.end(JSON.stringify({ ok: false, error: `no such account "${target}"`, accounts: names() }));
           return;
         }
-        accountManager.currentIndex = index;
+        accountManager.setCurrentAccount(index);
         const name = accountManager.accounts[index].name;
         // Recording the choice and the choice taking effect are two different
         // things: selection skips an account it cannot use on the very next
@@ -1390,6 +1390,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   const pinned = ctx.pinnedIndex != null && !ctx.tried.has(ctx.pinnedIndex)
     ? accountManager.accounts[ctx.pinnedIndex]
     : null;
+  // What this attempt's selection decided beyond which account it returned.
+  // Carried on ctx rather than read straight back, because the failover hops
+  // below run after an upstream round trip.
+  const selection = {};
   // A pin bypasses selection entirely, so the provider partition has to be
   // enforced here too — otherwise TC_ACCT aimed at a Claude subscription would
   // serve a Codex request from it, sending an OpenAI-shaped body to
@@ -1400,7 +1404,15 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     && providerOf(pinned) !== (ctx.provider || DEFAULT_PROVIDER);
   const account = ctx.pinnedIndex != null
     ? (pinned && !pinnedWrongProvider && !accountManager.capExceeded(pinned, ctx.model) ? pinned : null)
-    : accountManager.getActiveAccount(ctx.tried, ctx.model, ctx.advisorModel, ctx.sessionId, ctx.provider);
+    : accountManager.getActiveAccount(
+      ctx.tried, ctx.model, ctx.advisorModel, ctx.sessionId, ctx.provider, selection,
+    );
+  // Accounts a rollover deliberately routed this request away from. Request-
+  // scoped: the decision belongs to the request, not to one attempt of it.
+  if (selection.rolledOff) {
+    ctx.rolledOff ??= new Set();
+    for (const i of selection.rolledOff) ctx.rolledOff.add(i);
+  }
   if (pinnedWrongProvider && !res.headersSent && !clientGone(res)) {
     // Named plainly: a pin that cannot serve is a configuration mistake, and the
     // exhausted-account response would send the operator looking at quota.
@@ -1732,8 +1744,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // request, and the sx fresh-IP retry and the inline wait take over —
       // which is the right response to an IP-scoped limit.
       if (!ctx.rateLimitHopped && retryCount < maxRetries) {
+        // ctx.rolledOff as well as tried: an account a rollover moved this
+        // request off was never sent a request, so it is not in `tried`, and
+        // hopping back onto it would reverse that decision one step later.
         const alt = accountManager.getActiveAccount(
-          new Set([...ctx.tried, account.index]), ctx.model, ctx.advisorModel, ctx.sessionId, ctx.provider,
+          new Set([...ctx.tried, ...(ctx.rolledOff || []), account.index]),
+          ctx.model, ctx.advisorModel, ctx.sessionId, ctx.provider,
         );
         if (alt && !accountManager.isPaused(alt.index)) {
           ctx.rateLimitHopped = true;
@@ -1805,8 +1821,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // account'"'"'s cache discovering that. After the hop the response goes to the
     // client as it does today, with its own retry-after intact.
     if (upstreamRes.status >= 500 && !res.headersSent && !ctx.serverErrorHopped && retryCount < maxRetries) {
+      // Same exclusion as the 429 hop: see there.
       const alt = accountManager.getActiveAccount(
-        new Set([...ctx.tried, account.index]), ctx.model, ctx.advisorModel, ctx.sessionId, ctx.provider,
+        new Set([...ctx.tried, ...(ctx.rolledOff || []), account.index]),
+        ctx.model, ctx.advisorModel, ctx.sessionId, ctx.provider,
       );
       if (alt && !accountManager.isPaused(alt.index)) {
         await upstreamRes.body?.cancel();

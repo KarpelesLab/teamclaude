@@ -150,3 +150,65 @@ test('isPaused reports the rate-limit pause selection does not model', () => {
   assert.equal(am.isPaused(0), true);
   assert.equal(am.isPaused(1), false);
 });
+
+// The failover hop must not undo a routing decision made one step earlier.
+//
+// Expiry routing preempts traffic off an account whose weekly window just
+// rolled — correctly, since a rolled window is now the furthest-dated and
+// should be spent last. That account was never sent a request, so it is absent
+// from ctx.tried, and the hop would otherwise hand the request straight back to
+// it when the destination answers 429 — reversing the rollover inside the same
+// request, and invisibly.
+test('a rate-limit hop does not land back on the account a rollover moved off', async () => {
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    const token = tokenOf(req);
+    seen.push(token);
+    if (token === 't-b') {
+      res.writeHead(429, { 'retry-after': '300', 'content-type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error' } }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+  });
+  const upstreamPort = await listen(upstream);
+
+  const H = 3600_000;
+  const am = new AccountManager([
+    { name: 'a', type: 'oauth', accessToken: 't-a', refreshToken: 'r', expiresAt: Date.now() + H },
+    { name: 'b', type: 'oauth', accessToken: 't-b', refreshToken: 'r', expiresAt: Date.now() + H },
+    { name: 'c', type: 'oauth', accessToken: 't-c', refreshToken: 'r', expiresAt: Date.now() + H },
+  ], 0.98, { expiryRouting: { enabled: true, tolerance: 1.5, preempt: true } });
+
+  // Everyone has headroom; a's window is the soonest, so traffic starts there.
+  am.accounts.forEach((acct, i) => {
+    acct.quota.unified7d = 0.4;
+    acct.quota.unified7dReset = Date.now() + (i === 0 ? 10 : 20 + i * 10) * H;
+  });
+  am.currentIndex = 0;
+
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const proxyPort = await listen(proxy);
+
+  try {
+    // One request first, so a's pre-roll reset is observed — a rollover is a
+    // CHANGE, and with no earlier reading there is nothing for it to differ from.
+    assert.equal((await post(proxyPort)).status, 200);
+    assert.deepEqual(seen, ['t-a'], 'the fixture must start on a');
+
+    // a's window rolls: it is now the furthest-dated and should be held, not spent.
+    am.accounts[0].quota.unified7dReset = Date.now() + 500 * H;
+
+    const before = seen.length;
+    const { status } = await post(proxyPort);
+    assert.equal(status, 200);
+    const chain = seen.slice(before);
+    assert.ok(chain.includes('t-b'), `the roll should have moved traffic off a: ${chain.join(', ')}`);
+    assert.ok(!chain.includes('t-a'),
+      `the hop returned to the rolled-off account: ${chain.join(', ')}`);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
