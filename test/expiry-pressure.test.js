@@ -265,7 +265,7 @@ test('an equal-pressure tie breaks on the governing window\'s clock, not another
   assert.equal(on._expiryPressure(on.accounts[0], OPUS, now),
     on._expiryPressure(on.accounts[1], OPUS, now), 'the fixture must tie exactly');
   assert.notEqual(on._rankedReset(on.accounts[0], OPUS), on._rankedReset(on.accounts[1], OPUS),
-    'the governing clocks tie too, so only candidate order can decide');
+    'the governing clocks must differ, or candidate order decides');
   assert.equal(on._pickBestAvailable(null, OPUS).name, 'a');
   assert.equal(on._pickLeastLoaded(null, OPUS).name, 'a');
 
