@@ -11,7 +11,7 @@ import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
 import { TopLevelFieldFinder, modelGlobMatches } from './model.js';
 import { BodyWriter, truncationNote } from './request-log.js';
 import { upstreamFetch } from './upstream-fetch.js';
-import { applyAuthHeaders, upstreamFor, rewritesBody, providerForPath } from './provider.js';
+import { applyAuthHeaders, upstreamFor, rewritesBody, providerForPath, providerOf, isSubscriptionAccount, DEFAULT_PROVIDER } from './provider.js';
 import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
 import { safeLine } from './safe-text.js';
@@ -1384,9 +1384,31 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   const pinned = ctx.pinnedIndex != null && !ctx.tried.has(ctx.pinnedIndex)
     ? accountManager.accounts[ctx.pinnedIndex]
     : null;
+  // A pin bypasses selection entirely, so the provider partition has to be
+  // enforced here too — otherwise TC_ACCT aimed at a Claude subscription would
+  // serve a Codex request from it, sending an OpenAI-shaped body to
+  // api.anthropic.com with a Claude token. Subscriptions only: an API-key
+  // account is metered capacity with no tie to a caller, so a pin to one stands.
+  const pinnedWrongProvider = pinned
+    && isSubscriptionAccount(pinned)
+    && providerOf(pinned) !== (ctx.provider || DEFAULT_PROVIDER);
   const account = ctx.pinnedIndex != null
-    ? (pinned && !accountManager.capExceeded(pinned, ctx.model) ? pinned : null)
+    ? (pinned && !pinnedWrongProvider && !accountManager.capExceeded(pinned, ctx.model) ? pinned : null)
     : accountManager.getActiveAccount(ctx.tried, ctx.model, ctx.advisorModel, ctx.sessionId, ctx.provider);
+  if (pinnedWrongProvider && !res.headersSent && !clientGone(res)) {
+    // Named plainly: a pin that cannot serve is a configuration mistake, and the
+    // exhausted-account response would send the operator looking at quota.
+    ctx.status = 400;
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      type: 'error',
+      error: {
+        type: 'invalid_request_error',
+        message: `Pinned account "${pinned.name}" is a ${providerOf(pinned)} subscription and cannot serve a ${ctx.provider} request.`,
+      },
+    }));
+    return;
+  }
   if (!account) {
     // Every candidate was refused by upstream (403). Waiting will not help — the
     // account needs attention, not a retry — so say so plainly rather than

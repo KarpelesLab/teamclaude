@@ -1,5 +1,5 @@
 import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired, formatMoney } from './oauth.js';
-import { providerOf, DEFAULT_PROVIDER } from './provider.js';
+import { providerOf, DEFAULT_PROVIDER, isSubscriptionAccount } from './provider.js';
 import { refreshCodexToken } from './codex-auth.js';
 import { parseCodexQuota, parseCodexPlanType } from './codex-quota.js';
 import { sameIdentity } from './identity.js';
@@ -226,6 +226,15 @@ export class AccountManager {
     // it. Each such switch arms the ramp below, so steady interleaved traffic
     // holds both accounts at the ramp floor while nothing has failed over.
     this.routeCursors = new Map();
+    // One cursor per provider. `currentIndex` is a single slot, and a request
+    // only another provider can serve would otherwise drag it across: a Codex
+    // request moved it onto a Codex account and the next Anthropic request moved
+    // it straight back, flapping the TUI's current-account marker and re-arming
+    // storm control on every alternation. A provider partition is the purest
+    // form of "barred for THIS request only" — an Anthropic account serves every
+    // Anthropic request perfectly well — so it must not move the fleet, exactly
+    // as a spent family bucket does not (#276).
+    this.providerCursors = new Map();
     this.switchThreshold = switchThreshold;
     this.setRoutes(routes);
     // Storm control: when rotation switches to a fresh account, a burst of
@@ -506,12 +515,43 @@ export class AccountManager {
    * request keeps flowing (upstream then fails just the advisor call).
    */
   getActiveAccount(exclude = null, model = null, advisorModel = null, sessionId = null, provider = DEFAULT_PROVIDER) {
-    const account = this._pickActiveAccount(this._excludeOtherProviders(exclude, provider), model, advisorModel, sessionId);
+    // Selection reads this.currentIndex as "where the fleet is". With more than
+    // one provider that is a single slot for several fleets, so a request whose
+    // provider does not own it borrows the slot for the walk and hands it back.
+    //
+    // With one provider — every config that predates #246 — `borrowed` is always
+    // false and this is the same code it was.
+    const owner = providerOf(this.accounts[this.currentIndex]);
+    const borrowed = !!this.accounts.length && owner !== provider;
+    const saved = this.currentIndex;
+    if (borrowed) {
+      const own = this.providerCursors.get(provider);
+      if (own != null && this.accounts[own] && providerOf(this.accounts[own]) === provider) this.currentIndex = own;
+    }
+
+    let account;
+    // Scoped rather than threaded through _select/_selectNext/_divertedFor: the
+    // whole walk is synchronous, so nothing can interleave and observe it, and
+    // the alternative is a provider argument on six private methods that exist
+    // to answer a different question.
+    this._selectingProvider = provider;
+    try {
+      account = this._pickActiveAccount(this._excludeOtherProviders(exclude, provider), model, advisorModel, sessionId);
+    } finally {
+      this._selectingProvider = null;
+      // Hand the slot back before anything can observe it moved. Only the
+      // provider that owns currentIndex gets to change it.
+      if (borrowed) this.currentIndex = saved;
+    }
+
     // Record where this route now sits, whatever path chose it — the steady-state
     // path returns the account the cursor already names and never reaches the
     // rotation code, so recording there alone would leave the cursor unset and
     // the next real failover unpaced.
-    if (account) this.routeCursors.set(this._cursorKey(model, advisorModel), account.index);
+    if (account) {
+      this.routeCursors.set(this._cursorKey(model, advisorModel, provider), account.index);
+      this.providerCursors.set(providerOf(account), account.index);
+    }
     return account;
   }
 
@@ -530,7 +570,13 @@ export class AccountManager {
    * the common single-provider case allocates nothing.
    */
   _excludeOtherProviders(exclude, provider) {
-    const foreign = this.accounts.filter(a => providerOf(a) !== provider);
+    // Only SUBSCRIPTION accounts are partitioned. A Claude Max token is issued
+    // to Claude and a ChatGPT token to Codex; neither plan can be spent by the
+    // other's client, so crossing them is never right. An API key carries no
+    // such tie — it is metered capacity, not a seat — so it stays eligible for
+    // whichever app is asking, which is what keeps a third-party backend usable
+    // from both.
+    const foreign = this.accounts.filter(a => providerOf(a) !== provider && isSubscriptionAccount(a));
     if (foreign.length === 0) return exclude;
     const combined = new Set(exclude || []);
     for (const account of foreign) combined.add(account.index);
@@ -1179,11 +1225,20 @@ export class AccountManager {
    * executor's, and sharing a cursor with plain requests for the executor's
    * model would have each overwrite the other's and re-log the diversion.
    */
-  _cursorKey(model, advisorModel = null) {
+  _cursorKey(model, advisorModel = null, provider = this._selectingProvider || DEFAULT_PROVIDER) {
     const own = this._routeForModel(model)?.name || (model ? this._weeklyBucketFor(model) : '');
-    if (!advisorModel) return own;
-    const adv = this._routeForModel(advisorModel)?.name || this._weeklyBucketFor(advisorModel);
-    return adv === own ? own : `${own}+${adv}`;
+    const base = (() => {
+      if (!advisorModel) return own;
+      const adv = this._routeForModel(advisorModel)?.name || this._weeklyBucketFor(advisorModel);
+      return adv === own ? own : `${own}+${adv}`;
+    })();
+    // Namespaced by provider so a diversion recorded for one provider is never
+    // read back as another's. Model names do not have to differ between
+    // providers, and a bucket key certainly does not — an unprefixed key would
+    // hand a Codex request the account an Anthropic request was diverted to.
+    // The default provider keeps the bare key, so existing cursors and every
+    // single-provider config are unchanged.
+    return provider === DEFAULT_PROVIDER ? base : `${provider}\u0000${base}`;
   }
 
   /**

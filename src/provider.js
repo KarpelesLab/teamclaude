@@ -49,6 +49,24 @@ export function providerOf(account) {
   return (id && PROVIDERS[id]) ? id : DEFAULT_PROVIDER;
 }
 
+/**
+ * Whether an account is a SUBSCRIPTION, and therefore tied to the app whose plan
+ * it belongs to.
+ *
+ * An OAuth login is one: a Claude Max token is issued to Claude and a ChatGPT
+ * token to Codex, and neither plan can be spent by the other's client. Those
+ * accounts are partitioned by provider, strictly.
+ *
+ * An API key is not. It is metered capacity rather than a seat — nothing about
+ * it says which app may spend it — so it stays eligible for any caller. That is
+ * what lets a third-party backend (a `upstream` + `modelMap` account) serve
+ * whichever app is asking, instead of being fenced off by a provider field it
+ * never set.
+ */
+export function isSubscriptionAccount(account) {
+  return account?.type === 'oauth';
+}
+
 /** Whether `id` names a provider we know how to talk to. */
 export function isKnownProvider(id) {
   return Object.hasOwn(PROVIDERS, id);
