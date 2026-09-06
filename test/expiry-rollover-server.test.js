@@ -594,9 +594,13 @@ test('a roll that happens while the knob is OFF is not owed when it comes on', a
 test('the stay confirmation writes nothing while the knob is OFF', async () => {
   // The confirmation's own fleet and sequence with preemption disabled, on the
   // walk that has both an observation to write: the cursor's and the session
-  // pin's. The two state assertions are what an ungated write reddens on whether
-  // or not it throws — the selection-side read has nothing to carry off, and the
-  // confirmation has nothing to release.
+  // pin's. The two state assertions catch a WRITE — an ungated one leaves an
+  // observation behind whether or not it also throws — and that is all they
+  // catch: an ungated selection-side read still only reads, and an ungated
+  // release returns on the observation nothing created. So the read's gate is
+  // asserted on the manager directly. The release's own gate is NOT witnessed
+  // here; with the knob off it is unreachable, since the carried stamp is null
+  // and `confirmStay` refuses on that before either gate is consulted.
   let attempts = 0;
   const { am, send, close } = await fleet(['a', 'b'], async (name, res) => {
     if (name === 'b' && attempts < 3) {
@@ -619,6 +623,8 @@ test('the stay confirmation writes nothing while the knob is OFF', async () => {
     assert.equal(am._currentObs, null, 'an observation was written for the cursor with the knob off');
     assert.equal(am.sessionTracker.refsFor('s1', 'unified7d'), null,
       'an observation was written for the session pin with the knob off');
+    assert.equal(am.observedGeneration('s1', OPUS), null,
+      'the selection-side read handed a request a stamp to confirm with, knob off');
   } finally {
     await close();
   }
