@@ -420,10 +420,13 @@ export class AccountManager {
   /**
    * Move the cursor, and only the cursor. A reading is taken where a request
    * finds traffic resting, never where a selection aims it, so no caller of
-   * this method owes one. The single write here is `_firstSightOn`'s: an aim
-   * first-sights its destination only where the observation names no account, or
-   * where the account it names has rolled no window it recorded, and it discards
-   * nothing.
+   * this method owes one. `_firstSightOn` makes every write here, and it makes
+   * two of them. An aim onto the account a preemption pushed traffic off is a
+   * FAIL-BACK, and hands that account the roll being held for it: the reading it
+   * was preempted on is restored rather than replaced, which is the case the
+   * design turns on. Any other aim first-sights its destination, and only where
+   * the observation names no account or where the account it names has rolled no
+   * window it recorded, so it forfeits no roll either.
    */
   _setCurrent(account) {
     this.currentIndex = account.index;
