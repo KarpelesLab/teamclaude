@@ -137,9 +137,37 @@ export function switchOutcome(res) {
   return { kind: 'ok', text: 'switched to ' + res.account };
 }
 
+// One row per route the server reports — each model family the fleet meters
+// separately, autocreated or configured — plus a trailing row for everything
+// else, which goes to the current account. `target` is the server's own answer
+// to "where does a request for this family land right now", so the page does
+// not re-derive routing from quota bars; the eligible split says why a family
+// is where it is.
+export function routeRows(status) {
+  var s = status || {};
+  var rows = (s.routes || []).map(function (r) {
+    var accounts = r.accounts || [];
+    var name = r.name || '';
+    return {
+      name: name,
+      label: name.charAt(0).toUpperCase() + name.slice(1),
+      match: (r.match || []).join(', '),
+      target: r.target || null,
+      pinned: r.pinned || null,
+      autocreated: !!r.autocreated,
+      eligible: accounts.filter(function (a) { return a.eligible; }).map(function (a) { return a.name; }),
+      ineligible: accounts.filter(function (a) { return !a.eligible; }).map(function (a) { return a.name; }),
+    };
+  });
+  if (rows.length) {
+    rows.push({ name: '', label: 'Everything else', match: '', target: s.currentAccount || null, pinned: null, autocreated: false, eligible: [], ineligible: [] });
+  }
+  return rows;
+}
+
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, sessionRows, filterSessionRows, sortRows, uniqSorted,
-  switchRequest, switchOutcome,
+  switchRequest, switchOutcome, routeRows,
 ].map(fn => fn.toString()).join('\n\n');
 
 const PAGE = `<!doctype html>
@@ -197,6 +225,9 @@ const PAGE = `<!doctype html>
   th.sortable { cursor: pointer; user-select: none; }
   th.sortable:hover { color: var(--text); }
   td.dim { color: var(--dim); }
+  .ok { color: var(--ok); }
+  .no { color: var(--dim); text-decoration: line-through; }
+  .pin { color: var(--accent); font-size: 12px; }
   #err { color: var(--bad); margin: 12px 0; display: none; }
   #keybox { display: none; margin: 40px auto; max-width: 420px; text-align: center; }
   #keybox input { width: 100%; padding: 10px 12px; margin: 12px 0; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; color: var(--text); font: inherit; }
@@ -217,6 +248,10 @@ const PAGE = `<!doctype html>
     <p class="sub" id="summary"></p>
     <div id="err"></div>
     <div id="note"></div>
+    <div id="routesWrap" style="display:none">
+      <h2>Routing</h2>
+      <div class="card" style="padding:4px 6px"><table id="routes"></table></div>
+    </div>
     <h2>Accounts</h2>
     <div id="accounts"></div>
     <div id="clientsWrap" style="display:none">
@@ -510,6 +545,39 @@ ${SHARED_HELPERS}
     });
   }
 
+  // Where each metered family goes right now, and which accounts could take
+  // it. The last row is the default: everything without its own route lands
+  // on the current account.
+  function renderRoutes(s) {
+    var wrap = document.getElementById('routesWrap');
+    var rows = routeRows(s);
+    if (!rows.length) { wrap.style.display = 'none'; return; }
+    wrap.style.display = '';
+    var table = document.getElementById('routes');
+    table.textContent = '';
+    var hr = el('tr');
+    ['Family', 'Goes to', 'Can serve it'].forEach(function (h) { hr.appendChild(el('th', '', h)); });
+    table.appendChild(hr);
+    rows.forEach(function (r) {
+      var tr = el('tr');
+      var fam = el('td', '', r.label + (r.match ? ' ' : ''));
+      if (r.match) fam.appendChild(el('span', 'tag', r.match));
+      tr.appendChild(fam);
+      var to = el('td', '', r.target || '—');
+      if (r.pinned) to.appendChild(el('span', 'pin', ' · pinned'));
+      tr.appendChild(to);
+      var can = el('td', r.match ? '' : 'dim');
+      if (!r.match) can.textContent = 'current account';
+      else if (!r.eligible.length && !r.ineligible.length) can.textContent = '—';
+      else {
+        can.appendChild(el('span', 'ok', r.eligible.length + ' of ' + (r.eligible.length + r.ineligible.length)));
+        if (r.ineligible.length) can.appendChild(el('span', 'no', ' ' + r.ineligible.join(', ')));
+      }
+      tr.appendChild(can);
+      table.appendChild(tr);
+    });
+  }
+
   function render(s) {
     lastStatus = s;
     var sess = s.sessions || {};
@@ -522,6 +590,7 @@ ${SHARED_HELPERS}
     var acc = document.getElementById('accounts');
     acc.textContent = '';
     (s.accounts || []).forEach(function (a) { acc.appendChild(renderAccount(a, s.currentAccount)); });
+    renderRoutes(s);
     renderClients(s.clients);
     renderDimensions(s.usageDimensions);
     renderSessions(s.sessions);

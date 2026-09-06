@@ -6,7 +6,7 @@ import { createProxyServer } from '../src/server.js';
 import {
   renderDashboardHtml, scopedWeeklyRows, accountTokens,
   sessionRows, filterSessionRows, sortRows, uniqSorted,
-  switchRequest, switchOutcome,
+  switchRequest, switchOutcome, routeRows,
 } from '../src/dashboard.js';
 
 function listen(server) {
@@ -174,11 +174,48 @@ test('the switch button\'s request passes the same-origin gate and moves the cur
   }
 });
 
+// The shape /teamclaude/status reports per route: the server's own target for
+// the family, and every account with whether it could serve it.
+const ROUTED = {
+  currentAccount: 'a',
+  routes: [{
+    name: 'fable', match: ['*fable*'], autocreated: true, pinned: null, target: 'b',
+    accounts: [{ name: 'a', eligible: false }, { name: 'b', eligible: true }, { name: 'c', eligible: true }],
+  }],
+};
+
+test('route rows say where each family goes, why, and where everything else goes', () => {
+  const rows = routeRows(ROUTED);
+  assert.equal(rows.length, 2);
+  const [fable, rest] = rows;
+  // A family diverted away from the current account shows the server's target,
+  // not a re-derivation from quota bars, and names the accounts that cannot
+  // take it — that is the reason the family is elsewhere.
+  assert.deepEqual(
+    { label: fable.label, match: fable.match, target: fable.target, eligible: fable.eligible, ineligible: fable.ineligible },
+    { label: 'Fable', match: '*fable*', target: 'b', eligible: ['b', 'c'], ineligible: ['a'] },
+  );
+  assert.equal(fable.autocreated, true);
+  // The default row is the current account: everything without a route lands there.
+  assert.deepEqual({ label: rest.label, target: rest.target, match: rest.match }, { label: 'Everything else', target: 'a', match: '' });
+});
+
+test('a pinned route carries its pin, and a fleet with no routes renders no section', () => {
+  const pinned = routeRows({ ...ROUTED, routes: [{ ...ROUTED.routes[0], pinned: 'c', target: 'c' }] });
+  assert.equal(pinned[0].pinned, 'c');
+  assert.equal(pinned[0].target, 'c');
+  // Without a metered family there is nothing to route: the summary line
+  // already names the current account, so no redundant one-row table.
+  assert.deepEqual(routeRows({ currentAccount: 'a', routes: [] }), []);
+  assert.deepEqual(routeRows({ currentAccount: 'a' }), []);
+  assert.deepEqual(routeRows(null), []);
+});
+
 test('the page ships the same helper implementations it is tested against', () => {
   // The serialization is the contract: if a helper stops being self-contained
   // (closes over module scope), the page would silently ReferenceError.
   const html = renderDashboardHtml();
-  for (const fn of [scopedWeeklyRows, accountTokens, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome]) {
+  for (const fn of [scopedWeeklyRows, accountTokens, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, routeRows]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
