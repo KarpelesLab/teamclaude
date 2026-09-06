@@ -899,6 +899,37 @@ test('a retry that falls back onto the rolled account leaves the rollover owed',
     'the failed fail-back priced the rolled account');
 });
 
+test('a retry re-entering past a session pin leaves the pin\'s reading on the account that rolled', () => {
+  // The pin names the preemption's destination while the pin's reading is still
+  // on the account that rolled. A retry that has already tried the pinned
+  // account is failing over FROM it, so the pass takes no reading on the pin:
+  // one taken would move the reading onto an account this request cannot use,
+  // and a reading that names no rolled account no longer stops the next
+  // destination being first-sighted over it.
+  const am = mgr(['a', 'b', 'c'], ON, { distributeSessions: true });
+  bucket(am, 0, 'unified7d', 0.4, 10);
+  bucket(am, 1, 'unified7d', 0.4, 20);
+  bucket(am, 2, 'unified7d', 0.4, 30);
+  assert.equal(serve(am, 's1', OPUS).name, 'a');
+  rollWindow(am, 0);
+
+  am.beginSession('s1');
+  const moved = am.getActiveAccount(null, OPUS, null, 's1');
+  assert.equal(moved.name, 'b', 'the rollover did not move the pin to b');
+  am.recordSession('s1', moved.index, OPUS);
+  // The destination refuses, so the same request re-enters selection with the
+  // pinned destination tried and lands on a third account.
+  const back = am.getActiveAccount(new Set([moved.index]), OPUS, null, 's1');
+  assert.equal(back.name, 'c', 'the refusal did not fall back off the pinned destination');
+  assert.equal(am.sessionTracker.refsFor('s1', 'unified7d').idx, 0,
+    'the pin\'s reading was taken on the account the request was refused by');
+
+  am.recordSession('s1', back.index, OPUS);
+  am.endSession('s1');
+  assert.equal(am.sessionTracker.refsFor('s1', 'unified7d').idx, 0,
+    'the pin\'s reading left the account that rolled');
+});
+
 test('a retry that bounces back to the rolled current account leaves it owed', () => {
   // The same cascade on the path that is live by default: distributeSessions is
   // off, so current-account stickiness is what an operator gets by turning on
@@ -915,6 +946,33 @@ test('a retry that bounces back to the rolled current account leaves it owed', (
 
   assert.equal(serve(am, null, OPUS).name, 'b',
     'the bounce first-sighted the rolled reset');
+});
+
+test('a retry re-entering past the current account leaves the reading on the account that rolled', () => {
+  // The cursor sits on the preemption's destination while the reading is still
+  // on the account that rolled, which is the state the fail-back's protection
+  // lives in. A retry that has already tried the destination is failing over
+  // FROM it, so the pass takes no reading there: one taken would move the
+  // reading onto an account this request cannot use, and the roll it was pushed
+  // off would survive only in the held slot.
+  const am = mgr(['a', 'b', 'c'], ON);
+  bucket(am, 0, 'unified7d', 0.4, 10);
+  bucket(am, 1, 'unified7d', 0.4, 20);
+  bucket(am, 2, 'unified7d', 0.4, 30);
+  assert.equal(serve(am, null, OPUS).name, 'a');
+  rollWindow(am, 0);
+
+  assert.equal(am.getActiveAccount(null, OPUS, null, null).name, 'b',
+    'the rollover did not preempt');
+  // The destination refuses, so the same request re-enters selection with the
+  // destination tried and lands on a third account.
+  assert.equal(am.getActiveAccount(new Set([1]), OPUS, null, null).name, 'c',
+    'the refusal did not fall back off the destination');
+
+  assert.equal(am._currentObs.idx, 0,
+    'the reading was taken on the account the request was refused by');
+  assert.equal(am._currentRolledOver(am.accounts[0], OPUS), true,
+    'the roll is no longer read on the account that rolled');
 });
 
 test('a fail-back onto a FAMILY roll leaves the rollover owed', () => {
