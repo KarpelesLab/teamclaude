@@ -152,9 +152,11 @@ test('the switch button\'s request passes the same-origin gate and moves the cur
   try {
     assert.equal((await status()).currentAccount, 'a');
 
-    // Exactly what the page sends, plus the two headers a browser adds to a
-    // same-origin fetch. Mutating control routes are CSRF-gated, so this is the
-    // property the button actually depends on.
+    // The request the page builds, plus the two headers a browser adds to a
+    // same-origin fetch. This proves the CSRF gate, not the key: the test runs
+    // on loopback, which the key gate exempts, so the key here is inert. Key
+    // acceptance is covered in control-csrf.test.js; the gate is what the
+    // button depends on, and it runs regardless of loopback.
     const r = switchRequest('b', 'secret');
     const ok = await fetch(origin + r.url, { ...r.init, headers: { ...r.init.headers, origin, 'sec-fetch-site': 'same-origin' } });
     assert.equal(ok.status, 200);
@@ -164,7 +166,8 @@ test('the switch button\'s request passes the same-origin gate and moves the cur
     // The same request from another site is refused — a page the operator
     // happens to visit cannot drive the button.
     const evil = await fetch(origin + r.url, { ...r.init, headers: { ...r.init.headers, origin: 'https://evil.example', 'sec-fetch-site': 'cross-site' } });
-    assert.notEqual(evil.status, 200);
+    assert.equal(evil.status, 403);
+    assert.match((await evil.json()).error, /cross-origin/);
     assert.equal((await status()).currentAccount, 'b', 'unchanged');
   } finally {
     proxy.close();

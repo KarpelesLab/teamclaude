@@ -329,13 +329,14 @@ ${SHARED_HELPERS}
     head.appendChild(el('span', 'name', a.name));
     head.appendChild(el('span', 'tag', a.type + ' · prio ' + (a.priority || 0)));
     if (a.name === current) head.appendChild(el('span', 'badge current', 'current'));
-    else {
+    head.appendChild(el('span', 'badge ' + (a.status || ''), a.disabled ? 'disabled' : (a.status || 'unknown')));
+    if (a.sessions) head.appendChild(el('span', 'tag', a.sessions + ' active session' + (a.sessions > 1 ? 's' : '')));
+    // Last in the row so the badges sit in the same place on every card.
+    if (a.name !== current) {
       var btn = el('button', 'act', 'switch');
       btn.addEventListener('click', function () { doSwitch(a.name, btn); });
       head.appendChild(btn);
     }
-    head.appendChild(el('span', 'badge ' + (a.status || ''), a.disabled ? 'disabled' : (a.status || 'unknown')));
-    if (a.sessions) head.appendChild(el('span', 'tag', a.sessions + ' active session' + (a.sessions > 1 ? 's' : '')));
     card.appendChild(head);
     if (a.unavailable) card.appendChild(el('div', 'blocked', 'blocked: ' + (UNAVAILABLE_TEXT[a.unavailable] || a.unavailable)));
     var q = a.quota || {};
@@ -529,13 +530,14 @@ ${SHARED_HELPERS}
 
   function note(kind, text) {
     var n = document.getElementById('note');
-    n.className = kind; n.textContent = text; n.style.display = 'block';
+    n.className = kind;
+    n.textContent = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) + ' · ' + text;
+    n.style.display = 'block';
   }
 
   // One manual switch. The endpoint is a nudge, not a pin: it sets the current
-  // account and normal rotation resumes from there. Sessions already pinned to
-  // another account keep it until they go idle, so the badge moves before the
-  // traffic does.
+  // account and normal rotation resumes from there (see the handler's comment
+  // in server.js for what "eligible" means).
   function doSwitch(name, btn) {
     btn.disabled = true;
     var r = switchRequest(name, localStorage.getItem(KEY));
@@ -548,6 +550,9 @@ ${SHARED_HELPERS}
         if (!json) return;
         var out = switchOutcome(json);
         note(out.kind, out.text);
+        // Re-enabled on any non-success, whether the server refused or the
+        // fetch threw, so the two failure paths leave the button in one state.
+        if (out.kind !== 'ok') btn.disabled = false;
         poll();
       })
       .catch(function (e) { note('error', 'switch failed: ' + e.message); btn.disabled = false; });
