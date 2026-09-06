@@ -6,7 +6,7 @@ import { createProxyServer } from '../src/server.js';
 import {
   renderDashboardHtml, scopedWeeklyRows, accountTokens,
   sessionRows, filterSessionRows, sortRows, uniqSorted,
-  switchRequest, switchOutcome, routeRows,
+  switchRequest, switchOutcome, routeRows, problems, STUCK_MIN_REQUESTS,
 } from '../src/dashboard.js';
 
 function listen(server) {
@@ -256,11 +256,75 @@ test('a fleet with no routes renders no section', () => {
   assert.deepEqual(routeRows(null), []);
 });
 
+// A session whose requests never come back with a usage report reads as zero on
+// every token column, exactly like an idle one. That is the case the banner exists
+// for, so the tests are about telling those two apart.
+const NOW = 1_000_000_000;
+const OLD = NOW - 10 * 60_000;
+
+function withSession(extra) {
+  return {
+    currentAccount: 'a', defaultTarget: 'a', accounts: [{ name: 'a', unavailable: null, quota: {} }],
+    routes: [{ name: 'fable', match: ['*fable*'], accounts: [{ name: 'a', eligible: true }], target: 'a' }],
+    sessions: { items: [Object.assign({ id: 'deadbeef1234', client: 'alice', firstSeen: OLD, requests: 0, pins: {}, tokens: {} }, extra)] },
+  };
+}
+
+test('a session that gets nothing back is reported; an idle one is not', () => {
+  const stuck = problems(withSession({ requests: 20, tokens: { unified7d: { reports: 0 } } }), NOW);
+  assert.equal(stuck.length, 1);
+  assert.equal(stuck[0].kind, 'stuck-session');
+  assert.equal(stuck[0].severity, 'bad');
+  assert.match(stuck[0].text, /alice's session deadbeef/);
+  assert.match(stuck[0].text, /20 requests/);
+
+  // Same zero token columns, but upstream answered: idle, not stuck.
+  assert.deepEqual(problems(withSession({ requests: 20, tokens: { unified7d: { reports: 20 } } }), NOW), []);
+  // Nothing sent yet at all.
+  assert.deepEqual(problems(withSession({ requests: 0, tokens: {} }), NOW), []);
+});
+
+test('a young or barely-used session is not accused', () => {
+  // Below the request floor.
+  assert.deepEqual(problems(withSession({ requests: STUCK_MIN_REQUESTS - 1, tokens: { unified7d: { reports: 0 } } }), NOW), []);
+  // Old enough by requests, but only seconds old: its first report has not landed.
+  assert.deepEqual(problems(withSession({ requests: 20, firstSeen: NOW - 1000, tokens: { unified7d: { reports: 0 } } }), NOW), []);
+});
+
+test('a wedged fleet and accounts that need a human are reported; ordinary rotation is not', () => {
+  const base = withSession({ requests: 1, tokens: { unified7d: { reports: 1 } } });
+
+  // Nothing can serve an unrouted request.
+  const wedged = problems({ ...base, defaultTarget: null }, NOW);
+  assert.deepEqual(wedged.map(p => p.kind), ['no-target']);
+
+  // A spent bucket or a back-off is the policy working — silence.
+  for (const reason of ['quota', 'throttled']) {
+    assert.deepEqual(problems({ ...base, accounts: [{ name: 'a', unavailable: reason, quota: {} }] }, NOW), []);
+  }
+  // A broken token needs a person.
+  const broken = problems({ ...base, accounts: [{ name: 'a', unavailable: 'error', quota: {} }] }, NOW);
+  assert.deepEqual(broken.map(p => p.kind), ['account']);
+  assert.match(broken[0].text, /re-login/);
+
+  // Real money is not a quota bar.
+  const billing = problems({ ...base, accounts: [{ name: 'a', unavailable: null, quota: { spend: { enabled: true, usedMinor: 250 } } }] }, NOW);
+  assert.deepEqual(billing.map(p => p.kind), ['spend']);
+  // Able to bill but hasn't: nothing to say yet.
+  assert.deepEqual(problems({ ...base, accounts: [{ name: 'a', unavailable: null, quota: { spend: { enabled: true, usedMinor: 0 } } }] }, NOW), []);
+});
+
+test('a healthy fleet reports nothing at all', () => {
+  assert.deepEqual(problems(withSession({ requests: 30, tokens: { unified7d: { reports: 30 } } }), NOW), []);
+  assert.deepEqual(problems({}, NOW), []);
+  assert.deepEqual(problems(null, NOW), []);
+});
+
 test('the page ships the same helper implementations it is tested against', () => {
   // The serialization is the contract: if a helper stops being self-contained
   // (closes over module scope), the page would silently ReferenceError.
   const html = renderDashboardHtml();
-  for (const fn of [scopedWeeklyRows, accountTokens, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, routeRows]) {
+  for (const fn of [scopedWeeklyRows, accountTokens, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, routeRows, problems]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
