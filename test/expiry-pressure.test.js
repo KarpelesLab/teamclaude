@@ -638,6 +638,36 @@ test('path 3: a reset stays pending until a request that can act on it', () => {
     'the reset never reached a request that could act on it');
 });
 
+test('path 3: a request that cannot use the incumbent leaves the reset for one that can', () => {
+  // The same rule at the other end of the comparison. The switch measures every
+  // candidate against the account the cursor names, so a request that cannot be
+  // sent THERE settles nothing either, and spending the event on it costs a
+  // later request the decision it could have made — on its own model, over the
+  // accounts it can actually use. The cursor is the account a retry has just
+  // tried, since it names where the previous attempt went, so this is the
+  // ordinary shape of a retry rather than a corner. Read at the refresh rather
+  // than through getActiveAccount, for the reason the arm above gives.
+  const am = mgr(['cur', 'reset'], { expiry: ON });
+  bucket(am, 0, 'unified7d', 0.50, 50);
+  bucket(am, 1, 'unified7d', 0.10, 10);
+  am.accounts[1].quota.unified5h = 0.5;
+  am.accounts[1].quota.unified5hReset = Date.now() - 1000;
+
+  // Request 1 excludes the cursor's own account.
+  am.refreshExpiredQuotas(OPUS, new Set([am.currentIndex]));
+  assert.equal(am.accounts[1].sessionResetPending, true,
+    'a request that could not use the incumbent consumed the reset');
+  assert.equal(am.accounts[am.currentIndex].name, 'cur',
+    'the switch decided against an account the request cannot be sent to');
+
+  // Request 2 can be sent to either. Nothing re-triggers the event — the window
+  // was cleared on the first pass and reads null now — so this switches only if
+  // the reset survived the request that could not weigh it.
+  am.refreshExpiredQuotas(OPUS, asRequest());
+  assert.equal(am.accounts[am.currentIndex].name, 'reset',
+    'the reset did not survive to a request that could act on it');
+});
+
 test('path 3: a poll clears the window and leaves the reset for a request', () => {
   // A poll routes nothing, so a reset it spends is spent nowhere: the window
   // that raised the event is cleared on that same pass, nothing sets the flag

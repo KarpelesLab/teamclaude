@@ -2316,7 +2316,9 @@ export class AccountManager {
     // fleet that is the defect this rule exists for — a Codex account takes the
     // band on its own and vetoes an Anthropic-to-Anthropic move that no later
     // request can retry.
-    const spends = !this.expiryRouting.enabled || scope != null;
+    // The cursor's account is one end of every comparison the switch makes, so a
+    // request that cannot be sent there settles nothing and leaves the event too.
+    const spends = !this.expiryRouting.enabled || (scope != null && !scope.has(this.currentIndex));
     const sessionReset = [];
     for (const account of this.accounts) {
       const r = this._clearExpiredQuotas(account);
