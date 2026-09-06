@@ -69,6 +69,11 @@ export function sessionRows(sessions) {
       project: (s.dimensions || {}).project || '',
       active: !!s.active,
       requests: s.requests || 0,
+      // `reports` counts usage objects upstream returned for this session. It
+      // is what separates "idle" from "never got an answer": both read zero on
+      // the token columns, and only one of them is a problem.
+      reports: 0,
+      firstSeen: s.firstSeen || 0,
       cacheRead: 0, cacheCreation: 0, input: 0, output: 0, context: 0,
       accounts: Object.keys(s.pins || {}).map(function (b) { return s.pins[b]; }).join(', '),
       lastSeen: s.lastSeen || 0,
@@ -80,6 +85,7 @@ export function sessionRows(sessions) {
       row.input += t.input || 0;
       row.output += t.output || 0;
       row.context += t.context || 0;
+      row.reports += t.reports || 0;
     });
     row.total = row.cacheRead + row.cacheCreation + row.input + row.output;
     return row;
@@ -189,9 +195,66 @@ export function routeRows(status) {
   return rows;
 }
 
+// A session making requests that never come back with a usage report is not
+// idle — it is getting nothing. Every rejected attempt looks free on the token
+// columns, so without this the case is invisible: the one that prompted this
+// ran 117 requests over two hours, reported nothing, and was noticed only
+// because the fleet started flapping around it.
+export var STUCK_MIN_REQUESTS = 5;
+export var STUCK_MIN_AGE_MS = 120000;
+
+/**
+ * What is wrong right now, worst first, or an empty list. Only states that are
+ * actionable and not ordinary operation: a spent weekly bucket is the rotation
+ * policy working, and saying so every day would teach the reader to ignore the
+ * banner on the day it matters.
+ */
+export function problems(status, now) {
+  var s = status || {};
+  var at = now || Date.now();
+  var out = [];
+
+  var stuck = (s.sessions && s.sessions.items ? sessionRows(s.sessions) : []).filter(function (r) {
+    return r.requests >= STUCK_MIN_REQUESTS && r.reports === 0 && r.firstSeen && (at - r.firstSeen) >= STUCK_MIN_AGE_MS;
+  });
+  stuck.forEach(function (r) {
+    out.push({
+      severity: 'bad', kind: 'stuck-session',
+      text: (r.client ? r.client + "'s session " : 'Session ') + r.id.slice(0, 8)
+        + ' has made ' + r.requests + ' requests and received nothing back'
+        + (r.project ? ' (' + r.project + ')' : '') + ' — it is not idle, it is failing.',
+    });
+  });
+
+  // Nothing can serve an unrouted request: the fleet is wedged, not merely busy.
+  if ((s.routes || []).length && !s.defaultTarget) {
+    out.push({ severity: 'bad', kind: 'no-target', text: 'No account can serve an unrouted request right now.' });
+  }
+
+  // Hard states an operator has to act on. Deliberately excludes `quota` and
+  // `throttled`, which are rotation and back-off doing their job.
+  var ATTENTION = { error: 'needs a re-login', entitlement: 'was refused for its organization', 'upstream-rejected': 'is refused upstream', disabled: 'is disabled' };
+  (s.accounts || []).forEach(function (a) {
+    var why = ATTENTION[a.unavailable];
+    if (why) out.push({ severity: 'warn', kind: 'account', text: 'Account ' + a.name + ' ' + why + '.' });
+  });
+
+  // Past the plan allowance is real money, which no quota bar says.
+  (s.accounts || []).forEach(function (a) {
+    var spend = (a.quota || {}).spend;
+    if (spend && spend.enabled && (spend.usedMinor || 0) > 0) {
+      out.push({ severity: 'warn', kind: 'spend', text: 'Account ' + a.name + ' is billing real money this month.' });
+    }
+  });
+
+  return out;
+}
+
+const SHARED_CONSTS = `var STUCK_MIN_REQUESTS = ${STUCK_MIN_REQUESTS};\nvar STUCK_MIN_AGE_MS = ${STUCK_MIN_AGE_MS};`;
+
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, sessionRows, filterSessionRows, sortRows, uniqSorted,
-  switchRequest, switchOutcome, routeRows,
+  switchRequest, switchOutcome, routeRows, problems,
 ].map(fn => fn.toString()).join('\n\n');
 
 const PAGE = `<!doctype html>
@@ -255,6 +318,10 @@ const PAGE = `<!doctype html>
   .warnt { color: var(--warn); font-size: 12px; }
   .badt { color: var(--bad); }
   #err { color: var(--bad); margin: 12px 0; display: none; }
+  #problems { display: none; margin: 0 0 16px; }
+  #problems div { border-radius: 8px; padding: 8px 12px; margin-bottom: 6px; font-size: 13px; }
+  #problems .bad { background: rgba(248,81,73,.12); border: 1px solid var(--bad); color: var(--bad); }
+  #problems .warn { background: rgba(210,153,34,.12); border: 1px solid var(--warn); color: var(--warn); }
   #keybox { display: none; margin: 40px auto; max-width: 420px; text-align: center; }
   #keybox input { width: 100%; padding: 10px 12px; margin: 12px 0; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; color: var(--text); font: inherit; }
   #keybox button { padding: 8px 20px; background: var(--accent); border: 0; border-radius: 6px; color: #06121f; font: inherit; font-weight: 600; cursor: pointer; }
@@ -273,6 +340,7 @@ const PAGE = `<!doctype html>
     <h1>TeamClaude</h1>
     <p class="sub" id="summary"></p>
     <div id="err"></div>
+    <div id="problems"></div>
     <div id="note"></div>
     <div id="routesWrap" style="display:none">
       <h2>Routing</h2>
@@ -309,6 +377,8 @@ const PAGE = `<!doctype html>
   var sessionFilters = { project: '', client: '' };
   var sortState = { sessions: { key: 'lastSeen', dir: 'desc' } };
   var UNAVAILABLE_TEXT = ${JSON.stringify(UNAVAILABLE_TEXT)};
+
+${SHARED_CONSTS}
 
 ${SHARED_HELPERS}
 
@@ -611,6 +681,17 @@ ${SHARED_HELPERS}
     });
   }
 
+  // Top of the page and only when something is wrong: a banner that is always
+  // on is a banner nobody reads.
+  function renderProblems(s) {
+    var wrap = document.getElementById('problems');
+    var list = problems(s, Date.now());
+    wrap.textContent = '';
+    if (!list.length) { wrap.style.display = 'none'; return; }
+    wrap.style.display = 'block';
+    list.forEach(function (p) { wrap.appendChild(el('div', p.severity, p.text)); });
+  }
+
   function render(s) {
     lastStatus = s;
     var sess = s.sessions || {};
@@ -623,6 +704,7 @@ ${SHARED_HELPERS}
     var acc = document.getElementById('accounts');
     acc.textContent = '';
     (s.accounts || []).forEach(function (a) { acc.appendChild(renderAccount(a, s.currentAccount)); });
+    renderProblems(s);
     renderRoutes(s);
     renderClients(s.clients);
     renderDimensions(s.usageDimensions);
