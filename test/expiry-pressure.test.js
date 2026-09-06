@@ -602,6 +602,33 @@ test('path 3: the reset switch skips an excluded account that also reset', () =>
     'the switch let an account the request cannot be sent to decide where it goes');
 });
 
+test('path 3: a reset stays pending until a request that can act on it', () => {
+  // The reset is fleet state, not this request's: a five-hour window that
+  // expires while one request cannot use the account has to outlive that
+  // request. The exclusion here is a retry's tried set rather than a provider
+  // partition, because the switch refuses both the same way.
+  const am = mgr(['cur', 'reset'], { expiry: ON });
+  bucket(am, 0, 'unified7d', 0.50, 50);
+  bucket(am, 1, 'unified7d', 0.10, 10);
+  am.accounts[1].quota.unified5h = 0.5;
+  am.accounts[1].quota.unified5hReset = Date.now() - 1000;
+
+  // Request 1 has already tried the challenger and been refused there, so the
+  // switch may not install it. The flag is what this asserts, not the cursor:
+  // the cursor stays put whether or not the event was spent to leave it there.
+  am.refreshExpiredQuotas(OPUS, new Set([1]));
+  assert.equal(am.accounts[1].sessionResetPending, true,
+    'a request that could not use the account consumed its reset');
+  assert.equal(am.accounts[am.currentIndex].name, 'cur');
+
+  // Request 2 can be sent there. Nothing re-triggers the event — the window was
+  // cleared on the first pass and reads null now — so this switches only if the
+  // reset survived the request that had to refuse it.
+  am.refreshExpiredQuotas(OPUS);
+  assert.equal(am.accounts[am.currentIndex].name, 'reset',
+    'the reset never reached a request that could act on it');
+});
+
 test('path 3: the knob-off switch sees the fleet master shows it', () => {
   // The exclusion is gated at the call site for the reason the model is: with
   // the feature off the switch's candidate filter must be the one the router

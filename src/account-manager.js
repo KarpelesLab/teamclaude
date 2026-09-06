@@ -2287,10 +2287,19 @@ export class AccountManager {
 
   refreshExpiredQuotas(model = null, exclude = null) {
     let changed = false;
+    // Gated once, up here, because the flag below is now read against it too:
+    // with the feature off nothing is excluded from anything and every reset is
+    // consumed on sight, which is the fleet the disabled path has always seen.
+    const scope = this.expiryRouting.enabled ? exclude : null;
     const sessionReset = [];
     for (const account of this.accounts) {
       const r = this._clearExpiredQuotas(account);
       if (r.changed) changed = true;
+      // The reset belongs to the first request that can act on it. This one
+      // cannot be sent to the account at all, so consuming the flag here would
+      // spend the event on a switch that must refuse it and leave the next
+      // request — which could have used the account — nothing to act on.
+      if (scope?.has(account.index)) continue;
       // The flag, not r.session: a status read may have cleared the window
       // seconds earlier, and the rule still has to run. Cleared here because
       // this is the only path that acts on it.
@@ -2306,8 +2315,7 @@ export class AccountManager {
     // request's exclusions are gated for the same reason and say the same kind
     // of thing — which accounts this request can be sent to at all.
     if (sessionReset.length) {
-      this._switchOnSessionReset(sessionReset, this.expiryRouting.enabled ? model : null,
-        this.expiryRouting.enabled ? exclude : null);
+      this._switchOnSessionReset(sessionReset, this.expiryRouting.enabled ? model : null, scope);
     }
     return changed;
   }
