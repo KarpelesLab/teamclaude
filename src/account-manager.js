@@ -602,6 +602,8 @@ export class AccountManager {
       const betterExists = this._preemptedBy(current, model, advisorModel, exclude);
       return betterExists ? this._selectNext(exclude, model, advisorModel) : current;
     }
+    const diverted = this._divertedFor(model, advisorModel, exclude);
+    if (diverted) return diverted;
     const next = this._selectNext(exclude, model, advisorModel);
     if (next) return next;
     // No account is under the switch threshold. Before refusing locally, allow a
@@ -1159,8 +1161,28 @@ export class AccountManager {
   }
 
   /** Cursor key for a model: its route's name, or '' when no route matches. */
+  // Keyed by route name, or — with no route configured — by the weekly bucket
+  // the model spends, so Fable and Opus keep separate cursors in the default
+  // config too. One key for everything let a Fable diversion be read back as
+  // the Opus cursor (#276).
   _cursorKey(model) {
-    return this._routeForModel(model)?.name || '';
+    const route = this._routeForModel(model);
+    if (route) return route.name;
+    return model ? this._weeklyBucketFor(model) : '';
+  }
+
+  // Where this model's family was last diverted to, if that account can still
+  // serve it. Consulted only after the current account has been found unable
+  // to, so a family returns to the current account the moment it can (its
+  // bucket refreshed) rather than staying diverted out of habit. Yields to a
+  // higher-priority account the same way the current account does.
+  _divertedFor(model, advisorModel = null, exclude = null) {
+    if (!model) return null;
+    const idx = this.routeCursors.get(this._cursorKey(model));
+    const account = idx != null ? this.accounts[idx] : null;
+    if (!account || account.index === this.currentIndex || exclude?.has(account.index)) return null;
+    if (!this._isAvailable(account, model, advisorModel)) return null;
+    return this._preemptedBy(account, model, advisorModel, exclude) ? null : account;
   }
 
   /** The account this route was serving from before the current selection, or
@@ -1612,13 +1634,23 @@ export class AccountManager {
     if (best) {
       const previous = this._previousCursor(model);
       const switched = previous != null && previous !== best.index;
-      this.currentIndex = best.index;
+      // A family-scoped exclusion — the current account serves everything but
+      // THIS model's family — diverts that family alone. The global cursor
+      // stays: the account was chosen (often by hand, for a weekly window about
+      // to lapse) to be spent by the families it can serve, and moving the whole
+      // fleet off it for one family's sake undid that on the next request (#276).
+      const current = this.accounts[this.currentIndex];
+      const familyOnly = !!model && !!current && !exclude?.has(current.index)
+        && this._isAvailable(current, null) && !this._isAvailable(current, model, advisorModel);
+      if (!familyOnly) this.currentIndex = best.index;
       // If we switched to an account whose weekly quota is still unknown, flag
       // it so we re-evaluate once that quota is learned (see updateQuota).
       best.probing = best.quota.unified7dReset == null;
       if (switched) {
         this._beginRamp(best);
-        console.log(`[TeamClaude] Switched to account "${best.name}"`);
+        console.log(familyOnly
+          ? `[TeamClaude] Diverting "${model}" to "${best.name}" — "${current.name}" cannot serve it`
+          : `[TeamClaude] Switched to account "${best.name}"`);
       }
       return best;
     }
