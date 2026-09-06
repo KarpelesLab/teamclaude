@@ -67,6 +67,53 @@ export function isSubscriptionAccount(account) {
   return account?.type === 'oauth';
 }
 
+// The hosts each provider is reached on, for MITM interception.
+//
+// MITM is the mode that works without the client cooperating: a CLI that only
+// honours HTTPS_PROXY has no base-URL to redirect, so if the proxy will not
+// intercept the provider's host, that provider is simply unreachable through
+// it. Codex is exactly that case.
+const PROVIDER_HOSTS = { 'api.anthropic.com': 'anthropic', 'chatgpt.com': 'codex' };
+
+// Hosts adjacent to a provider that must NOT be intercepted.
+//
+// `ab.chatgpt.com` is OpenAI's own telemetry/experiment endpoint. It carries no
+// inference, nothing here would rewrite, and terminating it would mean
+// presenting our leaf for a host we have no reason to read — so it is
+// blind-tunnelled like any unrelated host. Listed rather than left to fall
+// through, because `chatgpt.com` matching by suffix would otherwise swallow it.
+const NEVER_INTERCEPT = new Set(['ab.chatgpt.com']);
+
+/**
+ * The provider reached on `host`, or null when the host is not one we intercept.
+ *
+ * Exact match, never a suffix: a subdomain of a provider is a different service
+ * (see NEVER_INTERCEPT), and matching loosely would have the proxy terminate TLS
+ * for hosts nobody asked it to read.
+ */
+export function providerForHost(host) {
+  if (!host || NEVER_INTERCEPT.has(host)) return null;
+  return PROVIDER_HOSTS[host] || null;
+}
+
+/** Whether `host` is one we deliberately refuse to intercept. */
+export function isNeverIntercepted(host) {
+  return NEVER_INTERCEPT.has(host);
+}
+
+/** Hosts to intercept for the providers this config actually uses. */
+export function interceptHostsFor(accounts = []) {
+  const wanted = new Set();
+  for (const [host, id] of Object.entries(PROVIDER_HOSTS)) {
+    // Anthropic is always intercepted — it is the default provider and the
+    // configured `upstream` may name a different host anyway. A non-default
+    // provider is intercepted only when an account actually uses it, so an
+    // Anthropic-only fleet never has its ChatGPT traffic terminated.
+    if (id === DEFAULT_PROVIDER || accounts.some(a => providerOf(a) === id)) wanted.add(host);
+  }
+  return [...wanted];
+}
+
 /** Whether `id` names a provider we know how to talk to. */
 export function isKnownProvider(id) {
   return Object.hasOwn(PROVIDERS, id);

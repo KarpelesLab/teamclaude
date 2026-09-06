@@ -129,6 +129,26 @@ base_url = "http://127.0.0.1:3456/backend-api/codex"
 wire_api = "responses"
 ```
 
+### Through the MITM proxy (no Codex config needed)
+
+MITM mode intercepts `chatgpt.com` as well as `api.anthropic.com`, so a Codex CLI
+launched behind the proxy is pooled with no `~/.codex/config.toml` change at all:
+
+```bash
+eval "$(teamclaude env)"   # HTTPS_PROXY + NODE_EXTRA_CA_CERTS
+codex
+```
+
+Two boundaries worth knowing:
+
+- `chatgpt.com` is intercepted **only when a Codex account is configured**. An
+  Anthropic-only fleet tunnels it untouched — intercepting a host nobody asked
+  the proxy to read is not a neutral default.
+- `ab.chatgpt.com` is never intercepted. It is OpenAI's telemetry endpoint,
+  carries no inference, and there is nothing there to rewrite.
+
+The base-URL route below still works and is the way to pool Codex without MITM.
+
 `OPENAI_BASE_URL` does **not** work for this — a ChatGPT-authenticated Codex
 ignores it. `model_providers` is the supported redirect.
 
