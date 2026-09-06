@@ -540,10 +540,14 @@ test('path 3: the reset switch is drawn over what the request can be sent to', (
     bucket(am, 0, 'unified7d', 0.50, 50);
     bucket(am, 1, 'unified7d', 0.10, 10);
     if (withCodex) bucket(am, 2, 'unified7d', 0.00, 1);
-    // Only the challenger's 5h window has expired, so it alone is what the
-    // switch is triggered by.
-    am.accounts[1].quota.unified5h = 0.5;
-    am.accounts[1].quota.unified5hReset = Date.now() - 1000;
+    // Every account but the incumbent has an expired 5h window, so the foreign
+    // one arrives at the switch as a candidate too. Triggering on the challenger
+    // alone leaves the eligible loop nothing to walk past, and the arm then
+    // rests on the band guard by itself.
+    for (const i of withCodex ? [1, 2] : [1]) {
+      am.accounts[i].quota.unified5h = 0.5;
+      am.accounts[i].quota.unified5hReset = Date.now() - 1000;
+    }
     return am;
   };
   // Asked of a TWIN, as elsewhere in this file: reading eligibility clears the
@@ -563,8 +567,11 @@ test('path 3: the reset switch is drawn over what the request can be sent to', (
     'an account the request cannot be sent to vetoed the switch');
 
   // codex's other two controls: the same fleet without the foreign account, and
-  // the same fleet with the knob off. Both switch, so neither the foreign
-  // account nor the feature alone accounts for the divergence.
+  // the same fleet with the knob off. Both end on the account the request can
+  // use, so neither the foreign account nor the feature alone accounts for the
+  // divergence. The knob-off one gets there through the walk, because the
+  // unfiltered switch installs the foreign account first — master's own
+  // behaviour, and what the arm below asserts directly.
   const without = build(ON, false);
   without.getActiveAccount(null, OPUS);
   assert.equal(without.accounts[without.currentIndex].name, 'reset');
