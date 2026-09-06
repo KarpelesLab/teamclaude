@@ -239,6 +239,10 @@ export class AccountManager {
     this.providerCursors = new Map();
     this.switchThreshold = switchThreshold;
     this.setRoutes(routes);
+    // Monotonic across every observation the manager holds, so a stamp read
+    // under one move can never match another. Live before the settings land,
+    // because turning the knob on takes a reading and stamps it.
+    this._obsGen = 0;
     this.setExpiryRouting(expiryRouting);
     // The rollover mechanism's whole state for the sticky current account: one
     // observation, { idx, windows: name → reset }, of the account traffic was
@@ -422,7 +426,7 @@ export class AccountManager {
   _setCurrent(account) {
     this.currentIndex = account.index;
     if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) return;
-    this._firstSightOn(this._currentObs ??= { idx: null, windows: new Map(), unescaped: null }, account);
+    this._firstSightOn(this._currentObs ??= { idx: null, windows: new Map(), unescaped: null, gen: 0 }, account);
   }
 
   /**
@@ -1496,7 +1500,7 @@ export class AccountManager {
     // the transition seeds" and "an aim never overwrites".
     if (wasWatching) return;
     const current = this.accounts[this.currentIndex];
-    if (current) this._firstSightOn(this._currentObs ??= { idx: null, windows: new Map(), unescaped: null }, current);
+    if (current) this._firstSightOn(this._currentObs ??= { idx: null, windows: new Map(), unescaped: null, gen: 0 }, current);
     for (const { sessionId, bucket, idx } of this.sessionTracker.livePins()) {
       this._firstSightOn(this.sessionTracker.refsFor(sessionId, bucket, true), this.accounts[idx]);
     }
@@ -1697,12 +1701,15 @@ export class AccountManager {
   /**
    * Has the governing window of this sticky choice rolled over since a request
    * was last found resting on it? A reading is written only where a request
-   * ARRIVES to find the choice on an account outside its own tried set; a
-   * selection that merely sends a request somewhere writes nothing, because the
-   * aimed request may never arrive. A same-account retry (short-wait 429, 401)
-   * re-enters with the tried set untouched and looks like a fresh arrival, so the
-   * roll it was pushed off is held until a second request confirms the stay; a
-   * one-request stay followed by a return preempts once more.
+   * ARRIVES to find the choice on an account outside its own tried set; an aim
+   * writes only where there is nothing to lose, because the aimed request may
+   * never arrive. Arriving is not being served either, so nothing here releases
+   * a held roll: a retry that re-enters with the tried set untouched — a 401's
+   * forced refresh, a short-wait 429 with no idle sibling to hop to — looks like
+   * a fresh arrival, and so does a second client request at a destination
+   * refusing every one of them. The roll is held until a request that carries
+   * the generation this observation was stamped with completes there; a stay so
+   * confirmed, followed by a return, preempts once more.
    */
   _restOn(obs, account, model) {
     if (obs.idx !== account.index) {
@@ -1717,15 +1724,10 @@ export class AccountManager {
       }
       // Established whole, from every window the account presents, so a window
       // that comes back is a first sight rather than a stale value read as a jump.
-      obs.idx = account.index;
+      this._moveObs(obs, account.index);
       obs.windows = new Map(Object.entries(this._accountWindows(account)));
       return;
     }
-    // A second request has found the choice where the last one left it, the only
-    // evidence that traffic came to rest here. Whatever roll it was pushed off
-    // is escaped: holding it longer would preempt off an account traffic has
-    // already left and returned to.
-    obs.unescaped = null;
     const win = this._governingWindow(account, model);
     // Redundant with _jumped's own null check, and kept because "there is
     // nothing to record" says something different from "what was recorded is
@@ -1765,7 +1767,7 @@ export class AccountManager {
       // that refused it, so _restOn never sees the arrival. The held roll is
       // given back here, to the account that still owes it.
       if (obs.unescaped?.idx === account.index) {
-        obs.idx = account.index;
+        this._moveObs(obs, account.index);
         obs.windows = obs.unescaped.windows;
         obs.unescaped = null;
         return;
@@ -1774,8 +1776,21 @@ export class AccountManager {
     } else if (obs.idx != null) {
       return;
     }
-    obs.idx = account.index;
+    this._moveObs(obs, account.index);
     obs.windows = new Map(Object.entries(this._accountWindows(account)));
+  }
+
+  /**
+   * Point an observation at an account, stamping the move with a fresh
+   * generation.
+   *
+   * The stamp is what a confirmation is scoped to: a request that selected
+   * before this move, or after a later one, carries a different one and is not
+   * evidence about the stay this move begins.
+   */
+  _moveObs(obs, index) {
+    obs.idx = index;
+    obs.gen = ++this._obsGen;
   }
 
   /** Has ANY window this reading holds rolled over on the account it was taken
@@ -1790,13 +1805,60 @@ export class AccountManager {
     return false;
   }
 
+  /**
+   * The generation stamps a request selects under, for the observations that
+   * can hold a roll on its behalf.
+   *
+   * Read BEFORE the walk: a move the walk itself makes is the request arriving
+   * somewhere, not finding traffic already at rest there, and only the latter
+   * can confirm a stay. Null with the knob off, so the caller carries nothing
+   * and the confirmation below has nothing to act on.
+   */
+  observedGeneration(sessionId = null, model = null) {
+    if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) return null;
+    const pin = sessionId
+      ? this.sessionTracker.refsFor(sessionId, this._weeklyBucketFor(model))
+      : null;
+    return { current: this._currentObs?.gen ?? null, pin: pin?.gen ?? null };
+  }
+
+  /**
+   * Release the roll a preemption pushed traffic off, on the evidence that a
+   * request COMPLETED where it was sent.
+   *
+   * Arriving is not that evidence. Several requests can start at a destination
+   * that goes on to refuse every one of them, and a retry re-entering selection
+   * with the tried set untouched starts there again; releasing on any of those
+   * would leave the fail-back nothing to hand back.
+   */
+  confirmStay(account, carried, sessionId = null, model = null) {
+    if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) return;
+    if (!account || !carried) return;
+    this._releaseHeld(this._currentObs, account, carried.current);
+    if (sessionId) {
+      const bucket = this._weeklyBucketFor(model);
+      this._releaseHeld(this.sessionTracker.refsFor(sessionId, bucket), account, carried.pin);
+    }
+  }
+
+  /**
+   * Clear one observation's held roll, and only where the request confirms the
+   * stay it selected under: another account, or any move since, is a different
+   * stay and leaves the roll held.
+   */
+  _releaseHeld(obs, account, carried) {
+    if (!obs || carried == null) return;
+    if (obs.idx !== account.index || obs.gen !== carried) return;
+    obs.unescaped = null;
+  }
+
   /** The reading for the sticky CURRENT account, taken at the top of a selection
    *  pass, before anything in that pass can move the cursor. */
   _restOnCurrent(exclude, model) {
     if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) return;
     const resting = this.accounts[this.currentIndex];
     if (!resting || exclude?.has(resting.index)) return;
-    this._currentObs ??= { idx: null, windows: new Map(), unescaped: null };
+    this._currentObs ??= { idx: null, windows: new Map(), unescaped: null, gen: 0 };
     this._restOn(this._currentObs, resting, model);
   }
 
@@ -2975,7 +3037,14 @@ export class AccountManager {
     const moved = this._currentObs?.idx == null ? null : remap(this._currentObs.idx);
     if (this._currentObs) {
       this._currentObs = moved == null ? null
-        : { idx: moved, windows: this._currentObs.windows, unescaped: remapHeld(this._currentObs.unescaped, remap) };
+        : {
+          idx: moved,
+          windows: this._currentObs.windows,
+          unescaped: remapHeld(this._currentObs.unescaped, remap),
+          // Renumbering names the same account by a new index, so a request
+          // already in flight against it still confirms the stay it selected on.
+          gen: this._currentObs.gen,
+        };
     }
     // A throttle key names an account by index, so the shift would point a live
     // entry at a different account. Not worth renumbering: the entries expire in

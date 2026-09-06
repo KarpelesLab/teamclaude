@@ -982,11 +982,11 @@ test('a retry that never left the destination does not spend the origin roll', (
 });
 
 test('a stay a second request confirms releases the roll it was pushed off', () => {
-  // The held roll is the fail-back's protection and nothing more. Once a second
-  // request has found the traffic where the last one left it, the move stuck and
-  // the origin's roll is escaped — holding it any longer would preempt off that
-  // account every time the fleet came back to it, for a rollover it has already
-  // been moved off once.
+  // The held roll is the fail-back's protection and nothing more. Once a request
+  // has found the traffic where the last one left it AND completed there, the
+  // move stuck and the origin's roll is escaped — holding it any longer would
+  // preempt off that account every time the fleet came back to it, for a
+  // rollover it has already been moved off once.
   const am = mgr(['a', 'b'], ON);
   bucket(am, 0, 'unified7d', 0.4, 10);
   bucket(am, 1, 'unified7d', 0.4, 10);
@@ -994,11 +994,16 @@ test('a stay a second request confirms releases the roll it was pushed off', () 
   rollWindow(am, 0);
 
   assert.equal(serve(am, null, OPUS).name, 'b', 'the rollover did not preempt');
-  // The preemption AIMED at b; the next request is the first to rest there, and
-  // the one after it is the second to find the traffic where the last one left
-  // it. That is the confirmation.
+  // The preemption AIMED at b; the next request is the first to rest there. The
+  // one after it finds the traffic already at rest and completes, which is the
+  // confirmation — `serve()` drives no upstream response, so the completion the
+  // server reports on an accepted status is spelled out here. The generation is
+  // read before that request's own selection, because a selection that moves the
+  // observation is the traffic arriving rather than being found at rest.
   assert.equal(serve(am, null, OPUS).name, 'b', 'the first request did not rest on b');
-  assert.equal(serve(am, null, OPUS).name, 'b', 'the second request did not confirm the stay');
+  const carried = am.observedGeneration(null, OPUS);
+  assert.equal(serve(am, null, OPUS).name, 'b', 'the second request did not rest on b');
+  am.confirmStay(am.accounts[1], carried, null, OPUS);
 
   // b is out of the way, so the traffic comes back to a on its own.
   assert.equal(serve(am, null, OPUS, { exclude: new Set([1]) }).name, 'a');

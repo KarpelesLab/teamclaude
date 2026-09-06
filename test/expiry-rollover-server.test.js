@@ -361,6 +361,92 @@ for (const distribute of [false, true]) {
       await close();
     }
   });
+
+  // ARRIVING IS NOT BEING SERVED. Three requests select b as a first selection
+  // each — no retry among them, so nothing here turns on the tried set — and b
+  // refuses all three. The second and third find the observation already naming
+  // b, which is what a rule keyed on a second arrival cannot tell from a stay,
+  // and none of the three is served there.
+  test(`${path} path: arrivals at a destination that serves none of them leave the roll owed`, async () => {
+    const arrivals = [0, 1, 2].map(i => deferred(`arrival ${i + 1} at b`));
+    const held = deferred('the suspension to be released');
+    let attempts = 0;
+
+    const { am, send, close } = await fleet(['a', 'b'], async (name, res) => {
+      if (name === 'b' && attempts < 3) {
+        arrivals[attempts++].resolve();
+        await held.promise;
+        return refuses(res);
+      }
+      return serves(res, name);
+    }, { distribute });
+
+    try {
+      assert.equal(await send(sid), 'a', 'the fixture must start on a');
+      am.accounts[0].quota.unified7dReset += WEEK;
+
+      // Serialised on the arrivals, so each selection runs with the ones before
+      // it already suspended at b: the fixture needs the observation to name b
+      // when the second and third select, and a race would decide that.
+      const first = send(sid);
+      await arrivals[0].promise;
+      const second = send(sid);
+      await arrivals[1].promise;
+      const third = send(sid);
+      await arrivals[2].promise;
+
+      held.resolve();
+      assert.deepEqual(await Promise.all([first, second, third]), ['a', 'a', 'a'],
+        'every refused request should have fallen back onto a');
+
+      // Nothing completed at b, so a is still owed the roll it was pushed off.
+      assert.equal(await send(sid), 'b',
+        'a stay no request completed released the roll the preemption held');
+    } finally {
+      await close();
+    }
+  });
+
+  // The same shape reached sequentially, with no concurrency at all: the 401's
+  // forced refresh re-enters selection with the tried set untouched, so one
+  // request supplies both the arrival that moves the observation and, on a later
+  // request, the arrival that finds it already there.
+  test(`${path} path: a 401 retry that rests without being served does not confirm the stay`, async () => {
+    const hits = [];
+    const { am, send, close } = await fleet(['a', 'b'], async (name, res) => {
+      if (name !== 'b') return serves(res, name);
+      hits.push(hits.length + 1);
+      // Hit 1 sends the request round again on b, and hit 2 serves it: that
+      // retry is the arrival, and its own selection made the move, so it
+      // confirms nothing. Hit 3 is the next request finding the traffic already
+      // at rest, and hit 4 refuses it — a rest with nothing served.
+      if (hits.length === 1 || hits.length === 3) {
+        res.writeHead(401, { 'content-type': 'application/json' });
+        return res.end(JSON.stringify({ type: 'error', error: { type: 'authentication_error' } }));
+      }
+      if (hits.length === 4) return refuses(res);
+      return serves(res, name);
+    }, {
+      distribute,
+      // Mints the same access token, so the retry is still identifiable upstream
+      // as the same account rather than rotating away.
+      refreshFn: async rt => ({ accessToken: 't-' + rt.slice(2), refreshToken: rt, expiresAt: Date.now() + H }),
+    });
+
+    try {
+      assert.equal(await send(sid), 'a', 'the fixture must start on a');
+      am.accounts[0].quota.unified7dReset += WEEK;
+
+      assert.equal(await send(sid), 'b', 'the 401 retry should have been served by b');
+      assert.equal(await send(sid), 'a', 'the refused request should have fallen back onto a');
+      assert.deepEqual(hits, [1, 2, 3, 4], 'b must have taken exactly the four attempts');
+
+      assert.equal(await send(sid), 'b',
+        'a rest nothing was served on released the roll the preemption held');
+    } finally {
+      await close();
+    }
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -500,6 +586,39 @@ test('a roll that happens while the knob is OFF is not owed when it comes on', a
     am.accounts[0].quota.unified7dReset += WEEK;
     assert.notEqual(await send(), 'a',
       'the first roll after the knob came on was missed');
+  } finally {
+    await close();
+  }
+});
+
+test('the stay confirmation writes nothing while the knob is OFF', async () => {
+  // The confirmation's own fleet and sequence with preemption disabled, on the
+  // walk that has both an observation to write: the cursor's and the session
+  // pin's. The two state assertions are what an ungated write reddens on whether
+  // or not it throws — the selection-side read has nothing to carry off, and the
+  // confirmation has nothing to release.
+  let attempts = 0;
+  const { am, send, close } = await fleet(['a', 'b'], async (name, res) => {
+    if (name === 'b' && attempts < 3) {
+      attempts++;
+      return refuses(res);
+    }
+    return serves(res, name);
+  }, { distribute: true });
+
+  try {
+    am.setExpiryRouting({ enabled: false });
+    assert.equal(await send('s1'), 'a', 'the fixture must start on a');
+    am.accounts[0].quota.unified7dReset += WEEK;
+
+    assert.deepEqual(await Promise.all([send('s1'), send('s1'), send('s1')]), ['a', 'a', 'a'],
+      'the knob-off walk left the account it started on');
+    assert.equal(await send('s1'), 'a', 'the knob-off walk left the account it started on');
+    assert.equal(attempts, 0, 'the knob-off walk sent traffic to the destination a roll would pick');
+
+    assert.equal(am._currentObs, null, 'an observation was written for the cursor with the knob off');
+    assert.equal(am.sessionTracker.refsFor('s1', 'unified7d'), null,
+      'an observation was written for the session pin with the knob off');
   } finally {
     await close();
   }

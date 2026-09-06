@@ -1380,6 +1380,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // from the default policy ('always' routes; 'off'/'429' start direct).
   const route = useSx === undefined ? !!(sx?.useByDefault()) : useSx;
 
+  // Taken before the walk, because the walk itself can move the observation and
+  // a request cannot confirm the stay its own selection began.
+  const restingGen = accountManager.observedGeneration(ctx.sessionId, ctx.model);
+
   // Select account, skipping any already tried (and failed) this request.
   // The model scopes availability so a Fable-exhausted account is skipped only
   // for Fable requests (it still serves other models).
@@ -1896,6 +1900,13 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     }
 
     res.writeHead(upstreamRes.status, responseHeaders);
+
+    // The catch block's transport-failure retry is guarded by `!res.headersSent`,
+    // so a stay confirmed once the headers are out has no retry behind it, and a
+    // forwarded status under 400 is the response the client is given.
+    if (upstreamRes.status < 400) {
+      accountManager.confirmStay(account, restingGen, ctx.sessionId, ctx.model);
+    }
 
     if (!upstreamRes.body) {
       const l = getLog();
