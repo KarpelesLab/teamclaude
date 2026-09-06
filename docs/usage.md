@@ -180,6 +180,9 @@ teamclaude help              # Show all commands
 
 With `proxy.usageDimensions` configured, each dimension gets its own sortable table. With `proxy.sessionDetail` on, a per-session table shows each session's client, project, serving accounts, and what it actually spent per weekly bucket — cache reads and cache creation included — filterable by project or client. That table is off by default; see [Configuration](configuration.md#usage-dimensions).
 
+Each account card has a **switch** button that makes that account the current one (the same `POST /teamclaude/switch` the CLI uses). It is a nudge, not a pin: normal rotation resumes from there. What happens to sessions already running depends on `distributeSessions` — with it on, a session pinned to another account keeps it until it goes idle, so the badge moves before the traffic does; with it off (the default), every session follows the switch on its next request. The page reports whether rotation will actually use the target: a disabled, errored, rate-limited, or over-threshold account — or one outranked by a higher-priority account — is still switched to, but the page says so and why rather than reporting a bare "done".
+
+
 ```
 http://localhost:3456/teamclaude/dashboard
 ```

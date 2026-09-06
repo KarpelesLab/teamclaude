@@ -114,8 +114,32 @@ export function uniqSorted(values) {
   return Object.keys(seen).sort();
 }
 
+// The request the switch button sends: POST /teamclaude/switch with the same
+// key the status poll uses. Pure, so the test suite can send exactly this
+// through a real proxy and prove the same-origin CSRF gate lets the page in.
+export function switchRequest(name, key) {
+  return {
+    url: '/teamclaude/switch',
+    init: {
+      method: 'POST',
+      headers: { 'x-api-key': key || '', 'content-type': 'application/json' },
+      body: JSON.stringify({ account: name }),
+    },
+  };
+}
+
+// What to tell the operator afterwards. The endpoint answers `ok` for the choice
+// being recorded and `eligible` for whether traffic will actually follow it —
+// two different things, and a bare "done" would be a lie for a spent target.
+export function switchOutcome(res) {
+  if (!res || !res.ok) return { kind: 'error', text: 'switch failed' + (res && res.error ? ': ' + res.error : '') };
+  if (res.eligible === false) return { kind: 'warn', text: 'switched to ' + res.account + ', but rotation will not use it' + (res.reason ? ': ' + res.reason : '') };
+  return { kind: 'ok', text: 'switched to ' + res.account };
+}
+
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, sessionRows, filterSessionRows, sortRows, uniqSorted,
+  switchRequest, switchOutcome,
 ].map(fn => fn.toString()).join('\n\n');
 
 const PAGE = `<!doctype html>
@@ -161,6 +185,11 @@ const PAGE = `<!doctype html>
   td.num, th.num { text-align: right; }
   .usage { color: var(--dim); font-size: 12px; margin-top: 6px; }
   .blocked { color: var(--warn); font-size: 12px; margin-top: 6px; }
+  .act { font: inherit; font-size: 12px; padding: 1px 10px; border-radius: 999px; border: 1px solid var(--accent); background: transparent; color: var(--accent); cursor: pointer; margin-left: auto; }
+  .act:hover { background: var(--accent); color: var(--bg); }
+  .act:disabled { opacity: .5; cursor: default; }
+  #note { font-size: 12px; margin: 8px 0; display: none; }
+  #note.ok { color: var(--ok); } #note.warn { color: var(--warn); } #note.error { color: var(--bad); }
   .filters { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; padding: 8px 10px; border-bottom: 1px solid var(--line); }
   .filters label { color: var(--dim); font-size: 12px; display: flex; align-items: center; gap: 6px; }
   .filters select { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; color: var(--text); font: inherit; font-size: 12px; padding: 4px 8px; }
@@ -187,6 +216,7 @@ const PAGE = `<!doctype html>
     <h1>TeamClaude</h1>
     <p class="sub" id="summary"></p>
     <div id="err"></div>
+    <div id="note"></div>
     <h2>Accounts</h2>
     <div id="accounts"></div>
     <div id="clientsWrap" style="display:none">
@@ -301,6 +331,12 @@ ${SHARED_HELPERS}
     if (a.name === current) head.appendChild(el('span', 'badge current', 'current'));
     head.appendChild(el('span', 'badge ' + (a.status || ''), a.disabled ? 'disabled' : (a.status || 'unknown')));
     if (a.sessions) head.appendChild(el('span', 'tag', a.sessions + ' active session' + (a.sessions > 1 ? 's' : '')));
+    // Last in the row so the badges sit in the same place on every card.
+    if (a.name !== current) {
+      var btn = el('button', 'act', 'switch');
+      btn.addEventListener('click', function () { doSwitch(a.name, btn); });
+      head.appendChild(btn);
+    }
     card.appendChild(head);
     if (a.unavailable) card.appendChild(el('div', 'blocked', 'blocked: ' + (UNAVAILABLE_TEXT[a.unavailable] || a.unavailable)));
     var q = a.quota || {};
@@ -490,6 +526,36 @@ ${SHARED_HELPERS}
     renderDimensions(s.usageDimensions);
     renderSessions(s.sessions);
     document.getElementById('foot').textContent = 'refreshes every ' + (POLL_MS / 1000) + 's · ' + new Date().toLocaleTimeString();
+  }
+
+  function note(kind, text) {
+    var n = document.getElementById('note');
+    n.className = kind;
+    n.textContent = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) + ' · ' + text;
+    n.style.display = 'block';
+  }
+
+  // One manual switch. The endpoint is a nudge, not a pin: it sets the current
+  // account and normal rotation resumes from there (see the handler's comment
+  // in server.js for what "eligible" means).
+  function doSwitch(name, btn) {
+    btn.disabled = true;
+    var r = switchRequest(name, localStorage.getItem(KEY));
+    fetch(r.url, r.init)
+      .then(function (res) {
+        if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
+        return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
+      })
+      .then(function (json) {
+        if (!json) return;
+        var out = switchOutcome(json);
+        note(out.kind, out.text);
+        // Re-enabled on any non-success, whether the server refused or the
+        // fetch threw, so the two failure paths leave the button in one state.
+        if (out.kind !== 'ok') btn.disabled = false;
+        poll();
+      })
+      .catch(function (e) { note('error', 'switch failed: ' + e.message); btn.disabled = false; });
   }
 
   function showKeybox() {

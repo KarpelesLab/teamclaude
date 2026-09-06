@@ -391,8 +391,14 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
  *   - `Origin` is the fallback for browsers that send no Sec-Fetch-Site. Its
  *     mere presence on a POST to a local control endpoint means a page issued
  *     it; matching it against our own host would mean guessing which of
- *     localhost / 127.0.0.1 / [::1] / a LAN address the caller used, and a
- *     browser-issued same-origin call is not a thing worth supporting here.
+ *     localhost / 127.0.0.1 / [::1] / a LAN address the caller used, so the
+ *     Origin-only fallback admits no page at all.
+ *
+ * The dashboard's switch button is a browser-issued same-origin call and is
+ * admitted by the Sec-Fetch-Site branch alone. A browser that sends Origin
+ * without Sec-Fetch-Site (or a proxy that strips it) lands in the fallback
+ * and is refused — deliberately: widening the fallback to guess our own host
+ * is the trade this comment declines.
  *
  * Non-browser callers (curl, the CLI, `teamclaude attach`) send neither and are
  * unaffected.
