@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
+import { DEFAULT_PROVIDER } from '../src/provider.js';
 
 const H = 3600_000;
 const OPUS = 'claude-opus-5';
@@ -15,7 +16,7 @@ function oauth(name, extra = {}) {
 // default parameter would turn `undefined` back into the knob's ON value.
 function mgr(names, opts = {}) {
   const { expiry, ...rest } = opts;
-  return new AccountManager(names.map(n => oauth(n)), 0.98,
+  return new AccountManager(names.map(n => (typeof n === 'string' ? oauth(n) : n)), 0.98,
     'expiry' in opts ? { expiryRouting: expiry, ...rest } : rest);
 }
 
@@ -524,6 +525,75 @@ test('path 3: a switch onto an account the band excluded is refused too', () => 
   // Driven through the refresh itself, as above: the switch has no other caller.
   am.refreshExpiredQuotas();
   assert.equal(am.accounts[am.currentIndex].name, 'cur');
+});
+
+test('path 3: the reset switch is drawn over what the request can be sent to', () => {
+  // A Codex account cannot serve an Anthropic request, so it may neither be
+  // switched to nor stop a switch. Its pressure takes the top band on its own
+  // here, and a band drawn over the whole fleet therefore vetoes the switch to
+  // the one account the request could actually use.
+  const build = (expiry, withCodex) => {
+    const fleet = [oauth('cur'), oauth('reset')];
+    if (withCodex) fleet.push(oauth('codex', { provider: 'codex' }));
+    const am = mgr(fleet, { expiry });
+    bucket(am, 0, 'unified7d', 0.50, 50);
+    bucket(am, 1, 'unified7d', 0.10, 10);
+    if (withCodex) bucket(am, 2, 'unified7d', 0.00, 1);
+    // Only the challenger's 5h window has expired, so it alone is what the
+    // switch is triggered by.
+    am.accounts[1].quota.unified5h = 0.5;
+    am.accounts[1].quota.unified5hReset = Date.now() - 1000;
+    return am;
+  };
+  // Asked of a TWIN, as elsewhere in this file: reading eligibility clears the
+  // expired window the switch is triggered by.
+  const twin = build(ON, true);
+  assert.deepEqual(twin._bandedCandidates(null, OPUS).map(a => a.name), ['codex'],
+    'the fixture must give the Codex account the band on its own');
+  assert.deepEqual(
+    twin._bandedCandidates(twin._excludeOtherProviders(null, DEFAULT_PROVIDER), OPUS).map(a => a.name),
+    ['reset'], 'the fixture must give the band to the challenger once the request excludes Codex');
+
+  // Driven through getActiveAccount, because that is where the request's
+  // provider partition is built; the switch runs inside it.
+  const on = build(ON, true);
+  on.getActiveAccount(null, OPUS);
+  assert.equal(on.accounts[on.currentIndex].name, 'reset',
+    'an account the request cannot be sent to vetoed the switch');
+
+  // codex's other two controls: the same fleet without the foreign account, and
+  // the same fleet with the knob off. Both switch, so neither the foreign
+  // account nor the feature alone accounts for the divergence.
+  const without = build(ON, false);
+  without.getActiveAccount(null, OPUS);
+  assert.equal(without.accounts[without.currentIndex].name, 'reset');
+
+  const off = build(OFF, true);
+  off.getActiveAccount(null, OPUS);
+  assert.equal(off.accounts[off.currentIndex].name, 'reset');
+});
+
+test('path 3: the knob-off switch sees the fleet master shows it', () => {
+  // The exclusion is gated at the call site for the reason the model is: with
+  // the feature off the switch's candidate filter must be the one the router
+  // makes without this feature. Both challengers rank equally with the knob off,
+  // so the tiebreak takes the sooner-resetting one — the Codex account, which an
+  // ungated threading would filter out.
+  const am = mgr([oauth('cur'), oauth('anth'), oauth('codex', { provider: 'codex' })], { expiry: OFF });
+  bucket(am, 0, 'unified7d', 0.50, 50);
+  bucket(am, 1, 'unified7d', 0.50, 40);
+  bucket(am, 2, 'unified7d', 0.50, 10);
+  for (const i of [1, 2]) {
+    am.accounts[i].quota.unified5h = 0.5;
+    am.accounts[i].quota.unified5hReset = Date.now() - 1000;
+  }
+  // The switch's own pick, read before the walk that follows it can move the
+  // cursor again: an Anthropic request cannot be sent to the account the
+  // knob-off switch installs here, so the walk leaves it either way and only
+  // this reads the filter.
+  am.refreshExpiredQuotas(OPUS, am._excludeOtherProviders(null, DEFAULT_PROVIDER));
+  assert.equal(am.accounts[am.currentIndex].name, 'codex',
+    'the knob-off switch dropped a candidate the router keeps');
 });
 
 test('path 3 still switches when the sooner-resetting account is the better one', () => {

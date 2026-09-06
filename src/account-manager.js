@@ -647,7 +647,7 @@ export class AccountManager {
     // Clear expired quotas across all accounts and switch proactively if a
     // session reset made a sooner-expiring account the better choice. This runs
     // on every request so the behaviour holds without the TUI render loop.
-    this.refreshExpiredQuotas(model);
+    this.refreshExpiredQuotas(model, exclude);
     // Session-affinity distribution (opt-in): keep a session on its pinned
     // account for cache reuse, and route a new session to the least-loaded
     // account. Only when enabled, only for a real session, and only outside a
@@ -2280,7 +2280,7 @@ export class AccountManager {
     for (const account of this.accounts) this._clearExpiredQuotas(account);
   }
 
-  refreshExpiredQuotas(model = null) {
+  refreshExpiredQuotas(model = null, exclude = null) {
     let changed = false;
     const sessionReset = [];
     for (const account of this.accounts) {
@@ -2297,9 +2297,12 @@ export class AccountManager {
     // The model reaches the switch only while the feature is on. Handed no
     // model, the switch runs the same `_isAvailable(acc)` it does with the knob
     // off: threading one in would make the disabled path's candidate filter
-    // model-scoped, a live routing change on the path that promises none.
+    // model-scoped, a live routing change on the path that promises none. The
+    // request's exclusions are gated for the same reason and say the same kind
+    // of thing — which accounts this request can be sent to at all.
     if (sessionReset.length) {
-      this._switchOnSessionReset(sessionReset, this.expiryRouting.enabled ? model : null);
+      this._switchOnSessionReset(sessionReset, this.expiryRouting.enabled ? model : null,
+        this.expiryRouting.enabled ? exclude : null);
     }
     return changed;
   }
@@ -2309,7 +2312,7 @@ export class AccountManager {
    * weekly limit expires soonest — but only if that is sooner than the current
    * account's weekly limit and the account still has weekly quota to spend.
    */
-  _switchOnSessionReset(candidates, model = null) {
+  _switchOnSessionReset(candidates, model = null, exclude = null) {
     const current = this.accounts[this.currentIndex];
     // Need a known weekly reset on the current account to compare against;
     // if it is unknown we are still probing it, so leave it alone. Read through
@@ -2325,6 +2328,10 @@ export class AccountManager {
     const eligible = [];
     for (const acc of candidates) {
       if (acc.index === this.currentIndex) continue;
+      // An account this request cannot be sent to decides nothing about where it
+      // goes: a foreign provider serves none of its models, and one it has
+      // already tried refused it.
+      if (exclude?.has(acc.index)) continue;
       // Model-scoped, because the request being routed has one: an account whose
       // Fable weekly is spent is still fully usable for Opus, and a switch that
       // ignores the model can install one the model's own picker would refuse.
@@ -2359,8 +2366,11 @@ export class AccountManager {
     // TWO guards, different properties, neither implying the other. Band
     // membership says the account is worth spending at all. The rank comparison
     // says this switch leaves no strictly better account behind, which
-    // membership does not claim once a lower tier passes through unbanded.
-    if (this.expiryRouting.enabled && !this._bandedCandidates(null, model).includes(best)) return;
+    // membership does not claim once a lower tier passes through unbanded. Both
+    // are drawn over what this request can be sent to, so an account it excludes
+    // neither takes the band on its own nor vetoes a switch to one that can
+    // serve it.
+    if (this.expiryRouting.enabled && !this._bandedCandidates(exclude, model).includes(best)) return;
     // Strictly worse than what we are on: stay. Equal keeps the reset tiebreak
     // that got us here, and with expiry routing off every rank is absent and
     // equal, so this cannot fire at all.
