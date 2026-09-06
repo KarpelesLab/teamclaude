@@ -53,6 +53,11 @@ function pinnedFleet(expiry) {
 
 const ON = { enabled: true, preempt: true };
 
+// A request's exclusion set, empty. With the knob on, `refreshExpiredQuotas`
+// spends a session reset only for a caller carrying one; a call without it is
+// a poll and runs no switch, so an arm about the switch has to hand one.
+const asRequest = () => new Set();
+
 // ---------------------------------------------------------------------------
 // A rollover moves a pin. Nothing else does.
 // ---------------------------------------------------------------------------
@@ -1346,14 +1351,17 @@ test('an account known to be nearly spent does not win on having fewer sessions'
 // and would be a false gate. The claim is differential by nature and is measured
 // that way, by flagoff-sweep.mjs over generated fleets.
 
-test('the real paint performs the 5h switch; only the status preview skips it', () => {
-  // The docs record the skipped switch as a limitation of the two surfaces, and
-  // it holds for one: _render calls the combined clear-AND-switch, so the paint
-  // IS the switch, while the preview path clears the window through the
-  // availability read and never reaches the switch at all. The sentence
-  // describing that is gated here rather than left to be read against the code.
-  function fleet() {
-    const am = mgr(['cur', 'reset'], ON);
+test('a paint clears the window; with the knob on the switch waits for a request', () => {
+  // The docs record a skipped switch as a limitation of the request-less
+  // surfaces, and the two surfaces differ. The preview never reaches the switch
+  // at all: it clears the window through the availability read. The paint calls
+  // the combined clear-and-switch, so with the knob OFF it performs the switch
+  // itself — with no request in hand, and therefore on the model-less ranking.
+  // With the knob ON it does not: a reset is spent by a request, so the paint
+  // clears the window and leaves the event for one. All of that is gated here
+  // rather than left to be read against the code.
+  function fleet(expiry) {
+    const am = mgr(['cur', 'reset'], expiry);
     const now = Date.now();
     bucket(am, 0, 'unified7d', 0.5, 200, now);
     bucket(am, 1, 'unified7d', 0.5, 20, now);   // its weekly expires sooner
@@ -1362,32 +1370,55 @@ test('the real paint performs the 5h switch; only the status preview skips it', 
     am.accounts[1].quota.unified5hReset = now - 1000;   // the reset the switch acts on
     return am;
   }
+  function paint(am) {
+    const tui = new TUI({
+      accountManager: am, config: { accounts: [], routes: [], blockedModels: [], proxy: { port: 1 } },
+      saveConfig: async () => {}, syncAccounts: async () => 0, onQuit: () => {},
+    });
+    const write = process.stdout.write.bind(process.stdout);
+    process.stdout.write = () => true;
+    try { tui._render(true); } finally { process.stdout.write = write; }
+  }
 
-  const painted = fleet();
-  const tui = new TUI({
-    accountManager: painted, config: { accounts: [], routes: [], blockedModels: [], proxy: { port: 1 } },
-    saveConfig: async () => {}, syncAccounts: async () => 0, onQuit: () => {},
-  });
-  const write = process.stdout.write.bind(process.stdout);
-  process.stdout.write = () => true;
-  try { tui._render(true); } finally { process.stdout.write = write; }
-  assert.equal(painted.accounts[painted.currentIndex].name, 'reset',
-    'the paint did not run the switch its own refresh call performs');
-  assert.equal(painted.accounts[1].quota.unified5h, null, 'the paint did not clear the expired window');
+  const off = fleet(undefined);
+  paint(off);
+  assert.equal(off.accounts[off.currentIndex].name, 'reset',
+    'the knob-off paint did not run the switch its own refresh call performs');
+  assert.equal(off.accounts[1].quota.unified5h, null, 'the knob-off paint did not clear the expired window');
 
-  const previewed = fleet();
-  for (const a of previewed.accounts) previewed._isNearQuota(a, null);
-  assert.equal(previewed.accounts[previewed.currentIndex].name, 'cur',
-    'the preview ran a switch the documented limitation says it skips');
-  assert.equal(previewed.accounts[1].quota.unified5h, null, 'the preview did not clear the expired window');
+  const on = fleet(ON);
+  paint(on);
+  assert.equal(on.accounts[1].quota.unified5h, null, 'the paint did not clear the expired window');
+  assert.equal(on.accounts[on.currentIndex].name, 'cur',
+    'the paint took a routing decision on a reset no request had asked about');
+  assert.equal(on.accounts[1].sessionResetPending, true,
+    'the paint consumed the event instead of leaving it for a request');
+  on.refreshExpiredQuotas(null, asRequest());
+  assert.equal(on.accounts[on.currentIndex].name, 'reset',
+    'the reset the paint left pending never reached the request');
+
+  // Neither setting lets the preview reach the switch, because it never calls
+  // the refresh at all. What it does not do is lose the event: since #275 the
+  // reset is recorded on the account, so the switch is deferred to the next
+  // request rather than skipped.
+  for (const expiry of [undefined, ON]) {
+    const previewed = fleet(expiry);
+    for (const a of previewed.accounts) previewed._isNearQuota(a, null);
+    assert.equal(previewed.accounts[previewed.currentIndex].name, 'cur',
+      'the preview ran a switch the documented limitation says it skips');
+    assert.equal(previewed.accounts[1].quota.unified5h, null, 'the preview did not clear the expired window');
+    previewed.refreshExpiredQuotas(null, asRequest());
+    assert.equal(previewed.accounts[previewed.currentIndex].name, 'reset',
+      'the reset the preview uncovered never reached the next request');
+  }
 });
 
 test('a repaint takes no reading, so it cannot spend the roll of the account it leaves', () => {
   // TUI._render calls the refresh with no request arguments, every few seconds
-  // idle and twice a second under load, and the 5h switch inside it can move the
-  // cursor, as it does with the knob off. What it must not do is take a READING,
-  // because nothing arrived anywhere: a paint is not a place a reading is taken
-  // from.
+  // idle and twice a second under load. With the knob off the 5h switch inside
+  // it can move the cursor; with the knob on it leaves that to a request. What
+  // it must not do on either setting is take a READING, because nothing arrived
+  // anywhere: a paint is not a place a reading is taken from.
   const am = mgr(['a', 'b', 'c'], ON);
   bucket(am, 0, 'unified7d', 0.4, 10);
   bucket(am, 1, 'unified7d', 0.4, 20);
@@ -1457,8 +1488,10 @@ test('the session-reset switch routes by the request\'s own window', () => {
   am.accounts[1].quota.unified5h = 0.5;
   am.accounts[1].quota.unified5hReset = now - 1000;
 
-  // A Fable request drives the refresh, so the switch is asked about Fable.
-  am.refreshExpiredQuotas(FABLE);
+  // A Fable request drives the refresh, so the switch is asked about Fable. The
+  // exclusion set is what makes it a request: without one the switch does not
+  // run at all and this would assert against a decision nobody took.
+  am.refreshExpiredQuotas(FABLE, asRequest());
   assert.equal(am.accounts[am.currentIndex].name, 'cur',
     'the switch installed an account the Fable picker excludes');
 });
@@ -1483,7 +1516,7 @@ test('the session-reset switch admits on the order the pick uses', () => {
     am.accounts[1].quota.unified5hReset = now - 1000;
     assert.equal(am._rankedReset(am.accounts[1], FABLE) < am._rankedReset(am.accounts[0], FABLE), true,
       'the fixture must have the candidate ranking first for Fable');
-    am.refreshExpiredQuotas(FABLE);
+    am.refreshExpiredQuotas(FABLE, asRequest());
     return am.accounts[am.currentIndex].name;
   }
 

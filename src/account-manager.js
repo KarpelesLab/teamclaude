@@ -649,7 +649,14 @@ export class AccountManager {
     // Clear expired quotas across all accounts and switch proactively if a
     // session reset made a sooner-expiring account the better choice. This runs
     // on every request so the behaviour holds without the TUI render loop.
-    this.refreshExpiredQuotas(model, exclude);
+    //
+    // A set on every call, empty included: `_excludeOtherProviders` hands back
+    // the caller's own argument when nothing needs excluding, so a
+    // single-provider request arrives here holding null — the same thing a poll
+    // holds, and the refresh tells the two apart by exactly that. Allocated
+    // fresh rather than shared, because a set handed out once is a set some
+    // later reader could add to.
+    this.refreshExpiredQuotas(model, this.expiryRouting.enabled ? (exclude ?? new Set()) : exclude);
     // Session-affinity distribution (opt-in): keep a session on its pinned
     // account for cache reuse, and route a new session to the least-loaded
     // account. Only when enabled, only for a real session, and only outside a
@@ -2163,7 +2170,8 @@ export class AccountManager {
       // unavailableReason, which getStatus calls for every account on every
       // read. Whichever noticed first used to consume the event, so with a
       // dashboard polling every 5s the rule almost never ran (#275). The flag
-      // outlives the observation; only the request path clears it.
+      // outlives the observation: only refreshExpiredQuotas clears it, and with
+      // the feature on only when a request drives that call.
       account.sessionResetPending = true;
       q.unified5h = null;
       q.unified5hReset = null;
@@ -2291,18 +2299,34 @@ export class AccountManager {
     // is read against it too: with the feature off nothing is excluded from
     // anything, and every reset is consumed on sight.
     const scope = this.expiryRouting.enabled ? exclude : null;
+    // THE EXCLUSION SET IS WHAT MARKS A CALL AS A REQUEST'S. The request path
+    // hands one on every call — empty when the request excludes nothing — and
+    // the three request-less callers (the TUI render loop, getQuotaSummary for
+    // the status poller, selectActiveAccount at startup) hand none.
+    //
+    // A reset spent by one of those is lost outright rather than acted on
+    // early: the window that raised it is already cleared, so nothing sets the
+    // flag again, and the switch it triggers is drawn over the whole fleet
+    // because a poll has no request to draw it over. With a mixed-provider
+    // fleet that is the defect this rule exists for — a Codex account takes the
+    // band on its own and vetoes an Anthropic-to-Anthropic move that no later
+    // request can retry.
+    const spends = !this.expiryRouting.enabled || scope != null;
     const sessionReset = [];
     for (const account of this.accounts) {
       const r = this._clearExpiredQuotas(account);
       if (r.changed) changed = true;
+      // Clearing windows is a poll's whole job and is left to it; spending the
+      // event is not.
+      if (!spends) continue;
       // The reset belongs to the first request that can act on it. This one
       // cannot be sent to the account at all, so consuming the flag here would
       // spend the event on a switch that must refuse it and leave the next
       // request — which could have used the account — nothing to act on.
       if (scope?.has(account.index)) continue;
       // The flag, not r.session: a status read may have cleared the window
-      // seconds earlier, and the rule still has to run. Cleared here because
-      // this is the only path that acts on it.
+      // seconds earlier, and the rule still has to run. Cleared here rather
+      // than where the window is, so that a read cannot swallow the event.
       if (account.sessionResetPending) {
         account.sessionResetPending = false;
         sessionReset.push(account);

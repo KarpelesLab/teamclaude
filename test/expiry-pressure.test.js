@@ -24,6 +24,14 @@ function mgr(names, opts = {}) {
 const ON = { enabled: true };
 const OFF = undefined;
 
+// A request's exclusion set, empty. With the knob on, `refreshExpiredQuotas`
+// spends a session reset only for a caller carrying one of these, so an arm
+// standing in for a request hands one even where the request excludes nothing
+// — which is exactly what the request path hands a single-provider fleet. A
+// call without it is a poll, and these arms would then assert against a switch
+// that never ran.
+const asRequest = () => new Set();
+
 function near(actual, expected, what) {
   assert.ok(Math.abs(actual - expected) <= Math.abs(expected) * 1e-12,
     `${what}: ${actual} is not ${expected}`);
@@ -478,7 +486,7 @@ test('path 3 (session-quota reset): a switch onto a spent account is vetoed', ()
   assert.equal(off.accounts[off.currentIndex].name, 'b');
 
   const on = build(ON);
-  on.refreshExpiredQuotas();
+  on.refreshExpiredQuotas(null, asRequest());
   assert.equal(on.accounts[on.currentIndex].name, 'cur');
 });
 
@@ -494,16 +502,16 @@ test('path 3: a band member with strictly worse pressure is still refused', () =
     am.accounts[1].quota.unified5hReset = Date.now() - 1000; // its 5h just expired
     return am;
   };
-  // Membership is asked of a TWIN, never of the manager under test: reading
-  // eligibility clears expired windows as a side effect, so asking here would
-  // consume the very session reset the switch is triggered by, and the
-  // assertion below would pass without the switch ever having been considered.
+  // Membership is asked of a TWIN, as elsewhere in this file: not because
+  // reading eligibility spends the event — since #275 the reset is recorded on
+  // the account and only a request's refresh clears it — but because this reads
+  // the band on a fleet the check below is about to move the cursor of.
   assert.deepEqual(build()._bandedCandidates().map(a => a.name), ['cur', 'b']);
   const am = build();
-  // Driven through the refresh itself, the one place the switch runs: no shape
-  // of this call clears the windows and leaves the switch for a later request,
-  // and a repaint takes the same path a request does.
-  am.refreshExpiredQuotas();
+  // Driven through the refresh itself, the one place the switch runs, and
+  // carrying a request: with the knob on a poll clears the windows and leaves
+  // the switch to the next request.
+  am.refreshExpiredQuotas(null, asRequest());
   assert.equal(am.accounts[am.currentIndex].name, 'cur');
 });
 
@@ -524,7 +532,7 @@ test('path 3: a switch onto an account the band excluded is refused too', () => 
   assert.deepEqual(build()._bandedCandidates().map(a => a.name), ['hot']);
   const am = build();
   // Driven through the refresh itself, as above: the switch has no other caller.
-  am.refreshExpiredQuotas();
+  am.refreshExpiredQuotas(null, asRequest());
   assert.equal(am.accounts[am.currentIndex].name, 'cur');
 });
 
@@ -547,9 +555,10 @@ test('path 3: the reset switch is drawn over what the request can be sent to', (
     return am;
   };
   // Asked of a TWIN, as elsewhere in this file. Not because reading eligibility
-  // spends what the switch is triggered by — since #275 the reset is recorded on
-  // the account and only the request path clears it — but because these read the
-  // band on a fleet whose cursor the checks below are about to move.
+  // spends what the switch is triggered by — since #275 the reset is recorded
+  // on the account, and with the knob on only a call carrying a request clears
+  // it — but because these read the band on a fleet whose cursor the checks
+  // below are about to move.
   const twin = build(ON, true);
   assert.deepEqual(twin._bandedCandidates(null, OPUS).map(a => a.name), ['codex'],
     'the fixture must give the Codex account the band on its own');
@@ -624,9 +633,60 @@ test('path 3: a reset stays pending until a request that can act on it', () => {
   // Request 2 can be sent there. Nothing re-triggers the event — the window was
   // cleared on the first pass and reads null now — so this switches only if the
   // reset survived the request that had to refuse it.
-  am.refreshExpiredQuotas(OPUS);
+  am.refreshExpiredQuotas(OPUS, asRequest());
   assert.equal(am.accounts[am.currentIndex].name, 'reset',
     'the reset never reached a request that could act on it');
+});
+
+test('path 3: a poll clears the window and leaves the reset for a request', () => {
+  // A poll routes nothing, so a reset it spends is spent nowhere: the window
+  // that raised the event is cleared on that same pass, nothing sets the flag
+  // again, and the switch it triggers is drawn over the whole fleet because a
+  // poll has no request to draw it over. Driven through getQuotaSummary, which
+  // is the live shape — the status-line poller hits it through
+  // GET /teamclaude/quota, several times a minute.
+  const am = mgr(['cur', 'reset'], { expiry: ON });
+  bucket(am, 0, 'unified7d', 0.50, 50);
+  bucket(am, 1, 'unified7d', 0.10, 10);
+  am.accounts[1].quota.unified5h = 0.5;
+  am.accounts[1].quota.unified5hReset = Date.now() - 1000;
+
+  am.getQuotaSummary();
+  assert.equal(am.accounts[1].quota.unified5h, null,
+    'the poll must still clear the expired window — that is its job');
+  assert.equal(am.accounts[1].sessionResetPending, true,
+    'a poll spent the reset');
+  assert.equal(am.accounts[am.currentIndex].name, 'cur',
+    'a poll ran the switch');
+
+  // Repeatedly, because the poller is not a one-off: whatever wears the event
+  // down would wear it down within a second of real polling.
+  for (let i = 0; i < 12; i++) am.getQuotaSummary();
+  assert.equal(am.accounts[1].sessionResetPending, true, 'repeated polling wore the reset down');
+
+  // And the request that can act on it still finds it.
+  am.refreshExpiredQuotas(OPUS, asRequest());
+  assert.equal(am.accounts[am.currentIndex].name, 'reset',
+    'the reset the poll left pending never reached the request');
+});
+
+test('path 3: the knob-off poll spends the reset exactly as master does', () => {
+  // The control for the arm above, and the whole of what the flag-off promise
+  // says here: with the feature off a poll consumes the event and runs the
+  // switch, because that is what the router does without this feature. The
+  // fixture is the one above with the knob flipped, so the divergence is the
+  // knob and nothing else.
+  const am = mgr(['cur', 'reset'], { expiry: OFF });
+  bucket(am, 0, 'unified7d', 0.50, 50);
+  bucket(am, 1, 'unified7d', 0.10, 10);
+  am.accounts[1].quota.unified5h = 0.5;
+  am.accounts[1].quota.unified5hReset = Date.now() - 1000;
+
+  am.getQuotaSummary();
+  assert.equal(am.accounts[1].sessionResetPending, false,
+    'the knob-off poll left an event master consumes');
+  assert.equal(am.accounts[am.currentIndex].name, 'reset',
+    'the knob-off poll skipped a switch master performs');
 });
 
 test('path 3: the knob-off switch sees the fleet master shows it', () => {
@@ -658,7 +718,7 @@ test('path 3 still switches when the sooner-resetting account is the better one'
   bucket(am, 1, 'unified7d', 0.1, 10);
   am.accounts[1].quota.unified5h = 0.5;
   am.accounts[1].quota.unified5hReset = Date.now() - 1000;
-  am.refreshExpiredQuotas();
+  am.refreshExpiredQuotas(null, asRequest());
   assert.equal(am.accounts[am.currentIndex].name, 'b');
 });
 
