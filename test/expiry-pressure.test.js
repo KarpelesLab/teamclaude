@@ -242,21 +242,20 @@ test('equally spent windows are governed by the one that resets sooner', () => {
 });
 
 test('an equal-pressure tie breaks on the governing window\'s clock, not another', () => {
-  // Identical scoped windows on both accounts, so the pressures are computed
-  // from identical inputs and the tie is exact rather than nearly so — the next
-  // sort key is what decides the pick. The SHARED weekly disagrees and points
-  // the other way, and it is a clock neither the gate nor the ratio consulted.
+  // Half the headroom over half the horizon is the same headroom per second, so
+  // the two scoped windows price identically and the tie is exact rather than
+  // nearly so — the next sort key is what decides the pick, and that key is the
+  // governing window's own clock. The SHARED weekly points the other way, and it
+  // is a clock neither the gate nor the ratio consulted.
   const now = Date.now();
   const fleet = expiry => {
     const am = mgr(['a', 'b'], { expiry });
     for (const i of [0, 1]) {
-      Object.assign(am.accounts[i].quota, {
-        unified5h: 0.1,
-        unified7d: 0.10,
-        scopedWeekly: { opus: { utilization: 0.80, resetAt: now + 20 * H } },
-      });
+      Object.assign(am.accounts[i].quota, { unified5h: 0.1, unified7d: 0.10 });
       am.accounts[i].probing = false;
     }
+    am.accounts[0].quota.scopedWeekly = { opus: { utilization: 0.75, resetAt: now + 10 * H } };
+    am.accounts[1].quota.scopedWeekly = { opus: { utilization: 0.50, resetAt: now + 20 * H } };
     am.accounts[0].quota.unified7dReset = now + 100 * H;
     am.accounts[1].quota.unified7dReset = now + 5 * H;
     return am;
@@ -265,6 +264,8 @@ test('an equal-pressure tie breaks on the governing window\'s clock, not another
   const on = fleet(ON);
   assert.equal(on._expiryPressure(on.accounts[0], OPUS, now),
     on._expiryPressure(on.accounts[1], OPUS, now), 'the fixture must tie exactly');
+  assert.notEqual(on._rankedReset(on.accounts[0], OPUS), on._rankedReset(on.accounts[1], OPUS),
+    'the governing clocks tie too, so only candidate order can decide');
   assert.equal(on._pickBestAvailable(null, OPUS).name, 'a');
   assert.equal(on._pickLeastLoaded(null, OPUS).name, 'a');
 
