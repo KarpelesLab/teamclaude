@@ -8,6 +8,16 @@ import { TextEncoder, TextDecoder } from 'node:util';
 import { upstreamFetch, writeRequestBody } from '../src/upstream-fetch.js';
 import { readWithIdleTimeout, relayFair, streamResponse } from '../src/server.js';
 
+test('client disconnect cancels a silent upstream immediately, not at idle timeout', { timeout: 2000 }, async () => {
+  let cancelled = false;
+  const upstream = new ReadableStream({ cancel() { cancelled = true; } });
+  const client = new Writable({ write(chunk, enc, cb) { cb(); } });
+  const running = streamResponse(upstream, client, 0, { recordTokenUsage() {} });
+  client.destroy();
+  await Promise.race([running, new Promise((_, reject) => setTimeout(() => reject(new Error('disconnect did not cancel upstream')), 200))]);
+  assert.equal(cancelled, true);
+});
+
 // Bring up an HTTP server on an ephemeral port and hand back {server, port}.
 async function listen(handler) {
   const server = http.createServer(handler);

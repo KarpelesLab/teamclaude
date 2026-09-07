@@ -14,6 +14,7 @@ import https from 'node:https';
 import { ReadableStream } from 'node:stream/web';
 import { tunnelTls } from './sx.js';
 import { proxyForHost, proxyAgent } from './upstream-proxy.js';
+import { AdmissionGate } from './admission-gate.js';
 
 // Pooled keep-alive agents for the direct (non-sx) path. Node's global fetch
 // multiplexes ALL requests to an origin over a SINGLE HTTP/2 connection; under
@@ -26,15 +27,18 @@ import { proxyForHost, proxyAgent } from './upstream-proxy.js';
 // socket at TCP speed, exactly like N direct Claude Code processes. maxSockets is
 // per-origin and bounds the fan-out. Escape hatch:
 // TEAMCLAUDE_UPSTREAM_GLOBAL_FETCH=1 reverts to the old global-fetch path.
-// A proxy has one JavaScript event loop, unlike N independent Claude Code
-// processes. Letting a reconnect storm fan out to hundreds of readable TLS
-// sockets can spend whole poll turns draining upstream data and starve even the
-// local status listener. Eight preserves useful parallelism (and fixes the old
-// single-h2 flow-control bottleneck) while applying backpressure before the
-// relay becomes unresponsive. Operators with measured headroom can override it.
-export const DEFAULT_UPSTREAM_MAX_SOCKETS = 8;
+// Long-lived streams occupy sockets until their body ends. A small default
+// (eight) serializes unrelated sessions behind those streams. Preserve the
+// original pool width; explicit bounded admission below limits waiting work.
+export const DEFAULT_UPSTREAM_MAX_SOCKETS = 256;
 const configuredMaxSockets = Number(process.env.TEAMCLAUDE_UPSTREAM_MAX_SOCKETS);
-const MAX_SOCKETS = configuredMaxSockets > 0 ? configuredMaxSockets : DEFAULT_UPSTREAM_MAX_SOCKETS;
+const MAX_SOCKETS = Number.isSafeInteger(configuredMaxSockets) && configuredMaxSockets > 0 ? configuredMaxSockets : DEFAULT_UPSTREAM_MAX_SOCKETS;
+const admissionByOrigin = new Map();
+export function upstreamPoolStatus() {
+  let active = 0, queued = 0;
+  for (const gate of admissionByOrigin.values()) { active += gate.active; queued += gate.queue.length; }
+  return { active, queued, origins: admissionByOrigin.size, perOriginLimit: MAX_SOCKETS };
+}
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: MAX_SOCKETS });
 const httpAgent = new http.Agent({ keepAlive: true, maxSockets: MAX_SOCKETS });
 const USE_GLOBAL_FETCH = /^(1|true|yes|on)$/i.test(process.env.TEAMCLAUDE_UPSTREAM_GLOBAL_FETCH || '');
@@ -145,7 +149,8 @@ function directFetch(url, opts, timeoutMs) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(headersTimeoutError(timeoutMs)), timeoutMs);
   timer.unref?.();
-  return fetch(url, { ...opts, signal: ctrl.signal }).then(
+  const signal = opts.signal ? AbortSignal.any([opts.signal, ctrl.signal]) : ctrl.signal;
+  return fetch(url, { ...opts, signal }).then(
     (res) => { clearTimeout(timer); return res; },
     (err) => { clearTimeout(timer); throw err; },
   );
@@ -176,12 +181,48 @@ function proxiedFetch(url, opts, sx, timeoutMs) {
 // minutes is never cut. `req` is created BEFORE the timer so a synchronous
 // throw (e.g. an invalid client header) can't leave a scheduled timer that later
 // fires against an uninitialized binding.
-function nodeRequest(u, opts, timeoutMs, { transport, agent }) {
+async function nodeRequest(u, opts, timeoutMs, { transport, agent }) {
+  // Admit before constructing ClientRequest. Destroying a request in Node's
+  // internal Agent queue need not emit error until it receives a socket.
+  // Our queue can expire/cancel and drop its retained body immediately.
+  let gate = admissionByOrigin.get(u.origin);
+  if (!gate) {
+    gate = new AdmissionGate(MAX_SOCKETS, process.env.TEAMCLAUDE_UPSTREAM_MAX_QUEUE);
+    admissionByOrigin.set(u.origin, gate);
+  }
+  const admitted = await gate.enter({ signal: opts.signal,
+    timeoutMs: opts.queueTimeoutMs ?? process.env.TEAMCLAUDE_UPSTREAM_QUEUE_TIMEOUT_MS });
+  if (!admitted) {
+    if (!gate.active && !gate.queue.length) admissionByOrigin.delete(u.origin);
+    if (opts.signal?.aborted) throw opts.signal.reason ?? new Error('aborted');
+    const err = new Error('TeamClaude upstream queue is full or its wait deadline expired');
+    err.code = 'TEAMCLAUDE_UPSTREAM_OVERLOADED';
+    throw err;
+  }
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    gate.leave();
+    if (!gate.active && !gate.queue.length) admissionByOrigin.delete(u.origin);
+  };
+  try {
+    return await sendNodeRequest(u, opts, timeoutMs, { transport, agent }, release);
+  } catch (err) { release(); throw err; }
+}
+
+function sendNodeRequest(u, opts, timeoutMs, { transport, agent }, release) {
   return new Promise((resolve, reject) => {
     const req = transport.request(
       u,
       { method: opts.method || 'GET', headers: opts.headers || {}, agent },
-      (res) => { clearTimeout(timer); cleanupAbort(); resolve(makeResponse(res)); },
+      (res) => {
+        clearTimeout(timer);
+        const finish = () => { cleanupAbort(); release(); };
+        res.once('end', finish);
+        res.once('close', finish);
+        resolve(makeResponse(res));
+      },
     );
     const timer = setTimeout(() => req.destroy(headersTimeoutError(timeoutMs)), timeoutMs);
     timer.unref?.();
@@ -192,12 +233,11 @@ function nodeRequest(u, opts, timeoutMs, { transport, agent }) {
     const signal = opts.signal;
     const onAbort = () => req.destroy(signal?.reason ?? new Error('aborted'));
     const cleanupAbort = () => signal?.removeEventListener?.('abort', onAbort);
+    req.once('error', (err) => { clearTimeout(timer); cleanupAbort(); release(); reject(err); });
     if (signal) {
       if (signal.aborted) { clearTimeout(timer); req.destroy(); reject(signal.reason ?? new Error('aborted')); return; }
       signal.addEventListener?.('abort', onAbort, { once: true });
     }
-
-    req.once('error', (err) => { clearTimeout(timer); cleanupAbort(); reject(err); });
 
     const body = opts.body;
     const method = (opts.method || 'GET').toUpperCase();

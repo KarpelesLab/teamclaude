@@ -11,7 +11,7 @@ import { sanitizeToolPairs } from './tool-pair-sanitize.js';
 import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
 import { TopLevelFieldFinder, modelGlobMatches } from './model.js';
 import { BodyWriter, truncationNote } from './request-log.js';
-import { upstreamFetch } from './upstream-fetch.js';
+import { upstreamFetch, upstreamPoolStatus } from './upstream-fetch.js';
 import { applyAuthHeaders, upstreamFor, rewritesBody, providerForPath, providerOf, isSubscriptionAccount, DEFAULT_PROVIDER } from './provider.js';
 import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
@@ -58,7 +58,7 @@ async function readErrorBody(body, limit = ERROR_BODY_INSPECTION_LIMIT) {
   let length = 0;
   try {
     while (true) {
-      const { done, value } = await reader.read();
+      const { done, value } = await readWithIdleTimeout(reader, resolveBodyIdleTimeout());
       if (done) return Buffer.concat(chunks, length);
       length += value.byteLength;
       if (length > limit) {
@@ -242,7 +242,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         const status = accountManager.getStatus({ sessionDetail: config.proxy?.sessionDetail === true });
         const extra = hooks.getStatusExtra?.() || {};
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ...extra, ...status, ingress: ingressGate?.status() ?? { enabled: false } }, null, 2));
+        res.end(JSON.stringify({ ...extra, ...status, ingress: ingressGate?.status() ?? { enabled: false }, upstreamPool: upstreamPoolStatus() }, null, 2));
         return;
       }
 
@@ -781,6 +781,11 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         client,
         dimensions: Object.fromEntries(usageDimensions.map(d => [d.name, d.key])),
       });
+      const requestAbort = new AbortController();
+      const onRequestClose = () => requestAbort.abort();
+      ctx.signal = requestAbort.signal;
+      res.once('close', onRequestClose);
+      if (clientGone(res)) onRequestClose();
       try {
         await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir, sx);
       } catch (err) {
@@ -795,6 +800,8 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
           res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Internal proxy error' } }));
         }
       } finally {
+        res.off('close', onRequestClose);
+        if (requestAbort.signal.aborted) ctx.status = 499;
         accountManager.endSession(sessionId);
         // Cleared BEFORE the hook, because the hook can throw: leaving the entry
         // marked open would send the outer catch to call that same throwing hook
@@ -845,7 +852,17 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
           if (req.httpVersionMajor !== 2) headers.Connection = 'close';
           res.writeHead(err.status, headers);
           res.end(JSON.stringify({ type: 'error', error: { type: err.status === 503 ? 'overloaded_error' : 'invalid_request_error', message: err.message } }), () => {
-            if (!req.complete) req.destroy();
+            if (!req.complete) {
+              if (req.httpVersionMajor === 2) { req.destroy(); return; }
+              // An immediate destroy with unread upload bytes can reset h1
+              // before the peer receives the 413/503. Discard (never buffer)
+              // briefly to allow the reply through, then bound the teardown.
+              const timer = setTimeout(() => req.destroy(), 1000);
+              timer.unref?.();
+              const cleanup = () => { clearTimeout(timer); req.off('end', cleanup); req.off('close', cleanup); };
+              req.once('end', cleanup); req.once('close', cleanup);
+              req.resume();
+            }
           });
         }
       } else answerUnhandled(res);
@@ -903,6 +920,15 @@ function reportFailure(...args) {
  * `drain` or a `close` that has already happened and will not happen again, so
  * the handler never returns and its activity entry never closes.
  */
+function waitForRetry(ms, signal) {
+  return new Promise(resolve => {
+    if (signal?.aborted) { resolve(); return; }
+    const finish = () => { clearTimeout(timer); signal?.removeEventListener('abort', finish); resolve(); };
+    const timer = setTimeout(finish, ms);
+    signal?.addEventListener('abort', finish, { once: true });
+  });
+}
+
 function clientGone(res) {
   return !!res.destroyed || !!res.stream?.destroyed;
 }
@@ -1560,7 +1586,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       const waitMs = Math.min(retryAfter * 1000, ctx.holdBudgetMs, 60_000);
       ctx.holdBudgetMs -= waitMs;
       console.log(`[TeamClaude] All accounts exhausted — holding connection, retry in ${Math.ceil(waitMs / 1000)}s (${Math.ceil(ctx.holdBudgetMs / 1000)}s budget left)`);
-      await new Promise(resolve => setTimeout(resolve, waitMs));
+      await waitForRetry(waitMs, ctx.signal);
       if (clientGone(res)) return;
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
     }
@@ -1569,7 +1595,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     if (exhaustedRetries < 1 && retryAfter <= INLINE_RETRY_AFTER_MAX_SECONDS) {
       ctx.exhaustedRetries = exhaustedRetries + 1;
       console.log(`[TeamClaude] All accounts exhausted — waiting ${retryAfter}s before retry`);
-      await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
+      await waitForRetry(retryAfter * 1000, ctx.signal);
       if (clientGone(res)) return;
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
     }
@@ -1705,6 +1731,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       upstreamRes = await upstreamFetch(upstreamUrl, {
         method,
         headers,
+        signal: ctx.signal,
         body: ['GET', 'HEAD'].includes(method) ? undefined : sendBody,
         redirect: 'manual',
       }, sx, route);
@@ -1843,7 +1870,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // rate-limited account can't loop forever tying up the connection.
       if (retryAfter <= RATE_LIMIT_ABSORB_MAX_SECONDS && retryCount < maxRetries) {
         console.log(`[TeamClaude] Rate-limit 429 on "${account.name}" — waiting ${retryAfter}s, retrying same account (no switch)`);
-        await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
+        await waitForRetry(retryAfter * 1000, ctx.signal);
         if (clientGone(res)) return;
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, nextUseSx);
       }
@@ -1981,13 +2008,22 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       }
       l?.end();
     } else {
-      const buf = Buffer.from(await upstreamRes.arrayBuffer());
+      const buf = await readBufferedResponse(upstreamRes.body);
       extractUsageFromBody(buf, account.index, accountManager, ctx.onUsage, ctx.sessionId, ctx.model);
       const l = getLog();
       if (l) { l.body('RESPONSE BODY', buf, contentType); l.end(); }
       res.end(buf);
     }
   } catch (err) {
+    if (clientGone(res)) { ctx.status = 499; return; }
+    // Local saturation is not an account error and must not rotate credentials
+    // or amplify load with another upstream attempt.
+    if (err.code === 'TEAMCLAUDE_UPSTREAM_OVERLOADED' && !res.headersSent) {
+      ctx.status = 503;
+      res.writeHead(503, { 'Content-Type': 'application/json', 'Retry-After': '1' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'overloaded_error', message: err.message } }));
+      return;
+    }
     console.error(`[TeamClaude] Upstream error (account "${account.name}"):`, describeConnectError(err));
 
     logRequestHead();
@@ -2094,6 +2130,27 @@ function resolveBodyIdleTimeout() {
   return env > 0 ? env : DEFAULT_BODY_IDLE_TIMEOUT_MS;
 }
 
+async function readBufferedResponse(body) {
+  const configured = Number(process.env.TEAMCLAUDE_RESPONSE_BODY_MAX_BYTES);
+  const limit = Number.isSafeInteger(configured) && configured > 0 ? configured : 32 * 1024 * 1024;
+  const reader = body.getReader();
+  const chunks = [];
+  let bytes = 0;
+  try {
+    for (;;) {
+      const { done, value } = await readWithIdleTimeout(reader, resolveBodyIdleTimeout());
+      if (done) return Buffer.concat(chunks, bytes);
+      bytes += value.byteLength;
+      if (bytes > limit) {
+        const err = new Error('Buffered upstream response exceeds TeamClaude byte limit');
+        err.code = 'TEAMCLAUDE_RESPONSE_TOO_LARGE';
+        throw err;
+      }
+      chunks.push(Buffer.from(value));
+    }
+  } finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
+}
+
 // Race a single reader.read() against an inactivity deadline. Resolves to the
 // read result, or rejects with a transient TEAMCLAUDE_BODY_TIMEOUT if no chunk
 // arrives within `ms`. The pending read is abandoned on timeout; the caller
@@ -2120,6 +2177,11 @@ export function readWithIdleTimeout(reader, ms) {
  */
 export async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter, onUsage = null, sessionId = null, model = null) {
   const reader = webStream.getReader();
+  // A disconnected client must cancel a pending read, even when the upstream
+  // is silent. Checking clientGone only after a chunk cannot release that slot.
+  const onClose = () => { reader.cancel().catch(() => {}); };
+  res.once?.('close', onClose);
+  if (clientGone(res)) onClose();
   const idleMs = resolveBodyIdleTimeout();
   const decoder = new TextDecoder();
   let sseBuffer = '';
@@ -2196,6 +2258,7 @@ export async function streamResponse(webStream, res, accountIndex, accountManage
     errored = true;
     throw err;
   } finally {
+    res.off?.('close', onClose);
     // Record the message once, on every exit path. A stream that died after
     // `message_start` still spent the input it reported, so the merge is written
     // even when no `message_delta` ever arrived. An empty merge is written

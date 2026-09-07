@@ -5,6 +5,32 @@ import { patchAccountUuid, AccountUuidPatcher } from '../src/account-uuid-rewrit
 const OLD = '4c39e915-eb47-450d-9bf4-4cbbcd049a08';
 const NEW = '11111111-2222-3333-4444-555555555555';
 
+test('whole-body rewrite never mistakes nested metadata for request metadata', () => {
+  const body = Buffer.from(JSON.stringify({ tools: [{ metadata: { user_id: JSON.stringify({ account_uuid: OLD }) } }] }));
+  assert.deepEqual(patchAccountUuid(body, NEW), body);
+});
+
+test('short account IDs cannot overwrite the enclosing JSON or adjacent fields', () => {
+  const body = Buffer.from(JSON.stringify({ metadata: { user_id: JSON.stringify({ account_uuid: 'short', device_id: 'a'.repeat(80) }) } }));
+  assert.deepEqual(patchAccountUuid(body, NEW), body);
+});
+
+test('escaped metadata keys and duplicated user strings change only top-level metadata', () => {
+  const userId = JSON.stringify({ account_uuid: OLD });
+  const body = Buffer.from(JSON.stringify({ copy: userId, metadata: { user_id: userId } }).replace('"metadata"', '"meta\\u0064ata"'));
+  const out = JSON.parse(patchAccountUuid(body, NEW));
+  assert.equal(out.copy, userId);
+  assert.equal(JSON.parse(out.metadata.user_id).account_uuid, NEW);
+});
+
+test('a canonical-looking string elsewhere cannot substitute for an escaped metadata value', () => {
+  const userId = JSON.stringify({ account_uuid: OLD });
+  const raw = `{${JSON.stringify(userId)}:1,"metadata":{"user_id":${JSON.stringify(userId).replace('account_uuid', 'account_\\u0075uid')}}}`;
+  const out = JSON.parse(patchAccountUuid(Buffer.from(raw), NEW));
+  assert.equal(out[userId], 1);
+  assert.equal(JSON.parse(out.metadata.user_id).account_uuid, NEW);
+});
+
 test('patches account_uuid inside metadata.user_id (escaped) same-length', () => {
   const body = Buffer.from(JSON.stringify({
     model: 'claude',
