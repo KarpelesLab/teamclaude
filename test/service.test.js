@@ -88,6 +88,9 @@ test('the LaunchAgent asks for restart-on-exit and headless mode', () => {
   assert.match(plist, /<string>server<\/string>\s*<string>--headless<\/string>/);
   assert.match(plist, /<key>KeepAlive<\/key>\s*<true\/>/);
   assert.match(plist, /<key>RunAtLoad<\/key>\s*<true\/>/);
+  // HTTP requests cannot lift launchd's Background QoS clamp through XPC.
+  // This process is on the interactive client's response path.
+  assert.match(plist, /<key>ProcessType<\/key>\s*<string>Interactive<\/string>/);
   assert.match(plist, /<key>PATH<\/key>\s*<string>\/opt\/homebrew\/bin:\/usr\/bin<\/string>/);
 });
 

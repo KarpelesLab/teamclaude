@@ -150,10 +150,12 @@ export function resolveClientAuth(proxyConfig, presented) {
 export function createProxyServer(accountManager, config, hooks = {}, sx = null, clientUsage = null, dimensionUsage = null) {
   const upstream = config.upstream || 'https://api.anthropic.com';
   const holdMs = (config.holdSeconds || 0) * 1000;
-  const ingressGate = new AdmissionGate(
+  // Experimental until cancellation, queue deadlines and slow-upload bounds
+  // are covered. Do not activate this draft gate on a routine service restart.
+  const ingressGate = Number(process.env.TEAMCLAUDE_INGRESS_CONCURRENCY) > 0 ? new AdmissionGate(
     process.env.TEAMCLAUDE_INGRESS_CONCURRENCY,
     process.env.TEAMCLAUDE_INGRESS_QUEUE,
-  );
+  ) : null;
 
   // The log directory is made up front and synchronously, so a path that
   // cannot be a directory (a file sitting there, no permission) is reported

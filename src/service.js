@@ -86,6 +86,9 @@ const xmlEscape = (s) => String(s)
   .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
 export function renderLaunchAgent({ node, entry, log, path, configPath = null }) {
+  // User-facing HTTP streaming depends on this service receiving CPU promptly.
+  // Background applies a QoS clamp that can starve it under host contention;
+  // Adaptive only promotes via XPC activity, which our HTTP clients do not use.
   const args = [node, entry, 'server', '--headless'];
   const env = [`    <key>PATH</key>\n    <string>${xmlEscape(path)}</string>`];
   if (configPath) env.push(`    <key>TEAMCLAUDE_CONFIG</key>\n    <string>${xmlEscape(configPath)}</string>`);
@@ -104,7 +107,7 @@ ${args.map(a => `    <string>${xmlEscape(a)}</string>`).join('\n')}
   <key>KeepAlive</key>
   <true/>
   <key>ProcessType</key>
-  <string>Background</string>
+  <string>Interactive</string>
   <key>StandardOutPath</key>
   <string>${xmlEscape(log)}</string>
   <key>StandardErrorPath</key>
