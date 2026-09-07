@@ -1851,9 +1851,28 @@ export class AccountManager {
   confirmStay(account, carried, sessionId = null, model = null) {
     if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) return;
     if (!account || !carried) return;
-    this._releaseHeld(this._currentObs, account, carried.current);
+    // The cursor's observation hangs off ONE slot every provider shares. A
+    // request whose provider does not own the cursor borrows it for the walk and
+    // hands the INDEX back, but not the observation — which that walk has left
+    // naming the borrower's own account. A success there is a stay under the
+    // borrowing provider's placement, not under the one this slot is holding a
+    // roll for, and without this test it reads as the same thing. The cursor
+    // still naming the account that served is what separates them: the walk is
+    // synchronous and restores the index long before the response confirmed here
+    // is read.
+    //
+    // It refuses on one more case, where a concurrent request moved the cursor
+    // between this one's selection and its response. That is the safe direction:
+    // a roll held one request too long costs one further preemption, while one
+    // released early strands the traffic on the week the account just gained.
+    if (this.currentIndex === account.index) {
+      this._releaseHeld(this._currentObs, account, carried.current);
+    }
     if (sessionId) {
       const bucket = this._weeklyBucketFor(model);
+      // Ungated, because a session's observation is its own: a walk borrowing
+      // the shared cursor cannot leave one naming an account this session never
+      // selected.
       this._releaseHeld(this.sessionTracker.refsFor(sessionId, bucket), account, carried.pin);
     }
   }

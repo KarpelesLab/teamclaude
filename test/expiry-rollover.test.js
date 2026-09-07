@@ -7,9 +7,17 @@ const H = 3600_000;
 const WEEK = 7 * 24 * H;
 const OPUS = 'claude-opus-5';
 const FABLE = 'claude-fable-5';
+const GPT = 'gpt-5.6-sol';
 
 function oauth(name) {
   return { name, type: 'oauth', accessToken: 't-' + name, refreshToken: 'r', expiresAt: Date.now() + 3600_000 };
+}
+
+// A Codex subscription. The provider partition is what makes currentIndex a slot
+// one fleet owns and the other BORROWS, which is the subject of the borrowed-
+// cursor arm below and of nothing else in this file.
+function codexAccount(name) {
+  return { ...oauth(name), provider: 'codex', accountId: 'acct-' + name };
 }
 
 // The knob spelled out at every call site: `undefined` here means the config key
@@ -1074,6 +1082,54 @@ test('a stay a second request confirms releases the roll it was pushed off', () 
     'a roll the fleet already moved off was charged a second time');
   assert.equal(serve(am, null, OPUS).name, 'a',
     'the return to an escaped roll preempted off it again');
+});
+
+test('a success on a borrowed cursor does not release the roll its owner holds', () => {
+  // currentIndex is ONE slot every provider shares, and a request whose provider
+  // does not own it borrows the slot for the walk and hands the INDEX back. The
+  // observation hanging off that slot is not handed back: the walk leaves it
+  // naming the borrower's own account, where a second borrowed request rests and
+  // is served. That success is a stay under the borrowing provider's placement,
+  // while the roll it would release is held for the owner's.
+  const am = new AccountManager(
+    [codexAccount('c'), codexAccount('c2'), oauth('a')], 0.98, { expiryRouting: ON },
+  );
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30]]) bucket(am, i, 'unified7d', 0.4, hours);
+  // What index.js does before the listener accepts anything, so the codex fleet
+  // owns the cursor and the anthropic request is the one that borrows.
+  am.selectActiveAccount();
+
+  const codexReq = (exclude = null) => am.getActiveAccount(exclude, GPT, null, null, 'codex');
+  const claudeReq = () => am.getActiveAccount(null, OPUS, null, null, 'anthropic');
+
+  assert.equal(codexReq().name, 'c', 'the fixture must start on c');
+  rollWindow(am, 0);
+  assert.equal(codexReq().name, 'c2', 'the roll did not preempt off c');
+  // The first request to REST on c2, which is what puts c's roll into the hold.
+  assert.equal(codexReq().name, 'c2', 'the preemption did not settle on c2');
+  assert.equal(am._currentObs.unescaped?.idx, 0, 'resting on c2 did not hold c\'s roll');
+
+  // Two borrowed requests, each served. `serve()` drives no upstream response,
+  // so the handshake the server makes on an accepted status is spelled out: the
+  // generation read before the walk, the confirmation after it. The first MOVES
+  // the observation onto a and so cannot confirm; the second finds it already
+  // there and can.
+  for (const attempt of ['first', 'second']) {
+    const carried = am.observedGeneration(null, OPUS);
+    const account = claudeReq();
+    assert.equal(account.name, 'a', `the ${attempt} borrowed request left the anthropic account`);
+    am.confirmStay(account, carried, null, OPUS);
+  }
+  assert.equal(am._currentObs.unescaped?.idx, 0,
+    'a success on the borrowed cursor released the roll its owner was holding');
+
+  // c2 out of the way, so the codex traffic falls back onto c. c still owes its
+  // roll, so the request after the fail-back leaves it again.
+  assert.equal(codexReq(new Set([1])).name, 'c', 'the fail-back did not reach c');
+  assert.equal(am._currentRolledOver(am.accounts[0], GPT), true,
+    'the fail-back onto c first-sighted the week c gained');
+  assert.equal(codexReq().name, 'c2',
+    'the codex request after the fail-back settled on the account its roll pushed it off');
 });
 
 test('removing an account renumbers a session pin\'s held roll too', () => {
