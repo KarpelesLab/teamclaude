@@ -324,6 +324,19 @@ export function parseAdvisorModel(body) {
   try {
     const buf = Buffer.isBuffer(body) ? body : Buffer.from(String(body), 'utf8');
     if (!buf.includes('advisor')) return null;
-    return new AdvisorModelFinder().push(buf);
+    // This function always receives the complete request body. JSON.parse runs
+    // in native code and is dramatically faster than feeding hundreds of KB
+    // through AdvisorModelFinder one JavaScript byte at a time. Keep the finder
+    // for callers that genuinely need incremental/chunked parsing; for a whole
+    // body, inspect only direct fields of direct tools[] entries, preserving the
+    // same decoy/nesting boundary as the state machine.
+    const payload = JSON.parse(buf.toString('utf8'));
+    if (!payload || !Array.isArray(payload.tools)) return null;
+    for (const tool of payload.tools) {
+      if (!tool || typeof tool !== 'object' || Array.isArray(tool)) continue;
+      if (typeof tool.type === 'string' && /^advisor/i.test(tool.type)
+          && typeof tool.model === 'string' && tool.model) return tool.model;
+    }
+    return null;
   } catch { return null; }
 }

@@ -14,6 +14,19 @@
 // Byte sequence of `account_uuid":"` as it appears INSIDE the (escaped) user_id
 // string: account_uuid \ " : \ "
 const PREFIX = Buffer.from('account_uuid\\":\\"', 'latin1');
+const CANONICAL_METADATA_USER_ID = Buffer.from('"metadata":{"user_id":"', 'latin1');
+let lastSlowFallbackWarning = 0;
+
+function hasOuterStringEndBefore(buf, start, limit) {
+  let at = start;
+  while ((at = buf.indexOf(0x22, at)) >= 0 && at < limit) {
+    let slashes = 0;
+    for (let i = at - 1; i >= start && buf[i] === 0x5c; i--) slashes++;
+    if (slashes % 2 === 0) return true;
+    at++;
+  }
+  return false;
+}
 
 export class AccountUuidPatcher {
   constructor(newUuid) {
@@ -109,7 +122,69 @@ export class AccountUuidPatcher {
 
 /** One-shot convenience (whole-buffer); returns the same instance if unchanged. */
 export function patchAccountUuid(buf, newUuid) {
+  if (typeof newUuid !== 'string' || newUuid.length !== 36) return buf;
+  // Most proxied request bodies do not carry this optional metadata at all.
+  // A native scan can prove the rewrite is a no-op without walking every JSON
+  // key in JavaScript.
+  if (!buf.includes(PREFIX)) return buf;
+  let fallbackReason = 'noncanonical-metadata';
+  // Claude Code emits compact JSON with this structural key sequence. Quotes
+  // inside prompt strings are escaped, so the unescaped sequence cannot be a
+  // user-content false positive. Native Buffer searches skip the potentially
+  // multi-megabyte messages array without executing JavaScript once per byte.
+  const metadataAt = buf.indexOf(CANONICAL_METADATA_USER_ID);
+  if (metadataAt >= 0 && buf.indexOf(CANONICAL_METADATA_USER_ID, metadataAt + 1) < 0) {
+    const valueStart = metadataAt + CANONICAL_METADATA_USER_ID.length;
+    const prefixAt = buf.indexOf(PREFIX, valueStart);
+    if (prefixAt >= valueStart && !hasOuterStringEndBefore(buf, valueStart, prefixAt)) {
+      const uuidAt = prefixAt + PREFIX.length;
+      const oldUuid = buf.toString('latin1', uuidAt, uuidAt + 36);
+      if (oldUuid.length === 36) {
+        if (oldUuid === newUuid) return buf;
+        const out = Buffer.from(buf);
+        out.write(newUuid, uuidAt, 36, 'latin1');
+        return out;
+      }
+    }
+  }
+  // Whole request bodies are already buffered by the retry layer. Let V8's
+  // native JSON parser validate the exact metadata value, then locate that
+  // serialized string with native Buffer searches. This avoids calling the JS
+  // byte-state-machine once per byte/key across multi-megabyte conversations.
+  // If the value is encoded unusually or appears more than once, retain the
+  // structural streaming patcher as the conservative compatibility fallback.
+  try {
+    const outer = JSON.parse(Buffer.from(buf).toString('utf8'));
+    const userId = outer?.metadata?.user_id;
+    if (typeof userId === 'string') {
+      fallbackReason = 'ambiguous-serialization';
+      const serialized = Buffer.from(JSON.stringify(userId), 'utf8');
+      const valueAt = buf.indexOf(serialized);
+      const uniqueValue = valueAt >= 0 && buf.indexOf(serialized, valueAt + 1) < 0;
+      const prefixAt = serialized.indexOf(PREFIX);
+      const uniquePrefix = prefixAt >= 0 && serialized.indexOf(PREFIX, prefixAt + 1) < 0;
+      const uuidAt = prefixAt + PREFIX.length;
+      const oldUuid = serialized.toString('latin1', uuidAt, uuidAt + 36);
+      if (valueAt < 0) fallbackReason = 'serialized-value-not-found';
+      else if (!uniqueValue) fallbackReason = 'serialized-value-duplicate';
+      else if (prefixAt < 0) fallbackReason = 'uuid-prefix-not-found';
+      else if (!uniquePrefix) fallbackReason = 'uuid-prefix-duplicate';
+      else if (oldUuid.length !== 36) fallbackReason = 'account-id-not-36-bytes';
+      if (uniqueValue && uniquePrefix && oldUuid.length === 36) {
+        if (oldUuid === newUuid) return buf;
+        const out = Buffer.from(buf);
+        out.write(newUuid, valueAt + uuidAt, 36, 'latin1');
+        return out;
+      }
+    }
+  } catch { /* malformed/unusual JSON: preserve the exact structural fallback */ }
+  const fallbackStarted = Date.now();
   const p = new AccountUuidPatcher(newUuid);
   const out = p.push(buf);
+  const fallbackMs = Date.now() - fallbackStarted;
+  if (fallbackMs >= 100 && Date.now() - lastSlowFallbackWarning >= 60_000) {
+    lastSlowFallbackWarning = Date.now();
+    console.error(`[TeamClaude] Slow account UUID rewrite fallback: ${fallbackMs}ms, ${buf.length} bytes, reason=${fallbackReason}`);
+  }
   return p.changed ? out : buf;
 }

@@ -62,3 +62,62 @@ test('no-op when already the target / no user_id / bad uuid length', () => {
   const body = Buffer.from(inner(OLD));
   assert.equal(patchAccountUuid(body, 'not-a-uuid'), body);    // wrong length → no-op
 });
+
+test('canonical whole bodies avoid the per-byte fallback', () => {
+  const body = Buffer.from(JSON.stringify({
+    messages: Array.from({ length: 1_000 }, (_, i) => ({ role: 'user', content: String(i) })),
+    metadata: { user_id: JSON.stringify({ account_uuid: OLD }) },
+  }));
+  const original = AccountUuidPatcher.prototype.push;
+  AccountUuidPatcher.prototype.push = () => { throw new Error('slow byte fallback used'); };
+  try {
+    const out = patchAccountUuid(body, NEW);
+    assert.equal(JSON.parse(JSON.parse(out).metadata.user_id).account_uuid, NEW);
+  } finally {
+    AccountUuidPatcher.prototype.push = original;
+  }
+});
+
+test('non-JSON metadata.user_id also avoids the per-byte fallback', () => {
+  const body = Buffer.from(JSON.stringify({
+    messages: [{ role: 'user', content: 'ordinary prompt' }],
+    metadata: { source: 'cli', user_id: `device=abc;account_uuid":"${OLD};session=xyz` },
+  }));
+  const original = AccountUuidPatcher.prototype.push;
+  AccountUuidPatcher.prototype.push = () => { throw new Error('slow byte fallback used'); };
+  try {
+    const out = patchAccountUuid(body, NEW);
+    assert.equal(JSON.parse(out).metadata.user_id,
+      `device=abc;account_uuid":"${NEW};session=xyz`);
+  } finally {
+    AccountUuidPatcher.prototype.push = original;
+  }
+});
+
+test('opaque 36-byte account identifiers use the validated fast path', () => {
+  const opaque = 'user_account_identifier_123456789012';
+  assert.equal(opaque.length, 36);
+  const body = Buffer.from(JSON.stringify({
+    metadata: { source: 'cli', user_id: `account_uuid":"${opaque}` },
+  }));
+  const original = AccountUuidPatcher.prototype.push;
+  AccountUuidPatcher.prototype.push = () => { throw new Error('slow byte fallback used'); };
+  try {
+    assert.match(JSON.parse(patchAccountUuid(body, NEW)).metadata.user_id, new RegExp(NEW));
+  } finally {
+    AccountUuidPatcher.prototype.push = original;
+  }
+});
+
+test('bodies without an account marker never enter the per-byte fallback', () => {
+  const body = Buffer.from(JSON.stringify({
+    messages: Array.from({ length: 1_000 }, (_, i) => ({ content: String(i) })),
+  }));
+  const original = AccountUuidPatcher.prototype.push;
+  AccountUuidPatcher.prototype.push = () => { throw new Error('slow byte fallback used'); };
+  try {
+    assert.equal(patchAccountUuid(body, NEW), body);
+  } finally {
+    AccountUuidPatcher.prototype.push = original;
+  }
+});

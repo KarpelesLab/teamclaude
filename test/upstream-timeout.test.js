@@ -3,9 +3,10 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { once } from 'node:events';
 import { ReadableStream } from 'node:stream/web';
+import { Readable, Writable } from 'node:stream';
 import { TextEncoder, TextDecoder } from 'node:util';
-import { upstreamFetch } from '../src/upstream-fetch.js';
-import { readWithIdleTimeout, streamResponse } from '../src/server.js';
+import { upstreamFetch, writeRequestBody } from '../src/upstream-fetch.js';
+import { readWithIdleTimeout, relayFair, streamResponse } from '../src/server.js';
 
 // Bring up an HTTP server on an ephemeral port and hand back {server, port}.
 async function listen(handler) {
@@ -178,4 +179,51 @@ test('a continuously buffered SSE stream yields to other server work', async () 
   assert.ok(written < totalChunks,
     `the relay consumed all ${totalChunks} ready chunks without yielding an event-loop turn`);
   await relay;
+});
+
+test('a buffered Remote Control relay yields to control-plane work', async () => {
+  const totalChunks = 10_000;
+  let written = 0;
+  const source = new Readable({
+    highWaterMark: 1024 * 1024,
+    read() {
+      for (let i = 0; i < totalChunks; i++) this.push(Buffer.from('x'));
+      this.push(null);
+    },
+  });
+  const destination = new Writable({
+    highWaterMark: 1024 * 1024,
+    write(_chunk, _encoding, callback) { written += 1; callback(); },
+  });
+
+  relayFair(source, destination);
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.ok(written > 0, 'the relay never started');
+  assert.ok(written < totalChunks,
+    `the relay consumed all ${totalChunks} ready chunks without yielding an event-loop turn`);
+  await once(destination, 'finish');
+});
+
+test('a large upstream upload yields to control-plane work', async () => {
+  const body = Buffer.alloc(4 * 1024 * 1024, 'x');
+  let written = 0;
+  let ended = false;
+  const req = {
+    write(chunk) { written += chunk.length; return true; },
+    end(chunk) {
+      if (chunk) written += chunk.length;
+      ended = true;
+    },
+    once() {},
+  };
+
+  writeRequestBody(req, body);
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.ok(written > 0, 'the upload never started');
+  assert.ok(written < body.length,
+    `the upload wrote all ${body.length} bytes without yielding an event-loop turn`);
+  while (!ended) await new Promise(resolve => setImmediate(resolve));
+  assert.equal(written, body.length);
 });

@@ -194,9 +194,34 @@ function nodeRequest(u, opts, timeoutMs, { transport, agent }) {
     const body = opts.body;
     const method = (opts.method || 'GET').toUpperCase();
     if (body == null || method === 'GET' || method === 'HEAD') req.end();
-    else if (typeof body === 'string' || Buffer.isBuffer(body) || body instanceof Uint8Array) req.end(Buffer.from(body));
-    else req.end(String(body));
+    else writeRequestBody(req, body);
   });
+}
+
+// Named seam for the potentially expensive upload path. Large Claude requests
+// commonly carry megabytes of context, so its scheduling behaviour is tested
+// independently of a real TLS socket.
+export function writeRequestBody(req, body) {
+  const bytes = typeof body === 'string' || Buffer.isBuffer(body) || body instanceof Uint8Array
+    ? Buffer.from(body)
+    : Buffer.from(String(body));
+  const chunkBytes = 64 * 1024;
+  let offset = 0;
+
+  const pump = () => {
+    if (req.destroyed) return;
+    if (offset >= bytes.length) { req.end(); return; }
+    const end = Math.min(offset + chunkBytes, bytes.length);
+    const ready = req.write(bytes.subarray(offset, end));
+    offset = end;
+    // A TLS write encrypts synchronously on Node's main thread. Yield even when
+    // the socket has room, otherwise several multi-megabyte Claude context
+    // uploads can monopolise that thread and keep status connections waiting in
+    // the kernel. Backpressure remains authoritative when the socket is full.
+    if (ready) setImmediate(pump);
+    else req.once('drain', pump);
+  };
+  pump();
 }
 
 // Adapt a Node IncomingMessage to a web ReadableStream. Done by hand rather than

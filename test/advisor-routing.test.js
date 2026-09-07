@@ -23,6 +23,18 @@ test('parseAdvisorModel extracts the advisor model from tools[]', () => {
   assert.equal(parseAdvisorModel(Buffer.from(advisorBody())), 'claude-fable-5');
 });
 
+test('parseAdvisorModel uses the native whole-body path instead of the byte scanner', () => {
+  const original = AdvisorModelFinder.prototype.push;
+  AdvisorModelFinder.prototype.push = () => {
+    throw new Error('whole-body advisor parsing must not use the byte scanner');
+  };
+  try {
+    assert.equal(parseAdvisorModel(advisorBody()), 'claude-fable-5');
+  } finally {
+    AdvisorModelFinder.prototype.push = original;
+  }
+});
+
 test('parseAdvisorModel ignores requests without an advisor tool', () => {
   assert.equal(parseAdvisorModel(JSON.stringify({ model: 'claude-opus-4-8', tools: [{ name: 'Bash' }] })), null);
   assert.equal(parseAdvisorModel('{"model":"claude-opus-4-8"}'), null);

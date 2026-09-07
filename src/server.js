@@ -4,6 +4,7 @@ import { timingSafeEqual } from 'node:crypto';
 import { createWriteStream, mkdirSync, writeSync } from 'node:fs';
 import { readdir, stat, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
+import { Transform } from 'node:stream';
 import { ensureCerts, createConnectHandler, mitmHosts } from './mitm.js';
 import { patchAccountUuid } from './account-uuid-rewrite.js';
 import { sanitizeToolPairs } from './tool-pair-sanitize.js';
@@ -930,7 +931,7 @@ function relayStream(req, res, upstream, sx) {
       responseHeaders[key] = value;
     }
     res.writeHead(upstreamRes.statusCode, responseHeaders);
-    upstreamRes.pipe(res);
+    relayFair(upstreamRes, res);
     // pipe() only propagates 'end'. If the upstream leg dies mid-response
     // (network blip, upstream restart), upstreamRes emits 'aborted'/'error'
     // and the pipe just stops — the client's long-poll stays open forever and
@@ -960,6 +961,26 @@ function relayStream(req, res, upstream, sx) {
 
   if (['GET', 'HEAD'].includes(req.method)) upstreamReq.end();
   else req.pipe(upstreamReq);
+}
+
+// Kept as a named seam so raw long-poll relay fairness can be regression-tested
+// independently of a real upstream socket.
+export function relayFair(source, destination) {
+  let chunks = 0;
+  const fairness = new Transform({
+    transform(chunk, encoding, callback) {
+      this.push(chunk);
+      chunks += 1;
+      if (chunks >= STREAM_FAIRNESS_CHUNKS) {
+        chunks = 0;
+        setImmediate(callback);
+      } else {
+        callback();
+      }
+    },
+  });
+  source.pipe(fairness).pipe(destination);
+  return fairness;
 }
 
 /**
@@ -2021,9 +2042,13 @@ const DEFAULT_BODY_IDLE_TIMEOUT_MS = 120_000;
 // buffered. With a busy upstream, repeatedly awaiting those ready reads never
 // returns to the event-loop poll phase, so the listener can accept a status
 // connection in the kernel while JavaScript never runs its request handler.
-// Yield periodically even when neither socket applies backpressure. Thirty-two
-// chunks keeps the relay hot while bounding how long control-plane requests wait.
-const STREAM_FAIRNESS_CHUNKS = 32;
+// Yield after every chunk even when neither socket applies backpressure. Under
+// a reconnect storm many TLS sockets can stay readable at once; batching even
+// 32 chunks per response lets that poll/microtask traffic starve a newly
+// accepted status request for seconds. A streamed model response naturally has
+// sizeable gaps between chunks, so one check-phase hop per chunk has negligible
+// user-visible cost and keeps the control plane responsive under saturation.
+const STREAM_FAIRNESS_CHUNKS = 1;
 
 function resolveBodyIdleTimeout() {
   const env = Number(process.env.TEAMCLAUDE_UPSTREAM_BODY_TIMEOUT_MS);
