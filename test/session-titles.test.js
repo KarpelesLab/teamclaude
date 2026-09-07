@@ -200,7 +200,9 @@ test('an upper-case UUID is still a session id', async () => {
 test('control characters in a title become spaces', async () => {
   const dir = await projects({ sidecar: JSON.stringify({ customTitle: 'adv\x1b[31m-review\r\nrewrite\x00\x7f\x9b!' }) });
   const titles = new SessionTitles({ enabled: true, projectsDir: dir });
-  assert.equal(await titles.resolve(SID), 'adv [31m-review rewrite !');
+  // The whole CSI sequence goes, not just its ESC byte: stripping the escape
+  // alone used to leave the literal '[31m' behind in the title.
+  assert.equal(await titles.resolve(SID), 'adv -review rewrite !');
 });
 
 test('a title made only of control characters is no title', async () => {

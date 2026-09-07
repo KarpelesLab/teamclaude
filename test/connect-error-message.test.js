@@ -7,6 +7,18 @@ import { fileURLToPath } from 'node:url';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer, describeConnectError } from '../src/server.js';
 import { createConnectHandler } from '../src/mitm.js';
+import { setUpstreamProxy, resolveUpstreamProxy, resetUpstreamProxy } from '../src/upstream-proxy.js';
+
+// A test that expects a CONNECTION-LEVEL failure must not be able to reach a
+// proxy. With HTTPS_PROXY or ALL_PROXY set in the developer's shell — common,
+// and the default on plenty of corporate machines — the request is tunneled
+// instead of refused, the proxy answers, and the test asserts against a
+// completely different error shape while still passing (#207).
+//
+// `upstreamProxy: false` is the explicit opt-out, and the empty env argument
+// stops resolveUpstreamProxy falling back to process.env.
+test.beforeEach(() => setUpstreamProxy(resolveUpstreamProxy({ upstreamProxy: false }, {})));
+test.afterEach(() => resetUpstreamProxy());
 
 // A failed connect has its reason in one of two places, and the interesting one
 // is not where you would look.
@@ -216,7 +228,15 @@ function describeThroughGlobalFetch() {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, ['--input-type=module', '--eval', source], {
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, TEAMCLAUDE_UPSTREAM_GLOBAL_FETCH: '1' },
+      // The child inherits this shell, so the proxy variables are dropped for
+      // the same reason as the in-process guard above — otherwise it dials the
+      // developer's proxy instead of the closed port this test is about.
+      env: {
+        ...process.env,
+        TEAMCLAUDE_UPSTREAM_GLOBAL_FETCH: '1',
+        HTTPS_PROXY: '', https_proxy: '', ALL_PROXY: '', all_proxy: '',
+        HTTP_PROXY: '', http_proxy: '', NO_PROXY: '*', no_proxy: '*',
+      },
     });
     const out = [];
     child.stdout.on('data', d => out.push(String(d)));

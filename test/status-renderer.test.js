@@ -43,6 +43,44 @@ test('renderStatus shows an OAuth entitlement cooldown separately from account s
   assert.match(output, /active \/ entitlement cooldown 4m/);
 });
 
+test('renderStatus describes a timezone-aware reset warm-up schedule', () => {
+  const status = sampleStatus();
+  status.warm = {
+    enabled: true,
+    mode: 'reset',
+    timezone: 'Europe/Moscow',
+    resetTime: '15:30',
+    warmupTime: '10:30',
+    nextWarmupAt: '2026-07-04T07:30:00Z',
+    accounts: [],
+  };
+
+  const output = renderStatus(status, { color: false, now });
+
+  assert.match(output, /Keep-warm\s+daily 10:30 Europe\/Moscow → reset 15:30, next/);
+  assert.doesNotMatch(output, /on every 0s/);
+});
+
+test('renderStatus describes a rolling five-hour warm-up schedule', () => {
+  const status = sampleStatus();
+  status.warm = {
+    enabled: true,
+    mode: 'rolling',
+    timezone: 'Europe/Moscow',
+    resetTime: '15:30',
+    anchorResetAt: '2026-07-03T12:30:00Z',
+    cadenceSeconds: 18_000,
+    nextWarmupAt: '2026-07-03T12:30:00Z',
+    nextTargetResetAt: '2026-07-03T17:30:00Z',
+    accounts: [],
+  };
+
+  const output = renderStatus(status, { color: false, now });
+
+  assert.match(output, /Keep-warm\s+rolling every 5h, reset anchor 15:30 Europe\/Moscow, next/);
+  assert.doesNotMatch(output, /on every 0s/);
+});
+
 test('renderStatus shows the sessions line and per-account session count when present', () => {
   const status = sampleStatus();
   status.sessions = { known: 3, active: 2, perAccount: { 0: 2 }, distribute: true };
@@ -147,6 +185,42 @@ test('renderStatus sanitizes probe errors', () => {
   const output = renderStatus(status, { color: false, now });
   assert.match(output, /bad red/);
   assert.doesNotMatch(output, /\x1b\[31m/);
+});
+
+test('renderStatus prints configured usage dimensions and sanitizes their labels', () => {
+  const status = sampleStatus();
+  status.usageDimensions = {
+    project: {
+      'KarpelesLab/teamclaude': { requests: 2, inputTokens: 1000, outputTokens: 250, lastUsed: '2026-07-03T11:59:00Z' },
+    },
+    'bad\x1b[31mname': {
+      'value\nred': { requests: 1, inputTokens: 1, outputTokens: 1 },
+    },
+  };
+
+  const output = renderStatus(status, { color: false, now });
+  assert.match(output, /Project usage/);
+  assert.match(output, /KarpelesLab\/teamclaude\s+2 req, 1.0k in \/ 250 out, last 1m ago/);
+  assert.match(output, /Bad name usage/);
+  assert.match(output, /value red/);
+  assert.doesNotMatch(output, /\x1b\[31m/);
+});
+
+test('renderStatus never grows a per-session section', () => {
+  // Sessions are unbounded caller-supplied ids: a terminal renderer that
+  // printed one line each would bury the whole status readout. The per-session
+  // view is the dashboard's (behind proxy.sessionDetail), not the CLI's.
+  const status = sampleStatus();
+  status.sessions = {
+    known: 3, active: 2, perAccount: {},
+    items: Array.from({ length: 300 }, (_, i) => ({
+      id: `session-${i}`, client: 'alice', dimensions: { project: 'p' },
+      requests: 1, lastSeen: 0, firstSeen: 0, active: true, inFlight: 0, pins: {}, tokens: {},
+    })),
+  };
+  const output = renderStatus(status, { color: false, now });
+  assert.doesNotMatch(output, /Session usage|Sessions usage/);
+  assert.doesNotMatch(output, /session-0/);
 });
 
 // --- blocklist visibility (issue: a blocked model read as available) ---------

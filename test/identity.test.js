@@ -6,6 +6,7 @@ import {
   emailOf,
   matchAccounts,
   findUpsertTarget,
+  updateAccountEntry,
   distinctAccounts,
   canUpsertOAuthAccount,
   oauthIdentityFields,
@@ -188,4 +189,78 @@ test('unavailable profile fields do not erase stored OAuth identity', () => {
     orgUuid: 'new-org',
     orgName: 'New Example',
   });
+});
+
+// The merge applied at a findUpsertTarget hit. Both the CLI login/import path
+// and the TUI's import go through it, and the id it pins is what a running
+// server uses to find the account built from this entry: reissue it and that
+// account has no entry to be saved onto, so the next token it refreshes is
+// dropped instead of persisted, and the account fails on the following start
+// with a credential that was already rotated away.
+test('an upsert keeps the existing entry\'s id and name', () => {
+  const prev = { id: 'entry-0', name: 'chosen-name', type: 'oauth', accessToken: 'old', importFrom: '~/creds.json' };
+  const incoming = { name: 'profile@example.com', type: 'oauth', accessToken: 'fresh', accountUuid: 'u1' };
+
+  const merged = updateAccountEntry(prev, incoming);
+
+  assert.equal(merged.id, 'entry-0');
+  assert.equal(merged.name, 'chosen-name');
+  assert.equal(merged.accessToken, 'fresh', 'the credential is what an upsert is for');
+  assert.equal(merged.accountUuid, 'u1', 'and freshly learned identity lands too');
+  assert.equal(merged.importFrom, '~/creds.json', 'a disk-only field survives');
+});
+
+test('an upsert keeps the existing id even when the incoming record carries one', () => {
+  const merged = updateAccountEntry({ id: 'entry-0', name: 'a' }, { id: 'minted-elsewhere', name: 'a' });
+  assert.equal(merged.id, 'entry-0');
+});
+
+// A UUID match is evidence; a name match is a guess. sameIdentity makes both in
+// one pass, so a namesake entry carrying no UUID used to win purely by sitting
+// earlier in the list — and the incoming credential landed on it (#236).
+test('findUpsertTarget prefers the UUID match over an earlier namesake', () => {
+  const accounts = [
+    { name: 'a@x.com' },                                  // hand-added, no UUID
+    { name: 'a@x.com', accountUuid: 'u1', orgUuid: 'o1' }, // the real one
+  ];
+  assert.equal(findUpsertTarget(accounts, { name: 'a@x.com', accountUuid: 'u1', orgUuid: 'o1' }), 1);
+});
+
+test('findUpsertTarget still backfills a namesake when nothing contradicts it', () => {
+  // No UUID anywhere else to prefer, so the bare name match remains the answer —
+  // this is the legacy-entry backfill, which must keep working.
+  const accounts = [{ name: 'a@x.com' }];
+  assert.equal(findUpsertTarget(accounts, { name: 'a@x.com', accountUuid: 'u1', orgUuid: 'o1' }), 0);
+});
+
+test('findUpsertTarget does not let a UUID match cross organizations', () => {
+  const accounts = [
+    { name: 'a@x.com', accountUuid: 'u1', orgUuid: 'o-personal' },
+    { name: 'a@x.com', accountUuid: 'u1', orgUuid: 'o-acme' },
+  ];
+  assert.equal(findUpsertTarget(accounts, { name: 'a@x.com', accountUuid: 'u1', orgUuid: 'o-acme' }), 1);
+});
+
+test('findUpsertTarget still adds a genuinely new account', () => {
+  const accounts = [{ name: 'a@x.com', accountUuid: 'u1', orgUuid: 'o1' }];
+  assert.equal(findUpsertTarget(accounts, { name: 'b@x.com', accountUuid: 'u2', orgUuid: 'o2' }), -1);
+});
+
+// findConfigAccount used to take the first sameIdentity hit, and sameIdentity
+// compares organization only when both records carry one — so for one person
+// holding accounts in two orgs, both rows matched and a refreshed token was
+// written to whichever came first, recording one account's refresh-token family
+// against another account's row (#203). The entry id is exact.
+test('a token write resolves the right row for one person in two orgs', async () => {
+  const { AccountManager } = await import('../src/account-manager.js');
+  const rows = [
+    { id: 'i-personal', name: 'a@x.com', type: 'oauth', accountUuid: 'u1', orgUuid: 'o-personal', accessToken: 'p' },
+    { id: 'i-acme', name: 'a@x.com', type: 'oauth', accountUuid: 'u1', orgUuid: 'o-acme', accessToken: 'a' },
+  ];
+  const am = new AccountManager(rows, 0.98);
+  const acme = am.accounts.find(a => a.orgUuid === 'o-acme');
+  assert.equal(acme.id, 'i-acme', 'the account must carry its entry id');
+  // The row the write should land on is the one whose id matches, not the first
+  // identity match (which would be the personal row).
+  assert.equal(rows.findIndex(r => r.id === acme.id), 1);
 });

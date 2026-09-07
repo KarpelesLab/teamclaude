@@ -309,3 +309,66 @@ test('pinnedSessionIds drops forgotten sessions as it reads', () => {
   assert.deepEqual(st.pinnedSessionIds(clock.t), ['fresh']);
   assert.equal(st.sessions.has('old'), false);
 });
+
+// --- per-session detail (proxy.sessionDetail) -------------------------------
+
+test('stats() carries no per-session rows unless detail is asked for', () => {
+  const { clock, now } = fixedClock();
+  const st = new SessionTracker({ now });
+  st.beginRequest('s1', clock.t, { client: 'alice', dimensions: { project: 'skaile-dev' } });
+  // Any holder of any proxy key can read status, so the default must not name
+  // sessions, clients, or project values.
+  assert.equal('items' in st.stats(clock.t), false);
+  assert.equal(Array.isArray(st.stats(clock.t, { detail: true }).items), true);
+  // The aggregate counts are unaffected either way.
+  assert.equal(st.stats(clock.t).known, st.stats(clock.t, { detail: true }).known);
+});
+
+test('a detail row carries the labels and the per-bucket tokens the responses reported', () => {
+  const { clock, now } = fixedClock();
+  const st = new SessionTracker({ now });
+  st.beginRequest('s1', clock.t, { client: 'alice', dimensions: { project: 'skaile-dev' } });
+  st.touch('s1', 0, SHARED, clock.t);
+  st.touch('s1', 1, FABLE, clock.t);
+  st.recordTokens('s1', SHARED, {
+    cache_read_input_tokens: 900, cache_creation_input_tokens: 50,
+    input_tokens: 10, output_tokens: 5,
+  }, clock.t);
+
+  const [row] = st.stats(clock.t, { detail: true }).items;
+  assert.equal(row.id, 's1');
+  assert.equal(row.client, 'alice');
+  assert.deepEqual(row.dimensions, { project: 'skaile-dev' });
+  // A session holds one pin per weekly bucket and can be served by two accounts
+  // at once, which a single accountIndex could not express.
+  assert.deepEqual(row.pins, { [SHARED]: 0, [FABLE]: 1 });
+  // Cost comes from the response usage, cache included: input+output alone
+  // would report 15 for a turn that actually read 965 tokens of context.
+  assert.equal(row.tokens[SHARED].cacheRead, 900);
+  assert.equal(row.tokens[SHARED].context, 960);
+  assert.equal(row.inFlight, 1);
+  assert.equal(row.active, true);
+});
+
+test('detail rows are newest-first, and a forgotten session is absent', () => {
+  const { clock, now } = fixedClock();
+  const st = new SessionTracker({ now });
+  st.touch('old', 0, SHARED, clock.t);
+  clock.t += 1000;
+  st.touch('new', 0, SHARED, clock.t);
+  assert.deepEqual(st.stats(clock.t, { detail: true }).items.map(r => r.id), ['new', 'old']);
+  clock.t += SESSION_KNOWN_TTL_MS + 1;
+  st.touch('newest', 0, SHARED, clock.t);
+  assert.deepEqual(st.stats(clock.t, { detail: true }).items.map(r => r.id), ['newest']);
+});
+
+test('a request without labels does not erase the ones the session already has', () => {
+  const { clock, now } = fixedClock();
+  const st = new SessionTracker({ now });
+  st.beginRequest('s1', clock.t, { client: 'alice', dimensions: { project: 'p1' } });
+  st.beginRequest('s1', clock.t, null);
+  st.beginRequest('s1', clock.t, { dimensions: {} });
+  const [row] = st.stats(clock.t, { detail: true }).items;
+  assert.equal(row.client, 'alice');
+  assert.deepEqual(row.dimensions, { project: 'p1' });
+});

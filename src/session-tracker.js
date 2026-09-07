@@ -19,6 +19,8 @@
 //   - ACTIVE: a session counts as "active" (and toward per-account load) if it
 //     made a request this recently. Short, so load-balancing reacts to what is
 //     actually running now rather than to sessions merely lingering in the hour.
+import { remapHeld } from './rollover.js';
+
 export const SESSION_KNOWN_TTL_MS = 60 * 60 * 1000; // 1h idle → forgotten
 export const SESSION_ACTIVE_TTL_MS = 2 * 60 * 1000; // 2min idle → no longer "active"
 
@@ -70,8 +72,10 @@ function setAndReturn(map, key, value) {
 
 export class SessionTracker {
   constructor({ knownTtlMs, activeTtlMs, now } = {}) {
-    // id -> { pins: Map<bucketKey, { idx, at }>, firstSeen, lastSeen, count,
-    //         inFlight, tokens: Map<bucketKey, ...> }
+    // id -> { pins: Map<bucketKey, { idx, at }>,
+    //         refs: Map<bucketKey, { idx, windows: Map<window, reset>,
+    //                                unescaped: { idx, windows } | null }>,
+    //         firstSeen, lastSeen, count, inFlight, tokens: Map<bucketKey, ...> }
     this.sessions = new Map();
     this.knownTtlMs = knownTtlMs ?? SESSION_KNOWN_TTL_MS;
     this.activeTtlMs = activeTtlMs ?? SESSION_ACTIVE_TTL_MS;
@@ -107,11 +111,18 @@ export class SessionTracker {
   // flight counts as active (and non-expirable) for the whole request, however
   // long it streams — a 5-minute completion must not drop out of "active" or the
   // load balancer would under-count that account. Paired with endRequest.
-  beginRequest(sessionId, now = this._now()) {
+  //
+  // `metadata` (`{ client, dimensions }`) labels the session with who asked and
+  // under which usage dimensions, for the per-session readout. It is attached
+  // here rather than in touch() or recordSession() because this is the one call
+  // that runs once per CLIENT request, with the request headers still in scope;
+  // the other two run per forward attempt and per route decision.
+  beginRequest(sessionId, now = this._now(), metadata = null) {
     if (!sessionId) return null;
     const s = this._ensure(sessionId, now);
     s.inFlight += 1;
     s.lastSeen = now;
+    applyMetadata(s, metadata);
     return s;
   }
 
@@ -203,7 +214,7 @@ export class SessionTracker {
     let s = this.sessions.get(sessionId);
     if (!s) {
       s = {
-        pins: new Map(), firstSeen: now, lastSeen: now, count: 0, inFlight: 0,
+        pins: new Map(), refs: new Map(), firstSeen: now, lastSeen: now, count: 0, inFlight: 0,
         // bucket -> emptyTokens(). On the session's own record rather than in a
         // map beside it, so there is one lifetime and one eviction policy for
         // everything scoped to a session: a second map keyed by session id would
@@ -211,6 +222,9 @@ export class SessionTracker {
         // The same key space as `pins`, so a family's spend and the account it
         // is pinned to are looked up by one bucket key.
         tokens: new Map(),
+        // Labels from the request that opened the session (see beginRequest).
+        client: null,
+        dimensions: null,
       };
       this.sessions.set(sessionId, s);
     }
@@ -244,6 +258,45 @@ export class SessionTracker {
     return s.pins.get(bucket)?.idx ?? null;
   }
 
+    // The rollover observation this session holds for `bucket`: the account
+    // traffic was last found resting on and what its windows read then. Kept
+    // beside the pin rather than on it because it outlives a relocation — a pin
+    // just moved off an account is not evidence about that account, and the
+    // observation has to still be there when the traffic comes back. It dies
+    // with the session.
+  refsFor(sessionId, bucket, create = false, now = this._now()) {
+    const s = sessionId && this.sessions.get(sessionId);
+    if (!s) return null;
+    if (this._isExpired(s, now)) {
+      this.sessions.delete(sessionId);
+      return null;
+    }
+    let ref = s.refs.get(bucket);
+    if (!ref && create) s.refs.set(bucket, ref = { idx: null, windows: new Map(), unescaped: null });
+    return ref || null;
+  }
+
+  // Every pin a live session holds, as { sessionId, bucket, idx }. Expired
+  // sessions are dropped on the way past, as every other read here does.
+  livePins(now = this._now()) {
+    const out = [];
+    for (const [sessionId, s] of [...this.sessions]) {
+      if (this._isExpired(s, now)) {
+        this.sessions.delete(sessionId);
+        continue;
+      }
+      for (const [bucket, pin] of s.pins) out.push({ sessionId, bucket, idx: pin.idx });
+    }
+    return out;
+  }
+
+  // Drop every session's rollover observations, leaving the pins alone. None may
+  // survive an interval in which nothing was watching, which is what switching
+  // preemption off creates (AccountManager.setExpiryRouting).
+  clearObservations() {
+    for (const s of this.sessions.values()) s.refs.clear();
+  }
+
   // Every account a known session is pinned to across its buckets, most recent
   // pin first — what selection falls back to when a request's own bucket has no
   // pin yet, so the session stays where it already is. Empty for an unknown or
@@ -270,6 +323,15 @@ export class SessionTracker {
         const moved = mapFn(pin.idx);
         if (moved == null) s.pins.delete(bucket);
         else pin.idx = moved;
+      }
+      // An observation names its account by the same position, so it follows the
+      // same shift. One naming the account that went away is dropped whole:
+      // left behind, it would be read against whatever inherits the slot.
+      for (const [bucket, ref] of [...s.refs]) {
+        const moved = ref.idx == null ? null : mapFn(ref.idx);
+        if (ref.idx != null && moved == null) { s.refs.delete(bucket); continue; }
+        ref.idx = moved;
+        ref.unescaped = remapHeld(ref.unescaped, mapFn);
       }
     }
   }
@@ -345,13 +407,18 @@ export class SessionTracker {
   // fleet has spent, and what it is carrying now. `byBucket` is the same pair
   // per weekly family, which is the only view in which a fleet spending its Opus
   // and its Fable windows at different rates is visible at all.
-  stats(now = this._now()) {
+  //
+  // `items` is the same walk, per session instead of summed — off unless the
+  // operator asks for it (see `stats({ detail: true })`), because it names every
+  // session id, client and project value to whoever reads status.
+  stats(now = this._now(), { detail = false } = {}) {
     this._lastSweep = now;
     let known = 0;
     let active = 0;
     const perAccount = {};
     const tokens = emptyAggregate();
     const byBucket = {};
+    const items = detail ? [] : null;
     let activeContext = 0;
     for (const [id, s] of this.sessions) {
       if (this._isExpired(s, now)) {
@@ -359,6 +426,7 @@ export class SessionTracker {
         continue;
       }
       known += 1;
+      if (items) items.push(sessionItem(id, s, this._isActive(s, now)));
       for (const [bucket, t] of s.tokens) {
         const per = byBucket[bucket] || (byBucket[bucket] = emptyAggregate());
         for (const k of COUNTERS) {
@@ -384,6 +452,43 @@ export class SessionTracker {
     }
     tokens.activeContext = activeContext;
     tokens.byBucket = byBucket;
-    return { known, active, perAccount, tokens };
+    // Newest first: a per-session table is read top-down for what is happening
+    // now, and the list is capped by the same TTLs as the map behind it.
+    if (items) items.sort((a, b) => b.lastSeen - a.lastSeen);
+    return items ? { known, active, perAccount, tokens, items } : { known, active, perAccount, tokens };
+  }
+}
+
+// One row of the per-session readout. `pins` replaces what used to be a single
+// accountIndex: a session holds one pin per weekly bucket, so a session
+// spending two families is served by two accounts at once and naming only one
+// of them would be wrong rather than merely incomplete.
+function sessionItem(id, s, active) {
+  return {
+    id,
+    active,
+    inFlight: s.inFlight,
+    requests: s.count,
+    firstSeen: s.firstSeen,
+    lastSeen: s.lastSeen,
+    client: s.client,
+    dimensions: s.dimensions ? { ...s.dimensions } : null,
+    pins: Object.fromEntries([...s.pins].map(([bucket, p]) => [bucket, p.idx])),
+    // #192's numbers, per weekly bucket: what the responses actually reported,
+    // cache included. An input+output sum understates a cached session by
+    // orders of magnitude, which is why this is not counted from request headers.
+    tokens: Object.fromEntries([...s.tokens].map(([bucket, t]) => [bucket, { ...t }])),
+  };
+}
+
+// Labels are last-write-wins: a session is one client's, and a caller that
+// changes the project mid-session means the new one. Absent fields leave the
+// existing label alone, so a request without the header does not erase it.
+function applyMetadata(s, metadata) {
+  if (!metadata || typeof metadata !== 'object') return;
+  if (typeof metadata.client === 'string' && metadata.client) s.client = metadata.client;
+  const dims = metadata.dimensions;
+  if (dims && typeof dims === 'object' && Object.keys(dims).length) {
+    s.dimensions = { ...(s.dimensions || {}), ...dims };
   }
 }

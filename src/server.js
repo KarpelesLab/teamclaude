@@ -4,15 +4,19 @@ import { timingSafeEqual } from 'node:crypto';
 import { createWriteStream, mkdirSync, writeSync } from 'node:fs';
 import { readdir, stat, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
-import { ensureCerts, createConnectHandler } from './mitm.js';
+import { ensureCerts, createConnectHandler, mitmHosts } from './mitm.js';
 import { patchAccountUuid } from './account-uuid-rewrite.js';
 import { sanitizeToolPairs } from './tool-pair-sanitize.js';
 import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
 import { TopLevelFieldFinder, modelGlobMatches } from './model.js';
 import { BodyWriter, truncationNote } from './request-log.js';
 import { upstreamFetch } from './upstream-fetch.js';
+import { applyAuthHeaders, upstreamFor, rewritesBody, providerForPath, providerOf, isSubscriptionAccount, DEFAULT_PROVIDER } from './provider.js';
 import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
+import { safeLine } from './safe-text.js';
+import { renderDashboardHtml } from './dashboard.js';
+import { createUsageRecorder, resolveUsageDimensions, usageDimensionHeaderNames } from './client-usage.js';
 
 
 export const HOP_BY_HOP_HEADERS = new Set([
@@ -141,7 +145,7 @@ export function resolveClientAuth(proxyConfig, presented) {
   return { ok: false, client: null };
 }
 
-export function createProxyServer(accountManager, config, hooks = {}, sx = null, clientUsage = null) {
+export function createProxyServer(accountManager, config, hooks = {}, sx = null, clientUsage = null, dimensionUsage = null) {
   const upstream = config.upstream || 'https://api.anthropic.com';
   const holdMs = (config.holdSeconds || 0) * 1000;
 
@@ -163,6 +167,18 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
 
   const requestHandler = async (req, res) => {
     try {
+      // Dashboard page — served BEFORE the auth gate on purpose. The page is a
+      // static asset containing no data: everything it shows comes from
+      // /teamclaude/status, which stays behind the gate and is fetched by the
+      // page's own script with the key. A browser address bar cannot send
+      // x-api-key, so gating the asset would just 401 every remote browser
+      // without protecting anything.
+      if (req.method === 'GET' && req.url === '/teamclaude/dashboard') {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+        res.end(renderDashboardHtml());
+        return;
+      }
+
       // Auth check — skip for localhost connections. `config.proxy` is read per
       // request (not captured at creation) so a reload that edits clientKeys
       // applies to a running server, matching how eventLogging/blockedModels
@@ -215,10 +231,20 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
 
       // Status endpoint
       if (req.method === 'GET' && req.url === '/teamclaude/status') {
-        const status = accountManager.getStatus();
+        const status = accountManager.getStatus({ sessionDetail: config.proxy?.sessionDetail === true });
         const extra = hooks.getStatusExtra?.() || {};
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ...extra, ...status }, null, 2));
+        return;
+      }
+
+      // Tier-weighted fleet quota for lightweight consumers such as a shell or
+      // Claude Code status line. Unlike /teamclaude/status this omits routing,
+      // usage counters and server diagnostics, and never reaches upstream.
+      if (req.method === 'GET' && req.url === '/teamclaude/quota') {
+        const extra = hooks.getQuotaExtra?.() || {};
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ...accountManager.getQuotaSummary(), ...extra }, null, 2));
         return;
       }
 
@@ -276,7 +302,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           res.end(JSON.stringify({ ok: false, error: `no such account "${target}"`, accounts: names() }));
           return;
         }
-        accountManager.currentIndex = index;
+        accountManager.setCurrentAccount(index);
         const name = accountManager.accounts[index].name;
         // Recording the choice and the choice taking effect are two different
         // things: selection skips an account it cannot use on the very next
@@ -308,7 +334,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
   // Opt-in egress pin: null unless config.egress.pin is set, and then shared by
   // the base listener and the MITM one so both honour the same hold.
   const egress = createEgressGuard(config, console.error);
-  const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, egress, clientUsage });
+  const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, egress, clientUsage, dimensionUsage });
   const server = http.createServer(requestHandler);
 
   // What bounds a directory of one-shot dumps is deleting the expired ones, not
@@ -337,16 +363,19 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
   // to the upstream host is a transparent MITM relay (rewrite only auth); the
   // test host is answered locally; anything else is blind-tunneled. Certs are
   // minted lazily on the first intercepted CONNECT.
-  const mitmHost = (() => { try { return new URL(upstream).hostname; } catch { return 'api.anthropic.com'; } })();
+  // Every host the leaf must cover, not just the Anthropic upstream: a Codex
+  // account is reached on chatgpt.com, and MITM cannot intercept a host its
+  // certificate does not name.
+  const mitmHostList = mitmHosts(config);
   let certsPromise = null;
   const ensureLeaf = async () => {
     // Reset the memo on failure so a transient cert error doesn't wedge the MITM
     // path permanently (a cached rejected promise would re-throw on every CONNECT).
-    certsPromise ||= ensureCerts(mitmHost).catch((err) => { certsPromise = null; throw err; });
+    certsPromise ||= ensureCerts(mitmHostList).catch((err) => { certsPromise = null; throw err; });
     const c = await certsPromise;
     return { key: c.leafKeyPem, cert: c.leafCertPem };
   };
-  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks, log: console.error, sx, egress, clientUsage }));
+  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks, log: console.error, sx, egress, clientUsage, dimensionUsage }));
   // Remote Control's real-time channel is a WebSocket, not a request/response
   // call — Node fires 'upgrade' for that handshake, never 'request', so it
   // needs its own listener (base-URL routing path; the MITM path wires the
@@ -365,8 +394,14 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
  *   - `Origin` is the fallback for browsers that send no Sec-Fetch-Site. Its
  *     mere presence on a POST to a local control endpoint means a page issued
  *     it; matching it against our own host would mean guessing which of
- *     localhost / 127.0.0.1 / [::1] / a LAN address the caller used, and a
- *     browser-issued same-origin call is not a thing worth supporting here.
+ *     localhost / 127.0.0.1 / [::1] / a LAN address the caller used, so the
+ *     Origin-only fallback admits no page at all.
+ *
+ * The dashboard's switch button is a browser-issued same-origin call and is
+ * admitted by the Sec-Fetch-Site branch alone. A browser that sends Origin
+ * without Sec-Fetch-Site (or a proxy that strips it) lands in the fallback
+ * and is refused — deliberately: widening the fallback to guess our own host
+ * is the trade this comment declines.
  *
  * Non-browser callers (curl, the CLI, `teamclaude attach`) send neither and are
  * unaffected.
@@ -506,7 +541,16 @@ export function relayHttpForward(req, res) {
   else req.pipe(upstreamReq);
 }
 
-const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/files/', '/api/oauth/file_upload'];
+// Paths relayed with the CLIENT's own credential, never a rotated account token.
+// Everything under /api/oauth/ is the client's identity/control plane — profile
+// ("who am I"), file uploads, and whatever Claude Code adds next — not inference.
+// Injecting a fleet token here makes Claude Code believe it IS the rotated
+// account: the cached oauthAccount profile gets overwritten with a stranger's
+// identity, the Claude-in-Chrome extension refuses to pair ("token belongs to a
+// different account than the one you're logged in as"), Remote Control binds to
+// the wrong account, and artifacts get published under it. Observed on a live
+// fleet; the whole prefix is the fix, not a growing allowlist of sub-paths.
+const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/'];
 
 /**
  * Build the core proxy request listener — buffer the body, then forward with
@@ -515,7 +559,7 @@ const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/files/', '/api/oauth/f
  * aware routing, and retry-on-quota behavior. Control endpoints (status/reload)
  * and the proxy-API-key gate live in the base server's wrapper, not here.
  */
-export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null, egress = null, clientUsage = null, forcedClient = null }) {
+export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null, egress = null, clientUsage = null, forcedClient = null, dimensionUsage = null }) {
   let counter = 0;
   return async (req, res) => {
     // The activity entry this request opened, while it is still open. Every
@@ -597,7 +641,9 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         try { token = decodeURIComponent(raw); } catch { token = null; }
         pinnedIndex = token == null ? null : resolveAccountPin(accountManager, token);
         if (pinnedIndex == null) {
-          const shown = token ?? raw;
+          // Client-supplied and already percent-decoded, so this is the one
+          // value on the path that can carry raw control bytes.
+          const shown = safeLine(token ?? raw);
           const reqId = ++counter;
           const sessionId = req.headers['x-claude-code-session-id'] || null;
           if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(unknown pin: "${shown}")`, status: 404, model: null, sessionId, pinned: false });
@@ -619,7 +665,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         if (pinnedIndex == null) {
           const reqId = ++counter;
           const sessionId = req.headers['x-claude-code-session-id'] || null;
-          if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(unknown pin: "${forcedPin}")`, status: 404, model: null, sessionId, pinned: false });
+          if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(unknown pin: "${safeLine(forcedPin)}")`, status: 404, model: null, sessionId, pinned: false });
           res.writeHead(404, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: `Unknown account pin "${forcedPin}" (from TC_ACCT)` } }));
           return;
@@ -684,17 +730,29 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // instead — the same split as the account pin. onUsage lets the usage
       // extraction deep in the response path book tokens against the client
       // without threading the name through every layer.
+      //
+      // Usage dimensions (proxy.usageDimensions) ride the same hook: each
+      // configured header the caller sent becomes one more counter the response
+      // tokens are booked against, so one CI key can still be split by project.
       const client = req.tcClient ?? forcedClient ?? null;
-      const onUsage = (client && clientUsage)
-        ? (inputTokens, outputTokens) => clientUsage.record(client, { inputTokens, outputTokens })
-        : null;
-      if (client && clientUsage) clientUsage.record(client, { requests: 1 });
+      const usageDimensions = resolveUsageDimensions(config.proxy, req.headers);
+      const usageRecorder = createUsageRecorder({ client, clientUsage, dimensions: usageDimensions, dimensionUsage });
+      usageRecorder.recordRequest();
 
-      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, holdBudgetMs: holdMs, sessionId, client, onUsage, logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
+      // The dimension headers are ours, not upstream's: they exist to label
+      // traffic for this proxy. Forwarding them would leak an operator's
+      // internal project and branch names to Anthropic for no benefit, so they
+      // are dropped with the other proxy-control headers.
+      const stripHeaders = usageDimensionHeaderNames(config.proxy);
+
+      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, provider: providerForPath(req.url), holdBudgetMs: holdMs, sessionId, client, onUsage: usageRecorder.onUsage, stripHeaders, logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
-      accountManager.beginSession(sessionId);
+      accountManager.beginSession(sessionId, {
+        client,
+        dimensions: Object.fromEntries(usageDimensions.map(d => [d.name, d.key])),
+      });
       try {
         await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir, sx);
       } catch (err) {
@@ -1276,6 +1334,39 @@ export function isTransientUpstreamError(err, { otherHostAvailable = false } = {
   return false;
 }
 
+/**
+ * The message behind the synthetic 429, when no account can serve the request.
+ *
+ * The old wording — `All N accounts exhausted. Retry in 60s.` — was wrong in
+ * three ways at once, and each one pushed the operator somewhere unhelpful
+ * (#168):
+ *
+ *   - N counted every configured account, including ones the operator had
+ *     disabled. An account deliberately out of rotation is not capacity that
+ *     ran out.
+ *   - it never named the model, so a family-specific refusal (Fable spent,
+ *     Opus fine) read as the whole proxy being out of capacity.
+ *   - "exhausted" reads terminal while "retry in 60s" reads transient, so the
+ *     operator retried by hand instead of looking at what was actually blocked.
+ *
+ * Counts only the accounts that were candidates, names the model when the
+ * request carried one, and says plainly that the wait is until a window resets.
+ */
+export function exhaustedMessage(accountManager, model, retryAfter) {
+  const accounts = accountManager.accounts || [];
+  const eligible = accounts.filter(a => !a.disabled);
+  const disabled = accounts.length - eligible.length;
+
+  const scope = model ? ` for ${model}` : '';
+  const pool = eligible.length === 1 ? '1 account' : `${eligible.length} accounts`;
+  const aside = disabled ? ` (${disabled} more disabled)` : '';
+  const when = retryAfter > 0
+    ? ` Quota resets in ${retryAfter}s.`
+    : ' Retry shortly.';
+
+  return `No account can serve this request${scope}: all ${pool}${aside} are at their quota or rate limit.${when}`;
+}
+
 export async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, useSx) {
   const maxRetries = accountManager.accounts.length;
   // This function is exported, so a caller may hand us a ctx built elsewhere.
@@ -1302,9 +1393,43 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   const pinned = ctx.pinnedIndex != null && !ctx.tried.has(ctx.pinnedIndex)
     ? accountManager.accounts[ctx.pinnedIndex]
     : null;
+  // What this attempt's selection decided beyond which account it returned.
+  // Carried on ctx rather than read straight back, because the failover hops
+  // below run after an upstream round trip.
+  const selection = {};
+  // A pin bypasses selection entirely, so the provider partition has to be
+  // enforced here too — otherwise TC_ACCT aimed at a Claude subscription would
+  // serve a Codex request from it, sending an OpenAI-shaped body to
+  // api.anthropic.com with a Claude token. Subscriptions only: an API-key
+  // account is metered capacity with no tie to a caller, so a pin to one stands.
+  const pinnedWrongProvider = pinned
+    && isSubscriptionAccount(pinned)
+    && providerOf(pinned) !== (ctx.provider || DEFAULT_PROVIDER);
   const account = ctx.pinnedIndex != null
-    ? (pinned && !accountManager.capExceeded(pinned, ctx.model) ? pinned : null)
-    : accountManager.getActiveAccount(ctx.tried, ctx.model, ctx.advisorModel, ctx.sessionId);
+    ? (pinned && !pinnedWrongProvider && !accountManager.capExceeded(pinned, ctx.model) ? pinned : null)
+    : accountManager.getActiveAccount(
+      ctx.tried, ctx.model, ctx.advisorModel, ctx.sessionId, ctx.provider, selection,
+    );
+  // Accounts a rollover deliberately routed this request away from. Request-
+  // scoped: the decision belongs to the request, not to one attempt of it.
+  if (selection.rolledOff) {
+    ctx.rolledOff ??= new Set();
+    for (const i of selection.rolledOff) ctx.rolledOff.add(i);
+  }
+  if (pinnedWrongProvider && !res.headersSent && !clientGone(res)) {
+    // Named plainly: a pin that cannot serve is a configuration mistake, and the
+    // exhausted-account response would send the operator looking at quota.
+    ctx.status = 400;
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      type: 'error',
+      error: {
+        type: 'invalid_request_error',
+        message: `Pinned account "${pinned.name}" is a ${providerOf(pinned)} subscription and cannot serve a ${ctx.provider} request.`,
+      },
+    }));
+    return;
+  }
   if (!account) {
     // Every candidate was refused by upstream (403). Waiting will not help — the
     // account needs attention, not a retry — so say so plainly rather than
@@ -1396,7 +1521,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       type: 'error',
       error: {
         type: 'rate_limit_error',
-        message: `All ${accountManager.accounts.length} accounts exhausted. Retry in ${retryAfter}s.`,
+        message: exhaustedMessage(accountManager, ctx.model, retryAfter),
       },
     }));
     return;
@@ -1418,7 +1543,6 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   }
 
   // Build upstream request headers
-  const isOAuth = account.type === 'oauth';
   const headers = {};
   for (const [key, value] of Object.entries(req.headers)) {
     const lk = key.toLowerCase();
@@ -1430,31 +1554,51 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // Strip accept-encoding: Node fetch auto-decompresses, which would
     // mismatch the Content-Encoding header we forward to the client
     if (lk === 'accept-encoding') continue;
+    // Headers configured as usage dimensions are addressed to this proxy and
+    // carry the operator's own labels (project, branch, team). They are
+    // consumed here, so they do not travel upstream.
+    if (ctx.stripHeaders?.has(lk)) continue;
     headers[key] = value;
   }
 
-  if (isOAuth) {
-    headers['authorization'] = `Bearer ${account.credential}`;
-  } else {
-    headers['x-api-key'] = account.credential;
-  }
+  // Credential presentation is provider-specific: Anthropic OAuth and Codex
+  // both use a bearer token, Anthropic API keys use x-api-key, and Codex also
+  // needs ChatGPT-Account-Id to scope the token to one account.
+  applyAuthHeaders(headers, account);
 
-  const upstreamUrl = `${account.upstream || upstream}${req.url}`;
+  const upstreamUrl = `${upstreamFor(account, upstream)}${req.url}`;
   const method = req.method;
 
-  // Strip orphaned tool_use / tool_result blocks so a client that compacted or
-  // interrupted a turn can't wedge the session with Anthropic's non-retryable
-  // 400 ("tool_use ids were found without tool_result blocks"). No-op (same
-  // Buffer) for a well-formed body.
-  let sendBody = sanitizeToolPairs(body, req.url, req.headers['content-type']);
-  // Align the body's account_uuid (in metadata.user_id) with the account whose
-  // token we're injecting (same-length patch; no-op if absent).
-  if (account.accountUuid) sendBody = patchAccountUuid(sendBody, account.accountUuid);
+  let sendBody = body;
+  // The body rewrites below are Anthropic-shaped and must not touch another
+  // provider's payload: a Responses API body has no metadata.user_id to patch
+  // and no Anthropic tool-pairing rule to repair, so running them would at
+  // best waste a pass and at worst corrupt a valid request.
+  if (rewritesBody(account)) {
+    // Strip orphaned tool_use / tool_result blocks so a client that compacted or
+    // interrupted a turn can't wedge the session with Anthropic's non-retryable
+    // 400 ("tool_use ids were found without tool_result blocks"). No-op (same
+    // Buffer) for a well-formed body.
+    sendBody = sanitizeToolPairs(body, req.url, req.headers['content-type']);
+    // Align the body's account_uuid (in metadata.user_id) with the account whose
+    // token we're injecting (same-length patch; no-op if absent).
+    if (account.accountUuid) sendBody = patchAccountUuid(sendBody, account.accountUuid);
+  }
   // Rewrite the model name for accounts that target a different upstream (e.g.
   // GLM), which uses different model identifiers than Anthropic.
   if (account.modelMap) sendBody = rewriteModel(sendBody, account.modelMap);
-  // If the body changed length (sanitize or model rewrite), update Content-Length
-  // so the upstream doesn't receive a mismatched framing and truncate or stall.
+  // Third-party upstreams (e.g. OpenCode Zen, GLM) implement the Anthropic
+  // message API but reject fields Claude Code legitimately sends — observed:
+  // `context_management` -> 400 "Extra inputs are not permitted", which breaks
+  // EVERY request once such an account is selected. Drop the configured fields
+  // for those accounts only; Anthropic accounts are untouched. Content-Length is
+  // refreshed below because the body shrinks.
+  if (Array.isArray(account.stripRequestFields) && account.stripRequestFields.length) {
+    sendBody = stripBodyFields(sendBody, account.stripRequestFields);
+  }
+  // If the body changed length (sanitize, model rewrite, or field strip), update
+  // Content-Length so the upstream doesn't receive a mismatched framing and
+  // truncate or stall.
   if (sendBody !== body) headers['content-length'] = String(sendBody.length);
 
   // Streaming request log, opened lazily on the first terminal outcome (a
@@ -1579,6 +1723,52 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // selection keeps choosing it.
       accountManager.pauseAccount(account.index, Math.min(retryAfter, RATE_LIMIT_ABSORB_MAX_SECONDS));
 
+      // ONE bounded failover hop to an idle sibling (#137, #165, #156).
+      //
+      // #84's argument against rotating on a rate-limit 429 is that moving a
+      // shared burst to the next account just throttles that one too and throws
+      // away this account's KV cache. That holds under load. It does not hold
+      // when a sibling is sitting idle, which is the case every reporter hit: a
+      // three-account fleet stalling for 60s at a time on one throttled account
+      // while another was at 9% weekly.
+      //
+      // So the hop is deliberately not a rotation policy: at most once per
+      // request, never onto an account already tried, and never onto one inside
+      // its own 429 pause — pauseAccount does not mark an account throttled, so
+      // selection would otherwise happily hand back an account that is itself
+      // waiting out a 429.
+      //
+      // The budget is one hop for a specific reason. If the SECOND account is
+      // rate-limited too, the limit is almost certainly scoped to the egress IP
+      // rather than to either account: every account leaves from the same
+      // address, which is the premise the sx.org path below is built on. Hopping
+      // further would prove nothing and pay a cold cache each time. After the
+      // hop ctx.rateLimitHopped is set, this branch does not run again for this
+      // request, and the sx fresh-IP retry and the inline wait take over —
+      // which is the right response to an IP-scoped limit.
+      if (!ctx.rateLimitHopped && retryCount < maxRetries) {
+        // ctx.rolledOff as well as tried: an account a rollover moved this
+        // request off was never sent a request, so it is not in `tried`, and
+        // hopping back onto it would reverse that decision one step later.
+        const alt = accountManager.getActiveAccount(
+          new Set([...ctx.tried, ...(ctx.rolledOff || []), account.index]),
+          ctx.model, ctx.advisorModel, ctx.sessionId, ctx.provider,
+        );
+        if (alt && !accountManager.isPaused(alt.index)) {
+          ctx.rateLimitHopped = true;
+          ctx.tried.add(account.index);
+          console.log(`[TeamClaude] Rate-limit 429 on "${account.name}" — failing over once to idle account "${alt.name}"`);
+          if (clientGone(res)) return;
+          return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+        }
+      } else if (ctx.rateLimitHopped) {
+        // Second 429 this request, on a different account. Say so once: the
+        // operator chasing "why is my fleet throttled" is looking for exactly
+        // this, and it points at the egress IP rather than at the accounts.
+        console.log('[TeamClaude] Second account rate-limited too — the limit looks IP-scoped, not per-account'
+          + (sx?.useOn429() ? '' : ' (sx.org mode "429" would retry from a fresh egress IP)'));
+      }
+
       // sx fresh-IP retry (still the same account) takes precedence over waiting.
       // Bounded by retryCount like the inline-wait path below, so a persistently
       // 429ing upstream can't loop forever through sx.
@@ -1622,6 +1812,33 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // retry's status check rotates to another account. Bounded to one re-auth
     // per account per request, so a genuinely dead credential surfaces the 401
     // instead of looping.
+    // Upstream 5xx — 529 "Overloaded" above all (#156). This is the provider
+    // saying it cannot serve right now, not anything about this account'"'"'s quota,
+    // so surfacing it to the client turns a provider-side transient into a
+    // client-visible failure — and Claude Code'"'"'s own retry loop then re-piles the
+    // same load onto the same account.
+    //
+    // One hop, on the same budget and for the same reason as the 429 path above:
+    // if a second account is overloaded too, it is the provider that is
+    // overloaded, not the account, and walking the fleet would just spend every
+    // account'"'"'s cache discovering that. After the hop the response goes to the
+    // client as it does today, with its own retry-after intact.
+    if (upstreamRes.status >= 500 && !res.headersSent && !ctx.serverErrorHopped && retryCount < maxRetries) {
+      // Same exclusion as the 429 hop: see there.
+      const alt = accountManager.getActiveAccount(
+        new Set([...ctx.tried, ...(ctx.rolledOff || []), account.index]),
+        ctx.model, ctx.advisorModel, ctx.sessionId, ctx.provider,
+      );
+      if (alt && !accountManager.isPaused(alt.index)) {
+        await upstreamRes.body?.cancel();
+        ctx.serverErrorHopped = true;
+        ctx.tried.add(account.index);
+        console.log(`[TeamClaude] Upstream ${upstreamRes.status} on "${account.name}" — failing over once to "${alt.name}"`);
+        if (clientGone(res)) return;
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+      }
+    }
+
     // A 403 ("Request not allowed") is upstream refusing THIS account outright —
     // not a stale token a refresh could fix, and not anything the client sent.
     // The client never sees the credential we inject, so it cannot act on the
@@ -1956,6 +2173,21 @@ function extractUsageFromBody(buffer, accountIndex, accountManager, onUsage = nu
   } catch {
     // not JSON or no usage
   }
+}
+
+// Remove top-level fields from a JSON request body (see stripRequestFields).
+// Returns the original buffer when nothing changed or the body isn't JSON, so
+// non-messages endpoints pass through untouched. Exported for tests.
+export function stripBodyFields(body, fields) {
+  try {
+    const obj = JSON.parse(body.toString('utf8'));
+    let changed = false;
+    for (const f of fields) {
+      if (Object.prototype.hasOwnProperty.call(obj, f)) { delete obj[f]; changed = true; }
+    }
+    if (changed) return Buffer.from(JSON.stringify(obj), 'utf8');
+  } catch { /* not JSON — pass through unchanged */ }
+  return body;
 }
 
 // Rewrite the `model` field in a JSON request body using a per-account map.

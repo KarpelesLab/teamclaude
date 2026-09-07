@@ -14,10 +14,6 @@ function oauth(name) {
 }
 
 // Shaped like the real /api/oauth/usage payload.
-// Relative: the assertion below is that the reset is still ahead of now, so a
-// pinned calendar date turns this into a time bomb the day it passes.
-const OPUS_RESET = new Date(Date.now() + 48 * 3600_000).toISOString();
-
 const payload = {
   five_hour: { utilization: 44, resets_at: '2026-09-02T08:50:00Z' },
   seven_day: { utilization: 18, resets_at: '2026-09-02T18:00:00Z' },
@@ -25,7 +21,7 @@ const payload = {
     { kind: 'session', group: 'session', percent: 44, scope: null },
     { kind: 'weekly_all', group: 'weekly', percent: 18, resets_at: '2026-09-02T18:00:00Z', scope: null },
     { kind: 'weekly_scoped', group: 'weekly', percent: 0, resets_at: null, scope: { model: { display_name: 'Fable' } } },
-    { kind: 'weekly_scoped', group: 'weekly', percent: 95, resets_at: OPUS_RESET, scope: { model: { display_name: 'Opus' } } },
+    { kind: 'weekly_scoped', group: 'weekly', percent: 95, resets_at: '2026-09-05T00:00:00Z', scope: { model: { display_name: 'Opus' } } },
   ],
 };
 
@@ -34,7 +30,8 @@ test('every scoped weekly limit is read, keyed by the name upstream used', () =>
   assert.deepEqual(Object.keys(scoped).sort(), ['fable', 'opus']);
   assert.equal(scoped.fable.utilization, 0);
   assert.equal(scoped.opus.utilization, 0.95, 'percent is normalized to a 0-1 fraction');
-  assert.ok(scoped.opus.resetAt > Date.now(), 'reset parses to a timestamp');
+  assert.equal(scoped.opus.resetAt, Date.parse('2026-09-05T00:00:00Z'),
+    'reset parses to a timestamp');
 });
 
 test('unscoped and non-weekly entries are not mistaken for family buckets', () => {

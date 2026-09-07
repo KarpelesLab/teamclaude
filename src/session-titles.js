@@ -20,6 +20,7 @@ import { readdir, readFile, open } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { SESSION_KNOWN_TTL_MS } from './session-tracker.js';
+import { sanitizeText } from './safe-text.js';
 
 const DEFAULT_PROJECTS_DIR = join(homedir(), '.claude', 'projects');
 
@@ -216,6 +217,6 @@ function isSessionId(value) {
  *  is an injection. Each becomes a space and runs of whitespace collapse. */
 function cleanTitle(value) {
   if (typeof value !== 'string') return null;
-  const cleaned = value.replace(/\p{Cc}/gu, ' ').replace(/\s+/g, ' ').trim();
+  const cleaned = sanitizeText(value);
   return cleaned || null;
 }

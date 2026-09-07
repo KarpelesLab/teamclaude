@@ -1,14 +1,19 @@
 import { createWriteStream } from 'node:fs';
+import { gatingUtilization } from './model.js';
 import { importCredentials, fetchProfile } from './oauth.js';
 import {
   sameIdentity,
   findUpsertTarget,
+  updateAccountEntry,
   canUpsertOAuthAccount,
   oauthIdentityFields,
 } from './identity.js';
+import { configIndexFor, managerAccountFor, markAccountRemoved } from './account-pairing.js';
+import { mintAccountId } from './account-id.js';
 import { formatPercent } from './status-renderer.js';
 import { resolveMaxUsage } from './model.js';
 import { parseProxyUrl, proxyToUrl, describeProxy, describeSelfProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy } from './upstream-proxy.js';
+import { sanitizeText } from './safe-text.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -184,11 +189,35 @@ const NAME_MIN = 12;
 // column layout (which reserves the width that tag needs).
 // `threshold` is a number, or a per-bucket lookup (bucket → number) so a family
 // is judged against its OWN configured threshold rather than the global one.
+/**
+ * Short row tag for an account that bills real money past its plan limits:
+ * `$!` once something has actually been billed, `$` while it merely can be,
+ * '' when it cannot. ASCII on purpose — the row is width-budgeted to the cell,
+ * and a glyph whose width varies by terminal would push it past the edge.
+ *
+ * Deliberately not shown for an account that spent earlier and has since been
+ * switched off: the row reports what rotating onto this account costs now, and
+ * the status screen carries the fuller history.
+ */
+export function spendTag(quota) {
+  const spend = quota?.spend;
+  if (!spend?.enabled) return '';
+  return (spend.usedMinor || 0) > 0 ? '$!' : '$';
+}
+
 export function blockedFamilies(quota, threshold) {
   const at = typeof threshold === 'function' ? threshold : () => threshold;
   const out = [];
-  if (quota.unified7dSonnet != null && quota.unified7dSonnet >= at('unified7dSonnet')) out.push('Sonnet');
-  if (quota.unified7dFable != null && quota.unified7dFable >= at('unified7dFable')) out.push('Fable');
+  for (const [label, key] of [['Sonnet', 'unified7dSonnet'], ['Fable', 'unified7dFable']]) {
+    if (quota[key] == null) continue;      // family not metered separately here
+    // Compared against gatingUtilization — the value the ROUTER gates on — not
+    // against the family bucket alone. Family spend meters into the shared
+    // weekly too, so an account under its family cap can be over the shared one
+    // and unable to serve that family at all (#175). This tag displays a routing
+    // decision, so deriving it a second way here would be a copy that drifts.
+    const gating = gatingUtilization(quota, key);
+    if (gating != null && gating >= at(key)) out.push(label);
+  }
   return out;
 }
 
@@ -368,16 +397,32 @@ export class TUI {
 
   // ── lifecycle ──────────────────────────────────────
 
+  /**
+   * Open the activity log, if one is configured.
+   *
+   * Split out of start() so it can be exercised without entering the alt screen
+   * or putting stdin in raw mode — neither of which a test process can do.
+   *
+   * 0600 like every sibling (config, state, request log and its directory): the
+   * activity log names which client made each call, so on a shared host it is
+   * the record that says who was working on what and when (#259). Mode applies
+   * on creation only, so a file the operator already placed keeps the
+   * permissions they chose rather than being chmod'ed underneath them.
+   */
+  _openActivityLog() {
+    if (!this.activityLogPath) return null;
+    this._activityStream = createWriteStream(this.activityLogPath, { flags: 'a', mode: 0o600 });
+    this._activityStream.on('error', err => {
+      // Swallow write errors — can't log them to the TUI without recursion
+      this._activityStream = null;
+      process.stderr.write(`[TeamClaude] activity log error: ${err.message}\n`);
+    });
+    return this._activityStream;
+  }
+
   start() {
     this.running = true;
-    if (this.activityLogPath) {
-      this._activityStream = createWriteStream(this.activityLogPath, { flags: 'a' });
-      this._activityStream.on('error', err => {
-        // Swallow write errors — can't log them to the TUI without recursion
-        this._activityStream = null;
-        process.stderr.write(`[TeamClaude] activity log error: ${err.message}\n`);
-      });
-    }
+    this._openActivityLog();
     process.stdout.write(`${ESC}?1049h${ESC}?25l`);
     process.stdin.setRawMode(true);
     process.stdin.resume();
@@ -485,7 +530,9 @@ export class TUI {
     const t = timestamp();
     this.log.unshift({ t, msg });
     if (this.log.length > 200) this.log.length = 200;
-    if (this._activityStream) this._activityStream.write(`${t}  ${strip(msg)}\n`);
+    // sanitizeText, not `strip`: the latter removes SGR colour only, so an
+    // erase or cursor-move sequence reached the file, as did a newline.
+    if (this._activityStream) this._activityStream.write(`${t}  ${sanitizeText(msg)}\n`);
     if (this.running) this.render();
   }
 
@@ -839,7 +886,7 @@ export class TUI {
     // whose result the next poll reflects, not a local assignment.
     if (this.applySwitch) { this.mode = 'normal'; this._doSwitchRemote(acct); return; }
     if (this.selRoute === null) {
-      this.am.currentIndex = this.selIdx;
+      this.am.setCurrentAccount(this.selIdx);
       this._addLog(`Switched to "${acct.name}"`);
       this.mode = 'normal';
       return;
@@ -1082,6 +1129,11 @@ export class TUI {
       const entry = {
         name, type: 'oauth', source: 'import',
         ...oauthIdentityFields(profile),
+        organizationType: profile?.organizationType || null,
+        rateLimitTier: profile?.rateLimitTier || creds.rateLimitTier || null,
+        seatTier: profile?.seatTier || null,
+        hasClaudeMax: profile?.hasClaudeMax ?? null,
+        hasClaudePro: profile?.hasClaudePro ?? null,
         accessToken: creds.accessToken,
         refreshToken: creds.refreshToken,
         expiresAt: creds.expiresAt,
@@ -1095,9 +1147,16 @@ export class TUI {
 
       if (idx >= 0) {
         const prev = this.config.accounts[idx];
-        this.config.accounts[idx] = { ...prev, ...entry, name: prev.name };
-        // Update the running account manager entry
-        const amAcct = this.am.accounts.find(a => sameIdentity(a, entry)) || this.am.accounts[idx];
+        this.config.accounts[idx] = updateAccountEntry(prev, entry);
+        // The account to update is the one built from this entry. Identity cannot
+        // answer that: the entry may have matched on a bare name while carrying no
+        // UUID, and then no account matches the freshly profiled identity at all.
+        // Falling back to `accounts[idx]` there applied a CONFIG index to this
+        // list and wrote the new credential and the new UUID onto whichever
+        // account sat at that position — a different person's, once
+        // resolveAccounts has dropped anything ahead of it. An entry with no
+        // running account now updates nothing, which is what there is to do.
+        const amAcct = managerAccountFor(this.am.accounts, prev);
         if (amAcct) {
           amAcct.credential = creds.accessToken;
           amAcct.refreshToken = creds.refreshToken;
@@ -1105,6 +1164,9 @@ export class TUI {
           if (entry.accountUuid) amAcct.accountUuid = entry.accountUuid;
           if (entry.orgUuid) amAcct.orgUuid = entry.orgUuid;
           if (entry.orgName) amAcct.orgName = entry.orgName;
+          for (const field of ['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro']) {
+            amAcct[field] = entry[field];
+          }
           if (amAcct.status === 'error') amAcct.status = 'active';
         }
         this._addLog(`Updated account "${prev.name}"`);
@@ -1122,6 +1184,9 @@ export class TUI {
             entry.name = `${name} (${orgLbl(entry)})`;
           }
         }
+        // One object into both lists, so the account is built carrying its
+        // entry's id and the two pair from the moment they exist.
+        entry.id = mintAccountId();
         this.config.accounts.push(entry);
         this.am.addAccount(entry);
         this._addLog(`Imported account "${entry.name}"`);
@@ -1136,8 +1201,11 @@ export class TUI {
   async _doAddKey(apiKey) {
     const n = this.config.accounts.filter(a => a.name.startsWith('api-')).length + 1;
     const name = `api-${n}`;
-    this.config.accounts.push({ name, type: 'apikey', apiKey });
-    this.am.addAccount({ name, type: 'apikey', apiKey });
+    // One object, not two equal literals: the account has to be built from the
+    // entry itself to carry its id, which is what pairs the two afterwards.
+    const entry = { id: mintAccountId(), name, type: 'apikey', apiKey };
+    this.config.accounts.push(entry);
+    this.am.addAccount(entry);
     await this.saveConfig(this.config);
     this._addLog(`Added API key account "${name}"`);
   }
@@ -1145,8 +1213,21 @@ export class TUI {
   async _doRemove(idx) {
     if (idx < 0 || idx >= this.am.accounts.length) return;
     const name = this.am.accounts[idx].name;
+    // Resolved before removeAccount, which splices this list and renumbers it.
+    // The selected row is a manager index; applying it to the config list
+    // deleted whichever entry sat at that position instead — the credential-less
+    // one resolveAccounts dropped, or a neighbour, either of which leaves the
+    // fleet running an account whose entry is gone.
+    const cfgIdx = configIndexFor(this.config.accounts, this.am.accounts, idx);
     this.am.removeAccount(idx);
-    this.config.accounts.splice(idx, 1);
+    if (cfgIdx >= 0) {
+      // Record the id before the row goes: the save adopts rows that are on disk
+      // and not in memory (an account added by another process since the last
+      // reload), and removal is itself a save — so without this the entry being
+      // deleted would be read back off disk and written straight out again.
+      markAccountRemoved(this.config, this.config.accounts[cfgIdx]?.id);
+      this.config.accounts.splice(cfgIdx, 1);
+    }
     if (this.selIdx >= this.am.accounts.length) this.selIdx = Math.max(0, this.am.accounts.length - 1);
     await this.saveConfig(this.config);
     this._addLog(`Removed account "${name}"`);
@@ -1156,10 +1237,15 @@ export class TUI {
     if (idx < 0 || idx >= this.am.accounts.length) return;
     const acct = this.am.accounts[idx];
     const next = !acct.disabled;
+    const cfgIdx = configIndexFor(this.config.accounts, this.am.accounts, idx);
     this.am.setDisabled(idx, next); // re-enabling also clears a stuck error state
     // Write an explicit boolean (not delete): saveConfig merges over the on-disk
     // entry, so a `delete` would leave a stale `disabled: true` from disk intact.
-    if (this.config.accounts[idx]) this.config.accounts[idx].disabled = next;
+    // Onto this account's own entry: a manager index is not a config index, so
+    // the flag used to land on a neighbour and the next save persisted it there,
+    // leaving one account disabled on disk while the operator watched another go
+    // grey on screen.
+    if (cfgIdx >= 0) this.config.accounts[cfgIdx].disabled = next;
     await this.saveConfig(this.config);
     this._addLog(`${next ? 'Disabled' : 'Enabled'} account "${acct.name}"`);
   }
@@ -1250,7 +1336,6 @@ export class TUI {
         : '  No accounts configured. Press [g] → Add account.'));
     } else {
       lines.push('');
-      const showBoth = W >= 70;
 
       // Routes drive the inline markers; general (non-family) routes get a stable
       // column each at the row start so the marker's position identifies the route.
@@ -1273,15 +1358,35 @@ export class TUI {
         const names = blockedFamilies(a.quota, key => this.am.thresholdFor(key));
         return names.length ? Math.max(w, 4 + vw(names.join(' '))) : w;
       }, 0);
-      const fixed = 28 + NAME_MIN + (genRoutes.length ? genRoutes.length + 1 : 0) + tagW;
+      // Same rule for the `$`/`$!` money tag: a column the row can draw is a
+      // column the budget has to know about, or the row overflows exactly the
+      // way #228 fixed.
+      const spendW = this.am.accounts.reduce((w, a) => {
+        const tag = spendTag(a.quota);
+        return tag ? Math.max(w, 2 + vw(tag)) : w;
+      }, 0);
+      const fixed = 28 + NAME_MIN + (genRoutes.length ? genRoutes.length + 1 : 0) + tagW + spendW;
       const roomFor = n => fixed + 6 * (n - 1) + n * BAR_MIN <= W;
       // The family bars are the first thing to go: below the width where they
       // fit even at BAR_MIN they would push the row past the edge, and a row cut
       // mid-bar reads worse than one that simply doesn't draw them (the `⊘` tag
       // still says which family is barred).
+      // The second shared bar answers to roomFor too, not just to a width
+      // threshold. `W >= 70` alone let the reservations (a 16-column blocked-family
+      // tag on two families, plus route cells) leave less than BAR_MIN per bar,
+      // and the floor below then overrode the budget: two accounts blocked on both
+      // families drew 72 columns at W=70, which fitLine silently cut (#234).
+      const showBoth = W >= 70 && roomFor(2);
       const showFamily = showBoth && (anyFable || anySonnet) && roomFor(2 + (anyFable ? 1 : 0) + (anySonnet ? 1 : 0));
       const nbars = (showBoth ? 2 : 1) + (showFamily ? (anyFable ? 1 : 0) + (anySonnet ? 1 : 0) : 0);
-      const bw = Math.max(BAR_MIN, Math.min(BAR_MAX, Math.floor((W - fixed - 6 * (nbars - 1)) / nbars)));
+      // Backstop for the case no count of bars can fix: when even one bar at
+      // BAR_MIN overruns the row, the floor has to yield. A narrow bar reads
+      // worse than a wide one; a row cut mid-bar loses the reset countdown its
+      // tail carries, and does it without saying so.
+      const avail = Math.floor((W - fixed - 6 * (nbars - 1)) / nbars);
+      const bw = avail < BAR_MIN
+        ? Math.max(1, avail)
+        : Math.min(BAR_MAX, avail);
 
       // Whatever the chrome and the capped bars leave over goes to the name
       // column, up to the longest name in the fleet, so a wide terminal shows
@@ -1466,12 +1571,20 @@ export class TUI {
         line += ` ${familyMark('fable')}F7  ${bar(q.unified7dFable, bw, q.unified7dFableReset, SEVEN_DAY_MS, limFor('unified7dFable'))}`;
       }
     }
-    // Explicit "disabled for these models" tag (issue #85): a family whose own
-    // weekly bucket is over the switch threshold can't serve that model even
-    // while the account is otherwise active. A spent shared 5h blocks everything
-    // and is already conveyed by the Ses bar + status, so it's not repeated here.
+    // Explicit "disabled for these models" tag (issue #85): a family the account
+    // can't serve even while it is otherwise active. A spent shared 5h blocks
+    // everything and is already conveyed by the Ses bar + status, so it's not
+    // repeated here.
+    //
+    // limFor, not thresholdFor: it is min(per-bucket threshold, per-account cap),
+    // so the tag covers both ceilings and still judges each family against its
+    // OWN configured threshold.
     const blocked = blockedFamilies(q, limFor);
     if (blocked.length) line += `  ${red('⊘ ' + blocked.join(' '))}`;
+    // Money tag last, so it sits at the end of the row where the eye lands after
+    // the bars. Red once real money has moved, yellow while it only could.
+    const money = spendTag(q);
+    if (money) line += `  ${(money === '$!' ? red : yellow)(money)}`;
     return line;
   }
 

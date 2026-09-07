@@ -48,9 +48,11 @@ Headless, you can re-sync accounts from the config without a restart by POSTing 
 curl -X POST http://localhost:3456/teamclaude/reload
 ```
 
-You usually don't need to call it directly. `login`, `import`, `enable`, `disable`, `priority`, `route`, `probe` and `warmup` notify a running server themselves.
+You usually don't need to call it directly. `login`, `import`, `enable`, `disable`, `priority`, `route`, `threshold`, `distribute`, `probe` and `warmup` notify a running server themselves.
 
 Control-plane **writes** (`reload`, `switch`) are refused when the request carries a browser `Origin` or a cross-site `Sec-Fetch-Site`. Loopback is exempt from the proxy API key so the CLI needs no configuration, but that exemption also covers any web page you happen to visit: a page can POST to `127.0.0.1` cross-origin without a preflight, and while it cannot read the reply, the write would still land. `curl` and the CLI send neither header and are unaffected. Reads (`status`) are not restricted — the same-origin policy already stops a page from seeing the response.
+
+`GET /teamclaude/quota` is the compact read endpoint for status-line integrations. It returns tier-weighted fleet aggregates and the underlying per-account limits; see [Fleet quota endpoint](quota.md#fleet-quota-endpoint).
 
 Switching the account by hand has the same headless path — the equivalent of pressing **s** in the TUI and confirming with the default target selected:
 
@@ -117,7 +119,9 @@ eval "$(teamclaude env --no-mitm)" # base-URL: ANTHROPIC_BASE_URL only
 claude
 ```
 
-Only the export lines go to stdout (so `eval` is safe); a short summary and any hints go to stderr. No `ANTHROPIC_API_KEY` is emitted — loopback clients are exempt from the proxy key gate, and setting it would drop Claude Code out of subscription mode. A remote (non-loopback) client must add the proxy key itself.
+Only the export lines go to stdout (so `eval` is safe); a short summary and any hints go to stderr. When local Claude OAuth is usable, no `ANTHROPIC_API_KEY` is emitted and Claude Code stays in subscription mode. An access token that has merely expired still counts as usable while its refresh token is valid, because Claude Code refreshes it itself at startup. Only when there is no local OAuth at all — no tokens, or a refresh token that has expired too — does TeamClaude switch to proxy credential mode and emit a harmless local bootstrap key so Claude Code can start; the proxy replaces it with the selected account credential for normal API requests. On macOS the Keychain (Claude Code's live store) is consulted before `~/.claude/.credentials.json`, which can be a stale snapshot from an earlier login.
+
+The bootstrap mode does not authenticate the passthrough endpoints used by Remote Control and claude.ai file transfers, which intentionally retain the client's own headers. Run `claude /login` if those features are needed. A remote (non-loopback) client must override the bootstrap key with the real proxy key.
 
 **Using an agent multiplexer or a tool that spawns `claude` itself?** Export this environment in the process that launches those `claude` instances — e.g. `eval "$(teamclaude env)"` in the shell you start the multiplexer from. Every spawned `claude` then gets the same routing (and MITM interception of hardcoded endpoints) without going through `teamclaude run`. The trade-off: `run`'s proxy-up/down guard only applies when you launch via `run`, so start the server before the multiplexer.
 
@@ -150,8 +154,14 @@ teamclaude disable <name>    # Temporarily exclude an account from rotation
 teamclaude enable <name>     # Re-enable it (also clears a stuck error state)
 teamclaude priority <name> 1 # Set rotation priority (lower = preferred)
 teamclaude route list        # Manage per-model routes (add/rm)
+teamclaude threshold 90      # Utilization at which rotation leaves an account
+teamclaude distribute on     # Spread new sessions across equal-priority accounts
 teamclaude probe 300         # Enable background quota refresh (off by default)
 teamclaude warmup 600        # Enable keep-warm (off by default, spends quota)
+teamclaude warmup reset 15:30 --timezone Europe/Moscow
+                             # Schedule warm-up for a daily target reset
+teamclaude warmup rolling 15:30 --timezone Europe/Moscow
+                             # Anchor resets at 15:30, then continue every 5h
 teamclaude api <path>        # Call an API endpoint with account credentials
 teamclaude update            # Check npm for a newer teamclaude and install it
 teamclaude version           # Print the installed version
@@ -163,6 +173,23 @@ teamclaude help              # Show all commands
 `teamclaude attach` opens the dashboard itself against a server that is already running, which is how you get interactive control back when the proxy runs as a background service. It polls the same status endpoint every second and can do the two things the control plane exposes: `s` switches account, `R` reloads config. Settings editing, quota probing and the request activity stream stay in the server's own TUI — they need state that only that process has. When contact with the server drops, the header marker turns from `▲` to `▼` and what is on screen is the last snapshot, not the current state.
 
 ![teamclaude status output](assets/status-redacted.png)
+
+## Status dashboard (browser)
+
+`GET /teamclaude/dashboard` serves a self-contained HTML page rendering the same data as `teamclaude status`: per-account quota bars (session and weekly, plus one bar per model-scoped weekly bucket upstream reports), rotation state, and active sessions — refreshed every few seconds.
+
+With `proxy.usageDimensions` configured, each dimension gets its own sortable table. With `proxy.sessionDetail` on, a per-session table shows each session's client, project, serving accounts, and what it actually spent per weekly bucket — cache reads and cache creation included — filterable by project or client. That table is off by default; see [Configuration](configuration.md#usage-dimensions).
+
+A **Routing** table above the accounts shows, for Fable, Sonnet, and any configured route, which account rotation would pick for a new request of that family and how many accounts could serve it — the ones that cannot are struck through, which is the reason the family is elsewhere. A pinned route names its pin, and says so when the pin is not eligible right now. The last row is everything without a route of its own; it names the server's `defaultTarget`, which is the current account unless that account is blocked or outranked, in which case the row says why. Targets are the server's own answers (`routes[].target` and `defaultTarget` in `/teamclaude/status`), not something the page derives from the quota bars; they describe a fresh request, not one a running session has already pinned elsewhere.
+
+Each account card has a **switch** button that makes that account the current one (the same `POST /teamclaude/switch` the CLI uses). It is a nudge, not a pin: normal rotation resumes from there. What happens to sessions already running depends on `distributeSessions` — with it on, a session pinned to another account keeps it until it goes idle, so the badge moves before the traffic does; with it off (the default), every session follows the switch on its next request. The page reports whether rotation will actually use the target: a disabled, errored, rate-limited, or over-threshold account — or one outranked by a higher-priority account — is still switched to, but the page says so and why rather than reporting a bare "done".
+
+
+```
+http://localhost:3456/teamclaude/dashboard
+```
+
+The page is a static asset and loads without a key; the data does not — its script fetches `/teamclaude/status` with the proxy key, which it asks for once and keeps in the browser's localStorage (a 401 after a key rotation brings the prompt back). Loopback browsers are key-exempt as everywhere else. On deployments that put the proxy behind TLS this works remotely too: `https://your-proxy.example.com/teamclaude/dashboard`.
 
 ## Auto-update
 

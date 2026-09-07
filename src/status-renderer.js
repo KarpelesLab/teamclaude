@@ -1,4 +1,6 @@
-import { findFamilyBlock, modelGlobOverlaps, resolveMaxUsage } from './model.js';
+import { formatMoney } from './oauth.js';
+import { findFamilyBlock, modelGlobOverlaps, gatingUtilization, resolveMaxUsage } from './model.js';
+import { safeLine } from './safe-text.js';
 
 const ESC = '\x1b[';
 const RESET = `${ESC}0m`;
@@ -44,6 +46,8 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
     if (routing) lines.push(`  ${routing}`);
     const why = unavailableLine(account, paint);
     if (why) lines.push(`  ${why}`);
+    const spend = spendLine(account, paint);
+    if (spend) lines.push(`  ${spend}`);
     lines.push(`  ${paint.dim('Usage'.padEnd(8))} ${formatUsage(account.usage, now)}`);
     lines.push(`  ${paint.dim('Probe'.padEnd(8))} ${formatAccountProbe(account.name, probe, now, paint)}`);
     lines.push('');
@@ -54,24 +58,44 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
   const clients = Object.entries(status.clients || {});
   if (clients.length) {
     lines.push(paint.bold('Clients'));
-    clients.sort(([, a], [, b]) => ((b.inputTokens || 0) + (b.outputTokens || 0)) - ((a.inputTokens || 0) + (a.outputTokens || 0)));
-    for (const [name, c] of clients) {
-      const tokens = `${formatNumber(c.inputTokens)} in / ${formatNumber(c.outputTokens)} out`;
-      const last = parseTs(c.lastUsed);
-      const lastText = last ? `, last ${formatAgo(last, now)}` : '';
-      lines.push(`  ${paint.cyan(safeLine(name).padEnd(20))} ${c.requests || 0} req, ${tokens}${lastText}`);
-    }
+    renderUsageEntries(lines, clients, paint, now);
+    lines.push('');
+  }
+
+  // One section per configured usage dimension (proxy.usageDimensions). The
+  // dimension list is operator config and each tracker is key-capped, so the
+  // size of this output is bounded by the config file, not by caller traffic.
+  for (const [dimension, entries] of Object.entries(status.usageDimensions || {})) {
+    const rows = Object.entries(entries || {});
+    if (!rows.length) continue;
+    lines.push(paint.bold(usageDimensionTitle(dimension)));
+    renderUsageEntries(lines, rows, paint, now);
     lines.push('');
   }
 
   return lines.join('\n').trimEnd();
 }
 
+function renderUsageEntries(lines, entries, paint, now) {
+  entries.sort(([, a], [, b]) => ((b.inputTokens || 0) + (b.outputTokens || 0)) - ((a.inputTokens || 0) + (a.outputTokens || 0)));
+  for (const [name, c] of entries) {
+    const tokens = `${formatNumber(c.inputTokens)} in / ${formatNumber(c.outputTokens)} out`;
+    const last = parseTs(c.lastUsed);
+    const lastText = last ? `, last ${formatAgo(last, now)}` : '';
+    lines.push(`  ${paint.cyan(safeLine(name).padEnd(20))} ${c.requests || 0} req, ${tokens}${lastText}`);
+  }
+}
+
+function usageDimensionTitle(name) {
+  const safe = safeLine(name);
+  return `${safe.charAt(0).toUpperCase()}${safe.slice(1)} usage`;
+}
+
 // Why an account is out of rotation, in the operator's terms. Reading
 // `unifiedStatus: allowed` next to an account that refuses everything used to
 // leave no way to tell whether the refusal was upstream's or the proxy's own
 // threshold policy (#166); this says which.
-const UNAVAILABLE_TEXT = {
+export const UNAVAILABLE_TEXT = {
   disabled: 'disabled by operator',
   throttled: 'upstream 429 hold',
   exhausted: 'marked exhausted',
@@ -80,10 +104,45 @@ const UNAVAILABLE_TEXT = {
   quota: 'local switch threshold reached',
   capped: 'account usage cap reached (maxUsage)',
   'advisor-capped': "advisor model's usage cap reached (maxUsage)",
+  entitlement: 'upstream refused this account for the organization (cooldown)',
   route: 'no route allows this account',
   'advisor-quota': "advisor model's weekly bucket spent",
   'advisor-route': 'no route allows the advisor model',
 };
+
+/**
+ * The paid-overage warning line, or null when this account cannot bill and
+ * never has. Rendered separately from the quota bars on purpose: those all
+ * measure a plan allowance that simply runs out, while this one says that
+ * running out is billable here. An operator scanning the bars has no other way
+ * to see that rotation onto this account spends money rather than quota.
+ *
+ * Shown whenever billing is possible OR anything has already been billed — an
+ * account that spent this month and has since been switched off is still a
+ * fact about where the money went.
+ */
+export function spendLine(account, paint) {
+  const spend = account?.quota?.spend;
+  if (!spend) return null;
+  const spent = (spend.usedMinor || 0) > 0;
+  if (!spend.enabled && !spent) return null;
+
+  const amount = formatMoney(spend);
+  if (spend.enabled) {
+    // Already billing is the louder of the two: red, and named as money rather
+    // than as a percentage, so it cannot be mistaken for another quota bar.
+    const text = spent
+      ? `billing real money — ${amount} used this month`
+      : `can bill real money past its plan limits — ${amount} used`;
+    return `${paint.dim('Spend'.padEnd(8))} ${(spent ? paint.red : paint.yellow)(`\u26a0 ${text}`)}`;
+  }
+  // Not enabled, but money was spent this month. Say why it is off now, since
+  // "out_of_credits" and "the member turned it off" have different futures.
+  const why = spend.userDisabled ? 'now disabled by the account holder'
+    : spend.disabledReason ? `now off (${spend.disabledReason})`
+    : 'now off';
+  return `${paint.dim('Spend'.padEnd(8))} ${paint.yellow(`${amount} spent this month, ${why}`)}`;
+}
 
 export function unavailableLine(account, paint) {
   const reason = account?.unavailable;
@@ -198,9 +257,15 @@ function formatAccountStatus(account, now, paint) {
 // specific models" view. Only rendered for accounts that meter a family
 // separately (a Sonnet or Fable weekly bucket), since that is the only case
 // where a request's model changes where it can route. A family reads ✗ when the
-// shared 5h bucket is spent (blocks everything) or when its own weekly bucket is
-// over the switch threshold; the reset is shown when the family bucket is the
-// blocker so it's clear when that model becomes available on this account again.
+// shared 5h bucket is spent (blocks everything) or when the utilization that
+// GATES it is over the switch threshold, which is the higher of its own weekly
+// bucket and the shared weekly one, since family spend meters into both.
+//
+// That gating value comes from `gatingUtilization`, the same function the router
+// gates on, rather than being recomputed here: this row DISPLAYS a routing
+// decision, so a second derivation of it is a copy that drifts. Reading the
+// family bucket alone printed `Fable ✓` on an account the router had already
+// refused, in one render.
 function modelRoutingLine(account, threshold, blocked, now, paint) {
   const q = account.quota || {};
   if (q.unified7dSonnet == null && q.unified7dFable == null) return null;
@@ -219,23 +284,60 @@ function modelRoutingLine(account, threshold, blocked, now, paint) {
   const sharedOver = overThreshold(q.unified5h) || overCap(q.unified5h, 'unified5h')
     || overCap(q.unified7d, 'unified7d');
 
-  const cell = (label, weekly, reset, bucket) => {
+  const cell = (label, bucketKey, reset) => {
     // The blocklist outranks quota: a blocked family cannot be served however
     // much headroom the account has, so it must not read ✓. Reporting quota
     // alone is what made a fully-blocked model look available.
     if (findFamilyBlock(blocked, label)) {
       return `${label} ${paint.red('⊘')}${paint.dim(' blocked')}`;
     }
-    const weeklyOver = overThreshold(weekly) || overCap(weekly, bucket);
+    // Two different ceilings, deliberately read from two different values —
+    // this row mirrors routing, and routing does not treat them alike:
+    //   - the THRESHOLD gates on the governing value, the max of this family's
+    //     bucket and the shared weekly (#175), which is what _governingWeekly
+    //     hands the selector;
+    //   - the CAP is compared against the family's OWN spend, because that is
+    //     what AccountManager.capExceeded does. The shared weekly's own cap is
+    //     folded into `sharedOver` instead, so a family still inherits it.
+    // Using the governing value for the cap would redden Fable because Opus
+    // spent the shared weekly, which is not a decision the router made.
+    const gating = gatingUtilization(q, bucketKey);
+    const weeklyOver = overThreshold(gating) || overCap(q[bucketKey] ?? null, bucketKey);
     const mark = sharedOver || weeklyOver ? paint.red('✗') : paint.green('✓');
-    const resetTs = parseTs(reset);
+    // The recovery time is the LATEST reset among the two WEEKLY buckets
+    // currently over the threshold, not this bucket's. The weekly half of the
+    // mark comes from a maximum, so it only clears once BOTH weekly blockers
+    // have rolled; showing the family reset beside a ✗ the shared weekly
+    // produced told an operator that a week-long block clears tomorrow. An
+    // unreported reset among the blockers means the recovery time is unknown,
+    // and a known-but-earlier one would understate it, so say nothing rather
+    // than name a time that is not when this clears.
+    //
+    // The shared 5h bucket is deliberately NOT in this set, and that is a known
+    // gap rather than an oversight. It can raise the mark through `fiveOver`
+    // while contributing no candidate reset, so an account blocked longer by 5h
+    // than by its weekly buckets still shows the weekly clearing time. Stock
+    // renders the identical line, so this is not a regression, and it is narrow:
+    // it needs the 5h reset to fall later than the blocking weekly reset, which
+    // only happens while the weekly window is within about five hours of
+    // rolling. Closing it means restructuring the cell rather than adding a
+    // third candidate, since the whole `when` clause is gated on `weeklyOver`
+    // and a 5h-only block suppresses the time entirely.
+    const over = [];
+    if (!Number.isNaN(t)) {
+      if (q[bucketKey] != null && q[bucketKey] >= t) over.push(parseTs(reset));
+      if (bucketKey !== 'unified7d' && q.unified7d != null && q.unified7d >= t) {
+        over.push(parseTs(q.unified7dReset));
+      }
+    }
+    const resetTs = over.length && over.every(Boolean) ? Math.max(...over) : null;
     const when = weeklyOver && resetTs && resetTs > now ? paint.dim(` ${formatDuration(resetTs - now)}`) : '';
     return `${label} ${mark}${when}`;
   };
 
-  const cells = [cell('Opus', q.unified7d, q.unified7dReset, 'unified7d')];
-  if (q.unified7dSonnet != null) cells.push(cell('Sonnet', q.unified7dSonnet, q.unified7dSonnetReset, 'unified7dSonnet'));
-  if (q.unified7dFable != null) cells.push(cell('Fable', q.unified7dFable, q.unified7dFableReset, 'unified7dFable'));
+  const cells = [cell('Opus', 'unified7d', q.unified7dReset)];
+  if (q.unified7dSonnet != null) cells.push(cell('Sonnet', 'unified7dSonnet', q.unified7dSonnetReset));
+  if (q.unified7dFable != null) cells.push(cell('Fable', 'unified7dFable', q.unified7dFableReset));
   return `${paint.dim('Models'.padEnd(8))} ${cells.join('   ')}`;
 }
 
@@ -313,11 +415,18 @@ function gradientColor(index, width) {
 
 function formatProbeSummary(probe, now, paint) {
   if (!probe.enabled) return paint.gray('off (passive only)');
-  const bits = [`on every ${formatDuration((probe.intervalSeconds || 0) * 1000)}`];
+  let bits;
+  if (probe.mode === 'reset') {
+    bits = [`daily ${probe.warmupTime} ${probe.timezone} → reset ${probe.resetTime}`];
+  } else if (probe.mode === 'rolling') {
+    bits = [`rolling every ${formatDuration(probe.cadenceSeconds * 1000)}, reset anchor ${probe.resetTime} ${probe.timezone}`];
+  } else {
+    bits = [`on every ${formatDuration((probe.intervalSeconds || 0) * 1000)}`];
+  }
   if (probe.running) bits.push(paint.yellow('running'));
   const last = parseTs(probe.lastRunFinishedAt);
   if (last) bits.push(`last ${formatAgo(last, now)}`);
-  const next = parseTs(probe.nextRunAt);
+  const next = parseTs(probe.nextWarmupAt || probe.nextRunAt);
   if (next && next > now) bits.push(`next ${formatDuration(next - now)}`);
   return bits.join(', ');
 }
@@ -339,10 +448,6 @@ function formatAccountProbe(accountName, probe, now, paint) {
   const duration = typeof row.durationMs === 'number' ? `, ${Math.round(row.durationMs)}ms` : '';
   const error = row.error ? `, ${safeLine(row.error)}` : '';
   return `${status}${when}${duration}${error}`;
-}
-
-function safeLine(value) {
-  return String(value).replace(/\x1b\[[0-?]*[ -/]*[@-~]|\p{C}/gu, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
 }
 
 function formatUsage(usage = {}, now) {

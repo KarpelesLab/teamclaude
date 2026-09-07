@@ -3,6 +3,7 @@ import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { resolveUpstreamProxy, setUpstreamProxy } from './upstream-proxy.js';
+import { ensureAccountIds } from './account-id.js';
 
 export function getConfigPath() {
   if (process.env.TEAMCLAUDE_CONFIG) return process.env.TEAMCLAUDE_CONFIG;
@@ -69,6 +70,10 @@ export async function loadConfig() {
   const path = getConfigPath();
   try {
     const config = JSON.parse(await readFile(path, 'utf-8'));
+    // Everything downstream pairs config entries to running accounts by entry id,
+    // so a config written before the field existed — or edited by hand — is given
+    // ids here, before anything can read one. The next save persists them.
+    ensureAccountIds(config.accounts);
     applyUpstreamProxy(config);
     return config;
   } catch (err) {
@@ -105,6 +110,15 @@ export async function loadOrCreateConfig() {
     config = createDefaultConfig();
     await saveConfig(config);
     console.log(`Created config at ${getConfigPath()}`);
+    // loadConfig applies this only when a file already existed — it returns
+    // early on ENOENT. Without it here, the FIRST run of a network command
+    // (`login` on a fresh install) leaves the process-wide setting unset, and
+    // the lazy fallback resolves it from the environment against an EMPTY
+    // config. That fallback has no listener to compare against, so the
+    // self-proxy guard cannot fire: an operator whose HTTPS_PROXY points at
+    // their own TeamClaude gets a CONNECT back into the proxy and a timeout,
+    // on the one run where there is no config to explain it.
+    applyUpstreamProxy(config);
   }
   return config;
 }

@@ -41,12 +41,15 @@ Volatile runtime state (observed quota) is written separately to `teamclaude.sta
 | `proxy.host` | Interface to bind. Defaults to `127.0.0.1` (localhost only). Set to `0.0.0.0` (or override with env `TEAMCLAUDE_HOST`) to accept off-box clients — in which case **set `proxy.apiKey`**, since remote clients must present it (via `x-api-key`, or `Proxy-Authorization` for CONNECT/HTTPS-proxy usage); loopback is always exempt |
 | `proxy.apiKey` | API key clients use to authenticate with the proxy (required for any non-loopback client; the proxy injects real account tokens, so an unauthenticated open port would leak them) |
 | `proxy.clientKeys` | Optional per-client keys: `[{ "name": "alice", "key": "tc-…" }, …]`. Each entry authenticates exactly like `proxy.apiKey`, and the tokens its responses report are booked against `name` — per-client usage shows up under `clients` in `/teamclaude/status`, in `teamclaude status`, and (with `--activity-log`) as a `[name]` prefix on each request line. Counters persist in the state file. Traffic on the shared `proxy.apiKey` or the loopback exemption stays unattributed, so give every consumer their own entry when you want complete stats. Edits apply live via `POST /teamclaude/reload` |
+| `proxy.usageDimensions` | Optional request-header usage dimensions: `[{ "name": "project", "header": "x-teamclaude-project" }, …]`. For each request the proxy reads the configured headers and books the response tokens against their sanitized values, shown under `usageDimensions` in `/teamclaude/status`, `teamclaude status`, and the dashboard. A request that omits a header is simply unattributed for that dimension. Counters persist in the state file, and each dimension is capped at 500 distinct values — further values are summed into `(other)` rather than evicting existing rows. Edits apply live via `POST /teamclaude/reload` |
+| `proxy.sessionDetail` | Adds a per-session breakdown (`sessions.items`) to `/teamclaude/status` and the dashboard: one row per session with its id, client, dimension values, pinned accounts, and the tokens it spent per weekly bucket. **Off by default** — any holder of any proxy key can read status, so on a shared proxy this shows every consumer what every other consumer is working on. The aggregate `sessions` counts are unaffected and always present |
 | `upstream` | Upstream API base URL |
-| `switchThreshold` | Quota utilization (0–1) at which to switch accounts (TUI settings screen: **Switch threshold**). The screen accepts tenths of a percent, e.g. `99.5`, which is stored as `0.995`. Reported OAuth utilization arrives on a whole-percent grid, so a fraction only changes the outcome for an API-key account, whose used share is continuous |
+| `switchThreshold` | Quota utilization (0–1) at which to switch accounts (`teamclaude threshold <1-100>`, or the TUI settings screen: **Switch threshold**). The screen accepts tenths of a percent, e.g. `99.5`, which is stored as `0.995`. Reported OAuth utilization arrives on a whole-percent grid, so a fraction only changes the outcome for an API-key account, whose used share is continuous |
 | `quotaProbeSeconds` | Background [quota-probe](quota.md#quota-probe) interval in seconds (`0` = off, the default; CLI `probe`, or the **Quota probe** row on the TUI settings screen) |
 | `warmupSeconds` | [Keep-warm](quota.md#keep-warm) interval in seconds (`0` = off, the default; CLI `warmup`). Spawns a minimal `claude` per idle account to start its 5h timer — **spends a little quota**, unlike the probe |
+| `warmupSchedule` | Optional reset-target keep-warm schedule. Daily mode stores `{ "resetTime": "15:30", "timezone": "Europe/Moscow" }`; rolling mode also stores `"mode": "rolling"` and an absolute `"anchorResetAt"`. The timezone must be an IANA name. Mutually exclusive with `warmupSeconds`; set with `teamclaude warmup reset HH:MM --timezone Area/City` or `teamclaude warmup rolling HH:MM --timezone Area/City` |
 | `holdSeconds` | Maximum seconds to [hold the connection](quota.md#hold-on-exhaustion) when all accounts are exhausted, polling silently until one recovers (`0` = return 429 immediately, the default). `teamclaude run` raises `API_TIMEOUT_MS` automatically to match |
-| `distributeSessions` | Spread concurrent Claude Code sessions across equal-priority accounts, each session pinned for cache reuse — one pin per weekly quota bucket, so a diversion in one model family leaves the others where they are (`false` = quota-driven rotation only, the default). Applied live on config reload; turning it **off** drains — sessions already running keep their accounts and only new ones stop being distributed, so nobody loses a prompt cache mid-session. Session tracking and readout is always on regardless — see [Session-aware routing](routing.md#session-aware-routing) |
+| `distributeSessions` | Spread concurrent Claude Code sessions across equal-priority accounts, each session pinned for cache reuse (`teamclaude distribute <on\|off>`) — one pin per weekly quota bucket, so a diversion in one model family leaves the others where they are (`false` = quota-driven rotation only, the default). Applied live on config reload; turning it **off** drains — sessions already running keep their accounts and only new ones stop being distributed, so nobody loses a prompt cache mid-session. Session tracking and readout is always on regardless — see [Session-aware routing](routing.md#session-aware-routing) |
 | `eventLogging` | How to handle Claude Code's telemetry (`/api/event_logging/*`), which is high-volume activity-log noise: `hide` (default) forwards it but keeps it out of the activity log; `block` answers `200` locally without forwarding (no upstream round-trip); `show` forwards and displays it |
 | `logDir` | Directory for request/response logs, one file per logged request (CLI: `--log-to DIR`). Unset (the default) writes nothing. The directory is created `0700` and each file `0600` (an existing directory or file keeps its mode); a directory that cannot be created is reported once at startup and logging is switched off for that run. The logged request body is the one sent upstream, so a rewrite by the proxy (tool-pair sanitising, `modelMap`) is visible. A 429 leaves no file at all, whether it rotates to another account, waits inline, or is returned to the client; an auth failure leaves none for the attempts it retries. Left unbounded it grows fast — a week of a few concurrent sessions measured 13 GB across 24,516 files, because a logged request records both bodies in full. Of the three keys below, `logMaxBodyBytes` and `logRetentionHours` are the bounds and are on by default; `logLevel` trades detail for size |
 | `logLevel` | How much of each request `logDir` records: `body` (default) writes the headers and both bodies; `headers` writes only the request and response heads, roughly a kilobyte per request instead of megabytes; `off` records nothing while leaving `logDir` set |
@@ -55,10 +58,12 @@ Volatile runtime state (observed quota) is written separately to `teamclaude.sta
 | `blockedModels` | Array of model glob patterns (e.g. `["*fable*"]`) whose requests are rejected with a fast, non-retryable `400` instead of being forwarded — avoids a model no account can serve getting rate-limited upstream and hanging the pipeline. Empty (the default) blocks nothing |
 | `sessionTitles` | [Session titles in the activity log](usage.md#session-titles-in-the-activity-log) (off by default). Object: `{ enabled, width, projectsDir }` — name each activity row after the Claude Code session that sent it, instead of showing six hex characters of its id. `width` is the columns the label gets (default 18; while enabled every row pays it, so the columns after it stay aligned). `projectsDir` overrides `~/.claude/projects`. Display only: no selection code reads it. Toggled from the settings screen (**g** → Session titles); every field is applied live on config reload |
 | `stormRamp` | Optional [storm-control](routing.md#storm-control) tuning (on by default). Object: `{ enabled, startConc, stepConc, stepMs, windowMs }` |
+| `expiryRouting` | Optional [expiry-pressure routing](routing.md#expiry-pressure-routing) (off by default). Object: `{ enabled, tolerance, preempt }` — prefer accounts whose governing weekly quota is ample and resets soonest. **The key name is provisional** — see [#176](https://github.com/KarpelesLab/teamclaude/issues/176) |
 | `routes` | Optional list of [routing rules](routing.md#model-routes) that pin model patterns to specific accounts |
 | `autoUpdate` | Set to `false` to disable the background [self-update](usage.md#auto-update) check |
 | `upstreamProxy` | Outbound HTTP proxy for **everything TeamClaude sends to Anthropic** — request forwarding, OAuth login, token refresh, profile and usage. `"http://user:pass@host:3128"`, or just `"host:3128"`. `false` disables it *and* ignores the environment. Unset = use `HTTPS_PROXY`/`ALL_PROXY` if present. A value addressing TeamClaude's own listener is ignored (it would proxy the server through itself). TUI settings screen: **Upstream proxy**. See [Upstream proxy](proxy-modes.md#upstream-proxy) |
 | `noProxy` | Comma-separated hosts that bypass `upstreamProxy` (suffix match, `*` = all). Defaults to `NO_PROXY` from the environment |
+| `mitm.http1Only` | Offer only HTTP/1.1 on the intercepted MITM connection (default `false`). Needed for **Remote Control from the Claude Code Desktop app**: a WebSocket over HTTP/2 requires RFC 8441 extended CONNECT, which is not relayed, so a client negotiating h2 has its handshake dropped with no error — the session syncs one way and messages from the phone are never delivered ([#164](https://github.com/KarpelesLab/teamclaude/issues/164)). Costs client→proxy multiplexing on a loopback hop; upstream is already pooled HTTP/1.1 |
 | `sx.apiKey` | [sx.org](https://sx.org) API key. When set, TeamClaude auto-provisions a residential proxy (egress-IP 429 workaround). Absent/empty = off — see [sx.org proxy mode](proxy-modes.md#sxorg-proxy-mode) |
 | `sx.mode` | `always` (route all upstream traffic), `429` (direct, fail over to the proxy after a 429), or `off` (keep the key but don't use it). Defaults to `always` when a key is set |
 | `accounts[].accountUuid` | Anthropic account (person) id; set automatically from the OAuth profile |
@@ -68,6 +73,7 @@ Volatile runtime state (observed quota) is written separately to `teamclaude.sta
 | `accounts[].disabled` | If `true`, the account is excluded from rotation until re-enabled |
 | `accounts[].upstream` | Alternative upstream base URL for this account (e.g. `https://api.deepseek.com/anthropic`). Overrides the global `upstream` for this account only — see [third-party backends](accounts.md#third-party-backend-accounts) |
 | `accounts[].modelMap` | Object mapping Anthropic model names to this backend's model names (e.g. `{"claude-sonnet-4-6": "deepseek-v4-pro[1m]"}`). Applied automatically when requests are routed to this account |
+| `accounts[].stripRequestFields` | Array of **top-level** request-body fields to drop before forwarding to this account. For third-party upstreams that implement the Anthropic message API but reject fields Claude Code sends (e.g. `["context_management"]`, which some return a `400 Extra inputs are not permitted` for — breaking every request once that account is selected). Applies to this account only; Anthropic accounts are untouched |
 | `accounts[].models` | **Deprecated** — use a [`routes`](routing.md#model-routes) entry with `match` and `accounts` instead. Array of model names this account exclusively handles; kept for backward compatibility with pre-routes configs |
 
 ## Environment variables
@@ -84,6 +90,49 @@ Volatile runtime state (observed quota) is written separately to `teamclaude.sta
 ```bash
 TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 ```
+
+## Usage Dimensions
+
+Usage dimensions answer which project, branch, pull request, or CI job spent the tokens, without a TeamClaude change for every new grouping. `proxy.clientKeys` names WHO spent them; a dimension names what they were spent ON, which one shared CI key cannot express on its own.
+
+Configure the dimensions once on the proxy:
+
+```json
+{
+  "proxy": {
+    "usageDimensions": [
+      { "name": "project", "header": "x-teamclaude-project" },
+      { "name": "ref", "header": "x-teamclaude-ref" }
+    ]
+  }
+}
+```
+
+Developers set a project identity per repository in `.claude/settings.json`:
+
+```json
+{
+  "env": {
+    "ANTHROPIC_CUSTOM_HEADERS": "X-Teamclaude-Project: KarpelesLab/teamclaude"
+  }
+}
+```
+
+CI can set several dimensions with newline-separated custom headers:
+
+```bash
+export ANTHROPIC_CUSTOM_HEADERS=$'X-Teamclaude-Project: KarpelesLab/teamclaude\nX-Teamclaude-Ref: pull/123'
+```
+
+Use stable, low-cardinality values such as `org/repo`, `pull/123`, or a branch name — a dimension is capped at 500 distinct values, and everything past the cap is summed into an `(other)` row. Header values are client-supplied: they are sanitized on ingest and length-capped before they reach any status output.
+
+A configured dimension header is **consumed by the proxy and not forwarded upstream** — it labels traffic for this proxy, so your internal project and branch names stay on your own infrastructure. It is still not a place for secrets: the values are persisted to the state file and readable by any proxy-key holder.
+
+Header names the proxy refuses to use as a dimension, because it or the client already relies on them: `authorization`, `proxy-authorization`, `cookie`, `x-api-key`, `x-app`, `x-claude-code-session-id`, `x-claude-code-agent-id`, `x-claude-code-parent-agent-id`, `x-anthropic-additional-protection`.
+
+### Per-session cost
+
+Per-session token cost is **not** a usage dimension. The session tracker already meters what each session's responses reported — cache reads and cache creation included — per weekly bucket, and that is the number that matters: a sum of `input_tokens` and `output_tokens` understates a cached Claude Code session by orders of magnitude. Set `proxy.sessionDetail` to surface it per session.
 
 ## Network resilience
 

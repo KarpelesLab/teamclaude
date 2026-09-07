@@ -5,12 +5,22 @@
     "clientKeys": [
       { "name": "alice", "key": "tc-alice-own-secret" },
       { "name": "bob", "key": "tc-bob-own-secret" }
-    ]
+    ],
+    "usageDimensions": [
+      { "name": "project", "header": "x-teamclaude-project" },
+      { "name": "ref", "header": "x-teamclaude-ref" }
+    ],
+    "sessionDetail": false
   },
   "upstream": "https://api.anthropic.com",
   "switchThreshold": 0.98,
   "quotaProbeSeconds": 0,
   "autoUpdate": true,
+  "expiryRouting": {
+    "enabled": false,
+    "tolerance": 1.5,
+    "preempt": true
+  },
   "accounts": [
     {
       "name": "primary-max",
@@ -26,6 +36,12 @@
       "priority": 0,
       "accessToken": "sk-ant-oat01-your-access-token",
       "refreshToken": "sk-ant-ort01-your-refresh-token"
+    },
+    {
+      "name": "codex@example.com",
+      "type": "oauth",
+      "provider": "codex",
+      "priority": 0
     },
     {
       "name": "api-fallback",

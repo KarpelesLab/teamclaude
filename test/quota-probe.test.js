@@ -191,10 +191,7 @@ test('a failed probe is not evidence', () => {
 test('a probe that reports the family still spent keeps it spent', () => {
   const am = new AccountManager([oauth('a')], 0.98);
   const q = sealFable(am);
-  // Relative, not absolute: a pinned calendar date silently turns this test into
-  // a time bomb — once it passes, _clearExpiredQuotas drops the reading it is
-  // asserting about and the failure looks like a routing regression.
-  const at = Date.now() + 24 * 3600_000;
+  const at = Math.floor((Date.now() + 48 * 3600_000) / 1000) * 1000;
   am.applyUsageData(0, normalizeUsagePayload({ limits: [
     { kind: 'weekly_scoped', group: 'weekly', percent: 99, resets_at: new Date(at).toISOString(),
       scope: { model: { display_name: 'Fable' } } },
@@ -280,6 +277,26 @@ test('prober probes oauth accounts and applies the usage data', async () => {
   assert.equal(calls, 1);
   assert.equal(am.accounts[0].quota.unified5h, 0.1);
   assert.equal(am.accounts[0].quota.unified7d, 0.2);
+});
+
+test('prober learns missing quota tier metadata with the first quota refresh', async () => {
+  const am = new AccountManager([oauth('a')], 0.98);
+  const prober = new Prober(am, {
+    intervalMs: 0,
+    probeFn: async () => ({ sevenDay: { utilization: 0.2, resetAt: 2000 } }),
+    profileFn: async () => ({
+      organizationType: 'claude_team', rateLimitTier: 'default_raven',
+      seatTier: 'team_standard', hasClaudeMax: true, hasClaudePro: false,
+    }),
+    log: () => {},
+  });
+
+  await prober.probeAll();
+
+  assert.equal(am.accounts[0].organizationType, 'claude_team');
+  assert.equal(am.accounts[0].rateLimitTier, 'default_raven');
+  assert.equal(am.accounts[0].seatTier, 'team_standard');
+  assert.equal(am.getQuotaSummary().accounts[0].tier.weight, 1);
 });
 
 // A third-party backend account is typed `oauth` with a static token (the

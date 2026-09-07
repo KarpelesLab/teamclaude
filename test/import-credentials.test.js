@@ -15,10 +15,20 @@ test('reads nested claudeAiOauth credentials from file', async () => {
   const home = await tmpHome();
   await mkdir(join(home, '.claude'), { recursive: true });
   await writeFile(join(home, '.claude', '.credentials.json'), JSON.stringify({ claudeAiOauth: CREDS }));
+  const readKeychain = async () => { throw new Error('no keychain here'); };
 
-  const creds = await importCredentials('~/.claude/.credentials.json', { home, platform: 'darwin' });
+  const creds = await importCredentials('~/.claude/.credentials.json', { home, platform: 'darwin', readKeychain });
   assert.equal(creds.accessToken, 'at');
   assert.equal(creds.refreshToken, 'rt');
+  assert.equal('refreshTokenExpiresAt' in creds, false, 'absent in the source, absent in the result');
+});
+
+test('passes refreshTokenExpiresAt through when the source carries it', async () => {
+  const home = await tmpHome();
+  await writeFile(join(home, 'creds.json'), JSON.stringify({ ...CREDS, refreshTokenExpiresAt: 1760000000000 }));
+
+  const creds = await importCredentials(join(home, 'creds.json'), { home, platform: 'linux' });
+  assert.equal(creds.refreshTokenExpiresAt, 1760000000000);
 });
 
 test('reads flat credentials from file', async () => {
@@ -38,6 +48,62 @@ test('falls back to Keychain on macOS when default file is missing', async () =>
   assert.equal(called, 1);
   assert.equal(creds.accessToken, 'at');
   assert.equal(creds.expiresAt, CREDS.expiresAt);
+});
+
+// On macOS the Keychain is Claude Code's live store; the default file, when it
+// exists, is a snapshot from an earlier login that nothing keeps fresh.
+
+test('prefers the Keychain over a stale default file on macOS', async () => {
+  const home = await tmpHome();
+  await mkdir(join(home, '.claude'), { recursive: true });
+  await writeFile(join(home, '.claude', '.credentials.json'), JSON.stringify({
+    claudeAiOauth: { accessToken: 'stale', refreshToken: 'stale-rt', expiresAt: 1 },
+  }));
+  const readKeychain = async () => ({ claudeAiOauth: { ...CREDS, accessToken: 'fresh' } });
+
+  const creds = await importCredentials('~/.claude/.credentials.json', { home, platform: 'darwin', readKeychain });
+  assert.equal(creds.accessToken, 'fresh');
+  assert.equal(creds.expiresAt, CREDS.expiresAt);
+});
+
+test('uses the default file on macOS when the Keychain carries no token', async () => {
+  const home = await tmpHome();
+  await mkdir(join(home, '.claude'), { recursive: true });
+  await writeFile(join(home, '.claude', '.credentials.json'), JSON.stringify({ claudeAiOauth: CREDS }));
+  const readKeychain = async () => ({ claudeAiOauth: { accessToken: '', refreshToken: '' } });
+
+  const creds = await importCredentials('~/.claude/.credentials.json', { home, platform: 'darwin', readKeychain });
+  assert.equal(creds.accessToken, 'at');
+});
+
+test('uses the default file on macOS when the Keychain lookup throws', async () => {
+  const home = await tmpHome();
+  await mkdir(join(home, '.claude'), { recursive: true });
+  await writeFile(join(home, '.claude', '.credentials.json'), JSON.stringify({ claudeAiOauth: CREDS }));
+  const readKeychain = async () => { throw new Error('item not found in keychain'); };
+
+  const creds = await importCredentials('~/.claude/.credentials.json', { home, platform: 'darwin', readKeychain });
+  assert.equal(creds.accessToken, 'at');
+});
+
+test('hands back a token-less Keychain payload when the default file is missing too', async () => {
+  const home = await tmpHome();
+  const readKeychain = async () => ({ claudeAiOauth: { accessToken: '', refreshToken: '' } });
+
+  const creds = await importCredentials('~/.claude/.credentials.json', { home, platform: 'darwin', readKeychain });
+  assert.equal(creds.accessToken, '');
+});
+
+test('a non-ENOENT file error on macOS is reported as-is', async () => {
+  const home = await tmpHome();
+  await mkdir(join(home, '.claude'), { recursive: true });
+  await writeFile(join(home, '.claude', '.credentials.json'), '{not json');
+  const readKeychain = async () => { throw new Error('item not found in keychain'); };
+
+  await assert.rejects(
+    importCredentials('~/.claude/.credentials.json', { home, platform: 'darwin', readKeychain }),
+    SyntaxError,
+  );
 });
 
 test('does not touch Keychain on non-macOS platforms', async () => {

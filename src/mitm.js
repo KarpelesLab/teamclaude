@@ -21,6 +21,7 @@ import http2 from 'node:http2';
 import { getConfigPath } from './config.js';
 import { generateCertChain } from './x509.js';
 import { createProxyRequestListener, resolveClientAuth, isLoopbackAddr, relayUpgrade, resolveAccountPin, describeConnectError } from './server.js';
+import { interceptHostsFor, isNeverIntercepted } from './provider.js';
 
 const CA_CERT = 'teamclaude-ca.pem';
 const LEAF_CERT = 'teamclaude-leaf.pem';
@@ -71,7 +72,9 @@ function leafCovers(caCertPem, leafCertPem, hosts) {
  * Returns { caPath, caCertPem, leafCertPem, leafKeyPem }.
  */
 export async function ensureCerts(host) {
-  const hosts = host === TEST_HOST ? [TEST_HOST] : [host, TEST_HOST];
+  const named = Array.isArray(host) ? host : [host];
+  const hosts = [...new Set(named.filter(Boolean))];
+  if (!hosts.includes(TEST_HOST)) hosts.push(TEST_HOST);
   const [caCertPem, leafCertPem, leafKeyPem] = await Promise.all([
     readIf(fpath(CA_CERT)), readIf(fpath(LEAF_CERT)), readIf(fpath(LEAF_KEY)),
   ]);
@@ -98,10 +101,23 @@ function upstreamHostOf(config) {
   catch { return 'api.anthropic.com'; }
 }
 
+/** Every host the MITM leaf must be valid for, given this config. */
+export function mitmHosts(config) {
+  return [...new Set([upstreamHostOf(config), ...interceptHostsFor(config?.accounts || [])])];
+}
+
 /** Per-CONNECT behavior: 'rewrite' (intercept + token inject), 'test', or 'tunnel'. */
 export function hostMode(host, config) {
   if (host === TEST_HOST) return 'test';
+  // Explicitly never intercepted, even though it sits under a provider's domain
+  // — checked before anything else so no later rule can claim it.
+  if (isNeverIntercepted(host)) return 'tunnel';
   if (host === upstreamHostOf(config)) return 'rewrite';
+  // A second provider's host, and only when an account actually uses that
+  // provider. MITM is the mode that works without the client cooperating — a
+  // CLI that honours only HTTPS_PROXY has no base URL to redirect — so refusing
+  // to intercept here is the same as not supporting the provider at all.
+  if (interceptHostsFor(config?.accounts || []).includes(host)) return 'rewrite';
   return 'tunnel';
 }
 
@@ -110,7 +126,7 @@ export function hostMode(host, config) {
  * the top of this file.
  * @param ensureLeaf async () => { key, cert }   // current leaf PEMs
  */
-export function createConnectHandler({ config, accountManager, ensureLeaf, logDir = null, hooks = {}, log = () => {}, sx = null, egress = null, clientUsage = null }) {
+export function createConnectHandler({ config, accountManager, ensureLeaf, logDir = null, hooks = {}, log = () => {}, sx = null, egress = null, clientUsage = null, dimensionUsage = null }) {
   const upstream = config.upstream || 'https://api.anthropic.com';
   const holdMs = (config.holdSeconds || 0) * 1000;
 
@@ -137,13 +153,40 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
     if (p) return p;
     p = (async () => {
     const { key, cert } = await ensureLeaf();
-    const srv = http2.createSecureServer({ key, cert, allowHTTP1: true });
-    srv.on('request', createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, forcedPin: pin || null, egress, clientUsage, forcedClient: client }));
+    // ALPN. Remote Control's real-time channel is a WebSocket, and a WebSocket
+    // over HTTP/2 needs RFC 8441 extended CONNECT, which Node does not offer
+    // here — so a client that negotiates h2 has no way to open one and the
+    // handshake is dropped with no error on either side. That is exactly the
+    // reported symptom: the session syncs one way and messages from the phone
+    // stay grey forever, while the desktop still reports bridge_state:
+    // connected (#164).
+    //
+    // `mitm.http1Only` forces http/1.1 so the Upgrade reaches 'upgrade' below.
+    // The cost is client→proxy multiplexing on a loopback hop, which is not
+    // where throughput is won; upstream is already pooled HTTP/1.1 (#106).
+    const http1Only = config.mitm?.http1Only === true;
+    const srv = http2.createSecureServer({
+      key, cert, allowHTTP1: true,
+      ...(http1Only ? { ALPNProtocols: ['http/1.1'] } : {}),
+    });
+    srv.on('request', createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, forcedPin: pin || null, egress, clientUsage, forcedClient: client, dimensionUsage }));
     // Remote Control's real-time channel is a WebSocket (Upgrade handshake),
     // which never fires 'request' — only 'upgrade', with a raw socket instead
     // of a response object (h1-only; falls back to blind h2 passthrough is not
     // needed since WS clients negotiate h1 for the handshake).
     srv.on('upgrade', (req, socket, head) => relayUpgrade(req, socket, head, upstream, sx));
+    // Make the h2-WebSocket dead end audible. Without this the only evidence is
+    // a message that never arrives, which is what made #164 cost a day to
+    // isolate rather than a minute.
+    if (!http1Only) {
+      srv.on('stream', (stream, headers) => {
+        if (headers[':method'] === 'CONNECT' || headers[':protocol']) {
+          log('[TeamClaude] A client tried to open a WebSocket over HTTP/2, which this proxy cannot relay. '
+            + 'Remote Control will appear connected and silently deliver nothing. '
+            + 'Set "mitm": { "http1Only": true } in the config to force HTTP/1.1 (see #164).');
+        }
+      });
+    }
     srv.on('sessionError', (e) => log(`[TeamClaude] MITM session error: ${e.message}`));
     srv.on('clientError', (e, sock) => { try { sock.destroy(); } catch { /* already gone */ } });
     return srv;

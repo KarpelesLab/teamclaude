@@ -6,30 +6,45 @@ import { createWriteStream } from 'node:fs';
 import net from 'node:net';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, loadState, saveState } from './config.js';
 import { installCrashHandlers } from './crash-log.js';
-import { AccountManager } from './account-manager.js';
+import { AccountManager, DEFAULT_SWITCH_THRESHOLD } from './account-manager.js';
 import { createProxyServer } from './server.js';
-import { importCredentials, loginOAuth, loginOAuthWithPastedCode, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
+import {
+  DEFAULT_CREDENTIALS_PATH,
+  importCredentials,
+  loginOAuth,
+  loginOAuthWithPastedCode,
+  fetchProfile,
+  refreshAccessToken,
+  isTokenExpiringSoon,
+  needsProxyClientCredential,
+} from './oauth.js';
 import {
   sameIdentity,
   orgKey,
   matchAccounts,
   findUpsertTarget,
+  updateAccountEntry,
   canUpsertOAuthAccount,
   oauthIdentityFields,
 } from './identity.js';
 import { resolveAccounts } from './resolve-accounts.js';
+import { loginCodex } from './codex-auth.js';
 import { syncAccountsFromDisk } from './sync-accounts.js';
+import { mergeAccountsForSave, syncRefreshedTokens, removedAccountIds, clearRemovedAccountIds } from './account-pairing.js';
+import { ensureAccountIds } from './account-id.js';
 import * as alias from './alias.js';
-import { ensureCerts } from './mitm.js';
+import { ensureCerts, mitmHosts } from './mitm.js';
 import { Prober } from './prober.js';
 import { Warmer } from './warmer.js';
+import { createRollingWarmupSchedule, formatWarmupScheduleConfirmation, resolveWarmupConfig, resolveWarmupSchedule } from './warmup-schedule.js';
 import { TUI } from './tui.js';
 import { SessionTitles } from './session-titles.js';
 import { RemoteControl, createAttachSession } from './tui-remote.js';
 import { SxManager } from './sx.js';
 import { autoUpdate, checkForUpdate, currentVersion, runUpdate, installKind, PKG_NAME } from './updater.js';
-import { renderStatus } from './status-renderer.js';
-import { ClientUsageTracker } from './client-usage.js';
+import { renderStatus, formatPercent } from './status-renderer.js';
+import { sanitizeText } from './safe-text.js';
+import { ClientUsageTracker, UsageDimensionTracker } from './client-usage.js';
 import { buildClaudeEnvLines, encodePinComponent } from './claude-env.js';
 import { serviceKind, installService, uninstallService, serviceStatus, renderService, logPath } from './service.js';
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
@@ -52,8 +67,27 @@ const ROUTE_USAGE = [
 
 const ROUTE_COLORS = ['red', 'green', 'yellow', 'blue', 'magenta', 'cyan'];
 
+const THRESHOLD_USAGE = [
+  'Usage: teamclaude threshold                 (show the current thresholds)',
+  '       teamclaude threshold <1-100>         (one number for every bucket)',
+  '       teamclaude threshold <bucket>=<1-100> [...]',
+  '       teamclaude threshold <bucket>=default (drop that bucket)',
+  '',
+  'The utilization at which rotation stops sending work to an account. Tenths of',
+  'a percent are kept, as on the TUI settings screen. Changes apply to a running',
+  'server immediately.',
+].join('\n');
+
+// The buckets a threshold can be keyed by: the quota windows the manager asks
+// thresholdFor() about. An unknown key would be accepted by the config and then
+// never consulted, so the CLI refuses it rather than storing a typo.
+const QUOTA_BUCKETS = ['unified5h', 'unified7d', 'unified7dSonnet', 'unified7dFable', 'tokens', 'requests'];
+
+const DISTRIBUTE_USAGE = 'Usage: teamclaude distribute <on|off>';
+
 const args = process.argv.slice(2);
 const command = args[0];
+const LOCAL_PROXY_API_KEY = 'teamclaude-local';
 
 switch (command) {
   case 'server':
@@ -124,6 +158,14 @@ switch (command) {
     break;
   case 'warmup':
     await warmupCommand();
+    process.exit(0);
+    break;
+  case 'threshold':
+    await thresholdCommand();
+    process.exit(0);
+    break;
+  case 'distribute':
+    await distributeCommand();
     process.exit(0);
     break;
   case 'route':
@@ -205,7 +247,7 @@ async function serverCommand() {
   }
 
   const threshold = config.switchThreshold || 0.98;
-  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp, distributeSessions: config.distributeSessions });
+  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp, distributeSessions: config.distributeSessions, expiryRouting: config.expiryRouting });
   // Names the activity log's session column from Claude Code's own on-disk
   // session titles. Built whether or not the TUI runs, so a reload has one
   // object to reconfigure.
@@ -224,6 +266,8 @@ async function serverCommand() {
   // per-client counters survive a restart the same way rotation state does.
   const clientUsage = new ClientUsageTracker();
   if (savedState?.clients) clientUsage.restore(savedState.clients);
+  const dimensionUsage = new UsageDimensionTracker();
+  if (savedState?.usageDimensions) dimensionUsage.restore(savedState.usageDimensions);
 
   // With quota restored, pick the best account up front (highest priority /
   // soonest-resetting weekly window) instead of defaulting to the first one.
@@ -231,7 +275,7 @@ async function serverCommand() {
 
   // Periodically persist quota (and once more on shutdown) to the state file.
   const persistQuotaState = () =>
-    saveState({ quota: accountManager.exportQuotaState(), clients: clientUsage.export() })
+    saveState({ quota: accountManager.exportQuotaState(), clients: clientUsage.export(), usageDimensions: dimensionUsage.export() })
       .catch(err => console.error(`[TeamClaude] Failed to save quota state: ${err.message}`));
   let quotaSaveInterval = null;
 
@@ -240,19 +284,22 @@ async function serverCommand() {
   accountManager.onTokenRefresh((idx, newTokens) => {
     const account = accountManager.accounts[idx];
     if (!account) return;
-    // Keep config.accounts in sync so TUI saveConfig doesn't clobber fresh tokens
-    if (config.accounts[idx]) {
-      config.accounts[idx].accessToken = newTokens.accessToken;
-      config.accounts[idx].refreshToken = newTokens.refreshToken;
-      config.accounts[idx].expiresAt = newTokens.expiresAt;
-    }
+    // Keep config.accounts in sync so the TUI save does not clobber fresh tokens.
+    // A -1 means no config entry pairs with this account and the in-memory copy
+    // keeps what it had; the disk write below is unaffected either way, since it
+    // resolves its own row through findConfigAccount rather than this pairing.
+    syncRefreshedTokens(config.accounts, accountManager.accounts, idx, newTokens);
     atomicConfigUpdate(diskConfig => {
-      // Pick up any new accounts from disk so index matching stays correct
+      // Pick up any new accounts from disk so the running fleet serves them
       // (only add, don't refresh credentials — we're about to write the authoritative tokens)
       for (const diskAcct of diskConfig.accounts) {
         const known = config.accounts.some(a => sameIdentity(a, diskAcct));
         if (!known) {
+          // Same object into both lists, so the account carries its entry's id;
+          // ensureAccountIds first, in case the entry brought in one this list
+          // already uses. See the matching add in sync-accounts.js.
           config.accounts.push(diskAcct);
+          ensureAccountIds(config.accounts);
           accountManager.addAccount(diskAcct);
         }
       }
@@ -276,7 +323,7 @@ async function serverCommand() {
 
   // Opt-in background quota probe (config.quotaProbeSeconds, default 0 = off).
   let prober = null;
-  // Opt-in keep-warm scheduler (config.warmupSeconds, default 0 = off).
+  // Opt-in keep-warm scheduler (interval or persisted reset-target schedule).
   let warmer = null;
   const serverStartedAt = Date.now();
 
@@ -303,6 +350,10 @@ async function serverCommand() {
     // key add/rotate/revoke needs — no restart).
     if (config.proxy && diskConfig.proxy) {
       config.proxy.clientKeys = diskConfig.proxy.clientKeys;
+      // Dimensions are resolved per request from this same object, so a
+      // reload adds or drops one without a restart.
+      config.proxy.usageDimensions = diskConfig.proxy.usageDimensions;
+      config.proxy.sessionDetail = diskConfig.proxy.sessionDetail;
       // The shared key is read per request too, so a rotated key on disk
       // takes effect on reload the same way.
       config.proxy.apiKey = diskConfig.proxy.apiKey;
@@ -314,6 +365,17 @@ async function serverCommand() {
     // way routes, sx, probe and warmup are picked up below.
     config.distributeSessions = !!diskConfig.distributeSessions;
     accountManager.setDistributeSessions(config.distributeSessions);
+    // Pick up a switchThreshold change the same way (teamclaude threshold, the
+    // TUI settings screen, or a hand edit). thresholdFor() reads it off the
+    // manager on every decision, so assigning it is the whole application —
+    // and without this a change from outside the TUI waited for a restart.
+    if (diskConfig.switchThreshold != null) {
+      config.switchThreshold = diskConfig.switchThreshold;
+      accountManager.switchThreshold = diskConfig.switchThreshold;
+    }
+    // Pick up expiry-routing edits the same way, so the knob hot-applies.
+    config.expiryRouting = diskConfig.expiryRouting;
+    accountManager.setExpiryRouting(config.expiryRouting);
     config.sessionTitles = diskConfig.sessionTitles;
     sessionTitles.configure(config.sessionTitles);
     // Apply an sx.org key/mode change made on disk (e.g. via POST /teamclaude/reload).
@@ -332,10 +394,18 @@ async function serverCommand() {
       }
     }
     if (warmer) {
+      const diskSchedule = diskConfig.warmupSchedule || null;
       const ms = (diskConfig.warmupSeconds || 0) * 1000;
-      if (ms !== warmer.intervalMs) {
-        config.warmupSeconds = diskConfig.warmupSeconds || 0;
+      if (diskSchedule) {
+        // Validate and arm before publishing the disk value to live readers. A
+        // bad hand edit leaves the prior schedule intact and makes reload fail.
+        warmer.rescheduleSchedule(diskSchedule);
+        config.warmupSchedule = diskSchedule;
+        config.warmupSeconds = 0;
+      } else if (config.warmupSchedule || ms !== warmer.intervalMs) {
         warmer.reschedule(ms);
+        delete config.warmupSchedule;
+        config.warmupSeconds = diskConfig.warmupSeconds || 0;
       }
     }
     return added;
@@ -348,20 +418,13 @@ async function serverCommand() {
     tui = new TUI({
       accountManager, config, sx, activityLogPath, sessionTitles,
       saveConfig: () => atomicConfigUpdate(async diskConfig => {
-        // Write in-memory accounts as the authoritative state, preserving
-        // extra disk-only fields (e.g. importFrom) where the account still exists.
-        // Use live tokens from AccountManager (not the stale config.accounts copy).
-        diskConfig.accounts = config.accounts.map((a, i) => {
-          const am = accountManager.accounts[i];
-          const live = am ? {
-            ...a,
-            accessToken: am.credential,
-            refreshToken: am.refreshToken,
-            expiresAt: am.expiresAt,
-          } : a;
-          const diskAcct = diskConfig.accounts.find(d => sameIdentity(d, a));
-          return diskAcct ? { ...diskAcct, ...live } : live;
-        });
+        diskConfig.accounts = mergeAccountsForSave(
+          config.accounts, accountManager.accounts, diskConfig.accounts, removedAccountIds(config),
+        );
+        // The written list omits them, so they are gone from disk too and there
+        // is nothing left to re-adopt. Holding the ids any longer would only
+        // refuse an account the operator re-adds later.
+        clearRemovedAccountIds(config);
         // Persist sx.org settings (set/cleared from the TUI settings screen).
         if (config.sx) diskConfig.sx = config.sx; else delete diskConfig.sx;
         // Persist other runtime-tunable settings edited from the TUI.
@@ -396,12 +459,16 @@ async function serverCommand() {
 
   // In headless mode, wire activity-log writes directly via hooks + console.
   if (!tui && activityLogPath) {
-    const aStream = createWriteStream(activityLogPath, { flags: 'a' });
+    // 0600, matching the request log and the config (see tui.js for why).
+    const aStream = createWriteStream(activityLogPath, { flags: 'a', mode: 0o600 });
     aStream.on('error', err => process.stderr.write(`[TeamClaude] activity log error: ${err.message}\n`));
     const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
     const writeActivity = msg => {
-      // Strip [TeamClaude] prefix to match TUI behaviour
-      aStream.write(`${ts()}  ${msg.replace(/^\[TeamClaude\]\s*/, '')}\n`);
+      // Strip [TeamClaude] prefix to match TUI behaviour. Sanitized because a
+      // log line is one line: a value carrying a newline would otherwise write
+      // a second entry that reads as genuine, and this file is what deployments
+      // join against to attribute traffic to a person.
+      aStream.write(`${ts()}  ${sanitizeText(msg.replace(/^\[TeamClaude\]\s*/, ''))}\n`);
     };
     // Capture request completions via the hook
     const inFlight = new Map();
@@ -442,6 +509,8 @@ async function serverCommand() {
     blockedModels: [...(config.blockedModels || [])],
     // Per-client usage (proxy.clientKeys) — empty object when unconfigured.
     clients: clientUsage.export(),
+    // Per-dimension usage (proxy.usageDimensions) — empty when unconfigured.
+    usageDimensions: dimensionUsage.export(),
     server: {
       startedAt: new Date(serverStartedAt).toISOString(),
       uptimeSeconds: Math.round((Date.now() - serverStartedAt) / 1000),
@@ -477,8 +546,9 @@ async function serverCommand() {
       })),
     },
   });
+  hooks.getQuotaExtra = () => ({ warmup: resolveWarmupConfig(config) });
 
-  const server = createProxyServer(accountManager, config, hooks, sx, clientUsage);
+  const server = createProxyServer(accountManager, config, hooks, sx, clientUsage, dimensionUsage);
   // Catch bind-time errors (e.g. EADDRINUSE) only. Once the socket is bound we
   // remove this handler so a later runtime 'error' isn't misreported as a
   // listen failure and exit the whole proxy.
@@ -536,14 +606,17 @@ async function serverCommand() {
   quotaSaveInterval.unref?.();
 
   // Start the opt-in quota probe (no-op when quotaProbeSeconds is 0).
-  prober = new Prober(accountManager, { intervalMs: (config.quotaProbeSeconds || 0) * 1000 });
+  prober = new Prober(accountManager, {
+    intervalMs: (config.quotaProbeSeconds || 0) * 1000,
+    profileFn: fetchProfile,
+  });
   prober.start();
 
-  // Start the opt-in keep-warm scheduler (no-op when warmupSeconds is 0). It
-  // spawns a minimal `claude` per idle account through this proxy, pinned via
-  // /tc-acct/<index>, so needs our own port and proxy key.
+  // Start the opt-in keep-warm scheduler. Interval mode runs relative to server
+  // startup; reset-target modes restore their next occurrence from config.
   warmer = new Warmer(accountManager, {
     intervalMs: (config.warmupSeconds || 0) * 1000,
+    schedule: config.warmupSchedule || null,
     port,
     apiKey: config.proxy?.apiKey,
   });
@@ -625,6 +698,64 @@ async function importCommand() {
 
 // ── login ───────────────────────────────────────────────────
 
+/**
+ * `teamclaude login --codex` — browser OAuth against OpenAI, then store the
+ * account.
+ *
+ * Deliberately simpler than the Anthropic path: that one calls the profile
+ * endpoint to discover identity, whereas a Codex id_token already carries the
+ * email and the ChatGPT account id, so there is nothing further to fetch.
+ */
+async function loginCodexCommand() {
+  // loadOrCreateConfig, not loadConfig: `login` is a first-run entry point and
+  // must work before any config file exists.
+  const config = await loadOrCreateConfig();
+  let creds;
+  try {
+    creds = await loginCodex({ noBrowser: args.includes('--no-browser') });
+  } catch (err) {
+    console.error(`Codex login failed: ${err.message}`);
+    console.error('');
+    console.error('Alternative: sign in with the Codex CLI and import that login instead —');
+    console.error('  CODEX_HOME=~/.codex-second codex login');
+    console.error('  then add: { "name": "...", "type": "oauth", "provider": "codex", "importFrom": "~/.codex-second/auth.json" }');
+    process.exit(1);
+  }
+
+  const name = argValue('--name') || creds.email
+    || `codex-${config.accounts.filter(a => a.provider === 'codex').length + 1}`;
+
+  const account = {
+    name,
+    type: 'oauth',
+    provider: 'codex',
+    source: 'login',
+    accountId: creds.accountId,
+    accessToken: creds.accessToken,
+    refreshToken: creds.refreshToken,
+    expiresAt: creds.expiresAt,
+  };
+
+  // Identity for a Codex account is its ChatGPT account id; fall back to the
+  // display name when upstream did not supply one.
+  const idx = config.accounts.findIndex(a => (
+    a.provider === 'codex' && (
+      (account.accountId && a.accountId === account.accountId) || a.name === account.name
+    )
+  ));
+  if (idx >= 0) {
+    const prev = config.accounts[idx];
+    config.accounts[idx] = { ...prev, ...account, name: prev.name };
+    console.log(`Updated account "${prev.name}"`);
+  } else {
+    config.accounts.push(account);
+    console.log(`Added account "${account.name}"${creds.planType ? ` (${creds.planType})` : ''}`);
+  }
+
+  await saveConfig(config);
+  console.log(`Saved to ${getConfigPath()}`);
+}
+
 async function loginCommand() {
   if (args.includes('--api')) {
     await loginApiCommand();
@@ -636,6 +767,10 @@ async function loginCommand() {
   }
   if (args.includes('--oauth')) {
     await loginOAuthCommand();
+    return;
+  }
+  if (args.includes('--codex')) {
+    await loginCodexCommand();
     return;
   }
 
@@ -650,11 +785,13 @@ async function loginCommand() {
   console.log('Select login method:\n');
   console.log('  1. Claude subscription  (Pro, Max, Team, Enterprise)');
   console.log('  2. Anthropic API key    (Console API billing)');
+  console.log('  3. Codex subscription   (ChatGPT Plus, Pro, Team)');
   console.log('');
   const choice = await new Promise(resolve => rl.question('Choice [1]: ', resolve));
   rl.close();
 
   switch (choice.trim() || '1') {
+    case '3': await loginCodexCommand(); break;
     case '1': await loginOAuthCommand(); break;
     case '2': await loginApiCommand(); break;
     default:
@@ -728,18 +865,27 @@ async function envCommand() {
   const useMitm = !args.slice(1).includes('--no-mitm');
 
   let caPath = null;
-  if (useMitm) ({ caPath } = await ensureCerts(upstreamHost(config)));
+  // The leaf has to name every host MITM will intercept, or the CONNECT for
+  // a second provider fails the handshake instead of being served.
+  if (useMitm) ({ caPath } = await ensureCerts(mitmHosts(config)));
 
   // Same pin as `teamclaude run`, so `eval "$(teamclaude env)"` and `run` agree.
   const account = (process.env.TC_ACCT || '').trim();
+  const clientApiKey = (
+    !process.env.ANTHROPIC_AUTH_TOKEN
+    && await needsLocalProxyClientCredential()
+  ) ? LOCAL_PROXY_API_KEY : null;
   const lines = buildClaudeEnvLines({
     port, useMitm, caPath, holdSeconds: config.holdSeconds,
-    account, proxyApiKey: config.proxy?.apiKey || '',
+    account, proxyApiKey: config.proxy?.apiKey || '', clientApiKey,
   });
   process.stdout.write(`${lines.join('\n')}\n`);
 
   const mode = useMitm ? 'MITM forward-proxy' : 'base-URL';
   process.stderr.write(`# TeamClaude env: ${mode} mode, localhost:${port}\n`);
+  if (clientApiKey) {
+    process.stderr.write('# local Claude OAuth unavailable; using proxy credential mode\n');
+  }
   if (account) {
     process.stderr.write(`# pinned to account "${account}" (TC_ACCT)\n`);
     // Warn, don't fail: the account list can change before the shell is used,
@@ -793,12 +939,16 @@ async function runCommand() {
   // MITM mode too, and keeps the pin out of the API path.
   const pinnedBase = isLocalAccountPin(process.env.ANTHROPIC_BASE_URL, port);
   if (await isProxyUp(port)) {
+    if (!env.ANTHROPIC_AUTH_TOKEN && await needsLocalProxyClientCredential()) {
+      delete env.ANTHROPIC_AUTH_TOKEN;
+      env.ANTHROPIC_API_KEY = LOCAL_PROXY_API_KEY;
+      console.error('[TeamClaude] Local Claude OAuth unavailable — using proxy credential mode');
+    }
     if (useMitm) {
       // Route ALL of claude's traffic through us as an HTTPS forward proxy, so
       // even hardcoded api.anthropic.com endpoints (e.g. the design MCP) get the
       // real token injected. claude trusts our MITM leaf via NODE_EXTRA_CA_CERTS.
-      const host = upstreamHost(config);
-      const { caPath } = await ensureCerts(host);
+      const { caPath } = await ensureCerts(mitmHosts(config));
       // The pin rides in the proxy URL's userinfo, which the client forwards as
       // `Proxy-Authorization: Basic <acct>:<key>` on each CONNECT — the only pin
       // channel an HTTPS_PROXY env var can express. The password slot keeps the
@@ -818,9 +968,10 @@ async function runCommand() {
       }
       delete env.ANTHROPIC_BASE_URL;
     } else {
-      // Only set ANTHROPIC_BASE_URL — Claude Code keeps its own OAuth token
-      // which the proxy accepts from localhost. Not setting ANTHROPIC_API_KEY
-      // lets Claude Code stay in subscription mode (full model access).
+      // Set ANTHROPIC_BASE_URL and preserve subscription mode while local OAuth
+      // is usable. When it is unavailable, the harmless bootstrap key above
+      // gets Claude Code past its startup auth check; the proxy replaces it
+      // with the selected account credential before forwarding.
       // TC_ACCT wins; teamclaude builds the pinned URL itself rather than making
       // the caller hand-write one. Otherwise an existing /tc-acct/ base URL
       // pointing at this proxy is preserved for configs written against 1.1.10.
@@ -875,6 +1026,17 @@ async function runCommand() {
   await autoUpdate({ config }).catch(() => {});
 
   process.exit(result.status ?? 1);
+}
+
+async function needsLocalProxyClientCredential() {
+  try {
+    return needsProxyClientCredential(await importCredentials(DEFAULT_CREDENTIALS_PATH));
+  } catch (error) {
+    if (error?.code !== 'ENOENT') {
+      console.error(`[TeamClaude] Could not read local Claude OAuth — using proxy credential mode: ${error.message}`);
+    }
+    return true;
+  }
 }
 
 // ── status ──────────────────────────────────────────────────
@@ -1068,6 +1230,9 @@ async function accountsCommand() {
       if (p.accountUuid && a.accountUuid !== p.accountUuid) { a.accountUuid = p.accountUuid; touched = true; }
       if (p.orgUuid && a.orgUuid !== p.orgUuid) { a.orgUuid = p.orgUuid; touched = true; }
       if (p.orgName && a.orgName !== p.orgName) { a.orgName = p.orgName; touched = true; }
+      for (const field of ['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro']) {
+        if (p[field] != null && a[field] !== p[field]) { a[field] = p[field]; touched = true; }
+      }
     }
     const uuid = a.accountUuid;
     if (!uuid) continue;
@@ -1292,11 +1457,47 @@ async function warmupCommand() {
   const arg = args[1];
 
   if (arg === undefined) {
+    if (config.warmupSchedule) {
+      console.log(formatWarmupScheduleConfirmation(config.warmupSchedule));
+      return;
+    }
     const cur = config.warmupSeconds || 0;
     console.log(cur > 0 ? `Keep-warm: every ${cur}s` : 'Keep-warm: off');
-    console.log('Set with: teamclaude warmup <off|seconds>   e.g. teamclaude warmup 600');
+    console.log('Set with: teamclaude warmup <off|seconds>');
+    console.log('          teamclaude warmup reset HH:MM --timezone Area/City');
+    console.log('          teamclaude warmup rolling HH:MM --timezone Area/City');
     console.log('Note: warming spawns a minimal `claude` per idle account and DOES spend a little quota');
     console.log('(unlike the passive quota probe). It only warms accounts whose 5h window is idle.');
+    return;
+  }
+
+  if (arg === 'reset' || arg === 'rolling') {
+    const resetTime = args[2];
+    const timezoneFlag = args.indexOf('--timezone', 3);
+    const timezone = timezoneFlag >= 0 ? args[timezoneFlag + 1] : null;
+    if (!resetTime || !timezone || args.length !== 5 || timezoneFlag !== 3) {
+      console.error(`Usage: teamclaude warmup ${arg} HH:MM --timezone Area/City`);
+      process.exit(1);
+    }
+    const schedule = { resetTime, timezone };
+    try {
+      if (arg === 'rolling') {
+        config.warmupSchedule = createRollingWarmupSchedule(schedule);
+      } else {
+        const resolved = resolveWarmupSchedule(schedule);
+        config.warmupSchedule = {
+          resetTime: resolved.resetTime,
+          timezone: resolved.timezone,
+        };
+      }
+    } catch (err) {
+      console.error(err.message);
+      process.exit(1);
+    }
+    config.warmupSeconds = 0;
+    await saveConfig(config);
+    console.log(formatWarmupScheduleConfirmation(config.warmupSchedule));
+    await notifyRunningServer(config);
     return;
   }
 
@@ -1316,10 +1517,150 @@ async function warmupCommand() {
   }
 
   config.warmupSeconds = seconds;
+  delete config.warmupSchedule;
   await saveConfig(config);
   console.log(seconds > 0
     ? `Keep-warm set to every ${seconds}s (spawns a minimal \`claude\` per idle account; spends a little quota).`
     : 'Keep-warm disabled.');
+  await notifyRunningServer(config);
+}
+
+// ── threshold ───────────────────────────────────────────────
+
+/** The stored form of a percentage: a 0–1 ratio quantised to tenths of a
+ *  percent, so a value set here reads back identically on the settings screen
+ *  (tui.js quantises the same way). Returns null when the input is not a
+ *  percentage this setting accepts. */
+function thresholdRatio(text) {
+  const pct = Number(text);
+  if (!Number.isFinite(pct) || pct < 1 || pct > 100) return null;
+  return Math.round(pct * 10) / 1000;
+}
+
+/** The threshold table as `{ default, ...buckets }`, whatever shape it is
+ *  stored in — a bare number is the default with no bucket overrides. */
+function thresholdTable(value) {
+  if (value && typeof value === 'object') {
+    return { default: DEFAULT_SWITCH_THRESHOLD, ...value };
+  }
+  return { default: typeof value === 'number' ? value : DEFAULT_SWITCH_THRESHOLD };
+}
+
+function printThresholds(value) {
+  const table = thresholdTable(value);
+  console.log(`Switch threshold: ${formatPercent(table.default)}`);
+  for (const [bucket, ratio] of Object.entries(table)) {
+    if (bucket !== 'default' && typeof ratio === 'number') {
+      console.log(`  ${bucket}: ${formatPercent(ratio)}`);
+    }
+  }
+}
+
+async function thresholdCommand() {
+  const config = await loadOrCreateConfig();
+  const rest = args.slice(1);
+
+  if (!rest.length) {
+    printThresholds(config.switchThreshold);
+    console.log('Set with: teamclaude threshold <1-100>   e.g. teamclaude threshold 90');
+    console.log('Per bucket: teamclaude threshold unified7d=90   (=default drops it again)');
+    return;
+  }
+
+  const keyed = rest.filter(arg => arg.includes('='));
+  if (keyed.length && keyed.length !== rest.length) {
+    console.error(THRESHOLD_USAGE);
+    process.exit(1);
+  }
+
+  // One number: the plain form the setting has always had, and it replaces any
+  // per-bucket table rather than hiding one behind the number now in effect.
+  if (!keyed.length) {
+    if (rest.length > 1) {
+      console.error(THRESHOLD_USAGE);
+      process.exit(1);
+    }
+    const ratio = thresholdRatio(rest[0]);
+    if (ratio === null) {
+      console.error(THRESHOLD_USAGE);
+      process.exit(1);
+    }
+    const dropped = Object.keys(thresholdTable(config.switchThreshold)).filter(b => b !== 'default');
+    config.switchThreshold = ratio;
+    await saveConfig(config);
+    if (dropped.length) {
+      console.log(`Dropped the per-bucket thresholds (${dropped.join(', ')}) — one number governs every bucket.`);
+    }
+    console.log(`Switch threshold set to ${formatPercent(ratio)}.`);
+    await notifyRunningServer(config);
+    return;
+  }
+
+  const table = thresholdTable(config.switchThreshold);
+  for (const pair of keyed) {
+    const at = pair.indexOf('=');
+    const bucket = pair.slice(0, at);
+    const value = pair.slice(at + 1);
+    if (bucket !== 'default' && !QUOTA_BUCKETS.includes(bucket)) {
+      console.error(`Unknown quota bucket "${bucket}" — expected one of: default, ${QUOTA_BUCKETS.join(', ')}`);
+      process.exit(1);
+    }
+    if (value === 'default') {
+      if (bucket === 'default') {
+        console.error('The default threshold is the fallback — set it to a number instead of dropping it.');
+        process.exit(1);
+      }
+      delete table[bucket];
+      continue;
+    }
+    const ratio = thresholdRatio(value);
+    if (ratio === null) {
+      console.error(THRESHOLD_USAGE);
+      process.exit(1);
+    }
+    table[bucket] = ratio;
+  }
+
+  // Back to the plain form once the last override is gone: an object holding
+  // only `default` is the same setting written the long way.
+  const overrides = Object.keys(table).filter(b => b !== 'default');
+  config.switchThreshold = overrides.length ? table : table.default;
+  await saveConfig(config);
+  printThresholds(config.switchThreshold);
+  await notifyRunningServer(config);
+}
+
+// ── distribute ──────────────────────────────────────────────
+
+async function distributeCommand() {
+  const config = await loadOrCreateConfig();
+  const arg = args[1];
+  const current = !!config.distributeSessions;
+
+  if (arg === undefined) {
+    console.log(`Session distribution: ${current ? 'on' : 'off'}`);
+    console.log('Set with: teamclaude distribute <on|off>');
+    console.log('On: each session stays on its account for cache reuse, and new sessions spread');
+    console.log('across equal-priority accounts by load. Off: quota-driven rotation only.');
+    return;
+  }
+
+  const on = ['on', 'true', 'yes', '1'].includes(arg);
+  if (!on && !['off', 'false', 'no', '0'].includes(arg)) {
+    console.error(DISTRIBUTE_USAGE);
+    process.exit(1);
+  }
+
+  // An unchanged setting is not rewritten — the config file is a
+  // read-modify-write shared with the running server — but the server is still
+  // notified, so a config that already says `on` can be made to take effect.
+  if (on !== current) {
+    config.distributeSessions = on;
+    await saveConfig(config);
+  }
+  console.log(on
+    ? 'Session distribution on — new sessions spread across equal-priority accounts, each pinned to its own for cache reuse.'
+    : 'Session distribution off — sessions already running keep their accounts and drain; new ones rotate by quota.');
   await notifyRunningServer(config);
 }
 
@@ -1577,11 +1918,18 @@ Commands:
   priority <name> <n> Set rotation priority (lower = preferred; --first/--last)
   route [list|add|rm] Per-model routing: pin model globs to specific accounts
                       (add <name> --match "<glob>" [--accounts "<name>"] [--bucket <b>])
+  threshold [pct]     Utilization at which rotation leaves an account (1-100);
+                      per bucket with 'unified7d=90', and '=default' drops one
+  distribute [on|off] Spread new sessions across equal-priority accounts, each
+                      pinned to its own for cache reuse (off by default)
   probe [off|secs]    Opt-in background quota refresh for idle accounts
                       (off by default; reads usage endpoint, spends no quota)
   warmup [off|secs]   Opt-in: keep idle accounts' 5h timers running by sending
-                      a minimal claude request to each (off by default; spends
-                      a little quota, unlike probe)
+                      a minimal claude request to each (spends a little quota)
+  warmup reset HH:MM --timezone Area/City
+                      Schedule daily warm-up for a target reset in an IANA zone
+  warmup rolling HH:MM --timezone Area/City
+                      Anchor a continuous five-hour reset cadence in an IANA zone
   api <path>          Call an API endpoint with account credentials
   update              Check npm for a newer teamclaude and install it
   version             Print the installed version
@@ -1686,6 +2034,11 @@ async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
     type: 'oauth',
     source,
     ...oauthIdentityFields(profile),
+    organizationType: profile?.organizationType || null,
+    rateLimitTier: profile?.rateLimitTier || creds.rateLimitTier || null,
+    seatTier: profile?.seatTier || null,
+    hasClaudeMax: profile?.hasClaudeMax ?? null,
+    hasClaudePro: profile?.hasClaudePro ?? null,
     accessToken: creds.accessToken,
     refreshToken: creds.refreshToken,
     expiresAt: creds.expiresAt,
@@ -1698,9 +2051,9 @@ async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
 
   if (idx >= 0) {
     // Same account+org: refresh credentials and org info, but keep the existing
-    // display name and any disk-only fields (e.g. importFrom).
+    // display name, entry id, and any disk-only fields (e.g. importFrom).
     const prev = config.accounts[idx];
-    config.accounts[idx] = { ...prev, ...account, name: prev.name };
+    config.accounts[idx] = updateAccountEntry(prev, account);
     console.log(`Updated account "${prev.name}"`);
   } else {
     // New org for this person: if another entry shares the accountUuid, the bare
@@ -1728,9 +2081,25 @@ async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
 // ── config sync helpers ─────────────────────────────────────
 
 /**
- * Find a config account entry matching an in-memory account by account+org identity.
+ * Find the config entry a running account came from.
+ *
+ * By entry id first. Identity is the fallback, and it is not one-to-one:
+ * sameIdentity compares organization only when BOTH records carry one and falls
+ * back to the name otherwise, so for one person holding accounts in two
+ * organizations — the case the identity module exists for — both rows match and
+ * the first one wins. Resolving a token write that way records one account's
+ * refresh-token family against another account's row (#203).
+ *
+ * The id is exact and survives the refresh that rewrites the credential, which
+ * is the one field that might otherwise have separated two records of one
+ * person. loadConfig gives every entry an id, so the fallback is only for a disk
+ * row written before the field existed and not yet saved back.
  */
 function findConfigAccount(diskConfig, account) {
+  if (account?.id) {
+    const byId = diskConfig.accounts.findIndex(a => a?.id === account.id);
+    if (byId >= 0) return byId;
+  }
   return diskConfig.accounts.findIndex(a => sameIdentity(a, account));
 }
 
@@ -1754,12 +2123,6 @@ function isLocalAccountPin(url, port) {
 function argValue(flag) {
   const i = args.indexOf(flag);
   return (i >= 0 && args[i + 1]) ? args[i + 1] : null;
-}
-
-// Hostname of the configured upstream (the host MITM-intercepts under `run`).
-function upstreamHost(config) {
-  try { return new URL(config.upstream || 'https://api.anthropic.com').hostname; }
-  catch { return 'api.anthropic.com'; }
 }
 
 // Keep the terminal title in sync with the active account (e.g. "teamclaude 2/4

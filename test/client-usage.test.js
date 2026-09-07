@@ -4,7 +4,16 @@ import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer, resolveClientAuth } from '../src/server.js';
 import { resolveConnectAuth, resolveConnectPin } from '../src/mitm.js';
-import { ClientUsageTracker } from '../src/client-usage.js';
+import {
+  ClientUsageTracker,
+  UsageDimensionTracker,
+  OVERFLOW_KEY,
+  DEFAULT_USAGE_DIMENSION_MAX_KEYS,
+  resolveUsageDimensions,
+  usageDimensionHeaderNames,
+  sanitizeUsageDimensionValue,
+  createUsageRecorder,
+} from '../src/client-usage.js';
 
 function listen(server) {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
@@ -193,4 +202,162 @@ test('export() keeps a hostile client name as a plain key', () => {
   assert.ok(Object.hasOwn(out, '__proto__'), 'an own key, not the prototype');
   assert.equal(out['__proto__'].requests, 1);
   assert.equal(Object.getPrototypeOf(out), Object.prototype, 'still a plain object for deepEqual/JSON');
+});
+
+// --- usage dimensions (proxy.usageDimensions) -------------------------------
+
+test('per-client accounting stays uncapped: clientKeys is bounded by the config', () => {
+  const t = new ClientUsageTracker();
+  for (let i = 0; i < DEFAULT_USAGE_DIMENSION_MAX_KEYS + 50; i++) t.record(`c${i}`, { requests: 1 });
+  assert.equal(Object.keys(t.export()).length, DEFAULT_USAGE_DIMENSION_MAX_KEYS + 50);
+});
+
+test('an over-cap dimension value folds into (other) and never evicts a row', () => {
+  const t = new ClientUsageTracker({ maxKeys: 3 });
+  t.record('a', { requests: 1, inputTokens: 10 });
+  t.record('b', { requests: 1 });
+  t.record('c', { requests: 1 });
+  // Three more distinct values arrive. Eviction would delete `a` — whose
+  // counters are cumulative and persisted — making the loss permanent at the
+  // next save. The fold must leave every existing row untouched.
+  t.record('d', { requests: 1, inputTokens: 5 });
+  t.record('e', { requests: 1, inputTokens: 5 });
+  t.record('f', { requests: 1, inputTokens: 5 });
+
+  const out = t.export();
+  assert.deepEqual(Object.keys(out).sort(), ['(other)', 'a', 'b', 'c']);
+  assert.equal(out.a.inputTokens, 10, 'the first value keeps its lifetime total');
+  assert.equal(out[OVERFLOW_KEY].requests, 3, 'the overflow is summed, not dropped');
+  assert.equal(out[OVERFLOW_KEY].inputTokens, 15);
+
+  // A value already known is still booked to itself, cap or no cap.
+  t.record('a', { requests: 1 });
+  assert.equal(t.export().a.requests, 2);
+});
+
+test('a restored snapshot cannot be evicted by later traffic either', () => {
+  const t = new ClientUsageTracker({ maxKeys: 2 });
+  t.restore({ old: { requests: 7, inputTokens: 70, lastUsed: '2020-01-01T00:00:00.000Z' } });
+  t.record('new', { requests: 1 });
+  t.record('newer', { requests: 1 });
+  const out = t.export();
+  assert.equal(out.old.requests, 7, 'the least-recently-used row survives');
+  assert.equal(out[OVERFLOW_KEY].requests, 1);
+});
+
+test('a caller-supplied dimension value of __proto__ lands as an own key', () => {
+  // Dimension NAMES are operator config and validated, but VALUES come from a
+  // request header: `X-Teamclaude-Project: __proto__` passes sanitization, so
+  // the row must survive the export rather than vanish onto the prototype.
+  const t = new UsageDimensionTracker();
+  assert.equal(sanitizeUsageDimensionValue('__proto__'), '__proto__', 'the value is not filtered');
+  t.record('project', '__proto__', { requests: 1 });
+  const project = t.export().project;
+  assert.ok(Object.hasOwn(project, '__proto__'), 'an own key, not the prototype');
+  assert.equal(project['__proto__'].requests, 1);
+  assert.equal(Object.getPrototypeOf(t.export()), Object.prototype, 'plain object for JSON');
+});
+
+test('a dimension name that is not a valid identifier is refused', () => {
+  const t = new UsageDimensionTracker();
+  t.record('__proto__', 'v', { requests: 1 });
+  t.record('bad name!', 'v', { requests: 1 });
+  assert.deepEqual(t.export(), {});
+});
+
+test('dimensions are resolved from configured headers only', () => {
+  const proxy = {
+    usageDimensions: [
+      { name: 'project', header: 'X-Teamclaude-Project' },
+      { name: 'ref', header: 'x-teamclaude-ref' },
+      { name: 'bad name!', header: 'x-ignored' },
+      { name: 'creds', header: 'authorization' },
+      { name: 'creds2', header: 'cookie' },
+    ],
+  };
+  const headers = {
+    'x-teamclaude-project': 'skaile-dev',
+    'x-claude-code-session-id': 'sess-1',
+    authorization: 'Bearer secret',
+    cookie: 'a=b',
+  };
+  // No session dimension: per-session cost comes from SessionTracker, which
+  // meters the response usage including cache tokens.
+  assert.deepEqual(resolveUsageDimensions(proxy, headers), [{ name: 'project', key: 'skaile-dev' }]);
+  // A dimension pointed at a credential header is refused outright, so the
+  // credential can never become a persisted counter name.
+  assert.deepEqual(
+    [...usageDimensionHeaderNames(proxy)].sort(),
+    ['x-teamclaude-project', 'x-teamclaude-ref'],
+  );
+  assert.deepEqual(resolveUsageDimensions({}, headers), []);
+  assert.deepEqual(resolveUsageDimensions(null, headers), []);
+});
+
+test('dimension values are sanitized at ingest and length-capped', () => {
+  assert.equal(sanitizeUsageDimensionValue('  my [31mproject\n '), 'my project');
+  assert.equal(sanitizeUsageDimensionValue('x'.repeat(500)).length, 200);
+  assert.equal(sanitizeUsageDimensionValue(['a', 'b']), 'a, b');
+  assert.equal(sanitizeUsageDimensionValue('   '), null);
+  assert.equal(sanitizeUsageDimensionValue(undefined), null);
+});
+
+test('the recorder books one request and its tokens to every target', () => {
+  const clientUsage = new ClientUsageTracker();
+  const dimensionUsage = new UsageDimensionTracker();
+  const rec = createUsageRecorder({
+    client: 'ci',
+    clientUsage,
+    dimensions: [{ name: 'project', key: 'skaile-dev' }],
+    dimensionUsage,
+  });
+  rec.recordRequest();
+  rec.onUsage(100, 20);
+  assert.equal(clientUsage.export().ci.requests, 1);
+  assert.equal(clientUsage.export().ci.inputTokens, 100);
+  assert.equal(dimensionUsage.export().project['skaile-dev'].outputTokens, 20);
+
+  // Nothing to attribute means no work and no onUsage hook to install.
+  const none = createUsageRecorder({ client: null, clientUsage, dimensions: [], dimensionUsage });
+  assert.equal(none.onUsage, null);
+});
+
+test('a dimension header is booked here and NOT forwarded upstream', async () => {
+  let seen = null;
+  const upstream = http.createServer((req, res) => {
+    seen = req.headers;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, usage: { input_tokens: 7, output_tokens: 3 } }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([{ name: 'acct', type: 'api_key', apiKey: 'sk-a' }], 0.98);
+  const dimensionUsage = new UsageDimensionTracker();
+  const proxy = createProxyServer(am, {
+    proxy: { ...PROXY, usageDimensions: [{ name: 'project', header: 'x-teamclaude-project' }] },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+  }, {}, null, new ClientUsageTracker(), dimensionUsage);
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-teamclaude-project': 'skaile-dev',
+        'x-teamclaude-other': 'kept',
+      },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+    });
+    await res.text();
+
+    assert.equal(dimensionUsage.export().project['skaile-dev'].inputTokens, 7);
+    // The header labels traffic for THIS proxy. Forwarding it would hand the
+    // operator's internal project names to the upstream vendor for no benefit.
+    assert.equal(seen['x-teamclaude-project'], undefined, 'dimension header must not reach upstream');
+    // Only the configured ones are stripped — this is not a general filter.
+    assert.equal(seen['x-teamclaude-other'], 'kept');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
 });

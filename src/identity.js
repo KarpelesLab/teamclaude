@@ -63,9 +63,39 @@ export function distinctAccounts(a, b) {
  * hard to trace back to the login that caused it.
  */
 export function findUpsertTarget(accounts, incoming) {
+  // A UUID match is evidence; a name match is a guess, and sameIdentity makes
+  // both in one pass — it compares UUIDs only when BOTH records carry one and
+  // falls back to the name otherwise. So an entry with no UUID matched any
+  // incoming record sharing its name, and if it sat earlier in the list it won
+  // over the entry whose account+org actually matched, landing the credential on
+  // the namesake row (#236). Two entries with one name where the earlier has no
+  // UUID is just a hand-added entry beside a logged-in one, or an account added
+  // before its first probe.
+  //
+  // So look for the evidence before accepting the guess.
+  if (incoming?.accountUuid) {
+    const byUuid = accounts.findIndex(a => a?.accountUuid && sameIdentity(a, incoming));
+    if (byUuid >= 0) return byUuid;
+  }
   const byIdentity = accounts.findIndex(a => sameIdentity(a, incoming));
   if (byIdentity >= 0) return byIdentity;
   return accounts.findIndex(a => a.name === incoming.name && !distinctAccounts(a, incoming));
+}
+
+/**
+ * The entry to store at a `findUpsertTarget` hit: `incoming` over `prev`, with
+ * two of the existing entry's fields pinned.
+ *
+ * `name` because a login should not rename an account the operator named. `id`
+ * because a running server holds an account built from this entry and finds it
+ * again by that id (see account-pairing.js) — reissuing it here would strand
+ * that account with no entry to be saved onto, and the token it refreshes next
+ * would be dropped instead of persisted. An `incoming` record carrying neither
+ * field already leaves both alone; pinning them says so, and keeps saying so if
+ * one day it carries them.
+ */
+export function updateAccountEntry(prev, incoming) {
+  return { ...prev, ...incoming, name: prev.name, id: prev.id };
 }
 
 /** The email portion of a display name, stripping any " (org)" suffix. */
