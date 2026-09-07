@@ -603,3 +603,72 @@ test('every config value the distribute command writes round-trips to its mode',
       `writing ${JSON.stringify(value)} must read back as ${mode}`);
   }
 });
+
+// ── Burn rate must be a wall-clock rate, not a per-reading one ──────────────
+
+test('concurrent readings do not inflate the burn rate', () => {
+  // Observed live: 27 sessions on one account produced a burn rate of 0.157
+  // utilization/second — a weekly window drained in six seconds — because each
+  // adjacent pair of readings divided a delta caused by many parallel requests
+  // by the milliseconds between two responses landing.
+  const l = new CapacityLearner();
+  const t0 = Date.now();
+  l.observeUtilization(0, 'unified7d', 0.10, t0);
+  // 10 minutes of traffic that moves the window 2%, delivered as bursts of
+  // readings a few ms apart — the shape high concurrency actually produces.
+  let u = 0.10;
+  for (let minute = 1; minute <= 10; minute++) {
+    for (let i = 0; i < 12; i++) {
+      u += 0.02 / 120;
+      l.observeUtilization(0, 'unified7d', u, t0 + minute * 60_000 + i * 3);
+    }
+  }
+  const rate = l.burnRate(0, 'unified7d');
+  // The truth is 2% over 10 minutes ≈ 3.3e-8 utilization/ms.
+  const truth = 0.02 / (10 * 60_000);
+  assert.ok(rate < truth * 3,
+    `burn rate must track wall-clock, got ${rate} vs truth ${truth}`);
+  // And the reserve it implies must stay a sane margin, not the ceiling.
+  assert.ok(l.reserve(0, 'unified7d') < ADAPTIVE_DEFAULTS.maxReserve,
+    'a modest real burn rate must not pin the reserve at its ceiling');
+});
+
+test('a flat reading is a legitimate zero-rate sample, not a discontinuity', () => {
+  // An idle account should learn a LOW burn rate — that is what earns it a
+  // narrow reserve and lets it run closer to its threshold. Treating a flat
+  // reading as a reset would leave it forever on the cold-start assumption.
+  const l = new CapacityLearner();
+  const t0 = Date.now();
+  l.observeUtilization(0, 'unified7d', 0.50, t0);
+  for (let i = 1; i <= 12; i++) l.observeUtilization(0, 'unified7d', 0.50, t0 + i * 60_000);
+  assert.equal(l.burnRate(0, 'unified7d'), 0, 'an idle account burns nothing');
+  assert.equal(l.reserve(0, 'unified7d'), ADAPTIVE_DEFAULTS.minReserve);
+});
+
+test('a genuinely fast burner still earns a wide reserve', () => {
+  // The fix must not simply flatten every rate: real sustained spend has to
+  // still widen the margin.
+  const l = new CapacityLearner();
+  const t0 = Date.now();
+  l.observeUtilization(0, 'unified7d', 0.10, t0);
+  let u = 0.10;
+  for (let i = 1; i <= 12; i++) { // 30% of the window in 12 minutes
+    u += 0.30 / 12;
+    l.observeUtilization(0, 'unified7d', u, t0 + i * 60_000);
+  }
+  assert.ok(l.reserve(0, 'unified7d') > ADAPTIVE_DEFAULTS.minReserve * 5,
+    `a real fast burner needs a wide margin, got ${l.reserve(0, 'unified7d')}`);
+});
+
+test('a window reset does not leak across the burn measurement', () => {
+  const l = new CapacityLearner();
+  const t0 = Date.now();
+  l.observeUtilization(0, 'unified7d', 0.90, t0);
+  l.observeUtilization(0, 'unified7d', 0.95, t0 + 6 * 60_000);
+  const before = l.burnRate(0, 'unified7d');
+  l.observeUtilization(0, 'unified7d', 0.02, t0 + 7 * 60_000); // weekly rolled
+  l.observeUtilization(0, 'unified7d', 0.03, t0 + 13 * 60_000);
+  // The roll must not be measured as a huge negative or positive swing.
+  assert.ok(l.burnRate(0, 'unified7d') >= 0 && l.burnRate(0, 'unified7d') < before * 2,
+    'the reset must reopen the window rather than be measured across');
+});

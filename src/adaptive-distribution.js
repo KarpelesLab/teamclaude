@@ -55,6 +55,21 @@ export const ADAPTIVE_DEFAULTS = {
   // allowed to run much closer to the threshold before it is tapered off.
   lookaheadMs: 30 * 60_000,
   burnAlpha: 0.3,
+  // The wall-clock window a burn-rate sample is measured over.
+  //
+  // Not per-reading, which is what makes this necessary. Readings arrive when
+  // RESPONSES do, so under concurrency a dozen land within a few milliseconds
+  // of each other, each carrying the utilization that a dozen parallel requests
+  // moved. Dividing that delta by the milliseconds between two adjacent
+  // readings measures the arrival burst, not the rate — observed at 0.157
+  // utilization/second against a fleet of 27 sessions, which would drain a
+  // weekly window in six seconds, and which pinned every reserve at its
+  // ceiling. Anchoring the sample to a real interval makes concurrency
+  // contribute to the numerator (more spend) instead of the denominator.
+  //
+  // Five minutes: long enough that arrival bursts average out, short enough
+  // that the 30-minute projection is still extrapolating from something recent.
+  burnWindowMs: 5 * 60_000,
   minReserve: 0.01, // never taper over a window narrower than 1%
   maxReserve: 0.20, // nor hold back more than 20% of the window in reserve
   // Utilization/ms assumed before anything has been observed. Sits mid-range so
@@ -104,7 +119,14 @@ export class CapacityLearner {
     const key = `${index}:${bucket}`;
     let s = this.state.get(key);
     if (!s) {
-      s = { capacity: null, burnRate: null, lastU: null, lastAt: null, pendingTokens: 0 };
+      s = {
+        capacity: null, burnRate: null, lastU: null, lastAt: null, pendingTokens: 0,
+        // The open burn-rate measurement window: where utilization stood when
+        // it opened, and when. Deliberately independent of lastU/lastAt, which
+        // move on every reading — this pair holds still until the window is
+        // wide enough to divide by.
+        burnAnchorU: null, burnAnchorAt: null,
+      };
       this.state.set(key, s);
     }
     return s;
@@ -141,28 +163,47 @@ export class CapacityLearner {
     if (!Number.isFinite(utilization)) return;
     const s = this._slot(index, bucket);
     const { lastU, lastAt, pendingTokens } = s;
-    const rebaseline = () => {
+    // `restart` also reopens the burn window: it is only used where continuity
+    // is broken (a reset, a stale gap), and measuring across that break would
+    // price a window's worth of drop, or an idle stretch, as this account's
+    // rate.
+    const rebaseline = (restart) => {
       s.lastU = utilization;
       s.lastAt = now;
       s.pendingTokens = 0;
+      if (restart || s.burnAnchorAt == null) {
+        s.burnAnchorU = utilization;
+        s.burnAnchorAt = now;
+      }
     };
-    if (lastU == null || lastAt == null) return rebaseline();
+    if (lastU == null || lastAt == null) return rebaseline(true);
 
     const deltaU = utilization - lastU;
     const elapsed = now - lastAt;
-    if (deltaU <= 0 || elapsed > this.opts.maxSampleAgeMs) return rebaseline();
+    // A DROP is a window reset; a long gap means the tokens and the move are
+    // not the same interval. A FLAT reading is neither — it is an account that
+    // simply spent nothing, which the burn window below should count, so it is
+    // no longer lumped in with the two discontinuities.
+    if (deltaU < 0 || elapsed > this.opts.maxSampleAgeMs) return rebaseline(true);
 
-    // Burn rate is learned from every forward move, even one too small to price
-    // in tokens: the reserve only needs to know how fast the window is being
-    // consumed, which the utilization move states directly.
-    if (elapsed > 0) {
-      s.burnRate = ewma(s.burnRate, deltaU / elapsed, this.opts.burnAlpha);
+    // Burn rate over a real elapsed interval rather than per reading. Left open
+    // until the window is wide enough, so every reading inside it contributes
+    // to how far utilization moved and none of them shortens the clock it is
+    // divided by. A flat stretch is a legitimate sample of ~0, which is what
+    // lets an idle account earn a narrow reserve and run nearer its threshold.
+    const burnElapsed = now - s.burnAnchorAt;
+    if (burnElapsed >= this.opts.burnWindowMs) {
+      const moved = utilization - s.burnAnchorU;
+      if (moved >= 0) s.burnRate = ewma(s.burnRate, moved / burnElapsed, this.opts.burnAlpha);
+      s.burnAnchorU = utilization;
+      s.burnAnchorAt = now;
     }
+    if (deltaU === 0) return rebaseline(false);
     if (deltaU >= this.opts.minDeltaU && pendingTokens > 0) {
       // Tokens the whole window holds, if this rate held across all of it.
       s.capacity = ewma(s.capacity, pendingTokens / deltaU, this.opts.capacityAlpha);
     }
-    rebaseline();
+    rebaseline(false);
   }
 
   /** Learned window size in tokens, or null while it is still unknown. */
