@@ -2316,9 +2316,17 @@ export class AccountManager {
     // fleet that is the defect this rule exists for — a Codex account takes the
     // band on its own and vetoes an Anthropic-to-Anthropic move that no later
     // request can retry.
+    // WHERE THIS REQUEST CAN BE SENT: an account it has not already tried, and
+    // one whose quota for the model it carries is not spent — the same two tests
+    // the switch's own eligible loop applies, so the two cannot disagree about
+    // which accounts are in play. Consulted only where `scope` is non-null,
+    // which is only with the feature on.
+    const canRouteTo = account => account != null
+      && !scope.has(account.index) && this._isAvailable(account, model);
     // The cursor's account is one end of every comparison the switch makes, so a
     // request that cannot be sent there settles nothing and leaves the event too.
-    const spends = !this.expiryRouting.enabled || (scope != null && !scope.has(this.currentIndex));
+    const spends = !this.expiryRouting.enabled
+      || (scope != null && canRouteTo(this.accounts[this.currentIndex]));
     const sessionReset = [];
     for (const account of this.accounts) {
       const r = this._clearExpiredQuotas(account);
@@ -2329,8 +2337,15 @@ export class AccountManager {
       // The reset belongs to the first request that can act on it. This one
       // cannot be sent to the account at all, so consuming the flag here would
       // spend the event on a switch that must refuse it and leave the next
-      // request — which could have used the account — nothing to act on.
-      if (scope?.has(account.index)) continue;
+      // request — which could have used the account — nothing to act on. An
+      // account whose Fable weekly is spent is exactly that for a Fable request
+      // and fully usable for the Opus one behind it.
+      //
+      // Below _clearExpiredQuotas above, not beside the flag it sets: the window
+      // whose expiry raised the event bars every model while it stands, so an
+      // account read before it is cleared refuses every request and the event
+      // would never be spendable at all.
+      if (scope != null && !canRouteTo(account)) continue;
       // The flag, not r.session: a status read may have cleared the window
       // seconds earlier, and the rule still has to run. Cleared here rather
       // than where the window is, so that a read cannot swallow the event.
@@ -2381,6 +2396,9 @@ export class AccountManager {
       // Model-scoped, because the request being routed has one: an account whose
       // Fable weekly is spent is still fully usable for Opus, and a switch that
       // ignores the model can install one the model's own picker would refuse.
+      // The same caller filters on this too, and for the same reason the line
+      // above is kept: a caller that hands unfiltered candidates gets the answer
+      // the parameter promises.
       if (!this._isAvailable(acc, model)) continue; // enough session & weekly quota left
       // Don't demote to a lower-priority (higher value) account on a reset.
       if ((acc.priority || 0) > (current.priority || 0)) continue;

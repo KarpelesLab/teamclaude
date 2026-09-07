@@ -668,6 +668,99 @@ test('path 3: a request that cannot use the incumbent leaves the reset for one t
     'the reset did not survive to a request that could act on it');
 });
 
+test('path 3: a request whose model the account cannot serve leaves the reset pending', () => {
+  // The third face of the rule the two arms above state, and the one an
+  // exclusion set cannot express: an account is out of reach of THIS request
+  // whenever the weekly bucket that governs this model is spent there, even
+  // though every other model still routes to it normally. The switch refuses it
+  // for exactly that reason a moment later, so consuming the event here costs
+  // the request behind it — on a model the account serves fine — the decision it
+  // was the only one able to make.
+  const build = expiry => {
+    const am = mgr(['cur', 'reset'], { expiry });
+    bucket(am, 0, 'unified7d', 0.50, 50);
+    bucket(am, 1, 'unified7d', 0.10, 10);
+    // Spent for Fable and untouched for Opus, which is the whole fixture.
+    bucket(am, 1, 'unified7dFable', 0.99, 10);
+    am.accounts[1].quota.unified5h = 0.5;
+    am.accounts[1].quota.unified5hReset = Date.now() - 1000;
+    return am;
+  };
+  // One account, two models, two answers — asked of a TWIN, because reading
+  // availability clears expired windows and this fixture is built on one.
+  const twin = build(ON);
+  assert.equal(twin._isAvailable(twin.accounts[1], FABLE), false,
+    'the fixture must bar the challenger from Fable');
+  assert.equal(twin._isAvailable(twin.accounts[1], OPUS), true,
+    'the fixture must leave the challenger usable for Opus');
+
+  const am = build(ON);
+  am.refreshExpiredQuotas(FABLE, asRequest());
+  assert.equal(am.accounts[1].sessionResetPending, true,
+    'a request the account cannot serve consumed its reset');
+  assert.equal(am.accounts[am.currentIndex].name, 'cur',
+    'the switch installed an account this request cannot be sent to');
+
+  // The request behind it. Nothing re-triggers the event — the window was
+  // cleared on the first pass and reads null now — so this switches only if the
+  // reset survived the model that had to refuse it.
+  am.refreshExpiredQuotas(OPUS, asRequest());
+  assert.equal(am.accounts[am.currentIndex].name, 'reset',
+    'the reset never reached the model that could act on it');
+
+  // The knob-off control, on the same fixture: master spends the event on sight
+  // whatever model the request carries, and takes the switch its own unscoped
+  // filter admits.
+  const off = build(OFF);
+  off.refreshExpiredQuotas(FABLE, asRequest());
+  assert.equal(off.accounts[1].sessionResetPending, false,
+    'the knob-off path left an event master consumes');
+  assert.equal(off.accounts[off.currentIndex].name, 'reset',
+    'the knob-off path skipped a switch master performs');
+});
+
+test('path 3: a request the incumbent cannot serve leaves the reset for one it does', () => {
+  // The same test at the other end of the comparison. A request the cursor's
+  // account cannot serve is diverted for that one request and leaves the fleet
+  // where it is, so what the switch measures against that account decides
+  // nothing about where anything goes — and the request behind it, which the
+  // account does serve, is the one whose decision moves the fleet. Here the
+  // incumbent's Fable window is the sooner of the two, so the Fable request
+  // declines the switch outright.
+  const build = expiry => {
+    const am = mgr(['cur', 'reset'], { expiry });
+    bucket(am, 0, 'unified7d', 0.50, 50);
+    bucket(am, 0, 'unified7dFable', 0.99, 1);
+    bucket(am, 1, 'unified7d', 0.10, 10);
+    am.accounts[1].quota.unified5h = 0.5;
+    am.accounts[1].quota.unified5hReset = Date.now() - 1000;
+    return am;
+  };
+  const twin = build(ON);
+  assert.equal(twin._isAvailable(twin.accounts[0], FABLE), false,
+    'the fixture must bar the incumbent from Fable');
+  assert.equal(twin._isAvailable(twin.accounts[0], OPUS), true,
+    'the fixture must leave the incumbent usable for Opus');
+
+  const am = build(ON);
+  am.refreshExpiredQuotas(FABLE, asRequest());
+  assert.equal(am.accounts[1].sessionResetPending, true,
+    'a request that could not be sent to the incumbent consumed the reset');
+  assert.equal(am.accounts[am.currentIndex].name, 'cur');
+
+  am.refreshExpiredQuotas(OPUS, asRequest());
+  assert.equal(am.accounts[am.currentIndex].name, 'reset',
+    'the reset did not survive to the model that could weigh it');
+
+  // The knob-off control: the incumbent's model tells master nothing either.
+  const off = build(OFF);
+  off.refreshExpiredQuotas(FABLE, asRequest());
+  assert.equal(off.accounts[1].sessionResetPending, false,
+    'the knob-off path left an event master consumes');
+  assert.equal(off.accounts[off.currentIndex].name, 'reset',
+    'the knob-off path skipped a switch master performs');
+});
+
 test('path 3: a poll clears the window and leaves the reset for a request', () => {
   // A poll routes nothing, so a reset it spends is spent nowhere: the window
   // that raised the event is cleared on that same pass, nothing sets the flag
