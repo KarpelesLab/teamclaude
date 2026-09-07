@@ -279,6 +279,24 @@ test('prober probes oauth accounts and applies the usage data', async () => {
   assert.equal(am.accounts[0].quota.unified7d, 0.2);
 });
 
+// A third-party backend account is typed `oauth` with a static token (the
+// documented DeepSeek/GLM pattern), so a type check alone sends THAT provider's
+// key to api.anthropic.com every cycle — which answers 429, leaving a permanent
+// probe error on an account that is serving traffic normally.
+test('prober never sends a third-party key to the Anthropic usage endpoint', async () => {
+  const am = new AccountManager([
+    oauth('claude'),
+    { ...oauth('deepseek'), upstream: 'https://api.deepseek.com/anthropic' },
+  ], 0.98);
+  const probed = [];
+  const probeFn = async (token) => { probed.push(token); return { fiveHour: { utilization: 0.1, resetAt: 1 } }; };
+  await new Prober(am, { intervalMs: 0, probeFn, log: () => {} }).probeAll();
+
+  assert.deepEqual(probed, ['t-claude']);
+  // …and the backend's own quota is left untouched rather than recorded as an error.
+  assert.equal(am.accounts[1].quota.unified5h, null);
+});
+
 test('prober skips API-key accounts', async () => {
   const am = new AccountManager([{ name: 'k', type: 'apikey', apiKey: 'sk' }], 0.98);
   let calls = 0;

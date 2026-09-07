@@ -454,7 +454,9 @@ async function serverCommand() {
       running: false,
       accounts: accountManager.accounts.map(account => ({
         name: account.name,
-        status: account.type === 'oauth' ? 'never' : 'not-applicable',
+        // Same rule as Prober._isProbeTarget: a third-party backend has no
+        // Anthropic usage to read, so it is not-applicable rather than pending.
+        status: (account.type === 'oauth' && !account.upstream) ? 'never' : 'not-applicable',
         lastProbedAt: null,
         startedAt: null,
         durationMs: null,
