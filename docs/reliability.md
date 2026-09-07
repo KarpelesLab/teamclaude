@@ -22,8 +22,8 @@ external status checks remain necessary to detect a continuously wedged process.
 
 All values below are environment variables read by the service process. Exporting
 them in a separate shell does not reconfigure an already-running LaunchAgent.
-Changing limits requires an intentional restart and verification. Invalid values
-fall back to defaults; use positive integers, except queue length may be zero.
+Changing limits requires an intentional restart and verification. Use positive
+integers for these settings, except queue length may be zero.
 
 | Variable | Default | Scope |
 | --- | --- | --- |
@@ -83,7 +83,18 @@ API first-byte/streaming behavior with representative concurrent sessions. Keep
 the ingestion gate opt-in pending sustained production-like testing. Do not
 infer permanent health from a restart, passing unit tests, or a short live check.
 
-Remaining validation: a longer representative soak, peak/steady-state memory
-measurements, mixed-account fairness under quota pressure, and operational alert
-thresholds. A generic circuit breaker must not classify local overload or an
-account-specific quota failure as a fleet-wide outage.
+The pre-merge isolated soak ran for 60 seconds with 12 concurrent clients,
+one-MiB requests and three pinned synthetic accounts. One account began returning
+429s after 20 seconds. All 1,608 activity entries closed, both unaffected accounts
+completed 536 requests, and all 585 status probes succeeded (p95 5.92 ms); the
+event-loop monitor recorded zero stalls. The throttled account returned four
+429s and had 204 requests cancelled during its existing per-account pause.
+Post-GC heap was approximately 11–12 MiB; sampled RSS peaked near 311 MiB for the
+combined proxy, fake upstream and load generator. This is a short synthetic
+memory sample, not a process-memory limit or proof against long-term leaks.
+
+For broader rollout, continue multi-hour real-workload observation and establish
+operational alert thresholds. Pinned synthetic-account progress does not validate
+adaptive routing fairness, which belongs to the separate adaptive-routing work.
+A generic circuit breaker must not classify local overload or an account-specific
+quota failure as a fleet-wide outage.

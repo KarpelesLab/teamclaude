@@ -146,7 +146,12 @@ The defaults are meant to be left alone; these exist for the rare case where the
 | --- | --- | --- |
 | `TEAMCLAUDE_UPSTREAM_HEADERS_TIMEOUT_MS` | `120000` | Max wait for upstream **response headers** (time-to-first-byte). Cleared the instant headers arrive, so a long streaming body is never cut. Streamed completions deliver first byte in seconds; a non-streaming (`stream:false`) request that legitimately generates for longer than this could trip it — raise it for such callers |
 | `TEAMCLAUDE_UPSTREAM_BODY_TIMEOUT_MS` | `120000` | Max **idle** gap between response-body chunks. Resets on every chunk, so a slow-but-healthy stream is fine; it fires only when the socket goes silent mid-stream (a drop after headers), turning a hang into a fast, retryable failure |
-| `TEAMCLAUDE_UPSTREAM_MAX_SOCKETS` | `256` | Max concurrent upstream connections **per origin** in the pooled path. Requests beyond this queue (raise it if you run more concurrent sessions than this against one host) |
+| `TEAMCLAUDE_UPSTREAM_MAX_SOCKETS` | `256` | Max concurrent upstream connections **per origin** in the pooled path. Long streams retain slots; additional requests enter bounded admission with a separate wait deadline |
 | `TEAMCLAUDE_UPSTREAM_GLOBAL_FETCH` | _(off)_ | Set to `1` to route upstream requests through Node's global `fetch` (single HTTP/2 connection) instead of the pooled H1 transport — an escape hatch, not recommended under concurrency |
 | `TEAMCLAUDE_REFRESH_TIMEOUT_MS` | `30000` | Max wait for an OAuth token refresh. A hung refresh is coalesced across all callers, so it would otherwise wedge every request for that account |
 | `TEAMCLAUDE_RATE_LIMIT_ABSORB_MAX_SECONDS` | `60` | Longest `retry-after` absorbed inline on the same account before a rate-limit 429 is surfaced to the client — see [the two kinds of 429](routing.md#the-two-kinds-of-429) |
+
+See [Reliability limits](reliability.md#limits) for the upstream queue limit and
+deadline, opt-in ingestion admission, upload and buffered-response limits, and
+the scope of each safeguard. Local queue overflow/expiry returns `503` with
+`Retry-After: 1`; it is not an account failure or a reason to rotate credentials.

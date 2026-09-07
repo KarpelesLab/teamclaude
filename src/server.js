@@ -150,8 +150,8 @@ export function resolveClientAuth(proxyConfig, presented) {
 export function createProxyServer(accountManager, config, hooks = {}, sx = null, clientUsage = null, dimensionUsage = null) {
   const upstream = config.upstream || 'https://api.anthropic.com';
   const holdMs = (config.holdSeconds || 0) * 1000;
-  // Experimental until cancellation, queue deadlines and slow-upload bounds
-  // are covered. Do not activate this draft gate on a routine service restart.
+  // Opt-in admission: cancellation, deadlines and byte bounds are tested, but
+  // operators must size ingestion concurrency for their actual workload.
   const ingressGate = Number(process.env.TEAMCLAUDE_INGRESS_CONCURRENCY) > 0 ? new AdmissionGate(
     process.env.TEAMCLAUDE_INGRESS_CONCURRENCY,
     process.env.TEAMCLAUDE_INGRESS_QUEUE,
@@ -920,6 +920,11 @@ function reportFailure(...args) {
  * `drain` or a `close` that has already happened and will not happen again, so
  * the handler never returns and its activity entry never closes.
  */
+function clientGone(res) {
+  return !!res.destroyed || !!res.stream?.destroyed;
+}
+
+// Stop retaining a cancelled request while a quota retry timer is pending.
 function waitForRetry(ms, signal) {
   return new Promise(resolve => {
     if (signal?.aborted) { resolve(); return; }
@@ -927,10 +932,6 @@ function waitForRetry(ms, signal) {
     const timer = setTimeout(finish, ms);
     signal?.addEventListener('abort', finish, { once: true });
   });
-}
-
-function clientGone(res) {
-  return !!res.destroyed || !!res.stream?.destroyed;
 }
 
 /**

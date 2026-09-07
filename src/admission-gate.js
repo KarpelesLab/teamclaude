@@ -59,8 +59,8 @@ export function readRequestBody(req, { maxBodyBytes, bodyTimeoutMs, signal, onCh
   });
 }
 
-// Small FIFO semaphore used only while request bodies are being ingested and
-// parsed. Long upstream streams and quota holds do not retain a permit.
+// FIFO semaphore shared by ingestion and upstream admission. Each caller owns
+// its permit lifetime: ingestion releases after parsing, upstream after close.
 export class AdmissionGate {
   constructor(limit = DEFAULT_INGRESS_CONCURRENCY, maxQueue = DEFAULT_INGRESS_QUEUE) {
     this.limit = positiveInt(limit, DEFAULT_INGRESS_CONCURRENCY);
