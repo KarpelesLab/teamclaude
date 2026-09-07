@@ -866,7 +866,7 @@ test('path 3: an advisor request leaves the reset for one that can use both ends
   assert.equal(am.getActiveAccount(null, OPUS).name, 'reset',
     'the reset never reached a request that could act on it');
   assert.equal(am.accounts[am.currentIndex].name, 'reset',
-    'the reset never reached a request that could act on it');
+    'the request that acted on the reset left the cursor elsewhere');
   assert.equal(am.accounts[1].sessionResetPending, false,
     'the request that acted on the reset left it pending');
 
@@ -878,6 +878,49 @@ test('path 3: an advisor request leaves the reset for one that can use both ends
     'the knob-off path left an event the router consumes');
   assert.equal(off.accounts[off.currentIndex].name, 'reset',
     'the knob-off path skipped a switch the router performs');
+});
+
+test('path 3: an advisor request barred from its only advisor account degrades the switch', () => {
+  // The exclusion set is part of what makes an advisor model reachable. The one
+  // account that serves it is the one this request may not be sent to, so the
+  // fleet the switch is drawn over carries the main model alone.
+  const build = expiry => {
+    const am = mgr(['cur', 'chall', 'elig'],
+      { expiry, routes: [{ name: 'fable', match: ['*fable*'], accounts: ['elig'] }] });
+    bucket(am, 0, 'unified7d', 0.50, 50);
+    bucket(am, 1, 'unified7d', 0.10, 10);
+    bucket(am, 2, 'unified7d', 0.20, 20);
+    am.accounts[1].quota.unified5h = 0.5;
+    am.accounts[1].quota.unified5hReset = Date.now() - 1000;
+    return am;
+  };
+  // Asked of a TWIN, because reading availability clears expired windows.
+  const twin = build(ON);
+  assert.equal(twin._isAvailable(twin.accounts[2], OPUS, FABLE), true,
+    'the fixture must leave the excluded account able to serve both models');
+  assert.equal(twin._isAvailable(twin.accounts[0], OPUS, FABLE), false,
+    'the fixture must bar the incumbent from the advisor model');
+  assert.equal(twin._isAvailable(twin.accounts[1], OPUS, FABLE), false,
+    'the fixture must bar the challenger from the advisor model');
+  assert.equal(twin._isAvailable(twin.accounts[1], OPUS), true,
+    'the fixture must leave the challenger usable for the request model');
+
+  const am = build(ON);
+  assert.equal(am.getActiveAccount(new Set([2]), OPUS, FABLE).name, 'chall',
+    'the request excluding its only advisor account was not served on the main model');
+  assert.equal(am.accounts[am.currentIndex].name, 'chall',
+    'the degraded switch did not move the cursor onto the account that reset');
+  assert.equal(am.accounts[1].sessionResetPending, false,
+    'the request the degraded switch could reach left the reset pending');
+
+  // The knob-off control on the same fixture: the event is spent on sight
+  // whatever the exclusion set puts out of reach.
+  const off = build(OFF);
+  off.getActiveAccount(new Set([2]), OPUS, FABLE);
+  assert.equal(off.accounts[off.currentIndex].name, 'chall',
+    'the knob-off path skipped a switch the router performs');
+  assert.equal(off.accounts[1].sessionResetPending, false,
+    'the knob-off path left an event the router consumes');
 });
 
 test('path 3: an advisor request the incumbent cannot serve leaves the reset', () => {
