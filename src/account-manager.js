@@ -1848,7 +1848,7 @@ export class AccountManager {
    * with the tried set untouched starts there again; releasing on any of those
    * would leave the fail-back nothing to hand back.
    */
-  confirmStay(account, carried, sessionId = null, model = null, provider = DEFAULT_PROVIDER) {
+  confirmStay(account, carried, sessionId = null, model = null, provider = null) {
     if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) return;
     if (!account || !carried) return;
     // The cursor's observation hangs off ONE slot every provider shares, so the
@@ -1867,8 +1867,11 @@ export class AccountManager {
     // At the held end there is no request to ask, only the declaration, so a
     // roll pushed off such a key reads as the provider it declares and the other
     // fleet's success leaves it held — the same safe direction, one preemption.
+    // A confirmation that names no fleet settles nothing for the same reason:
+    // supplying the default instead would answer the question with a guess, and
+    // the guess is right for every fleet but the one this rule exists for.
     const held = this._currentObs?.unescaped;
-    if (held && providerOf(this.accounts[held.idx]) === provider) {
+    if (held && provider && providerOf(this.accounts[held.idx]) === provider) {
       this._releaseHeld(this._currentObs, account, carried.current);
     }
     if (sessionId) {

@@ -1081,7 +1081,7 @@ test('a stay a second request confirms releases the roll it was pushed off', () 
   assert.equal(serve(am, null, OPUS).name, 'b', 'the first request did not rest on b');
   const carried = am.observedGeneration(null, OPUS);
   assert.equal(serve(am, null, OPUS).name, 'b', 'the second request did not rest on b');
-  am.confirmStay(am.accounts[1], carried, null, OPUS);
+  am.confirmStay(am.accounts[1], carried, null, OPUS, 'anthropic');
 
   // b is out of the way, so the traffic comes back to a on its own.
   assert.equal(serve(am, null, OPUS, { exclude: new Set([1]) }).name, 'a');
@@ -1125,7 +1125,7 @@ test('a success on a borrowed cursor does not release the roll its owner holds',
     const carried = am.observedGeneration(null, OPUS);
     const account = claudeReq();
     assert.equal(account.name, 'a', `the ${attempt} borrowed request left the anthropic account`);
-    am.confirmStay(account, carried, null, OPUS);
+    am.confirmStay(account, carried, null, OPUS, 'anthropic');
   }
   assert.equal(am._currentObs.unescaped?.idx, 0,
     'a success on the borrowed cursor released the roll its owner was holding');
@@ -1171,7 +1171,7 @@ test('a borrowed cursor\'s success settles the roll of its own provider', () => 
   const carried = am.observedGeneration(null, OPUS);
   const served = claudeReq();
   assert.equal(served.name, 'b', 'the confirming request left b');
-  am.confirmStay(served, carried, null, OPUS);
+  am.confirmStay(served, carried, null, OPUS, 'anthropic');
   assert.equal(am._currentObs.unescaped, null,
     'the success left its own provider\'s roll owed');
 
@@ -1227,6 +1227,35 @@ test('a success on a shared key for another provider\'s request leaves the roll 
     'the fail-back onto a1 first-sighted the week a1 gained');
   assert.equal(claudeReq().name, 'a2',
     'the anthropic request after the fail-back settled on the account its roll pushed it off');
+});
+
+test('a confirmation that names no fleet settles nothing', () => {
+  // The control for the arm above, on the plainest fixture there is: one
+  // provider, one roll, a success that would release it. What the rule asks is
+  // which fleet the request belonged to, and a caller naming none has not
+  // answered; answering for it with the default would settle every anthropic
+  // roll on the strength of a request nobody said was anthropic's, which is the
+  // shared key again in a different spelling.
+  const am = mgr(['a', 'b'], ON);
+  bucket(am, 0, 'unified7d', 0.4, 10);
+  bucket(am, 1, 'unified7d', 0.4, 10);
+  assert.equal(serve(am, null, OPUS).name, 'a');
+  rollWindow(am, 0);
+
+  assert.equal(serve(am, null, OPUS).name, 'b', 'the rollover did not preempt');
+  assert.equal(serve(am, null, OPUS).name, 'b', 'the first request did not rest on b');
+  const carried = am.observedGeneration(null, OPUS);
+  assert.equal(serve(am, null, OPUS).name, 'b', 'the second request did not rest on b');
+  am.confirmStay(am.accounts[1], carried, null, OPUS);
+  assert.equal(am._currentObs.unescaped?.idx, 0,
+    'a confirmation naming no fleet released the roll anyway');
+
+  // b out of the way, so the traffic comes back to a — still owing its roll.
+  assert.equal(serve(am, null, OPUS, { exclude: new Set([1]) }).name, 'a');
+  assert.equal(am._currentRolledOver(am.accounts[0], OPUS), true,
+    'the fail-back found a roll that nothing had settled already released');
+  assert.equal(serve(am, null, OPUS).name, 'b',
+    'the request after the fail-back stayed on the account the roll pushed it off');
 });
 
 test('removing an account renumbers a session pin\'s held roll too', () => {
