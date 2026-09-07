@@ -1381,8 +1381,14 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   const route = useSx === undefined ? !!(sx?.useByDefault()) : useSx;
 
   // Taken before the walk, because the walk itself can move the observation and
-  // a request cannot confirm the stay its own selection began.
-  const restingGen = accountManager.observedGeneration(ctx.sessionId, ctx.model);
+  // a request cannot confirm the stay its own selection began. A pinned request
+  // takes no reading at all: the pin below bypasses selection entirely, so it
+  // consults no observation and is not evidence about where traffic came to
+  // rest. The keep-warm scheduler pins every request it sends, so a confirmation
+  // from one would routinely release a roll an ordinary request is still owed.
+  const restingGen = ctx.pinnedIndex == null
+    ? accountManager.observedGeneration(ctx.sessionId, ctx.model)
+    : null;
 
   // Select account, skipping any already tried (and failed) this request.
   // The model scopes availability so a Fable-exhausted account is skipped only

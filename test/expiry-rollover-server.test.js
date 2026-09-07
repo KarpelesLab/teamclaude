@@ -79,8 +79,16 @@ async function fleet(names, handler, { distribute = false, hours = null, refresh
     body: JSON.stringify({ model, messages: [] }),
   }).then(async r => (await r.json()).account);
 
+  // The same request forced onto one named account by the path prefix the
+  // keep-warm scheduler uses. It never enters the selection walk.
+  const sendPinned = (name, session = null, model = OPUS) => fetch(`http://127.0.0.1:${port}/tc-acct/${name}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...(session ? { 'x-claude-code-session-id': session } : {}) },
+    body: JSON.stringify({ model, messages: [] }),
+  }).then(async r => (await r.json()).account);
+
   return {
-    am, send,
+    am, send, sendPinned,
     // Sockets first, then the listeners. `fetch` keeps its connections alive, so
     // both servers still hold established sockets when a test ends and
     // `close()` alone waits for them forever — the file's tests all pass and the
@@ -147,6 +155,35 @@ const refuses = res => {
   res.writeHead(403, { 'content-type': 'application/json' });
   res.end(JSON.stringify({ type: 'error', error: { type: 'permission_error', message: 'no' } }));
 };
+
+// A SUCCESS AT THE DESTINATION IS EVIDENCE ONLY IF IT SELECTED. Both of these
+// are served by b while two ordinary requests hang there holding a's roll, and
+// they differ in one thing: whether the request consulted the observation it
+// would be confirming.
+const RESTING_SUCCESSES = [
+  {
+    // A pin is routed by name and never enters the selection walk, so it takes
+    // no reading and answers for no stay. Not a corner: the keep-warm scheduler
+    // pins every request it sends.
+    title: 'a pinned success at the destination confirms nothing',
+    third: (handle, session) => handle.sendPinned('b', session),
+    rolledOver: true,
+    whyState: 'the pinned success released the roll the preemption was holding',
+    next: 'b',
+    whyNext: 'a request that never selected spent the rollover another request was owed',
+  },
+  {
+    // The control, and the half that must keep working: this one selected, found
+    // the observation already resting on b and was served there, which is the
+    // stay a confirmation exists to record.
+    title: 'an ordinary success resting at the destination confirms the stay',
+    third: (handle, session) => handle.send(session),
+    rolledOver: false,
+    whyState: 'a served request that rested on the destination left the roll held',
+    next: 'a',
+    whyNext: 'the confirmed stay did not settle the traffic on the destination',
+  },
+];
 
 for (const distribute of [false, true]) {
   const path = distribute ? 'session' : 'current';
@@ -447,6 +484,64 @@ for (const distribute of [false, true]) {
       await close();
     }
   });
+
+  // A THIRD REQUEST SERVED AT THE DESTINATION WHILE TWO ORDINARY ONES HANG
+  // THERE. The first of those made the move to b itself, so it can confirm
+  // nothing; the second found the observation already resting on b, which is
+  // the reading the third would be confirming. Both are then refused and fall
+  // back to a, and what the third was allowed to do decides where the traffic
+  // goes next.
+  for (const success of RESTING_SUCCESSES) {
+    test(`${path} path: ${success.title}`, async () => {
+      const arrivals = [0, 1].map(i => deferred(`arrival ${i + 1} at b`));
+      const held = deferred('the suspension to be released');
+      let attempts = 0;
+
+      const handle = await fleet(['a', 'b'], async (name, res) => {
+        if (name === 'b' && attempts < 2) {
+          arrivals[attempts++].resolve();
+          await held.promise;
+          return refuses(res);
+        }
+        return serves(res, name);
+      }, { distribute });
+      const { am, send, close } = handle;
+
+      try {
+        assert.equal(await send(sid), 'a', 'the fixture must start on a');
+        am.accounts[0].quota.unified7dReset += WEEK;
+
+        // Serialised on the arrivals, because the fixture needs both suspended
+        // requests at b before the third selects — a race would decide whether
+        // the observation names b by then, which is the whole question.
+        const first = send(sid);
+        await arrivals[0].promise;
+        const second = send(sid);
+        await arrivals[1].promise;
+
+        assert.equal(await success.third(handle, sid), 'b',
+          'the third request should have been served by b');
+
+        held.resolve();
+        assert.deepEqual(await Promise.all([first, second]), ['a', 'a'],
+          'both refused requests should have fallen back onto a');
+
+        // Read off whichever observation THIS path routes by: the session walk
+        // never moves the cursor, so on that path the cursor's reading stays on
+        // a whatever the third request was allowed to do.
+        const stillOwed = distribute
+          ? am._pinRolledOver(sid, am.accounts[0], OPUS)
+          : am._currentRolledOver(am.accounts[0], OPUS);
+        assert.equal(stillOwed, success.rolledOver, success.whyState);
+        assert.equal(await send(sid), success.next, success.whyNext);
+      } finally {
+        // Before close(), or a failed assertion above leaves the upstream
+        // handlers suspended and the listeners never come down.
+        held.resolve();
+        await close();
+      }
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------
