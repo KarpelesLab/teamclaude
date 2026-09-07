@@ -18,6 +18,7 @@ import { createEgressGuard } from './egress-guard.js';
 import { safeLine } from './safe-text.js';
 import { renderDashboardHtml } from './dashboard.js';
 import { createUsageRecorder, resolveUsageDimensions, usageDimensionHeaderNames } from './client-usage.js';
+import { AdmissionGate } from './admission-gate.js';
 
 
 export const HOP_BY_HOP_HEADERS = new Set([
@@ -149,6 +150,10 @@ export function resolveClientAuth(proxyConfig, presented) {
 export function createProxyServer(accountManager, config, hooks = {}, sx = null, clientUsage = null, dimensionUsage = null) {
   const upstream = config.upstream || 'https://api.anthropic.com';
   const holdMs = (config.holdSeconds || 0) * 1000;
+  const ingressGate = new AdmissionGate(
+    process.env.TEAMCLAUDE_INGRESS_CONCURRENCY,
+    process.env.TEAMCLAUDE_INGRESS_QUEUE,
+  );
 
   // The log directory is made up front and synchronously, so a path that
   // cannot be a directory (a file sitting there, no permission) is reported
@@ -335,7 +340,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
   // Opt-in egress pin: null unless config.egress.pin is set, and then shared by
   // the base listener and the MITM one so both honour the same hold.
   const egress = createEgressGuard(config, console.error);
-  const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, egress, clientUsage, dimensionUsage });
+  const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, egress, clientUsage, dimensionUsage, ingressGate });
   const server = http.createServer(requestHandler);
 
   // What bounds a directory of one-shot dumps is deleting the expired ones, not
@@ -376,7 +381,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
     const c = await certsPromise;
     return { key: c.leafKeyPem, cert: c.leafCertPem };
   };
-  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks, log: console.error, sx, egress, clientUsage, dimensionUsage }));
+  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks, log: console.error, sx, egress, clientUsage, dimensionUsage, ingressGate }));
   // Remote Control's real-time channel is a WebSocket, not a request/response
   // call — Node fires 'upgrade' for that handshake, never 'request', so it
   // needs its own listener (base-URL routing path; the MITM path wires the
@@ -560,7 +565,7 @@ const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/'];
  * aware routing, and retry-on-quota behavior. Control endpoints (status/reload)
  * and the proxy-API-key gate live in the base server's wrapper, not here.
  */
-export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null, egress = null, clientUsage = null, forcedClient = null, dimensionUsage = null }) {
+export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null, egress = null, clientUsage = null, forcedClient = null, dimensionUsage = null, ingressGate = null }) {
   let counter = 0;
   return async (req, res) => {
     // The activity entry this request opened, while it is still open. Every
@@ -692,25 +697,41 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // Peek the top-level `model` field incrementally as chunks arrive so the
       // TUI can show it the instant it appears in the stream — usually the first
       // frame — rather than waiting for the whole body and the request to finish.
-      const bodyChunks = [];
-      // A headless service has no live model hook, so an incremental byte scan
-      // buys it nothing. Defer to parseRequestModel's native whole-body path in
-      // that case; this keeps large reconnect uploads from blocking status.
-      const modelFinder = hooks.onRequestModel ? new TopLevelFieldFinder('model') : null;
-      for await (const chunk of req) {
-        bodyChunks.push(chunk);
-        if (modelFinder && !modelFinder.done) {
-          const found = modelFinder.push(chunk);
-          if (found && !hideActivity) hooks.onRequestModel?.(reqId, { model: found });
+      let body;
+      let model;
+      let advisorModel;
+      let admitted = false;
+      try {
+        if (ingressGate) {
+          admitted = await ingressGate.enter();
+          if (!admitted) {
+            res.writeHead(503, { 'Content-Type': 'application/json', 'Retry-After': '1' });
+            res.end(JSON.stringify({ type: 'error', error: { type: 'overloaded_error', message: 'TeamClaude request queue is full; retry shortly.' } }));
+            return;
+          }
+          if (clientGone(res)) return;
         }
+        const bodyChunks = [];
+        // A headless service has no live model hook, so an incremental byte scan
+        // buys it nothing. Defer to parseRequestModel's native whole-body path in
+        // that case; this keeps large reconnect uploads from blocking status.
+        const modelFinder = hooks.onRequestModel ? new TopLevelFieldFinder('model') : null;
+        for await (const chunk of req) {
+          bodyChunks.push(chunk);
+          if (modelFinder && !modelFinder.done) {
+            const found = modelFinder.push(chunk);
+            if (found && !hideActivity) hooks.onRequestModel?.(reqId, { model: found });
+          }
+        }
+        body = Buffer.concat(bodyChunks);
+        model = modelFinder?.done ? modelFinder.value : parseRequestModel(body);
+        advisorModel = parseAdvisorModel(body);
+      } finally {
+        if (admitted) ingressGate.leave();
       }
-      const body = Buffer.concat(bodyChunks);
-
-      const model = modelFinder?.done ? modelFinder.value : parseRequestModel(body);
       // An advisor request (Claude Code's advisor tool) carries a SECOND model
       // nested in tools[]; the advisor sub-inference runs on the selected
       // account, so selection must be eligible for it too (issue #98).
-      const advisorModel = parseAdvisorModel(body);
 
       // Model blocklist (issue #116): reject a request for a blocked model right
       // here instead of forwarding it. A model no account can serve (e.g. Fable
