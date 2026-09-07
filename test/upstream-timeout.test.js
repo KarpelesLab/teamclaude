@@ -5,7 +5,7 @@ import { once } from 'node:events';
 import { ReadableStream } from 'node:stream/web';
 import { TextEncoder, TextDecoder } from 'node:util';
 import { upstreamFetch } from '../src/upstream-fetch.js';
-import { readWithIdleTimeout } from '../src/server.js';
+import { readWithIdleTimeout, streamResponse } from '../src/server.js';
 
 // Bring up an HTTP server on an ephemeral port and hand back {server, port}.
 async function listen(handler) {
@@ -146,4 +146,36 @@ test('body watchdog does not fire when chunks keep arriving', async () => {
   } finally {
     clearInterval(alive);
   }
+});
+
+test('a continuously buffered SSE stream yields to other server work', async () => {
+  const totalChunks = 10_000;
+  const chunk = new TextEncoder().encode('event: ping\n\n');
+  let emitted = 0;
+  let written = 0;
+  const stream = new ReadableStream({
+    pull(controller) {
+      if (emitted === totalChunks) {
+        controller.close();
+        return;
+      }
+      emitted += 1;
+      controller.enqueue(chunk);
+    },
+  });
+  const res = {
+    destroyed: false,
+    writableEnded: false,
+    write() { written += 1; return true; },
+    end() { this.writableEnded = true; },
+  };
+  const accountManager = { recordTokenUsage() {} };
+
+  const relay = streamResponse(stream, res, 0, accountManager);
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.ok(written > 0, 'the relay never started');
+  assert.ok(written < totalChunks,
+    `the relay consumed all ${totalChunks} ready chunks without yielding an event-loop turn`);
+  await relay;
 });

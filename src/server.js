@@ -2017,6 +2017,13 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
 // the sx-tunnel path, since both hand back a web ReadableStream). Override with
 // TEAMCLAUDE_UPSTREAM_BODY_TIMEOUT_MS.
 const DEFAULT_BODY_IDLE_TIMEOUT_MS = 120_000;
+// A web-stream read resolves as a microtask when undici already has bytes
+// buffered. With a busy upstream, repeatedly awaiting those ready reads never
+// returns to the event-loop poll phase, so the listener can accept a status
+// connection in the kernel while JavaScript never runs its request handler.
+// Yield periodically even when neither socket applies backpressure. Thirty-two
+// chunks keeps the relay hot while bounding how long control-plane requests wait.
+const STREAM_FAIRNESS_CHUNKS = 32;
 
 function resolveBodyIdleTimeout() {
   const env = Number(process.env.TEAMCLAUDE_UPSTREAM_BODY_TIMEOUT_MS);
@@ -2047,12 +2054,13 @@ export function readWithIdleTimeout(reader, ms) {
 /**
  * Stream an SSE response to the client, parsing usage data along the way.
  */
-async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter, onUsage = null, sessionId = null, model = null) {
+export async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter, onUsage = null, sessionId = null, model = null) {
   const reader = webStream.getReader();
   const idleMs = resolveBodyIdleTimeout();
   const decoder = new TextDecoder();
   let sseBuffer = '';
   let errored = false;
+  let chunksSinceYield = 0;
   // The message's usage, merged across its two reports and recorded once below.
   const merged = {};
 
@@ -2097,6 +2105,16 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
           res.once('drain', done);
           res.once('close', done);
         });
+        if (clientGone(res)) break;
+      }
+
+      // `reader.read()` may stay immediately ready for the entire response.
+      // Awaiting an already-settled promise only drains more microtasks; it does
+      // not give the HTTP listener a turn to answer status/reload/dashboard.
+      chunksSinceYield += 1;
+      if (chunksSinceYield >= STREAM_FAIRNESS_CHUNKS) {
+        chunksSinceYield = 0;
+        await new Promise(resolve => setImmediate(resolve));
         if (clientGone(res)) break;
       }
     }
