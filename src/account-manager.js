@@ -2374,7 +2374,9 @@ export class AccountManager {
       if (acc.index === this.currentIndex) continue;
       // An account this request cannot be sent to decides nothing about where it
       // goes: a foreign provider serves none of its models, and one it has
-      // already tried refused it.
+      // already tried refused it. refreshExpiredQuotas already leaves such
+      // accounts out of `candidates`; the check is kept where the parameter is,
+      // so a caller that does not filter first gets the same answer.
       if (exclude?.has(acc.index)) continue;
       // Model-scoped, because the request being routed has one: an account whose
       // Fable weekly is spent is still fully usable for Opus, and a switch that
