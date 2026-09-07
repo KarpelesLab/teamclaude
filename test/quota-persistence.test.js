@@ -12,7 +12,7 @@ test('exportQuotaState carries only persistable fields and identity, no credenti
   am.accounts[0].quota.unified7d = 0.42;
   const [entry] = am.exportQuotaState();
 
-  assert.deepEqual(Object.keys(entry).sort(), ['accountUuid', 'name', 'orgName', 'orgUuid', 'profile', 'quota'].sort());
+  assert.deepEqual(Object.keys(entry).sort(), ['accountUuid', 'name', 'orgName', 'orgUuid', 'profile', 'quota', 'adaptive'].sort());
   assert.equal(entry.accountUuid, 'p1');
   assert.equal(entry.quota.unified7d, 0.42);
   // Transient/credential fields must not leak.
@@ -20,6 +20,21 @@ test('exportQuotaState carries only persistable fields and identity, no credenti
   assert.ok(!('rateLimitedUntil' in entry.quota));
   assert.ok(!('credential' in entry));
   assert.ok(!('accessToken' in entry));
+});
+
+test('adaptive burn and concurrency learning survive an identity-matched restart', () => {
+  const am1 = new AccountManager([oauth('a', { accountUuid: 'p1' })], 0.98);
+  const t0 = Date.now();
+  am1.burnRateLearner.observeUtilization(0, 'unified7d', 0.10, t0);
+  am1.burnRateLearner.observeUtilization(0, 'unified7d', 0.20, t0 + 5 * 60_000);
+  am1.concurrencyLearner.caps.set(0, 3.5);
+  const reserve = am1.burnRateLearner.reserve(0, 'unified7d');
+
+  const am2 = new AccountManager([oauth('a', { accountUuid: 'p1' })], 0.98);
+  am2.restoreQuotaState(am1.exportQuotaState());
+
+  assert.equal(am2.burnRateLearner.reserve(0, 'unified7d'), reserve);
+  assert.equal(am2.concurrencyLearner.cap(0), 3.5);
 });
 
 test('quota survives an export → restore round-trip', () => {

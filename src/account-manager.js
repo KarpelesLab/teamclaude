@@ -5,10 +5,10 @@ import { parseCodexQuota, parseCodexPlanType } from './codex-quota.js';
 import { sameIdentity } from './identity.js';
 import { weeklyBucketForModel, modelGlobMatches, modelFamily, gatingUtilization, resolveMaxUsage, WEEKLY_BUCKET_KEYS } from './model.js';
 import { SessionTracker } from './session-tracker.js';
-import { buildQuotaSummary } from './quota-summary.js';
+import { buildQuotaSummary, quotaTier } from './quota-summary.js';
 import { ROLLOVER_MIN_JUMP_MS, remapHeld } from './rollover.js';
 import { decideBand, pressureOf, pressureRank, assertNever } from './band-decision.js';
-import { CapacityLearner, ConcurrencyLearner, scoreCandidate } from './adaptive-distribution.js';
+import { BurnRateLearner, ConcurrencyLearner, scoreCandidate } from './adaptive-distribution.js';
 
 // Re-exported for callers that import these model helpers from here.
 export { isFableModel, parseRequestModel, parseAdvisorModel } from './model.js';
@@ -28,7 +28,11 @@ export { isFableModel, parseRequestModel, parseAdvisorModel } from './model.js';
  * the worse reading of a typo.
  */
 export function distributionMode(setting) {
-  if (setting === 'adaptive') return 'adaptive';
+  if (typeof setting === 'string') {
+    const value = setting.trim().toLowerCase();
+    if (value === 'adaptive') return 'adaptive';
+    if (['off', 'false', 'no', '0'].includes(value)) return 'off';
+  }
   if (!setting) return 'off';
   return 'even';
 }
@@ -238,13 +242,11 @@ export class AccountManager {
     // header and the remote dashboard all ask only that question.
     this.distributionMode = distributionMode(distributeSessions);
     this.distributeSessions = this.distributionMode !== 'off';
-    // Adaptive mode's two learned quantities: how big each account's weekly
-    // window is (its plan tier) and how much concurrency it tolerates. Both are
-    // inferred from live traffic — see adaptive-distribution.js. Constructed
-    // unconditionally and fed on every request regardless of mode, so switching
-    // to adaptive at runtime starts from what has already been observed instead
-    // of from a cold start.
-    this.capacityLearner = new CapacityLearner(adaptive);
+    // Adaptive burn rate and tolerated concurrency are inferred from live
+    // traffic. Plan size is authoritative OAuth profile metadata, not a learned
+    // estimate. Learners are constructed unconditionally so enabling adaptive
+    // mode at runtime can use observations already collected in this process.
+    this.burnRateLearner = new BurnRateLearner(adaptive);
     this.concurrencyLearner = new ConcurrencyLearner(adaptive);
     // Sessions still being drained after distribution was turned off (see
     // setDistributeSessions). null = not draining; a Set of session ids otherwise.
@@ -875,7 +877,7 @@ export class AccountManager {
 
   /** The quota window whose utilization adaptive scoring is using. Family
    * requests consume both their family window and the shared weekly window, so
-   * the tighter one supplies utilization, learned capacity, and burn reserve as
+   * the tighter one supplies utilization and burn reserve as
    * one unit. Dynamic scoped windows use the same `scoped:<family>` key that the
    * learner is fed from usage-probe observations. */
   _adaptiveWindow(account, model) {
@@ -905,7 +907,7 @@ export class AccountManager {
   /**
    * Adaptive selection: among the highest-priority eligible accounts, pick the
    * best score from adaptive-distribution.js — least remaining weekly credit
-   * (measured in tokens once the plan tier has been learned), tapered off as
+   * (weighted by the authoritative subscription tier), tapered off as
    * the account nears its switch threshold, and discounted by how much work is
    * already on it.
    *
@@ -934,22 +936,21 @@ export class AccountManager {
     const tier = eligible.filter(a => (a.priority || 0) === topPriority);
     if (tier.length === 1) return tier[0];
 
-    // `remaining` is comparable across the tier only if it is in one unit, and
-    // it is in tokens only where the capacity is known. A tier that has learned
-    // some accounts and not others would mix tokens with bare fractions and
-    // rank on the difference, so the absolute form is used only when EVERY
-    // candidate has been learned; otherwise all of them fall back to fractions.
+    // The OAuth profile already names the subscription tier. Reuse the same
+    // 1x/5x/20x mapping as quota summary instead of estimating plan size from
+    // token deltas. If any candidate has an unknown/future tier, keep the whole
+    // comparison in fractions rather than mixing unlike units.
     const windows = tier.map(a => this._adaptiveWindow(a, model));
-    const capacities = tier.map((a, i) => this.capacityLearner.capacity(a.index, windows[i].bucket));
-    const useCapacity = capacities.every(c => c != null && c > 0);
+    const planWeights = tier.map(a => quotaTier(a).weight);
+    const usePlanWeights = planWeights.every(weight => weight != null && weight > 0);
 
     const candidates = tier.map((account, i) => ({
       account,
       index: account.index,
       utilization: windows[i].utilization,
       threshold,
-      capacity: useCapacity ? capacities[i] : null,
-      reserve: this.capacityLearner.reserve(account.index, windows[i].bucket),
+      capacity: usePlanWeights ? planWeights[i] : null,
+      reserve: this.burnRateLearner.reserve(account.index, windows[i].bucket),
       load: this.sessionTracker.activeCountFor(account.index, now) + (account.inFlight || 0),
       concCap: this.concurrencyLearner.cap(account.index),
     }));
@@ -1066,8 +1067,8 @@ export class AccountManager {
   }
 
   /**
-   * Per-account diagnostics for adaptive distribution: what has been learned,
-   * each account's relative score weight, and the actual next target.
+   * Per-account diagnostics for adaptive distribution: the profile plan tier,
+   * relative score weight, and actual next target.
    *
    * This exists to make the mode auditable. Adaptive routing is the one mode
    * whose decision is not readable off the account list — "3 sessions here, 1
@@ -1080,32 +1081,29 @@ export class AccountManager {
    * learned, but nothing is routing on them, and presenting them as if they
    * governed anything would misreport what the proxy is doing.
    */
-  adaptiveStats(model = null) {
+  adaptiveStats(model = null, provider = DEFAULT_PROVIDER) {
     if (this.distributionMode !== 'adaptive') return [];
     const now = Date.now();
     const bucket = this._weeklyBucketFor(model);
     const threshold = this.thresholdFor(bucket);
 
-    const eligible = this._bandedCandidates(null, model);
+    const excluded = this._excludeOtherProviders(null, provider);
+    const eligible = this._bandedCandidates(excluded, model);
     const topPriority = eligible.length ? Math.min(...eligible.map(a => a.priority || 0)) : 0;
     // Only the accounts actually competing get a weight: an ineligible or
     // outranked account's weight is not "small", it is not in the draw at all.
     const inTier = new Set(eligible.filter(a => (a.priority || 0) === topPriority).map(a => a.index));
 
     const windows = new Map(this.accounts.map(a => [a.index, this._adaptiveWindow(a, model)]));
-    const capacities = new Map(this.accounts.map(a => {
-      const window = windows.get(a.index);
-      return [a.index, this.capacityLearner.capacity(a.index, window.bucket)];
-    }));
-    const useCapacity = [...inTier].every(i => capacities.get(i) != null && capacities.get(i) > 0);
+    const planWeights = new Map(this.accounts.map(a => [a.index, quotaTier(a).weight]));
+    const usePlanWeights = [...inTier].every(i => planWeights.get(i) != null && planWeights.get(i) > 0);
 
     const rows = this.accounts.map(a => {
       const window = windows.get(a.index);
       const utilization = window.utilization;
       const u = Number.isFinite(utilization) ? utilization : 0;
       const head = Math.max(0, threshold - u);
-      const capacity = capacities.get(a.index);
-      const burnRate = this.capacityLearner.burnRate(a.index, window.bucket);
+      const planWeight = planWeights.get(a.index);
       return {
         index: a.index,
         name: a.name,
@@ -1123,19 +1121,13 @@ export class AccountManager {
         // the only headroom that affects a routing decision.
         headroom: head,
         threshold,
-        // Learned window size in metered tokens — the account's plan tier as
-        // observed, rather than as declared. null until enough has been seen.
-        capacity: capacity ?? null,
-        reserve: this.capacityLearner.reserve(a.index, window.bucket),
+        // Authoritative relative subscription capacity from the OAuth profile.
+        // Unknown future tiers stay null and make the tier fall back to plain
+        // utilization fractions rather than a guessed multiplier.
+        planWeight: planWeight ?? null,
+        reserve: this.burnRateLearner.reserve(a.index, window.bucket),
         concCap: this.concurrencyLearner.cap(a.index),
-        // Observed throughput, in metered tokens per second. Derived rather
-        // than separately counted: burn rate is a fraction of the window per
-        // ms and capacity is tokens per window, so their product is tokens per
-        // ms and needs no plumbing of its own. Null while the tier is unknown,
-        // because a rate in fractions-of-a-window is not comparable between
-        // accounts on different plans — which is the whole point of showing it.
-        tokensPerSecond: capacity != null ? burnRate * capacity * 1000 : null,
-        _remaining: (useCapacity && capacity != null ? capacity : 1) * head,
+        _remaining: (usePlanWeights && planWeight != null ? planWeight : 1) * head,
       };
     });
 
@@ -1146,7 +1138,7 @@ export class AccountManager {
       const { score } = scoreCandidate({
         utilization: r.utilization,
         threshold,
-        capacity: useCapacity ? r.capacity : null,
+        capacity: usePlanWeights ? r.planWeight : null,
         reserve: r.reserve,
         load: r.sessions + r.inFlight,
         concCap: r.concCap,
@@ -1155,7 +1147,7 @@ export class AccountManager {
       r.score = score;
       total += score;
     }
-    const next = this._pickLeastLoaded(null, model);
+    const next = this._pickLeastLoaded(excluded, model);
     for (const r of rows) {
       // A normalized score weight explains the relative inputs but is not a
       // routing probability: the picker deterministically takes the maximum.
@@ -2763,11 +2755,15 @@ export class AccountManager {
    */
   _updateCodexQuota(account, headers) {
     const parsed = parseCodexQuota(headers);
+    const observed = new Set();
     const plan = parseCodexPlanType(headers);
     if (plan) account.quota.planType = plan;
 
     if (parsed.unified5h != null) account.quota.unified5h = parsed.unified5h;
-    if (parsed.unified7d != null) account.quota.unified7d = parsed.unified7d;
+    if (parsed.unified7d != null) {
+      account.quota.unified7d = parsed.unified7d;
+      observed.add('unified7d');
+    }
     if (parsed.unified5hReset != null) account.quota.unified5hReset = parsed.unified5hReset;
     if (parsed.unified7dReset != null) account.quota.unified7dReset = parsed.unified7dReset;
 
@@ -2792,7 +2788,7 @@ export class AccountManager {
       console.log(`[TeamClaude] Learned weekly quota for "${account.name}", re-evaluating selection`);
     }
 
-    this._observeQuotaForLearning(account);
+    this._observeBurnRate(account, observed);
 
     account.usage.totalRequests++;
     account.usage.lastUsed = new Date().toISOString();
@@ -2816,11 +2812,15 @@ export class AccountManager {
       return;
     }
 
+    const observed = new Set();
     // Unified rate limits (Claude Max)
     const u5h = parseFloat(headers['anthropic-ratelimit-unified-5h-utilization']);
     const u7d = parseFloat(headers['anthropic-ratelimit-unified-7d-utilization']);
     if (!isNaN(u5h)) account.quota.unified5h = u5h;
-    if (!isNaN(u7d)) account.quota.unified7d = u7d;
+    if (!isNaN(u7d)) {
+      account.quota.unified7d = u7d;
+      observed.add('unified7d');
+    }
 
     const r5h = headers['anthropic-ratelimit-unified-5h-reset'];
     const r7d = headers['anthropic-ratelimit-unified-7d-reset'];
@@ -2838,6 +2838,7 @@ export class AccountManager {
     if (!isNaN(u7dOi)) {
       account.quota.unified7dFable = u7dOi;
       account.quota.unified7dFableSeenAt = Date.now();
+      observed.add('unified7dFable');
     }
     const r7dOi = headers['anthropic-ratelimit-unified-7d_oi-reset'];
     if (r7dOi) account.quota.unified7dFableReset = parseInt(r7dOi, 10) * 1000;
@@ -2872,7 +2873,7 @@ export class AccountManager {
     if (tokensReset) account.quota.resetsAt = tokensReset;
     else if (requestsReset) account.quota.resetsAt = requestsReset;
 
-    this._observeQuotaForLearning(account);
+    this._observeBurnRate(account, observed);
 
     account.usage.totalRequests++;
     account.usage.lastUsed = new Date().toISOString();
@@ -2889,28 +2890,23 @@ export class AccountManager {
   }
 
   /**
-   * Feed every weekly utilization this account currently reports to the
-   * capacity learner, so adaptive distribution can price the tokens recorded
-   * since the last reading.
+   * Feed only weekly windows refreshed by this response to the burn learner.
    *
    * Called from all three paths that learn a utilization — response headers
    * (Anthropic and Codex) and the background usage probe — rather than from
-   * selection, because what makes a sample usable is that it is FRESH: the
-   * learner divides tokens by the utilization move they caused, and only the
-   * moment a new reading arrives are the two known to cover the same interval.
+   * selection, because a cached family value in a shared-only response is not a
+   * fresh observation and must not close or rebaseline that family's sample.
    */
-  _observeQuotaForLearning(account) {
+  _observeBurnRate(account, buckets) {
     if (!account) return;
     const q = account.quota;
     const now = Date.now();
-    this.capacityLearner.observeUtilization(account.index, 'unified7d', q.unified7d, now);
-    for (const { key } of FAMILY_WEEKLY_BUCKETS) {
-      if (q[key] != null) this.capacityLearner.observeUtilization(account.index, key, q[key], now);
-    }
-    for (const [family, scoped] of Object.entries(q.scopedWeekly || {})) {
-      if (scoped?.utilization != null) {
-        this.capacityLearner.observeUtilization(account.index,
-          `scoped:${family}`, scoped.utilization, now);
+    for (const bucket of buckets || []) {
+      const scoped = bucket.startsWith('scoped:')
+        ? q.scopedWeekly?.[bucket.slice('scoped:'.length)]?.utilization
+        : q[bucket];
+      if (scoped != null) {
+        this.burnRateLearner.observeUtilization(account.index, bucket, scoped, now);
       }
     }
   }
@@ -2964,18 +2960,6 @@ export class AccountManager {
     // A request with no session id (or one the tracker has forgotten) is still a
     // real spend by the account, so the two scopes are recorded independently.
     this.sessionTracker.recordTokens(sessionId, bucket, usage);
-    // Third scope: what these tokens cost each weekly window they consume.
-    // Family traffic advances both its own bucket and shared weekly quota; a
-    // dynamically reported scoped bucket does the same. Feed every applicable
-    // window so a later utilization reading is priced with matching tokens.
-    const learningBuckets = new Set(['unified7d', bucket]);
-    if (account && bucket === 'unified7d') {
-      const scoped = this._scopedWeekly(account, model);
-      if (scoped) learningBuckets.add(`scoped:${modelFamily(model)}`);
-    }
-    for (const learningBucket of learningBuckets) {
-      this.capacityLearner.recordTokens(accountIndex, learningBucket, usage);
-    }
   }
 
   /**
@@ -3009,13 +2993,17 @@ export class AccountManager {
     // transient HTTP error clear a bucket below.
     if (!account || !usage || usage.error) return;
     const q = account.quota;
+    const observed = new Set();
 
     if (usage.fiveHour) {
       if (usage.fiveHour.utilization != null) q.unified5h = usage.fiveHour.utilization;
       if (usage.fiveHour.resetAt != null) q.unified5hReset = usage.fiveHour.resetAt;
     }
     if (usage.sevenDay) {
-      if (usage.sevenDay.utilization != null) q.unified7d = usage.sevenDay.utilization;
+      if (usage.sevenDay.utilization != null) {
+        q.unified7d = usage.sevenDay.utilization;
+        observed.add('unified7d');
+      }
       if (usage.sevenDay.resetAt != null) q.unified7dReset = usage.sevenDay.resetAt;
     }
 
@@ -3045,6 +3033,7 @@ export class AccountManager {
         q[key] = bucket.utilization;
         q[`${key}Reset`] = bucket.resetAt ?? null;
         q[`${key}SeenAt`] = now;
+        observed.add(key);
       } else if (!bucket && usage.scopedWeeklyListed) {
         q[key] = null;
         q[`${key}Reset`] = null;
@@ -3061,11 +3050,15 @@ export class AccountManager {
     // than merged: a bucket that has dropped out of the payload no longer
     // applies, and keeping a remembered copy would gate on a limit that upstream
     // has stopped reporting.
-    if (usage.scopedWeekly) q.scopedWeekly = { ...usage.scopedWeekly };
-    // A probe is the cleanest capacity sample there is: it reads the same
-    // buckets a response header would, without spending anything itself, so the
-    // tokens it prices are exactly the client traffic since the last reading.
-    this._observeQuotaForLearning(account);
+    if (usage.scopedWeekly) {
+      q.scopedWeekly = { ...usage.scopedWeekly };
+      for (const [family, bucket] of Object.entries(usage.scopedWeekly)) {
+        if (bucket?.utilization != null) observed.add(`scoped:${family}`);
+      }
+    }
+    // A probe provides fresh utilization points without spending quota itself.
+    // Feed only the windows actually present in this payload.
+    this._observeBurnRate(account, observed);
 
     // Paid overage. Replaced wholesale like the buckets above, and announced
     // once on the transition into billing: an account that starts drawing real
@@ -3287,7 +3280,7 @@ export class AccountManager {
     // are the rollover observations hanging off them and off the current account.
     const remap = idx => (idx === index ? null : idx > index ? idx - 1 : idx);
     this.sessionTracker.remapAccounts(remap);
-    this.capacityLearner.remapAccounts(remap);
+    this.burnRateLearner.remapAccounts(remap);
     this.concurrencyLearner.remapAccounts(remap);
     // The observation names its account by index, so it follows the shift or
     // goes away with the account it described. Left behind, it would be read
@@ -3318,7 +3311,11 @@ export class AccountManager {
         hasClaudeMax: a.hasClaudeMax,
         hasClaudePro: a.hasClaudePro,
       };
-      return { accountUuid: a.accountUuid, orgUuid: a.orgUuid, orgName: a.orgName, name: a.name, profile, quota };
+      const adaptive = {
+        burnRate: this.burnRateLearner.export(a.index),
+        concCap: this.concurrencyLearner.export(a.index),
+      };
+      return { accountUuid: a.accountUuid, orgUuid: a.orgUuid, orgName: a.orgName, name: a.name, profile, quota, adaptive };
     });
   }
 
@@ -3338,6 +3335,8 @@ export class AccountManager {
       for (const field of ['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro']) {
         if (match.profile?.[field] != null) account[field] = match.profile[field];
       }
+      this.burnRateLearner.restore(account.index, match.adaptive?.burnRate);
+      this.concurrencyLearner.restore(account.index, match.adaptive?.concCap);
       // We already know this account's weekly window, so it isn't "probing".
       if (account.quota.unified7dReset != null) account.probing = false;
     }

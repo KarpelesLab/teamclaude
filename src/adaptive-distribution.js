@@ -18,11 +18,10 @@
 // spent down to the wall and never into it, and backs off when the account is
 // congested, so concentrating never costs response time.
 //
-// Nothing here is configured per account. Both quantities that would otherwise
-// be operator-set constants — how big an account's window is (its plan tier)
-// and how much concurrency it tolerates — are LEARNED from traffic, so the
-// fleet re-tunes itself as plans change, as upstream's limits move, and as the
-// week progresses. See CapacityLearner and ConcurrencyLearner below.
+// Plan size comes from the authoritative OAuth profile tier. The two dynamic
+// quantities — burn rate and tolerated concurrency — are learned from traffic,
+// so the fleet responds to current behavior without guessing the subscription.
+// See BurnRateLearner and ConcurrencyLearner below.
 
 // One EWMA step. `alpha` is the weight of the new sample.
 function ewma(prev, sample, alpha) {
@@ -34,18 +33,7 @@ function clamp(v, lo, hi) {
 }
 
 export const ADAPTIVE_DEFAULTS = {
-  // ── Plan-tier learning ────────────────────────────────────────────────────
-  // Weight of each new tokens-per-window sample. Deliberately slow: capacity is
-  // a property of the plan, so a single odd request (a huge cache write, a
-  // probe landing between two spends) must move it very little.
-  capacityAlpha: 0.2,
-  // The smallest utilization move that yields a usable sample. Below this the
-  // quotient is dominated by the reading's own rounding — upstream reports
-  // utilization to a few decimals — and would inject noise, not signal.
-  minDeltaU: 0.002,
-  // A sample is only meaningful if the tokens and the utilization move cover
-  // the same work. Past this the reading is treated as a fresh baseline
-  // instead: an idle gap, a restart, or a window reset sat in between.
+  // A burn sample cannot span an idle gap or a window reset.
   maxSampleAgeMs: 15 * 60_000,
 
   // ── Reserve (the taper's width) ───────────────────────────────────────────
@@ -95,23 +83,15 @@ export const ADAPTIVE_DEFAULTS = {
 };
 
 /**
- * Learns each account's weekly-window size in tokens — its plan tier — by
- * watching how far one unit of spend moves that window's utilization.
- *
- * A Max 20x and a Pro account both report utilization as a 0-1 fraction, so the
- * fraction alone says nothing about how much work is left behind it: 10% of a
- * 20x window is many times 10% of a Pro one. Dividing the tokens actually
- * served by the utilization those tokens consumed recovers the missing scale,
- * in the only unit that matters here — how much work the window still holds.
- *
- * Kept per (account, weekly bucket) because the buckets are separately sized:
- * an account's Fable weekly is not its shared weekly, and one cannot be used to
- * predict the other.
+ * Learns how quickly each account is consuming each weekly window. Plan size
+ * is deliberately not inferred here: AccountManager reads the subscription
+ * tier supplied by the OAuth profile and uses quota headers only for current
+ * utilization/reset state.
  */
-export class CapacityLearner {
+export class BurnRateLearner {
   constructor(opts = {}) {
     this.opts = { ...ADAPTIVE_DEFAULTS, ...opts };
-    // "index:bucket" -> { capacity, burnRate, lastU, lastAt, pendingTokens }
+    // "index:bucket" -> burn-rate observation state
     this.state = new Map();
   }
 
@@ -120,7 +100,7 @@ export class CapacityLearner {
     let s = this.state.get(key);
     if (!s) {
       s = {
-        capacity: null, burnRate: null, lastU: null, lastAt: null, pendingTokens: 0,
+        burnRate: null, lastU: null, lastAt: null,
         // The open burn-rate measurement window: where utilization stood when
         // it opened, and when. Deliberately independent of lastU/lastAt, which
         // move on every reading — this pair holds still until the window is
@@ -132,37 +112,11 @@ export class CapacityLearner {
     return s;
   }
 
-  /**
-   * Count tokens spent on an account's bucket, pending the next utilization
-   * reading that will price them. Only the tokens that actually meter are
-   * counted: a cache READ is billed at a fraction upstream does not publish, so
-   * including it would make the same work look like more spend on a
-   * cache-heavy session than a cold one and bias the learned capacity by how
-   * the client happened to use its cache.
-   */
-  recordTokens(index, bucket, usage) {
-    if (!usage) return;
-    const n = (v) => (Number.isFinite(v) ? v : 0);
-    const metered = n(usage.input_tokens) + n(usage.output_tokens)
-      + n(usage.cache_creation_input_tokens);
-    if (metered > 0) this._slot(index, bucket).pendingTokens += metered;
-  }
-
-  /**
-   * Price the pending tokens against a fresh utilization reading.
-   *
-   * Three readings are rejected rather than learned from, because each would
-   * teach the wrong number:
-   *   - a DROP in utilization is a window reset, not negative spend;
-   *   - a move smaller than `minDeltaU` is within the reading's own resolution;
-   *   - a gap longer than `maxSampleAgeMs` means the tokens and the move are
-   *     not measuring the same interval (an idle stretch, or a restart).
-   * All three still re-baseline, so the next interval starts clean.
-   */
+  /** Observe a fresh utilization reading for one specific quota window. */
   observeUtilization(index, bucket, utilization, now = Date.now()) {
     if (!Number.isFinite(utilization)) return;
     const s = this._slot(index, bucket);
-    const { lastU, lastAt, pendingTokens } = s;
+    const { lastU, lastAt } = s;
     // `restart` also reopens the burn window: it is only used where continuity
     // is broken (a reset, a stale gap), and measuring across that break would
     // price a window's worth of drop, or an idle stretch, as this account's
@@ -170,7 +124,6 @@ export class CapacityLearner {
     const rebaseline = (restart) => {
       s.lastU = utilization;
       s.lastAt = now;
-      s.pendingTokens = 0;
       if (restart || s.burnAnchorAt == null) {
         s.burnAnchorU = utilization;
         s.burnAnchorAt = now;
@@ -198,17 +151,7 @@ export class CapacityLearner {
       s.burnAnchorU = utilization;
       s.burnAnchorAt = now;
     }
-    if (deltaU === 0) return rebaseline(false);
-    if (deltaU >= this.opts.minDeltaU && pendingTokens > 0) {
-      // Tokens the whole window holds, if this rate held across all of it.
-      s.capacity = ewma(s.capacity, pendingTokens / deltaU, this.opts.capacityAlpha);
-    }
     rebaseline(false);
-  }
-
-  /** Learned window size in tokens, or null while it is still unknown. */
-  capacity(index, bucket) {
-    return this.state.get(`${index}:${bucket}`)?.capacity ?? null;
   }
 
   /** Learned utilization-per-ms, falling back to the cold-start assumption. */
@@ -244,6 +187,28 @@ export class CapacityLearner {
       if (mapped != null) next.set(`${mapped}:${key.slice(colon + 1)}`, value);
     }
     this.state = next;
+  }
+
+  /** Serializable per-account state for the existing identity-keyed state file. */
+  export(index) {
+    const result = {};
+    for (const [key, value] of this.state) {
+      const prefix = `${index}:`;
+      if (key.startsWith(prefix)) result[key.slice(prefix.length)] = { ...value };
+    }
+    return result;
+  }
+
+  restore(index, saved) {
+    if (!saved || typeof saved !== 'object' || Array.isArray(saved)) return;
+    for (const [bucket, value] of Object.entries(saved)) {
+      if (!bucket || !value || typeof value !== 'object' || Array.isArray(value)) continue;
+      const clean = {};
+      for (const field of ['burnRate', 'lastU', 'lastAt', 'burnAnchorU', 'burnAnchorAt']) {
+        clean[field] = Number.isFinite(value[field]) ? value[field] : null;
+      }
+      this.state.set(`${index}:${bucket}`, clean);
+    }
   }
 }
 
@@ -308,6 +273,15 @@ export class ConcurrencyLearner {
     }
     this.caps = next;
   }
+
+  export(index) {
+    return this.caps.has(index) ? this.caps.get(index) : null;
+  }
+
+  restore(index, cap) {
+    if (!Number.isFinite(cap)) return;
+    this.caps.set(index, clamp(cap, this.opts.minConcCap, this.opts.maxConcCap));
+  }
 }
 
 /**
@@ -316,7 +290,8 @@ export class ConcurrencyLearner {
  * just that it was.
  *
  * @param {object} c
- *   index, utilization (0-1 or null), threshold, capacity (tokens or null),
+ *   index, utilization (0-1 or null), threshold, capacity (relative plan
+ *   weight or null),
  *   reserve (fraction), load (active sessions + in-flight), concCap,
  *   maxRemaining (the largest `remaining` among the candidates)
  */
@@ -329,10 +304,9 @@ export function scoreCandidate(c, opts = ADAPTIVE_DEFAULTS) {
   const u = Number.isFinite(c.utilization) ? c.utilization : 0;
   const head = Math.max(0, c.threshold - u);
 
-  // Remaining credit. With a learned capacity this is absolute (tokens), which
-  // is what makes the comparison fair across plan tiers: 10% of a 20x window
-  // outranks 40% of a Pro one, as it should. Without it, the fraction is the
-  // best available stand-in and the comparison degrades to the same-tier case.
+  // Remaining credit. A profile-derived capacity weight makes the comparison
+  // fair across plan tiers: 10% of a 20x window outranks 40% of a Pro one, as
+  // it should. With an unknown tier, the fraction is the safe stand-in.
   const remaining = c.capacity != null ? c.capacity * head : head;
 
   // Burn-down: prefer the account with the LEAST left, to finish its window

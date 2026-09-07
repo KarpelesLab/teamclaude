@@ -416,10 +416,10 @@ test('adaptive diagnostics name the next target, score weight, and family split'
   s.adaptive = [{
     name: 'a', bucket: 'unified7d', window: 'unified7d', competing: true,
     next: true, weight: 0.6, sessions: 3, inFlight: 1,
-    headroom: 0.28, threshold: 0.98, capacity: 10_000_000,
-    tokensPerSecond: 1200, concCap: 6,
+    headroom: 0.28, threshold: 0.98, planWeight: 20, concCap: 6,
   }];
   const out = renderStatus(s, { color: false, now });
   assert.match(out, /^> a .*3 sess \(opus\+ 2, fable 1\)$/m);
   assert.match(out, /Adaptive\s+next · weight 60% of opus\+/);
+  assert.match(out, /plan 20x/);
 });

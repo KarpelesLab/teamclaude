@@ -303,8 +303,8 @@ function adaptiveFor(status, name) {
   return (status.adaptive || []).find(r => r.name === name) || null;
 }
 
-// "next · weight 62%  ·  3 sess / 1 inflight  ·  head 38.0% of 98%  ·  tier 42.1M tok
-//  ·  1.2k tok/s  ·  conc 6"
+// "next · weight 62%  ·  3 sess / 1 inflight  ·  head 38.0% of 98%  ·  plan 20x
+//  ·  conc 6"
 //
 // `next` is the deterministic routing result. `weight` is the account's score
 // normalized across competitors, useful for explaining why it won without
@@ -321,11 +321,9 @@ function formatAdaptive(a, paint) {
     : `${prefix}${paint.bold(`weight ${(a.weight * 100).toFixed(0)}% of ${family}`)}`);
   parts.push(`${a.sessions} sess / ${a.inFlight} inflight`);
   parts.push(`head ${(a.headroom * 100).toFixed(1)}% of ${(a.threshold * 100).toFixed(0)}%`);
-  // Both learned figures are absent together (tok/s is derived from the tier),
-  // so one "learning" note covers them rather than two nulls.
-  parts.push(a.capacity == null
-    ? paint.dim('tier learning…')
-    : `tier ${formatNumber(Math.round(a.capacity))} tok · ${formatNumber(Math.round(a.tokensPerSecond))} tok/s`);
+  parts.push(a.planWeight == null
+    ? paint.dim('plan unknown')
+    : `plan ${a.planWeight}x`);
   parts.push(`conc ${a.concCap.toFixed(1)}`);
   const line = parts.join(paint.dim('  ·  '));
   return a.competing ? line : `${paint.dim('(not competing)')} ${line}`;

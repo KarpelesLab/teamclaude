@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountManager, distributionMode } from '../src/account-manager.js';
-import { CapacityLearner, ConcurrencyLearner, scoreCandidate, ADAPTIVE_DEFAULTS } from '../src/adaptive-distribution.js';
+import { BurnRateLearner, ConcurrencyLearner, scoreCandidate, ADAPTIVE_DEFAULTS } from '../src/adaptive-distribution.js';
 
 const H = 3600_000;
 const OPUS = 'claude-opus-5';
@@ -21,15 +21,6 @@ function weekly(am, index, used, hours = 72) {
   q.unified7d = used;
   q.unified7dReset = Date.now() + hours * H;
   am.accounts[index].probing = false;
-}
-
-// Teach the capacity learner a window size directly, the way live traffic
-// would: spend `tokens`, then report the utilization those tokens moved.
-function teachCapacity(am, index, bucket, tokens, deltaU, base = 0) {
-  const t0 = Date.now();
-  am.capacityLearner.observeUtilization(index, bucket, base, t0);
-  am.capacityLearner.recordTokens(index, bucket, { input_tokens: tokens, output_tokens: 0 });
-  am.capacityLearner.observeUtilization(index, bucket, base + deltaU, t0 + 60_000);
 }
 
 // Route `n` fresh sessions and report how many each account received.
@@ -52,6 +43,9 @@ test('distributionMode maps the setting without breaking the boolean forms', () 
   assert.equal(distributionMode(false), 'off');
   assert.equal(distributionMode(true), 'even');
   assert.equal(distributionMode('adaptive'), 'adaptive');
+  for (const value of ['off', 'false', 'no', '0', ' OFF ']) {
+    assert.equal(distributionMode(value), 'off');
+  }
   // A typo means "distribute", not "stop distributing".
   assert.equal(distributionMode('addaptive'), 'even');
 });
@@ -186,95 +180,46 @@ test('scenario: raising the threshold lets an account be spent further', () => {
     'a higher threshold must leave more room to burn the account down');
 });
 
-// ── Scenario 4: plan tier, learned rather than configured ───────────────────
+// ── Scenario 4: authoritative subscription tiers ───────────────────────────
 
-test('scenario: the learner recovers a window size from tokens and utilization', () => {
-  const l = new CapacityLearner();
-  const t0 = Date.now();
-  l.observeUtilization(0, 'unified7d', 0.10, t0);
-  l.recordTokens(0, 'unified7d', { input_tokens: 800_000, output_tokens: 200_000 });
-  // 1M metered tokens moved the window 1% ⇒ the window holds ~100M.
-  l.observeUtilization(0, 'unified7d', 0.11, t0 + 60_000);
-  const cap = l.capacity(0, 'unified7d');
-  assert.ok(cap > 50_000_000 && cap < 200_000_000, `implausible capacity: ${cap}`);
-});
-
-test('production quota and usage wiring teaches plan capacity', () => {
+test('quota updates feed only the windows refreshed by that response', () => {
   const am = mgr(['a']);
-  am.updateQuota(0, { 'anthropic-ratelimit-unified-7d-utilization': '0.10' });
-  am.recordTokenUsage(0, 's1', OPUS, { input_tokens: 800_000, output_tokens: 200_000 });
-  am.updateQuota(0, { 'anthropic-ratelimit-unified-7d-utilization': '0.11' });
-  assert.ok(am.capacityLearner.capacity(0, 'unified7d') > 50_000_000);
-});
-
-test('family traffic teaches both its family window and shared weekly', () => {
-  const am = mgr(['a']);
+  const observed = [];
+  am.burnRateLearner.observeUtilization = (_index, bucket) => observed.push(bucket);
   am.updateQuota(0, {
     'anthropic-ratelimit-unified-7d-utilization': '0.10',
     'anthropic-ratelimit-unified-7d_oi-utilization': '0.20',
   });
-  am.recordTokenUsage(0, 's1', FABLE, { input_tokens: 800_000, output_tokens: 200_000 });
-  am.updateQuota(0, {
-    'anthropic-ratelimit-unified-7d-utilization': '0.11',
-    'anthropic-ratelimit-unified-7d_oi-utilization': '0.21',
-  });
-  assert.ok(am.capacityLearner.capacity(0, 'unified7d') > 0);
-  assert.ok(am.capacityLearner.capacity(0, 'unified7dFable') > 0);
-});
-
-test('scenario: a cache READ does not inflate the learned tier', () => {
-  // Cache reads meter at a fraction upstream does not publish, so counting them
-  // would make a cache-heavy session look like more spend than it was.
-  const l = new CapacityLearner();
-  const t0 = Date.now();
-  l.observeUtilization(0, 'unified7d', 0, t0);
-  l.recordTokens(0, 'unified7d', { input_tokens: 1000, cache_read_input_tokens: 9_000_000 });
-  l.observeUtilization(0, 'unified7d', 0.01, t0 + 1000);
-  assert.ok(l.capacity(0, 'unified7d') < 1_000_000, 'cache reads must not be priced as spend');
-});
-
-test('scenario: a window reset is not learned as negative spend', () => {
-  const l = new CapacityLearner();
-  const t0 = Date.now();
-  l.observeUtilization(0, 'unified7d', 0.90, t0);
-  l.recordTokens(0, 'unified7d', { input_tokens: 1_000_000 });
-  l.observeUtilization(0, 'unified7d', 0.02, t0 + 1000); // weekly rolled over
-  assert.equal(l.capacity(0, 'unified7d'), null, 'a reset must not produce a sample');
-});
-
-test('scenario: a stale gap re-baselines instead of pricing unrelated tokens', () => {
-  const l = new CapacityLearner();
-  const t0 = Date.now();
-  l.observeUtilization(0, 'unified7d', 0.10, t0);
-  l.recordTokens(0, 'unified7d', { input_tokens: 1_000_000 });
-  // Longer than maxSampleAgeMs: the tokens and the move are different intervals.
-  l.observeUtilization(0, 'unified7d', 0.20, t0 + ADAPTIVE_DEFAULTS.maxSampleAgeMs + 1);
-  assert.equal(l.capacity(0, 'unified7d'), null);
+  assert.deepEqual(observed, ['unified7d', 'unified7dFable']);
+  observed.length = 0;
+  am.updateQuota(0, { 'anthropic-ratelimit-unified-7d-utilization': '0.11' });
+  assert.deepEqual(observed, ['unified7d']);
 });
 
 test('scenario: a big plan outranks a small one at the same percentage', () => {
   // Both accounts sit at 60%. The Pro account has far less absolute credit
   // behind that 60%, so it is the one to finish off first.
-  const am = mgr(['pro', 'max20x']);
+  const am = new AccountManager([
+    oauth('pro', { rateLimitTier: 'default_claude_ai' }),
+    oauth('max20x', { rateLimitTier: 'default_claude_max_20x' }),
+  ], 0.98, { distributeSessions: 'adaptive' });
   weekly(am, 0, 0.60);
   weekly(am, 1, 0.60);
-  teachCapacity(am, 0, 'unified7d', 1_000_000, 0.10, 0.50);  // ~10M window
-  teachCapacity(am, 1, 'unified7d', 20_000_000, 0.10, 0.50); // ~200M window
   const counts = placeSessions(am, 10);
   assert.ok((counts.pro || 0) > (counts.max20x || 0),
     `the smaller plan should be finished first, got ${JSON.stringify(counts)}`);
 });
 
-test('scenario: an unlearned tier falls back to fractions rather than mixing units', () => {
-  // Only one account has a learned capacity. Comparing its tokens against the
-  // other's bare fraction would rank on the unit, not the account.
-  const am = mgr(['learned', 'unlearned']);
+test('scenario: an unknown profile tier falls back to fractions rather than guessing', () => {
+  const am = new AccountManager([
+    oauth('known', { rateLimitTier: 'default_claude_max_20x' }),
+    oauth('unknown', { rateLimitTier: 'future_tier' }),
+  ], 0.98, { distributeSessions: 'adaptive' });
   weekly(am, 0, 0.20);
   weekly(am, 1, 0.80);
-  teachCapacity(am, 0, 'unified7d', 5_000_000, 0.10, 0.10);
   const rows = am.adaptiveStats();
   // Fraction fallback ⇒ the more-spent account still leads on remaining credit.
-  assert.ok(rows.find(r => r.name === 'unlearned').weight > rows.find(r => r.name === 'learned').weight);
+  assert.ok(rows.find(r => r.name === 'unknown').weight > rows.find(r => r.name === 'known').weight);
 });
 
 // ── Scenario 5: response speed ──────────────────────────────────────────────
@@ -420,8 +365,11 @@ test('adaptive keeps the family buckets independent', () => {
   assert.ok((fable.b || 0) > (fable.a || 0), `Fable should burn 'b' down: ${JSON.stringify(fable)}`);
 });
 
-test('adaptive capacity and reserve follow the quota window supplying utilization', () => {
-  const am = mgr(['a', 'b']);
+test('adaptive reserve follows the quota window supplying utilization', () => {
+  const am = new AccountManager([
+    oauth('a', { rateLimitTier: 'default_claude_ai' }),
+    oauth('b', { rateLimitTier: 'default_claude_ai' }),
+  ], 0.98, { distributeSessions: 'adaptive' });
   const now = Date.now();
   for (const i of [0, 1]) am.accounts[i].probing = false;
   Object.assign(am.accounts[0].quota, {
@@ -432,28 +380,30 @@ test('adaptive capacity and reserve follow the quota window supplying utilizatio
     unified7d: 0.30, unified7dReset: now + 72 * H,
     unified7dFable: 0.20, unified7dFableReset: now + 72 * H,
   });
-  teachCapacity(am, 0, 'unified7d', 1_000_000, 0.10, 0.70);
-  teachCapacity(am, 0, 'unified7dFable', 20_000_000, 0.10, 0);
-  teachCapacity(am, 1, 'unified7d', 2_000_000, 0.10, 0.20);
+  am.burnRateLearner.reserve = (_index, bucket) => bucket === 'unified7d' ? 0.03 : 0.19;
   const row = am.adaptiveStats(FABLE).find(r => r.name === 'a');
   assert.equal(row.window, 'unified7d');
-  assert.equal(row.capacity, am.capacityLearner.capacity(0, 'unified7d'));
+  assert.equal(row.reserve, 0.03);
+  assert.equal(row.planWeight, 1);
 });
 
 test('removing an account keeps adaptive learning with surviving credentials', () => {
   const am = mgr(['a', 'b', 'c']);
-  teachCapacity(am, 1, 'unified7d', 1_000, 0.01);
-  teachCapacity(am, 2, 'unified7d', 2_000, 0.01);
+  const t0 = Date.now();
+  am.burnRateLearner.observeUtilization(1, 'unified7d', 0.10, t0);
+  am.burnRateLearner.observeUtilization(1, 'unified7d', 0.11, t0 + 5 * 60_000);
+  am.burnRateLearner.observeUtilization(2, 'unified7d', 0.10, t0);
+  am.burnRateLearner.observeUtilization(2, 'unified7d', 0.20, t0 + 5 * 60_000);
   am.concurrencyLearner.caps.set(1, 3);
   am.concurrencyLearner.caps.set(2, 9);
-  const bCapacity = am.capacityLearner.capacity(1, 'unified7d');
-  const cCapacity = am.capacityLearner.capacity(2, 'unified7d');
+  const bReserve = am.burnRateLearner.reserve(1, 'unified7d');
+  const cReserve = am.burnRateLearner.reserve(2, 'unified7d');
 
   am.removeAccount(0);
 
   assert.equal(am.accounts[0].name, 'b');
-  assert.equal(am.capacityLearner.capacity(0, 'unified7d'), bCapacity);
-  assert.equal(am.capacityLearner.capacity(1, 'unified7d'), cCapacity);
+  assert.equal(am.burnRateLearner.reserve(0, 'unified7d'), bReserve);
+  assert.equal(am.burnRateLearner.reserve(1, 'unified7d'), cReserve);
   assert.equal(am.concurrencyLearner.cap(0), 3);
   assert.equal(am.concurrencyLearner.cap(1), 9);
 });
@@ -494,18 +444,18 @@ test('adaptiveStats is empty unless adaptive is the active mode', () => {
 });
 
 test('adaptiveStats reports the per-account figures an operator gates on', () => {
-  const am = mgr(['a', 'b']);
+  const am = new AccountManager([
+    oauth('a', { rateLimitTier: 'default_claude_max_20x' }),
+    oauth('b', { rateLimitTier: 'default_claude_ai' }),
+  ], 0.98, { distributeSessions: 'adaptive' });
   weekly(am, 0, 0.70);
   weekly(am, 1, 0.30);
-  teachCapacity(am, 0, 'unified7d', 2_000_000, 0.05, 0.65);
-  teachCapacity(am, 1, 'unified7d', 2_000_000, 0.05, 0.25);
   am.recordSession('s1', 0);
   const rows = am.adaptiveStats();
   const a = rows.find(r => r.name === 'a');
   assert.equal(a.sessions, 1, 'per-account session count is reported');
   assert.equal(a.competing, true);
-  assert.ok(a.capacity > 0, 'learned plan tier is reported');
-  assert.ok(a.tokensPerSecond > 0, 'throughput is reported once the tier is known');
+  assert.equal(a.planWeight, 20, 'profile plan tier is reported');
   assert.ok(a.concCap > 0);
   assert.ok(Math.abs(a.headroom - (0.98 - 0.70)) < 1e-9);
   // Weights across the competing tier are normalized.
@@ -535,13 +485,26 @@ test('adaptiveStats distinguishes score weight from the deterministic next targe
   assert.ok(rows.every(r => r.weight == null || (r.weight >= 0 && r.weight <= 1)));
 });
 
-test('tok/s is withheld until the tier is known, rather than reported in the wrong unit', () => {
+test('an unknown profile tier is reported without inventing a plan weight', () => {
   const am = mgr(['a', 'b']);
   weekly(am, 0, 0.50);
   weekly(am, 1, 0.50);
   const row = am.adaptiveStats().find(r => r.name === 'a');
-  assert.equal(row.capacity, null);
-  assert.equal(row.tokensPerSecond, null);
+  assert.equal(row.planWeight, null);
+});
+
+test('adaptiveStats excludes subscriptions owned by another provider', () => {
+  const am = new AccountManager([
+    oauth('claude', { rateLimitTier: 'default_claude_ai' }),
+    oauth('codex', { provider: 'codex', rateLimitTier: 'default_claude_max_20x' }),
+  ], 0.98, { distributeSessions: 'adaptive' });
+  weekly(am, 0, 0.4);
+  weekly(am, 1, 0.8);
+  const rows = am.adaptiveStats(null, 'anthropic');
+  assert.equal(rows.find(r => r.name === 'claude').competing, true);
+  assert.equal(rows.find(r => r.name === 'claude').weight, 1);
+  assert.equal(rows.find(r => r.name === 'codex').competing, false);
+  assert.equal(rows.find(r => r.name === 'codex').weight, 0);
 });
 
 test('an outranked account is marked as not competing, not as a small share', () => {
@@ -587,7 +550,7 @@ test('scoreCandidate: load reduces the score monotonically', () => {
 });
 
 test('the reserve widens with the observed burn rate', () => {
-  const l = new CapacityLearner();
+  const l = new BurnRateLearner();
   const t0 = Date.now();
   // A fast burner: 4% of the window in five minutes.
   l.observeUtilization(0, 'unified7d', 0.10, t0);
@@ -705,7 +668,7 @@ test('concurrent readings do not inflate the burn rate', () => {
   // utilization/second — a weekly window drained in six seconds — because each
   // adjacent pair of readings divided a delta caused by many parallel requests
   // by the milliseconds between two responses landing.
-  const l = new CapacityLearner();
+  const l = new BurnRateLearner();
   const t0 = Date.now();
   l.observeUtilization(0, 'unified7d', 0.10, t0);
   // 10 minutes of traffic that moves the window 2%, delivered as bursts of
@@ -731,7 +694,7 @@ test('a flat reading is a legitimate zero-rate sample, not a discontinuity', () 
   // An idle account should learn a LOW burn rate — that is what earns it a
   // narrow reserve and lets it run closer to its threshold. Treating a flat
   // reading as a reset would leave it forever on the cold-start assumption.
-  const l = new CapacityLearner();
+  const l = new BurnRateLearner();
   const t0 = Date.now();
   l.observeUtilization(0, 'unified7d', 0.50, t0);
   for (let i = 1; i <= 12; i++) l.observeUtilization(0, 'unified7d', 0.50, t0 + i * 60_000);
@@ -742,7 +705,7 @@ test('a flat reading is a legitimate zero-rate sample, not a discontinuity', () 
 test('a genuinely fast burner still earns a wide reserve', () => {
   // The fix must not simply flatten every rate: real sustained spend has to
   // still widen the margin.
-  const l = new CapacityLearner();
+  const l = new BurnRateLearner();
   const t0 = Date.now();
   l.observeUtilization(0, 'unified7d', 0.10, t0);
   let u = 0.10;
@@ -755,7 +718,7 @@ test('a genuinely fast burner still earns a wide reserve', () => {
 });
 
 test('a window reset does not leak across the burn measurement', () => {
-  const l = new CapacityLearner();
+  const l = new BurnRateLearner();
   const t0 = Date.now();
   l.observeUtilization(0, 'unified7d', 0.90, t0);
   l.observeUtilization(0, 'unified7d', 0.95, t0 + 6 * 60_000);

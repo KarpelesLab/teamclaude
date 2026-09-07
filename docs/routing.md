@@ -147,28 +147,28 @@ Even distribution treats every account as interchangeable, which is wrong once a
 
 Adaptive mode does the opposite of even: it concentrates new sessions on the account with the **least remaining weekly credit**, to finish that window off — while tapering its share away as it nears the switch threshold, so the account is spent down to the wall and never into it, and backing off when it is congested, so concentrating never costs response time. A session's pin, priority ordering, and the drain-on-disable behaviour are all unchanged.
 
-Nothing is configured per account. The two quantities that would otherwise be operator-set constants are **learned from live traffic**:
+Plan size comes from authoritative account metadata; only dynamic behavior is learned from traffic:
 
-| Learned | How | Used for |
+| Input | Source | Used for |
 | --- | --- | --- |
-| **Plan tier** — the weekly window's size in tokens | The metered tokens served divided by the utilization they consumed. A Max 20x window moves far less per token than a Pro one. | Making "least remaining" an *absolute* comparison. Without it, 10% of a 20x window and 10% of a Pro one look identical. |
+| **Plan tier** | OAuth profile organization and seat tier, using the same persisted 1x/5x/20x mapping as quota summary. | Making “least remaining” comparable across differently sized subscriptions without estimating the subscription from traffic. |
 | **Tolerated concurrency** | AIMD: retreat below the depth that upstream throttled, creep back up while running at the cap without trouble. | The response-speed term, so an account is never concentrated onto past the point where the next session would just queue. |
 
 The taper's width is adaptive too, rather than a fixed percentage: it is how much of the window the account would spend in the next 30 minutes **at its own observed burn rate**, so a fast-burning account is given a wide margin and an idle one may run much closer to the threshold.
 
 The threshold it tapers toward is **your** `switchThreshold`, including the per-bucket form — set `{ "default": 0.98, "unified7d": 0.85 }` and the weekly taper reaches zero at 85%, not 98%.
 
-Cache reads are excluded from the tier measurement (they meter at a fraction upstream does not publish, so counting them would make a cache-heavy session look like more spend than it was), and a utilization *drop* is read as a window reset rather than negative spend.
+Quota response headers supply utilization and reset time. Burn rate is learned from fresh readings of each individual quota window; a response that refreshes only shared weekly quota does not rebaseline a cached family window.
 
 **Reading the result.** In this mode `teamclaude status` adds an `Adaptive` line per account, and the header reads `adapting`:
 
 ```
 > account-a (Max 20x) (oauth, prio 0) active 3 sess
   Weekly   [███████████░░░░░░░] 62% reset 3d8h
-  Adaptive next · weight 36%  ·  3 sess / 3 inflight  ·  head 36.0% of 98%  ·  tier 110.0m tok · 1.8k tok/s  ·  conc 6.0
+  Adaptive next · weight 36%  ·  3 sess / 3 inflight  ·  head 36.0% of 98%  ·  plan 20x  ·  conc 6.0
 ```
 
-`next` names the account the deterministic picker would choose for the next new session. `weight` is that account's score normalized across the competing tier; it explains how strongly the inputs favor an account, but is not a routing probability. The rest is the evidence behind it: headroom to your threshold, the measured window size, throughput, and the learned concurrency cap. `tier learning…` means not enough has been observed yet, and selection is falling back to plain fractions until it has; `weight n/a (all reserved)` means every account in the tier is inside its reserve, so the even fallback decides the next target.
+`next` names the account the deterministic picker would choose for the next new session. `weight` is that account's score normalized across the competing tier; it explains how strongly the inputs favor an account, but is not a routing probability. `plan` is the subscription multiplier read from the OAuth profile, not inferred from traffic. An unknown future tier is shown as `plan unknown`, and its competing tier falls back to plain utilization fractions rather than guessing. `weight n/a (all reserved)` means every account in the tier is inside its reserve, so the even fallback decides the next target.
 
 **Turning it off drains, it doesn't cut.** The setting is applied live on config reload, and switching it off would otherwise move every distributed session to the current account on its *next* request — each one throwing away the prompt cache it built on its old account, and all of them arriving at one account at once. Instead, the sessions running at that moment keep their accounts, and only **new** sessions go back to plain quota-driven rotation. Affinity therefore winds down as those sessions finish rather than snapping, and a draining session whose account becomes ineligible simply rejoins normal rotation. While this is happening `teamclaude status` reads `draining N` (the TUI header shows `drain N`) instead of `single-account`, and it clears itself once the last of those sessions is done or idles out.
 
