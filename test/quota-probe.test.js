@@ -317,6 +317,16 @@ test('prober never sends a third-party key to the Anthropic usage endpoint', asy
   assert.equal(am.accounts[1].quota.unified5h, null);
 });
 
+test('a third-party backend reads not-applicable, not a pending probe', () => {
+  const am = new AccountManager([
+    oauth('claude'),
+    { ...oauth('deepseek'), upstream: 'https://api.deepseek.com/anthropic' },
+  ], 0.98);
+  const rows = new Prober(am, { intervalMs: 300_000, log: () => {} }).getStatus().accounts;
+  assert.equal(rows[0].status, 'never');            // probed, just not yet
+  assert.equal(rows[1].status, 'not-applicable');   // nothing to probe, ever
+});
+
 test('prober skips API-key accounts', async () => {
   const am = new AccountManager([{ name: 'k', type: 'apikey', apiKey: 'sk' }], 0.98);
   let calls = 0;
