@@ -1132,6 +1132,51 @@ test('a success on a borrowed cursor does not release the roll its owner holds',
     'the codex request after the fail-back settled on the account its roll pushed it off');
 });
 
+test('a borrowed cursor\'s success settles the roll of its own provider', () => {
+  // The converse of the arm above, and the reason the gate asks which provider a
+  // roll belongs to rather than which account the cursor names. The provider that
+  // borrows is restored away from the cursor before any of its responses is read,
+  // so a cursor test would refuse every confirmation it ever offers: its own
+  // rollovers would stay owed for good and each fail-back would preempt again,
+  // which is recurring churn in place of the one-time cost a preemption is meant
+  // to be.
+  const am = new AccountManager(
+    [codexAccount('c'), oauth('a'), oauth('b')], 0.98, { expiryRouting: ON },
+  );
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30]]) bucket(am, i, 'unified7d', 0.4, hours);
+  // The codex fleet owns the cursor, so every anthropic request below borrows it.
+  am.selectActiveAccount();
+
+  const codexReq = () => am.getActiveAccount(null, GPT, null, null, 'codex');
+  const claudeReq = (exclude = null) => am.getActiveAccount(exclude, OPUS, null, null, 'anthropic');
+
+  assert.equal(codexReq().name, 'c', 'the fixture must start on c');
+  assert.equal(claudeReq().name, 'a', 'the anthropic traffic must start on a');
+  rollWindow(am, 1);
+  assert.equal(claudeReq().name, 'b', 'the roll did not preempt off a');
+  // The first request to REST on b, which is what puts a's roll into the hold.
+  assert.equal(claudeReq().name, 'b', 'the preemption did not settle on b');
+  assert.equal(am._currentObs.unescaped?.idx, 1, 'resting on b did not hold a\'s roll');
+
+  // The server's handshake spelled out, as in the arm above: the generation read
+  // before the walk, the confirmation after it. This one finds the observation
+  // already resting on b and is served there, and both accounts are anthropic's.
+  const carried = am.observedGeneration(null, OPUS);
+  const served = claudeReq();
+  assert.equal(served.name, 'b', 'the confirming request left b');
+  am.confirmStay(served, carried, null, OPUS);
+  assert.equal(am._currentObs.unescaped, null,
+    'the success left its own provider\'s roll owed');
+
+  // b out of the way, so the anthropic traffic falls back onto a. The roll is
+  // settled, so a is read whole and the request after the fail-back stays.
+  assert.equal(claudeReq(new Set([2])).name, 'a', 'the fail-back did not reach a');
+  assert.equal(am._currentRolledOver(am.accounts[1], OPUS), false,
+    'a roll the traffic already moved off was charged a second time');
+  assert.equal(claudeReq().name, 'a',
+    'the request after the fail-back preempted off a settled roll');
+});
+
 test('removing an account renumbers a session pin\'s held roll too', () => {
   // The pin's observation holds one the same way the cursor's does, and it is
   // renumbered by a different function in a different module — so it gets its

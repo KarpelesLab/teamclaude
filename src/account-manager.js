@@ -1851,21 +1851,24 @@ export class AccountManager {
   confirmStay(account, carried, sessionId = null, model = null) {
     if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) return;
     if (!account || !carried) return;
-    // The cursor's observation hangs off ONE slot every provider shares. A
-    // request whose provider does not own the cursor borrows it for the walk and
-    // hands the INDEX back, but not the observation — which that walk has left
-    // naming the borrower's own account. A success there is a stay under the
-    // borrowing provider's placement, not under the one this slot is holding a
-    // roll for, and without this test it reads as the same thing. The cursor
-    // still naming the account that served is what separates them: the walk is
-    // synchronous and restores the index long before the response confirmed here
-    // is read.
+    // The cursor's observation hangs off ONE slot every provider shares, so the
+    // roll it holds and the success offered for releasing it can belong to
+    // different fleets: a request whose provider does not own the cursor borrows
+    // it for the walk and hands the INDEX back, but not the observation — which
+    // that walk has left naming the borrower's own account. A success is a stay
+    // under its own provider's placement, and settles only a roll pushed off an
+    // account of that provider. Where the two differ the roll stays held, which
+    // is the safe direction: one held a request too long costs one further
+    // preemption, while one released early strands the traffic on the week the
+    // account just gained.
     //
-    // It refuses on one more case, where a concurrent request moved the cursor
-    // between this one's selection and its response. That is the safe direction:
-    // a roll held one request too long costs one further preemption, while one
-    // released early strands the traffic on the week the account just gained.
-    if (this.currentIndex === account.index) {
+    // An account counts as the provider it declares, at both ends. Only
+    // subscriptions are partitioned, so an API key either app may spend still
+    // answers with one provider: a fleet whose key bridges the two can hold a
+    // roll one request longer than it needs to, and never releases one the other
+    // fleet's placement is owed.
+    const held = this._currentObs?.unescaped;
+    if (held && providerOf(this.accounts[held.idx]) === providerOf(account)) {
       this._releaseHeld(this._currentObs, account, carried.current);
     }
     if (sessionId) {
