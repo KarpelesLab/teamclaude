@@ -353,3 +353,59 @@ test('the blocked line names the cap as the reason', () => {
   status.accounts[0].unavailable = 'capped';
   assert.match(renderStatus(status, { color: false, now }), /Blocked\s+account usage cap reached \(maxUsage\)/);
 });
+
+// ── The Active/Serving row under session distribution ───────────────────────
+//
+// `currentAccount` is the rotation cursor. Under distribution the session
+// pickers never move it, so it names where a SESSION-LESS request would go —
+// not what is serving. Reporting it as "Active" pointed at one account while
+// several were running.
+
+function distributedStatus(mode) {
+  return {
+    currentAccount: 'a',
+    switchThreshold: 0.98,
+    sessions: { active: 12, known: 12, distribute: mode !== 'off', mode },
+    accounts: [
+      { name: 'a', type: 'oauth', priority: 0, status: 'active', sessions: 3, quota: {}, usage: {} },
+      { name: 'b', type: 'oauth', priority: 0, status: 'active', sessions: 9, quota: {}, usage: {} },
+      { name: 'c', type: 'oauth', priority: 0, status: 'active', sessions: 0, quota: {}, usage: {} },
+    ],
+  };
+}
+
+test('distribution off: the cursor is the active account, as before', () => {
+  const s = distributedStatus('off');
+  const out = renderStatus(s, { color: false, now });
+  assert.match(out, /^Active {7}a$/m);
+  assert.doesNotMatch(out, /^Serving/m);
+  // Only the cursor is marked.
+  assert.match(out, /^> a \(oauth/m);
+  assert.match(out, /^ {2}b \(oauth/m);
+});
+
+test('distributing: the row names every account actually serving, plus the cursor', () => {
+  const out = renderStatus(distributedStatus('adaptive'), { color: false, now });
+  assert.doesNotMatch(out, /^Active/m);
+  // Busiest first, each with its session count, and the cursor named as such.
+  assert.match(out, /^Serving {6}b 9 · a 3 {2}cursor a$/m);
+});
+
+test('distributing: the marker follows the sessions, not the cursor', () => {
+  const out = renderStatus(distributedStatus('adaptive'), { color: false, now });
+  assert.match(out, /^> a \(oauth/m, 'a carries sessions');
+  assert.match(out, /^> b \(oauth/m, 'b carries sessions and is NOT the cursor');
+  assert.match(out, /^ {2}c \(oauth/m, 'c carries none');
+});
+
+test('distributing but idle: says so rather than implying the cursor is serving', () => {
+  const s = distributedStatus('adaptive');
+  for (const a of s.accounts) a.sessions = 0;
+  const out = renderStatus(s, { color: false, now });
+  assert.match(out, /^Serving {6}idle cursor a$/m);
+});
+
+test('even mode gets the same honest row as adaptive', () => {
+  const out = renderStatus(distributedStatus('even'), { color: false, now });
+  assert.match(out, /^Serving {6}b 9 · a 3 {2}cursor a$/m);
+});

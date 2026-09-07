@@ -14,7 +14,7 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
   const blocked = (status.blockedModels || []).filter(p => typeof p === 'string' && p.length);
 
   lines.push(paint.bold('TeamClaude status'));
-  lines.push(`${paint.dim('Active'.padEnd(12))} ${paint.cyan(status.currentAccount || 'none')}`);
+  lines.push(`${paint.dim(activeLabel(status).padEnd(12))} ${formatActive(status, paint)}`);
   lines.push(`${paint.dim('Switch at'.padEnd(12))} ${formatPercent(status.switchThreshold)}`);
   // Only when something is blocked: a always-visible "Blocked" row would be
   // noise for the common case, but its ABSENCE is what made a blocked model
@@ -38,7 +38,7 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
   for (const line of routingLines(status.routes, blocked, paint)) lines.push(line);
 
   for (const account of accounts) {
-    lines.push(renderAccountHeader(account, status.currentAccount, paint, now));
+    lines.push(renderAccountHeader(account, status.currentAccount, paint, now, distributing(status) || null));
     for (const quotaLine of quotaLines(account, now, paint)) {
       lines.push(`  ${quotaLine}`);
     }
@@ -204,8 +204,47 @@ function routingLines(routes, blocked, paint) {
   return lines;
 }
 
-function renderAccountHeader(account, currentAccount, paint, now) {
-  const current = account.name === currentAccount;
+// `currentAccount` is the ROTATION CURSOR, and under distribution that is not
+// the account serving the traffic. Only the non-session paths move it
+// (selectActiveAccount, _selectNext, _selectProbe, _switchOnSessionReset);
+// _selectForSession and the pickers beneath it never do, by design — a pinned
+// session is chosen per session, not from one global position. So while
+// sessions are distributed the cursor is just where a SESSION-LESS request
+// would go, and reporting it as "Active" points at one account while several
+// are serving. Observed live: the cursor sat on an account holding a 34% share
+// while the account beside it held 66%.
+//
+// So the label follows the mode. Off, the cursor genuinely is the active
+// account and nothing changes. Distributing, it is named for what it is and the
+// accounts actually carrying sessions are listed instead.
+function distributing(status) {
+  return !!status.sessions?.distribute;
+}
+
+function activeLabel(status) {
+  return distributing(status) ? 'Serving' : 'Active';
+}
+
+function formatActive(status, paint) {
+  if (!distributing(status)) return paint.cyan(status.currentAccount || 'none');
+  const serving = (status.accounts || []).filter(a => a.sessions > 0);
+  const cursor = paint.dim(`cursor ${status.currentAccount || 'none'}`);
+  if (!serving.length) {
+    // Nothing is running, so the cursor is the only answer there is — but say
+    // that it is the cursor, since the next request may not go there.
+    return `${paint.dim('idle')} ${cursor}`;
+  }
+  const named = serving
+    .sort((a, b) => b.sessions - a.sessions)
+    .map(a => `${paint.cyan(a.name)} ${paint.dim(`${a.sessions}`)}`)
+    .join(paint.dim(' · '));
+  return `${named}  ${cursor}`;
+}
+
+function renderAccountHeader(account, currentAccount, paint, now, serving) {
+  // Under distribution the marker follows the sessions rather than the cursor,
+  // so the accounts flagged here are the ones the fleet is actually running on.
+  const current = serving == null ? account.name === currentAccount : account.sessions > 0;
   const marker = current ? paint.cyan('>') : ' ';
   const name = current ? paint.bold(account.name) : account.name;
   const status = formatAccountStatus(account, now, paint);
