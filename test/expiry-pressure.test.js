@@ -24,12 +24,8 @@ function mgr(names, opts = {}) {
 const ON = { enabled: true };
 const OFF = undefined;
 
-// A request's exclusion set, empty. With the knob on, `refreshExpiredQuotas`
-// spends a session reset only for a caller carrying one of these, so an arm
-// standing in for a request hands one even where the request excludes nothing
-// — which is exactly what the request path hands a single-provider fleet. A
-// call without it is a poll, and these arms would then assert against a switch
-// that never ran.
+// A request's exclusion set, empty. With the knob on the refresh spends a session
+// reset only for a caller carrying one; without it the call reads as a poll.
 const asRequest = () => new Set();
 
 function near(actual, expected, what) {
@@ -250,11 +246,8 @@ test('equally spent windows are governed by the one that resets sooner', () => {
 });
 
 test('an equal-pressure tie breaks on the governing window\'s clock, not another', () => {
-  // Half the headroom over half the horizon is the same headroom per second, so
-  // the two scoped windows price identically and the tie is exact rather than
-  // nearly so — the next sort key is what decides the pick, and that key is the
-  // governing window's own clock. The SHARED weekly points the other way, and it
-  // is a clock neither the gate nor the ratio consulted.
+  // Half the headroom over half the horizon prices identically, so the tie is
+  // exact and the next key decides: the governing window's clock, not the shared.
   const now = Date.now();
   const fleet = expiry => {
     const am = mgr(['a', 'b'], { expiry });
@@ -502,15 +495,12 @@ test('path 3: a band member with strictly worse pressure is still refused', () =
     am.accounts[1].quota.unified5hReset = Date.now() - 1000; // its 5h just expired
     return am;
   };
-  // Membership is asked of a TWIN, as elsewhere in this file: not because
-  // reading eligibility spends the event — since #275 the reset is recorded on
-  // the account and only a request's refresh clears it — but because this reads
-  // the band on a fleet the check below is about to move the cursor of.
+  // Asked of a TWIN, because this reads the band on a fleet whose cursor the
+  // check below is about to move.
   assert.deepEqual(build()._bandedCandidates().map(a => a.name), ['cur', 'b']);
   const am = build();
-  // Driven through the refresh itself, the one place the switch runs, and
-  // carrying a request: with the knob on a poll clears the windows and leaves
-  // the switch to the next request.
+  // Driven through the refresh, the one place the switch runs, and carrying a
+  // request: with the knob on a poll leaves the switch to the next request.
   am.refreshExpiredQuotas(null, asRequest());
   assert.equal(am.accounts[am.currentIndex].name, 'cur');
 });
@@ -538,9 +528,7 @@ test('path 3: a switch onto an account the band excluded is refused too', () => 
 
 test('path 3: the reset switch is drawn over what the request can be sent to', () => {
   // A Codex account cannot serve an Anthropic request, so it may neither be
-  // switched to nor stop a switch. Its pressure takes the top band on its own
-  // here, and a band drawn over the whole fleet therefore vetoes the switch to
-  // the one account the request could actually use.
+  // switched to nor stop a switch. Here its pressure takes the top band alone.
   const build = (expiry, withCodex) => {
     const fleet = [oauth('cur'), oauth('reset')];
     if (withCodex) fleet.push(oauth('codex', { provider: 'codex' }));
@@ -548,17 +536,13 @@ test('path 3: the reset switch is drawn over what the request can be sent to', (
     bucket(am, 0, 'unified7d', 0.50, 50);
     bucket(am, 1, 'unified7d', 0.10, 10);
     if (withCodex) bucket(am, 2, 'unified7d', 0.00, 1);
-    // Only the challenger's 5h window has expired, so it alone is what the
-    // switch is triggered by.
+    // Only the challenger's 5h window has expired, so it alone triggers the switch.
     am.accounts[1].quota.unified5h = 0.5;
     am.accounts[1].quota.unified5hReset = Date.now() - 1000;
     return am;
   };
-  // Asked of a TWIN, as elsewhere in this file. Not because reading eligibility
-  // spends what the switch is triggered by — since #275 the reset is recorded
-  // on the account, and with the knob on only a call carrying a request clears
-  // it — but because these read the band on a fleet whose cursor the checks
-  // below are about to move.
+  // Asked of a TWIN, because these read the band on a fleet whose cursor the
+  // checks below are about to move.
   const twin = build(ON, true);
   assert.deepEqual(twin._bandedCandidates(null, OPUS).map(a => a.name), ['codex'],
     'the fixture must give the Codex account the band on its own');
@@ -566,16 +550,14 @@ test('path 3: the reset switch is drawn over what the request can be sent to', (
     twin._bandedCandidates(twin._excludeOtherProviders(null, DEFAULT_PROVIDER), OPUS).map(a => a.name),
     ['reset'], 'the fixture must give the band to the challenger once the request excludes Codex');
 
-  // Driven through getActiveAccount, because that is where the request's
-  // provider partition is built; the switch runs inside it.
+  // Through getActiveAccount, where the request's provider partition is built.
   const on = build(ON, true);
   on.getActiveAccount(null, OPUS);
   assert.equal(on.accounts[on.currentIndex].name, 'reset',
     'an account the request cannot be sent to vetoed the switch');
 
-  // codex's other two controls: the same fleet without the foreign account, and
-  // the same fleet with the knob off. Both switch, so neither the foreign
-  // account nor the feature alone accounts for the divergence.
+  // Two controls: the same fleet without the foreign account, and with the knob
+  // off. Both switch, so neither alone accounts for the divergence.
   const without = build(ON, false);
   without.getActiveAccount(null, OPUS);
   assert.equal(without.accounts[without.currentIndex].name, 'reset');
@@ -587,66 +569,48 @@ test('path 3: the reset switch is drawn over what the request can be sent to', (
 
 test('path 3: the reset switch skips an excluded account that also reset', () => {
   // The exclusion has to reach the eligible loop, not only the band guard that
-  // vetoes what the loop picked: an account on another provider whose own
-  // session window has expired arrives at the switch as a candidate in its own
-  // right. Read at the switch rather than at the end of a request, because
-  // `_select` corrects the cursor a moment later on the same exclusions and
-  // would hide the switch's own answer.
+  // vetoes its pick: an account on another provider that also reset is a candidate.
   const am = mgr([oauth('cur'), oauth('reset'), oauth('codex', { provider: 'codex' })], { expiry: ON });
   bucket(am, 0, 'unified7d', 0.50, 50);
   bucket(am, 1, 'unified7d', 0.10, 10);
   bucket(am, 2, 'unified7d', 0.00, 1);
-  // Both challengers reset, so the foreign account is a candidate the loop has
-  // to walk past; unrefused it wins outright, on no reported utilization at all.
+  // Both challengers reset, so the foreign account is a candidate to walk past.
   for (const i of [1, 2]) {
     am.accounts[i].quota.unified5h = 0.5;
     am.accounts[i].quota.unified5hReset = Date.now() - 1000;
   }
   am.refreshExpiredQuotas(OPUS, am._excludeOtherProviders(null, DEFAULT_PROVIDER));
-  // Names the account rather than only ruling out the foreign one: with the
-  // loop's refusal gone the band guard still vetoes that pick, so the switch
-  // makes no move at all, and "not codex" would pass on a cursor that never
-  // moved.
+  // Names the account rather than only ruling out the foreign one: "not codex"
+  // would pass on a cursor that never moved.
   assert.equal(am.accounts[am.currentIndex].name, 'reset',
     'the switch let an account the request cannot be sent to decide where it goes');
 });
 
 test('path 3: a reset stays pending until a request that can act on it', () => {
-  // The reset is fleet state, not this request's: a five-hour window that
-  // expires while one request cannot use the account has to outlive that
-  // request. The exclusion here is a retry's tried set rather than a provider
-  // partition, because the switch refuses both the same way.
+  // The reset is fleet state, not this request's, so a window that expires while
+  // one request cannot use the account has to outlive that request.
   const am = mgr(['cur', 'reset'], { expiry: ON });
   bucket(am, 0, 'unified7d', 0.50, 50);
   bucket(am, 1, 'unified7d', 0.10, 10);
   am.accounts[1].quota.unified5h = 0.5;
   am.accounts[1].quota.unified5hReset = Date.now() - 1000;
 
-  // Request 1 has already tried the challenger and been refused there, so the
-  // switch may not install it. The flag is what this asserts, not the cursor:
-  // the cursor stays put whether or not the event was spent to leave it there.
+  // Request 1 has already tried the challenger, so the switch may not install it.
+  // The flag is what this asserts: the cursor stays put either way.
   am.refreshExpiredQuotas(OPUS, new Set([1]));
   assert.equal(am.accounts[1].sessionResetPending, true,
     'a request that could not use the account consumed its reset');
   assert.equal(am.accounts[am.currentIndex].name, 'cur');
 
-  // Request 2 can be sent there. Nothing re-triggers the event — the window was
-  // cleared on the first pass and reads null now — so this switches only if the
-  // reset survived the request that had to refuse it.
+  // Request 2 can be sent there, and nothing re-triggers the event.
   am.refreshExpiredQuotas(OPUS, asRequest());
   assert.equal(am.accounts[am.currentIndex].name, 'reset',
     'the reset never reached a request that could act on it');
 });
 
 test('path 3: a request that cannot use the incumbent leaves the reset for one that can', () => {
-  // The same rule at the other end of the comparison. The switch measures every
-  // candidate against the account the cursor names, so a request that cannot be
-  // sent THERE settles nothing either, and spending the event on it costs a
-  // later request the decision it could have made — on its own model, over the
-  // accounts it can actually use. The cursor is the account a retry has just
-  // tried, since it names where the previous attempt went, so this is the
-  // ordinary shape of a retry rather than a corner. Read at the refresh rather
-  // than through getActiveAccount, for the reason the arm above gives.
+  // The same rule at the other end of the comparison: the switch measures every
+  // candidate against the cursor's account, so a request barred there settles nothing.
   const am = mgr(['cur', 'reset'], { expiry: ON });
   bucket(am, 0, 'unified7d', 0.50, 50);
   bucket(am, 1, 'unified7d', 0.10, 10);
@@ -660,22 +624,15 @@ test('path 3: a request that cannot use the incumbent leaves the reset for one t
   assert.equal(am.accounts[am.currentIndex].name, 'cur',
     'the switch decided against an account the request cannot be sent to');
 
-  // Request 2 can be sent to either. Nothing re-triggers the event — the window
-  // was cleared on the first pass and reads null now — so this switches only if
-  // the reset survived the request that could not weigh it.
+  // Request 2 can be sent to either, and nothing re-triggers the event.
   am.refreshExpiredQuotas(OPUS, asRequest());
   assert.equal(am.accounts[am.currentIndex].name, 'reset',
     'the reset did not survive to a request that could act on it');
 });
 
 test('path 3: a request whose model the account cannot serve leaves the reset pending', () => {
-  // The third face of the rule the two arms above state, and the one an
-  // exclusion set cannot express: an account is out of reach of THIS request
-  // whenever the weekly bucket that governs this model is spent there, even
-  // though every other model still routes to it normally. The switch refuses it
-  // for exactly that reason a moment later, so consuming the event here costs
-  // the request behind it — on a model the account serves fine — the decision it
-  // was the only one able to make.
+  // The face an exclusion set cannot express: the account is out of reach for
+  // THIS model alone, though every other model still routes to it.
   const build = expiry => {
     const am = mgr(['cur', 'reset'], { expiry });
     bucket(am, 0, 'unified7d', 0.50, 50);
@@ -686,8 +643,7 @@ test('path 3: a request whose model the account cannot serve leaves the reset pe
     am.accounts[1].quota.unified5hReset = Date.now() - 1000;
     return am;
   };
-  // One account, two models, two answers — asked of a TWIN, because reading
-  // availability clears expired windows and this fixture is built on one.
+  // Asked of a TWIN, because reading availability clears expired windows.
   const twin = build(ON);
   assert.equal(twin._isAvailable(twin.accounts[1], FABLE), false,
     'the fixture must bar the challenger from Fable');
@@ -701,16 +657,13 @@ test('path 3: a request whose model the account cannot serve leaves the reset pe
   assert.equal(am.accounts[am.currentIndex].name, 'cur',
     'the switch installed an account this request cannot be sent to');
 
-  // The request behind it. Nothing re-triggers the event — the window was
-  // cleared on the first pass and reads null now — so this switches only if the
-  // reset survived the model that had to refuse it.
+  // The request behind it, with nothing left to re-trigger the event.
   am.refreshExpiredQuotas(OPUS, asRequest());
   assert.equal(am.accounts[am.currentIndex].name, 'reset',
     'the reset never reached the model that could act on it');
 
-  // The knob-off control, on the same fixture: with the feature off the event
-  // is spent on sight whatever model the request carries, and the switch takes
-  // what its own unscoped filter admits.
+  // The knob-off control on the same fixture: the event is spent on sight
+  // whatever model the request carries.
   const off = build(OFF);
   off.refreshExpiredQuotas(FABLE, asRequest());
   assert.equal(off.accounts[1].sessionResetPending, false,
@@ -720,13 +673,8 @@ test('path 3: a request whose model the account cannot serve leaves the reset pe
 });
 
 test('path 3: a request the incumbent cannot serve leaves the reset for one it does', () => {
-  // The same test at the other end of the comparison. A request the cursor's
-  // account cannot serve is diverted for that one request and leaves the fleet
-  // where it is, so what the switch measures against that account decides
-  // nothing about where anything goes — and the request behind it, which the
-  // account does serve, is the one whose decision moves the fleet. Here the
-  // incumbent's Fable window is the sooner of the two, so the Fable request
-  // declines the switch outright.
+  // The same test at the other end. A request the cursor's account cannot serve
+  // is diverted for that request alone and leaves the fleet where it is.
   const build = expiry => {
     const am = mgr(['cur', 'reset'], { expiry });
     bucket(am, 0, 'unified7d', 0.50, 50);
@@ -762,12 +710,8 @@ test('path 3: a request the incumbent cannot serve leaves the reset for one it d
 });
 
 test('path 3: a poll clears the window and leaves the reset for a request', () => {
-  // A poll routes nothing, so a reset it spends is spent nowhere: the window
-  // that raised the event is cleared on that same pass, nothing sets the flag
-  // again, and the switch it triggers is drawn over the whole fleet because a
-  // poll has no request to draw it over. Driven through getQuotaSummary, which
-  // is the live shape — the status-line poller hits it through
-  // GET /teamclaude/quota, several times a minute.
+  // A poll routes nothing, so a reset it spends is spent nowhere. Driven through
+  // getQuotaSummary, which the status-line poller hits several times a minute.
   const am = mgr(['cur', 'reset'], { expiry: ON });
   bucket(am, 0, 'unified7d', 0.50, 50);
   bucket(am, 1, 'unified7d', 0.10, 10);
@@ -782,8 +726,7 @@ test('path 3: a poll clears the window and leaves the reset for a request', () =
   assert.equal(am.accounts[am.currentIndex].name, 'cur',
     'a poll ran the switch');
 
-  // Repeatedly, because the poller is not a one-off: whatever wears the event
-  // down would wear it down within a second of real polling.
+  // Repeatedly, because the poller is not a one-off.
   for (let i = 0; i < 12; i++) am.getQuotaSummary();
   assert.equal(am.accounts[1].sessionResetPending, true, 'repeated polling wore the reset down');
 
@@ -794,11 +737,8 @@ test('path 3: a poll clears the window and leaves the reset for a request', () =
 });
 
 test('path 3: the knob-off poll spends the reset on sight', () => {
-  // The control for the arm above, and the whole of what the flag-off promise
-  // says here: with the feature off a poll consumes the event and runs the
-  // switch, because that is what the router does without this feature. The
-  // fixture is the one above with the knob flipped, so the divergence is the
-  // knob and nothing else.
+  // The control for the arm above: with the feature off a poll consumes the
+  // event and runs the switch. The same fixture with the knob flipped.
   const am = mgr(['cur', 'reset'], { expiry: OFF });
   bucket(am, 0, 'unified7d', 0.50, 50);
   bucket(am, 1, 'unified7d', 0.10, 10);
@@ -813,11 +753,8 @@ test('path 3: the knob-off poll spends the reset on sight', () => {
 });
 
 test('path 3: the knob-off switch sees the whole fleet', () => {
-  // The exclusion is gated at the call site for the reason the model is: with
-  // the feature off the switch's candidate filter must be the one the router
-  // makes without this feature. Both challengers rank equally with the knob off,
-  // so the tiebreak takes the sooner-resetting one — the Codex account, which an
-  // ungated threading would filter out.
+  // The exclusion is gated at the call site for the reason the model is. Both
+  // challengers rank equally off, so the tiebreak takes the Codex account.
   const am = mgr([oauth('cur'), oauth('anth'), oauth('codex', { provider: 'codex' })], { expiry: OFF });
   bucket(am, 0, 'unified7d', 0.50, 50);
   bucket(am, 1, 'unified7d', 0.50, 40);
@@ -826,26 +763,20 @@ test('path 3: the knob-off switch sees the whole fleet', () => {
     am.accounts[i].quota.unified5h = 0.5;
     am.accounts[i].quota.unified5hReset = Date.now() - 1000;
   }
-  // The switch's own pick, read before the walk that follows it can move the
-  // cursor again: an Anthropic request cannot be sent to the account the
-  // knob-off switch installs here, so the walk leaves it either way and only
-  // this reads the filter.
+  // The switch's own pick, read before the walk can move the cursor again: an
+  // Anthropic request cannot be sent where the knob-off switch installs.
   am.refreshExpiredQuotas(OPUS, am._excludeOtherProviders(null, DEFAULT_PROVIDER));
   assert.equal(am.accounts[am.currentIndex].name, 'codex',
     'the knob-off switch dropped a candidate the router keeps');
 });
 
 test('path 3: the knob-off switch keeps a spent account out', () => {
-  // The eligible loop's availability guard is redundant only with the feature
-  // ON, where refreshExpiredQuotas hands the switch a model and an exclusion set
-  // and has already filtered on the same test. With the knob off it hands
-  // neither, so that guard is the only thing between an account whose weekly is
-  // spent and the cursor. It gates behaviour the disabled path already has,
-  // not behaviour this adds.
+  // With the knob on, refreshExpiredQuotas has already filtered on this test.
+  // With it off, this guard alone keeps a spent account out of the switch.
   const am = mgr(['cur', 'spent'], { expiry: OFF });
   bucket(am, 0, 'unified7d', 0.50, 50);
-  // Over the threshold, and resetting sooner than the incumbent — everything the
-  // switch looks for, on an account no request can be sent to.
+  // Over the threshold and resetting sooner than the incumbent, on an account
+  // no request can be sent to.
   bucket(am, 1, 'unified7d', 0.99, 10);
   am.accounts[1].quota.unified5h = 0.5;
   am.accounts[1].quota.unified5hReset = Date.now() - 1000; // its 5h window just expired

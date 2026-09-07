@@ -79,8 +79,7 @@ async function fleet(names, handler, { distribute = false, hours = null, refresh
     body: JSON.stringify({ model, messages: [] }),
   }).then(async r => (await r.json()).account);
 
-  // The same request forced onto one named account by the path prefix the
-  // keep-warm scheduler uses. It never enters the selection walk.
+  // The same request forced onto one named account by the keep-warm path prefix.
   const sendPinned = (name, session = null, model = OPUS) => fetch(`http://127.0.0.1:${port}/tc-acct/${name}/v1/messages`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', ...(session ? { 'x-claude-code-session-id': session } : {}) },
@@ -156,15 +155,12 @@ const refuses = res => {
   res.end(JSON.stringify({ type: 'error', error: { type: 'permission_error', message: 'no' } }));
 };
 
-// A SUCCESS AT THE DESTINATION IS EVIDENCE ONLY IF IT SELECTED. Both of these
-// are served by b while two ordinary requests hang there holding a's roll, and
-// they differ in one thing: whether the request consulted the observation it
-// would be confirming.
+// A SUCCESS AT THE DESTINATION IS EVIDENCE ONLY IF IT SELECTED. Both are served
+// by b, and differ only in whether the request consulted the observation.
 const RESTING_SUCCESSES = [
   {
     // A pin is routed by name and never enters the selection walk, so it takes
-    // no reading and answers for no stay. Not a corner: the keep-warm scheduler
-    // pins every request it sends.
+    // no reading and answers for no stay.
     title: 'a pinned success at the destination confirms nothing',
     third: (handle, session) => handle.sendPinned('b', session),
     rolledOver: true,
@@ -173,9 +169,8 @@ const RESTING_SUCCESSES = [
     whyNext: 'a request that never selected spent the rollover another request was owed',
   },
   {
-    // The control, and the half that must keep working: this one selected, found
-    // the observation already resting on b and was served there, which is the
-    // stay a confirmation exists to record.
+    // The control: this one selected, found the observation already resting on b
+    // and was served there, which is the stay a confirmation records.
     title: 'an ordinary success resting at the destination confirms the stay',
     third: (handle, session) => handle.send(session),
     rolledOver: false,
@@ -399,11 +394,8 @@ for (const distribute of [false, true]) {
     }
   });
 
-  // ARRIVING IS NOT BEING SERVED. Three requests select b as a first selection
-  // each — no retry among them, so nothing here turns on the tried set — and b
-  // refuses all three. The second and third find the observation already naming
-  // b, which is what a rule keyed on a second arrival cannot tell from a stay,
-  // and none of the three is served there.
+  // ARRIVING IS NOT BEING SERVED. Three requests each select b as a first
+  // selection, b refuses all three, and none of them is served there.
   test(`${path} path: arrivals at a destination that serves none of them leave the roll owed`, async () => {
     const arrivals = [0, 1, 2].map(i => deferred(`arrival ${i + 1} at b`));
     const held = deferred('the suspension to be released');
@@ -422,9 +414,8 @@ for (const distribute of [false, true]) {
       assert.equal(await send(sid), 'a', 'the fixture must start on a');
       am.accounts[0].quota.unified7dReset += WEEK;
 
-      // Serialised on the arrivals, so each selection runs with the ones before
-      // it already suspended at b: the fixture needs the observation to name b
-      // when the second and third select, and a race would decide that.
+      // Serialised on the arrivals, so the observation names b when the second
+      // and third select; a race would decide that instead.
       const first = send(sid);
       await arrivals[0].promise;
       const second = send(sid);
@@ -444,19 +435,15 @@ for (const distribute of [false, true]) {
     }
   });
 
-  // The same shape reached sequentially, with no concurrency at all: the 401's
-  // forced refresh re-enters selection with the tried set untouched, so one
-  // request supplies both the arrival that moves the observation and, on a later
-  // request, the arrival that finds it already there.
+  // The same shape reached sequentially: the 401's forced refresh re-enters
+  // selection with the tried set untouched, so one request supplies the arrival.
   test(`${path} path: a 401 retry that rests without being served does not confirm the stay`, async () => {
     const hits = [];
     const { am, send, close } = await fleet(['a', 'b'], async (name, res) => {
       if (name !== 'b') return serves(res, name);
       hits.push(hits.length + 1);
-      // Hit 1 sends the request round again on b, and hit 2 serves it: that
-      // retry is the arrival, and its own selection made the move, so it
-      // confirms nothing. Hit 3 is the next request finding the traffic already
-      // at rest, and hit 4 refuses it — a rest with nothing served.
+      // Hit 1 sends the request round again on b and hit 2 serves it, so that
+      // retry made the move itself. Hit 3 finds it at rest, hit 4 refuses.
       if (hits.length === 1 || hits.length === 3) {
         res.writeHead(401, { 'content-type': 'application/json' });
         return res.end(JSON.stringify({ type: 'error', error: { type: 'authentication_error' } }));
@@ -465,8 +452,7 @@ for (const distribute of [false, true]) {
       return serves(res, name);
     }, {
       distribute,
-      // Mints the same access token, so the retry is still identifiable upstream
-      // as the same account rather than rotating away.
+      // Mints the same access token, so the retry is the same account upstream.
       refreshFn: async rt => ({ accessToken: 't-' + rt.slice(2), refreshToken: rt, expiresAt: Date.now() + H }),
     });
 
@@ -485,12 +471,8 @@ for (const distribute of [false, true]) {
     }
   });
 
-  // A THIRD REQUEST SERVED AT THE DESTINATION WHILE TWO ORDINARY ONES HANG
-  // THERE. The first of those made the move to b itself, so it can confirm
-  // nothing; the second found the observation already resting on b, which is
-  // the reading the third would be confirming. Both are then refused and fall
-  // back to a, and what the third was allowed to do decides where the traffic
-  // goes next.
+  // A THIRD REQUEST SERVED AT THE DESTINATION WHILE TWO ORDINARY ONES HANG THERE.
+  // The first made the move itself; the second found the observation resting on b.
   for (const success of RESTING_SUCCESSES) {
     test(`${path} path: ${success.title}`, async () => {
       const arrivals = [0, 1].map(i => deferred(`arrival ${i + 1} at b`));
@@ -511,9 +493,8 @@ for (const distribute of [false, true]) {
         assert.equal(await send(sid), 'a', 'the fixture must start on a');
         am.accounts[0].quota.unified7dReset += WEEK;
 
-        // Serialised on the arrivals, because the fixture needs both suspended
-        // requests at b before the third selects — a race would decide whether
-        // the observation names b by then, which is the whole question.
+        // Serialised on the arrivals, because both suspended requests must be at
+        // b before the third selects; a race would decide the whole question.
         const first = send(sid);
         await arrivals[0].promise;
         const second = send(sid);
@@ -527,16 +508,14 @@ for (const distribute of [false, true]) {
           'both refused requests should have fallen back onto a');
 
         // Read off whichever observation THIS path routes by: the session walk
-        // never moves the cursor, so on that path the cursor's reading stays on
-        // a whatever the third request was allowed to do.
+        // never moves the cursor, so its reading stays on a either way.
         const stillOwed = distribute
           ? am._pinRolledOver(sid, am.accounts[0], OPUS)
           : am._currentRolledOver(am.accounts[0], OPUS);
         assert.equal(stillOwed, success.rolledOver, success.whyState);
         assert.equal(await send(sid), success.next, success.whyNext);
       } finally {
-        // Before close(), or a failed assertion above leaves the upstream
-        // handlers suspended and the listeners never come down.
+        // Before close(), or a failed assertion leaves the handlers suspended.
         held.resolve();
         await close();
       }
@@ -688,14 +667,8 @@ test('a roll that happens while the knob is OFF is not owed when it comes on', a
 
 test('the stay confirmation writes nothing while the knob is OFF', async () => {
   // The confirmation's own fleet and sequence with preemption disabled, on the
-  // walk that has both an observation to write: the cursor's and the session
-  // pin's. The two state assertions catch a WRITE — an ungated one leaves an
-  // observation behind whether or not it also throws — and that is all they
-  // catch: an ungated selection-side read still only reads, and an ungated
-  // release returns on the observation nothing created. So the read's gate is
-  // asserted on the manager directly. The release's own gate is NOT witnessed
-  // here; with the knob off it is unreachable, since the carried stamp is null
-  // and `confirmStay` refuses on that before either gate is consulted.
+  // walk that has both observations to write. The state assertions catch a WRITE;
+  // the release's own gate is unreachable off, since the carried stamp is null.
   let attempts = 0;
   const { am, send, close } = await fleet(['a', 'b'], async (name, res) => {
     if (name === 'b' && attempts < 3) {

@@ -239,9 +239,9 @@ export class AccountManager {
     this.providerCursors = new Map();
     this.switchThreshold = switchThreshold;
     this.setRoutes(routes);
-    // Monotonic across every observation the manager holds, so a stamp read
-    // under one move can never match another. Live before the settings land,
-    // because turning the knob on takes a reading and stamps it.
+    // Monotonic across every observation, so a stamp read under one move never
+    // matches another. Live before the settings, since turning the knob on
+    // takes a reading.
     this._obsGen = 0;
     this.setExpiryRouting(expiryRouting);
     // The rollover mechanism's whole state for the sticky current account: one
@@ -420,9 +420,8 @@ export class AccountManager {
   /**
    * Move the cursor, and only the cursor. A reading is taken where a request
    * finds traffic resting, never where a selection aims it, so no caller of
-   * this method owes one. Every write here is `_firstSightOn`'s: an aim onto
-   * the account a preemption pushed traffic off restores the roll held for it,
-   * and any other aim writes only where nothing is lost.
+   * this method owes one. Its only write is `_firstSightOn`'s: it restores a
+   * held roll to its own account, and otherwise writes where nothing is lost.
    */
   _setCurrent(account) {
     this.currentIndex = account.index;
@@ -648,12 +647,8 @@ export class AccountManager {
     // Clear expired quotas across all accounts and switch proactively if a
     // session reset made a sooner-expiring account the better choice. This runs
     // on every request so the behaviour holds without the TUI render loop.
-    //
-    // The exclusion set is what marks this call as a request's, and the three
-    // request-less callers hand none. The request path always hands one, empty
-    // included; substituted here because the parameter is optional, and a
-    // request excluding nothing must still be told apart from a poll. Allocated
-    // fresh: a set handed out once is one a later reader could add to.
+    // The empty set marks this call as a request's, since a poll hands none.
+    // Allocated fresh: a set handed out once is one a later reader could add to.
     this.refreshExpiredQuotas(model, this.expiryRouting.enabled ? (exclude ?? new Set()) : exclude);
     // Session-affinity distribution (opt-in): keep a session on its pinned
     // account for cache reuse, and route a new session to the least-loaded
@@ -940,12 +935,9 @@ export class AccountManager {
    * exhausted-fleet probe fallback. Returns null when nothing can serve `model`
    * at the moment. The TUI uses this to mark the single account each secondary
    * bucket (Fable/Sonnet) currently routes to — the F7/S7 analogue of the ► that
-   * marks the default route's current account. The walk it mirrors is the
-   * non-session one — manual pin, then the current account where neither
-   * priority nor a rollover displaces it, then best-available — and a session
-   * pin resolves ahead of that walk without being consulted here, so a
-   * distributed session can be routed somewhere this does not name. It decides
-   * nothing: no reading is taken and no cursor moves.
+   * marks the default route's current account. A session pin resolves ahead of
+   * the walk this mirrors, so a distributed session can be routed elsewhere.
+   * It decides nothing: no reading is taken and no cursor moves.
    */
   previewRouteIndex(model) {
     const pinned = this._pinnedAccountForModel(model);
@@ -1043,16 +1035,12 @@ export class AccountManager {
   _governingWeekly(account, model) {
     const q = account.quota;
     const key = this._weeklyBucketFor(model);
-    // A dedicated family bucket does NOT stand alone: family spend meters into
-    // the shared weekly too, so an account under its Fable cap can be over the
-    // shared one. Gating on the family bucket alone is a one-way ratchet —
-    // once the shared weekly caps, family requests are the only ones still
-    // admitted, and each one pushes it further over (#175).
+    // A dedicated family bucket does not stand alone: family spend meters into
+    // the shared weekly too, so gating on the family bucket alone is a one-way
+    // ratchet once the shared weekly caps.
     if (key !== 'unified7d') return gatingUtilization(q, key);
-    // No dedicated field for this family — but the usage endpoint may still
-    // report a weekly bucket scoped to it (upstream adds these over time). Gate
-    // on the tighter of that bucket and the shared weekly, so a family with its
-    // own cap can't overshoot it just because the code predates the family.
+    // No dedicated field, but upstream may report a weekly bucket scoped to this
+    // family. Gate on the tighter of the two, so the family's own cap still binds.
     const scoped = this._scopedWeekly(account, model)?.utilization;
     const known = [q.unified7d, scoped].filter(v => v != null);
     return known.length ? Math.max(...known) : null;
@@ -1712,13 +1700,9 @@ export class AccountManager {
    * Has the governing window of this sticky choice rolled over since a request
    * was last found resting on it? A reading is written only where a request
    * ARRIVES to find the choice on an account outside its own tried set; an aim
-   * writes only where there is nothing to lose, because the aimed request may
-   * never arrive. Arriving is not being served either, so nothing here releases
-   * a held roll: a retry that re-enters with the tried set untouched looks like
-   * a fresh arrival, and so does a second client request at a destination
-   * refusing every one of them. The roll is held until an attempt that carries
-   * the generation this observation was stamped with is SERVED there; a stay so
-   * confirmed, followed by a return, preempts once more.
+   * writes only where nothing is lost, since the aimed request may never arrive.
+   * Nothing here releases a held roll: arriving is not being served, and only a
+   * served attempt carrying this observation's stamp releases one.
    */
   _restOn(obs, account, model) {
     if (obs.idx !== account.index) {
@@ -1790,9 +1774,8 @@ export class AccountManager {
   }
 
   /**
-   * The stamp a move is written with is what a confirmation is scoped to: a
-   * request that selected before this move, or after a later one, carries a
-   * different one and is not evidence about the stay this move begins.
+   * The stamp scopes a confirmation: a request that selected before this move,
+   * or after a later one, carries a different one and is no evidence here.
    */
   _moveObs(obs, index) {
     obs.idx = index;
@@ -1812,13 +1795,9 @@ export class AccountManager {
   }
 
   /**
-   * The generation stamps a request selects under, for the observations that
-   * can hold a roll on its behalf.
-   *
-   * Read BEFORE the walk: a move the walk itself makes is the request arriving
-   * somewhere, not finding traffic already at rest there, and only the latter
-   * can confirm a stay. Null with the knob off, so the caller carries nothing
-   * and the confirmation below has nothing to act on.
+   * The generation stamps a request selects under. Read BEFORE the walk: a move
+   * the walk makes is the request arriving, not finding traffic already at rest,
+   * and only the latter can confirm a stay. Null with the knob off.
    */
   observedGeneration(sessionId = null, model = null) {
     if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) return null;
@@ -1829,48 +1808,30 @@ export class AccountManager {
 
   /**
    * Release the roll a preemption pushed traffic off, on the evidence that the
-   * destination SERVED a request sent there — upstream answered it with a status
-   * below 400, so the account did not refuse it. What the client makes of the
-   * body afterwards is a question about the response, not about the account.
-   *
-   * Arriving is not that evidence: releasing on it would leave the fail-back
-   * nothing to hand back.
+   * destination SERVED a request sent there, with a status below 400. Arriving
+   * is not that evidence, and releasing on it leaves the fail-back nothing.
    */
   confirmStay(account, carried, sessionId = null, provider = null) {
     if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) return;
     if (!account || !carried) return;
-    // The cursor's observation hangs off ONE slot every provider shares, so the
-    // roll it holds and the success offered for it can belong to different
-    // fleets: a borrowed walk hands the INDEX back but not the observation,
-    // which it may have left naming the borrower's own account. What settles a
-    // roll is the REQUEST's provider, the fleet whose placement the walk was
-    // made under. Where the two differ the roll stays held: holding one too long
-    // costs a further preemption, releasing one early strands the traffic on the
-    // week the account just gained. A confirmation that names no fleet settles
-    // nothing, which is why the parameter has no default fleet to fall back on.
+    // One observation slot is shared by every provider, so the roll it holds and
+    // the success offered for it can belong to different fleets. The REQUEST's
+    // provider settles it, and a confirmation naming no fleet settles nothing.
     const held = this._currentObs?.unescaped;
     if (held && provider && providerOf(this.accounts[held.idx]) === provider) {
       this._releaseHeld(this._currentObs, account, carried.current);
     }
     if (sessionId) {
-      // The bucket comes from the stamp, and nothing here can resolve another:
-      // a route edit reaches the running table before the response does, so a
-      // bucket resolved now can be one this session has no observation under —
-      // settling nothing there while the observation the stamp names keeps the
-      // roll, for every model still governed by that bucket to be preempted on
-      // a second time.
-      //
-      // Ungated, because a session's observation is its own: a walk borrowing
-      // the shared cursor cannot leave one naming an account this session never
-      // selected.
+      // The bucket comes from the stamp, since a route edit reaches the running
+      // table before the response does. Ungated, because a session's own
+      // observation cannot name an account it never selected.
       this._releaseHeld(this.sessionTracker.refsFor(sessionId, carried.bucket), account, carried.pin);
     }
   }
 
   /**
-   * Clear one observation's held roll, and only where the request confirms the
-   * stay it selected under: another account, or any move since, is a different
-   * stay and leaves the roll held.
+   * Clear one observation's held roll, only where the request confirms the stay
+   * it selected under. Another account, or any move since, is a different stay.
    */
   _releaseHeld(obs, account, carried) {
     if (!obs || carried == null) return;
@@ -2309,19 +2270,12 @@ export class AccountManager {
 
   refreshExpiredQuotas(model = null, exclude = null) {
     let changed = false;
-    // Gated here rather than at the switch call below, because the pending flag
-    // is read against it too: with the feature off nothing is excluded from
-    // anything, and every reset is consumed on sight.
+    // Gated here rather than at the switch call, because the pending flag is read
+    // against it too: with the feature off every reset is consumed on sight.
     const scope = this.expiryRouting.enabled ? exclude : null;
-    // THE EXCLUSION SET IS WHAT MARKS A CALL AS A REQUEST'S. The request path
-    // hands one on every call — empty when the request excludes nothing — and
-    // the three request-less callers (the TUI render loop, getQuotaSummary for
-    // the status poller, selectActiveAccount at startup) hand none.
-    //
-    // The two tests below are the ones the switch's own eligible loop applies,
-    // so the predicate and the loop cannot disagree about which accounts are in
-    // play. Consulted only where `scope` is non-null, which is only with the
-    // feature on.
+    // THE EXCLUSION SET IS WHAT MARKS A CALL AS A REQUEST'S: the request path
+    // hands one on every call, empty included, and the TUI loop, getQuotaSummary
+    // and selectActiveAccount hand none. The tests below are the switch's own.
     const canRouteTo = account => account != null
       && !scope.has(account.index) && this._isAvailable(account, model);
     // The cursor's account is one end of every comparison the switch makes, so a
@@ -2332,15 +2286,11 @@ export class AccountManager {
     for (const account of this.accounts) {
       const r = this._clearExpiredQuotas(account);
       if (r.changed) changed = true;
-      // Clearing windows is a poll's whole job and is left to it; spending the
-      // event is not.
+      // Clearing windows is a poll's whole job. Spending the event is not.
       if (!spends) continue;
-      // The reset belongs to the first request that can act on it. This one
-      // cannot be sent to the account at all, so consuming the flag here would
-      // spend the event on a switch that must refuse it and leave the next
-      // request — which could have used the account — nothing to act on. Read
-      // after _clearExpiredQuotas: an account read before its expired window is
-      // cleared refuses every request.
+      // The reset belongs to the first request that can act on it, so consuming
+      // the flag for one that cannot leaves the next nothing to act on. Read
+      // after _clearExpiredQuotas, since before it every account refuses.
       if (scope != null && !canRouteTo(account)) continue;
       // The flag, not r.session: a status read may have cleared the window
       // seconds earlier, and the rule still has to run. Cleared here rather
@@ -2353,9 +2303,7 @@ export class AccountManager {
     // The model reaches the switch only while the feature is on. Handed no
     // model, the switch runs the same `_isAvailable(acc)` it does with the knob
     // off: threading one in would make the disabled path's candidate filter
-    // model-scoped, a live routing change on the path that promises none. The
-    // request's exclusions are gated for the same reason and say the same kind
-    // of thing — which accounts this request can be sent to at all.
+    // model-scoped, a live routing change on the path that promises none.
     if (sessionReset.length) {
       this._switchOnSessionReset(sessionReset, this.expiryRouting.enabled ? model : null, scope);
     }
@@ -2384,18 +2332,14 @@ export class AccountManager {
     for (const acc of candidates) {
       if (acc.index === this.currentIndex) continue;
       // An account this request cannot be sent to decides nothing about where it
-      // goes: a foreign provider serves none of its models, and one it has
-      // already tried refused it. refreshExpiredQuotas already leaves such
-      // accounts out of `candidates`; the check is kept where the parameter is,
-      // so a caller that does not filter first gets the same answer.
+      // goes. Kept here as well as in refreshExpiredQuotas, so a caller that does
+      // not filter first gets the same answer.
       if (exclude?.has(acc.index)) continue;
       // Model-scoped, because the request being routed has one: an account whose
       // Fable weekly is spent is still fully usable for Opus, and a switch that
       // ignores the model can install one the model's own picker would refuse.
-      // The caller pre-filters on this only with the feature ON, where it hands
-      // a model and an exclusion set to filter by. With the feature off it hands
-      // neither, and this line is the whole of what keeps an account whose
-      // weekly is spent out of the switch.
+      // The caller pre-filters on this only with the feature on. With it off,
+      // this line alone keeps an account whose weekly is spent out of the switch.
       if (!this._isAvailable(acc, model)) continue; // enough session & weekly quota left
       // Don't demote to a lower-priority (higher value) account on a reset.
       if ((acc.priority || 0) > (current.priority || 0)) continue;
@@ -2428,9 +2372,7 @@ export class AccountManager {
     // membership says the account is worth spending at all. The rank comparison
     // says this switch leaves no strictly better account behind, which
     // membership does not claim once a lower tier passes through unbanded. Both
-    // are drawn over what this request can be sent to, so an account it excludes
-    // neither takes the band on its own nor vetoes a switch to one that can
-    // serve it.
+    // are drawn over what this request can be sent to.
     if (this.expiryRouting.enabled && !this._bandedCandidates(exclude, model).includes(best)) return;
     // Strictly worse than what we are on: stay. Equal keeps the reset tiebreak
     // that got us here, and with expiry routing off every rank is absent and

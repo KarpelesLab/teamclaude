@@ -1380,12 +1380,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // from the default policy ('always' routes; 'off'/'429' start direct).
   const route = useSx === undefined ? !!(sx?.useByDefault()) : useSx;
 
-  // Taken before the walk, because the walk itself can move the observation and
-  // a request cannot confirm the stay its own selection began. A pinned request
-  // takes no reading at all: the pin below bypasses selection entirely, so it
-  // consults no observation and is not evidence about where traffic came to
-  // rest. The keep-warm scheduler pins every request it sends, so a confirmation
-  // from one would routinely release a roll an ordinary request is still owed.
+  // Taken before the walk, which can move the observation, and a request cannot
+  // confirm the stay its own selection began. A pinned request bypasses
+  // selection, so it consults no observation and is no evidence about a rest.
   const restingGen = ctx.pinnedIndex == null
     ? accountManager.observedGeneration(ctx.sessionId, ctx.model)
     : null;
@@ -1907,9 +1904,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
 
     res.writeHead(upstreamRes.status, responseHeaders);
 
-    // The catch block's transport-failure retry is guarded by `!res.headersSent`,
-    // so a stay confirmed once the headers are out has no retry behind it, and a
-    // forwarded status under 400 is the response the client is given.
+    // The catch block's retry is guarded by `!res.headersSent`, so a stay
+    // confirmed once the headers are out has no retry behind it.
     if (upstreamRes.status < 400) {
       accountManager.confirmStay(account, restingGen, ctx.sessionId, ctx.provider);
     }
