@@ -20,6 +20,13 @@ function codexAccount(name) {
   return { ...oauth(name), provider: 'codex', accountId: 'acct-' + name };
 }
 
+// A shared API key. Only subscriptions are partitioned, so a key that declares
+// no provider is eligible for either app's traffic while reading as the default
+// one — the case the shared-key arm below turns on.
+function sharedKey(name) {
+  return { name, type: 'apikey', apiKey: 'k-' + name };
+}
+
 // The knob spelled out at every call site: `undefined` here means the config key
 // is genuinely absent, never a default standing in for it.
 function mgr(names, expiry, extra = {}) {
@@ -1175,6 +1182,51 @@ test('a borrowed cursor\'s success settles the roll of its own provider', () => 
     'a roll the traffic already moved off was charged a second time');
   assert.equal(claudeReq().name, 'a',
     'the request after the fail-back preempted off a settled roll');
+});
+
+test('a success on a shared key for another provider\'s request leaves the roll held', () => {
+  // Only SUBSCRIPTIONS are partitioned, so a key that declares nothing is
+  // eligible for either app's traffic while answering `anthropic` wherever a
+  // declaration is read. The account a request landed on therefore says nothing
+  // about which fleet it belonged to: a codex request served on the shared key
+  // is no confirmation of the anthropic fleet's placement, and the roll that
+  // fleet holds is its fail-back's protection.
+  const am = new AccountManager(
+    [oauth('a1'), oauth('a2'), sharedKey('kn')], 0.98, { expiryRouting: ON },
+  );
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30]]) bucket(am, i, 'unified7d', 0.4, hours);
+  // The anthropic fleet owns the cursor, so the codex request below borrows it.
+  am.selectActiveAccount();
+
+  const claudeReq = (exclude = null) => am.getActiveAccount(exclude, OPUS, null, null, 'anthropic');
+  const codexReq = () => am.getActiveAccount(null, GPT, null, null, 'codex');
+
+  assert.equal(claudeReq().name, 'a1', 'the fixture must start on a1');
+  rollWindow(am, 0);
+  assert.equal(claudeReq().name, 'a2', 'the roll did not preempt off a1');
+  // The first request to REST on a2, which is what puts a1's roll into the hold.
+  assert.equal(claudeReq().name, 'a2', 'the preemption did not settle on a2');
+  assert.equal(am._currentObs.unescaped?.idx, 0, 'resting on a2 did not hold a1\'s roll');
+
+  // The key is the only account the codex fleet has, so its traffic borrows the
+  // cursor and lands there. The server's handshake spelled out as in the arms
+  // above: the first request moves the observation onto the key, the second
+  // finds it at rest and is served, which is the confirmation.
+  assert.equal(codexReq().name, 'kn', 'the codex request did not reach the shared key');
+  const carried = am.observedGeneration(null, GPT);
+  const served = codexReq();
+  assert.equal(served.name, 'kn', 'the confirming codex request left the shared key');
+  am.confirmStay(served, carried, null, GPT, 'codex');
+  assert.equal(am._currentObs.unescaped?.idx, 0,
+    'a codex success released the roll the anthropic fleet was holding');
+
+  // a2 and the key out of the way, so the anthropic traffic falls back onto a1.
+  // a1 still owes its roll, so the request after the fail-back leaves it again.
+  assert.equal(claudeReq(new Set([1, 2])).name, 'a1', 'the fail-back did not reach a1');
+  assert.equal(am._currentRolledOver(am.accounts[0], OPUS), true,
+    'the fail-back onto a1 first-sighted the week a1 gained');
+  assert.equal(claudeReq().name, 'a2',
+    'the anthropic request after the fail-back settled on the account its roll pushed it off');
 });
 
 test('removing an account renumbers a session pin\'s held roll too', () => {

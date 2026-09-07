@@ -1848,27 +1848,27 @@ export class AccountManager {
    * with the tried set untouched starts there again; releasing on any of those
    * would leave the fail-back nothing to hand back.
    */
-  confirmStay(account, carried, sessionId = null, model = null) {
+  confirmStay(account, carried, sessionId = null, model = null, provider = DEFAULT_PROVIDER) {
     if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) return;
     if (!account || !carried) return;
     // The cursor's observation hangs off ONE slot every provider shares, so the
     // roll it holds and the success offered for releasing it can belong to
     // different fleets: a request whose provider does not own the cursor borrows
     // it for the walk and hands the INDEX back, but not the observation — which
-    // that walk has left naming the borrower's own account. A success is a stay
-    // under its own provider's placement, and settles only a roll pushed off an
-    // account of that provider. Where the two differ the roll stays held, which
-    // is the safe direction: one held a request too long costs one further
-    // preemption, while one released early strands the traffic on the week the
-    // account just gained.
+    // that walk has left naming the borrower's own account. What settles a roll
+    // is the REQUEST's provider, the fleet whose placement the walk was made
+    // under; the account it landed on cannot stand in for that, because only
+    // subscriptions are partitioned and an API key either app may spend is
+    // eligible for both while declaring one. Where the two fleets differ the
+    // roll stays held, which is the safe direction: one held a request too long
+    // costs one further preemption, while one released early strands the traffic
+    // on the week the account just gained.
     //
-    // An account counts as the provider it declares, at both ends. Only
-    // subscriptions are partitioned, so an API key either app may spend still
-    // answers with one provider: a fleet whose key bridges the two can hold a
-    // roll one request longer than it needs to, and never releases one the other
-    // fleet's placement is owed.
+    // At the held end there is no request to ask, only the declaration, so a
+    // roll pushed off such a key reads as the provider it declares and the other
+    // fleet's success leaves it held — the same safe direction, one preemption.
     const held = this._currentObs?.unescaped;
-    if (held && providerOf(this.accounts[held.idx]) === providerOf(account)) {
+    if (held && providerOf(this.accounts[held.idx]) === provider) {
       this._releaseHeld(this._currentObs, account, carried.current);
     }
     if (sessionId) {
