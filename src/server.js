@@ -2613,11 +2613,12 @@ export function rewriteRequestBody(body, account, url, contentType) {
     // token we're injecting (same-length patch; no-op if absent).
     if (account.accountUuid) sendBody = patchAccountUuid(sendBody, account.accountUuid);
     // Third-party Anthropic-compatible upstreams strictly validate
-    // cache_control: Claude Code sends a `scope` subfield Anthropic accepts but
-    // they reject (400 unknown parameter `system.cache_control.scope`),
-    // breaking EVERY request once such an account is selected. Keep only the
-    // documented subfields for custom-upstream accounts; Anthropic accounts are
-    // untouched.
+    // cache_control: Claude Code sends `scope` and `ttl: 1h` subfields Anthropic
+    // accepts but they reject (400 unknown parameter / not supported), breaking
+    // EVERY request once such an account is selected. Keep only `type` for
+    // custom-upstream accounts (`ttl: 5m` is the default window, so dropping
+    // `ttl` is lossless except on backends with 1h windows); Anthropic accounts
+    // are untouched.
     if (account.upstream) sendBody = sanitizeCacheControl(sendBody, url, contentType);
   }
   // Rewrite the model name for accounts that target a different upstream (e.g.

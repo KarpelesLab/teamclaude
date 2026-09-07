@@ -2,12 +2,13 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { sanitizeCacheControl } from '../src/cache-control-sanitize.js';
 
-// Claude Code recently started sending a `scope` subfield inside `cache_control`
-// (on system blocks, and potentially message/tool blocks) that Anthropic's own
-// API accepts but strict third-party validators reject — observed as
-// 400 unknown parameter `system.cache_control.scope`, which breaks EVERY
-// request once such an account is selected. sanitizeCacheControl keeps only the
-// documented subfields (`type`, `ttl`) so the forwarded body validates.
+// Claude Code sends `scope` and `ttl: 1h` inside `cache_control` (system,
+// message, and tool blocks) that Anthropic's own API accepts but strict
+// third-party validators reject — observed as 400 unknown parameter
+// `system.cache_control.scope` and `` `cache_control.ttl: 1h` is not
+// supported ``, which breaks EVERY request once such an account is selected.
+// sanitizeCacheControl keeps only `type` so the forwarded body validates
+// (`ttl: 5m` is the default window).
 
 const MESSAGES = '/v1/messages';
 const JSON_CT = 'application/json';
@@ -36,9 +37,9 @@ test('scope is stripped from message content blocks too', () => {
   assert.deepEqual(out.messages[0].content[0].cache_control, { type: 'ephemeral' });
 });
 
-test('a documented ttl survives alongside type', () => {
+test('ttl is dropped: 1h is rejected by strict backends, 5m is the default anyway', () => {
   const out = parse(run({ model: 'm', system: [{ type: 'text', text: 'e', cache_control: { type: 'ephemeral', ttl: '1h', scope: 's' } }], messages: [] }));
-  assert.deepEqual(out.system[0].cache_control, { type: 'ephemeral', ttl: '1h' });
+  assert.deepEqual(out.system[0].cache_control, { type: 'ephemeral' });
 });
 
 test('a cache_control left with nothing documented is dropped, not emptied', () => {
@@ -59,7 +60,7 @@ test('a body without cache_control is returned untouched', () => {
 });
 
 test('a body whose cache_control is already clean is returned untouched', () => {
-  const body = buf({ model: 'm', system: [{ type: 'text', text: 'e', cache_control: { type: 'ephemeral', ttl: '5m' } }], messages: [] });
+  const body = buf({ model: 'm', system: [{ type: 'text', text: 'e', cache_control: { type: 'ephemeral' } }], messages: [] });
   assert.equal(sanitizeCacheControl(body, MESSAGES, JSON_CT), body);
 });
 

@@ -2,13 +2,17 @@
 // a body Claude Code legitimately sends validates on strict third-party
 // upstreams.
 //
-// Claude Code recently started sending a `scope` subfield inside `cache_control`
-// (observed on system blocks: 400 unknown parameter `system.cache_control.scope`)
-// that Anthropic's own API accepts but strict Anthropic-compatible validators
-// reject with a non-retryable 400 — breaking EVERY request once such an account
-// is selected. Only the documented subfields (`type`, `ttl`) are forwarded; a
-// `cache_control` left with neither is dropped rather than sent empty (an empty
-// object is itself an extra input to a strict schema).
+// Claude Code sends `cache_control` subfields Anthropic accepts but strict
+// Anthropic-compatible validators reject with a non-retryable 400 — breaking
+// EVERY request once such an account is selected. Probed against a real strict
+// backend (api.meta.ai): `scope` draws `unknown parameter`, and `ttl: 1h` draws
+// `` `cache_control.ttl: 1h` is not supported``; bare `{type: ephemeral}` and
+// `{type, ttl: 5m}` both return 200. So only `type` is forwarded: `ttl: 5m` is
+// the default window and dropping it is lossless, while `ttl: 1h` must go. The
+// one cost is a shorter cache window on backends that do support `1h` —
+// requests still succeed. A `cache_control` left with no `type` is dropped
+// rather than sent empty (an empty object is itself an extra input to a
+// strict schema).
 //
 // This only ever REMOVES cache hints: dropping one can cost a cache hit, never
 // correctness — the request means the same without it. A body with no unknown
@@ -25,9 +29,10 @@ const MESSAGES_PATH = '/v1/messages';
 // unnecessary parse that still returns the same Buffer, so it stays correct.
 const CACHE_CONTROL_MARKER = Buffer.from('"cache_control"');
 
-// The only cache_control subfields Anthropic documents. Anything else is an
-// extension a strict validator may refuse — see above.
-const KEPT_SUBFIELDS = new Set(['type', 'ttl']);
+// The only cache_control subfield forwarded to a custom upstream. Anything
+// else is either a strictly-rejected extension (`scope`, `ttl: 1h`) or the
+// default window restated (`ttl: 5m`) — see above.
+const KEPT_SUBFIELDS = new Set(['type']);
 
 // Is this a JSON /v1/messages (or /v1/messages/count_tokens) request we can
 // reason about? Everything else (token refreshes, GETs, non-JSON) is left alone.
