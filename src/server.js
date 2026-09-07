@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { ensureCerts, createConnectHandler, mitmHosts } from './mitm.js';
 import { patchAccountUuid } from './account-uuid-rewrite.js';
 import { sanitizeToolPairs } from './tool-pair-sanitize.js';
+import { sanitizeCacheControl } from './cache-control-sanitize.js';
 import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
 import { TopLevelFieldFinder, modelGlobMatches } from './model.js';
 import { BodyWriter, truncationNote } from './request-log.js';
@@ -1931,33 +1932,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   const upstreamUrl = `${upstreamFor(account, upstream)}${req.url}`;
   const method = req.method;
 
-  let sendBody = body;
-  // The body rewrites below are Anthropic-shaped and must not touch another
-  // provider's payload: a Responses API body has no metadata.user_id to patch
-  // and no Anthropic tool-pairing rule to repair, so running them would at
-  // best waste a pass and at worst corrupt a valid request.
-  if (rewritesBody(account)) {
-    // Strip orphaned tool_use / tool_result blocks so a client that compacted or
-    // interrupted a turn can't wedge the session with Anthropic's non-retryable
-    // 400 ("tool_use ids were found without tool_result blocks"). No-op (same
-    // Buffer) for a well-formed body.
-    sendBody = sanitizeToolPairs(body, req.url, req.headers['content-type']);
-    // Align the body's account_uuid (in metadata.user_id) with the account whose
-    // token we're injecting (same-length patch; no-op if absent).
-    if (account.accountUuid) sendBody = patchAccountUuid(sendBody, account.accountUuid);
-  }
-  // Rewrite the model name for accounts that target a different upstream (e.g.
-  // GLM), which uses different model identifiers than Anthropic.
-  if (account.modelMap) sendBody = rewriteModel(sendBody, account.modelMap);
-  // Third-party upstreams (e.g. OpenCode Zen, GLM) implement the Anthropic
-  // message API but reject fields Claude Code legitimately sends — observed:
-  // `context_management` -> 400 "Extra inputs are not permitted", which breaks
-  // EVERY request once such an account is selected. Drop the configured fields
-  // for those accounts only; Anthropic accounts are untouched. Content-Length is
-  // refreshed below because the body shrinks.
-  if (Array.isArray(account.stripRequestFields) && account.stripRequestFields.length) {
-    sendBody = stripBodyFields(sendBody, account.stripRequestFields);
-  }
+  // Every rewrite below runs inside rewriteRequestBody (exported for tests);
+  // Content-Length is refreshed below because the body can shrink.
+  let sendBody = rewriteRequestBody(body, account, req.url, req.headers['content-type']);
   // If the body changed length (sanitize, model rewrite, or field strip), update
   // Content-Length so the upstream doesn't receive a mismatched framing and
   // truncate or stall.
@@ -1981,7 +1958,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     l.write(`=== REQUEST (account: ${account.name}, retry: ${retryCount}) ===\n${method} ${upstreamUrl}\n${formatHeaders(safeHeaders)}`);
     // The body that went upstream, not the one the client sent: they differ
     // exactly when the proxy rewrote it (tool-pair sanitising, account_uuid,
-    // modelMap), which is the first thing to check when upstream rejects it.
+    // modelMap, cache_control strip), which is the first thing to check when
+    // upstream rejects it.
     if (sendBody !== body) l.write(`\n(body rewritten by the proxy before sending: ${body.length} → ${sendBody.length} bytes; the upstream copy follows)`);
     if (sendBody.length > 0) l.body('REQUEST BODY', sendBody, req.headers['content-type']);
   };
@@ -2613,6 +2591,47 @@ function extractUsageFromBody(buffer, accountIndex, accountManager, onUsage = nu
   } catch {
     // not JSON or no usage
   }
+}
+
+// Apply every request-body rewrite for the account about to serve it, in
+// forward order. Pure (buffer in, buffer out) and exported for tests —
+// forwardRequest only threads the result into Content-Length and the log.
+// Each step is a no-op returning the same Buffer when it has nothing to do,
+// so untouched bodies keep their exact bytes.
+export function rewriteRequestBody(body, account, url, contentType) {
+  let sendBody = body;
+  // The rewrites below are Anthropic-shaped and must not touch another
+  // provider's payload: a Responses API body has no metadata.user_id to patch
+  // and no Anthropic tool-pairing rule to repair, so running them would at
+  // best waste a pass and at worst corrupt a valid request.
+  if (rewritesBody(account)) {
+    // Strip orphaned tool_use / tool_result blocks so a client that compacted or
+    // interrupted a turn can't wedge the session with Anthropic's non-retryable
+    // 400 ("tool_use ids were found without tool_result blocks").
+    sendBody = sanitizeToolPairs(sendBody, url, contentType);
+    // Align the body's account_uuid (in metadata.user_id) with the account whose
+    // token we're injecting (same-length patch; no-op if absent).
+    if (account.accountUuid) sendBody = patchAccountUuid(sendBody, account.accountUuid);
+    // Third-party Anthropic-compatible upstreams strictly validate
+    // cache_control: Claude Code sends a `scope` subfield Anthropic accepts but
+    // they reject (400 unknown parameter `system.cache_control.scope`),
+    // breaking EVERY request once such an account is selected. Keep only the
+    // documented subfields for custom-upstream accounts; Anthropic accounts are
+    // untouched.
+    if (account.upstream) sendBody = sanitizeCacheControl(sendBody, url, contentType);
+  }
+  // Rewrite the model name for accounts that target a different upstream (e.g.
+  // GLM), which uses different model identifiers than Anthropic.
+  if (account.modelMap) sendBody = rewriteModel(sendBody, account.modelMap);
+  // Third-party upstreams (e.g. OpenCode Zen, GLM) implement the Anthropic
+  // message API but reject fields Claude Code legitimately sends — observed:
+  // `context_management` -> 400 "Extra inputs are not permitted", which breaks
+  // EVERY request once such an account is selected. Drop the configured fields
+  // for those accounts only; Anthropic accounts are untouched.
+  if (Array.isArray(account.stripRequestFields) && account.stripRequestFields.length) {
+    sendBody = stripBodyFields(sendBody, account.stripRequestFields);
+  }
+  return sendBody;
 }
 
 // Remove top-level fields from a JSON request body (see stripRequestFields).
