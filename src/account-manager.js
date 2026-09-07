@@ -2415,9 +2415,10 @@ export class AccountManager {
       // Model-scoped, because the request being routed has one: an account whose
       // Fable weekly is spent is still fully usable for Opus, and a switch that
       // ignores the model can install one the model's own picker would refuse.
-      // The same caller filters on this too, and for the same reason the line
-      // above is kept: a caller that hands unfiltered candidates gets the answer
-      // the parameter promises.
+      // The caller pre-filters on this only with the feature ON, where it hands
+      // a model and an exclusion set to filter by. With the feature off it hands
+      // neither, and this line is the whole of what keeps an account whose
+      // weekly is spent out of the switch — exactly as at master.
       if (!this._isAvailable(acc, model)) continue; // enough session & weekly quota left
       // Don't demote to a lower-priority (higher value) account on a reset.
       if ((acc.priority || 0) > (current.priority || 0)) continue;

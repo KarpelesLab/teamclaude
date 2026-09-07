@@ -835,6 +835,28 @@ test('path 3: the knob-off switch sees the fleet master shows it', () => {
     'the knob-off switch dropped a candidate the router keeps');
 });
 
+test('path 3: the knob-off switch keeps a spent account out, as master does', () => {
+  // The eligible loop's availability guard is redundant only with the feature
+  // ON, where refreshExpiredQuotas hands the switch a model and an exclusion set
+  // and has already filtered on the same test. With the knob off it hands
+  // neither, so that guard is the only thing between an account whose weekly is
+  // spent and the cursor. This arm is green at master too: it gates behaviour
+  // the branch inherits rather than behaviour it adds.
+  const am = mgr(['cur', 'spent'], { expiry: OFF });
+  bucket(am, 0, 'unified7d', 0.50, 50);
+  // Over the threshold, and resetting sooner than the incumbent — everything the
+  // switch looks for, on an account no request can be sent to.
+  bucket(am, 1, 'unified7d', 0.99, 10);
+  am.accounts[1].quota.unified5h = 0.5;
+  am.accounts[1].quota.unified5hReset = Date.now() - 1000; // its 5h window just expired
+
+  assert.equal(am._isAvailable(am.accounts[1], null), false,
+    'the fixture must make the challenger unavailable, or it gates nothing');
+  am.refreshExpiredQuotas();
+  assert.equal(am.accounts[am.currentIndex].name, 'cur',
+    'the knob-off switch installed an account whose weekly is spent');
+});
+
 test('path 3 still switches when the sooner-resetting account is the better one', () => {
   const am = mgr(['cur', 'b'], { expiry: ON });
   bucket(am, 0, 'unified7d', 0.9, 100);
