@@ -50,6 +50,8 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
     if (spend) lines.push(`  ${spend}`);
     lines.push(`  ${paint.dim('Usage'.padEnd(8))} ${formatUsage(account.usage, now)}`);
     lines.push(`  ${paint.dim('Probe'.padEnd(8))} ${formatAccountProbe(account.name, probe, now, paint)}`);
+    const adaptive = adaptiveFor(status, account.name);
+    if (adaptive) lines.push(`  ${paint.dim('Adaptive'.padEnd(8))} ${formatAdaptive(adaptive, paint)}`);
     lines.push('');
   }
 
@@ -220,10 +222,49 @@ function formatSessions(sessions, paint) {
   const known = sessions.known || 0;
   const draining = sessions.draining || 0;
   let mode;
-  if (sessions.distribute) mode = paint.green('distributing');
+  // Name WHICH distribution is running: "distributing" and "adapting" pick
+  // different accounts for the same fleet, so an operator reading the line
+  // needs to know which rule produced what they are looking at.
+  if (sessions.mode === 'adaptive') mode = paint.green('adapting');
+  else if (sessions.distribute) mode = paint.green('distributing');
   else if (draining) mode = paint.yellow(`draining ${draining}`);
   else mode = paint.dim('single-account');
   return `${active} active / ${known} known ${paint.dim('·')} ${mode}`;
+}
+
+// The adaptive row for one account, or null when the mode is off (getStatus
+// sends an empty list) or this account predates the snapshot.
+function adaptiveFor(status, name) {
+  return (status.adaptive || []).find(r => r.name === name) || null;
+}
+
+// "share 62%  ·  3 sess / 1 inflight  ·  head 38.0% of 98%  ·  tier 42.1M tok
+//  ·  1.2k tok/s  ·  conc 6"
+//
+// `share` first because it is the one number that answers "is distribution
+// doing what I asked": it is what the router says this account's cut of the
+// next new session is, so it can be read straight against the session counts
+// beside it. Everything after it is the evidence behind that number — how much
+// window is left, how big the window was measured to be, how fast it is being
+// spent, and how much concurrency the account has been seen to take.
+function formatAdaptive(a, paint) {
+  const parts = [];
+  parts.push(a.share == null
+    // Every candidate scored zero: the whole tier is inside its reserve, so
+    // there is no split to report and saying "0%" everywhere would imply the
+    // router had stopped, which it has not.
+    ? paint.yellow('share n/a (all reserved)')
+    : paint.bold(`share ${(a.share * 100).toFixed(0)}%`));
+  parts.push(`${a.sessions} sess / ${a.inFlight} inflight`);
+  parts.push(`head ${(a.headroom * 100).toFixed(1)}% of ${(a.threshold * 100).toFixed(0)}%`);
+  // Both learned figures are absent together (tok/s is derived from the tier),
+  // so one "learning" note covers them rather than two nulls.
+  parts.push(a.capacity == null
+    ? paint.dim('tier learning…')
+    : `tier ${formatNumber(Math.round(a.capacity))} tok · ${formatNumber(Math.round(a.tokensPerSecond))} tok/s`);
+  parts.push(`conc ${a.concCap.toFixed(1)}`);
+  const line = parts.join(paint.dim('  ·  '));
+  return a.competing ? line : `${paint.dim('(not competing)')} ${line}`;
 }
 
 function formatAccountStatus(account, now, paint) {

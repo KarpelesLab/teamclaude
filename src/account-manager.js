@@ -8,9 +8,30 @@ import { SessionTracker } from './session-tracker.js';
 import { buildQuotaSummary } from './quota-summary.js';
 import { ROLLOVER_MIN_JUMP_MS, remapHeld } from './rollover.js';
 import { decideBand, pressureOf, pressureRank, assertNever } from './band-decision.js';
+import { CapacityLearner, ConcurrencyLearner, scoreCandidate } from './adaptive-distribution.js';
 
 // Re-exported for callers that import these model helpers from here.
 export { isFableModel, parseRequestModel, parseAdvisorModel } from './model.js';
+
+/**
+ * Normalize the `distributeSessions` setting to a mode.
+ *
+ * The setting began as a boolean and stays one for the two behaviours it
+ * already named, so every existing config keeps its meaning exactly:
+ *   false / absent → 'off'      quota-driven rotation, one account at a time
+ *   true           → 'even'     spread new sessions by active-session count
+ *   'adaptive'     → 'adaptive' spend the least-remaining window down first,
+ *                               tapering at the threshold and backing off when
+ *                               the account is busy (see adaptive-distribution.js)
+ * An unrecognised string is treated as 'even' rather than rejected: it is
+ * plainly a request to distribute, and refusing to distribute at all would be
+ * the worse reading of a typo.
+ */
+export function distributionMode(setting) {
+  if (setting === 'adaptive') return 'adaptive';
+  if (!setting) return 'off';
+  return 'even';
+}
 
 // How long after a successful token refresh a forced (post-401) refresh is
 // suppressed. Long enough to cover the 401s from requests already in flight
@@ -197,7 +218,7 @@ function sampleModelFor(route) {
 }
 
 export class AccountManager {
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, sessionTracker, expiryRouting } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting } = {}) {
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
@@ -212,7 +233,19 @@ export class AccountManager {
     // account for cache reuse, but spread NEW sessions across equal-priority
     // accounts by load instead of funnelling them all onto the current one.
     this.sessionTracker = sessionTracker || new SessionTracker();
-    this.distributeSessions = !!distributeSessions;
+    // 'off' | 'even' | 'adaptive'. `distributeSessions` stays a boolean beside
+    // it ("is distribution on at all") because the status readout, the TUI
+    // header and the remote dashboard all ask only that question.
+    this.distributionMode = distributionMode(distributeSessions);
+    this.distributeSessions = this.distributionMode !== 'off';
+    // Adaptive mode's two learned quantities: how big each account's weekly
+    // window is (its plan tier) and how much concurrency it tolerates. Both are
+    // inferred from live traffic — see adaptive-distribution.js. Constructed
+    // unconditionally and fed on every request regardless of mode, so switching
+    // to adaptive at runtime starts from what has already been observed instead
+    // of from a cold start.
+    this.capacityLearner = new CapacityLearner(adaptive);
+    this.concurrencyLearner = new ConcurrencyLearner(adaptive);
     // Sessions still being drained after distribution was turned off (see
     // setDistributeSessions). null = not draining; a Set of session ids otherwise.
     this._drainingSessions = null;
@@ -479,7 +512,12 @@ export class AccountManager {
   /** Release a slot taken by admit(). Safe to call once per successful admit. */
   release(index) {
     const account = this.accounts[index];
-    if (account && account.inFlight > 0) account.inFlight--;
+    if (!account) return;
+    // Counterpart to the throttle signal: a request that ran to completion at
+    // this depth is evidence the account sustained it. Read BEFORE the
+    // decrement, so it is the depth the request actually ran at.
+    this.concurrencyLearner.noteSuccess(index, account.inFlight || 0);
+    if (account.inFlight > 0) account.inFlight--;
   }
 
   /**
@@ -502,6 +540,10 @@ export class AccountManager {
   pauseAccount(index, seconds) {
     const account = this.accounts[index];
     if (!account) return;
+    // Upstream just refused this account at its current concurrency. That is
+    // the only direct evidence of how much it actually tolerates, so it is what
+    // adaptive distribution's response-speed term learns from.
+    this.concurrencyLearner.noteThrottled(index, account.inFlight || 0);
     const until = Date.now() + Math.max(0, seconds) * 1000;
     account.pausedUntil = Math.max(account.pausedUntil || 0, until);
     // Arm the ramp to begin when the pause ends: while paused, admit() holds on
@@ -812,12 +854,102 @@ export class AccountManager {
     return this._pickLeastLoaded(exclude, model, advisorModel);
   }
 
+  /** Where a new session goes, per the configured distribution mode. Adaptive
+   * scores the tier by remaining credit and congestion; even (the original)
+   * spreads by active-session count. */
+  _pickLeastLoaded(exclude = null, model = null, advisorModel = null) {
+    if (this.distributionMode === 'adaptive') {
+      const picked = this._pickAdaptive(exclude, model, advisorModel);
+      // Adaptive can legitimately score every candidate at zero — the whole
+      // tier is inside its reserve — and that is not a reason to refuse a
+      // request. Fall through to the even walk, which still returns the least
+      // loaded of them, and let the switch threshold be what actually takes an
+      // account out of rotation.
+      if (picked) return picked;
+    }
+    return this._pickLeastLoadedEven(exclude, model, advisorModel);
+  }
+
+  /**
+   * Adaptive selection: among the highest-priority eligible accounts, pick the
+   * best score from adaptive-distribution.js — least remaining weekly credit
+   * (measured in tokens once the plan tier has been learned), tapered off as
+   * the account nears its switch threshold, and discounted by how much work is
+   * already on it.
+   *
+   * Priority is applied as a hard filter first, exactly as the other selection
+   * paths apply it, so an operator's ordering still outranks every adaptive
+   * consideration. Scoring only ever chooses WITHIN a tier.
+   */
+  _pickAdaptive(exclude = null, model = null, advisorModel = null) {
+    const now = Date.now();
+    const bucket = this._weeklyBucketFor(model);
+    const threshold = this.thresholdFor(bucket);
+
+    // The SAME candidate set the even walk uses, so adaptive cannot quietly
+    // bypass expiry routing: with it off this is every eligible account, and
+    // with it on it is the top pressure band — which is where that feature
+    // intends distribution to spread (see _topPressureBand). Adaptive then
+    // decides WITHIN the admitted set, which is the layering the two want:
+    // expiry picks which windows are urgent, adaptive picks which of those to
+    // spend and how hard.
+    const eligible = this._bandedCandidates(exclude, model, advisorModel);
+    if (eligible.length === 0) return null;
+    // Banding may still span priorities (it passes everything through when
+    // expiry routing is off), so the tier filter stays: an operator's ordering
+    // outranks every adaptive consideration.
+    const topPriority = Math.min(...eligible.map(a => a.priority || 0));
+    const tier = eligible.filter(a => (a.priority || 0) === topPriority);
+    if (tier.length === 1) return tier[0];
+
+    // `remaining` is comparable across the tier only if it is in one unit, and
+    // it is in tokens only where the capacity is known. A tier that has learned
+    // some accounts and not others would mix tokens with bare fractions and
+    // rank on the difference, so the absolute form is used only when EVERY
+    // candidate has been learned; otherwise all of them fall back to fractions.
+    const capacities = tier.map(a => this.capacityLearner.capacity(a.index, bucket));
+    const useCapacity = capacities.every(c => c != null && c > 0);
+
+    const candidates = tier.map((account, i) => ({
+      account,
+      index: account.index,
+      utilization: this._governingWeekly(account, model),
+      threshold,
+      capacity: useCapacity ? capacities[i] : null,
+      reserve: this.capacityLearner.reserve(account.index, bucket),
+      load: this.sessionTracker.activeCountFor(account.index, now) + (account.inFlight || 0),
+      concCap: this.concurrencyLearner.cap(account.index),
+    }));
+    const maxRemaining = Math.max(...candidates.map(c => {
+      const u = Number.isFinite(c.utilization) ? c.utilization : 0;
+      const head = Math.max(0, threshold - u);
+      return c.capacity != null ? c.capacity * head : head;
+    }));
+
+    let best = null;
+    let bestScore = -Infinity;
+    let bestReset = Infinity;
+    for (const c of candidates) {
+      const { score } = scoreCandidate({ ...c, maxRemaining });
+      // Soonest weekly reset breaks a tie, matching the rest of selection: on
+      // an idle fleet every candidate scores identically, and without this the
+      // winner would be array order.
+      const reset = this._governingWeeklyReset(c.account, model) || -Infinity;
+      if (score > bestScore || (score === bestScore && reset < bestReset)) {
+        best = c.account;
+        bestScore = score;
+        bestReset = reset;
+      }
+    }
+    return bestScore > 0 ? best : null;
+  }
+
   /** Best-available biased toward the fewest active sessions, so new sessions
    * spread across equal-priority accounts instead of funnelling onto one. Order:
    * priority → [top pressure band, when expiry routing is on] → fewest active
    * sessions → fewest in-flight → highest expiry pressure (inert when expiry
    * routing is off) → soonest weekly reset (the existing tiebreak). */
-  _pickLeastLoaded(exclude = null, model = null, advisorModel = null) {
+  _pickLeastLoadedEven(exclude = null, model = null, advisorModel = null) {
     const now = Date.now();
     const candidates = this._bandedCandidates(exclude, model, advisorModel);
     // One clock for every candidate: pressure rises continuously as a window
@@ -900,9 +1032,100 @@ export class AccountManager {
     if (sessionId) this.sessionTracker.endRequest(sessionId);
   }
 
+  /**
+   * Per-account diagnostics for adaptive distribution: what has been learned
+   * about each account and what share of new sessions that produces right now.
+   *
+   * This exists to make the mode auditable. Adaptive routing is the one mode
+   * whose decision is not readable off the account list — "3 sessions here, 1
+   * there" is the same picture whether that split is what the rule intended or
+   * the opposite of it. `share` closes that: it is the scoring function's own
+   * output, normalised across the tier, so an operator can compare where
+   * sessions are actually going against where the rule says they should.
+   *
+   * Returns an empty array outside adaptive mode — the numbers are still being
+   * learned, but nothing is routing on them, and presenting them as if they
+   * governed anything would misreport what the proxy is doing.
+   */
+  adaptiveStats(model = null) {
+    if (this.distributionMode !== 'adaptive') return [];
+    const now = Date.now();
+    const bucket = this._weeklyBucketFor(model);
+    const threshold = this.thresholdFor(bucket);
+
+    const eligible = this.accounts.filter(a => this._isAvailable(a, model));
+    const topPriority = eligible.length ? Math.min(...eligible.map(a => a.priority || 0)) : 0;
+    // Only the accounts actually competing get a share: an ineligible or
+    // outranked account's share is not "small", it is not in the draw at all,
+    // and a percentage beside it would read as the former.
+    const inTier = new Set(eligible.filter(a => (a.priority || 0) === topPriority).map(a => a.index));
+
+    const capacities = new Map(this.accounts.map(a => [a.index, this.capacityLearner.capacity(a.index, bucket)]));
+    const useCapacity = [...inTier].every(i => capacities.get(i) != null && capacities.get(i) > 0);
+
+    const rows = this.accounts.map(a => {
+      const utilization = this._governingWeekly(a, model);
+      const u = Number.isFinite(utilization) ? utilization : 0;
+      const head = Math.max(0, threshold - u);
+      const capacity = capacities.get(a.index);
+      const burnRate = this.capacityLearner.burnRate(a.index, bucket);
+      return {
+        index: a.index,
+        name: a.name,
+        competing: inTier.has(a.index),
+        sessions: this.sessionTracker.activeCountFor(a.index, now),
+        inFlight: a.inFlight || 0,
+        utilization: Number.isFinite(utilization) ? utilization : null,
+        // Distance to the operator's own switch threshold for this bucket, not
+        // to 100%: the threshold is where the account leaves rotation, so it is
+        // the only headroom that affects a routing decision.
+        headroom: head,
+        threshold,
+        // Learned window size in metered tokens — the account's plan tier as
+        // observed, rather than as declared. null until enough has been seen.
+        capacity: capacity ?? null,
+        reserve: this.capacityLearner.reserve(a.index, bucket),
+        concCap: this.concurrencyLearner.cap(a.index),
+        // Observed throughput, in metered tokens per second. Derived rather
+        // than separately counted: burn rate is a fraction of the window per
+        // ms and capacity is tokens per window, so their product is tokens per
+        // ms and needs no plumbing of its own. Null while the tier is unknown,
+        // because a rate in fractions-of-a-window is not comparable between
+        // accounts on different plans — which is the whole point of showing it.
+        tokensPerSecond: capacity != null ? burnRate * capacity * 1000 : null,
+        _remaining: (useCapacity && capacity != null ? capacity : 1) * head,
+      };
+    });
+
+    const maxRemaining = Math.max(0, ...rows.filter(r => r.competing).map(r => r._remaining));
+    let total = 0;
+    for (const r of rows) {
+      if (!r.competing) { r.score = 0; continue; }
+      const { score } = scoreCandidate({
+        utilization: r.utilization,
+        threshold,
+        capacity: useCapacity ? r.capacity : null,
+        reserve: r.reserve,
+        load: r.sessions + r.inFlight,
+        concCap: r.concCap,
+        maxRemaining,
+      });
+      r.score = score;
+      total += score;
+    }
+    for (const r of rows) {
+      // Share of the NEXT new session, not of the sessions already placed. A
+      // tier scoring zero everywhere (all inside their reserve) has no share to
+      // divide rather than an equal one.
+      r.share = total > 0 ? r.score / total : null;
+      delete r._remaining;
+    }
+    return rows;
+  }
+
   /** { known, active, perAccount } session counts for status/TUI. */
   sessionStats() {
-    return { ...this.sessionTracker.stats(), draining: this.drainingCount() };
+    return { ...this.sessionTracker.stats(), mode: this.distributionMode, draining: this.drainingCount() };
   }
 
   /**
@@ -1283,12 +1506,17 @@ export class AccountManager {
    *
    *  Turning it ON cancels any drain in progress. */
   setDistributeSessions(enabled, { drain = true } = {}) {
-    const on = !!enabled;
-    if (on) {
+    const mode = distributionMode(enabled);
+    if (mode !== 'off') {
+      // Includes switching BETWEEN 'even' and 'adaptive'. Neither drains: both
+      // keep a session pinned to its account, so only the choice made for the
+      // NEXT new session changes and no running session loses its prompt cache.
+      this.distributionMode = mode;
       this.distributeSessions = true;
       this._drainingSessions = null;
       return;
     }
+    this.distributionMode = 'off';
     // Only a true → false transition drains; re-applying "off" (every config
     // reload while it is already off) must not resurrect affinity for sessions
     // that have since been routed by plain rotation.
@@ -2521,6 +2749,8 @@ export class AccountManager {
       console.log(`[TeamClaude] Learned weekly quota for "${account.name}", re-evaluating selection`);
     }
 
+    this._observeQuotaForLearning(account);
+
     account.usage.totalRequests++;
     account.usage.lastUsed = new Date().toISOString();
 
@@ -2599,6 +2829,8 @@ export class AccountManager {
     if (tokensReset) account.quota.resetsAt = tokensReset;
     else if (requestsReset) account.quota.resetsAt = requestsReset;
 
+    this._observeQuotaForLearning(account);
+
     account.usage.totalRequests++;
     account.usage.lastUsed = new Date().toISOString();
 
@@ -2610,6 +2842,27 @@ export class AccountManager {
           ? ((1 - account.quota.tokensRemaining / account.quota.tokensLimit) * 100).toFixed(1)
           : '?';
       console.log(`[TeamClaude] Account "${account.name}" at ${pct}% usage — will switch on next request`);
+    }
+  }
+
+  /**
+   * Feed every weekly utilization this account currently reports to the
+   * capacity learner, so adaptive distribution can price the tokens recorded
+   * since the last reading.
+   *
+   * Called from all three paths that learn a utilization — response headers
+   * (Anthropic and Codex) and the background usage probe — rather than from
+   * selection, because what makes a sample usable is that it is FRESH: the
+   * learner divides tokens by the utilization move they caused, and only the
+   * moment a new reading arrives are the two known to cover the same interval.
+   */
+  _observeQuotaForLearning(account) {
+    if (!account) return;
+    const q = account.quota;
+    const now = Date.now();
+    this.capacityLearner.observeUtilization(account.index, 'unified7d', q.unified7d, now);
+    for (const { key } of FAMILY_WEEKLY_BUCKETS) {
+      if (q[key] != null) this.capacityLearner.observeUtilization(account.index, key, q[key], now);
     }
   }
 
@@ -2662,6 +2915,11 @@ export class AccountManager {
     // A request with no session id (or one the tracker has forgotten) is still a
     // real spend by the account, so the two scopes are recorded independently.
     this.sessionTracker.recordTokens(sessionId, bucket, usage);
+    // Third scope: what these tokens cost this account's weekly window. Unlike
+    // the two above, this one IS routed on — it is how adaptive distribution
+    // learns the account's plan tier (see adaptive-distribution.js). Fed in
+    // every mode so the tier is already known if adaptive is switched on later.
+    this.capacityLearner.recordTokens(accountIndex, bucket, usage);
   }
 
   /**
@@ -2748,6 +3006,10 @@ export class AccountManager {
     // applies, and keeping a remembered copy would gate on a limit that upstream
     // has stopped reporting.
     if (usage.scopedWeekly) q.scopedWeekly = { ...usage.scopedWeekly };
+    // A probe is the cleanest capacity sample there is: it reads the same
+    // buckets a response header would, without spending anything itself, so the
+    // tokens it prices are exactly the client traffic since the last reading.
+    this._observeQuotaForLearning(account);
 
     // Paid overage. Replaced wholesale like the buckets above, and announced
     // once on the transition into billing: an account that starts drawing real
@@ -3053,7 +3315,10 @@ export class AccountManager {
       // operator reading status sees the configuration the router is using.
       expiryRouting: { ...this.expiryRouting },
       routes: this.getRoutes(),
-      sessions: { ...sessions, distribute: this.distributeSessions, draining: this.drainingCount() },
+      sessions: { ...sessions, distribute: this.distributeSessions, mode: this.distributionMode, draining: this.drainingCount() },
+      // Empty outside adaptive mode, so the renderer needs no mode check of its
+      // own and an older client simply sees nothing extra.
+      adaptive: this.adaptiveStats(),
       accounts: this.accounts.map(a => ({
         name: a.name,
         type: a.type,

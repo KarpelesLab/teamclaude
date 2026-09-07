@@ -247,7 +247,7 @@ async function serverCommand() {
   }
 
   const threshold = config.switchThreshold || 0.98;
-  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp, distributeSessions: config.distributeSessions, expiryRouting: config.expiryRouting });
+  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp, distributeSessions: config.distributeSessions, expiryRouting: config.expiryRouting, adaptive: config.adaptiveDistribution });
   // Names the activity log's session column from Claude Code's own on-disk
   // session titles. Built whether or not the TUI runs, so a reload has one
   // object to reconfigure.
@@ -363,7 +363,9 @@ async function serverCommand() {
     accountManager.setRoutes(config.routes);
     // Pick up a distributeSessions change (hand edit or another writer) the same
     // way routes, sx, probe and warmup are picked up below.
-    config.distributeSessions = !!diskConfig.distributeSessions;
+    // Not coerced to a boolean: 'adaptive' is a third mode, and !! would flatten
+    // it to plain even distribution on every config reload.
+    config.distributeSessions = diskConfig.distributeSessions ?? false;
     accountManager.setDistributeSessions(config.distributeSessions);
     // Pick up a switchThreshold change the same way (teamclaude threshold, the
     // TUI settings screen, or a hand edit). thresholdFor() reads it off the

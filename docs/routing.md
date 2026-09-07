@@ -137,6 +137,39 @@ More precisely, a session holds **one pin per weekly quota bucket**, not one ove
 
 **Families that share a bucket share a pin, including when only one of them is separately metered.** Upstream can report a *learned* weekly bucket scoped to a family the static table has no entry for; routing then meters that family on its own window (see [Expiry-pressure routing](#expiry-pressure-routing)) while affinity still keys on the shared bucket the family falls under. Such a family has its own quota clock and not its own pin, so anything that moves the pin moves both — a known limitation of pinning by bucket rather than by governing window, and the reason the cost bound below is stated per pin rather than per family.
 
+### Adaptive distribution
+
+Even distribution treats every account as interchangeable, which is wrong once a fleet is mixed. It sends a Pro account the same share as a Max 20x, so the small one hits its weekly wall days before the big one is half spent — and spreading evenly **fragments** the weekly windows: five accounts each left at 60% at reset is five windows' worth of credit thrown away, where four spent accounts and one untouched is the same work with the headroom kept where it can still be used.
+
+```json
+"distributeSessions": "adaptive"
+```
+
+Adaptive mode does the opposite of even: it concentrates new sessions on the account with the **least remaining weekly credit**, to finish that window off — while tapering its share away as it nears the switch threshold, so the account is spent down to the wall and never into it, and backing off when it is congested, so concentrating never costs response time. A session's pin, priority ordering, and the drain-on-disable behaviour are all unchanged.
+
+Nothing is configured per account. The two quantities that would otherwise be operator-set constants are **learned from live traffic**:
+
+| Learned | How | Used for |
+| --- | --- | --- |
+| **Plan tier** — the weekly window's size in tokens | The metered tokens served divided by the utilization they consumed. A Max 20x window moves far less per token than a Pro one. | Making "least remaining" an *absolute* comparison. Without it, 10% of a 20x window and 10% of a Pro one look identical. |
+| **Tolerated concurrency** | AIMD: retreat below the depth that upstream throttled, creep back up while running at the cap without trouble. | The response-speed term, so an account is never concentrated onto past the point where the next session would just queue. |
+
+The taper's width is adaptive too, rather than a fixed percentage: it is how much of the window the account would spend in the next 30 minutes **at its own observed burn rate**, so a fast-burning account is given a wide margin and an idle one may run much closer to the threshold.
+
+The threshold it tapers toward is **your** `switchThreshold`, including the per-bucket form — set `{ "default": 0.98, "unified7d": 0.85 }` and the weekly taper reaches zero at 85%, not 98%.
+
+Cache reads are excluded from the tier measurement (they meter at a fraction upstream does not publish, so counting them would make a cache-heavy session look like more spend than it was), and a utilization *drop* is read as a window reset rather than negative spend.
+
+**Reading the result.** In this mode `teamclaude status` adds an `Adaptive` line per account, and the header reads `adapting`:
+
+```
+> henry@work (Max 20x) (oauth, prio 0) active 3 sess
+  Weekly   [███████████░░░░░░░] 62% reset 3d8h
+  Adaptive share 16%  ·  3 sess / 3 inflight  ·  head 36.0% of 98%  ·  tier 110.0m tok · 1.8k tok/s  ·  conc 6.0
+```
+
+`share` is the number to gate on: it is the router's own output — this account's cut of the *next* new session — so it can be read straight against the session counts beside it to confirm traffic is going where the rule says it should. The rest is the evidence behind it: headroom to your threshold, the measured window size, throughput, and the learned concurrency cap. `tier learning…` means not enough has been observed yet, and selection is falling back to plain fractions until it has; `share n/a (all reserved)` means every account in the tier is inside its reserve, so there is no split to report.
+
 **Turning it off drains, it doesn't cut.** The setting is applied live on config reload, and switching it off would otherwise move every distributed session to the current account on its *next* request — each one throwing away the prompt cache it built on its old account, and all of them arriving at one account at once. Instead, the sessions running at that moment keep their accounts, and only **new** sessions go back to plain quota-driven rotation. Affinity therefore winds down as those sessions finish rather than snapping, and a draining session whose account becomes ineligible simply rejoins normal rotation. While this is happening `teamclaude status` reads `draining N` (the TUI header shows `drain N`) instead of `single-account`, and it clears itself once the last of those sessions is done or idles out.
 
 With `expiryRouting.preempt` on, a governing-window **rollover** also ends the drain for the session whose account rolled, and it rejoins normal rotation there and then. The drain trades expiring quota for a warm prompt cache, and that trade is priced on the window the account had when the drain started; once that window has gained a full week the account is the one the fleet should be spending last. Nothing else bounds it — a session making requests never idles out — so without this a long-lived session rides a rolled-over account for as long as it keeps talking.

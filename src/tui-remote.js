@@ -146,6 +146,7 @@ export class RemoteAccountManager {
     // marks the same families blocked as the server's own TUI does.
     this.switchThresholds = null;
     this.distributeSessions = false;
+    this.distributionMode = 'off';
     this.routes = [];
     this.sessions = { active: 0, known: 0, perAccount: {} };
     this.connected = false;   // false ⇒ the view is a stale snapshot
@@ -191,8 +192,15 @@ export class RemoteAccountManager {
       active: sessions.active || 0,
       known: sessions.known || 0,
       perAccount: sessions.perAccount || {},
+      // Only when the server actually sent one: an older server sends no
+      // `mode`, and carrying an explicit undefined would change the shape of a
+      // payload the dashboard compares structurally.
+      ...(sessions.mode ? { mode: sessions.mode } : {}),
     };
     this.distributeSessions = !!sessions.distribute;
+    // A server too old to send `mode` still reports `distribute`, so fall back
+    // to the behaviour that flag alone used to mean rather than showing 'off'.
+    this.distributionMode = sessions.mode || (sessions.distribute ? 'even' : 'off');
     // Same rule as the accounts above, and for the same reason: the renderer
     // walks route.accounts and route.match directly, so a route the payload
     // leaves half-specified would take the whole dashboard down mid-frame.

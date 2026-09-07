@@ -1297,7 +1297,8 @@ export class TUI {
     const port = this.config.proxy?.port || 3456;
     const sess = this.am.sessionStats();
     const sessStr = (sess.active || sess.known)
-      ? `${sess.active} sess${this.am.distributeSessions ? green(' dist')
+      ? `${sess.active} sess${this.am.distributeSessions
+        ? green(this.am.distributionMode === 'adaptive' ? ' adapt' : ' dist')
         : (sess.draining ? yellow(` drain ${sess.draining}`) : '')}  `
       : '';
     // ▼ marks a dashboard that lost contact with the server it polls (attach
