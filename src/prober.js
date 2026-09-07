@@ -8,13 +8,15 @@
 // probe reads a zero-spend endpoint and never consumes message quota.
 
 import { fetchUsage } from './oauth.js';
+import { fetchBackendQuota, hasBackendQuota } from './backend-quota.js';
 
 export class Prober {
-  constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, profileFn = null, timeoutMs = 10_000, log = console.log } = {}) {
+  constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, profileFn = null, backendFn = fetchBackendQuota, timeoutMs = 10_000, log = console.log } = {}) {
     this.am = accountManager;
     this.intervalMs = intervalMs;
     this.probeFn = probeFn;
     this.profileFn = profileFn;
+    this.backendFn = backendFn;
     this.timeoutMs = timeoutMs;
     this.log = log;
     this.timer = null;
@@ -61,7 +63,8 @@ export class Prober {
     this.lastRunStartedAt = Date.now();
     this.nextRunAt = this.intervalMs > 0 ? this.lastRunStartedAt + this.intervalMs : null;
     try {
-      const accounts = this.am.accounts.filter(account => this._isProbeTarget(account));
+      const accounts = this.am.accounts.filter(account =>
+        this._isProbeTarget(account) || this._isBackendTarget(account));
       await Promise.all(accounts.map(account => this.probeAccount(account)));
     } finally {
       this.lastRunFinishedAt = Date.now();
@@ -80,6 +83,12 @@ export class Prober {
    * is serving traffic perfectly well. The keep-warm scheduler already draws
    * this line (warmer.js `_isWarmTarget`); the probe did not.
    */
+  /** A third-party backend that publishes a quota of its own. The provider
+   * module decides which; nothing in this file knows one by name. */
+  _isBackendTarget(account) {
+    return !!account?.credential && hasBackendQuota(account);
+  }
+
   _isProbeTarget(account) {
     return !!account && account.type === 'oauth' && !!account.credential && !account.upstream;
   }
@@ -87,6 +96,9 @@ export class Prober {
   async probeAccount(account) {
     const startedAt = Date.now();
     this._recordAccount(account, { status: 'running', startedAt });
+    // A third-party backend has no Anthropic usage to read; it publishes its own
+    // figure, or none. Same schedule, same status row, different source.
+    if (this._isBackendTarget(account)) return this._probeBackend(account, startedAt);
     try {
       await this.am.ensureTokenFresh(account.index);
       let usage = await this._withTimeout(this.probeFn(account.credential));
@@ -135,6 +147,20 @@ export class Prober {
     }
   }
 
+  /** Read one backend account's own quota through the provider module. */
+  async _probeBackend(account, startedAt) {
+    const reading = await this.backendFn(account, { timeoutMs: this.timeoutMs })
+      .catch(err => ({ error: err?.message || String(err) }));
+    const finishedAt = Date.now();
+    const failed = !reading || reading.error;
+    if (!failed) this.am.applyBackendQuota(account.index, reading);
+    this._recordAccount(account, {
+      status: failed ? 'error' : 'ok',
+      error: failed ? (reading?.error || 'no reading') : null,
+      startedAt, finishedAt, durationMs: finishedAt - startedAt,
+    });
+  }
+
   getStatus() {
     return {
       enabled: this.intervalMs > 0,
@@ -147,7 +173,8 @@ export class Prober {
         const status = this.accountStatus.get(account.name);
         return {
           name: account.name,
-          status: this._isProbeTarget(account) ? (status?.status || 'never') : 'not-applicable',
+          status: (this._isProbeTarget(account) || this._isBackendTarget(account))
+            ? (status?.status || 'never') : 'not-applicable',
           lastProbedAt: iso(status?.finishedAt),
           startedAt: iso(status?.startedAt),
           durationMs: status?.durationMs ?? null,

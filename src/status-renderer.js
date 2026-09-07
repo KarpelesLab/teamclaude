@@ -369,6 +369,16 @@ function quotaLines(account, now, paint) {
     const ratio = 1 - quota.requestsRemaining / quota.requestsLimit;
     lines.push(formatQuotaLine('Requests', ratio, quota.resetsAt, now, paint, cap('requests')));
   }
+  // A third-party backend publishes its own figure (a balance, a percentage —
+  // backend-quota.js decides). Drawn from the normalized reading alone: a bar
+  // when the provider reports a fraction, its text when it does not.
+  const backend = quota.backend;
+  if (backend?.text) {
+    const label = String(backend.label || 'Quota').padEnd(8);
+    const bar = backend.utilization != null ? `${usageBar(backend.utilization, paint)} ` : '';
+    lines.push(`${paint.dim(label)} ${bar}${backend.text}`);
+  }
+
   if (lines.length === 0) lines.push(`${paint.dim('Quota'.padEnd(8))} ${paint.gray('unknown')}`);
   return lines;
 }

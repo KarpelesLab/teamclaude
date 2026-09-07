@@ -318,9 +318,12 @@ test('prober never sends a third-party key to the Anthropic usage endpoint', asy
 });
 
 test('a third-party backend reads not-applicable, not a pending probe', () => {
+  // A backend whose provider publishes nothing (see backend-quota.js). One that
+  // DOES publish is probeable and reads `never` until its first cycle — covered
+  // in backend-quota.test.js.
   const am = new AccountManager([
     oauth('claude'),
-    { ...oauth('deepseek'), upstream: 'https://api.deepseek.com/anthropic' },
+    { ...oauth('other'), upstream: 'https://api.example.invalid/anthropic' },
   ], 0.98);
   const rows = new Prober(am, { intervalMs: 300_000, log: () => {} }).getStatus().accounts;
   assert.equal(rows[0].status, 'never');            // probed, just not yet
