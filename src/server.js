@@ -18,7 +18,7 @@ import { createEgressGuard } from './egress-guard.js';
 import { safeLine } from './safe-text.js';
 import { renderDashboardHtml } from './dashboard.js';
 import { createUsageRecorder, resolveUsageDimensions, usageDimensionHeaderNames } from './client-usage.js';
-import { AdmissionGate } from './admission-gate.js';
+import { AdmissionGate, IngressError, ingressOptions, readRequestBody } from './admission-gate.js';
 
 
 export const HOP_BY_HOP_HEADERS = new Set([
@@ -242,7 +242,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         const status = accountManager.getStatus({ sessionDetail: config.proxy?.sessionDetail === true });
         const extra = hooks.getStatusExtra?.() || {};
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ...extra, ...status }, null, 2));
+        res.end(JSON.stringify({ ...extra, ...status, ingress: ingressGate?.status() ?? { enabled: false } }, null, 2));
         return;
       }
 
@@ -569,6 +569,7 @@ const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/'];
  */
 export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null, egress = null, clientUsage = null, forcedClient = null, dimensionUsage = null, ingressGate = null }) {
   let counter = 0;
+  const limits = ingressOptions();
   return async (req, res) => {
     // The activity entry this request opened, while it is still open. Every
     // consumer holds the row until it is told the request ended, so exactly one
@@ -703,32 +704,32 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       let model;
       let advisorModel;
       let admitted = false;
+      const uploadAbort = new AbortController();
+      const onUploadClose = () => uploadAbort.abort();
+      res.once('close', onUploadClose);
       try {
+        if (clientGone(res)) throw new IngressError(499, 'Client disconnected.');
         if (ingressGate) {
-          admitted = await ingressGate.enter();
+          admitted = await ingressGate.enter({ signal: uploadAbort.signal, timeoutMs: limits.queueTimeoutMs });
           if (!admitted) {
-            res.writeHead(503, { 'Content-Type': 'application/json', 'Retry-After': '1' });
-            res.end(JSON.stringify({ type: 'error', error: { type: 'overloaded_error', message: 'TeamClaude request queue is full; retry shortly.' } }));
-            return;
+            throw new IngressError(clientGone(res) ? 499 : 503, 'TeamClaude request queue is full or its wait deadline expired; retry shortly.');
           }
-          if (clientGone(res)) return;
+          if (clientGone(res)) throw new IngressError(499, 'Client disconnected.');
         }
-        const bodyChunks = [];
         // A headless service has no live model hook, so an incremental byte scan
         // buys it nothing. Defer to parseRequestModel's native whole-body path in
         // that case; this keeps large reconnect uploads from blocking status.
         const modelFinder = hooks.onRequestModel ? new TopLevelFieldFinder('model') : null;
-        for await (const chunk of req) {
-          bodyChunks.push(chunk);
+        body = await readRequestBody(req, { ...limits, signal: uploadAbort.signal, onChunk: chunk => {
           if (modelFinder && !modelFinder.done) {
             const found = modelFinder.push(chunk);
             if (found && !hideActivity) hooks.onRequestModel?.(reqId, { model: found });
           }
-        }
-        body = Buffer.concat(bodyChunks);
+        } });
         model = modelFinder?.done ? modelFinder.value : parseRequestModel(body);
         advisorModel = parseAdvisorModel(body);
       } finally {
+        res.off('close', onUploadClose);
         if (admitted) ingressGate.leave();
       }
       // An advisor request (Claude Code's advisor tool) carries a SECOND model
@@ -802,7 +803,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, sessionId, pinned: ctx.pinnedIndex != null, client });
       }
     } catch (err) {
-      reportFailure('[TeamClaude] Unhandled error:', err);
+      if (!(err instanceof IngressError)) reportFailure('[TeamClaude] Unhandled error:', err);
       // Close the activity entry. Only the inner path has a `finally`, so a
       // throw above it opens a row that nothing else will ever close, and every
       // consumer holds an open row indefinitely: the TUI keeps it in `active`
@@ -814,7 +815,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         // 499 when nothing was sent and nothing will be, either because the
         // client is gone or because the response is past the point of saying
         // anything; 502 is what the answer below is about to write.
-        const status = res.headersSent || clientGone(res) ? 499 : 502;
+        const status = res.headersSent || clientGone(res) ? 499 : err instanceof IngressError ? err.status : 502;
         const entry = openEntry;
         openEntry = null;
         // Guarded, because the throw that landed here may be this hook. Escaping
@@ -835,7 +836,19 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // buffering, the activity hooks) runs outside the 502 that guards
       // forwardRequest, and the inner `finally` calls onRequestEnd after the
       // response has streamed.
-      answerUnhandled(res);
+      if (err instanceof IngressError) {
+        if (!clientGone(res) && !res.headersSent) {
+          const headers = { 'Content-Type': 'application/json' };
+          if (err.status === 503) headers['Retry-After'] = '1';
+          // Unread h1 bodies must not become the next keep-alive request.
+          // On h2 close only this stream, never its shared connection.
+          if (req.httpVersionMajor !== 2) headers.Connection = 'close';
+          res.writeHead(err.status, headers);
+          res.end(JSON.stringify({ type: 'error', error: { type: err.status === 503 ? 'overloaded_error' : 'invalid_request_error', message: err.message } }), () => {
+            if (!req.complete) req.destroy();
+          });
+        }
+      } else answerUnhandled(res);
     }
   };
 }
