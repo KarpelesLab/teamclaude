@@ -1013,6 +1013,27 @@ test('path 3: the switch filters on the advisor model for a caller that does not
     'the switch refused a candidate the request model admits');
 });
 
+test('path 3: the switch picks among candidates on the advisor model, not just past them', () => {
+  // The loop's own test is what decides WHICH candidate wins, and the band below
+  // it can only veto. With the barred account ranking best, a loop blind to the
+  // advisor model picks it and the band then refuses the switch outright, losing
+  // the move to the account that can serve the request.
+  const am = mgr(['cur', 'barred', 'ok'], { expiry: ON });
+  bucket(am, 0, 'unified7d', 0.50, 50);
+  bucket(am, 1, 'unified7d', 0.00, 1);
+  bucket(am, 2, 'unified7d', 0.10, 10);
+  // Spent for Fable alone, and ranking best of the three on Opus.
+  bucket(am, 1, 'unified7dFable', 0.99, 10);
+  assert.equal(am._isAvailable(am.accounts[1], OPUS, FABLE), false,
+    'the fixture must bar the best-ranked candidate from the advisor model');
+  assert.equal(am._isAvailable(am.accounts[1], OPUS), true,
+    'the fixture must leave it usable for the request model');
+
+  am._switchOnSessionReset([am.accounts[1], am.accounts[2]], OPUS, asRequest(), FABLE);
+  assert.equal(am.accounts[am.currentIndex].name, 'ok',
+    'the switch let a candidate the advisor request cannot use take the move from one it can');
+});
+
 test('path 3: a poll clears the window and leaves the reset for a request', () => {
   // A poll routes nothing, so a reset it spends is spent nowhere. Driven through
   // getQuotaSummary, which the status-line poller hits several times a minute.
