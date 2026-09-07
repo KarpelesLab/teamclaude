@@ -2826,9 +2826,9 @@ export class AccountManager {
       }
     }
     // Neither model reaches the switch unless the feature is on. Handed none,
-    // the switch runs the same `_isAvailable(acc)` it does with the knob off:
-    // threading one in would make the disabled path's candidate filter
-    // model-scoped, a live routing change on the path that promises none.
+    // the switch runs the same `_isAvailable(acc)` the knob-off path runs; a
+    // model-scoped filter there is a live routing change on the path that
+    // promises none.
     if (sessionReset.length) {
       this._switchOnSessionReset(sessionReset, this.expiryRouting.enabled ? model : null, scope, adv);
     }
@@ -2860,11 +2860,12 @@ export class AccountManager {
       // goes. Kept here as well as in refreshExpiredQuotas, so a caller that does
       // not filter first gets the same answer.
       if (exclude?.has(acc.index)) continue;
-      // Scoped to the models the request being routed carries: an account whose
-      // Fable weekly is spent is still fully usable for Opus, and a switch that
-      // ignores either model can install one the request's own picker would
-      // refuse. The caller pre-filters on this only with the feature on. With it
-      // off, this line alone keeps an account whose weekly is spent out.
+      // Scoped to the models this switch is handed: the caller drops the advisor
+      // model when no reachable account serves it, so the switch is never
+      // stricter than the pass that decides the request. An account whose Fable
+      // weekly is spent is fully usable for Opus, and a switch that ignores
+      // either model installs one the request's own picker refuses. With the
+      // feature off this line alone keeps an account whose weekly is spent out.
       if (!this._isAvailable(acc, model, advisorModel)) continue; // enough session & weekly quota left
       // Don't demote to a lower-priority (higher value) account on a reset.
       if ((acc.priority || 0) > (current.priority || 0)) continue;
