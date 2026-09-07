@@ -61,12 +61,27 @@ export class Prober {
     this.lastRunStartedAt = Date.now();
     this.nextRunAt = this.intervalMs > 0 ? this.lastRunStartedAt + this.intervalMs : null;
     try {
-      const accounts = this.am.accounts.filter(account => account.type === 'oauth' && account.credential);
+      const accounts = this.am.accounts.filter(account => this._isProbeTarget(account));
       await Promise.all(accounts.map(account => this.probeAccount(account)));
     } finally {
       this.lastRunFinishedAt = Date.now();
       this._running = false;
     }
+  }
+
+  /**
+   * Whether this account has Anthropic subscription usage to read.
+   *
+   * `/api/oauth/usage` is Anthropic's own endpoint, and its URL is fixed — a
+   * third-party backend account (`upstream` set) carries a DIFFERENT provider's
+   * key, which the probe would send to api.anthropic.com every cycle. That
+   * leaks the key to a party it was never issued for, and the answer it gets
+   * back (429) is recorded as a permanent probe error against an account that
+   * is serving traffic perfectly well. The keep-warm scheduler already draws
+   * this line (warmer.js `_isWarmTarget`); the probe did not.
+   */
+  _isProbeTarget(account) {
+    return !!account && account.type === 'oauth' && !!account.credential && !account.upstream;
   }
 
   async probeAccount(account) {
