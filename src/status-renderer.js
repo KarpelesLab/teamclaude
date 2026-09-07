@@ -303,24 +303,22 @@ function adaptiveFor(status, name) {
   return (status.adaptive || []).find(r => r.name === name) || null;
 }
 
-// "share 62%  ·  3 sess / 1 inflight  ·  head 38.0% of 98%  ·  tier 42.1M tok
+// "next · weight 62%  ·  3 sess / 1 inflight  ·  head 38.0% of 98%  ·  tier 42.1M tok
 //  ·  1.2k tok/s  ·  conc 6"
 //
-// `share` first because it is the one number that answers "is distribution
-// doing what I asked": it is what the router says this account's cut of the
-// next new session is, so it can be read straight against the session counts
-// beside it. Everything after it is the evidence behind that number — how much
-// window is left, how big the window was measured to be, how fast it is being
-// spent, and how much concurrency the account has been seen to take.
+// `next` is the deterministic routing result. `weight` is the account's score
+// normalized across competitors, useful for explaining why it won without
+// misrepresenting the picker as a weighted random draw.
 function formatAdaptive(a, paint) {
   const parts = [];
   const family = BUCKET_LABELS[a.bucket] || a.bucket;
-  parts.push(a.share == null
+  const prefix = a.next ? `${paint.green('next')} ${paint.dim('·')} ` : '';
+  parts.push(a.weight == null
     // Every candidate scored zero: the whole tier is inside its reserve, so
-    // there is no split to report and saying "0%" everywhere would imply the
+    // there is no weight to report and saying "0%" everywhere would imply the
     // router had stopped, which it has not.
-    ? paint.yellow(`share n/a (all reserved, ${family})`)
-    : paint.bold(`share ${(a.share * 100).toFixed(0)}% of ${family}`));
+    ? `${prefix}${paint.yellow(`weight n/a (all reserved, ${family})`)}`
+    : `${prefix}${paint.bold(`weight ${(a.weight * 100).toFixed(0)}% of ${family}`)}`);
   parts.push(`${a.sessions} sess / ${a.inFlight} inflight`);
   parts.push(`head ${(a.headroom * 100).toFixed(1)}% of ${(a.threshold * 100).toFixed(0)}%`);
   // Both learned figures are absent together (tok/s is derived from the tier),

@@ -409,3 +409,17 @@ test('even mode gets the same honest row as adaptive', () => {
   const out = renderStatus(distributedStatus('even'), { color: false, now });
   assert.match(out, /^Serving {6}b 9 · a 3 {2}cursor a$/m);
 });
+
+test('adaptive diagnostics name the next target, score weight, and family split', () => {
+  const s = distributedStatus('adaptive');
+  s.accounts[0].sessionsByBucket = { unified7d: 2, unified7dFable: 1 };
+  s.adaptive = [{
+    name: 'a', bucket: 'unified7d', window: 'unified7d', competing: true,
+    next: true, weight: 0.6, sessions: 3, inFlight: 1,
+    headroom: 0.28, threshold: 0.98, capacity: 10_000_000,
+    tokensPerSecond: 1200, concCap: 6,
+  }];
+  const out = renderStatus(s, { color: false, now });
+  assert.match(out, /^> a .*3 sess \(opus\+ 2, fable 1\)$/m);
+  assert.match(out, /Adaptive\s+next · weight 60% of opus\+/);
+});

@@ -1636,11 +1636,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // request is about to send, so the cooldown also drains that preselected
     // backlog. Explicit caller pins still target exactly the requested account.
     if (ctx.pinnedIndex == null && retryCount < maxRetries && accountManager.isEntitlementDenied(account.index)) {
-      accountManager.release(account.index);
+      accountManager.release(account.index, { successful: false });
       ctx.tried.add(account.index);
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
     let upstreamRes;
+    let admittedLoad = 0;
     try {
       upstreamRes = await upstreamFetch(upstreamUrl, {
         method,
@@ -1649,7 +1650,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         redirect: 'manual',
       }, sx, route);
     } finally {
-      accountManager.release(account.index);
+      admittedLoad = accountManager.release(account.index,
+        { successful: !!upstreamRes && upstreamRes.status < 400 }) || 0;
     }
 
     // Extract rate limit headers
@@ -1721,7 +1723,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // (capped, then released through a fresh ramp) instead of piling on, and
       // retry the SAME account. The pause never marks the account throttled, so
       // selection keeps choosing it.
-      accountManager.pauseAccount(account.index, Math.min(retryAfter, RATE_LIMIT_ABSORB_MAX_SECONDS));
+      accountManager.pauseAccount(account.index,
+        Math.min(retryAfter, RATE_LIMIT_ABSORB_MAX_SECONDS), admittedLoad);
 
       // ONE bounded failover hop to an idle sibling (#137, #165, #156).
       //

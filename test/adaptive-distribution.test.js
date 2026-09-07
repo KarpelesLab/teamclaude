@@ -130,7 +130,7 @@ test('scenario: the taper is a ramp, not a cliff — preference peaks then falls
     weekly(am, 0, used);
     weekly(am, 1, 0.30);
     const row = am.adaptiveStats().find(r => r.name === 'probe');
-    shares.push(row.share);
+    shares.push(row.weight);
   }
   const peak = Math.max(...shares);
   const peakAt = shares.indexOf(peak);
@@ -180,7 +180,7 @@ test('scenario: raising the threshold lets an account be spent further', () => {
     const am = mgr(['probe', 'ref'], {}, threshold);
     weekly(am, 0, 0.90);
     weekly(am, 1, 0.50);
-    return am.adaptiveStats().find(r => r.name === 'probe').share;
+    return am.adaptiveStats().find(r => r.name === 'probe').weight;
   };
   assert.ok(shareAt(0.99) > shareAt(0.92),
     'a higher threshold must leave more room to burn the account down');
@@ -197,6 +197,29 @@ test('scenario: the learner recovers a window size from tokens and utilization',
   l.observeUtilization(0, 'unified7d', 0.11, t0 + 60_000);
   const cap = l.capacity(0, 'unified7d');
   assert.ok(cap > 50_000_000 && cap < 200_000_000, `implausible capacity: ${cap}`);
+});
+
+test('production quota and usage wiring teaches plan capacity', () => {
+  const am = mgr(['a']);
+  am.updateQuota(0, { 'anthropic-ratelimit-unified-7d-utilization': '0.10' });
+  am.recordTokenUsage(0, 's1', OPUS, { input_tokens: 800_000, output_tokens: 200_000 });
+  am.updateQuota(0, { 'anthropic-ratelimit-unified-7d-utilization': '0.11' });
+  assert.ok(am.capacityLearner.capacity(0, 'unified7d') > 50_000_000);
+});
+
+test('family traffic teaches both its family window and shared weekly', () => {
+  const am = mgr(['a']);
+  am.updateQuota(0, {
+    'anthropic-ratelimit-unified-7d-utilization': '0.10',
+    'anthropic-ratelimit-unified-7d_oi-utilization': '0.20',
+  });
+  am.recordTokenUsage(0, 's1', FABLE, { input_tokens: 800_000, output_tokens: 200_000 });
+  am.updateQuota(0, {
+    'anthropic-ratelimit-unified-7d-utilization': '0.11',
+    'anthropic-ratelimit-unified-7d_oi-utilization': '0.21',
+  });
+  assert.ok(am.capacityLearner.capacity(0, 'unified7d') > 0);
+  assert.ok(am.capacityLearner.capacity(0, 'unified7dFable') > 0);
 });
 
 test('scenario: a cache READ does not inflate the learned tier', () => {
@@ -251,7 +274,7 @@ test('scenario: an unlearned tier falls back to fractions rather than mixing uni
   teachCapacity(am, 0, 'unified7d', 5_000_000, 0.10, 0.10);
   const rows = am.adaptiveStats();
   // Fraction fallback ⇒ the more-spent account still leads on remaining credit.
-  assert.ok(rows.find(r => r.name === 'unlearned').share > rows.find(r => r.name === 'learned').share);
+  assert.ok(rows.find(r => r.name === 'unlearned').weight > rows.find(r => r.name === 'learned').weight);
 });
 
 // ── Scenario 5: response speed ──────────────────────────────────────────────
@@ -263,7 +286,7 @@ test('scenario: a congested account sheds share to an idle sibling', () => {
   // Bury 'busy' under in-flight work well past its learned concurrency cap.
   am.accounts[0].inFlight = 40;
   const rows = am.adaptiveStats();
-  assert.ok(rows.find(r => r.name === 'idle').share > rows.find(r => r.name === 'busy').share,
+  assert.ok(rows.find(r => r.name === 'idle').weight > rows.find(r => r.name === 'busy').weight,
     'congestion must outweigh the burn-down preference');
 });
 
@@ -273,7 +296,7 @@ test('scenario: quota preference still wins while the account keeps up', () => {
   weekly(am, 1, 0.30);
   am.accounts[0].inFlight = 1; // comfortably inside the cap
   const rows = am.adaptiveStats();
-  assert.ok(rows.find(r => r.name === 'busy').share > rows.find(r => r.name === 'idle').share,
+  assert.ok(rows.find(r => r.name === 'busy').weight > rows.find(r => r.name === 'idle').weight,
     'a lightly loaded account should still be burned down first');
 });
 
@@ -317,6 +340,17 @@ test('a throttle above the current cap leaves the more conservative estimate alo
   am.pauseAccount(0, 5);
   assert.ok(am.concurrencyLearner.cap(0) <= before,
     'a throttle must never raise the cap');
+});
+
+test('a released 429 still backs off using the admitted depth', async () => {
+  const am = mgr(['a']);
+  const before = am.concurrencyLearner.cap(0);
+  assert.equal(await am.admit(0), true);
+  const admittedLoad = am.release(0, { successful: false });
+  am.pauseAccount(0, 5, admittedLoad);
+  assert.equal(admittedLoad, 1);
+  assert.ok(am.concurrencyLearner.cap(0) < before,
+    'the release before status handling must not erase the throttled depth');
 });
 
 // ── Invariants that must survive the new mode ───────────────────────────────
@@ -386,6 +420,44 @@ test('adaptive keeps the family buckets independent', () => {
   assert.ok((fable.b || 0) > (fable.a || 0), `Fable should burn 'b' down: ${JSON.stringify(fable)}`);
 });
 
+test('adaptive capacity and reserve follow the quota window supplying utilization', () => {
+  const am = mgr(['a', 'b']);
+  const now = Date.now();
+  for (const i of [0, 1]) am.accounts[i].probing = false;
+  Object.assign(am.accounts[0].quota, {
+    unified7d: 0.80, unified7dReset: now + 72 * H,
+    unified7dFable: 0.10, unified7dFableReset: now + 72 * H,
+  });
+  Object.assign(am.accounts[1].quota, {
+    unified7d: 0.30, unified7dReset: now + 72 * H,
+    unified7dFable: 0.20, unified7dFableReset: now + 72 * H,
+  });
+  teachCapacity(am, 0, 'unified7d', 1_000_000, 0.10, 0.70);
+  teachCapacity(am, 0, 'unified7dFable', 20_000_000, 0.10, 0);
+  teachCapacity(am, 1, 'unified7d', 2_000_000, 0.10, 0.20);
+  const row = am.adaptiveStats(FABLE).find(r => r.name === 'a');
+  assert.equal(row.window, 'unified7d');
+  assert.equal(row.capacity, am.capacityLearner.capacity(0, 'unified7d'));
+});
+
+test('removing an account keeps adaptive learning with surviving credentials', () => {
+  const am = mgr(['a', 'b', 'c']);
+  teachCapacity(am, 1, 'unified7d', 1_000, 0.01);
+  teachCapacity(am, 2, 'unified7d', 2_000, 0.01);
+  am.concurrencyLearner.caps.set(1, 3);
+  am.concurrencyLearner.caps.set(2, 9);
+  const bCapacity = am.capacityLearner.capacity(1, 'unified7d');
+  const cCapacity = am.capacityLearner.capacity(2, 'unified7d');
+
+  am.removeAccount(0);
+
+  assert.equal(am.accounts[0].name, 'b');
+  assert.equal(am.capacityLearner.capacity(0, 'unified7d'), bCapacity);
+  assert.equal(am.capacityLearner.capacity(1, 'unified7d'), cCapacity);
+  assert.equal(am.concurrencyLearner.cap(0), 3);
+  assert.equal(am.concurrencyLearner.cap(1), 9);
+});
+
 test('an unknown utilization is not mistaken for a spent window', () => {
   // Nothing is known about 'unknown'. Treating null as "most spent" would send
   // every cold-start session to whichever account happens to be unmeasured.
@@ -393,7 +465,7 @@ test('an unknown utilization is not mistaken for a spent window', () => {
   am.accounts[0].probing = false;
   weekly(am, 1, 0.85);
   const rows = am.adaptiveStats();
-  assert.ok(rows.find(r => r.name === 'known').share > rows.find(r => r.name === 'unknown').share);
+  assert.ok(rows.find(r => r.name === 'known').weight > rows.find(r => r.name === 'unknown').weight);
 });
 
 test('a single-account tier is returned without scoring', () => {
@@ -436,9 +508,31 @@ test('adaptiveStats reports the per-account figures an operator gates on', () =>
   assert.ok(a.tokensPerSecond > 0, 'throughput is reported once the tier is known');
   assert.ok(a.concCap > 0);
   assert.ok(Math.abs(a.headroom - (0.98 - 0.70)) < 1e-9);
-  // Shares across the competing tier are a distribution.
-  const total = rows.filter(r => r.competing).reduce((n, r) => n + r.share, 0);
-  assert.ok(Math.abs(total - 1) < 1e-9, `shares should sum to 1, got ${total}`);
+  // Weights across the competing tier are normalized.
+  const total = rows.filter(r => r.competing).reduce((n, r) => n + r.weight, 0);
+  assert.ok(Math.abs(total - 1) < 1e-9, `weights should sum to 1, got ${total}`);
+});
+
+test('adaptiveStats uses the same expiry-routing candidate band as selection', () => {
+  const am = mgr(['a', 'b']);
+  weekly(am, 0, 0.40);
+  weekly(am, 1, 0.60);
+  am._bandedCandidates = () => [am.accounts[1]];
+  const rows = am.adaptiveStats();
+  assert.equal(rows.find(r => r.name === 'a').competing, false);
+  assert.equal(rows.find(r => r.name === 'b').competing, true);
+  assert.equal(rows.find(r => r.name === 'b').next, true);
+});
+
+test('adaptiveStats distinguishes score weight from the deterministic next target', () => {
+  const am = mgr(['a', 'b']);
+  weekly(am, 0, 0.70);
+  weekly(am, 1, 0.30);
+  const rows = am.adaptiveStats();
+  const nextRows = rows.filter(r => r.next);
+  assert.equal(nextRows.length, 1);
+  assert.equal(nextRows[0].name, am.getActiveAccount(null, null, null, 'new-session').name);
+  assert.ok(rows.every(r => r.weight == null || (r.weight >= 0 && r.weight <= 1)));
 });
 
 test('tok/s is withheld until the tier is known, rather than reported in the wrong unit', () => {
@@ -459,7 +553,7 @@ test('an outranked account is marked as not competing, not as a small share', ()
   weekly(am, 1, 0.50);
   const backup = am.adaptiveStats().find(r => r.name === 'backup');
   assert.equal(backup.competing, false);
-  assert.equal(backup.share, 0);
+  assert.equal(backup.weight, 0);
 });
 
 // ── The scoring function itself ─────────────────────────────────────────────
@@ -582,7 +676,7 @@ test('the breakdown reaches the status payload per account', () => {
   assert.equal(status.accounts[1].sessionsByBucket, null);
 });
 
-test('adaptiveStats names the bucket its shares were computed for', () => {
+test('adaptiveStats names the requested bucket its weights were computed for', () => {
   const am = mgr(['a', 'b']);
   weekly(am, 0, 0.20);
   weekly(am, 1, 0.20);

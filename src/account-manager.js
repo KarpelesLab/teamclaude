@@ -509,15 +509,17 @@ export class AccountManager {
     }
   }
 
-  /** Release a slot taken by admit(). Safe to call once per successful admit. */
-  release(index) {
+  /** Release a slot taken by admit(). Safe to call once per successful admit.
+   * `successful` must be false when no healthy upstream response was received. */
+  release(index, { successful = true } = {}) {
     const account = this.accounts[index];
     if (!account) return;
-    // Counterpart to the throttle signal: a request that ran to completion at
-    // this depth is evidence the account sustained it. Read BEFORE the
-    // decrement, so it is the depth the request actually ran at.
-    this.concurrencyLearner.noteSuccess(index, account.inFlight || 0);
+    // Read before decrementing. A later 429 handler needs the depth that was
+    // actually refused, and a healthy response teaches success at that depth.
+    const load = account.inFlight || 0;
+    if (successful) this.concurrencyLearner.noteSuccess(index, load);
     if (account.inFlight > 0) account.inFlight--;
+    return load;
   }
 
   /**
@@ -537,13 +539,14 @@ export class AccountManager {
     return !!(account?.pausedUntil && now < account.pausedUntil);
   }
 
-  pauseAccount(index, seconds) {
+  pauseAccount(index, seconds, throttledLoad = null) {
     const account = this.accounts[index];
     if (!account) return;
     // Upstream just refused this account at its current concurrency. That is
     // the only direct evidence of how much it actually tolerates, so it is what
     // adaptive distribution's response-speed term learns from.
-    this.concurrencyLearner.noteThrottled(index, account.inFlight || 0);
+    this.concurrencyLearner.noteThrottled(index,
+      Number.isFinite(throttledLoad) ? throttledLoad : (account.inFlight || 0));
     const until = Date.now() + Math.max(0, seconds) * 1000;
     account.pausedUntil = Math.max(account.pausedUntil || 0, until);
     // Arm the ramp to begin when the pause ends: while paused, admit() holds on
@@ -870,6 +873,35 @@ export class AccountManager {
     return this._pickLeastLoadedEven(exclude, model, advisorModel);
   }
 
+  /** The quota window whose utilization adaptive scoring is using. Family
+   * requests consume both their family window and the shared weekly window, so
+   * the tighter one supplies utilization, learned capacity, and burn reserve as
+   * one unit. Dynamic scoped windows use the same `scoped:<family>` key that the
+   * learner is fed from usage-probe observations. */
+  _adaptiveWindow(account, model) {
+    const requested = this._weeklyBucketFor(model);
+    const q = account.quota;
+    const windows = [];
+    const add = (bucket, utilization, resetAt) => {
+      if (Number.isFinite(utilization)) windows.push({ bucket, utilization, resetAt: resetAt ?? null });
+    };
+
+    add(requested, q[requested], q[`${requested}Reset`]);
+    if (requested !== 'unified7d') {
+      add('unified7d', q.unified7d, q.unified7dReset);
+    } else {
+      const scoped = this._scopedWeekly(account, model);
+      if (scoped) add(`scoped:${modelFamily(model)}`, scoped.utilization, scoped.resetAt);
+    }
+    if (!windows.length) return { bucket: requested, utilization: null, resetAt: null };
+
+    windows.sort((a, b) => {
+      if (a.utilization !== b.utilization) return b.utilization - a.utilization;
+      return (a.resetAt ?? Infinity) - (b.resetAt ?? Infinity);
+    });
+    return windows[0];
+  }
+
   /**
    * Adaptive selection: among the highest-priority eligible accounts, pick the
    * best score from adaptive-distribution.js — least remaining weekly credit
@@ -907,16 +939,17 @@ export class AccountManager {
     // some accounts and not others would mix tokens with bare fractions and
     // rank on the difference, so the absolute form is used only when EVERY
     // candidate has been learned; otherwise all of them fall back to fractions.
-    const capacities = tier.map(a => this.capacityLearner.capacity(a.index, bucket));
+    const windows = tier.map(a => this._adaptiveWindow(a, model));
+    const capacities = tier.map((a, i) => this.capacityLearner.capacity(a.index, windows[i].bucket));
     const useCapacity = capacities.every(c => c != null && c > 0);
 
     const candidates = tier.map((account, i) => ({
       account,
       index: account.index,
-      utilization: this._governingWeekly(account, model),
+      utilization: windows[i].utilization,
       threshold,
       capacity: useCapacity ? capacities[i] : null,
-      reserve: this.capacityLearner.reserve(account.index, bucket),
+      reserve: this.capacityLearner.reserve(account.index, windows[i].bucket),
       load: this.sessionTracker.activeCountFor(account.index, now) + (account.inFlight || 0),
       concCap: this.concurrencyLearner.cap(account.index),
     }));
@@ -1033,15 +1066,15 @@ export class AccountManager {
   }
 
   /**
-   * Per-account diagnostics for adaptive distribution: what has been learned
-   * about each account and what share of new sessions that produces right now.
+   * Per-account diagnostics for adaptive distribution: what has been learned,
+   * each account's relative score weight, and the actual next target.
    *
    * This exists to make the mode auditable. Adaptive routing is the one mode
    * whose decision is not readable off the account list — "3 sessions here, 1
    * there" is the same picture whether that split is what the rule intended or
-   * the opposite of it. `share` closes that: it is the scoring function's own
-   * output, normalised across the tier, so an operator can compare where
-   * sessions are actually going against where the rule says they should.
+   * the opposite of it. The normalized weight explains the score without
+   * pretending the deterministic maximum-score picker is probabilistic; `next`
+   * names the account the picker will actually choose.
    *
    * Returns an empty array outside adaptive mode — the numbers are still being
    * learned, but nothing is routing on them, and presenting them as if they
@@ -1053,29 +1086,34 @@ export class AccountManager {
     const bucket = this._weeklyBucketFor(model);
     const threshold = this.thresholdFor(bucket);
 
-    const eligible = this.accounts.filter(a => this._isAvailable(a, model));
+    const eligible = this._bandedCandidates(null, model);
     const topPriority = eligible.length ? Math.min(...eligible.map(a => a.priority || 0)) : 0;
-    // Only the accounts actually competing get a share: an ineligible or
-    // outranked account's share is not "small", it is not in the draw at all,
-    // and a percentage beside it would read as the former.
+    // Only the accounts actually competing get a weight: an ineligible or
+    // outranked account's weight is not "small", it is not in the draw at all.
     const inTier = new Set(eligible.filter(a => (a.priority || 0) === topPriority).map(a => a.index));
 
-    const capacities = new Map(this.accounts.map(a => [a.index, this.capacityLearner.capacity(a.index, bucket)]));
+    const windows = new Map(this.accounts.map(a => [a.index, this._adaptiveWindow(a, model)]));
+    const capacities = new Map(this.accounts.map(a => {
+      const window = windows.get(a.index);
+      return [a.index, this.capacityLearner.capacity(a.index, window.bucket)];
+    }));
     const useCapacity = [...inTier].every(i => capacities.get(i) != null && capacities.get(i) > 0);
 
     const rows = this.accounts.map(a => {
-      const utilization = this._governingWeekly(a, model);
+      const window = windows.get(a.index);
+      const utilization = window.utilization;
       const u = Number.isFinite(utilization) ? utilization : 0;
       const head = Math.max(0, threshold - u);
       const capacity = capacities.get(a.index);
-      const burnRate = this.capacityLearner.burnRate(a.index, bucket);
+      const burnRate = this.capacityLearner.burnRate(a.index, window.bucket);
       return {
         index: a.index,
         name: a.name,
-        // Which weekly bucket these figures are for. Shares are per bucket —
-        // the same fleet splits differently for Fable than for Opus — so a
-        // share reported without naming its bucket cannot be checked.
+        // Requested family and the actual quota window supplying the adaptive
+        // score. They differ when a family request is constrained by shared
+        // weekly quota.
         bucket,
+        window: window.bucket,
         competing: inTier.has(a.index),
         sessions: this.sessionTracker.activeCountFor(a.index, now),
         inFlight: a.inFlight || 0,
@@ -1088,7 +1126,7 @@ export class AccountManager {
         // Learned window size in metered tokens — the account's plan tier as
         // observed, rather than as declared. null until enough has been seen.
         capacity: capacity ?? null,
-        reserve: this.capacityLearner.reserve(a.index, bucket),
+        reserve: this.capacityLearner.reserve(a.index, window.bucket),
         concCap: this.concurrencyLearner.cap(a.index),
         // Observed throughput, in metered tokens per second. Derived rather
         // than separately counted: burn rate is a fraction of the window per
@@ -1117,11 +1155,12 @@ export class AccountManager {
       r.score = score;
       total += score;
     }
+    const next = this._pickLeastLoaded(null, model);
     for (const r of rows) {
-      // Share of the NEXT new session, not of the sessions already placed. A
-      // tier scoring zero everywhere (all inside their reserve) has no share to
-      // divide rather than an equal one.
-      r.share = total > 0 ? r.score / total : null;
+      // A normalized score weight explains the relative inputs but is not a
+      // routing probability: the picker deterministically takes the maximum.
+      r.weight = total > 0 ? r.score / total : null;
+      r.next = r.competing && next?.index === r.index;
       delete r._remaining;
     }
     return rows;
@@ -2868,6 +2907,12 @@ export class AccountManager {
     for (const { key } of FAMILY_WEEKLY_BUCKETS) {
       if (q[key] != null) this.capacityLearner.observeUtilization(account.index, key, q[key], now);
     }
+    for (const [family, scoped] of Object.entries(q.scopedWeekly || {})) {
+      if (scoped?.utilization != null) {
+        this.capacityLearner.observeUtilization(account.index,
+          `scoped:${family}`, scoped.utilization, now);
+      }
+    }
   }
 
   /**
@@ -2919,11 +2964,18 @@ export class AccountManager {
     // A request with no session id (or one the tracker has forgotten) is still a
     // real spend by the account, so the two scopes are recorded independently.
     this.sessionTracker.recordTokens(sessionId, bucket, usage);
-    // Third scope: what these tokens cost this account's weekly window. Unlike
-    // the two above, this one IS routed on — it is how adaptive distribution
-    // learns the account's plan tier (see adaptive-distribution.js). Fed in
-    // every mode so the tier is already known if adaptive is switched on later.
-    this.capacityLearner.recordTokens(accountIndex, bucket, usage);
+    // Third scope: what these tokens cost each weekly window they consume.
+    // Family traffic advances both its own bucket and shared weekly quota; a
+    // dynamically reported scoped bucket does the same. Feed every applicable
+    // window so a later utilization reading is priced with matching tokens.
+    const learningBuckets = new Set(['unified7d', bucket]);
+    if (account && bucket === 'unified7d') {
+      const scoped = this._scopedWeekly(account, model);
+      if (scoped) learningBuckets.add(`scoped:${modelFamily(model)}`);
+    }
+    for (const learningBucket of learningBuckets) {
+      this.capacityLearner.recordTokens(accountIndex, learningBucket, usage);
+    }
   }
 
   /**
@@ -3235,6 +3287,8 @@ export class AccountManager {
     // are the rollover observations hanging off them and off the current account.
     const remap = idx => (idx === index ? null : idx > index ? idx - 1 : idx);
     this.sessionTracker.remapAccounts(remap);
+    this.capacityLearner.remapAccounts(remap);
+    this.concurrencyLearner.remapAccounts(remap);
     // The observation names its account by index, so it follows the shift or
     // goes away with the account it described. Left behind, it would be read
     // against whichever account inherited the slot; its held roll the same.

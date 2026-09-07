@@ -233,6 +233,18 @@ export class CapacityLearner {
       if (key.startsWith(`${index}:`)) this.state.delete(key);
     }
   }
+
+  /** Follow an account-list reindexing without attaching learning to a new
+   * credential. `remap` returns the new index, or null for a removed account. */
+  remapAccounts(remap) {
+    const next = new Map();
+    for (const [key, value] of this.state) {
+      const colon = key.indexOf(':');
+      const mapped = remap(Number(key.slice(0, colon)));
+      if (mapped != null) next.set(`${mapped}:${key.slice(colon + 1)}`, value);
+    }
+    this.state = next;
+  }
 }
 
 /**
@@ -285,6 +297,16 @@ export class ConcurrencyLearner {
 
   forget(index) {
     this.caps.delete(index);
+  }
+
+  /** Keep learned caps with their credential when account indexes shift. */
+  remapAccounts(remap) {
+    const next = new Map();
+    for (const [index, cap] of this.caps) {
+      const mapped = remap(index);
+      if (mapped != null) next.set(mapped, cap);
+    }
+    this.caps = next;
   }
 }
 

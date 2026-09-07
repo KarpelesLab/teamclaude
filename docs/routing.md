@@ -163,12 +163,12 @@ Cache reads are excluded from the tier measurement (they meter at a fraction ups
 **Reading the result.** In this mode `teamclaude status` adds an `Adaptive` line per account, and the header reads `adapting`:
 
 ```
-> henry@work (Max 20x) (oauth, prio 0) active 3 sess
+> account-a (Max 20x) (oauth, prio 0) active 3 sess
   Weekly   [███████████░░░░░░░] 62% reset 3d8h
-  Adaptive share 16%  ·  3 sess / 3 inflight  ·  head 36.0% of 98%  ·  tier 110.0m tok · 1.8k tok/s  ·  conc 6.0
+  Adaptive next · weight 36%  ·  3 sess / 3 inflight  ·  head 36.0% of 98%  ·  tier 110.0m tok · 1.8k tok/s  ·  conc 6.0
 ```
 
-`share` is the number to gate on: it is the router's own output — this account's cut of the *next* new session — so it can be read straight against the session counts beside it to confirm traffic is going where the rule says it should. The rest is the evidence behind it: headroom to your threshold, the measured window size, throughput, and the learned concurrency cap. `tier learning…` means not enough has been observed yet, and selection is falling back to plain fractions until it has; `share n/a (all reserved)` means every account in the tier is inside its reserve, so there is no split to report.
+`next` names the account the deterministic picker would choose for the next new session. `weight` is that account's score normalized across the competing tier; it explains how strongly the inputs favor an account, but is not a routing probability. The rest is the evidence behind it: headroom to your threshold, the measured window size, throughput, and the learned concurrency cap. `tier learning…` means not enough has been observed yet, and selection is falling back to plain fractions until it has; `weight n/a (all reserved)` means every account in the tier is inside its reserve, so the even fallback decides the next target.
 
 **Turning it off drains, it doesn't cut.** The setting is applied live on config reload, and switching it off would otherwise move every distributed session to the current account on its *next* request — each one throwing away the prompt cache it built on its old account, and all of them arriving at one account at once. Instead, the sessions running at that moment keep their accounts, and only **new** sessions go back to plain quota-driven rotation. Affinity therefore winds down as those sessions finish rather than snapping, and a draining session whose account becomes ineligible simply rejoins normal rotation. While this is happening `teamclaude status` reads `draining N` (the TUI header shows `drain N`) instead of `single-account`, and it clears itself once the last of those sessions is done or idles out.
 
