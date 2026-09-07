@@ -191,9 +191,12 @@ test('a failed probe is not evidence', () => {
 test('a probe that reports the family still spent keeps it spent', () => {
   const am = new AccountManager([oauth('a')], 0.98);
   const q = sealFable(am);
-  const at = Date.parse('2026-09-04T10:00:00Z');
+  // Relative, not absolute: a pinned calendar date silently turns this test into
+  // a time bomb — once it passes, _clearExpiredQuotas drops the reading it is
+  // asserting about and the failure looks like a routing regression.
+  const at = Date.now() + 24 * 3600_000;
   am.applyUsageData(0, normalizeUsagePayload({ limits: [
-    { kind: 'weekly_scoped', group: 'weekly', percent: 99, resets_at: '2026-09-04T10:00:00Z',
+    { kind: 'weekly_scoped', group: 'weekly', percent: 99, resets_at: new Date(at).toISOString(),
       scope: { model: { display_name: 'Fable' } } },
   ]}));
   assert.equal(q.unified7dFable, 0.99);
