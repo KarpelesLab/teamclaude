@@ -1449,8 +1449,10 @@ test('an account known to be nearly spent does not win on having fewer sessions'
 // is byte-identity with the behaviour the knob is off for, and that behaviour
 // also lets a status preview consume a session reset and suppress the switch. So
 // an arm asserting "the preview changes nothing" fails with the knob off too,
-// and would be a false gate. The claim is differential by nature and is measured
-// that way, by flagoff-sweep.mjs over generated fleets.
+// and would be a false gate. The claim is differential by nature and nothing in
+// this suite establishes it. What the knob-off arms below do is narrower and
+// should not be read as it: each names one behaviour the disabled path must
+// keep, and fails if this feature's code has reached that path.
 
 test('a paint clears the window; with the knob on the switch waits for a request', () => {
   // The docs record a skipped switch as a limitation of the request-less
