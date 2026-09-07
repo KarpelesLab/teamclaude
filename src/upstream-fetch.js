@@ -226,7 +226,7 @@ export function writeRequestBody(req, body) {
     // the socket has room, otherwise several multi-megabyte Claude context
     // uploads can monopolise that thread and keep status connections waiting in
     // the kernel. Backpressure remains authoritative when the socket is full.
-    if (ready) setImmediate(pump);
+    if (ready) setTimeout(pump, 1);
     else req.once('drain', pump);
   };
   pump();

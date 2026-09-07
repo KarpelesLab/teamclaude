@@ -976,7 +976,7 @@ export function relayFair(source, destination) {
       chunks += 1;
       if (chunks >= STREAM_FAIRNESS_CHUNKS) {
         chunks = 0;
-        setImmediate(callback);
+        setTimeout(callback, STREAM_FAIRNESS_DELAY_MS);
       } else {
         callback();
       }
@@ -2045,13 +2045,13 @@ const DEFAULT_BODY_IDLE_TIMEOUT_MS = 120_000;
 // buffered. With a busy upstream, repeatedly awaiting those ready reads never
 // returns to the event-loop poll phase, so the listener can accept a status
 // connection in the kernel while JavaScript never runs its request handler.
-// Yield after every chunk even when neither socket applies backpressure. Under
-// a reconnect storm many TLS sockets can stay readable at once; batching even
-// 32 chunks per response lets that poll/microtask traffic starve a newly
-// accepted status request for seconds. A streamed model response naturally has
-// sizeable gaps between chunks, so one check-phase hop per chunk has negligible
-// user-visible cost and keeps the control plane responsive under saturation.
-const STREAM_FAIRNESS_CHUNKS = 1;
+// Yield briefly every small batch even when neither socket applies
+// backpressure. Under a reconnect storm many TLS sockets can stay readable at
+// once; the old 32-chunk batch let poll/microtask traffic starve a newly
+// accepted status request for seconds. Eight keeps bulk relays efficient while
+// regularly leaving a real scheduling window for the control plane.
+const STREAM_FAIRNESS_CHUNKS = 8;
+const STREAM_FAIRNESS_DELAY_MS = 1;
 
 function resolveBodyIdleTimeout() {
   const env = Number(process.env.TEAMCLAUDE_UPSTREAM_BODY_TIMEOUT_MS);
@@ -2142,7 +2142,7 @@ export async function streamResponse(webStream, res, accountIndex, accountManage
       chunksSinceYield += 1;
       if (chunksSinceYield >= STREAM_FAIRNESS_CHUNKS) {
         chunksSinceYield = 0;
-        await new Promise(resolve => setImmediate(resolve));
+        await new Promise(resolve => setTimeout(resolve, STREAM_FAIRNESS_DELAY_MS));
         if (clientGone(res)) break;
       }
     }
