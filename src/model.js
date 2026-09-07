@@ -210,14 +210,16 @@ export class TopLevelFieldFinder {
 }
 
 // Extract the requested model id from a JSON request body (Buffer or string).
-// Uses the streaming top-level finder so it is exact (never matches a `model`
-// key nested in conversation content) and cheap on large bodies (it stops as
-// soon as the top-level field resolves). Returns null if absent.
+// Whole-body callers use native JSON parsing: it is exact (never matches a
+// nested `model`) without a JavaScript loop over every byte of a large context.
+// TopLevelFieldFinder remains available to the interactive TUI, which is the
+// only caller that needs a result before the request body has finished.
 export function parseRequestModel(body) {
   if (!body) return null;
   try {
     const buf = Buffer.isBuffer(body) ? body : Buffer.from(String(body), 'utf8');
-    return new TopLevelFieldFinder('model').push(buf);
+    const payload = JSON.parse(buf.toString('utf8'));
+    return payload && typeof payload.model === 'string' ? payload.model : null;
   } catch { return null; }
 }
 

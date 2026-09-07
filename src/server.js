@@ -693,17 +693,20 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // TUI can show it the instant it appears in the stream — usually the first
       // frame — rather than waiting for the whole body and the request to finish.
       const bodyChunks = [];
-      const modelFinder = new TopLevelFieldFinder('model');
+      // A headless service has no live model hook, so an incremental byte scan
+      // buys it nothing. Defer to parseRequestModel's native whole-body path in
+      // that case; this keeps large reconnect uploads from blocking status.
+      const modelFinder = hooks.onRequestModel ? new TopLevelFieldFinder('model') : null;
       for await (const chunk of req) {
         bodyChunks.push(chunk);
-        if (!modelFinder.done) {
+        if (modelFinder && !modelFinder.done) {
           const found = modelFinder.push(chunk);
           if (found && !hideActivity) hooks.onRequestModel?.(reqId, { model: found });
         }
       }
       const body = Buffer.concat(bodyChunks);
 
-      const model = modelFinder.done ? modelFinder.value : parseRequestModel(body);
+      const model = modelFinder?.done ? modelFinder.value : parseRequestModel(body);
       // An advisor request (Claude Code's advisor tool) carries a SECOND model
       // nested in tools[]; the advisor sub-inference runs on the selected
       // account, so selection must be eligible for it too (issue #98).

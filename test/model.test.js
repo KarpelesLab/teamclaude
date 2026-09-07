@@ -18,6 +18,18 @@ test('parseRequestModel reads the top-level model', () => {
   assert.equal(parseRequestModel(null), null);
 });
 
+test('parseRequestModel avoids the incremental byte scanner for whole bodies', () => {
+  const original = TopLevelFieldFinder.prototype.push;
+  TopLevelFieldFinder.prototype.push = () => {
+    throw new Error('whole-body model parsing must not use the byte scanner');
+  };
+  try {
+    assert.equal(parseRequestModel('{"model":"claude-opus-4-8"}'), 'claude-opus-4-8');
+  } finally {
+    TopLevelFieldFinder.prototype.push = original;
+  }
+});
+
 test('parseRequestModel ignores a "model" key nested in conversation content', () => {
   // A user message literally contains `"model":"DECOY"`; the real field comes
   // after it at the top level. A regex would grab DECOY — the structural finder
