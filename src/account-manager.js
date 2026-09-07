@@ -2577,9 +2577,22 @@ export class AccountManager {
       console.log(`[TeamClaude] Learned weekly quota for "${account.name}", re-evaluating selection`);
     }
 
+    // `unified-status` is upstream's verdict on THIS response. A family-cap 429
+    // (Fable's `7d_oi` bucket spent) carries `rejected` too, while the shared
+    // `5h` and `7d` statuses on the same response still say `allowed`. The
+    // family bucket already bars the account for that family (the `7d_oi`
+    // reading above, checked by _isNearQuota), and server.js classifies the
+    // same 429 as family-only for its retry. Storing the verdict as-is parked
+    // the whole account for statusStaleMs after every Fable-cap hit, so haiku
+    // and Opus requests failed over as well. When the response says which
+    // shared buckets allowed, believe them: a rejection none of them signed is
+    // the family's, and the family bucket is its signal.
     const uStatus = headers['anthropic-ratelimit-unified-status'];
     if (uStatus) {
-      account.quota.unifiedStatus = uStatus;
+      const s5h = headers['anthropic-ratelimit-unified-5h-status'];
+      const s7d = headers['anthropic-ratelimit-unified-7d-status'];
+      const sharedSaidAllowed = (s5h || s7d) && s5h !== 'rejected' && s7d !== 'rejected';
+      account.quota.unifiedStatus = uStatus === 'rejected' && sharedSaidAllowed ? 'allowed' : uStatus;
       account.quota.unifiedStatusSeenAt = Date.now();
     }
 
