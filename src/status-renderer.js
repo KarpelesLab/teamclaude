@@ -210,7 +210,9 @@ function renderAccountHeader(account, currentAccount, paint, now) {
   const name = current ? paint.bold(account.name) : account.name;
   const status = formatAccountStatus(account, now, paint);
   const org = account.orgName ? ` ${paint.dim(account.orgName)}` : '';
-  const sess = account.sessions ? ` ${paint.dim(`${account.sessions} sess`)}` : '';
+  const sess = account.sessions
+    ? ` ${paint.dim(`${account.sessions} sess${formatSessionBuckets(account.sessionsByBucket)}`)}`
+    : '';
   return `${marker} ${name} ${paint.dim(`(${account.type}, prio ${account.priority || 0})`)} ${status}${org}${sess}`;
 }
 
@@ -232,6 +234,30 @@ function formatSessions(sessions, paint) {
   return `${active} active / ${known} known ${paint.dim('·')} ${mode}`;
 }
 
+// Weekly buckets, named for the model family an operator thinks in rather than
+// for the quota field. 'unified7d' is deliberately "opus+": it is the SHARED
+// weekly bucket, so Opus, Haiku and anything unclassified all meter there
+// together — calling it "opus" would misreport the other two as absent.
+const BUCKET_LABELS = {
+  unified7d: 'opus+',
+  unified7dFable: 'fable',
+  unified7dSonnet: 'sonnet',
+};
+
+// " (opus+ 2, fable 1)" — which families an account's sessions are on. A session
+// holding two families on one account appears in both, so these can sum to more
+// than the total they follow; that is the same double-count the per-account
+// totals already carry against `active`, for the same reason.
+//
+// Suppressed when there is only one family in play: "3 sess (opus+ 3)" adds a
+// parenthesis and no information, and the breakdown exists to show a split.
+function formatSessionBuckets(byBucket) {
+  const entries = Object.entries(byBucket || {}).filter(([, n]) => n > 0);
+  if (entries.length < 2) return '';
+  entries.sort((a, b) => b[1] - a[1]);
+  return ` (${entries.map(([b, n]) => `${BUCKET_LABELS[b] || b} ${n}`).join(', ')})`;
+}
+
 // The adaptive row for one account, or null when the mode is off (getStatus
 // sends an empty list) or this account predates the snapshot.
 function adaptiveFor(status, name) {
@@ -249,12 +275,13 @@ function adaptiveFor(status, name) {
 // spent, and how much concurrency the account has been seen to take.
 function formatAdaptive(a, paint) {
   const parts = [];
+  const family = BUCKET_LABELS[a.bucket] || a.bucket;
   parts.push(a.share == null
     // Every candidate scored zero: the whole tier is inside its reserve, so
     // there is no split to report and saying "0%" everywhere would imply the
     // router had stopped, which it has not.
-    ? paint.yellow('share n/a (all reserved)')
-    : paint.bold(`share ${(a.share * 100).toFixed(0)}%`));
+    ? paint.yellow(`share n/a (all reserved, ${family})`)
+    : paint.bold(`share ${(a.share * 100).toFixed(0)}% of ${family}`));
   parts.push(`${a.sessions} sess / ${a.inFlight} inflight`);
   parts.push(`head ${(a.headroom * 100).toFixed(1)}% of ${(a.threshold * 100).toFixed(0)}%`);
   // Both learned figures are absent together (tok/s is derived from the tier),

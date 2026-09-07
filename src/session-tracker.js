@@ -397,8 +397,8 @@ export class SessionTracker {
     }
   }
 
-  // { known, active, perAccount: { [index]: activeCount }, tokens } — for
-  // status/TUI. Sweeps as it goes so a long-lived headless server stays bounded.
+  // { known, active, perAccount: { [index]: activeCount }, perAccountBucket, tokens }
+  // — for status/TUI. Sweeps as it goes so a long-lived headless server stays bounded.
   // The token totals come out of the walk this already does: the status endpoint
   // is read on every TUI frame, so nothing here may add a second pass.
   //
@@ -416,6 +416,15 @@ export class SessionTracker {
     let known = 0;
     let active = 0;
     const perAccount = {};
+    // { [index]: { [bucket]: activeCount } }. `perAccount` counts a session once
+    // per account however many families it holds there, which is right for load
+    // — one session is one client — but it cannot answer which FAMILY those
+    // sessions are on. A pin is per weekly bucket, so that is the grain the
+    // answer exists at, and an operator checking that distribution went where
+    // intended needs it: an account carrying three Opus sessions and one
+    // carrying three Fable sessions are not the same picture, and `3 sess` on
+    // both says they are.
+    const perAccountBucket = {};
     const tokens = emptyAggregate();
     const byBucket = {};
     const items = detail ? [] : null;
@@ -441,6 +450,15 @@ export class SessionTracker {
         for (const idx of this._loadedAccounts(s, now)) {
           perAccount[idx] = (perAccount[idx] || 0) + 1;
         }
+        // Per family, from the same predicate `_loadedAccounts` applies, so the
+        // breakdown can never disagree with the total it sits under. A session
+        // holding two families on one account counts once in each of them —
+        // hence these sum to at least the account's `perAccount` figure.
+        for (const [bucket, pin] of s.pins) {
+          if (!this._pinCounts(s, pin, pin.idx, now)) continue;
+          const per = perAccountBucket[pin.idx] || (perAccountBucket[pin.idx] = {});
+          per[bucket] = (per[bucket] || 0) + 1;
+        }
         // The live cached footprint, per family and in total. A session holding
         // a big Opus context and a small Fable one contributes to both.
         for (const [bucket, t] of s.tokens) {
@@ -455,7 +473,9 @@ export class SessionTracker {
     // Newest first: a per-session table is read top-down for what is happening
     // now, and the list is capped by the same TTLs as the map behind it.
     if (items) items.sort((a, b) => b.lastSeen - a.lastSeen);
-    return items ? { known, active, perAccount, tokens, items } : { known, active, perAccount, tokens };
+    return items
+      ? { known, active, perAccount, perAccountBucket, tokens, items }
+      : { known, active, perAccount, perAccountBucket, tokens };
   }
 }
 

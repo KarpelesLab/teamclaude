@@ -534,3 +534,58 @@ test('scenario: even mode is unchanged by the presence of adaptive', () => {
   const counts = placeSessions(am, 3);
   assert.deepEqual(Object.keys(counts).sort(), ['a', 'b', 'c']);
 });
+
+// ── Per-family session breakdown ────────────────────────────────────────────
+
+test('sessions are broken down by the weekly bucket they are pinned on', () => {
+  const am = mgr(['a', 'b']);
+  weekly(am, 0, 0.20);
+  weekly(am, 1, 0.20);
+  // Two Opus sessions and one Fable session, all on account 0.
+  am.recordSession('s1', 0, OPUS);
+  am.recordSession('s2', 0, OPUS);
+  am.recordSession('s3', 0, FABLE);
+  const stats = am.sessionTracker.stats();
+  assert.deepEqual(stats.perAccountBucket[0], { unified7d: 2, unified7dFable: 1 });
+  // The per-account total still counts each SESSION once, not each pin.
+  assert.equal(stats.perAccount[0], 3);
+});
+
+test('a session spanning two families on one account appears in both', () => {
+  const am = mgr(['a', 'b']);
+  am.recordSession('s1', 0, OPUS);
+  am.recordSession('s1', 0, FABLE); // same session, second family, same account
+  const stats = am.sessionTracker.stats();
+  assert.deepEqual(stats.perAccountBucket[0], { unified7d: 1, unified7dFable: 1 });
+  // ...but is one client, so the account's own total is 1.
+  assert.equal(stats.perAccount[0], 1);
+});
+
+test('a session split across two accounts is counted on each', () => {
+  const am = mgr(['a', 'b']);
+  am.recordSession('s1', 0, OPUS);
+  am.recordSession('s1', 1, FABLE); // Fable diverted to the sibling
+  const stats = am.sessionTracker.stats();
+  assert.deepEqual(stats.perAccountBucket[0], { unified7d: 1 });
+  assert.deepEqual(stats.perAccountBucket[1], { unified7dFable: 1 });
+});
+
+test('the breakdown reaches the status payload per account', () => {
+  const am = mgr(['a', 'b']);
+  weekly(am, 0, 0.20);
+  weekly(am, 1, 0.20);
+  am.recordSession('s1', 0, OPUS);
+  am.recordSession('s2', 0, FABLE);
+  const status = am.getStatus();
+  assert.deepEqual(status.accounts[0].sessionsByBucket, { unified7d: 1, unified7dFable: 1 });
+  // An account carrying nothing sends null rather than an empty object.
+  assert.equal(status.accounts[1].sessionsByBucket, null);
+});
+
+test('adaptiveStats names the bucket its shares were computed for', () => {
+  const am = mgr(['a', 'b']);
+  weekly(am, 0, 0.20);
+  weekly(am, 1, 0.20);
+  assert.equal(am.adaptiveStats()[0].bucket, 'unified7d');
+  assert.equal(am.adaptiveStats(FABLE)[0].bucket, 'unified7dFable');
+});

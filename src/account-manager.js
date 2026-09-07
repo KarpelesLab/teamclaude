@@ -1072,6 +1072,10 @@ export class AccountManager {
       return {
         index: a.index,
         name: a.name,
+        // Which weekly bucket these figures are for. Shares are per bucket —
+        // the same fleet splits differently for Fable than for Opus — so a
+        // share reported without naming its bucket cannot be checked.
+        bucket,
         competing: inTier.has(a.index),
         sessions: this.sessionTracker.activeCountFor(a.index, now),
         inFlight: a.inFlight || 0,
@@ -3337,6 +3341,10 @@ export class AccountManager {
         // knob is on: a measurement of the fleet, not a report of the feature's
         // state.
         pressure: this._expiryPressure(a),
+        // Which model families those sessions are on, keyed by weekly bucket.
+        // Omitted rather than sent empty when the account carries none, so the
+        // renderer's "is there a breakdown" test stays a plain truthiness check.
+        sessionsByBucket: sessions.perAccountBucket?.[a.index] || null,
         quota: { ...a.quota },
         // `byBucket` is the one nested value under `usage`, so the shallow copy
         // that covers every flat counter beside it would hand the caller a live
