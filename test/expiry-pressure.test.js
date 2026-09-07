@@ -714,9 +714,9 @@ test('path 3: a request whose model the account cannot serve leaves the reset pe
   const off = build(OFF);
   off.refreshExpiredQuotas(FABLE, asRequest());
   assert.equal(off.accounts[1].sessionResetPending, false,
-    'the knob-off path left an event master consumes');
+    'the knob-off path left an event the router consumes');
   assert.equal(off.accounts[off.currentIndex].name, 'reset',
-    'the knob-off path skipped a switch master performs');
+    'the knob-off path skipped a switch the router performs');
 });
 
 test('path 3: a request the incumbent cannot serve leaves the reset for one it does', () => {
@@ -756,9 +756,9 @@ test('path 3: a request the incumbent cannot serve leaves the reset for one it d
   const off = build(OFF);
   off.refreshExpiredQuotas(FABLE, asRequest());
   assert.equal(off.accounts[1].sessionResetPending, false,
-    'the knob-off path left an event master consumes');
+    'the knob-off path left an event the router consumes');
   assert.equal(off.accounts[off.currentIndex].name, 'reset',
-    'the knob-off path skipped a switch master performs');
+    'the knob-off path skipped a switch the router performs');
 });
 
 test('path 3: a poll clears the window and leaves the reset for a request', () => {
@@ -807,9 +807,9 @@ test('path 3: the knob-off poll spends the reset on sight', () => {
 
   am.getQuotaSummary();
   assert.equal(am.accounts[1].sessionResetPending, false,
-    'the knob-off poll left an event master consumes');
+    'the knob-off poll left an event the router consumes');
   assert.equal(am.accounts[am.currentIndex].name, 'reset',
-    'the knob-off poll skipped a switch master performs');
+    'the knob-off poll skipped a switch the router performs');
 });
 
 test('path 3: the knob-off switch sees the whole fleet', () => {
