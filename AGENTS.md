@@ -72,3 +72,15 @@ and do not restart the live service just to experiment without authorization.
 - Do not immediately destroy an h1 request with unread upload bytes after
   writing a rejection: the reset can hide the 413/503 from its caller. Teardown
   must be bounded, while h2 rejection must close only the affected stream.
+
+### Privacy before publishing or merging
+
+- Audit the final diff, every new commit's content, and the PR description for
+  personal data and secrets before publishing or marking a PR ready. Removing
+  data only from the final tree does not remove it from earlier commits.
+- Keep real account emails/IDs, credentials, session identifiers, private local
+  paths, request payloads and raw operational logs out of source, fixtures and
+  PR text. Use clearly synthetic accounts and sanitized aggregate measurements.
+- If sensitive data was already published, stop and report it without repeating
+  the value. Coordinate credential revocation and history cleanup as appropriate;
+  do not silently force-push or rewrite contributor attribution.
