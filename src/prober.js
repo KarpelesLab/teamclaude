@@ -140,7 +140,7 @@ export class Prober {
         const status = this.accountStatus.get(account.name);
         return {
           name: account.name,
-          status: account.type === 'oauth' ? (status?.status || 'never') : 'not-applicable',
+          status: this._isProbeTarget(account) ? (status?.status || 'never') : 'not-applicable',
           lastProbedAt: iso(status?.finishedAt),
           startedAt: iso(status?.startedAt),
           durationMs: status?.durationMs ?? null,
