@@ -26,7 +26,15 @@ import { proxyForHost, proxyAgent } from './upstream-proxy.js';
 // socket at TCP speed, exactly like N direct Claude Code processes. maxSockets is
 // per-origin and bounds the fan-out. Escape hatch:
 // TEAMCLAUDE_UPSTREAM_GLOBAL_FETCH=1 reverts to the old global-fetch path.
-const MAX_SOCKETS = Number(process.env.TEAMCLAUDE_UPSTREAM_MAX_SOCKETS) || 256;
+// A proxy has one JavaScript event loop, unlike N independent Claude Code
+// processes. Letting a reconnect storm fan out to hundreds of readable TLS
+// sockets can spend whole poll turns draining upstream data and starve even the
+// local status listener. Eight preserves useful parallelism (and fixes the old
+// single-h2 flow-control bottleneck) while applying backpressure before the
+// relay becomes unresponsive. Operators with measured headroom can override it.
+export const DEFAULT_UPSTREAM_MAX_SOCKETS = 8;
+const configuredMaxSockets = Number(process.env.TEAMCLAUDE_UPSTREAM_MAX_SOCKETS);
+const MAX_SOCKETS = configuredMaxSockets > 0 ? configuredMaxSockets : DEFAULT_UPSTREAM_MAX_SOCKETS;
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: MAX_SOCKETS });
 const httpAgent = new http.Agent({ keepAlive: true, maxSockets: MAX_SOCKETS });
 const USE_GLOBAL_FETCH = /^(1|true|yes|on)$/i.test(process.env.TEAMCLAUDE_UPSTREAM_GLOBAL_FETCH || '');

@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { once } from 'node:events';
-import { upstreamFetch } from '../src/upstream-fetch.js';
+import { upstreamFetch, DEFAULT_UPSTREAM_MAX_SOCKETS } from '../src/upstream-fetch.js';
 
 async function listen(handler) {
   const server = http.createServer(handler);
@@ -35,6 +35,36 @@ test('concurrent requests each open their own connection and run in parallel', a
   assert.equal(conns, N, `expected ${N} parallel connections, saw ${conns}`);
   // Parallel: total ≈ one request's delay, NOT N × delay (serialization).
   assert.ok(elapsed < HEADER_DELAY * 3, `expected parallel (~${HEADER_DELAY}ms), took ${elapsed}ms`);
+
+  server.close();
+});
+
+test('default pool bounds reconnect fan-out before it starves the event loop', async () => {
+  let active = 0;
+  let peak = 0;
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const { server, port } = await listen(async (req, res) => {
+    active += 1;
+    peak = Math.max(peak, active);
+    await gate;
+    active -= 1;
+    res.writeHead(200);
+    res.end('ok');
+  });
+
+  const total = DEFAULT_UPSTREAM_MAX_SOCKETS + 4;
+  const requests = Array.from({ length: total }, () =>
+    upstreamFetch(`http://127.0.0.1:${port}/bounded`, { headersTimeoutMs: 5_000 })
+      .then(response => response.text()));
+
+  // Give every request time to reach the agent. The first pool-width batch is
+  // deliberately held, so any extra connection here proves the cap failed.
+  await new Promise(resolve => setTimeout(resolve, 100));
+  assert.equal(peak, DEFAULT_UPSTREAM_MAX_SOCKETS);
+  release();
+  assert.deepEqual(await Promise.all(requests), Array(total).fill('ok'));
+  assert.equal(peak, DEFAULT_UPSTREAM_MAX_SOCKETS);
 
   server.close();
 });
