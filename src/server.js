@@ -1911,7 +1911,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // so a stay confirmed once the headers are out has no retry behind it, and a
     // forwarded status under 400 is the response the client is given.
     if (upstreamRes.status < 400) {
-      accountManager.confirmStay(account, restingGen, ctx.sessionId, ctx.model, ctx.provider);
+      accountManager.confirmStay(account, restingGen, ctx.sessionId, ctx.provider);
     }
 
     if (!upstreamRes.body) {

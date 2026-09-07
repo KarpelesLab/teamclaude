@@ -1081,7 +1081,7 @@ test('a stay a second request confirms releases the roll it was pushed off', () 
   assert.equal(serve(am, null, OPUS).name, 'b', 'the first request did not rest on b');
   const carried = am.observedGeneration(null, OPUS);
   assert.equal(serve(am, null, OPUS).name, 'b', 'the second request did not rest on b');
-  am.confirmStay(am.accounts[1], carried, null, OPUS, 'anthropic');
+  am.confirmStay(am.accounts[1], carried, null, 'anthropic');
 
   // b is out of the way, so the traffic comes back to a on its own.
   assert.equal(serve(am, null, OPUS, { exclude: new Set([1]) }).name, 'a');
@@ -1125,7 +1125,7 @@ test('a success on a borrowed cursor does not release the roll its owner holds',
     const carried = am.observedGeneration(null, OPUS);
     const account = claudeReq();
     assert.equal(account.name, 'a', `the ${attempt} borrowed request left the anthropic account`);
-    am.confirmStay(account, carried, null, OPUS, 'anthropic');
+    am.confirmStay(account, carried, null, 'anthropic');
   }
   assert.equal(am._currentObs.unescaped?.idx, 0,
     'a success on the borrowed cursor released the roll its owner was holding');
@@ -1171,7 +1171,7 @@ test('a borrowed cursor\'s success settles the roll of its own provider', () => 
   const carried = am.observedGeneration(null, OPUS);
   const served = claudeReq();
   assert.equal(served.name, 'b', 'the confirming request left b');
-  am.confirmStay(served, carried, null, OPUS, 'anthropic');
+  am.confirmStay(served, carried, null, 'anthropic');
   assert.equal(am._currentObs.unescaped, null,
     'the success left its own provider\'s roll owed');
 
@@ -1216,7 +1216,7 @@ test('a success on a shared key for another provider\'s request leaves the roll 
   const carried = am.observedGeneration(null, GPT);
   const served = codexReq();
   assert.equal(served.name, 'kn', 'the confirming codex request left the shared key');
-  am.confirmStay(served, carried, null, GPT, 'codex');
+  am.confirmStay(served, carried, null, 'codex');
   assert.equal(am._currentObs.unescaped?.idx, 0,
     'a codex success released the roll the anthropic fleet was holding');
 
@@ -1246,7 +1246,7 @@ test('a confirmation that names no fleet settles nothing', () => {
   assert.equal(serve(am, null, OPUS).name, 'b', 'the first request did not rest on b');
   const carried = am.observedGeneration(null, OPUS);
   assert.equal(serve(am, null, OPUS).name, 'b', 'the second request did not rest on b');
-  am.confirmStay(am.accounts[1], carried, null, OPUS);
+  am.confirmStay(am.accounts[1], carried, null);
   assert.equal(am._currentObs.unescaped?.idx, 0,
     'a confirmation naming no fleet released the roll anyway');
 
@@ -1256,6 +1256,53 @@ test('a confirmation that names no fleet settles nothing', () => {
     'the fail-back found a roll that nothing had settled already released');
   assert.equal(serve(am, null, OPUS).name, 'b',
     'the request after the fail-back stayed on the account the roll pushed it off');
+});
+
+test('a session\'s confirmation releases under the bucket its stamp was taken under', () => {
+  // The stamp is read before the walk and the confirmation lands once upstream
+  // has answered, so an operator's route edit can arrive between them: the route
+  // editor hands the new table to the running rotation before it writes the file
+  // (`tui.js` `_routeSave`), and a `bucket` override is what the table says about
+  // this model. Resolving the bucket again at the confirmation sends it to a
+  // bucket this session has no observation under, and the roll stays held on the
+  // observation the stamp was taken on — where every model still governed by
+  // that bucket is handed it back on the next fail-back and preempted a second
+  // time for a roll the fleet has already moved off.
+  const am = mgr(['a', 'b'], ON, { distributeSessions: true });
+  am.setRoutes([{ name: 'fable', match: ['*fable*'], bucket: 'unified7d' }]);
+  bucket(am, 0, 'unified7d', 0.4, 10);
+  bucket(am, 1, 'unified7d', 0.4, 10);
+
+  assert.equal(serve(am, 's1', FABLE).name, 'a', 'the fixture must start on a');
+  rollWindow(am, 0);
+  assert.equal(serve(am, 's1', FABLE).name, 'b', 'the rollover did not move the pin off a');
+  // The first request to REST on b, which is what puts a's roll into the hold.
+  assert.equal(serve(am, 's1', FABLE).name, 'b', 'the preemption did not settle on b');
+  assert.equal(am.sessionTracker.refsFor('s1', 'unified7d').unescaped?.idx, 0,
+    'the fixture must have held a\'s roll on the pin');
+
+  // The server's handshake with an operator inside it: the stamp before the
+  // walk, the request it selects under, the route saved while that request is
+  // upstream, and the confirmation on the response it comes back with.
+  const carried = am.observedGeneration('s1', FABLE);
+  assert.equal(serve(am, 's1', FABLE).name, 'b', 'the confirming request left b');
+  am.setRoutes([{ name: 'fable', match: ['*fable*'] }]); // the override dropped
+  assert.equal(am._weeklyBucketFor(FABLE), 'unified7dFable',
+    'the edit did not move the model to another bucket');
+  am.confirmStay(am.accounts[1], carried, 's1', 'anthropic');
+
+  assert.equal(am.sessionTracker.refsFor('s1', 'unified7d').unescaped, null,
+    'the confirmation settled a bucket resolved after the response instead of the stamp\'s');
+
+  // Opus is governed by the bucket the edit left behind, so it is the traffic
+  // that reads what the confirmation did or did not settle. b out of the way,
+  // the session falls back onto a, whose roll this stay released.
+  assert.equal(serve(am, 's1', OPUS, { exclude: new Set([1]) }).name, 'a',
+    'the fail-back did not reach a');
+  assert.equal(am._pinRolledOver('s1', am.accounts[0], OPUS), false,
+    'the fail-back was handed back a roll the confirmation had settled');
+  assert.equal(serve(am, 's1', OPUS).name, 'a',
+    'the session was preempted off a again for a roll its own stay had settled');
 });
 
 test('removing an account renumbers a session pin\'s held roll too', () => {

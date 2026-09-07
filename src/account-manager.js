@@ -1828,13 +1828,17 @@ export class AccountManager {
    * somewhere, not finding traffic already at rest there, and only the latter
    * can confirm a stay. Null with the knob off, so the caller carries nothing
    * and the confirmation below has nothing to act on.
+   *
+   * The session's bucket travels with its stamp because it is part of what that
+   * stamp was taken under: the observation is keyed by it, and the routing table
+   * that answers which bucket governs a model is rewritten while requests are in
+   * flight.
    */
   observedGeneration(sessionId = null, model = null) {
     if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) return null;
-    const pin = sessionId
-      ? this.sessionTracker.refsFor(sessionId, this._weeklyBucketFor(model))
-      : null;
-    return { current: this._currentObs?.gen ?? null, pin: pin?.gen ?? null };
+    const bucket = sessionId ? this._weeklyBucketFor(model) : null;
+    const pin = sessionId ? this.sessionTracker.refsFor(sessionId, bucket) : null;
+    return { current: this._currentObs?.gen ?? null, pin: pin?.gen ?? null, bucket };
   }
 
   /**
@@ -1848,7 +1852,7 @@ export class AccountManager {
    * with the tried set untouched starts there again; releasing on any of those
    * would leave the fail-back nothing to hand back.
    */
-  confirmStay(account, carried, sessionId = null, model = null, provider = null) {
+  confirmStay(account, carried, sessionId = null, provider = null) {
     if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) return;
     if (!account || !carried) return;
     // The cursor's observation hangs off ONE slot every provider shares, so the
@@ -1875,11 +1879,17 @@ export class AccountManager {
       this._releaseHeld(this._currentObs, account, carried.current);
     }
     if (sessionId) {
-      const bucket = this._weeklyBucketFor(model);
+      // The bucket comes from the stamp, and nothing here can resolve another:
+      // a route edit reaches the running table before the response does, so a
+      // bucket resolved now can be one this session has no observation under —
+      // settling nothing there while the observation the stamp names keeps the
+      // roll, for every model still governed by that bucket to be preempted on
+      // a second time.
+      //
       // Ungated, because a session's observation is its own: a walk borrowing
       // the shared cursor cannot leave one naming an account this session never
       // selected.
-      this._releaseHeld(this.sessionTracker.refsFor(sessionId, bucket), account, carried.pin);
+      this._releaseHeld(this.sessionTracker.refsFor(sessionId, carried.bucket), account, carried.pin);
     }
   }
 
