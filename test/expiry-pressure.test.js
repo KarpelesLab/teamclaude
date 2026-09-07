@@ -708,9 +708,9 @@ test('path 3: a request whose model the account cannot serve leaves the reset pe
   assert.equal(am.accounts[am.currentIndex].name, 'reset',
     'the reset never reached the model that could act on it');
 
-  // The knob-off control, on the same fixture: master spends the event on sight
-  // whatever model the request carries, and takes the switch its own unscoped
-  // filter admits.
+  // The knob-off control, on the same fixture: with the feature off the event
+  // is spent on sight whatever model the request carries, and the switch takes
+  // what its own unscoped filter admits.
   const off = build(OFF);
   off.refreshExpiredQuotas(FABLE, asRequest());
   assert.equal(off.accounts[1].sessionResetPending, false,
@@ -752,7 +752,7 @@ test('path 3: a request the incumbent cannot serve leaves the reset for one it d
   assert.equal(am.accounts[am.currentIndex].name, 'reset',
     'the reset did not survive to the model that could weigh it');
 
-  // The knob-off control: the incumbent's model tells master nothing either.
+  // The knob-off control: the incumbent's model decides nothing either.
   const off = build(OFF);
   off.refreshExpiredQuotas(FABLE, asRequest());
   assert.equal(off.accounts[1].sessionResetPending, false,
@@ -793,7 +793,7 @@ test('path 3: a poll clears the window and leaves the reset for a request', () =
     'the reset the poll left pending never reached the request');
 });
 
-test('path 3: the knob-off poll spends the reset exactly as master does', () => {
+test('path 3: the knob-off poll spends the reset on sight', () => {
   // The control for the arm above, and the whole of what the flag-off promise
   // says here: with the feature off a poll consumes the event and runs the
   // switch, because that is what the router does without this feature. The
@@ -812,7 +812,7 @@ test('path 3: the knob-off poll spends the reset exactly as master does', () => 
     'the knob-off poll skipped a switch master performs');
 });
 
-test('path 3: the knob-off switch sees the fleet master shows it', () => {
+test('path 3: the knob-off switch sees the whole fleet', () => {
   // The exclusion is gated at the call site for the reason the model is: with
   // the feature off the switch's candidate filter must be the one the router
   // makes without this feature. Both challengers rank equally with the knob off,
@@ -835,13 +835,13 @@ test('path 3: the knob-off switch sees the fleet master shows it', () => {
     'the knob-off switch dropped a candidate the router keeps');
 });
 
-test('path 3: the knob-off switch keeps a spent account out, as master does', () => {
+test('path 3: the knob-off switch keeps a spent account out', () => {
   // The eligible loop's availability guard is redundant only with the feature
   // ON, where refreshExpiredQuotas hands the switch a model and an exclusion set
   // and has already filtered on the same test. With the knob off it hands
   // neither, so that guard is the only thing between an account whose weekly is
-  // spent and the cursor. This arm is green at master too: it gates behaviour
-  // the branch inherits rather than behaviour it adds.
+  // spent and the cursor. It gates behaviour the disabled path already has,
+  // not behaviour this adds.
   const am = mgr(['cur', 'spent'], { expiry: OFF });
   bucket(am, 0, 'unified7d', 0.50, 50);
   // Over the threshold, and resetting sooner than the incumbent — everything the

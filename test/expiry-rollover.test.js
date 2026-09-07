@@ -1102,8 +1102,8 @@ test('a success on a borrowed cursor does not release the roll its owner holds',
     [codexAccount('c'), codexAccount('c2'), oauth('a')], 0.98, { expiryRouting: ON },
   );
   for (const [i, hours] of [[0, 10], [1, 20], [2, 30]]) bucket(am, i, 'unified7d', 0.4, hours);
-  // What index.js does before the listener accepts anything, so the codex fleet
-  // owns the cursor and the anthropic request is the one that borrows.
+  // The opening placement a daemon launch makes, so the codex fleet owns the
+  // cursor and the anthropic request borrows it.
   am.selectActiveAccount();
 
   const codexReq = (exclude = null) => am.getActiveAccount(exclude, GPT, null, null, 'codex');

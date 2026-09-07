@@ -420,13 +420,9 @@ export class AccountManager {
   /**
    * Move the cursor, and only the cursor. A reading is taken where a request
    * finds traffic resting, never where a selection aims it, so no caller of
-   * this method owes one. `_firstSightOn` makes every write here, and it makes
-   * two of them. An aim onto the account a preemption pushed traffic off is a
-   * FAIL-BACK, and hands that account the roll being held for it: the reading it
-   * was preempted on is restored rather than replaced, which is the case the
-   * design turns on. Any other aim first-sights its destination, and only where
-   * the observation names no account or where the account it names has rolled no
-   * window it recorded, so it forfeits no roll either.
+   * this method owes one. Every write here is `_firstSightOn`'s: an aim onto
+   * the account a preemption pushed traffic off restores the roll held for it,
+   * and any other aim writes only where nothing is lost.
    */
   _setCurrent(account) {
     this.currentIndex = account.index;
@@ -653,12 +649,11 @@ export class AccountManager {
     // session reset made a sooner-expiring account the better choice. This runs
     // on every request so the behaviour holds without the TUI render loop.
     //
-    // A set on every call, empty included: `_excludeOtherProviders` hands back
-    // the caller's own argument when nothing needs excluding, so a
-    // single-provider request arrives here holding null — the same thing a poll
-    // holds, and the refresh tells the two apart by exactly that. Allocated
-    // fresh rather than shared, because a set handed out once is a set some
-    // later reader could add to.
+    // The exclusion set is what marks this call as a request's, and the three
+    // request-less callers hand none. The request path always hands one, empty
+    // included; substituted here because the parameter is optional, and a
+    // request excluding nothing must still be told apart from a poll. Allocated
+    // fresh: a set handed out once is one a later reader could add to.
     this.refreshExpiredQuotas(model, this.expiryRouting.enabled ? (exclude ?? new Set()) : exclude);
     // Session-affinity distribution (opt-in): keep a session on its pinned
     // account for cache reuse, and route a new session to the least-loaded
@@ -1719,8 +1714,7 @@ export class AccountManager {
    * ARRIVES to find the choice on an account outside its own tried set; an aim
    * writes only where there is nothing to lose, because the aimed request may
    * never arrive. Arriving is not being served either, so nothing here releases
-   * a held roll: a retry that re-enters with the tried set untouched — a 401's
-   * forced refresh, a short-wait 429 with no idle sibling to hop to — looks like
+   * a held roll: a retry that re-enters with the tried set untouched looks like
    * a fresh arrival, and so does a second client request at a destination
    * refusing every one of them. The roll is held until an attempt that carries
    * the generation this observation was stamped with is SERVED there; a stay so
@@ -1796,12 +1790,9 @@ export class AccountManager {
   }
 
   /**
-   * Point an observation at an account, stamping the move with a fresh
-   * generation.
-   *
-   * The stamp is what a confirmation is scoped to: a request that selected
-   * before this move, or after a later one, carries a different one and is not
-   * evidence about the stay this move begins.
+   * The stamp a move is written with is what a confirmation is scoped to: a
+   * request that selected before this move, or after a later one, carries a
+   * different one and is not evidence about the stay this move begins.
    */
   _moveObs(obs, index) {
     obs.idx = index;
@@ -1828,11 +1819,6 @@ export class AccountManager {
    * somewhere, not finding traffic already at rest there, and only the latter
    * can confirm a stay. Null with the knob off, so the caller carries nothing
    * and the confirmation below has nothing to act on.
-   *
-   * The session's bucket travels with its stamp because it is part of what that
-   * stamp was taken under: the observation is keyed by it, and the routing table
-   * that answers which bucket governs a model is rewritten while requests are in
-   * flight.
    */
   observedGeneration(sessionId = null, model = null) {
     if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) return null;
@@ -1847,33 +1833,21 @@ export class AccountManager {
    * below 400, so the account did not refuse it. What the client makes of the
    * body afterwards is a question about the response, not about the account.
    *
-   * Arriving is not that evidence. Several requests can start at a destination
-   * that goes on to refuse every one of them, and a retry re-entering selection
-   * with the tried set untouched starts there again; releasing on any of those
-   * would leave the fail-back nothing to hand back.
+   * Arriving is not that evidence: releasing on it would leave the fail-back
+   * nothing to hand back.
    */
   confirmStay(account, carried, sessionId = null, provider = null) {
     if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) return;
     if (!account || !carried) return;
     // The cursor's observation hangs off ONE slot every provider shares, so the
-    // roll it holds and the success offered for releasing it can belong to
-    // different fleets: a request whose provider does not own the cursor borrows
-    // it for the walk and hands the INDEX back, but not the observation — which
-    // that walk has left naming the borrower's own account. What settles a roll
-    // is the REQUEST's provider, the fleet whose placement the walk was made
-    // under; the account it landed on cannot stand in for that, because only
-    // subscriptions are partitioned and an API key either app may spend is
-    // eligible for both while declaring one. Where the two fleets differ the
-    // roll stays held, which is the safe direction: one held a request too long
-    // costs one further preemption, while one released early strands the traffic
-    // on the week the account just gained.
-    //
-    // At the held end there is no request to ask, only the declaration, so a
-    // roll pushed off such a key reads as the provider it declares and the other
-    // fleet's success leaves it held — the same safe direction, one preemption.
-    // A confirmation that names no fleet settles nothing for the same reason:
-    // supplying the default instead would answer the question with a guess, and
-    // the guess is right for every fleet but the one this rule exists for.
+    // roll it holds and the success offered for it can belong to different
+    // fleets: a borrowed walk hands the INDEX back but not the observation,
+    // which it may have left naming the borrower's own account. What settles a
+    // roll is the REQUEST's provider, the fleet whose placement the walk was
+    // made under. Where the two differ the roll stays held: holding one too long
+    // costs a further preemption, releasing one early strands the traffic on the
+    // week the account just gained. A confirmation that names no fleet settles
+    // nothing, which is why the parameter has no default fleet to fall back on.
     const held = this._currentObs?.unescaped;
     if (held && provider && providerOf(this.accounts[held.idx]) === provider) {
       this._releaseHeld(this._currentObs, account, carried.current);
@@ -2344,18 +2318,10 @@ export class AccountManager {
     // the three request-less callers (the TUI render loop, getQuotaSummary for
     // the status poller, selectActiveAccount at startup) hand none.
     //
-    // A reset spent by one of those is lost outright rather than acted on
-    // early: the window that raised it is already cleared, so nothing sets the
-    // flag again, and the switch it triggers is drawn over the whole fleet
-    // because a poll has no request to draw it over. With a mixed-provider
-    // fleet that is the defect this rule exists for — a Codex account takes the
-    // band on its own and vetoes an Anthropic-to-Anthropic move that no later
-    // request can retry.
-    // WHERE THIS REQUEST CAN BE SENT: an account it has not already tried, and
-    // one whose quota for the model it carries is not spent — the same two tests
-    // the switch's own eligible loop applies, so the two cannot disagree about
-    // which accounts are in play. Consulted only where `scope` is non-null,
-    // which is only with the feature on.
+    // The two tests below are the ones the switch's own eligible loop applies,
+    // so the predicate and the loop cannot disagree about which accounts are in
+    // play. Consulted only where `scope` is non-null, which is only with the
+    // feature on.
     const canRouteTo = account => account != null
       && !scope.has(account.index) && this._isAvailable(account, model);
     // The cursor's account is one end of every comparison the switch makes, so a
@@ -2372,14 +2338,9 @@ export class AccountManager {
       // The reset belongs to the first request that can act on it. This one
       // cannot be sent to the account at all, so consuming the flag here would
       // spend the event on a switch that must refuse it and leave the next
-      // request — which could have used the account — nothing to act on. An
-      // account whose Fable weekly is spent is exactly that for a Fable request
-      // and fully usable for the Opus one behind it.
-      //
-      // Below _clearExpiredQuotas above, not beside the flag it sets: the window
-      // whose expiry raised the event bars every model while it stands, so an
-      // account read before it is cleared refuses every request and the event
-      // would never be spendable at all.
+      // request — which could have used the account — nothing to act on. Read
+      // after _clearExpiredQuotas: an account read before its expired window is
+      // cleared refuses every request.
       if (scope != null && !canRouteTo(account)) continue;
       // The flag, not r.session: a status read may have cleared the window
       // seconds earlier, and the rule still has to run. Cleared here rather
@@ -2434,7 +2395,7 @@ export class AccountManager {
       // The caller pre-filters on this only with the feature ON, where it hands
       // a model and an exclusion set to filter by. With the feature off it hands
       // neither, and this line is the whole of what keeps an account whose
-      // weekly is spent out of the switch — exactly as at master.
+      // weekly is spent out of the switch.
       if (!this._isAvailable(acc, model)) continue; // enough session & weekly quota left
       // Don't demote to a lower-priority (higher value) account on a reset.
       if ((acc.priority || 0) > (current.priority || 0)) continue;
