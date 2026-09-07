@@ -764,7 +764,7 @@ export class AccountManager {
     // on every request so the behaviour holds without the TUI render loop.
     // The empty set marks this call as a request's, since a poll hands none.
     // Allocated fresh: a set handed out once is one a later reader could add to.
-    this.refreshExpiredQuotas(model, this.expiryRouting.enabled ? (exclude ?? new Set()) : exclude);
+    this.refreshExpiredQuotas(model, this.expiryRouting.enabled ? (exclude ?? new Set()) : exclude, advisorModel);
     // Session-affinity distribution (opt-in): keep a session on its pinned
     // account for cache reuse, and route a new session to the least-loaded
     // account. Only when enabled, only for a real session, and only outside a
@@ -2784,16 +2784,25 @@ export class AccountManager {
     for (const account of this.accounts) this._clearExpiredQuotas(account);
   }
 
-  refreshExpiredQuotas(model = null, exclude = null) {
+  refreshExpiredQuotas(model = null, exclude = null, advisorModel = null) {
     let changed = false;
     // Gated here rather than at the switch call, because the pending flag is read
     // against it too: with the feature off every reset is consumed on sight.
     const scope = this.expiryRouting.enabled ? exclude : null;
+    // Selection admits an advisor request on BOTH its models, so the switch is
+    // drawn on both too. Never more strictly than the pass that decides the
+    // request, though: where no reachable account can serve the advisor model,
+    // selection routes on the main model alone and the event is spent on that
+    // basis. Ordered so that with the knob off, or with no advisor model in
+    // hand, no account is read at all: reading one clears its expired windows.
+    const adv = (scope != null && advisorModel
+      && this.accounts.some(a => !scope.has(a.index) && this._isAvailable(a, model, advisorModel)))
+      ? advisorModel : null;
     // THE EXCLUSION SET IS WHAT MARKS A CALL AS A REQUEST'S: the request path
     // hands one on every call, empty included, and the TUI loop, getQuotaSummary
     // and selectActiveAccount hand none. The tests below are the switch's own.
     const canRouteTo = account => account != null
-      && !scope.has(account.index) && this._isAvailable(account, model);
+      && !scope.has(account.index) && this._isAvailable(account, model, adv);
     // The cursor's account is one end of every comparison the switch makes, so a
     // request that cannot be sent there settles nothing and leaves the event too.
     const spends = !this.expiryRouting.enabled
@@ -2816,12 +2825,12 @@ export class AccountManager {
         sessionReset.push(account);
       }
     }
-    // The model reaches the switch only while the feature is on. Handed no
-    // model, the switch runs the same `_isAvailable(acc)` it does with the knob
-    // off: threading one in would make the disabled path's candidate filter
+    // Neither model reaches the switch unless the feature is on. Handed none,
+    // the switch runs the same `_isAvailable(acc)` it does with the knob off:
+    // threading one in would make the disabled path's candidate filter
     // model-scoped, a live routing change on the path that promises none.
     if (sessionReset.length) {
-      this._switchOnSessionReset(sessionReset, this.expiryRouting.enabled ? model : null, scope);
+      this._switchOnSessionReset(sessionReset, this.expiryRouting.enabled ? model : null, scope, adv);
     }
     return changed;
   }
@@ -2831,7 +2840,7 @@ export class AccountManager {
    * weekly limit expires soonest — but only if that is sooner than the current
    * account's weekly limit and the account still has weekly quota to spend.
    */
-  _switchOnSessionReset(candidates, model = null, exclude = null) {
+  _switchOnSessionReset(candidates, model = null, exclude = null, advisorModel = null) {
     const current = this.accounts[this.currentIndex];
     // Need a known weekly reset on the current account to compare against;
     // if it is unknown we are still probing it, so leave it alone. Read through
@@ -2851,12 +2860,12 @@ export class AccountManager {
       // goes. Kept here as well as in refreshExpiredQuotas, so a caller that does
       // not filter first gets the same answer.
       if (exclude?.has(acc.index)) continue;
-      // Model-scoped, because the request being routed has one: an account whose
+      // Scoped to the models the request being routed carries: an account whose
       // Fable weekly is spent is still fully usable for Opus, and a switch that
-      // ignores the model can install one the model's own picker would refuse.
-      // The caller pre-filters on this only with the feature on. With it off,
-      // this line alone keeps an account whose weekly is spent out of the switch.
-      if (!this._isAvailable(acc, model)) continue; // enough session & weekly quota left
+      // ignores either model can install one the request's own picker would
+      // refuse. The caller pre-filters on this only with the feature on. With it
+      // off, this line alone keeps an account whose weekly is spent out.
+      if (!this._isAvailable(acc, model, advisorModel)) continue; // enough session & weekly quota left
       // Don't demote to a lower-priority (higher value) account on a reset.
       if ((acc.priority || 0) > (current.priority || 0)) continue;
       const weekly = this._rankingReset(acc, model);
@@ -2887,19 +2896,26 @@ export class AccountManager {
     // TWO guards, different properties, neither implying the other, and NOT
     // drawn over the same fleet. The rank comparison weighs `best` against the
     // account the cursor is on, both of which THIS REQUEST reached, so it is
-    // measured on what this request can be sent to. Band membership says the
+    // measured on what this request can be sent to; and it says this switch
+    // leaves no strictly better account behind, which membership does not claim
+    // once a lower tier passes through unbanded. Band membership says the
     // account is worth spending at all, and the only thing the answer does here
     // is move the CURSOR, which serves every request behind this one. So it is
     // drawn over the fleet that cursor serves: the request's provider partition,
     // narrowed by the model filter _bandedCandidates already applies, and never
     // by the accounts this one attempt has tried. An account a 429 pushed this
     // request off holds whatever band it holds for everybody else.
+    // Both models, because that filter is per-account and the caller has already
+    // dropped the advisor model where no account the request reaches serves it:
+    // the degraded answer is the request's, taken once, so widening the set the
+    // band is drawn over cannot make the switch stricter than the pass that
+    // decides the request.
     // The provider comes from the walk in progress, as it does in _cursorKey; a
     // direct caller has none and means the default fleet. Kept inside the `&&`
     // rather than hoisted, so the knob-off path evaluates none of it.
     if (this.expiryRouting.enabled && !this._bandedCandidates(
       this._excludeOtherProviders(null, this._selectingProvider || DEFAULT_PROVIDER),
-      model).includes(best)) return;
+      model, advisorModel).includes(best)) return;
     // Strictly worse than what we are on: stay. Equal keeps the reset tiebreak
     // that got us here, and with expiry routing off every rank is absent and
     // equal, so this cannot fire at all.
