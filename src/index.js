@@ -6,7 +6,7 @@ import { createWriteStream } from 'node:fs';
 import net from 'node:net';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, loadState, saveState } from './config.js';
 import { installCrashHandlers } from './crash-log.js';
-import { AccountManager, DEFAULT_SWITCH_THRESHOLD } from './account-manager.js';
+import { AccountManager, DEFAULT_SWITCH_THRESHOLD, distributionMode } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import {
   DEFAULT_CREDENTIALS_PATH,
@@ -83,7 +83,25 @@ const THRESHOLD_USAGE = [
 // never consulted, so the CLI refuses it rather than storing a typo.
 const QUOTA_BUCKETS = ['unified5h', 'unified7d', 'unified7dSonnet', 'unified7dFable', 'tokens', 'requests'];
 
-const DISTRIBUTE_USAGE = 'Usage: teamclaude distribute <on|off>';
+const DISTRIBUTE_USAGE = 'Usage: teamclaude distribute <on|off|adaptive>';
+
+// What each mode writes to the config, and what to say once it is set. Keyed by
+// the mode `distributionMode` resolves to, so the command and the router cannot
+// disagree about what a setting means.
+const DISTRIBUTE_MODES = {
+  off: {
+    value: false,
+    said: 'Session distribution off — sessions already running keep their accounts and drain; new ones rotate by quota.',
+  },
+  even: {
+    value: true,
+    said: 'Session distribution on — new sessions spread across equal-priority accounts, each pinned to its own for cache reuse.',
+  },
+  adaptive: {
+    value: 'adaptive',
+    said: 'Session distribution adaptive — new sessions concentrate on the account with the least remaining weekly credit, tapering off as it nears the switch threshold and backing off when it is busy.',
+  },
+};
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -1632,21 +1650,29 @@ async function thresholdCommand() {
 
 // ── distribute ──────────────────────────────────────────────
 
+
 async function distributeCommand() {
   const config = await loadOrCreateConfig();
   const arg = args[1];
-  const current = !!config.distributeSessions;
+  // The mode, not a boolean: `!!` would report "adaptive" as a plain "on" and,
+  // worse, write `true` back over it on the next set.
+  const current = distributionMode(config.distributeSessions);
 
   if (arg === undefined) {
-    console.log(`Session distribution: ${current ? 'on' : 'off'}`);
-    console.log('Set with: teamclaude distribute <on|off>');
+    console.log(`Session distribution: ${current}`);
+    console.log('Set with: teamclaude distribute <on|off|adaptive>');
     console.log('On: each session stays on its account for cache reuse, and new sessions spread');
     console.log('across equal-priority accounts by load. Off: quota-driven rotation only.');
+    console.log('Adaptive: spread by remaining weekly credit and load rather than evenly, so the');
+    console.log('most-spent account is finished off first without being run into its threshold.');
     return;
   }
 
-  const on = ['on', 'true', 'yes', '1'].includes(arg);
-  if (!on && !['off', 'false', 'no', '0'].includes(arg)) {
+  let next = null;
+  if (['on', 'true', 'yes', '1'].includes(arg)) next = 'even';
+  else if (['off', 'false', 'no', '0'].includes(arg)) next = 'off';
+  else if (arg === 'adaptive') next = 'adaptive';
+  if (!next) {
     console.error(DISTRIBUTE_USAGE);
     process.exit(1);
   }
@@ -1654,13 +1680,11 @@ async function distributeCommand() {
   // An unchanged setting is not rewritten — the config file is a
   // read-modify-write shared with the running server — but the server is still
   // notified, so a config that already says `on` can be made to take effect.
-  if (on !== current) {
-    config.distributeSessions = on;
+  if (next !== current) {
+    config.distributeSessions = DISTRIBUTE_MODES[next].value;
     await saveConfig(config);
   }
-  console.log(on
-    ? 'Session distribution on — new sessions spread across equal-priority accounts, each pinned to its own for cache reuse.'
-    : 'Session distribution off — sessions already running keep their accounts and drain; new ones rotate by quota.');
+  console.log(DISTRIBUTE_MODES[next].said);
   await notifyRunningServer(config);
 }
 
@@ -1920,8 +1944,10 @@ Commands:
                       (add <name> --match "<glob>" [--accounts "<name>"] [--bucket <b>])
   threshold [pct]     Utilization at which rotation leaves an account (1-100);
                       per bucket with 'unified7d=90', and '=default' drops one
-  distribute [on|off] Spread new sessions across equal-priority accounts, each
-                      pinned to its own for cache reuse (off by default)
+  distribute [on|off|adaptive]
+                      Spread new sessions across equal-priority accounts, each
+                      pinned to its own for cache reuse (off by default);
+                      'adaptive' spreads by remaining weekly credit and load
   probe [off|secs]    Opt-in background quota refresh for idle accounts
                       (off by default; reads usage endpoint, spends no quota)
   warmup [off|secs]   Opt-in: keep idle accounts' 5h timers running by sending

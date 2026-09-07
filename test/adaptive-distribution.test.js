@@ -589,3 +589,17 @@ test('adaptiveStats names the bucket its shares were computed for', () => {
   assert.equal(am.adaptiveStats()[0].bucket, 'unified7d');
   assert.equal(am.adaptiveStats(FABLE)[0].bucket, 'unified7dFable');
 });
+
+// ── The `teamclaude distribute` command's mode table ────────────────────────
+
+test('every config value the distribute command writes round-trips to its mode', () => {
+  // The command and the router must agree about what a setting means. Writing
+  // `true` for a mode that reads back as 'adaptive' (or vice versa) would make
+  // `teamclaude distribute` unable to express, or silently unable to leave, a
+  // mode — which is exactly what the boolean coercion it replaced did.
+  const written = { off: false, even: true, adaptive: 'adaptive' };
+  for (const [mode, value] of Object.entries(written)) {
+    assert.equal(distributionMode(value), mode,
+      `writing ${JSON.stringify(value)} must read back as ${mode}`);
+  }
+});
