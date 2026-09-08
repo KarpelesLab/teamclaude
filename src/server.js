@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { ensureCerts, createConnectHandler, mitmHosts } from './mitm.js';
 import { patchAccountUuid } from './account-uuid-rewrite.js';
 import { sanitizeToolPairs } from './tool-pair-sanitize.js';
-import { sanitizeCacheControl } from './cache-control-sanitize.js';
+import { sanitizeCacheControl, cacheControlSubfieldsToStrip } from './cache-control-sanitize.js';
 import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
 import { TopLevelFieldFinder, modelGlobMatches } from './model.js';
 import { BodyWriter, truncationNote } from './request-log.js';
@@ -2612,14 +2612,14 @@ export function rewriteRequestBody(body, account, url, contentType) {
     // Align the body's account_uuid (in metadata.user_id) with the account whose
     // token we're injecting (same-length patch; no-op if absent).
     if (account.accountUuid) sendBody = patchAccountUuid(sendBody, account.accountUuid);
-    // Third-party Anthropic-compatible upstreams strictly validate
-    // cache_control: Claude Code sends `scope` and `ttl: 1h` subfields Anthropic
-    // accepts but they reject (400 unknown parameter / not supported), breaking
-    // EVERY request once such an account is selected. Keep only `type` for
-    // custom-upstream accounts (`ttl: 5m` is the default window, so dropping
-    // `ttl` is lossless except on backends with 1h windows); Anthropic accounts
-    // are untouched.
-    if (account.upstream) sendBody = sanitizeCacheControl(sendBody, url, contentType);
+    // Some strict Anthropic-compatible upstreams reject `cache_control`
+    // subfields Claude Code sends (`scope`; `ttl: "1h"` on a few) with a
+    // non-retryable 400, breaking EVERY request once such an account is
+    // selected. Opt-in per account, like every other rewrite keyed on
+    // `upstream`: `stripRequestFields: ["cache_control.scope"]`. A first-party
+    // relay that honours every subfield loses nothing by default.
+    const ccSubfields = cacheControlSubfieldsToStrip(account.stripRequestFields);
+    if (ccSubfields.size) sendBody = sanitizeCacheControl(sendBody, url, contentType, ccSubfields);
   }
   // Rewrite the model name for accounts that target a different upstream (e.g.
   // GLM), which uses different model identifiers than Anthropic.
@@ -2627,11 +2627,12 @@ export function rewriteRequestBody(body, account, url, contentType) {
   // Third-party upstreams (e.g. OpenCode Zen, GLM) implement the Anthropic
   // message API but reject fields Claude Code legitimately sends — observed:
   // `context_management` -> 400 "Extra inputs are not permitted", which breaks
-  // EVERY request once such an account is selected. Drop the configured fields
-  // for those accounts only; Anthropic accounts are untouched.
-  if (Array.isArray(account.stripRequestFields) && account.stripRequestFields.length) {
-    sendBody = stripBodyFields(sendBody, account.stripRequestFields);
-  }
+  // EVERY request once such an account is selected. Drop the configured
+  // top-level fields for those accounts only (the `cache_control.<sub>` entries
+  // were consumed above); Anthropic accounts are untouched.
+  const topLevel = Array.isArray(account.stripRequestFields)
+    ? account.stripRequestFields.filter(f => typeof f === 'string' && !f.includes('.')) : [];
+  if (topLevel.length) sendBody = stripBodyFields(sendBody, topLevel);
   return sendBody;
 }
 
