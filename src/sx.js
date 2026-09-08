@@ -18,7 +18,27 @@ import tls from 'node:tls';
 const CONNECT_TIMEOUT_MS = 30000; // residential exits can be slow to establish
 
 // Resolved per call (not at import) so tests can point it at a local mock.
-const sxBase = () => process.env.SX_API_BASE || 'https://api.sx.org';
+//
+// The API key travels as a query parameter (the provider's design), so the base
+// URL decides whether it crosses the network in the clear. An override must be
+// https:, or plain http: to this machine only (a test mock): anything else is
+// reported once and the default is used, rather than sending the key to whatever
+// an inherited environment variable happens to name.
+const DEFAULT_SX_BASE = 'https://api.sx.org';
+let warnedBase = null;
+export function sxBase(env = process.env, warn = (m) => console.error(m)) {
+  const raw = env.SX_API_BASE;
+  if (!raw) return DEFAULT_SX_BASE;
+  let u = null;
+  try { u = new URL(raw); } catch { /* reported below */ }
+  const loopback = u && /^(localhost|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|\[::1\])$/.test(u.hostname);
+  if (u && (u.protocol === 'https:' || (u.protocol === 'http:' && loopback))) return raw.replace(/\/$/, '');
+  if (warnedBase !== raw) {
+    warnedBase = raw;
+    warn(`[TeamClaude] ignoring SX_API_BASE=${JSON.stringify(raw)}: the sx.org API key rides in the URL, so the base must be https:// (plain http:// is allowed for loopback only); using ${DEFAULT_SX_BASE}`);
+  }
+  return DEFAULT_SX_BASE;
+}
 
 // ── sx.org REST (apiKey is a query param; these hit api.sx.org directly, never
 // the proxy, and are unrelated to Anthropic traffic) ──
