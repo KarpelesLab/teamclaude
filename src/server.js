@@ -1000,6 +1000,10 @@ function relayStream(req, res, upstream, sx) {
   for (const [key, value] of Object.entries(req.headers)) {
     const lk = key.toLowerCase();
     if (lk.startsWith(':') || HOP_BY_HOP_HEADERS.has(lk) || lk === 'accept-encoding') continue;
+    // The client's identity on this path is its bearer; x-api-key is how it
+    // authenticated to THIS proxy, so relaying it would hand the operator's
+    // proxy key to upstream.
+    if (lk === 'x-api-key') continue;
     headers[key] = value;
   }
 
@@ -1063,8 +1067,9 @@ export function relayUpgrade(req, socket, head, upstream, sx) {
     const lk = key.toLowerCase();
     // Unlike relayStream, do NOT strip 'upgrade'/'connection' here — they ARE
     // the handshake. Only 'host' (the client transport reconstructs it from
-    // `target`) and h2 pseudo-headers are dropped.
-    if (lk.startsWith(':') || lk === 'host') continue;
+    // `target`), h2 pseudo-headers and the proxy's own x-api-key (the client's
+    // credential to us, not to upstream) are dropped.
+    if (lk.startsWith(':') || lk === 'host' || lk === 'x-api-key') continue;
     headers[key] = value;
   }
 

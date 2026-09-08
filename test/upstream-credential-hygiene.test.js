@@ -78,3 +78,54 @@ test('an OAuth account replaces the client bearer and sends no x-api-key', async
     assert.equal(headers['x-api-key'], undefined, 'the proxy key must not be forwarded');
   });
 });
+
+// The identity-bound paths relay the client's own bearer untouched — and must
+// still not relay the key the client used to authenticate to THIS proxy.
+test('relayStream (/v1/code/*) keeps the client bearer and drops the proxy key', async () => {
+  await withProxy([{ name: 'a', type: 'apikey', apiKey: 'sk-account-key' }], async (port, seen) => {
+    const res = await fetch(`http://127.0.0.1:${port}/v1/code/sessions/abc/worker/events`, {
+      headers: { 'x-api-key': 'tc-proxy-key', authorization: 'Bearer client-own-token' },
+    });
+    assert.equal(res.status, 200);
+    const { headers } = seen[0];
+    assert.equal(headers.authorization, 'Bearer client-own-token');
+    assert.equal(headers['x-api-key'], undefined, 'the proxy key must not be relayed');
+  });
+});
+
+test('relayUpgrade keeps the client bearer and drops the proxy key on the handshake', async () => {
+  const upstream = http.createServer(() => {});
+  const handshakes = [];
+  upstream.on('upgrade', (req, socket) => {
+    handshakes.push(req.headers);
+    socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n');
+    socket.end();
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([{ name: 'a', type: 'apikey', apiKey: 'sk-account-key' }], 0.98);
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'tc-proxy-key' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const port = await listen(proxy);
+  try {
+    const status = await new Promise((resolve, reject) => {
+      const req = http.request({
+        host: '127.0.0.1', port, path: '/v1/session_ingress/ws/abc',
+        headers: {
+          connection: 'Upgrade', upgrade: 'websocket',
+          'x-api-key': 'tc-proxy-key', authorization: 'Bearer client-own-token',
+        },
+      });
+      req.on('upgrade', (res, socket) => { socket.destroy(); resolve(res.statusCode); });
+      req.on('response', (res) => resolve(res.statusCode));
+      req.on('error', reject);
+      req.end();
+    });
+    assert.equal(status, 101);
+    assert.equal(handshakes.length, 1);
+    assert.equal(handshakes[0].authorization, 'Bearer client-own-token');
+    assert.equal(handshakes[0]['x-api-key'], undefined, 'the proxy key must not be relayed');
+  } finally {
+    proxy.close();
+    upstream.close();
+    upstream.closeAllConnections();
+  }
+});
