@@ -586,6 +586,85 @@ test('path 3: the reset switch skips an excluded account that also reset', () =>
     'the switch let an account the request cannot be sent to decide where it goes');
 });
 
+test('path 3: the band that refuses the switch is the fleet\'s, not this attempt\'s tried set', () => {
+  // `hot` never reset, so it is nothing this switch may weigh; what it does hold
+  // is the fleet's band, which is why a challenger the band leaves out must not
+  // become the cursor for every request behind this one. An exclusion that
+  // removes a genuine candidate may change the answer, and this does not deny it.
+  const build = () => {
+    const am = mgr(['cur', 'hot', 'reset'], { expiry: ON });
+    bucket(am, 0, 'unified7d', 0.50, 100); // 1.39e-6, the cursor
+    bucket(am, 1, 'unified7d', 0.00, 1);   // 2.78e-4, the band's maximum, alone
+    bucket(am, 2, 'unified7d', 0.50, 10);  // 1.39e-5, banded out by hot
+    am.accounts[2].quota.unified5h = 0.9;
+    am.accounts[2].quota.unified5hReset = Date.now() - 1000;
+    return am;
+  };
+  // Asked of TWINS, because reading availability clears the expired window the
+  // switch is triggered by.
+  assert.deepEqual(build()._bandedCandidates(null, OPUS).map(a => a.name), ['hot'],
+    'the fixture must give the band to hot on the whole fleet');
+  assert.deepEqual(build()._bandedCandidates(new Set([1]), OPUS).map(a => a.name), ['reset'],
+    'the fixture must hand the band to reset once hot is out, or the arm tests nothing');
+
+  // One event, two arriving requests differing only in what they have tried: the
+  // 429-hop shape, and a plain request.
+  const excluded = build();
+  const hop = excluded.getActiveAccount(new Set([1]), OPUS);
+  const unexcluded = build();
+  unexcluded.getActiveAccount(null, OPUS);
+  assert.equal(excluded.accounts[excluded.currentIndex].name,
+    unexcluded.accounts[unexcluded.currentIndex].name,
+    'the same event left the fleet in two places depending on what the arriving request had tried');
+
+  assert.equal(excluded.accounts[excluded.currentIndex].name, 'cur',
+    'the tried account left the band, and the switch installed what the band refuses');
+  // The veto costs this request nothing; only the fleet declines to move.
+  assert.equal(hop.name, 'cur',
+    'the vetoed switch also moved the request off the account it was entitled to');
+  // `cur` and not `hot`: the event was spent at the hop, the cursor never moved,
+  // and _select returns a live current before any pressure comparison.
+  assert.equal(excluded.getActiveAccount(null, OPUS).name, 'cur',
+    'the request behind the hop inherited a cursor the fleet band refuses');
+});
+
+test('path 3: an exclusion the fleet\'s band survives still lets the switch through', () => {
+  // The control for the arm above. The switch is refused when the FLEET's band
+  // refuses the challenger, never because the request excluded something: here
+  // the tried account holds the band and the challenger is inside it too.
+  const am = mgr(['cur', 'hot', 'reset'], { expiry: ON });
+  bucket(am, 0, 'unified7d', 0.50, 100); // 1.39e-6
+  bucket(am, 1, 'unified7d', 0.45, 10);  // 1.53e-5, the band's maximum
+  bucket(am, 2, 'unified7d', 0.50, 10);  // 1.39e-5, inside it
+  am.accounts[2].quota.unified5h = 0.9;
+  am.accounts[2].quota.unified5hReset = Date.now() - 1000;
+  am.getActiveAccount(new Set([1]), OPUS);
+  assert.equal(am.accounts[am.currentIndex].name, 'reset',
+    'a switch the fleet band admits was refused for excluding a band member');
+});
+
+test('path 3: a hop that refuses to move does not park the fleet on a paused account', () => {
+  // A paused account is still _isAvailable: the pause is the HOP's own test, and
+  // it runs after selection has moved the cursor, so a refused hop can leave the
+  // fleet somewhere no request wanted. The bound this arm does not close: the
+  // switch still never consults isPaused, so an account inside its own pause
+  // that genuinely holds the fleet band can still be installed.
+  const am = mgr(['cur', 'hot', 'reset'], { expiry: ON });
+  bucket(am, 0, 'unified7d', 0.50, 100);
+  bucket(am, 1, 'unified7d', 0.00, 1);
+  bucket(am, 2, 'unified7d', 0.50, 10);
+  am.accounts[2].quota.unified5h = 0.9;
+  am.accounts[2].quota.unified5hReset = Date.now() - 1000;
+  am.pauseAccount(2, 60);
+  am.getActiveAccount(new Set([1]), OPUS);
+  assert.equal(am.isPaused(am.currentIndex), false,
+    'a hop that refused to move parked the fleet inside a rate-limit pause');
+  assert.equal(am.accounts[am.currentIndex].name, 'cur',
+    'the refused hop moved the cursor onto the paused account');
+  assert.equal(am.getActiveAccount(null, OPUS).name, 'cur',
+    'the request behind the refused hop was routed to a paused account');
+});
+
 test('path 3: a reset stays pending until a request that can act on it', () => {
   // The reset is fleet state, not this request's, so a window that expires while
   // one request cannot use the account has to outlive that request.

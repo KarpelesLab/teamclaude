@@ -2776,12 +2776,22 @@ export class AccountManager {
         || (mine === theirs && this._rankedReset(acc, model) < this._rankedReset(best, model))) best = acc;
     }
 
-    // TWO guards, different properties, neither implying the other. Band
-    // membership says the account is worth spending at all. The rank comparison
-    // says this switch leaves no strictly better account behind, which
-    // membership does not claim once a lower tier passes through unbanded. Both
-    // are drawn over what this request can be sent to.
-    if (this.expiryRouting.enabled && !this._bandedCandidates(exclude, model).includes(best)) return;
+    // TWO guards, different properties, neither implying the other, and NOT
+    // drawn over the same fleet. The rank comparison weighs `best` against the
+    // account the cursor is on, both of which THIS REQUEST reached, so it is
+    // measured on what this request can be sent to. Band membership says the
+    // account is worth spending at all, and the only thing the answer does here
+    // is move the CURSOR, which serves every request behind this one. So it is
+    // drawn over the fleet that cursor serves: the request's provider partition,
+    // narrowed by the model filter _bandedCandidates already applies, and never
+    // by the accounts this one attempt has tried. An account a 429 pushed this
+    // request off holds whatever band it holds for everybody else.
+    // The provider comes from the walk in progress, as it does in _cursorKey; a
+    // direct caller has none and means the default fleet. Kept inside the `&&`
+    // rather than hoisted, so the knob-off path evaluates none of it.
+    if (this.expiryRouting.enabled && !this._bandedCandidates(
+      this._excludeOtherProviders(null, this._selectingProvider || DEFAULT_PROVIDER),
+      model).includes(best)) return;
     // Strictly worse than what we are on: stay. Equal keeps the reset tiebreak
     // that got us here, and with expiry routing off every rank is absent and
     // equal, so this cannot fire at all.
