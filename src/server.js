@@ -11,7 +11,7 @@ import { sanitizeCacheControl, cacheControlSubfieldsToStrip } from './cache-cont
 import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
 import { TopLevelFieldFinder, modelGlobMatches } from './model.js';
 import { BodyWriter, truncationNote } from './request-log.js';
-import { upstreamFetch } from './upstream-fetch.js';
+import { upstreamFetch, upstreamPoolStatus } from './upstream-fetch.js';
 import { applyAuthHeaders, upstreamFor, rewritesBody, providerForPath, providerOf, isSubscriptionAccount, DEFAULT_PROVIDER } from './provider.js';
 import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
@@ -308,7 +308,9 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         const status = accountManager.getStatus({ sessionDetail: config.proxy?.sessionDetail === true });
         const extra = hooks.getStatusExtra?.() || {};
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ...extra, ...status }, null, 2));
+        // Counters only: how full the upstream admission gate is (see
+        // upstream-fetch.js), never which origins or requests.
+        res.end(JSON.stringify({ ...extra, ...status, upstreamPool: upstreamPoolStatus() }, null, 2));
         return;
       }
 
@@ -958,6 +960,19 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         client,
         dimensions: Object.fromEntries(usageDimensions.map(d => [d.name, d.key])),
       });
+      // Everything forwardRequest waits on — the upstream admission queue, the
+      // upstream request itself, a quota-hold or rate-limit timer, a silent SSE
+      // read — is cancelled the moment the client goes away, so a departed
+      // client keeps neither an upstream slot nor a timer alive. Two closes are
+      // NOT departures and must never abort: the 'close' that follows a normal
+      // res.end() (writableEnded), and the one the proxy causes itself when it
+      // destroys the socket on a dead stream (ctx.proxyClosed) — that is the
+      // worst failure, not "the user left".
+      const requestAbort = new AbortController();
+      const onRequestClose = () => { if (!res.writableEnded && !ctx.proxyClosed) requestAbort.abort(clientGoneError()); };
+      ctx.signal = requestAbort.signal;
+      res.once('close', onRequestClose);
+      if (clientGone(res)) onRequestClose();
       try {
         await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir, sx);
       } catch (err) {
@@ -972,6 +987,11 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
           res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Internal proxy error' } }));
         }
       } finally {
+        res.off('close', onRequestClose);
+        // The signal fires only for a departure (see above), so this is the
+        // status of a row whose client will never read anything. It says
+        // nothing about abandonment: that is still marked where it is observed.
+        if (requestAbort.signal.aborted) ctx.status = 499;
         // null = record nothing: the client walked away (neither an answer nor a
         // starvation), or this was not a completion at all. Abandonment is
         // observed where it happens, never inferred here: the proxy destroys the
@@ -1108,6 +1128,27 @@ function recordEarlyOutcome(accountManager, sessionId, url, usable) {
  * `drain` or a `close` that has already happened and will not happen again, so
  * the handler never returns and its activity entry never closes.
  */
+// The reason a request's AbortSignal carries when the client went away. Every
+// wait in forwardRequest either resolves to a clientGone check or rejects with
+// this, and the catch recognises it by code.
+function clientGoneError() {
+  const err = new Error('client disconnected');
+  err.code = 'TEAMCLAUDE_CLIENT_GONE';
+  return err;
+}
+
+// A quota-hold / rate-limit sleep that a departed client does not sit out: the
+// timer is cleared the moment the request's signal aborts, so the request (and
+// its buffered body) is not retained for a retry nobody is waiting for.
+function waitForRetry(ms, signal) {
+  return new Promise(resolve => {
+    if (signal?.aborted) { resolve(); return; }
+    const finish = () => { clearTimeout(timer); signal?.removeEventListener('abort', finish); resolve(); };
+    const timer = setTimeout(finish, ms);
+    signal?.addEventListener('abort', finish, { once: true });
+  });
+}
+
 function clientGone(res) {
   return !!res.destroyed || !!res.stream?.destroyed;
 }
@@ -1858,7 +1899,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       const waitMs = Math.min(retryAfter * 1000, ctx.holdBudgetMs, 60_000);
       ctx.holdBudgetMs -= waitMs;
       console.log(`[TeamClaude] All accounts exhausted — holding connection, retry in ${Math.ceil(waitMs / 1000)}s (${Math.ceil(ctx.holdBudgetMs / 1000)}s budget left)`);
-      await new Promise(resolve => setTimeout(resolve, waitMs));
+      await waitForRetry(waitMs, ctx.signal);
       if (clientGone(res)) { ctx.abandoned = true; return; }
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
     }
@@ -1867,7 +1908,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     if (exhaustedRetries < 1 && retryAfter <= INLINE_RETRY_AFTER_MAX_SECONDS) {
       ctx.exhaustedRetries = exhaustedRetries + 1;
       console.log(`[TeamClaude] All accounts exhausted — waiting ${retryAfter}s before retry`);
-      await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
+      await waitForRetry(retryAfter * 1000, ctx.signal);
       if (clientGone(res)) { ctx.abandoned = true; return; }
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
     }
@@ -1990,6 +2031,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       upstreamRes = await upstreamFetch(upstreamUrl, {
         method,
         headers,
+        // Cancels the admission wait and the request itself when the client
+        // goes away (see the listener's AbortController).
+        signal: ctx.signal,
         body: ['GET', 'HEAD'].includes(method) ? undefined : sendBody,
         redirect: 'manual',
       }, sx, route);
@@ -2168,7 +2212,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         if (!ctx.rateLimitHopped && !ctx.requestScopedRetried && retryCount < maxRetries) {
           ctx.requestScopedRetried = true;
           console.log(`[TeamClaude] 429 with no rate-limit headers on "${account.name}" — retrying once in 2s${refusal ? ` (${safeLine(refusal)})` : ''}`);
-          await new Promise(resolve => setTimeout(resolve, 2000));
+          await waitForRetry(2000, ctx.signal);
           if (clientGone(res)) { ctx.abandoned = true; return; }
           return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, nextUseSx);
         }
@@ -2187,7 +2231,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // rate-limited account can't loop forever tying up the connection.
       if (retryAfter <= RATE_LIMIT_ABSORB_MAX_SECONDS && retryCount < maxRetries) {
         console.log(`[TeamClaude] Rate-limit 429 on "${account.name}" — waiting ${retryAfter}s, retrying same account (no switch)`);
-        await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
+        await waitForRetry(retryAfter * 1000, ctx.signal);
         if (clientGone(res)) { ctx.abandoned = true; return; }
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, nextUseSx);
       }
@@ -2347,11 +2391,41 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       ctx.delivered = answeredStatus(upstreamRes.status);
     }
   } catch (err) {
-    console.error(`[TeamClaude] Upstream error (account "${account.name}"):`, describeConnectError(err));
+    // Two of the things that can throw here are not upstream errors at all:
+    // the client left (the request's signal cancelled a wait or the request
+    // itself), and the proxy's own upstream admission gate turned the request
+    // away. Both still go through the log block below, so the request-log
+    // file is closed on every exit from this catch — they are only classified
+    // after it.
+    const clientLeft = err?.code === 'TEAMCLAUDE_CLIENT_GONE';
+    const overloaded = err?.code === 'TEAMCLAUDE_UPSTREAM_OVERLOADED';
+    if (clientLeft) console.log(`[TeamClaude] Client disconnected while waiting on "${account.name}" — upstream request cancelled`);
+    else if (overloaded) console.error(`[TeamClaude] Upstream admission queue full (${describeConnectError(err)}) — 503 to the client, no account rotation`);
+    else console.error(`[TeamClaude] Upstream error (account "${account.name}"):`, describeConnectError(err));
 
     logRequestHead();
     const l = getLog();
     if (l) { l.write(`\n\n=== ERROR ===\n${err.stack || err.message}`); l.end(); }
+
+    if (clientLeft) {
+      // Observed here, so marked here: neither an answer nor a starvation.
+      ctx.abandoned = true;
+      ctx.status = 499;
+      return;
+    }
+    if (overloaded) {
+      // Local saturation is not an account error: no failover (every account
+      // shares the same origin gate, and another attempt only adds load), no
+      // sidelining, and the row is not attributed to the account it never
+      // reached. A 503 with Retry-After lets the client back off briefly.
+      ctx.status = 503;
+      ctx.account = '(upstream queue full)';
+      if (!res.headersSent && !clientGone(res)) {
+        res.writeHead(503, { 'Content-Type': 'application/json', 'Retry-After': '1' });
+        res.end(JSON.stringify({ type: 'error', error: { type: 'overloaded_error', message: 'Proxy upstream queue is full; retry shortly.' } }));
+      }
+      return;
+    }
 
     // Would failing over dial anywhere else? Only an untried account pointing at
     // a different `upstream` makes that true, and it is what decides whether a
@@ -2394,6 +2468,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // cleanly. If headers were already sent (a mid-stream body timeout), destroy
     // is the only option — the client sees a broken response and retries.
     if (isTransient) {
+      ctx.proxyClosed = true;
       res.destroy();
       return;
     }
@@ -2424,6 +2499,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // classified transient: we can't send a status or fail over, and
       // streamResponse deliberately skipped res.end(). Destroy so the client
       // sees a broken response and retries instead of hanging on an open socket.
+      ctx.proxyClosed = true;
       res.destroy();
     }
   }
@@ -2470,8 +2546,17 @@ export function readWithIdleTimeout(reader, ms) {
 /**
  * Stream an SSE response to the client, parsing usage data along the way.
  */
-async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter, onUsage = null, sessionId = null, model = null) {
+export async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter, onUsage = null, sessionId = null, model = null) {
   const reader = webStream.getReader();
+  // A client that leaves while upstream is silent must not hold the pending
+  // read — and with it the upstream socket and its admission permit — until
+  // the idle watchdog fires: the clientGone check below runs only after a
+  // chunk. Cancelling the reader settles the pending read as done, and the
+  // loop exits through the same clientGone break. Optional-chained because
+  // tests drive this with a bare Writable.
+  const onClose = () => { reader.cancel().catch(() => {}); };
+  res.once?.('close', onClose);
+  if (clientGone(res)) onClose();
   const idleMs = resolveBodyIdleTimeout();
   const decoder = new TextDecoder();
   let sseBuffer = '';
@@ -2537,6 +2622,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
     errored = true;
     throw err;
   } finally {
+    res.off?.('close', onClose);
     // Record the message once, on every exit path. A stream that died after
     // `message_start` still spent the input it reported, so the merge is written
     // even when no `message_delta` ever arrived. An empty merge is written

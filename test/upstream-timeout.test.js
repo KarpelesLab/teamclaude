@@ -3,9 +3,24 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { once } from 'node:events';
 import { ReadableStream } from 'node:stream/web';
+import { Writable } from 'node:stream';
 import { TextEncoder, TextDecoder } from 'node:util';
 import { upstreamFetch } from '../src/upstream-fetch.js';
-import { readWithIdleTimeout } from '../src/server.js';
+import { readWithIdleTimeout, streamResponse } from '../src/server.js';
+
+// A client that leaves while the upstream is silent used to hold the pending
+// read (and the upstream socket) until the body-idle watchdog fired, because
+// the disconnect was only noticed after the next chunk. The relay now cancels
+// the reader on the client's 'close'.
+test('client disconnect cancels a silent upstream immediately, not at idle timeout', { timeout: 2000 }, async () => {
+  let cancelled = false;
+  const upstream = new ReadableStream({ cancel() { cancelled = true; } });
+  const client = new Writable({ write(chunk, enc, cb) { cb(); } });
+  const running = streamResponse(upstream, client, 0, { recordTokenUsage() {} });
+  client.destroy();
+  await Promise.race([running, new Promise((_, reject) => setTimeout(() => reject(new Error('disconnect did not cancel upstream')), 200))]);
+  assert.equal(cancelled, true);
+});
 
 // Bring up an HTTP server on an ephemeral port and hand back {server, port}.
 async function listen(handler) {
