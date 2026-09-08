@@ -1301,12 +1301,13 @@ test('path 3: the knob-on refresh with no advisor model reads no account past th
     'the refresh with no advisor model read an account past the incumbent and dropped its rate-limit clock');
 });
 
-test('path 3: the knob-on refresh reads no account the request excludes', () => {
+test('path 3: the knob-on refresh\'s advisor scan reads no account the request excludes', () => {
   // The two arms above assert the read for the guard's outer terms. This one
   // asserts it for the scan those terms gate, which looks for an account outside
   // the exclusion set that serves the advisor model: the exclusion test stands
   // ahead of the availability test, so the scan passes over an excluded account
   // without reading it.
+  // No other arm reds when that order swaps, so a prune here loses the guard.
   const past = Date.now() - 1000;
   const build = () => {
     const am = mgr(['cur', 'thr', 'ok'], { expiry: ON });
