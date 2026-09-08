@@ -530,7 +530,11 @@ export class AccountManager {
   pauseAccount(index, seconds) {
     const account = this.accounts[index];
     if (!account) return;
-    const until = Date.now() + Math.max(0, seconds) * 1000;
+    // A Retry-After that did not parse arrives as NaN, and Math.max(NaN, x) is
+    // NaN: pausedUntil and rampStartedAt would both go NaN, _rampCap would
+    // return NaN, and admit() would spin on `inFlight < NaN`. No number, no pause.
+    if (!Number.isFinite(seconds) || seconds <= 0) return;
+    const until = Date.now() + seconds * 1000;
     account.pausedUntil = Math.max(account.pausedUntil || 0, until);
     // Arm the ramp to begin when the pause ends: while paused, admit() holds on
     // the pause branch; once it lifts, _rampCap counts from here and releases the
@@ -2972,6 +2976,9 @@ export class AccountManager {
   markRateLimited(accountIndex, retryAfterSeconds) {
     const account = this.accounts[accountIndex];
     if (!account) return;
+    // Same guard as pauseAccount: a NaN hold would throttle the account with a
+    // rateLimitedUntil that never compares as expired.
+    if (!Number.isFinite(retryAfterSeconds) || retryAfterSeconds <= 0) return;
     account.status = 'throttled';
     account.rateLimitedUntil = Date.now() + (retryAfterSeconds * 1000);
     // Marks when the hold was (re-)armed: a revalidation probe is allowed only
