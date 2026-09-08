@@ -70,9 +70,15 @@ jobs:
 
       # Trusted Publishing (OIDC) needs npm >= 11.5.1. Upgrade so this works
       # regardless of which npm the runner image happens to ship.
+      #
+      # Pinned to an exact version rather than `npm@latest`: this is the one tool
+      # that receives our OIDC token and builds the tarball, so it must not be
+      # whatever the registry serves at run time. Dependabot does not track this
+      # line (only the `uses:` actions), so bump it by hand occasionally
+      # (`npm view npm version`); anything >= 11.5.1 keeps publishing working.
       - name: Upgrade npm for Trusted Publishing
         if: steps.check.outputs.publish == 'true'
-        run: npm install -g npm@latest
+        run: npm install -g npm@12.0.2
 
       - name: Publish to npm (Trusted Publishing via OIDC)
         if: steps.check.outputs.publish == 'true'
