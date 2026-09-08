@@ -729,7 +729,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       }
       // Client token refresh: pass through untouched (the proxy manages its own
       // tokens via ensureTokenFresh; rewriting client refreshes would conflict).
-      if (req.method === 'POST' && req.url === '/v1/oauth/token') { await relayRaw(req, res, upstream, sx); return; }
+      if (req.method === 'POST' && req.url === '/v1/oauth/token') { await relayRaw(req, res, upstream, sx, resolveMaxBodyBytes(config)); return; }
       // Remote Control (/v1/code/*) is bound to the session's paired claude.ai
       // identity — forward with the client's OWN credential (streamed), never a
       // rotated account token, which would 403 the worker event stream.
@@ -819,7 +819,19 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // frame — rather than waiting for the whole body and the request to finish.
       const bodyChunks = [];
       const modelFinder = new TopLevelFieldFinder('model');
+      const maxBodyBytes = resolveMaxBodyBytes(config);
+      let bodyBytes = 0;
       for await (const chunk of req) {
+        bodyBytes += chunk.length;
+        // Buffering is what makes retry possible, and also what lets one client
+        // hold as much memory as it cares to send. Past the cap, stop reading
+        // and say so; the request is torn down once the answer is out.
+        if (bodyBytes > maxBodyBytes) {
+          await refuseOversizedBody(req, res);
+          openEntry = null;   // this path owns the close below; the outer catch must not repeat it
+          if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: '(too large)', status: 413, model: modelFinder.done ? modelFinder.value : null, sessionId, pinned: pinnedIndex != null });
+          return;
+        }
         bodyChunks.push(chunk);
         if (!modelFinder.done) {
           const found = modelFinder.push(chunk);
@@ -1197,11 +1209,43 @@ export function relayUpgrade(req, socket, head, upstream, sx) {
 }
 
 /**
+ * Refuse a request whose body ran past the buffering cap.
+ *
+ * The 413 goes out first and the request is torn down only once it has been
+ * flushed. The order matters: destroying first races the answer off the
+ * socket, while merely ending the response makes Node drain (read and discard)
+ * the rest of the body, which is exactly the traffic the cap exists to stop.
+ * 'close' is raced against the flush so a client that has already gone away
+ * cannot hold the handler open waiting for a 'finish' that never comes.
+ * Mid-stream (headers already out) there is no status left to send.
+ */
+async function refuseOversizedBody(req, res) {
+  if (!res.headersSent) {
+    res.writeHead(413, { 'Content-Type': 'application/json' });
+    await new Promise((resolve) => {
+      res.once('close', resolve);
+      res.end(JSON.stringify({
+        type: 'error',
+        error: { type: 'invalid_request_error', message: 'Request body too large' },
+      }), resolve);
+    });
+  }
+  req.destroy();
+}
+
+/**
  * Relay a request to upstream with no header rewriting — pure passthrough.
  */
-async function relayRaw(req, res, upstream, sx) {
+async function relayRaw(req, res, upstream, sx, maxBodyBytes = DEFAULT_MAX_BODY_BYTES) {
   const bodyChunks = [];
-  for await (const chunk of req) bodyChunks.push(chunk);
+  let bodyBytes = 0;
+  for await (const chunk of req) {
+    bodyBytes += chunk.length;
+    // Same cap as the forward path: this buffers too, and a token exchange is
+    // a few hundred bytes.
+    if (bodyBytes > maxBodyBytes) { await refuseOversizedBody(req, res); return; }
+    bodyChunks.push(chunk);
+  }
   const body = Buffer.concat(bodyChunks);
 
   try {
@@ -1269,6 +1313,23 @@ export function resolveLogMaxBodyBytes(config) {
   const max = typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : raw;
   if (max === 0) return 0;
   return Number.isFinite(max) && max > 0 ? max : DEFAULT_LOG_MAX_BODY_BYTES;
+}
+
+// Cap on a buffered request body. The forward path buffers the whole body so
+// it can be resent on another account after a 429; without a cap, one client
+// holds as much of the proxy's memory as it cares to send. 64 MiB sits
+// comfortably above the largest legitimate request — a 1M-token context is a
+// few MiB of text, and the API bounds inline images and PDFs well below this —
+// so nothing real is refused. `proxy.maxBodyBytes` overrides it; 0 opts out.
+export const DEFAULT_MAX_BODY_BYTES = 64 * 1024 * 1024;
+
+export function resolveMaxBodyBytes(config) {
+  const raw = config?.proxy?.maxBodyBytes;
+  // Same reading rules as resolveLogMaxBodyBytes: a quoted number counts, a
+  // blank string means unset, and 0 is the explicit opt-out.
+  const max = typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : raw;
+  if (max === 0) return Infinity;
+  return Number.isFinite(max) && max > 0 ? max : DEFAULT_MAX_BODY_BYTES;
 }
 
 // The names openRequestLog writes, and nothing else. Deletion keys off this
