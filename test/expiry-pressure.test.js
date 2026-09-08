@@ -776,6 +776,8 @@ test('two providers and no pin at all still persist the switch', () => {
   am.providerCursors.set(DEFAULT_PROVIDER, ixOf('cur'));
 
   const served = am.getActiveAccount(null, OPUS, null, null, DEFAULT_PROVIDER);
+  // Served and `walked` are the same account here, so both branches of the
+  // ternary give the same index. The arm guards the steady state alone.
   assert.equal(served.name, 'R', 'the walk must return the switch destination itself, or the arm tests nothing');
   assert.equal(am.accounts[am.providerCursors.get(DEFAULT_PROVIDER)]?.name, 'R',
     'a borrowed walk that returned the destination still lost it');
@@ -829,11 +831,11 @@ test('a provider with no cursor yet is not given another provider\'s account', (
   am.recordSession('S-2', ixOf('a2'), OPUS);
 
   const served = am.getActiveAccount(null, OPUS, null, 'S-2', DEFAULT_PROVIDER);
+  // This arm holds the ternary's provider check: the cursor may not take an
+  // account this provider's own re-seed would refuse.
   assert.equal(served.name, 'a2', 'the session pin must serve this request, or the arm tests nothing');
   assert.equal(am.accounts[am.providerCursors.get(DEFAULT_PROVIDER)]?.name, 'a2',
     'a provider whose first request was pinned was left with no cursor of its own');
-  assert.notEqual(am.accounts[am.providerCursors.get(DEFAULT_PROVIDER)]?.name, 'codex',
-    'the Anthropic cursor names an account on another provider, which its own re-seed refuses');
 });
 
 test('a pinned return leaves the provider\'s cursor where its traffic rests', () => {
