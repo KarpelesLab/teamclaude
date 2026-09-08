@@ -310,17 +310,26 @@ test('prober never sends a third-party key to the Anthropic usage endpoint', asy
   ], 0.98);
   const probed = [];
   const probeFn = async (token) => { probed.push(token); return { fiveHour: { utilization: 0.1, resetAt: 1 } }; };
-  await new Prober(am, { intervalMs: 0, probeFn, log: () => {} }).probeAll();
+  // The DeepSeek backend publishes its own quota, so it IS a probe target now —
+  // of the backend read, which must go to its own host and never to Anthropic.
+  // Stubbed: the real read would leave the test suite for the network.
+  const backendRead = [];
+  const backendFn = async (account) => { backendRead.push(account.name); return { error: 'stub' }; };
+  await new Prober(am, { intervalMs: 0, probeFn, backendFn, log: () => {} }).probeAll();
 
   assert.deepEqual(probed, ['t-claude']);
+  assert.deepEqual(backendRead, ['deepseek']);
   // …and the backend's own quota is left untouched rather than recorded as an error.
   assert.equal(am.accounts[1].quota.unified5h, null);
 });
 
 test('a third-party backend reads not-applicable, not a pending probe', () => {
+  // A backend whose provider publishes nothing (see backend-quota.js). One that
+  // DOES publish is probeable and reads `never` until its first cycle — covered
+  // in backend-quota.test.js.
   const am = new AccountManager([
     oauth('claude'),
-    { ...oauth('deepseek'), upstream: 'https://api.deepseek.com/anthropic' },
+    { ...oauth('other'), upstream: 'https://api.example.invalid/anthropic' },
   ], 0.98);
   const rows = new Prober(am, { intervalMs: 300_000, log: () => {} }).getStatus().accounts;
   assert.equal(rows[0].status, 'never');            // probed, just not yet

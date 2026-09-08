@@ -132,6 +132,20 @@ The mark stays inside the bar rather than widening it, so capped and uncapped ro
 
 Edits apply live on config reload — no restart.
 
+## Third-party backend quota
+
+A [third-party backend account](accounts.md#third-party-backend-accounts) has no Anthropic quota, so its bars read `unknown`. Where the provider publishes a figure of its own, the probe reads it on the same schedule and status shows it:
+
+```
+  deepseek (oauth, prio 200) active
+  Balance  $25.81
+  Probe    ok 2m ago, 210ms
+```
+
+The reading is normalized to `{ label, text, utilization }`. A provider that reports a 0-1 fraction gets a bar like any other bucket; one that reports money or credits shows its text. A provider that publishes nothing keeps reading `unknown` — nothing is invented.
+
+Provider support lives entirely in `src/backend-quota.js`, matched by the host of the account's `upstream`. Adding one is a single entry there (a path and a parse function); the prober, the quota field and the renderer never name a provider. DeepSeek is supported today.
+
 ## Hold on exhaustion
 
 By default, when all accounts are exhausted TeamClaude returns a `429` immediately, which causes Claude Code to abort the current task. With `holdSeconds` set, the proxy **holds the HTTP connection open** instead and polls silently every ~60 seconds; the instant any account's quota resets, the request is forwarded and Claude Code resumes — the interruption never happens.

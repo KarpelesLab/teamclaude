@@ -70,6 +70,9 @@ function emptyQuota() {
     unified7dSonnetSeenAt: null,
     unified7dFableSeenAt: null,
     unifiedStatus: null,        // allowed | allowed_warning | rejected
+    // Normalized reading from a third-party backend (see backend-quota.js).
+    // { label, text, utilization, at } — nothing here knows which provider.
+    backend: null,
     unifiedStatusSeenAt: null,  // ms timestamp of the response that reported it
     // Every model-scoped weekly bucket the usage endpoint named, keyed by its
     // own display_name (lowercased): { fable: { utilization, resetAt }, ... }.
@@ -2887,6 +2890,17 @@ export class AccountManager {
     for (const field of ['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro']) {
       if (profile[field] != null) account[field] = profile[field];
     }
+  }
+
+  /**
+   * Store a backend account's own quota reading (see backend-quota.js). Kept
+   * separate from the unified buckets: those are Anthropic's utilization model,
+   * while this is whatever the provider publishes about itself.
+   */
+  applyBackendQuota(accountIndex, reading) {
+    const account = this.accounts[accountIndex];
+    if (!account || !reading || reading.error) return;
+    account.quota.backend = reading;
   }
 
   /**
