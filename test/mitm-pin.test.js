@@ -98,7 +98,7 @@ test('the Basic username selects the account', () => {
   // No key configured — username alone still pins.
   assert.deepEqual(resolveConnectPin({ headers: { 'proxy-authorization': basic('personal:') } }, am, null), { pin: 'personal', error: null });
   // A rotation index is not a pin form — array position moves under deletion.
-  assert.deepEqual(resolveConnectPin({ headers: { 'proxy-authorization': basic('1:') } }, am, null), { pin: null, error: 'Unknown account pin "1"' });
+  assert.deepEqual(resolveConnectPin({ headers: { 'proxy-authorization': basic('1:') } }, am, null), { pin: null, error: 'Unknown account pin "1…" (1 chars)' });
 });
 
 // The documented remote form is `--proxy http://<key>@host:port`, which puts the
@@ -117,7 +117,10 @@ test('an unknown username is an error rather than an ignored pin', () => {
   const am = { accounts: [{ name: 'work' }] };
   const { pin, error } = resolveConnectPin({ headers: { 'proxy-authorization': basic('typo:') } }, am, 'secret');
   assert.equal(pin, null);
-  assert.match(error, /Unknown account pin "typo"/);
+  // The username slot can carry a secret (`http://<key>@proxy`), so the log gets
+  // enough to spot a typo — a prefix and the length — and never the whole value.
+  assert.match(error, /Unknown account pin "ty…" \(4 chars\)/);
+  assert.doesNotMatch(error, /typo/);
 });
 
 test('no header, or a Bearer key, yields no pin', () => {

@@ -23,6 +23,7 @@ import { generateCertChain } from './x509.js';
 import { createProxyRequestListener, resolveClientAuth, isLoopbackAddr, relayUpgrade, resolveAccountPin, describeConnectError } from './server.js';
 import { interceptHostsFor, isNeverIntercepted } from './provider.js';
 import { forwardRefusal, guardedLookup, FORBIDDEN_FORWARD } from './forward-target.js';
+import { safeLine } from './safe-text.js';
 
 const CA_CERT = 'teamclaude-ca.pem';
 const LEAF_CERT = 'teamclaude-leaf.pem';
@@ -412,9 +413,20 @@ export function resolveConnectPin(req, accountManager, proxyConfig) {
     return { pin: null, error: null };
   }
   if (resolveAccountPin(accountManager, token) == null) {
-    return { pin: null, error: `Unknown account pin "${token}"` };
+    return { pin: null, error: `Unknown account pin ${redactToken(token)}` };
   }
   return { pin: token, error: null };
+}
+
+// An unrecognized CONNECT username reaches the log, and it is not necessarily a
+// typo'd account name: HTTPS_PROXY=http://<secret>@host:port is the documented
+// remote form, so a wrong key — or some other tool's credential inherited from
+// the environment — would be written out verbatim. Enough to spot the typo
+// (first two characters, length), stripped of anything that could forge a log
+// line, and never the whole value.
+function redactToken(token) {
+  const s = String(token);
+  return `"${safeLine(s.slice(0, 2), 2)}…" (${s.length} chars)`;
 }
 
 /**
