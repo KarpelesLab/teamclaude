@@ -3626,18 +3626,12 @@ export class AccountManager {
     // against whichever account inherited the slot; its held roll the same.
     const moved = this._currentObs?.idx == null ? null : remap(this._currentObs.idx);
     if (this._currentObs) {
+      // Renumbering is nobody's success, and it names the same account by a new
+      // index, so everything but the two indices survives the shift: the stamp
+      // saying whose reading this is, and the gen a request already in flight
+      // against that account still confirms its stay on.
       this._currentObs = moved == null ? null
-        : {
-          idx: moved,
-          windows: this._currentObs.windows,
-          unescaped: remapHeld(this._currentObs.unescaped, remap),
-          // Renumbering is not a fleet establishing a reading, so the stamp that
-          // says whose reading this is survives the shift like the reading does.
-          provider: this._currentObs.provider,
-          // Renumbering names the same account by a new index, so a request
-          // already in flight against it still confirms the stay it selected on.
-          gen: this._currentObs.gen,
-        };
+        : { ...this._currentObs, idx: moved, unescaped: remapHeld(this._currentObs.unescaped, remap) };
     }
     // A throttle key names an account by index, so the shift would point a live
     // entry at a different account. Not worth renumbering: the entries expire in
