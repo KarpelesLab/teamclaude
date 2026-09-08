@@ -656,7 +656,10 @@ async function serverCommand() {
 // ── import ──────────────────────────────────────────────────
 
 async function importCommand() {
-  const config = await loadOrCreateConfig();
+  // First-run entry point: the file has to exist (and the egress proxy be
+  // applied) before anything reaches the network. The list is not written back
+  // from this copy — upsertOAuthAccount re-reads the file when it saves.
+  await loadOrCreateConfig();
 
   let name = argValue('--name');
   const jsonStr = argValue('--json');
@@ -691,7 +694,7 @@ async function importCommand() {
     }
   }
 
-  await upsertOAuthAccount(config, name, creds, 'import');
+  await upsertOAuthAccount(name, creds, 'import');
 }
 
 // ── login ───────────────────────────────────────────────────
@@ -706,8 +709,9 @@ async function importCommand() {
  */
 async function loginCodexCommand() {
   // loadOrCreateConfig, not loadConfig: `login` is a first-run entry point and
-  // must work before any config file exists.
-  const config = await loadOrCreateConfig();
+  // must work before any config file exists. This copy is not what gets
+  // written — see the atomicConfigUpdate below.
+  await loadOrCreateConfig();
   let creds;
   try {
     creds = await loginCodex({ noBrowser: args.includes('--no-browser') });
@@ -720,37 +724,42 @@ async function loginCodexCommand() {
     process.exit(1);
   }
 
-  const name = argValue('--name') || creds.email
-    || `codex-${config.accounts.filter(a => a.provider === 'codex').length + 1}`;
+  // The browser flow above can take minutes, and a running server may have
+  // rotated another account's refresh token on disk in the meantime. Writing
+  // the copy loaded before the flow would put the dead token back, and that
+  // account would fail on its next restart. So the upsert runs against a fresh
+  // read of the file, and only this account's row is touched.
+  await atomicConfigUpdate(config => {
+    const name = argValue('--name') || creds.email
+      || `codex-${config.accounts.filter(a => a.provider === 'codex').length + 1}`;
 
-  const account = {
-    name,
-    type: 'oauth',
-    provider: 'codex',
-    source: 'login',
-    accountId: creds.accountId,
-    accessToken: creds.accessToken,
-    refreshToken: creds.refreshToken,
-    expiresAt: creds.expiresAt,
-  };
+    const account = {
+      name,
+      type: 'oauth',
+      provider: 'codex',
+      source: 'login',
+      accountId: creds.accountId,
+      accessToken: creds.accessToken,
+      refreshToken: creds.refreshToken,
+      expiresAt: creds.expiresAt,
+    };
 
-  // Identity for a Codex account is its ChatGPT account id; fall back to the
-  // display name when upstream did not supply one.
-  const idx = config.accounts.findIndex(a => (
-    a.provider === 'codex' && (
-      (account.accountId && a.accountId === account.accountId) || a.name === account.name
-    )
-  ));
-  if (idx >= 0) {
-    const prev = config.accounts[idx];
-    config.accounts[idx] = { ...prev, ...account, name: prev.name };
-    console.log(`Updated account "${prev.name}"`);
-  } else {
-    config.accounts.push(account);
-    console.log(`Added account "${account.name}"${creds.planType ? ` (${creds.planType})` : ''}`);
-  }
-
-  await saveConfig(config);
+    // Identity for a Codex account is its ChatGPT account id; fall back to the
+    // display name when upstream did not supply one.
+    const idx = config.accounts.findIndex(a => (
+      a.provider === 'codex' && (
+        (account.accountId && a.accountId === account.accountId) || a.name === account.name
+      )
+    ));
+    if (idx >= 0) {
+      const prev = config.accounts[idx];
+      config.accounts[idx] = { ...prev, ...account, name: prev.name };
+      console.log(`Updated account "${prev.name}"`);
+    } else {
+      config.accounts.push(account);
+      console.log(`Added account "${account.name}"${creds.planType ? ` (${creds.planType})` : ''}`);
+    }
+  });
   console.log(`Saved to ${getConfigPath()}`);
 }
 
@@ -823,7 +832,7 @@ async function loginApiCommand() {
 }
 
 async function loginOAuthCommand({ pasteOnly = false } = {}) {
-  const config = await loadOrCreateConfig();
+  await loadOrCreateConfig(); // first run: create the file; the save re-reads it
   let name = argValue('--name');
 
   console.log('Starting OAuth login...');
@@ -839,7 +848,7 @@ async function loginOAuthCommand({ pasteOnly = false } = {}) {
     process.exit(1);
   }
 
-  await upsertOAuthAccount(config, name, creds, 'login');
+  await upsertOAuthAccount(name, creds, 'login');
 }
 
 // ── env ─────────────────────────────────────────────────────
@@ -1167,8 +1176,12 @@ async function accountsCommand() {
     return;
   }
 
+  // Both writes below pair rows by entry id against a fresh read of the file,
+  // so a file written before ids existed needs its ids on disk first.
+  await persistMintedAccountIds(config);
+
   // Refresh expired tokens before fetching profiles
-  let configDirty = false;
+  const refreshed = [];
   await Promise.all(config.accounts.map(async (a) => {
     if (a.type !== 'oauth' || !a.refreshToken) return;
     if (!isTokenExpiringSoon(a.expiresAt)) return;
@@ -1177,12 +1190,26 @@ async function accountsCommand() {
       a.accessToken = newTokens.accessToken;
       a.refreshToken = newTokens.refreshToken;
       a.expiresAt = newTokens.expiresAt;
-      configDirty = true;
+      refreshed.push(a);
     } catch {
       // refresh failed — fetchProfile will report the specific error
     }
   }));
-  if (configDirty) await saveConfig(config);
+  // Only the refreshed rows are written, each onto the on-disk row with its id.
+  // Saving the whole in-memory list here would put back whatever a running
+  // server rotated on disk since the load — a refresh token that is now dead,
+  // and an account lost on its next restart.
+  if (refreshed.length > 0) {
+    await atomicConfigUpdate(disk => {
+      for (const a of refreshed) {
+        const i = findConfigAccount(disk, a);
+        if (i < 0) continue; // no row of its own; any other row would be another account's
+        disk.accounts[i].accessToken = a.accessToken;
+        disk.accounts[i].refreshToken = a.refreshToken;
+        disk.accounts[i].expiresAt = a.expiresAt;
+      }
+    });
+  }
 
   // Fetch profiles in parallel for all OAuth accounts
   const profiles = await Promise.all(
@@ -1196,16 +1223,18 @@ async function accountsCommand() {
   // account, not a duplicate. Keep the last (most recently added) entry.
   const seen = new Map();
   let removed = 0;
-  let touched = false;
+  // Which entries changed, by id, so the write below touches only those rows.
+  const touchedIds = new Set();
+  const removedIds = new Set();
   for (let i = config.accounts.length - 1; i >= 0; i--) {
     const a = config.accounts[i];
     const p = profiles[i];
     if (p && !p.error) {
-      if (p.accountUuid && a.accountUuid !== p.accountUuid) { a.accountUuid = p.accountUuid; touched = true; }
-      if (p.orgUuid && a.orgUuid !== p.orgUuid) { a.orgUuid = p.orgUuid; touched = true; }
-      if (p.orgName && a.orgName !== p.orgName) { a.orgName = p.orgName; touched = true; }
+      if (p.accountUuid && a.accountUuid !== p.accountUuid) { a.accountUuid = p.accountUuid; touchedIds.add(a.id); }
+      if (p.orgUuid && a.orgUuid !== p.orgUuid) { a.orgUuid = p.orgUuid; touchedIds.add(a.id); }
+      if (p.orgName && a.orgName !== p.orgName) { a.orgName = p.orgName; touchedIds.add(a.id); }
       for (const field of ['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro']) {
-        if (p[field] != null && a[field] !== p[field]) { a[field] = p[field]; touched = true; }
+        if (p[field] != null && a[field] !== p[field]) { a[field] = p[field]; touchedIds.add(a.id); }
       }
     }
     const uuid = a.accountUuid;
@@ -1215,7 +1244,7 @@ async function accountsCommand() {
       config.accounts.splice(i, 1);
       profiles.splice(i, 1);
       removed++;
-      touched = true;
+      removedIds.add(a.id);
     } else {
       seen.set(key, i);
     }
@@ -1233,10 +1262,24 @@ async function accountsCommand() {
     const email = (p && !p.error && p.email) ? p.email : null;
     if (!email) continue;
     const newName = orgCount.get(a.accountUuid) > 1 ? `${email} (${orgLabel(a)})` : email;
-    if (a.name !== newName) { a.name = newName; touched = true; }
+    if (a.name !== newName) { a.name = newName; touchedIds.add(a.id); }
   }
 
-  if (touched) await saveConfig(config);
+  // Same discipline as the token write: drop the duplicates by id and copy the
+  // profile fields onto the touched rows only, leaving every other row — and
+  // every other field of these rows — as it is on disk.
+  if (touchedIds.size > 0 || removedIds.size > 0) {
+    const fields = ['name', 'accountUuid', 'orgUuid', 'orgName', 'organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro'];
+    await atomicConfigUpdate(disk => {
+      disk.accounts = disk.accounts.filter(d => !removedIds.has(d?.id));
+      for (const a of config.accounts) {
+        if (!touchedIds.has(a.id)) continue;
+        const i = findConfigAccount(disk, a);
+        if (i < 0) continue;
+        for (const f of fields) if (a[f] !== undefined) disk.accounts[i][f] = a[f];
+      }
+    });
+  }
   if (removed > 0) console.log(`Removed ${removed} duplicate account(s)\n`);
 
   for (const [i, a] of config.accounts.entries()) {
@@ -1983,7 +2026,7 @@ function orgLabel(a) {
   return a.orgName || (a.orgUuid ? a.orgUuid.slice(0, 8) : 'org');
 }
 
-async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
+async function upsertOAuthAccount(name, creds, source = 'unknown') {
   // Fetch profile to auto-name and deduplicate by account+org identity.
   const userNamed = !!name;
   const profile = await fetchProfile(creds.accessToken);
@@ -2003,56 +2046,64 @@ async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
     const tier = profile.hasClaudeMax ? 'Max' : profile.hasClaudePro ? 'Pro' : null;
     if (tier) console.log(`Detected Claude ${tier} account: ${profile.email}`);
   }
-  if (!name) {
-    const n = config.accounts.filter(a => a.name.startsWith('account-')).length + 1;
-    name = `account-${n}`;
-  }
-
-  const account = {
-    name,
-    type: 'oauth',
-    source,
-    ...oauthIdentityFields(profile),
-    organizationType: profile?.organizationType || null,
-    rateLimitTier: profile?.rateLimitTier || creds.rateLimitTier || null,
-    seatTier: profile?.seatTier || null,
-    hasClaudeMax: profile?.hasClaudeMax ?? null,
-    hasClaudePro: profile?.hasClaudePro ?? null,
-    accessToken: creds.accessToken,
-    refreshToken: creds.refreshToken,
-    expiresAt: creds.expiresAt,
-  };
-
-  // Deduplicate by account+org identity (same email in a different org is a
-  // distinct account), then by name — but only where the name is not standing in
-  // for a different account+org, which is exactly the multi-org case below.
-  const idx = findUpsertTarget(config.accounts, account);
-
-  if (idx >= 0) {
-    // Same account+org: refresh credentials and org info, but keep the existing
-    // display name, entry id, and any disk-only fields (e.g. importFrom).
-    const prev = config.accounts[idx];
-    config.accounts[idx] = updateAccountEntry(prev, account);
-    console.log(`Updated account "${prev.name}"`);
-  } else {
-    // New org for this person: if another entry shares the accountUuid, the bare
-    // email name would collide — disambiguate both with " (org)".
-    if (!userNamed && account.accountUuid) {
-      const collisions = config.accounts.filter(
-        a => a.accountUuid === account.accountUuid && !sameIdentity(a, account)
-      );
-      if (collisions.length > 0) {
-        for (const c of collisions) {
-          if (!c.name.includes(' (')) c.name = `${c.name} (${orgLabel(c)})`;
-        }
-        account.name = `${name} (${orgLabel(account)})`;
-      }
+  // The login or import that produced `creds` ran between the caller's config
+  // load and this save — a browser flow can take minutes — and a running server
+  // may have rotated another account's refresh token on disk meanwhile. Saving
+  // a copy loaded before that would put the dead token back, and the account
+  // would fail on its next restart. So the whole upsert runs against a fresh
+  // read of the file: only this account's row (and, in the multi-org case, the
+  // display name of its namesakes) changes; every other row stays as it is on
+  // disk.
+  const config = await atomicConfigUpdate(config => {
+    if (!name) {
+      const n = config.accounts.filter(a => a.name.startsWith('account-')).length + 1;
+      name = `account-${n}`;
     }
-    config.accounts.push(account);
-    console.log(`Added account "${account.name}"`);
-  }
 
-  await saveConfig(config);
+    const account = {
+      name,
+      type: 'oauth',
+      source,
+      ...oauthIdentityFields(profile),
+      organizationType: profile?.organizationType || null,
+      rateLimitTier: profile?.rateLimitTier || creds.rateLimitTier || null,
+      seatTier: profile?.seatTier || null,
+      hasClaudeMax: profile?.hasClaudeMax ?? null,
+      hasClaudePro: profile?.hasClaudePro ?? null,
+      accessToken: creds.accessToken,
+      refreshToken: creds.refreshToken,
+      expiresAt: creds.expiresAt,
+    };
+
+    // Deduplicate by account+org identity (same email in a different org is a
+    // distinct account), then by name — but only where the name is not standing in
+    // for a different account+org, which is exactly the multi-org case below.
+    const idx = findUpsertTarget(config.accounts, account);
+
+    if (idx >= 0) {
+      // Same account+org: refresh credentials and org info, but keep the existing
+      // display name, entry id, and any disk-only fields (e.g. importFrom).
+      const prev = config.accounts[idx];
+      config.accounts[idx] = updateAccountEntry(prev, account);
+      console.log(`Updated account "${prev.name}"`);
+    } else {
+      // New org for this person: if another entry shares the accountUuid, the bare
+      // email name would collide — disambiguate both with " (org)".
+      if (!userNamed && account.accountUuid) {
+        const collisions = config.accounts.filter(
+          a => a.accountUuid === account.accountUuid && !sameIdentity(a, account)
+        );
+        if (collisions.length > 0) {
+          for (const c of collisions) {
+            if (!c.name.includes(' (')) c.name = `${c.name} (${orgLabel(c)})`;
+          }
+          account.name = `${name} (${orgLabel(account)})`;
+        }
+      }
+      config.accounts.push(account);
+      console.log(`Added account "${account.name}"`);
+    }
+  });
   console.log(`Saved to ${getConfigPath()}`);
   await notifyRunningServer(config);
 }
