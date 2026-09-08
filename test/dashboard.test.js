@@ -6,7 +6,7 @@ import { createProxyServer } from '../src/server.js';
 import {
   renderDashboardHtml, scopedWeeklyRows, accountTokens,
   sessionRows, filterSessionRows, sortRows, uniqSorted,
-  switchRequest, switchOutcome, routeRows,
+  switchRequest, switchOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
 } from '../src/dashboard.js';
 
 function listen(server) {
@@ -256,11 +256,145 @@ test('a fleet with no routes renders no section', () => {
   assert.deepEqual(routeRows(null), []);
 });
 
+// Built from a REAL getStatus() rather than a hand-written object: a previous
+// version of this banner was validated against a payload the server can never
+// emit, and the impossible fixture hid a false positive.
+function fleetStatus(mutate) {
+  const am = new AccountManager([
+    { name: 'a', type: 'api_key', apiKey: 'sk-a' },
+    { name: 'b', type: 'api_key', apiKey: 'sk-b' },
+  ], 0.98);
+  mutate?.(am);
+  return am.getStatus({ sessionDetail: true });
+}
+/** Drive a session to `n` consecutive no-answer outcomes on a real tracker. */
+function starve(am, id, n, client = 'alice') {
+  for (let i = 0; i < n; i++) {
+    am.beginSession(id, { client, dimensions: {} });
+    am.endSession(id, false);
+  }
+}
+
+test('a starving session is named, and a working one is not', () => {
+  const named = problems(fleetStatus(am => starve(am, 'deadbeef1234', STARVED_MIN)));
+  assert.equal(named.length, 1);
+  assert.equal(named[0].kind, 'starved-session');
+  assert.equal(named[0].severity, 'bad');
+  assert.match(named[0].text, /alice's session deadbeef/);
+  assert.match(named[0].text, new RegExp(`${STARVED_MIN} requests in a row`));
+
+  // One usable answer clears the streak — the session is working again.
+  assert.deepEqual(problems(fleetStatus(am => {
+    starve(am, 'deadbeef1234', STARVED_MIN);
+    am.beginSession('deadbeef1234'); am.endSession('deadbeef1234', true);
+  })), []);
+  // Literals, not STARVED_MIN: written in terms of the constant, these passed
+  // with the threshold set to 1 (fires on a single failure) and to 20 (never
+  // fires). The value is part of the behaviour, so the test has to name it.
+  assert.deepEqual(problems(fleetStatus(am => starve(am, 'deadbeef1234', 4))), [], 'four in a row is a wobble');
+  assert.equal(problems(fleetStatus(am => starve(am, 'deadbeef1234', 5))).length, 1, 'five is an alarm');
+  // A brand-new session, and a fleet doing nothing.
+  assert.deepEqual(problems(fleetStatus(am => am.beginSession('fresh1234', { client: 'bob' }))), []);
+  assert.deepEqual(problems(fleetStatus()), []);
+});
+
+test('a session that starved and then went quiet stops being reported', () => {
+  const am = new AccountManager([{ name: 'a', type: 'api_key', apiKey: 'sk-a' }], 0.98);
+  starve(am, 'deadbeef1234', 9);
+  assert.equal(problems(am.getStatus({ sessionDetail: true })).length, 1, 'reported while it is trying');
+  // Past the active window: the row survives in items[] with its streak intact,
+  // and only `active` keeps it out of the banner — deleting that filter passed
+  // every other test in this file.
+  const rec = am.sessionTracker.sessions.get('deadbeef1234');
+  rec.lastSeen -= 5 * 60 * 1000;
+  rec.inFlight = 0;
+  const detailed = am.getStatus({ sessionDetail: true });
+  assert.equal(detailed.sessions.items[0].starved, 9, 'the streak is still on the record');
+  assert.deepEqual(problems(detailed), [], 'but a session that stopped trying is not starving');
+  assert.deepEqual(problems(am.getStatus()), [], 'and the aggregate has cleared too');
+});
+
+test('many starving sessions are capped, worst first, with the rest counted', () => {
+  const am = new AccountManager([{ name: 'a', type: 'api_key', apiKey: 'sk-a' }], 0.98);
+  const depth = { aaaaaaaa1111: 5, bbbbbbbb2222: 9, cccccccc3333: 6, dddddddd4444: 7, eeeeeeee5555: 8 };
+  for (const [id, n] of Object.entries(depth)) starve(am, id, n, id.slice(0, 3));
+  const out = problems(am.getStatus({ sessionDetail: true }));
+  assert.equal(out.length, STARVED_LIST_MAX + 1, 'capped, plus one summary line');
+  // Worst first — items[] arrives sorted by recency, which is a different order.
+  assert.match(out[0].text, /bbbbbbbb/);
+  assert.match(out[1].text, /eeeeeeee/);
+  assert.match(out[2].text, /dddddddd/);
+  assert.equal(out[3].kind, 'starved-more');
+  assert.match(out[3].text, new RegExp(`and ${5 - STARVED_LIST_MAX} more`));
+});
+
+test('when the whole fleet is stalled the banner says so instead of blaming the session', () => {
+  const am = new AccountManager([{ name: 'a', type: 'api_key', apiKey: 'sk-a' }], 0.98);
+  am.accounts[0].quota.unified5h = 0.99;              // over the switch threshold
+  starve(am, 'deadbeef1234', 5);
+  const out = problems(am.getStatus({ sessionDetail: true }));
+  assert.equal(out.length, 1);
+  assert.match(out[0].text, /every account is over its quota threshold/);
+  assert.doesNotMatch(out[0].text, /it is failing, not idle/);
+});
+
+test('without sessionDetail the banner still fires, unnamed', () => {
+  const am = new AccountManager([{ name: 'a', type: 'api_key', apiKey: 'sk-a' }], 0.98);
+  starve(am, 'deadbeef1234', STARVED_MIN);
+  const hidden = am.getStatus();               // sessionDetail off — no items[]
+  assert.equal('items' in hidden.sessions, false);
+  const out = problems(hidden);
+  assert.equal(out.length, 1);
+  assert.equal(out[0].kind, 'starved-session');
+  assert.match(out[0].text, /proxy.sessionDetail/);
+  // And it is not doubled when both the row and the aggregate are available.
+  assert.equal(problems(am.getStatus({ sessionDetail: true })).length, 1);
+});
+
+test('only the account states that need a person are reported', () => {
+  // These clear themselves — rotation and back-off working.
+  // `status = 'exhausted'` is never assigned anywhere in src/, so a fixture that
+  // sets it proves nothing. These four are all reachable.
+  for (const quiet of [
+    am => am.markRateLimited(0, 60),
+    am => am.markEntitlementDenied(0),
+    am => { am.accounts[0].maxUsage = 0.5; am.accounts[0].quota.unified5h = 0.9; },
+    am => { am.accounts[0].quota.unifiedStatus = 'rejected'; am.accounts[0].quota.unifiedStatusSeenAt = Date.now(); },
+  ]) assert.deepEqual(problems(fleetStatus(quiet)), [], 'self-clearing state must stay silent');
+
+  // These do not.
+  const broken = problems(fleetStatus(am => { am.accounts[0].status = 'error'; }));
+  assert.deepEqual(broken.map(p => p.kind), ['account']);
+  assert.match(broken[0].text, /re-login/);
+  const off = problems(fleetStatus(am => am.setDisabled(0, true)));
+  assert.deepEqual(off.map(p => p.kind), ['account']);
+  assert.match(off[0].text, /disabled/);
+});
+
+test('overage spend is not a banner line', () => {
+  // usedMinor is month-to-date, so once overage is switched on this would be lit
+  // for most of the month. The account card and `teamclaude status` carry it,
+  // with the amount, which the banner did not.
+  assert.deepEqual(problems(fleetStatus(am => { am.accounts[0].quota.spend = { enabled: true, usedMinor: 250 }; })), []);
+});
+
+test('the serialized helpers run in the page\'s own scope, not just parse', () => {
+  // Parsing and grepping both pass for a helper that closes over a module
+  // constant the page never ships — it would ReferenceError at first render.
+  // Evaluate ONLY the serialized bundle and call into it.
+  const html = renderDashboardHtml();
+  const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
+  const bundle = script.slice(script.indexOf('var STARVED_MIN'), script.indexOf('function el('));
+  const isolated = new Function(`${bundle}; return problems;`)();
+  const payload = { sessions: { items: [{ id: 'deadbeef1234', client: 'alice', active: true, starved: 9, requests: 9, pins: {}, tokens: {} }] } };
+  assert.deepEqual(isolated(payload), problems(payload), 'the page runs what the tests exercise');
+});
+
 test('the page ships the same helper implementations it is tested against', () => {
   // The serialization is the contract: if a helper stops being self-contained
   // (closes over module scope), the page would silently ReferenceError.
   const html = renderDashboardHtml();
-  for (const fn of [scopedWeeklyRows, accountTokens, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, routeRows]) {
+  for (const fn of [scopedWeeklyRows, accountTokens, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, routeRows, problems]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));

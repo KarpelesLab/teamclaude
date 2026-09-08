@@ -74,7 +74,7 @@ export class SessionTracker {
   constructor({ knownTtlMs, activeTtlMs, now } = {}) {
     // id -> { pins: Map<bucketKey, { idx, at }>,
     //         refs: Map<bucketKey, { idx, windows: Map<window, reset>,
-    //                                unescaped: { idx, windows } | null }>,
+    //                                unescaped: { idx, windows } | null, gen }>,
     //         firstSeen, lastSeen, count, inFlight, tokens: Map<bucketKey, ...> }
     this.sessions = new Map();
     this.knownTtlMs = knownTtlMs ?? SESSION_KNOWN_TTL_MS;
@@ -198,6 +198,28 @@ export class SessionTracker {
     return t;
   }
 
+  /**
+   * Record how ONE client request ended. `usable` true resets the streak,
+   * false advances it; an outcome nobody can attribute — the client walked
+   * away mid-stream — is not reported here at all, because a session cannot be
+   * called starved for an answer it stopped waiting for.
+   *
+   * Deliberately NOT derived from the token counters. `reports` counts upstream
+   * usage objects, which is a different question: `count_tokens` and a
+   * third-party upstream both answer correctly while reporting none, and a
+   * stream that dies after `message_start` reports one while delivering
+   * nothing. Only the request path knows how a request ended.
+   *
+   * Like recordTokens, `_live` never resurrects a forgotten session: the id is
+   * a client-supplied header, and the idle window exists to drain that map.
+   */
+  recordOutcome(sessionId, usable, now = this._now()) {
+    const s = this._live(sessionId, now);
+    if (!s) return null;
+    s.starved = usable ? 0 : s.starved + 1;
+    return s.starved;
+  }
+
   // A known, non-expired session's record, or null. Never creates one, and
   // drops an expired one on read like pinnedAccount does.
   _live(sessionId, now) {
@@ -222,6 +244,13 @@ export class SessionTracker {
         // The same key space as `pins`, so a family's spend and the account it
         // is pinned to are looked up by one bucket key.
         tokens: new Map(),
+        // Consecutive CLIENT requests that ended without a usable answer; any
+        // usable answer resets it. A streak rather than a total, so a blip
+        // during an upstream wobble never accumulates on a session that is
+        // otherwise working, while one that is genuinely getting nothing climbs
+        // monotonically — and no denominator is needed, which keeps `count`
+        // (forward attempts, inflated by retries) out of the question entirely.
+        starved: 0,
         // Labels from the request that opened the session (see beginRequest).
         client: null,
         dimensions: null,
@@ -272,7 +301,7 @@ export class SessionTracker {
       return null;
     }
     let ref = s.refs.get(bucket);
-    if (!ref && create) s.refs.set(bucket, ref = { idx: null, windows: new Map(), unescaped: null });
+    if (!ref && create) s.refs.set(bucket, ref = { idx: null, windows: new Map(), unescaped: null, gen: 0 });
     return ref || null;
   }
 
@@ -420,6 +449,11 @@ export class SessionTracker {
     const byBucket = {};
     const items = detail ? [] : null;
     let activeContext = 0;
+    // The worst streak among ACTIVE sessions, so a reader without
+    // proxy.sessionDetail still sees that something is starving — and so it
+    // clears itself once the session stops trying, rather than lingering on a
+    // record the idle window has not yet dropped.
+    let starvedMax = 0;
     for (const [id, s] of this.sessions) {
       if (this._isExpired(s, now)) {
         this.sessions.delete(id);
@@ -436,6 +470,7 @@ export class SessionTracker {
       }
       if (this._isActive(s, now)) {
         active += 1;
+        if (s.starved > starvedMax) starvedMax = s.starved;
         // Once per account, on every account this session is currently
         // spending, so the per-account counts can sum to more than `active`.
         for (const idx of this._loadedAccounts(s, now)) {
@@ -452,10 +487,11 @@ export class SessionTracker {
     }
     tokens.activeContext = activeContext;
     tokens.byBucket = byBucket;
+    const base = { known, active, perAccount, tokens, starvedMax };
     // Newest first: a per-session table is read top-down for what is happening
     // now, and the list is capped by the same TTLs as the map behind it.
     if (items) items.sort((a, b) => b.lastSeen - a.lastSeen);
-    return items ? { known, active, perAccount, tokens, items } : { known, active, perAccount, tokens };
+    return items ? { ...base, items } : base;
   }
 }
 
@@ -469,6 +505,7 @@ function sessionItem(id, s, active) {
     active,
     inFlight: s.inFlight,
     requests: s.count,
+    starved: s.starved,
     firstSeen: s.firstSeen,
     lastSeen: s.lastSeen,
     client: s.client,

@@ -7,9 +7,22 @@ const H = 3600_000;
 const WEEK = 7 * 24 * H;
 const OPUS = 'claude-opus-5';
 const FABLE = 'claude-fable-5';
+const GPT = 'gpt-5.6-sol';
 
 function oauth(name) {
   return { name, type: 'oauth', accessToken: 't-' + name, refreshToken: 'r', expiresAt: Date.now() + 3600_000 };
+}
+
+// A Codex subscription. The provider partition makes currentIndex a slot one
+// fleet owns and the other BORROWS, which the borrowed-cursor arms below turn on.
+function codexAccount(name) {
+  return { ...oauth(name), provider: 'codex', accountId: 'acct-' + name };
+}
+
+// A shared API key. Only subscriptions are partitioned, so a key declaring no
+// provider is eligible for either app's traffic while reading as the default.
+function sharedKey(name) {
+  return { name, type: 'apikey', apiKey: 'k-' + name };
 }
 
 // The knob spelled out at every call site: `undefined` here means the config key
@@ -52,6 +65,10 @@ function pinnedFleet(expiry) {
 }
 
 const ON = { enabled: true, preempt: true };
+
+// A request's exclusion set, empty. With the knob on the refresh spends a session
+// reset only for a caller carrying one; a call without it runs no switch.
+const asRequest = () => new Set();
 
 // ---------------------------------------------------------------------------
 // A rollover moves a pin. Nothing else does.
@@ -899,6 +916,32 @@ test('a retry that falls back onto the rolled account leaves the rollover owed',
     'the failed fail-back priced the rolled account');
 });
 
+test('a retry re-entering past a session pin leaves the pin\'s reading on the account that rolled', () => {
+  // The pin names the preemption's destination while the pin's reading is still
+  // on the account that rolled. A retry failing over FROM it takes no reading.
+  const am = mgr(['a', 'b', 'c'], ON, { distributeSessions: true });
+  bucket(am, 0, 'unified7d', 0.4, 10);
+  bucket(am, 1, 'unified7d', 0.4, 20);
+  bucket(am, 2, 'unified7d', 0.4, 30);
+  assert.equal(serve(am, 's1', OPUS).name, 'a');
+  rollWindow(am, 0);
+
+  am.beginSession('s1');
+  const moved = am.getActiveAccount(null, OPUS, null, 's1');
+  assert.equal(moved.name, 'b', 'the rollover did not move the pin to b');
+  am.recordSession('s1', moved.index, OPUS);
+  // The destination refuses, so the same request re-enters with it tried.
+  const back = am.getActiveAccount(new Set([moved.index]), OPUS, null, 's1');
+  assert.equal(back.name, 'c', 'the refusal did not fall back off the pinned destination');
+  assert.equal(am.sessionTracker.refsFor('s1', 'unified7d').idx, 0,
+    'the pin\'s reading was taken on the account the request was refused by');
+
+  am.recordSession('s1', back.index, OPUS);
+  am.endSession('s1');
+  assert.equal(am.sessionTracker.refsFor('s1', 'unified7d').idx, 0,
+    'the pin\'s reading left the account that rolled');
+});
+
 test('a retry that bounces back to the rolled current account leaves it owed', () => {
   // The same cascade on the path that is live by default: distributeSessions is
   // off, so current-account stickiness is what an operator gets by turning on
@@ -915,6 +958,28 @@ test('a retry that bounces back to the rolled current account leaves it owed', (
 
   assert.equal(serve(am, null, OPUS).name, 'b',
     'the bounce first-sighted the rolled reset');
+});
+
+test('a retry re-entering past the current account leaves the reading on the account that rolled', () => {
+  // The cursor sits on the preemption's destination while the reading is still on
+  // the account that rolled, which is the state the fail-back's protection needs.
+  const am = mgr(['a', 'b', 'c'], ON);
+  bucket(am, 0, 'unified7d', 0.4, 10);
+  bucket(am, 1, 'unified7d', 0.4, 20);
+  bucket(am, 2, 'unified7d', 0.4, 30);
+  assert.equal(serve(am, null, OPUS).name, 'a');
+  rollWindow(am, 0);
+
+  assert.equal(am.getActiveAccount(null, OPUS, null, null).name, 'b',
+    'the rollover did not preempt');
+  // The destination refuses, so the same request re-enters with it tried.
+  assert.equal(am.getActiveAccount(new Set([1]), OPUS, null, null).name, 'c',
+    'the refusal did not fall back off the destination');
+
+  assert.equal(am._currentObs.idx, 0,
+    'the reading was taken on the account the request was refused by');
+  assert.equal(am._currentRolledOver(am.accounts[0], OPUS), true,
+    'the roll is no longer read on the account that rolled');
 });
 
 test('a fail-back onto a FAMILY roll leaves the rollover owed', () => {
@@ -978,15 +1043,12 @@ test('a retry that never left the destination does not spend the origin roll', (
     'the refusal did not fall back onto the rolled account');
 
   assert.equal(serve(am, null, OPUS).name, 'b',
-    'the retry was read as a completed stay and spent the roll');
+    'the retry was read as a confirmed stay and spent the roll');
 });
 
 test('a stay a second request confirms releases the roll it was pushed off', () => {
-  // The held roll is the fail-back's protection and nothing more. Once a second
-  // request has found the traffic where the last one left it, the move stuck and
-  // the origin's roll is escaped — holding it any longer would preempt off that
-  // account every time the fleet came back to it, for a rollover it has already
-  // been moved off once.
+  // The held roll is the fail-back's protection and nothing more. Holding it past
+  // a confirmed stay would preempt off that account every time traffic returned.
   const am = mgr(['a', 'b'], ON);
   bucket(am, 0, 'unified7d', 0.4, 10);
   bucket(am, 1, 'unified7d', 0.4, 10);
@@ -994,11 +1056,12 @@ test('a stay a second request confirms releases the roll it was pushed off', () 
   rollWindow(am, 0);
 
   assert.equal(serve(am, null, OPUS).name, 'b', 'the rollover did not preempt');
-  // The preemption AIMED at b; the next request is the first to rest there, and
-  // the one after it is the second to find the traffic where the last one left
-  // it. That is the confirmation.
+  // The preemption AIMED at b, so the next request is the first to rest there and
+  // the one after confirms. `serve()` drives no response, so this spells it out.
   assert.equal(serve(am, null, OPUS).name, 'b', 'the first request did not rest on b');
-  assert.equal(serve(am, null, OPUS).name, 'b', 'the second request did not confirm the stay');
+  const carried = am.observedGeneration(null, OPUS);
+  assert.equal(serve(am, null, OPUS).name, 'b', 'the second request did not rest on b');
+  am.confirmStay(am.accounts[1], carried, null, 'anthropic');
 
   // b is out of the way, so the traffic comes back to a on its own.
   assert.equal(serve(am, null, OPUS, { exclude: new Set([1]) }).name, 'a');
@@ -1006,6 +1069,185 @@ test('a stay a second request confirms releases the roll it was pushed off', () 
     'a roll the fleet already moved off was charged a second time');
   assert.equal(serve(am, null, OPUS).name, 'a',
     'the return to an escaped roll preempted off it again');
+});
+
+test('a success on a borrowed cursor does not release the roll its owner holds', () => {
+  // currentIndex is ONE slot every provider shares. A borrower hands the INDEX
+  // back but not the observation, which the walk left naming its own account.
+  const am = new AccountManager(
+    [codexAccount('c'), codexAccount('c2'), oauth('a')], 0.98, { expiryRouting: ON },
+  );
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30]]) bucket(am, i, 'unified7d', 0.4, hours);
+  // The opening placement a daemon launch makes, so the codex fleet owns the cursor.
+  am.selectActiveAccount();
+
+  const codexReq = (exclude = null) => am.getActiveAccount(exclude, GPT, null, null, 'codex');
+  const claudeReq = () => am.getActiveAccount(null, OPUS, null, null, 'anthropic');
+
+  assert.equal(codexReq().name, 'c', 'the fixture must start on c');
+  rollWindow(am, 0);
+  assert.equal(codexReq().name, 'c2', 'the roll did not preempt off c');
+  // The first request to REST on c2, which is what puts c's roll into the hold.
+  assert.equal(codexReq().name, 'c2', 'the preemption did not settle on c2');
+  assert.equal(am._currentObs.unescaped?.idx, 0, 'resting on c2 did not hold c\'s roll');
+
+  // Two borrowed requests, each served. The first MOVES the observation onto a
+  // and so cannot confirm; the second finds it there and can.
+  for (const attempt of ['first', 'second']) {
+    const carried = am.observedGeneration(null, OPUS);
+    const account = claudeReq();
+    assert.equal(account.name, 'a', `the ${attempt} borrowed request left the anthropic account`);
+    am.confirmStay(account, carried, null, 'anthropic');
+  }
+  assert.equal(am._currentObs.unescaped?.idx, 0,
+    'a success on the borrowed cursor released the roll its owner was holding');
+
+  // c2 out of the way, so the codex traffic falls back onto c, which still owes.
+  assert.equal(codexReq(new Set([1])).name, 'c', 'the fail-back did not reach c');
+  assert.equal(am._currentRolledOver(am.accounts[0], GPT), true,
+    'the fail-back onto c first-sighted the week c gained');
+  assert.equal(codexReq().name, 'c2',
+    'the codex request after the fail-back settled on the account its roll pushed it off');
+});
+
+test('a borrowed cursor\'s success settles the roll of its own provider', () => {
+  // The converse, and why the gate asks which provider a roll belongs to. A
+  // cursor test would refuse every confirmation the borrowing fleet ever offers.
+  const am = new AccountManager(
+    [codexAccount('c'), oauth('a'), oauth('b')], 0.98, { expiryRouting: ON },
+  );
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30]]) bucket(am, i, 'unified7d', 0.4, hours);
+  // The codex fleet owns the cursor, so every anthropic request below borrows it.
+  am.selectActiveAccount();
+
+  const codexReq = () => am.getActiveAccount(null, GPT, null, null, 'codex');
+  const claudeReq = (exclude = null) => am.getActiveAccount(exclude, OPUS, null, null, 'anthropic');
+
+  assert.equal(codexReq().name, 'c', 'the fixture must start on c');
+  assert.equal(claudeReq().name, 'a', 'the anthropic traffic must start on a');
+  rollWindow(am, 1);
+  assert.equal(claudeReq().name, 'b', 'the roll did not preempt off a');
+  // The first request to REST on b, which is what puts a's roll into the hold.
+  assert.equal(claudeReq().name, 'b', 'the preemption did not settle on b');
+  assert.equal(am._currentObs.unescaped?.idx, 1, 'resting on b did not hold a\'s roll');
+
+  // The server's handshake spelled out, as above. This one finds the observation
+  // already resting on b and is served, and both accounts are anthropic's.
+  const carried = am.observedGeneration(null, OPUS);
+  const served = claudeReq();
+  assert.equal(served.name, 'b', 'the confirming request left b');
+  am.confirmStay(served, carried, null, 'anthropic');
+  assert.equal(am._currentObs.unescaped, null,
+    'the success left its own provider\'s roll owed');
+
+  // b out of the way: the roll is settled, so a is read whole and traffic stays.
+  assert.equal(claudeReq(new Set([2])).name, 'a', 'the fail-back did not reach a');
+  assert.equal(am._currentRolledOver(am.accounts[1], OPUS), false,
+    'a roll the traffic already moved off was charged a second time');
+  assert.equal(claudeReq().name, 'a',
+    'the request after the fail-back preempted off a settled roll');
+});
+
+test('a success on a shared key for another provider\'s request leaves the roll held', () => {
+  // Only SUBSCRIPTIONS are partitioned, so the account a request landed on says
+  // nothing about which fleet it belonged to.
+  const am = new AccountManager(
+    [oauth('a1'), oauth('a2'), sharedKey('kn')], 0.98, { expiryRouting: ON },
+  );
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30]]) bucket(am, i, 'unified7d', 0.4, hours);
+  // The anthropic fleet owns the cursor, so the codex request below borrows it.
+  am.selectActiveAccount();
+
+  const claudeReq = (exclude = null) => am.getActiveAccount(exclude, OPUS, null, null, 'anthropic');
+  const codexReq = () => am.getActiveAccount(null, GPT, null, null, 'codex');
+
+  assert.equal(claudeReq().name, 'a1', 'the fixture must start on a1');
+  rollWindow(am, 0);
+  assert.equal(claudeReq().name, 'a2', 'the roll did not preempt off a1');
+  // The first request to REST on a2, which is what puts a1's roll into the hold.
+  assert.equal(claudeReq().name, 'a2', 'the preemption did not settle on a2');
+  assert.equal(am._currentObs.unescaped?.idx, 0, 'resting on a2 did not hold a1\'s roll');
+
+  // The key is the only account the codex fleet has, so its traffic borrows the
+  // cursor and lands there. The handshake as above: move, then rest and serve.
+  assert.equal(codexReq().name, 'kn', 'the codex request did not reach the shared key');
+  const carried = am.observedGeneration(null, GPT);
+  const served = codexReq();
+  assert.equal(served.name, 'kn', 'the confirming codex request left the shared key');
+  am.confirmStay(served, carried, null, 'codex');
+  assert.equal(am._currentObs.unescaped?.idx, 0,
+    'a codex success released the roll the anthropic fleet was holding');
+
+  // a2 and the key out of the way, so anthropic falls back onto a1, still owed.
+  assert.equal(claudeReq(new Set([1, 2])).name, 'a1', 'the fail-back did not reach a1');
+  assert.equal(am._currentRolledOver(am.accounts[0], OPUS), true,
+    'the fail-back onto a1 first-sighted the week a1 gained');
+  assert.equal(claudeReq().name, 'a2',
+    'the anthropic request after the fail-back settled on the account its roll pushed it off');
+});
+
+test('a confirmation that names no fleet settles nothing', () => {
+  // The control on the plainest fixture: one provider, one roll, a success that
+  // would release it. A caller naming no fleet has not answered which one it is.
+  const am = mgr(['a', 'b'], ON);
+  bucket(am, 0, 'unified7d', 0.4, 10);
+  bucket(am, 1, 'unified7d', 0.4, 10);
+  assert.equal(serve(am, null, OPUS).name, 'a');
+  rollWindow(am, 0);
+
+  assert.equal(serve(am, null, OPUS).name, 'b', 'the rollover did not preempt');
+  assert.equal(serve(am, null, OPUS).name, 'b', 'the first request did not rest on b');
+  const carried = am.observedGeneration(null, OPUS);
+  assert.equal(serve(am, null, OPUS).name, 'b', 'the second request did not rest on b');
+  am.confirmStay(am.accounts[1], carried, null);
+  assert.equal(am._currentObs.unescaped?.idx, 0,
+    'a confirmation naming no fleet released the roll anyway');
+
+  // b out of the way, so the traffic comes back to a — still owing its roll.
+  assert.equal(serve(am, null, OPUS, { exclude: new Set([1]) }).name, 'a');
+  assert.equal(am._currentRolledOver(am.accounts[0], OPUS), true,
+    'the fail-back found a roll that nothing had settled already released');
+  assert.equal(serve(am, null, OPUS).name, 'b',
+    'the request after the fail-back stayed on the account the roll pushed it off');
+});
+
+test('a session\'s confirmation releases under the bucket its stamp was taken under', () => {
+  // The stamp is read before the walk and the confirmation lands after the
+  // response, so a route edit can arrive between them. Resolving the bucket again
+  // would settle one this session has no observation under.
+  const am = mgr(['a', 'b'], ON, { distributeSessions: true });
+  am.setRoutes([{ name: 'fable', match: ['*fable*'], bucket: 'unified7d' }]);
+  bucket(am, 0, 'unified7d', 0.4, 10);
+  bucket(am, 1, 'unified7d', 0.4, 10);
+
+  assert.equal(serve(am, 's1', FABLE).name, 'a', 'the fixture must start on a');
+  rollWindow(am, 0);
+  assert.equal(serve(am, 's1', FABLE).name, 'b', 'the rollover did not move the pin off a');
+  // The first request to REST on b, which is what puts a's roll into the hold.
+  assert.equal(serve(am, 's1', FABLE).name, 'b', 'the preemption did not settle on b');
+  assert.equal(am.sessionTracker.refsFor('s1', 'unified7d').unescaped?.idx, 0,
+    'the fixture must have held a\'s roll on the pin');
+
+  // The server's handshake with an operator inside it: the stamp, the request,
+  // the route saved while it is upstream, and the confirmation on its response.
+  const carried = am.observedGeneration('s1', FABLE);
+  assert.equal(serve(am, 's1', FABLE).name, 'b', 'the confirming request left b');
+  am.setRoutes([{ name: 'fable', match: ['*fable*'] }]); // the override dropped
+  assert.equal(am._weeklyBucketFor(FABLE), 'unified7dFable',
+    'the edit did not move the model to another bucket');
+  am.confirmStay(am.accounts[1], carried, 's1', 'anthropic');
+
+  assert.equal(am.sessionTracker.refsFor('s1', 'unified7d').unescaped, null,
+    'the confirmation settled a bucket resolved after the response instead of the stamp\'s');
+
+  // Opus is governed by the bucket the edit left behind, so it reads what the
+  // confirmation settled. b out of the way, the session falls back onto a.
+  assert.equal(serve(am, 's1', OPUS, { exclude: new Set([1]) }).name, 'a',
+    'the fail-back did not reach a');
+  assert.equal(am._pinRolledOver('s1', am.accounts[0], OPUS), false,
+    'the fail-back was handed back a roll the confirmation had settled');
+  assert.equal(serve(am, 's1', OPUS).name, 'a',
+    'the session was preempted off a again for a roll its own stay had settled');
 });
 
 test('removing an account renumbers a session pin\'s held roll too', () => {
@@ -1280,17 +1522,14 @@ test('an account known to be nearly spent does not win on having fewer sessions'
 // is byte-identity with the behaviour the knob is off for, and that behaviour
 // also lets a status preview consume a session reset and suppress the switch. So
 // an arm asserting "the preview changes nothing" fails with the knob off too,
-// and would be a false gate. The claim is differential by nature and is measured
-// that way, by flagoff-sweep.mjs over generated fleets.
+// and would be a false gate. Each knob-off arm below is narrower: it names one
+// behaviour the disabled path must keep, and fails if this feature reached it.
 
-test('the real paint performs the 5h switch; only the status preview skips it', () => {
-  // The docs record the skipped switch as a limitation of the two surfaces, and
-  // it holds for one: _render calls the combined clear-AND-switch, so the paint
-  // IS the switch, while the preview path clears the window through the
-  // availability read and never reaches the switch at all. The sentence
-  // describing that is gated here rather than left to be read against the code.
-  function fleet() {
-    const am = mgr(['cur', 'reset'], ON);
+test('a paint clears the window; with the knob on the switch waits for a request', () => {
+  // The two request-less surfaces differ: the preview never reaches the switch,
+  // while the paint calls the combined clear-and-switch and takes it when off.
+  function fleet(expiry) {
+    const am = mgr(['cur', 'reset'], expiry);
     const now = Date.now();
     bucket(am, 0, 'unified7d', 0.5, 200, now);
     bucket(am, 1, 'unified7d', 0.5, 20, now);   // its weekly expires sooner
@@ -1299,32 +1538,51 @@ test('the real paint performs the 5h switch; only the status preview skips it', 
     am.accounts[1].quota.unified5hReset = now - 1000;   // the reset the switch acts on
     return am;
   }
+  function paint(am) {
+    const tui = new TUI({
+      accountManager: am, config: { accounts: [], routes: [], blockedModels: [], proxy: { port: 1 } },
+      saveConfig: async () => {}, syncAccounts: async () => 0, onQuit: () => {},
+    });
+    const write = process.stdout.write.bind(process.stdout);
+    process.stdout.write = () => true;
+    try { tui._render(true); } finally { process.stdout.write = write; }
+  }
 
-  const painted = fleet();
-  const tui = new TUI({
-    accountManager: painted, config: { accounts: [], routes: [], blockedModels: [], proxy: { port: 1 } },
-    saveConfig: async () => {}, syncAccounts: async () => 0, onQuit: () => {},
-  });
-  const write = process.stdout.write.bind(process.stdout);
-  process.stdout.write = () => true;
-  try { tui._render(true); } finally { process.stdout.write = write; }
-  assert.equal(painted.accounts[painted.currentIndex].name, 'reset',
-    'the paint did not run the switch its own refresh call performs');
-  assert.equal(painted.accounts[1].quota.unified5h, null, 'the paint did not clear the expired window');
+  const off = fleet(undefined);
+  paint(off);
+  assert.equal(off.accounts[off.currentIndex].name, 'reset',
+    'the knob-off paint did not run the switch its own refresh call performs');
+  assert.equal(off.accounts[1].quota.unified5h, null, 'the knob-off paint did not clear the expired window');
 
-  const previewed = fleet();
-  for (const a of previewed.accounts) previewed._isNearQuota(a, null);
-  assert.equal(previewed.accounts[previewed.currentIndex].name, 'cur',
-    'the preview ran a switch the documented limitation says it skips');
-  assert.equal(previewed.accounts[1].quota.unified5h, null, 'the preview did not clear the expired window');
+  const on = fleet(ON);
+  paint(on);
+  assert.equal(on.accounts[1].quota.unified5h, null, 'the paint did not clear the expired window');
+  assert.equal(on.accounts[on.currentIndex].name, 'cur',
+    'the paint took a routing decision on a reset no request had asked about');
+  assert.equal(on.accounts[1].sessionResetPending, true,
+    'the paint consumed the event instead of leaving it for a request');
+  on.refreshExpiredQuotas(null, asRequest());
+  assert.equal(on.accounts[on.currentIndex].name, 'reset',
+    'the reset the paint left pending never reached the request');
+
+  // Neither setting lets the preview reach the switch, because it never calls the
+  // refresh. The event is not lost: it is recorded and deferred to a request.
+  for (const expiry of [undefined, ON]) {
+    const previewed = fleet(expiry);
+    for (const a of previewed.accounts) previewed._isNearQuota(a, null);
+    assert.equal(previewed.accounts[previewed.currentIndex].name, 'cur',
+      'the preview ran a switch the documented limitation says it skips');
+    assert.equal(previewed.accounts[1].quota.unified5h, null, 'the preview did not clear the expired window');
+    previewed.refreshExpiredQuotas(null, asRequest());
+    assert.equal(previewed.accounts[previewed.currentIndex].name, 'reset',
+      'the reset the preview uncovered never reached the next request');
+  }
 });
 
 test('a repaint takes no reading, so it cannot spend the roll of the account it leaves', () => {
   // TUI._render calls the refresh with no request arguments, every few seconds
-  // idle and twice a second under load, and the 5h switch inside it can move the
-  // cursor, as it does with the knob off. What it must not do is take a READING,
-  // because nothing arrived anywhere: a paint is not a place a reading is taken
-  // from.
+  // idle and twice a second under load. What it must not do on either setting is
+  // take a READING: a paint is not a place a reading is taken from.
   const am = mgr(['a', 'b', 'c'], ON);
   bucket(am, 0, 'unified7d', 0.4, 10);
   bucket(am, 1, 'unified7d', 0.4, 20);
@@ -1394,8 +1652,9 @@ test('the session-reset switch routes by the request\'s own window', () => {
   am.accounts[1].quota.unified5h = 0.5;
   am.accounts[1].quota.unified5hReset = now - 1000;
 
-  // A Fable request drives the refresh, so the switch is asked about Fable.
-  am.refreshExpiredQuotas(FABLE);
+  // A Fable request drives the refresh, so the switch is asked about Fable. The
+  // exclusion set is what makes it a request rather than a poll.
+  am.refreshExpiredQuotas(FABLE, asRequest());
   assert.equal(am.accounts[am.currentIndex].name, 'cur',
     'the switch installed an account the Fable picker excludes');
 });
@@ -1420,7 +1679,7 @@ test('the session-reset switch admits on the order the pick uses', () => {
     am.accounts[1].quota.unified5hReset = now - 1000;
     assert.equal(am._rankedReset(am.accounts[1], FABLE) < am._rankedReset(am.accounts[0], FABLE), true,
       'the fixture must have the candidate ranking first for Fable');
-    am.refreshExpiredQuotas(FABLE);
+    am.refreshExpiredQuotas(FABLE, asRequest());
     return am.accounts[am.currentIndex].name;
   }
 
@@ -1594,11 +1853,21 @@ test('a knob toggled mid-request cannot leave a roll half-answered', () => {
 // The status view and the next selection name the same account
 // ---------------------------------------------------------------------------
 
+test('the preview does not mirror the session walk it never consults', () => {
+  // A session pin resolves ahead of the non-session walk the preview mirrors, so
+  // with distribution on the two can name different accounts.
+  const am = mgr(['a', 'b'], ON, { distributeSessions: true });
+  bucket(am, 0, 'unified7d', 0.4, 10);
+  bucket(am, 1, 'unified7d', 0.4, 10);
+  assert.equal(serve(am, 's1', OPUS).name, 'a', 'the fixture must pin s1 to a');
+  assert.equal(am.setCurrentAccount(1), true, 'the fixture must move the cursor off the pin');
+  assert.notEqual(am.previewRouteIndex(OPUS), am.getActiveAccount(null, OPUS, null, 's1').index,
+    'the preview answered for a session walk it does not consult');
+});
+
 test('the preview names the account the next request would actually get', () => {
-  // previewRouteIndex is what the TUI and the status JSON show. It mirrors the
-  // priority preemption but not the rollover one, so after a roll an operator
-  // watching the feature fire sees the parked account until some other request
-  // moves the cursor.
+  // previewRouteIndex is what the TUI and the status JSON show, and it mirrors
+  // both preemptions the non-session walk makes, so an operator sees the truth.
   const am = mgr(['a', 'b'], ON);
   bucket(am, 0, 'unified7d', 0.4, 10);
   bucket(am, 1, 'unified7d', 0.4, 10);

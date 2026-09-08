@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
+import { DEFAULT_PROVIDER } from '../src/provider.js';
 
 const H = 3600_000;
 const OPUS = 'claude-opus-5';
@@ -15,13 +16,17 @@ function oauth(name, extra = {}) {
 // default parameter would turn `undefined` back into the knob's ON value.
 function mgr(names, opts = {}) {
   const { expiry, ...rest } = opts;
-  return new AccountManager(names.map(n => oauth(n)), 0.98,
+  return new AccountManager(names.map(n => (typeof n === 'string' ? oauth(n) : n)), 0.98,
     'expiry' in opts ? { expiryRouting: expiry, ...rest } : rest);
 }
 
 // The knob as these tests spell it, so no call site can mean "off" by omission.
 const ON = { enabled: true };
 const OFF = undefined;
+
+// A request's exclusion set, empty. With the knob on the refresh spends a session
+// reset only for a caller carrying one; without it the call reads as a poll.
+const asRequest = () => new Set();
 
 function near(actual, expected, what) {
   assert.ok(Math.abs(actual - expected) <= Math.abs(expected) * 1e-12,
@@ -241,21 +246,17 @@ test('equally spent windows are governed by the one that resets sooner', () => {
 });
 
 test('an equal-pressure tie breaks on the governing window\'s clock, not another', () => {
-  // Identical scoped windows on both accounts, so the pressures are computed
-  // from identical inputs and the tie is exact rather than nearly so — the next
-  // sort key is what decides the pick. The SHARED weekly disagrees and points
-  // the other way, and it is a clock neither the gate nor the ratio consulted.
+  // Half the headroom over half the horizon prices identically, so the tie is
+  // exact and the next key decides: the governing window's clock, not the shared.
   const now = Date.now();
   const fleet = expiry => {
     const am = mgr(['a', 'b'], { expiry });
     for (const i of [0, 1]) {
-      Object.assign(am.accounts[i].quota, {
-        unified5h: 0.1,
-        unified7d: 0.10,
-        scopedWeekly: { opus: { utilization: 0.80, resetAt: now + 20 * H } },
-      });
+      Object.assign(am.accounts[i].quota, { unified5h: 0.1, unified7d: 0.10 });
       am.accounts[i].probing = false;
     }
+    am.accounts[0].quota.scopedWeekly = { opus: { utilization: 0.75, resetAt: now + 10 * H } };
+    am.accounts[1].quota.scopedWeekly = { opus: { utilization: 0.50, resetAt: now + 20 * H } };
     am.accounts[0].quota.unified7dReset = now + 100 * H;
     am.accounts[1].quota.unified7dReset = now + 5 * H;
     return am;
@@ -264,6 +265,8 @@ test('an equal-pressure tie breaks on the governing window\'s clock, not another
   const on = fleet(ON);
   assert.equal(on._expiryPressure(on.accounts[0], OPUS, now),
     on._expiryPressure(on.accounts[1], OPUS, now), 'the fixture must tie exactly');
+  assert.notEqual(on._rankedReset(on.accounts[0], OPUS), on._rankedReset(on.accounts[1], OPUS),
+    'the governing clocks must differ, or candidate order decides');
   assert.equal(on._pickBestAvailable(null, OPUS).name, 'a');
   assert.equal(on._pickLeastLoaded(null, OPUS).name, 'a');
 
@@ -476,7 +479,7 @@ test('path 3 (session-quota reset): a switch onto a spent account is vetoed', ()
   assert.equal(off.accounts[off.currentIndex].name, 'b');
 
   const on = build(ON);
-  on.refreshExpiredQuotas();
+  on.refreshExpiredQuotas(null, asRequest());
   assert.equal(on.accounts[on.currentIndex].name, 'cur');
 });
 
@@ -492,16 +495,13 @@ test('path 3: a band member with strictly worse pressure is still refused', () =
     am.accounts[1].quota.unified5hReset = Date.now() - 1000; // its 5h just expired
     return am;
   };
-  // Membership is asked of a TWIN, never of the manager under test: reading
-  // eligibility clears expired windows as a side effect, so asking here would
-  // consume the very session reset the switch is triggered by, and the
-  // assertion below would pass without the switch ever having been considered.
+  // Asked of a TWIN, because this reads the band on a fleet whose cursor the
+  // check below is about to move.
   assert.deepEqual(build()._bandedCandidates().map(a => a.name), ['cur', 'b']);
   const am = build();
-  // Driven through the refresh itself, the one place the switch runs: no shape
-  // of this call clears the windows and leaves the switch for a later request,
-  // and a repaint takes the same path a request does.
-  am.refreshExpiredQuotas();
+  // Driven through the refresh, the one place the switch runs, and carrying a
+  // request: with the knob on a poll leaves the switch to the next request.
+  am.refreshExpiredQuotas(null, asRequest());
   assert.equal(am.accounts[am.currentIndex].name, 'cur');
 });
 
@@ -522,8 +522,270 @@ test('path 3: a switch onto an account the band excluded is refused too', () => 
   assert.deepEqual(build()._bandedCandidates().map(a => a.name), ['hot']);
   const am = build();
   // Driven through the refresh itself, as above: the switch has no other caller.
-  am.refreshExpiredQuotas();
+  am.refreshExpiredQuotas(null, asRequest());
   assert.equal(am.accounts[am.currentIndex].name, 'cur');
+});
+
+test('path 3: the reset switch is drawn over what the request can be sent to', () => {
+  // A Codex account cannot serve an Anthropic request, so it may neither be
+  // switched to nor stop a switch. Here its pressure takes the top band alone.
+  const build = (expiry, withCodex) => {
+    const fleet = [oauth('cur'), oauth('reset')];
+    if (withCodex) fleet.push(oauth('codex', { provider: 'codex' }));
+    const am = mgr(fleet, { expiry });
+    bucket(am, 0, 'unified7d', 0.50, 50);
+    bucket(am, 1, 'unified7d', 0.10, 10);
+    if (withCodex) bucket(am, 2, 'unified7d', 0.00, 1);
+    // Only the challenger's 5h window has expired, so it alone triggers the switch.
+    am.accounts[1].quota.unified5h = 0.5;
+    am.accounts[1].quota.unified5hReset = Date.now() - 1000;
+    return am;
+  };
+  // Asked of a TWIN, because these read the band on a fleet whose cursor the
+  // checks below are about to move.
+  const twin = build(ON, true);
+  assert.deepEqual(twin._bandedCandidates(null, OPUS).map(a => a.name), ['codex'],
+    'the fixture must give the Codex account the band on its own');
+  assert.deepEqual(
+    twin._bandedCandidates(twin._excludeOtherProviders(null, DEFAULT_PROVIDER), OPUS).map(a => a.name),
+    ['reset'], 'the fixture must give the band to the challenger once the request excludes Codex');
+
+  // Through getActiveAccount, where the request's provider partition is built.
+  const on = build(ON, true);
+  on.getActiveAccount(null, OPUS);
+  assert.equal(on.accounts[on.currentIndex].name, 'reset',
+    'an account the request cannot be sent to vetoed the switch');
+
+  // Two controls: the same fleet without the foreign account, and with the knob
+  // off. Both switch, so neither alone accounts for the divergence.
+  const without = build(ON, false);
+  without.getActiveAccount(null, OPUS);
+  assert.equal(without.accounts[without.currentIndex].name, 'reset');
+
+  const off = build(OFF, true);
+  off.getActiveAccount(null, OPUS);
+  assert.equal(off.accounts[off.currentIndex].name, 'reset');
+});
+
+test('path 3: the reset switch skips an excluded account that also reset', () => {
+  // The exclusion has to reach the eligible loop, not only the band guard that
+  // vetoes its pick: an account on another provider that also reset is a candidate.
+  const am = mgr([oauth('cur'), oauth('reset'), oauth('codex', { provider: 'codex' })], { expiry: ON });
+  bucket(am, 0, 'unified7d', 0.50, 50);
+  bucket(am, 1, 'unified7d', 0.10, 10);
+  bucket(am, 2, 'unified7d', 0.00, 1);
+  // Both challengers reset, so the foreign account is a candidate to walk past.
+  for (const i of [1, 2]) {
+    am.accounts[i].quota.unified5h = 0.5;
+    am.accounts[i].quota.unified5hReset = Date.now() - 1000;
+  }
+  am.refreshExpiredQuotas(OPUS, am._excludeOtherProviders(null, DEFAULT_PROVIDER));
+  // Names the account rather than only ruling out the foreign one: "not codex"
+  // would pass on a cursor that never moved.
+  assert.equal(am.accounts[am.currentIndex].name, 'reset',
+    'the switch let an account the request cannot be sent to decide where it goes');
+});
+
+test('path 3: a reset stays pending until a request that can act on it', () => {
+  // The reset is fleet state, not this request's, so a window that expires while
+  // one request cannot use the account has to outlive that request.
+  const am = mgr(['cur', 'reset'], { expiry: ON });
+  bucket(am, 0, 'unified7d', 0.50, 50);
+  bucket(am, 1, 'unified7d', 0.10, 10);
+  am.accounts[1].quota.unified5h = 0.5;
+  am.accounts[1].quota.unified5hReset = Date.now() - 1000;
+
+  // Request 1 has already tried the challenger, so the switch may not install it.
+  // The flag is what this asserts: the cursor stays put either way.
+  am.refreshExpiredQuotas(OPUS, new Set([1]));
+  assert.equal(am.accounts[1].sessionResetPending, true,
+    'a request that could not use the account consumed its reset');
+  assert.equal(am.accounts[am.currentIndex].name, 'cur');
+
+  // Request 2 can be sent there, and nothing re-triggers the event.
+  am.refreshExpiredQuotas(OPUS, asRequest());
+  assert.equal(am.accounts[am.currentIndex].name, 'reset',
+    'the reset never reached a request that could act on it');
+});
+
+test('path 3: a request that cannot use the incumbent leaves the reset for one that can', () => {
+  // The same rule at the other end of the comparison: the switch measures every
+  // candidate against the cursor's account, so a request barred there settles nothing.
+  const am = mgr(['cur', 'reset'], { expiry: ON });
+  bucket(am, 0, 'unified7d', 0.50, 50);
+  bucket(am, 1, 'unified7d', 0.10, 10);
+  am.accounts[1].quota.unified5h = 0.5;
+  am.accounts[1].quota.unified5hReset = Date.now() - 1000;
+
+  // Request 1 excludes the cursor's own account.
+  am.refreshExpiredQuotas(OPUS, new Set([am.currentIndex]));
+  assert.equal(am.accounts[1].sessionResetPending, true,
+    'a request that could not use the incumbent consumed the reset');
+  assert.equal(am.accounts[am.currentIndex].name, 'cur',
+    'the switch decided against an account the request cannot be sent to');
+
+  // Request 2 can be sent to either, and nothing re-triggers the event.
+  am.refreshExpiredQuotas(OPUS, asRequest());
+  assert.equal(am.accounts[am.currentIndex].name, 'reset',
+    'the reset did not survive to a request that could act on it');
+});
+
+test('path 3: a request whose model the account cannot serve leaves the reset pending', () => {
+  // The face an exclusion set cannot express: the account is out of reach for
+  // THIS model alone, though every other model still routes to it.
+  const build = expiry => {
+    const am = mgr(['cur', 'reset'], { expiry });
+    bucket(am, 0, 'unified7d', 0.50, 50);
+    bucket(am, 1, 'unified7d', 0.10, 10);
+    // Spent for Fable and untouched for Opus, which is the whole fixture.
+    bucket(am, 1, 'unified7dFable', 0.99, 10);
+    am.accounts[1].quota.unified5h = 0.5;
+    am.accounts[1].quota.unified5hReset = Date.now() - 1000;
+    return am;
+  };
+  // Asked of a TWIN, because reading availability clears expired windows.
+  const twin = build(ON);
+  assert.equal(twin._isAvailable(twin.accounts[1], FABLE), false,
+    'the fixture must bar the challenger from Fable');
+  assert.equal(twin._isAvailable(twin.accounts[1], OPUS), true,
+    'the fixture must leave the challenger usable for Opus');
+
+  const am = build(ON);
+  am.refreshExpiredQuotas(FABLE, asRequest());
+  assert.equal(am.accounts[1].sessionResetPending, true,
+    'a request the account cannot serve consumed its reset');
+  assert.equal(am.accounts[am.currentIndex].name, 'cur',
+    'the switch installed an account this request cannot be sent to');
+
+  // The request behind it, with nothing left to re-trigger the event.
+  am.refreshExpiredQuotas(OPUS, asRequest());
+  assert.equal(am.accounts[am.currentIndex].name, 'reset',
+    'the reset never reached the model that could act on it');
+
+  // The knob-off control on the same fixture: the event is spent on sight
+  // whatever model the request carries.
+  const off = build(OFF);
+  off.refreshExpiredQuotas(FABLE, asRequest());
+  assert.equal(off.accounts[1].sessionResetPending, false,
+    'the knob-off path left an event the router consumes');
+  assert.equal(off.accounts[off.currentIndex].name, 'reset',
+    'the knob-off path skipped a switch the router performs');
+});
+
+test('path 3: a request the incumbent cannot serve leaves the reset for one it does', () => {
+  // The same test at the other end. A request the cursor's account cannot serve
+  // is diverted for that request alone and leaves the fleet where it is.
+  const build = expiry => {
+    const am = mgr(['cur', 'reset'], { expiry });
+    bucket(am, 0, 'unified7d', 0.50, 50);
+    bucket(am, 0, 'unified7dFable', 0.99, 1);
+    bucket(am, 1, 'unified7d', 0.10, 10);
+    am.accounts[1].quota.unified5h = 0.5;
+    am.accounts[1].quota.unified5hReset = Date.now() - 1000;
+    return am;
+  };
+  const twin = build(ON);
+  assert.equal(twin._isAvailable(twin.accounts[0], FABLE), false,
+    'the fixture must bar the incumbent from Fable');
+  assert.equal(twin._isAvailable(twin.accounts[0], OPUS), true,
+    'the fixture must leave the incumbent usable for Opus');
+
+  const am = build(ON);
+  am.refreshExpiredQuotas(FABLE, asRequest());
+  assert.equal(am.accounts[1].sessionResetPending, true,
+    'a request that could not be sent to the incumbent consumed the reset');
+  assert.equal(am.accounts[am.currentIndex].name, 'cur');
+
+  am.refreshExpiredQuotas(OPUS, asRequest());
+  assert.equal(am.accounts[am.currentIndex].name, 'reset',
+    'the reset did not survive to the model that could weigh it');
+
+  // The knob-off control: the incumbent's model decides nothing either.
+  const off = build(OFF);
+  off.refreshExpiredQuotas(FABLE, asRequest());
+  assert.equal(off.accounts[1].sessionResetPending, false,
+    'the knob-off path left an event the router consumes');
+  assert.equal(off.accounts[off.currentIndex].name, 'reset',
+    'the knob-off path skipped a switch the router performs');
+});
+
+test('path 3: a poll clears the window and leaves the reset for a request', () => {
+  // A poll routes nothing, so a reset it spends is spent nowhere. Driven through
+  // getQuotaSummary, which the status-line poller hits several times a minute.
+  const am = mgr(['cur', 'reset'], { expiry: ON });
+  bucket(am, 0, 'unified7d', 0.50, 50);
+  bucket(am, 1, 'unified7d', 0.10, 10);
+  am.accounts[1].quota.unified5h = 0.5;
+  am.accounts[1].quota.unified5hReset = Date.now() - 1000;
+
+  am.getQuotaSummary();
+  assert.equal(am.accounts[1].quota.unified5h, null,
+    'the poll must still clear the expired window — that is its job');
+  assert.equal(am.accounts[1].sessionResetPending, true,
+    'a poll spent the reset');
+  assert.equal(am.accounts[am.currentIndex].name, 'cur',
+    'a poll ran the switch');
+
+  // Repeatedly, because the poller is not a one-off.
+  for (let i = 0; i < 12; i++) am.getQuotaSummary();
+  assert.equal(am.accounts[1].sessionResetPending, true, 'repeated polling wore the reset down');
+
+  // And the request that can act on it still finds it.
+  am.refreshExpiredQuotas(OPUS, asRequest());
+  assert.equal(am.accounts[am.currentIndex].name, 'reset',
+    'the reset the poll left pending never reached the request');
+});
+
+test('path 3: the knob-off poll spends the reset on sight', () => {
+  // The control for the arm above: with the feature off a poll consumes the
+  // event and runs the switch. The same fixture with the knob flipped.
+  const am = mgr(['cur', 'reset'], { expiry: OFF });
+  bucket(am, 0, 'unified7d', 0.50, 50);
+  bucket(am, 1, 'unified7d', 0.10, 10);
+  am.accounts[1].quota.unified5h = 0.5;
+  am.accounts[1].quota.unified5hReset = Date.now() - 1000;
+
+  am.getQuotaSummary();
+  assert.equal(am.accounts[1].sessionResetPending, false,
+    'the knob-off poll left an event the router consumes');
+  assert.equal(am.accounts[am.currentIndex].name, 'reset',
+    'the knob-off poll skipped a switch the router performs');
+});
+
+test('path 3: the knob-off switch sees the whole fleet', () => {
+  // The exclusion is gated at the call site for the reason the model is. Both
+  // challengers rank equally off, so the tiebreak takes the Codex account.
+  const am = mgr([oauth('cur'), oauth('anth'), oauth('codex', { provider: 'codex' })], { expiry: OFF });
+  bucket(am, 0, 'unified7d', 0.50, 50);
+  bucket(am, 1, 'unified7d', 0.50, 40);
+  bucket(am, 2, 'unified7d', 0.50, 10);
+  for (const i of [1, 2]) {
+    am.accounts[i].quota.unified5h = 0.5;
+    am.accounts[i].quota.unified5hReset = Date.now() - 1000;
+  }
+  // The switch's own pick, read before the walk can move the cursor again: an
+  // Anthropic request cannot be sent where the knob-off switch installs.
+  am.refreshExpiredQuotas(OPUS, am._excludeOtherProviders(null, DEFAULT_PROVIDER));
+  assert.equal(am.accounts[am.currentIndex].name, 'codex',
+    'the knob-off switch dropped a candidate the router keeps');
+});
+
+test('path 3: the knob-off switch keeps a spent account out', () => {
+  // With the knob on, refreshExpiredQuotas has already filtered on this test.
+  // With it off, this guard alone keeps a spent account out of the switch.
+  const am = mgr(['cur', 'spent'], { expiry: OFF });
+  bucket(am, 0, 'unified7d', 0.50, 50);
+  // Over the threshold and resetting sooner than the incumbent, on an account
+  // no request can be sent to.
+  bucket(am, 1, 'unified7d', 0.99, 10);
+  am.accounts[1].quota.unified5h = 0.5;
+  am.accounts[1].quota.unified5hReset = Date.now() - 1000; // its 5h window just expired
+
+  assert.equal(am._isAvailable(am.accounts[1], null), false,
+    'the fixture must make the challenger unavailable, or it gates nothing');
+  am.refreshExpiredQuotas();
+  assert.equal(am.accounts[am.currentIndex].name, 'cur',
+    'the knob-off switch installed an account whose weekly is spent');
 });
 
 test('path 3 still switches when the sooner-resetting account is the better one', () => {
@@ -532,7 +794,7 @@ test('path 3 still switches when the sooner-resetting account is the better one'
   bucket(am, 1, 'unified7d', 0.1, 10);
   am.accounts[1].quota.unified5h = 0.5;
   am.accounts[1].quota.unified5hReset = Date.now() - 1000;
-  am.refreshExpiredQuotas();
+  am.refreshExpiredQuotas(null, asRequest());
   assert.equal(am.accounts[am.currentIndex].name, 'b');
 });
 
