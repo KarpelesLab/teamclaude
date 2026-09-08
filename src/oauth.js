@@ -182,12 +182,7 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
         throw err;
       }
 
-      const data = await res.json();
-      return {
-        accessToken: data.access_token,
-        refreshToken: data.refresh_token || refreshToken,
-        expiresAt: normalizeExpiresAt(data.expires_at) || (Date.now() + (data.expires_in || 3600) * 1000),
-      };
+      return tokenPairFromResponse(await res.json(), { previousRefreshToken: refreshToken });
     } catch (err) {
       const isNetworkError = err instanceof Error &&
         (err.name === 'TimeoutError' || err.name === 'AbortError' ||
@@ -204,22 +199,58 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
 }
 
 /**
- * Normalize an expires_at value to milliseconds.
+ * The credential fields of a token-endpoint response, checked.
+ *
+ * A 200 is not proof the body is usable. One without `access_token` used to be
+ * stored as `accessToken: undefined` and sent upstream as `Bearer undefined`,
+ * and a non-numeric expiry was stored as-is, where isTokenExpired never fired
+ * on it. So a missing or empty access token is an error here, the refresh token
+ * is taken only when it is a non-empty string (else the previous one is kept),
+ * and the expiry is `expires_at` (seconds or milliseconds) or `expires_in`
+ * seconds when either is a finite number — or one hour from now when neither
+ * is, which just makes the next refresh happen early.
+ */
+export function tokenPairFromResponse(data, { previousRefreshToken = undefined, now = Date.now() } = {}) {
+  const accessToken = data?.access_token;
+  if (typeof accessToken !== 'string' || accessToken === '') {
+    throw new Error('Token response carried no access_token');
+  }
+  const rotated = data.refresh_token;
+  const refreshToken = typeof rotated === 'string' && rotated !== '' ? rotated : previousRefreshToken;
+  const expiresIn = Number(data.expires_in);
+  const expiresAt = normalizeExpiresAt(data.expires_at)
+    ?? (Number.isFinite(expiresIn) && expiresIn > 0 ? now + expiresIn * 1000 : now + 3600 * 1000);
+  return { accessToken, refreshToken, expiresAt };
+}
+
+/**
+ * Normalize an expires_at value to milliseconds, or null when it is absent or
+ * not a positive finite number — a value that cannot be compared with the clock
+ * must not pass for one that can.
  * OAuth endpoints may return seconds; Claude Code credentials use milliseconds.
  */
 export function normalizeExpiresAt(expiresAt) {
-  if (!expiresAt) return expiresAt;
+  if (!expiresAt) return null;
+  const n = Number(expiresAt);
+  if (!Number.isFinite(n) || n <= 0) return null;
   // If the value is plausibly in seconds (< 10^12 ≈ year 2001 in ms, year 33658 in s),
   // convert to milliseconds
-  return expiresAt < 1e12 ? expiresAt * 1000 : expiresAt;
+  return n < 1e12 ? n * 1000 : n;
 }
 
 /**
  * Check if an OAuth token is expiring within the given threshold.
+ *
+ * No expiry at all means unknown, and the token is used until upstream says
+ * otherwise. An expiry that is present but not a number is treated as already
+ * reached: it cannot be trusted to lie in the future, and refreshing replaces
+ * it with one that can be compared.
  */
 export function isTokenExpiringSoon(expiresAt, thresholdMs = 5 * 60 * 1000) {
   if (!expiresAt) return false;
-  return Date.now() + thresholdMs >= normalizeExpiresAt(expiresAt);
+  const at = normalizeExpiresAt(expiresAt);
+  if (at == null) return true;
+  return Date.now() + thresholdMs >= at;
 }
 
 /**
@@ -230,7 +261,9 @@ export function isTokenExpiringSoon(expiresAt, thresholdMs = 5 * 60 * 1000) {
  */
 export function isTokenExpired(expiresAt) {
   if (!expiresAt) return false;
-  return Date.now() >= normalizeExpiresAt(expiresAt);
+  const at = normalizeExpiresAt(expiresAt);
+  if (at == null) return true; // present but unusable — see isTokenExpiringSoon
+  return Date.now() >= at;
 }
 
 /** Normalize the OAuth profile fields TeamClaude persists and exposes. */
@@ -518,12 +551,7 @@ async function exchangeCodeForTokens(code, state, codeVerifier, redirectUri, tok
     throw new Error(`Token exchange failed (${tokenRes.status}): ${text}`);
   }
 
-  const tokens = await tokenRes.json();
-  return {
-    accessToken: tokens.access_token,
-    refreshToken: tokens.refresh_token,
-    expiresAt: normalizeExpiresAt(tokens.expires_at) || (Date.now() + (tokens.expires_in || 3600) * 1000),
-  };
+  return tokenPairFromResponse(await tokenRes.json());
 }
 
 /**

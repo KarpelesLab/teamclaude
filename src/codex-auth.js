@@ -16,6 +16,7 @@ import { randomBytes, createHash } from 'node:crypto';
 import { exec } from 'node:child_process';
 import http from 'node:http';
 import { proxyFetch } from './upstream-fetch.js';
+import { tokenPairFromResponse } from './oauth.js';
 
 export const DEFAULT_CODEX_CREDENTIALS_PATH = '~/.codex/auth.json';
 
@@ -104,12 +105,9 @@ export async function refreshCodexToken(refreshToken, endpoint = TOKEN_ENDPOINT)
     throw err;
   }
 
-  const data = await res.json();
-  return {
-    accessToken: data.access_token,
-    refreshToken: data.refresh_token || refreshToken,
-    expiresAt: Date.now() + (data.expires_in || 3600) * 1000,
-  };
+  // Same checks as the Anthropic path: a 200 without an access token is an
+  // error, not a `Bearer undefined` waiting to happen.
+  return tokenPairFromResponse(await res.json(), { previousRefreshToken: refreshToken });
 }
 
 // ── Browser login ───────────────────────────────────────────────────────────
@@ -167,12 +165,10 @@ export function credentialsFromTokenResponse(data) {
   const claims = decodeJwtClaims(data.id_token) || {};
   const auth = claims['https://api.openai.com/auth'] || {};
   return {
-    accessToken: data.access_token,
-    refreshToken: data.refresh_token,
+    ...tokenPairFromResponse(data),
     accountId: auth.chatgpt_account_id,
     email: claims.email,
     planType: auth.chatgpt_plan_type,
-    expiresAt: Date.now() + (data.expires_in || 3600) * 1000,
   };
 }
 
