@@ -19,7 +19,6 @@ test('parses the forms people actually write', () => {
   assert.deepEqual(parseProxyUrl('host:3128'), { host: 'host', port: 3128, username: null, password: null });
   assert.deepEqual(parseProxyUrl('http://u:p@host:8080'), { host: 'host', port: 8080, username: 'u', password: 'p' });
   assert.equal(parseProxyUrl('http://host').port, 8080);       // default when unstated
-  assert.equal(parseProxyUrl('https://host').port, 443);
   assert.equal(parseProxyUrl(''), null);
   assert.equal(parseProxyUrl(null), null);
 });
@@ -35,6 +34,10 @@ test('credentials survive a round trip through percent-encoding', () => {
 
 test('a wrong protocol is named rather than failing later inside the tunnel', () => {
   assert.throws(() => parseProxyUrl('socks5://host:1080'), /unsupported proxy protocol "socks5"/);
+  // https:// used to be accepted, but nothing here speaks TLS to the proxy: the
+  // CONNECT and its Basic credentials went out in plaintext to port 443 and the
+  // connection never worked. Refuse it and say what to write instead.
+  assert.throws(() => parseProxyUrl('https://u:p@host'), /unsupported proxy protocol "https".*use http:\/\//);
   // Node's URL rejects an out-of-range port itself; either message is fine as
   // long as it names the offending value rather than failing at connect time.
   assert.throws(() => parseProxyUrl('http://host:99999'), /invalid proxy URL|invalid port/);

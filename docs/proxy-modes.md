@@ -75,7 +75,11 @@ restart.
   ciphertext only, and certificate verification is unchanged. A proxy that
   intercepts TLS needs its CA in `NODE_EXTRA_CA_CERTS`.
 - SOCKS proxies are not supported — only HTTP `CONNECT`. A `socks5://` value is
-  rejected at startup rather than failing later at connect time.
+  rejected at startup rather than failing later at connect time. So is an
+  `https://` proxy URL: TeamClaude does not speak TLS *to* the proxy, and
+  accepting the scheme would send the `CONNECT` (credentials included) in
+  plaintext to port 443. Write `http://host:port` — the tunnel through it is
+  end-to-end TLS regardless.
 
 This is a property of the **network**, not a routing policy: when set, it is
 simply how this machine reaches Anthropic. That is what separates it from sx.org
