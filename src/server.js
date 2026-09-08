@@ -1653,7 +1653,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // req.headers on the h2 server path; fetch rejects `:`-prefixed names.
     if (lk.startsWith(':')) continue;
     if (HOP_BY_HOP_HEADERS.has(lk)) continue;
-    if (lk === 'x-api-key') continue;
+    // Both credential headers are dropped, not just the one the account will
+    // set: applyAuthHeaders overwrites `authorization` only for bearer-token
+    // accounts, so on an API-key account the CLIENT's own
+    // `Authorization: Bearer <its Anthropic OAuth token>` would otherwise ride
+    // along untouched — to whatever host that account's `upstream` names.
+    if (lk === 'x-api-key' || lk === 'authorization') continue;
     // Strip accept-encoding: Node fetch auto-decompresses, which would
     // mismatch the Content-Encoding header we forward to the client
     if (lk === 'accept-encoding') continue;
