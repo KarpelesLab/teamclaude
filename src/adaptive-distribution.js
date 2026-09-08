@@ -82,6 +82,60 @@ export const ADAPTIVE_DEFAULTS = {
   maxBurnBoost: 4,
 };
 
+// The fields that are fractions of a window, or EWMA weights: bounded to the
+// unit interval, and the alphas additionally non-zero (an alpha of 0 would
+// mean "never learn", which is a request the learner cannot honour).
+const UNIT_FIELDS = ['minReserve', 'maxReserve'];
+const ALPHA_FIELDS = ['burnAlpha', 'concBackoff', 'concGrowth', 'concBackoffTo'];
+const POSITIVE_FIELDS = ['maxSampleAgeMs', 'lookaheadMs', 'burnWindowMs', 'initialConcCap', 'minConcCap', 'maxConcCap'];
+
+/**
+ * Check an `adaptiveDistribution` config block and return the fields to spread
+ * over ADAPTIVE_DEFAULTS. Throws an Error naming the offending field.
+ *
+ * Strict on purpose. Nothing in the learners or the scorer throws on a bad
+ * number: a NaN `burnAlpha` makes every burn rate NaN, every reserve NaN and
+ * every score NaN, and a NaN score loses to `-Infinity` — so the adaptive
+ * picker returns null and the even walk quietly takes over. The operator
+ * asked for adaptive, got even, and nothing said so. A typo in the field name
+ * is the same failure in a different coat: the value is ignored and the
+ * default keeps running. Both are refused at startup instead.
+ */
+export function validateAdaptiveConfig(raw) {
+  if (raw == null) return {};
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error('adaptiveDistribution must be an object of numeric fields');
+  }
+  const shown = v => (typeof v === 'string' ? JSON.stringify(v) : String(v));
+  const out = {};
+  for (const [field, value] of Object.entries(raw)) {
+    if (!Object.hasOwn(ADAPTIVE_DEFAULTS, field)) {
+      throw new Error(`adaptiveDistribution.${field} is not a setting (known fields: ${Object.keys(ADAPTIVE_DEFAULTS).join(', ')})`);
+    }
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+      throw new Error(`adaptiveDistribution.${field} must be a finite number, got ${shown(value)}`);
+    }
+    out[field] = value;
+  }
+  // Range checks run on the merged view, so a field left at its default is
+  // still compared against a provided partner (minReserve against maxReserve).
+  const merged = { ...ADAPTIVE_DEFAULTS, ...out };
+  const fail = (field, why) => {
+    throw new Error(`adaptiveDistribution.${field} ${why}, got ${shown(merged[field])}`);
+  };
+  for (const f of POSITIVE_FIELDS) if (!(merged[f] > 0)) fail(f, 'must be > 0');
+  for (const f of ALPHA_FIELDS) if (!(merged[f] > 0 && merged[f] <= 1)) fail(f, 'must be in (0, 1]');
+  for (const f of UNIT_FIELDS) if (!(merged[f] >= 0 && merged[f] <= 1)) fail(f, 'must be a fraction in [0, 1]');
+  if (merged.minReserve > merged.maxReserve) fail('minReserve', `must not exceed maxReserve (${merged.maxReserve})`);
+  if (!(merged.initialBurnRate >= 0)) fail('initialBurnRate', 'must be >= 0');
+  if (merged.minConcCap > merged.maxConcCap) fail('minConcCap', `must not exceed maxConcCap (${merged.maxConcCap})`);
+  if (merged.initialConcCap < merged.minConcCap || merged.initialConcCap > merged.maxConcCap) {
+    fail('initialConcCap', `must lie within [minConcCap, maxConcCap] = [${merged.minConcCap}, ${merged.maxConcCap}]`);
+  }
+  if (!(merged.maxBurnBoost >= 1)) fail('maxBurnBoost', 'must be >= 1');
+  return out;
+}
+
 /**
  * Learns how quickly each account is consuming each weekly window. Plan size
  * is deliberately not inferred here: AccountManager reads the subscription

@@ -8,6 +8,7 @@ import net from 'node:net';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, loadState, saveState } from './config.js';
 import { installCrashHandlers } from './crash-log.js';
 import { AccountManager, DEFAULT_SWITCH_THRESHOLD, distributionMode } from './account-manager.js';
+import { validateAdaptiveConfig } from './adaptive-distribution.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, loginOAuthWithPastedCode, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import {
@@ -262,7 +263,19 @@ async function serverCommand() {
   }
 
   const threshold = config.switchThreshold || 0.98;
-  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp, distributeSessions: config.distributeSessions, expiryRouting: config.expiryRouting, adaptive: config.adaptiveDistribution });
+  // Fatal on purpose, like a bad `upstreamProxy`: a NaN or out-of-range value
+  // in this block would not crash the router, it would make every adaptive
+  // score NaN and silently fall through to even distribution, with nothing
+  // pointing at the field that caused it. Checked whether or not the mode is
+  // on, so `teamclaude distribute adaptive` later cannot activate a bad block.
+  let adaptive;
+  try {
+    adaptive = validateAdaptiveConfig(config.adaptiveDistribution);
+  } catch (err) {
+    console.error(`[TeamClaude] Bad adaptiveDistribution setting in ${getConfigPath()}: ${err.message}`);
+    process.exit(1);
+  }
+  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp, distributeSessions: config.distributeSessions, expiryRouting: config.expiryRouting, adaptive });
   // Names the activity log's session column from Claude Code's own on-disk
   // session titles. Built whether or not the TUI runs, so a reload has one
   // object to reconfigure.

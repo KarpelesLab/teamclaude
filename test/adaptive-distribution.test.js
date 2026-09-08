@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountManager, distributionMode } from '../src/account-manager.js';
-import { BurnRateLearner, ConcurrencyLearner, scoreCandidate, ADAPTIVE_DEFAULTS } from '../src/adaptive-distribution.js';
+import { BurnRateLearner, ConcurrencyLearner, scoreCandidate, validateAdaptiveConfig, ADAPTIVE_DEFAULTS } from '../src/adaptive-distribution.js';
 
 const H = 3600_000;
 const OPUS = 'claude-opus-5';
@@ -728,4 +728,60 @@ test('a window reset does not leak across the burn measurement', () => {
   // The roll must not be measured as a huge negative or positive swing.
   assert.ok(l.burnRate(0, 'unified7d') >= 0 && l.burnRate(0, 'unified7d') < before * 2,
     'the reset must reopen the window rather than be measured across');
+});
+
+// ── The config block is checked before anything scores on it ────────────────
+//
+// Nothing downstream throws on a bad number: a NaN alpha makes every score NaN,
+// the adaptive picker returns null, and the even walk takes over in silence.
+// So the block is refused at startup, naming the field.
+
+test('validateAdaptiveConfig accepts nothing, an empty block, and in-range overrides', () => {
+  assert.deepEqual(validateAdaptiveConfig(undefined), {});
+  assert.deepEqual(validateAdaptiveConfig(null), {});
+  assert.deepEqual(validateAdaptiveConfig({}), {});
+  assert.deepEqual(validateAdaptiveConfig({ burnWindowMs: 60_000, burnAlpha: 1, minReserve: 0, maxReserve: 0.5 }),
+    { burnWindowMs: 60_000, burnAlpha: 1, minReserve: 0, maxReserve: 0.5 });
+  // Every default passes its own checks.
+  assert.deepEqual(validateAdaptiveConfig({ ...ADAPTIVE_DEFAULTS }), { ...ADAPTIVE_DEFAULTS });
+});
+
+test('validateAdaptiveConfig rejects NaN, zero, non-numeric and out-of-range values by name', () => {
+  const rejects = (block, field) => {
+    assert.throws(() => validateAdaptiveConfig(block), err => err.message.includes(`adaptiveDistribution.${field}`),
+      `${JSON.stringify(block)} should be refused naming ${field}`);
+  };
+  rejects({ burnAlpha: NaN }, 'burnAlpha');
+  rejects({ burnAlpha: Infinity }, 'burnAlpha');
+  rejects({ burnAlpha: 0 }, 'burnAlpha');
+  rejects({ burnAlpha: 1.5 }, 'burnAlpha');
+  rejects({ burnAlpha: '0.3' }, 'burnAlpha');
+  rejects({ burnWindowMs: 0 }, 'burnWindowMs');
+  rejects({ burnWindowMs: -1 }, 'burnWindowMs');
+  rejects({ lookaheadMs: null }, 'lookaheadMs');
+  rejects({ maxSampleAgeMs: true }, 'maxSampleAgeMs');
+  rejects({ concBackoff: 0 }, 'concBackoff');
+  rejects({ concBackoffTo: 2 }, 'concBackoffTo');
+  rejects({ concGrowth: -0.1 }, 'concGrowth');
+  rejects({ minReserve: -0.1 }, 'minReserve');
+  rejects({ maxReserve: 1.1 }, 'maxReserve');
+  // A pair is compared on the merged view, so one side left at its default
+  // still catches the other.
+  rejects({ minReserve: 0.5 }, 'minReserve');            // above the default maxReserve
+  rejects({ maxReserve: 0.001 }, 'minReserve');          // below the default minReserve
+  rejects({ initialBurnRate: -1 }, 'initialBurnRate');
+  rejects({ minConcCap: 0 }, 'minConcCap');
+  rejects({ minConcCap: 100 }, 'minConcCap');            // above the default maxConcCap
+  rejects({ initialConcCap: 0.5 }, 'initialConcCap');    // below the default minConcCap
+  rejects({ maxConcCap: 2 }, 'initialConcCap');          // the default initial cap no longer fits
+  rejects({ maxBurnBoost: 0.5 }, 'maxBurnBoost');
+  // A typo in the field name is the same silent failure in a different coat.
+  rejects({ burnAlfa: 0.3 }, 'burnAlfa');
+  assert.throws(() => validateAdaptiveConfig('adaptive'), /must be an object/);
+  assert.throws(() => validateAdaptiveConfig([0.3]), /must be an object/);
+});
+
+test('a bad adaptive value names itself and its value in the message', () => {
+  assert.throws(() => validateAdaptiveConfig({ burnAlpha: 'lots' }), /adaptiveDistribution\.burnAlpha must be a finite number, got "lots"/);
+  assert.throws(() => validateAdaptiveConfig({ burnWindowMs: 0 }), /adaptiveDistribution\.burnWindowMs must be > 0, got 0/);
 });
