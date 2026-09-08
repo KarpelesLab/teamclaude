@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { once } from 'node:events';
 import { createProxyServer } from '../src/server.js';
+import { allowLoopbackForward } from '../src/forward-target.js';
 
 async function listen(server) {
   server.listen(0, '127.0.0.1');
@@ -40,6 +41,7 @@ test('forwards an absolute-form HTTP request to its target host, not to Anthropi
   const targetPort = await listen(target);
 
   const proxy = createProxyServer(noRouteManager, { proxy: {}, upstream: 'https://api.anthropic.com' });
+  allowLoopbackForward(proxy); // the target stands in for a remote host but lives on 127.0.0.1
   const proxyPort = await listen(proxy);
 
   const r = await proxyRequest({ proxyPort, absoluteUrl: `http://127.0.0.1:${targetPort}/hello` });
@@ -62,6 +64,7 @@ test('forwards a POST body and method to the target', async () => {
   const targetPort = await listen(target);
 
   const proxy = createProxyServer(noRouteManager, { proxy: {}, upstream: 'https://api.anthropic.com' });
+  allowLoopbackForward(proxy); // the target stands in for a remote host but lives on 127.0.0.1
   const proxyPort = await listen(proxy);
 
   const r = await proxyRequest({ proxyPort, method: 'POST', absoluteUrl: `http://127.0.0.1:${targetPort}/`, body: 'payload-123' });
@@ -73,6 +76,7 @@ test('forwards a POST body and method to the target', async () => {
 
 test('returns 502 (not a hang) when the target host is unreachable', async () => {
   const proxy = createProxyServer(noRouteManager, { proxy: {}, upstream: 'https://api.anthropic.com' });
+  allowLoopbackForward(proxy); // the target stands in for a remote host but lives on 127.0.0.1
   const proxyPort = await listen(proxy);
 
   // Port 1 is not listening → connection refused.
@@ -81,4 +85,60 @@ test('returns 502 (not a hang) when the target host is unreachable', async () =>
   assert.match(r.body, /proxy_error/);
 
   proxy.close();
+});
+
+// ── Destination policy ───────────────────────────────────────
+//
+// The relay is transparent, and "transparent to anywhere" included this machine:
+// `GET http://127.0.0.1:<our port>/teamclaude/status` arrived at our own listener
+// from a loopback socket and passed the API-key gate as a local caller — so a
+// remote client holding only a low-trust key had the whole control plane, plus
+// any loopback-only service and the cloud metadata address.
+
+test('a forward to a loopback address is refused with 403 and never dialled', async () => {
+  const trap = http.createServer(() => { throw new Error('the proxy must not connect to a loopback target'); });
+  const trapPort = await listen(trap);
+  let connections = 0;
+  trap.on('connection', () => { connections++; });
+
+  const proxy = createProxyServer(noRouteManager, { proxy: {}, upstream: 'https://api.anthropic.com' });
+  const proxyPort = await listen(proxy);
+  try {
+    for (const target of [`http://127.0.0.1:${trapPort}/x`, `http://localhost:${trapPort}/x`, `http://[::1]:${trapPort}/x`, `http://0.0.0.0:${trapPort}/x`]) {
+      const r = await proxyRequest({ proxyPort, absoluteUrl: target });
+      assert.equal(r.status, 403, target);
+      assert.match(r.body, /refused/, target);
+    }
+    assert.equal(connections, 0, 'no connection may reach a loopback target');
+  } finally {
+    proxy.close(); trap.close();
+  }
+});
+
+test("a forward to the proxy's own listener is refused, not answered as a local caller", async () => {
+  // A key is configured, so a remote caller without it must be turned away —
+  // including one trying to arrive at the control plane through the relay.
+  const proxy = createProxyServer(noRouteManager, { proxy: { apiKey: 'k' }, upstream: 'https://api.anthropic.com' });
+  const proxyPort = await listen(proxy);
+  try {
+    // The test client is itself loopback and so passes the gate for the relay
+    // request; what matters is that the relayed hop is refused rather than
+    // served — the answer must be the 403, never the status document.
+    const r = await proxyRequest({ proxyPort, absoluteUrl: `http://127.0.0.1:${proxyPort}/teamclaude/status` });
+    assert.equal(r.status, 403);
+    assert.doesNotMatch(r.body, /accounts/);
+  } finally {
+    proxy.close();
+  }
+});
+
+test('the link-local range is refused by literal address', async () => {
+  const proxy = createProxyServer(noRouteManager, { proxy: {}, upstream: 'https://api.anthropic.com' });
+  const proxyPort = await listen(proxy);
+  try {
+    const r = await proxyRequest({ proxyPort, absoluteUrl: 'http://169.254.169.254/latest/meta-data/' });
+    assert.equal(r.status, 403);
+  } finally {
+    proxy.close();
+  }
 });

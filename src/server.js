@@ -15,6 +15,7 @@ import { applyAuthHeaders, upstreamFor, rewritesBody, providerForPath, providerO
 import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
 import { safeLine } from './safe-text.js';
+import { forwardRefusal, guardedLookup, FORBIDDEN_FORWARD } from './forward-target.js';
 import { renderDashboardHtml, dashboardCsp } from './dashboard.js';
 import { createUsageRecorder, resolveUsageDimensions, usageDimensionHeaderNames } from './client-usage.js';
 
@@ -632,6 +633,24 @@ export function relayHttpForward(req, res) {
     res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'Malformed forward-proxy URL' } }));
     return;
   }
+  // Destination policy, same as the CONNECT tunnel's (forward-target.js): a
+  // relay may not target this machine's loopback, the unspecified address, or
+  // link-local. `GET http://127.0.0.1:<our port>/teamclaude/status` would
+  // otherwise arrive at our own listener from a loopback socket and pass the
+  // API-key gate as a local caller. Refused by literal name here; the guarded
+  // lookup below refuses by resolved address, so a DNS alias for 127.0.0.1 does
+  // not get past either. Launched clients carry NO_PROXY for loopback, so no
+  // legitimate request is lost.
+  const hostname = target.hostname.replace(/^\[|\]$/g, '');
+  const refuse = (why) => {
+    console.error(`[TeamClaude] HTTP forward to ${target.host} refused: ${why}`);
+    if (res.headersSent) { res.destroy(); return; }
+    res.writeHead(403, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ type: 'error', error: { type: 'permission_error', message: `Forward to ${target.host} refused: ${why}` } }));
+  };
+  const refused = forwardRefusal(hostname, null, req.socket);
+  if (refused) { refuse(refused); return; }
+
   const transport = target.protocol === 'http:' ? http : https;
   const headers = {};
   for (const [key, value] of Object.entries(req.headers)) {
@@ -641,7 +660,7 @@ export function relayHttpForward(req, res) {
     headers[key] = value;
   }
 
-  const upstreamReq = transport.request(target, { method: req.method, headers }, (upstreamRes) => {
+  const upstreamReq = transport.request(target, { method: req.method, headers, lookup: guardedLookup(req.socket) }, (upstreamRes) => {
     const responseHeaders = {};
     for (const [key, value] of Object.entries(upstreamRes.headers)) {
       if (CONNECTION_SPECIFIC_HEADERS.has(key)) continue;
@@ -651,6 +670,7 @@ export function relayHttpForward(req, res) {
     upstreamRes.pipe(res);
   });
   upstreamReq.on('error', (err) => {
+    if (err.code === FORBIDDEN_FORWARD) { refuse(err.message); return; }
     console.error(`[TeamClaude] HTTP forward to ${target.host} failed:`, describeConnectError(err));
     if (!res.headersSent) {
       res.writeHead(502, { 'Content-Type': 'application/json' });

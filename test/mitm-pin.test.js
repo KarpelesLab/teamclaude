@@ -7,6 +7,7 @@ import tls from 'node:tls';
 import { once } from 'node:events';
 import { generateCertChain } from '../src/x509.js';
 import { createConnectHandler, resolveConnectPin, connectPinToken } from '../src/mitm.js';
+import { allowLoopbackForward } from '../src/forward-target.js';
 import { AccountManager } from '../src/account-manager.js';
 
 // MITM-mode account pinning (TC_ACCT). Inside a CONNECT tunnel the request path
@@ -64,6 +65,7 @@ function makeUpstream(handler) {
 
 function makeProxy(am, upPort, { leafCertPem, leafKeyPem }, config = {}) {
   const proxy = http.createServer();
+  allowLoopbackForward(proxy); // the tunnel targets below are on this machine
   proxy.on('connect', createConnectHandler({
     config: { upstream: `http://127.0.0.1:${upPort}`, ...config },
     accountManager: am,

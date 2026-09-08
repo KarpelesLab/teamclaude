@@ -10,7 +10,7 @@
 // different account when one returns a quota 429, instead of surfacing it. A host
 // routing table decides per-CONNECT behavior:
 //   api.anthropic.com → terminate + forward,  www.example.org → local test server,
-//   anything else      → blind tunnel.
+//   anything else      → blind tunnel (never to this machine — see forward-target.js).
 
 import { readFile, writeFile, mkdir, rename } from 'node:fs/promises';
 import { X509Certificate } from 'node:crypto';
@@ -22,6 +22,7 @@ import { getConfigPath } from './config.js';
 import { generateCertChain } from './x509.js';
 import { createProxyRequestListener, resolveClientAuth, isLoopbackAddr, relayUpgrade, resolveAccountPin, describeConnectError } from './server.js';
 import { interceptHostsFor, isNeverIntercepted } from './provider.js';
+import { forwardRefusal, guardedLookup, FORBIDDEN_FORWARD } from './forward-target.js';
 
 const CA_CERT = 'teamclaude-ca.pem';
 const LEAF_CERT = 'teamclaude-leaf.pem';
@@ -225,6 +226,18 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
     const mode = hostMode(host, config);
 
     if (mode === 'tunnel') {
+      // Destination policy (see forward-target.js): a tunnel may not reach
+      // this machine's loopback, the unspecified address, or link-local — that
+      // is how a remote client with only a low-trust key would reach our own
+      // listener as a "local" caller, or a cloud metadata endpoint. Refused by
+      // name here so the obvious case never dials; refused by resolved address
+      // in the lookup below so a DNS alias for 127.0.0.1 does not get past.
+      const refused = forwardRefusal(host, null, clientSocket);
+      if (refused) {
+        log(`[TeamClaude] CONNECT ${host}:${port} refused: ${refused}`);
+        refuseRaw(clientSocket, '403 Forbidden');
+        return;
+      }
       // Until the upstream connects we still owe the client a CONNECT status
       // line. If we tore the socket down on an upstream failure without one,
       // the client reports "Proxy connection ended before receiving CONNECT
@@ -243,13 +256,31 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
         }
         up.destroy(); clientSocket.destroy();
       };
-      const up = net.connect(port, host, () => {
+      const up = net.connect({ port, host, lookup: guardedLookup(clientSocket) }, () => {
+        // The lookup already vetted every resolved address; this re-checks the
+        // one actually connected (cheap, and independent of how the dial got
+        // there). A tunnel back to our own listener — any local address, our
+        // port — is a request loop with nothing legitimate behind it, whether
+        // or not the address class would otherwise pass.
+        const ownPort = clientSocket.server?.address?.()?.port;
+        const refusedAfter = forwardRefusal(host, up.remoteAddress, clientSocket)
+          || (up.remotePort === ownPort && up.localAddress === up.remoteAddress ? 'that is this proxy\'s own listener' : null);
+        if (refusedAfter) {
+          log(`[TeamClaude] CONNECT ${host}:${port} refused: ${refusedAfter}`);
+          teardown('403 Forbidden');
+          return;
+        }
         established = true;
         reply200Raw(clientSocket);
         if (head && head.length) up.write(head);
         up.pipe(clientSocket); clientSocket.pipe(up);
       });
       up.on('error', (err) => {
+        if (err.code === FORBIDDEN_FORWARD) {
+          log(`[TeamClaude] CONNECT ${host}:${port} refused: ${err.message}`);
+          teardown('403 Forbidden');
+          return;
+        }
         if (!established) log(`[TeamClaude] tunnel ${host}:${port} failed: ${describeConnectError(err)}`);
         teardown('502 Bad Gateway');
       });
@@ -382,7 +413,12 @@ export function connectAuthorized(req, socket, proxyApiKey) {
 }
 
 function reply200Raw(sock) { sock.write('HTTP/1.1 200 Connection Established\r\n\r\n'); }
-function reply502Raw(sock) { try { sock.write('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n'); } catch { /* client already gone */ } }
+function reply502Raw(sock) { refuseRaw(sock, '502 Bad Gateway'); }
+// Answer a CONNECT with a final status line and close — the client never gets a tunnel.
+function refuseRaw(sock, statusLine) {
+  try { sock.write(`HTTP/1.1 ${statusLine}\r\nConnection: close\r\n\r\n`); } catch { /* client already gone */ }
+  sock.destroy();
+}
 
 function termClaude(clientSocket, head, key, cert, alpn) {
   if (head && head.length) clientSocket.unshift(head);
