@@ -2268,9 +2268,10 @@ export class AccountManager {
    * Settle the roll the confirmed move escaped, on the evidence that the
    * destination SERVED a request selecting under that move. Another account, or
    * any move since, is a different stay. A roll another fleet escaped is not
-   * this request's to settle, and a confirmation naming no fleet settles
-   * nothing. Every other roll on the chain waits for its own fail-back or for
-   * the stay of its own move.
+   * this request's to settle unless the destination is one that fleet can never
+   * be served at, and a confirmation naming no fleet settles nothing. Every
+   * other roll on the chain waits for its own fail-back or for the stay of its
+   * own move.
    *
    * @param {Observation} obs
    * @param {string|null} provider
@@ -2279,7 +2280,14 @@ export class AccountManager {
     if (!obs || carried == null) return;
     if (obs.idx !== account.index || obs.gen !== carried) return;
     const owed = findHeld(obs.unescaped, h => h.gen === carried);
-    if (!owed || !provider || owed.provider !== provider) return;
+    if (!owed || !provider) return;
+    // A subscription outside the hold's own fleet can never serve that fleet, so
+    // no success of the holder's can ever arrive to settle the roll and a success
+    // by a fleet that can be served there releases it instead. A shared key is
+    // not such a destination: both fleets reach it, so the holder's own success
+    // is still owed there and a foreigner's still settles nothing.
+    const unreachable = providerOf(account) !== owed.provider && isSubscriptionAccount(account);
+    if (owed.provider !== provider && !unreachable) return;
     obs.unescaped = dropHeld(obs.unescaped, owed.idx);
   }
 
