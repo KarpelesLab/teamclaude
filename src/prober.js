@@ -83,14 +83,14 @@ export class Prober {
    * is serving traffic perfectly well. The keep-warm scheduler already draws
    * this line (warmer.js `_isWarmTarget`); the probe did not.
    */
+  _isProbeTarget(account) {
+    return !!account && account.type === 'oauth' && !!account.credential && !account.upstream;
+  }
+
   /** A third-party backend that publishes a quota of its own. The provider
    * module decides which; nothing in this file knows one by name. */
   _isBackendTarget(account) {
     return !!account?.credential && hasBackendQuota(account);
-  }
-
-  _isProbeTarget(account) {
-    return !!account && account.type === 'oauth' && !!account.credential && !account.upstream;
   }
 
   async probeAccount(account) {

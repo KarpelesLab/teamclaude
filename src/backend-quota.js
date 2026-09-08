@@ -11,6 +11,8 @@
 // dollar balance at its own path and its own JSON shape; a provider that
 // reports nothing simply has no entry and reads as unknown, exactly as now.
 
+import { proxyFetch } from './upstream-fetch.js';
+
 /**
  * A normalized reading. `text` is what the operator reads; `utilization` is set
  * only when a provider actually reports a 0-1 fraction, so a renderer can draw
@@ -66,7 +68,7 @@ export function hasBackendQuota(account) {
  *
  * @returns {Promise<BackendQuota | { error: string } | null>}
  */
-export async function fetchBackendQuota(account, { fetchImpl = fetch, timeoutMs = 10_000 } = {}) {
+export async function fetchBackendQuota(account, { fetchImpl = proxyFetch, timeoutMs = 10_000 } = {}) {
   const provider = providerFor(account?.upstream);
   if (!provider || !account?.credential) return null;
 

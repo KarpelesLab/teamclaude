@@ -10,7 +10,12 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
   const lines = [];
   const probe = status.probe || { enabled: false, intervalSeconds: 0, accounts: [] };
   const warm = status.warm || { enabled: false, intervalSeconds: 0, accounts: [] };
-  const accounts = status.accounts || [];
+  // Listed in preference order, which is what an operator configured priority to
+  // mean: the account the fleet reaches for first is at the top, the last resort
+  // at the bottom. The payload arrives in config-file order, so an account moved
+  // to the back of the ladder still read as second in the list. Ties keep their
+  // configured order (the sort is stable), which is also the rotation cursor's.
+  const accounts = [...(status.accounts || [])].sort((a, b) => (a.priority || 0) - (b.priority || 0));
   const blocked = (status.blockedModels || []).filter(p => typeof p === 'string' && p.length);
 
   lines.push(paint.bold('TeamClaude status'));

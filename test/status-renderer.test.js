@@ -353,3 +353,18 @@ test('the blocked line names the cap as the reason', () => {
   status.accounts[0].unavailable = 'capped';
   assert.match(renderStatus(status, { color: false, now }), /Blocked\s+account usage cap reached \(maxUsage\)/);
 });
+
+test('accounts are listed in priority order, not config order', () => {
+  const acct = (name, priority) => ({ name, type: 'oauth', status: 'active', priority, quota: {}, usage: {} });
+  const out = renderStatus({
+    currentAccount: 'first',
+    switchThreshold: 0.98,
+    // Config order puts the last-resort account second, which is how it reached
+    // the payload and how it used to render.
+    accounts: [acct('first', -1), acct('last-resort', 300), acct('fallback', 100)],
+  }, { color: false, now });
+
+  const order = out.split('\n').filter(l => /\(oauth, prio/.test(l))
+    .map(l => l.trim().replace(/^>\s*/, '').split(' ')[0]);
+  assert.deepEqual(order, ['first', 'fallback', 'last-resort']);
+});
