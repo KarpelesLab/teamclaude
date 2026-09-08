@@ -1323,6 +1323,67 @@ test('removing an account renumbers a held roll without changing whose it is', (
     'the renumbering dropped the fleet the held roll belongs to');
 });
 
+test('removing the account the reading rests on keeps every other roll', () => {
+  // The removal settles the roll of the account that went away and no other, so
+  // what the reading was holding for the rest is still owed to them. It moves
+  // onto a reading that names nobody, which is where a fail-back finds it.
+  // Windows far enough apart that each roll has one destination, so the chain
+  // below is deterministic: a2's roll held over a1's, with the reading on a3.
+  const am = mgr(['a1', 'a2', 'a3', 'a4'], ON);
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30], [3, 40]]) bucket(am, i, 'unified7d', 0.4, hours);
+  assert.equal(serve(am, null, OPUS).name, 'a1', 'the fixture must start on a1');
+  rollWindow(am, 0);
+  assert.equal(serve(am, null, OPUS).name, 'a2', 'a1\'s roll did not preempt');
+  assert.equal(serve(am, null, OPUS).name, 'a2', 'the preemption did not settle on a2');
+  rollWindow(am, 1);
+  assert.equal(serve(am, null, OPUS).name, 'a3', 'a2\'s roll did not preempt');
+  assert.equal(serve(am, null, OPUS).name, 'a3', 'the second preemption did not settle on a3');
+  assert.equal(am._currentObs.unescaped?.idx, 1, 'the fixture must hold a2\'s roll');
+  assert.equal(am._currentObs.unescaped?.prev?.idx, 0, 'the fixture must hold a1\'s roll under it');
+
+  am.removeAccount(2);
+  assert.notEqual(am._currentObs, null, 'removing the resting account discarded the whole chain');
+  assert.equal(am._currentObs.unescaped?.idx, 1, 'a2\'s held roll did not survive the removal');
+  assert.equal(am._currentObs.unescaped?.prev?.idx, 0, 'a1\'s held roll did not survive the removal');
+
+  // a4 inherited the removed slot and is excluded, so the traffic reaches a1
+  // through a cursor move and never rests on the account it came from.
+  assert.equal(serve(am, null, OPUS, { exclude: new Set([1, 2]) }).name, 'a1',
+    'the forced fail-back did not reach a1');
+  assert.equal(am._currentRolledOver(am.accounts[0], OPUS), true,
+    'the fail-back onto a1 did not find the week a1 gained still held');
+});
+
+test('removing an account no roll was taken on leaves the chain where it is', () => {
+  // The bystander case, and the discriminator for the arm above: the reading
+  // still names the account it rests on, so nothing about the chain moves.
+  // Windows far enough apart that each roll has one destination, so the chain
+  // below is deterministic: a2's roll held over a1's, with the reading on a3.
+  const am = mgr(['a1', 'a2', 'a3', 'a4'], ON);
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30], [3, 40]]) bucket(am, i, 'unified7d', 0.4, hours);
+  assert.equal(serve(am, null, OPUS).name, 'a1', 'the fixture must start on a1');
+  rollWindow(am, 0);
+  assert.equal(serve(am, null, OPUS).name, 'a2', 'a1\'s roll did not preempt');
+  assert.equal(serve(am, null, OPUS).name, 'a2', 'the preemption did not settle on a2');
+  rollWindow(am, 1);
+  assert.equal(serve(am, null, OPUS).name, 'a3', 'a2\'s roll did not preempt');
+  assert.equal(serve(am, null, OPUS).name, 'a3', 'the second preemption did not settle on a3');
+  assert.equal(am._currentObs.unescaped?.idx, 1, 'the fixture must hold a2\'s roll');
+  assert.equal(am._currentObs.unescaped?.prev?.idx, 0, 'the fixture must hold a1\'s roll under it');
+
+  am.removeAccount(3);
+  assert.notEqual(am._currentObs, null, 'removing a bystander discarded the whole chain');
+  assert.equal(am._currentObs.unescaped?.idx, 1,
+    'a2\'s held roll did not survive a bystander\'s removal');
+  assert.equal(am._currentObs.unescaped?.prev?.idx, 0,
+    'a1\'s held roll did not survive a bystander\'s removal');
+
+  assert.equal(serve(am, null, OPUS, { exclude: new Set([1, 2]) }).name, 'a1',
+    'the forced fail-back did not reach a1');
+  assert.equal(am._currentRolledOver(am.accounts[0], OPUS), true,
+    'the fail-back onto a1 did not find the week a1 gained still held');
+});
+
 test('a roll a borrowed walk holds belongs to the fleet whose reading it preserves', () => {
   // A borrower resting on the owner's cursor account writes the OWNER's rolled
   // reading into the hold. Stamping the writer there would hand the owner's roll
@@ -1644,6 +1705,34 @@ test('removing an account renumbers a session pin\'s held roll too', () => {
   am.removeAccount(0);
   assert.equal(am.sessionTracker.refsFor('s1', 'unified7d').unescaped, null,
     'the pin\'s held roll outlived the account it was taken on');
+});
+
+test('removing the account a pin\'s reading names keeps the roll it holds', () => {
+  // The pin store answers the same question the cursor store does, by different
+  // code. The ref names the account that went away, but the roll it holds is
+  // another account's and is still owed there, so the ref stays on naming nobody
+  // until traffic returning to that account is handed it.
+  const am = mgr(['a', 'b', 'c', 'd'], ON, { distributeSessions: true });
+  for (const i of [0, 1, 2, 3]) bucket(am, i, 'unified7d', 0.4, 10 + i * 10);
+  const ref = () => am.sessionTracker.refsFor('s1', 'unified7d');
+  assert.equal(serve(am, 's1', OPUS).name, 'a', 'the fixture must start on a');
+  rollWindow(am, 0);
+  assert.equal(serve(am, 's1', OPUS).name, 'b', 'the rollover did not move the pin to b');
+  // One request rests on b, which holds a's roll without confirming the stay.
+  assert.equal(serve(am, 's1', OPUS).name, 'b', 'the arrival did not settle on b');
+  assert.equal(ref()?.unescaped?.idx, 0, 'the fixture must have held a\'s roll on the pin');
+
+  am.removeAccount(1);
+  assert.notEqual(ref(), null, 'removing the account the ref names discarded the roll it held');
+  assert.equal(ref()?.unescaped?.idx, 0, 'a\'s held roll did not survive the removal');
+
+  // The pin went with b, so this request re-routes rather than returning to a
+  // pin; the ref is read whatever the pin loop left, which is where a's roll is
+  // handed back.
+  assert.equal(serve(am, 's1', OPUS, { exclude: new Set([1, 2]) }).name, 'a',
+    'the forced fail-back did not reach a');
+  assert.equal(am._pinRolledOver('s1', am.accounts[0], OPUS), true,
+    'the fail-back onto a did not find the week a gained still held');
 });
 
 test('removing an account renumbers a held roll rather than aiming it elsewhere', () => {

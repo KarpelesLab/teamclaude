@@ -441,13 +441,17 @@ export class SessionTracker {
         else pin.idx = moved;
       }
       // An observation names its account by the same position, so it follows the
-      // same shift. One naming the account that went away is dropped whole:
-      // left behind, it would be read against whatever inherits the slot.
+      // same shift. One naming the account that went away is dropped only if it
+      // holds nothing. Left behind it would be read against whatever inherits
+      // the slot, but the rolls it holds for OTHER accounts are still owed to
+      // them, so the ref stays on naming nobody until each is handed back.
       for (const [bucket, ref] of [...s.refs]) {
         const moved = ref.idx == null ? null : mapFn(ref.idx);
-        if (ref.idx != null && moved == null) { s.refs.delete(bucket); continue; }
+        const held = remapHeld(ref.unescaped, mapFn);
+        if (ref.idx != null && moved == null && !held) { s.refs.delete(bucket); continue; }
         ref.idx = moved;
-        ref.unescaped = remapHeld(ref.unescaped, mapFn);
+        ref.windows = moved == null ? new Map() : ref.windows;
+        ref.unescaped = held;
       }
     }
   }

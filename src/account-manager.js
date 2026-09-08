@@ -2180,7 +2180,7 @@ export class AccountManager {
    */
   _firstSightOn(obs, account) {
     if (!obs || !account) return;
-    if (obs.idx != null && obs.idx !== account.index) {
+    if (obs.idx !== account.index) {
       // A fail-back reaches its origin through a cursor move rather than a rest:
       // the pass returning the traffic finds the cursor still on the account
       // that refused it, so _restOn never sees the arrival. The held roll is
@@ -2188,7 +2188,10 @@ export class AccountManager {
       // Matched on index alone, whatever fleet holds it and whatever move
       // escaped it: handing a roll back to the account that owes it is a
       // restoration and not a settlement by anyone. Only that account's roll is
-      // given back, so every other escape still outstanding stands.
+      // given back, so every other escape still outstanding stands. A reading
+      // that names no account arrives here too, and one holding nothing for this
+      // account takes the same fresh reading it always did: there is no account
+      // at a null index for _anyJumped to have rolled.
       const owed = findHeld(obs.unescaped, h => h.idx === account.index);
       if (owed) {
         this._moveObs(obs, account.index);
@@ -3629,9 +3632,15 @@ export class AccountManager {
       // Renumbering is nobody's success, and it names the same account by a new
       // index, so everything but the two indices survives the shift: the stamp
       // saying whose reading this is, and the gen a request already in flight
-      // against that account still confirms its stay on.
-      this._currentObs = moved == null ? null
-        : { ...this._currentObs, idx: moved, unescaped: remapHeld(this._currentObs.unescaped, remap) };
+      // against that account still confirms its stay on. The account that went
+      // away is the only one whose roll the removal settles, so what it was
+      // holding for the others moves onto a fresh reading. That reading names no
+      // account and has no windows, which is evidence about nobody, while every
+      // hold under it keeps its own stamp and gen.
+      const held = remapHeld(this._currentObs.unescaped, remap);
+      this._currentObs = moved != null
+        ? { ...this._currentObs, idx: moved, unescaped: held }
+        : held ? { ...newObservation(), unescaped: held } : null;
     }
     // A throttle key names an account by index, so the shift would point a live
     // entry at a different account. Not worth renumbering: the entries expire in
