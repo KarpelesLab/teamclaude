@@ -669,6 +669,7 @@ export class AccountManager {
     }
 
     let account;
+    let walked = null;
     // Scoped rather than threaded through _select/_selectNext/_divertedFor: the
     // whole walk is synchronous, so nothing can interleave and observe it, and
     // the alternative is a provider argument on six private methods that exist
@@ -685,6 +686,7 @@ export class AccountManager {
     } finally {
       this._selectingProvider = null;
       this._selectionDecision = null;
+      if (borrowed) walked = this.currentIndex;
       // Hand the slot back before anything can observe it moved. Only the
       // provider that owns currentIndex gets to change it.
       if (borrowed) this.currentIndex = saved;
@@ -696,7 +698,14 @@ export class AccountManager {
     // the next real failover unpaced.
     if (account) {
       this.routeCursors.set(this._cursorKey(model, advisorModel, provider), account.index);
-      this.providerCursors.set(providerOf(account), account.index);
+      // A borrowed walk leaves the switch it spent in currentIndex, captured
+      // above as `walked` while the slot still holds it. A pinned return moves
+      // that slot nowhere, so `walked` names the foreign owner instead: falling
+      // back to the account that served keeps this provider from resting on no
+      // cursor at all.
+      const rest = walked != null && providerOf(this.accounts[walked]) === provider
+        ? walked : account.index;
+      if (providerOf(this.accounts[rest]) === provider) this.providerCursors.set(provider, rest);
     }
     return account;
   }

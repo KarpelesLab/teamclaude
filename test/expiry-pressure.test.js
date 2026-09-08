@@ -686,6 +686,156 @@ test('path 3: the band that refuses the switch reads the fleet the walk serves, 
     'the Codex fleet\'s cursor did not follow the switch its own band admitted');
 });
 
+// ---------------------------------------------------------------------------
+// The borrowed walk's cursor
+// ---------------------------------------------------------------------------
+
+// Index 0 is the Codex account, so a default-provider request does not own
+// `currentIndex` and borrows the slot for its walk. `R` alone carries an expired
+// 5h window, so it is what the reset switch installs; `P` is what a pin serves.
+const f1 = (opts, withCodex = true) => {
+  const fleet = withCodex ? [oauth('codex', { provider: 'codex' })] : [];
+  fleet.push(oauth('cur'), oauth('R'), oauth('P'));
+  const am = mgr(fleet, opts);
+  const at = name => am.accounts.findIndex(a => a.name === name);
+  if (withCodex) bucket(am, at('codex'), 'unified7d', 0.00, 1);
+  bucket(am, at('cur'), 'unified7d', 0.50, 100);
+  bucket(am, at('R'), 'unified7d', 0.10, 10);
+  bucket(am, at('P'), 'unified7d', 0.50, 50);
+  am.accounts[at('R')].quota.unified5h = 0.5;
+  am.accounts[at('R')].quota.unified5hReset = Date.now() - 1000;
+  return am;
+};
+
+test('a borrowed walk\'s reset switch survives the pin that served the request', () => {
+  const am = f1({ expiry: ON, distributeSessions: true, routes: [] });
+  const ixOf = name => am.accounts.findIndex(a => a.name === name);
+  am.providerCursors.set(DEFAULT_PROVIDER, ixOf('cur'));
+
+  // Asked of a TWIN, because reading availability clears the expired window the
+  // switch is triggered by. These two guard the whole family's fixture.
+  const twin = f1({ expiry: ON, distributeSessions: true, routes: [] });
+  twin.providerCursors.set(DEFAULT_PROVIDER, twin.accounts.findIndex(a => a.name === 'cur'));
+  assert.deepEqual(
+    twin._bandedCandidates(twin._excludeOtherProviders(null, DEFAULT_PROVIDER), OPUS).map(a => a.name),
+    ['R'], 'the fixture must give the Anthropic partition\'s band to the challenger');
+  assert.equal(twin.accounts[twin.providerCursors.get(DEFAULT_PROVIDER)]?.name, 'cur',
+    'the fixture must rest the Anthropic fleet on cur, or the arm tests nothing');
+
+  am.recordSession('S-1', ixOf('P'), OPUS);
+  const served = am.getActiveAccount(null, OPUS, null, 'S-1', DEFAULT_PROVIDER);
+  assert.equal(served.name, 'P', 'the session pin must serve this request, or the arm tests nothing');
+  // Names the account rather than an index, so a cursor that never moved cannot pass.
+  assert.equal(am.accounts[am.providerCursors.get(DEFAULT_PROVIDER)]?.name, 'R',
+    'the pin that served the request overwrote the reset switch the walk spent');
+  assert.equal(am.getActiveAccount(null, OPUS).name, 'R',
+    'the request behind the pinned one did not find the fleet where the switch left it');
+});
+
+test('a route pin\'s borrowed walk records the switch the same way a session\'s does', () => {
+  const am = f1({ expiry: ON, routes: [{ name: 'opus', match: '*opus*' }] });
+  const ixOf = name => am.accounts.findIndex(a => a.name === name);
+  am.providerCursors.set(DEFAULT_PROVIDER, ixOf('cur'));
+  assert.equal(am.setRoutePin('opus', ixOf('P')).ok, true,
+    'the fixture must pin the opus route to P, or the arm tests nothing');
+
+  const served = am.getActiveAccount(null, OPUS, null, null, DEFAULT_PROVIDER);
+  assert.equal(served.name, 'P', 'the route pin must serve this request, or the arm tests nothing');
+  assert.equal(am.accounts[am.providerCursors.get(DEFAULT_PROVIDER)]?.name, 'R',
+    'the route pin that served the request overwrote the reset switch the walk spent');
+  // Cleared first: the pin governs the later request too, and would answer P
+  // whatever the cursor says.
+  am.clearRoutePin('opus');
+  assert.equal(am.getActiveAccount(null, OPUS).name, 'R',
+    'the request behind the pinned one did not find the fleet where the switch left it');
+});
+
+test('a single-provider fleet\'s switch is recorded exactly as it was', () => {
+  const am = f1({ expiry: ON, distributeSessions: true, routes: [] }, false);
+  const ixOf = name => am.accounts.findIndex(a => a.name === name);
+  am.providerCursors.set(DEFAULT_PROVIDER, ixOf('cur'));
+  am.recordSession('S-1', ixOf('P'), OPUS);
+
+  const served = am.getActiveAccount(null, OPUS, null, 'S-1', DEFAULT_PROVIDER);
+  assert.equal(served.name, 'P', 'the session pin must serve this request, or the arm tests nothing');
+  assert.equal(am.accounts[am.currentIndex].name, 'R',
+    'the one fleet in the config lost the switch its own walk spent');
+  assert.equal(am.getActiveAccount(null, OPUS).name, 'R',
+    'the request behind the pinned one did not find the fleet where the switch left it');
+  assert.equal(am.accounts[am.providerCursors.get(DEFAULT_PROVIDER)]?.name, 'R',
+    'the single-provider cursor does not name where the fleet rests');
+});
+
+test('two providers and no pin at all still persist the switch', () => {
+  const am = f1({ expiry: ON });
+  const ixOf = name => am.accounts.findIndex(a => a.name === name);
+  am.providerCursors.set(DEFAULT_PROVIDER, ixOf('cur'));
+
+  const served = am.getActiveAccount(null, OPUS, null, null, DEFAULT_PROVIDER);
+  assert.equal(served.name, 'R', 'the walk must return the switch destination itself, or the arm tests nothing');
+  assert.equal(am.accounts[am.providerCursors.get(DEFAULT_PROVIDER)]?.name, 'R',
+    'a borrowed walk that returned the destination still lost it');
+  assert.equal(am.getActiveAccount(null, OPUS).name, 'R',
+    'the request behind it did not find the fleet where the switch left it');
+});
+
+// The value guard's two faces. No account has a pending reset here, and the
+// session pin returns without the walk moving `currentIndex` at all, so
+// `walked` names the Codex account that owns the slot.
+const f2 = () => {
+  const am = mgr([oauth('codex', { provider: 'codex' }), oauth('a1'), oauth('a2')],
+    { expiry: ON, distributeSessions: true });
+  bucket(am, 0, 'unified7d', 0.00, 1);
+  bucket(am, 1, 'unified7d', 0.10, 10);
+  bucket(am, 2, 'unified7d', 0.50, 50);
+  return am;
+};
+
+test('a provider with no cursor yet is not given another provider\'s account', () => {
+  const am = f2();
+  const ixOf = name => am.accounts.findIndex(a => a.name === name);
+  am.recordSession('S-2', ixOf('a2'), OPUS);
+
+  const served = am.getActiveAccount(null, OPUS, null, 'S-2', DEFAULT_PROVIDER);
+  assert.equal(served.name, 'a2', 'the session pin must serve this request, or the arm tests nothing');
+  assert.equal(am.accounts[am.providerCursors.get(DEFAULT_PROVIDER)]?.name, 'a2',
+    'a provider whose first request was pinned was left with no cursor of its own');
+  assert.notEqual(am.accounts[am.providerCursors.get(DEFAULT_PROVIDER)]?.name, 'codex',
+    'the Anthropic cursor names an account on another provider, which its own re-seed refuses');
+});
+
+test('a pinned return leaves the provider\'s cursor where its traffic rests', () => {
+  const am = f2();
+  const ixOf = name => am.accounts.findIndex(a => a.name === name);
+  am.providerCursors.set(DEFAULT_PROVIDER, ixOf('a1'));
+  am.recordSession('S-2', ixOf('a2'), OPUS);
+
+  const served = am.getActiveAccount(null, OPUS, null, 'S-2', DEFAULT_PROVIDER);
+  assert.equal(served.name, 'a2', 'the session pin must serve this request, or the arm tests nothing');
+  assert.equal(am.accounts[am.providerCursors.get(DEFAULT_PROVIDER)]?.name, 'a1',
+    'one pinned request moved the fleet\'s resting place to the account it was pinned to');
+});
+
+test('a shared key serving another provider\'s request leaves both cursors intact', () => {
+  const am = mgr([oauth('a1'), { name: 'kn', type: 'apikey', apiKey: 'k' },
+    oauth('c', { provider: 'codex' })], { expiry: ON });
+  const ixOf = name => am.accounts.findIndex(a => a.name === name);
+  bucket(am, ixOf('a1'), 'unified7d', 0.40, 10);
+  bucket(am, ixOf('kn'), 'unified7d', 0.40, 20);
+  bucket(am, ixOf('c'), 'unified7d', 0.40, 30);
+  am.providerCursors.set(DEFAULT_PROVIDER, ixOf('a1'));
+  am.providerCursors.set('codex', ixOf('c'));
+
+  // An API key serves either fleet and reads as the default provider, so this
+  // Codex request returns an account no Codex cursor may name.
+  const served = am.getActiveAccount(new Set([ixOf('c')]), OPUS, null, null, 'codex');
+  assert.equal(served.name, 'kn', 'the shared key must serve this request, or the arm tests nothing');
+  assert.equal(am.accounts[am.providerCursors.get(DEFAULT_PROVIDER)]?.name, 'a1',
+    'a Codex request on the shared key moved the Anthropic fleet\'s cursor');
+  assert.equal(am.accounts[am.providerCursors.get('codex')]?.name, 'c',
+    'the Codex cursor was overwritten with an account its own re-seed refuses');
+});
+
 test('path 3: a hop that refuses to move does not park the fleet on a paused account', () => {
   // A paused account is still _isAvailable: the pause is the hop's own test, so
   // an ordinary retry excluding the account it just tried, which is what a grown
