@@ -2285,8 +2285,11 @@ export class AccountManager {
     // no success of the holder's can ever arrive to settle the roll and a success
     // by a fleet that can be served there releases it instead. A shared key is
     // not such a destination: both fleets reach it, so the holder's own success
-    // is still owed there and a foreigner's still settles nothing.
-    const unreachable = providerOf(account) !== owed.provider && isSubscriptionAccount(account);
+    // is still owed there and a foreigner's still settles nothing. A roll naming
+    // no fleet has no partition to be served across, so it keeps the owner-only
+    // gate.
+    const unreachable = owed.provider != null
+      && providerOf(account) !== owed.provider && isSubscriptionAccount(account);
     if (owed.provider !== provider && !unreachable) return;
     obs.unescaped = dropHeld(obs.unescaped, owed.idx);
   }
