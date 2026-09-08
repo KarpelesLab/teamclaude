@@ -76,7 +76,8 @@ test('a request past the upstream pool and queue gets a 503, with no account rot
     held[1].writeHead(200, { 'content-type': 'application/json' });
     held[1].end('{}');
     assert.equal((await third).status, 200);
-    assert.equal(reached, 3);
+    // First and third reached the upstream; the refused second never did.
+    assert.equal(reached, 2);
   } finally {
     proxy.closeAllConnections(); proxy.close();
     upstream.closeAllConnections(); upstream.close();
