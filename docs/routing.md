@@ -153,20 +153,20 @@ Plan size comes from authoritative account metadata; only dynamic behavior is le
 | Input | Source | Used for |
 | --- | --- | --- |
 | **Plan tier** | OAuth profile organization and seat tier, using the same persisted 1x/5x/20x mapping as quota summary. | Making “least remaining” comparable across differently sized subscriptions without estimating the subscription from traffic. |
-| **Tolerated concurrency** | AIMD: retreat below the depth that upstream throttled, creep back up while running at the cap without trouble. | The response-speed term, so an account is never concentrated onto past the point where the next session would just queue. |
+| **Tolerated concurrency** | AIMD: retreat below the load that upstream throttled, creep back up while running at the cap without trouble. Load is measured as active sessions plus requests in flight, the same figure the score compares against the cap. | The response-speed term: an account's share of *new sessions* decays as its load approaches the learned cap, so concentrating for quota reasons stops before the next session would just queue. It shapes placement only — it does not bound admission, and a request already on an account is never held back by it. |
 
 The taper's width is adaptive too, rather than a fixed percentage: it is how much of the window the account would spend in the next 30 minutes **at its own observed burn rate**, so a fast-burning account is given a wide margin and an idle one may run much closer to the threshold.
 
 The threshold it tapers toward is **your** `switchThreshold`, including the per-bucket form — set `{ "default": 0.98, "unified7d": 0.85 }` and the weekly taper reaches zero at 85%, not 98%.
 
-Quota response headers supply utilization and reset time. Burn rate is learned from fresh readings of each individual quota window; a response that refreshes only shared weekly quota does not rebaseline a cached family window.
+Quota response headers supply utilization and reset time. Burn rate is learned from fresh readings of each individual quota window; a response that refreshes only shared weekly quota does not rebaseline a cached family window. The burn-rate and concurrency learners run, and persist to the state file, in **every** mode — they have no effect on routing unless `distributeSessions` is `"adaptive"`, but what they have already observed is in hand the moment it is.
 
 **Reading the result.** In this mode `teamclaude status` adds an `Adaptive` line per account, and the header reads `adapting`:
 
 ```
 > account-a (Max 20x) (oauth, prio 0) active 3 sess
   Weekly   [███████████░░░░░░░] 62% reset 3d8h
-  Adaptive next · weight 36%  ·  3 sess / 3 inflight  ·  head 36.0% of 98%  ·  plan 20x  ·  conc 6.0
+  Adaptive next · weight 36% of opus+  ·  3 sess / 3 inflight  ·  head 36.0% of 98%  ·  plan 20x  ·  conc 6.0
 ```
 
 `next` names the account the deterministic picker would choose for the next new session. `weight` is that account's score normalized across the competing tier; it explains how strongly the inputs favor an account, but is not a routing probability. `plan` is the subscription multiplier read from the OAuth profile, not inferred from traffic. An unknown future tier is shown as `plan unknown`, and its competing tier falls back to plain utilization fractions rather than guessing. `weight n/a (all reserved)` means every account in the tier is inside its reserve, so the even fallback decides the next target.
