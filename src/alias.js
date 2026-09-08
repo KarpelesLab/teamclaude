@@ -9,11 +9,32 @@
 // that exec `claude` themselves). It's intentionally lighter than a PATH shim:
 // no binary shadowing, one line per rc, trivially reversible.
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync, realpathSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync, realpathSync, renameSync, statSync, chmodSync } from 'node:fs';
+import { join, dirname, basename } from 'node:path';
 import { homedir } from 'node:os';
+import { randomBytes } from 'node:crypto';
 
 const MARKER = '# teamclaude alias';
+
+/**
+ * Replace `path` with `text` atomically: write a sibling temp file, then rename
+ * it over. Writing the rc file in place left a truncated .bashrc behind a crash
+ * or a full disk, and a truncated .bashrc breaks every new shell. The existing
+ * mode is carried over, so a 0600 rc file stays 0600.
+ */
+function writeFileAtomic(path, text) {
+  let mode = null;
+  try { mode = statSync(path).mode & 0o777; } catch { /* new file: default mode */ }
+  const tmp = join(dirname(path), `.${basename(path)}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`);
+  try {
+    writeFileSync(tmp, text);
+    if (mode !== null) chmodSync(tmp, mode);
+    renameSync(tmp, path);
+  } catch (err) {
+    rmSync(tmp, { force: true });
+    throw err;
+  }
+}
 
 /** Basename of the user's login shell, e.g. "zsh". Defaults to bash. */
 export function detectShell() {
@@ -39,12 +60,22 @@ export function teamclaudeRef() {
   if (!entry) return 'teamclaude';
   let abs;
   try { abs = realpathSync(entry); } catch { abs = entry; }
-  return `"${abs}"`;
+  // The double quotes are read by the shell each time the alias runs, so the
+  // characters special inside them — `\`, `"`, `$` in both bash and fish — are
+  // escaped. A path with a `'` is handled by aliasLine, which wraps this.
+  return `"${abs.replace(/[\\"$]/g, (c) => `\\${c}`)}"`;
 }
 
-/** The alias definition for a given shell family. */
+/**
+ * The alias definition for a given shell family.
+ *
+ * The body is single-quoted, and a `'` in the embedded path used to terminate
+ * that quote (verified: /home/o'brien produced a broken alias). It is spliced
+ * the POSIX way — close the quote, add a double-quoted `'`, reopen — which
+ * fish accepts too, since it also concatenates adjacent quoted strings.
+ */
 export function aliasLine(shell = detectShell(), ref = teamclaudeRef()) {
-  const body = `${ref} run --`;
+  const body = `${ref} run --`.replaceAll("'", "'\"'\"'");
   if (shell === 'fish') return `alias claude '${body}'`;
   return `alias claude='${body}'`;
 }
@@ -87,7 +118,7 @@ export function installAlias({ shell = detectShell(), rcPath = rcPathForShell(sh
   }
   if (text && !text.endsWith('\n')) text += '\n';
   text += `${MARKER}\n${line}\n`;
-  writeFileSync(rcPath, text);
+  writeFileAtomic(rcPath, text);
   console.log(`Installed alias in ${rcPath}`);
   console.log('Reload your shell (or open a new terminal) to use it.');
 }
@@ -116,7 +147,7 @@ export function uninstallAlias({ shell = detectShell(), rcPath = rcPathForShell(
     console.log(`Removed ${rcPath}`);
     return;
   }
-  writeFileSync(rcPath, cleaned);
+  writeFileAtomic(rcPath, cleaned);
   console.log(`Removed alias from ${rcPath}`);
 }
 

@@ -1,7 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
-import { existsSync, writeFileSync, chmodSync } from 'node:fs';
+import { existsSync, writeFileSync, chmodSync, statSync, readdirSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { aliasLine, rcPathForShell, teamclaudeRef, installAlias, uninstallAlias } from '../src/alias.js';
@@ -15,6 +16,69 @@ test('aliasLine uses the right syntax per shell (explicit ref)', () => {
 test('aliasLine embeds a quoted absolute path when teamclaude is not on PATH', () => {
   assert.equal(aliasLine('bash', '"/opt/tc/index.js"'), `alias claude='"/opt/tc/index.js" run --'`);
   assert.equal(aliasLine('fish', '"/opt/tc/index.js"'), `alias claude '"/opt/tc/index.js" run --'`);
+});
+
+// A `'` in the embedded path used to terminate the single-quoted alias body:
+// alias claude='"/home/o'brien/tc/src/index.js" run --' is a broken alias.
+test("aliasLine survives a ' in the embedded path, in bash and in fish", () => {
+  const ref = `"/home/o'brien/tc/index.js"`;
+  assert.equal(aliasLine('bash', ref), `alias claude='"/home/o'"'"'brien/tc/index.js" run --'`);
+  assert.equal(aliasLine('fish', ref), `alias claude '"/home/o'"'"'brien/tc/index.js" run --'`);
+});
+
+// The proof is the shell: define the alias, run it, and see the script at the
+// awkward path receive the arguments.
+test('an alias with a quote and a space in the path runs the script under bash', async () => {
+  const dir = await mkdtemp(join(tmpdir(), "tc-o'brien has space-"));
+  try {
+    const script = join(dir, 'index.js');
+    writeFileSync(script, '#!/bin/sh\nprintf "%s|" "$@"\n', { mode: 0o755 });
+    chmodSync(script, 0o755);
+    const ref = `"${script.replace(/[\\"$]/g, (c) => `\\${c}`)}"`;
+    const line = aliasLine('bash', ref);
+    const result = spawnSync('bash', ['-O', 'expand_aliases', '-c', `${line}\nclaude one "two words"`], { encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, 'run|--|one|two words|');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('teamclaudeRef escapes what the shell reads inside double quotes', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'tc-path-'));
+  const prev = { PATH: process.env.PATH, argv1: process.argv[1] };
+  try {
+    process.env.PATH = dir; // no teamclaude on PATH → embed argv[1]
+    process.argv[1] = '/opt/we$ird"dir\\x/index.js';
+    assert.equal(teamclaudeRef(), '"/opt/we\\$ird\\"dir\\\\x/index.js"');
+  } finally {
+    process.env.PATH = prev.PATH;
+    process.argv[1] = prev.argv1;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// The rc file is replaced by rename, so a crash mid-write cannot leave a
+// truncated .bashrc — and the file keeps its mode.
+test('install and uninstall replace the rc file whole, keeping its mode', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'tc-alias-'));
+  const rcPath = join(dir, '.bashrc');
+  await writeFile(rcPath, 'export FOO=1\n');
+  chmodSync(rcPath, 0o600);
+  try {
+    const before = statSync(rcPath).ino;
+    installAlias({ shell: 'bash', rcPath });
+    assert.notEqual(statSync(rcPath).ino, before, 'a new inode: written beside and renamed over');
+    assert.equal(statSync(rcPath).mode & 0o777, 0o600);
+    assert.match(await readFile(rcPath, 'utf8'), /alias claude=/);
+    uninstallAlias({ shell: 'bash', rcPath });
+    assert.equal(statSync(rcPath).mode & 0o777, 0o600);
+    assert.equal(await readFile(rcPath, 'utf8'), 'export FOO=1\n');
+    // No temp file left behind either way.
+    assert.deepEqual(readdirSync(dir), ['.bashrc']);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test('teamclaudeRef returns the bare command when it is on PATH', async () => {
