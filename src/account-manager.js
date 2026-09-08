@@ -6,7 +6,7 @@ import { sameIdentity } from './identity.js';
 import { weeklyBucketForModel, modelGlobMatches, modelFamily, gatingUtilization, resolveMaxUsage, WEEKLY_BUCKET_KEYS } from './model.js';
 import { SessionTracker } from './session-tracker.js';
 import { buildQuotaSummary, quotaTier } from './quota-summary.js';
-import { ROLLOVER_MIN_JUMP_MS, remapHeld } from './rollover.js';
+import { ROLLOVER_MIN_JUMP_MS, remapHeld, findHeld, dropHeld } from './rollover.js';
 import { decideBand, pressureOf, pressureRank, assertNever } from './band-decision.js';
 import { BurnRateLearner, ConcurrencyLearner, scoreCandidate } from './adaptive-distribution.js';
 import { safeLine } from './safe-text.js';
@@ -2125,17 +2125,23 @@ export class AccountManager {
       // through `_setCurrent` or `recordSession`, so a fail-back has been
       // offered it before any request reaches here.
       const leaving = obs.idx == null ? null : this.accounts[obs.idx];
-      if (leaving && this._anyJumped(obs.windows, leaving)) {
-        // The hold belongs to the fleet whose READING it preserves, the one that
-        // last moved this observation, rather than to the fleet that writes it.
-        // A borrower resting on the owner's cursor displaces the owner's reading.
-        // A reading no walk has moved names no fleet, so the fleet that observes
-        // the roll takes it, and a single-provider fleet can still settle it.
-        obs.unescaped = { idx: obs.idx, windows: obs.windows, provider: obs.provider ?? this._selectingProvider };
-      }
+      // The hold belongs to the fleet whose READING it preserves, the one that
+      // last moved this observation, rather than to the fleet that writes it.
+      // A borrower resting on the owner's cursor displaces the owner's reading.
+      // A reading no walk has moved names no fleet, so the fleet that observes
+      // the roll takes it, and a single-provider fleet can still settle it.
+      const owed = leaving && this._anyJumped(obs.windows, leaving)
+        ? { idx: obs.idx, windows: obs.windows, provider: obs.provider ?? this._selectingProvider }
+        : null;
+      this._moveObs(obs, account.index);
+      // Every account the fleet is still away from keeps its OWN roll, so a
+      // second escape is chained onto the first instead of forgetting it. The
+      // push takes the stamp of the move that escaped the roll, and only a stay
+      // under that stamp releases it. At most one roll per account, the newest:
+      // a later escape was read after the earlier one's window had rolled.
+      if (owed) obs.unescaped = { ...owed, gen: obs.gen, prev: dropHeld(obs.unescaped, owed.idx) };
       // Established whole, from every window the account presents, so a window
       // that comes back is a first sight rather than a stale value read as a jump.
-      this._moveObs(obs, account.index);
       obs.windows = new Map(Object.entries(this._accountWindows(account)));
       return;
     }
@@ -2179,12 +2185,15 @@ export class AccountManager {
       // the pass returning the traffic finds the cursor still on the account
       // that refused it, so _restOn never sees the arrival. The held roll is
       // given back here, to the account that still owes it.
-      // Matched on index alone, whatever fleet holds it: handing a roll back to
-      // the account that owes it is a restoration and not a settlement by anyone.
-      if (obs.unescaped?.idx === account.index) {
+      // Matched on index alone, whatever fleet holds it and whatever move
+      // escaped it: handing a roll back to the account that owes it is a
+      // restoration and not a settlement by anyone. Only that account's roll is
+      // given back, so every other escape still outstanding stands.
+      const owed = findHeld(obs.unescaped, h => h.idx === account.index);
+      if (owed) {
         this._moveObs(obs, account.index);
-        obs.windows = obs.unescaped.windows;
-        obs.unescaped = null;
+        obs.windows = owed.windows;
+        obs.unescaped = dropHeld(obs.unescaped, account.index);
         return;
       }
       if (this._anyJumped(obs.windows, this.accounts[obs.idx])) return;
@@ -2244,36 +2253,31 @@ export class AccountManager {
   confirmStay(account, carried, sessionId = null, provider = null) {
     if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) return;
     if (!account || !carried) return;
-    // One observation slot is shared by every provider, so the roll it holds and
-    // the success offered for it can belong to different fleets. The REQUEST's
-    // provider settles it, and a confirmation naming no fleet settles nothing.
-    const held = this._currentObs?.unescaped;
-    if (held && provider && held.provider === provider) {
-      this._releaseHeld(this._currentObs, account, carried.current);
-    }
+    this._releaseHeld(this._currentObs, account, carried.current, provider);
     if (sessionId) {
       // The bucket comes from the stamp, since a route edit reaches the running
-      // table before the response does. Gated like the cursor above: a session
-      // that has served both fleets holds a roll one of them was pushed off, and
-      // the other's success is no evidence about it.
-      const pinObs = this.sessionTracker.refsFor(sessionId, carried.bucket);
-      const pinHeld = pinObs?.unescaped;
-      if (pinHeld && provider && pinHeld.provider === provider) {
-        this._releaseHeld(pinObs, account, carried.pin);
-      }
+      // table before the response does.
+      this._releaseHeld(this.sessionTracker.refsFor(sessionId, carried.bucket), account, carried.pin, provider);
     }
   }
 
   /**
-   * Clear one observation's held roll, only where the request confirms the stay
-   * it selected under. Another account, or any move since, is a different stay.
+   * Settle the roll the confirmed move escaped, on the evidence that the
+   * destination SERVED a request selecting under that move. Another account, or
+   * any move since, is a different stay. A roll another fleet escaped is not
+   * this request's to settle, and a confirmation naming no fleet settles
+   * nothing. Every other roll on the chain waits for its own fail-back or for
+   * the stay of its own move.
    *
    * @param {Observation} obs
+   * @param {string|null} provider
    */
-  _releaseHeld(obs, account, carried) {
+  _releaseHeld(obs, account, carried, provider) {
     if (!obs || carried == null) return;
     if (obs.idx !== account.index || obs.gen !== carried) return;
-    obs.unescaped = null;
+    const owed = findHeld(obs.unescaped, h => h.gen === carried);
+    if (!owed || !provider || owed.provider !== provider) return;
+    obs.unescaped = dropHeld(obs.unescaped, owed.idx);
   }
 
   /** The reading for the sticky CURRENT account, taken at the top of a selection

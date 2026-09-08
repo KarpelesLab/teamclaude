@@ -1390,6 +1390,132 @@ test('a confirmation that names no fleet settles nothing', () => {
     'the request after the fail-back stayed on the account the roll pushed it off');
 });
 
+test('a second escape does not forget the first roll', () => {
+  // Neither preemption is settled, so the fleet is away from both accounts and
+  // owes each its own reading. The second escape must not answer for the first:
+  // the roll handed back on a fail-back is all that keeps an account from being
+  // preempted off the week it just gained, every time traffic returns.
+  const am = mgr(['a', 'b', 'c'], ON);
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30]]) bucket(am, i, 'unified7d', 0.4, hours);
+  // One fleet throughout, so the opening placement leaving the reading unstamped
+  // costs nothing: the first hold takes the fleet that observes the roll.
+  am.selectActiveAccount();
+
+  assert.equal(serve(am, null, OPUS).name, 'a', 'the fixture must start on a');
+  rollWindow(am, 0);
+  assert.equal(serve(am, null, OPUS).name, 'b', 'a\'s roll did not preempt');
+  // The first request to REST on b, which is what holds a's roll.
+  assert.equal(serve(am, null, OPUS).name, 'b', 'the preemption did not settle on b');
+  rollWindow(am, 1);
+  assert.equal(serve(am, null, OPUS).name, 'c', 'b\'s roll did not preempt');
+  assert.equal(serve(am, null, OPUS).name, 'c', 'the second preemption did not settle on c');
+
+  // b and c out of the way, so the traffic is forced back onto a.
+  assert.equal(serve(am, null, OPUS, { exclude: new Set([1, 2]) }).name, 'a',
+    'the forced fail-back did not reach a');
+  assert.equal(am._currentRolledOver(am.accounts[0], OPUS), true,
+    'the second escape forgot the roll the first was pushed off');
+  assert.equal(serve(am, null, OPUS).name, 'c',
+    'the fleet parked on the week a had just gained');
+
+  // The hand-back to a settles nothing for b, which is still owed its own.
+  assert.equal(serve(am, null, OPUS, { exclude: new Set([0, 2]) }).name, 'b',
+    'the forced fail-back did not reach b');
+  assert.equal(am._currentRolledOver(am.accounts[1], OPUS), true,
+    'handing a its roll back took b\'s with it');
+
+  // The same forced fail-back with one escape outstanding controls for the
+  // fixture: what the assertions above measure is the second escape.
+  const one = mgr(['a', 'b', 'c'], ON);
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30]]) bucket(one, i, 'unified7d', 0.4, hours);
+  one.selectActiveAccount();
+  assert.equal(serve(one, null, OPUS).name, 'a', 'the control must start on a');
+  rollWindow(one, 0);
+  assert.equal(serve(one, null, OPUS).name, 'b', 'the control\'s roll did not preempt');
+  assert.equal(serve(one, null, OPUS).name, 'b', 'the control did not settle on b');
+  assert.equal(serve(one, null, OPUS, { exclude: new Set([1, 2]) }).name, 'a',
+    'the control\'s fail-back did not reach a');
+  assert.equal(one._currentRolledOver(one.accounts[0], OPUS), true,
+    'the control lost a\'s roll with nothing else outstanding');
+});
+
+test('a fail-back to the account of the most recent escape is still handed its roll', () => {
+  // The other end of the chain from the arm above: the newest escape is handed
+  // back too, and is not lost to the older one still outstanding.
+  const am = mgr(['a', 'b', 'c'], ON);
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30]]) bucket(am, i, 'unified7d', 0.4, hours);
+  am.selectActiveAccount();
+
+  assert.equal(serve(am, null, OPUS).name, 'a', 'the fixture must start on a');
+  rollWindow(am, 0);
+  assert.equal(serve(am, null, OPUS).name, 'b', 'a\'s roll did not preempt');
+  assert.equal(serve(am, null, OPUS).name, 'b', 'the preemption did not settle on b');
+  rollWindow(am, 1);
+  assert.equal(serve(am, null, OPUS).name, 'c', 'b\'s roll did not preempt');
+  assert.equal(serve(am, null, OPUS).name, 'c', 'the second preemption did not settle on c');
+
+  assert.equal(serve(am, null, OPUS, { exclude: new Set([0, 2]) }).name, 'b',
+    'the forced fail-back did not reach b');
+  assert.equal(am._currentRolledOver(am.accounts[1], OPUS), true,
+    'the fail-back to the newest escape was handed nothing');
+});
+
+test('a confirmed stay settles the roll its own move escaped and no other', () => {
+  // A serve at the destination is evidence that the move onto it stuck, and that
+  // move escaped one roll. It says nothing about an account the fleet left
+  // earlier and has not been back to.
+  const am = mgr(['a', 'b', 'c'], ON);
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30]]) bucket(am, i, 'unified7d', 0.4, hours);
+  am.selectActiveAccount();
+
+  assert.equal(serve(am, null, OPUS).name, 'a', 'the fixture must start on a');
+  rollWindow(am, 0);
+  assert.equal(serve(am, null, OPUS).name, 'b', 'a\'s roll did not preempt');
+  assert.equal(serve(am, null, OPUS).name, 'b', 'the preemption did not settle on b');
+  rollWindow(am, 1);
+  assert.equal(serve(am, null, OPUS).name, 'c', 'b\'s roll did not preempt');
+  assert.equal(serve(am, null, OPUS).name, 'c', 'the second preemption did not settle on c');
+
+  // The stamp of the move onto c, read before the request that confirms it.
+  const carried = am.observedGeneration(null, OPUS);
+  assert.equal(serve(am, null, OPUS).name, 'c', 'the confirming request left c');
+  am.confirmStay(am.accounts[2], carried, null, 'anthropic');
+
+  assert.equal(serve(am, null, OPUS, { exclude: new Set([0, 2]) }).name, 'b',
+    'the forced fail-back did not reach b');
+  assert.equal(am._currentRolledOver(am.accounts[1], OPUS), false,
+    'a roll the fleet already moved off was charged a second time');
+
+  assert.equal(serve(am, null, OPUS, { exclude: new Set([1, 2]) }).name, 'a',
+    'the forced fail-back did not reach a');
+  assert.equal(am._currentRolledOver(am.accounts[0], OPUS), true,
+    'a stay at c settled a roll that move never escaped');
+});
+
+test('a stay confirming a move that escaped nothing settles nothing', () => {
+  // An operator's switch mints a stamp of its own without escaping anything, so
+  // the roll still outstanding is left at the head of the chain. A serve after
+  // it confirms that move, which owes nobody a settlement.
+  const am = mgr(['a', 'b', 'c'], ON);
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30]]) bucket(am, i, 'unified7d', 0.4, hours);
+  am.selectActiveAccount();
+
+  assert.equal(serve(am, null, OPUS).name, 'a', 'the fixture must start on a');
+  rollWindow(am, 0);
+  assert.equal(serve(am, null, OPUS).name, 'b', 'a\'s roll did not preempt');
+  assert.equal(serve(am, null, OPUS).name, 'b', 'the preemption did not settle on b');
+
+  am.setCurrentAccount(2);
+  const carried = am.observedGeneration(null, OPUS);
+  assert.equal(serve(am, null, OPUS).name, 'c', 'the confirming request left the switch\'s account');
+  am.confirmStay(am.accounts[2], carried, null, 'anthropic');
+
+  assert.equal(serve(am, null, OPUS, { exclude: new Set([1, 2]) }).name, 'a',
+    'the forced fail-back did not reach a');
+  assert.equal(am._currentRolledOver(am.accounts[0], OPUS), true,
+    'a stay confirming a move that escaped nothing released a roll anyway');
+});
+
 test('a session\'s confirmation releases under the bucket its stamp was taken under', () => {
   // The stamp is read before the walk and the confirmation lands after the
   // response, so a route edit can arrive between them. Resolving the bucket again
@@ -1465,6 +1591,55 @@ test('removing an account renumbers a held roll rather than aiming it elsewhere'
   am.removeAccount(0);
   assert.equal(am._currentObs.unescaped, null,
     'the held roll outlived the account it was taken on');
+});
+
+test('removing an account renumbers every roll an observation is holding', () => {
+  // The shift reaches the whole chain, not just its newest link: a hold left
+  // behind names whichever account inherited the slot, and would be handed back
+  // to it on the next fail-back.
+  const am = mgr(['a', 'b', 'c', 'd'], ON);
+  for (const [i, hours] of [[0, 40], [1, 10], [2, 20], [3, 30]]) bucket(am, i, 'unified7d', 0.4, hours);
+  // b has the soonest window, so the opening placement starts there and a sits
+  // out of the way with the furthest one, held by nobody when it is removed.
+  am.selectActiveAccount();
+  assert.equal(serve(am, null, OPUS).name, 'b', 'the fixture must start on b');
+  assert.equal(serve(am, null, OPUS).name, 'b', 'the fixture did not rest on b');
+  rollWindow(am, 1);
+  assert.equal(serve(am, null, OPUS).name, 'c', 'b\'s roll did not preempt');
+  assert.equal(serve(am, null, OPUS).name, 'c', 'the preemption did not settle on c');
+  rollWindow(am, 2);
+  assert.equal(serve(am, null, OPUS).name, 'd', 'c\'s roll did not preempt');
+  assert.equal(serve(am, null, OPUS).name, 'd', 'the second preemption did not settle on d');
+
+  am.removeAccount(0);
+  assert.equal(am.accounts[0].name, 'b', 'the removal did not shift the list down');
+  assert.equal(serve(am, null, OPUS, { exclude: new Set([0, 2]) }).name, 'c',
+    'the forced fail-back did not reach c');
+  assert.equal(am._currentRolledOver(am.accounts[1], OPUS), true,
+    'the newest held roll did not follow c to its new index');
+  assert.equal(serve(am, null, OPUS, { exclude: new Set([1, 2]) }).name, 'b',
+    'the forced fail-back did not reach b');
+  assert.equal(am._currentRolledOver(am.accounts[0], OPUS), true,
+    'the older held roll did not follow b to its new index');
+
+  // Removing an account the chain DOES name: only its own link goes, and every
+  // other escape stands. Above, the removed account was held by nobody.
+  const two = mgr(['a', 'b', 'c'], ON);
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30]]) bucket(two, i, 'unified7d', 0.4, hours);
+  two.selectActiveAccount();
+  assert.equal(serve(two, null, OPUS).name, 'a', 'the second fixture must start on a');
+  rollWindow(two, 0);
+  assert.equal(serve(two, null, OPUS).name, 'b', 'a\'s roll did not preempt');
+  assert.equal(serve(two, null, OPUS).name, 'b', 'the preemption did not settle on b');
+  rollWindow(two, 1);
+  assert.equal(serve(two, null, OPUS).name, 'c', 'b\'s roll did not preempt');
+  assert.equal(serve(two, null, OPUS).name, 'c', 'the second preemption did not settle on c');
+
+  two.removeAccount(1);
+  assert.equal(serve(two, null, OPUS, { exclude: new Set([1]) }).name, 'a',
+    'the forced fail-back did not reach a');
+  assert.equal(two._currentRolledOver(two.accounts[0], OPUS), true,
+    'removing the account of one escape took the roll of another with it');
 });
 
 test('a destination is measured from the first request that rests on it', () => {

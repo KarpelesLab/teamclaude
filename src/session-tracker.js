@@ -88,12 +88,16 @@ function setAndReturn(map, key, value) {
 
 /**
  * A rollover reading held for the account a preemption pushed traffic off,
- * until a served request releases it or a fail-back hands it back.
+ * until a served request releases it or a fail-back hands it back. One hold per
+ * escaped account, chained newest first, so a second preemption taken before the
+ * first is settled holds both readings.
  *
  * @typedef {Object} Hold
  * @property {number} idx the account the held reading was taken on
  * @property {Map<string, number>} windows window name to that window's reset, in epoch ms
  * @property {string|null} provider the fleet whose reading this preserves, null while no walk has moved it
+ * @property {number} gen the stamp of the move that escaped this roll
+ * @property {Hold|null} prev the escape still outstanding behind this one, null at the tail
  */
 /**
  * What one sticky choice was last found resting on, and what that account's
