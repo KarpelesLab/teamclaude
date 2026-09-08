@@ -923,6 +923,59 @@ test('path 3: an advisor request barred from its only advisor account degrades t
     'the knob-off path left an event the router consumes');
 });
 
+test('path 3: an account barred from the request model does not keep the switch advisor-scoped', () => {
+  // The mirror of every other advisor fixture here: the one account that serves
+  // the advisor model cannot serve the request's own, so it is no more reachable
+  // than an excluded one and the fleet the switch is drawn over carries the main
+  // model alone.
+  const build = expiry => {
+    const am = mgr(['cur', 'chall', 'elig'], {
+      expiry,
+      routes: [
+        { name: 'opus', match: ['*opus*'], accounts: ['cur', 'chall'] },
+        { name: 'fable', match: ['*fable*'], accounts: ['elig'] },
+      ],
+    });
+    bucket(am, 0, 'unified7d', 0.50, 50);
+    bucket(am, 1, 'unified7d', 0.10, 10);
+    bucket(am, 2, 'unified7d', 0.20, 20);
+    am.accounts[1].quota.unified5h = 0.5;
+    am.accounts[1].quota.unified5hReset = Date.now() - 1000;
+    return am;
+  };
+  // Asked of a TWIN, because reading availability clears expired windows.
+  const twin = build(ON);
+  assert.equal(twin._isAvailable(twin.accounts[2], OPUS, FABLE), false,
+    'the fixture must bar the only advisor account from the request model');
+  assert.equal(twin._isAvailable(twin.accounts[2], null, FABLE), true,
+    'the fixture must leave the only advisor account able to serve the advisor model');
+  assert.equal(twin._isAvailable(twin.accounts[0], OPUS, FABLE), false,
+    'the fixture must bar the incumbent from the advisor model');
+  assert.equal(twin._isAvailable(twin.accounts[0], OPUS), true,
+    'the fixture must leave the incumbent usable for the request model');
+  assert.equal(twin._isAvailable(twin.accounts[1], OPUS, FABLE), false,
+    'the fixture must bar the challenger from the advisor model');
+  assert.equal(twin._isAvailable(twin.accounts[1], OPUS), true,
+    'the fixture must leave the challenger usable for the request model');
+
+  const am = build(ON);
+  assert.equal(am.getActiveAccount(asRequest(), OPUS, FABLE).name, 'chall',
+    'the request its only advisor account cannot serve was not served on the main model');
+  assert.equal(am.accounts[am.currentIndex].name, 'chall',
+    'the degraded switch did not move the cursor onto the account that reset');
+  assert.equal(am.accounts[1].sessionResetPending, false,
+    'the request the degraded switch could reach left the reset pending');
+
+  // The knob-off control on the same fixture: the event is spent on sight
+  // whatever the request model puts out of reach.
+  const off = build(OFF);
+  off.getActiveAccount(asRequest(), OPUS, FABLE);
+  assert.equal(off.accounts[off.currentIndex].name, 'chall',
+    'the knob-off path skipped a switch the router performs');
+  assert.equal(off.accounts[1].sessionResetPending, false,
+    'the knob-off path left an event the router consumes');
+});
+
 test('path 3: an advisor request the incumbent cannot serve leaves the reset', () => {
   // The same rule at the other end of the comparison, on the advisor model: the
   // request is diverted off the cursor's account for itself alone, so it settles
@@ -1183,6 +1236,33 @@ test('path 3: the knob-off switch reads no account the band would have read', ()
     'the knob-off switch read an account the band would have read, and cleared its throttle');
   assert.equal(am.accounts[2].rateLimitedUntil, past,
     'the knob-off switch read an account the band would have read, and dropped its rate-limit clock');
+});
+
+test('path 3: the knob-off refresh reads no account at all', () => {
+  // Every other knob-off control asserts a verdict. This one asserts the read:
+  // reading availability is what clears a past-due throttle, so a throttle still
+  // standing is the evidence that the disabled path asked nothing.
+  const past = Date.now() - 1000;
+  const build = () => {
+    const am = mgr(['cur', 'thr'], { expiry: OFF });
+    // Over the threshold, so a fleet scan cannot stop at the incumbent before it
+    // reaches the account whose fields show the read.
+    bucket(am, 0, 'unified7d', 0.99, 50);
+    bucket(am, 1, 'unified7d', 0.10, 10);
+    am.accounts[1].status = 'throttled';
+    am.accounts[1].rateLimitedUntil = past;
+    return am;
+  };
+  const twin = build();
+  assert.equal(twin._isAvailable(twin.accounts[0], null), false,
+    'the fixture must leave the incumbent unavailable, or a scan stops before the throttled account');
+
+  const am = build();
+  am.refreshExpiredQuotas();
+  assert.equal(am.accounts[1].status, 'throttled',
+    'the knob-off refresh read an account and cleared its throttle');
+  assert.equal(am.accounts[1].rateLimitedUntil, past,
+    'the knob-off refresh read an account and dropped its rate-limit clock');
 });
 
 test('path 3 still switches when the sooner-resetting account is the better one', () => {
