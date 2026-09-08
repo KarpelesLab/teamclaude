@@ -12,10 +12,11 @@ import { X509Certificate } from 'node:crypto';
 const TMP = mkdtempSync(join(tmpdir(), 'tc-mitm-'));
 process.env.TEAMCLAUDE_CONFIG = join(TMP, 'config.json');
 
-const { ensureCerts, caCertPath, TEST_HOST, parseConnectAuthority } = await import('../src/mitm.js');
+const { ensureCerts, caCertPath, TEST_HOST, leafCovers, parseConnectAuthority } = await import('../src/mitm.js');
 const { AccountManager } = await import('../src/account-manager.js');
 const { createProxyServer } = await import('../src/server.js');
 const { allowLoopbackForward } = await import('../src/forward-target.js');
+const { generateCertChain } = await import('../src/x509.js');
 
 function listen(server) {
   return new Promise((r) => server.listen(0, '127.0.0.1', () => r(server.address().port)));
@@ -196,4 +197,39 @@ test('an unparseable CONNECT target gets a 400, and a differently-cased test hos
   } finally {
     proxy.close();
   }
+});
+
+// ── Stored chain validity ────────────────────────────────────
+//
+// leafCovers used to check signature and SANs only, so an expired leaf or CA
+// was reused for ever — every handshake failed and nothing regenerated it.
+
+test('leafCovers rejects a chain with under 30 days left, on either certificate', () => {
+  const hosts = ['api.anthropic.com', TEST_HOST];
+  const fresh = generateCertChain(hosts);
+  assert.equal(leafCovers(fresh.caCertPem, fresh.leafCertPem, hosts), true);
+  const DAY = 24 * 3600 * 1000;
+  // Judged from a clock 20 days before the leaf's expiry: too close to renew.
+  assert.equal(leafCovers(fresh.caCertPem, fresh.leafCertPem, hosts, Date.now() + (825 - 20) * DAY), false);
+  const shortLeaf = generateCertChain(hosts, { leafDays: 10 });
+  assert.equal(leafCovers(shortLeaf.caCertPem, shortLeaf.leafCertPem, hosts), false);
+  const shortCa = generateCertChain(hosts, { caDays: 10 });
+  assert.equal(leafCovers(shortCa.caCertPem, shortCa.leafCertPem, hosts), false);
+});
+
+test('ensureCerts regenerates a stored chain that is about to expire', async () => {
+  const { writeFile } = await import('node:fs/promises');
+  const dir = join(caCertPath(), '..');
+  const hosts = ['api.anthropic.com', TEST_HOST];
+  const short = generateCertChain(hosts, { leafDays: 5 });
+  await writeFile(join(dir, 'teamclaude-ca.pem'), short.caCertPem);
+  await writeFile(join(dir, 'teamclaude-leaf.pem'), short.leafCertPem);
+  await writeFile(join(dir, 'teamclaude-leaf.key'), short.leafKeyPem);
+
+  const renewed = await ensureCerts('api.anthropic.com');
+  assert.notEqual(renewed.leafCertPem, short.leafCertPem);
+  assert.ok(new Date(new X509Certificate(renewed.leafCertPem).validTo) - Date.now() > 300 * 24 * 3600 * 1000);
+  // And the renewed chain is then kept.
+  const again = await ensureCerts('api.anthropic.com');
+  assert.equal(again.leafCertPem, renewed.leafCertPem);
 });

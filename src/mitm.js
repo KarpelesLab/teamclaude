@@ -52,12 +52,26 @@ async function atomicWrite(path, data, mode) {
   await rename(tmp, path);
 }
 
-// Is the stored leaf signed by the stored CA and valid for every host in `hosts`?
-function leafCovers(caCertPem, leafCertPem, hosts) {
+// A stored chain is reused only while it has this much life left. Without a
+// date check an expired leaf or CA was reused forever: every handshake failed
+// and nothing regenerated it, so the only cure was deleting the files by hand.
+// Renewing early keeps a long-running server from crossing the line mid-flight.
+const MIN_CERT_REMAINING_MS = 30 * 24 * 60 * 60 * 1000;
+
+/**
+ * Is the stored leaf signed by the stored CA, valid for every host in `hosts`,
+ * and (both certs) good for at least MIN_CERT_REMAINING_MS past `now`?
+ * Exported for tests.
+ */
+export function leafCovers(caCertPem, leafCertPem, hosts, now = Date.now()) {
   try {
     const ca = new X509Certificate(caCertPem);
     const leaf = new X509Certificate(leafCertPem);
     if (!leaf.verify(ca.publicKey)) return false;
+    for (const cert of [ca, leaf]) {
+      const validTo = new Date(cert.validTo).getTime();
+      if (!Number.isFinite(validTo) || validTo - now < MIN_CERT_REMAINING_MS) return false;
+    }
     const names = (leaf.subjectAltName || '').split(',').map((s) => s.trim());
     return hosts.every((h) => names.includes(`DNS:${h}`));
   } catch {
