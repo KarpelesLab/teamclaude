@@ -1301,6 +1301,41 @@ test('path 3: the knob-on refresh with no advisor model reads no account past th
     'the refresh with no advisor model read an account past the incumbent and dropped its rate-limit clock');
 });
 
+test('path 3: the knob-on refresh reads no account the request excludes', () => {
+  // The two arms above assert the read for the guard's outer terms. This one
+  // asserts it for the scan those terms gate, which looks for an account outside
+  // the exclusion set that serves the advisor model: the exclusion test stands
+  // ahead of the availability test, so the scan passes over an excluded account
+  // without reading it.
+  const past = Date.now() - 1000;
+  const build = () => {
+    const am = mgr(['cur', 'thr', 'ok'], { expiry: ON });
+    // Over the threshold, so the scan cannot stop at the incumbent before it
+    // reaches the excluded account whose fields show the read.
+    bucket(am, 0, 'unified7d', 0.99, 50);
+    // Healthy and excluded: the account the scan leaves alone.
+    bucket(am, 1, 'unified7d', 0.10, 10);
+    am.accounts[1].status = 'throttled';
+    am.accounts[1].rateLimitedUntil = past;
+    // Reachable on both models, so the scan answers yes whichever conjunct it
+    // reads first and no routing outcome rides on this arm.
+    bucket(am, 2, 'unified7d', 0.10, 5);
+    return am;
+  };
+  const twin = build();
+  assert.equal(twin._isAvailable(twin.accounts[0], OPUS), false,
+    'the fixture must leave the incumbent unavailable, or the scan stops before the excluded account');
+  assert.equal(twin._isAvailable(twin.accounts[2], OPUS, FABLE), true,
+    'the fixture must leave the last account available on both models, or the scan has no answer of its own');
+
+  const am = build();
+  am.refreshExpiredQuotas(OPUS, new Set([1]), FABLE);
+  assert.equal(am.accounts[1].status, 'throttled',
+    'the refresh read an account the request excludes and cleared its throttle');
+  assert.equal(am.accounts[1].rateLimitedUntil, past,
+    'the refresh read an account the request excludes and dropped its rate-limit clock');
+});
+
 test('path 3 still switches when the sooner-resetting account is the better one', () => {
   const am = mgr(['cur', 'b'], { expiry: ON });
   bucket(am, 0, 'unified7d', 0.9, 100);
