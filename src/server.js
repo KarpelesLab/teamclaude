@@ -327,8 +327,12 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: true, added: added || 0 }));
         } catch (err) {
+          // The reason belongs in the log, not the reply: a reload failure
+          // names config paths and account details, and this endpoint is
+          // reachable by anyone holding a client key.
+          console.error('[TeamClaude] Reload failed:', err.message);
           res.writeHead(500, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: false, error: err.message }));
+          res.end(JSON.stringify({ ok: false, error: 'reload failed; see the proxy log' }));
         }
         return;
       }
@@ -2322,10 +2326,14 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     ctx.status = 502;
 
     if (!res.headersSent) {
+      // Generic on purpose, as relayStream's 502 already is: the described
+      // error names the resolved upstream hosts and ports (per-account
+      // upstreams included), which is the operator's business — it went to
+      // the log above — and not the client's.
       res.writeHead(502, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         type: 'error',
-        error: { type: 'proxy_error', message: `Upstream error: ${describeConnectError(err)}` },
+        error: { type: 'proxy_error', message: 'Upstream error; see the proxy log' },
       }));
     } else if (!res.writableEnded) {
       // Error after headers were already sent (mid-stream) and it wasn't
