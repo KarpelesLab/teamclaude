@@ -3,6 +3,7 @@
 import { spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { createWriteStream } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import net from 'node:net';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, loadState, saveState } from './config.js';
 import { installCrashHandlers } from './crash-log.js';
@@ -200,6 +201,9 @@ async function serverCommand() {
   installCrashHandlers(crashLog);
 
   const config = await loadOrCreateConfig();
+  // Token writes below pair rows by entry id against a re-read of the file, so
+  // the ids have to be on disk before the first refresh, not just in memory.
+  await persistMintedAccountIds(config);
 
   // --log-to <dir>
   const logTo = argValue('--log-to');
@@ -293,7 +297,8 @@ async function serverCommand() {
           accountManager.addAccount(diskAcct);
         }
       }
-      // Match by UUID first, then by name — index may have shifted
+      // By entry id only — the index may have shifted, and identity is not
+      // one-to-one (see findConfigAccount). No row: nothing is written.
       const cfgIdx = findConfigAccount(diskConfig, account);
       if (cfgIdx >= 0) {
         diskConfig.accounts[cfgIdx].accessToken = newTokens.accessToken;
@@ -2047,26 +2052,49 @@ async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
 // ── config sync helpers ─────────────────────────────────────
 
 /**
- * Find the config entry a running account came from.
+ * Find the config entry a running account came from, by entry id only; -1 when
+ * no row carries its id.
  *
- * By entry id first. Identity is the fallback, and it is not one-to-one:
- * sameIdentity compares organization only when BOTH records carry one and falls
- * back to the name otherwise, so for one person holding accounts in two
- * organizations — the case the identity module exists for — both rows match and
- * the first one wins. Resolving a token write that way records one account's
- * refresh-token family against another account's row (#203).
+ * There is deliberately no identity fallback (mirroring syncRefreshedTokens).
+ * sameIdentity is not one-to-one: it compares organization only when BOTH
+ * records carry one and falls back to the name otherwise, so for one person
+ * holding accounts in two organizations — the case the identity module exists
+ * for — both rows match and the first one wins. Resolving a token write that way
+ * records one account's refresh-token family against another account's row
+ * (#203), and on a fleet holding other people's accounts that is a credential
+ * crossing. A -1 means the write is skipped: an account the file no longer
+ * describes has no row of its own, and any row picked for it would be another
+ * account's.
  *
- * The id is exact and survives the refresh that rewrites the credential, which
- * is the one field that might otherwise have separated two records of one
- * person. loadConfig gives every entry an id, so the fallback is only for a disk
- * row written before the field existed and not yet saved back.
+ * The id is exact and survives the refresh that rewrites the credential. A file
+ * written before the field existed gets its ids persisted at startup
+ * (persistMintedAccountIds), so the in-memory ids are the on-disk ids.
  */
 function findConfigAccount(diskConfig, account) {
-  if (account?.id) {
-    const byId = diskConfig.accounts.findIndex(a => a?.id === account.id);
-    if (byId >= 0) return byId;
+  if (!account?.id) return -1;
+  return diskConfig.accounts.findIndex(a => a?.id === account.id);
+}
+
+/**
+ * Persist the entry ids loadConfig just minted, if the file did not carry them.
+ *
+ * Every later token write pairs its row by id and re-reads the file to do it. A
+ * config written before the field existed has ids in memory only, and the
+ * re-read would mint a second, different set — nothing would pair until the
+ * next start, and refreshed tokens would never reach disk. One save up front
+ * makes the in-memory ids the on-disk ids. A file that already carries a
+ * complete, unique set is left alone.
+ */
+async function persistMintedAccountIds(config) {
+  let raw;
+  try {
+    raw = JSON.parse(await readFile(getConfigPath(), 'utf-8'));
+  } catch {
+    return; // nothing on disk to reconcile with (or unreadable — the next save will tell)
   }
-  return diskConfig.accounts.findIndex(a => sameIdentity(a, account));
+  const ids = (Array.isArray(raw?.accounts) ? raw.accounts : []).map(a => a?.id);
+  const complete = ids.every(id => typeof id === 'string' && id !== '') && new Set(ids).size === ids.length;
+  if (!complete) await saveConfig(config);
 }
 
 // ── helpers ─────────────────────────────────────────────────
