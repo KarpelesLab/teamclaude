@@ -30,11 +30,6 @@ export function remapHeld(held, mapFn) {
   return moved == null ? rest : { ...held, idx: moved, prev: rest };
 }
 
-// The rolls one observation owes, newest escape first. A preemption can
-// happen while an earlier one is still outstanding and each escaped account owes
-// its own reading, so this is a chain rather than a slot: `prev` is the roll
-// escaped before this one, and null is a hold on nothing.
-
 // The roll this observation owes an account, or the one a stay's stamp names.
 // The newest match, since a later escape of the same account was read after the
 // earlier one's window had already rolled.
