@@ -253,13 +253,21 @@ export class BurnRateLearner {
     return result;
   }
 
-  restore(index, saved) {
+  restore(index, saved, now = Date.now()) {
     if (!saved || typeof saved !== 'object' || Array.isArray(saved)) return;
     for (const [bucket, value] of Object.entries(saved)) {
       if (!bucket || !value || typeof value !== 'object' || Array.isArray(value)) continue;
       const clean = {};
-      for (const field of ['burnRate', 'lastU', 'lastAt', 'burnAnchorU', 'burnAnchorAt']) {
+      for (const field of ['burnRate', 'lastU', 'burnAnchorU']) {
         clean[field] = Number.isFinite(value[field]) ? value[field] : null;
+      }
+      // Timestamps are clamped to now. A burnAnchorAt in the future — clock
+      // skew between the write and this read, or a tampered state file — would
+      // keep `now - burnAnchorAt` below burnWindowMs until the clock caught up,
+      // holding the burn window open and the rate unlearnable for that long; a
+      // future lastAt would likewise hide a stale gap from maxSampleAgeMs.
+      for (const field of ['lastAt', 'burnAnchorAt']) {
+        clean[field] = Number.isFinite(value[field]) ? Math.min(value[field], now) : null;
       }
       this.state.set(`${index}:${bucket}`, clean);
     }

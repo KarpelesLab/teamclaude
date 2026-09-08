@@ -847,3 +847,23 @@ test('a bad adaptive value names itself and its value in the message', () => {
   assert.throws(() => validateAdaptiveConfig({ burnAlpha: 'lots' }), /adaptiveDistribution\.burnAlpha must be a finite number, got "lots"/);
   assert.throws(() => validateAdaptiveConfig({ burnWindowMs: 0 }), /adaptiveDistribution\.burnWindowMs must be > 0, got 0/);
 });
+
+test('restore clamps a future burn anchor to now so the window cannot be held open', () => {
+  const l = new BurnRateLearner();
+  const now = Date.now();
+  const skewed = now + 6 * H; // a clock six hours ahead wrote the state file
+  l.restore(0, { unified7d: { burnRate: null, lastU: 0.10, lastAt: skewed, burnAnchorU: 0.10, burnAnchorAt: skewed } }, now);
+  const slot = l.state.get('0:unified7d');
+  assert.equal(slot.lastAt, now);
+  assert.equal(slot.burnAnchorAt, now);
+  assert.equal(slot.lastU, 0.10);
+  // With the anchor clamped, one burn window of steady spend is enough to
+  // learn a rate; left in the future it would have taken six hours longer.
+  l.observeUtilization(0, 'unified7d', 0.12, now + ADAPTIVE_DEFAULTS.burnWindowMs);
+  assert.ok(Number.isFinite(l.burnRate(0, 'unified7d')) && l.burnRate(0, 'unified7d') > 0
+    && l.burnRate(0, 'unified7d') !== ADAPTIVE_DEFAULTS.initialBurnRate,
+    'the rate must be learned from the first window after restore');
+  // A timestamp already in the past is left alone.
+  l.restore(1, { unified7d: { burnRate: 1e-9, lastU: 0.5, lastAt: now - 1000, burnAnchorU: 0.5, burnAnchorAt: now - 1000 } }, now);
+  assert.equal(l.state.get('1:unified7d').burnAnchorAt, now - 1000);
+});
