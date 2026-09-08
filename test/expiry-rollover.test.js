@@ -1561,6 +1561,33 @@ test('a stay confirming a move that escaped nothing settles nothing', () => {
     'a stay confirming a move that escaped nothing released a roll anyway');
 });
 
+test('a stay whose stamp the reading has left and returned to settles nothing', () => {
+  // The hold belongs to the stamp of the move that made it. Once the reading
+  // has moved away and come back, its stamp is a later one, so a confirmation
+  // under the old stamp settles nothing.
+  const am = mgr(['a', 'b', 'c'], ON);
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30]]) bucket(am, i, 'unified7d', 0.4, hours);
+  am.selectActiveAccount();
+
+  assert.equal(serve(am, null, OPUS).name, 'a', 'the fixture must start on a');
+  rollWindow(am, 0);
+  assert.equal(serve(am, null, OPUS).name, 'b', 'a\'s roll did not preempt');
+  assert.equal(serve(am, null, OPUS).name, 'b', 'the preemption did not settle on b');
+  assert.equal(am._currentObs.unescaped?.idx, 0, 'the fixture must hold a\'s roll');
+
+  const carried = am.observedGeneration(null, OPUS);
+  am.setCurrentAccount(2);
+  am.setCurrentAccount(1);
+  assert.notEqual(am._currentObs.gen, carried.current,
+    'the arm tests nothing unless the reading actually left b and returned');
+  am.confirmStay(am.accounts[1], carried, null, 'anthropic');
+
+  assert.equal(serve(am, null, OPUS, { exclude: new Set([1, 2]) }).name, 'a',
+    'the forced fail-back did not reach a');
+  assert.equal(am._currentRolledOver(am.accounts[0], OPUS), true,
+    'a stay under a stamp the reading had left and returned to released a roll anyway');
+});
+
 test('a session\'s confirmation releases under the bucket its stamp was taken under', () => {
   // The stamp is read before the walk and the confirmation lands after the
   // response, so a route edit can arrive between them. Resolving the bucket again
