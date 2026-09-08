@@ -1273,6 +1273,34 @@ test('path 3: the knob-off refresh reads no account at all', () => {
     'the knob-off refresh carrying an advisor model read an account and dropped its rate-limit clock');
 });
 
+test('path 3: the knob-on refresh with no advisor model reads no account past the incumbent', () => {
+  // The arm above asserts the read for the disabled path. This one asserts it for
+  // the enabled path carrying no advisor model, where the guard's advisor term is
+  // the only term left between the call and the scan.
+  const past = Date.now() - 1000;
+  const build = () => {
+    const am = mgr(['cur', 'thr'], { expiry: ON });
+    // Over the threshold, so the incumbent is unroutable: the loop reads no
+    // account past it, and a scan cannot stop at it before the account whose
+    // fields show the read.
+    bucket(am, 0, 'unified7d', 0.99, 50);
+    bucket(am, 1, 'unified7d', 0.10, 10);
+    am.accounts[1].status = 'throttled';
+    am.accounts[1].rateLimitedUntil = past;
+    return am;
+  };
+  const twin = build();
+  assert.equal(twin._isAvailable(twin.accounts[0], null), false,
+    'the fixture must leave the incumbent unavailable, or a scan stops before the throttled account');
+
+  const am = build();
+  am.refreshExpiredQuotas(null, asRequest());
+  assert.equal(am.accounts[1].status, 'throttled',
+    'the refresh with no advisor model read an account past the incumbent and cleared its throttle');
+  assert.equal(am.accounts[1].rateLimitedUntil, past,
+    'the refresh with no advisor model read an account past the incumbent and dropped its rate-limit clock');
+});
+
 test('path 3 still switches when the sooner-resetting account is the better one', () => {
   const am = mgr(['cur', 'b'], { expiry: ON });
   bucket(am, 0, 'unified7d', 0.9, 100);
