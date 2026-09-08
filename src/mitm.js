@@ -165,6 +165,30 @@ export function parseConnectAuthority(target) {
 }
 
 /**
+ * Where a WebSocket Upgrade that arrived inside a terminated tunnel is relayed.
+ *
+ * The terminating server is shared by every intercepted host — it is keyed by
+ * pin and client, not by host — and the 'request' path routes each request by
+ * its path (providerForPath). An Upgrade had no such routing: it went to the
+ * configured upstream whatever host the client had tunnelled to, so a
+ * WebSocket a Codex client opened against chatgpt.com was delivered, its own
+ * Authorization header included, to api.anthropic.com. Route it by the Host
+ * the client wrote instead, which under a terminated tunnel is the CONNECT
+ * authority as the client sees it: the configured upstream (scheme and port
+ * included) for its own host, https://<host> for another provider host this
+ * config intercepts, and null — refuse, do not guess — for anything else. A
+ * host this proxy never terminates cannot legitimately reach this listener, so
+ * a request naming one is a spoofed or confused header, not traffic to route.
+ */
+export function upgradeUpstreamFor(hostHeader, config, upstream) {
+  const host = parseConnectAuthority(hostHeader)?.host;
+  if (!host) return null;
+  if (host === upstreamHostOf(config)) return upstream;
+  if (hostMode(host, config) === 'rewrite') return `https://${host}`;
+  return null;
+}
+
+/**
  * Build a `connect` event handler implementing the terminating MITM described at
  * the top of this file.
  * @param ensureLeaf async () => { key, cert }   // current leaf PEMs
@@ -217,7 +241,16 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
     // which never fires 'request' — only 'upgrade', with a raw socket instead
     // of a response object (h1-only; falls back to blind h2 passthrough is not
     // needed since WS clients negotiate h1 for the handshake).
-    srv.on('upgrade', (req, socket, head) => relayUpgrade(req, socket, head, upstream, sx));
+    srv.on('upgrade', (req, socket, head) => {
+      const target = upgradeUpstreamFor(req.headers.host, config, upstream);
+      if (!target) {
+        log(`[TeamClaude] MITM: refusing a WebSocket Upgrade for host ${JSON.stringify(safeLine(req.headers.host, 64))}, which this proxy does not intercept`);
+        try { socket.write('HTTP/1.1 421 Misdirected Request\r\nConnection: close\r\n\r\n'); } catch { /* client already gone */ }
+        socket.destroy();
+        return;
+      }
+      relayUpgrade(req, socket, head, target, sx);
+    });
     // Make the h2-WebSocket dead end audible. Without this the only evidence is
     // a message that never arrives, which is what made #164 cost a day to
     // isolate rather than a minute.
