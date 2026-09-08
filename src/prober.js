@@ -10,10 +10,20 @@
 import { fetchUsage } from './oauth.js';
 import { fetchBackendQuota, hasBackendQuota } from './backend-quota.js';
 
+// Node's timers take a 32-bit signed delay: anything above 2^31-1 ms is
+// coerced to 1 ms, so an interval large enough to mean "practically never"
+// would instead probe in a tight loop. The TUI and CLI accept any number of
+// seconds, so the ceiling lives here where the timer is armed.
+export const MAX_PROBE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
+
+function clampInterval(ms) {
+  return ms > 0 ? Math.min(ms, MAX_PROBE_INTERVAL_MS) : 0;
+}
+
 export class Prober {
   constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, profileFn = null, backendFn = fetchBackendQuota, timeoutMs = 10_000, log = console.log } = {}) {
     this.am = accountManager;
-    this.intervalMs = intervalMs;
+    this.intervalMs = clampInterval(intervalMs);
     this.probeFn = probeFn;
     this.profileFn = profileFn;
     this.backendFn = backendFn;
@@ -23,7 +33,7 @@ export class Prober {
     this._running = false;
     this.lastRunStartedAt = null;
     this.lastRunFinishedAt = null;
-    this.nextRunAt = intervalMs > 0 ? Date.now() + intervalMs : null;
+    this.nextRunAt = this.intervalMs > 0 ? Date.now() + this.intervalMs : null;
     this.accountStatus = new Map();
   }
 
@@ -34,6 +44,7 @@ export class Prober {
   /** Change interval at runtime (0 = off). Probes once immediately when on. */
   reschedule(intervalMs) {
     const wasOn = this.intervalMs > 0 && this.timer;
+    intervalMs = clampInterval(intervalMs);
     this.intervalMs = intervalMs;
     if (this.timer) { clearInterval(this.timer); this.timer = null; }
 
@@ -64,7 +75,7 @@ export class Prober {
     this.nextRunAt = this.intervalMs > 0 ? this.lastRunStartedAt + this.intervalMs : null;
     try {
       const accounts = this.am.accounts.filter(account =>
-        this._isProbeTarget(account) || this._isBackendTarget(account));
+        this._probeable(account) && (this._isProbeTarget(account) || this._isBackendTarget(account)));
       await Promise.all(accounts.map(account => this.probeAccount(account)));
     } finally {
       this.lastRunFinishedAt = Date.now();
@@ -91,6 +102,20 @@ export class Prober {
    * module decides which; nothing in this file knows one by name. */
   _isBackendTarget(account) {
     return !!account?.credential && hasBackendQuota(account);
+  }
+
+  // Only accounts in rotation are probed. A probe forces a token refresh and
+  // sends the access token upstream, and neither belongs to an account the
+  // operator took out of service (`disabled`) or one whose refresh token upstream
+  // has already rejected — refreshing it again only rotates the token family
+  // once more, and its access token cannot be trusted either. The manager's
+  // dead-token guard is keyed on the token value, so a re-login lifts this skip
+  // on its own.
+  _probeable(account) {
+    if (!account?.credential) return false;
+    if (account.disabled) return false;
+    if (account._deadRefreshToken && account._deadRefreshToken === account.refreshToken) return false;
+    return true;
   }
 
   async probeAccount(account) {
