@@ -9,7 +9,7 @@ import { proxyFetch } from './upstream-fetch.js';
 
 const execFileAsync = promisify(execFile);
 
-export const DEFAULT_CREDENTIALS_PATH = '~/.claude/.credentials.json';
+const DEFAULT_CREDENTIALS_PATH = '~/.claude/.credentials.json';
 const KEYCHAIN_SERVICE = 'Claude Code-credentials';
 
 /** The login name whose Keychain item to prefer, or null where there isn't one. */
@@ -231,25 +231,6 @@ export function isTokenExpiringSoon(expiresAt, thresholdMs = 5 * 60 * 1000) {
 export function isTokenExpired(expiresAt) {
   if (!expiresAt) return false;
   return Date.now() >= normalizeExpiresAt(expiresAt);
-}
-
-/**
- * Whether Claude Code has to start in proxy credential mode (on the bootstrap
- * key) because it has no usable OAuth of its own.
- *
- * "Usable" is deliberately loose. An access token that has already expired is
- * fine as long as a refresh token is there: Claude Code refreshes the pair
- * itself at startup, and the proxy relays that refresh untouched. Counting an
- * expired access token as "no OAuth" put Claude Code into API-key mode — which
- * drops subscription mode and disables Claude in Chrome — whenever the
- * credentials it read were a stale snapshot. Only a missing, or itself
- * expired, refresh token means Claude Code cannot sign in on its own.
- */
-export function needsProxyClientCredential(credentials, now = Date.now()) {
-  if (!credentials) return true;
-  const { accessToken, expiresAt, refreshToken, refreshTokenExpiresAt } = credentials;
-  const live = (token, expiry) => Boolean(token) && (!expiry || normalizeExpiresAt(expiry) > now);
-  return !live(accessToken, expiresAt) && !live(refreshToken, refreshTokenExpiresAt);
 }
 
 /** Normalize the OAuth profile fields TeamClaude persists and exposes. */
