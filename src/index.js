@@ -42,6 +42,7 @@ import { buildClaudeEnvLines, encodePinComponent } from './claude-env.js';
 import { serviceKind, installService, uninstallService, serviceStatus, renderService, logPath } from './service.js';
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
 import { getUpstreamProxy, describeProxy, describeSelfProxy } from './upstream-proxy.js';
+import { startEventLoopMonitor } from './event-loop-monitor.js';
 
 // These constants are referenced by routeCommand, which the dispatch below
 // reaches through a top-level `await`. The await suspends module evaluation at
@@ -221,6 +222,10 @@ async function serverCommand() {
   // overnight leaves nothing behind to explain why.
   const crashLog = getCrashLogPath();
   installCrashHandlers(crashLog);
+  // Same motive as the crash log: when the process is wedged, the status
+  // endpoint cannot say so. The monitor leaves the evidence (one bounded warning
+  // per stall in the service log, lag figures under `server.eventLoop`).
+  const eventLoopMonitor = startEventLoopMonitor();
 
   const config = await loadOrCreateConfig();
   // Token writes below pair rows by entry id against a re-read of the file, so
@@ -547,6 +552,7 @@ async function serverCommand() {
       uptimeSeconds: Math.round((Date.now() - serverStartedAt) / 1000),
       port,
       upstream: config.upstream || 'https://api.anthropic.com',
+      eventLoop: eventLoopMonitor.status(),
     },
     probe: prober?.getStatus() || {
       enabled: false,
@@ -673,6 +679,7 @@ async function serverCommand() {
     if (!tui) console.log('\n[TeamClaude] Shutting down...');
     prober?.stop();
     warmer?.stop();
+    eventLoopMonitor.stop();
     if (quotaSaveInterval) clearInterval(quotaSaveInterval);
     await persistQuotaState();
     // Don't linger waiting on keep-alive / streaming connections: actively
