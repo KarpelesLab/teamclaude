@@ -1079,8 +1079,17 @@ async function statusCommand() {
   const color = colorArg === 'always'
     || (colorArg !== 'never' && process.stdout.isTTY);
 
+  // A connection that is accepted and then never answered is a different
+  // failure from a refused one — a stalled or overloaded server rather than a
+  // stopped one — and without a deadline this command would just hang on it.
+  const configuredTimeout = Number(process.env.TEAMCLAUDE_STATUS_TIMEOUT_MS);
+  const timeoutMs = configuredTimeout > 0 ? configuredTimeout : 5_000;
+
   try {
-    const res = await fetch(url, { headers: { 'x-api-key': config.proxy.apiKey } });
+    const res = await fetch(url, {
+      headers: { 'x-api-key': config.proxy.apiKey },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
     const data = await res.json();
     if (json) {
       console.log(JSON.stringify(data, null, 2));
@@ -1088,6 +1097,12 @@ async function statusCommand() {
     }
     console.log(renderStatus(data, { color }));
   } catch (err) {
+    if (err?.name === 'TimeoutError') {
+      console.error(`Proxy at localhost:${config.proxy.port} did not answer status within ${timeoutMs}ms.`);
+      console.error('The process may be overloaded or its event loop may be stalled.');
+      console.error(`Check the service log: ${logPath()}`);
+      process.exit(1);
+    }
     console.error('Cannot connect to proxy at localhost:' + config.proxy.port);
     console.error('Is the server running? Start with: teamclaude server');
     if (err?.message) console.error(`Details: ${err.message}`);
