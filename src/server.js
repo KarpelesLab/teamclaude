@@ -25,6 +25,33 @@ export const HOP_BY_HOP_HEADERS = new Set([
 ]);
 // Path prefix for the deprecated URL-based account pin (superseded by TC_ACCT).
 const PIN_PREFIX = '/tc-acct/';
+
+/**
+ * Does the request path carry a dot-segment (`.` or `..`, in any percent-encoded
+ * spelling, on either slash)?
+ *
+ * Every path classification in the listener — the Codex pool, the
+ * client-credential relay, the `/tc-acct/` pin — is a prefix test on the path
+ * AS SENT, while the upstream URL is normalised afterwards by `new URL()` and
+ * fetch. So `/backend-api/codex/../conversations` classifies as Codex and
+ * reaches chatgpt.com as `/backend-api/conversations`, pooled token attached;
+ * `/v1/messages/../../api/oauth/profile` does not start with `/api/oauth/`,
+ * takes the pool path, and reaches the profile endpoint with a rotated token —
+ * the exact thing the relay exists to prevent for the literal path. Backslash
+ * counts because the URL parser treats it as a slash for http(s). No client of
+ * ours ever sends one; refusing the request is the whole fix.
+ */
+export function hasDotSegment(url) {
+  const path = String(url || '').split('?')[0].split('#')[0];
+  for (const seg of path.split(/[\/\\]/)) {
+    let s = seg;
+    // An undecodable segment (`%`) is compared as sent: the URL parser leaves
+    // it alone too, so it cannot become a dot-segment upstream.
+    try { s = decodeURIComponent(seg); } catch { /* keep raw */ }
+    if (s === '.' || s === '..') return true;
+  }
+  return false;
+}
 const INLINE_RETRY_AFTER_MAX_SECONDS = 15;
 // How long the proxy will absorb a rate-limit 429's retry-after inline (waiting
 // on the SAME account) before surfacing a 429 + retry-after to the client. A
@@ -569,6 +596,19 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
     // already closed.
     let openEntry = null;
     try {
+      // Refused before any path-prefix classification below, so each of those
+      // sees the path upstream will see (see hasDotSegment). Logged like the
+      // unknown-pin 404: an operator should see a client probing the boundary.
+      if (hasDotSegment(req.url)) {
+        const reqId = ++counter;
+        const sessionId = req.headers['x-claude-code-session-id'] || null;
+        hooks.onRequestEnd?.(reqId, { method: req.method, path: safeLine(req.url), account: '(refused: dot-segment in path)', status: 400, model: null, sessionId, pinned: false });
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'Request path must not contain dot-segments' } }));
+        recordEarlyOutcome(accountManager, sessionId, req.url, true);
+        return;
+      }
+
       // Claude Code's telemetry (`/api/event_logging/*`) is high-volume noise in
       // the activity log. `config.eventLogging` (read live so the TUI toggle takes
       // effect immediately): 'show' forwards + displays; 'hide' (default) forwards
