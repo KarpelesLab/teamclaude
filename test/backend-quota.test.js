@@ -1,4 +1,6 @@
 import { test } from 'node:test';
+import { ReadableStream } from 'node:stream/web';
+import { Blob } from 'node:buffer';
 import assert from 'node:assert/strict';
 import { providerFor, hasBackendQuota, fetchBackendQuota } from '../src/backend-quota.js';
 import { AccountManager } from '../src/account-manager.js';
@@ -124,4 +126,36 @@ test('status draws whatever the reading says, knowing no provider', () => {
   assert.match(out, /Balance\s+\$25\.81/);
   assert.match(out, /Credits\s+\[█+░+\] 42% used/, 'a reported fraction gets a bar');
   assert.match(out, /Quota\s+unknown/, 'a provider that reports nothing is still honest');
+});
+
+// ── hostile backend (#310) ───────────────────────────────────
+
+// The reply comes from whatever host `account.upstream` names, and `currency`
+// is printed to the operator's terminal by `teamclaude status`.
+test('a currency carrying terminal controls is stripped and bounded before it can be rendered', async () => {
+  const hostile = { balance_infos: [{ currency: 'X\x1b]0;PWNED\x07\x1b[2J\rBALANCE  100% OK', total_balance: '12.34' }] };
+  const r = await fetchBackendQuota({ upstream: DS, credential: 'k' }, { fetchImpl: okFetch(hostile) });
+  assert.doesNotMatch(r.text, /[\x00-\x1f\x7f]/, 'no control character survives');
+  assert.ok(r.text.length < 24, `bounded: ${JSON.stringify(r.text)}`);
+
+  const am = new AccountManager([backend('ds', DS)], 0.98);
+  am.accounts[0].quota.backend = { ...r, at: Date.now() };
+  const out = renderStatus(am.getStatus(), { color: false, now: Date.now() });
+  assert.doesNotMatch(out, /[\x1b\x07\r]/, 'nothing reaches the terminal raw');
+});
+
+test('a response larger than the cap is refused, not buffered', async () => {
+  const stream = (bytes) => new ReadableStream({
+    start(c) { for (let i = 0; i < bytes; i += 4096) c.enqueue(new Uint8Array(Math.min(4096, bytes - i)).fill(0x20)); c.close(); },
+  });
+  const huge = async () => ({ ok: true, status: 200, headers: new Map(), body: stream(200 * 1024), json: async () => { throw new Error('must not be called'); } });
+  assert.deepEqual(await fetchBackendQuota({ upstream: DS, credential: 'k' }, { fetchImpl: huge }), { error: 'response too large' });
+
+  const declared = async () => ({ ok: true, status: 200, headers: new Map([['content-length', String(10 * 1024 * 1024)]]), body: stream(16), json: async () => BALANCE });
+  assert.deepEqual(await fetchBackendQuota({ upstream: DS, credential: 'k' }, { fetchImpl: declared }), { error: 'response too large' });
+
+  // A small real stream still parses.
+  const small = async () => ({ ok: true, status: 200, headers: new Map(), body: new Blob([JSON.stringify(BALANCE)]).stream() });
+  const r = await fetchBackendQuota({ upstream: DS, credential: 'k' }, { fetchImpl: small });
+  assert.equal(r.text, '$26.11');
 });
