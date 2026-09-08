@@ -88,6 +88,10 @@ test('the LaunchAgent asks for restart-on-exit and headless mode', () => {
   assert.match(plist, /<string>server<\/string>\s*<string>--headless<\/string>/);
   assert.match(plist, /<key>KeepAlive<\/key>\s*<true\/>/);
   assert.match(plist, /<key>RunAtLoad<\/key>\s*<true\/>/);
+  // Standard, not Background: launchd's Background QoS clamp starved the proxy
+  // (status timeouts, seconds of event-loop lag) and an HTTP client cannot lift
+  // it. Not Interactive either — that tier is for processes with a UI.
+  assert.match(plist, /<key>ProcessType<\/key>\s*<string>Standard<\/string>/);
   assert.match(plist, /<key>PATH<\/key>\s*<string>\/opt\/homebrew\/bin:\/usr\/bin<\/string>/);
 });
 
