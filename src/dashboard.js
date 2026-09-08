@@ -13,10 +13,38 @@
 // rendering uses textContent — status fields (account names, client names) are
 // operator/OAuth-derived, but they still never reach innerHTML.
 
+import { createHash } from 'node:crypto';
 import { UNAVAILABLE_TEXT } from './status-renderer.js';
 
 export function renderDashboardHtml() {
   return PAGE;
+}
+
+/**
+ * Content-Security-Policy for the dashboard, sent by the server with the page.
+ *
+ * The page holds the proxy key in localStorage, so the policy is the backstop
+ * for a script that should never run there: nothing loads from anywhere
+ * (`default-src 'none'`), the one inline script is admitted by its hash rather
+ * than by `'unsafe-inline'` — the page is static, so the hash is stable — and
+ * the only network the script may touch is this origin, for status and switch.
+ * Styles need `'unsafe-inline'` because the layout uses `style=` attributes,
+ * which hashes do not cover; CSSOM writes (`el.style.width = …`) are not
+ * governed by CSP at all. `frame-ancestors 'none'` keeps the page out of
+ * another site's iframe, where a click on "switch" could be overlaid.
+ */
+export function dashboardCsp(html = PAGE) {
+  const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
+  const hash = createHash('sha256').update(script, 'utf8').digest('base64');
+  return [
+    "default-src 'none'",
+    `script-src 'sha256-${hash}'`,
+    "style-src 'unsafe-inline'",
+    "connect-src 'self'",
+    "base-uri 'none'",
+    "form-action 'none'",
+    "frame-ancestors 'none'",
+  ].join('; ');
 }
 
 // The page's pure logic lives here, not in the script string: these functions

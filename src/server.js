@@ -15,7 +15,7 @@ import { applyAuthHeaders, upstreamFor, rewritesBody, providerForPath, providerO
 import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
 import { safeLine } from './safe-text.js';
-import { renderDashboardHtml } from './dashboard.js';
+import { renderDashboardHtml, dashboardCsp } from './dashboard.js';
 import { createUsageRecorder, resolveUsageDimensions, usageDimensionHeaderNames } from './client-usage.js';
 
 
@@ -201,7 +201,14 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // x-api-key, so gating the asset would just 401 every remote browser
       // without protecting anything.
       if (req.method === 'GET' && req.url === '/teamclaude/dashboard') {
-        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+        // The page keeps the proxy key in localStorage; the policy is what
+        // stops any script but its own from ever running next to it.
+        res.writeHead(200, {
+          'Content-Type': 'text/html; charset=utf-8',
+          'Cache-Control': 'no-store',
+          'Content-Security-Policy': dashboardCsp(),
+          'X-Content-Type-Options': 'nosniff',
+        });
         res.end(renderDashboardHtml());
         return;
       }

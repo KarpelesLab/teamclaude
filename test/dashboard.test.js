@@ -1,10 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import { createHash } from 'node:crypto';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
 import {
-  renderDashboardHtml, scopedWeeklyRows, accountTokens,
+  renderDashboardHtml, dashboardCsp, scopedWeeklyRows, accountTokens,
   sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
 } from '../src/dashboard.js';
@@ -426,7 +427,23 @@ test('GET /teamclaude/dashboard serves HTML without a key; other methods take th
     const page = await fetch(`http://127.0.0.1:${port}/teamclaude/dashboard`);
     assert.equal(page.status, 200);
     assert.match(page.headers.get('content-type'), /text\/html/);
-    assert.match(await page.text(), /TeamClaude/);
+    const html = await page.text();
+    assert.match(html, /TeamClaude/);
+
+    // The page keeps the proxy key in localStorage, so it ships with a policy
+    // that lets nothing load from anywhere and admits only its own script —
+    // by hash, so a script that is not byte-for-byte this one does not run.
+    const csp = page.headers.get('content-security-policy');
+    assert.ok(csp, 'the dashboard must carry a Content-Security-Policy');
+    assert.equal(csp, dashboardCsp(html));
+    assert.match(csp, /(^|; )default-src 'none'(;|$)/);
+    assert.match(csp, /(^|; )connect-src 'self'(;|$)/);
+    assert.match(csp, /(^|; )frame-ancestors 'none'(;|$)/);
+    assert.doesNotMatch(csp, /script-src[^;]*'unsafe-inline'/);
+    const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
+    const hash = createHash('sha256').update(script, 'utf8').digest('base64');
+    assert.match(csp, new RegExp(`script-src 'sha256-${hash.replace(/[+/=]/g, '\\$&')}'`));
+    assert.equal(page.headers.get('x-content-type-options'), 'nosniff');
 
     // The asset route is GET + exact path only — a POST to the same path must
     // NOT hit the dashboard handler but flow down the normal (gated, then
