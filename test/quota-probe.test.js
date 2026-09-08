@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { normalizeUsageBucket, findScopedWeeklyLimit, normalizeUsagePayload } from '../src/oauth.js';
 import { AccountManager, isFableModel, parseRequestModel } from '../src/account-manager.js';
-import { Prober } from '../src/prober.js';
+import { Prober, MAX_PROBE_INTERVAL_MS } from '../src/prober.js';
 
 function oauth(name, extra = {}) {
   return { name, type: 'oauth', accessToken: 't-' + name, expiresAt: Date.now() + 3600_000, ...extra };
@@ -299,6 +299,43 @@ test('prober learns missing quota tier metadata with the first quota refresh', a
   assert.equal(am.getQuotaSummary().accounts[0].tier.weight, 1);
 });
 
+// A third-party backend account is typed `oauth` with a static token (the
+// documented DeepSeek/GLM pattern), so a type check alone sends THAT provider's
+// key to api.anthropic.com every cycle — which answers 429, leaving a permanent
+// probe error on an account that is serving traffic normally.
+test('prober never sends a third-party key to the Anthropic usage endpoint', async () => {
+  const am = new AccountManager([
+    oauth('claude'),
+    { ...oauth('deepseek'), upstream: 'https://api.deepseek.com/anthropic' },
+  ], 0.98);
+  const probed = [];
+  const probeFn = async (token) => { probed.push(token); return { fiveHour: { utilization: 0.1, resetAt: 1 } }; };
+  // The DeepSeek backend publishes its own quota, so it IS a probe target now —
+  // of the backend read, which must go to its own host and never to Anthropic.
+  // Stubbed: the real read would leave the test suite for the network.
+  const backendRead = [];
+  const backendFn = async (account) => { backendRead.push(account.name); return { error: 'stub' }; };
+  await new Prober(am, { intervalMs: 0, probeFn, backendFn, log: () => {} }).probeAll();
+
+  assert.deepEqual(probed, ['t-claude']);
+  assert.deepEqual(backendRead, ['deepseek']);
+  // …and the backend's own quota is left untouched rather than recorded as an error.
+  assert.equal(am.accounts[1].quota.unified5h, null);
+});
+
+test('a third-party backend reads not-applicable, not a pending probe', () => {
+  // A backend whose provider publishes nothing (see backend-quota.js). One that
+  // DOES publish is probeable and reads `never` until its first cycle — covered
+  // in backend-quota.test.js.
+  const am = new AccountManager([
+    oauth('claude'),
+    { ...oauth('other'), upstream: 'https://api.example.invalid/anthropic' },
+  ], 0.98);
+  const rows = new Prober(am, { intervalMs: 300_000, log: () => {} }).getStatus().accounts;
+  assert.equal(rows[0].status, 'never');            // probed, just not yet
+  assert.equal(rows[1].status, 'not-applicable');   // nothing to probe, ever
+});
+
 test('prober skips API-key accounts', async () => {
   const am = new AccountManager([{ name: 'k', type: 'apikey', apiKey: 'sk' }], 0.98);
   let calls = 0;
@@ -356,4 +393,61 @@ test('prober refreshes expired token before probing', async () => {
 
   await prober.probeAll();
   assert.equal(token, 'fresh');
+});
+
+// A probe forces a refresh and sends the token upstream. Neither belongs to an
+// account the operator disabled, nor to one whose refresh token upstream has
+// already rejected: re-sending it just rotates the family once more.
+test('prober skips disabled accounts', async () => {
+  const am = new AccountManager([oauth('a'), oauth('b')], 0.98);
+  am.setDisabled(0, true);
+  const probed = [];
+  const prober = new Prober(am, { intervalMs: 0, probeFn: async cred => { probed.push(cred); return {}; }, log: () => {} });
+  await prober.probeAll();
+  assert.deepEqual(probed, ['t-b']);
+});
+
+test('prober skips an account holding a rejected refresh token, until a new one arrives', async () => {
+  let refreshes = 0;
+  const am = new AccountManager(
+    [oauth('a', { refreshToken: 'rt-dead', expiresAt: Date.now() - 1000 })],
+    0.98,
+    { refreshFn: async () => { refreshes++; const e = new Error('invalid_grant'); e.status = 400; throw e; } },
+  );
+  let probes = 0;
+  const prober = new Prober(am, { intervalMs: 0, probeFn: async () => { probes++; return {}; }, log: () => {} });
+
+  await prober.probeAll();                 // first cycle: the refresh is tried once and rejected
+  assert.equal(refreshes, 1);
+  assert.equal(am.accounts[0]._deadRefreshToken, 'rt-dead');
+  const probesAfterRejection = probes;
+
+  await prober.probeAll();
+  await prober.probeAll();
+  assert.equal(probes, probesAfterRejection, 'no token is sent for an account that needs a re-login');
+  assert.equal(refreshes, 1);
+
+  // A re-login lifts the skip: the manager's guard is keyed on the token value.
+  am.updateAccountTokens(0, { accessToken: 'at-new', refreshToken: 'rt-new', expiresAt: Date.now() + 3600_000 });
+  await prober.probeAll();
+  assert.equal(probes, probesAfterRejection + 1);
+});
+
+// setInterval coerces a delay above 2^31-1 ms to 1 ms, which would turn an
+// interval meant as "practically never" into a tight probing loop.
+test('prober clamps its interval so the timer cannot overflow', () => {
+  const am = new AccountManager([oauth('a')], 0.98);
+  const prober = new Prober(am, { intervalMs: 0, probeFn: async () => ({}), log: () => {} });
+  try {
+    prober.reschedule(365 * 24 * 3600 * 1000);
+    assert.equal(prober.intervalMs, MAX_PROBE_INTERVAL_MS);
+    assert.ok(prober.intervalMs <= 2 ** 31 - 1);
+    assert.equal(prober.getStatus().intervalSeconds, MAX_PROBE_INTERVAL_MS / 1000);
+    assert.ok(prober.nextRunAt - Date.now() <= MAX_PROBE_INTERVAL_MS);
+  } finally {
+    prober.stop();
+  }
+  const huge = new Prober(am, { intervalMs: Number.MAX_SAFE_INTEGER, probeFn: async () => ({}), log: () => {} });
+  assert.equal(huge.intervalMs, MAX_PROBE_INTERVAL_MS, 'the constructor clamps too');
+  assert.equal(new Prober(am, { intervalMs: NaN, log: () => {} }).intervalMs, 0, 'a non-number is off');
 });

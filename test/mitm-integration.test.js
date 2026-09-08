@@ -12,6 +12,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { generateCertChain } from '../src/x509.js';
 import { createConnectHandler } from '../src/mitm.js';
+import { allowLoopbackForward } from '../src/forward-target.js';
 import { AccountManager } from '../src/account-manager.js';
 
 // The MITM now TERMINATES the tunnel (real h2/h1 server) and forwards each
@@ -69,6 +70,7 @@ function makeUpstream(handler) {
 // Build the teamclaude proxy (CONNECT → terminate + forward) against `upPort`.
 function makeProxy(am, upPort, { leafCertPem, leafKeyPem }, { logDir = null, hooks = {}, sx = null } = {}) {
   const proxy = http.createServer();
+  allowLoopbackForward(proxy); // tunnel-mode targets in these tests are on this machine
   proxy.on('connect', createConnectHandler({
     // upstream host is 127.0.0.1 so a `CONNECT 127.0.0.1:<port>` is 'rewrite' mode.
     config: { upstream: `http://127.0.0.1:${upPort}` },

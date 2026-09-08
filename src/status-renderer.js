@@ -10,11 +10,25 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
   const lines = [];
   const probe = status.probe || { enabled: false, intervalSeconds: 0, accounts: [] };
   const warm = status.warm || { enabled: false, intervalSeconds: 0, accounts: [] };
-  const accounts = status.accounts || [];
-  const blocked = (status.blockedModels || []).filter(p => typeof p === 'string' && p.length);
+  // Listed in preference order, which is what an operator configured priority to
+  // mean: the account the fleet reaches for first is at the top, the last resort
+  // at the bottom. The payload arrives in config-file order, so an account moved
+  // to the back of the ladder still read as second in the list. Ties keep their
+  // configured order (the sort is stable), which is also the rotation cursor's.
+    const accounts = [...(status.accounts || [])].sort((a, b) => (a.priority || 0) - (b.priority || 0));
+  const blocked = (status.blockedModels || []).filter(p => typeof p === 'string' && p.length).map(p => safeLine(p, 64));
+  // This payload can come off the wire (`teamclaude status` against a running
+  // server), and account/route strings in it started life in an OAuth reply or
+  // a config file. Names are cut down once here and compared in that form, so a
+  // stripped account still matches a stripped current-account marker.
+  const currentAccount = status.currentAccount == null ? null : nameText(status.currentAccount);
+
+  // Only adaptive distribution swaps the Active row for a Serving row and lets
+  // the `>` marker follow the sessions; see formatActive for why the modes differ.
+  const adaptiveMode = status.sessions?.mode === 'adaptive';
 
   lines.push(paint.bold('TeamClaude status'));
-  lines.push(`${paint.dim(activeLabel(status).padEnd(12))} ${formatActive(status, paint)}`);
+  lines.push(`${paint.dim(activeLabel(adaptiveMode).padEnd(12))} ${formatActive(status, currentAccount, adaptiveMode, paint)}`);
   lines.push(`${paint.dim('Switch at'.padEnd(12))} ${formatPercent(status.switchThreshold)}`);
   // Only when something is blocked: a always-visible "Blocked" row would be
   // noise for the common case, but its ABSENCE is what made a blocked model
@@ -38,7 +52,7 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
   for (const line of routingLines(status.routes, blocked, paint)) lines.push(line);
 
   for (const account of accounts) {
-    lines.push(renderAccountHeader(account, status.currentAccount, paint, now, distributing(status) || null));
+    lines.push(renderAccountHeader(account, currentAccount, paint, now, adaptiveMode));
     for (const quotaLine of quotaLines(account, now, paint)) {
       lines.push(`  ${quotaLine}`);
     }
@@ -49,8 +63,8 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
     const spend = spendLine(account, paint);
     if (spend) lines.push(`  ${spend}`);
     lines.push(`  ${paint.dim('Usage'.padEnd(8))} ${formatUsage(account.usage, now)}`);
-    lines.push(`  ${paint.dim('Probe'.padEnd(8))} ${formatAccountProbe(account.name, probe, now, paint)}`);
-    const adaptive = adaptiveFor(status, account.name);
+    lines.push(`  ${paint.dim('Probe'.padEnd(8))} ${formatAccountProbe(nameText(account.name), probe, now, paint)}`);
+    const adaptive = adaptiveFor(status, nameText(account.name));
     if (adaptive) lines.push(`  ${paint.dim('Adaptive'.padEnd(8))} ${formatAdaptive(adaptive, paint)}`);
     lines.push('');
   }
@@ -77,6 +91,9 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
 
   return lines.join('\n').trimEnd();
 }
+
+// A name-sized field, fit to print: an account or route name, a glob, a pin.
+const nameText = value => safeLine(value, 64);
 
 function renderUsageEntries(lines, entries, paint, now) {
   entries.sort(([, a], [, b]) => ((b.inputTokens || 0) + (b.outputTokens || 0)) - ((a.inputTokens || 0) + (a.outputTokens || 0)));
@@ -141,7 +158,7 @@ export function spendLine(account, paint) {
   // Not enabled, but money was spent this month. Say why it is off now, since
   // "out_of_credits" and "the member turned it off" have different futures.
   const why = spend.userDisabled ? 'now disabled by the account holder'
-    : spend.disabledReason ? `now off (${spend.disabledReason})`
+    : spend.disabledReason ? `now off (${safeLine(spend.disabledReason, 64)})`
     : 'now off';
   return `${paint.dim('Spend'.padEnd(8))} ${paint.yellow(`${amount} spent this month, ${why}`)}`;
 }
@@ -149,7 +166,7 @@ export function spendLine(account, paint) {
 export function unavailableLine(account, paint) {
   const reason = account?.unavailable;
   if (!reason) return null;
-  const text = UNAVAILABLE_TEXT[reason] || reason;
+  const text = UNAVAILABLE_TEXT[reason] || safeLine(reason, 64);
   return `${paint.dim('Blocked'.padEnd(8))} ${paint.yellow(text)}`;
 }
 
@@ -184,7 +201,7 @@ function routingLines(routes, blocked, paint) {
   if (!Array.isArray(routes) || routes.length === 0) return [];
   const lines = [paint.bold('Routing')];
   for (const route of routes) {
-    const globs = route.match || [];
+    const globs = (route.match || []).map(nameText);
     const match = globs.join(', ');
     // A route every one of whose globs is blocked can carry no traffic at all —
     // say so, rather than listing eligible accounts it will never reach.
@@ -193,9 +210,9 @@ function routingLines(routes, blocked, paint) {
     const accounts = routeBlocked
       ? paint.red('blocked')
       : (route.accounts || [])
-        .map(a => (a.eligible ? paint.green(a.name) : paint.red(a.name))).join(' ') || paint.gray('(none)');
-    const tag = route.autocreated ? paint.dim(' (auto)') : route.bucket ? paint.dim(` [${route.bucket}]`) : '';
-    const pin = route.pinned ? paint.dim(` [pinned: ${route.pinned}]`) : '';
+        .map(a => (a.eligible ? paint.green(nameText(a.name)) : paint.red(nameText(a.name)))).join(' ') || paint.gray('(none)');
+    const tag = route.autocreated ? paint.dim(' (auto)') : route.bucket ? paint.dim(` [${nameText(route.bucket)}]`) : '';
+    const pin = route.pinned ? paint.dim(` [pinned: ${nameText(route.pinned)}]`) : '';
     // padEnd on the raw text, color after, so ANSI codes don't throw off alignment.
     const label = paintRoute(paint, route.color, match.padEnd(16));
     lines.push(`  ${label} ${paint.dim('→')} ${accounts}${tag}${pin}`);
@@ -204,55 +221,56 @@ function routingLines(routes, blocked, paint) {
   return lines;
 }
 
-// `currentAccount` is the ROTATION CURSOR, and under distribution that is not
-// the account serving the traffic. Only the non-session paths move it
-// (selectActiveAccount, _selectNext, _selectProbe, _switchOnSessionReset);
-// _selectForSession and the pickers beneath it never do, by design — a pinned
-// session is chosen per session, not from one global position. So while
-// sessions are distributed the cursor is just where a SESSION-LESS request
-// would go, and reporting it as "Active" points at one account while several
-// are serving. Observed live: the cursor sat on an account holding a 34% share
-// while the account beside it held 66%.
+// `currentAccount` is the ROTATION CURSOR. Under ADAPTIVE distribution that is
+// not the account serving the traffic: the adaptive picker scores every
+// candidate per session and never moves the cursor, so it is just where a
+// SESSION-LESS request would go, and reporting it as "Active" points at one
+// account while several are serving. Observed live: the cursor sat on an
+// account holding a 34% share while the account beside it held 66%.
 //
-// So the label follows the mode. Off, the cursor genuinely is the active
-// account and nothing changes. Distributing, it is named for what it is and the
-// accounts actually carrying sessions are listed instead.
-function distributing(status) {
-  return !!status.sessions?.distribute;
+// So the label follows the mode. Off — and in plain even distribution, whose
+// picker still walks from the cursor — the cursor is the active account and
+// the row reads as it always has. Adapting, the cursor is named for what it is
+// and the accounts actually carrying sessions are listed instead.
+function activeLabel(adaptiveMode) {
+  return adaptiveMode ? 'Serving' : 'Active';
 }
 
-function activeLabel(status) {
-  return distributing(status) ? 'Serving' : 'Active';
+// A session count off the wire: anything that is not a finite number is zero.
+function sessionCount(account) {
+  return Number.isFinite(account?.sessions) ? account.sessions : 0;
 }
 
-function formatActive(status, paint) {
-  if (!distributing(status)) return paint.cyan(status.currentAccount || 'none');
-  const serving = (status.accounts || []).filter(a => a.sessions > 0);
-  const cursor = paint.dim(`cursor ${status.currentAccount || 'none'}`);
+function formatActive(status, currentAccount, adaptiveMode, paint) {
+  if (!adaptiveMode) return paint.cyan(currentAccount || 'none');
+  const serving = (status.accounts || []).filter(a => sessionCount(a) > 0);
+  const cursor = paint.dim(`cursor ${currentAccount || 'none'}`);
   if (!serving.length) {
     // Nothing is running, so the cursor is the only answer there is — but say
     // that it is the cursor, since the next request may not go there.
     return `${paint.dim('idle')} ${cursor}`;
   }
   const named = serving
-    .sort((a, b) => b.sessions - a.sessions)
-    .map(a => `${paint.cyan(a.name)} ${paint.dim(`${a.sessions}`)}`)
+    .sort((a, b) => sessionCount(b) - sessionCount(a))
+    .map(a => `${paint.cyan(nameText(a.name))} ${paint.dim(`${sessionCount(a)}`)}`)
     .join(paint.dim(' · '));
   return `${named}  ${cursor}`;
 }
 
-function renderAccountHeader(account, currentAccount, paint, now, serving) {
-  // Under distribution the marker follows the sessions rather than the cursor,
-  // so the accounts flagged here are the ones the fleet is actually running on.
-  const current = serving == null ? account.name === currentAccount : account.sessions > 0;
+function renderAccountHeader(account, currentAccount, paint, now, followSessions = false) {
+  const acctName = nameText(account.name);
+  // Under adaptive distribution the marker follows the sessions rather than the
+  // cursor, so the accounts flagged here are the ones the fleet is running on.
+  const current = followSessions ? sessionCount(account) > 0 : acctName === currentAccount;
   const marker = current ? paint.cyan('>') : ' ';
-  const name = current ? paint.bold(account.name) : account.name;
+  const shown = current ? paint.bold(acctName) : acctName;
   const status = formatAccountStatus(account, now, paint);
-  const org = account.orgName ? ` ${paint.dim(account.orgName)}` : '';
-  const sess = account.sessions
-    ? ` ${paint.dim(`${account.sessions} sess${formatSessionBuckets(account.sessionsByBucket)}`)}`
+  const org = account.orgName ? ` ${paint.dim(nameText(account.orgName))}` : '';
+  const sessions = sessionCount(account);
+  const sess = sessions
+    ? ` ${paint.dim(`${sessions} sess${formatSessionBuckets(account.sessionsByBucket)}`)}`
     : '';
-  return `${marker} ${name} ${paint.dim(`(${account.type}, prio ${account.priority || 0})`)} ${status}${org}${sess}`;
+  return `${marker} ${shown} ${paint.dim(`(${safeLine(account.type, 16)}, prio ${account.priority || 0})`)} ${status}${org}${sess}`;
 }
 
 // "2 active / 3 known · distributing" — the running-sessions readout. While a
@@ -291,16 +309,34 @@ const BUCKET_LABELS = {
 // Suppressed when there is only one family in play: "3 sess (opus+ 3)" adds a
 // parenthesis and no information, and the breakdown exists to show a split.
 function formatSessionBuckets(byBucket) {
-  const entries = Object.entries(byBucket || {}).filter(([, n]) => n > 0);
+  const entries = Object.entries(byBucket || {}).filter(([, n]) => Number.isFinite(n) && n > 0);
   if (entries.length < 2) return '';
   entries.sort((a, b) => b[1] - a[1]);
-  return ` (${entries.map(([b, n]) => `${BUCKET_LABELS[b] || b} ${n}`).join(', ')})`;
+  return ` (${entries.map(([b, n]) => `${bucketLabel(b)} ${n}`).join(', ')})`;
+}
+
+// A bucket key is a quota field name on our side, but it arrives in the status
+// payload like everything else, so an unknown one is printed stripped and short.
+function bucketLabel(key) {
+  return BUCKET_LABELS[key] || safeLine(key, 24);
+}
+
+// A number in the adaptive readout, or `?` when the payload did not carry one:
+// an older server omits fields, a hostile one sends strings, and neither may
+// throw inside `teamclaude status`.
+function pct(value, digits) {
+  return Number.isFinite(value) ? `${(value * 100).toFixed(digits)}%` : '?';
+}
+function num(value, digits = 0) {
+  return Number.isFinite(value) ? value.toFixed(digits) : '?';
 }
 
 // The adaptive row for one account, or null when the mode is off (getStatus
 // sends an empty list) or this account predates the snapshot.
+// Matched on the stripped name, the form the account header was rendered in.
 function adaptiveFor(status, name) {
-  return (status.adaptive || []).find(r => r.name === name) || null;
+  const rows = Array.isArray(status.adaptive) ? status.adaptive : [];
+  return rows.find(r => r && typeof r === 'object' && nameText(r.name) === name) || null;
 }
 
 // "next · weight 62%  ·  3 sess / 1 inflight  ·  head 38.0% of 98%  ·  plan 20x
@@ -311,20 +347,20 @@ function adaptiveFor(status, name) {
 // misrepresenting the picker as a weighted random draw.
 function formatAdaptive(a, paint) {
   const parts = [];
-  const family = BUCKET_LABELS[a.bucket] || a.bucket;
+  const family = bucketLabel(a.bucket);
   const prefix = a.next ? `${paint.green('next')} ${paint.dim('·')} ` : '';
   parts.push(a.weight == null
     // Every candidate scored zero: the whole tier is inside its reserve, so
     // there is no weight to report and saying "0%" everywhere would imply the
     // router had stopped, which it has not.
     ? `${prefix}${paint.yellow(`weight n/a (all reserved, ${family})`)}`
-    : `${prefix}${paint.bold(`weight ${(a.weight * 100).toFixed(0)}% of ${family}`)}`);
-  parts.push(`${a.sessions} sess / ${a.inFlight} inflight`);
-  parts.push(`head ${(a.headroom * 100).toFixed(1)}% of ${(a.threshold * 100).toFixed(0)}%`);
+    : `${prefix}${paint.bold(`weight ${pct(a.weight, 0)} of ${family}`)}`);
+  parts.push(`${num(a.sessions)} sess / ${num(a.inFlight)} inflight`);
+  parts.push(`head ${pct(a.headroom, 1)} of ${pct(a.threshold, 0)}`);
   parts.push(a.planWeight == null
     ? paint.dim('plan unknown')
-    : `plan ${a.planWeight}x`);
-  parts.push(`conc ${a.concCap.toFixed(1)}`);
+    : `plan ${Number.isFinite(a.planWeight) ? a.planWeight : '?'}x`);
+  parts.push(`conc ${num(a.concCap, 1)}`);
   const line = parts.join(paint.dim('  ·  '));
   return a.competing ? line : `${paint.dim('(not competing)')} ${line}`;
 }
@@ -333,7 +369,7 @@ function formatAccountStatus(account, now, paint) {
   const parts = [];
   if (account.disabled) parts.push(paint.gray('disabled'));
 
-  const status = account.status || 'unknown';
+  const status = safeLine(account.status || 'unknown', 32) || 'unknown';
   const colored = status === 'active'
     ? paint.green(status)
     : status === 'throttled'
@@ -472,6 +508,16 @@ function quotaLines(account, now, paint) {
     const ratio = 1 - quota.requestsRemaining / quota.requestsLimit;
     lines.push(formatQuotaLine('Requests', ratio, quota.resetsAt, now, paint, cap('requests')));
   }
+  // A third-party backend publishes its own figure (a balance, a percentage —
+  // backend-quota.js decides). Drawn from the normalized reading alone: a bar
+  // when the provider reports a fraction, its text when it does not.
+  const backend = quota.backend;
+  if (backend?.text) {
+    const label = String(backend.label || 'Quota').padEnd(8);
+    const bar = backend.utilization != null ? `${usageBar(backend.utilization, paint)} ` : '';
+    lines.push(`${paint.dim(label)} ${bar}${backend.text}`);
+  }
+
   if (lines.length === 0) lines.push(`${paint.dim('Quota'.padEnd(8))} ${paint.gray('unknown')}`);
   return lines;
 }
@@ -545,7 +591,7 @@ function formatAccountProbe(accountName, probe, now, paint) {
       ? paint.yellow('running')
       : row.status === 'never'
         ? paint.gray('never')
-        : paint.red(row.status || 'error');
+        : paint.red(safeLine(row.status, 32) || 'error');
   const last = parseTs(row.lastProbedAt || row.startedAt);
   const when = last ? ` ${formatAgo(last, now)}` : '';
   const duration = typeof row.durationMs === 'number' ? `, ${Math.round(row.durationMs)}ms` : '';

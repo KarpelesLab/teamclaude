@@ -18,7 +18,27 @@ import tls from 'node:tls';
 const CONNECT_TIMEOUT_MS = 30000; // residential exits can be slow to establish
 
 // Resolved per call (not at import) so tests can point it at a local mock.
-const sxBase = () => process.env.SX_API_BASE || 'https://api.sx.org';
+//
+// The API key travels as a query parameter (the provider's design), so the base
+// URL decides whether it crosses the network in the clear. An override must be
+// https:, or plain http: to this machine only (a test mock): anything else is
+// reported once and the default is used, rather than sending the key to whatever
+// an inherited environment variable happens to name.
+const DEFAULT_SX_BASE = 'https://api.sx.org';
+let warnedBase = null;
+export function sxBase(env = process.env, warn = (m) => console.error(m)) {
+  const raw = env.SX_API_BASE;
+  if (!raw) return DEFAULT_SX_BASE;
+  let u = null;
+  try { u = new URL(raw); } catch { /* reported below */ }
+  const loopback = u && /^(localhost|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|\[::1\])$/.test(u.hostname);
+  if (u && (u.protocol === 'https:' || (u.protocol === 'http:' && loopback))) return raw.replace(/\/$/, '');
+  if (warnedBase !== raw) {
+    warnedBase = raw;
+    warn(`[TeamClaude] ignoring SX_API_BASE=${JSON.stringify(raw)}: the sx.org API key rides in the URL, so the base must be https:// (plain http:// is allowed for loopback only); using ${DEFAULT_SX_BASE}`);
+  }
+  return DEFAULT_SX_BASE;
+}
 
 // ── sx.org REST (apiKey is a query param; these hit api.sx.org directly, never
 // the proxy, and are unrelated to Anthropic traffic) ──
@@ -101,10 +121,32 @@ export function connectThroughProxy({ proxyHost, proxyPort, auth, targetHost, ta
 }
 
 /**
+ * Complete a TLS handshake over an already-open tunnel socket. Resolves with the
+ * TLSSocket after secureConnect; rejects (and destroys the tunnel) on error or
+ * when the handshake takes longer than `timeout`. The CONNECT had its own timer;
+ * without one here a proxy that answers 200 and then goes quiet — or a target
+ * that never sends a ServerHello — held the caller for ever, with every request
+ * behind it. Cert verification stays at its secure default; tests inject a CA
+ * via tlsOptions.ca.
+ */
+export function handshakeOverTunnel(sock, { servername, tlsOptions = {}, timeout = CONNECT_TIMEOUT_MS }) {
+  return new Promise((resolve, reject) => {
+    const tlsSock = tls.connect({ socket: sock, servername, ...tlsOptions });
+    const settle = () => { clearTimeout(timer); tlsSock.removeListener('secureConnect', onOk); tlsSock.removeListener('error', onErr); };
+    // On failure nothing will listen to the dying TLSSocket any more, so give it
+    // a sink: a late error from the teardown must not become an uncaught one.
+    const onErr = (err) => { settle(); tlsSock.on('error', () => {}); tlsSock.destroy(); sock.destroy(); reject(err); };
+    const onOk = () => { settle(); resolve(tlsSock); };
+    const timer = setTimeout(() => onErr(new Error(`TLS handshake with ${servername} through the tunnel timed out after ${timeout}ms`)), timeout);
+    tlsSock.once('secureConnect', onOk);
+    tlsSock.once('error', onErr);
+  });
+}
+
+/**
  * CONNECT through `proxy`, then complete a TLS handshake to targetHost so TLS is
  * end-to-end (the proxy sees ciphertext only). Resolves with the TLSSocket after
- * secureConnect. Cert verification stays at its secure default; tests inject a CA
- * via tlsOptions.ca.
+ * secureConnect.
  */
 export async function tunnelTls({ proxy, targetHost, targetPort = 443, tlsOptions = {} }) {
   const sock = await connectThroughProxy({
@@ -114,13 +156,7 @@ export async function tunnelTls({ proxy, targetHost, targetPort = 443, tlsOption
     targetHost,
     targetPort,
   });
-  return new Promise((resolve, reject) => {
-    const tlsSock = tls.connect({ socket: sock, servername: targetHost, ...tlsOptions });
-    const onErr = (err) => { tlsSock.removeListener('secureConnect', onOk); sock.destroy(); reject(err); };
-    const onOk = () => { tlsSock.removeListener('error', onErr); resolve(tlsSock); };
-    tlsSock.once('secureConnect', onOk);
-    tlsSock.once('error', onErr);
-  });
+  return handshakeOverTunnel(sock, { servername: targetHost, tlsOptions });
 }
 
 /**

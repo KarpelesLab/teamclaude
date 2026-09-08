@@ -3,21 +3,13 @@
 import { spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { createWriteStream } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import net from 'node:net';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, loadState, saveState } from './config.js';
 import { installCrashHandlers } from './crash-log.js';
 import { AccountManager, DEFAULT_SWITCH_THRESHOLD, distributionMode } from './account-manager.js';
 import { createProxyServer } from './server.js';
-import {
-  DEFAULT_CREDENTIALS_PATH,
-  importCredentials,
-  loginOAuth,
-  loginOAuthWithPastedCode,
-  fetchProfile,
-  refreshAccessToken,
-  isTokenExpiringSoon,
-  needsProxyClientCredential,
-} from './oauth.js';
+import { importCredentials, loginOAuth, loginOAuthWithPastedCode, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import {
   sameIdentity,
   orgKey,
@@ -54,6 +46,9 @@ import { getUpstreamProxy, describeProxy, describeSelfProxy } from './upstream-p
 // reaches through a top-level `await`. The await suspends module evaluation at
 // the switch, so a const declared under the switch is still in the temporal
 // dead zone when the command body runs — keep them above the dispatch.
+// Ceiling for `teamclaude probe <seconds>`: setInterval takes a 32-bit signed
+// millisecond delay, so anything past ~2,147,483 s overflows to 1 ms.
+const MAX_PROBE_SECONDS = 7 * 24 * 3600;
 const ROUTE_USAGE = [
   'Usage: teamclaude route [list]',
   '       teamclaude route add <name> --match "<glob>[,<glob>]" [--accounts "<name-or-index>[,...]"] [--bucket <quota-bucket>] [--color <name>]',
@@ -105,7 +100,6 @@ const DISTRIBUTE_MODES = {
 
 const args = process.argv.slice(2);
 const command = args[0];
-const LOCAL_PROXY_API_KEY = 'teamclaude-local';
 
 switch (command) {
   case 'server':
@@ -228,6 +222,9 @@ async function serverCommand() {
   installCrashHandlers(crashLog);
 
   const config = await loadOrCreateConfig();
+  // Token writes below pair rows by entry id against a re-read of the file, so
+  // the ids have to be on disk before the first refresh, not just in memory.
+  await persistMintedAccountIds(config);
 
   // --log-to <dir>
   const logTo = argValue('--log-to');
@@ -321,7 +318,8 @@ async function serverCommand() {
           accountManager.addAccount(diskAcct);
         }
       }
-      // Match by UUID first, then by name — index may have shifted
+      // By entry id only — the index may have shifted, and identity is not
+      // one-to-one (see findConfigAccount). No row: nothing is written.
       const cfgIdx = findConfigAccount(diskConfig, account);
       if (cfgIdx >= 0) {
         diskConfig.accounts[cfgIdx].accessToken = newTokens.accessToken;
@@ -543,7 +541,9 @@ async function serverCommand() {
       running: false,
       accounts: accountManager.accounts.map(account => ({
         name: account.name,
-        status: account.type === 'oauth' ? 'never' : 'not-applicable',
+        // Same rule as Prober._isProbeTarget: a third-party backend has no
+        // Anthropic usage to read, so it is not-applicable rather than pending.
+        status: (account.type === 'oauth' && !account.upstream) ? 'never' : 'not-applicable',
         lastProbedAt: null,
         startedAt: null,
         durationMs: null,
@@ -676,7 +676,10 @@ async function serverCommand() {
 // ── import ──────────────────────────────────────────────────
 
 async function importCommand() {
-  const config = await loadOrCreateConfig();
+  // First-run entry point: the file has to exist (and the egress proxy be
+  // applied) before anything reaches the network. The list is not written back
+  // from this copy — upsertOAuthAccount re-reads the file when it saves.
+  await loadOrCreateConfig();
 
   let name = argValue('--name');
   const jsonStr = argValue('--json');
@@ -711,7 +714,7 @@ async function importCommand() {
     }
   }
 
-  await upsertOAuthAccount(config, name, creds, 'import');
+  await upsertOAuthAccount(name, creds, 'import');
 }
 
 // ── login ───────────────────────────────────────────────────
@@ -726,8 +729,9 @@ async function importCommand() {
  */
 async function loginCodexCommand() {
   // loadOrCreateConfig, not loadConfig: `login` is a first-run entry point and
-  // must work before any config file exists.
-  const config = await loadOrCreateConfig();
+  // must work before any config file exists. This copy is not what gets
+  // written — see the atomicConfigUpdate below.
+  await loadOrCreateConfig();
   let creds;
   try {
     creds = await loginCodex({ noBrowser: args.includes('--no-browser') });
@@ -740,37 +744,42 @@ async function loginCodexCommand() {
     process.exit(1);
   }
 
-  const name = argValue('--name') || creds.email
-    || `codex-${config.accounts.filter(a => a.provider === 'codex').length + 1}`;
+  // The browser flow above can take minutes, and a running server may have
+  // rotated another account's refresh token on disk in the meantime. Writing
+  // the copy loaded before the flow would put the dead token back, and that
+  // account would fail on its next restart. So the upsert runs against a fresh
+  // read of the file, and only this account's row is touched.
+  await atomicConfigUpdate(config => {
+    const name = argValue('--name') || creds.email
+      || `codex-${config.accounts.filter(a => a.provider === 'codex').length + 1}`;
 
-  const account = {
-    name,
-    type: 'oauth',
-    provider: 'codex',
-    source: 'login',
-    accountId: creds.accountId,
-    accessToken: creds.accessToken,
-    refreshToken: creds.refreshToken,
-    expiresAt: creds.expiresAt,
-  };
+    const account = {
+      name,
+      type: 'oauth',
+      provider: 'codex',
+      source: 'login',
+      accountId: creds.accountId,
+      accessToken: creds.accessToken,
+      refreshToken: creds.refreshToken,
+      expiresAt: creds.expiresAt,
+    };
 
-  // Identity for a Codex account is its ChatGPT account id; fall back to the
-  // display name when upstream did not supply one.
-  const idx = config.accounts.findIndex(a => (
-    a.provider === 'codex' && (
-      (account.accountId && a.accountId === account.accountId) || a.name === account.name
-    )
-  ));
-  if (idx >= 0) {
-    const prev = config.accounts[idx];
-    config.accounts[idx] = { ...prev, ...account, name: prev.name };
-    console.log(`Updated account "${prev.name}"`);
-  } else {
-    config.accounts.push(account);
-    console.log(`Added account "${account.name}"${creds.planType ? ` (${creds.planType})` : ''}`);
-  }
-
-  await saveConfig(config);
+    // Identity for a Codex account is its ChatGPT account id; fall back to the
+    // display name when upstream did not supply one.
+    const idx = config.accounts.findIndex(a => (
+      a.provider === 'codex' && (
+        (account.accountId && a.accountId === account.accountId) || a.name === account.name
+      )
+    ));
+    if (idx >= 0) {
+      const prev = config.accounts[idx];
+      config.accounts[idx] = { ...prev, ...account, name: prev.name };
+      console.log(`Updated account "${prev.name}"`);
+    } else {
+      config.accounts.push(account);
+      console.log(`Added account "${account.name}"${creds.planType ? ` (${creds.planType})` : ''}`);
+    }
+  });
   console.log(`Saved to ${getConfigPath()}`);
 }
 
@@ -843,7 +852,7 @@ async function loginApiCommand() {
 }
 
 async function loginOAuthCommand({ pasteOnly = false } = {}) {
-  const config = await loadOrCreateConfig();
+  await loadOrCreateConfig(); // first run: create the file; the save re-reads it
   let name = argValue('--name');
 
   console.log('Starting OAuth login...');
@@ -859,7 +868,7 @@ async function loginOAuthCommand({ pasteOnly = false } = {}) {
     process.exit(1);
   }
 
-  await upsertOAuthAccount(config, name, creds, 'login');
+  await upsertOAuthAccount(name, creds, 'login');
 }
 
 // ── env ─────────────────────────────────────────────────────
@@ -889,21 +898,21 @@ async function envCommand() {
 
   // Same pin as `teamclaude run`, so `eval "$(teamclaude env)"` and `run` agree.
   const account = (process.env.TC_ACCT || '').trim();
-  const clientApiKey = (
-    !process.env.ANTHROPIC_AUTH_TOKEN
-    && await needsLocalProxyClientCredential()
-  ) ? LOCAL_PROXY_API_KEY : null;
-  const lines = buildClaudeEnvLines({
-    port, useMitm, caPath, holdSeconds: config.holdSeconds,
-    account, proxyApiKey: config.proxy?.apiKey || '', clientApiKey,
-  });
+  let lines;
+  try {
+    lines = buildClaudeEnvLines({
+      port, useMitm, caPath, holdSeconds: config.holdSeconds,
+      account, proxyApiKey: config.proxy?.apiKey || '',
+    });
+  } catch (err) {
+    // A bad proxy.port. Nothing reaches stdout: the shell is eval'ing it.
+    process.stderr.write(`teamclaude env: ${err.message} (in ${getConfigPath()})\n`);
+    process.exit(1);
+  }
   process.stdout.write(`${lines.join('\n')}\n`);
 
   const mode = useMitm ? 'MITM forward-proxy' : 'base-URL';
   process.stderr.write(`# TeamClaude env: ${mode} mode, localhost:${port}\n`);
-  if (clientApiKey) {
-    process.stderr.write('# local Claude OAuth unavailable; using proxy credential mode\n');
-  }
   if (account) {
     process.stderr.write(`# pinned to account "${account}" (TC_ACCT)\n`);
     // Warn, don't fail: the account list can change before the shell is used,
@@ -957,11 +966,6 @@ async function runCommand() {
   // MITM mode too, and keeps the pin out of the API path.
   const pinnedBase = isLocalAccountPin(process.env.ANTHROPIC_BASE_URL, port);
   if (await isProxyUp(port)) {
-    if (!env.ANTHROPIC_AUTH_TOKEN && await needsLocalProxyClientCredential()) {
-      delete env.ANTHROPIC_AUTH_TOKEN;
-      env.ANTHROPIC_API_KEY = LOCAL_PROXY_API_KEY;
-      console.error('[TeamClaude] Local Claude OAuth unavailable — using proxy credential mode');
-    }
     if (useMitm) {
       // Route ALL of claude's traffic through us as an HTTPS forward proxy, so
       // even hardcoded api.anthropic.com endpoints (e.g. the design MCP) get the
@@ -986,10 +990,9 @@ async function runCommand() {
       }
       delete env.ANTHROPIC_BASE_URL;
     } else {
-      // Set ANTHROPIC_BASE_URL and preserve subscription mode while local OAuth
-      // is usable. When it is unavailable, the harmless bootstrap key above
-      // gets Claude Code past its startup auth check; the proxy replaces it
-      // with the selected account credential before forwarding.
+      // Only set ANTHROPIC_BASE_URL — Claude Code keeps its own OAuth token
+      // which the proxy accepts from localhost. Not setting ANTHROPIC_API_KEY
+      // lets Claude Code stay in subscription mode (full model access).
       // TC_ACCT wins; teamclaude builds the pinned URL itself rather than making
       // the caller hand-write one. Otherwise an existing /tc-acct/ base URL
       // pointing at this proxy is preserved for configs written against 1.1.10.
@@ -1044,17 +1047,6 @@ async function runCommand() {
   await autoUpdate({ config }).catch(() => {});
 
   process.exit(result.status ?? 1);
-}
-
-async function needsLocalProxyClientCredential() {
-  try {
-    return needsProxyClientCredential(await importCredentials(DEFAULT_CREDENTIALS_PATH));
-  } catch (error) {
-    if (error?.code !== 'ENOENT') {
-      console.error(`[TeamClaude] Could not read local Claude OAuth — using proxy credential mode: ${error.message}`);
-    }
-    return true;
-  }
 }
 
 // ── status ──────────────────────────────────────────────────
@@ -1211,8 +1203,12 @@ async function accountsCommand() {
     return;
   }
 
+  // Both writes below pair rows by entry id against a fresh read of the file,
+  // so a file written before ids existed needs its ids on disk first.
+  await persistMintedAccountIds(config);
+
   // Refresh expired tokens before fetching profiles
-  let configDirty = false;
+  const refreshed = [];
   await Promise.all(config.accounts.map(async (a) => {
     if (a.type !== 'oauth' || !a.refreshToken) return;
     if (!isTokenExpiringSoon(a.expiresAt)) return;
@@ -1221,12 +1217,26 @@ async function accountsCommand() {
       a.accessToken = newTokens.accessToken;
       a.refreshToken = newTokens.refreshToken;
       a.expiresAt = newTokens.expiresAt;
-      configDirty = true;
+      refreshed.push(a);
     } catch {
       // refresh failed — fetchProfile will report the specific error
     }
   }));
-  if (configDirty) await saveConfig(config);
+  // Only the refreshed rows are written, each onto the on-disk row with its id.
+  // Saving the whole in-memory list here would put back whatever a running
+  // server rotated on disk since the load — a refresh token that is now dead,
+  // and an account lost on its next restart.
+  if (refreshed.length > 0) {
+    await atomicConfigUpdate(disk => {
+      for (const a of refreshed) {
+        const i = findConfigAccount(disk, a);
+        if (i < 0) continue; // no row of its own; any other row would be another account's
+        disk.accounts[i].accessToken = a.accessToken;
+        disk.accounts[i].refreshToken = a.refreshToken;
+        disk.accounts[i].expiresAt = a.expiresAt;
+      }
+    });
+  }
 
   // Fetch profiles in parallel for all OAuth accounts
   const profiles = await Promise.all(
@@ -1240,16 +1250,18 @@ async function accountsCommand() {
   // account, not a duplicate. Keep the last (most recently added) entry.
   const seen = new Map();
   let removed = 0;
-  let touched = false;
+  // Which entries changed, by id, so the write below touches only those rows.
+  const touchedIds = new Set();
+  const removedIds = new Set();
   for (let i = config.accounts.length - 1; i >= 0; i--) {
     const a = config.accounts[i];
     const p = profiles[i];
     if (p && !p.error) {
-      if (p.accountUuid && a.accountUuid !== p.accountUuid) { a.accountUuid = p.accountUuid; touched = true; }
-      if (p.orgUuid && a.orgUuid !== p.orgUuid) { a.orgUuid = p.orgUuid; touched = true; }
-      if (p.orgName && a.orgName !== p.orgName) { a.orgName = p.orgName; touched = true; }
+      if (p.accountUuid && a.accountUuid !== p.accountUuid) { a.accountUuid = p.accountUuid; touchedIds.add(a.id); }
+      if (p.orgUuid && a.orgUuid !== p.orgUuid) { a.orgUuid = p.orgUuid; touchedIds.add(a.id); }
+      if (p.orgName && a.orgName !== p.orgName) { a.orgName = p.orgName; touchedIds.add(a.id); }
       for (const field of ['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro']) {
-        if (p[field] != null && a[field] !== p[field]) { a[field] = p[field]; touched = true; }
+        if (p[field] != null && a[field] !== p[field]) { a[field] = p[field]; touchedIds.add(a.id); }
       }
     }
     const uuid = a.accountUuid;
@@ -1259,7 +1271,7 @@ async function accountsCommand() {
       config.accounts.splice(i, 1);
       profiles.splice(i, 1);
       removed++;
-      touched = true;
+      removedIds.add(a.id);
     } else {
       seen.set(key, i);
     }
@@ -1277,10 +1289,24 @@ async function accountsCommand() {
     const email = (p && !p.error && p.email) ? p.email : null;
     if (!email) continue;
     const newName = orgCount.get(a.accountUuid) > 1 ? `${email} (${orgLabel(a)})` : email;
-    if (a.name !== newName) { a.name = newName; touched = true; }
+    if (a.name !== newName) { a.name = newName; touchedIds.add(a.id); }
   }
 
-  if (touched) await saveConfig(config);
+  // Same discipline as the token write: drop the duplicates by id and copy the
+  // profile fields onto the touched rows only, leaving every other row — and
+  // every other field of these rows — as it is on disk.
+  if (touchedIds.size > 0 || removedIds.size > 0) {
+    const fields = ['name', 'accountUuid', 'orgUuid', 'orgName', 'organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro'];
+    await atomicConfigUpdate(disk => {
+      disk.accounts = disk.accounts.filter(d => !removedIds.has(d?.id));
+      for (const a of config.accounts) {
+        if (!touchedIds.has(a.id)) continue;
+        const i = findConfigAccount(disk, a);
+        if (i < 0) continue;
+        for (const f of fields) if (a[f] !== undefined) disk.accounts[i][f] = a[f];
+      }
+    });
+  }
   if (removed > 0) console.log(`Removed ${removed} duplicate account(s)\n`);
 
   for (const [i, a] of config.accounts.entries()) {
@@ -1456,6 +1482,11 @@ async function probeCommand() {
     }
     if (seconds > 0 && seconds < 30) {
       console.error('Minimum probe interval is 30s (to avoid hammering the usage endpoint).');
+      process.exit(1);
+    }
+    // Past the ceiling the interval would overflow into a 1 ms probe storm.
+    if (seconds > MAX_PROBE_SECONDS) {
+      console.error(`Maximum probe interval is ${MAX_PROBE_SECONDS}s (7 days).`);
       process.exit(1);
     }
   }
@@ -2030,7 +2061,7 @@ function orgLabel(a) {
   return a.orgName || (a.orgUuid ? a.orgUuid.slice(0, 8) : 'org');
 }
 
-async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
+async function upsertOAuthAccount(name, creds, source = 'unknown') {
   // Fetch profile to auto-name and deduplicate by account+org identity.
   const userNamed = !!name;
   const profile = await fetchProfile(creds.accessToken);
@@ -2050,56 +2081,64 @@ async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
     const tier = profile.hasClaudeMax ? 'Max' : profile.hasClaudePro ? 'Pro' : null;
     if (tier) console.log(`Detected Claude ${tier} account: ${profile.email}`);
   }
-  if (!name) {
-    const n = config.accounts.filter(a => a.name.startsWith('account-')).length + 1;
-    name = `account-${n}`;
-  }
-
-  const account = {
-    name,
-    type: 'oauth',
-    source,
-    ...oauthIdentityFields(profile),
-    organizationType: profile?.organizationType || null,
-    rateLimitTier: profile?.rateLimitTier || creds.rateLimitTier || null,
-    seatTier: profile?.seatTier || null,
-    hasClaudeMax: profile?.hasClaudeMax ?? null,
-    hasClaudePro: profile?.hasClaudePro ?? null,
-    accessToken: creds.accessToken,
-    refreshToken: creds.refreshToken,
-    expiresAt: creds.expiresAt,
-  };
-
-  // Deduplicate by account+org identity (same email in a different org is a
-  // distinct account), then by name — but only where the name is not standing in
-  // for a different account+org, which is exactly the multi-org case below.
-  const idx = findUpsertTarget(config.accounts, account);
-
-  if (idx >= 0) {
-    // Same account+org: refresh credentials and org info, but keep the existing
-    // display name, entry id, and any disk-only fields (e.g. importFrom).
-    const prev = config.accounts[idx];
-    config.accounts[idx] = updateAccountEntry(prev, account);
-    console.log(`Updated account "${prev.name}"`);
-  } else {
-    // New org for this person: if another entry shares the accountUuid, the bare
-    // email name would collide — disambiguate both with " (org)".
-    if (!userNamed && account.accountUuid) {
-      const collisions = config.accounts.filter(
-        a => a.accountUuid === account.accountUuid && !sameIdentity(a, account)
-      );
-      if (collisions.length > 0) {
-        for (const c of collisions) {
-          if (!c.name.includes(' (')) c.name = `${c.name} (${orgLabel(c)})`;
-        }
-        account.name = `${name} (${orgLabel(account)})`;
-      }
+  // The login or import that produced `creds` ran between the caller's config
+  // load and this save — a browser flow can take minutes — and a running server
+  // may have rotated another account's refresh token on disk meanwhile. Saving
+  // a copy loaded before that would put the dead token back, and the account
+  // would fail on its next restart. So the whole upsert runs against a fresh
+  // read of the file: only this account's row (and, in the multi-org case, the
+  // display name of its namesakes) changes; every other row stays as it is on
+  // disk.
+  const config = await atomicConfigUpdate(config => {
+    if (!name) {
+      const n = config.accounts.filter(a => a.name.startsWith('account-')).length + 1;
+      name = `account-${n}`;
     }
-    config.accounts.push(account);
-    console.log(`Added account "${account.name}"`);
-  }
 
-  await saveConfig(config);
+    const account = {
+      name,
+      type: 'oauth',
+      source,
+      ...oauthIdentityFields(profile),
+      organizationType: profile?.organizationType || null,
+      rateLimitTier: profile?.rateLimitTier || creds.rateLimitTier || null,
+      seatTier: profile?.seatTier || null,
+      hasClaudeMax: profile?.hasClaudeMax ?? null,
+      hasClaudePro: profile?.hasClaudePro ?? null,
+      accessToken: creds.accessToken,
+      refreshToken: creds.refreshToken,
+      expiresAt: creds.expiresAt,
+    };
+
+    // Deduplicate by account+org identity (same email in a different org is a
+    // distinct account), then by name — but only where the name is not standing in
+    // for a different account+org, which is exactly the multi-org case below.
+    const idx = findUpsertTarget(config.accounts, account);
+
+    if (idx >= 0) {
+      // Same account+org: refresh credentials and org info, but keep the existing
+      // display name, entry id, and any disk-only fields (e.g. importFrom).
+      const prev = config.accounts[idx];
+      config.accounts[idx] = updateAccountEntry(prev, account);
+      console.log(`Updated account "${prev.name}"`);
+    } else {
+      // New org for this person: if another entry shares the accountUuid, the bare
+      // email name would collide — disambiguate both with " (org)".
+      if (!userNamed && account.accountUuid) {
+        const collisions = config.accounts.filter(
+          a => a.accountUuid === account.accountUuid && !sameIdentity(a, account)
+        );
+        if (collisions.length > 0) {
+          for (const c of collisions) {
+            if (!c.name.includes(' (')) c.name = `${c.name} (${orgLabel(c)})`;
+          }
+          account.name = `${name} (${orgLabel(account)})`;
+        }
+      }
+      config.accounts.push(account);
+      console.log(`Added account "${account.name}"`);
+    }
+  });
   console.log(`Saved to ${getConfigPath()}`);
   await notifyRunningServer(config);
 }
@@ -2107,26 +2146,49 @@ async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
 // ── config sync helpers ─────────────────────────────────────
 
 /**
- * Find the config entry a running account came from.
+ * Find the config entry a running account came from, by entry id only; -1 when
+ * no row carries its id.
  *
- * By entry id first. Identity is the fallback, and it is not one-to-one:
- * sameIdentity compares organization only when BOTH records carry one and falls
- * back to the name otherwise, so for one person holding accounts in two
- * organizations — the case the identity module exists for — both rows match and
- * the first one wins. Resolving a token write that way records one account's
- * refresh-token family against another account's row (#203).
+ * There is deliberately no identity fallback (mirroring syncRefreshedTokens).
+ * sameIdentity is not one-to-one: it compares organization only when BOTH
+ * records carry one and falls back to the name otherwise, so for one person
+ * holding accounts in two organizations — the case the identity module exists
+ * for — both rows match and the first one wins. Resolving a token write that way
+ * records one account's refresh-token family against another account's row
+ * (#203), and on a fleet holding other people's accounts that is a credential
+ * crossing. A -1 means the write is skipped: an account the file no longer
+ * describes has no row of its own, and any row picked for it would be another
+ * account's.
  *
- * The id is exact and survives the refresh that rewrites the credential, which
- * is the one field that might otherwise have separated two records of one
- * person. loadConfig gives every entry an id, so the fallback is only for a disk
- * row written before the field existed and not yet saved back.
+ * The id is exact and survives the refresh that rewrites the credential. A file
+ * written before the field existed gets its ids persisted at startup
+ * (persistMintedAccountIds), so the in-memory ids are the on-disk ids.
  */
 function findConfigAccount(diskConfig, account) {
-  if (account?.id) {
-    const byId = diskConfig.accounts.findIndex(a => a?.id === account.id);
-    if (byId >= 0) return byId;
+  if (!account?.id) return -1;
+  return diskConfig.accounts.findIndex(a => a?.id === account.id);
+}
+
+/**
+ * Persist the entry ids loadConfig just minted, if the file did not carry them.
+ *
+ * Every later token write pairs its row by id and re-reads the file to do it. A
+ * config written before the field existed has ids in memory only, and the
+ * re-read would mint a second, different set — nothing would pair until the
+ * next start, and refreshed tokens would never reach disk. One save up front
+ * makes the in-memory ids the on-disk ids. A file that already carries a
+ * complete, unique set is left alone.
+ */
+async function persistMintedAccountIds(config) {
+  let raw;
+  try {
+    raw = JSON.parse(await readFile(getConfigPath(), 'utf-8'));
+  } catch {
+    return; // nothing on disk to reconcile with (or unreadable — the next save will tell)
   }
-  return diskConfig.accounts.findIndex(a => sameIdentity(a, account));
+  const ids = (Array.isArray(raw?.accounts) ? raw.accounts : []).map(a => a?.id);
+  const complete = ids.every(id => typeof id === 'string' && id !== '') && new Set(ids).size === ids.length;
+  if (!complete) await saveConfig(config);
 }
 
 // ── helpers ─────────────────────────────────────────────────

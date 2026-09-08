@@ -299,3 +299,35 @@ test('import stores quota tier metadata returned by the OAuth profile', async ()
     accessToken: 'fresh', refreshToken: 'r', expiresAt,
   });
 });
+
+// Node's setInterval takes a 32-bit millisecond delay; an interval past
+// 2,147,483 s overflows it and the probe fires every millisecond instead.
+test('a probe interval over seven days is refused, not scheduled', async () => {
+  const { tui, config } = makeTUI();
+  config.quotaProbeSeconds = 300;
+  await tui._doSetProbe('2147484');
+  assert.equal(config.quotaProbeSeconds, 300);
+  assert.ok(tui.log.some(l => /at most 604800s/.test(l.msg)), 'the refusal is logged');
+  assert.equal(tui.mode, 'settings');
+  // The ceiling itself is accepted.
+  await tui._doSetProbe('604800');
+  assert.equal(config.quotaProbeSeconds, 604800);
+});
+
+
+// The footer echoes the prompt buffer while it is typed. For a key, that echo
+// is the key in clear on a screen that is often shared.
+test('an API key being typed is masked in the footer', () => {
+  const { tui } = makeTUI();
+  openSettingsRow(tui, 'addAccount');
+  tui._key('k');
+  type(tui, 'sk-secret');
+  const footer = tui._renderFooter().replace(/\x1b\[[0-9;]*m/g, '');
+  assert.doesNotMatch(footer, /sk-secret/);
+  assert.match(footer, /API key: \*{9}█/);
+  tui._key('esc');
+  // The next, ordinary prompt echoes again.
+  tui._promptInput('Switch threshold (%)', () => {});
+  type(tui, '95');
+  assert.match(tui._renderFooter(), /95█/);
+});

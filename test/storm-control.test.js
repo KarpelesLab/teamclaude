@@ -102,6 +102,28 @@ test('pauseAccount extends an existing pause, never shortens it', () => {
   assert.equal(am.accounts[0].pausedUntil, long);
 });
 
+// A Retry-After that did not parse reaches here as NaN (Math.max(NaN, 1) is
+// NaN). A NaN pause would arm a NaN ramp, _rampCap would return NaN, and admit()
+// would spin on `inFlight < NaN` forever.
+test('pauseAccount and markRateLimited ignore a non-finite or non-positive duration', async () => {
+  const am = new AccountManager([oauth('a')], 0.98, { ramp: { startConc: 1, stepConc: 1, stepMs: 10, windowMs: 100, pollMs: 5 } });
+  const acct = am.accounts[0];
+  for (const bad of [NaN, Infinity, -Infinity, 0, -5, undefined, 'soon']) {
+    am.pauseAccount(0, bad);
+    am.markRateLimited(0, bad);
+  }
+  assert.equal(acct.pausedUntil, null);
+  assert.equal(acct.rampStartedAt, null);
+  assert.equal(acct.rateLimitedUntil, null);
+  assert.equal(acct.status, 'active');
+  assert.equal(am._rampCap(acct), Infinity);
+  assert.equal(await am.admit(0), true, 'admit is not stuck');
+  am.release(0);
+
+  am.markRateLimited(0, 30);
+  assert.equal(acct.status, 'throttled', 'a real duration still holds');
+});
+
 test('admit holds a request during a pause, then admits once it lifts', async () => {
   const am = new AccountManager([oauth('a')], 0.98, {
     ramp: { startConc: 10, stepConc: 1, stepMs: 10, windowMs: 60_000, pollMs: 5 },

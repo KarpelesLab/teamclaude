@@ -1,0 +1,20 @@
+# Keep the commit-SHA-pinned actions in .github/workflows/ up to date.
+#
+# The workflows pin every `uses:` to a full commit SHA (with the release tag as
+# a trailing comment) so a repointed tag cannot change what runs in CI or in the
+# publish job. The price of pinning is that nothing moves on its own; dependabot
+# closes that gap by opening a PR whenever an action publishes a new release,
+# bumping the SHA and the version comment together.
+#
+# No npm ecosystem entry on purpose: the package has zero runtime dependencies,
+# eslint is the only devDependency, and package-lock.json is gitignored, so
+# there is nothing for dependabot to track there. The `npm install -g npm@x.y.z`
+# pin in publish.yml is also outside its reach and is bumped by hand.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(ci)"

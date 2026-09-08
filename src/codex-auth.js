@@ -16,6 +16,7 @@ import { randomBytes, createHash } from 'node:crypto';
 import { exec } from 'node:child_process';
 import http from 'node:http';
 import { proxyFetch } from './upstream-fetch.js';
+import { tokenPairFromResponse } from './oauth.js';
 
 export const DEFAULT_CODEX_CREDENTIALS_PATH = '~/.codex/auth.json';
 
@@ -104,12 +105,9 @@ export async function refreshCodexToken(refreshToken, endpoint = TOKEN_ENDPOINT)
     throw err;
   }
 
-  const data = await res.json();
-  return {
-    accessToken: data.access_token,
-    refreshToken: data.refresh_token || refreshToken,
-    expiresAt: Date.now() + (data.expires_in || 3600) * 1000,
-  };
+  // Same checks as the Anthropic path: a 200 without an access token is an
+  // error, not a `Bearer undefined` waiting to happen.
+  return tokenPairFromResponse(await res.json(), { previousRefreshToken: refreshToken });
 }
 
 // ── Browser login ───────────────────────────────────────────────────────────
@@ -167,18 +165,18 @@ export function credentialsFromTokenResponse(data) {
   const claims = decodeJwtClaims(data.id_token) || {};
   const auth = claims['https://api.openai.com/auth'] || {};
   return {
-    accessToken: data.access_token,
-    refreshToken: data.refresh_token,
+    ...tokenPairFromResponse(data),
     accountId: auth.chatgpt_account_id,
     email: claims.email,
     planType: auth.chatgpt_plan_type,
-    expiresAt: Date.now() + (data.expires_in || 3600) * 1000,
   };
 }
 
 function openBrowser(url) {
+  // `start` takes its first quoted argument as the window title, so the URL
+  // needs an empty title in front of it or the browser never opens.
   const cmd = process.platform === 'darwin' ? 'open'
-    : process.platform === 'win32' ? 'start'
+    : process.platform === 'win32' ? 'start ""'
       : 'xdg-open';
   exec(`${cmd} ${JSON.stringify(url)}`, () => {});
 }
@@ -191,6 +189,45 @@ function openBrowser(url) {
  * port, which is why the bind failure is reported as such rather than as a
  * generic error.
  */
+/**
+ * The request handler for the login callback, settling `resolve`/`reject` with
+ * the authorization code or the failure.
+ *
+ * The state is checked FIRST, and a request without the expected state gets a
+ * 400 and settles nothing: port 1455 is open while the user is in the browser,
+ * and a stray GET — a drive-by page probing localhost, a scanner, a stale tab —
+ * used to abort the whole login by arriving with `?error=` or with no state.
+ * Exported for tests, which run it on an ephemeral port instead of 1455.
+ */
+export function codexCallbackHandler(expectedState, { resolve, reject }) {
+  return (req, res) => {
+    const url = new URL(req.url, 'http://localhost');
+    if (url.pathname !== '/auth/callback') { res.writeHead(404); res.end('Not found'); return; }
+
+    const returnedState = url.searchParams.get('state');
+    if (!returnedState || returnedState !== expectedState) {
+      res.writeHead(400, { 'Content-Type': 'text/html' });
+      res.end('<html><body><h2>Invalid request</h2><p>State mismatch. You can close this tab.</p></body></html>');
+      return;
+    }
+
+    const err = url.searchParams.get('error');
+    const returnedCode = url.searchParams.get('code');
+    const fail = (message) => {
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end('<html><body><h2>Authentication failed</h2><p>You can close this tab.</p></body></html>');
+      reject(new Error(message));
+    };
+
+    if (err) return fail(`OAuth error: ${err} ${url.searchParams.get('error_description') || ''}`.trim());
+    if (!returnedCode) return fail('OAuth callback carried no code');
+
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end('<html><body><h2>Signed in</h2><p>You can close this tab and return to the terminal.</p></body></html>');
+    resolve(returnedCode);
+  };
+}
+
 export async function loginCodex({ noBrowser = false, timeoutMs = 120_000 } = {}) {
   const codeVerifier = randomBytes(32).toString('base64url');
   const codeChallenge = createHash('sha256').update(codeVerifier).digest('base64url');
@@ -199,27 +236,7 @@ export async function loginCodex({ noBrowser = false, timeoutMs = 120_000 } = {}
 
   let server;
   const code = await new Promise((resolve, reject) => {
-    server = http.createServer((req, res) => {
-      const url = new URL(req.url, 'http://localhost');
-      if (url.pathname !== '/auth/callback') { res.writeHead(404); res.end('Not found'); return; }
-
-      const err = url.searchParams.get('error');
-      const returnedState = url.searchParams.get('state');
-      const returnedCode = url.searchParams.get('code');
-      const fail = (message) => {
-        res.writeHead(200, { 'Content-Type': 'text/html' });
-        res.end('<html><body><h2>Authentication failed</h2><p>You can close this tab.</p></body></html>');
-        reject(new Error(message));
-      };
-
-      if (err) return fail(`OAuth error: ${err} ${url.searchParams.get('error_description') || ''}`.trim());
-      if (returnedState !== state) return fail('OAuth state mismatch');
-      if (!returnedCode) return fail('OAuth callback carried no code');
-
-      res.writeHead(200, { 'Content-Type': 'text/html' });
-      res.end('<html><body><h2>Signed in</h2><p>You can close this tab and return to the terminal.</p></body></html>');
-      resolve(returnedCode);
-    });
+    server = http.createServer(codexCallbackHandler(state, { resolve, reject }));
 
     server.on('error', (e) => reject(e.code === 'EADDRINUSE'
       ? new Error(`Port ${CALLBACK_PORT} is in use. OpenAI only accepts ${REDIRECT_URI} for this client, so close whatever holds it (a running \`codex login\`) and retry.`)

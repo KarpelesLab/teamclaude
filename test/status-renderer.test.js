@@ -356,10 +356,11 @@ test('the blocked line names the cap as the reason', () => {
 
 // ── The Active/Serving row under session distribution ───────────────────────
 //
-// `currentAccount` is the rotation cursor. Under distribution the session
-// pickers never move it, so it names where a SESSION-LESS request would go —
+// `currentAccount` is the rotation cursor. Under ADAPTIVE distribution the
+// picker never moves it, so it names where a SESSION-LESS request would go —
 // not what is serving. Reporting it as "Active" pointed at one account while
-// several were running.
+// several were running. Even distribution still walks from the cursor, so it
+// keeps the plain Active row.
 
 function distributedStatus(mode) {
   return {
@@ -405,9 +406,12 @@ test('distributing but idle: says so rather than implying the cursor is serving'
   assert.match(out, /^Serving {6}idle cursor a$/m);
 });
 
-test('even mode gets the same honest row as adaptive', () => {
+test('even mode keeps the Active row and the cursor marker', () => {
   const out = renderStatus(distributedStatus('even'), { color: false, now });
-  assert.match(out, /^Serving {6}b 9 · a 3 {2}cursor a$/m);
+  assert.match(out, /^Active {7}a$/m);
+  assert.doesNotMatch(out, /^Serving/m);
+  assert.match(out, /^> a \(oauth/m, 'the cursor is marked');
+  assert.match(out, /^ {2}b \(oauth/m, 'b carries sessions but is not the cursor');
 });
 
 test('adaptive diagnostics name the next target, score weight, and family split', () => {
@@ -422,4 +426,75 @@ test('adaptive diagnostics name the next target, score weight, and family split'
   assert.match(out, /^> a .*3 sess \(opus\+ 2, fable 1\)$/m);
   assert.match(out, /Adaptive\s+next · weight 60% of opus\+/);
   assert.match(out, /plan 20x/);
+});
+
+// The adaptive rows come off the wire like everything else. An older server
+// omits fields and a hostile one sends strings where numbers belong; neither
+// may throw inside `teamclaude status` or reach the terminal unstripped.
+test('a hostile adaptive row renders as ? fields, not a throw or an escape', () => {
+  const CLIP = '\x1b]52;c;aGVsbG8=\x07';
+  const s = distributedStatus('adaptive');
+  s.accounts[0].name = `a${CLIP}`;
+  // A string count and a NaN are dropped; the escaped key is stripped.
+  s.accounts[0].sessionsByBucket = { [`unified7d\x1b[2J`]: 2, unified7dFable: 1, other: '9', bad: NaN };
+  s.adaptive = [
+    null,
+    'garbage',
+    {
+      name: `a${CLIP}`, bucket: `opus\x1b[2Jforged`, window: `w\r\n`, competing: true,
+      next: 'yes', weight: 'lots', sessions: '3', inFlight: null,
+      headroom: Infinity, threshold: undefined, planWeight: 'x', concCap: '6',
+    },
+  ];
+  let out;
+  assert.doesNotThrow(() => { out = renderStatus(s, { color: false, now }); });
+  assert.doesNotMatch(out, /[\x1b\x07\x9b\r]/);
+  assert.match(out, /Adaptive\s+next · weight \? of opus forged/);
+  assert.match(out, /\? sess \/ \? inflight/);
+  assert.match(out, /head \? of \?/);
+  assert.match(out, /plan \?x/);
+  assert.match(out, /conc \?/);
+  assert.match(out, /^> a .*3 sess \(unified7d 2, fable 1\)$/m);
+});
+
+test('accounts are listed in priority order, not config order', () => {
+  const acct = (name, priority) => ({ name, type: 'oauth', status: 'active', priority, quota: {}, usage: {} });
+  const out = renderStatus({
+    currentAccount: 'first',
+    switchThreshold: 0.98,
+    // Config order puts the last-resort account second, which is how it reached
+    // the payload and how it used to render.
+    accounts: [acct('first', -1), acct('last-resort', 300), acct('fallback', 100)],
+  }, { color: false, now });
+
+  const order = out.split('\n').filter(l => /\(oauth, prio/.test(l))
+    .map(l => l.trim().replace(/^>\s*/, '').split(' ')[0]);
+  assert.deepEqual(order, ['first', 'fallback', 'last-resort']);
+});
+
+// Every account and route string in the payload can have come off the wire
+// (`teamclaude status` against a running server) or out of an OAuth reply, and
+// the output is printed straight to the operator's terminal.
+test('renderStatus strips control characters out of account and route strings', () => {
+  const CLIP = '\x1b]52;c;aGVsbG8=\x07';
+  const status = sampleStatus();
+  status.currentAccount = `a${CLIP}`;
+  status.accounts[0].name = `a${CLIP}`;
+  status.accounts[0].orgName = `Org\x1b[2J\r\nforged`;
+  status.accounts[0].type = `oauth\x9b2J`;
+  status.accounts[0].status = `weird${CLIP}`;
+  status.accounts[0].unavailable = `custom\x1b[2Jreason`;
+  status.accounts[0].quota.spend = { enabled: false, usedMinor: 500, currency: 'USD', disabledReason: `out\x1b[2J` };
+  status.probe.accounts[0].status = `boom${CLIP}`;
+  status.routes = [{
+    name: 'r', match: [`*fable*${CLIP}`], bucket: `b\x1b[2J`, pinned: `a${CLIP}`,
+    accounts: [{ name: `a${CLIP}`, eligible: true }, { name: `b\x1b[2J`, eligible: false }],
+  }];
+
+  const output = renderStatus(status, { color: false, now });
+  assert.doesNotMatch(output, /[\x1b\x07\x9b\r]/);
+  assert.match(output, /^> a /m);           // still marked current after stripping
+  assert.match(output, /Blocked\s+custom/);
+  assert.match(output, /pinned: a/);
+  assert.equal(output.split('\n').filter(l => /forged/.test(l)).length, 1);   // no forged line
 });

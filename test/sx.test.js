@@ -5,7 +5,7 @@ import tls from 'node:tls';
 import http from 'node:http';
 import { once } from 'node:events';
 import { generateCertChain } from '../src/x509.js';
-import { connectThroughProxy, tunnelTls, SxManager } from '../src/sx.js';
+import { connectThroughProxy, tunnelTls, handshakeOverTunnel, sxBase, SxManager } from '../src/sx.js';
 import { upstreamFetch } from '../src/upstream-fetch.js';
 
 const T = { timeout: 30000 };
@@ -270,4 +270,46 @@ test('SxManager.configure reports an error when provisioning fails', T, async ()
     assert.match(r.error, /create-port failed/);
     assert.equal(sx.isProvisioned(), false, 'not enabled when provisioning fails');
   } finally { delete process.env.SX_API_BASE; closeHard(api); }
+});
+
+// ── Handshake bound ──────────────────────────────────────────
+//
+// The CONNECT had a timer; the TLS handshake after it did not. A proxy that
+// answers 200 and then goes silent (or a target that never sends a ServerHello)
+// held the caller for ever, with every request queued behind it.
+test('the TLS handshake over a tunnel is bounded', T, async () => {
+  const silent = net.createServer(() => { /* accept, never speak */ });
+  const port = await listen(silent);
+  try {
+    const sock = net.connect(port, '127.0.0.1');
+    await once(sock, 'connect');
+    await assert.rejects(
+      handshakeOverTunnel(sock, { servername: 'localhost', timeout: 200 }),
+      /TLS handshake with localhost through the tunnel timed out after 200ms/,
+    );
+    assert.equal(sock.destroyed, true);
+  } finally { closeHard(silent); }
+});
+
+// ── SX_API_BASE ──────────────────────────────────────────────
+//
+// The sx.org key rides in the query string, so the base URL decides whether it
+// crosses the network in the clear. An override is honoured only over https, or
+// over plain http to this machine (a test mock).
+test('SX_API_BASE must be https, or http to loopback', () => {
+  const warnings = [];
+  const warn = (m) => warnings.push(m);
+  assert.equal(sxBase({}, warn), 'https://api.sx.org');
+  assert.equal(sxBase({ SX_API_BASE: 'https://mock.example/' }, warn), 'https://mock.example');
+  assert.equal(sxBase({ SX_API_BASE: 'http://127.0.0.1:4321' }, warn), 'http://127.0.0.1:4321');
+  assert.equal(sxBase({ SX_API_BASE: 'http://localhost:4321' }, warn), 'http://localhost:4321');
+  assert.equal(warnings.length, 0);
+  for (const bad of ['http://api.sx.org', 'http://10.0.0.5:80', 'ftp://x', 'not a url']) {
+    assert.equal(sxBase({ SX_API_BASE: bad }, warn), 'https://api.sx.org', bad);
+  }
+  assert.equal(warnings.length, 4);
+  assert.match(warnings[0], /ignoring SX_API_BASE.*https/);
+  // Reported once per value, not once per request.
+  sxBase({ SX_API_BASE: 'not a url' }, warn);
+  assert.equal(warnings.length, 4);
 });

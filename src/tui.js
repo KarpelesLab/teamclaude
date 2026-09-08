@@ -13,7 +13,7 @@ import { mintAccountId } from './account-id.js';
 import { formatPercent } from './status-renderer.js';
 import { resolveMaxUsage } from './model.js';
 import { parseProxyUrl, proxyToUrl, describeProxy, describeSelfProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy } from './upstream-proxy.js';
-import { sanitizeText } from './safe-text.js';
+import { sanitizeText, safeLine } from './safe-text.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -33,6 +33,11 @@ const IDLE_TICK_MS = 5_000;
 // is shared state, and anything that writes over it (a stray warning, a resumed
 // job) would otherwise leave the screen corrupted until the next real change.
 const FORCE_REPAINT_MS = 60_000;
+// Longest quota-probe interval the settings screen accepts. Node's timers take
+// a 32-bit millisecond delay: past 2,147,483 s setInterval overflows and fires
+// every millisecond, which is a probe storm rather than a slow probe. A week
+// is far under that and already longer than any quota window.
+const PROBE_MAX_SECONDS = 7 * 24 * 3600;
 const ESC = '\x1b[';
 const RESET = `${ESC}0m`;
 const BOLD = `${ESC}1m`;
@@ -79,8 +84,13 @@ function sessionColorCode(sid) {
 // no session (e.g. a telemetry request). One width for every row, named or not,
 // keeps the columns after it aligned. Measured in display columns, not UTF-16
 // units, so a CJK title takes the same room as an ASCII one.
+// The id is a client header. Node's parser lets C1 bytes (U+009B is a CSI on
+// its own) through, so only an id of the shape Claude Code actually sends is
+// shown as-is; anything else is stripped down before it reaches the frame.
+const SAFE_SID = /^[A-Za-z0-9._-]+$/;
+const shortSid = sid => (SAFE_SID.test(sid) ? sid : safeLine(sid, 64) || '?').slice(0, SESSION_ID_LEN);
 const sessionTag = (sid, title = null, width = SESSION_ID_LEN) =>
-  sid ? fg(sessionColorCode(sid), rpad(truncate(title || sid.slice(0, SESSION_ID_LEN), width), width)) : ' '.repeat(width);
+  sid ? fg(sessionColorCode(sid), rpad(truncate(title || shortSid(sid), width), width)) : ' '.repeat(width);
 
 // Which quota-family bar (F7/S7) a route binds to, or null for a general route.
 // Auto routes are named 'fable'/'sonnet'; a configured route is classified by its
@@ -100,6 +110,17 @@ const routeGlyph = (paint, eligible, pinned) =>
 
 const ANSI_RE = /\x1b\[[0-9;]*m/g;
 const strip = s => s.replace(ANSI_RE, '');
+
+// What a composed line may still carry when it reaches the frame: the SGR
+// colour this file adds, and nothing else that a terminal would act on. Every
+// other escape form (an OSC 52 clipboard write, a CSI erase, a bare C0/C1
+// control) came from a value that was not ours, and unlike sanitizeText this
+// keeps the colour, so it can run on a line after it has been painted.
+// Alternatives, in order: SGR (kept), OSC through its BEL/ST terminator, any
+// other CSI, any remaining control or format character.
+const NON_SGR_CONTROL = /(\x1b\[[0-9;]*m)|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b\[[0-?]*[ -/]*[@-~]|\p{C}/gu;
+export const scrubLine = s => String(s).replace(NON_SGR_CONTROL, (m, sgr) => sgr || '');
+const SGR_AT = /\x1b\[[0-9;]*m/y;   // sticky: "an SGR starting exactly here"
 
 // Terminal display width of one code point: 0 for combining and zero-width
 // marks, 2 for East Asian wide/fullwidth characters and emoji, 1 otherwise.
@@ -157,10 +178,16 @@ export function truncate(s, w) {
   let i = 0;
   while (i < s.length) {
     if (s[i] === '\x1b') {
-      const end = s.indexOf('m', i);
-      if (end >= 0) { out += s.slice(i, end + 1); i = end + 1; continue; }
+      // Only a well-formed SGR is copied through. Copying "ESC up to the next
+      // m" carried an erase or a clipboard write into the frame whole.
+      SGR_AT.lastIndex = i;
+      const m = SGR_AT.exec(s);
+      if (m) { out += m[0]; i += m[0].length; continue; }
+      i++; continue;
     }
     const cp = s.codePointAt(i);
+    // A stray control (BEL, a C1 byte) is dropped, not drawn.
+    if (cp < 0x20 || (cp >= 0x7f && cp <= 0x9f)) { i++; continue; }
     const cw = charWidth(cp);
     // A wide glyph that would cross the limit is dropped whole rather than split;
     // the one leftover column is filled by the caller's padding.
@@ -182,6 +209,16 @@ const BAR_MAX = 20;
 // when the row has width to spare, but never drops below it, so a narrow
 // terminal lays the table out exactly as it did before the column could grow.
 const NAME_MIN = 12;
+
+// Which pair of bars a row draws: the subscription buckets (Ses/Wk, plus the
+// S7/F7 family bars) when any unified reading exists, else the metered Tok/Req
+// pair an API-key account reports. The account row budget is drawn per
+// category (#234): the two kinds of row share no bar, so sizing an API-key row
+// for family bars it never draws only left it short of the edge.
+function rowCategory(q) {
+  return (q.unified5h != null || q.unified7d != null || q.unified7dSonnet != null || q.unified7dFable != null)
+    ? 'unified' : 'metered';
+}
 
 // Families this account can't serve right now: a family whose own weekly bucket
 // is over the switch threshold is barred from that model while the account is
@@ -336,6 +373,28 @@ export function bar(ratio, w = 10, resetTs, windowMs, threshold) {
   return out;
 }
 
+// The request fields the hooks hand us come from the client — the path and
+// method off the request line, the model peeked from the body, the session id
+// from a header — so they are cut down once here, before they are stored to be
+// drawn every frame and logged.
+const REQ_FIELD_MAX = { method: 16, path: 256, model: 64, account: 64, sessionId: 64 };
+function cleanRequestInfo(info) {
+  const out = { ...info };
+  for (const [k, max] of Object.entries(REQ_FIELD_MAX)) {
+    if (out[k] != null) out[k] = safeLine(out[k], max);
+  }
+  return out;
+}
+
+// A stored key, shown enough to recognise and no more. First-4/last-4 on a key
+// of eight characters or fewer is the whole key; a short one shows its tail only.
+export function maskKey(key) {
+  const k = String(key);
+  if (k.length <= 4) return '****';
+  if (k.length < 12) return `…${k.slice(-4)}`;
+  return `${k.slice(0, 4)}…${k.slice(-4)}`;
+}
+
 function timestamp() {
   return new Date().toLocaleTimeString('en-US', { hour12: false });
 }
@@ -384,6 +443,7 @@ export class TUI {
     this.inputPrompt = '';
     this.inputBuf = '';
     this.inputCb = null;
+    this.inputSecret = false;    // a key is being typed: the footer echoes * for each char
     this.inputReturn = 'normal'; // mode to fall back to when an input is cancelled
     this.frame = 0;
     this.running = false;
@@ -495,6 +555,7 @@ export class TUI {
   // ── server hooks ───────────────────────────────────
 
   onRequestStart(id, info) {
+    info = cleanRequestInfo(info);
     // Start the lookup now, so the title is cached by the time the request ends
     // and its log line is composed.
     this._sessionTag(info.sessionId);
@@ -505,15 +566,17 @@ export class TUI {
 
   onRequestModel(id, info) {
     const r = this.active.get(id);
-    if (r && info.model) { r.model = info.model; this.render(); }
+    const model = info.model ? safeLine(info.model, 64) : '';
+    if (r && model) { r.model = model; this.render(); }
   }
 
   onRequestRouted(id, info) {
     const r = this.active.get(id);
-    if (r) r.account = info.account;
+    if (r) r.account = info.account == null ? info.account : safeLine(info.account, 64);
   }
 
   onRequestEnd(id, info) {
+    info = cleanRequestInfo(info);
     const r = this.active.get(id);
     this.active.delete(id);
     const dur = r ? ((Date.now() - r.started) / 1000).toFixed(1) : '?';
@@ -526,7 +589,10 @@ export class TUI {
   }
 
   _addLog(msg) {
-    msg = msg.replace(/^\[TeamClaude\]\s*/, '');
+    // The screen copy keeps the colour callers painted on, and only that: a
+    // request's model string is repainted from this list every frame for as
+    // long as the entry lives, so an escape stored here would fire 200 times.
+    msg = scrubLine(msg).replace(/^\[TeamClaude\]\s*/, '');
     const t = timestamp();
     this.log.unshift({ t, msg });
     if (this.log.length > 200) this.log.length = 200;
@@ -734,10 +800,9 @@ export class TUI {
         label: 'sx.org API key',
         hint: 'Enter to set',
         value: () => {
-          const key = this.config.sx?.apiKey;
-          return key ? key.slice(0, 4) + '…' + key.slice(-4) : dim('(not set)');
+          return this.config.sx?.apiKey ? maskKey(this.config.sx.apiKey) : dim('(not set)');
         },
-        enter: () => this._promptInput('sx.org API key', v => this._doSetSxKey(v.trim())),
+        enter: () => this._promptInput('sx.org API key', v => this._doSetSxKey(v.trim()), { secret: true }),
       });
 
       if (this.config.sx?.apiKey) {
@@ -769,11 +834,14 @@ export class TUI {
   }
 
   // Open the text-input prompt and return to the settings screen afterward.
-  _promptInput(prompt, cb) {
+  // `secret` masks the echo — the footer is on screen for as long as a key is
+  // being typed, and a terminal is the one thing a screen-share always shows.
+  _promptInput(prompt, cb, { secret = false } = {}) {
     this.mode = 'input';
     this.inputReturn = 'settings';
     this.inputPrompt = prompt;
     this.inputBuf = '';
+    this.inputSecret = secret;
     this.inputCb = v => { if (v) cb(v); };
   }
 
@@ -824,6 +892,9 @@ export class TUI {
     let secs = parseInt(input, 10);
     if (Number.isNaN(secs) || secs < 0) {
       this._addLog('Invalid interval — enter 0 (off) or seconds'); this.mode = 'settings'; if (this.running) this.render(); return;
+    }
+    if (secs > PROBE_MAX_SECONDS) {
+      this._addLog(`Invalid interval — at most ${PROBE_MAX_SECONDS}s (7 days)`); this.mode = 'settings'; if (this.running) this.render(); return;
     }
     if (secs > 0 && secs < 30) secs = 30; // match the CLI minimum (don't hammer the usage endpoint)
     this.config.quotaProbeSeconds = secs;
@@ -916,7 +987,7 @@ export class TUI {
       // prefer that over what was highlighted here. `eligible: false` means the
       // switch applied to an account that cannot currently serve requests, which
       // the row already shows but is worth stating at the moment it is chosen.
-      const name = res?.account || acct.name;
+      const name = res?.account ? safeLine(res.account, 64) || acct.name : acct.name;
       if (res?.eligible === false) {
         // The server knows WHY — disabled, out of quota, outranked by a
         // higher-priority account — so quote it rather than restating the
@@ -944,6 +1015,7 @@ export class TUI {
       this.inputReturn = 'settings';
       this.inputPrompt = 'API key';
       this.inputBuf = '';
+      this.inputSecret = true;
       this.inputCb = v => { if (v) this._doAddKey(v); };
     }
     else if (k === 'esc' || k === 'q') { this.mode = 'settings'; }
@@ -953,10 +1025,10 @@ export class TUI {
     if (k === 'enter') {
       const cb = this.inputCb;
       const v = this.inputBuf;
-      this.mode = this.inputReturn; this.inputCb = null; this.inputBuf = '';
+      this.mode = this.inputReturn; this.inputCb = null; this.inputBuf = ''; this.inputSecret = false;
       cb?.(v);
     }
-    else if (k === 'esc') { this.mode = this.inputReturn; this.inputCb = null; this.inputBuf = ''; }
+    else if (k === 'esc') { this.mode = this.inputReturn; this.inputCb = null; this.inputBuf = ''; this.inputSecret = false; }
     else if (k === 'bs') { this.inputBuf = this.inputBuf.slice(0, -1); }
     else if (k.length === 1) { this.inputBuf += k; }
   }
@@ -1342,61 +1414,86 @@ export class TUI {
       // column each at the row start so the marker's position identifies the route.
       const routes = this.am.getRoutes();
       const genRoutes = routes.filter(r => routeFamily(r) === null);
-      const anyFable = this.am.accounts.some(a => a.quota.unified7dFable != null);
-      const anySonnet = this.am.accounts.some(a => a.quota.unified7dSonnet != null);
-
-      // Bar width. The budget must count every column the widest row actually
-      // draws, or the row overruns the terminal and fitLine cuts the tail off —
-      // which is how the S7/F7 bars lost the reset countdown they carry. Three
-      // parts beyond the bars themselves:
+      // Bar width, budgeted PER ROW CATEGORY (#234). A subscription row draws
+      // Ses/Wk and the S7/F7 family bars; an API-key row draws Tok/Req and
+      // nothing else. Neither shares a bar with the other, so the two are laid
+      // out against separate budgets: every subscription row lines up with the
+      // other subscription rows, every API-key row with the other API-key rows,
+      // and an API-key row no longer pays for family columns it never draws (or
+      // for a blocked-family tag only a subscription row can carry). Within a
+      // category the budget is still shared, on purpose: bars line up and equal
+      // lengths mean equal percentages, and the whitespace that costs a row
+      // without a tag is the price of that.
+      //
+      // The budget must count every column the widest row in the category
+      // actually draws, or the row overruns the terminal and fitLine cuts the
+      // tail off — which is how the S7/F7 bars lost the reset countdown they
+      // carry. Three parts beyond the bars themselves:
       //   - the fixed prefix (marker, name, type, status, first bar label),
       //   - the route-marker cells, one per general route,
       //   - 6 columns of label for each bar past the first (`  Wk `, ` ►F7  `).
       // The `⊘ Sonnet Fable` tag is reserved for only when some account is
       // actually blocked; the common case where nothing is spends those columns
       // on the bars instead of leaving the row short of the edge.
-      const tagW = this.am.accounts.reduce((w, a) => {
-        const names = blockedFamilies(a.quota, key => this.am.thresholdFor(key));
-        return names.length ? Math.max(w, 4 + vw(names.join(' '))) : w;
-      }, 0);
-      // Same rule for the `$`/`$!` money tag: a column the row can draw is a
-      // column the budget has to know about, or the row overflows exactly the
-      // way #228 fixed.
-      const spendW = this.am.accounts.reduce((w, a) => {
-        const tag = spendTag(a.quota);
-        return tag ? Math.max(w, 2 + vw(tag)) : w;
-      }, 0);
-      const fixed = 28 + NAME_MIN + (genRoutes.length ? genRoutes.length + 1 : 0) + tagW + spendW;
-      const roomFor = n => fixed + 6 * (n - 1) + n * BAR_MIN <= W;
-      // The family bars are the first thing to go: below the width where they
-      // fit even at BAR_MIN they would push the row past the edge, and a row cut
-      // mid-bar reads worse than one that simply doesn't draw them (the `⊘` tag
-      // still says which family is barred).
-      // The second shared bar answers to roomFor too, not just to a width
-      // threshold. `W >= 70` alone let the reservations (a 16-column blocked-family
-      // tag on two families, plus route cells) leave less than BAR_MIN per bar,
-      // and the floor below then overrode the budget: two accounts blocked on both
-      // families drew 72 columns at W=70, which fitLine silently cut (#234).
-      const showBoth = W >= 70 && roomFor(2);
-      const showFamily = showBoth && (anyFable || anySonnet) && roomFor(2 + (anyFable ? 1 : 0) + (anySonnet ? 1 : 0));
-      const nbars = (showBoth ? 2 : 1) + (showFamily ? (anyFable ? 1 : 0) + (anySonnet ? 1 : 0) : 0);
-      // Backstop for the case no count of bars can fix: when even one bar at
-      // BAR_MIN overruns the row, the floor has to yield. A narrow bar reads
-      // worse than a wide one; a row cut mid-bar loses the reset countdown its
-      // tail carries, and does it without saying so.
-      const avail = Math.floor((W - fixed - 6 * (nbars - 1)) / nbars);
-      const bw = avail < BAR_MIN
-        ? Math.max(1, avail)
-        : Math.min(BAR_MAX, avail);
+      const categoryOf = a => rowCategory(a.quota);
+      const routeCells = genRoutes.length ? genRoutes.length + 1 : 0;
+      const budgetFor = (members) => {
+        const anyFable = members.some(a => a.quota.unified7dFable != null);
+        const anySonnet = members.some(a => a.quota.unified7dSonnet != null);
+        const tagW = members.reduce((w, a) => {
+          const names = blockedFamilies(a.quota, key => this.am.thresholdFor(key));
+          return names.length ? Math.max(w, 4 + vw(names.join(' '))) : w;
+        }, 0);
+        // Same rule for the `$`/`$!` money tag: a column the row can draw is a
+        // column the budget has to know about, or the row overflows exactly the
+        // way #228 fixed.
+        const spendW = members.reduce((w, a) => {
+          const tag = spendTag(a.quota);
+          return tag ? Math.max(w, 2 + vw(tag)) : w;
+        }, 0);
+        const fixed = 28 + NAME_MIN + routeCells + tagW + spendW;
+        const roomFor = n => fixed + 6 * (n - 1) + n * BAR_MIN <= W;
+        // The family bars are the first thing to go: below the width where they
+        // fit even at BAR_MIN they would push the row past the edge, and a row
+        // cut mid-bar reads worse than one that simply doesn't draw them (the
+        // `⊘` tag still says which family is barred).
+        // The second shared bar answers to roomFor too, not just to a width
+        // threshold. `W >= 70` alone let the reservations (a 16-column
+        // blocked-family tag on two families, plus route cells) leave less than
+        // BAR_MIN per bar, and the floor below then overrode the budget: two
+        // accounts blocked on both families drew 72 columns at W=70, which
+        // fitLine silently cut (#234).
+        const showBoth = W >= 70 && roomFor(2);
+        const showFamily = showBoth && (anyFable || anySonnet) && roomFor(2 + (anyFable ? 1 : 0) + (anySonnet ? 1 : 0));
+        const nbars = (showBoth ? 2 : 1) + (showFamily ? (anyFable ? 1 : 0) + (anySonnet ? 1 : 0) : 0);
+        // Backstop for the case no count of bars can fix: when even one bar at
+        // BAR_MIN overruns the row, the floor has to yield. A narrow bar reads
+        // worse than a wide one; a row cut mid-bar loses the reset countdown its
+        // tail carries, and does it without saying so.
+        const avail = Math.floor((W - fixed - 6 * (nbars - 1)) / nbars);
+        const bw = avail < BAR_MIN
+          ? Math.max(1, avail)
+          : Math.min(BAR_MAX, avail);
+        const slack = Math.max(0, W - fixed - 6 * (nbars - 1) - nbars * bw);
+        return { bw, showBoth, showFamily, anyFable, anySonnet, slack };
+      };
+      const budgets = new Map();
+      for (const a of this.am.accounts) {
+        const cat = categoryOf(a);
+        if (!budgets.has(cat)) budgets.set(cat, budgetFor(this.am.accounts.filter(m => categoryOf(m) === cat)));
+      }
+      const anyFable = [...budgets.values()].some(b => b.anyFable);
+      const anySonnet = [...budgets.values()].some(b => b.anySonnet);
 
       // Whatever the chrome and the capped bars leave over goes to the name
       // column, up to the longest name in the fleet, so a wide terminal shows
-      // whole addresses instead of `a-considerab`. `fixed` already reserves
-      // NAME_MIN, so only the surplus past it is spent here: the row stays
-      // inside the budget above, and a terminal with no surplus keeps the
-      // twelve-column cell it had.
+      // whole addresses instead of `a-considerab`. The name column is one width
+      // for the whole table (it is the prefix every row shares), so it grows by
+      // the smallest slack any category has left: `fixed` already reserves
+      // NAME_MIN, so only the surplus past it is spent here, and no category's
+      // rows are pushed past the budget above.
       const longestName = Math.max(0, ...this.am.accounts.map(a => vw(a.name)));
-      const slack = Math.max(0, W - fixed - 6 * (nbars - 1) - nbars * bw);
+      const slack = Math.min(...[...budgets.values()].map(b => b.slack));
       const nameW = Math.max(NAME_MIN, Math.min(longestName, NAME_MIN + slack));
 
       // The single account each secondary bucket currently routes to (null = none
@@ -1407,7 +1504,8 @@ export class TUI {
         sonnet: anySonnet ? this.am.previewRouteIndex('claude-sonnet-4-6') : null,
       };
       for (let i = 0; i < this.am.accounts.length; i++) {
-        lines.push(this._renderAcct(i, bw, showBoth, routes, genRoutes, familyTarget, showFamily, nameW));
+        const b = budgets.get(categoryOf(this.am.accounts[i]));
+        lines.push(this._renderAcct(i, b.bw, b.showBoth, routes, genRoutes, familyTarget, b.showFamily, nameW));
       }
     }
 
@@ -1522,7 +1620,7 @@ export class TUI {
     const q = a.quota;
     let r1 = null, r2 = null, l1 = 'Ses', l2 = 'Wk ', t1 = null, t2 = null, w1 = null, w2 = null;
 
-    if (q.unified5h != null || q.unified7d != null || q.unified7dSonnet != null || q.unified7dFable != null) {
+    if (rowCategory(q) === 'unified') {
       r1 = q.unified5h;
       r2 = q.unified7d;
       t1 = q.unified5hReset;
@@ -1667,6 +1765,11 @@ export class TUI {
     lines.push(dim('  off       never use sx.org (API key is kept)'));
     lines.push('');
     lines.push(dim('  TLS stays end-to-end; residential traffic is metered by sx.org.'));
+    if (!key) {
+      lines.push('');
+      lines.push(dim('  No sx.org account yet? Signing up via https://sx.org/c/ufVrLW'));
+      lines.push(dim('  costs nothing extra and supports TeamClaude development.'));
+    }
   }
 
   // ── routes editor ──────────────────────────────────
@@ -1983,7 +2086,7 @@ export class TUI {
       case 'add':
         return ` ${bold('i')}mport Claude Code  ${bold('k')} API key  ${bold('Esc')} cancel`;
       case 'input':
-        return ` ${this.inputPrompt}: ${this.inputBuf}█`;
+        return ` ${this.inputPrompt}: ${this.inputSecret ? '*'.repeat(this.inputBuf.length) : this.inputBuf}█`;
       default:
         return '';
     }

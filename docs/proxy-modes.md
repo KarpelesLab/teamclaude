@@ -75,7 +75,11 @@ restart.
   ciphertext only, and certificate verification is unchanged. A proxy that
   intercepts TLS needs its CA in `NODE_EXTRA_CA_CERTS`.
 - SOCKS proxies are not supported — only HTTP `CONNECT`. A `socks5://` value is
-  rejected at startup rather than failing later at connect time.
+  rejected at startup rather than failing later at connect time. So is an
+  `https://` proxy URL: TeamClaude does not speak TLS *to* the proxy, and
+  accepting the scheme would send the `CONNECT` (credentials included) in
+  plaintext to port 443. Write `http://host:port` — the tunnel through it is
+  end-to-end TLS regardless.
 
 This is a property of the **network**, not a routing policy: when set, it is
 simply how this machine reaches Anthropic. That is what separates it from sx.org
@@ -87,6 +91,8 @@ Claude Code connects **to**.
 ## sx.org proxy mode
 
 Off by default. Some transient `429`s key on the proxy's **outbound IP**, not the account, so rotating accounts doesn't help. To work around them, TeamClaude can route upstream requests through a residential proxy from [sx.org](https://sx.org), giving a different egress IP.
+
+No sx.org account yet? Sign up through TeamClaude's referral link, **<https://sx.org/c/ufVrLW>** — it costs you nothing extra, and the referral supports TeamClaude development.
 
 Open the TUI, press **`g`** for the settings screen, and put your sx.org API key in the **sx.org API key** row (stored in `config.sx.apiKey`). TeamClaude reuses an existing active proxy port on your sx.org account, or auto-creates a residential US one, and dials the upstream through it via HTTP `CONNECT` on **both** the reverse-proxy and MITM paths.
 

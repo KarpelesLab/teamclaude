@@ -216,6 +216,8 @@ Any Anthropic-compatible API can be added as an account alongside your Claude ac
 - **`upstream`** — base URL of the target API. Requests are sent to `upstream + /v1/messages` (etc.) for this account only.
 - **`modelMap`** — when a Claude model name arrives in the request body, it is rewritten to the mapped name before forwarding.
 
+Where the provider publishes one, its own balance or quota is shown in `teamclaude status` — see [third-party backend quota](quota.md#third-party-backend-quota).
+
 Reserve the backend for sessions that explicitly ask for its models with a [route](routing.md#model-routes):
 
 ```json

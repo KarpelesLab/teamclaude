@@ -118,16 +118,35 @@ ${env.join('\n')}
 `;
 }
 
+/**
+ * One word of a systemd unit value, double-quoted the way systemd.syntax(7)
+ * reads it: `\` and `"` escaped inside the quotes. Unquoted, a path with a
+ * space split into two words (ExecStart would run the wrong program), and a
+ * newline anywhere started a new line of the unit — so a TEAMCLAUDE_CONFIG
+ * carrying "\n" injected directives of its own into [Service]. Control
+ * characters are refused outright: systemd has no escape that makes them safe
+ * in a path, and no real path holds one.
+ */
+export function systemdQuote(value) {
+  const s = String(value);
+  if (/[\x00-\x1f\x7f]/.test(s)) {
+    throw new Error(`Cannot write a systemd unit with a control character in ${JSON.stringify(s)}`);
+  }
+  return `"${s.replace(/[\\"]/g, (c) => `\\${c}`)}"`;
+}
+
 export function renderSystemdUnit({ node, entry, path, configPath = null }) {
-  const environment = [`Environment=PATH=${path}`];
-  if (configPath) environment.push(`Environment=TEAMCLAUDE_CONFIG=${configPath}`);
+  // Environment= takes whole VAR=VALUE assignments as its words, so the quotes
+  // wrap the assignment, not just the value.
+  const environment = [`Environment=${systemdQuote(`PATH=${path}`)}`];
+  if (configPath) environment.push(`Environment=${systemdQuote(`TEAMCLAUDE_CONFIG=${configPath}`)}`);
   return `[Unit]
 Description=TeamClaude multi-account Claude proxy
 Documentation=https://github.com/KarpelesLab/teamclaude
 After=network-online.target
 
 [Service]
-ExecStart=${node} ${entry} server --headless
+ExecStart=${systemdQuote(node)} ${systemdQuote(entry)} server --headless
 Restart=always
 RestartSec=5
 ${environment.join('\n')}

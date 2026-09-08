@@ -134,29 +134,36 @@ function newRsaKey() {
   };
 }
 
-export function createCA(cn = 'TeamClaude Local CA') {
+// Default lifetimes. Callers (tests) may shorten them to exercise renewal.
+export const CA_DAYS = 3650;
+export const LEAF_DAYS = 825;
+
+export function createCA(cn = 'TeamClaude Local CA', { days = CA_DAYS } = {}) {
   const key = newRsaKey();
   const certPem = buildCert({
     subjectCN: cn, issuerCN: cn, spkiDer: key.spkiDer, signKey: key.privateKey,
-    isCA: true, days: 3650,
+    isCA: true, days,
   });
   return { cn, certPem, keyPem: key.keyPem, privateKey: key.privateKey };
 }
 
-export function createLeaf(hosts, ca) {
+export function createLeaf(hosts, ca, { days = LEAF_DAYS } = {}) {
   const list = Array.isArray(hosts) ? hosts : [hosts];
   const key = newRsaKey();
   const certPem = buildCert({
     subjectCN: list[0], issuerCN: ca.cn, spkiDer: key.spkiDer, signKey: ca.privateKey,
-    isCA: false, altDnsNames: list, days: 825,
+    isCA: false, altDnsNames: list, days,
   });
   return { certPem, keyPem: key.keyPem };
 }
 
-/** Generate a fresh CA + a leaf covering `hosts` (string or array). Returns PEM strings. */
-export function generateCertChain(hosts) {
-  const ca = createCA();
-  const leaf = createLeaf(hosts, ca);
+/**
+ * Generate a fresh CA + a leaf covering `hosts` (string or array). Returns PEM
+ * strings. `caDays` / `leafDays` override the default lifetimes (tests).
+ */
+export function generateCertChain(hosts, { caDays = CA_DAYS, leafDays = LEAF_DAYS } = {}) {
+  const ca = createCA(undefined, { days: caDays });
+  const leaf = createLeaf(hosts, ca, { days: leafDays });
   return {
     caCertPem: ca.certPem,
     caKeyPem: ca.keyPem,

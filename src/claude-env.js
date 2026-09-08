@@ -12,6 +12,20 @@ function shellQuote(value) {
   return `'${String(value).replaceAll("'", "'\"'\"'")}'`;
 }
 
+/**
+ * `port` as a number in 1..65535, or a throw. Strict on purpose: parseInt alone
+ * would turn "3456; touch /tmp/x" into 3456 and hide the bad config value that
+ * would otherwise have been eval'd.
+ */
+export function validPort(port) {
+  const text = String(port ?? '').trim();
+  const n = /^\d{1,5}$/.test(text) ? Number.parseInt(text, 10) : NaN;
+  if (!(n >= 1 && n <= 65535)) {
+    throw new Error(`proxy.port must be an integer between 1 and 65535, got ${JSON.stringify(port)}`);
+  }
+  return n;
+}
+
 // Build the shell `export` lines that point Claude Code — or any tool that
 // spawns it, e.g. an agent multiplexer — at the proxy. This is the same
 // environment `teamclaude run` sets up, but emitted for `eval "$(teamclaude
@@ -24,27 +38,22 @@ function shellQuote(value) {
 // NODE_EXTRA_CA_CERTS. base-URL mode only redirects the Anthropic base URL and
 // leaves other hosts alone.
 //
-// A client bootstrap key is emitted only when the caller determined that local
-// Claude OAuth is unavailable. It gets Claude Code past its startup auth check;
-// the proxy replaces it for normal API requests. Remote clients that are not on
-// loopback must replace it with the real proxy key.
+// No ANTHROPIC_API_KEY is emitted: loopback clients are exempt from the proxy's
+// key gate, and setting it would drop Claude Code out of subscription mode (and
+// its full model access). Remote clients that aren't on loopback must add the
+// proxy key themselves.
 // `account` pins the session to one account (TC_ACCT), exactly as `teamclaude
 // run` does: in MITM mode it rides in the proxy URL's userinfo and reaches the
 // proxy as the CONNECT's Basic username; in base-URL mode it becomes a
 // `/tc-acct/` prefix. TC_ACCT itself is then unset, so the pin does not leak
 // into claude or anything it spawns — same reasoning as `run` deleting it from
 // the child environment.
-export function buildClaudeEnvLines({
-  port,
-  useMitm = true,
-  caPath = null,
-  holdSeconds = 0,
-  account = null,
-  proxyApiKey = '',
-  clientApiKey = null,
-}) {
+export function buildClaudeEnvLines({ port, useMitm = true, caPath = null, holdSeconds = 0, account = null, proxyApiKey = '' }) {
   const lines = [];
   const pin = (account || '').trim();
+  // The port is interpolated unquoted into URLs the shell evals, so it has to
+  // BE a port: a config value of "3456; rm -rf ~" was emitted verbatim.
+  port = validPort(port);
 
   if (useMitm) {
     const userinfo = pin ? `${encodePinComponent(pin)}:${encodePinComponent(proxyApiKey || '')}@` : '';
@@ -57,7 +66,9 @@ export function buildClaudeEnvLines({
       'export NO_PROXY=localhost,127.0.0.1,::1',
       'export no_proxy=localhost,127.0.0.1,::1',
     );
-    if (caPath) lines.push(`export NODE_EXTRA_CA_CERTS=${caPath}`);
+    // Quoted: the path is under $HOME (or XDG_CONFIG_HOME), which can carry a
+    // space or a quote, and this line is eval'd.
+    if (caPath) lines.push(`export NODE_EXTRA_CA_CERTS=${shellQuote(caPath)}`);
     // Clear any stale base-URL so the two modes don't stack in one shell.
     lines.push('unset ANTHROPIC_BASE_URL');
   } else {
@@ -67,10 +78,6 @@ export function buildClaudeEnvLines({
 
   // The pin is now carried by the routing itself; keep it out of the child.
   if (pin) lines.push('unset TC_ACCT');
-  if (clientApiKey) {
-    lines.push('unset ANTHROPIC_AUTH_TOKEN');
-    lines.push(`export ANTHROPIC_API_KEY=${shellQuote(clientApiKey)}`);
-  }
 
   // Parity with `run`: if the proxy may hold the connection on exhaustion, raise
   // the client-side timeout so it doesn't give up mid-hold.

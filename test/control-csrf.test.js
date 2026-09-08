@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer, isSameOriginControlRequest } from '../src/server.js';
 
@@ -100,15 +101,73 @@ test('a same-origin browser request is allowed through', async () => {
   });
 });
 
-// Reading status cross-origin is already prevented by the same-origin policy —
-// the page issues the request but cannot see the answer — so the guard is
-// deliberately scoped to mutations and does not break anyone polling status.
-test('the guard applies to mutations, not to reads', async () => {
-  await withServer(async (_am, port) => {
-    const res = await fetch(`http://127.0.0.1:${port}/teamclaude/status`, {
-      headers: { Origin: 'https://evil.example' },
+// The control plane is not the only thing the loopback exemption exposes to a
+// page. The same no-cors POST reaches /v1/messages, where the proxy injects a
+// fleet credential — a quota drain, with the page's prompt content booked to
+// the operator — so a key-less loopback request is refused cross-origin on
+// EVERY path, not only under /teamclaude/.
+test('a page cannot spend fleet quota through /v1/messages cross-origin', async () => {
+  let reached = 0;
+  const upstream = http.createServer((_req, res) => {
+    reached++;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(ACCTS, 0.98);
+  const proxy = createProxyServer(am, { ...CONFIG, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const port = await listen(proxy);
+  try {
+    for (const headers of [{ Origin: 'https://evil.example' }, { 'Sec-Fetch-Site': 'cross-site' }]) {
+      const res = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain', ...headers },
+        body: JSON.stringify({ model: 'claude-sonnet-4-6', messages: [] }),
+      });
+      assert.equal(res.status, 403);
+      assert.match((await res.json()).error.message, /cross-origin/);
+    }
+    assert.equal(reached, 0, 'a refused request must not have been forwarded');
+    // The same request from a non-browser client is forwarded as before.
+    const res = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-sonnet-4-6', messages: [] }),
     });
     assert.equal(res.status, 200);
+    assert.equal(reached, 1);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+// Reads too: the same-origin policy keeps the answer from the page only for as
+// long as no CORS header ever leaks, so a key-less cross-origin GET is refused
+// rather than relied upon to be unreadable.
+test('a key-less cross-origin read of status is refused; a keyed one is served', async () => {
+  await withServer(async (_am, port) => {
+    const refused = await fetch(`http://127.0.0.1:${port}/teamclaude/status`, {
+      headers: { Origin: 'https://evil.example' },
+    });
+    assert.equal(refused.status, 403);
+    // A caller that presented a valid key has proven itself; the browser
+    // headers no longer matter. (The dashboard polls status this way.)
+    const keyed = await fetch(`http://127.0.0.1:${port}/teamclaude/status`, {
+      headers: { Origin: 'https://evil.example', 'x-api-key': 'tc-test' },
+    });
+    assert.equal(keyed.status, 200);
+  });
+});
+
+// The control-plane gate still applies to mutations even WITH a key: the
+// browser would preflight a request carrying x-api-key and never send it
+// cross-origin, so nothing legitimate is lost by keeping the stricter rule.
+test('a keyed cross-origin control-plane POST is still refused', async () => {
+  await withServer(async (am, port) => {
+    const res = await switchTo(port, 'bob@example.com', { Origin: 'https://evil.example', 'x-api-key': 'tc-test' });
+    assert.equal(res.status, 403);
+    assert.equal(am.currentIndex, 0);
   });
 });
 

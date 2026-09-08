@@ -26,6 +26,22 @@ export const SESSION_ACTIVE_TTL_MS = 2 * 60 * 1000; // 2min idle → no longer "
 
 const SWEEP_INTERVAL_MS = 60 * 1000; // bound growth without an external timer
 
+// The session id is a client-supplied header, and every distinct value becomes
+// a Map key that lives for the known window. A client minting a fresh id per
+// request would otherwise grow this map for an hour with nothing to stop it, so
+// the tracker bounds itself: at most this many sessions (the idle ones go first
+// when the cap is hit — one still in flight is never dropped), and no key longer
+// than this. server.js validates the header too; this is the tracker's own guard.
+export const MAX_SESSIONS = 10_000;
+export const MAX_SESSION_ID_LENGTH = 128;
+
+// The Map key for a client-supplied id. Bounded here so every entry point keys
+// the same way and a long id cannot hold more memory than a short one.
+function keyOf(sessionId) {
+  if (typeof sessionId !== 'string' || sessionId.length <= MAX_SESSION_ID_LENGTH) return sessionId;
+  return sessionId.slice(0, MAX_SESSION_ID_LENGTH);
+}
+
 // Per-session token totals, kept per weekly bucket rather than once per session.
 // Fable meters into its own weekly bucket, so how much capacity a point there
 // costs is a per-family quantity by construction; totals summed across families
@@ -74,7 +90,7 @@ export class SessionTracker {
   constructor({ knownTtlMs, activeTtlMs, now } = {}) {
     // id -> { pins: Map<bucketKey, { idx, at }>,
     //         refs: Map<bucketKey, { idx, windows: Map<window, reset>,
-    //                                unescaped: { idx, windows } | null }>,
+    //                                unescaped: { idx, windows } | null, gen }>,
     //         firstSeen, lastSeen, count, inFlight, tokens: Map<bucketKey, ...> }
     this.sessions = new Map();
     this.knownTtlMs = knownTtlMs ?? SESSION_KNOWN_TTL_MS;
@@ -123,6 +139,10 @@ export class SessionTracker {
     s.inFlight += 1;
     s.lastSeen = now;
     applyMetadata(s, metadata);
+    // Same throttled sweep as touch(): this is the one call every client request
+    // makes, so a server that never routes (all requests failing early) or never
+    // renders status must still shed idle sessions from here.
+    if (now - this._lastSweep > SWEEP_INTERVAL_MS) this.sweep(now);
     return s;
   }
 
@@ -142,6 +162,7 @@ export class SessionTracker {
   // requests on different families can still refresh the wrong one, which is the
   // same limit the in-flight arm has.
   endRequest(sessionId, now = this._now()) {
+    sessionId = keyOf(sessionId);
     const s = sessionId && this.sessions.get(sessionId);
     if (!s) return;
     s.inFlight = Math.max(0, s.inFlight - 1);
@@ -198,9 +219,32 @@ export class SessionTracker {
     return t;
   }
 
+  /**
+   * Record how ONE client request ended. `usable` true resets the streak,
+   * false advances it; an outcome nobody can attribute — the client walked
+   * away mid-stream — is not reported here at all, because a session cannot be
+   * called starved for an answer it stopped waiting for.
+   *
+   * Deliberately NOT derived from the token counters. `reports` counts upstream
+   * usage objects, which is a different question: `count_tokens` and a
+   * third-party upstream both answer correctly while reporting none, and a
+   * stream that dies after `message_start` reports one while delivering
+   * nothing. Only the request path knows how a request ended.
+   *
+   * Like recordTokens, `_live` never resurrects a forgotten session: the id is
+   * a client-supplied header, and the idle window exists to drain that map.
+   */
+  recordOutcome(sessionId, usable, now = this._now()) {
+    const s = this._live(sessionId, now);
+    if (!s) return null;
+    s.starved = usable ? 0 : s.starved + 1;
+    return s.starved;
+  }
+
   // A known, non-expired session's record, or null. Never creates one, and
   // drops an expired one on read like pinnedAccount does.
   _live(sessionId, now) {
+    sessionId = keyOf(sessionId);
     const s = sessionId && this.sessions.get(sessionId);
     if (!s) return null;
     if (this._isExpired(s, now)) {
@@ -211,8 +255,10 @@ export class SessionTracker {
   }
 
   _ensure(sessionId, now) {
+    sessionId = keyOf(sessionId);
     let s = this.sessions.get(sessionId);
     if (!s) {
+      this._makeRoom(now);
       s = {
         pins: new Map(), refs: new Map(), firstSeen: now, lastSeen: now, count: 0, inFlight: 0,
         // bucket -> emptyTokens(). On the session's own record rather than in a
@@ -222,6 +268,13 @@ export class SessionTracker {
         // The same key space as `pins`, so a family's spend and the account it
         // is pinned to are looked up by one bucket key.
         tokens: new Map(),
+        // Consecutive CLIENT requests that ended without a usable answer; any
+        // usable answer resets it. A streak rather than a total, so a blip
+        // during an upstream wobble never accumulates on a session that is
+        // otherwise working, while one that is genuinely getting nothing climbs
+        // monotonically — and no denominator is needed, which keeps `count`
+        // (forward attempts, inflated by retries) out of the question entirely.
+        starved: 0,
         // Labels from the request that opened the session (see beginRequest).
         client: null,
         dimensions: null,
@@ -229,6 +282,27 @@ export class SessionTracker {
       this.sessions.set(sessionId, s);
     }
     return s;
+  }
+
+  // Keep the map under MAX_SESSIONS before a new session is added. Expired
+  // entries go first (the ordinary sweep); if the cap still binds, the idle
+  // session seen longest ago is dropped — its pin is an hour of cache affinity
+  // at most, and losing one is the price of a flood of unique ids not being
+  // able to grow the map without bound. A session with a request in flight is
+  // never evicted, so under a genuine 10k-concurrent load the cap yields rather
+  // than the accounting breaking.
+  _makeRoom(now) {
+    if (this.sessions.size < MAX_SESSIONS) return;
+    this.sweep(now);
+    while (this.sessions.size >= MAX_SESSIONS) {
+      let oldestId = null;
+      let oldestSeen = Infinity;
+      for (const [id, s] of this.sessions) {
+        if (s.inFlight === 0 && s.lastSeen < oldestSeen) { oldestSeen = s.lastSeen; oldestId = id; }
+      }
+      if (oldestId === null) return;
+      this.sessions.delete(oldestId);
+    }
   }
 
   // Active = a request in flight now, or one seen within the active window.
@@ -249,6 +323,7 @@ export class SessionTracker {
   // this session on" is precisely the question with no single answer, and
   // answering it anyway is what used to move a session wholesale.
   pinnedAccount(sessionId, bucket, now = this._now()) {
+    sessionId = keyOf(sessionId);
     const s = sessionId && this.sessions.get(sessionId);
     if (!s) return null;
     if (this._isExpired(s, now)) {
@@ -265,6 +340,7 @@ export class SessionTracker {
     // observation has to still be there when the traffic comes back. It dies
     // with the session.
   refsFor(sessionId, bucket, create = false, now = this._now()) {
+    sessionId = keyOf(sessionId);
     const s = sessionId && this.sessions.get(sessionId);
     if (!s) return null;
     if (this._isExpired(s, now)) {
@@ -272,7 +348,7 @@ export class SessionTracker {
       return null;
     }
     let ref = s.refs.get(bucket);
-    if (!ref && create) s.refs.set(bucket, ref = { idx: null, windows: new Map(), unescaped: null });
+    if (!ref && create) s.refs.set(bucket, ref = { idx: null, windows: new Map(), unescaped: null, gen: 0 });
     return ref || null;
   }
 
@@ -302,6 +378,7 @@ export class SessionTracker {
   // pin yet, so the session stays where it already is. Empty for an unknown or
   // expired session (expired-on-read entries are dropped).
   pinnedAccounts(sessionId, now = this._now()) {
+    sessionId = keyOf(sessionId);
     const s = sessionId && this.sessions.get(sessionId);
     if (!s) return [];
     if (this._isExpired(s, now)) {
@@ -429,6 +506,11 @@ export class SessionTracker {
     const byBucket = {};
     const items = detail ? [] : null;
     let activeContext = 0;
+    // The worst streak among ACTIVE sessions, so a reader without
+    // proxy.sessionDetail still sees that something is starving — and so it
+    // clears itself once the session stops trying, rather than lingering on a
+    // record the idle window has not yet dropped.
+    let starvedMax = 0;
     for (const [id, s] of this.sessions) {
       if (this._isExpired(s, now)) {
         this.sessions.delete(id);
@@ -445,6 +527,7 @@ export class SessionTracker {
       }
       if (this._isActive(s, now)) {
         active += 1;
+        if (s.starved > starvedMax) starvedMax = s.starved;
         // Once per account, on every account this session is currently
         // spending, so the per-account counts can sum to more than `active`.
         for (const idx of this._loadedAccounts(s, now)) {
@@ -470,12 +553,11 @@ export class SessionTracker {
     }
     tokens.activeContext = activeContext;
     tokens.byBucket = byBucket;
+    const base = { known, active, perAccount, perAccountBucket, tokens, starvedMax };
     // Newest first: a per-session table is read top-down for what is happening
     // now, and the list is capped by the same TTLs as the map behind it.
     if (items) items.sort((a, b) => b.lastSeen - a.lastSeen);
-    return items
-      ? { known, active, perAccount, perAccountBucket, tokens, items }
-      : { known, active, perAccount, perAccountBucket, tokens };
+    return items ? { ...base, items } : base;
   }
 }
 
@@ -489,6 +571,7 @@ function sessionItem(id, s, active) {
     active,
     inFlight: s.inFlight,
     requests: s.count,
+    starved: s.starved,
     firstSeen: s.firstSeen,
     lastSeen: s.lastSeen,
     client: s.client,

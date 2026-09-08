@@ -29,10 +29,10 @@ jobs:
       contents: write   # create the git tag + GitHub release
       id-token: write   # OIDC token for npm Trusted Publishing + provenance
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           registry-url: 'https://registry.npmjs.org'
@@ -56,19 +56,29 @@ jobs:
             echo "publish=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Install dependencies
-        if: steps.check.outputs.publish == 'true'
-        run: npm install
-
+      # Deliberately no `npm install` here. The package has zero runtime
+      # dependencies, the tests are plain `node --test` and import nothing from
+      # node_modules, and the published tarball is just `files: ["src/"]`. The
+      # only devDependency is eslint, which is linted in ci.yml, not here. This
+      # job holds `id-token: write` + `contents: write` and ends in `npm publish`,
+      # so pulling ~90 unpinned transitive packages from the registry (and
+      # running their lifecycle scripts) in the same job would hand any one of
+      # them a path to publishing under our name.
       - name: Run tests
         if: steps.check.outputs.publish == 'true'
         run: npm test
 
       # Trusted Publishing (OIDC) needs npm >= 11.5.1. Upgrade so this works
       # regardless of which npm the runner image happens to ship.
+      #
+      # Pinned to an exact version rather than `npm@latest`: this is the one tool
+      # that receives our OIDC token and builds the tarball, so it must not be
+      # whatever the registry serves at run time. Dependabot does not track this
+      # line (only the `uses:` actions), so bump it by hand occasionally
+      # (`npm view npm version`); anything >= 11.5.1 keeps publishing working.
       - name: Upgrade npm for Trusted Publishing
         if: steps.check.outputs.publish == 'true'
-        run: npm install -g npm@latest
+        run: npm install -g npm@12.0.2
 
       - name: Publish to npm (Trusted Publishing via OIDC)
         if: steps.check.outputs.publish == 'true'

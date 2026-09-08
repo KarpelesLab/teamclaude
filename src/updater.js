@@ -121,8 +121,25 @@ export async function checkForUpdate({
   return { current, latest, updateAvailable: compareVersions(latest, current) > 0 };
 }
 
-/** Install a specific version globally. Returns true on success. */
+/**
+ * Whether `v` is a plain release version, the only shape we ever pass to npm.
+ *
+ * The registry's `dist-tags.latest` is a string from the network, and
+ * compareVersions is lenient by design (it parses what it can), so a value like
+ * "99.0.0 || npm:evil" reads as newer and would go straight into
+ * `npm install -g <name>@<value>`. Only x.y.z is installed; anything else is
+ * reported and skipped.
+ */
+export function isReleaseVersion(v) {
+  return /^\d+\.\d+\.\d+$/.test(String(v));
+}
+
+/**
+ * Install a specific version globally. Returns true on success. `version` must
+ * be a release version (or the literal `latest`), or nothing is spawned.
+ */
 export function runUpdate(version = 'latest', { spawnImpl = spawnSync } = {}) {
+  if (version !== 'latest' && !isReleaseVersion(version)) return false;
   const r = spawnImpl('npm', ['install', '-g', `${PKG_NAME}@${version}`], {
     stdio: 'inherit',
     timeout: 180000,
@@ -130,29 +147,53 @@ export function runUpdate(version = 'latest', { spawnImpl = spawnSync } = {}) {
   return !!r && !r.error && r.status === 0;
 }
 
+// The root warning is printed once per process: autoUpdate runs at startup and
+// again at session end, and a daemon would otherwise say it every day.
+let rootWarned = false;
+
 /**
  * The automatic path used at startup / session-end. Skips dev checkouts and
  * respects the opt-out; when an update exists it silently installs it for a
  * global install, or just prints a one-line notice otherwise. Cheap in the
  * common case: the expensive `npm root -g` probe only runs when an update is
  * actually available.
+ *
+ * Never runs as root. `sudo teamclaude server` would otherwise run
+ * `npm install -g` as root on a daily schedule, off a version string fetched
+ * from the network — the operator can run `teamclaude update` deliberately.
+ *
+ * `root`, `uid`, `check`, `kind` and `install` are injectable for tests.
  */
-export async function autoUpdate({ config = {}, force = false, log = console.error } = {}) {
-  const root = packageRoot();
+export async function autoUpdate({
+  config = {}, force = false, log = console.error,
+  root = packageRoot(), uid = process.getuid?.(),
+  check = checkForUpdate, kind = installKind, install = runUpdate,
+} = {}) {
   if (existsSync(join(root, '.git'))) return { skipped: 'git' }; // dev checkout — never touch
   if (process.env.TEAMCLAUDE_DISABLE_AUTOUPDATE || config.autoUpdate === false) {
     return { skipped: 'disabled' };
   }
-  const info = await checkForUpdate({ force });
+  if (uid === 0) {
+    if (!rootWarned) {
+      rootWarned = true;
+      log('[TeamClaude] Auto-update is disabled when running as root. Update deliberately with: teamclaude update');
+    }
+    return { skipped: 'root' };
+  }
+  const info = await check({ force });
   if (!info) return { skipped: 'check-failed' };
   if (!info.updateAvailable) return { ...info, upToDate: true };
+  if (!isReleaseVersion(info.latest)) {
+    log(`[TeamClaude] Ignoring registry "latest" that is not a release version: ${JSON.stringify(String(info.latest)).slice(0, 80)}`);
+    return { ...info, skipped: 'bad-version' };
+  }
 
-  if (installKind({ root }) !== 'global') {
+  if (kind({ root }) !== 'global') {
     log(`[TeamClaude] Update available: ${info.current} → ${info.latest}. Run: teamclaude update`);
     return { ...info, notified: true };
   }
   log(`[TeamClaude] Updating ${info.current} → ${info.latest}…`);
-  const ok = runUpdate(info.latest);
+  const ok = install(info.latest);
   log(ok
     ? `[TeamClaude] Updated to ${info.latest}. Restart teamclaude to use the new version.`
     : `[TeamClaude] Auto-update failed. Run manually: npm install -g ${PKG_NAME}@latest`);

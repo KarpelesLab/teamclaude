@@ -10,7 +10,7 @@
 // different account when one returns a quota 429, instead of surfacing it. A host
 // routing table decides per-CONNECT behavior:
 //   api.anthropic.com → terminate + forward,  www.example.org → local test server,
-//   anything else      → blind tunnel.
+//   anything else      → blind tunnel (never to this machine — see forward-target.js).
 
 import { readFile, writeFile, mkdir, rename } from 'node:fs/promises';
 import { X509Certificate } from 'node:crypto';
@@ -22,6 +22,8 @@ import { getConfigPath } from './config.js';
 import { generateCertChain } from './x509.js';
 import { createProxyRequestListener, resolveClientAuth, isLoopbackAddr, relayUpgrade, resolveAccountPin, describeConnectError } from './server.js';
 import { interceptHostsFor, isNeverIntercepted } from './provider.js';
+import { forwardRefusal, guardedLookup, FORBIDDEN_FORWARD } from './forward-target.js';
+import { safeLine } from './safe-text.js';
 
 const CA_CERT = 'teamclaude-ca.pem';
 const LEAF_CERT = 'teamclaude-leaf.pem';
@@ -51,12 +53,26 @@ async function atomicWrite(path, data, mode) {
   await rename(tmp, path);
 }
 
-// Is the stored leaf signed by the stored CA and valid for every host in `hosts`?
-function leafCovers(caCertPem, leafCertPem, hosts) {
+// A stored chain is reused only while it has this much life left. Without a
+// date check an expired leaf or CA was reused forever: every handshake failed
+// and nothing regenerated it, so the only cure was deleting the files by hand.
+// Renewing early keeps a long-running server from crossing the line mid-flight.
+const MIN_CERT_REMAINING_MS = 30 * 24 * 60 * 60 * 1000;
+
+/**
+ * Is the stored leaf signed by the stored CA, valid for every host in `hosts`,
+ * and (both certs) good for at least MIN_CERT_REMAINING_MS past `now`?
+ * Exported for tests.
+ */
+export function leafCovers(caCertPem, leafCertPem, hosts, now = Date.now()) {
   try {
     const ca = new X509Certificate(caCertPem);
     const leaf = new X509Certificate(leafCertPem);
     if (!leaf.verify(ca.publicKey)) return false;
+    for (const cert of [ca, leaf]) {
+      const validTo = new Date(cert.validTo).getTime();
+      if (!Number.isFinite(validTo) || validTo - now < MIN_CERT_REMAINING_MS) return false;
+    }
     const names = (leaf.subjectAltName || '').split(',').map((s) => s.trim());
     return hosts.every((h) => names.includes(`DNS:${h}`));
   } catch {
@@ -122,6 +138,57 @@ export function hostMode(host, config) {
 }
 
 /**
+ * Parse a CONNECT request-target (authority-form, `host:port`) into
+ * { host, port }, or null when it is not one we will dial.
+ *
+ * A naive `split(':')` got every awkward spelling wrong, and each one landed
+ * on the blind tunnel: `[::1]:443` became host `[`; `:443` an empty host,
+ * which Node dials as localhost; `API.ANTHROPIC.COM:443` and
+ * `api.anthropic.com.:443` missed hostMode's exact match and were tunnelled
+ * instead of intercepted. So the host goes through the URL parser (lowercase,
+ * IDNA, character validation), a root dot is dropped, IPv6 brackets are
+ * removed, and an empty host or an out-of-range port is refused. The port
+ * defaults to 443 as before; authority-form nominally requires one, but
+ * refusing its absence would break nothing and help nobody.
+ */
+export function parseConnectAuthority(target) {
+  const m = /^(\[[^\]]*\]|[^:[\]/?#@\s]+)(?::(\d{1,5}))?$/.exec(String(target || ''));
+  if (!m) return null;
+  let host;
+  try { host = new URL(`http://${m[1]}`).hostname; } catch { return null; }
+  host = host.toLowerCase().replace(/\.$/, '');
+  if (host.startsWith('[') && host.endsWith(']')) host = host.slice(1, -1);
+  if (!host) return null;
+  const port = m[2] == null ? 443 : Number(m[2]);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+  return { host, port };
+}
+
+/**
+ * Where a WebSocket Upgrade that arrived inside a terminated tunnel is relayed.
+ *
+ * The terminating server is shared by every intercepted host — it is keyed by
+ * pin and client, not by host — and the 'request' path routes each request by
+ * its path (providerForPath). An Upgrade had no such routing: it went to the
+ * configured upstream whatever host the client had tunnelled to, so a
+ * WebSocket a Codex client opened against chatgpt.com was delivered, its own
+ * Authorization header included, to api.anthropic.com. Route it by the Host
+ * the client wrote instead, which under a terminated tunnel is the CONNECT
+ * authority as the client sees it: the configured upstream (scheme and port
+ * included) for its own host, https://<host> for another provider host this
+ * config intercepts, and null — refuse, do not guess — for anything else. A
+ * host this proxy never terminates cannot legitimately reach this listener, so
+ * a request naming one is a spoofed or confused header, not traffic to route.
+ */
+export function upgradeUpstreamFor(hostHeader, config, upstream) {
+  const host = parseConnectAuthority(hostHeader)?.host;
+  if (!host) return null;
+  if (host === upstreamHostOf(config)) return upstream;
+  if (hostMode(host, config) === 'rewrite') return `https://${host}`;
+  return null;
+}
+
+/**
  * Build a `connect` event handler implementing the terminating MITM described at
  * the top of this file.
  * @param ensureLeaf async () => { key, cert }   // current leaf PEMs
@@ -174,7 +241,16 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
     // which never fires 'request' — only 'upgrade', with a raw socket instead
     // of a response object (h1-only; falls back to blind h2 passthrough is not
     // needed since WS clients negotiate h1 for the handshake).
-    srv.on('upgrade', (req, socket, head) => relayUpgrade(req, socket, head, upstream, sx));
+    srv.on('upgrade', (req, socket, head) => {
+      const target = upgradeUpstreamFor(req.headers.host, config, upstream);
+      if (!target) {
+        log(`[TeamClaude] MITM: refusing a WebSocket Upgrade for host ${JSON.stringify(safeLine(req.headers.host, 64))}, which this proxy does not intercept`);
+        try { socket.write('HTTP/1.1 421 Misdirected Request\r\nConnection: close\r\n\r\n'); } catch { /* client already gone */ }
+        socket.destroy();
+        return;
+      }
+      relayUpgrade(req, socket, head, target, sx);
+    });
     // Make the h2-WebSocket dead end audible. Without this the only evidence is
     // a message that never arrives, which is what made #164 cost a day to
     // isolate rather than a minute.
@@ -220,11 +296,27 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
       return;
     }
 
-    const [host, portStr] = (req.url || '').split(':');
-    const port = parseInt(portStr, 10) || 443;
+    const authority = parseConnectAuthority(req.url);
+    if (!authority) {
+      refuseRaw(clientSocket, '400 Bad Request');
+      return;
+    }
+    const { host, port } = authority;
     const mode = hostMode(host, config);
 
     if (mode === 'tunnel') {
+      // Destination policy (see forward-target.js): a tunnel may not reach
+      // this machine's loopback, the unspecified address, or link-local — that
+      // is how a remote client with only a low-trust key would reach our own
+      // listener as a "local" caller, or a cloud metadata endpoint. Refused by
+      // name here so the obvious case never dials; refused by resolved address
+      // in the lookup below so a DNS alias for 127.0.0.1 does not get past.
+      const refused = forwardRefusal(host, null, clientSocket);
+      if (refused) {
+        log(`[TeamClaude] CONNECT ${host}:${port} refused: ${refused}`);
+        refuseRaw(clientSocket, '403 Forbidden');
+        return;
+      }
       // Until the upstream connects we still owe the client a CONNECT status
       // line. If we tore the socket down on an upstream failure without one,
       // the client reports "Proxy connection ended before receiving CONNECT
@@ -243,13 +335,31 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
         }
         up.destroy(); clientSocket.destroy();
       };
-      const up = net.connect(port, host, () => {
+      const up = net.connect({ port, host, lookup: guardedLookup(clientSocket) }, () => {
+        // The lookup already vetted every resolved address; this re-checks the
+        // one actually connected (cheap, and independent of how the dial got
+        // there). A tunnel back to our own listener — any local address, our
+        // port — is a request loop with nothing legitimate behind it, whether
+        // or not the address class would otherwise pass.
+        const ownPort = clientSocket.server?.address?.()?.port;
+        const refusedAfter = forwardRefusal(host, up.remoteAddress, clientSocket)
+          || (up.remotePort === ownPort && up.localAddress === up.remoteAddress ? 'that is this proxy\'s own listener' : null);
+        if (refusedAfter) {
+          log(`[TeamClaude] CONNECT ${host}:${port} refused: ${refusedAfter}`);
+          teardown('403 Forbidden');
+          return;
+        }
         established = true;
         reply200Raw(clientSocket);
         if (head && head.length) up.write(head);
         up.pipe(clientSocket); clientSocket.pipe(up);
       });
       up.on('error', (err) => {
+        if (err.code === FORBIDDEN_FORWARD) {
+          log(`[TeamClaude] CONNECT ${host}:${port} refused: ${err.message}`);
+          teardown('403 Forbidden');
+          return;
+        }
         if (!established) log(`[TeamClaude] tunnel ${host}:${port} failed: ${describeConnectError(err)}`);
         teardown('502 Bad Gateway');
       });
@@ -336,9 +446,20 @@ export function resolveConnectPin(req, accountManager, proxyConfig) {
     return { pin: null, error: null };
   }
   if (resolveAccountPin(accountManager, token) == null) {
-    return { pin: null, error: `Unknown account pin "${token}"` };
+    return { pin: null, error: `Unknown account pin ${redactToken(token)}` };
   }
   return { pin: token, error: null };
+}
+
+// An unrecognized CONNECT username reaches the log, and it is not necessarily a
+// typo'd account name: HTTPS_PROXY=http://<secret>@host:port is the documented
+// remote form, so a wrong key — or some other tool's credential inherited from
+// the environment — would be written out verbatim. Enough to spot the typo
+// (first two characters, length), stripped of anything that could forge a log
+// line, and never the whole value.
+function redactToken(token) {
+  const s = String(token);
+  return `"${safeLine(s.slice(0, 2), 2)}…" (${s.length} chars)`;
 }
 
 /**
@@ -382,17 +503,35 @@ export function connectAuthorized(req, socket, proxyApiKey) {
 }
 
 function reply200Raw(sock) { sock.write('HTTP/1.1 200 Connection Established\r\n\r\n'); }
-function reply502Raw(sock) { try { sock.write('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n'); } catch { /* client already gone */ } }
+function reply502Raw(sock) { refuseRaw(sock, '502 Bad Gateway'); }
+// Answer a CONNECT with a final status line and close — the client never gets a tunnel.
+function refuseRaw(sock, statusLine) {
+  try { sock.write(`HTTP/1.1 ${statusLine}\r\nConnection: close\r\n\r\n`); } catch { /* client already gone */ }
+  sock.destroy();
+}
+
+// How long a client has to complete the TLS handshake on a locally-terminated
+// tunnel, and how long the test host waits for a request. A raw TLSSocket has no
+// handshakeTimeout of its own, so a client that CONNECTs and then sends nothing
+// held a socket (and the tunnel behind it) open for ever.
+const HANDSHAKE_TIMEOUT_MS = 30_000;
 
 function termClaude(clientSocket, head, key, cert, alpn) {
   if (head && head.length) clientSocket.unshift(head);
   const t = new tls.TLSSocket(clientSocket, { isServer: true, key, cert, ALPNProtocols: alpn });
   t.on('error', () => t.destroy());
+  // Scoped to the handshake only: an idle timer on a live session would cut a
+  // long-lived connection that is legitimately quiet. Cleared on 'secure'.
+  const timer = setTimeout(() => t.destroy(), HANDSHAKE_TIMEOUT_MS);
+  t.once('secure', () => clearTimeout(timer));
+  t.once('close', () => clearTimeout(timer));
   return t;
 }
 
 // Answer the built-in test host locally over h1 with a canned JSON response.
 function serveTest(tlsSock) {
+  // One request, one response: a peer that never sends the request is done.
+  tlsSock.setTimeout(HANDSHAKE_TIMEOUT_MS, () => tlsSock.destroy());
   let buf = Buffer.alloc(0);
   const onData = (chunk) => {
     buf = Buffer.concat([buf, chunk]);

@@ -20,8 +20,7 @@
 
 import http from 'node:http';
 import https from 'node:https';
-import tls from 'node:tls';
-import { connectThroughProxy } from './sx.js';
+import { connectThroughProxy, handshakeOverTunnel } from './sx.js';
 
 /**
  * Parse a proxy URL into the shape connectThroughProxy wants.
@@ -29,8 +28,9 @@ import { connectThroughProxy } from './sx.js';
  * Accepts `http://host:port`, `http://user:pass@host:port`, and a bare
  * `host:port` (people write proxies that way constantly, and rejecting it would
  * be pedantry). Returns null for empty input; throws on input that looks like a
- * URL but isn't usable, so a typo in the config surfaces at startup rather than
- * as a mystery connection failure on the first request.
+ * URL but isn't usable — including `https://`, which we cannot honour — so a
+ * typo in the config surfaces at startup rather than as a mystery connection
+ * failure on the first request.
  */
 export function parseProxyUrl(value) {
   if (!value || typeof value !== 'string') return null;
@@ -45,14 +45,21 @@ export function parseProxyUrl(value) {
   } catch {
     throw new Error(`invalid proxy URL: ${value}`);
   }
-  if (!/^https?:$/.test(u.protocol)) {
+  if (u.protocol === 'https:') {
+    // Accepting this used to be a silent lie: nothing here speaks TLS TO the
+    // proxy, so the CONNECT — Basic credentials included — went out in
+    // plaintext to port 443 and the connection never worked. Refuse it and
+    // name the fix; the tunnel's own TLS is end-to-end regardless of scheme.
+    throw new Error(`unsupported proxy protocol "https" (TLS to the proxy itself is not supported; use http://host:port — the tunnel through it is still end-to-end TLS): ${value}`);
+  }
+  if (u.protocol !== 'http:') {
     // socks5:// is a different wire protocol, not a CONNECT proxy — say so
     // plainly instead of failing later inside the tunnel.
-    throw new Error(`unsupported proxy protocol "${u.protocol.replace(/:$/, '')}" (only http/https): ${value}`);
+    throw new Error(`unsupported proxy protocol "${u.protocol.replace(/:$/, '')}" (only http): ${value}`);
   }
   if (!u.hostname) throw new Error(`proxy URL has no host: ${value}`);
 
-  const port = u.port ? Number(u.port) : (u.protocol === 'https:' ? 443 : 8080);
+  const port = u.port ? Number(u.port) : 8080;
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     throw new Error(`proxy URL has an invalid port: ${value}`);
   }
@@ -276,11 +283,8 @@ export function proxyAgent(proxy, { targetHost, targetPort, tls: useTls = true, 
         }
         // TLS is established end-to-end over the tunnel, so the proxy sees only
         // ciphertext and cert verification stays at its secure default.
-        const tlsSock = tls.connect({ socket: sock, servername: targetHost, ...tlsOptions });
-        const onErr = (err) => { tlsSock.removeListener('secureConnect', onOk); sock.destroy(); cb(err); };
-        const onOk = () => { tlsSock.removeListener('error', onErr); cb(null, tlsSock); };
-        tlsSock.once('secureConnect', onOk);
-        tlsSock.once('error', onErr);
+        handshakeOverTunnel(sock, { servername: targetHost, tlsOptions })
+          .then((tlsSock) => cb(null, tlsSock), (err) => cb(err));
       })
       .catch((err) => cb(err));
     return undefined; // socket is delivered asynchronously through cb

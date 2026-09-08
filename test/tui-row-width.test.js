@@ -17,11 +17,21 @@ function oauth(name) {
 
 /** Render the dashboard at `width` and return the account rows, ANSI stripped,
  * exactly as _renderAcct produced them (before fitLine pads or truncates). */
-function renderRows(width, { fable = [], sonnet = [], accounts = 6, routes = [] } = {}) {
+function renderRows(width, { fable = [], sonnet = [], accounts = 6, routes = [], apikey = [] } = {}) {
   const names = Array.from({ length: accounts }, (_, i) => `acct${i}@example.com`);
-  const am = new AccountManager(names.map(oauth), 0.98, routes.length ? { routes } : {});
+  const entries = names.map((name, i) => apikey.includes(i)
+    ? { name, type: 'apikey', apiKey: `k-${i}` }
+    : oauth(name));
+  const am = new AccountManager(entries, 0.98, routes.length ? { routes } : {});
   const h = 3600_000;
   am.accounts.forEach((a, i) => {
+    if (apikey.includes(i)) {
+      // A metered account: the row draws Tok/Req, never a family bar.
+      a.quota.tokensLimit = 1_000_000; a.quota.tokensRemaining = 600_000;
+      a.quota.requestsLimit = 1000; a.quota.requestsRemaining = 700;
+      a.quota.resetsAt = new Date(Date.now() + h).toISOString();
+      return;
+    }
     a.quota.unified5h = 0.4;
     a.quota.unified5hReset = Date.now() + 4 * h;
     a.quota.unified7d = 0.3;
@@ -165,4 +175,50 @@ test('a blocked row with general routes does not overflow', () => {
 test('the blocked tag survives the narrowing', () => {
   const rows = renderRows(70, { accounts: 2, fable: [SPENT, SPENT], sonnet: [SPENT, SPENT] });
   assert.ok(rows.some(r => r.includes('⊘')), 'the blocked tag was dropped to fit');
+});
+
+// #234's two remaining cases were about a MIXED fleet. The budget was fleet-wide,
+// so an API-key row — which draws Tok/Req and never a family bar — was sized
+// for the S7/F7 columns its subscription neighbours draw, and paid for a
+// blocked-family tag only they can carry. The budget is per row category now:
+// subscription rows share one, API-key rows another.
+const isMetered = r => r.includes(' Tok ');
+
+// Widths at which two bars are still under BAR_MAX, so an API-key row CAN fill
+// the width: past 86 columns its Tok/Req bars are capped at 20 and the row
+// stops short by design (a wider bar carries no more information), exactly as a
+// two-bar subscription fleet does.
+const UNCAPPED = [70, 76, 80, 86];
+
+test('an API-key row fills its width instead of reserving family columns it never draws', () => {
+  for (const w of [...UNCAPPED, 100, 120]) {
+    const rows = renderRows(w, { fable: [null, 0.29, 0.02, null, 0.11, 0.0], sonnet: [null, 0.3, 0.4, null, 0.2, 0.3], apikey: [0, 3] });
+    const metered = rows.filter(isMetered);
+    const unified = rows.filter(r => !isMetered(r));
+    assert.equal(metered.length, 2);
+    assert.ok(widest(rows) <= w, `W=${w}: widest row is ${widest(rows)} columns`);
+    if (!UNCAPPED.includes(w)) continue;
+    assert.ok(w - widest(metered) <= 3, `W=${w}: API-key rows leave ${w - widest(metered)} columns unused`);
+    assert.ok(w - widest(unified) <= 3, `W=${w}: subscription rows leave ${w - widest(unified)} columns unused`);
+  }
+});
+
+test('rows line up within their category, not across categories', () => {
+  for (const w of [80, 100, 120]) {
+    const rows = renderRows(w, { fable: [null, 0.29, 0.02, null, 0.11, 0.0], apikey: [0, 3] });
+    const metered = rows.filter(isMetered).map(r => r.length);
+    const unified = rows.filter(r => !isMetered(r)).map(r => r.length);
+    assert.equal(new Set(metered).size, 1, `W=${w}: API-key rows differ: ${metered.join(', ')}`);
+    assert.equal(new Set(unified).size, 1, `W=${w}: subscription rows differ: ${unified.join(', ')}`);
+  }
+});
+
+test('a blocked family on a subscription row does not shorten the API-key rows', () => {
+  for (const w of UNCAPPED) {
+    const rows = renderRows(w, { fable: [null, 0.99, 0.02, null, 0.11, 0.0], apikey: [0, 3] });
+    assert.ok(rows.some(r => r.includes('⊘ Fable')), 'the fixture blocks a family');
+    assert.ok(widest(rows) <= w, `W=${w}: widest row is ${widest(rows)} columns`);
+    const metered = rows.filter(isMetered);
+    assert.ok(w - widest(metered) <= 3, `W=${w}: the tag cost the API-key rows ${w - widest(metered)} columns`);
+  }
 });

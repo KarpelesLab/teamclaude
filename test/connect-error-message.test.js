@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer, describeConnectError } from '../src/server.js';
 import { createConnectHandler } from '../src/mitm.js';
+import { allowLoopbackForward } from '../src/forward-target.js';
 import { setUpstreamProxy, resolveUpstreamProxy, resetUpstreamProxy } from '../src/upstream-proxy.js';
 
 // A test that expects a CONNECTION-LEVEL failure must not be able to reach a
@@ -137,6 +138,7 @@ test('a forward-proxy target whose every address refuses is logged with its reas
   const realErr = console.error;
   console.error = (...a) => logged.push(a.map(String).join(' '));
   const proxy = createProxyServer(am, { proxy: {}, upstream: 'https://api.anthropic.com' });
+  allowLoopbackForward(proxy); // localhost:1 is a loopback target, refused by default
   const port = await listen(proxy);
   try {
     await new Promise((resolve) => {
@@ -170,6 +172,7 @@ test('a tunnel whose every address refuses is logged with its reasons', { skip: 
   const logged = [];
   const am = new AccountManager([{ name: 'alice', type: 'apikey', apiKey: 'k1' }], 0.98);
   const server = http.createServer();
+  allowLoopbackForward(server); // localhost:1 is a loopback target, refused by default
   server.on('connect', createConnectHandler({
     config: { proxy: {}, upstream: 'https://api.anthropic.com' },
     accountManager: am,

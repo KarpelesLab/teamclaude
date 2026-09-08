@@ -13,10 +13,38 @@
 // rendering uses textContent — status fields (account names, client names) are
 // operator/OAuth-derived, but they still never reach innerHTML.
 
+import { createHash } from 'node:crypto';
 import { UNAVAILABLE_TEXT } from './status-renderer.js';
 
 export function renderDashboardHtml() {
   return PAGE;
+}
+
+/**
+ * Content-Security-Policy for the dashboard, sent by the server with the page.
+ *
+ * The page holds the proxy key in localStorage, so the policy is the backstop
+ * for a script that should never run there: nothing loads from anywhere
+ * (`default-src 'none'`), the one inline script is admitted by its hash rather
+ * than by `'unsafe-inline'` — the page is static, so the hash is stable — and
+ * the only network the script may touch is this origin, for status and switch.
+ * Styles need `'unsafe-inline'` because the layout uses `style=` attributes,
+ * which hashes do not cover; CSSOM writes (`el.style.width = …`) are not
+ * governed by CSP at all. `frame-ancestors 'none'` keeps the page out of
+ * another site's iframe, where a click on "switch" could be overlaid.
+ */
+export function dashboardCsp(html = PAGE) {
+  const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
+  const hash = createHash('sha256').update(script, 'utf8').digest('base64');
+  return [
+    "default-src 'none'",
+    `script-src 'sha256-${hash}'`,
+    "style-src 'unsafe-inline'",
+    "connect-src 'self'",
+    "base-uri 'none'",
+    "form-action 'none'",
+    "frame-ancestors 'none'",
+  ].join('; ');
 }
 
 // The page's pure logic lives here, not in the script string: these functions
@@ -69,6 +97,7 @@ export function sessionRows(sessions) {
       project: (s.dimensions || {}).project || '',
       active: !!s.active,
       requests: s.requests || 0,
+      starved: s.starved || 0,
       cacheRead: 0, cacheCreation: 0, input: 0, output: 0, context: 0,
       accounts: Object.keys(s.pins || {}).map(function (b) { return s.pins[b]; }).join(', '),
       lastSeen: s.lastSeen || 0,
@@ -189,10 +218,95 @@ export function routeRows(status) {
   return rows;
 }
 
+// Consecutive client requests that ended with nothing usable. Claude Code has
+// its own retry loop, so two or three in a row are ordinary during a seconds-long
+// upstream wobble; five with no success in between is past any blip and past the
+// client's own budget. No age floor is needed — unlike a token-based guess, a
+// streak of five is true of no healthy session at any age, so a floor would only
+// delay a true positive.
+export var STARVED_MIN = 5;
+// The failure that makes this fire is usually fleet-wide, so every active
+// session starves at once. Naming all of them would bury the dashboard at the
+// moment it matters most; the count carries the scale, three names carry enough
+// to go and ask someone.
+export var STARVED_LIST_MAX = 3;
+
+/**
+ * What is wrong right now, worst first, or an empty list. Only states that are
+ * actionable and not ordinary operation: a spent weekly bucket, a rate-limit
+ * back-off and an upstream refusal are rotation and back-off working, and
+ * saying so every day would teach the reader to ignore the banner on the day it
+ * matters.
+ */
+export function problems(status) {
+  var s = status || {};
+  var out = [];
+
+  // Named when proxy.sessionDetail is on; otherwise the aggregate still says
+  // that something is starving, which is the half that must not be opt-in.
+  // When nothing can serve, every session starves and "it is failing" sends the
+  // operator hunting for a broken token. Say which, if the fleet agrees on why.
+  var accounts = s.accounts || [];
+  var stalled = accounts.filter(function (a) { return a.unavailable === 'quota' || a.unavailable === 'throttled'; });
+  var reasons = {};
+  stalled.forEach(function (a) { reasons[a.unavailable] = true; });
+  var why = accounts.length && stalled.length === accounts.length
+    ? ' — every account is ' + (reasons.quota && reasons.throttled ? 'over its quota threshold or in a rate-limit hold'
+      : reasons.quota ? 'over its quota threshold' : 'in a rate-limit hold') + '.'
+    : ' — it is failing, not idle.';
+
+  var sessions = s.sessions || {};
+  var named = (sessions.items ? sessionRows(sessions) : []).filter(function (r) {
+    return r.active && r.starved >= STARVED_MIN;
+  }).sort(function (a, b) { return b.starved - a.starved; });
+  named.slice(0, STARVED_LIST_MAX).forEach(function (r) {
+    out.push({
+      severity: 'bad', kind: 'starved-session',
+      text: (r.client ? r.client + "'s session " : 'Session ') + String(r.id || '').slice(0, 8)
+        + ' has had ' + r.starved + ' requests in a row come back with nothing'
+        + (r.project ? ' (' + r.project + ')' : '') + why,
+    });
+  });
+  if (named.length > STARVED_LIST_MAX) {
+    out.push({
+      severity: 'bad', kind: 'starved-more',
+      text: 'and ' + (named.length - STARVED_LIST_MAX) + ' more sessions are getting nothing back.',
+    });
+  }
+  if (!named.length && (sessions.starvedMax || 0) >= STARVED_MIN) {
+    out.push({
+      severity: 'bad', kind: 'starved-session',
+      text: 'A session has had ' + sessions.starvedMax + ' requests in a row come back with nothing.'
+        + ' Turn on proxy.sessionDetail to see which.',
+    });
+  }
+
+  // Only the two states that do not clear themselves. `entitlement` is a
+  // five-minute cooldown and `upstream-rejected` is upstream's way of saying a
+  // shared bucket is spent — both expire on their own, like `quota` and
+  // `throttled`, and none of them wants a person.
+  var ATTENTION = { error: 'needs a re-login', disabled: 'is disabled' };
+  (s.accounts || []).forEach(function (a) {
+    var why = ATTENTION[a.unavailable];
+    if (why) out.push({ severity: 'warn', kind: 'account', text: 'Account ' + a.name + ' ' + why + '.' });
+  });
+
+  // Deliberately no spend line. `usedMinor` is month-to-date overage, so on a
+  // fleet that has overage switched on it is non-zero for most of the month —
+  // an always-lit banner, which is the thing this is trying not to be. The
+  // account card and `teamclaude status` both carry it, with the amount.
+
+  return out;
+}
+
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, sessionRows, filterSessionRows, sortRows, uniqSorted,
-  switchRequest, switchOutcome, routeRows,
+  switchRequest, switchOutcome, routeRows, problems,
 ].map(fn => fn.toString()).join('\n\n');
+
+// The threshold rides along: `problems` closes over it, so a page without it
+// would ReferenceError on first render.
+const SHARED_CONSTS = `var STARVED_MIN = ${STARVED_MIN};\nvar STARVED_LIST_MAX = ${STARVED_LIST_MAX};`;
 
 const PAGE = `<!doctype html>
 <html lang="en">
@@ -255,6 +369,10 @@ const PAGE = `<!doctype html>
   .warnt { color: var(--warn); font-size: 12px; }
   .badt { color: var(--bad); }
   #err { color: var(--bad); margin: 12px 0; display: none; }
+  #problems { display: none; margin: 0 0 16px; }
+  #problems div { border-radius: 8px; padding: 8px 12px; margin-bottom: 6px; font-size: 13px; }
+  #problems .bad { background: rgba(248,81,73,.12); border: 1px solid var(--bad); color: var(--bad); }
+  #problems .warn { background: rgba(210,153,34,.12); border: 1px solid var(--warn); color: var(--warn); }
   #keybox { display: none; margin: 40px auto; max-width: 420px; text-align: center; }
   #keybox input { width: 100%; padding: 10px 12px; margin: 12px 0; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; color: var(--text); font: inherit; }
   #keybox button { padding: 8px 20px; background: var(--accent); border: 0; border-radius: 6px; color: #06121f; font: inherit; font-weight: 600; cursor: pointer; }
@@ -273,6 +391,7 @@ const PAGE = `<!doctype html>
     <h1>TeamClaude</h1>
     <p class="sub" id="summary"></p>
     <div id="err"></div>
+    <div id="problems"></div>
     <div id="note"></div>
     <div id="routesWrap" style="display:none">
       <h2>Routing</h2>
@@ -309,6 +428,8 @@ const PAGE = `<!doctype html>
   var sessionFilters = { project: '', client: '' };
   var sortState = { sessions: { key: 'lastSeen', dir: 'desc' } };
   var UNAVAILABLE_TEXT = ${JSON.stringify(UNAVAILABLE_TEXT)};
+
+${SHARED_CONSTS}
 
 ${SHARED_HELPERS}
 
@@ -611,6 +732,17 @@ ${SHARED_HELPERS}
     });
   }
 
+  // Top of the page and only when something is wrong: a banner that is always
+  // on is a banner nobody reads.
+  function renderProblems(s) {
+    var wrap = document.getElementById('problems');
+    var list = problems(s);
+    wrap.textContent = '';
+    if (!list.length) { wrap.style.display = 'none'; return; }
+    wrap.style.display = 'block';
+    list.forEach(function (p) { wrap.appendChild(el('div', p.severity, p.text)); });
+  }
+
   function render(s) {
     lastStatus = s;
     var sess = s.sessions || {};
@@ -623,6 +755,7 @@ ${SHARED_HELPERS}
     var acc = document.getElementById('accounts');
     acc.textContent = '';
     (s.accounts || []).forEach(function (a) { acc.appendChild(renderAccount(a, s.currentAccount)); });
+    renderProblems(s);
     renderRoutes(s);
     renderClients(s.clients);
     renderDimensions(s.usageDimensions);

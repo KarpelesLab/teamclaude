@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { SessionTracker, SESSION_KNOWN_TTL_MS, SESSION_ACTIVE_TTL_MS } from '../src/session-tracker.js';
+import { SessionTracker, SESSION_KNOWN_TTL_MS, SESSION_ACTIVE_TTL_MS, MAX_SESSIONS, MAX_SESSION_ID_LENGTH } from '../src/session-tracker.js';
 
 // The weekly buckets a pin is keyed by (see model.js weeklyBucketForModel).
 const SHARED = 'unified7d';
@@ -371,4 +371,64 @@ test('a request without labels does not erase the ones the session already has',
   const [row] = st.stats(clock.t, { detail: true }).items;
   assert.equal(row.client, 'alice');
   assert.deepEqual(row.dimensions, { project: 'p1' });
+});
+
+// The id is a client-supplied header. A client minting a new one per request
+// must not be able to grow the map for the whole known window.
+test('the session map is capped: a flood of unique ids evicts the idlest sessions', () => {
+  const { clock, now } = fixedClock();
+  const st = new SessionTracker({ now });
+  for (let i = 0; i < MAX_SESSIONS; i++) {
+    st.beginRequest(`flood-${i}`, clock.t);
+    st.endRequest(`flood-${i}`, clock.t);
+    clock.t += 1;
+  }
+  assert.equal(st.sessions.size, MAX_SESSIONS);
+  st.beginRequest('one-more', clock.t);
+  assert.equal(st.sessions.size, MAX_SESSIONS, 'the cap holds');
+  assert.equal(st.sessions.has('flood-0'), false, 'the session seen longest ago went first');
+  assert.equal(st.sessions.has('flood-1'), true);
+  assert.equal(st.sessions.has('one-more'), true);
+});
+
+test('the cap never evicts a session with a request in flight', () => {
+  const { clock, now } = fixedClock();
+  const st = new SessionTracker({ now });
+  st.beginRequest('streaming', clock.t); // oldest, but still running
+  clock.t += 1;
+  for (let i = 0; i < MAX_SESSIONS; i++) {
+    st.touch(`flood-${i}`, 0, SHARED, clock.t);
+    clock.t += 1;
+  }
+  assert.equal(st.sessions.has('streaming'), true, 'in-flight sessions are load, not garbage');
+  assert.equal(st.sessions.size, MAX_SESSIONS);
+});
+
+test('an over-long session id is keyed by its first MAX_SESSION_ID_LENGTH characters', () => {
+  const { clock, now } = fixedClock();
+  const st = new SessionTracker({ now });
+  const base = 'x'.repeat(MAX_SESSION_ID_LENGTH);
+  st.touch(base + '-tail-one', 3, SHARED, clock.t);
+  assert.equal(st.sessions.has(base), true);
+  assert.equal([...st.sessions.keys()][0].length, MAX_SESSION_ID_LENGTH);
+  // Every entry point keys the same way, so a long id round-trips through them.
+  assert.equal(st.pinnedAccount(base + '-tail-two', SHARED, clock.t), 3, 'the same prefix is the same session');
+  st.beginRequest(base + '-tail-three', clock.t);
+  assert.equal(st.sessions.get(base).inFlight, 1);
+  st.endRequest(base + '-tail-three', clock.t);
+  assert.equal(st.sessions.get(base).inFlight, 0);
+  assert.deepEqual(st.pinnedAccounts(base + '-tail-four', clock.t), [3]);
+  assert.equal(st.sessions.size, 1);
+});
+
+test('beginRequest sweeps expired sessions on the same throttle as touch', () => {
+  const { clock, now } = fixedClock();
+  const st = new SessionTracker({ now });
+  st.beginRequest('s1', clock.t);
+  st.endRequest('s1', clock.t);
+  clock.t += SESSION_KNOWN_TTL_MS + 1;
+  // A server whose requests all fail before routing only ever calls beginRequest.
+  st.beginRequest('s2', clock.t);
+  assert.equal(st.sessions.has('s1'), false, 'the idle session was shed without touch() or stats()');
+  assert.equal(st.sessions.size, 1);
 });
