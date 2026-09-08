@@ -38,6 +38,11 @@ export function distributionMode(setting) {
   return 'even';
 }
 
+// How long a status read reuses the last adaptive diagnostics. adaptiveStats
+// is a full selection pass over the fleet, and the TUI polls status once a
+// second; the picture cannot change faster than the poll can show it.
+const ADAPTIVE_STATS_CACHE_MS = 1000;
+
 // How long after a successful token refresh a forced (post-401) refresh is
 // suppressed. Long enough to cover the 401s from requests already in flight
 // when the token turned over, short enough that a genuinely bad new token
@@ -272,6 +277,9 @@ export class AccountManager {
     // mode at runtime can use observations already collected in this process.
     this.burnRateLearner = new BurnRateLearner(adaptive);
     this.concurrencyLearner = new ConcurrencyLearner(adaptive);
+    // The last adaptiveStats() a status read computed, and when. Time is the
+    // only thing that invalidates it (see _adaptiveStatsCached).
+    this._adaptiveStatsCache = null;
     // Sessions still being drained after distribution was turned off (see
     // setDistributeSessions). null = not draining; a Set of session ids otherwise.
     this._drainingSessions = null;
@@ -544,9 +552,12 @@ export class AccountManager {
   release(index, { successful = true } = {}) {
     const account = this.accounts[index];
     if (!account) return;
-    // Read before decrementing. A later 429 handler needs the depth that was
-    // actually refused, and a healthy response teaches success at that depth.
-    const load = account.inFlight || 0;
+    // Read before decrementing. A later 429 handler needs the load that was
+    // actually refused, and a healthy response teaches success at that load.
+    // Measured in the unit the adaptive scorer compares against the cap —
+    // active sessions plus requests in flight (_adaptiveLoad) — so what the
+    // learner is taught is what the picker asks it about.
+    const load = this._adaptiveLoad(account);
     if (successful) this.concurrencyLearner.noteSuccess(index, load);
     if (account.inFlight > 0) account.inFlight--;
     return load;
@@ -581,7 +592,7 @@ export class AccountManager {
     // adaptive distribution's response-speed term learns from. A refused pause
     // (above) is not evidence of anything, so it does not teach the learner.
     this.concurrencyLearner.noteThrottled(index,
-      Number.isFinite(throttledLoad) ? throttledLoad : (account.inFlight || 0));
+      Number.isFinite(throttledLoad) ? throttledLoad : this._adaptiveLoad(account));
     const until = Date.now() + seconds * 1000;
     account.pausedUntil = Math.max(account.pausedUntil || 0, until);
     // Arm the ramp to begin when the pause ends: while paused, admit() holds on
@@ -968,6 +979,18 @@ export class AccountManager {
    * paths apply it, so an operator's ordering still outranks every adaptive
    * consideration. Scoring only ever chooses WITHIN a tier.
    */
+  /**
+   * The load adaptive scoring sees on an account: its active sessions plus
+   * the requests in flight on it. One definition, used both where the score
+   * is computed and where the concurrency learner is taught (release,
+   * pauseAccount), so the learned cap and the load compared against it are
+   * in the same unit. It is a scoring input, not an admission bound: admit()
+   * paces on the storm ramp, never on this.
+   */
+  _adaptiveLoad(account, now = Date.now()) {
+    return this.sessionTracker.activeCountFor(account.index, now) + (account.inFlight || 0);
+  }
+
   _pickAdaptive(exclude = null, model = null, advisorModel = null) {
     const now = Date.now();
     const bucket = this._weeklyBucketFor(model);
@@ -986,7 +1009,15 @@ export class AccountManager {
     // expiry routing is off), so the tier filter stays: an operator's ordering
     // outranks every adaptive consideration.
     const topPriority = Math.min(...eligible.map(a => a.priority || 0));
-    const tier = eligible.filter(a => (a.priority || 0) === topPriority);
+    const ranked = eligible.filter(a => (a.priority || 0) === topPriority);
+    if (ranked.length === 1) return ranked[0];
+    // The same floor the even walk applies ahead of its load terms (see
+    // _belowBandFloor): with expiry routing on, an account the tree knows is
+    // nearly spent waits behind the ones that are not, and is scored only when
+    // nothing above the floor is available. Inert when the knob is off.
+    const spent = this._belowBandFloor(ranked, model, now);
+    const aboveFloor = ranked.filter((_, i) => !spent[i]);
+    const tier = aboveFloor.length ? aboveFloor : ranked;
     if (tier.length === 1) return tier[0];
 
     // The OAuth profile already names the subscription tier. Reuse the same
@@ -1004,7 +1035,7 @@ export class AccountManager {
       threshold,
       capacity: usePlanWeights ? planWeights[i] : null,
       reserve: this.burnRateLearner.reserve(account.index, windows[i].bucket),
-      load: this.sessionTracker.activeCountFor(account.index, now) + (account.inFlight || 0),
+      load: this._adaptiveLoad(account, now),
       concCap: this.concurrencyLearner.cap(account.index),
     }));
     const maxRemaining = Math.max(...candidates.map(c => {
@@ -1153,9 +1184,43 @@ export class AccountManager {
    * Returns an empty array outside adaptive mode — the numbers are still being
    * learned, but nothing is routing on them, and presenting them as if they
    * governed anything would misreport what the proxy is doing.
+   *
+   * A subscription competes only with subscriptions of its own provider (see
+   * _excludeOtherProviders), so there is one draw per provider present in the
+   * fleet: with no `provider` given, every account is reported against the
+   * draw its own provider runs, and a Codex account is shown competing with
+   * the other Codex accounts rather than as a permanent bystander to the
+   * Anthropic one. Naming a provider reports the whole fleet against that
+   * provider's draw alone.
    */
-  adaptiveStats(model = null, provider = DEFAULT_PROVIDER) {
+  adaptiveStats(model = null, provider = null) {
     if (this.distributionMode !== 'adaptive') return [];
+    if (provider != null) return this._adaptiveStatsFor(model, provider, this.accounts);
+    const rows = [];
+    for (const p of new Set(this.accounts.map(a => providerOf(a)))) {
+      rows.push(...this._adaptiveStatsFor(model, p, this.accounts.filter(a => providerOf(a) === p)));
+    }
+    return rows;
+  }
+
+  /**
+   * adaptiveStats for a status read, which the TUI takes once a second: the
+   * last pass is reused for ADAPTIVE_STATS_CACHE_MS. Only time invalidates it —
+   * a change inside the window shows up on the next tick, which is also the
+   * first tick that could have shown it.
+   */
+  _adaptiveStatsCached(now = Date.now()) {
+    if (this.distributionMode !== 'adaptive') return [];
+    const cached = this._adaptiveStatsCache;
+    if (cached && now >= cached.at && now - cached.at < ADAPTIVE_STATS_CACHE_MS) return cached.rows;
+    const rows = this.adaptiveStats();
+    this._adaptiveStatsCache = { at: now, rows };
+    return rows;
+  }
+
+  /** One provider's draw: the rows for `reported`, scored against the
+   * candidates that provider's requests may choose from. */
+  _adaptiveStatsFor(model, provider, reported) {
     const now = Date.now();
     const bucket = this._weeklyBucketFor(model);
     const threshold = this.thresholdFor(bucket);
@@ -1167,11 +1232,14 @@ export class AccountManager {
     // outranked account's weight is not "small", it is not in the draw at all.
     const inTier = new Set(eligible.filter(a => (a.priority || 0) === topPriority).map(a => a.index));
 
-    const windows = new Map(this.accounts.map(a => [a.index, this._adaptiveWindow(a, model)]));
-    const planWeights = new Map(this.accounts.map(a => [a.index, quotaTier(a).weight]));
-    const usePlanWeights = [...inTier].every(i => planWeights.get(i) != null && planWeights.get(i) > 0);
+    const windows = new Map(reported.map(a => [a.index, this._adaptiveWindow(a, model)]));
+    const planWeights = new Map(reported.map(a => [a.index, quotaTier(a).weight]));
+    const usePlanWeights = [...inTier].every(i => {
+      const weight = planWeights.get(i) ?? quotaTier(this.accounts[i]).weight;
+      return weight != null && weight > 0;
+    });
 
-    const rows = this.accounts.map(a => {
+    const rows = reported.map(a => {
       const window = windows.get(a.index);
       const utilization = window.utilization;
       const u = Number.isFinite(utilization) ? utilization : 0;
@@ -3597,7 +3665,7 @@ export class AccountManager {
       sessions: { ...sessions, distribute: this.distributeSessions, mode: this.distributionMode, draining: this.drainingCount() },
       // Empty outside adaptive mode, so the renderer needs no mode check of its
       // own and an older client simply sees nothing extra.
-      adaptive: this.adaptiveStats(),
+      adaptive: this._adaptiveStatsCached(),
       accounts: this.accounts.map(a => ({
         name: a.name,
         type: a.type,

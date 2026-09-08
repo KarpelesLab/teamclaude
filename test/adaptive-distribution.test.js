@@ -507,6 +507,68 @@ test('adaptiveStats excludes subscriptions owned by another provider', () => {
   assert.equal(rows.find(r => r.name === 'codex').weight, 0);
 });
 
+test('adaptiveStats reports each provider against its own draw', () => {
+  // A Codex subscription can only be spent by Codex, so it competes with the
+  // other Codex accounts — not as a permanent bystander to the Anthropic draw.
+  const am = new AccountManager([
+    oauth('claude-a'),
+    oauth('claude-b'),
+    oauth('codex-a', { provider: 'codex' }),
+    oauth('codex-b', { provider: 'codex' }),
+  ], 0.98, { distributeSessions: 'adaptive' });
+  for (let i = 0; i < 4; i++) weekly(am, i, 0.4);
+  const rows = am.adaptiveStats();
+  assert.equal(rows.length, 4, 'one row per account, none reported twice');
+  for (const name of ['claude-a', 'claude-b', 'codex-a', 'codex-b']) {
+    assert.equal(rows.find(r => r.name === name).competing, true, `${name} competes in its own draw`);
+  }
+  // Each draw normalizes on its own, and names its own next target.
+  const sum = names => names.reduce((t, n) => t + rows.find(r => r.name === n).weight, 0);
+  assert.ok(Math.abs(sum(['claude-a', 'claude-b']) - 1) < 1e-9);
+  assert.ok(Math.abs(sum(['codex-a', 'codex-b']) - 1) < 1e-9);
+  assert.equal(rows.filter(r => r.next && r.name.startsWith('claude')).length, 1);
+  assert.equal(rows.filter(r => r.next && r.name.startsWith('codex')).length, 1);
+});
+
+test('a status read reuses the adaptive pass for about a second, the direct call never does', () => {
+  const am = mgr(['a', 'b']);
+  weekly(am, 0, 0.5);
+  weekly(am, 1, 0.5);
+  const first = am.getStatus().adaptive;
+  assert.equal(first.length, 2);
+  weekly(am, 0, 0.9);
+  // Inside the window the same rows come back, untouched by the change...
+  assert.strictEqual(am.getStatus().adaptive, first);
+  // ...while adaptiveStats() itself is always a fresh pass.
+  assert.equal(am.adaptiveStats().find(r => r.name === 'a').utilization, 0.9);
+  // Only time invalidates the cache.
+  am._adaptiveStatsCache.at -= 5000;
+  const later = am.getStatus().adaptive;
+  assert.notStrictEqual(later, first);
+  assert.equal(later.find(r => r.name === 'a').utilization, 0.9);
+  // Outside adaptive mode nothing is computed or cached.
+  am.setDistributeSessions(true);
+  assert.deepEqual(am.getStatus().adaptive, []);
+});
+
+test('the concurrency learner is taught in the unit the scorer compares: sessions plus in-flight', async () => {
+  const am = mgr(['a', 'b']);
+  // Two sessions active on `a`, and one request admitted on it.
+  am.recordSession('s1', 0);
+  am.recordSession('s2', 0);
+  assert.equal(await am.admit(0), true);
+  const taught = [];
+  am.concurrencyLearner.noteSuccess = (index, load) => taught.push(['success', index, load]);
+  am.concurrencyLearner.noteThrottled = (index, load) => taught.push(['throttled', index, load]);
+  // Released at 2 sessions + 1 in flight: that is the load the scorer would
+  // have compared against the cap, so it is the load success is taught at.
+  assert.equal(am.release(0), 3);
+  // A pause with no explicit load falls back to the same figure, now that the
+  // request has left: 2 sessions + 0 in flight.
+  am.pauseAccount(0, 5);
+  assert.deepEqual(taught, [['success', 0, 3], ['throttled', 0, 2]]);
+});
+
 test('an outranked account is marked as not competing, not as a small share', () => {
   const am = new AccountManager([
     oauth('primary', { priority: 0 }),
