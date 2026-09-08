@@ -2793,8 +2793,8 @@ export class AccountManager {
     // drawn on both too. Never more strictly than the pass that decides the
     // request, though: where no reachable account can serve the advisor model,
     // selection routes on the main model alone and the event is spent on that
-    // basis. Ordered so that with the knob off, or with no advisor model in
-    // hand, no account is read at all: reading one clears its expired windows.
+    // basis. Ordered so that this scan reads no account with the knob off or
+    // with no advisor model in hand: reading one clears its expired windows.
     const adv = (scope != null && advisorModel
       && this.accounts.some(a => !scope.has(a.index) && this._isAvailable(a, model, advisorModel)))
       ? advisorModel : null;
