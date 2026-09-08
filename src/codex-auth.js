@@ -191,6 +191,45 @@ function openBrowser(url) {
  * port, which is why the bind failure is reported as such rather than as a
  * generic error.
  */
+/**
+ * The request handler for the login callback, settling `resolve`/`reject` with
+ * the authorization code or the failure.
+ *
+ * The state is checked FIRST, and a request without the expected state gets a
+ * 400 and settles nothing: port 1455 is open while the user is in the browser,
+ * and a stray GET — a drive-by page probing localhost, a scanner, a stale tab —
+ * used to abort the whole login by arriving with `?error=` or with no state.
+ * Exported for tests, which run it on an ephemeral port instead of 1455.
+ */
+export function codexCallbackHandler(expectedState, { resolve, reject }) {
+  return (req, res) => {
+    const url = new URL(req.url, 'http://localhost');
+    if (url.pathname !== '/auth/callback') { res.writeHead(404); res.end('Not found'); return; }
+
+    const returnedState = url.searchParams.get('state');
+    if (!returnedState || returnedState !== expectedState) {
+      res.writeHead(400, { 'Content-Type': 'text/html' });
+      res.end('<html><body><h2>Invalid request</h2><p>State mismatch. You can close this tab.</p></body></html>');
+      return;
+    }
+
+    const err = url.searchParams.get('error');
+    const returnedCode = url.searchParams.get('code');
+    const fail = (message) => {
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end('<html><body><h2>Authentication failed</h2><p>You can close this tab.</p></body></html>');
+      reject(new Error(message));
+    };
+
+    if (err) return fail(`OAuth error: ${err} ${url.searchParams.get('error_description') || ''}`.trim());
+    if (!returnedCode) return fail('OAuth callback carried no code');
+
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end('<html><body><h2>Signed in</h2><p>You can close this tab and return to the terminal.</p></body></html>');
+    resolve(returnedCode);
+  };
+}
+
 export async function loginCodex({ noBrowser = false, timeoutMs = 120_000 } = {}) {
   const codeVerifier = randomBytes(32).toString('base64url');
   const codeChallenge = createHash('sha256').update(codeVerifier).digest('base64url');
@@ -199,27 +238,7 @@ export async function loginCodex({ noBrowser = false, timeoutMs = 120_000 } = {}
 
   let server;
   const code = await new Promise((resolve, reject) => {
-    server = http.createServer((req, res) => {
-      const url = new URL(req.url, 'http://localhost');
-      if (url.pathname !== '/auth/callback') { res.writeHead(404); res.end('Not found'); return; }
-
-      const err = url.searchParams.get('error');
-      const returnedState = url.searchParams.get('state');
-      const returnedCode = url.searchParams.get('code');
-      const fail = (message) => {
-        res.writeHead(200, { 'Content-Type': 'text/html' });
-        res.end('<html><body><h2>Authentication failed</h2><p>You can close this tab.</p></body></html>');
-        reject(new Error(message));
-      };
-
-      if (err) return fail(`OAuth error: ${err} ${url.searchParams.get('error_description') || ''}`.trim());
-      if (returnedState !== state) return fail('OAuth state mismatch');
-      if (!returnedCode) return fail('OAuth callback carried no code');
-
-      res.writeHead(200, { 'Content-Type': 'text/html' });
-      res.end('<html><body><h2>Signed in</h2><p>You can close this tab and return to the terminal.</p></body></html>');
-      resolve(returnedCode);
-    });
+    server = http.createServer(codexCallbackHandler(state, { resolve, reject }));
 
     server.on('error', (e) => reject(e.code === 'EADDRINUSE'
       ? new Error(`Port ${CALLBACK_PORT} is in use. OpenAI only accepts ${REDIRECT_URI} for this client, so close whatever holds it (a running \`codex login\`) and retry.`)

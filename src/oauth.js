@@ -706,7 +706,17 @@ function raceWithStdinCode(callbackPromise, expectedState) {
   });
 }
 
-function startCallbackServer(expectedState) {
+/**
+ * The loopback listener the browser is redirected back to.
+ *
+ * Only a request carrying the expected `state` may settle the login. The state
+ * is checked FIRST, and a mismatch is answered 400 without touching the
+ * promise: this port is briefly open while the user is in the browser, and a
+ * stray GET — a drive-by page hitting localhost ports, a scanner, a stale tab —
+ * used to abort the whole login by arriving with `?error=` or with no state at
+ * all. Exported for tests.
+ */
+export function startCallbackServer(expectedState) {
   return new Promise((resolve, reject) => {
     let resolveCode, rejectCode;
     const codePromise = new Promise((res, rej) => { resolveCode = res; rejectCode = rej; });
@@ -715,10 +725,14 @@ function startCallbackServer(expectedState) {
       const url = new URL(req.url, `http://localhost`);
 
       if (url.pathname === '/callback') {
-        const code = url.searchParams.get('code');
-        const error = url.searchParams.get('error');
         const state = url.searchParams.get('state');
+        if (!state || state !== expectedState) {
+          res.writeHead(400, { 'Content-Type': 'text/html' });
+          res.end('<html><body><h2>Invalid request</h2><p>State mismatch. You can close this tab.</p></body></html>');
+          return;
+        }
 
+        const error = url.searchParams.get('error');
         if (error) {
           res.writeHead(200, { 'Content-Type': 'text/html' });
           res.end('<html><body><h2>Authentication failed</h2><p>You can close this tab.</p></body></html>');
@@ -726,13 +740,7 @@ function startCallbackServer(expectedState) {
           return;
         }
 
-        if (expectedState && state !== expectedState) {
-          res.writeHead(200, { 'Content-Type': 'text/html' });
-          res.end('<html><body><h2>Authentication failed</h2><p>State mismatch. You can close this tab.</p></body></html>');
-          rejectCode(new Error('OAuth state mismatch'));
-          return;
-        }
-
+        const code = url.searchParams.get('code');
         if (code) {
           res.writeHead(302, { 'Location': 'https://platform.claude.com/oauth/code/success?app=claude-code' });
           res.end();
@@ -745,7 +753,9 @@ function startCallbackServer(expectedState) {
       res.end('Not found');
     });
 
-    server.listen(0, () => {
+    // Loopback only: the redirect URI is http://localhost:<port>/callback, so
+    // nothing off this machine ever has a reason to reach the listener.
+    server.listen(0, '127.0.0.1', () => {
       resolve({ port: server.address().port, codePromise, server });
     });
     server.on('error', reject);
