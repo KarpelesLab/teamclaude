@@ -1,4 +1,4 @@
-import { readFile, open, mkdir, chmod, rename, unlink } from 'node:fs/promises';
+import { readFile, open, mkdir, chmod, rename, unlink, realpath } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
@@ -62,6 +62,11 @@ export async function saveState(state) {
  * never on disk under a looser mode even for an instant.
  */
 async function writeJsonAtomic(path, value) {
+  // A rename replaces the NAME, so a config that is a symlink (a dotfiles
+  // checkout, say) would silently become a regular file where the old in-place
+  // write followed the link. Resolve it first; a dangling or absent path is
+  // written where it is.
+  path = await realpath(path).catch(() => path);
   await mkdir(dirname(path), { recursive: true });
   const tmp = `${path}.tmp-${process.pid}-${randomBytes(4).toString('hex')}`;
   try {

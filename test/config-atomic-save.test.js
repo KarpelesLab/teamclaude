@@ -76,3 +76,16 @@ test('the round trip through loadConfig reads back what saveConfig wrote', async
     assert.equal(loaded.accounts[0].refreshToken, 'rt');
   });
 });
+
+test('saveConfig follows a symlinked config to its target instead of replacing the link', { skip: !onPosix }, async () => {
+  await withConfigDir(async ({ dir, cfg, path }) => {
+    const { symlink, lstat } = await import('node:fs/promises');
+    const real = join(dir, 'real.json');
+    await writeFile(real, '{"old":true}\n');
+    await symlink(real, path);
+    await cfg.saveConfig({ proxy: { port: 2, apiKey: 'k' }, accounts: [] });
+    assert.ok((await lstat(path)).isSymbolicLink(), 'the config path is still a symlink');
+    assert.deepEqual(JSON.parse(await readFile(real, 'utf-8')).proxy.port, 2, 'the link target received the write');
+    assert.deepEqual((await readdir(dir)).sort(), ['real.json', 'teamclaude.json']);
+  });
+});
