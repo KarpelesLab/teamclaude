@@ -1365,6 +1365,51 @@ test('a roll a borrowed walk holds belongs to the fleet whose reading it preserv
     'the owner\'s success left its own roll owed');
 });
 
+test('a walk that moves an observation makes the reading its own fleet\'s', () => {
+  // The other face of the same rule. A stamp that only fills a blank leaves the
+  // reading naming whichever fleet moved it first, so a fleet preempted off a
+  // roll of its own could not settle it: the hold would name a fleet whose
+  // success is no evidence, and every fail-back would find the roll standing.
+  const am = new AccountManager(
+    [sharedKey('key'), codexAccount('cx1'), codexAccount('cx2')], 0.98, { expiryRouting: ON },
+  );
+  for (const [i, used, hours] of [[0, 0.10, 90], [1, 0.50, 10], [2, 0.40, 20]]) {
+    bucket(am, i, 'unified7d', used, hours);
+  }
+
+  const claudeReq = () => am.getActiveAccount(null, OPUS, null, null, 'anthropic');
+  // The key excluded, so the codex walk MOVES the observation rather than resting
+  // where the anthropic walk already left it.
+  const codexReq = (exclude = new Set([0])) => am.getActiveAccount(exclude, GPT, null, null, 'codex');
+
+  // No opening placement: that would baseline the observation outside a walk and
+  // leave it naming no fleet. The key is all the anthropic partition has.
+  assert.equal(claudeReq().name, 'key', 'the anthropic traffic must come to rest on the shared key');
+  assert.equal(am._currentObs.idx, 0, 'the anthropic walk did not take the reading on the key');
+  assert.equal(am._currentObs.provider, 'anthropic',
+    'the reading the anthropic walk established names another fleet');
+
+  assert.equal(codexReq().name, 'cx1', 'the codex walk did not move the observation onto cx1');
+  assert.equal(am._currentObs.idx, 1, 'the codex walk did not move the reading with the cursor');
+  assert.equal(am._currentObs.provider, 'codex',
+    'the walk that moved the reading left it naming the fleet it was taken from');
+
+  // cx1 rolls, and the codex fleet is pushed off a roll that is now its own.
+  rollWindow(am, 1);
+  assert.equal(codexReq().name, 'cx2', 'cx1\'s roll did not preempt the codex traffic');
+  assert.equal(codexReq().name, 'cx2', 'the preemption did not settle on cx2');
+
+  const carried = am.observedGeneration(null, GPT);
+  const served = codexReq();
+  assert.equal(served.name, 'cx2', 'the confirming codex request left cx2');
+  am.confirmStay(served, carried, null, 'codex');
+
+  // cx2 out of the way, so the traffic returns to the account it was pushed off.
+  assert.equal(codexReq(new Set([0, 2])).name, 'cx1', 'the fail-back did not reach cx1');
+  assert.equal(am._currentRolledOver(am.accounts[1], GPT), false,
+    'the codex fleet could not settle a roll it was itself pushed off');
+});
+
 test('a confirmation that names no fleet settles nothing', () => {
   // The control on the plainest fixture: one provider, one roll, a success that
   // would release it. A caller naming no fleet has not answered which one it is.
