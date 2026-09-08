@@ -85,12 +85,33 @@ Volatile runtime state (observed quota) is written separately to `teamclaude.sta
 | `TEAMCLAUDE_CONFIG` | Path to the config file (default `~/.config/teamclaude.json`) |
 | `TEAMCLAUDE_HOST` | Override `proxy.host` |
 | `TEAMCLAUDE_DISABLE_AUTOUPDATE` | Set to `1` to skip the background self-update check |
+| `TEAMCLAUDE_STATUS_TIMEOUT_MS` | How long `teamclaude status` waits for the server's answer before giving up (default `5000`). A connection that is accepted but never answered is reported as a stalled or overloaded server, distinct from a refused one ("Is the server running?") |
 | `HTTPS_PROXY` / `ALL_PROXY` | Outbound proxy used when the config sets no `upstreamProxy` (lowercase forms honoured too) |
 | `NO_PROXY` | Hosts that bypass the outbound proxy, when the config sets no `noProxy` |
 
 ```bash
 TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 ```
+
+### Event-loop diagnostics
+
+A wedged event loop is the one failure the status endpoint cannot report, because the endpoint itself cannot run. The server therefore keeps a small watchdog: a 1 s timer measures how late each tick fires, and a tick more than 500 ms late counts as a stall and writes one line to the service log (at most one every 30 s):
+
+```
+[TeamClaude] Event loop stalled: lag=1840ms (threshold=500ms, stalls=3)
+```
+
+The figures are reported under `server.eventLoop` in `GET /teamclaude/status` and `teamclaude status --json` — numbers only, never request content:
+
+| Field | Meaning |
+| --- | --- |
+| `lastLagMs` | How late the most recent tick fired |
+| `maxLagMs` | The worst lag seen since the server started |
+| `stallCount` | Ticks that exceeded the threshold since start |
+| `lastStallAt` | ISO timestamp of the most recent stall, or `null` |
+| `warnLagMs` | The threshold in effect (`500`) |
+
+A `teamclaude status` that times out (see `TEAMCLAUDE_STATUS_TIMEOUT_MS`) while the log shows stalls is the signature of a starved or blocked process — on macOS, check that the LaunchAgent is not running under a `Background` QoS clamp — rather than of an upstream problem.
 
 ## Usage Dimensions
 
