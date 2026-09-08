@@ -1,4 +1,4 @@
-import { readFile, writeFile, mkdir, chmod } from 'node:fs/promises';
+import { readFile, open, mkdir, chmod, rename, unlink } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
@@ -41,12 +41,45 @@ export async function loadState() {
 }
 
 export async function saveState(state) {
-  const path = getStatePath();
+  await writeJsonAtomic(getStatePath(), state);
+}
+
+/**
+ * Write a JSON document so that the file at `path` is, at every instant, either
+ * the previous complete document or the new one.
+ *
+ * A plain writeFile truncates first and fills in afterwards. The config holds
+ * every account's OAuth tokens and the proxy key; a crash or power loss in that
+ * gap left an empty or half-written file, and the next start threw on
+ * JSON.parse with the credentials gone. So the document goes to a sibling
+ * temp file, is fsynced so it is on disk before it is named, and is renamed
+ * over the target — rename replaces atomically on POSIX and, in Node, on
+ * Windows too (same scheme mitm.js uses for the leaf key).
+ *
+ * The temp file is created 0600 and chmod'ed before the rename, so the
+ * "enforce 0600 on every save" behaviour of the old code holds: a config that
+ * was once world-readable becomes 0600 on the next save, and the tokens are
+ * never on disk under a looser mode even for an instant.
+ */
+async function writeJsonAtomic(path, value) {
   await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, JSON.stringify(state, null, 2) + '\n', { mode: 0o600 });
-  // `mode` only applies when the file is CREATED; enforce 0600 on every save so
-  // a pre-existing state file (holding quota + tokens) can't linger world-readable.
-  await chmod(path, 0o600).catch(() => {});
+  const tmp = `${path}.tmp-${process.pid}-${randomBytes(4).toString('hex')}`;
+  try {
+    const fh = await open(tmp, 'w', 0o600);
+    try {
+      await fh.writeFile(JSON.stringify(value, null, 2) + '\n');
+      await fh.sync();
+    } finally {
+      await fh.close();
+    }
+    // `open`'s mode is masked by the umask; make the mode exact regardless.
+    await chmod(tmp, 0o600).catch(() => {});
+    await rename(tmp, path);
+  } catch (err) {
+    // Never leave a half-written copy of the credentials lying beside the config.
+    await unlink(tmp).catch(() => {});
+    throw err;
+  }
 }
 
 export function createDefaultConfig() {
@@ -124,12 +157,9 @@ export async function loadOrCreateConfig() {
 }
 
 export async function saveConfig(config) {
-  const path = getConfigPath();
-  await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
-  // Enforce 0600 even if the file already existed (the proxy apiKey + account
-  // tokens live here); `mode` above is honored only on creation.
-  await chmod(path, 0o600).catch(() => {});
+  // The proxy apiKey and every account's tokens live here: see writeJsonAtomic
+  // for why this is not a plain writeFile.
+  await writeJsonAtomic(getConfigPath(), config);
 }
 
 // Serialize config updates. atomicConfigUpdate is a read-modify-write, so two
