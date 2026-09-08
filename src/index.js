@@ -878,10 +878,17 @@ async function envCommand() {
 
   // Same pin as `teamclaude run`, so `eval "$(teamclaude env)"` and `run` agree.
   const account = (process.env.TC_ACCT || '').trim();
-  const lines = buildClaudeEnvLines({
-    port, useMitm, caPath, holdSeconds: config.holdSeconds,
-    account, proxyApiKey: config.proxy?.apiKey || '',
-  });
+  let lines;
+  try {
+    lines = buildClaudeEnvLines({
+      port, useMitm, caPath, holdSeconds: config.holdSeconds,
+      account, proxyApiKey: config.proxy?.apiKey || '',
+    });
+  } catch (err) {
+    // A bad proxy.port. Nothing reaches stdout: the shell is eval'ing it.
+    process.stderr.write(`teamclaude env: ${err.message} (in ${getConfigPath()})\n`);
+    process.exit(1);
+  }
   process.stdout.write(`${lines.join('\n')}\n`);
 
   const mode = useMitm ? 'MITM forward-proxy' : 'base-URL';

@@ -1,4 +1,5 @@
 import { test } from 'node:test';
+import { spawnSync } from 'node:child_process';
 import assert from 'node:assert/strict';
 import { buildClaudeEnvLines } from '../src/claude-env.js';
 
@@ -11,9 +12,34 @@ test('MITM mode (default) emits proxy vars + CA cert, and clears ANTHROPIC_BASE_
     'export http_proxy=http://127.0.0.1:3456',
     'export NO_PROXY=localhost,127.0.0.1,::1',
     'export no_proxy=localhost,127.0.0.1,::1',
-    'export NODE_EXTRA_CA_CERTS=/home/u/.config/teamclaude-ca.pem',
+    "export NODE_EXTRA_CA_CERTS='/home/u/.config/teamclaude-ca.pem'",
     'unset ANTHROPIC_BASE_URL',
   ]);
+});
+
+// NODE_EXTRA_CA_CERTS is a path under $HOME, and $HOME can carry a space or a
+// quote. The line is eval'd, so it has to survive the shell intact.
+test('the CA path is shell-quoted: a space and a quote survive eval', () => {
+  for (const caPath of ['/home/first last/.config/teamclaude-ca.pem', "/home/o'brien/.config/tc-ca.pem", '/h/a b\'c"d$e/ca.pem']) {
+    const lines = buildClaudeEnvLines({ port: 3456, caPath });
+    const result = spawnSync('/bin/sh', ['-c', `${lines.join('\n')}\nprintf %s "$NODE_EXTRA_CA_CERTS"`], { encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, caPath);
+  }
+});
+
+// The port is interpolated unquoted into URLs. A config value that is not a
+// port used to be emitted verbatim — "3456; touch /tmp/x" included.
+test('a port that is not an integer in 1..65535 is refused, not emitted', () => {
+  for (const port of ['3456; touch /tmp/x', 'abc', '', null, undefined, 0, 65536, -1, 3456.5, '0x1000', ' 3456 ; x']) {
+    assert.throws(() => buildClaudeEnvLines({ port, caPath: '/x' }), /proxy\.port must be an integer between 1 and 65535/, String(port));
+    assert.throws(() => buildClaudeEnvLines({ port, useMitm: false }), /proxy\.port/, String(port));
+  }
+});
+
+test('a numeric string port is accepted as the number it spells', () => {
+  assert.deepEqual(buildClaudeEnvLines({ port: '8080', useMitm: false }), ['export ANTHROPIC_BASE_URL=http://localhost:8080']);
+  assert.deepEqual(buildClaudeEnvLines({ port: 65535, useMitm: false }), ['export ANTHROPIC_BASE_URL=http://localhost:65535']);
 });
 
 test('MITM mode without a caPath omits NODE_EXTRA_CA_CERTS (never emits an empty value)', () => {
@@ -87,7 +113,10 @@ test('a pinned line is shell-safe: no unquoted metacharacters survive', () => {
   for (const name of ["work (Acme)", "o'brien", "a!b", "x*y"]) {
     for (const useMitm of [true, false]) {
       const lines = buildClaudeEnvLines({ port: 3456, useMitm, account: name, caPath: '/x' });
-      for (const l of lines) assert.ok(!/[()'!*]/.test(l), `${l} (from ${name})`);
+      // The pin rides unquoted in the URL lines; the CA path line is quoted separately.
+      for (const l of lines.filter(l => !l.startsWith('export NODE_EXTRA_CA_CERTS='))) {
+        assert.ok(!/[()'!*]/.test(l), `${l} (from ${name})`);
+      }
     }
   }
 });

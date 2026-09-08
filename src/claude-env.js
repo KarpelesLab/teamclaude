@@ -8,6 +8,24 @@ export function encodePinComponent(s) {
   return encodeURIComponent(s).replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
 }
 
+function shellQuote(value) {
+  return `'${String(value).replaceAll("'", "'\"'\"'")}'`;
+}
+
+/**
+ * `port` as a number in 1..65535, or a throw. Strict on purpose: parseInt alone
+ * would turn "3456; touch /tmp/x" into 3456 and hide the bad config value that
+ * would otherwise have been eval'd.
+ */
+export function validPort(port) {
+  const text = String(port ?? '').trim();
+  const n = /^\d{1,5}$/.test(text) ? Number.parseInt(text, 10) : NaN;
+  if (!(n >= 1 && n <= 65535)) {
+    throw new Error(`proxy.port must be an integer between 1 and 65535, got ${JSON.stringify(port)}`);
+  }
+  return n;
+}
+
 // Build the shell `export` lines that point Claude Code — or any tool that
 // spawns it, e.g. an agent multiplexer — at the proxy. This is the same
 // environment `teamclaude run` sets up, but emitted for `eval "$(teamclaude
@@ -33,6 +51,9 @@ export function encodePinComponent(s) {
 export function buildClaudeEnvLines({ port, useMitm = true, caPath = null, holdSeconds = 0, account = null, proxyApiKey = '' }) {
   const lines = [];
   const pin = (account || '').trim();
+  // The port is interpolated unquoted into URLs the shell evals, so it has to
+  // BE a port: a config value of "3456; rm -rf ~" was emitted verbatim.
+  port = validPort(port);
 
   if (useMitm) {
     const userinfo = pin ? `${encodePinComponent(pin)}:${encodePinComponent(proxyApiKey || '')}@` : '';
@@ -45,7 +66,9 @@ export function buildClaudeEnvLines({ port, useMitm = true, caPath = null, holdS
       'export NO_PROXY=localhost,127.0.0.1,::1',
       'export no_proxy=localhost,127.0.0.1,::1',
     );
-    if (caPath) lines.push(`export NODE_EXTRA_CA_CERTS=${caPath}`);
+    // Quoted: the path is under $HOME (or XDG_CONFIG_HOME), which can carry a
+    // space or a quote, and this line is eval'd.
+    if (caPath) lines.push(`export NODE_EXTRA_CA_CERTS=${shellQuote(caPath)}`);
     // Clear any stale base-URL so the two modes don't stack in one shell.
     lines.push('unset ANTHROPIC_BASE_URL');
   } else {
