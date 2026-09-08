@@ -10,6 +10,8 @@ import { ROLLOVER_MIN_JUMP_MS, remapHeld } from './rollover.js';
 import { decideBand, pressureOf, pressureRank, assertNever } from './band-decision.js';
 import { BurnRateLearner, ConcurrencyLearner, scoreCandidate } from './adaptive-distribution.js';
 import { safeLine } from './safe-text.js';
+/** @typedef {import('./session-tracker.js').Hold} Hold */
+/** @typedef {import('./session-tracker.js').Observation} Observation */
 
 // Re-exported for callers that import these model helpers from here.
 export { isFableModel, parseRequestModel, parseAdvisorModel } from './model.js';
@@ -325,6 +327,7 @@ export class AccountManager {
     // observation, { idx, windows: name → reset }, of the account traffic was
     // resting on when a request last arrived to find it there. Null while the
     // knob is off: nothing writes one then and none survives the transition.
+    /** @type {Observation|null} */
     this._currentObs = null;
     // Throttle for the held-rollover line, keyed by (account index, WINDOW,
     // reason). Keying by the request bucket would let two windows that share one
@@ -2111,6 +2114,8 @@ export class AccountManager {
    * writes only where nothing is lost, since the aimed request may never arrive.
    * Nothing here releases a held roll: arriving is not being served, and only a
    * served attempt carrying this observation's stamp releases one.
+   *
+   * @param {Observation} obs
    */
   _restOn(obs, account, model) {
     if (obs.idx !== account.index) {
@@ -2164,6 +2169,8 @@ export class AccountManager {
    * design turns on — a reading whose account HAS rolled while its traffic has
    * not come to rest elsewhere, the fail-back's only protection. The test is
    * whether ANY window rolled, since an aim discards the whole reading at once.
+   *
+   * @param {Observation} obs
    */
   _firstSightOn(obs, account) {
     if (!obs || !account) return;
@@ -2191,6 +2198,9 @@ export class AccountManager {
   /**
    * The stamp scopes a confirmation: a request that selected before this move,
    * or after a later one, carries a different one and is no evidence here.
+   *
+   * @param {Observation} obs
+   * @param {number} index
    */
   _moveObs(obs, index) {
     obs.idx = index;
@@ -2257,6 +2267,8 @@ export class AccountManager {
   /**
    * Clear one observation's held roll, only where the request confirms the stay
    * it selected under. Another account, or any move since, is a different stay.
+   *
+   * @param {Observation} obs
    */
   _releaseHeld(obs, account, carried) {
     if (!obs || carried == null) return;
@@ -2374,8 +2386,11 @@ export class AccountManager {
    * are recorded whether or not they currently bind, because one that starts
    * binding later would otherwise be first-sighted on the very request that
    * should have caught it rolling.
+   *
+   * @returns {Object<string, number>}
    */
   _accountWindows(account) {
+    /** @type {Object<string, number>} */
     const out = {};
     for (const bucket of this._windowKeys()) {
       const window = this._windowForBucket(account, bucket);

@@ -86,12 +86,37 @@ function setAndReturn(map, key, value) {
   return value;
 }
 
+/**
+ * A rollover reading held for the account a preemption pushed traffic off,
+ * until a served request releases it or a fail-back hands it back.
+ *
+ * @typedef {Object} Hold
+ * @property {number} idx the account the held reading was taken on
+ * @property {Map<string, number>} windows window name to that window's reset, in epoch ms
+ * @property {string|null} provider the fleet whose reading this preserves, null while no walk has moved it
+ */
+/**
+ * What one sticky choice was last found resting on, and what that account's
+ * windows read then. Shared by the current account and by every session pin,
+ * so both stores answer a roll the same way.
+ *
+ * @typedef {Object} Observation
+ * @property {number|null} idx the account the reading was taken on, null before one is named
+ * @property {Map<string, number>} windows window name to that window's reset, in epoch ms
+ * @property {Hold|null} unescaped the roll this choice was pushed off and has not escaped
+ * @property {number} gen the stamp a confirmation is scoped by
+ * @property {string|null} provider the fleet whose reading this is
+ */
 export class SessionTracker {
+  /**
+   * @param {Object} [opts]
+   * @param {number} [opts.knownTtlMs]
+   * @param {number} [opts.activeTtlMs]
+   * @param {() => number} [opts.now]
+   */
   constructor({ knownTtlMs, activeTtlMs, now } = {}) {
     // id -> { pins: Map<bucketKey, { idx, at }>,
-    //         refs: Map<bucketKey, { idx, windows: Map<window, reset>,
-    //                                unescaped: { idx, windows, provider } | null,
-    //                                gen, provider }>,
+    //         refs: Map<bucketKey, Observation>,
     //         firstSeen, lastSeen, count, inFlight, tokens: Map<bucketKey, ...> }
     this.sessions = new Map();
     this.knownTtlMs = knownTtlMs ?? SESSION_KNOWN_TTL_MS;
@@ -334,12 +359,20 @@ export class SessionTracker {
     return s.pins.get(bucket)?.idx ?? null;
   }
 
-    // The rollover observation this session holds for `bucket`: the account
-    // traffic was last found resting on and what its windows read then. Kept
-    // beside the pin rather than on it because it outlives a relocation — a pin
-    // just moved off an account is not evidence about that account, and the
-    // observation has to still be there when the traffic comes back. It dies
-    // with the session.
+  /**
+   * The rollover observation this session holds for `bucket`: the account
+   * traffic was last found resting on and what its windows read then. Kept
+   * beside the pin rather than on it because it outlives a relocation — a pin
+   * just moved off an account is not evidence about that account, and the
+   * observation has to still be there when the traffic comes back. It dies
+   * with the session.
+   *
+   * @param {string|null} sessionId
+   * @param {string|null} bucket
+   * @param {boolean} [create]
+   * @param {number} [now]
+   * @returns {Observation|null}
+   */
   refsFor(sessionId, bucket, create = false, now = this._now()) {
     sessionId = keyOf(sessionId);
     const s = sessionId && this.sessions.get(sessionId);
@@ -348,6 +381,7 @@ export class SessionTracker {
       this.sessions.delete(sessionId);
       return null;
     }
+    /** @type {Observation|null} */
     let ref = s.refs.get(bucket);
     // `provider` names the fleet whose reading this is. Nothing here knows one,
     // so it is stamped when a selection walk first moves the observation.
