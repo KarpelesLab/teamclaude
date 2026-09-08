@@ -1427,7 +1427,13 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // Taken before the walk, which can move the observation, and a request cannot
   // confirm the stay its own selection began. A pinned request bypasses
   // selection, so it consults no observation and is no evidence about a rest.
-  const restingGen = ctx.pinnedIndex == null
+  // A failover hop names its destination up front (ctx.hopTo, set by the 429
+  // and 5xx hops below) and is one attempt long: consumed here so the attempt
+  // after it, if any, selects normally. Like a pin it bypasses selection, so it
+  // is no evidence about a rest either.
+  const hopTo = ctx.hopTo ?? null;
+  ctx.hopTo = null;
+  const restingGen = ctx.pinnedIndex == null && hopTo == null
     ? accountManager.observedGeneration(ctx.sessionId, ctx.model)
     : null;
 
@@ -1456,11 +1462,16 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   const pinnedWrongProvider = pinned
     && isSubscriptionAccount(pinned)
     && providerOf(pinned) !== (ctx.provider || DEFAULT_PROVIDER);
-  const account = ctx.pinnedIndex != null
-    ? (pinned && !pinnedWrongProvider && !accountManager.capExceeded(pinned, ctx.model) ? pinned : null)
-    : accountManager.getActiveAccount(
-      ctx.tried, ctx.model, ctx.advisorModel, ctx.sessionId, ctx.provider, selection,
-    );
+  // The hop's destination was picked by pickAlternate against this request's
+  // own exclusions, and is taken as-is: re-selecting here would walk the fleet
+  // cursor onto it, which is exactly the move a detour must not make (#286).
+  const account = hopTo != null
+    ? accountManager.accounts[hopTo]
+    : ctx.pinnedIndex != null
+      ? (pinned && !pinnedWrongProvider && !accountManager.capExceeded(pinned, ctx.model) ? pinned : null)
+      : accountManager.getActiveAccount(
+        ctx.tried, ctx.model, ctx.advisorModel, ctx.sessionId, ctx.provider, selection,
+      );
   // Accounts a rollover deliberately routed this request away from. Request-
   // scoped: the decision belongs to the request, not to one attempt of it.
   if (selection.rolledOff) {
@@ -1806,12 +1817,15 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         // ctx.rolledOff as well as tried: an account a rollover moved this
         // request off was never sent a request, so it is not in `tried`, and
         // hopping back onto it would reverse that decision one step later.
-        const alt = accountManager.getActiveAccount(
+        // pickAlternate, not getActiveAccount: the hop detours THIS request and
+        // must leave the fleet cursor where it is (#286).
+        const alt = accountManager.pickAlternate(
           new Set([...ctx.tried, ...(ctx.rolledOff || []), account.index]),
-          ctx.model, ctx.advisorModel, ctx.sessionId, ctx.provider,
+          ctx.model, ctx.advisorModel, ctx.provider,
         );
         if (alt && !accountManager.isPaused(alt.index)) {
           ctx.rateLimitHopped = true;
+          ctx.hopTo = alt.index;
           ctx.tried.add(account.index);
           console.log(`[TeamClaude] Rate-limit 429 on "${account.name}" — failing over once to idle account "${alt.name}"`);
           if (clientGone(res)) { ctx.abandoned = true; return; }
@@ -1880,14 +1894,15 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // account'"'"'s cache discovering that. After the hop the response goes to the
     // client as it does today, with its own retry-after intact.
     if (upstreamRes.status >= 500 && !res.headersSent && !ctx.serverErrorHopped && retryCount < maxRetries) {
-      // Same exclusion as the 429 hop: see there.
-      const alt = accountManager.getActiveAccount(
+      // Same exclusion as the 429 hop, and the same cursor-preserving pick.
+      const alt = accountManager.pickAlternate(
         new Set([...ctx.tried, ...(ctx.rolledOff || []), account.index]),
-        ctx.model, ctx.advisorModel, ctx.sessionId, ctx.provider,
+        ctx.model, ctx.advisorModel, ctx.provider,
       );
       if (alt && !accountManager.isPaused(alt.index)) {
         await upstreamRes.body?.cancel();
         ctx.serverErrorHopped = true;
+        ctx.hopTo = alt.index;
         ctx.tried.add(account.index);
         console.log(`[TeamClaude] Upstream ${upstreamRes.status} on "${account.name}" — failing over once to "${alt.name}"`);
         if (clientGone(res)) { ctx.abandoned = true; return; }

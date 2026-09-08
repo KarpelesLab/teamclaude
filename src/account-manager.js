@@ -606,6 +606,22 @@ export class AccountManager {
   }
 
   /**
+   * The best account this request could hop to, moving NOTHING: no cursor, no
+   * observation, no route cursor. For the one-hop failovers in the server, which
+   * detour a single request around an account that just refused it. A detour
+   * is not a decision about where the fleet rests — but routing it through
+   * getActiveAccount made every hop a "Switched to account" the whole fleet
+   * then followed, and under a sustained 429 the cursor bounced between two
+   * siblings with every request (#286).
+   *
+   * Same candidate set as a real selection: the request's own exclusions, the
+   * provider partition, the expiry band. Returns the account or null.
+   */
+  pickAlternate(exclude, model = null, advisorModel = null, provider = DEFAULT_PROVIDER) {
+    return this._pickBestAvailable(this._excludeOtherProviders(exclude, provider), model, advisorModel);
+  }
+
+  /**
    * Widen a request's exclude set to every account that belongs to a different
    * provider.
    *
