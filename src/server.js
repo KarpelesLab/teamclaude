@@ -666,6 +666,21 @@ export function relayHttpForward(req, res) {
 // fleet; the whole prefix is the fix, not a growing allowlist of sub-paths.
 const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/'];
 
+// Claude Code's session id is a UUID, but other clients tag sessions too, so
+// the shape is a conservative charset rather than the UUID grammar: wide enough
+// that a non-UUID client keeps its session tracking, tight enough that nothing
+// odd gets in. The value becomes a Map key in the session tracker (the length
+// cap is what bounds that map per client) and a column in the TUI, where Node's
+// header parser would otherwise let C1 control bytes through untouched.
+const SESSION_ID_SHAPE = /^[A-Za-z0-9._-]{1,128}$/;
+
+/** The session id a request carries, or null when the header is absent or
+ *  malformed — a malformed one is treated as no session, not rejected. */
+export function clientSessionId(headers) {
+  const raw = headers['x-claude-code-session-id'];
+  return typeof raw === 'string' && SESSION_ID_SHAPE.test(raw) ? raw : null;
+}
+
 /**
  * Build the core proxy request listener — buffer the body, then forward with
  * account selection + retry (forwardRequest). Shared by the base HTTP server and
@@ -773,7 +788,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
           // value on the path that can carry raw control bytes.
           const shown = safeLine(token ?? raw);
           const reqId = ++counter;
-          const sessionId = req.headers['x-claude-code-session-id'] || null;
+          const sessionId = clientSessionId(req.headers);
           if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(unknown pin: "${shown}")`, status: 404, model: null, sessionId, pinned: false });
           res.writeHead(404, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: `Unknown account pin "${shown}"` } }));
@@ -793,7 +808,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         pinnedIndex = resolveAccountPin(accountManager, forcedPin);
         if (pinnedIndex == null) {
           const reqId = ++counter;
-          const sessionId = req.headers['x-claude-code-session-id'] || null;
+          const sessionId = clientSessionId(req.headers);
           if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(unknown pin: "${safeLine(forcedPin)}")`, status: 404, model: null, sessionId, pinned: false });
           res.writeHead(404, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: `Unknown account pin "${forcedPin}" (from TC_ACCT)` } }));
@@ -806,7 +821,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // Claude Code tags each session's requests with this header (present on
       // /v1/messages and count_tokens). Read from headers up front so it drives
       // session-aware routing (issue #109) and colors the TUI activity stream.
-      const sessionId = req.headers['x-claude-code-session-id'] || null;
+      const sessionId = clientSessionId(req.headers);
       if (!hideActivity) {
         // Marked open BEFORE the hook runs. The shipped TUI hook registers its
         // row and then renders, and the render can rethrow, so a hook that
