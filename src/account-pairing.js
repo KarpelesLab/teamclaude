@@ -44,21 +44,6 @@ export function configIndexFor(configAccounts, managerAccounts, mgrIdx) {
 }
 
 /**
- * The account list to write to disk: in-memory config entries carrying live
- * credentials from the account each was built into, merged over the on-disk
- * entry so disk-only fields (e.g. importFrom) survive. An entry with no account
- * keeps what it has — there is no live credential to write.
- *
- * The config-to-disk lookup is a different axis and stays on identity, which is
- * not claimed one-to-one: two entries identity cannot separate both merge over
- * the same disk record. No credential moves that way, because the live one above
- * overrides whatever the lookup found — but the record's other fields do move,
- * and `importFrom` among them names the file an entry takes its credential from
- * at the next start. An entry can therefore pick up a delegation that was never
- * its own and read another's credential a restart later. Pairing by id does not
- * reach this axis.
- */
-/**
  * Whether this entry's OAuth token belongs in `config.json` at all.
  *
  * The save used to write `accessToken: am.credential` onto EVERY entry, which
@@ -118,8 +103,52 @@ export function clearRemovedAccountIds(config) {
   if (config?.[REMOVED]) config[REMOVED].clear();
 }
 
+/**
+ * Which disk row each config entry merges over, as a Map of config index to disk
+ * index. A row is claimed by at most one entry.
+ *
+ * Evidence before guesswork, in three passes: an exact id, then an account uuid
+ * both records carry, then the display name. `sameIdentity` collapses the last
+ * two — it compares uuids only when both sides have one and falls back to the
+ * name otherwise — so calling it alone lets an entry holding a uuid settle for a
+ * namesake's row. Claiming consumes, so that row is then taken from the entry it
+ * belonged to, and `importFrom` on it names the file an entry reads its
+ * credential from at the next start. findUpsertTarget in identity.js puts the
+ * same two questions in this order for the login axis.
+ *
+ * Ids can disagree with disk — a file written before the field existed, or
+ * re-minted by another process — which is why they cannot be the only pass.
+ */
+function claimDiskRows(configAccounts, diskAccounts) {
+  const rowFor = new Map();
+  const taken = new Set();
+  const claim = (i, matches) => {
+    for (const [d, diskAcct] of diskAccounts.entries()) {
+      if (taken.has(d) || !matches(diskAcct)) continue;
+      taken.add(d);
+      rowFor.set(i, d);
+      return;
+    }
+  };
+  configAccounts.forEach((a, i) => { if (a?.id) claim(i, d => d?.id === a.id); });
+  configAccounts.forEach((a, i) => { if (!rowFor.has(i) && a?.accountUuid) claim(i, d => d?.accountUuid && sameIdentity(d, a)); });
+  configAccounts.forEach((a, i) => { if (!rowFor.has(i)) claim(i, d => sameIdentity(d, a)); });
+  return rowFor;
+}
+
+/**
+ * The account list to write to disk: in-memory config entries carrying live
+ * credentials from the account each was built into, merged over the on-disk
+ * entry so disk-only fields (e.g. importFrom) survive. An entry with no account
+ * keeps what it has — there is no live credential to write.
+ *
+ * The config-to-disk lookup is a different axis from the config-to-manager one,
+ * and claimDiskRows is where it is decided: one row per entry, one entry per row.
+ */
 export function mergeAccountsForSave(configAccounts, managerAccounts, diskAccounts, removedIds = new Set()) {
-  const merged = configAccounts.map(a => {
+  const rowFor = claimDiskRows(configAccounts, diskAccounts);
+
+  const merged = configAccounts.map((a, i) => {
     const am = managerAccountFor(managerAccounts, a);
     const live = am && ownsInlineToken(a) ? {
       ...a,
@@ -127,7 +156,7 @@ export function mergeAccountsForSave(configAccounts, managerAccounts, diskAccoun
       refreshToken: am.refreshToken,
       expiresAt: am.expiresAt,
     } : a;
-    const diskAcct = diskAccounts.find(d => sameIdentity(d, a));
+    const diskAcct = diskAccounts[rowFor.get(i)];
     return diskAcct ? { ...diskAcct, ...live } : live;
   });
 
@@ -137,12 +166,19 @@ export function mergeAccountsForSave(configAccounts, managerAccounts, diskAccoun
   // server runs — was silently dropped by the next save (#205). The refresh
   // handler already re-reads disk for this reason; the save had no equivalent.
   //
+  // A claimed row is one the merge above already folded into an entry, so this
+  // loop and the claim have to agree on what counts as already represented. The
+  // id alone does not agree: two processes mint different ids for the same
+  // pre-id row, so every row would look absent and the whole list would double.
+  //
   // Except the ones the operator removed: removal is itself a save, so without
   // that check this would resurrect the account being deleted, on the very
   // write that was meant to delete it.
+  const claimed = new Set(rowFor.values());
   const keptIds = new Set(merged.map(a => a?.id).filter(Boolean));
-  for (const diskAcct of diskAccounts) {
-    if (!diskAcct?.id) continue;                 // pre-id row; identity above covers it
+  for (const [d, diskAcct] of diskAccounts.entries()) {
+    if (claimed.has(d)) continue;
+    if (!diskAcct?.id) continue;                 // nothing for removedIds to match; adopting it could undo a removal
     if (keptIds.has(diskAcct.id)) continue;
     if (removedIds.has(diskAcct.id)) continue;
     merged.push(diskAcct);
