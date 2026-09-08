@@ -503,7 +503,7 @@ export class AccountManager {
   _setCurrent(account) {
     this.currentIndex = account.index;
     if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) return;
-    this._firstSightOn(this._currentObs ??= { idx: null, windows: new Map(), unescaped: null, gen: 0 }, account);
+    this._firstSightOn(this._currentObs ??= { idx: null, windows: new Map(), unescaped: null, gen: 0, provider: null }, account);
   }
 
   /**
@@ -1906,7 +1906,7 @@ export class AccountManager {
     // the transition seeds" and "an aim never overwrites".
     if (wasWatching) return;
     const current = this.accounts[this.currentIndex];
-    if (current) this._firstSightOn(this._currentObs ??= { idx: null, windows: new Map(), unescaped: null, gen: 0 }, current);
+    if (current) this._firstSightOn(this._currentObs ??= { idx: null, windows: new Map(), unescaped: null, gen: 0, provider: null }, current);
     for (const { sessionId, bucket, idx } of this.sessionTracker.livePins()) {
       this._firstSightOn(this.sessionTracker.refsFor(sessionId, bucket, true), this.accounts[idx]);
     }
@@ -2121,7 +2121,12 @@ export class AccountManager {
       // offered it before any request reaches here.
       const leaving = obs.idx == null ? null : this.accounts[obs.idx];
       if (leaving && this._anyJumped(obs.windows, leaving)) {
-        obs.unescaped = { idx: obs.idx, windows: obs.windows };
+        // The hold belongs to the fleet whose READING it preserves, the one that
+        // last moved this observation, rather than to the fleet that writes it.
+        // A borrower resting on the owner's cursor displaces the owner's reading.
+        // A reading no walk has moved names no fleet, so the fleet that observes
+        // the roll takes it, and a single-provider fleet can still settle it.
+        obs.unescaped = { idx: obs.idx, windows: obs.windows, provider: obs.provider ?? this._selectingProvider };
       }
       // Established whole, from every window the account presents, so a window
       // that comes back is a first sight rather than a stale value read as a jump.
@@ -2167,6 +2172,8 @@ export class AccountManager {
       // the pass returning the traffic finds the cursor still on the account
       // that refused it, so _restOn never sees the arrival. The held roll is
       // given back here, to the account that still owes it.
+      // Matched on index alone, whatever fleet holds it: handing a roll back to
+      // the account that owes it is a restoration and not a settlement by anyone.
       if (obs.unescaped?.idx === account.index) {
         this._moveObs(obs, account.index);
         obs.windows = obs.unescaped.windows;
@@ -2188,6 +2195,11 @@ export class AccountManager {
   _moveObs(obs, index) {
     obs.idx = index;
     obs.gen = ++this._obsGen;
+    // A move inside a selection walk makes the reading that fleet's, so its own
+    // stay is what settles a roll pushed off it. The same-index stay in `_restOn`
+    // does not come through here: a borrowed walk advances a reading the resting
+    // fleet never established, and stamping there hands it the owner's roll.
+    obs.provider = this._selectingProvider;
   }
 
   /** Has ANY window this reading holds rolled over on the account it was taken
@@ -2226,14 +2238,19 @@ export class AccountManager {
     // the success offered for it can belong to different fleets. The REQUEST's
     // provider settles it, and a confirmation naming no fleet settles nothing.
     const held = this._currentObs?.unescaped;
-    if (held && provider && providerOf(this.accounts[held.idx]) === provider) {
+    if (held && provider && held.provider === provider) {
       this._releaseHeld(this._currentObs, account, carried.current);
     }
     if (sessionId) {
       // The bucket comes from the stamp, since a route edit reaches the running
-      // table before the response does. Ungated, because a session's own
-      // observation cannot name an account it never selected.
-      this._releaseHeld(this.sessionTracker.refsFor(sessionId, carried.bucket), account, carried.pin);
+      // table before the response does. Gated like the cursor above: a session
+      // that has served both fleets holds a roll one of them was pushed off, and
+      // the other's success is no evidence about it.
+      const pinObs = this.sessionTracker.refsFor(sessionId, carried.bucket);
+      const pinHeld = pinObs?.unescaped;
+      if (pinHeld && provider && pinHeld.provider === provider) {
+        this._releaseHeld(pinObs, account, carried.pin);
+      }
     }
   }
 
@@ -2253,7 +2270,7 @@ export class AccountManager {
     if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) return;
     const resting = this.accounts[this.currentIndex];
     if (!resting || exclude?.has(resting.index)) return;
-    this._currentObs ??= { idx: null, windows: new Map(), unescaped: null, gen: 0 };
+    this._currentObs ??= { idx: null, windows: new Map(), unescaped: null, gen: 0, provider: null };
     this._restOn(this._currentObs, resting, model);
   }
 
@@ -3595,6 +3612,9 @@ export class AccountManager {
           idx: moved,
           windows: this._currentObs.windows,
           unescaped: remapHeld(this._currentObs.unescaped, remap),
+          // Renumbering is not a fleet establishing a reading, so the stamp that
+          // says whose reading this is survives the shift like the reading does.
+          provider: this._currentObs.provider,
           // Renumbering names the same account by a new index, so a request
           // already in flight against it still confirms the stay it selected on.
           gen: this._currentObs.gen,

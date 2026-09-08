@@ -13,9 +13,11 @@ export const ROLLOVER_MIN_JUMP_MS = 3600_000;
 // whose account went away is dropped, because handing it back on a later
 // fail-back would hand it to whichever account inherited the slot. `mapFn` is
 // the same renumbering the observation's own index goes through, returning null
-// for the removed account.
+// for the removed account. The stamp naming the fleet whose reading the hold
+// preserves travels with it: a renumbering is nobody's success, so it settles
+// nothing, and dropping the stamp would leave a hold no fleet can settle.
 export function remapHeld(held, mapFn) {
   if (!held) return null;
   const moved = mapFn(held.idx);
-  return moved == null ? null : { idx: moved, windows: held.windows };
+  return moved == null ? null : { idx: moved, windows: held.windows, provider: held.provider };
 }
