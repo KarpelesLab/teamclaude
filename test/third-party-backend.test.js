@@ -135,3 +135,14 @@ test('rewriteModel passes through a JSON body that has no model field', () => {
   const out = rewriteModel(body, modelMap);
   assert.equal(out, body);
 });
+
+// The map is a plain object, so a client-chosen model name that is also a
+// prototype property ("constructor") used to look up a function, which
+// JSON.stringify drops — the request went upstream with no model at all.
+test('rewriteModel ignores prototype properties as model names', () => {
+  for (const name of ['constructor', 'toString', '__proto__', 'hasOwnProperty']) {
+    const body = Buffer.from(JSON.stringify({ model: name, max_tokens: 1 }));
+    const out = rewriteModel(body, modelMap);
+    assert.equal(out, body, `${name} must pass through unchanged`);
+  }
+});
