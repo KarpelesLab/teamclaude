@@ -13,7 +13,7 @@ import { mintAccountId } from './account-id.js';
 import { formatPercent } from './status-renderer.js';
 import { resolveMaxUsage } from './model.js';
 import { parseProxyUrl, proxyToUrl, describeProxy, describeSelfProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy } from './upstream-proxy.js';
-import { sanitizeText } from './safe-text.js';
+import { sanitizeText, safeLine } from './safe-text.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -79,8 +79,13 @@ function sessionColorCode(sid) {
 // no session (e.g. a telemetry request). One width for every row, named or not,
 // keeps the columns after it aligned. Measured in display columns, not UTF-16
 // units, so a CJK title takes the same room as an ASCII one.
+// The id is a client header. Node's parser lets C1 bytes (U+009B is a CSI on
+// its own) through, so only an id of the shape Claude Code actually sends is
+// shown as-is; anything else is stripped down before it reaches the frame.
+const SAFE_SID = /^[A-Za-z0-9._-]+$/;
+const shortSid = sid => (SAFE_SID.test(sid) ? sid : safeLine(sid, 64) || '?').slice(0, SESSION_ID_LEN);
 const sessionTag = (sid, title = null, width = SESSION_ID_LEN) =>
-  sid ? fg(sessionColorCode(sid), rpad(truncate(title || sid.slice(0, SESSION_ID_LEN), width), width)) : ' '.repeat(width);
+  sid ? fg(sessionColorCode(sid), rpad(truncate(title || shortSid(sid), width), width)) : ' '.repeat(width);
 
 // Which quota-family bar (F7/S7) a route binds to, or null for a general route.
 // Auto routes are named 'fable'/'sonnet'; a configured route is classified by its
@@ -100,6 +105,17 @@ const routeGlyph = (paint, eligible, pinned) =>
 
 const ANSI_RE = /\x1b\[[0-9;]*m/g;
 const strip = s => s.replace(ANSI_RE, '');
+
+// What a composed line may still carry when it reaches the frame: the SGR
+// colour this file adds, and nothing else that a terminal would act on. Every
+// other escape form (an OSC 52 clipboard write, a CSI erase, a bare C0/C1
+// control) came from a value that was not ours, and unlike sanitizeText this
+// keeps the colour, so it can run on a line after it has been painted.
+// Alternatives, in order: SGR (kept), OSC through its BEL/ST terminator, any
+// other CSI, any remaining control or format character.
+const NON_SGR_CONTROL = /(\x1b\[[0-9;]*m)|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b\[[0-?]*[ -/]*[@-~]|\p{C}/gu;
+export const scrubLine = s => String(s).replace(NON_SGR_CONTROL, (m, sgr) => sgr || '');
+const SGR_AT = /\x1b\[[0-9;]*m/y;   // sticky: "an SGR starting exactly here"
 
 // Terminal display width of one code point: 0 for combining and zero-width
 // marks, 2 for East Asian wide/fullwidth characters and emoji, 1 otherwise.
@@ -157,10 +173,16 @@ export function truncate(s, w) {
   let i = 0;
   while (i < s.length) {
     if (s[i] === '\x1b') {
-      const end = s.indexOf('m', i);
-      if (end >= 0) { out += s.slice(i, end + 1); i = end + 1; continue; }
+      // Only a well-formed SGR is copied through. Copying "ESC up to the next
+      // m" carried an erase or a clipboard write into the frame whole.
+      SGR_AT.lastIndex = i;
+      const m = SGR_AT.exec(s);
+      if (m) { out += m[0]; i += m[0].length; continue; }
+      i++; continue;
     }
     const cp = s.codePointAt(i);
+    // A stray control (BEL, a C1 byte) is dropped, not drawn.
+    if (cp < 0x20 || (cp >= 0x7f && cp <= 0x9f)) { i++; continue; }
     const cw = charWidth(cp);
     // A wide glyph that would cross the limit is dropped whole rather than split;
     // the one leftover column is filled by the caller's padding.
@@ -346,6 +368,19 @@ export function bar(ratio, w = 10, resetTs, windowMs, threshold) {
   return out;
 }
 
+// The request fields the hooks hand us come from the client — the path and
+// method off the request line, the model peeked from the body, the session id
+// from a header — so they are cut down once here, before they are stored to be
+// drawn every frame and logged.
+const REQ_FIELD_MAX = { method: 16, path: 256, model: 64, account: 64, sessionId: 64 };
+function cleanRequestInfo(info) {
+  const out = { ...info };
+  for (const [k, max] of Object.entries(REQ_FIELD_MAX)) {
+    if (out[k] != null) out[k] = safeLine(out[k], max);
+  }
+  return out;
+}
+
 function timestamp() {
   return new Date().toLocaleTimeString('en-US', { hour12: false });
 }
@@ -505,6 +540,7 @@ export class TUI {
   // ── server hooks ───────────────────────────────────
 
   onRequestStart(id, info) {
+    info = cleanRequestInfo(info);
     // Start the lookup now, so the title is cached by the time the request ends
     // and its log line is composed.
     this._sessionTag(info.sessionId);
@@ -515,15 +551,17 @@ export class TUI {
 
   onRequestModel(id, info) {
     const r = this.active.get(id);
-    if (r && info.model) { r.model = info.model; this.render(); }
+    const model = info.model ? safeLine(info.model, 64) : '';
+    if (r && model) { r.model = model; this.render(); }
   }
 
   onRequestRouted(id, info) {
     const r = this.active.get(id);
-    if (r) r.account = info.account;
+    if (r) r.account = info.account == null ? info.account : safeLine(info.account, 64);
   }
 
   onRequestEnd(id, info) {
+    info = cleanRequestInfo(info);
     const r = this.active.get(id);
     this.active.delete(id);
     const dur = r ? ((Date.now() - r.started) / 1000).toFixed(1) : '?';
@@ -536,7 +574,10 @@ export class TUI {
   }
 
   _addLog(msg) {
-    msg = msg.replace(/^\[TeamClaude\]\s*/, '');
+    // The screen copy keeps the colour callers painted on, and only that: a
+    // request's model string is repainted from this list every frame for as
+    // long as the entry lives, so an escape stored here would fire 200 times.
+    msg = scrubLine(msg).replace(/^\[TeamClaude\]\s*/, '');
     const t = timestamp();
     this.log.unshift({ t, msg });
     if (this.log.length > 200) this.log.length = 200;
