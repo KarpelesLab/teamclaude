@@ -24,8 +24,14 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
 
+      # `--ignore-scripts`: eslint (the only devDependency) is needed for lint
+      # only, and neither it nor its transitive packages need lifecycle scripts to
+      # work. Not running them denies a compromised package arbitrary code
+      # execution at install time. Still `npm install` rather than `npm ci`:
+      # package-lock.json is deliberately gitignored for this zero-dependency
+      # package, so there is no lockfile for `npm ci` to consume.
       - name: Install dependencies
-        run: npm install
+        run: npm install --ignore-scripts
 
       - name: Run tests
         run: npm test
