@@ -3004,14 +3004,25 @@ export class AccountManager {
 
     account._refreshPromise = (async () => {
       console.log(`[TeamClaude] Refreshing token for account "${account.name}"...`);
+      // The token we SEND, captured before the await. A config reload or
+      // `teamclaude import` (updateAccountTokens) can install newer tokens while
+      // the grant is in flight; reading `account.refreshToken` afterwards would
+      // attribute this call's outcome to the wrong token — marking the freshly
+      // imported one dead on invalid_grant (locking the account out until a
+      // re-login), or overwriting it with a result minted from the old family.
+      const sent = account.refreshToken;
       try {
         // Each provider mints tokens at its own endpoint with its own client
         // id, so the grant is dispatched by provider. Both return the same
         // { accessToken, refreshToken, expiresAt } shape, which is what lets
         // everything downstream stay provider-agnostic.
         const newTokens = await (providerOf(account) === 'codex'
-          ? this._codexRefreshFn(account.refreshToken)
-          : this._refreshFn(account.refreshToken));
+          ? this._codexRefreshFn(sent)
+          : this._refreshFn(sent));
+        if (account.refreshToken !== sent) {
+          console.log(`[TeamClaude] Discarding refresh result for account "${account.name}" — its tokens were replaced while the refresh was in flight`);
+          return;
+        }
         account.credential = newTokens.accessToken;
         account.refreshToken = newTokens.refreshToken;
         account.expiresAt = newTokens.expiresAt;
@@ -3029,11 +3040,17 @@ export class AccountManager {
         // what kept accounts wrongly "errored" after a momentary refresh blip.
         const isAuthRejection = err.status === 400 || err.status === 401 || err.status === 403;
         if (isAuthRejection) {
-          account.status = 'error';
           // Remember WHICH token was rejected so we stop re-sending it (see the
           // dead-token guard above). A transient failure deliberately does not
-          // arm this — that token may still be good.
-          account._deadRefreshToken = account.refreshToken;
+          // arm this — that token may still be good. The token that was SENT,
+          // not whatever the account holds now: the guard compares by value, so
+          // a token imported mid-refresh stays untouched and gets its own try.
+          account._deadRefreshToken = sent;
+          if (account.refreshToken !== sent) {
+            console.log(`[TeamClaude] Account "${account.name}" received new tokens while its old refresh token was being rejected — keeping the new ones`);
+            return;
+          }
+          account.status = 'error';
           console.error(`[TeamClaude] Account "${account.name}" needs re-login (refresh token rejected) — run: teamclaude login`);
         }
       } finally {
