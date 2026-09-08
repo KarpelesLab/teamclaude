@@ -8,6 +8,20 @@
 export const ROLLOVER_MIN_JUMP_MS = 3600_000;
 
 /** @typedef {import('./session-tracker.js').Hold} Hold */
+/** @typedef {import('./session-tracker.js').Observation} Observation */
+
+/**
+ * A sticky choice with no reading taken yet. Both stores of observations create
+ * one through here, so a field the shape gains cannot reach one store and miss
+ * the other. `provider` starts null because nothing creating an observation
+ * knows a fleet: a selection walk stamps it on the first move.
+ *
+ * @returns {Observation}
+ */
+export function newObservation() {
+  return { idx: null, windows: new Map(), unescaped: null, gen: 0, provider: null };
+}
+
 /**
  * Renumber the roll an observation is holding for the account it was pushed off,
  * after an account is removed and every index above it shifts down. Both stores

@@ -19,7 +19,7 @@
 //   - ACTIVE: a session counts as "active" (and toward per-account load) if it
 //     made a request this recently. Short, so load-balancing reacts to what is
 //     actually running now rather than to sessions merely lingering in the hour.
-import { remapHeld } from './rollover.js';
+import { remapHeld, newObservation } from './rollover.js';
 
 export const SESSION_KNOWN_TTL_MS = 60 * 60 * 1000; // 1h idle → forgotten
 export const SESSION_ACTIVE_TTL_MS = 2 * 60 * 1000; // 2min idle → no longer "active"
@@ -387,9 +387,7 @@ export class SessionTracker {
     }
     /** @type {Observation|null} */
     let ref = s.refs.get(bucket);
-    // `provider` names the fleet whose reading this is. Nothing here knows one,
-    // so it is stamped when a selection walk first moves the observation.
-    if (!ref && create) s.refs.set(bucket, ref = { idx: null, windows: new Map(), unescaped: null, gen: 0, provider: null });
+    if (!ref && create) s.refs.set(bucket, ref = newObservation());
     return ref || null;
   }
 
