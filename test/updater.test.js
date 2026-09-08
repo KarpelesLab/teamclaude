@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  compareVersions, installKind, fetchLatestVersion, checkForUpdate, runUpdate, PKG_NAME,
+  compareVersions, installKind, fetchLatestVersion, checkForUpdate, runUpdate, autoUpdate, isReleaseVersion, PKG_NAME,
 } from '../src/updater.js';
 
 // ── compareVersions ─────────────────────────────────────────
@@ -110,4 +110,85 @@ test('runUpdate invokes the global npm install for the requested version', () =>
 test('runUpdate returns false when npm fails', () => {
   assert.equal(runUpdate('2.3.4', { spawnImpl: () => ({ status: 1 }) }), false);
   assert.equal(runUpdate('2.3.4', { spawnImpl: () => ({ error: new Error('ENOENT') }) }), false);
+});
+
+// ── the registry's "latest" is a string from the network ─────
+
+// compareVersions parses what it can, so "99.0.0 || npm:evil" reads as newer
+// than anything installed and used to go straight into `npm install -g`.
+test('isReleaseVersion accepts only x.y.z', () => {
+  for (const v of ['1.2.3', '0.0.1', '10.20.30']) assert.equal(isReleaseVersion(v), true, v);
+  for (const v of ['99.0.0 || npm:evil', '1.2', '1.2.3-beta.1', 'latest', ' 1.2.3', '1.2.3\n', '', null, undefined, 'v1.2.3']) {
+    assert.equal(isReleaseVersion(v), false, String(v));
+  }
+});
+
+test('runUpdate spawns nothing for a version that is not a release version', () => {
+  const calls = [];
+  const spawnImpl = (cmd, argv) => { calls.push([cmd, argv]); return { status: 0 }; };
+  assert.equal(runUpdate('99.0.0 || npm:evil', { spawnImpl }), false);
+  assert.equal(runUpdate('1.2.3-beta.1', { spawnImpl }), false);
+  assert.equal(calls.length, 0);
+  // The literal tag the manual fallback uses is still fine.
+  assert.equal(runUpdate('latest', { spawnImpl }), true);
+});
+
+// ── autoUpdate guards ────────────────────────────────────────
+
+/** A package root that is not a git checkout, so autoUpdate gets past its first check. */
+function nonGitRoot() {
+  return mkdtempSync(join(tmpdir(), 'tc-root-'));
+}
+
+test('autoUpdate skips a malformed registry version with a log line and installs nothing', async () => {
+  const root = nonGitRoot();
+  const logs = [];
+  let installed = 0;
+  try {
+    const res = await autoUpdate({
+      root, uid: 1000, log: (m) => logs.push(m),
+      check: async () => ({ current: '1.0.0', latest: '99.0.0 || npm:evil', updateAvailable: true }),
+      kind: () => 'global',
+      install: () => { installed++; return true; },
+    });
+    assert.equal(res.skipped, 'bad-version');
+    assert.equal(installed, 0);
+    assert.equal(logs.length, 1);
+    assert.match(logs[0], /not a release version/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('autoUpdate still installs a well-formed newer version for a global install', async () => {
+  const root = nonGitRoot();
+  const installs = [];
+  try {
+    const res = await autoUpdate({
+      root, uid: 1000, log: () => {},
+      check: async () => ({ current: '1.0.0', latest: '2.0.0', updateAvailable: true }),
+      kind: () => 'global',
+      install: (v) => { installs.push(v); return true; },
+    });
+    assert.equal(res.updated, true);
+    assert.deepEqual(installs, ['2.0.0']);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+// `sudo teamclaude server` would otherwise run `npm install -g` as root every
+// day, off a version string fetched from the network.
+test('autoUpdate never runs as root, and says so once', async () => {
+  const root = nonGitRoot();
+  const logs = [];
+  let checked = 0;
+  try {
+    const opts = {
+      root, uid: 0, log: (m) => logs.push(m),
+      check: async () => { checked++; return { current: '1.0.0', latest: '2.0.0', updateAvailable: true }; },
+      kind: () => 'global',
+      install: () => { throw new Error('must not install as root'); },
+    };
+    assert.equal((await autoUpdate(opts)).skipped, 'root');
+    assert.equal((await autoUpdate(opts)).skipped, 'root');
+    assert.equal(checked, 0, 'the registry is not even consulted');
+    assert.equal(logs.filter(l => /root/.test(l)).length, 1, 'warned exactly once across calls');
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
