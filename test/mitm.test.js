@@ -12,7 +12,7 @@ import { X509Certificate } from 'node:crypto';
 const TMP = mkdtempSync(join(tmpdir(), 'tc-mitm-'));
 process.env.TEAMCLAUDE_CONFIG = join(TMP, 'config.json');
 
-const { ensureCerts, caCertPath, TEST_HOST } = await import('../src/mitm.js');
+const { ensureCerts, caCertPath, TEST_HOST, parseConnectAuthority } = await import('../src/mitm.js');
 const { AccountManager } = await import('../src/account-manager.js');
 const { createProxyServer } = await import('../src/server.js');
 const { allowLoopbackForward } = await import('../src/forward-target.js');
@@ -143,7 +143,7 @@ test('CONNECT to a loopback target is refused with 403 and never dialled', async
   const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: 'https://api.anthropic.com' }, {});
   const port = await listen(proxy);
   try {
-    for (const target of [`127.0.0.1:${trapPort}`, `127.1.2.3:${trapPort}`, `localhost:${trapPort}`, `0.0.0.0:${trapPort}`, '169.254.169.254:80']) {
+    for (const target of [`127.0.0.1:${trapPort}`, `127.1.2.3:${trapPort}`, `localhost:${trapPort}`, `[::1]:${trapPort}`, `0.0.0.0:${trapPort}`, `[::ffff:127.0.0.1]:${trapPort}`, '169.254.169.254:80', '[fe80::1]:80']) {
       assert.match(await connectStatus(port, target), /^HTTP\/1\.1 403 /, target);
     }
     assert.equal(connections, 0, 'no connection may reach a loopback target');
@@ -162,6 +162,37 @@ test("CONNECT to the proxy's own port is refused even where loopback is admitted
     // (our port, connected to ourselves) still refuses the request loop.
     allowLoopbackForward(proxy);
     assert.match(await connectStatus(port, `127.0.0.1:${port}`), /^HTTP\/1\.1 403 /);
+  } finally {
+    proxy.close();
+  }
+});
+
+// ── CONNECT authority parsing ────────────────────────────────
+
+test('parseConnectAuthority normalizes the host and refuses what cannot be dialled', () => {
+  assert.deepEqual(parseConnectAuthority('api.anthropic.com:443'), { host: 'api.anthropic.com', port: 443 });
+  // Case and a root dot must not dodge hostMode's exact match into the blind tunnel.
+  assert.deepEqual(parseConnectAuthority('API.ANTHROPIC.COM:443'), { host: 'api.anthropic.com', port: 443 });
+  assert.deepEqual(parseConnectAuthority('api.anthropic.com.:443'), { host: 'api.anthropic.com', port: 443 });
+  assert.deepEqual(parseConnectAuthority('[::1]:8443'), { host: '::1', port: 8443 });
+  assert.deepEqual(parseConnectAuthority('example.org'), { host: 'example.org', port: 443 });
+  // An empty host used to be dialled as localhost.
+  for (const bad of [':443', '', undefined, 'host:0', 'host:65536', 'host:abc', '[::1', 'a:b:c', 'host/path:443', 'ho st:443', '[]:443']) {
+    assert.equal(parseConnectAuthority(bad), null, String(bad));
+  }
+});
+
+test('an unparseable CONNECT target gets a 400, and a differently-cased test host is still intercepted', async () => {
+  const { caCertPem } = await ensureCerts('api.anthropic.com');
+  const am = new AccountManager([{ name: 'k', type: 'apikey', apiKey: 'sk' }], 0.98);
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: 'https://api.anthropic.com' }, {});
+  const port = await listen(proxy);
+  try {
+    assert.match(await connectStatus(port, ':443'), /^HTTP\/1\.1 400 /);
+    assert.match(await connectStatus(port, 'example.org:0'), /^HTTP\/1\.1 400 /);
+    const sock = await connectTls(port, `${TEST_HOST.toUpperCase()}.:443`, caCertPem, TEST_HOST);
+    const resp = await httpOver(sock, TEST_HOST, '/upper');
+    assert.match(resp, /"teamclaude":"mitm-proxy-ok"/);
   } finally {
     proxy.close();
   }

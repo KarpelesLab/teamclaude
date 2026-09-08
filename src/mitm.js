@@ -123,6 +123,33 @@ export function hostMode(host, config) {
 }
 
 /**
+ * Parse a CONNECT request-target (authority-form, `host:port`) into
+ * { host, port }, or null when it is not one we will dial.
+ *
+ * A naive `split(':')` got every awkward spelling wrong, and each one landed
+ * on the blind tunnel: `[::1]:443` became host `[`; `:443` an empty host,
+ * which Node dials as localhost; `API.ANTHROPIC.COM:443` and
+ * `api.anthropic.com.:443` missed hostMode's exact match and were tunnelled
+ * instead of intercepted. So the host goes through the URL parser (lowercase,
+ * IDNA, character validation), a root dot is dropped, IPv6 brackets are
+ * removed, and an empty host or an out-of-range port is refused. The port
+ * defaults to 443 as before; authority-form nominally requires one, but
+ * refusing its absence would break nothing and help nobody.
+ */
+export function parseConnectAuthority(target) {
+  const m = /^(\[[^\]]*\]|[^:[\]/?#@\s]+)(?::(\d{1,5}))?$/.exec(String(target || ''));
+  if (!m) return null;
+  let host;
+  try { host = new URL(`http://${m[1]}`).hostname; } catch { return null; }
+  host = host.toLowerCase().replace(/\.$/, '');
+  if (host.startsWith('[') && host.endsWith(']')) host = host.slice(1, -1);
+  if (!host) return null;
+  const port = m[2] == null ? 443 : Number(m[2]);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+  return { host, port };
+}
+
+/**
  * Build a `connect` event handler implementing the terminating MITM described at
  * the top of this file.
  * @param ensureLeaf async () => { key, cert }   // current leaf PEMs
@@ -221,8 +248,12 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
       return;
     }
 
-    const [host, portStr] = (req.url || '').split(':');
-    const port = parseInt(portStr, 10) || 443;
+    const authority = parseConnectAuthority(req.url);
+    if (!authority) {
+      refuseRaw(clientSocket, '400 Bad Request');
+      return;
+    }
+    const { host, port } = authority;
     const mode = hostMode(host, config);
 
     if (mode === 'tunnel') {
