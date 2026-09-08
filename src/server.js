@@ -240,8 +240,8 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // this costs legitimate callers nothing. Deliberately not a content-type
       // requirement, which would also close the hole but would break the
       // documented `curl -X POST .../teamclaude/reload` that sends no body.
-      if (req.method === 'POST' && (req.url || '').startsWith('/teamclaude/')
-          && !isSameOriginControlRequest(req)) {
+      const crossOrigin = !isSameOriginControlRequest(req);
+      if (crossOrigin && req.method === 'POST' && (req.url || '').startsWith('/teamclaude/')) {
         res.writeHead(403, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           ok: false,
@@ -254,7 +254,45 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // proxying plain HTTP to some host. Account logic is only for hosts we
       // manage (the Anthropic upstream, which is HTTPS-only and never arrives
       // this way); forward anything else transparently instead of hijacking it.
+      // Dispatched BEFORE the loopback-only checks below: a page cannot make a
+      // browser emit an absolute-form request line, the relay injects no fleet
+      // credential, and its Host header names the TARGET, not this proxy.
       if (/^https?:\/\//i.test(req.url || '')) { relayHttpForward(req, res); return; }
+
+      // A request admitted ONLY by the loopback exemption — no valid key — is
+      // held to two more conditions. Both target the same actor: a web page in
+      // the operator's browser, whose requests are loopback-sourced too. A
+      // caller that presented a valid key has proven itself and skips both.
+      if (!auth.ok) {
+        // Cross-origin, for every method and path this time. The control-plane
+        // gate above covers its mutations, but the same no-cors trick reaches
+        // POST /v1/messages, where the proxy injects a fleet credential (a quota
+        // drain, with prompt content booked to the operator), and a GET of
+        // /teamclaude/status is unreadable to the page only for as long as no
+        // CORS header ever leaks. Same browser-set headers, same zero cost to
+        // curl, the CLI and Node clients, which send neither.
+        if (crossOrigin) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            type: 'error',
+            error: { type: 'permission_error', message: 'cross-origin request refused: a web page cannot use the proxy without a key' },
+          }));
+          return;
+        }
+        // DNS rebinding. A page at attacker.example whose name flips to
+        // 127.0.0.1 sends requests that are loopback-sourced AND same-origin as
+        // far as the browser can tell, and it can read the answers. What it
+        // cannot forge is the Host header, which the browser derives from its
+        // own URL bar — so a key-less loopback request must name this machine.
+        if (!isLocalHostHeader(req.headers.host ?? req.headers[':authority'], config.proxy?.host)) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            type: 'error',
+            error: { type: 'permission_error', message: 'request refused: the Host header does not name this proxy' },
+          }));
+          return;
+        }
+      }
 
       // Status endpoint
       if (req.method === 'GET' && req.url === '/teamclaude/status') {
@@ -437,6 +475,51 @@ export function isSameOriginControlRequest(req) {
   const site = req.headers['sec-fetch-site'];
   if (site) return site === 'same-origin' || site === 'none';
   return !req.headers.origin;
+}
+
+// Names a browser can reach this machine by. `::ffff:127.0.0.1` is how a
+// dual-stack listener reports loopback and is accepted for symmetry with
+// isLoopbackAddr, though no browser writes it in a URL.
+const LOCAL_HOSTNAMES = new Set(['localhost', '127.0.0.1', '::1', '::ffff:127.0.0.1']);
+// Binding to a wildcard says nothing about what name reaches us, so it does
+// not widen the set.
+const WILDCARD_BINDS = new Set(['0.0.0.0', '::', '']);
+
+// The hostname part of a Host header (or a bind address): port stripped, IPv6
+// brackets removed, lowercased. null when the value cannot be one.
+function hostnameOf(host) {
+  const h = String(host).trim().toLowerCase();
+  if (h.startsWith('[')) {
+    const end = h.indexOf(']');
+    return end < 0 ? null : h.slice(1, end);
+  }
+  // A bare IPv6 address (how config.proxy.host spells one) has several colons
+  // and no port to strip; a `name:port` has exactly one.
+  const colon = h.indexOf(':');
+  if (colon >= 0 && h.indexOf(':', colon + 1) >= 0) return h;
+  return colon >= 0 ? h.slice(0, colon) : h;
+}
+
+/**
+ * Whether a request's Host header names this proxy, for the DNS-rebinding
+ * check on key-less loopback requests.
+ *
+ * Accepted: localhost, 127.0.0.1, ::1 (bracketed or not), and the address the
+ * proxy is bound to (`config.proxy.host`) unless that is a wildcard. Port and
+ * case are ignored.
+ *
+ * A MISSING Host header is accepted. Only an HTTP/1.0 client can omit it (Node
+ * rejects an HTTP/1.1 request without one before this code runs), and no
+ * browser speaks HTTP/1.0 — while a hand-rolled local tool might. Refusing it
+ * would break that tool without closing anything.
+ */
+export function isLocalHostHeader(host, bindHost = null) {
+  if (host == null || host === '') return true;
+  const name = hostnameOf(host);
+  if (name == null) return false;
+  if (LOCAL_HOSTNAMES.has(name)) return true;
+  const bound = typeof bindHost === 'string' ? hostnameOf(bindHost) : null;
+  return bound != null && !WILDCARD_BINDS.has(bound) && bound === name;
 }
 
 // Read a control-endpoint body as text. Capped, unlike the proxied request path:
