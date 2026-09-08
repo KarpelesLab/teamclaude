@@ -14,6 +14,7 @@ import https from 'node:https';
 import { ReadableStream } from 'node:stream/web';
 import { tunnelTls } from './sx.js';
 import { proxyForHost, proxyAgent } from './upstream-proxy.js';
+import { AdmissionGate, DEFAULT_MAX_QUEUE, DEFAULT_QUEUE_TIMEOUT_MS } from './admission-gate.js';
 
 // Pooled keep-alive agents for the direct (non-sx) path. Node's global fetch
 // multiplexes ALL requests to an origin over a SINGLE HTTP/2 connection; under
@@ -26,7 +27,45 @@ import { proxyForHost, proxyAgent } from './upstream-proxy.js';
 // socket at TCP speed, exactly like N direct Claude Code processes. maxSockets is
 // per-origin and bounds the fan-out. Escape hatch:
 // TEAMCLAUDE_UPSTREAM_GLOBAL_FETCH=1 reverts to the old global-fetch path.
-const MAX_SOCKETS = Number(process.env.TEAMCLAUDE_UPSTREAM_MAX_SOCKETS) || 256;
+export const DEFAULT_UPSTREAM_MAX_SOCKETS = 256;
+const MAX_SOCKETS = positiveInt(process.env.TEAMCLAUDE_UPSTREAM_MAX_SOCKETS, DEFAULT_UPSTREAM_MAX_SOCKETS);
+
+// Admission in front of the pool. Node's Agent queues a request past
+// maxSockets internally, without bound and without a deadline, and destroying
+// a request parked in that queue need not surface an error until it is handed
+// a socket — so a client that had already gone away kept its (megabyte) body
+// retained until a long-lived stream ahead of it ended. Requests are admitted
+// here, per origin, BEFORE the ClientRequest exists: the queue is bounded
+// (TEAMCLAUDE_UPSTREAM_MAX_QUEUE), the wait is bounded
+// (TEAMCLAUDE_UPSTREAM_QUEUE_TIMEOUT_MS), and a caller whose signal aborts
+// leaves the queue immediately. A request the gate turns away fails with
+// TEAMCLAUDE_UPSTREAM_OVERLOADED, which server.js answers with a 503 and no
+// account rotation: the proxy is saturated, not the account. The limit is
+// MAX_SOCKETS itself, so an admitted request always finds a pooled socket
+// free (a permit is held until the response body ends or is dropped).
+export const DEFAULT_UPSTREAM_MAX_QUEUE = DEFAULT_MAX_QUEUE;
+export const DEFAULT_UPSTREAM_QUEUE_TIMEOUT_MS = DEFAULT_QUEUE_TIMEOUT_MS;
+const MAX_QUEUE = nonNegativeInt(process.env.TEAMCLAUDE_UPSTREAM_MAX_QUEUE, DEFAULT_UPSTREAM_MAX_QUEUE);
+const QUEUE_TIMEOUT_MS = positiveInt(process.env.TEAMCLAUDE_UPSTREAM_QUEUE_TIMEOUT_MS, DEFAULT_UPSTREAM_QUEUE_TIMEOUT_MS);
+const admissionByOrigin = new Map();
+
+// Counters only (no origins, no request data): for the status endpoint.
+export function upstreamPoolStatus() {
+  let active = 0, queued = 0;
+  for (const gate of admissionByOrigin.values()) { active += gate.active; queued += gate.queue.length; }
+  return { active, queued, origins: admissionByOrigin.size, perOriginLimit: MAX_SOCKETS, maxQueue: MAX_QUEUE, queueTimeoutMs: QUEUE_TIMEOUT_MS };
+}
+
+function positiveInt(value, fallback) {
+  const n = Number(value);
+  return Number.isSafeInteger(n) && n > 0 ? n : fallback;
+}
+
+function nonNegativeInt(value, fallback) {
+  if (value == null || value === '') return fallback;
+  const n = Number(value);
+  return Number.isSafeInteger(n) && n >= 0 ? n : fallback;
+}
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: MAX_SOCKETS });
 const httpAgent = new http.Agent({ keepAlive: true, maxSockets: MAX_SOCKETS });
 const USE_GLOBAL_FETCH = /^(1|true|yes|on)$/i.test(process.env.TEAMCLAUDE_UPSTREAM_GLOBAL_FETCH || '');
@@ -83,15 +122,18 @@ function headersTimeoutError(ms) {
 // then via sx after a 429). With it false, or sx unprovisioned, this is plain fetch
 // (plus the headers-timeout guard).
 export function upstreamFetch(url, opts = {}, sx = null, useProxy = false) {
-  const { headersTimeoutMs, ...fetchOpts } = opts;
+  const { headersTimeoutMs, queueTimeoutMs, ...fetchOpts } = opts;
   const timeoutMs = resolveHeadersTimeout(headersTimeoutMs);
-  if (sx && useProxy && sx.isProvisioned()) return proxiedFetch(url, fetchOpts, sx, timeoutMs);
+  // The admission wait is a per-call option of the node:http paths only; the
+  // global-fetch escape hatch is not gated (it has no socket pool to protect).
+  const nodeOpts = queueTimeoutMs == null ? fetchOpts : { ...fetchOpts, queueTimeoutMs };
+  if (sx && useProxy && sx.isProvisioned()) return proxiedFetch(url, nodeOpts, sx, timeoutMs);
   // The global-fetch escape hatch cannot speak CONNECT (that is why the tunnel
   // is hand-rolled at all), so an upstream proxy overrides it rather than being
   // silently dropped — on a host that needs the proxy, ignoring it means every
   // request fails.
   const useGlobal = USE_GLOBAL_FETCH && !proxyForHost(new URL(url).hostname);
-  return useGlobal ? directFetch(url, fetchOpts, timeoutMs) : pooledFetch(url, fetchOpts, timeoutMs);
+  return useGlobal ? directFetch(url, fetchOpts, timeoutMs) : pooledFetch(url, nodeOpts, timeoutMs);
 }
 
 /**
@@ -137,9 +179,19 @@ function directFetch(url, opts, timeoutMs) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(headersTimeoutError(timeoutMs)), timeoutMs);
   timer.unref?.();
+  // The caller's signal (the client went away) is relayed onto ours for the
+  // same pre-headers window as the timer, and detached with it: aborting an
+  // undici fetch mid-body is what leaks the zombie connections described
+  // above. Relayed by hand rather than with AbortSignal.any, which needs
+  // Node 20.3 while package.json admits 20.0.
+  const caller = opts.signal;
+  const relay = () => ctrl.abort(caller.reason);
+  if (caller?.aborted) relay();
+  else caller?.addEventListener?.('abort', relay, { once: true });
+  const settled = () => { clearTimeout(timer); caller?.removeEventListener?.('abort', relay); };
   return fetch(url, { ...opts, signal: ctrl.signal }).then(
-    (res) => { clearTimeout(timer); return res; },
-    (err) => { clearTimeout(timer); throw err; },
+    (res) => { settled(); return res; },
+    (err) => { settled(); throw err; },
   );
 }
 
@@ -168,12 +220,53 @@ function proxiedFetch(url, opts, sx, timeoutMs) {
 // minutes is never cut. `req` is created BEFORE the timer so a synchronous
 // throw (e.g. an invalid client header) can't leave a scheduled timer that later
 // fires against an uninitialized binding.
-function nodeRequest(u, opts, timeoutMs, { transport, agent }) {
+async function nodeRequest(u, opts, timeoutMs, { transport, agent }) {
+  // Admit before constructing the ClientRequest (see the admission comment at
+  // the top). A caller that is turned away, or whose signal aborts while it
+  // waits, never touches Node's Agent queue and drops its body right here.
+  let gate = admissionByOrigin.get(u.origin);
+  if (!gate) {
+    gate = new AdmissionGate(MAX_SOCKETS, MAX_QUEUE);
+    admissionByOrigin.set(u.origin, gate);
+  }
+  const forget = () => { if (!gate.active && !gate.queue.length && admissionByOrigin.get(u.origin) === gate) admissionByOrigin.delete(u.origin); };
+  const admitted = await gate.enter({ signal: opts.signal, timeoutMs: opts.queueTimeoutMs ?? QUEUE_TIMEOUT_MS });
+  if (!admitted) {
+    forget();
+    if (opts.signal?.aborted) throw opts.signal.reason ?? new Error('aborted');
+    const err = new Error(`upstream admission queue for ${u.origin} is full or its wait deadline passed`);
+    err.code = 'TEAMCLAUDE_UPSTREAM_OVERLOADED';
+    throw err;
+  }
+  // Idempotent: the permit is released on whichever of the response's end,
+  // close, error or the request's error comes first, and every path that can
+  // drop the response body unread destroys it (nodeToWeb's cancel), so a
+  // dropped body still closes and still releases.
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    gate.leave();
+    forget();
+  };
+  try {
+    return await sendNodeRequest(u, opts, timeoutMs, { transport, agent }, release);
+  } catch (err) { release(); throw err; }
+}
+
+function sendNodeRequest(u, opts, timeoutMs, { transport, agent }, release) {
   return new Promise((resolve, reject) => {
     const req = transport.request(
       u,
       { method: opts.method || 'GET', headers: opts.headers || {}, agent },
-      (res) => { clearTimeout(timer); cleanupAbort(); resolve(makeResponse(res)); },
+      (res) => {
+        clearTimeout(timer);
+        const finish = () => { cleanupAbort(); release(); };
+        res.once('end', finish);
+        res.once('close', finish);
+        res.once('error', finish);
+        resolve(makeResponse(res));
+      },
     );
     const timer = setTimeout(() => req.destroy(headersTimeoutError(timeoutMs)), timeoutMs);
     timer.unref?.();
@@ -181,15 +274,20 @@ function nodeRequest(u, opts, timeoutMs, { transport, agent }) {
     // Honour an AbortSignal the way fetch does. Callers that already guard a
     // hung call this way (oauth's refresh timeout, which otherwise wedges every
     // request for that account) must keep working when the call is tunneled.
+    // The listener stays attached through the body: unlike undici, destroying
+    // a node:http request mid-body tears the socket down cleanly, and a client
+    // that leaves mid-stream should not keep the upstream socket (and its
+    // permit) busy until the body-idle watchdog fires.
     const signal = opts.signal;
     const onAbort = () => req.destroy(signal?.reason ?? new Error('aborted'));
     const cleanupAbort = () => signal?.removeEventListener?.('abort', onAbort);
+    // Registered before the aborted check below: a synchronous req.destroy()
+    // there must find its error listener in place.
+    req.once('error', (err) => { clearTimeout(timer); cleanupAbort(); release(); reject(err); });
     if (signal) {
       if (signal.aborted) { clearTimeout(timer); req.destroy(); reject(signal.reason ?? new Error('aborted')); return; }
       signal.addEventListener?.('abort', onAbort, { once: true });
     }
-
-    req.once('error', (err) => { clearTimeout(timer); cleanupAbort(); reject(err); });
 
     const body = opts.body;
     const method = (opts.method || 'GET').toUpperCase();
