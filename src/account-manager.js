@@ -658,8 +658,9 @@ export class AccountManager {
     // one provider that is a single slot for several fleets, so a request whose
     // provider does not own it borrows the slot for the walk and hands it back.
     //
-    // With one provider — every config that predates #246 — `borrowed` is always
-    // false and this is the same code it was.
+    // With one provider `borrowed` is always false, so the cursor recorded below
+    // has no reader at all. Its one reader is the re-seed above, which only a
+    // borrowed walk reaches.
     const owner = providerOf(this.accounts[this.currentIndex]);
     const borrowed = !!this.accounts.length && owner !== provider;
     const saved = this.currentIndex;
@@ -686,7 +687,7 @@ export class AccountManager {
     } finally {
       this._selectingProvider = null;
       this._selectionDecision = null;
-      if (borrowed) walked = this.currentIndex;
+      walked = this.currentIndex;
       // Hand the slot back before anything can observe it moved. Only the
       // provider that owns currentIndex gets to change it.
       if (borrowed) this.currentIndex = saved;
@@ -698,11 +699,13 @@ export class AccountManager {
     // the next real failover unpaced.
     if (account) {
       this.routeCursors.set(this._cursorKey(model, advisorModel, provider), account.index);
-      // A borrowed walk leaves the switch it spent in currentIndex, captured
-      // above as `walked` while the slot still holds it. A pinned return moves
-      // that slot nowhere, so `walked` names the foreign owner instead: falling
-      // back to the account that served keeps this provider from resting on no
-      // cursor at all.
+      // `walked` names where this walk left the shared slot, captured above
+      // while it still held it. When it names one of this provider's own
+      // accounts — including a borrow that re-seeded and then held its slot —
+      // the cursor takes it. When the slot ends on another provider's account,
+      // which is typically a borrowed pinned return on a provider with no cursor
+      // to re-seed from, falling back to the account that served keeps this
+      // provider from resting on no cursor at all.
       const rest = walked != null && providerOf(this.accounts[walked]) === provider
         ? walked : account.index;
       if (providerOf(this.accounts[rest]) === provider) this.providerCursors.set(provider, rest);

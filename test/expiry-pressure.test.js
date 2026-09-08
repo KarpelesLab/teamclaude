@@ -750,7 +750,7 @@ test('a route pin\'s borrowed walk records the switch the same way a session\'s 
     'the request behind the pinned one did not find the fleet where the switch left it');
 });
 
-test('a single-provider fleet\'s switch is recorded exactly as it was', () => {
+test('a single-provider fleet records the switch its own walk spent', () => {
   const am = f1({ expiry: ON, distributeSessions: true, routes: [] }, false);
   const ixOf = name => am.accounts.findIndex(a => a.name === name);
   am.providerCursors.set(DEFAULT_PROVIDER, ixOf('cur'));
@@ -760,8 +760,10 @@ test('a single-provider fleet\'s switch is recorded exactly as it was', () => {
   assert.equal(served.name, 'P', 'the session pin must serve this request, or the arm tests nothing');
   assert.equal(am.accounts[am.currentIndex].name, 'R',
     'the one fleet in the config lost the switch its own walk spent');
-  assert.equal(am.accounts[am.providerCursors.get(DEFAULT_PROVIDER)]?.name, 'P',
-    'the pinned request moved the single-provider cursor off the account that served it');
+  // This arm holds the ungated capture: with one provider the walk still
+  // records where it left the slot, so re-gating that capture reds this arm.
+  assert.equal(am.accounts[am.providerCursors.get(DEFAULT_PROVIDER)]?.name, 'R',
+    'the single-provider walk lost the switch it spent to the account the pin served');
   assert.equal(am.getActiveAccount(null, OPUS).name, 'R',
     'the request behind the pinned one did not find the fleet where the switch left it');
   assert.equal(am.accounts[am.providerCursors.get(DEFAULT_PROVIDER)]?.name, 'R',
@@ -779,6 +781,34 @@ test('two providers and no pin at all still persist the switch', () => {
     'a borrowed walk that returned the destination still lost it');
   assert.equal(am.getActiveAccount(null, OPUS).name, 'R',
     'the request behind it did not find the fleet where the switch left it');
+});
+
+// The non-borrowed twin of the arm above: `cur` is a default-provider account
+// at index 0, so this request owns `currentIndex` and never borrows the slot.
+test('a pinned walk that owns the slot records the switch it spent there', () => {
+  const am = mgr([oauth('cur'), oauth('R'), oauth('P'), oauth('codex', { provider: 'codex' })],
+    { expiry: ON, distributeSessions: true, routes: [] });
+  const ixOf = name => am.accounts.findIndex(a => a.name === name);
+  bucket(am, ixOf('cur'), 'unified7d', 0.50, 100);
+  bucket(am, ixOf('R'), 'unified7d', 0.10, 10);
+  bucket(am, ixOf('P'), 'unified7d', 0.50, 50);
+  bucket(am, ixOf('codex'), 'unified7d', 0.00, 1);
+  am.accounts[ixOf('R')].quota.unified5h = 0.5;
+  am.accounts[ixOf('R')].quota.unified5hReset = Date.now() - 1000;
+  am.providerCursors.set(DEFAULT_PROVIDER, ixOf('cur'));
+
+  am.recordSession('S-3', ixOf('P'), OPUS);
+  const served = am.getActiveAccount(null, OPUS, null, 'S-3', DEFAULT_PROVIDER);
+  assert.equal(served.name, 'P', 'the session pin must serve this request, or the arm tests nothing');
+  assert.equal(am.accounts[am.currentIndex].name, 'R',
+    'the walk must leave its own slot on the reset switch, or the arm tests nothing');
+  assert.equal(am.accounts[am.providerCursors.get(DEFAULT_PROVIDER)]?.name, 'R',
+    'a walk holding its own slot recorded the pin over the switch it spent');
+  // The slot changes hands, which is what makes the record readable: the
+  // request behind this one borrows and re-seeds from the cursor.
+  am.setCurrentAccount(ixOf('codex'));
+  assert.equal(am.getActiveAccount(null, OPUS).name, 'R',
+    'the request after the slot changed hands did not find the fleet where the switch left it');
 });
 
 // The value guard's two faces. No account has a pending reset here, and the
