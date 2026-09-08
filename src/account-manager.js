@@ -8,6 +8,7 @@ import { SessionTracker } from './session-tracker.js';
 import { buildQuotaSummary } from './quota-summary.js';
 import { ROLLOVER_MIN_JUMP_MS, remapHeld } from './rollover.js';
 import { decideBand, pressureOf, pressureRank, assertNever } from './band-decision.js';
+import { safeLine } from './safe-text.js';
 
 // Re-exported for callers that import these model helpers from here.
 export { isFableModel, parseRequestModel, parseAdvisorModel } from './model.js';
@@ -22,6 +23,26 @@ const FORCED_REFRESH_FLOOR_MS = 10_000;
 // members to serve, then re-admit it so an administrator's policy change is
 // discovered without a restart.
 const ENTITLEMENT_DENIAL_COOLDOWN_SECONDS = 5 * 60;
+
+// Codex model-scoped weekly buckets are keyed by slugs taken from response
+// header NAMES, so the table needs a ceiling an upstream cannot talk past.
+const MAX_CODEX_MODEL_BUCKETS = 32;
+
+// An `anthropic-ratelimit-*-reset` header (epoch seconds) as ms, or null when
+// it is not a positive finite number. Never NaN: see updateQuota.
+function resetHeaderMs(value) {
+  if (value == null || value === '') return null;
+  const seconds = parseInt(value, 10);
+  return Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : null;
+}
+
+// An RFC 3339 reset header, stripped and bounded, or null when it does not
+// name a moment in time.
+function resetTimestamp(value) {
+  if (value == null || value === '') return null;
+  const text = safeLine(value, 64);
+  return Number.isFinite(new Date(text).getTime()) ? text : null;
+}
 
 // Fallback when a per-bucket threshold table names neither the bucket nor a
 // `default` — the same value the single-number form has always used.
@@ -692,7 +713,9 @@ export class AccountManager {
       // Throttled so a busy advisor session doesn't flood the activity log.
       if (Date.now() >= (this._advisorDegradeLogAt || 0)) {
         this._advisorDegradeLogAt = Date.now() + 60_000;
-        console.log(`[TeamClaude] No account eligible for advisor model "${advisorModel}" — routing by request model only`);
+        // The model names come out of the client's request body, so they are
+        // stripped before reaching the log (see safe-text.js).
+        console.log(`[TeamClaude] No account eligible for advisor model "${safeLine(advisorModel, 64)}" — routing by request model only`);
       }
     }
     return this._select(exclude, model, null, true);
@@ -2550,7 +2573,7 @@ export class AccountManager {
       if (switched) {
         this._beginRamp(best);
         console.log(scoped
-          ? `[TeamClaude] Diverting "${model}" to "${best.name}" — "${current.name}" cannot serve it`
+          ? `[TeamClaude] Diverting "${safeLine(model, 64)}" to "${best.name}" — "${current.name}" cannot serve it`
           : `[TeamClaude] Switched to account "${best.name}"`);
       }
       return best;
@@ -2606,8 +2629,10 @@ export class AccountManager {
    */
   _updateCodexQuota(account, headers) {
     const parsed = parseCodexQuota(headers);
+    // Header-derived strings are rendered into status and logs, so they are
+    // stripped and bounded here rather than trusted from a third-party upstream.
     const plan = parseCodexPlanType(headers);
-    if (plan) account.quota.planType = plan;
+    if (plan) account.quota.planType = safeLine(plan, 64);
 
     if (parsed.unified5h != null) account.quota.unified5h = parsed.unified5h;
     if (parsed.unified7d != null) account.quota.unified7d = parsed.unified7d;
@@ -2618,9 +2643,22 @@ export class AccountManager {
     // Fable bucket: it rides only on responses for that model, so stamp when
     // the reading was taken. That timestamp is what lets a spent bucket be
     // revalidated instead of sealing the account out of the family forever.
+    //
+    // The slugs are header NAMES, so an upstream can mint as many as it likes;
+    // a response never legitimately names more than a handful of families, so
+    // the table is capped and the reading not refreshed longest ago makes room.
+    const buckets = (account.quota.codexModelBuckets ??= {});
     for (const bucket of parsed.modelBuckets || []) {
-      (account.quota.codexModelBuckets ??= {})[bucket.slug] = {
-        name: bucket.name,
+      const slug = safeLine(bucket.slug, 64);
+      if (!slug) continue;
+      if (!(slug in buckets)) {
+        while (Object.keys(buckets).length >= MAX_CODEX_MODEL_BUCKETS) {
+          const stalest = Object.entries(buckets).sort((a, b) => a[1].seenAt - b[1].seenAt)[0][0];
+          delete buckets[stalest];
+        }
+      }
+      buckets[slug] = {
+        name: safeLine(bucket.name, 64),
         utilization: bucket.utilization,
         resetAt: bucket.resetAt,
         seenAt: Date.now(),
@@ -2663,10 +2701,14 @@ export class AccountManager {
     if (!isNaN(u5h)) account.quota.unified5h = u5h;
     if (!isNaN(u7d)) account.quota.unified7d = u7d;
 
-    const r5h = headers['anthropic-ratelimit-unified-5h-reset'];
-    const r7d = headers['anthropic-ratelimit-unified-7d-reset'];
-    if (r5h) account.quota.unified5hReset = parseInt(r5h, 10) * 1000;
-    if (r7d) account.quota.unified7dReset = parseInt(r7d, 10) * 1000;
+    // A reset that does not parse is treated as absent, never stored: parseInt
+    // of a non-numeric value is NaN, and `now >= NaN` is false forever, so a
+    // NaN reset would leave the bucket unclearable and park the account until
+    // the next valid response (a third-party upstream can send anything here).
+    const r5h = resetHeaderMs(headers['anthropic-ratelimit-unified-5h-reset']);
+    const r7d = resetHeaderMs(headers['anthropic-ratelimit-unified-7d-reset']);
+    if (r5h != null) account.quota.unified5hReset = r5h;
+    if (r7d != null) account.quota.unified7dReset = r7d;
 
     // Model-scoped weekly bucket — surfaced in headers as `7d_oi` ("7-day,
     // overage included"). On current subscription plans this is the Fable weekly
@@ -2680,8 +2722,8 @@ export class AccountManager {
       account.quota.unified7dFable = u7dOi;
       account.quota.unified7dFableSeenAt = Date.now();
     }
-    const r7dOi = headers['anthropic-ratelimit-unified-7d_oi-reset'];
-    if (r7dOi) account.quota.unified7dFableReset = parseInt(r7dOi, 10) * 1000;
+    const r7dOi = resetHeaderMs(headers['anthropic-ratelimit-unified-7d_oi-reset']);
+    if (r7dOi != null) account.quota.unified7dFableReset = r7dOi;
 
     // We switched to this account to discover its weekly quota; now that we
     // know it, flag for re-evaluation so selection can pick the best account.
@@ -2706,7 +2748,9 @@ export class AccountManager {
       const s5h = headers['anthropic-ratelimit-unified-5h-status'];
       const s7d = headers['anthropic-ratelimit-unified-7d-status'];
       const sharedSaidAllowed = (s5h || s7d) && s5h !== 'rejected' && s7d !== 'rejected';
-      account.quota.unifiedStatus = uStatus === 'rejected' && sharedSaidAllowed ? 'allowed' : uStatus;
+      // Rendered into status output, so stripped and bounded like every other
+      // header-derived string.
+      account.quota.unifiedStatus = uStatus === 'rejected' && sharedSaidAllowed ? 'allowed' : safeLine(uStatus, 32);
       account.quota.unifiedStatusSeenAt = Date.now();
     }
 
@@ -2723,8 +2767,11 @@ export class AccountManager {
     if (!isNaN(requestsLimit)) account.quota.requestsLimit = requestsLimit;
     if (!isNaN(requestsRemaining)) account.quota.requestsRemaining = requestsRemaining;
 
-    if (tokensReset) account.quota.resetsAt = tokensReset;
-    else if (requestsReset) account.quota.resetsAt = requestsReset;
+    // Kept as the RFC 3339 string upstream sent (status renders it), but only
+    // one that parses: _clearExpiredQuotas compares `new Date(resetsAt)`, and an
+    // unparseable value would never compare true and never clear.
+    const resetsAt = resetTimestamp(tokensReset) ?? resetTimestamp(requestsReset);
+    if (resetsAt != null) account.quota.resetsAt = resetsAt;
 
     account.usage.totalRequests++;
     account.usage.lastUsed = new Date().toISOString();
