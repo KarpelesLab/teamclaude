@@ -771,8 +771,10 @@ export function startCallbackServer(expectedState) {
 
 function openBrowser(url) {
   const platform = process.platform;
+  // `start` takes its first quoted argument as the window title, so the URL
+  // needs an empty title in front of it or the browser never opens.
   const cmd = platform === 'darwin' ? 'open'
-    : platform === 'win32' ? 'start'
+    : platform === 'win32' ? 'start ""'
     : 'xdg-open';
   exec(`${cmd} ${JSON.stringify(url)}`, () => {});
 }

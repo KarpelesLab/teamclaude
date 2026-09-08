@@ -177,8 +177,10 @@ export function credentialsFromTokenResponse(data) {
 }
 
 function openBrowser(url) {
+  // `start` takes its first quoted argument as the window title, so the URL
+  // needs an empty title in front of it or the browser never opens.
   const cmd = process.platform === 'darwin' ? 'open'
-    : process.platform === 'win32' ? 'start'
+    : process.platform === 'win32' ? 'start ""'
       : 'xdg-open';
   exec(`${cmd} ${JSON.stringify(url)}`, () => {});
 }
