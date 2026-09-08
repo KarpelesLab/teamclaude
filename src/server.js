@@ -1781,10 +1781,27 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // and out-of-range values are bounded to [1, 300]. A negative value would
       // otherwise bypass the wait cap — setTimeout returns immediately and a
       // pause/hold would be armed in the past.
-      let retryAfter = parseInt(upstreamRes.headers.get('retry-after'), 10);
+      const retryAfterHeader = upstreamRes.headers.get('retry-after');
+      let retryAfter = parseInt(retryAfterHeader, 10);
       if (Number.isNaN(retryAfter)) retryAfter = 60;
-      // Discard the 429 response body
-      await upstreamRes.body?.cancel();
+      // A 429 that says nothing about the account — no retry-after, no
+      // anthropic-ratelimit-* — is about the REQUEST: a model id upstream
+      // refuses, a shape it will not take. Neither of the account-level
+      // responses below applies to it. Pausing the account made every other
+      // session on it wait out a fabricated 60s for one client's bad model id,
+      // and the inline wait then held that client for the same 60s per attempt;
+      // together they turned one request's problem into a fleet-wide stall
+      // (#288). A throttle, by contrast, always carries the headers.
+      const requestScoped = retryAfterHeader == null && Object.keys(rateLimitHeaders).length === 0;
+      // The body is diagnostic for a request-scoped refusal (it names the
+      // reason) and noise otherwise.
+      let refusal = '';
+      if (requestScoped) {
+        const raw = await readErrorBody(upstreamRes.body).catch(() => null);
+        try { refusal = raw ? String(JSON.parse(raw.toString('utf8'))?.error?.message || '') : ''; } catch { refusal = ''; }
+      } else {
+        await upstreamRes.body?.cancel();
+      }
 
       // Durable quota exhaustion vs. a transient rate limit. A "rejected" unified
       // status means a quota bucket is spent, so waiting and retrying the SAME
@@ -1818,7 +1835,11 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // wait (a fresh IP isn't throttled). Also arm the sticky window for MITM.
       const nextUseSx = !!(sx?.useOn429());
       const switchingToSx = nextUseSx && !route;
-      sx?.noteRateLimited(retryAfter);
+      // The sticky window routes every new MITM tunnel through sx.org for a
+      // while, which is metered. A request-scoped 429 is not an IP limit, so it
+      // does not arm it; the one-shot sx retry below still runs, in case an
+      // IP-scoped limit ever presents without headers.
+      if (!requestScoped) sx?.noteRateLimited(retryAfter);
 
       // This is a rate-limit 429 (per-minute throttle), NOT quota exhaustion —
       // quota rejection is handled above and is the only thing that rotates.
@@ -1828,7 +1849,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // (capped, then released through a fresh ramp) instead of piling on, and
       // retry the SAME account. The pause never marks the account throttled, so
       // selection keeps choosing it.
-      accountManager.pauseAccount(account.index, Math.min(retryAfter, RATE_LIMIT_ABSORB_MAX_SECONDS));
+      // Not for a request-scoped 429: the account is fine, and the pause is
+      // exactly the fleet-wide stall #288 describes.
+      if (!requestScoped) accountManager.pauseAccount(account.index, Math.min(retryAfter, RATE_LIMIT_ABSORB_MAX_SECONDS));
 
       // ONE bounded failover hop to an idle sibling (#137, #165, #156).
       //
@@ -1871,6 +1894,11 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
           if (clientGone(res)) { ctx.abandoned = true; return; }
           return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
         }
+      } else if (ctx.rateLimitHopped && requestScoped) {
+        // Second headerless 429, on a different account: it followed the
+        // request. Nothing here is about either account.
+        console.log(`[TeamClaude] 429 followed the request onto "${account.name}" with no rate-limit headers — it is about the request, not the accounts; returning it to the client`
+          + (refusal ? ` (${safeLine(refusal)})` : ''));
       } else if (ctx.rateLimitHopped) {
         // Second 429 this request, on a different account. Say so once: the
         // operator chasing "why is my fleet throttled" is looking for exactly
@@ -1886,6 +1914,30 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         console.log(`[TeamClaude] 429 on "${account.name}" — retrying via sx.org (fresh egress IP)`);
         if (clientGone(res)) { ctx.abandoned = true; return; }
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, nextUseSx);
+      }
+
+      // A request-scoped 429 goes back to the client now. The hop above (and
+      // the sx retry, for the IP-scoped case that might present the same way)
+      // has had its chance; a second account saying the same thing about the
+      // same request is the answer, and waiting a fabricated 60s to hear it a
+      // third time is the other half of #288. With no sibling to hop to, one
+      // short retry covers a momentary blip, and then it is the client's turn.
+      if (requestScoped) {
+        if (!ctx.rateLimitHopped && !ctx.requestScopedRetried && retryCount < maxRetries) {
+          ctx.requestScopedRetried = true;
+          console.log(`[TeamClaude] 429 with no rate-limit headers on "${account.name}" — retrying once in 2s${refusal ? ` (${safeLine(refusal)})` : ''}`);
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          if (clientGone(res)) { ctx.abandoned = true; return; }
+          return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, nextUseSx);
+        }
+        ctx.status = 429;
+        if (!res.headersSent && !clientGone(res)) {
+          // No retry-after: upstream gave none, and inventing one would tell the
+          // client to wait for a limit that does not exist. Its own backoff applies.
+          res.writeHead(429, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: refusal || 'Upstream refused this request (429) without rate-limit headers.' } }));
+        }
+        return;
       }
 
       // Absorb short waits inline on the same account — the client never sees the

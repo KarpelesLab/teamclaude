@@ -26,6 +26,7 @@ Reacting the wrong way to either one makes things worse, so they are handled sep
 
 - A **quota rejection** (a spent 5h or weekly bucket, `unified-…-status: rejected`) switches accounts immediately.
 - A **rate-limit 429** (the per-minute throttle) does **not** switch. It pauses the account so concurrent requests wait instead of flooding, retries the same account (absorbing short `retry-after`s inline, default ≤ 60s via `TEAMCLAUDE_RATE_LIMIT_ABSORB_MAX_SECONDS`), and only surfaces a 429 to the client for longer waits.
+- A **request-scoped 429** — no `retry-after` and no `anthropic-ratelimit-*` headers at all, which is how upstream refuses a model id it will not serve — is about the request, not the account. Nothing is paused. The request gets the same one hop to an idle sibling (or, with no sibling, one retry after 2s); if the answer is the same, the 429 goes back to the client without a fabricated `retry-after`, and the client's own backoff applies.
 
 Rotating on a rate-limit 429 would just move the burst to the next account and throw away the first account's prompt cache.
 
