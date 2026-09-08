@@ -1263,6 +1263,14 @@ test('path 3: the knob-off refresh reads no account at all', () => {
     'the knob-off refresh read an account and cleared its throttle');
   assert.equal(am.accounts[1].rateLimitedUntil, past,
     'the knob-off refresh read an account and dropped its rate-limit clock');
+
+  // With no advisor model the guard's advisor term stops the scan on its own, so
+  // the same call carrying one leaves the disabled scope as the only term left.
+  am.refreshExpiredQuotas(null, null, FABLE);
+  assert.equal(am.accounts[1].status, 'throttled',
+    'the knob-off refresh carrying an advisor model read an account and cleared its throttle');
+  assert.equal(am.accounts[1].rateLimitedUntil, past,
+    'the knob-off refresh carrying an advisor model read an account and dropped its rate-limit clock');
 });
 
 test('path 3 still switches when the sooner-resetting account is the better one', () => {
