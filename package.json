@@ -1,7 +1,7 @@
 {
   "name": "@karpeleslab/teamclaude",
   "version": "1.1.16",
-  "description": "Multi-account Claude proxy with automatic quota-based rotation",
+  "description": "Multi-account proxy for Claude Code and Codex: pools Claude Max, ChatGPT/Codex, API-key and third-party backend accounts, and rotates on quota",
   "type": "module",
   "main": "src/index.js",
   "bin": {
@@ -18,9 +18,17 @@
   "keywords": [
     "claude",
     "anthropic",
+    "claude-code",
+    "codex",
+    "openai",
+    "chatgpt",
+    "deepseek",
     "proxy",
     "load-balancer",
-    "multi-account"
+    "multi-account",
+    "quota",
+    "rate-limiting",
+    "cli"
   ],
   "license": "MIT",
   "repository": {

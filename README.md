@@ -5,9 +5,9 @@
 [![node](https://img.shields.io/node/v/@karpeleslab/teamclaude.svg)](https://nodejs.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Multi-account Claude proxy with automatic quota-based rotation for [Claude Code](https://claude.ai/claude-code).
+Multi-account proxy for [Claude Code](https://claude.ai/claude-code) and [Codex](https://github.com/openai/codex): it pools Claude Max, ChatGPT/Codex, API-key and third-party backend accounts, and rotates on quota.
 
-It sits between Claude Code and the Anthropic API, holds several Claude Max (or API key) accounts, and moves to the next one when the current account gets close to its session or weekly limit. The session keeps running instead of stopping on a 429.
+It sits between the coding agent and the provider's API, holds several accounts, and moves to the next one when the current account gets close to its session or weekly limit. The session keeps running instead of stopping on a 429. Claude accounts serve Claude Code, Codex accounts serve the Codex CLI, and both pools share one proxy.
 
 ![TeamClaude TUI](screenshots/teamclaude.png)
 
@@ -35,6 +35,7 @@ Already logged into Claude Code? `teamclaude import` takes its credentials inste
 - Catches hardcoded `api.anthropic.com` endpoints (the Claude Design MCP, for one) through a local MITM forward proxy, not only what `ANTHROPIC_BASE_URL` covers.
 - Holds the request open until quota resets instead of returning 429 when every account is spent, so an unattended run finishes on its own (`holdSeconds`, off by default).
 - Refreshes OAuth tokens before they expire and writes them back to config. Client refreshes pass through untouched.
+- Pools OpenAI Codex subscriptions alongside Claude accounts (experimental): the Codex CLI is routed through the same proxy, by config or transparently through the MITM proxy, and rotates on its own quota.
 - Takes any Anthropic-compatible API (DeepSeek, GLM) as a low-priority fallback for when the Claude accounts are done.
 - No dependencies. Node built-ins only.
 
@@ -71,7 +72,7 @@ Step-by-step lifecycle: [docs/routing.md](docs/routing.md#request-lifecycle).
 
 | Page | Contents |
 | --- | --- |
-| [Accounts](docs/accounts.md) | OAuth login, import, API keys, multiple orgs, third-party backends |
+| [Accounts](docs/accounts.md) | OAuth login, import, API keys, multiple orgs, Codex accounts, third-party backends |
 | [Usage](docs/usage.md) | Server and TUI, running Claude Code, shell alias, command reference, logging |
 | [Routing](docs/routing.md) | Rotation, the two kinds of 429, storm control, model routes, session spreading, pinning, prompt cache |
 | [Quota](docs/quota.md) | Quota probe, keep-warm, holding on exhaustion |
