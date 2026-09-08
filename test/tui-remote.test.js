@@ -724,3 +724,41 @@ test('an error reason off the wire is stripped and clamped', async (t) => {
     return /^no such account/.test(err.message);
   });
 });
+
+// ── reply size ───────────────────────────────────────────────
+
+// The poller runs every second against whatever listens on the configured
+// port. A status payload is a few KiB; a body that is not must not be buffered
+// whole, whether it announces its size or streams it.
+test('a reply that declares itself oversized is refused before it is read', async (t) => {
+  const { control } = await makeSession(t, {
+    routes: {
+      'GET /teamclaude/status': (req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': String(2 * 1024 * 1024) });
+        res.write('{"accounts":[');   // never finishes; the client must not wait for it
+      },
+    },
+  });
+  await assert.rejects(() => control.status(), /too large/);
+});
+
+test('a chunked reply is abandoned once it passes the cap', async (t) => {
+  const { control } = await makeSession(t, {
+    routes: {
+      'GET /teamclaude/status': (req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });   // chunked: no length
+        const chunk = 'x'.repeat(64 * 1024);
+        for (let i = 0; i < 24; i++) res.write(chunk);   // 1.5 MiB
+        res.end(']');
+      },
+    },
+  });
+  await assert.rejects(() => control.status(), /too large/);
+});
+
+test('a reply under the cap is read whole', async (t) => {
+  const big = statusFixture({ note: 'y'.repeat(200 * 1024) });
+  const { control } = await makeSession(t, { routes: { 'GET /teamclaude/status': json(big) } });
+  const status = await control.status();
+  assert.equal(status.note.length, 200 * 1024);
+});

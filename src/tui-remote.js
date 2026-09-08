@@ -116,7 +116,7 @@ export class RemoteControl {
       }
       throw err;
     }
-    const raw = await res.text();
+    const raw = await readReply(res);
     let payload = null;
     try { payload = raw ? JSON.parse(raw) : null; } catch { /* not JSON — the status carries the meaning */ }
 
@@ -143,6 +143,35 @@ export class RemoteControl {
     if (payload && payload.ok === false) throw new Error(text(payload.error, 200, 'request rejected'));
     return payload;
   }
+}
+
+/**
+ * The reply body as text, refused past MAX_REPLY_BYTES. A declared length over
+ * the cap is refused before a byte is read; an undeclared (chunked) body is
+ * read off the stream and abandoned the moment it passes the cap, so a wedged
+ * or hostile listener on the port cannot make the poller buffer it whole.
+ * A reply without a stream (a test double, a bodiless response) reads as text.
+ */
+async function readReply(res) {
+  const declared = Number(res.headers?.get?.('content-length'));
+  if (Number.isFinite(declared) && declared > MAX_REPLY_BYTES) {
+    throw new Error(`reply too large (${declared} bytes)`);
+  }
+  if (typeof res.body?.getReader !== 'function') return res.text();
+  const reader = res.body.getReader();
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > MAX_REPLY_BYTES) {
+      reader.cancel().catch(() => {});
+      throw new Error(`reply too large (over ${MAX_REPLY_BYTES} bytes)`);
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks).toString('utf8');
 }
 
 /**
