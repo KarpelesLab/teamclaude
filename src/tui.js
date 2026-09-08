@@ -386,6 +386,15 @@ function cleanRequestInfo(info) {
   return out;
 }
 
+// A stored key, shown enough to recognise and no more. First-4/last-4 on a key
+// of eight characters or fewer is the whole key; a short one shows its tail only.
+export function maskKey(key) {
+  const k = String(key);
+  if (k.length <= 4) return '****';
+  if (k.length < 12) return `…${k.slice(-4)}`;
+  return `${k.slice(0, 4)}…${k.slice(-4)}`;
+}
+
 function timestamp() {
   return new Date().toLocaleTimeString('en-US', { hour12: false });
 }
@@ -434,6 +443,7 @@ export class TUI {
     this.inputPrompt = '';
     this.inputBuf = '';
     this.inputCb = null;
+    this.inputSecret = false;    // a key is being typed: the footer echoes * for each char
     this.inputReturn = 'normal'; // mode to fall back to when an input is cancelled
     this.frame = 0;
     this.running = false;
@@ -790,10 +800,9 @@ export class TUI {
         label: 'sx.org API key',
         hint: 'Enter to set',
         value: () => {
-          const key = this.config.sx?.apiKey;
-          return key ? key.slice(0, 4) + '…' + key.slice(-4) : dim('(not set)');
+          return this.config.sx?.apiKey ? maskKey(this.config.sx.apiKey) : dim('(not set)');
         },
-        enter: () => this._promptInput('sx.org API key', v => this._doSetSxKey(v.trim())),
+        enter: () => this._promptInput('sx.org API key', v => this._doSetSxKey(v.trim()), { secret: true }),
       });
 
       if (this.config.sx?.apiKey) {
@@ -825,11 +834,14 @@ export class TUI {
   }
 
   // Open the text-input prompt and return to the settings screen afterward.
-  _promptInput(prompt, cb) {
+  // `secret` masks the echo — the footer is on screen for as long as a key is
+  // being typed, and a terminal is the one thing a screen-share always shows.
+  _promptInput(prompt, cb, { secret = false } = {}) {
     this.mode = 'input';
     this.inputReturn = 'settings';
     this.inputPrompt = prompt;
     this.inputBuf = '';
+    this.inputSecret = secret;
     this.inputCb = v => { if (v) cb(v); };
   }
 
@@ -1003,6 +1015,7 @@ export class TUI {
       this.inputReturn = 'settings';
       this.inputPrompt = 'API key';
       this.inputBuf = '';
+      this.inputSecret = true;
       this.inputCb = v => { if (v) this._doAddKey(v); };
     }
     else if (k === 'esc' || k === 'q') { this.mode = 'settings'; }
@@ -1012,10 +1025,10 @@ export class TUI {
     if (k === 'enter') {
       const cb = this.inputCb;
       const v = this.inputBuf;
-      this.mode = this.inputReturn; this.inputCb = null; this.inputBuf = '';
+      this.mode = this.inputReturn; this.inputCb = null; this.inputBuf = ''; this.inputSecret = false;
       cb?.(v);
     }
-    else if (k === 'esc') { this.mode = this.inputReturn; this.inputCb = null; this.inputBuf = ''; }
+    else if (k === 'esc') { this.mode = this.inputReturn; this.inputCb = null; this.inputBuf = ''; this.inputSecret = false; }
     else if (k === 'bs') { this.inputBuf = this.inputBuf.slice(0, -1); }
     else if (k.length === 1) { this.inputBuf += k; }
   }
@@ -2072,7 +2085,7 @@ export class TUI {
       case 'add':
         return ` ${bold('i')}mport Claude Code  ${bold('k')} API key  ${bold('Esc')} cancel`;
       case 'input':
-        return ` ${this.inputPrompt}: ${this.inputBuf}█`;
+        return ` ${this.inputPrompt}: ${this.inputSecret ? '*'.repeat(this.inputBuf.length) : this.inputBuf}█`;
       default:
         return '';
     }

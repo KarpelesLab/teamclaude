@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { TUI } from '../src/tui.js';
+import { TUI, maskKey } from '../src/tui.js';
 
 // The settings screen keeps two lists in step: _settingsFields() drives the
 // cursor (↑↓ walk it, ←→/Enter act on the current entry) and _renderSettings()
@@ -62,4 +62,21 @@ test('settings: sx.org rows are drawn once an sx client exists', () => {
     assert.ok(text.includes(fields[i].label),
       `"${fields[i].label}" is reachable with the cursor but never drawn`);
   }
+});
+
+// first-4 + last-4 of a key eight characters long is the whole key.
+test('a short sx.org key is not shown whole by its mask', () => {
+  assert.equal(maskKey('sk-ant-api03-abcdefgh'), 'sk-a…efgh');
+  assert.equal(maskKey('12345678'), '…5678');
+  assert.equal(maskKey('abcd'), '****');
+  const sx = { getMode: () => 'always', getBalance: () => null, configure: async () => ({ ok: true }) };
+  const tui = makeTUI({ sx });
+  tui.config.sx = { apiKey: 'short-key', mode: 'always' };
+  const row = tui._settingsFields().find(f => f.id === 'sxkey');
+  const shown = stripAnsi(row.value());
+  assert.doesNotMatch(shown, /short-key/);
+  assert.equal(shown, '…-key');
+  // The prompt it opens is a masked one.
+  row.enter();
+  assert.equal(tui.inputSecret, true);
 });

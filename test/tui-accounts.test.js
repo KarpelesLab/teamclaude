@@ -314,3 +314,20 @@ test('a probe interval over seven days is refused, not scheduled', async () => {
   assert.equal(config.quotaProbeSeconds, 604800);
 });
 
+
+// The footer echoes the prompt buffer while it is typed. For a key, that echo
+// is the key in clear on a screen that is often shared.
+test('an API key being typed is masked in the footer', () => {
+  const { tui } = makeTUI();
+  openSettingsRow(tui, 'addAccount');
+  tui._key('k');
+  type(tui, 'sk-secret');
+  const footer = tui._renderFooter().replace(/\x1b\[[0-9;]*m/g, '');
+  assert.doesNotMatch(footer, /sk-secret/);
+  assert.match(footer, /API key: \*{9}█/);
+  tui._key('esc');
+  // The next, ordinary prompt echoes again.
+  tui._promptInput('Switch threshold (%)', () => {});
+  type(tui, '95');
+  assert.match(tui._renderFooter(), /95█/);
+});
