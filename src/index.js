@@ -46,6 +46,9 @@ import { getUpstreamProxy, describeProxy, describeSelfProxy } from './upstream-p
 // reaches through a top-level `await`. The await suspends module evaluation at
 // the switch, so a const declared under the switch is still in the temporal
 // dead zone when the command body runs — keep them above the dispatch.
+// Ceiling for `teamclaude probe <seconds>`: setInterval takes a 32-bit signed
+// millisecond delay, so anything past ~2,147,483 s overflows to 1 ms.
+const MAX_PROBE_SECONDS = 7 * 24 * 3600;
 const ROUTE_USAGE = [
   'Usage: teamclaude route [list]',
   '       teamclaude route add <name> --match "<glob>[,<glob>]" [--accounts "<name-or-index>[,...]"] [--bucket <quota-bucket>] [--color <name>]',
@@ -1409,6 +1412,11 @@ async function probeCommand() {
     }
     if (seconds > 0 && seconds < 30) {
       console.error('Minimum probe interval is 30s (to avoid hammering the usage endpoint).');
+      process.exit(1);
+    }
+    // Past the ceiling the interval would overflow into a 1 ms probe storm.
+    if (seconds > MAX_PROBE_SECONDS) {
+      console.error(`Maximum probe interval is ${MAX_PROBE_SECONDS}s (7 days).`);
       process.exit(1);
     }
   }
