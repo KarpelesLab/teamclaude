@@ -687,11 +687,12 @@ test('path 3: the band that refuses the switch reads the fleet the walk serves, 
 });
 
 test('path 3: a hop that refuses to move does not park the fleet on a paused account', () => {
-  // A paused account is still _isAvailable: the pause is the HOP's own test, and
-  // it runs after selection has moved the cursor, so a refused hop can leave the
-  // fleet somewhere no request wanted. The bound this arm does not close: the
-  // switch still never consults isPaused, so an account inside its own pause
-  // that genuinely holds the fleet band can still be installed.
+  // A paused account is still _isAvailable: the pause is the hop's own test, so
+  // an ordinary retry excluding the account it just tried, which is what a grown
+  // ctx.tried produces, can leave the fleet parked inside a pause. The bound this
+  // arm does not close: the switch still never consults isPaused, so an account
+  // inside its own pause that genuinely holds the fleet band can still be
+  // installed.
   const am = mgr(['cur', 'hot', 'reset'], { expiry: ON });
   bucket(am, 0, 'unified7d', 0.50, 100);
   bucket(am, 1, 'unified7d', 0.00, 1);
