@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { ensureCerts, createConnectHandler, mitmHosts } from './mitm.js';
 import { patchAccountUuid } from './account-uuid-rewrite.js';
 import { sanitizeToolPairs } from './tool-pair-sanitize.js';
+import { sanitizeCacheControl, cacheControlSubfieldsToStrip } from './cache-control-sanitize.js';
 import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
 import { TopLevelFieldFinder, modelGlobMatches } from './model.js';
 import { BodyWriter, truncationNote } from './request-log.js';
@@ -457,7 +458,26 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
   // call — Node fires 'upgrade' for that handshake, never 'request', so it
   // needs its own listener (base-URL routing path; the MITM path wires the
   // same relayUpgrade onto its own terminating server in mitm.js).
-  server.on('upgrade', (req, socket, head) => relayUpgrade(req, socket, head, upstream, sx));
+  server.on('upgrade', (req, socket, head) => {
+    // The upgrade handshake never reaches requestHandler, so it does not
+    // inherit the key gate above — it has to ask for itself. Without this a
+    // WebSocket handshake is an unauthenticated relay to `upstream`: the
+    // handshake carries no pooled credential (relayUpgrade forwards the
+    // client's own headers), so it is not a way to spend the fleet's quota,
+    // but it is a way to reach the upstream on this host's address and
+    // bandwidth. A deployment on a public hostname hands that to anyone.
+    if (!resolveUpgradeAuth(req, socket, config.proxy).ok) {
+      // Logged as well as answered: a WebSocket client discards the status
+      // line, so the 401 alone leaves an operator with a channel that is
+      // silently dead — the same shape as the outage this gate could cause if
+      // a client turns out not to send the key.
+      console.log(`[TeamClaude] WebSocket upgrade refused (no proxy key) from ${safeLine(socket?.remoteAddress || 'unknown')} for ${safeLine(req.url)}`);
+      try { socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n'); } catch { /* already gone */ }
+      socket.destroy();
+      return;
+    }
+    relayUpgrade(req, socket, head, upstream, sx);
+  });
 
   return server;
 }
@@ -1192,6 +1212,46 @@ function relayStream(req, res, upstream, sx) {
 }
 
 /**
+ * The key gate for a WebSocket upgrade, in the shape of the CONNECT one.
+ *
+ * Separate from `resolveClientAuth` only because the answer depends on the
+ * socket's address as well as the header, and separate from the request path
+ * because `server.on('upgrade')` is a different event that no part of
+ * `requestHandler` runs for.
+ *
+ * `x-api-key` only. A browser cannot set that header on a WebSocket
+ * handshake, so a browser client cannot authenticate here — deliberately.
+ * The obvious alternative, reading the key out of `Sec-WebSocket-Protocol`,
+ * is worse than not supporting browsers: relayUpgrade forwards that header to
+ * the upstream (it strips `x-api-key`, which is the whole reason the
+ * handshake carries no operator credential today), the offer list is
+ * attacker-sized so it turns one guess per connection into thousands, and the
+ * proxy cannot honour the negotiation anyway because it relays the handshake
+ * rather than answering it.
+ */
+export function resolveUpgradeAuth(req, socket, proxyConfig) {
+  const auth = resolveClientAuth(proxyConfig, req?.headers?.['x-api-key']);
+  if (auth.ok) return auth;
+  // Loopback is exempt from the key requirement, exactly as the HTTP and
+  // CONNECT gates are — with the request path's two conditions on top, for
+  // the same actor: a web page in the operator's browser. A page can open a
+  // WebSocket to 127.0.0.1 with no CORS check at all, and its handshake is
+  // loopback-sourced too. What it cannot forge is `Origin`, which a browser
+  // sets on every handshake and a CLI never sends, nor `Host`, which a
+  // rebound name (attacker.example → 127.0.0.1) leaves naming the attacker.
+  if (!isLoopbackAddr(socket?.remoteAddress)) return auth;
+  const bindHost = proxyConfig?.host;
+  const origin = req?.headers?.origin;
+  if (origin) {
+    let originHost;
+    try { originHost = new URL(origin).host; } catch { return auth; }
+    if (!isLocalHostHeader(originHost, bindHost)) return auth;
+  }
+  if (!isLocalHostHeader(req?.headers?.host, bindHost)) return auth;
+  return { ok: true, client: null };
+}
+
+/**
  * Relay a WebSocket upgrade (e.g. Remote Control's real-time
  * `/v1/session_ingress/ws/*` channel) to upstream with the client's own
  * headers intact. An HTTP server never emits 'request' for an Upgrade
@@ -1872,33 +1932,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   const upstreamUrl = `${upstreamFor(account, upstream)}${req.url}`;
   const method = req.method;
 
-  let sendBody = body;
-  // The body rewrites below are Anthropic-shaped and must not touch another
-  // provider's payload: a Responses API body has no metadata.user_id to patch
-  // and no Anthropic tool-pairing rule to repair, so running them would at
-  // best waste a pass and at worst corrupt a valid request.
-  if (rewritesBody(account)) {
-    // Strip orphaned tool_use / tool_result blocks so a client that compacted or
-    // interrupted a turn can't wedge the session with Anthropic's non-retryable
-    // 400 ("tool_use ids were found without tool_result blocks"). No-op (same
-    // Buffer) for a well-formed body.
-    sendBody = sanitizeToolPairs(body, req.url, req.headers['content-type']);
-    // Align the body's account_uuid (in metadata.user_id) with the account whose
-    // token we're injecting (same-length patch; no-op if absent).
-    if (account.accountUuid) sendBody = patchAccountUuid(sendBody, account.accountUuid);
-  }
-  // Rewrite the model name for accounts that target a different upstream (e.g.
-  // GLM), which uses different model identifiers than Anthropic.
-  if (account.modelMap) sendBody = rewriteModel(sendBody, account.modelMap);
-  // Third-party upstreams (e.g. OpenCode Zen, GLM) implement the Anthropic
-  // message API but reject fields Claude Code legitimately sends — observed:
-  // `context_management` -> 400 "Extra inputs are not permitted", which breaks
-  // EVERY request once such an account is selected. Drop the configured fields
-  // for those accounts only; Anthropic accounts are untouched. Content-Length is
-  // refreshed below because the body shrinks.
-  if (Array.isArray(account.stripRequestFields) && account.stripRequestFields.length) {
-    sendBody = stripBodyFields(sendBody, account.stripRequestFields);
-  }
+  // Every rewrite below runs inside rewriteRequestBody (exported for tests);
+  // Content-Length is refreshed below because the body can shrink.
+  let sendBody = rewriteRequestBody(body, account, req.url, req.headers['content-type']);
   // If the body changed length (sanitize, model rewrite, or field strip), update
   // Content-Length so the upstream doesn't receive a mismatched framing and
   // truncate or stall.
@@ -1922,7 +1958,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     l.write(`=== REQUEST (account: ${account.name}, retry: ${retryCount}) ===\n${method} ${upstreamUrl}\n${formatHeaders(safeHeaders)}`);
     // The body that went upstream, not the one the client sent: they differ
     // exactly when the proxy rewrote it (tool-pair sanitising, account_uuid,
-    // modelMap), which is the first thing to check when upstream rejects it.
+    // modelMap, cache_control strip), which is the first thing to check when
+    // upstream rejects it.
     if (sendBody !== body) l.write(`\n(body rewritten by the proxy before sending: ${body.length} → ${sendBody.length} bytes; the upstream copy follows)`);
     if (sendBody.length > 0) l.body('REQUEST BODY', sendBody, req.headers['content-type']);
   };
@@ -2559,6 +2596,49 @@ function extractUsageFromBody(buffer, accountIndex, accountManager, onUsage = nu
   } catch {
     // not JSON or no usage
   }
+}
+
+// Apply every request-body rewrite for the account about to serve it, in
+// forward order. Pure (buffer in, buffer out) and exported for tests —
+// forwardRequest only threads the result into Content-Length and the log.
+// Each step is a no-op returning the same Buffer when it has nothing to do,
+// so untouched bodies keep their exact bytes.
+export function rewriteRequestBody(body, account, url, contentType) {
+  let sendBody = body;
+  // The rewrites below are Anthropic-shaped and must not touch another
+  // provider's payload: a Responses API body has no metadata.user_id to patch
+  // and no Anthropic tool-pairing rule to repair, so running them would at
+  // best waste a pass and at worst corrupt a valid request.
+  if (rewritesBody(account)) {
+    // Strip orphaned tool_use / tool_result blocks so a client that compacted or
+    // interrupted a turn can't wedge the session with Anthropic's non-retryable
+    // 400 ("tool_use ids were found without tool_result blocks").
+    sendBody = sanitizeToolPairs(sendBody, url, contentType);
+    // Align the body's account_uuid (in metadata.user_id) with the account whose
+    // token we're injecting (same-length patch; no-op if absent).
+    if (account.accountUuid) sendBody = patchAccountUuid(sendBody, account.accountUuid);
+    // Some strict Anthropic-compatible upstreams reject `cache_control`
+    // subfields Claude Code sends (`scope`; `ttl: "1h"` on a few) with a
+    // non-retryable 400, breaking EVERY request once such an account is
+    // selected. Opt-in per account, like every other rewrite keyed on
+    // `upstream`: `stripRequestFields: ["cache_control.scope"]`. A first-party
+    // relay that honours every subfield loses nothing by default.
+    const ccSubfields = cacheControlSubfieldsToStrip(account.stripRequestFields);
+    if (ccSubfields.size) sendBody = sanitizeCacheControl(sendBody, url, contentType, ccSubfields);
+  }
+  // Rewrite the model name for accounts that target a different upstream (e.g.
+  // GLM), which uses different model identifiers than Anthropic.
+  if (account.modelMap) sendBody = rewriteModel(sendBody, account.modelMap);
+  // Third-party upstreams (e.g. OpenCode Zen, GLM) implement the Anthropic
+  // message API but reject fields Claude Code legitimately sends — observed:
+  // `context_management` -> 400 "Extra inputs are not permitted", which breaks
+  // EVERY request once such an account is selected. Drop the configured
+  // top-level fields for those accounts only (the `cache_control.<sub>` entries
+  // were consumed above); Anthropic accounts are untouched.
+  const topLevel = Array.isArray(account.stripRequestFields)
+    ? account.stripRequestFields.filter(f => typeof f === 'string' && !f.includes('.')) : [];
+  if (topLevel.length) sendBody = stripBodyFields(sendBody, topLevel);
+  return sendBody;
 }
 
 // Remove top-level fields from a JSON request body (see stripRequestFields).
