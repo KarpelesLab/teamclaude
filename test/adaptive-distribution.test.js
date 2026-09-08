@@ -46,8 +46,27 @@ test('distributionMode maps the setting without breaking the boolean forms', () 
   for (const value of ['off', 'false', 'no', '0', ' OFF ']) {
     assert.equal(distributionMode(value), 'off');
   }
-  // A typo means "distribute", not "stop distributing".
-  assert.equal(distributionMode('addaptive'), 'even');
+});
+
+test('distributionMode treats a typo as a request to distribute, and says so once', () => {
+  const warned = [];
+  const original = console.warn;
+  console.warn = (...args) => warned.push(args.join(' '));
+  try {
+    // A typo means "distribute", not "stop distributing"...
+    assert.equal(distributionMode('adaptve'), 'even');
+    assert.equal(distributionMode('adaptve'), 'even');
+    assert.equal(distributionMode(' ADAPTVE '), 'even');
+    // ...but the spellings that plainly mean "on" are not typos.
+    for (const value of ['on', 'true', 'yes', '1', 'even', 'ON']) assert.equal(distributionMode(value), 'even');
+    assert.equal(distributionMode(true), 'even');
+  } finally {
+    console.warn = original;
+  }
+  // Once per distinct value, naming what was written.
+  assert.equal(warned.length, 1, warned.join('\n'));
+  assert.match(warned[0], /distributeSessions: unrecognised value "adaptve"/);
+  assert.match(warned[0], /distributing evenly/);
 });
 
 test('adaptive mode reports itself and still counts as distributing', () => {

@@ -26,13 +26,23 @@ export { isFableModel, parseRequestModel, parseAdvisorModel } from './model.js';
  *                               the account is busy (see adaptive-distribution.js)
  * An unrecognised string is treated as 'even' rather than rejected: it is
  * plainly a request to distribute, and refusing to distribute at all would be
- * the worse reading of a typo.
+ * the worse reading of a typo. It is still said once, naming the value: an
+ * operator who typed "adaptve" and got even mode should not have to discover
+ * that from the status header.
  */
+const EVEN_SPELLINGS = ['on', 'true', 'yes', '1', 'even'];
+const warnedDistributeValues = new Set();
+
 export function distributionMode(setting) {
   if (typeof setting === 'string') {
     const value = setting.trim().toLowerCase();
     if (value === 'adaptive') return 'adaptive';
     if (['off', 'false', 'no', '0'].includes(value)) return 'off';
+    if (!EVEN_SPELLINGS.includes(value) && !warnedDistributeValues.has(value)) {
+      warnedDistributeValues.add(value);
+      console.warn(`[TeamClaude] distributeSessions: unrecognised value ${JSON.stringify(setting)}, distributing evenly (valid: true, false, "adaptive")`);
+    }
+    return 'even';
   }
   if (!setting) return 'off';
   return 'even';
