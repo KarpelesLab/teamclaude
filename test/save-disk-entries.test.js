@@ -165,3 +165,75 @@ test('an entry with a uuid claims the row that proves it, not a namesake without
   assert.deepEqual(out.map(a => a.importFrom), ['/logged-in', '/hand-added'], 'the uuid is evidence; a shared display name is not');
   assert.equal(out[1].accountUuid, undefined, 'and the namesake does not acquire a uuid from a row that is not its own');
 });
+
+// The third rung of the same ladder. With uuids equal on both sides,
+// sameIdentity compares organizations only when both are known and returns true
+// when either is missing — so a legacy entry, whose org was never stored, matches
+// any organization of that person. Claiming consumes, so it takes the row from
+// the entry whose org actually names it.
+test('an entry whose org is stored keeps its own row against a legacy namesake', () => {
+  const cfg = [
+    { id: 'x1', name: 'p@example.com', type: 'oauth', accountUuid: 'U' },
+    { id: 'x2', name: 'p@example.com', type: 'oauth', accountUuid: 'U', orgUuid: 'O2' },
+  ];
+  const disk = [
+    { id: 'y2', name: 'p@example.com', type: 'oauth', accountUuid: 'U', orgUuid: 'O2', importFrom: '/second-org' },
+    { id: 'y1', name: 'p@example.com', type: 'oauth', accountUuid: 'U', importFrom: '/legacy' },
+  ];
+  const out = mergeAccountsForSave(cfg, [], disk);
+
+  assert.deepEqual(out.map(a => a.importFrom), ['/legacy', '/second-org'], 'a known org outranks an unknown one');
+});
+
+// The other side of the same rung. Matching the person is not matching the
+// account: one uuid spans every organization that person belongs to, so a claim
+// made on a known organization has to match that organization and not merely
+// its owner. This pass runs earliest of the three and consumes, so accepting the
+// person alone here crosses two organizations' rows before any later pass can
+// object.
+test('two organizations of one person keep their own rows, whatever the disk order', () => {
+  const cfg = [
+    { id: 'x1', name: 'p@example.com', type: 'oauth', accountUuid: 'U', orgUuid: 'O1' },
+    { id: 'x2', name: 'p@example.com', type: 'oauth', accountUuid: 'U', orgUuid: 'O2' },
+  ];
+  const disk = [
+    { id: 'y2', name: 'p@example.com', type: 'oauth', accountUuid: 'U', orgUuid: 'O2', importFrom: '/org-two' },
+    { id: 'y1', name: 'p@example.com', type: 'oauth', accountUuid: 'U', orgUuid: 'O1', importFrom: '/org-one' },
+  ];
+  const out = mergeAccountsForSave(cfg, [], disk);
+
+  assert.deepEqual(out.map(a => a.importFrom), ['/org-one', '/org-two'], 'a claim on a known org must match that org, not merely the person');
+});
+
+// One organization is not one account. Colleagues share an org key, so matching
+// the organization alone pairs two different people — and this pass consumes,
+// so it would hand each of them the other's credentials file.
+test('colleagues in one organization keep their own rows', () => {
+  const cfg = [
+    { id: 'x1', name: 'a@example.com', type: 'oauth', accountUuid: 'U1', orgUuid: 'O' },
+    { id: 'x2', name: 'b@example.com', type: 'oauth', accountUuid: 'U2', orgUuid: 'O' },
+  ];
+  const disk = [
+    { id: 'y2', name: 'b@example.com', type: 'oauth', accountUuid: 'U2', orgUuid: 'O', importFrom: '/person-b' },
+    { id: 'y1', name: 'a@example.com', type: 'oauth', accountUuid: 'U1', orgUuid: 'O', importFrom: '/person-a' },
+  ];
+  const out = mergeAccountsForSave(cfg, [], disk);
+
+  assert.deepEqual(out.map(a => a.importFrom), ['/person-a', '/person-b'], 'a shared organization must not pair different people');
+});
+
+// An entry that already claimed its row by id must not claim a second one. A
+// later pass that re-claims overwrites the record of the first, and the row it
+// abandons is then suppressed by the keptIds guard rather than carried, because
+// the entry still holds that row's id. So the row is not duplicated, it is lost —
+// and the entry is left holding a credentials path that belongs to another row.
+test('an entry that claimed its row by id does not claim a second one', () => {
+  const cfg = [{ id: 'y1', name: 'a@example.com', type: 'oauth', accountUuid: 'U1', orgUuid: 'O' }];
+  const disk = [
+    { id: 'y1', name: 'a@example.com', type: 'oauth', accountUuid: 'U1', orgUuid: 'O', importFrom: '/its-own' },
+    { id: 'y9', name: 'a@example.com', type: 'oauth', accountUuid: 'U1', orgUuid: 'O', importFrom: '/twin' },
+  ];
+  const out = mergeAccountsForSave(cfg, [], disk);
+
+  assert.deepEqual(out.map(a => a.importFrom), ['/its-own', '/twin'], 'its own row merged, the twin carried over once');
+});

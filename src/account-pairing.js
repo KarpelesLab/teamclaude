@@ -14,7 +14,7 @@
 // evidence and admits no ambiguity: it survives the refresh that rewrites the
 // credential, and it separates two entries that agree on everything else.
 
-import { sameIdentity } from './identity.js';
+import { orgKey, sameIdentity } from './identity.js';
 
 /**
  * The manager account built from config entry `acct`, or null if it has none.
@@ -107,14 +107,16 @@ export function clearRemovedAccountIds(config) {
  * Which disk row each config entry merges over, as a Map of config index to disk
  * index. A row is claimed by at most one entry.
  *
- * Evidence before guesswork, in three passes: an exact id, then an account uuid
- * both records carry, then the display name. `sameIdentity` collapses the last
- * two — it compares uuids only when both sides have one and falls back to the
- * name otherwise — so calling it alone lets an entry holding a uuid settle for a
- * namesake's row. Claiming consumes, so that row is then taken from the entry it
- * belonged to, and `importFrom` on it names the file an entry reads its
- * credential from at the next start. findUpsertTarget in identity.js puts the
- * same two questions in this order for the login axis.
+ * Evidence before guesswork, strongest first, because a claim consumes: a row
+ * taken on weak grounds is taken away from the entry that could have proved it,
+ * and `importFrom` on that row names the file an entry reads its credential from
+ * at the next start.
+ *
+ * `sameIdentity` returns true three ways, and they are not equally strong — uuid
+ * with both organizations known and equal, uuid with an organization missing on
+ * either side, and a bare name match when either record lacks a uuid. One boolean
+ * hides which one answered, so each gets a pass of its own here, behind the exact
+ * id that outranks them all.
  *
  * Ids can disagree with disk — a file written before the field existed, or
  * re-minted by another process — which is why they cannot be the only pass.
@@ -131,6 +133,7 @@ function claimDiskRows(configAccounts, diskAccounts) {
     }
   };
   configAccounts.forEach((a, i) => { if (a?.id) claim(i, d => d?.id === a.id); });
+  configAccounts.forEach((a, i) => { if (!rowFor.has(i) && a?.accountUuid && orgKey(a)) claim(i, d => d?.accountUuid === a.accountUuid && orgKey(d) === orgKey(a)); });
   configAccounts.forEach((a, i) => { if (!rowFor.has(i) && a?.accountUuid) claim(i, d => d?.accountUuid && sameIdentity(d, a)); });
   configAccounts.forEach((a, i) => { if (!rowFor.has(i)) claim(i, d => sameIdentity(d, a)); });
   return rowFor;
