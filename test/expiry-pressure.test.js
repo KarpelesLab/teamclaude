@@ -760,6 +760,8 @@ test('a single-provider fleet\'s switch is recorded exactly as it was', () => {
   assert.equal(served.name, 'P', 'the session pin must serve this request, or the arm tests nothing');
   assert.equal(am.accounts[am.currentIndex].name, 'R',
     'the one fleet in the config lost the switch its own walk spent');
+  assert.equal(am.accounts[am.providerCursors.get(DEFAULT_PROVIDER)]?.name, 'P',
+    'the pinned request moved the single-provider cursor off the account that served it');
   assert.equal(am.getActiveAccount(null, OPUS).name, 'R',
     'the request behind the pinned one did not find the fleet where the switch left it');
   assert.equal(am.accounts[am.providerCursors.get(DEFAULT_PROVIDER)]?.name, 'R',
@@ -834,6 +836,32 @@ test('a shared key serving another provider\'s request leaves both cursors intac
     'a Codex request on the shared key moved the Anthropic fleet\'s cursor');
   assert.equal(am.accounts[am.providerCursors.get('codex')]?.name, 'c',
     'the Codex cursor was overwritten with an account its own re-seed refuses');
+});
+
+test('a session pin onto the shared key still records the Codex switch under Codex', () => {
+  const am = mgr([oauth('a1'), { name: 'kn', type: 'apikey', apiKey: 'k' },
+    oauth('c1', { provider: 'codex' }), oauth('c2', { provider: 'codex' })],
+  { expiry: ON, distributeSessions: true });
+  const ixOf = name => am.accounts.findIndex(a => a.name === name);
+  bucket(am, ixOf('a1'), 'unified7d', 0.40, 10);
+  bucket(am, ixOf('kn'), 'unified7d', 0.40, 20);
+  bucket(am, ixOf('c1'), 'unified7d', 0.50, 100);
+  bucket(am, ixOf('c2'), 'unified7d', 0.10, 5);
+  // `c2` alone carries an expired 5h window, so it is what the switch installs.
+  am.accounts[ixOf('c2')].quota.unified5h = 0.5;
+  am.accounts[ixOf('c2')].quota.unified5hReset = Date.now() - 1000;
+  am.providerCursors.set(DEFAULT_PROVIDER, ixOf('a1'));
+  am.providerCursors.set('codex', ixOf('c1'));
+
+  // The pin serves the Codex request off the shared key, and the walk that
+  // reached it spends the Codex switch on the way.
+  am.recordSession('S-9', ixOf('kn'), OPUS);
+  const served = am.getActiveAccount(null, OPUS, null, 'S-9', 'codex');
+  assert.equal(served.name, 'kn', 'the shared key must serve this request, or the arm tests nothing');
+  assert.equal(am.accounts[am.providerCursors.get(DEFAULT_PROVIDER)]?.name, 'a1',
+    'a Codex request on the shared key moved the Anthropic cursor');
+  assert.equal(am.accounts[am.providerCursors.get('codex')]?.name, 'c2',
+    'the Codex cursor lost the switch the borrowed walk spent');
 });
 
 test('path 3: a hop that refuses to move does not park the fleet on a paused account', () => {
