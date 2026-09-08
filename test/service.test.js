@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   serviceKind, launchAgentPath, systemdUnitPath, logPath, resolveExec, servicePath,
-  renderLaunchAgent, renderSystemdUnit, installService, uninstallService, serviceStatus, LABEL,
+  renderLaunchAgent, renderSystemdUnit, systemdQuote, installService, uninstallService, serviceStatus, LABEL,
 } from '../src/service.js';
 
 // Records every command a call would run, and answers each with a canned result.
@@ -103,16 +103,43 @@ test('the systemd unit restarts and starts at login', () => {
   const unit = renderSystemdUnit({
     node: '/usr/bin/node', entry: '/usr/bin/teamclaude', path: '/usr/bin',
   });
-  assert.match(unit, /ExecStart=\/usr\/bin\/node \/usr\/bin\/teamclaude server --headless/);
+  assert.match(unit, /ExecStart="\/usr\/bin\/node" "\/usr\/bin\/teamclaude" server --headless/);
   assert.match(unit, /Restart=always/);
   assert.match(unit, /WantedBy=default\.target/);
-  assert.match(unit, /Environment=PATH=\/usr\/bin/);
+  assert.match(unit, /Environment="PATH=\/usr\/bin"/);
 });
 
 test('an optional config path is carried into both unit formats', () => {
   const opts = { node: '/n', entry: '/e', log: '/l', path: '/p', configPath: '/cfg/teamclaude.json' };
   assert.match(renderLaunchAgent(opts), /TEAMCLAUDE_CONFIG<\/key>\s*<string>\/cfg\/teamclaude\.json/);
-  assert.match(renderSystemdUnit(opts), /Environment=TEAMCLAUDE_CONFIG=\/cfg\/teamclaude\.json/);
+  assert.match(renderSystemdUnit(opts), /Environment="TEAMCLAUDE_CONFIG=\/cfg\/teamclaude\.json"/);
+});
+
+// Unquoted, a path with a space is two words to systemd — ExecStart would run
+// the wrong program — and a newline anywhere starts a new line of the unit, so
+// a TEAMCLAUDE_CONFIG carrying "\n" injected [Service] directives of its own.
+test('systemd unit values are quoted systemd-style: spaces kept, backslash and quote escaped', () => {
+  assert.equal(systemdQuote('/opt/my tools/node'), '"/opt/my tools/node"');
+  assert.equal(systemdQuote('/o"p\\t'), '"/o\\"p\\\\t"');
+  const unit = renderSystemdUnit({
+    node: '/opt/my tools/node', entry: '/home/o"brien/tc', path: '/opt/my tools:/usr/bin',
+    configPath: '/home/o"brien/cfg.json',
+  });
+  assert.match(unit, /^ExecStart="\/opt\/my tools\/node" "\/home\/o\\"brien\/tc" server --headless$/m);
+  assert.match(unit, /^Environment="PATH=\/opt\/my tools:\/usr\/bin"$/m);
+  assert.match(unit, /^Environment="TEAMCLAUDE_CONFIG=\/home\/o\\"brien\/cfg.json"$/m);
+});
+
+test('a control character in any unit path is refused, not written', () => {
+  const base = { node: '/n', entry: '/e', path: '/p' };
+  assert.throws(() => renderSystemdUnit({ ...base, configPath: '/cfg.json\nExecStartPre=/bin/evil' }), /control character/);
+  assert.throws(() => renderSystemdUnit({ ...base, entry: '/e\r' }), /control character/);
+  assert.throws(() => renderSystemdUnit({ ...base, node: '/n\tx' }), /control character/);
+  assert.throws(() => renderSystemdUnit({ ...base, path: '/p\n[Service]\nUser=root' }), /control character/);
+  // ...and the injected directive never appears in a rendered unit.
+  let unit = null;
+  try { unit = renderSystemdUnit({ ...base, configPath: '/cfg.json\nExecStartPre=/bin/evil' }); } catch { /* refused */ }
+  assert.equal(unit, null);
 });
 
 test('installing on launchd writes the plist and loads it', async () => {
