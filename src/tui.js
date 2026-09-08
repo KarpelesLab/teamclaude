@@ -967,7 +967,7 @@ export class TUI {
       // prefer that over what was highlighted here. `eligible: false` means the
       // switch applied to an account that cannot currently serve requests, which
       // the row already shows but is worth stating at the moment it is chosen.
-      const name = res?.account || acct.name;
+      const name = res?.account ? safeLine(res.account, 64) || acct.name : acct.name;
       if (res?.eligible === false) {
         // The server knows WHY — disabled, out of quota, outranked by a
         // higher-priority account — so quote it rather than restating the

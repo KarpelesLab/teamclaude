@@ -1,6 +1,7 @@
 import { TUI } from './tui.js';
 import { SessionTitles } from './session-titles.js';
 import { modelGlobMatches } from './model.js';
+import { safeLine } from './safe-text.js';
 
 // Attach mode — the dashboard against a server running somewhere else (a
 // background service, another terminal). The renderer is the same one the
@@ -9,6 +10,20 @@ import { modelGlobMatches } from './model.js';
 
 const DEFAULT_POLL_MS = 1000;
 const DEFAULT_TIMEOUT_MS = 5000;
+
+// Ceiling on a control-plane reply. A status payload is a few KiB; the poll
+// runs every second against whatever answers on the configured port, and
+// buffering an unbounded body from it once a second is not a dashboard.
+const MAX_REPLY_BYTES = 1024 * 1024;
+
+// A string off the wire, fit to be drawn: coerced (a number where a name was
+// expected used to throw inside strip() and kill the poll loop), stripped of
+// controls, and capped. `fallback` when nothing is left.
+const text = (value, max, fallback = '') => {
+  if (value == null || typeof value === 'object') return fallback;
+  return safeLine(value, max) || fallback;
+};
+const NAME_MAX = 64;
 
 // Addresses that reach this machine. A server bound to one of these exempts
 // loopback clients from the proxy-key gate, which changes what a 401 can mean.
@@ -101,9 +116,9 @@ export class RemoteControl {
       }
       throw err;
     }
-    const text = await res.text();
+    const raw = await res.text();
     let payload = null;
-    try { payload = text ? JSON.parse(text) : null; } catch { /* not JSON — the status carries the meaning */ }
+    try { payload = raw ? JSON.parse(raw) : null; } catch { /* not JSON — the status carries the meaning */ }
 
     if (!res.ok) {
       // `ok: false` + a string reason is this control plane's own error shape;
@@ -119,13 +134,13 @@ export class RemoteControl {
         ? (LOOPBACK_HOSTS.has(this.host)
           ? `something other than teamclaude is answering on port ${this.port} (HTTP ${res.status})`
           : `the server rejected the proxy API key (HTTP ${res.status})`)
-        : answered ? payload.error : `HTTP ${res.status}`);
+        : answered ? text(payload.error, 200, `HTTP ${res.status}`) : `HTTP ${res.status}`);
       err.status = res.status;
       err.answered = answered;
       throw err;
     }
     // A 200 body can still report failure (the reload endpoint does this).
-    if (payload && payload.ok === false) throw new Error(payload.error || 'request rejected');
+    if (payload && payload.ok === false) throw new Error(text(payload.error, 200, 'request rejected'));
     return payload;
   }
 }
@@ -172,17 +187,22 @@ export class RemoteAccountManager {
     const accounts = Array.isArray(status?.accounts) ? status.accounts : [];
     // The payload crosses a process boundary, and the renderer calls string
     // methods on name/type unguarded: a malformed reply (wrong port, older or
-    // newer server) should read as unknown, not take the dashboard down.
+    // newer server) should read as unknown, not take the dashboard down. The
+    // same strings are drawn straight into the frame, so whatever answered on
+    // that port must not be able to put an escape sequence there either.
     this.accounts = accounts.map((a, index) => ({
       ...a,
       index,
-      name: a.name || '(unnamed)',
-      type: a.type || '?',
-      quota: { ...(a.quota || {}) },
+      name: text(a?.name, NAME_MAX, '(unnamed)'),
+      type: text(a?.type, 16, '?'),
+      status: text(a?.status, 16, a?.status == null ? undefined : '?'),
+      orgName: a?.orgName == null ? a?.orgName : text(a.orgName, NAME_MAX),
+      unavailable: a?.unavailable == null ? a?.unavailable : text(a.unavailable, 64),
+      quota: { ...(a?.quota || {}) },
     }));
     // -1 when the payload names an account that is no longer listed: nothing is
     // marked current, which is the truth, rather than defaulting to the first row.
-    this.currentIndex = this.accounts.findIndex(a => a.name === status?.currentAccount);
+    this.currentIndex = this.accounts.findIndex(a => a.name === text(status?.currentAccount, NAME_MAX));
     if (status?.switchThreshold != null) this.switchThreshold = status.switchThreshold;
     this.switchThresholds = status?.switchThresholds || null;
 
@@ -198,8 +218,14 @@ export class RemoteAccountManager {
     // leaves half-specified would take the whole dashboard down mid-frame.
     this.routes = (Array.isArray(status?.routes) ? status.routes : []).map(r => ({
       ...r,
-      match: Array.isArray(r?.match) ? r.match : [],
-      accounts: Array.isArray(r?.accounts) ? r.accounts : [],
+      name: text(r?.name, NAME_MAX, '(unnamed)'),
+      color: r?.color == null ? r?.color : text(r.color, 16),
+      bucket: r?.bucket == null ? r?.bucket : text(r.bucket, 32),
+      pinned: r?.pinned == null ? r?.pinned : text(r.pinned, NAME_MAX),
+      target: r?.target == null ? r?.target : text(r.target, NAME_MAX),
+      match: (Array.isArray(r?.match) ? r.match : []).map(g => text(g, 64)).filter(Boolean),
+      accounts: (Array.isArray(r?.accounts) ? r.accounts : [])
+        .map(a => ({ ...a, name: text(a?.name, NAME_MAX, '?'), eligible: !!a?.eligible })),
     }));
     this.status = status;
     this.connected = true;
