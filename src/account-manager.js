@@ -2906,11 +2906,12 @@ export class AccountManager {
     // narrowed by the model filter _bandedCandidates already applies, and never
     // by the accounts this one attempt has tried. An account a 429 pushed this
     // request off holds whatever band it holds for everybody else.
-    // Both models, because that filter is per-account and the caller has already
-    // dropped the advisor model where no account the request reaches serves it:
-    // the degraded answer is the request's, taken once, so widening the set the
-    // band is drawn over cannot make the switch stricter than the pass that
-    // decides the request.
+    // Both models, because that filter is per-account and reads the
+    // already-degraded argument: the band re-evaluates no degradation, so the
+    // advisor term narrows the set and re-imposes nothing the caller dropped.
+    // Narrowing moves membership, since the floor is drawn from the highest
+    // pressure in whatever set it is given: an account inside the fleet's band
+    // can sit outside this one.
     // The provider comes from the walk in progress, as it does in _cursorKey; a
     // direct caller has none and means the default fleet. Kept inside the `&&`
     // rather than hoisted, so the knob-off path evaluates none of it.
