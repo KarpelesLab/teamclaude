@@ -168,3 +168,18 @@ test('an unchanged token is refreshed normally (the guard only fires on a swap)'
   assert.strictEqual(m.accounts[0].refreshToken, 'rt-new');
   assert.strictEqual(m.accounts[0].credential, 'at-new');
 });
+
+// #315: a third-party backend's credential must never be sent to Anthropic's
+// token endpoint. The prober and warmer already skip `upstream` accounts; the
+// send path and the 401 retry go through here and did not.
+test('an account with a third-party upstream is never refreshed against Anthropic', async () => {
+  let calls = 0;
+  const m = new AccountManager([{
+    name: 'glm', type: 'oauth', upstream: 'https://glm.example/anthropic',
+    accessToken: 'third-party-key', refreshToken: 'rt-third-party', expiresAt: Date.now() - 1000,
+  }], 0.98, { refreshFn: async () => { calls++; return { accessToken: 'x', refreshToken: 'y', expiresAt: Date.now() + 1e6 }; } });
+  await m.ensureTokenFresh(0);
+  await m.ensureTokenFresh(0, true);
+  assert.strictEqual(calls, 0, 'the refresh token was not sent anywhere');
+  assert.strictEqual(m.accounts[0].credential, 'third-party-key', 'the credential is untouched');
+});

@@ -3009,7 +3009,12 @@ export class AccountManager {
    */
   async ensureTokenFresh(accountIndex, force = false) {
     const account = this.accounts[accountIndex];
-    if (!account || account.type !== 'oauth' || !account.refreshToken) return;
+    // A third-party backend (`upstream` set) carries a DIFFERENT provider's
+    // credential; the token endpoint here is Anthropic's, so refreshing would
+    // hand that credential to a party it was never issued for. The prober and
+    // the warmer already draw this line; this is the third caller that reaches
+    // a credential, and the one the send path and the 401 retry go through.
+    if (!account || account.type !== 'oauth' || !account.refreshToken || account.upstream) return;
 
     // Dead-token guard: a refresh token upstream already rejected (invalid_grant)
     // will be rejected every time, so retrying it only floods the OAuth endpoint
