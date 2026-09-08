@@ -1666,6 +1666,11 @@ export class TUI {
     lines.push(dim('  off       never use sx.org (API key is kept)'));
     lines.push('');
     lines.push(dim('  TLS stays end-to-end; residential traffic is metered by sx.org.'));
+    if (!key) {
+      lines.push('');
+      lines.push(dim('  No sx.org account yet? Signing up via https://sx.org/c/ufVrLW'));
+      lines.push(dim('  costs nothing extra and supports TeamClaude development.'));
+    }
   }
 
   // ── routes editor ──────────────────────────────────
