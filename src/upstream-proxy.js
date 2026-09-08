@@ -20,8 +20,7 @@
 
 import http from 'node:http';
 import https from 'node:https';
-import tls from 'node:tls';
-import { connectThroughProxy } from './sx.js';
+import { connectThroughProxy, handshakeOverTunnel } from './sx.js';
 
 /**
  * Parse a proxy URL into the shape connectThroughProxy wants.
@@ -276,11 +275,8 @@ export function proxyAgent(proxy, { targetHost, targetPort, tls: useTls = true, 
         }
         // TLS is established end-to-end over the tunnel, so the proxy sees only
         // ciphertext and cert verification stays at its secure default.
-        const tlsSock = tls.connect({ socket: sock, servername: targetHost, ...tlsOptions });
-        const onErr = (err) => { tlsSock.removeListener('secureConnect', onOk); sock.destroy(); cb(err); };
-        const onOk = () => { tlsSock.removeListener('error', onErr); cb(null, tlsSock); };
-        tlsSock.once('secureConnect', onOk);
-        tlsSock.once('error', onErr);
+        handshakeOverTunnel(sock, { servername: targetHost, tlsOptions })
+          .then((tlsSock) => cb(null, tlsSock), (err) => cb(err));
       })
       .catch((err) => cb(err));
     return undefined; // socket is delivered asynchronously through cb

@@ -5,7 +5,7 @@ import tls from 'node:tls';
 import http from 'node:http';
 import { once } from 'node:events';
 import { generateCertChain } from '../src/x509.js';
-import { connectThroughProxy, tunnelTls, SxManager } from '../src/sx.js';
+import { connectThroughProxy, tunnelTls, handshakeOverTunnel, SxManager } from '../src/sx.js';
 import { upstreamFetch } from '../src/upstream-fetch.js';
 
 const T = { timeout: 30000 };
@@ -270,4 +270,23 @@ test('SxManager.configure reports an error when provisioning fails', T, async ()
     assert.match(r.error, /create-port failed/);
     assert.equal(sx.isProvisioned(), false, 'not enabled when provisioning fails');
   } finally { delete process.env.SX_API_BASE; closeHard(api); }
+});
+
+// ── Handshake bound ──────────────────────────────────────────
+//
+// The CONNECT had a timer; the TLS handshake after it did not. A proxy that
+// answers 200 and then goes silent (or a target that never sends a ServerHello)
+// held the caller for ever, with every request queued behind it.
+test('the TLS handshake over a tunnel is bounded', T, async () => {
+  const silent = net.createServer(() => { /* accept, never speak */ });
+  const port = await listen(silent);
+  try {
+    const sock = net.connect(port, '127.0.0.1');
+    await once(sock, 'connect');
+    await assert.rejects(
+      handshakeOverTunnel(sock, { servername: 'localhost', timeout: 200 }),
+      /TLS handshake with localhost through the tunnel timed out after 200ms/,
+    );
+    assert.equal(sock.destroyed, true);
+  } finally { closeHard(silent); }
 });

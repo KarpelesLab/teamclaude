@@ -101,10 +101,32 @@ export function connectThroughProxy({ proxyHost, proxyPort, auth, targetHost, ta
 }
 
 /**
+ * Complete a TLS handshake over an already-open tunnel socket. Resolves with the
+ * TLSSocket after secureConnect; rejects (and destroys the tunnel) on error or
+ * when the handshake takes longer than `timeout`. The CONNECT had its own timer;
+ * without one here a proxy that answers 200 and then goes quiet — or a target
+ * that never sends a ServerHello — held the caller for ever, with every request
+ * behind it. Cert verification stays at its secure default; tests inject a CA
+ * via tlsOptions.ca.
+ */
+export function handshakeOverTunnel(sock, { servername, tlsOptions = {}, timeout = CONNECT_TIMEOUT_MS }) {
+  return new Promise((resolve, reject) => {
+    const tlsSock = tls.connect({ socket: sock, servername, ...tlsOptions });
+    const settle = () => { clearTimeout(timer); tlsSock.removeListener('secureConnect', onOk); tlsSock.removeListener('error', onErr); };
+    // On failure nothing will listen to the dying TLSSocket any more, so give it
+    // a sink: a late error from the teardown must not become an uncaught one.
+    const onErr = (err) => { settle(); tlsSock.on('error', () => {}); tlsSock.destroy(); sock.destroy(); reject(err); };
+    const onOk = () => { settle(); resolve(tlsSock); };
+    const timer = setTimeout(() => onErr(new Error(`TLS handshake with ${servername} through the tunnel timed out after ${timeout}ms`)), timeout);
+    tlsSock.once('secureConnect', onOk);
+    tlsSock.once('error', onErr);
+  });
+}
+
+/**
  * CONNECT through `proxy`, then complete a TLS handshake to targetHost so TLS is
  * end-to-end (the proxy sees ciphertext only). Resolves with the TLSSocket after
- * secureConnect. Cert verification stays at its secure default; tests inject a CA
- * via tlsOptions.ca.
+ * secureConnect.
  */
 export async function tunnelTls({ proxy, targetHost, targetPort = 443, tlsOptions = {} }) {
   const sock = await connectThroughProxy({
@@ -114,13 +136,7 @@ export async function tunnelTls({ proxy, targetHost, targetPort = 443, tlsOption
     targetHost,
     targetPort,
   });
-  return new Promise((resolve, reject) => {
-    const tlsSock = tls.connect({ socket: sock, servername: targetHost, ...tlsOptions });
-    const onErr = (err) => { tlsSock.removeListener('secureConnect', onOk); sock.destroy(); reject(err); };
-    const onOk = () => { tlsSock.removeListener('error', onErr); resolve(tlsSock); };
-    tlsSock.once('secureConnect', onOk);
-    tlsSock.once('error', onErr);
-  });
+  return handshakeOverTunnel(sock, { servername: targetHost, tlsOptions });
 }
 
 /**
