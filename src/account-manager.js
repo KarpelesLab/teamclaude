@@ -3607,6 +3607,7 @@ export class AccountManager {
    */
   removeAccount(index) {
     if (index < 0 || index >= this.accounts.length) return;
+    const before = this.accounts[this.currentIndex] ?? null;
     this.accounts.splice(index, 1);
     this.accounts.forEach((a, i) => a.index = i);
     if (this.currentIndex >= this.accounts.length) {
@@ -3649,6 +3650,15 @@ export class AccountManager {
       this._currentObs = moved != null
         ? { ...this._currentObs, idx: moved, unescaped: held }
         : held ? { ...newObservation(), unescaped: held } : null;
+    }
+    // A removal that takes the account the cursor rests on lands the cursor on
+    // a neighbour with a reading the rebuild left nameless. That arrival is
+    // owed the offer every move makes: a roll the removal did not settle is
+    // its to take back. A reading the removal merely renumbered keeps its
+    // account and gets no offer.
+    const landed = this.accounts[this.currentIndex] ?? null;
+    if (landed && landed !== before && this._currentObs && this._currentObs.idx == null) {
+      this._firstSightOn(this._currentObs, landed);
     }
     // A throttle key names an account by index, so the shift would point a live
     // entry at a different account. Not worth renumbering: the entries expire in
