@@ -703,13 +703,10 @@ export class AccountManager {
       // `walked` names where this walk left the shared slot, captured in the
       // `finally` while it still held it. When it names one of this provider's
       // own accounts — including a borrow that re-seeded and then held its
-      // slot — the cursor takes it. It names another provider's account when a
-      // pin returns a borrowed walk without moving the slot, on a provider
-      // with no cursor to re-seed from, and when a walk's own pick is itself
-      // another provider's, which `_excludeOtherProviders` leaves eligible
-      // because it partitions subscriptions only. Either way the fallback is
-      // the account that served — and when that account is another provider's,
-      // as a shared key is, this provider records nothing rather than a cursor
+      // slot — the cursor takes it. Which one it names turns on where the walk
+      // left the slot, not on what it picked. Either way the fallback is the
+      // account that served — and when that account is another provider's, as
+      // a shared key is, this provider records nothing rather than a cursor
       // its own re-seed would refuse.
       const rest = providerOf(this.accounts[walked]) === provider ? walked : account.index;
       if (providerOf(this.accounts[rest]) === provider) this.providerCursors.set(provider, rest);
