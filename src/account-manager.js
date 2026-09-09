@@ -2281,16 +2281,13 @@ export class AccountManager {
     if (obs.idx !== account.index || obs.gen !== carried) return;
     const owed = findHeld(obs.unescaped, h => h.gen === carried);
     if (!owed || !provider) return;
-    // A subscription outside the hold's own fleet can never serve that fleet, so
-    // no success of the holder's can ever arrive to settle the roll and a success
-    // by a fleet that can be served there releases it instead. A shared key is
-    // not such a destination: both fleets reach it, so the holder's own success
-    // is still owed there and a foreigner's still settles nothing. A roll naming
-    // no fleet has no partition to be served across, so it keeps the owner-only
-    // gate.
-    const unreachable = owed.provider != null
-      && providerOf(account) !== owed.provider && isSubscriptionAccount(account);
-    if (owed.provider !== provider && !unreachable) return;
+    // A hold owns a reading alone only where the destination is its own fleet's
+    // subscription, which no other fleet is ever served at. Anywhere else the
+    // destination holds one reading for whoever it serves, so the success of the
+    // fleet served there settles the roll that reading carries.
+    const settledByAnyServed = owed.provider != null
+      && !(isSubscriptionAccount(account) && providerOf(account) === owed.provider);
+    if (owed.provider !== provider && !settledByAnyServed) return;
     obs.unescaped = dropHeld(obs.unescaped, owed.idx);
   }
 

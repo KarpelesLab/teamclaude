@@ -1256,10 +1256,12 @@ test('the fleet that created a hold on a shared key settles it with its own succ
     'a roll the codex fleet already settled was charged a second time');
 });
 
-test('a session\'s held roll is settled only by the fleet whose reading it preserves', () => {
+test('a roll held at a shared key is settled by any fleet the key serves', () => {
   // A pin is one slot per bucket too, and a session that has served both apps
-  // holds a roll one of them was pushed off. The other's success is no evidence
-  // about it, so the pin leg asks the same question the cursor leg does.
+  // holds a roll one of them was pushed off. The key is the only destination
+  // either app has here, so it holds ONE reading for whichever of them it is
+  // serving, and the success of the fleet resting there settles the roll the
+  // other was pushed off.
   const am = new AccountManager(
     [codexAccount('c'), sharedKey('kn')], 0.98,
     { expiryRouting: ON, distributeSessions: true },
@@ -1288,13 +1290,8 @@ test('a session\'s held roll is settled only by the fleet whose reading it prese
   const carriedClaude = am.observedGeneration('s1', OPUS);
   assert.equal(req(OPUS, 'anthropic').name, 'kn', 'the anthropic request left the shared key');
   am.confirmStay(am.accounts[1], carriedClaude, 's1', 'anthropic');
-  assert.equal(held()?.idx, 0,
-    'an anthropic success on the session released the roll the codex fleet was pushed off');
-
-  const carriedCodex = am.observedGeneration('s1', GPT);
-  assert.equal(req(GPT, 'codex').name, 'kn', 'the confirming codex request left the shared key');
-  am.confirmStay(am.accounts[1], carriedCodex, 's1', 'codex');
-  assert.equal(held(), null, 'the fleet the roll pushed off could not settle its own pin');
+  assert.equal(held(), null,
+    'an anthropic success at the shared key did not settle the roll the codex fleet was pushed off');
 });
 
 test('a roll no borrowing fleet can ever settle is released by the fleet that owns the destination', () => {
@@ -1363,6 +1360,45 @@ test('a roll the fleet that owns the destination was pushed off is settled by it
   am.confirmStay(served, carried, null, 'anthropic');
   assert.equal(am._currentObs.unescaped, null,
     'the fleet the roll pushed off could not settle it with its own success');
+});
+
+test('a roll held at a shared key is settled by the fleet that rests there', () => {
+  // The cursor leg of the pin arm above. The destination is a key both fleets
+  // are served at, so the reading there is nobody's alone: the fleet resting on
+  // it settles the roll the other was pushed off, and the fail-back finds its
+  // origin whole.
+  const am = new AccountManager(
+    [sharedKey('kn1'), sharedKey('kn2'), codexAccount('c')], 0.98, { expiryRouting: ON },
+  );
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30]]) bucket(am, i, 'unified7d', 0.4, hours);
+
+  const codexReq = () => am.getActiveAccount(null, GPT, null, null, 'codex');
+  const claudeReq = (exclude = null) => am.getActiveAccount(exclude, OPUS, null, null, 'anthropic');
+
+  // No opening placement: the codex request establishes the reading on the first
+  // key, so the roll it is pushed off names the codex fleet.
+  assert.equal(codexReq().name, 'kn1', 'the codex fixture must start on the first key');
+  assert.equal(claudeReq().name, 'kn1', 'the anthropic traffic did not rest on the same key');
+
+  rollWindow(am, 0);
+  assert.equal(claudeReq().name, 'kn2', 'the key\'s roll did not preempt onto the second key');
+  assert.equal(claudeReq().name, 'kn2', 'the preemption did not settle on the second key');
+  assert.equal(am._currentObs.unescaped?.idx, 0,
+    'resting on the second key did not hold the first key\'s roll');
+  assert.equal(am._currentObs.unescaped?.provider, 'codex',
+    'the hold does not name the fleet whose reading it preserves');
+
+  const carried = am.observedGeneration(null, OPUS);
+  const served = claudeReq();
+  assert.equal(served.name, 'kn2', 'the confirming anthropic request left the second key');
+  am.confirmStay(served, carried, null, 'anthropic');
+  assert.equal(am._currentObs.unescaped, null,
+    'a confirmed stay at a key both fleets reach did not settle the roll');
+
+  // The roll is settled, so the origin is read whole on return.
+  assert.equal(claudeReq(new Set([1])).name, 'kn1', 'the fail-back did not reach the first key');
+  assert.equal(am._currentRolledOver(am.accounts[0], OPUS), false,
+    'a roll the shared key already settled was charged a second time');
 });
 
 test('removing an account renumbers a held roll without changing whose it is', () => {
@@ -1452,10 +1488,12 @@ test('removing an account no roll was taken on leaves the chain where it is', ()
     'the fail-back onto a1 did not find the week a1 gained still held');
 });
 
-test('a roll a borrowed walk holds belongs to the fleet whose reading it preserves', () => {
+test('a borrowed walk\'s confirmed serve at a shared key releases the roll it was holding', () => {
   // A borrower resting on the owner's cursor account writes the OWNER's rolled
-  // reading into the hold. Stamping the writer there would hand the owner's roll
-  // to the fleet that only passed through, and the owner could never settle it.
+  // reading into the hold, so the hold names the owner. The destination is a key
+  // both fleets are served at, though, and such a key holds ONE reading for
+  // whoever it is serving: the borrower's own confirmed serve there settles the
+  // roll the owner was pushed off, exactly as the owner's would.
   const am = new AccountManager(
     [oauth('a1'), sharedKey('kn')], 0.98, { expiryRouting: ON },
   );
@@ -1477,21 +1515,15 @@ test('a roll a borrowed walk holds belongs to the fleet whose reading it preserv
   assert.equal(am._currentObs.unescaped?.provider, 'anthropic',
     'the hold names the fleet that wrote it instead of the one whose reading it is');
 
-  // The borrower's own success on the key is no evidence about that roll.
+  // The borrower is served at the key, so its success is evidence about the one
+  // reading the key holds. The owner's continuation goes with the roll: once the
+  // borrower has settled it there is nothing left for a second success to settle.
   const carriedCodex = am.observedGeneration(null, GPT);
   const servedCodex = codexReq();
   assert.equal(servedCodex.name, 'kn', 'the confirming codex request left the shared key');
   am.confirmStay(servedCodex, carriedCodex, null, 'codex');
-  assert.equal(am._currentObs.unescaped?.idx, 0,
-    'the borrower\'s success released the roll the owner was pushed off');
-
-  // The owner's is.
-  const carried = am.observedGeneration(null, OPUS);
-  const served = claudeReq();
-  assert.equal(served.name, 'kn', 'the confirming anthropic request left the shared key');
-  am.confirmStay(served, carried, null, 'anthropic');
   assert.equal(am._currentObs.unescaped, null,
-    'the owner\'s success left its own roll owed');
+    'a codex success at the key both fleets reach did not settle the roll a1 was pushed off');
 });
 
 test('a walk that moves an observation makes the reading its own fleet\'s', () => {
