@@ -3615,7 +3615,11 @@ export class AccountManager {
         burnRate: this.burnRateLearner.export(a.index),
         concCap: this.concurrencyLearner.export(a.index),
       };
-      return { accountUuid: a.accountUuid, orgUuid: a.orgUuid, orgName: a.orgName, name: a.name, profile, quota, adaptive };
+      // `provider` and `accountId` identify a Codex account, which has no
+      // `accountUuid`: a row saved without them reads as Anthropic and stops
+      // matching the account it was written for. Rows from an older version
+      // therefore stop restoring Codex quota, which is re-learned from traffic.
+      return { accountUuid: a.accountUuid, accountId: a.accountId, provider: providerOf(a), orgUuid: a.orgUuid, orgName: a.orgName, name: a.name, profile, quota, adaptive };
     });
   }
 
