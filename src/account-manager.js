@@ -2266,11 +2266,9 @@ export class AccountManager {
   /**
    * Settle the roll the confirmed move escaped, on the evidence that the
    * destination SERVED a request selecting under that move. Another account, or
-   * any move since, is a different stay. A roll another fleet escaped is not
-   * this request's to settle unless the destination is one that fleet can never
-   * be served at, and a confirmation naming no fleet settles nothing. Every
-   * other roll on the chain waits for its own fail-back or for the stay of its
-   * own move.
+   * any move since, is a different stay. A confirmation naming no fleet settles
+   * nothing. Every other roll on the chain waits for its own fail-back or for
+   * the stay of its own move.
    *
    * @param {Observation} obs
    * @param {string|null} provider
