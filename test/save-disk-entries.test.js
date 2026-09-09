@@ -180,3 +180,37 @@ test('a disk config with no accounts list is saved as an empty one', () => {
   markAccountRemoved(config, 'i2');
   assert.deepEqual(mergeAccountsForSave([], [], undefined, removedAccountIds(config)), []);
 });
+
+// The removal set was consulted only where rows are carried over, so the
+// removed row was not appended — but nothing consulted it where rows are
+// claimed, and the identity fallback matched the removed row to a surviving
+// namesake and merged its fields in. `importFrom` names the file an entry reads
+// its credential from at the next start, so the survivor was left pointing at
+// the deleted account's credentials (#329). Reachable with a hand-added entry
+// (no id of its own) sharing the removed account's name.
+test('a removed row hands nothing to a surviving namesake', () => {
+  const config = { accounts: [{ name: 'p@example.com', type: 'oauth' }] };
+  markAccountRemoved(config, 'gone');
+  const disk = [{ id: 'gone', name: 'p@example.com', type: 'oauth', importFrom: '/removed-account-creds' }];
+
+  const out = mergeAccountsForSave(config.accounts, [], disk, removedAccountIds(config));
+
+  assert.equal(out.length, 1);
+  assert.equal(out[0].importFrom, undefined, 'the survivor must not read the deleted account\'s credentials');
+  assert.equal(out[0].id, undefined, 'nor inherit its id');
+});
+
+test('a removed row is not claimed even when the survivor carries the same uuid', () => {
+  const config = { accounts: [{ id: 'new', name: 'p@example.com', type: 'oauth', accountUuid: 'u1' }] };
+  markAccountRemoved(config, 'gone');
+  const disk = [
+    { id: 'gone', name: 'p@example.com', type: 'oauth', accountUuid: 'u1', importFrom: '/removed-account-creds' },
+    { id: 'new', name: 'p@example.com', type: 'oauth', accountUuid: 'u1', refreshToken: 'r-new' },
+  ];
+
+  const out = mergeAccountsForSave(config.accounts, [], disk, removedAccountIds(config));
+
+  assert.deepEqual(out.map(a => a.id), ['new']);
+  assert.equal(out[0].importFrom, undefined);
+  assert.equal(out[0].refreshToken, 'r-new', 'its own row is still merged over');
+});
