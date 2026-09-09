@@ -284,3 +284,33 @@ test('the TUI blocked tag stays off when the account can still serve the family'
   assert.equal(am._isAvailable(am.accounts[0], FABLE), true);
   assert.equal(/⊘/.test(row), false, `a servable family was tagged blocked: ${row}`);
 });
+
+// The regression. A spent family reading is cleared so it can be revalidated,
+// which nulls the DEDICATED bucket and leaves `scopedWeekly` holding its own
+// until that bucket's reset passes. The row was gated on the dedicated bucket
+// alone, so it vanished whole from an account that still routes both families.
+test('a family known only through its learned bucket still appears in the Models row', () => {
+  const am = managerWith({
+    unified7d: 0.69,
+    unified7dFable: null,
+    scopedWeekly: { fable: { utilization: 1, resetAt: Date.now() + 72 * 3600_000 } },
+  });
+  const row = modelsRowFor(am, 'a');
+  const cell = row.split(/\s{2,}/).find(c => c.trim().startsWith('Fable'));
+  assert.ok(cell, `no Fable cell in: ${row}`);
+  // The mark stays the router's answer, not the learned bucket's: with the
+  // dedicated key unknown the gate reads the shared weekly, and the cell must
+  // say what routing will actually do with a Fable request.
+  assert.equal(cell.includes('✓'), am._isAvailable(am.accounts[0], FABLE),
+    `the Fable cell disagrees with routing — ${row}`);
+});
+
+// The other side of the gate: listing a family needs evidence that the account
+// meters one. Without this an account with no family bucket at all — every
+// Codex account, among others — would grow a Models row it has no data for.
+test('an account with no family bucket at all still renders no Models row', () => {
+  const am = managerWith({ unified7d: 0.4, scopedWeekly: {} });
+  const out = renderStatus(am.getStatus(), { color: false, now: Date.now() });
+  const row = out.split('\n').find(l => stripAnsi(l).trim().startsWith('Models'));
+  assert.equal(row, undefined, `a Models row was rendered with no family metered: ${row}`);
+});
