@@ -146,6 +146,9 @@ function claimDiskRows(configAccounts, diskAccounts) {
  * and claimDiskRows is where it is decided: one row per entry, one entry per row.
  */
 export function mergeAccountsForSave(configAccounts, managerAccounts, diskAccounts, removedIds = new Set()) {
+  // loadConfig normalises a missing list, but this is the function that threw
+  // on one (#330), so it holds its own contract too: no rows is an empty list.
+  if (!Array.isArray(diskAccounts)) diskAccounts = [];
   const rowFor = claimDiskRows(configAccounts, diskAccounts);
 
   const merged = configAccounts.map((a, i) => {

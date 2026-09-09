@@ -165,3 +165,18 @@ test('an entry with a uuid claims the row that proves it, not a namesake without
   assert.deepEqual(out.map(a => a.importFrom), ['/logged-in', '/hand-added'], 'the uuid is evidence; a shared display name is not');
   assert.equal(out[1].accountUuid, undefined, 'and the namesake does not acquire a uuid from a row that is not its own');
 });
+
+// A config.json with no `accounts` key at all is what an empty or hand-trimmed
+// file looks like. Every reader treated the list as always present, and the
+// first to trip was this save — a TypeError while writing, long after the read
+// that could have explained it (#330). A missing list is an empty one.
+test('a disk config with no accounts list is saved as an empty one', () => {
+  const cfg = [entry('i1', 'a')];
+  for (const disk of [undefined, null, 'not a list']) {
+    const out = mergeAccountsForSave(cfg, [], disk);
+    assert.deepEqual(out.map(a => a.name), ['a'], `disk accounts = ${String(disk)}`);
+  }
+  const config = { accounts: [] };
+  markAccountRemoved(config, 'i2');
+  assert.deepEqual(mergeAccountsForSave([], [], undefined, removedAccountIds(config)), []);
+});

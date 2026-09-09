@@ -108,6 +108,12 @@ export async function loadConfig() {
   const path = getConfigPath();
   try {
     const config = JSON.parse(await readFile(path, 'utf-8'));
+    // A file with no `accounts` key is what an empty or hand-trimmed config
+    // looks like. Every reader treats the list as always present, and the first
+    // one to trip was the save path — so the failure arrived while writing,
+    // long after the read that could have explained it (#330). A missing list
+    // is an empty one.
+    if (!Array.isArray(config.accounts)) config.accounts = [];
     // Everything downstream pairs config entries to running accounts by entry id,
     // so a config written before the field existed — or edited by hand — is given
     // ids here, before anything can read one. The next save persists them.
