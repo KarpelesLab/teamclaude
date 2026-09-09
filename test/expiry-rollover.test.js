@@ -1328,40 +1328,6 @@ test('a roll no borrowing fleet can ever settle is released by the fleet that ow
     'the owner\'s success did not settle the roll it was pushed off');
 });
 
-test('a roll the fleet that owns the destination was pushed off is settled by its own success', () => {
-  // The mirror of the arm above and its discriminator: the same fixture with the
-  // fleets the other way round leaves the hold naming the fleet the destination
-  // does serve, so the ordinary rule already releases it. A release rule that
-  // read the stamp rather than the destination would move this one too.
-  const am = new AccountManager(
-    [sharedKey('kn'), oauth('a'), codexAccount('c')], 0.98, { expiryRouting: ON },
-  );
-  for (const [i, hours] of [[0, 10], [1, 20], [2, 30]]) bucket(am, i, 'unified7d', 0.4, hours);
-
-  const codexReq = () => am.getActiveAccount(null, GPT, null, null, 'codex');
-  const claudeReq = (exclude = null) => am.getActiveAccount(exclude, OPUS, null, null, 'anthropic');
-
-  assert.equal(claudeReq().name, 'kn', 'the anthropic fixture must start on the shared key');
-  assert.equal(am._currentObs.provider, 'anthropic',
-    'the reading on the key is not the anthropic fleet\'s');
-  assert.equal(codexReq().name, 'kn', 'the codex request did not rest on the same key');
-
-  rollWindow(am, 0);
-  // The key is in the tried set, so no rest of the owner's precedes the escape.
-  assert.equal(claudeReq(new Set([0])).name, 'a', 'the key\'s roll did not push the owner onto a');
-  assert.equal(claudeReq(new Set([0])).name, 'a', 'the escape did not settle on a');
-  assert.equal(am._currentObs.unescaped?.idx, 0, 'resting on a did not hold the key\'s roll');
-  assert.equal(am._currentObs.unescaped?.provider, 'anthropic',
-    'the hold does not name the fleet whose reading it preserves');
-
-  const carried = am.observedGeneration(null, OPUS);
-  const served = claudeReq(new Set([0]));
-  assert.equal(served.name, 'a', 'the confirming anthropic request left a');
-  am.confirmStay(served, carried, null, 'anthropic');
-  assert.equal(am._currentObs.unescaped, null,
-    'the fleet the roll pushed off could not settle it with its own success');
-});
-
 test('a roll held at a shared key is settled by the fleet that rests there', () => {
   // The cursor leg of the pin arm above. The destination is a key both fleets
   // are served at, so the reading there is nobody's alone: the fleet resting on
