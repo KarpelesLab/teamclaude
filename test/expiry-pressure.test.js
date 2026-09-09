@@ -806,8 +806,10 @@ test('a pinned walk that owns the slot records the switch it spent there', () =>
     'the walk must leave its own slot on the reset switch, or the arm tests nothing');
   assert.equal(am.accounts[am.providerCursors.get(DEFAULT_PROVIDER)]?.name, 'R',
     'a walk holding its own slot recorded the pin over the switch it spent');
-  // The slot changes hands, which is what makes the record readable: the
-  // request behind this one borrows and re-seeds from the cursor.
+  // The slot changes hands so the request behind this one borrows and re-seeds
+  // from the cursor. That is what makes a WRONG record visible here — dropping
+  // the write, or recording the account the pin served, reds this assertion —
+  // while a missing re-seed does not: best-available answers R either way.
   am.setCurrentAccount(ixOf('codex'));
   assert.equal(am.getActiveAccount(null, OPUS).name, 'R',
     'the request after the slot changed hands did not find the fleet where the switch left it');
