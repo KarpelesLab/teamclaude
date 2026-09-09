@@ -508,7 +508,8 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
     // client's own headers), so it is not a way to spend the fleet's quota,
     // but it is a way to reach the upstream on this host's address and
     // bandwidth. A deployment on a public hostname hands that to anyone.
-    if (!resolveUpgradeAuth(req, socket, config.proxy).ok) {
+    const auth = resolveUpgradeAuth(req, socket, config.proxy);
+    if (!auth.ok) {
       // Logged as well as answered: a WebSocket client discards the status
       // line, so the 401 alone leaves an operator with a channel that is
       // silently dead — the same shape as the outage this gate could cause if
@@ -518,7 +519,11 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       socket.destroy();
       return;
     }
-    relayUpgrade(req, socket, head, upstream, sx);
+    // The identity the gate resolved rides along, as it does on the request
+    // path (req.tcClient): a handshake authenticated with a client key is
+    // attributed to that client, or it is a channel the operator cannot see
+    // under `clients` at all (#325).
+    relayUpgrade(req, socket, head, upstream, sx, { client: auth.client, clientUsage });
   });
 
   return server;
@@ -1342,8 +1347,14 @@ export function resolveUpgradeAuth(req, socket, proxyConfig) {
  * handshake (emits its own 'upgrade' event on a 101); once that fires it's
  * just two raw sockets spliced together.
  */
-export function relayUpgrade(req, socket, head, upstream, sx) {
+export function relayUpgrade(req, socket, head, upstream, sx, { client = null, clientUsage = null, log = console.log } = {}) {
   const target = new URL(`${upstream}${req.url}`);
+  // The channel's log lines, prefixed `[name]` like a request line when a
+  // client key authenticated the handshake, so an operator reading per-client
+  // activity sees the channel beside the requests. Booked only once upstream
+  // accepts: a handshake it refuses opened nothing.
+  const tag = client ? `[${safeLine(client, 64)}] ` : '';
+  const path = safeLine(req.url);
   const headers = {};
   for (const [key, value] of Object.entries(req.headers)) {
     const lk = key.toLowerCase();
@@ -1369,6 +1380,10 @@ export function relayUpgrade(req, socket, head, upstream, sx) {
     if (head?.length) upstreamSocket.write(head);
     socket.pipe(upstreamSocket);
     upstreamSocket.pipe(socket);
+    clientUsage?.record(client, { connections: 1 });
+    const opened = Date.now();
+    log(`[TeamClaude] ${tag}WebSocket ${path} connected`);
+    socket.once('close', () => log(`[TeamClaude] ${tag}WebSocket ${path} closed (${((Date.now() - opened) / 1000).toFixed(1)}s)`));
     // An upgraded socket defaults to half-open: the peer's FIN only ends the
     // READABLE side ('end'), it does NOT destroy the socket or fire 'close' —
     // so without this, one side hanging up (dropped wifi, killed CLI) leaves
@@ -1384,6 +1399,22 @@ export function relayUpgrade(req, socket, head, upstream, sx) {
     // which Node escalates to an uncaught exception — one dropped WebSocket
     // would kill the proxy for every other session. Close the pair instead.
     upstreamSocket.on('error', () => socket.destroy());
+  });
+
+  // Upstream answered with a plain response instead of the 101: the handshake
+  // was refused (an expired credential, an unknown session). Without this the
+  // client socket hung with no answer until it timed out, and nothing was
+  // logged. Relay the status so the client sees the refusal it was given.
+  upstreamReq.on('response', (upstreamRes) => {
+    log(`[TeamClaude] ${tag}WebSocket ${path} refused by upstream (${upstreamRes.statusCode})`);
+    const headerLines = Object.entries(upstreamRes.headers)
+      .filter(([k]) => !CONNECTION_SPECIFIC_HEADERS.has(k.toLowerCase()) && k.toLowerCase() !== 'content-length')
+      .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(', ') : v}`).join('\r\n');
+    try {
+      socket.write(`HTTP/1.1 ${upstreamRes.statusCode} ${upstreamRes.statusMessage}\r\n${headerLines}\r\nConnection: close\r\n\r\n`);
+    } catch { /* already gone */ }
+    upstreamRes.resume();
+    socket.destroy();
   });
 
   upstreamReq.on('error', (err) => {

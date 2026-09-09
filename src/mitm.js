@@ -249,7 +249,9 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
         socket.destroy();
         return;
       }
-      relayUpgrade(req, socket, head, target, sx);
+      // The CONNECT's client identity is bound to this listener (see getServer),
+      // so the channel is attributed the way the requests in the tunnel are.
+      relayUpgrade(req, socket, head, target, sx, { client, clientUsage, log });
     });
     // Make the h2-WebSocket dead end audible. Without this the only evidence is
     // a message that never arrives, which is what made #164 cost a day to

@@ -101,7 +101,11 @@ function renderUsageEntries(lines, entries, paint, now) {
     const tokens = `${formatNumber(c.inputTokens)} in / ${formatNumber(c.outputTokens)} out`;
     const last = parseTs(c.lastUsed);
     const lastText = last ? `, last ${formatAgo(last, now)}` : '';
-    lines.push(`  ${paint.cyan(safeLine(name).padEnd(20))} ${c.requests || 0} req, ${tokens}${lastText}`);
+    // WebSocket channels (Remote Control) are counted apart from requests and
+    // shown only where a client has opened one, so the row reads as before
+    // everywhere else.
+    const conns = c.connections ? `, ${c.connections} ws` : '';
+    lines.push(`  ${paint.cyan(safeLine(name).padEnd(20))} ${c.requests || 0} req${conns}, ${tokens}${lastText}`);
   }
 }
 
