@@ -214,3 +214,39 @@ test('a removed row is not claimed even when the survivor carries the same uuid'
   assert.equal(out[0].importFrom, undefined);
   assert.equal(out[0].refreshToken, 'r-new', 'its own row is still merged over');
 });
+
+// The uuid and name forms of one organization compared unequal through orgKey,
+// so on this axis neither record claimed the other's row: the row was carried
+// over and the account appeared twice after an upgrade that changed which field
+// the profile handed back (#328).
+test('an entry naming its organization by uuid claims the disk row naming it by name', () => {
+  const cfg = [{ id: 'x1', name: 'p@example.com', type: 'oauth', accountUuid: 'U', orgUuid: 'O', accessToken: 't' }];
+  const disk = [{ id: 'y1', name: 'p@example.com', type: 'oauth', accountUuid: 'U', orgName: 'Acme', importFrom: '/creds' }];
+
+  const out = mergeAccountsForSave(cfg, [], disk);
+
+  assert.equal(out.length, 1, 'one account, not two');
+  assert.equal(out[0].importFrom, '/creds', 'merged over its own row');
+});
+
+// The uuid pass took sameIdentity's tolerant answer, so an entry that never
+// stored an organization could claim the row of the same person in another
+// one, taking it away from the entry it belonged to (#327, on the disk axis).
+test('an entry with no organization does not claim the row of the same person in a known one', () => {
+  const cfg = [
+    { id: 'x1', name: 'p@example.com', type: 'oauth', accountUuid: 'U', accessToken: 't-legacy' },
+    { id: 'x2', name: 'p@example.com (Acme)', type: 'oauth', accountUuid: 'U', orgUuid: 'O', accessToken: 't-acme' },
+  ];
+  const disk = [
+    { id: 'y1', name: 'p@example.com (Acme)', type: 'oauth', accountUuid: 'U', orgUuid: 'O', importFrom: '/acme-creds' },
+    { id: 'y2', name: 'p@example.com', type: 'oauth', accountUuid: 'U' },
+  ];
+
+  const out = mergeAccountsForSave(cfg, [], disk);
+
+  assert.equal(out.length, 2);
+  const acme = out.find(a => a.id === 'x2');
+  const legacy = out.find(a => a.id === 'x1');
+  assert.equal(acme.importFrom, '/acme-creds', 'the Acme entry keeps the Acme row');
+  assert.equal(legacy.importFrom, undefined, 'the legacy entry does not take it');
+});
