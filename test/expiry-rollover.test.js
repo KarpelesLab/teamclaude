@@ -1948,6 +1948,13 @@ test('removing the account a pin\'s reading names keeps the roll it holds', () =
   am.removeAccount(1);
   assert.notEqual(ref(), null, 'removing the account the ref names discarded the roll it held');
   assert.equal(ref()?.unescaped?.idx, 0, 'a\'s held roll did not survive the removal');
+  // What stays behind names nobody, and a reading of nobody's carries nothing
+  // but the rolls: the stamp and the gen of the account that went away would
+  // answer a later confirmation as though the reading were still that account's.
+  assert.equal(ref()?.idx, null, 'the ref kept naming an account after that account went away');
+  assert.equal(ref()?.gen, 0, 'the nameless ref kept the gen of the reading the removal ended');
+  assert.equal(ref()?.provider, null,
+    'the nameless ref kept the fleet stamp of a reading it no longer holds');
 
   // The pin went with b, so this request re-routes rather than returning to a
   // pin; the ref is read whatever the pin loop left, which is where a's roll is
@@ -1956,6 +1963,25 @@ test('removing the account a pin\'s reading names keeps the roll it holds', () =
     'the forced fail-back did not reach a');
   assert.equal(am._pinRolledOver('s1', am.accounts[0], OPUS), true,
     'the fail-back onto a did not find the week a gained still held');
+});
+
+test('a pin ref that stayed on for one roll goes away with it', () => {
+  // The other half of the one drop rule the arm above turns on: a ref naming
+  // nobody is kept only by what it holds, so once the last roll on it goes with
+  // the account it was taken on there is nothing left to be evidence about.
+  const am = mgr(['a', 'b', 'c', 'd'], ON, { distributeSessions: true });
+  for (const i of [0, 1, 2, 3]) bucket(am, i, 'unified7d', 0.4, 10 + i * 10);
+  const ref = () => am.sessionTracker.refsFor('s1', 'unified7d');
+  assert.equal(serve(am, 's1', OPUS).name, 'a', 'the fixture must start on a');
+  rollWindow(am, 0);
+  assert.equal(serve(am, 's1', OPUS).name, 'b', 'the rollover did not move the pin to b');
+  assert.equal(serve(am, 's1', OPUS).name, 'b', 'the arrival did not settle on b');
+  assert.equal(ref()?.unescaped?.idx, 0, 'the fixture must have held a\'s roll on the pin');
+
+  am.removeAccount(1);
+  assert.equal(ref()?.idx, null, 'the ref the removal left behind still names an account');
+  am.removeAccount(0);
+  assert.equal(ref(), null, 'the ref outlived the one roll that was keeping it');
 });
 
 test('removing an account renumbers a held roll rather than aiming it elsewhere', () => {
