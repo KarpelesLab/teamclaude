@@ -552,7 +552,7 @@ ${SHARED_HELPERS}
     var table = document.getElementById('clients');
     table.textContent = '';
     var hr = el('tr');
-    ['Client', 'Requests', 'Input tok', 'Output tok', 'Last used'].forEach(function (h, i) {
+    ['Client', 'Requests', 'WebSockets', 'Input tok', 'Output tok', 'Last used'].forEach(function (h, i) {
       hr.appendChild(el('th', i ? 'num' : '', h));
     });
     table.appendChild(hr);
@@ -561,6 +561,7 @@ ${SHARED_HELPERS}
       var tr = el('tr');
       tr.appendChild(el('td', '', n));
       tr.appendChild(el('td', 'num', fmtNum(c.requests)));
+      tr.appendChild(el('td', 'num', fmtNum(c.connections || 0)));
       tr.appendChild(el('td', 'num', fmtNum(c.inputTokens)));
       tr.appendChild(el('td', 'num', fmtNum(c.outputTokens)));
       tr.appendChild(el('td', 'num', c.lastUsed ? fmtAgo(c.lastUsed) : '—'));

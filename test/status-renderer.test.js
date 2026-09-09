@@ -206,6 +206,17 @@ test('renderStatus prints configured usage dimensions and sanitizes their labels
   assert.doesNotMatch(output, /\x1b\[31m/);
 });
 
+test('renderStatus shows a client\'s WebSocket connections apart from its requests', () => {
+  const status = sampleStatus();
+  status.clients = {
+    alice: { requests: 2, connections: 1, inputTokens: 1000, outputTokens: 250, lastUsed: '2026-07-03T11:59:00Z' },
+    bob: { requests: 1, connections: 0, inputTokens: 10, outputTokens: 5 },
+  };
+  const output = renderStatus(status, { color: false, now });
+  assert.match(output, /alice\s+2 req, 1 ws, 1.0k in \/ 250 out, last 1m ago/);
+  assert.match(output, /bob\s+1 req, 10 in \/ 5 out/, 'no channel, no column');
+});
+
 test('renderStatus never grows a per-session section', () => {
   // Sessions are unbounded caller-supplied ids: a terminal renderer that
   // printed one line each would bury the whole status readout. The per-session
