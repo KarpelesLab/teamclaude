@@ -118,10 +118,20 @@ export function clearRemovedAccountIds(config) {
  *
  * Ids can disagree with disk — a file written before the field existed, or
  * re-minted by another process — which is why they cannot be the only pass.
+ *
+ * A row the operator removed is claimed by nobody. Removal consults `removedIds`
+ * where rows are carried over, so the removed row is not appended as its own
+ * entry; without the same check here, the identity fallback matched that row
+ * to a surviving namesake and merged its fields in — including `importFrom`,
+ * which names the file an entry reads its credential from at the next start, so
+ * the survivor was left pointing at the deleted account's credentials (#329).
  */
-function claimDiskRows(configAccounts, diskAccounts) {
+function claimDiskRows(configAccounts, diskAccounts, removedIds) {
   const rowFor = new Map();
   const taken = new Set();
+  for (const [d, diskAcct] of diskAccounts.entries()) {
+    if (diskAcct?.id && removedIds.has(diskAcct.id)) taken.add(d);
+  }
   const claim = (i, matches) => {
     for (const [d, diskAcct] of diskAccounts.entries()) {
       if (taken.has(d) || !matches(diskAcct)) continue;
@@ -149,7 +159,7 @@ export function mergeAccountsForSave(configAccounts, managerAccounts, diskAccoun
   // loadConfig normalises a missing list, but this is the function that threw
   // on one (#330), so it holds its own contract too: no rows is an empty list.
   if (!Array.isArray(diskAccounts)) diskAccounts = [];
-  const rowFor = claimDiskRows(configAccounts, diskAccounts);
+  const rowFor = claimDiskRows(configAccounts, diskAccounts, removedIds);
 
   const merged = configAccounts.map((a, i) => {
     const am = managerAccountFor(managerAccounts, a);
