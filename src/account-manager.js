@@ -2280,10 +2280,10 @@ export class AccountManager {
     if (obs.idx !== account.index || obs.gen !== carried) return;
     const owed = findHeld(obs.unescaped, h => h.gen === carried);
     if (!owed || !provider) return;
-    // A hold owns a reading alone only where the destination is its own fleet's
-    // subscription, which no other fleet is ever served at. Anywhere else the
-    // destination holds one reading for whoever it serves, so the success of the
-    // fleet served there settles the roll that reading carries.
+    // A hold has a reading to itself only where the destination is its own
+    // fleet's subscription, which no other fleet is ever served at. Anywhere
+    // else the destination has one reading for whoever it serves, so a success
+    // by the fleet served there settles the roll held against it.
     const settledByAnyServed = owed.provider != null
       && !(isSubscriptionAccount(account) && providerOf(account) === owed.provider);
     if (owed.provider !== provider && !settledByAnyServed) return;
@@ -3650,11 +3650,11 @@ export class AccountManager {
         ? { ...this._currentObs, idx: moved, unescaped: held }
         : held ? { ...newObservation(), unescaped: held } : null;
     }
-    // A removal that takes the account the cursor rests on lands the cursor on
-    // a neighbour with a reading the rebuild left nameless. That arrival is
-    // owed the offer every move makes: a roll the removal did not settle is
-    // its to take back. A reading the removal merely renumbered keeps its
-    // account and gets no offer.
+    // A removal that takes the account the cursor rests on leaves the cursor at
+    // a neighbour, with a reading the rebuild left nameless. Every move offers
+    // its arrival the roll that move did not settle, and this arrival is owed
+    // the same offer. A reading the removal merely renumbered keeps its own
+    // account, so it is offered nothing.
     const landed = this.accounts[this.currentIndex] ?? null;
     if (landed && landed !== before && this._currentObs && this._currentObs.idx == null) {
       this._firstSightOn(this._currentObs, landed);
