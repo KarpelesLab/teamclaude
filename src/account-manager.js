@@ -10,7 +10,6 @@ import { ROLLOVER_MIN_JUMP_MS, remapHeld, findHeld, dropHeld, newObservation } f
 import { decideBand, pressureOf, pressureRank, assertNever } from './band-decision.js';
 import { BurnRateLearner, ConcurrencyLearner, scoreCandidate } from './adaptive-distribution.js';
 import { safeLine } from './safe-text.js';
-/** @typedef {import('./session-tracker.js').Hold} Hold */
 /** @typedef {import('./session-tracker.js').Observation} Observation */
 
 // Re-exported for callers that import these model helpers from here.
