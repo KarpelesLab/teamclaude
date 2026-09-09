@@ -2113,10 +2113,13 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         { successful: !!upstreamRes && upstreamRes.status < 400 }) || 0;
     }
 
-    // Extract rate limit headers
+    // Extract rate limit headers. Anthropic states its quota under
+    // `anthropic-ratelimit-*` and Codex under `x-codex-*`; `updateQuota` picks
+    // the parser by provider, so keeping only Anthropic's prefix handed a Codex
+    // account an empty object and its quota never landed.
     const rateLimitHeaders = {};
     for (const [key, value] of upstreamRes.headers.entries()) {
-      if (key.startsWith('anthropic-ratelimit-')) {
+      if (key.startsWith('anthropic-ratelimit-') || key.startsWith('x-codex-')) {
         rateLimitHeaders[key] = value;
       }
     }
