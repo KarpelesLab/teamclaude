@@ -658,8 +658,9 @@ export class AccountManager {
     // one provider that is a single slot for several fleets, so a request whose
     // provider does not own it borrows the slot for the walk and hands it back.
     //
-    // With one provider `borrowed` is always false, so the cursor recorded below
-    // has no reader at all. Its one reader is the re-seed above, which only a
+    // With one provider `borrowed` is always false, so the `providerCursors`
+    // entry this method writes has no reader at all. Its one reader is the
+    // `providerCursors.get(provider)` inside `if (borrowed)`, which only a
     // borrowed walk reaches.
     const owner = providerOf(this.accounts[this.currentIndex]);
     const borrowed = !!this.accounts.length && owner !== provider;
@@ -670,7 +671,7 @@ export class AccountManager {
     }
 
     let account;
-    let walked = null;
+    let walked;
     // Scoped rather than threaded through _select/_selectNext/_divertedFor: the
     // whole walk is synchronous, so nothing can interleave and observe it, and
     // the alternative is a provider argument on six private methods that exist
@@ -699,15 +700,18 @@ export class AccountManager {
     // the next real failover unpaced.
     if (account) {
       this.routeCursors.set(this._cursorKey(model, advisorModel, provider), account.index);
-      // `walked` names where this walk left the shared slot, captured above
-      // while it still held it. When it names one of this provider's own
-      // accounts — including a borrow that re-seeded and then held its slot —
-      // the cursor takes it. When the slot ends on another provider's account,
-      // which is typically a borrowed pinned return on a provider with no cursor
-      // to re-seed from, falling back to the account that served keeps this
-      // provider from resting on no cursor at all.
-      const rest = walked != null && providerOf(this.accounts[walked]) === provider
-        ? walked : account.index;
+      // `walked` names where this walk left the shared slot, captured in the
+      // `finally` while it still held it. When it names one of this provider's
+      // own accounts — including a borrow that re-seeded and then held its
+      // slot — the cursor takes it. It names another provider's account when a
+      // pin returns a borrowed walk without moving the slot, on a provider
+      // with no cursor to re-seed from, and when a walk's own pick is itself
+      // another provider's, which `_excludeOtherProviders` leaves eligible
+      // because it partitions subscriptions only. Either way the fallback is
+      // the account that served — and when that account is another provider's,
+      // as a shared key is, this provider records nothing rather than a cursor
+      // its own re-seed would refuse.
+      const rest = providerOf(this.accounts[walked]) === provider ? walked : account.index;
       if (providerOf(this.accounts[rest]) === provider) this.providerCursors.set(provider, rest);
     }
     return account;
