@@ -3649,10 +3649,9 @@ export class AccountManager {
         : held ? { ...newObservation(), unescaped: held } : null;
     }
     // A removal that takes the account the cursor rests on leaves the cursor at
-    // a neighbour, with a reading the rebuild left nameless. Every move offers
-    // its arrival the roll that move did not settle, and this arrival is owed
-    // the same offer. A reading the removal merely renumbered keeps its own
-    // account, so it is offered nothing.
+    // a neighbour, with a reading the rebuild left nameless. A reading the
+    // removal merely renumbered keeps its own account, so it is offered
+    // nothing.
     const landed = this.accounts[this.currentIndex] ?? null;
     if (landed && landed !== before && this._currentObs && this._currentObs.idx == null) {
       this._firstSightOn(this._currentObs, landed);
