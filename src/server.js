@@ -126,6 +126,46 @@ export function isLoopbackAddr(addr) {
   return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1';
 }
 
+// Headers a forwarding proxy adds to name the caller it forwards for. Any of
+// them on a loopback-sourced request says the socket's peer is a proxy on this
+// host, not the caller.
+const FORWARDED_HEADERS = ['x-forwarded-for', 'x-real-ip', 'forwarded'];
+
+/** Whether the request carries a forwarding proxy's mark. */
+export function isForwardedRequest(headers) {
+  return FORWARDED_HEADERS.some(h => headers?.[h] != null && headers[h] !== '');
+}
+
+/**
+ * Whether a key-less caller is admitted on the strength of its address alone.
+ * All three gates — HTTP, CONNECT and the WebSocket upgrade — ask this one
+ * question, so they cannot drift apart.
+ *
+ * The exemption is trying to answer "is this caller on this machine", and the
+ * socket address stops answering that as soon as anything forwards. The
+ * ordinary way this proxy is deployed on a public name is nginx or Caddy
+ * terminating TLS in front of a listener bound to 127.0.0.1 — and then every
+ * caller on the internet is loopback-sourced, the key gate never runs, and an
+ * anonymous POST /v1/messages spends the fleet's quota (#324). The browser
+ * checks that sit behind this one (Origin, Host) do not catch it: curl sends
+ * neither, and the Host header is written by the operator's own reverse proxy,
+ * so it reports the proxy's configuration rather than the request's provenance.
+ *
+ * Two answers, cheapest first:
+ *   - A request carrying a forwarding header (X-Forwarded-For, X-Real-IP,
+ *     Forwarded) is refused the exemption. Costs nothing to configure and fails
+ *     closed on exactly the deployments that are exposed; a reverse proxy set
+ *     up to send none of them is the case the setting below is for.
+ *   - `proxy.trustLoopback: false` switches the exemption off outright. The CLI
+ *     presents the proxy key on every call of its own, so a local install keeps
+ *     working with it; documented as required behind a reverse proxy.
+ */
+export function loopbackExempt(headers, remoteAddress, proxyConfig) {
+  if (proxyConfig?.trustLoopback === false) return false;
+  if (!isLoopbackAddr(remoteAddress)) return false;
+  return !isForwardedRequest(headers);
+}
+
 /**
  * Which identity a presented key authenticates as, checked against the shared
  * `proxy.apiKey` and every `proxy.clientKeys` entry ({ name, key }).
@@ -220,7 +260,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // applies to a running server, matching how eventLogging/blockedModels
       // are read live further down the pipeline.
       const clientKey = req.headers['x-api-key'];
-      const isLocal = isLoopbackAddr(req.socket.remoteAddress);
+      const isLocal = loopbackExempt(req.headers, req.socket.remoteAddress, config.proxy);
       const auth = resolveClientAuth(config.proxy, clientKey);
       if (!auth.ok && !isLocal) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
@@ -1280,7 +1320,7 @@ export function resolveUpgradeAuth(req, socket, proxyConfig) {
   // loopback-sourced too. What it cannot forge is `Origin`, which a browser
   // sets on every handshake and a CLI never sends, nor `Host`, which a
   // rebound name (attacker.example → 127.0.0.1) leaves naming the attacker.
-  if (!isLoopbackAddr(socket?.remoteAddress)) return auth;
+  if (!loopbackExempt(req?.headers, socket?.remoteAddress, proxyConfig)) return auth;
   const bindHost = proxyConfig?.host;
   const origin = req?.headers?.origin;
   if (origin) {
