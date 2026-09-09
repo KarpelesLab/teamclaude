@@ -1148,7 +1148,7 @@ test('a borrowed cursor\'s success settles the roll of its own provider', () => 
     'the request after the fail-back preempted off a settled roll');
 });
 
-test('a success on a shared key for another provider\'s request leaves the roll held', () => {
+test('a success settles no hold the move that reached its destination left behind', () => {
   // Only SUBSCRIPTIONS are partitioned, so the account a request landed on says
   // nothing about which fleet it belonged to.
   const am = new AccountManager(
@@ -1176,7 +1176,7 @@ test('a success on a shared key for another provider\'s request leaves the roll 
   assert.equal(served.name, 'kn', 'the confirming codex request left the shared key');
   am.confirmStay(served, carried, null, 'codex');
   assert.equal(am._currentObs.unescaped?.idx, 0,
-    'a codex success released the roll the anthropic fleet was holding');
+    'a codex success under a stamp the hold does not carry released the roll');
 
   // a2 and the key out of the way, so anthropic falls back onto a1, still owed.
   assert.equal(claudeReq(new Set([1, 2])).name, 'a1', 'the fail-back did not reach a1');
@@ -1186,10 +1186,7 @@ test('a success on a shared key for another provider\'s request leaves the roll 
     'the anthropic request after the fail-back settled on the account its roll pushed it off');
 });
 
-test('a hold one fleet creates on a shared key outlives the other fleet\'s success', () => {
-  // The held account is the KEY, which declares no provider and reads as the
-  // default while serving either app. Its declaration says nothing about which
-  // fleet was pushed off it, so the hold names the fleet whose reading it is.
+test('a success at a shared key settles no hold the arrival that reached it left behind', () => {
   const am = new AccountManager(
     [sharedKey('kn'), codexAccount('c'), oauth('a')], 0.98, { expiryRouting: ON },
   );
@@ -1221,9 +1218,7 @@ test('a hold one fleet creates on a shared key outlives the other fleet\'s succe
   assert.equal(served.name, 'kn', 'the confirming anthropic request left the shared key');
   am.confirmStay(served, carried, null, 'anthropic');
   assert.equal(am._currentObs.unescaped?.idx, 0,
-    'an anthropic success released the roll the codex fleet was pushed off');
-  assert.equal(am._currentObs.unescaped?.provider, 'codex',
-    'the surviving hold no longer names the fleet whose reading it preserves');
+    'an anthropic success under a stamp the hold does not carry released the roll');
 });
 
 test('the fleet that created a hold on a shared key settles it with its own success', () => {
