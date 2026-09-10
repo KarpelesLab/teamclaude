@@ -19,6 +19,7 @@ import { safeLine } from './safe-text.js';
 import { forwardRefusal, guardedLookup, FORBIDDEN_FORWARD } from './forward-target.js';
 import { renderDashboardHtml, dashboardCsp } from './dashboard.js';
 import { createUsageRecorder, resolveUsageDimensions, usageDimensionHeaderNames } from './client-usage.js';
+import { classificationPath } from './classification-path.js';
 
 
 export const HOP_BY_HOP_HEADERS = new Set([
@@ -33,26 +34,24 @@ const PIN_PREFIX = '/tc-acct/';
  * spelling, on either slash)?
  *
  * Every path classification in the listener — the Codex pool, the
- * client-credential relay, the `/tc-acct/` pin — is a prefix test on the path
- * AS SENT, while the upstream URL is normalised afterwards by `new URL()` and
- * fetch. So `/backend-api/codex/../conversations` classifies as Codex and
- * reaches chatgpt.com as `/backend-api/conversations`, pooled token attached;
+ * client-credential relay, the `/tc-acct/` pin — is a prefix test, while the
+ * path itself is forwarded verbatim and resolved elsewhere. So
+ * `/backend-api/codex/../conversations` classifies as Codex and reaches
+ * chatgpt.com as `/backend-api/conversations`, pooled token attached;
  * `/v1/messages/../../api/oauth/profile` does not start with `/api/oauth/`,
  * takes the pool path, and reaches the profile endpoint with a rotated token —
- * the exact thing the relay exists to prevent for the literal path. Backslash
- * counts because the URL parser treats it as a slash for http(s). No client of
- * ours ever sends one; refusing the request is the whole fix.
+ * the exact thing the relay exists to prevent for the literal path. No client
+ * of ours ever sends such a path; refusing the request is the whole fix.
+ *
+ * Read on the classification path, which is decoded once and has its
+ * backslashes folded (the URL parser treats one as a slash for http(s), so
+ * `new URL()` folds it on the way out too). `..%2f..%2f` and `..\..\` are
+ * therefore the same request as `../../` here, as they are to whatever
+ * resolves them — and splitting on `/` alone is enough, since no separator
+ * survives classificationPath in any other spelling.
  */
 export function hasDotSegment(url) {
-  const path = String(url || '').split('?')[0].split('#')[0];
-  for (const seg of path.split(/[\/\\]/)) {
-    let s = seg;
-    // An undecodable segment (`%`) is compared as sent: the URL parser leaves
-    // it alone too, so it cannot become a dot-segment upstream.
-    try { s = decodeURIComponent(seg); } catch { /* keep raw */ }
-    if (s === '.' || s === '..') return true;
-  }
-  return false;
+  return classificationPath(url).split('/').some((s) => s === '.' || s === '..');
 }
 const INLINE_RETRY_AFTER_MAX_SECONDS = 15;
 // How long the proxy will absorb a rate-limit 429's retry-after inline (waiting
@@ -843,15 +842,6 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // Client token refresh: pass through untouched (the proxy manages its own
       // tokens via ensureTokenFresh; rewriting client refreshes would conflict).
       if (req.method === 'POST' && req.url === '/v1/oauth/token') { await relayRaw(req, res, upstream, sx, resolveMaxBodyBytes(config)); return; }
-      // Remote Control (/v1/code/*) is bound to the session's paired claude.ai
-      // identity — forward with the client's OWN credential (streamed), never a
-      // rotated account token, which would 403 the worker event stream.
-      // Attachment transfers (/api/oauth/files/*, /api/oauth/file_upload) are
-      // likewise account-bound: files uploaded from claude.ai belong to the
-      // paired identity, so fetching them with a rotated token 403s and Claude
-      // Code silently drops the image from the message.
-      if (CLIENT_CREDENTIAL_PATHS.some((p) => (req.url || '').startsWith(p))) { await relayStream(req, res, upstream, sx); return; }
-
       // Account pin: a request to `/tc-acct/<name-or-index>/...` (e.g. via
       // ANTHROPIC_BASE_URL=http://host:port/tc-acct/deepseek) is forced onto that
       // one account, bypassing rotation. Used by the keep-warm scheduler and for
@@ -891,6 +881,30 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         }
         req.url = afterPrefix.slice(tokenEnd);
       }
+
+      // Remote Control (/v1/code/*) is bound to the session's paired claude.ai
+      // identity — forward with the client's OWN credential (streamed), never a
+      // rotated account token, which would 403 the worker event stream.
+      // Attachment transfers (/api/oauth/files/*, /api/oauth/file_upload) are
+      // likewise account-bound: files uploaded from claude.ai belong to the
+      // paired identity, so fetching them with a rotated token 403s and Claude
+      // Code silently drops the image from the message.
+      //
+      // Below the pin strip, so this reads the path that will actually be sent,
+      // and on its classification form: `/%61pi/oauth/…`, `/api/oauth%2fprofile`,
+      // `/api\oauth\profile` and `/tc-acct/<acct>/api/oauth/profile` all leave
+      // here as the identity plane, so all of them take the relay. A pinned
+      // account's token is a rotated token like any other — the pin says which
+      // account serves INFERENCE, and no version of it should put a fleet
+      // identity on /api/oauth/*. Above the strip this test still saw the
+      // prefix and matched nothing, while `provider` further down is built from
+      // the stripped url: the two disagreed about the same request.
+      //
+      // Still ABOVE the TC_ACCT branch below, which does not touch req.url —
+      // moving past it would turn an unknown TC_ACCT pin on an identity-plane
+      // request into a 404 that it does not return today.
+      const classifiedPath = classificationPath(req.url);
+      if (CLIENT_CREDENTIAL_PATHS.some((p) => classifiedPath.startsWith(p))) { await relayStream(req, res, upstream, sx); return; }
 
       // MITM-mode pin. A CONNECT carrying `Proxy-Authorization: Basic <acct>:…`
       // has no URL to hang a `/tc-acct/` prefix on — the path inside the tunnel

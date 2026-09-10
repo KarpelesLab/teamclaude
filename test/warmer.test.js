@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
+import { resolveAccountPin } from '../src/server.js';
 import { Warmer } from '../src/warmer.js';
 
 function oauth(name, extra = {}) {
@@ -73,6 +74,22 @@ test('the spawn invocation is a minimal non-interactive claude pinned to the acc
   assert.deepEqual(spec.args, ['-p', '--bare', '--model', 'haiku', '--output-format', 'text', 'hi']);
   assert.equal(spec.env.ANTHROPIC_BASE_URL, 'http://127.0.0.1:9999/tc-acct/solo');
   assert.equal(spec.env.ANTHROPIC_API_KEY, 'tc-secret');
+});
+
+test('warm-up pins distinguish one user across multiple organizations', async () => {
+  const am = new AccountManager([
+    oauth('person@example.com (Personal)', { accountUuid: 'account-1', orgUuid: 'org-personal' }),
+    oauth('person@example.com (Work)', { accountUuid: 'account-1', orgUuid: 'org-work' }),
+  ], 0.98);
+  const spawn = fakeSpawner();
+
+  await makeWarmer(am, spawn).warmAll();
+
+  const resolved = spawn.calls.map(({ env }) => {
+    const encodedPin = new URL(env.ANTHROPIC_BASE_URL).pathname.split('/').at(-1);
+    return resolveAccountPin(am, decodeURIComponent(encodedPin));
+  });
+  assert.deepEqual(resolved, [0, 1]);
 });
 
 // ── status ───────────────────────────────────────────────────────────────────
