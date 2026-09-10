@@ -852,7 +852,7 @@ async function loginCommand() {
 }
 
 async function loginApiCommand() {
-  const config = await loadOrCreateConfig();
+  await loadOrCreateConfig(); // first run: create the file; the save re-reads it
   let name = argValue('--name');
 
   const rl = createInterface({ input: process.stdin, output: process.stderr });
@@ -864,15 +864,20 @@ async function loginApiCommand() {
     process.exit(1);
   }
 
-  if (!name) {
-    const n = config.accounts.filter(a => a.name.startsWith('api-')).length + 1;
-    name = `api-${n}`;
-  }
-
-  config.accounts.push({ name, type: 'apikey', apiKey: apiKey.trim() });
-  await saveConfig(config);
+  // The prompt above waits on the user for as long as they take, and a running
+  // server may have rotated an OAuth account's refresh token on disk meanwhile.
+  // Saving the copy loaded before the prompt would put the dead token back and
+  // lose that account on its next restart, so the row is added to a fresh read.
+  const config = await atomicConfigUpdate(disk => {
+    if (!name) {
+      const n = disk.accounts.filter(a => a.name.startsWith('api-')).length + 1;
+      name = `api-${n}`;
+    }
+    disk.accounts.push({ name, type: 'apikey', apiKey: apiKey.trim() });
+  });
   console.log(`Added API key account "${name}"`);
   console.log(`Saved to ${getConfigPath()}`);
+  await notifyRunningServer(config);
 }
 
 async function loginOAuthCommand({ pasteOnly = false } = {}) {
