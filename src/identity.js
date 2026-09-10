@@ -10,6 +10,11 @@
 // The org discriminator prefers the org UUID but falls back to the org name
 // (the profile endpoint has always returned a name), so identity still works on
 // entries created before org UUIDs were stored.
+//
+// Provider is part of it too: a Codex account has no Anthropic UUID at all, so
+// without it one email's Claude and ChatGPT subscriptions compare as one account.
+
+import { providerOf } from './provider.js';
 
 /** Stable org discriminator for an account record: org UUID, else org name, else null. */
 export function orgKey(acct) {
@@ -38,6 +43,12 @@ export function sameOrg(a, b) {
 /**
  * Whether two account records refer to the same account+org.
  *
+ * - Different providers: never the same account, and the one case that needs no
+ *   UUID. Checked first because the name fallback below is what a cross-provider
+ *   pair reaches — a Codex account has no accountUuid to tell it apart from its
+ *   Claude namesake, so one email holding both subscriptions read as one account.
+ * - Both have an accountId (the ChatGPT one): it must match. Same evidence class
+ *   as the accountUuid below, so it decides before the name.
  * - Both have an accountUuid: it must match. If the organizations can be
  *   compared (see sameOrg) they must also match; but if either side's org is
  *   still unknown we treat them as the same. This lets a freshly-profiled login
@@ -47,6 +58,8 @@ export function sameOrg(a, b) {
  * - Otherwise (API-key accounts, or no UUID yet): fall back to matching by name.
  */
 export function sameIdentity(a, b) {
+  if (providerOf(a) !== providerOf(b)) return false;
+  if (a?.accountId && b?.accountId) return a.accountId === b.accountId;
   if (a?.accountUuid && b?.accountUuid) {
     if (a.accountUuid !== b.accountUuid) return false;
     return sameOrg(a, b) !== false;
@@ -58,8 +71,11 @@ export function sameIdentity(a, b) {
  * Are these two records definitely NOT the same account? True only when both
  * sides are fully identified and point at different account+org pairs — an
  * unknown UUID or org on either side means "cannot tell", never "different".
+ * Two providers are the exception: separate plans, whoever holds them.
  */
 export function distinctAccounts(a, b) {
+  if (providerOf(a) !== providerOf(b)) return true;
+  if (a?.accountId && b?.accountId) return a.accountId !== b.accountId;
   if (!a?.accountUuid || !b?.accountUuid) return false;
   if (a.accountUuid !== b.accountUuid) return true;
   return sameOrg(a, b) === false;
