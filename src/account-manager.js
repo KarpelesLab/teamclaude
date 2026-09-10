@@ -2123,6 +2123,20 @@ export class AccountManager {
       // `_firstSightOn` hands that back, and every cursor or pin move goes
       // through `_setCurrent` or `recordSession`, so a fail-back has been
       // offered it before any request reaches here.
+      // A reading that names NO account was offered nothing on the way here: the
+      // rebuild a removal leaves behind names nobody, and no cursor moved for
+      // `_firstSightOn` to run on. So this rest is the arrival, and a roll the
+      // chain still owes the account it arrives at is handed back rather than
+      // first-sighted away with the week that account has already gained.
+      if (obs.idx == null) {
+        const back = findHeld(obs.unescaped, h => h.idx === account.index);
+        if (back) {
+          this._moveObs(obs, account.index);
+          obs.windows = back.windows;
+          obs.unescaped = dropHeld(obs.unescaped, account.index);
+          return;
+        }
+      }
       const leaving = obs.idx == null ? null : this.accounts[obs.idx];
       // The hold belongs to the fleet whose READING it preserves, the one that
       // last moved this observation, rather than to the fleet that writes it.
@@ -2193,9 +2207,18 @@ export class AccountManager {
       // at a null index for _anyJumped to have rolled.
       const owed = findHeld(obs.unescaped, h => h.idx === account.index);
       if (owed) {
+        // The account the hand-back LEAVES may have rolled under the traffic that
+        // rested on it, and the restore below replaces its reading. That roll is
+        // an escape like any other, so it is chained rather than discarded, under
+        // the stamp of the move that escapes it — the push `_restOn` makes.
+        const leaving = obs.idx == null ? null : this.accounts[obs.idx];
+        const displaced = leaving && this._anyJumped(obs.windows, leaving)
+          ? { idx: obs.idx, windows: obs.windows, provider: obs.provider ?? this._selectingProvider }
+          : null;
         this._moveObs(obs, account.index);
         obs.windows = owed.windows;
         obs.unescaped = dropHeld(obs.unescaped, account.index);
+        if (displaced) obs.unescaped = { ...displaced, gen: obs.gen, prev: dropHeld(obs.unescaped, displaced.idx) };
         return;
       }
       if (this._anyJumped(obs.windows, this.accounts[obs.idx])) return;
@@ -2276,7 +2299,14 @@ export class AccountManager {
   _releaseHeld(obs, account, carried, provider) {
     if (!obs || carried == null) return;
     if (obs.idx !== account.index || obs.gen !== carried) return;
-    const owed = findHeld(obs.unescaped, h => h.gen === carried);
+    // A serve settles a roll held against the very account it was served at,
+    // whatever move stamped it: a borrowed walk can leave the reading resting on
+    // an account the chain still owes without any move of ours, and being served
+    // there is the arrival the hold was waiting for. Its own fleet only, so the
+    // shared-key rule above is untouched, and only that account's roll, so every
+    // other escape on the chain still stands.
+    const owed = findHeld(obs.unescaped, h => h.gen === carried)
+      ?? findHeld(obs.unescaped, h => h.idx === account.index && h.provider === provider);
     if (!owed || !provider) return;
     // A hold has a reading to itself only where the destination is its own
     // fleet's subscription, which no other fleet is ever served at. Anywhere
