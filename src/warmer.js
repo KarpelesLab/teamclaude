@@ -326,11 +326,16 @@ export class Warmer {
   /** The `claude` invocation for one account. Pure/deterministic so tests can
    *  assert the args and env without spawning anything. */
   _spawnSpec(account, signal) {
-    // Pin by accountUuid — a stable identity. The rotation index is NOT usable:
-    // it is array position, so removing an account would repoint this at a
+    // One user can have accounts in several organizations, all sharing the
+    // same accountUuid. Qualify it with orgUuid when possible so each warm-up
+    // reaches the intended subscription. The rotation index is NOT usable: it
+    // is array position, so removing an account would repoint this at a
     // different one. Fall back to the display name when the uuid isn't known
-    // yet (e.g. an API-key account, or before the first profile fetch).
-    const pin = encodePinComponent(account.accountUuid || account.name);
+    // yet (e.g. before the first profile fetch).
+    const identity = account.accountUuid && account.orgUuid
+      ? `${account.accountUuid}/${account.orgUuid}`
+      : account.accountUuid || account.name;
+    const pin = encodePinComponent(identity);
     const baseUrl = `http://127.0.0.1:${this.port}/tc-acct/${pin}`;
     return {
       command: 'claude',
