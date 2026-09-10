@@ -6,6 +6,8 @@ Config is stored at `~/.config/teamclaude.json` (or `$XDG_CONFIG_HOME/teamclaude
 
 Volatile runtime state (observed quota) is written separately to `teamclaude.state.json` alongside the config, so the config file stays clean and hand-editable. The state file is safe to delete — quota is simply re-learned from traffic.
 
+While the config is being rewritten — by the server rotating a refresh token, by a CLI command that saves, or by any other client — the writer holds `teamclaude.json.lock` next to it: a file containing `{"pid":<pid>,"at":<ms epoch>}`. It is an advisory lock so that separate writers wait for one another instead of overwriting each other's edit (a lost write here was typically a freshly rotated refresh token, which cost a re-login). It exists for milliseconds; a lock older than 10 s or whose pid is gone is treated as stale and removed by the next writer, and a writer that cannot get it within 2 s proceeds anyway, with one warning in the log, rather than hang. It is safe to delete by hand if one is left behind.
+
 ## Format
 
 ```json
