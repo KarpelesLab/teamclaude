@@ -1,6 +1,6 @@
 {
   "name": "@karpeleslab/teamclaude",
-  "version": "1.1.18",
+  "version": "1.1.19",
   "description": "Multi-account proxy for Claude Code and Codex: pools Claude Max, ChatGPT/Codex, API-key and third-party backend accounts, and rotates on quota",
   "type": "module",
   "main": "src/index.js",
