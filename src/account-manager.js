@@ -2217,8 +2217,16 @@ export class AccountManager {
           : null;
         this._moveObs(obs, account.index);
         obs.windows = owed.windows;
+        // A restore outside a selection walk reads no fleet from one. The reading
+        // handed back is the one the hold's fleet established, so it keeps that
+        // fleet, and the next hand-back has one to stamp the roll it leaves with.
+        obs.provider ??= owed.provider;
         obs.unescaped = dropHeld(obs.unescaped, account.index);
-        if (displaced) obs.unescaped = { ...displaced, gen: obs.gen, prev: dropHeld(obs.unescaped, displaced.idx) };
+        // No stamp: the move that leaves this roll is a move BACK, and a stay
+        // served at the account it returns to is no evidence about the one it
+        // left. Only a stay served on that account releases it, or a return that
+        // restores it, which is matched on index and needs no stamp.
+        if (displaced) obs.unescaped = { ...displaced, gen: null, prev: dropHeld(obs.unescaped, displaced.idx) };
         return;
       }
       if (this._anyJumped(obs.windows, this.accounts[obs.idx])) return;
@@ -2299,15 +2307,18 @@ export class AccountManager {
   _releaseHeld(obs, account, carried, provider) {
     if (!obs || carried == null) return;
     if (obs.idx !== account.index || obs.gen !== carried) return;
+    const owed = findHeld(obs.unescaped, h => h.gen === carried);
     // A serve settles a roll held against the very account it was served at,
     // whatever move stamped it: a borrowed walk can leave the reading resting on
     // an account the chain still owes without any move of ours, and being served
     // there is the arrival the hold was waiting for. Its own fleet only, so the
-    // shared-key rule above is untouched, and only that account's roll, so every
-    // other escape on the chain still stands.
-    const owed = findHeld(obs.unescaped, h => h.gen === carried)
-      ?? findHeld(obs.unescaped, h => h.idx === account.index && h.provider === provider);
-    if (!owed || !provider) return;
+    // shared-key rule is untouched, and only that account's roll, so every
+    // other escape on the chain still stands. One confirmation can qualify that
+    // roll and the one this move escaped, and each is settled on its own evidence.
+    const own = findHeld(obs.unescaped, h => h.idx === account.index && h.provider === provider);
+    if (!provider) return;
+    if (own) obs.unescaped = dropHeld(obs.unescaped, own.idx);
+    if (!owed) return;
     // A hold has a reading to itself only where the destination is its own
     // fleet's subscription, which no other fleet is ever served at. Anywhere
     // else the destination has one reading for whoever it serves, so a success

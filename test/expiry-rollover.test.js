@@ -1871,6 +1871,188 @@ test('a confirmed serve releases a roll held against the account it rests on', (
     'the request after the return was preempted off a week already spent');
 });
 
+test('a hand-back holds the roll it leaves for the fleet whose reading it is', () => {
+  // A hand-back outside a selection walk reads no fleet from the walk: the pin
+  // store's restore runs from `recordSession`, after the walk has cleared it.
+  // The reading it hands back was established by the fleet the hold names, so
+  // keeping that fleet on the reading is what lets the NEXT hand-back stamp the
+  // roll it leaves with a fleet at all. A roll naming none can be settled by
+  // nobody, and the account it belongs to keeps it for ever.
+  const am = mgr(['a', 'b', 'c'], ON, { distributeSessions: true });
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30]]) bucket(am, i, 'unified7d', 0.4, hours);
+
+  assert.equal(serve(am, 's1', OPUS).name, 'a', 'the fixture must start on a');
+  rollWindow(am, 0);
+  assert.equal(serve(am, 's1', OPUS).name, 'b', 'a\'s roll did not move the pin');
+  assert.equal(serve(am, 's1', OPUS).name, 'b', 'the preemption did not settle on b');
+  rollWindow(am, 1);
+
+  assert.equal(serve(am, 's1', OPUS, { exclude: new Set([1, 2]) }).name, 'a',
+    'the forced fail-back did not reach a');
+  const first = am.sessionTracker.refsFor('s1', 'unified7d');
+  assert.equal(first.provider, 'anthropic',
+    'the reading the hand-back restored forgot the fleet that established it');
+
+  assert.equal(serve(am, 's1', OPUS, { exclude: new Set([2]) }).name, 'b',
+    'the forced return did not reach b');
+  const held = am.sessionTracker.refsFor('s1', 'unified7d').unescaped;
+  assert.equal(held.idx, 0, 'the second hand-back did not hold a\'s roll');
+  assert.equal(held.provider, 'anthropic',
+    'the roll the second hand-back left names no fleet, so no serve can settle it');
+
+  // The control on the fleet this arm reads. A hand-back INSIDE a walk takes the
+  // fleet from the walk, so a fix that reads the hold would be untested by the
+  // assertions above: this one is stamped whether or not the restore keeps it.
+  const one = mgr(['a', 'b', 'c'], ON);
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30]]) bucket(one, i, 'unified7d', 0.4, hours);
+  one.selectActiveAccount();
+  const walkReq = (exclude = null) => one.getActiveAccount(exclude, OPUS, null, null, 'anthropic');
+  assert.equal(walkReq().name, 'a', 'the control must start on a');
+  rollWindow(one, 0);
+  assert.equal(walkReq().name, 'b', 'the control\'s roll did not preempt');
+  assert.equal(walkReq().name, 'b', 'the control did not settle on b');
+  rollWindow(one, 1);
+  assert.equal(walkReq(new Set([1, 2])).name, 'a', 'the control\'s fail-back did not reach a');
+  assert.equal(one._currentObs.unescaped.provider, 'anthropic',
+    'a hand-back inside a walk stamped the roll it left with no fleet');
+});
+
+test('an operator switch that hands a roll back keeps the fleet on the reading', () => {
+  // The second route to the same restore: the TUI's switch and the /switch
+  // endpoint move the cursor with no walk around them at all, so a reading whose
+  // fleet the first switch dropped leaves the second switch a roll no serve can
+  // reach.
+  const am = mgr(['a', 'b', 'c'], ON);
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30]]) bucket(am, i, 'unified7d', 0.4, hours);
+  am.selectActiveAccount();
+  const walkReq = (exclude = null) => am.getActiveAccount(exclude, OPUS, null, null, 'anthropic');
+
+  assert.equal(walkReq().name, 'a', 'the fixture must start on a');
+  rollWindow(am, 0);
+  assert.equal(walkReq().name, 'b', 'a\'s roll did not preempt');
+  assert.equal(walkReq().name, 'b', 'the preemption did not settle on b');
+  rollWindow(am, 1);
+
+  assert.equal(am.setCurrentAccount(0), true, 'the operator switch to a was refused');
+  assert.equal(am._currentObs.provider, 'anthropic',
+    'the switch back to a forgot the fleet that established the reading');
+  assert.equal(am.setCurrentAccount(1), true, 'the operator switch to b was refused');
+  assert.equal(am._currentObs.unescaped.idx, 0,
+    'the second switch did not hold a\'s roll');
+  assert.equal(am._currentObs.unescaped.provider, 'anthropic',
+    'the roll the second switch left names no fleet, so no serve can settle it');
+});
+
+test('a confirmed serve releases the roll held against the account it rests on and the one the move escaped', () => {
+  // A confirmation can qualify two rolls. The move that rested the traffic back
+  // escaped the borrower's; the borrowed rest before it left the served
+  // account's own. One settlement per confirmation reaches only the first, so
+  // the account that answered keeps a roll it has already been served under,
+  // and the fleet is preempted off it a request later.
+  const am = new AccountManager(
+    [oauth('d'), oauth('e'), codexAccount('c1')], 0.98, { expiryRouting: ON },
+  );
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30]]) bucket(am, i, 'unified7d', 0.4, hours);
+
+  const ownerReq = (exclude = null) => am.getActiveAccount(exclude, OPUS, null, null, 'anthropic');
+  const codexReq = () => am.getActiveAccount(null, GPT, null, null, 'codex');
+
+  assert.equal(ownerReq().name, 'd', 'the owner must start on d');
+  rollWindow(am, 0);
+  assert.equal(codexReq().name, 'c1', 'the first borrowed walk did not reach c1');
+  assert.equal(codexReq().name, 'c1', 'the second borrowed walk did not rest on c1');
+  // c1 rolls under the borrowed traffic, so the rest back on d escapes its roll
+  // too and two rolls are outstanding at once.
+  rollWindow(am, 2);
+  assert.equal(ownerReq(new Set([1])).name, 'd', 'the owner\'s first arrival left d');
+  assert.equal(ownerReq(new Set([1])).name, 'd', 'the owner\'s rest left d');
+  assert.equal(am._currentObs.unescaped.idx, 2, 'the rest back on d held nothing for c1');
+  assert.equal(am._currentObs.unescaped.prev?.idx, 0, 'the borrowed walk held nothing for d');
+
+  const carried = am.observedGeneration(null, OPUS);
+  const served = ownerReq(new Set([1]));
+  assert.equal(served.name, 'd', 'the confirming request left d');
+  am.confirmStay(served, carried, null, 'anthropic');
+  assert.equal(am._currentObs.unescaped, null,
+    'a serve on d left the roll held against d outstanding behind the move-stamped one');
+
+  assert.equal(ownerReq(new Set([0])).name, 'e', 'the forced move off d did not reach e');
+  assert.equal(ownerReq(new Set([1])).name, 'd', 'the forced return did not reach d');
+  assert.equal(am._currentRolledOver(am.accounts[0], OPUS), false,
+    'the return was handed a roll d had already been served under');
+  assert.equal(ownerReq().name, 'd',
+    'the request after the return was preempted off a week already spent');
+});
+
+test('a stay at a fail-back destination does not release the roll the hand-back left behind', () => {
+  // A 429 excludes the destination and the fail-back reaches an account the
+  // chain still owes, so the roll it leaves behind is chained under that move's
+  // own stamp. The very next request stays where it is, so it selects under
+  // that same stamp and its serve settles a roll held against the account the
+  // fleet has just left. Nothing has come back there, and the return finds the
+  // week that account gained already spent.
+  const am = mgr(['a', 'b'], ON);
+  bucket(am, 0, 'unified7d', 0.4, 10);
+  bucket(am, 1, 'unified7d', 0.4, 20);
+  const req = (exclude, confirm) => {
+    const carried = am.observedGeneration(null, OPUS);
+    const account = am.getActiveAccount(exclude, OPUS, null, null, 'anthropic');
+    if (account && confirm) am.confirmStay(account, carried, null, 'anthropic');
+    return account;
+  };
+
+  assert.equal(req(null, true).name, 'a', 'the fixture must start on a');
+  rollWindow(am, 0);
+  assert.equal(req(null, true).name, 'b', 'a\'s roll did not preempt');
+  assert.equal(req(null, true).name, 'b', 'the preemption did not settle on b');
+  // b rolls under the resting traffic, so the fail-back below leaves a roll there.
+  rollWindow(am, 1);
+  assert.equal(req(new Set([1]), true).name, 'a', 'the 429 fail-back did not reach a');
+  assert.equal(am._currentObs.unescaped.idx, 1, 'the fail-back held nothing for b');
+
+  assert.equal(req(null, true).name, 'a', 'the next request did not stay on a');
+  assert.equal(am._currentObs.unescaped?.idx, 1,
+    'a serve at a settled the roll held against b');
+
+  assert.equal(req(new Set([0]), true).name, 'b', 'the forced return did not reach b');
+  assert.equal(am._currentRolledOver(am.accounts[1], OPUS), true,
+    'the return to b was handed a week b had already gained');
+  assert.equal(req(null, false).name, 'a',
+    'the fleet parked on the week b had just gained');
+});
+
+test('a pinned fail-back holds its roll across the serves that confirm each stay', () => {
+  // The same fail-back in the store a session pin keeps, with the server's own
+  // handshake around every request and the stamp read before each walk selects.
+  // A confirmation the pin's own hand-back leaves reachable spends the pin's
+  // roll where the sticky reading's does the fleet's.
+  const am = mgr(['a', 'b', 'c', 'd'], ON, { distributeSessions: true });
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30], [3, 40]]) bucket(am, i, 'unified7d', 0.4, hours);
+  const req = (exclude = null) => {
+    const carried = am.observedGeneration('s1', OPUS);
+    const account = serve(am, 's1', OPUS, { exclude });
+    if (account) am.confirmStay(account, carried, 's1', 'anthropic');
+    return account;
+  };
+
+  assert.equal(req().name, 'a', 'the fixture must start on a');
+  rollWindow(am, 0);
+  assert.equal(req().name, 'b', 'a\'s roll did not move the pin');
+  assert.equal(req().name, 'b', 'the preemption did not settle on b');
+  rollWindow(am, 1);
+  assert.equal(req().name, 'c', 'b\'s roll did not move the pin');
+  assert.equal(req().name, 'c', 'the second preemption did not settle on c');
+  rollWindow(am, 2);
+
+  assert.equal(req(new Set([1, 2, 3])).name, 'a', 'the forced fail-back did not reach a');
+  assert.equal(am._pinRolledOver('s1', am.accounts[0], OPUS), true,
+    'the pin\'s fail-back to a was handed nothing');
+  assert.equal(req(new Set([0, 1, 3])).name, 'c', 'the forced return to c did not reach c');
+  assert.equal(am._pinRolledOver('s1', am.accounts[2], OPUS), true,
+    'a confirmation spent the roll the pin\'s hand-back left on c');
+  assert.equal(req().name, 'd', 'the pin parked on the week c had just gained');
+});
+
 test('a fail-back to the account of the most recent escape is still handed its roll', () => {
   // The other end of the chain from the arm above: the newest escape is handed
   // back too, and is not lost to the older one still outstanding.
