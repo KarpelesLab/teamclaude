@@ -666,6 +666,9 @@ async function serverCommand() {
   // Background self-update for a backgrounded (headless) server. Skipped under
   // the TUI, where npm's install output would corrupt the display — interactive
   // users update via `teamclaude run` (post-session) or `teamclaude update`.
+  // Not awaited, and nothing inside it is synchronous: the npm probe and the
+  // install are child processes the loop runs beside (#353), so this never
+  // holds up a request.
   if (!tui) autoUpdate({ config }).catch(() => {});
 
   // One idempotent shutdown funnel for BOTH modes and BOTH triggers: POSIX
@@ -1783,7 +1786,7 @@ async function updateCommand() {
   const cur = currentVersion();
   console.log(`Current version: ${cur || 'unknown'}`);
 
-  const kind = installKind();
+  const kind = await installKind();
   if (kind === 'git') {
     console.log('This is a git checkout — update it with `git pull`, not npm.');
     return;
@@ -1801,7 +1804,7 @@ async function updateCommand() {
   }
 
   console.log(`Updating ${info.current} → ${info.latest} …`);
-  const ok = runUpdate(info.latest);
+  const ok = await runUpdate(info.latest);
   if (ok) {
     console.log(`Updated to ${info.latest}. Restart teamclaude to use the new version.`);
   } else {

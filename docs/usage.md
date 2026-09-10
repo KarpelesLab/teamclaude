@@ -215,7 +215,7 @@ The page is a static asset and loads without a key; the data does not — its sc
 
 ## Auto-update
 
-When TeamClaude is installed globally via npm, it self-updates in the background: it checks the npm registry at most once a day, and when a newer version is published it runs `npm install -g @karpeleslab/teamclaude@latest` and applies it on the next launch. The check runs after a `teamclaude run` session ends and when a headless server starts. A git checkout is never touched — update that with `git pull`. Run `teamclaude update` to update on demand.
+When TeamClaude is installed globally via npm, it self-updates in the background: it checks the npm registry at most once a day, and when a newer version is published it runs `npm install -g @karpeleslab/teamclaude@latest` and applies it on the next launch. The check runs after a `teamclaude run` session ends and when a headless server starts. In a headless server the install runs as a background child process, so the proxy keeps serving requests while npm works (a synchronous install used to stall it for the duration). A git checkout is never touched — update that with `git pull`. Run `teamclaude update` to update on demand.
 
 Disable it with `TEAMCLAUDE_DISABLE_AUTOUPDATE=1` or `"autoUpdate": false` in the config.
 

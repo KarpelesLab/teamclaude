@@ -2700,10 +2700,10 @@ export async function streamResponse(webStream, res, accountIndex, accountManage
   if (clientGone(res)) onClose();
   const idleMs = resolveBodyIdleTimeout();
   const decoder = new TextDecoder();
-  let sseBuffer = '';
   let errored = false;
   // The message's usage, merged across its two reports and recorded once below.
   const merged = {};
+  const usage = createSseLineScanner(line => parseSSEDataLine(line, accountIndex, accountManager, onUsage, merged));
 
   try {
     while (true) {
@@ -2724,16 +2724,10 @@ export async function streamResponse(webStream, res, accountIndex, accountManage
       const logPending = bodyWriter?.drain?.();
       if (logPending) await logPending;
 
-      const text = decoder.decode(value, { stream: true });
-
-      // Parse SSE events for usage tracking
-      sseBuffer += text;
-      const events = sseBuffer.split('\n\n');
-      sseBuffer = events.pop(); // keep incomplete event
-
-      for (const event of events) {
-        parseSSEUsage(event, accountIndex, accountManager, onUsage, merged);
-      }
+      // Parse the SSE data lines for usage tracking, as they arrive. The relay
+      // above is done with the chunk by now; this reads it and retains at most
+      // one bounded partial line, never the response.
+      usage.push(decoder.decode(value, { stream: true }));
 
       // Handle backpressure — also bail out if client disconnects,
       // because 'drain' will never fire on a destroyed socket
@@ -2750,10 +2744,9 @@ export async function streamResponse(webStream, res, accountIndex, accountManage
       }
     }
 
-    // Parse any remaining buffer
-    if (sseBuffer.trim()) {
-      parseSSEUsage(sseBuffer, accountIndex, accountManager, onUsage, merged);
-    }
+    // A final data line without a trailing newline.
+    usage.push(decoder.decode());
+    usage.flush();
   } catch (err) {
     // A mid-stream idle timeout (or any read error) means the upstream went
     // silent after headers. Rethrow to the caller's transient handler, which
@@ -2780,6 +2773,61 @@ export async function streamResponse(webStream, res, accountIndex, accountManage
   }
 }
 
+// The longest line the usage scanner will hold while waiting for its newline.
+// A real Anthropic SSE line is a single JSON event of at most a few kilobytes,
+// so this sits three orders of magnitude above anything legitimate.
+export const SSE_MAX_LINE_CHARS = 1 << 20;
+
+/**
+ * A line scanner for the usage parser: `push(text)` hands every complete line
+ * to `onLine` as it arrives and retains only the trailing partial one; `flush()`
+ * delivers that partial at end of stream.
+ *
+ * The parser used to accumulate the whole response into one string and drain
+ * it on the `\n\n` event boundary. An upstream that sends
+ * `text/event-stream` and never a blank line — a stuck or garbage stream, a
+ * misbehaving third-party backend — therefore grew that string for the whole
+ * response, re-split on every chunk, until V8 aborted the process on its heap
+ * limit: uncatchable, and it took every account and every session down with
+ * it (#341). The relay never needed the buffer; only the accounting did, and
+ * the accounting reads single lines.
+ *
+ * So the retained state is one line, and even that is bounded: a partial line
+ * that outgrows `maxChars` is dropped, and the rest of that line is discarded
+ * up to its newline. Only that line's usage figure is lost, which the caller
+ * already tolerates; the bytes themselves were relayed before they came here.
+ */
+export function createSseLineScanner(onLine, maxChars = SSE_MAX_LINE_CHARS) {
+  let partial = '';
+  let dropping = false; // inside a line already judged too long
+  return {
+    push(text) {
+      let start = 0;
+      for (;;) {
+        const nl = text.indexOf('\n', start);
+        if (nl < 0) break;
+        if (!dropping) {
+          const line = partial + text.slice(start, nl);
+          if (line.length <= maxChars) onLine(line);
+        }
+        partial = '';
+        dropping = false;
+        start = nl + 1;
+      }
+      if (dropping) return;
+      partial += text.slice(start);
+      if (partial.length > maxChars) { partial = ''; dropping = true; }
+    },
+    flush() {
+      if (!dropping && partial.trim()) onLine(partial);
+      partial = '';
+      dropping = false;
+    },
+    /** Characters currently retained, for tests that pin the bound. */
+    pending() { return partial.length; },
+  };
+}
+
 // A streaming response reports its usage twice. `message_start` carries the
 // input side, including the two cache fields, with an output figure that is only
 // a placeholder. `message_delta` then reports figures that are cumulative for
@@ -2792,12 +2840,14 @@ export async function streamResponse(webStream, res, accountIndex, accountManage
 // message's final figures for a single `recordTokenUsage` once the stream is
 // over. One record per message is what makes double counting unrepresentable
 // rather than merely avoided.
-function parseSSEUsage(event, accountIndex, accountManager, onUsage = null, merged = null) {
-  const dataLine = event.split('\n').find(l => l.startsWith('data: '));
-  if (!dataLine) return;
+//
+// Reads one `data:` line. Anthropic's events carry exactly one, so a line is an
+// event for this purpose, and the scanner above never has to hold more.
+function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, merged = null) {
+  if (!line.startsWith('data: ')) return;
 
   try {
-    const data = JSON.parse(dataLine.slice(6));
+    const data = JSON.parse(line.slice(6));
     if (data.type === 'message_start' && data.message?.usage) {
       accountManager.updateUsage(accountIndex, data.message.usage.input_tokens, 0);
       onUsage?.(data.message.usage.input_tokens || 0, 0);
