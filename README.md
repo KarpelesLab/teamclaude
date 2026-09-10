@@ -23,7 +23,7 @@ teamclaude server    # start the proxy, shows the TUI
 teamclaude run       # in another terminal: Claude Code through the proxy
 ```
 
-Already logged into Claude Code? `teamclaude import` takes its credentials instead of a fresh OAuth round. API keys, and one email holding accounts in several orgs, are covered in [docs/accounts.md](docs/accounts.md).
+Already logged into Claude Code? `teamclaude import` takes its credentials instead of a fresh OAuth round. A container image is on GHCR — see [Running in a container](docs/usage.md#running-in-a-container). API keys, and one email holding accounts in several orgs, are covered in [docs/accounts.md](docs/accounts.md).
 
 ## What it does
 
