@@ -414,6 +414,10 @@ async function serverCommand() {
     accountManager.setExpiryRouting(config.expiryRouting);
     config.sessionTitles = diskConfig.sessionTitles;
     sessionTitles.configure(config.sessionTitles);
+    // Both are read per request off this object (server.js) and the TUI already
+    // persists them; without this a hand edit or another writer waited for a restart.
+    config.eventLogging = diskConfig.eventLogging || 'hide';
+    config.blockedModels = Array.isArray(diskConfig.blockedModels) ? diskConfig.blockedModels : [];
     // Apply an sx.org key/mode change made on disk (e.g. via POST /teamclaude/reload).
     const diskSxKey = diskConfig.sx?.apiKey || null;
     const diskSxMode = diskConfig.sx?.mode || 'always';
@@ -1076,6 +1080,20 @@ async function runCommand() {
 
 // ── status ──────────────────────────────────────────────────
 
+// process.stdout.write is asynchronous when stdout is a pipe, so a write that
+// is followed by process.exit loses whatever has not reached the pipe yet: on
+// macOS a 15 KB status came out as its first 512 bytes through `| jq`. This
+// resolves once the bytes are handed off. A reader that quits early (`| head`)
+// raises EPIPE, which console.log swallows; the listener keeps that behaviour.
+function writeStdout(text) {
+  return new Promise(resolve => {
+    process.stdout.write(text, err => {
+      if (err) process.stdout.once('error', () => {});
+      resolve();
+    });
+  });
+}
+
 async function statusCommand() {
   const config = await loadOrCreateConfig();
   const url = `http://localhost:${config.proxy.port}/teamclaude/status`;
@@ -1097,10 +1115,10 @@ async function statusCommand() {
     });
     const data = await res.json();
     if (json) {
-      console.log(JSON.stringify(data, null, 2));
+      await writeStdout(`${JSON.stringify(data, null, 2)}\n`);
       return;
     }
-    console.log(renderStatus(data, { color }));
+    await writeStdout(`${renderStatus(data, { color })}\n`);
   } catch (err) {
     if (err?.name === 'TimeoutError') {
       console.error(`Proxy at localhost:${config.proxy.port} did not answer status within ${timeoutMs}ms.`);
@@ -2292,7 +2310,8 @@ function startTerminalTitleUpdater(accountManager) {
 // CLI changes take effect without a restart. A closed local port refuses the
 // connection immediately, so this is a no-op (and near-instant) when nothing is
 // running. Reload picks up new accounts, credential, priority, and enable/disable
-// changes; account removals still need a restart.
+// changes, plus eventLogging and blockedModels edits; account removals still
+// need a restart.
 async function notifyRunningServer(config) {
   const port = config?.proxy?.port;
   if (!port) return;

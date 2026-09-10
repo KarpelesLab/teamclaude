@@ -13,6 +13,8 @@
 // re-serialising tool calls, streaming events and cache breakpoints, which is
 // exactly the fidelity loss this proxy exists to avoid.
 
+import { classificationPath } from './classification-path.js';
+
 /** Providers keyed by the value used in an account's `provider` field. */
 export const PROVIDERS = {
   anthropic: {
@@ -137,7 +139,14 @@ const CODEX_PATHS = ['/backend-api/codex'];
  * client-supplied hint that could disagree with the body.
  */
 export function providerForPath(url) {
-  const path = String(url || '').split('?')[0];
+  // Read on the classification path, never rewritten: the request goes out with
+  // the path exactly as it arrived, so this test has to read it the way the
+  // parser and the receiving server will. Otherwise
+  // `/backend-api/codex/..%2fconversations` classifies as Codex and lands
+  // somewhere else entirely, and `/backend-api\codex/responses` — which
+  // `new URL()` folds to a Codex path before sending it — does not classify as
+  // Codex at all, so it draws the wrong pool's credential.
+  const path = classificationPath(url);
   return CODEX_PATHS.some(p => path === p || path.startsWith(`${p}/`))
     ? 'codex'
     : DEFAULT_PROVIDER;
