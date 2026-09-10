@@ -17,11 +17,14 @@ export async function resolveAccounts(config) {
   const accounts = [];
   for (const acct of config.accounts) {
     if (acct.type === 'oauth') {
-      if (acct.importFrom || providerOf(acct) === 'codex') {
-        // A Codex account defaults to the Codex CLI's own credentials file, so
-        // `{ "name": "...", "type": "oauth", "provider": "codex" }` is enough
-        // to pool an already-signed-in Codex login.
-        const isCodex = providerOf(acct) === 'codex';
+      // A Codex account defaults to the Codex CLI's own credentials file, so
+      // `{ "name": "...", "type": "oauth", "provider": "codex" }` is enough to
+      // pool an already-signed-in Codex login. A default, not an override: that
+      // file holds ONE ChatGPT login, and importing it over an account that has
+      // its own credential collapsed every Codex row onto that login, discarding
+      // what `teamclaude login --codex` had stored.
+      const isCodex = providerOf(acct) === 'codex';
+      if (acct.importFrom || (isCodex && !acct.accessToken)) {
         const from = acct.importFrom || (isCodex ? DEFAULT_CODEX_CREDENTIALS_PATH : null);
         if (!from) { console.error(`No token for "${acct.name}", skipping`); continue; }
         try {

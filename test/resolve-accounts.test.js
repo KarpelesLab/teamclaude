@@ -125,3 +125,54 @@ test('non-import accounts pass through with every field intact', async () => {
   assert.equal(accounts[0].priority, 2);
   assert.deepEqual(accounts[1].models, ['glm-4']);
 });
+
+// Write a Codex CLI credentials file and return its path.
+async function codexFile(dir, name, tokens) {
+  const path = join(dir, name);
+  await writeFile(path, JSON.stringify({ tokens }));
+  return path;
+}
+
+// The regression. `~/.codex/auth.json` holds ONE ChatGPT login and was imported
+// for EVERY Codex account, credential of its own or not, so both pool entries
+// authenticated as the CLI's account while their usage was booked separately —
+// two rows that could never rotate against each other. No file is touched here
+// on purpose: reading the real one is what must not happen.
+test('a Codex account with its own credentials is not overwritten by the CLI login', async () => {
+  const accounts = await resolveAccounts({
+    accounts: [{
+      name: 'second@example.com',
+      type: 'oauth',
+      provider: 'codex',
+      accessToken: 'own-access',
+      refreshToken: 'own-refresh',
+      accountId: 'own-account-id',
+      expiresAt: Date.now() + HOUR,
+    }],
+  });
+
+  assert.deepEqual(accounts.map(a => a.name), ['second@example.com']);
+  assert.equal(accounts[0].accessToken, 'own-access');
+  assert.equal(accounts[0].refreshToken, 'own-refresh');
+  assert.equal(accounts[0].accountId, 'own-account-id');
+});
+
+// The other half of the contract: an entry with no credential of its own still
+// picks up the CLI's login, which is what makes a bare
+// `{ name, type, provider }` entry work. Pinned through importFrom so the test
+// names its own file instead of the developer's.
+test('a Codex account with no credentials still takes them from the CLI file', async () => {
+  await withTmp(async dir => {
+    const path = await codexFile(dir, 'auth.json', {
+      access_token: 'cli-access', refresh_token: 'cli-refresh', account_id: 'cli-account-id',
+    });
+
+    const [acct] = await resolveAccounts({
+      accounts: [{ name: 'first@example.com', type: 'oauth', provider: 'codex', importFrom: path }],
+    });
+
+    assert.equal(acct.accessToken, 'cli-access');
+    assert.equal(acct.refreshToken, 'cli-refresh');
+    assert.equal(acct.accountId, 'cli-account-id');
+  });
+});
