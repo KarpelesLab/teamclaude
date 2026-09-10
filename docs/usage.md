@@ -12,6 +12,25 @@ From a TTY this shows the interactive TUI: an account table with session/weekly 
 
 It falls back to plain log output when stdout is not a TTY (e.g. running as a service). Pass `--headless` (or `--no-tui`) to force plain-log mode from a terminal — useful for backgrounding the proxy.
 
+### Running in a container
+
+A container image is published to GHCR on every version bump (`ghcr.io/karpeleslab/teamclaude`, tagged `latest`, `1`, `1.1` and the full version). It runs `server --headless` bound to `0.0.0.0` inside the container, so publish the port and bind-mount the config file:
+
+```bash
+docker run -d --name teamclaude -p 3456:3456 \
+  -v ~/.config/teamclaude.json:/data/teamclaude.json \
+  ghcr.io/karpeleslab/teamclaude:latest
+
+docker exec -it teamclaude teamclaude login --token   # add accounts from inside
+docker exec -it teamclaude teamclaude status
+```
+
+The entrypoint starts as root only long enough to match the runtime user to the owner of the mounted config (or of `/data` when the file does not exist yet), then drops privileges — so a file owned by your user stays writable without a `chown`. `TEAMCLAUDE_UID` (and optional `TEAMCLAUDE_GID`) override the detected owner. stderr is folded into stdout so `docker logs` shows one stream; set `TEAMCLAUDE_SPLIT_STDERR=1` to keep them apart. Auto-update is disabled in the image; pull a new tag to upgrade.
+
+The config is created on first start with a random `proxy.apiKey`. Anything reaching the proxy from outside the container is a non-loopback client and must present that key (see [proxy.host](configuration.md#fields)); only `teamclaude` commands run via `docker exec` are exempt.
+
+Build it yourself with `docker build -t teamclaude .` from a checkout.
+
 ### Session titles in the activity log
 
 Claude Code sends `x-claude-code-session-id` with each request, so every activity row belongs to a known

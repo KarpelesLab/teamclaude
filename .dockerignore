@@ -1,0 +1,32 @@
+# The image only needs src/, package.json and LICENSE.
+
+# Secrets -- config.json holds account credentials.
+config.json
+*.pem
+*.key
+.env
+.env.*
+
+# VCS and CI
+.git
+.gitignore
+.github
+
+# Dependencies and build noise
+node_modules
+npm-debug.log*
+*.log
+
+# Dev-only tooling and docs
+test
+docs
+screenshots
+nix
+flake.nix
+flake.lock
+eslint.config.js
+.claude
+README.md
+SECURITY.md
+Dockerfile
+.dockerignore
