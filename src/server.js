@@ -499,30 +499,39 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
   // call — Node fires 'upgrade' for that handshake, never 'request', so it
   // needs its own listener (base-URL routing path; the MITM path wires the
   // same relayUpgrade onto its own terminating server in mitm.js).
+  // Guarded like requestHandler and the connect handler are: this process
+  // exits on any uncaught throw (see crash-log.js), and a listener handed a raw
+  // socket has nothing else standing between a bad handshake and that exit.
   server.on('upgrade', (req, socket, head) => {
-    // The upgrade handshake never reaches requestHandler, so it does not
-    // inherit the key gate above — it has to ask for itself. Without this a
-    // WebSocket handshake is an unauthenticated relay to `upstream`: the
-    // handshake carries no pooled credential (relayUpgrade forwards the
-    // client's own headers), so it is not a way to spend the fleet's quota,
-    // but it is a way to reach the upstream on this host's address and
-    // bandwidth. A deployment on a public hostname hands that to anyone.
-    const auth = resolveUpgradeAuth(req, socket, config.proxy);
-    if (!auth.ok) {
-      // Logged as well as answered: a WebSocket client discards the status
-      // line, so the 401 alone leaves an operator with a channel that is
-      // silently dead — the same shape as the outage this gate could cause if
-      // a client turns out not to send the key.
-      console.log(`[TeamClaude] WebSocket upgrade refused (no proxy key) from ${safeLine(socket?.remoteAddress || 'unknown')} for ${safeLine(req.url)}`);
-      try { socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n'); } catch { /* already gone */ }
+    try {
+      // The upgrade handshake never reaches requestHandler, so it does not
+      // inherit the key gate above — it has to ask for itself. Without this a
+      // WebSocket handshake is an unauthenticated relay to `upstream`: the
+      // handshake carries no pooled credential (relayUpgrade forwards the
+      // client's own headers), so it is not a way to spend the fleet's quota,
+      // but it is a way to reach the upstream on this host's address and
+      // bandwidth. A deployment on a public hostname hands that to anyone.
+      const auth = resolveUpgradeAuth(req, socket, config.proxy);
+      if (!auth.ok) {
+        // Logged as well as answered: a WebSocket client discards the status
+        // line, so the 401 alone leaves an operator with a channel that is
+        // silently dead — the same shape as the outage this gate could cause if
+        // a client turns out not to send the key.
+        console.log(`[TeamClaude] WebSocket upgrade refused (no proxy key) from ${safeLine(socket?.remoteAddress || 'unknown')} for ${safeLine(req.url)}`);
+        try { socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n'); } catch { /* already gone */ }
+        socket.destroy();
+        return;
+      }
+      // The identity the gate resolved rides along, as it does on the request
+      // path (req.tcClient): a handshake authenticated with a client key is
+      // attributed to that client, or it is a channel the operator cannot see
+      // under `clients` at all (#325).
+      relayUpgrade(req, socket, head, upstream, sx, { client: auth.client, clientUsage });
+    } catch (err) {
+      console.error(`[TeamClaude] WebSocket upgrade handler failed for ${safeLine(req?.url)}: ${err?.message || err}`);
+      try { socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n'); } catch { /* already gone */ }
       socket.destroy();
-      return;
     }
-    // The identity the gate resolved rides along, as it does on the request
-    // path (req.tcClient): a handshake authenticated with a client key is
-    // attributed to that client, or it is a channel the operator cannot see
-    // under `clients` at all (#325).
-    relayUpgrade(req, socket, head, upstream, sx, { client: auth.client, clientUsage });
   });
 
   return server;
@@ -1367,8 +1376,46 @@ export function resolveUpgradeAuth(req, socket, proxyConfig) {
  * handshake (emits its own 'upgrade' event on a 101); once that fires it's
  * just two raw sockets spliced together.
  */
+/**
+ * The URL a WebSocket upgrade for `url` is relayed to on `upstream`, or null
+ * when it cannot be — an answer, never a throw.
+ *
+ * This was `new URL(upstream + req.url)`. With an upstream that carries a port
+ * (`http://127.0.0.1:4000`, or a redundant `:443`) and a request target that
+ * is not a plain path — the absolute form `GET http://x/ HTTP/1.1`, ordinary
+ * proxy traffic — the concatenation ran straight on from the port digits and
+ * `new URL()` threw. The upgrade listener was the one entry point with no
+ * try/catch around it, so the throw was an uncaughtException and the daemon
+ * exited: one crafted handshake, every session gone (#340).
+ *
+ * Only the origin form is relayed, and the result is pinned to the upstream's
+ * origin: resolving the target against the upstream as a base would turn
+ * `http://x/` or `//evil.example/p` into a relay to that host instead. The
+ * concatenation itself is kept for an origin-form path, because an upstream
+ * may carry a path prefix of its own (`https://gateway.example/anthropic`)
+ * that resolution would discard.
+ */
+export function upgradeTarget(upstream, url) {
+  // Origin form: a single leading slash. `//host` is scheme-relative, and the
+  // URL parser reads a backslash as a slash for http(s), so `/\host` is too.
+  if (typeof url !== 'string' || !/^\/(?![\/\\])/.test(url)) return null;
+  let base, target;
+  try {
+    base = new URL(upstream);
+    target = new URL(`${upstream}${url}`);
+  } catch { return null; }
+  if (target.origin !== base.origin) return null;
+  return target;
+}
+
 export function relayUpgrade(req, socket, head, upstream, sx, { client = null, clientUsage = null, log = console.log } = {}) {
-  const target = new URL(`${upstream}${req.url}`);
+  const target = upgradeTarget(upstream, req.url);
+  if (!target) {
+    log(`[TeamClaude] WebSocket upgrade refused: request target ${JSON.stringify(safeLine(req.url, 128))} is not a path on the upstream`);
+    try { socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n'); } catch { /* already gone */ }
+    socket.destroy();
+    return;
+  }
   // The channel's log lines, prefixed `[name]` like a request line when a
   // client key authenticated the handshake, so an operator reading per-client
   // activity sees the channel beside the requests. Booked only once upstream

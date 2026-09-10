@@ -241,17 +241,25 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
     // which never fires 'request' — only 'upgrade', with a raw socket instead
     // of a response object (h1-only; falls back to blind h2 passthrough is not
     // needed since WS clients negotiate h1 for the handshake).
+    // Guarded for the same reason the listener in server.js is: an uncaught
+    // throw here exits the process (#340).
     srv.on('upgrade', (req, socket, head) => {
-      const target = upgradeUpstreamFor(req.headers.host, config, upstream);
-      if (!target) {
-        log(`[TeamClaude] MITM: refusing a WebSocket Upgrade for host ${JSON.stringify(safeLine(req.headers.host, 64))}, which this proxy does not intercept`);
-        try { socket.write('HTTP/1.1 421 Misdirected Request\r\nConnection: close\r\n\r\n'); } catch { /* client already gone */ }
+      try {
+        const target = upgradeUpstreamFor(req.headers.host, config, upstream);
+        if (!target) {
+          log(`[TeamClaude] MITM: refusing a WebSocket Upgrade for host ${JSON.stringify(safeLine(req.headers.host, 64))}, which this proxy does not intercept`);
+          try { socket.write('HTTP/1.1 421 Misdirected Request\r\nConnection: close\r\n\r\n'); } catch { /* client already gone */ }
+          socket.destroy();
+          return;
+        }
+        // The CONNECT's client identity is bound to this listener (see getServer),
+        // so the channel is attributed the way the requests in the tunnel are.
+        relayUpgrade(req, socket, head, target, sx, { client, clientUsage, log });
+      } catch (err) {
+        log(`[TeamClaude] MITM: WebSocket upgrade handler failed for ${safeLine(req?.url)}: ${err?.message || err}`);
+        try { socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n'); } catch { /* client already gone */ }
         socket.destroy();
-        return;
       }
-      // The CONNECT's client identity is bound to this listener (see getServer),
-      // so the channel is attributed the way the requests in the tunnel are.
-      relayUpgrade(req, socket, head, target, sx, { client, clientUsage, log });
     });
     // Make the h2-WebSocket dead end audible. Without this the only evidence is
     // a message that never arrives, which is what made #164 cost a day to
