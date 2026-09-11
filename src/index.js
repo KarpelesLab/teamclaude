@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { spawn, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { createWriteStream } from 'node:fs';
 import { readFile } from 'node:fs/promises';
@@ -1192,55 +1192,28 @@ async function attachCommand() {
   });
 }
 
-// Open the browser dashboard, starting a headless proxy when no server is
-// reachable. This keeps the common background-service workflow one command,
-// while preserving `attach` as the terminal-only remote TUI.
+// Open the browser dashboard against a running server. The page is served by
+// the proxy itself, so this is `attach` for the browser: it does not start a
+// server. A background daemon started from here would run with no log and no
+// supervisor, which is what `teamclaude service install` exists to avoid.
 async function dashboardCommand() {
   const config = await loadOrCreateConfig();
   const port = config.proxy.port;
   const bound = process.env.TEAMCLAUDE_HOST || config.proxy.host || '127.0.0.1';
   const host = (bound === '0.0.0.0' || bound === '::') ? '127.0.0.1' : bound;
-  const statusUrl = `http://${host}:${port}/teamclaude/status`;
   const dashboardUrl = `http://${host}:${port}/teamclaude/dashboard`;
-  const canReach = async () => {
-    try {
-      const res = await fetch(statusUrl, {
-        headers: { 'x-api-key': config.proxy.apiKey },
-        signal: AbortSignal.timeout(750),
-      });
-      return res.ok;
-    } catch { return false; }
-  };
-
-  if (!(await canReach())) {
-    const child = spawn(process.argv[1], ['server', '--headless'], {
-      detached: true,
-      stdio: 'ignore',
-      env: process.env,
-    });
-    child.unref();
-    let ready = false;
-    for (let i = 0; i < 20; i++) {
-      await new Promise(resolve => setTimeout(resolve, 250));
-      if (await canReach()) { ready = true; break; }
-    }
-    if (!ready) {
-      console.error(`Started headless server, but it did not answer at ${host}:${port}.`);
-      console.error(`Check the service log: ${logPath()}`);
-      process.exit(1);
-    }
-    console.log(`Started headless server at ${host}:${port}`);
+  if (!(await isProxyUp(port))) {
+    console.error(`[TeamClaude] Proxy not running on port ${port}.`);
+    console.error('Start it with: teamclaude server   (or: teamclaude service install)');
+    process.exit(1);
   }
 
+  console.log(`Dashboard: ${dashboardUrl}`);
   const opener = process.platform === 'darwin' ? 'open'
     : process.platform === 'win32' ? 'start'
     : 'xdg-open';
-  const opened = spawnSync(opener, [dashboardUrl], { stdio: 'ignore', shell: process.platform === 'win32' });
-  if (opened.error || opened.status !== 0) {
-    console.log(`Dashboard: ${dashboardUrl}`);
-    return;
-  }
-  console.log(`Dashboard: ${dashboardUrl}`);
+  const opened = spawnSync(opener, process.platform === 'win32' ? ['', dashboardUrl] : [dashboardUrl], { stdio: 'ignore', shell: process.platform === 'win32' });
+  if (opened.error || opened.status !== 0) console.error('Could not open a browser; open the URL above by hand.');
 }
 
 // ── switch ──────────────────────────────────────────────────
@@ -2089,7 +2062,7 @@ Commands:
                       Use --color=always|never to control ANSI colors
   attach              Open the live dashboard against a running server; s
                       switches account, R reloads config, q leaves it running
-  dashboard           Start a headless server if needed and open the web dashboard
+  dashboard           Open the web dashboard of a running server in the browser
   accounts            List configured accounts
   switch [NAME]       Make the running server prefer one account (as 's' in the
                       TUI does); with no NAME, list accounts and mark the current

@@ -165,7 +165,7 @@ teamclaude alias             # Print/install a `claude` alias that routes via th
 teamclaude accounts          # List accounts with subscription tier and token status
 teamclaude status            # Show live proxy status (requires running server)
 teamclaude attach            # Open the live dashboard against a running server
-teamclaude dashboard         # Start headless mode if needed and open web dashboard
+teamclaude dashboard         # Open the web dashboard in the browser (needs server)
 teamclaude service install   # Run the proxy as a login service (uninstall/status/print)
 teamclaude switch [name]     # Prefer an account; no name lists them (needs server)
 teamclaude remove <name>     # Remove an account (by name or email)
@@ -199,7 +199,7 @@ teamclaude help              # Show all commands
 
 `GET /teamclaude/dashboard` serves a self-contained HTML page rendering the same data as `teamclaude status`: per-account quota bars (session and weekly, plus one bar per model-scoped weekly bucket upstream reports), rotation state, and active sessions — refreshed every few seconds.
 
-Use `teamclaude dashboard` to start a headless server when needed and open this page in the system browser. The page's **Reload config** and **Probe quotas** buttons mirror the corresponding TUI actions without spending message quota.
+`teamclaude dashboard` opens this page in the system browser against a running server (it starts none; use `teamclaude server` or `teamclaude service install` for that). The page's **Reload config** and **Probe quotas** buttons mirror the corresponding TUI actions without spending message quota.
 
 With `proxy.usageDimensions` configured, each dimension gets its own sortable table. With `proxy.sessionDetail` on, a per-session table shows each session's client, project, serving accounts, and what it actually spent per weekly bucket — cache reads and cache creation included — filterable by project or client. That table is off by default; see [Configuration](configuration.md#usage-dimensions).
 
