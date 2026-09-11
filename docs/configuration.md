@@ -90,7 +90,7 @@ While the config is being rewritten — by the server rotating a refresh token, 
 | `TEAMCLAUDE_DISABLE_AUTOUPDATE` | Set to `1` to skip the background self-update check |
 | `TEAMCLAUDE_STATUS_TIMEOUT_MS` | How long `teamclaude status` waits for the server's answer before giving up (default `5000`). A connection that is accepted but never answered is reported as a stalled or overloaded server, distinct from a refused one ("Is the server running?") |
 | `HTTPS_PROXY` / `ALL_PROXY` | Outbound proxy used when the config sets no `upstreamProxy` (lowercase forms honoured too) |
-| `NO_PROXY` | Hosts that bypass the outbound proxy, when the config sets no `noProxy` |
+| `NO_PROXY` | Hosts that bypass the outbound proxy, when the config sets no `noProxy`. Also inherited by clients that `teamclaude run`/`env` launch — their loopback entries are added to yours, and `*` is ignored |
 
 ```bash
 TEAMCLAUDE_CONFIG=./my-config.json teamclaude server

@@ -6,10 +6,11 @@ import { sameIdentity } from './identity.js';
 import { weeklyBucketForModel, modelGlobMatches, modelFamily, gatingUtilization, resolveMaxUsage, WEEKLY_BUCKET_KEYS } from './model.js';
 import { SessionTracker } from './session-tracker.js';
 import { buildQuotaSummary, quotaTier } from './quota-summary.js';
-import { ROLLOVER_MIN_JUMP_MS, remapHeld } from './rollover.js';
+import { ROLLOVER_MIN_JUMP_MS, remapHeld, findHeld, dropHeld, newObservation } from './rollover.js';
 import { decideBand, pressureOf, pressureRank, assertNever } from './band-decision.js';
 import { BurnRateLearner, ConcurrencyLearner, scoreCandidate } from './adaptive-distribution.js';
 import { safeLine } from './safe-text.js';
+/** @typedef {import('./session-tracker.js').Observation} Observation */
 
 // Re-exported for callers that import these model helpers from here.
 export { isFableModel, parseRequestModel, parseAdvisorModel } from './model.js';
@@ -325,6 +326,7 @@ export class AccountManager {
     // observation, { idx, windows: name → reset }, of the account traffic was
     // resting on when a request last arrived to find it there. Null while the
     // knob is off: nothing writes one then and none survives the transition.
+    /** @type {Observation|null} */
     this._currentObs = null;
     // Throttle for the held-rollover line, keyed by (account index, WINDOW,
     // reason). Keying by the request bucket would let two windows that share one
@@ -504,7 +506,7 @@ export class AccountManager {
     this.currentIndex = account.index;
     this.providerCursors.set(providerOf(account), account.index);
     if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) return;
-    this._firstSightOn(this._currentObs ??= { idx: null, windows: new Map(), unescaped: null, gen: 0 }, account);
+    this._firstSightOn(this._currentObs ??= newObservation(), account);
   }
 
   /**
@@ -1921,7 +1923,7 @@ export class AccountManager {
     // the transition seeds" and "an aim never overwrites".
     if (wasWatching) return;
     const current = this.accounts[this.currentIndex];
-    if (current) this._firstSightOn(this._currentObs ??= { idx: null, windows: new Map(), unescaped: null, gen: 0 }, current);
+    if (current) this._firstSightOn(this._currentObs ??= newObservation(), current);
     for (const { sessionId, bucket, idx } of this.sessionTracker.livePins()) {
       this._firstSightOn(this.sessionTracker.refsFor(sessionId, bucket, true), this.accounts[idx]);
     }
@@ -2126,6 +2128,8 @@ export class AccountManager {
    * writes only where nothing is lost, since the aimed request may never arrive.
    * Nothing here releases a held roll: arriving is not being served, and only a
    * served attempt carrying this observation's stamp releases one.
+   *
+   * @param {Observation} obs
    */
   _restOn(obs, account, model) {
     if (obs.idx !== account.index) {
@@ -2134,13 +2138,39 @@ export class AccountManager {
       // `_firstSightOn` hands that back, and every cursor or pin move goes
       // through `_setCurrent` or `recordSession`, so a fail-back has been
       // offered it before any request reaches here.
-      const leaving = obs.idx == null ? null : this.accounts[obs.idx];
-      if (leaving && this._anyJumped(obs.windows, leaving)) {
-        obs.unescaped = { idx: obs.idx, windows: obs.windows };
+      // A reading that names NO account was offered nothing on the way here: the
+      // rebuild a removal leaves behind names nobody, and no cursor moved for
+      // `_firstSightOn` to run on. So this rest is the arrival, and a roll the
+      // chain still owes the account it arrives at is handed back rather than
+      // first-sighted away with the week that account has already gained.
+      if (obs.idx == null) {
+        const back = findHeld(obs.unescaped, h => h.idx === account.index);
+        if (back) {
+          this._moveObs(obs, account.index);
+          obs.windows = back.windows;
+          obs.handedBack = new Map(Object.entries(this._accountWindows(account)));
+          obs.unescaped = dropHeld(obs.unescaped, account.index);
+          return;
+        }
       }
+      const leaving = obs.idx == null ? null : this.accounts[obs.idx];
+      // The hold belongs to the fleet whose READING it preserves, the one that
+      // last moved this observation, rather than to the fleet that writes it.
+      // A borrower resting on the owner's cursor displaces the owner's reading.
+      // A reading no walk has moved names no fleet, so the fleet that observes
+      // the roll takes it, and a single-provider fleet can still settle it.
+      const owed = leaving && this._newRoll(obs, leaving)
+        ? { idx: obs.idx, windows: obs.windows, provider: obs.provider ?? this._selectingProvider }
+        : null;
+      this._moveObs(obs, account.index);
+      // Every account the fleet is still away from keeps its OWN roll, so a
+      // second escape is chained onto the first instead of forgetting it. The
+      // push takes the stamp of the move that escaped the roll, and only a stay
+      // under that stamp releases it. At most one roll per account, the newest:
+      // a later escape was read after the earlier one's window had rolled.
+      if (owed) obs.unescaped = { ...owed, gen: obs.gen, prev: dropHeld(obs.unescaped, owed.idx) };
       // Established whole, from every window the account presents, so a window
       // that comes back is a first sight rather than a stale value read as a jump.
-      this._moveObs(obs, account.index);
       obs.windows = new Map(Object.entries(this._accountWindows(account)));
       return;
     }
@@ -2174,18 +2204,48 @@ export class AccountManager {
    * design turns on — a reading whose account HAS rolled while its traffic has
    * not come to rest elsewhere, the fail-back's only protection. The test is
    * whether ANY window rolled, since an aim discards the whole reading at once.
+   *
+   * @param {Observation} obs
    */
   _firstSightOn(obs, account) {
     if (!obs || !account) return;
-    if (obs.idx != null && obs.idx !== account.index) {
+    if (obs.idx !== account.index) {
       // A fail-back reaches its origin through a cursor move rather than a rest:
       // the pass returning the traffic finds the cursor still on the account
       // that refused it, so _restOn never sees the arrival. The held roll is
       // given back here, to the account that still owes it.
-      if (obs.unescaped?.idx === account.index) {
+      // Matched on index alone, whatever fleet holds it and whatever move
+      // escaped it: handing a roll back to the account that owes it is a
+      // restoration and not a settlement by anyone. Only that account's roll is
+      // given back, so every other escape still outstanding stands. A reading
+      // that names no account arrives here too, and one holding nothing for this
+      // account takes the same fresh reading it always did: there is no account
+      // at a null index for _anyJumped to have rolled.
+      const owed = findHeld(obs.unescaped, h => h.idx === account.index);
+      if (owed) {
+        // The account the hand-back LEAVES may have rolled under the traffic that
+        // rested on it, and the restore below replaces its reading. That roll is
+        // an escape like any other, so it is chained rather than discarded.
+        // A reading no walk established names no fleet, so the roll it loses is
+        // held for the fleet the chain belongs to: the hold being handed back is
+        // that fleet's, and a hold naming nobody can be settled by nobody.
+        const leaving = obs.idx == null ? null : this.accounts[obs.idx];
+        const displaced = leaving && this._newRoll(obs, leaving)
+          ? { idx: obs.idx, windows: obs.windows, provider: obs.provider ?? owed.provider ?? this._selectingProvider }
+          : null;
         this._moveObs(obs, account.index);
-        obs.windows = obs.unescaped.windows;
-        obs.unescaped = null;
+        obs.windows = owed.windows;
+        obs.handedBack = new Map(Object.entries(this._accountWindows(account)));
+        // A restore outside a selection walk reads no fleet from one. The reading
+        // handed back is the one the hold's fleet established, so it keeps that
+        // fleet, and the next hand-back has one to stamp the roll it leaves with.
+        obs.provider ??= owed.provider;
+        obs.unescaped = dropHeld(obs.unescaped, account.index);
+        // No stamp: the move that leaves this roll is a move BACK, and a stay
+        // served at the account it returns to is no evidence about the one it
+        // left. Only a stay served on that account releases it, or a return that
+        // restores it, which is matched on index and needs no stamp.
+        if (displaced) obs.unescaped = { ...displaced, gen: null, prev: dropHeld(obs.unescaped, displaced.idx) };
         return;
       }
       if (this._anyJumped(obs.windows, this.accounts[obs.idx])) return;
@@ -2199,10 +2259,19 @@ export class AccountManager {
   /**
    * The stamp scopes a confirmation: a request that selected before this move,
    * or after a later one, carries a different one and is no evidence here.
+   *
+   * @param {Observation} obs
+   * @param {number} index
    */
   _moveObs(obs, index) {
     obs.idx = index;
     obs.gen = ++this._obsGen;
+    obs.handedBack = null;
+    // A move inside a selection walk makes the reading that fleet's, so its own
+    // stay is what settles a roll pushed off it. The same-index stay in `_restOn`
+    // does not come through here: a borrowed walk advances a reading the resting
+    // fleet never established, and stamping there hands it the owner's roll.
+    obs.provider = this._selectingProvider;
   }
 
   /** Has ANY window this reading holds rolled over on the account it was taken
@@ -2213,6 +2282,24 @@ export class AccountManager {
     if (!reading || !account) return false;
     for (const [window, resetAt] of Object.entries(this._accountWindows(account))) {
       if (this._jumped(reading, { window, resetAt })) return true;
+    }
+    return false;
+  }
+
+  /** Has a window rolled on this account that the reading was NOT handed back
+   * for? A hand-back restores the reading from before a roll and records the
+   * account's windows as they stood then, so that roll is a jump against the
+   * reading but not against the record. A window that has moved since the
+   * hand-back, or one the record never saw, is a roll of its own, and the
+   * departure that finds it holds it. Per window, so a rest governed by one
+   * window says nothing about another's roll, and a second fleet's window
+   * rolling on the same reading is still seen. */
+  _newRoll(obs, account) {
+    if (!obs.handedBack) return this._anyJumped(obs.windows, account);
+    for (const [window, resetAt] of Object.entries(this._accountWindows(account))) {
+      const win = { window, resetAt };
+      if (!this._jumped(obs.windows, win)) continue;
+      if (!obs.handedBack.has(window) || this._jumped(obs.handedBack, win)) return true;
     }
     return false;
   }
@@ -2237,29 +2324,47 @@ export class AccountManager {
   confirmStay(account, carried, sessionId = null, provider = null) {
     if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) return;
     if (!account || !carried) return;
-    // One observation slot is shared by every provider, so the roll it holds and
-    // the success offered for it can belong to different fleets. The REQUEST's
-    // provider settles it, and a confirmation naming no fleet settles nothing.
-    const held = this._currentObs?.unescaped;
-    if (held && provider && providerOf(this.accounts[held.idx]) === provider) {
-      this._releaseHeld(this._currentObs, account, carried.current);
-    }
+    this._releaseHeld(this._currentObs, account, carried.current, provider);
     if (sessionId) {
       // The bucket comes from the stamp, since a route edit reaches the running
-      // table before the response does. Ungated, because a session's own
-      // observation cannot name an account it never selected.
-      this._releaseHeld(this.sessionTracker.refsFor(sessionId, carried.bucket), account, carried.pin);
+      // table before the response does.
+      this._releaseHeld(this.sessionTracker.refsFor(sessionId, carried.bucket), account, carried.pin, provider);
     }
   }
 
   /**
-   * Clear one observation's held roll, only where the request confirms the stay
-   * it selected under. Another account, or any move since, is a different stay.
+   * Settle the roll the confirmed move escaped, on the evidence that the
+   * destination SERVED a request selecting under that move. Another account, or
+   * any move since, is a different stay. A confirmation naming no fleet settles
+   * nothing. Every other roll on the chain waits for its own fail-back or for
+   * the stay of its own move.
+   *
+   * @param {Observation} obs
+   * @param {string|null} provider
    */
-  _releaseHeld(obs, account, carried) {
+  _releaseHeld(obs, account, carried, provider) {
     if (!obs || carried == null) return;
     if (obs.idx !== account.index || obs.gen !== carried) return;
-    obs.unescaped = null;
+    const owed = findHeld(obs.unescaped, h => h.gen === carried);
+    // A serve settles a roll held against the very account it was served at,
+    // whatever move stamped it: a borrowed walk can leave the reading resting on
+    // an account the chain still owes without any move of ours, and being served
+    // there is the arrival the hold was waiting for. Its own fleet only, so the
+    // shared-key rule is untouched, and only that account's roll, so every
+    // other escape on the chain still stands. One confirmation can qualify that
+    // roll and the one this move escaped, and each is settled on its own evidence.
+    const own = findHeld(obs.unescaped, h => h.idx === account.index && h.provider === provider);
+    if (!provider) return;
+    if (own) obs.unescaped = dropHeld(obs.unescaped, own.idx);
+    if (!owed) return;
+    // A hold has a reading to itself only where the destination is its own
+    // fleet's subscription, which no other fleet is ever served at. Anywhere
+    // else the destination has one reading for whoever it serves, so a success
+    // by the fleet served there settles the roll held against it.
+    const settledByAnyServed = owed.provider != null
+      && !(isSubscriptionAccount(account) && providerOf(account) === owed.provider);
+    if (owed.provider !== provider && !settledByAnyServed) return;
+    obs.unescaped = dropHeld(obs.unescaped, owed.idx);
   }
 
   /** The reading for the sticky CURRENT account, taken at the top of a selection
@@ -2268,7 +2373,7 @@ export class AccountManager {
     if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) return;
     const resting = this.accounts[this.currentIndex];
     if (!resting || exclude?.has(resting.index)) return;
-    this._currentObs ??= { idx: null, windows: new Map(), unescaped: null, gen: 0 };
+    this._currentObs ??= newObservation();
     this._restOn(this._currentObs, resting, model);
   }
 
@@ -2372,8 +2477,11 @@ export class AccountManager {
    * are recorded whether or not they currently bind, because one that starts
    * binding later would otherwise be first-sighted on the very request that
    * should have caught it rolling.
+   *
+   * @returns {Object<string, number>}
    */
   _accountWindows(account) {
+    /** @type {Object<string, number>} */
     const out = {};
     for (const bucket of this._windowKeys()) {
       const window = this._windowForBucket(account, bucket);
@@ -2795,12 +2903,22 @@ export class AccountManager {
         || (mine === theirs && this._rankedReset(acc, model) < this._rankedReset(best, model))) best = acc;
     }
 
-    // TWO guards, different properties, neither implying the other. Band
-    // membership says the account is worth spending at all. The rank comparison
-    // says this switch leaves no strictly better account behind, which
-    // membership does not claim once a lower tier passes through unbanded. Both
-    // are drawn over what this request can be sent to.
-    if (this.expiryRouting.enabled && !this._bandedCandidates(exclude, model).includes(best)) return;
+    // TWO guards, different properties, neither implying the other, and NOT
+    // drawn over the same fleet. The rank comparison weighs `best` against the
+    // account the cursor is on, both of which THIS REQUEST reached, so it is
+    // measured on what this request can be sent to. Band membership says the
+    // account is worth spending at all, and the only thing the answer does here
+    // is move the CURSOR, which serves every request behind this one. So it is
+    // drawn over the fleet that cursor serves: the request's provider partition,
+    // narrowed by the model filter _bandedCandidates already applies, and never
+    // by the accounts this one attempt has tried. An account a 429 pushed this
+    // request off holds whatever band it holds for everybody else.
+    // The provider comes from the walk in progress, as it does in _cursorKey; a
+    // direct caller has none and means the default fleet. Kept inside the `&&`
+    // rather than hoisted, so the knob-off path evaluates none of it.
+    if (this.expiryRouting.enabled && !this._bandedCandidates(
+      this._excludeOtherProviders(null, this._selectingProvider || DEFAULT_PROVIDER),
+      model).includes(best)) return;
     // Strictly worse than what we are on: stay. Equal keeps the reset tiebreak
     // that got us here, and with expiry routing off every rank is absent and
     // equal, so this cannot fire at all.
@@ -3599,6 +3717,7 @@ export class AccountManager {
    */
   removeAccount(index) {
     if (index < 0 || index >= this.accounts.length) return;
+    const before = this.accounts[this.currentIndex] ?? null;
     this.accounts.splice(index, 1);
     this.accounts.forEach((a, i) => a.index = i);
     if (this.currentIndex >= this.accounts.length) {
@@ -3629,15 +3748,26 @@ export class AccountManager {
     // against whichever account inherited the slot; its held roll the same.
     const moved = this._currentObs?.idx == null ? null : remap(this._currentObs.idx);
     if (this._currentObs) {
-      this._currentObs = moved == null ? null
-        : {
-          idx: moved,
-          windows: this._currentObs.windows,
-          unescaped: remapHeld(this._currentObs.unescaped, remap),
-          // Renumbering names the same account by a new index, so a request
-          // already in flight against it still confirms the stay it selected on.
-          gen: this._currentObs.gen,
-        };
+      // Renumbering is nobody's success, and it names the same account by a new
+      // index, so everything but the two indices survives the shift: the stamp
+      // saying whose reading this is, and the gen a request already in flight
+      // against that account still confirms its stay on. The account that went
+      // away is the only one whose roll the removal settles, so what it was
+      // holding for the others moves onto a fresh reading. That reading names no
+      // account and has no windows, which is evidence about nobody, while every
+      // hold under it keeps its own stamp and gen.
+      const held = remapHeld(this._currentObs.unescaped, remap);
+      this._currentObs = moved != null
+        ? { ...this._currentObs, idx: moved, unescaped: held }
+        : held ? { ...newObservation(), unescaped: held } : null;
+    }
+    // A removal that takes the account the cursor rests on leaves the cursor at
+    // a neighbour, with a reading the rebuild left nameless. A reading the
+    // removal merely renumbered keeps its own account, so it is offered
+    // nothing.
+    const landed = this.accounts[this.currentIndex] ?? null;
+    if (landed && landed !== before && this._currentObs && this._currentObs.idx == null) {
+      this._firstSightOn(this._currentObs, landed);
     }
     // A throttle key names an account by index, so the shift would point a live
     // entry at a different account. Not worth renumbering: the entries expire in
