@@ -130,6 +130,10 @@ switch (command) {
     await attachCommand();
     process.exit(0);
     break;
+  case 'dashboard':
+    await dashboardCommand();
+    process.exit(0);
+    break;
   case 'accounts':
     await accountsCommand();
     process.exit(0);
@@ -656,6 +660,10 @@ async function serverCommand() {
     intervalMs: (config.quotaProbeSeconds || 0) * 1000,
     profileFn: fetchProfile,
   });
+  // The web dashboard's one-shot probe button uses the same zero-spend action
+  // as the TUI's `p` key. Assigned after construction because the hook object
+  // is already shared with the server created above.
+  hooks.probeQuota = () => prober?.probeAll();
   prober.start();
 
   // Start the opt-in keep-warm scheduler. Interval mode runs relative to server
@@ -1191,6 +1199,30 @@ async function attachCommand() {
     session.am.applyStatus(first);
     session.start();
   });
+}
+
+// Open the browser dashboard against a running server. The page is served by
+// the proxy itself, so this is `attach` for the browser: it does not start a
+// server. A background daemon started from here would run with no log and no
+// supervisor, which is what `teamclaude service install` exists to avoid.
+async function dashboardCommand() {
+  const config = await loadOrCreateConfig();
+  const port = config.proxy.port;
+  const bound = process.env.TEAMCLAUDE_HOST || config.proxy.host || '127.0.0.1';
+  const host = (bound === '0.0.0.0' || bound === '::') ? '127.0.0.1' : bound;
+  const dashboardUrl = `http://${host}:${port}/teamclaude/dashboard`;
+  if (!(await isProxyUp(port))) {
+    console.error(`[TeamClaude] Proxy not running on port ${port}.`);
+    console.error('Start it with: teamclaude server   (or: teamclaude service install)');
+    process.exit(1);
+  }
+
+  console.log(`Dashboard: ${dashboardUrl}`);
+  const opener = process.platform === 'darwin' ? 'open'
+    : process.platform === 'win32' ? 'start'
+    : 'xdg-open';
+  const opened = spawnSync(opener, process.platform === 'win32' ? ['', dashboardUrl] : [dashboardUrl], { stdio: 'ignore', shell: process.platform === 'win32' });
+  if (opened.error || opened.status !== 0) console.error('Could not open a browser; open the URL above by hand.');
 }
 
 // ── switch ──────────────────────────────────────────────────
@@ -2039,6 +2071,7 @@ Commands:
                       Use --color=always|never to control ANSI colors
   attach              Open the live dashboard against a running server; s
                       switches account, R reloads config, q leaves it running
+  dashboard           Open the web dashboard of a running server in the browser
   accounts            List configured accounts
   switch [NAME]       Make the running server prefer one account (as 's' in the
                       TUI does); with no NAME, list accounts and mark the current
