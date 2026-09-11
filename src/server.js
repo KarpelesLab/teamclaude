@@ -387,6 +387,26 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         return;
       }
 
+      // One-shot quota probe — the web equivalent of the TUI's `p` key. It is
+      // zero-spend and only available when the running server has a prober.
+      if (req.method === 'POST' && req.url === '/teamclaude/probe') {
+        if (!hooks.probeQuota) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'quota probe not supported' }));
+          return;
+        }
+        try {
+          await hooks.probeQuota();
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true }));
+        } catch (err) {
+          console.error('[TeamClaude] Quota probe failed:', err.message);
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'quota probe failed; see the proxy log' }));
+        }
+        return;
+      }
+
       // Switch endpoint — make one account the preferred one, the headless
       // equivalent of picking it with 's' in the TUI. Both do the same single
       // thing: move currentIndex. That is a preference, and a weak one: _select

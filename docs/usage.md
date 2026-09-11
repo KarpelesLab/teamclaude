@@ -165,6 +165,7 @@ teamclaude alias             # Print/install a `claude` alias that routes via th
 teamclaude accounts          # List accounts with subscription tier and token status
 teamclaude status            # Show live proxy status (requires running server)
 teamclaude attach            # Open the live dashboard against a running server
+teamclaude dashboard         # Start headless mode if needed and open web dashboard
 teamclaude service install   # Run the proxy as a login service (uninstall/status/print)
 teamclaude switch [name]     # Prefer an account; no name lists them (needs server)
 teamclaude remove <name>     # Remove an account (by name or email)
@@ -188,7 +189,7 @@ teamclaude help              # Show all commands
 
 `teamclaude status` prints the same picture as the TUI, once, as text. Handy over SSH or in a script; `--json` for machine-readable output. The JSON's `server.version` is the version of the process answering — read once at startup, so right after `teamclaude update` it still names the old code until the restart, where the installed CLI's `teamclaude version` already names the new one.
 
-`teamclaude attach` opens the dashboard itself against a server that is already running, which is how you get interactive control back when the proxy runs as a background service. It polls the same status endpoint every second and can do the two things the control plane exposes: `s` switches account, `R` reloads config. Settings editing, quota probing and the request activity stream stay in the server's own TUI — they need state that only that process has. When contact with the server drops, the header marker turns from `▲` to `▼` and what is on screen is the last snapshot, not the current state.
+`teamclaude attach` opens the terminal dashboard itself against a server that is already running, which is how you get interactive control back when the proxy runs as a background service. It polls the same status endpoint every second and can do the two things the remote control exposes: `s` switches account, `R` reloads config. The browser dashboard adds the matching **Reload config** action plus a zero-spend **Probe quotas** action; settings editing and the request activity stream still stay in the server's own TUI because they need state that only that process has. When contact with the server drops, the header marker turns from `▲` to `▼` and what is on screen is the last snapshot, not the current state.
 
 `teamclaude service install` registers the proxy as a user service that starts at login and restarts on its own — a LaunchAgent on macOS, a `systemd --user` unit on Linux (`uninstall`, `status` and `print` round it out; `print` writes the unit to stdout without touching anything). On macOS the LaunchAgent runs with `ProcessType` `Standard`: the `Background` class it used before carried a QoS clamp that starved the proxy under host contention (status timeouts, seconds of event-loop lag). The unit is only written at install time, so an existing install keeps whatever it was installed with until you re-run `teamclaude service install`.
 
@@ -197,6 +198,8 @@ teamclaude help              # Show all commands
 ## Status dashboard (browser)
 
 `GET /teamclaude/dashboard` serves a self-contained HTML page rendering the same data as `teamclaude status`: per-account quota bars (session and weekly, plus one bar per model-scoped weekly bucket upstream reports), rotation state, and active sessions — refreshed every few seconds.
+
+Use `teamclaude dashboard` to start a headless server when needed and open this page in the system browser. The page's **Reload config** and **Probe quotas** buttons mirror the corresponding TUI actions without spending message quota.
 
 With `proxy.usageDimensions` configured, each dimension gets its own sortable table. With `proxy.sessionDetail` on, a per-session table shows each session's client, project, serving accounts, and what it actually spent per weekly bucket — cache reads and cache creation included — filterable by project or client. That table is off by default; see [Configuration](configuration.md#usage-dimensions).
 

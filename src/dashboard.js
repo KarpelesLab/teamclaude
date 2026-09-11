@@ -404,6 +404,10 @@ const PAGE = `<!doctype html>
   .filters label { color: var(--dim); font-size: 12px; display: flex; align-items: center; gap: 6px; }
   .filters select { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; color: var(--text); font: inherit; font-size: 12px; padding: 4px 8px; }
   .hint { color: var(--dim); font-size: 12px; margin-left: auto; }
+  .actions { display: flex; gap: 8px; margin: 8px 0 16px; }
+  .actions button { font: inherit; font-size: 12px; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--line); background: transparent; color: var(--dim); cursor: pointer; }
+  .actions button:hover { color: var(--text); border-color: var(--text); }
+  .actions button:disabled { opacity: .5; cursor: default; }
   th.sortable { cursor: pointer; user-select: none; }
   th.sortable:hover { color: var(--text); }
   td.dim { color: var(--dim); }
@@ -434,6 +438,10 @@ const PAGE = `<!doctype html>
   <div id="app" style="display:none">
     <h1>TeamClaude</h1>
     <p class="sub" id="summary"></p>
+    <div class="actions">
+      <button id="reload" type="button">Reload config</button>
+      <button id="probe" type="button">Probe quotas</button>
+    </div>
     <div id="err"></div>
     <div id="problems"></div>
     <div id="note"></div>
@@ -814,6 +822,10 @@ ${SHARED_HELPERS}
       sum.appendChild(el('b', '', s.currentAccount || 'none'));
     }
     sum.appendChild(el('span', '', ' · ' + (sess.active || 0) + ' active / ' + (sess.known || 0) + ' known sessions' + (up ? ' · ' + up : '')));
+    var probe = s.probe || {};
+    var probeBtn = document.getElementById('probe');
+    probeBtn.textContent = probe.running ? 'Probe running…' : 'Probe quotas';
+    probeBtn.disabled = !!probe.running;
     var acc = document.getElementById('accounts');
     acc.textContent = '';
     (s.accounts || []).forEach(function (a) { acc.appendChild(renderAccount(a, s.currentAccount, currentAccounts)); });
@@ -853,6 +865,23 @@ ${SHARED_HELPERS}
         poll();
       })
       .catch(function (e) { note('error', 'switch failed: ' + e.message); btn.disabled = false; });
+  }
+
+  function doControl(path, label, btn) {
+    btn.disabled = true;
+    fetch(path, { method: 'POST', headers: { 'x-api-key': localStorage.getItem(KEY) || '' } })
+      .then(function (res) {
+        if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
+        return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
+      })
+      .then(function (json) {
+        if (!json) return;
+        if (json.ok !== true) { note('error', label + ' failed' + (json.error ? ': ' + json.error : '')); return; }
+        note('ok', label + ' complete');
+        poll();
+      })
+      .catch(function (e) { note('error', label + ' failed: ' + e.message); })
+      .finally(function () { btn.disabled = false; });
   }
 
   function showKeybox() {
@@ -897,6 +926,8 @@ ${SHARED_HELPERS}
   document.getElementById('key').addEventListener('keydown', function (e) {
     if (e.key === 'Enter') document.getElementById('go').click();
   });
+  document.getElementById('reload').addEventListener('click', function () { doControl('/teamclaude/reload', 'config reload', this); });
+  document.getElementById('probe').addEventListener('click', function () { doControl('/teamclaude/probe', 'quota probe', this); });
 
   ['fProject', 'fClient'].forEach(function (id) {
     document.getElementById(id).addEventListener('change', function () {
