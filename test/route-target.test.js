@@ -36,6 +36,21 @@ test('an auto-detected family route names its live target', () => {
   assert.equal(byName(am.getRoutes(), 'fable').target, 'b');
 });
 
+test('a Claude family route never previews Codex subscription accounts', () => {
+  const am = new AccountManager([
+    oauth('claude'),
+    oauth('codex', { provider: 'codex', accountId: 'acct-codex', priority: -2 }),
+  ], 0.98);
+  am.accounts[0].quota.unified7dFable = 0.1;
+  am.accounts[0].quota.unified7dFableReset = Date.now() + 3600_000;
+
+  const route = byName(am.getRoutes(), 'fable');
+  assert.equal(route.provider, 'anthropic');
+  assert.equal(route.target, 'claude');
+  assert.deepEqual(route.accounts, [{ name: 'claude', eligible: true }]);
+  assert.equal(am.getStatus().defaultTarget, 'claude');
+});
+
 test('target is null when no account can serve the route', () => {
   const am = new AccountManager([oauth('a'), oauth('b')], 0.98, {
     routes: [{ name: 'bulk', match: ['*opus*'], accounts: ['a'] }], // only a may serve it

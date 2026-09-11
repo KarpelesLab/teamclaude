@@ -236,3 +236,60 @@ test('TUI routes editor: delete removes the selected route', async () => {
   assert.deepEqual(config.routes, [{ name: 'bulk', match: ['*opus*'] }]);
   assert.deepEqual(applied.routes, config.routes);
 });
+
+// Pressing → in switch mode targets the Fable route; the cursor should say so
+// where the eye is: in front of the F7 bar, where the pin's ► will land. The
+// row start keeps a dim `>` so the row is still easy to find.
+test('TUI: targeting a family route moves the cursor to its bar and dims the row-start one', () => {
+  const future = Date.now() + 7 * 24 * 3600_000;
+  const oauth = n => ({ name: n, type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: future });
+  const am = new AccountManager([oauth('a'), oauth('b')], 0.98);
+  for (const acc of am.accounts) {
+    acc.quota.unified5h = 0.1; acc.quota.unified5hReset = future;
+    acc.quota.unified7d = 0.1; acc.quota.unified7dReset = future;
+    acc.quota.unified7dFable = 0.2; acc.quota.unified7dFableReset = future;
+    acc.quota.unified7dSonnet = 0.2; acc.quota.unified7dSonnetReset = future;
+  }
+  const routes = am.getRoutes();
+  const fable = routes.find(r => r.name === 'fable');
+  const sonnet = routes.find(r => r.name === 'sonnet');
+  assert.ok(fable && sonnet, 'auto routes exist');
+
+  const tui = Object.create(TUI.prototype);
+  tui.am = am; tui.mode = 'select'; tui.selAction = 'switch'; tui.selIdx = 1;
+  const render = (i) => tui._renderAcct(i, 8, true, routes, [], { fable: null, sonnet: null });
+  const CYAN_CURSOR = '\x1b[36m>\x1b[0m';
+  const DIM_CURSOR = '\x1b[2m>\x1b[0m';
+
+  // Default target: the bright cursor at the row start, nothing at the bars.
+  tui.selRoute = null;
+  let row = render(1);
+  assert.ok(row.startsWith(` ${CYAN_CURSOR}`), 'bright cursor at the row start');
+  assert.doesNotMatch(stripAnsi(row), />\s*[►]?\s*F7/, 'no cursor at F7');
+  const width = stripAnsi(row).length;
+
+  // Fable target: dim at the start, bright in front of F7, same row width.
+  tui.selRoute = fable;
+  row = render(1);
+  assert.ok(row.startsWith(` ${DIM_CURSOR}`), 'the row-start cursor is dimmed');
+  assert.ok(row.includes(`${CYAN_CURSOR} F7`), `bright cursor in front of F7, got: ${JSON.stringify(stripAnsi(row))}`);
+  assert.equal(stripAnsi(row).length, width, 'the row does not grow');
+  assert.ok(!render(0).includes('>'), 'an unselected row draws no cursor anywhere');
+
+  // Sonnet target: the cursor sits at S7 instead, and F7 is clear again.
+  tui.selRoute = sonnet;
+  row = render(1);
+  assert.ok(row.includes(`${CYAN_CURSOR} S7`), 'bright cursor in front of S7');
+  assert.ok(!row.includes(`${CYAN_CURSOR} F7`), 'not at F7');
+
+  // The pin's own ► keeps its place: the cursor takes the separator column, not the marker's.
+  row = tui._renderAcct(1, 8, true, routes, [], { fable: 1, sonnet: null });
+  tui.selRoute = fable;
+  row = tui._renderAcct(1, 8, true, routes, [], { fable: 1, sonnet: null });
+  assert.match(stripAnsi(row), />►F7/, 'cursor, then the marker, then the label');
+
+  // A row without the F7 bar keeps the bright cursor at the start: nothing to point at.
+  am.accounts[1].quota.unified7dFable = null;
+  row = render(1);
+  assert.ok(row.startsWith(` ${CYAN_CURSOR}`), 'bright cursor stays at the start when the bar is absent');
+});

@@ -1,6 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import http from 'node:http';
+import { once } from 'node:events';
 import { AccountManager } from '../src/account-manager.js';
+import { createProxyRequestListener } from '../src/server.js';
 
 const oauth = (name, extra = {}) => ({
   name, type: 'oauth', accessToken: 't-' + name, refreshToken: 'r',
@@ -98,4 +101,83 @@ test('a response with no quota headers leaves a known reading intact', () => {
   am.updateQuota(0, codexHeaders(77));
   am.updateQuota(0, { 'content-type': 'application/json' });
   assert.equal(am.accounts[0].quota.unified7d, 0.77);
+});
+
+// ── the partition is decided on the classification path ─────────────────────
+//
+// The tests above prove selection never crosses the partition once the provider
+// is known. This proves the provider is read from the path the request will
+// actually be resolved on: `providerForPath` matched the raw string, while the
+// `new URL()` that builds the outgoing target folds a backslash to a slash
+// first. So `/backend-api\codex/conversations` classified as Anthropic and then
+// went out as a Codex path — drawing its credential from the wrong pool.
+
+async function listen(handler) {
+  const server = http.createServer(handler);
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  return { server, port: server.address().port };
+}
+
+// http.request, not fetch: fetch normalises the path client-side, and the raw
+// path is the whole point of these cases.
+function rawGet(port, path) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port, method: 'GET', path }, (res) => {
+      res.resume();
+      res.on('end', () => resolve(res.statusCode));
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+async function withBothPools(run) {
+  const seen = [];
+  const { server: upstream, port: upstreamPort } = await listen((req, res) => {
+    seen.push({ url: req.url, auth: req.headers.authorization });
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+  // A Codex account's default upstream is chatgpt.com; the per-account override
+  // points both pools at the one local recorder, so the credential that arrives
+  // is what says which pool was chosen.
+  const am = new AccountManager([
+    oauth('claude-1'),
+    { ...codex('codex-1'), upstream: `http://127.0.0.1:${upstreamPort}` },
+  ], 0.98);
+  const listener = createProxyRequestListener({ accountManager: am, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const { server: proxy, port } = await listen(listener);
+  try {
+    return await run({ port, seen });
+  } finally {
+    proxy.closeAllConnections?.(); proxy.close();
+    upstream.close();
+  }
+}
+
+for (const [path, onWire] of [
+  ['/backend-api\\codex/conversations', '/backend-api/codex/conversations'],
+  ['/backend-api/codex\\responses', '/backend-api/codex/responses'],
+  ['/backend-api%5ccodex/responses', '/backend-api%5ccodex/responses'],
+  ['/backend-api%2fcodex/responses', '/backend-api%2fcodex/responses'],
+]) {
+  test(`${path} draws on the Codex pool`, async () => {
+    await withBothPools(async ({ port, seen }) => {
+      assert.equal(await rawGet(port, path), 200);
+      assert.equal(seen.length, 1);
+      assert.equal(seen[0].auth, 'Bearer t-codex-1',
+        "an Anthropic account's credential was attached to a Codex path");
+      assert.equal(seen[0].url, onWire, 'the request went out on a path this test did not predict');
+    });
+  });
+}
+
+// The counterpart: an Anthropic path must not be pulled across by the folding.
+test('an ordinary Anthropic path still draws on the Anthropic pool', async () => {
+  await withBothPools(async ({ port, seen }) => {
+    assert.equal(await rawGet(port, '/v1/messages'), 200);
+    assert.equal(seen[0].auth, 'Bearer t-claude-1');
+    assert.equal(seen[0].url, '/v1/messages');
+  });
 });

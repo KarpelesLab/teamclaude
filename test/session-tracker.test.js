@@ -145,6 +145,19 @@ test('activeCountFor counts only recently-active sessions on that account', () =
   assert.equal(st.activeCountFor(2, clock.t), 0);
 });
 
+test('stats attributes known sessions after they stop counting as recent load', () => {
+  const { clock, now } = fixedClock();
+  const st = new SessionTracker({ now });
+  st.touch('claude-idle', 0, SHARED, clock.t);
+  st.touch('codex-recent', 1, SHARED, clock.t);
+  clock.t += SESSION_ACTIVE_TTL_MS + 1;
+  st.touch('codex-recent', 1, SHARED, clock.t);
+
+  const stats = st.stats(clock.t);
+  assert.deepEqual(stats.perAccount, { 1: 1 });
+  assert.deepEqual(stats.knownPerAccount, { 0: 1, 1: 1 });
+});
+
 test('a session spending two accounts is load on both, counted once each', () => {
   const { clock, now } = fixedClock();
   const st = new SessionTracker({ now });

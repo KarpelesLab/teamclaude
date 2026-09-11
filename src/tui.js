@@ -1563,9 +1563,21 @@ export class TUI {
     const isCur = idx === this.am.currentIndex;
     const isSel = this.mode === 'select' && idx === this.selIdx;
 
-    // Prefix: selection marker + current marker
-    const sel = isSel ? cyan('>') : ' ';
+    // Prefix: selection marker + current marker.
+    //
+    // In switch mode with a Fable/Sonnet route as the pin target, the cursor
+    // moves to that family's bar — in front of `F7` / `S7`, where the pin's ►
+    // will land — and the row start keeps a dim `>` so the row stays easy to
+    // find. The move only happens when the row draws that bar; a row without
+    // it keeps the cursor at the start, since there is nothing to point at.
+    const q = a.quota;
+    const selFamily = isSel && this.selAction === 'switch' && this.selRoute ? routeFamily(this.selRoute) : null;
+    const barShown = fam => showBoth && showFamily && q[fam === 'fable' ? 'unified7dFable' : 'unified7dSonnet'] != null;
+    const cursorAt = selFamily && barShown(selFamily) ? selFamily : null;
+    const sel = !isSel ? ' ' : cursorAt ? dim('>') : cyan('>');
     const cur = isCur ? green('►') : ' ';
+    // The column before a family bar's marker: the cursor when it moved here, else the separator space.
+    const famLead = fam => (cursorAt === fam ? cyan('>') : ' ');
 
     // General-route markers: one fixed column per general route (stable order), so
     // the same route always sits in the same slot across accounts. A member shows
@@ -1617,7 +1629,6 @@ export class TUI {
     status = rpad(status, 10);
 
     // Quota ratios — prefer unified (Claude Max), fall back to standard (API key)
-    const q = a.quota;
     let r1 = null, r2 = null, l1 = 'Ses', l2 = 'Wk ', t1 = null, t2 = null, w1 = null, w2 = null;
 
     if (rowCategory(q) === 'unified') {
@@ -1663,11 +1674,11 @@ export class TUI {
       // Sonnet weekly bar — only shown when the usage probe has populated it. A
       // leading ► (in place of a padding space) marks a Sonnet route on this account.
       if (showFamily && q.unified7dSonnet != null) {
-        line += ` ${familyMark('sonnet')}S7  ${bar(q.unified7dSonnet, bw, q.unified7dSonnetReset, SEVEN_DAY_MS, limFor('unified7dSonnet'))}`;
+        line += `${famLead('sonnet')}${familyMark('sonnet')}S7  ${bar(q.unified7dSonnet, bw, q.unified7dSonnetReset, SEVEN_DAY_MS, limFor('unified7dSonnet'))}`;
       }
       // Fable weekly bar — only shown when the usage probe has populated it.
       if (showFamily && q.unified7dFable != null) {
-        line += ` ${familyMark('fable')}F7  ${bar(q.unified7dFable, bw, q.unified7dFableReset, SEVEN_DAY_MS, limFor('unified7dFable'))}`;
+        line += `${famLead('fable')}${familyMark('fable')}F7  ${bar(q.unified7dFable, bw, q.unified7dFableReset, SEVEN_DAY_MS, limFor('unified7dFable'))}`;
       }
     }
     // Explicit "disabled for these models" tag (issue #85): a family the account
