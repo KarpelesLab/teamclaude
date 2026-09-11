@@ -2139,6 +2139,87 @@ test('two accounts that have each rolled come to rest after one bounce', () => {
     'a roll stayed held after the fleet came to rest');
 });
 
+// The pin bucket carries ONE reading for every model it governs. With a scoped
+// Opus bucket more spent than the shared window, OPUS rests that reading under
+// scoped:opus and HAIKU, which has no bucket of its own, under the shared window.
+function mixedFleet() {
+  const am = mgr(['a', 'b', 'c'], ON, { distributeSessions: true });
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30]]) {
+    bucket(am, i, 'unified7d', 0.4, hours);
+    scoped(am, i, 'opus', 0.5, hours);
+  }
+  return am;
+}
+
+// Roll a's Opus window, escape to b, first-sight onto c, roll c's Opus window,
+// and fail back to a: the pin rests on a with the reading from before its roll.
+function handedBackToA(am) {
+  const ex = new Set([1]);
+  assert.equal(serve(am, 's1', OPUS).name, 'a', 'the fixture must start on a');
+  am.accounts[0].quota.scopedWeekly.opus.resetAt += WEEK;
+  assert.equal(serve(am, 's1', OPUS).name, 'b', 'a\'s roll did not move the pin');
+  assert.equal(serve(am, 's1', OPUS).name, 'b', 'the preemption did not settle on b');
+  assert.equal(serve(am, 's1', OPUS, { exclude: ex }).name, 'c', 'the pin did not first-sight onto c');
+  assert.equal(serve(am, 's1', OPUS, { exclude: ex }).name, 'c', 'the pin did not rest on c');
+  am.accounts[2].quota.scopedWeekly.opus.resetAt += WEEK;
+  assert.equal(serve(am, 's1', OPUS, { exclude: ex }).name, 'a', 'c\'s roll did not send the pin back to a');
+  return ex;
+}
+
+test('a rest governed by another window does not re-arm a roll already handed back', () => {
+  // A HAIKU request served on a advances the shared window and says nothing
+  // about the Opus roll the hand-back restored. The next departure from a
+  // finds that roll as it was handed back, and holds nothing for it.
+  const am = mixedFleet();
+  const ex = handedBackToA(am);
+  const obs = am.sessionTracker.refsFor('s1', 'unified7d');
+  assert.equal(serve(am, 's1', HAIKU, { exclude: ex }).name, 'a', 'the HAIKU request left a');
+  assert.equal(serve(am, 's1', OPUS, { exclude: ex }).name, 'c', 'a\'s restored roll did not move the pin once more');
+  assert.equal(obs.unescaped, null,
+    'a roll already handed back was held again after a rest under another window');
+});
+
+test('alternating traffic after a hand-back comes to rest', () => {
+  // The trade the hand-back-once rule exists to stop, driven by two models on
+  // one reading: without the rule per window, every HAIKU stay re-armed the
+  // hold and the Opus pin bounced between a and c for ever.
+  const am = mixedFleet();
+  const ex = handedBackToA(am);
+  const seq = [];
+  for (let i = 0; i < 6; i++) {
+    serve(am, 's1', HAIKU, { exclude: ex });
+    seq.push(serve(am, 's1', OPUS, { exclude: ex }).name);
+  }
+  assert.equal(seq.slice(1).join(''), 'aaaaa', `the Opus pin did not come to rest: ${seq.join('')}`);
+  assert.equal(am.sessionTracker.refsFor('s1', 'unified7d').unescaped, null,
+    'a roll stayed held after the fleet came to rest');
+});
+
+test('a window that rolls after a hand-back is held and handed back on its own', () => {
+  // The hand-back covers the roll it restored and no other. A first roll of
+  // a's shared window while the pin rests there is a new event: the departure
+  // holds it, and the fail-back is handed it.
+  const am = mixedFleet();
+  const ex = new Set([1, 2]);
+  assert.equal(serve(am, 's1', OPUS).name, 'a', 'the fixture must start on a');
+  am.accounts[0].quota.scopedWeekly.opus.resetAt += WEEK;
+  assert.equal(serve(am, 's1', OPUS).name, 'b', 'a\'s Opus roll did not move the pin');
+  assert.equal(serve(am, 's1', OPUS).name, 'b', 'the preemption did not settle on b');
+  assert.equal(serve(am, 's1', OPUS, { exclude: ex }).name, 'a', 'the forced fail-back did not reach a');
+  const obs = am.sessionTracker.refsFor('s1', 'unified7d');
+  assert.equal(obs.idx, 0, 'the fail-back did not hand a its reading back');
+
+  rollWindow(am, 0);
+  const away = serve(am, 's1', HAIKU).name;
+  assert.notEqual(away, 'a', 'a\'s shared roll did not move the pin');
+  assert.equal(serve(am, 's1', HAIKU).name, away, 'the preemption did not settle');
+  assert.equal(obs.unescaped?.idx, 0,
+    'the first roll of a\'s shared window was not held because an earlier reading had been handed back');
+  assert.equal(serve(am, 's1', HAIKU, { exclude: ex }).name, 'a', 'the second fail-back did not reach a');
+  assert.equal(am._pinRolledOver('s1', am.accounts[0], HAIKU), true,
+    'the fail-back was not handed the shared roll');
+});
+
 test('a fail-back to the account of the most recent escape is still handed its roll', () => {
   // The other end of the chain from the arm above: the newest escape is handed
   // back too, and is not lost to the older one still outstanding.

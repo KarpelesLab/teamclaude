@@ -2133,7 +2133,7 @@ export class AccountManager {
         if (back) {
           this._moveObs(obs, account.index);
           obs.windows = back.windows;
-          obs.restored = true;
+          obs.handedBack = new Map(Object.entries(this._accountWindows(account)));
           obs.unescaped = dropHeld(obs.unescaped, account.index);
           return;
         }
@@ -2144,7 +2144,7 @@ export class AccountManager {
       // A borrower resting on the owner's cursor displaces the owner's reading.
       // A reading no walk has moved names no fleet, so the fleet that observes
       // the roll takes it, and a single-provider fleet can still settle it.
-      const owed = leaving && !obs.restored && this._anyJumped(obs.windows, leaving)
+      const owed = leaving && this._newRoll(obs, leaving)
         ? { idx: obs.idx, windows: obs.windows, provider: obs.provider ?? this._selectingProvider }
         : null;
       this._moveObs(obs, account.index);
@@ -2173,7 +2173,6 @@ export class AccountManager {
     // not evidence about the others. A reading that never freshens still detects
     // the next roll, measured from a value further back rather than a wrong one.
     obs.windows.set(win.window, win.resetAt);
-    obs.restored = false;
     // A window with no entry at all is different: it has appeared on the account
     // since the reading was taken, most often a learned scoped bucket upstream
     // has just reported. Taking it now discards nothing, and is the difference
@@ -2216,12 +2215,12 @@ export class AccountManager {
         // held for the fleet the chain belongs to: the hold being handed back is
         // that fleet's, and a hold naming nobody can be settled by nobody.
         const leaving = obs.idx == null ? null : this.accounts[obs.idx];
-        const displaced = leaving && !obs.restored && this._anyJumped(obs.windows, leaving)
+        const displaced = leaving && this._newRoll(obs, leaving)
           ? { idx: obs.idx, windows: obs.windows, provider: obs.provider ?? owed.provider ?? this._selectingProvider }
           : null;
         this._moveObs(obs, account.index);
         obs.windows = owed.windows;
-        obs.restored = true;
+        obs.handedBack = new Map(Object.entries(this._accountWindows(account)));
         // A restore outside a selection walk reads no fleet from one. The reading
         // handed back is the one the hold's fleet established, so it keeps that
         // fleet, and the next hand-back has one to stamp the roll it leaves with.
@@ -2252,7 +2251,7 @@ export class AccountManager {
   _moveObs(obs, index) {
     obs.idx = index;
     obs.gen = ++this._obsGen;
-    obs.restored = false;
+    obs.handedBack = null;
     // A move inside a selection walk makes the reading that fleet's, so its own
     // stay is what settles a roll pushed off it. The same-index stay in `_restOn`
     // does not come through here: a borrowed walk advances a reading the resting
@@ -2268,6 +2267,24 @@ export class AccountManager {
     if (!reading || !account) return false;
     for (const [window, resetAt] of Object.entries(this._accountWindows(account))) {
       if (this._jumped(reading, { window, resetAt })) return true;
+    }
+    return false;
+  }
+
+  /** Has a window rolled on this account that the reading was NOT handed back
+   * for? A hand-back restores the reading from before a roll and records the
+   * account's windows as they stood then, so that roll is a jump against the
+   * reading but not against the record. A window that has moved since the
+   * hand-back, or one the record never saw, is a roll of its own, and the
+   * departure that finds it holds it. Per window, so a rest governed by one
+   * window says nothing about another's roll, and a second fleet's window
+   * rolling on the same reading is still seen. */
+  _newRoll(obs, account) {
+    if (!obs.handedBack) return this._anyJumped(obs.windows, account);
+    for (const [window, resetAt] of Object.entries(this._accountWindows(account))) {
+      const win = { window, resetAt };
+      if (!this._jumped(obs.windows, win)) continue;
+      if (!obs.handedBack.has(window) || this._jumped(obs.handedBack, win)) return true;
     }
     return false;
   }

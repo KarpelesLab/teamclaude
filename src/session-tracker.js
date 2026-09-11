@@ -110,7 +110,7 @@ function setAndReturn(map, key, value) {
  * @property {Hold|null} unescaped the roll this choice was pushed off and has not escaped
  * @property {number} gen the stamp a confirmation is scoped by
  * @property {string|null} provider the fleet whose reading this is
- * @property {boolean} restored the reading was handed back from a hold and no request has been served on it since
+ * @property {Map<string, number>|null} handedBack the account's windows as they stood when a hold handed this reading back, so the roll it was handed back for is not held again; null once the reading moves
  */
 export class SessionTracker {
   /**

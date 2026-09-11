@@ -19,7 +19,7 @@ export const ROLLOVER_MIN_JUMP_MS = 3600_000;
  * @returns {Observation}
  */
 export function newObservation() {
-  return { idx: null, windows: new Map(), unescaped: null, gen: 0, provider: null, restored: false };
+  return { idx: null, windows: new Map(), unescaped: null, gen: 0, provider: null, handedBack: null };
 }
 
 /**
