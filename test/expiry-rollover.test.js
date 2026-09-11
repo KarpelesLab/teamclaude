@@ -1871,13 +1871,14 @@ test('a confirmed serve releases a roll held against the account it rests on', (
     'the request after the return was preempted off a week already spent');
 });
 
-test('a hand-back holds the roll it leaves for the fleet whose reading it is', () => {
+test('a hand-back keeps the fleet on the reading it restores and holds no roll it already handed back', () => {
   // A hand-back outside a selection walk reads no fleet from the walk: the pin
   // store's restore runs from `recordSession`, after the walk has cleared it.
   // The reading it hands back was established by the fleet the hold names, so
-  // keeping that fleet on the reading is what lets the NEXT hand-back stamp the
-  // roll it leaves with a fleet at all. A roll naming none can be settled by
-  // nobody, and the account it belongs to keeps it for ever.
+  // the reading keeps that fleet. A roll is handed back ONCE: the reading this
+  // hand-back restored rolls away again before any request is served on it, and
+  // the next hand-back does not hold it a second time, or two accounts that have
+  // each rolled would trade their rolls for ever.
   const am = mgr(['a', 'b', 'c'], ON, { distributeSessions: true });
   for (const [i, hours] of [[0, 10], [1, 20], [2, 30]]) bucket(am, i, 'unified7d', 0.4, hours);
 
@@ -1895,10 +1896,8 @@ test('a hand-back holds the roll it leaves for the fleet whose reading it is', (
 
   assert.equal(serve(am, 's1', OPUS, { exclude: new Set([2]) }).name, 'b',
     'the forced return did not reach b');
-  const held = am.sessionTracker.refsFor('s1', 'unified7d').unescaped;
-  assert.equal(held.idx, 0, 'the second hand-back did not hold a\'s roll');
-  assert.equal(held.provider, 'anthropic',
-    'the roll the second hand-back left names no fleet, so no serve can settle it');
+  assert.equal(am.sessionTracker.refsFor('s1', 'unified7d').unescaped, null,
+    'a roll handed back once was held a second time');
 
   // The control on the fleet this arm reads. A hand-back INSIDE a walk takes the
   // fleet from the walk, so a fix that reads the hold would be untested by the
@@ -1919,9 +1918,9 @@ test('a hand-back holds the roll it leaves for the fleet whose reading it is', (
 
 test('an operator switch that hands a roll back keeps the fleet on the reading', () => {
   // The second route to the same restore: the TUI's switch and the /switch
-  // endpoint move the cursor with no walk around them at all, so a reading whose
-  // fleet the first switch dropped leaves the second switch a roll no serve can
-  // reach.
+  // endpoint move the cursor with no walk around them at all, so the reading the
+  // first switch restores must keep its fleet, and the second switch holds no
+  // roll that first switch already handed back.
   const am = mgr(['a', 'b', 'c'], ON);
   for (const [i, hours] of [[0, 10], [1, 20], [2, 30]]) bucket(am, i, 'unified7d', 0.4, hours);
   am.selectActiveAccount();
@@ -1937,10 +1936,8 @@ test('an operator switch that hands a roll back keeps the fleet on the reading',
   assert.equal(am._currentObs.provider, 'anthropic',
     'the switch back to a forgot the fleet that established the reading');
   assert.equal(am.setCurrentAccount(1), true, 'the operator switch to b was refused');
-  assert.equal(am._currentObs.unescaped.idx, 0,
-    'the second switch did not hold a\'s roll');
-  assert.equal(am._currentObs.unescaped.provider, 'anthropic',
-    'the roll the second switch left names no fleet, so no serve can settle it');
+  assert.equal(am._currentObs.unescaped, null,
+    'a roll the first switch handed back was held again by the second');
 });
 
 test('a confirmed serve releases the roll held against the account it rests on and the one the move escaped', () => {
@@ -2086,8 +2083,8 @@ test('a roll displaced by a restore onto a reading no walk established still nam
   // chain, and the reading that comes back is c's own pre-roll one.
   assert.equal(serve(am, 's1', OPUS, { exclude: new Set([0]) }).name, 'c',
     'the forced return did not reach c');
-  assert.equal(am.sessionTracker.refsFor('s1', 'unified7d').unescaped.idx, 0,
-    'the return did not take c\'s roll back off the chain');
+  assert.equal(am.sessionTracker.refsFor('s1', 'unified7d').unescaped, null,
+    'the return did not take c\'s roll back off the chain, or held a\'s roll a second time');
 });
 
 test('a restore displaces a fleetless reading the same way with no account removed', () => {
@@ -2115,6 +2112,31 @@ test('a restore displaces a fleetless reading the same way with no account remov
   assert.equal(held.idx, 2, 'the control\'s restore held nothing for c');
   assert.equal(held.provider, 'anthropic',
     'the control\'s displaced roll names no fleet either, so the removal is not the cause');
+});
+
+test('two accounts that have each rolled come to rest after one bounce', () => {
+  // The reading a hand-back restores is the one from before the roll, so the
+  // next request sees the roll again and the reset switch fires again. Held on
+  // every departure, two rolls would trade places for ever; handed back once,
+  // the fleet bounces once and rests.
+  const am = mgr(['a', 'b', 'c'], ON, { distributeSessions: true });
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30]]) bucket(am, i, 'unified7d', 0.4, hours);
+  const ex = new Set([1]);
+
+  assert.equal(serve(am, 's1', OPUS).name, 'a', 'the fixture must start on a');
+  rollWindow(am, 0);
+  assert.equal(serve(am, 's1', OPUS).name, 'b', 'a\'s roll did not move the pin');
+  assert.equal(serve(am, 's1', OPUS).name, 'b', 'the preemption did not settle on b');
+  assert.equal(serve(am, 's1', OPUS, { exclude: ex }).name, 'c', 'the pin did not first-sight onto c');
+  assert.equal(serve(am, 's1', OPUS, { exclude: ex }).name, 'c', 'the pin did not rest on c');
+  rollWindow(am, 2);
+  assert.equal(serve(am, 's1', OPUS, { exclude: ex }).name, 'a', 'c\'s roll did not send the pin back to a');
+
+  const seq = [];
+  for (let i = 0; i < 6; i++) seq.push(serve(am, 's1', OPUS, { exclude: ex }).name);
+  assert.equal(seq.slice(1).join(''), 'aaaaa', `the fleet did not come to rest: ${seq.join('')}`);
+  assert.equal(am.sessionTracker.refsFor('s1', 'unified7d').unescaped, null,
+    'a roll stayed held after the fleet came to rest');
 });
 
 test('a fail-back to the account of the most recent escape is still handed its roll', () => {

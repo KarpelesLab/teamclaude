@@ -110,6 +110,7 @@ function setAndReturn(map, key, value) {
  * @property {Hold|null} unescaped the roll this choice was pushed off and has not escaped
  * @property {number} gen the stamp a confirmation is scoped by
  * @property {string|null} provider the fleet whose reading this is
+ * @property {boolean} restored the reading was handed back from a hold and no request has been served on it since
  */
 export class SessionTracker {
   /**

@@ -2133,6 +2133,7 @@ export class AccountManager {
         if (back) {
           this._moveObs(obs, account.index);
           obs.windows = back.windows;
+          obs.restored = true;
           obs.unescaped = dropHeld(obs.unescaped, account.index);
           return;
         }
@@ -2143,7 +2144,7 @@ export class AccountManager {
       // A borrower resting on the owner's cursor displaces the owner's reading.
       // A reading no walk has moved names no fleet, so the fleet that observes
       // the roll takes it, and a single-provider fleet can still settle it.
-      const owed = leaving && this._anyJumped(obs.windows, leaving)
+      const owed = leaving && !obs.restored && this._anyJumped(obs.windows, leaving)
         ? { idx: obs.idx, windows: obs.windows, provider: obs.provider ?? this._selectingProvider }
         : null;
       this._moveObs(obs, account.index);
@@ -2172,6 +2173,7 @@ export class AccountManager {
     // not evidence about the others. A reading that never freshens still detects
     // the next roll, measured from a value further back rather than a wrong one.
     obs.windows.set(win.window, win.resetAt);
+    obs.restored = false;
     // A window with no entry at all is different: it has appeared on the account
     // since the reading was taken, most often a learned scoped bucket upstream
     // has just reported. Taking it now discards nothing, and is the difference
@@ -2214,11 +2216,12 @@ export class AccountManager {
         // held for the fleet the chain belongs to: the hold being handed back is
         // that fleet's, and a hold naming nobody can be settled by nobody.
         const leaving = obs.idx == null ? null : this.accounts[obs.idx];
-        const displaced = leaving && this._anyJumped(obs.windows, leaving)
+        const displaced = leaving && !obs.restored && this._anyJumped(obs.windows, leaving)
           ? { idx: obs.idx, windows: obs.windows, provider: obs.provider ?? owed.provider ?? this._selectingProvider }
           : null;
         this._moveObs(obs, account.index);
         obs.windows = owed.windows;
+        obs.restored = true;
         // A restore outside a selection walk reads no fleet from one. The reading
         // handed back is the one the hold's fleet established, so it keeps that
         // fleet, and the next hand-back has one to stamp the roll it leaves with.
@@ -2249,6 +2252,7 @@ export class AccountManager {
   _moveObs(obs, index) {
     obs.idx = index;
     obs.gen = ++this._obsGen;
+    obs.restored = false;
     // A move inside a selection walk makes the reading that fleet's, so its own
     // stay is what settles a roll pushed off it. The same-index stay in `_restOn`
     // does not come through here: a borrowed walk advances a reading the resting
