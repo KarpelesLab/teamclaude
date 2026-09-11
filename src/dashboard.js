@@ -357,6 +357,7 @@ const PAGE = `<!doctype html>
   :root {
     --bg: #101418; --panel: #171d24; --line: #242c36;
     --text: #d7dde4; --dim: #8a949f; --accent: #53b1fd;
+    --anthropic: #d97757; --codex: #10a37f;
     --ok: #3fb950; --warn: #d29922; --bad: #f85149;
   }
   * { box-sizing: border-box; margin: 0; }
@@ -375,8 +376,8 @@ const PAGE = `<!doctype html>
   .badge.throttled { color: var(--warn); border-color: var(--warn); }
   .badge.error, .badge.exhausted { color: var(--bad); border-color: var(--bad); }
   .badge.current { color: var(--accent); border-color: var(--accent); }
-  .badge.provider { color: var(--text); }
-  .badge.provider.codex { color: var(--accent); border-color: var(--accent); }
+  .badge.provider.anthropic { color: var(--anthropic); border-color: var(--anthropic); }
+  .badge.provider.codex { color: var(--codex); border-color: var(--codex); }
   .badge.meta { color: var(--dim); }
   .badge.sessions { color: var(--text); }
   .badge.sessions.known { color: var(--dim); }

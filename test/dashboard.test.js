@@ -75,6 +75,14 @@ test('account metadata and session state are separate badges', () => {
   ]);
 });
 
+test('provider badges use the Anthropic and Codex brand colors', () => {
+  const html = renderDashboardHtml();
+  assert.match(html, /--anthropic:\s*#d97757/);
+  assert.match(html, /--codex:\s*#10a37f/);
+  assert.match(html, /\.badge\.provider\.anthropic\s*\{[^}]*var\(--anthropic\)/);
+  assert.match(html, /\.badge\.provider\.codex\s*\{[^}]*var\(--codex\)/);
+});
+
 const SESSIONS = {
   items: [
     {
