@@ -186,7 +186,7 @@ teamclaude version           # Print the installed version
 teamclaude help              # Show all commands
 ```
 
-`teamclaude status` prints the same picture as the TUI, once, as text. Handy over SSH or in a script; `--json` for machine-readable output.
+`teamclaude status` prints the same picture as the TUI, once, as text. Handy over SSH or in a script; `--json` for machine-readable output. The JSON's `server.version` is the version of the process answering — read once at startup, so right after `teamclaude update` it still names the old code until the restart, where the installed CLI's `teamclaude version` already names the new one.
 
 `teamclaude attach` opens the dashboard itself against a server that is already running, which is how you get interactive control back when the proxy runs as a background service. It polls the same status endpoint every second and can do the two things the control plane exposes: `s` switches account, `R` reloads config. Settings editing, quota probing and the request activity stream stay in the server's own TUI — they need state that only that process has. When contact with the server drops, the header marker turns from `▲` to `▼` and what is on screen is the last snapshot, not the current state.
 

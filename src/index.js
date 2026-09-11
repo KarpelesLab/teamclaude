@@ -360,6 +360,10 @@ async function serverCommand() {
   // Opt-in keep-warm scheduler (interval or persisted reset-target schedule).
   let warmer = null;
   const serverStartedAt = Date.now();
+  // Read once here, not per request: `teamclaude update` swaps package.json on
+  // disk while this process keeps running the old code, and status must report
+  // what is running, not what is installed.
+  const serverVersion = currentVersion();
 
   // sx.org proxy (IP-based-429 workaround). Dormant unless an API key is set in
   // config.sx.apiKey; when set we provision a proxy and route upstream through it.
@@ -552,6 +556,7 @@ async function serverCommand() {
     // Per-dimension usage (proxy.usageDimensions) — empty when unconfigured.
     usageDimensions: dimensionUsage.export(),
     server: {
+      version: serverVersion,
       startedAt: new Date(serverStartedAt).toISOString(),
       uptimeSeconds: Math.round((Date.now() - serverStartedAt) / 1000),
       port,
