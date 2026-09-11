@@ -38,7 +38,7 @@ import { autoUpdate, checkForUpdate, currentVersion, runUpdate, installKind, PKG
 import { renderStatus, formatPercent } from './status-renderer.js';
 import { sanitizeText } from './safe-text.js';
 import { ClientUsageTracker, UsageDimensionTracker } from './client-usage.js';
-import { buildClaudeEnvLines, encodePinComponent } from './claude-env.js';
+import { buildClaudeEnvLines, bypassesAllHosts, encodePinComponent, mergeNoProxy } from './claude-env.js';
 import { serviceKind, installService, uninstallService, serviceStatus, renderService, logPath } from './service.js';
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
 import { getUpstreamProxy, describeProxy, describeSelfProxy } from './upstream-proxy.js';
@@ -940,6 +940,9 @@ async function envCommand() {
     lines = buildClaudeEnvLines({
       port, useMitm, caPath, holdSeconds: config.holdSeconds,
       account, proxyApiKey: config.proxy?.apiKey || '',
+      // The shell doing the eval keeps its own NO_PROXY entries; re-running is
+      // idempotent, since the merged value is what it will have next time.
+      inheritedNoProxy: [process.env.NO_PROXY, process.env.no_proxy].filter(Boolean).join(','),
     });
   } catch (err) {
     // A bad proxy.port. Nothing reaches stdout: the shell is eval'ing it.
@@ -1018,7 +1021,13 @@ async function runCommand() {
         : '';
       const proxyUrl = `http://${userinfo}127.0.0.1:${port}`;
       env.HTTPS_PROXY = env.HTTP_PROXY = env.https_proxy = env.http_proxy = proxyUrl;
-      env.NO_PROXY = env.no_proxy = 'localhost,127.0.0.1,::1';
+      // Keep the operator's own NO_PROXY and add ours — see mergeNoProxy. Both
+      // spellings are read: a tool that set only one still meant it.
+      const inheritedNoProxy = [process.env.NO_PROXY, process.env.no_proxy];
+      env.NO_PROXY = env.no_proxy = mergeNoProxy(...inheritedNoProxy);
+      if (inheritedNoProxy.some(bypassesAllHosts)) {
+        console.error('[TeamClaude] NO_PROXY=* ignored: it would send api.anthropic.com around the proxy (no rotation). Use --no-mitm for a direct launch.');
+      }
       env.NODE_EXTRA_CA_CERTS = caPath;
       if (tcAcct) console.error(`[TeamClaude] Pinned to account "${tcAcct}" (TC_ACCT)`);
       else if (pinnedBase) {

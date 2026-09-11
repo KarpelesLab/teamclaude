@@ -140,6 +140,8 @@ claude
 
 Only the export lines go to stdout (so `eval` is safe); a short summary and any hints go to stderr. No `ANTHROPIC_API_KEY` is emitted — loopback clients are exempt from the proxy key gate, and setting it would drop Claude Code out of subscription mode. A remote (non-loopback) client must add the proxy key itself.
 
+**Your own `NO_PROXY` is kept.** `run` and `env` both set `NO_PROXY=localhost,127.0.0.1,::1` and append whatever the launching shell already had. That matters for local development: a dev server on a name like `app.test` resolves to 127.0.0.1 through a local resolver, and a forward to loopback is refused, so a client that proxied it would get a 403 on every retry. `export NO_PROXY=.test` before the eval (or before `run`) and the launched client gets `localhost,127.0.0.1,::1,.test`. The one entry that is dropped is `*` — it would send `api.anthropic.com` around the proxy as well, silently ending rotation; use `--no-mitm` for a direct launch.
+
 **Using an agent multiplexer or a tool that spawns `claude` itself?** Export this environment in the process that launches those `claude` instances — e.g. `eval "$(teamclaude env)"` in the shell you start the multiplexer from. Every spawned `claude` then gets the same routing (and MITM interception of hardcoded endpoints) without going through `teamclaude run`. The trade-off: `run`'s proxy-up/down guard only applies when you launch via `run`, so start the server before the multiplexer.
 
 ### Routing plain `claude` automatically
