@@ -90,6 +90,25 @@ test('each provider keeps its own cursor across calls', () => {
   assert.equal(am.currentIndex, 0, 'and still without touching the Anthropic cursor');
 });
 
+test('status exposes the current account independently for every provider', () => {
+  const am = new AccountManager([claude('a1'), claude('a2'), codex('c1'), codex('c2')], 0.98);
+  am.setCurrentAccount(1);
+  am.getActiveAccount(null, 'gpt-5.6-sol', null, null, 'codex');
+
+  const status = am.getStatus();
+  assert.deepEqual(status.currentAccounts, { anthropic: 'a2', codex: 'c1' });
+  assert.deepEqual(status.defaultTargets, { anthropic: 'a2', codex: 'c1' });
+  assert.deepEqual(
+    status.accounts.map(a => ({ name: a.name, provider: a.provider })),
+    [
+      { name: 'a1', provider: 'anthropic' },
+      { name: 'a2', provider: 'anthropic' },
+      { name: 'c1', provider: 'codex' },
+      { name: 'c2', provider: 'codex' },
+    ],
+  );
+});
+
 // A single-provider fleet — every config predating the provider seam — must
 // behave exactly as it did.
 test('a single-provider fleet still moves its cursor normally', () => {

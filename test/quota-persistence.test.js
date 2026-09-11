@@ -12,8 +12,14 @@ test('exportQuotaState carries only persistable fields and identity, no credenti
   am.accounts[0].quota.unified7d = 0.42;
   const [entry] = am.exportQuotaState();
 
-  assert.deepEqual(Object.keys(entry).sort(), ['accountUuid', 'name', 'orgName', 'orgUuid', 'profile', 'quota', 'adaptive'].sort());
+  // `provider` and `accountId` are identity, not credentials: they are what
+  // identifies an account that has no Anthropic uuid to be matched by.
+  assert.deepEqual(
+    Object.keys(entry).sort(),
+    ['accountUuid', 'accountId', 'provider', 'name', 'orgName', 'orgUuid', 'profile', 'quota', 'adaptive'].sort(),
+  );
   assert.equal(entry.accountUuid, 'p1');
+  assert.equal(entry.provider, 'anthropic');
   assert.equal(entry.quota.unified7d, 0.42);
   // Transient/credential fields must not leak.
   assert.ok(!('probing' in entry.quota));

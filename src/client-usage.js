@@ -16,6 +16,12 @@
 // is exempt from the gate and therefore unattributed, as is anything using the
 // single shared proxy.apiKey. Deployments that want complete per-client stats
 // give every consumer a clientKeys entry and treat the shared key as legacy.
+//
+// A WebSocket handshake (Remote Control's real-time channel) is booked as a
+// `connection`, apart from the request counters: it is not a request and
+// carries no tokens, so folding it into `requests` would misstate the usage
+// totals — but "which clients open channels here" is a question the same
+// table answers (#325).
 
 export const DEFAULT_USAGE_DIMENSION_MAX_KEYS = 500;
 export const USAGE_DIMENSION_VALUE_MAX_LENGTH = 200;
@@ -51,7 +57,7 @@ export class ClientUsageTracker {
   // set only for the header-derived dimension trackers, whose values come from
   // callers and are therefore unbounded.
   constructor({ now = () => Date.now(), maxKeys = Infinity } = {}) {
-    this.clients = new Map(); // name → { requests, inputTokens, outputTokens, lastUsed(ms) }
+    this.clients = new Map(); // name → { requests, connections, inputTokens, outputTokens, lastUsed(ms) }
     this._now = now;
     this.maxKeys = maxKeys;
   }
@@ -60,17 +66,18 @@ export class ClientUsageTracker {
     let c = this.clients.get(name);
     if (!c) {
       if (this.clients.size >= this.maxKeys && name !== OVERFLOW_KEY) return this._ensure(OVERFLOW_KEY);
-      c = { requests: 0, inputTokens: 0, outputTokens: 0, lastUsed: null };
+      c = { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0, lastUsed: null };
       this.clients.set(name, c);
     }
     return c;
   }
 
   /** Book usage against a client name. A null/empty name is dropped (unattributed). */
-  record(name, { requests = 0, inputTokens = 0, outputTokens = 0 } = {}) {
+  record(name, { requests = 0, connections = 0, inputTokens = 0, outputTokens = 0 } = {}) {
     if (!name) return;
     const c = this._ensure(name);
     c.requests += requests;
+    c.connections += connections;
     c.inputTokens += inputTokens;
     c.outputTokens += outputTokens;
     c.lastUsed = this._now();
@@ -89,6 +96,7 @@ export class ClientUsageTracker {
     for (const [name, c] of this.clients) {
       out[name] = {
         requests: c.requests,
+        connections: c.connections,
         inputTokens: c.inputTokens,
         outputTokens: c.outputTokens,
         lastUsed: c.lastUsed ? new Date(c.lastUsed).toISOString() : null,
@@ -110,6 +118,7 @@ export class ClientUsageTracker {
       if (!name || !s || typeof s !== 'object') continue;
       const c = this._ensure(name);
       c.requests += Number(s.requests) || 0;
+      c.connections += Number(s.connections) || 0;
       c.inputTokens += Number(s.inputTokens) || 0;
       c.outputTokens += Number(s.outputTokens) || 0;
       const t = s.lastUsed ? Date.parse(s.lastUsed) : NaN;

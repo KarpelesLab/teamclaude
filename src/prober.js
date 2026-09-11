@@ -9,6 +9,8 @@
 
 import { fetchUsage } from './oauth.js';
 import { fetchBackendQuota, hasBackendQuota } from './backend-quota.js';
+import { providerOf } from './provider.js';
+import { fetchCodexUsage } from './codex-usage.js';
 
 // Node's timers take a 32-bit signed delay: anything above 2^31-1 ms is
 // coerced to 1 ms, so an interval large enough to mean "practically never"
@@ -21,10 +23,11 @@ function clampInterval(ms) {
 }
 
 export class Prober {
-  constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, profileFn = null, backendFn = fetchBackendQuota, timeoutMs = 10_000, log = console.log } = {}) {
+  constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, codexProbeFn = fetchCodexUsage, profileFn = null, backendFn = fetchBackendQuota, timeoutMs = 10_000, log = console.log } = {}) {
     this.am = accountManager;
     this.intervalMs = clampInterval(intervalMs);
     this.probeFn = probeFn;
+    this.codexProbeFn = codexProbeFn;
     this.profileFn = profileFn;
     this.backendFn = backendFn;
     this.timeoutMs = timeoutMs;
@@ -75,7 +78,7 @@ export class Prober {
     this.nextRunAt = this.intervalMs > 0 ? this.lastRunStartedAt + this.intervalMs : null;
     try {
       const accounts = this.am.accounts.filter(account =>
-        this._probeable(account) && (this._isProbeTarget(account) || this._isBackendTarget(account)));
+        this._probeable(account) && (this._isProbeTarget(account) || this._isCodexProbeTarget(account) || this._isBackendTarget(account)));
       await Promise.all(accounts.map(account => this.probeAccount(account)));
     } finally {
       this.lastRunFinishedAt = Date.now();
@@ -95,7 +98,13 @@ export class Prober {
    * this line (warmer.js `_isWarmTarget`); the probe did not.
    */
   _isProbeTarget(account) {
-    return !!account && account.type === 'oauth' && !!account.credential && !account.upstream;
+    return !!account && providerOf(account) === 'anthropic'
+      && account.type === 'oauth' && !!account.credential && !account.upstream;
+  }
+
+  _isCodexProbeTarget(account) {
+    return !!account && providerOf(account) === 'codex'
+      && account.type === 'oauth' && !!account.credential && !!account.accountId && !account.upstream;
   }
 
   /** A third-party backend that publishes a quota of its own. The provider
@@ -124,6 +133,7 @@ export class Prober {
     // A third-party backend has no Anthropic usage to read; it publishes its own
     // figure, or none. Same schedule, same status row, different source.
     if (this._isBackendTarget(account)) return this._probeBackend(account, startedAt);
+    if (this._isCodexProbeTarget(account)) return this._probeCodex(account, startedAt);
     try {
       await this.am.ensureTokenFresh(account.index);
       let usage = await this._withTimeout(this.probeFn(account.credential));
@@ -172,6 +182,28 @@ export class Prober {
     }
   }
 
+  async _probeCodex(account, startedAt) {
+    try {
+      await this.am.ensureTokenFresh(account.index);
+      let usage = await this._withTimeout(this.codexProbeFn(account));
+      if (usage?.status === 401) {
+        await this.am.ensureTokenFresh(account.index, true);
+        usage = await this._withTimeout(this.codexProbeFn(account));
+      }
+      if (!usage || usage.error) {
+        const finishedAt = Date.now();
+        this._recordAccount(account, { status: usage?.error ? 'error' : 'timeout', error: usage?.error || 'probe timed out', startedAt, finishedAt, durationMs: finishedAt - startedAt });
+        return;
+      }
+      this.am.applyCodexUsageData(account.index, usage);
+      const finishedAt = Date.now();
+      this._recordAccount(account, { status: 'ok', error: null, startedAt, finishedAt, durationMs: finishedAt - startedAt });
+    } catch (err) {
+      const finishedAt = Date.now();
+      this._recordAccount(account, { status: 'error', error: err?.message || String(err), startedAt, finishedAt, durationMs: finishedAt - startedAt });
+    }
+  }
+
   /** Read one backend account's own quota through the provider module. */
   async _probeBackend(account, startedAt) {
     const reading = await this.backendFn(account, { timeoutMs: this.timeoutMs })
@@ -198,7 +230,7 @@ export class Prober {
         const status = this.accountStatus.get(account.name);
         return {
           name: account.name,
-          status: (this._isProbeTarget(account) || this._isBackendTarget(account))
+          status: (this._isProbeTarget(account) || this._isCodexProbeTarget(account) || this._isBackendTarget(account))
             ? (status?.status || 'never') : 'not-applicable',
           lastProbedAt: iso(status?.finishedAt),
           startedAt: iso(status?.startedAt),

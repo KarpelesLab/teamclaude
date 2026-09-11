@@ -82,6 +82,32 @@ export function accountTokens(usage) {
     + (u.totalCacheReadTokens || 0) + (u.totalCacheCreationTokens || 0);
 }
 
+export function providerLabel(provider) {
+  if (provider === 'codex') return 'Codex';
+  if (provider === 'anthropic') return 'Claude';
+  return provider || 'Unknown';
+}
+
+export function accountBadges(account, current, currentAccounts) {
+  var a = account || {};
+  var isCurrent = currentAccounts
+    ? currentAccounts[a.provider] === a.name
+    : a.name === current;
+  var status = a.disabled ? 'disabled' : (a.status || 'unknown');
+  var recent = Number.isFinite(a.sessions) ? a.sessions : 0;
+  var known = Number.isFinite(a.knownSessions) ? a.knownSessions : 0;
+  var badges = [
+    { cls: 'provider ' + (a.provider || 'unknown'), text: providerLabel(a.provider) },
+    { cls: 'meta', text: a.type || 'unknown' },
+    { cls: 'meta priority', text: 'prio ' + (a.priority || 0) },
+  ];
+  if (isCurrent) badges.push({ cls: 'current', text: 'current' });
+  badges.push({ cls: status, text: status });
+  if (recent) badges.push({ cls: 'sessions', text: recent + ' recent' });
+  if (known > recent) badges.push({ cls: 'sessions known', text: known + ' known' });
+  return badges;
+}
+
 // One row per session, from `sessions.items` (proxy.sessionDetail). The token
 // columns are #192's numbers — what each response actually reported, cache
 // included — summed across the weekly buckets the session touched. `pins` is a
@@ -184,6 +210,7 @@ export function routeRows(status) {
     return {
       kind: 'route',
       name: name,
+      provider: r.provider || 'anthropic',
       label: name.charAt(0).toUpperCase() + name.slice(1),
       match: match.join(', '),
       target: target,
@@ -203,16 +230,28 @@ export function routeRows(status) {
     };
   });
   if (rows.length) {
-    // The default row is the server's answer too (`defaultTarget`), not an
-    // assumption that unrouted traffic lands on the current account: a
-    // blocked or outranked current account is skipped by the next request.
-    var current = s.currentAccount || null;
-    var cur = (s.accounts || []).filter(function (a) { return a.name === current; })[0];
-    rows.push({
-      kind: 'default', name: '', label: 'Everything else', match: '',
-      target: s.defaultTarget || current, current: current,
-      currentUnavailable: (cur && cur.unavailable) || null,
-      pinned: null, pinMismatch: false, blocked: false, autocreated: false, eligible: [], ineligible: [],
+    // The server reports one default per provider. A mixed Claude/Codex fleet
+    // has two independent cursors, so collapsing these into one global row is
+    // the exact ambiguity this table exists to remove. Older servers retain
+    // the original single-row fallback.
+    var defaults = s.defaultTargets || null;
+    var providers = defaults ? Object.keys(defaults).sort(function (a, b) {
+      if (a === 'anthropic') return -1;
+      if (b === 'anthropic') return 1;
+      return a < b ? -1 : a > b ? 1 : 0;
+    }) : [];
+    if (!providers.length) providers = [rows[0].provider || 'anthropic'];
+    providers.forEach(function (provider) {
+      var current = (s.currentAccounts && s.currentAccounts[provider]) || s.currentAccount || null;
+      var cur = (s.accounts || []).filter(function (a) { return a.name === current; })[0];
+      rows.push({
+        kind: 'default', name: '',
+        label: defaults ? providerLabel(provider) + ' default' : 'Everything else',
+        provider: provider, match: '',
+        target: defaults ? defaults[provider] : (s.defaultTarget || current), current: current,
+        currentUnavailable: (cur && cur.unavailable) || null,
+        pinned: null, pinMismatch: false, blocked: false, autocreated: false, eligible: [], ineligible: [],
+      });
     });
   }
   return rows;
@@ -300,7 +339,7 @@ export function problems(status) {
 }
 
 const SHARED_HELPERS = [
-  scopedWeeklyRows, accountTokens, sessionRows, filterSessionRows, sortRows, uniqSorted,
+  scopedWeeklyRows, accountTokens, providerLabel, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, routeRows, problems,
 ].map(fn => fn.toString()).join('\n\n');
 
@@ -336,6 +375,11 @@ const PAGE = `<!doctype html>
   .badge.throttled { color: var(--warn); border-color: var(--warn); }
   .badge.error, .badge.exhausted { color: var(--bad); border-color: var(--bad); }
   .badge.current { color: var(--accent); border-color: var(--accent); }
+  .badge.provider { color: var(--text); }
+  .badge.provider.codex { color: var(--accent); border-color: var(--accent); }
+  .badge.meta { color: var(--dim); }
+  .badge.sessions { color: var(--text); }
+  .badge.sessions.known { color: var(--dim); }
   .quota { display: grid; grid-template-columns: 64px 1fr 170px; gap: 8px; align-items: center; margin-top: 6px; }
   .quota .lbl { color: var(--dim); font-size: 12px; }
   .quota .val { color: var(--dim); font-size: 12px; text-align: right; font-variant-numeric: tabular-nums; }
@@ -360,6 +404,10 @@ const PAGE = `<!doctype html>
   .filters label { color: var(--dim); font-size: 12px; display: flex; align-items: center; gap: 6px; }
   .filters select { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; color: var(--text); font: inherit; font-size: 12px; padding: 4px 8px; }
   .hint { color: var(--dim); font-size: 12px; margin-left: auto; }
+  .actions { display: flex; gap: 8px; margin: 8px 0 16px; }
+  .actions button { font: inherit; font-size: 12px; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--line); background: transparent; color: var(--dim); cursor: pointer; }
+  .actions button:hover { color: var(--text); border-color: var(--text); }
+  .actions button:disabled { opacity: .5; cursor: default; }
   th.sortable { cursor: pointer; user-select: none; }
   th.sortable:hover { color: var(--text); }
   td.dim { color: var(--dim); }
@@ -390,6 +438,10 @@ const PAGE = `<!doctype html>
   <div id="app" style="display:none">
     <h1>TeamClaude</h1>
     <p class="sub" id="summary"></p>
+    <div class="actions">
+      <button id="reload" type="button">Reload config</button>
+      <button id="probe" type="button">Probe quotas</button>
+    </div>
     <div id="err"></div>
     <div id="problems"></div>
     <div id="note"></div>
@@ -505,16 +557,18 @@ ${SHARED_HELPERS}
     return row;
   }
 
-  function renderAccount(a, current) {
+  function renderAccount(a, current, currentAccounts) {
     var card = el('div', 'card');
     var head = el('div', 'row');
     head.appendChild(el('span', 'name', a.name));
-    head.appendChild(el('span', 'tag', a.type + ' · prio ' + (a.priority || 0)));
-    if (a.name === current) head.appendChild(el('span', 'badge current', 'current'));
-    head.appendChild(el('span', 'badge ' + (a.status || ''), a.disabled ? 'disabled' : (a.status || 'unknown')));
-    if (a.sessions) head.appendChild(el('span', 'tag', a.sessions + ' active session' + (a.sessions > 1 ? 's' : '')));
+    var isCurrent = currentAccounts
+      ? currentAccounts[a.provider] === a.name
+      : a.name === current;
+    accountBadges(a, current, currentAccounts).forEach(function (badge) {
+      head.appendChild(el('span', 'badge ' + badge.cls, badge.text));
+    });
     // Last in the row so the badges sit in the same place on every card.
-    if (a.name !== current) {
+    if (!isCurrent) {
       var btn = el('button', 'act', 'switch');
       btn.addEventListener('click', function () { doSwitch(a.name, btn); });
       head.appendChild(btn);
@@ -552,7 +606,7 @@ ${SHARED_HELPERS}
     var table = document.getElementById('clients');
     table.textContent = '';
     var hr = el('tr');
-    ['Client', 'Requests', 'Input tok', 'Output tok', 'Last used'].forEach(function (h, i) {
+    ['Client', 'Requests', 'WebSockets', 'Input tok', 'Output tok', 'Last used'].forEach(function (h, i) {
       hr.appendChild(el('th', i ? 'num' : '', h));
     });
     table.appendChild(hr);
@@ -561,6 +615,7 @@ ${SHARED_HELPERS}
       var tr = el('tr');
       tr.appendChild(el('td', '', n));
       tr.appendChild(el('td', 'num', fmtNum(c.requests)));
+      tr.appendChild(el('td', 'num', fmtNum(c.connections || 0)));
       tr.appendChild(el('td', 'num', fmtNum(c.inputTokens)));
       tr.appendChild(el('td', 'num', fmtNum(c.outputTokens)));
       tr.appendChild(el('td', 'num', c.lastUsed ? fmtAgo(c.lastUsed) : '—'));
@@ -709,6 +764,7 @@ ${SHARED_HELPERS}
       var tr = el('tr');
       var fam = el('td', '', r.label + (r.match ? ' ' : ''));
       if (r.match) fam.appendChild(el('span', 'tag', r.match));
+      if (r.provider) fam.appendChild(el('span', 'tag', ' ' + providerLabel(r.provider)));
       tr.appendChild(fam);
       var to = el('td', r.blocked ? 'badt' : '', r.blocked ? 'blocked' : (r.target || '—'));
       if (r.pinned) to.appendChild(el('span', 'pin', ' · pinned to ' + r.pinned));
@@ -749,12 +805,30 @@ ${SHARED_HELPERS}
     var up = s.server && s.server.uptimeSeconds != null ? 'up ' + fmtIn(s.server.uptimeSeconds) : '';
     var sum = document.getElementById('summary');
     sum.textContent = '';
-    sum.appendChild(el('span', '', 'active account '));
-    sum.appendChild(el('b', '', s.currentAccount || 'none'));
+    var currentAccounts = s.currentAccounts || null;
+    var providerIds = currentAccounts ? Object.keys(currentAccounts).sort(function (a, b) {
+      if (a === 'anthropic') return -1;
+      if (b === 'anthropic') return 1;
+      return a < b ? -1 : a > b ? 1 : 0;
+    }) : [];
+    sum.appendChild(el('span', '', providerIds.length ? 'active accounts ' : 'active account '));
+    if (providerIds.length) {
+      providerIds.forEach(function (provider, i) {
+        if (i) sum.appendChild(el('span', '', ' · '));
+        sum.appendChild(el('span', '', providerLabel(provider) + ': '));
+        sum.appendChild(el('b', '', currentAccounts[provider] || 'none'));
+      });
+    } else {
+      sum.appendChild(el('b', '', s.currentAccount || 'none'));
+    }
     sum.appendChild(el('span', '', ' · ' + (sess.active || 0) + ' active / ' + (sess.known || 0) + ' known sessions' + (up ? ' · ' + up : '')));
+    var probe = s.probe || {};
+    var probeBtn = document.getElementById('probe');
+    probeBtn.textContent = probe.running ? 'Probe running…' : 'Probe quotas';
+    probeBtn.disabled = !!probe.running;
     var acc = document.getElementById('accounts');
     acc.textContent = '';
-    (s.accounts || []).forEach(function (a) { acc.appendChild(renderAccount(a, s.currentAccount)); });
+    (s.accounts || []).forEach(function (a) { acc.appendChild(renderAccount(a, s.currentAccount, currentAccounts)); });
     renderProblems(s);
     renderRoutes(s);
     renderClients(s.clients);
@@ -791,6 +865,23 @@ ${SHARED_HELPERS}
         poll();
       })
       .catch(function (e) { note('error', 'switch failed: ' + e.message); btn.disabled = false; });
+  }
+
+  function doControl(path, label, btn) {
+    btn.disabled = true;
+    fetch(path, { method: 'POST', headers: { 'x-api-key': localStorage.getItem(KEY) || '' } })
+      .then(function (res) {
+        if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
+        return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
+      })
+      .then(function (json) {
+        if (!json) return;
+        if (json.ok !== true) { note('error', label + ' failed' + (json.error ? ': ' + json.error : '')); return; }
+        note('ok', label + ' complete');
+        poll();
+      })
+      .catch(function (e) { note('error', label + ' failed: ' + e.message); })
+      .finally(function () { btn.disabled = false; });
   }
 
   function showKeybox() {
@@ -835,6 +926,8 @@ ${SHARED_HELPERS}
   document.getElementById('key').addEventListener('keydown', function (e) {
     if (e.key === 'Enter') document.getElementById('go').click();
   });
+  document.getElementById('reload').addEventListener('click', function () { doControl('/teamclaude/reload', 'config reload', this); });
+  document.getElementById('probe').addEventListener('click', function () { doControl('/teamclaude/probe', 'quota probe', this); });
 
   ['fProject', 'fClient'].forEach(function (id) {
     document.getElementById(id).addEventListener('change', function () {

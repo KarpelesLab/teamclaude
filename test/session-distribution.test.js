@@ -189,6 +189,8 @@ test('getStatus exposes session counts (known/active/perAccount) and the mode fl
   assert.equal(status.sessions.distribute, true);
   assert.equal(status.accounts[0].sessions, 1);
   assert.equal(status.accounts[1].sessions, 1);
+  assert.equal(status.accounts[0].knownSessions, 1);
+  assert.equal(status.accounts[1].knownSessions, 1);
 });
 
 test('setDistributeSessions applies a config change live', () => {

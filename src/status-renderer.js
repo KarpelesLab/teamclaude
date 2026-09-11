@@ -101,7 +101,11 @@ function renderUsageEntries(lines, entries, paint, now) {
     const tokens = `${formatNumber(c.inputTokens)} in / ${formatNumber(c.outputTokens)} out`;
     const last = parseTs(c.lastUsed);
     const lastText = last ? `, last ${formatAgo(last, now)}` : '';
-    lines.push(`  ${paint.cyan(safeLine(name).padEnd(20))} ${c.requests || 0} req, ${tokens}${lastText}`);
+    // WebSocket channels (Remote Control) are counted apart from requests and
+    // shown only where a client has opened one, so the row reads as before
+    // everywhere else.
+    const conns = c.connections ? `, ${c.connections} ws` : '';
+    lines.push(`  ${paint.cyan(safeLine(name).padEnd(20))} ${c.requests || 0} req${conns}, ${tokens}${lastText}`);
   }
 }
 
@@ -407,7 +411,14 @@ function formatAccountStatus(account, now, paint) {
 // refused, in one render.
 function modelRoutingLine(account, threshold, blocked, now, paint) {
   const q = account.quota || {};
-  if (q.unified7dSonnet == null && q.unified7dFable == null) return null;
+  // A family is metered here when its own weekly bucket is known, or when only
+  // the learned one is: a spent reading is cleared for revalidation (see
+  // refreshExpiredQuotas) while `scopedWeekly` keeps its own until that bucket's
+  // reset passes. Reading the dedicated field alone, the whole row vanished from
+  // an account that still routes both families. The mark stays on the dedicated
+  // key regardless, which is what the router gates on.
+  const metered = family => q[`unified7d${family}`] != null || q.scopedWeekly?.[family.toLowerCase()] != null;
+  if (!metered('Sonnet') && !metered('Fable')) return null;
   const t = Number(threshold);
   const overThreshold = v => v != null && !Number.isNaN(t) && v >= t;
   // A per-account cap is the other ceiling a family can be over. Without it a
@@ -475,8 +486,8 @@ function modelRoutingLine(account, threshold, blocked, now, paint) {
   };
 
   const cells = [cell('Opus', 'unified7d', q.unified7dReset)];
-  if (q.unified7dSonnet != null) cells.push(cell('Sonnet', 'unified7dSonnet', q.unified7dSonnetReset));
-  if (q.unified7dFable != null) cells.push(cell('Fable', 'unified7dFable', q.unified7dFableReset));
+  if (metered('Sonnet')) cells.push(cell('Sonnet', 'unified7dSonnet', q.unified7dSonnetReset));
+  if (metered('Fable')) cells.push(cell('Fable', 'unified7dFable', q.unified7dFableReset));
   return `${paint.dim('Models'.padEnd(8))} ${cells.join('   ')}`;
 }
 

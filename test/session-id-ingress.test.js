@@ -80,3 +80,37 @@ test('clientSessionId: shape', () => {
   assert.equal(clientSessionId({ 'x-claude-code-session-id': ['a', 'b'] }), null);
   assert.equal(clientSessionId({}), null);
 });
+
+// http.request again, so the header name is sent verbatim.
+function postWithHeaders(port, extra) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      host: '127.0.0.1', port, method: 'POST', path: '/v1/messages',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'k', ...extra },
+    }, (res) => { res.resume(); res.on('end', () => resolve(res.statusCode)); });
+    req.on('error', reject);
+    req.end(JSON.stringify({ model: 'claude-sonnet-4-6', messages: [] }));
+  });
+}
+
+// The regression. The Codex CLI tags its turns with `session-id`, not with
+// Claude Code's header, so every Codex request arrived untagged: the session
+// tracker never saw one, `distributeSessions` had nothing to place, and a pool
+// of two Codex subscriptions served every request from whichever account was
+// current until it reached the switch threshold.
+test('a Codex request is tracked by the session-id header its CLI sends', async () => {
+  await withProxy(async (port, started) => {
+    assert.equal(await postWithHeaders(port, { 'session-id': UUID, originator: 'codex_cli_rs' }), 200);
+    assert.deepEqual(started, [UUID]);
+  });
+});
+
+test('clientSessionId: the Codex spelling, and which header wins', () => {
+  assert.equal(clientSessionId({ 'session-id': UUID }), UUID);
+  assert.equal(clientSessionId({ 'session-id': 'a/b' }), null);
+  assert.equal(clientSessionId({ 'session-id': ['a', 'b'] }), null);
+  // Claude Code's header is the specific one, so it decides when both are set —
+  // including when its value is malformed, which is still an answer.
+  assert.equal(clientSessionId({ 'x-claude-code-session-id': 'sess-1', 'session-id': UUID }), 'sess-1');
+  assert.equal(clientSessionId({ 'x-claude-code-session-id': 'a/b', 'session-id': UUID }), null);
+});

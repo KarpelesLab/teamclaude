@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { EventEmitter } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -20,24 +21,27 @@ test('compareVersions orders x.y.z numerically and ignores pre-release', () => {
 
 // ── installKind ──────────────────────────────────────────────
 
-test('installKind detects a git checkout by a .git dir', () => {
+test('installKind detects a git checkout by a .git dir', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'tc-git-'));
   mkdirSync(join(dir, '.git'));
   try {
-    assert.equal(installKind({ root: dir, globalRoot: () => '/usr/lib/node_modules' }), 'git');
+    assert.equal(await installKind({ root: dir, globalRoot: () => '/usr/lib/node_modules' }), 'git');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('installKind flags a global npm install and distinguishes a local one', () => {
+test('installKind flags a global npm install and distinguishes a local one', async () => {
   const gRoot = '/usr/lib/node_modules';
   const global = `${gRoot}/@karpeleslab/teamclaude`;
   const local = '/home/x/project/node_modules/@karpeleslab/teamclaude';
-  assert.equal(installKind({ root: global, globalRoot: () => gRoot }), 'global');
-  assert.equal(installKind({ root: local, globalRoot: () => gRoot }), 'local');
+  assert.equal(await installKind({ root: global, globalRoot: () => gRoot }), 'global');
+  assert.equal(await installKind({ root: local, globalRoot: () => gRoot }), 'local');
+  // `npm root -g` is asked asynchronously now, so a probe that answers later is
+  // the shape the real one has.
+  assert.equal(await installKind({ root: global, globalRoot: async () => gRoot }), 'global');
 });
 
-test('installKind is unknown outside node_modules (e.g. running from source path)', () => {
-  assert.equal(installKind({ root: '/opt/teamclaude-src', globalRoot: () => null }), 'unknown');
+test('installKind is unknown outside node_modules (e.g. running from source path)', async () => {
+  assert.equal(await installKind({ root: '/opt/teamclaude-src', globalRoot: () => null }), 'unknown');
 });
 
 // ── fetchLatestVersion ───────────────────────────────────────
@@ -99,17 +103,46 @@ test('checkForUpdate reports no update when already on the latest', async () => 
 
 // ── runUpdate ────────────────────────────────────────────────
 
-test('runUpdate invokes the global npm install for the requested version', () => {
+// A fake `spawn`: a ChildProcess-shaped emitter that settles on the next tick
+// with an exit code, or with an 'error' when `error` is given.
+function fakeSpawn(calls, { code = 0, error = null } = {}) {
+  return (cmd, argv, opts) => {
+    calls.push([cmd, argv, opts]);
+    const child = new EventEmitter();
+    setImmediate(() => { if (error) child.emit('error', error); else child.emit('exit', code); });
+    return child;
+  };
+}
+
+test('runUpdate invokes the global npm install for the requested version', async () => {
   const calls = [];
-  const spawnImpl = (cmd, argv) => { calls.push([cmd, argv]); return { status: 0 }; };
-  const ok = runUpdate('2.3.4', { spawnImpl });
+  const ok = await runUpdate('2.3.4', { spawnImpl: fakeSpawn(calls) });
   assert.equal(ok, true);
-  assert.deepEqual(calls[0], ['npm', ['install', '-g', `${PKG_NAME}@2.3.4`]]);
+  assert.deepEqual(calls[0].slice(0, 2), ['npm', ['install', '-g', `${PKG_NAME}@2.3.4`]]);
 });
 
-test('runUpdate returns false when npm fails', () => {
-  assert.equal(runUpdate('2.3.4', { spawnImpl: () => ({ status: 1 }) }), false);
-  assert.equal(runUpdate('2.3.4', { spawnImpl: () => ({ error: new Error('ENOENT') }) }), false);
+test('runUpdate resolves false when npm fails', async () => {
+  assert.equal(await runUpdate('2.3.4', { spawnImpl: fakeSpawn([], { code: 1 }) }), false);
+  assert.equal(await runUpdate('2.3.4', { spawnImpl: fakeSpawn([], { error: new Error('ENOENT') }) }), false);
+  assert.equal(await runUpdate('2.3.4', { spawnImpl: () => { throw new Error('ENOENT'); } }), false);
+});
+
+// The install runs inside `server --headless`, the one process every client
+// depends on. A synchronous spawn parked the event loop for the whole install
+// (#353); the child must run beside it.
+test('runUpdate does not block the event loop while npm runs', async () => {
+  const calls = [];
+  let child;
+  const spawnImpl = (cmd, argv, opts) => { calls.push([cmd, argv, opts]); child = new EventEmitter(); return child; };
+  const pending = runUpdate('2.3.4', { spawnImpl });
+  // The install is "running": the loop must still turn.
+  let ticks = 0;
+  await new Promise(r => { const t = setInterval(() => { if (++ticks === 3) { clearInterval(t); r(); } }, 1); });
+  assert.equal(ticks, 3, 'timers ran while the install was in flight');
+  assert.equal(calls[0][2].stdio, 'inherit');
+  assert.equal(calls[0][2].timeout, 180000, 'a hung npm is still bounded');
+  child.emit('exit', 0);
+  assert.equal(await pending, true);
 });
 
 // ── the registry's "latest" is a string from the network ─────
@@ -123,14 +156,14 @@ test('isReleaseVersion accepts only x.y.z', () => {
   }
 });
 
-test('runUpdate spawns nothing for a version that is not a release version', () => {
+test('runUpdate spawns nothing for a version that is not a release version', async () => {
   const calls = [];
-  const spawnImpl = (cmd, argv) => { calls.push([cmd, argv]); return { status: 0 }; };
-  assert.equal(runUpdate('99.0.0 || npm:evil', { spawnImpl }), false);
-  assert.equal(runUpdate('1.2.3-beta.1', { spawnImpl }), false);
+  const spawnImpl = fakeSpawn(calls);
+  assert.equal(await runUpdate('99.0.0 || npm:evil', { spawnImpl }), false);
+  assert.equal(await runUpdate('1.2.3-beta.1', { spawnImpl }), false);
   assert.equal(calls.length, 0);
   // The literal tag the manual fallback uses is still fine.
-  assert.equal(runUpdate('latest', { spawnImpl }), true);
+  assert.equal(await runUpdate('latest', { spawnImpl }), true);
 });
 
 // ── autoUpdate guards ────────────────────────────────────────
@@ -165,8 +198,8 @@ test('autoUpdate still installs a well-formed newer version for a global install
     const res = await autoUpdate({
       root, uid: 1000, log: () => {},
       check: async () => ({ current: '1.0.0', latest: '2.0.0', updateAvailable: true }),
-      kind: () => 'global',
-      install: (v) => { installs.push(v); return true; },
+      kind: async () => 'global',
+      install: async (v) => { installs.push(v); return true; },
     });
     assert.equal(res.updated, true);
     assert.deepEqual(installs, ['2.0.0']);
