@@ -2209,11 +2209,13 @@ export class AccountManager {
       if (owed) {
         // The account the hand-back LEAVES may have rolled under the traffic that
         // rested on it, and the restore below replaces its reading. That roll is
-        // an escape like any other, so it is chained rather than discarded, under
-        // the stamp of the move that escapes it — the push `_restOn` makes.
+        // an escape like any other, so it is chained rather than discarded.
+        // A reading no walk established names no fleet, so the roll it loses is
+        // held for the fleet the chain belongs to: the hold being handed back is
+        // that fleet's, and a hold naming nobody can be settled by nobody.
         const leaving = obs.idx == null ? null : this.accounts[obs.idx];
         const displaced = leaving && this._anyJumped(obs.windows, leaving)
-          ? { idx: obs.idx, windows: obs.windows, provider: obs.provider ?? this._selectingProvider }
+          ? { idx: obs.idx, windows: obs.windows, provider: obs.provider ?? owed.provider ?? this._selectingProvider }
           : null;
         this._moveObs(obs, account.index);
         obs.windows = owed.windows;

@@ -2053,6 +2053,70 @@ test('a pinned fail-back holds its roll across the serves that confirm each stay
   assert.equal(req().name, 'd', 'the pin parked on the week c had just gained');
 });
 
+test('a roll displaced by a restore onto a reading no walk established still names a fleet', () => {
+  // The pin's account is removed, so the session's reading is rebuilt naming
+  // nobody and first-sights onto a third account from `recordSession`, outside
+  // any walk. When that account rolls and selection goes back to one the chain
+  // still owes, the roll it leaves is displaced against a reading no walk ever
+  // stamped. The hold that reading builds names the fleet the chain belongs to,
+  // because a hold naming none can be settled by nobody.
+  const am = mgr(['a', 'b', 'c'], ON, { distributeSessions: true });
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30]]) bucket(am, i, 'unified7d', 0.4, hours);
+
+  assert.equal(serve(am, 's1', OPUS).name, 'a', 'the fixture must start on a');
+  rollWindow(am, 0);
+  assert.equal(serve(am, 's1', OPUS).name, 'b', 'a\'s roll did not move the pin');
+  assert.equal(serve(am, 's1', OPUS).name, 'b', 'the preemption did not settle on b');
+
+  am.removeAccount(1);
+  assert.equal(am.accounts.length, 2, 'the removal did not take b out of the fleet');
+  assert.equal(serve(am, 's1', OPUS).name, 'c', 'the re-pin did not first-sight onto c');
+  assert.equal(am.sessionTracker.refsFor('s1', 'unified7d').idx, 1,
+    'the rebuilt reading did not take c');
+  rollWindow(am, 1);
+
+  assert.equal(serve(am, 's1', OPUS).name, 'a', 'c\'s roll did not send the pin back to a');
+  const held = am.sessionTracker.refsFor('s1', 'unified7d').unescaped;
+  assert.equal(held.idx, 1, 'the restore held nothing for c');
+  assert.equal(held.gen, null, 'a hand-back\'s roll took a stamp');
+  assert.equal(held.provider, 'anthropic',
+    'the roll the restore displaced names no fleet, so no stay can settle it');
+
+  // The return is handed the roll back, which is the other way it can leave the
+  // chain, and the reading that comes back is c's own pre-roll one.
+  assert.equal(serve(am, 's1', OPUS, { exclude: new Set([0]) }).name, 'c',
+    'the forced return did not reach c');
+  assert.equal(am.sessionTracker.refsFor('s1', 'unified7d').unescaped.idx, 0,
+    'the return did not take c\'s roll back off the chain');
+});
+
+test('a restore displaces a fleetless reading the same way with no account removed', () => {
+  // The control on the removal. The finding's trigger deletes the pin, but the
+  // reading a walk never stamped is what the hold is built from, and a first
+  // sight from `recordSession` leaves one whether or not an account went away.
+  const am = mgr(['a', 'b', 'c'], ON, { distributeSessions: true });
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30]]) bucket(am, i, 'unified7d', 0.4, hours);
+  const away = new Set([1]);
+
+  assert.equal(serve(am, 's1', OPUS).name, 'a', 'the control must start on a');
+  rollWindow(am, 0);
+  assert.equal(serve(am, 's1', OPUS).name, 'b', 'a\'s roll did not move the control\'s pin');
+  assert.equal(serve(am, 's1', OPUS).name, 'b', 'the control\'s preemption did not settle');
+
+  assert.equal(serve(am, 's1', OPUS, { exclude: away }).name, 'c',
+    'the control\'s pin did not first-sight onto c');
+  assert.equal(am.sessionTracker.refsFor('s1', 'unified7d').idx, 2,
+    'the control\'s reading did not take c');
+  rollWindow(am, 2);
+
+  assert.equal(serve(am, 's1', OPUS, { exclude: away }).name, 'a',
+    'c\'s roll did not send the control\'s pin back to a');
+  const held = am.sessionTracker.refsFor('s1', 'unified7d').unescaped;
+  assert.equal(held.idx, 2, 'the control\'s restore held nothing for c');
+  assert.equal(held.provider, 'anthropic',
+    'the control\'s displaced roll names no fleet either, so the removal is not the cause');
+});
+
 test('a fail-back to the account of the most recent escape is still handed its roll', () => {
   // The other end of the chain from the arm above: the newest escape is handed
   // back too, and is not lost to the older one still outstanding.
