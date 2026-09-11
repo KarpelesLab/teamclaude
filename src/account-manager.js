@@ -3722,6 +3722,7 @@ export class AccountManager {
         // without it the two are indistinguishable in status output (#166).
         unavailable: this.unavailableReason(a),
         sessions: sessions.perAccount[a.index] || 0,
+        knownSessions: sessions.knownPerAccount[a.index] || 0,
         // Shared-weekly pressure (model-agnostic), so the ordering the router
         // works from can be read off the payload. Computed whether or not the
         // knob is on: a measurement of the fleet, not a report of the feature's

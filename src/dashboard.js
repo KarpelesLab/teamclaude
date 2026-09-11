@@ -88,6 +88,26 @@ export function providerLabel(provider) {
   return provider || 'Unknown';
 }
 
+export function accountBadges(account, current, currentAccounts) {
+  var a = account || {};
+  var isCurrent = currentAccounts
+    ? currentAccounts[a.provider] === a.name
+    : a.name === current;
+  var status = a.disabled ? 'disabled' : (a.status || 'unknown');
+  var recent = Number.isFinite(a.sessions) ? a.sessions : 0;
+  var known = Number.isFinite(a.knownSessions) ? a.knownSessions : 0;
+  var badges = [
+    { cls: 'provider ' + (a.provider || 'unknown'), text: providerLabel(a.provider) },
+    { cls: 'meta', text: a.type || 'unknown' },
+    { cls: 'meta priority', text: 'prio ' + (a.priority || 0) },
+  ];
+  if (isCurrent) badges.push({ cls: 'current', text: 'current' });
+  badges.push({ cls: status, text: status });
+  if (recent) badges.push({ cls: 'sessions', text: recent + ' recent' });
+  if (known > recent) badges.push({ cls: 'sessions known', text: known + ' known' });
+  return badges;
+}
+
 // One row per session, from `sessions.items` (proxy.sessionDetail). The token
 // columns are #192's numbers — what each response actually reported, cache
 // included — summed across the weekly buckets the session touched. `pins` is a
@@ -319,7 +339,7 @@ export function problems(status) {
 }
 
 const SHARED_HELPERS = [
-  scopedWeeklyRows, accountTokens, providerLabel, sessionRows, filterSessionRows, sortRows, uniqSorted,
+  scopedWeeklyRows, accountTokens, providerLabel, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, routeRows, problems,
 ].map(fn => fn.toString()).join('\n\n');
 
@@ -355,6 +375,11 @@ const PAGE = `<!doctype html>
   .badge.throttled { color: var(--warn); border-color: var(--warn); }
   .badge.error, .badge.exhausted { color: var(--bad); border-color: var(--bad); }
   .badge.current { color: var(--accent); border-color: var(--accent); }
+  .badge.provider { color: var(--text); }
+  .badge.provider.codex { color: var(--accent); border-color: var(--accent); }
+  .badge.meta { color: var(--dim); }
+  .badge.sessions { color: var(--text); }
+  .badge.sessions.known { color: var(--dim); }
   .quota { display: grid; grid-template-columns: 64px 1fr 170px; gap: 8px; align-items: center; margin-top: 6px; }
   .quota .lbl { color: var(--dim); font-size: 12px; }
   .quota .val { color: var(--dim); font-size: 12px; text-align: right; font-variant-numeric: tabular-nums; }
@@ -528,15 +553,14 @@ ${SHARED_HELPERS}
     var card = el('div', 'card');
     var head = el('div', 'row');
     head.appendChild(el('span', 'name', a.name));
-    head.appendChild(el('span', 'tag', providerLabel(a.provider) + ' · ' + a.type + ' · prio ' + (a.priority || 0)));
     var isCurrent = currentAccounts
       ? currentAccounts[a.provider] === a.name
       : a.name === current;
-    if (isCurrent) head.appendChild(el('span', 'badge current', 'current'));
-    head.appendChild(el('span', 'badge ' + (a.status || ''), a.disabled ? 'disabled' : (a.status || 'unknown')));
-    if (a.sessions) head.appendChild(el('span', 'tag', a.sessions + ' active session' + (a.sessions > 1 ? 's' : '')));
+    accountBadges(a, current, currentAccounts).forEach(function (badge) {
+      head.appendChild(el('span', 'badge ' + badge.cls, badge.text));
+    });
     // Last in the row so the badges sit in the same place on every card.
-    if (a.name !== current) {
+    if (!isCurrent) {
       var btn = el('button', 'act', 'switch');
       btn.addEventListener('click', function () { doSwitch(a.name, btn); });
       head.appendChild(btn);
