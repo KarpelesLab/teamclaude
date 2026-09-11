@@ -6,6 +6,7 @@ import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
 import {
   renderDashboardHtml, dashboardCsp, scopedWeeklyRows, accountTokens,
+  accountBadges,
   sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
 } from '../src/dashboard.js';
@@ -56,6 +57,22 @@ test('account token total includes the cache fields', () => {
   }), 113);
   assert.equal(accountTokens({}), 0);
   assert.equal(accountTokens(null), 0);
+});
+
+test('account metadata and session state are separate badges', () => {
+  const badges = accountBadges({
+    name: 'corp', provider: 'codex', type: 'oauth', priority: -2,
+    status: 'active', sessions: 1, knownSessions: 3,
+  }, 'legacy', { anthropic: 'personal', codex: 'corp' });
+  assert.deepEqual(badges, [
+    { cls: 'provider codex', text: 'Codex' },
+    { cls: 'meta', text: 'oauth' },
+    { cls: 'meta priority', text: 'prio -2' },
+    { cls: 'current', text: 'current' },
+    { cls: 'active', text: 'active' },
+    { cls: 'sessions', text: '1 recent' },
+    { cls: 'sessions known', text: '3 known' },
+  ]);
 });
 
 const SESSIONS = {
@@ -184,6 +201,44 @@ const ROUTED = {
     accounts: [{ name: 'a', eligible: false }, { name: 'b', eligible: true }, { name: 'c', eligible: true }],
   }],
 };
+
+test('dashboard payload identifies both provider cursors without one false global current', () => {
+  const am = new AccountManager([
+    { name: 'claude', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+    { name: 'codex', type: 'oauth', provider: 'codex', accountId: 'acct', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+  ], 0.98);
+  am.getActiveAccount(null, 'gpt-5.6-sol', null, null, 'codex');
+
+  const status = am.getStatus();
+  assert.deepEqual(status.currentAccounts, { anthropic: 'claude', codex: 'codex' });
+  const html = renderDashboardHtml();
+  assert.match(html, /currentAccounts/);
+  assert.match(html, /providerLabel/);
+});
+
+test('mixed-provider routing reports one default row per provider', () => {
+  const rows = routeRows({
+    currentAccount: 'codex',
+    currentAccounts: { anthropic: 'claude', codex: 'codex' },
+    defaultTargets: { anthropic: 'claude', codex: 'codex' },
+    accounts: [
+      { name: 'claude', provider: 'anthropic', unavailable: null },
+      { name: 'codex', provider: 'codex', unavailable: null },
+    ],
+    routes: [{
+      name: 'fable', provider: 'anthropic', match: ['*fable*'], target: 'claude',
+      accounts: [{ name: 'claude', eligible: true }],
+    }],
+  });
+  assert.deepEqual(
+    rows.map(r => ({ label: r.label, provider: r.provider, target: r.target })),
+    [
+      { label: 'Fable', provider: 'anthropic', target: 'claude' },
+      { label: 'Claude default', provider: 'anthropic', target: 'claude' },
+      { label: 'Codex default', provider: 'codex', target: 'codex' },
+    ],
+  );
+});
 
 test('route rows say where each family goes, why, and where everything else goes', () => {
   const rows = routeRows(ROUTED);

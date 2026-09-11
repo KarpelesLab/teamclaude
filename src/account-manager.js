@@ -502,6 +502,7 @@ export class AccountManager {
    */
   _setCurrent(account) {
     this.currentIndex = account.index;
+    this.providerCursors.set(providerOf(account), account.index);
     if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) return;
     this._firstSightOn(this._currentObs ??= { idx: null, windows: new Map(), unescaped: null, gen: 0 }, account);
   }
@@ -694,7 +695,7 @@ export class AccountManager {
     // the next real failover unpaced.
     if (account) {
       this.routeCursors.set(this._cursorKey(model, advisorModel, provider), account.index);
-      this.providerCursors.set(providerOf(account), account.index);
+      this.providerCursors.set(provider, account.index);
     }
     return account;
   }
@@ -1342,15 +1343,18 @@ export class AccountManager {
    * the walk this mirrors, so a distributed session can be routed elsewhere.
    * It decides nothing: no reading is taken and no cursor moves.
    */
-  previewRouteIndex(model) {
+  previewRouteIndex(model, provider = DEFAULT_PROVIDER) {
+    const excluded = this._excludeOtherProviders(null, provider);
+    const allowed = account => account && !excluded?.has(account.index);
     const pinned = this._pinnedAccountForModel(model);
-    if (pinned && this._isAvailable(pinned, model)) return pinned.index;
-    const current = this.accounts[this.currentIndex];
+    if (allowed(pinned) && this._isAvailable(pinned, model)) return pinned.index;
+    const currentIndex = this._currentIndexForProvider(provider);
+    const current = this.accounts[currentIndex];
     if (current && this._isAvailable(current, model)) {
       // Mirror getActiveAccount's priority preemption: a strictly higher-priority
       // available account wins over a healthy current one; same tier stays put.
       const better = this.accounts.some(a =>
-        this._isAvailable(a, model) && (a.priority || 0) < (current.priority || 0));
+        allowed(a) && this._isAvailable(a, model) && (a.priority || 0) < (current.priority || 0));
       const rolled = this.expiryRouting.enabled && this.expiryRouting.preempt
         && this._currentRolledOver(current, model);
       if (!better && !rolled) return current.index;
@@ -1358,12 +1362,23 @@ export class AccountManager {
     // Mirror _select's diversion cursor, so the preview names the account a
     // diverted family will actually land on rather than the one a fresh walk
     // would pick.
-    if (this._currentBarredOnlyFor(model)) {
+    if (currentIndex === this.currentIndex && this._currentBarredOnlyFor(model)) {
       const diverted = this._divertedFor(model);
-      if (diverted) return diverted.index;
+      if (allowed(diverted)) return diverted.index;
     }
-    const best = this._pickBestAvailable(null, model);
+    const best = this._pickBestAvailable(excluded, model);
     return best ? best.index : null;
+  }
+
+  /** The cursor owned by one provider, falling back to the account that its
+   * next request would start from before that provider has seen traffic. */
+  _currentIndexForProvider(provider) {
+    const excluded = this._excludeOtherProviders(null, provider);
+    const allowed = index => index != null && this.accounts[index] && !excluded?.has(index);
+    const own = this.providerCursors.get(provider);
+    if (allowed(own)) return own;
+    if (allowed(this.currentIndex)) return this.currentIndex;
+    return this._pickBestAvailable(excluded, null)?.index ?? null;
   }
 
   _isProbeable(account) {
@@ -2424,9 +2439,10 @@ export class AccountManager {
   getRoutes() {
     const out = this.routes.map(r => ({
       name: r.name, match: r.match, bucket: r.bucket, color: r.color || null, autocreated: false,
+      provider: DEFAULT_PROVIDER,
       pinned: this._pinnedName(r.name),
-      accounts: this._routeAccountsView(r),
-      target: this._routeTarget(sampleModelFor(r)),
+      accounts: this._routeAccountsView(r, DEFAULT_PROVIDER),
+      target: this._routeTarget(sampleModelFor(r), DEFAULT_PROVIDER),
     }));
 
     const detected = [];
@@ -2440,9 +2456,10 @@ export class AccountManager {
       if (this._routeForModel(d.sample)) continue; // already covered by a configured route
       out.push({
         name: d.name, match: d.match, bucket: null, color: null, autocreated: true,
+        provider: DEFAULT_PROVIDER,
         pinned: this._pinnedName(d.name),
-        accounts: this.accounts.map(a => ({ name: a.name, eligible: this._isAvailable(a, d.sample) })),
-        target: this._routeTarget(d.sample),
+        accounts: this._routeAccountsView({ accounts: [], match: d.match }, DEFAULT_PROVIDER),
+        target: this._routeTarget(d.sample, DEFAULT_PROVIDER),
       });
     }
     return out;
@@ -2450,8 +2467,8 @@ export class AccountManager {
 
   /** The name of the account a request for `model` would land on right now, or
    * null when nothing can serve it (every candidate disabled, spent or excluded). */
-  _routeTarget(model) {
-    const idx = this.previewRouteIndex(model);
+  _routeTarget(model, provider = DEFAULT_PROVIDER) {
+    const idx = this.previewRouteIndex(model, provider);
     return idx == null ? null : (this.accounts[idx]?.name ?? null);
   }
 
@@ -2463,11 +2480,13 @@ export class AccountManager {
 
   /** Accounts a configured route can use (all accounts when it lists none), each
    * with a live eligibility flag for a representative model of the route. */
-  _routeAccountsView(route) {
+  _routeAccountsView(route, provider = DEFAULT_PROVIDER) {
     const sample = sampleModelFor(route);
+    const excluded = this._excludeOtherProviders(null, provider);
     const inRoute = a => !route.accounts.length
       || route.accounts.includes(a.name) || route.accounts.includes(String(a.index));
-    return this.accounts.filter(inRoute).map(a => ({ name: a.name, eligible: this._isAvailable(a, sample) }));
+    return this.accounts.filter(a => inRoute(a) && !excluded?.has(a.index))
+      .map(a => ({ name: a.name, eligible: this._isAvailable(a, sample) }));
   }
 
   /** A representative model id for a route name (configured or auto fable/sonnet),
@@ -3661,8 +3680,17 @@ export class AccountManager {
     // precisely because it trusts the server to have done this (#237).
     this.sweepExpiredQuotas();
     const sessions = this.sessionTracker.stats(undefined, { detail: sessionDetail });
+    const currentAccounts = {};
+    const defaultTargets = {};
+    for (const provider of new Set(this.accounts.map(a => providerOf(a)))) {
+      const index = this._currentIndexForProvider(provider);
+      currentAccounts[provider] = index == null ? null : this.accounts[index]?.name ?? null;
+      defaultTargets[provider] = this._routeTarget(null, provider);
+    }
     return {
       currentAccount: this.accounts[this.currentIndex]?.name,
+      currentAccounts,
+      defaultTargets,
       // Where a request no route claims lands right now — the same derivation
       // as each route's `target`, so a status reader need not assume "the
       // current account" when that account is blocked or outranked.
@@ -3683,6 +3711,7 @@ export class AccountManager {
       accounts: this.accounts.map(a => ({
         name: a.name,
         type: a.type,
+        provider: providerOf(a),
         orgName: a.orgName || null,
         priority: a.priority || 0,
         disabled: a.disabled || false,
@@ -3693,6 +3722,7 @@ export class AccountManager {
         // without it the two are indistinguishable in status output (#166).
         unavailable: this.unavailableReason(a),
         sessions: sessions.perAccount[a.index] || 0,
+        knownSessions: sessions.knownPerAccount[a.index] || 0,
         // Shared-weekly pressure (model-agnostic), so the ordering the router
         // works from can be read off the payload. Computed whether or not the
         // knob is on: a measurement of the fleet, not a report of the feature's

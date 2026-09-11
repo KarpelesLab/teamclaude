@@ -493,6 +493,7 @@ export class SessionTracker {
     let known = 0;
     let active = 0;
     const perAccount = {};
+    const knownPerAccount = {};
     // { [index]: { [bucket]: activeCount } }. `perAccount` counts a session once
     // per account however many families it holds there, which is right for load
     // — one session is one client — but it cannot answer which FAMILY those
@@ -518,6 +519,11 @@ export class SessionTracker {
       }
       known += 1;
       if (items) items.push(sessionItem(id, s, this._isActive(s, now)));
+      // A pin remains useful for the whole known hour even after it stops
+      // counting as live load. Attribute that quieter population separately so
+      // status can distinguish an idle session from no observed session at all.
+      const knownAccounts = new Set([...s.pins.values()].map(pin => pin.idx));
+      for (const idx of knownAccounts) knownPerAccount[idx] = (knownPerAccount[idx] || 0) + 1;
       for (const [bucket, t] of s.tokens) {
         const per = byBucket[bucket] || (byBucket[bucket] = emptyAggregate());
         for (const k of COUNTERS) {
@@ -553,7 +559,7 @@ export class SessionTracker {
     }
     tokens.activeContext = activeContext;
     tokens.byBucket = byBucket;
-    const base = { known, active, perAccount, perAccountBucket, tokens, starvedMax };
+    const base = { known, active, perAccount, knownPerAccount, perAccountBucket, tokens, starvedMax };
     // Newest first: a per-session table is read top-down for what is happening
     // now, and the list is capped by the same TTLs as the map behind it.
     if (items) items.sort((a, b) => b.lastSeen - a.lastSeen);
