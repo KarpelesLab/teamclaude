@@ -82,6 +82,12 @@ export function accountTokens(usage) {
     + (u.totalCacheReadTokens || 0) + (u.totalCacheCreationTokens || 0);
 }
 
+export function providerLabel(provider) {
+  if (provider === 'codex') return 'Codex';
+  if (provider === 'anthropic') return 'Claude';
+  return provider || 'Unknown';
+}
+
 // One row per session, from `sessions.items` (proxy.sessionDetail). The token
 // columns are #192's numbers — what each response actually reported, cache
 // included — summed across the weekly buckets the session touched. `pins` is a
@@ -184,6 +190,7 @@ export function routeRows(status) {
     return {
       kind: 'route',
       name: name,
+      provider: r.provider || 'anthropic',
       label: name.charAt(0).toUpperCase() + name.slice(1),
       match: match.join(', '),
       target: target,
@@ -203,16 +210,28 @@ export function routeRows(status) {
     };
   });
   if (rows.length) {
-    // The default row is the server's answer too (`defaultTarget`), not an
-    // assumption that unrouted traffic lands on the current account: a
-    // blocked or outranked current account is skipped by the next request.
-    var current = s.currentAccount || null;
-    var cur = (s.accounts || []).filter(function (a) { return a.name === current; })[0];
-    rows.push({
-      kind: 'default', name: '', label: 'Everything else', match: '',
-      target: s.defaultTarget || current, current: current,
-      currentUnavailable: (cur && cur.unavailable) || null,
-      pinned: null, pinMismatch: false, blocked: false, autocreated: false, eligible: [], ineligible: [],
+    // The server reports one default per provider. A mixed Claude/Codex fleet
+    // has two independent cursors, so collapsing these into one global row is
+    // the exact ambiguity this table exists to remove. Older servers retain
+    // the original single-row fallback.
+    var defaults = s.defaultTargets || null;
+    var providers = defaults ? Object.keys(defaults).sort(function (a, b) {
+      if (a === 'anthropic') return -1;
+      if (b === 'anthropic') return 1;
+      return a < b ? -1 : a > b ? 1 : 0;
+    }) : [];
+    if (!providers.length) providers = [rows[0].provider || 'anthropic'];
+    providers.forEach(function (provider) {
+      var current = (s.currentAccounts && s.currentAccounts[provider]) || s.currentAccount || null;
+      var cur = (s.accounts || []).filter(function (a) { return a.name === current; })[0];
+      rows.push({
+        kind: 'default', name: '',
+        label: defaults ? providerLabel(provider) + ' default' : 'Everything else',
+        provider: provider, match: '',
+        target: defaults ? defaults[provider] : (s.defaultTarget || current), current: current,
+        currentUnavailable: (cur && cur.unavailable) || null,
+        pinned: null, pinMismatch: false, blocked: false, autocreated: false, eligible: [], ineligible: [],
+      });
     });
   }
   return rows;
@@ -300,7 +319,7 @@ export function problems(status) {
 }
 
 const SHARED_HELPERS = [
-  scopedWeeklyRows, accountTokens, sessionRows, filterSessionRows, sortRows, uniqSorted,
+  scopedWeeklyRows, accountTokens, providerLabel, sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, routeRows, problems,
 ].map(fn => fn.toString()).join('\n\n');
 
@@ -505,12 +524,15 @@ ${SHARED_HELPERS}
     return row;
   }
 
-  function renderAccount(a, current) {
+  function renderAccount(a, current, currentAccounts) {
     var card = el('div', 'card');
     var head = el('div', 'row');
     head.appendChild(el('span', 'name', a.name));
-    head.appendChild(el('span', 'tag', a.type + ' · prio ' + (a.priority || 0)));
-    if (a.name === current) head.appendChild(el('span', 'badge current', 'current'));
+    head.appendChild(el('span', 'tag', providerLabel(a.provider) + ' · ' + a.type + ' · prio ' + (a.priority || 0)));
+    var isCurrent = currentAccounts
+      ? currentAccounts[a.provider] === a.name
+      : a.name === current;
+    if (isCurrent) head.appendChild(el('span', 'badge current', 'current'));
     head.appendChild(el('span', 'badge ' + (a.status || ''), a.disabled ? 'disabled' : (a.status || 'unknown')));
     if (a.sessions) head.appendChild(el('span', 'tag', a.sessions + ' active session' + (a.sessions > 1 ? 's' : '')));
     // Last in the row so the badges sit in the same place on every card.
@@ -710,6 +732,7 @@ ${SHARED_HELPERS}
       var tr = el('tr');
       var fam = el('td', '', r.label + (r.match ? ' ' : ''));
       if (r.match) fam.appendChild(el('span', 'tag', r.match));
+      if (r.provider) fam.appendChild(el('span', 'tag', ' ' + providerLabel(r.provider)));
       tr.appendChild(fam);
       var to = el('td', r.blocked ? 'badt' : '', r.blocked ? 'blocked' : (r.target || '—'));
       if (r.pinned) to.appendChild(el('span', 'pin', ' · pinned to ' + r.pinned));
@@ -750,12 +773,26 @@ ${SHARED_HELPERS}
     var up = s.server && s.server.uptimeSeconds != null ? 'up ' + fmtIn(s.server.uptimeSeconds) : '';
     var sum = document.getElementById('summary');
     sum.textContent = '';
-    sum.appendChild(el('span', '', 'active account '));
-    sum.appendChild(el('b', '', s.currentAccount || 'none'));
+    var currentAccounts = s.currentAccounts || null;
+    var providerIds = currentAccounts ? Object.keys(currentAccounts).sort(function (a, b) {
+      if (a === 'anthropic') return -1;
+      if (b === 'anthropic') return 1;
+      return a < b ? -1 : a > b ? 1 : 0;
+    }) : [];
+    sum.appendChild(el('span', '', providerIds.length ? 'active accounts ' : 'active account '));
+    if (providerIds.length) {
+      providerIds.forEach(function (provider, i) {
+        if (i) sum.appendChild(el('span', '', ' · '));
+        sum.appendChild(el('span', '', providerLabel(provider) + ': '));
+        sum.appendChild(el('b', '', currentAccounts[provider] || 'none'));
+      });
+    } else {
+      sum.appendChild(el('b', '', s.currentAccount || 'none'));
+    }
     sum.appendChild(el('span', '', ' · ' + (sess.active || 0) + ' active / ' + (sess.known || 0) + ' known sessions' + (up ? ' · ' + up : '')));
     var acc = document.getElementById('accounts');
     acc.textContent = '';
-    (s.accounts || []).forEach(function (a) { acc.appendChild(renderAccount(a, s.currentAccount)); });
+    (s.accounts || []).forEach(function (a) { acc.appendChild(renderAccount(a, s.currentAccount, currentAccounts)); });
     renderProblems(s);
     renderRoutes(s);
     renderClients(s.clients);

@@ -185,6 +185,44 @@ const ROUTED = {
   }],
 };
 
+test('dashboard payload identifies both provider cursors without one false global current', () => {
+  const am = new AccountManager([
+    { name: 'claude', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+    { name: 'codex', type: 'oauth', provider: 'codex', accountId: 'acct', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+  ], 0.98);
+  am.getActiveAccount(null, 'gpt-5.6-sol', null, null, 'codex');
+
+  const status = am.getStatus();
+  assert.deepEqual(status.currentAccounts, { anthropic: 'claude', codex: 'codex' });
+  const html = renderDashboardHtml();
+  assert.match(html, /currentAccounts/);
+  assert.match(html, /providerLabel/);
+});
+
+test('mixed-provider routing reports one default row per provider', () => {
+  const rows = routeRows({
+    currentAccount: 'codex',
+    currentAccounts: { anthropic: 'claude', codex: 'codex' },
+    defaultTargets: { anthropic: 'claude', codex: 'codex' },
+    accounts: [
+      { name: 'claude', provider: 'anthropic', unavailable: null },
+      { name: 'codex', provider: 'codex', unavailable: null },
+    ],
+    routes: [{
+      name: 'fable', provider: 'anthropic', match: ['*fable*'], target: 'claude',
+      accounts: [{ name: 'claude', eligible: true }],
+    }],
+  });
+  assert.deepEqual(
+    rows.map(r => ({ label: r.label, provider: r.provider, target: r.target })),
+    [
+      { label: 'Fable', provider: 'anthropic', target: 'claude' },
+      { label: 'Claude default', provider: 'anthropic', target: 'claude' },
+      { label: 'Codex default', provider: 'codex', target: 'codex' },
+    ],
+  );
+});
+
 test('route rows say where each family goes, why, and where everything else goes', () => {
   const rows = routeRows(ROUTED);
   assert.equal(rows.length, 2);
