@@ -30,7 +30,7 @@ test('tracker aggregates per name and drops unattributed records', () => {
   t.record(null, { requests: 1, inputTokens: 99 });   // unattributed → dropped
   t.record('', { requests: 1 });                       // ditto
   assert.deepEqual(t.export(), {
-    alice: { requests: 1, inputTokens: 7, outputTokens: 3, lastUsed: new Date(1000).toISOString() },
+    alice: { requests: 1, connections: 0, inputTokens: 7, outputTokens: 3, lastUsed: new Date(1000).toISOString() },
   });
 });
 
@@ -48,7 +48,7 @@ test('restore is additive and survives malformed entries', () => {
   assert.equal(out.alice.inputTokens, 11);
   // live lastUsed (5000) is newer than the restored one (2000) and must win
   assert.equal(out.alice.lastUsed, new Date(5000).toISOString());
-  assert.deepEqual(out.bob, { requests: 1, inputTokens: 4, outputTokens: 2, lastUsed: null });
+  assert.deepEqual(out.bob, { requests: 1, connections: 0, inputTokens: 4, outputTokens: 2, lastUsed: null });
   assert.equal(out.mallory, undefined);
   assert.equal(Object.keys(out).length, 2);
 });

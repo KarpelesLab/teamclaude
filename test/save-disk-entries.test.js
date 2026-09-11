@@ -165,3 +165,88 @@ test('an entry with a uuid claims the row that proves it, not a namesake without
   assert.deepEqual(out.map(a => a.importFrom), ['/logged-in', '/hand-added'], 'the uuid is evidence; a shared display name is not');
   assert.equal(out[1].accountUuid, undefined, 'and the namesake does not acquire a uuid from a row that is not its own');
 });
+
+// A config.json with no `accounts` key at all is what an empty or hand-trimmed
+// file looks like. Every reader treated the list as always present, and the
+// first to trip was this save — a TypeError while writing, long after the read
+// that could have explained it (#330). A missing list is an empty one.
+test('a disk config with no accounts list is saved as an empty one', () => {
+  const cfg = [entry('i1', 'a')];
+  for (const disk of [undefined, null, 'not a list']) {
+    const out = mergeAccountsForSave(cfg, [], disk);
+    assert.deepEqual(out.map(a => a.name), ['a'], `disk accounts = ${String(disk)}`);
+  }
+  const config = { accounts: [] };
+  markAccountRemoved(config, 'i2');
+  assert.deepEqual(mergeAccountsForSave([], [], undefined, removedAccountIds(config)), []);
+});
+
+// The removal set was consulted only where rows are carried over, so the
+// removed row was not appended — but nothing consulted it where rows are
+// claimed, and the identity fallback matched the removed row to a surviving
+// namesake and merged its fields in. `importFrom` names the file an entry reads
+// its credential from at the next start, so the survivor was left pointing at
+// the deleted account's credentials (#329). Reachable with a hand-added entry
+// (no id of its own) sharing the removed account's name.
+test('a removed row hands nothing to a surviving namesake', () => {
+  const config = { accounts: [{ name: 'p@example.com', type: 'oauth' }] };
+  markAccountRemoved(config, 'gone');
+  const disk = [{ id: 'gone', name: 'p@example.com', type: 'oauth', importFrom: '/removed-account-creds' }];
+
+  const out = mergeAccountsForSave(config.accounts, [], disk, removedAccountIds(config));
+
+  assert.equal(out.length, 1);
+  assert.equal(out[0].importFrom, undefined, 'the survivor must not read the deleted account\'s credentials');
+  assert.equal(out[0].id, undefined, 'nor inherit its id');
+});
+
+test('a removed row is not claimed even when the survivor carries the same uuid', () => {
+  const config = { accounts: [{ id: 'new', name: 'p@example.com', type: 'oauth', accountUuid: 'u1' }] };
+  markAccountRemoved(config, 'gone');
+  const disk = [
+    { id: 'gone', name: 'p@example.com', type: 'oauth', accountUuid: 'u1', importFrom: '/removed-account-creds' },
+    { id: 'new', name: 'p@example.com', type: 'oauth', accountUuid: 'u1', refreshToken: 'r-new' },
+  ];
+
+  const out = mergeAccountsForSave(config.accounts, [], disk, removedAccountIds(config));
+
+  assert.deepEqual(out.map(a => a.id), ['new']);
+  assert.equal(out[0].importFrom, undefined);
+  assert.equal(out[0].refreshToken, 'r-new', 'its own row is still merged over');
+});
+
+// The uuid and name forms of one organization compared unequal through orgKey,
+// so on this axis neither record claimed the other's row: the row was carried
+// over and the account appeared twice after an upgrade that changed which field
+// the profile handed back (#328).
+test('an entry naming its organization by uuid claims the disk row naming it by name', () => {
+  const cfg = [{ id: 'x1', name: 'p@example.com', type: 'oauth', accountUuid: 'U', orgUuid: 'O', accessToken: 't' }];
+  const disk = [{ id: 'y1', name: 'p@example.com', type: 'oauth', accountUuid: 'U', orgName: 'Acme', importFrom: '/creds' }];
+
+  const out = mergeAccountsForSave(cfg, [], disk);
+
+  assert.equal(out.length, 1, 'one account, not two');
+  assert.equal(out[0].importFrom, '/creds', 'merged over its own row');
+});
+
+// The uuid pass took sameIdentity's tolerant answer, so an entry that never
+// stored an organization could claim the row of the same person in another
+// one, taking it away from the entry it belonged to (#327, on the disk axis).
+test('an entry with no organization does not claim the row of the same person in a known one', () => {
+  const cfg = [
+    { id: 'x1', name: 'p@example.com', type: 'oauth', accountUuid: 'U', accessToken: 't-legacy' },
+    { id: 'x2', name: 'p@example.com (Acme)', type: 'oauth', accountUuid: 'U', orgUuid: 'O', accessToken: 't-acme' },
+  ];
+  const disk = [
+    { id: 'y1', name: 'p@example.com (Acme)', type: 'oauth', accountUuid: 'U', orgUuid: 'O', importFrom: '/acme-creds' },
+    { id: 'y2', name: 'p@example.com', type: 'oauth', accountUuid: 'U' },
+  ];
+
+  const out = mergeAccountsForSave(cfg, [], disk);
+
+  assert.equal(out.length, 2);
+  const acme = out.find(a => a.id === 'x2');
+  const legacy = out.find(a => a.id === 'x1');
+  assert.equal(acme.importFrom, '/acme-creds', 'the Acme entry keeps the Acme row');
+  assert.equal(legacy.importFrom, undefined, 'the legacy entry does not take it');
+});

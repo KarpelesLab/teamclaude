@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   orgKey,
+  sameOrg,
   sameIdentity,
   emailOf,
   matchAccounts,
@@ -239,6 +240,55 @@ test('findUpsertTarget does not let a UUID match cross organizations', () => {
     { name: 'a@x.com', accountUuid: 'u1', orgUuid: 'o-acme' },
   ];
   assert.equal(findUpsertTarget(accounts, { name: 'a@x.com', accountUuid: 'u1', orgUuid: 'o-acme' }), 1);
+});
+
+// Which org field a record carries depends on what the profile returned when
+// the account was added, so the uuid form and the name form of one organization
+// are both in circulation. Keyed through orgKey they compared unequal, and on
+// the config-to-disk axis neither record claimed the other's row, so the row
+// was carried over and the account appeared twice after an upgrade (#328).
+test('sameOrg: the uuid and name forms of one organization agree', () => {
+  const byUuid = { accountUuid: 'u1', orgUuid: 'O' };
+  const byName = { accountUuid: 'u1', orgName: 'Acme' };
+  assert.equal(sameOrg(byUuid, byName), null, 'a uuid against a name is no evidence either way');
+  assert.equal(sameIdentity(byUuid, byName), true);
+  assert.equal(distinctAccounts(byUuid, byName), false);
+});
+
+test('sameOrg: the uuid decides when both sides carry one, the name only when they do not', () => {
+  assert.equal(sameOrg({ orgUuid: 'O', orgName: 'Acme' }, { orgUuid: 'O', orgName: 'Acme Renamed' }), true);
+  assert.equal(sameOrg({ orgUuid: 'O1', orgName: 'Acme' }, { orgUuid: 'O2', orgName: 'Acme' }), false);
+  assert.equal(sameOrg({ orgUuid: 'O', orgName: 'Acme' }, { orgName: 'Acme' }), true);
+  assert.equal(sameOrg({ orgUuid: 'O', orgName: 'Acme' }, { orgName: 'Other' }), false);
+  assert.equal(sameOrg({}, { orgUuid: 'O' }), null);
+  assert.equal(sameOrg(null, undefined), null);
+});
+
+// findUpsertTarget's uuid pass takes sameIdentity's tolerant answer, which says
+// yes to an entry that never stored an organization — so a legacy entry sitting
+// earlier in the list won over the one whose organization actually matched, and
+// a login for a known organization landed its credential on the legacy row
+// (#327).
+test('findUpsertTarget prefers the entry whose organization matches over an earlier legacy entry', () => {
+  const accounts = [
+    { name: 'a@x.com', accountUuid: 'u1' },                 // no org stored: hand-added, or never probed
+    { name: 'a@x.com', accountUuid: 'u1', orgUuid: 'o2' },  // the one this login is for
+  ];
+  assert.equal(findUpsertTarget(accounts, { name: 'a@x.com', accountUuid: 'u1', orgUuid: 'o2' }), 1);
+  // The same organization under its name form is still the exact match.
+  const named = [
+    { name: 'a@x.com', accountUuid: 'u1' },
+    { name: 'a@x.com', accountUuid: 'u1', orgName: 'Acme' },
+  ];
+  assert.equal(findUpsertTarget(named, { name: 'a@x.com', accountUuid: 'u1', orgName: 'Acme' }), 1);
+});
+
+test('findUpsertTarget still backfills the legacy entry when no entry names the organization', () => {
+  const accounts = [
+    { name: 'a@x.com', accountUuid: 'u1' },
+    { name: 'a@x.com', accountUuid: 'u1', orgUuid: 'o-other' },
+  ];
+  assert.equal(findUpsertTarget(accounts, { name: 'a@x.com', accountUuid: 'u1', orgUuid: 'o2' }), 0);
 });
 
 test('findUpsertTarget still adds a genuinely new account', () => {

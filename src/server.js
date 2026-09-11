@@ -19,6 +19,7 @@ import { safeLine } from './safe-text.js';
 import { forwardRefusal, guardedLookup, FORBIDDEN_FORWARD } from './forward-target.js';
 import { renderDashboardHtml, dashboardCsp } from './dashboard.js';
 import { createUsageRecorder, resolveUsageDimensions, usageDimensionHeaderNames } from './client-usage.js';
+import { classificationPath } from './classification-path.js';
 
 
 export const HOP_BY_HOP_HEADERS = new Set([
@@ -33,26 +34,24 @@ const PIN_PREFIX = '/tc-acct/';
  * spelling, on either slash)?
  *
  * Every path classification in the listener — the Codex pool, the
- * client-credential relay, the `/tc-acct/` pin — is a prefix test on the path
- * AS SENT, while the upstream URL is normalised afterwards by `new URL()` and
- * fetch. So `/backend-api/codex/../conversations` classifies as Codex and
- * reaches chatgpt.com as `/backend-api/conversations`, pooled token attached;
+ * client-credential relay, the `/tc-acct/` pin — is a prefix test, while the
+ * path itself is forwarded verbatim and resolved elsewhere. So
+ * `/backend-api/codex/../conversations` classifies as Codex and reaches
+ * chatgpt.com as `/backend-api/conversations`, pooled token attached;
  * `/v1/messages/../../api/oauth/profile` does not start with `/api/oauth/`,
  * takes the pool path, and reaches the profile endpoint with a rotated token —
- * the exact thing the relay exists to prevent for the literal path. Backslash
- * counts because the URL parser treats it as a slash for http(s). No client of
- * ours ever sends one; refusing the request is the whole fix.
+ * the exact thing the relay exists to prevent for the literal path. No client
+ * of ours ever sends such a path; refusing the request is the whole fix.
+ *
+ * Read on the classification path, which is decoded once and has its
+ * backslashes folded (the URL parser treats one as a slash for http(s), so
+ * `new URL()` folds it on the way out too). `..%2f..%2f` and `..\..\` are
+ * therefore the same request as `../../` here, as they are to whatever
+ * resolves them — and splitting on `/` alone is enough, since no separator
+ * survives classificationPath in any other spelling.
  */
 export function hasDotSegment(url) {
-  const path = String(url || '').split('?')[0].split('#')[0];
-  for (const seg of path.split(/[\/\\]/)) {
-    let s = seg;
-    // An undecodable segment (`%`) is compared as sent: the URL parser leaves
-    // it alone too, so it cannot become a dot-segment upstream.
-    try { s = decodeURIComponent(seg); } catch { /* keep raw */ }
-    if (s === '.' || s === '..') return true;
-  }
-  return false;
+  return classificationPath(url).split('/').some((s) => s === '.' || s === '..');
 }
 const INLINE_RETRY_AFTER_MAX_SECONDS = 15;
 // How long the proxy will absorb a rate-limit 429's retry-after inline (waiting
@@ -124,6 +123,46 @@ export function safeKeyEqual(a, b) {
 // localhost on both the HTTP and CONNECT paths.
 export function isLoopbackAddr(addr) {
   return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1';
+}
+
+// Headers a forwarding proxy adds to name the caller it forwards for. Any of
+// them on a loopback-sourced request says the socket's peer is a proxy on this
+// host, not the caller.
+const FORWARDED_HEADERS = ['x-forwarded-for', 'x-real-ip', 'forwarded'];
+
+/** Whether the request carries a forwarding proxy's mark. */
+export function isForwardedRequest(headers) {
+  return FORWARDED_HEADERS.some(h => headers?.[h] != null && headers[h] !== '');
+}
+
+/**
+ * Whether a key-less caller is admitted on the strength of its address alone.
+ * All three gates — HTTP, CONNECT and the WebSocket upgrade — ask this one
+ * question, so they cannot drift apart.
+ *
+ * The exemption is trying to answer "is this caller on this machine", and the
+ * socket address stops answering that as soon as anything forwards. The
+ * ordinary way this proxy is deployed on a public name is nginx or Caddy
+ * terminating TLS in front of a listener bound to 127.0.0.1 — and then every
+ * caller on the internet is loopback-sourced, the key gate never runs, and an
+ * anonymous POST /v1/messages spends the fleet's quota (#324). The browser
+ * checks that sit behind this one (Origin, Host) do not catch it: curl sends
+ * neither, and the Host header is written by the operator's own reverse proxy,
+ * so it reports the proxy's configuration rather than the request's provenance.
+ *
+ * Two answers, cheapest first:
+ *   - A request carrying a forwarding header (X-Forwarded-For, X-Real-IP,
+ *     Forwarded) is refused the exemption. Costs nothing to configure and fails
+ *     closed on exactly the deployments that are exposed; a reverse proxy set
+ *     up to send none of them is the case the setting below is for.
+ *   - `proxy.trustLoopback: false` switches the exemption off outright. The CLI
+ *     presents the proxy key on every call of its own, so a local install keeps
+ *     working with it; documented as required behind a reverse proxy.
+ */
+export function loopbackExempt(headers, remoteAddress, proxyConfig) {
+  if (proxyConfig?.trustLoopback === false) return false;
+  if (!isLoopbackAddr(remoteAddress)) return false;
+  return !isForwardedRequest(headers);
 }
 
 /**
@@ -220,7 +259,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // applies to a running server, matching how eventLogging/blockedModels
       // are read live further down the pipeline.
       const clientKey = req.headers['x-api-key'];
-      const isLocal = isLoopbackAddr(req.socket.remoteAddress);
+      const isLocal = loopbackExempt(req.headers, req.socket.remoteAddress, config.proxy);
       const auth = resolveClientAuth(config.proxy, clientKey);
       if (!auth.ok && !isLocal) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
@@ -348,6 +387,26 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         return;
       }
 
+      // One-shot quota probe — the web equivalent of the TUI's `p` key. It is
+      // zero-spend and only available when the running server has a prober.
+      if (req.method === 'POST' && req.url === '/teamclaude/probe') {
+        if (!hooks.probeQuota) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'quota probe not supported' }));
+          return;
+        }
+        try {
+          await hooks.probeQuota();
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true }));
+        } catch (err) {
+          console.error('[TeamClaude] Quota probe failed:', err.message);
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'quota probe failed; see the proxy log' }));
+        }
+        return;
+      }
+
       // Switch endpoint — make one account the preferred one, the headless
       // equivalent of picking it with 's' in the TUI. Both do the same single
       // thing: move currentIndex. That is a preference, and a weak one: _select
@@ -460,25 +519,39 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
   // call — Node fires 'upgrade' for that handshake, never 'request', so it
   // needs its own listener (base-URL routing path; the MITM path wires the
   // same relayUpgrade onto its own terminating server in mitm.js).
+  // Guarded like requestHandler and the connect handler are: this process
+  // exits on any uncaught throw (see crash-log.js), and a listener handed a raw
+  // socket has nothing else standing between a bad handshake and that exit.
   server.on('upgrade', (req, socket, head) => {
-    // The upgrade handshake never reaches requestHandler, so it does not
-    // inherit the key gate above — it has to ask for itself. Without this a
-    // WebSocket handshake is an unauthenticated relay to `upstream`: the
-    // handshake carries no pooled credential (relayUpgrade forwards the
-    // client's own headers), so it is not a way to spend the fleet's quota,
-    // but it is a way to reach the upstream on this host's address and
-    // bandwidth. A deployment on a public hostname hands that to anyone.
-    if (!resolveUpgradeAuth(req, socket, config.proxy).ok) {
-      // Logged as well as answered: a WebSocket client discards the status
-      // line, so the 401 alone leaves an operator with a channel that is
-      // silently dead — the same shape as the outage this gate could cause if
-      // a client turns out not to send the key.
-      console.log(`[TeamClaude] WebSocket upgrade refused (no proxy key) from ${safeLine(socket?.remoteAddress || 'unknown')} for ${safeLine(req.url)}`);
-      try { socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n'); } catch { /* already gone */ }
+    try {
+      // The upgrade handshake never reaches requestHandler, so it does not
+      // inherit the key gate above — it has to ask for itself. Without this a
+      // WebSocket handshake is an unauthenticated relay to `upstream`: the
+      // handshake carries no pooled credential (relayUpgrade forwards the
+      // client's own headers), so it is not a way to spend the fleet's quota,
+      // but it is a way to reach the upstream on this host's address and
+      // bandwidth. A deployment on a public hostname hands that to anyone.
+      const auth = resolveUpgradeAuth(req, socket, config.proxy);
+      if (!auth.ok) {
+        // Logged as well as answered: a WebSocket client discards the status
+        // line, so the 401 alone leaves an operator with a channel that is
+        // silently dead — the same shape as the outage this gate could cause if
+        // a client turns out not to send the key.
+        console.log(`[TeamClaude] WebSocket upgrade refused (no proxy key) from ${safeLine(socket?.remoteAddress || 'unknown')} for ${safeLine(req.url)}`);
+        try { socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n'); } catch { /* already gone */ }
+        socket.destroy();
+        return;
+      }
+      // The identity the gate resolved rides along, as it does on the request
+      // path (req.tcClient): a handshake authenticated with a client key is
+      // attributed to that client, or it is a channel the operator cannot see
+      // under `clients` at all (#325).
+      relayUpgrade(req, socket, head, upstream, sx, { client: auth.client, clientUsage });
+    } catch (err) {
+      console.error(`[TeamClaude] WebSocket upgrade handler failed for ${safeLine(req?.url)}: ${err?.message || err}`);
+      try { socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n'); } catch { /* already gone */ }
       socket.destroy();
-      return;
     }
-    relayUpgrade(req, socket, head, upstream, sx);
   });
 
   return server;
@@ -724,9 +797,15 @@ const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/'];
 const SESSION_ID_SHAPE = /^[A-Za-z0-9._-]{1,128}$/;
 
 /** The session id a request carries, or null when the header is absent or
- *  malformed — a malformed one is treated as no session, not rejected. */
+ *  malformed — a malformed one is treated as no session, not rejected.
+ *
+ *  Claude Code sends `x-claude-code-session-id`, the Codex CLI `session-id`.
+ *  Reading only the first left every Codex request untagged, so
+ *  `distributeSessions` had nothing to place and a Codex pool stayed on one
+ *  account until the switch threshold. The specific header wins when both are
+ *  present: `session-id` is generic enough for a proxy in front to set. */
 export function clientSessionId(headers) {
-  const raw = headers['x-claude-code-session-id'];
+  const raw = headers['x-claude-code-session-id'] ?? headers['session-id'];
   return typeof raw === 'string' && SESSION_ID_SHAPE.test(raw) ? raw : null;
 }
 
@@ -798,15 +877,6 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // Client token refresh: pass through untouched (the proxy manages its own
       // tokens via ensureTokenFresh; rewriting client refreshes would conflict).
       if (req.method === 'POST' && req.url === '/v1/oauth/token') { await relayRaw(req, res, upstream, sx, resolveMaxBodyBytes(config)); return; }
-      // Remote Control (/v1/code/*) is bound to the session's paired claude.ai
-      // identity — forward with the client's OWN credential (streamed), never a
-      // rotated account token, which would 403 the worker event stream.
-      // Attachment transfers (/api/oauth/files/*, /api/oauth/file_upload) are
-      // likewise account-bound: files uploaded from claude.ai belong to the
-      // paired identity, so fetching them with a rotated token 403s and Claude
-      // Code silently drops the image from the message.
-      if (CLIENT_CREDENTIAL_PATHS.some((p) => (req.url || '').startsWith(p))) { await relayStream(req, res, upstream, sx); return; }
-
       // Account pin: a request to `/tc-acct/<name-or-index>/...` (e.g. via
       // ANTHROPIC_BASE_URL=http://host:port/tc-acct/deepseek) is forced onto that
       // one account, bypassing rotation. Used by the keep-warm scheduler and for
@@ -846,6 +916,30 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         }
         req.url = afterPrefix.slice(tokenEnd);
       }
+
+      // Remote Control (/v1/code/*) is bound to the session's paired claude.ai
+      // identity — forward with the client's OWN credential (streamed), never a
+      // rotated account token, which would 403 the worker event stream.
+      // Attachment transfers (/api/oauth/files/*, /api/oauth/file_upload) are
+      // likewise account-bound: files uploaded from claude.ai belong to the
+      // paired identity, so fetching them with a rotated token 403s and Claude
+      // Code silently drops the image from the message.
+      //
+      // Below the pin strip, so this reads the path that will actually be sent,
+      // and on its classification form: `/%61pi/oauth/…`, `/api/oauth%2fprofile`,
+      // `/api\oauth\profile` and `/tc-acct/<acct>/api/oauth/profile` all leave
+      // here as the identity plane, so all of them take the relay. A pinned
+      // account's token is a rotated token like any other — the pin says which
+      // account serves INFERENCE, and no version of it should put a fleet
+      // identity on /api/oauth/*. Above the strip this test still saw the
+      // prefix and matched nothing, while `provider` further down is built from
+      // the stripped url: the two disagreed about the same request.
+      //
+      // Still ABOVE the TC_ACCT branch below, which does not touch req.url —
+      // moving past it would turn an unknown TC_ACCT pin on an identity-plane
+      // request into a 404 that it does not return today.
+      const classifiedPath = classificationPath(req.url);
+      if (CLIENT_CREDENTIAL_PATHS.some((p) => classifiedPath.startsWith(p))) { await relayStream(req, res, upstream, sx); return; }
 
       // MITM-mode pin. A CONNECT carrying `Proxy-Authorization: Basic <acct>:…`
       // has no URL to hang a `/tc-acct/` prefix on — the path inside the tunnel
@@ -1280,7 +1374,7 @@ export function resolveUpgradeAuth(req, socket, proxyConfig) {
   // loopback-sourced too. What it cannot forge is `Origin`, which a browser
   // sets on every handshake and a CLI never sends, nor `Host`, which a
   // rebound name (attacker.example → 127.0.0.1) leaves naming the attacker.
-  if (!isLoopbackAddr(socket?.remoteAddress)) return auth;
+  if (!loopbackExempt(req?.headers, socket?.remoteAddress, proxyConfig)) return auth;
   const bindHost = proxyConfig?.host;
   const origin = req?.headers?.origin;
   if (origin) {
@@ -1302,8 +1396,52 @@ export function resolveUpgradeAuth(req, socket, proxyConfig) {
  * handshake (emits its own 'upgrade' event on a 101); once that fires it's
  * just two raw sockets spliced together.
  */
-export function relayUpgrade(req, socket, head, upstream, sx) {
-  const target = new URL(`${upstream}${req.url}`);
+/**
+ * The URL a WebSocket upgrade for `url` is relayed to on `upstream`, or null
+ * when it cannot be — an answer, never a throw.
+ *
+ * This was `new URL(upstream + req.url)`. With an upstream that carries a port
+ * (`http://127.0.0.1:4000`, or a redundant `:443`) and a request target that
+ * is not a plain path — the absolute form `GET http://x/ HTTP/1.1`, ordinary
+ * proxy traffic — the concatenation ran straight on from the port digits and
+ * `new URL()` threw. The upgrade listener was the one entry point with no
+ * try/catch around it, so the throw was an uncaughtException and the daemon
+ * exited: one crafted handshake, every session gone (#340).
+ *
+ * Only the origin form is relayed, and the result is pinned to the upstream's
+ * origin: resolving the target against the upstream as a base would turn
+ * `http://x/` or `//evil.example/p` into a relay to that host instead. The
+ * concatenation itself is kept for an origin-form path, because an upstream
+ * may carry a path prefix of its own (`https://gateway.example/anthropic`)
+ * that resolution would discard.
+ */
+export function upgradeTarget(upstream, url) {
+  // Origin form: a single leading slash. `//host` is scheme-relative, and the
+  // URL parser reads a backslash as a slash for http(s), so `/\host` is too.
+  if (typeof url !== 'string' || !/^\/(?![\/\\])/.test(url)) return null;
+  let base, target;
+  try {
+    base = new URL(upstream);
+    target = new URL(`${upstream}${url}`);
+  } catch { return null; }
+  if (target.origin !== base.origin) return null;
+  return target;
+}
+
+export function relayUpgrade(req, socket, head, upstream, sx, { client = null, clientUsage = null, log = console.log } = {}) {
+  const target = upgradeTarget(upstream, req.url);
+  if (!target) {
+    log(`[TeamClaude] WebSocket upgrade refused: request target ${JSON.stringify(safeLine(req.url, 128))} is not a path on the upstream`);
+    try { socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n'); } catch { /* already gone */ }
+    socket.destroy();
+    return;
+  }
+  // The channel's log lines, prefixed `[name]` like a request line when a
+  // client key authenticated the handshake, so an operator reading per-client
+  // activity sees the channel beside the requests. Booked only once upstream
+  // accepts: a handshake it refuses opened nothing.
+  const tag = client ? `[${safeLine(client, 64)}] ` : '';
+  const path = safeLine(req.url);
   const headers = {};
   for (const [key, value] of Object.entries(req.headers)) {
     const lk = key.toLowerCase();
@@ -1329,6 +1467,10 @@ export function relayUpgrade(req, socket, head, upstream, sx) {
     if (head?.length) upstreamSocket.write(head);
     socket.pipe(upstreamSocket);
     upstreamSocket.pipe(socket);
+    clientUsage?.record(client, { connections: 1 });
+    const opened = Date.now();
+    log(`[TeamClaude] ${tag}WebSocket ${path} connected`);
+    socket.once('close', () => log(`[TeamClaude] ${tag}WebSocket ${path} closed (${((Date.now() - opened) / 1000).toFixed(1)}s)`));
     // An upgraded socket defaults to half-open: the peer's FIN only ends the
     // READABLE side ('end'), it does NOT destroy the socket or fire 'close' —
     // so without this, one side hanging up (dropped wifi, killed CLI) leaves
@@ -1344,6 +1486,22 @@ export function relayUpgrade(req, socket, head, upstream, sx) {
     // which Node escalates to an uncaught exception — one dropped WebSocket
     // would kill the proxy for every other session. Close the pair instead.
     upstreamSocket.on('error', () => socket.destroy());
+  });
+
+  // Upstream answered with a plain response instead of the 101: the handshake
+  // was refused (an expired credential, an unknown session). Without this the
+  // client socket hung with no answer until it timed out, and nothing was
+  // logged. Relay the status so the client sees the refusal it was given.
+  upstreamReq.on('response', (upstreamRes) => {
+    log(`[TeamClaude] ${tag}WebSocket ${path} refused by upstream (${upstreamRes.statusCode})`);
+    const headerLines = Object.entries(upstreamRes.headers)
+      .filter(([k]) => !CONNECTION_SPECIFIC_HEADERS.has(k.toLowerCase()) && k.toLowerCase() !== 'content-length')
+      .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(', ') : v}`).join('\r\n');
+    try {
+      socket.write(`HTTP/1.1 ${upstreamRes.statusCode} ${upstreamRes.statusMessage}\r\n${headerLines}\r\nConnection: close\r\n\r\n`);
+    } catch { /* already gone */ }
+    upstreamRes.resume();
+    socket.destroy();
   });
 
   upstreamReq.on('error', (err) => {
@@ -2042,10 +2200,13 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         { successful: !!upstreamRes && upstreamRes.status < 400 }) || 0;
     }
 
-    // Extract rate limit headers
+    // Extract rate limit headers. Anthropic states its quota under
+    // `anthropic-ratelimit-*` and Codex under `x-codex-*`; `updateQuota` picks
+    // the parser by provider, so keeping only Anthropic's prefix handed a Codex
+    // account an empty object and its quota never landed.
     const rateLimitHeaders = {};
     for (const [key, value] of upstreamRes.headers.entries()) {
-      if (key.startsWith('anthropic-ratelimit-')) {
+      if (key.startsWith('anthropic-ratelimit-') || key.startsWith('x-codex-')) {
         rateLimitHeaders[key] = value;
       }
     }
@@ -2559,10 +2720,10 @@ export async function streamResponse(webStream, res, accountIndex, accountManage
   if (clientGone(res)) onClose();
   const idleMs = resolveBodyIdleTimeout();
   const decoder = new TextDecoder();
-  let sseBuffer = '';
   let errored = false;
   // The message's usage, merged across its two reports and recorded once below.
   const merged = {};
+  const usage = createSseLineScanner(line => parseSSEDataLine(line, accountIndex, accountManager, onUsage, merged));
 
   try {
     while (true) {
@@ -2583,16 +2744,10 @@ export async function streamResponse(webStream, res, accountIndex, accountManage
       const logPending = bodyWriter?.drain?.();
       if (logPending) await logPending;
 
-      const text = decoder.decode(value, { stream: true });
-
-      // Parse SSE events for usage tracking
-      sseBuffer += text;
-      const events = sseBuffer.split('\n\n');
-      sseBuffer = events.pop(); // keep incomplete event
-
-      for (const event of events) {
-        parseSSEUsage(event, accountIndex, accountManager, onUsage, merged);
-      }
+      // Parse the SSE data lines for usage tracking, as they arrive. The relay
+      // above is done with the chunk by now; this reads it and retains at most
+      // one bounded partial line, never the response.
+      usage.push(decoder.decode(value, { stream: true }));
 
       // Handle backpressure — also bail out if client disconnects,
       // because 'drain' will never fire on a destroyed socket
@@ -2609,10 +2764,9 @@ export async function streamResponse(webStream, res, accountIndex, accountManage
       }
     }
 
-    // Parse any remaining buffer
-    if (sseBuffer.trim()) {
-      parseSSEUsage(sseBuffer, accountIndex, accountManager, onUsage, merged);
-    }
+    // A final data line without a trailing newline.
+    usage.push(decoder.decode());
+    usage.flush();
   } catch (err) {
     // A mid-stream idle timeout (or any read error) means the upstream went
     // silent after headers. Rethrow to the caller's transient handler, which
@@ -2639,6 +2793,61 @@ export async function streamResponse(webStream, res, accountIndex, accountManage
   }
 }
 
+// The longest line the usage scanner will hold while waiting for its newline.
+// A real Anthropic SSE line is a single JSON event of at most a few kilobytes,
+// so this sits three orders of magnitude above anything legitimate.
+export const SSE_MAX_LINE_CHARS = 1 << 20;
+
+/**
+ * A line scanner for the usage parser: `push(text)` hands every complete line
+ * to `onLine` as it arrives and retains only the trailing partial one; `flush()`
+ * delivers that partial at end of stream.
+ *
+ * The parser used to accumulate the whole response into one string and drain
+ * it on the `\n\n` event boundary. An upstream that sends
+ * `text/event-stream` and never a blank line — a stuck or garbage stream, a
+ * misbehaving third-party backend — therefore grew that string for the whole
+ * response, re-split on every chunk, until V8 aborted the process on its heap
+ * limit: uncatchable, and it took every account and every session down with
+ * it (#341). The relay never needed the buffer; only the accounting did, and
+ * the accounting reads single lines.
+ *
+ * So the retained state is one line, and even that is bounded: a partial line
+ * that outgrows `maxChars` is dropped, and the rest of that line is discarded
+ * up to its newline. Only that line's usage figure is lost, which the caller
+ * already tolerates; the bytes themselves were relayed before they came here.
+ */
+export function createSseLineScanner(onLine, maxChars = SSE_MAX_LINE_CHARS) {
+  let partial = '';
+  let dropping = false; // inside a line already judged too long
+  return {
+    push(text) {
+      let start = 0;
+      for (;;) {
+        const nl = text.indexOf('\n', start);
+        if (nl < 0) break;
+        if (!dropping) {
+          const line = partial + text.slice(start, nl);
+          if (line.length <= maxChars) onLine(line);
+        }
+        partial = '';
+        dropping = false;
+        start = nl + 1;
+      }
+      if (dropping) return;
+      partial += text.slice(start);
+      if (partial.length > maxChars) { partial = ''; dropping = true; }
+    },
+    flush() {
+      if (!dropping && partial.trim()) onLine(partial);
+      partial = '';
+      dropping = false;
+    },
+    /** Characters currently retained, for tests that pin the bound. */
+    pending() { return partial.length; },
+  };
+}
+
 // A streaming response reports its usage twice. `message_start` carries the
 // input side, including the two cache fields, with an output figure that is only
 // a placeholder. `message_delta` then reports figures that are cumulative for
@@ -2651,12 +2860,14 @@ export async function streamResponse(webStream, res, accountIndex, accountManage
 // message's final figures for a single `recordTokenUsage` once the stream is
 // over. One record per message is what makes double counting unrepresentable
 // rather than merely avoided.
-function parseSSEUsage(event, accountIndex, accountManager, onUsage = null, merged = null) {
-  const dataLine = event.split('\n').find(l => l.startsWith('data: '));
-  if (!dataLine) return;
+//
+// Reads one `data:` line. Anthropic's events carry exactly one, so a line is an
+// event for this purpose, and the scanner above never has to hold more.
+function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, merged = null) {
+  if (!line.startsWith('data: ')) return;
 
   try {
-    const data = JSON.parse(dataLine.slice(6));
+    const data = JSON.parse(line.slice(6));
     if (data.type === 'message_start' && data.message?.usage) {
       accountManager.updateUsage(accountIndex, data.message.usage.input_tokens, 0);
       onUsage?.(data.message.usage.input_tokens || 0, 0);

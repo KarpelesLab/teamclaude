@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import { spawnSync } from 'node:child_process';
 import assert from 'node:assert/strict';
-import { buildClaudeEnvLines } from '../src/claude-env.js';
+import { buildClaudeEnvLines, bypassesAllHosts, mergeNoProxy } from '../src/claude-env.js';
 
 test('MITM mode (default) emits proxy vars + CA cert, and clears ANTHROPIC_BASE_URL', () => {
   const lines = buildClaudeEnvLines({ port: 3456, caPath: '/home/u/.config/teamclaude-ca.pem' });
@@ -10,8 +10,8 @@ test('MITM mode (default) emits proxy vars + CA cert, and clears ANTHROPIC_BASE_
     'export HTTP_PROXY=http://127.0.0.1:3456',
     'export https_proxy=http://127.0.0.1:3456',
     'export http_proxy=http://127.0.0.1:3456',
-    'export NO_PROXY=localhost,127.0.0.1,::1',
-    'export no_proxy=localhost,127.0.0.1,::1',
+    "export NO_PROXY='localhost,127.0.0.1,::1'",
+    "export no_proxy='localhost,127.0.0.1,::1'",
     "export NODE_EXTRA_CA_CERTS='/home/u/.config/teamclaude-ca.pem'",
     'unset ANTHROPIC_BASE_URL',
   ]);
@@ -113,10 +113,58 @@ test('a pinned line is shell-safe: no unquoted metacharacters survive', () => {
   for (const name of ["work (Acme)", "o'brien", "a!b", "x*y"]) {
     for (const useMitm of [true, false]) {
       const lines = buildClaudeEnvLines({ port: 3456, useMitm, account: name, caPath: '/x' });
-      // The pin rides unquoted in the URL lines; the CA path line is quoted separately.
-      for (const l of lines.filter(l => !l.startsWith('export NODE_EXTRA_CA_CERTS='))) {
+      // The pin rides unquoted in the URL lines; the CA path and NO_PROXY lines
+      // carry operator-supplied text and are quoted separately.
+      for (const l of lines.filter(l => !/^export (NODE_EXTRA_CA_CERTS|NO_PROXY|no_proxy)=/.test(l))) {
         assert.ok(!/[()'!*]/.test(l), `${l} (from ${name})`);
       }
     }
   }
+});
+
+// ── NO_PROXY ─────────────────────────────────────────────────
+//
+// Replacing the operator's NO_PROXY broke local development: a dev host on a
+// `*.test` name resolves to 127.0.0.1, the client proxied it because the name
+// is not `localhost`, and the proxy refused the loopback forward — a 403 per
+// retry, for as long as the dev server ran.
+test('an inherited NO_PROXY is kept, with ours in front', () => {
+  const lines = buildClaudeEnvLines({ port: 3456, caPath: '/x', inheritedNoProxy: '.test,dev.internal:8080' });
+  assert.ok(lines.includes("export NO_PROXY='localhost,127.0.0.1,::1,.test,dev.internal:8080'"), lines.join('\n'));
+  assert.ok(lines.includes("export no_proxy='localhost,127.0.0.1,::1,.test,dev.internal:8080'"), lines.join('\n'));
+});
+
+test('mergeNoProxy: always emits the loopback trio, trims, and dedupes case-insensitively', () => {
+  assert.equal(mergeNoProxy(null), 'localhost,127.0.0.1,::1');
+  assert.equal(mergeNoProxy(''), 'localhost,127.0.0.1,::1');
+  assert.equal(mergeNoProxy('  .test ,, 127.0.0.1 '), 'localhost,127.0.0.1,::1,.test');
+  assert.equal(mergeNoProxy('LOCALHOST,Dev.Test,dev.test'), 'localhost,127.0.0.1,::1,Dev.Test');
+  // Both spellings of the variable are read; overlap collapses.
+  assert.equal(mergeNoProxy('.test', '.test,.example'), 'localhost,127.0.0.1,::1,.test,.example');
+});
+
+// `*` means "proxy nothing". Honouring it would send api.anthropic.com straight
+// out: no rotation, the operator's own quota, and nothing on screen to say so.
+test('mergeNoProxy drops `*`, keeping the rest of the list', () => {
+  assert.equal(mergeNoProxy('*'), 'localhost,127.0.0.1,::1');
+  assert.equal(mergeNoProxy(' * , .test'), 'localhost,127.0.0.1,::1,.test');
+  assert.ok(bypassesAllHosts('.test, *'));
+  assert.ok(!bypassesAllHosts('.test,*.example'));
+  assert.ok(!bypassesAllHosts(null));
+});
+
+// The value now comes from the environment, and these lines are eval'd — the
+// same hazard the port check exists for.
+test('an inherited NO_PROXY is shell-quoted: a space, a quote and a $ survive eval', () => {
+  for (const inherited of ['.test,a b', ".test,o'brien", '.test,$(touch /tmp/tc-no-proxy-pwn)', '.test;touch /tmp/tc-no-proxy-pwn2']) {
+    const lines = buildClaudeEnvLines({ port: 3456, caPath: '/x', inheritedNoProxy: inherited });
+    const result = spawnSync('/bin/sh', ['-c', `${lines.join('\n')}\nprintf %s "$NO_PROXY"`], { encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, mergeNoProxy(inherited), inherited);
+  }
+});
+
+test('base-URL mode still emits no NO_PROXY, inherited or not', () => {
+  const lines = buildClaudeEnvLines({ port: 3456, useMitm: false, inheritedNoProxy: '.test' });
+  assert.deepEqual(lines, ['export ANTHROPIC_BASE_URL=http://localhost:3456']);
 });

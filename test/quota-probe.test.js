@@ -344,6 +344,23 @@ test('prober skips API-key accounts', async () => {
   assert.equal(calls, 0);
 });
 
+test('prober sends Codex accounts only to the Codex usage endpoint', async () => {
+  const am = new AccountManager([oauth('codex', { provider: 'codex', accountId: 'acct-codex' })], 0.98);
+  let anthropicCalls = 0;
+  let codexCalls = 0;
+  const prober = new Prober(am, {
+    intervalMs: 0,
+    probeFn: async () => { anthropicCalls++; return { error: 'HTTP 401', status: 401 }; },
+    codexProbeFn: async account => { codexCalls++; assert.equal(account.accountId, 'acct-codex'); return { sevenDay: { utilization: 0.2, resetAt: 123 } }; },
+    log: () => {},
+  });
+  await prober.probeAll();
+  assert.equal(anthropicCalls, 0);
+  assert.equal(codexCalls, 1);
+  assert.equal(prober.getStatus().accounts[0].status, 'ok');
+  assert.equal(am.accounts[0].quota.unified7d, 0.2);
+});
+
 test('prober retries once on a 401', async () => {
   const am = new AccountManager([oauth('a')], 0.98); // no refreshToken → ensureTokenFresh is a no-op
   let calls = 0;
