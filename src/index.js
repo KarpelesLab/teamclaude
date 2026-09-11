@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { createWriteStream } from 'node:fs';
 import { readFile } from 'node:fs/promises';
@@ -128,6 +128,10 @@ switch (command) {
     break;
   case 'attach':
     await attachCommand();
+    process.exit(0);
+    break;
+  case 'dashboard':
+    await dashboardCommand();
     process.exit(0);
     break;
   case 'accounts':
@@ -656,6 +660,10 @@ async function serverCommand() {
     intervalMs: (config.quotaProbeSeconds || 0) * 1000,
     profileFn: fetchProfile,
   });
+  // The web dashboard's one-shot probe button uses the same zero-spend action
+  // as the TUI's `p` key. Assigned after construction because the hook object
+  // is already shared with the server created above.
+  hooks.probeQuota = () => prober?.probeAll();
   prober.start();
 
   // Start the opt-in keep-warm scheduler. Interval mode runs relative to server
@@ -1182,6 +1190,57 @@ async function attachCommand() {
     session.am.applyStatus(first);
     session.start();
   });
+}
+
+// Open the browser dashboard, starting a headless proxy when no server is
+// reachable. This keeps the common background-service workflow one command,
+// while preserving `attach` as the terminal-only remote TUI.
+async function dashboardCommand() {
+  const config = await loadOrCreateConfig();
+  const port = config.proxy.port;
+  const bound = process.env.TEAMCLAUDE_HOST || config.proxy.host || '127.0.0.1';
+  const host = (bound === '0.0.0.0' || bound === '::') ? '127.0.0.1' : bound;
+  const statusUrl = `http://${host}:${port}/teamclaude/status`;
+  const dashboardUrl = `http://${host}:${port}/teamclaude/dashboard`;
+  const canReach = async () => {
+    try {
+      const res = await fetch(statusUrl, {
+        headers: { 'x-api-key': config.proxy.apiKey },
+        signal: AbortSignal.timeout(750),
+      });
+      return res.ok;
+    } catch { return false; }
+  };
+
+  if (!(await canReach())) {
+    const child = spawn(process.argv[1], ['server', '--headless'], {
+      detached: true,
+      stdio: 'ignore',
+      env: process.env,
+    });
+    child.unref();
+    let ready = false;
+    for (let i = 0; i < 20; i++) {
+      await new Promise(resolve => setTimeout(resolve, 250));
+      if (await canReach()) { ready = true; break; }
+    }
+    if (!ready) {
+      console.error(`Started headless server, but it did not answer at ${host}:${port}.`);
+      console.error(`Check the service log: ${logPath()}`);
+      process.exit(1);
+    }
+    console.log(`Started headless server at ${host}:${port}`);
+  }
+
+  const opener = process.platform === 'darwin' ? 'open'
+    : process.platform === 'win32' ? 'start'
+    : 'xdg-open';
+  const opened = spawnSync(opener, [dashboardUrl], { stdio: 'ignore', shell: process.platform === 'win32' });
+  if (opened.error || opened.status !== 0) {
+    console.log(`Dashboard: ${dashboardUrl}`);
+    return;
+  }
+  console.log(`Dashboard: ${dashboardUrl}`);
 }
 
 // ── switch ──────────────────────────────────────────────────
@@ -2030,6 +2089,7 @@ Commands:
                       Use --color=always|never to control ANSI colors
   attach              Open the live dashboard against a running server; s
                       switches account, R reloads config, q leaves it running
+  dashboard           Start a headless server if needed and open the web dashboard
   accounts            List configured accounts
   switch [NAME]       Make the running server prefer one account (as 's' in the
                       TUI does); with no NAME, list accounts and mark the current

@@ -200,6 +200,32 @@ test('the switch button\'s request passes the same-origin gate and moves the cur
   }
 });
 
+test('the dashboard exposes reload and one-shot probe controls', () => {
+  const html = renderDashboardHtml();
+  assert.match(html, /id="reload"/);
+  assert.match(html, /id="probe"/);
+  assert.match(html, /\/teamclaude\/reload/);
+  assert.match(html, /\/teamclaude\/probe/);
+});
+
+test('the probe control invokes the server hook', async () => {
+  let calls = 0;
+  const am = new AccountManager([{ name: 'a', type: 'api_key', apiKey: 'sk-x' }], 0.98);
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'secret' }, upstream: 'http://127.0.0.1:9' }, {
+    probeQuota: async () => { calls++; },
+  });
+  const port = await listen(proxy);
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/teamclaude/probe`, {
+      method: 'POST', headers: { origin: `http://127.0.0.1:${port}`, 'sec-fetch-site': 'same-origin' },
+    });
+    assert.deepEqual(await res.json(), { ok: true });
+    assert.equal(calls, 1);
+  } finally {
+    proxy.close();
+  }
+});
+
 // The shape /teamclaude/status reports per route: the server's own target for
 // the family, and every account with whether it could serve it.
 const ROUTED = {
