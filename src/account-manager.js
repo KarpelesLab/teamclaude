@@ -504,7 +504,12 @@ export class AccountManager {
    */
   _setCurrent(account) {
     this.currentIndex = account.index;
-    this.providerCursors.set(providerOf(account), account.index);
+    // A move made by an operator or a poll names the provider cursor of the
+    // account it lands on. A move inside a selection walk does not: the walk
+    // records where it left the slot once it is done (see getActiveAccount),
+    // and a borrowed walk that picks a shared API key — which reads as the
+    // default provider — would otherwise overwrite the OWNER's cursor here.
+    if (this._selectingProvider == null) this.providerCursors.set(providerOf(account), account.index);
     if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) return;
     this._firstSightOn(this._currentObs ??= newObservation(), account);
   }
