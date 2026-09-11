@@ -9,6 +9,7 @@
 
 import { fetchUsage } from './oauth.js';
 import { fetchBackendQuota, hasBackendQuota } from './backend-quota.js';
+import { providerOf } from './provider.js';
 
 // Node's timers take a 32-bit signed delay: anything above 2^31-1 ms is
 // coerced to 1 ms, so an interval large enough to mean "practically never"
@@ -95,7 +96,8 @@ export class Prober {
    * this line (warmer.js `_isWarmTarget`); the probe did not.
    */
   _isProbeTarget(account) {
-    return !!account && account.type === 'oauth' && !!account.credential && !account.upstream;
+    return !!account && providerOf(account) === 'anthropic'
+      && account.type === 'oauth' && !!account.credential && !account.upstream;
   }
 
   /** A third-party backend that publishes a quota of its own. The provider

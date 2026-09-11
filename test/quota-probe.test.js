@@ -344,6 +344,19 @@ test('prober skips API-key accounts', async () => {
   assert.equal(calls, 0);
 });
 
+test('prober does not send a Codex token to the Anthropic usage endpoint', async () => {
+  const am = new AccountManager([oauth('codex', { provider: 'codex', accountId: 'acct-codex' })], 0.98);
+  let calls = 0;
+  const prober = new Prober(am, {
+    intervalMs: 0,
+    probeFn: async () => { calls++; return { error: 'HTTP 401', status: 401 }; },
+    log: () => {},
+  });
+  await prober.probeAll();
+  assert.equal(calls, 0);
+  assert.equal(prober.getStatus().accounts[0].status, 'not-applicable');
+});
+
 test('prober retries once on a 401', async () => {
   const am = new AccountManager([oauth('a')], 0.98); // no refreshToken → ensureTokenFresh is a no-op
   let calls = 0;
