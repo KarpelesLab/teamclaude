@@ -245,10 +245,15 @@ test('equally spent windows are governed by the one that resets sooner', () => {
   }
 });
 
-test('an equal-pressure tie breaks on the governing window\'s clock, not another', () => {
+test('an equal-pressure tie breaks on the governing window\'s clock, not another', t => {
   // Half the headroom over half the horizon prices identically, so the tie is
   // exact and the next key decides: the governing window's clock, not the shared.
   const now = Date.now();
+  // The pickers read their own `Date.now()`, and pressure is a function of the
+  // instant it is read at: one millisecond past the fixture's `now` ends the tie
+  // and the ranking answers on raw pressure before the tiebreak is consulted.
+  // Frozen here so the tie is still a tie when the pickers below read it.
+  t.mock.timers.enable({ apis: ['Date'], now });
   const fleet = expiry => {
     const am = mgr(['a', 'b'], { expiry });
     for (const i of [0, 1]) {
@@ -586,6 +591,124 @@ test('path 3: the reset switch skips an excluded account that also reset', () =>
     'the switch let an account the request cannot be sent to decide where it goes');
 });
 
+test('path 3: the band that refuses the switch is the fleet\'s, not this attempt\'s tried set', () => {
+  // `hot` never reset, so it is nothing this switch may weigh; what it does hold
+  // is the fleet's band, which is why a challenger the band leaves out must not
+  // become the cursor for every request behind this one. An exclusion that
+  // removes a genuine candidate may change the answer, and this does not deny it.
+  const build = () => {
+    const am = mgr(['cur', 'hot', 'reset'], { expiry: ON });
+    bucket(am, 0, 'unified7d', 0.50, 100); // 1.39e-6, the cursor
+    bucket(am, 1, 'unified7d', 0.00, 1);   // 2.78e-4, the band's maximum, alone
+    bucket(am, 2, 'unified7d', 0.50, 10);  // 1.39e-5, banded out by hot
+    am.accounts[2].quota.unified5h = 0.9;
+    am.accounts[2].quota.unified5hReset = Date.now() - 1000;
+    return am;
+  };
+  // Asked of TWINS, because reading availability clears the expired window the
+  // switch is triggered by.
+  assert.deepEqual(build()._bandedCandidates(null, OPUS).map(a => a.name), ['hot'],
+    'the fixture must give the band to hot on the whole fleet');
+  assert.deepEqual(build()._bandedCandidates(new Set([1]), OPUS).map(a => a.name), ['reset'],
+    'the fixture must hand the band to reset once hot is out, or the arm tests nothing');
+
+  // One event, two arriving requests differing only in what they have tried: the
+  // 429-hop shape, and a plain request.
+  const excluded = build();
+  const hop = excluded.getActiveAccount(new Set([1]), OPUS);
+  const unexcluded = build();
+  unexcluded.getActiveAccount(null, OPUS);
+  assert.equal(excluded.accounts[excluded.currentIndex].name,
+    unexcluded.accounts[unexcluded.currentIndex].name,
+    'the same event left the fleet in two places depending on what the arriving request had tried');
+
+  assert.equal(excluded.accounts[excluded.currentIndex].name, 'cur',
+    'the tried account left the band, and the switch installed what the band refuses');
+  // The veto costs this request nothing; only the fleet declines to move.
+  assert.equal(hop.name, 'cur',
+    'the vetoed switch also moved the request off the account it was entitled to');
+  // `cur` and not `hot`: the event was spent at the hop, the cursor never moved,
+  // and _select returns a live current before any pressure comparison.
+  assert.equal(excluded.getActiveAccount(null, OPUS).name, 'cur',
+    'the request behind the hop inherited a cursor the fleet band refuses');
+});
+
+test('path 3: an exclusion the fleet\'s band survives still lets the switch through', () => {
+  // The control for the arm above. The switch is refused when the FLEET's band
+  // refuses the challenger, never because the request excluded something: here
+  // the tried account holds the band and the challenger is inside it too.
+  const am = mgr(['cur', 'hot', 'reset'], { expiry: ON });
+  bucket(am, 0, 'unified7d', 0.50, 100); // 1.39e-6
+  bucket(am, 1, 'unified7d', 0.45, 10);  // 1.53e-5, the band's maximum
+  bucket(am, 2, 'unified7d', 0.50, 10);  // 1.39e-5, inside it
+  am.accounts[2].quota.unified5h = 0.9;
+  am.accounts[2].quota.unified5hReset = Date.now() - 1000;
+  am.getActiveAccount(new Set([1]), OPUS);
+  assert.equal(am.accounts[am.currentIndex].name, 'reset',
+    'a switch the fleet band admits was refused for excluding a band member');
+});
+
+test('path 3: the band that refuses the switch reads the fleet the walk serves, not the fleet the cursor account declares', () => {
+  // `_excludeOtherProviders` partitions subscriptions only, so an API-key cursor
+  // reads anthropic whatever fleet the walk is serving. Deriving the band's
+  // partition from that account bands a Codex switch over the Anthropic fleet,
+  // whose top-band account the challenger cannot beat, and the switch is vetoed
+  // for a reason no Codex request has anything to do with.
+  const build = () => {
+    const am = mgr([{ name: 'key', type: 'apikey', apiKey: 'k-key' },
+      oauth('cxreset', { provider: 'codex' }), oauth('anhot')], { expiry: ON });
+    bucket(am, 0, 'unified7d', 0.50, 100); // the cursor, and an API key: reads anthropic
+    bucket(am, 1, 'unified7d', 0.50, 10);  // the Codex fleet's reset candidate
+    bucket(am, 2, 'unified7d', 0.00, 1);   // the Anthropic fleet's top band, alone
+    am.accounts[1].quota.unified5h = 0.9;
+    am.accounts[1].quota.unified5hReset = Date.now() - 1000;
+    am.currentIndex = 0;
+    return am;
+  };
+  // Asked of TWINS, because reading availability clears the expired window the
+  // switch is triggered by. The two bands differing is the whole discriminator.
+  const codex = build();
+  assert.deepEqual(
+    codex._bandedCandidates(codex._excludeOtherProviders(null, 'codex'), OPUS).map(a => a.name),
+    ['cxreset'], 'the fixture must give the Codex partition\'s band to the challenger');
+  const anthropic = build();
+  assert.deepEqual(
+    anthropic._bandedCandidates(anthropic._excludeOtherProviders(null, DEFAULT_PROVIDER), OPUS).map(a => a.name),
+    ['anhot'], 'the fixture must hand the Anthropic partition\'s band elsewhere, or the arm tests nothing');
+
+  const am = build();
+  const served = am.getActiveAccount(null, OPUS, null, null, 'codex');
+  assert.equal(served.name, 'cxreset',
+    'the band was drawn over the fleet the cursor account declares, and vetoed a switch the walk\'s own fleet admits');
+  // The number, not an index lookup: a vetoed switch leaves no entry at all, and
+  // reading `accounts[undefined]` would throw instead of failing here.
+  assert.equal(am.providerCursors.get('codex'), 1,
+    'the Codex fleet\'s cursor did not follow the switch its own band admitted');
+});
+
+test('path 3: a hop that refuses to move does not park the fleet on a paused account', () => {
+  // A paused account is still _isAvailable: the pause is the hop's own test, so
+  // an ordinary retry excluding the account it just tried, which is what a grown
+  // ctx.tried produces, can leave the fleet parked inside a pause. The bound this
+  // arm does not close: the switch still never consults isPaused, so an account
+  // inside its own pause that genuinely holds the fleet band can still be
+  // installed.
+  const am = mgr(['cur', 'hot', 'reset'], { expiry: ON });
+  bucket(am, 0, 'unified7d', 0.50, 100);
+  bucket(am, 1, 'unified7d', 0.00, 1);
+  bucket(am, 2, 'unified7d', 0.50, 10);
+  am.accounts[2].quota.unified5h = 0.9;
+  am.accounts[2].quota.unified5hReset = Date.now() - 1000;
+  am.pauseAccount(2, 60);
+  am.getActiveAccount(new Set([1]), OPUS);
+  assert.equal(am.isPaused(am.currentIndex), false,
+    'a hop that refused to move parked the fleet inside a rate-limit pause');
+  assert.equal(am.accounts[am.currentIndex].name, 'cur',
+    'the refused hop moved the cursor onto the paused account');
+  assert.equal(am.getActiveAccount(null, OPUS).name, 'cur',
+    'the request behind the refused hop was routed to a paused account');
+});
+
 test('path 3: a reset stays pending until a request that can act on it', () => {
   // The reset is fleet state, not this request's, so a window that expires while
   // one request cannot use the account has to outlive that request.
@@ -786,6 +909,35 @@ test('path 3: the knob-off switch keeps a spent account out', () => {
   am.refreshExpiredQuotas();
   assert.equal(am.accounts[am.currentIndex].name, 'cur',
     'the knob-off switch installed an account whose weekly is spent');
+});
+
+test('path 3: the knob-off switch reads no account the band would have read', () => {
+  // The band expression sits inside the `&&` so the knob-off path evaluates none
+  // of it, and that placement is behaviour and not tidiness: banding an account
+  // reads its availability, and reading availability clears a past-due throttle.
+  // `thr` is never a candidate here, so nothing the knob-off path is entitled to
+  // touch reaches it, and its throttle fields are what show whether the band was
+  // built anyway. Quota windows cannot show it: the refresh clears every expired
+  // one whatever the knob.
+  const past = Date.now() - 1000;
+  const am = mgr(['cur', 'chall', 'thr'], { expiry: OFF });
+  bucket(am, 0, 'unified7d', 0.50, 100);
+  bucket(am, 1, 'unified7d', 0.10, 10);
+  bucket(am, 2, 'unified7d', 0.40, 50);
+  // Only the challenger's 5h window has expired, so it alone fires the switch and
+  // `thr` is nothing this path may consider.
+  am.accounts[1].quota.unified5h = 0.5;
+  am.accounts[1].quota.unified5hReset = past;
+  am.accounts[2].status = 'throttled';
+  am.accounts[2].rateLimitedUntil = past;
+
+  am.refreshExpiredQuotas();
+  assert.equal(am.accounts[am.currentIndex].name, 'chall',
+    'the knob-off switch never fired, so the arm tests nothing about the statement it guards');
+  assert.equal(am.accounts[2].status, 'throttled',
+    'the knob-off switch read an account the band would have read, and cleared its throttle');
+  assert.equal(am.accounts[2].rateLimitedUntil, past,
+    'the knob-off switch read an account the band would have read, and dropped its rate-limit clock');
 });
 
 test('path 3 still switches when the sooner-resetting account is the better one', () => {

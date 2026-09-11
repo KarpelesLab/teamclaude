@@ -1148,7 +1148,7 @@ test('a borrowed cursor\'s success settles the roll of its own provider', () => 
     'the request after the fail-back preempted off a settled roll');
 });
 
-test('a success on a shared key for another provider\'s request leaves the roll held', () => {
+test('a success settles no hold the move that reached its destination left behind', () => {
   // Only SUBSCRIPTIONS are partitioned, so the account a request landed on says
   // nothing about which fleet it belonged to.
   const am = new AccountManager(
@@ -1176,7 +1176,7 @@ test('a success on a shared key for another provider\'s request leaves the roll 
   assert.equal(served.name, 'kn', 'the confirming codex request left the shared key');
   am.confirmStay(served, carried, null, 'codex');
   assert.equal(am._currentObs.unescaped?.idx, 0,
-    'a codex success released the roll the anthropic fleet was holding');
+    'a codex success under a stamp the hold does not carry released the roll');
 
   // a2 and the key out of the way, so anthropic falls back onto a1, still owed.
   assert.equal(claudeReq(new Set([1, 2])).name, 'a1', 'the fail-back did not reach a1');
@@ -1184,6 +1184,475 @@ test('a success on a shared key for another provider\'s request leaves the roll 
     'the fail-back onto a1 first-sighted the week a1 gained');
   assert.equal(claudeReq().name, 'a2',
     'the anthropic request after the fail-back settled on the account its roll pushed it off');
+});
+
+test('a success at a shared key settles no hold the arrival that reached it left behind', () => {
+  const am = new AccountManager(
+    [sharedKey('kn'), codexAccount('c'), oauth('a')], 0.98, { expiryRouting: ON },
+  );
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30]]) bucket(am, i, 'unified7d', 0.4, hours);
+  // The key has the soonest window, so the daemon's opening placement starts there.
+  am.selectActiveAccount();
+
+  const codexReq = (exclude = null) => am.getActiveAccount(exclude, GPT, null, null, 'codex');
+  // The anthropic subscription is excluded so this traffic reaches the key
+  // WITHOUT moving the cursor. A cursor move hands the roll back before any
+  // confirmation, which is a different rule than the one under test.
+  const claudeReq = () => am.getActiveAccount(new Set([2]), OPUS, null, null, 'anthropic');
+
+  assert.equal(codexReq().name, 'kn', 'the codex fixture must start on the shared key');
+  rollWindow(am, 0);
+  assert.equal(codexReq().name, 'c', 'the key\'s roll did not preempt the codex traffic');
+  // The first codex request to REST on c, which is what puts the key's roll
+  // into the hold.
+  assert.equal(codexReq().name, 'c', 'the preemption did not settle on c');
+  assert.equal(am._currentObs.unescaped?.idx, 0, 'resting on c did not hold the key\'s roll');
+  assert.equal(am._currentObs.unescaped?.provider, 'codex',
+    'the hold does not name the fleet whose reading it preserves');
+
+  // Anthropic traffic now rests on the same key and is served. The first request
+  // MOVES the observation onto the key and so cannot confirm; the second rests.
+  assert.equal(claudeReq().name, 'kn', 'the anthropic request did not reach the shared key');
+  const carried = am.observedGeneration(null, OPUS);
+  const served = claudeReq();
+  assert.equal(served.name, 'kn', 'the confirming anthropic request left the shared key');
+  am.confirmStay(served, carried, null, 'anthropic');
+  assert.equal(am._currentObs.unescaped?.idx, 0,
+    'an anthropic success under a stamp the hold does not carry released the roll');
+});
+
+test('the fleet that created a hold on a shared key settles it with its own success', () => {
+  // The converse, and the loss the cursor rule leaves behind: codex traffic can
+  // never settle a roll it was pushed off a key that reads as anthropic.
+  const am = new AccountManager(
+    [sharedKey('kn'), codexAccount('c'), oauth('a')], 0.98, { expiryRouting: ON },
+  );
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30]]) bucket(am, i, 'unified7d', 0.4, hours);
+  am.selectActiveAccount();
+
+  const codexReq = (exclude = null) => am.getActiveAccount(exclude, GPT, null, null, 'codex');
+
+  assert.equal(codexReq().name, 'kn', 'the codex fixture must start on the shared key');
+  rollWindow(am, 0);
+  assert.equal(codexReq().name, 'c', 'the key\'s roll did not preempt the codex traffic');
+  assert.equal(codexReq().name, 'c', 'the preemption did not settle on c');
+  assert.equal(am._currentObs.unescaped?.idx, 0, 'resting on c did not hold the key\'s roll');
+
+  const carried = am.observedGeneration(null, GPT);
+  const served = codexReq();
+  assert.equal(served.name, 'c', 'the confirming codex request left c');
+  am.confirmStay(served, carried, null, 'codex');
+  assert.equal(am._currentObs.unescaped, null,
+    'the fleet the roll pushed off could not settle it with its own success');
+
+  // c out of the way: the roll is settled, so the key is read whole on return.
+  assert.equal(codexReq(new Set([1])).name, 'kn', 'the codex fail-back did not reach the key');
+  assert.equal(am._currentRolledOver(am.accounts[0], GPT), false,
+    'a roll the codex fleet already settled was charged a second time');
+});
+
+test('a roll held at a shared key is settled by any fleet the key serves', () => {
+  // A pin is one slot per bucket too, and a session that has served both apps
+  // holds a roll one of them was pushed off. The key is the only destination
+  // either app has here, so it holds ONE reading for whichever of them it is
+  // serving, and the success of the fleet resting there settles the roll the
+  // other was pushed off.
+  const am = new AccountManager(
+    [codexAccount('c'), sharedKey('kn')], 0.98,
+    { expiryRouting: ON, distributeSessions: true },
+  );
+  for (const [i, hours] of [[0, 10], [1, 20]]) bucket(am, i, 'unified7d', 0.4, hours);
+
+  const req = (model, provider) => {
+    am.beginSession('s1');
+    const account = am.getActiveAccount(null, model, null, 's1', provider);
+    if (account) am.recordSession('s1', account.index, model);
+    am.endSession('s1');
+    return account;
+  };
+  const held = () => am.sessionTracker.refsFor('s1', 'unified7d').unescaped;
+
+  assert.equal(req(GPT, 'codex').name, 'c', 'the session must start on the codex subscription');
+  rollWindow(am, 0);
+  assert.equal(req(GPT, 'codex').name, 'kn', 'the roll did not move the pin off c');
+  // The first request to REST on the key, which is what puts c's roll into the hold.
+  assert.equal(req(GPT, 'codex').name, 'kn', 'the preemption did not settle on the key');
+  assert.equal(held()?.idx, 0, 'the fixture must have held c\'s roll on the pin');
+  assert.equal(held()?.provider, 'codex', 'the pin\'s hold does not name the fleet it belongs to');
+
+  // The key is the only account anthropic has here, so its traffic rests on the
+  // same pin the codex hold hangs off and is served there.
+  const carriedClaude = am.observedGeneration('s1', OPUS);
+  assert.equal(req(OPUS, 'anthropic').name, 'kn', 'the anthropic request left the shared key');
+  am.confirmStay(am.accounts[1], carriedClaude, 's1', 'anthropic');
+  assert.equal(held(), null,
+    'an anthropic success at the shared key did not settle the roll the codex fleet was pushed off');
+});
+
+test('a roll no borrowing fleet can ever settle is released by the fleet that owns the destination', () => {
+  // The destination is a subscription the holding fleet is never routed to, so
+  // no success of that fleet can arrive there to settle the roll. Refusing the
+  // only fleet that can be served there would hold it until the window rolls
+  // again. The stamp is untouched; what changed is who the release accepts.
+  const am = new AccountManager(
+    [sharedKey('kn'), oauth('a'), codexAccount('c')], 0.98, { expiryRouting: ON },
+  );
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30]]) bucket(am, i, 'unified7d', 0.4, hours);
+
+  const codexReq = () => am.getActiveAccount(null, GPT, null, null, 'codex');
+  const claudeReq = (exclude = null) => am.getActiveAccount(exclude, OPUS, null, null, 'anthropic');
+
+  // No opening placement: the first codex request establishes the reading, so
+  // the hold the anthropic escape creates is the codex fleet's.
+  assert.equal(codexReq().name, 'kn', 'the codex fixture must start on the shared key');
+  assert.equal(am._currentObs.provider, 'codex', 'the reading on the key is not the codex fleet\'s');
+  assert.equal(claudeReq().name, 'kn', 'the anthropic request did not rest on the same key');
+
+  rollWindow(am, 0);
+  assert.equal(claudeReq().name, 'a', 'the key\'s roll did not preempt the anthropic traffic');
+  assert.equal(claudeReq().name, 'a', 'the preemption did not settle on a');
+  assert.equal(am._currentObs.unescaped?.idx, 0, 'resting on a did not hold the key\'s roll');
+  assert.equal(am._currentObs.unescaped?.provider, 'codex',
+    'the hold does not name the fleet whose reading it preserves');
+
+  const carried = am.observedGeneration(null, OPUS);
+  const served = claudeReq();
+  assert.equal(served.name, 'a', 'the confirming anthropic request left a');
+  am.confirmStay(served, carried, null, 'anthropic');
+  assert.equal(am._currentObs.unescaped, null,
+    'the owner\'s success did not settle the roll it was pushed off');
+});
+
+test('a roll held at a shared key is settled by the fleet that rests there', () => {
+  // The cursor leg of the pin arm above. The destination is a key both fleets
+  // are served at, so the reading there is nobody's alone: the fleet resting on
+  // it settles the roll the other was pushed off, and the fail-back finds its
+  // origin whole.
+  const am = new AccountManager(
+    [sharedKey('kn1'), sharedKey('kn2'), codexAccount('c')], 0.98, { expiryRouting: ON },
+  );
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30]]) bucket(am, i, 'unified7d', 0.4, hours);
+
+  const codexReq = () => am.getActiveAccount(null, GPT, null, null, 'codex');
+  const claudeReq = (exclude = null) => am.getActiveAccount(exclude, OPUS, null, null, 'anthropic');
+
+  // No opening placement: the codex request establishes the reading on the first
+  // key, so the roll it is pushed off names the codex fleet.
+  assert.equal(codexReq().name, 'kn1', 'the codex fixture must start on the first key');
+  assert.equal(claudeReq().name, 'kn1', 'the anthropic traffic did not rest on the same key');
+
+  rollWindow(am, 0);
+  assert.equal(claudeReq().name, 'kn2', 'the key\'s roll did not preempt onto the second key');
+  assert.equal(claudeReq().name, 'kn2', 'the preemption did not settle on the second key');
+  assert.equal(am._currentObs.unescaped?.idx, 0,
+    'resting on the second key did not hold the first key\'s roll');
+  assert.equal(am._currentObs.unescaped?.provider, 'codex',
+    'the hold does not name the fleet whose reading it preserves');
+
+  const carried = am.observedGeneration(null, OPUS);
+  const served = claudeReq();
+  assert.equal(served.name, 'kn2', 'the confirming anthropic request left the second key');
+  am.confirmStay(served, carried, null, 'anthropic');
+  assert.equal(am._currentObs.unescaped, null,
+    'a confirmed stay at a key both fleets reach did not settle the roll');
+
+  // The roll is settled, so the origin is read whole on return.
+  assert.equal(claudeReq(new Set([1])).name, 'kn1', 'the fail-back did not reach the first key');
+  assert.equal(am._currentRolledOver(am.accounts[0], OPUS), false,
+    'a roll the shared key already settled was charged a second time');
+});
+
+test('removing an account renumbers a held roll without changing whose it is', () => {
+  // The renumbering is nobody's success, so it settles nothing: a hold that came
+  // back naming no fleet could never be settled by the one it was taken for.
+  const am = new AccountManager(
+    [oauth('a'), sharedKey('kn'), codexAccount('c')], 0.98, { expiryRouting: ON },
+  );
+  for (const [i, hours] of [[0, 40], [1, 10], [2, 20]]) bucket(am, i, 'unified7d', 0.4, hours);
+  // The key's window is the soonest, so the opening placement starts there and
+  // `a` sits out of the way with the furthest one.
+  am.selectActiveAccount();
+
+  const codexReq = (exclude = null) => am.getActiveAccount(exclude, GPT, null, null, 'codex');
+
+  assert.equal(codexReq().name, 'kn', 'the codex fixture must start on the shared key');
+  rollWindow(am, 1);
+  assert.equal(codexReq().name, 'c', 'the key\'s roll did not preempt the codex traffic');
+  assert.equal(codexReq().name, 'c', 'the preemption did not settle on c');
+  assert.equal(am._currentObs.unescaped?.idx, 1, 'resting on c did not hold the key\'s roll');
+
+  am.removeAccount(0);
+  assert.equal(am._currentObs.unescaped?.idx, 0,
+    'the held roll did not follow the key to its new index');
+  assert.equal(am._currentObs.unescaped?.provider, 'codex',
+    'the renumbering dropped the fleet the held roll belongs to');
+});
+
+test('removing the account the reading rests on keeps every other roll', () => {
+  // The removal settles the roll of the account that went away and no other, so
+  // what the reading was holding for the rest is still owed to them. It moves
+  // onto a reading that names nobody, which is where a fail-back finds it.
+  // Windows far enough apart that each roll has one destination, so the chain
+  // below is deterministic: a2's roll held over a1's, with the reading on a3.
+  const am = mgr(['a1', 'a2', 'a3', 'a4'], ON);
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30], [3, 40]]) bucket(am, i, 'unified7d', 0.4, hours);
+  assert.equal(serve(am, null, OPUS).name, 'a1', 'the fixture must start on a1');
+  rollWindow(am, 0);
+  assert.equal(serve(am, null, OPUS).name, 'a2', 'a1\'s roll did not preempt');
+  assert.equal(serve(am, null, OPUS).name, 'a2', 'the preemption did not settle on a2');
+  rollWindow(am, 1);
+  assert.equal(serve(am, null, OPUS).name, 'a3', 'a2\'s roll did not preempt');
+  assert.equal(serve(am, null, OPUS).name, 'a3', 'the second preemption did not settle on a3');
+  assert.equal(am._currentObs.unescaped?.idx, 1, 'the fixture must hold a2\'s roll');
+  assert.equal(am._currentObs.unescaped?.prev?.idx, 0, 'the fixture must hold a1\'s roll under it');
+
+  am.removeAccount(2);
+  assert.notEqual(am._currentObs, null, 'removing the resting account discarded the whole chain');
+  assert.equal(am._currentObs.unescaped?.idx, 1, 'a2\'s held roll did not survive the removal');
+  assert.equal(am._currentObs.unescaped?.prev?.idx, 0, 'a1\'s held roll did not survive the removal');
+
+  // a4 inherited the removed slot and is excluded, so the traffic reaches a1
+  // through a cursor move and never rests on the account it came from.
+  assert.equal(serve(am, null, OPUS, { exclude: new Set([1, 2]) }).name, 'a1',
+    'the forced fail-back did not reach a1');
+  assert.equal(am._currentRolledOver(am.accounts[0], OPUS), true,
+    'the fail-back onto a1 did not find the week a1 gained still held');
+});
+
+test('removing an account no roll was taken on leaves the chain where it is', () => {
+  // The bystander case, and the discriminator for the arm above: the reading
+  // still names the account it rests on, so nothing about the chain moves.
+  // Windows far enough apart that each roll has one destination, so the chain
+  // below is deterministic: a2's roll held over a1's, with the reading on a3.
+  const am = mgr(['a1', 'a2', 'a3', 'a4'], ON);
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30], [3, 40]]) bucket(am, i, 'unified7d', 0.4, hours);
+  assert.equal(serve(am, null, OPUS).name, 'a1', 'the fixture must start on a1');
+  rollWindow(am, 0);
+  assert.equal(serve(am, null, OPUS).name, 'a2', 'a1\'s roll did not preempt');
+  assert.equal(serve(am, null, OPUS).name, 'a2', 'the preemption did not settle on a2');
+  rollWindow(am, 1);
+  assert.equal(serve(am, null, OPUS).name, 'a3', 'a2\'s roll did not preempt');
+  assert.equal(serve(am, null, OPUS).name, 'a3', 'the second preemption did not settle on a3');
+  assert.equal(am._currentObs.unescaped?.idx, 1, 'the fixture must hold a2\'s roll');
+  assert.equal(am._currentObs.unescaped?.prev?.idx, 0, 'the fixture must hold a1\'s roll under it');
+
+  am.removeAccount(3);
+  assert.notEqual(am._currentObs, null, 'removing a bystander discarded the whole chain');
+  assert.equal(am._currentObs.unescaped?.idx, 1,
+    'a2\'s held roll did not survive a bystander\'s removal');
+  assert.equal(am._currentObs.unescaped?.prev?.idx, 0,
+    'a1\'s held roll did not survive a bystander\'s removal');
+
+  assert.equal(serve(am, null, OPUS, { exclude: new Set([1, 2]) }).name, 'a1',
+    'the forced fail-back did not reach a1');
+  assert.equal(am._currentRolledOver(am.accounts[0], OPUS), true,
+    'the fail-back onto a1 did not find the week a1 gained still held');
+});
+
+test('the account a removal clamps the cursor onto is handed the roll it is owed', () => {
+  // The clamp takes the account the cursor rested on, so the account it lands on
+  // is an arrival: every other arrival is offered whatever the chain still holds
+  // for it. Unoffered, the roll is charged a second time the next time traffic
+  // rests there.
+  const am = mgr(['p', 'q', 'r', 's'], ON);
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30], [3, 40]]) bucket(am, i, 'unified7d', 0.4, hours);
+  assert.equal(serve(am, null, OPUS).name, 'p', 'the fixture must start on p');
+  rollWindow(am, 0);
+  assert.equal(serve(am, null, OPUS).name, 'q', 'p\'s roll did not preempt');
+  assert.equal(serve(am, null, OPUS).name, 'q', 'the preemption did not settle on q');
+  rollWindow(am, 1);
+  assert.equal(serve(am, null, OPUS).name, 'r', 'q\'s roll did not preempt');
+  assert.equal(serve(am, null, OPUS).name, 'r', 'the second preemption did not settle on r');
+  rollWindow(am, 2);
+  assert.equal(serve(am, null, OPUS).name, 's', 'r\'s roll did not preempt');
+  assert.equal(serve(am, null, OPUS).name, 's', 'the third preemption did not settle on s');
+  assert.equal(am._currentObs.unescaped?.idx, 2, 'the fixture must hold r\'s roll');
+
+  // s goes away and the cursor has nothing above it to move to, so it clamps
+  // back onto r: an arrival no selection made.
+  am.removeAccount(3);
+  assert.equal(am._currentObs?.idx, 2,
+    'the cursor clamped onto r without being handed the reading r is owed');
+  assert.equal(am._currentRolledOver(am.accounts[2], OPUS), true,
+    'the account the clamp landed on did not find the week it gained still held');
+  assert.equal(serve(am, null, OPUS).name, 'p',
+    'the fleet parked on the account whose window had just rolled');
+});
+
+test('the account a removal shifts under the cursor is handed a reading of its own', () => {
+  // The same arrival with the clamp not involved: the removal takes the account
+  // the cursor rested on from the middle of the list, so the cursor index is
+  // unchanged and a4 inherits the slot a3 left. Nothing is owed to a4 on the
+  // chain, so what the arrival owes it is a reading of its own -- left nameless,
+  // the reading would answer for a4 with evidence taken on a3.
+  const am = mgr(['a1', 'a2', 'a3', 'a4'], ON);
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30], [3, 40]]) bucket(am, i, 'unified7d', 0.4, hours);
+  assert.equal(serve(am, null, OPUS).name, 'a1', 'the fixture must start on a1');
+  rollWindow(am, 0);
+  assert.equal(serve(am, null, OPUS).name, 'a2', 'a1\'s roll did not preempt');
+  assert.equal(serve(am, null, OPUS).name, 'a2', 'the preemption did not settle on a2');
+  rollWindow(am, 1);
+  assert.equal(serve(am, null, OPUS).name, 'a3', 'a2\'s roll did not preempt');
+  assert.equal(serve(am, null, OPUS).name, 'a3', 'the second preemption did not settle on a3');
+  assert.equal(am.currentIndex, 2, 'the fixture must rest on a3');
+
+  am.removeAccount(2);
+  assert.equal(am.accounts[2].name, 'a4', 'a4 did not inherit the slot a3 left');
+  assert.equal(am._currentObs?.idx, 2,
+    'the account that inherited the slot under the cursor was left unnamed by the reading');
+});
+
+test('a removal that takes the reading\'s account but not the cursor\'s hands nothing back', () => {
+  // A borrowed walk moves the reading without the cursor, so the account a
+  // removal takes can be the reading's while the cursor rests where it was.
+  // Nobody arrived anywhere: the cursor is on the account it was already on, and
+  // the rolls the reading was holding for others are still owed to them. An
+  // offer here would hand the cursor's account its own roll back and empty a
+  // chain the removal only renumbered.
+  const am = new AccountManager(
+    [oauth('a'), sharedKey('kn'), codexAccount('c')], 0.98, { expiryRouting: ON },
+  );
+  for (const [i, hours] of [[0, 40], [1, 10], [2, 20]]) bucket(am, i, 'unified7d', 0.4, hours);
+  // The key's window is the soonest, so the opening placement starts there.
+  am.selectActiveAccount();
+
+  const codexReq = () => am.getActiveAccount(null, GPT, null, null, 'codex');
+
+  assert.equal(codexReq().name, 'kn', 'the codex fixture must start on the shared key');
+  rollWindow(am, 1);
+  assert.equal(codexReq().name, 'c', 'the key\'s roll did not preempt the codex traffic');
+  assert.equal(codexReq().name, 'c', 'the preemption did not settle on c');
+  assert.equal(am._currentObs.unescaped?.idx, 1, 'resting on c did not hold the key\'s roll');
+  assert.equal(am.currentIndex, 1,
+    'the fixture must leave the cursor on the key the borrowed walk moved past');
+
+  am.removeAccount(2);
+  assert.equal(am._currentObs?.idx, null,
+    'a removal that only took the reading\'s account stamped the reading onto the cursor\'s');
+  assert.equal(am._currentObs?.unescaped?.idx, 1,
+    'the roll the reading held for the key was handed back to a key nobody arrived at');
+});
+
+test('an arrival a removal makes is offered nothing against a reading that is not its own', () => {
+  // The other side of the arm above: here the removal DOES take the account the
+  // cursor rested on, so the cursor lands on a new one. But a borrowed walk has
+  // carried the reading two accounts further on, so the reading is not that
+  // arrival's to be read against: offering it would hand the landed account a
+  // roll it is still owed elsewhere and stamp the walk's reading onto an account
+  // the walk never reached.
+  const am = new AccountManager(
+    [oauth('a'), sharedKey('kn'), codexAccount('c1'), codexAccount('c2')], 0.98,
+    { expiryRouting: ON },
+  );
+  for (const [i, hours] of [[0, 50], [1, 10], [2, 20], [3, 30]]) bucket(am, i, 'unified7d', 0.4, hours);
+  // The key's window is the soonest, so the opening placement puts the cursor
+  // there and the anthropic side never moves it again.
+  am.selectActiveAccount();
+
+  const codexReq = () => am.getActiveAccount(null, GPT, null, null, 'codex');
+
+  assert.equal(codexReq().name, 'kn', 'the codex fixture must start on the shared key');
+  rollWindow(am, 1);
+  assert.equal(codexReq().name, 'c1', 'the key\'s roll did not preempt the codex traffic');
+  assert.equal(codexReq().name, 'c1', 'the preemption did not settle on c1');
+  rollWindow(am, 2);
+  assert.equal(codexReq().name, 'c2', 'c1\'s roll did not preempt the codex traffic');
+  assert.equal(codexReq().name, 'c2', 'the second preemption did not settle on c2');
+  assert.equal(am._currentObs?.idx, 3, 'the fixture must leave the reading on c2');
+  assert.equal(am.currentIndex, 1,
+    'the fixture must leave the cursor two accounts behind the reading');
+
+  // kn is the cursor's account, so the cursor lands on c1 -- and the reading
+  // still names c2, which is where the walk actually is.
+  am.removeAccount(1);
+  assert.equal(am.accounts[am.currentIndex].name, 'c1', 'the cursor did not land on c1');
+  assert.equal(am._currentObs?.idx, 2,
+    'the reading the walk left on c2 was stamped onto the account the cursor landed on');
+  assert.equal(am._currentObs?.unescaped?.idx, 1,
+    'c1\'s roll was handed back at a removal no traffic arrived at c1 through');
+});
+
+test('a borrowed walk\'s confirmed serve at a shared key releases the roll it was holding', () => {
+  // A borrower resting on the owner's cursor account writes the OWNER's rolled
+  // reading into the hold, so the hold names the owner. The destination is a key
+  // both fleets are served at, though, and such a key holds ONE reading for
+  // whoever it is serving: the borrower's own confirmed serve there settles the
+  // roll the owner was pushed off, exactly as the owner's would.
+  const am = new AccountManager(
+    [oauth('a1'), sharedKey('kn')], 0.98, { expiryRouting: ON },
+  );
+  for (const [i, hours] of [[0, 10], [1, 20]]) bucket(am, i, 'unified7d', 0.4, hours);
+
+  const claudeReq = (exclude = null) => am.getActiveAccount(exclude, OPUS, null, null, 'anthropic');
+  const codexReq = () => am.getActiveAccount(null, GPT, null, null, 'codex');
+
+  // No opening placement: that would baseline the observation outside a walk and
+  // leave it naming no fleet. The first anthropic request establishes it instead.
+  assert.equal(claudeReq().name, 'a1', 'the anthropic traffic must start on a1');
+  rollWindow(am, 0);
+  assert.equal(claudeReq().name, 'kn', 'a1\'s roll did not preempt the anthropic traffic');
+
+  // The key is the only account the codex fleet has, so its request borrows the
+  // cursor and is the first to rest on the key, which is what holds a1's roll.
+  assert.equal(codexReq().name, 'kn', 'the codex request did not reach the shared key');
+  assert.equal(am._currentObs.unescaped?.idx, 0, 'the borrowed walk did not hold a1\'s roll');
+  assert.equal(am._currentObs.unescaped?.provider, 'anthropic',
+    'the hold names the fleet that wrote it instead of the one whose reading it is');
+
+  // The borrower is served at the key, so its success is evidence about the one
+  // reading the key holds. The owner's continuation goes with the roll: once the
+  // borrower has settled it there is nothing left for a second success to settle.
+  const carriedCodex = am.observedGeneration(null, GPT);
+  const servedCodex = codexReq();
+  assert.equal(servedCodex.name, 'kn', 'the confirming codex request left the shared key');
+  am.confirmStay(servedCodex, carriedCodex, null, 'codex');
+  assert.equal(am._currentObs.unescaped, null,
+    'a codex success at the key both fleets reach did not settle the roll a1 was pushed off');
+});
+
+test('a walk that moves an observation makes the reading its own fleet\'s', () => {
+  // The other face of the same rule. A stamp that only fills a blank leaves the
+  // reading naming whichever fleet moved it first, so a fleet preempted off a
+  // roll of its own could not settle it: the hold would name a fleet whose
+  // success is no evidence, and every fail-back would find the roll standing.
+  const am = new AccountManager(
+    [sharedKey('key'), codexAccount('cx1'), codexAccount('cx2')], 0.98, { expiryRouting: ON },
+  );
+  for (const [i, used, hours] of [[0, 0.10, 90], [1, 0.50, 10], [2, 0.40, 20]]) {
+    bucket(am, i, 'unified7d', used, hours);
+  }
+
+  const claudeReq = () => am.getActiveAccount(null, OPUS, null, null, 'anthropic');
+  // The key excluded, so the codex walk MOVES the observation rather than resting
+  // where the anthropic walk already left it.
+  const codexReq = (exclude = new Set([0])) => am.getActiveAccount(exclude, GPT, null, null, 'codex');
+
+  // No opening placement: that would baseline the observation outside a walk and
+  // leave it naming no fleet. The key is all the anthropic partition has.
+  assert.equal(claudeReq().name, 'key', 'the anthropic traffic must come to rest on the shared key');
+  assert.equal(am._currentObs.idx, 0, 'the anthropic walk did not take the reading on the key');
+  assert.equal(am._currentObs.provider, 'anthropic',
+    'the reading the anthropic walk established names another fleet');
+
+  assert.equal(codexReq().name, 'cx1', 'the codex walk did not move the observation onto cx1');
+  assert.equal(am._currentObs.idx, 1, 'the codex walk did not move the reading with the cursor');
+  assert.equal(am._currentObs.provider, 'codex',
+    'the walk that moved the reading left it naming the fleet it was taken from');
+
+  // cx1 rolls, and the codex fleet is pushed off a roll that is now its own.
+  rollWindow(am, 1);
+  assert.equal(codexReq().name, 'cx2', 'cx1\'s roll did not preempt the codex traffic');
+  assert.equal(codexReq().name, 'cx2', 'the preemption did not settle on cx2');
+
+  const carried = am.observedGeneration(null, GPT);
+  const served = codexReq();
+  assert.equal(served.name, 'cx2', 'the confirming codex request left cx2');
+  am.confirmStay(served, carried, null, 'codex');
+
+  // cx2 out of the way, so the traffic returns to the account it was pushed off.
+  assert.equal(codexReq(new Set([0, 2])).name, 'cx1', 'the fail-back did not reach cx1');
+  assert.equal(am._currentRolledOver(am.accounts[1], GPT), false,
+    'the codex fleet could not settle a roll it was itself pushed off');
 });
 
 test('a confirmation that names no fleet settles nothing', () => {
@@ -1209,6 +1678,650 @@ test('a confirmation that names no fleet settles nothing', () => {
     'the fail-back found a roll that nothing had settled already released');
   assert.equal(serve(am, null, OPUS).name, 'b',
     'the request after the fail-back stayed on the account the roll pushed it off');
+});
+
+test('a second escape does not forget the first roll', () => {
+  // Neither preemption is settled, so the fleet is away from both accounts and
+  // owes each its own reading. The second escape must not answer for the first:
+  // the roll handed back on a fail-back is all that keeps an account from being
+  // preempted off the week it just gained, every time traffic returns.
+  const am = mgr(['a', 'b', 'c'], ON);
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30]]) bucket(am, i, 'unified7d', 0.4, hours);
+  // One fleet throughout, so the opening placement leaving the reading unstamped
+  // costs nothing: the first hold takes the fleet that observes the roll.
+  am.selectActiveAccount();
+
+  assert.equal(serve(am, null, OPUS).name, 'a', 'the fixture must start on a');
+  rollWindow(am, 0);
+  assert.equal(serve(am, null, OPUS).name, 'b', 'a\'s roll did not preempt');
+  // The first request to REST on b, which is what holds a's roll.
+  assert.equal(serve(am, null, OPUS).name, 'b', 'the preemption did not settle on b');
+  rollWindow(am, 1);
+  assert.equal(serve(am, null, OPUS).name, 'c', 'b\'s roll did not preempt');
+  assert.equal(serve(am, null, OPUS).name, 'c', 'the second preemption did not settle on c');
+
+  // b and c out of the way, so the traffic is forced back onto a.
+  assert.equal(serve(am, null, OPUS, { exclude: new Set([1, 2]) }).name, 'a',
+    'the forced fail-back did not reach a');
+  assert.equal(am._currentRolledOver(am.accounts[0], OPUS), true,
+    'the second escape forgot the roll the first was pushed off');
+  assert.equal(serve(am, null, OPUS).name, 'c',
+    'the fleet parked on the week a had just gained');
+
+  // The hand-back to a settles nothing for b, which is still owed its own.
+  assert.equal(serve(am, null, OPUS, { exclude: new Set([0, 2]) }).name, 'b',
+    'the forced fail-back did not reach b');
+  assert.equal(am._currentRolledOver(am.accounts[1], OPUS), true,
+    'handing a its roll back took b\'s with it');
+
+  // The same forced fail-back with one escape outstanding controls for the
+  // fixture: what the assertions above measure is the second escape.
+  const one = mgr(['a', 'b', 'c'], ON);
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30]]) bucket(one, i, 'unified7d', 0.4, hours);
+  one.selectActiveAccount();
+  assert.equal(serve(one, null, OPUS).name, 'a', 'the control must start on a');
+  rollWindow(one, 0);
+  assert.equal(serve(one, null, OPUS).name, 'b', 'the control\'s roll did not preempt');
+  assert.equal(serve(one, null, OPUS).name, 'b', 'the control did not settle on b');
+  assert.equal(serve(one, null, OPUS, { exclude: new Set([1, 2]) }).name, 'a',
+    'the control\'s fail-back did not reach a');
+  assert.equal(one._currentRolledOver(one.accounts[0], OPUS), true,
+    'the control lost a\'s roll with nothing else outstanding');
+});
+
+test('a fail-back holds the roll on the account it is leaving', () => {
+  // The account a hand-back leaves may have rolled while the traffic rested on
+  // it. Replacing its reading with the restored one discards that roll unless it
+  // is chained like any other escape, and the fleet then parks on the week that
+  // account had just gained the moment nothing excludes it.
+  const am = mgr(['a', 'b', 'c', 'd'], ON);
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30], [3, 40]]) bucket(am, i, 'unified7d', 0.4, hours);
+  am.selectActiveAccount();
+
+  assert.equal(serve(am, null, OPUS).name, 'a', 'the fixture must start on a');
+  rollWindow(am, 0);
+  assert.equal(serve(am, null, OPUS).name, 'b', 'a\'s roll did not preempt');
+  assert.equal(serve(am, null, OPUS).name, 'b', 'the preemption did not settle on b');
+  rollWindow(am, 1);
+  assert.equal(serve(am, null, OPUS).name, 'c', 'b\'s roll did not preempt');
+  assert.equal(serve(am, null, OPUS).name, 'c', 'the second preemption did not settle on c');
+  // c rolls under the resting traffic, so nothing has escaped it yet.
+  rollWindow(am, 2);
+
+  assert.equal(serve(am, null, OPUS, { exclude: new Set([1, 2, 3]) }).name, 'a',
+    'the forced fail-back did not reach a');
+  assert.equal(am._currentRolledOver(am.accounts[0], OPUS), true,
+    'the fail-back to a was handed nothing');
+
+  assert.equal(serve(am, null, OPUS, { exclude: new Set([0, 1, 3]) }).name, 'c',
+    'the forced return to c did not reach c');
+  assert.equal(am._currentRolledOver(am.accounts[2], OPUS), true,
+    'the fail-back to a spent the roll c had gained under it');
+  assert.equal(serve(am, null, OPUS).name, 'd',
+    'the fleet parked on the week c had just gained');
+
+  // b's escape is untouched by either hand-back, so the chain kept it.
+  assert.equal(serve(am, null, OPUS, { exclude: new Set([0, 2, 3]) }).name, 'b',
+    'the forced fail-back did not reach b');
+  assert.equal(am._currentRolledOver(am.accounts[1], OPUS), true,
+    'holding c\'s roll took b\'s off the chain');
+  // The control on the hold this arm adds. The same forced fail-back with the
+  // account it LEAVES unrolled escapes nothing there, so it chains nothing: what
+  // the assertions above measure is the roll c gained, not the hand-back itself.
+  const one = mgr(['a', 'b', 'c', 'd'], ON);
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30], [3, 40]]) bucket(one, i, 'unified7d', 0.4, hours);
+  one.selectActiveAccount();
+  assert.equal(serve(one, null, OPUS).name, 'a', 'the control must start on a');
+  rollWindow(one, 0);
+  assert.equal(serve(one, null, OPUS).name, 'b', 'the control\'s roll did not preempt');
+  assert.equal(serve(one, null, OPUS).name, 'b', 'the control did not settle on b');
+  assert.equal(serve(one, null, OPUS, { exclude: new Set([1, 2, 3]) }).name, 'a',
+    'the control\'s fail-back did not reach a');
+  assert.equal(one._currentObs.unescaped, null,
+    'the fail-back off b, which had not rolled, held a roll b never gained');
+});
+
+test('a pinned fail-back holds the roll on the account it is leaving', () => {
+  // The same reading, in the store a session pin keeps. Both stores go through
+  // the one restore, so a fix reaching only the sticky current account would
+  // leave the pin spending the week the account it left had gained.
+  const am = mgr(['a', 'b', 'c', 'd'], ON, { distributeSessions: true });
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30], [3, 40]]) bucket(am, i, 'unified7d', 0.4, hours);
+
+  assert.equal(serve(am, 's1', OPUS).name, 'a', 'the fixture must start on a');
+  rollWindow(am, 0);
+  assert.equal(serve(am, 's1', OPUS).name, 'b', 'a\'s roll did not move the pin');
+  assert.equal(serve(am, 's1', OPUS).name, 'b', 'the preemption did not settle on b');
+  rollWindow(am, 1);
+  assert.equal(serve(am, 's1', OPUS).name, 'c', 'b\'s roll did not move the pin');
+  assert.equal(serve(am, 's1', OPUS).name, 'c', 'the second preemption did not settle on c');
+  rollWindow(am, 2);
+
+  assert.equal(serve(am, 's1', OPUS, { exclude: new Set([1, 2, 3]) }).name, 'a',
+    'the forced fail-back did not reach a');
+  assert.equal(am._pinRolledOver('s1', am.accounts[0], OPUS), true,
+    'the pin\'s fail-back to a was handed nothing');
+
+  assert.equal(serve(am, 's1', OPUS, { exclude: new Set([0, 1, 3]) }).name, 'c',
+    'the forced return to c did not reach c');
+  assert.equal(am._pinRolledOver('s1', am.accounts[2], OPUS), true,
+    'the pin\'s fail-back to a spent the roll c had gained under it');
+  assert.equal(serve(am, 's1', OPUS).name, 'd',
+    'the pin parked on the week c had just gained');
+});
+
+test('a rest on the nameless reading a removal left is handed the roll it still owes', () => {
+  // A removal that takes the account the READING names, but not the cursor's,
+  // rebuilds the reading nameless and carries the chain across. The first rest
+  // afterwards reaches the very account the chain owes, and a first sight there
+  // adopts the week that account has already gained.
+  const am = new AccountManager(
+    [oauth('a'), sharedKey('kn'), codexAccount('c')], 0.98, { expiryRouting: ON },
+  );
+  for (const [i, hours] of [[0, 40], [1, 10], [2, 20]]) bucket(am, i, 'unified7d', 0.4, hours);
+  am.selectActiveAccount();
+
+  const codexReq = () => am.getActiveAccount(null, GPT, null, null, 'codex');
+  const ownerReq = (exclude = null) => am.getActiveAccount(exclude, OPUS, null, null, 'anthropic');
+
+  assert.equal(codexReq().name, 'kn', 'the codex traffic must start on the shared key');
+  rollWindow(am, 1);
+  assert.equal(codexReq().name, 'c', 'the key\'s roll did not preempt the codex traffic');
+  assert.equal(codexReq().name, 'c', 'the preemption did not settle on c');
+  assert.equal(am.currentIndex, 1, 'the cursor must still rest on the key');
+
+  am.removeAccount(2);
+  assert.equal(am._currentObs.idx, null, 'the removal did not leave the reading nameless');
+
+  assert.equal(ownerReq().name, 'a', 'the first rest spent the week the key had gained');
+  assert.equal(am._currentRolledOver(am.accounts[1], OPUS), true,
+    'the roll the chain owed the key was first-sighted away');
+});
+
+test('a confirmed serve releases a roll held against the account it rests on', () => {
+  // A borrowed walk leaves the reading on the borrower and the roll on the chain;
+  // the cursor comes back, so the owner's next request rests on its own account
+  // while the chain still owes that same account. Whatever move stamped it, a
+  // serve there is the stay the hold was waiting for.
+  const am = new AccountManager(
+    [oauth('d'), oauth('e'), codexAccount('c1')], 0.98, { expiryRouting: ON },
+  );
+  for (const [i, hours] of [[0, 10], [1, 40], [2, 20]]) bucket(am, i, 'unified7d', 0.4, hours);
+
+  const ownerReq = (exclude = null) => am.getActiveAccount(exclude, OPUS, null, null, 'anthropic');
+  const codexReq = () => am.getActiveAccount(null, GPT, null, null, 'codex');
+
+  assert.equal(ownerReq().name, 'd', 'the owner must start on d');
+  rollWindow(am, 0);
+  assert.equal(codexReq().name, 'c1', 'the first borrowed walk did not reach c1');
+  assert.equal(codexReq().name, 'c1', 'the second borrowed walk did not rest on c1');
+  assert.equal(ownerReq().name, 'd', 'the owner\'s next request left d');
+  assert.equal(am._currentObs.unescaped?.idx, 0, 'the borrowed walk held nothing for d');
+
+  const carried = am.observedGeneration(null, OPUS);
+  const served = ownerReq();
+  assert.equal(served.name, 'd', 'the confirming request left d');
+  am.confirmStay(served, carried, null, 'anthropic');
+  assert.equal(am._currentObs.unescaped, null,
+    'a serve on d left a roll held against d');
+
+  assert.equal(ownerReq(new Set([0])).name, 'e', 'the forced move off d did not reach e');
+  assert.equal(ownerReq(new Set([1])).name, 'd', 'the forced return did not reach d');
+  assert.equal(ownerReq().name, 'd',
+    'the request after the return was preempted off a week already spent');
+});
+
+test('a hand-back keeps the fleet on the reading it restores and holds no roll it already handed back', () => {
+  // A hand-back outside a selection walk reads no fleet from the walk: the pin
+  // store's restore runs from `recordSession`, after the walk has cleared it.
+  // The reading it hands back was established by the fleet the hold names, so
+  // the reading keeps that fleet. A roll is handed back ONCE: the reading this
+  // hand-back restored rolls away again before any request is served on it, and
+  // the next hand-back does not hold it a second time, or two accounts that have
+  // each rolled would trade their rolls for ever.
+  const am = mgr(['a', 'b', 'c'], ON, { distributeSessions: true });
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30]]) bucket(am, i, 'unified7d', 0.4, hours);
+
+  assert.equal(serve(am, 's1', OPUS).name, 'a', 'the fixture must start on a');
+  rollWindow(am, 0);
+  assert.equal(serve(am, 's1', OPUS).name, 'b', 'a\'s roll did not move the pin');
+  assert.equal(serve(am, 's1', OPUS).name, 'b', 'the preemption did not settle on b');
+  rollWindow(am, 1);
+
+  assert.equal(serve(am, 's1', OPUS, { exclude: new Set([1, 2]) }).name, 'a',
+    'the forced fail-back did not reach a');
+  const first = am.sessionTracker.refsFor('s1', 'unified7d');
+  assert.equal(first.provider, 'anthropic',
+    'the reading the hand-back restored forgot the fleet that established it');
+
+  assert.equal(serve(am, 's1', OPUS, { exclude: new Set([2]) }).name, 'b',
+    'the forced return did not reach b');
+  assert.equal(am.sessionTracker.refsFor('s1', 'unified7d').unescaped, null,
+    'a roll handed back once was held a second time');
+
+  // The control on the fleet this arm reads. A hand-back INSIDE a walk takes the
+  // fleet from the walk, so a fix that reads the hold would be untested by the
+  // assertions above: this one is stamped whether or not the restore keeps it.
+  const one = mgr(['a', 'b', 'c'], ON);
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30]]) bucket(one, i, 'unified7d', 0.4, hours);
+  one.selectActiveAccount();
+  const walkReq = (exclude = null) => one.getActiveAccount(exclude, OPUS, null, null, 'anthropic');
+  assert.equal(walkReq().name, 'a', 'the control must start on a');
+  rollWindow(one, 0);
+  assert.equal(walkReq().name, 'b', 'the control\'s roll did not preempt');
+  assert.equal(walkReq().name, 'b', 'the control did not settle on b');
+  rollWindow(one, 1);
+  assert.equal(walkReq(new Set([1, 2])).name, 'a', 'the control\'s fail-back did not reach a');
+  assert.equal(one._currentObs.unescaped.provider, 'anthropic',
+    'a hand-back inside a walk stamped the roll it left with no fleet');
+});
+
+test('an operator switch that hands a roll back keeps the fleet on the reading', () => {
+  // The second route to the same restore: the TUI's switch and the /switch
+  // endpoint move the cursor with no walk around them at all, so the reading the
+  // first switch restores must keep its fleet, and the second switch holds no
+  // roll that first switch already handed back.
+  const am = mgr(['a', 'b', 'c'], ON);
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30]]) bucket(am, i, 'unified7d', 0.4, hours);
+  am.selectActiveAccount();
+  const walkReq = (exclude = null) => am.getActiveAccount(exclude, OPUS, null, null, 'anthropic');
+
+  assert.equal(walkReq().name, 'a', 'the fixture must start on a');
+  rollWindow(am, 0);
+  assert.equal(walkReq().name, 'b', 'a\'s roll did not preempt');
+  assert.equal(walkReq().name, 'b', 'the preemption did not settle on b');
+  rollWindow(am, 1);
+
+  assert.equal(am.setCurrentAccount(0), true, 'the operator switch to a was refused');
+  assert.equal(am._currentObs.provider, 'anthropic',
+    'the switch back to a forgot the fleet that established the reading');
+  assert.equal(am.setCurrentAccount(1), true, 'the operator switch to b was refused');
+  assert.equal(am._currentObs.unescaped, null,
+    'a roll the first switch handed back was held again by the second');
+});
+
+test('a confirmed serve releases the roll held against the account it rests on and the one the move escaped', () => {
+  // A confirmation can qualify two rolls. The move that rested the traffic back
+  // escaped the borrower's; the borrowed rest before it left the served
+  // account's own. One settlement per confirmation reaches only the first, so
+  // the account that answered keeps a roll it has already been served under,
+  // and the fleet is preempted off it a request later.
+  const am = new AccountManager(
+    [oauth('d'), oauth('e'), codexAccount('c1')], 0.98, { expiryRouting: ON },
+  );
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30]]) bucket(am, i, 'unified7d', 0.4, hours);
+
+  const ownerReq = (exclude = null) => am.getActiveAccount(exclude, OPUS, null, null, 'anthropic');
+  const codexReq = () => am.getActiveAccount(null, GPT, null, null, 'codex');
+
+  assert.equal(ownerReq().name, 'd', 'the owner must start on d');
+  rollWindow(am, 0);
+  assert.equal(codexReq().name, 'c1', 'the first borrowed walk did not reach c1');
+  assert.equal(codexReq().name, 'c1', 'the second borrowed walk did not rest on c1');
+  // c1 rolls under the borrowed traffic, so the rest back on d escapes its roll
+  // too and two rolls are outstanding at once.
+  rollWindow(am, 2);
+  assert.equal(ownerReq(new Set([1])).name, 'd', 'the owner\'s first arrival left d');
+  assert.equal(ownerReq(new Set([1])).name, 'd', 'the owner\'s rest left d');
+  assert.equal(am._currentObs.unescaped.idx, 2, 'the rest back on d held nothing for c1');
+  assert.equal(am._currentObs.unescaped.prev?.idx, 0, 'the borrowed walk held nothing for d');
+
+  const carried = am.observedGeneration(null, OPUS);
+  const served = ownerReq(new Set([1]));
+  assert.equal(served.name, 'd', 'the confirming request left d');
+  am.confirmStay(served, carried, null, 'anthropic');
+  assert.equal(am._currentObs.unescaped, null,
+    'a serve on d left the roll held against d outstanding behind the move-stamped one');
+
+  assert.equal(ownerReq(new Set([0])).name, 'e', 'the forced move off d did not reach e');
+  assert.equal(ownerReq(new Set([1])).name, 'd', 'the forced return did not reach d');
+  assert.equal(am._currentRolledOver(am.accounts[0], OPUS), false,
+    'the return was handed a roll d had already been served under');
+  assert.equal(ownerReq().name, 'd',
+    'the request after the return was preempted off a week already spent');
+});
+
+test('a stay at a fail-back destination does not release the roll the hand-back left behind', () => {
+  // A 429 excludes the destination and the fail-back reaches an account the
+  // chain still owes, so the roll it leaves behind is chained under that move's
+  // own stamp. The very next request stays where it is, so it selects under
+  // that same stamp and its serve settles a roll held against the account the
+  // fleet has just left. Nothing has come back there, and the return finds the
+  // week that account gained already spent.
+  const am = mgr(['a', 'b'], ON);
+  bucket(am, 0, 'unified7d', 0.4, 10);
+  bucket(am, 1, 'unified7d', 0.4, 20);
+  const req = (exclude, confirm) => {
+    const carried = am.observedGeneration(null, OPUS);
+    const account = am.getActiveAccount(exclude, OPUS, null, null, 'anthropic');
+    if (account && confirm) am.confirmStay(account, carried, null, 'anthropic');
+    return account;
+  };
+
+  assert.equal(req(null, true).name, 'a', 'the fixture must start on a');
+  rollWindow(am, 0);
+  assert.equal(req(null, true).name, 'b', 'a\'s roll did not preempt');
+  assert.equal(req(null, true).name, 'b', 'the preemption did not settle on b');
+  // b rolls under the resting traffic, so the fail-back below leaves a roll there.
+  rollWindow(am, 1);
+  assert.equal(req(new Set([1]), true).name, 'a', 'the 429 fail-back did not reach a');
+  assert.equal(am._currentObs.unescaped.idx, 1, 'the fail-back held nothing for b');
+
+  assert.equal(req(null, true).name, 'a', 'the next request did not stay on a');
+  assert.equal(am._currentObs.unescaped?.idx, 1,
+    'a serve at a settled the roll held against b');
+
+  assert.equal(req(new Set([0]), true).name, 'b', 'the forced return did not reach b');
+  assert.equal(am._currentRolledOver(am.accounts[1], OPUS), true,
+    'the return to b was handed a week b had already gained');
+  assert.equal(req(null, false).name, 'a',
+    'the fleet parked on the week b had just gained');
+});
+
+test('a pinned fail-back holds its roll across the serves that confirm each stay', () => {
+  // The same fail-back in the store a session pin keeps, with the server's own
+  // handshake around every request and the stamp read before each walk selects.
+  // A confirmation the pin's own hand-back leaves reachable spends the pin's
+  // roll where the sticky reading's does the fleet's.
+  const am = mgr(['a', 'b', 'c', 'd'], ON, { distributeSessions: true });
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30], [3, 40]]) bucket(am, i, 'unified7d', 0.4, hours);
+  const req = (exclude = null) => {
+    const carried = am.observedGeneration('s1', OPUS);
+    const account = serve(am, 's1', OPUS, { exclude });
+    if (account) am.confirmStay(account, carried, 's1', 'anthropic');
+    return account;
+  };
+
+  assert.equal(req().name, 'a', 'the fixture must start on a');
+  rollWindow(am, 0);
+  assert.equal(req().name, 'b', 'a\'s roll did not move the pin');
+  assert.equal(req().name, 'b', 'the preemption did not settle on b');
+  rollWindow(am, 1);
+  assert.equal(req().name, 'c', 'b\'s roll did not move the pin');
+  assert.equal(req().name, 'c', 'the second preemption did not settle on c');
+  rollWindow(am, 2);
+
+  assert.equal(req(new Set([1, 2, 3])).name, 'a', 'the forced fail-back did not reach a');
+  assert.equal(am._pinRolledOver('s1', am.accounts[0], OPUS), true,
+    'the pin\'s fail-back to a was handed nothing');
+  assert.equal(req(new Set([0, 1, 3])).name, 'c', 'the forced return to c did not reach c');
+  assert.equal(am._pinRolledOver('s1', am.accounts[2], OPUS), true,
+    'a confirmation spent the roll the pin\'s hand-back left on c');
+  assert.equal(req().name, 'd', 'the pin parked on the week c had just gained');
+});
+
+test('a roll displaced by a restore onto a reading no walk established still names a fleet', () => {
+  // The pin's account is removed, so the session's reading is rebuilt naming
+  // nobody and first-sights onto a third account from `recordSession`, outside
+  // any walk. When that account rolls and selection goes back to one the chain
+  // still owes, the roll it leaves is displaced against a reading no walk ever
+  // stamped. The hold that reading builds names the fleet the chain belongs to,
+  // because a hold naming none can be settled by nobody.
+  const am = mgr(['a', 'b', 'c'], ON, { distributeSessions: true });
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30]]) bucket(am, i, 'unified7d', 0.4, hours);
+
+  assert.equal(serve(am, 's1', OPUS).name, 'a', 'the fixture must start on a');
+  rollWindow(am, 0);
+  assert.equal(serve(am, 's1', OPUS).name, 'b', 'a\'s roll did not move the pin');
+  assert.equal(serve(am, 's1', OPUS).name, 'b', 'the preemption did not settle on b');
+
+  am.removeAccount(1);
+  assert.equal(am.accounts.length, 2, 'the removal did not take b out of the fleet');
+  assert.equal(serve(am, 's1', OPUS).name, 'c', 'the re-pin did not first-sight onto c');
+  assert.equal(am.sessionTracker.refsFor('s1', 'unified7d').idx, 1,
+    'the rebuilt reading did not take c');
+  rollWindow(am, 1);
+
+  assert.equal(serve(am, 's1', OPUS).name, 'a', 'c\'s roll did not send the pin back to a');
+  const held = am.sessionTracker.refsFor('s1', 'unified7d').unescaped;
+  assert.equal(held.idx, 1, 'the restore held nothing for c');
+  assert.equal(held.gen, null, 'a hand-back\'s roll took a stamp');
+  assert.equal(held.provider, 'anthropic',
+    'the roll the restore displaced names no fleet, so no stay can settle it');
+
+  // The return is handed the roll back, which is the other way it can leave the
+  // chain, and the reading that comes back is c's own pre-roll one.
+  assert.equal(serve(am, 's1', OPUS, { exclude: new Set([0]) }).name, 'c',
+    'the forced return did not reach c');
+  assert.equal(am.sessionTracker.refsFor('s1', 'unified7d').unescaped, null,
+    'the return did not take c\'s roll back off the chain, or held a\'s roll a second time');
+});
+
+test('a restore displaces a fleetless reading the same way with no account removed', () => {
+  // The control on the removal. The finding's trigger deletes the pin, but the
+  // reading a walk never stamped is what the hold is built from, and a first
+  // sight from `recordSession` leaves one whether or not an account went away.
+  const am = mgr(['a', 'b', 'c'], ON, { distributeSessions: true });
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30]]) bucket(am, i, 'unified7d', 0.4, hours);
+  const away = new Set([1]);
+
+  assert.equal(serve(am, 's1', OPUS).name, 'a', 'the control must start on a');
+  rollWindow(am, 0);
+  assert.equal(serve(am, 's1', OPUS).name, 'b', 'a\'s roll did not move the control\'s pin');
+  assert.equal(serve(am, 's1', OPUS).name, 'b', 'the control\'s preemption did not settle');
+
+  assert.equal(serve(am, 's1', OPUS, { exclude: away }).name, 'c',
+    'the control\'s pin did not first-sight onto c');
+  assert.equal(am.sessionTracker.refsFor('s1', 'unified7d').idx, 2,
+    'the control\'s reading did not take c');
+  rollWindow(am, 2);
+
+  assert.equal(serve(am, 's1', OPUS, { exclude: away }).name, 'a',
+    'c\'s roll did not send the control\'s pin back to a');
+  const held = am.sessionTracker.refsFor('s1', 'unified7d').unescaped;
+  assert.equal(held.idx, 2, 'the control\'s restore held nothing for c');
+  assert.equal(held.provider, 'anthropic',
+    'the control\'s displaced roll names no fleet either, so the removal is not the cause');
+});
+
+test('two accounts that have each rolled come to rest after one bounce', () => {
+  // The reading a hand-back restores is the one from before the roll, so the
+  // next request sees the roll again and the reset switch fires again. Held on
+  // every departure, two rolls would trade places for ever; handed back once,
+  // the fleet bounces once and rests.
+  const am = mgr(['a', 'b', 'c'], ON, { distributeSessions: true });
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30]]) bucket(am, i, 'unified7d', 0.4, hours);
+  const ex = new Set([1]);
+
+  assert.equal(serve(am, 's1', OPUS).name, 'a', 'the fixture must start on a');
+  rollWindow(am, 0);
+  assert.equal(serve(am, 's1', OPUS).name, 'b', 'a\'s roll did not move the pin');
+  assert.equal(serve(am, 's1', OPUS).name, 'b', 'the preemption did not settle on b');
+  assert.equal(serve(am, 's1', OPUS, { exclude: ex }).name, 'c', 'the pin did not first-sight onto c');
+  assert.equal(serve(am, 's1', OPUS, { exclude: ex }).name, 'c', 'the pin did not rest on c');
+  rollWindow(am, 2);
+  assert.equal(serve(am, 's1', OPUS, { exclude: ex }).name, 'a', 'c\'s roll did not send the pin back to a');
+
+  const seq = [];
+  for (let i = 0; i < 6; i++) seq.push(serve(am, 's1', OPUS, { exclude: ex }).name);
+  assert.equal(seq.slice(1).join(''), 'aaaaa', `the fleet did not come to rest: ${seq.join('')}`);
+  assert.equal(am.sessionTracker.refsFor('s1', 'unified7d').unescaped, null,
+    'a roll stayed held after the fleet came to rest');
+});
+
+// The pin bucket carries ONE reading for every model it governs. With a scoped
+// Opus bucket more spent than the shared window, OPUS rests that reading under
+// scoped:opus and HAIKU, which has no bucket of its own, under the shared window.
+function mixedFleet() {
+  const am = mgr(['a', 'b', 'c'], ON, { distributeSessions: true });
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30]]) {
+    bucket(am, i, 'unified7d', 0.4, hours);
+    scoped(am, i, 'opus', 0.5, hours);
+  }
+  return am;
+}
+
+// Roll a's Opus window, escape to b, first-sight onto c, roll c's Opus window,
+// and fail back to a: the pin rests on a with the reading from before its roll.
+function handedBackToA(am) {
+  const ex = new Set([1]);
+  assert.equal(serve(am, 's1', OPUS).name, 'a', 'the fixture must start on a');
+  am.accounts[0].quota.scopedWeekly.opus.resetAt += WEEK;
+  assert.equal(serve(am, 's1', OPUS).name, 'b', 'a\'s roll did not move the pin');
+  assert.equal(serve(am, 's1', OPUS).name, 'b', 'the preemption did not settle on b');
+  assert.equal(serve(am, 's1', OPUS, { exclude: ex }).name, 'c', 'the pin did not first-sight onto c');
+  assert.equal(serve(am, 's1', OPUS, { exclude: ex }).name, 'c', 'the pin did not rest on c');
+  am.accounts[2].quota.scopedWeekly.opus.resetAt += WEEK;
+  assert.equal(serve(am, 's1', OPUS, { exclude: ex }).name, 'a', 'c\'s roll did not send the pin back to a');
+  return ex;
+}
+
+test('a rest governed by another window does not re-arm a roll already handed back', () => {
+  // A HAIKU request served on a advances the shared window and says nothing
+  // about the Opus roll the hand-back restored. The next departure from a
+  // finds that roll as it was handed back, and holds nothing for it.
+  const am = mixedFleet();
+  const ex = handedBackToA(am);
+  const obs = am.sessionTracker.refsFor('s1', 'unified7d');
+  assert.equal(serve(am, 's1', HAIKU, { exclude: ex }).name, 'a', 'the HAIKU request left a');
+  assert.equal(serve(am, 's1', OPUS, { exclude: ex }).name, 'c', 'a\'s restored roll did not move the pin once more');
+  assert.equal(obs.unescaped, null,
+    'a roll already handed back was held again after a rest under another window');
+});
+
+test('alternating traffic after a hand-back comes to rest', () => {
+  // The trade the hand-back-once rule exists to stop, driven by two models on
+  // one reading: without the rule per window, every HAIKU stay re-armed the
+  // hold and the Opus pin bounced between a and c for ever.
+  const am = mixedFleet();
+  const ex = handedBackToA(am);
+  const seq = [];
+  for (let i = 0; i < 6; i++) {
+    serve(am, 's1', HAIKU, { exclude: ex });
+    seq.push(serve(am, 's1', OPUS, { exclude: ex }).name);
+  }
+  assert.equal(seq.slice(1).join(''), 'aaaaa', `the Opus pin did not come to rest: ${seq.join('')}`);
+  assert.equal(am.sessionTracker.refsFor('s1', 'unified7d').unescaped, null,
+    'a roll stayed held after the fleet came to rest');
+});
+
+test('a window that rolls after a hand-back is held and handed back on its own', () => {
+  // The hand-back covers the roll it restored and no other. A first roll of
+  // a's shared window while the pin rests there is a new event: the departure
+  // holds it, and the fail-back is handed it.
+  const am = mixedFleet();
+  const ex = new Set([1, 2]);
+  assert.equal(serve(am, 's1', OPUS).name, 'a', 'the fixture must start on a');
+  am.accounts[0].quota.scopedWeekly.opus.resetAt += WEEK;
+  assert.equal(serve(am, 's1', OPUS).name, 'b', 'a\'s Opus roll did not move the pin');
+  assert.equal(serve(am, 's1', OPUS).name, 'b', 'the preemption did not settle on b');
+  assert.equal(serve(am, 's1', OPUS, { exclude: ex }).name, 'a', 'the forced fail-back did not reach a');
+  const obs = am.sessionTracker.refsFor('s1', 'unified7d');
+  assert.equal(obs.idx, 0, 'the fail-back did not hand a its reading back');
+
+  rollWindow(am, 0);
+  const away = serve(am, 's1', HAIKU).name;
+  assert.notEqual(away, 'a', 'a\'s shared roll did not move the pin');
+  assert.equal(serve(am, 's1', HAIKU).name, away, 'the preemption did not settle');
+  assert.equal(obs.unescaped?.idx, 0,
+    'the first roll of a\'s shared window was not held because an earlier reading had been handed back');
+  assert.equal(serve(am, 's1', HAIKU, { exclude: ex }).name, 'a', 'the second fail-back did not reach a');
+  assert.equal(am._pinRolledOver('s1', am.accounts[0], HAIKU), true,
+    'the fail-back was not handed the shared roll');
+});
+
+test('a fail-back to the account of the most recent escape is still handed its roll', () => {
+  // The other end of the chain from the arm above: the newest escape is handed
+  // back too, and is not lost to the older one still outstanding.
+  const am = mgr(['a', 'b', 'c'], ON);
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30]]) bucket(am, i, 'unified7d', 0.4, hours);
+  am.selectActiveAccount();
+
+  assert.equal(serve(am, null, OPUS).name, 'a', 'the fixture must start on a');
+  rollWindow(am, 0);
+  assert.equal(serve(am, null, OPUS).name, 'b', 'a\'s roll did not preempt');
+  assert.equal(serve(am, null, OPUS).name, 'b', 'the preemption did not settle on b');
+  rollWindow(am, 1);
+  assert.equal(serve(am, null, OPUS).name, 'c', 'b\'s roll did not preempt');
+  assert.equal(serve(am, null, OPUS).name, 'c', 'the second preemption did not settle on c');
+
+  assert.equal(serve(am, null, OPUS, { exclude: new Set([0, 2]) }).name, 'b',
+    'the forced fail-back did not reach b');
+  assert.equal(am._currentRolledOver(am.accounts[1], OPUS), true,
+    'the fail-back to the newest escape was handed nothing');
+});
+
+test('a confirmed stay settles the roll its own move escaped and no other', () => {
+  // A serve at the destination is evidence that the move onto it stuck, and that
+  // move escaped one roll. It says nothing about an account the fleet left
+  // earlier and has not been back to.
+  const am = mgr(['a', 'b', 'c'], ON);
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30]]) bucket(am, i, 'unified7d', 0.4, hours);
+  am.selectActiveAccount();
+
+  assert.equal(serve(am, null, OPUS).name, 'a', 'the fixture must start on a');
+  rollWindow(am, 0);
+  assert.equal(serve(am, null, OPUS).name, 'b', 'a\'s roll did not preempt');
+  assert.equal(serve(am, null, OPUS).name, 'b', 'the preemption did not settle on b');
+  rollWindow(am, 1);
+  assert.equal(serve(am, null, OPUS).name, 'c', 'b\'s roll did not preempt');
+  assert.equal(serve(am, null, OPUS).name, 'c', 'the second preemption did not settle on c');
+
+  // The stamp of the move onto c, read before the request that confirms it.
+  const carried = am.observedGeneration(null, OPUS);
+  assert.equal(serve(am, null, OPUS).name, 'c', 'the confirming request left c');
+  am.confirmStay(am.accounts[2], carried, null, 'anthropic');
+
+  assert.equal(serve(am, null, OPUS, { exclude: new Set([0, 2]) }).name, 'b',
+    'the forced fail-back did not reach b');
+  assert.equal(am._currentRolledOver(am.accounts[1], OPUS), false,
+    'a roll the fleet already moved off was charged a second time');
+
+  assert.equal(serve(am, null, OPUS, { exclude: new Set([1, 2]) }).name, 'a',
+    'the forced fail-back did not reach a');
+  assert.equal(am._currentRolledOver(am.accounts[0], OPUS), true,
+    'a stay at c settled a roll that move never escaped');
+});
+
+test('a stay confirming a move that escaped nothing settles nothing', () => {
+  // An operator's switch mints a stamp of its own without escaping anything, so
+  // the roll still outstanding is left at the head of the chain. A serve after
+  // it confirms that move, which owes nobody a settlement.
+  const am = mgr(['a', 'b', 'c'], ON);
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30]]) bucket(am, i, 'unified7d', 0.4, hours);
+  am.selectActiveAccount();
+
+  assert.equal(serve(am, null, OPUS).name, 'a', 'the fixture must start on a');
+  rollWindow(am, 0);
+  assert.equal(serve(am, null, OPUS).name, 'b', 'a\'s roll did not preempt');
+  assert.equal(serve(am, null, OPUS).name, 'b', 'the preemption did not settle on b');
+
+  am.setCurrentAccount(2);
+  const carried = am.observedGeneration(null, OPUS);
+  assert.equal(serve(am, null, OPUS).name, 'c', 'the confirming request left the switch\'s account');
+  am.confirmStay(am.accounts[2], carried, null, 'anthropic');
+
+  assert.equal(serve(am, null, OPUS, { exclude: new Set([1, 2]) }).name, 'a',
+    'the forced fail-back did not reach a');
+  assert.equal(am._currentRolledOver(am.accounts[0], OPUS), true,
+    'a stay confirming a move that escaped nothing released a roll anyway');
+});
+
+test('a stay whose stamp the reading has left and returned to settles nothing', () => {
+  // The hold belongs to the stamp of the move that made it. Once the reading
+  // has moved away and come back, its stamp is a later one, so a confirmation
+  // under the old stamp settles nothing.
+  const am = mgr(['a', 'b', 'c'], ON);
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30]]) bucket(am, i, 'unified7d', 0.4, hours);
+  am.selectActiveAccount();
+
+  assert.equal(serve(am, null, OPUS).name, 'a', 'the fixture must start on a');
+  rollWindow(am, 0);
+  assert.equal(serve(am, null, OPUS).name, 'b', 'a\'s roll did not preempt');
+  assert.equal(serve(am, null, OPUS).name, 'b', 'the preemption did not settle on b');
+  assert.equal(am._currentObs.unescaped?.idx, 0, 'the fixture must hold a\'s roll');
+
+  const carried = am.observedGeneration(null, OPUS);
+  am.setCurrentAccount(2);
+  am.setCurrentAccount(1);
+  assert.notEqual(am._currentObs.gen, carried.current,
+    'the arm tests nothing unless the reading actually left b and returned');
+  am.confirmStay(am.accounts[1], carried, null, 'anthropic');
+
+  assert.equal(serve(am, null, OPUS, { exclude: new Set([1, 2]) }).name, 'a',
+    'the forced fail-back did not reach a');
+  assert.equal(am._currentRolledOver(am.accounts[0], OPUS), true,
+    'a stay under a stamp the reading had left and returned to released a roll anyway');
 });
 
 test('a session\'s confirmation releases under the bucket its stamp was taken under', () => {
@@ -1269,6 +2382,60 @@ test('removing an account renumbers a session pin\'s held roll too', () => {
     'the pin\'s held roll outlived the account it was taken on');
 });
 
+test('removing the account a pin\'s reading names keeps the roll it holds', () => {
+  // The pin store answers the same question the cursor store does, by different
+  // code. The ref names the account that went away, but the roll it holds is
+  // another account's and is still owed there, so the ref stays on naming nobody
+  // until traffic returning to that account is handed it.
+  const am = mgr(['a', 'b', 'c', 'd'], ON, { distributeSessions: true });
+  for (const i of [0, 1, 2, 3]) bucket(am, i, 'unified7d', 0.4, 10 + i * 10);
+  const ref = () => am.sessionTracker.refsFor('s1', 'unified7d');
+  assert.equal(serve(am, 's1', OPUS).name, 'a', 'the fixture must start on a');
+  rollWindow(am, 0);
+  assert.equal(serve(am, 's1', OPUS).name, 'b', 'the rollover did not move the pin to b');
+  // One request rests on b, which holds a's roll without confirming the stay.
+  assert.equal(serve(am, 's1', OPUS).name, 'b', 'the arrival did not settle on b');
+  assert.equal(ref()?.unescaped?.idx, 0, 'the fixture must have held a\'s roll on the pin');
+
+  am.removeAccount(1);
+  assert.notEqual(ref(), null, 'removing the account the ref names discarded the roll it held');
+  assert.equal(ref()?.unescaped?.idx, 0, 'a\'s held roll did not survive the removal');
+  // What stays behind names nobody, and a reading of nobody's carries nothing
+  // but the rolls: the stamp and the gen of the account that went away would
+  // answer a later confirmation as though the reading were still that account's.
+  assert.equal(ref()?.idx, null, 'the ref kept naming an account after that account went away');
+  assert.equal(ref()?.gen, 0, 'the nameless ref kept the gen of the reading the removal ended');
+  assert.equal(ref()?.provider, null,
+    'the nameless ref kept the fleet stamp of a reading it no longer holds');
+
+  // The pin went with b, so this request re-routes rather than returning to a
+  // pin; the ref is read whatever the pin loop left, which is where a's roll is
+  // handed back.
+  assert.equal(serve(am, 's1', OPUS, { exclude: new Set([1, 2]) }).name, 'a',
+    'the forced fail-back did not reach a');
+  assert.equal(am._pinRolledOver('s1', am.accounts[0], OPUS), true,
+    'the fail-back onto a did not find the week a gained still held');
+});
+
+test('a pin ref that stayed on for one roll goes away with it', () => {
+  // The other half of the one drop rule the arm above turns on: a ref naming
+  // nobody is kept only by what it holds, so once the last roll on it goes with
+  // the account it was taken on there is nothing left to be evidence about.
+  const am = mgr(['a', 'b', 'c', 'd'], ON, { distributeSessions: true });
+  for (const i of [0, 1, 2, 3]) bucket(am, i, 'unified7d', 0.4, 10 + i * 10);
+  const ref = () => am.sessionTracker.refsFor('s1', 'unified7d');
+  assert.equal(serve(am, 's1', OPUS).name, 'a', 'the fixture must start on a');
+  rollWindow(am, 0);
+  assert.equal(serve(am, 's1', OPUS).name, 'b', 'the rollover did not move the pin to b');
+  assert.equal(serve(am, 's1', OPUS).name, 'b', 'the arrival did not settle on b');
+  assert.equal(ref()?.unescaped?.idx, 0, 'the fixture must have held a\'s roll on the pin');
+
+  am.removeAccount(1);
+  assert.equal(ref()?.idx, null, 'the ref the removal left behind still names an account');
+  am.removeAccount(0);
+  assert.equal(ref(), null, 'the ref outlived the one roll that was keeping it');
+});
+
 test('removing an account renumbers a held roll rather than aiming it elsewhere', () => {
   // The held reading names its account by index like every other, so the shift
   // reaches it too: left behind, it would be handed back on the next fail-back to
@@ -1286,6 +2453,55 @@ test('removing an account renumbers a held roll rather than aiming it elsewhere'
   am.removeAccount(0);
   assert.equal(am._currentObs.unescaped, null,
     'the held roll outlived the account it was taken on');
+});
+
+test('removing an account renumbers every roll an observation is holding', () => {
+  // The shift reaches the whole chain, not just its newest link: a hold left
+  // behind names whichever account inherited the slot, and would be handed back
+  // to it on the next fail-back.
+  const am = mgr(['a', 'b', 'c', 'd'], ON);
+  for (const [i, hours] of [[0, 40], [1, 10], [2, 20], [3, 30]]) bucket(am, i, 'unified7d', 0.4, hours);
+  // b has the soonest window, so the opening placement starts there and a sits
+  // out of the way with the furthest one, held by nobody when it is removed.
+  am.selectActiveAccount();
+  assert.equal(serve(am, null, OPUS).name, 'b', 'the fixture must start on b');
+  assert.equal(serve(am, null, OPUS).name, 'b', 'the fixture did not rest on b');
+  rollWindow(am, 1);
+  assert.equal(serve(am, null, OPUS).name, 'c', 'b\'s roll did not preempt');
+  assert.equal(serve(am, null, OPUS).name, 'c', 'the preemption did not settle on c');
+  rollWindow(am, 2);
+  assert.equal(serve(am, null, OPUS).name, 'd', 'c\'s roll did not preempt');
+  assert.equal(serve(am, null, OPUS).name, 'd', 'the second preemption did not settle on d');
+
+  am.removeAccount(0);
+  assert.equal(am.accounts[0].name, 'b', 'the removal did not shift the list down');
+  assert.equal(serve(am, null, OPUS, { exclude: new Set([0, 2]) }).name, 'c',
+    'the forced fail-back did not reach c');
+  assert.equal(am._currentRolledOver(am.accounts[1], OPUS), true,
+    'the newest held roll did not follow c to its new index');
+  assert.equal(serve(am, null, OPUS, { exclude: new Set([1, 2]) }).name, 'b',
+    'the forced fail-back did not reach b');
+  assert.equal(am._currentRolledOver(am.accounts[0], OPUS), true,
+    'the older held roll did not follow b to its new index');
+
+  // Removing an account the chain DOES name: only its own link goes, and every
+  // other escape stands. Above, the removed account was held by nobody.
+  const two = mgr(['a', 'b', 'c'], ON);
+  for (const [i, hours] of [[0, 10], [1, 20], [2, 30]]) bucket(two, i, 'unified7d', 0.4, hours);
+  two.selectActiveAccount();
+  assert.equal(serve(two, null, OPUS).name, 'a', 'the second fixture must start on a');
+  rollWindow(two, 0);
+  assert.equal(serve(two, null, OPUS).name, 'b', 'a\'s roll did not preempt');
+  assert.equal(serve(two, null, OPUS).name, 'b', 'the preemption did not settle on b');
+  rollWindow(two, 1);
+  assert.equal(serve(two, null, OPUS).name, 'c', 'b\'s roll did not preempt');
+  assert.equal(serve(two, null, OPUS).name, 'c', 'the second preemption did not settle on c');
+
+  two.removeAccount(1);
+  assert.equal(serve(two, null, OPUS, { exclude: new Set([1]) }).name, 'a',
+    'the forced fail-back did not reach a');
+  assert.equal(two._currentRolledOver(two.accounts[0], OPUS), true,
+    'removing the account of one escape took the roll of another with it');
 });
 
 test('a destination is measured from the first request that rests on it', () => {

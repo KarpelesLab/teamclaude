@@ -19,7 +19,7 @@
 //   - ACTIVE: a session counts as "active" (and toward per-account load) if it
 //     made a request this recently. Short, so load-balancing reacts to what is
 //     actually running now rather than to sessions merely lingering in the hour.
-import { remapHeld } from './rollover.js';
+import { remapHeld, newObservation } from './rollover.js';
 
 export const SESSION_KNOWN_TTL_MS = 60 * 60 * 1000; // 1h idle → forgotten
 export const SESSION_ACTIVE_TTL_MS = 2 * 60 * 1000; // 2min idle → no longer "active"
@@ -86,11 +86,42 @@ function setAndReturn(map, key, value) {
   return value;
 }
 
+/**
+ * A rollover reading held for the account a preemption pushed traffic off,
+ * until a served request releases it or a fail-back hands it back. One hold per
+ * escaped account, chained newest first, so a second preemption taken before the
+ * first is settled holds both readings.
+ *
+ * @typedef {Object} Hold
+ * @property {number} idx the account the held reading was taken on
+ * @property {Map<string, number>} windows window name to that window's reset, in epoch ms
+ * @property {string|null} provider the fleet whose reading this preserves, null while no walk has moved it
+ * @property {number} gen the stamp of the move that escaped this roll
+ * @property {Hold|null} prev the escape still outstanding behind this one, null at the tail
+ */
+/**
+ * What one sticky choice was last found resting on, and what that account's
+ * windows read then. Shared by the current account and by every session pin,
+ * so both stores answer a roll the same way.
+ *
+ * @typedef {Object} Observation
+ * @property {number|null} idx the account the reading was taken on, null before one is named
+ * @property {Map<string, number>} windows window name to that window's reset, in epoch ms
+ * @property {Hold|null} unescaped the roll this choice was pushed off and has not escaped
+ * @property {number} gen the stamp a confirmation is scoped by
+ * @property {string|null} provider the fleet whose reading this is
+ * @property {Map<string, number>|null} handedBack the account's windows as they stood when a hold handed this reading back, so the roll it was handed back for is not held again; null once the reading moves
+ */
 export class SessionTracker {
+  /**
+   * @param {Object} [opts]
+   * @param {number} [opts.knownTtlMs]
+   * @param {number} [opts.activeTtlMs]
+   * @param {() => number} [opts.now]
+   */
   constructor({ knownTtlMs, activeTtlMs, now } = {}) {
     // id -> { pins: Map<bucketKey, { idx, at }>,
-    //         refs: Map<bucketKey, { idx, windows: Map<window, reset>,
-    //                                unescaped: { idx, windows } | null, gen }>,
+    //         refs: Map<bucketKey, Observation>,
     //         firstSeen, lastSeen, count, inFlight, tokens: Map<bucketKey, ...> }
     this.sessions = new Map();
     this.knownTtlMs = knownTtlMs ?? SESSION_KNOWN_TTL_MS;
@@ -333,12 +364,20 @@ export class SessionTracker {
     return s.pins.get(bucket)?.idx ?? null;
   }
 
-    // The rollover observation this session holds for `bucket`: the account
-    // traffic was last found resting on and what its windows read then. Kept
-    // beside the pin rather than on it because it outlives a relocation — a pin
-    // just moved off an account is not evidence about that account, and the
-    // observation has to still be there when the traffic comes back. It dies
-    // with the session.
+  /**
+   * The rollover observation this session holds for `bucket`: the account
+   * traffic was last found resting on and what its windows read then. Kept
+   * beside the pin rather than on it because it outlives a relocation — a pin
+   * just moved off an account is not evidence about that account, and the
+   * observation has to still be there when the traffic comes back. It dies
+   * with the session.
+   *
+   * @param {string|null} sessionId
+   * @param {string|null} bucket
+   * @param {boolean} [create]
+   * @param {number} [now]
+   * @returns {Observation|null}
+   */
   refsFor(sessionId, bucket, create = false, now = this._now()) {
     sessionId = keyOf(sessionId);
     const s = sessionId && this.sessions.get(sessionId);
@@ -347,8 +386,9 @@ export class SessionTracker {
       this.sessions.delete(sessionId);
       return null;
     }
+    /** @type {Observation|null} */
     let ref = s.refs.get(bucket);
-    if (!ref && create) s.refs.set(bucket, ref = { idx: null, windows: new Map(), unescaped: null, gen: 0 });
+    if (!ref && create) s.refs.set(bucket, ref = newObservation());
     return ref || null;
   }
 
@@ -402,13 +442,22 @@ export class SessionTracker {
         else pin.idx = moved;
       }
       // An observation names its account by the same position, so it follows the
-      // same shift. One naming the account that went away is dropped whole:
-      // left behind, it would be read against whatever inherits the slot.
+      // same shift. One naming the account that went away is dropped only if it
+      // holds nothing. Left behind it would be read against whatever inherits
+      // the slot, but the rolls it holds for OTHER accounts are still owed to
+      // them, so a reading naming nobody carries them until each is handed back.
       for (const [bucket, ref] of [...s.refs]) {
         const moved = ref.idx == null ? null : mapFn(ref.idx);
-        if (ref.idx != null && moved == null) { s.refs.delete(bucket); continue; }
+        const held = remapHeld(ref.unescaped, mapFn);
+        if (moved == null) {
+          // The one factory builds the nameless reading in both stores, so a
+          // field the shape gains cannot miss one. Nothing owed is nothing to keep.
+          if (held) s.refs.set(bucket, { ...newObservation(), unescaped: held });
+          else s.refs.delete(bucket);
+          continue;
+        }
         ref.idx = moved;
-        ref.unescaped = remapHeld(ref.unescaped, mapFn);
+        ref.unescaped = held;
       }
     }
   }
