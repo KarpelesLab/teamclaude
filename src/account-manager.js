@@ -3359,6 +3359,36 @@ export class AccountManager {
     }
   }
 
+  /** Apply a read-only Codex `/wham/usage` reading without counting traffic. */
+  applyCodexUsageData(accountIndex, usage) {
+    const account = this.accounts[accountIndex];
+    if (!account || !usage || usage.error) return;
+    const q = account.quota;
+    if (usage.fiveHour) {
+      q.unified5h = usage.fiveHour.utilization;
+      q.unified5hReset = usage.fiveHour.resetAt ?? null;
+    }
+    if (usage.sevenDay) {
+      q.unified7d = usage.sevenDay.utilization;
+      q.unified7dReset = usage.sevenDay.resetAt ?? null;
+    }
+    if (usage.planType) q.planType = safeLine(usage.planType, 64);
+    if (Array.isArray(usage.modelBuckets)) {
+      q.codexModelBuckets = Object.fromEntries(usage.modelBuckets.slice(0, MAX_CODEX_MODEL_BUCKETS)
+        .filter(bucket => bucket?.slug)
+        .map(bucket => [safeLine(bucket.slug, 64), {
+          name: safeLine(bucket.name || bucket.slug, 64),
+          utilization: bucket.utilization,
+          resetAt: bucket.resetAt ?? null,
+          seenAt: Date.now(),
+        }]));
+    }
+    if (account.probing && q.unified7dReset != null) {
+      account.probing = false;
+      account.requalify = true;
+    }
+  }
+
   /** Apply subscription metadata learned from the OAuth profile endpoint. */
   applyProfileData(accountIndex, profile) {
     const account = this.accounts[accountIndex];
