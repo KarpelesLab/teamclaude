@@ -1,4 +1,5 @@
 import { readFile, open, mkdir, chmod, rename, unlink, realpath } from 'node:fs/promises';
+import { openSync, writeSync, closeSync, readFileSync, statSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
@@ -167,36 +168,114 @@ export async function loadOrCreateConfig() {
   return config;
 }
 
-export async function saveConfig(config) {
-  // The proxy apiKey and every account's tokens live here: see writeJsonAtomic
-  // for why this is not a plain writeFile.
-  await writeJsonAtomic(getConfigPath(), config);
+// Every writer of the config — the server rotating a refresh token, a CLI
+// command, a GUI client — does its own read-modify-write with a temp+rename.
+// Two of them racing keep only the later write, and the edit that is lost is
+// as likely as not a freshly rotated refresh token, which costs a re-login.
+// The lock below is the coordination point. It is advisory and file-based so
+// that clients outside this package can honour it with no shared code:
+//
+//   path     <configPath>.lock
+//   acquire  open(O_CREAT|O_EXCL, 0600), then write {"pid":<pid>,"at":<ms epoch>}
+//   stale    `at` older than 10 s, or the pid no longer alive: unlink and retry
+//   busy     poll every 25 ms for at most 2 s, then write WITHOUT the lock
+//   release  unlink
+//
+// The 2 s cap is deliberate: a writer must never hang on a lock, so contention
+// past it degrades to today's behaviour (a possible lost update) plus one
+// warning line, rather than to a stuck server or CLI.
+const LOCK_STALE_MS = 10_000;
+const LOCK_WAIT_MS = 2_000;
+const LOCK_POLL_MS = 25;
+
+function lockIsStale(lockPath) {
+  let pid, at;
+  try {
+    ({ pid, at } = JSON.parse(readFileSync(lockPath, 'utf8')));
+  } catch (err) {
+    if (err.code === 'ENOENT') return false; // released under us; the retry takes it
+    // Empty or garbled: the holder is between its open and its write, or died
+    // there. Only the file's age can tell those apart.
+    try { return Date.now() - statSync(lockPath).mtimeMs > LOCK_STALE_MS; } catch { return false; }
+  }
+  if (Date.now() - at > LOCK_STALE_MS) return true;
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return false; } catch (err) { return err.code === 'ESRCH'; }
 }
 
-// Serialize config updates. atomicConfigUpdate is a read-modify-write, so two
-// concurrent callers can both read the same config and then save in turn, and
-// the later save silently drops the earlier caller's change. This bites hardest
-// on startup, when several OAuth accounts refresh their tokens at once: only the
-// last writer's rotated refresh token persists, and the other accounts keep a
-// token that was just rotated away, so they fail on the next restart with
-// invalid_grant and need a re-login. Chaining the updates keeps every write.
-let configUpdateChain = Promise.resolve();
+/** True when the lock is ours; false when we gave up and proceed without it. */
+async function acquireConfigLock(lockPath) {
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  for (;;) {
+    try {
+      const fd = openSync(lockPath, 'wx', 0o600);
+      try { writeSync(fd, JSON.stringify({ pid: process.pid, at: Date.now() })); } finally { closeSync(fd); }
+      return true;
+    } catch (err) {
+      if (err.code !== 'EEXIST') {
+        console.error(`[TeamClaude] Cannot create ${lockPath} (${err.code || err.message}); writing the config without it`);
+        return false;
+      }
+    }
+    if (lockIsStale(lockPath)) {
+      await unlink(lockPath).catch(() => {});
+      continue;
+    }
+    if (Date.now() >= deadline) {
+      console.error(`[TeamClaude] ${lockPath} is still held by another process after ${LOCK_WAIT_MS}ms; writing the config without it`);
+      return false;
+    }
+    await new Promise(resolve => setTimeout(resolve, LOCK_POLL_MS));
+  }
+}
+
+// One queue per lock path inside this process: same-process callers (the TUI
+// saving while a token refresh runs) would otherwise spin against their own
+// live lock file for the full 2 s.
+const lockQueues = new Map();
+
+/**
+ * Run `fn` while holding the advisory lock for `configPath` (protocol above).
+ * Same-process callers are queued; other processes are held off by the file.
+ * The lock is released whether `fn` resolves or throws.
+ */
+export function withConfigLock(configPath, fn) {
+  const lockPath = `${configPath}.lock`;
+  const run = async () => {
+    await mkdir(dirname(lockPath), { recursive: true });
+    const held = await acquireConfigLock(lockPath);
+    try {
+      return await fn();
+    } finally {
+      if (held) await unlink(lockPath).catch(() => {});
+    }
+  };
+  const prev = lockQueues.get(lockPath) || Promise.resolve();
+  const result = prev.then(run, run);
+  lockQueues.set(lockPath, result.then(() => {}, () => {}));
+  return result;
+}
+
+export async function saveConfig(config) {
+  const path = getConfigPath();
+  // The proxy apiKey and every account's tokens live here: see writeJsonAtomic
+  // for why this is not a plain writeFile.
+  await withConfigLock(path, () => writeJsonAtomic(path, config));
+}
 
 /**
  * Atomically update the config: re-reads from disk, calls updater(config),
  * then saves. Returns the updated config. This prevents overwriting changes
  * made by other processes (e.g. `teamclaude import` while the server runs), and
- * serializes concurrent callers so simultaneous updates queue instead of
- * clobbering one another.
+ * holds the config lock across the read and the write so a concurrent writer —
+ * in this process or another — waits its turn instead of clobbering the update.
  */
 export function atomicConfigUpdate(updater) {
-  const run = async () => {
+  const path = getConfigPath();
+  return withConfigLock(path, async () => {
     const config = await loadConfig() || createDefaultConfig();
     await updater(config);
-    await saveConfig(config);
+    await writeJsonAtomic(path, config);
     return config;
-  };
-  const result = configUpdateChain.then(run, run);
-  configUpdateChain = result.then(() => {}, () => {});
-  return result;
+  });
 }

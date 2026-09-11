@@ -56,7 +56,10 @@ async function quietly(fn) {
 // A client that announces a body, sends part of it, and hangs up. This is what
 // Ctrl+C in Claude Code does to a request that is still uploading, and it makes
 // the server's `for await (const chunk of req)` reject above the inner try.
-function abortMidBody(port) {
+// The hang-up waits for `opened` — the server's onRequestStart — rather than a
+// timer: destroying on a timer races the header parse under load, and a request
+// the server never opened says nothing about how it closes entries.
+function abortMidBody(port, opened) {
   return new Promise((resolve) => {
     const req = http.request({
       host: '127.0.0.1', port, method: 'POST', path: '/v1/messages',
@@ -64,23 +67,31 @@ function abortMidBody(port) {
     });
     req.on('error', () => {});
     req.write(BODY.slice(0, 24));
-    setTimeout(() => { req.destroy(); resolve(); }, 50);
+    opened.then(() => { req.destroy(); resolve(); });
   });
+}
+
+// Poll `cond` until it holds or `ms` elapse; the caller asserts afterwards.
+async function until(cond, ms = 5000) {
+  const deadline = Date.now() + ms;
+  while (!cond() && Date.now() < deadline) await new Promise(r => setTimeout(r, 10));
 }
 
 test('a request aborted mid-body closes its activity entry', async () => {
   const am = new AccountManager(ACCTS, 0.98);
   const started = [];
   const ended = [];
+  let markOpened;
+  const opened = new Promise(resolve => { markOpened = resolve; });
   const proxy = createProxyServer(am, NO_UPSTREAM, {
-    onRequestStart: (id) => started.push(id),
+    onRequestStart: (id) => { started.push(id); markOpened(); },
     onRequestEnd: (id, info) => ended.push({ id, status: info.status }),
   });
   const port = await listen(proxy);
   try {
     await quietly(async () => {
-      await abortMidBody(port);
-      await new Promise(r => setTimeout(r, 200));   // let the server-side rejection land
+      await abortMidBody(port, opened);
+      await until(() => ended.length >= started.length);   // let the server-side rejection land
     });
   } finally {
     proxy.close();
