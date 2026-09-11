@@ -504,7 +504,12 @@ export class AccountManager {
    */
   _setCurrent(account) {
     this.currentIndex = account.index;
-    this.providerCursors.set(providerOf(account), account.index);
+    // A move made by an operator or a poll names the provider cursor of the
+    // account it lands on. A move inside a selection walk does not: the walk
+    // records where it left the slot once it is done (see getActiveAccount),
+    // and a borrowed walk that picks a shared API key — which reads as the
+    // default provider — would otherwise overwrite the OWNER's cursor here.
+    if (this._selectingProvider == null) this.providerCursors.set(providerOf(account), account.index);
     if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) return;
     this._firstSightOn(this._currentObs ??= newObservation(), account);
   }
@@ -659,8 +664,10 @@ export class AccountManager {
     // one provider that is a single slot for several fleets, so a request whose
     // provider does not own it borrows the slot for the walk and hands it back.
     //
-    // With one provider — every config that predates #246 — `borrowed` is always
-    // false and this is the same code it was.
+    // With one provider `borrowed` is always false, so the `providerCursors`
+    // entry this method writes has no reader at all. Its one reader is the
+    // `providerCursors.get(provider)` inside `if (borrowed)`, which only a
+    // borrowed walk reaches.
     const owner = providerOf(this.accounts[this.currentIndex]);
     const borrowed = !!this.accounts.length && owner !== provider;
     const saved = this.currentIndex;
@@ -670,6 +677,7 @@ export class AccountManager {
     }
 
     let account;
+    let walked;
     // Scoped rather than threaded through _select/_selectNext/_divertedFor: the
     // whole walk is synchronous, so nothing can interleave and observe it, and
     // the alternative is a provider argument on six private methods that exist
@@ -686,6 +694,7 @@ export class AccountManager {
     } finally {
       this._selectingProvider = null;
       this._selectionDecision = null;
+      walked = this.currentIndex;
       // Hand the slot back before anything can observe it moved. Only the
       // provider that owns currentIndex gets to change it.
       if (borrowed) this.currentIndex = saved;
@@ -697,7 +706,16 @@ export class AccountManager {
     // the next real failover unpaced.
     if (account) {
       this.routeCursors.set(this._cursorKey(model, advisorModel, provider), account.index);
-      this.providerCursors.set(provider, account.index);
+      // `walked` names where this walk left the shared slot, captured in the
+      // `finally` while it still held it. When it names one of this provider's
+      // own accounts — including a borrow that re-seeded and then held its
+      // slot — the cursor takes it. Which one it names turns on where the walk
+      // left the slot, not on what it picked. Either way the fallback is the
+      // account that served — and when that account is another provider's, as
+      // a shared key is, this provider records nothing rather than a cursor
+      // its own re-seed would refuse.
+      const rest = providerOf(this.accounts[walked]) === provider ? walked : account.index;
+      if (providerOf(this.accounts[rest]) === provider) this.providerCursors.set(provider, rest);
     }
     return account;
   }
