@@ -13,7 +13,8 @@
   "scripts": {
     "start": "node src/index.js",
     "test": "node --test --test-timeout=120000",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "typecheck": "tsc -p tsconfig.json"
   },
   "keywords": [
     "claude",
@@ -43,6 +44,8 @@
     "node": ">=20.0.0"
   },
   "devDependencies": {
-    "eslint": "^9.0.0"
+    "@types/node": "20.19.43",
+    "eslint": "^9.0.0",
+    "typescript": "5.9.2"
   }
 }

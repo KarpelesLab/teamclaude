@@ -262,6 +262,23 @@ function sampleModelFor(route) {
 }
 
 export class AccountManager {
+  /**
+   * @param {Array<Object>} accounts  config entries, credentials resolved
+   * @param {number|Object<string, number>} [switchThreshold]  one number, or per bucket with a `default`
+   * @param {Object} [opts]
+   * @param {Function} [opts.refreshFn]
+   * @param {Function} [opts.codexRefreshFn]
+   * @param {number} [opts.throttleProbeFloorMs]
+   * @param {number} [opts.familyStaleMs]
+   * @param {number} [opts.statusStaleMs]
+   * @param {number} [opts.forcedRefreshFloorMs]
+   * @param {Array<Object>} [opts.routes]
+   * @param {Object} [opts.ramp]
+   * @param {boolean|string} [opts.distributeSessions]
+   * @param {Object} [opts.adaptive]
+   * @param {Object} [opts.sessionTracker]
+   * @param {Object} [opts.expiryRouting]
+   */
   constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting } = {}) {
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;

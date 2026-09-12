@@ -190,6 +190,16 @@ let rootWarned = false;
  * from the network — the operator can run `teamclaude update` deliberately.
  *
  * `root`, `uid`, `check`, `kind` and `install` are injectable for tests.
+ *
+ * @param {Object} [opts]
+ * @param {{ autoUpdate?: boolean }} [opts.config]
+ * @param {boolean} [opts.force]
+ * @param {(line: string) => void} [opts.log]
+ * @param {string} [opts.root]
+ * @param {number|undefined} [opts.uid]
+ * @param {Function} [opts.check]
+ * @param {Function} [opts.kind]
+ * @param {Function} [opts.install]
  */
 export async function autoUpdate({
   config = {}, force = false, log = console.error,

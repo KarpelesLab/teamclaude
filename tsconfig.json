@@ -1,0 +1,21 @@
+{
+  // `npm run typecheck`: TypeScript's checker over the plain-JS sources, driven
+  // by the JSDoc already in them. Nothing is compiled and no .ts file exists;
+  // this only reads. Non-strict on purpose for now — strict mode reports about
+  // two thousand implicit-any diagnostics on this tree — so what it catches is
+  // drift between a signature and its callers, a misspelled option, a property
+  // read off the wrong shape. Widening towards `strict` is the intended
+  // direction; each notch should land with the annotations that make it green.
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": true,
+    "noEmit": true,
+    "target": "es2022",
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "strict": false,
+    "skipLibCheck": true,
+    "types": ["node"]
+  },
+  "include": ["src/**/*.js"]
+}

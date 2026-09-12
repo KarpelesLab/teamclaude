@@ -209,11 +209,12 @@ export class Prober {
     const reading = await this.backendFn(account, { timeoutMs: this.timeoutMs })
       .catch(err => ({ error: err?.message || String(err) }));
     const finishedAt = Date.now();
-    const failed = !reading || reading.error;
+    const failure = reading && 'error' in reading ? reading.error : null;
+    const failed = !reading || !!failure;
     if (!failed) this.am.applyBackendQuota(account.index, reading);
     this._recordAccount(account, {
       status: failed ? 'error' : 'ok',
-      error: failed ? (reading?.error || 'no reading') : null,
+      error: failed ? (failure || 'no reading') : null,
       startedAt, finishedAt, durationMs: finishedAt - startedAt,
     });
   }

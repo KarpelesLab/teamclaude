@@ -1198,6 +1198,7 @@ export class TUI {
         name = `account-${n}`;
       }
 
+      /** @type {Object<string, any>} */
       const entry = {
         name, type: 'oauth', source: 'import',
         ...oauthIdentityFields(profile),

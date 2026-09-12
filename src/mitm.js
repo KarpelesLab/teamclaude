@@ -24,6 +24,7 @@ import { createProxyRequestListener, resolveClientAuth, loopbackExempt, relayUpg
 import { interceptHostsFor, isNeverIntercepted } from './provider.js';
 import { forwardRefusal, guardedLookup, FORBIDDEN_FORWARD } from './forward-target.js';
 import { safeLine } from './safe-text.js';
+/** @typedef {import('./types.js').CodedError} CodedError */
 
 const CA_CERT = 'teamclaude-ca.pem';
 const LEAF_CERT = 'teamclaude-leaf.pem';
@@ -191,7 +192,17 @@ export function upgradeUpstreamFor(hostHeader, config, upstream) {
 /**
  * Build a `connect` event handler implementing the terminating MITM described at
  * the top of this file.
- * @param ensureLeaf async () => { key, cert }   // current leaf PEMs
+ * @param {Object} opts
+ * @param {Object} opts.config
+ * @param {Object} opts.accountManager
+ * @param {() => Promise<{ key: string, cert: string }>} opts.ensureLeaf  current leaf PEMs
+ * @param {string|null} [opts.logDir]
+ * @param {Object} [opts.hooks]
+ * @param {(line: string) => void} [opts.log]
+ * @param {Object|null} [opts.sx]
+ * @param {Object|null} [opts.egress]
+ * @param {Object|null} [opts.clientUsage]
+ * @param {Object|null} [opts.dimensionUsage]
  */
 export function createConnectHandler({ config, accountManager, ensureLeaf, logDir = null, hooks = {}, log = () => {}, sx = null, egress = null, clientUsage = null, dimensionUsage = null }) {
   const upstream = config.upstream || 'https://api.anthropic.com';
@@ -364,7 +375,7 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
         if (head && head.length) up.write(head);
         up.pipe(clientSocket); clientSocket.pipe(up);
       });
-      up.on('error', (err) => {
+      up.on('error', (/** @type {CodedError} */ err) => {
         if (err.code === FORBIDDEN_FORWARD) {
           log(`[TeamClaude] CONNECT ${host}:${port} refused: ${err.message}`);
           teardown('403 Forbidden');

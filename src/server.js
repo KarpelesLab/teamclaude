@@ -20,6 +20,7 @@ import { forwardRefusal, guardedLookup, FORBIDDEN_FORWARD } from './forward-targ
 import { renderDashboardHtml, dashboardCsp } from './dashboard.js';
 import { createUsageRecorder, resolveUsageDimensions, usageDimensionHeaderNames } from './client-usage.js';
 import { classificationPath } from './classification-path.js';
+/** @typedef {import('./types.js').CodedError} CodedError */
 
 
 export const HOP_BY_HOP_HEADERS = new Set([
@@ -537,7 +538,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         // line, so the 401 alone leaves an operator with a channel that is
         // silently dead — the same shape as the outage this gate could cause if
         // a client turns out not to send the key.
-        console.log(`[TeamClaude] WebSocket upgrade refused (no proxy key) from ${safeLine(socket?.remoteAddress || 'unknown')} for ${safeLine(req.url)}`);
+        console.log(`[TeamClaude] WebSocket upgrade refused (no proxy key) from ${safeLine(/** @type {import('node:net').Socket} */ (socket)?.remoteAddress || 'unknown')} for ${safeLine(req.url)}`);
         try { socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n'); } catch { /* already gone */ }
         socket.destroy();
         return;
@@ -747,6 +748,7 @@ export function relayHttpForward(req, res) {
   if (refused) { refuse(refused); return; }
 
   const transport = target.protocol === 'http:' ? http : https;
+  /** @type {import('node:http').OutgoingHttpHeaders} */
   const headers = {};
   for (const [key, value] of Object.entries(req.headers)) {
     const lk = key.toLowerCase();
@@ -764,7 +766,7 @@ export function relayHttpForward(req, res) {
     res.writeHead(upstreamRes.statusCode, responseHeaders);
     upstreamRes.pipe(res);
   });
-  upstreamReq.on('error', (err) => {
+  upstreamReq.on('error', (/** @type {CodedError} */ err) => {
     if (err.code === FORBIDDEN_FORWARD) { refuse(err.message); return; }
     console.error(`[TeamClaude] HTTP forward to ${target.host} failed:`, describeConnectError(err));
     if (!res.headersSent) {
@@ -815,6 +817,21 @@ export function clientSessionId(headers) {
  * the MITM's terminating h2/h1 server, so both get identical buffering, model-
  * aware routing, and retry-on-quota behavior. Control endpoints (status/reload)
  * and the proxy-API-key gate live in the base server's wrapper, not here.
+ */
+/**
+ * @param {Object} opts
+ * @param {Object} opts.accountManager
+ * @param {string} opts.upstream
+ * @param {string|null} [opts.logDir]
+ * @param {Object} [opts.hooks]  activity callbacks (onRequestStart, onRequestEnd, ...), all optional
+ * @param {Object|null} [opts.sx]
+ * @param {number} [opts.holdMs]
+ * @param {Object} [opts.config]  the live config object; read per request, never copied
+ * @param {string|null} [opts.forcedPin]
+ * @param {Object|null} [opts.egress]
+ * @param {Object|null} [opts.clientUsage]
+ * @param {string|null} [opts.forcedClient]
+ * @param {Object|null} [opts.dimensionUsage]
  */
 export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null, egress = null, clientUsage = null, forcedClient = null, dimensionUsage = null }) {
   let counter = 0;
@@ -1226,7 +1243,7 @@ function recordEarlyOutcome(accountManager, sessionId, url, usable) {
 // wait in forwardRequest either resolves to a clientGone check or rejects with
 // this, and the catch recognises it by code.
 function clientGoneError() {
-  const err = new Error('client disconnected');
+  const err = /** @type {CodedError} */ (new Error('client disconnected'));
   err.code = 'TEAMCLAUDE_CLIENT_GONE';
   return err;
 }
@@ -1276,7 +1293,7 @@ function sxAgent(sx, targetHost) {
   agent.createConnection = (_options, cb) => {
     tunnelTls({ proxy, targetHost, targetPort: 443, tlsOptions: sx.tlsOptions || {} })
       .then((sock) => cb(null, sock))
-      .catch((err) => cb(err));
+      .catch((err) => cb(err, null));
     return undefined;
   };
   return agent;
@@ -1292,6 +1309,7 @@ function sxAgent(sx, targetHost) {
  */
 function relayStream(req, res, upstream, sx) {
   const target = new URL(`${upstream}${req.url}`);
+  /** @type {import('node:http').OutgoingHttpHeaders} */
   const headers = {};
   for (const [key, value] of Object.entries(req.headers)) {
     const lk = key.toLowerCase();
@@ -1442,6 +1460,7 @@ export function relayUpgrade(req, socket, head, upstream, sx, { client = null, c
   // accepts: a handshake it refuses opened nothing.
   const tag = client ? `[${safeLine(client, 64)}] ` : '';
   const path = safeLine(req.url);
+  /** @type {import('node:http').OutgoingHttpHeaders} */
   const headers = {};
   for (const [key, value] of Object.entries(req.headers)) {
     const lk = key.toLowerCase();
@@ -1455,7 +1474,10 @@ export function relayUpgrade(req, socket, head, upstream, sx, { client = null, c
 
   const useProxy = !!(sx?.useByDefault() && sx.isProvisioned());
   const agent = useProxy ? sxAgent(sx, target.hostname) : undefined;
-  const transport = target.protocol === 'http:' ? http : https;
+  // One module's signature stands for both: the options this call passes are
+  // the same for http and https, and a union of the two `request` overload sets
+  // is not callable as such.
+  const transport = /** @type {typeof https} */ (target.protocol === 'http:' ? http : https);
 
   const upstreamReq = transport.request(target, { method: req.method, headers, agent });
 
@@ -2100,6 +2122,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   }
 
   // Build upstream request headers
+  /** @type {import('node:http').OutgoingHttpHeaders} */
   const headers = {};
   for (const [key, value] of Object.entries(req.headers)) {
     const lk = key.toLowerCase();
@@ -2152,8 +2175,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     if (!l || reqLogged) return;
     reqLogged = true;
     const safeHeaders = { ...headers };
-    if (safeHeaders['x-api-key']) safeHeaders['x-api-key'] = safeHeaders['x-api-key'].slice(0, 15) + '...';
-    if (safeHeaders['authorization']) safeHeaders['authorization'] = safeHeaders['authorization'].slice(0, 20) + '...';
+    if (safeHeaders['x-api-key']) safeHeaders['x-api-key'] = String(safeHeaders['x-api-key']).slice(0, 15) + '...';
+    if (safeHeaders['authorization']) safeHeaders['authorization'] = String(safeHeaders['authorization']).slice(0, 20) + '...';
     l.write(`=== REQUEST (account: ${account.name}, retry: ${retryCount}) ===\n${method} ${upstreamUrl}\n${formatHeaders(safeHeaders)}`);
     // The body that went upstream, not the one the client sent: they differ
     // exactly when the proxy rewrote it (tool-pair sanitising, account_uuid,
@@ -2691,7 +2714,7 @@ export function readWithIdleTimeout(reader, ms) {
   let timer;
   const timeout = new Promise((_, reject) => {
     timer = setTimeout(() => {
-      const err = new Error(`upstream stream idle for ${ms}ms`);
+      const err = /** @type {CodedError} */ (new Error(`upstream stream idle for ${ms}ms`));
       err.code = 'TEAMCLAUDE_BODY_TIMEOUT';
       reject(err);
     }, ms);

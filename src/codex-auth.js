@@ -17,6 +17,7 @@ import { exec } from 'node:child_process';
 import http from 'node:http';
 import { proxyFetch } from './upstream-fetch.js';
 import { tokenPairFromResponse } from './oauth.js';
+/** @typedef {import('./types.js').CodedError} CodedError */
 
 export const DEFAULT_CODEX_CREDENTIALS_PATH = '~/.codex/auth.json';
 
@@ -98,7 +99,7 @@ export async function refreshCodexToken(refreshToken, endpoint = TOKEN_ENDPOINT)
 
   if (!res.ok) {
     const text = await res.text();
-    const err = new Error(`Codex token refresh failed (${res.status}): ${text}`);
+    const err = /** @type {CodedError} */ (new Error(`Codex token refresh failed (${res.status}): ${text}`));
     // Surfaced so callers can tell a dead refresh token (re-login needed) from
     // a transient server error, exactly as the Anthropic path does.
     err.status = res.status;
@@ -238,7 +239,7 @@ export async function loginCodex({ noBrowser = false, timeoutMs = 120_000 } = {}
   const code = await new Promise((resolve, reject) => {
     server = http.createServer(codexCallbackHandler(state, { resolve, reject }));
 
-    server.on('error', (e) => reject(e.code === 'EADDRINUSE'
+    server.on('error', (/** @type {CodedError} */ e) => reject(e.code === 'EADDRINUSE'
       ? new Error(`Port ${CALLBACK_PORT} is in use. OpenAI only accepts ${REDIRECT_URI} for this client, so close whatever holds it (a running \`codex login\`) and retry.`)
       : e));
 

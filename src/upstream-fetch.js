@@ -15,6 +15,7 @@ import { ReadableStream } from 'node:stream/web';
 import { tunnelTls } from './sx.js';
 import { proxyForHost, proxyAgent } from './upstream-proxy.js';
 import { AdmissionGate, DEFAULT_MAX_QUEUE, DEFAULT_QUEUE_TIMEOUT_MS } from './admission-gate.js';
+/** @typedef {import('./types.js').CodedError} CodedError */
 
 // Pooled keep-alive agents for the direct (non-sx) path. Node's global fetch
 // multiplexes ALL requests to an origin over a SINGLE HTTP/2 connection; under
@@ -111,7 +112,7 @@ function resolveHeadersTimeout(perCall) {
 }
 
 function headersTimeoutError(ms) {
-  const err = new Error(`upstream response headers timed out after ${ms}ms`);
+  const err = /** @type {CodedError} */ (new Error(`upstream response headers timed out after ${ms}ms`));
   // Recognized by server.js isTransient → fail fast + let the client retry, so
   // Node's fetch pool evicts the stale connection instead of wedging.
   err.code = 'TEAMCLAUDE_HEADERS_TIMEOUT';
@@ -208,7 +209,7 @@ function proxiedFetch(url, opts, sx, timeoutMs) {
     // tests inject a CA here to reach a self-signed upstream.
     tunnelTls({ proxy, targetHost: u.hostname, targetPort: Number(u.port) || 443, tlsOptions: sx.tlsOptions || {} })
       .then((sock) => cb(null, sock))
-      .catch((err) => cb(err));
+      .catch((err) => cb(err, null));
     return undefined; // socket delivered asynchronously via cb
   };
   return nodeRequest(u, opts, timeoutMs, { transport: https, agent });
@@ -234,7 +235,7 @@ async function nodeRequest(u, opts, timeoutMs, { transport, agent }) {
   if (!admitted) {
     forget();
     if (opts.signal?.aborted) throw opts.signal.reason ?? new Error('aborted');
-    const err = new Error(`upstream admission queue for ${u.origin} is full or its wait deadline passed`);
+    const err = /** @type {CodedError} */ (new Error(`upstream admission queue for ${u.origin} is full or its wait deadline passed`));
     err.code = 'TEAMCLAUDE_UPSTREAM_OVERLOADED';
     throw err;
   }
