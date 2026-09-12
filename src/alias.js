@@ -21,6 +21,8 @@ const MARKER = '# teamclaude alias';
  * it over. Writing the rc file in place left a truncated .bashrc behind a crash
  * or a full disk, and a truncated .bashrc breaks every new shell. The existing
  * mode is carried over, so a 0600 rc file stays 0600.
+ * @param {string} path
+ * @param {string} text
  */
 function writeFileAtomic(path, text) {
   let mode = null;
@@ -41,7 +43,11 @@ export function detectShell() {
   return (process.env.SHELL || '').split('/').pop() || 'bash';
 }
 
-/** Whether a bare command resolves on the current $PATH. */
+/**
+ * Whether a bare command resolves on the current $PATH.
+ *
+ * @param {string} cmd
+ */
 function commandOnPath(cmd) {
   for (const dir of (process.env.PATH || '').split(':')) {
     if (dir && existsSync(join(dir, cmd))) return true;
@@ -151,6 +157,9 @@ export function uninstallAlias({ shell = detectShell(), rcPath = rcPathForShell(
   console.log(`Removed alias from ${rcPath}`);
 }
 
+/**
+ * @param {string} s
+ */
 function escapeRe(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }

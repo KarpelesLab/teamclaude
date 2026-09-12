@@ -6,6 +6,9 @@ import { ensureAccountIds } from './account-id.js';
  * Sync accounts from disk config: add new accounts and refresh credentials
  * for existing ones (handles re-imported OAuth tokens, rotated API keys, etc.).
  * Returns the number of new accounts added.
+ * @param {Record<string, any>} diskConfig
+ * @param {Record<string, any>} memConfig
+ * @param {import('./account-manager.js').AccountManager} accountManager
  */
 export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
   let added = 0;
@@ -14,7 +17,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
   // same-person/different-org entries pair correctly instead of all matching the
   // first one with that accountUuid.
   const claimed = new Set();
-  const claim = (diskAcct) => {
+  const claim = (/** @type {Record<string, any>} */ diskAcct) => {
     for (let i = 0; i < accountManager.accounts.length; i++) {
       if (!claimed.has(i) && sameIdentity(accountManager.accounts[i], diskAcct)) {
         claimed.add(i);
@@ -30,7 +33,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
   // its entries never receive the org backfill below, so a first-match scan
   // pairs an unorged entry with whichever same-uuid disk entry comes first.
   const cfgClaimed = new Set();
-  const claimConfig = (diskAcct) => {
+  const claimConfig = (/** @type {Record<string, any>} */ diskAcct) => {
     for (let i = 0; i < memConfig.accounts.length; i++) {
       if (!cfgClaimed.has(i) && sameIdentity(memConfig.accounts[i], diskAcct)) {
         cfgClaimed.add(i);
@@ -84,7 +87,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     // account (e.g. after disk-side org disambiguation or a `priority` change).
     if (diskAcct.orgUuid && !mgr.orgUuid) mgr.orgUuid = diskAcct.orgUuid;
     if (diskAcct.orgName && !mgr.orgName) mgr.orgName = diskAcct.orgName;
-    for (const field of ['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro']) {
+    for (const field of /** @type {const} */ (['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro'])) {
       if (diskAcct[field] != null) mgr[field] = diskAcct[field];
     }
     if (diskAcct.name && mgr.name !== diskAcct.name) mgr.name = diskAcct.name;
@@ -116,12 +119,13 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     if (mgr.disabled !== wantDisabled) accountManager.setDisabled(mgr.index, wantDisabled);
 
     // Existing account — resolve fresh credentials from disk
+    /** @type {{ accessToken?: string, refreshToken?: string, expiresAt?: number, apiKey?: string }|null} */
     let freshCred = null;
     if (diskAcct.type === 'oauth' && diskAcct.importFrom) {
       try {
         const creds = await importCredentials(diskAcct.importFrom);
         freshCred = { accessToken: creds.accessToken, refreshToken: creds.refreshToken, expiresAt: creds.expiresAt };
-      } catch (err) {
+      } catch (/** @type {any} */ err) {
         console.error(`[TeamClaude] Re-import failed for "${diskAcct.name}": ${err.message}`);
       }
     } else if (diskAcct.type === 'oauth' && diskAcct.accessToken) {

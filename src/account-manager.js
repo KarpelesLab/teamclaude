@@ -2476,7 +2476,10 @@ export class AccountManager {
     console.log(`[TeamClaude] Account "${account.name}" rolled over its ${window} window ${this._heldRolloverReason(reason)}`);
   }
 
-  /** The half of the held-rollover line that says which of the two cases it is. */
+  /**
+   * The half of the held-rollover line that says which of the two cases it is.
+   * @param {'none-eligible'|'ranks-best'} reason
+   */
   _heldRolloverReason(reason) {
     switch (reason) {
       case 'none-eligible': return 'but no eligible account can take that traffic — still routing there';
@@ -3736,6 +3739,8 @@ export class AccountManager {
 
   /**
    * Update a specific account's OAuth tokens (e.g. after intercepting a token refresh).
+   * @param {number} accountIndex
+   * @param {{ accessToken?: string, refreshToken?: string, expiresAt?: number }} tokens
    */
   updateAccountTokens(accountIndex, { accessToken, refreshToken, expiresAt }) {
     const account = this.accounts[accountIndex];

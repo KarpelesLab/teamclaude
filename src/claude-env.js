@@ -4,10 +4,16 @@
 // statements for `eval "$(teamclaude env)"` — a name like "work (Acme)" would be
 // a shell syntax error. Clients percent-decode userinfo before using it
 // (verified against Claude Code 2.1.220), so the extra escaping is transparent.
+/**
+ * @param {string} s
+ */
 export function encodePinComponent(s) {
   return encodeURIComponent(s).replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
 }
 
+/**
+ * @param {unknown} value
+ */
 function shellQuote(value) {
   return `'${String(value).replaceAll("'", "'\"'\"'")}'`;
 }
@@ -16,6 +22,7 @@ function shellQuote(value) {
  * `port` as a number in 1..65535, or a throw. Strict on purpose: parseInt alone
  * would turn "3456; touch /tmp/x" into 3456 and hide the bad config value that
  * would otherwise have been eval'd.
+ * @param {unknown} port
  */
 export function validPort(port) {
   const text = String(port ?? '').trim();
@@ -32,7 +39,11 @@ export function validPort(port) {
 // its own dev server.
 export const LOOPBACK_NO_PROXY = ['localhost', '127.0.0.1', '::1'];
 
-/** True if `value` names `*` — "proxy nothing" — among its entries. */
+/**
+ * True if `value` names `*` — "proxy nothing" — among its entries.
+ *
+ * @param {unknown} value
+ */
 export function bypassesAllHosts(value) {
   return String(value ?? '').split(',').some((entry) => entry.trim() === '*');
 }
@@ -50,6 +61,7 @@ export function bypassesAllHosts(value) {
  * `*` is the one entry dropped: it routes every host around the proxy,
  * api.anthropic.com included, which silently turns the launch into a direct run
  * — no rotation, the operator's own quota. `--no-mitm` is how that is asked for.
+ * @param {...(string|null|undefined)} inherited
  */
 export function mergeNoProxy(...inherited) {
   const seen = new Set();
@@ -87,6 +99,16 @@ export function mergeNoProxy(...inherited) {
 // `/tc-acct/` prefix. TC_ACCT itself is then unset, so the pin does not leak
 // into claude or anything it spawns — same reasoning as `run` deleting it from
 // the child environment.
+/**
+ * @param {Object} opts
+ * @param {unknown} opts.port
+ * @param {boolean} [opts.useMitm]
+ * @param {string|null} [opts.caPath]
+ * @param {number} [opts.holdSeconds]
+ * @param {string|null} [opts.account]
+ * @param {string} [opts.proxyApiKey]
+ * @param {string|null} [opts.inheritedNoProxy]
+ */
 export function buildClaudeEnvLines({ port, useMitm = true, caPath = null, holdSeconds = 0, account = null, proxyApiKey = '', inheritedNoProxy = null }) {
   const lines = [];
   const pin = (account || '').trim();

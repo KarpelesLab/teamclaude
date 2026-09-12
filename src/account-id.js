@@ -40,6 +40,7 @@ export function mintAccountId() {
  * copies its id along with it, and two entries answering to one id collapse
  * onto whichever comes first — the later one would be handed the earlier one's
  * credential, which is the crossing this field exists to prevent.
+ * @param {Array<Record<string, any>>} accounts
  */
 export function ensureAccountIds(accounts) {
   const seen = new Set();

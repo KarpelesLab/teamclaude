@@ -37,6 +37,10 @@ const TOOL_RESULT_MARKER = Buffer.from('"tool_result"');
 
 // Is this a JSON /v1/messages (or /v1/messages/count_tokens) request we can
 // reason about? Everything else (token refreshes, GETs, non-JSON) is left alone.
+/**
+ * @param {unknown} url
+ * @param {string|undefined} contentType
+ */
 function isMessagesRequest(url, contentType) {
   if (typeof url !== 'string' || !url.includes(MESSAGES_PATH)) return false;
   if (contentType && !/json/i.test(contentType)) return false;
@@ -44,6 +48,9 @@ function isMessagesRequest(url, contentType) {
 }
 
 // Ids of the tool_use blocks in a message (empty for a non-array / absent message).
+/**
+ * @param {any} msg
+ */
 function toolUseIds(msg) {
   const ids = new Set();
   if (msg && Array.isArray(msg.content)) {
@@ -55,6 +62,9 @@ function toolUseIds(msg) {
 }
 
 // tool_use_ids referenced by the tool_result blocks in a message.
+/**
+ * @param {any} msg
+ */
 function toolResultIds(msg) {
   const ids = new Set();
   if (msg && Array.isArray(msg.content)) {
@@ -69,6 +79,9 @@ function toolResultIds(msg) {
 // merged losslessly. Anthropic accepts a single-text-block array as equivalent
 // to a plain string, so this never changes meaning. Returns null for shapes we
 // don't recognize (caller then declines to merge rather than risk corruption).
+/**
+ * @param {any} content
+ */
 function toBlocks(content) {
   if (Array.isArray(content)) return content;
   if (typeof content === 'string') return [{ type: 'text', text: content }];
@@ -79,7 +92,11 @@ function toBlocks(content) {
 // (a user turn that held only an orphaned tool_result is removed, leaving the
 // assistant turns on either side touching). Anthropic requires roles to alternate,
 // so coalesce same-role neighbors by concatenating their content.
+/**
+ * @param {any[]} messages
+ */
 function coalesceSameRole(messages) {
+  /** @type {any[]} */
   const out = [];
   for (const msg of messages) {
     const prev = out[out.length - 1];
@@ -100,6 +117,9 @@ function coalesceSameRole(messages) {
 // message it empties, and (only when it dropped something) coalesces same-role
 // neighbors so roles still alternate. Returns the possibly-new array plus whether
 // it changed anything. Mutates the `content` arrays of the (already-cloned) input.
+/**
+ * @param {any[]} messages
+ */
 function pruneOnce(messages) {
   let changed = false;
 
@@ -147,6 +167,9 @@ function pruneOnce(messages) {
 // expose a new positional orphan (the cascade), so one pass is not enough. Each
 // pass only removes, so this terminates. Returns the new array, or null if the
 // body was already valid (so the caller can forward the original bytes untouched).
+/**
+ * @param {any[]} messages
+ */
 function pruneOrphans(messages) {
   let current = messages;
   let everChanged = false;
