@@ -18,6 +18,7 @@ export class AdmissionGate {
     this.queue = [];
   }
 
+  /** @param {{ signal?: AbortSignal, timeoutMs?: number }} [opts] */
   enter({ signal, timeoutMs = DEFAULT_QUEUE_TIMEOUT_MS } = {}) {
     if (signal?.aborted) return Promise.resolve(false);
     if (this.active < this.limit) {

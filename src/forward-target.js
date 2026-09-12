@@ -24,6 +24,7 @@
 
 import dns from 'node:dns';
 import net from 'node:net';
+/** @typedef {import('./types.js').CodedError} CodedError */
 
 /** Error code carried by a lookup refused by this policy. */
 export const FORBIDDEN_FORWARD = 'EFORBIDDENFORWARD';
@@ -171,7 +172,7 @@ export function guardedLookup(socket, { lookup = dns.lookup } = {}) {
       for (const { address } of list) {
         const why = forwardRefusal(hostname, address, socket);
         if (why) {
-          const e = new Error(`forward to ${hostname} refused: ${why}`);
+          const e = /** @type {CodedError} */ (new Error(`forward to ${hostname} refused: ${why}`));
           e.code = FORBIDDEN_FORWARD;
           return callback(e);
         }

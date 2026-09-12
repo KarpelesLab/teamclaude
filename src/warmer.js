@@ -29,6 +29,22 @@ import {
 const SCHEDULE_TIMER_GRACE_MS = 60_000;
 
 export class Warmer {
+  /**
+   * @param {Object} accountManager
+   * @param {Object} opts
+   * @param {number} [opts.intervalMs]
+   * @param {Object|null} [opts.schedule]
+   * @param {number} [opts.port]
+   * @param {string|null} [opts.apiKey]
+   * @param {string} [opts.model]
+   * @param {string} [opts.prompt]
+   * @param {Function} [opts.spawnFn]
+   * @param {number} [opts.timeoutMs]
+   * @param {Function} [opts.log]
+   * @param {Function} [opts.nowFn]
+   * @param {Function} [opts.setTimeoutFn]
+   * @param {Function} [opts.clearTimeoutFn]
+   */
   constructor(accountManager, {
     intervalMs = 0,
     schedule = null,
@@ -219,7 +235,8 @@ export class Warmer {
     if (generation !== this._scheduleGeneration || this._stopped) return false;
     if (deadline !== null && this.nowFn() >= deadline) return false;
     this._running = true;
-    let finishRun;
+    /** @type {(value?: unknown) => void} */
+    let finishRun = () => {};
     const runFinished = new Promise(resolve => { finishRun = resolve; });
     this._runFinished = runFinished;
     const abort = this._abort = new AbortController();

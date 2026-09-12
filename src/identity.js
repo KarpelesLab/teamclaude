@@ -179,6 +179,7 @@ export function canUpsertOAuthAccount(profile, userNamed) {
  * Copy only known profile identity fields. Omitting unavailable fields keeps a
  * named re-import from erasing identity already stored on the account.
  */
+/** @returns {{ accountUuid?: string, orgUuid?: string, orgName?: string }} */
 export function oauthIdentityFields(profile) {
   if (!profile || profile.error) return {};
   return Object.fromEntries(

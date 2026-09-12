@@ -6,6 +6,7 @@ import { promisify } from 'node:util';
 import { createInterface } from 'node:readline';
 import http from 'node:http';
 import { proxyFetch } from './upstream-fetch.js';
+/** @typedef {import('./types.js').CodedError} CodedError */
 
 const execFileAsync = promisify(execFile);
 
@@ -173,7 +174,7 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
           continue;
         }
         const text = await res.text();
-        const err = new Error(`Token refresh failed (${res.status}): ${text}`);
+        const err = /** @type {CodedError} */ (new Error(`Token refresh failed (${res.status}): ${text}`));
         // Surface the HTTP status so callers can distinguish a genuine auth
         // rejection (the refresh token is dead — re-login needed) from a
         // transient server error. 5xx is retried above; reaching here with a 5xx
@@ -187,8 +188,8 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
       const isNetworkError = err instanceof Error &&
         (err.name === 'TimeoutError' || err.name === 'AbortError' ||
           err.message.includes('fetch failed') ||
-          (err.code === 'ECONNRESET' || err.code === 'ECONNREFUSED' ||
-           err.code === 'ETIMEDOUT' || err.code === 'UND_ERR_CONNECT_TIMEOUT'));
+          ['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'UND_ERR_CONNECT_TIMEOUT']
+            .includes(/** @type {CodedError} */ (err).code));
 
       if (attempt < maxRetries && isNetworkError) {
         continue;
@@ -784,7 +785,7 @@ export function startCallbackServer(expectedState) {
     // Loopback only: the redirect URI is http://localhost:<port>/callback, so
     // nothing off this machine ever has a reason to reach the listener.
     server.listen(0, '127.0.0.1', () => {
-      resolve({ port: server.address().port, codePromise, server });
+      resolve({ port: /** @type {import('node:net').AddressInfo} */ (server.address()).port, codePromise, server });
     });
     server.on('error', reject);
 

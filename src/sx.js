@@ -164,6 +164,7 @@ export async function tunnelTls({ proxy, targetHost, targetPort = 443, tlsOption
  * reverse proxy, the MITM handler, and the TUI so a key change applies live.
  */
 export class SxManager {
+  /** @param {{ log?: (line: string) => void }} [opts] */
   constructor({ log = () => {} } = {}) {
     this.log = log;
     this.apiKey = null;

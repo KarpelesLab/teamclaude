@@ -67,7 +67,7 @@ function isPlainObject(v) {
  *
  * @param {Buffer} body fully-buffered request body
  * @param {string} url req.url (only /v1/messages bodies are inspected)
- * @param {string} [contentType] the request's content-type header
+ * @param {string|undefined} contentType the request's content-type header
  * @param {Iterable<string>} subfields subfield names to drop (e.g. `scope`)
  * @returns {Buffer} the original buffer when nothing needed stripping (or on any
  *   parse / shape surprise), else a re-serialized buffer with those subfields

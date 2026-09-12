@@ -2,6 +2,7 @@ import { TUI } from './tui.js';
 import { SessionTitles } from './session-titles.js';
 import { modelGlobMatches } from './model.js';
 import { safeLine } from './safe-text.js';
+/** @typedef {import('./types.js').CodedError} CodedError */
 
 // Attach mode — the dashboard against a server running somewhere else (a
 // background service, another terminal). The renderer is the same one the
@@ -96,6 +97,7 @@ export class RemoteControl {
 
   async _call(method, path, body) {
     const deadline = this.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    /** @type {Record<string, string>} */
     const headers = {};
     if (this.apiKey) headers['x-api-key'] = this.apiKey;
     if (body !== undefined) headers['content-type'] = 'application/json';
@@ -130,11 +132,11 @@ export class RemoteControl {
       // clients from the key gate, so a 401 from there cannot be about the key
       // and blaming it would send the operator to edit a config that is fine.
       const auth = !answered && (res.status === 401 || res.status === 403);
-      const err = new Error(auth
+      const err = /** @type {CodedError} */ (new Error(auth
         ? (LOOPBACK_HOSTS.has(this.host)
           ? `something other than teamclaude is answering on port ${this.port} (HTTP ${res.status})`
           : `the server rejected the proxy API key (HTTP ${res.status})`)
-        : answered ? text(payload.error, 200, `HTTP ${res.status}`) : `HTTP ${res.status}`);
+        : answered ? text(payload.error, 200, `HTTP ${res.status}`) : `HTTP ${res.status}`));
       err.status = res.status;
       err.answered = answered;
       throw err;

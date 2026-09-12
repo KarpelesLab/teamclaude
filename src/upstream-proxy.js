@@ -284,9 +284,9 @@ export function proxyAgent(proxy, { targetHost, targetPort, tls: useTls = true, 
         // TLS is established end-to-end over the tunnel, so the proxy sees only
         // ciphertext and cert verification stays at its secure default.
         handshakeOverTunnel(sock, { servername: targetHost, tlsOptions })
-          .then((tlsSock) => cb(null, tlsSock), (err) => cb(err));
+          .then((tlsSock) => cb(null, tlsSock), (err) => cb(err, null));
       })
-      .catch((err) => cb(err));
+      .catch((err) => cb(err, null));
     return undefined; // socket is delivered asynchronously through cb
   };
   return agent;

@@ -43,6 +43,7 @@ import { serviceKind, installService, uninstallService, serviceStatus, renderSer
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
 import { getUpstreamProxy, describeProxy, describeSelfProxy } from './upstream-proxy.js';
 import { startEventLoopMonitor } from './event-loop-monitor.js';
+/** @typedef {import('./types.js').CodedError} CodedError */
 
 // These constants are referenced by routeCommand, which the dispatch below
 // reaches through a top-level `await`. The await suspends module evaluation at
@@ -460,6 +461,7 @@ async function serverCommand() {
   };
 
   let tui = null;
+  /** @type {Object} */
   let hooks = {};
 
   if (useTUI) {
@@ -1087,7 +1089,7 @@ async function runCommand() {
   });
 
   if (result.error) {
-    if (result.error.code === 'ENOENT') {
+    if (/** @type {CodedError} */ (result.error).code === 'ENOENT') {
       console.error('Claude Code not found in PATH. Install it first.');
     } else {
       console.error(`Failed to start claude: ${result.error.message}`);

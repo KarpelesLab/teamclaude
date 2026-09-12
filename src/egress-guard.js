@@ -19,8 +19,14 @@ const POLL_MS = 3_000;
 
 export class EgressGuard {
   /**
-   * @param {object} opts
-   * @param {string|string[]} opts.pin  'auto' (pin whatever is seen first), or one or more allowed IPs
+   * @param {Object} [opts]
+   * @param {string|string[]} [opts.pin]  'auto' (pin whatever is seen first), or one or more allowed IPs
+   * @param {string} [opts.checkUrl]  what to ask for the egress address
+   * @param {number} [opts.ttlMs]
+   * @param {number} [opts.holdMs]
+   * @param {Function} [opts.fetchImpl]
+   * @param {number} [opts.pollMs]
+   * @param {(line: string) => void} [opts.log]
    */
   constructor({ pin, checkUrl = DEFAULT_CHECK_URL, ttlMs = DEFAULT_TTL_MS, holdMs = DEFAULT_HOLD_MS,
     fetchImpl = fetch, pollMs = POLL_MS, log = () => {} } = {}) {
