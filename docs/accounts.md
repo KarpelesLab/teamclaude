@@ -213,8 +213,9 @@ Any Anthropic-compatible API can be added as an account alongside your Claude ac
 }
 ```
 
-- **`upstream`** — base URL of the target API. Requests are sent to `upstream + /v1/messages` (etc.) for this account only.
+- **`upstream`** — base URL of the target API. Requests are sent to `upstream + /v1/messages` (etc.) for this account only. One class of request is answered by the proxy instead of being forwarded — see [message threads](#message-threads) below.
 - **`modelMap`** — when a Claude model name arrives in the request body, it is rewritten to the mapped name before forwarding.
+- **`messageThreads`** — set to `true` when the backend keeps Anthropic message-thread state (a relay that reaches Anthropic does). Off by default for a third-party backend — see below.
 
 Where the provider publishes one, its own balance or quota is shown in `teamclaude status` — see [third-party backend quota](quota.md#third-party-backend-quota).
 
@@ -232,6 +233,20 @@ claude --model 'deepseek-v4-pro[1m]'
 ```
 
 Model names with brackets (e.g. `deepseek-v4-pro[1m]`) must be quoted in the shell.
+
+### Message threads
+
+Claude Code keeps the conversation on the server once a thread exists: the first `/v1/messages` body carries `thread: {"type": "create"}` with the whole messages array, and every later one carries `thread: {"type": "continue"}` with only the new delta. A backend that keeps no thread state ignores the unknown field and answers the delta on its own, so from the second turn onward the model no longer sees the conversation — and nothing anywhere reports an error.
+
+When a thread cannot be continued Anthropic answers `400`, and Claude Code resends the whole conversation rather than giving up (observed on 2.1.269). So the proxy answers a `continue` bound for an account with a per-account `upstream` with that same `400` rather than forwarding it. The body carries `details.error_code: "thread_unsupported_request"`, which the client reads as "this model keeps no thread state": it resends the turn in full and then drops the `thread` field entirely for the rest of the session, so the refusals are counted per agent and model rather than per turn, and cost no tokens. A session running subagents pays one refusal for the main agent and one for each subagent on that model. `count_tokens` is never refused: there is no conversation to resend for a token count.
+
+The flag the client sets is keyed on the model, not on the account serving it. If the same model name is served both by a third-party backend and by Anthropic accounts, a refusal turns threads off for that model everywhere until the session ends — the conversation still works, it just travels in full each turn.
+
+An `upstream` whose host is Anthropic's own is left alone without any flag — a region pin or a mirror reaches the real thread store, so there is nothing to repair. The host is what decides it: a third-party API serving the Anthropic shape does that under its own host.
+
+Only a per-account `upstream` arms this. A fleet pointed at a third-party host through the global `upstream` is not covered, and there is no setting to turn the refusal on for it.
+
+A relay that forwards to Anthropic does keep thread state, and for it the refusal is pure overhead — the client would re-send a full history each turn for nothing. Declare it with `"messageThreads": true` and continues are forwarded untouched.
 
 ### `accounts[].models` is deprecated
 
