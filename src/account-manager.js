@@ -193,6 +193,13 @@ function makeAccount(acct, index) {
     // Fields to drop from request bodies for this account (third-party upstreams
     // that reject e.g. `context_management`). See server.js stripBodyFields.
     stripRequestFields: acct.stripRequestFields || null,
+    // Whether this upstream keeps Anthropic message-thread state. Off for a
+    // third-party backend, which would otherwise be handed a bare delta. See
+    // server.js refusesThreadContinue.
+    messageThreads: acct.messageThreads === true,
+    // Whether the operator has already been told this upstream keeps no thread
+    // state, so the line is printed once rather than per refusal.
+    threadRefusalReported: false,
     models: acct.models || null,
     credential: acct.accessToken || acct.apiKey,
     refreshToken: acct.refreshToken || null,
