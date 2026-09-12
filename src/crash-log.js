@@ -11,9 +11,11 @@ import { appendFileSync } from 'node:fs';
  * Handling these events replaces Node's own behaviour, so this must do what
  * Node would: report and exit non-zero. Continuing after an uncaught exception
  * would leave the proxy running on unknown state.
+ * @param {string} path
+ * @param {{ exit?: (code: number) => void, log?: { write: (s: string) => void } }} [opts]
  */
 export function installCrashHandlers(path, { exit = process.exit, log = process.stderr } = {}) {
-  const report = (kind) => (err) => {
+  const report = (/** @type {string} */ kind) => (/** @type {any} */ err) => {
     const stack = err?.stack || String(err);
     const entry = `\n=== ${new Date().toISOString()} ${kind} ===\n${stack}\n`;
     // 0600: a stack can carry request context. A write failure (read-only home,

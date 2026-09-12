@@ -20,9 +20,15 @@ export class JsonStreamFormatter {
     this.freshContainer = false; // just opened { or [ — first element needs a newline+indent
   }
 
+  /**
+   * @param {number} depth
+   */
   nl(depth) { return '\n' + this.pad.repeat(depth); }
 
   // Feed a chunk; returns the formatted text for that chunk.
+  /**
+   * @param {Buffer|string} buf
+   */
   push(buf) {
     const text = Buffer.isBuffer(buf) ? buf.toString('latin1') : String(buf);
     let out = '';

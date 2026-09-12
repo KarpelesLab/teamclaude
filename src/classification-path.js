@@ -41,10 +41,16 @@
 // Splits a path into segments AND separators, so a rejoin reproduces it.
 const KEEP_SEPARATORS = /([/\\])/;
 
+/**
+ * @param {unknown} url
+ */
 function pathOnly(url) {
   return String(url || '').split('?')[0].split('#')[0];
 }
 
+/**
+ * @param {string} s
+ */
 function decodeOnce(s) {
   try { return decodeURIComponent(s); } catch { return s; }
 }
@@ -60,6 +66,7 @@ function decodeOnce(s) {
  * `/a/%zz%2e%2e/b` is classified exactly as sent, as it was before — because
  * that segment has no decoded form either. Both branches are one decode deep,
  * so which one runs never changes how deep the decoding goes.
+ * @param {string} path
  */
 function decodeOncePath(path) {
   try { return decodeURIComponent(path); } catch { /* per-segment below */ }
@@ -75,6 +82,7 @@ function decodeOncePath(path) {
  * decoded, and folding first would leave it encoded and unseen. The order also
  * keeps the decoding one level deep — `%255c` decodes to a literal `%5c`, which
  * stays a character inside a segment rather than becoming a separator.
+ * @param {unknown} url
  */
 export function classificationPath(url) {
   return decodeOncePath(pathOnly(url)).replaceAll('\\', '/');

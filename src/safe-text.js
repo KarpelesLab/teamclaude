@@ -24,12 +24,18 @@ const CONTROL = /\x1b\[[0-?]*[ -/]*[@-~]|\p{C}/gu;
 /**
  * Strip escape sequences and control characters, collapsing the whitespace they
  * leave behind so a stripped value cannot pad a column or split a line.
+ * @param {unknown} value
  */
 export function sanitizeText(value) {
   return String(value).replace(CONTROL, ' ').replace(/\s+/g, ' ').trim();
 }
 
-/** sanitizeText, bounded — for a value rendered into a fixed-width column. */
+/**
+ * sanitizeText, bounded — for a value rendered into a fixed-width column.
+ *
+ * @param {unknown} value
+ * @param {number} [max]
+ */
 export function safeLine(value, max = 120) {
   const cleaned = sanitizeText(value);
   return cleaned.length > max ? cleaned.slice(0, max) : cleaned;

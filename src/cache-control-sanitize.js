@@ -38,6 +38,7 @@ const SUBFIELD_PREFIX = 'cache_control.';
  * The `cache_control` subfields an account's `stripRequestFields` asks to drop:
  * every entry of the form `cache_control.<name>`. Top-level entries are the
  * forwarder's `stripBodyFields` business and are ignored here.
+ * @param {unknown} stripRequestFields
  */
 export function cacheControlSubfieldsToStrip(stripRequestFields) {
   const out = new Set();
@@ -52,12 +53,19 @@ export function cacheControlSubfieldsToStrip(stripRequestFields) {
 
 // Is this a JSON /v1/messages (or /v1/messages/count_tokens) request we can
 // reason about? Everything else (token refreshes, GETs, non-JSON) is left alone.
+/**
+ * @param {unknown} url
+ * @param {string|undefined} contentType
+ */
 function isMessagesRequest(url, contentType) {
   if (typeof url !== 'string' || !url.includes(MESSAGES_PATH)) return false;
   if (contentType && !/json/i.test(contentType)) return false;
   return true;
 }
 
+/**
+ * @param {unknown} v
+ */
 function isPlainObject(v) {
   return !!v && typeof v === 'object' && !Array.isArray(v);
 }
@@ -101,6 +109,10 @@ export function sanitizeCacheControl(body, url, contentType, subfields) {
 // Drop `drop` subfields from `holder.cache_control` (and the key itself when
 // nothing is left — an empty object is itself an extra input to a strict
 // schema). Returns the number of keys removed.
+/**
+ * @param {any} holder
+ * @param {Set<string>} drop
+ */
 function stripOn(holder, drop) {
   if (!isPlainObject(holder) || !isPlainObject(holder.cache_control)) return 0;
   const cc = holder.cache_control;
@@ -113,6 +125,10 @@ function stripOn(holder, drop) {
 }
 
 // The documented breakpoint positions, and nothing else (see the header).
+/**
+ * @param {any} root
+ * @param {Set<string>} drop
+ */
 function stripAtDocumentedPositions(root, drop) {
   let removed = stripOn(root, drop);
   if (Array.isArray(root.system)) for (const block of root.system) removed += stripOn(block, drop);

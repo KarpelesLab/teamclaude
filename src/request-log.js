@@ -8,16 +8,22 @@
 
 import { JsonStreamFormatter } from './json-format-stream.js';
 
-export const truncationNote = (bytes) => `... truncated ${bytes} bytes ...`;
+export const truncationNote = (/** @type {number} */ bytes) => `... truncated ${bytes} bytes ...`;
 
 // Tracks how one direction's body is written: decide formatter-vs-raw on the
 // first chunk (event-stream → raw; otherwise pretty-print if it looks like JSON,
 // i.e. the first non-whitespace byte is { or [). Writes the section header once.
 export class BodyWriter {
+  /**
+   * @param {(text: string) => void} write
+   * @param {string} label
+   * @param {string|undefined} contentType
+   * @param {number} [maxBytes]
+   */
   constructor(write, label, contentType, maxBytes = 0) {
     this.write = write;
     this.label = label;
-    this.isStream = /event-stream/.test(contentType);
+    this.isStream = /event-stream/.test(contentType || '');
     this.decided = false;
     this.fmt = null;
     this.headerWritten = false;
@@ -26,6 +32,9 @@ export class BodyWriter {
     this.remaining = maxBytes > 0 ? maxBytes : Infinity;
     this.dropped = 0;
   }
+  /**
+   * @param {Buffer} buf
+   */
   chunk(buf) {
     if (!buf.length) return;
     if (this.remaining <= 0) { this.dropped += buf.length; return; }

@@ -36,6 +36,7 @@ export function newObservation() {
  *
  * @param {Hold|null} held
  * @returns {Hold|null}
+ * @param {(idx: number) => number|null} mapFn
  */
 export function remapHeld(held, mapFn) {
   if (!held) return null;
@@ -47,6 +48,11 @@ export function remapHeld(held, mapFn) {
 // The roll this observation owes an account, or the one a stay's stamp names.
 // The newest match, since a later escape of the same account was read after the
 // earlier one's window had already rolled.
+/**
+ * @param {Hold|null} held
+ * @param {(h: Hold) => boolean} match
+ * @returns {Hold|null}
+ */
 export function findHeld(held, match) {
   for (let h = held; h; h = h.prev) if (match(h)) return h;
   return null;
@@ -54,6 +60,11 @@ export function findHeld(held, match) {
 
 // The chain without the roll owed to `idx`. Handing a roll back and settling one
 // both remove that account's own, and leave every other escape standing.
+/**
+ * @param {Hold|null} held
+ * @param {number} idx
+ * @returns {Hold|null}
+ */
 export function dropHeld(held, idx) {
   if (!held) return null;
   const rest = dropHeld(held.prev, idx);

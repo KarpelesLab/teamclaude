@@ -59,6 +59,9 @@ const WEEKLY_WINDOW_SECONDS = 7 * 24 * 3600;
 /**
  * Exhaustiveness enforced at runtime: on plain JS a variant nothing here
  * handles has no other check.
+ * @param {never} value
+ * @param {string} context
+ * @returns {never}
  */
 export function assertNever(value, context) {
   throw new Error(`${context}: unhandled variant ${JSON.stringify(value)}`);
@@ -98,6 +101,7 @@ export function pressureOf(account, now) {
 /** How much of a window is left to spend. Clamped at both ends: above 1 is real
  * overage and leaves nothing, below 0 would read as MORE headroom than the
  * window has. Shared by the measured pressure and the unknown-reset bound so the
+ * @param {number} utilization
  * two cannot disagree about what an account is holding. */
 function spendableFraction(utilization) {
   return 1 - Math.min(1, Math.max(0, utilization));
@@ -110,6 +114,7 @@ function spendableFraction(utilization) {
  * known. `expiry-routing-off` sorts there too and must be constant across the
  * fleet, or the off switch stops being one. A bounded absence sorts by its
  * bound, since `no-reset` knows the utilization and lacks only the clock.
+ * @param {Pressure} pressure
  */
 export function pressureRank(pressure) {
   switch (pressure.kind) {
@@ -126,6 +131,8 @@ export function pressureRank(pressure) {
  * preferred. Lower tiers pass through unfiltered, since they are reached only
  * when the top tier is empty, which banding cannot cause because the maximum
  * always qualifies.
+ * @param {BandSnapshot} snapshot
+ * @returns {BandDecision}
  */
 export function decideBand(snapshot) {
   const { accounts, now, tolerance, enabled } = snapshot;
@@ -147,6 +154,7 @@ export function decideBand(snapshot) {
   const ratio = Number.isFinite(tolerance) && tolerance > 0 ? tolerance : 1;
   const floor = Math.min(maxKnown, maxKnown / ratio);
 
+  /** @type {number[]} */
   const keep = [];
   tier.forEach((account, i) => {
     const pressure = pressures[i];

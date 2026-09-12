@@ -36,7 +36,7 @@ const PROVIDERS = [
     // host keeps working.
     host: 'api.deepseek.com',
     path: '/user/balance',
-    parse(body) {
+    parse(/** @type {any} */ body) {
       const info = Array.isArray(body?.balance_infos) ? body.balance_infos[0] : null;
       if (!info) return null;
       const amount = Number(info.total_balance);
@@ -58,7 +58,11 @@ const PROVIDERS = [
   },
 ];
 
-/** The provider entry for an upstream URL, or null when we know of none. */
+/**
+ * The provider entry for an upstream URL, or null when we know of none.
+ *
+ * @param {string|null|undefined} upstream
+ */
 export function providerFor(upstream) {
   if (!upstream || typeof upstream !== 'string') return null;
   let host;
@@ -66,7 +70,11 @@ export function providerFor(upstream) {
   return PROVIDERS.find(p => host === p.host || host.endsWith(`.${p.host}`)) || null;
 }
 
-/** True when this account has a backend reading we know how to fetch. */
+/**
+ * True when this account has a backend reading we know how to fetch.
+ *
+ * @param {Record<string, any>|null|undefined} account
+ */
 export function hasBackendQuota(account) {
   return !!account?.upstream && !!providerFor(account.upstream);
 }
@@ -77,6 +85,8 @@ export function hasBackendQuota(account) {
  * could not refresh.
  *
  * @returns {Promise<BackendQuota | { error: string } | null>}
+ * @param {Record<string, any>|null|undefined} account
+ * @param {{ fetchImpl?: Function, timeoutMs?: number }} [opts]
  */
 export async function fetchBackendQuota(account, { fetchImpl = proxyFetch, timeoutMs = 10_000 } = {}) {
   const provider = providerFor(account?.upstream);
@@ -94,7 +104,7 @@ export async function fetchBackendQuota(account, { fetchImpl = proxyFetch, timeo
     if (body === undefined) return { error: 'response too large' };
     const reading = provider.parse(body);
     return reading ? { ...reading, at: Date.now() } : { error: 'unrecognized response' };
-  } catch (err) {
+  } catch (/** @type {any} */ err) {
     return { error: err?.message || String(err) };
   }
 }
@@ -103,6 +113,8 @@ export async function fetchBackendQuota(account, { fetchImpl = proxyFetch, timeo
  * Parse a JSON response body of at most `limit` bytes; `undefined` when it is
  * larger (declared or actual). A response without a readable stream (a test
  * double) falls back to `json()`.
+ * @param {any} res
+ * @param {number} limit
  */
 async function readJsonBounded(res, limit) {
   const declared = Number(res.headers?.get?.('content-length'));

@@ -11,10 +11,15 @@ export const DEFAULT_MAX_QUEUE = 64;
 export const DEFAULT_QUEUE_TIMEOUT_MS = 5_000;
 
 export class AdmissionGate {
+  /**
+   * @param {unknown} limit
+   * @param {unknown} [maxQueue]
+   */
   constructor(limit, maxQueue = DEFAULT_MAX_QUEUE) {
     this.limit = positiveInt(limit, 1);
     this.maxQueue = Number.isSafeInteger(Number(maxQueue)) && Number(maxQueue) >= 0 ? Number(maxQueue) : DEFAULT_MAX_QUEUE;
     this.active = 0;
+    /** @type {Array<(admitted: boolean) => void>} */
     this.queue = [];
   }
 
@@ -27,8 +32,9 @@ export class AdmissionGate {
     }
     if (this.queue.length >= this.maxQueue) return Promise.resolve(false);
     return new Promise(resolve => {
+      /** @type {ReturnType<typeof setTimeout>|undefined} */
       let timer;
-      const settle = admitted => {
+      const settle = (/** @type {boolean} */ admitted) => {
         clearTimeout(timer);
         signal?.removeEventListener('abort', cancel);
         const index = this.queue.indexOf(settle);
@@ -54,6 +60,10 @@ export class AdmissionGate {
   }
 }
 
+/**
+ * @param {unknown} value
+ * @param {number} fallback
+ */
 function positiveInt(value, fallback) {
   const n = Number(value);
   return Number.isSafeInteger(n) && n > 0 && n <= 2 ** 31 - 1 ? n : fallback;

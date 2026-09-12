@@ -15,12 +15,13 @@ export function startEventLoopMonitor({
   now = () => performance.now(),
   schedule = setInterval,
   cancel = clearInterval,
-  log = (message) => console.error(message),
+  log = (/** @type {string} */ message) => console.error(message),
 } = {}) {
   let expectedAt = now() + intervalMs;
   let lastLagMs = 0;
   let maxLagMs = 0;
   let stallCount = 0;
+  /** @type {string|null} */
   let lastStallAt = null;
   let lastWarningClock = -Infinity;
 

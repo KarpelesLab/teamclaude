@@ -35,9 +35,14 @@ export function currentVersion(root = packageRoot()) {
   }
 }
 
-/** Numeric compare of x.y.z (prerelease/build suffix ignored). >0 if a is newer. */
+/**
+ * Numeric compare of x.y.z (prerelease/build suffix ignored). >0 if a is newer.
+ *
+ * @param {string} a
+ * @param {string} b
+ */
 export function compareVersions(a, b) {
-  const nums = (v) => String(v).split('+')[0].split('-')[0].split('.').map((n) => parseInt(n, 10) || 0);
+  const nums = (/** @type {string} */ v) => String(v).split('+')[0].split('-')[0].split('.').map((n) => parseInt(n, 10) || 0);
   const pa = nums(a), pb = nums(b);
   for (let i = 0; i < 3; i++) {
     const d = (pa[i] || 0) - (pb[i] || 0);
@@ -95,9 +100,16 @@ export async function fetchLatestVersion({ fetchImpl = fetch, timeoutMs = 5000 }
 function defaultCacheFile() {
   return join(dirname(getConfigPath()), 'update-check.json');
 }
+/**
+ * @param {string} path
+ */
 async function readCache(path) {
   try { return JSON.parse(await readFile(path, 'utf8')); } catch { return {}; }
 }
+/**
+ * @param {string} path
+ * @param {object} obj
+ */
 async function writeCache(path, obj) {
   try { await writeFile(path, JSON.stringify(obj)); } catch { /* best effort */ }
 }
@@ -137,6 +149,7 @@ export async function checkForUpdate({
  * "99.0.0 || npm:evil" reads as newer and would go straight into
  * `npm install -g <name>@<value>`. Only x.y.z is installed; anything else is
  * reported and skipped.
+ * @param {unknown} v
  */
 export function isReleaseVersion(v) {
   return /^\d+\.\d+\.\d+$/.test(String(v));

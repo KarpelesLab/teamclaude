@@ -16,12 +16,17 @@
 const PREFIX = Buffer.from('account_uuid\\":\\"', 'latin1');
 
 export class AccountUuidPatcher {
+  /**
+   * @param {unknown} newUuid  a 36-character account uuid; anything else disables the patcher
+   */
   constructor(newUuid) {
     this.newUuid = (typeof newUuid === 'string' && newUuid.length === 36) ? Buffer.from(newUuid, 'latin1') : null;
-    this.frames = [];          // container stack: { container:'obj'|'arr', name, key, awaitingKey }
+    /** @type {Array<{ container: 'obj'|'arr', name: string|null, key: string|null, awaitingKey: boolean }>} */
+    this.frames = [];          // container stack
     this.inStr = false;
     this.esc = false;
     this.readingKey = false;
+    /** @type {number[]} */
     this.keyBuf = [];
     this.target = false;       // inside the metadata.user_id string value
     this.matchPos = 0;         // PREFIX match progress (within target)
@@ -30,7 +35,11 @@ export class AccountUuidPatcher {
     this.changed = false;
   }
 
-  /** Feed a chunk; returns a same-length chunk (patched in place). */
+  /**
+   * Feed a chunk; returns a same-length chunk (patched in place).
+   *
+   * @param {Buffer|Uint8Array} chunk
+   */
   push(chunk) {
     if (!this.newUuid || this.done) return chunk;
     const out = Buffer.from(chunk);
@@ -43,6 +52,9 @@ export class AccountUuidPatcher {
 
   #top() { return this.frames[this.frames.length - 1]; }
 
+  /**
+   * @param {number} b
+   */
   #byte(b) {
     if (this.target) return this.#targetByte(b);
 
@@ -82,9 +94,14 @@ export class AccountUuidPatcher {
 
   // Inside the metadata.user_id string value: stream-match the account_uuid key
   // and overwrite its 36-byte value. Detect the (unescaped) closing quote to exit.
+  /**
+   * @param {number} b
+   */
   #targetByte(b) {
     if (this.uuidRemaining > 0) {
-      const outByte = this.newUuid[this.newUuid.length - this.uuidRemaining];
+      // `push` returns before any byte reaches here while `newUuid` is null.
+      const uuid = /** @type {Buffer} */ (this.newUuid);
+      const outByte = uuid[uuid.length - this.uuidRemaining];
       this.uuidRemaining--;
       if (outByte !== b) this.changed = true;
       if (this.uuidRemaining === 0) this.done = true; // only one account_uuid per body
@@ -97,6 +114,9 @@ export class AccountUuidPatcher {
     return b;
   }
 
+  /**
+   * @param {number} b
+   */
   #match(b) {
     if (b === PREFIX[this.matchPos]) {
       this.matchPos++;
@@ -107,7 +127,12 @@ export class AccountUuidPatcher {
   }
 }
 
-/** One-shot convenience (whole-buffer); returns the same instance if unchanged. */
+/**
+ * One-shot convenience (whole-buffer); returns the same instance if unchanged.
+ *
+ * @param {Buffer} buf
+ * @param {unknown} newUuid
+ */
 export function patchAccountUuid(buf, newUuid) {
   const p = new AccountUuidPatcher(newUuid);
   const out = p.push(buf);

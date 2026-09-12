@@ -11,6 +11,10 @@ const BEL = '\x07';
 export const TITLE_STACK_PUSH = '\x1b[22;2t';
 export const TITLE_STACK_POP = '\x1b[23;2t';
 
+/**
+ * @param {string} s
+ * @param {number} max
+ */
 function truncate(s, max) {
   s = String(s);
   return s.length <= max ? s : `${s.slice(0, max - 1)}…`;
@@ -25,6 +29,9 @@ export function formatTerminalTitle({ index = 0, total = 0, name = null } = {}) 
 
 // Wrap a title string in the OSC set-title sequence, stripping control chars so a
 // crafted account name can't break out of the escape or move the cursor.
+/**
+ * @param {string} title
+ */
 export function titleSequence(title) {
   const safe = String(title).replace(/[\x00-\x1f\x7f]/g, ' ').trimEnd();
   return `${OSC_TITLE}${safe}${BEL}`;

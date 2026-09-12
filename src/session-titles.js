@@ -70,6 +70,7 @@ export class SessionTitles {
   /** Apply a config change in place, so a reload takes effect without a
    *  restart. An absent key returns to its default. Off unless asked for: this
    *  reads the transcripts of every session the proxy sees, which is further
+   * @param {Record<string, any>|null|undefined} cfg
    *  than the proxy reaches for anything else by default. */
   configure(cfg) {
     const { enabled = false, width = DEFAULT_WIDTH, projectsDir = DEFAULT_PROJECTS_DIR } = cfg || {};
@@ -87,6 +88,8 @@ export class SessionTitles {
   }
 
   /** The cached title, or null. Never touches the disk: a miss or a stale entry
+   * @param {string} sessionId
+   * @param {number} [now]
    *  schedules the read and the caller gets the previous answer until it lands. */
   get(sessionId, now = Date.now()) {
     if (!this.enabled || !isSessionId(sessionId)) return null;
@@ -96,7 +99,12 @@ export class SessionTitles {
     return hit ? hit.title : null;
   }
 
-  /** Read the title now. Resolves to null when the session has none. */
+  /**
+   * Read the title now. Resolves to null when the session has none.
+   *
+   * @param {string} sessionId
+   * @param {number} [now]
+   */
   async resolve(sessionId, now = Date.now()) {
     if (!this.enabled || !isSessionId(sessionId)) return null;
     return this._schedule(sessionId, now);
@@ -114,6 +122,7 @@ export class SessionTitles {
 
   /** Drop entries no row has refreshed within the window. A visible session is
    *  re-read every TTL, which keeps its entry young; one that left the screen
+   * @param {number} now
    *  ages out. Runs at most once per TTL, so a frame does not pay for it. */
   _evict(now) {
     if (now - this.sweptAt < this.ttlMs) return;
@@ -123,6 +132,10 @@ export class SessionTitles {
     }
   }
 
+  /**
+   * @param {string} sessionId
+   * @param {number} now
+   */
   _schedule(sessionId, now) {
     const existing = this.inflight.get(sessionId);
     if (existing) return existing;
@@ -140,6 +153,7 @@ export class SessionTitles {
   }
 
   /** The project directory is keyed by the session's cwd, which the proxy does
+   * @param {string} sessionId
    *  not know, so each directory is tried until one holds the session. */
   async _read(sessionId) {
     const entries = await readdir(this.projectsDir, { withFileTypes: true }).catch(() => []);
@@ -154,6 +168,9 @@ export class SessionTitles {
     return null;
   }
 
+  /**
+   * @param {string} path
+   */
   async _fromSidecar(path) {
     const raw = await readFile(path, 'utf8').catch(() => null);
     if (raw == null) return null;
@@ -164,6 +181,9 @@ export class SessionTitles {
     }
   }
 
+  /**
+   * @param {string} path
+   */
   async _fromTranscript(path) {
     const file = await open(path, 'r').catch(() => null);
     if (!file) return null;
@@ -185,6 +205,7 @@ export class SessionTitles {
 
 /** A typed name wins wherever it sits in the file; otherwise the most recent
  *  generated one. Both are re-appended as a session runs, so the scan reads
+ * @param {string[]} lines
  *  backwards and stops at the first match. */
 function lastTitle(lines) {
   let generated = null;
@@ -208,12 +229,16 @@ function lastTitle(lines) {
   return generated;
 }
 
+/**
+ * @param {unknown} value
+ */
 function isSessionId(value) {
   return typeof value === 'string' && SESSION_ID.test(value);
 }
 
 /** A title is printed inside a terminal escape and written to the activity log
  *  file, so a control character in it (an ESC, a newline) is not a title, it
+ * @param {unknown} value
  *  is an injection. Each becomes a space and runs of whitespace collapse. */
 function cleanTitle(value) {
   if (typeof value !== 'string') return null;

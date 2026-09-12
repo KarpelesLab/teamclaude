@@ -8,6 +8,9 @@ import { proxyFetch } from './upstream-fetch.js';
 
 export const CODEX_USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage';
 
+/**
+ * @param {any} window
+ */
 function windowReading(window) {
   if (!window || typeof window !== 'object') return null;
   const used = Number(window.used_percent ?? window.usedPercentage ?? window.utilization);
@@ -21,14 +24,21 @@ function windowReading(window) {
   };
 }
 
+/**
+ * @param {any} rateLimit
+ */
 function classify(rateLimit) {
-  const readings = Object.values(rateLimit || {}).map(windowReading).filter(Boolean);
+  const readings = Object.values(rateLimit || {}).flatMap(w => windowReading(w) ?? []);
   const fiveHour = readings.find(r => r.seconds <= 6 * 60 * 60) || null;
   const sevenDay = readings.find(r => r.seconds >= 6 * 24 * 60 * 60) || null;
   return { fiveHour, sevenDay };
 }
 
-/** Convert the private `/wham/usage` response into TeamClaude quota fields. */
+/**
+ * Convert the private `/wham/usage` response into TeamClaude quota fields.
+ *
+ * @param {any} data
+ */
 export function normalizeCodexUsagePayload(data) {
   const rateLimit = data?.rate_limit || data?.rate_limits;
   const shared = classify(rateLimit);
@@ -52,7 +62,12 @@ export function normalizeCodexUsagePayload(data) {
   };
 }
 
-/** Fetch Codex quota without sending an inference request. */
+/**
+ * Fetch Codex quota without sending an inference request.
+ *
+ * @param {Record<string, any>|null|undefined} account
+ * @param {{ fetchImpl?: Function, timeoutMs?: number, url?: string }} [opts]
+ */
 export async function fetchCodexUsage(account, { fetchImpl = proxyFetch, timeoutMs = 10_000, url = CODEX_USAGE_URL } = {}) {
   if (!account?.credential || !account?.accountId) return { error: 'missing Codex account identity' };
   try {
@@ -66,7 +81,7 @@ export async function fetchCodexUsage(account, { fetchImpl = proxyFetch, timeout
     });
     if (!res.ok) return { error: `HTTP ${res.status}`, status: res.status };
     return normalizeCodexUsagePayload(await res.json());
-  } catch (err) {
+  } catch (/** @type {any} */ err) {
     return { error: err?.message || String(err), status: null };
   }
 }
