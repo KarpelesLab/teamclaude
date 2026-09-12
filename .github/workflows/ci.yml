@@ -45,6 +45,22 @@ jobs:
         if: matrix.node == 24
         run: npm run typecheck
 
+      # The strict-mode ratchet (scripts/typecheck-strict.mjs): strict
+      # diagnostics per file may not grow against the pre-merge commit. For a
+      # pull request the checkout is the merge of the branch into master and
+      # the base is master's tip; for a push to master it is the previous tip.
+      # The base commit is fetched on its own, since the checkout is shallow.
+      - name: Strict typecheck ratchet
+        if: matrix.node == 24 && (github.event_name == 'pull_request' || github.event_name == 'push')
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
+            echo "No base commit for this event; skipping."; exit 0
+          fi
+          git fetch --no-tags --depth=1 origin "$BASE"
+          npm run typecheck:strict -- --base "$BASE"
+
   nix:
     name: nix package
     runs-on: ubuntu-latest

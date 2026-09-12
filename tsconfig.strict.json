@@ -1,0 +1,11 @@
+{
+  // The strict-mode view of the same sources, for the ratchet in
+  // scripts/typecheck-strict.mjs: `npm run typecheck:strict` counts strict
+  // diagnostics per file here and on the pre-merge commit, and fails when any
+  // file's count grew. `strict: true` in tsconfig.json is where this ends,
+  // with this file deleted.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "strict": true
+  }
+}
