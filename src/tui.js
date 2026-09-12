@@ -14,6 +14,7 @@ import { formatPercent } from './status-renderer.js';
 import { resolveMaxUsage } from './model.js';
 import { parseProxyUrl, proxyToUrl, describeProxy, describeSelfProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy } from './upstream-proxy.js';
 import { sanitizeText, safeLine } from './safe-text.js';
+import { isLocalUpstream } from './provider.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -756,7 +757,7 @@ export class TUI {
         label: 'Remove account',
         hint: 'Enter to pick',
         value: () => dim('—'),
-        enter: () => { this.mode = 'select'; this.selAction = 'remove'; this.selIdx = 0; this.selReturn = 'settings'; },
+        enter: () => { this.mode = 'select'; this.selAction = 'remove'; this.selIdx = this._displayOrder()[0] ?? 0; this.selReturn = 'settings'; },
       });
     }
 
@@ -909,9 +910,13 @@ export class TUI {
   }
 
   _keySelect(k) {
-    const len = this.am.accounts.length;
-    if (k === 'up' || k === 'k') this.selIdx = Math.max(0, this.selIdx - 1);
-    else if (k === 'down' || k === 'j') this.selIdx = Math.min(len - 1, this.selIdx + 1);
+    // Step through the rows AS DRAWN (_displayOrder), while selIdx itself stays
+    // a manager index — everything it feeds (switch, toggle, remove, route pins)
+    // addresses an account by that index, not by its position on screen.
+    const order = this._displayOrder();
+    const pos = order.indexOf(this.selIdx);
+    if (k === 'up' || k === 'k') this.selIdx = order[Math.max(0, pos - 1)] ?? this.selIdx;
+    else if (k === 'down' || k === 'j') this.selIdx = order[Math.min(order.length - 1, pos + 1)] ?? this.selIdx;
     // Tab / ←→ (switch only): cycle which route the pick applies to. null = the
     // global default account; each getRoutes() entry = a per-route manual pin.
     // ↑↓ move within the account list, so ←→ are free to move across targets.
@@ -1504,7 +1509,7 @@ export class TUI {
         fable: anyFable ? this.am.previewRouteIndex('claude-fable-5') : null,
         sonnet: anySonnet ? this.am.previewRouteIndex('claude-sonnet-4-6') : null,
       };
-      for (let i = 0; i < this.am.accounts.length; i++) {
+      for (const i of this._displayOrder()) {
         const b = budgets.get(categoryOf(this.am.accounts[i]));
         lines.push(this._renderAcct(i, b.bw, b.showBoth, routes, genRoutes, familyTarget, b.showFamily, nameW));
       }
@@ -1557,6 +1562,29 @@ export class TUI {
     // Show cursor only in input mode
     buf += this.mode === 'input' ? `${ESC}?25h` : `${ESC}?25l`;
     this._paint(buf, force);
+  }
+
+  /** Manager indices in the order the rows are drawn: accounts served by a
+   *  local process last, every other account left where it is.
+   *
+   *  A local backend (a translating proxy in front of another vendor, say) is
+   *  infrastructure rather than a seat to rotate between, so it reads as noise
+   *  wedged among the accounts that do rotate. Config order cannot keep it out
+   *  of the way on its own, because a newly added account is appended AFTER it
+   *  and puts it back in the middle.
+   *
+   *  Display only. `selIdx`, `currentIndex`, session pins and route entries all
+   *  stay manager indices, so nothing about selection or routing moves with the
+   *  rows — see _keySelect, which walks this order but still stores an index.
+   */
+  _displayOrder() {
+    return this.am.accounts
+      .map((/** @type {any} */ _, /** @type {number} */ i) => i)
+      .sort((/** @type {number} */ x, /** @type {number} */ y) => {
+        const sx = isLocalUpstream(this.am.accounts[x]) ? 1 : 0;
+        const sy = isLocalUpstream(this.am.accounts[y]) ? 1 : 0;
+        return sx - sy || x - y; // ties keep list order, so the sort is stable
+      });
   }
 
   _renderAcct(idx, bw, showBoth, routes = this.am.getRoutes(), genRoutes = routes.filter(r => routeFamily(r) === null), familyTarget = {}, showFamily = true, nameW = NAME_MIN) {

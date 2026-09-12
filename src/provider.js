@@ -199,3 +199,25 @@ export function upstreamFor(account, configuredUpstream) {
 export function rewritesBody(account) {
   return PROVIDERS[providerOf(account)].rewritesBody;
 }
+
+/** Whether `account` is served by a process on this machine rather than by a
+ *  vendor endpoint — typically a local translating proxy in front of another
+ *  backend.
+ *
+ *  Keyed on the upstream resolving to loopback. Pairing the account against a
+ *  declared local process does not generalise: such a declaration carries a
+ *  COMMAND rather than a port, and the port sits inside its argv, where every
+ *  program spells it differently. A loopback upstream says the same thing
+ *  directly, and says it for a hand-started process too. A remote third-party
+ *  backend (DeepSeek, GLM) keeps a public host and is not caught.
+ *
+ * @param {any} account
+ */
+export function isLocalUpstream(account) {
+  if (!account?.upstream) return false;
+  let hostname;
+  try { hostname = new URL(account.upstream).hostname; }
+  catch { return false; } // not a URL we can judge — treat it as a normal account
+  const host = hostname.replace(/^\[|\]$/g, '').toLowerCase(); // URL brackets IPv6
+  return host === 'localhost' || host === '::1' || /^127\./.test(host);
+}
