@@ -78,6 +78,10 @@ export function mergeNoProxy(...inherited) {
 
 const SHELL_PROXY_VARS = ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy'];
 
+/**
+ * @param {unknown} value
+ * @param {number} port
+ */
 function pointsAtLoopback(value, port) {
   if (!value) return false;
   try {
@@ -89,7 +93,11 @@ function pointsAtLoopback(value, port) {
   }
 }
 
-/** Remove stale TeamClaude proxy exports without touching a real corporate proxy. */
+/**
+ * Remove stale TeamClaude proxy exports without touching a real corporate proxy.
+ * @param {unknown} port
+ * @param {NodeJS.ProcessEnv} [env]
+ */
 export function clearSelfProxyEnvLines(port, env = process.env) {
   port = validPort(port);
   return SHELL_PROXY_VARS.filter(name => pointsAtLoopback(env[name], port)).map(name => `unset ${name}`);
