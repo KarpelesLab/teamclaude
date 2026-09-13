@@ -76,6 +76,25 @@ export function mergeNoProxy(...inherited) {
   return out.join(',');
 }
 
+const SHELL_PROXY_VARS = ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy'];
+
+function pointsAtLoopback(value, port) {
+  if (!value) return false;
+  try {
+    const url = new URL(value);
+    const host = url.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+    return ['127.0.0.1', 'localhost', '::1'].includes(host) && Number(url.port || 80) === port;
+  } catch {
+    return false;
+  }
+}
+
+/** Remove stale TeamClaude proxy exports without touching a real corporate proxy. */
+export function clearSelfProxyEnvLines(port, env = process.env) {
+  port = validPort(port);
+  return SHELL_PROXY_VARS.filter(name => pointsAtLoopback(env[name], port)).map(name => `unset ${name}`);
+}
+
 // Build the shell `export` lines that point Claude Code — or any tool that
 // spawns it, e.g. an agent multiplexer — at the proxy. This is the same
 // environment `teamclaude run` sets up, but emitted for `eval "$(teamclaude
@@ -83,7 +102,8 @@ export function mergeNoProxy(...inherited) {
 // can be unit-tested; the caller resolves the port, cert path, holdSeconds and
 // the NO_PROXY the invoking shell already had.
 //
-// MITM (forward-proxy) mode is the default, matching `teamclaude run`: it routes
+// MITM (forward-proxy) mode is opt-in for `teamclaude env` (matching
+// `teamclaude run`'s explicit process environment): it routes
 // ALL of claude's traffic through the proxy — even hardcoded api.anthropic.com
 // endpoints (e.g. the design MCP) — with claude trusting our leaf via
 // NODE_EXTRA_CA_CERTS. base-URL mode only redirects the Anthropic base URL and

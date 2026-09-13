@@ -38,7 +38,7 @@ import { autoUpdate, checkForUpdate, currentVersion, runUpdate, installKind, PKG
 import { renderStatus, formatPercent } from './status-renderer.js';
 import { sanitizeText } from './safe-text.js';
 import { ClientUsageTracker, UsageDimensionTracker } from './client-usage.js';
-import { buildClaudeEnvLines, bypassesAllHosts, encodePinComponent, mergeNoProxy } from './claude-env.js';
+import { buildClaudeEnvLines, bypassesAllHosts, clearSelfProxyEnvLines, encodePinComponent, mergeNoProxy } from './claude-env.js';
 import { serviceKind, installService, uninstallService, serviceStatus, renderService, logPath } from './service.js';
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
 import { getUpstreamProxy, describeProxy, describeSelfProxy } from './upstream-proxy.js';
@@ -920,12 +920,13 @@ async function loginOAuthCommand({ pasteOnly = false } = {}) {
 
 // ── env ─────────────────────────────────────────────────────
 
-// `teamclaude env [--no-mitm]` — print the export lines that point Claude Code
-// at the proxy, for `eval "$(teamclaude env)"`. Mirrors `teamclaude run`'s
-// environment (MITM forward-proxy by default; --no-mitm for base-URL only) so a
-// tool that spawns claude itself — an agent multiplexer, a CI job, a manual
-// shell — gets the same routing without going through `run`. Only the export
-// lines go to stdout; all guidance goes to stderr so the output stays eval-safe.
+// `teamclaude env [--mitm|--no-mitm]` — print the export lines that point Claude
+// Code at the proxy, for `eval "$(teamclaude env)"`. Shell setup is base-URL by
+// default so unrelated commands in that shell (gh, git, CI helpers) do not
+// inherit TeamClaude's localhost MITM proxy. `--mitm` is explicit because it
+// changes the whole shell's HTTP(S) routing; `teamclaude run` remains MITM by
+// default. Only export lines go to stdout; guidance stays on stderr so output
+// remains eval-safe.
 async function envCommand() {
   // Use loadConfig (not loadOrCreateConfig): a query command must never write to
   // stdout — creating a config prints "Created config at …", which would poison
@@ -936,7 +937,14 @@ async function envCommand() {
     process.exit(1);
   }
   const port = config.proxy.port;
-  const useMitm = !args.slice(1).includes('--no-mitm');
+  const envArgs = args.slice(1);
+  const wantsMitm = envArgs.includes('--mitm');
+  const wantsNoMitm = envArgs.includes('--no-mitm');
+  if (wantsMitm && wantsNoMitm) {
+    process.stderr.write('teamclaude env: choose either --mitm or --no-mitm\n');
+    process.exit(1);
+  }
+  const useMitm = wantsMitm;
 
   let caPath = null;
   // The leaf has to name every host MITM will intercept, or the CONNECT for
@@ -954,6 +962,7 @@ async function envCommand() {
       // idempotent, since the merged value is what it will have next time.
       inheritedNoProxy: [process.env.NO_PROXY, process.env.no_proxy].filter(Boolean).join(','),
     });
+    if (!useMitm) lines.push(...clearSelfProxyEnvLines(port));
   } catch (err) {
     // A bad proxy.port. Nothing reaches stdout: the shell is eval'ing it.
     process.stderr.write(`teamclaude env: ${err.message} (in ${getConfigPath()})\n`);
@@ -971,7 +980,7 @@ async function envCommand() {
       process.stderr.write(`# warning: no account named "${account}" in the config — the proxy will refuse this pin\n`);
     }
   }
-  process.stderr.write(`# apply to this shell:  eval "$(teamclaude env${useMitm ? '' : ' --no-mitm'})"\n`);
+  process.stderr.write(`# apply to this shell:  eval "$(teamclaude env${useMitm ? ' --mitm' : ''})"\n`);
   if (!(await isProxyUp(port))) {
     process.stderr.write(`# note: proxy not running on port ${port} — start it with: teamclaude server\n`);
   }
@@ -2052,10 +2061,12 @@ Commands:
   login               OAuth login via browser
   login --token       OAuth login via copy/paste (no local callback; for headless/remote)
   login --api         Add an API key account
-  env [--no-mitm]     Print export lines to point Claude Code at the proxy, for
-                      'eval "$(teamclaude env)"' (MITM forward-proxy by default;
-                      --no-mitm for base-URL only). Handy for agent multiplexers
-                      that spawn claude themselves instead of via 'teamclaude run'
+  env [--mitm]        Print export lines to point Claude Code at the proxy, for
+                      'eval "$(teamclaude env)"'. Base-URL routing is the safe
+                      default so unrelated commands in the shell do not inherit
+                      TeamClaude's localhost proxy. Use --mitm explicitly when
+                      the whole shell must use the forward proxy. --no-mitm is
+                      accepted as an explicit compatibility spelling.
   run [--no-mitm] [--auto-fallback] [-- args...]
                       Run Claude Code through the proxy (errors if it's down,
                       unless --auto-fallback launches claude directly instead).
