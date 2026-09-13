@@ -85,7 +85,7 @@ const SHELL_PROXY_VARS = ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy'
 function pointsAtLoopback(value, port) {
   if (!value) return false;
   try {
-    const url = new URL(value);
+    const url = new URL(String(value));
     const host = url.hostname.replace(/^\[|\]$/g, '').toLowerCase();
     return ['127.0.0.1', 'localhost', '::1'].includes(host) && Number(url.port || 80) === port;
   } catch {
@@ -99,8 +99,8 @@ function pointsAtLoopback(value, port) {
  * @param {NodeJS.ProcessEnv} [env]
  */
 export function clearSelfProxyEnvLines(port, env = process.env) {
-  port = validPort(port);
-  return SHELL_PROXY_VARS.filter(name => pointsAtLoopback(env[name], port)).map(name => `unset ${name}`);
+  const checkedPort = validPort(port);
+  return SHELL_PROXY_VARS.filter(name => pointsAtLoopback(env[name], checkedPort)).map(name => `unset ${name}`);
 }
 
 // Build the shell `export` lines that point Claude Code — or any tool that
