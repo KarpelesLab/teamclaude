@@ -135,7 +135,7 @@ MITM mode intercepts `chatgpt.com` as well as `api.anthropic.com`, so a Codex CL
 launched behind the proxy is pooled with no `~/.codex/config.toml` change at all:
 
 ```bash
-eval "$(teamclaude env)"   # HTTPS_PROXY + NODE_EXTRA_CA_CERTS
+eval "$(teamclaude env)"   # safe base-URL routing; use --mitm for whole-shell MITM
 codex
 ```
 

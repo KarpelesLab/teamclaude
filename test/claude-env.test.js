@@ -1,9 +1,9 @@
 import { test } from 'node:test';
 import { spawnSync } from 'node:child_process';
 import assert from 'node:assert/strict';
-import { buildClaudeEnvLines, bypassesAllHosts, mergeNoProxy } from '../src/claude-env.js';
+import { buildClaudeEnvLines, bypassesAllHosts, clearSelfProxyEnvLines, mergeNoProxy } from '../src/claude-env.js';
 
-test('MITM mode (default) emits proxy vars + CA cert, and clears ANTHROPIC_BASE_URL', () => {
+test('MITM mode emits proxy vars + CA cert, and clears ANTHROPIC_BASE_URL', () => {
   const lines = buildClaudeEnvLines({ port: 3456, caPath: '/home/u/.config/teamclaude-ca.pem' });
   assert.deepEqual(lines, [
     'export HTTPS_PROXY=http://127.0.0.1:3456',
@@ -69,6 +69,26 @@ test('holdSeconds > 0 adds API_TIMEOUT_MS = holdSeconds + 60s, in both modes', (
 test('holdSeconds 0 / unset adds no API_TIMEOUT_MS', () => {
   const lines = buildClaudeEnvLines({ port: 3456, useMitm: false });
   assert.ok(!lines.some((l) => l.startsWith('export API_TIMEOUT_MS')));
+});
+
+test('stale TeamClaude loopback proxy exports are cleared without touching real proxies', () => {
+  assert.deepEqual(clearSelfProxyEnvLines(3456, {
+    HTTP_PROXY: 'http://127.0.0.1:3456',
+    HTTPS_PROXY: 'http://localhost:3456',
+    ALL_PROXY: 'http://corp.example:3456',
+    http_proxy: 'http://127.0.0.1:3456',
+    https_proxy: 'http://proxy.corp.example:3128',
+  }), ['unset HTTP_PROXY', 'unset HTTPS_PROXY', 'unset http_proxy']);
+});
+
+test('stale TeamClaude loopback proxy exports are cleared without touching real proxies', () => {
+  assert.deepEqual(clearSelfProxyEnvLines(3456, {
+    HTTP_PROXY: 'http://127.0.0.1:3456',
+    HTTPS_PROXY: 'http://localhost:3456',
+    ALL_PROXY: 'http://corp.example:3456',
+    http_proxy: 'http://127.0.0.1:3456',
+    https_proxy: 'http://proxy.corp.example:3128',
+  }), ['unset HTTP_PROXY', 'unset HTTPS_PROXY', 'unset http_proxy']);
 });
 
 // TC_ACCT parity with `teamclaude run`: the pin must be carried by the routing

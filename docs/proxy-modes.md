@@ -10,11 +10,22 @@ The plain reverse-proxy only intercepts what `ANTHROPIC_BASE_URL` covers. Some C
 teamclaude run -- <claude args...>
 ```
 
-To opt out and route via `ANTHROPIC_BASE_URL` only, pass `--no-mitm`:
+`teamclaude run` and the shell alias use MITM by default. `teamclaude env` is
+different: its default is base-URL routing so evaluating it in a working shell
+does not route unrelated tools through the localhost proxy. Opt into whole-shell
+MITM explicitly:
 
 ```bash
+eval "$(teamclaude env --mitm)"
 teamclaude run --no-mitm -- <claude args...>
 ```
+
+This distinction is deliberate. `eval "$(teamclaude env)"` changes the current
+shell and all of its children. Exporting `HTTP(S)_PROXY` there can make tools
+such as `gh` connect to TeamClaude's loopback listener. Sandboxed agent shells
+may deny that private-network connection, and machines without a direct route
+to GitHub cannot repair it with `NO_PROXY`. The safe default leaves those tools'
+network environment untouched while Claude still uses `ANTHROPIC_BASE_URL`.
 
 MITM mode launches claude pointed at TeamClaude as an **HTTPS forward proxy** (`HTTPS_PROXY`) and trusts a locally-generated CA (`NODE_EXTRA_CA_CERTS`). For an intercepted host, TeamClaude **terminates** the tunnel with a real HTTP/2 server (HTTP/1.1 clients are handled too) presenting its local leaf, then **forwards each request with a buffering, retrying client** — the same path the base URL mode uses. On each request it:
 

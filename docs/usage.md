@@ -130,11 +130,14 @@ teamclaude run -- --model opus
 
 ### Setting the environment yourself
 
-`teamclaude env` prints the same export lines `run` uses:
+`teamclaude env` prints shell exports for Claude Code. It uses base-URL routing
+by default so unrelated commands in the same shell do not inherit TeamClaude's
+localhost proxy:
 
 ```bash
-eval "$(teamclaude env)"           # MITM: HTTPS_PROXY + NODE_EXTRA_CA_CERTS
-eval "$(teamclaude env --no-mitm)" # base-URL: ANTHROPIC_BASE_URL only
+eval "$(teamclaude env)"           # base-URL: ANTHROPIC_BASE_URL only
+eval "$(teamclaude env --mitm)"     # explicit whole-shell MITM: HTTPS_PROXY + CA
+eval "$(teamclaude env --no-mitm)"  # explicit compatibility spelling
 claude
 ```
 
@@ -143,6 +146,7 @@ Only the export lines go to stdout (so `eval` is safe); a short summary and any 
 **Your own `NO_PROXY` is kept.** `run` and `env` both set `NO_PROXY=localhost,127.0.0.1,::1` and append whatever the launching shell already had. That matters for local development: a dev server on a name like `app.test` resolves to 127.0.0.1 through a local resolver, and a forward to loopback is refused, so a client that proxied it would get a 403 on every retry. `export NO_PROXY=.test` before the eval (or before `run`) and the launched client gets `localhost,127.0.0.1,::1,.test`. The one entry that is dropped is `*` — it would send `api.anthropic.com` around the proxy as well, silently ending rotation; use `--no-mitm` for a direct launch.
 
 **Using an agent multiplexer or a tool that spawns `claude` itself?** Export this environment in the process that launches those `claude` instances — e.g. `eval "$(teamclaude env)"` in the shell you start the multiplexer from. Every spawned `claude` then gets the same routing (and MITM interception of hardcoded endpoints) without going through `teamclaude run`. The trade-off: `run`'s proxy-up/down guard only applies when you launch via `run`, so start the server before the multiplexer.
+**Using an agent multiplexer or a tool that spawns `claude` itself?** Export this environment in the process that launches those `claude` instances — e.g. `eval "$(teamclaude env)"` in the shell you start the multiplexer from. Every spawned `claude` then gets base-URL routing without changing proxy settings for `gh`, `git`, or other tools. Use `eval "$(teamclaude env --mitm)"` only when the whole shell must intercept hardcoded Anthropic endpoints. The trade-off: `run`'s proxy-up/down guard only applies when you launch via `run`, so start the server before the multiplexer.
 
 ### Routing plain `claude` automatically
 
