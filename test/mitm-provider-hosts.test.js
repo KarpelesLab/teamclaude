@@ -21,6 +21,12 @@ test('a Codex fleet intercepts chatgpt.com', () => {
   assert.equal(hostMode('api.anthropic.com', config), 'rewrite');
 });
 
+test('terminal-only mode tunnels chatgpt.com even with Codex accounts', () => {
+  const config = { proxy: { terminalOnly: true }, accounts: [claude('a'), codex('c')] };
+  assert.equal(hostMode('chatgpt.com', config), 'tunnel');
+  assert.equal(hostMode('api.anthropic.com', config), 'rewrite');
+});
+
 // The safety half: a fleet with no Codex account must not have its ChatGPT
 // traffic terminated. Intercepting a host nobody asked us to read is not a
 // neutral default.

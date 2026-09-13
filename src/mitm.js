@@ -129,6 +129,11 @@ export function hostMode(host, config) {
   // Explicitly never intercepted, even though it sits under a provider's domain
   // — checked before anything else so no later rule can claim it.
   if (isNeverIntercepted(host)) return 'tunnel';
+  // In terminal-only mode the MITM must never terminate ChatGPT Desktop's
+  // connection. Terminal Codex uses the explicit /backend-api/codex base URL;
+  // this host-level bypass keeps Desktop's native auth and feature endpoints
+  // outside TeamClaude entirely.
+  if (config?.proxy?.terminalOnly === true && host === 'chatgpt.com') return 'tunnel';
   if (host === upstreamHostOf(config)) return 'rewrite';
   // A second provider's host, and only when an account actually uses that
   // provider. MITM is the mode that works without the client cooperating — a
