@@ -77,8 +77,16 @@ export function normalizeCodexUsagePayload(data) {
   const rateLimit = data?.rate_limit || data?.rate_limits;
   const shared = classify(rateLimit);
   const modelBuckets = [];
+  /** @type {{utilization: number, resetAt: number|null, seconds: number}|null} */
+  let extraFiveHour = null;
   for (const { slug, name, rateLimit: extra } of additionalLimits(data?.additional_rate_limits)) {
     const reading = classify(extra);
+    // Taken before the weekly guard below, so an extra limit stating a 5-hour
+    // window and no weekly one contributes its reading instead of being
+    // dropped whole. Tightest wins when several state one.
+    if (reading.fiveHour && (!extraFiveHour || reading.fiveHour.utilization > extraFiveHour.utilization)) {
+      extraFiveHour = reading.fiveHour;
+    }
     if (reading.sevenDay) {
       modelBuckets.push({
         slug,
@@ -88,8 +96,17 @@ export function normalizeCodexUsagePayload(data) {
       });
     }
   }
+
+  // The shared `rate_limit` on a subscription states a 7-day window and a null
+  // secondary, so it yields no 5-hour reading; the only one the payload states
+  // sits in an extra limit. Fall back to that so the probe learns a session
+  // window at all, and never let it replace a shared reading: an extra limit
+  // meters the models it names, and one barring the rest would be the one-way
+  // ratchet the weekly buckets are written to avoid.
+  const fiveHour = shared.fiveHour || extraFiveHour;
+
   return {
-    fiveHour: shared.fiveHour && { utilization: shared.fiveHour.utilization, resetAt: shared.fiveHour.resetAt },
+    fiveHour: fiveHour && { utilization: fiveHour.utilization, resetAt: fiveHour.resetAt },
     sevenDay: shared.sevenDay && { utilization: shared.sevenDay.utilization, resetAt: shared.sevenDay.resetAt },
     modelBuckets,
     planType: data?.plan_type || null,

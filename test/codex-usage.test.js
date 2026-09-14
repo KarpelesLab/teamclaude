@@ -64,6 +64,71 @@ test('an unnamed extra limit is dropped rather than filed under its index', () =
   assert.deepEqual(usage.modelBuckets, []);
 });
 
+// On a live subscription the shared `rate_limit` states a 7-day window and a
+// null secondary, so it yields no 5-hour reading at all. The only one the
+// payload states sits in an extra limit. Without this fallback the probe could
+// never learn a session window, and every rule keyed on it — preemptive
+// rotation, expiry clearing, the session-reset switch — stayed unreachable on
+// an account the probe was the only reader of.
+test("a shared reading with no five-hour window falls back to an extra limit's", () => {
+  const usage = normalizeCodexUsagePayload({
+    rate_limit: {
+      primary_window: { used_percent: 7, limit_window_seconds: 604800, reset_at: 1700604800 },
+      secondary_window: null,
+    },
+    additional_rate_limits: [
+      {
+        limit_name: 'GPT-5.3-Codex-Spark',
+        metered_feature: 'codex_bengalfox',
+        rate_limit: {
+          primary_window: { used_percent: 40, limit_window_seconds: 18000, reset_at: 1700018000 },
+          secondary_window: { used_percent: 3, limit_window_seconds: 604800, reset_at: 1700604800 },
+        },
+      },
+    ],
+  });
+  assert.deepEqual(usage.fiveHour, { utilization: 0.4, resetAt: 1700018000000 });
+  assert.deepEqual(usage.sevenDay, { utilization: 0.07, resetAt: 1700604800000 });
+});
+
+// The shared window is the account-wide authority. An extra limit meters the
+// models it names, so letting a spent one replace the shared reading would bar
+// models it never metered — the one-way ratchet the weekly buckets avoid.
+test('an extra limit never replaces a shared five-hour reading', () => {
+  const usage = normalizeCodexUsagePayload({
+    rate_limit: {
+      primary_window: { used_percent: 10, limit_window_seconds: 18000, reset_at: 1700018000 },
+      secondary_window: { used_percent: 7, limit_window_seconds: 604800, reset_at: 1700604800 },
+    },
+    additional_rate_limits: [
+      {
+        limit_name: 'GPT-5.3-Codex-Spark',
+        metered_feature: 'codex_bengalfox',
+        rate_limit: { primary_window: { used_percent: 99, limit_window_seconds: 18000, reset_at: 1700099000 } },
+      },
+    ],
+  });
+  assert.deepEqual(usage.fiveHour, { utilization: 0.1, resetAt: 1700018000000 });
+});
+
+// The weekly guard builds the model bucket; it must not also decide whether the
+// 5-hour reading survives, or an extra limit that states only a session window
+// is thrown away along with it.
+test('an extra limit stating only a five-hour window still contributes it', () => {
+  const usage = normalizeCodexUsagePayload({
+    rate_limit: { primary_window: { used_percent: 7, limit_window_seconds: 604800, reset_at: 1700604800 } },
+    additional_rate_limits: [
+      {
+        limit_name: 'GPT-5.3-Codex-Spark',
+        metered_feature: 'codex_bengalfox',
+        rate_limit: { primary_window: { used_percent: 55, limit_window_seconds: 18000, reset_at: 1700018000 } },
+      },
+    ],
+  });
+  assert.deepEqual(usage.fiveHour, { utilization: 0.55, resetAt: 1700018000000 });
+  assert.deepEqual(usage.modelBuckets, []);
+});
+
 test('fetchCodexUsage sends the account-scoped read-only request', async () => {
   let request;
   const usage = await fetchCodexUsage({ credential: 'secret', accountId: 'acct-1' }, {
