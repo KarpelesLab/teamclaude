@@ -210,6 +210,11 @@ const BAR_MAX = 20;
 // terminal lays the table out exactly as it did before the column could grow.
 const NAME_MIN = 12;
 
+// Clear space the centred version label needs on each side before it is drawn
+// at all. Below that it reads as a collision with the title or the port block,
+// so the whole label is dropped rather than squeezed.
+const HEAD_GAP = 2;
+
 // Which pair of bars a row draws: the subscription buckets (Ses/Wk, plus the
 // S7/F7 family bars) when any unified reading exists, else the metered Tok/Req
 // pair an API-key account reports. The account row budget is drawn per
@@ -412,7 +417,11 @@ export class TUI {
     readCredentials = importCredentials, readProfile = fetchProfile,
     // Names the activity column against the session id the client sent. Absent
     // or disabled leaves every row showing the short id.
-    sessionTitles = null }) {
+    sessionTitles = null,
+    // How the header names this build, and whether a newer release is known.
+    // In attach mode the account manager carries the server's own answer and
+    // these are unused; the empty defaults keep the label hidden until it does.
+    versionLabel = '', updateAvailable = false }) {
     this.am = accountManager;
     this.remote = remote;
     this.applySwitch = applySwitch;
@@ -428,6 +437,8 @@ export class TUI {
     this._readProfile = readProfile;
     this._activityStream = null;
     this.sessionTitles = sessionTitles;
+    this.versionLabel = versionLabel;
+    this.updateAvailable = updateAvailable;
 
     this.log = [];           // completed activity entries
     this.active = new Map(); // in-flight requests
@@ -1378,7 +1389,26 @@ export class TUI {
     // mode): what is on screen is the last snapshot, not the current state.
     const live = this.am.connected === false ? red('▼') : green('▲');
     const right = `${sessStr}Port ${port} ${live} `;
-    lines.push(left + ' '.repeat(Math.max(1, W - vw(left) - vw(right))) + right);
+    // In attach mode the dashboard names the server's build, not this process's,
+    // so the account manager's answer wins. It arrives sanitized (applyStatus)
+    // and starts empty, which keeps the label hidden until the first poll rather
+    // than briefly showing the local checkout's version as if it were the
+    // server's. A local AccountManager has neither property.
+    const label = this.am.versionLabel ?? this.versionLabel;
+    const upd = this.am.updateAvailable ?? this.updateAvailable;
+    const mid = label ? dim(label) + (upd ? ` ${green('▲')}` : '') : '';
+    const lw = vw(left), rw = vw(right), mw = vw(mid);
+    // Centred on the line, not in the gap between the two blocks, so the label
+    // holds still as the session segment comes and goes.
+    const start = Math.floor((W - mw) / 2);
+    // Load-bearing, not cosmetic: both padding runs below would be negative
+    // without it, and ' '.repeat(-1) throws. Satisfying it also means the mid
+    // branch can never produce the over-wide line the other branch can, so the
+    // two are not interchangeable.
+    const midFits = mw > 0 && start - lw >= HEAD_GAP && (W - rw) - (start + mw) >= HEAD_GAP;
+    lines.push(midFits
+      ? left + ' '.repeat(start - lw) + mid + ' '.repeat(W - rw - start - mw) + right
+      : left + ' '.repeat(Math.max(1, W - lw - rw)) + right);
     lines.push(' ' + dim('─'.repeat(W - 2)));
 
     const footerH = 2;
