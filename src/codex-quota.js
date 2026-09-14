@@ -68,14 +68,24 @@ function collectFamilies(headers) {
 }
 
 /**
+ * One window reading: utilization as a 0-1 fraction, reset as ms epoch or null.
+ *
+ * @typedef {{utilization: number, resetAt: number|null}} QuotaWindow
+ */
+
+/**
  * Turn one family's windows into `{ fiveHour, weekly }` readings, keyed by the
  * window's own duration rather than its primary/secondary position.
  *
  * A window with no `window-minutes`, a zero duration, or an unparseable
  * utilization is dropped: a zeroed window is how this API says "not
  * applicable", and treating that as 0% used would look like full headroom.
+ *
+ * @param {Record<string, {usedPercent?: number, windowMinutes?: number, resetAt?: number}>} windows
+ * @returns {{fiveHour?: QuotaWindow, weekly?: QuotaWindow}}
  */
 function classify(windows) {
+  /** @type {{fiveHour?: QuotaWindow, weekly?: QuotaWindow}} */
   const out = {};
   for (const w of Object.values(windows)) {
     const minutes = Number(w.windowMinutes);
@@ -122,12 +132,19 @@ export function parseCodexQuota(headers) {
     if (account.weekly.resetAt) quota.unified7dReset = account.weekly.resetAt;
   }
 
-  // Model-scoped families. Their 5-hour window is not modelled separately —
-  // the manager scopes eligibility by weekly family buckets — so only the
-  // weekly reading is carried, alongside the name upstream gave it.
+  // Model-scoped families. Their weekly reading is the family bucket, carried
+  // alongside the name upstream gave it. Their 5-hour one is picked up below:
+  // on a subscription it is the only 5h this API ever states.
+  /** @type {QuotaWindow|null} */
+  let scopedFiveHour = null;
   for (const fam of families.values()) {
     if (!fam.slug) continue;
     const scoped = classify(fam.windows);
+    // Tightest wins, so the reading is taken before the weekly guard below
+    // drops a family that states a 5h window and no weekly one.
+    if (scoped.fiveHour && (!scopedFiveHour || scoped.fiveHour.utilization > scopedFiveHour.utilization)) {
+      scopedFiveHour = scoped.fiveHour;
+    }
     if (!scoped.weekly) continue;
     (quota.modelBuckets ??= []).push({
       slug: fam.slug,
@@ -135,6 +152,21 @@ export function parseCodexQuota(headers) {
       utilization: scoped.weekly.utilization,
       resetAt: scoped.weekly.resetAt,
     });
+  }
+
+  // A subscription's account-wide family states no 5-hour window at all: it
+  // puts the 7-day one in `primary` and zeroes `secondary`, which classify()
+  // drops, correctly, because a zero-length window is how this API says "not
+  // applicable". The only 5h it states sits in a named family, and upstream
+  // returns the same one whatever model was asked for — it is the account's
+  // session window wearing a model's name. So fill the shared bucket from it
+  // when the account-wide family left it empty, and never overwrite a reading
+  // the account-wide family did give: a family bucket barring models it does
+  // not meter would be the one-way ratchet the weekly buckets take such care
+  // to avoid.
+  if (quota.unified5h == null && scopedFiveHour) {
+    quota.unified5h = scopedFiveHour.utilization;
+    if (scopedFiveHour.resetAt) quota.unified5hReset = scopedFiveHour.resetAt;
   }
 
   return quota;
