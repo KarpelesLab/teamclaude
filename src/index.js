@@ -39,6 +39,7 @@ import { renderStatus, formatPercent } from './status-renderer.js';
 import { sanitizeText } from './safe-text.js';
 import { ClientUsageTracker, UsageDimensionTracker } from './client-usage.js';
 import { buildClaudeEnvLines, bypassesAllHosts, encodePinComponent, mergeNoProxy } from './claude-env.js';
+import { issueManagedCredential, buildManagedEnv, syncManagedClientAuth } from './managed-client-auth.js';
 import { serviceKind, installService, uninstallService, serviceStatus, renderService, logPath } from './service.js';
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
 import { getUpstreamProxy, describeProxy, describeSelfProxy } from './upstream-proxy.js';
@@ -388,6 +389,7 @@ async function serverCommand() {
     const diskConfig = await loadConfig();
     if (!diskConfig) return 0;
     const added = await syncAccountsFromDisk(diskConfig, config, accountManager);
+    syncManagedClientAuth(diskConfig, config);
     // Pick up client-key edits (proxy.clientKeys is read live by both auth
     // gates through the shared config object, so refreshing it here is all a
     // key add/rotate/revoke needs — no restart).
@@ -937,6 +939,9 @@ async function envCommand() {
   }
   const port = config.proxy.port;
   const useMitm = !args.slice(1).includes('--no-mitm');
+  const managedEnv = config.proxy.managedClientAuth === true
+    ? await managedLaunchEnv(config, useMitm, process.env)
+    : null;
 
   let caPath = null;
   // The leaf has to name every host MITM will intercept, or the CONNECT for
@@ -952,12 +957,24 @@ async function envCommand() {
       account, proxyApiKey: config.proxy?.apiKey || '',
       // The shell doing the eval keeps its own NO_PROXY entries; re-running is
       // idempotent, since the merged value is what it will have next time.
-      inheritedNoProxy: [process.env.NO_PROXY, process.env.no_proxy].filter(Boolean).join(','),
+      inheritedNoProxy: [managedEnv?.NO_PROXY ?? process.env.NO_PROXY, managedEnv?.no_proxy ?? process.env.no_proxy].filter(Boolean).join(','),
     });
   } catch (err) {
     // A bad proxy.port. Nothing reaches stdout: the shell is eval'ing it.
     process.stderr.write(`teamclaude env: ${err.message} (in ${getConfigPath()})\n`);
     process.exit(1);
+  }
+  if (managedEnv) {
+    // Only auth-related changes are emitted; never dump inherited environment.
+    for (const key of new Set([...Object.keys(process.env), ...Object.keys(managedEnv)])) {
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
+      if (!(key in managedEnv)) lines.push(`unset ${key}`);
+      else if (managedEnv[key] !== process.env[key] || key === 'CLAUDE_CODE_OAUTH_TOKEN') {
+        const quoted = `'${String(managedEnv[key]).replaceAll("'", "'\"'\"'")}'`;
+        lines.push(`export ${key}=${quoted}`);
+      }
+    }
+    console.error('[TeamClaude] Pool-managed authentication (no personal Claude login required)');
   }
   process.stdout.write(`${lines.join('\n')}\n`);
 
@@ -977,6 +994,37 @@ async function envCommand() {
   }
   if (config.proxy?.apiKey) {
     process.stderr.write(`# remote (non-loopback) clients must also present the proxy key: ANTHROPIC_API_KEY=<proxy.apiKey> (base-URL), or http://<key>@host:${port} (MITM)\n`);
+  }
+}
+
+// Managed clients must never fall back to their own OAuth credentials. A TCP
+// listener alone is insufficient: an older proxy cannot translate this token.
+async function managedLaunchEnv(config, useMitm, inherited) {
+  try {
+    if (!useMitm) throw new Error('Pool-managed authentication requires MITM; remove --no-mitm.');
+    let supported = false;
+    try {
+      const response = await fetch(`http://127.0.0.1:${config.proxy.port}/teamclaude/status`, {
+        headers: { 'x-api-key': config.proxy.apiKey || '' },
+        signal: AbortSignal.timeout(5_000), redirect: 'error',
+      });
+      supported = response.ok && (await response.json()).managedClientAuth?.enabled === true;
+    } catch { /* down, stalled or incompatible; no personal-login fallback */ }
+    if (!supported) throw new Error('Pool-managed authentication requires a running compatible TeamClaude proxy with managedClientAuth enabled.');
+
+    const pin = (inherited.TC_ACCT || '').trim();
+    let accountId;
+    if (pin) {
+      const named = matchAccounts(config.accounts, pin);
+      const matched = named.length ? named
+        : /^\d+$/.test(pin) && config.accounts[Number(pin)] ? [config.accounts[Number(pin)]] : [];
+      if (matched.length !== 1) throw new Error('Pool-managed authentication cannot resolve TC_ACCT to one account.');
+      accountId = matched[0].id;
+    }
+    return buildManagedEnv(inherited, issueManagedCredential(config, accountId), mitmHosts(config));
+  } catch (err) {
+    console.error(`[TeamClaude] ${err.message}`);
+    process.exit(1);
   }
 }
 
@@ -1004,7 +1052,10 @@ async function runCommand() {
   // proxy (no rotation, spending the user's own quota). Pass --auto-fallback to
   // opt back into the transparent direct launch (e.g. for a dumb shell alias).
   const port = config.proxy.port;
-  const env = { ...process.env };
+  const managedAuth = config.proxy.managedClientAuth === true;
+  const env = managedAuth
+    ? await managedLaunchEnv(config, useMitm, process.env)
+    : { ...process.env };
   // TC_ACCT pins this session to one account, in either mode. It is teamclaude's
   // own knob, so it never reaches the child: claude has no use for it, and an
   // account name is not something to leak into a subprocess environment that
@@ -1033,7 +1084,7 @@ async function runCommand() {
       env.HTTPS_PROXY = env.HTTP_PROXY = env.https_proxy = env.http_proxy = proxyUrl;
       // Keep the operator's own NO_PROXY and add ours — see mergeNoProxy. Both
       // spellings are read: a tool that set only one still meant it.
-      const inheritedNoProxy = [process.env.NO_PROXY, process.env.no_proxy];
+      const inheritedNoProxy = [env.NO_PROXY, env.no_proxy];
       env.NO_PROXY = env.no_proxy = mergeNoProxy(...inheritedNoProxy);
       if (inheritedNoProxy.some(bypassesAllHosts)) {
         console.error('[TeamClaude] NO_PROXY=* ignored: it would send api.anthropic.com around the proxy (no rotation). Use --no-mitm for a direct launch.');
@@ -1059,14 +1110,16 @@ async function runCommand() {
         env.ANTHROPIC_BASE_URL = `http://localhost:${port}`;
       }
     }
-  } else if (autoFallback) {
+  } else if (autoFallback && !managedAuth) {
     console.error(`[TeamClaude] Proxy not running on port ${port} — launching claude directly (--auto-fallback; start it with: teamclaude server)`);
   } else {
     console.error(`[TeamClaude] Proxy not running on port ${port}.`);
     console.error('Start it with: teamclaude server');
-    console.error('Or pass --auto-fallback to launch claude directly (bypassing the proxy) when it is down.');
+    if (!managedAuth) console.error('Or pass --auto-fallback to launch claude directly (bypassing the proxy) when it is down.');
     process.exit(1);
   }
+
+  if (managedAuth) console.error('[TeamClaude] Pool-managed authentication (no personal Claude login required)');
 
   // If holdSeconds is set, ensure API_TIMEOUT_MS on the Claude Code side is
   // large enough for the hold to complete. Add 60s padding (one extra poll

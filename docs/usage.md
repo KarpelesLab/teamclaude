@@ -128,6 +128,31 @@ Arguments after `--` go to `claude`:
 teamclaude run -- --model opus
 ```
 
+### Pool-managed authentication (no personal login)
+
+By default every machine running `teamclaude run` still needs its own Claude login: the proxy rotates *which account serves the request*, but the CLI authenticates as whoever is signed in locally. Set `proxy.managedClientAuth` to `true` (see [Configuration](configuration.md#fields)) and it no longer does.
+
+```json
+{ "proxy": { "managedClientAuth": true } }
+```
+
+`run` then launches the CLI with a **facade bearer** in `CLAUDE_CODE_OAUTH_TOKEN`, and `teamclaude env` emits the same thing for a shell you set up yourself:
+
+```
+tc-managed-v1.<base64url account id>.<HMAC-SHA256 over proxy.apiKey>
+```
+
+It names an identity and nothing else — no access token, no refresh token, no OAuth origin. Only this proxy can turn it into a request: the signature is verified against `proxy.apiKey`, the identity is resolved to a live account, and the real token is injected upstream. Copying the credential to another machine buys nothing without the proxy that minted it.
+
+The launch environment is scrubbed to match. The 23 variables that would let the CLI pick a different credential or provider (`ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_OAUTH_REFRESH_TOKEN`, …) are unset in the child only — your shell and your saved login are never touched — and any `NO_PROXY` entry matching an intercepted host is dropped, since bypassing the proxy would leave the CLI holding a token nothing else accepts.
+
+Two boundaries worth knowing:
+
+- **MITM is required.** `run --no-mitm` is refused rather than downgraded. Base-URL routing leaves the CLI free to reach `api.anthropic.com` directly, where the facade bearer is not a credential — the failure would look like a broken login instead of a misconfiguration.
+- **Anthropic OAuth accounts only.** Codex, API-key and third-party backend accounts are never eligible identities, and a facade bearer presented to a non-Anthropic upstream (including over a WebSocket upgrade) is refused with 403 rather than relayed.
+
+Revocation is live and needs no client change: disable the mode, remove or disable the account, or rotate `proxy.apiKey`, then `POST /teamclaude/reload`. Credentials naming a now-ineligible identity stop working on the next request, while ordinary inference on the remaining accounts continues uninterrupted.
+
 ### Setting the environment yourself
 
 `teamclaude env` prints the same export lines `run` uses:

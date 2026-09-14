@@ -438,6 +438,7 @@ const PAGE = `<!doctype html>
   <div id="app" style="display:none">
     <h1>TeamClaude</h1>
     <p class="sub" id="summary"></p>
+    <p class="sub" id="clientAuth"></p>
     <div class="actions">
       <button id="reload" type="button">Reload config</button>
       <button id="probe" type="button">Probe quotas</button>
@@ -822,6 +823,14 @@ ${SHARED_HELPERS}
       sum.appendChild(el('b', '', s.currentAccount || 'none'));
     }
     sum.appendChild(el('span', '', ' · ' + (sess.active || 0) + ' active / ' + (sess.known || 0) + ' known sessions' + (up ? ' · ' + up : '')));
+    var managedAuth = s.managedClientAuth || {};
+    var authSummary = document.getElementById('clientAuth');
+    authSummary.textContent = managedAuth.enabled
+      ? 'Claude 실행 인증: 풀 관리 · 계정 토큰 자동 갱신: 풀에서 처리 · 관리 인증 요청 ' + (managedAuth.requests || 0) + '건. 적용 전 Claude 창은 종료 후 대화 재개가 필요합니다.'
+      : 'Claude 실행 인증: 개별 로그인 · 풀의 active 상태와 Claude 창의 로그인 상태는 별개입니다.';
+    if (managedAuth.lastFailure) {
+      authSummary.appendChild(el('span', 'warn', ' 최근 관리 인증 오류: ' + managedAuth.lastFailure.reason + ' (' + managedAuth.lastFailure.at + ')'));
+    }
     var probe = s.probe || {};
     var probeBtn = document.getElementById('probe');
     probeBtn.textContent = probe.running ? 'Probe running…' : 'Probe quotas';

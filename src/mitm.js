@@ -265,7 +265,7 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
         }
         // The CONNECT's client identity is bound to this listener (see getServer),
         // so the channel is attributed the way the requests in the tunnel are.
-        relayUpgrade(req, socket, head, target, sx, { client, clientUsage, log });
+        relayUpgrade(req, socket, head, target, sx, { client, clientUsage, log, managedConfig: config, accountManager });
       } catch (err) {
         log(`[TeamClaude] MITM: WebSocket upgrade handler failed for ${safeLine(req?.url)}: ${err?.message || err}`);
         try { socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n'); } catch { /* client already gone */ }
