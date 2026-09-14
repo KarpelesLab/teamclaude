@@ -1927,6 +1927,79 @@ export function exhaustedMessage(accountManager, model, retryAfter) {
   return `No account can serve this request${scope}: all ${pool}${aside} are at their quota or rate limit.${when}`;
 }
 
+// The events an SSE response emits before it has committed to any output. A refusal can
+// still arrive while the stream sits in these, and nothing has reached the client yet.
+const SSE_UNCOMMITTED_EVENTS = new Set(['response.created', 'response.queued', 'response.in_progress']);
+// A refusal reported inside the body rather than as a status.
+const SSE_FAILURE_EVENTS = new Set(['response.failed', 'error']);
+
+/**
+ * Replay what was already read, then hand back the rest of the same stream.
+ *
+ * @param {Array<Uint8Array>} chunks
+ * @param {ReadableStreamDefaultReader<Uint8Array>} reader
+ * @returns {ReadableStream<Uint8Array>}
+ */
+function replayStream(chunks, reader) {
+  return new ReadableStream({
+    start(controller) { for (const chunk of chunks) controller.enqueue(chunk); },
+    async pull(controller) {
+      const { value, done } = await reader.read();
+      if (done) controller.close(); else controller.enqueue(value);
+    },
+    cancel(reason) { return reader.cancel(reason); },
+  });
+}
+
+/**
+ * Read the head of an SSE response before its headers reach the client.
+ *
+ * The Responses API answers 200 and then reports a refusal as an event inside the body —
+ * "Selected model is at capacity" arrives that way, and so does any other mid-stream
+ * failure — so a failover keyed on the status never sees it and the refusal reaches the
+ * client as if it were the answer. Nothing has been written out yet at this point, so the
+ * head can be read, judged, and the request retried on another account.
+ *
+ * Held only while the stream is still uncommitted, and bounded twice over — a byte budget
+ * and a wall clock — so a slow first token is never held hostage, and a stream that says
+ * nothing is released rather than waited on.
+ */
+/**
+ * @param {ReadableStream<Uint8Array>} body
+ * @param {{ budgetBytes?: number, holdMs?: number, now?: () => number }} [options]
+ * @returns {Promise<{ failed: boolean, head: string, body: ReadableStream<Uint8Array>, cancel: () => Promise<void> }>}
+ */
+export async function peekStreamFailure(body, { budgetBytes = 65_536, holdMs = 10_000, now = Date.now } = {}) {
+  const reader = body.getReader();
+  const chunks = [];
+  let size = 0, failed = false, head = '';
+  const deadline = now() + holdMs;
+  try {
+    for (;;) {
+      const left = deadline - now();
+      if (left <= 0) break;
+      let timer;
+      const expiry = new Promise(resolve => { timer = setTimeout(() => resolve(null), left); });
+      const next = await Promise.race([reader.read(), expiry]);
+      clearTimeout(timer);
+      if (!next || next.done) break;
+      chunks.push(next.value);
+      size += next.value.byteLength ?? next.value.length ?? 0;
+      head += Buffer.from(next.value).toString('utf8');
+      // Order decides this, not presence: a failure that follows real output is a stream
+      // that broke after committing, and there is no retry behind committed output. Both
+      // spellings are read — the SSE event name and the type inside its data frame — and
+      // the earliest one in the body wins.
+      const names = [...head.matchAll(/^event:\s*(\S+)/gm), ...head.matchAll(/"type"\s*:\s*"(response\.[a-z_.]+|error)"/g)]
+        .map(m => ({ at: m.index ?? 0, name: m[1] })).sort((a, b) => a.at - b.at);
+      const decisive = names.find(({ name }) => !SSE_UNCOMMITTED_EVENTS.has(name));
+      if (decisive) { failed = SSE_FAILURE_EVENTS.has(decisive.name); break; }
+      if (size >= budgetBytes) break;
+    }
+  } catch { /* Release whatever arrived; the stream itself reports its own break. */ }
+  return { failed, head, body: replayStream(chunks, reader), cancel: () => reader.cancel().catch(() => {}) };
+}
+
 export async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, useSx) {
   const maxRetries = accountManager.accounts.length;
   // This function is exported, so a caller may hand us a ctx built elsewhere.
@@ -2559,6 +2632,32 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       }
     }
 
+    // Read before the headers go out, because after them there is no retry left.
+    const contentType = upstreamRes.headers.get('content-type') || '';
+    const isStreaming = contentType.includes('text/event-stream');
+    let streamBody = upstreamRes.body;
+
+    if (accountManager.failoverOnAnyError && isStreaming && upstreamRes.status < 400 && streamBody
+        && !res.headersSent && !ctx.streamFailureHopped && retryCount < maxRetries) {
+      const peeked = await peekStreamFailure(streamBody);
+      streamBody = peeked.body;
+      if (peeked.failed) {
+        const alt = accountManager.pickAlternate(
+          new Set([...ctx.tried, ...(ctx.rolledOff || []), account.index]),
+          ctx.model, ctx.advisorModel, ctx.provider,
+        );
+        if (alt && !accountManager.isPaused(alt.index)) {
+          await peeked.cancel();
+          ctx.streamFailureHopped = true;
+          ctx.hopTo = alt.index;
+          ctx.tried.add(account.index);
+          console.log(`[TeamClaude] Stream failed inside a 200 on "${account.name}" — failing over once to "${alt.name}" (failoverOnAnyError)`);
+          if (clientGone(res)) { ctx.abandoned = true; return; }
+          return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+        }
+      }
+    }
+
     res.writeHead(upstreamRes.status, responseHeaders);
 
     // The catch block's retry is guarded by `!res.headersSent`, so a stay
@@ -2567,7 +2666,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       accountManager.confirmStay(account, restingGen, ctx.sessionId, ctx.provider);
     }
 
-    if (!upstreamRes.body) {
+    if (!streamBody) {
       const l = getLog();
       if (l) { l.body('RESPONSE BODY', null); l.end(); }
       res.end();
@@ -2575,16 +2674,13 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       return;
     }
 
-    const contentType = upstreamRes.headers.get('content-type') || '';
-    const isStreaming = contentType.includes('text/event-stream');
-
     if (isStreaming) {
       // Stream each chunk straight to the log as it is relayed — never hold the
       // whole (potentially ~1M-token) SSE body in memory.
       const l = getLog();
       const bw = l ? l.bodyWriter('RESPONSE BODY (streamed)', contentType) : null;
       try {
-        await streamResponse(upstreamRes.body, res, account.index, accountManager, bw, ctx.onUsage, ctx.sessionId, ctx.model);
+        await streamResponse(streamBody, res, account.index, accountManager, bw, ctx.onUsage, ctx.sessionId, ctx.model);
         // Reached only when the stream completed. A stream that dies upstream
         // throws out of streamResponse, so it never marks itself delivered —
         // which is the failure the token counters cannot see, since a stream

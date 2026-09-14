@@ -101,3 +101,63 @@ test('the account a refusal happened on is not taken out of rotation', async () 
     assert.equal(am.isPaused(0), false);
   }, { failoverOnAnyError: true });
 });
+
+// ── A refusal reported inside a 200 ─────────────────────────────────────────
+
+// The Responses API answers 200 and then says the request failed in an event — this is
+// how "Selected model is at capacity" arrives. Every failover in this file keys on the
+// status, so the refusal used to reach the client as though it were the answer, on an
+// account that may be the only one refusing.
+const sse = (...events) => events.map(e => `event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`).join('');
+const CREATED = { type: 'response.created', response: { id: 'resp_1' } };
+const FAILED = { type: 'response.failed', response: { error: { message: 'Selected model is at capacity.' } } };
+const ANSWER = [{ type: 'response.output_text.delta', delta: 'hi' }, { type: 'response.completed' }];
+
+function stream(res, body) {
+  res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+  res.end(body);
+}
+
+test('a failure reported inside a 200 stream hops to a sibling', async () => {
+  await withFleet((req, res) => {
+    if (tokenOf(req) === 't-a') return stream(res, sse(CREATED, FAILED));
+    stream(res, sse(CREATED, ...ANSWER));
+  }, async ({ proxyPort, seen }) => {
+    const { status, body } = await post(proxyPort);
+    assert.equal(status, 200);
+    assert.match(body, /response\.completed/, 'the sibling\'s answer should be what the client reads');
+    assert.doesNotMatch(body, /at capacity/, 'the refusal must not reach the client');
+    assert.deepEqual(seen, ['t-a', 't-b']);
+  }, { failoverOnAnyError: true });
+});
+
+// Bounded like every other hop here: a refusal the whole fleet shares is the provider
+// talking, and walking it would spend every account to learn the same thing.
+test('the in-stream hop is bounded to one', async () => {
+  await withFleet((req, res) => stream(res, sse(CREATED, FAILED)), async ({ proxyPort, seen }) => {
+    const { status, body } = await post(proxyPort);
+    assert.equal(status, 200, 'upstream answered 200, and that is what the client gets');
+    assert.match(body, /at capacity/, 'the second refusal is relayed rather than hidden');
+    assert.equal(seen.length, 2, 'two attempts, not one per account');
+  }, { failoverOnAnyError: true });
+});
+
+// Once output has been committed there is no retry behind it: the headers are out and
+// bytes may already be on the wire, so a late failure is relayed, not re-routed.
+test('a stream that already produced output is relayed, not re-routed', async () => {
+  await withFleet((req, res) => stream(res, sse(CREATED, ANSWER[0], FAILED)), async ({ proxyPort, seen }) => {
+    const { status, body } = await post(proxyPort);
+    assert.equal(status, 200);
+    assert.match(body, /at capacity/);
+    assert.deepEqual(seen, ['t-a'], 'no sibling was spent on a committed stream');
+  }, { failoverOnAnyError: true });
+});
+
+// Off by default, like the status-keyed hop beside it.
+test('off by default: an in-stream failure is relayed without a hop', async () => {
+  await withFleet((req, res) => stream(res, sse(CREATED, FAILED)), async ({ proxyPort, seen }) => {
+    const { body } = await post(proxyPort);
+    assert.match(body, /at capacity/);
+    assert.deepEqual(seen, ['t-a']);
+  });
+});
