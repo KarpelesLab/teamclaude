@@ -25,6 +25,7 @@ const text = (value, max, fallback = '') => {
   return safeLine(value, max) || fallback;
 };
 const NAME_MAX = 64;
+const LABEL_MAX = 32;
 
 // Addresses that reach this machine. A server bound to one of these exempts
 // loopback clients from the proxy-key gate, which changes what a 401 can mean.
@@ -198,6 +199,10 @@ export class RemoteAccountManager {
     this.connected = false;   // false ⇒ the view is a stale snapshot
     this.lastError = null;
     this.status = null;
+    // Empty until the first poll, so the header shows no version rather than
+    // this process's own — in attach mode that would name the wrong machine.
+    this.versionLabel = '';
+    this.updateAvailable = false;
   }
 
   /** Per-bucket threshold lookup, mirroring AccountManager.thresholdFor so the
@@ -266,6 +271,10 @@ export class RemoteAccountManager {
       accounts: (Array.isArray(r?.accounts) ? r.accounts : [])
         .map(a => ({ ...a, name: text(a?.name, NAME_MAX, '?'), eligible: !!a?.eligible })),
     }));
+    // A server too old to send versionLabel still sends version; one older than
+    // both leaves the label empty and the header simply omits it.
+    this.versionLabel = text(status?.server?.versionLabel ?? status?.server?.version, LABEL_MAX);
+    this.updateAvailable = !!status?.server?.updateAvailable;
     this.status = status;
     this.connected = true;
     this.lastError = null;
