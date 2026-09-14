@@ -275,11 +275,12 @@ export class AccountManager {
    * @param {Array<Object>} [opts.routes]
    * @param {Object} [opts.ramp]
    * @param {boolean|string} [opts.distributeSessions]
+   * @param {boolean} [opts.failoverOnAnyError]
    * @param {Object} [opts.adaptive]
    * @param {Object} [opts.sessionTracker]
    * @param {Object} [opts.expiryRouting]
    */
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, failoverOnAnyError = false, adaptive, sessionTracker, expiryRouting } = {}) {
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
@@ -299,6 +300,12 @@ export class AccountManager {
     // header and the remote dashboard all ask only that question.
     this.distributionMode = distributionMode(distributeSessions);
     this.distributeSessions = this.distributionMode !== 'off';
+    /** Hop once to another account on any non-2xx the specific branches in
+     *  forwardRequest do not already handle. Off by default: the handled
+     *  statuses are the ones whose meaning is known, and a blanket hop spends a
+     *  second account on errors that are not about accounts at all.
+     *  @type {boolean} */
+    this.failoverOnAnyError = failoverOnAnyError === true;
     // Adaptive burn rate and tolerated concurrency are inferred from live
     // traffic. Plan size is authoritative OAuth profile metadata, not a learned
     // estimate. Learners are constructed unconditionally so enabling adaptive

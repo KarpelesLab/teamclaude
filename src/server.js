@@ -2528,6 +2528,37 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       responseHeaders[key] = value;
     }
 
+    // Every branch above handles a status whose shape this file knows. An
+    // upstream that refuses for a reason it has no branch for — "the selected
+    // model is at capacity" arrives as one — still costs the client its request
+    // on an account that may be the only one refusing. With the option on,
+    // spend one hop finding out.
+    //
+    // One hop, for the reason the 5xx path takes one: a second account
+    // answering the same way is the provider talking, not the account, and
+    // walking the fleet would spend every account's cache to learn it.
+    //
+    // The account is NOT marked for this. A status this branch cannot classify
+    // is as likely the request's fault as the account's — a malformed body is
+    // refused identically everywhere — and cooling the pool over one bad request
+    // would take the fleet out for something no account did wrong.
+    if (accountManager.failoverOnAnyError && upstreamRes.status >= 400
+        && !res.headersSent && !ctx.anyErrorHopped && retryCount < maxRetries) {
+      const alt = accountManager.pickAlternate(
+        new Set([...ctx.tried, ...(ctx.rolledOff || []), account.index]),
+        ctx.model, ctx.advisorModel, ctx.provider,
+      );
+      if (alt && !accountManager.isPaused(alt.index)) {
+        await upstreamRes.body?.cancel();
+        ctx.anyErrorHopped = true;
+        ctx.hopTo = alt.index;
+        ctx.tried.add(account.index);
+        console.log(`[TeamClaude] Upstream ${upstreamRes.status} on "${account.name}" — failing over once to "${alt.name}" (failoverOnAnyError)`);
+        if (clientGone(res)) { ctx.abandoned = true; return; }
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+      }
+    }
+
     res.writeHead(upstreamRes.status, responseHeaders);
 
     // The catch block's retry is guarded by `!res.headersSent`, so a stay
