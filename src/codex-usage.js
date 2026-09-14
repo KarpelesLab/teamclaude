@@ -35,6 +35,40 @@ function classify(rateLimit) {
 }
 
 /**
+ * Name each extra limit from the entry itself.
+ *
+ * A live subscription sends `additional_rate_limits` as a LIST whose entries
+ * name themselves (`metered_feature`, `limit_name`); older readings used an
+ * object keyed by the feature. `Object.entries` over a list hands back array
+ * indices, so every bucket was filed as "0" and "1" — two accounts' Spark
+ * limits collided under one meaningless key, and the header path's name for
+ * the same bucket stacked beside it rather than replacing it.
+ *
+ * `metered_feature` is that header name with a `codex_` prefix (`codex_bengalfox`
+ * here is `x-codex-bengalfox-*` there), so stripping it makes the two paths
+ * agree on one key per bucket.
+ *
+ * @param {any} additional
+ * @returns {Array<{slug: string, name: string, rateLimit: any}>}
+ */
+function additionalLimits(additional) {
+  if (Array.isArray(additional)) {
+    const out = [];
+    for (const entry of additional) {
+      if (!entry || typeof entry !== 'object') continue;
+      const feature = typeof entry.metered_feature === 'string' ? entry.metered_feature.replace(/^codex_/, '') : '';
+      const label = typeof entry.limit_name === 'string' ? entry.limit_name : '';
+      const slug = feature || label;
+      if (!slug) continue;
+      out.push({ slug, name: label || slug, rateLimit: entry.rate_limit || entry });
+    }
+    return out;
+  }
+  return Object.entries(additional || {})
+    .map(([key, value]) => ({ slug: key, name: key, rateLimit: value?.rate_limit || value }));
+}
+
+/**
  * Convert the private `/wham/usage` response into TeamClaude quota fields.
  *
  * @param {any} data
@@ -43,11 +77,11 @@ export function normalizeCodexUsagePayload(data) {
   const rateLimit = data?.rate_limit || data?.rate_limits;
   const shared = classify(rateLimit);
   const modelBuckets = [];
-  for (const [name, value] of Object.entries(data?.additional_rate_limits || {})) {
-    const reading = classify(value?.rate_limit || value);
+  for (const { slug, name, rateLimit: extra } of additionalLimits(data?.additional_rate_limits)) {
+    const reading = classify(extra);
     if (reading.sevenDay) {
       modelBuckets.push({
-        slug: name,
+        slug,
         name,
         utilization: reading.sevenDay.utilization,
         resetAt: reading.sevenDay.resetAt,
