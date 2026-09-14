@@ -9,6 +9,7 @@ import {
   oauthIdentityFields,
 } from './identity.js';
 import { configIndexFor, managerAccountFor, markAccountRemoved } from './account-pairing.js';
+import { PROVIDERS, providerOf } from './provider.js';
 import { mintAccountId } from './account-id.js';
 import { formatPercent } from './status-renderer.js';
 import { resolveMaxUsage } from './model.js';
@@ -1613,8 +1614,18 @@ export class TUI {
     const rawName = rpad(truncate(a.name, nameW), nameW);
     const name = isSel ? bold(rawName) : rawName;
 
-    // Type
-    const type = gray(a.type.padEnd(7));
+    // Type — or the provider, once the pool serves more than one.
+    //
+    // One person's ChatGPT and Claude subscriptions are usually the same email, so a
+    // mixed pool lists that address twice and the name column cannot tell the two rows
+    // apart. `oauth` repeated down every row is what the column says instead, which the
+    // operator already knew. Width follows the labels actually present, so nothing is
+    // truncated and a single-provider pool keeps the column it has today.
+    /** @type {Set<keyof typeof PROVIDERS>} */
+    const pooled = new Set(this.am.accounts.map(providerOf));
+    const mixed = pooled.size > 1;
+    const typeW = mixed ? Math.max(...[...pooled].map(id => PROVIDERS[id].label.length)) : 7;
+    const type = gray((mixed ? PROVIDERS[providerOf(a)].label : a.type).padEnd(typeW));
 
     // Status — a disabled account is shown as such regardless of its quota state.
     let status;

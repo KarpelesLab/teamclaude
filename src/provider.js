@@ -45,6 +45,9 @@ export const DEFAULT_PROVIDER = 'anthropic';
  * The provider an account belongs to. Accounts written before providers
  * existed have no `provider` field and are Anthropic, so the default keeps
  * every existing config working untouched.
+ *
+ * @param {Record<string, any>|null|undefined} account
+ * @returns {keyof typeof PROVIDERS}
  */
 export function providerOf(account) {
   const id = account?.provider;
