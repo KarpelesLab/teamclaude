@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { resolveManagedCredential } from './managed-client-auth.js';
 import https from 'node:https';
 import { timingSafeEqual } from 'node:crypto';
 import { createWriteStream, mkdirSync, writeSync } from 'node:fs';
@@ -306,7 +307,13 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // Dispatched BEFORE the loopback-only checks below: a page cannot make a
       // browser emit an absolute-form request line, the relay injects no fleet
       // credential, and its Host header names the TARGET, not this proxy.
-      if (/^https?:\/\//i.test(req.url || '')) { relayHttpForward(req, res); return; }
+      if (/^https?:\/\//i.test(req.url || '')) {
+        if (resolveManagedCredential(config, req.headers.authorization)) {
+          managedClientFailure(accountManager, res, 403, 'managed_auth_requires_intercepted_https');
+          return;
+        }
+        relayHttpForward(req, res); return;
+      }
 
       // A request admitted ONLY by the loopback exemption — no valid key — is
       // held to two more conditions. Both target the same actor: a web page in
@@ -350,7 +357,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         res.writeHead(200, { 'Content-Type': 'application/json' });
         // Counters only: how full the upstream admission gate is (see
         // upstream-fetch.js), never which origins or requests.
-        res.end(JSON.stringify({ ...extra, ...status, upstreamPool: upstreamPoolStatus() }, null, 2));
+        res.end(JSON.stringify({ ...extra, ...status, upstreamPool: upstreamPoolStatus(), managedClientAuth: managedClientStatus(accountManager, config) }, null, 2));
         return;
       }
 
@@ -547,7 +554,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // path (req.tcClient): a handshake authenticated with a client key is
       // attributed to that client, or it is a channel the operator cannot see
       // under `clients` at all (#325).
-      relayUpgrade(req, socket, head, upstream, sx, { client: auth.client, clientUsage });
+      relayUpgrade(req, socket, head, upstream, sx, { client: auth.client, clientUsage, managedConfig: config, accountManager });
     } catch (err) {
       console.error(`[TeamClaude] WebSocket upgrade handler failed for ${safeLine(req?.url)}: ${err?.message || err}`);
       try { socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n'); } catch { /* already gone */ }
@@ -790,6 +797,28 @@ export function relayHttpForward(req, res) {
 // fleet; the whole prefix is the fix, not a growing allowlist of sub-paths.
 const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/'];
 
+// Runtime observations only: never persist facade credentials or request data.
+const managedClientStates = new WeakMap();
+function managedClientState(manager) {
+  let state = managedClientStates.get(manager);
+  if (!state) {
+    state = { requests: 0, lastSeenAt: null, lastFailure: null };
+    managedClientStates.set(manager, state);
+  }
+  return state;
+}
+function managedClientStatus(manager, config) {
+  return { enabled: config.proxy?.managedClientAuth === true, protocol: 'tc-managed-v1', refreshOwner: 'pool', ...managedClientState(manager) };
+}
+function managedClientFailure(manager, res, status, reason) {
+  managedClientState(manager).lastFailure = { reason, at: new Date().toISOString() };
+  res.writeHead(status, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ type: 'error', error: {
+    type: status === 503 ? 'proxy_error' : 'permission_error',
+    message: `TeamClaude managed authentication: ${reason}. Check the pool dashboard; personal Claude login cannot repair this proxy credential.`,
+  } }));
+}
+
 // Claude Code's session id is a UUID, but other clients tag sessions too, so
 // the shape is a conservative charset rather than the UUID grammar: wide enough
 // that a non-UUID client keeps its session tracking, tight enough that nothing
@@ -891,9 +920,21 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
           return;
         }
       }
+      // A managed launch has no provider token to expire or independently
+      // refresh. Validate its account-bound facade before ANY passthrough.
+      const managed = resolveManagedCredential(config, req.headers.authorization);
+      if (managed && !managed.ok) {
+        managedClientFailure(accountManager, res, 403, managed.reason);
+        return;
+      }
+      if (managed) {
+        const state = managedClientState(accountManager);
+        state.requests++;
+        state.lastSeenAt = new Date().toISOString();
+      }
       // Client token refresh: pass through untouched (the proxy manages its own
       // tokens via ensureTokenFresh; rewriting client refreshes would conflict).
-      if (req.method === 'POST' && req.url === '/v1/oauth/token') { await relayRaw(req, res, upstream, sx, resolveMaxBodyBytes(config)); return; }
+      if (!managed && req.method === 'POST' && req.url === '/v1/oauth/token') { await relayRaw(req, res, upstream, sx, resolveMaxBodyBytes(config)); return; }
       // Account pin: a request to `/tc-acct/<name-or-index>/...` (e.g. via
       // ANTHROPIC_BASE_URL=http://host:port/tc-acct/deepseek) is forced onto that
       // one account, bypassing rotation. Used by the keep-warm scheduler and for
@@ -956,6 +997,57 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // moving past it would turn an unknown TC_ACCT pin on an identity-plane
       // request into a 404 that it does not return today.
       const classifiedPath = classificationPath(req.url);
+      if (managed && classifiedPath === '/v1/oauth/token') {
+        managedClientFailure(accountManager, res, 409, 'refresh_owned_by_pool');
+        return;
+      }
+      if (managed && CLIENT_CREDENTIAL_PATHS.some((p) => classifiedPath.startsWith(p))) {
+        // Explicit managed identity contract: the id was signed at launch and
+        // is independent of the current inference target. Never rotate a file,
+        // profile or Remote Control request onto somebody else's identity.
+        const identity = accountManager.accounts.find(a => a.id === managed.accountId);
+        if (!identity || identity.disabled || identity.provider === 'codex' || identity.upstream) {
+          managedClientFailure(accountManager, res, 503, 'identity_unavailable');
+          return;
+        }
+        await accountManager.ensureTokenFresh(identity.index);
+        if (clientGone(res)) return;
+        if (identity.status === 'error' || !identity.credential || identity.expiresAt <= Date.now()) {
+          managedClientFailure(accountManager, res, 503, 'identity_unavailable');
+          return;
+        }
+        // Retry a read once on 401. A different in-flight request may already
+        // have rotated the token after this request was sent; prefer that new
+        // credential instead of needlessly rotating the same family again.
+        const attempt = (retried = false) => {
+          if (clientGone(res)) return;
+          const sent = identity.credential;
+          req.headers.authorization = `Bearer ${sent}`;
+          relayStream(req, res, upstream, sx, (status) => {
+            if (status === 401) {
+              if (!retried && ['GET', 'HEAD'].includes(req.method)) {
+                const recover = identity.credential === sent
+                  ? accountManager.ensureTokenFresh(identity.index, true) : Promise.resolve();
+                recover.then(() => {
+                  if (clientGone(res)) return;
+                  if (identity.status === 'error' || !identity.credential || identity.expiresAt <= Date.now()) {
+                    managedClientFailure(accountManager, res, 503, 'identity_unavailable');
+                  } else attempt(true);
+                }).catch(() => { if (!clientGone(res)) managedClientFailure(accountManager, res, 503, 'identity_unavailable'); });
+              } else {
+                // Never replay an account-bound mutation, or tell Claude that
+                // its non-expiring facade needs a personal OAuth login.
+                managedClientFailure(accountManager, res, 503, 'identity_upstream_rejected');
+              }
+              return true;
+            }
+            if (status === 403) managedClientState(accountManager).lastFailure = { reason: 'identity_upstream_rejected', at: new Date().toISOString() };
+            return false;
+          });
+        };
+        attempt();
+        return;
+      }
       if (CLIENT_CREDENTIAL_PATHS.some((p) => classifiedPath.startsWith(p))) { await relayStream(req, res, upstream, sx); return; }
 
       // MITM-mode pin. A CONNECT carrying `Proxy-Authorization: Basic <acct>:…`
@@ -1307,7 +1399,7 @@ function sxAgent(sx, targetHost) {
  * buffering, no timeout, no reconstruction — just pipe bytes both ways as they
  * arrive, exactly like a transparent proxy would.
  */
-function relayStream(req, res, upstream, sx) {
+function relayStream(req, res, upstream, sx, onResponse = null) {
   const target = new URL(`${upstream}${req.url}`);
   /** @type {import('node:http').OutgoingHttpHeaders} */
   const headers = {};
@@ -1326,6 +1418,11 @@ function relayStream(req, res, upstream, sx) {
   const transport = target.protocol === 'http:' ? http : https;
 
   const upstreamReq = transport.request(target, { method: req.method, headers, agent }, (upstreamRes) => {
+    if (onResponse?.(upstreamRes.statusCode) === true) {
+      upstreamRes.on('error', () => {}); // a discarded 401 body may abort
+      upstreamRes.resume();
+      return;
+    }
     const responseHeaders = {};
     for (const [key, value] of Object.entries(upstreamRes.headers)) {
       if (CONNECTION_SPECIFIC_HEADERS.has(key) || key === 'content-encoding' || key === 'content-length') continue;
@@ -1446,7 +1543,48 @@ export function upgradeTarget(upstream, url) {
   return target;
 }
 
-export function relayUpgrade(req, socket, head, upstream, sx, { client = null, clientUsage = null, log = console.log } = {}) {
+/**
+ * @param {Object} req
+ * @param {Object} socket
+ * @param {Buffer} head
+ * @param {string} upstream
+ * @param {Object|null} sx
+ * @param {Object} [opts]
+ * @param {string|null} [opts.client]
+ * @param {Object|null} [opts.clientUsage]
+ * @param {Function} [opts.log]
+ * @param {Object} [opts.managedConfig]  the live config object; read per handshake, never copied
+ * @param {Object|null} [opts.accountManager]
+ */
+export function relayUpgrade(req, socket, head, upstream, sx, { client = null, clientUsage = null, log = console.log, managedConfig = {}, accountManager = null } = {}) {
+  const managed = resolveManagedCredential(managedConfig, req.headers.authorization);
+  if (managed) {
+    const refuse = (status, reason) => {
+      if (accountManager) managedClientState(accountManager).lastFailure = { reason, at: new Date().toISOString() };
+      socket.end(`HTTP/1.1 ${status} ${status === 403 ? 'Forbidden' : 'Service Unavailable'}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
+    };
+    if (!managed.ok) { refuse(403, managed.reason); return; }
+    // MITM also supports other providers. An Anthropic identity must never be
+    // sent to their WebSocket endpoints, even with a valid facade signature.
+    let sameProvider = false;
+    try { sameProvider = new URL(upstream).origin === new URL(managedConfig.upstream || 'https://api.anthropic.com').origin; } catch { /* invalid target */ }
+    if (!sameProvider) { refuse(403, 'managed_identity_provider_mismatch'); return; }
+    const identity = accountManager?.accounts.find(a => a.id === managed.accountId);
+    if (!identity || identity.disabled || identity.provider === 'codex' || identity.upstream) {
+      refuse(503, 'identity_unavailable'); return;
+    }
+    // The Upgrade event bypasses the HTTP listener. Apply the same account
+    // binding before forwarding it; a facade must never reach upstream.
+    accountManager.ensureTokenFresh(identity.index).then(() => {
+      if (socket.destroyed) return;
+      if (identity.status === 'error' || !identity.credential || identity.expiresAt <= Date.now()) {
+        refuse(503, 'identity_unavailable'); return;
+      }
+      req.headers.authorization = `Bearer ${identity.credential}`;
+      relayUpgrade(req, socket, head, upstream, sx, { client, clientUsage, log });
+    }).catch(() => { if (!socket.destroyed) refuse(503, 'identity_unavailable'); });
+    return;
+  }
   const target = upgradeTarget(upstream, req.url);
   if (!target) {
     log(`[TeamClaude] WebSocket upgrade refused: request target ${JSON.stringify(safeLine(req.url, 128))} is not a path on the upstream`);
