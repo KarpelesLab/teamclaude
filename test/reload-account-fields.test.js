@@ -133,6 +133,54 @@ async function sendMessage(proxyPort, model) {
   }
 }
 
+// A continue is the witness for messageThreads: with the flag off the proxy
+// answers it itself and the stub sees nothing, with it on the request goes
+// through untouched.
+async function sendContinue(proxyPort, model) {
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model, max_tokens: 1, messages: [], thread: { type: 'continue', previous_message_id: 'msg_1' },
+      }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    await res.text();
+    return res;
+  } catch {
+    return null;
+  }
+}
+
+test('reload picks up messageThreads being set and removed', async () => {
+  await withServer(async ({ hits, stubPort, proxyPort, configPath }) => {
+    const withBackend = JSON.parse(await readFile(configPath, 'utf8'));
+    withBackend.accounts[0].upstream = `http://127.0.0.1:${stubPort}`;
+    await writeFile(configPath, JSON.stringify(withBackend));
+    await reload(proxyPort);
+    assert.equal((await sendContinue(proxyPort, 'claude-test-model'))?.status, 400, 'setup: a backend with no thread state refuses the continue');
+    assert.equal(hits.length, 0, 'setup: the refused continue must not reach the stub');
+
+    // The operator declares the backend keeps thread state.
+    const declared = JSON.parse(await readFile(configPath, 'utf8'));
+    declared.accounts[0].messageThreads = true;
+    await writeFile(configPath, JSON.stringify(declared));
+    await reload(proxyPort);
+    assert.equal((await sendContinue(proxyPort, 'claude-test-model'))?.status, 200);
+    assert.equal(hits.length, 1, 'a declared backend must receive the continue');
+
+    // And taking it back off must revert the running account, not stick until a
+    // restart — the disk is the source of truth on every reload.
+    const reverted = JSON.parse(await readFile(configPath, 'utf8'));
+    delete reverted.accounts[0].messageThreads;
+    await writeFile(configPath, JSON.stringify(reverted));
+    await reload(proxyPort);
+    assert.equal((await sendContinue(proxyPort, 'claude-test-model'))?.status, 400);
+    assert.equal(hits.length, 1, `the stub must see no further requests, got ${hits.length}`);
+  });
+});
+
 test('reload picks up upstream and modelMap edits for an existing account', async () => {
   await withServer(async ({ hits, stubPort, proxyPort, configPath }) => {
     // The disk edit a user makes to bolt a third-party backend onto the account.

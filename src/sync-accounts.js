@@ -102,11 +102,20 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     // disk edit must land here to take effect on reload. `|| null` mirrors the
     // constructor's normalization, letting a removal on disk revert the account
     // to the fleet default instead of sticking on the old value.
+    // Re-arm the one-shot operator line whenever either input it reports on
+    // changes — the setting, or the upstream it was reported for. An operator
+    // who takes `messageThreads` back off, or who moves the account to a
+    // different backend, needs to be told again that continues are refused;
+    // otherwise their only signal stays silent. Read before the assignments
+    // below, which are what it compares against.
+    if (mgr.upstream !== (diskAcct.upstream || null)
+      || mgr.messageThreads !== (diskAcct.messageThreads === true)) mgr.threadRefusalReported = false;
     mgr.upstream = diskAcct.upstream || null;
     mgr.modelMap = diskAcct.modelMap || null;
     // Read per request like the two above (server.js rewriteRequestBody), and
     // missing from this sync until #374: an edit waited for a restart.
     mgr.stripRequestFields = diskAcct.stripRequestFields || null;
+    mgr.messageThreads = diskAcct.messageThreads === true;
     // Mirror onto the memConfig entry: the TUI save stencil rebuilds
     // diskConfig.accounts from config.accounts as `{ ...diskAcct, ...live }`,
     // so a stale key there would win the spread and silently overwrite this
@@ -117,6 +126,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       if (diskAcct.upstream) cfgAcct.upstream = diskAcct.upstream; else delete cfgAcct.upstream;
       if (diskAcct.modelMap) cfgAcct.modelMap = diskAcct.modelMap; else delete cfgAcct.modelMap;
       if (diskAcct.stripRequestFields) cfgAcct.stripRequestFields = diskAcct.stripRequestFields; else delete cfgAcct.stripRequestFields;
+      if (diskAcct.messageThreads === true) cfgAcct.messageThreads = true; else delete cfgAcct.messageThreads;
       if (diskAcct.maxUsage != null) cfgAcct.maxUsage = diskAcct.maxUsage; else delete cfgAcct.maxUsage;
     }
     // Pick up enable/disable toggles; re-enabling clears a stuck error state.

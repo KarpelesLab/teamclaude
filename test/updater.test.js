@@ -1,11 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { EventEmitter } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  compareVersions, installKind, fetchLatestVersion, checkForUpdate, runUpdate, autoUpdate, isReleaseVersion, PKG_NAME,
+  compareVersions, installKind, fetchLatestVersion, checkForUpdate, runUpdate, autoUpdate, isReleaseVersion,
+  resolveVersionLabel, updateAvailableFromCache, PKG_NAME,
 } from '../src/updater.js';
 
 // ── compareVersions ─────────────────────────────────────────
@@ -224,4 +225,113 @@ test('autoUpdate never runs as root, and says so once', async () => {
     assert.equal(checked, 0, 'the registry is not even consulted');
     assert.equal(logs.filter(l => /root/.test(l)).length, 1, 'warned exactly once across calls');
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+// ── resolveVersionLabel ──────────────────────────────────────
+
+function labelRoot({ git = false, version = null } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'tc-label-'));
+  if (git) mkdirSync(join(dir, '.git'));
+  if (version) writeFileSync(join(dir, 'package.json'), JSON.stringify({ version }));
+  return dir;
+}
+
+// Answers keyed by git subcommand; anything unlisted fails the way the real git
+// does when HEAD is not on a tag, or when the checkout is shallow or broken.
+function gitStub(answers, seen = []) {
+  return async (file, args, opts) => {
+    seen.push([file, args, opts]);
+    const sub = args[0];
+    if (!(sub in answers)) throw new Error(`git ${sub}: no answer`);
+    return { stdout: answers[sub] };
+  };
+}
+
+test('resolveVersionLabel prefers the tag HEAD sits on', async () => {
+  const root = labelRoot({ git: true, version: '1.1.20' });
+  try {
+    const exec = gitStub({ describe: 'v1.1.20\n', 'rev-parse': 'b8bbfcc\n' });
+    assert.deepEqual(await resolveVersionLabel({ root, exec }), { label: 'v1.1.20', git: true });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('resolveVersionLabel falls back to the short sha off a tag', async () => {
+  const root = labelRoot({ git: true, version: '1.1.20' });
+  try {
+    const exec = gitStub({ 'rev-parse': 'b8bbfcc\n' });
+    assert.deepEqual(await resolveVersionLabel({ root, exec }), { label: 'b8bbfcc', git: true });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+// The server is started from the operator's own project directory. Resolving
+// against the process cwd would report that repository's sha as ours.
+test('resolveVersionLabel asks git about the package root, not the process cwd', async () => {
+  const root = labelRoot({ git: true, version: '1.1.20' });
+  const seen = [];
+  try {
+    await resolveVersionLabel({ root, exec: gitStub({ describe: 'v1.1.20\n' }, seen) });
+    assert.equal(seen[0][2].cwd, root);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('resolveVersionLabel reads package.json outside a checkout, without running git', async () => {
+  const root = labelRoot({ version: '1.1.20-pr378' });
+  const seen = [];
+  try {
+    const label = await resolveVersionLabel({ root, exec: gitStub({ describe: 'v9.9.9\n' }, seen) });
+    assert.deepEqual(label, { label: '1.1.20-pr378', git: false });
+    assert.equal(seen.length, 0, 'no git process for an npm install');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+// A shallow CI clone has no tags, and a checkout without the git binary answers
+// nothing at all — package.json is still readable in both.
+test('resolveVersionLabel falls through to package.json when git answers nothing', async () => {
+  const root = labelRoot({ git: true, version: '1.1.20' });
+  try {
+    assert.deepEqual(await resolveVersionLabel({ root, exec: gitStub({}) }), { label: '1.1.20', git: true });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('resolveVersionLabel reports local when nothing identifies the copy', async () => {
+  const root = labelRoot();
+  try {
+    assert.deepEqual(await resolveVersionLabel({ root, exec: gitStub({}) }), { label: 'local', git: false });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+// A tag name is drawn into the operator's terminal by the dashboard header.
+test('resolveVersionLabel strips control characters out of a tag name', async () => {
+  const root = labelRoot({ git: true, version: '1.1.20' });
+  try {
+    const exec = gitStub({ describe: 'v1\x1b[2J\x07evil\n' });
+    const { label } = await resolveVersionLabel({ root, exec });
+    assert.doesNotMatch(label, /[\x1b\x07]/);
+    assert.match(label, /v1/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+// ── updateAvailableFromCache ─────────────────────────────────
+
+test('updateAvailableFromCache answers from the cache alone', async () => {
+  const cachePath = tmpCache();
+  writeFileSync(cachePath, JSON.stringify({ checkedAt: 1, latest: '2.0.0' }));
+  assert.equal(await updateAvailableFromCache({ current: '1.0.0', cachePath }), true);
+  assert.equal(await updateAvailableFromCache({ current: '2.0.0', cachePath }), false);
+  assert.equal(await updateAvailableFromCache({ current: '3.0.0', cachePath }), false);
+});
+
+test('updateAvailableFromCache is false with no cache and with no version to compare', async () => {
+  assert.equal(await updateAvailableFromCache({ current: '1.0.0', cachePath: tmpCache() }), false);
+  const cachePath = tmpCache();
+  writeFileSync(cachePath, JSON.stringify({ checkedAt: 1, latest: '2.0.0' }));
+  assert.equal(await updateAvailableFromCache({ current: null, cachePath }), false);
+});
+
+// The daily check is what refreshes the cache; a stale entry is still the last
+// thing known, and reporting it is the same choice checkForUpdate makes.
+test('updateAvailableFromCache ignores how old the cached answer is', async () => {
+  const cachePath = tmpCache();
+  writeFileSync(cachePath, JSON.stringify({ checkedAt: 0, latest: '2.0.0' }));
+  assert.equal(await updateAvailableFromCache({ current: '1.0.0', cachePath }), true);
 });

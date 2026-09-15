@@ -9,11 +9,13 @@ import {
   oauthIdentityFields,
 } from './identity.js';
 import { configIndexFor, managerAccountFor, markAccountRemoved } from './account-pairing.js';
+import { PROVIDERS, providerOf } from './provider.js';
 import { mintAccountId } from './account-id.js';
 import { formatPercent } from './status-renderer.js';
 import { resolveMaxUsage } from './model.js';
 import { parseProxyUrl, proxyToUrl, describeProxy, describeSelfProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy } from './upstream-proxy.js';
 import { sanitizeText, safeLine } from './safe-text.js';
+import { isLocalUpstream } from './provider.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -209,6 +211,11 @@ const BAR_MAX = 20;
 // when the row has width to spare, but never drops below it, so a narrow
 // terminal lays the table out exactly as it did before the column could grow.
 const NAME_MIN = 12;
+
+// Clear space the centred version label needs on each side before it is drawn
+// at all. Below that it reads as a collision with the title or the port block,
+// so the whole label is dropped rather than squeezed.
+const HEAD_GAP = 2;
 
 // Which pair of bars a row draws: the subscription buckets (Ses/Wk, plus the
 // S7/F7 family bars) when any unified reading exists, else the metered Tok/Req
@@ -412,7 +419,11 @@ export class TUI {
     readCredentials = importCredentials, readProfile = fetchProfile,
     // Names the activity column against the session id the client sent. Absent
     // or disabled leaves every row showing the short id.
-    sessionTitles = null }) {
+    sessionTitles = null,
+    // How the header names this build, and whether a newer release is known.
+    // In attach mode the account manager carries the server's own answer and
+    // these are unused; the empty defaults keep the label hidden until it does.
+    versionLabel = '', updateAvailable = false }) {
     this.am = accountManager;
     this.remote = remote;
     this.applySwitch = applySwitch;
@@ -428,6 +439,8 @@ export class TUI {
     this._readProfile = readProfile;
     this._activityStream = null;
     this.sessionTitles = sessionTitles;
+    this.versionLabel = versionLabel;
+    this.updateAvailable = updateAvailable;
 
     this.log = [];           // completed activity entries
     this.active = new Map(); // in-flight requests
@@ -756,7 +769,7 @@ export class TUI {
         label: 'Remove account',
         hint: 'Enter to pick',
         value: () => dim('—'),
-        enter: () => { this.mode = 'select'; this.selAction = 'remove'; this.selIdx = 0; this.selReturn = 'settings'; },
+        enter: () => { this.mode = 'select'; this.selAction = 'remove'; this.selIdx = this._displayOrder()[0] ?? 0; this.selReturn = 'settings'; },
       });
     }
 
@@ -909,9 +922,13 @@ export class TUI {
   }
 
   _keySelect(k) {
-    const len = this.am.accounts.length;
-    if (k === 'up' || k === 'k') this.selIdx = Math.max(0, this.selIdx - 1);
-    else if (k === 'down' || k === 'j') this.selIdx = Math.min(len - 1, this.selIdx + 1);
+    // Step through the rows AS DRAWN (_displayOrder), while selIdx itself stays
+    // a manager index — everything it feeds (switch, toggle, remove, route pins)
+    // addresses an account by that index, not by its position on screen.
+    const order = this._displayOrder();
+    const pos = order.indexOf(this.selIdx);
+    if (k === 'up' || k === 'k') this.selIdx = order[Math.max(0, pos - 1)] ?? this.selIdx;
+    else if (k === 'down' || k === 'j') this.selIdx = order[Math.min(order.length - 1, pos + 1)] ?? this.selIdx;
     // Tab / ←→ (switch only): cycle which route the pick applies to. null = the
     // global default account; each getRoutes() entry = a per-route manual pin.
     // ↑↓ move within the account list, so ←→ are free to move across targets.
@@ -1378,7 +1395,26 @@ export class TUI {
     // mode): what is on screen is the last snapshot, not the current state.
     const live = this.am.connected === false ? red('▼') : green('▲');
     const right = `${sessStr}Port ${port} ${live} `;
-    lines.push(left + ' '.repeat(Math.max(1, W - vw(left) - vw(right))) + right);
+    // In attach mode the dashboard names the server's build, not this process's,
+    // so the account manager's answer wins. It arrives sanitized (applyStatus)
+    // and starts empty, which keeps the label hidden until the first poll rather
+    // than briefly showing the local checkout's version as if it were the
+    // server's. A local AccountManager has neither property.
+    const label = this.am.versionLabel ?? this.versionLabel;
+    const upd = this.am.updateAvailable ?? this.updateAvailable;
+    const mid = label ? dim(label) + (upd ? ` ${green('▲')}` : '') : '';
+    const lw = vw(left), rw = vw(right), mw = vw(mid);
+    // Centred on the line, not in the gap between the two blocks, so the label
+    // holds still as the session segment comes and goes.
+    const start = Math.floor((W - mw) / 2);
+    // Load-bearing, not cosmetic: both padding runs below would be negative
+    // without it, and ' '.repeat(-1) throws. Satisfying it also means the mid
+    // branch can never produce the over-wide line the other branch can, so the
+    // two are not interchangeable.
+    const midFits = mw > 0 && start - lw >= HEAD_GAP && (W - rw) - (start + mw) >= HEAD_GAP;
+    lines.push(midFits
+      ? left + ' '.repeat(start - lw) + mid + ' '.repeat(W - rw - start - mw) + right
+      : left + ' '.repeat(Math.max(1, W - lw - rw)) + right);
     lines.push(' ' + dim('─'.repeat(W - 2)));
 
     const footerH = 2;
@@ -1504,7 +1540,7 @@ export class TUI {
         fable: anyFable ? this.am.previewRouteIndex('claude-fable-5') : null,
         sonnet: anySonnet ? this.am.previewRouteIndex('claude-sonnet-4-6') : null,
       };
-      for (let i = 0; i < this.am.accounts.length; i++) {
+      for (const i of this._displayOrder()) {
         const b = budgets.get(categoryOf(this.am.accounts[i]));
         lines.push(this._renderAcct(i, b.bw, b.showBoth, routes, genRoutes, familyTarget, b.showFamily, nameW));
       }
@@ -1557,6 +1593,29 @@ export class TUI {
     // Show cursor only in input mode
     buf += this.mode === 'input' ? `${ESC}?25h` : `${ESC}?25l`;
     this._paint(buf, force);
+  }
+
+  /** Manager indices in the order the rows are drawn: accounts served by a
+   *  local process last, every other account left where it is.
+   *
+   *  A local backend (a translating proxy in front of another vendor, say) is
+   *  infrastructure rather than a seat to rotate between, so it reads as noise
+   *  wedged among the accounts that do rotate. Config order cannot keep it out
+   *  of the way on its own, because a newly added account is appended AFTER it
+   *  and puts it back in the middle.
+   *
+   *  Display only. `selIdx`, `currentIndex`, session pins and route entries all
+   *  stay manager indices, so nothing about selection or routing moves with the
+   *  rows — see _keySelect, which walks this order but still stores an index.
+   */
+  _displayOrder() {
+    return this.am.accounts
+      .map((/** @type {any} */ _, /** @type {number} */ i) => i)
+      .sort((/** @type {number} */ x, /** @type {number} */ y) => {
+        const sx = isLocalUpstream(this.am.accounts[x]) ? 1 : 0;
+        const sy = isLocalUpstream(this.am.accounts[y]) ? 1 : 0;
+        return sx - sy || x - y; // ties keep list order, so the sort is stable
+      });
   }
 
   _renderAcct(idx, bw, showBoth, routes = this.am.getRoutes(), genRoutes = routes.filter(r => routeFamily(r) === null), familyTarget = {}, showFamily = true, nameW = NAME_MIN) {
@@ -1613,8 +1672,18 @@ export class TUI {
     const rawName = rpad(truncate(a.name, nameW), nameW);
     const name = isSel ? bold(rawName) : rawName;
 
-    // Type
-    const type = gray(a.type.padEnd(7));
+    // Type — or the provider, once the pool serves more than one.
+    //
+    // One person's ChatGPT and Claude subscriptions are usually the same email, so a
+    // mixed pool lists that address twice and the name column cannot tell the two rows
+    // apart. `oauth` repeated down every row is what the column says instead, which the
+    // operator already knew. Width follows the labels actually present, so nothing is
+    // truncated and a single-provider pool keeps the column it has today.
+    /** @type {Set<keyof typeof PROVIDERS>} */
+    const pooled = new Set(this.am.accounts.map(providerOf));
+    const mixed = pooled.size > 1;
+    const typeW = mixed ? Math.max(...[...pooled].map(id => PROVIDERS[id].label.length)) : 7;
+    const type = gray((mixed ? PROVIDERS[providerOf(a)].label : a.type).padEnd(typeW));
 
     // Status — a disabled account is shown as such regardless of its quota state.
     let status;
