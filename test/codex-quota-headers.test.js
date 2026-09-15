@@ -47,17 +47,21 @@ async function runAgainstCodexUpstream(headers) {
 // its call site were both in place, so nothing errored — the account simply read
 // `unknown` for its whole life, however many requests it served.
 test('a Codex response\'s x-codex-* quota headers reach the account', async () => {
+  // Derived, never pinned: a reset in the past is swept as an expired window
+  // before the assertion reads it, so a fixed epoch stops passing the day it
+  // goes by (the original did, on 2026-09-15).
+  const resetAt = Math.floor(Date.now() / 1000) + 3 * 86400;
   const quota = await runAgainstCodexUpstream({
     'x-codex-primary-used-percent': '35',
     'x-codex-primary-window-minutes': '10080',
-    'x-codex-primary-reset-at': '1789453626',
+    'x-codex-primary-reset-at': String(resetAt),
     'x-codex-secondary-used-percent': '0',
     'x-codex-secondary-window-minutes': '0',
     'x-codex-plan-type': 'pro',
   });
 
   assert.equal(quota.unified7d, 0.35);
-  assert.equal(quota.unified7dReset, 1789453626 * 1000);
+  assert.equal(quota.unified7dReset, resetAt * 1000);
   assert.equal(quota.planType, 'pro');
 });
 
