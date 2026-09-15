@@ -100,6 +100,7 @@ export function createDefaultConfig() {
     distributeSessions: false,
     sessionTitles: { enabled: false, width: 18 },
     eventLogging: 'hide',
+    defaultClientMode: 'mitm',
     blockedModels: [],
     accounts: [],
   };

@@ -38,7 +38,7 @@ import { autoUpdate, checkForUpdate, currentVersion, resolveVersionLabel, runUpd
 import { renderStatus, formatPercent } from './status-renderer.js';
 import { sanitizeText } from './safe-text.js';
 import { ClientUsageTracker, UsageDimensionTracker } from './client-usage.js';
-import { buildClaudeEnvLines, bypassesAllHosts, encodePinComponent, mergeNoProxy } from './claude-env.js';
+import { buildClaudeEnvLines, bypassesAllHosts, clearSelfProxyEnvLines, encodePinComponent, mergeNoProxy, resolveClientMode } from './claude-env.js';
 import { serviceKind, installService, uninstallService, serviceStatus, renderService, logPath } from './service.js';
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
 import { getUpstreamProxy, describeProxy, describeSelfProxy } from './upstream-proxy.js';
@@ -431,6 +431,8 @@ async function serverCommand() {
     // Both are read per request off this object (server.js) and the TUI already
     // persists them; without this a hand edit or another writer waited for a restart.
     config.eventLogging = diskConfig.eventLogging || 'hide';
+    // Read by `run`/`env` from disk, but the TUI settings screen shows it live.
+    config.defaultClientMode = diskConfig.defaultClientMode === 'base-url' ? 'base-url' : 'mitm';
     config.blockedModels = Array.isArray(diskConfig.blockedModels) ? diskConfig.blockedModels : [];
     // Apply an sx.org key/mode change made on disk (e.g. via POST /teamclaude/reload).
     const diskSxKey = diskConfig.sx?.apiKey || null;
@@ -490,6 +492,7 @@ async function serverCommand() {
         // screen too; the server reads them live from `config`, but without this
         // the edit never reached disk and was silently undone by the next start.
         if (config.eventLogging != null) diskConfig.eventLogging = config.eventLogging;
+        if (config.defaultClientMode != null) diskConfig.defaultClientMode = config.defaultClientMode;
         if (config.blockedModels != null) diskConfig.blockedModels = config.blockedModels;
         if (config.sessionTitles != null) diskConfig.sessionTitles = config.sessionTitles;
         // Persist the route table (edited from the TUI routes screen).
@@ -943,7 +946,13 @@ async function envCommand() {
     process.exit(1);
   }
   const port = config.proxy.port;
-  const useMitm = !args.slice(1).includes('--no-mitm');
+  let useMitm;
+  try {
+    useMitm = resolveClientMode(config, args.slice(1)) === 'mitm';
+  } catch (/** @type {any} */ err) {
+    process.stderr.write(`teamclaude env: ${err.message}\n`);
+    process.exit(1);
+  }
 
   let caPath = null;
   // The leaf has to name every host MITM will intercept, or the CONNECT for
@@ -961,6 +970,9 @@ async function envCommand() {
       // idempotent, since the merged value is what it will have next time.
       inheritedNoProxy: [process.env.NO_PROXY, process.env.no_proxy].filter(Boolean).join(','),
     });
+    // Base-URL mode takes the proxy back OUT of a shell an earlier MITM eval
+    // put it into; only this proxy's own loopback address is unset.
+    if (!useMitm) lines.push(...clearSelfProxyEnvLines(port));
   } catch (err) {
     // A bad proxy.port. Nothing reaches stdout: the shell is eval'ing it.
     process.stderr.write(`teamclaude env: ${err.message} (in ${getConfigPath()})\n`);
@@ -978,7 +990,9 @@ async function envCommand() {
       process.stderr.write(`# warning: no account named "${account}" in the config — the proxy will refuse this pin\n`);
     }
   }
-  process.stderr.write(`# apply to this shell:  eval "$(teamclaude env${useMitm ? '' : ' --no-mitm'})"\n`);
+  // The flag that reproduces this mode whatever the config's default says.
+  process.stderr.write(`# apply to this shell:  eval "$(teamclaude env${useMitm ? ' --mitm' : ' --no-mitm'})"\n`);
+  process.stderr.write(`# default mode is ${config.defaultClientMode === 'base-url' ? 'base-URL' : 'MITM'} (config defaultClientMode; the TUI settings screen toggles it)\n`);
   if (!(await isProxyUp(port))) {
     process.stderr.write(`# note: proxy not running on port ${port} — start it with: teamclaude server\n`);
   }
@@ -995,12 +1009,18 @@ async function runCommand() {
   // Args after 'run'. teamclaude flags (e.g. --no-mitm) are recognized only
   // before an optional `--` separator; everything after `--` goes verbatim to
   // claude. MITM forward-proxy mode is the default so hardcoded api.anthropic.com
-  // endpoints are intercepted too; --no-mitm opts back into base-URL-only routing.
-  // --mitm is still accepted (now a no-op) for backward compatibility.
+  // endpoints are intercepted too; the config's `defaultClientMode` can make
+  // base-URL the default instead, and --mitm / --no-mitm decide per launch.
   const rest = args.slice(1);
   const sep = rest.indexOf('--');
   const tcFlags = sep >= 0 ? rest.slice(0, sep) : rest;
-  const useMitm = !tcFlags.includes('--no-mitm');
+  let useMitm;
+  try {
+    useMitm = resolveClientMode(config, tcFlags) === 'mitm';
+  } catch (/** @type {any} */ err) {
+    console.error(`[TeamClaude] ${err.message}`);
+    process.exit(1);
+  }
   const autoFallback = tcFlags.includes('--auto-fallback');
   const claudeArgs = sep >= 0
     ? rest.slice(sep + 1)
@@ -2059,10 +2079,12 @@ Commands:
   login               OAuth login via browser
   login --token       OAuth login via copy/paste (no local callback; for headless/remote)
   login --api         Add an API key account
-  env [--no-mitm]     Print export lines to point Claude Code at the proxy, for
-                      'eval "$(teamclaude env)"' (MITM forward-proxy by default;
-                      --no-mitm for base-URL only). Handy for agent multiplexers
-                      that spawn claude themselves instead of via 'teamclaude run'
+  env [--mitm|--no-mitm]
+                      Print export lines to point Claude Code at the proxy, for
+                      'eval "$(teamclaude env)"'. MITM forward-proxy unless the
+                      config's defaultClientMode is "base-url"; a flag decides
+                      per call. Handy for agent multiplexers that spawn claude
+                      themselves instead of via 'teamclaude run'
   run [--no-mitm] [--auto-fallback] [-- args...]
                       Run Claude Code through the proxy (errors if it's down,
                       unless --auto-fallback launches claude directly instead).
