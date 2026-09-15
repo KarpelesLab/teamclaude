@@ -5,8 +5,9 @@
 // /teamclaude/status (same origin) with the proxy key and re-renders every few
 // seconds. That split is what lets the asset be served without the key (a
 // browser address bar cannot send x-api-key) while every byte of actual status
-// stays behind the existing gate. The key is asked for once and kept in
-// localStorage; a 401 (wrong or rotated key) brings the prompt back.
+// stays behind the existing gate. The key is asked for only when the server
+// refuses the page without one (401/403; loopback browsers are exempt), and is
+// kept in localStorage; a later refusal (wrong or rotated key) asks again.
 //
 // Self-contained on purpose: no external scripts, styles, or fonts, so the
 // page works on air-gapped deployments and adds no third-party surface. All
@@ -894,7 +895,10 @@ ${SHARED_HELPERS}
   function poll() {
     fetch('/teamclaude/status', { headers: { 'x-api-key': localStorage.getItem(KEY) || '' } })
       .then(function (res) {
-        if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
+        // 403 is the loopback exemption refusing a key-less request (a Host
+        // that does not name this machine, e.g. behind a local reverse proxy
+        // that adds no forwarding headers). A valid key clears that gate too.
+        if (res.status === 401 || res.status === 403) { localStorage.removeItem(KEY); showKeybox(); return null; }
         if (!res.ok) throw new Error('status ' + res.status);
         return res.json();
       })
@@ -909,6 +913,9 @@ ${SHARED_HELPERS}
         var err = document.getElementById('err');
         err.style.display = 'block';
         err.textContent = 'Cannot reach the proxy: ' + e.message;
+        // The banner lives inside #app, which stays hidden until a first
+        // status lands; without this a first poll that fails is a blank page.
+        if (document.getElementById('keybox').style.display !== 'block') document.getElementById('app').style.display = '';
       });
   }
 
@@ -936,7 +943,9 @@ ${SHARED_HELPERS}
     });
   });
 
-  if (localStorage.getItem(KEY)) start(); else showKeybox();
+  // Poll before asking: a loopback browser is key-exempt, so the prompt is
+  // shown only once the server refuses the request without a valid key.
+  start();
 })();
 </script>
 </body>
