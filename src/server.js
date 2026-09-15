@@ -12,7 +12,7 @@ import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
 import { TopLevelFieldFinder, modelGlobMatches } from './model.js';
 import { BodyWriter, truncationNote } from './request-log.js';
 import { upstreamFetch, upstreamPoolStatus } from './upstream-fetch.js';
-import { applyAuthHeaders, upstreamFor, rewritesBody, providerForPath, providerOf, isSubscriptionAccount, DEFAULT_PROVIDER } from './provider.js';
+import { applyAuthHeaders, upstreamFor, rewritesBody, providerForPath, providerOf, isSubscriptionAccount, DEFAULT_PROVIDER, PROVIDERS } from './provider.js';
 import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
 import { safeLine } from './safe-text.js';
@@ -2154,6 +2154,38 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   const upstreamUrl = `${upstreamFor(account, upstream)}${req.url}`;
   const method = req.method;
 
+  // An upstream that keeps no thread state would receive only this turn's delta
+  // and answer it as the whole conversation. Refusing makes the client resend
+  // the full history (see refusesThreadContinue). Placed before admit() so the
+  // early return holds no concurrency slot, and after recordSession so the
+  // resend that follows lands on this same account and reuses its cache.
+  if (refusesThreadContinue(body, account, req.url) && !res.headersSent && !clientGone(res)) {
+    ctx.status = 400;
+    ctx.delivered = true;   // a 4xx IS an answer — see answeredStatus
+    // Said once per account: the client stops sending threads for that model
+    // after the first refusal, so a line per refusal would be a line per model,
+    // not per turn — and an operator watching tokens rise needs to find this.
+    // The flag lives on the account so a reload clears it with the setting it
+    // reports on (see syncAccountsFromDisk).
+    if (!account.threadRefusalReported) {
+      account.threadRefusalReported = true;
+      console.error(`[TeamClaude] ${safeLine(account.name, 64)}: refusing message-thread continues (this upstream keeps no thread state; set "messageThreads": true if it does)`);
+    }
+    res.writeHead(400, { 'Content-Type': 'application/json', 'x-should-retry': 'false' });
+    res.end(JSON.stringify({
+      type: 'error',
+      error: {
+        type: 'invalid_request_error',
+        message: 'thread: this upstream does not keep thread state; resend the conversation',
+        // Read by the client as "stop threading this model for the session"
+        // rather than "retry this one turn", which is the difference between
+        // one refusal and one per turn.
+        details: { error_code: 'thread_unsupported_request' },
+      },
+    }));
+    return;
+  }
+
   // Every rewrite below runs inside rewriteRequestBody (exported for tests);
   // Content-Length is refreshed below because the body can shrink.
   let sendBody = rewriteRequestBody(body, account, req.url, req.headers['content-type']);
@@ -2959,6 +2991,78 @@ export function rewriteRequestBody(body, account, url, contentType) {
     ? account.stripRequestFields.filter(f => typeof f === 'string' && !f.includes('.')) : [];
   if (topLevel.length) sendBody = stripBodyFields(sendBody, topLevel);
   return sendBody;
+}
+
+// A continue must carry both of these exact JSON substrings, so a Buffer scan
+// skips the parse for any body missing either. Necessary, not sufficient: a
+// create whose message text is the word "continue" carries both as well and
+// gets parsed for nothing. The parse below is what decides.
+const THREAD_MARKER = Buffer.from('"thread"');
+const CONTINUE_MARKER = Buffer.from('"continue"');
+
+/**
+ * Whether an `upstream` names Anthropic itself — a region pin or a mirror rather
+ * than a different backend. Those reach the real thread store, so refusing their
+ * continues would be overhead the operator has to discover and opt out of by
+ * hand. The HOST decides: a third-party API serving the Anthropic shape does it
+ * under its own host, usually with a path prefix.
+ *
+ * @param {unknown} upstream
+ */
+function pointsAtAnthropic(upstream) {
+  try {
+    return new URL(String(upstream)).hostname === new URL(PROVIDERS.anthropic.upstream).hostname;
+  } catch {
+    return false; // unparseable is not evidence of a thread store
+  }
+}
+
+/**
+ * Whether a request must be refused instead of forwarded, because it continues
+ * an Anthropic message thread on an upstream that keeps no thread state.
+ *
+ * Claude Code stores the conversation on Anthropic's side once a thread exists:
+ * the first /v1/messages body carries thread:{type:"create"} with the whole
+ * messages array, later ones thread:{type:"continue"} with only the new delta.
+ * A third-party upstream ignores the unknown field and answers the delta alone,
+ * so from the second turn on the model no longer sees the conversation — with
+ * no error anywhere. Anthropic itself answers 400 when a thread cannot be
+ * continued, and the client reacts by resending the whole conversation, so
+ * refusing here is what puts the upstream back on a complete one.
+ *
+ * The body carries `details.error_code: "thread_unsupported_request"`, which the
+ * client reads as "this model keeps no thread state": it resends the turn in
+ * full and then drops the `thread` field entirely for the rest of the session,
+ * so the refusals are counted per agent and model rather than per turn, and cost
+ * no tokens. A relay that does reach Anthropic keeps working threads and opts
+ * out with `messageThreads: true`.
+ *
+ * Exported for tests.
+ *
+ * @param {Buffer|null|undefined} body fully-buffered request body
+ * @param {Record<string, any>|null|undefined} account the account about to serve it
+ * @param {string|undefined} url req.url
+ * @returns {boolean}
+ */
+export function refusesThreadContinue(body, account, url) {
+  if (!account?.upstream || !rewritesBody(account)) return false;
+  if (account.messageThreads) return false;
+  if (!Buffer.isBuffer(body) || body.length === 0) return false;
+  // Only a completion continues a thread. count_tokens carries a body of the
+  // same shape, and a refusal there is unrecoverable — there is no conversation
+  // to resend for a token count. Classified on the folded, once-decoded path
+  // like every other refusal here: `\v1\messages` is what this process itself
+  // will send as `/v1/messages`, so the test has to read it the same way.
+  if (!isCompletionPath(classificationPath(url))) return false;
+  if (!body.includes(THREAD_MARKER) || !body.includes(CONTINUE_MARKER)) return false;
+  // Last of the cheap gates because it parses two URLs: by here the request is
+  // already known to be a completion whose body could carry a continue.
+  if (pointsAtAnthropic(account.upstream)) return false;
+  try {
+    return JSON.parse(body.toString('utf8'))?.thread?.type === 'continue';
+  } catch {
+    return false; // not JSON we can reason about — never break it
+  }
 }
 
 // Remove top-level fields from a JSON request body (see stripRequestFields).

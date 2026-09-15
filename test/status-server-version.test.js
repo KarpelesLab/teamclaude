@@ -81,6 +81,10 @@ test('GET /teamclaude/status reports the running package version under server.ve
     assert.match(version, /^\d+\.\d+\.\d+/, 'package.json carries a version to compare against');
     assert.equal(status.server.version, version);
     assert.equal(typeof status.server.startedAt, 'string', 'the rest of the server block is untouched');
+    // What the dashboard header draws: a tag or sha in a checkout, this version
+    // otherwise. Either way an attached client has something to name the build.
+    assert.match(status.server.versionLabel, /\S/);
+    assert.equal(typeof status.server.updateAvailable, 'boolean');
   } finally {
     await server.stop();
   }

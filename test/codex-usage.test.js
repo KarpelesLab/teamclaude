@@ -21,6 +21,49 @@ test('normalizes Codex wham usage windows and model buckets', () => {
   assert.equal(usage.planType, 'pro');
 });
 
+// The shape a live subscription actually sends: a LIST whose entries name
+// themselves. `Object.entries` over it yields array indices, so before this was
+// handled every bucket was filed as "0" and "1" — names that identify nothing,
+// collide across accounts, and sit beside the header path's name for the same
+// bucket instead of replacing it. `metered_feature` is the header's own slug
+// with a `codex_` prefix, so stripping it makes the two paths agree on one key.
+test('a list of extra limits is named from its entries, not their indices', () => {
+  const usage = normalizeCodexUsagePayload({
+    plan_type: 'pro',
+    rate_limit: { primary_window: { used_percent: 7, limit_window_seconds: 604800, reset_at: 1700604800 } },
+    additional_rate_limits: [
+      {
+        limit_name: 'GPT-5.3-Codex-Spark',
+        metered_feature: 'codex_bengalfox',
+        rate_limit: {
+          primary_window: { used_percent: 0, limit_window_seconds: 18000, reset_at: 1700018000 },
+          secondary_window: { used_percent: 3, limit_window_seconds: 604800, reset_at: 1700604800 },
+        },
+      },
+      {
+        limit_name: 'gpt-reserve',
+        metered_feature: 'base_model_inference',
+        rate_limit: { primary_window: { used_percent: 1, limit_window_seconds: 604800, reset_at: 1700604800 } },
+      },
+    ],
+  });
+  assert.deepEqual(usage.modelBuckets, [
+    { slug: 'bengalfox', name: 'GPT-5.3-Codex-Spark', utilization: 0.03, resetAt: 1700604800000 },
+    { slug: 'base_model_inference', name: 'gpt-reserve', utilization: 0.01, resetAt: 1700604800000 },
+  ]);
+});
+
+// An entry that names itself no way at all is dropped rather than filed under a
+// number, which would be indistinguishable from the bug this replaced.
+test('an unnamed extra limit is dropped rather than filed under its index', () => {
+  const usage = normalizeCodexUsagePayload({
+    additional_rate_limits: [
+      { rate_limit: { primary_window: { used_percent: 5, limit_window_seconds: 604800, reset_at: 1700604800 } } },
+    ],
+  });
+  assert.deepEqual(usage.modelBuckets, []);
+});
+
 test('fetchCodexUsage sends the account-scoped read-only request', async () => {
   let request;
   const usage = await fetchCodexUsage({ credential: 'secret', accountId: 'acct-1' }, {

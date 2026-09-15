@@ -34,7 +34,7 @@ import { TUI } from './tui.js';
 import { SessionTitles } from './session-titles.js';
 import { RemoteControl, createAttachSession } from './tui-remote.js';
 import { SxManager } from './sx.js';
-import { autoUpdate, checkForUpdate, currentVersion, runUpdate, installKind, PKG_NAME } from './updater.js';
+import { autoUpdate, checkForUpdate, currentVersion, resolveVersionLabel, runUpdate, installKind, updateAvailableFromCache, PKG_NAME } from './updater.js';
 import { renderStatus, formatPercent } from './status-renderer.js';
 import { sanitizeText } from './safe-text.js';
 import { ClientUsageTracker, UsageDimensionTracker } from './client-usage.js';
@@ -369,6 +369,11 @@ async function serverCommand() {
   // disk while this process keeps running the old code, and status must report
   // what is running, not what is installed.
   const serverVersion = currentVersion();
+  // What the header names this build, and whether the last recorded check saw
+  // something newer. A checkout gets no update marker: autoUpdate refuses to
+  // npm-install over one, so offering it would advertise a declined action.
+  const { label: versionLabel, git: fromGit } = await resolveVersionLabel();
+  const updateAvailable = !fromGit && await updateAvailableFromCache({ current: serverVersion });
 
   // sx.org proxy (IP-based-429 workaround). Dormant unless an API key is set in
   // config.sx.apiKey; when set we provision a proxy and route upstream through it.
@@ -466,7 +471,7 @@ async function serverCommand() {
 
   if (useTUI) {
     tui = new TUI({
-      accountManager, config, sx, activityLogPath, sessionTitles,
+      accountManager, config, sx, activityLogPath, sessionTitles, versionLabel, updateAvailable,
       saveConfig: () => atomicConfigUpdate(async diskConfig => {
         diskConfig.accounts = mergeAccountsForSave(
           config.accounts, accountManager.accounts, diskConfig.accounts, removedAccountIds(config),
@@ -563,6 +568,8 @@ async function serverCommand() {
     usageDimensions: dimensionUsage.export(),
     server: {
       version: serverVersion,
+      versionLabel,
+      updateAvailable,
       startedAt: new Date(serverStartedAt).toISOString(),
       uptimeSeconds: Math.round((Date.now() - serverStartedAt) / 1000),
       port,

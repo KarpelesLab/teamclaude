@@ -45,6 +45,9 @@ export const DEFAULT_PROVIDER = 'anthropic';
  * The provider an account belongs to. Accounts written before providers
  * existed have no `provider` field and are Anthropic, so the default keeps
  * every existing config working untouched.
+ *
+ * @param {Record<string, any>|null|undefined} account
+ * @returns {keyof typeof PROVIDERS}
  */
 export function providerOf(account) {
   const id = account?.provider;
@@ -198,4 +201,26 @@ export function upstreamFor(account, configuredUpstream) {
 /** Whether the Anthropic-only body rewrites apply to this account. */
 export function rewritesBody(account) {
   return PROVIDERS[providerOf(account)].rewritesBody;
+}
+
+/** Whether `account` is served by a process on this machine rather than by a
+ *  vendor endpoint — typically a local translating proxy in front of another
+ *  backend.
+ *
+ *  Keyed on the upstream resolving to loopback. Pairing the account against a
+ *  declared local process does not generalise: such a declaration carries a
+ *  COMMAND rather than a port, and the port sits inside its argv, where every
+ *  program spells it differently. A loopback upstream says the same thing
+ *  directly, and says it for a hand-started process too. A remote third-party
+ *  backend (DeepSeek, GLM) keeps a public host and is not caught.
+ *
+ * @param {any} account
+ */
+export function isLocalUpstream(account) {
+  if (!account?.upstream) return false;
+  let hostname;
+  try { hostname = new URL(account.upstream).hostname; }
+  catch { return false; } // not a URL we can judge — treat it as a normal account
+  const host = hostname.replace(/^\[|\]$/g, '').toLowerCase(); // URL brackets IPv6
+  return host === 'localhost' || host === '::1' || /^127\./.test(host);
 }
