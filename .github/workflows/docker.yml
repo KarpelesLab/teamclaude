@@ -128,7 +128,7 @@ jobs:
       # OIDC token. The digest guard skips the build-without-push case.
       - name: Attest build provenance
         if: steps.decide.outputs.push == 'true' && steps.build.outputs.digest != ''
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}
           subject-digest: ${{ steps.build.outputs.digest }}
