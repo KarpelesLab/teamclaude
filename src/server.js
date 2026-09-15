@@ -1109,7 +1109,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         // socket itself on a dead stream, so a clientGone check at this point
         // would reclassify the worst failure as "the user left".
         accountManager.endSession(sessionId,
-          !isCompletionPath(req.url) ? null : (ctx.delivered ? true : (ctx.abandoned ? null : false)));
+          !isCompletionPath(classificationPath(req.url)) ? null : (ctx.delivered ? true : (ctx.abandoned ? null : false)));
         // Cleared BEFORE the hook, because the hook can throw: leaving the entry
         // marked open would send the outer catch to call that same throwing hook
         // a second time for one request.
@@ -1214,7 +1214,9 @@ function isCompletionPath(url) {
 // a stale streak, and one the proxy refuses to send at all (egress unpinned)
 // must still count as getting nothing.
 function recordEarlyOutcome(accountManager, sessionId, url, usable) {
-  if (sessionId && isCompletionPath(url)) accountManager.recordOutcome(sessionId, usable);
+  // On the classification path, like every other decision here: `\v1\messages`
+  // goes out as `/v1/messages` and is a completion for the streak too (#377).
+  if (sessionId && isCompletionPath(classificationPath(url))) accountManager.recordOutcome(sessionId, usable);
 }
 
 /**

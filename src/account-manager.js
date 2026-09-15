@@ -655,7 +655,7 @@ export class AccountManager {
     if (!account?.entitlementDeniedUntil) return false;
     if (now < account.entitlementDeniedUntil) return true;
     account.entitlementDeniedUntil = null;
-    console.log(`[TeamClaude] Account "${account.name}" entitlement cooldown expired, marking available`);
+    console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" entitlement cooldown expired, marking available`);
     return false;
   }
 
@@ -1647,7 +1647,7 @@ export class AccountManager {
       account.status = 'active';
       account.rateLimitedUntil = null;
       account.throttledAt = null;
-      console.log(`[TeamClaude] Account "${account.name}" rate limit expired, marking active`);
+      console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" rate limit expired, marking active`);
     }
 
     if (account.status === 'exhausted') return 'exhausted';
@@ -2473,7 +2473,7 @@ export class AccountManager {
     const now = Date.now();
     if (now < (this._rolloverHeldLogAt.get(key) || 0)) return;
     this._rolloverHeldLogAt.set(key, now + 60_000);
-    console.log(`[TeamClaude] Account "${account.name}" rolled over its ${window} window ${this._heldRolloverReason(reason)}`);
+    console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" rolled over its ${window} window ${this._heldRolloverReason(reason)}`);
   }
 
   /**
@@ -2711,7 +2711,7 @@ export class AccountManager {
 
     // Clear expired unified quotas
     if (q.unified5h != null && q.unified5hReset && now >= q.unified5hReset) {
-      console.log(`[TeamClaude] Account "${account.name}" session quota reset`);
+      console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" session quota reset`);
       // Recorded on the account, not just returned. _clearExpiredQuotas is
       // reached from two directions — refreshExpiredQuotas on the request path,
       // which runs the session-reset switch rule, and _isNearQuota via
@@ -2731,7 +2731,7 @@ export class AccountManager {
       session = true;
     }
     if (q.unified7d != null && q.unified7dReset && now >= q.unified7dReset) {
-      console.log(`[TeamClaude] Account "${account.name}" weekly quota reset`);
+      console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" weekly quota reset`);
       q.unified7d = null;
       q.unified7dReset = null;
       q.unifiedStatus = null;
@@ -2775,7 +2775,7 @@ export class AccountManager {
       // so a reading is never discarded before it has had a window to prove out.
       if (!q[seenField]) { q[seenField] = now; continue; }
       if (now < q[seenField] + this.familyStaleMs) continue;
-      console.log(`[TeamClaude] Account "${account.name}" ${label} weekly reading is stale — revalidating on the next ${label} request`);
+      console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" ${label} weekly reading is stale — revalidating on the next ${label} request`);
       q[key] = null;
       q[`${key}Reset`] = null;
       q[seenField] = null;
@@ -3210,7 +3210,7 @@ export class AccountManager {
     if (account.probing && account.quota.unified7dReset != null) {
       account.probing = false;
       account.requalify = true;
-      console.log(`[TeamClaude] Learned weekly quota for "${account.name}", re-evaluating selection`);
+      console.log(`[TeamClaude] Learned weekly quota for "${safeLine(account.name, 64)}", re-evaluating selection`);
     }
 
     this._observeBurnRate(account, observed);
@@ -3220,7 +3220,7 @@ export class AccountManager {
 
     if (this._isNearQuota(account)) {
       const pct = account.quota.unified7d != null ? Math.round(account.quota.unified7d * 100) : null;
-      console.log(`[TeamClaude] "${account.name}" near weekly quota${pct == null ? '' : ` (${pct}%)`}`);
+      console.log(`[TeamClaude] "${safeLine(account.name, 64)}" near weekly quota${pct == null ? '' : ` (${pct}%)`}`);
     }
   }
 
@@ -3277,7 +3277,7 @@ export class AccountManager {
     if (account.probing && account.quota.unified7dReset != null) {
       account.probing = false;
       account.requalify = true;
-      console.log(`[TeamClaude] Learned weekly quota for "${account.name}", re-evaluating selection`);
+      console.log(`[TeamClaude] Learned weekly quota for "${safeLine(account.name, 64)}", re-evaluating selection`);
     }
 
     // `unified-status` is upstream's verdict on THIS response. A family-cap 429
@@ -3332,7 +3332,7 @@ export class AccountManager {
         : account.quota.tokensLimit
           ? ((1 - account.quota.tokensRemaining / account.quota.tokensLimit) * 100).toFixed(1)
           : '?';
-      console.log(`[TeamClaude] Account "${account.name}" at ${pct}% usage — will switch on next request`);
+      console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" at ${pct}% usage — will switch on next request`);
     }
   }
 
@@ -3425,7 +3425,7 @@ export class AccountManager {
       // drop the dead-token guard too — otherwise the account would come back
       // active but never attempt a refresh (see ensureTokenFresh).
       account._deadRefreshToken = null;
-      console.log(`[TeamClaude] Account "${account.name}" re-enabled — clearing error state`);
+      console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" re-enabled — clearing error state`);
     }
   }
 
@@ -3490,7 +3490,7 @@ export class AccountManager {
       }
       // Worth a line: the account was refusing this family and is not any more.
       if (wasSpent && !(q[key] != null && q[key] >= this.thresholdFor(key))) {
-        console.log(`[TeamClaude] Account "${account.name}" ${label} weekly quota confirmed available by probe`);
+        console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" ${label} weekly quota confirmed available by probe`);
       }
     }
     // Families beyond the two with dedicated fields. Replaced wholesale rather
@@ -3514,11 +3514,11 @@ export class AccountManager {
       const was = q.spend;
       q.spend = { ...usage.spend };
       if (q.spend.enabled && !was?.enabled) {
-        console.log(`[TeamClaude] Account "${account.name}" can bill real money past its plan limits (extra usage is enabled upstream)`);
+        console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" can bill real money past its plan limits (extra usage is enabled upstream)`);
       }
       const spentNow = (q.spend.usedMinor || 0) > 0;
       if (spentNow && !((was?.usedMinor || 0) > 0)) {
-        console.log(`[TeamClaude] Account "${account.name}" has started spending real money: ${formatMoney(q.spend)}`);
+        console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" has started spending real money: ${formatMoney(q.spend)}`);
       }
     }
 
@@ -3595,7 +3595,7 @@ export class AccountManager {
     // after throttleProbeFloorMs from here, so a probe that 429s again pushes
     // the next probe out by a full floor rather than hammering upstream.
     account.throttledAt = Date.now();
-    console.log(`[TeamClaude] Account "${account.name}" rate limited for ${retryAfterSeconds}s`);
+    console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" rate limited for ${retryAfterSeconds}s`);
   }
 
   /**
@@ -3609,7 +3609,7 @@ export class AccountManager {
     account.status = 'active';
     account.rateLimitedUntil = null;
     account.throttledAt = null;
-    console.log(`[TeamClaude] Account "${account.name}" revalidated — rate limit no longer applies, back in rotation`);
+    console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" revalidated — rate limit no longer applies, back in rotation`);
   }
 
   /**
@@ -3646,7 +3646,7 @@ export class AccountManager {
     if (account._deadRefreshToken && account._deadRefreshToken === account.refreshToken) {
       if (account.status !== 'error') {
         account.status = 'error';
-        console.error(`[TeamClaude] Account "${account.name}" still holds a rejected refresh token — run: teamclaude login`);
+        console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}" still holds a rejected refresh token — run: teamclaude login`);
       }
       return;
     }
@@ -3672,7 +3672,7 @@ export class AccountManager {
     if (account._refreshPromise) return account._refreshPromise;
 
     account._refreshPromise = (async () => {
-      console.log(`[TeamClaude] Refreshing token for account "${account.name}"...`);
+      console.log(`[TeamClaude] Refreshing token for account "${safeLine(account.name, 64)}"...`);
       // The token we SEND, captured before the await. A config reload or
       // `teamclaude import` (updateAccountTokens) can install newer tokens while
       // the grant is in flight; reading `account.refreshToken` afterwards would
@@ -3689,7 +3689,7 @@ export class AccountManager {
           ? this._codexRefreshFn(sent)
           : this._refreshFn(sent));
         if (account.refreshToken !== sent) {
-          console.log(`[TeamClaude] Discarding refresh result for account "${account.name}" — its tokens were replaced while the refresh was in flight`);
+          console.log(`[TeamClaude] Discarding refresh result for account "${safeLine(account.name, 64)}" — its tokens were replaced while the refresh was in flight`);
           return;
         }
         account.credential = newTokens.accessToken;
@@ -3697,10 +3697,10 @@ export class AccountManager {
         account.expiresAt = newTokens.expiresAt;
         account._lastRefreshAt = Date.now();
         account._deadRefreshToken = null; // this token works; clear any stale guard
-        console.log(`[TeamClaude] Token refreshed for account "${account.name}"`);
+        console.log(`[TeamClaude] Token refreshed for account "${safeLine(account.name, 64)}"`);
         this._onTokenRefresh?.(accountIndex, newTokens);
       } catch (err) {
-        console.error(`[TeamClaude] Token refresh failed for "${account.name}": ${err.message}`);
+        console.error(`[TeamClaude] Token refresh failed for "${safeLine(account.name, 64)}": ${err.message}`);
         // Reserve 'error' (which drops the account from rotation until re-login)
         // for a GENUINE auth rejection: the refresh token itself is no longer
         // valid — revoked, or invalidated by an account/plan migration. A
@@ -3716,11 +3716,11 @@ export class AccountManager {
           // a token imported mid-refresh stays untouched and gets its own try.
           account._deadRefreshToken = sent;
           if (account.refreshToken !== sent) {
-            console.log(`[TeamClaude] Account "${account.name}" received new tokens while its old refresh token was being rejected — keeping the new ones`);
+            console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" received new tokens while its old refresh token was being rejected — keeping the new ones`);
             return;
           }
           account.status = 'error';
-          console.error(`[TeamClaude] Account "${account.name}" needs re-login (refresh token rejected) — run: teamclaude login`);
+          console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}" needs re-login (refresh token rejected) — run: teamclaude login`);
         }
       } finally {
         account._refreshPromise = null;
@@ -3750,7 +3750,7 @@ export class AccountManager {
     if (refreshToken) account.refreshToken = refreshToken;
     account.expiresAt = expiresAt;
     if (account.status === 'error') account.status = 'active';
-    console.log(`[TeamClaude] Updated tokens for account "${account.name}"`);
+    console.log(`[TeamClaude] Updated tokens for account "${safeLine(account.name, 64)}"`);
     this._onTokenRefresh?.(accountIndex, {
       accessToken,
       refreshToken: account.refreshToken,

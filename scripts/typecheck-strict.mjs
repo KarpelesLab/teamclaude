@@ -25,7 +25,7 @@
 // tree's copy.
 
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync, copyFileSync, symlinkSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, copyFileSync, symlinkSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
@@ -72,7 +72,10 @@ for (const line of git('diff', '--name-status', '-M', baseSha, 'HEAD', '--', 'sr
   if (m) renamed[m[1]] = m[2];
 }
 
-const work = mkdtempSync(join(tmpdir(), 'tc-strict-base-'));
+// Resolved: on macOS tmpdir() is under /var, a symlink to /private/var, and tsc
+// prints diagnostics relative to the REAL cwd, so an unresolved spelling made
+// every base path `../../private/var/...` and the counter read zero (#375).
+const work = realpathSync(mkdtempSync(join(tmpdir(), 'tc-strict-base-')));
 let before;
 try {
   git('worktree', 'add', '--detach', '--quiet', work, baseSha);

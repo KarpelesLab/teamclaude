@@ -176,3 +176,42 @@ test('reload also picks up the REMOVAL of upstream and modelMap', async () => {
     assert.equal(hits.length, 1, `the stub must see no further requests, got ${hits.length}`);
   });
 });
+
+// `stripRequestFields` is read per request off the running account exactly as
+// `upstream` and `modelMap` are (server.js rewriteRequestBody), but the sync
+// did not carry it, so an edit on disk waited for a restart. Removal was worse:
+// with no delete-on-absence mirror the save stencil (`{ ...diskAcct, ...live }`)
+// wrote the stale key back into the operator's config (#374).
+test('reload picks up a stripRequestFields edit, and its removal', async () => {
+  await withServer(async ({ hits, stubPort, proxyPort, configPath }) => {
+    const edited = JSON.parse(await readFile(configPath, 'utf8'));
+    edited.accounts[0].upstream = `http://127.0.0.1:${stubPort}`;
+    edited.accounts[0].stripRequestFields = ['context_management'];
+    await writeFile(configPath, JSON.stringify(edited));
+    await reload(proxyPort);
+
+    const send = async () => {
+      const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'claude-test-model', max_tokens: 1, messages: [], context_management: { edits: [] } }),
+        signal: AbortSignal.timeout(10_000),
+      });
+      await res.text();
+      return res.status;
+    };
+
+    assert.equal(await send(), 200);
+    assert.equal(hits.length, 1);
+    assert.ok(!('context_management' in JSON.parse(hits[0].body)), 'the field listed on disk must be stripped after a reload');
+
+    const trimmed = JSON.parse(await readFile(configPath, 'utf8'));
+    delete trimmed.accounts[0].stripRequestFields;
+    await writeFile(configPath, JSON.stringify(trimmed));
+    await reload(proxyPort);
+
+    assert.equal(await send(), 200);
+    assert.equal(hits.length, 2);
+    assert.ok('context_management' in JSON.parse(hits[1].body), 'removing the entry on disk must stop the stripping');
+  });
+});
