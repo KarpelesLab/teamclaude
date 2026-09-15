@@ -249,6 +249,15 @@ export function spendTag(quota) {
   return (spend.usedMinor || 0) > 0 ? '$!' : '$';
 }
 
+// The type column: the auth kind (7 columns), or the provider in a mixed pool.
+// The row and the width budget both take its width from here.
+function typeColumn(/** @type {any[]} */ accounts) {
+  /** @type {Set<keyof typeof PROVIDERS>} */
+  const pooled = new Set(accounts.map(providerOf));
+  const mixed = pooled.size > 1;
+  return { mixed, width: mixed ? Math.max(...[...pooled].map(id => PROVIDERS[id].label.length)) : 7 };
+}
+
 export function blockedFamilies(quota, threshold) {
   const at = typeof threshold === 'function' ? threshold : () => threshold;
   const out = [];
@@ -1540,6 +1549,8 @@ export class TUI {
       // on the bars instead of leaving the row short of the edge.
       const categoryOf = a => rowCategory(a.quota);
       const routeCells = genRoutes.length ? genRoutes.length + 1 : 0;
+      // The type cell and the space after it, at the width the row pads it to.
+      const typeCell = typeColumn(this.am.accounts).width + 1;
       const budgetFor = (members) => {
         const anyFable = members.some(a => a.quota.unified7dFable != null);
         const anySonnet = members.some(a => a.quota.unified7dSonnet != null);
@@ -1554,7 +1565,7 @@ export class TUI {
           const tag = spendTag(a.quota);
           return tag ? Math.max(w, 2 + vw(tag)) : w;
         }, 0);
-        const fixed = 28 + NAME_MIN + routeCells + tagW + spendW;
+        const fixed = 20 + typeCell + NAME_MIN + routeCells + tagW + spendW;
         const roomFor = n => fixed + 6 * (n - 1) + n * BAR_MIN <= W;
         // The family bars are the first thing to go: below the width where they
         // fit even at BAR_MIN they would push the row past the edge, and a row
@@ -1745,10 +1756,7 @@ export class TUI {
     // apart. `oauth` repeated down every row is what the column says instead, which the
     // operator already knew. Width follows the labels actually present, so nothing is
     // truncated and a single-provider pool keeps the column it has today.
-    /** @type {Set<keyof typeof PROVIDERS>} */
-    const pooled = new Set(this.am.accounts.map(providerOf));
-    const mixed = pooled.size > 1;
-    const typeW = mixed ? Math.max(...[...pooled].map(id => PROVIDERS[id].label.length)) : 7;
+    const { mixed, width: typeW } = typeColumn(this.am.accounts);
     const type = gray((mixed ? PROVIDERS[providerOf(a)].label : a.type).padEnd(typeW));
 
     // Status — a disabled account is shown as such regardless of its quota state.
