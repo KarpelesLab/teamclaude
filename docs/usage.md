@@ -216,7 +216,7 @@ Each account card has a **switch** button that makes that account the current on
 http://localhost:3456/teamclaude/dashboard
 ```
 
-The page is a static asset and loads without a key; the data does not — its script fetches `/teamclaude/status` with the proxy key, which it asks for once and keeps in the browser's localStorage (a 401 after a key rotation brings the prompt back). Loopback browsers are key-exempt as everywhere else. On deployments that put the proxy behind TLS this works remotely too: `https://your-proxy.example.com/teamclaude/dashboard`.
+The page is a static asset and loads without a key; the data does not — its script fetches `/teamclaude/status` first, and asks for the proxy key only if the server refuses the request without one. Loopback browsers are key-exempt as everywhere else, so on the proxy's own machine there is no prompt. A key that is entered is kept in the browser's localStorage, and a 401 after a key rotation brings the prompt back. On deployments that put the proxy behind TLS this works remotely too: `https://your-proxy.example.com/teamclaude/dashboard`.
 
 ## Auto-update
 
