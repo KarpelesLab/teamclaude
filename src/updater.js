@@ -15,11 +15,18 @@ import { existsSync, readFileSync } from 'node:fs';
 import { readFile, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
+import { promisify } from 'node:util';
 import { getConfigPath } from './config.js';
+import { safeLine } from './safe-text.js';
 
 export const PKG_NAME = '@karpeleslab/teamclaude';
 const REGISTRY = 'https://registry.npmjs.org';
 const DAY_MS = 24 * 60 * 60 * 1000;
+// Wide enough for `v1.2.3-rc.1+build`, narrow enough that a tag cannot be the
+// reason a fixed-width caller has no room left.
+const LABEL_MAX = 32;
+
+const pexec = promisify(execFile);
 
 /** Package root = one directory above this file's src/ directory. */
 function packageRoot() {
@@ -33,6 +40,37 @@ export function currentVersion(root = packageRoot()) {
   } catch {
     return null;
   }
+}
+
+/**
+ * How the running copy identifies itself, for display: the exact tag when the
+ * checkout sits on one, else the short sha, else the shipped package.json
+ * version, else the literal `local`. `git` reports a checkout — npm cannot
+ * update one, so nothing should offer to.
+ *
+ * The git calls are pinned to the package root. `teamclaude server` is started
+ * from the operator's own project directory, and resolving against the process
+ * cwd would report that repository's sha as this package's version.
+ *
+ * @param {Object} [opts]
+ * @param {string} [opts.root]
+ * @param {(file: string, args: string[], options: { cwd: string, encoding: 'utf8', timeout: number }) => Promise<{ stdout: string }>} [opts.exec]
+ * @returns {Promise<{ label: string, git: boolean }>}
+ */
+export async function resolveVersionLabel({ root = packageRoot(), exec = pexec } = {}) {
+  const git = existsSync(join(root, '.git'));
+  if (git) {
+    /** @type {{ cwd: string, encoding: 'utf8', timeout: number }} */
+    const opts = { cwd: root, encoding: 'utf8', timeout: 2000 };
+    const probes = [['describe', '--tags', '--exact-match', 'HEAD'], ['rev-parse', '--short', 'HEAD']];
+    for (const args of probes) {
+      try {
+        const label = safeLine((await exec('git', args, opts)).stdout, LABEL_MAX);
+        if (label) return { label, git };
+      } catch { /* not on a tag, a shallow or broken checkout, or no git binary */ }
+    }
+  }
+  return { label: safeLine(currentVersion(root) || 'local', LABEL_MAX), git };
 }
 
 /**
@@ -139,6 +177,22 @@ export async function checkForUpdate({
   }
   if (!latest) return null;
   return { current, latest, updateAvailable: compareVersions(latest, current) > 0 };
+}
+
+/**
+ * Whether the last recorded check saw a newer release. Cache only — never the
+ * registry — so a caller on a render or status path costs nothing. Like
+ * `checkForUpdate`, the cached `latest` is used regardless of its age.
+ *
+ * @param {Object} [opts]
+ * @param {string|null} [opts.current]
+ * @param {string} [opts.cachePath]
+ * @returns {Promise<boolean>}
+ */
+export async function updateAvailableFromCache({ current = currentVersion(), cachePath = defaultCacheFile() } = {}) {
+  if (!current) return false;
+  const { latest } = await readCache(cachePath);
+  return !!latest && compareVersions(latest, current) > 0;
 }
 
 /**
