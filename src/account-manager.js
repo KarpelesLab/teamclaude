@@ -323,6 +323,10 @@ export class AccountManager {
     // it. Each such switch arms the ramp below, so steady interleaved traffic
     // holds both accounts at the ramp floor while nothing has failed over.
     this.routeCursors = new Map();
+    /** Rotation for requests that carry no session id; separate from the shared
+     *  cursor so turning it never moves a running session's account.
+     *  @type {number} */
+    this._untaggedCursor = 0;
     // One cursor per provider. `currentIndex` is a single slot, and a request
     // only another provider can serve would otherwise drag it across: a Codex
     // request moved it onto a Codex account and the next Anthropic request moved
@@ -818,6 +822,12 @@ export class AccountManager {
         if (acc) return acc;
       }
     }
+    // An untagged request has no session to pin, so the walk below rests every
+    // one of them on the current account. Spread them too, on their own cursor.
+    if (!sessionId && this.distributeSessions && !this._pinnedAccountForModel(model, advisorModel)) {
+      const acc = this._selectUntagged(exclude, model, advisorModel);
+      if (acc) return acc;
+    }
     if (advisorModel) {
       const account = this._select(exclude, model, advisorModel, false);
       if (account) return account;
@@ -911,6 +921,41 @@ export class AccountManager {
    * eligible account. Returns null if nothing is eligible, so the caller falls
    * back to the normal quota-driven walk. Does NOT record the pin — that happens
    * on the actual route (recordSession), so retries/failover re-pin naturally. */
+  /**
+   * Round-robin for requests that carry no session id.
+   *
+   * The Codex CLI tags `POST /responses` with `session-id` but not its catalog
+   * fetch, and Claude Code tags `/v1/messages` but not its telemetry. Those
+   * untagged requests have nothing to pin, so the walk below rests all of them
+   * on the current account: measured against a five-account Codex pool with
+   * distribution on, every session's `GET /models` landed on one account, 16
+   * requests against 1 apiece for its siblings.
+   *
+   * `_pickLeastLoaded` does not spread them. An untagged request never reaches
+   * `recordSession`, so it adds no session count, and a serial caller's
+   * in-flight is back to zero by the time the next one arrives — the tiebreak
+   * chain is level every time and answers with the same account. Hence a cursor
+   * of its own.
+   *
+   * That cursor is its own on purpose: `_setCurrent` is what sessions riding
+   * the shared one follow, and moving it from a catalog fetch would hand a
+   * running conversation to another account mid-flight and throw away the
+   * prompt cache it built there. An untagged request picks where it goes and
+   * changes nothing for anyone else.
+   *
+   * @param {Set<number>|null} exclude
+   * @param {string|null} model
+   * @param {string|null} advisorModel
+   * @returns {Record<string, any>|null}
+   */
+  _selectUntagged(exclude, model, advisorModel) {
+    const candidates = this._bandedCandidates(exclude, model, advisorModel);
+    if (candidates.length === 0) return null;
+    const cursor = this._untaggedCursor;
+    this._untaggedCursor = cursor + 1;
+    return candidates[cursor % candidates.length];
+  }
+
   _selectForSession(sessionId, exclude, model, advisorModel) {
     // The pin is per governing bucket, and this request is bound by the
     // EXECUTOR's: one request goes to one account, so the executor's affinity is
@@ -2102,6 +2147,12 @@ export class AccountManager {
    * request, narrowed to the top pressure band when expiry routing is on.
    * `_isAvailable` excludes accounts at or above the switch threshold. Shared by
    * both selection loops so they cannot disagree on the candidate set.
+   */
+  /**
+   * @param {Set<number>|null} [exclude]
+   * @param {string|null} [model]
+   * @param {string|null} [advisorModel]
+   * @returns {Array<Record<string, any>>}
    */
   _bandedCandidates(exclude = null, model = null, advisorModel = null) {
     return this._topPressureBand(

@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { parseCodexQuota, parseCodexPlanType } from '../src/codex-quota.js';
+import { AccountManager } from '../src/account-manager.js';
 
 // The exact header SET from a live Codex response, with the values replaced by
 // synthetic ones. The shape is what matters here and is not invented: the
@@ -37,16 +38,66 @@ test('the account-wide weekly window is read from its duration, not its position
   const q = parseCodexQuota(LIVE);
   assert.equal(q.unified7d, 0.42);
   assert.equal(q.unified7dReset, 1900000000 * 1000);
-  // 31% weekly used must never appear as a 5h reading.
-  assert.equal(q.unified5h, undefined);
-  assert.equal(q.unified5hReset, undefined);
+  // 42% weekly used must never appear as a 5h reading. The only 5h window this
+  // response states is the model family's own, and it reads 0%.
+  assert.equal(q.unified5h, 0);
 });
 
 // A zero-length window is how this API says "not applicable"; treating it as
 // 0% used would read as full headroom.
 test('a zero-length window is dropped rather than read as empty', () => {
-  const q = parseCodexQuota(LIVE);
+  const q = parseCodexQuota({
+    'x-codex-primary-used-percent': '42',
+    'x-codex-primary-window-minutes': '10080',
+    'x-codex-secondary-used-percent': '0',
+    'x-codex-secondary-window-minutes': '0',
+  });
   assert.ok(!('unified5h' in q), 'secondary window-minutes=0 must not produce a bucket');
+});
+
+// The bug this file's LIVE fixture already described but did not gate on: on a
+// real ChatGPT account the 5-hour window is stated ONLY by the model family, so
+// dropping it left `unified5h` null for the account's whole life and every
+// rule keyed on it — rotation, expiry clearing, the session-reset switch —
+// silently never fired.
+test("a model family's five-hour window becomes the account's 5h reading", () => {
+  const q = parseCodexQuota(LIVE);
+  assert.equal(q.unified5h, 0);
+  assert.equal(q.unified5hReset, 1900001111 * 1000);
+});
+
+test("a spent model-family five-hour window rotates the account off", () => {
+  const am = new AccountManager(
+    [{ name: 'c', type: 'oauth', provider: 'codex', accountId: 'acct-c', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 }],
+    0.98,
+  );
+  am.updateQuota(0, {
+    ...LIVE,
+    'x-codex-bengalfox-primary-used-percent': '99',
+    // Derived, never pinned: a fixed epoch would stop gating the day it passes.
+    'x-codex-bengalfox-primary-reset-at': String(Math.floor(Date.now() / 1000) + 3600),
+  });
+  assert.equal(am.accounts[0].quota.unified5h, 0.99);
+  assert.equal(am._isAvailable(am.accounts[0], 'gpt-5.3-codex'), false);
+});
+
+// The account-wide family is the authority on the account-wide bucket. A named
+// family only meters the models it names, so letting a spent one overwrite an
+// account reading would bar models it never metered — the one-way ratchet the
+// weekly buckets are written to avoid. Without this the fill-the-gap rule would
+// quietly drift into a tightest-of-all rule the first time upstream reports
+// both.
+test('a named family never overwrites an account-wide five-hour reading', () => {
+  const q = parseCodexQuota({
+    'x-codex-primary-used-percent': '10',
+    'x-codex-primary-window-minutes': '300',
+    'x-codex-primary-reset-at': '1900003333',
+    'x-codex-bengalfox-primary-used-percent': '99',
+    'x-codex-bengalfox-primary-window-minutes': '300',
+    'x-codex-bengalfox-primary-reset-at': '1900004444',
+  });
+  assert.equal(q.unified5h, 0.1);
+  assert.equal(q.unified5hReset, 1900003333 * 1000);
 });
 
 test('a named family becomes a model-scoped weekly bucket', () => {
