@@ -26,6 +26,8 @@ MITM mode launches claude pointed at TeamClaude as an **HTTPS forward proxy** (`
 
 Because the request is buffered, the retry is transparent to claude. Client token refreshes (`/v1/oauth/token`), Remote Control (`/v1/code/*`) and claude.ai attachment transfers (`/api/oauth/files/*`, `/api/oauth/file_upload`) are passed through with the client's own credential, since they are bound to the paired identity and would 403 under a rotated token. Any host other than the upstream is blind-tunnelled. The server accepts *both* base-URL and proxy clients at once, so instances launched with and without `--no-mitm` can share one server.
 
+A pool with Codex accounts also intercepts `chatgpt.com`, which is where ChatGPT Desktop talks to as well. On a machine running that app, set `proxy.terminalOnly` to `true` to tunnel that host untouched: the terminal Codex CLI keeps reaching the pool through its explicit `/backend-api/codex` base URL, and the desktop app keeps its own login.
+
 ### Trust model
 
 - The CA is generated locally, stored in the config dir, and trusted **only** by the claude process you launch via `teamclaude run` (through `NODE_EXTRA_CA_CERTS`) — it is **never** added to your system trust store. The leaf private key is `0600`; the CA private key is never written to disk.
