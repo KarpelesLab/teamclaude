@@ -496,6 +496,18 @@ export class TUI {
   start() {
     this.running = true;
     this._openActivityLog();
+    // Node puts a TTY stdout in BLOCKING mode, so every paint is a synchronous
+    // write(2) that returns only when the terminal has drained the pty. That
+    // makes the proxy's event loop hostage to its own display: when the
+    // terminal emulator pauses — an Electron pane busy elsewhere, a window
+    // occluded, the machine dozing — the write sits in the kernel and nothing
+    // else runs: no upstream bytes relayed, no request completed, no log line.
+    // Measured live: stalls of 5-29s, the main thread in write() under
+    // StreamBase::WriteString, with sessions "waiting for API response" and
+    // nothing to see anywhere because the thing that would show it is the
+    // thing blocked. Non-blocking here, and the paint below drops a frame
+    // when the terminal is behind instead of waiting for it.
+    this._setStdoutBlocking(false);
     process.stdout.write(`${ESC}?1049h${ESC}?25l`);
     process.stdin.setRawMode(true);
     process.stdin.resume();
@@ -552,6 +564,12 @@ export class TUI {
     if (this._activityStream) { this._activityStream.end(); this._activityStream = null; }
     process.stdin.removeListener('data', this._dataHandler);
     process.stdout.removeListener('resize', this._resizeHandler);
+    if (this._drainHandler) { process.stdout.removeListener('drain', this._drainHandler); this._drainHandler = null; }
+    // Blocking again for the exit sequence: a non-blocking write can still be
+    // queued when the process exits, and a terminal left on the alternate
+    // screen with no cursor is the one state an operator cannot recover
+    // without knowing the escape by heart.
+    this._setStdoutBlocking(true);
     process.stdout.write(`${ESC}?25h${ESC}?1049l`);
     try { process.stdin.setRawMode(false); } catch {}
     process.stdin.pause();
@@ -1363,9 +1381,34 @@ export class TUI {
   _paint(buf, force) {
     const stale = Date.now() - (this._lastPaintAt || 0) >= FORCE_REPAINT_MS;
     if (!force && !stale && buf === this._lastFrame) return;
+    // The terminal has not taken the previous frame yet. Painting anyway would
+    // only queue another full screen behind it — the operator sees the newest
+    // frame either way, so the one in between is worth nothing. Drop it, and
+    // paint what is current once the terminal catches up.
+    if (process.stdout.writableNeedDrain) {
+      this._pendingPaint = true;
+      if (!this._drainHandler) {
+        this._drainHandler = () => {
+          this._drainHandler = null;
+          if (this._pendingPaint && this.running) { this._pendingPaint = false; this.render({ force: true }); }
+        };
+        process.stdout.once('drain', this._drainHandler);
+      }
+      return;
+    }
+    this._pendingPaint = false;
     this._lastFrame = buf;
     this._lastPaintAt = Date.now();
     process.stdout.write(buf);
+  }
+
+  /** Flip stdout between blocking and non-blocking. A handle without the
+   *  method (a pipe in tests, a file) needs neither, and a failure to flip is
+   *  worth no more than the old behaviour it leaves in place.
+   *  @param {boolean} blocking */
+  _setStdoutBlocking(blocking) {
+    // `_handle` is Node-internal and untyped; the optional chain is the guard.
+    try { /** @type {any} */ (process.stdout)._handle?.setBlocking?.(blocking); } catch {}
   }
 
   _render(force = false) {
