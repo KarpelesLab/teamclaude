@@ -483,6 +483,67 @@ test('the page ships the same helper implementations it is tested against', () =
   assert.doesNotThrow(() => new Function(script), 'inline script must parse');
 });
 
+// Run the page's whole inline script against a stub DOM, a stub localStorage and
+// a fetch the test answers by hand. Elements absorb any method call, so render()
+// runs without a real DOM; only the style and text the startup path sets are read.
+function bootPage({ storedKey = null } = {}) {
+  const els = new Map();
+  const stubEl = () => {
+    const target = { style: {}, value: '', textContent: '', className: '', disabled: false };
+    return new Proxy(target, { get: (t, p) => (p in t ? t[p] : () => stubEl()) });
+  };
+  const byId = id => { if (!els.has(id)) els.set(id, stubEl()); return els.get(id); };
+  const store = new Map(storedKey ? [['teamclaude-dashboard-key', storedKey]] : []);
+  const localStorage = {
+    getItem: k => (store.has(k) ? store.get(k) : null),
+    setItem: (k, v) => store.set(k, String(v)),
+    removeItem: k => store.delete(k),
+  };
+  const requests = [];
+  const fetch = (url, init) => new Promise(resolve => requests.push({ url, init, resolve }));
+  const document = { getElementById: byId, createElement: () => stubEl() };
+  const html = renderDashboardHtml();
+  const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
+  new Function('document', 'localStorage', 'fetch', 'setInterval', 'clearInterval', script)(
+    document, localStorage, fetch, () => 1, () => {});
+  const answer = async (status, body = {}) => {
+    requests.shift().resolve({ status, ok: status >= 200 && status < 300, json: async () => body });
+    await new Promise(r => setImmediate(r));
+  };
+  return { byId, store, requests, answer };
+}
+
+test('the page polls status before asking for a key, so a key-exempt browser is never prompted', async () => {
+  const page = bootPage();
+  assert.equal(page.requests.length, 1, 'polls on load with no stored key');
+  assert.equal(page.requests[0].url, '/teamclaude/status');
+  assert.equal(page.requests[0].init.headers['x-api-key'], '');
+  assert.notEqual(page.byId('keybox').style.display, 'block', 'no prompt before the server answers');
+
+  await page.answer(200, { accounts: [] });
+  assert.notEqual(page.byId('keybox').style.display, 'block');
+  assert.equal(page.byId('app').style.display, '');
+});
+
+for (const status of [401, 403]) {
+  test(`a ${status} on the status poll brings the key prompt up and drops the stored key`, async () => {
+    const page = bootPage({ storedKey: 'tc-stale' });
+    assert.equal(page.requests[0].init.headers['x-api-key'], 'tc-stale');
+    await page.answer(status);
+    assert.equal(page.byId('keybox').style.display, 'block');
+    assert.equal(page.byId('app').style.display, 'none');
+    assert.equal(page.store.size, 0);
+  });
+}
+
+test('a first poll that fails shows its error instead of a blank page', async () => {
+  const page = bootPage();
+  await page.answer(500);
+  assert.equal(page.byId('err').style.display, 'block');
+  assert.match(page.byId('err').textContent, /status 500/);
+  assert.equal(page.byId('app').style.display, '');
+});
+
 test('dashboard page is self-contained: no external resources', () => {
   const html = renderDashboardHtml();
   assert.match(html, /^<!doctype html>/);
