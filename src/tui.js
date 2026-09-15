@@ -1827,6 +1827,10 @@ export class TUI {
     lines.push(row(byId('eventlog')));
     if (byId('sessionTitles')) lines.push(row(byId('sessionTitles')));
     lines.push('');
+    // ── Launch
+    lines.push(bold('  Launch') + dim('  — how `teamclaude run` and `env` reach the proxy when no flag says'));
+    lines.push(row(byId('clientMode')));
+    lines.push('');
     // ── Routing
     lines.push(bold('  Routing') + dim('  — pin model families to specific accounts, or block them outright'));
     lines.push(row(byId('routes')));
