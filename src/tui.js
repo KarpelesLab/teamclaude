@@ -9,7 +9,7 @@ import {
   oauthIdentityFields,
 } from './identity.js';
 import { configIndexFor, managerAccountFor, markAccountRemoved } from './account-pairing.js';
-import { PROVIDERS, providerOf } from './provider.js';
+import { PROVIDERS, providerOf, isSubscriptionAccount } from './provider.js';
 import { mintAccountId } from './account-id.js';
 import { formatPercent } from './status-renderer.js';
 import { resolveMaxUsage } from './model.js';
@@ -218,12 +218,13 @@ const NAME_MIN = 12;
 const HEAD_GAP = 2;
 
 // Which pair of bars a row draws: the subscription buckets (Ses/Wk, plus the
-// S7/F7 family bars) when any unified reading exists, else the metered Tok/Req
-// pair an API-key account reports. The account row budget is drawn per
+// S7/F7 family bars) for a subscription or any unified reading, else the metered
+// Tok/Req pair an API-key account reports. The account row budget is drawn per
 // category (#234): the two kinds of row share no bar, so sizing an API-key row
 // for family bars it never draws only left it short of the edge.
-function rowCategory(q) {
-  return (q.unified5h != null || q.unified7d != null || q.unified7dSonnet != null || q.unified7dFable != null)
+function rowCategory(/** @type {any} */ account) {
+  const q = account.quota;
+  return (isSubscriptionAccount(account) || q.unified5h != null || q.unified7d != null || q.unified7dSonnet != null || q.unified7dFable != null)
     ? 'unified' : 'metered';
 }
 
@@ -1547,7 +1548,7 @@ export class TUI {
       // The `⊘ Sonnet Fable` tag is reserved for only when some account is
       // actually blocked; the common case where nothing is spends those columns
       // on the bars instead of leaving the row short of the edge.
-      const categoryOf = a => rowCategory(a.quota);
+      const categoryOf = a => rowCategory(a);
       const routeCells = genRoutes.length ? genRoutes.length + 1 : 0;
       // The type cell and the space after it, at the width the row pads it to.
       const typeCell = typeColumn(this.am.accounts).width + 1;
@@ -1775,7 +1776,7 @@ export class TUI {
     // Quota ratios — prefer unified (Claude Max), fall back to standard (API key)
     let r1 = null, r2 = null, l1 = 'Ses', l2 = 'Wk ', t1 = null, t2 = null, w1 = null, w2 = null;
 
-    if (rowCategory(q) === 'unified') {
+    if (rowCategory(a) === 'unified') {
       r1 = q.unified5h;
       r2 = q.unified7d;
       t1 = q.unified5hReset;

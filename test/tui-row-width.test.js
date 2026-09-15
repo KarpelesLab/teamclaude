@@ -222,3 +222,36 @@ test('a blocked family on a subscription row does not shorten the API-key rows',
     assert.ok(w - widest(metered) <= 3, `W=${w}: the tag cost the API-key rows ${w - widest(metered)} columns`);
   }
 });
+
+// Before its first reading an OAuth row drew the API-key Tok/Req pair, at the
+// metered rows' width.
+test('a subscription account with no reading yet draws its own bars, empty', () => {
+  const am = new AccountManager([
+    oauth('probed@example.com'),
+    oauth('fresh@example.com'),
+    { name: 'key@example.com', type: 'apikey', apiKey: 'k' },
+  ], 0.98);
+  Object.assign(am.accounts[0].quota, { unified5h: 0.4, unified5hReset: Date.now() + 3600_000, unified7d: 0.3, unified7dReset: Date.now() + 86400_000 });
+  const tui = new TUI({
+    accountManager: am, config: { proxy: { port: 1 }, accounts: [], routes: [] }, sx: null,
+    saveConfig: async () => {}, syncAccounts: async () => 0, onQuit: () => {}, probeQuota: () => {},
+  });
+  const cols = Object.getOwnPropertyDescriptor(process.stdout, 'columns');
+  Object.defineProperty(process.stdout, 'columns', { value: 120, configurable: true });
+  const drawn = [];
+  try {
+    const real = tui._renderAcct.bind(tui);
+    tui._renderAcct = (...args) => { const out = real(...args); drawn.push(strip(out)); return out; };
+    tui._paint = () => {};
+    tui.running = true;
+    tui.render(true);
+  } finally {
+    if (cols) Object.defineProperty(process.stdout, 'columns', cols);
+    else delete process.stdout.columns;
+  }
+  const [probed, fresh, key] = drawn;
+  assert.match(fresh, /Ses .*Wk /, fresh);
+  assert.doesNotMatch(fresh, /Tok|Req/);
+  assert.equal(fresh.indexOf('Wk '), probed.indexOf('Wk '), 'lined up with the probed subscription row');
+  assert.match(key, /Tok .*Req /, 'an API key keeps the metered pair');
+});
