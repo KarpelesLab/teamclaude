@@ -18,6 +18,7 @@ export default [
         fetch: 'readonly',
         AbortController: 'readonly',
         AbortSignal: 'readonly',
+        ReadableStream: 'readonly',
       },
     },
     rules: {
