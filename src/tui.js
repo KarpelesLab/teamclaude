@@ -581,13 +581,16 @@ export class TUI {
     this._setStdoutBlocking(true);
     // Blocking again means a failed write throws here instead of arriving as
     // an event, and a terminal that has already gone will fail. Restoring the
-    // screen is best-effort: there is nobody left to restore it for. The error
-    // listener outlives this write, so a late async failure is absorbed too.
+    // screen is best-effort: there is nobody left to restore it for.
     try { process.stdout.write(`${ESC}?25h${ESC}?1049l`); } catch { /* terminal already gone */ }
-    if (this._stdoutErrorHandler) {
-      process.stdout.removeListener('error', this._stdoutErrorHandler);
-      this._stdoutErrorHandler = null;
-    }
+    // The error listener stays. Flipping back to blocking does not make writes
+    // ALREADY QUEUED synchronous, so a paint still in flight can fail after
+    // this point, and shutdown() runs well past it — stopping the prober, the
+    // warmer and the sidecar, then awaiting a state save. An earlier version
+    // removed the listener here while claiming it outlived the write; it did
+    // not, and the proxy died of an unhandled EPIPE in exactly that window. It
+    // only sets a flag, so leaving it attached for the rest of the process
+    // costs nothing.
     try { process.stdin.setRawMode(false); } catch {}
     process.stdin.pause();
   }

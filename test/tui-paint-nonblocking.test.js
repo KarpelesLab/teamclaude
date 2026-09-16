@@ -157,7 +157,7 @@ test('a dead terminal cannot throw out of stop()', () => {
     tui.start();
     out.write = () => { throw epipe(); };   // blocking again: the failure throws here
     assert.doesNotThrow(() => tui.stop());
-    assert.equal(out.listeners('error').length, 0, 'the listener is released with the terminal');
+    assert.equal(out.listeners('error').length, 1, 'the guard outlives stop(): a queued write can still fail after it');
   });
 });
 
@@ -175,5 +175,24 @@ test('a stalled terminal that never drains does not strand the next paint', () =
     out.writableNeedDrain = false;
     tui._paint('later', true);
     assert.equal(out.writes.length, before, 'the broken stream is checked before the drain handshake');
+  });
+});
+
+// Flipping stdout back to blocking does not make writes ALREADY QUEUED
+// synchronous, and shutdown() runs well past stop() — stopping the prober, the
+// warmer and the sidecar, then awaiting a state save. A paint still in flight
+// can fail anywhere in there. An earlier fix removed the guard inside stop()
+// while claiming it outlived the write; the proxy then died of an unhandled
+// EPIPE in exactly that window.
+test('a write that fails after stop() is still absorbed', () => {
+  const out = fakeStdout(); this_ = out;
+  withStdio(out, () => {
+    const tui = makeTUI();
+    tui.render = () => {};
+    tui._scheduleTick = () => {};
+    tui.start();
+    tui.stop();
+    assert.doesNotThrow(() => out.emit('error', epipe()),
+      'the late failure has somewhere to go, so Node never promotes it');
   });
 });

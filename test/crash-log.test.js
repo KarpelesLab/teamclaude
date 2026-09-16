@@ -80,3 +80,48 @@ test('the crash log sits next to the config', () => {
     else process.env.TEAMCLAUDE_CONFIG = prev;
   }
 });
+
+// A terminal closing is not a fault in the daemon: every account, route and
+// inflight request is exactly as it was. Ending the process for it punishes
+// every routed session for a closed pane — which happened three times in two
+// days, each death also orphaning a sidecar on its port. The TUI writes to a
+// non-blocking stdout, so the failure arrives as an event and no `try` at the
+// write can see it; this handler is the only place left to be sensible.
+
+test('a broken pipe is recorded but does NOT kill the proxy', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'tc-crash-'));
+  try {
+    const { code, logged } = await crashIn(dir,
+      `setTimeout(() => { const e = new Error('write EPIPE'); e.code = 'EPIPE'; e.syscall = 'write'; throw e; }, 0);
+       setTimeout(() => process.exit(7), 80);`);
+    assert.equal(code, 7, 'it survived and exited on its own terms, not the handler s');
+    assert.match(logged, /EPIPE write/, 'code and syscall are recorded, not just the bare message');
+    assert.match(logged, /uncaughtException/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a stream that keeps failing is recorded once, not once per write', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'tc-crash-'));
+  try {
+    const { logged } = await crashIn(dir,
+      `const blow = () => { const e = new Error('write EPIPE'); e.code = 'EPIPE'; throw e; };
+       setTimeout(blow, 0); setTimeout(blow, 10); setTimeout(blow, 20);
+       setTimeout(() => process.exit(0), 80);`);
+    assert.equal((logged.match(/=== /g) || []).length, 1, 'the stream stays dead; repeats say nothing new');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a real error still ends the process, broken-pipe handling notwithstanding', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'tc-crash-'));
+  try {
+    const { code, logged } = await crashIn(dir, 'setTimeout(() => { throw new Error("genuine"); }, 0);');
+    assert.equal(code, 1);
+    assert.match(logged, /Error: genuine/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
