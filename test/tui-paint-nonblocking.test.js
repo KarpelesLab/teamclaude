@@ -20,14 +20,26 @@ function oauth(name) {
  *  lets the test say whether the terminal is behind. */
 function fakeStdout() {
   const listeners = {};
+  const persistent = {};
   return {
     writes: [], blocking: [], writableNeedDrain: false, columns: 100, rows: 30,
     _handle: { setBlocking(b) { this_.blocking.push(b); } },
     write(s) { this.writes.push(s); return !this.writableNeedDrain; },
     once(ev, fn) { (listeners[ev] ||= []).push(fn); },
-    on() {}, removeListener(ev, fn) { listeners[ev] = (listeners[ev] || []).filter(f => f !== fn); },
-    emit(ev) { const fns = listeners[ev] || []; listeners[ev] = []; for (const f of fns) f(); },
-    listeners: (ev) => listeners[ev] || [],
+    // A `once` listener is spent by an emit; an `on` listener is not. The TUI
+    // uses `once` for drain and `on` for error, and only stop() clears the latter.
+    on(ev, fn) { (persistent[ev] ||= []).push(fn); },
+    removeListener(ev, fn) {
+      listeners[ev] = (listeners[ev] || []).filter(f => f !== fn);
+      persistent[ev] = (persistent[ev] || []).filter(f => f !== fn);
+    },
+    emit(ev, arg) {
+      const fns = listeners[ev] || [];
+      listeners[ev] = [];
+      for (const f of fns) f(arg);
+      for (const f of persistent[ev] || []) f(arg);
+    },
+    listeners: (ev) => [...(listeners[ev] || []), ...(persistent[ev] || [])],
   };
 }
 // `this_` lets the handle reach the outer object without a class.
@@ -100,5 +112,68 @@ test('a stdout without a settable handle is left alone', () => {
   withStdout(out, () => {
     const tui = makeTUI();
     assert.doesNotThrow(() => tui._setStdoutBlocking(false));
+  });
+});
+
+// Flipping stdout non-blocking moved its write failures onto the async path,
+// where they arrive as an 'error' event. Nothing listened, so Node promoted
+// them to uncaughtException and the crash handler exited the process: the
+// proxy died whenever a terminal went away, twice within a day, each time
+// orphaning the sidecar on its port. The display is now allowed to fail alone.
+
+function withStdio(out, fn) {
+  const stdin = { setRawMode() {}, resume() {}, setEncoding() {}, on() {}, removeListener() {}, pause() {} };
+  const realIn = Object.getOwnPropertyDescriptor(process, 'stdin');
+  Object.defineProperty(process, 'stdin', { value: stdin, configurable: true });
+  try { return withStdout(out, fn); } finally { Object.defineProperty(process, 'stdin', realIn); }
+}
+
+const epipe = () => Object.assign(new Error('write EPIPE'), { code: 'EPIPE' });
+
+test('a stdout error stops the painting, not the process', () => {
+  const out = fakeStdout(); this_ = out;
+  withStdio(out, () => {
+    const tui = makeTUI();
+    tui.render = () => {};
+    tui._scheduleTick = () => {};
+    tui.start();
+    assert.equal(out.listeners('error').length, 1, 'an async write failure has somewhere to go');
+
+    // Precisely what Node would otherwise promote to an uncaughtException.
+    out.emit('error', epipe());
+
+    const before = out.writes.length;
+    tui._paint('the terminal is gone', true);
+    assert.equal(out.writes.length, before, 'no further write is attempted');
+  });
+});
+
+test('a dead terminal cannot throw out of stop()', () => {
+  const out = fakeStdout(); this_ = out;
+  withStdio(out, () => {
+    const tui = makeTUI();
+    tui.render = () => {};
+    tui._scheduleTick = () => {};
+    tui.start();
+    out.write = () => { throw epipe(); };   // blocking again: the failure throws here
+    assert.doesNotThrow(() => tui.stop());
+    assert.equal(out.listeners('error').length, 0, 'the listener is released with the terminal');
+  });
+});
+
+test('a stalled terminal that never drains does not strand the next paint', () => {
+  const out = fakeStdout(); this_ = out;
+  withStdio(out, () => {
+    const tui = makeTUI();
+    tui.render = () => {};
+    tui._scheduleTick = () => {};
+    tui.start();
+    out.writableNeedDrain = true;           // a frame is parked waiting for drain
+    tui._paint('parked', true);
+    out.emit('error', epipe());             // the drain will now never come
+    const before = out.writes.length;
+    out.writableNeedDrain = false;
+    tui._paint('later', true);
+    assert.equal(out.writes.length, before, 'the broken stream is checked before the drain handshake');
   });
 });
