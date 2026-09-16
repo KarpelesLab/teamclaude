@@ -508,6 +508,15 @@ export class TUI {
     // thing blocked. Non-blocking here, and the paint below drops a frame
     // when the terminal is behind instead of waiting for it.
     this._setStdoutBlocking(false);
+    // The other half of that bargain: a non-blocking write reports failure
+    // asynchronously, as an 'error' event on the stream, and an unhandled one
+    // becomes an uncaughtException that ends the process. So a terminal going
+    // away — a pane closed, a pty recreated — took the whole proxy with it:
+    // two EPIPE crashes, 2026-09-15 and 2026-09-16, both from this path, each
+    // leaving the sidecar orphaned on its port. A display may no more kill the
+    // proxy than block it. Record that stdout is gone and serve on without it.
+    this._stdoutErrorHandler = () => { this._stdoutBroken = true; };
+    process.stdout.on('error', this._stdoutErrorHandler);
     process.stdout.write(`${ESC}?1049h${ESC}?25l`);
     process.stdin.setRawMode(true);
     process.stdin.resume();
@@ -570,7 +579,18 @@ export class TUI {
     // screen with no cursor is the one state an operator cannot recover
     // without knowing the escape by heart.
     this._setStdoutBlocking(true);
-    process.stdout.write(`${ESC}?25h${ESC}?1049l`);
+    // Blocking again means a failed write throws here instead of arriving as
+    // an event, and a terminal that has already gone will fail. Restoring the
+    // screen is best-effort: there is nobody left to restore it for.
+    try { process.stdout.write(`${ESC}?25h${ESC}?1049l`); } catch { /* terminal already gone */ }
+    // The error listener stays. Flipping back to blocking does not make writes
+    // ALREADY QUEUED synchronous, so a paint still in flight can fail after
+    // this point, and shutdown() runs well past it — stopping the prober, the
+    // warmer and the sidecar, then awaiting a state save. An earlier version
+    // removed the listener here while claiming it outlived the write; it did
+    // not, and the proxy died of an unhandled EPIPE in exactly that window. It
+    // only sets a flag, so leaving it attached for the rest of the process
+    // costs nothing.
     try { process.stdin.setRawMode(false); } catch {}
     process.stdin.pause();
   }
@@ -1402,6 +1422,10 @@ export class TUI {
    * again costs a wake-up and a terminal round trip to change nothing.
    */
   _paint(buf, force) {
+    // stdout has already failed once: the terminal is gone, every further
+    // write would fail the same way, and a stream that never drains would
+    // strand the pending-paint handshake below. Serving continues blind.
+    if (this._stdoutBroken) return;
     const stale = Date.now() - (this._lastPaintAt || 0) >= FORCE_REPAINT_MS;
     if (!force && !stale && buf === this._lastFrame) return;
     // The terminal has not taken the previous frame yet. Painting anyway would
