@@ -73,7 +73,7 @@ const ERROR_BODY_INSPECTION_LIMIT = 64 * 1024;
 // never overrides it — so outlive the longest pool and let the client always be
 // the one to close. headersTimeout bounds an in-progress request's headers, not
 // the idle gap between them (measured), so it is deliberately left alone.
-const KEEP_ALIVE_TIMEOUT_MS = 120_000;
+export const KEEP_ALIVE_TIMEOUT_MS = 120_000;
 
 /** Classify only the structured organization-policy denial observed upstream.
  * Message text and generic permission errors are deliberately not enough. */
