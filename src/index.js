@@ -2083,6 +2083,15 @@ A running server re-syncs accounts from config on POST /teamclaude/reload
 POST /teamclaude/switch {"account": "<name>"} makes one account the preferred
 one, which is what 'teamclaude switch' calls.
 
+MCP endpoint (off by default). With "proxy": { "mcp": "read" } the server
+serves its status, quota and settings as MCP tools at /teamclaude/mcp; "full"
+adds the tools that change them (switch, enable/disable, priority, remove,
+threshold, distribute, probe, warmup, routes, blocked models, client mode).
+Connect Claude Code with:
+  claude mcp add --transport http teamclaude http://localhost:3456/teamclaude/mcp
+Same gates as the other /teamclaude/ routes, so in "full" mode every proxy key
+holder can reconfigure the fleet.
+
 Upstream proxy. On a host with no direct route to the internet, set
 "upstreamProxy": "http://user:pass@host:3128" (or just "host:3128") and every
 outbound connection — request forwarding, OAuth login, token refresh, profile

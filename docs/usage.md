@@ -221,6 +221,28 @@ http://localhost:3456/teamclaude/dashboard
 
 The page is a static asset and loads without a key; the data does not — its script fetches `/teamclaude/status` first, and asks for the proxy key only if the server refuses the request without one. Loopback browsers are key-exempt as everywhere else, so on the proxy's own machine there is no prompt. A key that is entered is kept in the browser's localStorage, and a 401 after a key rotation brings the prompt back. On deployments that put the proxy behind TLS this works remotely too: `https://your-proxy.example.com/teamclaude/dashboard`.
 
+## MCP endpoint
+
+The running server can expose its control plane to Claude Code (or any other MCP client) as tools, so an agent can check the fleet's quota, switch accounts, or change a rotation setting from inside a session. It is off until the config says otherwise:
+
+```json
+{ "proxy": { "mcp": "read" } }
+```
+
+`"read"` serves `get_status` (the fleet at a glance: server version, current account, and for each account its priority, whether it is disabled, whether rotation can use it and why not, sessions and known quota windows), `get_quota` and `get_settings`. `"full"` adds everything the CLI's management commands can do: `switch_account`, `reload_config`, `probe_quota`, `set_account_enabled`, `set_account_priority`, `remove_account`, `set_threshold`, `set_distribution`, `set_probe_interval`, `set_warmup`, `set_route`, `remove_route`, `set_blocked_models` and `set_client_mode`. There is no tool for adding accounts or handling credentials, and none for changing `proxy.mcp` itself. A reload picks the setting up, so the endpoint can be opened, narrowed or closed while the server runs.
+
+Point Claude Code at it once; `teamclaude run` and `teamclaude env` already keep loopback out of the proxy variables, so the connection goes straight to the server and is key-exempt like every other loopback caller:
+
+```bash
+claude mcp add --transport http teamclaude http://localhost:3456/teamclaude/mcp
+```
+
+A client elsewhere on the network presents the proxy key the same way the CLI does: `--header "x-api-key: tc-…"`.
+
+The endpoint is one more `/teamclaude/` route and is gated like the others: the proxy key or loopback, no cross-origin requests, and, for a caller admitted without a key, a Host header naming this machine. Two things follow from that. Every holder of any proxy key can use it, so `"full"` on a shared proxy means every client can disable or remove accounts — keep it at `"read"` there, or off. And a browser-based MCP client cannot reach it, because it sends an `Origin` header and is refused as cross-origin; the endpoint is for clients that run as programs. Each write is logged by the server as one line naming the tool, the name of the client key the caller presented (never the key itself) and the arguments.
+
+It speaks both the stateless 2026-07-28 revision of the protocol and the handshake revisions before it, so a client on either works. Replies are plain JSON, never a stream.
+
 ## Auto-update
 
 When TeamClaude is installed globally via npm, it self-updates in the background: it checks the npm registry at most once a day, and when a newer version is published it runs `npm install -g @karpeleslab/teamclaude@latest` and applies it on the next launch. The check runs after a `teamclaude run` session ends and when a headless server starts. In a headless server the install runs as a background child process, so the proxy keeps serving requests while npm works (a synchronous install used to stall it for the duration). A git checkout is never touched — update that with `git pull`. Run `teamclaude update` to update on demand.
