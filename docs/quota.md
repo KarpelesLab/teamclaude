@@ -157,10 +157,10 @@ Utilization goes past 100% in overage, so `maxUsage` above 1.0 is a spend limit:
 The switch onto extra usage and back off it is logged once each, per model scope (a Fable-only episode is not ended by Opus traffic that still has headroom), and a failover hop onto a paid account is logged once per episode too. While an account is serving this way, `teamclaude status` marks it:
 
 ```
-  Blocked  local switch threshold reached — serving on extra usage (paid overage)
+  Blocked  local switch threshold reached — serving on extra usage (paid overage), billing
 ```
 
-and the status payload carries `allowExtraUsage` and `onExtraUsage` per account. With the quota probe on, the `Spend` row shows what has been billed this month.
+and the status payload carries `allowExtraUsage` and `onExtraUsage` per account. The opt-in itself is visible before it is ever used: `extra usage allowed` in the account header of `teamclaude status`, an `xu` tag (yellow) at the end of the TUI row that turns into a red `xu!` while billing, and an `extra usage allowed` / `on extra usage — billing` badge on the web dashboard. With the quota probe on, the `Spend` row shows what has been billed this month.
 
 Edits apply live on config reload — turning it off stops the spending immediately.
 

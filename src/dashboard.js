@@ -106,6 +106,10 @@ export function accountBadges(account, current, currentAccounts) {
   badges.push({ cls: status, text: status });
   if (recent) badges.push({ cls: 'sessions', text: recent + ' recent' });
   if (known > recent) badges.push({ cls: 'sessions known', text: known + ' known' });
+  // Extra-usage fallback: one badge, the louder state winning. Strict `true`
+  // so a missing field on an older server's payload shows nothing.
+  if (a.onExtraUsage === true) badges.push({ cls: 'extra-usage billing', text: 'on extra usage \u2014 billing' });
+  else if (a.allowExtraUsage === true) badges.push({ cls: 'extra-usage', text: 'extra usage allowed' });
   return badges;
 }
 
@@ -381,6 +385,8 @@ const PAGE = `<!doctype html>
   .badge.meta { color: var(--dim); }
   .badge.sessions { color: var(--text); }
   .badge.sessions.known { color: var(--dim); }
+  .badge.extra-usage { color: var(--warn); border-color: var(--warn); }
+  .badge.extra-usage.billing { color: var(--bad); border-color: var(--bad); }
   .quota { display: grid; grid-template-columns: 64px 1fr 170px; gap: 8px; align-items: center; margin-top: 6px; }
   .quota .lbl { color: var(--dim); font-size: 12px; }
   .quota .val { color: var(--dim); font-size: 12px; text-align: right; font-variant-numeric: tabular-nums; }

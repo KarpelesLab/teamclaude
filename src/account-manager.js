@@ -772,7 +772,53 @@ export class AccountManager {
       if (account) console.log(`[TeamClaude] Quota headroom is back on "${safeLine(account.name, 64)}" — leaving extra usage${this._scopeLabel(model)}`);
       this._extraUsage.delete(scope);
     }
+    this._unstrandCursor(provider);
     return account;
+  }
+
+  /**
+   * Move this provider's cursor off a paid account that can no longer serve
+   * normally, once some account can.
+   *
+   * _selectExtraUsage parks the cursor on the paid account, and the way back
+   * relies on the walk: `_select` finds the current account unavailable and
+   * `_selectNext` moves it. Not every request reaches that walk. Session
+   * distribution (even or adaptive), the untagged round-robin and a route pin
+   * all answer without touching the shared cursor, so under them the traffic
+   * returned to a normal account while the cursor — and status's "current" —
+   * named the paid one for good, which reads as still billing.
+   *
+   * Done here, after every selection, rather than by keeping the fallback off
+   * the cursor under distribution: the stranding is a property of those paths,
+   * not of the mode, and the cursor pointing at the account actually serving
+   * while the fleet is spent is what status needs. Scoped to opted-in accounts,
+   * so no other cursor behaviour changes, and to the account being unavailable
+   * for ANY model, so an account barred only for one family keeps the cursor
+   * (#276). The destination is what rotation would pick for general traffic,
+   * through the same helpers selectActiveAccount uses.
+   *
+   * @param {string} provider
+   */
+  _unstrandCursor(provider) {
+    const idx = this._currentIndexForProvider(provider);
+    const parked = idx != null ? this.accounts[idx] : null;
+    if (!parked?.allowExtraUsage || this._isAvailable(parked)) return;
+    const best = /** @type {Record<string, any>|null} */ (this._pickBestAvailable(this._excludeOtherProviders(null, provider), null));
+    if (!best) return;
+    // The shared slot is this provider's only when it names one of its own
+    // accounts; otherwise the provider's cursor is its own entry, and moving
+    // the shared slot would hand another provider's fleet a new position.
+    if (this.currentIndex === idx) this._setCurrent(best);
+    else this.providerCursors.set(provider, best.index);
+    console.log(`[TeamClaude] Switched to account "${safeLine(best.name, 64)}" — "${safeLine(parked.name, 64)}" is past its quota and only served on extra usage`);
+  }
+
+  /** Whether `index` is the extra-usage fallback for any selection scope right
+   * now: serving past its quota and billing for it.
+   * @param {number} index */
+  onExtraUsage(index) {
+    for (const e of this._extraUsage.values()) if (e.index === index) return true;
+    return false;
   }
 
   /**
@@ -4147,7 +4193,7 @@ export class AccountManager {
         // True while this account is the extra-usage fallback — serving past
         // its quota and billing for it. The one state `unavailable` alone
         // cannot tell apart from an account that is simply out.
-        onExtraUsage: [...this._extraUsage.values()].some(e => e.index === a.index),
+        onExtraUsage: this.onExtraUsage(a.index),
         status: a.status,
         // Why the account is out of rotation right now (null = it can serve).
         // Distinguishes a local threshold decision from an upstream rejection —

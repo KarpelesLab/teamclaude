@@ -175,7 +175,7 @@ export function unavailableLine(account, paint) {
   // any other, yet is taking traffic and billing for it. Say so on the line
   // that would otherwise tell the operator it is idle.
   if (account.onExtraUsage) {
-    return `${paint.dim('Blocked'.padEnd(8))} ${paint.yellow(text)} ${paint.red('\u2014 serving on extra usage (paid overage)')}`;
+    return `${paint.dim('Blocked'.padEnd(8))} ${paint.yellow(text)} ${paint.red('\u2014 serving on extra usage (paid overage), billing')}`;
   }
   return `${paint.dim('Blocked'.padEnd(8))} ${paint.yellow(text)}`;
 }
@@ -280,7 +280,11 @@ function renderAccountHeader(account, currentAccount, paint, now, followSessions
   const sess = sessions
     ? ` ${paint.dim(`${sessions} sess${formatSessionBuckets(account.sessionsByBucket)}`)}`
     : '';
-  return `${marker} ${shown} ${paint.dim(`(${safeLine(account.type, 16)}, prio ${account.priority || 0})`)} ${status}${org}${sess}`;
+  // The opt-in is shown even while unused, so an operator can tell before the
+  // fleet runs dry which accounts would start billing; serving on it is said
+  // in red on the Blocked line (see unavailableLine).
+  const xu = account.allowExtraUsage === true ? ', extra usage allowed' : '';
+  return `${marker} ${shown} ${paint.dim(`(${safeLine(account.type, 16)}, prio ${account.priority || 0}${xu})`)} ${status}${org}${sess}`;
 }
 
 // "2 active / 3 known · distributing" — the running-sessions readout. While a
