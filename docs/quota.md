@@ -117,6 +117,17 @@ leaves `b`'s `unified5h` and `unified7d` on whatever the fleet has configured, a
 
 It is still a **preference**, exactly like the fleet setting: the all-exhausted revalidation probe can override it the same way, which is what keeps it a different setting from the hard `accounts[].maxUsage` cap above. The account's own value is what the bars, the `Models` row, and `teamclaude status` redden against for that account — see [Per-account usage caps](#per-account-usage-caps) for how the two ceilings are drawn together when both are set.
 
+An override shows up wherever the account itself does — `teamclaude status`, the TUI (live and attach mode), and the web dashboard — but only where it actually moves something: an account with no `switchThreshold`, or one whose table happens to repeat the fleet's own numbers, draws no extra line. `teamclaude status` shows it as its own row:
+
+```
+  Weekly   [███████████░░░░░░] 62%
+  Fable    [██░░░░░░░░░░░░░░░] 10%
+  Models   Opus ✓   Fable ✓
+  Switch   switch fable 80%
+```
+
+A bare-number override reads `switch at 100%` instead. The TUI and the dashboard show the identical compact text as a trailing tag / badge on the account's own row or card, rather than a mark on the bar — unlike `maxUsage`, `switchThreshold` was never drawn as a percentage on the bar itself (only as the point past which the bar goes red), so there was no existing mark to extend.
+
 No CLI editor for this one, matching `maxUsage`: hand-edit the config and let a running server pick it up on reload, or restart.
 
 ## Per-account usage caps

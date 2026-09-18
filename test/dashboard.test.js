@@ -6,7 +6,7 @@ import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
 import {
   renderDashboardHtml, dashboardCsp, scopedWeeklyRows, accountTokens,
-  accountBadges,
+  accountBadges, thresholdBadgeText,
   sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
 } from '../src/dashboard.js';
@@ -73,6 +73,47 @@ test('account metadata and session state are separate badges', () => {
     { cls: 'sessions', text: '1 recent' },
     { cls: 'sessions known', text: '3 known' },
   ]);
+});
+
+// ── per-account switch threshold (#409) ───────────────────────
+
+test('thresholdBadgeText is silent with no override, or one that matches the fleet', () => {
+  assert.equal(thresholdBadgeText(null, 0.98, null), '');
+  assert.equal(thresholdBadgeText(undefined, 0.98, null), '');
+  assert.equal(thresholdBadgeText(0.98, 0.98, null), '');
+  assert.equal(thresholdBadgeText({ unified7d: 0.98 }, 0.98, null), '');
+  // A hand-edited array is the #425 hazard class — refused, not spread into
+  // numeric bucket keys.
+  assert.equal(thresholdBadgeText([0.5], 0.98, null), '');
+});
+
+test('thresholdBadgeText names a bare-number override "at", and a table by bucket', () => {
+  assert.equal(thresholdBadgeText(1.0, 0.98, null), 'switch at 100%');
+  assert.equal(thresholdBadgeText({ unified7dFable: 0.8 }, 0.98, null), 'switch fable 80%');
+  assert.equal(
+    thresholdBadgeText({ unified7d: 0.9, unified7dFable: 0.8 }, 0.98, null),
+    'switch 7d 90%, fable 80%',
+  );
+  // A per-bucket fleet table, not just a bare fleet number: the account's
+  // unified7d entry is compared against the fleet's OWN unified7d, not its
+  // default — an account that merely matches the fleet's per-bucket override
+  // must stay silent on that bucket.
+  assert.equal(thresholdBadgeText({ unified7d: 0.9 }, 0.98, { default: 0.98, unified7d: 0.9 }), '');
+  assert.equal(thresholdBadgeText({ unified7d: 0.85 }, 0.98, { default: 0.98, unified7d: 0.9 }), 'switch 7d 85%');
+});
+
+test('accountBadges adds the threshold badge only when it differs from the fleet', () => {
+  const withFleet = accountBadges({ name: 'a', type: 'oauth', switchThreshold: 1.0 }, null, null, 0.98, null);
+  assert.deepEqual(withFleet[withFleet.length - 1], { cls: 'meta threshold', text: 'switch at 100%' });
+
+  const matching = accountBadges({ name: 'a', type: 'oauth', switchThreshold: 0.98 }, null, null, 0.98, null);
+  assert.ok(!matching.some(b => b.cls.includes('threshold')), 'an override equal to the fleet stays silent');
+
+  // No `switchThreshold` on the account at all (the common case, and the
+  // shape the pre-#409 unit test above still exercises): no badge, whatever
+  // the fleet args are, fleet omitted included — never a crash.
+  const noOverride = accountBadges({ name: 'a', type: 'oauth' }, null, null);
+  assert.ok(!noOverride.some(b => b.cls.includes('threshold')));
 });
 
 const SESSIONS = {
@@ -472,11 +513,25 @@ test('the serialized helpers run in the page\'s own scope, not just parse', () =
   assert.deepEqual(isolated(payload), problems(payload), 'the page runs what the tests exercise');
 });
 
+// The threshold badge specifically: accountBadges calls thresholdBadgeText by
+// NAME, not by reference, so if the two ever land on different sides of the
+// `bundle` slice (or thresholdBadgeText is dropped from SHARED_HELPERS while
+// accountBadges keeps calling it) this is a page-breaking ReferenceError that
+// grepping the source would not catch — only running the bundle does.
+test('accountBadges calls thresholdBadgeText inside the same serialized bundle', () => {
+  const html = renderDashboardHtml();
+  const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
+  const bundle = script.slice(script.indexOf('var STARVED_MIN'), script.indexOf('function el('));
+  const isolated = new Function(`${bundle}; return accountBadges;`)();
+  const account = { name: 'a', type: 'oauth', switchThreshold: 1.0 };
+  assert.deepEqual(isolated(account, null, null, 0.98, null), accountBadges(account, null, null, 0.98, null));
+});
+
 test('the page ships the same helper implementations it is tested against', () => {
   // The serialization is the contract: if a helper stops being self-contained
   // (closes over module scope), the page would silently ReferenceError.
   const html = renderDashboardHtml();
-  for (const fn of [scopedWeeklyRows, accountTokens, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, routeRows, problems]) {
+  for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, routeRows, problems]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));

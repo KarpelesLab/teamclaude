@@ -78,6 +78,80 @@ export function resolveSwitchThreshold(accountThreshold, bucket, fleetValue) {
   return fleetValue;
 }
 
+// Every bucket a switchThreshold/maxUsage table can be keyed by, plus the
+// `default` fallback the CLI's `threshold` command already validates against
+// (index.js QUOTA_BUCKETS). Shared here so a reader that must recognise "is
+// this a real bucket, or a typo/garbage key" — the account-vs-fleet diff below,
+// a future validator — does not keep a second copy of the list (#426).
+export const THRESHOLD_BUCKET_KEYS = Object.freeze([
+  'unified5h', 'unified7d', 'unified7dSonnet', 'unified7dFable', 'tokens', 'requests',
+]);
+
+// The fleet-wide switch threshold for one bucket, reconstructed from the SPLIT
+// status payload: `switchThreshold` (thresholdFor('default'), already resolved
+// to a number) and `switchThresholds` (the raw per-bucket table, or null when
+// the fleet setting is a bare number). This is the wire-shape twin of
+// AccountManager's own private _fleetThresholdFor, for a reader — the status
+// renderer, the dashboard — that only ever sees the JSON payload, never the
+// AccountManager itself. 0.98 mirrors DEFAULT_SWITCH_THRESHOLD (account-manager.js)
+// without importing it, the same way RemoteAccountManager's own fleet lookup does
+// — account-manager.js already imports FROM this file, so the reverse import
+// would be circular.
+/**
+ * @param {number|undefined|null} switchThreshold
+ * @param {Object<string, number>|null|undefined} switchThresholds
+ * @param {string} bucket
+ * @returns {number}
+ */
+export function resolveFleetThreshold(switchThreshold, switchThresholds, bucket) {
+  if (switchThresholds && typeof switchThresholds === 'object') {
+    const v = switchThresholds[bucket] ?? switchThresholds.default;
+    if (typeof v === 'number' && Number.isFinite(v)) return v;
+  }
+  return typeof switchThreshold === 'number' && Number.isFinite(switchThreshold) ? switchThreshold : 0.98;
+}
+
+/**
+ * Which buckets an account's OWN switchThreshold actually moves away from the
+ * fleet's — the "only when it differs" filter a per-account display needs so a
+ * table that merely repeats the fleet's numbers (or a stray unknown key) stays
+ * silent instead of adding a badge that says nothing new.
+ *
+ * `accountThreshold` is the raw `accounts[].switchThreshold` value (number,
+ * table, null, or garbage — same tolerance as resolveSwitchThreshold, so an
+ * invalid shape here answers "nothing to show" rather than throwing).
+ * `fleetFor(bucket)` answers what the FLEET alone resolves that bucket to —
+ * `AccountManager#thresholdFor(bucket)` (no account arg) in-process, or
+ * `resolveFleetThreshold(status.switchThreshold, status.switchThresholds, bucket)`
+ * off a status payload.
+ *
+ * Returns `[]` for "nothing to show" and otherwise a list of
+ * `{ bucket, value }`, `bucket` being `'default'` (a bare account number, or a
+ * table's own `default` entry) or one of THRESHOLD_BUCKET_KEYS — never a key
+ * the table carried but this function does not recognise, so a typo'd bucket
+ * (already inert for routing — thresholdFor() is never asked about it) does
+ * not get displayed as though it did something.
+ *
+ * @param {number|Object<string, number>|null|undefined} accountThreshold
+ * @param {(bucket: string) => number} fleetFor
+ * @returns {Array<{bucket: string, value: number}>}
+ */
+export function switchThresholdDiffs(accountThreshold, fleetFor) {
+  if (typeof accountThreshold === 'number' && Number.isFinite(accountThreshold)) {
+    return accountThreshold !== fleetFor('default') ? [{ bucket: 'default', value: accountThreshold }] : [];
+  }
+  if (accountThreshold && typeof accountThreshold === 'object' && !Array.isArray(accountThreshold)) {
+    const out = [];
+    for (const [key, v] of Object.entries(accountThreshold)) {
+      if (typeof v !== 'number' || !Number.isFinite(v)) continue;
+      if (key !== 'default' && !THRESHOLD_BUCKET_KEYS.includes(key)) continue;
+      if (v !== fleetFor(key)) out.push({ bucket: key, value: v });
+    }
+    return out;
+  }
+  return [];
+}
+
 // The weekly quota bucket key that governs a model, e.g. a Fable request is
 // gated by 'unified7dFable' rather than the shared 'unified7d'. Used by account
 // selection so a spent family bucket only bars that family's requests.

@@ -8,6 +8,7 @@ import net from 'node:net';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, loadState, saveState } from './config.js';
 import { installCrashHandlers } from './crash-log.js';
 import { AccountManager, DEFAULT_SWITCH_THRESHOLD, distributionMode } from './account-manager.js';
+import { THRESHOLD_BUCKET_KEYS } from './model.js';
 import { validateAdaptiveConfig } from './adaptive-distribution.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, loginOAuthWithPastedCode, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
@@ -78,8 +79,10 @@ const THRESHOLD_USAGE = [
 
 // The buckets a threshold can be keyed by: the quota windows the manager asks
 // thresholdFor() about. An unknown key would be accepted by the config and then
-// never consulted, so the CLI refuses it rather than storing a typo.
-const QUOTA_BUCKETS = ['unified5h', 'unified7d', 'unified7dSonnet', 'unified7dFable', 'tokens', 'requests'];
+// never consulted, so the CLI refuses it rather than storing a typo. Shared
+// with model.js's switchThresholdDiffs, which needs the identical list to
+// decide whether a per-account table entry is a real bucket or garbage (#426).
+const QUOTA_BUCKETS = THRESHOLD_BUCKET_KEYS;
 
 const DISTRIBUTE_USAGE = 'Usage: teamclaude distribute <on|off|adaptive>';
 
