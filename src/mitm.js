@@ -20,8 +20,8 @@ import tls from 'node:tls';
 import http2 from 'node:http2';
 import { getConfigPath } from './config.js';
 import { generateCertChain } from './x509.js';
-import { createProxyRequestListener, resolveClientAuth, loopbackExempt, relayUpgrade, resolveAccountPin, describeConnectError } from './server.js';
-import { interceptHostsFor, isNeverIntercepted } from './provider.js';
+import { createProxyRequestListener, resolveClientAuth, loopbackExempt, relayUpgrade, resolveAccountPin, describeConnectError, relayOAuthToken, relayRaw } from './server.js';
+import { interceptHostsFor, isNeverIntercepted, isOAuthMirrorHost } from './provider.js';
 import { forwardRefusal, guardedLookup, FORBIDDEN_FORWARD } from './forward-target.js';
 import { safeLine } from './safe-text.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
@@ -123,12 +123,20 @@ export function mitmHosts(config) {
   return [...new Set([upstreamHostOf(config), ...interceptHostsFor(config?.accounts || [])])];
 }
 
-/** Per-CONNECT behavior: 'rewrite' (intercept + token inject), 'test', or 'tunnel'. */
+/** Per-CONNECT behavior: 'rewrite' (intercept + token inject), 'oauth-mirror'
+ *  (intercept + passthrough to the OAuth host, syncing refresh grants),
+ *  'test', or 'tunnel'. */
 export function hostMode(host, config) {
   if (host === TEST_HOST) return 'test';
   // Explicitly never intercepted, even though it sits under a provider's domain
   // — checked before anything else so no later rule can claim it.
   if (isNeverIntercepted(host)) return 'tunnel';
+  // Claude Code's refresh endpoint. Must terminate so we can sync the new
+  // refresh token onto the fleet — but MUST NOT inject a rotated account token
+  // (that would break the client's own grant). Forwarded to the same host.
+  // Checked before interceptHostsFor's rewrite arm: that list also contains
+  // this host (for the leaf SAN), and rewrite would send it to api.anthropic.com.
+  if (isOAuthMirrorHost(host)) return 'oauth-mirror';
   // In terminal-only mode the MITM must never terminate ChatGPT Desktop's
   // connection. Terminal Codex uses the explicit /backend-api/codex base URL;
   // this host-level bypass keeps Desktop's native auth and feature endpoints
@@ -190,7 +198,8 @@ export function upgradeUpstreamFor(hostHeader, config, upstream) {
   const host = parseConnectAuthority(hostHeader)?.host;
   if (!host) return null;
   if (host === upstreamHostOf(config)) return upstream;
-  if (hostMode(host, config) === 'rewrite') return `https://${host}`;
+  const mode = hostMode(host, config);
+  if (mode === 'rewrite' || mode === 'oauth-mirror') return `https://${host}`;
   return null;
 }
 
@@ -303,6 +312,43 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
     return p;
   };
 
+  // Separate terminating server for platform.claude.com: passthrough only (no
+  // fleet token inject), and sync successful refresh_token grants onto the fleet.
+  let oauthMirrorPromise = null;
+  const getOAuthMirrorServer = () => {
+    if (oauthMirrorPromise) return oauthMirrorPromise;
+    oauthMirrorPromise = (async () => {
+      const { key, cert } = await ensureLeaf();
+      const oauthUpstream = 'https://platform.claude.com';
+      const srv = http2.createSecureServer({ key, cert, allowHTTP1: true });
+      srv.on('request', async (req, res) => {
+        try {
+          const path = req.url || '';
+          if (req.method === 'POST' && (path === '/v1/oauth/token' || path.startsWith('/v1/oauth/token?'))) {
+            await relayOAuthToken(req, res, oauthUpstream, sx, 1024 * 1024, accountManager);
+            return;
+          }
+          await relayRaw(req, res, oauthUpstream, sx);
+        } catch (err) {
+          log(`[TeamClaude] OAuth-mirror handler failed: ${err?.message || err}`);
+          if (!res.headersSent) {
+            try {
+              res.writeHead(502, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'OAuth upstream unreachable' } }));
+            } catch { /* client gone */ }
+          }
+        }
+      });
+      srv.on('sessionError', (e) => log(`[TeamClaude] OAuth-mirror session error: ${e.message}`));
+      srv.on('clientError', (e, sock) => { try { sock.destroy(); } catch { /* already gone */ } });
+      return srv;
+    })().catch((err) => {
+      oauthMirrorPromise = null;
+      throw err;
+    });
+    return oauthMirrorPromise;
+  };
+
   return (req, clientSocket, head) => {
     clientSocket.on('error', () => {});
 
@@ -402,6 +448,18 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
       ensureLeaf().then(({ key, cert }) => {
         reply200Raw(clientSocket);
         serveTest(termClaude(clientSocket, head, key, cert, ['http/1.1']));
+      }).catch((err) => { log(`[TeamClaude] MITM ${host}: ${err.message}`); reply502Raw(clientSocket); clientSocket.destroy(); });
+      return;
+    }
+
+    if (mode === 'oauth-mirror') {
+      // Terminate platform.claude.com so we can sync Claude Code's own token
+      // refreshes onto the fleet. No account pin — this is the client's identity
+      // plane, not inference.
+      getOAuthMirrorServer().then((srv) => {
+        reply200Raw(clientSocket);
+        if (head && head.length) clientSocket.unshift(head);
+        srv.emit('connection', clientSocket);
       }).catch((err) => { log(`[TeamClaude] MITM ${host}: ${err.message}`); reply502Raw(clientSocket); clientSocket.destroy(); });
       return;
     }

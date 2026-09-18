@@ -20,6 +20,7 @@ import { forwardRefusal, guardedLookup, FORBIDDEN_FORWARD } from './forward-targ
 import { renderDashboardHtml, dashboardCsp } from './dashboard.js';
 import { createUsageRecorder, resolveUsageDimensions, usageDimensionHeaderNames } from './client-usage.js';
 import { classificationPath } from './classification-path.js';
+import { syncClientOAuthRefresh } from './oauth-sync.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 
@@ -893,7 +894,13 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       }
       // Client token refresh: pass through untouched (the proxy manages its own
       // tokens via ensureTokenFresh; rewriting client refreshes would conflict).
-      if (req.method === 'POST' && req.url === '/v1/oauth/token') { await relayRaw(req, res, upstream, sx, resolveMaxBodyBytes(config)); return; }
+      // After a successful refresh_token grant, copy the new tokens onto any
+      // fleet account that still held the old refresh token — otherwise Claude
+      // Code's Keychain rotates and TeamClaude's copy dies with invalid_grant.
+      if (req.method === 'POST' && (req.url === '/v1/oauth/token' || (req.url || '').startsWith('/v1/oauth/token?'))) {
+        await relayOAuthToken(req, res, upstream, sx, resolveMaxBodyBytes(config), accountManager);
+        return;
+      }
       // Account pin: a request to `/tc-acct/<name-or-index>/...` (e.g. via
       // ANTHROPIC_BASE_URL=http://host:port/tc-acct/deepseek) is forced onto that
       // one account, bypassing rotation. Used by the keep-warm scheduler and for
@@ -1564,8 +1571,10 @@ async function refuseOversizedBody(req, res) {
 
 /**
  * Relay a request to upstream with no header rewriting — pure passthrough.
+ * Exported so the MITM oauth-mirror host can forward non-token paths to
+ * platform.claude.com without injecting a fleet credential.
  */
-async function relayRaw(req, res, upstream, sx, maxBodyBytes = DEFAULT_MAX_BODY_BYTES) {
+export async function relayRaw(req, res, upstream, sx, maxBodyBytes = DEFAULT_MAX_BODY_BYTES) {
   const bodyChunks = [];
   let bodyBytes = 0;
   for await (const chunk of req) {
@@ -1602,6 +1611,58 @@ async function relayRaw(req, res, upstream, sx, maxBodyBytes = DEFAULT_MAX_BODY_
     res.end(responseBody);
   } catch (err) {
     console.error('[TeamClaude] Raw relay error:', describeConnectError(err));
+    if (!res.headersSent) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Upstream unreachable' } }));
+    }
+  }
+}
+
+/**
+ * Passthrough for a client OAuth token exchange, then sync a successful
+ * refresh_token grant onto any fleet account that still held the old token.
+ *
+ * Exported for its own tests. Claude Code's live refreshes usually hit
+ * `platform.claude.com` (see mitm oauth-mirror); this covers the same path
+ * when it arrives on the inference upstream instead.
+ */
+export async function relayOAuthToken(req, res, upstream, sx, maxBodyBytes, accountManager) {
+  const bodyChunks = [];
+  let bodyBytes = 0;
+  for await (const chunk of req) {
+    bodyBytes += chunk.length;
+    if (bodyBytes > maxBodyBytes) { await refuseOversizedBody(req, res); return; }
+    bodyChunks.push(chunk);
+  }
+  const body = Buffer.concat(bodyChunks);
+
+  try {
+    const upstreamRes = await upstreamFetch(`${upstream}${req.url}`, {
+      method: req.method,
+      headers: {
+        'content-type': req.headers['content-type'] || 'application/json',
+        'accept': req.headers['accept'] || 'application/json',
+        'user-agent': req.headers['user-agent'] || 'node',
+      },
+      body: body.length > 0 ? body : undefined,
+    }, sx, sx?.useByDefault());
+
+    const responseBody = await upstreamRes.text();
+    try {
+      syncClientOAuthRefresh(accountManager, body, responseBody, upstreamRes.status);
+    } catch (err) {
+      console.error(`[TeamClaude] OAuth sync failed: ${err?.message || err}`);
+    }
+    const responseHeaders = {};
+    for (const [key, value] of upstreamRes.headers.entries()) {
+      if (key === 'transfer-encoding' || key === 'connection' ||
+          key === 'content-encoding' || key === 'content-length') continue;
+      responseHeaders[key] = value;
+    }
+    res.writeHead(upstreamRes.status, responseHeaders);
+    res.end(responseBody);
+  } catch (err) {
+    console.error('[TeamClaude] OAuth token relay error:', describeConnectError(err));
     if (!res.headersSent) {
       res.writeHead(502, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Upstream unreachable' } }));
@@ -1911,22 +1972,94 @@ export function isTransientUpstreamError(err, { otherHostAvailable = false } = {
  *   - "exhausted" reads terminal while "retry in 60s" reads transient, so the
  *     operator retried by hand instead of looking at what was actually blocked.
  *
+ * A later failure mode made the #168 wording wrong again: when one account is
+ * at a real family quota and another still has headroom but is in `error`
+ * (typically `invalid_grant` after Claude Code `/login` rotated the refresh
+ * token elsewhere), the proxy correctly skips both — but the client still saw
+ * "all N accounts are at their quota or rate limit". The TUI kept showing the
+ * errored account's quota bars (Fable ✓ at 13%), so operators chased a quota
+ * problem that was actually a credential problem.
+ *
  * Counts only the accounts that were candidates, names the model when the
- * request carried one, and says plainly that the wait is until a window resets.
+ * request carried one, and names auth/error accounts separately from quota so
+ * the next step is `teamclaude login` / `teamclaude import`, not "wait 60s".
  */
 export function exhaustedMessage(accountManager, model, retryAfter) {
   const accounts = accountManager.accounts || [];
-  const eligible = accounts.filter(a => !a.disabled);
-  const disabled = accounts.length - eligible.length;
+  const candidates = accounts.filter(a => !a.disabled);
+  const disabled = accounts.length - candidates.length;
 
   const scope = model ? ` for ${model}` : '';
-  const pool = eligible.length === 1 ? '1 account' : `${eligible.length} accounts`;
   const aside = disabled ? ` (${disabled} more disabled)` : '';
-  const when = retryAfter > 0
-    ? ` Quota resets in ${retryAfter}s.`
-    : ' Retry shortly.';
 
-  return `No account can serve this request${scope}: all ${pool}${aside} are at their quota or rate limit.${when}`;
+  // Classify each non-disabled account the same way selection does. Without
+  // this, an auth-dead account with leftover quota still reads as "at quota".
+  const reasons = typeof accountManager.unavailableReason === 'function'
+    ? candidates.map(a => ({ account: a, reason: accountManager.unavailableReason(a, model) }))
+    : candidates.map(a => ({ account: a, reason: a.status === 'error' ? 'error' : 'quota' }));
+
+  const authDead = reasons.filter(r => r.reason === 'error' || r.reason === 'entitlement');
+  const quotaish = reasons.filter(r => (
+    r.reason === 'quota'
+    || r.reason === 'throttled'
+    || r.reason === 'exhausted'
+    || r.reason === 'upstream-rejected'
+    || r.reason === 'capped'
+    || r.reason === 'advisor-quota'
+    || r.reason === 'advisor-capped'
+  ));
+  const other = reasons.filter(r => (
+    r.reason != null
+    && !authDead.includes(r)
+    && !quotaish.includes(r)
+  ));
+
+  const names = list => list.map(r => `"${r.account.name}"`).join(', ');
+  const parts = [];
+
+  if (authDead.length) {
+    parts.push(
+      `${authDead.length === 1 ? 'account' : 'accounts'} ${names(authDead)} `
+      + `${authDead.length === 1 ? 'needs' : 'need'} re-login `
+      + `(credential error — run: teamclaude login / teamclaude import)`,
+    );
+  }
+  if (quotaish.length) {
+    parts.push(
+      `${quotaish.length === 1 ? 'account' : 'accounts'} ${names(quotaish)} `
+      + `${quotaish.length === 1 ? 'is' : 'are'} at quota or rate-limited`,
+    );
+  }
+  for (const r of other) {
+    parts.push(`account "${r.account.name}" unavailable (${r.reason})`);
+  }
+
+  // Fallback when we somehow have no classified reasons (empty fleet, or a
+  // reason set the classifier does not yet name): keep the #168 shape.
+  if (!parts.length) {
+    const pool = candidates.length === 1 ? '1 account' : `${candidates.length} accounts`;
+    const when = retryAfter > 0
+      ? ` Quota resets in ${retryAfter}s.`
+      : ' Retry shortly.';
+    return `No account can serve this request${scope}: all ${pool}${aside} are at their quota or rate limit.${when}`;
+  }
+
+  // Auth errors do not clear by waiting on a quota window. Only append a reset
+  // countdown when every blocker is a quota/throttle style one.
+  let when = '';
+  if (!authDead.length && !other.length && quotaish.length && retryAfter > 0) {
+    when = ` Quota resets in ${retryAfter}s.`;
+  } else if (authDead.length && !quotaish.length) {
+    when = ' Re-auth the broken account, then retry.';
+  } else if (authDead.length && quotaish.length) {
+    when = retryAfter > 0
+      ? ` Re-auth the broken account (quota on the others resets in ${retryAfter}s).`
+      : ' Re-auth the broken account, then retry.';
+  } else {
+    when = ' Retry shortly.';
+  }
+
+  return `No account can serve this request${scope}: ${parts.join('; ')}${aside}.${when}`;
 }
 
 export async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, useSx) {

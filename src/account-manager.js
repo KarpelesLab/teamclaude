@@ -1,4 +1,4 @@
-import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired, formatMoney } from './oauth.js';
+import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired, formatMoney, importCredentials } from './oauth.js';
 import { providerOf, DEFAULT_PROVIDER, isSubscriptionAccount } from './provider.js';
 import { refreshCodexToken } from './codex-auth.js';
 import { parseCodexQuota, parseCodexPlanType } from './codex-quota.js';
@@ -204,6 +204,11 @@ function makeAccount(acct, index) {
     credential: acct.accessToken || acct.apiKey,
     refreshToken: acct.refreshToken || null,
     expiresAt: acct.expiresAt || null,
+    // Live credentials file (or the macOS Keychain via the default Claude Code
+    // path). Kept on the in-memory account so an invalid_grant can re-read it
+    // without waiting for a config reload — Claude Code rotates the token
+    // family on its own schedule and the fleet copy must catch up.
+    importFrom: acct.importFrom || null,
     status: 'active',
     // No quota is known at startup, so start probing: the first response for
     // an account reveals its weekly limit and triggers re-evaluation.
@@ -3777,6 +3782,13 @@ export class AccountManager {
             console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" received new tokens while its old refresh token was being rejected — keeping the new ones`);
             return;
           }
+          // Claude Code (or another holder) often rotates the refresh-token
+          // family while TeamClaude still holds the previous copy. Before
+          // declaring the account dead, re-read the live Claude Code store
+          // (importFrom, or the default Keychain path on macOS) — if it has a
+          // different refresh token, adopt it and stay in rotation.
+          const recovered = await this._recoverFromClaudeCodeStore(account, sent);
+          if (recovered) return;
           account.status = 'error';
           console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}" needs re-login (refresh token rejected) — run: teamclaude login`);
         }
@@ -3786,6 +3798,40 @@ export class AccountManager {
     })();
 
     return account._refreshPromise;
+  }
+
+  /**
+   * After invalid_grant, try to adopt a fresher refresh token from Claude Code's
+   * live store. Returns true when the account was healed and should stay active.
+   * @param {object} account
+   * @param {string} rejectedRefreshToken
+   * @returns {Promise<boolean>}
+   */
+  async _recoverFromClaudeCodeStore(account, rejectedRefreshToken) {
+    // Codex / third-party backends do not live in Claude Code's Keychain.
+    if (providerOf(account) !== 'anthropic' || account.upstream) return false;
+    const from = account.importFrom || '~/.claude/.credentials.json';
+    let creds;
+    try {
+      creds = await (this._importCredentialsFn || importCredentials)(from);
+    } catch (err) {
+      console.error(`[TeamClaude] Could not re-read Claude Code credentials for "${safeLine(account.name, 64)}": ${err.message}`);
+      return false;
+    }
+    if (!creds?.refreshToken || creds.refreshToken === rejectedRefreshToken) {
+      return false;
+    }
+    // A different refresh token is in the live store — Claude Code already
+    // rotated. Adopt it; the next ensureTokenFresh (or this same request's
+    // retry) will mint a fresh access token from it.
+    this.updateAccountTokens(account.index, {
+      accessToken: creds.accessToken,
+      refreshToken: creds.refreshToken,
+      expiresAt: creds.expiresAt,
+    });
+    account._deadRefreshToken = null;
+    console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" adopted a fresher Claude Code refresh token — staying in rotation`);
+    return true;
   }
 
   /**
@@ -3808,6 +3854,7 @@ export class AccountManager {
     if (refreshToken) account.refreshToken = refreshToken;
     account.expiresAt = expiresAt;
     if (account.status === 'error') account.status = 'active';
+    account._deadRefreshToken = null;
     console.log(`[TeamClaude] Updated tokens for account "${safeLine(account.name, 64)}"`);
     this._onTokenRefresh?.(accountIndex, {
       accessToken,

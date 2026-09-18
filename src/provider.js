@@ -80,6 +80,11 @@ export function isSubscriptionAccount(account) {
 // it. Codex is exactly that case.
 const PROVIDER_HOSTS = { 'api.anthropic.com': 'anthropic', 'chatgpt.com': 'codex' };
 
+// Claude Code refreshes OAuth against platform.claude.com, not the inference
+// host. MITM must terminate that host too (see mitm `oauth-mirror`) or the
+// client's refresh rotates the token family while TeamClaude's copy goes stale.
+export const OAUTH_MIRROR_HOSTS = new Set(['platform.claude.com']);
+
 // Hosts adjacent to a provider that must NOT be intercepted.
 //
 // `ab.chatgpt.com` is OpenAI's own telemetry/experiment endpoint. It carries no
@@ -106,6 +111,11 @@ export function isNeverIntercepted(host) {
   return NEVER_INTERCEPT.has(host);
 }
 
+/** Whether `host` is Claude Code's OAuth token endpoint host (mirrored, not rewritten). */
+export function isOAuthMirrorHost(host) {
+  return OAUTH_MIRROR_HOSTS.has(host);
+}
+
 /** Hosts to intercept for the providers this config actually uses. */
 export function interceptHostsFor(accounts = []) {
   const wanted = new Set();
@@ -115,6 +125,11 @@ export function interceptHostsFor(accounts = []) {
     // provider is intercepted only when an account actually uses it, so an
     // Anthropic-only fleet never has its ChatGPT traffic terminated.
     if (id === DEFAULT_PROVIDER || accounts.some(a => providerOf(a) === id)) wanted.add(host);
+  }
+  // Always mirror the OAuth host when Anthropic is in play — that is where
+  // Claude Code rotates refresh tokens.
+  if (wanted.has('api.anthropic.com') || accounts.some(a => providerOf(a) === 'anthropic') || !accounts.length) {
+    for (const host of OAUTH_MIRROR_HOSTS) wanted.add(host);
   }
   return [...wanted];
 }
