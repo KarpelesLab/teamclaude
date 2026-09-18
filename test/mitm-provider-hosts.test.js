@@ -61,22 +61,24 @@ test('unrelated hosts still tunnel, and the test host is still answered locally'
 });
 
 test('interceptHostsFor only adds a provider an account actually uses', () => {
-  assert.deepEqual(interceptHostsFor([claude('a')]), ['api.anthropic.com']);
+  assert.deepEqual(interceptHostsFor([claude('a')]).sort(),
+    ['api.anthropic.com', 'platform.claude.com']);
   assert.deepEqual(interceptHostsFor([claude('a'), codex('c')]).sort(),
-    ['api.anthropic.com', 'chatgpt.com']);
+    ['api.anthropic.com', 'chatgpt.com', 'platform.claude.com']);
 });
 
 // The leaf has to NAME every host we intercept, or the CONNECT fails the
 // handshake instead of being served — which is the failure this whole change
 // exists to avoid.
 test('mitmHosts covers the Anthropic upstream and every used provider host', () => {
-  assert.deepEqual(mitmHosts({ accounts: [claude('a')] }), ['api.anthropic.com']);
+  assert.deepEqual(mitmHosts({ accounts: [claude('a')] }).sort(),
+    ['api.anthropic.com', 'platform.claude.com']);
   assert.deepEqual(mitmHosts({ accounts: [claude('a'), codex('c')] }).sort(),
-    ['api.anthropic.com', 'chatgpt.com']);
+    ['api.anthropic.com', 'chatgpt.com', 'platform.claude.com']);
   // A custom upstream is still covered alongside the provider hosts.
   assert.deepEqual(
     mitmHosts({ upstream: 'https://proxy.internal.test', accounts: [codex('c')] }).sort(),
-    ['api.anthropic.com', 'chatgpt.com', 'proxy.internal.test'].sort(),
+    ['api.anthropic.com', 'chatgpt.com', 'platform.claude.com', 'proxy.internal.test'].sort(),
   );
 });
 

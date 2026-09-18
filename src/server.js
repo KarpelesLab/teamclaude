@@ -20,6 +20,7 @@ import { forwardRefusal, guardedLookup, FORBIDDEN_FORWARD } from './forward-targ
 import { renderDashboardHtml, dashboardCsp } from './dashboard.js';
 import { createUsageRecorder, resolveUsageDimensions, usageDimensionHeaderNames } from './client-usage.js';
 import { classificationPath } from './classification-path.js';
+import { syncClientOAuthRefresh } from './oauth-sync.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 
@@ -893,7 +894,13 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       }
       // Client token refresh: pass through untouched (the proxy manages its own
       // tokens via ensureTokenFresh; rewriting client refreshes would conflict).
-      if (req.method === 'POST' && req.url === '/v1/oauth/token') { await relayRaw(req, res, upstream, sx, resolveMaxBodyBytes(config)); return; }
+      // After a successful refresh_token grant, copy the new tokens onto any
+      // fleet account that still held the old refresh token — otherwise Claude
+      // Code's Keychain rotates and TeamClaude's copy dies with invalid_grant.
+      if (req.method === 'POST' && (req.url === '/v1/oauth/token' || (req.url || '').startsWith('/v1/oauth/token?'))) {
+        await relayOAuthToken(req, res, upstream, sx, resolveMaxBodyBytes(config), accountManager);
+        return;
+      }
       // Account pin: a request to `/tc-acct/<name-or-index>/...` (e.g. via
       // ANTHROPIC_BASE_URL=http://host:port/tc-acct/deepseek) is forced onto that
       // one account, bypassing rotation. Used by the keep-warm scheduler and for
@@ -1564,8 +1571,10 @@ async function refuseOversizedBody(req, res) {
 
 /**
  * Relay a request to upstream with no header rewriting — pure passthrough.
+ * Exported so the MITM oauth-mirror host can forward non-token paths to
+ * platform.claude.com without injecting a fleet credential.
  */
-async function relayRaw(req, res, upstream, sx, maxBodyBytes = DEFAULT_MAX_BODY_BYTES) {
+export async function relayRaw(req, res, upstream, sx, maxBodyBytes = DEFAULT_MAX_BODY_BYTES) {
   const bodyChunks = [];
   let bodyBytes = 0;
   for await (const chunk of req) {
@@ -1602,6 +1611,58 @@ async function relayRaw(req, res, upstream, sx, maxBodyBytes = DEFAULT_MAX_BODY_
     res.end(responseBody);
   } catch (err) {
     console.error('[TeamClaude] Raw relay error:', describeConnectError(err));
+    if (!res.headersSent) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Upstream unreachable' } }));
+    }
+  }
+}
+
+/**
+ * Passthrough for a client OAuth token exchange, then sync a successful
+ * refresh_token grant onto any fleet account that still held the old token.
+ *
+ * Exported for its own tests. Claude Code's live refreshes usually hit
+ * `platform.claude.com` (see mitm oauth-mirror); this covers the same path
+ * when it arrives on the inference upstream instead.
+ */
+export async function relayOAuthToken(req, res, upstream, sx, maxBodyBytes, accountManager) {
+  const bodyChunks = [];
+  let bodyBytes = 0;
+  for await (const chunk of req) {
+    bodyBytes += chunk.length;
+    if (bodyBytes > maxBodyBytes) { await refuseOversizedBody(req, res); return; }
+    bodyChunks.push(chunk);
+  }
+  const body = Buffer.concat(bodyChunks);
+
+  try {
+    const upstreamRes = await upstreamFetch(`${upstream}${req.url}`, {
+      method: req.method,
+      headers: {
+        'content-type': req.headers['content-type'] || 'application/json',
+        'accept': req.headers['accept'] || 'application/json',
+        'user-agent': req.headers['user-agent'] || 'node',
+      },
+      body: body.length > 0 ? body : undefined,
+    }, sx, sx?.useByDefault());
+
+    const responseBody = await upstreamRes.text();
+    try {
+      syncClientOAuthRefresh(accountManager, body, responseBody, upstreamRes.status);
+    } catch (err) {
+      console.error(`[TeamClaude] OAuth sync failed: ${err?.message || err}`);
+    }
+    const responseHeaders = {};
+    for (const [key, value] of upstreamRes.headers.entries()) {
+      if (key === 'transfer-encoding' || key === 'connection' ||
+          key === 'content-encoding' || key === 'content-length') continue;
+      responseHeaders[key] = value;
+    }
+    res.writeHead(upstreamRes.status, responseHeaders);
+    res.end(responseBody);
+  } catch (err) {
+    console.error('[TeamClaude] OAuth token relay error:', describeConnectError(err));
     if (!res.headersSent) {
       res.writeHead(502, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Upstream unreachable' } }));
