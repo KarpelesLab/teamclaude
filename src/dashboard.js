@@ -89,7 +89,64 @@ export function providerLabel(provider) {
   return provider || 'Unknown';
 }
 
-export function accountBadges(account, current, currentAccounts) {
+// Every bucket switchThreshold can be keyed by, plus the short names the
+// threshold badge shows them under. Mirrors THRESHOLD_BUCKET_KEYS /
+// THRESHOLD_BUCKET_LABELS in model.js and status-renderer.js — duplicated
+// rather than imported, like every other pure function on this page: the
+// browser only ever runs what SHARED_HELPERS.toString()s in, never an import.
+var THRESHOLD_BUCKET_KEYS = ['unified5h', 'unified7d', 'unified7dSonnet', 'unified7dFable', 'tokens', 'requests'];
+/** @type {Object<string, string>} */
+var THRESHOLD_BUCKET_LABELS = {
+  unified5h: '5h', unified7d: '7d', unified7dSonnet: 'sonnet', unified7dFable: 'fable',
+  tokens: 'tokens', requests: 'requests',
+};
+
+/**
+ * "switch at 100%" / "switch 7d 90%, fable 80%" — an account's OWN
+ * switchThreshold (issue #409), or '' when it has none or every override it
+ * carries merely repeats what the fleet already resolves to. `fleetThreshold`
+ * and `fleetThresholds` are the status payload's own top-level fields
+ * (`status.switchThreshold` / `status.switchThresholds`), so the comparison
+ * uses the exact fleet value the live server is gating on.
+ * @param {number|Object<string, number>|null|undefined} accountThreshold
+ * @param {number|null|undefined} fleetThreshold
+ * @param {Object<string, number>|null|undefined} fleetThresholds
+ * @returns {string}
+ */
+export function thresholdBadgeText(accountThreshold, fleetThreshold, fleetThresholds) {
+  /** @param {string} bucket */
+  function fleetFor(bucket) {
+    if (fleetThresholds && typeof fleetThresholds === 'object') {
+      var v = fleetThresholds[bucket];
+      if (v == null) v = fleetThresholds.default;
+      if (typeof v === 'number' && isFinite(v)) return v;
+    }
+    return typeof fleetThreshold === 'number' && isFinite(fleetThreshold) ? fleetThreshold : 0.98;
+  }
+  /** @param {number} v */
+  function pct(v) { return (Math.round(v * 1000) / 10) + '%'; }
+  var parts = [];
+  if (typeof accountThreshold === 'number' && isFinite(accountThreshold)) {
+    if (accountThreshold !== fleetFor('default')) parts.push('at ' + pct(accountThreshold));
+  } else if (accountThreshold && typeof accountThreshold === 'object' && !Array.isArray(accountThreshold)) {
+    Object.keys(accountThreshold).forEach(function (key) {
+      var v = accountThreshold[key];
+      if (typeof v !== 'number' || !isFinite(v)) return;
+      if (key !== 'default' && THRESHOLD_BUCKET_KEYS.indexOf(key) === -1) return;
+      if (v !== fleetFor(key)) parts.push((key === 'default' ? 'at' : (THRESHOLD_BUCKET_LABELS[key] || key)) + ' ' + pct(v));
+    });
+  }
+  return parts.length ? 'switch ' + parts.join(', ') : '';
+}
+
+/**
+ * @param {any} account
+ * @param {any} [current]
+ * @param {any} [currentAccounts]
+ * @param {number|null|undefined} [fleetThreshold]
+ * @param {Object<string, number>|null|undefined} [fleetThresholds]
+ */
+export function accountBadges(account, current, currentAccounts, fleetThreshold, fleetThresholds) {
   var a = account || {};
   var isCurrent = currentAccounts
     ? currentAccounts[a.provider] === a.name
@@ -106,6 +163,14 @@ export function accountBadges(account, current, currentAccounts) {
   badges.push({ cls: status, text: status });
   if (recent) badges.push({ cls: 'sessions', text: recent + ' recent' });
   if (known > recent) badges.push({ cls: 'sessions known', text: known + ' known' });
+  // Arguments 4/5 are optional (the pre-#409 unit test above omits them): with
+  // no account switchThreshold at all — the common case — thresholdBadgeText
+  // returns '' regardless of what the fleet args are, so an old caller sees no
+  // new badge. A caller that DOES set switchThreshold on the account is
+  // expected to pass the fleet's own value too, the way `render()` does below,
+  // or the comparison falls back to thresholdBadgeText's own 0.98 default.
+  var thresholdText = thresholdBadgeText(a.switchThreshold, fleetThreshold, fleetThresholds);
+  if (thresholdText) badges.push({ cls: 'meta threshold', text: thresholdText });
   return badges;
 }
 
@@ -340,7 +405,7 @@ export function problems(status) {
 }
 
 const SHARED_HELPERS = [
-  scopedWeeklyRows, accountTokens, providerLabel, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
+  scopedWeeklyRows, accountTokens, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, routeRows, problems,
 ].map(fn => fn.toString()).join('\n\n');
 
@@ -558,14 +623,14 @@ ${SHARED_HELPERS}
     return row;
   }
 
-  function renderAccount(a, current, currentAccounts) {
+  function renderAccount(a, current, currentAccounts, fleetThreshold, fleetThresholds) {
     var card = el('div', 'card');
     var head = el('div', 'row');
     head.appendChild(el('span', 'name', a.name));
     var isCurrent = currentAccounts
       ? currentAccounts[a.provider] === a.name
       : a.name === current;
-    accountBadges(a, current, currentAccounts).forEach(function (badge) {
+    accountBadges(a, current, currentAccounts, fleetThreshold, fleetThresholds).forEach(function (badge) {
       head.appendChild(el('span', 'badge ' + badge.cls, badge.text));
     });
     // Last in the row so the badges sit in the same place on every card.
@@ -829,7 +894,7 @@ ${SHARED_HELPERS}
     probeBtn.disabled = !!probe.running;
     var acc = document.getElementById('accounts');
     acc.textContent = '';
-    (s.accounts || []).forEach(function (a) { acc.appendChild(renderAccount(a, s.currentAccount, currentAccounts)); });
+    (s.accounts || []).forEach(function (a) { acc.appendChild(renderAccount(a, s.currentAccount, currentAccounts, s.switchThreshold, s.switchThresholds)); });
     renderProblems(s);
     renderRoutes(s);
     renderClients(s.clients);
