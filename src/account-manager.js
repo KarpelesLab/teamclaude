@@ -440,10 +440,14 @@ export class AccountManager {
     // often to refresh the cached quota. See _selectProbe.
     this.probeIntervalMs = 60_000;
     this._nextProbeAt = 0;
-    // The account the fleet is currently leaning on for paid overage, or null.
-    // Only there so the switch onto (and back off) extra usage is logged once
-    // per episode rather than once per request. See _selectExtraUsage.
-    this._extraUsageIndex = null;
+    // Extra-usage episodes, keyed by selection scope (`_cursorKey(model, null,
+    // provider)`) → { index, hopOnly }. Scoped because availability is: with
+    // every Fable bucket spent and Opus fine, the Fable scope is billing while
+    // the Opus scope is not, and one fleet-wide marker had each Opus request
+    // "end" the episode and each Fable request restart it — a log pair and a
+    // ramp restart per request. Bookkeeping for logs, status and the ramp
+    // trigger only; no routing decision reads it. See _selectExtraUsage.
+    this._extraUsage = new Map();
     // Minimum time a 429 hold is respected verbatim before a throttled account
     // becomes probe-eligible (see _isProbeable). Long enough to honor a genuine
     // retry-after, short enough that a stale hold cannot pin the fleet.
@@ -846,9 +850,12 @@ export class AccountManager {
     // so, once. Not on a probe or on another fallback pick — neither is
     // available under the normal rules — and quietly on null, so the next
     // episode is announced afresh.
-    if (this._extraUsageIndex != null && (!account || this._isAvailable(account, model))) {
-      if (account) console.log(`[TeamClaude] Quota headroom is back on "${safeLine(account.name, 64)}" — leaving extra usage`);
-      this._extraUsageIndex = null;
+    // Only a walk for the SAME scope can end its episode: an Opus request that
+    // finds headroom says nothing about Fable's.
+    const scope = this._cursorKey(model, null, provider);
+    if (this._extraUsage.has(scope) && (!account || this._isAvailable(account, model))) {
+      if (account) console.log(`[TeamClaude] Quota headroom is back on "${safeLine(account.name, 64)}" — leaving extra usage${this._scopeLabel(model)}`);
+      this._extraUsage.delete(scope);
     }
     return account;
   }
@@ -873,8 +880,24 @@ export class AccountManager {
     // sits idle. Its fleet-wide gate is what keeps a hop off a HEALTHY account
     // (a per-minute 429 pause leaves it available) from spending money to skip
     // a wait — see _pickExtraUsage.
-    return this._pickBestAvailable(excluded, model, advisorModel)
-      ?? this._pickExtraUsage(excluded, model, provider);
+    const normal = this._pickBestAvailable(excluded, model, advisorModel);
+    if (normal) return normal;
+    const paid = this._pickExtraUsage(excluded, model, provider);
+    // A paid hop must not bill silently, yet it is still a detour: no cursor,
+    // no ramp. So it only records the scope's episode — bookkeeping that feeds
+    // the log dedupe and `onExtraUsage`, which no routing decision reads — and
+    // says so once per episode rather than once per hop. `hopOnly` tells a
+    // later real selection that the fleet has not moved there yet, so that
+    // selection still starts its ramp (see _selectExtraUsage); the hop itself
+    // routes exactly as it would without this block.
+    if (paid) {
+      const scope = this._cursorKey(model, null, provider);
+      if (this._extraUsage.get(scope)?.index !== paid.index) {
+        this._extraUsage.set(scope, { index: paid.index, hopOnly: true });
+        console.log(`[TeamClaude] Failover hop onto "${safeLine(paid.name, 64)}" on extra usage (paid overage)${this._scopeLabel(model)}`);
+      }
+    }
+    return paid;
   }
 
   /**
@@ -1825,12 +1848,27 @@ export class AccountManager {
     const best = this._pickExtraUsage(exclude, model, this._selectingProvider ?? DEFAULT_PROVIDER);
     if (!best) return null;
     if (!this._currentBarredOnlyFor(model, null, exclude)) this._setCurrent(best);
-    if (this._extraUsageIndex !== best.index) {
-      this._extraUsageIndex = best.index;
+    // Per scope, so a request for a model with headroom elsewhere neither ends
+    // nor restarts this one. A switch within the scope (another paid account)
+    // is announced and ramped like any switch; a scope first reached by a hop
+    // is already announced but the fleet only moves now, so it ramps quietly.
+    const scope = this._cursorKey(model);
+    const prev = this._extraUsage.get(scope);
+    if (!prev || prev.index !== best.index || prev.hopOnly) {
+      this._extraUsage.set(scope, { index: best.index, hopOnly: false });
       this._beginRamp(best);
-      console.log(`[TeamClaude] Every account is past its quota — routing to "${safeLine(best.name, 64)}" on extra usage (paid overage)`);
+      if (prev?.index !== best.index) {
+        console.log(`[TeamClaude] No account has quota left${this._scopeLabel(model)} — routing to "${safeLine(best.name, 64)}" on extra usage (paid overage)`);
+      }
     }
     return best;
+  }
+
+  /** ` for "<model>"`, or nothing for an unscoped request — the log suffix that
+   * says which traffic an extra-usage episode covers.
+   * @param {string|null} [model] */
+  _scopeLabel(model) {
+    return model ? ` for "${safeLine(model, 64)}"` : '';
   }
 
   /**
@@ -4265,7 +4303,7 @@ export class AccountManager {
         // True while this account is the extra-usage fallback — serving past
         // its quota and billing for it. The one state `unavailable` alone
         // cannot tell apart from an account that is simply out.
-        onExtraUsage: this._extraUsageIndex === a.index,
+        onExtraUsage: [...this._extraUsage.values()].some(e => e.index === a.index),
         status: a.status,
         // Why the account is out of rotation right now (null = it can serve).
         // Distinguishes a local threshold decision from an upstream rejection —

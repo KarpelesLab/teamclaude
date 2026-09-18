@@ -205,7 +205,63 @@ test('pickAlternate reaches the fallback when the fleet is spent, moving nothing
   assert.equal(alt?.name, 'paid');
   // A detour, not a decision about where the fleet rests (#286).
   assert.equal(am.currentIndex, 0);
-  assert.equal(am._extraUsageIndex, null);
+  assert.equal(am.accounts[1].rampStartedAt, null);
+});
+
+test('a paid hop is logged once per episode and shows in status, still moving nothing', () => {
+  const am = spentFleet([oauth('a'), oauth('paid', { allowExtraUsage: true })]);
+  am.currentIndex = 0;
+  const lines = [];
+  const log = console.log;
+  console.log = (...args) => lines.push(args.join(' '));
+  try {
+    for (let i = 0; i < 4; i++) assert.equal(am.pickAlternate(new Set([0]), OPUS)?.name, 'paid');
+  } finally {
+    console.log = log;
+  }
+  assert.equal(lines.filter(l => l.includes('Failover hop onto "paid" on extra usage')).length, 1);
+  assert.equal(am.getStatus().accounts[1].onExtraUsage, true);
+  assert.equal(am.currentIndex, 0);
+  assert.equal(am.accounts[1].rampStartedAt, null);
+
+  // The fleet then really moves there: announced already, so no second enter
+  // line, but the ramp the hop deliberately skipped starts now.
+  const more = [];
+  console.log = (...args) => more.push(args.join(' '));
+  try {
+    assert.equal(am.getActiveAccount(null, OPUS).name, 'paid');
+  } finally {
+    console.log = log;
+  }
+  assert.equal(more.filter(l => l.includes('extra usage')).length, 0);
+  assert.notEqual(am.accounts[1].rampStartedAt, null);
+});
+
+// Availability is model-scoped, so the episode is too. With every Fable
+// bucket spent and Opus fine, alternating requests used to end and restart
+// the episode on every request: a log pair and a ramp restart each time.
+test('alternating Fable/Opus: one enter log, no leave, no ramp restart', () => {
+  const am = new AccountManager([oauth('a'), oauth('paid', { allowExtraUsage: true })], 0.98);
+  for (const acc of am.accounts) setQuota(acc, { unified7d: 0.3, unified7dFable: 0.99 });
+  am._nextProbeAt = Date.now() + 60 * 60_000;
+  am.currentIndex = 0;
+  const lines = [];
+  const log = console.log;
+  console.log = (...args) => lines.push(args.join(' '));
+  let rampAfterFirst;
+  try {
+    for (let i = 0; i < 6; i++) {
+      assert.equal(am.getActiveAccount(null, FABLE).name, 'paid');
+      if (i === 0) { rampAfterFirst = am.accounts[1].rampStartedAt = 1; }
+      assert.equal(am.getActiveAccount(null, OPUS).name, 'a');
+      assert.equal(am.getStatus().accounts[1].onExtraUsage, true);
+    }
+  } finally {
+    console.log = log;
+  }
+  assert.equal(lines.filter(l => l.includes('on extra usage')).length, 1);
+  assert.equal(lines.filter(l => l.includes('leaving extra usage')).length, 0);
+  assert.equal(am.accounts[1].rampStartedAt, rampAfterFirst);
 });
 
 test('pickAlternate does not start billing to skip a wait on a healthy account', () => {

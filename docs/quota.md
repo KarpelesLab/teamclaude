@@ -191,7 +191,7 @@ By default, once every account is past its quota the proxy answers 429 (or holds
 
 Utilization goes past 100% in overage, so `maxUsage` above 1.0 is a spend limit: `"maxUsage": 1.5` lets an account run to 150% of its plan and then stop, like any other cap.
 
-The switch onto extra usage and back off it is logged once each. While an account is serving this way, `teamclaude status` marks it:
+The switch onto extra usage and back off it is logged once each, per model scope (a Fable-only episode is not ended by Opus traffic that still has headroom), and a failover hop onto a paid account is logged once per episode too. While an account is serving this way, `teamclaude status` marks it:
 
 ```
   Blocked  local switch threshold reached — serving on extra usage (paid overage)
