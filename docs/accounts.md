@@ -46,6 +46,10 @@ Instead of storing an OAuth account's tokens in `teamclaude.json`, an account en
 
 The tokens (`accessToken`, `refreshToken`, `expiresAt`) are read from that file at startup and again on every config reload, so a login refreshed by Claude Code itself is picked up without re-running `teamclaude import`. Every other field on the entry (`priority`, `disabled`, `upstream`, `modelMap`, …) is kept as written. A file with no token skips the account with a message rather than sending an empty credential upstream. `teamclaude import` is the alternative: it copies the tokens into the config once.
 
+On macOS the default path reads the **Keychain** first (Claude Code's live store); `~/.claude/.credentials.json` is only a fallback. Prefer `importFrom` for any account that Claude Code itself is also signed into — a copied refresh token goes stale the moment Claude Code rotates it.
+
+TeamClaude also mirrors Claude Code's own refreshes against `platform.claude.com` (MITM `oauth-mirror`) and, on `invalid_grant`, re-reads the Claude Code store before marking the account as needing re-login.
+
 ## API key
 
 For Anthropic API key accounts (billed via Console):
