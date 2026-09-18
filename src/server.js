@@ -20,6 +20,7 @@ import { forwardRefusal, guardedLookup, FORBIDDEN_FORWARD } from './forward-targ
 import { renderDashboardHtml, dashboardCsp } from './dashboard.js';
 import { createUsageRecorder, resolveUsageDimensions, usageDimensionHeaderNames } from './client-usage.js';
 import { classificationPath } from './classification-path.js';
+import { serveManagementMcp } from './mcp-tools.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 
@@ -459,6 +460,25 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           + (eligible ? '' : ` — ${reason}, so rotation will not use it`));
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true, account: name, eligible, ...(reason ? { reason } : {}) }));
+        return;
+      }
+
+      // MCP management endpoint — the tool-shaped face of this control plane,
+      // off unless proxy.mcp says otherwise. The gates above are the same ones
+      // the other /teamclaude/ routes pass, with one addition: a config with no
+      // key at all admits every caller as authenticated, which skips the
+      // rebinding check on key-less loopback requests — so it is asked here.
+      // A trailing slash and a query string are matched too: this URL is typed
+      // into a client by hand, and a near miss would fall through to the
+      // forwarder below with a fleet credential attached.
+      if (/^\/teamclaude\/mcp\/?(\?|$)/.test(req.url || '')) {
+        if (resolveClientAuth(config.proxy, undefined).ok
+          && !isLocalHostHeader(req.headers.host ?? req.headers[':authority'], config.proxy?.host)) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'request refused: the Host header does not name this proxy' }));
+          return;
+        }
+        await serveManagementMcp(req, res, { accountManager, config, hooks, client: req.tcClient, readBody: readControlBody });
         return;
       }
 
