@@ -1,5 +1,5 @@
 import { formatMoney } from './oauth.js';
-import { findFamilyBlock, modelGlobOverlaps, gatingUtilization, resolveMaxUsage } from './model.js';
+import { findFamilyBlock, modelGlobOverlaps, gatingUtilization, resolveMaxUsage, resolveSwitchThreshold } from './model.js';
 import { safeLine } from './safe-text.js';
 
 const ESC = '\x1b[';
@@ -56,7 +56,14 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
     for (const quotaLine of quotaLines(account, now, paint)) {
       lines.push(`  ${quotaLine}`);
     }
-    const routing = modelRoutingLine(account, status.switchThreshold, blocked, now, paint);
+    // The account's OWN effective ("default"-bucket) threshold (issue #409)
+    // when it set one, else the fleet's. Same single-number simplification the
+    // header row above already makes for the fleet-wide value — a per-account
+    // table that overrides only, say, unified7dFable leaves this line on the
+    // fleet default too, exactly as the fleet's own per-bucket overrides
+    // already do not reach this line.
+    const accountThreshold = resolveSwitchThreshold(account.switchThreshold, 'default', status.switchThreshold);
+    const routing = modelRoutingLine(account, accountThreshold, blocked, now, paint);
     if (routing) lines.push(`  ${routing}`);
     const why = unavailableLine(account, paint);
     if (why) lines.push(`  ${why}`);

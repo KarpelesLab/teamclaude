@@ -1544,7 +1544,7 @@ export class TUI {
         const anyFable = members.some(a => a.quota.unified7dFable != null);
         const anySonnet = members.some(a => a.quota.unified7dSonnet != null);
         const tagW = members.reduce((w, a) => {
-          const names = blockedFamilies(a.quota, key => this.am.thresholdFor(key));
+          const names = blockedFamilies(a.quota, key => this.am.thresholdFor(key, a));
           return names.length ? Math.max(w, 4 + vw(names.join(' '))) : w;
         }, 0);
         // Same rule for the `$`/`$!` money tag: a column the row can draw is a
@@ -1788,9 +1788,11 @@ export class TUI {
     // The live routing threshold, so a bucket the rotation already refuses to
     // use reads red however healthy its pace looks.
     // Each bar reddens at ITS bucket's threshold (a per-bucket table may set
-    // the weekly one lower than the 5-hour one); the attach-mode manager
-    // mirrors thresholdFor, so both dashboards agree with the gate.
-    const thFor = (k) => (typeof this.am.thresholdFor === 'function' ? this.am.thresholdFor(k) : this.am.switchThreshold);
+    // the weekly one lower than the 5-hour one), further overridden by THIS
+    // account's own switchThreshold (#409) when it has one; the attach-mode
+    // manager mirrors thresholdFor(bucket, account), so both dashboards agree
+    // with the gate.
+    const thFor = (k) => (typeof this.am.thresholdFor === 'function' ? this.am.thresholdFor(k, a) : this.am.switchThreshold);
     // A per-account cap (accounts[].maxUsage) is the lower ceiling when it is
     // set, and it is the harder one — past it the account is sent nothing at
     // all. Reddening at the cap keeps the bar honest about where this account

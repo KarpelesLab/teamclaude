@@ -45,6 +45,39 @@ export function resolveMaxUsage(maxUsage, bucket) {
   return null;
 }
 
+// The switch threshold for one bucket on one account (accounts[].switchThreshold,
+// issue #409), falling back to the fleet's own thresholdFor(bucket) rather than
+// to DEFAULT_SWITCH_THRESHOLD directly — an account whose table lists only, say,
+// `unified7dFable` still inherits the fleet's `unified5h`/`unified7d` instead of
+// opting out of them. Resolution order, closest override wins:
+//   1. the account table's entry for THIS bucket
+//   2. the account's own `default` (or a bare per-account number)
+//   3. `fleetValue`, already fully resolved by the caller
+//
+// Lives beside resolveMaxUsage for the same reason: the status renderer and the
+// attach-mode TUI draw against a JSON payload, not an AccountManager, and both
+// need this exact resolution to agree with the live gate.
+//
+// Array.isArray is checked explicitly — `typeof [] === 'object'` passes the
+// object branch, and a hand-edited `"switchThreshold": [0.9]` would otherwise be
+// spread as a bucket table keyed by numeric string indices (see #425, the same
+// hazard for the fleet-wide setting). Falling through to `fleetValue` here is
+// the same refusal thresholdTable() applies to the fleet field.
+/**
+ * @param {number|Object<string, number>|null|undefined} accountThreshold
+ * @param {string} bucket
+ * @param {number} fleetValue
+ * @returns {number}
+ */
+export function resolveSwitchThreshold(accountThreshold, bucket, fleetValue) {
+  if (typeof accountThreshold === 'number' && Number.isFinite(accountThreshold)) return accountThreshold;
+  if (accountThreshold && typeof accountThreshold === 'object' && !Array.isArray(accountThreshold)) {
+    const v = accountThreshold[bucket] ?? accountThreshold.default;
+    if (typeof v === 'number' && Number.isFinite(v)) return v;
+  }
+  return fleetValue;
+}
+
 // The weekly quota bucket key that governs a model, e.g. a Fable request is
 // gated by 'unified7dFable' rather than the shared 'unified7d'. Used by account
 // selection so a spent family bucket only bars that family's requests.

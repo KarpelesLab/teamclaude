@@ -95,6 +95,30 @@ teamclaude threshold unified7d=default  # drop it again
 
 A running server picks the change up on the reload the command sends it. This is the only way to edit a per-bucket table in place: the TUI shows it read-only, and the single-number form there would flatten it.
 
+### Per-account thresholds
+
+The fleet-wide setting above is one number (or one table) for every account, which doesn't fit a mixed fleet: one account with extra usage bought and one without, or a Max 20x account next to a Pro one that should rotate off much sooner ([#409](https://github.com/KarpelesLab/teamclaude/issues/409)). `accounts[].switchThreshold` overrides it per account, same two shapes:
+
+```json
+{ "name": "extra-usage@example.com", "switchThreshold": 1.0 }
+```
+
+```json
+{ "name": "small-plan@example.com", "switchThreshold": 0.9 }
+```
+
+Resolution is per bucket, not all-or-nothing: for a given bucket, TeamClaude checks the account table's entry for that bucket, then the account's own `default` (or a bare per-account number), and only then falls back to the fleet's own `switchThreshold` for that bucket. So a table that names only one bucket overrides just that one and inherits every other bucket from the fleet setting:
+
+```json
+{ "name": "b@example.com", "switchThreshold": { "unified7dFable": 0.8 } }
+```
+
+leaves `b`'s `unified5h` and `unified7d` on whatever the fleet has configured, and only rotates Fable off at 80%.
+
+It is still a **preference**, exactly like the fleet setting: the all-exhausted revalidation probe can override it the same way, which is what keeps it a different setting from the hard `accounts[].maxUsage` cap above. The account's own value is what the bars, the `Models` row, and `teamclaude status` redden against for that account — see [Per-account usage caps](#per-account-usage-caps) for how the two ceilings are drawn together when both are set.
+
+No CLI editor for this one, matching `maxUsage`: hand-edit the config and let a running server pick it up on reload, or restart.
+
 ## Per-account usage caps
 
 `switchThreshold` is fleet-wide, and it is a *preference*: at that level rotation prefers another account, but when every account is over it the proxy still sends one revalidating request, because a threshold decision can rest on a stale reading and refusing forever is worse. That makes it the wrong tool for "this account may spend only part of its quota".
