@@ -249,6 +249,19 @@ export function spendTag(quota) {
   return (spend.usedMinor || 0) > 0 ? '$!' : '$';
 }
 
+/**
+ * Short row tag for the extra-usage fallback (`accounts[].allowExtraUsage`):
+ * `xu!` while the account is serving past its quota and billing for it, `xu`
+ * while it is merely allowed to, '' otherwise. Same shape and colours as the
+ * money tag beside it, for the same width-budget reason.
+ * @param {boolean} allowed
+ * @param {boolean} serving
+ */
+export function extraUsageTag(allowed, serving) {
+  if (serving) return 'xu!';
+  return allowed ? 'xu' : '';
+}
+
 export function blockedFamilies(quota, threshold) {
   const at = typeof threshold === 'function' ? threshold : () => threshold;
   const out = [];
@@ -1550,9 +1563,12 @@ export class TUI {
         // Same rule for the `$`/`$!` money tag: a column the row can draw is a
         // column the budget has to know about, or the row overflows exactly the
         // way #228 fixed.
+        // The extra-usage `xu`/`xu!` tag is one more such column, drawn after
+        // it on the same row, so a row's reserve is the two together.
         const spendW = members.reduce((w, a) => {
           const tag = spendTag(a.quota);
-          return tag ? Math.max(w, 2 + vw(tag)) : w;
+          const xu = extraUsageTag(a.allowExtraUsage === true, this._onExtraUsage(a));
+          return Math.max(w, (tag ? 2 + vw(tag) : 0) + (xu ? 2 + vw(xu) : 0));
         }, 0);
         const fixed = 28 + NAME_MIN + routeCells + tagW + spendW;
         const roomFor = n => fixed + 6 * (n - 1) + n * BAR_MIN <= W;
@@ -1831,7 +1847,18 @@ export class TUI {
     // the bars. Red once real money has moved, yellow while it only could.
     const money = spendTag(q);
     if (money) line += `  ${(money === '$!' ? red : yellow)(money)}`;
+    // Extra-usage fallback: allowed reads yellow like `$`; serving on it is
+    // billing now, so red like `$!`.
+    const xu = extraUsageTag(a.allowExtraUsage === true, this._onExtraUsage(a));
+    if (xu) line += `  ${(xu === 'xu!' ? red : yellow)(xu)}`;
     return line;
+  }
+
+  /** Whether the account behind this row is serving on extra usage. Asked of
+   * the manager, which answers the same way in-process and attached.
+   * @param {{ index: number, onExtraUsage?: boolean }} a */
+  _onExtraUsage(a) {
+    return typeof this.am.onExtraUsage === 'function' ? this.am.onExtraUsage(a.index) : a.onExtraUsage === true;
   }
 
   _renderSettings(lines) {

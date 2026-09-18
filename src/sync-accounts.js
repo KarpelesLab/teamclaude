@@ -97,6 +97,9 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     // operator decision about a running fleet, and waiting for a restart to
     // honour a budget defeats the budget.
     mgr.maxUsage = diskAcct.maxUsage ?? null;
+    // Same for the extra-usage opt-in, and more so: it decides whether the
+    // fleet may spend money, so turning it off on disk must stop that now.
+    mgr.allowExtraUsage = diskAcct.allowExtraUsage === true;
     // Third-party-backend bindings are read per request off this object
     // (`account.upstream || upstream`, `account.modelMap` in server.js), so a
     // disk edit must land here to take effect on reload. `|| null` mirrors the
@@ -128,6 +131,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       if (diskAcct.stripRequestFields) cfgAcct.stripRequestFields = diskAcct.stripRequestFields; else delete cfgAcct.stripRequestFields;
       if (diskAcct.messageThreads === true) cfgAcct.messageThreads = true; else delete cfgAcct.messageThreads;
       if (diskAcct.maxUsage != null) cfgAcct.maxUsage = diskAcct.maxUsage; else delete cfgAcct.maxUsage;
+      if (diskAcct.allowExtraUsage === true) cfgAcct.allowExtraUsage = true; else delete cfgAcct.allowExtraUsage;
     }
     // Pick up enable/disable toggles; re-enabling clears a stuck error state.
     const wantDisabled = !!diskAcct.disabled;
