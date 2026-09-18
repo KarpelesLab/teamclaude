@@ -34,6 +34,7 @@ Already logged into Claude Code? `teamclaude import` takes its credentials inste
 - TUI with quota bars, reset countdowns, activity log, and settings you can change while it runs, including adding and removing accounts.
 - Catches hardcoded `api.anthropic.com` endpoints (the Claude Design MCP, for one) through a local MITM forward proxy, not only what `ANTHROPIC_BASE_URL` covers.
 - Holds the request open until quota resets instead of returning 429 when every account is spent, so an unattended run finishes on its own (`holdSeconds`, off by default).
+- Optionally leans on accounts with Anthropic's paid extra usage once every account is spent, instead of returning 429 (`allowExtraUsage`, off by default — it bills real money), and goes back as soon as a window resets.
 - Refreshes OAuth tokens before they expire and writes them back to config. Client refreshes pass through untouched.
 - Pools OpenAI Codex subscriptions alongside Claude accounts (experimental): the Codex CLI is routed through the same proxy, by config or transparently through the MITM proxy, and rotates on its own quota.
 - Takes any Anthropic-compatible API (DeepSeek, GLM) as a low-priority fallback for when the Claude accounts are done.

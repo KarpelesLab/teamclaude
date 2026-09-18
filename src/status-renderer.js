@@ -171,6 +171,12 @@ export function unavailableLine(account, paint) {
   const reason = account?.unavailable;
   if (!reason) return null;
   const text = UNAVAILABLE_TEXT[reason] || safeLine(reason, 64);
+  // An account serving as the extra-usage fallback reads as out of quota like
+  // any other, yet is taking traffic and billing for it. Say so on the line
+  // that would otherwise tell the operator it is idle.
+  if (account.onExtraUsage) {
+    return `${paint.dim('Blocked'.padEnd(8))} ${paint.yellow(text)} ${paint.red('\u2014 serving on extra usage (paid overage)')}`;
+  }
   return `${paint.dim('Blocked'.padEnd(8))} ${paint.yellow(text)}`;
 }
 
