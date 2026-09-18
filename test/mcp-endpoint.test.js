@@ -270,11 +270,14 @@ test('no read tool lets a credential out', async () => {
   }, hooks);
 });
 
-test('arguments a tool does not take are refused as invalid params', async () => {
+test('arguments a tool does not take come back as a tool error, an unknown tool as a protocol one', async () => {
   await withServer({ ...KEYED, mcp: 'read' }, async ({ port }) => {
     const reply = await callTool(port, 'get_settings', { verbose: true });
-    assert.equal(reply.error.code, -32602);
-    assert.match(reply.error.message, /verbose/);
+    assert.equal(reply.result.isError, true);
+    assert.match(reply.result.content[0].text, /verbose/);
+
+    const unknown = await callTool(port, 'switch_account', { account: 'alice@example.com' });
+    assert.equal(unknown.error.code, -32602);
   });
 });
 

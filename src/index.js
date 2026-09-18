@@ -391,6 +391,9 @@ async function serverCommand() {
       // The shared key is read per request too, so a rotated key on disk
       // takes effect on reload the same way.
       config.proxy.apiKey = diskConfig.proxy.apiKey;
+      // The MCP endpoint's mode: read per request, so this is what opens,
+      // narrows or closes it without a restart.
+      config.proxy.mcp = diskConfig.proxy.mcp;
     }
     // Pick up route table edits (teamclaude route …, TUI editor, or a hand edit).
     config.routes = diskConfig.routes || [];
@@ -453,21 +456,30 @@ async function serverCommand() {
     return added;
   };
 
+  // The account half of a save. The TUI's save below starts with it, and the
+  // MCP endpoint uses it alone: an account changed there is changed in-process,
+  // on a server that may have no TUI to save for it, and writing the settings
+  // too would pin this server's resolved defaults into a file that never
+  // spelled them out.
+  const mergeAccountsOnto = (/** @type {Record<string, any>} */ diskConfig) => {
+    diskConfig.accounts = mergeAccountsForSave(
+      config.accounts, accountManager.accounts, diskConfig.accounts, removedAccountIds(config),
+    );
+    // The written list omits them, so they are gone from disk too and there
+    // is nothing left to re-adopt. Holding the ids any longer would only
+    // refuse an account the operator re-adds later.
+    clearRemovedAccountIds(config);
+  };
+
   let tui = null;
-  /** @type {Object} */
+  /** @type {Record<string, any>} */
   let hooks = {};
 
   if (useTUI) {
     tui = new TUI({
       accountManager, config, sx, activityLogPath, sessionTitles, versionLabel, updateAvailable,
       saveConfig: () => atomicConfigUpdate(async diskConfig => {
-        diskConfig.accounts = mergeAccountsForSave(
-          config.accounts, accountManager.accounts, diskConfig.accounts, removedAccountIds(config),
-        );
-        // The written list omits them, so they are gone from disk too and there
-        // is nothing left to re-adopt. Holding the ids any longer would only
-        // refuse an account the operator re-adds later.
-        clearRemovedAccountIds(config);
+        mergeAccountsOnto(diskConfig);
         // Persist sx.org settings (set/cleared from the TUI settings screen).
         if (config.sx) diskConfig.sx = config.sx; else delete diskConfig.sx;
         // Persist other runtime-tunable settings edited from the TUI.
@@ -546,6 +558,7 @@ async function serverCommand() {
 
   // Expose reload to the proxy's control endpoint (works with or without TUI).
   hooks.reload = reloadAccounts;
+  hooks.persistAccounts = () => atomicConfigUpdate(mergeAccountsOnto);
   hooks.getStatusExtra = () => ({
     // Read live from the shared config (not a startup snapshot) so the TUI's
     // blocklist editor shows up in `status` immediately, the same way the
