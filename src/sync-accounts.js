@@ -93,6 +93,11 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     }
     if (diskAcct.name && mgr.name !== diskAcct.name) mgr.name = diskAcct.name;
     if (diskAcct.priority != null && mgr.priority !== diskAcct.priority) mgr.priority = diskAcct.priority;
+    // A list position edited on disk applies on reload for the same reason a
+    // priority edit does, and `null` rather than `??` so deleting the field
+    // puts the account back among the unplaced instead of leaving it stuck at
+    // the position it last held. Display only — see makeAccount.
+    mgr.displayOrder = Number.isFinite(diskAcct.displayOrder) ? diskAcct.displayOrder : null;
     // A cap edit applies live for the same reason priority does: it is an
     // operator decision about a running fleet, and waiting for a restart to
     // honour a budget defeats the budget.
