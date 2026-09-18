@@ -169,6 +169,38 @@ The mark stays inside the bar rather than widening it, so capped and uncapped ro
 
 Edits apply live on config reload — no restart.
 
+## Extra-usage fallback
+
+> **This spends real money.** An account with Anthropic's "extra usage" (paid overage) enabled does not stop at its plan limit — it keeps serving and bills for it. Opt in only for accounts whose overage you are prepared to pay for.
+
+By default, once every account is past its quota the proxy answers 429 (or holds the request, with `holdSeconds`), apart from the throttled revalidation probe. `accounts[].allowExtraUsage: true` lets an account with overage switched on take that traffic instead:
+
+```json
+{
+  "name": "team@example.com",
+  "allowExtraUsage": true,
+  "maxUsage": { "unified7d": 1.5 }
+}
+```
+
+- **Rotation is unchanged.** An opted-in account rotates away at `switchThreshold` like any other, and is never chosen while any account can serve under the normal rules — a lower-priority one included.
+- **Last resort only.** It is used where the proxy would otherwise have nothing: after the normal walk, and after the free revalidation probe, which still goes first when it is due because headroom it finds costs nothing. If that probe is refused, the same request retries on the extra-usage account rather than returning 429. The 429/5xx failover hops reach it too, but only when the whole fleet is spent — a hop off an account that is merely rate-limited for a minute waits that out as before rather than starting to bill.
+- **Several opted-in accounts** are chosen by `priority` (lower first), then the least utilized.
+- **It goes back on its own.** As soon as a normal account's window resets, selection returns to it.
+- **Only the quota verdicts are overridden** — the switch threshold (a spent Fable bucket included, for Fable requests only) and a remembered upstream `rejected` status. Everything else still binds: `disabled`, `maxUsage`, a live upstream 429 hold, an entitlement cooldown, an error state, routes and model ownership, and the Claude/Codex partition. An account whose usage probe reports overage switched off upstream is skipped, since it would only 429; with no probe data, upstream decides.
+
+Utilization goes past 100% in overage, so `maxUsage` above 1.0 is a spend limit: `"maxUsage": 1.5` lets an account run to 150% of its plan and then stop, like any other cap.
+
+The switch onto extra usage and back off it is logged once each. While an account is serving this way, `teamclaude status` marks it:
+
+```
+  Blocked  local switch threshold reached — serving on extra usage (paid overage)
+```
+
+and the status payload carries `allowExtraUsage` and `onExtraUsage` per account. With the quota probe on, the `Spend` row shows what has been billed this month.
+
+Edits apply live on config reload — turning it off stops the spending immediately.
+
 ## Third-party backend quota
 
 A [third-party backend account](accounts.md#third-party-backend-accounts) has no Anthropic quota, so its bars read `unknown`. Where the provider publishes a figure of its own, the probe reads it on the same schedule and status shows it:

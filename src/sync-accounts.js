@@ -119,6 +119,9 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     // and reported here as it would be at startup. The config entry below keeps
     // the operator's text as written: this only decides what the gate reads.
     mgr.switchThreshold = accountSwitchThreshold(diskAcct);
+    // Same for the extra-usage opt-in, and more so: it decides whether the
+    // fleet may spend money, so turning it off on disk must stop that now.
+    mgr.allowExtraUsage = diskAcct.allowExtraUsage === true;
     // Third-party-backend bindings are read per request off this object
     // (`account.upstream || upstream`, `account.modelMap` in server.js), so a
     // disk edit must land here to take effect on reload. `|| null` mirrors the
@@ -156,6 +159,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       // arrangement every entry carries a value for a hand edit to lose to.
       if (Number.isFinite(diskAcct.displayOrder)) cfgAcct.displayOrder = diskAcct.displayOrder; else delete cfgAcct.displayOrder;
       if (diskAcct.disabled) cfgAcct.disabled = true; else delete cfgAcct.disabled;
+      if (diskAcct.allowExtraUsage === true) cfgAcct.allowExtraUsage = true; else delete cfgAcct.allowExtraUsage;
     }
     // Pick up enable/disable toggles; re-enabling clears a stuck error state.
     const wantDisabled = !!diskAcct.disabled;
