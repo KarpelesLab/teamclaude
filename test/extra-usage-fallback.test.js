@@ -382,3 +382,149 @@ test('server: a rate-limited probe hops to the extra-usage account', async () =>
   assert.equal(status, 200);
   assert.deepEqual(seen, ['a', 'paid']);
 });
+
+// ── the cursor under session distribution ────────────────────
+
+// Live repro: under distribution the session walks never move the shared
+// cursor, so once the fallback parked it on the paid account nothing moved it
+// off — traffic went back to a normal account while status kept naming the
+// paid one as current, which reads as still billing.
+function liveRepro(distributeSessions) {
+  const am = new AccountManager([
+    oauth('L', { allowExtraUsage: true, priority: 0 }),
+    oauth('R', { priority: 2 }),
+  ], 0.98, { distributeSessions });
+  const [L, R] = am.accounts;
+  setQuota(L, { unified7d: 1.0, unifiedStatus: 'rejected', unifiedStatusSeenAt: Date.now(), spend: { enabled: true } });
+  setQuota(R, { unified7d: 0.99 });
+  am._nextProbeAt = Date.now() + 60 * 60_000;
+  return { am, L, R };
+}
+
+for (const mode of [true, 'adaptive']) {
+  test(`distributeSessions ${JSON.stringify(mode)}: the cursor leaves the paid account once a normal one can serve`, () => {
+    const { am, L, R } = liveRepro(mode);
+    quietly(() => {
+      assert.equal(am.getActiveAccount(null, OPUS, null, 'sess-1').name, 'L');
+      am.recordSession('sess-1', L.index, OPUS);
+      assert.equal(am.getStatus().currentAccounts.anthropic, 'L');
+
+      // The operator raises the threshold: R has headroom, L is still refused
+      // upstream. Every session moves to R — including the one pinned to L,
+      // since a pin is honoured only while its account is eligible.
+      am.switchThreshold = 1.05;
+      assert.equal(am.getActiveAccount(null, OPUS, null, 'sess-1').name, 'R');
+      am.recordSession('sess-1', R.index, OPUS);
+      assert.equal(am.getActiveAccount(null, OPUS, null, 'sess-2').name, 'R');
+    });
+    const status = am.getStatus();
+    assert.equal(status.currentAccounts.anthropic, 'R');
+    assert.equal(status.currentAccount, 'R');
+    assert.equal(status.accounts[0].onExtraUsage, false);
+  });
+}
+
+test('a draining session is not held on the paid account either', () => {
+  const { am, L } = liveRepro(true);
+  quietly(() => {
+    assert.equal(am.getActiveAccount(null, OPUS, null, 'sess-1').name, 'L');
+    am.recordSession('sess-1', L.index, OPUS);
+    am.setDistributeSessions(false);
+    assert.equal(am._isDrainingSession('sess-1'), true);
+    am.switchThreshold = 1.05;
+    assert.equal(am.getActiveAccount(null, OPUS, null, 'sess-1').name, 'R');
+  });
+  assert.equal(am.getStatus().currentAccounts.anthropic, 'R');
+});
+
+test('the cursor stays on the paid account while nothing else can serve', () => {
+  const { am } = liveRepro('adaptive');
+  quietly(() => {
+    for (let i = 0; i < 3; i++) assert.equal(am.getActiveAccount(null, OPUS, null, `s${i}`).name, 'L');
+  });
+  assert.equal(am.getStatus().currentAccounts.anthropic, 'L');
+});
+
+// ── dashboards ───────────────────────────────────────────────
+
+test('the status header names the opt-in even while it is unused', async () => {
+  const { renderStatus } = await import('../src/status-renderer.js');
+  const am = new AccountManager([oauth('a'), oauth('paid', { allowExtraUsage: true })], 0.98);
+  const text = renderStatus(am.getStatus(), { color: false });
+  const lines = text.split('\n');
+  assert.ok(lines.some(l => l.includes('paid') && l.includes('extra usage allowed')), text);
+  assert.ok(!lines.some(l => /\ba\b \(oauth.*extra usage/.test(l)), text);
+});
+
+test('dashboard badges: allowed, then billing', async () => {
+  const { accountBadges } = await import('../src/dashboard.js');
+  const texts = acct => accountBadges(acct, 'x', null).filter(b => b.cls.startsWith('extra-usage'));
+  assert.deepEqual(texts({ name: 'p' }), []);
+  assert.deepEqual(texts({ name: 'p', allowExtraUsage: true }), [{ cls: 'extra-usage', text: 'extra usage allowed' }]);
+  assert.deepEqual(texts({ name: 'p', allowExtraUsage: true, onExtraUsage: true }),
+    [{ cls: 'extra-usage billing', text: 'on extra usage — billing' }]);
+});
+
+test('TUI row tag: xu while allowed, xu! while billing, same in attach mode', async () => {
+  const { extraUsageTag } = await import('../src/tui.js');
+  const { RemoteAccountManager } = await import('../src/tui-remote.js');
+  assert.equal(extraUsageTag(false, false), '');
+  assert.equal(extraUsageTag(true, false), 'xu');
+  assert.equal(extraUsageTag(true, true), 'xu!');
+
+  const am = spentFleet([oauth('a'), oauth('paid', { allowExtraUsage: true })]);
+  quietly(() => am.getActiveAccount(null, OPUS));
+  assert.equal(am.onExtraUsage(1), true);
+  const remote = new RemoteAccountManager();
+  remote.applyStatus(JSON.parse(JSON.stringify(am.getStatus())));
+  assert.equal(remote.accounts[1].allowExtraUsage, true);
+  assert.equal(remote.onExtraUsage(1), true);
+  assert.equal(remote.onExtraUsage(0), false);
+  // A non-boolean from the other end never reads as billing.
+  remote.applyStatus({ accounts: [{ name: 'x', onExtraUsage: 'yes', allowExtraUsage: 1 }] });
+  assert.equal(remote.onExtraUsage(0), false);
+  assert.equal(remote.accounts[0].allowExtraUsage, false);
+});
+
+// The row is budgeted to the terminal cell (#228, #234); the tag is one more
+// column that budget has to know about.
+test('the extra-usage tag is drawn and never pushes a TUI row past the edge', async () => {
+  const { TUI } = await import('../src/tui.js');
+  const strip = s => s.replace(/\x1b\[[0-9;]*m/g, '');
+  const am = spentFleet([
+    oauth('plain@example.com'),
+    oauth('allowed@example.com', { allowExtraUsage: true }),
+    oauth('billing@example.com', { allowExtraUsage: true, priority: -1 }),
+  ]);
+  for (const a of am.accounts) {
+    setQuota(a, { unified5h: 0.4, unified5hReset: Date.now() + 3600_000, unified7dReset: Date.now() + 86400_000,
+      unified7dFable: 0.2, unified7dFableReset: Date.now() + 86400_000, spend: { enabled: true, usedMinor: 5 } });
+  }
+  quietly(() => am.getActiveAccount(null, OPUS));
+  assert.equal(am.onExtraUsage(2), true);
+  const tui = new TUI({
+    accountManager: am, config: { proxy: { port: 1 }, accounts: [], routes: [] }, sx: null,
+    saveConfig: async () => {}, syncAccounts: async () => 0, onQuit: () => {}, probeQuota: () => {},
+  });
+  const cols = Object.getOwnPropertyDescriptor(process.stdout, 'columns');
+  const rows = Object.getOwnPropertyDescriptor(process.stdout, 'rows');
+  try {
+    for (const w of [60, 70, 80, 100, 140]) {
+      Object.defineProperty(process.stdout, 'columns', { value: w, configurable: true });
+      Object.defineProperty(process.stdout, 'rows', { value: 40, configurable: true });
+      const drawn = [];
+      const real = tui._renderAcct.bind(tui);
+      tui._renderAcct = (...args) => { const out = real(...args); drawn.push(strip(out)); return out; };
+      tui._paint = () => {};
+      tui.running = true;
+      tui.render(true);
+      tui._renderAcct = real;
+      assert.ok(Math.max(...drawn.map(r => r.length)) <= w, `W=${w}`);
+      assert.ok(drawn.some(r => /xu!\s*$/.test(r)), `W=${w}: billing tag missing`);
+      assert.ok(drawn.some(r => /\bxu\s*$/.test(r)), `W=${w}: allowed tag missing`);
+    }
+  } finally {
+    if (cols) Object.defineProperty(process.stdout, 'columns', cols);
+    if (rows) Object.defineProperty(process.stdout, 'rows', rows);
+  }
+});

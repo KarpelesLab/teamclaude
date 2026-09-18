@@ -211,6 +211,10 @@ export function accountBadges(account, current, currentAccounts, now, fleetThres
   // or the comparison falls back to thresholdBadgeText's own 0.98 default.
   var thresholdText = thresholdBadgeText(a.switchThreshold, fleetThreshold, fleetThresholds);
   if (thresholdText) badges.push({ cls: 'meta threshold', text: thresholdText });
+  // Extra-usage fallback: one badge, the louder state winning. Strict `true`
+  // so a missing field on an older server's payload shows nothing.
+  if (a.onExtraUsage === true) badges.push({ cls: 'extra-usage billing', text: 'on extra usage \u2014 billing' });
+  else if (a.allowExtraUsage === true) badges.push({ cls: 'extra-usage', text: 'extra usage allowed' });
   return badges;
 }
 
@@ -517,6 +521,8 @@ const PAGE = `<!doctype html>
   .badge.meta { color: var(--dim); }
   .badge.sessions { color: var(--text); }
   .badge.sessions.known { color: var(--dim); }
+  .badge.extra-usage { color: var(--warn); border-color: var(--warn); }
+  .badge.extra-usage.billing { color: var(--bad); border-color: var(--bad); }
   .quota { display: grid; grid-template-columns: 64px 1fr 170px; gap: 8px; align-items: center; margin-top: 6px; }
   .quota .lbl { color: var(--dim); font-size: 12px; }
   .quota .val { color: var(--dim); font-size: 12px; text-align: right; font-variant-numeric: tabular-nums; }
