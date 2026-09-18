@@ -75,6 +75,7 @@ While the config is being rewritten — by the server rotating a refresh token, 
 | `accounts[].accountUuid` | Anthropic account (person) id; set automatically from the OAuth profile |
 | `accounts[].orgUuid` / `orgName` | Organization the account is scoped to — lets one email hold multiple org accounts |
 | `accounts[].priority` | Rotation preference, lower = preferred (default 0) |
+| `accounts[].displayOrder` | Where the account sits in the TUI's account list, lowest first; unset lists after every account that has one. **Display only** — it decides nothing about which account rotation spends, which is `priority` above. Set it from the TUI (**`g`** → **Reorder accounts**), or by hand; applied live on reload |
 | `accounts[].maxUsage` | Hard per-account usage cap: a number, or a per-bucket table like `{ "unified7d": 0.6, "unified7dFable": 0.8 }` (same keys as `switchThreshold`; `default` covers unlisted buckets, anything else is uncapped). At the cap the account receives **no** requests — rotation skips it, the all-exhausted revalidation probe skips it, and a pin gets the exhausted answer. Model-scoped like the thresholds, applied live on reload. See [Per-account usage caps](quota.md#per-account-usage-caps) |
 | `accounts[].disabled` | If `true`, the account is excluded from rotation until re-enabled |
 | `accounts[].upstream` | Alternative upstream base URL for this account (e.g. `https://api.deepseek.com/anthropic`). Overrides the global `upstream` for this account only — see [third-party backends](accounts.md#third-party-backend-accounts) |
