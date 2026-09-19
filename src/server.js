@@ -19,6 +19,7 @@ import { safeLine } from './safe-text.js';
 import { forwardRefusal, guardedLookup, FORBIDDEN_FORWARD } from './forward-target.js';
 import { renderDashboardHtml, dashboardCsp } from './dashboard.js';
 import { createUsageRecorder, resolveUsageDimensions, usageDimensionHeaderNames } from './client-usage.js';
+import { responsesEventUsage, isResponsesBody, normalizeResponsesUsage } from './responses-usage.js';
 import { classificationPath } from './classification-path.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
@@ -2780,7 +2781,11 @@ export async function streamResponse(webStream, res, accountIndex, accountManage
   let errored = false;
   // The message's usage, merged across its two reports and recorded once below.
   const merged = {};
-  const usage = createSseLineScanner(line => parseSSEDataLine(line, accountIndex, accountManager, onUsage, merged));
+  // A Responses turn settles both sides on ONE terminal event, so this stream
+  // remembers that it did — the incremental counters would book the turn again
+  // if a second terminal event arrived. See parseSSEDataLine.
+  const responsesTurn = { settled: false };
+  const usage = createSseLineScanner(line => parseSSEDataLine(line, accountIndex, accountManager, onUsage, merged, responsesTurn));
 
   try {
     while (true) {
@@ -2918,9 +2923,26 @@ export function createSseLineScanner(onLine, maxChars = SSE_MAX_LINE_CHARS) {
 // over. One record per message is what makes double counting unrepresentable
 // rather than merely avoided.
 //
-// Reads one `data:` line. Anthropic's events carry exactly one, so a line is an
-// event for this purpose, and the scanner above never has to hold more.
-function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, merged = null) {
+// A Responses stream (the Codex path) instead reports once, at the end, and in
+// OpenAI's own vocabulary — so it is rewritten into Anthropic's disjoint shape
+// before it reaches either counter (src/responses-usage.js explains why the two
+// disagree). It rides this function rather than a parser of its own because the
+// line is ALREADY parsed here: the branch costs a Set lookup on a string, not a
+// second pass over the stream. Nothing else would be cheap — a Responses stream
+// is mostly text deltas, and the settled figures arrive on one event near the end
+// with no header or marker to find it by.
+//
+// Reads one `data:` line. Both dialects carry exactly one per event, so a line
+// is an event for this purpose, and the scanner above never has to hold more.
+/**
+ * @param {string} line
+ * @param {number} accountIndex
+ * @param {any} accountManager
+ * @param {((inputTokens: number, outputTokens: number) => void)|null} [onUsage]
+ * @param {Record<string, any>|null} [merged]
+ * @param {{settled: boolean}|null} [responsesTurn] this stream's "already booked" flag
+ */
+function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, merged = null, responsesTurn = null) {
   if (!line.startsWith('data: ')) return;
 
   try {
@@ -2933,6 +2955,20 @@ function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, me
       accountManager.updateUsage(accountIndex, 0, data.usage.output_tokens);
       onUsage?.(0, data.usage.output_tokens || 0);
       if (merged) Object.assign(merged, data.usage);
+    } else if (!responsesTurn?.settled) {
+      // Both sides settle at once here, so unlike the Anthropic branches above
+      // this is a single incremental update rather than one per side — and it
+      // runs for the FIRST terminal event only. The event names bound what may
+      // report, not how often: a backend that re-sent `response.completed`, or a
+      // relay that replayed the tail of the stream, would otherwise add the
+      // whole turn to the account and per-client counters a second time.
+      const usage = responsesEventUsage(data);
+      if (usage) {
+        if (responsesTurn) responsesTurn.settled = true;
+        accountManager.updateUsage(accountIndex, usage.input_tokens, usage.output_tokens);
+        onUsage?.(usage.input_tokens, usage.output_tokens);
+        if (merged) Object.assign(merged, usage);
+      }
     }
   } catch {
     // not valid JSON, skip
@@ -2943,9 +2979,19 @@ function extractUsageFromBody(buffer, accountIndex, accountManager, onUsage = nu
   try {
     const json = JSON.parse(buffer.toString());
     if (json.usage) {
-      accountManager.updateUsage(accountIndex, json.usage.input_tokens, json.usage.output_tokens);
-      onUsage?.(json.usage.input_tokens || 0, json.usage.output_tokens || 0);
-      accountManager.recordTokenUsage(accountIndex, sessionId, model, json.usage);
+      // A buffered Responses body reports under the same two field NAMES with a
+      // different meaning, so reading it as Anthropic's would book the cached
+      // prefix as fresh input and never book it as a cache read at all. The
+      // discriminator picks the reading, and it picks once: a body that is NOT a
+      // Responses one falls through to the reading this had before, unchanged,
+      // while a body that is one but whose figures do not survive the normaliser
+      // (a negative, a NaN, nothing at all) books nothing. Falling back there
+      // would book exactly the number the normaliser exists to stop.
+      const usage = isResponsesBody(json) ? normalizeResponsesUsage(json.usage) : json.usage;
+      if (!usage) return;
+      accountManager.updateUsage(accountIndex, usage.input_tokens, usage.output_tokens);
+      onUsage?.(usage.input_tokens || 0, usage.output_tokens || 0);
+      accountManager.recordTokenUsage(accountIndex, sessionId, model, usage);
     }
   } catch {
     // not JSON or no usage
