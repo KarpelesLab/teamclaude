@@ -24,11 +24,6 @@ export const PROVIDERS = {
     // Anthropic pins the account inside the request body (metadata.user_id),
     // so the body rewrites apply here and only here.
     rewritesBody: true,
-    // Claude Code waits for the first response byte for as long as its own
-    // API_TIMEOUT_MS allows, which is generous. That is what lets the proxy
-    // pause and re-ask without the client ever learning that anything went
-    // wrong.
-    holdsConnection: true,
   },
   codex: {
     id: 'codex',
@@ -41,15 +36,6 @@ export const PROVIDERS = {
     // needed — and the Anthropic-specific tool-pair repair would be wrong to
     // apply to a Responses API body.
     rewritesBody: false,
-    // A Codex client does not wait on us: it gives the response head a fixed
-    // 60s and then retries the whole request itself. What disqualifies a hold
-    // here is not the arithmetic — 2s is well inside 60s — but the rule the
-    // arithmetic only illustrates: a hold is invisible only to a caller that
-    // outwaits it, and this one has said in its protocol that it will not.
-    // Held anyway, the attempt is one the client may already have walked away
-    // from, and the 429 it could have reported becomes a gap it cannot explain.
-    // Answer it instead and let it back off knowing why.
-    holdsConnection: false,
   },
 };
 
@@ -210,28 +196,6 @@ export function upstreamFor(account, configuredUpstream) {
   const provider = providerOf(account);
   if (provider !== DEFAULT_PROVIDER) return PROVIDERS[provider].upstream;
   return configuredUpstream || PROVIDERS.anthropic.upstream;
-}
-
-/**
- * Whether the proxy may hold a request on the connection — waiting before it
- * re-asks upstream — instead of answering the client now.
- *
- * A wait is only invisible to a client that waits longer than we do. That is a
- * property of the caller, and the request path is what we know about it: every
- * caller on the Codex path speaks the Codex protocol and brings that protocol's
- * fixed head deadline with it. Keyed on the provider rather than on the peer's
- * address, because a loopback peer does not narrow it — Claude Code is loopback
- * too.
- *
- * Unknown or missing providers hold, matching DEFAULT_PROVIDER: the safe answer
- * for a caller we cannot identify is the one every pre-Codex caller relied on.
- *
- * @param {string|null|undefined} provider
- * @returns {boolean}
- */
-export function holdsConnection(provider) {
-  const id = (provider && Object.hasOwn(PROVIDERS, provider)) ? provider : DEFAULT_PROVIDER;
-  return PROVIDERS[/** @type {keyof typeof PROVIDERS} */ (id)].holdsConnection;
 }
 
 /** Whether the Anthropic-only body rewrites apply to this account. */

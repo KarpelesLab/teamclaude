@@ -229,62 +229,28 @@ test('with no sibling, a headerless 429 gets one short retry and then reaches th
   });
 });
 
-// Both retries wait before re-asking, and that trade is only invisible to a
-// client that waits longer than we do. A Codex one does not: it gives the
-// response head a fixed 60s and then retries the whole request itself, so a
-// caller that will not wait must not be held at all. A Codex 429 carrying no
-// `x-codex-*` headers classifies as request-scoped, so it reaches both of these
-// gates by construction — which is what these two tests pin. Note the second is
-// a behaviour CHANGE, not just a wait withheld: the no-sibling retry used to
-// hold a Codex caller for 2s as well.
-
-const codexAccount = (name, port) => ({
-  name, type: 'oauth', provider: 'codex', accessToken: `t-${name}`, refreshToken: 'r',
-  expiresAt: Date.now() + HOUR, upstream: `http://127.0.0.1:${port}`,
-});
-
-/** One Codex request through the proxy, against an upstream that always 429s headerlessly. */
-async function codexRun(accounts) {
-  let hits = 0;
-  const upstream = http.createServer((_req, res) => {
-    hits++;
-    res.writeHead(429, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'Error' } }));
-  });
-  const upstreamPort = await listen(upstream);
-  const am = new AccountManager(
-    Array.from({ length: accounts }, (_unused, i) => codexAccount(`c${i}`, upstreamPort)),
-    0.98, { refreshFn: async () => { throw new Error('no refresh'); } },
-  );
-  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
-  const proxyPort = await listen(proxy);
+// A delay of 0 is the operator saying "do not retry": they would rather have
+// the 429 at once than have the transient absorbed. It has to switch off BOTH
+// retry sites, since one env var moves both — the hop still runs, because it
+// costs no wait, and nothing follows it.
+test('a retry delay of 0 disables the retry at both sites', async () => {
+  const restore = withRetryDelay(0);
   try {
-    const t0 = Date.now();
-    const res = await fetch(`http://127.0.0.1:${proxyPort}/backend-api/codex/responses`, {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'gpt-5-codex', input: [] }),
+    await withFleet(['a', 'b'], async ({ am, proxyPort, seen }) => {
+      const r = await post(proxyPort);
+      assert.equal(r.status, 429);
+      assert.deepEqual(seen, ['t-a', 't-b'], 'the hop, and no retry after it');
+      assert.equal(r.retryAfter, null, 'no fabricated retry-after');
+      assert.equal(paused(am, 0), false);
+      assert.equal(paused(am, 1), false);
     });
-    await res.text();
-    return { status: res.status, hits, ms: Date.now() - t0 };
-  } finally { proxy.close(); upstream.close(); }
-}
-
-// No env override here on purpose: the shipped 2s is what the elapsed time has
-// to rule out.
-test('a headerless Codex 429 is answered now, not retried after a wait', async () => {
-  const r = await codexRun(1);
-  assert.equal(r.status, 429);
-  assert.equal(r.hits, 1, 'the no-sibling retry must not run for a caller that will not wait');
-  assert.ok(r.ms < 1500, `answered in ${r.ms}ms; the retry would have added a 2s wait first`);
-});
-
-test('nor after the failover hop, with a sibling to hop to', async () => {
-  const r = await codexRun(2);
-  assert.equal(r.status, 429);
-  // The hop itself is fine — it costs no wait. What must not follow is the
-  // timed retry on top of it.
-  assert.ok(r.hits <= 2, `upstream saw ${r.hits} attempts; the hop may try twice, the timed retry must not make it three`);
-  assert.ok(r.ms < 1500, `answered in ${r.ms}ms; expected no 2s wait`);
+    await withFleet(['a'], async ({ proxyPort, seen }) => {
+      const r = await post(proxyPort);
+      assert.equal(r.status, 429);
+      assert.deepEqual(seen, ['t-a'], 'no sibling and no retry: asked once');
+      assert.ok(r.ms < 1500, `answered in ${r.ms}ms; the default would have waited 2s first`);
+    });
+  } finally { restore(); }
 });
 
 // The control: a 429 that carries rate-limit headers is still a throttle and
