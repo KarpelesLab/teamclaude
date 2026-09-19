@@ -64,6 +64,17 @@ const RATE_LIMIT_ABSORB_MAX_SECONDS =
   Number(process.env.TEAMCLAUDE_RATE_LIMIT_ABSORB_MAX_SECONDS) || 60;
 const OAUTH_ENTITLEMENT_ERROR_CODE = 'oauth_not_allowed_for_organization';
 const ERROR_BODY_INSPECTION_LIMIT = 64 * 1024;
+// How long an idle keep-alive connection is held open.
+//
+// Node's default is 5s, but a client's connection pool may hold the same socket
+// far longer, and whoever closes first wins: when the server does, the client
+// finds out only by writing to a socket that is already gone, which surfaces as
+// a request that fails in ~130ms with no upstream involvement. The Codex
+// sidecar is such a client — reqwest's pool_idle_timeout defaults to 90s and it
+// never overrides it — so outlive the longest pool and let the client always be
+// the one to close. headersTimeout bounds an in-progress request's headers, not
+// the idle gap between them (measured), so it is deliberately left alone.
+export const KEEP_ALIVE_TIMEOUT_MS = 120_000;
 
 /** Classify only the structured organization-policy denial observed upstream.
  * Message text and generic permission errors are deliberately not enough. */
@@ -472,11 +483,20 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
     }
   };
 
+  // Resolved per call, not captured. This server is built before `tui.start()`
+  // replaces `console.error` with the activity log, so handing a collaborator
+  // the function object binds the pre-TUI console — and everything the two
+  // below report (egress holds, CONNECT refusals, tunnel and MITM failures)
+  // happens at request time, long after the swap, on a terminal the alternate
+  // screen has already covered.
+  const logLine = (/** @type {string} */ line) => console.error(line);
+
   // Opt-in egress pin: null unless config.egress.pin is set, and then shared by
   // the base listener and the MITM one so both honour the same hold.
-  const egress = createEgressGuard(config, console.error);
+  const egress = createEgressGuard(config, logLine);
   const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, egress, clientUsage, dimensionUsage });
   const server = http.createServer(requestHandler);
+  server.keepAliveTimeout = KEEP_ALIVE_TIMEOUT_MS;
 
   // What bounds a directory of one-shot dumps is deleting the expired ones, not
   // rotating a growing file. Swept once at startup, because a backlog is usually
@@ -516,7 +536,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
     const c = await certsPromise;
     return { key: c.leafKeyPem, cert: c.leafCertPem };
   };
-  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks, log: console.error, sx, egress, clientUsage, dimensionUsage }));
+  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks, log: logLine, sx, egress, clientUsage, dimensionUsage }));
   // Remote Control's real-time channel is a WebSocket, not a request/response
   // call — Node fires 'upgrade' for that handshake, never 'request', so it
   // needs its own listener (base-URL routing path; the MITM path wires the
