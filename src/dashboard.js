@@ -15,7 +15,7 @@
 // operator/OAuth-derived, but they still never reach innerHTML.
 
 import { createHash } from 'node:crypto';
-import { UNAVAILABLE_TEXT } from './status-renderer.js';
+import { UNAVAILABLE_TEXT, RESET_CREDIT_MAX_AGE_MS } from './status-renderer.js';
 
 export function renderDashboardHtml() {
   return PAGE;
@@ -89,7 +89,13 @@ export function providerLabel(provider) {
   return provider || 'Unknown';
 }
 
-export function accountBadges(account, current, currentAccounts) {
+/**
+ * @param {Record<string, any>|null|undefined} account
+ * @param {string|null} [current]
+ * @param {Record<string, string>|null} [currentAccounts]
+ * @param {number} [now]  ms epoch a reset-credit reading's age is measured from
+ */
+export function accountBadges(account, current, currentAccounts, now) {
   var a = account || {};
   var isCurrent = currentAccounts
     ? currentAccounts[a.provider] === a.name
@@ -106,6 +112,18 @@ export function accountBadges(account, current, currentAccounts) {
   badges.push({ cls: status, text: status });
   if (recent) badges.push({ cls: 'sessions', text: recent + ' recent' });
   if (known > recent) badges.push({ cls: 'sessions known', text: known + ' known' });
+  // Free Codex rate-limit reset credits this account holds — what it could
+  // spend to undo an exhausted window rather than wait one out. The count is
+  // the account's holdings, not what upstream would apply this instant.
+  // A reading past RESET_CREDIT_MAX_AGE_MS is dropped, as it is on the status
+  // screen and the TUI row: only the usage probe refreshes the count, so an old
+  // one may describe a credit that has since been redeemed or has expired.
+  var reading = (a.quota || {}).resetCredits || {};
+  var credits = reading.available;
+  var stale = Number.isFinite(reading.seenAt) && (now == null ? Date.now() : now) - reading.seenAt > RESET_CREDIT_MAX_AGE_MS;
+  if (Number.isFinite(credits) && credits > 0 && !stale) {
+    badges.push({ cls: 'meta', text: credits + ' reset credit' + (credits === 1 ? '' : 's') });
+  }
   return badges;
 }
 
@@ -366,9 +384,10 @@ const SHARED_HELPERS = [
   switchRequest, switchOutcome, routeRows, problems,
 ].map(fn => fn.toString()).join('\n\n');
 
-// The threshold rides along: `problems` closes over it, so a page without it
-// would ReferenceError on first render.
-const SHARED_CONSTS = `var STARVED_MIN = ${STARVED_MIN};\nvar STARVED_LIST_MAX = ${STARVED_LIST_MAX};`;
+// The constants ride along: `problems` closes over the thresholds and
+// `accountBadges` over the reset-credit cut-off, so a page without them would
+// ReferenceError on first render.
+const SHARED_CONSTS = `var STARVED_MIN = ${STARVED_MIN};\nvar STARVED_LIST_MAX = ${STARVED_LIST_MAX};\nvar RESET_CREDIT_MAX_AGE_MS = ${RESET_CREDIT_MAX_AGE_MS};`;
 
 const PAGE = `<!doctype html>
 <html lang="en">

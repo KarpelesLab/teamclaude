@@ -62,6 +62,8 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
     if (why) lines.push(`  ${why}`);
     const spend = spendLine(account, paint);
     if (spend) lines.push(`  ${spend}`);
+    const resetCredits = resetCreditLine(account, paint, now);
+    if (resetCredits) lines.push(`  ${resetCredits}`);
     lines.push(`  ${paint.dim('Usage'.padEnd(8))} ${formatUsage(account.usage, now)}`);
     lines.push(`  ${paint.dim('Probe'.padEnd(8))} ${formatAccountProbe(nameText(account.name), probe, now, paint)}`);
     const adaptive = adaptiveFor(status, nameText(account.name));
@@ -165,6 +167,64 @@ export function spendLine(account, paint) {
     : spend.disabledReason ? `now off (${safeLine(spend.disabledReason, 64)})`
     : 'now off';
   return `${paint.dim('Spend'.padEnd(8))} ${paint.yellow(`${amount} spent this month, ${why}`)}`;
+}
+
+/**
+ * The free-reset-credit line, or null when this account holds none.
+ *
+ * Its own line rather than another bar: every bar above measures an allowance
+ * running down, while this counts something the account can spend to put one
+ * back. `applicable` is named alongside because a credit upstream would
+ * currently decline to apply is a different situation from one it would honour,
+ * and the count on its own reads the same either way.
+ *
+ * The reading's age rides along ("as of 3h ago"): the count is only refreshed
+ * by the usage probe, which is off by default, so how old it is says how much
+ * it is worth. Past RESET_CREDIT_MAX_AGE_MS the line is dropped altogether.
+ *
+ * @param {Record<string, any>|null|undefined} account  a row of the status payload
+ * @param {ReturnType<typeof colors>} paint
+ * @param {number} [now]  ms epoch the age is measured from
+ */
+export function resetCreditLine(account, paint, now = Date.now()) {
+  const credits = account?.quota?.resetCredits;
+  const available = heldResetCredits(account?.quota, now);
+  if (!available) return null;
+  const noun = `free rate-limit reset ${available === 1 ? 'credit' : 'credits'}`;
+  const notes = [];
+  if (credits.applicable === 0) notes.push('none applicable to a window right now');
+  if (Number.isFinite(credits.seenAt)) notes.push(`as of ${formatAgo(Math.min(credits.seenAt, now), now)}`);
+  const note = notes.length ? ` — ${notes.join(', ')}` : '';
+  return `${paint.dim('Reset'.padEnd(8))} ${paint.cyan(`${available} ${noun}`)}${paint.gray(note)}`;
+}
+
+// How long a reset-credit reading is worth showing. Nothing refreshes the count
+// but the usage probe, and the probe is off by default, so a credit that was
+// redeemed or expired would otherwise stay on screen indefinitely. A week is the
+// longest Codex window: past it, every window the credit could have reset has
+// reset on its own, and the reading describes a situation that is gone.
+export const RESET_CREDIT_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * How many reset credits to REPORT for this quota: the held count while the
+ * reading is fresh, 0 once it is older than RESET_CREDIT_MAX_AGE_MS or states
+ * no positive count. One rule for the status screen and the TUI row, so the two
+ * cannot disagree about whether a credit is there (the dashboard page applies
+ * the same cut-off in its own serialized helper).
+ *
+ * A reading with no `seenAt` is shown: its age is unknown rather than old, and
+ * every reading the proxy stores itself is stamped.
+ *
+ * @param {Record<string, any>|null|undefined} quota
+ * @param {number} [now]  ms epoch the age is measured from
+ * @returns {number}
+ */
+export function heldResetCredits(quota, now = Date.now()) {
+  const credits = quota?.resetCredits;
+  const available = credits?.available;
+  if (!Number.isFinite(available) || available <= 0) return 0;
+  if (Number.isFinite(credits.seenAt) && now - credits.seenAt > RESET_CREDIT_MAX_AGE_MS) return 0;
+  return available;
 }
 
 export function unavailableLine(account, paint) {
