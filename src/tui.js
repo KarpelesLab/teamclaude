@@ -466,6 +466,9 @@ export class TUI {
     this._setTimeout = setTimeout;
     this._origLog = null;
     this._origErr = null;
+    // Set once the terminal has reported a failure. Everything that would
+    // write to it checks this first.
+    this._stdoutDead = false;
   }
 
   // ── lifecycle ──────────────────────────────────────
@@ -511,17 +514,25 @@ export class TUI {
     // The other half of that bargain: a non-blocking write reports failure
     // asynchronously, as an 'error' event on the stream, and an unhandled one
     // becomes an uncaughtException that ends the process. So a terminal going
-    // away — a pane closed, a pty recreated — took the whole proxy with it:
-    // two EPIPE crashes, 2026-09-15 and 2026-09-16, both from this path, each
-    // leaving the sidecar orphaned on its port. A display may no more kill the
-    // proxy than block it. Record that stdout is gone and serve on without it.
-    this._stdoutErrorHandler = () => { this._stdoutBroken = true; };
+    // away — a pane closed, a pty recreated — took the whole proxy with it, and
+    // the hard exit skipped stop() and the state save. A display may no more
+    // kill the proxy than block it, so the failure is given somewhere to go
+    // before the first write. A handler left over from an earlier start() is
+    // dropped first: stop() can leave one attached (see there), and a second
+    // would log the same failure twice.
+    if (this._stdoutErrorHandler) process.stdout.removeListener('error', this._stdoutErrorHandler);
+    this._stdoutDead = false;
+    this._stdoutErrorHandler = (/** @type {any} */ err) => this._terminalGone('stdout', err);
     process.stdout.on('error', this._stdoutErrorHandler);
     process.stdout.write(`${ESC}?1049h${ESC}?25l`);
     process.stdin.setRawMode(true);
     process.stdin.resume();
     process.stdin.setEncoding('utf8');
     this._dataHandler = d => this._onData(d);
+    // The read side of the same terminal fails the same way (EIO once the pty
+    // is gone) and is just as fatal with nobody listening.
+    this._stdinErrorHandler = (/** @type {any} */ err) => this._terminalGone('stdin', err);
+    process.stdin.on('error', this._stdinErrorHandler);
     // A resize reflows the terminal itself, so the cached frame says nothing
     // about what is on screen — always repaint.
     this._resizeHandler = () => this.render({ force: true });
@@ -537,6 +548,32 @@ export class TUI {
     this._lastFrame = null;   // entering the alt screen always paints
     this.render();
     this._scheduleTick();
+  }
+
+  /**
+   * The terminal reported a failure on either of its streams: it is gone, and
+   * every later write would fail the same way.
+   *
+   * Said once, through the console.error saved before start() patched it — the
+   * patched one feeds the activity pane, which is the thing nobody can see any
+   * more. Once is enough: the stream stays dead and a line per failed write
+   * would say nothing new.
+   *
+   * The server keeps serving without a display; that a closed pane must not
+   * end every routed session is the whole point. An attach client is nothing
+   * but its display, so it quits.
+   * @param {'stdout' | 'stdin'} stream
+   * @param {any} err
+   */
+  _terminalGone(stream, err) {
+    if (this._stdoutDead) return;
+    this._stdoutDead = true;
+    const report = this._origErr || console.error;
+    report(`[TeamClaude] terminal lost (${stream}: ${err?.code || err?.message || err}); ` +
+      (this.remote ? 'closing the attach client' : 'the proxy keeps running without a display'));
+    // A failure that arrives after stop() — a write still queued when the
+    // operator quit — is only recorded: the exit is already under way.
+    if (this.remote && this.running) { this.stop(); this.onQuit?.(); }
   }
 
   /** Fast while something is animating, slow when there is nothing to animate. */
@@ -572,6 +609,7 @@ export class TUI {
     if (this._origLog) { console.log = this._origLog; console.error = this._origErr; }
     if (this._activityStream) { this._activityStream.end(); this._activityStream = null; }
     process.stdin.removeListener('data', this._dataHandler);
+    if (this._stdinErrorHandler) { process.stdin.removeListener('error', this._stdinErrorHandler); this._stdinErrorHandler = null; }
     process.stdout.removeListener('resize', this._resizeHandler);
     if (this._drainHandler) { process.stdout.removeListener('drain', this._drainHandler); this._drainHandler = null; }
     // Blocking again for the exit sequence: a non-blocking write can still be
@@ -579,18 +617,27 @@ export class TUI {
     // screen with no cursor is the one state an operator cannot recover
     // without knowing the escape by heart.
     this._setStdoutBlocking(true);
-    // Blocking again means a failed write throws here instead of arriving as
-    // an event, and a terminal that has already gone will fail. Restoring the
-    // screen is best-effort: there is nobody left to restore it for.
-    try { process.stdout.write(`${ESC}?25h${ESC}?1049l`); } catch { /* terminal already gone */ }
-    // The error listener stays. Flipping back to blocking does not make writes
-    // ALREADY QUEUED synchronous, so a paint still in flight can fail after
-    // this point, and shutdown() runs well past it — stopping the prober, the
-    // warmer and the sidecar, then awaiting a state save. An earlier version
-    // removed the listener here while claiming it outlived the write; it did
-    // not, and the proxy died of an unhandled EPIPE in exactly that window. It
-    // only sets a flag, so leaving it attached for the rest of the process
-    // costs nothing.
+    // Restoring the screen is best-effort, and skipped outright for a terminal
+    // already known to be gone: there is nobody left to restore it for.
+    //
+    // The stdout error listener is released only once this last write is
+    // confirmed. Flipping back to blocking does not make writes ALREADY QUEUED
+    // synchronous, and a failed write is reported as an event after this
+    // returns, while shutdown() is still stopping the prober and awaiting a
+    // state save. Removing the listener here unconditionally would hand that
+    // late EPIPE to nobody and end the process inside exactly that window.
+    // Writes complete in order, so a clean callback for this one means nothing
+    // the TUI wrote is still outstanding; on failure, or with the terminal
+    // already dead, the listener stays and keeps absorbing.
+    const guard = this._stdoutErrorHandler;
+    const release = (/** @type {any} */ err) => {
+      if (err || !guard || this._stdoutErrorHandler !== guard) return;
+      process.stdout.removeListener('error', guard);
+      this._stdoutErrorHandler = null;
+    };
+    if (!this._stdoutDead) {
+      try { process.stdout.write(`${ESC}?25h${ESC}?1049l`, release); } catch { /* terminal already gone */ }
+    }
     try { process.stdin.setRawMode(false); } catch {}
     process.stdin.pause();
   }
@@ -1405,6 +1452,9 @@ export class TUI {
 
   render({ force = false } = {}) {
     if (!this.running) return;
+    // Nobody can see it: composing a frame for a dead terminal every tick is
+    // work for nothing.
+    if (this._stdoutDead) return;
     // Guard against re-entry: clearing an expired quota logs, and _addLog calls
     // render() again — without this the nested call would render twice.
     if (this._rendering) return;
@@ -1425,7 +1475,7 @@ export class TUI {
     // stdout has already failed once: the terminal is gone, every further
     // write would fail the same way, and a stream that never drains would
     // strand the pending-paint handshake below. Serving continues blind.
-    if (this._stdoutBroken) return;
+    if (this._stdoutDead) return;
     const stale = Date.now() - (this._lastPaintAt || 0) >= FORCE_REPAINT_MS;
     if (!force && !stale && buf === this._lastFrame) return;
     // The terminal has not taken the previous frame yet. Painting anyway would
