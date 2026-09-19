@@ -72,6 +72,23 @@ export function isSubscriptionAccount(account) {
   return account?.type === 'oauth';
 }
 
+/**
+ * Whether `account` is a candidate for a request arriving on `provider`'s path.
+ *
+ * The partition above, stated as the predicate rather than as its complement,
+ * because two places need it and they must not drift: selection expresses it as
+ * an exclusion (`_excludeOtherProviders`), while the exhaustion report needs the
+ * set itself — how many accounts the request could ever have landed on, and
+ * whose windows may speak for when it becomes servable again.
+ *
+ * @param {Record<string, any>|null|undefined} account
+ * @param {string} provider
+ * @returns {boolean}
+ */
+export function canServeProvider(account, provider) {
+  return providerOf(account) === provider || !isSubscriptionAccount(account);
+}
+
 // The hosts each provider is reached on, for MITM interception.
 //
 // MITM is the mode that works without the client cooperating: a CLI that only
