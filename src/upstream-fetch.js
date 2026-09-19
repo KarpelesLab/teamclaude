@@ -101,14 +101,24 @@ const USE_GLOBAL_FETCH = /^(1|true|yes|on)$/i.test(process.env.TEAMCLAUDE_UPSTRE
 //
 // Default is generous (well above Claude's realistic first-byte, even when
 // queued or under load) so a slow-but-legitimate response is never mistaken for
-// a dead socket. Override with TEAMCLAUDE_UPSTREAM_HEADERS_TIMEOUT_MS (or
-// per-call opts).
-const DEFAULT_HEADERS_TIMEOUT_MS = 120_000;
+// a dead socket. It is the wait for a backend this module knows nothing about:
+// a caller that knows its own upstream is slower to the head says so with
+// `defaultHeadersTimeoutMs`, which is how the forward path applies the
+// provider's default (provider.js — a Codex response head is held open while
+// the model reasons). Order, most specific first: the per-call
+// `headersTimeoutMs`, then TEAMCLAUDE_UPSTREAM_HEADERS_TIMEOUT_MS (the
+// operator's fleet-wide override), then the caller's default, then this one.
+export const DEFAULT_HEADERS_TIMEOUT_MS = 120_000;
 
-function resolveHeadersTimeout(perCall) {
+/**
+ * @param {number|null|undefined} perCall
+ * @param {number|null|undefined} [fallbackMs]
+ * @returns {number}
+ */
+function resolveHeadersTimeout(perCall, fallbackMs) {
   if (perCall != null) return perCall;
   const env = Number(process.env.TEAMCLAUDE_UPSTREAM_HEADERS_TIMEOUT_MS);
-  return env > 0 ? env : DEFAULT_HEADERS_TIMEOUT_MS;
+  return env > 0 ? env : positiveInt(fallbackMs, DEFAULT_HEADERS_TIMEOUT_MS);
 }
 
 function headersTimeoutError(ms) {
@@ -122,9 +132,10 @@ function headersTimeoutError(ms) {
 // `useProxy` is decided by the caller (it varies per attempt — e.g. direct first,
 // then via sx after a 429). With it false, or sx unprovisioned, this is plain fetch
 // (plus the headers-timeout guard).
+/** @param {Record<string, any>} [opts] */
 export function upstreamFetch(url, opts = {}, sx = null, useProxy = false) {
-  const { headersTimeoutMs, queueTimeoutMs, ...fetchOpts } = opts;
-  const timeoutMs = resolveHeadersTimeout(headersTimeoutMs);
+  const { headersTimeoutMs, defaultHeadersTimeoutMs, queueTimeoutMs, ...fetchOpts } = opts;
+  const timeoutMs = resolveHeadersTimeout(headersTimeoutMs, defaultHeadersTimeoutMs);
   // The admission wait is a per-call option of the node:http paths only; the
   // global-fetch escape hatch is not gated (it has no socket pool to protect).
   const nodeOpts = queueTimeoutMs == null ? fetchOpts : { ...fetchOpts, queueTimeoutMs };

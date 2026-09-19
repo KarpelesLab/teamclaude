@@ -5,7 +5,7 @@ import { once } from 'node:events';
 import { ReadableStream } from 'node:stream/web';
 import { Writable } from 'node:stream';
 import { TextEncoder, TextDecoder } from 'node:util';
-import { upstreamFetch } from '../src/upstream-fetch.js';
+import { upstreamFetch, DEFAULT_HEADERS_TIMEOUT_MS } from '../src/upstream-fetch.js';
 import { readWithIdleTimeout, streamResponse } from '../src/server.js';
 
 // A client that leaves while the upstream is silent used to hold the pending
@@ -160,5 +160,69 @@ test('body watchdog does not fire when chunks keep arriving', async () => {
     assert.match(new TextDecoder().decode(r.value), /ok/);
   } finally {
     clearInterval(alive);
+  }
+});
+
+// The head deadline has four sources, and this is the order they settle in:
+// the per-call `headersTimeoutMs`, the operator's
+// TEAMCLAUDE_UPSTREAM_HEADERS_TIMEOUT_MS, the caller's
+// `defaultHeadersTimeoutMs` (the forward path passes the account provider's
+// own default there — Codex's head is held open while the model reasons), and
+// finally the fleet default below. The tests that follow pin that order, in
+// milliseconds rather than the real figures, so a wrong answer shows up as a
+// failure instead of a two-minute wait.
+test('the fleet default is two minutes, for any backend with no opinion', () => {
+  assert.equal(DEFAULT_HEADERS_TIMEOUT_MS, 120_000);
+});
+
+test('a caller default bounds the head wait when nothing overrides it', async () => {
+  const { server, port } = await listen(() => { /* never respond */ });
+
+  const start = Date.now();
+  await assert.rejects(
+    () => upstreamFetch(`http://127.0.0.1:${port}/`, { defaultHeadersTimeoutMs: 200 }),
+    (err) => err.code === 'TEAMCLAUDE_HEADERS_TIMEOUT',
+  );
+  const elapsed = Date.now() - start;
+  assert.ok(elapsed < 2000, `expected the caller default to apply, took ${elapsed}ms`);
+
+  server.close();
+});
+
+// A per-call timeout is the most specific thing anyone can say about one
+// request, so a caller default must never narrow it.
+test('a per-call headers timeout wins over the caller default', async () => {
+  const { server, port } = await listen(async (req, res) => {
+    await new Promise((r) => setTimeout(r, 200)); // head arrives past the 20ms default
+    res.writeHead(200);
+    res.end('ok');
+  });
+
+  const res = await upstreamFetch(`http://127.0.0.1:${port}/`, { headersTimeoutMs: 5000, defaultHeadersTimeoutMs: 20 });
+  assert.equal(res.status, 200);
+  assert.equal(await res.text(), 'ok');
+
+  server.close();
+});
+
+// The env var is the operator's fleet-wide say, so it outranks a default the
+// caller supplied — otherwise a provider default could not be brought back
+// down on a deployment that wants it shorter.
+test('the env override beats the caller default', async () => {
+  const prev = process.env.TEAMCLAUDE_UPSTREAM_HEADERS_TIMEOUT_MS;
+  process.env.TEAMCLAUDE_UPSTREAM_HEADERS_TIMEOUT_MS = '200';
+  const { server, port } = await listen(() => { /* never respond */ });
+  try {
+    const start = Date.now();
+    await assert.rejects(
+      () => upstreamFetch(`http://127.0.0.1:${port}/`, { defaultHeadersTimeoutMs: 60_000 }),
+      (err) => err.code === 'TEAMCLAUDE_HEADERS_TIMEOUT',
+    );
+    const elapsed = Date.now() - start;
+    assert.ok(elapsed < 2000, `expected the env override to apply, took ${elapsed}ms`);
+  } finally {
+    if (prev === undefined) delete process.env.TEAMCLAUDE_UPSTREAM_HEADERS_TIMEOUT_MS;
+    else process.env.TEAMCLAUDE_UPSTREAM_HEADERS_TIMEOUT_MS = prev;
+    server.close();
   }
 });

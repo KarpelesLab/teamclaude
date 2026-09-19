@@ -150,3 +150,40 @@ test('fetchCodexUsage preserves HTTP status for refresh-on-401', async () => {
   });
   assert.deepEqual(result, { error: 'HTTP 401', status: 401 });
 });
+
+// The free rate-limit reset credits ride on this very payload, so reporting
+// what an account holds costs no request of its own. Two counts, kept apart:
+// `available` is the holdings, `applicable` is upstream's view of how many
+// would reset a window right now.
+test('reset-credit counts are read from the usage payload', () => {
+  const usage = normalizeCodexUsagePayload({
+    ...payload,
+    rate_limit_reset_credits: { available_count: 1, applicable_available_count: 0 },
+  });
+  assert.deepEqual(usage.resetCredits, { available: 1, applicable: 0 });
+});
+
+test('a payload that mentions no reset credits reports none rather than zero', () => {
+  assert.equal(normalizeCodexUsagePayload(payload).resetCredits, null);
+  assert.equal(normalizeCodexUsagePayload({ rate_limit_reset_credits: { available_count: 'lots' } }).resetCredits, null);
+});
+
+test('an unstated applicable count is null, not zero', () => {
+  const usage = normalizeCodexUsagePayload({ rate_limit_reset_credits: { available_count: 2 } });
+  assert.deepEqual(usage.resetCredits, { available: 2, applicable: null });
+});
+
+// The count is drawn as `RC<n>` on a width-budgeted TUI row, and it comes from a
+// private endpoint: whatever arrives has to leave as a small whole number.
+test('reset-credit counts are truncated and capped at two digits', () => {
+  const read = (available_count, applicable_available_count) =>
+    normalizeCodexUsagePayload({ rate_limit_reset_credits: { available_count, applicable_available_count } }).resetCredits;
+  assert.deepEqual(read(1.9, 1.2), { available: 1, applicable: 1 });
+  assert.deepEqual(read(1e9, 250), { available: 99, applicable: 99 });
+  assert.deepEqual(read('3', '0'), { available: 3, applicable: 0 });
+  // Not a count at all: dropped, never clamped into one.
+  assert.equal(read(Infinity, 1), null);
+  assert.equal(read(NaN, 1), null);
+  assert.equal(read(-1, 1), null);
+  assert.deepEqual(read(2, Infinity), { available: 2, applicable: null });
+});

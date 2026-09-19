@@ -11,7 +11,7 @@ import {
 import { configIndexFor, managerAccountFor, markAccountRemoved } from './account-pairing.js';
 import { PROVIDERS, providerOf } from './provider.js';
 import { mintAccountId } from './account-id.js';
-import { formatPercent } from './status-renderer.js';
+import { formatPercent, heldResetCredits } from './status-renderer.js';
 import { resolveMaxUsage } from './model.js';
 import { parseProxyUrl, proxyToUrl, describeProxy, describeSelfProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy } from './upstream-proxy.js';
 import { sanitizeText, safeLine } from './safe-text.js';
@@ -249,6 +249,29 @@ export function spendTag(quota) {
   return (spend.usedMinor || 0) > 0 ? '$!' : '$';
 }
 
+/**
+ * Short row tag for an account holding free Codex rate-limit reset credits:
+ * `RC1` for one, `RC2` for two, '' for none. ASCII for the same reason spendTag
+ * is — the row is budgeted to the cell, and a glyph whose width varies by
+ * terminal pushes it past the edge.
+ *
+ * The number is what the account HOLDS. It is deliberately not the number that
+ * could be redeemed right now: only the account's own credit rows say whether a
+ * given credit is supported by the plan, and they cost a request nobody should
+ * make to draw a badge.
+ *
+ * A reading older than RESET_CREDIT_MAX_AGE_MS draws nothing: the row has no
+ * room to say how old the count is, so past the point where it stops being
+ * worth anything the honest tag is no tag.
+ *
+ * @param {Record<string, any>|null|undefined} quota
+ * @param {number} [now]  ms epoch the reading's age is measured from
+ */
+export function resetCreditTag(quota, now = Date.now()) {
+  const available = heldResetCredits(quota, now);
+  return available ? `RC${available}` : '';
+}
+
 export function blockedFamilies(quota, threshold) {
   const at = typeof threshold === 'function' ? threshold : () => threshold;
   const out = [];
@@ -360,9 +383,19 @@ export function bar(ratio, w = 10, resetTs, windowMs, threshold) {
   const f = Math.round(ratio * w);
   const { bg, fg } = barColor(ratio, resetTs, windowMs, threshold);
 
-  // Build the label to overlay: show reset time if available, else percentage
+  // Both fields when the bar is wide enough to hold them, `97% · 2h30m`, and
+  // the countdown alone when it is not: the countdown is what the width budget
+  // already treats as load-bearing (a row cut mid-bar "loses the reset countdown
+  // its tail carries", see the backstop in the row renderer), so the percentage
+  // is the field that yields. From BAR_MIN up the label is therefore one field
+  // entire or the other, never half of one — half a countdown reads as a
+  // different number, not a shorter one; below BAR_MIN the slice that follows
+  // still cuts it, as it did before. The other two quota readouts already draw
+  // both values in this order — the ` · ` between them is the dashboard's
+  // (src/dashboard.js).
   const pct = (ratio * 100).toFixed(0) + '%';
-  const label = rst || pct;
+  const both = rst ? `${pct} · ${rst}` : '';
+  const label = both && vw(both) <= w ? both : (rst || pct);
   const text = label.slice(0, w);
   const pad = w - text.length;
   const lp = Math.floor(pad / 2);
@@ -1831,6 +1864,10 @@ export class TUI {
     // the bars. Red once real money has moved, yellow while it only could.
     const money = spendTag(q);
     if (money) line += `  ${(money === '$!' ? red : yellow)(money)}`;
+    // Free reset credits sit beside the money tag: both report what this
+    // account holds in reserve rather than what it is currently spending.
+    const credits = resetCreditTag(q);
+    if (credits) line += `  ${cyan(credits)}`;
     return line;
   }
 
