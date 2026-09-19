@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   providerOf, providerForPath, applyAuthHeaders, upstreamFor, rewritesBody,
-  isKnownProvider, DEFAULT_PROVIDER,
+  isKnownProvider, holdsConnection, DEFAULT_PROVIDER,
 } from '../src/provider.js';
 
 // An account written before providers existed carries no `provider` field. It
@@ -110,4 +110,19 @@ test('the configured upstream applies to Anthropic only', () => {
 test('body rewrites are Anthropic-only', () => {
   assert.equal(rewritesBody({ type: 'oauth' }), true);
   assert.equal(rewritesBody({ provider: 'codex' }), false);
+});
+
+// Whether the proxy may make the client wait is a property of the client, and
+// the only thing it knows about the client is which protocol it speaks. An
+// unknown provider must hold, because that is what every caller predating the
+// Codex path relied on.
+test('only the provider whose client actually waits holds the connection', () => {
+  assert.equal(holdsConnection('anthropic'), true);
+  assert.equal(holdsConnection('codex'), false);
+  assert.equal(holdsConnection(undefined), true);
+  assert.equal(holdsConnection(null), true);
+  assert.equal(holdsConnection('nonsense'), true);
+  // Not a prototype lookup: `constructor` is on every object, and treating it
+  // as a provider would read `holdsConnection` off a function.
+  assert.equal(holdsConnection('constructor'), true);
 });
