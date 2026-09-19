@@ -1035,7 +1035,12 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // readout. Degrades to the session id when the body names no conversation.
       // Only when there is a session to narrow: with no session id there is no
       // pin either way, and digesting would walk a body for an answer nobody reads.
-      const conversation = sessionId ? conversationDigest(body) : null;
+      // And only for an Anthropic request: the path already says which provider
+      // this is, and a Codex Responses body carries `input`/`instructions` and
+      // no `messages`, so the walk could only ever come back empty-handed — after
+      // reading as far into a multi-megabyte body as its bound allows.
+      const provider = providerForPath(req.url);
+      const conversation = sessionId && provider === DEFAULT_PROVIDER ? conversationDigest(body) : null;
       const pinKey = pinKeyFor(sessionId, conversation);
 
       // Model blocklist (issue #116): reject a request for a blocked model right
@@ -1076,7 +1081,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // are dropped with the other proxy-control headers.
       const stripHeaders = usageDimensionHeaderNames(config.proxy);
 
-      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, provider: providerForPath(req.url), holdBudgetMs: holdMs, pinKey, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
+      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, provider, holdBudgetMs: holdMs, pinKey, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.

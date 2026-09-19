@@ -322,7 +322,9 @@ export class SessionTracker {
   recordOutcomeForSession(sessionId, usable, now = this._now()) {
     if (!sessionId) return 0;
     let touched = 0;
-    for (const [key, s] of [...this.sessions]) {
+    // Deleting the entry a Map iterator is on is defined behaviour, so the
+    // expired ones are dropped in place without copying the map first.
+    for (const [key, s] of this.sessions) {
       if (this._isExpired(s, now)) { this.sessions.delete(key); continue; }
       if (s.sessionId !== sessionId) continue;
       s.starved = usable ? 0 : s.starved + 1;

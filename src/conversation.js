@@ -58,12 +58,31 @@ import { createHash } from 'node:crypto';
 // pasted file — bodies are allowed up to 64 MiB, and `proxy.maxBodyBytes: 0`
 // lifts even that — and neither the scan nor the hash may scale with it, or the
 // cost of ROUTING a request would be set by how much the client pasted into it.
-// So the walk stops here too, not just the digest.
+// So the walk stops here too, not just the digest — this many bytes past the
+// start of the first message, wherever that start is. How far the walk may go
+// to FIND that start is the second bound, below.
 //
 // Two openings that agree over this much collide, which is the harmless case
 // above. Past the bound they collide whatever their length, since an opening
 // the scan never reached the end of has no length to tell them apart by.
 export const MAX_CONVERSATION_BYTES = 64 * 1024;
+
+// How far into a body the walk looks for the opening before giving up. The
+// bound above only starts counting once the first message has been found, and
+// on its own it leaves the other half open: a body with no top-level `messages`
+// at all, or with it behind megabytes of something else, would be walked byte
+// by byte to its end, in JS, on the event loop, on every request. So the search
+// is bounded too, and a body whose opening has not begun by here yields no
+// digest and routes on its session id alone — the same harmless fallback as a
+// body that names no conversation.
+//
+// Generous on purpose. What precedes the message list in a real request is the
+// model, a system prompt and the tool definitions, tens of kilobytes together;
+// a mebibyte is far past any of that, and still a fixed, small cost.
+//
+// Between them the two bounds cap the walk at MAX_SCAN_PREFIX_BYTES +
+// MAX_CONVERSATION_BYTES, whatever the size of the body.
+export const MAX_SCAN_PREFIX_BYTES = 1024 * 1024;
 
 // 132 bits of SHA-256. Long enough that a collision within one session's live
 // conversations is not a thing that happens, short enough to read in a log line
@@ -79,14 +98,17 @@ const WHITESPACE = new Set([0x20, 0x09, 0x0a, 0x0d]);
 
 /**
  * The byte range of the first element of the top-level `messages` array, or
- * null when the body has no such array or it is empty.
+ * null when the body has no such array, it is empty, or its first element has
+ * not begun within MAX_SCAN_PREFIX_BYTES.
  *
  * Scans rather than parses. The body is held whole by the time a request picks
  * an account, so this could call JSON.parse — but that materialises the entire
  * message list, tools and system prompt as objects on every request, to read
- * one slice of it. This walks the bytes to that slice and stops, allocating
- * nothing, and it cannot throw on a body that is not the JSON we expect: a
- * truncated or foreign body simply yields no range.
+ * one slice of it. This walks the bytes to that slice and stops, and it cannot
+ * throw on a body that is not the JSON we expect: a truncated or foreign body
+ * simply yields no range. The walk is bounded on both sides of the slice — at
+ * most MAX_SCAN_PREFIX_BYTES to reach it, at most MAX_CONVERSATION_BYTES
+ * through it — so its cost never follows the size of the body.
  *
  * Checked against JSON.parse over 40k generated bodies; they agree everywhere
  * but one, and it is deliberate. A body carrying the top-level key `messages`
@@ -130,6 +152,10 @@ function firstMessageRange(body) {
     // walk rather than by clamping the range at the end, because the point is
     // not to read the rest of it.
     if (start >= 0 && i - start >= MAX_CONVERSATION_BYTES) return [start, start + MAX_CONVERSATION_BYTES];
+    // And before the opening has begun, the search for it gives up. Without
+    // this a body that names no `messages` — or names it after megabytes of
+    // something else — is read to its last byte for a null.
+    if (start < 0 && i >= MAX_SCAN_PREFIX_BYTES) return null;
     const b = body[i];
 
     if (inString) {
@@ -165,9 +191,13 @@ function firstMessageRange(body) {
       case 0x7d:                                               // }
       case 0x5d:                                               // ]
         stack.pop(); depth--; key = null;
-        // Element 0 closing, either on its own `}` or on the `]` of a list that
-        // holds nothing else. The `]` is not part of the element; the `}` is.
-        if (start >= 0 && depth < arrayDepth) return upTo(b === 0x5d ? i : i + 1);
+        // The `]` of a list that holds nothing but element 0, which is not part
+        // of the element. An element's own `}` never lands here: it returns the
+        // depth TO arrayDepth, not below it, and the element then ends at the `,`
+        // or `]` that follows. Only the array's closer drops below, and in
+        // well-formed JSON that is a `]`; a stray `}` in its place is cut at the
+        // same byte rather than given an arm of its own.
+        if (start >= 0 && depth < arrayDepth) return upTo(i);
         if (depth === 0) return null;                          // root closed, no message list
         break;
       case 0x3a: awaitingKey = false; break;                   // :

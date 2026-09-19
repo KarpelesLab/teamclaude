@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { conversationDigest, pinKeyFor, MAX_CONVERSATION_BYTES } from '../src/conversation.js';
+import { conversationDigest, pinKeyFor, MAX_CONVERSATION_BYTES, MAX_SCAN_PREFIX_BYTES } from '../src/conversation.js';
 import { MAX_KEY_LENGTH, MAX_SESSION_ID_LENGTH } from '../src/session-tracker.js';
 
 const body = (o) => Buffer.from(typeof o === 'string' ? o : JSON.stringify(o), 'utf8');
@@ -130,23 +130,33 @@ test('a pretty-printed body is stable from its first turn to its second', () => 
 });
 
 test('a huge opening is bounded in what it costs to read', () => {
-  // The walk stops at the bound, so routing a request never costs more than
-  // this however much was pasted into its first message. Two openings that
-  // agree over the bound then collide, which is the harmless direction.
+  // The walk stops this far into the first message, however much was pasted
+  // into it. Two openings that agree over the bound then collide, which is the
+  // harmless direction.
   const huge = (tail) => digest({ messages: [{ role: 'user', content: 'x'.repeat(MAX_CONVERSATION_BYTES) + tail }] });
   assert.equal(huge('a'), huge('aa'));
   // Openings that differ INSIDE the bound are still told apart.
   assert.notEqual(huge('a'), digest({ messages: [{ role: 'user', content: 'y'.repeat(MAX_CONVERSATION_BYTES) }] }));
-  // And the cost is flat past it: 16x the bytes, nothing like 16x the time.
-  const time = (n) => {
-    const b = Buffer.from(JSON.stringify({ messages: [{ role: 'user', content: 'x'.repeat(n) }] }), 'utf8');
-    const t0 = process.hrtime.bigint();
-    for (let i = 0; i < 50; i++) conversationDigest(b);
-    return Number(process.hrtime.bigint() - t0);
-  };
-  const small = time(MAX_CONVERSATION_BYTES * 2);
-  const large = time(MAX_CONVERSATION_BYTES * 32);
-  assert.ok(large < small * 4, `cost grew with the paste: ${small} -> ${large}`);
+});
+
+test('a body with no message list is given up on, not read to its end', () => {
+  // Every Codex Responses request is this shape, and one can run to megabytes.
+  // Asserted on the answer rather than on a clock: the bound is what makes the
+  // walk cheap, and a timing check would only flake.
+  const big = body({ model: 'gpt-6', instructions: 'be nice', input: 'x'.repeat(4 * 1024 * 1024) });
+  assert.ok(big.length > MAX_SCAN_PREFIX_BYTES * 3);
+  assert.equal(conversationDigest(big), null);
+});
+
+test('a message list that opens past the search bound yields no digest', () => {
+  // The search for the opening is bounded as well as the opening itself, so a
+  // `messages` behind a mebibyte of something else is not found. Routing then
+  // falls back to the session id, which is the harmless direction.
+  const late = (pad) => digest({ model: 'claude-opus-5', system: 'x'.repeat(pad), messages: [{ role: 'user', content: 'go' }] });
+  assert.equal(late(MAX_SCAN_PREFIX_BYTES), null);
+  // Inside the bound the same opening is found, and keys as it does anywhere.
+  assert.notEqual(late(1024), null);
+  assert.equal(late(1024), digest({ messages: [{ role: 'user', content: 'go' }] }));
 });
 
 test('pinKeyFor narrows a session, and degrades to it', () => {
