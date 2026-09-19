@@ -1,7 +1,21 @@
-// Tracks Claude Code sessions by their `x-claude-code-session-id` header so
-// teamclaude can (a) report how many sessions are running and (b) optionally
-// keep each session pinned to one account while spreading NEW sessions across
-// accounts (the opt-in fix for concurrency funnelling — issue #109).
+// Tracks live CONVERSATIONS so teamclaude can (a) report what the fleet is
+// carrying and (b) optionally keep each conversation pinned to one account
+// while spreading NEW ones across accounts (the opt-in fix for concurrency
+// funnelling — issue #109).
+//
+// The key is a pin key, not a bare session id: a client's
+// `x-claude-code-session-id` narrowed to the conversation within it (see
+// conversation.js for how, and why). One Claude Code session emits one session
+// id for its own turns AND for every subagent it launches, so keying on that
+// header alone held a whole fan-out on one account — N concurrent requests
+// queueing behind one account's ceiling, for a prompt cache none of them
+// shared. A conversation is the thing that owns a cache, so it is the thing
+// that is pinned, counted as load, and spread.
+//
+// Each record carries the session id it belongs to, unnarrowed, so the readout
+// can still group and name what an operator recognises. Counts here are
+// therefore conversations: a session that fans out nine ways is nine of them,
+// which is also what its load on the fleet actually is.
 //
 // A session pins PER WEEKLY QUOTA BUCKET, not once overall. Quota and
 // eligibility are already decided per bucket — an account whose Fable weekly is
@@ -26,20 +40,30 @@ export const SESSION_ACTIVE_TTL_MS = 2 * 60 * 1000; // 2min idle → no longer "
 
 const SWEEP_INTERVAL_MS = 60 * 1000; // bound growth without an external timer
 
-// The session id is a client-supplied header, and every distinct value becomes
-// a Map key that lives for the known window. A client minting a fresh id per
-// request would otherwise grow this map for an hour with nothing to stop it, so
-// the tracker bounds itself: at most this many sessions (the idle ones go first
-// when the cap is hit — one still in flight is never dropped), and no key longer
-// than this. server.js validates the header too; this is the tracker's own guard.
+// A pin key is derived from client-supplied bytes — the session header and the
+// conversation's opening — and every distinct value becomes a Map key that lives
+// for the known window. A client minting a fresh session id per request, or one
+// rewriting its first message every turn, would otherwise grow this map for an
+// hour with nothing to stop it, so the tracker bounds itself: at most this many
+// conversations (the idle ones go first when the cap is hit — one still in
+// flight is never dropped), and no key longer than this.
+//
+// The cap counts conversations, so one client fanning out holds as many entries
+// as it has agents in flight rather than one. That is the quantity worth
+// bounding: the entries exist to hold a pin and a prompt cache each, and a
+// client with ten thousand live conversations has bigger problems than this map.
 export const MAX_SESSIONS = 10_000;
 export const MAX_SESSION_ID_LENGTH = 128;
+// The session id, the separator and the digest conversation.js appends. Bounded
+// rather than derived from that module so the tracker's own guard does not
+// depend on the caller it is guarding against.
+export const MAX_KEY_LENGTH = MAX_SESSION_ID_LENGTH + 1 + 22;
 
-// The Map key for a client-supplied id. Bounded here so every entry point keys
-// the same way and a long id cannot hold more memory than a short one.
-function keyOf(sessionId) {
-  if (typeof sessionId !== 'string' || sessionId.length <= MAX_SESSION_ID_LENGTH) return sessionId;
-  return sessionId.slice(0, MAX_SESSION_ID_LENGTH);
+// The Map key for a client-supplied pin key. Bounded here so every entry point
+// keys the same way and a long key cannot hold more memory than a short one.
+function keyOf(key) {
+  if (typeof key !== 'string' || key.length <= MAX_KEY_LENGTH) return key;
+  return key.slice(0, MAX_KEY_LENGTH);
 }
 
 // Per-session token totals, kept per weekly bucket rather than once per session.
@@ -272,6 +296,41 @@ export class SessionTracker {
     return s.starved;
   }
 
+  /**
+   * Record one client request's outcome against EVERY live conversation of a
+   * session, for the exits that refuse a request before its body is read: an
+   * unreachable egress, a dot-segment path, an unknown account pin. They can
+   * name the session that asked but not the conversation within it, because the
+   * conversation is named by a body nobody has read yet.
+   *
+   * Refusing them all is the honest reading rather than a convenient one: what
+   * those exits refuse is the SESSION's request, on grounds that have nothing to
+   * do with which of its conversations sent it — an egress that is not up is not
+   * up for any of them. Attributing it to one conversation would need a guess,
+   * and dropping it entirely would let a proxy refusing everything report that
+   * nothing is starving.
+   *
+   * Walks rather than keeping an index: these exits are rare, the map is bounded
+   * by MAX_SESSIONS, and a second map keyed by session id would need its own
+   * lifetime and its own sweep to stay in step with this one.
+   *
+   * @param {string|null} sessionId
+   * @param {boolean} usable
+   * @param {number} [now]
+   * @returns {number} how many conversations took the outcome
+   */
+  recordOutcomeForSession(sessionId, usable, now = this._now()) {
+    if (!sessionId) return 0;
+    let touched = 0;
+    for (const [key, s] of [...this.sessions]) {
+      if (this._isExpired(s, now)) { this.sessions.delete(key); continue; }
+      if (s.sessionId !== sessionId) continue;
+      s.starved = usable ? 0 : s.starved + 1;
+      touched += 1;
+    }
+    return touched;
+  }
+
   // A known, non-expired session's record, or null. Never creates one, and
   // drops an expired one on read like pinnedAccount does.
   _live(sessionId, now) {
@@ -306,7 +365,12 @@ export class SessionTracker {
         // monotonically — and no denominator is needed, which keeps `count`
         // (forward attempts, inflated by retries) out of the question entirely.
         starved: 0,
-        // Labels from the request that opened the session (see beginRequest).
+        // Labels from the request that opened the conversation (see
+        // beginRequest). `sessionId` is the client session this conversation is
+        // one of — what the readout groups by, and the only name of it an
+        // operator would recognise.
+        sessionId: null,
+        conversation: null,
         client: null,
         dimensions: null,
       };
@@ -629,6 +693,8 @@ function sessionItem(id, s, active) {
     starved: s.starved,
     firstSeen: s.firstSeen,
     lastSeen: s.lastSeen,
+    session: s.sessionId,
+    conversation: s.conversation,
     client: s.client,
     dimensions: s.dimensions ? { ...s.dimensions } : null,
     pins: Object.fromEntries([...s.pins].map(([bucket, p]) => [bucket, p.idx])),
@@ -645,6 +711,8 @@ function sessionItem(id, s, active) {
 function applyMetadata(s, metadata) {
   if (!metadata || typeof metadata !== 'object') return;
   if (typeof metadata.client === 'string' && metadata.client) s.client = metadata.client;
+  if (typeof metadata.sessionId === 'string' && metadata.sessionId) s.sessionId = metadata.sessionId;
+  if (typeof metadata.conversation === 'string' && metadata.conversation) s.conversation = metadata.conversation;
   const dims = metadata.dimensions;
   if (dims && typeof dims === 'object' && Object.keys(dims).length) {
     s.dimensions = { ...(s.dimensions || {}), ...dims };

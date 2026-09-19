@@ -75,15 +75,20 @@ test('account metadata and session state are separate badges', () => {
   ]);
 });
 
+// The shape the server emits: a row is one CONVERSATION, keyed by the pin key
+// routing uses, with the session it belongs to and the conversation's digest
+// beside it as separate labels.
 const SESSIONS = {
   items: [
     {
-      id: 's-old', client: 'bob', dimensions: { project: 'p2' }, active: false,
+      id: 's-old/conv-old-0123456789abc', session: 's-old', conversation: 'conv-old-0123456789abc',
+      client: 'bob', dimensions: { project: 'p2' }, active: false,
       requests: 2, lastSeen: 200, pins: { unified7d: 1 },
       tokens: { unified7d: { cacheRead: 5, cacheCreation: 1, input: 2, output: 1, context: 8 } },
     },
     {
-      id: 's-new', client: 'alice', dimensions: { project: 'p1' }, active: true,
+      id: 's-new/conv-new-0123456789abc', session: 's-new', conversation: 'conv-new-0123456789abc',
+      client: 'alice', dimensions: { project: 'p1' }, active: true,
       requests: 1, lastSeen: 100, pins: { unified7d: 0, unified7dFable: 1 },
       tokens: {
         unified7d: { cacheRead: 900, cacheCreation: 50, input: 10, output: 5, context: 960 },
@@ -93,36 +98,54 @@ const SESSIONS = {
   ],
 };
 
-test('a session row totals what the responses reported, cache included', () => {
+test('a conversation row totals what the responses reported, cache included', () => {
   const rows = sessionRows(SESSIONS);
-  const row = rows.find(r => r.id === 's-new');
-  // input+output alone would say 21 for a session that actually cost 971.
+  const row = rows.find(r => r.session === 's-new');
+  // input+output alone would say 21 for a conversation that actually cost 971.
   assert.equal(row.input + row.output, 21);
   assert.equal(row.total, 971);
   assert.equal(row.cacheRead, 900);
-  // Summed across every weekly bucket the session touched.
+  // Summed across every weekly bucket the conversation touched.
   assert.equal(row.context, 964);
-  // A session spending two model families is served by two accounts at once,
-  // which is why this is a pin map and not one index.
+  // A conversation spending two model families is served by two accounts at
+  // once, which is why this is a pin map and not one index.
   assert.equal(row.accounts, '0, 1');
   assert.equal(row.client, 'alice');
   assert.equal(row.project, 'p1');
 });
 
+test('a fan-out is one row per conversation, under the one session that owns them', () => {
+  // The rows of one client session are identical but for the conversation, so
+  // the session alone cannot tell them apart — and the key that can is a
+  // composite nobody recognises, so it is not what the table shows.
+  const rows = sessionRows({
+    items: [
+      { id: 'sess-7/aaaaaaaaaaaaaaaaaaaaaa', session: 'sess-7', conversation: 'aaaaaaaaaaaaaaaaaaaaaa', client: 'alice', pins: {}, tokens: {} },
+      { id: 'sess-7/bbbbbbbbbbbbbbbbbbbbbb', session: 'sess-7', conversation: 'bbbbbbbbbbbbbbbbbbbbbb', client: 'alice', pins: {}, tokens: {} },
+    ],
+  });
+  assert.deepEqual(rows.map(r => r.session), ['sess-7', 'sess-7']);
+  // Eight characters of the digest: enough to separate siblings, narrow enough
+  // for a column beside the session.
+  assert.deepEqual(rows.map(r => r.conversation), ['aaaaaaaa', 'bbbbbbbb']);
+});
+
 test('session rows tolerate a payload with nothing in it', () => {
   assert.deepEqual(sessionRows({}), []);
   assert.deepEqual(sessionRows(null), []);
+  // A record no request ever labelled (touch() alone) names no session, and
+  // falls back to the key it is filed under rather than rendering blank.
   const [bare] = sessionRows({ items: [{ id: 'x' }] });
   assert.deepEqual(
-    { id: bare.id, client: bare.client, project: bare.project, total: bare.total, accounts: bare.accounts },
-    { id: 'x', client: '', project: '', total: 0, accounts: '' },
+    { id: bare.id, session: bare.session, conversation: bare.conversation, client: bare.client, project: bare.project, total: bare.total, accounts: bare.accounts },
+    { id: 'x', session: 'x', conversation: '', client: '', project: '', total: 0, accounts: '' },
   );
 });
 
 test('filters narrow by project and client, and combine', () => {
   const rows = sessionRows(SESSIONS);
-  assert.deepEqual(filterSessionRows(rows, { project: 'p1' }).map(r => r.id), ['s-new']);
-  assert.deepEqual(filterSessionRows(rows, { client: 'bob' }).map(r => r.id), ['s-old']);
+  assert.deepEqual(filterSessionRows(rows, { project: 'p1' }).map(r => r.session), ['s-new']);
+  assert.deepEqual(filterSessionRows(rows, { client: 'bob' }).map(r => r.session), ['s-old']);
   assert.deepEqual(filterSessionRows(rows, { project: 'p1', client: 'bob' }), []);
   // An empty filter is "All", not a match against the empty string.
   assert.equal(filterSessionRows(rows, { project: '', client: '' }).length, 2);
@@ -131,12 +154,12 @@ test('filters narrow by project and client, and combine', () => {
 
 test('sorting handles both text and number columns, and does not mutate', () => {
   const rows = sessionRows(SESSIONS);
-  const before = rows.map(r => r.id);
-  assert.deepEqual(sortRows(rows, 'total', 'desc').map(r => r.id), ['s-new', 's-old']);
-  assert.deepEqual(sortRows(rows, 'total', 'asc').map(r => r.id), ['s-old', 's-new']);
-  assert.deepEqual(sortRows(rows, 'client', 'asc').map(r => r.id), ['s-new', 's-old']);
-  assert.deepEqual(sortRows(rows, 'client', 'desc').map(r => r.id), ['s-old', 's-new']);
-  assert.deepEqual(rows.map(r => r.id), before, 'the caller\'s array is untouched');
+  const before = rows.map(r => r.session);
+  assert.deepEqual(sortRows(rows, 'total', 'desc').map(r => r.session), ['s-new', 's-old']);
+  assert.deepEqual(sortRows(rows, 'total', 'asc').map(r => r.session), ['s-old', 's-new']);
+  assert.deepEqual(sortRows(rows, 'client', 'asc').map(r => r.session), ['s-new', 's-old']);
+  assert.deepEqual(sortRows(rows, 'client', 'desc').map(r => r.session), ['s-old', 's-new']);
+  assert.deepEqual(rows.map(r => r.session), before, 'the caller\'s array is untouched');
   assert.deepEqual(sortRows(null, 'total', 'desc'), []);
 });
 
@@ -349,10 +372,14 @@ function fleetStatus(mutate) {
   mutate?.(am);
   return am.getStatus({ sessionDetail: true });
 }
-/** Drive a session to `n` consecutive no-answer outcomes on a real tracker. */
-function starve(am, id, n, client = 'alice') {
+/**
+ * Drive a conversation to `n` consecutive no-answer outcomes on a real tracker.
+ * `id` is the pin key; `labels` carries the session and conversation names the
+ * request path attaches to it, which most cases here do not need.
+ */
+function starve(am, id, n, client = 'alice', labels = null) {
   for (let i = 0; i < n; i++) {
-    am.beginSession(id, { client, dimensions: {} });
+    am.beginSession(id, { client, dimensions: {}, ...labels });
     am.endSession(id, false);
   }
 }
@@ -378,6 +405,17 @@ test('a starving session is named, and a working one is not', () => {
   // A brand-new session, and a fleet doing nothing.
   assert.deepEqual(problems(fleetStatus(am => am.beginSession('fresh1234', { client: 'bob' }))), []);
   assert.deepEqual(problems(fleetStatus()), []);
+});
+
+test('a starving line names the session and the conversation, never the key', () => {
+  // A fan-out starves as a group, so lines carrying only the session would read
+  // as the same line repeated; the pin key that does separate them is a
+  // composite an operator has never seen and cannot look up.
+  const out = problems(fleetStatus(am => starve(am, 'deadbeef1234/AbCdEfGhIjKlMnOpQrStUv', STARVED_MIN, 'alice',
+    { sessionId: 'deadbeef1234', conversation: 'AbCdEfGhIjKlMnOpQrStUv' })));
+  assert.equal(out.length, 1);
+  assert.match(out[0].text, /alice's session deadbeef, conversation AbCdEfGh, has had/);
+  assert.doesNotMatch(out[0].text, /\//);
 });
 
 test('a session that starved and then went quiet stops being reported', () => {
