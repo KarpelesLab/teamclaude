@@ -12,13 +12,14 @@ import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
 import { TopLevelFieldFinder, modelGlobMatches } from './model.js';
 import { BodyWriter, truncationNote } from './request-log.js';
 import { upstreamFetch, upstreamPoolStatus } from './upstream-fetch.js';
-import { applyAuthHeaders, upstreamFor, rewritesBody, providerForPath, providerOf, isSubscriptionAccount, canServeProvider, DEFAULT_PROVIDER, PROVIDERS } from './provider.js';
+import { applyAuthHeaders, upstreamFor, rewritesBody, defaultHeadersTimeoutFor, providerForPath, providerOf, isSubscriptionAccount, canServeProvider, DEFAULT_PROVIDER, PROVIDERS } from './provider.js';
 import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
 import { safeLine } from './safe-text.js';
 import { forwardRefusal, guardedLookup, FORBIDDEN_FORWARD } from './forward-target.js';
 import { renderDashboardHtml, dashboardCsp } from './dashboard.js';
 import { createUsageRecorder, resolveUsageDimensions, usageDimensionHeaderNames } from './client-usage.js';
+import { responsesEventUsage, isResponsesBody, normalizeResponsesUsage } from './responses-usage.js';
 import { classificationPath } from './classification-path.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
@@ -63,6 +64,17 @@ const RATE_LIMIT_ABSORB_MAX_SECONDS =
   Number(process.env.TEAMCLAUDE_RATE_LIMIT_ABSORB_MAX_SECONDS) || 60;
 const OAUTH_ENTITLEMENT_ERROR_CODE = 'oauth_not_allowed_for_organization';
 const ERROR_BODY_INSPECTION_LIMIT = 64 * 1024;
+// How long an idle keep-alive connection is held open.
+//
+// Node's default is 5s, but a client's connection pool may hold the same socket
+// far longer, and whoever closes first wins: when the server does, the client
+// finds out only by writing to a socket that is already gone, which surfaces as
+// a request that fails in ~130ms with no upstream involvement. The Codex
+// sidecar is such a client — reqwest's pool_idle_timeout defaults to 90s and it
+// never overrides it — so outlive the longest pool and let the client always be
+// the one to close. headersTimeout bounds an in-progress request's headers, not
+// the idle gap between them (measured), so it is deliberately left alone.
+export const KEEP_ALIVE_TIMEOUT_MS = 120_000;
 
 /** Classify only the structured organization-policy denial observed upstream.
  * Message text and generic permission errors are deliberately not enough. */
@@ -471,11 +483,20 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
     }
   };
 
+  // Resolved per call, not captured. This server is built before `tui.start()`
+  // replaces `console.error` with the activity log, so handing a collaborator
+  // the function object binds the pre-TUI console — and everything the two
+  // below report (egress holds, CONNECT refusals, tunnel and MITM failures)
+  // happens at request time, long after the swap, on a terminal the alternate
+  // screen has already covered.
+  const logLine = (/** @type {string} */ line) => console.error(line);
+
   // Opt-in egress pin: null unless config.egress.pin is set, and then shared by
   // the base listener and the MITM one so both honour the same hold.
-  const egress = createEgressGuard(config, console.error);
+  const egress = createEgressGuard(config, logLine);
   const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, egress, clientUsage, dimensionUsage });
   const server = http.createServer(requestHandler);
+  server.keepAliveTimeout = KEEP_ALIVE_TIMEOUT_MS;
 
   // What bounds a directory of one-shot dumps is deleting the expired ones, not
   // rotating a growing file. Swept once at startup, because a backlog is usually
@@ -515,7 +536,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
     const c = await certsPromise;
     return { key: c.leafKeyPem, cert: c.leafCertPem };
   };
-  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks, log: console.error, sx, egress, clientUsage, dimensionUsage }));
+  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks, log: logLine, sx, egress, clientUsage, dimensionUsage }));
   // Remote Control's real-time channel is a WebSocket, not a request/response
   // call — Node fires 'upgrade' for that handshake, never 'request', so it
   // needs its own listener (base-URL routing path; the MITM path wires the
@@ -2340,6 +2361,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         // Cancels the admission wait and the request itself when the client
         // goes away (see the listener's AbortController).
         signal: ctx.signal,
+        // How long the head may stay silent before the socket is called dead,
+        // when the operator has set no override. It is the account's provider
+        // that knows: Codex reasons with the head held open, so its first byte
+        // arrives minutes in and a two-minute deadline would cut a healthy
+        // request — and the client would only re-send and reason again.
+        defaultHeadersTimeoutMs: defaultHeadersTimeoutFor(account),
         body: ['GET', 'HEAD'].includes(method) ? undefined : sendBody,
         redirect: 'manual',
       }, sx, route);
@@ -2871,7 +2898,11 @@ export async function streamResponse(webStream, res, accountIndex, accountManage
   let errored = false;
   // The message's usage, merged across its two reports and recorded once below.
   const merged = {};
-  const usage = createSseLineScanner(line => parseSSEDataLine(line, accountIndex, accountManager, onUsage, merged));
+  // A Responses turn settles both sides on ONE terminal event, so this stream
+  // remembers that it did — the incremental counters would book the turn again
+  // if a second terminal event arrived. See parseSSEDataLine.
+  const responsesTurn = { settled: false };
+  const usage = createSseLineScanner(line => parseSSEDataLine(line, accountIndex, accountManager, onUsage, merged, responsesTurn));
 
   try {
     while (true) {
@@ -3009,9 +3040,26 @@ export function createSseLineScanner(onLine, maxChars = SSE_MAX_LINE_CHARS) {
 // over. One record per message is what makes double counting unrepresentable
 // rather than merely avoided.
 //
-// Reads one `data:` line. Anthropic's events carry exactly one, so a line is an
-// event for this purpose, and the scanner above never has to hold more.
-function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, merged = null) {
+// A Responses stream (the Codex path) instead reports once, at the end, and in
+// OpenAI's own vocabulary — so it is rewritten into Anthropic's disjoint shape
+// before it reaches either counter (src/responses-usage.js explains why the two
+// disagree). It rides this function rather than a parser of its own because the
+// line is ALREADY parsed here: the branch costs a Set lookup on a string, not a
+// second pass over the stream. Nothing else would be cheap — a Responses stream
+// is mostly text deltas, and the settled figures arrive on one event near the end
+// with no header or marker to find it by.
+//
+// Reads one `data:` line. Both dialects carry exactly one per event, so a line
+// is an event for this purpose, and the scanner above never has to hold more.
+/**
+ * @param {string} line
+ * @param {number} accountIndex
+ * @param {any} accountManager
+ * @param {((inputTokens: number, outputTokens: number) => void)|null} [onUsage]
+ * @param {Record<string, any>|null} [merged]
+ * @param {{settled: boolean}|null} [responsesTurn] this stream's "already booked" flag
+ */
+function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, merged = null, responsesTurn = null) {
   if (!line.startsWith('data: ')) return;
 
   try {
@@ -3024,6 +3072,20 @@ function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, me
       accountManager.updateUsage(accountIndex, 0, data.usage.output_tokens);
       onUsage?.(0, data.usage.output_tokens || 0);
       if (merged) Object.assign(merged, data.usage);
+    } else if (!responsesTurn?.settled) {
+      // Both sides settle at once here, so unlike the Anthropic branches above
+      // this is a single incremental update rather than one per side — and it
+      // runs for the FIRST terminal event only. The event names bound what may
+      // report, not how often: a backend that re-sent `response.completed`, or a
+      // relay that replayed the tail of the stream, would otherwise add the
+      // whole turn to the account and per-client counters a second time.
+      const usage = responsesEventUsage(data);
+      if (usage) {
+        if (responsesTurn) responsesTurn.settled = true;
+        accountManager.updateUsage(accountIndex, usage.input_tokens, usage.output_tokens);
+        onUsage?.(usage.input_tokens, usage.output_tokens);
+        if (merged) Object.assign(merged, usage);
+      }
     }
   } catch {
     // not valid JSON, skip
@@ -3034,9 +3096,19 @@ function extractUsageFromBody(buffer, accountIndex, accountManager, onUsage = nu
   try {
     const json = JSON.parse(buffer.toString());
     if (json.usage) {
-      accountManager.updateUsage(accountIndex, json.usage.input_tokens, json.usage.output_tokens);
-      onUsage?.(json.usage.input_tokens || 0, json.usage.output_tokens || 0);
-      accountManager.recordTokenUsage(accountIndex, sessionId, model, json.usage);
+      // A buffered Responses body reports under the same two field NAMES with a
+      // different meaning, so reading it as Anthropic's would book the cached
+      // prefix as fresh input and never book it as a cache read at all. The
+      // discriminator picks the reading, and it picks once: a body that is NOT a
+      // Responses one falls through to the reading this had before, unchanged,
+      // while a body that is one but whose figures do not survive the normaliser
+      // (a negative, a NaN, nothing at all) books nothing. Falling back there
+      // would book exactly the number the normaliser exists to stop.
+      const usage = isResponsesBody(json) ? normalizeResponsesUsage(json.usage) : json.usage;
+      if (!usage) return;
+      accountManager.updateUsage(accountIndex, usage.input_tokens, usage.output_tokens);
+      onUsage?.(usage.input_tokens || 0, usage.output_tokens || 0);
+      accountManager.recordTokenUsage(accountIndex, sessionId, model, usage);
     }
   } catch {
     // not JSON or no usage
