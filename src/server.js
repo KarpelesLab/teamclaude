@@ -12,7 +12,7 @@ import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
 import { TopLevelFieldFinder, modelGlobMatches } from './model.js';
 import { BodyWriter, truncationNote } from './request-log.js';
 import { upstreamFetch, upstreamPoolStatus } from './upstream-fetch.js';
-import { applyAuthHeaders, upstreamFor, rewritesBody, providerForPath, providerOf, isSubscriptionAccount, DEFAULT_PROVIDER, PROVIDERS } from './provider.js';
+import { applyAuthHeaders, upstreamFor, rewritesBody, providerForPath, providerOf, isSubscriptionAccount, canServeProvider, DEFAULT_PROVIDER, PROVIDERS } from './provider.js';
 import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
 import { safeLine } from './safe-text.js';
@@ -1897,6 +1897,37 @@ export function isTransientUpstreamError(err, { otherHostAvailable = false } = {
 }
 
 /**
+ * The accounts this request could ever have landed on, disabled ones included.
+ *
+ * Both halves of the exhaustion answer — how many accounts ran out, and how long
+ * until one of them is back — used to be read off the whole fleet. On a mixed
+ * fleet that is the wrong pool twice over: a Codex request has no claim on the
+ * Anthropic subscriptions beside it, so neither their capacity nor their reset
+ * windows say anything about why it was refused.
+ *
+ * Eligibility here is only the two gates a request cannot argue with, the ones
+ * that hold however rotation goes: the provider partition (a Claude Max token
+ * and a ChatGPT token are each issued to one app and cannot be spent by the
+ * other) and the route/ownership rule that decides which accounts a model id may
+ * use at all. Everything else selection weighs — quota, throttles, priority,
+ * session affinity — is a reason an eligible account is unavailable RIGHT NOW,
+ * which is the very thing the caller is measuring; folding those in would leave
+ * an empty set and nothing to measure.
+ *
+ * Disabled accounts stay in, because the message counts them separately: they
+ * are the aside that says the fleet is smaller than the config looks.
+ *
+ * @param {import('./account-manager.js').AccountManager} accountManager
+ * @param {string|null|undefined} model
+ * @param {string|undefined} provider
+ * @returns {Record<string, any>[]}
+ */
+export function candidateAccounts(accountManager, model, provider) {
+  return (accountManager.accounts || []).filter(a =>
+    canServeProvider(a, provider || DEFAULT_PROVIDER) && accountManager._routeAllows(a, model));
+}
+
+/**
  * The message behind the synthetic 429, when no account can serve the request.
  *
  * The old wording — `All N accounts exhausted. Retry in 60s.` — was wrong in
@@ -1913,13 +1944,37 @@ export function isTransientUpstreamError(err, { otherHostAvailable = false } = {
  *
  * Counts only the accounts that were candidates, names the model when the
  * request carried one, and says plainly that the wait is until a window resets.
+ *
+ * "Candidates" was the word but not the behaviour: the count went on filtering
+ * the whole fleet by `disabled` alone, so a Codex request with three accounts to
+ * its name reported all twelve as being at their quota — nine of them Anthropic
+ * accounts it could never have used, and an operator reading that goes looking
+ * for a fleet-wide outage. The set now arrives from the caller, already narrowed
+ * (`candidateAccounts`), and is the same set the retry-after beside it was
+ * measured from, so the number and the wait cannot disagree about who was even
+ * asked.
+ *
+ * @param {Record<string, any>[]} candidates
+ * @param {string|null|undefined} model
+ * @param {number} retryAfter
+ * @returns {string}
  */
-export function exhaustedMessage(accountManager, model, retryAfter) {
-  const accounts = accountManager.accounts || [];
-  const eligible = accounts.filter(a => !a.disabled);
-  const disabled = accounts.length - eligible.length;
+export function exhaustedMessage(candidates, model, retryAfter) {
+  const eligible = candidates.filter(a => !a.disabled);
+  const disabled = candidates.length - eligible.length;
 
   const scope = model ? ` for ${model}` : '';
+  // No eligible account is not exhaustion. Nothing is going to reset, so a wait
+  // is the wrong advice and "all 0 accounts are at their quota" is the wrong
+  // sentence: either the operator disabled the ones that qualify, or none
+  // qualifies at all — a route's account list crossed with the provider
+  // partition, which leaves a route that looks healthy in `teamclaude status`
+  // and can serve nothing.
+  if (!eligible.length) {
+    return disabled
+      ? `No account can serve this request${scope}: every account eligible for it is disabled (${disabled}).`
+      : `No account can serve this request${scope}: no configured account is eligible for it — check the model's route and which provider its accounts belong to.`;
+  }
   const pool = eligible.length === 1 ? '1 account' : `${eligible.length} accounts`;
   const aside = disabled ? ` (${disabled} more disabled)` : '';
   const when = retryAfter > 0
@@ -2067,8 +2122,11 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     }
     ctx.status = 429;
     ctx.account = '(none available)';
-    const status = accountManager.getStatus();
-    const retryAfter = computeRetryAfter(status.accounts);
+    // Measured once and used twice: the accounts the message counts and the
+    // windows the retry-after is read from have to be the same accounts, or the
+    // two halves of one sentence contradict each other.
+    const candidates = candidateAccounts(accountManager, ctx.model, ctx.provider);
+    const retryAfter = computeRetryAfter(accountManager, candidates, ctx.model);
 
     // Long-hold mode: hold the HTTP connection and poll until an account
     // recovers or the budget (holdSeconds) runs out. Claude Code waits for
@@ -2102,7 +2160,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       type: 'error',
       error: {
         type: 'rate_limit_error',
-        message: exhaustedMessage(accountManager, ctx.model, retryAfter),
+        message: exhaustedMessage(candidates, ctx.model, retryAfter),
       },
     }));
     return;
@@ -3101,15 +3159,128 @@ export function rewriteModel(body, modelMap) {
   return body;
 }
 
-function computeRetryAfter(accounts) {
-  let soonest = Infinity;
-  for (const acct of accounts) {
-    const resets = [acct.rateLimitedUntil, acct.entitlementDeniedUntil, acct.quota.resetsAt]
-      .filter(Boolean);
-    for (const reset of resets) {
-      const ms = new Date(reset).getTime() - Date.now();
-      if (ms < soonest) soonest = ms;
+/**
+ * The resets that are actually holding `account` back, each read off the window
+ * that imposes it.
+ *
+ * The quota half is `_isNearQuota`'s gate — its checks, in its order, against
+ * the same `switchThreshold` — with one addition: every check hands back the
+ * reset belonging to the window it just tripped on. A bucket that is not
+ * blocking has no business naming the moment this request becomes servable
+ * again.
+ *
+ * Timestamps come back in whatever form the account holds them — epoch millis on
+ * the holds and the unified windows, a date string on `resetsAt`, which is kept
+ * as the header spelled it. `new Date` takes either, and the caller drops
+ * anything that will not parse or has already passed.
+ *
+ * @param {import('./account-manager.js').AccountManager} accountManager
+ * @param {Record<string, any>} account
+ * @param {string|null|undefined} model
+ * @returns {any[]}
+ */
+function blockingResets(accountManager, account, model) {
+  const q = account.quota || {};
+  /** @type {any[]} */
+  const resets = [account.rateLimitedUntil, account.entitlementDeniedUntil];
+
+  if (q.unified5h != null && q.unified5h >= accountManager.thresholdFor('unified5h')) {
+    resets.push(q.unified5hReset);
+  }
+
+  // The weekly gate, asked of `_governingWeekly` so the question is
+  // `_isNearQuota`'s verbatim, then resolved to a time by the buckets that gate
+  // is a maximum over: the one metering this model's family, the shared one its
+  // spend also meters into, and — for a family with no dedicated bucket — the
+  // scoped bucket upstream reports for it. EVERY bucket at or over the threshold
+  // contributes, because the account only frees when the LAST of them rolls.
+  // `modelRoutingLine` derives its recovery time by the same rule, for the same
+  // reason: naming the family reset beside a block the shared weekly produced
+  // tells the operator a week-long wait clears tomorrow.
+  const bucket = accountManager._weeklyBucketFor(model);
+  const weeklyThreshold = accountManager.thresholdFor(bucket);
+  const weekly = accountManager._governingWeekly(account, model);
+  if (weekly != null && weekly >= weeklyThreshold) {
+    if (q[bucket] != null && q[bucket] >= weeklyThreshold) resets.push(q[`${bucket}Reset`]);
+    if (bucket !== 'unified7d' && q.unified7d != null && q.unified7d >= weeklyThreshold) {
+      resets.push(q.unified7dReset);
     }
+    const scoped = bucket === 'unified7d' ? accountManager._scopedWeekly(account, model) : null;
+    if (scoped?.utilization != null && scoped.utilization >= weeklyThreshold) resets.push(scoped.resetAt);
+  }
+
+  // `resetsAt` is the tokens/requests clock (it is set from those headers), so
+  // it answers for those two gates and only while one of them binds. An API-key
+  // account throttled for a minute with most of its tokens left is not held
+  // until its next refill.
+  const tokens = q.tokensLimit != null && q.tokensRemaining != null
+    ? 1 - q.tokensRemaining / q.tokensLimit : null;
+  const requests = q.requestsLimit != null && q.requestsRemaining != null
+    ? 1 - q.requestsRemaining / q.requestsLimit : null;
+  if ((tokens != null && tokens >= accountManager.thresholdFor('tokens'))
+      || (requests != null && requests >= accountManager.thresholdFor('requests'))) {
+    resets.push(q.resetsAt);
+  }
+
+  return resets;
+}
+
+/**
+ * How long before this request is worth sending again: the seconds that become
+ * the synthetic 429's `retry-after`, which Claude Code obeys to the letter.
+ *
+ * It used to read three fields per account, and on a fleet of subscriptions all
+ * three are routinely null — `quota.resetsAt` is set from the tokens/requests
+ * headers an API key returns, and a subscription is metered by the unified
+ * windows instead. So an account sitting at `unified7d` 1.00 with three days to
+ * go looked like an account that knew nothing, every account did, and the
+ * function fell through to its 60s default. The client honoured that default
+ * forever: one silent retry a minute, a spinner, and no error ever reaching the
+ * operator.
+ *
+ * Two rules keep the number honest.
+ *
+ * A window may only speak for a block it is imposing (`blockingResets`). A
+ * 5-hour bucket at 12% that happens to refresh in four minutes is not why the
+ * request was refused, and letting it answer would put the client back in the
+ * one-minute loop wearing a different number.
+ *
+ * An account is blocked until the LAST of its blocks clears, so its own clocks
+ * are taken at their maximum, while the fleet recovers when the FIRST account
+ * does, so accounts are taken at their minimum. Mixing those up is how this
+ * failure survives a half-fix: a spent subscription is usually throttled as
+ * well, for the hour the 429 path clamps a relayed `retry-after` to, and reading
+ * the sooner of the two would advertise an hour on a window with three days left
+ * on it.
+ *
+ * Nothing known anywhere still means 60s. An account sidelined by a broken token
+ * or a transport error carries no clock at all, and there is no honest number to
+ * invent for it.
+ *
+ * Deliberately uncapped: the truthful value is the whole point, and a ceiling
+ * would rebuild the silent loop at whatever interval the ceiling was. Nothing
+ * downstream sleeps on it unbounded — the hold path clamps its own poll to 60s
+ * and the inline retry only fires under INLINE_RETRY_AFTER_MAX_SECONDS, both of
+ * which a multi-day value simply steps past. Exported for tests.
+ *
+ * @param {import('./account-manager.js').AccountManager} accountManager
+ * @param {Record<string, any>[]} candidates
+ * @param {string|null|undefined} [model]
+ * @returns {number}
+ */
+export function computeRetryAfter(accountManager, candidates, model = null) {
+  const now = Date.now();
+  let soonest = Infinity;
+  for (const acct of candidates) {
+    if (acct.disabled) continue;
+    let blockedFor = 0;
+    for (const reset of blockingResets(accountManager, acct, model)) {
+      const ms = new Date(reset).getTime() - now;
+      // Skips what will not parse (NaN fails both comparisons) and what has
+      // already lapsed: a hold that expired is not a hold.
+      if (ms > 0 && ms > blockedFor) blockedFor = ms;
+    }
+    if (blockedFor > 0 && blockedFor < soonest) soonest = blockedFor;
   }
   return soonest === Infinity ? 60 : Math.max(1, Math.ceil(soonest / 1000));
 }
