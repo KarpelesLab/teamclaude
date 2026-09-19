@@ -168,6 +168,35 @@ export function loopbackExempt(headers, remoteAddress, proxyConfig) {
 }
 
 /**
+ * Why the MCP endpoint refuses a request when the config holds no key at all,
+ * or null when it may be served. With a key configured this is always null:
+ * the key gate has already decided.
+ *
+ * Without one the key gate admits everybody, which is tolerable for forwarding
+ * on a private network and is not for tools that remove accounts. So the
+ * caller has to be on this machine, by the same test the loopback exemption
+ * uses — a loopback peer, no forwarding header, and `trustLoopback` not
+ * switched off. The Host check alone does not say that: it is there for
+ * browsers, and on a non-loopback bind anything that is not a browser can
+ * simply send `Host: localhost`. It is still asked, because a page rebound to
+ * 127.0.0.1 does arrive from loopback.
+ * @param {import('node:http').IncomingHttpHeaders} headers
+ * @param {string|undefined} remoteAddress
+ * @param {Record<string, any>|undefined} proxyConfig
+ * @returns {string|null}
+ */
+export function keylessMcpRefusal(headers, remoteAddress, proxyConfig) {
+  if (!resolveClientAuth(proxyConfig, undefined).ok) return null;
+  if (!loopbackExempt(headers, remoteAddress, proxyConfig)) {
+    return 'request refused: with no proxy key configured the MCP endpoint serves only this machine; set proxy.apiKey to reach it from elsewhere';
+  }
+  if (!isLocalHostHeader(headers.host ?? headers[':authority'], proxyConfig?.host)) {
+    return 'request refused: the Host header does not name this proxy';
+  }
+  return null;
+}
+
+/**
  * Which identity a presented key authenticates as, checked against the shared
  * `proxy.apiKey` and every `proxy.clientKeys` entry ({ name, key }).
  *
@@ -466,16 +495,17 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // MCP management endpoint — the tool-shaped face of this control plane,
       // off unless proxy.mcp says otherwise. The gates above are the same ones
       // the other /teamclaude/ routes pass, with one addition: a config with no
-      // key at all admits every caller as authenticated, which skips the
-      // rebinding check on key-less loopback requests — so it is asked here.
+      // key at all admits every caller as authenticated, from any address and
+      // without the rebinding check on key-less loopback requests — so
+      // keylessMcpRefusal asks both here.
       // A trailing slash and a query string are matched too: this URL is typed
       // into a client by hand, and a near miss would fall through to the
       // forwarder below with a fleet credential attached.
       if (/^\/teamclaude\/mcp\/?(\?|$)/.test(req.url || '')) {
-        if (resolveClientAuth(config.proxy, undefined).ok
-          && !isLocalHostHeader(req.headers.host ?? req.headers[':authority'], config.proxy?.host)) {
+        const refusal = keylessMcpRefusal(req.headers, req.socket.remoteAddress, config.proxy);
+        if (refusal) {
           res.writeHead(403, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: false, error: 'request refused: the Host header does not name this proxy' }));
+          res.end(JSON.stringify({ ok: false, error: refusal }));
           return;
         }
         await serveManagementMcp(req, res, { accountManager, config, hooks, client: req.tcClient, readBody: readControlBody });

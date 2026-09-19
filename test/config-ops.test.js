@@ -145,6 +145,27 @@ test('a route needs a name, a match and a known color', () => {
   assert.equal(config.routes, undefined);
 });
 
+// These strings are drawn on the operator's terminal as stored — the TUI prints
+// a route's name raw — so an escape sequence in one is a way to repaint it.
+test('a control character is refused in every string a route or the blocklist stores', () => {
+  const config = { accounts: [], blockedModels: ['kept'] };
+  const ok = { name: 'r', match: ['claude-*'] };
+  // ESC, a bare newline, DEL, and the 8-bit CSI that needs no ESC in front.
+  for (const bad of ['\x1b[2J', 'a\nb', 'a\x7f', '\x9b31m', 'trailing\n']) {
+    refused(() => upsertRoute(config, { ...ok, name: `opus${bad}` }), /route name must not contain control characters/);
+    refused(() => upsertRoute(config, { ...ok, match: ['fine', `x${bad}`] }), /route match glob must not contain control characters/);
+    refused(() => upsertRoute(config, { ...ok, accounts: [`a${bad}`] }), /route account must not contain control characters/);
+    refused(() => upsertRoute(config, { ...ok, bucket: `unified7d${bad}` }), /route bucket must not contain control characters/);
+    refused(() => setBlockedModels(config, ['fine', `gpt-${bad}`]), /blocked-model pattern must not contain control characters/);
+  }
+  assert.equal(config.routes, undefined, 'a refused route must not be stored');
+  assert.deepEqual(config.blockedModels, ['kept'], 'a refused blocklist must not be stored');
+
+  // Printable text outside ASCII is not a control character.
+  upsertRoute(config, { name: 'opus — équipe', match: ['claude-opus-*'] });
+  assert.equal(config.routes[0].name, 'opus — équipe');
+});
+
 test('removing a route that is not there is refused', () => {
   const config = { routes: [{ name: 'opus', match: ['x'] }] };
   refused(() => removeRoute(config, 'sonnet'), /Route "sonnet" not found/);

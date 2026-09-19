@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
-import { createProxyServer } from '../src/server.js';
+import { createProxyServer, keylessMcpRefusal } from '../src/server.js';
 
 // The MCP endpoint is one more control-plane route, so it has to sit behind
 // every gate the others sit behind — and, unlike them, it is off until the
@@ -175,6 +175,67 @@ test('with no key configured at all, the Host header still has to name this mach
 
     const local = await postWithHost(port, `localhost:${port}`, ping);
     assert.equal(local.status, 200);
+  });
+});
+
+// A config with no key admits everybody at the key gate. On a bind that is not
+// loopback, anything that is not a browser can write `Host: localhost` itself,
+// so the Host check cannot be what stands between the network and the tools.
+test('with no key configured at all, only this machine is served', async () => {
+  const localHost = { host: 'localhost:3456' };
+  for (const remote of ['192.168.1.20', '::ffff:10.0.0.5', '203.0.113.7', undefined]) {
+    assert.match(keylessMcpRefusal(localHost, remote, { mcp: 'full', host: '0.0.0.0' }), /no proxy key configured/, String(remote));
+  }
+  for (const remote of ['127.0.0.1', '::1', '::ffff:127.0.0.1']) {
+    assert.equal(keylessMcpRefusal(localHost, remote, { mcp: 'full' }), null, remote);
+  }
+  // A reverse proxy on this host makes every caller loopback-sourced.
+  assert.match(keylessMcpRefusal({ ...localHost, 'x-real-ip': '203.0.113.7' }, '127.0.0.1', { mcp: 'full' }), /no proxy key configured/);
+  // With the exemption switched off there is nothing left to tell callers apart by.
+  assert.match(keylessMcpRefusal(localHost, '127.0.0.1', { mcp: 'full', trustLoopback: false }), /no proxy key configured/);
+  // An entry with no name is not a usable key, so this config is key-less too.
+  assert.match(keylessMcpRefusal(localHost, '203.0.113.7', { mcp: 'full', clientKeys: [{ key: 'orphan' }] }), /no proxy key configured/);
+  // Once a key exists the key gate has decided, and this check stands aside.
+  assert.equal(keylessMcpRefusal(localHost, '203.0.113.7', { ...KEYED, mcp: 'full' }), null);
+
+  await withServer({ mcp: 'full' }, async ({ port }) => {
+    for (const header of ['X-Forwarded-For', 'X-Real-IP', 'Forwarded']) {
+      const res = await rpc(port, 'tools/list', undefined, { [header]: header === 'Forwarded' ? 'for=203.0.113.7' : '203.0.113.7' });
+      assert.equal(res.status, 403, header);
+      assert.match((await res.json()).error, /no proxy key configured/, header);
+    }
+    assert.equal((await rpc(port, 'tools/list')).status, 200);
+  });
+});
+
+// A client key is handed to whoever uses the fleet. Elsewhere in the control
+// plane it can switch, reload and probe; it must not become the right to delete
+// an account's credentials or to block a model for everyone.
+test('a named client key is served read-only even in full mode', async () => {
+  await withServer({ ...KEYED, mcp: 'full', trustLoopback: false }, async ({ port, am }) => {
+    const names = async headers => (await (await rpc(port, 'tools/list', undefined, headers)).json()).result.tools.map(t => t.name);
+
+    assert.deepEqual(await names({ 'x-api-key': CLIENT_KEY }), ['get_status', 'get_quota', 'get_settings']);
+    assert.ok((await names({ 'x-api-key': PROXY_KEY })).includes('remove_account'), 'the shared key keeps the write tools');
+
+    // Not merely unlisted: to this caller the write tools do not exist.
+    const before = am.accounts.map(a => a.name);
+    const res = await rpc(port, 'tools/call', { name: 'remove_account', arguments: { account: 'alice@example.com' } }, { 'x-api-key': CLIENT_KEY });
+    assert.equal(res.status, 200);
+    assert.equal((await res.json()).error.code, -32602);
+    assert.deepEqual(am.accounts.map(a => a.name), before);
+
+    const read = await rpc(port, 'tools/call', { name: 'get_settings', arguments: {} }, { 'x-api-key': CLIENT_KEY });
+    assert.equal((await read.json()).result.structuredContent.mcp, 'full');
+  });
+
+  // A caller on this machine that needed no key is the operator, and keeps full
+  // access; one that presents a client key anyway is served as that client.
+  await withServer({ ...KEYED, mcp: 'full' }, async ({ port }) => {
+    const list = await (await rpc(port, 'tools/list')).json();
+    assert.ok(list.result.tools.some(t => t.name === 'remove_account'));
+    const asClient = await (await rpc(port, 'tools/list', undefined, { 'x-api-key': CLIENT_KEY })).json();
+    assert.equal(asClient.result.tools.length, 3);
   });
 });
 

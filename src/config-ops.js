@@ -202,15 +202,35 @@ export function setDistribution(config, mode) {
   return changed;
 }
 
+// C0 and C1 control characters, ESC and the 8-bit CSI among them. These values
+// are drawn on a terminal as they are stored (the TUI prints a route's name
+// raw), so one that carries an escape sequence would let whoever set it
+// repaint or retitle the operator's screen.
+const CONTROL_CHARACTER = /[\x00-\x1f\x7f-\x9f]/;
+
+/**
+ * Refuse a string that carries a control character, naming the field it came in.
+ * @param {string} value
+ * @param {string} field
+ */
+function refuseControlCharacters(value, field) {
+  if (CONTROL_CHARACTER.test(value)) {
+    throw new ConfigOpError(`${field} must not contain control characters.`);
+  }
+}
+
 /**
  * @param {unknown} list
+ * @param {string} field what the list is, for the refusal of a control character
  * @returns {string[]|null} null when the value is not a list of non-empty strings
  */
-function stringList(list) {
+function stringList(list, field) {
   if (!Array.isArray(list)) return null;
   const out = [];
   for (const item of list) {
     if (typeof item !== 'string' || !item.trim()) return null;
+    // Before the trim: a stored value is never one the check did not see.
+    refuseControlCharacters(item, field);
     out.push(item.trim());
   }
   return out;
@@ -226,10 +246,11 @@ function stringList(list) {
  *   worth telling the caller about
  */
 export function upsertRoute(config, spec) {
+  if (typeof spec.name === 'string') refuseControlCharacters(spec.name, 'A route name');
   const name = typeof spec.name === 'string' ? spec.name.trim() : '';
-  const match = stringList(spec.match);
+  const match = stringList(spec.match, 'A route match glob');
   if (!name || !match?.length) throw new ConfigOpError('A route needs a name and at least one match glob.');
-  const accounts = spec.accounts == null ? [] : stringList(spec.accounts);
+  const accounts = spec.accounts == null ? [] : stringList(spec.accounts, 'A route account');
   if (!accounts) throw new ConfigOpError('Route accounts are a list of account names or indexes.');
   const color = typeof spec.color === 'string' && spec.color ? spec.color.toLowerCase() : null;
   if (color && !ROUTE_COLORS.includes(color)) {
@@ -239,7 +260,10 @@ export function upsertRoute(config, spec) {
   /** @type {Record<string, any>} */
   const route = { name, match };
   if (accounts.length) route.accounts = accounts;
-  if (typeof spec.bucket === 'string' && spec.bucket) route.bucket = spec.bucket;
+  if (typeof spec.bucket === 'string' && spec.bucket) {
+    refuseControlCharacters(spec.bucket, 'A route bucket');
+    route.bucket = spec.bucket;
+  }
   if (color) route.color = color;
 
   const known = new Set((config.accounts || []).map((/** @type {any} */ a) => a.name));
@@ -269,7 +293,7 @@ export function removeRoute(config, name) {
  */
 export function setBlockedModels(config, patterns) {
   if (!Array.isArray(patterns)) throw new ConfigOpError('Blocked models are a list of model patterns.');
-  const list = stringList(patterns);
+  const list = stringList(patterns, 'A blocked-model pattern');
   if (!list) throw new ConfigOpError('Each blocked-model pattern is a non-empty string.');
   config.blockedModels = [...new Set(list)];
 }

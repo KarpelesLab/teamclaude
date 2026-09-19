@@ -144,6 +144,21 @@ test('a headless server applies and saves what the write tools change', async ()
     const summary = await call(proxyPort, 'get_status');
     assert.deepEqual(summary.accounts.map(a => a.name), ['a@example.com', 'c@example.com']);
     assert.equal(summary.server.port, proxyPort);
+
+    // Deleting the whole proxy section takes `mcp` with it, and the reload has
+    // to read that as off rather than keep serving the mode it last saw.
+    const trimmed = await disk();
+    delete trimmed.proxy;
+    await writeFile(configPath, JSON.stringify(trimmed));
+    const closing = await fetch(`http://127.0.0.1:${proxyPort}/teamclaude/reload`, { method: 'POST' });
+    assert.equal(closing.status, 200);
+    const closed = await fetch(`http://127.0.0.1:${proxyPort}/teamclaude/mcp`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'ping' }),
+    });
+    assert.equal(closed.status, 404, 'a reload without a proxy section must close the endpoint');
+    await closed.arrayBuffer();
   } finally {
     await server.stop();
   }

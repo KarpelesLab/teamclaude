@@ -391,10 +391,13 @@ async function serverCommand() {
       // The shared key is read per request too, so a rotated key on disk
       // takes effect on reload the same way.
       config.proxy.apiKey = diskConfig.proxy.apiKey;
-      // The MCP endpoint's mode: read per request, so this is what opens,
-      // narrows or closes it without a restart.
-      config.proxy.mcp = diskConfig.proxy.mcp;
     }
+    // The MCP endpoint's mode: read per request, so this is what opens,
+    // narrows or closes it without a restart. Outside the guard above on
+    // purpose: an operator who deletes the whole `proxy` section has asked for
+    // the endpoint to be off as surely as one who deletes the key, and leaving
+    // the old mode in memory would keep it served.
+    if (config.proxy) config.proxy.mcp = diskConfig.proxy?.mcp;
     // Pick up route table edits (teamclaude route …, TUI editor, or a hand edit).
     config.routes = diskConfig.routes || [];
     accountManager.setRoutes(config.routes);
@@ -2089,8 +2092,9 @@ adds the tools that change them (switch, enable/disable, priority, remove,
 threshold, distribute, probe, warmup, routes, blocked models, client mode).
 Connect Claude Code with:
   claude mcp add --transport http teamclaude http://localhost:3456/teamclaude/mcp
-Same gates as the other /teamclaude/ routes, so in "full" mode every proxy key
-holder can reconfigure the fleet.
+Same gates as the other /teamclaude/ routes. A named client key is served
+read-only even in "full" mode: the write tools answer to the shared proxy key
+and to local callers. With no proxy key configured, only local callers are served.
 
 Upstream proxy. On a host with no direct route to the internet, set
 "upstreamProxy": "http://user:pass@host:3128" (or just "host:3128") and every

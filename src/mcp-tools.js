@@ -565,6 +565,23 @@ export function createToolSet(mode, ctx, { writeTimeoutMs = WRITE_TIMEOUT_MS } =
 }
 
 /**
+ * The mode one caller is served in. A named client key never gets more than
+ * 'read', whatever the config says: those keys are handed to the machines and
+ * people who use the fleet, and everywhere else in the control plane one can
+ * switch, reload and probe at most. The write tools go well past that —
+ * remove_account deletes credentials from disk, and a blocklist or a route can
+ * refuse service to everyone — so they stay with the operator: the shared
+ * `proxy.apiKey`, or a caller on this machine that needed no key. Both arrive
+ * here with no client name.
+ * @param {'read'|'full'} mode what `proxy.mcp` allows
+ * @param {string|null|undefined} client the name a client key authenticated as
+ * @returns {'read'|'full'}
+ */
+export function modeFor(mode, client) {
+  return client ? 'read' : mode;
+}
+
+/**
  * Serve /teamclaude/mcp. The caller has already passed the proxy's own gates.
  * @param {import('node:http').IncomingMessage} req
  * @param {import('node:http').ServerResponse} res
@@ -579,5 +596,5 @@ export async function serveManagementMcp(req, res, { readBody, ...ctx }) {
     res.end(JSON.stringify({ ok: false, error: 'the MCP endpoint is off; set proxy.mcp to "read" or "full" to serve it' }));
     return;
   }
-  await serveMcp(req, res, { readBody, tools: createToolSet(mode, ctx), serverInfo: SERVER_INFO, instructions: INSTRUCTIONS });
+  await serveMcp(req, res, { readBody, tools: createToolSet(modeFor(mode, ctx.client), ctx), serverInfo: SERVER_INFO, instructions: INSTRUCTIONS });
 }
