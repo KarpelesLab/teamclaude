@@ -99,6 +99,12 @@ const PERSISTED_QUOTA_FIELDS = [
   'unifiedStatus', 'unifiedStatusSeenAt',
   'tokensLimit', 'tokensRemaining', 'requestsLimit', 'requestsRemaining', 'resetsAt',
   'scopedWeekly',
+  // Codex free rate-limit reset credits, `{ available, applicable, seenAt }`.
+  // Worth persisting although it is not a quota: the usage probe is off by
+  // default, so without this a restart forgets that an account holds a credit
+  // until something next reads /wham/usage — and the row that says so is the
+  // only place an operator sees one at all.
+  'resetCredits',
 ];
 
 // The family (Fable/Sonnet) weekly buckets and the field holding when each was
@@ -109,6 +115,23 @@ const FAMILY_WEEKLY_BUCKETS = [
   { key: 'unified7dFable', label: 'Fable', usageKey: 'sevenDayFable' },
   { key: 'unified7dSonnet', label: 'Sonnet', usageKey: 'sevenDaySonnet' },
 ];
+
+/**
+ * The quota fields a Codex account only ever LEARNS — from a `/wham/usage`
+ * payload, or for `resetCredits` from the state restored off disk — so
+ * `emptyQuota` below does not seed them. Absent is meaningful for each: it says
+ * nothing has been read yet, which a seeded null would spell the same way as
+ * "read, and empty".
+ *
+ * Declared here so the one place that writes them can say so (`@type` on the
+ * local that holds the quota), rather than each one reading as a property that
+ * does not exist.
+ *
+ * @typedef {object} CodexLearnedQuota
+ * @property {string} [planType]  the Codex subscription tier
+ * @property {{available: number, applicable: number|null, seenAt: number}} [resetCredits]  free rate-limit reset credits held, and when that was last seen
+ * @property {Record<string, {name: string, utilization: number, resetAt: number|null, seenAt: number}>} [codexModelBuckets]  model-scoped weekly buckets, keyed by slug
+ */
 
 function emptyQuota() {
   return {
@@ -3592,6 +3615,9 @@ export class AccountManager {
   applyCodexUsageData(accountIndex, usage) {
     const account = this.accounts[accountIndex];
     if (!account || !usage || usage.error) return;
+    // The Codex-learned fields below are written here for the first time, so the
+    // empty-quota shape does not carry them. See CodexLearnedQuota.
+    /** @type {typeof account.quota & CodexLearnedQuota} */
     const q = account.quota;
     if (usage.fiveHour) {
       q.unified5h = usage.fiveHour.utilization;
@@ -3602,6 +3628,10 @@ export class AccountManager {
       q.unified7dReset = usage.sevenDay.resetAt ?? null;
     }
     if (usage.planType) q.planType = safeLine(usage.planType, 64);
+    // Stamped, because nothing else refreshes it: a payload that mentions no
+    // credits leaves the last reading alone rather than blanking it, so the
+    // age is the only thing that says how much the number is worth.
+    if (usage.resetCredits) q.resetCredits = { ...usage.resetCredits, seenAt: Date.now() };
     if (Array.isArray(usage.modelBuckets)) {
       q.codexModelBuckets = Object.fromEntries(usage.modelBuckets.slice(0, MAX_CODEX_MODEL_BUCKETS)
         .filter(bucket => bucket?.slug)

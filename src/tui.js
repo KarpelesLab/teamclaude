@@ -249,6 +249,24 @@ export function spendTag(quota) {
   return (spend.usedMinor || 0) > 0 ? '$!' : '$';
 }
 
+/**
+ * Short row tag for an account holding free Codex rate-limit reset credits:
+ * `RC1` for one, `RC2` for two, '' for none. ASCII for the same reason spendTag
+ * is — the row is budgeted to the cell, and a glyph whose width varies by
+ * terminal pushes it past the edge.
+ *
+ * The number is what the account HOLDS. It is deliberately not the number that
+ * could be redeemed right now: only the account's own credit rows say whether a
+ * given credit is supported by the plan, and they cost a request nobody should
+ * make to draw a badge.
+ *
+ * @param {Record<string, any>|null|undefined} quota
+ */
+export function resetCreditTag(quota) {
+  const available = quota?.resetCredits?.available;
+  return Number.isFinite(available) && available > 0 ? `RC${available}` : '';
+}
+
 export function blockedFamilies(quota, threshold) {
   const at = typeof threshold === 'function' ? threshold : () => threshold;
   const out = [];
@@ -1831,6 +1849,10 @@ export class TUI {
     // the bars. Red once real money has moved, yellow while it only could.
     const money = spendTag(q);
     if (money) line += `  ${(money === '$!' ? red : yellow)(money)}`;
+    // Free reset credits sit beside the money tag: both report what this
+    // account holds in reserve rather than what it is currently spending.
+    const credits = resetCreditTag(q);
+    if (credits) line += `  ${cyan(credits)}`;
     return line;
   }
 

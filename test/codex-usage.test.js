@@ -150,3 +150,25 @@ test('fetchCodexUsage preserves HTTP status for refresh-on-401', async () => {
   });
   assert.deepEqual(result, { error: 'HTTP 401', status: 401 });
 });
+
+// The free rate-limit reset credits ride on this very payload, so reporting
+// what an account holds costs no request of its own. Two counts, kept apart:
+// `available` is the holdings, `applicable` is upstream's view of how many
+// would reset a window right now.
+test('reset-credit counts are read from the usage payload', () => {
+  const usage = normalizeCodexUsagePayload({
+    ...payload,
+    rate_limit_reset_credits: { available_count: 1, applicable_available_count: 0 },
+  });
+  assert.deepEqual(usage.resetCredits, { available: 1, applicable: 0 });
+});
+
+test('a payload that mentions no reset credits reports none rather than zero', () => {
+  assert.equal(normalizeCodexUsagePayload(payload).resetCredits, null);
+  assert.equal(normalizeCodexUsagePayload({ rate_limit_reset_credits: { available_count: 'lots' } }).resetCredits, null);
+});
+
+test('an unstated applicable count is null, not zero', () => {
+  const usage = normalizeCodexUsagePayload({ rate_limit_reset_credits: { available_count: 2 } });
+  assert.deepEqual(usage.resetCredits, { available: 2, applicable: null });
+});
