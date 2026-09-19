@@ -152,6 +152,44 @@ test('the fleet is back when the first account is', () => {
   near(computeRetryAfter(am, am.accounts, 'claude-opus-5'), HOUR, 'the soonest account to recover was not used');
 });
 
+test('a candidate blocked by nothing with a clock still bounds the wait', () => {
+  // A is spent for three days. B is healthy, but this request already tried it
+  // and lost the connection, so it sits in the request's tried set — a refusal
+  // that lives on the request and leaves no timestamp on the account. B may
+  // well serve the retry, so the honest answer is the default minute. Letting
+  // an untimed account say nothing handed the whole answer to A: three days.
+  const am = new AccountManager([oauth('a'), oauth('b')], 0.98);
+  quota(am, 'a', { unified7d: 1, unified7dReset: Date.now() + 3 * DAY });
+  assert.equal(am.unavailableReason(am.accounts[1], 'claude-opus-5'), null,
+    'the fixture is meant to be an account only this request has given up on');
+  assert.equal(computeRetryAfter(am, am.accounts, 'claude-opus-5'), 60,
+    'a healthy account that dropped one connection was left out of the minimum');
+});
+
+test('an untimed upstream rejection bounds the wait the same way', () => {
+  // `unifiedStatus: rejected` takes the account out of rotation and names no
+  // moment at which it comes back.
+  const am = new AccountManager([oauth('a'), oauth('b')], 0.98);
+  quota(am, 'a', { unified7d: 1, unified7dReset: Date.now() + 3 * DAY });
+  quota(am, 'b', { unifiedStatus: 'rejected' });
+  assert.equal(computeRetryAfter(am, am.accounts, 'claude-opus-5'), 60);
+});
+
+test('an untimed candidate does not lengthen a wait that was already shorter', () => {
+  const am = new AccountManager([oauth('a'), oauth('b')], 0.98);
+  am.accounts[0].rateLimitedUntil = Date.now() + 20_000;
+  near(computeRetryAfter(am, am.accounts, 'claude-opus-5'), 20_000, 'the default replaced a sooner clock');
+});
+
+test('an account waiting on a re-login is not capacity about to return', () => {
+  // The one untimed state that does not clear by itself: counting it would put
+  // a fleet whose only other account is spent for days back in the 60s loop.
+  const am = new AccountManager([oauth('a'), oauth('b')], 0.98);
+  quota(am, 'a', { unified7d: 1, unified7dReset: Date.now() + 3 * DAY });
+  am.accounts[1].status = 'error';
+  near(computeRetryAfter(am, am.accounts, 'claude-opus-5'), 3 * DAY, 'a dead account shortened the wait');
+});
+
 test('a hold that has already expired is not a hold', () => {
   const am = new AccountManager([oauth('a')], 0.98);
   am.accounts[0].rateLimitedUntil = Date.now() - MINUTE;

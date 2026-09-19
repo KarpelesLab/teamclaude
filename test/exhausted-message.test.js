@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
-import { candidateAccounts, exhaustedMessage } from '../src/server.js';
+import { candidateAccounts, computeRetryAfter, exhaustedMessage, formatWait } from '../src/server.js';
 
 // `All 3 accounts exhausted. Retry in 60s.` was wrong three ways at once, and
 // each one sent the operator somewhere unhelpful (#168).
@@ -44,6 +44,42 @@ test('the wording does not contradict itself', () => {
   assert.doesNotMatch(msg, /exhausted/i);
   assert.match(msg, /quota or rate limit/i);
   assert.match(msg, /resets in 60s/i);
+});
+
+// The retry-after became the real window, which can be days. `resets in
+// 259200s` is a number the operator has to divide before it means anything.
+test('a long wait is written as a duration, a short one stays in seconds', () => {
+  assert.equal(formatWait(1), '1s');
+  assert.equal(formatWait(60), '60s');
+  assert.equal(formatWait(119), '119s', 'seconds run up to two minutes, matching the header by eye');
+  assert.equal(formatWait(120), '2m');
+  assert.equal(formatWait(12 * 60), '12m');
+  assert.equal(formatWait(3600), '1h');
+  assert.equal(formatWait(3 * 3600 + 12 * 60), '3h 12m');
+  assert.equal(formatWait(24 * 3600), '1d');
+  assert.equal(formatWait(2 * 86400 + 3 * 3600), '2d 3h');
+  assert.equal(formatWait(259200), '3d');
+});
+
+test('a wait is rounded up, never down, to the unit it is shown in', () => {
+  // The text must not promise capacity sooner than the retry-after header does.
+  assert.equal(formatWait(121), '3m');
+  assert.equal(formatWait(3 * 3600 + 11 * 60 + 1), '3h 12m');
+  assert.equal(formatWait(2 * 86400 + 2 * 3600 + 60), '2d 3h');
+  assert.equal(formatWait(59 * 60 + 1), '1h', 'rounding that crosses a unit moves to the next one');
+  assert.equal(formatWait(23 * 3600 + 59 * 60 + 1), '1d');
+});
+
+test('the message carries the readable wait for a fleet spent for days', () => {
+  const am = fleet(oauth('a'));
+  // Half an hour short of 2d 3h, so the rounded text holds however long the
+  // test takes to get from here to the computation.
+  am.accounts[0].quota.unified7d = 1;
+  am.accounts[0].quota.unified7dReset = Date.now() + (2 * 24 + 3) * 3600_000 - 30 * 60_000;
+  const retryAfter = computeRetryAfter(am, am.accounts, 'claude-opus-5');
+  const msg = said(am, 'claude-opus-5', retryAfter);
+  assert.match(msg, /resets in 2d 3h\./);
+  assert.doesNotMatch(msg, /\d{4,}s/, 'the raw second count leaked into the sentence');
 });
 
 test('singular reads correctly with one account', () => {

@@ -1928,6 +1928,39 @@ export function candidateAccounts(accountManager, model, provider) {
 }
 
 /**
+ * A wait in seconds, written the way a person would say it.
+ *
+ * The retry-after is now the real window, which can be days, and "resets in
+ * 259200s" makes the operator do the division before they learn whether to get
+ * a coffee or go home. Short waits stay in seconds, since that is the unit the
+ * header beside the message carries and the two are easy to match up by eye.
+ * Everything longer is rounded UP to the unit shown, so the text never promises
+ * capacity sooner than the header does.
+ *
+ * Not `formatDuration` from status-renderer.js: that one is private to the
+ * status view, packs its units together ("2d3h") for a narrow column, and
+ * leaves seconds at one minute. This is a sentence, not a column.
+ *
+ * @param {number} seconds
+ * @returns {string}
+ */
+export function formatWait(seconds) {
+  if (seconds < 120) return `${seconds}s`;
+  const minutes = Math.ceil(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  if (minutes < 24 * 60) {
+    const rest = minutes % 60;
+    const hours = Math.floor(minutes / 60);
+    return rest ? `${hours}h ${rest}m` : `${hours}h`;
+  }
+  // Past a day the minutes are noise, so they are folded up into the hour.
+  const hours = Math.ceil(minutes / 60);
+  const rest = hours % 24;
+  const days = Math.floor(hours / 24);
+  return rest ? `${days}d ${rest}h` : `${days}d`;
+}
+
+/**
  * The message behind the synthetic 429, when no account can serve the request.
  *
  * The old wording — `All N accounts exhausted. Retry in 60s.` — was wrong in
@@ -1978,7 +2011,7 @@ export function exhaustedMessage(candidates, model, retryAfter) {
   const pool = eligible.length === 1 ? '1 account' : `${eligible.length} accounts`;
   const aside = disabled ? ` (${disabled} more disabled)` : '';
   const when = retryAfter > 0
-    ? ` Quota resets in ${retryAfter}s.`
+    ? ` Quota resets in ${formatWait(retryAfter)}.`
     : ' Retry shortly.';
 
   return `No account can serve this request${scope}: all ${pool}${aside} are at their quota or rate limit.${when}`;
@@ -3225,6 +3258,10 @@ function blockingResets(accountManager, account, model) {
   return resets;
 }
 
+// What a block with no clock is worth: the interval the synthetic 429 always
+// fell back to, short enough that a transient fault is retried promptly.
+const UNTIMED_RETRY_AFTER_SECONDS = 60;
+
 /**
  * How long before this request is worth sending again: the seconds that become
  * the synthetic 429's `retry-after`, which Claude Code obeys to the letter.
@@ -3253,9 +3290,18 @@ function blockingResets(accountManager, account, model) {
  * the sooner of the two would advertise an hour on a window with three days left
  * on it.
  *
- * Nothing known anywhere still means 60s. An account sidelined by a broken token
- * or a transport error carries no clock at all, and there is no honest number to
- * invent for it.
+ * A candidate that is out of this request with NO clock still bounds the wait,
+ * at the old 60s default. Plenty of refusals carry no timestamp: an account this
+ * very request already tried and lost to a socket error, an upstream `rejected`
+ * verdict, an `exhausted` status, an operator cap, an advisor's spent bucket.
+ * Such an account may well serve the next attempt, so letting it contribute
+ * nothing hands the answer to whichever neighbour does have a clock — one
+ * account spent for three days beside a healthy one that just dropped a
+ * connection told the client to come back in three days, where it used to say a
+ * minute. Only accounts that will not come back on their own are left out: the
+ * disabled, and those in an error state waiting on a re-login. (An entitlement
+ * quarantine always has a clock, so it answers with that.) With nobody left to
+ * ask, the answer is still 60s.
  *
  * Deliberately uncapped: the truthful value is the whole point, and a ceiling
  * would rebuild the silent loop at whatever interval the ceiling was. Nothing
@@ -3272,7 +3318,7 @@ export function computeRetryAfter(accountManager, candidates, model = null) {
   const now = Date.now();
   let soonest = Infinity;
   for (const acct of candidates) {
-    if (acct.disabled) continue;
+    if (acct.disabled || acct.status === 'error') continue;
     let blockedFor = 0;
     for (const reset of blockingResets(accountManager, acct, model)) {
       const ms = new Date(reset).getTime() - now;
@@ -3280,7 +3326,12 @@ export function computeRetryAfter(accountManager, candidates, model = null) {
       // already lapsed: a hold that expired is not a hold.
       if (ms > 0 && ms > blockedFor) blockedFor = ms;
     }
-    if (blockedFor > 0 && blockedFor < soonest) soonest = blockedFor;
+    // No live clock means blocked by something untimed, which is worth a retry
+    // at the default interval rather than being silent in the minimum.
+    if (blockedFor <= 0) blockedFor = UNTIMED_RETRY_AFTER_SECONDS * 1000;
+    if (blockedFor < soonest) soonest = blockedFor;
   }
-  return soonest === Infinity ? 60 : Math.max(1, Math.ceil(soonest / 1000));
+  return soonest === Infinity
+    ? UNTIMED_RETRY_AFTER_SECONDS
+    : Math.max(1, Math.ceil(soonest / 1000));
 }
