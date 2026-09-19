@@ -111,15 +111,30 @@ function classify(windows) {
 }
 
 /**
+ * A parsed reading: the fields `account.quota` already uses, each present only
+ * when the headers stated it.
+ *
+ * @typedef {object} CodexQuota
+ * @property {number} [unified5h] Session-window utilization, 0-1.
+ * @property {number} [unified5hReset] When that window resets, ms epoch.
+ * @property {number} [unified7d] Weekly-window utilization, 0-1.
+ * @property {number} [unified7dReset] When that window resets, ms epoch.
+ * @property {{slug: string, name: string, utilization: number, resetAt: number|null}[]} [modelBuckets] Model-scoped weekly buckets.
+ */
+
+/**
  * Parse Codex rate-limit headers into the fields `account.quota` already uses.
  *
  * Returns only what the headers actually stated, so a caller can assign over
  * an existing quota without blanking readings this response did not mention.
  * An empty object means "this response carried no quota", which is normal:
  * the catalog fetch (`/models`) has none.
+ *
+ * @returns {CodexQuota}
  */
 export function parseCodexQuota(headers) {
   const families = collectFamilies(headers);
+  /** @type {CodexQuota} */
   const quota = {};
 
   const account = classify(families.get('')?.windows || {});
@@ -170,6 +185,52 @@ export function parseCodexQuota(headers) {
   }
 
   return quota;
+}
+
+/**
+ * Is a window at or past its limit?
+ *
+ * Readings are 0-1 fractions here, and the comparison is `>=` because upstream
+ * keeps counting once a window is past its limit: 104% arrives as 1.04. A
+ * window the headers did not state is not spent — `classify` has already
+ * dropped the unparseable and the zeroed.
+ *
+ * @param {number} [utilization]
+ */
+const isSpent = (utilization) => utilization != null && utilization >= 1;
+
+/**
+ * Which windows these headers report as spent — at or past their limit. Empty
+ * when none are, including when the response carried no Codex quota at all.
+ *
+ * Anthropic names a spent bucket outright, as `…-status: rejected`. This API
+ * publishes no status at all: it reports how much of each window is gone, and a
+ * window at its limit is the same fact in the other spelling. That distinction
+ * is what a 429 handler needs, because a spent window is durable — the account
+ * cannot serve again until the window resets, so waiting out `retry-after` and
+ * asking the SAME account again is futile, however momentary the 429 looked.
+ *
+ * Every family is read, not just the account-wide one. A subscription states
+ * its only 5-hour window inside a NAMED family (see parseCodexQuota), so the
+ * account-wide percentages alone would never show a spent session window; and a
+ * model-scoped weekly bucket is spent on its own terms, whatever the
+ * account-wide reading says.
+ *
+ * The labels name what is spent, for the log line that follows. A caller that
+ * only wants the verdict tests the length.
+ *
+ * @param {Record<string, string>} headers Rate-limit headers from the response.
+ * @returns {string[]} One label per spent window, e.g. `['weekly']`.
+ */
+export function codexSpentWindows(headers) {
+  const quota = parseCodexQuota(headers);
+  const spent = [];
+  if (isSpent(quota.unified5h)) spent.push('5h');
+  if (isSpent(quota.unified7d)) spent.push('weekly');
+  for (const bucket of quota.modelBuckets ?? []) {
+    if (isSpent(bucket.utilization)) spent.push(`${bucket.name} weekly`);
+  }
+  return spent;
 }
 
 /** The subscription plan upstream reports, for status output. Null when absent. */
