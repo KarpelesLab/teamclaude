@@ -128,7 +128,9 @@ An override shows up wherever the account itself does — `teamclaude status`, t
 
 A bare-number override reads `switch at 100%` instead. The TUI and the dashboard show the identical compact text as a trailing tag / badge on the account's own row or card, rather than a mark on the bar — unlike `maxUsage`, `switchThreshold` was never drawn as a percentage on the bar itself (only as the point past which the bar goes red), so there was no existing mark to extend.
 
-No CLI editor for this one, matching `maxUsage`: hand-edit the config and let a running server pick it up on reload, or restart.
+A bare number whose default matches the fleet's can still move a bucket, because it outranks the fleet's per-bucket entries: with a fleet `{ "default": 0.98, "unified7d": 0.85 }`, an account set to `0.98` rotates off the weekly bucket at 98%, not 85%, and is shown as `switch 7d 98%`.
+
+No CLI editor for this one, matching `maxUsage`: hand-edit the config and let a running server pick it up on reload, or restart. Values are ratios: a number must be above 0 and at most 1 (`1.0` is valid, `98` is not). An out-of-range or non-numeric entry is ignored, the account falls back to the fleet value for it, and one log line names the account and the field.
 
 ## Per-account usage caps
 

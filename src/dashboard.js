@@ -90,13 +90,16 @@ export function providerLabel(provider) {
 }
 
 // Every bucket switchThreshold can be keyed by, plus the short names the
-// threshold badge shows them under. Mirrors THRESHOLD_BUCKET_KEYS /
-// THRESHOLD_BUCKET_LABELS in model.js and status-renderer.js — duplicated
-// rather than imported, like every other pure function on this page: the
-// browser only ever runs what SHARED_HELPERS.toString()s in, never an import.
-var THRESHOLD_BUCKET_KEYS = ['unified5h', 'unified7d', 'unified7dSonnet', 'unified7dFable', 'tokens', 'requests'];
+// threshold badge shows them under. Mirrors THRESHOLD_BUCKET_KEYS in model.js
+// and THRESHOLD_BUCKET_LABELS in status-renderer.js — duplicated rather than
+// imported, because the browser never runs an import. It does not see this
+// module's scope either: a helper reaches the page as its own source text, so
+// these two are written into the page by SHARED_CONSTS below. Without that the
+// first table-form override throws a ReferenceError inside render() and takes
+// the accounts pane with it.
+export var THRESHOLD_BUCKET_KEYS = ['unified5h', 'unified7d', 'unified7dSonnet', 'unified7dFable', 'tokens', 'requests'];
 /** @type {Object<string, string>} */
-var THRESHOLD_BUCKET_LABELS = {
+export var THRESHOLD_BUCKET_LABELS = {
   unified5h: '5h', unified7d: '7d', unified7dSonnet: 'sonnet', unified7dFable: 'fable',
   tokens: 'tokens', requests: 'requests',
 };
@@ -125,15 +128,37 @@ export function thresholdBadgeText(accountThreshold, fleetThreshold, fleetThresh
   }
   /** @param {number} v */
   function pct(v) { return (Math.round(v * 1000) / 10) + '%'; }
+  /** @param {unknown} v */
+  function valid(v) { return typeof v === 'number' && isFinite(v); }
+  /** @type {string[]} */
   var parts = [];
-  if (typeof accountThreshold === 'number' && isFinite(accountThreshold)) {
+  /** @type {Object<string, any>} */
+  var table = {};
+  /** @type {any} */
+  var ownDefault = null;
+  if (typeof accountThreshold === 'number') {
+    if (!valid(accountThreshold)) return '';
+    ownDefault = accountThreshold;
     if (accountThreshold !== fleetFor('default')) parts.push('at ' + pct(accountThreshold));
   } else if (accountThreshold && typeof accountThreshold === 'object' && !Array.isArray(accountThreshold)) {
-    Object.keys(accountThreshold).forEach(function (key) {
-      var v = accountThreshold[key];
-      if (typeof v !== 'number' || !isFinite(v)) return;
+    table = accountThreshold;
+    ownDefault = table.default;
+    Object.keys(table).forEach(function (key) {
+      var v = table[key];
+      if (!valid(v)) return;
       if (key !== 'default' && THRESHOLD_BUCKET_KEYS.indexOf(key) === -1) return;
       if (v !== fleetFor(key)) parts.push((key === 'default' ? 'at' : (THRESHOLD_BUCKET_LABELS[key] || key)) + ' ' + pct(v));
+    });
+  }
+  // As switchThresholdDiffs in model.js: the account's own default outranks a
+  // bucket entry in the FLEET table, so a default equal to the fleet's can
+  // still move a bucket the fleet names (fleet 7d at 85%, account 0.98 puts
+  // that account's 7d at 98%). When the defaults differ, "at N%" already
+  // covers every bucket the account does not list.
+  if (valid(ownDefault) && ownDefault === fleetFor('default')) {
+    THRESHOLD_BUCKET_KEYS.forEach(function (key) {
+      if (valid(table[key])) return;
+      if (ownDefault !== fleetFor(key)) parts.push(THRESHOLD_BUCKET_LABELS[key] + ' ' + pct(ownDefault));
     });
   }
   return parts.length ? 'switch ' + parts.join(', ') : '';
@@ -410,8 +435,15 @@ const SHARED_HELPERS = [
 ].map(fn => fn.toString()).join('\n\n');
 
 // The threshold rides along: `problems` closes over it, so a page without it
-// would ReferenceError on first render.
-const SHARED_CONSTS = `var STARVED_MIN = ${STARVED_MIN};\nvar STARVED_LIST_MAX = ${STARVED_LIST_MAX};`;
+// would ReferenceError on first render. The same goes for the two tables
+// `thresholdBadgeText` reads. They follow the STARVED pair so the page's
+// constants stay in one block ahead of the helpers that use them.
+const SHARED_CONSTS = [
+  `var STARVED_MIN = ${STARVED_MIN};`,
+  `var STARVED_LIST_MAX = ${STARVED_LIST_MAX};`,
+  `var THRESHOLD_BUCKET_KEYS = ${JSON.stringify(THRESHOLD_BUCKET_KEYS)};`,
+  `var THRESHOLD_BUCKET_LABELS = ${JSON.stringify(THRESHOLD_BUCKET_LABELS)};`,
+].join('\n');
 
 const PAGE = `<!doctype html>
 <html lang="en">

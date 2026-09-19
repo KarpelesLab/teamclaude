@@ -3,7 +3,7 @@ import { providerOf, DEFAULT_PROVIDER, isSubscriptionAccount } from './provider.
 import { refreshCodexToken } from './codex-auth.js';
 import { parseCodexQuota, parseCodexPlanType } from './codex-quota.js';
 import { sameIdentity } from './identity.js';
-import { weeklyBucketForModel, modelGlobMatches, modelFamily, gatingUtilization, resolveMaxUsage, resolveSwitchThreshold, WEEKLY_BUCKET_KEYS } from './model.js';
+import { weeklyBucketForModel, modelGlobMatches, modelFamily, gatingUtilization, resolveMaxUsage, resolveSwitchThreshold, sanitizeSwitchThreshold, WEEKLY_BUCKET_KEYS } from './model.js';
 import { SessionTracker } from './session-tracker.js';
 import { buildQuotaSummary, quotaTier } from './quota-summary.js';
 import { ROLLOVER_MIN_JUMP_MS, remapHeld, findHeld, dropHeld, newObservation } from './rollover.js';
@@ -157,6 +157,24 @@ function copyBuckets(byBucket) {
   return out;
 }
 
+/**
+ * The per-account switchThreshold an account will actually gate on: the config
+ * entry's value with anything outside (0, 1] dropped, and one line telling the
+ * operator what was dropped. The constructor and the config reload both come
+ * through here so a value refused at startup is refused on reload too. Without
+ * the line a `98` typed for 98% would silently hold the account in rotation
+ * until it hit the upstream wall, with every display showing it as configured.
+ * @param {Record<string, any>} acct
+ * @returns {number|Object<string, number>|null}
+ */
+export function accountSwitchThreshold(acct) {
+  const { value, rejected } = sanitizeSwitchThreshold(acct?.switchThreshold);
+  if (rejected.length) {
+    console.log(`[TeamClaude] Account "${safeLine(acct?.name, 64)}": ignoring ${safeLine(rejected.join(', '), 160)} — a switch threshold must be a number above 0 and at most 1 (0.98 means 98%)`);
+  }
+  return value;
+}
+
 // Build a fresh in-memory account record from a config/disk account object.
 // Shared by the constructor and addAccount() so the field set can never drift
 // between startup accounts and runtime-added ones (a divergence here once left
@@ -191,7 +209,7 @@ function makeAccount(acct, index) {
     // Per-account switchThreshold override (issue #409) — a rotation
     // PREFERENCE like the fleet setting, not the hard cap maxUsage is. See
     // thresholdFor() for the resolution order.
-    switchThreshold: acct.switchThreshold ?? null,
+    switchThreshold: accountSwitchThreshold(acct),
     upstream: acct.upstream || null,
     modelMap: acct.modelMap || null,
     // Fields to drop from request bodies for this account (third-party upstreams
@@ -463,17 +481,6 @@ export class AccountManager {
    * places that show one (status header, TUI settings row). */
   get effectiveThreshold() {
     return this.thresholdFor('default');
-  }
-
-  /** As `effectiveThreshold`, but for one account — the fleet's `default`
-   * threshold overridden by the account's own, if it has one. Used by the
-   * per-account displays (the status renderer's Models row, the TUI bar
-   * reddening) that show a single representative threshold rather than
-   * walking every bucket, the same simplification `effectiveThreshold`
-   * already makes for the fleet-wide header.
-   * @param {any} account */
-  effectiveThresholdFor(account) {
-    return this.thresholdFor('default', account);
   }
 
   /**

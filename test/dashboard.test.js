@@ -102,6 +102,18 @@ test('thresholdBadgeText names a bare-number override "at", and a table by bucke
   assert.equal(thresholdBadgeText({ unified7d: 0.85 }, 0.98, { default: 0.98, unified7d: 0.9 }), 'switch 7d 85%');
 });
 
+test('thresholdBadgeText names a bucket the account default moves off the fleet table', () => {
+  // The defaults agree, so the old default-to-default comparison said nothing,
+  // yet this account's weekly wall really is 98% where the fleet's is 85%.
+  const fleetTable = { default: 0.98, unified7d: 0.85 };
+  assert.equal(thresholdBadgeText(0.98, 0.98, fleetTable), 'switch 7d 98%');
+  assert.equal(thresholdBadgeText({ default: 0.98 }, 0.98, fleetTable), 'switch 7d 98%');
+  // An account entry for that bucket answers for it, equal to the fleet's or not.
+  assert.equal(thresholdBadgeText({ default: 0.98, unified7d: 0.85 }, 0.98, fleetTable), '');
+  // A differing default already covers every unlisted bucket.
+  assert.equal(thresholdBadgeText(1.0, 0.98, fleetTable), 'switch at 100%');
+});
+
 test('accountBadges adds the threshold badge only when it differs from the fleet', () => {
   const withFleet = accountBadges({ name: 'a', type: 'oauth', switchThreshold: 1.0 }, null, null, 0.98, null);
   assert.deepEqual(withFleet[withFleet.length - 1], { cls: 'meta threshold', text: 'switch at 100%' });
@@ -525,6 +537,24 @@ test('accountBadges calls thresholdBadgeText inside the same serialized bundle',
   const isolated = new Function(`${bundle}; return accountBadges;`)();
   const account = { name: 'a', type: 'oauth', switchThreshold: 1.0 };
   assert.deepEqual(isolated(account, null, null, 0.98, null), accountBadges(account, null, null, 0.98, null));
+});
+
+// The bare number above never reaches the bucket tables: only a TABLE-form
+// override reads THRESHOLD_BUCKET_KEYS and THRESHOLD_BUCKET_LABELS, and those
+// are module constants the page does not see unless SHARED_CONSTS writes them
+// in. Imported, the helper finds them in module scope and passes; in the page
+// it threw a ReferenceError from render() and blanked the accounts pane.
+test('a table-form override renders its badge inside the serialized bundle', () => {
+  const html = renderDashboardHtml();
+  const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
+  const bundle = script.slice(script.indexOf('var STARVED_MIN'), script.indexOf('function el('));
+  const isolated = new Function(`${bundle}; return accountBadges;`)();
+  const account = { name: 'a', type: 'oauth', switchThreshold: { unified7d: 0.9, unified7dFable: 0.8 } };
+  const badges = isolated(account, null, null, 0.98, null);
+  assert.deepEqual(badges[badges.length - 1], { cls: 'meta threshold', text: 'switch 7d 90%, fable 80%' });
+  // The inherited-bucket path reads the same two tables.
+  const moved = isolated({ name: 'b', type: 'oauth', switchThreshold: 0.98 }, null, null, 0.98, { default: 0.98, unified7d: 0.85 });
+  assert.deepEqual(moved[moved.length - 1], { cls: 'meta threshold', text: 'switch 7d 98%' });
 });
 
 test('the page ships the same helper implementations it is tested against', () => {
