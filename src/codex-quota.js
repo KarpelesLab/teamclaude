@@ -216,8 +216,11 @@ const isSpent = (utilization) => utilization != null && utilization >= 1;
  * model-scoped weekly bucket is spent on its own terms, whatever the
  * account-wide reading says.
  *
- * The labels name what is spent, for the log line that follows. A caller that
- * only wants the verdict tests the length.
+ * The labels name what is spent, for the log line that follows, and they keep
+ * the two scopes apart: `5h` and `weekly` are windows the whole account shares,
+ * while `<name> weekly` is one model family's bucket. The caller needs that
+ * distinction (see isAccountWideCodexWindow), because only the first kind is a
+ * reason to take the account out of rotation.
  *
  * @param {Record<string, string>} headers Rate-limit headers from the response.
  * @returns {string[]} One label per spent window, e.g. `['weekly']`.
@@ -232,6 +235,19 @@ export function codexSpentWindows(headers) {
   }
   return spent;
 }
+
+/**
+ * Is this `codexSpentWindows` label a window the whole account shares?
+ *
+ * A model-scoped bucket is always labelled `<name> weekly`, so it can never
+ * collide with the two bare labels. The scope matters to the 429 handler: a
+ * spent account-wide window refuses every request, so the account is held; a
+ * spent model bucket refuses one family only, and holding the account for it
+ * would park a subscription that still serves every other model.
+ *
+ * @param {string} label One label from `codexSpentWindows`.
+ */
+export const isAccountWideCodexWindow = (label) => label === '5h' || label === 'weekly';
 
 /** The subscription plan upstream reports, for status output. Null when absent. */
 export function parseCodexPlanType(headers) {

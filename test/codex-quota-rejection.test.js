@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
-import { codexSpentWindows } from '../src/codex-quota.js';
+import { codexSpentWindows, isAccountWideCodexWindow } from '../src/codex-quota.js';
 
 // A Codex 429 whose subscription window is spent is durable exhaustion, not a
 // transient throttle. Anthropic says so outright, as `…-status: rejected`; this
@@ -49,6 +49,21 @@ const spentNamedFiveHour = {
   'x-codex-gpt-5-primary-used-percent': '100',
   'x-codex-gpt-5-primary-window-minutes': '300',
   'x-codex-gpt-5-secondary-used-percent': '42',
+  'x-codex-gpt-5-secondary-window-minutes': '10080',
+};
+
+// Only a NAMED family's weekly bucket is spent: one model family is refused and
+// every account-wide window has headroom, so the account still serves the rest.
+const spentNamedWeekly = {
+  'retry-after': String(RETRY_AFTER),
+  'content-type': 'application/json',
+  'x-codex-plan-type': 'pro',
+  'x-codex-primary-used-percent': '50',
+  'x-codex-primary-window-minutes': '10080',
+  'x-codex-secondary-used-percent': '0',
+  'x-codex-secondary-window-minutes': '0',
+  'x-codex-gpt-5-limit-name': 'gpt-5',
+  'x-codex-gpt-5-secondary-used-percent': '100',
   'x-codex-gpt-5-secondary-window-minutes': '10080',
 };
 
@@ -100,6 +115,14 @@ test('a named family at its limit is spent, account-wide headroom or not', () =>
     'x-codex-gpt-5-secondary-used-percent': '100',
     'x-codex-gpt-5-secondary-window-minutes': '10080',
   }), ['gpt-5 weekly']);
+});
+
+test('only the bare labels are account-wide', () => {
+  assert.equal(isAccountWideCodexWindow('5h'), true);
+  assert.equal(isAccountWideCodexWindow('weekly'), true);
+  // A model bucket always carries its family name, so it cannot pass for one.
+  assert.equal(isAccountWideCodexWindow('gpt-5 weekly'), false);
+  assert.deepEqual(codexSpentWindows(spentNamedWeekly), ['gpt-5 weekly']);
 });
 
 test('headroom, and headers that state nothing, are not spent', () => {
@@ -174,7 +197,8 @@ test('a spent Codex subscription is held for retry-after and the request rotates
     // Not the window's own reset, though the headers stated it and it was
     // recorded: the hold is how long upstream asked to be left alone, and the
     // utilization above the switch threshold is what keeps selection off the
-    // account for the rest of the window.
+    // account for the rest of the window. That holds for an account-wide
+    // window only — selection reads unified5h/unified7d, not the model buckets.
     assert.equal(spentAccount.quota.unified7dReset, RESET_AT_MS);
     assert.ok(hold < RESET_AT_MS, 'the hold is retry-after, not the window reset');
     assert.equal(spentAccount.quota.unified7d, 1);
@@ -237,6 +261,50 @@ test('a spent session window is a rejection even though it is model-scoped', asy
     // spent, and it is the one the account is actually refusing on.
     assert.equal(am.accounts[0].quota.unified7d, 0.42);
     assert.equal(am.accounts[0].quota.unified5h, 1);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('a spent named-family weekly bucket rotates the request without holding the account', async () => {
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    seen.push(req.headers.authorization);
+    if (req.headers.authorization === 'Bearer t-codex-1') {
+      res.writeHead(429, spentNamedWeekly);
+      res.end(JSON.stringify({ error: { type: 'usage_limit_reached' } }));
+    } else {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{}');
+    }
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager(
+    [codexAccount('codex-1', upstreamPort), codexAccount('codex-2', upstreamPort)],
+    0.98,
+  );
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' } });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await codexRequest(proxyPort);
+    await res.text();
+    assert.equal(res.status, 200, 'should succeed on the second subscription');
+    // Asked once and not again: the bucket is spent, so waiting out retry-after
+    // on the same account would only buy a second refusal.
+    assert.deepEqual(seen, ['Bearer t-codex-1', 'Bearer t-codex-2']);
+
+    // The account is left in rotation. Only one model family is refused, and
+    // nothing in selection reads the model buckets — so a hold would lapse, the
+    // account would be picked again, refuse again and be parked again: a healthy
+    // subscription out of service for every model over one family's bucket.
+    const account = am.accounts[0];
+    assert.equal(account.status, 'active');
+    assert.equal(account.rateLimitedUntil, null, 'a model-scoped rejection must not hold the account');
+    assert.equal(am.isPaused(0), false, 'nor pause it: the throttle path must not have run');
+    assert.equal(account.quota.unified7d, 0.5);
   } finally {
     proxy.close();
     upstream.close();
