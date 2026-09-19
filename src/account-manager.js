@@ -1,5 +1,5 @@
 import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired, formatMoney } from './oauth.js';
-import { providerOf, DEFAULT_PROVIDER, isSubscriptionAccount } from './provider.js';
+import { providerOf, DEFAULT_PROVIDER, isSubscriptionAccount, canServeProvider } from './provider.js';
 import { refreshCodexToken } from './codex-auth.js';
 import { parseCodexQuota, parseCodexPlanType } from './codex-quota.js';
 import { sameIdentity } from './identity.js';
@@ -807,8 +807,10 @@ export class AccountManager {
     // other's client, so crossing them is never right. An API key carries no
     // such tie — it is metered capacity, not a seat — so it stays eligible for
     // whichever app is asking, which is what keeps a third-party backend usable
-    // from both.
-    const foreign = this.accounts.filter(a => providerOf(a) !== provider && isSubscriptionAccount(a));
+    // from both. Asked through `canServeProvider`, the same predicate the
+    // exhaustion report draws its candidate set from, so the accounts a request
+    // could have used and the accounts it is told about cannot disagree.
+    const foreign = this.accounts.filter(a => !canServeProvider(a, provider));
     if (foreign.length === 0) return exclude;
     const combined = new Set(exclude || []);
     for (const account of foreign) combined.add(account.index);
