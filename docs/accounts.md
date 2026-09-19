@@ -200,20 +200,59 @@ Two details are worth knowing if you read the raw headers:
 OpenAI occasionally grants a ChatGPT account a free **rate-limit reset credit**:
 redeeming one clears the account's spent windows ahead of their own reset. The
 Codex CLI offers it as a manual action only, so a pooled account that runs dry
-sits out the rest of its week holding one unless somebody notices it is there.
+would otherwise sit out the rest of its week holding one.
 
 The count an account holds comes free with the quota probe — it rides on the
 same `/wham/usage` payload the quota reading does — and shows up as `RC1` on the
 TUI row, a `Reset` line in `teamclaude status`, and a badge on the dashboard
-card. It survives a restart, which matters because the probe is off by default:
-without that, nothing would say a credit exists until something next happened to
-read the usage endpoint.
+card. It survives a restart, which matters because the probe is off by default.
 
-The count is what the account **holds**. Whether a particular credit can be
-spent is a separate question — the payload's `applicable_available_count` is
-upstream's own view of how many would reset a window right now, and is named on
-the `status` line when it is zero — and spending one remains a manual action in
-the Codex CLI.
+Spending one is **opt-in**, and the switch is fleet-wide: set
+[`autoRedeemResets`](configuration.md) to `true`, or toggle it from the TUI
+settings screen (**g** → **Auto-redeem**). It is `false` by default, and stays
+that way until you say otherwise: a redemption cannot be undone and the credits
+are scarce, so a fleet nobody has armed holds its credits for manual use however
+dry it runs. The switch is fleet-scoped because the policy below is — "only when
+the whole pool is dry" is a statement about the fleet, not about one account —
+and it applies live, so it can be armed or killed without a restart.
+
+One account can be exempted with `accounts[].autoRedeemReset: false`, and that
+is **all** that key can do. A per-account `true` arms nothing on its own: with
+`autoRedeemResets` off, no account spends anything.
+
+A redemption is considered at the moment a spent weekly window turns a request
+away with nothing chosen to serve it: every Codex account the request is
+eligible for is out of quota, so selection refuses it before picking one and
+nothing is ever sent upstream. On a pool of two this is what almost every
+request gets. Only the accounts a reset would actually return to service are
+considered — an account you disabled or capped stays out whatever its windows
+say — and when several qualify, the one whose credit expires soonest is asked
+first.
+
+While it is on, a credit is spent only when **all** of this holds:
+
+1. The account's **weekly** window is exhausted. A spent 5-hour window never
+   triggers it — that one comes back on its own within hours, while the weekly
+   one is what walls an account off for days, and a full reset is too scarce to
+   burn on the short window.
+2. The account holds a credit that is `available` **and** supported by its plan.
+3. Either every other Codex account is unavailable too — so the credit actually
+   unblocks work rather than topping up an account rotation would have stepped
+   past — or the credit expires within three days.
+
+At most one credit is spent, per dry pool rather than per account. Refusals
+arriving together join a single attempt rather than each starting one, and an
+attempt that has spent a credit — or that failed in a way that cannot rule out
+having spent one — holds **every** account off for hours afterwards, not just
+the one it touched. That hold is deliberately not left to the account a
+redemption returned to service making condition 3 answer "no" for the others:
+that depends on a quota re-read, and a re-read can fail.
+
+The request is then re-selected and served on the account whose windows were
+just reset. The whole decision — token refresh, credit read and redemption — is
+held to a 10-second budget, because the waiting client gives the response head
+60 seconds and the retry needs the rest of it. Every attempt and outcome is
+logged.
 
 ## Third-party backend accounts
 

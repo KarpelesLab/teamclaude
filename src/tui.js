@@ -256,9 +256,9 @@ export function spendTag(quota) {
  * terminal pushes it past the edge.
  *
  * The number is what the account HOLDS. It is deliberately not the number that
- * could be redeemed right now: only the account's own credit rows say whether a
- * given credit is supported by the plan, and they cost a request nobody should
- * make to draw a badge.
+ * could be redeemed right now: only the detail rows say whether a given credit
+ * is supported by the plan, and they cost a request nobody should make to draw
+ * a badge. See codex-reset-credits.js.
  *
  * @param {Record<string, any>|null|undefined} quota
  */
@@ -724,6 +724,20 @@ export class TUI {
       left: () => this._nudgeThreshold(-1),
       right: () => this._nudgeThreshold(+1),
       enter: () => this._promptInput('Switch threshold % (1-100, tenths allowed)', v => this._doSetThreshold(v.trim())),
+    });
+
+    // Fleet-scoped because the policy behind it is: a credit is spent only when
+    // the whole Codex pool is dry. It sits here, on the screen, rather than in
+    // the config file alone because the one thing an operator needs from this
+    // setting is to be able to kill it at once.
+    fields.push({
+      id: 'autoRedeemResets',
+      label: 'Auto-redeem',
+      hint: '←→ toggle',
+      value: () => (this.config.autoRedeemResets === true ? green('on') : gray('off')),
+      left: () => this._toggleAutoRedeemResets(),
+      right: () => this._toggleAutoRedeemResets(),
+      enter: () => this._toggleAutoRedeemResets(),
     });
 
     fields.push({
@@ -1215,6 +1229,23 @@ export class TUI {
     try { await this.saveConfig(this.config); }
     catch (e) { this._addLog(`Failed to save: ${e.message}`); }
     this._addLog(`Session titles: ${enabled ? 'on' : 'off'}`);
+    if (this.running) this.render();
+  }
+
+  async _toggleAutoRedeemResets() {
+    // Whether a spent weekly Codex window may spend one of that account's free
+    // rate-limit reset credits. Fleet-scoped: the policy it arms is about the
+    // whole pool being dry, so its switch is too. The redeemer reads it off the
+    // shared config per refusal, so the assignment is the whole application and
+    // the save is only what survives a restart.
+    //
+    // A per-account `autoRedeemReset: false` still exempts its account while
+    // this is on; nothing per-account can switch it ON.
+    const next = this.config.autoRedeemResets !== true;
+    this.config.autoRedeemResets = next;
+    try { await this.saveConfig(this.config); }
+    catch (/** @type {any} */ e) { this._addLog(`Failed to save: ${e.message}`); }
+    this._addLog(`Auto-redeem Codex reset credits: ${next ? 'on' : 'off'}`);
     if (this.running) this.render();
   }
 
@@ -1882,6 +1913,9 @@ export class TUI {
     // ── Rotation
     lines.push(bold('  Rotation') + dim('  — switch accounts when quota crosses the threshold'));
     lines.push(row(byId('threshold')));
+    lines.push(row(byId('autoRedeemResets')));
+    lines.push(dim('  Spend a free Codex rate-limit reset credit when the whole pool'));
+    lines.push(dim('  is dry. Irreversible and scarce — off unless you say otherwise.'));
     lines.push('');
     // ── Quota probe
     lines.push(bold('  Quota probe') + dim('  — refresh idle accounts from the usage endpoint'));
