@@ -23,7 +23,14 @@ function clampInterval(ms) {
 }
 
 export class Prober {
-  constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, codexProbeFn = fetchCodexUsage, profileFn = null, backendFn = fetchBackendQuota, timeoutMs = 10_000, log = console.log } = {}) {
+  // `log` resolves the console per call rather than capturing it. A default
+  // parameter is evaluated when the constructor runs, and the server builds its
+  // prober in the same tick as `server.listen()` — before the listen callback
+  // reaches `tui.start()`, which swaps `console.log` for the activity log. The
+  // notices below are produced later still, by a reload that changes the probe
+  // interval, so a captured `console.log` would put them on a terminal the
+  // alternate screen has already covered.
+  constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, codexProbeFn = fetchCodexUsage, profileFn = null, backendFn = fetchBackendQuota, timeoutMs = 10_000, log = (/** @type {string} */ line) => console.log(line) } = {}) {
     this.am = accountManager;
     this.intervalMs = clampInterval(intervalMs);
     this.probeFn = probeFn;
