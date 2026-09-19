@@ -62,6 +62,8 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
     if (why) lines.push(`  ${why}`);
     const spend = spendLine(account, paint);
     if (spend) lines.push(`  ${spend}`);
+    const resetCredits = resetCreditLine(account, paint);
+    if (resetCredits) lines.push(`  ${resetCredits}`);
     lines.push(`  ${paint.dim('Usage'.padEnd(8))} ${formatUsage(account.usage, now)}`);
     lines.push(`  ${paint.dim('Probe'.padEnd(8))} ${formatAccountProbe(nameText(account.name), probe, now, paint)}`);
     const adaptive = adaptiveFor(status, nameText(account.name));
@@ -165,6 +167,27 @@ export function spendLine(account, paint) {
     : spend.disabledReason ? `now off (${safeLine(spend.disabledReason, 64)})`
     : 'now off';
   return `${paint.dim('Spend'.padEnd(8))} ${paint.yellow(`${amount} spent this month, ${why}`)}`;
+}
+
+/**
+ * The free-reset-credit line, or null when this account holds none.
+ *
+ * Its own line rather than another bar: every bar above measures an allowance
+ * running down, while this counts something the account can spend to put one
+ * back. `applicable` is named alongside because a credit upstream would
+ * currently decline to apply is a different situation from one it would honour,
+ * and the count on its own reads the same either way.
+ *
+ * @param {Record<string, any>|null|undefined} account  a row of the status payload
+ * @param {ReturnType<typeof colors>} paint
+ */
+export function resetCreditLine(account, paint) {
+  const credits = account?.quota?.resetCredits;
+  const available = credits?.available;
+  if (!Number.isFinite(available) || available <= 0) return null;
+  const noun = `free rate-limit reset ${available === 1 ? 'credit' : 'credits'}`;
+  const note = credits.applicable === 0 ? ' — none applicable to a window right now' : '';
+  return `${paint.dim('Reset'.padEnd(8))} ${paint.cyan(`${available} ${noun}`)}${paint.gray(note)}`;
 }
 
 export function unavailableLine(account, paint) {

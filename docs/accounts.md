@@ -195,6 +195,26 @@ Two details are worth knowing if you read the raw headers:
   a 5-hour window there. Windows are classified by their stated
   `window-minutes`, never by position.
 
+### Free rate-limit reset credits
+
+OpenAI occasionally grants a ChatGPT account a free **rate-limit reset credit**:
+redeeming one clears the account's spent windows ahead of their own reset. The
+Codex CLI offers it as a manual action only, so a pooled account that runs dry
+sits out the rest of its week holding one unless somebody notices it is there.
+
+The count an account holds comes free with the quota probe — it rides on the
+same `/wham/usage` payload the quota reading does — and shows up as `RC1` on the
+TUI row, a `Reset` line in `teamclaude status`, and a badge on the dashboard
+card. It survives a restart, which matters because the probe is off by default:
+without that, nothing would say a credit exists until something next happened to
+read the usage endpoint.
+
+The count is what the account **holds**. Whether a particular credit can be
+spent is a separate question — the payload's `applicable_available_count` is
+upstream's own view of how many would reset a window right now, and is named on
+the `status` line when it is zero — and spending one remains a manual action in
+the Codex CLI.
+
 ## Third-party backend accounts
 
 Any Anthropic-compatible API can be added as an account alongside your Claude accounts. Give it a higher `priority` value (lower = preferred, so use e.g. `100`) and it will be used as a fallback when all Claude accounts are exhausted.

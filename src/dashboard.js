@@ -106,6 +106,13 @@ export function accountBadges(account, current, currentAccounts) {
   badges.push({ cls: status, text: status });
   if (recent) badges.push({ cls: 'sessions', text: recent + ' recent' });
   if (known > recent) badges.push({ cls: 'sessions known', text: known + ' known' });
+  // Free Codex rate-limit reset credits this account holds — what it could
+  // spend to undo an exhausted window rather than wait one out. The count is
+  // the account's holdings, not what upstream would apply this instant.
+  var credits = ((a.quota || {}).resetCredits || {}).available;
+  if (Number.isFinite(credits) && credits > 0) {
+    badges.push({ cls: 'meta', text: credits + ' reset credit' + (credits === 1 ? '' : 's') });
+  }
   return badges;
 }
 
