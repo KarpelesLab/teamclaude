@@ -12,7 +12,7 @@ import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
 import { TopLevelFieldFinder, modelGlobMatches } from './model.js';
 import { BodyWriter, truncationNote } from './request-log.js';
 import { upstreamFetch, upstreamPoolStatus } from './upstream-fetch.js';
-import { applyAuthHeaders, upstreamFor, rewritesBody, providerForPath, providerOf, isSubscriptionAccount, DEFAULT_PROVIDER, PROVIDERS } from './provider.js';
+import { applyAuthHeaders, upstreamFor, rewritesBody, providerForPath, providerOf, isSubscriptionAccount, holdsConnection, DEFAULT_PROVIDER, PROVIDERS } from './provider.js';
 import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
 import { safeLine } from './safe-text.js';
@@ -61,6 +61,32 @@ const INLINE_RETRY_AFTER_MAX_SECONDS = 15;
 // the account so concurrent requests wait, then retries the same account.
 const RATE_LIMIT_ABSORB_MAX_SECONDS =
   Number(process.env.TEAMCLAUDE_RATE_LIMIT_ABSORB_MAX_SECONDS) || 60;
+// How long to wait before the one retry of a headerless 429 — a 429 carrying no
+// retry-after and no anthropic-ratelimit-* headers at all.
+//
+// Observed over a 32-minute window on a live fleet: these land about once every
+// 8 minutes on Fable traffic and never on any other model; they follow the
+// request onto whichever account the failover hop moves it to; consecutive
+// refusals arrive 0.6-0.8s apart; and the client's own retry, after the 2m 38s
+// backoff Claude Code applies, usually succeeds.
+//
+// 2s is chosen against those numbers rather than measured from them — nothing
+// observed says how long the limit actually lasts. It sits above the 0.6-0.8s
+// the hop already re-asked across and was refused, and far below the backoff the
+// client would otherwise serve out. That is the entire argument for it, which is
+// why it is an env var: TEAMCLAUDE_HEADERLESS_429_RETRY_DELAY_MS.
+//
+// One delay, not a ladder: the limit's window is unknown, and a second guess at
+// it would cost the client the wait without evidence that it helps. So the worst
+// case is the retry being refused too, and the client getting the 429 it gets
+// today about 2s later.
+const DEFAULT_HEADERLESS_429_RETRY_DELAY_MS = 2000;
+
+/** @returns {number} the wait before a headerless 429 is re-asked, in ms. */
+function resolveHeaderless429RetryDelayMs() {
+  const env = Number(process.env.TEAMCLAUDE_HEADERLESS_429_RETRY_DELAY_MS);
+  return env > 0 ? env : DEFAULT_HEADERLESS_429_RETRY_DELAY_MS;
+}
 const OAUTH_ENTITLEMENT_ERROR_CODE = 'oauth_not_allowed_for_organization';
 const ERROR_BODY_INSPECTION_LIMIT = 64 * 1024;
 
@@ -2401,7 +2427,56 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       } else if (ctx.rateLimitHopped && requestScoped) {
         // Second headerless 429, on a different account: it followed the
         // request. Nothing here is about either account.
-        console.log(`[TeamClaude] 429 followed the request onto "${account.name}" with no rate-limit headers — it is about the request, not the accounts; returning it to the client`
+        //
+        // That does not make it permanent. Measured on a live fleet: these land
+        // about once every 8 minutes on Fable traffic, from four different
+        // starting accounts, and the client's own retry usually succeeds — so
+        // most are a transient the fleet cannot route around, not a model id
+        // upstream refuses. Returning it straight away is what left Claude Code
+        // sitting on "will retry in 2m 38s", with nothing in the session
+        // transcript to explain the pause.
+        //
+        // So take one short retry first, on THIS account. Not on a third one:
+        // the limit is scoped to neither account, so another hop would pay a
+        // cold prompt cache to learn what the first hop already established —
+        // the same argument that bounds the hop budget above. ctx.hopTo keeps
+        // the attempt on the account it landed on and off the fleet cursor
+        // (#286), and `route` keeps its egress, since the wait is the only
+        // variable being tested. A fresh IP is a different hypothesis and the sx
+        // retry below still owns it: when it is armed it goes first, for free,
+        // and this retry takes the attempt after it.
+        //
+        // ctx.requestScopedRetried is the SAME flag the no-sibling retry below
+        // sets: one headerless-429 wait per request, whichever of the two spends
+        // it. A request that finds no sibling, retries, and only then finds one
+        // to hop onto reaches both sites, and two flags would let it wait twice.
+        //
+        // Only for a caller that waits on the connection. A Codex one does not:
+        // it gives the response head 60s, then retries the whole request itself
+        // (see holdsConnection). A caller that will not wait should not be made
+        // to wait at all — 2s is small, but "never hold a caller that is not
+        // holding" is the rule that makes every other hold in here safe, and a
+        // rule applied only where the cost is obvious is not a rule. A Codex 429
+        // carrying no `x-codex-*` headers classifies as request-scoped, so the
+        // path is reachable by construction; no headerless 429 in the
+        // measurement above was Codex traffic, so this closes a reachable path
+        // rather than a firing one.
+        const retryDelayMs = resolveHeaderless429RetryDelayMs();
+        const callerWaits = holdsConnection(ctx.provider);
+        if (!ctx.requestScopedRetried && !switchingToSx && retryCount < maxRetries
+          && !res.headersSent && !clientGone(res) && !ctx.signal?.aborted && callerWaits) {
+          // Once per request: a retry that is refused too has made the point.
+          ctx.requestScopedRetried = true;
+          console.log(`[TeamClaude] 429 followed the request onto "${account.name}" with no rate-limit headers — retrying it once on the same account in ${retryDelayMs}ms`
+            + (refusal ? ` (${safeLine(refusal)})` : ''));
+          await waitForRetry(retryDelayMs, ctx.signal);
+          if (clientGone(res)) { ctx.abandoned = true; return; }
+          ctx.hopTo = account.index;
+          return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+        }
+        console.log(`[TeamClaude] 429 followed the request onto "${account.name}" with no rate-limit headers — `
+          + (callerWaits ? 'it is about the request, not the accounts' : `${ctx.provider} caller does not wait`)
+          + '; returning it to the client'
           + (refusal ? ` (${safeLine(refusal)})` : ''));
       } else if (ctx.rateLimitHopped) {
         // Second 429 this request, on a different account. Say so once: the
@@ -2427,10 +2502,19 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // third time is the other half of #288. With no sibling to hop to, one
       // short retry covers a momentary blip, and then it is the client's turn.
       if (requestScoped) {
-        if (!ctx.rateLimitHopped && !ctx.requestScopedRetried && retryCount < maxRetries) {
+        // Same rule as the post-hop retry above, and the same one-wait budget:
+        // a wait is only invisible to a caller that waits longer than we do.
+        // Fixing one site and leaving the other would apply the rule by half —
+        // and this is the site that changes behaviour, since a Codex caller used
+        // to serve out this 2s with no way to decline it.
+        if (!ctx.rateLimitHopped && !ctx.requestScopedRetried && retryCount < maxRetries
+          && holdsConnection(ctx.provider)) {
           ctx.requestScopedRetried = true;
-          console.log(`[TeamClaude] 429 with no rate-limit headers on "${account.name}" — retrying once in 2s${refusal ? ` (${safeLine(refusal)})` : ''}`);
-          await waitForRetry(2000, ctx.signal);
+          // The same number as the post-hop retry above: one phenomenon, one
+          // delay, one env var to move both.
+          const retryDelayMs = resolveHeaderless429RetryDelayMs();
+          console.log(`[TeamClaude] 429 with no rate-limit headers on "${account.name}" — retrying once in ${retryDelayMs}ms${refusal ? ` (${safeLine(refusal)})` : ''}`);
+          await waitForRetry(retryDelayMs, ctx.signal);
           if (clientGone(res)) { ctx.abandoned = true; return; }
           return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, nextUseSx);
         }
