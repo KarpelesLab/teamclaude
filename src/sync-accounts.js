@@ -97,6 +97,13 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     // operator decision about a running fleet, and waiting for a restart to
     // honour a budget defeats the budget.
     mgr.maxUsage = diskAcct.maxUsage ?? null;
+    // Read at the moment a refusal asks whether to spend a reset credit, so a
+    // disk edit must land here to bind — and an operator who has just exempted
+    // an account is doing so precisely because they do not want the next
+    // refusal to spend its credit. Negative-only (see makeAccount): only `false`
+    // says anything, so removing the key returns the account to following the
+    // fleet-wide `autoRedeemResets`.
+    mgr.autoRedeemReset = diskAcct.autoRedeemReset !== false;
     // Third-party-backend bindings are read per request off this object
     // (`account.upstream || upstream`, `account.modelMap` in server.js), so a
     // disk edit must land here to take effect on reload. `|| null` mirrors the
@@ -128,6 +135,11 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       if (diskAcct.stripRequestFields) cfgAcct.stripRequestFields = diskAcct.stripRequestFields; else delete cfgAcct.stripRequestFields;
       if (diskAcct.messageThreads === true) cfgAcct.messageThreads = true; else delete cfgAcct.messageThreads;
       if (diskAcct.maxUsage != null) cfgAcct.maxUsage = diskAcct.maxUsage; else delete cfgAcct.maxUsage;
+      // Both polarities are mirrored, unlike the flags above: `false` is the
+      // side of this key that does something, so a stale mirror of either value
+      // would win the save stencil's spread and undo the disk edit.
+      if (typeof diskAcct.autoRedeemReset === 'boolean') cfgAcct.autoRedeemReset = diskAcct.autoRedeemReset;
+      else delete cfgAcct.autoRedeemReset;
     }
     // Pick up enable/disable toggles; re-enabling clears a stuck error state.
     const wantDisabled = !!diskAcct.disabled;

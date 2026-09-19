@@ -69,6 +69,35 @@ function additionalLimits(additional) {
 }
 
 /**
+ * The free rate-limit reset credits this account holds, or null when the
+ * payload says nothing about them. Two counts, kept apart on purpose:
+ *
+ *  - `available` is what the account HOLDS, and is the number every display
+ *    surface reports. It says nothing about whether this plan may spend one.
+ *  - `applicable` is upstream's own view of how many would reset something
+ *    right now — 0 whenever no window is currently eligible.
+ *
+ * Neither decides a redemption: only the detail rows say whether a specific
+ * credit is both available and supported by the plan, and spending one is not
+ * recoverable. See codex-reset-credits.js.
+ *
+ * @param {any} raw  the payload's `rate_limit_reset_credits` object
+ */
+function resetCredits(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const available = Number(raw.available_count);
+  // A malformed or absent count is dropped rather than read as zero, the same
+  // way a zeroed window is above: "none" and "we were not told" have different
+  // consequences, and only one of them is a fact.
+  if (!Number.isFinite(available) || available < 0) return null;
+  const applicable = Number(raw.applicable_available_count);
+  return {
+    available,
+    applicable: Number.isFinite(applicable) && applicable >= 0 ? applicable : null,
+  };
+}
+
+/**
  * Convert the private `/wham/usage` response into TeamClaude quota fields.
  *
  * @param {any} data
@@ -110,6 +139,7 @@ export function normalizeCodexUsagePayload(data) {
     sevenDay: shared.sevenDay && { utilization: shared.sevenDay.utilization, resetAt: shared.sevenDay.resetAt },
     modelBuckets,
     planType: data?.plan_type || null,
+    resetCredits: resetCredits(data?.rate_limit_reset_credits),
   };
 }
 
