@@ -32,6 +32,7 @@ import { Warmer } from './warmer.js';
 import { createRollingWarmupSchedule, formatWarmupScheduleConfirmation, resolveWarmupConfig, resolveWarmupSchedule } from './warmup-schedule.js';
 import { TUI } from './tui.js';
 import { SessionTitles } from './session-titles.js';
+import { captureEarlyConsole } from './early-log.js';
 import { RemoteControl, createAttachSession } from './tui-remote.js';
 import { SxManager } from './sx.js';
 import { autoUpdate, checkForUpdate, currentVersion, resolveVersionLabel, runUpdate, installKind, updateAvailableFromCache, PKG_NAME } from './updater.js';
@@ -232,6 +233,14 @@ async function serverCommand() {
   // per stall in the service log, lag figures under `server.eventLoop`).
   const eventLoopMonitor = startEventLoopMonitor();
 
+  // With a TUI coming, hold what startup prints until the TUI owns the console,
+  // then replay it into the activity pane (and its log file) — see early-log.js.
+  // The same test `useTUI` applies below, taken here because the first lines are
+  // printed long before that one is reached.
+  const tuiExpected = !(args.includes('--headless') || args.includes('--no-tui'))
+    && process.stdout.isTTY && process.stdin.isTTY;
+  const earlyConsole = tuiExpected ? captureEarlyConsole() : null;
+
   const config = await loadOrCreateConfig();
   // Token writes below pair rows by entry id against a re-read of the file, so
   // the ids have to be on disk before the first refresh, not just in memory.
@@ -330,7 +339,10 @@ async function serverCommand() {
     atomicConfigUpdate(diskConfig => {
       // Pick up any new accounts from disk so the running fleet serves them
       // (only add, don't refresh credentials — we're about to write the authoritative tokens)
+      const removed = removedAccountIds(config);
       for (const diskAcct of diskConfig.accounts) {
+        // A row the TUI is in the middle of removing is not a new account (#422).
+        if (diskAcct?.id && removed.has(diskAcct.id)) continue;
         const known = config.accounts.some(a => sameIdentity(a, diskAcct));
         if (!known) {
           // Same object into both lists, so the account carries its entry's id;
@@ -619,7 +631,7 @@ async function serverCommand() {
   });
   hooks.getQuotaExtra = () => ({ warmup: resolveWarmupConfig(config) });
 
-  const server = createProxyServer(accountManager, config, hooks, sx, clientUsage, dimensionUsage);
+  const server = createProxyServer(accountManager, config, hooks, sx, clientUsage, dimensionUsage, { bindHost });
   // Catch bind-time errors (e.g. EADDRINUSE) only. Once the socket is bound we
   // remove this handler so a later runtime 'error' isn't misreported as a
   // listen failure and exit the whole proxy.
@@ -644,9 +656,15 @@ async function serverCommand() {
       console.log(`[TeamClaude] Upstream proxy: direct — ${describeSelfProxy(egressProxy)}`);
     }
     if (tui) {
+      const held = earlyConsole?.release() ?? [];
       tui.start();
+      // In the order they were said, ahead of the line that follows them.
+      for (const line of held) console.log(line);
       console.log(`Listening on port ${port} with ${accounts.length} account(s)`);
     } else {
+      // Same test as `tuiExpected`, so this holds nothing; released all the same
+      // so a line can never stay held if the two ever come to disagree.
+      for (const line of earlyConsole?.release() ?? []) console.log(line);
       const sep = '='.repeat(60);
       console.log('');
       console.log(sep);

@@ -226,7 +226,21 @@ export function resolveClientAuth(proxyConfig, presented) {
   return { ok: false, client: null };
 }
 
-export function createProxyServer(accountManager, config, hooks = {}, sx = null, clientUsage = null, dimensionUsage = null) {
+/**
+ * @param {any} accountManager
+ * @param {any} config
+ * @param {any} [hooks]
+ * @param {any} [sx]
+ * @param {any} [clientUsage]
+ * @param {any} [dimensionUsage]
+ * @param {{ bindHost?: string|null }} [opts]  `bindHost`: the address the caller
+ *   binds, when it is not `config.proxy.host` (TEAMCLAUDE_HOST overrides it). The
+ *   DNS-rebinding Host check accepts that address as naming this machine; given
+ *   only the config value, a server bound off-box through the env var refused a
+ *   key-less caller naming the very address it listens on (#423).
+ */
+export function createProxyServer(accountManager, config, hooks = {}, sx = null, clientUsage = null, dimensionUsage = null, { bindHost = null } = {}) {
+  const boundHost = () => bindHost || config.proxy?.host;
   const upstream = config.upstream || 'https://api.anthropic.com';
   const holdMs = (config.holdSeconds || 0) * 1000;
 
@@ -345,7 +359,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         // far as the browser can tell, and it can read the answers. What it
         // cannot forge is the Host header, which the browser derives from its
         // own URL bar — so a key-less loopback request must name this machine.
-        if (!isLocalHostHeader(req.headers.host ?? req.headers[':authority'], config.proxy?.host)) {
+        if (!isLocalHostHeader(req.headers.host ?? req.headers[':authority'], boundHost())) {
           res.writeHead(403, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({
             type: 'error',
@@ -474,6 +488,20 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         return;
       }
 
+      // Every control route above matches an exact method and path, so a typo —
+      // or just the wrong verb, `GET /teamclaude/reload` — fell through to the
+      // forwarder: the request went upstream under a fleet account's credential
+      // and the client got THAT server's 404 (#420). The prefix is ours, so
+      // whatever under it no route claimed is answered here. Read on the
+      // classification path like every other prefix test; `/tc-acct/` and an
+      // absolute-form proxy URL do not start with it and are untouched.
+      const controlPath = classificationPath(req.url);
+      if (controlPath === '/teamclaude' || controlPath.startsWith('/teamclaude/')) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'unknown teamclaude control route (check the path and the method)' }));
+        return;
+      }
+
       return forward(req, res);
     } catch (err) {
       reportFailure('[TeamClaude] Unhandled error:', err);
@@ -553,7 +581,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // client's own headers), so it is not a way to spend the fleet's quota,
       // but it is a way to reach the upstream on this host's address and
       // bandwidth. A deployment on a public hostname hands that to anyone.
-      const auth = resolveUpgradeAuth(req, socket, config.proxy);
+      const auth = resolveUpgradeAuth(req, socket, config.proxy, boundHost());
       if (!auth.ok) {
         // Logged as well as answered: a WebSocket client discards the status
         // line, so the 401 alone leaves an operator with a channel that is
@@ -1405,7 +1433,7 @@ function relayStream(req, res, upstream, sx) {
  * proxy cannot honour the negotiation anyway because it relays the handshake
  * rather than answering it.
  */
-export function resolveUpgradeAuth(req, socket, proxyConfig) {
+export function resolveUpgradeAuth(req, socket, proxyConfig, boundHost = null) {
   const auth = resolveClientAuth(proxyConfig, req?.headers?.['x-api-key']);
   if (auth.ok) return auth;
   // Loopback is exempt from the key requirement, exactly as the HTTP and
@@ -1416,7 +1444,7 @@ export function resolveUpgradeAuth(req, socket, proxyConfig) {
   // sets on every handshake and a CLI never sends, nor `Host`, which a
   // rebound name (attacker.example → 127.0.0.1) leaves naming the attacker.
   if (!loopbackExempt(req?.headers, socket?.remoteAddress, proxyConfig)) return auth;
-  const bindHost = proxyConfig?.host;
+  const bindHost = boundHost || proxyConfig?.host;
   const origin = req?.headers?.origin;
   if (origin) {
     let originHost;
@@ -2567,6 +2595,35 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       await upstreamRes.body?.cancel();
       console.log(`[TeamClaude] 401 on "${account.name}" — token rejected; forcing refresh and retrying`);
       await accountManager.ensureTokenFresh(account.index, true);
+      if (clientGone(res)) { ctx.abandoned = true; return; }
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+    }
+
+    // A 401 the branch above did not take, or one that came BACK after it. The
+    // re-auth is gated on a stored refresh token, so an OAuth account without
+    // one, and every API-key account, had no 401 handler at all: the answer was
+    // relayed, the account stayed `active`, and the next request picked it
+    // again — measured as 4,124 consecutive 401s from one account over twenty
+    // hours while three healthy siblings served none of them (#412). Like the
+    // 403 above, the client must not see it: Claude Code reads a 401 as its own
+    // login having died. So the account is skipped for this request and the
+    // request fails over. It also leaves rotation when nothing here can repair
+    // it — no refresh token to try, or a freshly refreshed token rejected too.
+    // A 401 that merely ran out of retry budget proves nothing about the
+    // credential, so that one only fails over.
+    if (upstreamRes.status === 401 && !res.headersSent) {
+      await upstreamRes.body?.cancel();
+      const refreshed = ctx.reauthed.has(account.index);
+      const repairable = account.type === 'oauth' && !!account.refreshToken && !refreshed;
+      if (!repairable) {
+        accountManager.markCredentialRejected(account.index, account.type !== 'oauth'
+          ? 'upstream rejected its API key (401)'
+          : refreshed ? 'upstream rejected a freshly refreshed token (401)'
+            : 'upstream rejected its token (401) and it has no refresh token');
+      }
+      (ctx.credentialRejected ??= new Set()).add(account.name);
+      ctx.tried.add(account.index);
+      console.error(`[TeamClaude] 401 on "${safeLine(account.name, 64)}"; failing over to another account`);
       if (clientGone(res)) { ctx.abandoned = true; return; }
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }

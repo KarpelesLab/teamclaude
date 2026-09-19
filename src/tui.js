@@ -466,6 +466,7 @@ export class TUI {
     this._setTimeout = setTimeout;
     this._origLog = null;
     this._origErr = null;
+    this._origWarn = null;
   }
 
   // ── lifecycle ──────────────────────────────────────
@@ -522,8 +523,12 @@ export class TUI {
     // Redirect console to activity log
     this._origLog = console.log;
     this._origErr = console.error;
+    this._origWarn = console.warn;
     console.log = (...a) => this._addLog(a.join(' '));
     console.error = (...a) => this._addLog(a.join(' '));
+    // warn as well: the one caller (an unrecognised distributeSessions value on
+    // reload) otherwise writes raw over the dashboard and misses the log (#414).
+    console.warn = (...a) => this._addLog(a.join(' '));
 
     this._lastFrame = null;   // entering the alt screen always paints
     this.render();
@@ -560,7 +565,7 @@ export class TUI {
   stop() {
     this.running = false;
     if (this.timer) { clearTimeout(this.timer); this.timer = null; }
-    if (this._origLog) { console.log = this._origLog; console.error = this._origErr; }
+    if (this._origLog) { console.log = this._origLog; console.error = this._origErr; if (this._origWarn) console.warn = this._origWarn; }
     if (this._activityStream) { this._activityStream.end(); this._activityStream = null; }
     process.stdin.removeListener('data', this._dataHandler);
     process.stdout.removeListener('resize', this._resizeHandler);

@@ -1,6 +1,7 @@
 import { importCredentials } from './oauth.js';
 import { sameIdentity } from './identity.js';
 import { safeLine } from './safe-text.js';
+import { removedAccountIds } from './account-pairing.js';
 import { ensureAccountIds } from './account-id.js';
 
 /**
@@ -44,7 +45,15 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     return null;
   };
 
+  // The TUI's remove changes memory first and saves second. A reload landing
+  // between the two reads the file the save has not rewritten yet, finds a row
+  // with no running account, and would add it straight back — after which the
+  // save writes it back too. The ids are recorded for exactly that window
+  // (cleared once the save lands), so a row naming one is the removal itself,
+  // not a new account (#422).
+  const removed = removedAccountIds(memConfig);
   for (const diskAcct of diskConfig.accounts) {
+    if (diskAcct?.id && removed.has(diskAcct.id)) continue;
     const mgrIdx = claim(diskAcct);
     // Claimed once per disk entry and reused below. Calling claimConfig twice
     // for one entry would consume two different config rows.

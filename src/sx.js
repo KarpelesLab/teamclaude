@@ -42,12 +42,29 @@ export function sxBase(env = process.env, warn = (m) => console.error(m)) {
 
 // ── sx.org REST (apiKey is a query param; these hit api.sx.org directly, never
 // the proxy, and are unrelated to Anthropic traffic) ──
+// fetch gives a connect timeout and no response timeout, so an api.sx.org that
+// accepts the connection and then says nothing hung the promise for good — and
+// `reloadAccounts` awaits this path when the sx key or mode changed on disk, so
+// `POST /teamclaude/reload` and the TUI's R key never came back (#421).
+const SX_TIMEOUT_MS = 15_000;
+// A provisioning reply is a few hundred bytes; nothing here needs more.
+const SX_MAX_REPLY_BYTES = 1 << 20;
+
+/** @param {Response} res */
+async function sxJson(res) {
+  const declared = Number(res.headers.get('content-length'));
+  if (Number.isFinite(declared) && declared > SX_MAX_REPLY_BYTES) throw new Error('sx.org reply too large');
+  const text = await res.text();
+  if (text.length > SX_MAX_REPLY_BYTES) throw new Error('sx.org reply too large');
+  return JSON.parse(text);
+}
+
 async function sxGet(path, apiKey, params = {}) {
   const url = new URL(sxBase() + path);
   url.searchParams.set('apiKey', apiKey);
   for (const [k, v] of Object.entries(params)) url.searchParams.set(k, String(v));
-  const res = await fetch(url, { headers: { accept: 'application/json' } });
-  return res.json();
+  const res = await fetch(url, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(SX_TIMEOUT_MS) });
+  return sxJson(res);
 }
 
 async function sxPost(path, apiKey, body) {
@@ -57,8 +74,9 @@ async function sxPost(path, apiKey, body) {
     method: 'POST',
     headers: { 'content-type': 'application/json', accept: 'application/json' },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(SX_TIMEOUT_MS),
   });
-  return res.json();
+  return sxJson(res);
 }
 
 export const SX_MODES = ['off', '429', 'always'];

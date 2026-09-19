@@ -3796,6 +3796,23 @@ export class AccountManager {
   }
 
   /**
+   * Take an account out of rotation because upstream rejected its credential
+   * and nothing in this process can repair it. `error` is the state selection
+   * already skips and status already explains ("needs re-login"); a reload that
+   * brings a new credential, or re-enabling the account, clears it.
+   *
+   * @param {number} accountIndex
+   * @param {string} why  one clause for the log line
+   */
+  markCredentialRejected(accountIndex, why) {
+    const account = this.accounts[accountIndex];
+    if (!account || account.status === 'error') return;
+    account.status = 'error';
+    const remedy = account.type === 'oauth' ? 'run: teamclaude login' : 'check the key in the config';
+    console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}" taken out of rotation: ${why} — ${remedy}`);
+  }
+
+  /**
    * Update a specific account's OAuth tokens (e.g. after intercepting a token refresh).
    * @param {number} accountIndex
    * @param {{ accessToken?: string, refreshToken?: string, expiresAt?: number }} tokens
