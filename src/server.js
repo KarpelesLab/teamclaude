@@ -12,7 +12,7 @@ import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
 import { TopLevelFieldFinder, modelGlobMatches } from './model.js';
 import { BodyWriter, truncationNote } from './request-log.js';
 import { upstreamFetch, upstreamPoolStatus } from './upstream-fetch.js';
-import { applyAuthHeaders, upstreamFor, rewritesBody, providerForPath, providerOf, isSubscriptionAccount, DEFAULT_PROVIDER, PROVIDERS } from './provider.js';
+import { applyAuthHeaders, upstreamFor, rewritesBody, defaultHeadersTimeoutFor, providerForPath, providerOf, isSubscriptionAccount, DEFAULT_PROVIDER, PROVIDERS } from './provider.js';
 import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
 import { safeLine } from './safe-text.js';
@@ -2249,6 +2249,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         // Cancels the admission wait and the request itself when the client
         // goes away (see the listener's AbortController).
         signal: ctx.signal,
+        // How long the head may stay silent before the socket is called dead,
+        // when the operator has set no override. It is the account's provider
+        // that knows: Codex reasons with the head held open, so its first byte
+        // arrives minutes in and a two-minute deadline would cut a healthy
+        // request — and the client would only re-send and reason again.
+        defaultHeadersTimeoutMs: defaultHeadersTimeoutFor(account),
         body: ['GET', 'HEAD'].includes(method) ? undefined : sendBody,
         redirect: 'manual',
       }, sx, route);

@@ -174,6 +174,12 @@ and one TUI.
   `account_uuid` TeamClaude patches into an Anthropic request body — so the
   Codex path performs no body rewrite at all.
 - Tokens refresh against `auth.openai.com` using the Codex CLI's own client id.
+- The proxy waits **5 minutes** for the response head instead of the fleet's 2,
+  because the ChatGPT backend sends nothing until the model has finished
+  reasoning — on a large-context turn that is minutes of silence on a perfectly
+  healthy socket. The wait covers the head only: once it arrives the deadline is
+  dropped and the body streams for as long as it needs.
+  `TEAMCLAUDE_UPSTREAM_HEADERS_TIMEOUT_MS` overrides both figures.
 - The request body is forwarded untouched. This is a passthrough, not a
   translation layer: TeamClaude never converts between the Anthropic and OpenAI
   protocols.
