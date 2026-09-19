@@ -24,6 +24,9 @@ export const PROVIDERS = {
     // Anthropic pins the account inside the request body (metadata.user_id),
     // so the body rewrites apply here and only here.
     rewritesBody: true,
+    // No provider opinion on the header wait: a streamed completion delivers
+    // its first token in seconds, so the fleet default already fits.
+    headersTimeoutMs: null,
   },
   codex: {
     id: 'codex',
@@ -36,6 +39,15 @@ export const PROVIDERS = {
     // needed — and the Anthropic-specific tool-pair repair would be wrong to
     // apply to a Responses API body.
     rewritesBody: false,
+    // The ChatGPT backend holds the response head open while the model
+    // reasons, so time-to-first-byte here measures the length of the reasoning
+    // rather than the health of the socket: a large-context turn passes two
+    // minutes before its first byte and is still perfectly alive. Cutting it
+    // does not degrade gracefully either — the client re-sends, pays for a
+    // fresh reasoning run, and hits the same wall, so one short deadline turns
+    // into a loop of them. Five minutes is the wait that keeps the
+    // dead-socket guard useful while leaving a long reasoning turn alone.
+    headersTimeoutMs: 300_000,
   },
 };
 
@@ -70,6 +82,23 @@ export function providerOf(account) {
  */
 export function isSubscriptionAccount(account) {
   return account?.type === 'oauth';
+}
+
+/**
+ * Whether `account` is a candidate for a request arriving on `provider`'s path.
+ *
+ * The partition above, stated as the predicate rather than as its complement,
+ * because two places need it and they must not drift: selection expresses it as
+ * an exclusion (`_excludeOtherProviders`), while the exhaustion report needs the
+ * set itself — how many accounts the request could ever have landed on, and
+ * whose windows may speak for when it becomes servable again.
+ *
+ * @param {Record<string, any>|null|undefined} account
+ * @param {string} provider
+ * @returns {boolean}
+ */
+export function canServeProvider(account, provider) {
+  return providerOf(account) === provider || !isSubscriptionAccount(account);
 }
 
 // The hosts each provider is reached on, for MITM interception.
@@ -201,6 +230,22 @@ export function upstreamFor(account, configuredUpstream) {
 /** Whether the Anthropic-only body rewrites apply to this account. */
 export function rewritesBody(account) {
   return PROVIDERS[providerOf(account)].rewritesBody;
+}
+
+/**
+ * How long to wait for this account's upstream to send response HEADERS, when
+ * nothing more specific has been asked for.
+ *
+ * `null` means the provider has no opinion and the fleet default applies. The
+ * number is a default, not a setting: `TEAMCLAUDE_UPSTREAM_HEADERS_TIMEOUT_MS`
+ * and a per-call `headersTimeoutMs` both still win over it (see
+ * resolveHeadersTimeout in upstream-fetch.js).
+ *
+ * @param {Record<string, any>|null|undefined} account
+ * @returns {number|null}
+ */
+export function defaultHeadersTimeoutFor(account) {
+  return PROVIDERS[providerOf(account)].headersTimeoutMs;
 }
 
 /** Whether `account` is served by a process on this machine rather than by a
