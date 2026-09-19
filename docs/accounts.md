@@ -209,6 +209,11 @@ card. It survives a restart, which matters because the probe is off by default:
 without that, nothing would say a credit exists until something next happened to
 read the usage endpoint.
 
+Only the probe refreshes the count, so a reading can outlive the credit it
+describes — redeemed in the Codex CLI, or expired. The `status` line therefore
+says how old the reading is (`as of 3h ago`), and every surface drops it once it
+is more than 7 days old.
+
 The count is what the account **holds**. Whether a particular credit can be
 spent is a separate question — the payload's `applicable_available_count` is
 upstream's own view of how many would reset a window right now, and is named on

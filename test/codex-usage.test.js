@@ -172,3 +172,18 @@ test('an unstated applicable count is null, not zero', () => {
   const usage = normalizeCodexUsagePayload({ rate_limit_reset_credits: { available_count: 2 } });
   assert.deepEqual(usage.resetCredits, { available: 2, applicable: null });
 });
+
+// The count is drawn as `RC<n>` on a width-budgeted TUI row, and it comes from a
+// private endpoint: whatever arrives has to leave as a small whole number.
+test('reset-credit counts are truncated and capped at two digits', () => {
+  const read = (available_count, applicable_available_count) =>
+    normalizeCodexUsagePayload({ rate_limit_reset_credits: { available_count, applicable_available_count } }).resetCredits;
+  assert.deepEqual(read(1.9, 1.2), { available: 1, applicable: 1 });
+  assert.deepEqual(read(1e9, 250), { available: 99, applicable: 99 });
+  assert.deepEqual(read('3', '0'), { available: 3, applicable: 0 });
+  // Not a count at all: dropped, never clamped into one.
+  assert.equal(read(Infinity, 1), null);
+  assert.equal(read(NaN, 1), null);
+  assert.equal(read(-1, 1), null);
+  assert.deepEqual(read(2, Infinity), { available: 2, applicable: null });
+});

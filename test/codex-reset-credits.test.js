@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
 import { accountBadges } from '../src/dashboard.js';
-import { renderStatus, resetCreditLine } from '../src/status-renderer.js';
+import { renderStatus, resetCreditLine, RESET_CREDIT_MAX_AGE_MS } from '../src/status-renderer.js';
 import { resetCreditTag } from '../src/tui.js';
 
 // Free Codex rate-limit reset credits: the count an account holds, and every
@@ -92,4 +92,40 @@ test('a usage reading with no credit counters leaves the last one alone', () => 
   am.applyCodexUsageData(0, { resetCredits: { available: 1, applicable: 1 } });
   am.applyCodexUsageData(0, { sevenDay: { utilization: 0.5, resetAt: Date.now() + DAY } });
   assert.equal(am.accounts[0].quota.resetCredits.available, 1);
+});
+
+// Nothing refreshes the count but the usage probe, which is off by default, so a
+// credit that was redeemed or expired would otherwise stay on screen for good.
+// Every surface drops the reading once it is older than the cut-off.
+test('a reading older than the cut-off is hidden on every surface', () => {
+  const now = Date.now();
+  const paint = { dim: s => s, cyan: s => s, gray: s => s };
+  const at = seenAt => ({ resetCredits: { available: 1, applicable: 1, seenAt } });
+  const fresh = at(now - (RESET_CREDIT_MAX_AGE_MS - 60_000));
+  const stale = at(now - (RESET_CREDIT_MAX_AGE_MS + 60_000));
+
+  assert.equal(resetCreditTag(fresh, now), 'RC1');
+  assert.equal(resetCreditTag(stale, now), '');
+
+  assert.match(resetCreditLine({ quota: fresh }, paint, now), /1 free rate-limit reset credit/);
+  assert.equal(resetCreditLine({ quota: stale }, paint, now), null);
+
+  const badge = quota => accountBadges({ name: 'a', provider: 'codex', quota }, 'a', null, now)
+    .some(b => /reset credit/.test(b.text));
+  assert.equal(badge(fresh), true);
+  assert.equal(badge(stale), false);
+
+  const account = { name: 'a', type: 'oauth', status: 'active', quota: { unified5h: 0.2, unified7d: 0.3, ...stale }, usage: {}, sessions: 0 };
+  const out = renderStatus({ currentAccount: 'a', switchThreshold: 0.98, routes: [], sessions: {}, accounts: [account] }, { color: false, now });
+  assert.equal(/Reset/.test(out), false);
+});
+
+test('the status line says how old the reading is', () => {
+  const now = Date.now();
+  const paint = { dim: s => s, cyan: s => s, gray: s => s };
+  const line = seenAt => resetCreditLine({ quota: { resetCredits: { available: 2, applicable: 2, seenAt } } }, paint, now);
+  assert.match(line(now - 3 * 60 * 60 * 1000), /2 free rate-limit reset credits — as of 3h ago$/);
+  // Beside the applicability note, not instead of it.
+  const both = resetCreditLine({ quota: { resetCredits: { available: 1, applicable: 0, seenAt: now - DAY } } }, paint, now);
+  assert.match(both, /none applicable to a window right now, as of 1d ago$/);
 });

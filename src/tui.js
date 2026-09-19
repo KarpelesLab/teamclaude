@@ -11,7 +11,7 @@ import {
 import { configIndexFor, managerAccountFor, markAccountRemoved } from './account-pairing.js';
 import { PROVIDERS, providerOf } from './provider.js';
 import { mintAccountId } from './account-id.js';
-import { formatPercent } from './status-renderer.js';
+import { formatPercent, heldResetCredits } from './status-renderer.js';
 import { resolveMaxUsage } from './model.js';
 import { parseProxyUrl, proxyToUrl, describeProxy, describeSelfProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy } from './upstream-proxy.js';
 import { sanitizeText, safeLine } from './safe-text.js';
@@ -260,11 +260,16 @@ export function spendTag(quota) {
  * given credit is supported by the plan, and they cost a request nobody should
  * make to draw a badge.
  *
+ * A reading older than RESET_CREDIT_MAX_AGE_MS draws nothing: the row has no
+ * room to say how old the count is, so past the point where it stops being
+ * worth anything the honest tag is no tag.
+ *
  * @param {Record<string, any>|null|undefined} quota
+ * @param {number} [now]  ms epoch the reading's age is measured from
  */
-export function resetCreditTag(quota) {
-  const available = quota?.resetCredits?.available;
-  return Number.isFinite(available) && available > 0 ? `RC${available}` : '';
+export function resetCreditTag(quota, now = Date.now()) {
+  const available = heldResetCredits(quota, now);
+  return available ? `RC${available}` : '';
 }
 
 export function blockedFamilies(quota, threshold) {

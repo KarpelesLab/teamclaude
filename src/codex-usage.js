@@ -85,16 +85,34 @@ function additionalLimits(additional) {
  */
 function resetCredits(raw) {
   if (!raw || typeof raw !== 'object') return null;
-  const available = Number(raw.available_count);
+  const available = creditCount(raw.available_count);
   // A malformed or absent count is dropped rather than read as zero, the same
   // way a zeroed window is above: "none" and "we were not told" have different
   // consequences, and only one of them is a fact.
-  if (!Number.isFinite(available) || available < 0) return null;
-  const applicable = Number(raw.applicable_available_count);
-  return {
-    available,
-    applicable: Number.isFinite(applicable) && applicable >= 0 ? applicable : null,
-  };
+  if (available == null) return null;
+  return { available, applicable: creditCount(raw.applicable_available_count) };
+}
+
+// The most credits any surface will report. The count is drawn as `RC<n>` on a
+// TUI row budgeted to the cell, so it has to stay two digits wide whatever the
+// payload says; nobody holds a hundred of something granted one at a time.
+const RESET_CREDIT_COUNT_MAX = 99;
+
+/**
+ * One credit counter from the payload as a whole number in 0..99, or null when
+ * it is not a count at all (absent, non-numeric, infinite, negative).
+ *
+ * Truncated and capped because the value comes from a private endpoint and goes
+ * straight onto width-budgeted display rows: `1.5` or `1e9` would otherwise be
+ * drawn verbatim and push the row past its edge.
+ *
+ * @param {unknown} value
+ * @returns {number|null}
+ */
+function creditCount(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) return null;
+  return Math.min(Math.trunc(n), RESET_CREDIT_COUNT_MAX);
 }
 
 /**
