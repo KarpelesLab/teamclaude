@@ -45,6 +45,35 @@ export function resolveMaxUsage(maxUsage, bucket) {
   return null;
 }
 
+// A per-account money cap (accounts[].maxSpend) in the smallest unit of the
+// account's billing currency, or null when the account carries no valid cap or
+// upstream has not said what its currency is. The cap is written in major units
+// (`20` is $20.00) because that is how a person thinks about a budget; the
+// exponent that turns it into minor units comes from the same upstream `spend`
+// record the month-to-date figure does, so the two are always compared in the
+// same unit. Lives here for the reason resolveMaxUsage does: the status
+// renderer draws it from remote JSON as well as from a live account.
+export function resolveMaxSpendMinor(maxSpend, spend) {
+  if (typeof maxSpend !== 'number' || !Number.isFinite(maxSpend) || maxSpend < 0) return null;
+  const exponent = spend?.exponent ?? 2;
+  if (!Number.isInteger(exponent) || exponent < 0 || exponent > 6) return null;
+  return Math.round(maxSpend * 10 ** exponent);
+}
+
+// Whether an account has spent its money cap this month: `usedMinor` is the
+// month-to-date extra-usage figure upstream reports, and the cap binds at the
+// level set (`>=`), except that a cap of 0 means "not one cent" rather than
+// "nothing at all" — an account that has billed nothing is still under it.
+// Only an account that CAN bill is judged: with extra usage off upstream no
+// request costs money, and barring it would only waste the quota it still has.
+export function spendCapReached(maxSpend, spend) {
+  if (!spend?.enabled) return false;
+  const cap = resolveMaxSpendMinor(maxSpend, spend);
+  if (cap == null) return false;
+  const used = spend.usedMinor || 0;
+  return used > 0 && used >= cap;
+}
+
 // The switch threshold for one bucket on one account (accounts[].switchThreshold,
 // issue #409), falling back to the fleet's own thresholdFor(bucket) rather than
 // to DEFAULT_SWITCH_THRESHOLD directly — an account whose table lists only, say,

@@ -112,6 +112,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     // operator decision about a running fleet, and waiting for a restart to
     // honour a budget defeats the budget.
     mgr.maxUsage = diskAcct.maxUsage ?? null;
+    mgr.maxSpend = diskAcct.maxSpend ?? null;
     // Same for a per-account switch threshold (#409): thresholdFor() reads it
     // straight off the account, so a disk edit takes effect on the very next
     // selection without a restart, exactly like the fleet-wide setting does.
@@ -150,6 +151,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       if (diskAcct.stripRequestFields) cfgAcct.stripRequestFields = diskAcct.stripRequestFields; else delete cfgAcct.stripRequestFields;
       if (diskAcct.messageThreads === true) cfgAcct.messageThreads = true; else delete cfgAcct.messageThreads;
       if (diskAcct.maxUsage != null) cfgAcct.maxUsage = diskAcct.maxUsage; else delete cfgAcct.maxUsage;
+      if (diskAcct.maxSpend != null) cfgAcct.maxSpend = diskAcct.maxSpend; else delete cfgAcct.maxSpend;
       if (diskAcct.switchThreshold != null) cfgAcct.switchThreshold = diskAcct.switchThreshold; else delete cfgAcct.switchThreshold;
       if (diskAcct.priority != null) cfgAcct.priority = diskAcct.priority; else delete cfgAcct.priority;
       // The TUI's reorder writes this key onto the entry, so after one
