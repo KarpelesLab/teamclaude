@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   providerOf, providerForPath, applyAuthHeaders, upstreamFor, rewritesBody,
-  isKnownProvider, DEFAULT_PROVIDER,
+  defaultHeadersTimeoutFor, isKnownProvider, DEFAULT_PROVIDER,
 } from '../src/provider.js';
 
 // An account written before providers existed carries no `provider` field. It
@@ -110,4 +110,16 @@ test('the configured upstream applies to Anthropic only', () => {
 test('body rewrites are Anthropic-only', () => {
   assert.equal(rewritesBody({ type: 'oauth' }), true);
   assert.equal(rewritesBody({ provider: 'codex' }), false);
+});
+
+// Codex holds the response head open while the model reasons, so a large turn
+// passes two minutes before its first byte while the socket is perfectly
+// healthy. Anthropic streams within seconds and keeps the fleet default —
+// `null` says the provider has no opinion, so nothing else has to know what
+// that default is.
+test('Codex waits longer for the response head than the fleet default', () => {
+  assert.equal(defaultHeadersTimeoutFor({ provider: 'codex' }), 300_000);
+  assert.equal(defaultHeadersTimeoutFor({ provider: 'anthropic' }), null);
+  assert.equal(defaultHeadersTimeoutFor({ type: 'oauth' }), null);
+  assert.equal(defaultHeadersTimeoutFor(undefined), null);
 });

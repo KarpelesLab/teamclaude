@@ -176,6 +176,12 @@ and one TUI.
   `account_uuid` TeamClaude patches into an Anthropic request body — so the
   Codex path performs no body rewrite at all.
 - Tokens refresh against `auth.openai.com` using the Codex CLI's own client id.
+- The proxy waits **5 minutes** for the response head instead of the fleet's 2,
+  because the ChatGPT backend sends nothing until the model has finished
+  reasoning — on a large-context turn that is minutes of silence on a perfectly
+  healthy socket. The wait covers the head only: once it arrives the deadline is
+  dropped and the body streams for as long as it needs.
+  `TEAMCLAUDE_UPSTREAM_HEADERS_TIMEOUT_MS` overrides both figures.
 - The request body is forwarded untouched. This is a passthrough, not a
   translation layer: TeamClaude never converts between the Anthropic and OpenAI
   protocols.
@@ -196,6 +202,31 @@ Two details are worth knowing if you read the raw headers:
   family can put its 7-day window in `primary` while a model-scoped family puts
   a 5-hour window there. Windows are classified by their stated
   `window-minutes`, never by position.
+
+### Free rate-limit reset credits
+
+OpenAI occasionally grants a ChatGPT account a free **rate-limit reset credit**:
+redeeming one clears the account's spent windows ahead of their own reset. The
+Codex CLI offers it as a manual action only, so a pooled account that runs dry
+sits out the rest of its week holding one unless somebody notices it is there.
+
+The count an account holds comes free with the quota probe — it rides on the
+same `/wham/usage` payload the quota reading does — and shows up as `RC1` on the
+TUI row, a `Reset` line in `teamclaude status`, and a badge on the dashboard
+card. It survives a restart, which matters because the probe is off by default:
+without that, nothing would say a credit exists until something next happened to
+read the usage endpoint.
+
+Only the probe refreshes the count, so a reading can outlive the credit it
+describes — redeemed in the Codex CLI, or expired. The `status` line therefore
+says how old the reading is (`as of 3h ago`), and every surface drops it once it
+is more than 7 days old.
+
+The count is what the account **holds**. Whether a particular credit can be
+spent is a separate question — the payload's `applicable_available_count` is
+upstream's own view of how many would reset a window right now, and is named on
+the `status` line when it is zero — and spending one remains a manual action in
+the Codex CLI.
 
 ## Third-party backend accounts
 
