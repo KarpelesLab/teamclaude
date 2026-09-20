@@ -7,7 +7,7 @@ import { readFile } from 'node:fs/promises';
 import net from 'node:net';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, loadState, saveState } from './config.js';
 import { installCrashHandlers } from './crash-log.js';
-import { AccountManager, distributionMode } from './account-manager.js';
+import { AccountManager, distributionMode, accountRouting } from './account-manager.js';
 import { validateAdaptiveConfig } from './adaptive-distribution.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, loginOAuthWithPastedCode, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
@@ -43,6 +43,7 @@ import { buildClaudeEnvLines, bypassesAllHosts, clearSelfProxyEnvLines, encodePi
 import { serviceKind, installService, uninstallService, serviceStatus, renderService, logPath } from './service.js';
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
 import { getUpstreamProxy, describeProxy, describeSelfProxy } from './upstream-proxy.js';
+import { parseRoutingUrl, routingToUrl, describeRouting } from './account-routing.js';
 import { startEventLoopMonitor } from './event-loop-monitor.js';
 import {
   ConfigOpError,
@@ -87,6 +88,19 @@ const THRESHOLD_USAGE = [
 ].join('\n');
 
 const DISTRIBUTE_USAGE = 'Usage: teamclaude distribute <on|off|adaptive>';
+
+const ROUTING_USAGE = [
+  'Usage: teamclaude routing <account-name|email>                (show the account\'s routing)',
+  '       teamclaude routing <account-name|email> <url>          (set it)',
+  '       teamclaude routing <account-name|email> none           (clear it)',
+  '',
+  'One account\'s own egress proxy: EVERY connection made for that account —',
+  'completions, token refresh, profile and quota — tunnels through it, and no',
+  'other account is touched. Schemes: http (CONNECT), socks4, socks4a, socks5,',
+  'socks5h; the a/h forms resolve hostnames at the proxy. Optional user:pass@',
+  'auth, e.g. socks5h://alice:s3cret@proxy.example.com:1080. A bare host:port',
+  'is http. Changes apply to a running server immediately.',
+].join('\n');
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -177,6 +191,10 @@ switch (command) {
   case 'route':
   case 'routes':
     await routeCommand();
+    process.exit(0);
+    break;
+  case 'routing':
+    await routingCommand();
     process.exit(0);
     break;
   case 'update':
@@ -769,6 +787,7 @@ async function importCommand() {
 
   let name = argValue('--name');
   const jsonStr = argValue('--json');
+  const routing = routingFlagValue();
 
   let creds;
   if (jsonStr) {
@@ -800,10 +819,28 @@ async function importCommand() {
     }
   }
 
-  await upsertOAuthAccount(name, creds, 'import');
+  await upsertOAuthAccount(name, creds, 'import', routing);
 }
 
 // ── login ───────────────────────────────────────────────────
+
+/**
+ * The --routing flag, parsed: the account's own egress proxy URL
+ * (http/socks4/socks4a/socks5/socks5h with optional user:pass auth — see
+ * account-routing.js). An invalid value is a hard CLI error: a typo must not
+ * quietly add an account that goes direct. Null when the flag is absent.
+ * @returns {import('./account-routing.js').RoutingProxy|null}
+ */
+function routingFlagValue() {
+  const raw = argValue('--routing');
+  if (!raw) return null;
+  try {
+    return parseRoutingUrl(raw);
+  } catch (/** @type {any} */ err) {
+    console.error(`Invalid --routing value: ${err.message}`);
+    process.exit(1);
+  }
+}
 
 /**
  * `teamclaude login --codex` — browser OAuth against OpenAI, then store the
@@ -818,9 +855,10 @@ async function loginCodexCommand() {
   // must work before any config file exists. This copy is not what gets
   // written — see the atomicConfigUpdate below.
   await loadOrCreateConfig();
+  const routing = routingFlagValue();
   let creds;
   try {
-    creds = await loginCodex({ noBrowser: args.includes('--no-browser') });
+    creds = await loginCodex({ noBrowser: args.includes('--no-browser'), routing });
   } catch (err) {
     console.error(`Codex login failed: ${err.message}`);
     console.error('');
@@ -848,6 +886,10 @@ async function loginCodexCommand() {
       accessToken: creds.accessToken,
       refreshToken: creds.refreshToken,
       expiresAt: creds.expiresAt,
+      // Key absent rather than null when --routing was not passed: on a
+      // re-login the spread below then keeps the routing the entry already
+      // had, instead of silently clearing it.
+      ...(routing ? { routing: routingToUrl(routing) } : {}),
     };
 
     // Identity for a Codex account is its ChatGPT account id; fall back to the
@@ -916,6 +958,7 @@ async function loginCommand() {
 async function loginApiCommand() {
   await loadOrCreateConfig(); // first run: create the file; the save re-reads it
   let name = argValue('--name');
+  const routing = routingFlagValue();
 
   const rl = createInterface({ input: process.stdin, output: process.stderr });
   const apiKey = await new Promise(resolve => rl.question('Anthropic API key: ', resolve));
@@ -935,9 +978,12 @@ async function loginApiCommand() {
       const n = disk.accounts.filter(a => a.name.startsWith('api-')).length + 1;
       name = `api-${n}`;
     }
-    disk.accounts.push({ name, type: 'apikey', apiKey: apiKey.trim() });
+    disk.accounts.push({
+      name, type: 'apikey', apiKey: apiKey.trim(),
+      ...(routing ? { routing: routingToUrl(routing) } : {}),
+    });
   });
-  console.log(`Added API key account "${name}"`);
+  console.log(`Added API key account "${name}"${routing ? ` (routed via ${describeRouting(routing)})` : ''}`);
   console.log(`Saved to ${getConfigPath()}`);
   await notifyRunningServer(config);
 }
@@ -945,11 +991,12 @@ async function loginApiCommand() {
 async function loginOAuthCommand({ pasteOnly = false } = {}) {
   await loadOrCreateConfig(); // first run: create the file; the save re-reads it
   let name = argValue('--name');
+  const routing = routingFlagValue();
 
   console.log('Starting OAuth login...');
   let creds;
   try {
-    creds = pasteOnly ? await loginOAuthWithPastedCode() : await loginOAuth();
+    creds = pasteOnly ? await loginOAuthWithPastedCode({ routing }) : await loginOAuth({ routing });
   } catch (err) {
     console.error(`OAuth login failed: ${err.message}`);
     console.error('');
@@ -959,7 +1006,7 @@ async function loginOAuthCommand({ pasteOnly = false } = {}) {
     process.exit(1);
   }
 
-  await upsertOAuthAccount(name, creds, 'login');
+  await upsertOAuthAccount(name, creds, 'login', routing);
 }
 
 // ── env ─────────────────────────────────────────────────────
@@ -1377,13 +1424,14 @@ async function accountsCommand() {
   // so a file written before ids existed needs its ids on disk first.
   await persistMintedAccountIds(config);
 
-  // Refresh expired tokens before fetching profiles
+  // Refresh expired tokens before fetching profiles. Each call goes by the
+  // account's own routing when it has one — this is that account's traffic.
   const refreshed = [];
   await Promise.all(config.accounts.map(async (a) => {
     if (a.type !== 'oauth' || !a.refreshToken) return;
     if (!isTokenExpiringSoon(a.expiresAt)) return;
     try {
-      const newTokens = await refreshAccessToken(a.refreshToken);
+      const newTokens = await refreshAccessToken(a.refreshToken, undefined, accountRouting(a));
       a.accessToken = newTokens.accessToken;
       a.refreshToken = newTokens.refreshToken;
       a.expiresAt = newTokens.expiresAt;
@@ -1411,7 +1459,7 @@ async function accountsCommand() {
   // Fetch profiles in parallel for all OAuth accounts
   const profiles = await Promise.all(
     config.accounts.map(a =>
-      a.type === 'oauth' && a.accessToken ? fetchProfile(a.accessToken) : null
+      a.type === 'oauth' && a.accessToken ? fetchProfile(a.accessToken, accountRouting(a)) : null
     )
   );
 
@@ -1481,9 +1529,12 @@ async function accountsCommand() {
 
   for (const [i, a] of config.accounts.entries()) {
     const p = profiles[i];
+    // The account's own egress proxy, password masked; absent = fleet path.
+    const routeTag = describeRouting(accountRouting(a));
 
     if (a.type === 'apikey') {
       console.log(`  [${i + 1}] ${a.name} (apikey)  ${a.apiKey?.slice(0, 15)}...`);
+      if (routeTag) console.log(`       Route: ${routeTag}`);
       continue;
     }
 
@@ -1497,6 +1548,7 @@ async function accountsCommand() {
     if (hasProfile && p.orgName) console.log(`       Org:   ${p.orgName}`);
     // The stable pin identity (TC_ACCT), unlike the display name above.
     if (a.accountUuid) console.log(`       ID:    ${a.accountUuid}`);
+    if (routeTag) console.log(`       Route: ${routeTag}`);
     if (verbose && a.expiresAt) {
       const remaining = a.expiresAt - Date.now();
       if (remaining <= 0) {
@@ -2017,6 +2069,60 @@ async function setDisabledCommand(disabled) {
   await notifyRunningServer(config);
 }
 
+// ── routing ─────────────────────────────────────────────────
+
+async function routingCommand() {
+  const config = await loadOrCreateConfig();
+  const name = args[1];
+
+  if (!name) {
+    console.error(ROUTING_USAGE);
+    process.exit(1);
+  }
+
+  const account = resolveAccount(config.accounts, name, argValue('--org'));
+  if (!account) {
+    console.error(`Account "${name}" not found`);
+    process.exit(1);
+  }
+
+  // The URL is positional, like priority's number; a flag here would only
+  // collide with --org.
+  const value = args[2] && !args[2].startsWith('--') ? args[2] : null;
+
+  if (!value) {
+    const current = accountRouting(account);
+    console.log(current
+      ? `${account.name}: ${describeRouting(current)}`
+      : `${account.name}: no routing — the account uses the fleet egress (the upstream proxy when configured, direct otherwise)`);
+    return;
+  }
+
+  if (/^(none|off|-)$/i.test(value)) {
+    delete account.routing;
+    await saveConfig(config);
+    console.log(`Cleared routing for "${account.name}" — it now uses the fleet egress`);
+    await notifyRunningServer(config);
+    return;
+  }
+
+  /** @type {import('./account-routing.js').RoutingProxy|null} */
+  let routing = null;
+  try {
+    routing = parseRoutingUrl(value);
+  } catch (/** @type {any} */ err) {
+    console.error(err.message);
+    console.error('');
+    console.error(ROUTING_USAGE);
+    process.exit(1);
+  }
+  // Canonical form on disk: defaults spelled out, credentials percent-encoded.
+  account.routing = routingToUrl(routing);
+  await saveConfig(config);
+  console.log(`Routing "${account.name}" via ${describeRouting(routing)} — all of its traffic now tunnels through this proxy`);
+  await notifyRunningServer(config);
+}
+
 // ── help ────────────────────────────────────────────────────
 
 function showHelp() {
@@ -2063,6 +2169,11 @@ Commands:
   priority <name> <n> Set rotation priority (lower = preferred; --first/--last)
   route [list|add|rm] Per-model routing: pin model globs to specific accounts
                       (add <name> --match "<glob>" [--accounts "<name>"] [--bucket <b>])
+  routing <name> [url|none]
+                      Per-account egress proxy: send ALL of one account's
+                      traffic (completions, token refresh, quota) through its
+                      own proxy — http/socks4/socks4a/socks5/socks5h, optional
+                      user:pass@ auth; 'none' clears it (also: login --routing)
   threshold [pct]     Utilization at which rotation leaves an account (1-100);
                       per bucket with 'unified7d=90', and '=default' drops one
   distribute [on|off|adaptive]
@@ -2084,6 +2195,9 @@ Commands:
 
 Options:
   --name NAME         Set account name (import/login)
+  --routing URL       Per-account egress proxy for the account being added
+                      (import/login), e.g. socks5h://alice:s3cret@host:1080 —
+                      every connection for it tunnels through this proxy
   --org NAME|UUID     Disambiguate when an email spans multiple orgs (remove/priority/api)
   --from PATH         Credentials path (import, default: ~/.claude/.credentials.json;
                       on macOS the default falls back to the Keychain)
@@ -2137,6 +2251,17 @@ ALL_PROXY are honored when the config says nothing, NO_PROXY exempts hosts, and
 TUI settings screen. Distinct from "proxy" (the local port Claude Code talks to)
 and from sx.org (a specific residential-egress provider with its own policy).
 
+Per-account routing. One account can have its own egress proxy instead: set
+"routing": "socks5h://user:pass@host:1080" on the account, or run
+'teamclaude routing <name> <url>', or pass --routing to login/import. Every
+connection for that account — forwarding, token refresh, profile, usage and
+quota — tunnels through that proxy with TLS end to end; no other account is
+affected, and the account bypasses both the fleet upstream proxy and sx (its
+contract is that its traffic never leaves by another path). Schemes: http
+(CONNECT), socks4, socks4a, socks5, socks5h — the a/h forms resolve hostnames
+at the proxy; optional user:pass@ auth (SOCKS4 takes a username only). A bare
+host:port is http. Shown masked in 'accounts', status, and the TUI.
+
 Egress pin (opt-in, off unless configured). Set "egress": { "pin": "auto" } to
 hold requests whenever the exit IP is not the pinned one — a VPN that dropped
 mid-session otherwise sends the request from an unexpected region, and upstream
@@ -2161,10 +2286,19 @@ function orgLabel(a) {
   return a.orgName || (a.orgUuid ? a.orgUuid.slice(0, 8) : 'org');
 }
 
-async function upsertOAuthAccount(name, creds, source = 'unknown') {
+/**
+ * @param {string|null} name
+ * @param {Record<string, any>} creds
+ * @param {string} [source]
+ * @param {import('./account-routing.js').RoutingProxy|null} [routing] - the --routing
+ * flag, parsed: the new account's own egress proxy. The profile fetch below is
+ * already that account's traffic, so it goes the same way; null leaves every
+ * call on the fleet path.
+ */
+async function upsertOAuthAccount(name, creds, source = 'unknown', routing = null) {
   // Fetch profile to auto-name and deduplicate by account+org identity.
   const userNamed = !!name;
-  const profile = await fetchProfile(creds.accessToken);
+  const profile = await fetchProfile(creds.accessToken, routing);
   const profileOk = profile && !profile.error;
 
   if (!canUpsertOAuthAccount(profile, userNamed)) {
@@ -2208,6 +2342,10 @@ async function upsertOAuthAccount(name, creds, source = 'unknown') {
       accessToken: creds.accessToken,
       refreshToken: creds.refreshToken,
       expiresAt: creds.expiresAt,
+      // Key absent rather than null when --routing was not passed: on a
+      // re-login updateAccountEntry spreads incoming over prev, so the routing
+      // the entry already had survives instead of being silently cleared.
+      ...(routing ? { routing: routingToUrl(routing) } : {}),
     };
 
     // Deduplicate by account+org identity (same email in a different org is a
