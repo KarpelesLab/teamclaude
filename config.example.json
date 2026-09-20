@@ -40,6 +40,13 @@
       "refreshToken": "sk-ant-ort01-your-refresh-token"
     },
     {
+      "name": "waffles@waffle.com",
+      "type": "oauth",
+      "accessToken": "sk-ant-oat01-your-access-token",
+      "refreshToken": "sk-ant-ort01-your-refresh-token",
+      "routing": "socks5h://alice:s3cret@proxy.example.com:1080"
+    },
+    {
       "name": "codex@example.com",
       "type": "oauth",
       "provider": "codex",

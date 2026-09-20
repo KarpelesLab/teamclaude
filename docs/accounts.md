@@ -75,9 +75,45 @@ teamclaude enable <name>        # re-enable it (also clears a stuck error state)
 teamclaude priority <name> 1    # rotation preference, lower = preferred
 teamclaude priority <name> --first
 teamclaude priority <name> --last
+teamclaude routing <name> <url> # route ALL of the account's traffic via its own proxy
+teamclaude routing <name> none  # clear it
 ```
 
-`login`, `import`, `enable`, `disable` and `priority` notify a running server to reload, so credential, priority and enable/disable changes are picked up live; the same reload (POST `/teamclaude/reload`, or **R** in the TUI) also applies hand edits to an account's `upstream`/`modelMap`. Account **removals** made on disk still need a restart, because a reload never drops a running account; removing one from the TUI or through the [MCP endpoint](usage.md#mcp-endpoint)'s `remove_account` takes effect at once.
+`login`, `import`, `enable`, `disable`, `priority` and `routing` notify a running server to reload, so credential, priority, enable/disable and routing changes are picked up live; the same reload (POST `/teamclaude/reload`, or **R** in the TUI) also applies hand edits to an account's `upstream`/`modelMap`. Account **removals** made on disk still need a restart, because a reload never drops a running account; removing one from the TUI or through the [MCP endpoint](usage.md#mcp-endpoint)'s `remove_account` takes effect at once.
+
+## Per-account routing (`routing`)
+
+One account can leave through its own proxy while the rest of the fleet goes direct (or through the fleet [upstream proxy](proxy-modes.md#upstream-proxy)):
+
+```bash
+teamclaude login --name "waffles@waffle.com" --routing "socks5h://alice:s3cret@proxy.example.com:1080"
+teamclaude routing waffles@waffle.com socks5h://alice:s3cret@proxy.example.com:1080
+teamclaude routing waffles@waffle.com        # show it (password masked)
+teamclaude routing waffles@waffle.com none   # clear it
+```
+
+Or in the config:
+
+```json
+{ "name": "waffles@waffle.com", "type": "oauth", "routing": "socks5h://alice:s3cret@proxy.example.com:1080" }
+```
+
+**Every** connection made for that account (request forwarding, OAuth login and token refresh, profile, usage and quota probes) tunnels through the proxy with TLS end to end, and no other account is touched. A routed account bypasses both the fleet upstream proxy and sx.org: the contract is that its traffic never leaves by another path, so even a post-429 sx retry goes through the account's own proxy.
+
+Schemes:
+
+| Scheme | Protocol | Hostname resolution |
+| --- | --- | --- |
+| `http` | HTTP `CONNECT` | at the proxy |
+| `socks5` | SOCKS5 | locally |
+| `socks5h` | SOCKS5 | at the proxy |
+| `socks4` | SOCKS4 | locally (IPv4 only) |
+| `socks4a` | SOCKS4 | at the proxy |
+
+Optional `user:pass@` auth works for `http` and `socks5`/`socks5h` (SOCKS4 carries a username only, so a password there is refused with a message). A bare `host:port` is read as `http`. The `h`/`a` forms are usually what you want for a remote exit: the proxy resolves the hostname, so the exit's DNS view matches its geography.
+
+The value is validated when the account is read: a bad URL is reported once and ignored, never fatal. It shows masked in `teamclaude accounts`, `status`, and the TUI, and the reload note above applies to disk edits and `routing` changes alike. Settable through the [MCP endpoint](usage.md#mcp-endpoint)'s `set_account_routing` too.
+
 
 Accounts can also be added, removed and reordered from the TUI settings screen: **`g`** → **Add account** / **Remove account** / **Reorder accounts**.
 
