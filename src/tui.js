@@ -515,7 +515,7 @@ function timestamp() {
 // ── TUI class ────────────────────────────────────────────────
 
 export class TUI {
-  constructor({ accountManager, config, saveConfig, syncAccounts, onQuit, sx = null, probeQuota = null, activityLogPath = null,
+  constructor({ accountManager, config, saveConfig, syncAccounts, onQuit, sx = null, probeQuota = null, loginAccount = null, activityLogPath = null,
     // Attach mode: the accounts belong to a server in another process, reached
     // over its control plane. Everything that would mutate local state is off,
     // and a switch becomes a request (applySwitch) instead of an assignment.
@@ -540,6 +540,7 @@ export class TUI {
     this.sx = sx;            // sx.org proxy manager (may be null)
     this.sxBalance = null;   // last fetched sx.org balance, for the settings screen
     this.probeQuota = probeQuota; // on-demand fleet-wide quota refresh (may be null)
+    this.loginAccount = loginAccount; // browser (re-)login for a chosen account (may be null)
     this.activityLogPath = activityLogPath;
     this._readCredentials = readCredentials;
     this._readProfile = readProfile;
@@ -862,6 +863,16 @@ export class TUI {
       this.mode = 'select'; this.selAction = 'toggle'; this.selIdx = this.am.currentIndex; this.selReturn = 'normal';
     }
     else if (k === 'p' && this.am.accounts.length > 0) { this._doProbe(); }
+    // Re-login: an OAuth account whose refresh token upstream has rejected stays
+    // in 'error' until someone signs in again, and that someone is usually
+    // looking at this screen. The cursor starts on the first account that needs
+    // it, so the common case is `l`, Enter.
+    else if (k === 'l' && this.loginAccount && this.am.accounts.length > 0) {
+      const order = this._displayOrder();
+      const broken = order.find(i => this.am.accounts[i]?.status === 'error');
+      this.mode = 'select'; this.selAction = 'login'; this.selReturn = 'normal';
+      this.selIdx = broken ?? order[0] ?? 0;
+    }
     else if (k === 'g') { this.mode = 'settings'; this.setIdx = 0; this._loadSxBalance(); }
   }
 
@@ -1174,6 +1185,8 @@ export class TUI {
         this._doSwitchSelection();
       } else if (this.selAction === 'toggle') {
         this._doToggleDisabled(this.selIdx);
+      } else if (this.selAction === 'login') {
+        this._doLogin(this.selIdx);
       } else if (this.selAction === 'reorder') {
         // Every move is already applied, so Enter only means "done" — and it
         // has to be caught here, ahead of the remove branch below, which is
@@ -1309,6 +1322,40 @@ export class TUI {
       this._addLog(`Quota refresh failed: ${e.message}`);
     } finally {
       this._probing = false;
+    }
+  }
+
+  // Browser login for the account under the cursor (the `l` key). The row
+  // chooses the PROVIDER's sign-in page and tells the operator which identity to
+  // sign in as; it does not choose where the tokens go. They go to the account
+  // the browser actually signed in as — the same identity match `teamclaude
+  // login` makes — because writing one person's tokens onto the row that was
+  // merely highlighted would be a credential crossing. So a sign-in as someone
+  // else is reported as exactly that, and the picked row stays in need of one.
+  // Fire-and-forget: the flow waits on a human for up to two minutes, and the
+  // dashboard has to stay live meanwhile.
+  async _doLogin(idx) {
+    const acct = this.am.accounts[idx];
+    if (!acct) { this._addLog('That account is no longer listed'); return; }
+    if (!this.loginAccount) { this._addLog('Login unavailable'); return; }
+    if (acct.type !== 'oauth') { this._addLog(`"${acct.name}" is not an OAuth account — nothing to sign in to`); return; }
+    // One at a time: a second flow would race the first for the browser, and
+    // for Codex for the fixed callback port as well.
+    if (this._loggingIn) { this._addLog(`Still waiting on the sign-in for "${this._loggingIn}"`); return; }
+    this._loggingIn = acct.name;
+    this._addLog(`Sign in as "${acct.name}" in the browser (waits 2 minutes)...`);
+    try {
+      const outcome = await this.loginAccount(acct);
+      if (outcome?.name && outcome.name !== acct.name) {
+        this._addLog(`Signed in as "${outcome.name}" (${outcome.action}), not "${acct.name}" — that one still needs a login`);
+      } else {
+        this._addLog(`Logged in "${acct.name}"`);
+      }
+    } catch (e) {
+      this._addLog(`Login failed for "${acct.name}": ${e?.message || e}`);
+    } finally {
+      this._loggingIn = null;
+      if (this.running) this.render();
     }
   }
 
@@ -2664,7 +2711,7 @@ export class TUI {
       case 'normal':
         return this.remote
           ? ` ${bold('s')}witch  ${bold('R')}eload  ${bold('q')}uit`
-          : ` ${bold('s')}witch  ${bold('d')}isable  ${bold('p')}robe quota  ${bold('R')}eload  ${bold('g')} settings  ${bold('q')}uit`;
+          : ` ${bold('s')}witch  ${bold('d')}isable  ${this.loginAccount ? `${bold('l')}ogin  ` : ''}${bold('p')}robe quota  ${bold('R')}eload  ${bold('g')} settings  ${bold('q')}uit`;
       case 'settings':
         return ` ${dim('↑↓')} navigate  ${dim('←→')} change  ${bold('Enter')} edit  ${bold('Esc')} back`;
       case 'routes':
@@ -2691,6 +2738,9 @@ export class TUI {
         // offering "cancel" would promise an undo this screen does not have.
         if (this.selAction === 'reorder') {
           return ` ${dim('↑↓')} select  ${dim('←→')} move  ${bold('Enter')}/${bold('Esc')} done`;
+        }
+        if (this.selAction === 'login') {
+          return ` ${dim('↑↓')} select  ${bold('Enter')} sign in via browser  ${bold('Esc')} cancel`;
         }
         const act = this.selAction === 'toggle' ? 'enable/disable' : 'remove';
         return ` ${dim('↑↓')} select  ${bold('Enter')} ${act}  ${bold('Esc')} cancel`;

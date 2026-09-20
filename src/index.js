@@ -22,6 +22,7 @@ import {
 } from './identity.js';
 import { resolveAccounts } from './resolve-accounts.js';
 import { loginCodex } from './codex-auth.js';
+import { providerOf } from './provider.js';
 import { syncAccountsFromDisk } from './sync-accounts.js';
 import { mergeAccountsForSave, syncRefreshedTokens, removedAccountIds, clearRemovedAccountIds } from './account-pairing.js';
 import { ensureAccountIds } from './account-id.js';
@@ -521,6 +522,18 @@ async function serverCommand() {
         if (config.routes != null) diskConfig.routes = config.routes;
       }),
       syncAccounts: reloadAccounts,
+      // `l` key: browser login for the chosen account's provider, from inside
+      // the running server. Same upsert the CLI uses — the account the BROWSER
+      // signed in as is the one that gets the tokens, whichever row was picked —
+      // then an in-process reload instead of the CLI's HTTP notify. Never exits:
+      // a failed login is a line in the activity pane, not the end of the proxy.
+      loginAccount: async (account) => {
+        const outcome = account && providerOf(account) === 'codex'
+          ? await upsertCodexAccount(undefined, await loginCodex({ showUrl: false }))
+          : await upsertOAuthAccount(undefined, await loginOAuth({ interactive: false }), 'login', { fatal: false, notify: false });
+        await reloadAccounts();
+        return outcome;
+      },
       // `p` key: on-demand fleet-wide quota refresh. The prober is constructed
       // after the TUI, so this is a thunk over the closure variable.
       probeQuota: () => prober?.probeAll(),
@@ -830,13 +843,27 @@ async function loginCodexCommand() {
     process.exit(1);
   }
 
-  // The browser flow above can take minutes, and a running server may have
-  // rotated another account's refresh token on disk in the meantime. Writing
-  // the copy loaded before the flow would put the dead token back, and that
-  // account would fail on its next restart. So the upsert runs against a fresh
-  // read of the file, and only this account's row is touched.
+  await upsertCodexAccount(argValue('--name'), creds);
+}
+
+/**
+ * Store a Codex login: refresh the row for the same ChatGPT account, or add one.
+ *
+ * The browser flow that produced `creds` can take minutes, and a running server
+ * may have rotated another account's refresh token on disk in the meantime.
+ * Writing a copy loaded before the flow would put the dead token back, and that
+ * account would fail on its next restart. So the upsert runs against a fresh
+ * read of the file, and only this account's row is touched.
+ *
+ * @param {string | undefined} requestedName
+ * @param {any} creds
+ * @returns {Promise<{ action: 'updated' | 'added', name: string }>}
+ */
+async function upsertCodexAccount(requestedName, creds) {
+  /** @type {{ action: 'updated' | 'added', name: string }} */
+  let outcome = { action: 'added', name: requestedName || '' };
   await atomicConfigUpdate(config => {
-    const name = argValue('--name') || creds.email
+    const name = requestedName || creds.email
       || `codex-${config.accounts.filter(a => a.provider === 'codex').length + 1}`;
 
     const account = {
@@ -860,13 +887,16 @@ async function loginCodexCommand() {
     if (idx >= 0) {
       const prev = config.accounts[idx];
       config.accounts[idx] = { ...prev, ...account, name: prev.name };
+      outcome = { action: 'updated', name: prev.name };
       console.log(`Updated account "${prev.name}"`);
     } else {
       config.accounts.push(account);
+      outcome = { action: 'added', name: account.name };
       console.log(`Added account "${account.name}"${creds.planType ? ` (${creds.planType})` : ''}`);
     }
   });
   console.log(`Saved to ${getConfigPath()}`);
+  return outcome;
 }
 
 async function loginCommand() {
@@ -2161,14 +2191,26 @@ function orgLabel(a) {
   return a.orgName || (a.orgUuid ? a.orgUuid.slice(0, 8) : 'org');
 }
 
-async function upsertOAuthAccount(name, creds, source = 'unknown') {
+/**
+ * @param {string | undefined} name
+ * @param {any} creds
+ * @param {string} [source]
+ * @param {{ fatal?: boolean, notify?: boolean }} [opts] The CLI exits on an
+ *   unidentifiable account and pokes a running server afterwards. The TUI's
+ *   login runs INSIDE that server: it must survive a failed login (`fatal:
+ *   false` throws instead) and reloads itself rather than over HTTP.
+ * @returns {Promise<{ action: 'updated' | 'added', name: string }>}
+ */
+async function upsertOAuthAccount(name, creds, source = 'unknown', { fatal = true, notify = true } = {}) {
   // Fetch profile to auto-name and deduplicate by account+org identity.
   const userNamed = !!name;
   const profile = await fetchProfile(creds.accessToken);
   const profileOk = profile && !profile.error;
 
   if (!canUpsertOAuthAccount(profile, userNamed)) {
-    console.error(`Could not identify OAuth account — ${profile?.error || 'profile unavailable'}`);
+    const why = `Could not identify OAuth account — ${profile?.error || 'profile unavailable'}`;
+    if (!fatal) throw new Error(why);
+    console.error(why);
     console.error('Retry with valid credentials, or pass --name to add the account without profile detection.');
     process.exit(1);
   }
@@ -2189,6 +2231,8 @@ async function upsertOAuthAccount(name, creds, source = 'unknown') {
   // read of the file: only this account's row (and, in the multi-org case, the
   // display name of its namesakes) changes; every other row stays as it is on
   // disk.
+  /** @type {{ action: 'updated' | 'added', name: string }} */
+  let outcome = { action: 'added', name: name || '' };
   const config = await atomicConfigUpdate(config => {
     if (!name) {
       const n = config.accounts.filter(a => a.name.startsWith('account-')).length + 1;
@@ -2220,6 +2264,7 @@ async function upsertOAuthAccount(name, creds, source = 'unknown') {
       // display name, entry id, and any disk-only fields (e.g. importFrom).
       const prev = config.accounts[idx];
       config.accounts[idx] = updateAccountEntry(prev, account);
+      outcome = { action: 'updated', name: prev.name };
       console.log(`Updated account "${prev.name}"`);
     } else {
       // New org for this person: if another entry shares the accountUuid, the bare
@@ -2236,11 +2281,13 @@ async function upsertOAuthAccount(name, creds, source = 'unknown') {
         }
       }
       config.accounts.push(account);
+      outcome = { action: 'added', name: account.name };
       console.log(`Added account "${account.name}"`);
     }
   });
   console.log(`Saved to ${getConfigPath()}`);
-  await notifyRunningServer(config);
+  if (notify) await notifyRunningServer(config);
+  return outcome;
 }
 
 // ── config sync helpers ─────────────────────────────────────

@@ -606,8 +606,11 @@ export function parseAuthCode(input, expectedState) {
 /**
  * Perform OAuth login via browser with PKCE flow.
  * Opens the user's browser, waits for the callback, exchanges the code for tokens.
+ *
+ * @param {{ interactive?: boolean }} [opts] `interactive: false` skips the
+ *   stdin paste prompt and the printed URL, for a caller that owns the terminal.
  */
-export async function loginOAuth() {
+export async function loginOAuth({ interactive = true } = {}) {
   // Generate PKCE
   const codeVerifier = randomBytes(32).toString('base64url');
   const codeChallenge = createHash('sha256').update(codeVerifier).digest('base64url');
@@ -630,13 +633,18 @@ export async function loginOAuth() {
 
   // Open browser
   console.log('Opening browser for authentication...');
-  console.log(`If it doesn't open, visit:\n  ${authUrl.toString()}\n`);
+  // The URL is several hundred characters and the paste prompt below reads
+  // stdin. A caller that owns the terminal — the TUI, whose stdin is its key
+  // handler and whose console is a one-line-per-entry activity pane — can use
+  // neither, so `interactive: false` leaves the browser callback as the only
+  // way in. The callback server's own two-minute timeout still ends the wait.
+  if (interactive) console.log(`If it doesn't open, visit:\n  ${authUrl.toString()}\n`);
   openBrowser(authUrl.toString());
 
   // Wait for either the callback server or manual paste from stdin
   let code;
   try {
-    code = await raceWithStdinCode(codePromise, state);
+    code = interactive ? await raceWithStdinCode(codePromise, state) : await codePromise;
   } finally {
     server.close();
   }

@@ -229,7 +229,7 @@ export function codexCallbackHandler(expectedState, { resolve, reject }) {
   };
 }
 
-export async function loginCodex({ noBrowser = false, timeoutMs = 120_000 } = {}) {
+export async function loginCodex({ noBrowser = false, timeoutMs = 120_000, showUrl = true } = {}) {
   const codeVerifier = randomBytes(32).toString('base64url');
   const codeChallenge = createHash('sha256').update(codeVerifier).digest('base64url');
   const state = randomBytes(32).toString('base64url');
@@ -249,7 +249,9 @@ export async function loginCodex({ noBrowser = false, timeoutMs = 120_000 } = {}
       } else {
         console.log('Opening browser for OpenAI sign-in...');
         openBrowser(authUrl);
-        console.log(`If it did not open, visit:\n${authUrl}`);
+        // showUrl: false is for a caller whose console is the TUI's one-line
+        // activity pane, where a multi-line URL is noise it cannot act on.
+        if (showUrl) console.log(`If it did not open, visit:\n${authUrl}`);
       }
     });
 

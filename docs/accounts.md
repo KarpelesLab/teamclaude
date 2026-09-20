@@ -81,6 +81,14 @@ teamclaude priority <name> --last
 
 Accounts can also be added, removed and reordered from the TUI settings screen: **`g`** → **Add account** / **Remove account** / **Reorder accounts**.
 
+### Signing in again from the TUI
+
+An OAuth account whose refresh token upstream has rejected — typically because the same account was signed in somewhere else, which rotates the token and kills the copy TeamClaude holds — shows as `error` and stays that way until someone signs in again. Press **`l`** on the dashboard: the picker opens on the first account in `error`, and **Enter** opens the provider's sign-in page in your browser (Claude or Codex, by the account's provider). The dashboard stays live while it waits, up to two minutes.
+
+The tokens go to the account the browser actually signed in as, matched by identity exactly as `teamclaude login` does — not to whichever row was highlighted. Sign in as a different account and that account is updated (or added) instead, the activity pane says so, and the row you picked still needs its login.
+
+The key needs a browser on the machine running the server, so it is not offered in `teamclaude attach`, and on a headless host `teamclaude login --token` remains the way.
+
 **Reorder accounts** sets the order the account list is drawn in — `↑`/`↓` pick an account, `←`/`→` move it up and down, each move saved as you make it. It writes a `displayOrder` on the entry and touches nothing else: an account keeps its place in the `accounts` array, so route pins, session pins and `TC_ACCT` all go on naming the same accounts, and rotation order stays `priority`'s business alone. An account with no `displayOrder` — every account, until the first time you arrange them, and every one added afterwards — lists after the ones that have one, which is where a newly added account appeared anyway. A [third-party backend](#third-party-backend-accounts) served by a local process is infrastructure rather than a seat to rotate between: the TUI keeps those at the end of the list, and the screen leaves them there.
 
 ## The `id` field
