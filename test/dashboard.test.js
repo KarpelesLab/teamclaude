@@ -679,8 +679,10 @@ test('dashboard page is self-contained: no external resources', () => {
   assert.match(html, /fetch\('\/teamclaude\/status'/);
 });
 
-test('GET /teamclaude/dashboard serves HTML without a key; other methods take the normal path', async () => {
+test('GET /teamclaude/dashboard serves HTML without a key; other methods are a local 404', async () => {
+  let upstreamHits = 0;
   const upstream = http.createServer((req, res) => {
+    upstreamHits++;
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ upstream: true }));
   });
@@ -711,11 +713,13 @@ test('GET /teamclaude/dashboard serves HTML without a key; other methods take th
     assert.equal(page.headers.get('x-content-type-options'), 'nosniff');
 
     // The asset route is GET + exact path only — a POST to the same path must
-    // NOT hit the dashboard handler but flow down the normal (gated, then
-    // proxied) pipeline like any other request. Loopback is key-exempt, so
-    // over a real socket the observable is that it reaches the upstream.
+    // NOT hit the dashboard handler. It used to flow on to the forwarder and
+    // reach the upstream under a fleet credential; an unclaimed path under the
+    // proxy's own prefix is now answered here (#420).
     const post = await fetch(`http://127.0.0.1:${port}/teamclaude/dashboard`, { method: 'POST' });
-    assert.deepEqual(await post.json(), { upstream: true });
+    assert.equal(post.status, 404);
+    assert.match((await post.json()).error, /unknown teamclaude control route/);
+    assert.equal(upstreamHits, 0);
   } finally {
     proxy.close();
     upstream.close();

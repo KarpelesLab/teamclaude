@@ -2953,19 +2953,18 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // hours while three healthy siblings served none of them (#412). Like the
     // 403 above, the client must not see it: Claude Code reads a 401 as its own
     // login having died. So the account is skipped for this request and the
-    // request fails over. It also leaves rotation when nothing here can repair
-    // it — no refresh token to try, or a freshly refreshed token rejected too.
-    // A 401 that merely ran out of retry budget proves nothing about the
-    // credential, so that one only fails over.
+    // request fails over. It also leaves rotation when nothing here can ever
+    // repair it: an API key, or an OAuth account with no refresh token to try.
+    // An account that DOES hold one only fails over. Its second 401 can be stale
+    // news — the forced refresh is suppressed for a short floor after a
+    // successful one (the refresh-storm guard), so the retry may have gone out
+    // on the same token — and a later request gets to try the refresh again.
     if (upstreamRes.status === 401 && !res.headersSent) {
       await upstreamRes.body?.cancel();
-      const refreshed = ctx.reauthed.has(account.index);
-      const repairable = account.type === 'oauth' && !!account.refreshToken && !refreshed;
-      if (!repairable) {
+      if (account.type !== 'oauth' || !account.refreshToken) {
         accountManager.markCredentialRejected(account.index, account.type !== 'oauth'
           ? 'upstream rejected its API key (401)'
-          : refreshed ? 'upstream rejected a freshly refreshed token (401)'
-            : 'upstream rejected its token (401) and it has no refresh token');
+          : 'upstream rejected its token (401) and it has no refresh token');
       }
       (ctx.credentialRejected ??= new Set()).add(account.name);
       ctx.tried.add(account.index);
