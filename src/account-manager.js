@@ -3,7 +3,7 @@ import { providerOf, DEFAULT_PROVIDER, isSubscriptionAccount, canServeProvider }
 import { refreshCodexToken } from './codex-auth.js';
 import { parseCodexQuota, parseCodexPlanType } from './codex-quota.js';
 import { sameIdentity } from './identity.js';
-import { weeklyBucketForModel, modelGlobMatches, modelFamily, gatingUtilization, resolveMaxUsage, resolveSwitchThreshold, sanitizeSwitchThreshold, WEEKLY_BUCKET_KEYS } from './model.js';
+import { weeklyBucketForModel, modelGlobMatches, modelFamily, gatingUtilization, resolveMaxUsage, spendCapReached, resolveSwitchThreshold, sanitizeSwitchThreshold, WEEKLY_BUCKET_KEYS } from './model.js';
 import { SessionTracker } from './session-tracker.js';
 import { buildQuotaSummary, quotaTier } from './quota-summary.js';
 import { ROLLOVER_MIN_JUMP_MS, remapHeld, findHeld, dropHeld, newObservation } from './rollover.js';
@@ -236,6 +236,9 @@ function makeAccount(acct, index) {
     displayOrder: Number.isFinite(acct.displayOrder) ? acct.displayOrder : null,
     disabled: acct.disabled || false,
     maxUsage: acct.maxUsage ?? null,
+    // Money cap in the account's currency (accounts[].maxSpend). Like maxUsage a
+    // total, not a preference: at the cap the account receives nothing.
+    maxSpend: acct.maxSpend ?? null,
     // Per-account switchThreshold override (issue #409) — a rotation
     // PREFERENCE like the fleet setting, not the hard cap maxUsage is. See
     // thresholdFor() for the resolution order.
@@ -547,6 +550,11 @@ export class AccountManager {
    * alone. Both apply: a Fable request is capped by whichever binds first.
    */
   capExceeded(account, model = null) {
+    // The money cap first: it is the budget the usage caps exist to protect, and
+    // it is account-wide — no model is exempt from costing money. `spend` is the
+    // upstream month-to-date record, refreshed by every probe and every
+    // response, so a new month lifts the cap on the next reading by itself.
+    if (account?.maxSpend != null && spendCapReached(account.maxSpend, account.quota?.spend)) return 'spend';
     if (!account?.maxUsage) return null;
     const q = account.quota;
     // Same reason _isNearQuota does this first: a window that has already reset
@@ -1798,6 +1806,7 @@ export class AccountManager {
     // it is a decision rather than an estimate — and unlike the switch threshold
     // nothing overrides it: _selectProbe skips a capped account too, so an
     // account at its cap receives no requests at all.
+    if (this.capExceeded(account, model) === 'spend') return 'spend-capped';
     if (this.capExceeded(account, model)) return 'capped';
 
     // A structured organization-policy 403 means this account cannot serve OAuth
@@ -4140,6 +4149,7 @@ export class AccountManager {
         displayOrder: a.displayOrder ?? null,
         disabled: a.disabled || false,
         maxUsage: a.maxUsage ?? null,
+        maxSpend: a.maxSpend ?? null,
         // Raw per-account override (issue #409), same shapes as the fleet-wide
         // field, so a remote reader (the attach-mode TUI, a status --json
         // consumer) can resolve it with the shared resolveSwitchThreshold

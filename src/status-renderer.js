@@ -1,5 +1,5 @@
 import { formatMoney } from './oauth.js';
-import { findFamilyBlock, modelGlobOverlaps, gatingUtilization, resolveMaxUsage, resolveSwitchThreshold, resolveFleetThreshold, switchThresholdDiffs } from './model.js';
+import { findFamilyBlock, modelGlobOverlaps, gatingUtilization, resolveMaxUsage, resolveSwitchThreshold, resolveFleetThreshold, switchThresholdDiffs, resolveMaxSpendMinor, spendCapReached } from './model.js';
 import { safeLine } from './safe-text.js';
 import { ROUTE_COLORS } from './config-ops.js';
 
@@ -139,6 +139,7 @@ export const UNAVAILABLE_TEXT = {
   'upstream-rejected': 'upstream reports quota rejected',
   quota: 'local switch threshold reached',
   capped: 'account usage cap reached (maxUsage)',
+  'spend-capped': 'extra-usage spend cap reached (maxSpend)',
   'advisor-capped': "advisor model's usage cap reached (maxUsage)",
   entitlement: 'upstream refused this account for the organization (cooldown)',
   route: 'no route allows this account',
@@ -164,12 +165,21 @@ export function spendLine(account, paint) {
   if (!spend.enabled && !spent) return null;
 
   const amount = formatMoney(spend);
+  // The operator's own ceiling (accounts[].maxSpend), drawn beside the upstream
+  // figure it is judged against so the two read in one glance: `$14.35 of
+  // $10,000.00 used this month, cap $20.00`. Named `cap` like the usage caps on
+  // the bars above — same word, same meaning: at it the account gets nothing.
+  const capMinor = resolveMaxSpendMinor(account?.maxSpend, spend);
+  const cap = capMinor == null ? '' : `, cap ${formatMoney({ ...spend, usedMinor: capMinor, limitMinor: null })}`;
   if (spend.enabled) {
     // Already billing is the louder of the two: red, and named as money rather
     // than as a percentage, so it cannot be mistaken for another quota bar.
-    const text = spent
-      ? `billing real money — ${amount} used this month`
-      : `can bill real money past its plan limits — ${amount} used`;
+    const reached = spendCapReached(account?.maxSpend, spend);
+    const text = reached
+      ? `spend cap reached — ${amount} used this month${cap}`
+      : spent
+        ? `billing real money — ${amount} used this month${cap}`
+        : `can bill real money past its plan limits — ${amount} used${cap}`;
     return `${paint.dim('Spend'.padEnd(8))} ${(spent ? paint.red : paint.yellow)(`\u26a0 ${text}`)}`;
   }
   // Not enabled, but money was spent this month. Say why it is off now, since

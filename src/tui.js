@@ -1,6 +1,6 @@
 import { createWriteStream } from 'node:fs';
 import { gatingUtilization } from './model.js';
-import { importCredentials, fetchProfile } from './oauth.js';
+import { importCredentials, fetchProfile, formatMoney } from './oauth.js';
 import {
   sameIdentity,
   findUpsertTarget,
@@ -12,7 +12,7 @@ import { configIndexFor, managerAccountFor, markAccountRemoved } from './account
 import { PROVIDERS, providerOf, isSubscriptionAccount } from './provider.js';
 import { mintAccountId } from './account-id.js';
 import { formatPercent, heldResetCredits } from './status-renderer.js';
-import { resolveMaxUsage, switchThresholdDiffs } from './model.js';
+import { resolveMaxUsage, resolveMaxSpendMinor, switchThresholdDiffs } from './model.js';
 import { parseProxyUrl, proxyToUrl, describeProxy, describeSelfProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy } from './upstream-proxy.js';
 import { sanitizeText, safeLine } from './safe-text.js';
 // The setting rules live in one module; the CLI, the MCP tools and this screen
@@ -263,19 +263,37 @@ function rowCategory(/** @type {any} */ account) {
 // `threshold` is a number, or a per-bucket lookup (bucket → number) so a family
 // is judged against its OWN configured threshold rather than the global one.
 /**
- * Short row tag for an account that bills real money past its plan limits:
- * `$!` once something has actually been billed, `$` while it merely can be,
- * '' when it cannot. ASCII on purpose — the row is width-budgeted to the cell,
- * and a glyph whose width varies by terminal would push it past the edge.
+ * Short row tag for an account that bills real money past its plan limits: the
+ * month-to-date amount once something has actually been billed (`$14.35`), `$`
+ * while it merely can be, '' when it cannot. With a money cap configured
+ * (accounts[].maxSpend) the cap trails it, `$14.35/20`, so the row shows how
+ * much of the budget is gone without a trip to the status screen. ASCII on
+ * purpose — the row is width-budgeted to the cell, and a glyph whose width
+ * varies by terminal would push it past the edge; the budget takes this tag's
+ * width from the same call, so a longer amount widens the column, never the row.
  *
  * Deliberately not shown for an account that spent earlier and has since been
  * switched off: the row reports what rotating onto this account costs now, and
  * the status screen carries the fuller history.
+ *
+ * @param {any} quota
+ * @param {number | null} [maxSpend] the account's accounts[].maxSpend, if any
  */
-export function spendTag(quota) {
+export function spendTag(quota, maxSpend = null) {
   const spend = quota?.spend;
   if (!spend?.enabled) return '';
-  return (spend.usedMinor || 0) > 0 ? '$!' : '$';
+  const used = spend.usedMinor || 0;
+  const capMinor = resolveMaxSpendMinor(maxSpend, spend);
+  const cap = capMinor == null ? '' : `/${compactMoney(capMinor, spend)}`;
+  if (used <= 0) return `$${cap}`;
+  return `${formatMoney({ ...spend, limitMinor: null })}${cap}`;
+}
+
+// `20` for a whole-unit cap, `12.5` otherwise: the cap is the operator's own
+// round number, so the cents that formatMoney always carries would only be
+// noise after the slash.
+function compactMoney(minor, spend) {
+  return String(minor / 10 ** (spend?.exponent ?? 2));
 }
 
 // The type column: the auth kind (7 columns), or the provider in a mixed pool.
@@ -1920,7 +1938,7 @@ export class TUI {
       // column the budget has to know about, or the row overflows exactly the
       // way #228 fixed.
       const spendW = members.reduce((w, a) => {
-        const tag = spendTag(a.quota);
+        const tag = spendTag(a.quota, a.maxSpend);
         return tag ? Math.max(w, 2 + vw(tag)) : w;
       }, 0);
       // Same rule again for the switch-threshold tag (#409) — silent on the
@@ -2272,8 +2290,10 @@ export class TUI {
     if (blocked.length) line += `  ${red('⊘ ' + blocked.join(' '))}`;
     // Money tag last, so it sits at the end of the row where the eye lands after
     // the bars. Red once real money has moved, yellow while it only could.
-    const money = spendTag(q);
-    if (money) line += `  ${(money === '$!' ? red : yellow)(money)}`;
+    const money = spendTag(q, a.maxSpend);
+    // Red once real money has moved (the tag then carries an amount), yellow
+    // while it only could (a bare `$`, with or without its `/cap`).
+    if (money) line += `  ${(/\d/.test(money.split('/')[0]) ? red : yellow)(money)}`;
     // Free reset credits sit beside the money tag: both report what this
     // account holds in reserve rather than what it is currently spending.
     const credits = resetCreditTag(q);
