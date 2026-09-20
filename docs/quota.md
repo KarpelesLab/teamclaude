@@ -173,7 +173,7 @@ Edits apply live on config reload — no restart.
 
 > **This spends real money.** An account with Anthropic's "extra usage" (paid overage) enabled does not stop at its plan limit — it keeps serving and bills for it. Opt in only for accounts whose overage you are prepared to pay for.
 
-By default, once every account is past its quota the proxy answers 429 (or holds the request, with `holdSeconds`), apart from the throttled revalidation probe. `accounts[].allowExtraUsage: true` lets an account with overage switched on take that traffic instead:
+By default, once every account is past its switch threshold the proxy answers 429 (or holds the request, with `holdSeconds`), apart from the throttled revalidation probe. `accounts[].allowExtraUsage: true` lets the fleet keep serving instead — on the free quota any account still has past its threshold first, and on the opted-in account's overage only once no free quota is left anywhere:
 
 ```json
 {
@@ -183,21 +183,22 @@ By default, once every account is past its quota the proxy answers 429 (or holds
 }
 ```
 
-- **Rotation is unchanged.** An opted-in account rotates away at `switchThreshold` like any other, and is never chosen while any account can serve under the normal rules — a lower-priority one included.
-- **Last resort only.** It is used where the proxy would otherwise have nothing: after the normal walk, and after the free revalidation probe, which still goes first when it is due because headroom it finds costs nothing. If that probe is refused, the same request retries on the extra-usage account rather than returning 429. The 429/5xx failover hops reach it too, but only when the whole fleet is spent — a hop off an account that is merely rate-limited for a minute waits that out as before rather than starting to bill.
-- **Several opted-in accounts** are chosen by `priority` (lower first), then the least utilized.
-- **It goes back on its own.** As soon as a normal account's window resets, selection returns to it.
-- **Only the quota verdicts are overridden** — the switch threshold (a spent Fable bucket included, for Fable requests only) and a remembered upstream `rejected` status. Everything else still binds: `disabled`, `maxUsage`, a live upstream 429 hold, an entitlement cooldown, an error state, routes and model ownership, and the Claude/Codex partition. An account whose usage probe reports overage switched off upstream is skipped, since it would only 429; with no probe data, upstream decides.
+- **Rotation is unchanged.** An opted-in account rotates away at `switchThreshold` like any other, and the fallback never runs while any account can serve under the normal rules — a lower-priority one included.
+- **Free quota first.** The switch threshold is a rotation preference, so an account between it and 100% — under a per-bucket `unified7d: 0.85`, that is 15% of the week — still has quota you already pay for. Once nothing is under its threshold, the fallback serves from the best such account, **opted in or not**, chosen by `priority` (lower first) and then the most free quota left. No money moves while any account can still serve for free.
+- **Billing is the last resort.** An opted-in account is billed only when every account that could serve at all is at 100% of a governing bucket or carries upstream's own `rejected` verdict. Among several opted-in accounts: `priority`, then the least deep into overage. An account that cannot serve at all — `disabled`, over its `maxUsage` cap, in an `error` state, under an entitlement cooldown or a live 429 hold — is neither used nor waited for: it does not count as free quota, and the fallback proceeds without it.
+- **After the free probe.** The fallback runs where the proxy would otherwise have nothing: after the normal walk, and after the free revalidation probe, which still goes first when it is due because headroom it finds costs nothing. If that probe is refused, the same request retries through the fallback rather than returning 429. The 429/5xx failover hops reach it too, but only when nothing in the fleet is under its threshold — a hop off an account that is merely rate-limited for a minute waits that out as before rather than spending quota, free or paid.
+- **It goes back on its own.** As soon as any account's window resets — the paid one's included — selection returns to normal, and the "billing" mark clears even if no request for that model has come in since.
+- **Only the quota verdicts are overridden** — the switch threshold (a spent Fable bucket included, for Fable requests only) and, for the paid tier, a remembered upstream `rejected` status. Everything else still binds: `disabled`, `maxUsage`, a live upstream 429 hold, an entitlement cooldown, an error state, routes and model ownership, and the Claude/Codex partition. An account whose usage probe reports overage switched off upstream is skipped, since it would only 429; with no probe data, upstream decides.
 
 Utilization goes past 100% in overage, so `maxUsage` above 1.0 is a spend limit: `"maxUsage": 1.5` lets an account run to 150% of its plan and then stop, like any other cap.
 
-The switch onto extra usage and back off it is logged once each, per model scope (a Fable-only episode is not ended by Opus traffic that still has headroom), and a failover hop onto a paid account is logged once per episode too. While an account is serving this way, `teamclaude status` marks it:
+The switch onto the fallback and back off it is logged once each, per model scope (a Fable-only episode is not ended by Opus traffic that still has headroom), and a failover hop onto it is logged once per episode too — the free-quota and the paid step each get their own line. While an account is **billing** — at 100% of a governing bucket, or with its month's spend seen rising — `teamclaude status` marks it:
 
 ```
   Blocked  local switch threshold reached — serving on extra usage (paid overage), billing
 ```
 
-and the status payload carries `allowExtraUsage` and `onExtraUsage` per account. The opt-in itself is visible before it is ever used: `extra usage allowed` in the account header of `teamclaude status`, an `xu` tag (yellow) at the end of the TUI row that turns into a red `xu!` while billing, and an `extra usage allowed` / `on extra usage — billing` badge on the web dashboard. With the quota probe on, the `Spend` row shows what has been billed this month.
+and the status payload carries `allowExtraUsage` and `onExtraUsage` per account; `onExtraUsage` is false while the fallback is only serving free quota past a threshold. The opt-in itself is visible before it is ever used: `extra usage allowed` in the account header of `teamclaude status`, an `xu` tag (yellow) at the end of the TUI row that turns into a red `xu!` while billing, and an `extra usage allowed` / `on extra usage — billing` badge on the web dashboard. With the quota probe on, the `Spend` row shows what has been billed this month.
 
 Edits apply live on config reload — turning it off stops the spending immediately.
 

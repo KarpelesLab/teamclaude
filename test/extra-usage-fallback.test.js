@@ -6,10 +6,12 @@ import { syncAccountsFromDisk } from '../src/sync-accounts.js';
 import { unavailableLine } from '../src/status-renderer.js';
 
 // `accounts[].allowExtraUsage`: an account with paid overage on upstream may be
-// leaned on once every account is past its quota, instead of the fleet
+// leaned on once every account is out of free quota, instead of the fleet
 // answering a synthetic 429. Rotation itself is untouched — these tests pin
-// both halves: nothing changes while any account has headroom, and once none
-// does, the paid account serves unless a hard gate says it must not.
+// three things: nothing changes while any account is under its threshold; an
+// account past its threshold but under 100% still serves for free before any
+// money moves; and once no free quota is left, the paid account serves unless
+// a hard gate says it must not.
 
 function oauth(name, extra = {}) {
   return { name, type: 'oauth', accessToken: 't-' + name, refreshToken: 'r', expiresAt: Date.now() + 3600_000, ...extra };
@@ -22,11 +24,12 @@ function setQuota(account, q) {
   Object.assign(account.quota, q);
 }
 
-// Every account past the 0.98 switch threshold, and the probe slot spent, so
-// the walk reaches the point where today it answers null.
+// Every account at 100% of its weekly quota (past the 0.98 switch threshold
+// AND out of free headroom), and the probe slot spent, so the walk reaches the
+// point where without the opt-in it answers null.
 function spentFleet(accounts) {
   const am = new AccountManager(accounts, 0.98);
-  for (const a of am.accounts) setQuota(a, { unified7d: 0.99 });
+  for (const a of am.accounts) setQuota(a, { unified7d: 1.0 });
   am._nextProbeAt = Date.now() + 60_000;
   return am;
 }
@@ -55,6 +58,93 @@ test('without the opt-in the spent fleet still answers null', () => {
   assert.equal(am.getActiveAccount(null, OPUS), null);
 });
 
+// ── free quota first ─────────────────────────────────────────
+
+// The switch threshold is a rotation preference: an account between it and
+// 100% still has quota the operator pays for. Billing another account while
+// that is unused is the one thing this feature must never do.
+test('a normal account at 0.99 is used before the paid account, which is NOT billed', () => {
+  const am = new AccountManager([oauth('a'), oauth('paid', { allowExtraUsage: true })], 0.98);
+  setQuota(am.accounts[0], { unified7d: 0.99 });
+  setQuota(am.accounts[1], { unified7d: 0.99 });
+  am._nextProbeAt = Date.now() + 60_000;
+  am.currentIndex = 1;
+  for (let i = 0; i < 3; i++) assert.equal(quietly(() => am.getActiveAccount(null, OPUS)).name, 'a');
+  assert.equal(am.accounts[1].usage.totalRequests, 0);
+  const [a, paid] = am.getStatus().accounts;
+  assert.equal(a.onExtraUsage, false);
+  assert.equal(paid.onExtraUsage, false);
+  // Still a fallback pick, not a normal one: `a` reads as over threshold.
+  assert.equal(am.unavailableReason(am.accounts[0], OPUS), 'quota');
+});
+
+test('a per-bucket threshold leaves free quota the fallback uses before paying', () => {
+  const am = new AccountManager([oauth('a'), oauth('paid', { allowExtraUsage: true })], { unified7d: 0.85 });
+  setQuota(am.accounts[0], { unified7d: 0.90 });
+  setQuota(am.accounts[1], { unified7d: 1.0 });
+  am._nextProbeAt = Date.now() + 60_000;
+  assert.equal(quietly(() => am.getActiveAccount(null, OPUS)).name, 'a');
+  assert.equal(am.getStatus().accounts[1].onExtraUsage, false);
+});
+
+test('billing starts only once every account is at 100%, and is marked from then on', () => {
+  const am = new AccountManager([oauth('a'), oauth('paid', { allowExtraUsage: true })], 0.98);
+  setQuota(am.accounts[0], { unified7d: 1.0 });
+  setQuota(am.accounts[1], { unified7d: 0.99 });
+  am._nextProbeAt = Date.now() + 60_000;
+  const lines = [];
+  const log = console.log;
+  console.log = (...args) => lines.push(args.join(' '));
+  try {
+    // The opted-in account is the one with free quota left: it serves, unmarked.
+    assert.equal(am.getActiveAccount(null, OPUS).name, 'paid');
+    assert.equal(am.getStatus().accounts[1].onExtraUsage, false);
+    assert.equal(lines.filter(l => l.includes('extra usage')).length, 0);
+    assert.equal(lines.filter(l => l.includes('free quota it has left')).length, 1);
+    // It reaches 100%: the same account now bills, and says so once.
+    setQuota(am.accounts[1], { unified7d: 1.0 });
+    for (let i = 0; i < 3; i++) assert.equal(am.getActiveAccount(null, OPUS).name, 'paid');
+  } finally {
+    console.log = log;
+  }
+  assert.equal(am.getStatus().accounts[1].onExtraUsage, true);
+  assert.equal(lines.filter(l => l.includes('on extra usage')).length, 1);
+});
+
+test('among spent-but-free accounts: priority, then the most free quota left, opted in or not', () => {
+  const am = new AccountManager([
+    oauth('a', { priority: 1 }),
+    oauth('b', { priority: 0 }),
+    oauth('paid', { allowExtraUsage: true, priority: 0 }),
+  ], 0.98);
+  setQuota(am.accounts[0], { unified7d: 0.985 });
+  setQuota(am.accounts[1], { unified7d: 0.995 });
+  setQuota(am.accounts[2], { unified7d: 0.99 });
+  am._nextProbeAt = Date.now() + 60_000;
+  assert.equal(quietly(() => am.getActiveAccount(null, OPUS)).name, 'paid');
+  assert.equal(quietly(() => am.getActiveAccount(new Set([2]), OPUS)).name, 'b');
+  assert.equal(am.getStatus().accounts[2].onExtraUsage, false);
+});
+
+test('an account in error or entitlement cooldown counts as unable to serve, not as free quota to wait for', () => {
+  for (const arm of [a => { a.status = 'error'; }, a => { a.entitlementDeniedUntil = Date.now() + 60_000; }]) {
+    const am = new AccountManager([oauth('a'), oauth('paid', { allowExtraUsage: true })], 0.98);
+    setQuota(am.accounts[0], { unified7d: 0.5 });
+    setQuota(am.accounts[1], { unified7d: 1.0 });
+    am._nextProbeAt = Date.now() + 60_000;
+    arm(am.accounts[0]);
+    assert.equal(quietly(() => am.getActiveAccount(null, OPUS)).name, 'paid');
+    assert.equal(am.getStatus().accounts[1].onExtraUsage, true);
+  }
+});
+
+test('a free-quota fallback is not a fleet with no opt-in: it still answers 429 past the threshold', () => {
+  const am = new AccountManager([oauth('a'), oauth('b')], 0.98);
+  for (const a of am.accounts) setQuota(a, { unified7d: 0.99 });
+  am._nextProbeAt = Date.now() + 60_000;
+  assert.equal(am.getActiveAccount(null, OPUS), null);
+});
+
 test('rotation is unchanged: an opted-in account still rotates away at the threshold', () => {
   const am = new AccountManager([oauth('paid', { allowExtraUsage: true }), oauth('b')], 0.98);
   setQuota(am.accounts[0], { unified7d: 0.99 });
@@ -76,7 +166,7 @@ test('never chosen while any normal account has headroom, even a lower-priority 
 
 test('the free revalidation probe goes first when it is due', () => {
   const am = new AccountManager([oauth('a'), oauth('paid', { allowExtraUsage: true, priority: 1 })], 0.98);
-  for (const a of am.accounts) setQuota(a, { unified7d: 0.99 });
+  for (const a of am.accounts) setQuota(a, { unified7d: 1.0 });
   // Probe due: it may find stale headroom on `a`, which costs nothing.
   assert.equal(quietly(() => am.getActiveAccount(null, OPUS)).name, 'a');
   // The probed account refused, so this request retries with it tried and the
@@ -100,14 +190,27 @@ test('priority orders several fallback accounts, then least utilization', () => 
 
 test('a stale upstream `rejected` verdict is overridden like the threshold', () => {
   const am = spentFleet([oauth('a'), oauth('paid', { allowExtraUsage: true })]);
-  setQuota(am.accounts[1], { unified7d: 0.5, unifiedStatus: 'rejected', unifiedStatusSeenAt: Date.now() });
+  setQuota(am.accounts[1], { unified7d: 0.5, unifiedStatus: 'rejected', unifiedStatusSeenAt: Date.now(), spend: { enabled: true, usedMinor: 0 } });
   assert.equal(am.unavailableReason(am.accounts[1], OPUS), 'upstream-rejected');
+  assert.equal(quietly(() => am.getActiveAccount(null, OPUS)).name, 'paid');
+  // Under 100% by the counters, so it is not marked as billing on the pick
+  // alone — only once the month's spend is seen to rise.
+  assert.equal(am.getStatus().accounts[1].onExtraUsage, false);
+  am.accounts[1].quota.spend.usedMinor = 250;
+  assert.equal(am.getStatus().accounts[1].onExtraUsage, true);
+});
+
+test('a rejected account is never the free pick, even under 100% and not opted in', () => {
+  const am = new AccountManager([oauth('a'), oauth('paid', { allowExtraUsage: true })], 0.98);
+  setQuota(am.accounts[0], { unified7d: 0.5, unifiedStatus: 'rejected', unifiedStatusSeenAt: Date.now() });
+  setQuota(am.accounts[1], { unified7d: 1.0 });
+  am._nextProbeAt = Date.now() + 60_000;
   assert.equal(quietly(() => am.getActiveAccount(null, OPUS)).name, 'paid');
 });
 
 test('a spent family bucket falls back for that family only', () => {
   const am = new AccountManager([oauth('a'), oauth('paid', { allowExtraUsage: true })], 0.98);
-  for (const a of am.accounts) setQuota(a, { unified7d: 0.3, unified7dFable: 0.99 });
+  for (const a of am.accounts) setQuota(a, { unified7d: 0.3, unified7dFable: 1.0 });
   am._nextProbeAt = Date.now() + 60_000;
   am.currentIndex = 0;
   assert.equal(quietly(() => am.getActiveAccount(null, FABLE)).name, 'paid');
@@ -180,6 +283,59 @@ test('selection returns to a normal account once its window resets', () => {
   assert.equal(am.getStatus().accounts[1].onExtraUsage, false);
 });
 
+test('the episode ends when the paid account itself has headroom again, with no request in between', () => {
+  const am = spentFleet([oauth('a'), oauth('paid', { allowExtraUsage: true })]);
+  quietly(() => am.getActiveAccount(null, OPUS));
+  assert.equal(am.getStatus().accounts[1].onExtraUsage, true);
+  assert.equal(am.getStatus().currentAccounts.anthropic, 'paid');
+  // Its own window resets. Nothing asks for Opus again; status alone must
+  // stop calling it "billing".
+  setQuota(am.accounts[1], { unified7d: 0.1 });
+  const lines = [];
+  const log = console.log;
+  console.log = (...args) => lines.push(args.join(' '));
+  try {
+    assert.equal(am.getStatus().accounts[1].onExtraUsage, false);
+    assert.equal(am.onExtraUsage(1), false);
+  } finally {
+    console.log = log;
+  }
+  assert.equal(lines.filter(l => l.includes('leaving extra usage')).length, 1);
+  // And the next request neither re-announces nor re-ramps: it is a plain pick.
+  assert.equal(quietly(() => am.getActiveAccount(null, OPUS)).name, 'paid');
+  assert.equal(am.getStatus().accounts[1].onExtraUsage, false);
+});
+
+test('the episode ends when another account has headroom again, with no request in between', () => {
+  const am = spentFleet([oauth('a'), oauth('paid', { allowExtraUsage: true })]);
+  quietly(() => am.getActiveAccount(null, OPUS));
+  assert.equal(am.getStatus().accounts[1].onExtraUsage, true);
+  setQuota(am.accounts[0], { unified7d: 0.1 });
+  assert.equal(quietly(() => am.getStatus()).accounts[1].onExtraUsage, false);
+  // The cursor did not stay parked on the paid account either.
+  assert.equal(am.getStatus().currentAccounts.anthropic, 'a');
+});
+
+test('an episode follows its account, not its index, when another account is removed', () => {
+  const am = spentFleet([oauth('gone'), oauth('a'), oauth('paid', { allowExtraUsage: true })]);
+  quietly(() => am.getActiveAccount(null, OPUS));
+  assert.equal(am.getStatus().accounts[2].onExtraUsage, true);
+  quietly(() => am.removeAccount(0));
+  const status = am.getStatus();
+  assert.deepEqual(status.accounts.map(a => [a.name, a.onExtraUsage]), [['a', false], ['paid', true]]);
+  assert.equal(am.onExtraUsage(1), true);
+  assert.equal(am.onExtraUsage(0), false);
+});
+
+test('removing the paid account itself ends its episode', () => {
+  const am = spentFleet([oauth('paid', { allowExtraUsage: true }), oauth('a')]);
+  quietly(() => am.getActiveAccount(null, OPUS));
+  assert.equal(am.onExtraUsage(0), true);
+  quietly(() => am.removeAccount(0));
+  assert.equal(am.onExtraUsage(0), false);
+  assert.equal(am._extraUsage.size, 0);
+});
+
 test('the switch onto and off extra usage is logged once each, not per request', () => {
   const am = spentFleet([oauth('a'), oauth('paid', { allowExtraUsage: true })]);
   const lines = [];
@@ -242,7 +398,7 @@ test('a paid hop is logged once per episode and shows in status, still moving no
 // the episode on every request: a log pair and a ramp restart each time.
 test('alternating Fable/Opus: one enter log, no leave, no ramp restart', () => {
   const am = new AccountManager([oauth('a'), oauth('paid', { allowExtraUsage: true })], 0.98);
-  for (const acc of am.accounts) setQuota(acc, { unified7d: 0.3, unified7dFable: 0.99 });
+  for (const acc of am.accounts) setQuota(acc, { unified7d: 0.3, unified7dFable: 1.0 });
   am._nextProbeAt = Date.now() + 60 * 60_000;
   am.currentIndex = 0;
   const lines = [];
@@ -330,7 +486,8 @@ async function throughProxy(respondToA) {
   await new Promise(r => upstream.listen(0, '127.0.0.1', r));
 
   const am = new AccountManager([oauth('a'), oauth('paid', { allowExtraUsage: true, priority: 1 })], 0.98);
-  for (const a of am.accounts) setQuota(a, { unified7d: 0.99 });
+  setQuota(am.accounts[0], { unified7d: 0.99 });
+  setQuota(am.accounts[1], { unified7d: 1.0 });
   const proxy = createProxyServer(am, {
     proxy: { apiKey: 'k' },
     upstream: `http://127.0.0.1:${upstream.address().port}`,
@@ -396,7 +553,7 @@ function liveRepro(distributeSessions) {
   ], 0.98, { distributeSessions });
   const [L, R] = am.accounts;
   setQuota(L, { unified7d: 1.0, unifiedStatus: 'rejected', unifiedStatusSeenAt: Date.now(), spend: { enabled: true } });
-  setQuota(R, { unified7d: 0.99 });
+  setQuota(R, { unified7d: 1.0 });
   am._nextProbeAt = Date.now() + 60 * 60_000;
   return { am, L, R };
 }
