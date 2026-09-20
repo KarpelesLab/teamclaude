@@ -2235,7 +2235,8 @@ one, which is what 'teamclaude switch' calls.
 MCP endpoint (off by default). With "proxy": { "mcp": "read" } the server
 serves its status, quota and settings as MCP tools at /teamclaude/mcp; "full"
 adds the tools that change them (switch, enable/disable, priority, remove,
-threshold, distribute, probe, warmup, routes, blocked models, client mode).
+threshold, distribute, probe, warmup, routes, routing, blocked models, client
+mode).
 Connect Claude Code with:
   claude mcp add --transport http teamclaude http://localhost:3456/teamclaude/mcp
 Same gates as the other /teamclaude/ routes. A named client key is served

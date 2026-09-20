@@ -2,6 +2,7 @@ import { formatMoney } from './oauth.js';
 import { findFamilyBlock, modelGlobOverlaps, gatingUtilization, resolveMaxUsage, resolveSwitchThreshold, resolveFleetThreshold, switchThresholdDiffs } from './model.js';
 import { safeLine } from './safe-text.js';
 import { ROUTE_COLORS } from './config-ops.js';
+import { describeRouting } from './account-routing.js';
 
 const ESC = '\x1b[';
 const RESET = `${ESC}0m`;
@@ -69,6 +70,8 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
     if (routing) lines.push(`  ${routing}`);
     const threshold = thresholdLine(account, status, paint);
     if (threshold) lines.push(`  ${threshold}`);
+    const egress = egressProxyLine(account, paint);
+    if (egress) lines.push(`  ${egress}`);
     const why = unavailableLine(account, paint);
     if (why) lines.push(`  ${why}`);
     const spend = spendLine(account, paint);
@@ -279,6 +282,23 @@ export function thresholdLine(account, status, paint) {
     return `${label} ${formatPercent(value)}`;
   });
   return `${paint.dim('Switch'.padEnd(8))} ${paint.cyan(`switch ${parts.join(', ')}`)}`;
+}
+
+/**
+ * "Egress   via socks5h://alice:***@host:1080" — the account's OWN egress
+ * proxy (accounts[].routing), or null when it has none: the fleet path needs
+ * no line. The status payload carries it already password-masked; a renderer
+ * against the live manager (which holds the parsed object) gets the same
+ * masked string out of describeRouting.
+ * @param {any} account
+ * @param {any} paint
+ */
+export function egressProxyLine(account, paint) {
+  const r = account?.routing;
+  if (!r) return null;
+  const text = typeof r === 'string' ? r : describeRouting(r);
+  if (!text) return null;
+  return `${paint.dim('Egress'.padEnd(8))} ${paint.cyan(`via ${text}`)}`;
 }
 
 function colors(enabled) {

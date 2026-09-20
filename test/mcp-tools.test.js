@@ -70,7 +70,7 @@ test('full mode lists every tool in a fixed order, annotated', async () => {
   assert.deepEqual(listed.map(t => t.name), [
     'get_status', 'get_quota', 'get_settings',
     'switch_account', 'reload_config', 'probe_quota',
-    'set_account_enabled', 'set_account_priority', 'remove_account',
+    'set_account_enabled', 'set_account_priority', 'set_account_routing', 'remove_account',
     'set_threshold', 'set_distribution', 'set_probe_interval', 'set_warmup',
     'set_route', 'remove_route', 'set_blocked_models', 'set_client_mode',
   ]);
@@ -183,6 +183,24 @@ test('set_account_priority writes the number to both the account and its entry',
   assert.equal(am.accounts[1].priority, -3);
   assert.equal(config.accounts[1].priority, -3);
   assert.match(await refused(tools, 'set_account_priority', { account: 'alice@example.com', priority: 1.5 }), /integer/);
+});
+
+test('set_account_routing sets, masks, and clears the account proxy', async () => {
+  const { tools, am, config } = await fixture();
+  assert.deepEqual(
+    await ok(tools, 'set_account_routing', { account: 'bob@example.com', org: 'Acme', routing: 'socks5h://alice:s3cret@proxy.example.com:1080' }),
+    { account: 'bob@example.com (Acme)', routing: 'socks5h://alice:***@proxy.example.com:1080', persisted: true },
+  );
+  assert.equal(am.accounts[1].routing.protocol, 'socks5h');
+  assert.equal(am.accounts[1].routing.password, 's3cret', 'the live account keeps the credential');
+  assert.equal(config.accounts[1].routing, 'socks5h://alice:s3cret@proxy.example.com:1080', 'the entry stores it canonical');
+
+  // Clearing writes an explicit null, not a deleted key (the save merges over disk).
+  await ok(tools, 'set_account_routing', { account: 'bob@example.com', org: 'Acme', routing: 'none' });
+  assert.equal(am.accounts[1].routing, null);
+  assert.equal(config.accounts[1].routing, null);
+
+  assert.match(await refused(tools, 'set_account_routing', { account: 'bob@example.com', org: 'Acme', routing: 'https://proxy.example.com' }), /unsupported routing protocol/);
 });
 
 test('remove_account takes the account out of rotation and marks its entry removed before saving', async () => {

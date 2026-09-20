@@ -14,6 +14,7 @@ import { mintAccountId } from './account-id.js';
 import { formatPercent, heldResetCredits } from './status-renderer.js';
 import { resolveMaxUsage, switchThresholdDiffs } from './model.js';
 import { parseProxyUrl, proxyToUrl, describeProxy, describeSelfProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy } from './upstream-proxy.js';
+import { describeRouting } from './account-routing.js';
 import { sanitizeText, safeLine } from './safe-text.js';
 // The setting rules live in one module; the CLI, the MCP tools and this screen
 // all read them from there, so they cannot drift apart (#426).
@@ -354,6 +355,21 @@ export function switchThresholdTag(account, fleetFor) {
     return `${label} ${formatPercent(value)}`;
   });
   return `switch ${parts.join(', ')}`;
+}
+
+/**
+ * "via socks5h://alice:***@host:1080" — the account's OWN egress proxy, or ''
+ * when it has none: the fleet path is the default and earns no tag. The live
+ * TUI reads the parsed object the manager holds; an attached dashboard reads
+ * the already-masked string the status payload carries (passwords never cross
+ * that boundary) — both land here.
+ * @param {any} account
+ */
+export function routingTag(account) {
+  const r = account?.routing;
+  if (!r) return '';
+  const text = typeof r === 'string' ? r : describeRouting(r);
+  return text ? `via ${text}` : '';
 }
 
 /** Fit a line to exactly w columns: truncate if too long, pad if too short.
@@ -1932,7 +1948,13 @@ export class TUI {
         const tag = switchThresholdTag(a, key => this.am.thresholdFor(key));
         return tag ? Math.max(w, 2 + vw(tag)) : w;
       }, 0);
-      const fixed = 20 + typeCell + NAME_MIN + routeCells + tagW + spendW + switchW;
+      // Same rule again for the routing tag: silent for every account on the
+      // fleet path, so it costs the budget nothing there.
+      const routeW = members.reduce((/** @type {number} */ w, /** @type {any} */ a) => {
+        const tag = routingTag(a);
+        return tag ? Math.max(w, 2 + vw(tag)) : w;
+      }, 0);
+      const fixed = 20 + typeCell + NAME_MIN + routeCells + tagW + spendW + switchW + routeW;
       const span = (/** @type {number} */ n, /** @type {number} */ bar) => fixed + 6 * (n - 1) + n * bar;
       const roomFor = (/** @type {number} */ n) => span(n, BAR_MIN) <= W;
       // No Ses bar once every Codex account here has reported without a 5h window;
@@ -2284,6 +2306,10 @@ export class TUI {
     // the fleet's own numbers) — see switchThresholdTag.
     const switchTag = switchThresholdTag(a, key => this.am.thresholdFor(key));
     if (switchTag) line += `  ${cyan(switchTag)}`;
+    // Routing tag trails even that: where the account's traffic physically
+    // leaves the machine, when the operator pinned it to its own proxy.
+    const routeTag = routingTag(a);
+    if (routeTag) line += `  ${cyan(routeTag)}`;
     return line;
   }
 
