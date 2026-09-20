@@ -1,5 +1,5 @@
 import { formatMoney } from './oauth.js';
-import { findFamilyBlock, modelGlobOverlaps, gatingUtilization, resolveMaxUsage } from './model.js';
+import { findFamilyBlock, modelGlobOverlaps, gatingUtilization, resolveMaxUsage, resolveSwitchThreshold, resolveFleetThreshold, switchThresholdDiffs } from './model.js';
 import { safeLine } from './safe-text.js';
 
 const ESC = '\x1b[';
@@ -56,8 +56,18 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
     for (const quotaLine of quotaLines(account, now, paint)) {
       lines.push(`  ${quotaLine}`);
     }
-    const routing = modelRoutingLine(account, status.switchThreshold, blocked, now, paint);
+    // The account's OWN threshold (issue #409) for each bucket the row judges
+    // — a per-bucket lookup, not one flat number, so a table that overrides
+    // only unified7dFable reddens THAT cell at the account's own wall while
+    // Opus/Sonnet still judge against the fleet's, exactly as the live gate
+    // (thresholdFor(bucket, account)) does.
+    /** @param {string} bucket */
+    const accountThresholdFor = bucket => resolveSwitchThreshold(
+      account.switchThreshold, bucket, resolveFleetThreshold(status.switchThreshold, status.switchThresholds, bucket));
+    const routing = modelRoutingLine(account, accountThresholdFor, blocked, now, paint);
     if (routing) lines.push(`  ${routing}`);
+    const threshold = thresholdLine(account, status, paint);
+    if (threshold) lines.push(`  ${threshold}`);
     const why = unavailableLine(account, paint);
     if (why) lines.push(`  ${why}`);
     const spend = spendLine(account, paint);
@@ -232,6 +242,42 @@ export function unavailableLine(account, paint) {
   if (!reason) return null;
   const text = UNAVAILABLE_TEXT[reason] || safeLine(reason, 64);
   return `${paint.dim('Blocked'.padEnd(8))} ${paint.yellow(text)}`;
+}
+
+// Compact names for the "switch NN%" line below — short enough that several
+// can sit on one line (`switch 7d 90%, fable 80%`), and the same short form
+// `teamclaude threshold <bucket>=<pct>` already uses on the command line.
+/** @type {Object<string, string>} */
+const THRESHOLD_BUCKET_LABELS = {
+  unified5h: '5h', unified7d: '7d', unified7dSonnet: 'sonnet', unified7dFable: 'fable',
+  tokens: 'tokens', requests: 'requests',
+};
+
+/**
+ * "switch at 100%" / "switch 7d 90%, fable 80%" — this account's OWN
+ * switchThreshold (issue #409), shown ONLY where it actually moves rotation
+ * away from the fleet-wide setting a bare read of the header row already
+ * named. Silent for an account with no override, and silent for one whose
+ * table merely repeats the fleet's own numbers — the diff, not the config, is
+ * what earns a line (see switchThresholdDiffs).
+ *
+ * `default` reads as "at" rather than the bucket name: it is the account's
+ * own bare-number override, or its table's own `default`, and neither is a
+ * quota window a reader would recognise as a bucket.
+ * @param {any} account
+ * @param {any} status
+ * @param {any} paint
+ */
+export function thresholdLine(account, status, paint) {
+  /** @param {string} bucket */
+  const fleetFor = bucket => resolveFleetThreshold(status.switchThreshold, status.switchThresholds, bucket);
+  const diffs = switchThresholdDiffs(account?.switchThreshold, fleetFor);
+  if (!diffs.length) return null;
+  const parts = diffs.map(({ bucket, value }) => {
+    const label = bucket === 'default' ? 'at' : (THRESHOLD_BUCKET_LABELS[bucket] || bucket);
+    return `${label} ${formatPercent(value)}`;
+  });
+  return `${paint.dim('Switch'.padEnd(8))} ${paint.cyan(`switch ${parts.join(', ')}`)}`;
 }
 
 function colors(enabled) {
@@ -469,7 +515,22 @@ function formatAccountStatus(account, now, paint) {
 // decision, so a second derivation of it is a copy that drifts. Reading the
 // family bucket alone printed `Fable ✓` on an account the router had already
 // refused, in one render.
-function modelRoutingLine(account, threshold, blocked, now, paint) {
+//
+// `thresholdFor` is a per-bucket lookup, `bucket => number`, not one flat
+// number — a per-account switchThreshold table (#409) can set Fable's own
+// bucket lower than the shared weekly's, exactly the case `_isNearQuota`
+// itself honors bucket by bucket. A single shared number here would show a
+// Fable override on the fleet-wide Weekly bar while the Models row quietly
+// judged Fable against the fleet's number instead of the account's own —
+// this row displays a routing decision, and that decision is per bucket.
+/**
+ * @param {any} account
+ * @param {(bucket: string) => number} thresholdFor
+ * @param {any} blocked
+ * @param {any} now
+ * @param {any} paint
+ */
+function modelRoutingLine(account, thresholdFor, blocked, now, paint) {
   const q = account.quota || {};
   // A family is metered here when its own weekly bucket is known, or when only
   // the learned one is: a spent reading is cleared for revalidation (see
@@ -479,8 +540,10 @@ function modelRoutingLine(account, threshold, blocked, now, paint) {
   // key regardless, which is what the router gates on.
   const metered = family => q[`unified7d${family}`] != null || q.scopedWeekly?.[family.toLowerCase()] != null;
   if (!metered('Sonnet') && !metered('Fable')) return null;
-  const t = Number(threshold);
-  const overThreshold = v => v != null && !Number.isNaN(t) && v >= t;
+  const overThreshold = (v, bucket) => {
+    const t = Number(thresholdFor(bucket));
+    return v != null && !Number.isNaN(t) && v >= t;
+  };
   // A per-account cap is the other ceiling a family can be over. Without it a
   // capped family reads ✓ on the very line that exists to say where a model can
   // still run, right beside the Blocked line saying it cannot.
@@ -491,7 +554,7 @@ function modelRoutingLine(account, threshold, blocked, now, paint) {
   // Blocks every family: the shared 5-hour bucket, and the shared weekly at its
   // CAP — family spend meters into the shared bucket, so a cap written against
   // it stops the families too (see AccountManager.capExceeded).
-  const sharedOver = overThreshold(q.unified5h) || overCap(q.unified5h, 'unified5h')
+  const sharedOver = overThreshold(q.unified5h, 'unified5h') || overCap(q.unified5h, 'unified5h')
     || overCap(q.unified7d, 'unified7d');
 
   const cell = (label, bucketKey, reset) => {
@@ -512,7 +575,7 @@ function modelRoutingLine(account, threshold, blocked, now, paint) {
     // Using the governing value for the cap would redden Fable because Opus
     // spent the shared weekly, which is not a decision the router made.
     const gating = gatingUtilization(q, bucketKey);
-    const weeklyOver = overThreshold(gating) || overCap(q[bucketKey] ?? null, bucketKey);
+    const weeklyOver = overThreshold(gating, bucketKey) || overCap(q[bucketKey] ?? null, bucketKey);
     const mark = sharedOver || weeklyOver ? paint.red('✗') : paint.green('✓');
     // The recovery time is the LATEST reset among the two WEEKLY buckets
     // currently over the threshold, not this bucket's. The weekly half of the
@@ -533,6 +596,12 @@ function modelRoutingLine(account, threshold, blocked, now, paint) {
     // rolling. Closing it means restructuring the cell rather than adding a
     // third candidate, since the whole `when` clause is gated on `weeklyOver`
     // and a 5h-only block suppresses the time entirely.
+    // Same bucket's threshold for both readings, matching `weeklyOver`'s own
+    // single comparison above: the governing value is the max of this
+    // family's bucket and the shared one, judged against THIS bucket's own
+    // threshold — never the shared bucket's, which is a different number
+    // once a per-account table sets them apart (#409).
+    const t = Number(thresholdFor(bucketKey));
     const over = [];
     if (!Number.isNaN(t)) {
       if (q[bucketKey] != null && q[bucketKey] >= t) over.push(parseTs(reset));

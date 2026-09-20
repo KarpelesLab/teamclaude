@@ -3,7 +3,7 @@ import { providerOf, DEFAULT_PROVIDER, isSubscriptionAccount, canServeProvider }
 import { refreshCodexToken } from './codex-auth.js';
 import { parseCodexQuota, parseCodexPlanType } from './codex-quota.js';
 import { sameIdentity } from './identity.js';
-import { weeklyBucketForModel, modelGlobMatches, modelFamily, gatingUtilization, resolveMaxUsage, WEEKLY_BUCKET_KEYS } from './model.js';
+import { weeklyBucketForModel, modelGlobMatches, modelFamily, gatingUtilization, resolveMaxUsage, resolveSwitchThreshold, sanitizeSwitchThreshold, WEEKLY_BUCKET_KEYS } from './model.js';
 import { SessionTracker } from './session-tracker.js';
 import { buildQuotaSummary, quotaTier } from './quota-summary.js';
 import { ROLLOVER_MIN_JUMP_MS, remapHeld, findHeld, dropHeld, newObservation } from './rollover.js';
@@ -180,6 +180,24 @@ function copyBuckets(byBucket) {
   return out;
 }
 
+/**
+ * The per-account switchThreshold an account will actually gate on: the config
+ * entry's value with anything outside (0, 1] dropped, and one line telling the
+ * operator what was dropped. The constructor and the config reload both come
+ * through here so a value refused at startup is refused on reload too. Without
+ * the line a `98` typed for 98% would silently hold the account in rotation
+ * until it hit the upstream wall, with every display showing it as configured.
+ * @param {Record<string, any>} acct
+ * @returns {number|Object<string, number>|null}
+ */
+export function accountSwitchThreshold(acct) {
+  const { value, rejected } = sanitizeSwitchThreshold(acct?.switchThreshold);
+  if (rejected.length) {
+    console.log(`[TeamClaude] Account "${safeLine(acct?.name, 64)}": ignoring ${safeLine(rejected.join(', '), 160)} — a switch threshold must be a number above 0 and at most 1 (0.98 means 98%)`);
+  }
+  return value;
+}
+
 // Build a fresh in-memory account record from a config/disk account object.
 // Shared by the constructor and addAccount() so the field set can never drift
 // between startup accounts and runtime-added ones (a divergence here once left
@@ -218,6 +236,10 @@ function makeAccount(acct, index) {
     displayOrder: Number.isFinite(acct.displayOrder) ? acct.displayOrder : null,
     disabled: acct.disabled || false,
     maxUsage: acct.maxUsage ?? null,
+    // Per-account switchThreshold override (issue #409) — a rotation
+    // PREFERENCE like the fleet setting, not the hard cap maxUsage is. See
+    // thresholdFor() for the resolution order.
+    switchThreshold: accountSwitchThreshold(acct),
     upstream: acct.upstream || null,
     modelMap: acct.modelMap || null,
     // Fields to drop from request bodies for this account (third-party upstreams
@@ -449,8 +471,34 @@ export class AccountManager {
    * Bucket keys are the quota field names (unified5h, unified7d, unified7dFable,
    * unified7dSonnet, tokens, requests). Anything unlisted takes `default`, so a
    * bare number behaves exactly as it always has.
+   *
+   * An individual account can override this fleet setting with its own
+   * `accounts[].switchThreshold` (issue #409 — mixed plans, mixed extra-usage
+   * settings, want different rotation points). Same two shapes, and the same
+   * resolution order one level down: the account table's entry for THIS
+   * bucket, else the account's own `default` (or bare number), else the fleet
+   * value resolved above. So an account table with no `default` only overrides
+   * the buckets it lists — it does not opt the account out of the fleet
+   * setting for every OTHER bucket. `resolveSwitchThreshold` is shared with the
+   * status renderer and the attach-mode TUI so a value read off the wire agrees
+   * with the value the live gate used.
+   *
+   * Still a rotation PREFERENCE, exactly like the fleet value: the
+   * all-exhausted revalidation probe can override it the same way. That is
+   * what keeps it a different setting from the hard `accounts[].maxUsage` cap
+   * — see capFor.
+   * @param {string} bucket
+   * @param {any} [account]
    */
-  thresholdFor(bucket) {
+  thresholdFor(bucket, account = null) {
+    return resolveSwitchThreshold(account?.switchThreshold, bucket, this._fleetThresholdFor(bucket));
+  }
+
+  /** The fleet-wide threshold for one bucket, ignoring any per-account
+   * override — thresholdFor()'s fallback, and what an account with no
+   * `switchThreshold` of its own resolves to.
+   * @param {string} bucket */
+  _fleetThresholdFor(bucket) {
     const t = this.switchThreshold;
     if (typeof t === 'number') return t;
     if (t && typeof t === 'object') {
@@ -1142,7 +1190,6 @@ export class AccountManager {
   _pickAdaptive(exclude = null, model = null, advisorModel = null) {
     const now = Date.now();
     const bucket = this._weeklyBucketFor(model);
-    const threshold = this.thresholdFor(bucket);
 
     // The SAME candidate set the even walk uses, so adaptive cannot quietly
     // bypass expiry routing: with it off this is every eligible account, and
@@ -1176,11 +1223,13 @@ export class AccountManager {
     const planWeights = tier.map(a => quotaTier(a).weight);
     const usePlanWeights = planWeights.every(weight => weight != null && weight > 0);
 
+    // Per-account, not hoisted above the tier: an account with its own
+    // switchThreshold (issue #409) tapers toward ITS OWN wall, not the fleet's.
     const candidates = tier.map((account, i) => ({
       account,
       index: account.index,
       utilization: windows[i].utilization,
-      threshold,
+      threshold: this.thresholdFor(bucket, account),
       capacity: usePlanWeights ? planWeights[i] : null,
       reserve: this.burnRateLearner.reserve(account.index, windows[i].bucket),
       load: this._adaptiveLoad(account, now),
@@ -1188,7 +1237,7 @@ export class AccountManager {
     }));
     const maxRemaining = Math.max(...candidates.map(c => {
       const u = Number.isFinite(c.utilization) ? c.utilization : 0;
-      const head = Math.max(0, threshold - u);
+      const head = Math.max(0, c.threshold - u);
       return c.capacity != null ? c.capacity * head : head;
     }));
 
@@ -1383,7 +1432,6 @@ export class AccountManager {
   _adaptiveStatsFor(model, provider, reported) {
     const now = Date.now();
     const bucket = this._weeklyBucketFor(model);
-    const threshold = this.thresholdFor(bucket);
 
     const excluded = this._excludeOtherProviders(null, provider);
     const eligible = this._bandedCandidates(excluded, model);
@@ -1403,6 +1451,9 @@ export class AccountManager {
       const window = windows.get(a.index);
       const utilization = window.utilization;
       const u = Number.isFinite(utilization) ? utilization : 0;
+      // Per-account: an account with its own switchThreshold (#409) reports
+      // headroom against ITS OWN wall, not the fleet's.
+      const threshold = this.thresholdFor(bucket, a);
       const head = Math.max(0, threshold - u);
       const planWeight = planWeights.get(a.index);
       return {
@@ -1438,7 +1489,7 @@ export class AccountManager {
       if (!r.competing) { r.score = 0; continue; }
       const { score } = scoreCandidate({
         utilization: r.utilization,
-        threshold,
+        threshold: r.threshold,
         capacity: usePlanWeights ? r.planWeight : null,
         reserve: r.reserve,
         load: r.sessions + r.inFlight,
@@ -1669,7 +1720,7 @@ export class AccountManager {
     const q = account.quota;
     const key = this._weeklyBucketFor(model);
     if (key === 'unified7d') return false;
-    return q[key] != null && q[key] >= this.thresholdFor(key);
+    return q[key] != null && q[key] >= this.thresholdFor(key, account);
   }
 
   /**
@@ -2892,7 +2943,7 @@ export class AccountManager {
     // per account per window and no more. A reading with headroom is left alone:
     // it gates nothing, so it cannot seal anything in.
     for (const { key, label } of FAMILY_WEEKLY_BUCKETS) {
-      if (q[key] == null || q[key] < this.thresholdFor(key)) continue;
+      if (q[key] == null || q[key] < this.thresholdFor(key, account)) continue;
       const seenField = `${key}SeenAt`;
       // Unknown age (restored from an older state file, or set by a path that
       // predates the stamp): start the clock now rather than clearing at once,
@@ -3113,7 +3164,7 @@ export class AccountManager {
     this._clearExpiredQuotas(account);
 
     // Shared 5-hour bucket gates every request regardless of model.
-    if (q.unified5h != null && q.unified5h >= this.thresholdFor('unified5h')) return true;
+    if (q.unified5h != null && q.unified5h >= this.thresholdFor('unified5h', account)) return true;
 
     // The HIGHER of the weekly bucket that GOVERNS this model and the shared
     // weekly one. Fable and Sonnet meter their own quota, so a spent Fable
@@ -3123,17 +3174,17 @@ export class AccountManager {
     // ratcheting further past that cap. When the family bucket isn't reported
     // (e.g. the plan doesn't expose it) the shared one answers alone.
     const weeklyVal = this._governingWeekly(account, model);
-    if (weeklyVal != null && weeklyVal >= this.thresholdFor(this._weeklyBucketFor(model))) return true;
+    if (weeklyVal != null && weeklyVal >= this.thresholdFor(this._weeklyBucketFor(model), account)) return true;
 
     // Standard quotas (API key accounts)
     if (q.tokensLimit != null && q.tokensRemaining != null) {
       const used = 1 - (q.tokensRemaining / q.tokensLimit);
-      if (used >= this.thresholdFor('tokens')) return true;
+      if (used >= this.thresholdFor('tokens', account)) return true;
     }
 
     if (q.requestsLimit != null && q.requestsRemaining != null) {
       const used = 1 - (q.requestsRemaining / q.requestsLimit);
-      if (used >= this.thresholdFor('requests')) return true;
+      if (used >= this.thresholdFor('requests', account)) return true;
     }
 
     return false;
@@ -3599,7 +3650,7 @@ export class AccountManager {
     const now = Date.now();
     for (const { key, label, usageKey } of FAMILY_WEEKLY_BUCKETS) {
       const bucket = usage[usageKey];
-      const wasSpent = q[key] != null && q[key] >= this.thresholdFor(key);
+      const wasSpent = q[key] != null && q[key] >= this.thresholdFor(key, account);
       if (bucket && bucket.utilization != null) {
         q[key] = bucket.utilization;
         q[`${key}Reset`] = bucket.resetAt ?? null;
@@ -3613,7 +3664,7 @@ export class AccountManager {
         continue;
       }
       // Worth a line: the account was refusing this family and is not any more.
-      if (wasSpent && !(q[key] != null && q[key] >= this.thresholdFor(key))) {
+      if (wasSpent && !(q[key] != null && q[key] >= this.thresholdFor(key, account))) {
         console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" ${label} weekly quota confirmed available by probe`);
       }
     }
@@ -4072,6 +4123,11 @@ export class AccountManager {
         displayOrder: a.displayOrder ?? null,
         disabled: a.disabled || false,
         maxUsage: a.maxUsage ?? null,
+        // Raw per-account override (issue #409), same shapes as the fleet-wide
+        // field, so a remote reader (the attach-mode TUI, a status --json
+        // consumer) can resolve it with the shared resolveSwitchThreshold
+        // rather than only seeing this account's already-resolved default.
+        switchThreshold: a.switchThreshold ?? null,
         status: a.status,
         // Why the account is out of rotation right now (null = it can serve).
         // Distinguishes a local threshold decision from an upstream rejection —

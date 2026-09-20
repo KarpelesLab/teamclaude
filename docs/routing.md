@@ -169,7 +169,7 @@ Plan size comes from authoritative account metadata; only dynamic behavior is le
 
 The taper's width is adaptive too, rather than a fixed percentage: it is how much of the window the account would spend in the next 30 minutes **at its own observed burn rate**, so a fast-burning account is given a wide margin and an idle one may run much closer to the threshold.
 
-The threshold it tapers toward is **your** `switchThreshold`, including the per-bucket form — set `{ "default": 0.98, "unified7d": 0.85 }` and the weekly taper reaches zero at 85%, not 98%.
+The threshold it tapers toward is **your** `switchThreshold`, including the per-bucket form — set `{ "default": 0.98, "unified7d": 0.85 }` and the weekly taper reaches zero at 85%, not 98%. An account's own `accounts[].switchThreshold` ([per-account thresholds](quota.md#per-account-thresholds)) overrides that wall for just that account, so two accounts on the same fleet setting can still taper toward different walls.
 
 Quota response headers supply utilization and reset time. Burn rate is learned from fresh readings of each individual quota window; a response that refreshes only shared weekly quota does not rebaseline a cached family window. The burn-rate and concurrency learners run, and persist to the state file, in **every** mode — they have no effect on routing unless `distributeSessions` is `"adaptive"`, but what they have already observed is in hand the moment it is.
 
