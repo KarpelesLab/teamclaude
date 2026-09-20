@@ -2568,6 +2568,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         // Cancels the admission wait and the request itself when the client
         // goes away (see the listener's AbortController).
         signal: ctx.signal,
+        // This account's own egress proxy, when the operator pinned one
+        // (accounts[].routing): every attempt for the account — this one, and
+        // any failover that lands back on it — leaves through that proxy, and
+        // sx's per-attempt policy does not apply to it. Null for every other
+        // account, where the fleet path is unchanged.
+        routing: account.routing || null,
         // How long the head may stay silent before the socket is called dead,
         // when the operator has set no override. It is the account's provider
         // that knows: Codex reasons with the head held open, so its first byte

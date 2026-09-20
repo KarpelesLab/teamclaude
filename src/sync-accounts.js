@@ -3,7 +3,7 @@ import { sameIdentity } from './identity.js';
 import { safeLine } from './safe-text.js';
 import { removedAccountIds } from './account-pairing.js';
 import { ensureAccountIds } from './account-id.js';
-import { accountSwitchThreshold } from './account-manager.js';
+import { accountSwitchThreshold, accountRouting } from './account-manager.js';
 
 /**
  * Sync accounts from disk config: add new accounts and refresh credentials
@@ -119,6 +119,12 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     // and reported here as it would be at startup. The config entry below keeps
     // the operator's text as written: this only decides what the gate reads.
     mgr.switchThreshold = accountSwitchThreshold(diskAcct);
+    // Same for a per-account routing proxy: it is read per request off this
+    // object (server.js forwardRequest, ensureTokenFresh, the prober), so a
+    // disk edit or a `teamclaude routing` change takes effect on the very next
+    // request without a restart. Through the constructor's own parse, so a bad
+    // URL is refused and reported here as it would be at startup.
+    mgr.routing = accountRouting(diskAcct);
     // Third-party-backend bindings are read per request off this object
     // (`account.upstream || upstream`, `account.modelMap` in server.js), so a
     // disk edit must land here to take effect on reload. `|| null` mirrors the
@@ -151,6 +157,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       if (diskAcct.messageThreads === true) cfgAcct.messageThreads = true; else delete cfgAcct.messageThreads;
       if (diskAcct.maxUsage != null) cfgAcct.maxUsage = diskAcct.maxUsage; else delete cfgAcct.maxUsage;
       if (diskAcct.switchThreshold != null) cfgAcct.switchThreshold = diskAcct.switchThreshold; else delete cfgAcct.switchThreshold;
+      if (diskAcct.routing) cfgAcct.routing = diskAcct.routing; else delete cfgAcct.routing;
       if (diskAcct.priority != null) cfgAcct.priority = diskAcct.priority; else delete cfgAcct.priority;
       // The TUI's reorder writes this key onto the entry, so after one
       // arrangement every entry carries a value for a hand edit to lose to.

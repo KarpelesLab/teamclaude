@@ -177,6 +177,9 @@ export async function fetchCodexUsage(account, { fetchImpl = proxyFetch, timeout
         Accept: 'application/json',
       },
       signal: AbortSignal.timeout(timeoutMs),
+      // The account's own egress proxy, when it has one (account-routing.js);
+      // null on every other account, where this key is inert.
+      routing: account.routing ?? null,
     });
     if (!res.ok) return { error: `HTTP ${res.status}`, status: res.status };
     return normalizeCodexUsagePayload(await res.json());

@@ -10,6 +10,7 @@ import { ROLLOVER_MIN_JUMP_MS, remapHeld, findHeld, dropHeld, newObservation } f
 import { decideBand, pressureOf, pressureRank, assertNever } from './band-decision.js';
 import { BurnRateLearner, ConcurrencyLearner, scoreCandidate } from './adaptive-distribution.js';
 import { safeLine } from './safe-text.js';
+import { parseRoutingUrl, describeRouting } from './account-routing.js';
 /** @typedef {import('./session-tracker.js').Observation} Observation */
 
 // Re-exported for callers that import these model helpers from here.
@@ -198,6 +199,26 @@ export function accountSwitchThreshold(acct) {
   return value;
 }
 
+/**
+ * One account's own egress proxy (accounts[].routing), parsed and validated.
+ * The URL carries scheme (http/socks4/socks4a/socks5/socks5h), optional
+ * user:pass auth, host and port — see account-routing.js. An unusable value is
+ * dropped with one line saying so, and the account goes by the fleet path
+ * rather than failing every request it touches with a parse error. The
+ * constructor and the config reload both come through here so a value refused
+ * at startup is refused on reload too.
+ * @param {Record<string, any>} acct
+ * @returns {import('./account-routing.js').RoutingProxy|null}
+ */
+export function accountRouting(acct) {
+  try {
+    return parseRoutingUrl(acct?.routing);
+  } catch (/** @type {any} */ err) {
+    console.log(`[TeamClaude] Account "${safeLine(acct?.name, 64)}": ignoring routing — ${safeLine(err?.message || String(err), 200)}`);
+    return null;
+  }
+}
+
 // Build a fresh in-memory account record from a config/disk account object.
 // Shared by the constructor and addAccount() so the field set can never drift
 // between startup accounts and runtime-added ones (a divergence here once left
@@ -240,6 +261,12 @@ function makeAccount(acct, index) {
     // PREFERENCE like the fleet setting, not the hard cap maxUsage is. See
     // thresholdFor() for the resolution order.
     switchThreshold: accountSwitchThreshold(acct),
+    // This account's own egress proxy, parsed (accounts[].routing). Every
+    // socket opened for the account tunnels through it — request forwarding,
+    // token refresh, profile, usage and quota probes — and it outranks both sx
+    // and the fleet upstream proxy for this account. Null goes by the fleet
+    // path. See account-routing.js.
+    routing: accountRouting(acct),
     upstream: acct.upstream || null,
     modelMap: acct.modelMap || null,
     // Fields to drop from request bodies for this account (third-party upstreams
@@ -3866,10 +3893,11 @@ export class AccountManager {
         // Each provider mints tokens at its own endpoint with its own client
         // id, so the grant is dispatched by provider. Both return the same
         // { accessToken, refreshToken, expiresAt } shape, which is what lets
-        // everything downstream stay provider-agnostic.
+        // everything downstream stay provider-agnostic. The account's own
+        // routing applies here too: a token refresh is that account's traffic.
         const newTokens = await (providerOf(account) === 'codex'
-          ? this._codexRefreshFn(sent)
-          : this._refreshFn(sent));
+          ? this._codexRefreshFn(sent, undefined, account.routing || null)
+          : this._refreshFn(sent, undefined, account.routing || null));
         if (account.refreshToken !== sent) {
           console.log(`[TeamClaude] Discarding refresh result for account "${safeLine(account.name, 64)}" — its tokens were replaced while the refresh was in flight`);
           return;
@@ -4145,6 +4173,10 @@ export class AccountManager {
         // consumer) can resolve it with the shared resolveSwitchThreshold
         // rather than only seeing this account's already-resolved default.
         switchThreshold: a.switchThreshold ?? null,
+        // The account's own egress proxy, password masked (describeRouting):
+        // the status payload crosses process boundaries to the attach TUI and
+        // `status --json`, and a credential has no business in either.
+        routing: describeRouting(a.routing),
         status: a.status,
         // Why the account is out of rotation right now (null = it can serve).
         // Distinguishes a local threshold decision from an upstream rejection —
