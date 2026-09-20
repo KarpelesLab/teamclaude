@@ -380,7 +380,16 @@ async function serverCommand() {
 
   // sx.org proxy (IP-based-429 workaround). Dormant unless an API key is set in
   // config.sx.apiKey; when set we provision a proxy and route upstream through it.
-  const sx = new SxManager({ log: console.error });
+  // Resolved per call, not captured. This manager speaks when it provisions,
+  // and the provisioning just below is the only one that happens here — at
+  // startup, with no TUI yet to paint over the answer. Every later one is
+  // triggered from inside a running TUI: the settings screen's `sx.configure`
+  // and `sx.setMode`, and the key/mode change picked up by `reloadAccounts`.
+  // By then `tui.start()` has swapped `console.error` for the activity log, so
+  // handing over the function object here would bind the pre-TUI console and
+  // put "sx.org proxy ready" / "provisioning failed" on a terminal the
+  // alternate screen has already covered.
+  const sx = new SxManager({ log: line => console.error(line) });
   if (config.sx?.apiKey) {
     const r = await sx.configure(config.sx.apiKey, config.sx.mode);
     if (!r.ok) console.error(`[TeamClaude] sx.org disabled: ${r.error}`);
@@ -700,8 +709,8 @@ async function serverCommand() {
   if (!tui) autoUpdate({ config }).catch(() => {});
 
   // One idempotent shutdown funnel for BOTH modes and BOTH triggers: POSIX
-  // signals (SIGINT/SIGTERM) and the TUI's ctrl-c / q keypress (which in raw mode
-  // never reaches the OS as a signal). Guards re-entry: a second ctrl-c — an
+  // signals (SIGINT/SIGTERM/SIGHUP) and the TUI's ctrl-c / q keypress (which in
+  // raw mode never reaches the OS as a signal). Guards re-entry: a second ctrl-c — an
   // impatient user, or a signal racing the keypress — forces an immediate exit
   // instead of re-running teardown, which would re-arm server.close() and leak a
   // 'close' listener on the server each time (MaxListenersExceededWarning).
@@ -726,6 +735,11 @@ async function serverCommand() {
   }
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
+  // A closed pane or a dropped SSH session hangs up the controlling terminal.
+  // SIGHUP's default action kills the process where it stands, skipping stop()
+  // and the quota-state save; routed through the same funnel, a vanished
+  // terminal is an orderly exit like any other.
+  process.on('SIGHUP', shutdown);
 }
 
 // ── import ──────────────────────────────────────────────────

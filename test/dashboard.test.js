@@ -115,10 +115,10 @@ test('thresholdBadgeText names a bucket the account default moves off the fleet 
 });
 
 test('accountBadges adds the threshold badge only when it differs from the fleet', () => {
-  const withFleet = accountBadges({ name: 'a', type: 'oauth', switchThreshold: 1.0 }, null, null, 0.98, null);
+  const withFleet = accountBadges({ name: 'a', type: 'oauth', switchThreshold: 1.0 }, null, null, null, 0.98, null);
   assert.deepEqual(withFleet[withFleet.length - 1], { cls: 'meta threshold', text: 'switch at 100%' });
 
-  const matching = accountBadges({ name: 'a', type: 'oauth', switchThreshold: 0.98 }, null, null, 0.98, null);
+  const matching = accountBadges({ name: 'a', type: 'oauth', switchThreshold: 0.98 }, null, null, null, 0.98, null);
   assert.ok(!matching.some(b => b.cls.includes('threshold')), 'an override equal to the fleet stays silent');
 
   // No `switchThreshold` on the account at all (the common case, and the
@@ -536,7 +536,7 @@ test('accountBadges calls thresholdBadgeText inside the same serialized bundle',
   const bundle = script.slice(script.indexOf('var STARVED_MIN'), script.indexOf('function el('));
   const isolated = new Function(`${bundle}; return accountBadges;`)();
   const account = { name: 'a', type: 'oauth', switchThreshold: 1.0 };
-  assert.deepEqual(isolated(account, null, null, 0.98, null), accountBadges(account, null, null, 0.98, null));
+  assert.deepEqual(isolated(account, null, null, null, 0.98, null), accountBadges(account, null, null, null, 0.98, null));
 });
 
 // The bare number above never reaches the bucket tables: only a TABLE-form
@@ -550,10 +550,10 @@ test('a table-form override renders its badge inside the serialized bundle', () 
   const bundle = script.slice(script.indexOf('var STARVED_MIN'), script.indexOf('function el('));
   const isolated = new Function(`${bundle}; return accountBadges;`)();
   const account = { name: 'a', type: 'oauth', switchThreshold: { unified7d: 0.9, unified7dFable: 0.8 } };
-  const badges = isolated(account, null, null, 0.98, null);
+  const badges = isolated(account, null, null, null, 0.98, null);
   assert.deepEqual(badges[badges.length - 1], { cls: 'meta threshold', text: 'switch 7d 90%, fable 80%' });
   // The inherited-bucket path reads the same two tables.
-  const moved = isolated({ name: 'b', type: 'oauth', switchThreshold: 0.98 }, null, null, 0.98, { default: 0.98, unified7d: 0.85 });
+  const moved = isolated({ name: 'b', type: 'oauth', switchThreshold: 0.98 }, null, null, null, 0.98, { default: 0.98, unified7d: 0.85 });
   assert.deepEqual(moved[moved.length - 1], { cls: 'meta threshold', text: 'switch 7d 98%' });
 });
 

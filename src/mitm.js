@@ -20,7 +20,7 @@ import tls from 'node:tls';
 import http2 from 'node:http2';
 import { getConfigPath } from './config.js';
 import { generateCertChain } from './x509.js';
-import { createProxyRequestListener, resolveClientAuth, loopbackExempt, relayUpgrade, resolveAccountPin, describeConnectError } from './server.js';
+import { createProxyRequestListener, resolveClientAuth, loopbackExempt, relayUpgrade, resolveAccountPin, describeConnectError, KEEP_ALIVE_TIMEOUT_MS } from './server.js';
 import { interceptHostsFor, isNeverIntercepted } from './provider.js';
 import { forwardRefusal, guardedLookup, FORBIDDEN_FORWARD } from './forward-target.js';
 import { safeLine } from './safe-text.js';
@@ -252,6 +252,18 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
       key, cert, allowHTTP1: true,
       ...(http1Only ? { ALPNProtocols: ['http/1.1'] } : {}),
     });
+    // The same client pools sit in front of this server as the base listener,
+    // so it holds an idle connection for the same time. Set on the h2 server,
+    // which passes it to the internal HTTP/1 server that `allowHTTP1` clients
+    // actually land on. Left unset, the two halves of one proxy disagree:
+    // measured on node 24, the base listener advertises `Keep-Alive:
+    // timeout=120` and this one advertises nothing at all, so the idle window
+    // is whatever that runtime happens to default to (node 26: 5s).
+    // @types/node does not declare keepAliveTimeout on Http2SecureServer, but
+    // the runtime honours it for the HTTP/1 connections allowHTTP1 accepts —
+    // asserted end-to-end through a real tunnel in mitm-integration.test.js,
+    // so the cast is checked by a test rather than taken on trust.
+    /** @type {any} */ (srv).keepAliveTimeout = KEEP_ALIVE_TIMEOUT_MS;
     srv.on('request', createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, forcedPin: pin || null, egress, clientUsage, forcedClient: client, dimensionUsage }));
     // Remote Control's real-time channel is a WebSocket (Upgrade handshake),
     // which never fires 'request' — only 'upgrade', with a raw socket instead
