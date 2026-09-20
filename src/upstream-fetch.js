@@ -14,6 +14,7 @@ import https from 'node:https';
 import { ReadableStream } from 'node:stream/web';
 import { tunnelTls } from './sx.js';
 import { proxyForHost, proxyAgent } from './upstream-proxy.js';
+import { routingAgent } from './account-routing.js';
 import { AdmissionGate, DEFAULT_MAX_QUEUE, DEFAULT_QUEUE_TIMEOUT_MS } from './admission-gate.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
@@ -132,13 +133,19 @@ function headersTimeoutError(ms) {
 // `useProxy` is decided by the caller (it varies per attempt — e.g. direct first,
 // then via sx after a 429). With it false, or sx unprovisioned, this is plain fetch
 // (plus the headers-timeout guard).
+//
+// `opts.routing` is one account's own egress proxy (account-routing.js). It
+// outranks BOTH sx and the fleet upstream proxy: the operator's contract for a
+// routed account is that its traffic never leaves by another path, so every
+// attempt — including a post-429 retry — goes through that account's proxy.
 /** @param {Record<string, any>} [opts] */
 export function upstreamFetch(url, opts = {}, sx = null, useProxy = false) {
-  const { headersTimeoutMs, defaultHeadersTimeoutMs, queueTimeoutMs, ...fetchOpts } = opts;
+  const { headersTimeoutMs, defaultHeadersTimeoutMs, queueTimeoutMs, routing, ...fetchOpts } = opts;
   const timeoutMs = resolveHeadersTimeout(headersTimeoutMs, defaultHeadersTimeoutMs);
   // The admission wait is a per-call option of the node:http paths only; the
   // global-fetch escape hatch is not gated (it has no socket pool to protect).
   const nodeOpts = queueTimeoutMs == null ? fetchOpts : { ...fetchOpts, queueTimeoutMs };
+  if (routing) return pooledFetch(url, { ...nodeOpts, routing }, timeoutMs);
   if (sx && useProxy && sx.isProvisioned()) return proxiedFetch(url, nodeOpts, sx, timeoutMs);
   // The global-fetch escape hatch cannot speak CONNECT (that is why the tunnel
   // is hand-rolled at all), so an upstream proxy overrides it rather than being
@@ -157,9 +164,15 @@ export function upstreamFetch(url, opts = {}, sx = null, useProxy = false) {
  * whether an account can be added or kept alive at all. Leaving them direct
  * would mean `login` fails and every token refresh dies on a host that can only
  * reach the network through a proxy, which is precisely the reported setup.
+ *
+ * `opts.routing` pins the call to one account's own egress proxy, which — as on
+ * the forwarding path — outranks the fleet proxy for that account.
+ * @param {string} url
+ * @param {Record<string, any>} [opts]
  */
 export function proxyFetch(url, opts = {}) {
-  const { headersTimeoutMs, ...rest } = opts;
+  const { headersTimeoutMs, routing, ...rest } = opts;
+  if (routing) return pooledFetch(url, { ...rest, routing }, resolveHeadersTimeout(headersTimeoutMs));
   if (!proxyForHost(new URL(url).hostname)) return fetch(url, rest);
   return pooledFetch(url, rest, resolveHeadersTimeout(headersTimeoutMs));
 }
@@ -170,11 +183,16 @@ export function proxyFetch(url, opts = {}) {
 // "Direct" here means "not via sx". A configured upstream proxy (config
 // `upstreamProxy`, or HTTPS_PROXY — see upstream-proxy.js) still applies: on
 // those hosts there is no such thing as a direct socket to api.anthropic.com,
-// which is the whole of issue #155.
+// which is the whole of issue #155. A per-call `opts.routing` (one account's
+// own proxy) is checked FIRST and replaces the fleet proxy for this call.
 function pooledFetch(url, opts, timeoutMs) {
   const u = new URL(url);
   const isHttp = u.protocol === 'http:';
   const port = Number(u.port) || (isHttp ? 80 : 443);
+  if (opts.routing) {
+    const agent = routingAgent(opts.routing, { targetHost: u.hostname, targetPort: port, tls: !isHttp, tlsOptions: opts.tlsOptions || {} });
+    return nodeRequest(u, opts, timeoutMs, { transport: isHttp ? http : https, agent });
+  }
   const proxy = proxyForHost(u.hostname);
   if (proxy) {
     const agent = proxyAgent(proxy, { targetHost: u.hostname, targetPort: port, tls: !isHttp, tlsOptions: opts.tlsOptions || {} });

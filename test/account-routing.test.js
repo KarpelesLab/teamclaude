@@ -6,6 +6,8 @@ import http from 'node:http';
 import https from 'node:https';
 import { generateCertChain } from '../src/x509.js';
 import { parseRoutingUrl, routingToUrl, describeRouting, connectThroughRouting, routingAgent } from '../src/account-routing.js';
+import { upstreamFetch, proxyFetch } from '../src/upstream-fetch.js';
+import { setUpstreamProxy, resetUpstreamProxy, resolveUpstreamProxy } from '../src/upstream-proxy.js';
 
 const T = { timeout: 30000 };
 const listen = (s) => new Promise((r) => s.listen(0, '127.0.0.1', () => r(s.address().port)));
@@ -373,4 +375,96 @@ test('TLS is end-to-end through a socks5 tunnel', T, async () => {
     assert.equal(seen.host, 'localhost');
     assert.equal(seen.port, upPort);
   } finally { closeHard(srv); closeHard(upstream); }
+});
+
+// ── Precedence: one account's proxy beats the fleet's ────────
+
+// A CONNECT proxy that only counts how many tunnels it was asked for, then
+// relays. Used to prove which proxy a request actually left through.
+function makeCountingConnectProxy() {
+  const seen = { targets: [] };
+  const srv = net.createServer((client) => {
+    client.once('data', (buf) => {
+      const m = buf.toString('latin1').match(/^CONNECT (\S+) HTTP\/1\.1/);
+      if (!m) { client.destroy(); return; }
+      seen.targets.push(m[1]);
+      const [host, port] = m[1].split(':');
+      const up = net.connect(Number(port), host, () => {
+        client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+        up.pipe(client); client.pipe(up);
+      });
+      up.on('error', () => client.destroy());
+    });
+    client.on('error', () => {});
+  });
+  return { srv, seen };
+}
+
+test.afterEach(() => resetUpstreamProxy());
+
+test('upstreamFetch prefers account routing over the fleet upstream proxy', T, async () => {
+  const origin = jsonOrigin();
+  const originPort = await listen(origin);
+  const fleet = makeCountingConnectProxy();
+  const fleetPort = await listen(fleet.srv);
+  const { srv: socks, seen } = makeSocks5Server();
+  const socksPort = await listen(socks);
+
+  // The fleet proxy is configured and would happily serve — the account's own
+  // routing must still win for this call. Explicit empty env: a developer shell
+  // carrying HTTPS_PROXY/NO_PROXY must not leak into the assertion.
+  setUpstreamProxy(resolveUpstreamProxy({ upstreamProxy: `127.0.0.1:${fleetPort}` }, {}));
+  try {
+    const res = await upstreamFetch(`http://127.0.0.1:${originPort}/routed`, {
+      method: 'GET', headersTimeoutMs: 8000, routing: parseRoutingUrl(`socks5://127.0.0.1:${socksPort}`),
+    });
+    assert.equal(res.status, 200);
+    assert.equal(seen.host, '127.0.0.1', 'request left through the account proxy');
+    assert.equal(seen.port, originPort);
+    assert.deepEqual(fleet.seen.targets, [], 'fleet proxy was bypassed for the routed account');
+  } finally { closeHard(socks); closeHard(fleet.srv); closeHard(origin); }
+});
+
+test('upstreamFetch prefers account routing over sx, even on a proxy retry', T, async () => {
+  const origin = jsonOrigin();
+  const originPort = await listen(origin);
+  const fleet = makeCountingConnectProxy();
+  const fleetPort = await listen(fleet.srv);
+  const { srv: socks, seen } = makeSocks5Server();
+  const socksPort = await listen(socks);
+
+  // sx is provisioned and this attempt is the "route via sx" one (useProxy
+  // true) — for a routed account that policy must not fire.
+  const sx = {
+    isProvisioned: () => true,
+    getProxy: () => ({ host: '127.0.0.1', port: fleetPort, username: null, password: null }),
+  };
+  try {
+    const res = await upstreamFetch(`http://127.0.0.1:${originPort}/retry`, {
+      method: 'GET', headersTimeoutMs: 8000, routing: parseRoutingUrl(`socks5h://127.0.0.1:${socksPort}`),
+    }, sx, true);
+    assert.equal(res.status, 200);
+    assert.equal(seen.port, originPort, 'request left through the account proxy');
+    assert.deepEqual(fleet.seen.targets, [], 'sx was bypassed for the routed account');
+  } finally { closeHard(socks); closeHard(fleet.srv); closeHard(origin); }
+});
+
+test('proxyFetch tunnels control-plane calls through account routing', T, async () => {
+  const origin = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ access_token: 'a' }));
+  });
+  const originPort = await listen(origin);
+  const { srv, seen } = makeSocks5Server({ username: 'alice', password: 's3cret' });
+  const proxyPort = await listen(srv);
+  try {
+    const res = await proxyFetch(`http://127.0.0.1:${originPort}/oauth/token`, {
+      method: 'POST', body: '{}', headersTimeoutMs: 8000,
+      routing: `socks5://alice:s3cret@127.0.0.1:${proxyPort}`, // the stored string form
+    });
+    assert.equal(res.ok, true);
+    assert.deepEqual(await res.json(), { access_token: 'a' });
+    assert.equal(seen.auth, 'alice:s3cret');
+    assert.equal(seen.port, originPort);
+  } finally { closeHard(srv); closeHard(origin); }
 });
