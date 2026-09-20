@@ -1,6 +1,6 @@
 import { TUI } from './tui.js';
 import { SessionTitles } from './session-titles.js';
-import { modelGlobMatches } from './model.js';
+import { modelGlobMatches, resolveSwitchThreshold } from './model.js';
 import { safeLine } from './safe-text.js';
 import { providerOf } from './provider.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
@@ -213,8 +213,19 @@ export class RemoteAccountManager {
   }
 
   /** Per-bucket threshold lookup, mirroring AccountManager.thresholdFor so the
-   * shared renderer works against either. */
-  thresholdFor(bucket) {
+   * shared renderer works against either. `account`, when given, is one of the
+   * plain objects `applyStatus` builds off `status.accounts` — its own
+   * `switchThreshold` (#409) is resolved with the SAME `resolveSwitchThreshold`
+   * the live server uses, so the attached dashboard reddens a bar at exactly
+   * the value the server is gating on.
+   * @param {string} bucket
+   * @param {any} [account] */
+  thresholdFor(bucket, account = null) {
+    return resolveSwitchThreshold(account?.switchThreshold, bucket, this._fleetThresholdFor(bucket));
+  }
+
+  /** @param {string} bucket */
+  _fleetThresholdFor(bucket) {
     const t = this.switchThresholds;
     if (t && typeof t === 'object') {
       const v = t[bucket] ?? t.default;

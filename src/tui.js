@@ -12,7 +12,7 @@ import { configIndexFor, managerAccountFor, markAccountRemoved } from './account
 import { PROVIDERS, providerOf, isSubscriptionAccount } from './provider.js';
 import { mintAccountId } from './account-id.js';
 import { formatPercent, heldResetCredits } from './status-renderer.js';
-import { resolveMaxUsage } from './model.js';
+import { resolveMaxUsage, switchThresholdDiffs } from './model.js';
 import { parseProxyUrl, proxyToUrl, describeProxy, describeSelfProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy } from './upstream-proxy.js';
 import { sanitizeText, safeLine } from './safe-text.js';
 // The setting rules live in one module; the CLI, the MCP tools and this screen
@@ -308,6 +308,36 @@ export function blockedFamilies(quota, threshold) {
     if (gating != null && gating >= at(key)) out.push(label);
   }
   return out;
+}
+
+// Matches THRESHOLD_BUCKET_LABELS in status-renderer.js — same short names on
+// both surfaces, so an operator moving from `teamclaude status` text to the
+// live TUI (or attach mode) sees the identical tag rather than relearning it.
+/** @type {Object<string, string>} */
+const THRESHOLD_TAG_LABELS = {
+  unified5h: '5h', unified7d: '7d', unified7dSonnet: 'sonnet', unified7dFable: 'fable',
+  tokens: 'tokens', requests: 'requests',
+};
+
+/**
+ * "switch at 100%" / "switch 7d 90%, fable 80%" — the account's OWN
+ * switchThreshold (issue #409), or '' when it has none or every override it
+ * carries merely repeats what the fleet already resolves to (see
+ * switchThresholdDiffs). `fleetFor(bucket)` is the fleet-only lookup —
+ * `this.am.thresholdFor(bucket)` with no account arg, which both AccountManager
+ * and RemoteAccountManager answer identically, so attach mode reads the same
+ * tag the live server would show.
+ * @param {any} account
+ * @param {(bucket: string) => number} fleetFor
+ */
+export function switchThresholdTag(account, fleetFor) {
+  const diffs = switchThresholdDiffs(account?.switchThreshold, fleetFor);
+  if (!diffs.length) return '';
+  const parts = diffs.map(({ bucket, value }) => {
+    const label = bucket === 'default' ? 'at' : (THRESHOLD_TAG_LABELS[bucket] || bucket);
+    return `${label} ${formatPercent(value)}`;
+  });
+  return `switch ${parts.join(', ')}`;
 }
 
 /** Fit a line to exactly w columns: truncate if too long, pad if too short.
@@ -1764,7 +1794,7 @@ export class TUI {
       const anySonnet = members.some(a => a.quota.unified7dSonnet != null);
       const families = (anyFable ? 1 : 0) + (anySonnet ? 1 : 0);
       const tagW = members.reduce((w, a) => {
-        const names = blockedFamilies(a.quota, key => this.am.thresholdFor(key));
+        const names = blockedFamilies(a.quota, key => this.am.thresholdFor(key, a));
         return names.length ? Math.max(w, 4 + vw(names.join(' '))) : w;
       }, 0);
       // Same rule for the `$`/`$!` money tag: a column the row can draw is a
@@ -1774,7 +1804,16 @@ export class TUI {
         const tag = spendTag(a.quota);
         return tag ? Math.max(w, 2 + vw(tag)) : w;
       }, 0);
-      const fixed = 20 + typeCell + NAME_MIN + routeCells + tagW + spendW;
+      // Same rule again for the switch-threshold tag (#409) — silent on the
+      // common (no override, or one that matches the fleet) row, so it costs
+      // the budget nothing there, exactly like the two tags above it. It sits
+      // in `fixed`, so `span` and the pane `stages` carry it too: a pane is
+      // sized wide enough for the tag, or the split falls back to one column.
+      const switchW = members.reduce((/** @type {number} */ w, /** @type {any} */ a) => {
+        const tag = switchThresholdTag(a, key => this.am.thresholdFor(key));
+        return tag ? Math.max(w, 2 + vw(tag)) : w;
+      }, 0);
+      const fixed = 20 + typeCell + NAME_MIN + routeCells + tagW + spendW + switchW;
       const span = (/** @type {number} */ n, /** @type {number} */ bar) => fixed + 6 * (n - 1) + n * bar;
       const roomFor = (/** @type {number} */ n) => span(n, BAR_MIN) <= W;
       // No Ses bar once every Codex account here has reported without a 5h window;
@@ -2044,9 +2083,11 @@ export class TUI {
     // The live routing threshold, so a bucket the rotation already refuses to
     // use reads red however healthy its pace looks.
     // Each bar reddens at ITS bucket's threshold (a per-bucket table may set
-    // the weekly one lower than the 5-hour one); the attach-mode manager
-    // mirrors thresholdFor, so both dashboards agree with the gate.
-    const thFor = (k) => (typeof this.am.thresholdFor === 'function' ? this.am.thresholdFor(k) : this.am.switchThreshold);
+    // the weekly one lower than the 5-hour one), further overridden by THIS
+    // account's own switchThreshold (#409) when it has one; the attach-mode
+    // manager mirrors thresholdFor(bucket, account), so both dashboards agree
+    // with the gate.
+    const thFor = (k) => (typeof this.am.thresholdFor === 'function' ? this.am.thresholdFor(k, a) : this.am.switchThreshold);
     // A per-account cap (accounts[].maxUsage) is the lower ceiling when it is
     // set, and it is the harder one — past it the account is sent nothing at
     // all. Reddening at the cap keeps the bar honest about where this account
@@ -2096,6 +2137,12 @@ export class TUI {
     // account holds in reserve rather than what it is currently spending.
     const credits = resetCreditTag(q);
     if (credits) line += `  ${cyan(credits)}`;
+    // Switch-threshold tag (issue #409) trails everything else: it is a config
+    // fact about the account, not a live state like the two tags above it, and
+    // it is silent for the common case (no override, or one that just repeats
+    // the fleet's own numbers) — see switchThresholdTag.
+    const switchTag = switchThresholdTag(a, key => this.am.thresholdFor(key));
+    if (switchTag) line += `  ${cyan(switchTag)}`;
     return line;
   }
 

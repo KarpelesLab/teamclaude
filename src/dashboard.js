@@ -89,13 +89,92 @@ export function providerLabel(provider) {
   return provider || 'Unknown';
 }
 
+// Every bucket switchThreshold can be keyed by, plus the short names the
+// threshold badge shows them under. Mirrors THRESHOLD_BUCKET_KEYS in model.js
+// and THRESHOLD_BUCKET_LABELS in status-renderer.js — duplicated rather than
+// imported, because the browser never runs an import. It does not see this
+// module's scope either: a helper reaches the page as its own source text, so
+// these two are written into the page by SHARED_CONSTS below. Without that the
+// first table-form override throws a ReferenceError inside render() and takes
+// the accounts pane with it.
+export var THRESHOLD_BUCKET_KEYS = ['unified5h', 'unified7d', 'unified7dSonnet', 'unified7dFable', 'tokens', 'requests'];
+/** @type {Object<string, string>} */
+export var THRESHOLD_BUCKET_LABELS = {
+  unified5h: '5h', unified7d: '7d', unified7dSonnet: 'sonnet', unified7dFable: 'fable',
+  tokens: 'tokens', requests: 'requests',
+};
+
 /**
+ * "switch at 100%" / "switch 7d 90%, fable 80%" — an account's OWN
+ * switchThreshold (issue #409), or '' when it has none or every override it
+ * carries merely repeats what the fleet already resolves to. `fleetThreshold`
+ * and `fleetThresholds` are the status payload's own top-level fields
+ * (`status.switchThreshold` / `status.switchThresholds`), so the comparison
+ * uses the exact fleet value the live server is gating on.
+ * @param {number|Object<string, number>|null|undefined} accountThreshold
+ * @param {number|null|undefined} fleetThreshold
+ * @param {Object<string, number>|null|undefined} fleetThresholds
+ * @returns {string}
+ */
+export function thresholdBadgeText(accountThreshold, fleetThreshold, fleetThresholds) {
+  /** @param {string} bucket */
+  function fleetFor(bucket) {
+    if (fleetThresholds && typeof fleetThresholds === 'object') {
+      var v = fleetThresholds[bucket];
+      if (v == null) v = fleetThresholds.default;
+      if (typeof v === 'number' && isFinite(v)) return v;
+    }
+    return typeof fleetThreshold === 'number' && isFinite(fleetThreshold) ? fleetThreshold : 0.98;
+  }
+  /** @param {number} v */
+  function pct(v) { return (Math.round(v * 1000) / 10) + '%'; }
+  /** @param {unknown} v */
+  function valid(v) { return typeof v === 'number' && isFinite(v); }
+  /** @type {string[]} */
+  var parts = [];
+  /** @type {Object<string, any>} */
+  var table = {};
+  /** @type {any} */
+  var ownDefault = null;
+  if (typeof accountThreshold === 'number') {
+    if (!valid(accountThreshold)) return '';
+    ownDefault = accountThreshold;
+    if (accountThreshold !== fleetFor('default')) parts.push('at ' + pct(accountThreshold));
+  } else if (accountThreshold && typeof accountThreshold === 'object' && !Array.isArray(accountThreshold)) {
+    table = accountThreshold;
+    ownDefault = table.default;
+    Object.keys(table).forEach(function (key) {
+      var v = table[key];
+      if (!valid(v)) return;
+      if (key !== 'default' && THRESHOLD_BUCKET_KEYS.indexOf(key) === -1) return;
+      if (v !== fleetFor(key)) parts.push((key === 'default' ? 'at' : (THRESHOLD_BUCKET_LABELS[key] || key)) + ' ' + pct(v));
+    });
+  }
+  // As switchThresholdDiffs in model.js: the account's own default outranks a
+  // bucket entry in the FLEET table, so a default equal to the fleet's can
+  // still move a bucket the fleet names (fleet 7d at 85%, account 0.98 puts
+  // that account's 7d at 98%). When the defaults differ, "at N%" already
+  // covers every bucket the account does not list.
+  if (valid(ownDefault) && ownDefault === fleetFor('default')) {
+    THRESHOLD_BUCKET_KEYS.forEach(function (key) {
+      if (valid(table[key])) return;
+      if (ownDefault !== fleetFor(key)) parts.push(THRESHOLD_BUCKET_LABELS[key] + ' ' + pct(ownDefault));
+    });
+  }
+  return parts.length ? 'switch ' + parts.join(', ') : '';
+}
+
+/**
+ * `now` keeps the fourth slot master's reset-credit callers already use; the
+ * fleet threshold pair (#409) follows it.
  * @param {Record<string, any>|null|undefined} account
  * @param {string|null} [current]
  * @param {Record<string, string>|null} [currentAccounts]
- * @param {number} [now]  ms epoch a reset-credit reading's age is measured from
+ * @param {number|null} [now]  ms epoch a reset-credit reading's age is measured from
+ * @param {number|null|undefined} [fleetThreshold]
+ * @param {Object<string, number>|null|undefined} [fleetThresholds]
  */
-export function accountBadges(account, current, currentAccounts, now) {
+export function accountBadges(account, current, currentAccounts, now, fleetThreshold, fleetThresholds) {
   var a = account || {};
   var isCurrent = currentAccounts
     ? currentAccounts[a.provider] === a.name
@@ -124,20 +203,42 @@ export function accountBadges(account, current, currentAccounts, now) {
   if (Number.isFinite(credits) && credits > 0 && !stale) {
     badges.push({ cls: 'meta', text: credits + ' reset credit' + (credits === 1 ? '' : 's') });
   }
+  // Arguments 5/6 are optional (the pre-#409 unit test above omits them): with
+  // no account switchThreshold at all — the common case — thresholdBadgeText
+  // returns '' regardless of what the fleet args are, so an old caller sees no
+  // new badge. A caller that DOES set switchThreshold on the account is
+  // expected to pass the fleet's own value too, the way `render()` does below,
+  // or the comparison falls back to thresholdBadgeText's own 0.98 default.
+  var thresholdText = thresholdBadgeText(a.switchThreshold, fleetThreshold, fleetThresholds);
+  if (thresholdText) badges.push({ cls: 'meta threshold', text: thresholdText });
   return badges;
 }
 
-// One row per session, from `sessions.items` (proxy.sessionDetail). The token
-// columns are #192's numbers — what each response actually reported, cache
-// included — summed across the weekly buckets the session touched. `pins` is a
-// bucket→account map rather than one index, because a session spending two
-// model families is served by two accounts at the same time.
+// One row per CONVERSATION, from `sessions.items` (proxy.sessionDetail). A
+// Claude Code session that fans out to nine subagents is nine rows, because a
+// conversation is what holds a pin and a prompt cache.
+//
+// `id` is the pin key those rows are keyed by — a session id narrowed to one
+// conversation — which is an identity for routing, not one to read: a composite
+// nobody recognises, and identical between siblings but for its tail. So the
+// visible identity is split in two, the session an operator knows and the
+// conversation that tells its siblings apart. A record labelled by no request
+// (touch() alone) has no session name, and falls back to the key it is under.
+//
+// The token columns are #192's numbers — what each response actually reported,
+// cache included — summed across the weekly buckets the conversation touched.
+// `pins` is a bucket→account map rather than one index, because a conversation
+// spending two model families is served by two accounts at the same time.
 export function sessionRows(sessions) {
   var items = (sessions && sessions.items) || [];
   return items.map(function (s) {
     var buckets = s.tokens || {};
     var row = {
       id: s.id,
+      session: s.session || s.id || '',
+      // Enough of the digest to separate one session's live conversations; the
+      // whole of it is a column read to the end by nobody.
+      conversation: String(s.conversation || '').slice(0, 8),
       client: s.client || '',
       project: (s.dimensions || {}).project || '',
       active: !!s.active,
@@ -284,9 +385,10 @@ export function routeRows(status) {
 // delay a true positive.
 export var STARVED_MIN = 5;
 // The failure that makes this fire is usually fleet-wide, so every active
-// session starves at once. Naming all of them would bury the dashboard at the
-// moment it matters most; the count carries the scale, three names carry enough
-// to go and ask someone.
+// conversation starves at once — and one fan-out is a dozen of them under one
+// session's name. Naming all of them would bury the dashboard at the moment it
+// matters most; the count carries the scale, three names carry enough to go and
+// ask someone.
 export var STARVED_LIST_MAX = 3;
 
 /**
@@ -320,7 +422,12 @@ export function problems(status) {
   named.slice(0, STARVED_LIST_MAX).forEach(function (r) {
     out.push({
       severity: 'bad', kind: 'starved-session',
-      text: (r.client ? r.client + "'s session " : 'Session ') + String(r.id || '').slice(0, 8)
+      // The session first, since that is the name an operator can go and find,
+      // and the conversation after it, because a streak belongs to one agent of
+      // a fan-out: without it three lines of one session read as the same line
+      // three times. Omitted when the record carries no conversation.
+      text: (r.client ? r.client + "'s session " : 'Session ') + r.session.slice(0, 8)
+        + (r.conversation ? ', conversation ' + r.conversation + ',' : '')
         + ' has had ' + r.starved + ' requests in a row come back with nothing'
         + (r.project ? ' (' + r.project + ')' : '') + why,
     });
@@ -328,13 +435,15 @@ export function problems(status) {
   if (named.length > STARVED_LIST_MAX) {
     out.push({
       severity: 'bad', kind: 'starved-more',
-      text: 'and ' + (named.length - STARVED_LIST_MAX) + ' more sessions are getting nothing back.',
+      text: 'and ' + (named.length - STARVED_LIST_MAX) + ' more conversations are getting nothing back.',
     });
   }
   if (!named.length && (sessions.starvedMax || 0) >= STARVED_MIN) {
     out.push({
       severity: 'bad', kind: 'starved-session',
-      text: 'A session has had ' + sessions.starvedMax + ' requests in a row come back with nothing.'
+      // A conversation, not a session: the streak is counted per conversation,
+      // and a session whose other agents are answering fine is not starving.
+      text: 'A conversation has had ' + sessions.starvedMax + ' requests in a row come back with nothing.'
         + ' Turn on proxy.sessionDetail to see which.',
     });
   }
@@ -358,14 +467,22 @@ export function problems(status) {
 }
 
 const SHARED_HELPERS = [
-  scopedWeeklyRows, accountTokens, providerLabel, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
+  scopedWeeklyRows, accountTokens, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, routeRows, problems,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
 // `accountBadges` over the reset-credit cut-off, so a page without them would
-// ReferenceError on first render.
-const SHARED_CONSTS = `var STARVED_MIN = ${STARVED_MIN};\nvar STARVED_LIST_MAX = ${STARVED_LIST_MAX};\nvar RESET_CREDIT_MAX_AGE_MS = ${RESET_CREDIT_MAX_AGE_MS};`;
+// ReferenceError on first render. The same goes for the two tables
+// `thresholdBadgeText` reads. They follow the STARVED pair so the page's
+// constants stay in one block ahead of the helpers that use them.
+const SHARED_CONSTS = [
+  `var STARVED_MIN = ${STARVED_MIN};`,
+  `var STARVED_LIST_MAX = ${STARVED_LIST_MAX};`,
+  `var RESET_CREDIT_MAX_AGE_MS = ${RESET_CREDIT_MAX_AGE_MS};`,
+  `var THRESHOLD_BUCKET_KEYS = ${JSON.stringify(THRESHOLD_BUCKET_KEYS)};`,
+  `var THRESHOLD_BUCKET_LABELS = ${JSON.stringify(THRESHOLD_BUCKET_LABELS)};`,
+].join('\n');
 
 const PAGE = `<!doctype html>
 <html lang="en">
@@ -577,14 +694,14 @@ ${SHARED_HELPERS}
     return row;
   }
 
-  function renderAccount(a, current, currentAccounts) {
+  function renderAccount(a, current, currentAccounts, fleetThreshold, fleetThresholds) {
     var card = el('div', 'card');
     var head = el('div', 'row');
     head.appendChild(el('span', 'name', a.name));
     var isCurrent = currentAccounts
       ? currentAccounts[a.provider] === a.name
       : a.name === current;
-    accountBadges(a, current, currentAccounts).forEach(function (badge) {
+    accountBadges(a, current, currentAccounts, null, fleetThreshold, fleetThresholds).forEach(function (badge) {
       head.appendChild(el('span', 'badge ' + badge.cls, badge.text));
     });
     // Last in the row so the badges sit in the same place on every card.
@@ -656,8 +773,13 @@ ${SHARED_HELPERS}
     tr.appendChild(th);
   }
 
+  // Session and conversation are two columns rather than one composite: sorting
+  // by Session brings a fan-out's rows together (the sort is stable, so they
+  // stay in recency order inside it) and Conv is the only column that differs
+  // between them. Narrow on purpose — it is a digest, not a name.
   var SESSION_COLUMNS = [
-    { key: 'id', label: 'Session' },
+    { key: 'session', label: 'Session' },
+    { key: 'conversation', label: 'Conv' },
     { key: 'client', label: 'Client' },
     { key: 'project', label: 'Project' },
     { key: 'accounts', label: 'Accounts' },
@@ -686,7 +808,10 @@ ${SHARED_HELPERS}
     sessionFilters.client = clientSel.value;
 
     var rows = sortRows(filterSessionRows(all, sessionFilters), sortState.sessions.key, sortState.sessions.dir);
-    document.getElementById('sessionCount').textContent = rows.length + ' of ' + all.length + ' sessions';
+    // Conversations, not sessions: one client session contributes a row per
+    // agent it has in flight, and counting rows as sessions would report a
+    // fleet carrying several times the clients it has.
+    document.getElementById('sessionCount').textContent = rows.length + ' of ' + all.length + ' conversations';
 
     var table = document.getElementById('sessions');
     table.textContent = '';
@@ -695,7 +820,8 @@ ${SHARED_HELPERS}
     table.appendChild(hr);
     rows.forEach(function (r) {
       var tr = el('tr');
-      tr.appendChild(el('td', r.active ? '' : 'dim', r.id));
+      tr.appendChild(el('td', r.active ? '' : 'dim', r.session));
+      tr.appendChild(el('td', r.active ? '' : 'dim', r.conversation || '—'));
       tr.appendChild(el('td', '', r.client || '—'));
       tr.appendChild(el('td', '', r.project || '—'));
       tr.appendChild(el('td', '', r.accounts || '—'));
@@ -841,14 +967,17 @@ ${SHARED_HELPERS}
     } else {
       sum.appendChild(el('b', '', s.currentAccount || 'none'));
     }
-    sum.appendChild(el('span', '', ' · ' + (sess.active || 0) + ' active / ' + (sess.known || 0) + ' known sessions' + (up ? ' · ' + up : '')));
+    // Conversations, like the table below it and the count above that table:
+    // one page saying "sessions" here and "conversations" there would read as
+    // two different quantities rather than one counted twice.
+    sum.appendChild(el('span', '', ' · ' + (sess.active || 0) + ' active / ' + (sess.known || 0) + ' known conversations' + (up ? ' · ' + up : '')));
     var probe = s.probe || {};
     var probeBtn = document.getElementById('probe');
     probeBtn.textContent = probe.running ? 'Probe running…' : 'Probe quotas';
     probeBtn.disabled = !!probe.running;
     var acc = document.getElementById('accounts');
     acc.textContent = '';
-    (s.accounts || []).forEach(function (a) { acc.appendChild(renderAccount(a, s.currentAccount, currentAccounts)); });
+    (s.accounts || []).forEach(function (a) { acc.appendChild(renderAccount(a, s.currentAccount, currentAccounts, s.switchThreshold, s.switchThresholds)); });
     renderProblems(s);
     renderRoutes(s);
     renderClients(s.clients);

@@ -213,6 +213,39 @@ test('an unknown current account marks nothing current rather than guessing', as
   assert.equal(am.currentIndex, -1);
 });
 
+// A per-account switchThreshold (#409) rides the wire as a plain field on the
+// account object — the same `...a` spread that already carries maxUsage — so
+// the attached dashboard must resolve it exactly as the live server did, not
+// just display the fleet's own number for every account.
+test('thresholdFor resolves a per-account override off the wire, agreeing with the live gate', async (t) => {
+  const { am } = await makeSession(t);
+  am.applyStatus(statusFixture({
+    switchThreshold: 0.98,
+    accounts: [
+      {
+        name: 'alpha', type: 'oauth', orgName: null, priority: 0, disabled: false,
+        status: 'active', sessions: 1, switchThreshold: 1.0,
+        quota: {}, usage: { totalRequests: 0 }, rateLimitedUntil: null, pausedUntil: null,
+      },
+      {
+        name: 'bravo', type: 'apikey', orgName: null, priority: 0, disabled: false,
+        status: 'active', sessions: 1, switchThreshold: { unified7dFable: 0.8 },
+        quota: {}, usage: { totalRequests: 0 }, rateLimitedUntil: null, pausedUntil: null,
+      },
+    ],
+  }));
+  const [alpha, bravo] = am.accounts;
+  assert.equal(am.thresholdFor('unified7d', alpha), 1.0);
+  // A table without `default` only overrides the bucket it names — the rest
+  // still reads the fleet's own setting.
+  assert.equal(am.thresholdFor('unified7dFable', bravo), 0.8);
+  assert.equal(am.thresholdFor('unified7d', bravo), 0.98);
+  // No account (or an account with no override) reads the fleet value alone —
+  // this is also what the TUI's tag-width budget calls to find the fleet side
+  // of the comparison.
+  assert.equal(am.thresholdFor('unified7d'), 0.98);
+});
+
 test('previewRouteIndex resolves a route target by glob', async (t) => {
   const { am } = await makeSession(t);
   am.applyStatus(statusFixture());

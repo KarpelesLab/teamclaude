@@ -1,5 +1,5 @@
 import { DEFAULT_SWITCH_THRESHOLD, distributionMode } from './account-manager.js';
-import { WEEKLY_BUCKET_KEYS } from './model.js';
+import { THRESHOLD_BUCKET_KEYS, WEEKLY_BUCKET_KEYS } from './model.js';
 import { createRollingWarmupSchedule, resolveWarmupSchedule } from './warmup-schedule.js';
 
 /**
@@ -25,7 +25,7 @@ export const ROUTE_COLORS = ['red', 'green', 'yellow', 'blue', 'magenta', 'cyan'
 // The buckets a threshold can be keyed by: the quota windows the manager asks
 // thresholdFor() about. An unknown key would be stored and then never
 // consulted, so it is refused rather than kept as a typo.
-export const QUOTA_BUCKETS = ['unified5h', 'unified7d', 'unified7dSonnet', 'unified7dFable', 'tokens', 'requests'];
+export const QUOTA_BUCKETS = THRESHOLD_BUCKET_KEYS;
 
 // What each mode writes to the config, and what to say once it is set. Keyed by
 // the mode `distributionMode` resolves to, so a caller and the router cannot

@@ -6,7 +6,7 @@ import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
 import {
   renderDashboardHtml, dashboardCsp, scopedWeeklyRows, accountTokens,
-  accountBadges,
+  accountBadges, thresholdBadgeText,
   sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
 } from '../src/dashboard.js';
@@ -75,15 +75,73 @@ test('account metadata and session state are separate badges', () => {
   ]);
 });
 
+// ── per-account switch threshold (#409) ───────────────────────
+
+test('thresholdBadgeText is silent with no override, or one that matches the fleet', () => {
+  assert.equal(thresholdBadgeText(null, 0.98, null), '');
+  assert.equal(thresholdBadgeText(undefined, 0.98, null), '');
+  assert.equal(thresholdBadgeText(0.98, 0.98, null), '');
+  assert.equal(thresholdBadgeText({ unified7d: 0.98 }, 0.98, null), '');
+  // A hand-edited array is the #425 hazard class — refused, not spread into
+  // numeric bucket keys.
+  assert.equal(thresholdBadgeText([0.5], 0.98, null), '');
+});
+
+test('thresholdBadgeText names a bare-number override "at", and a table by bucket', () => {
+  assert.equal(thresholdBadgeText(1.0, 0.98, null), 'switch at 100%');
+  assert.equal(thresholdBadgeText({ unified7dFable: 0.8 }, 0.98, null), 'switch fable 80%');
+  assert.equal(
+    thresholdBadgeText({ unified7d: 0.9, unified7dFable: 0.8 }, 0.98, null),
+    'switch 7d 90%, fable 80%',
+  );
+  // A per-bucket fleet table, not just a bare fleet number: the account's
+  // unified7d entry is compared against the fleet's OWN unified7d, not its
+  // default — an account that merely matches the fleet's per-bucket override
+  // must stay silent on that bucket.
+  assert.equal(thresholdBadgeText({ unified7d: 0.9 }, 0.98, { default: 0.98, unified7d: 0.9 }), '');
+  assert.equal(thresholdBadgeText({ unified7d: 0.85 }, 0.98, { default: 0.98, unified7d: 0.9 }), 'switch 7d 85%');
+});
+
+test('thresholdBadgeText names a bucket the account default moves off the fleet table', () => {
+  // The defaults agree, so the old default-to-default comparison said nothing,
+  // yet this account's weekly wall really is 98% where the fleet's is 85%.
+  const fleetTable = { default: 0.98, unified7d: 0.85 };
+  assert.equal(thresholdBadgeText(0.98, 0.98, fleetTable), 'switch 7d 98%');
+  assert.equal(thresholdBadgeText({ default: 0.98 }, 0.98, fleetTable), 'switch 7d 98%');
+  // An account entry for that bucket answers for it, equal to the fleet's or not.
+  assert.equal(thresholdBadgeText({ default: 0.98, unified7d: 0.85 }, 0.98, fleetTable), '');
+  // A differing default already covers every unlisted bucket.
+  assert.equal(thresholdBadgeText(1.0, 0.98, fleetTable), 'switch at 100%');
+});
+
+test('accountBadges adds the threshold badge only when it differs from the fleet', () => {
+  const withFleet = accountBadges({ name: 'a', type: 'oauth', switchThreshold: 1.0 }, null, null, null, 0.98, null);
+  assert.deepEqual(withFleet[withFleet.length - 1], { cls: 'meta threshold', text: 'switch at 100%' });
+
+  const matching = accountBadges({ name: 'a', type: 'oauth', switchThreshold: 0.98 }, null, null, null, 0.98, null);
+  assert.ok(!matching.some(b => b.cls.includes('threshold')), 'an override equal to the fleet stays silent');
+
+  // No `switchThreshold` on the account at all (the common case, and the
+  // shape the pre-#409 unit test above still exercises): no badge, whatever
+  // the fleet args are, fleet omitted included — never a crash.
+  const noOverride = accountBadges({ name: 'a', type: 'oauth' }, null, null);
+  assert.ok(!noOverride.some(b => b.cls.includes('threshold')));
+});
+
+// The shape the server emits: a row is one CONVERSATION, keyed by the pin key
+// routing uses, with the session it belongs to and the conversation's digest
+// beside it as separate labels.
 const SESSIONS = {
   items: [
     {
-      id: 's-old', client: 'bob', dimensions: { project: 'p2' }, active: false,
+      id: 's-old/conv-old-0123456789abc', session: 's-old', conversation: 'conv-old-0123456789abc',
+      client: 'bob', dimensions: { project: 'p2' }, active: false,
       requests: 2, lastSeen: 200, pins: { unified7d: 1 },
       tokens: { unified7d: { cacheRead: 5, cacheCreation: 1, input: 2, output: 1, context: 8 } },
     },
     {
-      id: 's-new', client: 'alice', dimensions: { project: 'p1' }, active: true,
+      id: 's-new/conv-new-0123456789abc', session: 's-new', conversation: 'conv-new-0123456789abc',
+      client: 'alice', dimensions: { project: 'p1' }, active: true,
       requests: 1, lastSeen: 100, pins: { unified7d: 0, unified7dFable: 1 },
       tokens: {
         unified7d: { cacheRead: 900, cacheCreation: 50, input: 10, output: 5, context: 960 },
@@ -93,36 +151,54 @@ const SESSIONS = {
   ],
 };
 
-test('a session row totals what the responses reported, cache included', () => {
+test('a conversation row totals what the responses reported, cache included', () => {
   const rows = sessionRows(SESSIONS);
-  const row = rows.find(r => r.id === 's-new');
-  // input+output alone would say 21 for a session that actually cost 971.
+  const row = rows.find(r => r.session === 's-new');
+  // input+output alone would say 21 for a conversation that actually cost 971.
   assert.equal(row.input + row.output, 21);
   assert.equal(row.total, 971);
   assert.equal(row.cacheRead, 900);
-  // Summed across every weekly bucket the session touched.
+  // Summed across every weekly bucket the conversation touched.
   assert.equal(row.context, 964);
-  // A session spending two model families is served by two accounts at once,
-  // which is why this is a pin map and not one index.
+  // A conversation spending two model families is served by two accounts at
+  // once, which is why this is a pin map and not one index.
   assert.equal(row.accounts, '0, 1');
   assert.equal(row.client, 'alice');
   assert.equal(row.project, 'p1');
 });
 
+test('a fan-out is one row per conversation, under the one session that owns them', () => {
+  // The rows of one client session are identical but for the conversation, so
+  // the session alone cannot tell them apart — and the key that can is a
+  // composite nobody recognises, so it is not what the table shows.
+  const rows = sessionRows({
+    items: [
+      { id: 'sess-7/aaaaaaaaaaaaaaaaaaaaaa', session: 'sess-7', conversation: 'aaaaaaaaaaaaaaaaaaaaaa', client: 'alice', pins: {}, tokens: {} },
+      { id: 'sess-7/bbbbbbbbbbbbbbbbbbbbbb', session: 'sess-7', conversation: 'bbbbbbbbbbbbbbbbbbbbbb', client: 'alice', pins: {}, tokens: {} },
+    ],
+  });
+  assert.deepEqual(rows.map(r => r.session), ['sess-7', 'sess-7']);
+  // Eight characters of the digest: enough to separate siblings, narrow enough
+  // for a column beside the session.
+  assert.deepEqual(rows.map(r => r.conversation), ['aaaaaaaa', 'bbbbbbbb']);
+});
+
 test('session rows tolerate a payload with nothing in it', () => {
   assert.deepEqual(sessionRows({}), []);
   assert.deepEqual(sessionRows(null), []);
+  // A record no request ever labelled (touch() alone) names no session, and
+  // falls back to the key it is filed under rather than rendering blank.
   const [bare] = sessionRows({ items: [{ id: 'x' }] });
   assert.deepEqual(
-    { id: bare.id, client: bare.client, project: bare.project, total: bare.total, accounts: bare.accounts },
-    { id: 'x', client: '', project: '', total: 0, accounts: '' },
+    { id: bare.id, session: bare.session, conversation: bare.conversation, client: bare.client, project: bare.project, total: bare.total, accounts: bare.accounts },
+    { id: 'x', session: 'x', conversation: '', client: '', project: '', total: 0, accounts: '' },
   );
 });
 
 test('filters narrow by project and client, and combine', () => {
   const rows = sessionRows(SESSIONS);
-  assert.deepEqual(filterSessionRows(rows, { project: 'p1' }).map(r => r.id), ['s-new']);
-  assert.deepEqual(filterSessionRows(rows, { client: 'bob' }).map(r => r.id), ['s-old']);
+  assert.deepEqual(filterSessionRows(rows, { project: 'p1' }).map(r => r.session), ['s-new']);
+  assert.deepEqual(filterSessionRows(rows, { client: 'bob' }).map(r => r.session), ['s-old']);
   assert.deepEqual(filterSessionRows(rows, { project: 'p1', client: 'bob' }), []);
   // An empty filter is "All", not a match against the empty string.
   assert.equal(filterSessionRows(rows, { project: '', client: '' }).length, 2);
@@ -131,12 +207,12 @@ test('filters narrow by project and client, and combine', () => {
 
 test('sorting handles both text and number columns, and does not mutate', () => {
   const rows = sessionRows(SESSIONS);
-  const before = rows.map(r => r.id);
-  assert.deepEqual(sortRows(rows, 'total', 'desc').map(r => r.id), ['s-new', 's-old']);
-  assert.deepEqual(sortRows(rows, 'total', 'asc').map(r => r.id), ['s-old', 's-new']);
-  assert.deepEqual(sortRows(rows, 'client', 'asc').map(r => r.id), ['s-new', 's-old']);
-  assert.deepEqual(sortRows(rows, 'client', 'desc').map(r => r.id), ['s-old', 's-new']);
-  assert.deepEqual(rows.map(r => r.id), before, 'the caller\'s array is untouched');
+  const before = rows.map(r => r.session);
+  assert.deepEqual(sortRows(rows, 'total', 'desc').map(r => r.session), ['s-new', 's-old']);
+  assert.deepEqual(sortRows(rows, 'total', 'asc').map(r => r.session), ['s-old', 's-new']);
+  assert.deepEqual(sortRows(rows, 'client', 'asc').map(r => r.session), ['s-new', 's-old']);
+  assert.deepEqual(sortRows(rows, 'client', 'desc').map(r => r.session), ['s-old', 's-new']);
+  assert.deepEqual(rows.map(r => r.session), before, 'the caller\'s array is untouched');
   assert.deepEqual(sortRows(null, 'total', 'desc'), []);
 });
 
@@ -349,10 +425,14 @@ function fleetStatus(mutate) {
   mutate?.(am);
   return am.getStatus({ sessionDetail: true });
 }
-/** Drive a session to `n` consecutive no-answer outcomes on a real tracker. */
-function starve(am, id, n, client = 'alice') {
+/**
+ * Drive a conversation to `n` consecutive no-answer outcomes on a real tracker.
+ * `id` is the pin key; `labels` carries the session and conversation names the
+ * request path attaches to it, which most cases here do not need.
+ */
+function starve(am, id, n, client = 'alice', labels = null) {
   for (let i = 0; i < n; i++) {
-    am.beginSession(id, { client, dimensions: {} });
+    am.beginSession(id, { client, dimensions: {}, ...labels });
     am.endSession(id, false);
   }
 }
@@ -378,6 +458,17 @@ test('a starving session is named, and a working one is not', () => {
   // A brand-new session, and a fleet doing nothing.
   assert.deepEqual(problems(fleetStatus(am => am.beginSession('fresh1234', { client: 'bob' }))), []);
   assert.deepEqual(problems(fleetStatus()), []);
+});
+
+test('a starving line names the session and the conversation, never the key', () => {
+  // A fan-out starves as a group, so lines carrying only the session would read
+  // as the same line repeated; the pin key that does separate them is a
+  // composite an operator has never seen and cannot look up.
+  const out = problems(fleetStatus(am => starve(am, 'deadbeef1234/AbCdEfGhIjKlMnOpQrStUv', STARVED_MIN, 'alice',
+    { sessionId: 'deadbeef1234', conversation: 'AbCdEfGhIjKlMnOpQrStUv' })));
+  assert.equal(out.length, 1);
+  assert.match(out[0].text, /alice's session deadbeef, conversation AbCdEfGh, has had/);
+  assert.doesNotMatch(out[0].text, /\//);
 });
 
 test('a session that starved and then went quiet stops being reported', () => {
@@ -472,11 +563,43 @@ test('the serialized helpers run in the page\'s own scope, not just parse', () =
   assert.deepEqual(isolated(payload), problems(payload), 'the page runs what the tests exercise');
 });
 
+// The threshold badge specifically: accountBadges calls thresholdBadgeText by
+// NAME, not by reference, so if the two ever land on different sides of the
+// `bundle` slice (or thresholdBadgeText is dropped from SHARED_HELPERS while
+// accountBadges keeps calling it) this is a page-breaking ReferenceError that
+// grepping the source would not catch — only running the bundle does.
+test('accountBadges calls thresholdBadgeText inside the same serialized bundle', () => {
+  const html = renderDashboardHtml();
+  const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
+  const bundle = script.slice(script.indexOf('var STARVED_MIN'), script.indexOf('function el('));
+  const isolated = new Function(`${bundle}; return accountBadges;`)();
+  const account = { name: 'a', type: 'oauth', switchThreshold: 1.0 };
+  assert.deepEqual(isolated(account, null, null, null, 0.98, null), accountBadges(account, null, null, null, 0.98, null));
+});
+
+// The bare number above never reaches the bucket tables: only a TABLE-form
+// override reads THRESHOLD_BUCKET_KEYS and THRESHOLD_BUCKET_LABELS, and those
+// are module constants the page does not see unless SHARED_CONSTS writes them
+// in. Imported, the helper finds them in module scope and passes; in the page
+// it threw a ReferenceError from render() and blanked the accounts pane.
+test('a table-form override renders its badge inside the serialized bundle', () => {
+  const html = renderDashboardHtml();
+  const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
+  const bundle = script.slice(script.indexOf('var STARVED_MIN'), script.indexOf('function el('));
+  const isolated = new Function(`${bundle}; return accountBadges;`)();
+  const account = { name: 'a', type: 'oauth', switchThreshold: { unified7d: 0.9, unified7dFable: 0.8 } };
+  const badges = isolated(account, null, null, null, 0.98, null);
+  assert.deepEqual(badges[badges.length - 1], { cls: 'meta threshold', text: 'switch 7d 90%, fable 80%' });
+  // The inherited-bucket path reads the same two tables.
+  const moved = isolated({ name: 'b', type: 'oauth', switchThreshold: 0.98 }, null, null, null, 0.98, { default: 0.98, unified7d: 0.85 });
+  assert.deepEqual(moved[moved.length - 1], { cls: 'meta threshold', text: 'switch 7d 98%' });
+});
+
 test('the page ships the same helper implementations it is tested against', () => {
   // The serialization is the contract: if a helper stops being self-contained
   // (closes over module scope), the page would silently ReferenceError.
   const html = renderDashboardHtml();
-  for (const fn of [scopedWeeklyRows, accountTokens, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, routeRows, problems]) {
+  for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, routeRows, problems]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
