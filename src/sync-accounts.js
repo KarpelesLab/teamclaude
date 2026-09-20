@@ -134,6 +134,9 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       if (diskAcct.messageThreads === true) cfgAcct.messageThreads = true; else delete cfgAcct.messageThreads;
       if (diskAcct.maxUsage != null) cfgAcct.maxUsage = diskAcct.maxUsage; else delete cfgAcct.maxUsage;
       if (diskAcct.priority != null) cfgAcct.priority = diskAcct.priority; else delete cfgAcct.priority;
+      // The TUI's reorder writes this key onto the entry, so after one
+      // arrangement every entry carries a value for a hand edit to lose to.
+      if (Number.isFinite(diskAcct.displayOrder)) cfgAcct.displayOrder = diskAcct.displayOrder; else delete cfgAcct.displayOrder;
       if (diskAcct.disabled) cfgAcct.disabled = true; else delete cfgAcct.disabled;
     }
     // Pick up enable/disable toggles; re-enabling clears a stuck error state.

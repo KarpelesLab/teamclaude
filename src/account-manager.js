@@ -4038,6 +4038,10 @@ export class AccountManager {
         provider: providerOf(a),
         orgName: a.orgName || null,
         priority: a.priority || 0,
+        // The attached TUI spreads these fields onto its own account objects
+        // and sorts its rows by this one, so without it `teamclaude attach`
+        // draws array order beside a server TUI drawing the arrangement.
+        displayOrder: a.displayOrder ?? null,
         disabled: a.disabled || false,
         maxUsage: a.maxUsage ?? null,
         status: a.status,

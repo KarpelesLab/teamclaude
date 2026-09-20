@@ -239,6 +239,11 @@ const HEAD_GAP = 2;
 // the feature, and there is nothing to migrate.
 const listRank = (/** @type {any} */ a) => (Number.isFinite(a?.displayOrder) ? a.displayOrder : Infinity);
 
+// How long a reorder waits after the last move before it is written. Longer
+// than a terminal's key-repeat interval, so a held arrow is one write; short
+// enough that the file is current by the time anyone looks at it.
+const ORDER_SAVE_DELAY_MS = 400;
+
 // Which pair of bars a row draws: the subscription buckets (Ses/Wk, plus the
 // S7/F7 family bars) for a subscription or any unified reading, else the metered
 // Tok/Req pair an API-key account reports. The account row budget is drawn per
@@ -531,6 +536,8 @@ export class TUI {
     this.frame = 0;
     this.running = false;
     this.timer = null;
+    /** @type {ReturnType<typeof setTimeout>|null} */
+    this._orderSaveTimer = null; // a reorder waiting to be written: see _doMoveAccount
     // Injectable so a test can drive the repaint tick by hand instead of
     // sleeping through real 500ms/5s intervals.
     this._setTimeout = setTimeout;
@@ -676,6 +683,9 @@ export class TUI {
   stop() {
     this.running = false;
     if (this.timer) { clearTimeout(this.timer); this.timer = null; }
+    // Written now rather than dropped: quitting inside the debounce window
+    // would otherwise lose the last arrangement the operator saw on screen.
+    this._flushOrderSave();
     if (this._origLog) { console.log = this._origLog; console.error = this._origErr; }
     if (this._activityStream) { this._activityStream.end(); this._activityStream = null; }
     process.stdin.removeListener('data', this._dataHandler);
@@ -1129,8 +1139,8 @@ export class TUI {
       } else if (this.selAction === 'toggle') {
         this._doToggleDisabled(this.selIdx);
       } else if (this.selAction === 'reorder') {
-        // Every move has already been saved, so Enter only means "done" — and
-        // it has to be caught here, ahead of the remove branch below, which is
+        // Every move is already applied, so Enter only means "done" — and it
+        // has to be caught here, ahead of the remove branch below, which is
         // what an unlisted action falls into.
       } else {
         this._doRemove(this.selIdx);
@@ -1138,6 +1148,9 @@ export class TUI {
       if (this.mode === 'select') this.mode = this.selReturn;
     }
     else if (k === 'esc' || k === 'q') { this.mode = this.selReturn; }
+    // Leaving the reorder screen by either key writes a move still waiting on
+    // its timer, so "done" means on disk. A no-op for every other action.
+    if (this.mode !== 'select') this._flushOrderSave();
   }
 
   // Step the switch-mode pin target by `dir` through [default, ...routes],
@@ -1563,13 +1576,22 @@ export class TUI {
    *  insert between, and a dense 0..n-1 is the form that reads in a hand-edited
    *  config.
    *
+   *  A move stays inside the account's own provider group. _displayOrder sorts
+   *  by provider before it reads this field, so swapping numbers with a
+   *  neighbour from the other provider would rewrite the config while no row
+   *  moved. The locally-served rows are already out of reach: _arrangeable
+   *  leaves them out, so neither end of a move can be one.
+   *
    *  @param {number} delta  rows to travel: -1 up the list, +1 down it
    */
-  async _doMoveAccount(delta) {
+  _doMoveAccount(delta) {
     const order = this._arrangeable();
     const from = order.indexOf(this.selIdx);
     const to = from + delta;
     if (from < 0 || to < 0 || to >= order.length) return; // already at the end it was pushed against
+    // The edge of a provider group is an end of the list as far as a move goes:
+    // nothing is renumbered and nothing is saved.
+    if (providerOf(this.am.accounts[order[to]]) !== providerOf(this.am.accounts[order[from]])) return;
     order.splice(to, 0, ...order.splice(from, 1));
     order.forEach((/** @type {number} */ mgrIdx, /** @type {number} */ pos) => {
       this.am.accounts[mgrIdx].displayOrder = pos;
@@ -1582,6 +1604,24 @@ export class TUI {
     // Nothing is logged on success. The row visibly moves, which is the whole
     // feedback a drag needs, and a held arrow key would otherwise push the
     // activity pane out from under the list being arranged.
+    //
+    // The save waits for the keys to stop. It is a locked read-merge-write of
+    // the whole config, and a held arrow would otherwise run one per repeat.
+    if (this._orderSaveTimer) clearTimeout(this._orderSaveTimer);
+    this._orderSaveTimer = setTimeout(() => { this._flushOrderSave(); }, ORDER_SAVE_DELAY_MS);
+  }
+
+  /** Write an arrangement that is still waiting on its timer, if one is.
+   *
+   *  Called by the timer, on leaving reorder mode and from stop(), so the wait
+   *  is only ever a delay: no way off the screen leaves a move unsaved.
+   *
+   *  @returns {Promise<void>}
+   */
+  async _flushOrderSave() {
+    if (!this._orderSaveTimer) return;
+    clearTimeout(this._orderSaveTimer);
+    this._orderSaveTimer = null;
     try { await this.saveConfig(this.config); }
     catch (/** @type {any} */ e) { this._addLog(`Failed to save: ${e.message}`); }
   }
@@ -2592,8 +2632,9 @@ export class TUI {
             : 'default';
           return ` ${dim('↑↓')} select  ${dim('←→')} target: ${target}  ${bold('Enter')} pin  ${bold('Esc')} cancel`;
         }
-        // Both keys leave, because each move has already been saved: there is
-        // no pending change for one to commit and the other to throw away, and
+        // Both keys leave, because each move is applied as it is made and written
+        // on the way out at the latest: there is no pending change for one to
+        // commit and the other to throw away, and
         // offering "cancel" would promise an undo this screen does not have.
         if (this.selAction === 'reorder') {
           return ` ${dim('↑↓')} select  ${dim('←→')} move  ${bold('Enter')}/${bold('Esc')} done`;

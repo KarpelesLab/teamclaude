@@ -46,3 +46,19 @@ test('a priority removed on disk does not come back', async () => {
   const { written } = await roundTrip(entry({ priority: 5 }), entry({}));
   assert.equal('priority' in written, false);
 });
+
+// `displayOrder` is the one field here the TUI itself writes onto the entry
+// (Settings → Reorder accounts), so after a single arrangement every entry
+// holds a value for the save stencil to prefer over the operator's hand edit.
+
+test('a displayOrder changed on disk stays changed through the next save', async () => {
+  const { written, running } = await roundTrip(entry({ displayOrder: 3 }), entry({ displayOrder: 0 }));
+  assert.equal(written.displayOrder, 0, 'the save wrote the arranged position back over the hand edit');
+  assert.equal(running.displayOrder, 0);
+});
+
+test('a displayOrder removed on disk does not come back', async () => {
+  const { written, running } = await roundTrip(entry({ displayOrder: 3 }), entry({}));
+  assert.equal('displayOrder' in written, false);
+  assert.equal(running.displayOrder, null, 'the account did not go back among the unplaced');
+});
