@@ -1512,6 +1512,12 @@ export class AccountManager {
     return best ? best.index : null;
   }
 
+  /** One provider's current account index, as `currentAccounts` names it in
+   * status; null when nothing can serve that provider. Moves nothing. */
+  currentIndexFor(/** @type {string} */ provider) {
+    return this._currentIndexForProvider(provider);
+  }
+
   /** The cursor owned by one provider, falling back to the account that its
    * next request would start from before that provider has seen traffic. */
   _currentIndexForProvider(provider) {
@@ -4014,15 +4020,21 @@ export class AccountManager {
     this.sweepExpiredQuotas();
     const sessions = this.sessionTracker.stats(undefined, { detail: sessionDetail });
     const currentAccounts = {};
+    // The same, by position in `accounts`. A name alone is ambiguous when one
+    // address is both a pool's own login and a shared API key.
+    /** @type {Record<string, number|null>} */
+    const currentIndexes = {};
     const defaultTargets = {};
     for (const provider of new Set(this.accounts.map(a => providerOf(a)))) {
       const index = this._currentIndexForProvider(provider);
       currentAccounts[provider] = index == null ? null : this.accounts[index]?.name ?? null;
+      currentIndexes[provider] = index ?? null;
       defaultTargets[provider] = this._routeTarget(null, provider);
     }
     return {
       currentAccount: this.accounts[this.currentIndex]?.name,
       currentAccounts,
+      currentIndexes,
       defaultTargets,
       // Where a request no route claims lands right now — the same derivation
       // as each route's `target`, so a status reader need not assume "the

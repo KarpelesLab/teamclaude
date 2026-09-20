@@ -2,6 +2,7 @@ import { TUI } from './tui.js';
 import { SessionTitles } from './session-titles.js';
 import { modelGlobMatches } from './model.js';
 import { safeLine } from './safe-text.js';
+import { providerOf } from './provider.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 // Attach mode — the dashboard against a server running somewhere else (a
@@ -188,6 +189,12 @@ export class RemoteAccountManager {
   constructor() {
     this.accounts = [];
     this.currentIndex = -1;
+    // Provider → current account, from a server that reports one per pool: by
+    // position when the server sends it, else by name.
+    /** @type {Record<string, string|null>|null} */
+    this.currentAccounts = null;
+    /** @type {Record<string, number|null>|null} */
+    this.currentIndexes = null;
     this.switchThreshold = 0.98;
     // The per-bucket table when the server sent one, so the attached dashboard
     // marks the same families blocked as the server's own TUI does.
@@ -240,6 +247,14 @@ export class RemoteAccountManager {
     // -1 when the payload names an account that is no longer listed: nothing is
     // marked current, which is the truth, rather than defaulting to the first row.
     this.currentIndex = this.accounts.findIndex(a => a.name === text(status?.currentAccount, NAME_MAX));
+    const perProvider = status?.currentAccounts;
+    this.currentAccounts = perProvider && typeof perProvider === 'object' && !Array.isArray(perProvider)
+      ? Object.fromEntries(Object.entries(perProvider).map(([p, name]) => [p, name == null ? null : text(name, NAME_MAX)]))
+      : null;
+    const indexes = status?.currentIndexes;
+    this.currentIndexes = indexes && typeof indexes === 'object' && !Array.isArray(indexes)
+      ? Object.fromEntries(Object.entries(indexes).map(([p, i]) => [p, Number.isInteger(i) && i >= 0 && i < this.accounts.length ? i : null]))
+      : null;
     if (status?.switchThreshold != null) this.switchThreshold = status.switchThreshold;
     this.switchThresholds = status?.switchThresholds || null;
 
@@ -291,6 +306,20 @@ export class RemoteAccountManager {
 
   getRoutes() {
     return this.routes;
+  }
+
+  /** Mirrors AccountManager.currentIndexFor: by `currentIndexes`, else by name and
+   * provider, else the one cursor an older server sends. */
+  currentIndexFor(/** @type {string} */ provider) {
+    if (this.currentIndexes && provider in this.currentIndexes) return this.currentIndexes[provider];
+    if (!this.currentAccounts) {
+      const cur = this.accounts[this.currentIndex];
+      return cur && providerOf(cur) === provider ? this.currentIndex : null;
+    }
+    const name = this.currentAccounts[provider];
+    if (name == null) return null;
+    const idx = this.accounts.findIndex(a => a.name === name && providerOf(a) === provider);
+    return idx >= 0 ? idx : null;
   }
 
   /** The account index a request for `model` would land on, from the route

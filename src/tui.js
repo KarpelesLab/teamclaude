@@ -9,7 +9,7 @@ import {
   oauthIdentityFields,
 } from './identity.js';
 import { configIndexFor, managerAccountFor, markAccountRemoved } from './account-pairing.js';
-import { PROVIDERS, providerOf } from './provider.js';
+import { PROVIDERS, providerOf, isSubscriptionAccount } from './provider.js';
 import { mintAccountId } from './account-id.js';
 import { formatPercent, heldResetCredits } from './status-renderer.js';
 import { resolveMaxUsage } from './model.js';
@@ -211,6 +211,17 @@ const BAR_MAX = 20;
 // when the row has width to spare, but never drops below it, so a narrow
 // terminal lays the table out exactly as it did before the column could grow.
 const NAME_MIN = 12;
+// Providers in declaration order: the order rows and panes are drawn in.
+const PROVIDER_ORDER = Object.keys(PROVIDERS);
+// Two provider pools side by side: the gutter between the panes.
+const PANE_GUTTER = ' │ ';
+// Pane bars: at least wide enough for `10h23m`, and past that only once every
+// name is whole.
+const PANE_BAR_MAX = 12;
+const PANE_BAR_FLOOR = 8;
+// The narrowest a list draws both shared bars in, full width and in a pane.
+const LIST_MIN = 70;
+const PANE_MIN = 62;
 
 // Clear space the centred version label needs on each side before it is drawn
 // at all. Below that it reads as a collision with the title or the port block,
@@ -218,12 +229,13 @@ const NAME_MIN = 12;
 const HEAD_GAP = 2;
 
 // Which pair of bars a row draws: the subscription buckets (Ses/Wk, plus the
-// S7/F7 family bars) when any unified reading exists, else the metered Tok/Req
-// pair an API-key account reports. The account row budget is drawn per
+// S7/F7 family bars) for a subscription or any unified reading, else the metered
+// Tok/Req pair an API-key account reports. The account row budget is drawn per
 // category (#234): the two kinds of row share no bar, so sizing an API-key row
 // for family bars it never draws only left it short of the edge.
-function rowCategory(q) {
-  return (q.unified5h != null || q.unified7d != null || q.unified7dSonnet != null || q.unified7dFable != null)
+function rowCategory(/** @type {any} */ account) {
+  const q = account.quota;
+  return (isSubscriptionAccount(account) || q.unified5h != null || q.unified7d != null || q.unified7dSonnet != null || q.unified7dFable != null)
     ? 'unified' : 'metered';
 }
 
@@ -247,6 +259,15 @@ export function spendTag(quota) {
   const spend = quota?.spend;
   if (!spend?.enabled) return '';
   return (spend.usedMinor || 0) > 0 ? '$!' : '$';
+}
+
+// The type column: the auth kind (7 columns), or the provider in a mixed pool.
+// The row and the width budget both take its width from here.
+function typeColumn(/** @type {any[]} */ accounts) {
+  /** @type {Set<keyof typeof PROVIDERS>} */
+  const pooled = new Set(accounts.map(providerOf));
+  const mixed = pooled.size > 1;
+  return { mixed, width: mixed ? Math.max(...[...pooled].map(id => PROVIDERS[id].label.length)) : 7 };
 }
 
 /**
@@ -301,6 +322,11 @@ export function fitLine(s, w) {
   }
   if (v < w) return s + ' '.repeat(w - v);
   return s;
+}
+
+/** A pane's title, `w` columns wide: the label, then a rule to the pane's edge. */
+function paneTitle(/** @type {string} */ label, /** @type {number} */ w) {
+  return fitLine(` ${bold(label)} ${dim('─'.repeat(Math.max(1, w - vw(label) - 2)))}`, w);
 }
 
 function formatReset(resetTs) {
@@ -1618,104 +1644,24 @@ export class TUI {
         ? '  The server reports no accounts.'
         : '  No accounts configured. Press [g] → Add account.'));
     } else {
-      lines.push('');
-
-      // Routes drive the inline markers; general (non-family) routes get a stable
-      // column each at the row start so the marker's position identifies the route.
-      const routes = this.am.getRoutes();
-      const genRoutes = routes.filter(r => routeFamily(r) === null);
-      // Bar width, budgeted PER ROW CATEGORY (#234). A subscription row draws
-      // Ses/Wk and the S7/F7 family bars; an API-key row draws Tok/Req and
-      // nothing else. Neither shares a bar with the other, so the two are laid
-      // out against separate budgets: every subscription row lines up with the
-      // other subscription rows, every API-key row with the other API-key rows,
-      // and an API-key row no longer pays for family columns it never draws (or
-      // for a blocked-family tag only a subscription row can carry). Within a
-      // category the budget is still shared, on purpose: bars line up and equal
-      // lengths mean equal percentages, and the whitespace that costs a row
-      // without a tag is the price of that.
-      //
-      // The budget must count every column the widest row in the category
-      // actually draws, or the row overruns the terminal and fitLine cuts the
-      // tail off — which is how the S7/F7 bars lost the reset countdown they
-      // carry. Three parts beyond the bars themselves:
-      //   - the fixed prefix (marker, name, type, status, first bar label),
-      //   - the route-marker cells, one per general route,
-      //   - 6 columns of label for each bar past the first (`  Wk `, ` ►F7  `).
-      // The `⊘ Sonnet Fable` tag is reserved for only when some account is
-      // actually blocked; the common case where nothing is spends those columns
-      // on the bars instead of leaving the row short of the edge.
-      const categoryOf = a => rowCategory(a.quota);
-      const routeCells = genRoutes.length ? genRoutes.length + 1 : 0;
-      const budgetFor = (members) => {
-        const anyFable = members.some(a => a.quota.unified7dFable != null);
-        const anySonnet = members.some(a => a.quota.unified7dSonnet != null);
-        const tagW = members.reduce((w, a) => {
-          const names = blockedFamilies(a.quota, key => this.am.thresholdFor(key));
-          return names.length ? Math.max(w, 4 + vw(names.join(' '))) : w;
-        }, 0);
-        // Same rule for the `$`/`$!` money tag: a column the row can draw is a
-        // column the budget has to know about, or the row overflows exactly the
-        // way #228 fixed.
-        const spendW = members.reduce((w, a) => {
-          const tag = spendTag(a.quota);
-          return tag ? Math.max(w, 2 + vw(tag)) : w;
-        }, 0);
-        const fixed = 28 + NAME_MIN + routeCells + tagW + spendW;
-        const roomFor = n => fixed + 6 * (n - 1) + n * BAR_MIN <= W;
-        // The family bars are the first thing to go: below the width where they
-        // fit even at BAR_MIN they would push the row past the edge, and a row
-        // cut mid-bar reads worse than one that simply doesn't draw them (the
-        // `⊘` tag still says which family is barred).
-        // The second shared bar answers to roomFor too, not just to a width
-        // threshold. `W >= 70` alone let the reservations (a 16-column
-        // blocked-family tag on two families, plus route cells) leave less than
-        // BAR_MIN per bar, and the floor below then overrode the budget: two
-        // accounts blocked on both families drew 72 columns at W=70, which
-        // fitLine silently cut (#234).
-        const showBoth = W >= 70 && roomFor(2);
-        const showFamily = showBoth && (anyFable || anySonnet) && roomFor(2 + (anyFable ? 1 : 0) + (anySonnet ? 1 : 0));
-        const nbars = (showBoth ? 2 : 1) + (showFamily ? (anyFable ? 1 : 0) + (anySonnet ? 1 : 0) : 0);
-        // Backstop for the case no count of bars can fix: when even one bar at
-        // BAR_MIN overruns the row, the floor has to yield. A narrow bar reads
-        // worse than a wide one; a row cut mid-bar loses the reset countdown its
-        // tail carries, and does it without saying so.
-        const avail = Math.floor((W - fixed - 6 * (nbars - 1)) / nbars);
-        const bw = avail < BAR_MIN
-          ? Math.max(1, avail)
-          : Math.min(BAR_MAX, avail);
-        const slack = Math.max(0, W - fixed - 6 * (nbars - 1) - nbars * bw);
-        return { bw, showBoth, showFamily, anyFable, anySonnet, slack };
-      };
-      const budgets = new Map();
-      for (const a of this.am.accounts) {
-        const cat = categoryOf(a);
-        if (!budgets.has(cat)) budgets.set(cat, budgetFor(this.am.accounts.filter(m => categoryOf(m) === cat)));
-      }
-      const anyFable = [...budgets.values()].some(b => b.anyFable);
-      const anySonnet = [...budgets.values()].some(b => b.anySonnet);
-
-      // Whatever the chrome and the capped bars leave over goes to the name
-      // column, up to the longest name in the fleet, so a wide terminal shows
-      // whole addresses instead of `a-considerab`. The name column is one width
-      // for the whole table (it is the prefix every row shares), so it grows by
-      // the smallest slack any category has left: `fixed` already reserves
-      // NAME_MIN, so only the surplus past it is spent here, and no category's
-      // rows are pushed past the budget above.
-      const longestName = Math.max(0, ...this.am.accounts.map(a => vw(a.name)));
-      const slack = Math.min(...[...budgets.values()].map(b => b.slack));
-      const nameW = Math.max(NAME_MIN, Math.min(longestName, NAME_MIN + slack));
-
-      // The single account each secondary bucket currently routes to (null = none
-      // can serve it right now). Marked next to that account's F7/S7 bar — the
-      // secondary-quota analogue of ► marking the default route's current account.
-      const familyTarget = {
-        fable: anyFable ? this.am.previewRouteIndex('claude-fable-5') : null,
-        sonnet: anySonnet ? this.am.previewRouteIndex('claude-sonnet-4-6') : null,
-      };
-      for (const i of this._displayOrder()) {
-        const b = budgets.get(categoryOf(this.am.accounts[i]));
-        lines.push(this._renderAcct(i, b.bw, b.showBoth, routes, genRoutes, familyTarget, b.showFamily, nameW));
+      // Two providers, two panes; the titles take the spacer line. One column when
+      // the panes cannot draw every bar the rows have.
+      const current = this._currentRows();
+      const groups = this._providerGroups();
+      const split = groups.length === 2 ? this._splitLayout(groups, W) : null;
+      if (split) {
+        const [a, b] = groups;
+        lines.push(paneTitle(PROVIDERS[a.provider].label, split.leftW) + dim(PANE_GUTTER) + paneTitle(PROVIDERS[b.provider].label, split.rightW));
+        for (let r = 0; r < Math.max(a.indices.length, b.indices.length); r++) {
+          const left = r < a.indices.length ? this._renderRow(a.indices[r], split.left, current) : '';
+          const right = r < b.indices.length ? this._renderRow(b.indices[r], split.right, current) : '';
+          lines.push(fitLine(left, split.leftW) + dim(PANE_GUTTER) + right);
+        }
+      } else {
+        lines.push('');
+        const order = this._displayOrder();
+        const layout = this._listLayout(order, W);
+        for (const i of order) lines.push(this._renderRow(i, layout, current));
       }
     }
 
@@ -1768,8 +1714,191 @@ export class TUI {
     this._paint(buf, force);
   }
 
-  /** Manager indices in the order the rows are drawn: accounts served by a
-   *  local process last, every other account left where it is.
+  /** Width budget for a list `W` wide, per row category, as one provider's pane when
+   *  `pane` is set; `stages` are the widths at which bars, names, then caps fit. */
+  _listLayout(/** @type {number[]} */ indices, /** @type {number} */ W, { pane = /** @type {string|null} */ (null), measure = false } = {}) {
+    const accts = indices.map(i => this.am.accounts[i]);
+    // Routes drive the inline markers; general (non-family) routes get a stable
+    // column each at the row start so the marker's position identifies the route.
+    const routes = this.am.getRoutes();
+    const genRoutes = routes.filter((/** @type {any} */ r) => routeFamily(r) === null
+      && (pane == null || providerOf(r) === pane)); // a pane only holds its own provider's routes
+    // Bar width, budgeted PER ROW CATEGORY (#234). A subscription row draws
+    // Ses/Wk and the S7/F7 family bars; an API-key row draws Tok/Req and
+    // nothing else. Neither shares a bar with the other, so the two are laid
+    // out against separate budgets: every subscription row lines up with the
+    // other subscription rows, every API-key row with the other API-key rows,
+    // and an API-key row no longer pays for family columns it never draws (or
+    // for a blocked-family tag only a subscription row can carry). Within a
+    // category the budget is still shared, on purpose: bars line up and equal
+    // lengths mean equal percentages, and the whitespace that costs a row
+    // without a tag is the price of that.
+    //
+    // The budget must count every column the widest row in the category
+    // actually draws, or the row overruns the terminal and fitLine cuts the
+    // tail off — which is how the S7/F7 bars lost the reset countdown they
+    // carry. Three parts beyond the bars themselves:
+    //   - the fixed prefix (marker, name, type, status, first bar label),
+    //   - the route-marker cells, one per general route,
+    //   - 6 columns of label for each bar past the first (`  Wk `, ` ►F7  `).
+    // The `⊘ Sonnet Fable` tag is reserved for only when some account is
+    // actually blocked; the common case where nothing is spends those columns
+    // on the bars instead of leaving the row short of the edge.
+    const categoryOf = (/** @type {any} */ a) => rowCategory(a);
+    const routeCells = genRoutes.length ? genRoutes.length + 1 : 0;
+    // The type cell and the space after it, at the width the row pads it to.
+    const typeCell = pane == null ? typeColumn(this.am.accounts).width + 1 : 0;
+    const floor = pane == null ? LIST_MIN : PANE_MIN;
+    const barCap = pane == null ? BAR_MAX : PANE_BAR_MAX;
+    // The columns every name needs past NAME_MIN to be whole.
+    const longestName = Math.max(0, ...accts.map(a => vw(a.name)));
+    const nameWant = Math.max(0, longestName - NAME_MIN);
+    const budgetFor = (/** @type {string} */ cat, /** @type {any[]} */ members) => {
+      const anyFable = members.some(a => a.quota.unified7dFable != null);
+      const anySonnet = members.some(a => a.quota.unified7dSonnet != null);
+      const families = (anyFable ? 1 : 0) + (anySonnet ? 1 : 0);
+      const tagW = members.reduce((w, a) => {
+        const names = blockedFamilies(a.quota, key => this.am.thresholdFor(key));
+        return names.length ? Math.max(w, 4 + vw(names.join(' '))) : w;
+      }, 0);
+      // Same rule for the `$`/`$!` money tag: a column the row can draw is a
+      // column the budget has to know about, or the row overflows exactly the
+      // way #228 fixed.
+      const spendW = members.reduce((w, a) => {
+        const tag = spendTag(a.quota);
+        return tag ? Math.max(w, 2 + vw(tag)) : w;
+      }, 0);
+      const fixed = 20 + typeCell + NAME_MIN + routeCells + tagW + spendW;
+      const span = (/** @type {number} */ n, /** @type {number} */ bar) => fixed + 6 * (n - 1) + n * bar;
+      const roomFor = (/** @type {number} */ n) => span(n, BAR_MIN) <= W;
+      // No Ses bar once every Codex account here has reported without a 5h window;
+      // a Claude row or an unreported account keeps it.
+      const shortBar = cat !== 'unified'
+        || members.some(a => providerOf(a) !== 'codex' || a.quota.unified5h != null || a.quota.unified7d == null);
+      // The family bars are the first thing to go: below the width where they
+      // fit even at BAR_MIN they would push the row past the edge, and a row
+      // cut mid-bar reads worse than one that simply doesn't draw them (the
+      // `⊘` tag still says which family is barred).
+      // The second shared bar answers to roomFor too, not just to a width
+      // threshold. `W >= 70` alone let the reservations (a 16-column
+      // blocked-family tag on two families, plus route cells) leave less than
+      // BAR_MIN per bar, and the floor below then overrode the budget: two
+      // accounts blocked on both families drew 72 columns at W=70, which
+      // fitLine silently cut (#234).
+      const showBoth = W >= floor && roomFor(2);
+      const showFamily = showBoth && families > 0 && roomFor(2 + families);
+      const nbars = (showBoth && shortBar ? 2 : 1) + (showFamily ? families : 0);
+      // Backstop for the case no count of bars can fix: when even one bar at
+      // BAR_MIN overruns the row, the floor has to yield. A narrow bar reads
+      // worse than a wide one; a row cut mid-bar loses the reset countdown its
+      // tail carries, and does it without saying so.
+      const barRoom = (/** @type {number} */ reserved) => Math.floor((W - fixed - reserved - 6 * (nbars - 1)) / nbars);
+      const avail = barRoom(0);
+      let bw = avail < BAR_MIN
+        ? Math.max(1, avail)
+        : Math.min(barCap, avail);
+      // A pane gives names the columns before bars grow past the floor.
+      if (pane != null && avail >= BAR_MIN) {
+        const named = barRoom(nameWant);
+        bw = named >= PANE_BAR_FLOOR ? Math.min(barCap, named) : Math.min(PANE_BAR_FLOOR, avail);
+      }
+      const slack = Math.max(0, W - fixed - 6 * (nbars - 1) - nbars * bw);
+      const drawn = (shortBar ? 2 : 1) + families;
+      // The first step also holds what showBoth and showFamily test, so a
+      // width that reaches it draws every bar.
+      const s1 = Math.max(floor, span(2 + families, BAR_MIN), span(drawn, PANE_BAR_FLOOR));
+      const s2 = Math.max(s1, span(drawn, PANE_BAR_FLOOR) + nameWant);
+      const s3 = Math.max(s2, span(drawn, barCap) + nameWant);
+      return {
+        bw, showBoth, showFamily, anyFable, anySonnet, slack, shortBar,
+        complete: showBoth && (families === 0 || showFamily),
+        stages: [s1, s2, s3],
+      };
+    };
+    const budgets = new Map();
+    for (const a of accts) {
+      const cat = categoryOf(a);
+      if (!budgets.has(cat)) budgets.set(cat, budgetFor(cat, accts.filter(m => categoryOf(m) === cat)));
+    }
+    const all = [...budgets.values()];
+    const anyFable = all.some(b => b.anyFable);
+    const anySonnet = all.some(b => b.anySonnet);
+
+    // Whatever the chrome and the capped bars leave over goes to the name
+    // column, up to the longest name in the list, so a wide terminal shows
+    // whole addresses instead of `a-considerab`. The name column is one width
+    // for the whole list (it is the prefix every row shares), so it grows by
+    // the smallest slack any category has left: `fixed` already reserves
+    // NAME_MIN, so only the surplus past it is spent here, and no category's
+    // rows are pushed past the budget above.
+    const slack = Math.min(...all.map(b => b.slack));
+    const nameW = Math.max(NAME_MIN, Math.min(longestName, NAME_MIN + slack));
+
+    // The single account each secondary bucket currently routes to (null = none
+    // can serve it right now). Marked next to that account's F7/S7 bar — the
+    // secondary-quota analogue of ► marking the default route's current account.
+    const familyTarget = {
+      fable: anyFable && !measure ? this.am.previewRouteIndex('claude-fable-5') : null,
+      sonnet: anySonnet && !measure ? this.am.previewRouteIndex('claude-sonnet-4-6') : null,
+    };
+    return {
+      routes, genRoutes, budgets, nameW, familyTarget, compact: pane != null, width: W,
+      complete: all.every(b => b.complete),
+      stages: [0, 1, 2].map(k => Math.max(...all.map(b => b.stages[k]))),
+    };
+  }
+
+  /** Draw one row against a layout from _listLayout. */
+  _renderRow(/** @type {number} */ idx, /** @type {any} */ L, /** @type {Set<number>} */ current) {
+    const b = L.budgets.get(rowCategory(this.am.accounts[idx]));
+    return this._renderAcct(idx, b.bw, b.showBoth, L.routes, L.genRoutes, L.familyTarget, b.showFamily, L.nameW, { current, compact: L.compact, shortBar: b.shortBar });
+  }
+
+  /** The accounts of each provider present, in the order its rows are drawn. */
+  _providerGroups() {
+    /** @type {Map<string, number[]>} */
+    const groups = new Map();
+    for (const i of this._displayOrder()) {
+      const provider = providerOf(this.am.accounts[i]);
+      if (!groups.has(provider)) groups.set(provider, []);
+      groups.get(provider)?.push(i);
+    }
+    return [...groups].map(([provider, indices]) => ({ provider: /** @type {keyof typeof PROVIDERS} */ (provider), indices }));
+  }
+
+  /** Two pane layouts, or null when `W` cannot fit both. Width goes stage by stage,
+   *  both panes reaching one before either starts the next, a partial one shared pro rata. */
+  _splitLayout(/** @type {{ provider: string, indices: number[] }[]} */ groups, /** @type {number} */ W) {
+    const [a, b] = groups;
+    const avail = W - vw(PANE_GUTTER);
+    const size = (/** @type {{ provider: string, indices: number[] }} */ g) => this._listLayout(g.indices, avail, { pane: g.provider, measure: true });
+    const sa = size(a).stages;
+    const sb = size(b).stages;
+    if (sa[0] + sb[0] > avail) return null;
+    let leftW = sa[0];
+    let rightW = sb[0];
+    for (let k = 1; k < sa.length; k++) {
+      const wantA = sa[k] - leftW;
+      const wantB = sb[k] - rightW;
+      const room = avail - leftW - rightW;
+      if (room < wantA + wantB) {
+        const give = Math.round(room * wantA / (wantA + wantB));
+        leftW += give;
+        rightW += room - give;
+        break;
+      }
+      leftW += wantA;
+      rightW += wantB;
+    }
+    leftW += Math.floor((avail - leftW - rightW) / 2);
+    rightW = avail - leftW;
+    const left = this._listLayout(a.indices, leftW, { pane: a.provider });
+    const right = this._listLayout(b.indices, rightW, { pane: b.provider });
+    return left.complete && right.complete ? { leftW, rightW, left, right } : null;
+  }
+
+  /** Manager indices in the order the rows are drawn: grouped by provider, then
+   *  accounts served by a local process last, every other account left where it is.
    *
    *  A local backend (a translating proxy in front of another vendor, say) is
    *  infrastructure rather than a seat to rotate between, so it reads as noise
@@ -1785,15 +1914,31 @@ export class TUI {
     return this.am.accounts
       .map((/** @type {any} */ _, /** @type {number} */ i) => i)
       .sort((/** @type {number} */ x, /** @type {number} */ y) => {
+        const px = PROVIDER_ORDER.indexOf(providerOf(this.am.accounts[x]));
+        const py = PROVIDER_ORDER.indexOf(providerOf(this.am.accounts[y]));
         const sx = isLocalUpstream(this.am.accounts[x]) ? 1 : 0;
         const sy = isLocalUpstream(this.am.accounts[y]) ? 1 : 0;
-        return sx - sy || x - y; // ties keep list order, so the sort is stable
+        return px - py || sx - sy || x - y; // ties keep list order, so the sort is stable
       });
   }
 
-  _renderAcct(idx, bw, showBoth, routes = this.am.getRoutes(), genRoutes = routes.filter(r => routeFamily(r) === null), familyTarget = {}, showFamily = true, nameW = NAME_MIN) {
+  /** The rows that carry ►: the cursor, or in a mixed pool each provider's current
+   *  account, since `currentIndex` only names the pool that moved last. */
+  _currentRows() {
+    const providers = new Set(this.am.accounts.map((/** @type {any} */ a) => providerOf(a)));
+    if (providers.size < 2) return new Set([this.am.currentIndex]);
+    /** @type {Set<number>} */
+    const rows = new Set();
+    for (const provider of providers) {
+      const idx = this.am.currentIndexFor(provider);
+      if (idx != null) rows.add(idx);
+    }
+    return rows;
+  }
+
+  _renderAcct(idx, bw, showBoth, routes = this.am.getRoutes(), genRoutes = routes.filter(r => routeFamily(r) === null), familyTarget = {}, showFamily = true, nameW = NAME_MIN, { current = this._currentRows(), compact = false, shortBar = true } = {}) {
     const a = this.am.accounts[idx];
-    const isCur = idx === this.am.currentIndex;
+    const isCur = current.has(idx);
     const isSel = this.mode === 'select' && idx === this.selIdx;
 
     // Prefix: selection marker + current marker.
@@ -1852,11 +1997,9 @@ export class TUI {
     // apart. `oauth` repeated down every row is what the column says instead, which the
     // operator already knew. Width follows the labels actually present, so nothing is
     // truncated and a single-provider pool keeps the column it has today.
-    /** @type {Set<keyof typeof PROVIDERS>} */
-    const pooled = new Set(this.am.accounts.map(providerOf));
-    const mixed = pooled.size > 1;
-    const typeW = mixed ? Math.max(...[...pooled].map(id => PROVIDERS[id].label.length)) : 7;
-    const type = gray((mixed ? PROVIDERS[providerOf(a)].label : a.type).padEnd(typeW));
+    // A pane draws no type cell: its title names the provider.
+    const { mixed, width: typeW } = typeColumn(this.am.accounts);
+    const type = compact ? '' : `${gray((mixed ? PROVIDERS[providerOf(a)].label : a.type).padEnd(typeW))} `;
 
     // Status — a disabled account is shown as such regardless of its quota state.
     let status;
@@ -1874,7 +2017,7 @@ export class TUI {
     // Quota ratios — prefer unified (Claude Max), fall back to standard (API key)
     let r1 = null, r2 = null, l1 = 'Ses', l2 = 'Wk ', t1 = null, t2 = null, w1 = null, w2 = null;
 
-    if (rowCategory(q) === 'unified') {
+    if (rowCategory(a) === 'unified') {
       r1 = q.unified5h;
       r2 = q.unified7d;
       t1 = q.unified5hReset;
@@ -1908,12 +2051,17 @@ export class TUI {
       const th = thFor(k);
       return cap == null ? th : (typeof th === 'number' ? Math.min(th, cap) : cap);
     };
-    const th1 = limFor(r1 === q.unified5h ? 'unified5h' : 'tokens');
+    let th1 = limFor(r1 === q.unified5h ? 'unified5h' : 'tokens');
     const th2 = limFor(r2 === q.unified7d ? 'unified7d' : 'requests');
 
-    let line = ` ${sel}${cur} ${startSlot}${name} ${type} ${status} ${l1} ${bar(r1, bw, t1, w1, th1)}`;
+    // A list with no five-hour window to draw (see _listLayout) starts the row
+    // at the weekly bar.
+    const weeklyFirst = !shortBar && rowCategory(a) === 'unified';
+    if (weeklyFirst) [l1, r1, t1, w1, th1] = [l2, r2, t2, w2, th2];
+
+    let line = ` ${sel}${cur} ${startSlot}${name} ${type}${status} ${l1} ${bar(r1, bw, t1, w1, th1)}`;
     if (showBoth) {
-      line += `  ${l2} ${bar(r2, bw, t2, w2, th2)}`;
+      if (!weeklyFirst) line += `  ${l2} ${bar(r2, bw, t2, w2, th2)}`;
       // Sonnet weekly bar — only shown when the usage probe has populated it. A
       // leading ► (in place of a padding space) marks a Sonnet route on this account.
       if (showFamily && q.unified7dSonnet != null) {

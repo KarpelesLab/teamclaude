@@ -72,3 +72,48 @@ test('a codex-only pool also keeps the auth type', () => {
   assert.match(row, /oauth/);
   assert.doesNotMatch(row, /Codex/);
 });
+
+// The budget reserved 7 columns for `Anthropic` (9), so mixed rows ran 2 past the
+// edge. It only shows on a row carrying every reserved tag itself.
+test('a mixed pool row never outgrows the terminal', () => {
+  const tui = tuiFor([
+    oauth('someone@example.com'),
+    oauth('someone@example.com', { provider: 'codex', accountId: 'acct-5' }),
+  ]);
+  const claude = tui.am.accounts[0];
+  Object.assign(claude.quota, {
+    unified5h: 0.4, unified5hReset: Date.now() + 4 * HOUR,
+    unified7d: 0.3, unified7dReset: Date.now() + 48 * HOUR,
+    unified7dFable: 0.995, unified7dFableReset: Date.now() + 48 * HOUR,
+    spend: { enabled: true, usedMinor: 0 },
+  });
+  Object.assign(tui.am.accounts[1].quota, { unified5h: 0.1, unified7d: 0.2, unified7dReset: Date.now() + 24 * HOUR });
+  for (const width of [70, 80, 100, 120, 160]) {
+    for (const row of drawnRows(tui, width)) {
+      assert.ok(row.length <= width, `W=${width}: ${row.length} columns: ${row}`);
+    }
+  }
+});
+
+/** The rows render() draws at `width`, ANSI stripped, before fitLine pads or cuts them. */
+function drawnRows(tui, width) {
+  const cols = Object.getOwnPropertyDescriptor(process.stdout, 'columns');
+  const rows = Object.getOwnPropertyDescriptor(process.stdout, 'rows');
+  Object.defineProperty(process.stdout, 'columns', { value: width, configurable: true });
+  Object.defineProperty(process.stdout, 'rows', { value: 40, configurable: true });
+  const drawn = [];
+  const real = tui._renderAcct;
+  try {
+    tui._renderAcct = (...args) => { const out = real.apply(tui, args); drawn.push(plain(out)); return out; };
+    tui._paint = () => {};
+    tui.running = true;
+    TUI.prototype.render.call(tui, true);
+  } finally {
+    tui._renderAcct = real;
+    if (cols) Object.defineProperty(process.stdout, 'columns', cols);
+    else delete process.stdout.columns;
+    if (rows) Object.defineProperty(process.stdout, 'rows', rows);
+    else delete process.stdout.rows;
+  }
+  return drawn;
+}

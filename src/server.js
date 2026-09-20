@@ -22,6 +22,7 @@ import { renderDashboardHtml, dashboardCsp } from './dashboard.js';
 import { createUsageRecorder, resolveUsageDimensions, usageDimensionHeaderNames } from './client-usage.js';
 import { responsesEventUsage, isResponsesBody, normalizeResponsesUsage } from './responses-usage.js';
 import { classificationPath } from './classification-path.js';
+import { serveManagementMcp } from './mcp-tools.js';
 import { codexSpentWindows, isAccountWideCodexWindow } from './codex-quota.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
@@ -216,6 +217,35 @@ export function loopbackExempt(headers, remoteAddress, proxyConfig) {
   if (proxyConfig?.trustLoopback === false) return false;
   if (!isLoopbackAddr(remoteAddress)) return false;
   return !isForwardedRequest(headers);
+}
+
+/**
+ * Why the MCP endpoint refuses a request when the config holds no key at all,
+ * or null when it may be served. With a key configured this is always null:
+ * the key gate has already decided.
+ *
+ * Without one the key gate admits everybody, which is tolerable for forwarding
+ * on a private network and is not for tools that remove accounts. So the
+ * caller has to be on this machine, by the same test the loopback exemption
+ * uses — a loopback peer, no forwarding header, and `trustLoopback` not
+ * switched off. The Host check alone does not say that: it is there for
+ * browsers, and on a non-loopback bind anything that is not a browser can
+ * simply send `Host: localhost`. It is still asked, because a page rebound to
+ * 127.0.0.1 does arrive from loopback.
+ * @param {import('node:http').IncomingHttpHeaders} headers
+ * @param {string|undefined} remoteAddress
+ * @param {Record<string, any>|undefined} proxyConfig
+ * @returns {string|null}
+ */
+export function keylessMcpRefusal(headers, remoteAddress, proxyConfig) {
+  if (!resolveClientAuth(proxyConfig, undefined).ok) return null;
+  if (!loopbackExempt(headers, remoteAddress, proxyConfig)) {
+    return 'request refused: with no proxy key configured the MCP endpoint serves only this machine; set proxy.apiKey to reach it from elsewhere';
+  }
+  if (!isLocalHostHeader(headers.host ?? headers[':authority'], proxyConfig?.host)) {
+    return 'request refused: the Host header does not name this proxy';
+  }
+  return null;
 }
 
 /**
@@ -511,6 +541,26 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           + (eligible ? '' : ` — ${reason}, so rotation will not use it`));
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true, account: name, eligible, ...(reason ? { reason } : {}) }));
+        return;
+      }
+
+      // MCP management endpoint — the tool-shaped face of this control plane,
+      // off unless proxy.mcp says otherwise. The gates above are the same ones
+      // the other /teamclaude/ routes pass, with one addition: a config with no
+      // key at all admits every caller as authenticated, from any address and
+      // without the rebinding check on key-less loopback requests — so
+      // keylessMcpRefusal asks both here.
+      // A trailing slash and a query string are matched too: this URL is typed
+      // into a client by hand, and a near miss would fall through to the
+      // forwarder below with a fleet credential attached.
+      if (/^\/teamclaude\/mcp\/?(\?|$)/.test(req.url || '')) {
+        const refusal = keylessMcpRefusal(req.headers, req.socket.remoteAddress, config.proxy);
+        if (refusal) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: refusal }));
+          return;
+        }
+        await serveManagementMcp(req, res, { accountManager, config, hooks, client: req.tcClient, readBody: readControlBody });
         return;
       }
 
@@ -2058,6 +2108,10 @@ export function formatWait(seconds) {
   return rest ? `${days}d ${rest}h` : `${days}d`;
 }
 
+// How many credential-dead accounts the synthetic 429 names before it says
+// "and N more". The sentence is read in a client's one-line error, not a report.
+const EXHAUSTED_MESSAGE_MAX_NAMES = 3;
+
 /**
  * The message behind the synthetic 429, when no account can serve the request.
  *
@@ -2085,6 +2139,26 @@ export function formatWait(seconds) {
  * measured from, so the number and the wait cannot disagree about who was even
  * asked.
  *
+ * That wording was then wrong a different way (#407). One account at a real
+ * family quota, another with headroom but in `error` — typically
+ * `invalid_grant`, after a Claude Code `/login` elsewhere rotated the refresh
+ * token — and the proxy rightly skips both, yet the client read "all 2 accounts
+ * are at their quota or rate limit". The TUI went on showing the errored
+ * account's quota bars with room in them, so the operator waited out a reset
+ * that was never going to help, when the fix was `teamclaude login`.
+ *
+ * Only two kinds of blocker are told apart, because only two next steps exist:
+ * log in again, or wait. A dead credential is read off `status === 'error'`
+ * directly rather than through `unavailableReason`, for two reasons. It is
+ * exactly the test `computeRetryAfter` uses to leave an account's clocks out of
+ * the wait, so the accounts named here and the accounts the wait ignores are
+ * one set by construction. And `unavailableReason` reports a budget cap or an
+ * entitlement cooldown ahead of `error`, which would file a dead token under
+ * "wait for the reset" whenever the two coincide. Everything that is not a dead
+ * credential — quota, throttle, upstream rejection, a cap, and an OAuth
+ * entitlement denial, which is an org-policy 403 on a timed cooldown and not
+ * something a new login repairs — stays in the quota/rate-limit group.
+ *
  * @param {Record<string, any>[]} candidates
  * @param {string|null|undefined} model
  * @param {number} retryAfter
@@ -2106,13 +2180,38 @@ export function exhaustedMessage(candidates, model, retryAfter) {
       ? `No account can serve this request${scope}: every account eligible for it is disabled (${disabled}).`
       : `No account can serve this request${scope}: no configured account is eligible for it — check the model's route and which provider its accounts belong to.`;
   }
-  const pool = eligible.length === 1 ? '1 account' : `${eligible.length} accounts`;
   const aside = disabled ? ` (${disabled} more disabled)` : '';
   const when = retryAfter > 0
     ? ` Quota resets in ${formatWait(retryAfter)}.`
     : ' Retry shortly.';
 
-  return `No account can serve this request${scope}: all ${pool}${aside} are at their quota or rate limit.${when}`;
+  const dead = eligible.filter(a => a.status === 'error');
+  if (!dead.length) {
+    const pool = eligible.length === 1 ? '1 account' : `${eligible.length} accounts`;
+    return `No account can serve this request${scope}: all ${pool}${aside} are at their quota or rate limit.${when}`;
+  }
+
+  // Named, because "one of your accounts" sends the operator off to the status
+  // view to learn which. Capped, because this text lands in a client's error
+  // line and a fleet that lost every token at once would fill it. Sanitised,
+  // because an account name comes out of an OAuth payload and is not ours.
+  const shown = dead.slice(0, EXHAUSTED_MESSAGE_MAX_NAMES).map(a => `"${safeLine(a.name, 64)}"`).join(', ');
+  const unnamed = Math.max(0, dead.length - EXHAUSTED_MESSAGE_MAX_NAMES);
+  const relogin = `${dead.length === 1 ? 'account' : 'accounts'} ${shown}${unnamed ? ` and ${unnamed} more` : ''} `
+    + `${dead.length === 1 ? 'needs' : 'need'} re-login (run: teamclaude login)`;
+
+  // Every account that could take this request has a dead credential. No reset
+  // clause: no window is being waited on, and the retry-after the caller worked
+  // out is only the default interval it falls back to with nobody left to ask.
+  const waiting = eligible.length - dead.length;
+  if (!waiting) {
+    return `No account can serve this request${scope}: ${relogin}, and no other account is eligible for it.${aside}`;
+  }
+
+  const rest = waiting === 1
+    ? '1 account is at its quota or rate limit'
+    : `${waiting} accounts are at their quota or rate limit`;
+  return `No account can serve this request${scope}: ${relogin}; ${rest}.${when}${aside}`;
 }
 
 export async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, useSx) {
