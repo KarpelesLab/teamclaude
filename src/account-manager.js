@@ -345,6 +345,7 @@ export class AccountManager {
     // `distributeSessions` gates the behavioural change: keep each session on its
     // account for cache reuse, but spread NEW sessions across equal-priority
     // accounts by load instead of funnelling them all onto the current one.
+    /** @type {SessionTracker} */
     this.sessionTracker = sessionTracker || new SessionTracker();
     // 'off' | 'even' | 'adaptive'. `distributeSessions` stays a boolean beside
     // it ("is distribution on at all") because the status readout, the TUI
@@ -757,6 +758,12 @@ export class AccountManager {
    * bucket, so the account must be eligible for both models. When no account
    * satisfies both, selection degrades to executor-only routing so the main
    * request keeps flowing (upstream then fails just the advisor call).
+   *
+   * `sessionId` is a PIN KEY throughout this class and the session tracker: a
+   * client session narrowed to the conversation within it, since one client
+   * session fans out across many (see conversation.js). It is spelled
+   * `sessionId` because it is one for every request that names no conversation,
+   * and because the affinity it drives is the same affinity it always was.
    */
   getActiveAccount(exclude = null, model = null, advisorModel = null, sessionId = null, provider = DEFAULT_PROVIDER, decision = null) {
     // Selection reads this.currentIndex as "where the fleet is". With more than
@@ -885,11 +892,15 @@ export class AccountManager {
     // The empty set marks this call as a request's, since a poll hands none.
     // Allocated fresh: a set handed out once is one a later reader could add to.
     this.refreshExpiredQuotas(model, this.expiryRouting.enabled ? (exclude ?? new Set()) : exclude, advisorModel);
-    // Session-affinity distribution (opt-in): keep a session on its pinned
-    // account for cache reuse, and route a new session to the least-loaded
-    // account. Only when enabled, only for a real session, and only outside a
-    // manual route pin (which must still win). Falls through to the normal walk
-    // if nothing session-eligible is found (e.g. the whole tier is exhausted).
+    // Session-affinity distribution (opt-in): keep a conversation on its pinned
+    // account for cache reuse, and route a new one to the least-loaded account.
+    // The unit is the conversation rather than the client session because one
+    // session fans out — a Claude Code session and every subagent it launches
+    // share its id, and holding them together pinned a whole fan-out to one
+    // account for a cache none of them shared (see conversation.js). Only when
+    // enabled, only for a request that named one, and only outside a manual
+    // route pin (which must still win). Falls through to the normal walk if
+    // nothing eligible is found (e.g. the whole tier is exhausted).
     if (sessionId && !this._pinnedAccountForModel(model, advisorModel)) {
       if (this.distributeSessions) {
         const acc = this._selectForSession(sessionId, exclude, model, advisorModel);
@@ -1043,13 +1054,18 @@ export class AccountManager {
     // (_isAvailable, below) rather than a second key.
     const bucket = this._weeklyBucketFor(model);
     const pinIdx = this.sessionTracker.pinnedAccount(sessionId, bucket);
-    // The bucket's own pin first. Failing that, any account the session already
-    // sits on for another family: one session stays on one account unless that
-    // account cannot serve the request (the README's "pins it there"). Without
-    // this, a session's first request of a second family would go to
-    // _pickLeastLoaded, which counts the session's own pin as load and pushes
-    // the new family onto a sibling — splitting every mixed-model session
-    // across two accounts by construction, not only on a real diversion.
+    // The bucket's own pin first. Failing that, any account this conversation
+    // already sits on for another family: one conversation stays on one account
+    // unless that account cannot serve the request (the README's "pins it
+    // there"). Without this, its first request of a second family would go to
+    // _pickLeastLoaded, which counts the conversation's own pin as load and
+    // pushes the new family onto a sibling — splitting every mixed-model
+    // conversation across two accounts by construction, not only on a real
+    // diversion.
+    //
+    // Scoped to the one conversation, not to everything sharing its session id:
+    // two agents of one fan-out are not each other's affinity, and treating
+    // them as one is what funnelled them onto a single account.
     const candidates = [];
     if (pinIdx != null) candidates.push(pinIdx);
     for (const idx of this.sessionTracker.pinnedAccounts(sessionId)) {
@@ -1342,6 +1358,18 @@ export class AccountManager {
   recordOutcome(sessionId, usable) {
     if (!sessionId || usable === null) return;
     this.sessionTracker.recordOutcome(sessionId, usable);
+  }
+
+  /**
+   * The same, for an exit that can name only the client session — every live
+   * conversation of it takes the outcome (see SessionTracker).
+   *
+   * @param {string|null} sessionId
+   * @param {boolean|null} usable
+   */
+  recordOutcomeForSession(sessionId, usable) {
+    if (!sessionId || usable === null) return;
+    this.sessionTracker.recordOutcomeForSession(sessionId, usable);
   }
 
   /**

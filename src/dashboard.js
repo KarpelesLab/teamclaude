@@ -214,17 +214,31 @@ export function accountBadges(account, current, currentAccounts, now, fleetThres
   return badges;
 }
 
-// One row per session, from `sessions.items` (proxy.sessionDetail). The token
-// columns are #192's numbers — what each response actually reported, cache
-// included — summed across the weekly buckets the session touched. `pins` is a
-// bucket→account map rather than one index, because a session spending two
-// model families is served by two accounts at the same time.
+// One row per CONVERSATION, from `sessions.items` (proxy.sessionDetail). A
+// Claude Code session that fans out to nine subagents is nine rows, because a
+// conversation is what holds a pin and a prompt cache.
+//
+// `id` is the pin key those rows are keyed by — a session id narrowed to one
+// conversation — which is an identity for routing, not one to read: a composite
+// nobody recognises, and identical between siblings but for its tail. So the
+// visible identity is split in two, the session an operator knows and the
+// conversation that tells its siblings apart. A record labelled by no request
+// (touch() alone) has no session name, and falls back to the key it is under.
+//
+// The token columns are #192's numbers — what each response actually reported,
+// cache included — summed across the weekly buckets the conversation touched.
+// `pins` is a bucket→account map rather than one index, because a conversation
+// spending two model families is served by two accounts at the same time.
 export function sessionRows(sessions) {
   var items = (sessions && sessions.items) || [];
   return items.map(function (s) {
     var buckets = s.tokens || {};
     var row = {
       id: s.id,
+      session: s.session || s.id || '',
+      // Enough of the digest to separate one session's live conversations; the
+      // whole of it is a column read to the end by nobody.
+      conversation: String(s.conversation || '').slice(0, 8),
       client: s.client || '',
       project: (s.dimensions || {}).project || '',
       active: !!s.active,
@@ -371,9 +385,10 @@ export function routeRows(status) {
 // delay a true positive.
 export var STARVED_MIN = 5;
 // The failure that makes this fire is usually fleet-wide, so every active
-// session starves at once. Naming all of them would bury the dashboard at the
-// moment it matters most; the count carries the scale, three names carry enough
-// to go and ask someone.
+// conversation starves at once — and one fan-out is a dozen of them under one
+// session's name. Naming all of them would bury the dashboard at the moment it
+// matters most; the count carries the scale, three names carry enough to go and
+// ask someone.
 export var STARVED_LIST_MAX = 3;
 
 /**
@@ -407,7 +422,12 @@ export function problems(status) {
   named.slice(0, STARVED_LIST_MAX).forEach(function (r) {
     out.push({
       severity: 'bad', kind: 'starved-session',
-      text: (r.client ? r.client + "'s session " : 'Session ') + String(r.id || '').slice(0, 8)
+      // The session first, since that is the name an operator can go and find,
+      // and the conversation after it, because a streak belongs to one agent of
+      // a fan-out: without it three lines of one session read as the same line
+      // three times. Omitted when the record carries no conversation.
+      text: (r.client ? r.client + "'s session " : 'Session ') + r.session.slice(0, 8)
+        + (r.conversation ? ', conversation ' + r.conversation + ',' : '')
         + ' has had ' + r.starved + ' requests in a row come back with nothing'
         + (r.project ? ' (' + r.project + ')' : '') + why,
     });
@@ -415,13 +435,15 @@ export function problems(status) {
   if (named.length > STARVED_LIST_MAX) {
     out.push({
       severity: 'bad', kind: 'starved-more',
-      text: 'and ' + (named.length - STARVED_LIST_MAX) + ' more sessions are getting nothing back.',
+      text: 'and ' + (named.length - STARVED_LIST_MAX) + ' more conversations are getting nothing back.',
     });
   }
   if (!named.length && (sessions.starvedMax || 0) >= STARVED_MIN) {
     out.push({
       severity: 'bad', kind: 'starved-session',
-      text: 'A session has had ' + sessions.starvedMax + ' requests in a row come back with nothing.'
+      // A conversation, not a session: the streak is counted per conversation,
+      // and a session whose other agents are answering fine is not starving.
+      text: 'A conversation has had ' + sessions.starvedMax + ' requests in a row come back with nothing.'
         + ' Turn on proxy.sessionDetail to see which.',
     });
   }
@@ -751,8 +773,13 @@ ${SHARED_HELPERS}
     tr.appendChild(th);
   }
 
+  // Session and conversation are two columns rather than one composite: sorting
+  // by Session brings a fan-out's rows together (the sort is stable, so they
+  // stay in recency order inside it) and Conv is the only column that differs
+  // between them. Narrow on purpose — it is a digest, not a name.
   var SESSION_COLUMNS = [
-    { key: 'id', label: 'Session' },
+    { key: 'session', label: 'Session' },
+    { key: 'conversation', label: 'Conv' },
     { key: 'client', label: 'Client' },
     { key: 'project', label: 'Project' },
     { key: 'accounts', label: 'Accounts' },
@@ -781,7 +808,10 @@ ${SHARED_HELPERS}
     sessionFilters.client = clientSel.value;
 
     var rows = sortRows(filterSessionRows(all, sessionFilters), sortState.sessions.key, sortState.sessions.dir);
-    document.getElementById('sessionCount').textContent = rows.length + ' of ' + all.length + ' sessions';
+    // Conversations, not sessions: one client session contributes a row per
+    // agent it has in flight, and counting rows as sessions would report a
+    // fleet carrying several times the clients it has.
+    document.getElementById('sessionCount').textContent = rows.length + ' of ' + all.length + ' conversations';
 
     var table = document.getElementById('sessions');
     table.textContent = '';
@@ -790,7 +820,8 @@ ${SHARED_HELPERS}
     table.appendChild(hr);
     rows.forEach(function (r) {
       var tr = el('tr');
-      tr.appendChild(el('td', r.active ? '' : 'dim', r.id));
+      tr.appendChild(el('td', r.active ? '' : 'dim', r.session));
+      tr.appendChild(el('td', r.active ? '' : 'dim', r.conversation || '—'));
       tr.appendChild(el('td', '', r.client || '—'));
       tr.appendChild(el('td', '', r.project || '—'));
       tr.appendChild(el('td', '', r.accounts || '—'));
@@ -936,7 +967,10 @@ ${SHARED_HELPERS}
     } else {
       sum.appendChild(el('b', '', s.currentAccount || 'none'));
     }
-    sum.appendChild(el('span', '', ' · ' + (sess.active || 0) + ' active / ' + (sess.known || 0) + ' known sessions' + (up ? ' · ' + up : '')));
+    // Conversations, like the table below it and the count above that table:
+    // one page saying "sessions" here and "conversations" there would read as
+    // two different quantities rather than one counted twice.
+    sum.appendChild(el('span', '', ' · ' + (sess.active || 0) + ' active / ' + (sess.known || 0) + ' known conversations' + (up ? ' · ' + up : '')));
     var probe = s.probe || {};
     var probeBtn = document.getElementById('probe');
     probeBtn.textContent = probe.running ? 'Probe running…' : 'Probe quotas';
