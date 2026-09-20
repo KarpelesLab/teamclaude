@@ -77,7 +77,7 @@ teamclaude priority <name> --first
 teamclaude priority <name> --last
 ```
 
-`login`, `import`, `enable`, `disable` and `priority` notify a running server to reload, so credential, priority and enable/disable changes are picked up live; the same reload (POST `/teamclaude/reload`, or **R** in the TUI) also applies hand edits to an account's `upstream`/`modelMap`. Account **removals** still need a restart.
+`login`, `import`, `enable`, `disable` and `priority` notify a running server to reload, so credential, priority and enable/disable changes are picked up live; the same reload (POST `/teamclaude/reload`, or **R** in the TUI) also applies hand edits to an account's `upstream`/`modelMap`. Account **removals** made on disk still need a restart, because a reload never drops a running account; removing one from the TUI or through the [MCP endpoint](usage.md#mcp-endpoint)'s `remove_account` takes effect at once.
 
 Accounts can also be added and removed from the TUI settings screen: **`g`** → **Add account** / **Remove account**.
 
@@ -200,6 +200,31 @@ Two details are worth knowing if you read the raw headers:
   family can put its 7-day window in `primary` while a model-scoped family puts
   a 5-hour window there. Windows are classified by their stated
   `window-minutes`, never by position.
+
+### Free rate-limit reset credits
+
+OpenAI occasionally grants a ChatGPT account a free **rate-limit reset credit**:
+redeeming one clears the account's spent windows ahead of their own reset. The
+Codex CLI offers it as a manual action only, so a pooled account that runs dry
+sits out the rest of its week holding one unless somebody notices it is there.
+
+The count an account holds comes free with the quota probe — it rides on the
+same `/wham/usage` payload the quota reading does — and shows up as `RC1` on the
+TUI row, a `Reset` line in `teamclaude status`, and a badge on the dashboard
+card. It survives a restart, which matters because the probe is off by default:
+without that, nothing would say a credit exists until something next happened to
+read the usage endpoint.
+
+Only the probe refreshes the count, so a reading can outlive the credit it
+describes — redeemed in the Codex CLI, or expired. The `status` line therefore
+says how old the reading is (`as of 3h ago`), and every surface drops it once it
+is more than 7 days old.
+
+The count is what the account **holds**. Whether a particular credit can be
+spent is a separate question — the payload's `applicable_available_count` is
+upstream's own view of how many would reset a window right now, and is named on
+the `status` line when it is zero — and spending one remains a manual action in
+the Codex CLI.
 
 ## Third-party backend accounts
 

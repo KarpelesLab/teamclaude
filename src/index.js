@@ -7,7 +7,7 @@ import { readFile } from 'node:fs/promises';
 import net from 'node:net';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, loadState, saveState } from './config.js';
 import { installCrashHandlers } from './crash-log.js';
-import { AccountManager, DEFAULT_SWITCH_THRESHOLD, distributionMode } from './account-manager.js';
+import { AccountManager, distributionMode } from './account-manager.js';
 import { validateAdaptiveConfig } from './adaptive-distribution.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, loginOAuthWithPastedCode, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
@@ -29,7 +29,7 @@ import * as alias from './alias.js';
 import { ensureCerts, mitmHosts } from './mitm.js';
 import { Prober } from './prober.js';
 import { Warmer } from './warmer.js';
-import { createRollingWarmupSchedule, formatWarmupScheduleConfirmation, resolveWarmupConfig, resolveWarmupSchedule } from './warmup-schedule.js';
+import { formatWarmupScheduleConfirmation, resolveWarmupConfig } from './warmup-schedule.js';
 import { TUI } from './tui.js';
 import { SessionTitles } from './session-titles.js';
 import { captureEarlyConsole } from './early-log.js';
@@ -44,15 +44,26 @@ import { serviceKind, installService, uninstallService, serviceStatus, renderSer
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
 import { getUpstreamProxy, describeProxy, describeSelfProxy } from './upstream-proxy.js';
 import { startEventLoopMonitor } from './event-loop-monitor.js';
+import {
+  ConfigOpError,
+  DISTRIBUTE_MODES,
+  removeRoute,
+  setBucketThresholds,
+  setDistribution,
+  setProbeSeconds,
+  setThreshold,
+  setWarmupSchedule,
+  setWarmupSeconds,
+  thresholdRatio,
+  thresholdTable,
+  upsertRoute,
+} from './config-ops.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 // These constants are referenced by routeCommand, which the dispatch below
 // reaches through a top-level `await`. The await suspends module evaluation at
 // the switch, so a const declared under the switch is still in the temporal
 // dead zone when the command body runs — keep them above the dispatch.
-// Ceiling for `teamclaude probe <seconds>`: setInterval takes a 32-bit signed
-// millisecond delay, so anything past ~2,147,483 s overflows to 1 ms.
-const MAX_PROBE_SECONDS = 7 * 24 * 3600;
 const ROUTE_USAGE = [
   'Usage: teamclaude route [list]',
   '       teamclaude route add <name> --match "<glob>[,<glob>]" [--accounts "<name-or-index>[,...]"] [--bucket <quota-bucket>] [--color <name>]',
@@ -63,8 +74,6 @@ const ROUTE_USAGE = [
   '--color (red/green/yellow/blue/magenta/cyan) tints the route\'s inline marker in the TUI.',
   'First matching route wins. Changes apply to a running server immediately.',
 ].join('\n');
-
-const ROUTE_COLORS = ['red', 'green', 'yellow', 'blue', 'magenta', 'cyan'];
 
 const THRESHOLD_USAGE = [
   'Usage: teamclaude threshold                 (show the current thresholds)',
@@ -77,30 +86,7 @@ const THRESHOLD_USAGE = [
   'server immediately.',
 ].join('\n');
 
-// The buckets a threshold can be keyed by: the quota windows the manager asks
-// thresholdFor() about. An unknown key would be accepted by the config and then
-// never consulted, so the CLI refuses it rather than storing a typo.
-const QUOTA_BUCKETS = ['unified5h', 'unified7d', 'unified7dSonnet', 'unified7dFable', 'tokens', 'requests'];
-
 const DISTRIBUTE_USAGE = 'Usage: teamclaude distribute <on|off|adaptive>';
-
-// What each mode writes to the config, and what to say once it is set. Keyed by
-// the mode `distributionMode` resolves to, so the command and the router cannot
-// disagree about what a setting means.
-const DISTRIBUTE_MODES = {
-  off: {
-    value: false,
-    said: 'Session distribution off — sessions already running keep their accounts and drain; new ones rotate by quota.',
-  },
-  even: {
-    value: true,
-    said: 'Session distribution on — new sessions spread across equal-priority accounts, each pinned to its own for cache reuse.',
-  },
-  adaptive: {
-    value: 'adaptive',
-    said: 'Session distribution adaptive — new sessions concentrate on the account with the least remaining weekly credit, tapering off as it nears the switch threshold and backing off when it is busy.',
-  },
-};
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -427,6 +413,12 @@ async function serverCommand() {
       // takes effect on reload the same way.
       config.proxy.apiKey = diskConfig.proxy.apiKey;
     }
+    // The MCP endpoint's mode: read per request, so this is what opens,
+    // narrows or closes it without a restart. Outside the guard above on
+    // purpose: an operator who deletes the whole `proxy` section has asked for
+    // the endpoint to be off as surely as one who deletes the key, and leaving
+    // the old mode in memory would keep it served.
+    if (config.proxy) config.proxy.mcp = diskConfig.proxy?.mcp;
     // Pick up route table edits (teamclaude route …, TUI editor, or a hand edit).
     config.routes = diskConfig.routes || [];
     accountManager.setRoutes(config.routes);
@@ -488,21 +480,30 @@ async function serverCommand() {
     return added;
   };
 
+  // The account half of a save. The TUI's save below starts with it, and the
+  // MCP endpoint uses it alone: an account changed there is changed in-process,
+  // on a server that may have no TUI to save for it, and writing the settings
+  // too would pin this server's resolved defaults into a file that never
+  // spelled them out.
+  const mergeAccountsOnto = (/** @type {Record<string, any>} */ diskConfig) => {
+    diskConfig.accounts = mergeAccountsForSave(
+      config.accounts, accountManager.accounts, diskConfig.accounts, removedAccountIds(config),
+    );
+    // The written list omits them, so they are gone from disk too and there
+    // is nothing left to re-adopt. Holding the ids any longer would only
+    // refuse an account the operator re-adds later.
+    clearRemovedAccountIds(config);
+  };
+
   let tui = null;
-  /** @type {Object} */
+  /** @type {Record<string, any>} */
   let hooks = {};
 
   if (useTUI) {
     tui = new TUI({
       accountManager, config, sx, activityLogPath, sessionTitles, versionLabel, updateAvailable,
       saveConfig: () => atomicConfigUpdate(async diskConfig => {
-        diskConfig.accounts = mergeAccountsForSave(
-          config.accounts, accountManager.accounts, diskConfig.accounts, removedAccountIds(config),
-        );
-        // The written list omits them, so they are gone from disk too and there
-        // is nothing left to re-adopt. Holding the ids any longer would only
-        // refuse an account the operator re-adds later.
-        clearRemovedAccountIds(config);
+        mergeAccountsOnto(diskConfig);
         // Persist sx.org settings (set/cleared from the TUI settings screen).
         if (config.sx) diskConfig.sx = config.sx; else delete diskConfig.sx;
         // Persist other runtime-tunable settings edited from the TUI.
@@ -581,6 +582,7 @@ async function serverCommand() {
 
   // Expose reload to the proxy's control endpoint (works with or without TUI).
   hooks.reload = reloadAccounts;
+  hooks.persistAccounts = () => atomicConfigUpdate(mergeAccountsOnto);
   hooks.getStatusExtra = () => ({
     // Read live from the shared config (not a startup snapshot) so the TUI's
     // blocklist editor shows up in `status` immediately, the same way the
@@ -724,8 +726,8 @@ async function serverCommand() {
   if (!tui) autoUpdate({ config }).catch(() => {});
 
   // One idempotent shutdown funnel for BOTH modes and BOTH triggers: POSIX
-  // signals (SIGINT/SIGTERM) and the TUI's ctrl-c / q keypress (which in raw mode
-  // never reaches the OS as a signal). Guards re-entry: a second ctrl-c — an
+  // signals (SIGINT/SIGTERM/SIGHUP) and the TUI's ctrl-c / q keypress (which in
+  // raw mode never reaches the OS as a signal). Guards re-entry: a second ctrl-c — an
   // impatient user, or a signal racing the keypress — forces an immediate exit
   // instead of re-running teardown, which would re-arm server.close() and leak a
   // 'close' listener on the server each time (MaxListenersExceededWarning).
@@ -750,6 +752,11 @@ async function serverCommand() {
   }
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
+  // A closed pane or a dropped SSH session hangs up the controlling terminal.
+  // SIGHUP's default action kills the process where it stands, skipping stop()
+  // and the quota-state save; routed through the same funnel, a vanished
+  // terminal is an orderly exit like any other.
+  process.on('SIGHUP', shutdown);
 }
 
 // ── import ──────────────────────────────────────────────────
@@ -1643,18 +1650,9 @@ async function probeCommand() {
       console.error('Usage: teamclaude probe <off|seconds>');
       process.exit(1);
     }
-    if (seconds > 0 && seconds < 30) {
-      console.error('Minimum probe interval is 30s (to avoid hammering the usage endpoint).');
-      process.exit(1);
-    }
-    // Past the ceiling the interval would overflow into a 1 ms probe storm.
-    if (seconds > MAX_PROBE_SECONDS) {
-      console.error(`Maximum probe interval is ${MAX_PROBE_SECONDS}s (7 days).`);
-      process.exit(1);
-    }
   }
 
-  config.quotaProbeSeconds = seconds;
+  applyOrExit(() => setProbeSeconds(config, seconds));
   await saveConfig(config);
   console.log(seconds > 0
     ? `Quota probe set to every ${seconds}s (reads /api/oauth/usage; does not spend quota).`
@@ -1691,22 +1689,7 @@ async function warmupCommand() {
       console.error(`Usage: teamclaude warmup ${arg} HH:MM --timezone Area/City`);
       process.exit(1);
     }
-    const schedule = { resetTime, timezone };
-    try {
-      if (arg === 'rolling') {
-        config.warmupSchedule = createRollingWarmupSchedule(schedule);
-      } else {
-        const resolved = resolveWarmupSchedule(schedule);
-        config.warmupSchedule = {
-          resetTime: resolved.resetTime,
-          timezone: resolved.timezone,
-        };
-      }
-    } catch (err) {
-      console.error(err.message);
-      process.exit(1);
-    }
-    config.warmupSeconds = 0;
+    applyOrExit(() => setWarmupSchedule(config, arg, { resetTime, timezone }));
     await saveConfig(config);
     console.log(formatWarmupScheduleConfirmation(config.warmupSchedule));
     await notifyRunningServer(config);
@@ -1722,14 +1705,9 @@ async function warmupCommand() {
       console.error('Usage: teamclaude warmup <off|seconds>');
       process.exit(1);
     }
-    if (seconds > 0 && seconds < 60) {
-      console.error('Minimum keep-warm interval is 60s.');
-      process.exit(1);
-    }
   }
 
-  config.warmupSeconds = seconds;
-  delete config.warmupSchedule;
+  applyOrExit(() => setWarmupSeconds(config, seconds));
   await saveConfig(config);
   console.log(seconds > 0
     ? `Keep-warm set to every ${seconds}s (spawns a minimal \`claude\` per idle account; spends a little quota).`
@@ -1738,25 +1716,6 @@ async function warmupCommand() {
 }
 
 // ── threshold ───────────────────────────────────────────────
-
-/** The stored form of a percentage: a 0–1 ratio quantised to tenths of a
- *  percent, so a value set here reads back identically on the settings screen
- *  (tui.js quantises the same way). Returns null when the input is not a
- *  percentage this setting accepts. */
-function thresholdRatio(text) {
-  const pct = Number(text);
-  if (!Number.isFinite(pct) || pct < 1 || pct > 100) return null;
-  return Math.round(pct * 10) / 1000;
-}
-
-/** The threshold table as `{ default, ...buckets }`, whatever shape it is
- *  stored in — a bare number is the default with no bucket overrides. */
-function thresholdTable(value) {
-  if (value && typeof value === 'object') {
-    return { default: DEFAULT_SWITCH_THRESHOLD, ...value };
-  }
-  return { default: typeof value === 'number' ? value : DEFAULT_SWITCH_THRESHOLD };
-}
 
 function printThresholds(value) {
   const table = thresholdTable(value);
@@ -1792,51 +1751,33 @@ async function thresholdCommand() {
       console.error(THRESHOLD_USAGE);
       process.exit(1);
     }
-    const ratio = thresholdRatio(rest[0]);
-    if (ratio === null) {
+    if (thresholdRatio(rest[0]) === null) {
       console.error(THRESHOLD_USAGE);
       process.exit(1);
     }
-    const dropped = Object.keys(thresholdTable(config.switchThreshold)).filter(b => b !== 'default');
-    config.switchThreshold = ratio;
+    const { dropped } = applyOrExit(() => setThreshold(config, rest[0]));
     await saveConfig(config);
     if (dropped.length) {
       console.log(`Dropped the per-bucket thresholds (${dropped.join(', ')}) — one number governs every bucket.`);
     }
-    console.log(`Switch threshold set to ${formatPercent(ratio)}.`);
+    console.log(`Switch threshold set to ${formatPercent(config.switchThreshold)}.`);
     await notifyRunningServer(config);
     return;
   }
 
-  const table = thresholdTable(config.switchThreshold);
-  for (const pair of keyed) {
+  // `bucket=default` is the command's spelling of "drop this override".
+  const pairs = keyed.map(pair => {
     const at = pair.indexOf('=');
-    const bucket = pair.slice(0, at);
     const value = pair.slice(at + 1);
-    if (bucket !== 'default' && !QUOTA_BUCKETS.includes(bucket)) {
-      console.error(`Unknown quota bucket "${bucket}" — expected one of: default, ${QUOTA_BUCKETS.join(', ')}`);
-      process.exit(1);
-    }
-    if (value === 'default') {
-      if (bucket === 'default') {
-        console.error('The default threshold is the fallback — set it to a number instead of dropping it.');
-        process.exit(1);
-      }
-      delete table[bucket];
-      continue;
-    }
-    const ratio = thresholdRatio(value);
-    if (ratio === null) {
-      console.error(THRESHOLD_USAGE);
-      process.exit(1);
-    }
-    table[bucket] = ratio;
+    return /** @type {[string, unknown]} */ ([pair.slice(0, at), value === 'default' ? null : value]);
+  });
+  // A value that is not a percentage gets the usage text, as it always has;
+  // what a bucket may be called is the shared rule's to say.
+  if (pairs.some(([, value]) => value !== null && thresholdRatio(value) === null)) {
+    console.error(THRESHOLD_USAGE);
+    process.exit(1);
   }
-
-  // Back to the plain form once the last override is gone: an object holding
-  // only `default` is the same setting written the long way.
-  const overrides = Object.keys(table).filter(b => b !== 'default');
-  config.switchThreshold = overrides.length ? table : table.default;
+  applyOrExit(() => setBucketThresholds(config, pairs));
   await saveConfig(config);
   printThresholds(config.switchThreshold);
   await notifyRunningServer(config);
@@ -1874,10 +1815,7 @@ async function distributeCommand() {
   // An unchanged setting is not rewritten — the config file is a
   // read-modify-write shared with the running server — but the server is still
   // notified, so a config that already says `on` can be made to take effect.
-  if (next !== current) {
-    config.distributeSessions = DISTRIBUTE_MODES[next].value;
-    await saveConfig(config);
-  }
+  if (setDistribution(config, next)) await saveConfig(config);
   console.log(DISTRIBUTE_MODES[next].said);
   await notifyRunningServer(config);
 }
@@ -1989,21 +1927,9 @@ async function routeCommand() {
       console.error(ROUTE_USAGE);
       process.exit(1);
     }
-    if (color && !ROUTE_COLORS.includes(color.toLowerCase())) {
-      console.error(`Unknown color "${color}" — expected one of: ${ROUTE_COLORS.join(', ')}`);
-      process.exit(1);
-    }
-    const known = new Set(config.accounts.map(a => a.name));
-    for (const a of accounts) {
-      if (!known.has(a) && !/^\d+$/.test(a)) console.error(`Warning: no account named "${a}" (yet)`);
-    }
-    const route = { name, match };
-    if (accounts.length) route.accounts = accounts;
-    if (bucket) route.bucket = bucket;
-    if (color) route.color = color.toLowerCase();
-    const at = config.routes.findIndex(r => r.name === name);
-    if (at >= 0) { config.routes[at] = route; console.log(`Updated route "${name}"`); }
-    else { config.routes.push(route); console.log(`Added route "${name}"`); }
+    const { route, updated, unknownAccounts } = applyOrExit(() => upsertRoute(config, { name, match, accounts, bucket, color }));
+    for (const a of unknownAccounts) console.error(`Warning: no account named "${a}" (yet)`);
+    console.log(`${updated ? 'Updated' : 'Added'} route "${route.name}"`);
     await saveConfig(config);
     await notifyRunningServer(config);
     return;
@@ -2011,9 +1937,7 @@ async function routeCommand() {
 
   if (sub === 'rm' || sub === 'remove' || sub === 'delete') {
     const name = args[2];
-    const before = config.routes.length;
-    config.routes = config.routes.filter(r => r.name !== name);
-    if (config.routes.length === before) { console.error(`Route "${name}" not found`); process.exit(1); }
+    applyOrExit(() => removeRoute(config, name));
     await saveConfig(config);
     await notifyRunningServer(config);
     console.log(`Removed route "${name}"`);
@@ -2193,6 +2117,16 @@ A running server re-syncs accounts from config on POST /teamclaude/reload
 (local only). add/login/enable/disable/priority trigger it automatically.
 POST /teamclaude/switch {"account": "<name>"} makes one account the preferred
 one, which is what 'teamclaude switch' calls.
+
+MCP endpoint (off by default). With "proxy": { "mcp": "read" } the server
+serves its status, quota and settings as MCP tools at /teamclaude/mcp; "full"
+adds the tools that change them (switch, enable/disable, priority, remove,
+threshold, distribute, probe, warmup, routes, blocked models, client mode).
+Connect Claude Code with:
+  claude mcp add --transport http teamclaude http://localhost:3456/teamclaude/mcp
+Same gates as the other /teamclaude/ routes. A named client key is served
+read-only even in "full" mode: the write tools answer to the shared proxy key
+and to local callers. With no proxy key configured, only local callers are served.
 
 Upstream proxy. On a host with no direct route to the internet, set
 "upstreamProxy": "http://user:pass@host:3128" (or just "host:3128") and every
@@ -2377,6 +2311,22 @@ function isLocalAccountPin(url, port) {
 function argValue(flag) {
   const i = args.indexOf(flag);
   return (i >= 0 && args[i + 1]) ? args[i + 1] : null;
+}
+
+/**
+ * Apply a settings change, exiting with its message when the change is refused.
+ * @template T
+ * @param {() => T} change
+ * @returns {T}
+ */
+function applyOrExit(change) {
+  try {
+    return change();
+  } catch (err) {
+    if (!(err instanceof ConfigOpError)) throw err;
+    console.error(err.message);
+    process.exit(1);
+  }
 }
 
 // Keep the terminal title in sync with the active account (e.g. "teamclaude 2/4
