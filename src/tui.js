@@ -1617,6 +1617,11 @@ export class TUI {
           if (amAcct.status === 'error') amAcct.status = 'active';
         }
         this._addLog(`Updated account "${prev.name}"`);
+        // Which account a credential belongs to is only known once its profile
+        // has been read, so that one lookup cannot go through a proxy it has
+        // not found yet. Said, because the operator routed this account to
+        // keep its traffic off this machine's address.
+        if (prev.routing) this._addLog(`Note: "${safeLine(prev.name, 64)}" has its own proxy, and this import's profile lookup did not go through it`);
       } else {
         // New org for this person: disambiguate colliding email names with " (org)".
         if (profile?.accountUuid) {

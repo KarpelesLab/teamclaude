@@ -118,6 +118,13 @@ The value is validated when the account is read: a bad URL is reported once and 
 
 Besides the CLI there are two more places to set it. In the TUI, **`g`** then **Account proxy** picks an account and asks for the URL (`none` clears it). Over the [MCP endpoint](usage.md#mcp-endpoint) the tool is `set_account_routing`.
 
+### What is not routed
+
+Routing covers what TeamClaude does with the account's own credential. Two kinds of traffic are outside that, and both keep the fleet path:
+
+- Claude Code's own identity calls (`/api/oauth/*`, `/v1/code/*` and its token refresh) are relayed with the credential of the Claude Code login, never with a pooled account's, so they belong to no account here. That holds even when the login is the same person as a routed account.
+- A sign-in or import that names no account. Which account it belongs to is only known once the profile has been read, so that lookup cannot use a proxy it has not found yet. Pass `--name` (or `--routing`) and it can.
+
 ### The proxy is tested before anything depends on it
 
 `login --routing`, `import --routing`, `routing <name> <url>` and the TUI row all open a tunnel through the proxy to the account's upstream and finish the TLS handshake before they change anything. No request is sent, so the only credential that leaves the machine is the proxy's own. If the test fails the command stops and nothing is saved:
