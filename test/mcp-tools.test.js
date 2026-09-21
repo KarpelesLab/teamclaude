@@ -203,6 +203,25 @@ test('set_account_routing sets, masks, and clears the account proxy', async () =
   assert.match(await refused(tools, 'set_account_routing', { account: 'bob@example.com', org: 'Acme', routing: 'https://proxy.example.com' }), /unsupported routing protocol/);
 });
 
+test('set_account_routing keeps the proxy password out of the write log', async () => {
+  const lines = [];
+  const original = console.log;
+  console.log = (...args) => { lines.push(args.join(' ')); };
+  try {
+    const { tools } = await fixture();
+    await ok(tools, 'set_account_routing', { account: 'bob@example.com', org: 'Acme', routing: 'socks5h://alice:s3cret@proxy.example.com:1080' });
+    // A value that will not parse is logged before it is refused, and an
+    // unescaped '@' in the password is the usual reason it will not parse.
+    await refused(tools, 'set_account_routing', { account: 'bob@example.com', org: 'Acme', routing: 'socks9://alice:s3c@ret@proxy.example.com:1080' });
+  } finally {
+    console.log = original;
+  }
+  const logged = lines.filter(l => l.includes('MCP set_account_routing'));
+  assert.equal(logged.length, 2, lines.join('\n'));
+  assert.ok(logged[0].includes('socks5h://alice:***@proxy.example.com:1080'), logged[0]);
+  assert.equal(lines.some(l => /s3c/.test(l)), false, lines.join('\n'));
+});
+
 test('remove_account takes the account out of rotation and marks its entry removed before saving', async () => {
   const { tools, am, config, calls } = await fixture();
   assert.deepEqual(await ok(tools, 'remove_account', { account: 'bob@example.com', org: 'Acme' }), { account: 'bob@example.com (Acme)', removed: true, persisted: true });

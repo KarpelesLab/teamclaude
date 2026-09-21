@@ -21,7 +21,7 @@ import { WEEKLY_BUCKET_KEYS } from './model.js';
 import { sanitizeText } from './safe-text.js';
 import { currentVersion } from './updater.js';
 import { upstreamPoolStatus } from './upstream-fetch.js';
-import { parseRoutingUrl, routingToUrl, describeRouting } from './account-routing.js';
+import { parseRoutingUrl, routingToUrl, describeRouting, maskRoutingUrl } from './account-routing.js';
 
 /**
  * The management tools served at /teamclaude/mcp, and the `proxy.mcp` gate in
@@ -40,9 +40,12 @@ import { parseRoutingUrl, routingToUrl, describeRouting } from './account-routin
  *   properties?: Record<string, Record<string, any>>,
  *   required?: string[],
  *   write?: boolean,
+ *   auditArgs?: (args: Record<string, any>) => Record<string, any>,
  *   run: (args: Record<string, any>, ctx: ToolContext) => Record<string, any>|Promise<Record<string, any>>,
  * }} Tool `run` throws a ToolFailure or ConfigOpError to refuse with a message
  *   the caller may read; any other exception is reported without its text.
+ *   `auditArgs` is what the write log prints in place of the arguments, for a
+ *   tool whose arguments hold a secret.
  */
 
 const INVALID_PARAMS = -32602;
@@ -308,6 +311,8 @@ const WRITE_TOOLS = [
     properties: { ...ACCOUNT_ARGS, routing: { type: 'string', description: 'The proxy URL, or an empty value / "none" / "off" to clear' } },
     required: ['account', 'routing'],
     write: true,
+    // The URL carries the proxy password, and the write log is not a place for it.
+    auditArgs: args => ({ ...args, routing: maskRoutingUrl(args.routing) }),
     run: (args, ctx) => {
       /** @type {import('./account-routing.js').RoutingProxy|null} */
       let routing = null;
@@ -541,7 +546,7 @@ export function createToolSet(mode, ctx, { writeTimeoutMs = WRITE_TIMEOUT_MS } =
   /** @type {(tool: Tool, args: Record<string, any>) => Promise<Record<string, any>>} */
   const run = async (tool, args) => {
     if (tool.write) {
-      console.log(`[TeamClaude] MCP ${tool.name} by ${ctx.client ? sanitizeText(ctx.client) : 'a local caller'}: ${sanitizeText(JSON.stringify(args)).slice(0, 300)}`);
+      console.log(`[TeamClaude] MCP ${tool.name} by ${ctx.client ? sanitizeText(ctx.client) : 'a local caller'}: ${sanitizeText(JSON.stringify(tool.auditArgs ? tool.auditArgs(args) : args)).slice(0, 300)}`);
     }
     try {
       const value = await tool.run(args, ctx);

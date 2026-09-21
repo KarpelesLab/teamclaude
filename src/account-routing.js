@@ -61,19 +61,23 @@ export function parseRoutingUrl(value) {
   if (!value || typeof value !== 'string') return null;
   const raw = value.trim();
   if (!raw) return null;
+  // What the error text echoes. These messages reach the server log (a bad
+  // value in the config is reported at startup and on every reload) and the
+  // MCP reply, and the value holds the proxy password.
+  const shown = maskRoutingUrl(raw);
 
   const withScheme = /^[a-z0-9+.-]+:\/\//i.test(raw) ? raw : `http://${raw}`;
   let u;
   try {
     u = new URL(withScheme);
   } catch {
-    throw new Error(`invalid routing URL: ${value}`);
+    throw new Error(`invalid routing URL: ${shown}`);
   }
   const protocol = u.protocol.replace(/:$/, '').toLowerCase();
   if (!ROUTING_SCHEMES.includes(protocol)) {
-    throw new Error(`unsupported routing protocol "${protocol}" (one of ${ROUTING_SCHEMES.join(', ')}): ${value}`);
+    throw new Error(`unsupported routing protocol "${protocol}" (one of ${ROUTING_SCHEMES.join(', ')}): ${shown}`);
   }
-  if (!u.hostname) throw new Error(`routing URL has no host: ${value}`);
+  if (!u.hostname) throw new Error(`routing URL has no host: ${shown}`);
 
   // Read the port off the raw authority as well as u.port: WHATWG URL refuses
   // most bad ports outright, but accepts `:0`, which no proxy listens on —
@@ -88,21 +92,51 @@ export function parseRoutingUrl(value) {
     portRaw = hostport.slice(hostport.lastIndexOf(':') + 1);
   }
   if (portRaw != null && portRaw !== '' && !/^\d+$/.test(portRaw)) {
-    throw new Error(`routing URL has an invalid port: ${value}`);
+    throw new Error(`routing URL has an invalid port: ${shown}`);
   }
   const port = portRaw ? Number(portRaw) : (protocol === 'http' ? 8080 : 1080);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    throw new Error(`routing URL has an invalid port: ${value}`);
+    throw new Error(`routing URL has an invalid port: ${shown}`);
   }
-  const username = u.username ? decodeURIComponent(u.username) : null;
-  const password = u.password ? decodeURIComponent(u.password) : null;
+  let username;
+  let password;
+  try {
+    username = u.username ? decodeURIComponent(u.username) : null;
+    password = u.password ? decodeURIComponent(u.password) : null;
+  } catch {
+    // URL keeps a stray `%` as written; decodeURIComponent then throws a bare
+    // "URI malformed", which names neither the field nor the fix.
+    throw new Error(`routing URL credentials have a malformed percent-escape (write a literal % as %25): ${shown}`);
+  }
   if (password && (protocol === 'socks4' || protocol === 'socks4a')) {
     // SOCKS4's request carries a userid and nothing else; a password written
     // here would be silently dropped on the floor. Name the fix instead.
-    throw new Error(`SOCKS4 has no password authentication — use socks5 for user:pass auth: ${value}`);
+    throw new Error(`SOCKS4 has no password authentication — use socks5 for user:pass auth: ${shown}`);
   }
   // URL keeps an IPv6 literal bracketed; the socket layer wants it bare.
   return { protocol, host: u.hostname.replace(/^\[(.*)\]$/, '$1'), port, username, password };
+}
+
+/**
+ * A routing value AS TYPED, password masked — for text that echoes input which
+ * may not parse at all (error messages, the MCP audit log). describeRouting()
+ * is the form for a routing that did parse.
+ *
+ * Cut at the LAST `@`, not the first: an unescaped `@`, `/` or `#` inside a
+ * password is exactly the typo that makes a value unparseable, and a mask that
+ * stopped early would print the tail of the secret. Over-masking an odd value
+ * costs nothing; this text is for reading, never for parsing.
+ * @param {any} value
+ * @returns {string}
+ */
+export function maskRoutingUrl(value) {
+  const text = String(value ?? '');
+  const at = text.lastIndexOf('@');
+  if (at < 0) return text;
+  const scheme = text.indexOf('://');
+  const colon = text.indexOf(':', scheme < 0 ? 0 : scheme + 3);
+  if (colon < 0 || colon > at) return text; // a username alone holds no secret
+  return `${text.slice(0, colon)}:***${text.slice(at)}`;
 }
 
 /**

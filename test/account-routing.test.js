@@ -5,7 +5,7 @@ import tls from 'node:tls';
 import http from 'node:http';
 import https from 'node:https';
 import { generateCertChain } from '../src/x509.js';
-import { parseRoutingUrl, routingToUrl, describeRouting, connectThroughRouting, routingAgent } from '../src/account-routing.js';
+import { parseRoutingUrl, routingToUrl, describeRouting, maskRoutingUrl, connectThroughRouting, routingAgent } from '../src/account-routing.js';
 import { upstreamFetch, proxyFetch } from '../src/upstream-fetch.js';
 import { setUpstreamProxy, resetUpstreamProxy, resolveUpstreamProxy } from '../src/upstream-proxy.js';
 
@@ -59,6 +59,40 @@ test('parseRoutingUrl refuses unusable input with a named reason', () => {
   // SOCKS4 carries a userid only — a password would be silently dropped.
   assert.throws(() => parseRoutingUrl('socks4://bob:s3cret@proxy.example.com'), /SOCKS4 has no password/);
   assert.throws(() => parseRoutingUrl('not a url at all:8bad'), /invalid routing URL|invalid port/);
+});
+
+test('a refused routing URL never echoes its password', () => {
+  // These messages reach the server log (a bad config value is reported at
+  // startup and on every reload), so each refusal is checked, not just one.
+  const refusedValues = [
+    'ftp://alice:s3cret@proxy.example.com:21',          // unsupported scheme
+    'socks5://alice:s3cret@proxy.example.com:0',        // invalid port
+    'socks5://alice:s3cret@proxy.example.com:99999',    // port out of range
+    'socks4://alice:s3cret@proxy.example.com:1080',     // SOCKS4 has no password
+    'socks5://alice:s3%zzcret@proxy.example.com:1080',  // malformed percent-escape
+    'socks5://alice:s3c#ret@proxy.example.com:1080',    // unescaped '#' cuts the authority short
+    'socks5://alice:s3cret@',                           // no host
+  ];
+  for (const value of refusedValues) {
+    assert.throws(() => parseRoutingUrl(value), (err) => {
+      assert.ok(err instanceof Error);
+      assert.equal(/s3c|cret/.test(err.message), false, `${value} → ${err.message}`);
+      assert.ok(err.message.includes('alice:***@'), `${value} → ${err.message}`);
+      return true;
+    });
+  }
+  assert.throws(() => parseRoutingUrl('socks5://alice:s3%zzcret@proxy.example.com:1080'), /malformed percent-escape/);
+});
+
+test('maskRoutingUrl masks a password in a value that may not parse at all', () => {
+  assert.equal(maskRoutingUrl('socks5h://alice:s3cret@proxy.example.com:1080'), 'socks5h://alice:***@proxy.example.com:1080');
+  assert.equal(maskRoutingUrl('alice:s3cret@proxy.example.com:3128'), 'alice:***@proxy.example.com:3128', 'no scheme');
+  assert.equal(maskRoutingUrl('socks5://alice:s3c@ret@host:1080'), 'socks5://alice:***@host:1080', 'cut at the LAST @');
+  assert.equal(maskRoutingUrl('socks5://alice:s3c/r#et@host:1080'), 'socks5://alice:***@host:1080', 'delimiters inside the password');
+  assert.equal(maskRoutingUrl('socks4a://alice@host:1080'), 'socks4a://alice@host:1080', 'a username alone is left as it is');
+  assert.equal(maskRoutingUrl('proxy.example.com:3128'), 'proxy.example.com:3128');
+  assert.equal(maskRoutingUrl('none'), 'none');
+  assert.equal(maskRoutingUrl(null), '');
 });
 
 test('routingToUrl round-trips and describeRouting masks the password', () => {
