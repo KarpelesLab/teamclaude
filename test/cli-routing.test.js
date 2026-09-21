@@ -223,3 +223,23 @@ test('api sends the account\'s credential through that account\'s routing, and o
     origin.closeAllConnections?.();
   }
 });
+
+// ── the flag itself ──────────────────────────────────────────
+
+test('--routing=URL is read, and a --routing with no URL is refused rather than ignored', async () => {
+  const configPath = await writeConfig([]);
+  const inline = await runCli(configPath,
+    ['login', '--api', '--name', 'inline@example.com', '--routing=socks5h://alice:s3cret@proxy.example.com:1080', '--no-check'],
+    { stdin: 'sk-ant-test\n' });
+  assert.equal(inline.code, 0, inline.stderr);
+  assert.equal((await readAccounts(configPath))[0].routing, 'socks5h://alice:s3cret@proxy.example.com:1080');
+
+  // Ignoring either of these would add the account on this machine's own
+  // address: the one outcome the flag exists to prevent.
+  for (const tail of [['--routing'], ['--routing', '--no-check'], ['--routing=']]) {
+    const res = await runCli(configPath, ['login', '--api', '--name', 'bare@example.com', ...tail], { stdin: 'sk-ant-test\n' });
+    assert.equal(res.code, 1, `${tail.join(' ')} → ${res.stdout}`);
+    assert.match(res.stderr, /--routing needs a proxy URL/);
+  }
+  assert.equal((await readAccounts(configPath)).length, 1, 'nothing was added by the refused runs');
+});

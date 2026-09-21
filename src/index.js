@@ -833,8 +833,17 @@ async function importCommand() {
  * @returns {import('./account-routing.js').RoutingProxy|null}
  */
 function routingFlagValue() {
-  const raw = argValue('--routing');
-  if (!raw) return null;
+  // Both spellings, and a flag with nothing after it is an error rather than
+  // an absent flag. Every other option here can afford to be ignored when it
+  // is mistyped; this one cannot, because what happens instead is the sign-in
+  // leaving from this machine's own address.
+  const inline = args.find(a => a.startsWith('--routing='));
+  if (inline == null && !args.includes('--routing')) return null;
+  const raw = inline != null ? inline.slice('--routing='.length) : argValue('--routing');
+  if (!raw || raw.startsWith('--')) {
+    console.error('--routing needs a proxy URL, e.g. --routing "socks5h://alice:s3cret@proxy.example.com:1080"');
+    process.exit(1);
+  }
   try {
     return parseRoutingUrl(raw);
   } catch (/** @type {any} */ err) {
