@@ -1955,6 +1955,21 @@ export class TUI {
     }
     } // end non-settings body
 
+    // A body taller than the terminal used to push the footer off the bottom,
+    // and the footer is where a prompt is typed: on a settings screen longer
+    // than the window, the operator typed a value they could not see into a
+    // prompt they could not read. The header and footer now always stay, and
+    // the body between them is a window that follows the cursor row.
+    const HEADER_H = 2;
+    const bodyRoom = H - footerH - HEADER_H;
+    if (lines.length - HEADER_H > bodyRoom) {
+      const body = lines.slice(HEADER_H);
+      const at = Math.max(0, body.findIndex(l => strip(l).includes('▸')));
+      const from = Math.max(0, Math.min(body.length - bodyRoom, at - Math.floor(bodyRoom / 2)));
+      lines.length = HEADER_H;
+      lines.push(...body.slice(from, from + bodyRoom));
+    }
+
     // Pad to fill
     while (lines.length < H - footerH) lines.push('');
 
