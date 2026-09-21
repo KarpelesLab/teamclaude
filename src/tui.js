@@ -848,6 +848,17 @@ export class TUI {
     if (d === '\x03') return this._key('ctrl-c');
     if (d === '\x7f' || d === '\x08') return this._key('bs');
     if (d.length === 1 && d >= ' ') return this._key(d);
+    // A paste arrives as ONE chunk of many characters, which the line above
+    // turns away — so a pasted proxy URL or API key vanished without a sign,
+    // and those are exactly the values nobody types by hand. Only a text
+    // prompt takes it, and never anything holding an escape: that is a key
+    // sequence this parser does not know, not text. Control characters are
+    // dropped, the clipboard's trailing newline among them, so a paste fills
+    // the prompt and the operator still presses Enter on what they can see.
+    if (this.mode === 'input' && d.length > 1 && !d.includes('\x1b')) {
+      this.inputBuf += d.replace(/[\x00-\x1f\x7f]/g, '');
+      this.render();
+    }
   }
 
   _key(k) {

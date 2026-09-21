@@ -170,3 +170,36 @@ test('a blank entry and Esc both leave everything as it was', async () => {
   assert.equal(tui.mode, 'settings');
   assert.equal(saves.length, 0);
 });
+
+// ── pasted input ─────────────────────────────────────────────
+
+test('a pasted URL fills the prompt: stdin hands a paste over as one chunk', async () => {
+  // Nobody types socks5h://user:long-password@host:1080 by hand. The key
+  // parser used to drop any chunk longer than one character without a sign.
+  const { tui, am } = makeTUI();
+  openPicker(tui);
+  tui._key('enter');
+  assert.equal(tui.mode, 'input');
+
+  // The clipboard's trailing newline does not submit on the operator's behalf.
+  tui._onData('socks5h://alice:s3cret@proxy.example.com:1080\n');
+  assert.equal(tui.inputBuf, 'socks5h://alice:s3cret@proxy.example.com:1080');
+  assert.equal(tui.mode, 'input', 'still waiting for Enter');
+
+  tui._onData('\r');
+  await settle();
+  assert.equal(am.accounts[0].routing?.host, 'proxy.example.com');
+});
+
+test('a multi-character chunk is text only inside a prompt, and never when it holds an escape', () => {
+  const { tui } = makeTUI();
+  tui.mode = 'settings';
+  tui._onData('qqq');
+  assert.equal(tui.mode, 'settings', 'outside a prompt a burst is not replayed as keypresses');
+
+  tui._promptInput('Anything', () => {});
+  tui._onData('ab\x1b[Acd');
+  assert.equal(tui.inputBuf, '', 'an unknown key sequence is not text');
+  tui._onData('a\x00b\x07c\x7fd');
+  assert.equal(tui.inputBuf, 'abcd', 'control characters never reach the buffer');
+});
