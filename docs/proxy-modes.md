@@ -120,7 +120,14 @@ teamclaude routing waffles@waffle.com none   # back to the fleet path
   proxy relays ciphertext only, and certificate verification is unchanged.
 - Changes apply live: the CLI command and disk edits both flow through the same
   reload as every other per-account field. The URL shows password-masked in
-  `accounts`, `status`, and the TUI.
+  `accounts`, `status`, the TUI and the dashboard.
+- A new URL is tested first: a tunnel to the account's upstream and a TLS
+  handshake, with no request sent. A proxy that does not answer is refused and
+  nothing is saved (`--no-check` skips the test).
+- A proxy that goes down later takes only its own account out. The request
+  fails over to the next account and the routed one sits out for 30 seconds
+  before its proxy is tried again. See
+  [When the proxy is down](accounts.md#when-the-proxy-is-down).
 
 Typical uses: one account that only answers from a specific region, an account
 served through a jump host the others cannot use, or one seat whose traffic

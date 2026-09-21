@@ -2366,6 +2366,11 @@ contract is that its traffic never leaves by another path). Schemes: http
 (CONNECT), socks4, socks4a, socks5, socks5h — the a/h forms resolve hostnames
 at the proxy; optional user:pass@ auth (SOCKS4 takes a username only). A bare
 host:port is http. Shown masked in 'accounts', status, and the TUI.
+A new URL is tested before it is saved (a tunnel to the account's upstream, no
+request sent); --no-check skips that, and 'routing <name> --check' tests the
+one an account already has. 'login --name <account>' signs a routed account in
+again through the routing it already has. If the proxy goes down, the request
+fails over to the next account and the routed one sits out for 30 seconds.
 
 Egress pin (opt-in, off unless configured). Set "egress": { "pin": "auto" } to
 hold requests whenever the exit IP is not the pinned one — a VPN that dropped
