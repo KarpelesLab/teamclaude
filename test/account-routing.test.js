@@ -111,6 +111,8 @@ test('routingToUrl round-trips and describeRouting masks the password', () => {
   assert.equal(describeRouting(bare), 'http://proxy.example.com:3128');
   assert.equal(routingToUrl(null), null);
   assert.equal(describeRouting(null), null);
+  // A SOCKS4 userid has no password beside it, and the mask must not invent one.
+  assert.equal(describeRouting(parseRoutingUrl('socks4a://alice@proxy.example.com')), 'socks4a://alice@proxy.example.com:1080');
 });
 
 // ── SOCKS mocks ──────────────────────────────────────────────

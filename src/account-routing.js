@@ -175,7 +175,9 @@ export function routingToUrl(routing) {
  */
 export function describeRouting(routing) {
   if (!routing) return null;
-  const auth = routing.username ? `${routing.username}:***@` : '';
+  // `:***` only where there is a password to mask: SOCKS4 has a userid and
+  // nothing else, and a masked password that does not exist misleads.
+  const auth = routing.username ? `${routing.username}${routing.password ? ':***' : ''}@` : '';
   return `${routing.protocol}://${auth}${routing.host}:${routing.port}`;
 }
 
