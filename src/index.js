@@ -43,8 +43,9 @@ import { buildClaudeEnvLines, bypassesAllHosts, clearSelfProxyEnvLines, encodePi
 import { serviceKind, installService, uninstallService, serviceStatus, renderService, logPath } from './service.js';
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
 import { getUpstreamProxy, describeProxy, describeSelfProxy } from './upstream-proxy.js';
-import { parseRoutingUrl, routingToUrl, describeRouting } from './account-routing.js';
+import { parseRoutingUrl, routingToUrl, describeRouting, checkRouting } from './account-routing.js';
 import { proxyFetch } from './upstream-fetch.js';
+import { upstreamFor } from './provider.js';
 import { startEventLoopMonitor } from './event-loop-monitor.js';
 import {
   ConfigOpError,
@@ -91,8 +92,8 @@ const THRESHOLD_USAGE = [
 const DISTRIBUTE_USAGE = 'Usage: teamclaude distribute <on|off|adaptive>';
 
 const ROUTING_USAGE = [
-  'Usage: teamclaude routing <account-name|email>                (show the account\'s routing)',
-  '       teamclaude routing <account-name|email> <url>          (set it)',
+  'Usage: teamclaude routing <account-name|email> [--check]      (show the account\'s routing; --check tests it)',
+  '       teamclaude routing <account-name|email> <url>          (set it; --no-check skips the proxy test)',
   '       teamclaude routing <account-name|email> none           (clear it)',
   '',
   'One account\'s own egress proxy: EVERY connection made for that account —',
@@ -100,7 +101,9 @@ const ROUTING_USAGE = [
   'other account is touched. Schemes: http (CONNECT), socks4, socks4a, socks5,',
   'socks5h; the a/h forms resolve hostnames at the proxy. Optional user:pass@',
   'auth, e.g. socks5h://alice:s3cret@proxy.example.com:1080. A bare host:port',
-  'is http. Changes apply to a running server immediately.',
+  'is http. A new URL is tested first (a tunnel to the account\'s upstream; no',
+  'request is sent) and refused if the proxy does not answer. Changes apply to a',
+  'running server immediately.',
 ].join('\n');
 
 const args = process.argv.slice(2);
@@ -784,11 +787,13 @@ async function importCommand() {
   // First-run entry point: the file has to exist (and the egress proxy be
   // applied) before anything reaches the network. The list is not written back
   // from this copy — upsertOAuthAccount re-reads the file when it saves.
-  await loadOrCreateConfig();
+  const config = await loadOrCreateConfig();
 
   let name = argValue('--name');
   const jsonStr = argValue('--json');
+  // The profile lookup below is already the account's traffic.
   const routing = routingFlagValue();
+  await requireWorkingRouting(routing, upstreamFor({ type: 'oauth' }, config.upstream));
 
   let creds;
   if (jsonStr) {
@@ -853,6 +858,26 @@ function routingFlagValue() {
 }
 
 /**
+ * Exit unless `routing` can reach `upstreamUrl`'s host, before anything is
+ * changed or a browser is opened: an OAuth code is single-use, and finding
+ * out at the token exchange that the proxy password was wrong costs the whole
+ * sign-in. `--no-check` skips it, for a proxy that is not up yet.
+ * @param {import('./account-routing.js').RoutingProxy|null} routing
+ * @param {string} upstreamUrl
+ */
+async function requireWorkingRouting(routing, upstreamUrl) {
+  if (!routing || args.includes('--no-check')) return;
+  const check = await checkRouting(routing, upstreamUrl);
+  if (check.ok) {
+    console.log(`Routing proxy OK: reached ${check.host} through ${describeRouting(routing)} in ${check.ms}ms`);
+    return;
+  }
+  console.error(`Routing proxy check failed: ${check.error}`);
+  console.error('Nothing was changed. Fix the proxy or the URL, or pass --no-check to skip this test.');
+  process.exit(1);
+}
+
+/**
  * `teamclaude login --codex` — browser OAuth against OpenAI, then store the
  * account.
  *
@@ -864,8 +889,9 @@ async function loginCodexCommand() {
   // loadOrCreateConfig, not loadConfig: `login` is a first-run entry point and
   // must work before any config file exists. This copy is not what gets
   // written — see the atomicConfigUpdate below.
-  await loadOrCreateConfig();
+  const loaded = await loadOrCreateConfig();
   const routing = routingFlagValue();
+  await requireWorkingRouting(routing, upstreamFor({ type: 'oauth', provider: 'codex' }, loaded.upstream));
   let creds;
   try {
     creds = await loginCodex({ noBrowser: args.includes('--no-browser'), routing });
@@ -966,9 +992,12 @@ async function loginCommand() {
 }
 
 async function loginApiCommand() {
-  await loadOrCreateConfig(); // first run: create the file; the save re-reads it
+  const loaded = await loadOrCreateConfig(); // first run: create the file; the save re-reads it
   let name = argValue('--name');
+  // The flag alone: an API key is always a NEW entry, so there is no stored
+  // routing for it to borrow.
   const routing = routingFlagValue();
+  await requireWorkingRouting(routing, upstreamFor({ type: 'apikey' }, loaded.upstream));
 
   const rl = createInterface({ input: process.stdin, output: process.stderr });
   const apiKey = await new Promise(resolve => rl.question('Anthropic API key: ', resolve));
@@ -999,9 +1028,10 @@ async function loginApiCommand() {
 }
 
 async function loginOAuthCommand({ pasteOnly = false } = {}) {
-  await loadOrCreateConfig(); // first run: create the file; the save re-reads it
+  const loaded = await loadOrCreateConfig(); // first run: create the file; the save re-reads it
   let name = argValue('--name');
   const routing = routingFlagValue();
+  await requireWorkingRouting(routing, upstreamFor({ type: 'oauth' }, loaded.upstream));
 
   console.log('Starting OAuth login...');
   let creds;
@@ -2105,11 +2135,23 @@ async function routingCommand() {
   // collide with --org.
   const value = args[2] && !args[2].startsWith('--') ? args[2] : null;
 
+  const upstreamUrl = upstreamFor(account, config.upstream);
+
   if (!value) {
     const current = accountRouting(account);
     console.log(current
       ? `${account.name}: ${describeRouting(current)}`
       : `${account.name}: no routing — the account uses the fleet egress (the upstream proxy when configured, direct otherwise)`);
+    // On request only: showing a setting should not need the network.
+    if (current && args.includes('--check')) {
+      const check = await checkRouting(current, upstreamUrl);
+      if (check.ok) {
+        console.log(`Routing proxy OK: reached ${check.host} in ${check.ms}ms`);
+      } else {
+        console.error(`Routing proxy check failed: ${check.error}`);
+        process.exit(1);
+      }
+    }
     return;
   }
 
@@ -2131,6 +2173,9 @@ async function routingCommand() {
     console.error(ROUTING_USAGE);
     process.exit(1);
   }
+  // Before the save, not after: on a running server the change is live at
+  // once, and a mistyped password would take a working account out of rotation.
+  await requireWorkingRouting(routing, upstreamUrl);
   // Canonical form on disk: defaults spelled out, credentials percent-encoded.
   account.routing = routingToUrl(routing);
   await saveConfig(config);
@@ -2212,7 +2257,10 @@ Options:
   --name NAME         Set account name (import/login)
   --routing URL       Per-account egress proxy for the account being added
                       (import/login), e.g. socks5h://alice:s3cret@host:1080 —
-                      every connection for it tunnels through this proxy
+                      every connection for it tunnels through this proxy, the
+                      sign-in included
+  --no-check          Skip the proxy test that --routing and 'routing <url>' run
+                      first (for a proxy that is not up yet)
   --org NAME|UUID     Disambiguate when an email spans multiple orgs (remove/priority/api)
   --from PATH         Credentials path (import, default: ~/.claude/.credentials.json;
                       on macOS the default falls back to the Keychain)
