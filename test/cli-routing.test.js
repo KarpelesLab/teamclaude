@@ -348,3 +348,56 @@ test('login --api --routing refuses a proxy that does not answer, before it asks
   assert.doesNotMatch(res.stderr, /Anthropic API key/, 'it never got as far as the prompt');
   assert.equal((await readAccounts(configPath)).length, 0);
 });
+
+// ── signing an already-routed account in again ───────────────
+
+test('import --name <routed account> leaves through the routing that account already has', async () => {
+  // The mock refuses every CONNECT after recording it, so the profile lookup
+  // for api.anthropic.com is witnessed without reaching the real host. The
+  // lookup then fails, and --name lets the import go ahead without it.
+  const connects = [];
+  const socks = startSocks5(connects, { refuse: true });
+  const socksPort = await listen(socks);
+  try {
+    const stored = `socks5h://127.0.0.1:${socksPort}`;
+    const configPath = await writeConfig([
+      { name: 'routed@example.com', type: 'oauth', accessToken: 'old-token', refreshToken: 'old-refresh', routing: stored },
+    ]);
+    const json = JSON.stringify({ accessToken: 'new-token', refreshToken: 'new-refresh', expiresAt: Date.now() + 3600_000 });
+    const res = await runCli(configPath, ['import', '--json', json, '--name', 'routed@example.com', '--no-check']);
+    assert.equal(res.code, 0, res.stderr + res.stdout);
+    assert.match(res.stdout, new RegExp(`Using the routing stored on "routed@example\\.com": socks5h://127\\.0\\.0\\.1:${socksPort}`));
+    assert.deepEqual(connects, ['api.anthropic.com:443'], 'the profile lookup went to the account\'s proxy, by name (socks5h)');
+
+    const accounts = await readAccounts(configPath);
+    assert.equal(accounts.length, 1);
+    assert.equal(accounts[0].accessToken, 'new-token');
+    assert.equal(accounts[0].routing, stored, 'a borrowed routing is used, not rewritten');
+  } finally {
+    socks.close();
+  }
+});
+
+test('import --name <unrouted account> borrows nothing', async () => {
+  const connects = [];
+  const socks = startSocks5(connects, { refuse: true });
+  const socksPort = await listen(socks);
+  try {
+    // The fleet path is pointed at a port nothing listens on, so the unrouted
+    // profile lookup fails here instead of reaching the real host.
+    const configPath = await writeConfig([
+      { name: 'routed@example.com', type: 'oauth', accessToken: 'a', refreshToken: 'b', routing: `socks5h://127.0.0.1:${socksPort}` },
+    ], { upstreamProxy: `http://127.0.0.1:${await closedPort()}` });
+    // A different name: a new entry, which must not inherit a neighbour's proxy.
+    const json = JSON.stringify({ accessToken: 'new-token', refreshToken: 'new-refresh', expiresAt: Date.now() + 3600_000 });
+    const res = await runCli(configPath, ['import', '--json', json, '--name', 'other@example.com']);
+    assert.equal(res.code, 0, res.stderr + res.stdout);
+    assert.doesNotMatch(res.stdout, /Using the routing stored/);
+    assert.deepEqual(connects, [], 'the routed account\'s proxy saw nothing of it');
+    const other = (await readAccounts(configPath)).find(a => a.name === 'other@example.com');
+    assert.ok(other, 'the new entry was added');
+    assert.equal('routing' in other, false);
+  } finally {
+    socks.close();
+  }
+});

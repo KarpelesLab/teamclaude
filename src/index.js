@@ -792,7 +792,7 @@ async function importCommand() {
   let name = argValue('--name');
   const jsonStr = argValue('--json');
   // The profile lookup below is already the account's traffic.
-  const routing = routingFlagValue();
+  const { routing, store } = loginRouting(config);
   await requireWorkingRouting(routing, upstreamFor({ type: 'oauth' }, config.upstream));
 
   let creds;
@@ -825,7 +825,7 @@ async function importCommand() {
     }
   }
 
-  await upsertOAuthAccount(name, creds, 'import', routing);
+  await upsertOAuthAccount(name, creds, 'import', routing, store);
 }
 
 // ── login ───────────────────────────────────────────────────
@@ -858,6 +858,28 @@ function routingFlagValue() {
 }
 
 /**
+ * The routing a login or import leaves by, and whether to store it.
+ *
+ * `--routing` wins and is written onto the entry. Without it, an account that
+ * `--name` identifies and that already has a routing lends its own: signing
+ * that account in again is that account's traffic. A borrowed routing is used
+ * for the network calls only and never written back — the sign-in may turn out
+ * to be a different identity, and a new entry must not inherit a proxy by
+ * sharing a name.
+ * @param {Record<string, any>} config
+ * @returns {{ routing: import('./account-routing.js').RoutingProxy|null, store: boolean }}
+ */
+function loginRouting(config) {
+  const flagged = routingFlagValue();
+  if (flagged) return { routing: flagged, store: true };
+  const name = argValue('--name');
+  const named = name ? matchAccounts(config.accounts || [], name, argValue('--org')) : [];
+  const stored = named.length === 1 ? accountRouting(named[0]) : null;
+  if (stored) console.log(`Using the routing stored on "${named[0].name}": ${describeRouting(stored)}`);
+  return { routing: stored, store: false };
+}
+
+/**
  * Exit unless `routing` can reach `upstreamUrl`'s host, before anything is
  * changed or a browser is opened: an OAuth code is single-use, and finding
  * out at the token exchange that the proxy password was wrong costs the whole
@@ -878,6 +900,23 @@ async function requireWorkingRouting(routing, upstreamUrl) {
 }
 
 /**
+ * Say so when a sign-in turned out to belong to an account with its own
+ * routing and did not go through it. Which account a sign-in is for is only
+ * known once it has happened, so without --name or --routing this cannot be
+ * prevented, only reported — and the operator who routes an account to keep
+ * its traffic off this machine's address needs to know that it was not.
+ * @param {Record<string, any>} entry  the existing entry the sign-in matched
+ * @param {import('./account-routing.js').RoutingProxy|null} used
+ */
+function noteUnusedRouting(entry, used) {
+  const own = accountRouting(entry);
+  if (!own || used) return;
+  console.log(`Note: "${entry.name}" has its own routing (${describeRouting(own)}), and this sign-in did not use it:`);
+  console.log('      the account was only identified after signing in. Its requests are still routed.');
+  console.log(`      To route the sign-in too, pass: --name "${entry.name}"`);
+}
+
+/**
  * `teamclaude login --codex` — browser OAuth against OpenAI, then store the
  * account.
  *
@@ -890,7 +929,7 @@ async function loginCodexCommand() {
   // must work before any config file exists. This copy is not what gets
   // written — see the atomicConfigUpdate below.
   const loaded = await loadOrCreateConfig();
-  const routing = routingFlagValue();
+  const { routing, store } = loginRouting(loaded);
   await requireWorkingRouting(routing, upstreamFor({ type: 'oauth', provider: 'codex' }, loaded.upstream));
   let creds;
   try {
@@ -925,7 +964,7 @@ async function loginCodexCommand() {
       // Key absent rather than null when --routing was not passed: on a
       // re-login the spread below then keeps the routing the entry already
       // had, instead of silently clearing it.
-      ...(routing ? { routing: routingToUrl(routing) } : {}),
+      ...(routing && store ? { routing: routingToUrl(routing) } : {}),
     };
 
     // Identity for a Codex account is its ChatGPT account id; fall back to the
@@ -939,6 +978,7 @@ async function loginCodexCommand() {
       const prev = config.accounts[idx];
       config.accounts[idx] = { ...prev, ...account, name: prev.name };
       console.log(`Updated account "${prev.name}"`);
+      noteUnusedRouting(prev, routing);
     } else {
       config.accounts.push(account);
       console.log(`Added account "${account.name}"${creds.planType ? ` (${creds.planType})` : ''}`);
@@ -1030,7 +1070,7 @@ async function loginApiCommand() {
 async function loginOAuthCommand({ pasteOnly = false } = {}) {
   const loaded = await loadOrCreateConfig(); // first run: create the file; the save re-reads it
   let name = argValue('--name');
-  const routing = routingFlagValue();
+  const { routing, store } = loginRouting(loaded);
   await requireWorkingRouting(routing, upstreamFor({ type: 'oauth' }, loaded.upstream));
 
   console.log('Starting OAuth login...');
@@ -1046,7 +1086,7 @@ async function loginOAuthCommand({ pasteOnly = false } = {}) {
     process.exit(1);
   }
 
-  await upsertOAuthAccount(name, creds, 'login', routing);
+  await upsertOAuthAccount(name, creds, 'login', routing, store);
 }
 
 // ── env ─────────────────────────────────────────────────────
@@ -2258,7 +2298,8 @@ Options:
   --routing URL       Per-account egress proxy for the account being added
                       (import/login), e.g. socks5h://alice:s3cret@host:1080 —
                       every connection for it tunnels through this proxy, the
-                      sign-in included
+                      sign-in included. Signing in again with --name reuses the
+                      routing the account already has
   --no-check          Skip the proxy test that --routing and 'routing <url>' run
                       first (for a proxy that is not up yet)
   --org NAME|UUID     Disambiguate when an email spans multiple orgs (remove/priority/api)
@@ -2354,12 +2395,14 @@ function orgLabel(a) {
  * @param {string|null} name
  * @param {Record<string, any>} creds
  * @param {string} [source]
- * @param {import('./account-routing.js').RoutingProxy|null} [routing] - the --routing
- * flag, parsed: the new account's own egress proxy. The profile fetch below is
+ * @param {import('./account-routing.js').RoutingProxy|null} [routing] - the
+ * account's own egress proxy (see loginRouting). The profile fetch below is
  * already that account's traffic, so it goes the same way; null leaves every
  * call on the fleet path.
+ * @param {boolean} [storeRouting] - false when `routing` was borrowed from the
+ * existing entry rather than given with --routing: used, never written.
  */
-async function upsertOAuthAccount(name, creds, source = 'unknown', routing = null) {
+async function upsertOAuthAccount(name, creds, source = 'unknown', routing = null, storeRouting = true) {
   // Fetch profile to auto-name and deduplicate by account+org identity.
   const userNamed = !!name;
   const profile = await fetchProfile(creds.accessToken, routing);
@@ -2409,7 +2452,7 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
       // Key absent rather than null when --routing was not passed: on a
       // re-login updateAccountEntry spreads incoming over prev, so the routing
       // the entry already had survives instead of being silently cleared.
-      ...(routing ? { routing: routingToUrl(routing) } : {}),
+      ...(routing && storeRouting ? { routing: routingToUrl(routing) } : {}),
     };
 
     // Deduplicate by account+org identity (same email in a different org is a
@@ -2423,6 +2466,7 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
       const prev = config.accounts[idx];
       config.accounts[idx] = updateAccountEntry(prev, account);
       console.log(`Updated account "${prev.name}"`);
+      noteUnusedRouting(prev, routing);
     } else {
       // New org for this person: if another entry shares the accountUuid, the bare
       // email name would collide — disambiguate both with " (org)".
