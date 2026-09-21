@@ -5,7 +5,7 @@ import tls from 'node:tls';
 import http from 'node:http';
 import https from 'node:https';
 import { generateCertChain } from '../src/x509.js';
-import { parseRoutingUrl, routingToUrl, describeRouting, maskRoutingUrl, connectThroughRouting, routingAgent } from '../src/account-routing.js';
+import { parseRoutingUrl, routingToUrl, describeRouting, maskRoutingUrl, connectThroughRouting, routingAgent, checkRouting } from '../src/account-routing.js';
 import { upstreamFetch, proxyFetch } from '../src/upstream-fetch.js';
 import { setUpstreamProxy, resetUpstreamProxy, resolveUpstreamProxy } from '../src/upstream-proxy.js';
 
@@ -409,6 +409,72 @@ test('TLS is end-to-end through a socks5 tunnel', T, async () => {
     assert.equal(seen.host, 'localhost');
     assert.equal(seen.port, upPort);
   } finally { closeHard(srv); closeHard(upstream); }
+});
+
+// ── checkRouting: the question asked before a routing is saved ──
+
+test('checkRouting completes the TLS handshake through the proxy and sends no request', T, async () => {
+  const { caCertPem, leafCertPem, leafKeyPem } = generateCertChain('localhost');
+  let received = 0;
+  const upstream = tls.createServer({ key: leafKeyPem, cert: leafCertPem }, (s) => {
+    s.on('data', (d) => { received += d.length; });
+    s.on('error', () => {});
+  });
+  const upPort = await listen(upstream);
+  const { srv, seen } = makeSocks5Server({ username: 'alice', password: 's3cret' });
+  const proxyPort = await listen(srv);
+  try {
+    const routing = parseRoutingUrl(`socks5h://alice:s3cret@127.0.0.1:${proxyPort}`);
+    const ok = await checkRouting(routing, `https://localhost:${upPort}/v1/messages`, { tlsOptions: { ca: caCertPem } });
+    assert.equal(ok.ok, true, ok.error);
+    assert.equal(ok.host, `localhost:${upPort}`);
+    assert.ok(Number.isFinite(ok.ms));
+    assert.equal(seen.host, 'localhost', 'the proxy was asked for the upstream by name');
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(received, 0, 'a check is a handshake, never a request');
+
+    // A certificate the machine does not trust is a failed check, not a pass:
+    // that is what a TLS-intercepting proxy looks like from here.
+    const untrusted = await checkRouting(routing, `https://localhost:${upPort}/`);
+    assert.equal(untrusted.ok, false);
+    assert.match(untrusted.error, /certificate|self.signed|unable to verify/i);
+  } finally { closeHard(srv); closeHard(upstream); }
+});
+
+test('checkRouting resolves with a masked reason instead of rejecting', T, async () => {
+  const { srv } = makeSocks5Server({ username: 'alice', password: 's3cret' });
+  const proxyPort = await listen(srv);
+  const origin = jsonOrigin();
+  const originPort = await listen(origin);
+  try {
+    const wrong = await checkRouting(parseRoutingUrl(`socks5://alice:wr0ng@127.0.0.1:${proxyPort}`), `http://127.0.0.1:${originPort}`);
+    assert.equal(wrong.ok, false);
+    assert.equal(wrong.error, `account routing proxy socks5://alice:***@127.0.0.1:${proxyPort}: SOCKS5 authentication failed`);
+
+    const right = await checkRouting(parseRoutingUrl(`socks5://alice:s3cret@127.0.0.1:${proxyPort}`), `http://127.0.0.1:${originPort}`);
+    assert.equal(right.ok, true, right.error);
+  } finally { closeHard(srv); closeHard(origin); }
+});
+
+test('an IPv6 literal target reaches SOCKS as an address and CONNECT in brackets', T, async () => {
+  // URL.hostname hands an IPv6 literal over bracketed. Left that way, SOCKS
+  // would send "[::1]" to DNS as a hostname.
+  const socks = makeSocks5Server();
+  const socksPort = await listen(socks.srv);
+  const connect = makeCountingConnectProxy();
+  const connectPort = await listen(connect.srv);
+  try {
+    await connectThroughRouting(parseRoutingUrl(`socks5://127.0.0.1:${socksPort}`), { targetHost: '[::1]', targetPort: 9, timeout: 3000 })
+      .then((s) => s.destroy(), () => {});
+    assert.equal(socks.seen.atyp, 0x04, 'sent as an IPv6 address, not a domain');
+    assert.equal(socks.seen.host, '0:0:0:0:0:0:0:1');
+
+    // The counting proxy cannot dial this target and never answers; what it
+    // was ASKED for is the whole assertion, so a short wait is enough.
+    await connectThroughRouting(parseRoutingUrl(`http://127.0.0.1:${connectPort}`), { targetHost: '[::1]', targetPort: 9, timeout: 300 })
+      .then((s) => s.destroy(), () => {});
+    assert.deepEqual(connect.seen.targets, ['[::1]:9']);
+  } finally { closeHard(socks.srv); closeHard(connect.srv); }
 });
 
 // ── Precedence: one account's proxy beats the fleet's ────────

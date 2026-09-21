@@ -441,21 +441,56 @@ async function buildSocks4Request({ proxy, targetHost, targetPort, label }) {
  * @returns {Promise<import('node:net').Socket>}
  */
 export function connectThroughRouting(proxy, { targetHost, targetPort, timeout = CONNECT_TIMEOUT_MS, label = 'account routing proxy' }) {
+  // An IPv6 literal arrives bracketed from URL.hostname. CONNECT's authority
+  // form wants the brackets; a SOCKS address field wants the bare address, and
+  // with them on it would be sent to DNS as a hostname.
+  const bare = targetHost.replace(/^\[(.*)\]$/, '$1');
   if (proxy.protocol === 'http') {
     return connectThroughProxy({
       proxyHost: proxy.host,
       proxyPort: proxy.port,
       auth: proxy.username ? `${proxy.username}:${proxy.password ?? ''}` : null,
-      targetHost,
+      targetHost: net.isIP(bare) === 6 ? `[${bare}]` : bare,
       targetPort,
       timeout,
       label,
     });
   }
   if (proxy.protocol === 'socks5' || proxy.protocol === 'socks5h') {
-    return connectThroughSocks5({ proxy, targetHost, targetPort, timeout, label });
+    return connectThroughSocks5({ proxy, targetHost: bare, targetPort, timeout, label });
   }
-  return connectThroughSocks4({ proxy, targetHost, targetPort, timeout, label });
+  return connectThroughSocks4({ proxy, targetHost: bare, targetPort, timeout, label });
+}
+
+/**
+ * Prove a routing works before anything depends on it: tunnel through the
+ * proxy to `url`'s host, complete the TLS handshake when it is https, hang up.
+ * No request is sent, so the only credential that leaves the machine is the
+ * proxy's own. Covers what a routing can get wrong in one go — the proxy's
+ * address, its credentials, whether it will dial the target, and (for the h/a
+ * schemes) whether it can resolve it.
+ *
+ * Resolves either way, never rejects: a check is a question, not an operation.
+ * @param {RoutingProxy} routing
+ * @param {string} url  what the account will be dialling, e.g. its upstream
+ * @param {{ timeout?: number, tlsOptions?: Record<string, any> }} [options]
+ * @returns {Promise<{ ok: boolean, host: string, ms?: number, error?: string }>} `ms` when ok, `error` when not
+ */
+export async function checkRouting(routing, url, { timeout = 10000, tlsOptions = {} } = {}) {
+  const u = new URL(url);
+  const useTls = u.protocol !== 'http:';
+  const label = `account routing proxy ${describeRouting(routing)}`;
+  const started = Date.now();
+  try {
+    const sock = await connectThroughRouting(routing, {
+      targetHost: u.hostname, targetPort: Number(u.port) || (useTls ? 443 : 80), timeout, label,
+    });
+    if (useTls) (await handshakeOverTunnel(sock, { servername: u.hostname, tlsOptions, timeout })).destroy();
+    else sock.destroy();
+    return { ok: true, host: u.host, ms: Date.now() - started };
+  } catch (err) {
+    return { ok: false, host: u.host, error: routingFailure(err, label).message };
+  }
 }
 
 /**
