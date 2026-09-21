@@ -831,26 +831,30 @@ async function importCommand() {
 // ── login ───────────────────────────────────────────────────
 
 /**
- * The --routing flag, parsed: the account's own egress proxy URL
- * (http/socks4/socks4a/socks5/socks5h with optional user:pass auth — see
- * account-routing.js). An invalid value is a hard CLI error: a typo must not
- * quietly add an account that goes direct. Null when the flag is absent.
- * @returns {import('./account-routing.js').RoutingProxy|null}
+ * The --routing flag: the account's own egress proxy URL
+ * (http/socks4/socks4a/socks5/socks5h with optional user:pass auth, see
+ * account-routing.js), or `none` for "no proxy", spelled as `teamclaude
+ * routing <name> none` spells it. An invalid value is a hard CLI error: a typo
+ * must not quietly add an account that goes direct.
+ * @returns {{ given: boolean, routing: import('./account-routing.js').RoutingProxy|null }}
+ * `given` is false when the flag is absent; given with a null routing is `none`.
  */
-function routingFlagValue() {
+function routingFlag() {
   // Both spellings, and a flag with nothing after it is an error rather than
   // an absent flag. Every other option here can afford to be ignored when it
   // is mistyped; this one cannot, because what happens instead is the sign-in
   // leaving from this machine's own address.
   const inline = args.find(a => a.startsWith('--routing='));
-  if (inline == null && !args.includes('--routing')) return null;
+  if (inline == null && !args.includes('--routing')) return { given: false, routing: null };
   const raw = inline != null ? inline.slice('--routing='.length) : argValue('--routing');
   if (!raw || raw.startsWith('--')) {
-    console.error('--routing needs a proxy URL, e.g. --routing "socks5h://alice:s3cret@proxy.example.com:1080"');
+    console.error('--routing needs a proxy URL, e.g. --routing "socks5h://alice:s3cret@proxy.example.com:1080" (or none)');
     process.exit(1);
   }
+  // Before the parse, which would read a bare word as a proxy HOST named "none".
+  if (/^(none|off|-)$/i.test(raw)) return { given: true, routing: null };
   try {
-    return parseRoutingUrl(raw);
+    return { given: true, routing: parseRoutingUrl(raw) };
   } catch (/** @type {any} */ err) {
     console.error(`Invalid --routing value: ${err.message}`);
     process.exit(1);
@@ -860,18 +864,21 @@ function routingFlagValue() {
 /**
  * The routing a login or import leaves by, and whether to store it.
  *
- * `--routing` wins and is written onto the entry. Without it, an account that
- * `--name` identifies and that already has a routing lends its own: signing
- * that account in again is that account's traffic. A borrowed routing is used
- * for the network calls only and never written back: the sign-in may turn out
- * to be a different identity, and a new entry must not inherit a proxy by
- * sharing a name.
+ * `--routing` wins and is written onto the entry, `none` included: that signs
+ * in without a proxy and clears the one the entry had, which is the way out
+ * when a stored proxy is dead and the account needs a new sign-in. Without the
+ * flag, an account that `--name` identifies and that already has a routing
+ * lends its own: signing that account in again is that account's traffic. A
+ * borrowed routing is used for the network calls only and never written back:
+ * the sign-in may turn out to be a different identity, and a new entry must
+ * not inherit a proxy by sharing a name.
  * @param {Record<string, any>} config
  * @returns {{ routing: import('./account-routing.js').RoutingProxy|null, store: boolean }}
+ * `store` with a null routing means "clear it".
  */
 function loginRouting(config) {
-  const flagged = routingFlagValue();
-  if (flagged) return { routing: flagged, store: true };
+  const flag = routingFlag();
+  if (flag.given) return { routing: flag.routing, store: true };
   const name = argValue('--name');
   const named = name ? matchAccounts(config.accounts || [], name, argValue('--org')) : [];
   const stored = named.length === 1 ? accountRouting(named[0]) : null;
@@ -977,8 +984,9 @@ async function loginCodexCommand() {
     if (idx >= 0) {
       const prev = config.accounts[idx];
       config.accounts[idx] = { ...prev, ...account, name: prev.name };
+      if (store && !routing) delete config.accounts[idx].routing; // --routing none
       console.log(`Updated account "${prev.name}"`);
-      noteUnusedRouting(prev, routing);
+      if (!store) noteUnusedRouting(prev, routing);
     } else {
       config.accounts.push(account);
       console.log(`Added account "${account.name}"${creds.planType ? ` (${creds.planType})` : ''}`);
@@ -1035,8 +1043,8 @@ async function loginApiCommand() {
   const loaded = await loadOrCreateConfig(); // first run: create the file; the save re-reads it
   let name = argValue('--name');
   // The flag alone: an API key is always a NEW entry, so there is no stored
-  // routing for it to borrow.
-  const routing = routingFlagValue();
+  // routing for it to borrow (and `none` is what it gets without the flag).
+  const { routing } = routingFlag();
   await requireWorkingRouting(routing, upstreamFor({ type: 'apikey' }, loaded.upstream));
 
   const rl = createInterface({ input: process.stdin, output: process.stderr });
@@ -2299,7 +2307,8 @@ Options:
                       (import/login), e.g. socks5h://alice:s3cret@host:1080 —
                       every connection for it tunnels through this proxy, the
                       sign-in included. Signing in again with --name reuses the
-                      routing the account already has
+                      routing the account already has; --routing none signs in
+                      without a proxy and clears it
   --no-check          Skip the proxy test that --routing and 'routing <url>' run
                       first (for a proxy that is not up yet)
   --org NAME|UUID     Disambiguate when an email spans multiple orgs (remove/priority/api)
@@ -2405,9 +2414,10 @@ function orgLabel(a) {
  * already that account's traffic, so it goes the same way; null leaves every
  * call on the fleet path.
  * @param {boolean} [storeRouting] - false when `routing` was borrowed from the
- * existing entry rather than given with --routing: used, never written.
+ * existing entry rather than given with --routing: used, never written. True
+ * with a null `routing` is `--routing none`: the entry's routing is cleared.
  */
-async function upsertOAuthAccount(name, creds, source = 'unknown', routing = null, storeRouting = true) {
+async function upsertOAuthAccount(name, creds, source = 'unknown', routing = null, storeRouting = false) {
   // Fetch profile to auto-name and deduplicate by account+org identity.
   const userNamed = !!name;
   const profile = await fetchProfile(creds.accessToken, routing);
@@ -2470,8 +2480,9 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
       // display name, entry id, and any disk-only fields (e.g. importFrom).
       const prev = config.accounts[idx];
       config.accounts[idx] = updateAccountEntry(prev, account);
+      if (storeRouting && !routing) delete config.accounts[idx].routing; // --routing none
       console.log(`Updated account "${prev.name}"`);
-      noteUnusedRouting(prev, routing);
+      if (!storeRouting) noteUnusedRouting(prev, routing);
     } else {
       // New org for this person: if another entry shares the accountUuid, the bare
       // email name would collide — disambiguate both with " (org)".

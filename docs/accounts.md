@@ -143,6 +143,8 @@ For an OAuth login this is what saves the sign-in. The authorisation code works 
 
 `teamclaude login --name "waffles@waffle.com"` reuses the routing that account already has, so a re-login leaves through the same proxy without the URL being typed again. The stored value is only borrowed for the sign-in and is left as it was.
 
+If that proxy is dead and the account needs a new sign-in now, add `--routing none`. That signs in without a proxy and clears the stored routing, the same way `teamclaude routing <name> none` does.
+
 Without `--name`, TeamClaude cannot know which account a sign-in belongs to until it is over. If it turns out to be a routed account, the command says that the sign-in went out unrouted and how to route the next one.
 
 ### When the proxy is down

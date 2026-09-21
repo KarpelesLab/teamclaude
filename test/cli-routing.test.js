@@ -401,3 +401,32 @@ test('import --name <unrouted account> borrows nothing', async () => {
     socks.close();
   }
 });
+
+test('--routing none signs in without a proxy and clears the one the entry had', async () => {
+  // The way out when a stored proxy is dead and the account needs a new
+  // sign-in. Read before the URL parse, which takes a bare word for a proxy
+  // HOST: `none` would otherwise become http://none:8080.
+  const connects = [];
+  const socks = startSocks5(connects, { refuse: true });
+  const socksPort = await listen(socks);
+  try {
+    const configPath = await writeConfig([
+      { name: 'routed@example.com', type: 'oauth', accessToken: 'old-token', refreshToken: 'old-refresh', routing: `socks5h://127.0.0.1:${socksPort}` },
+    ], { upstreamProxy: `http://127.0.0.1:${await closedPort()}` });
+    const json = JSON.stringify({ accessToken: 'new-token', refreshToken: 'new-refresh', expiresAt: Date.now() + 3600_000 });
+    const res = await runCli(configPath, ['import', '--json', json, '--name', 'routed@example.com', '--routing', 'none']);
+    assert.equal(res.code, 0, res.stderr + res.stdout);
+    assert.doesNotMatch(res.stdout, /Using the routing stored/);
+    assert.deepEqual(connects, [], 'the stored proxy was not used');
+    const [acct] = await readAccounts(configPath);
+    assert.equal(acct.accessToken, 'new-token');
+    assert.equal('routing' in acct, false, 'cleared, and the key is gone rather than null');
+  } finally {
+    socks.close();
+  }
+
+  const fresh = await writeConfig([]);
+  const added = await runCli(fresh, ['login', '--api', '--name', 'plain@example.com', '--routing=none'], { stdin: 'sk-ant-test\n' });
+  assert.equal(added.code, 0, added.stderr);
+  assert.equal('routing' in (await readAccounts(fresh))[0], false, 'not a proxy named "none"');
+});
