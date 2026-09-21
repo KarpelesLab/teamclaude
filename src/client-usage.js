@@ -36,6 +36,33 @@ export const USAGE_DIMENSION_VALUE_MAX_LENGTH = 200;
 // also could not be typed by an operator reading the docs.
 export const OVERFLOW_KEY = '(other)';
 
+// Windowed usage.
+//
+// The counters above are lifetime: they answer "how much has this client ever
+// spent" and cannot answer "how much in the last day", because nothing records
+// WHEN a token was spent. A per-slot tally does, at a bounded cost. Traffic
+// lands in the 15-minute slot it arrived in, and a slot that has fallen out of
+// the longest window is deleted rather than kept, so the cost is set by the
+// window and not by uptime. Slots are sparse — a key seen twice a day holds two
+// of them, not ninety-six — which is what keeps this affordable for a dimension
+// tracker holding up to `maxKeys` distinct values.
+export const USAGE_SLOT_MS = 15 * 60 * 1000;
+
+// The windows rolled up for readers, shortest first. `5h` is the shared quota
+// window, so it says what is being spent against the bucket that gates the next
+// request; `24h` is the day-scale question an operator actually asks. A 7-day
+// rolling window is deliberately absent: the weekly quota is a bucket with a
+// reset instant, not a rolling window, so the honest weekly number is "since
+// the reset" and would be a baseline, not a tally like this one.
+export const USAGE_WINDOWS = { '5h': 5 * 60 * 60 * 1000, '24h': 24 * 60 * 60 * 1000 };
+
+// Retention is the longest window plus one slot. A window's start falls inside
+// a slot rather than on its edge, so that oldest slot is only partly covered:
+// keeping it overstates the window by less than one slot, dropping it would
+// understate it by the same amount, and overstating is the safer of the two for
+// a number an operator reads to decide whether they are near a limit.
+const RETAINED_SLOTS = Math.ceil(Math.max(...Object.values(USAGE_WINDOWS)) / USAGE_SLOT_MS) + 1;
+
 const RESERVED_CUSTOM_HEADER_NAMES = new Set([
   'authorization',
   'proxy-authorization',
@@ -57,7 +84,9 @@ export class ClientUsageTracker {
   // set only for the header-derived dimension trackers, whose values come from
   // callers and are therefore unbounded.
   constructor({ now = () => Date.now(), maxKeys = Infinity } = {}) {
-    this.clients = new Map(); // name → { requests, connections, inputTokens, outputTokens, lastUsed(ms) }
+    // name → { requests, connections, inputTokens, outputTokens, lastUsed(ms),
+    //          slots: Map<slotNumber, { requests, connections, inputTokens, outputTokens }> }
+    this.clients = new Map();
     this._now = now;
     this.maxKeys = maxKeys;
   }
@@ -66,7 +95,7 @@ export class ClientUsageTracker {
     let c = this.clients.get(name);
     if (!c) {
       if (this.clients.size >= this.maxKeys && name !== OVERFLOW_KEY) return this._ensure(OVERFLOW_KEY);
-      c = { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0, lastUsed: null };
+      c = { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0, lastUsed: null, slots: new Map() };
       this.clients.set(name, c);
     }
     return c;
@@ -81,25 +110,123 @@ export class ClientUsageTracker {
     c.inputTokens += inputTokens;
     c.outputTokens += outputTokens;
     c.lastUsed = this._now();
+    const slot = this._slotFor(c, Math.floor(c.lastUsed / USAGE_SLOT_MS));
+    slot.requests += requests;
+    slot.connections += connections;
+    slot.inputTokens += inputTokens;
+    slot.outputTokens += outputTokens;
   }
 
   /**
-   * Plain-object snapshot for the state file and /teamclaude/status
-   * (lastUsed as ISO string, matching how the status endpoint reports times).
+   * Drop every slot now outside retention. Runs both when a key opens a new
+   * slot and when a key is read out, and needs both: eviction on write alone
+   * never runs for a key that has stopped recording, and a dimension keyed on
+   * something like a git ref is mostly keys that went silent for good. Those
+   * would hold their slots for as long as the process ran, making the cost a
+   * function of every distinct key seen since the last restart rather than of
+   * the window. So a read prunes too — unusual, but the slots it drops are
+   * outside every window and can never be reported again, and the alternative
+   * is a timer this file does not have.
+   */
+  _evict(c, now) {
+    const cutoff = Math.floor(now / USAGE_SLOT_MS) - RETAINED_SLOTS;
+    // Deleting during iteration is defined for a Map: an entry removed before
+    // it is reached is simply never visited.
+    for (const slot of c.slots.keys()) if (slot <= cutoff) c.slots.delete(slot);
+  }
+
+  /** The tally for `slot`, created on first use. */
+  _slotFor(c, slot) {
+    let tally = c.slots.get(slot);
+    if (!tally) {
+      c.slots.set(slot, tally = { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0 });
+      this._evict(c, this._now());
+    }
+    return tally;
+  }
+
+  /**
+   * One client's counters rolled up per window in USAGE_WINDOWS. A window
+   * covers its own length plus at most one slot — see RETAINED_SLOTS. Every
+   * window is present here, zeros included; whether the set is reported at all
+   * is export()'s decision, not this one's.
+   */
+  _windows(c, now) {
+    const out = {};
+    // Cutoffs first, then ONE walk of the slots: this runs per key on every
+    // status poll, and the fastest poller in the tree asks once a second.
+    const cutoffs = [];
+    for (const [label, span] of Object.entries(USAGE_WINDOWS)) {
+      out[label] = { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0 };
+      cutoffs.push([Math.floor((now - span) / USAGE_SLOT_MS), out[label]]);
+    }
+    for (const [slot, t] of c.slots) {
+      for (const [from, sum] of cutoffs) {
+        if (slot < from) continue;
+        sum.requests += t.requests;
+        sum.connections += t.connections;
+        sum.inputTokens += t.inputTokens;
+        sum.outputTokens += t.outputTokens;
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Plain-object snapshot for /teamclaude/status and the dashboard (lastUsed as
+   * ISO string, matching how the status endpoint reports times), carrying the
+   * rolled-up windows rather than the slots they were summed from: a reader
+   * wants two figures per client, and the tally behind them is up to a hundred
+   * rows that the dashboard would have to re-sum on every poll.
    */
   export() {
+    const now = this._now();
+    return this._snapshot(now, c => {
+      const windows = this._windows(c, now);
+      // Omitted entirely for a key with nothing in any window, rather than
+      // shipped as rows of zeros. The windows nest — the shortest is contained
+      // in the longest — so "empty" is unambiguous: no traffic in the longest
+      // one. On a dimension carrying a value per git ref, most keys are old
+      // branches that are silent for good, and they were the bulk of the
+      // payload. A reader that finds no `windows` reads zero for every window,
+      // which is what the absence means.
+      return Object.values(windows).some(w => w.requests || w.connections || w.inputTokens || w.outputTokens)
+        ? { windows }
+        : {};
+    });
+  }
+
+  /**
+   * Snapshot for the state file. Carries the slots instead of the windows, so a
+   * restart resumes the windows rather than restarting them — an upgrade is
+   * exactly when someone looks at the dashboard, and a 24h figure that reads
+   * zero after every deploy is worse than not offering one.
+   */
+  exportState() {
+    // An empty `slots` is left out for the same reason `export()` leaves out an
+    // empty `windows`: at the key cap the stale rows are most of them.
+    return this._snapshot(this._now(), c => (c.slots.size ? { slots: Object.fromEntries(c.slots) } : {}));
+  }
+
+  // `now` is passed in rather than read here, so that a caller which also uses
+  // it — export() rolls the windows up against it — cannot have eviction run
+  // against a second, later instant. Two reads straddling a slot boundary would
+  // evict exactly the oldest slot the rollup still reads.
+  _snapshot(now, extra) {
     // Built on a null prototype and copied out with fromEntries, so a name like
     // `__proto__` lands as an own key of a plain object instead of on its
     // prototype (names are operator-configured, but the cost of getting this
     // wrong is silent loss of the row).
     const out = Object.create(null);
     for (const [name, c] of this.clients) {
+      this._evict(c, now);
       out[name] = {
         requests: c.requests,
         connections: c.connections,
         inputTokens: c.inputTokens,
         outputTokens: c.outputTokens,
         lastUsed: c.lastUsed ? new Date(c.lastUsed).toISOString() : null,
+        ...extra(c),
       };
     }
     return Object.fromEntries(Object.entries(out));
@@ -123,6 +250,34 @@ export class ClientUsageTracker {
       c.outputTokens += Number(s.outputTokens) || 0;
       const t = s.lastUsed ? Date.parse(s.lastUsed) : NaN;
       if (!Number.isNaN(t) && (c.lastUsed == null || t > c.lastUsed)) c.lastUsed = t;
+      this._restoreSlots(c, s.slots);
+    }
+  }
+
+  /**
+   * Slots from a saved snapshot, added onto whatever is already tallied for the
+   * same slot. Anything already outside retention is dropped here rather than
+   * left for the next write: a proxy that was down for a week would otherwise
+   * restore a full set of dead slots and report them as current until its next
+   * request. A snapshot from a build that did not keep slots simply has none,
+   * and the windows then fill from live traffic.
+   */
+  _restoreSlots(c, saved) {
+    if (!saved || typeof saved !== 'object') return;
+    const current = Math.floor(this._now() / USAGE_SLOT_MS);
+    const oldest = current - RETAINED_SLOTS;
+    for (const [key, t] of Object.entries(saved)) {
+      const slot = Number(key);
+      // Bounded at BOTH ends. A slot ahead of the clock cannot be a real
+      // observation of the past — it is a snapshot written before the clock
+      // moved backwards — and admitting one would leave it counting in every
+      // window until the clock caught up with it.
+      if (!Number.isInteger(slot) || slot <= oldest || slot > current || !t || typeof t !== 'object') continue;
+      const tally = this._slotFor(c, slot);
+      tally.requests += Number(t.requests) || 0;
+      tally.connections += Number(t.connections) || 0;
+      tally.inputTokens += Number(t.inputTokens) || 0;
+      tally.outputTokens += Number(t.outputTokens) || 0;
     }
   }
 }
@@ -166,12 +321,21 @@ export class UsageDimensionTracker {
   }
 
   export() {
+    return this._snapshot(tracker => tracker.export());
+  }
+
+  /** The state-file form, carrying slots. See ClientUsageTracker.exportState(). */
+  exportState() {
+    return this._snapshot(tracker => tracker.exportState());
+  }
+
+  _snapshot(pick) {
     // Null prototype for the same reason ClientUsageTracker.export() uses one:
     // a dimension named `__proto__` must land as an own key, not silently
     // vanish onto the prototype.
     const out = Object.create(null);
     for (const [name, tracker] of this._dimensions) {
-      const entries = tracker.export();
+      const entries = pick(tracker);
       if (Object.keys(entries).length) out[name] = entries;
     }
     return Object.fromEntries(Object.entries(out));
