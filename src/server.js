@@ -2696,13 +2696,23 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // sx.org failover: 429s are IP-based, so retry via the proxy's egress IP.
       // 'always' is already on sx; '429' switches direct→sx now and skips the
       // wait (a fresh IP isn't throttled). Also arm the sticky window for MITM.
-      const nextUseSx = !!(sx?.useOn429());
+      //
+      // None of which holds for an account with its own routing. It leaves
+      // through its own proxy on every attempt (upstreamFetch ranks `routing`
+      // above sx), so this 429 was earned by ITS exit address and says nothing
+      // about the host's: an "sx retry" would re-send at once, with no wait,
+      // through the very proxy that was just refused, and arming the sticky
+      // window would push every other account onto metered sx.org over a
+      // limit none of them share. `route` is carried forward unchanged, since
+      // a later attempt may land on an account that does use sx.
+      const routed = !!account.routing;
+      const nextUseSx = routed ? route : !!(sx?.useOn429());
       const switchingToSx = nextUseSx && !route;
       // The sticky window routes every new MITM tunnel through sx.org for a
       // while, which is metered. A request-scoped 429 is not an IP limit, so it
       // does not arm it; the one-shot sx retry below still runs, in case an
       // IP-scoped limit ever presents without headers.
-      if (!requestScoped) sx?.noteRateLimited(retryAfter);
+      if (!requestScoped && !routed) sx?.noteRateLimited(retryAfter);
 
       // This is a rate-limit 429 (per-minute throttle), NOT quota exhaustion —
       // quota rejection is handled above and is the only thing that rotates.
@@ -2754,6 +2764,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         );
         if (alt && !accountManager.isPaused(alt.index)) {
           ctx.rateLimitHopped = true;
+          // Whether the two accounts leave from one address: what the
+          // "IP-scoped" reading of a second 429 below rests on.
+          ctx.rateLimitHopSharedExit = !routed && !alt.routing;
           ctx.hopTo = alt.index;
           ctx.tried.add(account.index);
           console.log(`[TeamClaude] Rate-limit 429 on "${account.name}" — failing over once to idle account "${alt.name}"`);
@@ -2810,8 +2823,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         // Second 429 this request, on a different account. Say so once: the
         // operator chasing "why is my fleet throttled" is looking for exactly
         // this, and it points at the egress IP rather than at the accounts.
-        console.log('[TeamClaude] Second account rate-limited too — the limit looks IP-scoped, not per-account'
-          + (sx?.useOn429() ? '' : ' (sx.org mode "429" would retry from a fresh egress IP)'));
+        console.log(ctx.rateLimitHopSharedExit
+          ? '[TeamClaude] Second account rate-limited too — the limit looks IP-scoped, not per-account'
+            + (sx?.useOn429() ? '' : ' (sx.org mode "429" would retry from a fresh egress IP)')
+          // Per-account routing gave the two different exits, so one address
+          // being limited is the one thing this cannot be.
+          : '[TeamClaude] Second account rate-limited too — they leave through different exits (per-account routing), so this is not one IP-scoped limit');
       }
 
       // sx fresh-IP retry (still the same account) takes precedence over waiting.
