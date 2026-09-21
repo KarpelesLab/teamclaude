@@ -114,6 +114,16 @@ test('thresholdBadgeText names a bucket the account default moves off the fleet 
   assert.equal(thresholdBadgeText(1.0, 0.98, fleetTable), 'switch at 100%');
 });
 
+test('accountBadges names a routed account\'s proxy as the status payload masks it, and stays silent otherwise', () => {
+  const routed = accountBadges({ name: 'a', type: 'oauth', routing: 'socks5h://alice:***@proxy.example.com:1080' }, null, null);
+  assert.deepEqual(routed.find(b => b.cls === 'meta routing'), { cls: 'meta routing', text: 'via socks5h://alice:***@proxy.example.com:1080' });
+  assert.equal(accountBadges({ name: 'a', type: 'oauth' }, null, null).some(b => /routing/.test(b.cls)), false);
+  // The payload is masked at the source. A parsed object would mean the live
+  // account leaked into it, password and all: draw nothing rather than that.
+  const leaked = accountBadges({ name: 'a', type: 'oauth', routing: { host: 'h', password: 'p' } }, null, null);
+  assert.equal(leaked.some(b => /routing/.test(b.cls)), false);
+});
+
 test('accountBadges adds the threshold badge only when it differs from the fleet', () => {
   const withFleet = accountBadges({ name: 'a', type: 'oauth', switchThreshold: 1.0 }, null, null, null, 0.98, null);
   assert.deepEqual(withFleet[withFleet.length - 1], { cls: 'meta threshold', text: 'switch at 100%' });
