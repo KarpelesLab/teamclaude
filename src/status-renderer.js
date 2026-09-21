@@ -144,6 +144,7 @@ export const UNAVAILABLE_TEXT = {
   capped: 'account usage cap reached (maxUsage)',
   'advisor-capped': "advisor model's usage cap reached (maxUsage)",
   entitlement: 'upstream refused this account for the organization (cooldown)',
+  routing: "the account's routing proxy is unreachable (cooldown)",
   route: 'no route allows this account',
   'advisor-quota': "advisor model's weekly bucket spent",
   'advisor-route': 'no route allows the advisor model',
@@ -517,6 +518,11 @@ function formatAccountStatus(account, now, paint) {
   const entitlementAt = parseTs(account.entitlementDeniedUntil);
   if (entitlementAt && entitlementAt > now) {
     parts.push(paint.yellow(`entitlement cooldown ${formatDuration(entitlementAt - now)}`));
+  }
+
+  const routingAt = parseTs(account.routingFailedUntil);
+  if (routingAt && routingAt > now) {
+    parts.push(paint.yellow(`routing proxy down, retry in ${formatDuration(routingAt - now)}`));
   }
 
   return parts.join(' / ');

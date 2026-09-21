@@ -124,7 +124,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     // disk edit or a `teamclaude routing` change takes effect on the very next
     // request without a restart. Through the constructor's own parse, so a bad
     // URL is refused and reported here as it would be at startup.
-    mgr.routing = accountRouting(diskAcct);
+    accountManager.setRouting(mgr.index, accountRouting(diskAcct));
     // Third-party-backend bindings are read per request off this object
     // (`account.upstream || upstream`, `account.modelMap` in server.js), so a
     // disk edit must land here to take effect on reload. `|| null` mirrors the

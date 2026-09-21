@@ -36,6 +36,17 @@ const CONNECT_TIMEOUT_MS = 30000; // same budget as the CONNECT tunnel
 
 export const ROUTING_SCHEMES = ['http', 'socks4', 'socks4a', 'socks5', 'socks5h'];
 
+// The code on every failure to OPEN a connection through an account's routing:
+// the proxy refused, hung up, rejected the credentials, could not reach the
+// target, or the TLS handshake over the tunnel never completed. It names the
+// one case the forward path cannot read off the socket error underneath
+// (kept on `cause`): an ECONNREFUSED from the upstream host is the same for
+// every account, so failing over is pointless, but an ECONNREFUSED from ONE
+// account's proxy says nothing about the others, so failing over is the fix.
+// Nothing of the request has been sent when it is raised, so a retry elsewhere
+// can never duplicate a request upstream.
+export const ROUTING_FAILED = 'TEAMCLAUDE_ROUTING_FAILED';
+
 /**
  * @typedef {Object} RoutingProxy
  * @property {string} protocol  One of ROUTING_SCHEMES.
@@ -462,13 +473,17 @@ export function connectThroughRouting(proxy, { targetHost, targetPort, timeout =
  * @returns {http.Agent | https.Agent}
  */
 export function routingAgent(routing, { targetHost, targetPort, tls: useTls = true, tlsOptions = {} }) {
-  const proxy = typeof routing === 'string' ? parseRoutingUrl(routing) : routing;
+  const proxy = /** @type {RoutingProxy} */ (typeof routing === 'string' ? parseRoutingUrl(routing) : routing);
+  // Names WHICH proxy in every failure: a fleet may hold several, and "SOCKS5
+  // authentication failed" alone sends the operator to the wrong one.
+  const label = `account routing proxy ${describeRouting(proxy)}`;
   const agent = new (useTls ? https : http).Agent({ keepAlive: false });
   agent.createConnection = (
     /** @type {import('node:http').ClientRequestArgs} */ _options,
     /** @type {(err: Error | null, sock: import('node:stream').Duplex) => void} */ cb,
   ) => {
-    connectThroughRouting(/** @type {RoutingProxy} */ (proxy), { targetHost, targetPort })
+    const failed = (/** @type {any} */ err) => cb(routingFailure(err, label), /** @type {any} */ (null));
+    connectThroughRouting(proxy, { targetHost, targetPort, label })
       .then((sock) => {
         if (!useTls) {
           // The tunnel pauses the socket so a TLS layer sees every byte. On the
@@ -479,10 +494,38 @@ export function routingAgent(routing, { targetHost, targetPort, tls: useTls = tr
           return;
         }
         handshakeOverTunnel(sock, { servername: targetHost, tlsOptions })
-          .then((tlsSock) => cb(null, tlsSock), (err) => cb(err, /** @type {any} */ (null)));
+          .then((tlsSock) => cb(null, tlsSock), failed);
       })
-      .catch((err) => cb(err, /** @type {any} */ (null)));
+      .catch(failed);
     return undefined; // socket is delivered asynchronously through cb
   };
   return agent;
+}
+
+/**
+ * Wrap a connection failure as ROUTING_FAILED. The original stays on `cause`
+ * with its own code, for the log and for anything that wants the socket-level
+ * reason.
+ * @param {any} err
+ * @param {string} label
+ * @returns {import('./types.js').CodedError}
+ */
+function routingFailure(err, label) {
+  // Happy-eyeballs reports an all-addresses-failed connect as an AggregateError
+  // with an empty message and one reason per address.
+  const reason = (Array.isArray(err?.errors) && err.errors.length
+    ? err.errors.map((/** @type {any} */ e) => e?.message).filter(Boolean).join('; ')
+    : '') || err?.message || String(err);
+  const wrapped = /** @type {import('./types.js').CodedError} */ (
+    new Error(reason.startsWith(label) ? reason : `${label}: ${reason}`, { cause: err }));
+  wrapped.code = ROUTING_FAILED;
+  return wrapped;
+}
+
+/** Whether a failure is (or wraps) a ROUTING_FAILED.
+ * @param {any} err
+ * @returns {boolean}
+ */
+export function isRoutingFailure(err) {
+  return err?.code === ROUTING_FAILED || err?.cause?.code === ROUTING_FAILED;
 }

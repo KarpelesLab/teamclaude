@@ -324,7 +324,7 @@ const WRITE_TOOLS = [
         }
       }
       return changeAccount(ctx, args, (index, entry) => {
-        ctx.accountManager.accounts[index].routing = routing;
+        ctx.accountManager.setRouting(index, routing);
         // Null, not a deleted key: the save merges over the on-disk entry, and
         // a missing key leaves a stale `routing` standing (the same reason
         // set_account_enabled writes an explicit boolean).
