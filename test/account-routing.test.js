@@ -61,6 +61,13 @@ test('parseRoutingUrl refuses unusable input with a named reason', () => {
   assert.throws(() => parseRoutingUrl('not a url at all:8bad'), /invalid routing URL|invalid port/);
 });
 
+test('parseRoutingUrl reads none and off as no routing, not as a proxy host', () => {
+  for (const value of ['none', 'None', ' off ', 'OFF']) assert.equal(parseRoutingUrl(value), null, value);
+  // A real single-label host still parses: only the two words are reserved.
+  assert.equal(parseRoutingUrl('localhost').host, 'localhost');
+  assert.equal(parseRoutingUrl('socks5://none:1080').host, 'none', 'with a scheme it is a host, as written');
+});
+
 test('a refused routing URL never echoes its password', () => {
   // These messages reach the server log (a bad config value is reported at
   // startup and on every reload), so each refusal is checked, not just one.

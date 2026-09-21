@@ -72,6 +72,11 @@ export function parseRoutingUrl(value) {
   if (!value || typeof value !== 'string') return null;
   const raw = value.trim();
   if (!raw) return null;
+  // `none` is how the CLI, the TUI and the MCP tool all spell "no routing", so
+  // it is what a hand edit of the config will write too. Read as a URL it
+  // would be a proxy HOST named "none", and the account would fail every
+  // request it was given.
+  if (/^(none|off)$/i.test(raw)) return null;
   // What the error text echoes. These messages reach the server log (a bad
   // value in the config is reported at startup and on every reload) and the
   // MCP reply, and the value holds the proxy password.
