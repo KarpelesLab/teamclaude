@@ -849,7 +849,7 @@ export class TUI {
     if (d === '\x7f' || d === '\x08') return this._key('bs');
     if (d.length === 1 && d >= ' ') return this._key(d);
     // A paste arrives as ONE chunk of many characters, which the line above
-    // turns away — so a pasted proxy URL or API key vanished without a sign,
+    // turns away, so a pasted proxy URL or API key vanished without a sign,
     // and those are exactly the values nobody types by hand. Only a text
     // prompt takes it, and never anything holding an escape: that is a key
     // sequence this parser does not know, not text. Control characters are
@@ -1459,7 +1459,7 @@ export class TUI {
     catch (/** @type {any} */ e) { this._addLog(`Failed to save: ${e.message}`); }
     this._addLog(routing
       ? `"${safeLine(acct.name, 64)}" now leaves through ${describeRouting(routing)}`
-      : `Cleared the proxy for "${safeLine(acct.name, 64)}" — it uses the fleet egress`);
+      : `Cleared the proxy for "${safeLine(acct.name, 64)}"; it uses the fleet egress`);
     if (this.running) this.render();
   }
 

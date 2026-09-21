@@ -2068,7 +2068,7 @@ export function isTransientUpstreamError(err, { otherHostAvailable = false } = {
   // the opposite: an ECONNREFUSED is "the same for every account" only when it
   // comes from the host they all dial. From one account's proxy it describes
   // that account alone, the next account leaves by another path, and nothing
-  // of the request has been sent — so failing over is both safe and the fix.
+  // of the request has been sent, so failing over is both safe and the fix.
   // Closing for the client to retry would hand the retry to the same account.
   if (isRoutingFailure(err)) return false;
   if (err.name === 'TimeoutError' || err.name === 'AbortError') return true;
@@ -2860,7 +2860,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
             + (sx?.useOn429() ? '' : ' (sx.org mode "429" would retry from a fresh egress IP)')
           // Per-account routing gave the two different exits, so one address
           // being limited is the one thing this cannot be.
-          : '[TeamClaude] Second account rate-limited too — they leave through different exits (per-account routing), so this is not one IP-scoped limit');
+          : '[TeamClaude] Second account rate-limited too. They leave through different exits (per-account routing), so this is not one IP-scoped limit');
       }
 
       // sx fresh-IP retry (still the same account) takes precedence over waiting.
@@ -3109,7 +3109,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     else if (overloaded) console.error(`[TeamClaude] Upstream admission queue full (${describeConnectError(err)}) — 503 to the client, no account rotation`);
     else if (routingFailed) {
       const until = accountManager.markRoutingFailed(account.index);
-      const hold = until ? ` — out of rotation for ${Math.max(1, Math.round((until - Date.now()) / 1000))}s` : '';
+      const hold = until ? `; out of rotation for ${Math.max(1, Math.round((until - Date.now()) / 1000))}s` : '';
       // err.message, not describeConnectError: that prefers the cause, which
       // is the bare socket error and does not say a routing proxy was involved.
       console.error(`[TeamClaude] Routing proxy failed for account "${safeLine(account.name, 64)}" (${describeRouting(account.routing) || 'routing'}): ${safeLine(err instanceof Error ? err.message : String(err), 300)}${hold}`);

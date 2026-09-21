@@ -5,8 +5,8 @@ import { AccountManager } from '../src/account-manager.js';
 
 // The frame is header + body + footer, and the footer is where a prompt is
 // typed. A body taller than the terminal used to push the footer off the
-// bottom: on the settings screen — the tallest one, and the one every prompt
-// returns to — the operator typed a value they could not see. These pin the
+// bottom. On the settings screen (the tallest one, and the one every prompt
+// returns to) the operator typed a value they could not see. These pin the
 // fix: the footer is always on the last line, and the body window follows the
 // cursor row.
 

@@ -863,7 +863,7 @@ function routingFlagValue() {
  * `--routing` wins and is written onto the entry. Without it, an account that
  * `--name` identifies and that already has a routing lends its own: signing
  * that account in again is that account's traffic. A borrowed routing is used
- * for the network calls only and never written back — the sign-in may turn out
+ * for the network calls only and never written back: the sign-in may turn out
  * to be a different identity, and a new entry must not inherit a proxy by
  * sharing a name.
  * @param {Record<string, any>} config
@@ -903,8 +903,8 @@ async function requireWorkingRouting(routing, upstreamUrl) {
  * Say so when a sign-in turned out to belong to an account with its own
  * routing and did not go through it. Which account a sign-in is for is only
  * known once it has happened, so without --name or --routing this cannot be
- * prevented, only reported — and the operator who routes an account to keep
- * its traffic off this machine's address needs to know that it was not.
+ * prevented, only reported. The operator who routes an account to keep its
+ * traffic off this machine's address needs to know that it was not.
  * @param {Record<string, any>} entry  the existing entry the sign-in matched
  * @param {import('./account-routing.js').RoutingProxy|null} used
  */

@@ -842,7 +842,7 @@ export class AccountManager {
     if (!account?.routingFailedUntil) return false;
     if (now < account.routingFailedUntil) return true;
     account.routingFailedUntil = null;
-    console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" routing cooldown expired — the next request retries its proxy`);
+    console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" routing cooldown expired; the next request retries its proxy`);
     return false;
   }
 

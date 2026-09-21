@@ -5,7 +5,7 @@ import { AccountManager } from '../src/account-manager.js';
 
 // The settings screen's "Account proxy" row: pick an account, type a URL (or
 // `none`), and the account's routing changes in the running fleet and on disk.
-// Driven through _key, the way a keypress arrives, against a real manager — the
+// Driven through _key, the way a keypress arrives, against a real manager: the
 // cooldown reset and the config pairing are the manager's and the pairing
 // module's own code, and a stub would only restate what this expects of them.
 

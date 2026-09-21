@@ -129,8 +129,8 @@ export function parseRoutingUrl(value) {
 }
 
 /**
- * A routing value AS TYPED, password masked — for text that echoes input which
- * may not parse at all (error messages, the MCP audit log). describeRouting()
+ * A routing value AS TYPED, password masked. It is for text that echoes input
+ * which may not parse at all (error messages, the MCP audit log). describeRouting()
  * is the form for a routing that did parse.
  *
  * Cut at the LAST `@`, not the first: an unescaped `@`, `/` or `#` inside a
@@ -466,7 +466,7 @@ export function connectThroughRouting(proxy, { targetHost, targetPort, timeout =
  * Prove a routing works before anything depends on it: tunnel through the
  * proxy to `url`'s host, complete the TLS handshake when it is https, hang up.
  * No request is sent, so the only credential that leaves the machine is the
- * proxy's own. Covers what a routing can get wrong in one go — the proxy's
+ * proxy's own. One check covers what a routing can get wrong: the proxy's
  * address, its credentials, whether it will dial the target, and (for the h/a
  * schemes) whether it can resolve it.
  *
