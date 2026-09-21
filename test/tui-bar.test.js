@@ -133,6 +133,18 @@ test('no width from BAR_MIN up produces a half-drawn countdown', () => {
   }
 });
 
+// The percentage is the newer of the two fields, and the one an operator can
+// send back: `quotaBarPercent: false` restores the countdown-only label.
+test('the percentage can be turned off, leaving the countdown alone', () => {
+  assert.equal(plain(bar(0.97, 20, inTwoAndAHalfHours(), undefined, undefined, false)), '2h30m');
+});
+
+// With no countdown there is nothing else for the bar to say, so the switch
+// does not empty it.
+test('turning the percentage off leaves it on a bar with no countdown', () => {
+  assert.equal(plain(bar(0.45, 10, undefined, undefined, undefined, false)), '45%');
+});
+
 test('with no countdown to show, the percentage is the label', () => {
   assert.equal(plain(bar(0.45, 10)), '45%');
   assert.equal(plain(bar(0.45, 10, Date.now() - 60_000)), '45%');
@@ -148,13 +160,13 @@ test('a bar with no reading at all is unchanged', () => {
 // The row renderer has to hand the live threshold to every bar it draws, or the
 // clamp above never reaches the screen. Rendered, not called directly: the
 // argument list is the thing under test.
-function renderRow(quota, threshold = 0.98) {
+function renderRow(quota, threshold = 0.98, config = {}) {
   const am = new AccountManager(
     [{ name: 'acct@example.com', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 }],
     threshold);
   Object.assign(am.accounts[0].quota, quota);
   const tui = new TUI({
-    accountManager: am, config: { proxy: { port: 1 }, accounts: [], routes: [] }, sx: null,
+    accountManager: am, config: { proxy: { port: 1 }, accounts: [], routes: [], ...config }, sx: null,
     saveConfig: async () => {}, syncAccounts: async () => 0, onQuit: () => {}, probeQuota: () => {},
   });
   const cols = Object.getOwnPropertyDescriptor(process.stdout, 'columns');
@@ -174,6 +186,23 @@ function renderRow(quota, threshold = 0.98) {
   }
   return drawn;
 }
+
+// The switch is read once per row and handed to every bar on it, so a row with
+// the family bars drawn has four call sites to get wrong.
+test('the row drops the percentage from every bar when the switch is off', () => {
+  const h = 3600_000;
+  const quota = {
+    unified5h: 0.42, unified5hReset: Date.now() + 2.5 * h,
+    unified7d: 0.31, unified7dReset: Date.now() + 3 * 24 * h,
+    unified7dSonnet: 0.22, unified7dSonnetReset: Date.now() + 3 * 24 * h,
+    unified7dFable: 0.11, unified7dFableReset: Date.now() + 3 * 24 * h,
+  };
+  assert.match(plain(renderRow(quota)), /31% \u00b7 3d/);
+  const off = plain(renderRow(quota, 0.98, { quotaBarPercent: false }));
+  assert.doesNotMatch(off, /%/);
+  // The countdowns stay: the percentage is the only field the switch removes.
+  assert.match(off, /2h30m/);
+});
 
 test('a spent session bucket renders red on the row, not just in bar()', () => {
   const h = 3600_000;
