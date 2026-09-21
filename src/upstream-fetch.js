@@ -374,6 +374,7 @@ function makeResponse(res) {
   };
   return {
     status: res.statusCode,
+    statusText: res.statusMessage || '',
     ok: res.statusCode >= 200 && res.statusCode < 300,
     headers: makeHeaders(res.headers),
     body: web,

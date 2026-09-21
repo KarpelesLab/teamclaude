@@ -44,6 +44,7 @@ import { serviceKind, installService, uninstallService, serviceStatus, renderSer
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
 import { getUpstreamProxy, describeProxy, describeSelfProxy } from './upstream-proxy.js';
 import { parseRoutingUrl, routingToUrl, describeRouting } from './account-routing.js';
+import { proxyFetch } from './upstream-fetch.js';
 import { startEventLoopMonitor } from './event-loop-monitor.js';
 import {
   ConfigOpError,
@@ -1605,7 +1606,12 @@ async function apiCommand() {
     fetchOpts.body = data;
   }
 
-  const res = await fetch(url, fetchOpts);
+  // This call carries the account's credential, so it is that account's
+  // traffic: it leaves by the account's own routing when it has one, and by
+  // the fleet path (the upstream proxy when configured) otherwise.
+  const routing = accountRouting(account);
+  if (routing) console.error(`(via ${describeRouting(routing)})`);
+  const res = await proxyFetch(url, { ...fetchOpts, routing });
 
   // Print response headers to stderr
   console.error(`${res.status} ${res.statusText}`);

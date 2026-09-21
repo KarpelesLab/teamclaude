@@ -1,5 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import net from 'node:net';
+import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { mkdtemp, writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -146,4 +148,78 @@ test('login --api --routing with an invalid URL refuses before prompting', async
   assert.match(res.stderr, /Invalid --routing value:.*unsupported routing protocol/);
   const accounts = await readAccounts(configPath);
   assert.equal(accounts.length, 0, 'no half-added account');
+});
+
+// ── teamclaude api ───────────────────────────────────────────
+
+const listen = (s) => new Promise((r) => s.listen(0, '127.0.0.1', () => r(s.address().port)));
+
+// No-auth SOCKS5 relay that records each CONNECT target.
+function startSocks5(connects) {
+  return net.createServer((client) => {
+    let stage = 'greeting';
+    let buf = Buffer.alloc(0);
+    client.on('error', () => {});
+    client.on('data', (chunk) => {
+      if (stage === 'relay') return;
+      buf = Buffer.concat([buf, chunk]);
+      if (stage === 'greeting') {
+        if (buf.length < 2 + (buf[1] || 0)) return;
+        buf = buf.subarray(2 + buf[1]);
+        stage = 'request';
+        client.write(Buffer.from([0x05, 0x00]));
+      }
+      if (stage === 'request') {
+        if (buf.length < 10) return;
+        const host = [...buf.subarray(4, 8)].join('.');
+        const port = buf.readUInt16BE(8);
+        buf = buf.subarray(10);
+        connects.push(`${host}:${port}`);
+        const up = net.connect(port, host, () => {
+          client.write(Buffer.from([0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
+          if (buf.length) up.write(buf);
+          up.pipe(client); client.pipe(up);
+        });
+        up.on('error', () => client.destroy());
+        stage = 'relay';
+      }
+    });
+  });
+}
+
+test('api sends the account\'s credential through that account\'s routing, and only that account\'s', async () => {
+  const seen = [];
+  const origin = http.createServer((req, res) => {
+    seen.push(req.headers['x-api-key']);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+  });
+  const originPort = await listen(origin);
+  const connects = [];
+  const socks = startSocks5(connects);
+  const socksPort = await listen(socks);
+  try {
+    const configPath = await writeConfig([
+      { name: 'routed', type: 'apikey', apiKey: 'sk-routed', routing: `socks5://alice:s3cret@127.0.0.1:${socksPort}` },
+      { name: 'direct', type: 'apikey', apiKey: 'sk-direct' },
+    ]);
+    const url = `http://127.0.0.1:${originPort}/v1/models`;
+
+    const routed = await runCli(configPath, ['api', url, '--account', 'routed']);
+    assert.equal(routed.code, 0, routed.stderr);
+    assert.deepEqual(JSON.parse(routed.stdout), { ok: true });
+    assert.deepEqual(connects, [`127.0.0.1:${originPort}`], 'the call left through the account\'s proxy');
+    assert.match(routed.stderr, /^\(via socks5:\/\/alice:\*\*\*@127\.0\.0\.1:\d+\)$/m, 'it says so, password masked');
+    // The node:http path has no Response of its own; the status line must still read properly.
+    assert.match(routed.stderr, /^200 OK$/m, routed.stderr);
+
+    const direct = await runCli(configPath, ['api', url, '--account', 'direct']);
+    assert.equal(direct.code, 0, direct.stderr);
+    assert.equal(connects.length, 1, 'an account without routing does not touch the proxy');
+    assert.equal(/via socks5/.test(direct.stderr), false);
+    assert.deepEqual(seen, ['sk-routed', 'sk-direct']);
+  } finally {
+    origin.close(); socks.close();
+    origin.closeAllConnections?.();
+  }
 });
