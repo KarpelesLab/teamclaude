@@ -320,7 +320,7 @@ function makeAccount(acct, index) {
     entitlementDeniedUntil: null,
     // The account's own routing proxy could not be reached (see
     // markRoutingFailed). Ephemeral for the same reason: a live observation.
-    routingFailedUntil: null,
+    routingFailedUntil: /** @type {number|null} */ (null),
     // Storm control (see admit/release): in-flight upstream requests and the
     // time this account last became the current one (starts a ramp window).
     inFlight: 0,
@@ -794,7 +794,10 @@ export class AccountManager {
   /** Keep an account whose own routing proxy failed out of automatic rotation
    * for a short while, so the requests behind the one that found out do not
    * each pay the connect failure before failing over. Extends, never shortens.
-   * Returns the expiry timestamp, or null when there is nothing to hold. */
+   * Returns the expiry timestamp, or null when there is nothing to hold.
+   * @param {number} index
+   * @param {number} [seconds]
+   * @returns {number|null} */
   markRoutingFailed(index, seconds = ROUTING_FAILURE_COOLDOWN_SECONDS) {
     const account = this.accounts[index];
     if (!account?.routing) return null;
@@ -807,7 +810,9 @@ export class AccountManager {
 
   /** Install an account's routing (null clears it). A different proxy is a
    * different path, so a cooldown learned on the old one goes with it: the
-   * operator who just fixed the URL should not wait out the old one's hold. */
+   * operator who just fixed the URL should not wait out the old one's hold.
+   * @param {number} index
+   * @param {import('./account-routing.js').RoutingProxy|null} routing */
   setRouting(index, routing) {
     const account = this.accounts[index];
     if (!account) return;
@@ -815,19 +820,24 @@ export class AccountManager {
     account.routing = routing;
   }
 
-  /** Public form for the request path, which re-checks after a token refresh. */
+  /** Public form for the request path, which re-checks after a token refresh.
+   * @param {number} index
+   * @param {number} [now] */
   isRoutingDown(index, now = Date.now()) {
     return this._routingDown(this.accounts[index], now);
   }
 
-  /** A response that came back through the routing proxy is proof it works. */
+  /** A response that came back through the routing proxy is proof it works.
+   * @param {number} index */
   clearRoutingFailed(index) {
     const account = this.accounts[index];
     if (account?.routingFailedUntil) account.routingFailedUntil = null;
   }
 
   /** True while an account is in its routing-failure cooldown; expiry is
-   * consumed lazily, as the entitlement cooldown's is. */
+   * consumed lazily, as the entitlement cooldown's is.
+   * @param {Record<string, any>|undefined} account
+   * @param {number} [now] */
   _routingDown(account, now = Date.now()) {
     if (!account?.routingFailedUntil) return false;
     if (now < account.routingFailedUntil) return true;

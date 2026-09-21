@@ -3112,7 +3112,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       const hold = until ? ` — out of rotation for ${Math.max(1, Math.round((until - Date.now()) / 1000))}s` : '';
       // err.message, not describeConnectError: that prefers the cause, which
       // is the bare socket error and does not say a routing proxy was involved.
-      console.error(`[TeamClaude] Routing proxy failed for account "${safeLine(account.name, 64)}" (${describeRouting(account.routing) || 'routing'}): ${safeLine(err.message, 300)}${hold}`);
+      console.error(`[TeamClaude] Routing proxy failed for account "${safeLine(account.name, 64)}" (${describeRouting(account.routing) || 'routing'}): ${safeLine(err instanceof Error ? err.message : String(err), 300)}${hold}`);
     } else console.error(`[TeamClaude] Upstream error (account "${account.name}"):`, describeConnectError(err));
 
     logRequestHead();
