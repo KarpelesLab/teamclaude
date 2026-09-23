@@ -743,9 +743,21 @@ async function serverCommand() {
     const spent = await consumeCodexResetCredit(account, credit.id, requestId);
     if (spent.error) return { ok: false, account: account.name, error: `redemption refused: ${spent.error}`, creditId: credit.id };
     console.log(`[TeamClaude] Redeemed a rate-limit reset credit on "${account.name}" (${why}; ${spent.windowsReset} window(s) reset, ${listed.rows.length - 1} credit(s) left)`);
-    // Re-read the quota right away so the status readout and the rotation see
-    // the emptied windows instead of waiting for the next scheduled probe.
+    // Upstream has confirmed the windows are empty, so the local memory of the
+    // account being spent is stale: a throttle hold armed by an earlier 429
+    // (which runs to the window's old reset time, days away), an `exhausted`
+    // status, or upstream's cached `rejected` verdict. Left in place they keep
+    // the account ineligible after a real reset — which is how one exhaustion
+    // once cost three credits a minute apart. Clear them, then re-read the quota
+    // so the rotation sees the emptied windows now, not at the next probe.
+    if (spent.windowsReset > 0) {
+      accountManager.clearRateLimited(index);
+      if (account.status === 'exhausted') account.status = 'active';
+      if (account.quota?.unifiedStatus === 'rejected') account.quota.unifiedStatus = null;
+    }
     try { await prober?.probeAccount(account); } catch { /* the next probe will catch up */ }
+    const { eligible, reason } = accountManager.eligibility(index);
+    if (!eligible) console.log(`[TeamClaude] After the reset, "${account.name}" is still ${reason}; not spending further credits on this emptiness`);
     return {
       ok: true,
       account: account.name,
@@ -753,6 +765,8 @@ async function serverCommand() {
       windowsReset: spent.windowsReset,
       creditsLeft: Math.max(0, listed.rows.length - 1),
       code: spent.code,
+      eligible,
+      ...(reason ? { reason } : {}),
     };
   };
   hooks.redeemReset = index => redeemOn(index, 'manual');
@@ -765,12 +779,18 @@ async function serverCommand() {
   // successes, so a probe that has not caught up yet cannot cause a second
   // spend on the same emptiness. Returns true when a window was reset.
   let autoRedeemInFlight = null;
-  let lastAutoRedeemAt = 0;
-  const AUTO_REDEEM_FLOOR_MS = 60_000;
+  let autoRedeemNotBefore = 0;
+  // Between successes: long enough for the reset account to have served the
+  // stalled requests and for the probe to reflect it, so a second spend only
+  // happens on a second, real exhaustion.
+  const AUTO_REDEEM_FLOOR_MS = 10 * 60_000;
+  // A reset that left its account ineligible is a bug or an upstream oddity,
+  // not something to spend more credits on: stand down for an hour and say so.
+  const AUTO_REDEEM_STANDDOWN_MS = 60 * 60_000;
   hooks.autoRedeem = provider => {
     if (config.autoRedeemResets !== true) return Promise.resolve(false);
     if (autoRedeemInFlight) return autoRedeemInFlight;
-    if (Date.now() - lastAutoRedeemAt < AUTO_REDEEM_FLOOR_MS) return Promise.resolve(false);
+    if (Date.now() < autoRedeemNotBefore) return Promise.resolve(false);
     autoRedeemInFlight = (async () => {
       // Candidates: enabled Codex accounts of the stalled provider that report
       // a held credit, most credits first so the fleet's deepest bank is
@@ -784,7 +804,11 @@ async function serverCommand() {
         .sort((x, y) => (y.a.quota.resetCredits.available - x.a.quota.resetCredits.available));
       for (const { a, i } of candidates) {
         const r = await redeemOn(i, 'automatic: no account could serve a request');
-        if (r.ok) { lastAutoRedeemAt = Date.now(); return true; }
+        if (r.ok) {
+          autoRedeemNotBefore = Date.now() + (r.eligible ? AUTO_REDEEM_FLOOR_MS : AUTO_REDEEM_STANDDOWN_MS);
+          if (!r.eligible) console.log(`[TeamClaude] Auto-redeem standing down for ${AUTO_REDEEM_STANDDOWN_MS / 60_000} min: the reset did not make "${a.name}" eligible`);
+          return r.eligible;
+        }
         console.log(`[TeamClaude] Auto-redeem on "${a.name}" did not happen: ${r.error}`);
       }
       return false;
