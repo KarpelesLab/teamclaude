@@ -22,6 +22,9 @@ import {
 } from './identity.js';
 import { resolveAccounts } from './resolve-accounts.js';
 import { loginCodex } from './codex-auth.js';
+import { fetchCodexResetCredits, consumeCodexResetCredit, spendableCredit } from './codex-usage.js';
+import { randomUUID } from 'node:crypto';
+import { providerOf } from './provider.js';
 import { syncAccountsFromDisk } from './sync-accounts.js';
 import { mergeAccountsForSave, syncRefreshedTokens, removedAccountIds, clearRemovedAccountIds } from './account-pairing.js';
 import { ensureAccountIds } from './account-id.js';
@@ -128,6 +131,10 @@ switch (command) {
     break;
   case 'switch':
     await switchCommand();
+    process.exit(0);
+    break;
+  case 'redeem':
+    await redeemCommand();
     process.exit(0);
     break;
   case 'remove':
@@ -705,6 +712,41 @@ async function serverCommand() {
   // as the TUI's `p` key. Assigned after construction because the hook object
   // is already shared with the server created above.
   hooks.probeQuota = () => prober?.probeAll();
+  // `teamclaude redeem <account>`: spend one banked Codex reset credit. Lives
+  // here rather than in the CLI because the fresh access token is in this
+  // process. One credit per call; the caller says which account.
+  hooks.redeemReset = async (index) => {
+    const account = accountManager.accounts[index];
+    if (!account || providerOf(account) !== 'codex' || !account.accountId) {
+      return { ok: false, account: account?.name, error: 'not a Codex OAuth account' };
+    }
+    await accountManager.ensureTokenFresh(index);
+    let listed = await fetchCodexResetCredits(account);
+    if (listed.status === 401) {
+      await accountManager.ensureTokenFresh(index, true);
+      listed = await fetchCodexResetCredits(account);
+    }
+    if (listed.error) return { ok: false, account: account.name, error: `could not list reset credits: ${listed.error}` };
+    const credit = spendableCredit(listed.rows);
+    if (!credit) {
+      return { ok: false, account: account.name, error: 'no spendable reset credit', credits: listed.rows.length };
+    }
+    const requestId = randomUUID();
+    const spent = await consumeCodexResetCredit(account, credit.id, requestId);
+    if (spent.error) return { ok: false, account: account.name, error: `redemption refused: ${spent.error}`, creditId: credit.id };
+    console.log(`[TeamClaude] Redeemed a rate-limit reset credit on "${account.name}" (${spent.windowsReset} window(s) reset, ${listed.rows.length - 1} credit(s) left)`);
+    // Re-read the quota right away so the status readout and the rotation see
+    // the emptied windows instead of waiting for the next scheduled probe.
+    try { await prober?.probeAccount(account); } catch { /* the next probe will catch up */ }
+    return {
+      ok: true,
+      account: account.name,
+      creditId: credit.id,
+      windowsReset: spent.windowsReset,
+      creditsLeft: Math.max(0, listed.rows.length - 1),
+      code: spent.code,
+    };
+  };
   prober.start();
 
   // Start the opt-in keep-warm scheduler. Interval mode runs relative to server
@@ -1289,6 +1331,48 @@ async function dashboardCommand() {
 }
 
 // ── switch ──────────────────────────────────────────────────
+
+// Spend one banked Codex rate-limit reset credit on a RUNNING server — the
+// headless equivalent of `/usage` → "Redeem reset" in a Codex client signed in
+// to that account. The server does the spending (it holds the fresh token);
+// this command only names the account and prints the answer. One credit per
+// invocation, always explicit: a reset is irreversible, and which account to
+// spend it on is a decision, not a schedule.
+async function redeemCommand() {
+  const config = await loadOrCreateConfig();
+  const port = config.proxy.port;
+  const headers = { 'x-api-key': config.proxy.apiKey };
+  const name = args[1] && !args[1].startsWith('-') ? args[1] : null;
+  if (!name) {
+    console.error('Usage: teamclaude redeem <account>   (spends ONE of that Codex account\'s reset credits)');
+    console.error('See held credits with: teamclaude status');
+    process.exit(1);
+  }
+  try {
+    const res = await fetch(`http://localhost:${port}/teamclaude/redeem`, {
+      method: 'POST',
+      headers: { ...headers, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ account: name }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) {
+      const detail = typeof data.error === 'string' ? data.error : null;
+      console.error(detail || `Redeem failed: unexpected reply from localhost:${port} (HTTP ${res.status}).`);
+      if (!detail) console.error('An older server without this endpoint answers this way; restart it to pick up the new version.');
+      if (data.accounts?.length) {
+        console.error('Known accounts:');
+        for (const n of data.accounts) console.error(`  ${n}`);
+      }
+      process.exit(1);
+    }
+    console.log(`Redeemed one reset credit on "${data.account}": ${data.windowsReset} window(s) reset, ${data.creditsLeft} credit(s) left.`);
+  } catch (err) {
+    console.error('Cannot connect to proxy at localhost:' + port);
+    console.error('Is the server running? Start with: teamclaude server');
+    if (err?.message) console.error(`Details: ${err.message}`);
+    process.exit(1);
+  }
+}
 
 // Manual account switch against a RUNNING server — the headless equivalent of
 // pressing 's' in the TUI, which is unreachable when the proxy runs as a
@@ -2057,6 +2141,9 @@ Commands:
   accounts            List configured accounts
   switch [NAME]       Make the running server prefer one account (as 's' in the
                       TUI does); with no NAME, list accounts and mark the current
+  redeem <name>       Spend ONE of a Codex account's banked rate-limit reset
+                      credits (as '/usage' -> 'Redeem reset' in a signed-in
+                      Codex client); the running server does the spending
   remove <name>       Remove an account (by name or email; --org to disambiguate)
   disable <name>      Temporarily exclude an account from rotation
   enable <name>       Re-enable a disabled account (also clears a stuck error)

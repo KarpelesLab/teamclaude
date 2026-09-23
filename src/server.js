@@ -561,6 +561,55 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         return;
       }
 
+      // Spend one of a Codex account's banked rate-limit reset credits — the
+      // headless equivalent of `/usage` → "Redeem reset" in a signed-in Codex
+      // client. It runs on the server because only the server holds a fresh
+      // token for each account; the CLI never sees a credential. A redemption
+      // is irreversible, so the endpoint spends exactly one credit per call,
+      // for the one account named in the body, and never on its own.
+      if (req.method === 'POST' && req.url === '/teamclaude/redeem') {
+        if (!hooks.redeemReset) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'reset redemption not supported' }));
+          return;
+        }
+        const names = () => (accountManager.accounts || []).map(a => a.name);
+        let target;
+        try {
+          const raw = await readControlBody(req);
+          target = JSON.parse(raw || '{}')?.account;
+        } catch (err) {
+          const tooLarge = err.message === 'body too large';
+          res.writeHead(tooLarge ? 413 : 400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: tooLarge ? 'request body too large' : 'invalid request body' }));
+          return;
+        }
+        if (typeof target !== 'string' || !target.trim()) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'missing "account"', accounts: names() }));
+          return;
+        }
+        const index = resolveAccountPin(accountManager, target);
+        if (index == null) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: `no such account "${target}"`, accounts: names() }));
+          return;
+        }
+        try {
+          const result = await hooks.redeemReset(index);
+          // A refused redemption (no credit, wrong provider, upstream said no)
+          // is a normal answer, not a server failure: it comes back as 200 with
+          // ok:false and the reason, so the CLI can print it as-is.
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(result));
+        } catch (err) {
+          console.error('[TeamClaude] Reset redemption failed:', err.message);
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'redemption failed; see the proxy log' }));
+        }
+        return;
+      }
+
       // MCP management endpoint — the tool-shaped face of this control plane,
       // off unless proxy.mcp says otherwise. The gates above are the same ones
       // the other /teamclaude/ routes pass, with one addition: a config with no

@@ -184,3 +184,111 @@ export async function fetchCodexUsage(account, { fetchImpl = proxyFetch, timeout
     return { error: err?.message || String(err), status: null };
   }
 }
+
+// ── Rate-limit reset credits ────────────────────────────────────────────────
+//
+// A Codex subscription banks "rate-limit reset credits" (one granted at launch,
+// more via referrals). Spending one resets the account's usage windows on the
+// spot. The desktop app and the CLI's `/usage` picker do it through the two
+// endpoints below, with the same bearer + account-id headers as `/wham/usage`.
+// Redeeming is a deliberate, irreversible spend, so nothing here runs on its
+// own: the server exposes it behind the control endpoint and a person asks.
+
+export const CODEX_RESET_CREDITS_URL = 'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits';
+
+/**
+ * @param {Record<string, any>} account
+ */
+function codexHeaders(account) {
+  return {
+    Authorization: `Bearer ${account.credential}`,
+    'ChatGPT-Account-Id': account.accountId,
+    Accept: 'application/json',
+  };
+}
+
+/**
+ * The credit rows a payload lists, wherever it keeps them. The endpoint is
+ * private and undocumented, so the shape is read permissively: a top-level
+ * array, or the first array-valued field, each row an object.
+ *
+ * @param {any} data
+ * @returns {Array<Record<string, any>>}
+ */
+export function creditRows(data) {
+  if (Array.isArray(data)) return data.filter(r => r && typeof r === 'object');
+  if (!data || typeof data !== 'object') return [];
+  for (const key of ['credits', 'rate_limit_reset_credits', 'items', 'data']) {
+    if (Array.isArray(data[key])) return data[key].filter(r => r && typeof r === 'object');
+  }
+  const first = Object.values(data).find(Array.isArray);
+  return first ? first.filter(r => r && typeof r === 'object') : [];
+}
+
+/**
+ * The first credit that can be spent now: available by its own status and not
+ * marked unsupported for this plan. Null when there is none.
+ *
+ * @param {Array<Record<string, any>>} rows
+ */
+export function spendableCredit(rows) {
+  for (const row of rows) {
+    const status = String(row.status ?? row.state ?? '').toLowerCase();
+    if (status && status !== 'available' && status !== 'active') continue;
+    if (row.supported === false || row.is_supported === false || row.plan_supported === false) continue;
+    const id = row.id ?? row.credit_id;
+    if (typeof id === 'string' && id) return { id, row };
+  }
+  return null;
+}
+
+/**
+ * List the account's reset credits.
+ *
+ * @param {Record<string, any>|null|undefined} account
+ * @param {{ fetchImpl?: Function, timeoutMs?: number, url?: string }} [opts]
+ */
+export async function fetchCodexResetCredits(account, { fetchImpl = proxyFetch, timeoutMs = 10_000, url = CODEX_RESET_CREDITS_URL } = {}) {
+  if (!account?.credential || !account?.accountId) return { error: 'missing Codex account identity' };
+  try {
+    const res = await fetchImpl(url, { headers: codexHeaders(account), signal: AbortSignal.timeout(timeoutMs) });
+    if (!res.ok) return { error: `HTTP ${res.status}`, status: res.status };
+    const data = await res.json();
+    return { rows: creditRows(data), raw: data };
+  } catch (/** @type {any} */ err) {
+    return { error: err?.message || String(err), status: null };
+  }
+}
+
+/**
+ * Spend one reset credit. `requestId` is the idempotency key: a retry of the
+ * same logical redemption must reuse it, so a timed-out call cannot burn two.
+ *
+ * @param {Record<string, any>|null|undefined} account
+ * @param {string} creditId
+ * @param {string} requestId
+ * @param {{ fetchImpl?: Function, timeoutMs?: number, url?: string }} [opts]
+ */
+export async function consumeCodexResetCredit(account, creditId, requestId, { fetchImpl = proxyFetch, timeoutMs = 15_000, url = `${CODEX_RESET_CREDITS_URL}/consume` } = {}) {
+  if (!account?.credential || !account?.accountId) return { error: 'missing Codex account identity' };
+  try {
+    const res = await fetchImpl(url, {
+      method: 'POST',
+      headers: { ...codexHeaders(account), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ credit_id: creditId, redeem_request_id: requestId }),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const text = await res.text();
+    let data = null;
+    try { data = text ? JSON.parse(text) : null; } catch { /* non-JSON reply: reported below */ }
+    if (!res.ok) return { error: `HTTP ${res.status}${data?.detail ? `: ${data.detail}` : ''}`, status: res.status, raw: data };
+    return {
+      code: data?.code ?? null,
+      windowsReset: Number(data?.windows_reset ?? 0) || 0,
+      credit: data?.credit ?? null,
+      raw: data,
+    };
+  } catch (/** @type {any} */ err) {
+    return { error: err?.message || String(err), status: null };
+  }
+}
