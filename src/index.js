@@ -137,6 +137,10 @@ switch (command) {
     await redeemCommand();
     process.exit(0);
     break;
+  case 'autoredeem':
+    await autoRedeemCommand();
+    process.exit(0);
+    break;
   case 'remove':
     await removeCommand();
     process.exit(0);
@@ -435,6 +439,10 @@ async function serverCommand() {
     // it to plain even distribution on every config reload.
     config.distributeSessions = diskConfig.distributeSessions ?? false;
     accountManager.setDistributeSessions(config.distributeSessions);
+    // `teamclaude autoredeem on|off` writes this and reloads; the hook reads it
+    // off the shared config at decision time, so assigning it is the whole
+    // application.
+    config.autoRedeemResets = diskConfig.autoRedeemResets === true;
     // Pick up a switchThreshold change the same way (teamclaude threshold, the
     // TUI settings screen, or a hand edit). thresholdFor() reads it off the
     // manager on every decision, so assigning it is the whole application —
@@ -715,7 +723,7 @@ async function serverCommand() {
   // `teamclaude redeem <account>`: spend one banked Codex reset credit. Lives
   // here rather than in the CLI because the fresh access token is in this
   // process. One credit per call; the caller says which account.
-  hooks.redeemReset = async (index) => {
+  const redeemOn = async (index, why) => {
     const account = accountManager.accounts[index];
     if (!account || providerOf(account) !== 'codex' || !account.accountId) {
       return { ok: false, account: account?.name, error: 'not a Codex OAuth account' };
@@ -734,7 +742,7 @@ async function serverCommand() {
     const requestId = randomUUID();
     const spent = await consumeCodexResetCredit(account, credit.id, requestId);
     if (spent.error) return { ok: false, account: account.name, error: `redemption refused: ${spent.error}`, creditId: credit.id };
-    console.log(`[TeamClaude] Redeemed a rate-limit reset credit on "${account.name}" (${spent.windowsReset} window(s) reset, ${listed.rows.length - 1} credit(s) left)`);
+    console.log(`[TeamClaude] Redeemed a rate-limit reset credit on "${account.name}" (${why}; ${spent.windowsReset} window(s) reset, ${listed.rows.length - 1} credit(s) left)`);
     // Re-read the quota right away so the status readout and the rotation see
     // the emptied windows instead of waiting for the next scheduled probe.
     try { await prober?.probeAccount(account); } catch { /* the next probe will catch up */ }
@@ -746,6 +754,42 @@ async function serverCommand() {
       creditsLeft: Math.max(0, listed.rows.length - 1),
       code: spent.code,
     };
+  };
+  hooks.redeemReset = index => redeemOn(index, 'manual');
+
+  // Automatic redemption, opt-in (`autoRedeemResets`). Runs only from the
+  // request path's "no account can serve this" branch: that is the one moment
+  // a credit is worth spending, and spending earlier would throw away whatever
+  // the account still had under its threshold. One redemption at a time (a
+  // burst of stalled requests shares the in-flight one) and a floor between
+  // successes, so a probe that has not caught up yet cannot cause a second
+  // spend on the same emptiness. Returns true when a window was reset.
+  let autoRedeemInFlight = null;
+  let lastAutoRedeemAt = 0;
+  const AUTO_REDEEM_FLOOR_MS = 60_000;
+  hooks.autoRedeem = provider => {
+    if (config.autoRedeemResets !== true) return Promise.resolve(false);
+    if (autoRedeemInFlight) return autoRedeemInFlight;
+    if (Date.now() - lastAutoRedeemAt < AUTO_REDEEM_FLOOR_MS) return Promise.resolve(false);
+    autoRedeemInFlight = (async () => {
+      // Candidates: enabled Codex accounts of the stalled provider that report
+      // a held credit, most credits first so the fleet's deepest bank is
+      // spent before a one-credit account. The list is read at decision time
+      // so a reload or a probe in between is honoured.
+      const candidates = accountManager.accounts
+        .map((a, i) => ({ a, i }))
+        .filter(({ a }) => !a.disabled && providerOf(a) === 'codex' && a.accountId
+          && (provider == null || providerOf(a) === provider)
+          && (a.quota?.resetCredits?.available || 0) > 0)
+        .sort((x, y) => (y.a.quota.resetCredits.available - x.a.quota.resetCredits.available));
+      for (const { a, i } of candidates) {
+        const r = await redeemOn(i, 'automatic: no account could serve a request');
+        if (r.ok) { lastAutoRedeemAt = Date.now(); return true; }
+        console.log(`[TeamClaude] Auto-redeem on "${a.name}" did not happen: ${r.error}`);
+      }
+      return false;
+    })().finally(() => { autoRedeemInFlight = null; });
+    return autoRedeemInFlight;
   };
   prober.start();
 
@@ -1372,6 +1416,37 @@ async function redeemCommand() {
     if (err?.message) console.error(`Details: ${err.message}`);
     process.exit(1);
   }
+}
+
+// `teamclaude autoredeem [on|off]`: let the running server spend banked Codex
+// reset credits by itself, at the one moment it matters — when no account can
+// serve a request. Off by default: a credit is a real, irreversible thing.
+async function autoRedeemCommand() {
+  const config = await loadOrCreateConfig();
+  const arg = args[1];
+  const current = config.autoRedeemResets === true;
+  if (arg === undefined) {
+    console.log(`Automatic reset redemption: ${current ? 'on' : 'off'}`);
+    console.log('Set with: teamclaude autoredeem <on|off>');
+    console.log('On: when every account is at its quota and a request cannot be served, the server');
+    console.log('spends ONE banked Codex reset credit (most-credits account first) and retries.');
+    return;
+  }
+  let next;
+  if (['on', 'true', 'yes', '1'].includes(arg)) next = true;
+  else if (['off', 'false', 'no', '0'].includes(arg)) next = false;
+  else {
+    console.error('Usage: teamclaude autoredeem <on|off>');
+    process.exit(1);
+  }
+  if (next !== current) {
+    config.autoRedeemResets = next;
+    await saveConfig(config);
+  }
+  console.log(next
+    ? 'Automatic reset redemption on: a credit is spent only when no account can serve a request.'
+    : 'Automatic reset redemption off: credits are spent only by `teamclaude redeem <account>`.');
+  await notifyRunningServer(config);
 }
 
 // Manual account switch against a RUNNING server — the headless equivalent of
@@ -2144,6 +2219,8 @@ Commands:
   redeem <name>       Spend ONE of a Codex account's banked rate-limit reset
                       credits (as '/usage' -> 'Redeem reset' in a signed-in
                       Codex client); the running server does the spending
+  autoredeem [on|off] Let the server spend one such credit by itself whenever
+                      no account can serve a request (off by default)
   remove <name>       Remove an account (by name or email; --org to disambiguate)
   disable <name>      Temporarily exclude an account from rotation
   enable <name>       Re-enable a disabled account (also clears a stuck error)

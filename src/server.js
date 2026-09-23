@@ -2430,6 +2430,23 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       }
       return;
     }
+    // Nobody can serve this request. Before telling the client to wait for a
+    // window to reset, spend a banked reset credit if the operator allowed it
+    // (`autoRedeemResets`): that is exactly the moment a credit is worth
+    // spending, and no earlier. The hook decides which account and holds its
+    // own lock, so a burst of requests landing here spends one credit, not one
+    // per request. A redemption empties a window at once, so selection is
+    // simply run again; a refusal falls through to the ordinary 429 path.
+    if (hooks.autoRedeem && !ctx.autoRedeemed) {
+      ctx.autoRedeemed = true;
+      let redeemed = false;
+      try { redeemed = await hooks.autoRedeem(ctx.provider); } catch (err) { console.error('[TeamClaude] Auto-redeem failed:', err.message); }
+      if (redeemed) {
+        if (clientGone(res)) { ctx.abandoned = true; return; }
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
+      }
+    }
+
     ctx.status = 429;
     ctx.account = '(none available)';
     // Measured once and used twice: the accounts the message counts and the
