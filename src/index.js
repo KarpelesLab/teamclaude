@@ -10,7 +10,7 @@ import { installCrashHandlers } from './crash-log.js';
 import { AccountManager, distributionMode } from './account-manager.js';
 import { validateAdaptiveConfig } from './adaptive-distribution.js';
 import { createProxyServer } from './server.js';
-import { importCredentials, loginOAuth, loginOAuthWithPastedCode, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
+import { importCredentials, loginOAuth, loginOAuthWithPastedCode, fetchProfile, refreshAccessToken, isTokenExpiringSoon, isTokenRejection } from './oauth.js';
 import {
   sameIdentity,
   orgKey,
@@ -2169,7 +2169,12 @@ async function upsertOAuthAccount(name, creds, source = 'unknown') {
 
   if (!canUpsertOAuthAccount(profile, userNamed)) {
     console.error(`Could not identify OAuth account — ${profile?.error || 'profile unavailable'}`);
-    console.error('Retry with valid credentials, or pass --name to add the account without profile detection.');
+    // --name is the documented way past a profile the proxy could not read, but
+    // it is not a way past a token the upstream refused: suggesting it there
+    // would be pointing at the one door this no longer opens.
+    console.error(isTokenRejection(profile)
+      ? 'The upstream refused this token. Log in again to get a fresh one.'
+      : 'Retry with valid credentials, or pass --name to add the account without profile detection.');
     process.exit(1);
   }
 
