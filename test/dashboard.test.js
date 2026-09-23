@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
 import {
-  renderDashboardHtml, dashboardCsp, scopedWeeklyRows, accountTokens,
+  renderDashboardHtml, dashboardCsp, inlineScripts, scopedWeeklyRows, accountTokens,
   accountBadges, thresholdBadgeText,
   sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
@@ -556,7 +556,7 @@ test('the serialized helpers run in the page\'s own scope, not just parse', () =
   // constant the page never ships — it would ReferenceError at first render.
   // Evaluate ONLY the serialized bundle and call into it.
   const html = renderDashboardHtml();
-  const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
+  const script = inlineScripts(html).at(-1);
   const bundle = script.slice(script.indexOf('var STARVED_MIN'), script.indexOf('function el('));
   const isolated = new Function(`${bundle}; return problems;`)();
   const payload = { sessions: { items: [{ id: 'deadbeef1234', client: 'alice', active: true, starved: 9, requests: 9, pins: {}, tokens: {} }] } };
@@ -570,7 +570,7 @@ test('the serialized helpers run in the page\'s own scope, not just parse', () =
 // grepping the source would not catch — only running the bundle does.
 test('accountBadges calls thresholdBadgeText inside the same serialized bundle', () => {
   const html = renderDashboardHtml();
-  const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
+  const script = inlineScripts(html).at(-1);
   const bundle = script.slice(script.indexOf('var STARVED_MIN'), script.indexOf('function el('));
   const isolated = new Function(`${bundle}; return accountBadges;`)();
   const account = { name: 'a', type: 'oauth', switchThreshold: 1.0 };
@@ -584,7 +584,7 @@ test('accountBadges calls thresholdBadgeText inside the same serialized bundle',
 // it threw a ReferenceError from render() and blanked the accounts pane.
 test('a table-form override renders its badge inside the serialized bundle', () => {
   const html = renderDashboardHtml();
-  const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
+  const script = inlineScripts(html).at(-1);
   const bundle = script.slice(script.indexOf('var STARVED_MIN'), script.indexOf('function el('));
   const isolated = new Function(`${bundle}; return accountBadges;`)();
   const account = { name: 'a', type: 'oauth', switchThreshold: { unified7d: 0.9, unified7dFable: 0.8 } };
@@ -602,21 +602,32 @@ test('the page ships the same helper implementations it is tested against', () =
   for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, routeRows, problems]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
-  const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
+  const script = inlineScripts(html).at(-1);
   assert.doesNotThrow(() => new Function(script), 'inline script must parse');
 });
 
 // Run the page's whole inline script against a stub DOM, a stub localStorage and
 // a fetch the test answers by hand. Elements absorb any method call, so render()
 // runs without a real DOM; only the style and text the startup path sets are read.
-function bootPage({ storedKey = null } = {}) {
+function bootPage({ storedKey = null, storedTheme = null } = {}) {
   const els = new Map();
   const stubEl = () => {
-    const target = { style: {}, value: '', textContent: '', className: '', disabled: false };
+    // Listeners are recorded rather than absorbed, so a test can fire a click
+    // the way the page registered it instead of reaching for an onclick the
+    // page never sets.
+    const listeners = new Map();
+    const target = {
+      style: {}, value: '', textContent: '', className: '', disabled: false,
+      addEventListener: (type, fn) => listeners.set(type, fn),
+      fire: (type) => listeners.get(type)?.call(target),
+    };
     return new Proxy(target, { get: (t, p) => (p in t ? t[p] : () => stubEl()) });
   };
   const byId = id => { if (!els.has(id)) els.set(id, stubEl()); return els.get(id); };
-  const store = new Map(storedKey ? [['teamclaude-dashboard-key', storedKey]] : []);
+  const store = new Map([
+    ...(storedKey ? [['teamclaude-dashboard-key', storedKey]] : []),
+    ...(storedTheme ? [['teamclaude-dashboard-theme', storedTheme]] : []),
+  ]);
   const localStorage = {
     getItem: k => (store.has(k) ? store.get(k) : null),
     setItem: (k, v) => store.set(k, String(v)),
@@ -624,16 +635,24 @@ function bootPage({ storedKey = null } = {}) {
   };
   const requests = [];
   const fetch = (url, init) => new Promise(resolve => requests.push({ url, init, resolve }));
-  const document = { getElementById: byId, createElement: () => stubEl() };
+  // documentElement is real enough to record the theme attribute, so a test can
+  // assert what the page actually sets rather than that it merely did not throw.
+  const rootAttrs = new Map();
+  const documentElement = {
+    setAttribute: (k, v) => rootAttrs.set(k, String(v)),
+    removeAttribute: k => rootAttrs.delete(k),
+    getAttribute: k => (rootAttrs.has(k) ? rootAttrs.get(k) : null),
+  };
+  const document = { getElementById: byId, createElement: () => stubEl(), documentElement };
   const html = renderDashboardHtml();
-  const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
+  const script = inlineScripts(html).at(-1);
   new Function('document', 'localStorage', 'fetch', 'setInterval', 'clearInterval', script)(
     document, localStorage, fetch, () => 1, () => {});
   const answer = async (status, body = {}) => {
     requests.shift().resolve({ status, ok: status >= 200 && status < 300, json: async () => body });
     await new Promise(r => setImmediate(r));
   };
-  return { byId, store, requests, answer };
+  return { byId, store, requests, answer, rootAttrs };
 }
 
 test('the page polls status before asking for a key, so a key-exempt browser is never prompted', async () => {
@@ -707,9 +726,15 @@ test('GET /teamclaude/dashboard serves HTML without a key; other methods are a l
     assert.match(csp, /(^|; )connect-src 'self'(;|$)/);
     assert.match(csp, /(^|; )frame-ancestors 'none'(;|$)/);
     assert.doesNotMatch(csp, /script-src[^;]*'unsafe-inline'/);
-    const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
-    const hash = createHash('sha256').update(script, 'utf8').digest('base64');
-    assert.match(csp, new RegExp(`script-src 'sha256-${hash.replace(/[+/=]/g, '\\$&')}'`));
+    // Every inline script is admitted by hash, not just the first: the theme
+    // is applied by a short script in <head>, and a policy covering only the
+    // main script would block it and paint the page dark for a light viewer.
+    const scripts = inlineScripts(html);
+    assert.ok(scripts.length >= 2, 'the page has a head script and a main script');
+    for (const script of scripts) {
+      const hash = createHash('sha256').update(script, 'utf8').digest('base64');
+      assert.match(csp, new RegExp(`'sha256-${hash.replace(/[+/=]/g, '\\$&')}'`));
+    }
     assert.equal(page.headers.get('x-content-type-options'), 'nosniff');
 
     // The asset route is GET + exact path only — a POST to the same path must
@@ -724,4 +749,51 @@ test('GET /teamclaude/dashboard serves HTML without a key; other methods are a l
     proxy.close();
     upstream.close();
   }
+});
+
+test('the theme starts from what was stored, and system means no attribute', () => {
+  // No stored choice: the attribute is absent, so the media query decides and a
+  // viewer who never touches this keeps following their desktop.
+  assert.equal(bootPage().rootAttrs.get('data-theme'), undefined);
+  assert.equal(bootPage({ storedTheme: 'light' }).rootAttrs.get('data-theme'), 'light');
+  assert.equal(bootPage({ storedTheme: 'dark' }).rootAttrs.get('data-theme'), 'dark');
+  // Junk in storage is not a theme; fall back to following the system rather
+  // than writing an attribute no stylesheet matches.
+  assert.equal(bootPage({ storedTheme: 'neon' }).rootAttrs.get('data-theme'), undefined);
+});
+
+test('the theme button cycles system -> light -> dark and persists each step', () => {
+  const page = bootPage();
+  const click = () => page.byId('theme').fire('click');
+  const stored = () => page.store.get('teamclaude-dashboard-theme');
+
+  assert.equal(page.byId('theme').textContent, 'Theme: system');
+  assert.equal(stored(), undefined, 'following the system stores nothing');
+
+  click();
+  assert.equal(page.rootAttrs.get('data-theme'), 'light');
+  assert.equal(stored(), 'light');
+  assert.equal(page.byId('theme').textContent, 'Theme: light');
+
+  click();
+  assert.equal(page.rootAttrs.get('data-theme'), 'dark');
+  assert.equal(stored(), 'dark');
+
+  // Back to system: the attribute goes away AND the stored value is removed,
+  // so the page does not keep re-applying a choice the viewer just dropped.
+  click();
+  assert.equal(page.rootAttrs.get('data-theme'), undefined);
+  assert.equal(stored(), undefined);
+  assert.equal(page.byId('theme').textContent, 'Theme: system');
+});
+
+test('a stored dark choice survives a reload', () => {
+  const first = bootPage();
+  first.byId('theme').fire('click');
+  first.byId('theme').fire('click');
+  assert.equal(first.store.get('teamclaude-dashboard-theme'), 'dark');
+  // A fresh page with that storage comes up dark without another click.
+  const reloaded = bootPage({ storedTheme: first.store.get('teamclaude-dashboard-theme') });
+  assert.equal(reloaded.rootAttrs.get('data-theme'), 'dark');
+  assert.equal(reloaded.byId('theme').textContent, 'Theme: dark');
 });
