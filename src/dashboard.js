@@ -303,6 +303,43 @@ export function switchRequest(name, key) {
   };
 }
 
+// The request the threshold control sends. The number goes as typed: what
+// counts as a percentage is the server's rule (1–100, kept to tenths), and a
+// second opinion here would only disagree with it on the edges.
+export function thresholdRequest(percent, key) {
+  return {
+    url: '/teamclaude/threshold',
+    init: {
+      method: 'POST',
+      headers: { 'x-api-key': key || '', 'content-type': 'application/json' },
+      body: JSON.stringify({ percent: percent }),
+    },
+  };
+}
+
+// The stored 0–1 ratio as the number the control shows. Tenths, and no trailing
+// zero: the setting is quantised to tenths of a percent, so 0.98 must read back
+// as "98" rather than "98.0" for a re-save to be a no-op the operator can see.
+export function thresholdPercentText(value) {
+  var ratio = value;
+  // A per-bucket table: the control sets one number for every bucket, so what it
+  // shows is the default the table falls back to.
+  if (ratio && typeof ratio === 'object' && !Array.isArray(ratio)) ratio = ratio.default;
+  if (typeof ratio !== 'number' || !isFinite(ratio)) return '';
+  return String(Math.round(ratio * 1000) / 10);
+}
+
+// What to tell the operator after a threshold change. `dropped` is the part a
+// bare "saved" would hide: one number replaces a per-bucket table rather than
+// hiding one behind it, and the operator who set those buckets should hear it.
+export function thresholdOutcome(res) {
+  if (!res || !res.ok) return { kind: 'error', text: 'threshold change failed' + (res && res.error ? ': ' + res.error : '') };
+  var pct = thresholdPercentText(res.switchThreshold);
+  var dropped = res.dropped || [];
+  if (dropped.length) return { kind: 'warn', text: 'switch threshold set to ' + pct + '% — dropped the per-bucket thresholds (' + dropped.join(', ') + ')' };
+  return { kind: 'ok', text: 'switch threshold set to ' + pct + '%' };
+}
+
 // What to tell the operator afterwards. The endpoint answers `ok` for the choice
 // being recorded and `eligible` for whether traffic will actually follow it —
 // two different things, and a bare "done" would be a lie for a spent target.
@@ -468,7 +505,7 @@ export function problems(status) {
 
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
-  switchRequest, switchOutcome, routeRows, problems,
+  switchRequest, switchOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -545,6 +582,11 @@ const PAGE = `<!doctype html>
   .actions button { font: inherit; font-size: 12px; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--line); background: transparent; color: var(--dim); cursor: pointer; }
   .actions button:hover { color: var(--text); border-color: var(--text); }
   .actions button:disabled { opacity: .5; cursor: default; }
+  /* Pushed to the far end: the two buttons on the left act on the fleet as it
+     stands, while this one edits a stored setting — a gap says so without a
+     second row. */
+  .actions .thr { display: flex; align-items: center; gap: 6px; margin-left: auto; font-size: 12px; color: var(--dim); }
+  .actions .thr input { width: 64px; font: inherit; font-size: 12px; padding: 4px 8px; text-align: right; border-radius: 999px; border: 1px solid var(--line); background: transparent; color: var(--text); }
   th.sortable { cursor: pointer; user-select: none; }
   th.sortable:hover { color: var(--text); }
   td.dim { color: var(--dim); }
@@ -578,6 +620,12 @@ const PAGE = `<!doctype html>
     <div class="actions">
       <button id="reload" type="button">Reload config</button>
       <button id="probe" type="button">Probe quotas</button>
+      <span class="thr">
+        <label for="thrVal">Switch at</label>
+        <input id="thrVal" type="number" min="1" max="100" step="0.1" inputmode="decimal">
+        <span>%</span>
+        <button id="thrSet" type="button">Set</button>
+      </span>
     </div>
     <div id="err"></div>
     <div id="problems"></div>
@@ -947,6 +995,12 @@ ${SHARED_HELPERS}
 
   function render(s) {
     lastStatus = s;
+    // The poll owns the threshold field except while it is being typed into:
+    // rewriting it every POLL_MS would delete the operator's half-entered
+    // number under the cursor. It also means a change made from the CLI, the
+    // TUI or another browser shows up here without a refresh.
+    var thrInput = document.getElementById('thrVal');
+    if (document.activeElement !== thrInput) thrInput.value = thresholdPercentText(s.switchThreshold);
     var sess = s.sessions || {};
     var up = s.server && s.server.uptimeSeconds != null ? 'up ' + fmtIn(s.server.uptimeSeconds) : '';
     var sum = document.getElementById('summary');
@@ -1016,6 +1070,38 @@ ${SHARED_HELPERS}
       .catch(function (e) { note('error', 'switch failed: ' + e.message); btn.disabled = false; });
   }
 
+  // The one control here that writes a setting rather than nudging the running
+  // fleet: the server saves it to the config file and reloads, so it holds
+  // across a restart. One number governs every quota bucket — a fleet using
+  // per-bucket thresholds is told what the save dropped (thresholdOutcome).
+  function doThreshold(btn) {
+    var input = document.getElementById('thrVal');
+    var raw = input.value.trim();
+    // Left to the server otherwise: an empty field is the one case it would see
+    // as a missing key rather than a bad number, and "invalid request body" is
+    // not what an operator who cleared the box needs to read.
+    if (!raw) { note('error', 'switch threshold: enter a percentage from 1 to 100'); return; }
+    btn.disabled = true;
+    var r = thresholdRequest(Number(raw), localStorage.getItem(KEY));
+    fetch(r.url, r.init)
+      .then(function (res) {
+        if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
+        return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
+      })
+      .then(function (json) {
+        if (!json) return;
+        var out = thresholdOutcome(json);
+        note(out.kind, out.text);
+        // The stored number, not the typed one: the setting is quantised to
+        // tenths, and a field left reading 97.55 after a save of 97.6 invites a
+        // re-save that changes nothing.
+        if (json.ok) input.value = thresholdPercentText(json.switchThreshold);
+        poll();
+      })
+      .catch(function (e) { note('error', 'switch threshold change failed: ' + e.message); })
+      .finally(function () { btn.disabled = false; });
+  }
+
   function doControl(path, label, btn) {
     btn.disabled = true;
     fetch(path, { method: 'POST', headers: { 'x-api-key': localStorage.getItem(KEY) || '' } })
@@ -1083,6 +1169,10 @@ ${SHARED_HELPERS}
   });
   document.getElementById('reload').addEventListener('click', function () { doControl('/teamclaude/reload', 'config reload', this); });
   document.getElementById('probe').addEventListener('click', function () { doControl('/teamclaude/probe', 'quota probe', this); });
+  document.getElementById('thrSet').addEventListener('click', function () { doThreshold(this); });
+  document.getElementById('thrVal').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') document.getElementById('thrSet').click();
+  });
 
   ['fProject', 'fClient'].forEach(function (id) {
     document.getElementById(id).addEventListener('change', function () {
