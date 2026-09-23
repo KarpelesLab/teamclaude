@@ -23,6 +23,7 @@ import { createUsageRecorder, resolveUsageDimensions, usageDimensionHeaderNames 
 import { responsesEventUsage, isResponsesBody, normalizeResponsesUsage } from './responses-usage.js';
 import { classificationPath } from './classification-path.js';
 import { serveManagementMcp } from './mcp-tools.js';
+import { ConfigOpError } from './config-ops.js';
 import { codexSpentWindows, isAccountWideCodexWindow } from './codex-quota.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
@@ -483,6 +484,58 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           console.error('[TeamClaude] Reload failed:', err.message);
           res.writeHead(500, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: 'reload failed; see the proxy log' }));
+        }
+        return;
+      }
+
+      // Account controls — the web equivalent of `teamclaude priority` and
+      // `teamclaude disable` / `enable`. Local control only (no upstream
+      // calls); the auth and cross-origin gates above already apply, and the
+      // hook writes through atomicConfigUpdate so a refusal leaves the file
+      // untouched. Both answer with the account as it now stands, because a
+      // relative move ('first'/'last') picks a number the caller did not send.
+      if (req.method === 'POST' && (req.url === '/teamclaude/priority' || req.url === '/teamclaude/disable')) {
+        const isPriority = req.url === '/teamclaude/priority';
+        const hook = isPriority ? hooks.setAccountPriority : hooks.setAccountDisabled;
+        if (!hook) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: `${isPriority ? 'priority' : 'enable/disable'} not supported` }));
+          return;
+        }
+        let body;
+        try {
+          body = JSON.parse(await readControlBody(req) || '{}');
+        } catch (err) {
+          const tooLarge = /** @type {Error} */ (err).message === 'body too large';
+          res.writeHead(tooLarge ? 413 : 400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: tooLarge ? 'request body too large' : 'invalid request body' }));
+          return;
+        }
+        if (typeof body.account !== 'string' || !body.account.trim()) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'missing "account"' }));
+          return;
+        }
+        try {
+          const result = isPriority
+            ? await hook(body.account.trim(), { priority: body.priority, place: body.place, orgFilter: body.org })
+            : await hook(body.account.trim(), body.disabled, { orgFilter: body.org });
+          // Leave a trace where the manual switch already leaves one: on a
+          // headless deployment this endpoint is the only way the change
+          // happens, and an account leaving rotation should never be silent.
+          console.log(`[TeamClaude] ${isPriority
+            ? `Set priority of "${result.name}" to ${result.priority}`
+            : `${result.disabled ? 'Disabled' : 'Enabled'} account "${result.name}"`} (control endpoint)`);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, ...result }));
+        } catch (err) {
+          // A ConfigOpError is the caller's own input (unknown or ambiguous
+          // account, bad priority) and is safe to echo; anything else is ours.
+          const known = err instanceof ConfigOpError;
+          const message = /** @type {Error} */ (err).message;
+          if (!known) console.error('[TeamClaude] Account control failed:', message);
+          res.writeHead(known ? 400 : 500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: known ? message : 'account change failed; see the proxy log' }));
         }
         return;
       }
