@@ -2245,11 +2245,19 @@ export class TUI {
     // A list with no five-hour window to draw (see _listLayout) starts the row
     // at the weekly bar.
     const weeklyFirst = !shortBar && rowCategory(a) === 'unified';
-    if (weeklyFirst) [l1, r1, t1, w1, th1] = [l2, r2, t2, w2, th2];
+    // A Codex row that has reported a weekly window and no five-hour one draws
+    // only the weekly bar even while Claude rows on the same list keep Ses/Wk:
+    // Codex subscriptions publish no session window, so a `Ses -` cell said
+    // nothing. The weekly bar takes the two cells' width (bar + `  Wk ` + bar)
+    // so the row still ends where its neighbours do.
+    const weeklyOnly = !weeklyFirst && showBoth && rowCategory(a) === 'unified'
+      && providerOf(a) === 'codex' && q.unified5h == null && q.unified7d != null;
+    if (weeklyFirst || weeklyOnly) [l1, r1, t1, w1, th1] = [l2, r2, t2, w2, th2];
+    const bw1 = weeklyOnly ? bw * 2 + 6 : bw;
 
-    let line = ` ${sel}${cur} ${startSlot}${name} ${type}${status} ${l1} ${bar(r1, bw, t1, w1, th1)}`;
+    let line = ` ${sel}${cur} ${startSlot}${name} ${type}${status} ${l1} ${bar(r1, bw1, t1, w1, th1)}`;
     if (showBoth) {
-      if (!weeklyFirst) line += `  ${l2} ${bar(r2, bw, t2, w2, th2)}`;
+      if (!weeklyFirst && !weeklyOnly) line += `  ${l2} ${bar(r2, bw, t2, w2, th2)}`;
       // Sonnet weekly bar — only shown when the usage probe has populated it. A
       // leading ► (in place of a padding space) marks a Sonnet route on this account.
       if (showFamily && q.unified7dSonnet != null) {

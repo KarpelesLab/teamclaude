@@ -237,9 +237,14 @@ test('a Codex pane whose accounts state no five-hour window drops Ses; Wk takes 
   assert.match(left, /Ses .*Wk .*F7/, 'the Anthropic pane is unchanged');
   assert.doesNotMatch(right, /Ses/);
   assert.match(right, /k1@x\.com +active +Wk /);
-  // One account stating the window brings the column back for the pane.
+  // One account stating the window brings the column back for that ROW only:
+  // a Codex row that reports a weekly window and no session window keeps
+  // drawing the wide weekly bar whatever its neighbours state.
   am.accounts[2].quota.unified5h = 0.1;
-  assert.match(halves(accountRows(screen(am, 160).lines)[0])[1], /Ses .*Wk /);
+  const rows = accountRows(screen(am, 160).lines).map(r => halves(r)[1]);
+  assert.match(rows[0], /k1@x\.com +active +Wk /);
+  assert.doesNotMatch(rows[0], /Ses/);
+  assert.match(rows[1], /k2@x\.com +active +Ses .*Wk /);
 });
 
 test('an account that has not reported yet keeps the Ses column, so it does not come and go at startup', () => {
@@ -248,10 +253,13 @@ test('an account that has not reported yet keeps the Ses column, so it does not 
   am.accounts[2].quota = {};
   const rows = accountRows(screen(am, 160).lines).map(r => halves(r)[1]).filter(r => r.trim());
   assert.equal(rows.length, 2);
-  for (const r of rows) assert.match(r, /active +Ses .*Wk /, r);
+  // The reported row (weekly, no session window) draws only the weekly bar;
+  // the unreported one keeps both cells until its probe says otherwise.
+  assert.match(rows[0], /k1@x\.com +active +Wk /, rows[0]);
+  assert.match(rows[1], /k2@x\.com +active +Ses .*Wk /, rows[1]);
 });
 
-test('without a five-hour window a Codex-only list drops Ses, and a mixed single column keeps it', () => {
+test('without a five-hour window a Codex-only list drops Ses, and in a mixed single column only the Codex row does', () => {
   const only = fleet([codex('k1@x.com'), codex('k2@x.com')]);
   for (const a of only.accounts) a.quota.unified5h = null;
   for (const r of accountRows(screen(only, 120).lines)) { assert.doesNotMatch(r, /Ses/); assert.match(r, /Wk /); }
@@ -259,7 +267,12 @@ test('without a five-hour window a Codex-only list drops Ses, and a mixed single
   mixed.accounts[1].quota.unified5h = null;
   const narrow = accountRows(screen(mixed, 100).lines);
   assert.equal(narrow.length, 2);
-  for (const r of narrow) assert.match(r, /Ses /);
+  assert.match(narrow[0], /a@x\.com.*Ses /, 'the Claude row keeps its session bar');
+  assert.match(narrow[1], /k1@x\.com.*Wk /);
+  assert.doesNotMatch(narrow[1], /Ses/, 'the Codex row draws the wide weekly bar');
+  // The weekly bar took both cells' width: it is wider than the Claude row's Wk bar.
+  const barLen = (r) => (r.match(/Wk +\[([^\]]*)\]/) || [,''])[1].length;
+  assert.ok(barLen(narrow[1]) > barLen(narrow[0]) || barLen(narrow[0]) === 0, `${narrow[0]}\n${narrow[1]}`);
 });
 
 test('selection walks the Anthropic pane, then the Codex pane, and stores manager indices', () => {
