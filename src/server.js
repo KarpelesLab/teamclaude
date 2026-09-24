@@ -473,9 +473,12 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           return;
         }
         try {
-          const added = await hooks.reload();
+          const r = await hooks.reload();
+          // Older hooks return a bare count; the current one a { added, removed } pair.
+          const added = typeof r === 'number' ? r : (r?.added || 0);
+          const removed = typeof r === 'number' ? 0 : (r?.removed || 0);
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: true, added: added || 0 }));
+          res.end(JSON.stringify({ ok: true, added, removed }));
         } catch (err) {
           // The reason belongs in the log, not the reply: a reload failure
           // names config paths and account details, and this endpoint is

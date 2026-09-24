@@ -8,7 +8,8 @@ import { accountSwitchThreshold } from './account-manager.js';
 /**
  * Sync accounts from disk config: add new accounts and refresh credentials
  * for existing ones (handles re-imported OAuth tokens, rotated API keys, etc.).
- * Returns the number of new accounts added.
+ * Returns { added, removed }: accounts picked up from disk, and running
+ * accounts dropped because their disk entry is gone.
  * @param {Record<string, any>} diskConfig
  * @param {Record<string, any>} memConfig
  * @param {import('./account-manager.js').AccountManager} accountManager
@@ -196,5 +197,22 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       console.log(`[TeamClaude] Updated API key for "${safeLine(mgr.name, 64)}"`);
     }
   }
-  return added;
+  // Accounts running here that no disk row claims any more were removed on
+  // disk (a `teamclaude remove` from another process, or a hand edit). A reload
+  // used to add only and leave them serving until the next restart, so an
+  // operator's removal did not take effect when they asked for it. Drop them
+  // from the manager and from the in-memory config, highest index first so
+  // the indices already claimed stay valid. The TUI's own in-flight removal
+  // (memory first, disk second) is the opposite direction and untouched.
+  let dropped = 0;
+  for (let i = accountManager.accounts.length - 1; i >= 0; i--) {
+    if (claimed.has(i)) continue;
+    const gone = accountManager.accounts[i];
+    const cfgIdx = memConfig.accounts.findIndex((c, k) => !cfgClaimed.has(k) && sameIdentity(c, gone));
+    console.log(`[TeamClaude] Removed account "${safeLine(gone.name, 64)}": its config entry is gone from disk`);
+    accountManager.removeAccount(i);
+    if (cfgIdx >= 0) memConfig.accounts.splice(cfgIdx, 1);
+    dropped++;
+  }
+  return { added, removed: dropped };
 }

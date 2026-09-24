@@ -399,7 +399,7 @@ async function serverCommand() {
   const reloadAccounts = async () => {
     const diskConfig = await loadConfig();
     if (!diskConfig) return 0;
-    const added = await syncAccountsFromDisk(diskConfig, config, accountManager);
+    const { added, removed } = await syncAccountsFromDisk(diskConfig, config, accountManager);
     // Pick up client-key edits (proxy.clientKeys is read live by both auth
     // gates through the shared config object, so refreshing it here is all a
     // key add/rotate/revoke needs — no restart).
@@ -477,7 +477,7 @@ async function serverCommand() {
         config.warmupSeconds = diskConfig.warmupSeconds || 0;
       }
     }
-    return added;
+    return { added, removed };
   };
 
   // The account half of a save. The TUI's save below starts with it, and the
@@ -2380,7 +2380,10 @@ async function notifyRunningServer(config) {
     });
     if (res.ok) {
       const data = await res.json().catch(() => ({}));
-      console.log(`Reloaded running server${data.added ? ` (+${data.added} new account)` : ''}.`);
+      const parts = [];
+      if (data.added) parts.push(`+${data.added} new account`);
+      if (data.removed) parts.push(`-${data.removed} removed account`);
+      console.log(`Reloaded running server${parts.length ? ` (${parts.join(', ')})` : ''}.`);
     }
   } catch { /* no server running — nothing to notify */ }
 }
