@@ -796,12 +796,24 @@ async function serverCommand() {
       // a held credit, most credits first so the fleet's deepest bank is
       // spent before a one-credit account. The list is read at decision time
       // so a reload or a probe in between is honoured.
-      const candidates = accountManager.accounts
+      // A redemption starts a NEW 7-day window at that instant (it does not
+      // keep the account's natural reset), so a credit spent on an account
+      // that would have reset by itself in a day buys one day of quota, not
+      // a week. Order candidates by how far their natural reset is (furthest
+      // first: the most quota gained), then by credits held; an account within
+      // two days of its own reset is used only when nothing else can be.
+      const DAY = 86_400_000;
+      const untilReset = (a) => (a.quota?.unified7dReset || 0) - Date.now();
+      const all = accountManager.accounts
         .map((a, i) => ({ a, i }))
         .filter(({ a }) => !a.disabled && providerOf(a) === 'codex' && a.accountId
           && (provider == null || providerOf(a) === provider)
           && (a.quota?.resetCredits?.available || 0) > 0)
-        .sort((x, y) => (y.a.quota.resetCredits.available - x.a.quota.resetCredits.available));
+        .sort((x, y) => (untilReset(y.a) - untilReset(x.a))
+          || (y.a.quota.resetCredits.available - x.a.quota.resetCredits.available));
+      const farEnough = all.filter(({ a }) => untilReset(a) >= 2 * DAY);
+      const candidates = farEnough.length ? farEnough : all;
+      if (!farEnough.length && all.length) console.log('[TeamClaude] Auto-redeem: every candidate is within two days of its natural reset; spending one anyway because nothing can serve');
       for (const { a, i } of candidates) {
         const r = await redeemOn(i, 'automatic: no account could serve a request');
         if (r.ok) {
