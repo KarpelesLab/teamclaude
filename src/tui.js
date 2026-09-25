@@ -603,6 +603,7 @@ export class TUI {
     this.selRoute = null;    // in switch mode: null = global default, else a getRoutes() entry to pin
     this.selReturn = 'normal'; // mode to fall back to when select mode closes
     this.setIdx = 0;         // cursor row on the settings screen (BIOS-style nav)
+    this.setScroll = 0;      // first body line the settings screen shows (see _viewport)
     this.blockIdx = 0;       // cursor row on the blocked-models editor
     this.inputPrompt = '';
     this.inputBuf = '';
@@ -1222,10 +1223,13 @@ export class TUI {
     // Tenths of a percent are kept; anything finer is quantised so the stored
     // value is the one the screen shows.
     const v = Math.round(pct * 10) / 1000;
+    const prev = { config: this.config.switchThreshold, live: this.am.switchThreshold };
     this.config.switchThreshold = v;
     this.am.switchThreshold = v; // apply to the running rotation immediately
-    try { await this.saveConfig(this.config); }
-    catch (e) { this._addLog(`Failed to save: ${e.message}`); }
+    if (!await this._saveSetting('switch threshold', () => {
+      this.config.switchThreshold = prev.config;
+      this.am.switchThreshold = prev.live;
+    })) { this.mode = 'settings'; if (this.running) this.render(); return; }
     this._addLog(`Switch threshold set to ${formatPercent(v)}`);
     this.mode = 'settings';
     if (this.running) this.render();
@@ -1597,14 +1601,36 @@ export class TUI {
     if (this.running) this.render();
   }
 
+  /**
+   * Save the shared config after a settings change; on a failed save, put the
+   * old value back. The gates (event logging, the blocklist, session titles, the
+   * sx mode) are read live off the same object, so a value that stayed in memory
+   * after the save failed would change what the running server does while disk
+   * still said otherwise, and the settings row would show the new value the
+   * whole time. Restoring it keeps memory, screen and file in step, and the log
+   * line says which setting was left alone (#443).
+   * @param {string} label what the row is called, for the log line
+   * @param {() => void} revert puts the previous value back in memory
+   * @returns {Promise<boolean>} whether the save landed
+   */
+  async _saveSetting(label, revert) {
+    try { await this.saveConfig(this.config); return true; }
+    catch (/** @type {any} */ e) {
+      revert();
+      this._addLog(`Failed to save: ${e.message} — ${label} left unchanged`);
+      if (this.running) this.render();
+      return false;
+    }
+  }
+
   // Cycle off → on-429 → always (dir +1) or the reverse (dir -1). Keeps the API
   // key, so the user can disable sx.org without deconfiguring it.
   async _cycleSxMode(dir = 1) {
     const order = ['off', '429', 'always'];
     const next = order[(order.indexOf(this.sx.getMode()) + dir + order.length) % order.length];
+    const prev = this.config.sx;
     this.config.sx = { ...(this.config.sx || {}), mode: next };
-    try { await this.saveConfig(this.config); }
-    catch (e) { this._addLog(`Failed to save: ${e.message}`); }
+    if (!await this._saveSetting('sx.org mode', () => { this.config.sx = prev; })) return;
     const r = await this.sx.setMode(next);
     this._addLog(`sx.org mode: ${this._sxModeLabel(next)}${r.ok ? '' : ` — ${r.error}`}`);
     if (next !== 'off') this._loadSxBalance();
@@ -1615,10 +1641,13 @@ export class TUI {
     // The shared config object is what a save writes and a reload re-applies,
     // so it is the record; the store is configured from it, never the reverse.
     const enabled = !this.sessionTitles.enabled;
+    const prev = this.config.sessionTitles;
     this.config.sessionTitles = { ...this.config.sessionTitles, enabled };
     this.sessionTitles.configure(this.config.sessionTitles);
-    try { await this.saveConfig(this.config); }
-    catch (e) { this._addLog(`Failed to save: ${e.message}`); }
+    if (!await this._saveSetting('session titles', () => {
+      this.config.sessionTitles = prev;
+      this.sessionTitles.configure(prev);
+    })) return;
     this._addLog(`Session titles: ${enabled ? 'on' : 'off'}`);
     if (this.running) this.render();
   }
@@ -1632,10 +1661,10 @@ export class TUI {
     //
     // A per-account `autoRedeemReset: false` still exempts its account while
     // this is on; nothing per-account can switch it ON.
-    const next = this.config.autoRedeemResets !== true;
+    const prev = this.config.autoRedeemResets;
+    const next = prev !== true;
     this.config.autoRedeemResets = next;
-    try { await this.saveConfig(this.config); }
-    catch (/** @type {any} */ e) { this._addLog(`Failed to save: ${e.message}`); }
+    if (!await this._saveSetting('auto-redeem', () => { this.config.autoRedeemResets = prev; })) return;
     this._addLog(`Auto-redeem Codex reset credits: ${next ? 'on' : 'off'}`);
     if (this.running) this.render();
   }
@@ -1643,10 +1672,10 @@ export class TUI {
   async _toggleQuotaBarPercent() {
     // Absent means on, so the first toggle from a config that predates the key
     // has to write `false` — hence the comparison rather than a negation.
-    const on = this.config.quotaBarPercent === false;
+    const prev = this.config.quotaBarPercent;
+    const on = prev === false;
     this.config.quotaBarPercent = on;
-    try { await this.saveConfig(this.config); }
-    catch (/** @type {any} */ e) { this._addLog(`Failed to save: ${e.message}`); }
+    if (!await this._saveSetting('bar percentage', () => { this.config.quotaBarPercent = prev; })) return;
     this._addLog(`Quota bar percentage: ${on ? 'on' : 'off'}`);
     if (this.running) this.render();
   }
@@ -1654,11 +1683,11 @@ export class TUI {
   async _cycleEventLogging(dir = 1) {
     // Claude Code telemetry display/handling: show → hide → block → show.
     const order = ['show', 'hide', 'block'];
-    const cur = this.config.eventLogging || 'hide';
+    const prev = this.config.eventLogging;
+    const cur = prev || 'hide';
     const next = order[(order.indexOf(cur) + dir + order.length) % order.length];
     this.config.eventLogging = next; // shared config object; the server reads it live
-    try { await this.saveConfig(this.config); }
-    catch (e) { this._addLog(`Failed to save: ${e.message}`); }
+    if (!await this._saveSetting('event logging', () => { this.config.eventLogging = prev; })) return;
     this._addLog(`Event logging: ${next}`);
     if (this.running) this.render();
   }
@@ -1668,10 +1697,10 @@ export class TUI {
     // Base-URL keeps a shell's other tools off the proxy (#382); MITM covers the
     // hard-coded endpoints and the Codex CLI. Read from disk by those commands,
     // so the save is the whole application.
-    const next = this.config.defaultClientMode === 'base-url' ? 'mitm' : 'base-url';
+    const prev = this.config.defaultClientMode;
+    const next = prev === 'base-url' ? 'mitm' : 'base-url';
     this.config.defaultClientMode = next;
-    try { await this.saveConfig(this.config); }
-    catch (/** @type {any} */ e) { this._addLog(`Failed to save: ${e.message}`); }
+    if (!await this._saveSetting('client mode', () => { this.config.defaultClientMode = prev; })) return;
     this._addLog(`Default client mode: ${next} (run/env without a flag)`);
     if (this.running) this.render();
   }
@@ -2026,7 +2055,14 @@ export class TUI {
       : this.mode === 'add' ? 'settings'
       : this.mode;
     if (view === 'settings') {
-      this._renderSettings(lines);
+      const selLine = this._renderSettings(lines);
+      // The settings body grows with every account and every setting, and a
+      // short terminal used to cut it off silently: the footer, and the rows
+      // past the fold, were pushed off the buffer with nothing said (#445).
+      // The body scrolls instead, following the cursor row.
+      const headerH = 2;   // the title line and its rule, drawn above
+      const body = lines.splice(headerH);
+      lines.push(...this._viewport(body, selLine - headerH, H - footerH - headerH));
     } else if (view === 'routes') {
       this._renderRoutes(lines);
     } else if (view === 'pick') {
@@ -2455,9 +2491,23 @@ export class TUI {
     const type = compact ? '' : `${gray((mixed ? PROVIDERS[providerOf(a)].label : a.type).padEnd(typeW))} `;
 
     // Status — a disabled account is shown as such regardless of its quota state.
+    // So is one rotation will not reach although its own status says active: the
+    // entitlement cooldown a 403 arms and the usage caps live beside the status,
+    // not in it, and a row reading `active` for an account that receives nothing
+    // sent operators looking at the wrong thing (#468). Live, the manager says;
+    // in attach mode the status payload carries the same reason.
+    const barred = typeof this.am.unavailableReason === 'function'
+      ? this.am.unavailableReason(a)
+      : (a.unavailable ?? null);
     let status;
     if (a.disabled) {
       status = gray('disabled');
+    } else if (barred === 'entitlement') {
+      const until = typeof a.entitlementDeniedUntil === 'string' ? Date.parse(a.entitlementDeniedUntil) : a.entitlementDeniedUntil;
+      const left = formatReset(until);
+      status = yellow(left ? `denied ${left}` : 'denied');
+    } else if (typeof barred === 'string' && /capped$/.test(barred)) {
+      status = yellow('capped');
     } else switch (a.status) {
       case 'active':    status = isCur ? green('active') : 'active'; break;
       case 'throttled': status = yellow('throttled'); break;
@@ -2576,10 +2626,45 @@ export class TUI {
     return line;
   }
 
+  /**
+   * The `viewH` lines of `body` to draw, scrolled so that line `sel` (the
+   * cursor row, or -1 for none) is on screen and never under the edge markers.
+   * A body that fits is returned as is. Otherwise the first and last visible
+   * lines become `↑ N more` / `↓ N more` markers whenever there is something
+   * past them, so the fold is never silent. The scroll position persists
+   * between frames (`setScroll`) and only moves when the cursor would leave
+   * the window, so paging with ↑↓ reads like a list, not a jump per keypress.
+   * @param {string[]} body
+   * @param {number} sel
+   * @param {number} viewH
+   */
+  _viewport(body, sel, viewH) {
+    const n = body.length;
+    if (n <= viewH || viewH < 3) { this.setScroll = 0; return body.slice(0, Math.max(0, viewH)); }
+    let top = Math.min(Math.max(0, this.setScroll || 0), n - viewH);
+    if (sel >= 0) {
+      // One line of margin at each edge is where a marker may be drawn; the
+      // cursor row must never be the line a marker replaces.
+      if (sel < top + 1) top = Math.max(0, sel - 1);
+      if (sel > top + viewH - 2) top = Math.min(n - viewH, sel - viewH + 2);
+    }
+    this.setScroll = top;
+    const out = body.slice(top, top + viewH);
+    if (top > 0) out[0] = dim(`  ↑ ${top} more`);
+    if (top + viewH < n) out[viewH - 1] = dim(`  ↓ ${n - top - viewH} more`);
+    return out;
+  }
+
+  /**
+   * Draws the settings screen into `lines`; returns the index in `lines` of the
+   * cursor row, or -1 when no row is selected (so the caller can keep it on screen).
+   * @param {string[]} lines
+   */
   _renderSettings(lines) {
     const fields = this._settingsFields();
     if (this.setIdx >= fields.length) this.setIdx = Math.max(0, fields.length - 1);
     const selId = fields[this.setIdx]?.id;
+    let selLine = -1;
     const byId = id => fields.find(f => f.id === id);
 
     // Render a navigable setting row with a BIOS-style highlight bar on the
@@ -2589,6 +2674,7 @@ export class TUI {
       const label = (field ? field.label : '').padEnd(16);
       const value = field ? field.value() : '';
       if (selected) {
+        selLine = lines.length;   // the row is pushed right after this returns
         const hint = field.hint ? `   ${dim(field.hint)}` : '';
         const inner = rpad(` ${label}  ${strip(value)} `, 34);
         return `  ${cyan('▸')}${REV}${inner}${RESET}${hint}`;
@@ -2651,7 +2737,7 @@ export class TUI {
     // ── sx.org
     lines.push(bold('  sx.org proxy') + dim('  — route upstream via a residential IP (429 workaround)'));
     lines.push('');
-    if (!this.sx) { lines.push(yellow('  Unavailable in this build.')); return; }
+    if (!this.sx) { lines.push(yellow('  Unavailable in this build.')); return selLine; }
     const key = this.config.sx?.apiKey;
     const mode = this.sx.getMode();
     const p = this.sx.getProxy?.();
@@ -2676,6 +2762,7 @@ export class TUI {
       lines.push(dim('  No sx.org account yet? Signing up via https://sx.org/c/ufVrLW'));
       lines.push(dim('  costs nothing extra and supports TeamClaude development.'));
     }
+    return selLine;
   }
 
   // ── routes editor ──────────────────────────────────

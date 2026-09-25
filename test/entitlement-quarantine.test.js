@@ -52,3 +52,40 @@ test('a zero-second entitlement cooldown leaves the account available', () => {
   assert.equal(am.markEntitlementDenied(0, 0), null);
   assert.equal(am.getActiveAccount().name, 'a');
 });
+
+// The TUI status column reads `active` off the account's own status, but the
+// entitlement cooldown and the usage caps live beside it, so a barred account
+// looked exactly like a healthy one (#468). The column now names the bar.
+test('the TUI status column shows an entitlement cooldown and a usage cap', async () => {
+  const { TUI } = await import('../src/tui.js');
+  const { RemoteAccountManager } = await import('../src/tui-remote.js');
+  const strip = s => s.replace(/\x1b\[[0-9;]*m/g, '');
+  const am = new AccountManager([
+    { name: 'denied', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+    { name: 'capped', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000, maxUsage: 0.5 },
+    { name: 'fine', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+  ], 0.98);
+  am.markEntitlementDenied(0, 240);
+  am.accounts[1].quota.unified7d = 0.6;
+  am.accounts[1].quota.unified7dReset = Date.now() + 3600_000;
+  const row = (mgr, i) => {
+    const tui = new TUI({
+      accountManager: mgr, config: { proxy: { port: 1 }, accounts: [], routes: [] },
+      saveConfig: async () => {}, syncAccounts: async () => 0, onQuit: () => {}, remote: mgr !== am,
+    });
+    tui.render = () => {}; tui.mode = 'normal'; tui.selIdx = -1;
+    return strip(tui._renderAcct(i, 8, true, mgr.getRoutes(), [], { fable: null, sonnet: null }));
+  };
+  assert.match(row(am, 0), /denied 4m/);
+  assert.match(row(am, 1), /capped/);
+  assert.match(row(am, 2), /active/);
+  assert.doesNotMatch(row(am, 0), /active/);
+
+  // Attach mode reads the same off the status payload, where the deadline is an
+  // ISO string rather than a timestamp.
+  const remote = new RemoteAccountManager();
+  remote.applyStatus(am.getStatus());
+  assert.match(row(remote, 0), /denied 4m/);
+  assert.match(row(remote, 1), /capped/);
+  assert.match(row(remote, 2), /active/);
+});

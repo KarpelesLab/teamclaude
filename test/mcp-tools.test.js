@@ -5,7 +5,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { AccountManager } from '../src/account-manager.js';
+import { QUOTA_BUCKETS } from '../src/config-ops.js';
 import { createToolSet } from '../src/mcp-tools.js';
+import { WEEKLY_BUCKET_KEYS } from '../src/model.js';
 
 // The write tools drive a real AccountManager against a throwaway config file,
 // with the hooks a server would wire in replaced by spies. Whether reloading
@@ -88,6 +90,13 @@ test('full mode lists every tool in a fixed order, annotated', async () => {
     assert.ok(tool.description.length > 20, tool.name);
   }
   assert.deepEqual(byName.set_account_enabled.inputSchema.required, ['account', 'enabled']);
+  // What the validator enforces, the schema says up front: a list is a list of
+  // strings, and a bucket table only takes the bucket names the setter accepts.
+  for (const [tool, key] of [['set_route', 'match'], ['set_route', 'accounts'], ['set_blocked_models', 'patterns']]) {
+    assert.deepEqual(byName[tool].inputSchema.properties[key].items, { type: 'string' }, `${tool}.${key}`);
+  }
+  assert.deepEqual(byName.set_threshold.inputSchema.properties.buckets.propertyNames, { enum: ['default', ...QUOTA_BUCKETS] });
+  assert.deepEqual(byName.set_route.inputSchema.properties.bucket.enum, [...WEEKLY_BUCKET_KEYS]);
 });
 
 test('switch_account moves the preference and says whether rotation will follow', async () => {
@@ -372,6 +381,58 @@ test('a write that never settles is answered, and the queue moves on without it'
   const next = await ok(tools, 'set_account_priority', { account: 'alice@example.com', priority: 2 });
   assert.equal(next.priority, 2);
   assert.equal(am.accounts[0].priority, 2);
+});
+
+test('the write queue takes only so many turns; past that a call is refused at once', async () => {
+  const releases = [];
+  const reload = () => new Promise(resolve => { releases.push(resolve); });
+  const { tools, disk } = await fixture({ hooks: { reload }, options: { writeQueueDepth: 2 } });
+  const waitFor = async (n) => {
+    const deadline = Date.now() + 5000;
+    while (releases.length < n) {
+      if (Date.now() > deadline) throw new Error(`write ${n} never reached its reload`);
+      await new Promise(r => setTimeout(r, 5));
+    }
+  };
+  const first = tools.call('set_probe_interval', { seconds: 120 });
+  const second = tools.call('set_probe_interval', { seconds: 130 });
+  try {
+    await waitFor(1);
+    // A third has no place in line: answered now, and nothing of it ran.
+    const text = await refused(tools, 'set_probe_interval', { seconds: 140 });
+    assert.match(text, /2 writes are already waiting/);
+    assert.equal((await disk()).quotaProbeSeconds, 120);
+  } finally {
+    // Shared queue: whatever the verdict, the pending turns are let through.
+    await waitFor(1);
+    releases[0]();
+    await first;
+    await waitFor(2);
+    releases[1]();
+    await second;
+  }
+  // Once the line has cleared, the next call is served.
+  const next = tools.call('set_probe_interval', { seconds: 150 });
+  await waitFor(3);
+  releases[2]();
+  assert.deepEqual(await next.then(r => r.structuredContent), { quotaProbeSeconds: 150 });
+});
+
+test('a write is logged once it has happened; a refused one says it was refused', async () => {
+  const lines = [];
+  const original = console.log;
+  console.log = (...args) => { lines.push(args.join(' ')); };
+  try {
+    const { tools } = await fixture();
+    await refused(tools, 'set_threshold', { percent: 0 });
+    await refused(tools, 'set_account_priority', { account: 'nobody@example.com', priority: 1 });
+  } finally {
+    console.log = original;
+  }
+  const audit = lines.filter(l => l.includes('] MCP '));
+  assert.equal(audit.length, 2, lines.join('\n'));
+  for (const line of audit) assert.match(line, /^\[TeamClaude\] MCP \w+ by ci refused \(/, line);
+  assert.match(audit[1], /nobody@example\.com/);
 });
 
 test('every write is logged with the tool, the caller and what changed', async () => {

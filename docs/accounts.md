@@ -412,9 +412,9 @@ The flag the client sets is keyed on the model, not on the account serving it. I
 
 An `upstream` whose host is Anthropic's own is left alone without any flag — a region pin or a mirror reaches the real thread store, so there is nothing to repair. The host is what decides it: a third-party API serving the Anthropic shape does that under its own host.
 
-Only a per-account `upstream` arms this. A fleet pointed at a third-party host through the global `upstream` is not covered, and there is no setting to turn the refusal on for it.
+The effective upstream is what counts. A fleet pointed at a third-party host through the global `upstream` is covered the same way: every account without an `upstream` of its own is refused continues there. (Before 1.1.22 only a per-account `upstream` armed this; a fleet on a third-party global upstream now gets the repair without a setting.)
 
-A relay that forwards to Anthropic does keep thread state, and for it the refusal is pure overhead — the client would re-send a full history each turn for nothing. Declare it with `"messageThreads": true` and continues are forwarded untouched.
+A relay that forwards to Anthropic does keep thread state, and for it the refusal is pure overhead — the client would re-send a full history each turn for nothing. Declare it with `"messageThreads": true` on the account, or at the top level of the config for the global `upstream`, and continues are forwarded untouched.
 
 ### `accounts[].models` is deprecated
 
