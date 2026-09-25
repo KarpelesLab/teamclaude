@@ -1,15 +1,17 @@
 import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired, formatMoney } from './oauth.js';
 import { providerOf, DEFAULT_PROVIDER, isSubscriptionAccount, canServeProvider } from './provider.js';
 import { refreshCodexToken } from './codex-auth.js';
-import { parseCodexQuota, parseCodexPlanType } from './codex-quota.js';
+import { parseCodexQuota, parseCodexPlanType, parseCodexActiveLimit } from './codex-quota.js';
 import { sameIdentity } from './identity.js';
-import { weeklyBucketForModel, modelGlobMatches, modelFamily, gatingUtilization, resolveMaxUsage, resolveSwitchThreshold, sanitizeSwitchThreshold, WEEKLY_BUCKET_KEYS } from './model.js';
+import { weeklyBucketForModel, modelGlobMatches, modelFamily, gatingUtilization, resolveMaxUsage, spendCapReached, resolveSwitchThreshold, sanitizeSwitchThreshold, WEEKLY_BUCKET_KEYS } from './model.js';
 import { SessionTracker } from './session-tracker.js';
 import { buildQuotaSummary, quotaTier } from './quota-summary.js';
 import { ROLLOVER_MIN_JUMP_MS, remapHeld, findHeld, dropHeld, newObservation } from './rollover.js';
 import { decideBand, pressureOf, pressureRank, assertNever } from './band-decision.js';
 import { BurnRateLearner, ConcurrencyLearner, scoreCandidate } from './adaptive-distribution.js';
 import { safeLine } from './safe-text.js';
+import { parseRoutingUrl, describeRouting, routingToUrl, isRoutingFailure } from './account-routing.js';
+import { isSelfProxy } from './upstream-proxy.js';
 /** @typedef {import('./session-tracker.js').Observation} Observation */
 
 // Re-exported for callers that import these model helpers from here.
@@ -64,10 +66,19 @@ const FORCED_REFRESH_FLOOR_MS = 10_000;
 // members to serve, then re-admit it so an administrator's policy change is
 // discovered without a restart.
 const ENTITLEMENT_DENIAL_COOLDOWN_SECONDS = 5 * 60;
+// An account whose OWN routing proxy cannot be reached is no use until the
+// proxy answers again, and asking costs up to the 30s connect budget per
+// request when the proxy is black-holed rather than refusing. Short, because
+// proxies do come back, and the first request after the cooldown is the probe:
+// it either serves or re-arms this.
+const ROUTING_FAILURE_COOLDOWN_SECONDS = 30;
 
 // Codex model-scoped weekly buckets are keyed by slugs taken from response
 // header NAMES, so the table needs a ceiling an upstream cannot talk past.
 const MAX_CODEX_MODEL_BUCKETS = 32;
+// The model-to-limit map is keyed by the model the CLIENT asked for, so it
+// needs the same ceiling for the same reason.
+const MAX_CODEX_MODEL_LIMITS = 32;
 
 // An `anthropic-ratelimit-*-reset` header (epoch seconds) as ms, or null when
 // it is not a positive finite number. Never NaN: see updateQuota.
@@ -105,6 +116,12 @@ const PERSISTED_QUOTA_FIELDS = [
   // until something next reads /wham/usage — and the row that says so is the
   // only place an operator sees one at all.
   'resetCredits',
+  // Whether the last Codex reading stated a 5-hour window at all (see
+  // _updateCodexQuota). A fact about the subscription's shape rather than a
+  // counter, so it holds across a restart: without it a restored Codex row
+  // would draw Ses/Wk until its first reading and then snap to one wide
+  // weekly bar — the startup flicker the TUI rule is written to avoid.
+  'sessionWindowStated',
 ];
 
 // The family (Fable/Sonnet) weekly buckets and the field holding when each was
@@ -131,6 +148,8 @@ const FAMILY_WEEKLY_BUCKETS = [
  * @property {string} [planType]  the Codex subscription tier
  * @property {{available: number, applicable: number|null, seenAt: number}} [resetCredits]  free rate-limit reset credits held, and when that was last seen
  * @property {Record<string, {name: string, utilization: number, resetAt: number|null, seenAt: number}>} [codexModelBuckets]  model-scoped weekly buckets, keyed by slug
+ * @property {Record<string, string>} [codexModelLimits]  which limit each model was last metered on, from `x-codex-active-limit`: a `codexModelBuckets` slug, or the name upstream gives the account-wide limit
+ * @property {boolean} [sessionWindowStated]  whether the last reading that stated a window stated a 5-hour one; `false` says the subscription meters no session window
  */
 
 function emptyQuota() {
@@ -198,11 +217,47 @@ export function accountSwitchThreshold(acct) {
   return value;
 }
 
+/**
+ * One account's own egress proxy (accounts[].routing), parsed and validated.
+ * The URL carries scheme (http/socks4/socks4a/socks5/socks5h), optional
+ * user:pass auth, host and port — see account-routing.js. An unusable value is
+ * dropped with one line saying so, and the account goes by the fleet path
+ * rather than failing every request it touches with a parse error. The
+ * constructor and the config reload both come through here so a value refused
+ * at startup is refused on reload too.
+ *
+ * `listener` is this server's own address (upstream-proxy.js localListener).
+ * A routing that names it is dropped the same way: the MITM listener
+ * intercepts api.anthropic.com, so a request tunnelled through it would come
+ * straight back into forwardRequest and go around again. The fleet
+ * upstreamProxy has the same guard (resolveUpstreamProxy). Null, the default
+ * for callers without a config, compares nothing and drops nothing.
+ * @param {Record<string, any>} acct
+ * @param {{ host: string, port: number }|null} [listener]
+ * @returns {import('./account-routing.js').RoutingProxy|null}
+ */
+export function accountRouting(acct, listener = null) {
+  try {
+    const routing = parseRoutingUrl(acct?.routing);
+    if (routing && isSelfProxy(routing, listener)) {
+      console.log(`[TeamClaude] Account "${safeLine(acct?.name, 64)}": ignoring routing — that address is this server (${describeRouting(routing)}), and a request sent through it would loop back here`);
+      return null;
+    }
+    return routing;
+  } catch (/** @type {any} */ err) {
+    console.log(`[TeamClaude] Account "${safeLine(acct?.name, 64)}": ignoring routing — ${safeLine(err?.message || String(err), 200)}`);
+    return null;
+  }
+}
+
 // Build a fresh in-memory account record from a config/disk account object.
 // Shared by the constructor and addAccount() so the field set can never drift
 // between startup accounts and runtime-added ones (a divergence here once left
 // runtime-added accounts without `inFlight`, hanging every request in admit()).
-function makeAccount(acct, index) {
+// `listener` is the server's own address, for the self-routing guard in
+// accountRouting; null when the manager was built without a config.
+/** @param {{ host: string, port: number }|null} [listener] */
+function makeAccount(acct, index, listener = null) {
   return {
     index,
     // The entry this account was built from. `index` is a position in this list
@@ -236,10 +291,30 @@ function makeAccount(acct, index) {
     displayOrder: Number.isFinite(acct.displayOrder) ? acct.displayOrder : null,
     disabled: acct.disabled || false,
     maxUsage: acct.maxUsage ?? null,
+    // Money cap in the account's currency (accounts[].maxSpend). Like maxUsage a
+    // total, not a preference: at the cap the account receives nothing.
+    maxSpend: acct.maxSpend ?? null,
     // Per-account switchThreshold override (issue #409) — a rotation
     // PREFERENCE like the fleet setting, not the hard cap maxUsage is. See
     // thresholdFor() for the resolution order.
     switchThreshold: accountSwitchThreshold(acct),
+    // This account's own egress proxy, parsed (accounts[].routing). Every
+    // socket opened for the account tunnels through it — request forwarding,
+    // token refresh, profile, usage and quota probes — and it outranks both sx
+    // and the fleet upstream proxy for this account. Null goes by the fleet
+    // path. See account-routing.js.
+    routing: accountRouting(acct, listener),
+    // Whether this account is EXEMPT from spending one of its free Codex
+    // rate-limit reset credits (see codex-reset-credits.js). Negative-only, and
+    // the polarity is the opposite of what the name suggests: the switch that
+    // arms anything is the fleet-wide `autoRedeemResets`, because the policy it
+    // arms ("only when the whole Codex pool is dry") is a statement about the
+    // fleet. All this key can say is "never this one", so `true` and an absent
+    // key mean exactly the same thing here. Meaningless on an Anthropic
+    // account, which has no such credits — the redeemer checks the provider
+    // rather than making the field's default depend on it, so a config moved
+    // between providers keeps saying the same thing.
+    autoRedeemReset: acct.autoRedeemReset !== false,
     upstream: acct.upstream || null,
     modelMap: acct.modelMap || null,
     // Fields to drop from request bodies for this account (third-party upstreams
@@ -285,6 +360,9 @@ function makeAccount(acct, index) {
     // valid. This cross-request cooldown is intentionally ephemeral: unlike
     // quota, it is a live routing observation and is re-learned after restart.
     entitlementDeniedUntil: null,
+    // The account's own routing proxy could not be reached (see
+    // markRoutingFailed). Ephemeral for the same reason: a live observation.
+    routingFailedUntil: /** @type {number|null} */ (null),
     // Storm control (see admit/release): in-flight upstream requests and the
     // time this account last became the current one (starts a ramp window).
     inFlight: 0,
@@ -337,15 +415,18 @@ export class AccountManager {
    * @param {Object} [opts.adaptive]
    * @param {Object} [opts.sessionTracker]
    * @param {Object} [opts.expiryRouting]
+   * @param {{ host: string, port: number }|null} [opts.listener]  this server's own address, so an accounts[].routing that points back at it is refused (see accountRouting)
    */
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, listener = null } = {}) {
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
     // OAuth token refresh.
     this._refreshFn = refreshFn;
     this._codexRefreshFn = codexRefreshFn;
-    this.accounts = accounts.map((acct, index) => makeAccount(acct, index));
+    // Kept for accounts added at runtime, which go through the same guard.
+    this.listener = listener;
+    this.accounts = accounts.map((acct, index) => makeAccount(acct, index, listener));
     this.currentIndex = 0;
     // Session awareness (issue #109). The tracker is always on (passive — it just
     // observes the x-claude-code-session-id header for the status readout).
@@ -547,6 +628,14 @@ export class AccountManager {
    * alone. Both apply: a Fable request is capped by whichever binds first.
    */
   capExceeded(account, model = null) {
+    // The money cap first: it is the budget the usage caps exist to protect, and
+    // it is account-wide — no model is exempt from costing money. `spend` is the
+    // upstream month-to-date record, refreshed only by the quota probe
+    // (prober.js, on its interval) and the TUI's `p` refresh — a response
+    // carries no spend figure — so the cap binds within one probe interval of
+    // the figure being reached, and a new month lifts it on the next reading
+    // by itself.
+    if (account?.maxSpend != null && spendCapReached(account.maxSpend, account.quota?.spend)) return 'spend';
     if (!account?.maxUsage) return null;
     const q = account.quota;
     // Same reason _isNearQuota does this first: a window that has already reset
@@ -753,6 +842,61 @@ export class AccountManager {
    * in storm-control admission. */
   isEntitlementDenied(index, now = Date.now()) {
     return this._entitlementDenied(this.accounts[index], now);
+  }
+
+  /** Keep an account whose own routing proxy failed out of automatic rotation
+   * for a short while, so the requests behind the one that found out do not
+   * each pay the connect failure before failing over. Extends, never shortens.
+   * Returns the expiry timestamp, or null when there is nothing to hold.
+   * @param {number} index
+   * @param {number} [seconds]
+   * @returns {number|null} */
+  markRoutingFailed(index, seconds = ROUTING_FAILURE_COOLDOWN_SECONDS) {
+    const account = this.accounts[index];
+    if (!account?.routing) return null;
+    const duration = Number(seconds);
+    if (!Number.isFinite(duration) || duration <= 0) return null;
+    const until = Date.now() + duration * 1000;
+    account.routingFailedUntil = Math.max(account.routingFailedUntil || 0, until);
+    return account.routingFailedUntil;
+  }
+
+  /** Install an account's routing (null clears it). A different proxy is a
+   * different path, so a cooldown learned on the old one goes with it: the
+   * operator who just fixed the URL should not wait out the old one's hold.
+   * @param {number} index
+   * @param {import('./account-routing.js').RoutingProxy|null} routing */
+  setRouting(index, routing) {
+    const account = this.accounts[index];
+    if (!account) return;
+    if (routingToUrl(routing) !== routingToUrl(account.routing)) account.routingFailedUntil = null;
+    account.routing = routing;
+  }
+
+  /** Public form for the request path, which re-checks after a token refresh.
+   * @param {number} index
+   * @param {number} [now] */
+  isRoutingDown(index, now = Date.now()) {
+    return this._routingDown(this.accounts[index], now);
+  }
+
+  /** A response that came back through the routing proxy is proof it works.
+   * @param {number} index */
+  clearRoutingFailed(index) {
+    const account = this.accounts[index];
+    if (account?.routingFailedUntil) account.routingFailedUntil = null;
+  }
+
+  /** True while an account is in its routing-failure cooldown; expiry is
+   * consumed lazily, as the entitlement cooldown's is.
+   * @param {Record<string, any>|undefined} account
+   * @param {number} [now] */
+  _routingDown(account, now = Date.now()) {
+    if (!account?.routingFailedUntil) return false;
+    if (now < account.routingFailedUntil) return true;
+    account.routingFailedUntil = null;
+    console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" routing cooldown expired; the next request retries its proxy`);
+    return false;
   }
 
   /**
@@ -1596,6 +1740,9 @@ export class AccountManager {
     // A live entitlement cooldown is evidence, not a stale quota estimate. Do
     // not let the all-unavailable probe path defeat it immediately.
     if (this._entitlementDenied(account)) return false;
+    // Nor a routing cooldown: probing would spend the connect budget on a
+    // proxy that was unreachable seconds ago, and the hold is short anyway.
+    if (this._routingDown(account)) return false;
     // A 429 hold is respected verbatim at first, but a hold is a snapshot: the
     // 429 that armed it may itself have been transient (e.g. the retry burst
     // after a network flap), and while it lasts NOTHING revalidates it — so a
@@ -1785,8 +1932,9 @@ export class AccountManager {
    * seeing `unifiedStatus: allowed` next to a refusing account had no way to know
    * the refusal was the proxy's own doing (issue #166).
    *
-   * Returns one of: 'disabled', 'throttled', 'error', 'exhausted',
-   * 'upstream-rejected', 'quota', 'route', 'advisor-quota', 'advisor-route'.
+   * Returns one of: 'disabled', 'spend-capped', 'capped', 'throttled', 'error',
+   * 'entitlement', 'exhausted', 'upstream-rejected', 'quota', 'route', 'routing',
+   * 'advisor-capped', 'advisor-quota', 'advisor-route'.
    */
   unavailableReason(account, model = null, advisorModel = null) {
     if (!account) return 'error';
@@ -1798,7 +1946,9 @@ export class AccountManager {
     // it is a decision rather than an estimate — and unlike the switch threshold
     // nothing overrides it: _selectProbe skips a capped account too, so an
     // account at its cap receives no requests at all.
-    if (this.capExceeded(account, model)) return 'capped';
+    const cap = this.capExceeded(account, model);
+    if (cap === 'spend') return 'spend-capped';
+    if (cap) return 'capped';
 
     // A structured organization-policy 403 means this account cannot serve OAuth
     // requests right now. Skip it across requests until the short cooldown ends.
@@ -1809,6 +1959,9 @@ export class AccountManager {
     // unavailableLine drop the row — so the one state added to make a refusal
     // explainable was the only one that printed no explanation (#258).
     if (this._entitlementDenied(account)) return 'entitlement';
+
+    // The account's own routing proxy could not be reached a moment ago.
+    if (this._routingDown(account)) return 'routing';
 
     // Check rate limit expiry
     if (account.status === 'throttled' && account.rateLimitedUntil) {
@@ -2876,6 +3029,10 @@ export class AccountManager {
    * call frequently (e.g. from the TUI render loop) — once a counter is cleared
    * it stays null until the next upstream response repopulates it, so the
    * "reset" log fires at most once per window.
+   *
+   * `sessionWindowStated` is deliberately not touched here: it records whether
+   * the subscription meters a session window at all, which an expired window
+   * says nothing about (see _updateCodexQuota).
    * @returns {{changed: boolean, session: boolean}} what was cleared.
    */
   _clearExpiredQuotas(account) {
@@ -3337,14 +3494,29 @@ export class AccountManager {
    * Only fields the response actually stated are assigned: a reading that a
    * given response did not carry must not blank what we already knew, and the
    * catalog fetch carries none at all.
+   *
+   * @param {string|null} [model] The model the client asked for, if any.
    */
-  _updateCodexQuota(account, headers) {
+  _updateCodexQuota(account, headers, model) {
     const parsed = parseCodexQuota(headers);
     const observed = new Set();
     // Header-derived strings are rendered into status and logs, so they are
     // stripped and bounded here rather than trusted from a third-party upstream.
     const plan = parseCodexPlanType(headers);
     if (plan) account.quota.planType = safeLine(plan, 64);
+
+    // Which limit metered this model. The response names it and nothing else
+    // does: the buckets say what each limit has left, not which models draw on
+    // it. Re-inserted on every sighting so key order is recency, and the entry
+    // seen longest ago makes room when the table is full.
+    const active = parseCodexActiveLimit(headers);
+    const key = model ? safeLine(model, 64).toLowerCase() : '';
+    if (active && key) {
+      const limits = (account.quota.codexModelLimits ??= {});
+      delete limits[key];
+      while (Object.keys(limits).length >= MAX_CODEX_MODEL_LIMITS) delete limits[Object.keys(limits)[0]];
+      limits[key] = safeLine(active, 64);
+    }
 
     if (parsed.unified5h != null) account.quota.unified5h = parsed.unified5h;
     if (parsed.unified7d != null) {
@@ -3353,6 +3525,17 @@ export class AccountManager {
     }
     if (parsed.unified5hReset != null) account.quota.unified5hReset = parsed.unified5hReset;
     if (parsed.unified7dReset != null) account.quota.unified7dReset = parsed.unified7dReset;
+
+    // Whether this subscription meters a session window at all, kept apart from
+    // the reading itself: `unified5h` is nulled the moment its window expires
+    // (_clearExpiredQuotas), so a TUI row keyed on the reading alone would swing
+    // between Ses/Wk and one wide weekly bar every five hours. Only a response
+    // that stated a window says anything — the catalog fetch carries none — and
+    // a weekly window with no 5-hour one beside it is how a subscription that
+    // meters no session window reads (see codex-quota.js). The usage probe
+    // records the same fact in applyCodexUsageData.
+    if (parsed.unified5h != null) account.quota.sessionWindowStated = true;
+    else if (parsed.unified7d != null) account.quota.sessionWindowStated = false;
 
     // A model-scoped weekly bucket is the counterpart of Anthropic's `7d_oi`
     // Fable bucket: it rides only on responses for that model, so stamp when
@@ -3399,7 +3582,7 @@ export class AccountManager {
     }
   }
 
-  updateQuota(accountIndex, headers) {
+  updateQuota(accountIndex, headers, model = null) {
     const account = this.accounts[accountIndex];
     if (!account) return;
 
@@ -3408,7 +3591,7 @@ export class AccountManager {
     // downstream — the switch threshold, reset countdowns, the TUI bars — then
     // works unchanged rather than needing a parallel Codex-shaped path.
     if (providerOf(account) === 'codex') {
-      this._updateCodexQuota(account, headers);
+      this._updateCodexQuota(account, headers, model);
       return;
     }
 
@@ -3721,6 +3904,9 @@ export class AccountManager {
       q.unified7d = usage.sevenDay.utilization;
       q.unified7dReset = usage.sevenDay.resetAt ?? null;
     }
+    // Same sticky fact the header path records; see _updateCodexQuota.
+    if (usage.fiveHour) q.sessionWindowStated = true;
+    else if (usage.sevenDay) q.sessionWindowStated = false;
     if (usage.planType) q.planType = safeLine(usage.planType, 64);
     // Stamped, because nothing else refreshes it: a payload that mentions no
     // credits leaves the last reading alone rather than blanking it, so the
@@ -3866,10 +4052,11 @@ export class AccountManager {
         // Each provider mints tokens at its own endpoint with its own client
         // id, so the grant is dispatched by provider. Both return the same
         // { accessToken, refreshToken, expiresAt } shape, which is what lets
-        // everything downstream stay provider-agnostic.
+        // everything downstream stay provider-agnostic. The account's own
+        // routing applies here too: a token refresh is that account's traffic.
         const newTokens = await (providerOf(account) === 'codex'
-          ? this._codexRefreshFn(sent)
-          : this._refreshFn(sent));
+          ? this._codexRefreshFn(sent, undefined, account.routing || null)
+          : this._refreshFn(sent, undefined, account.routing || null));
         if (account.refreshToken !== sent) {
           console.log(`[TeamClaude] Discarding refresh result for account "${safeLine(account.name, 64)}" — its tokens were replaced while the refresh was in flight`);
           return;
@@ -3883,6 +4070,10 @@ export class AccountManager {
         this._onTokenRefresh?.(accountIndex, newTokens);
       } catch (err) {
         console.error(`[TeamClaude] Token refresh failed for "${safeLine(account.name, 64)}": ${err.message}`);
+        // The refresh never reached the token endpoint: the account's own
+        // routing proxy is down. The forward that follows would fail the same
+        // way, so hold the account out of rotation now rather than after it.
+        if (isRoutingFailure(err)) this.markRoutingFailed(accountIndex);
         // Reserve 'error' (which drops the account from rotation until re-login)
         // for a GENUINE auth rejection: the refresh token itself is no longer
         // valid — revoked, or invalidated by an account/plan migration. A
@@ -3962,7 +4153,7 @@ export class AccountManager {
    */
   addAccount(acctData) {
     const index = this.accounts.length;
-    this.accounts.push(makeAccount(acctData, index));
+    this.accounts.push(makeAccount(acctData, index, this.listener));
     return index;
   }
 
@@ -4140,11 +4331,16 @@ export class AccountManager {
         displayOrder: a.displayOrder ?? null,
         disabled: a.disabled || false,
         maxUsage: a.maxUsage ?? null,
+        maxSpend: a.maxSpend ?? null,
         // Raw per-account override (issue #409), same shapes as the fleet-wide
         // field, so a remote reader (the attach-mode TUI, a status --json
         // consumer) can resolve it with the shared resolveSwitchThreshold
         // rather than only seeing this account's already-resolved default.
         switchThreshold: a.switchThreshold ?? null,
+        // The account's own egress proxy, password masked (describeRouting):
+        // the status payload crosses process boundaries to the attach TUI and
+        // `status --json`, and a credential has no business in either.
+        routing: describeRouting(a.routing),
         status: a.status,
         // Why the account is out of rotation right now (null = it can serve).
         // Distinguishes a local threshold decision from an upstream rejection —
@@ -4178,6 +4374,9 @@ export class AccountManager {
           : null,
         entitlementDeniedUntil: a.entitlementDeniedUntil && a.entitlementDeniedUntil > Date.now()
           ? new Date(a.entitlementDeniedUntil).toISOString()
+          : null,
+        routingFailedUntil: a.routingFailedUntil && a.routingFailedUntil > Date.now()
+          ? new Date(a.routingFailedUntil).toISOString()
           : null,
       })),
     };

@@ -77,9 +77,9 @@ function additionalLimits(additional) {
  *  - `applicable` is upstream's own view of how many would reset something
  *    right now — 0 whenever no window is currently eligible.
  *
- * Neither is a verdict on whether a credit could actually be spent: that is
- * stated only by the account's own credit rows, which say whether a specific
- * credit is both available and supported by the plan.
+ * Neither decides a redemption: only the detail rows say whether a specific
+ * credit is both available and supported by the plan, and spending one is not
+ * recoverable. See codex-reset-credits.js.
  *
  * @param {any} raw  the payload's `rate_limit_reset_credits` object
  */
@@ -177,6 +177,9 @@ export async function fetchCodexUsage(account, { fetchImpl = proxyFetch, timeout
         Accept: 'application/json',
       },
       signal: AbortSignal.timeout(timeoutMs),
+      // The account's own egress proxy, when it has one (account-routing.js);
+      // null on every other account, where this key is inert.
+      routing: account.routing ?? null,
     });
     if (!res.ok) return { error: `HTTP ${res.status}`, status: res.status };
     return normalizeCodexUsagePayload(await res.json());

@@ -290,3 +290,22 @@ test('the function needs no manager: plain account records are enough', () => {
   assert.equal(msg, 'No account can serve this request for m: account "x" needs re-login (run: teamclaude login); '
     + '1 account is at its quota or rate limit. Quota resets in 90s. (1 more disabled)');
 });
+
+test('an account inside its routing cooldown is named with its own next step, not filed under quota', () => {
+  const soon = Date.now() + 20_000;
+  const routed = { name: 'routed@example.com', status: 'active', routingFailedUntil: soon };
+  assert.equal(
+    exhaustedMessage([routed], null, 20),
+    'No account can serve this request: account "routed@example.com" cannot reach its routing proxy (see: teamclaude routing <name>), and no other account is eligible for it.',
+  );
+  assert.equal(
+    exhaustedMessage([routed, { name: 'full', status: 'active' }], 'claude-opus-5', 300),
+    'No account can serve this request for claude-opus-5: account "routed@example.com" cannot reach its routing proxy (see: teamclaude routing <name>); 1 account is at its quota or rate limit. Quota resets in 5m.',
+  );
+  assert.equal(
+    exhaustedMessage([{ name: 'dead', status: 'error' }, routed], null, 20),
+    'No account can serve this request: account "dead" needs re-login (run: teamclaude login); account "routed@example.com" cannot reach its routing proxy (see: teamclaude routing <name>), and no other account is eligible for it.',
+  );
+  // A cooldown that has lapsed is not a blocker any more.
+  assert.match(exhaustedMessage([{ name: 'was-routed', status: 'active', routingFailedUntil: Date.now() - 1 }], null, 60), /at their quota or rate limit/);
+});

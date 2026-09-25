@@ -8,13 +8,21 @@ import {
   renderDashboardHtml, dashboardCsp, scopedWeeklyRows, accountTokens,
   accountBadges, thresholdBadgeText,
   sessionRows, filterSessionRows, sortRows, uniqSorted,
-  switchRequest, switchOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
+  switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
+  thresholdRequest, thresholdPercentText, thresholdOutcome,
   usageFor, USAGE_VIEWS,
 } from '../src/dashboard.js';
 import { USAGE_WINDOWS } from '../src/client-usage.js';
 
 function listen(server) {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
+}
+
+// The page's main inline script — what the CSP hashes and what the harness
+// below runs. One extraction for every test, so a page that gains a second
+// script block changes this in one place.
+function mainScript(html) {
+  return html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
 }
 
 // The page's pure logic is exported and serialized into the script, so these
@@ -114,6 +122,16 @@ test('thresholdBadgeText names a bucket the account default moves off the fleet 
   assert.equal(thresholdBadgeText({ default: 0.98, unified7d: 0.85 }, 0.98, fleetTable), '');
   // A differing default already covers every unlisted bucket.
   assert.equal(thresholdBadgeText(1.0, 0.98, fleetTable), 'switch at 100%');
+});
+
+test('accountBadges names a routed account\'s proxy as the status payload masks it, and stays silent otherwise', () => {
+  const routed = accountBadges({ name: 'a', type: 'oauth', routing: 'socks5h://alice:***@proxy.example.com:1080' }, null, null);
+  assert.deepEqual(routed.find(b => b.cls === 'meta routing'), { cls: 'meta routing', text: 'via socks5h://alice:***@proxy.example.com:1080' });
+  assert.equal(accountBadges({ name: 'a', type: 'oauth' }, null, null).some(b => /routing/.test(b.cls)), false);
+  // The payload is masked at the source. A parsed object would mean the live
+  // account leaked into it, password and all: draw nothing rather than that.
+  const leaked = accountBadges({ name: 'a', type: 'oauth', routing: { host: 'h', password: 'p' } }, null, null);
+  assert.equal(leaked.some(b => /routing/.test(b.cls)), false);
 });
 
 test('accountBadges adds the threshold badge only when it differs from the fleet', () => {
@@ -558,7 +576,7 @@ test('the serialized helpers run in the page\'s own scope, not just parse', () =
   // constant the page never ships — it would ReferenceError at first render.
   // Evaluate ONLY the serialized bundle and call into it.
   const html = renderDashboardHtml();
-  const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
+  const script = mainScript(html);
   const bundle = script.slice(script.indexOf('var STARVED_MIN'), script.indexOf('function el('));
   const isolated = new Function(`${bundle}; return problems;`)();
   const payload = { sessions: { items: [{ id: 'deadbeef1234', client: 'alice', active: true, starved: 9, requests: 9, pins: {}, tokens: {} }] } };
@@ -572,7 +590,7 @@ test('the serialized helpers run in the page\'s own scope, not just parse', () =
 // grepping the source would not catch — only running the bundle does.
 test('accountBadges calls thresholdBadgeText inside the same serialized bundle', () => {
   const html = renderDashboardHtml();
-  const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
+  const script = mainScript(html);
   const bundle = script.slice(script.indexOf('var STARVED_MIN'), script.indexOf('function el('));
   const isolated = new Function(`${bundle}; return accountBadges;`)();
   const account = { name: 'a', type: 'oauth', switchThreshold: 1.0 };
@@ -586,7 +604,7 @@ test('accountBadges calls thresholdBadgeText inside the same serialized bundle',
 // it threw a ReferenceError from render() and blanked the accounts pane.
 test('a table-form override renders its badge inside the serialized bundle', () => {
   const html = renderDashboardHtml();
-  const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
+  const script = mainScript(html);
   const bundle = script.slice(script.indexOf('var STARVED_MIN'), script.indexOf('function el('));
   const isolated = new Function(`${bundle}; return accountBadges;`)();
   const account = { name: 'a', type: 'oauth', switchThreshold: { unified7d: 0.9, unified7dFable: 0.8 } };
@@ -597,14 +615,74 @@ test('a table-form override renders its badge inside the serialized bundle', () 
   assert.deepEqual(moved[moved.length - 1], { cls: 'meta threshold', text: 'switch 7d 98%' });
 });
 
+// The "Switch at __ %" control. The stored setting is a 0–1 ratio quantised to
+// tenths of a percent; the field shows the percentage, so the two have to agree
+// or a re-save of what is on screen would change the setting.
+test('thresholdPercentText shows the stored ratio as a percentage', () => {
+  assert.equal(thresholdPercentText(0.98), '98');
+  // No trailing zero: "98.0" in the box would read as a different number from
+  // the 98 the status line and the CLI both print.
+  assert.equal(thresholdPercentText(0.9), '90');
+  assert.equal(thresholdPercentText(0.915), '91.5');
+  assert.equal(thresholdPercentText(1), '100');
+});
+
+test('thresholdPercentText shows a per-bucket table as its default', () => {
+  // The control sets one number for every bucket, so the default is the only
+  // part of a table it can honestly show.
+  assert.equal(thresholdPercentText({ default: 0.91, unified7d: 0.8 }), '91');
+  // A config with no switchThreshold at all, and the array a hand edit can
+  // produce: an empty field is better than a made-up number.
+  assert.equal(thresholdPercentText(undefined), '');
+  assert.equal(thresholdPercentText(null), '');
+  assert.equal(thresholdPercentText([0.9]), '');
+});
+
+test('thresholdOutcome says when one number replaced a per-bucket table', () => {
+  assert.deepEqual(
+    thresholdOutcome({ ok: true, switchThreshold: 0.91, dropped: [] }),
+    { kind: 'ok', text: 'switch threshold set to 91%' },
+  );
+  // A bare "saved" would hide the part the operator most needs to hear.
+  const dropped = thresholdOutcome({ ok: true, switchThreshold: 0.9, dropped: ['unified7d', 'tokens'] });
+  assert.equal(dropped.kind, 'warn');
+  assert.match(dropped.text, /unified7d, tokens/);
+  assert.deepEqual(
+    thresholdOutcome({ ok: false, error: 'percent must be a number from 1 to 100' }),
+    { kind: 'error', text: 'threshold change failed: percent must be a number from 1 to 100' },
+  );
+  assert.deepEqual(thresholdOutcome(null), { kind: 'error', text: 'threshold change failed' });
+});
+
+test('thresholdRequest posts the number to the control endpoint with the key', () => {
+  const r = thresholdRequest(91.5, 'secret');
+  assert.equal(r.url, '/teamclaude/threshold');
+  assert.equal(r.init.method, 'POST');
+  assert.equal(r.init.headers['x-api-key'], 'secret');
+  assert.equal(r.init.body, '{"percent":91.5}');
+  // A page that has no key yet still sends the header: loopback is exempt from
+  // the key gate, and an absent header would be a different request shape.
+  assert.equal(thresholdRequest(90, null).init.headers['x-api-key'], '');
+});
+
+test('the page carries the threshold control and wires it', () => {
+  const html = renderDashboardHtml();
+  assert.ok(html.includes('id="thrVal"'), 'the percentage field');
+  assert.ok(html.includes('id="thrSet"'), 'the Set button');
+  assert.ok(html.includes("getElementById('thrSet').addEventListener"), 'the click handler');
+  // Enter in the field is the same action: a number typed and left alone would
+  // otherwise look applied without being saved.
+  assert.ok(html.includes("getElementById('thrVal').addEventListener"), 'the Enter handler');
+});
+
 test('the page ships the same helper implementations it is tested against', () => {
   // The serialization is the contract: if a helper stops being self-contained
   // (closes over module scope), the page would silently ReferenceError.
   const html = renderDashboardHtml();
-  for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, routeRows, problems, usageFor]) {
+  for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
-  const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
+  const script = mainScript(html);
   assert.doesNotThrow(() => new Function(script), 'inline script must parse');
 });
 
@@ -639,7 +717,7 @@ function bootPage({ storedKey = null } = {}) {
   const fetch = (url, init) => new Promise(resolve => requests.push({ url, init, resolve }));
   const document = { getElementById: byId, createElement: () => stubEl() };
   const html = renderDashboardHtml();
-  const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
+  const script = mainScript(html);
   new Function('document', 'localStorage', 'fetch', 'setInterval', 'clearInterval', script)(
     document, localStorage, fetch, () => 1, () => {});
   const answer = async (status, body = {}) => {
@@ -732,7 +810,7 @@ test('GET /teamclaude/dashboard serves HTML without a key; other methods are a l
     assert.match(csp, /(^|; )connect-src 'self'(;|$)/);
     assert.match(csp, /(^|; )frame-ancestors 'none'(;|$)/);
     assert.doesNotMatch(csp, /script-src[^;]*'unsafe-inline'/);
-    const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
+    const script = mainScript(html);
     const hash = createHash('sha256').update(script, 'utf8').digest('base64');
     assert.match(csp, new RegExp(`script-src 'sha256-${hash.replace(/[+/=]/g, '\\$&')}'`));
     assert.equal(page.headers.get('x-content-type-options'), 'nosniff');
@@ -749,6 +827,48 @@ test('GET /teamclaude/dashboard serves HTML without a key; other methods are a l
     proxy.close();
     upstream.close();
   }
+});
+
+test('accountControlRequest picks the endpoint and body from the spec', () => {
+  // A relative move sends `place` and no number: the caller has buttons, not a
+  // number field, and the server is the one that knows the other priorities.
+  const first = accountControlRequest('a@x.com', { place: 'first' }, 'k');
+  assert.equal(first.url, '/teamclaude/priority');
+  assert.deepEqual(JSON.parse(first.init.body), { account: 'a@x.com', place: 'first' });
+  assert.equal(first.init.headers['x-api-key'], 'k');
+
+  const exact = accountControlRequest('a@x.com', { priority: 3 }, 'k');
+  assert.deepEqual(JSON.parse(exact.init.body), { account: 'a@x.com', priority: 3 });
+
+  // disabled:false is a real value, not an absent one — it must still route to
+  // the disable endpoint rather than being read as a priority change.
+  const off = accountControlRequest('a@x.com', { disabled: true }, 'k');
+  assert.equal(off.url, '/teamclaude/disable');
+  assert.deepEqual(JSON.parse(off.init.body), { account: 'a@x.com', disabled: true });
+  const on = accountControlRequest('a@x.com', { disabled: false }, 'k');
+  assert.equal(on.url, '/teamclaude/disable');
+  assert.deepEqual(JSON.parse(on.init.body), { account: 'a@x.com', disabled: false });
+
+  // No key configured is not an error here; the server decides.
+  assert.equal(accountControlRequest('a@x.com', { place: 'last' }, null).init.headers['x-api-key'], '');
+});
+
+test('accountControlOutcome reports the number a relative move landed on', () => {
+  assert.deepEqual(
+    accountControlOutcome({ ok: true, name: 'a@x.com', priority: -1 }, { place: 'first' }),
+    { kind: 'ok', text: 'a@x.com priority -1' });
+  assert.deepEqual(
+    accountControlOutcome({ ok: true, name: 'a@x.com', disabled: true }, { disabled: true }),
+    { kind: 'ok', text: 'disabled a@x.com' });
+  assert.deepEqual(
+    accountControlOutcome({ ok: true, name: 'a@x.com', disabled: false }, { disabled: false }),
+    { kind: 'ok', text: 'enabled a@x.com' });
+  assert.deepEqual(
+    accountControlOutcome({ ok: false, error: 'no account matches "z"' }, { place: 'first' }),
+    { kind: 'error', text: 'change failed: no account matches "z"' });
+  assert.deepEqual(
+    accountControlOutcome(null, { place: 'first' }),
+    { kind: 'error', text: 'change failed' });
 });
 
 // ── usage windows ───────────────────────────────────────────

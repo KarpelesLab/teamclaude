@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import { spawnSync } from 'node:child_process';
 import assert from 'node:assert/strict';
-import { buildClaudeEnvLines, bypassesAllHosts, clearSelfProxyEnvLines, mergeNoProxy, resolveClientMode } from '../src/claude-env.js';
+import { buildClaudeEnvLines, bypassesAllHosts, clearSelfProxyEnvLines, localLoginHint, mergeNoProxy, resolveClientMode } from '../src/claude-env.js';
 
 test('MITM mode (default) emits proxy vars + CA cert, and clears ANTHROPIC_BASE_URL', () => {
   const lines = buildClaudeEnvLines({ port: 3456, caPath: '/home/u/.config/teamclaude-ca.pem' });
@@ -194,4 +194,18 @@ test('clearSelfProxyEnvLines unsets only proxy variables naming this proxy', () 
   assert.deepEqual(clearSelfProxyEnvLines(3456, env).sort(), ['unset HTTPS_PROXY', 'unset https_proxy']);
   assert.deepEqual(clearSelfProxyEnvLines(3456, {}), []);
   assert.throws(() => clearSelfProxyEnvLines('3456; rm -rf /', env), /proxy.port/);
+});
+
+// Claude Code gates on its own login before it sends anything, so a fleet with
+// healthy accounts still fails at launch when that login has lapsed, with an
+// error that reads like the pool being down (#395). The hint names the right
+// login; it stays quiet when the local login looks fine, or is simply unreadable
+// in a way that says nothing.
+test('the local-login hint fires for a missing or stale login and not for a live one', async () => {
+  const expired = (at) => typeof at === 'number' && at < Date.now();
+  assert.match(await localLoginHint({ read: async () => { throw new Error('ENOENT'); }, expired }), /no login of its own.*claude auth login/);
+  assert.match(await localLoginHint({ read: async () => ({ accessToken: undefined, refreshToken: undefined }), expired }), /no login of its own/);
+  assert.match(await localLoginHint({ read: async () => ({ accessToken: 'a', refreshToken: 'r', expiresAt: Date.now() - 1 }), expired }), /Claude Code's own login.*claude auth login/);
+  assert.equal(await localLoginHint({ read: async () => ({ accessToken: 'a', refreshToken: 'r', expiresAt: Date.now() + 3600_000 }), expired }), null);
+  assert.equal(await localLoginHint({ read: async () => ({ accessToken: 'a', refreshToken: 'r' }), expired }), null, 'no expiry recorded is not evidence');
 });
