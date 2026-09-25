@@ -1,7 +1,7 @@
 import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired, formatMoney } from './oauth.js';
 import { providerOf, DEFAULT_PROVIDER, isSubscriptionAccount, canServeProvider } from './provider.js';
 import { refreshCodexToken } from './codex-auth.js';
-import { parseCodexQuota, parseCodexPlanType } from './codex-quota.js';
+import { parseCodexQuota, parseCodexPlanType, parseCodexActiveLimit } from './codex-quota.js';
 import { sameIdentity } from './identity.js';
 import { weeklyBucketForModel, modelGlobMatches, modelFamily, gatingUtilization, resolveMaxUsage, resolveSwitchThreshold, sanitizeSwitchThreshold, WEEKLY_BUCKET_KEYS } from './model.js';
 import { SessionTracker } from './session-tracker.js';
@@ -76,6 +76,9 @@ const ROUTING_FAILURE_COOLDOWN_SECONDS = 30;
 // Codex model-scoped weekly buckets are keyed by slugs taken from response
 // header NAMES, so the table needs a ceiling an upstream cannot talk past.
 const MAX_CODEX_MODEL_BUCKETS = 32;
+// The model-to-limit map is keyed by the model the CLIENT asked for, so it
+// needs the same ceiling for the same reason.
+const MAX_CODEX_MODEL_LIMITS = 32;
 
 // An `anthropic-ratelimit-*-reset` header (epoch seconds) as ms, or null when
 // it is not a positive finite number. Never NaN: see updateQuota.
@@ -113,6 +116,12 @@ const PERSISTED_QUOTA_FIELDS = [
   // until something next reads /wham/usage — and the row that says so is the
   // only place an operator sees one at all.
   'resetCredits',
+  // Whether the last Codex reading stated a 5-hour window at all (see
+  // _updateCodexQuota). A fact about the subscription's shape rather than a
+  // counter, so it holds across a restart: without it a restored Codex row
+  // would draw Ses/Wk until its first reading and then snap to one wide
+  // weekly bar — the startup flicker the TUI rule is written to avoid.
+  'sessionWindowStated',
 ];
 
 // The family (Fable/Sonnet) weekly buckets and the field holding when each was
@@ -139,6 +148,8 @@ const FAMILY_WEEKLY_BUCKETS = [
  * @property {string} [planType]  the Codex subscription tier
  * @property {{available: number, applicable: number|null, seenAt: number}} [resetCredits]  free rate-limit reset credits held, and when that was last seen
  * @property {Record<string, {name: string, utilization: number, resetAt: number|null, seenAt: number}>} [codexModelBuckets]  model-scoped weekly buckets, keyed by slug
+ * @property {Record<string, string>} [codexModelLimits]  which limit each model was last metered on, from `x-codex-active-limit`: a `codexModelBuckets` slug, or the name upstream gives the account-wide limit
+ * @property {boolean} [sessionWindowStated]  whether the last reading that stated a window stated a 5-hour one; `false` says the subscription meters no session window
  */
 
 function emptyQuota() {
@@ -3005,6 +3016,10 @@ export class AccountManager {
    * call frequently (e.g. from the TUI render loop) — once a counter is cleared
    * it stays null until the next upstream response repopulates it, so the
    * "reset" log fires at most once per window.
+   *
+   * `sessionWindowStated` is deliberately not touched here: it records whether
+   * the subscription meters a session window at all, which an expired window
+   * says nothing about (see _updateCodexQuota).
    * @returns {{changed: boolean, session: boolean}} what was cleared.
    */
   _clearExpiredQuotas(account) {
@@ -3466,14 +3481,29 @@ export class AccountManager {
    * Only fields the response actually stated are assigned: a reading that a
    * given response did not carry must not blank what we already knew, and the
    * catalog fetch carries none at all.
+   *
+   * @param {string|null} [model] The model the client asked for, if any.
    */
-  _updateCodexQuota(account, headers) {
+  _updateCodexQuota(account, headers, model) {
     const parsed = parseCodexQuota(headers);
     const observed = new Set();
     // Header-derived strings are rendered into status and logs, so they are
     // stripped and bounded here rather than trusted from a third-party upstream.
     const plan = parseCodexPlanType(headers);
     if (plan) account.quota.planType = safeLine(plan, 64);
+
+    // Which limit metered this model. The response names it and nothing else
+    // does: the buckets say what each limit has left, not which models draw on
+    // it. Re-inserted on every sighting so key order is recency, and the entry
+    // seen longest ago makes room when the table is full.
+    const active = parseCodexActiveLimit(headers);
+    const key = model ? safeLine(model, 64).toLowerCase() : '';
+    if (active && key) {
+      const limits = (account.quota.codexModelLimits ??= {});
+      delete limits[key];
+      while (Object.keys(limits).length >= MAX_CODEX_MODEL_LIMITS) delete limits[Object.keys(limits)[0]];
+      limits[key] = safeLine(active, 64);
+    }
 
     if (parsed.unified5h != null) account.quota.unified5h = parsed.unified5h;
     if (parsed.unified7d != null) {
@@ -3482,6 +3512,17 @@ export class AccountManager {
     }
     if (parsed.unified5hReset != null) account.quota.unified5hReset = parsed.unified5hReset;
     if (parsed.unified7dReset != null) account.quota.unified7dReset = parsed.unified7dReset;
+
+    // Whether this subscription meters a session window at all, kept apart from
+    // the reading itself: `unified5h` is nulled the moment its window expires
+    // (_clearExpiredQuotas), so a TUI row keyed on the reading alone would swing
+    // between Ses/Wk and one wide weekly bar every five hours. Only a response
+    // that stated a window says anything — the catalog fetch carries none — and
+    // a weekly window with no 5-hour one beside it is how a subscription that
+    // meters no session window reads (see codex-quota.js). The usage probe
+    // records the same fact in applyCodexUsageData.
+    if (parsed.unified5h != null) account.quota.sessionWindowStated = true;
+    else if (parsed.unified7d != null) account.quota.sessionWindowStated = false;
 
     // A model-scoped weekly bucket is the counterpart of Anthropic's `7d_oi`
     // Fable bucket: it rides only on responses for that model, so stamp when
@@ -3528,7 +3569,7 @@ export class AccountManager {
     }
   }
 
-  updateQuota(accountIndex, headers) {
+  updateQuota(accountIndex, headers, model = null) {
     const account = this.accounts[accountIndex];
     if (!account) return;
 
@@ -3537,7 +3578,7 @@ export class AccountManager {
     // downstream — the switch threshold, reset countdowns, the TUI bars — then
     // works unchanged rather than needing a parallel Codex-shaped path.
     if (providerOf(account) === 'codex') {
-      this._updateCodexQuota(account, headers);
+      this._updateCodexQuota(account, headers, model);
       return;
     }
 
@@ -3850,6 +3891,9 @@ export class AccountManager {
       q.unified7d = usage.sevenDay.utilization;
       q.unified7dReset = usage.sevenDay.resetAt ?? null;
     }
+    // Same sticky fact the header path records; see _updateCodexQuota.
+    if (usage.fiveHour) q.sessionWindowStated = true;
+    else if (usage.sevenDay) q.sessionWindowStated = false;
     if (usage.planType) q.planType = safeLine(usage.planType, 64);
     // Stamped, because nothing else refreshes it: a payload that mentions no
     // credits leaves the last reading alone rather than blanking it, so the

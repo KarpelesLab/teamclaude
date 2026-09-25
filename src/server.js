@@ -2675,7 +2675,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         rateLimitHeaders[key] = value;
       }
     }
-    accountManager.updateQuota(account.index, rateLimitHeaders);
+    accountManager.updateQuota(account.index, rateLimitHeaders, ctx.model);
 
     // Any response at all came back through the account's routing proxy.
     accountManager.clearRoutingFailed(account.index);
