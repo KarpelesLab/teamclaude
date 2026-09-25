@@ -69,9 +69,18 @@ Headless, you can re-sync accounts from the config without a restart by POSTing 
 curl -X POST http://localhost:3456/teamclaude/reload
 ```
 
+The switch threshold has a control endpoint of its own — the same change as `teamclaude threshold 90`, and what the browser dashboard's **Switch at** control sends:
+
+```bash
+curl -X POST http://localhost:3456/teamclaude/threshold \
+  -H 'content-type: application/json' -d '{"percent": 90}'
+```
+
+It is a setting, not a nudge: the number is written to the config file (under its lock, so an edit the CLI or TUI made meanwhile survives) and the server reloads to apply it. The answer carries the stored ratio and, when one number replaced a per-bucket table, `dropped` names the buckets that went. Per-account `accounts[].switchThreshold` overrides are untouched. A request authenticated with a `proxy.clientKeys` entry is refused with 403 — a client key is a tenant of the proxy, not its operator; the shared `proxy.apiKey` and key-exempt loopback callers are allowed.
+
 You usually don't need to call it directly. `login`, `import`, `enable`, `disable`, `priority`, `route`, `threshold`, `distribute`, `probe` and `warmup` notify a running server themselves.
 
-Control-plane **writes** (`reload`, `switch`) are refused when the request carries a browser `Origin` or a cross-site `Sec-Fetch-Site`. Loopback is exempt from the proxy API key so the CLI needs no configuration, but that exemption also covers any web page you happen to visit: a page can POST to `127.0.0.1` cross-origin without a preflight, and while it cannot read the reply, the write would still land. `curl` and the CLI send neither header and are unaffected. Reads (`status`) are not restricted — the same-origin policy already stops a page from seeing the response.
+Control-plane **writes** (`reload`, `switch`, `threshold`) are refused when the request carries a browser `Origin` or a cross-site `Sec-Fetch-Site`. Loopback is exempt from the proxy API key so the CLI needs no configuration, but that exemption also covers any web page you happen to visit: a page can POST to `127.0.0.1` cross-origin without a preflight, and while it cannot read the reply, the write would still land. `curl` and the CLI send neither header and are unaffected. Reads (`status`) are not restricted — the same-origin policy already stops a page from seeing the response.
 
 `GET /teamclaude/quota` is the compact read endpoint for status-line integrations. It returns tier-weighted fleet aggregates and the underlying per-account limits; see [Fleet quota endpoint](quota.md#fleet-quota-endpoint).
 
@@ -218,6 +227,8 @@ A **warning banner** sits at the top of the page and is empty unless something i
 A **Routing** table above the accounts shows, for Fable, Sonnet, and any configured route, which account rotation would pick for a new request of that family and how many accounts could serve it — the ones that cannot are struck through, which is the reason the family is elsewhere. A pinned route names its pin, and says so when the pin is not eligible right now. The last rows are everything without a route of its own, one per provider in the fleet ("Claude default", "Codex default"): each names the server's default target for that provider, which is that provider's current account unless it is blocked or outranked, in which case the row says why. A Claude and a Codex pool keep independent cursors, so the summary line and the `current` badge on each card are per provider too. Targets are the server's own answers (`routes[].target`, `defaultTargets` and `currentAccounts` in `/teamclaude/status`; the older single-valued `defaultTarget` and `currentAccount` are still emitted. `currentIndexes` is `currentAccounts` by position: an object keyed by provider whose value is the current account's zero-based index into the status `accounts` array, or `null` when nothing can serve that provider — a name alone is ambiguous when two accounts share one, and it is what the attached TUI uses to place each `►`), not something the page derives from the quota bars; they describe a fresh request, not one a running conversation has already pinned elsewhere.
 
 Each account card has a **switch** button that makes that account the current one (the same `POST /teamclaude/switch` the CLI uses). It is a nudge, not a pin: normal rotation resumes from there. What happens to traffic already running depends on `distributeSessions` — with it on, a conversation pinned to another account keeps it until it goes idle, so the badge moves before the traffic does; with it off (the default), everything follows the switch on its next request. The page reports whether rotation will actually use the target: a disabled, errored, rate-limited, or over-threshold account — or one outranked by a higher-priority account — is still switched to, but the page says so and why rather than reporting a bare "done".
+
+A **Switch at __ %** control on the actions row sets the fleet-wide switch threshold, the utilization at which rotation leaves an account — the same setting as `teamclaude threshold <1-100>` and the TUI's settings screen, sent as `POST /teamclaude/threshold` with a `{"percent": 1-100}` body. Unlike the switch button this writes the config file and reloads, so it holds across a restart. One number replaces a per-bucket `switchThreshold` table, and the page says which buckets were dropped; per-account `accounts[].switchThreshold` overrides are untouched. The field follows changes made from the CLI, the TUI or another browser on the next poll, except while you are typing in it. A dashboard opened with a `proxy.clientKeys` key may not call it — the server answers 403, since a client key is a tenant of the proxy rather than its operator.
 
 
 ```

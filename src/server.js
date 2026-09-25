@@ -26,6 +26,8 @@ import { responsesEventUsage, isResponsesBody, normalizeResponsesUsage } from '.
 import { classificationPath } from './classification-path.js';
 import { serveManagementMcp } from './mcp-tools.js';
 import { codexSpentWindows, isAccountWideCodexWindow } from './codex-quota.js';
+import { atomicConfigUpdate } from './config.js';
+import { ConfigOpError, setThreshold, thresholdRatio } from './config-ops.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 
@@ -408,6 +410,20 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         return;
       }
 
+      // A client key (proxy.clientKeys) names a tenant of the proxy, not its
+      // operator: it may spend quota under its own name, read status and nudge
+      // the running fleet, but the switch threshold is a SETTING written to the
+      // config file and governing every account, and one tenant must not be
+      // able to retire the whole fleet for the others. The shared proxy.apiKey
+      // and the key-exempt loopback caller are the operator and stay allowed.
+      // Refused here, before the body is read, so a request that will not be
+      // honoured is never parsed.
+      if (req.tcClient && req.method === 'POST' && req.url === '/teamclaude/threshold') {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'a client key cannot change settings' }));
+        return;
+      }
+
       // Forward-proxy request (HTTP_PROXY): an absolute-form URL is a tool
       // proxying plain HTTP to some host. Account logic is only for hosts we
       // manage (the Anthropic upstream, which is HTTPS-only and never arrives
@@ -568,6 +584,84 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           + (eligible ? '' : ` — ${reason}, so rotation will not use it`));
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true, account: name, eligible, ...(reason ? { reason } : {}) }));
+        return;
+      }
+
+      // Threshold endpoint — the utilization at which rotation leaves an
+      // account, the web equivalent of `teamclaude threshold <1-100>` and of the
+      // set_threshold MCP tool. Unlike /switch, which only moves currentIndex in
+      // the running manager, this is a SETTING: it goes through the config file
+      // under its lock and a reload applies it, so it survives a restart and
+      // does not clobber a concurrent writer (changeSetting in mcp-tools.js
+      // takes the same two steps for the same reason).
+      // Body: {"percent": <1-100>}. Local control only; the gates above apply,
+      // including the cross-origin refusal — the dashboard's own fetch is
+      // same-origin, so it passes while another site's no-cors POST does not —
+      // and the client-key refusal, since this is a setting and not a nudge.
+      if (req.method === 'POST' && req.url === '/teamclaude/threshold') {
+        let percent;
+        try {
+          const raw = await readControlBody(req);
+          percent = JSON.parse(raw || '{}')?.percent;
+        } catch (err) {
+          const message = /** @type {Error} */ (err).message;
+          const tooLarge = message === 'body too large';
+          res.writeHead(tooLarge ? 413 : 400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: tooLarge ? 'request body too large' : 'invalid request body' }));
+          return;
+        }
+        // What counts as a percentage is the shared rule's to say (1–100, kept
+        // to tenths); restating the range here would let the two drift. Checked
+        // before the write so a bad number never takes the config lock.
+        if (thresholdRatio(percent) === null) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'percent must be a number from 1 to 100' }));
+          return;
+        }
+        // Without a reload hook the setting could be saved but never applied:
+        // the file would claim a number the running fleet ignored until the
+        // next restart. Refused up front, as /probe refuses without a prober,
+        // rather than written and then reported as half-done.
+        if (!hooks.reload) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'threshold change not supported' }));
+          return;
+        }
+        /** @type {string[]} */ let dropped = [];
+        let saved;
+        try {
+          const disk = await atomicConfigUpdate((/** @type {Record<string, any>} */ c) => { ({ dropped } = setThreshold(c, percent)); });
+          saved = disk.switchThreshold;
+        } catch (err) {
+          const message = /** @type {Error} */ (err).message;
+          // A ConfigOpError is the caller's input being refused and says so in
+          // words meant for them; anything else is ours and goes to the log.
+          const bad = err instanceof ConfigOpError;
+          console.error('[TeamClaude] Threshold change failed:', message);
+          res.writeHead(bad ? 400 : 500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: bad ? message : 'threshold change failed; see the proxy log' }));
+          return;
+        }
+        // Saved is not applied: rotation reads the threshold off the manager,
+        // which a reload refreshes (reloadAccounts in index.js assigns
+        // switchThreshold onto it). Without this the file would claim a number
+        // the running fleet ignored until the next restart.
+        try {
+          await hooks.reload();
+        } catch (err) {
+          const message = /** @type {Error} */ (err).message;
+          console.error('[TeamClaude] Reload after a threshold change failed:', message);
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'saved to the config file, but the reload failed; see the proxy log' }));
+          return;
+        }
+        // The same trace a manual switch leaves, and for the same reason: on the
+        // background-service deployment this endpoint exists for, a threshold
+        // that quietly retires an account would otherwise change nothing visible.
+        console.log(`[TeamClaude] Switch threshold set to ${Math.round(saved * 1000) / 10}% (dashboard)`
+          + (dropped.length ? ` — dropped the per-bucket thresholds (${dropped.join(', ')})` : ''));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, switchThreshold: saved, dropped }));
         return;
       }
 
