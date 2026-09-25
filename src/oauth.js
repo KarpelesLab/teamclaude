@@ -703,9 +703,13 @@ export function parseAuthCode(input, expectedState) {
 /**
  * Perform OAuth login via browser with PKCE flow.
  * Opens the user's browser, waits for the callback, exchanges the code for tokens.
- * @param {{ routing?: import('./account-routing.js').RoutingProxy|null }} [opts]
+ *
+ * @param {{ interactive?: boolean, routing?: import('./account-routing.js').RoutingProxy|null }} [opts]
+ *   `interactive: false` skips the stdin paste prompt and the printed URL, for
+ *   a caller that owns the terminal. `routing` is the about-to-be-added
+ *   account's own egress proxy (login --routing).
  */
-export async function loginOAuth({ routing = null } = {}) {
+export async function loginOAuth({ interactive = true, routing = null } = {}) {
   // Generate PKCE
   const codeVerifier = randomBytes(32).toString('base64url');
   const codeChallenge = createHash('sha256').update(codeVerifier).digest('base64url');
@@ -728,13 +732,18 @@ export async function loginOAuth({ routing = null } = {}) {
 
   // Open browser
   console.log('Opening browser for authentication...');
-  console.log(`If it doesn't open, visit:\n  ${authUrl.toString()}\n`);
+  // The URL is several hundred characters and the paste prompt below reads
+  // stdin. A caller that owns the terminal — the TUI, whose stdin is its key
+  // handler and whose console is a one-line-per-entry activity pane — can use
+  // neither, so `interactive: false` leaves the browser callback as the only
+  // way in. The callback server's own two-minute timeout still ends the wait.
+  if (interactive) console.log(`If it doesn't open, visit:\n  ${authUrl.toString()}\n`);
   openBrowser(authUrl.toString());
 
   // Wait for either the callback server or manual paste from stdin
   let code;
   try {
-    code = await raceWithStdinCode(codePromise, state);
+    code = interactive ? await raceWithStdinCode(codePromise, state) : await codePromise;
   } finally {
     server.close();
   }
@@ -904,5 +913,5 @@ function openBrowser(url) {
   const cmd = platform === 'darwin' ? 'open'
     : platform === 'win32' ? 'start ""'
     : 'xdg-open';
-  exec(`${cmd} ${JSON.stringify(url)}`, () => {});
+  exec(`${cmd} ${JSON.stringify(url)}`, err => { if (err) console.error(`Could not open a browser (${cmd}): ${err.message} — open the URL by hand or run \`teamclaude login\` on a machine with one`); });
 }

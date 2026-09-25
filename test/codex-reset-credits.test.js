@@ -950,12 +950,15 @@ test('settings: Enter toggles it the same way ←→ do', async () => {
 // A save that throws must not leave the running fleet and the operator's screen
 // disagreeing about a switch this consequential: the in-memory flip stands and
 // the failure is said out loud.
-test('settings: a failed save still leaves the switch where the operator put it', async () => {
+// The redeemer reads the switch live off the shared config, so a value disk
+// refused must not stay in memory: the fleet would spend credits while the
+// file, and so the next start, said off (#443). The save failing puts it back.
+test('settings: a failed save puts the switch back where it was', async () => {
   const { tui, config } = settingsTui();
   tui.saveConfig = async () => { throw new Error('disk full'); };
   await switchRow(tui).right();
-  assert.equal(config.autoRedeemResets, true);
-  assert.ok(tui.log.some((/** @type {any} */ l) => /Failed to save/.test(plain(l.msg))));
+  assert.notEqual(config.autoRedeemResets, true, 'the refused value must not stay in memory');
+  assert.ok(tui.log.some((/** @type {any} */ l) => /Failed to save.*auto-redeem left unchanged/.test(plain(l.msg))));
 });
 
 // ── configuration ───────────────────────────────────────────────────────────

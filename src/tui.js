@@ -8,7 +8,7 @@ import {
   canUpsertOAuthAccount,
   oauthIdentityFields,
 } from './identity.js';
-import { configIndexFor, managerAccountFor, markAccountRemoved } from './account-pairing.js';
+import { configIndexFor, managerAccountFor, markAccountRemoved, markAccountAdded } from './account-pairing.js';
 import { PROVIDERS, providerOf, isSubscriptionAccount, upstreamFor } from './provider.js';
 import { mintAccountId } from './account-id.js';
 import { formatPercent, heldResetCredits } from './status-renderer.js';
@@ -565,7 +565,10 @@ function timestamp() {
 // ── TUI class ────────────────────────────────────────────────
 
 export class TUI {
-  constructor({ accountManager, config, saveConfig, syncAccounts, onQuit, sx = null, probeQuota = null, activityLogPath = null,
+  constructor({ accountManager, config, saveConfig, syncAccounts, onQuit, sx = null, probeQuota = null,
+    // Cast so the destructured binding is the callback type, not `null`: index.js passes a function here.
+    loginAccount = /** @type {null | ((account: Record<string, any>) => Promise<{ action: 'updated' | 'added', name: string }>)} */ (null),
+    activityLogPath = null,
     // Attach mode: the accounts belong to a server in another process, reached
     // over its control plane. Everything that would mutate local state is off,
     // and a switch becomes a request (applySwitch) instead of an assignment.
@@ -592,6 +595,8 @@ export class TUI {
     this.sx = sx;            // sx.org proxy manager (may be null)
     this.sxBalance = null;   // last fetched sx.org balance, for the settings screen
     this.probeQuota = probeQuota; // on-demand fleet-wide quota refresh (may be null)
+    /** @type {null | ((account: Record<string, any>) => Promise<{ action: 'updated' | 'added', name: string }>)} */
+    this.loginAccount = loginAccount; // browser (re-)login for a chosen account (may be null)
     this.activityLogPath = activityLogPath;
     this._readCredentials = readCredentials;
     this._readProfile = readProfile;
@@ -611,6 +616,7 @@ export class TUI {
     this.selRoute = null;    // in switch mode: null = global default, else a getRoutes() entry to pin
     this.selReturn = 'normal'; // mode to fall back to when select mode closes
     this.setIdx = 0;         // cursor row on the settings screen (BIOS-style nav)
+    this.setScroll = 0;      // first body line the settings screen shows (see _viewport)
     this.blockIdx = 0;       // cursor row on the blocked-models editor
     this.inputPrompt = '';
     this.inputBuf = '';
@@ -926,6 +932,16 @@ export class TUI {
       this.mode = 'select'; this.selAction = 'toggle'; this.selIdx = this.am.currentIndex; this.selReturn = 'normal';
     }
     else if (k === 'p' && this.am.accounts.length > 0) { this._doProbe(); }
+    // Re-login: an OAuth account whose refresh token upstream has rejected stays
+    // in 'error' until someone signs in again, and that someone is usually
+    // looking at this screen. The cursor starts on the first account that needs
+    // it, so the common case is `l`, Enter.
+    else if (k === 'l' && this.loginAccount && this.am.accounts.length > 0) {
+      const order = this._displayOrder();
+      const broken = order.find((/** @type {number} */ i) => this.am.accounts[i]?.status === 'error');
+      this.mode = 'select'; this.selAction = 'login'; this.selReturn = 'normal';
+      this.selIdx = broken ?? order[0] ?? 0;
+    }
     else if (k === 'g') { this.mode = 'settings'; this.setIdx = 0; this._loadSxBalance(); }
   }
 
@@ -1220,10 +1236,13 @@ export class TUI {
     // Tenths of a percent are kept; anything finer is quantised so the stored
     // value is the one the screen shows.
     const v = Math.round(pct * 10) / 1000;
+    const prev = { config: this.config.switchThreshold, live: this.am.switchThreshold };
     this.config.switchThreshold = v;
     this.am.switchThreshold = v; // apply to the running rotation immediately
-    try { await this.saveConfig(this.config); }
-    catch (e) { this._addLog(`Failed to save: ${e.message}`); }
+    if (!await this._saveSetting('switch threshold', () => {
+      this.config.switchThreshold = prev.config;
+      this.am.switchThreshold = prev.live;
+    })) { this.mode = 'settings'; if (this.running) this.render(); return; }
     this._addLog(`Switch threshold set to ${formatPercent(v)}`);
     this.mode = 'settings';
     if (this.running) this.render();
@@ -1279,6 +1298,8 @@ export class TUI {
         this._doSwitchSelection();
       } else if (this.selAction === 'toggle') {
         this._doToggleDisabled(this.selIdx);
+      } else if (this.selAction === 'login') {
+        this._doLogin(this.selIdx);
       } else if (this.selAction === 'reorder') {
         // Every move is already applied, so Enter only means "done" — and it
         // has to be caught here, ahead of the remove branch below, which is
@@ -1421,11 +1442,56 @@ export class TUI {
     }
   }
 
+  // Browser login for the account under the cursor (the `l` key). The row
+  // chooses the PROVIDER's sign-in page and tells the operator which identity to
+  // sign in as; it does not choose where the tokens go. They go to the account
+  // the browser actually signed in as — the same identity match `teamclaude
+  // login` makes — because writing one person's tokens onto the row that was
+  // merely highlighted would be a credential crossing. So a sign-in as someone
+  // else is reported as exactly that, and the picked row stays in need of one.
+  // Fire-and-forget: the flow waits on a human for up to two minutes, and the
+  // dashboard has to stay live meanwhile.
+  async _doLogin(/** @type {number} */ idx) {
+    const acct = this.am.accounts[idx];
+    if (!acct) { this._addLog('That account is no longer listed'); return; }
+    if (!this.loginAccount) { this._addLog('Login unavailable'); return; }
+    if (acct.type !== 'oauth') { this._addLog(`"${acct.name}" is not an OAuth account — nothing to sign in to`); return; }
+    // An importFrom row owns no tokens of its own: every reload re-reads the
+    // file it points at, so tokens the upsert wrote onto the row would be
+    // ignored on the next reload and the account would land back in `error`.
+    const entry = acct.id ? this.config?.accounts?.find((/** @type {any} */ c) => c.id === acct.id) : null;
+    if (entry?.importFrom) { this._addLog(`"${acct.name}" reads its tokens from ${entry.importFrom} — sign in there instead`); return; }
+    // One at a time: a second flow would race the first for the browser, and
+    // for Codex for the fixed callback port as well.
+    if (this._loggingIn) { this._addLog(`Still waiting on the sign-in for "${this._loggingIn}"`); return; }
+    this._loggingIn = acct.name;
+    this._addLog(`Sign in as "${acct.name}" in the browser (waits 2 minutes)...`);
+    try {
+      const outcome = await this.loginAccount(acct);
+      if (outcome?.name && outcome.name !== acct.name) {
+        this._addLog(`Signed in as "${outcome.name}" (${outcome.action}), not "${acct.name}" — that one still needs a login`);
+      } else {
+        this._addLog(`Logged in "${acct.name}"`);
+      }
+    } catch (/** @type {any} */ e) {
+      this._addLog(`Login failed for "${acct.name}": ${e?.message || e}`);
+    } finally {
+      this._loggingIn = null;
+      if (this.running) this.render();
+    }
+  }
+
   async _doSync() {
     try {
-      const count = await this.syncAccounts();
-      if (count > 0) {
-        this._addLog(`Synced ${count} new account(s) from config`);
+      const r = await this.syncAccounts();
+      // { added, removed } from the server's reload; a bare count from an
+      // older hook still reads as additions only.
+      const added = typeof r === 'number' ? r : (r?.added || 0);
+      const removed = typeof r === 'number' ? 0 : (r?.removed || 0);
+      // A removal shortens the list under the cursor, the same as _doRemove.
+      if (this.selIdx >= this.am.accounts.length) this.selIdx = Math.max(0, this.am.accounts.length - 1);
+      if (added > 0 || removed > 0) {
+        this._addLog(`Synced from config: +${added} account(s), -${removed} account(s)`);
       } else {
         this._addLog('Config reloaded, credentials refreshed');
       }
@@ -1554,14 +1620,36 @@ export class TUI {
     if (this.running) this.render();
   }
 
+  /**
+   * Save the shared config after a settings change; on a failed save, put the
+   * old value back. The gates (event logging, the blocklist, session titles, the
+   * sx mode) are read live off the same object, so a value that stayed in memory
+   * after the save failed would change what the running server does while disk
+   * still said otherwise, and the settings row would show the new value the
+   * whole time. Restoring it keeps memory, screen and file in step, and the log
+   * line says which setting was left alone (#443).
+   * @param {string} label what the row is called, for the log line
+   * @param {() => void} revert puts the previous value back in memory
+   * @returns {Promise<boolean>} whether the save landed
+   */
+  async _saveSetting(label, revert) {
+    try { await this.saveConfig(this.config); return true; }
+    catch (/** @type {any} */ e) {
+      revert();
+      this._addLog(`Failed to save: ${e.message} — ${label} left unchanged`);
+      if (this.running) this.render();
+      return false;
+    }
+  }
+
   // Cycle off → on-429 → always (dir +1) or the reverse (dir -1). Keeps the API
   // key, so the user can disable sx.org without deconfiguring it.
   async _cycleSxMode(dir = 1) {
     const order = ['off', '429', 'always'];
     const next = order[(order.indexOf(this.sx.getMode()) + dir + order.length) % order.length];
+    const prev = this.config.sx;
     this.config.sx = { ...(this.config.sx || {}), mode: next };
-    try { await this.saveConfig(this.config); }
-    catch (e) { this._addLog(`Failed to save: ${e.message}`); }
+    if (!await this._saveSetting('sx.org mode', () => { this.config.sx = prev; })) return;
     const r = await this.sx.setMode(next);
     this._addLog(`sx.org mode: ${this._sxModeLabel(next)}${r.ok ? '' : ` — ${r.error}`}`);
     if (next !== 'off') this._loadSxBalance();
@@ -1572,10 +1660,13 @@ export class TUI {
     // The shared config object is what a save writes and a reload re-applies,
     // so it is the record; the store is configured from it, never the reverse.
     const enabled = !this.sessionTitles.enabled;
+    const prev = this.config.sessionTitles;
     this.config.sessionTitles = { ...this.config.sessionTitles, enabled };
     this.sessionTitles.configure(this.config.sessionTitles);
-    try { await this.saveConfig(this.config); }
-    catch (e) { this._addLog(`Failed to save: ${e.message}`); }
+    if (!await this._saveSetting('session titles', () => {
+      this.config.sessionTitles = prev;
+      this.sessionTitles.configure(prev);
+    })) return;
     this._addLog(`Session titles: ${enabled ? 'on' : 'off'}`);
     if (this.running) this.render();
   }
@@ -1589,10 +1680,10 @@ export class TUI {
     //
     // A per-account `autoRedeemReset: false` still exempts its account while
     // this is on; nothing per-account can switch it ON.
-    const next = this.config.autoRedeemResets !== true;
+    const prev = this.config.autoRedeemResets;
+    const next = prev !== true;
     this.config.autoRedeemResets = next;
-    try { await this.saveConfig(this.config); }
-    catch (/** @type {any} */ e) { this._addLog(`Failed to save: ${e.message}`); }
+    if (!await this._saveSetting('auto-redeem', () => { this.config.autoRedeemResets = prev; })) return;
     this._addLog(`Auto-redeem Codex reset credits: ${next ? 'on' : 'off'}`);
     if (this.running) this.render();
   }
@@ -1600,10 +1691,10 @@ export class TUI {
   async _toggleQuotaBarPercent() {
     // Absent means on, so the first toggle from a config that predates the key
     // has to write `false` — hence the comparison rather than a negation.
-    const on = this.config.quotaBarPercent === false;
+    const prev = this.config.quotaBarPercent;
+    const on = prev === false;
     this.config.quotaBarPercent = on;
-    try { await this.saveConfig(this.config); }
-    catch (/** @type {any} */ e) { this._addLog(`Failed to save: ${e.message}`); }
+    if (!await this._saveSetting('bar percentage', () => { this.config.quotaBarPercent = prev; })) return;
     this._addLog(`Quota bar percentage: ${on ? 'on' : 'off'}`);
     if (this.running) this.render();
   }
@@ -1611,11 +1702,11 @@ export class TUI {
   async _cycleEventLogging(dir = 1) {
     // Claude Code telemetry display/handling: show → hide → block → show.
     const order = ['show', 'hide', 'block'];
-    const cur = this.config.eventLogging || 'hide';
+    const prev = this.config.eventLogging;
+    const cur = prev || 'hide';
     const next = order[(order.indexOf(cur) + dir + order.length) % order.length];
     this.config.eventLogging = next; // shared config object; the server reads it live
-    try { await this.saveConfig(this.config); }
-    catch (e) { this._addLog(`Failed to save: ${e.message}`); }
+    if (!await this._saveSetting('event logging', () => { this.config.eventLogging = prev; })) return;
     this._addLog(`Event logging: ${next}`);
     if (this.running) this.render();
   }
@@ -1625,10 +1716,10 @@ export class TUI {
     // Base-URL keeps a shell's other tools off the proxy (#382); MITM covers the
     // hard-coded endpoints and the Codex CLI. Read from disk by those commands,
     // so the save is the whole application.
-    const next = this.config.defaultClientMode === 'base-url' ? 'mitm' : 'base-url';
+    const prev = this.config.defaultClientMode;
+    const next = prev === 'base-url' ? 'mitm' : 'base-url';
     this.config.defaultClientMode = next;
-    try { await this.saveConfig(this.config); }
-    catch (/** @type {any} */ e) { this._addLog(`Failed to save: ${e.message}`); }
+    if (!await this._saveSetting('client mode', () => { this.config.defaultClientMode = prev; })) return;
     this._addLog(`Default client mode: ${next} (run/env without a flag)`);
     if (this.running) this.render();
   }
@@ -1733,6 +1824,9 @@ export class TUI {
         entry.id = mintAccountId();
         this.config.accounts.push(entry);
         this.am.addAccount(entry);
+        // Recorded until the save below lands: a reload that reads the file
+        // first would find a running account with no row and drop it.
+        markAccountAdded(this.config, entry.id);
         this._addLog(`Imported account "${entry.name}"`);
       }
 
@@ -1750,6 +1844,9 @@ export class TUI {
     const entry = { id: mintAccountId(), name, type: 'apikey', apiKey };
     this.config.accounts.push(entry);
     this.am.addAccount(entry);
+    // Same window as in _doImport: the account exists here before it does on
+    // disk, and a reload in between must not read the file as a removal.
+    markAccountAdded(this.config, entry.id);
     await this.saveConfig(this.config);
     this._addLog(`Added API key account "${name}"`);
   }
@@ -1983,7 +2080,14 @@ export class TUI {
       : this.mode === 'add' ? 'settings'
       : this.mode;
     if (view === 'settings') {
-      this._renderSettings(lines);
+      const selLine = this._renderSettings(lines);
+      // The settings body grows with every account and every setting, and a
+      // short terminal used to cut it off silently: the footer, and the rows
+      // past the fold, were pushed off the buffer with nothing said (#445).
+      // The body scrolls instead, following the cursor row.
+      const headerH = 2;   // the title line and its rule, drawn above
+      const body = lines.splice(headerH);
+      lines.push(...this._viewport(body, selLine - headerH, H - footerH - headerH));
     } else if (view === 'routes') {
       this._renderRoutes(lines);
     } else if (view === 'pick') {
@@ -2415,9 +2519,23 @@ export class TUI {
     const type = compact ? '' : `${gray((mixed ? PROVIDERS[providerOf(a)].label : a.type).padEnd(typeW))} `;
 
     // Status — a disabled account is shown as such regardless of its quota state.
+    // So is one rotation will not reach although its own status says active: the
+    // entitlement cooldown a 403 arms and the usage caps live beside the status,
+    // not in it, and a row reading `active` for an account that receives nothing
+    // sent operators looking at the wrong thing (#468). Live, the manager says;
+    // in attach mode the status payload carries the same reason.
+    const barred = typeof this.am.unavailableReason === 'function'
+      ? this.am.unavailableReason(a)
+      : (a.unavailable ?? null);
     let status;
     if (a.disabled) {
       status = gray('disabled');
+    } else if (barred === 'entitlement') {
+      const until = typeof a.entitlementDeniedUntil === 'string' ? Date.parse(a.entitlementDeniedUntil) : a.entitlementDeniedUntil;
+      const left = formatReset(until);
+      status = yellow(left ? `denied ${left}` : 'denied');
+    } else if (typeof barred === 'string' && /capped$/.test(barred)) {
+      status = yellow('capped');
     } else switch (a.status) {
       case 'active':    status = isCur ? green('active') : 'active'; break;
       case 'throttled': status = yellow('throttled'); break;
@@ -2547,10 +2665,45 @@ export class TUI {
     return typeof this.am.onExtraUsage === 'function' ? this.am.onExtraUsage(a.index) : a.onExtraUsage === true;
   }
 
+  /**
+   * The `viewH` lines of `body` to draw, scrolled so that line `sel` (the
+   * cursor row, or -1 for none) is on screen and never under the edge markers.
+   * A body that fits is returned as is. Otherwise the first and last visible
+   * lines become `↑ N more` / `↓ N more` markers whenever there is something
+   * past them, so the fold is never silent. The scroll position persists
+   * between frames (`setScroll`) and only moves when the cursor would leave
+   * the window, so paging with ↑↓ reads like a list, not a jump per keypress.
+   * @param {string[]} body
+   * @param {number} sel
+   * @param {number} viewH
+   */
+  _viewport(body, sel, viewH) {
+    const n = body.length;
+    if (n <= viewH || viewH < 3) { this.setScroll = 0; return body.slice(0, Math.max(0, viewH)); }
+    let top = Math.min(Math.max(0, this.setScroll || 0), n - viewH);
+    if (sel >= 0) {
+      // One line of margin at each edge is where a marker may be drawn; the
+      // cursor row must never be the line a marker replaces.
+      if (sel < top + 1) top = Math.max(0, sel - 1);
+      if (sel > top + viewH - 2) top = Math.min(n - viewH, sel - viewH + 2);
+    }
+    this.setScroll = top;
+    const out = body.slice(top, top + viewH);
+    if (top > 0) out[0] = dim(`  ↑ ${top} more`);
+    if (top + viewH < n) out[viewH - 1] = dim(`  ↓ ${n - top - viewH} more`);
+    return out;
+  }
+
+  /**
+   * Draws the settings screen into `lines`; returns the index in `lines` of the
+   * cursor row, or -1 when no row is selected (so the caller can keep it on screen).
+   * @param {string[]} lines
+   */
   _renderSettings(lines) {
     const fields = this._settingsFields();
     if (this.setIdx >= fields.length) this.setIdx = Math.max(0, fields.length - 1);
     const selId = fields[this.setIdx]?.id;
+    let selLine = -1;
     const byId = id => fields.find(f => f.id === id);
 
     // Render a navigable setting row with a BIOS-style highlight bar on the
@@ -2560,6 +2713,7 @@ export class TUI {
       const label = (field ? field.label : '').padEnd(16);
       const value = field ? field.value() : '';
       if (selected) {
+        selLine = lines.length;   // the row is pushed right after this returns
         const hint = field.hint ? `   ${dim(field.hint)}` : '';
         const inner = rpad(` ${label}  ${strip(value)} `, 34);
         return `  ${cyan('▸')}${REV}${inner}${RESET}${hint}`;
@@ -2622,7 +2776,7 @@ export class TUI {
     // ── sx.org
     lines.push(bold('  sx.org proxy') + dim('  — route upstream via a residential IP (429 workaround)'));
     lines.push('');
-    if (!this.sx) { lines.push(yellow('  Unavailable in this build.')); return; }
+    if (!this.sx) { lines.push(yellow('  Unavailable in this build.')); return selLine; }
     const key = this.config.sx?.apiKey;
     const mode = this.sx.getMode();
     const p = this.sx.getProxy?.();
@@ -2647,6 +2801,7 @@ export class TUI {
       lines.push(dim('  No sx.org account yet? Signing up via https://sx.org/c/ufVrLW'));
       lines.push(dim('  costs nothing extra and supports TeamClaude development.'));
     }
+    return selLine;
   }
 
   // ── routes editor ──────────────────────────────────
@@ -2936,7 +3091,7 @@ export class TUI {
       case 'normal':
         return this.remote
           ? ` ${bold('s')}witch  ${bold('R')}eload  ${bold('q')}uit`
-          : ` ${bold('s')}witch  ${bold('d')}isable  ${bold('p')}robe quota  ${bold('R')}eload  ${bold('g')} settings  ${bold('q')}uit`;
+          : ` ${bold('s')}witch  ${bold('d')}isable  ${this.loginAccount ? `${bold('l')}ogin  ` : ''}${bold('p')}robe quota  ${bold('R')}eload  ${bold('g')} settings  ${bold('q')}uit`;
       case 'settings':
         return ` ${dim('↑↓')} navigate  ${dim('←→')} change  ${bold('Enter')} edit  ${bold('Esc')} back`;
       case 'routes':
@@ -2963,6 +3118,9 @@ export class TUI {
         // offering "cancel" would promise an undo this screen does not have.
         if (this.selAction === 'reorder') {
           return ` ${dim('↑↓')} select  ${dim('←→')} move  ${bold('Enter')}/${bold('Esc')} done`;
+        }
+        if (this.selAction === 'login') {
+          return ` ${dim('↑↓')} select  ${bold('Enter')} sign in via browser  ${bold('Esc')} cancel`;
         }
         const act = this.selAction === 'toggle' ? 'enable/disable'
           : this.selAction === 'routing' ? 'set its proxy' : 'remove';

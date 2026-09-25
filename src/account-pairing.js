@@ -103,6 +103,51 @@ export function clearRemovedAccountIds(config) {
   if (config?.[REMOVED]) config[REMOVED].clear();
 }
 
+// Entries the operator added in this process, by id — the mirror of REMOVED.
+//
+// A reload now drops a running account no disk row claims (a `teamclaude
+// remove` from another shell). The TUI and the MCP endpoint add an account the
+// other way round: into memory first, then a save. A reload that reads the
+// file in between sees a running account the file does not describe yet and
+// would treat the addition as a removal. An id recorded here names an account
+// whose save has not landed, and the reload leaves it alone.
+//
+// Held on the config object and non-enumerable, like REMOVED, so it never
+// reaches JSON.
+const ADDED = Symbol('addedAccountIds');
+
+/**
+ * Record that `id` was added in memory, so a reload does not drop it before its save lands.
+ * @param {any} config
+ * @param {string|undefined} id
+ */
+export function markAccountAdded(config, id) {
+  if (!config || !id) return;
+  if (!config[ADDED]) {
+    Object.defineProperty(config, ADDED, { value: new Set(), enumerable: false, writable: true });
+  }
+  config[ADDED].add(id);
+}
+
+/**
+ * The ids added so far whose save has not landed.
+ * @param {any} config
+ * @returns {Set<string>}
+ */
+export function addedAccountIds(config) {
+  return config?.[ADDED] || new Set();
+}
+
+/**
+ * Forget the additions, once a save has written a list that carries them. From
+ * then on the rows are on disk, so a reload pairs them like any other and the
+ * ids have nothing left to protect.
+ * @param {any} config
+ */
+export function clearAddedAccountIds(config) {
+  if (config?.[ADDED]) config[ADDED].clear();
+}
+
 /**
  * Which disk row each config entry merges over, as a Map of config index to disk
  * index. A row is claimed by at most one entry.

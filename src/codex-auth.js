@@ -186,7 +186,7 @@ function openBrowser(url) {
   const cmd = process.platform === 'darwin' ? 'open'
     : process.platform === 'win32' ? 'start ""'
       : 'xdg-open';
-  exec(`${cmd} ${JSON.stringify(url)}`, () => {});
+  exec(`${cmd} ${JSON.stringify(url)}`, err => { if (err) console.error(`Could not open a browser (${cmd}): ${err.message} — open the URL by hand or run \`teamclaude login\` on a machine with one`); });
 }
 
 /**
@@ -237,10 +237,12 @@ export function codexCallbackHandler(expectedState, { resolve, reject }) {
 }
 
 /**
- * @param {{ noBrowser?: boolean, timeoutMs?: number, routing?: import('./account-routing.js').RoutingProxy|null }} [opts]
+ * @param {{ noBrowser?: boolean, timeoutMs?: number, showUrl?: boolean, routing?: import('./account-routing.js').RoutingProxy|null }} [opts]
  * `routing` is the about-to-be-added account's own egress proxy (login --routing).
+ * `showUrl: false` skips the printed fallback URL, for a caller whose console
+ * is the TUI's one-line activity pane.
  */
-export async function loginCodex({ noBrowser = false, timeoutMs = 120_000, routing = null } = {}) {
+export async function loginCodex({ noBrowser = false, timeoutMs = 120_000, showUrl = true, routing = null } = {}) {
   const codeVerifier = randomBytes(32).toString('base64url');
   const codeChallenge = createHash('sha256').update(codeVerifier).digest('base64url');
   const state = randomBytes(32).toString('base64url');
@@ -260,7 +262,9 @@ export async function loginCodex({ noBrowser = false, timeoutMs = 120_000, routi
       } else {
         console.log('Opening browser for OpenAI sign-in...');
         openBrowser(authUrl);
-        console.log(`If it did not open, visit:\n${authUrl}`);
+        // showUrl: false is for a caller whose console is the TUI's one-line
+        // activity pane, where a multi-line URL is noise it cannot act on.
+        if (showUrl) console.log(`If it did not open, visit:\n${authUrl}`);
       }
     });
 
