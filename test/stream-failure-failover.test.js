@@ -226,7 +226,10 @@ test('a chunk that lands just after the deadline still appears in the replayed b
   controller.enqueue(Buffer.from(frame(DELTA)));
   controller.enqueue(Buffer.from(frame(COMPLETED)));
   controller.close();
-  const out = Buffer.concat(await Array.fromAsync(peeked.body)).toString();
+  // Not Array.fromAsync: the suite runs on node 20, which lacks it.
+  const chunks = [];
+  for await (const chunk of peeked.body) chunks.push(chunk);
+  const out = Buffer.concat(chunks).toString();
   assert.equal(out, sse(CREATED, DELTA, COMPLETED), 'the chunk the abandoned read resolved with was dropped');
 });
 
