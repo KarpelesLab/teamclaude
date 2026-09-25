@@ -97,6 +97,7 @@ Warning: "me@example.com" is disabled, so requests will not route to it until th
 | --- | --- |
 | `s` | Switch active account (`←`/`→` picks the default account or a specific [route](routing.md#model-routes)) |
 | `d` | Enable/disable an account |
+| `l` | Sign an account in again via the browser (opens on the first account in `error`; not in attach mode) |
 | `p` | Refresh quota on all accounts (one-shot probe of the zero-spend usage endpoint) |
 | `R` | Reload accounts from config |
 | `g` | Settings (threshold, quota probe, routing, add/remove/reorder accounts, sx.org) |

@@ -540,6 +540,7 @@ export class TUI {
     this.sx = sx;            // sx.org proxy manager (may be null)
     this.sxBalance = null;   // last fetched sx.org balance, for the settings screen
     this.probeQuota = probeQuota; // on-demand fleet-wide quota refresh (may be null)
+    /** @type {null | ((account: Record<string, any>) => Promise<{ action: 'updated' | 'added', name: string }>)} */
     this.loginAccount = loginAccount; // browser (re-)login for a chosen account (may be null)
     this.activityLogPath = activityLogPath;
     this._readCredentials = readCredentials;
@@ -869,7 +870,7 @@ export class TUI {
     // it, so the common case is `l`, Enter.
     else if (k === 'l' && this.loginAccount && this.am.accounts.length > 0) {
       const order = this._displayOrder();
-      const broken = order.find(i => this.am.accounts[i]?.status === 'error');
+      const broken = order.find((/** @type {number} */ i) => this.am.accounts[i]?.status === 'error');
       this.mode = 'select'; this.selAction = 'login'; this.selReturn = 'normal';
       this.selIdx = broken ?? order[0] ?? 0;
     }
@@ -1334,11 +1335,16 @@ export class TUI {
   // else is reported as exactly that, and the picked row stays in need of one.
   // Fire-and-forget: the flow waits on a human for up to two minutes, and the
   // dashboard has to stay live meanwhile.
-  async _doLogin(idx) {
+  async _doLogin(/** @type {number} */ idx) {
     const acct = this.am.accounts[idx];
     if (!acct) { this._addLog('That account is no longer listed'); return; }
     if (!this.loginAccount) { this._addLog('Login unavailable'); return; }
     if (acct.type !== 'oauth') { this._addLog(`"${acct.name}" is not an OAuth account — nothing to sign in to`); return; }
+    // An importFrom row owns no tokens of its own: every reload re-reads the
+    // file it points at, so tokens the upsert wrote onto the row would be
+    // ignored on the next reload and the account would land back in `error`.
+    const entry = acct.id ? this.config?.accounts?.find((/** @type {any} */ c) => c.id === acct.id) : null;
+    if (entry?.importFrom) { this._addLog(`"${acct.name}" reads its tokens from ${entry.importFrom} — sign in there instead`); return; }
     // One at a time: a second flow would race the first for the browser, and
     // for Codex for the fixed callback port as well.
     if (this._loggingIn) { this._addLog(`Still waiting on the sign-in for "${this._loggingIn}"`); return; }
@@ -1351,7 +1357,7 @@ export class TUI {
       } else {
         this._addLog(`Logged in "${acct.name}"`);
       }
-    } catch (e) {
+    } catch (/** @type {any} */ e) {
       this._addLog(`Login failed for "${acct.name}": ${e?.message || e}`);
     } finally {
       this._loggingIn = null;

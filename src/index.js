@@ -527,7 +527,7 @@ async function serverCommand() {
       // signed in as is the one that gets the tokens, whichever row was picked —
       // then an in-process reload instead of the CLI's HTTP notify. Never exits:
       // a failed login is a line in the activity pane, not the end of the proxy.
-      loginAccount: async (account) => {
+      loginAccount: async (/** @type {Record<string, any>} */ account) => {
         const outcome = account && providerOf(account) === 'codex'
           ? await upsertCodexAccount(undefined, await loginCodex({ showUrl: false }))
           : await upsertOAuthAccount(undefined, await loginOAuth({ interactive: false }), 'login', { fatal: false, notify: false });
@@ -855,7 +855,7 @@ async function loginCodexCommand() {
  * account would fail on its next restart. So the upsert runs against a fresh
  * read of the file, and only this account's row is touched.
  *
- * @param {string | undefined} requestedName
+ * @param {string | null | undefined} requestedName
  * @param {any} creds
  * @returns {Promise<{ action: 'updated' | 'added', name: string }>}
  */
@@ -2192,7 +2192,7 @@ function orgLabel(a) {
 }
 
 /**
- * @param {string | undefined} name
+ * @param {string | null | undefined} name
  * @param {any} creds
  * @param {string} [source]
  * @param {{ fatal?: boolean, notify?: boolean }} [opts] The CLI exits on an

@@ -813,5 +813,5 @@ function openBrowser(url) {
   const cmd = platform === 'darwin' ? 'open'
     : platform === 'win32' ? 'start ""'
     : 'xdg-open';
-  exec(`${cmd} ${JSON.stringify(url)}`, () => {});
+  exec(`${cmd} ${JSON.stringify(url)}`, err => { if (err) console.error(`Could not open a browser (${cmd}): ${err.message} — open the URL by hand or run \`teamclaude login\` on a machine with one`); });
 }
