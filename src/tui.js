@@ -294,9 +294,9 @@ function typeColumn(/** @type {any[]} */ accounts) {
  * terminal pushes it past the edge.
  *
  * The number is what the account HOLDS. It is deliberately not the number that
- * could be redeemed right now: only the account's own credit rows say whether a
- * given credit is supported by the plan, and they cost a request nobody should
- * make to draw a badge.
+ * could be redeemed right now: only the detail rows say whether a given credit
+ * is supported by the plan, and they cost a request nobody should make to draw
+ * a badge. See codex-reset-credits.js.
  *
  * A reading older than RESET_CREDIT_MAX_AGE_MS draws nothing: the row has no
  * room to say how old the count is, so past the point where it stops being
@@ -437,9 +437,11 @@ function barColor(ratio, resetTs, windowMs, threshold) {
  * The label (e.g. "Ses 2h30m" or "45%") is drawn on top of the bar.
  * windowMs is the bucket's rolling-window length; when known, the color tracks
  * burn rate instead of raw fill. threshold is the routing switch threshold, at
- * or above which the bar goes red regardless of pace.
+ * or above which the bar goes red regardless of pace. showPct false drops the
+ * percentage wherever a countdown can stand in its place (config
+ * `quotaBarPercent`); with no countdown the percentage is the label either way.
  */
-export function bar(ratio, w = 10, resetTs, windowMs, threshold) {
+export function bar(ratio, w = 10, resetTs, windowMs, threshold, showPct = true) {
   const rst = formatReset(resetTs);
 
   if (ratio == null || isNaN(ratio)) {
@@ -467,7 +469,7 @@ export function bar(ratio, w = 10, resetTs, windowMs, threshold) {
   // both values in this order — the ` · ` between them is the dashboard's
   // (src/dashboard.js).
   const pct = (ratio * 100).toFixed(0) + '%';
-  const both = rst ? `${pct} · ${rst}` : '';
+  const both = showPct && rst ? `${pct} · ${rst}` : '';
   const label = both && vw(both) <= w ? both : (rst || pct);
   const text = label.slice(0, w);
   const pad = w - text.length;
@@ -891,6 +893,20 @@ export class TUI {
       enter: () => this._promptInput('Switch threshold % (1-100, tenths allowed)', v => this._doSetThreshold(v.trim())),
     });
 
+    // Fleet-scoped because the policy behind it is: a credit is spent only when
+    // the whole Codex pool is dry. It sits here, on the screen, rather than in
+    // the config file alone because the one thing an operator needs from this
+    // setting is to be able to kill it at once.
+    fields.push({
+      id: 'autoRedeemResets',
+      label: 'Auto-redeem',
+      hint: '←→ toggle',
+      value: () => (this.config.autoRedeemResets === true ? green('on') : gray('off')),
+      left: () => this._toggleAutoRedeemResets(),
+      right: () => this._toggleAutoRedeemResets(),
+      enter: () => this._toggleAutoRedeemResets(),
+    });
+
     fields.push({
       id: 'probe',
       label: 'Quota probe',
@@ -902,6 +918,16 @@ export class TUI {
       left: () => this._nudgeProbe(-30),
       right: () => this._nudgeProbe(+30),
       enter: () => this._promptInput('Quota probe seconds (0=off, min 30)', v => this._doSetProbe(v.trim())),
+    });
+
+    fields.push({
+      id: 'quotaBarPercent',
+      label: 'Bar percentage',
+      hint: '←→ toggle',
+      value: () => (this.config.quotaBarPercent !== false ? green('on') : gray('off')),
+      left: () => this._toggleQuotaBarPercent(),
+      right: () => this._toggleQuotaBarPercent(),
+      enter: () => this._toggleQuotaBarPercent(),
     });
 
     fields.push({
@@ -1409,6 +1435,34 @@ export class TUI {
     try { await this.saveConfig(this.config); }
     catch (e) { this._addLog(`Failed to save: ${e.message}`); }
     this._addLog(`Session titles: ${enabled ? 'on' : 'off'}`);
+    if (this.running) this.render();
+  }
+
+  async _toggleAutoRedeemResets() {
+    // Whether a spent weekly Codex window may spend one of that account's free
+    // rate-limit reset credits. Fleet-scoped: the policy it arms is about the
+    // whole pool being dry, so its switch is too. The redeemer reads it off the
+    // shared config per refusal, so the assignment is the whole application and
+    // the save is only what survives a restart.
+    //
+    // A per-account `autoRedeemReset: false` still exempts its account while
+    // this is on; nothing per-account can switch it ON.
+    const next = this.config.autoRedeemResets !== true;
+    this.config.autoRedeemResets = next;
+    try { await this.saveConfig(this.config); }
+    catch (/** @type {any} */ e) { this._addLog(`Failed to save: ${e.message}`); }
+    this._addLog(`Auto-redeem Codex reset credits: ${next ? 'on' : 'off'}`);
+    if (this.running) this.render();
+  }
+
+  async _toggleQuotaBarPercent() {
+    // Absent means on, so the first toggle from a config that predates the key
+    // has to write `false` — hence the comparison rather than a negation.
+    const on = this.config.quotaBarPercent === false;
+    this.config.quotaBarPercent = on;
+    try { await this.saveConfig(this.config); }
+    catch (/** @type {any} */ e) { this._addLog(`Failed to save: ${e.message}`); }
+    this._addLog(`Quota bar percentage: ${on ? 'on' : 'off'}`);
     if (this.running) this.render();
   }
 
@@ -2247,17 +2301,21 @@ export class TUI {
     const weeklyFirst = !shortBar && rowCategory(a) === 'unified';
     if (weeklyFirst) [l1, r1, t1, w1, th1] = [l2, r2, t2, w2, th2];
 
-    let line = ` ${sel}${cur} ${startSlot}${name} ${type}${status} ${l1} ${bar(r1, bw, t1, w1, th1)}`;
+    // Keep the optional chaining: _renderAcct is called on instances built
+    // without a config, and it read none before this line existed.
+    const pctInBar = this.config?.quotaBarPercent !== false;
+
+    let line = ` ${sel}${cur} ${startSlot}${name} ${type}${status} ${l1} ${bar(r1, bw, t1, w1, th1, pctInBar)}`;
     if (showBoth) {
-      if (!weeklyFirst) line += `  ${l2} ${bar(r2, bw, t2, w2, th2)}`;
+      if (!weeklyFirst) line += `  ${l2} ${bar(r2, bw, t2, w2, th2, pctInBar)}`;
       // Sonnet weekly bar — only shown when the usage probe has populated it. A
       // leading ► (in place of a padding space) marks a Sonnet route on this account.
       if (showFamily && q.unified7dSonnet != null) {
-        line += `${famLead('sonnet')}${familyMark('sonnet')}S7  ${bar(q.unified7dSonnet, bw, q.unified7dSonnetReset, SEVEN_DAY_MS, limFor('unified7dSonnet'))}`;
+        line += `${famLead('sonnet')}${familyMark('sonnet')}S7  ${bar(q.unified7dSonnet, bw, q.unified7dSonnetReset, SEVEN_DAY_MS, limFor('unified7dSonnet'), pctInBar)}`;
       }
       // Fable weekly bar — only shown when the usage probe has populated it.
       if (showFamily && q.unified7dFable != null) {
-        line += `${famLead('fable')}${familyMark('fable')}F7  ${bar(q.unified7dFable, bw, q.unified7dFableReset, SEVEN_DAY_MS, limFor('unified7dFable'))}`;
+        line += `${famLead('fable')}${familyMark('fable')}F7  ${bar(q.unified7dFable, bw, q.unified7dFableReset, SEVEN_DAY_MS, limFor('unified7dFable'), pctInBar)}`;
       }
     }
     // Explicit "disabled for these models" tag (issue #85): a family the account
@@ -2313,10 +2371,17 @@ export class TUI {
     // ── Rotation
     lines.push(bold('  Rotation') + dim('  — switch accounts when quota crosses the threshold'));
     lines.push(row(byId('threshold')));
+    lines.push(row(byId('autoRedeemResets')));
+    lines.push(dim('  Spend a free Codex rate-limit reset credit when the whole pool'));
+    lines.push(dim('  is dry. Irreversible and scarce — off unless you say otherwise.'));
     lines.push('');
     // ── Quota probe
     lines.push(bold('  Quota probe') + dim('  — refresh idle accounts from the usage endpoint'));
     lines.push(row(byId('probe')));
+    lines.push('');
+    // ── Quota bars
+    lines.push(bold('  Quota bars') + dim('  — what the bar on each account row carries'));
+    lines.push(row(byId('quotaBarPercent')));
     lines.push('');
     // ── Activity log
     lines.push(bold('  Activity log') + dim('  — what to do with Claude Code\'s telemetry'));

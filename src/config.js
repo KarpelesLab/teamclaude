@@ -99,8 +99,13 @@ export function createDefaultConfig() {
     holdSeconds: 0,
     distributeSessions: false,
     sessionTitles: { enabled: false, width: 18 },
+    quotaBarPercent: true,
     eventLogging: 'hide',
     defaultClientMode: 'mitm',
+    // Written out rather than left absent, so a fresh config states the one
+    // setting whose default matters most: a redemption cannot be undone and the
+    // credits are scarce, so nothing spends one until this is switched on.
+    autoRedeemResets: false,
     blockedModels: [],
     accounts: [],
   };

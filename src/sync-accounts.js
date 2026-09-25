@@ -119,6 +119,13 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     // and reported here as it would be at startup. The config entry below keeps
     // the operator's text as written: this only decides what the gate reads.
     mgr.switchThreshold = accountSwitchThreshold(diskAcct);
+    // Read at the moment a refusal asks whether to spend a reset credit, so a
+    // disk edit must land here to bind — and an operator who has just exempted
+    // an account is doing so precisely because they do not want the next
+    // refusal to spend its credit. Negative-only (see makeAccount): only `false`
+    // says anything, so removing the key returns the account to following the
+    // fleet-wide `autoRedeemResets`.
+    mgr.autoRedeemReset = diskAcct.autoRedeemReset !== false;
     // Third-party-backend bindings are read per request off this object
     // (`account.upstream || upstream`, `account.modelMap` in server.js), so a
     // disk edit must land here to take effect on reload. `|| null` mirrors the
@@ -156,6 +163,11 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       // arrangement every entry carries a value for a hand edit to lose to.
       if (Number.isFinite(diskAcct.displayOrder)) cfgAcct.displayOrder = diskAcct.displayOrder; else delete cfgAcct.displayOrder;
       if (diskAcct.disabled) cfgAcct.disabled = true; else delete cfgAcct.disabled;
+      // Both polarities are mirrored, unlike the flags above: `false` is the
+      // side of this key that does something, so a stale mirror of either value
+      // would win the save stencil's spread and undo the disk edit.
+      if (typeof diskAcct.autoRedeemReset === 'boolean') cfgAcct.autoRedeemReset = diskAcct.autoRedeemReset;
+      else delete cfgAcct.autoRedeemReset;
     }
     // Pick up enable/disable toggles; re-enabling clears a stuck error state.
     const wantDisabled = !!diskAcct.disabled;
