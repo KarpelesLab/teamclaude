@@ -14,7 +14,9 @@ Run it once per account. You can add accounts while the server is running — pr
 
 If the profile cannot be identified, login stops without adding a placeholder
 account. Retry after confirming the credential is valid, or pass
-`teamclaude login --name <name>` to add it without profile detection.
+`teamclaude login --name <name>` to add it without profile detection. A
+credential the upstream rejects with 401 (and that cannot be refreshed) is
+refused regardless of `--name` — log in again to get a fresh one.
 
 ## Import from Claude Code
 
@@ -34,7 +36,10 @@ teamclaude import --from /path/to/credentials.json
 Automatic naming requires a successful profile lookup. If credentials are
 invalid or the profile cannot be identified, the import stops without adding a
 placeholder account. Pass `--name <name>` to explicitly import without profile
-detection.
+detection. An expired access token is refreshed on import when the file carries
+a refresh token; a credential the upstream rejects with 401 (and that cannot be
+refreshed) is refused regardless of `--name` — run `claude /login` and import
+again, or `teamclaude login`.
 
 ## Delegating credentials to a file (`importFrom`)
 

@@ -14,7 +14,6 @@
 // Provider is part of it too: a Codex account has no Anthropic UUID at all, so
 // without it one email's Claude and ChatGPT subscriptions compare as one account.
 
-import { isTokenRejection } from './oauth.js';
 import { providerOf } from './provider.js';
 
 /** Stable org discriminator for an account record: org UUID, else org name, else null. */
@@ -166,6 +165,20 @@ export function matchAccounts(accounts, query, orgFilter) {
 }
 
 /**
+ * Whether a failed fetchProfile proves the token is dead, as opposed to merely
+ * unreachable. Only a 401 counts. A 5xx, a timeout or a DNS failure says
+ * nothing about the token, and neither does a 403: the upstream answers 403
+ * "Request not allowed" to a valid token from an unexpected region (see
+ * egress-guard.js), and an org-policy 403 is a cooldown at request time, not a
+ * dead credential — a fresh token would meet the same answer.
+ *
+ * @param {Record<string, any>|null|undefined} profile - a fetchProfile result, success or error
+ */
+export function isTokenRejection(profile) {
+  return profile?.status === 401;
+}
+
+/**
  * Automatic naming is safe only when the profile identifies the account.
  * An explicit name is the caller's opt-in to importing without detection.
  */
@@ -175,9 +188,11 @@ export function canUpsertOAuthAccount(profile, userNamed) {
   // pointing back at the account that was already known to be bad at the moment
   // it was added.
   //
-  // Only a definitive refusal counts. A 5xx, a timeout or a DNS failure says
-  // nothing about the token, and a healthy one must stay importable from a
-  // restricted network — which is what `userNamed` is for, and still is.
+  // Only a definitive refusal counts — a 401 the caller could not refresh away
+  // (oauth.js profileForCredentials renews a stale access token before the
+  // profile gets here). A 5xx, a 403, a timeout or a DNS failure says nothing
+  // about the token, and a healthy one must stay importable from a restricted
+  // network — which is what `userNamed` is for, and still is.
   if (isTokenRejection(profile)) return false;
   return Boolean(
     userNamed
