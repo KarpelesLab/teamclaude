@@ -230,6 +230,10 @@ export function accountBadges(account, current, currentAccounts, now, fleetThres
   // or the comparison falls back to thresholdBadgeText's own 0.98 default.
   var thresholdText = thresholdBadgeText(a.switchThreshold, fleetThreshold, fleetThresholds);
   if (thresholdText) badges.push({ cls: 'meta threshold', text: thresholdText });
+  // The account's own egress proxy, as the status payload carries it: already
+  // password-masked (describeRouting), and absent for an account on the fleet
+  // path, which is the default and earns no badge.
+  if (typeof a.routing === 'string' && a.routing) badges.push({ cls: 'meta routing', text: 'via ' + a.routing });
   return badges;
 }
 
@@ -322,9 +326,99 @@ export function switchRequest(name, key) {
   };
 }
 
+// The request the threshold control sends. The number goes as typed: what
+// counts as a percentage is the server's rule (1–100, kept to tenths), and a
+// second opinion here would only disagree with it on the edges.
+/**
+ * @param {number|string} percent
+ * @param {string|null|undefined} key
+ */
+export function thresholdRequest(percent, key) {
+  return {
+    url: '/teamclaude/threshold',
+    init: {
+      method: 'POST',
+      headers: { 'x-api-key': key || '', 'content-type': 'application/json' },
+      body: JSON.stringify({ percent: percent }),
+    },
+  };
+}
+
+// The stored 0–1 ratio as the number the control shows. Tenths, and no trailing
+// zero: the setting is quantised to tenths of a percent, so 0.98 must read back
+// as "98" rather than "98.0" for a re-save to be a no-op the operator can see.
+/** @param {unknown} value */
+export function thresholdPercentText(value) {
+  /** @type {any} */ var ratio = value;
+  // A per-bucket table: the control sets one number for every bucket, so what it
+  // shows is the default the table falls back to.
+  if (ratio && typeof ratio === 'object' && !Array.isArray(ratio)) ratio = ratio.default;
+  if (typeof ratio !== 'number' || !isFinite(ratio)) return '';
+  return String(Math.round(ratio * 1000) / 10);
+}
+
+// What to tell the operator after a threshold change. `dropped` is the part a
+// bare "saved" would hide: one number replaces a per-bucket table rather than
+// hiding one behind it, and the operator who set those buckets should hear it.
+/**
+ * @param {any} res
+ * @returns {{ kind: string, text: string }}
+ */
+export function thresholdOutcome(res) {
+  if (!res || !res.ok) return { kind: 'error', text: 'threshold change failed' + (res && res.error ? ': ' + res.error : '') };
+  var pct = thresholdPercentText(res.switchThreshold);
+  var dropped = res.dropped || [];
+  if (dropped.length) return { kind: 'warn', text: 'switch threshold set to ' + pct + '% — dropped the per-bucket thresholds (' + dropped.join(', ') + ')' };
+  return { kind: 'ok', text: 'switch threshold set to ' + pct + '%' };
+}
+
 // What to tell the operator afterwards. The endpoint answers `ok` for the choice
 // being recorded and `eligible` for whether traffic will actually follow it —
 // two different things, and a bare "done" would be a lie for a spent target.
+/**
+ * POST for an account control. `spec` is {place}/{priority} for a priority
+ * move, or {disabled} to take an account out of rotation or put it back.
+ *
+ * @param {any} name
+ * @param {{ place?: string, priority?: number, disabled?: boolean }} spec
+ * @param {string|null} key
+ */
+export function accountControlRequest(name, spec, key) {
+  var isPriority = spec.disabled === undefined;
+  /** @type {{ account: any, place?: any, priority?: any, disabled?: any }} */
+  var body = { account: name };
+  if (isPriority) {
+    if (spec.place) body.place = spec.place;
+    else body.priority = spec.priority;
+  } else {
+    body.disabled = spec.disabled;
+  }
+  return {
+    url: isPriority ? '/teamclaude/priority' : '/teamclaude/disable',
+    init: {
+      method: 'POST',
+      headers: { 'x-api-key': key || '', 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    },
+  };
+}
+
+/**
+ * What to tell the operator afterwards. A priority move reports the number it
+ * landed on, which is the part the caller did not choose when it asked for
+ * 'first' or 'last'.
+ *
+ * @param {any} res
+ * @param {{ place?: string, priority?: number, disabled?: boolean }} spec
+ */
+export function accountControlOutcome(res, spec) {
+  if (!res || !res.ok) return { kind: 'error', text: 'change failed' + (res && res.error ? ': ' + res.error : '') };
+  if (spec.disabled !== undefined) {
+    return { kind: 'ok', text: (res.disabled ? 'disabled ' : 'enabled ') + res.name };
+  }
+  return { kind: 'ok', text: res.name + ' priority ' + res.priority };
+}
+
 export function switchOutcome(res) {
   if (!res || !res.ok) return { kind: 'error', text: 'switch failed' + (res && res.error ? ': ' + res.error : '') };
   if (res.eligible === false) return { kind: 'warn', text: 'switched to ' + res.account + ', but rotation will not use it' + (res.reason ? ': ' + res.reason : '') };
@@ -487,7 +581,7 @@ export function problems(status) {
 
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
-  switchRequest, switchOutcome, routeRows, problems,
+  switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -584,6 +678,11 @@ const PAGE = `<!doctype html>
   .actions button { font: inherit; font-size: 12px; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--line); background: transparent; color: var(--dim); cursor: pointer; }
   .actions button:hover { color: var(--text); border-color: var(--text); }
   .actions button:disabled { opacity: .5; cursor: default; }
+  /* Pushed to the far end: the two buttons on the left act on the fleet as it
+     stands, while this one edits a stored setting — a gap says so without a
+     second row. */
+  .actions .thr { display: flex; align-items: center; gap: 6px; margin-left: auto; font-size: 12px; color: var(--dim); }
+  .actions .thr input { width: 64px; font: inherit; font-size: 12px; padding: 4px 8px; text-align: right; border-radius: 999px; border: 1px solid var(--line); background: transparent; color: var(--text); }
   th.sortable { cursor: pointer; user-select: none; }
   th.sortable:hover { color: var(--text); }
   td.dim { color: var(--dim); }
@@ -626,6 +725,12 @@ const PAGE = `<!doctype html>
       <button id="reload" type="button">Reload config</button>
       <button id="probe" type="button">Probe quotas</button>
       <button id="theme" type="button" title="Switch between following the system, light and dark"></button>
+      <span class="thr">
+        <label for="thrVal">Switch at</label>
+        <input id="thrVal" type="number" min="1" max="100" step="0.1" inputmode="decimal">
+        <span>%</span>
+        <button id="thrSet" type="button">Set</button>
+      </span>
     </div>
     <div id="err"></div>
     <div id="problems"></div>
@@ -758,6 +863,24 @@ ${SHARED_HELPERS}
       var btn = el('button', 'act', 'switch');
       btn.addEventListener('click', function () { doSwitch(a.name, btn); });
       head.appendChild(btn);
+    }
+    // Account controls, in the order an operator reaches for them: take it out
+    // of rotation, or move where rotation reaches it. Only the enable/disable
+    // control is shown for a disabled account — the rest would be moving an
+    // account that nothing will select anyway.
+    // Named ctl* deliberately: var is function-scoped, and this builder already
+    // declares a "last" further down (the last-used string). A button named
+    // last here is overwritten by that before any click can fire.
+    var ctlDisable = el('button', 'act', a.disabled ? 'enable' : 'disable');
+    ctlDisable.addEventListener('click', function () { doControlAccount(a.name, { disabled: !a.disabled }, ctlDisable); });
+    head.appendChild(ctlDisable);
+    if (!a.disabled) {
+      var ctlFirst = el('button', 'act', 'prioritize');
+      ctlFirst.addEventListener('click', function () { doControlAccount(a.name, { place: 'first' }, ctlFirst); });
+      head.appendChild(ctlFirst);
+      var ctlLast = el('button', 'act', 'deprioritize');
+      ctlLast.addEventListener('click', function () { doControlAccount(a.name, { place: 'last' }, ctlLast); });
+      head.appendChild(ctlLast);
     }
     card.appendChild(head);
     if (a.unavailable) card.appendChild(el('div', 'blocked', 'blocked: ' + (UNAVAILABLE_TEXT[a.unavailable] || a.unavailable)));
@@ -996,6 +1119,12 @@ ${SHARED_HELPERS}
 
   function render(s) {
     lastStatus = s;
+    // The poll owns the threshold field except while it is being typed into:
+    // rewriting it every POLL_MS would delete the operator's half-entered
+    // number under the cursor. It also means a change made from the CLI, the
+    // TUI or another browser shows up here without a refresh.
+    var thrInput = document.getElementById('thrVal');
+    if (document.activeElement !== thrInput) thrInput.value = thresholdPercentText(s.switchThreshold);
     var sess = s.sessions || {};
     var up = s.server && s.server.uptimeSeconds != null ? 'up ' + fmtIn(s.server.uptimeSeconds) : '';
     var sum = document.getElementById('summary');
@@ -1063,6 +1192,59 @@ ${SHARED_HELPERS}
         poll();
       })
       .catch(function (e) { note('error', 'switch failed: ' + e.message); btn.disabled = false; });
+  }
+
+  function doControlAccount(name, spec, btn) {
+    btn.disabled = true;
+    var r = accountControlRequest(name, spec, localStorage.getItem(KEY));
+    fetch(r.url, r.init)
+      .then(function (res) {
+        if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
+        return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
+      })
+      .then(function (json) {
+        if (!json) return;
+        var out = accountControlOutcome(json, spec);
+        note(out.kind, out.text);
+        poll();
+      })
+      .catch(function (e) { note('error', 'change failed: ' + e.message); })
+      // Unlike doSwitch, always re-enabled: the card is rebuilt by the poll
+      // above, and a button that stayed dead after a refused change would be
+      // the only control an operator could not retry.
+      .finally(function () { btn.disabled = false; });
+  }
+
+  // The one control here that writes a setting rather than nudging the running
+  // fleet: the server saves it to the config file and reloads, so it holds
+  // across a restart. One number governs every quota bucket — a fleet using
+  // per-bucket thresholds is told what the save dropped (thresholdOutcome).
+  function doThreshold(btn) {
+    var input = document.getElementById('thrVal');
+    var raw = input.value.trim();
+    // Left to the server otherwise: an empty field is the one case it would see
+    // as a missing key rather than a bad number, and "invalid request body" is
+    // not what an operator who cleared the box needs to read.
+    if (!raw) { note('error', 'switch threshold: enter a percentage from 1 to 100'); return; }
+    btn.disabled = true;
+    var r = thresholdRequest(Number(raw), localStorage.getItem(KEY));
+    fetch(r.url, r.init)
+      .then(function (res) {
+        if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
+        return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
+      })
+      .then(function (json) {
+        if (!json) return;
+        var out = thresholdOutcome(json);
+        note(out.kind, out.text);
+        // The stored number, not the typed one: the setting is quantised to
+        // tenths, and a field left reading 97.55 after a save of 97.6 invites a
+        // re-save that changes nothing.
+        if (json.ok) input.value = thresholdPercentText(json.switchThreshold);
+        poll();
+      })
+      .catch(function (e) { note('error', 'switch threshold change failed: ' + e.message); })
+      .finally(function () { btn.disabled = false; });
   }
 
   function doControl(path, label, btn) {
@@ -1168,6 +1350,10 @@ ${SHARED_HELPERS}
 
   document.getElementById('reload').addEventListener('click', function () { doControl('/teamclaude/reload', 'config reload', this); });
   document.getElementById('probe').addEventListener('click', function () { doControl('/teamclaude/probe', 'quota probe', this); });
+  document.getElementById('thrSet').addEventListener('click', function () { doThreshold(this); });
+  document.getElementById('thrVal').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') document.getElementById('thrSet').click();
+  });
 
   ['fProject', 'fClient'].forEach(function (id) {
     document.getElementById(id).addEventListener('change', function () {

@@ -40,9 +40,13 @@ function v4Octets(ip) {
 /**
  * Expand an IPv6 address to its eight 16-bit groups, or null. Handles `::`
  * compression and a trailing dotted-quad (`::ffff:127.0.0.1`), which is how
- * Node reports a mapped IPv4 peer on a dual-stack socket.
+ * Node reports a mapped IPv4 peer on a dual-stack socket. Exported for the
+ * SOCKS5 address encoder in account-routing.js, which needs the same folding
+ * of a mapped tail into two groups.
+ * @param {string} ip
+ * @returns {number[]|null}
  */
-function v6Groups(ip) {
+export function v6Groups(ip) {
   let s = ip.toLowerCase().replace(/%.*$/, ''); // drop a zone id (fe80::1%eth0)
   const tail = /:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/.exec(s);
   let v4tail = [];

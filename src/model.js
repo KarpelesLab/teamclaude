@@ -45,6 +45,44 @@ export function resolveMaxUsage(maxUsage, bucket) {
   return null;
 }
 
+// A per-account money cap (accounts[].maxSpend) in the smallest unit of the
+// account's billing currency, or null when the account carries no valid cap or
+// upstream has not said what its currency is. The cap is written in major units
+// (`20` is $20.00) because that is how a person thinks about a budget; the
+// exponent that turns it into minor units comes from the same upstream `spend`
+// record the month-to-date figure does, so the two are always compared in the
+// same unit. Lives here for the reason resolveMaxUsage does: the status
+// renderer draws it from remote JSON as well as from a live account.
+/**
+ * @param {unknown} maxSpend
+ * @param {{ exponent?: number } | null | undefined} spend
+ * @returns {number | null}
+ */
+export function resolveMaxSpendMinor(maxSpend, spend) {
+  if (typeof maxSpend !== 'number' || !Number.isFinite(maxSpend) || maxSpend < 0) return null;
+  const exponent = spend?.exponent ?? 2;
+  if (!Number.isInteger(exponent) || exponent < 0 || exponent > 6) return null;
+  return Math.round(maxSpend * 10 ** exponent);
+}
+
+// Whether an account has spent its money cap this month: `usedMinor` is the
+// month-to-date extra-usage figure upstream reports, and the cap binds at the
+// level set (`>=`), except that a cap of 0 means "not one cent" rather than
+// "nothing at all" — an account that has billed nothing is still under it.
+// Only an account that CAN bill is judged: with extra usage off upstream no
+// request costs money, and barring it would only waste the quota it still has.
+/**
+ * @param {unknown} maxSpend
+ * @param {{ enabled?: boolean, usedMinor?: number | null, exponent?: number } | null | undefined} spend
+ */
+export function spendCapReached(maxSpend, spend) {
+  if (!spend?.enabled) return false;
+  const cap = resolveMaxSpendMinor(maxSpend, spend);
+  if (cap == null) return false;
+  const used = spend.usedMinor || 0;
+  return used > 0 && used >= cap;
+}
+
 // The switch threshold for one bucket on one account (accounts[].switchThreshold,
 // issue #409), falling back to the fleet's own thresholdFor(bucket) rather than
 // to DEFAULT_SWITCH_THRESHOLD directly — an account whose table lists only, say,
@@ -318,9 +356,11 @@ export class TopLevelFieldFinder {
     this.esc = false;
     this.readingKey = false;
     this.readingValue = false;        // accumulating the target field's value
+    this.readingScalar = false;       // accumulating a bare scalar (true/false/null/number)
     this.curKey = null;               // last key seen in the current object
     this.buf = [];                    // key/value byte accumulation
     this.value = null;                // the found value, or null
+    this.scalar = false;              // the value was a bare scalar, not a quoted string
     this.done = false;                // found it, or the root object closed without it
   }
 
@@ -333,7 +373,22 @@ export class TopLevelFieldFinder {
 
   #atRoot() { return this.isObj.length === 1 && this.isObj[0] === true; }
 
+  // A bare scalar (`true`, `false`, `null`, a number) has no closing quote; it
+  // ends at the first byte that cannot be part of it. The token is kept as its
+  // source text, so `stream: true` reads back as the string 'true'.
+  #endScalar() {
+    this.value = Buffer.from(this.buf).toString('utf8'); this.buf = [];
+    this.readingScalar = false; this.scalar = true; this.done = true;
+  }
+
   #byte(b) {
+    if (this.readingScalar) {
+      const scalarByte = (b >= 0x30 && b <= 0x39) || (b >= 0x61 && b <= 0x7a) || (b >= 0x41 && b <= 0x5a)
+        || b === 0x2b || b === 0x2d || b === 0x2e;                 // 0-9 a-z A-Z + - .
+      if (scalarByte) { this.buf.push(b); return; }
+      this.#endScalar();
+      // Fall through: the byte that ended the scalar still counts as structure.
+    }
     if (this.inStr) {
       if (this.esc) { this.esc = false; if (this.readingKey || this.readingValue) this.buf.push(b); return; }
       if (b === 0x5c) { this.esc = true; if (this.readingKey || this.readingValue) this.buf.push(b); return; } // backslash
@@ -368,9 +423,28 @@ export class TopLevelFieldFinder {
         }
         this.inStr = true; this.esc = false;
         break;
-      default: break;                                              // scalars / whitespace
+      default:                                                     // scalars / whitespace
+        if (this.#atRoot() && this.curKey === this.field && !this.awaitingKey
+          && b !== 0x20 && b !== 0x09 && b !== 0x0a && b !== 0x0d) {
+          this.readingScalar = true; this.buf = [b];               // the target field's bare value
+        }
+        break;
     }
   }
+}
+
+// Whether a JSON request body asks for a streamed reply: its top-level
+// `stream` field is the literal `true`. Same finder as the model, so a
+// `"stream": true` inside conversation text is never mistaken for the field.
+// Absent, malformed, or anything but `true` reads as false.
+/** @param {Buffer|string|null|undefined} body */
+export function parseRequestStream(body) {
+  if (!body) return false;
+  try {
+    const buf = Buffer.isBuffer(body) ? body : Buffer.from(String(body), 'utf8');
+    const finder = new TopLevelFieldFinder('stream');
+    return finder.push(buf) === 'true' && finder.scalar;
+  } catch { return false; }
 }
 
 // Extract the requested model id from a JSON request body (Buffer or string).

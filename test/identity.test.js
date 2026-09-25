@@ -10,6 +10,7 @@ import {
   updateAccountEntry,
   distinctAccounts,
   canUpsertOAuthAccount,
+  isTokenRejection,
   oauthIdentityFields,
 } from '../src/identity.js';
 
@@ -174,6 +175,34 @@ test('anonymous OAuth upsert requires an identifiable profile', () => {
 test('explicitly named OAuth upsert remains available without a profile', () => {
   assert.equal(canUpsertOAuthAccount(null, true), true);
   assert.equal(canUpsertOAuthAccount({ error: 'offline' }, true), true);
+  // Unreachable is not refused: a 5xx or a network failure says nothing about
+  // the token, and --name must still get a healthy one in from a restricted
+  // network. `status: null` is what fetchProfile reports for a thrown fetch.
+  assert.equal(canUpsertOAuthAccount({ error: 'HTTP 503', status: 503 }, true), true);
+  assert.equal(canUpsertOAuthAccount({ error: 'getaddrinfo ENOTFOUND', status: null }, true), true);
+  assert.equal(canUpsertOAuthAccount({ error: 'HTTP 500', status: 500 }, true), true);
+  // Nor is a 403: the upstream answers it to a valid token from an unexpected
+  // region (egress-guard.js) and under an org policy. A fresh token would get
+  // the same answer, so it says nothing about this one.
+  assert.equal(isTokenRejection({ error: 'HTTP 403: Request not allowed', status: 403 }), false);
+  assert.equal(canUpsertOAuthAccount({ error: 'HTTP 403: Request not allowed', status: 403 }, true), true);
+  assert.equal(canUpsertOAuthAccount({ error: 'HTTP 403: Request not allowed', status: 403 }, false), false);
+});
+
+test('a token the upstream refused is not importable, with or without --name', () => {
+  // The whole point of the flag is to add an account the proxy could not
+  // identify. It is not a way past the upstream saying the token is dead:
+  // that import reports success and then 401s on every request, with nothing
+  // pointing back at the account that was already known to be bad.
+  assert.equal(isTokenRejection({ error: 'HTTP 401', status: 401 }), true);
+  assert.equal(canUpsertOAuthAccount({ error: 'HTTP 401', status: 401 }, true), false);
+  assert.equal(canUpsertOAuthAccount({ error: 'HTTP 401', status: 401 }, false), false);
+  // A profile that somehow carries both a refusal and an identity is still a
+  // refusal — the identity came from a token that no longer works.
+  assert.equal(canUpsertOAuthAccount({ email: 'a@example.com', status: 401 }, true), false);
+  // Only the status decides; the shape of the message does not.
+  assert.equal(isTokenRejection({ error: 'HTTP 401' }), false);
+  assert.equal(isTokenRejection(null), false);
 });
 
 test('unavailable profile fields do not erase stored OAuth identity', () => {
