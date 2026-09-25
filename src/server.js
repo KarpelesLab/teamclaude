@@ -2453,6 +2453,189 @@ export function exhaustedMessage(candidates, model, retryAfter) {
   return `No account can serve this request${scope}: ${blockers.join('; ')}; ${rest}.${when}${aside}`;
 }
 
+// ── A refusal reported inside a 200 stream ───────────────────────────────────
+//
+// Every failover in forwardRequest keys on the upstream status, and the
+// Responses API does not always use one: it answers 200, opens the SSE stream,
+// and then reports "the selected model is at capacity" as an event in the body
+// before any output. Measured on a five-account Codex pool, that was every
+// refusal the pool saw — 937 × 200 and not one status-shaped failure — so the
+// proxy relayed each one as an answer, on an account that may have been the
+// only one refusing. The head of the stream is therefore read BEFORE its
+// headers go out to the client: nothing has been written at that point, so the
+// request is still retryable.
+
+// The lifecycle events a Responses stream emits before it has committed to any
+// output. While only these have been seen the stream is undecided and the peek
+// keeps reading; the first event that is not one of them decides it.
+const SSE_UNCOMMITTED_EVENTS = new Set(['response.created', 'response.queued', 'response.in_progress']);
+
+/**
+ * The failure codes that name the provider or the account rather than the
+ * request. A stream whose first decisive event is a `response.failed` or
+ * `error` carrying one of these takes one hop to a sibling. Any other code
+ * (`invalid_prompt`, `invalid_request`, a content filter, ...) would be refused
+ * identically by every account, so it is relayed and no sibling is spent.
+ *
+ * - `server_is_overloaded` — the Responses API's "selected model is at
+ *   capacity", the case this exists for.
+ * - `server_error` — the Responses API's own 5xx, reported in-band.
+ * - `rate_limit_exceeded` — a throttle that arrived after the 200.
+ * - `overloaded_error` — Anthropic's `error.type` for a 529 reported inside a
+ *   stream that had already opened.
+ */
+export const STREAM_FAILURE_CODES = new Set(['server_is_overloaded', 'server_error', 'rate_limit_exceeded', 'overloaded_error']);
+
+// How much of a stream the peek may hold before releasing it undecided. The
+// Codex lifecycle envelopes echo the whole request back, instructions included,
+// so `response.created` alone can run to tens of KiB.
+const DEFAULT_STREAM_PEEK_BUDGET_BYTES = 256 * 1024;
+// How long the peek may hold the headers back. A slow first token is not a
+// failure, and a stream that says nothing is released rather than waited on.
+const DEFAULT_STREAM_PEEK_HOLD_MS = 10_000;
+
+/**
+ * The peek's two bounds. Read per call like the body idle timeout, so a test
+ * can shrink them through TEAMCLAUDE_STREAM_PEEK_BUDGET_BYTES and
+ * TEAMCLAUDE_STREAM_PEEK_HOLD_MS without reloading the module. Unset, empty or
+ * non-positive means the default.
+ * @returns {{ budgetBytes: number, holdMs: number }}
+ */
+export function resolveStreamPeekBounds() {
+  const budget = Number(process.env.TEAMCLAUDE_STREAM_PEEK_BUDGET_BYTES);
+  const hold = Number(process.env.TEAMCLAUDE_STREAM_PEEK_HOLD_MS);
+  return {
+    budgetBytes: budget > 0 ? budget : DEFAULT_STREAM_PEEK_BUDGET_BYTES,
+    holdMs: hold > 0 ? hold : DEFAULT_STREAM_PEEK_HOLD_MS,
+  };
+}
+
+// What the wall clock resolves to when it beats a read.
+const STREAM_PEEK_TIMED_OUT = Symbol('stream peek timed out');
+
+/**
+ * The failure code a stream event reports, or null when it reports none.
+ *
+ * Three spellings: `response.failed` carries it under `response.error.code`;
+ * the Responses API's `error` event carries it at the top level (`code`), or
+ * nested under `error.code` on some backends; an Anthropic `error` event names
+ * it by `error.type`.
+ * @param {any} data
+ * @returns {string|null}
+ */
+function streamFailureCode(data) {
+  const code = data.response?.error?.code ?? data.error?.code ?? data.code ?? data.error?.type;
+  return typeof code === 'string' ? code : null;
+}
+
+/**
+ * @typedef {object} PeekedStream
+ * @property {string|null} failureCode the code that decided a hop, or null to release
+ * @property {ReadableStream<Uint8Array>} body the bytes already read, then the rest of the same stream
+ * @property {() => Promise<void>} cancel drop the stream without relaying it
+ */
+
+/**
+ * Read the head of an SSE body before its headers reach the client and say
+ * whether it reports its own failure.
+ *
+ * Reads until the first event that is not a lifecycle envelope, or until
+ * `budgetBytes` are held or `holdMs` has passed, whichever comes first. The
+ * verdict is the failure code when that event is a `response.failed` or
+ * `error` naming one of STREAM_FAILURE_CODES, and null for everything else: a
+ * delta (output is committed, and there is no retry behind committed output),
+ * a request-fault error, an Anthropic `message_start`, a stream that ended,
+ * either bound, a read error. Order decides this, not presence.
+ *
+ * Events are found by the same line scanner the usage parser uses and judged
+ * on the parsed event's `type` alone: the lifecycle envelopes echo the whole
+ * request back, so text inside `instructions` must never be able to look like
+ * an event.
+ *
+ * The returned body replays what was read and then continues the same stream,
+ * so a released peek costs the client nothing. A read the wall clock abandoned
+ * is still pending on the reader, and the chunk it resolves with is real: the
+ * replay awaits it before reading again rather than dropping it.
+ *
+ * @param {ReadableStream<Uint8Array>} stream
+ * @param {{ budgetBytes?: number, holdMs?: number }} [bounds] defaults from resolveStreamPeekBounds
+ * @returns {Promise<PeekedStream>}
+ */
+export async function peekStreamFailure(stream, bounds = {}) {
+  const defaults = resolveStreamPeekBounds();
+  const budgetBytes = bounds.budgetBytes ?? defaults.budgetBytes;
+  const holdMs = bounds.holdMs ?? defaults.holdMs;
+  const reader = stream.getReader();
+  /** @type {Uint8Array[]} */
+  const chunks = [];
+  /** @type {Promise<ReadableStreamReadResult<Uint8Array>>|null} */
+  let pending = null;
+  let ended = false;
+  let held = 0;
+  // Mutated by the scanner's callback below, so an object rather than a
+  // reassigned binding: the checker cannot see a closure's assignments.
+  /** @type {{ decided: boolean, failureCode: string|null }} */
+  const verdict = { decided: false, failureCode: null };
+  const decoder = new TextDecoder();
+  const scanner = createSseLineScanner((/** @type {string} */ line) => {
+    if (verdict.decided || !line.startsWith('data: ')) return;
+    /** @type {any} */
+    let data;
+    try { data = JSON.parse(line.slice(6)); } catch { verdict.decided = true; return; }
+    const type = typeof data?.type === 'string' ? data.type : '';
+    if (SSE_UNCOMMITTED_EVENTS.has(type)) return;
+    const code = type === 'response.failed' || type === 'error' ? streamFailureCode(data) : null;
+    verdict.decided = true;
+    verdict.failureCode = code && STREAM_FAILURE_CODES.has(code) ? code : null;
+  });
+
+  const deadline = Date.now() + holdMs;
+  try {
+    while (!verdict.decided && !ended && held < budgetBytes) {
+      const left = deadline - Date.now();
+      if (left <= 0) break;
+      const read = pending ?? reader.read();
+      // Kept if the clock wins below, for the replay to consume first. Its
+      // rejection is observed there — or nowhere, once the peek is cancelled.
+      read.catch(() => {});
+      pending = read;
+      /** @type {ReturnType<typeof setTimeout>|undefined} */
+      let timer;
+      const clock = new Promise((resolve) => { timer = setTimeout(() => resolve(STREAM_PEEK_TIMED_OUT), left); });
+      const next = await Promise.race([read, clock]).finally(() => clearTimeout(timer));
+      if (next === STREAM_PEEK_TIMED_OUT) break;
+      pending = null;
+      if (next.done) { ended = true; break; }
+      chunks.push(next.value);
+      held += next.value.byteLength;
+      scanner.push(decoder.decode(next.value, { stream: true }));
+    }
+  } catch {
+    // A read that failed mid-peek: release. The replay's next read reports the
+    // same failure to streamResponse, which handles it as it always has.
+    pending = null;
+  }
+
+  return {
+    failureCode: verdict.failureCode,
+    body: new ReadableStream({
+      start(controller) {
+        for (const chunk of chunks) controller.enqueue(chunk);
+        if (ended) controller.close();
+      },
+      async pull(controller) {
+        const read = pending ?? reader.read();
+        pending = null;
+        const { done, value } = await read;
+        if (done) controller.close();
+        else controller.enqueue(value);
+      },
+      cancel(reason) { return reader.cancel(reason); },
+    }),
+    cancel: () => reader.cancel().catch(() => {}),
+  };
+}
+
 export async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, useSx) {
   const maxRetries = accountManager.accounts.length;
   // This function is exported, so a caller may hand us a ctx built elsewhere.
@@ -3253,6 +3436,53 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
 
+    // The ChatGPT backend answers a Codex Responses stream with no Content-Type
+    // at all (issue #456). Keyed on the header alone, such a reply took the
+    // buffered branch: the client saw nothing until the turn was over, and the
+    // usage booking, which lives on the streaming branch, never ran. A headerless
+    // success to a request that asked for a stream is relayed as one, and told
+    // so (when the response headers are built below), since the client keys on
+    // the same header. Computed here, before the peek, because the peek keys on
+    // the same reading — a headerless Codex stream is exactly where the
+    // in-band refusal arrives — and reused by the relay after it.
+    let contentType = upstreamRes.headers.get('content-type') || '';
+    const streamAssumed = !contentType && upstreamRes.status < 400 && ctx.streamRequested;
+    if (streamAssumed) contentType = 'text/event-stream';
+    const isStreaming = contentType.includes('text/event-stream');
+    // The body the relay reads: the upstream's own, or, after a released peek,
+    // the same bytes replayed ahead of the rest of the same stream.
+    let upstreamBody = upstreamRes.body;
+
+    // The 5xx hop above never sees "the selected model is at capacity": the
+    // Responses API answers it with a 200, opens the stream, and reports the
+    // refusal as an event in the body before any output (see peekStreamFailure).
+    // Same hop, same budget, same reason — a second account refusing the same
+    // way is the provider talking, not the account — keyed on the first
+    // decisive event instead of the status. The sibling is picked first so a
+    // request with nowhere to hop to is never held for nothing.
+    if (isStreaming && upstreamRes.status < 400 && upstreamBody && !res.headersSent
+        && !ctx.streamFailureHopped && retryCount < maxRetries) {
+      const alt = accountManager.pickAlternate(
+        new Set([...ctx.tried, ...(ctx.rolledOff || []), account.index]),
+        ctx.model, ctx.advisorModel, ctx.provider,
+      );
+      if (alt && !accountManager.isPaused(alt.index)) {
+        const peeked = await peekStreamFailure(upstreamBody);
+        upstreamBody = peeked.body;
+        if (peeked.failureCode && !accountManager.isPaused(alt.index)) {
+          await peeked.cancel();
+          ctx.streamFailureHopped = true;
+          ctx.hopTo = alt.index;
+          ctx.tried.add(account.index);
+          console.log(`[TeamClaude] Stream failed inside a ${upstreamRes.status} on "${account.name}" (${peeked.failureCode}) — failing over once to "${alt.name}"`);
+          if (clientGone(res)) { ctx.abandoned = true; return; }
+          return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+        }
+        // The hold was real time, and the client may have left during it.
+        if (clientGone(res)) { await peeked.cancel(); ctx.abandoned = true; return; }
+      }
+    }
+
     // Log the request head (once) followed by the response headers, streaming
     // to disk from here on.
     logRequestHead();
@@ -3272,17 +3502,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       responseHeaders[key] = value;
     }
 
-    // The ChatGPT backend answers a Codex Responses stream with no Content-Type
-    // at all (issue #456). Keyed on the header alone, such a reply took the
-    // buffered branch: the client saw nothing until the turn was over, and the
-    // usage booking, which lives on the streaming branch, never ran. A headerless
-    // success to a request that asked for a stream is relayed as one, and told
-    // so, since the client keys on the same header.
-    let contentType = upstreamRes.headers.get('content-type') || '';
-    if (!contentType && upstreamRes.status < 400 && ctx.streamRequested) {
-      contentType = 'text/event-stream';
-      responseHeaders['content-type'] = contentType;
-    }
+    // A headerless stream is told it is one (see `streamAssumed` above).
+    if (streamAssumed) responseHeaders['content-type'] = contentType;
 
     res.writeHead(upstreamRes.status, responseHeaders);
 
@@ -3292,7 +3513,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       accountManager.confirmStay(account, restingGen, ctx.pinKey, ctx.provider);
     }
 
-    if (!upstreamRes.body) {
+    if (!upstreamBody) {
       const l = getLog();
       if (l) { l.body('RESPONSE BODY', null); l.end(); }
       res.end();
@@ -3300,15 +3521,13 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       return;
     }
 
-    const isStreaming = contentType.includes('text/event-stream');
-
     if (isStreaming) {
       // Stream each chunk straight to the log as it is relayed — never hold the
       // whole (potentially ~1M-token) SSE body in memory.
       const l = getLog();
       const bw = l ? l.bodyWriter('RESPONSE BODY (streamed)', contentType) : null;
       try {
-        await streamResponse(upstreamRes.body, res, account.index, accountManager, bw, ctx.onUsage, ctx.pinKey, ctx.model);
+        await streamResponse(upstreamBody, res, account.index, accountManager, bw, ctx.onUsage, ctx.pinKey, ctx.model);
         // Reached only when the stream completed. A stream that dies upstream
         // throws out of streamResponse, so it never marks itself delivered —
         // which is the failure the token counters cannot see, since a stream
