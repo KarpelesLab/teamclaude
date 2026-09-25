@@ -301,13 +301,15 @@ test('without a five-hour window a Codex-only list drops Ses, and in a mixed sin
   // The weekly bar took both cells' width. A bar is drawn as `bw` columns of
   // background colour, so measure the raw rows: the Codex row's Wk bar spans
   // bar + `  Wk ` + bar, ends where the Claude row's Wk bar ends, and is the
-  // last thing on its row.
+  // last thing on its row. The label is `Wk ` — three columns, padded to
+  // `Ses`'s width — and the row puts one more space between label and bar,
+  // so a bar starts four columns after its `W`.
   const [cl, cx] = [drawn.find(r => r.idx === 0), drawn.find(r => r.idx === 1)];
   assert.ok(cl && cx && !cl.pane && !cx.pane, 'one column at 100');
   assert.equal(cx.bw, cl.bw, 'both rows are budgeted from the same category');
-  const wideEnd = cx.text.indexOf('Wk ') + 3 + (2 * cx.bw + 6);
+  const wideEnd = cx.text.indexOf('Wk ') + 4 + (2 * cx.bw + 6);
   assert.equal(cx.text.length, wideEnd, `${cl.text}\n${cx.text}`);
-  assert.equal(cl.text.indexOf('  Wk ') + 5 + cl.bw, wideEnd, `${cl.text}\n${cx.text}`);
+  assert.equal(cl.text.indexOf('  Wk ') + 6 + cl.bw, wideEnd, `${cl.text}\n${cx.text}`);
 });
 
 test('selection walks the Anthropic pane, then the Codex pane, and stores manager indices', () => {
