@@ -10,7 +10,7 @@ import { installCrashHandlers } from './crash-log.js';
 import { AccountManager, distributionMode } from './account-manager.js';
 import { validateAdaptiveConfig } from './adaptive-distribution.js';
 import { createProxyServer } from './server.js';
-import { importCredentials, loginOAuth, loginOAuthWithPastedCode, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
+import { importCredentials, loginOAuth, loginOAuthWithPastedCode, fetchProfile, profileForCredentials, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import {
   sameIdentity,
   orgKey,
@@ -18,6 +18,7 @@ import {
   findUpsertTarget,
   updateAccountEntry,
   canUpsertOAuthAccount,
+  isTokenRejection,
   oauthIdentityFields,
 } from './identity.js';
 import { resolveAccounts } from './resolve-accounts.js';
@@ -2181,14 +2182,24 @@ function orgLabel(a) {
 }
 
 async function upsertOAuthAccount(name, creds, source = 'unknown') {
-  // Fetch profile to auto-name and deduplicate by account+org identity.
+  // Fetch profile to auto-name and deduplicate by account+org identity. A
+  // credentials file is routinely past its access token's hour while its
+  // refresh token is still good, so a stale token is renewed first and the
+  // renewed pair is what gets saved below — `creds` is the set to write.
   const userNamed = !!name;
-  const profile = await fetchProfile(creds.accessToken);
+  const identified = await profileForCredentials(creds);
+  creds = identified.creds;
+  const profile = identified.profile;
   const profileOk = profile && !profile.error;
 
   if (!canUpsertOAuthAccount(profile, userNamed)) {
     console.error(`Could not identify OAuth account — ${profile?.error || 'profile unavailable'}`);
-    console.error('Retry with valid credentials, or pass --name to add the account without profile detection.');
+    // --name is the documented way past a profile the proxy could not read, but
+    // it is not a way past a token the upstream refused: suggesting it there
+    // would be pointing at the one door this no longer opens.
+    console.error(isTokenRejection(profile)
+      ? 'The upstream rejected this token and it could not be refreshed. Run `teamclaude login` to get a fresh one.'
+      : 'Retry with valid credentials, or pass --name to add the account without profile detection.');
     process.exit(1);
   }
 
