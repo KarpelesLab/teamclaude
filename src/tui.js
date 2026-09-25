@@ -292,6 +292,7 @@ export function spendTag(quota, maxSpend = null) {
 // `20` for a whole-unit cap, `12.5` otherwise: the cap is the operator's own
 // round number, so the cents that formatMoney always carries would only be
 // noise after the slash.
+/** @param {number} minor @param {{ exponent?: number } | null | undefined} spend */
 function compactMoney(minor, spend) {
   return String(minor / 10 ** (spend?.exponent ?? 2));
 }
@@ -1934,9 +1935,9 @@ export class TUI {
         const names = blockedFamilies(a.quota, key => this.am.thresholdFor(key, a));
         return names.length ? Math.max(w, 4 + vw(names.join(' '))) : w;
       }, 0);
-      // Same rule for the `$`/`$!` money tag: a column the row can draw is a
-      // column the budget has to know about, or the row overflows exactly the
-      // way #228 fixed.
+      // Same rule for the money tag (`$`, or the billed amount with its `/cap`):
+      // a column the row can draw is a column the budget has to know about, or
+      // the row overflows exactly the way #228 fixed.
       const spendW = members.reduce((w, a) => {
         const tag = spendTag(a.quota, a.maxSpend);
         return tag ? Math.max(w, 2 + vw(tag)) : w;

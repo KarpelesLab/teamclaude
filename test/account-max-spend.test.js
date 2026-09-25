@@ -81,8 +81,16 @@ test('the money cap is judged ahead of, and independently from, the usage caps',
 
 test('the cap rides along in status JSON and applies live on a config reload', async () => {
   const am = fleet(20);
-  const row = am.toStatusJSON ? am.toStatusJSON().accounts?.find(a => a.name === 'budget') : null;
-  if (row) assert.equal(row.maxSpend, 20);
+  // Status JSON carries both the cap and, once it binds, the reason — the
+  // attach-mode TUI and a `status --json` reader draw both from there.
+  Object.assign(am.accounts[1].quota, { spend: usd(2000) });
+  const row = am.getStatus().accounts.find(a => a.name === 'budget');
+  assert.equal(row.maxSpend, 20);
+  assert.equal(row.unavailable, 'spend-capped');
+  assert.equal(am.getStatus().accounts.find(a => a.name === 'a').maxSpend, null);
+  // Back under the cap before the reload half, so the lower cap it installs is
+  // what bars the account below, not the figure set here.
+  Object.assign(am.accounts[1].quota, { spend: usd(0) });
   const { syncAccountsFromDisk } = await import('../src/sync-accounts.js');
   const disk = { accounts: [ { ...oauth('a'), id: am.accounts[0].id }, { ...oauth('budget'), id: am.accounts[1].id, maxSpend: 5 } ] };
   const cfg = { accounts: disk.accounts.map(a => ({ ...a })) };

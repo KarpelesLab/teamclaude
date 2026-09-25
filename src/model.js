@@ -53,6 +53,11 @@ export function resolveMaxUsage(maxUsage, bucket) {
 // record the month-to-date figure does, so the two are always compared in the
 // same unit. Lives here for the reason resolveMaxUsage does: the status
 // renderer draws it from remote JSON as well as from a live account.
+/**
+ * @param {unknown} maxSpend
+ * @param {{ exponent?: number } | null | undefined} spend
+ * @returns {number | null}
+ */
 export function resolveMaxSpendMinor(maxSpend, spend) {
   if (typeof maxSpend !== 'number' || !Number.isFinite(maxSpend) || maxSpend < 0) return null;
   const exponent = spend?.exponent ?? 2;
@@ -66,6 +71,10 @@ export function resolveMaxSpendMinor(maxSpend, spend) {
 // "nothing at all" — an account that has billed nothing is still under it.
 // Only an account that CAN bill is judged: with extra usage off upstream no
 // request costs money, and barring it would only waste the quota it still has.
+/**
+ * @param {unknown} maxSpend
+ * @param {{ enabled?: boolean, usedMinor?: number | null, exponent?: number } | null | undefined} spend
+ */
 export function spendCapReached(maxSpend, spend) {
   if (!spend?.enabled) return false;
   const cap = resolveMaxSpendMinor(maxSpend, spend);

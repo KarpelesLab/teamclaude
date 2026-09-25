@@ -169,7 +169,6 @@ The mark stays inside the bar rather than widening it, so capped and uncapped ro
 
 Edits apply live on config reload — no restart.
 
-
 ## Per-account spend caps
 
 A usage cap is about quota. On a seat with **extra usage** enabled the interesting ceiling is money: past 100% of its included quota such an account keeps serving and bills the organization for it. The switch threshold rotates away at 98%, and a `maxUsage` of `1.0` refuses the account at exactly 100%, but a reading is whole percents refreshed by the probe, and a request in flight when the bucket fills is billed. `accounts[].maxSpend` is the ceiling on that:
@@ -180,9 +179,11 @@ A usage cap is about quota. On a seat with **extra usage** enabled the interesti
 
 Written in the account's billing currency (`20` is $20.00), and judged against the month-to-date extra-usage figure the usage endpoint reports — the same figure `teamclaude status` prints as `$14.35 of $10,000.00 used this month`. At the cap the account receives nothing, exactly like a usage cap: rotation skips it, the exhausted-fleet probe skips it, a pin gets the exhausted answer. When upstream's figure resets with the month, the next probe lifts the cap by itself.
 
+**`maxSpend` requires the quota probe.** The spend figure comes only from probe readings — a response carries no month-to-date amount — so it is refreshed on the probe's schedule (`quotaProbeSeconds`, or `teamclaude probe N`; see [Quota probe](#quota-probe)) and by the TUI's **`p`** refresh, never by the request in flight. The cap therefore binds within one probe interval of the figure being reached, not on the request that crosses it: what one interval can bill is the slack to budget for, and with the probe off the figure only moves when you press **`p`**, so the cap effectively never binds.
+
 - The cap binds at the level set (`>=`). `0` means "not one cent": an account that has billed nothing is still admitted, the first billed cent bars it.
 - Only an account that **can** bill is judged. With extra usage off upstream no request costs money, and barring the account would only waste the quota it still has.
-- It is a total, not a preference — nothing overrides it. Combine it with `"maxUsage": 1.0` to stop before billing can start, and keep `maxSpend` as the bound on what a late reading or an in-flight request can cost.
+- It is a total, not a preference — nothing overrides it. Combine it with `"maxUsage": 1.0` to stop before billing can start, and keep `maxSpend` as the backstop: it bounds the month's total to the cap plus whatever one probe interval can bill, not to the cent.
 
 The TUI row shows the amount once anything has been billed, and the cap after it: `$14.35/20`. `teamclaude status` prints the same on the account's `Spend` line, and names the reason `extra-usage spend cap reached (maxSpend)` while the cap holds.
 

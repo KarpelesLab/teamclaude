@@ -706,6 +706,14 @@ async function serverCommand() {
   // is already shared with the server created above.
   hooks.probeQuota = () => prober?.probeAll();
   prober.start();
+  // A money cap (accounts[].maxSpend) is judged against the month-to-date
+  // figure only the probe refreshes — a response carries none — so with the
+  // probe off it binds only after a manual `p` refresh. Said once at start,
+  // like the config warnings in config-ops.js, rather than silently leaving a
+  // budget unenforced.
+  if (!(config.quotaProbeSeconds > 0) && accountManager.accounts.some(a => a.maxSpend != null)) {
+    console.error('[TeamClaude] accounts[].maxSpend is set but the quota probe is off (quotaProbeSeconds = 0) — the spend figure it is judged against is only refreshed by the probe, so the cap only binds after a manual `p` refresh; run `teamclaude probe <seconds>`');
+  }
 
   // Start the opt-in keep-warm scheduler. Interval mode runs relative to server
   // startup; reset-target modes restore their next occurrence from config.
