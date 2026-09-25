@@ -3,7 +3,7 @@ import { sameIdentity } from './identity.js';
 import { safeLine } from './safe-text.js';
 import { removedAccountIds } from './account-pairing.js';
 import { ensureAccountIds } from './account-id.js';
-import { accountSwitchThreshold } from './account-manager.js';
+import { accountSwitchThreshold, accountAllowsExtraUsage } from './account-manager.js';
 
 /**
  * Sync accounts from disk config: add new accounts and refresh credentials
@@ -121,7 +121,10 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     mgr.switchThreshold = accountSwitchThreshold(diskAcct);
     // Same for the extra-usage opt-in, and more so: it decides whether the
     // fleet may spend money, so turning it off on disk must stop that now.
-    mgr.allowExtraUsage = diskAcct.allowExtraUsage === true;
+    // Through the constructor's own test, so an entry the fallback cannot bill
+    // (an API key, a third-party backend, a Codex login) stays opted out on
+    // reload as it was at startup; the warning was makeAccount's to give.
+    mgr.allowExtraUsage = accountAllowsExtraUsage(diskAcct);
     // Third-party-backend bindings are read per request off this object
     // (`account.upstream || upstream`, `account.modelMap` in server.js), so a
     // disk edit must land here to take effect on reload. `|| null` mirrors the

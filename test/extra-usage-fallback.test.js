@@ -265,8 +265,11 @@ test('route ownership still binds the fallback', () => {
 });
 
 test('the provider partition still binds the fallback', () => {
-  const am = spentFleet([oauth('claude'), oauth('codex-paid', { provider: 'codex', allowExtraUsage: true })]);
-  assert.equal(quietly(() => am.getActiveAccount(null, OPUS)), null);
+  // Only an Anthropic login can opt in, so the partition is tested from the
+  // other side: a request on the Codex path never lands on the Anthropic paid
+  // account, however spent the Codex fleet is.
+  const am = spentFleet([oauth('codex', { provider: 'codex' }), oauth('paid', { allowExtraUsage: true })]);
+  assert.equal(quietly(() => am.getActiveAccount(null, null, null, null, 'codex')), null);
 });
 
 // ── automatic return ─────────────────────────────────────────
@@ -333,6 +336,9 @@ test('removing the paid account itself ends its episode', () => {
   assert.equal(am.onExtraUsage(0), true);
   quietly(() => am.removeAccount(0));
   assert.equal(am.onExtraUsage(0), false);
+  // onExtraUsage moves nothing (the TUI calls it per row on every paint); the
+  // status read is what sweeps the orphaned episode away.
+  assert.equal(am.getStatus().accounts[0].onExtraUsage, false);
   assert.equal(am._extraUsage.size, 0);
 });
 
@@ -447,6 +453,36 @@ test('only a literal true opts in', () => {
   const am = new AccountManager([oauth('a', { allowExtraUsage: 'yes' }), oauth('b', { allowExtraUsage: true })], 0.98);
   assert.equal(am.accounts[0].allowExtraUsage, false);
   assert.equal(am.accounts[1].allowExtraUsage, true);
+});
+
+test('the opt-in is honoured on Anthropic OAuth accounts only, and says so once', () => {
+  const warned = [];
+  const original = console.warn;
+  console.warn = (...args) => warned.push(args.join(' '));
+  let am;
+  try {
+    am = new AccountManager([
+      { name: 'key', type: 'apikey', apiKey: 'k', allowExtraUsage: true },
+      oauth('backend', { upstream: 'https://api.example.com/anthropic', allowExtraUsage: true }),
+      oauth('codex', { provider: 'codex', allowExtraUsage: true }),
+      oauth('paid', { allowExtraUsage: true }),
+    ], 0.98);
+  } finally {
+    console.warn = original;
+  }
+  assert.deepEqual(am.accounts.map(a => a.allowExtraUsage), [false, false, false, true]);
+  const ignored = warned.filter(l => l.includes('allowExtraUsage is ignored'));
+  assert.deepEqual(ignored.map(l => /Account "([^"]+)"/.exec(l)?.[1]), ['key', 'backend', 'codex']);
+  // The one account that can bill was not warned about.
+  assert.equal(ignored.some(l => l.includes('"paid"')), false);
+});
+
+test('a reload cannot opt in an account the fallback cannot bill', async () => {
+  const config = [oauth('codex', { provider: 'codex' }), oauth('paid')];
+  const am = new AccountManager(config.map(c => ({ ...c })), 0.98);
+  const disk = [oauth('codex', { provider: 'codex', allowExtraUsage: true }), oauth('paid', { allowExtraUsage: true })];
+  await quietly(() => syncAccountsFromDisk({ accounts: disk }, { accounts: config }, am));
+  assert.deepEqual(am.accounts.map(a => a.allowExtraUsage), [false, true]);
 });
 
 test('a config reload applies the opt-in live, both ways', async () => {

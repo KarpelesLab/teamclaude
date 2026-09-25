@@ -198,11 +198,35 @@ export function accountSwitchThreshold(acct) {
   return value;
 }
 
+/**
+ * Whether a config entry opts its account into the extra-usage fallback: a
+ * literal `true`, on an account the fallback can actually bill — an Anthropic
+ * OAuth login, drawn by the same line ensureTokenFresh draws before it touches
+ * a credential. "Extra usage" is a feature of Anthropic's subscription plans:
+ * an API key has no plan limit to serve past, a third-party backend
+ * (`upstream`) is metered by someone else, and a Codex login belongs to
+ * another provider's plan. On any of those the flag could only run the
+ * account into the 429 it was set to avoid, so it is ignored — makeAccount
+ * says so once, since an operator who set it expects something to happen.
+ * Shared with sync-accounts.js so a reload reads the flag as startup did.
+ *
+ * @param {Record<string, any>} acct
+ */
+export function accountAllowsExtraUsage(acct) {
+  return acct.allowExtraUsage === true && acct.type === 'oauth' && !acct.upstream && providerOf(acct) === DEFAULT_PROVIDER;
+}
+
 // Build a fresh in-memory account record from a config/disk account object.
 // Shared by the constructor and addAccount() so the field set can never drift
 // between startup accounts and runtime-added ones (a divergence here once left
 // runtime-added accounts without `inFlight`, hanging every request in admit()).
 function makeAccount(acct, index) {
+  // Once, at construction, not on every reload: the flag names money the
+  // operator meant to spend, so silently doing nothing would be the one wrong
+  // answer.
+  if (acct.allowExtraUsage === true && !accountAllowsExtraUsage(acct)) {
+    console.warn(`[TeamClaude] Account "${safeLine(acct.name, 64)}": allowExtraUsage is ignored — only an Anthropic OAuth account can serve on extra usage`);
+  }
   return {
     index,
     // The entry this account was built from. `index` is a position in this list
@@ -243,8 +267,9 @@ function makeAccount(acct, index) {
     // Opt-in: this account has Anthropic "extra usage" (paid overage) turned on
     // upstream, and the operator allows the proxy to lean on it once every
     // account is past its quota. Strictly `true`, so a stray truthy value in a
-    // hand-edited config cannot start billing. See _pickFallback.
-    allowExtraUsage: acct.allowExtraUsage === true,
+    // hand-edited config cannot start billing, and Anthropic OAuth logins only
+    // (see accountAllowsExtraUsage). See _pickFallback.
+    allowExtraUsage: accountAllowsExtraUsage(acct),
     upstream: acct.upstream || null,
     modelMap: acct.modelMap || null,
     // Fields to drop from request bodies for this account (third-party upstreams
@@ -859,12 +884,22 @@ export class AccountManager {
     // announced afresh. Only a walk for the SAME scope can end its episode: an
     // Opus request that finds headroom says nothing about Fable's. The sweep
     // after it ends the episodes no request has reached (see _sweepFallback).
-    const scope = this._cursorKey(model, null, provider);
-    if (this._extraUsage.has(scope) && (!account || this._isAvailable(account, model))) {
-      this._endFallback(scope, account ? `Quota headroom is back on "${safeLine(account.name, 64)}"` : null);
+    //
+    // A null that only means "the paid account was in `exclude`" — the retry
+    // after a probe upstream refused, a failover hop that already tried it —
+    // is not the fleet unable to serve at all, and leaves the episode alone;
+    // ending it there re-announced and re-ramped the same account on the next
+    // request. And none of this runs for a fleet with no opt-in and no episode
+    // to end, so such a fleet pays nothing per request for the feature.
+    if (this._extraUsage.size || this.accounts.some(a => a.allowExtraUsage)) {
+      const scope = this._cursorKey(model, null, provider);
+      const excluded = /** @type {Set<number>|null} */ (exclude);
+      if (this._extraUsage.has(scope) && ((!account && !excluded?.size) || (account && this._isAvailable(account, model)))) {
+        this._endFallback(scope, account ? `Quota headroom is back on "${safeLine(account.name, 64)}"` : null);
+      }
+      this._sweepFallback();
+      this._unstrandCursor(provider);
     }
-    this._sweepFallback();
-    this._unstrandCursor(provider);
     return account;
   }
 
@@ -904,7 +939,14 @@ export class AccountManager {
     // the shared slot would hand another provider's fleet a new position.
     if (this.currentIndex === idx) this._setCurrent(best);
     else this.providerCursors.set(provider, best.index);
-    console.log(`[TeamClaude] Switched to account "${safeLine(best.name, 64)}" — "${safeLine(parked.name, 64)}" is past its switch threshold and only served as the fallback`);
+    // Say why it lost the cursor: the fallback also parks it on an account that
+    // has since been capped, rejected upstream, or disabled, and "past its
+    // switch threshold" would be a lie for those.
+    const reason = this.unavailableReason(parked);
+    const why = reason === 'quota' ? 'is past its switch threshold'
+      : reason === 'upstream-rejected' ? 'was refused upstream on quota'
+      : reason ? `is unavailable (${reason})` : 'can no longer serve normally';
+    console.log(`[TeamClaude] Switched to account "${safeLine(best.name, 64)}" — "${safeLine(parked.name, 64)}" ${why} and only served as the fallback`);
   }
 
   /**
@@ -915,14 +957,16 @@ export class AccountManager {
    * account the fallback runs past its switch threshold but under 100% is
    * serving on quota it still has for free, and is not marked.
    *
-   * Sweeps first, so a mark never outlives the billing it describes just
-   * because no request for that scope has come in since.
+   * A read, and nothing more: the TUI calls it once per row on every redraw,
+   * and a getter that ended episodes and re-seated the cursor would rotate the
+   * fleet from a paint. getStatus sweeps once before it builds its rows, so a
+   * status read still never shows a mark that has outlived the billing it
+   * describes; an in-process caller wanting the same freshness reads status.
    * @param {number} index
    */
   onExtraUsage(index) {
     const account = this.accounts[index];
     if (!account) return false;
-    this._sweepFallback();
     for (const e of this._extraUsage.values()) {
       if (e.account !== account || !e.paid) continue;
       if (this._maxUtilization(account, e.model) >= 1) return true;
@@ -4409,6 +4453,12 @@ export class AccountManager {
     // against the endpoint, and the attached TUI, whose own refresh is a no-op
     // precisely because it trusts the server to have done this (#237).
     this.sweepExpiredQuotas();
+    // And the extra-usage episodes, once, before any row is built: the per-row
+    // `onExtraUsage` below is a plain read, so this is what keeps a "billing"
+    // mark from outliving a window reset no request has walked past yet, and
+    // what re-seats a cursor the fallback parked (see _sweepFallback). Before
+    // `currentAccounts` is read, so the same payload reports the re-seated cursor.
+    this._sweepFallback();
     const sessions = this.sessionTracker.stats(undefined, { detail: sessionDetail });
     const currentAccounts = {};
     // The same, by position in `accounts`. A name alone is ambiguous when one
