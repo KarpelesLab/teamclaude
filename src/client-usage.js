@@ -63,6 +63,9 @@ export const USAGE_WINDOWS = { '5h': 5 * 60 * 60 * 1000, '24h': 24 * 60 * 60 * 1
 // a number an operator reads to decide whether they are near a limit.
 const RETAINED_SLOTS = Math.ceil(Math.max(...Object.values(USAGE_WINDOWS)) / USAGE_SLOT_MS) + 1;
 
+/** @typedef {{ requests: number, connections: number, inputTokens: number, outputTokens: number }} UsageCounters */
+/** @typedef {UsageCounters & { lastUsed: number | null, slots: Map<number, UsageCounters> }} ClientRecord */
+
 const RESERVED_CUSTOM_HEADER_NAMES = new Set([
   'authorization',
   'proxy-authorization',
@@ -110,7 +113,13 @@ export class ClientUsageTracker {
     c.inputTokens += inputTokens;
     c.outputTokens += outputTokens;
     c.lastUsed = this._now();
-    const slot = this._slotFor(c, Math.floor(c.lastUsed / USAGE_SLOT_MS));
+    // Eviction runs only when this write opens a new slot, and against the
+    // same clock reading as lastUsed: a second read of the clock could land
+    // past a slot boundary and evict the oldest slot the windows still cover.
+    const slotNo = Math.floor(c.lastUsed / USAGE_SLOT_MS);
+    const opening = !c.slots.has(slotNo);
+    const slot = this._slotFor(c, slotNo);
+    if (opening) this._evict(c, c.lastUsed);
     slot.requests += requests;
     slot.connections += connections;
     slot.inputTokens += inputTokens;
@@ -126,7 +135,11 @@ export class ClientUsageTracker {
    * function of every distinct key seen since the last restart rather than of
    * the window. So a read prunes too — unusual, but the slots it drops are
    * outside every window and can never be reported again, and the alternative
-   * is a timer this file does not have.
+   * is a timer this file does not have. In practice the reads come on a
+   * schedule anyway: the once-a-minute state save in index.js
+   * (persistQuotaState → exportState) prunes every key it writes out.
+   * @param {ClientRecord} c
+   * @param {number} now
    */
   _evict(c, now) {
     const cutoff = Math.floor(now / USAGE_SLOT_MS) - RETAINED_SLOTS;
@@ -135,13 +148,18 @@ export class ClientUsageTracker {
     for (const slot of c.slots.keys()) if (slot <= cutoff) c.slots.delete(slot);
   }
 
-  /** The tally for `slot`, created on first use. */
+  /**
+   * The tally for `slot`, created on first use. Creation alone does not evict:
+   * record() does that when a live write opens a slot, and restore bounds what
+   * it admits up front — running a full eviction walk from here made a restore
+   * of n slots cost n walks over a growing map.
+   * @param {ClientRecord} c
+   * @param {number} slot
+   * @returns {UsageCounters}
+   */
   _slotFor(c, slot) {
     let tally = c.slots.get(slot);
-    if (!tally) {
-      c.slots.set(slot, tally = { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0 });
-      this._evict(c, this._now());
-    }
+    if (!tally) c.slots.set(slot, tally = { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0 });
     return tally;
   }
 
@@ -150,11 +168,16 @@ export class ClientUsageTracker {
    * covers its own length plus at most one slot — see RETAINED_SLOTS. Every
    * window is present here, zeros included; whether the set is reported at all
    * is export()'s decision, not this one's.
+   * @param {ClientRecord} c
+   * @param {number} now
+   * @returns {Record<string, UsageCounters>}
    */
   _windows(c, now) {
+    /** @type {Record<string, UsageCounters>} */
     const out = {};
     // Cutoffs first, then ONE walk of the slots: this runs per key on every
     // status poll, and the fastest poller in the tree asks once a second.
+    /** @type {Array<[number, UsageCounters]>} */
     const cutoffs = [];
     for (const [label, span] of Object.entries(USAGE_WINDOWS)) {
       out[label] = { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0 };
@@ -212,6 +235,7 @@ export class ClientUsageTracker {
   // it — export() rolls the windows up against it — cannot have eviction run
   // against a second, later instant. Two reads straddling a slot boundary would
   // evict exactly the oldest slot the rollup still reads.
+  /** @param {number} now @param {(c: ClientRecord) => Record<string, unknown>} extra */
   _snapshot(now, extra) {
     // Built on a null prototype and copied out with fromEntries, so a name like
     // `__proto__` lands as an own key of a plain object instead of on its
@@ -260,7 +284,11 @@ export class ClientUsageTracker {
    * left for the next write: a proxy that was down for a week would otherwise
    * restore a full set of dead slots and report them as current until its next
    * request. A snapshot from a build that did not keep slots simply has none,
-   * and the windows then fill from live traffic.
+   * and the windows then fill from live traffic. This is also the only place a
+   * slot ahead of the clock is refused: a backwards clock step during a run is
+   * not caught until the next restart.
+   * @param {ClientRecord} c
+   * @param {unknown} saved
    */
   _restoreSlots(c, saved) {
     if (!saved || typeof saved !== 'object') return;
@@ -329,6 +357,7 @@ export class UsageDimensionTracker {
     return this._snapshot(tracker => tracker.exportState());
   }
 
+  /** @param {(tracker: ClientUsageTracker) => Record<string, unknown>} pick */
   _snapshot(pick) {
     // Null prototype for the same reason ClientUsageTracker.export() uses one:
     // a dimension named `__proto__` must land as an own key, not silently

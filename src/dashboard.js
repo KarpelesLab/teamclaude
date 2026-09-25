@@ -479,6 +479,7 @@ export const USAGE_VIEWS = [{ key: 'total', label: 'Total' }].concat(
 // window through this, rather than each renderer reaching into `windows`
 // itself — the Clients table and the per-dimension tables carry the same shape
 // and must not drift into answering the same question differently.
+/** @param {any} entry @param {string} [view] */
 export function usageFor(entry, view) {
   var e = entry || {};
   var src = !view || view === 'total' ? e : ((e.windows || {})[view] || {});
