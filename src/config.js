@@ -99,6 +99,7 @@ export function createDefaultConfig() {
     holdSeconds: 0,
     distributeSessions: false,
     sessionTitles: { enabled: false, width: 18 },
+    quotaBarPercent: true,
     eventLogging: 'hide',
     defaultClientMode: 'mitm',
     blockedModels: [],
