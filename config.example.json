@@ -18,6 +18,7 @@
   "distributeSessions": false,
   "quotaProbeSeconds": 0,
   "autoUpdate": true,
+  "autoRedeemResets": false,
   "expiryRouting": {
     "enabled": false,
     "tolerance": 1.5,

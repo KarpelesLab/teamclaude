@@ -310,13 +310,88 @@ export async function fetchProfile(accessToken, routing = null) {
       } catch {
         detail = await res.text().catch(() => '');
       }
-      return { error: `HTTP ${res.status}${detail ? ': ' + detail : ''}` };
+      // Carry the status alongside the message, as fetchUsage already does:
+      // a caller has to tell "this token is dead" (401) from "we could not
+      // reach the endpoint" (5xx, network), and parsing that back out of the
+      // string would be fragile. What the status means is decided by the
+      // caller (identity.js isTokenRejection); this only reports it.
+      return { error: `HTTP ${res.status}${detail ? ': ' + detail : ''}`, status: res.status };
     }
     const data = await res.json();
     return normalizeProfile(data);
   } catch (err) {
-    return { error: err.message || String(err) };
+    return { error: err.message || String(err), status: null };
   }
+}
+
+/**
+ * The profile behind a credential set, renewing a stale access token first.
+ *
+ * An import hands over whatever Claude Code left on disk, and that access
+ * token is routinely past its hour while the refresh token beside it is still
+ * good. A 401 from the profile endpoint on such a token says nothing about the
+ * account — the refresh token is what proves it — so the token is refreshed
+ * (straight away when the clock already says it has expired, sparing the
+ * doomed round trip) and the profile fetched again with the new one. The
+ * credentials that come back are the ones to save: the renewed pair over every
+ * other field the set came with.
+ *
+ * `profile.status` is then the upstream's verdict on the set as a whole, which
+ * is what identity.js isTokenRejection keys on:
+ *   - 401 when the credential is dead: the profile endpoint rejected the access
+ *     token and there was no refresh token to renew it with, or the token
+ *     endpoint rejected the refresh (400/401/403 — the same reading
+ *     account-manager gives a refresh that needs a re-login);
+ *   - the token endpoint's status, or null, when the refresh failed for a
+ *     reason that says nothing about the token (network, 5xx after retries):
+ *     the credential is unreachable, not refused, and stays importable by name.
+ * A 403 is neither refreshed nor a rejection: the upstream answers 403 to a
+ * valid token from an unexpected region (see egress-guard.js) and under an org
+ * policy, and a new token would meet the same answer.
+ *
+ * @param {Record<string, any>} creds - { accessToken, refreshToken?, expiresAt?, ... }
+ * @param {import('./account-routing.js').RoutingProxy|null} [routing] - the
+ * account's own egress proxy; every call here (the profile, and the refresh it
+ * may need first) is that account's traffic. Null goes by the fleet path.
+ * @returns {Promise<{ creds: Record<string, any>, profile: Record<string, any> }>}
+ */
+export async function profileForCredentials(creds, routing = null) {
+  /** @type {Record<string, any>|null} */
+  let profile = isTokenExpired(creds.expiresAt) ? null : await fetchProfile(creds.accessToken, routing);
+  if (profile && profile.status !== 401) return { creds, profile };
+
+  if (!creds.refreshToken) {
+    // Nothing to renew with: the upstream's answer on the access token is final.
+    profile ??= await fetchProfile(creds.accessToken, routing);
+    if (profile.status === 401) {
+      profile = { ...profile, error: `${profile.error}; no refresh token to renew it with` };
+    }
+    return { creds, profile };
+  }
+
+  let renewed;
+  try {
+    renewed = await refreshAccessToken(creds.refreshToken, undefined, routing);
+  } catch (err) {
+    // The refresh did not go through. The upstream keeps the last word on the
+    // access token itself, so one the clock wrote off is still presented once:
+    // a skewed clock must not refuse a token the upstream accepts.
+    profile ??= await fetchProfile(creds.accessToken, routing);
+    if (profile.status !== 401) return { creds, profile };
+    const e = /** @type {CodedError} */ (err);
+    const rejected = e.status === 400 || e.status === 401 || e.status === 403;
+    return {
+      creds,
+      profile: rejected
+        ? { ...profile, error: `${profile.error}; token refresh rejected: ${e.message}` }
+        // Not a verdict: the refresh token may well be good, so this is the
+        // unreachable shape, carrying the token endpoint's status if it gave one.
+        : { error: `${profile.error}; token refresh failed: ${e.message}`, status: e.status ?? null },
+    };
+  }
+
+  const fresh = { ...creds, ...renewed };
+  return { creds: fresh, profile: await fetchProfile(fresh.accessToken, routing) };
 }
 
 // Pull a per-model weekly limit out of the payload's `limits[]` array, which is

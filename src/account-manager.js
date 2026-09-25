@@ -290,6 +290,17 @@ function makeAccount(acct, index, listener = null) {
     // and the fleet upstream proxy for this account. Null goes by the fleet
     // path. See account-routing.js.
     routing: accountRouting(acct, listener),
+    // Whether this account is EXEMPT from spending one of its free Codex
+    // rate-limit reset credits (see codex-reset-credits.js). Negative-only, and
+    // the polarity is the opposite of what the name suggests: the switch that
+    // arms anything is the fleet-wide `autoRedeemResets`, because the policy it
+    // arms ("only when the whole Codex pool is dry") is a statement about the
+    // fleet. All this key can say is "never this one", so `true` and an absent
+    // key mean exactly the same thing here. Meaningless on an Anthropic
+    // account, which has no such credits — the redeemer checks the provider
+    // rather than making the field's default depend on it, so a config moved
+    // between providers keeps saying the same thing.
+    autoRedeemReset: acct.autoRedeemReset !== false,
     upstream: acct.upstream || null,
     modelMap: acct.modelMap || null,
     // Fields to drop from request bodies for this account (third-party upstreams

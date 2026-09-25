@@ -10,7 +10,7 @@ import { installCrashHandlers } from './crash-log.js';
 import { AccountManager, distributionMode, accountRouting } from './account-manager.js';
 import { validateAdaptiveConfig } from './adaptive-distribution.js';
 import { createProxyServer } from './server.js';
-import { importCredentials, loginOAuth, loginOAuthWithPastedCode, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
+import { importCredentials, loginOAuth, loginOAuthWithPastedCode, fetchProfile, profileForCredentials, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import {
   sameIdentity,
   orgKey,
@@ -18,6 +18,7 @@ import {
   findUpsertTarget,
   updateAccountEntry,
   canUpsertOAuthAccount,
+  isTokenRejection,
   oauthIdentityFields,
 } from './identity.js';
 import { resolveAccounts } from './resolve-accounts.js';
@@ -28,6 +29,7 @@ import { ensureAccountIds } from './account-id.js';
 import * as alias from './alias.js';
 import { ensureCerts, mitmHosts } from './mitm.js';
 import { Prober } from './prober.js';
+import { ResetCreditRedeemer } from './codex-reset-credits.js';
 import { Warmer } from './warmer.js';
 import { formatWarmupScheduleConfirmation, resolveWarmupConfig } from './warmup-schedule.js';
 import { TUI } from './tui.js';
@@ -466,8 +468,15 @@ async function serverCommand() {
     // Both are read per request off this object (server.js) and the TUI already
     // persists them; without this a hand edit or another writer waited for a restart.
     config.eventLogging = diskConfig.eventLogging || 'hide';
+    // Read by the TUI on every frame, so a hand edit lands on the next reload.
+    config.quotaBarPercent = diskConfig.quotaBarPercent !== false;
     // Read by `run`/`env` from disk, but the TUI settings screen shows it live.
     config.defaultClientMode = diskConfig.defaultClientMode === 'base-url' ? 'base-url' : 'mitm';
+    // The fleet switch for spending Codex reset credits. The redeemer reads it
+    // off this object per refusal, so the assignment is the whole application —
+    // and this one has to hot-apply in particular: "stop spending credits" must
+    // not wait for a restart.
+    config.autoRedeemResets = diskConfig.autoRedeemResets === true;
     config.blockedModels = Array.isArray(diskConfig.blockedModels) ? diskConfig.blockedModels : [];
     // Apply an sx.org key/mode change made on disk (e.g. via POST /teamclaude/reload).
     const diskSxKey = diskConfig.sx?.apiKey || null;
@@ -536,7 +545,9 @@ async function serverCommand() {
         // screen too; the server reads them live from `config`, but without this
         // the edit never reached disk and was silently undone by the next start.
         if (config.eventLogging != null) diskConfig.eventLogging = config.eventLogging;
+        if (config.quotaBarPercent != null) diskConfig.quotaBarPercent = config.quotaBarPercent;
         if (config.defaultClientMode != null) diskConfig.defaultClientMode = config.defaultClientMode;
+        if (config.autoRedeemResets != null) diskConfig.autoRedeemResets = config.autoRedeemResets;
         if (config.blockedModels != null) diskConfig.blockedModels = config.blockedModels;
         if (config.sessionTitles != null) diskConfig.sessionTitles = config.sessionTitles;
         // Persist the route table (edited from the TUI routes screen).
@@ -605,6 +616,15 @@ async function serverCommand() {
   // Expose reload to the proxy's control endpoint (works with or without TUI).
   hooks.reload = reloadAccounts;
   hooks.persistAccounts = () => atomicConfigUpdate(mergeAccountsOnto);
+  // Whether one of a Codex account's free rate-limit reset credits should be
+  // spent to undo a spent weekly window. Wired as a hook rather than reached
+  // from the request path directly: the forwarding path stays ignorant of a
+  // provider's billing features, and a server built without it (every test that
+  // is not about redemption) simply refuses as before. The shared config, so the
+  // fleet switch (`autoRedeemResets`) is read live — a TUI toggle or a reload
+  // binds on the next refusal, not the next restart.
+  const redeemer = new ResetCreditRedeemer(accountManager, { config });
+  hooks.redeemCodexResetForPool = (/** @type {Record<string, any>[]} */ accounts) => redeemer.maybeRedeemForPool(accounts);
   hooks.getStatusExtra = () => ({
     // Read live from the shared config (not a startup snapshot) so the TUI's
     // blocklist editor shows up in `status` immediately, the same way the
@@ -2432,22 +2452,32 @@ function orgLabel(a) {
  * @param {Record<string, any>} creds
  * @param {string} [source]
  * @param {import('./account-routing.js').RoutingProxy|null} [routing] - the
- * account's own egress proxy (see loginRouting). The profile fetch below is
- * already that account's traffic, so it goes the same way; null leaves every
- * call on the fleet path.
+ * account's own egress proxy (see loginRouting). The profile lookup below (and
+ * the token refresh it may need first) is already that account's traffic, so
+ * it goes the same way; null leaves every call on the fleet path.
  * @param {boolean} [storeRouting] - false when `routing` was borrowed from the
  * existing entry rather than given with --routing: used, never written. True
  * with a null `routing` is `--routing none`: the entry's routing is cleared.
  */
 async function upsertOAuthAccount(name, creds, source = 'unknown', routing = null, storeRouting = false) {
-  // Fetch profile to auto-name and deduplicate by account+org identity.
+  // Fetch profile to auto-name and deduplicate by account+org identity. A
+  // credentials file is routinely past its access token's hour while its
+  // refresh token is still good, so a stale token is renewed first and the
+  // renewed pair is what gets saved below — `creds` is the set to write.
   const userNamed = !!name;
-  const profile = await fetchProfile(creds.accessToken, routing);
+  const identified = await profileForCredentials(creds, routing);
+  creds = identified.creds;
+  const profile = identified.profile;
   const profileOk = profile && !profile.error;
 
   if (!canUpsertOAuthAccount(profile, userNamed)) {
     console.error(`Could not identify OAuth account — ${profile?.error || 'profile unavailable'}`);
-    console.error('Retry with valid credentials, or pass --name to add the account without profile detection.');
+    // --name is the documented way past a profile the proxy could not read, but
+    // it is not a way past a token the upstream refused: suggesting it there
+    // would be pointing at the one door this no longer opens.
+    console.error(isTokenRejection(profile)
+      ? 'The upstream rejected this token and it could not be refreshed. Run `teamclaude login` to get a fresh one.'
+      : 'Retry with valid credentials, or pass --name to add the account without profile detection.');
     process.exit(1);
   }
 

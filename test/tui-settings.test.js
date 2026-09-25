@@ -80,3 +80,22 @@ test('a short sx.org key is not shown whole by its mask', () => {
   row.enter();
   assert.equal(tui.inputSecret, true);
 });
+
+// A config written before the key existed has no value for it, and the row
+// reads that as on. The first toggle from there has to reach disk as `false`,
+// or the switch appears to do nothing until the setting is toggled twice.
+test('the quota-bar percentage toggles off from a config that never had the key', async () => {
+  const saved = [];
+  const tui = makeTUI();
+  tui.saveConfig = async c => { saved.push(c.quotaBarPercent); };
+  const row = tui._settingsFields().find(f => f.id === 'quotaBarPercent');
+  assert.equal(stripAnsi(row.value()), 'on');
+
+  await row.right();
+  assert.equal(tui.config.quotaBarPercent, false);
+  assert.equal(stripAnsi(tui._settingsFields().find(f => f.id === 'quotaBarPercent').value()), 'off');
+
+  await row.right();
+  assert.equal(tui.config.quotaBarPercent, true);
+  assert.deepEqual(saved, [false, true]);
+});
