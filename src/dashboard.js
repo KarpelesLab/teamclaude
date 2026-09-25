@@ -22,24 +22,43 @@ export function renderDashboardHtml() {
 }
 
 /**
+ * The body of every `<script>` in the page, in order. Attribute-free tags only,
+ * which is all this page has and all the hash policy can admit anyway.
+ *
+ * @param {string} html
+ */
+export function inlineScripts(html) {
+  const out = [];
+  const re = /<script>([\s\S]*?)<\/script>/g;
+  let m;
+  while ((m = re.exec(html)) !== null) out.push(m[1]);
+  return out;
+}
+
+/**
  * Content-Security-Policy for the dashboard, sent by the server with the page.
  *
  * The page holds the proxy key in localStorage, so the policy is the backstop
  * for a script that should never run there: nothing loads from anywhere
- * (`default-src 'none'`), the one inline script is admitted by its hash rather
- * than by `'unsafe-inline'` — the page is static, so the hash is stable — and
- * the only network the script may touch is this origin, for status and switch.
+ * (`default-src 'none'`), each inline script (the theme bootstrap in `<head>`
+ * and the main script) is admitted by its hash rather than by
+ * `'unsafe-inline'` — the page is static, so the hashes are stable — and the
+ * only network the script may touch is this origin, for status and switch.
  * Styles need `'unsafe-inline'` because the layout uses `style=` attributes,
  * which hashes do not cover; CSSOM writes (`el.style.width = …`) are not
  * governed by CSP at all. `frame-ancestors 'none'` keeps the page out of
  * another site's iframe, where a click on "switch" could be overlaid.
  */
 export function dashboardCsp(html = PAGE) {
-  const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
-  const hash = createHash('sha256').update(script, 'utf8').digest('base64');
+  // Every inline script, not just the first: the theme is applied by a short
+  // script in <head> so the page does not paint dark and then flip to light,
+  // and a hash that covered only the main script would leave that one blocked.
+  const hashes = inlineScripts(html)
+    .map(script => `'sha256-${createHash('sha256').update(script, 'utf8').digest('base64')}'`)
+    .join(' ');
   return [
     "default-src 'none'",
-    `script-src 'sha256-${hash}'`,
+    `script-src ${hashes}`,
     "style-src 'unsafe-inline'",
     "connect-src 'self'",
     "base-uri 'none'",
@@ -589,10 +608,30 @@ const PAGE = `<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>TeamClaude</title>
 <style>
+  /* Dark is the default, and stays the default for a viewer whose system says
+     nothing. The light palette is applied two ways: by the media query when no
+     choice has been stored (data-theme absent), and by the attribute when one
+     has. The media rule excludes an explicit dark choice, so choosing dark on a
+     light desktop is honoured rather than overridden by the system. */
   :root {
+    color-scheme: dark;
     --bg: #101418; --panel: #171d24; --line: #242c36;
     --text: #d7dde4; --dim: #8a949f; --accent: #53b1fd;
     --ok: #3fb950; --warn: #d29922; --bad: #f85149;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      color-scheme: light;
+      --bg: #f6f8fa; --panel: #ffffff; --line: #d8dee4;
+      --text: #1f2328; --dim: #59636e; --accent: #0969da;
+      --ok: #1a7f37; --warn: #9a6700; --bad: #cf222e;
+    }
+  }
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --bg: #f6f8fa; --panel: #ffffff; --line: #d8dee4;
+    --text: #1f2328; --dim: #59636e; --accent: #0969da;
+    --ok: #1a7f37; --warn: #9a6700; --bad: #cf222e;
   }
   * { box-sizing: border-box; margin: 0; }
   body { background: var(--bg); color: var(--text); font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; padding: 24px; }
@@ -665,9 +704,17 @@ const PAGE = `<!doctype html>
   #problems .warn { background: rgba(210,153,34,.12); border: 1px solid var(--warn); color: var(--warn); }
   #keybox { display: none; margin: 40px auto; max-width: 420px; text-align: center; }
   #keybox input { width: 100%; padding: 10px 12px; margin: 12px 0; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; color: var(--text); font: inherit; }
-  #keybox button { padding: 8px 20px; background: var(--accent); border: 0; border-radius: 6px; color: #06121f; font: inherit; font-weight: 600; cursor: pointer; }
+  #keybox button { padding: 8px 20px; background: var(--accent); border: 0; border-radius: 6px; color: var(--panel); font: inherit; font-weight: 600; cursor: pointer; }
   footer { color: var(--dim); font-size: 12px; margin-top: 24px; }
 </style>
+<script>
+(function () {
+  try {
+    var t = localStorage.getItem('teamclaude-dashboard-theme');
+    if (t === 'light' || t === 'dark') document.documentElement.setAttribute('data-theme', t);
+  } catch (e) { /* storage disabled: the media query still decides */ }
+})();
+</script>
 </head>
 <body>
 <main>
@@ -683,6 +730,7 @@ const PAGE = `<!doctype html>
     <div class="actions">
       <button id="reload" type="button">Reload config</button>
       <button id="probe" type="button">Probe quotas</button>
+      <button id="theme" type="button" title="Switch between following the system, light and dark"></button>
       <span class="thr">
         <label for="thrVal">Switch at</label>
         <input id="thrVal" type="number" min="1" max="100" step="0.1" inputmode="decimal">
@@ -722,6 +770,7 @@ const PAGE = `<!doctype html>
 (function () {
   'use strict';
   var KEY = 'teamclaude-dashboard-key';
+  var THEME_KEY = 'teamclaude-dashboard-theme';
   var POLL_MS = 5000;
   var timer = null;
   var lastStatus = null;
@@ -1269,6 +1318,42 @@ ${SHARED_HELPERS}
   document.getElementById('key').addEventListener('keydown', function (e) {
     if (e.key === 'Enter') document.getElementById('go').click();
   });
+  // Theme: system → light → dark → system. "system" is the absence of a
+  // stored choice, so a viewer who never touches this keeps following their
+  // desktop, and one who does is not re-decided for by it later.
+  var THEMES = ['system', 'light', 'dark'];
+  function readTheme() {
+    try {
+      var t = localStorage.getItem(THEME_KEY);
+      return t === 'light' || t === 'dark' ? t : 'system';
+    } catch (e) { return 'system'; }
+  }
+  function applyTheme(theme) {
+    if (theme === 'system') document.documentElement.removeAttribute('data-theme');
+    else document.documentElement.setAttribute('data-theme', theme);
+    var btn = document.getElementById('theme');
+    // Name the state, not the action: a button reading "Dark" while the page is
+    // light is the ambiguity every theme toggle has, and this one says where it
+    // is rather than where it would go.
+    btn.textContent = theme === 'system' ? 'Theme: system' : theme === 'light' ? 'Theme: light' : 'Theme: dark';
+  }
+  function storeTheme(theme) {
+    try {
+      if (theme === 'system') localStorage.removeItem(THEME_KEY);
+      else localStorage.setItem(THEME_KEY, theme);
+    } catch (e) { /* storage disabled: the choice lasts for this page only */ }
+  }
+  // The current theme lives in a variable rather than being re-read from
+  // storage on each click: with storage blocked, readTheme() would always say
+  // 'system' and the button would be stuck on 'light' instead of cycling.
+  var theme = readTheme();
+  applyTheme(theme);
+  document.getElementById('theme').addEventListener('click', function () {
+    theme = THEMES[(THEMES.indexOf(theme) + 1) % THEMES.length];
+    storeTheme(theme);
+    applyTheme(theme);
+  });
+
   document.getElementById('reload').addEventListener('click', function () { doControl('/teamclaude/reload', 'config reload', this); });
   document.getElementById('probe').addEventListener('click', function () { doControl('/teamclaude/probe', 'quota probe', this); });
   document.getElementById('thrSet').addEventListener('click', function () { doThreshold(this); });
