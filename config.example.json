@@ -18,6 +18,7 @@
   "distributeSessions": false,
   "quotaProbeSeconds": 0,
   "autoUpdate": true,
+  "autoRedeemResets": false,
   "expiryRouting": {
     "enabled": false,
     "tolerance": 1.5,
@@ -38,6 +39,13 @@
       "priority": 0,
       "accessToken": "sk-ant-oat01-your-access-token",
       "refreshToken": "sk-ant-ort01-your-refresh-token"
+    },
+    {
+      "name": "waffles@waffle.com",
+      "type": "oauth",
+      "accessToken": "sk-ant-oat01-your-access-token",
+      "refreshToken": "sk-ant-ort01-your-refresh-token",
+      "routing": "socks5h://alice:s3cret@proxy.example.com:1080"
     },
     {
       "name": "codex@example.com",

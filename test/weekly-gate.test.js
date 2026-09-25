@@ -5,6 +5,18 @@ import { gatingUtilization } from '../src/model.js';
 import { renderStatus } from '../src/status-renderer.js';
 import { TUI } from '../src/tui.js';
 
+// A real TUI over the manager, as the dashboard builds one, so the row renderer
+// may read any instance field (config, sx, ...) without these tests noticing
+// (#444). Rendering is stubbed: only _renderAcct is exercised here.
+function rowTUI(am) {
+  const tui = new TUI({
+    accountManager: am, config: { proxy: { port: 1 }, accounts: [], routes: [] },
+    saveConfig: async () => {}, syncAccounts: async () => 0, onQuit: () => {},
+  });
+  tui.render = () => {};
+  return tui;
+}
+
 // The weekly gate: which bucket decides whether an account may serve a family
 // model. Family spend meters TWICE, once in the family bucket and once in the
 // shared one, so reading the family bucket alone let an account already over its
@@ -263,8 +275,8 @@ test('the TUI blocked tag follows the gate, not the family bucket', () => {
     unified7d: 0.99, unified7dReset: now + 3600_000,
     unified7dFable: 0.05, unified7dFableReset: now + 3600_000,
   });
-  const tui = Object.create(TUI.prototype);
-  tui.am = am; tui.mode = 'normal'; tui.selIdx = -1;
+  const tui = rowTUI(am);
+  tui.mode = 'normal'; tui.selIdx = -1;
   const row = stripAnsi(tui._renderAcct(0, 8, true, am.getRoutes(), [], { fable: null, sonnet: null }));
   assert.equal(am._isAvailable(am.accounts[0], FABLE), false);
   assert.match(row, /⊘ Fable/,
@@ -278,8 +290,8 @@ test('the TUI blocked tag stays off when the account can still serve the family'
     unified7d: 0.1, unified7dReset: now + 3600_000,
     unified7dFable: 0.05, unified7dFableReset: now + 3600_000,
   });
-  const tui = Object.create(TUI.prototype);
-  tui.am = am; tui.mode = 'normal'; tui.selIdx = -1;
+  const tui = rowTUI(am);
+  tui.mode = 'normal'; tui.selIdx = -1;
   const row = stripAnsi(tui._renderAcct(0, 8, true, am.getRoutes(), [], { fable: null, sonnet: null }));
   assert.equal(am._isAvailable(am.accounts[0], FABLE), true);
   assert.equal(/⊘/.test(row), false, `a servable family was tagged blocked: ${row}`);

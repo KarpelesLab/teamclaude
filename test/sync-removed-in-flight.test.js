@@ -25,7 +25,7 @@ function removing(markRemoved) {
 
 test('a reload during a removal does not re-add the account from the stale file', async () => {
   const { disk, memConfig, am } = removing(true);
-  const added = await syncAccountsFromDisk({ accounts: disk }, memConfig, am);
+  const { added } = await syncAccountsFromDisk({ accounts: disk }, memConfig, am);
   assert.equal(added, 0);
   assert.deepEqual(am.accounts.map(a => a.name), ['a@example.com']);
   assert.deepEqual(memConfig.accounts.map(a => a.name), ['a@example.com']);
@@ -35,7 +35,7 @@ test('a reload during a removal does not re-add the account from the stale file'
 // account added on disk reaches a running server.
 test('the same row with no removal recorded is still adopted', async () => {
   const { disk, memConfig, am } = removing(false);
-  const added = await syncAccountsFromDisk({ accounts: disk }, memConfig, am);
+  const { added } = await syncAccountsFromDisk({ accounts: disk }, memConfig, am);
   assert.equal(added, 1);
   assert.deepEqual(am.accounts.map(a => a.name), ['a@example.com', 'b@example.com']);
 });

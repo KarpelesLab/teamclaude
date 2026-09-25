@@ -16,9 +16,24 @@
 
 import { createHash } from 'node:crypto';
 import { UNAVAILABLE_TEXT, RESET_CREDIT_MAX_AGE_MS } from './status-renderer.js';
+import { USAGE_WINDOWS } from './client-usage.js';
 
 export function renderDashboardHtml() {
   return PAGE;
+}
+
+/**
+ * The body of every `<script>` in the page, in order. Attribute-free tags only,
+ * which is all this page has and all the hash policy can admit anyway.
+ *
+ * @param {string} html
+ */
+export function inlineScripts(html) {
+  const out = [];
+  const re = /<script>([\s\S]*?)<\/script>/g;
+  let m;
+  while ((m = re.exec(html)) !== null) out.push(m[1]);
+  return out;
 }
 
 /**
@@ -26,20 +41,25 @@ export function renderDashboardHtml() {
  *
  * The page holds the proxy key in localStorage, so the policy is the backstop
  * for a script that should never run there: nothing loads from anywhere
- * (`default-src 'none'`), the one inline script is admitted by its hash rather
- * than by `'unsafe-inline'` — the page is static, so the hash is stable — and
- * the only network the script may touch is this origin, for status and switch.
+ * (`default-src 'none'`), each inline script (the theme bootstrap in `<head>`
+ * and the main script) is admitted by its hash rather than by
+ * `'unsafe-inline'` — the page is static, so the hashes are stable — and the
+ * only network the script may touch is this origin, for status and switch.
  * Styles need `'unsafe-inline'` because the layout uses `style=` attributes,
  * which hashes do not cover; CSSOM writes (`el.style.width = …`) are not
  * governed by CSP at all. `frame-ancestors 'none'` keeps the page out of
  * another site's iframe, where a click on "switch" could be overlaid.
  */
 export function dashboardCsp(html = PAGE) {
-  const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
-  const hash = createHash('sha256').update(script, 'utf8').digest('base64');
+  // Every inline script, not just the first: the theme is applied by a short
+  // script in <head> so the page does not paint dark and then flip to light,
+  // and a hash that covered only the main script would leave that one blocked.
+  const hashes = inlineScripts(html)
+    .map(script => `'sha256-${createHash('sha256').update(script, 'utf8').digest('base64')}'`)
+    .join(' ');
   return [
     "default-src 'none'",
-    `script-src 'sha256-${hash}'`,
+    `script-src ${hashes}`,
     "style-src 'unsafe-inline'",
     "connect-src 'self'",
     "base-uri 'none'",
@@ -211,6 +231,14 @@ export function accountBadges(account, current, currentAccounts, now, fleetThres
   // or the comparison falls back to thresholdBadgeText's own 0.98 default.
   var thresholdText = thresholdBadgeText(a.switchThreshold, fleetThreshold, fleetThresholds);
   if (thresholdText) badges.push({ cls: 'meta threshold', text: thresholdText });
+  // Extra-usage fallback: one badge, the louder state winning. Strict `true`
+  // so a missing field on an older server's payload shows nothing.
+  if (a.onExtraUsage === true) badges.push({ cls: 'extra-usage billing', text: 'on extra usage \u2014 billing' });
+  else if (a.allowExtraUsage === true) badges.push({ cls: 'extra-usage', text: 'extra usage allowed' });
+  // The account's own egress proxy, as the status payload carries it: already
+  // password-masked (describeRouting), and absent for an account on the fleet
+  // path, which is the default and earns no badge.
+  if (typeof a.routing === 'string' && a.routing) badges.push({ cls: 'meta routing', text: 'via ' + a.routing });
   return badges;
 }
 
@@ -303,9 +331,99 @@ export function switchRequest(name, key) {
   };
 }
 
+// The request the threshold control sends. The number goes as typed: what
+// counts as a percentage is the server's rule (1–100, kept to tenths), and a
+// second opinion here would only disagree with it on the edges.
+/**
+ * @param {number|string} percent
+ * @param {string|null|undefined} key
+ */
+export function thresholdRequest(percent, key) {
+  return {
+    url: '/teamclaude/threshold',
+    init: {
+      method: 'POST',
+      headers: { 'x-api-key': key || '', 'content-type': 'application/json' },
+      body: JSON.stringify({ percent: percent }),
+    },
+  };
+}
+
+// The stored 0–1 ratio as the number the control shows. Tenths, and no trailing
+// zero: the setting is quantised to tenths of a percent, so 0.98 must read back
+// as "98" rather than "98.0" for a re-save to be a no-op the operator can see.
+/** @param {unknown} value */
+export function thresholdPercentText(value) {
+  /** @type {any} */ var ratio = value;
+  // A per-bucket table: the control sets one number for every bucket, so what it
+  // shows is the default the table falls back to.
+  if (ratio && typeof ratio === 'object' && !Array.isArray(ratio)) ratio = ratio.default;
+  if (typeof ratio !== 'number' || !isFinite(ratio)) return '';
+  return String(Math.round(ratio * 1000) / 10);
+}
+
+// What to tell the operator after a threshold change. `dropped` is the part a
+// bare "saved" would hide: one number replaces a per-bucket table rather than
+// hiding one behind it, and the operator who set those buckets should hear it.
+/**
+ * @param {any} res
+ * @returns {{ kind: string, text: string }}
+ */
+export function thresholdOutcome(res) {
+  if (!res || !res.ok) return { kind: 'error', text: 'threshold change failed' + (res && res.error ? ': ' + res.error : '') };
+  var pct = thresholdPercentText(res.switchThreshold);
+  var dropped = res.dropped || [];
+  if (dropped.length) return { kind: 'warn', text: 'switch threshold set to ' + pct + '% — dropped the per-bucket thresholds (' + dropped.join(', ') + ')' };
+  return { kind: 'ok', text: 'switch threshold set to ' + pct + '%' };
+}
+
 // What to tell the operator afterwards. The endpoint answers `ok` for the choice
 // being recorded and `eligible` for whether traffic will actually follow it —
 // two different things, and a bare "done" would be a lie for a spent target.
+/**
+ * POST for an account control. `spec` is {place}/{priority} for a priority
+ * move, or {disabled} to take an account out of rotation or put it back.
+ *
+ * @param {any} name
+ * @param {{ place?: string, priority?: number, disabled?: boolean }} spec
+ * @param {string|null} key
+ */
+export function accountControlRequest(name, spec, key) {
+  var isPriority = spec.disabled === undefined;
+  /** @type {{ account: any, place?: any, priority?: any, disabled?: any }} */
+  var body = { account: name };
+  if (isPriority) {
+    if (spec.place) body.place = spec.place;
+    else body.priority = spec.priority;
+  } else {
+    body.disabled = spec.disabled;
+  }
+  return {
+    url: isPriority ? '/teamclaude/priority' : '/teamclaude/disable',
+    init: {
+      method: 'POST',
+      headers: { 'x-api-key': key || '', 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    },
+  };
+}
+
+/**
+ * What to tell the operator afterwards. A priority move reports the number it
+ * landed on, which is the part the caller did not choose when it asked for
+ * 'first' or 'last'.
+ *
+ * @param {any} res
+ * @param {{ place?: string, priority?: number, disabled?: boolean }} spec
+ */
+export function accountControlOutcome(res, spec) {
+  if (!res || !res.ok) return { kind: 'error', text: 'change failed' + (res && res.error ? ': ' + res.error : '') };
+  if (spec.disabled !== undefined) {
+    return { kind: 'ok', text: (res.disabled ? 'disabled ' : 'enabled ') + res.name };
+  }
+  return { kind: 'ok', text: res.name + ' priority ' + res.priority };
+}
+
 export function switchOutcome(res) {
   if (!res || !res.ok) return { kind: 'error', text: 'switch failed' + (res && res.error ? ': ' + res.error : '') };
   if (res.eligible === false) return { kind: 'warn', text: 'switched to ' + res.account + ', but rotation will not use it' + (res.reason ? ': ' + res.reason : '') };
@@ -466,9 +584,33 @@ export function problems(status) {
   return out;
 }
 
+// The usage views the page offers, derived from the windows the tracker
+// actually keeps rather than listed again here: a window added or renamed in
+// client-usage.js must not leave a button behind that reads zero for everyone.
+// `total` is first because it is the lifetime counter the status payload has
+// always carried, and the view the page opens on.
+export const USAGE_VIEWS = [{ key: 'total', label: 'Total' }].concat(
+  Object.keys(USAGE_WINDOWS).map(key => ({ key, label: 'Last ' + key })));
+
+// Which counters one usage row shows. Every usage table reads the selected
+// window through this, rather than each renderer reaching into `windows`
+// itself — the Clients table and the per-dimension tables carry the same shape
+// and must not drift into answering the same question differently.
+/** @param {any} entry @param {string} [view] */
+export function usageFor(entry, view) {
+  var e = entry || {};
+  var src = !view || view === 'total' ? e : ((e.windows || {})[view] || {});
+  return {
+    requests: src.requests || 0,
+    connections: src.connections || 0,
+    inputTokens: src.inputTokens || 0,
+    outputTokens: src.outputTokens || 0,
+  };
+}
+
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
-  switchRequest, switchOutcome, routeRows, problems,
+  switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -482,6 +624,7 @@ const SHARED_CONSTS = [
   `var RESET_CREDIT_MAX_AGE_MS = ${RESET_CREDIT_MAX_AGE_MS};`,
   `var THRESHOLD_BUCKET_KEYS = ${JSON.stringify(THRESHOLD_BUCKET_KEYS)};`,
   `var THRESHOLD_BUCKET_LABELS = ${JSON.stringify(THRESHOLD_BUCKET_LABELS)};`,
+  `var USAGE_VIEWS = ${JSON.stringify(USAGE_VIEWS)};`,
 ].join('\n');
 
 const PAGE = `<!doctype html>
@@ -491,10 +634,30 @@ const PAGE = `<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>TeamClaude</title>
 <style>
+  /* Dark is the default, and stays the default for a viewer whose system says
+     nothing. The light palette is applied two ways: by the media query when no
+     choice has been stored (data-theme absent), and by the attribute when one
+     has. The media rule excludes an explicit dark choice, so choosing dark on a
+     light desktop is honoured rather than overridden by the system. */
   :root {
+    color-scheme: dark;
     --bg: #101418; --panel: #171d24; --line: #242c36;
     --text: #d7dde4; --dim: #8a949f; --accent: #53b1fd;
     --ok: #3fb950; --warn: #d29922; --bad: #f85149;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      color-scheme: light;
+      --bg: #f6f8fa; --panel: #ffffff; --line: #d8dee4;
+      --text: #1f2328; --dim: #59636e; --accent: #0969da;
+      --ok: #1a7f37; --warn: #9a6700; --bad: #cf222e;
+    }
+  }
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --bg: #f6f8fa; --panel: #ffffff; --line: #d8dee4;
+    --text: #1f2328; --dim: #59636e; --accent: #0969da;
+    --ok: #1a7f37; --warn: #9a6700; --bad: #cf222e;
   }
   * { box-sizing: border-box; margin: 0; }
   body { background: var(--bg); color: var(--text); font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; padding: 24px; }
@@ -517,6 +680,8 @@ const PAGE = `<!doctype html>
   .badge.meta { color: var(--dim); }
   .badge.sessions { color: var(--text); }
   .badge.sessions.known { color: var(--dim); }
+  .badge.extra-usage { color: var(--warn); border-color: var(--warn); }
+  .badge.extra-usage.billing { color: var(--bad); border-color: var(--bad); }
   .quota { display: grid; grid-template-columns: 64px 1fr 170px; gap: 8px; align-items: center; margin-top: 6px; }
   .quota .lbl { color: var(--dim); font-size: 12px; }
   .quota .val { color: var(--dim); font-size: 12px; text-align: right; font-variant-numeric: tabular-nums; }
@@ -545,6 +710,13 @@ const PAGE = `<!doctype html>
   .actions button { font: inherit; font-size: 12px; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--line); background: transparent; color: var(--dim); cursor: pointer; }
   .actions button:hover { color: var(--text); border-color: var(--text); }
   .actions button:disabled { opacity: .5; cursor: default; }
+  .actions button.sel { color: var(--text); border-color: var(--accent); }
+  .actions .lbl { color: var(--dim); font-size: 12px; align-self: center; }
+  /* Pushed to the far end: the two buttons on the left act on the fleet as it
+     stands, while this one edits a stored setting — a gap says so without a
+     second row. */
+  .actions .thr { display: flex; align-items: center; gap: 6px; margin-left: auto; font-size: 12px; color: var(--dim); }
+  .actions .thr input { width: 64px; font: inherit; font-size: 12px; padding: 4px 8px; text-align: right; border-radius: 999px; border: 1px solid var(--line); background: transparent; color: var(--text); }
   th.sortable { cursor: pointer; user-select: none; }
   th.sortable:hover { color: var(--text); }
   td.dim { color: var(--dim); }
@@ -560,9 +732,17 @@ const PAGE = `<!doctype html>
   #problems .warn { background: rgba(210,153,34,.12); border: 1px solid var(--warn); color: var(--warn); }
   #keybox { display: none; margin: 40px auto; max-width: 420px; text-align: center; }
   #keybox input { width: 100%; padding: 10px 12px; margin: 12px 0; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; color: var(--text); font: inherit; }
-  #keybox button { padding: 8px 20px; background: var(--accent); border: 0; border-radius: 6px; color: #06121f; font: inherit; font-weight: 600; cursor: pointer; }
+  #keybox button { padding: 8px 20px; background: var(--accent); border: 0; border-radius: 6px; color: var(--panel); font: inherit; font-weight: 600; cursor: pointer; }
   footer { color: var(--dim); font-size: 12px; margin-top: 24px; }
 </style>
+<script>
+(function () {
+  try {
+    var t = localStorage.getItem('teamclaude-dashboard-theme');
+    if (t === 'light' || t === 'dark') document.documentElement.setAttribute('data-theme', t);
+  } catch (e) { /* storage disabled: the media query still decides */ }
+})();
+</script>
 </head>
 <body>
 <main>
@@ -578,6 +758,13 @@ const PAGE = `<!doctype html>
     <div class="actions">
       <button id="reload" type="button">Reload config</button>
       <button id="probe" type="button">Probe quotas</button>
+      <button id="theme" type="button" title="Switch between following the system, light and dark"></button>
+      <span class="thr">
+        <label for="thrVal">Switch at</label>
+        <input id="thrVal" type="number" min="1" max="100" step="0.1" inputmode="decimal">
+        <span>%</span>
+        <button id="thrSet" type="button">Set</button>
+      </span>
     </div>
     <div id="err"></div>
     <div id="problems"></div>
@@ -588,8 +775,9 @@ const PAGE = `<!doctype html>
     </div>
     <h2>Accounts</h2>
     <div id="accounts"></div>
+    <div id="usageViewWrap" class="actions" style="display:none"></div>
     <div id="clientsWrap" style="display:none">
-      <h2>Clients</h2>
+      <h2 id="clientsHeading">Clients</h2>
       <div class="card" style="padding:4px 6px"><table id="clients"></table></div>
     </div>
     <div id="dimensionsWrap"></div>
@@ -611,11 +799,18 @@ const PAGE = `<!doctype html>
 (function () {
   'use strict';
   var KEY = 'teamclaude-dashboard-key';
+  var THEME_KEY = 'teamclaude-dashboard-theme';
   var POLL_MS = 5000;
   var timer = null;
   var lastStatus = null;
   var sessionFilters = { project: '', client: '' };
   var sortState = { sessions: { key: 'lastSeen', dir: 'desc' } };
+  // The usage window applies to every table the usage trackers feed (Clients
+  // and each configured dimension), so it is page state rather than per-table:
+  // two controls left on different windows would invite reading one table's
+  // number against the other's. Like the sort, it survives the poll.
+  var usageView = 'total';
+  var usageButtons = [];
   var UNAVAILABLE_TEXT = ${JSON.stringify(UNAVAILABLE_TEXT)};
 
 ${SHARED_CONSTS}
@@ -710,6 +905,24 @@ ${SHARED_HELPERS}
       btn.addEventListener('click', function () { doSwitch(a.name, btn); });
       head.appendChild(btn);
     }
+    // Account controls, in the order an operator reaches for them: take it out
+    // of rotation, or move where rotation reaches it. Only the enable/disable
+    // control is shown for a disabled account — the rest would be moving an
+    // account that nothing will select anyway.
+    // Named ctl* deliberately: var is function-scoped, and this builder already
+    // declares a "last" further down (the last-used string). A button named
+    // last here is overwritten by that before any click can fire.
+    var ctlDisable = el('button', 'act', a.disabled ? 'enable' : 'disable');
+    ctlDisable.addEventListener('click', function () { doControlAccount(a.name, { disabled: !a.disabled }, ctlDisable); });
+    head.appendChild(ctlDisable);
+    if (!a.disabled) {
+      var ctlFirst = el('button', 'act', 'prioritize');
+      ctlFirst.addEventListener('click', function () { doControlAccount(a.name, { place: 'first' }, ctlFirst); });
+      head.appendChild(ctlFirst);
+      var ctlLast = el('button', 'act', 'deprioritize');
+      ctlLast.addEventListener('click', function () { doControlAccount(a.name, { place: 'last' }, ctlLast); });
+      head.appendChild(ctlLast);
+    }
     card.appendChild(head);
     if (a.unavailable) card.appendChild(el('div', 'blocked', 'blocked: ' + (UNAVAILABLE_TEXT[a.unavailable] || a.unavailable)));
     var q = a.quota || {};
@@ -731,33 +944,80 @@ ${SHARED_HELPERS}
     return card;
   }
 
+  // The window a usage table is showing, in its own heading. The control sits
+  // above the Clients table, but the dimension tables are below it and can be
+  // scrolled clear of it — and a five-hour figure under a bare "Input tok" is
+  // the one way this feature can state a number under the wrong label.
+  // Last used is a lifetime figure in a table whose heading may name a window.
+  // Under Total that needs no saying; under a window it does, or it reads as
+  // the one thing this control must never do — a number under the wrong label.
+  function lastUsedLabel() {
+    return usageView === 'total' ? 'Last used' : 'Last used (all time)';
+  }
+
+  function usageHeading(base) {
+    if (usageView === 'total') return base;
+    var view = USAGE_VIEWS.filter(function (v) { return v.key === usageView; })[0];
+    return view ? base + ' · ' + view.label.toLowerCase() : base;
+  }
+
   function renderClients(clients) {
     var wrap = document.getElementById('clientsWrap');
     var names = Object.keys(clients || {});
     if (!names.length) { wrap.style.display = 'none'; return; }
     wrap.style.display = '';
+    document.getElementById('clientsHeading').textContent = usageHeading('Clients');
+    // Sorted on the window being shown, not on the lifetime total: a table
+    // ordered by all-time spend while displaying the last five hours would put
+    // the quiet clients on top of the busy one.
     names.sort(function (a, b) {
-      var ca = clients[a], cb = clients[b];
-      return ((cb.inputTokens || 0) + (cb.outputTokens || 0)) - ((ca.inputTokens || 0) + (ca.outputTokens || 0));
+      var ua = usageFor(clients[a], usageView), ub = usageFor(clients[b], usageView);
+      return (ub.inputTokens + ub.outputTokens) - (ua.inputTokens + ua.outputTokens);
     });
     var table = document.getElementById('clients');
     table.textContent = '';
     var hr = el('tr');
-    ['Client', 'Requests', 'WebSockets', 'Input tok', 'Output tok', 'Last used'].forEach(function (h, i) {
+    ['Client', 'Requests', 'WebSockets', 'Input tok', 'Output tok', lastUsedLabel()].forEach(function (h, i) {
       hr.appendChild(el('th', i ? 'num' : '', h));
     });
     table.appendChild(hr);
     names.forEach(function (n) {
       var c = clients[n];
+      var u = usageFor(c, usageView);
       var tr = el('tr');
       tr.appendChild(el('td', '', n));
-      tr.appendChild(el('td', 'num', fmtNum(c.requests)));
-      tr.appendChild(el('td', 'num', fmtNum(c.connections || 0)));
-      tr.appendChild(el('td', 'num', fmtNum(c.inputTokens)));
-      tr.appendChild(el('td', 'num', fmtNum(c.outputTokens)));
+      tr.appendChild(el('td', 'num', fmtNum(u.requests)));
+      tr.appendChild(el('td', 'num', fmtNum(u.connections)));
+      tr.appendChild(el('td', 'num', fmtNum(u.inputTokens)));
+      tr.appendChild(el('td', 'num', fmtNum(u.outputTokens)));
+      // Last used stays the lifetime figure under every window: it answers
+      // when this client was last seen at all, which a window cannot.
       tr.appendChild(el('td', 'num', c.lastUsed ? fmtAgo(c.lastUsed) : '—'));
       table.appendChild(tr);
     });
+  }
+
+  // The window buttons, built once: the windows are fixed by the server that
+  // served this page. Visibility is decided per render, since the control only
+  // means something when there is a usage table under it.
+  function buildUsageViews() {
+    var wrap = document.getElementById('usageViewWrap');
+    wrap.appendChild(el('span', 'lbl', 'Usage window'));
+    USAGE_VIEWS.forEach(function (v) {
+      var btn = el('button', '', v.label);
+      btn.addEventListener('click', function () {
+        usageView = v.key;
+        markUsageView();
+        if (lastStatus) render(lastStatus);
+      });
+      wrap.appendChild(btn);
+      usageButtons.push({ key: v.key, btn: btn });
+    });
+    markUsageView();
+  }
+
+  function markUsageView() {
+    usageButtons.forEach(function (b) { b.btn.className = b.key === usageView ? 'sel' : ''; });
   }
 
   // Header cells that re-sort in place. The sort is state, not a re-fetch, so
@@ -854,11 +1114,12 @@ ${SHARED_HELPERS}
       var entries = dimensions[name] || {};
       var rows = Object.keys(entries).map(function (key) {
         var e = entries[key] || {};
+        var u = usageFor(e, usageView);
         return {
           name: key,
-          requests: e.requests || 0,
-          inputTokens: e.inputTokens || 0,
-          outputTokens: e.outputTokens || 0,
+          requests: u.requests,
+          inputTokens: u.inputTokens,
+          outputTokens: u.outputTokens,
           lastUsed: e.lastUsed ? Date.parse(e.lastUsed) : 0,
         };
       });
@@ -866,7 +1127,7 @@ ${SHARED_HELPERS}
       sortState[name] = sortState[name] || { key: 'inputTokens', dir: 'desc' };
       rows = sortRows(rows, sortState[name].key, sortState[name].dir);
 
-      wrap.appendChild(el('h2', '', name.charAt(0).toUpperCase() + name.slice(1)));
+      wrap.appendChild(el('h2', '', usageHeading(name.charAt(0).toUpperCase() + name.slice(1))));
       var card = el('div', 'card');
       card.style.padding = '4px 6px';
       var table = el('table');
@@ -875,7 +1136,7 @@ ${SHARED_HELPERS}
         { key: 'requests', label: 'Req', num: true },
         { key: 'inputTokens', label: 'Input tok', num: true },
         { key: 'outputTokens', label: 'Output tok', num: true },
-        { key: 'lastUsed', label: 'Last used', num: true }].forEach(function (c) {
+        { key: 'lastUsed', label: lastUsedLabel(), num: true }].forEach(function (c) {
         addSortableHeader(hr, name, c.label, c.key, !!c.num);
       });
       table.appendChild(hr);
@@ -947,6 +1208,12 @@ ${SHARED_HELPERS}
 
   function render(s) {
     lastStatus = s;
+    // The poll owns the threshold field except while it is being typed into:
+    // rewriting it every POLL_MS would delete the operator's half-entered
+    // number under the cursor. It also means a change made from the CLI, the
+    // TUI or another browser shows up here without a refresh.
+    var thrInput = document.getElementById('thrVal');
+    if (document.activeElement !== thrInput) thrInput.value = thresholdPercentText(s.switchThreshold);
     var sess = s.sessions || {};
     var up = s.server && s.server.uptimeSeconds != null ? 'up ' + fmtIn(s.server.uptimeSeconds) : '';
     var sum = document.getElementById('summary');
@@ -982,6 +1249,10 @@ ${SHARED_HELPERS}
     renderRoutes(s);
     renderClients(s.clients);
     renderDimensions(s.usageDimensions);
+    // The control means nothing with no usage table under it. The payload
+    // already answers that: the server omits a dimension with no entries.
+    var anyUsage = Object.keys(s.clients || {}).length || Object.keys(s.usageDimensions || {}).length;
+    document.getElementById('usageViewWrap').style.display = anyUsage ? '' : 'none';
     renderSessions(s.sessions);
     document.getElementById('foot').textContent = 'refreshes every ' + (POLL_MS / 1000) + 's · ' + new Date().toLocaleTimeString();
   }
@@ -1014,6 +1285,59 @@ ${SHARED_HELPERS}
         poll();
       })
       .catch(function (e) { note('error', 'switch failed: ' + e.message); btn.disabled = false; });
+  }
+
+  function doControlAccount(name, spec, btn) {
+    btn.disabled = true;
+    var r = accountControlRequest(name, spec, localStorage.getItem(KEY));
+    fetch(r.url, r.init)
+      .then(function (res) {
+        if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
+        return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
+      })
+      .then(function (json) {
+        if (!json) return;
+        var out = accountControlOutcome(json, spec);
+        note(out.kind, out.text);
+        poll();
+      })
+      .catch(function (e) { note('error', 'change failed: ' + e.message); })
+      // Unlike doSwitch, always re-enabled: the card is rebuilt by the poll
+      // above, and a button that stayed dead after a refused change would be
+      // the only control an operator could not retry.
+      .finally(function () { btn.disabled = false; });
+  }
+
+  // The one control here that writes a setting rather than nudging the running
+  // fleet: the server saves it to the config file and reloads, so it holds
+  // across a restart. One number governs every quota bucket — a fleet using
+  // per-bucket thresholds is told what the save dropped (thresholdOutcome).
+  function doThreshold(btn) {
+    var input = document.getElementById('thrVal');
+    var raw = input.value.trim();
+    // Left to the server otherwise: an empty field is the one case it would see
+    // as a missing key rather than a bad number, and "invalid request body" is
+    // not what an operator who cleared the box needs to read.
+    if (!raw) { note('error', 'switch threshold: enter a percentage from 1 to 100'); return; }
+    btn.disabled = true;
+    var r = thresholdRequest(Number(raw), localStorage.getItem(KEY));
+    fetch(r.url, r.init)
+      .then(function (res) {
+        if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
+        return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
+      })
+      .then(function (json) {
+        if (!json) return;
+        var out = thresholdOutcome(json);
+        note(out.kind, out.text);
+        // The stored number, not the typed one: the setting is quantised to
+        // tenths, and a field left reading 97.55 after a save of 97.6 invites a
+        // re-save that changes nothing.
+        if (json.ok) input.value = thresholdPercentText(json.switchThreshold);
+        poll();
+      })
+      .catch(function (e) { note('error', 'switch threshold change failed: ' + e.message); })
+      .finally(function () { btn.disabled = false; });
   }
 
   function doControl(path, label, btn) {
@@ -1081,8 +1405,49 @@ ${SHARED_HELPERS}
   document.getElementById('key').addEventListener('keydown', function (e) {
     if (e.key === 'Enter') document.getElementById('go').click();
   });
+  // Theme: system → light → dark → system. "system" is the absence of a
+  // stored choice, so a viewer who never touches this keeps following their
+  // desktop, and one who does is not re-decided for by it later.
+  var THEMES = ['system', 'light', 'dark'];
+  function readTheme() {
+    try {
+      var t = localStorage.getItem(THEME_KEY);
+      return t === 'light' || t === 'dark' ? t : 'system';
+    } catch (e) { return 'system'; }
+  }
+  function applyTheme(theme) {
+    if (theme === 'system') document.documentElement.removeAttribute('data-theme');
+    else document.documentElement.setAttribute('data-theme', theme);
+    var btn = document.getElementById('theme');
+    // Name the state, not the action: a button reading "Dark" while the page is
+    // light is the ambiguity every theme toggle has, and this one says where it
+    // is rather than where it would go.
+    btn.textContent = theme === 'system' ? 'Theme: system' : theme === 'light' ? 'Theme: light' : 'Theme: dark';
+  }
+  function storeTheme(theme) {
+    try {
+      if (theme === 'system') localStorage.removeItem(THEME_KEY);
+      else localStorage.setItem(THEME_KEY, theme);
+    } catch (e) { /* storage disabled: the choice lasts for this page only */ }
+  }
+  // The current theme lives in a variable rather than being re-read from
+  // storage on each click: with storage blocked, readTheme() would always say
+  // 'system' and the button would be stuck on 'light' instead of cycling.
+  var theme = readTheme();
+  applyTheme(theme);
+  document.getElementById('theme').addEventListener('click', function () {
+    theme = THEMES[(THEMES.indexOf(theme) + 1) % THEMES.length];
+    storeTheme(theme);
+    applyTheme(theme);
+  });
+
   document.getElementById('reload').addEventListener('click', function () { doControl('/teamclaude/reload', 'config reload', this); });
   document.getElementById('probe').addEventListener('click', function () { doControl('/teamclaude/probe', 'quota probe', this); });
+  document.getElementById('thrSet').addEventListener('click', function () { doThreshold(this); });
+  document.getElementById('thrVal').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') document.getElementById('thrSet').click();
+  });
+  buildUsageViews();
 
   ['fProject', 'fClient'].forEach(function (id) {
     document.getElementById(id).addEventListener('change', function () {

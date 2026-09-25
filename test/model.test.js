@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { findFamilyBlock, isFableModel, modelGlobOverlaps, parseRequestModel, TopLevelFieldFinder } from '../src/model.js';
+import { findFamilyBlock, isFableModel, modelGlobOverlaps, parseRequestModel, parseRequestStream, TopLevelFieldFinder } from '../src/model.js';
 
 test('isFableModel matches the Fable family only', () => {
   assert.equal(isFableModel('claude-fable-5'), true);
@@ -72,4 +72,19 @@ test('modelGlobOverlaps compares literal cores in both directions', () => {
   assert.equal(modelGlobOverlaps('*', '*fable*'), true);
   assert.equal(modelGlobOverlaps('*opus*', '*fable*'), false);
   assert.equal(modelGlobOverlaps(undefined, '*fable*'), false);
+});
+
+test('parseRequestStream reads only the top-level stream field', () => {
+  assert.equal(parseRequestStream('{"model":"m","stream":true}'), true);
+  assert.equal(parseRequestStream('{"model":"m","stream": true ,"input":[]}'), true);
+  assert.equal(parseRequestStream('{"model":"m","stream":false}'), false);
+  assert.equal(parseRequestStream('{"model":"m"}'), false);
+  assert.equal(parseRequestStream('{"input":[{"stream":true}],"model":"m"}'), false, 'nested stream is not the field');
+  assert.equal(parseRequestStream('{"messages":[{"content":"\\"stream\\": true"}]}'), false, 'text is not the field');
+  assert.equal(parseRequestStream('{"stream":"true"}'), false, 'a string is not the literal');
+  assert.equal(parseRequestStream(''), false);
+  assert.equal(parseRequestStream(null), false);
+  // The finder still reads string fields as before, scalar support notwithstanding.
+  assert.equal(new TopLevelFieldFinder('n').push(Buffer.from('{"n": 42, "model":"m"}')), '42');
+  assert.equal(new TopLevelFieldFinder('model').push(Buffer.from('{"n": 42, "model":"m"}')), 'm');
 });
