@@ -602,8 +602,10 @@ test('the page ships the same helper implementations it is tested against', () =
   for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, routeRows, problems]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
-  const script = inlineScripts(html).at(-1);
-  assert.doesNotThrow(() => new Function(script), 'inline script must parse');
+  // Both the head bootstrap and the main script must parse, not just the last.
+  for (const script of inlineScripts(html)) {
+    assert.doesNotThrow(() => new Function(script), 'inline script must parse');
+  }
 });
 
 // Run the page's whole inline script against a stub DOM, a stub localStorage and
@@ -619,9 +621,12 @@ function bootPage({ storedKey = null, storedTheme = null } = {}) {
     const target = {
       style: {}, value: '', textContent: '', className: '', disabled: false,
       addEventListener: (type, fn) => listeners.set(type, fn),
-      fire: (type) => listeners.get(type)?.call(target),
     };
-    return new Proxy(target, { get: (t, p) => (p in t ? t[p] : () => stubEl()) });
+    const proxy = new Proxy(target, { get: (t, p) => (p in t ? t[p] : () => stubEl()) });
+    // Fire with the proxy as `this`, the way the page sees the element, so a
+    // handler that touches an unstubbed property gets the absorbing stub.
+    target.fire = type => listeners.get(type)?.call(proxy);
+    return proxy;
   };
   const byId = id => { if (!els.has(id)) els.set(id, stubEl()); return els.get(id); };
   const store = new Map([

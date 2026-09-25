@@ -22,19 +22,6 @@ export function renderDashboardHtml() {
 }
 
 /**
- * Content-Security-Policy for the dashboard, sent by the server with the page.
- *
- * The page holds the proxy key in localStorage, so the policy is the backstop
- * for a script that should never run there: nothing loads from anywhere
- * (`default-src 'none'`), the one inline script is admitted by its hash rather
- * than by `'unsafe-inline'` — the page is static, so the hash is stable — and
- * the only network the script may touch is this origin, for status and switch.
- * Styles need `'unsafe-inline'` because the layout uses `style=` attributes,
- * which hashes do not cover; CSSOM writes (`el.style.width = …`) are not
- * governed by CSP at all. `frame-ancestors 'none'` keeps the page out of
- * another site's iframe, where a click on "switch" could be overlaid.
- */
-/**
  * The body of every `<script>` in the page, in order. Attribute-free tags only,
  * which is all this page has and all the hash policy can admit anyway.
  *
@@ -48,6 +35,20 @@ export function inlineScripts(html) {
   return out;
 }
 
+/**
+ * Content-Security-Policy for the dashboard, sent by the server with the page.
+ *
+ * The page holds the proxy key in localStorage, so the policy is the backstop
+ * for a script that should never run there: nothing loads from anywhere
+ * (`default-src 'none'`), each inline script (the theme bootstrap in `<head>`
+ * and the main script) is admitted by its hash rather than by
+ * `'unsafe-inline'` — the page is static, so the hashes are stable — and the
+ * only network the script may touch is this origin, for status and switch.
+ * Styles need `'unsafe-inline'` because the layout uses `style=` attributes,
+ * which hashes do not cover; CSSOM writes (`el.style.width = …`) are not
+ * governed by CSP at all. `frame-ancestors 'none'` keeps the page out of
+ * another site's iframe, where a click on "switch" could be overlaid.
+ */
 export function dashboardCsp(html = PAGE) {
   // Every inline script, not just the first: the theme is applied by a short
   // script in <head> so the page does not paint dark and then flip to light,
@@ -598,7 +599,7 @@ const PAGE = `<!doctype html>
   #problems .warn { background: rgba(210,153,34,.12); border: 1px solid var(--warn); color: var(--warn); }
   #keybox { display: none; margin: 40px auto; max-width: 420px; text-align: center; }
   #keybox input { width: 100%; padding: 10px 12px; margin: 12px 0; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; color: var(--text); font: inherit; }
-  #keybox button { padding: 8px 20px; background: var(--accent); border: 0; border-radius: 6px; color: #06121f; font: inherit; font-weight: 600; cursor: pointer; }
+  #keybox button { padding: 8px 20px; background: var(--accent); border: 0; border-radius: 6px; color: var(--panel); font: inherit; font-weight: 600; cursor: pointer; }
   footer { color: var(--dim); font-size: 12px; margin-top: 24px; }
 </style>
 <script>
@@ -1154,11 +1155,15 @@ ${SHARED_HELPERS}
       else localStorage.setItem(THEME_KEY, theme);
     } catch (e) { /* storage disabled: the choice lasts for this page only */ }
   }
-  applyTheme(readTheme());
+  // The current theme lives in a variable rather than being re-read from
+  // storage on each click: with storage blocked, readTheme() would always say
+  // 'system' and the button would be stuck on 'light' instead of cycling.
+  var theme = readTheme();
+  applyTheme(theme);
   document.getElementById('theme').addEventListener('click', function () {
-    var next = THEMES[(THEMES.indexOf(readTheme()) + 1) % THEMES.length];
-    storeTheme(next);
-    applyTheme(next);
+    theme = THEMES[(THEMES.indexOf(theme) + 1) % THEMES.length];
+    storeTheme(theme);
+    applyTheme(theme);
   });
 
   document.getElementById('reload').addEventListener('click', function () { doControl('/teamclaude/reload', 'config reload', this); });
