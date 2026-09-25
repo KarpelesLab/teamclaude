@@ -3,7 +3,8 @@ import { sameIdentity } from './identity.js';
 import { safeLine } from './safe-text.js';
 import { removedAccountIds } from './account-pairing.js';
 import { ensureAccountIds } from './account-id.js';
-import { accountSwitchThreshold, accountAllowsExtraUsage } from './account-manager.js';
+import { accountSwitchThreshold, accountAllowsExtraUsage, accountRouting } from './account-manager.js';
+import { localListener } from './upstream-proxy.js';
 
 /**
  * Sync accounts from disk config: add new accounts and refresh credentials
@@ -112,6 +113,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     // operator decision about a running fleet, and waiting for a restart to
     // honour a budget defeats the budget.
     mgr.maxUsage = diskAcct.maxUsage ?? null;
+    mgr.maxSpend = diskAcct.maxSpend ?? null;
     // Same for a per-account switch threshold (#409): thresholdFor() reads it
     // straight off the account, so a disk edit takes effect on the very next
     // selection without a restart, exactly like the fleet-wide setting does.
@@ -125,6 +127,21 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     // (an API key, a third-party backend, a Codex login) stays opted out on
     // reload as it was at startup; the warning was makeAccount's to give.
     mgr.allowExtraUsage = accountAllowsExtraUsage(diskAcct);
+    // Same for a per-account routing proxy: it is read per request off this
+    // object (server.js forwardRequest, ensureTokenFresh, the prober), so a
+    // disk edit or a `teamclaude routing` change takes effect on the very next
+    // request without a restart. Through the constructor's own parse, so a bad
+    // URL is refused and reported here as it would be at startup, and so is
+    // one that points back at this server's own listener (memConfig's port is
+    // the one the server is bound to; a port edit on disk needs a restart).
+    accountManager.setRouting(mgr.index, accountRouting(diskAcct, localListener(memConfig)));
+    // Read at the moment a refusal asks whether to spend a reset credit, so a
+    // disk edit must land here to bind — and an operator who has just exempted
+    // an account is doing so precisely because they do not want the next
+    // refusal to spend its credit. Negative-only (see makeAccount): only `false`
+    // says anything, so removing the key returns the account to following the
+    // fleet-wide `autoRedeemResets`.
+    mgr.autoRedeemReset = diskAcct.autoRedeemReset !== false;
     // Third-party-backend bindings are read per request off this object
     // (`account.upstream || upstream`, `account.modelMap` in server.js), so a
     // disk edit must land here to take effect on reload. `|| null` mirrors the
@@ -156,13 +173,20 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       if (diskAcct.stripRequestFields) cfgAcct.stripRequestFields = diskAcct.stripRequestFields; else delete cfgAcct.stripRequestFields;
       if (diskAcct.messageThreads === true) cfgAcct.messageThreads = true; else delete cfgAcct.messageThreads;
       if (diskAcct.maxUsage != null) cfgAcct.maxUsage = diskAcct.maxUsage; else delete cfgAcct.maxUsage;
+      if (diskAcct.maxSpend != null) cfgAcct.maxSpend = diskAcct.maxSpend; else delete cfgAcct.maxSpend;
       if (diskAcct.switchThreshold != null) cfgAcct.switchThreshold = diskAcct.switchThreshold; else delete cfgAcct.switchThreshold;
+      if (diskAcct.routing) cfgAcct.routing = diskAcct.routing; else delete cfgAcct.routing;
       if (diskAcct.priority != null) cfgAcct.priority = diskAcct.priority; else delete cfgAcct.priority;
       // The TUI's reorder writes this key onto the entry, so after one
       // arrangement every entry carries a value for a hand edit to lose to.
       if (Number.isFinite(diskAcct.displayOrder)) cfgAcct.displayOrder = diskAcct.displayOrder; else delete cfgAcct.displayOrder;
       if (diskAcct.disabled) cfgAcct.disabled = true; else delete cfgAcct.disabled;
       if (diskAcct.allowExtraUsage === true) cfgAcct.allowExtraUsage = true; else delete cfgAcct.allowExtraUsage;
+      // Both polarities are mirrored, unlike the flags above: `false` is the
+      // side of this key that does something, so a stale mirror of either value
+      // would win the save stencil's spread and undo the disk edit.
+      if (typeof diskAcct.autoRedeemReset === 'boolean') cfgAcct.autoRedeemReset = diskAcct.autoRedeemReset;
+      else delete cfgAcct.autoRedeemReset;
     }
     // Pick up enable/disable toggles; re-enabling clears a stuck error state.
     const wantDisabled = !!diskAcct.disabled;

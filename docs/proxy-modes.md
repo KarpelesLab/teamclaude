@@ -57,8 +57,10 @@ screen (**Network → Upstream proxy**) — it applies to the next request, with
 restart.
 
 - Covers **all** Anthropic-bound traffic: request forwarding, OAuth login, token
-  refresh, profile and usage lookups. A proxy that covered only some of them
-  would leave you able to refresh an account but not add one, or the reverse.
+  refresh, profile and usage lookups, and (since per-account routing landed)
+  `teamclaude api`, which used to go direct. A proxy that covered only some of
+  them would leave you able to refresh an account but not add one, or the
+  reverse.
 - `HTTPS_PROXY` / `ALL_PROXY` are picked up automatically when the config sets
   nothing, so a machine already configured for other tools needs no extra setup.
   When that happens the server says so on startup, and the TUI marks the row with
@@ -76,12 +78,12 @@ restart.
 - **TLS stays end-to-end.** The tunnel is a plain `CONNECT`; the proxy sees
   ciphertext only, and certificate verification is unchanged. A proxy that
   intercepts TLS needs its CA in `NODE_EXTRA_CA_CERTS`.
-- SOCKS proxies are not supported — only HTTP `CONNECT`. A `socks5://` value is
-  rejected at startup rather than failing later at connect time. So is an
-  `https://` proxy URL: TeamClaude does not speak TLS *to* the proxy, and
-  accepting the scheme would send the `CONNECT` (credentials included) in
-  plaintext to port 443. Write `http://host:port` — the tunnel through it is
-  end-to-end TLS regardless.
+- SOCKS URLs are refused here (`http` `CONNECT` only), as is `https://` to the
+  proxy itself: TeamClaude does not speak TLS *to* the proxy, and accepting the
+  scheme would send the `CONNECT` (credentials included) in plaintext to port
+  443. Write `http://host:port` — the tunnel through it is end-to-end TLS
+  regardless. (SOCKS **is** supported one level down, per account: see
+  [per-account routing](#per-account-routing) below.)
 
 This is a property of the **network**, not a routing policy: when set, it is
 simply how this machine reaches Anthropic. That is what separates it from sx.org
@@ -89,6 +91,50 @@ below, which is a specific egress *provider* chosen per request. If both are
 configured, a request routed via sx.org uses sx.org; everything else uses the
 upstream proxy. Neither is related to `proxy.port`, which is the local port
 Claude Code connects **to**.
+
+## Per-account routing
+
+The fleet settings above move *every* account together. `accounts[].routing`
+does the opposite: it pins **one** account to its own proxy and leaves the rest
+untouched.
+
+```bash
+teamclaude login --name "waffles@waffle.com" --routing "socks5h://alice:s3cret@proxy.example.com:1080"
+teamclaude routing waffles@waffle.com socks5h://alice:s3cret@proxy.example.com:1080
+teamclaude routing waffles@waffle.com none   # back to the fleet path
+```
+
+```json
+{ "name": "waffles@waffle.com", "type": "oauth", "routing": "socks5h://alice:s3cret@proxy.example.com:1080" }
+```
+
+- **All of that account's traffic** tunnels through it: request forwarding,
+  OAuth login and token refresh, profile, usage and quota probes. A proxy that
+  covered only some of those would strand the account mid-rotation.
+- **Only that account.** Every other account keeps the fleet path, and the
+  routed account ignores both the fleet upstream proxy and sx.org (chaining
+  would be two hops for one problem).
+- Schemes: `http` (CONNECT), `socks5`, `socks5h`, `socks4`, `socks4a`, with
+  optional `user:pass@` auth (SOCKS4 takes a username only). The `h`/`a`
+  suffixes follow curl's convention and resolve hostnames at the proxy; the
+  bare forms resolve locally. A bare `host:port` is `http`.
+- **TLS stays end-to-end** exactly as through the fleet proxy: the account's
+  proxy relays ciphertext only, and certificate verification is unchanged.
+- Changes apply live: the CLI command and disk edits both flow through the same
+  reload as every other per-account field. The URL shows password-masked in
+  `accounts`, `status`, the TUI and the dashboard.
+- A new URL is tested first: a tunnel to the account's upstream and a TLS
+  handshake, with no request sent. A proxy that does not answer is refused and
+  nothing is saved (`--no-check` skips the test).
+- A proxy that goes down later takes only its own account out. The request
+  fails over to the next account and the routed one sits out for 30 seconds
+  before its proxy is tried again. See
+  [When the proxy is down](accounts.md#when-the-proxy-is-down).
+
+Typical uses: one account that only answers from a specific region, an account
+served through a jump host the others cannot use, or one seat whose traffic
+must exit a particular network. See [accounts.md](accounts.md#per-account-routing-routing)
+for the CLI reference.
 
 ## sx.org proxy mode
 

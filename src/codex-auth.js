@@ -83,8 +83,11 @@ export async function importCodexCredentials(filePath = DEFAULT_CODEX_CREDENTIAL
  * expiresAt }`) so the account manager can treat both the same. A rotated
  * refresh token is returned when the server issues one, and the old one is
  * kept when it does not.
+ * @param {string} refreshToken
+ * @param {string} [endpoint]
+ * @param {import('./account-routing.js').RoutingProxy|null} [routing] - the account's own egress proxy
  */
-export async function refreshCodexToken(refreshToken, endpoint = TOKEN_ENDPOINT) {
+export async function refreshCodexToken(refreshToken, endpoint = TOKEN_ENDPOINT, routing = null) {
   const timeoutMs = Number(process.env.TEAMCLAUDE_REFRESH_TIMEOUT_MS) || 30_000;
   const res = await proxyFetch(endpoint, {
     method: 'POST',
@@ -95,6 +98,7 @@ export async function refreshCodexToken(refreshToken, endpoint = TOKEN_ENDPOINT)
       client_id: CLIENT_ID,
     }),
     signal: AbortSignal.timeout(timeoutMs),
+    routing,
   });
 
   if (!res.ok) {
@@ -139,8 +143,10 @@ export function buildCodexAuthUrl({ state, codeChallenge, redirectUri = REDIRECT
   return url.toString();
 }
 
-/** Exchange an authorization code for tokens, completing the PKCE handshake. */
-export async function exchangeCodexCode({ code, codeVerifier, redirectUri = REDIRECT_URI }) {
+/** Exchange an authorization code for tokens, completing the PKCE handshake.
+ * @param {{ code: string, codeVerifier: string, redirectUri?: string, routing?: import('./account-routing.js').RoutingProxy|null }} args
+ */
+export async function exchangeCodexCode({ code, codeVerifier, redirectUri = REDIRECT_URI, routing = null }) {
   const res = await proxyFetch(TOKEN_ENDPOINT, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
@@ -151,6 +157,7 @@ export async function exchangeCodexCode({ code, codeVerifier, redirectUri = REDI
       redirect_uri: redirectUri,
       code_verifier: codeVerifier,
     }),
+    routing,
   });
   if (!res.ok) {
     throw new Error(`Codex token exchange failed (${res.status}): ${await res.text()}`);
@@ -229,7 +236,11 @@ export function codexCallbackHandler(expectedState, { resolve, reject }) {
   };
 }
 
-export async function loginCodex({ noBrowser = false, timeoutMs = 120_000 } = {}) {
+/**
+ * @param {{ noBrowser?: boolean, timeoutMs?: number, routing?: import('./account-routing.js').RoutingProxy|null }} [opts]
+ * `routing` is the about-to-be-added account's own egress proxy (login --routing).
+ */
+export async function loginCodex({ noBrowser = false, timeoutMs = 120_000, routing = null } = {}) {
   const codeVerifier = randomBytes(32).toString('base64url');
   const codeChallenge = createHash('sha256').update(codeVerifier).digest('base64url');
   const state = randomBytes(32).toString('base64url');
@@ -259,5 +270,5 @@ export async function loginCodex({ noBrowser = false, timeoutMs = 120_000 } = {}
     // an authorization code, and nothing off this machine should reach it.
   }).finally(() => { server?.close(); });
 
-  return exchangeCodexCode({ code, codeVerifier });
+  return exchangeCodexCode({ code, codeVerifier, routing });
 }

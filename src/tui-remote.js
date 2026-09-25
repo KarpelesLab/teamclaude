@@ -264,6 +264,9 @@ export class RemoteAccountManager {
       // from the other end reads as off, never as a claim that money moves.
       allowExtraUsage: a?.allowExtraUsage === true,
       onExtraUsage: a?.onExtraUsage === true,
+      // Already password-masked by the server; still a payload string drawn
+      // into the frame, so it gets the same scrub as everything else.
+      routing: a?.routing == null ? a?.routing : text(a.routing, 128),
       quota: { ...(a?.quota || {}) },
     }));
     // -1 when the payload names an account that is no longer listed: nothing is
