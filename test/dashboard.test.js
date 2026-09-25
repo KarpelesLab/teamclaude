@@ -10,7 +10,9 @@ import {
   sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
   thresholdRequest, thresholdPercentText, thresholdOutcome,
+  usageFor, USAGE_VIEWS,
 } from '../src/dashboard.js';
+import { USAGE_WINDOWS } from '../src/client-usage.js';
 
 function listen(server) {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
@@ -670,7 +672,7 @@ test('the page ships the same helper implementations it is tested against', () =
   // The serialization is the contract: if a helper stops being self-contained
   // (closes over module scope), the page would silently ReferenceError.
   const html = renderDashboardHtml();
-  for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems]) {
+  for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   // Both the head bootstrap and the main script must parse, not just the last.
@@ -684,19 +686,26 @@ test('the page ships the same helper implementations it is tested against', () =
 // runs without a real DOM; only the style and text the startup path sets are read.
 function bootPage({ storedKey = null, storedTheme = null } = {}) {
   const els = new Map();
+  // Listeners are recorded rather than absorbed, and every element built is
+  // kept, so a test can drive a control the page created for itself — the
+  // window buttons have no id to look up.
+  const built = [];
   const stubEl = () => {
     // Listeners are recorded rather than absorbed, so a test can fire a click
     // the way the page registered it instead of reaching for an onclick the
-    // page never sets.
+    // page never sets. Every listener for a type is kept, in registration
+    // order, since a page may attach more than one to the same element.
     const listeners = new Map();
     const target = {
       style: {}, value: '', textContent: '', className: '', disabled: false,
-      addEventListener: (type, fn) => listeners.set(type, fn),
+      addEventListener: (type, fn) => { if (!listeners.has(type)) listeners.set(type, []); listeners.get(type).push(fn); },
+      listens: type => (listeners.get(type) || []).length > 0,
     };
     const proxy = new Proxy(target, { get: (t, p) => (p in t ? t[p] : () => stubEl()) });
     // Fire with the proxy as `this`, the way the page sees the element, so a
     // handler that touches an unstubbed property gets the absorbing stub.
-    target.fire = type => listeners.get(type)?.call(proxy);
+    target.fire = type => { for (const fn of listeners.get(type) || []) fn.call(proxy); };
+    built.push(proxy);
     return proxy;
   };
   const byId = id => { if (!els.has(id)) els.set(id, stubEl()); return els.get(id); };
@@ -728,7 +737,19 @@ function bootPage({ storedKey = null, storedTheme = null } = {}) {
     requests.shift().resolve({ status, ok: status >= 200 && status < 300, json: async () => body });
     await new Promise(r => setImmediate(r));
   };
-  return { byId, store, requests, answer, rootAttrs };
+  // Click the control carrying this label, whoever built it. A render replaces
+  // a table by building new elements rather than mutating the old ones, so the
+  // mark is what keeps `labelled` counting what is on the page now instead of
+  // everything ever built.
+  let mark = 0;
+  const click = label => {
+    const el = built.find(e => e.textContent === label && e.listens('click'));
+    assert.ok(el, `no clickable element labelled ${label}`);
+    mark = built.length;
+    el.fire('click');
+  };
+  const labelled = label => built.slice(mark).filter(e => e.textContent === label).length;
+  return { byId, store, requests, answer, rootAttrs, click, labelled };
 }
 
 test('the page polls status before asking for a key, so a key-exempt browser is never prompted', async () => {
@@ -914,4 +935,73 @@ test('accountControlOutcome reports the number a relative move landed on', () =>
   assert.deepEqual(
     accountControlOutcome(null, { place: 'first' }),
     { kind: 'error', text: 'change failed' });
+});
+
+// ── usage windows ───────────────────────────────────────────
+
+const ENTRY = {
+  requests: 100, connections: 4, inputTokens: 9000, outputTokens: 500,
+  windows: {
+    '5h': { requests: 3, connections: 0, inputTokens: 300, outputTokens: 20 },
+    '24h': { requests: 12, connections: 1, inputTokens: 1200, outputTokens: 80 },
+  },
+};
+
+test('the total view reads the lifetime counters', () => {
+  assert.deepEqual(usageFor(ENTRY, 'total'), { requests: 100, connections: 4, inputTokens: 9000, outputTokens: 500 });
+  // No view at all is the same question, asked before the page has state.
+  assert.deepEqual(usageFor(ENTRY), usageFor(ENTRY, 'total'));
+});
+
+test('a window view reads that window, not the lifetime counters', () => {
+  assert.deepEqual(usageFor(ENTRY, '24h'), { requests: 12, connections: 1, inputTokens: 1200, outputTokens: 80 });
+  assert.equal(usageFor(ENTRY, '5h').inputTokens, 300);
+});
+
+test('a window the payload does not carry reads as zero, never as the total', () => {
+  // The alternative — falling back to the lifetime figure — would label an
+  // all-time number as a five-hour one, which is the one answer that misleads
+  // rather than merely disappoints.
+  assert.deepEqual(usageFor({ requests: 7, inputTokens: 5 }, '24h'), { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0 });
+  assert.deepEqual(usageFor(null, '5h'), { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0 });
+  assert.deepEqual(usageFor(undefined, 'total'), { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0 });
+});
+
+test('every offered view names a window the tracker actually keeps', () => {
+  // The buttons are derived from USAGE_WINDOWS rather than listed twice: a
+  // renamed window must not leave behind a button that reads zero for everyone.
+  assert.equal(USAGE_VIEWS[0].key, 'total');
+  assert.deepEqual(USAGE_VIEWS.slice(1).map(v => v.key), Object.keys(USAGE_WINDOWS));
+  for (const view of USAGE_VIEWS) assert.ok(view.label, 'every view carries a button label');
+});
+
+test('the page ships the view list it renders buttons from', () => {
+  assert.ok(renderDashboardHtml().includes(`var USAGE_VIEWS = ${JSON.stringify(USAGE_VIEWS)};`));
+});
+
+test('selecting a window relabels every table it governs', async () => {
+  const page = bootPage();
+  const windows = { '5h': { requests: 1, connections: 0, inputTokens: 10, outputTokens: 2 },
+    '24h': { requests: 9, connections: 0, inputTokens: 900, outputTokens: 40 } };
+  await page.answer(200, {
+    accounts: [],
+    clients: { alice: { requests: 99, connections: 0, inputTokens: 9000, outputTokens: 400, lastUsed: new Date().toISOString(), windows } },
+    usageDimensions: { project: { widgets: { requests: 99, inputTokens: 9000, outputTokens: 400, windows } } },
+  });
+
+  assert.equal(page.byId('clientsHeading').textContent, 'Clients');
+  assert.equal(page.labelled('Last used'), 2, 'both tables label the column plainly under Total');
+  assert.equal(page.labelled('Project'), 2, 'the dimension heading and its first column');
+
+  page.click('Last 24h');
+
+  // The heading is what stops a windowed figure being read as a lifetime one
+  // once the control itself is scrolled out of view.
+  assert.equal(page.byId('clientsHeading').textContent, 'Clients · last 24h');
+  assert.equal(page.labelled('Project · last 24h'), 1, 'the dimension table names the window too');
+  assert.equal(page.labelled('Last used (all time)'), 2, 'and the one lifetime column says so');
+  assert.equal(page.labelled('Last used'), 0);
+
+  page.click('Total');
+  assert.equal(page.byId('clientsHeading').textContent, 'Clients', 'and back again');
 });
