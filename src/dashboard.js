@@ -360,6 +360,50 @@ export function thresholdOutcome(res) {
 // What to tell the operator afterwards. The endpoint answers `ok` for the choice
 // being recorded and `eligible` for whether traffic will actually follow it —
 // two different things, and a bare "done" would be a lie for a spent target.
+/**
+ * POST for an account control. `spec` is {place}/{priority} for a priority
+ * move, or {disabled} to take an account out of rotation or put it back.
+ *
+ * @param {any} name
+ * @param {{ place?: string, priority?: number, disabled?: boolean }} spec
+ * @param {string|null} key
+ */
+export function accountControlRequest(name, spec, key) {
+  var isPriority = spec.disabled === undefined;
+  /** @type {{ account: any, place?: any, priority?: any, disabled?: any }} */
+  var body = { account: name };
+  if (isPriority) {
+    if (spec.place) body.place = spec.place;
+    else body.priority = spec.priority;
+  } else {
+    body.disabled = spec.disabled;
+  }
+  return {
+    url: isPriority ? '/teamclaude/priority' : '/teamclaude/disable',
+    init: {
+      method: 'POST',
+      headers: { 'x-api-key': key || '', 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    },
+  };
+}
+
+/**
+ * What to tell the operator afterwards. A priority move reports the number it
+ * landed on, which is the part the caller did not choose when it asked for
+ * 'first' or 'last'.
+ *
+ * @param {any} res
+ * @param {{ place?: string, priority?: number, disabled?: boolean }} spec
+ */
+export function accountControlOutcome(res, spec) {
+  if (!res || !res.ok) return { kind: 'error', text: 'change failed' + (res && res.error ? ': ' + res.error : '') };
+  if (spec.disabled !== undefined) {
+    return { kind: 'ok', text: (res.disabled ? 'disabled ' : 'enabled ') + res.name };
+  }
+  return { kind: 'ok', text: res.name + ' priority ' + res.priority };
+}
+
 export function switchOutcome(res) {
   if (!res || !res.ok) return { kind: 'error', text: 'switch failed' + (res && res.error ? ': ' + res.error : '') };
   if (res.eligible === false) return { kind: 'warn', text: 'switched to ' + res.account + ', but rotation will not use it' + (res.reason ? ': ' + res.reason : '') };
@@ -522,7 +566,7 @@ export function problems(status) {
 
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
-  switchRequest, switchOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems,
+  switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -776,6 +820,24 @@ ${SHARED_HELPERS}
       var btn = el('button', 'act', 'switch');
       btn.addEventListener('click', function () { doSwitch(a.name, btn); });
       head.appendChild(btn);
+    }
+    // Account controls, in the order an operator reaches for them: take it out
+    // of rotation, or move where rotation reaches it. Only the enable/disable
+    // control is shown for a disabled account — the rest would be moving an
+    // account that nothing will select anyway.
+    // Named ctl* deliberately: var is function-scoped, and this builder already
+    // declares a "last" further down (the last-used string). A button named
+    // last here is overwritten by that before any click can fire.
+    var ctlDisable = el('button', 'act', a.disabled ? 'enable' : 'disable');
+    ctlDisable.addEventListener('click', function () { doControlAccount(a.name, { disabled: !a.disabled }, ctlDisable); });
+    head.appendChild(ctlDisable);
+    if (!a.disabled) {
+      var ctlFirst = el('button', 'act', 'prioritize');
+      ctlFirst.addEventListener('click', function () { doControlAccount(a.name, { place: 'first' }, ctlFirst); });
+      head.appendChild(ctlFirst);
+      var ctlLast = el('button', 'act', 'deprioritize');
+      ctlLast.addEventListener('click', function () { doControlAccount(a.name, { place: 'last' }, ctlLast); });
+      head.appendChild(ctlLast);
     }
     card.appendChild(head);
     if (a.unavailable) card.appendChild(el('div', 'blocked', 'blocked: ' + (UNAVAILABLE_TEXT[a.unavailable] || a.unavailable)));
@@ -1087,6 +1149,27 @@ ${SHARED_HELPERS}
         poll();
       })
       .catch(function (e) { note('error', 'switch failed: ' + e.message); btn.disabled = false; });
+  }
+
+  function doControlAccount(name, spec, btn) {
+    btn.disabled = true;
+    var r = accountControlRequest(name, spec, localStorage.getItem(KEY));
+    fetch(r.url, r.init)
+      .then(function (res) {
+        if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
+        return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
+      })
+      .then(function (json) {
+        if (!json) return;
+        var out = accountControlOutcome(json, spec);
+        note(out.kind, out.text);
+        poll();
+      })
+      .catch(function (e) { note('error', 'change failed: ' + e.message); })
+      // Unlike doSwitch, always re-enabled: the card is rebuilt by the poll
+      // above, and a button that stayed dead after a refused change would be
+      // the only control an operator could not retry.
+      .finally(function () { btn.disabled = false; });
   }
 
   // The one control here that writes a setting rather than nudging the running

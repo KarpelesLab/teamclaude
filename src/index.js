@@ -63,6 +63,8 @@ import {
   thresholdRatio,
   thresholdTable,
   upsertRoute,
+  setAccountDisabled,
+  setAccountPriority,
 } from './config-ops.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
@@ -656,6 +658,26 @@ async function serverCommand() {
   // Expose reload to the proxy's control endpoint (works with or without TUI).
   hooks.reload = reloadAccounts;
   hooks.persistAccounts = () => atomicConfigUpdate(mergeAccountsOnto);
+
+  // Account controls for the dashboard's POST /teamclaude/{priority,disable}.
+  // Written through atomicConfigUpdate under the config lock, so a concurrent
+  // TUI edit cannot be clobbered and an op that throws leaves the file as it
+  // was. The endpoint runs hooks.reload afterwards, which is what makes the
+  // change take effect live — not done here, so a failed reload is reported
+  // separately from a refused write.
+  hooks.setAccountPriority = async (/** @type {string} */ account, /** @type {any} */ spec) => {
+    /** @type {{ name: string, priority: number }|undefined} */
+    let result;
+    await atomicConfigUpdate((/** @type {any} */ diskConfig) => { result = setAccountPriority(diskConfig, account, spec); });
+    return result;
+  };
+  hooks.setAccountDisabled = async (/** @type {string} */ account, /** @type {boolean} */ disabled, /** @type {any} */ spec) => {
+    /** @type {{ name: string, disabled: boolean }|undefined} */
+    let result;
+    await atomicConfigUpdate((/** @type {any} */ diskConfig) => { result = setAccountDisabled(diskConfig, account, disabled, spec); });
+    return result;
+  };
+
   // Whether one of a Codex account's free rate-limit reset credits should be
   // spent to undo a spent weekly window. Wired as a hook rather than reached
   // from the request path directly: the forwarding path stays ignorant of a

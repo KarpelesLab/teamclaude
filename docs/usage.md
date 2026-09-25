@@ -80,7 +80,7 @@ It is a setting, not a nudge: the number is written to the config file (under it
 
 You usually don't need to call it directly. `login`, `import`, `enable`, `disable`, `priority`, `route`, `threshold`, `distribute`, `probe` and `warmup` notify a running server themselves.
 
-Control-plane **writes** (`reload`, `switch`, `threshold`) are refused when the request carries a browser `Origin` or a cross-site `Sec-Fetch-Site`. Loopback is exempt from the proxy API key so the CLI needs no configuration, but that exemption also covers any web page you happen to visit: a page can POST to `127.0.0.1` cross-origin without a preflight, and while it cannot read the reply, the write would still land. `curl` and the CLI send neither header and are unaffected. Reads (`status`) are not restricted — the same-origin policy already stops a page from seeing the response.
+Control-plane **writes** (`reload`, `switch`, `threshold`, `priority`, `disable`) are refused when the request carries a browser `Origin` or a cross-site `Sec-Fetch-Site`. Loopback is exempt from the proxy API key so the CLI needs no configuration, but that exemption also covers any web page you happen to visit: a page can POST to `127.0.0.1` cross-origin without a preflight, and while it cannot read the reply, the write would still land. `curl` and the CLI send neither header and are unaffected. Reads (`status`) are not restricted — the same-origin policy already stops a page from seeing the response.
 
 `GET /teamclaude/quota` is the compact read endpoint for status-line integrations. It returns tier-weighted fleet aggregates and the underlying per-account limits; see [Fleet quota endpoint](quota.md#fleet-quota-endpoint).
 
@@ -99,6 +99,17 @@ As in the TUI, the choice is a weak preference rather than a lock, and it is wor
 Switched to "me@example.com"
 Warning: "me@example.com" is disabled, so requests will not route to it until that changes.
 ```
+
+Taking an account out of rotation, or moving it in the priority order, has a headless path too — the web equivalent of `teamclaude disable` / `enable` and `teamclaude priority --first` / `--last`, and what the browser dashboard's buttons call:
+
+```bash
+curl -X POST http://localhost:3456/teamclaude/disable \
+  -H 'content-type: application/json' -d '{"account": "me@example.com", "disabled": true}'
+curl -X POST http://localhost:3456/teamclaude/priority \
+  -H 'content-type: application/json' -d '{"account": "me@example.com", "place": "first"}'
+```
+
+`POST /teamclaude/priority` takes `{"account", "place": "first" | "last"}` or `{"account", "priority": <integer>}`; `POST /teamclaude/disable` takes `{"account", "disabled": true | false}`. Both accept an optional `"org"` (name or uuid) for an email that holds accounts in several orgs — an ambiguous name is refused rather than guessed. Unlike `switch`, these are config **writes**: the change is saved to the config file under the same lock the TUI uses, and the server reloads itself afterwards, so it survives a restart. `place` is relative — `first` lands one below the lowest priority in the fleet, `last` one above the highest — and the reply carries the account as it now stands (`{"ok": true, "name": ..., "priority": ...}` or `{"ok": true, "name": ..., "disabled": ...}`), so a caller learns the number it did not choose. An unknown or ambiguous account, or a priority that is not an integer, is a `400` with the reason; a write that landed but whose reload failed is a `500` that says so, since the file did change. A request authenticated with a `proxy.clientKeys` entry is refused with `403`: a client key is for using the fleet, not for changing which accounts it contains. Use the shared proxy key, or call from the proxy's own machine.
 
 ### TUI keyboard shortcuts
 
@@ -231,6 +242,8 @@ A **Routing** table above the accounts shows, for Fable, Sonnet, and any configu
 Each account card has a **switch** button that makes that account the current one (the same `POST /teamclaude/switch` the CLI uses). It is a nudge, not a pin: normal rotation resumes from there. What happens to traffic already running depends on `distributeSessions` — with it on, a conversation pinned to another account keeps it until it goes idle, so the badge moves before the traffic does; with it off (the default), everything follows the switch on its next request. The page reports whether rotation will actually use the target: a disabled, errored, rate-limited, or over-threshold account — or one outranked by a higher-priority account — is still switched to, but the page says so and why rather than reporting a bare "done".
 
 A **Switch at __ %** control on the actions row sets the fleet-wide switch threshold, the utilization at which rotation leaves an account — the same setting as `teamclaude threshold <1-100>` and the TUI's settings screen, sent as `POST /teamclaude/threshold` with a `{"percent": 1-100}` body. Unlike the switch button this writes the config file and reloads, so it holds across a restart. One number replaces a per-bucket `switchThreshold` table, and the page says which buckets were dropped; per-account `accounts[].switchThreshold` overrides are untouched. The field follows changes made from the CLI, the TUI or another browser on the next poll, except while you are typing in it. A dashboard opened with a `proxy.clientKeys` key may not call it — the server answers 403, since a client key is a tenant of the proxy rather than its operator.
+
+Beside it, each card has an **enable** / **disable** button (`POST /teamclaude/disable`) and, for an enabled account, **prioritize** and **deprioritize** (`POST /teamclaude/priority` with `place: "first"` / `"last"`). Unlike switch, these write the config file and reload the server — the same as `teamclaude disable`, `enable` and `priority --first` / `--last` — so they persist across restarts. A disabled account shows only the enable button: reordering an account that nothing will select is a control that looks like it does something and does not. The note under the cards reports the priority the account landed on, since a relative move picks a number the operator did not type. Both are refused when the page holds a `proxy.clientKeys` key rather than the shared proxy key; see the endpoint notes above.
 
 
 ```

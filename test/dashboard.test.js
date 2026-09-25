@@ -8,7 +8,7 @@ import {
   renderDashboardHtml, dashboardCsp, scopedWeeklyRows, accountTokens,
   accountBadges, thresholdBadgeText,
   sessionRows, filterSessionRows, sortRows, uniqSorted,
-  switchRequest, switchOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
+  switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
   thresholdRequest, thresholdPercentText, thresholdOutcome,
 } from '../src/dashboard.js';
 
@@ -670,7 +670,7 @@ test('the page ships the same helper implementations it is tested against', () =
   // The serialization is the contract: if a helper stops being self-contained
   // (closes over module scope), the page would silently ReferenceError.
   const html = renderDashboardHtml();
-  for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems]) {
+  for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
@@ -795,4 +795,46 @@ test('GET /teamclaude/dashboard serves HTML without a key; other methods are a l
     proxy.close();
     upstream.close();
   }
+});
+
+test('accountControlRequest picks the endpoint and body from the spec', () => {
+  // A relative move sends `place` and no number: the caller has buttons, not a
+  // number field, and the server is the one that knows the other priorities.
+  const first = accountControlRequest('a@x.com', { place: 'first' }, 'k');
+  assert.equal(first.url, '/teamclaude/priority');
+  assert.deepEqual(JSON.parse(first.init.body), { account: 'a@x.com', place: 'first' });
+  assert.equal(first.init.headers['x-api-key'], 'k');
+
+  const exact = accountControlRequest('a@x.com', { priority: 3 }, 'k');
+  assert.deepEqual(JSON.parse(exact.init.body), { account: 'a@x.com', priority: 3 });
+
+  // disabled:false is a real value, not an absent one — it must still route to
+  // the disable endpoint rather than being read as a priority change.
+  const off = accountControlRequest('a@x.com', { disabled: true }, 'k');
+  assert.equal(off.url, '/teamclaude/disable');
+  assert.deepEqual(JSON.parse(off.init.body), { account: 'a@x.com', disabled: true });
+  const on = accountControlRequest('a@x.com', { disabled: false }, 'k');
+  assert.equal(on.url, '/teamclaude/disable');
+  assert.deepEqual(JSON.parse(on.init.body), { account: 'a@x.com', disabled: false });
+
+  // No key configured is not an error here; the server decides.
+  assert.equal(accountControlRequest('a@x.com', { place: 'last' }, null).init.headers['x-api-key'], '');
+});
+
+test('accountControlOutcome reports the number a relative move landed on', () => {
+  assert.deepEqual(
+    accountControlOutcome({ ok: true, name: 'a@x.com', priority: -1 }, { place: 'first' }),
+    { kind: 'ok', text: 'a@x.com priority -1' });
+  assert.deepEqual(
+    accountControlOutcome({ ok: true, name: 'a@x.com', disabled: true }, { disabled: true }),
+    { kind: 'ok', text: 'disabled a@x.com' });
+  assert.deepEqual(
+    accountControlOutcome({ ok: true, name: 'a@x.com', disabled: false }, { disabled: false }),
+    { kind: 'ok', text: 'enabled a@x.com' });
+  assert.deepEqual(
+    accountControlOutcome({ ok: false, error: 'no account matches "z"' }, { place: 'first' }),
+    { kind: 'error', text: 'change failed: no account matches "z"' });
+  assert.deepEqual(
+    accountControlOutcome(null, { place: 'first' }),
+    { kind: 'error', text: 'change failed' });
 });
