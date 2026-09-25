@@ -57,7 +57,7 @@ export function cacheControlSubfieldsToStrip(stripRequestFields) {
  * @param {unknown} url
  * @param {string|undefined} contentType
  */
-function isMessagesRequest(url, contentType) {
+export function isMessagesRequest(url, contentType) {
   if (typeof url !== 'string' || !url.includes(MESSAGES_PATH)) return false;
   if (contentType && !/json/i.test(contentType)) return false;
   return true;
@@ -66,7 +66,7 @@ function isMessagesRequest(url, contentType) {
 /**
  * @param {unknown} v
  */
-function isPlainObject(v) {
+export function isPlainObject(v) {
   return !!v && typeof v === 'object' && !Array.isArray(v);
 }
 
