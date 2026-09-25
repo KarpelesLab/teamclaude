@@ -1,14 +1,16 @@
 import { importCredentials } from './oauth.js';
 import { sameIdentity } from './identity.js';
 import { safeLine } from './safe-text.js';
-import { removedAccountIds } from './account-pairing.js';
+import { removedAccountIds, addedAccountIds, configIndexFor } from './account-pairing.js';
 import { ensureAccountIds } from './account-id.js';
-import { accountSwitchThreshold } from './account-manager.js';
+import { accountSwitchThreshold, accountAllowsExtraUsage, accountRouting } from './account-manager.js';
+import { localListener } from './upstream-proxy.js';
 
 /**
  * Sync accounts from disk config: add new accounts and refresh credentials
  * for existing ones (handles re-imported OAuth tokens, rotated API keys, etc.).
- * Returns the number of new accounts added.
+ * Returns { added, removed }: accounts picked up from disk, and running
+ * accounts dropped because their disk entry is gone.
  * @param {Record<string, any>} diskConfig
  * @param {Record<string, any>} memConfig
  * @param {import('./account-manager.js').AccountManager} accountManager
@@ -112,6 +114,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     // operator decision about a running fleet, and waiting for a restart to
     // honour a budget defeats the budget.
     mgr.maxUsage = diskAcct.maxUsage ?? null;
+    mgr.maxSpend = diskAcct.maxSpend ?? null;
     // Same for a per-account switch threshold (#409): thresholdFor() reads it
     // straight off the account, so a disk edit takes effect on the very next
     // selection without a restart, exactly like the fleet-wide setting does.
@@ -119,6 +122,27 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     // and reported here as it would be at startup. The config entry below keeps
     // the operator's text as written: this only decides what the gate reads.
     mgr.switchThreshold = accountSwitchThreshold(diskAcct);
+    // Same for the extra-usage opt-in, and more so: it decides whether the
+    // fleet may spend money, so turning it off on disk must stop that now.
+    // Through the constructor's own test, so an entry the fallback cannot bill
+    // (an API key, a third-party backend, a Codex login) stays opted out on
+    // reload as it was at startup; the warning was makeAccount's to give.
+    mgr.allowExtraUsage = accountAllowsExtraUsage(diskAcct);
+    // Same for a per-account routing proxy: it is read per request off this
+    // object (server.js forwardRequest, ensureTokenFresh, the prober), so a
+    // disk edit or a `teamclaude routing` change takes effect on the very next
+    // request without a restart. Through the constructor's own parse, so a bad
+    // URL is refused and reported here as it would be at startup, and so is
+    // one that points back at this server's own listener (memConfig's port is
+    // the one the server is bound to; a port edit on disk needs a restart).
+    accountManager.setRouting(mgr.index, accountRouting(diskAcct, localListener(memConfig)));
+    // Read at the moment a refusal asks whether to spend a reset credit, so a
+    // disk edit must land here to bind — and an operator who has just exempted
+    // an account is doing so precisely because they do not want the next
+    // refusal to spend its credit. Negative-only (see makeAccount): only `false`
+    // says anything, so removing the key returns the account to following the
+    // fleet-wide `autoRedeemResets`.
+    mgr.autoRedeemReset = diskAcct.autoRedeemReset !== false;
     // Third-party-backend bindings are read per request off this object
     // (`account.upstream || upstream`, `account.modelMap` in server.js), so a
     // disk edit must land here to take effect on reload. `|| null` mirrors the
@@ -150,12 +174,20 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       if (diskAcct.stripRequestFields) cfgAcct.stripRequestFields = diskAcct.stripRequestFields; else delete cfgAcct.stripRequestFields;
       if (diskAcct.messageThreads === true) cfgAcct.messageThreads = true; else delete cfgAcct.messageThreads;
       if (diskAcct.maxUsage != null) cfgAcct.maxUsage = diskAcct.maxUsage; else delete cfgAcct.maxUsage;
+      if (diskAcct.maxSpend != null) cfgAcct.maxSpend = diskAcct.maxSpend; else delete cfgAcct.maxSpend;
       if (diskAcct.switchThreshold != null) cfgAcct.switchThreshold = diskAcct.switchThreshold; else delete cfgAcct.switchThreshold;
+      if (diskAcct.routing) cfgAcct.routing = diskAcct.routing; else delete cfgAcct.routing;
       if (diskAcct.priority != null) cfgAcct.priority = diskAcct.priority; else delete cfgAcct.priority;
       // The TUI's reorder writes this key onto the entry, so after one
       // arrangement every entry carries a value for a hand edit to lose to.
       if (Number.isFinite(diskAcct.displayOrder)) cfgAcct.displayOrder = diskAcct.displayOrder; else delete cfgAcct.displayOrder;
       if (diskAcct.disabled) cfgAcct.disabled = true; else delete cfgAcct.disabled;
+      if (diskAcct.allowExtraUsage === true) cfgAcct.allowExtraUsage = true; else delete cfgAcct.allowExtraUsage;
+      // Both polarities are mirrored, unlike the flags above: `false` is the
+      // side of this key that does something, so a stale mirror of either value
+      // would win the save stencil's spread and undo the disk edit.
+      if (typeof diskAcct.autoRedeemReset === 'boolean') cfgAcct.autoRedeemReset = diskAcct.autoRedeemReset;
+      else delete cfgAcct.autoRedeemReset;
     }
     // Pick up enable/disable toggles; re-enabling clears a stuck error state.
     const wantDisabled = !!diskAcct.disabled;
@@ -196,5 +228,35 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       console.log(`[TeamClaude] Updated API key for "${safeLine(mgr.name, 64)}"`);
     }
   }
-  return added;
+  // Accounts running here that no disk row claims any more were removed on
+  // disk (a `teamclaude remove` from another process, or a hand edit). A reload
+  // used to add only and leave them serving until the next restart, so an
+  // operator's removal did not take effect when they asked for it. Drop them
+  // from the manager and from the in-memory config, highest index first so
+  // the indices already claimed stay valid. The TUI's own in-flight removal
+  // (memory first, disk second) is the opposite direction and untouched.
+  //
+  // The mirror image of the removal window above: the TUI and the MCP endpoint
+  // add into memory first and save second, so a reload landing between the two
+  // finds a running account the file does not list yet. Those ids are recorded
+  // for exactly that window (cleared once the save lands), and an account
+  // naming one is the addition itself, not a removal.
+  //
+  // The config row goes by id (configIndexFor), resolved before removeAccount
+  // splices and renumbers the manager list — the same order the TUI's remove
+  // uses. Matching by identity instead could take a namesake's row: the two
+  // lists are not positionally aligned, and resolveAccounts may have dropped a
+  // credential-less entry that agrees with this account on everything else.
+  const pendingAdds = addedAccountIds(memConfig);
+  let dropped = 0;
+  for (let i = accountManager.accounts.length - 1; i >= 0; i--) {
+    const gone = accountManager.accounts[i];
+    if (claimed.has(i) || pendingAdds.has(gone.id)) continue;
+    const cfgIdx = configIndexFor(memConfig.accounts, accountManager.accounts, i);
+    console.log(`[TeamClaude] Removed account "${safeLine(gone.name, 64)}": its config entry is gone from disk`);
+    accountManager.removeAccount(i);
+    if (cfgIdx >= 0) memConfig.accounts.splice(cfgIdx, 1);
+    dropped++;
+  }
+  return { added, removed: dropped };
 }

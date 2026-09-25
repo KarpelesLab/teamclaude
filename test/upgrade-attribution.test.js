@@ -5,7 +5,7 @@ import net from 'node:net';
 import { createHash } from 'node:crypto';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
-import { ClientUsageTracker } from '../src/client-usage.js';
+import { ClientUsageTracker, USAGE_WINDOWS } from '../src/client-usage.js';
 
 // The upgrade gate resolved a client identity and the handler threw it away,
 // so a WebSocket handshake authenticated with a clientKeys entry was relayed
@@ -80,8 +80,15 @@ test('a handshake authenticated with a client key is booked as that client\'s co
       const { buf, close } = await handshake('alice-key');
       assert.match(buf, /^HTTP\/1\.1 101/, 'the channel opened');
       await tick();
+      // `windows` joined this shape when the tracker began tallying per slot.
+      // Asserted in full rather than skipped: the window must book the
+      // handshake exactly as the lifetime counters do — as a connection, and
+      // still not as a request.
+      const booked = { requests: 0, connections: 1, inputTokens: 0, outputTokens: 0 };
       assert.deepEqual(tracker.export().alice, {
-        requests: 0, connections: 1, inputTokens: 0, outputTokens: 0, lastUsed: tracker.export().alice.lastUsed,
+        ...booked,
+        lastUsed: tracker.export().alice.lastUsed,
+        windows: Object.fromEntries(Object.keys(USAGE_WINDOWS).map(label => [label, { ...booked }])),
       });
       assert.ok(tracker.export().alice.lastUsed, 'a connection is use');
       await close();

@@ -4,6 +4,7 @@ import { atomicConfigUpdate } from './config.js';
 import {
   ConfigOpError,
   DISTRIBUTE_MODES,
+  QUOTA_BUCKETS,
   removeRoute,
   setBlockedModels,
   setBucketThresholds,
@@ -21,6 +22,8 @@ import { WEEKLY_BUCKET_KEYS } from './model.js';
 import { sanitizeText } from './safe-text.js';
 import { currentVersion } from './updater.js';
 import { upstreamPoolStatus } from './upstream-fetch.js';
+import { parseRoutingUrl, routingToUrl, describeRouting, maskRoutingUrl } from './account-routing.js';
+import { isSelfProxy, localListener } from './upstream-proxy.js';
 
 /**
  * The management tools served at /teamclaude/mcp, and the `proxy.mcp` gate in
@@ -39,9 +42,12 @@ import { upstreamPoolStatus } from './upstream-fetch.js';
  *   properties?: Record<string, Record<string, any>>,
  *   required?: string[],
  *   write?: boolean,
+ *   auditArgs?: (args: Record<string, any>) => Record<string, any>,
  *   run: (args: Record<string, any>, ctx: ToolContext) => Record<string, any>|Promise<Record<string, any>>,
  * }} Tool `run` throws a ToolFailure or ConfigOpError to refuse with a message
  *   the caller may read; any other exception is reported without its text.
+ *   `auditArgs` is what the write log prints in place of the arguments, for a
+ *   tool whose arguments hold a secret.
  */
 
 const INVALID_PARAMS = -32602;
@@ -111,6 +117,8 @@ function fleetStatus({ accountManager, hooks }) {
         priority: a.priority,
         disabled: a.disabled,
         status: a.status,
+        // Already password-masked by the status payload.
+        ...(a.routing ? { routing: a.routing } : {}),
         current: index === accountManager.currentIndex,
         ...accountManager.eligibility(index),
         sessions: a.sessions,
@@ -185,9 +193,9 @@ function accountIndexFor({ accountManager }, { account, org }) {
 
 /**
  * Change one account in the running fleet and in its config entry, then save,
- * the way the TUI does. Not a file edit plus reload: a reload never drops an
- * account, and it applies a disk-side priority or disabled flag to the manager
- * without mirroring it onto the entry the next save is built from.
+ * the way the TUI does. Not a file edit plus reload: a reload applies a
+ * disk-side priority or disabled flag to the manager without mirroring it onto
+ * the entry the next save is built from.
  * @param {ToolContext} ctx
  * @param {Record<string, any>} args
  * @param {(index: number, entry: Record<string, any>|null, entryIndex: number) => void} mutate
@@ -254,11 +262,12 @@ const WRITE_TOOLS = [
   {
     name: 'reload_config',
     title: 'Reload config',
-    description: 'Re-read the config file and apply it to the running server without a restart: accounts added or edited on disk, client keys, routes, thresholds and the other settings. Returns how many accounts were added.',
+    description: 'Re-read the config file and apply it to the running server without a restart: accounts added, removed or edited on disk, client keys, routes, thresholds and the other settings. Returns how many accounts were added and how many were removed.',
     write: true,
     run: async (_args, { hooks }) => {
       if (!hooks.reload) throw new ToolFailure('reload is not available on this server');
-      return { added: (await hooks.reload()) || 0 };
+      const r = await hooks.reload();
+      return { added: r?.added || 0, removed: r?.removed || 0 };
     },
   },
   {
@@ -299,6 +308,41 @@ const WRITE_TOOLS = [
     }).then(outcome => ({ ...outcome, priority: args.priority })),
   },
   {
+    name: 'set_account_routing',
+    title: 'Set or clear account routing',
+    description: 'Pin one account\'s egress to its own proxy: EVERY connection for it (completions, token refresh, profile and quota) tunnels through, no other account is touched, and the account bypasses the fleet upstream proxy and sx. URL schemes: http (CONNECT), socks4, socks4a, socks5, socks5h (a/h resolve hostnames at the proxy), optional user:pass@ auth — e.g. socks5h://alice:s3cret@proxy.example.com:1080. An empty value (or "none"/"off") clears it back to the fleet egress. Saved to the config file.',
+    properties: { ...ACCOUNT_ARGS, routing: { type: 'string', description: 'The proxy URL, or an empty value / "none" / "off" to clear' } },
+    required: ['account', 'routing'],
+    write: true,
+    // The URL carries the proxy password, and the write log is not a place for it.
+    auditArgs: args => ({ ...args, routing: maskRoutingUrl(args.routing) }),
+    run: (args, ctx) => {
+      /** @type {import('./account-routing.js').RoutingProxy|null} */
+      let routing = null;
+      if (!/^\s*(|none|off|-)$/i.test(String(args.routing ?? ''))) {
+        try {
+          routing = parseRoutingUrl(String(args.routing));
+        } catch (/** @type {any} */ err) {
+          throw new ToolFailure(err?.message || String(err));
+        }
+        // This server's own listener: a request tunnelled through it would
+        // come straight back in (the MITM listener intercepts the upstream
+        // host). The server drops such a routing on load anyway, so saving it
+        // would only store a value it then ignores.
+        if (isSelfProxy(routing, localListener(ctx.config))) {
+          throw new ToolFailure(`${describeRouting(routing)} is this server's own address; routing an account through it would loop back into this proxy`);
+        }
+      }
+      return changeAccount(ctx, args, (index, entry) => {
+        ctx.accountManager.setRouting(index, routing);
+        // Null, not a deleted key: the save merges over the on-disk entry, and
+        // a missing key leaves a stale `routing` standing (the same reason
+        // set_account_enabled writes an explicit boolean).
+        if (entry) entry.routing = routing ? routingToUrl(routing) : null;
+      }).then(outcome => ({ ...outcome, routing: describeRouting(routing) }));
+    },
+  },
+  {
     name: 'remove_account',
     title: 'Remove account',
     description: 'Remove an account from the fleet and from the config file, credentials included. There is no undo; disable it instead when in doubt.',
@@ -321,7 +365,14 @@ const WRITE_TOOLS = [
     description: 'The utilization (1-100 percent) at which rotation leaves an account. Give `percent` for one number governing every quota bucket, or `buckets` with a percentage per bucket (null drops that bucket\'s override); the bucket names are those get_settings shows under switchThreshold. Saved and applied live.',
     properties: {
       percent: { type: 'number' },
-      buckets: { type: 'object', description: 'e.g. {"unified7d": 90, "unified5h": null}' },
+      buckets: {
+        type: 'object',
+        description: 'e.g. {"unified7d": 90, "unified5h": null}',
+        // The validator already refuses any other key; saying so here lets the
+        // model pick a valid bucket without a refusal round trip.
+        propertyNames: { enum: ['default', ...QUOTA_BUCKETS] },
+        additionalProperties: { type: ['number', 'null'] },
+      },
     },
     write: true,
     run: (args, ctx) => {
@@ -391,8 +442,8 @@ const WRITE_TOOLS = [
     description: 'Pin model ids matching the globs in `match` to the accounts in `accounts` (names, or indexes written as strings; omit to route to every account). Replaces a route already holding the name. `bucket` overrides the quota bucket the route is judged by; `color` tints its TUI marker. Saved and applied live.',
     properties: {
       name: { type: 'string' },
-      match: { type: 'array', description: 'Model id globs, e.g. ["claude-opus-*"]' },
-      accounts: { type: 'array', description: 'Account names, or indexes as strings, e.g. ["0", "work@example.com"]' },
+      match: { type: 'array', items: { type: 'string' }, description: 'Model id globs, e.g. ["claude-opus-*"]' },
+      accounts: { type: 'array', items: { type: 'string' }, description: 'Account names, or indexes as strings, e.g. ["0", "work@example.com"]' },
       bucket: { type: 'string', enum: [...WEEKLY_BUCKET_KEYS] },
       color: { type: 'string' },
     },
@@ -413,7 +464,7 @@ const WRITE_TOOLS = [
     name: 'set_blocked_models',
     title: 'Set blocked models',
     description: 'Replace the list of model-id globs the proxy refuses outright. Saved and applied live.',
-    properties: { patterns: { type: 'array' } },
+    properties: { patterns: { type: 'array', items: { type: 'string' } } },
     required: ['patterns'],
     write: true,
     run: (args, ctx) => changeSetting(ctx, disk => { setBlockedModels(disk, args.patterns); return { blockedModels: disk.blockedModels }; }),
@@ -442,6 +493,14 @@ let writeQueue = Promise.resolve();
 // that one turn the stale-read re-add above is possible again. A permanent
 // wedge is worse.
 const WRITE_TIMEOUT_MS = 60_000;
+
+// How many writes may wait their turn. A client that loops tool calls would
+// otherwise stack up every one of them, each holding its request open for up
+// to WRITE_TIMEOUT_MS after the one before. Past the cap a call is refused at
+// once with a tool error the model can read and retry later. Counted across
+// every tool set in the process, as the queue itself is.
+const WRITE_QUEUE_DEPTH = 8;
+let writesPending = 0;
 
 /**
  * `pending`, or a tool error once `ms` have passed without it settling. The
@@ -503,25 +562,35 @@ function argumentProblem(tool, args) {
  * are not merely hidden: a call to one is an unknown tool.
  * @param {'read'|'full'} mode
  * @param {ToolContext} ctx
- * @param {{ writeTimeoutMs?: number }} [options]
+ * @param {{ writeTimeoutMs?: number, writeQueueDepth?: number }} [options]
  * @returns {import('./mcp.js').ToolSet}
  */
-export function createToolSet(mode, ctx, { writeTimeoutMs = WRITE_TIMEOUT_MS } = {}) {
+export function createToolSet(mode, ctx, { writeTimeoutMs = WRITE_TIMEOUT_MS, writeQueueDepth = WRITE_QUEUE_DEPTH } = {}) {
   const tools = new Map([...READ_TOOLS, ...(mode === 'full' ? WRITE_TOOLS : [])].map(tool => [tool.name, tool]));
+
+  const caller = ctx.client ? sanitizeText(ctx.client) : 'a local caller';
+  /** @type {(tool: Tool, args: Record<string, any>, outcome: string) => void} */
+  const audit = (tool, args, outcome) => {
+    // auditArgs masks what must not reach the log (a proxy password in a routing URL).
+    const shown = tool.auditArgs ? tool.auditArgs(args) : args;
+    console.log(`[TeamClaude] MCP ${tool.name} by ${caller}${outcome}: ${sanitizeText(JSON.stringify(shown)).slice(0, 300)}`);
+  };
 
   /** @type {(tool: Tool, args: Record<string, any>) => Promise<Record<string, any>>} */
   const run = async (tool, args) => {
-    if (tool.write) {
-      console.log(`[TeamClaude] MCP ${tool.name} by ${ctx.client ? sanitizeText(ctx.client) : 'a local caller'}: ${sanitizeText(JSON.stringify(args)).slice(0, 300)}`);
-    }
     try {
       const value = await tool.run(args, ctx);
+      // Logged once the change has landed, as POST /teamclaude/switch does: the
+      // line is a record of what happened, not of what was attempted, so a call
+      // that was refused or blew up never reads like a change that went through.
+      if (tool.write) audit(tool, args, '');
       return { content: [{ type: 'text', text: JSON.stringify(value) }], structuredContent: value };
     } catch (err) {
       /** @type {string} */
       let text;
       if (err instanceof ToolFailure || err instanceof ConfigOpError) {
         text = err.message;
+        if (tool.write) audit(tool, args, ` refused (${sanitizeText(text).slice(0, 120)})`);
       } else {
         // Ours, not the caller's: the detail goes to the log, as the other
         // control endpoints do with a failure that may name paths or accounts.
@@ -557,8 +626,13 @@ export function createToolSet(mode, ctx, { writeTimeoutMs = WRITE_TIMEOUT_MS } =
       const problem = argumentProblem(tool, args);
       if (problem) return { content: [{ type: 'text', text: problem }], isError: true };
       if (!tool.write) return run(tool, args);
+      if (writesPending >= writeQueueDepth) {
+        return { content: [{ type: 'text', text: `${tool.name} refused: ${writesPending} writes are already waiting their turn; try again once they have finished` }], isError: true };
+      }
+      writesPending++;
       const turn = writeQueue.then(() => settleWithin(run(tool, args), writeTimeoutMs, tool.name));
       writeQueue = turn.then(() => {}, () => {});
+      writeQueue.then(() => { writesPending--; });
       return turn;
     },
   };

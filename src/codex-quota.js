@@ -254,3 +254,20 @@ export function parseCodexPlanType(headers) {
   const value = headers?.['x-codex-plan-type'];
   return value ? String(value).trim() || null : null;
 }
+
+/**
+ * The limit that metered this response, from `x-codex-active-limit`. Null when
+ * absent.
+ *
+ * Upstream already spells it the way the usage probe keys `codexModelBuckets`,
+ * so it is kept as sent: a live Pro account answered `premium` for every model,
+ * and a Pro Lite account answered `base_model_inference` for `gpt-reserve`, the
+ * key its probe files the `gpt-reserve` bucket under.
+ *
+ * @param {Record<string, string>} headers Rate-limit headers from the response.
+ * @returns {string|null}
+ */
+export function parseCodexActiveLimit(headers) {
+  const value = headers?.['x-codex-active-limit'];
+  return value ? String(value).trim().toLowerCase() || null : null;
+}

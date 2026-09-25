@@ -4,6 +4,9 @@ import assert from 'node:assert/strict';
 import {
   ConfigOpError,
   MAX_PROBE_SECONDS,
+  resolveConfiguredAccount,
+  setAccountDisabled,
+  setAccountPriority,
   removeRoute,
   setBlockedModels,
   setBucketThresholds,
@@ -220,4 +223,56 @@ test('an array switchThreshold is the default table, not numeric bucket keys', (
   }
   assert.equal(said.length, 1);
   assert.match(said[0], /switchThreshold is an array/);
+});
+
+const acctConfig = () => ({ accounts: [
+  { name: 'a@x.com (Acme)', accountUuid: 'u-1', orgName: 'Acme', priority: 0 },
+  { name: 'a@x.com (Beta)', accountUuid: 'u-1', orgName: 'Beta', priority: 3 },
+  { name: 'solo@x.com', accountUuid: 'u-2', priority: 7 },
+] });
+
+test('resolveConfiguredAccount refuses an ambiguous name rather than picking one', () => {
+  const config = acctConfig();
+  // The same email in two orgs is two different accounts; taking the first
+  // would disable or reprioritize the wrong one.
+  assert.throws(() => resolveConfiguredAccount(config, 'a@x.com'), ConfigOpError);
+  try {
+    resolveConfiguredAccount(config, 'a@x.com');
+  } catch (err) {
+    assert.match(err.message, /matches 2 accounts/);
+    assert.match(err.message, /Acme/);
+    assert.match(err.message, /Beta/);
+  }
+  assert.equal(resolveConfiguredAccount(config, 'a@x.com', 'Acme').orgName, 'Acme');
+  assert.equal(resolveConfiguredAccount(config, 'solo@x.com').name, 'solo@x.com');
+  assert.throws(() => resolveConfiguredAccount(config, 'nobody@x.com'), ConfigOpError);
+  assert.throws(() => resolveConfiguredAccount(config, '  '), ConfigOpError);
+});
+
+test('setAccountPriority places relative to the rest, or takes an exact number', () => {
+  const config = acctConfig();
+  // 'first' is one below the lowest, counting 0 even when nothing sits there.
+  assert.deepEqual(setAccountPriority(config, 'solo@x.com', { place: 'first' }),
+    { name: 'solo@x.com', priority: -1 });
+  assert.deepEqual(setAccountPriority(config, 'solo@x.com', { place: 'last' }),
+    { name: 'solo@x.com', priority: 4 });
+  assert.deepEqual(setAccountPriority(config, 'solo@x.com', { priority: 2 }),
+    { name: 'solo@x.com', priority: 2 });
+  // Zero is a real priority, not a missing one.
+  assert.deepEqual(setAccountPriority(config, 'solo@x.com', { priority: 0 }),
+    { name: 'solo@x.com', priority: 0 });
+  assert.throws(() => setAccountPriority(config, 'solo@x.com', { priority: 1.5 }), ConfigOpError);
+  assert.throws(() => setAccountPriority(config, 'solo@x.com', {}), ConfigOpError);
+  assert.throws(() => setAccountPriority(config, 'a@x.com', { place: 'first' }), ConfigOpError);
+});
+
+test('setAccountDisabled deletes the key when enabling, as the CLI always has', () => {
+  const config = acctConfig();
+  assert.deepEqual(setAccountDisabled(config, 'solo@x.com', true), { name: 'solo@x.com', disabled: true });
+  assert.equal(config.accounts[2].disabled, true);
+  assert.deepEqual(setAccountDisabled(config, 'solo@x.com', false), { name: 'solo@x.com', disabled: false });
+  assert.ok(!('disabled' in config.accounts[2]), 'enabling removes the key rather than writing false');
+  // A throwing op must not have half-applied.
+  assert.throws(() => setAccountDisabled(config, 'solo@x.com', 'yes'), ConfigOpError);
+  assert.ok(!('disabled' in config.accounts[2]));
 });
