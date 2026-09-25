@@ -306,6 +306,10 @@ export function switchRequest(name, key) {
 // The request the threshold control sends. The number goes as typed: what
 // counts as a percentage is the server's rule (1–100, kept to tenths), and a
 // second opinion here would only disagree with it on the edges.
+/**
+ * @param {number|string} percent
+ * @param {string|null|undefined} key
+ */
 export function thresholdRequest(percent, key) {
   return {
     url: '/teamclaude/threshold',
@@ -320,8 +324,9 @@ export function thresholdRequest(percent, key) {
 // The stored 0–1 ratio as the number the control shows. Tenths, and no trailing
 // zero: the setting is quantised to tenths of a percent, so 0.98 must read back
 // as "98" rather than "98.0" for a re-save to be a no-op the operator can see.
+/** @param {unknown} value */
 export function thresholdPercentText(value) {
-  var ratio = value;
+  /** @type {any} */ var ratio = value;
   // A per-bucket table: the control sets one number for every bucket, so what it
   // shows is the default the table falls back to.
   if (ratio && typeof ratio === 'object' && !Array.isArray(ratio)) ratio = ratio.default;
@@ -332,6 +337,10 @@ export function thresholdPercentText(value) {
 // What to tell the operator after a threshold change. `dropped` is the part a
 // bare "saved" would hide: one number replaces a per-bucket table rather than
 // hiding one behind it, and the operator who set those buckets should hear it.
+/**
+ * @param {any} res
+ * @returns {{ kind: string, text: string }}
+ */
 export function thresholdOutcome(res) {
   if (!res || !res.ok) return { kind: 'error', text: 'threshold change failed' + (res && res.error ? ': ' + res.error : '') };
   var pct = thresholdPercentText(res.switchThreshold);

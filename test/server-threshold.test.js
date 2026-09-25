@@ -50,9 +50,10 @@ async function post(port, body) {
 
 /**
  * A server whose config file is a throwaway. `reloads` counts the hook calls so
- * a test can tell "saved" from "applied"; pass `reload` to override it.
+ * a test can tell "saved" from "applied"; pass `reload` to override it, and
+ * `proxy` to give the running server a different proxy section (client keys).
  */
-async function withServer(fn, { configExtra = {}, reload } = {}) {
+async function withServer(fn, { configExtra = {}, reload, proxy = { apiKey: 'tc-test' } } = {}) {
   const path = await writeConfig(configExtra);
   const previous = process.env.TEAMCLAUDE_CONFIG;
   process.env.TEAMCLAUDE_CONFIG = path;
@@ -61,12 +62,12 @@ async function withServer(fn, { configExtra = {}, reload } = {}) {
   const hooks = reload === null ? {} : {
     reload: reload || (async () => { reloads.count++; return 0; }),
   };
-  const proxy = createProxyServer(am, { proxy: { apiKey: 'tc-test' }, upstream: 'https://api.anthropic.com' }, hooks);
-  const port = await listen(proxy);
+  const server = createProxyServer(am, { proxy, upstream: 'https://api.anthropic.com' }, hooks);
+  const port = await listen(server);
   try {
     await fn({ port, path, reloads, am });
   } finally {
-    proxy.close();
+    server.close();
     if (previous === undefined) delete process.env.TEAMCLAUDE_CONFIG;
     else process.env.TEAMCLAUDE_CONFIG = previous;
   }
@@ -177,18 +178,53 @@ test('a reload failure is reported as saved-but-not-applied', async () => {
   }, { reload: async () => { throw new Error('boom'); } });
 });
 
-test('a server with no reload hook says the same thing', async () => {
+test('a server with no reload hook refuses up front and writes nothing', async () => {
   await withServer(async ({ port, path }) => {
     const res = await post(port, JSON.stringify({ percent: 93 }));
-    assert.equal(res.status, 500);
-    assert.match(res.body.error, /saved/);
-    assert.equal(await readStored(path), 0.93, 'it still applies on the next start');
-  }, { reload: null });
+    // Saved-but-never-applied is worse than refused: the file would claim a
+    // number the running fleet ignored. Same answer /probe gives with no prober.
+    assert.equal(res.status, 501);
+    assert.equal(res.body.ok, false);
+    assert.match(res.body.error, /not supported/);
+    assert.equal(await readStored(path), 0.95, 'nothing may be written when it cannot be applied');
+  }, { reload: null, configExtra: { switchThreshold: 0.95 } });
+});
+
+// A client key names a tenant of the proxy, not its operator. It may spend
+// quota and read status, but a setting that governs every account — and can
+// take the whole fleet out of rotation — is the operator's alone. The shared
+// proxy key is the operator's own and stays allowed, as does the key-exempt
+// loopback caller every other test here uses.
+test('a client key is refused; the shared proxy key is not', async () => {
+  const send = (port, key) => fetch(`http://127.0.0.1:${port}/teamclaude/threshold`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-api-key': key },
+    body: JSON.stringify({ percent: 50 }),
+  });
+  await withServer(async ({ port, path, reloads }) => {
+    const refused = await send(port, 'ci-key');
+    assert.equal(refused.status, 403);
+    const body = await refused.json();
+    assert.equal(body.ok, false);
+    assert.match(body.error, /client key/);
+    assert.equal(await readStored(path), 0.95, 'a refused request must not have written the file');
+    assert.equal(reloads.count, 0, 'a refused request must not have been applied');
+
+    const allowed = await send(port, 'tc-test');
+    assert.equal(allowed.status, 200);
+    assert.equal((await allowed.json()).switchThreshold, 0.5);
+    assert.equal(await readStored(path), 0.5);
+    assert.equal(reloads.count, 1);
+  }, {
+    configExtra: { switchThreshold: 0.95 },
+    proxy: { apiKey: 'tc-test', clientKeys: [{ name: 'ci', key: 'ci-key' }] },
+  });
 });
 
 test('the endpoint answers only to POST', async () => {
   await withServer(async ({ port }) => {
     const res = await fetch(`http://127.0.0.1:${port}/teamclaude/threshold`);
-    assert.notEqual(res.status, 200);
+    // An unclaimed control route: the server's catch-all, not a method error.
+    assert.equal(res.status, 404);
   });
 });
