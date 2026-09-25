@@ -110,7 +110,7 @@ curl -X POST http://localhost:3456/teamclaude/priority \
 | `d` | Enable/disable an account |
 | `p` | Refresh quota on all accounts (one-shot probe of the zero-spend usage endpoint) |
 | `R` | Reload accounts from config |
-| `g` | Settings (threshold, quota probe, routing, add/remove/reorder accounts, sx.org) |
+| `g` | Settings (threshold, quota probe, quota-bar contents, routing, add/remove/reorder accounts, sx.org) |
 | `q` | Quit |
 
 In selection mode, use `j`/`k` or the arrow keys to navigate, `Enter` to confirm, `Esc` to cancel.
