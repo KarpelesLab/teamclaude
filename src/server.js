@@ -311,6 +311,15 @@ export function resolveClientAuth(proxyConfig, presented) {
   return { ok: false, client: null };
 }
 
+// Control-plane writes that change the config file, with the refusal a
+// caller holding a client key (rather than the operator's proxy.apiKey) gets.
+// See the check in createProxyServer for why a tenant may not reach these.
+const CLIENT_KEY_REFUSED_PATHS = new Map([
+  ['/teamclaude/threshold', 'a client key cannot change settings'],
+  ['/teamclaude/priority', 'a client key cannot change accounts'],
+  ['/teamclaude/disable', 'a client key cannot change accounts'],
+]);
+
 /**
  * @param {any} accountManager
  * @param {any} config
@@ -412,15 +421,18 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
 
       // A client key (proxy.clientKeys) names a tenant of the proxy, not its
       // operator: it may spend quota under its own name, read status and nudge
-      // the running fleet, but the switch threshold is a SETTING written to the
-      // config file and governing every account, and one tenant must not be
-      // able to retire the whole fleet for the others. The shared proxy.apiKey
-      // and the key-exempt loopback caller are the operator and stay allowed.
+      // the running fleet (switch, reload — runtime-only and older than client
+      // keys), but not rewrite what the config file says. The switch threshold
+      // is a SETTING governing every account, and one tenant must not be able
+      // to retire the whole fleet for the others; the account controls decide
+      // which accounts rotation may reach at all. The shared proxy.apiKey and
+      // the key-exempt loopback caller are the operator and stay allowed.
       // Refused here, before the body is read, so a request that will not be
       // honoured is never parsed.
-      if (req.tcClient && req.method === 'POST' && req.url === '/teamclaude/threshold') {
+      const clientKeyRefusal = req.method === 'POST' ? CLIENT_KEY_REFUSED_PATHS.get(req.url || '') : undefined;
+      if (req.tcClient && clientKeyRefusal) {
         res.writeHead(403, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: false, error: 'a client key cannot change settings' }));
+        res.end(JSON.stringify({ ok: false, error: clientKeyRefusal }));
         return;
       }
 
@@ -509,6 +521,78 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           console.error('[TeamClaude] Reload failed:', err.message);
           res.writeHead(500, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: 'reload failed; see the proxy log' }));
+        }
+        return;
+      }
+
+      // Account controls — the web equivalent of `teamclaude priority` and
+      // `teamclaude disable` / `enable`. Local control only (no upstream
+      // calls); the auth and cross-origin gates above already apply, and the
+      // hook writes through atomicConfigUpdate so a refusal leaves the file
+      // untouched. Both answer with the account as it now stands, because a
+      // relative move ('first'/'last') picks a number the caller did not send.
+      if (req.method === 'POST' && (req.url === '/teamclaude/priority' || req.url === '/teamclaude/disable')) {
+        const isPriority = req.url === '/teamclaude/priority';
+        const hook = isPriority ? hooks.setAccountPriority : hooks.setAccountDisabled;
+        if (!hook) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: `${isPriority ? 'priority' : 'enable/disable'} not supported` }));
+          return;
+        }
+        // Checked before the write, not after: a change that lands on disk but
+        // never takes effect in the running server is the worst of both, and
+        // a server with no reload hook has nothing to make it take effect.
+        if (!hooks.reload) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'reload not supported' }));
+          return;
+        }
+        let body;
+        try {
+          // `?? {}`: JSON.parse('null') is a value, and `.account` of it throws.
+          body = JSON.parse(await readControlBody(req) || '{}') ?? {};
+        } catch (err) {
+          const tooLarge = /** @type {Error} */ (err).message === 'body too large';
+          res.writeHead(tooLarge ? 413 : 400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: tooLarge ? 'request body too large' : 'invalid request body' }));
+          return;
+        }
+        if (typeof body.account !== 'string' || !body.account.trim()) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'missing "account"' }));
+          return;
+        }
+        try {
+          const result = isPriority
+            ? await hook(body.account.trim(), { priority: body.priority, place: body.place, orgFilter: body.org })
+            : await hook(body.account.trim(), body.disabled, { orgFilter: body.org });
+          // The write is on disk; the reload is what makes it live. Same
+          // split as the MCP changeSetting tool: a reload failure is reported
+          // as such, not as a refused change, because the file did change.
+          try {
+            await hooks.reload();
+          } catch (err) {
+            console.error('[TeamClaude] Reload after an account change failed:', /** @type {Error} */ (err).message);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'saved to the config file, but the reload failed; see the proxy log' }));
+            return;
+          }
+          // Leave a trace where the manual switch already leaves one: on a
+          // headless deployment this endpoint is the only way the change
+          // happens, and an account leaving rotation should never be silent.
+          console.log(`[TeamClaude] ${isPriority
+            ? `Set priority of "${result.name}" to ${result.priority}`
+            : `${result.disabled ? 'Disabled' : 'Enabled'} account "${result.name}"`} (control endpoint)`);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, ...result }));
+        } catch (err) {
+          // A ConfigOpError is the caller's own input (unknown or ambiguous
+          // account, bad priority) and is safe to echo; anything else is ours.
+          const known = err instanceof ConfigOpError;
+          const message = /** @type {Error} */ (err).message;
+          if (!known) console.error('[TeamClaude] Account control failed:', message);
+          res.writeHead(known ? 400 : 500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: known ? message : 'account change failed; see the proxy log' }));
         }
         return;
       }
