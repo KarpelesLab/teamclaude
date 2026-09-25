@@ -212,6 +212,13 @@ export class RemoteAccountManager {
     this.updateAvailable = false;
   }
 
+  /** Mirrors AccountManager.onExtraUsage off the payload's per-account flag,
+   * so the shared row renderer asks one question of either manager.
+   * @param {number} index */
+  onExtraUsage(index) {
+    return this.accounts[index]?.onExtraUsage === true;
+  }
+
   /** Per-bucket threshold lookup, mirroring AccountManager.thresholdFor so the
    * shared renderer works against either. `account`, when given, is one of the
    * plain objects `applyStatus` builds off `status.accounts` — its own
@@ -253,6 +260,10 @@ export class RemoteAccountManager {
       status: text(a?.status, 16, a?.status == null ? undefined : '?'),
       orgName: a?.orgName == null ? a?.orgName : text(a.orgName, NAME_MAX),
       unavailable: a?.unavailable == null ? a?.unavailable : text(a.unavailable, 64),
+      // Booleans that decide a red "billing" tag: anything but a literal true
+      // from the other end reads as off, never as a claim that money moves.
+      allowExtraUsage: a?.allowExtraUsage === true,
+      onExtraUsage: a?.onExtraUsage === true,
       // Already password-masked by the server; still a payload string drawn
       // into the frame, so it gets the same scrub as everything else.
       routing: a?.routing == null ? a?.routing : text(a.routing, 128),
