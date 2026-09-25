@@ -21,6 +21,8 @@ import { WEEKLY_BUCKET_KEYS } from './model.js';
 import { sanitizeText } from './safe-text.js';
 import { currentVersion } from './updater.js';
 import { upstreamPoolStatus } from './upstream-fetch.js';
+import { parseRoutingUrl, routingToUrl, describeRouting, maskRoutingUrl } from './account-routing.js';
+import { isSelfProxy, localListener } from './upstream-proxy.js';
 
 /**
  * The management tools served at /teamclaude/mcp, and the `proxy.mcp` gate in
@@ -39,9 +41,12 @@ import { upstreamPoolStatus } from './upstream-fetch.js';
  *   properties?: Record<string, Record<string, any>>,
  *   required?: string[],
  *   write?: boolean,
+ *   auditArgs?: (args: Record<string, any>) => Record<string, any>,
  *   run: (args: Record<string, any>, ctx: ToolContext) => Record<string, any>|Promise<Record<string, any>>,
  * }} Tool `run` throws a ToolFailure or ConfigOpError to refuse with a message
  *   the caller may read; any other exception is reported without its text.
+ *   `auditArgs` is what the write log prints in place of the arguments, for a
+ *   tool whose arguments hold a secret.
  */
 
 const INVALID_PARAMS = -32602;
@@ -111,6 +116,8 @@ function fleetStatus({ accountManager, hooks }) {
         priority: a.priority,
         disabled: a.disabled,
         status: a.status,
+        // Already password-masked by the status payload.
+        ...(a.routing ? { routing: a.routing } : {}),
         current: index === accountManager.currentIndex,
         ...accountManager.eligibility(index),
         sessions: a.sessions,
@@ -297,6 +304,41 @@ const WRITE_TOOLS = [
       ctx.accountManager.accounts[index].priority = args.priority;
       if (entry) entry.priority = args.priority;
     }).then(outcome => ({ ...outcome, priority: args.priority })),
+  },
+  {
+    name: 'set_account_routing',
+    title: 'Set or clear account routing',
+    description: 'Pin one account\'s egress to its own proxy: EVERY connection for it (completions, token refresh, profile and quota) tunnels through, no other account is touched, and the account bypasses the fleet upstream proxy and sx. URL schemes: http (CONNECT), socks4, socks4a, socks5, socks5h (a/h resolve hostnames at the proxy), optional user:pass@ auth — e.g. socks5h://alice:s3cret@proxy.example.com:1080. An empty value (or "none"/"off") clears it back to the fleet egress. Saved to the config file.',
+    properties: { ...ACCOUNT_ARGS, routing: { type: 'string', description: 'The proxy URL, or an empty value / "none" / "off" to clear' } },
+    required: ['account', 'routing'],
+    write: true,
+    // The URL carries the proxy password, and the write log is not a place for it.
+    auditArgs: args => ({ ...args, routing: maskRoutingUrl(args.routing) }),
+    run: (args, ctx) => {
+      /** @type {import('./account-routing.js').RoutingProxy|null} */
+      let routing = null;
+      if (!/^\s*(|none|off|-)$/i.test(String(args.routing ?? ''))) {
+        try {
+          routing = parseRoutingUrl(String(args.routing));
+        } catch (/** @type {any} */ err) {
+          throw new ToolFailure(err?.message || String(err));
+        }
+        // This server's own listener: a request tunnelled through it would
+        // come straight back in (the MITM listener intercepts the upstream
+        // host). The server drops such a routing on load anyway, so saving it
+        // would only store a value it then ignores.
+        if (isSelfProxy(routing, localListener(ctx.config))) {
+          throw new ToolFailure(`${describeRouting(routing)} is this server's own address; routing an account through it would loop back into this proxy`);
+        }
+      }
+      return changeAccount(ctx, args, (index, entry) => {
+        ctx.accountManager.setRouting(index, routing);
+        // Null, not a deleted key: the save merges over the on-disk entry, and
+        // a missing key leaves a stale `routing` standing (the same reason
+        // set_account_enabled writes an explicit boolean).
+        if (entry) entry.routing = routing ? routingToUrl(routing) : null;
+      }).then(outcome => ({ ...outcome, routing: describeRouting(routing) }));
+    },
   },
   {
     name: 'remove_account',
@@ -512,7 +554,7 @@ export function createToolSet(mode, ctx, { writeTimeoutMs = WRITE_TIMEOUT_MS } =
   /** @type {(tool: Tool, args: Record<string, any>) => Promise<Record<string, any>>} */
   const run = async (tool, args) => {
     if (tool.write) {
-      console.log(`[TeamClaude] MCP ${tool.name} by ${ctx.client ? sanitizeText(ctx.client) : 'a local caller'}: ${sanitizeText(JSON.stringify(args)).slice(0, 300)}`);
+      console.log(`[TeamClaude] MCP ${tool.name} by ${ctx.client ? sanitizeText(ctx.client) : 'a local caller'}: ${sanitizeText(JSON.stringify(tool.auditArgs ? tool.auditArgs(args) : args)).slice(0, 300)}`);
     }
     try {
       const value = await tool.run(args, ctx);

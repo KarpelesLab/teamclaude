@@ -1,7 +1,8 @@
 import { formatMoney } from './oauth.js';
-import { findFamilyBlock, modelGlobOverlaps, gatingUtilization, resolveMaxUsage, resolveSwitchThreshold, resolveFleetThreshold, switchThresholdDiffs } from './model.js';
+import { findFamilyBlock, modelGlobOverlaps, gatingUtilization, resolveMaxUsage, resolveSwitchThreshold, resolveFleetThreshold, switchThresholdDiffs, resolveMaxSpendMinor, spendCapReached } from './model.js';
 import { safeLine } from './safe-text.js';
 import { ROUTE_COLORS } from './config-ops.js';
+import { describeRouting } from './account-routing.js';
 
 const ESC = '\x1b[';
 const RESET = `${ESC}0m`;
@@ -69,6 +70,8 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
     if (routing) lines.push(`  ${routing}`);
     const threshold = thresholdLine(account, status, paint);
     if (threshold) lines.push(`  ${threshold}`);
+    const egress = egressProxyLine(account, paint);
+    if (egress) lines.push(`  ${egress}`);
     const why = unavailableLine(account, paint);
     if (why) lines.push(`  ${why}`);
     const spend = spendLine(account, paint);
@@ -139,8 +142,10 @@ export const UNAVAILABLE_TEXT = {
   'upstream-rejected': 'upstream reports quota rejected',
   quota: 'local switch threshold reached',
   capped: 'account usage cap reached (maxUsage)',
+  'spend-capped': 'extra-usage spend cap reached (maxSpend)',
   'advisor-capped': "advisor model's usage cap reached (maxUsage)",
   entitlement: 'upstream refused this account for the organization (cooldown)',
+  routing: "the account's routing proxy is unreachable (cooldown)",
   route: 'no route allows this account',
   'advisor-quota': "advisor model's weekly bucket spent",
   'advisor-route': 'no route allows the advisor model',
@@ -164,12 +169,21 @@ export function spendLine(account, paint) {
   if (!spend.enabled && !spent) return null;
 
   const amount = formatMoney(spend);
+  // The operator's own ceiling (accounts[].maxSpend), drawn beside the upstream
+  // figure it is judged against so the two read in one glance: `$14.35 of
+  // $10,000.00 used this month, cap $20.00`. Named `cap` like the usage caps on
+  // the bars above — same word, same meaning: at it the account gets nothing.
+  const capMinor = resolveMaxSpendMinor(account?.maxSpend, spend);
+  const cap = capMinor == null ? '' : `, cap ${formatMoney({ ...spend, usedMinor: capMinor, limitMinor: null })}`;
   if (spend.enabled) {
     // Already billing is the louder of the two: red, and named as money rather
     // than as a percentage, so it cannot be mistaken for another quota bar.
-    const text = spent
-      ? `billing real money — ${amount} used this month`
-      : `can bill real money past its plan limits — ${amount} used`;
+    const reached = spendCapReached(account?.maxSpend, spend);
+    const text = reached
+      ? `spend cap reached — ${amount} used this month${cap}`
+      : spent
+        ? `billing real money — ${amount} used this month${cap}`
+        : `can bill real money past its plan limits — ${amount} used${cap}`;
     return `${paint.dim('Spend'.padEnd(8))} ${(spent ? paint.red : paint.yellow)(`\u26a0 ${text}`)}`;
   }
   // Not enabled, but money was spent this month. Say why it is off now, since
@@ -279,6 +293,23 @@ export function thresholdLine(account, status, paint) {
     return `${label} ${formatPercent(value)}`;
   });
   return `${paint.dim('Switch'.padEnd(8))} ${paint.cyan(`switch ${parts.join(', ')}`)}`;
+}
+
+/**
+ * "Egress   via socks5h://alice:***@host:1080" — the account's OWN egress
+ * proxy (accounts[].routing), or null when it has none: the fleet path needs
+ * no line. The status payload carries it already password-masked; a renderer
+ * against the live manager (which holds the parsed object) gets the same
+ * masked string out of describeRouting.
+ * @param {any} account
+ * @param {any} paint
+ */
+export function egressProxyLine(account, paint) {
+  const r = account?.routing;
+  if (!r) return null;
+  const text = typeof r === 'string' ? r : describeRouting(r);
+  if (!text) return null;
+  return `${paint.dim('Egress'.padEnd(8))} ${paint.cyan(`via ${text}`)}`;
 }
 
 function colors(enabled) {
@@ -497,6 +528,11 @@ function formatAccountStatus(account, now, paint) {
   const entitlementAt = parseTs(account.entitlementDeniedUntil);
   if (entitlementAt && entitlementAt > now) {
     parts.push(paint.yellow(`entitlement cooldown ${formatDuration(entitlementAt - now)}`));
+  }
+
+  const routingAt = parseTs(account.routingFailedUntil);
+  if (routingAt && routingAt > now) {
+    parts.push(paint.yellow(`routing proxy down, retry in ${formatDuration(routingAt - now)}`));
   }
 
   return parts.join(' / ');
