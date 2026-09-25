@@ -105,6 +105,12 @@ const PERSISTED_QUOTA_FIELDS = [
   // until something next reads /wham/usage — and the row that says so is the
   // only place an operator sees one at all.
   'resetCredits',
+  // Whether the last Codex reading stated a 5-hour window at all (see
+  // _updateCodexQuota). A fact about the subscription's shape rather than a
+  // counter, so it holds across a restart: without it a restored Codex row
+  // would draw Ses/Wk until its first reading and then snap to one wide
+  // weekly bar — the startup flicker the TUI rule is written to avoid.
+  'sessionWindowStated',
 ];
 
 // The family (Fable/Sonnet) weekly buckets and the field holding when each was
@@ -131,6 +137,7 @@ const FAMILY_WEEKLY_BUCKETS = [
  * @property {string} [planType]  the Codex subscription tier
  * @property {{available: number, applicable: number|null, seenAt: number}} [resetCredits]  free rate-limit reset credits held, and when that was last seen
  * @property {Record<string, {name: string, utilization: number, resetAt: number|null, seenAt: number}>} [codexModelBuckets]  model-scoped weekly buckets, keyed by slug
+ * @property {boolean} [sessionWindowStated]  whether the last reading that stated a window stated a 5-hour one; `false` says the subscription meters no session window
  */
 
 function emptyQuota() {
@@ -2876,6 +2883,10 @@ export class AccountManager {
    * call frequently (e.g. from the TUI render loop) — once a counter is cleared
    * it stays null until the next upstream response repopulates it, so the
    * "reset" log fires at most once per window.
+   *
+   * `sessionWindowStated` is deliberately not touched here: it records whether
+   * the subscription meters a session window at all, which an expired window
+   * says nothing about (see _updateCodexQuota).
    * @returns {{changed: boolean, session: boolean}} what was cleared.
    */
   _clearExpiredQuotas(account) {
@@ -3354,6 +3365,17 @@ export class AccountManager {
     if (parsed.unified5hReset != null) account.quota.unified5hReset = parsed.unified5hReset;
     if (parsed.unified7dReset != null) account.quota.unified7dReset = parsed.unified7dReset;
 
+    // Whether this subscription meters a session window at all, kept apart from
+    // the reading itself: `unified5h` is nulled the moment its window expires
+    // (_clearExpiredQuotas), so a TUI row keyed on the reading alone would swing
+    // between Ses/Wk and one wide weekly bar every five hours. Only a response
+    // that stated a window says anything — the catalog fetch carries none — and
+    // a weekly window with no 5-hour one beside it is how a subscription that
+    // meters no session window reads (see codex-quota.js). The usage probe
+    // records the same fact in applyCodexUsageData.
+    if (parsed.unified5h != null) account.quota.sessionWindowStated = true;
+    else if (parsed.unified7d != null) account.quota.sessionWindowStated = false;
+
     // A model-scoped weekly bucket is the counterpart of Anthropic's `7d_oi`
     // Fable bucket: it rides only on responses for that model, so stamp when
     // the reading was taken. That timestamp is what lets a spent bucket be
@@ -3721,6 +3743,9 @@ export class AccountManager {
       q.unified7d = usage.sevenDay.utilization;
       q.unified7dReset = usage.sevenDay.resetAt ?? null;
     }
+    // Same sticky fact the header path records; see _updateCodexQuota.
+    if (usage.fiveHour) q.sessionWindowStated = true;
+    else if (usage.sevenDay) q.sessionWindowStated = false;
     if (usage.planType) q.planType = safeLine(usage.planType, 64);
     // Stamped, because nothing else refreshes it: a payload that mentions no
     // credits leaves the last reading alone rather than blanking it, so the

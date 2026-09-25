@@ -230,9 +230,15 @@ test('a single-provider pool is unchanged: one column, no titles, one marker', (
   }
 });
 
+// What a Codex subscription's reading leaves behind when it states a weekly
+// window and no 5-hour one (account-manager `_updateCodexQuota`). The rule keys
+// on that fact, never on `unified5h` being empty: the expiry sweep nulls the
+// reading every five hours on an account that does have a session window.
+const noSessionWindow = (a) => Object.assign(a.quota, { unified5h: null, unified5hReset: null, sessionWindowStated: false });
+
 test('a Codex pane whose accounts state no five-hour window drops Ses; Wk takes the first slot', () => {
   const am = fleet([claude('a@x.com'), codex('k1@x.com'), codex('k2@x.com')]);
-  for (const i of [1, 2]) { am.accounts[i].quota.unified5h = null; am.accounts[i].quota.unified5hReset = null; }
+  for (const i of [1, 2]) noSessionWindow(am.accounts[i]);
   const [left, right] = halves(accountRows(screen(am, 160).lines)[0]);
   assert.match(left, /Ses .*Wk .*F7/, 'the Anthropic pane is unchanged');
   assert.doesNotMatch(right, /Ses/);
@@ -240,7 +246,7 @@ test('a Codex pane whose accounts state no five-hour window drops Ses; Wk takes 
   // One account stating the window brings the column back for that ROW only:
   // a Codex row that reports a weekly window and no session window keeps
   // drawing the wide weekly bar whatever its neighbours state.
-  am.accounts[2].quota.unified5h = 0.1;
+  Object.assign(am.accounts[2].quota, { unified5h: 0.1, sessionWindowStated: true });
   const rows = accountRows(screen(am, 160).lines).map(r => halves(r)[1]);
   assert.match(rows[0], /k1@x\.com +active +Wk /);
   assert.doesNotMatch(rows[0], /Ses/);
@@ -249,7 +255,7 @@ test('a Codex pane whose accounts state no five-hour window drops Ses; Wk takes 
 
 test('an account that has not reported yet keeps the Ses column, so it does not come and go at startup', () => {
   const am = fleet([claude('a@x.com'), codex('k1@x.com'), codex('k2@x.com')]);
-  am.accounts[1].quota.unified5h = null;
+  noSessionWindow(am.accounts[1]);
   am.accounts[2].quota = {};
   const rows = accountRows(screen(am, 160).lines).map(r => halves(r)[1]).filter(r => r.trim());
   assert.equal(rows.length, 2);
@@ -259,20 +265,49 @@ test('an account that has not reported yet keeps the Ses column, so it does not 
   assert.match(rows[1], /k2@x\.com +active +Ses .*Wk /, rows[1]);
 });
 
-test('without a five-hour window a Codex-only list drops Ses, and in a mixed single column only the Codex row does', () => {
+// The trigger the rule must NOT have: a Codex account whose session window
+// simply ran out. The reading is nulled by the expiry sweep (which the render
+// runs), but the subscription still meters one, so the row keeps both cells —
+// otherwise it would swing between Ses/Wk and one wide weekly bar every five
+// hours. Driven through the probe path so the fact is recorded the way it is
+// in service, not written by the test.
+test('a Codex row whose five-hour window has expired keeps both cells', () => {
+  const am = fleet([claude('a@x.com'), codex('k1@x.com'), codex('k2@x.com')]);
+  am.applyCodexUsageData(1, {
+    fiveHour: { utilization: 0.4, resetAt: Date.now() - 1 },
+    sevenDay: { utilization: 0.3, resetAt: Date.now() + 24 * h },
+  });
+  noSessionWindow(am.accounts[2]);
+  const rows = accountRows(screen(am, 160).lines).map(r => halves(r)[1]).filter(r => r.trim());
+  assert.equal(am.accounts[1].quota.unified5h, null, 'the sweep cleared the expired window');
+  assert.equal(am.accounts[1].quota.sessionWindowStated, true, 'and left the fact alone');
+  assert.match(rows[0], /k1@x\.com +active +Ses .*Wk /, rows[0]);
+  assert.match(rows[1], /k2@x\.com +active +Wk /, rows[1]);
+  assert.doesNotMatch(rows[1], /Ses/);
+});
+
+test('without a five-hour window a Codex-only list drops Ses, and in a mixed single column the Codex row alone draws one wide weekly bar', () => {
   const only = fleet([codex('k1@x.com'), codex('k2@x.com')]);
-  for (const a of only.accounts) a.quota.unified5h = null;
+  for (const a of only.accounts) noSessionWindow(a);
   for (const r of accountRows(screen(only, 120).lines)) { assert.doesNotMatch(r, /Ses/); assert.match(r, /Wk /); }
   const mixed = fleet([claude('a@x.com'), codex('k1@x.com')]);
-  mixed.accounts[1].quota.unified5h = null;
-  const narrow = accountRows(screen(mixed, 100).lines);
+  noSessionWindow(mixed.accounts[1]);
+  const { lines, drawn } = screen(mixed, 100);
+  const narrow = accountRows(lines);
   assert.equal(narrow.length, 2);
   assert.match(narrow[0], /a@x\.com.*Ses /, 'the Claude row keeps its session bar');
   assert.match(narrow[1], /k1@x\.com.*Wk /);
   assert.doesNotMatch(narrow[1], /Ses/, 'the Codex row draws the wide weekly bar');
-  // The weekly bar took both cells' width: it is wider than the Claude row's Wk bar.
-  const barLen = (r) => (r.match(/Wk +\[([^\]]*)\]/) || [,''])[1].length;
-  assert.ok(barLen(narrow[1]) > barLen(narrow[0]) || barLen(narrow[0]) === 0, `${narrow[0]}\n${narrow[1]}`);
+  // The weekly bar took both cells' width. A bar is drawn as `bw` columns of
+  // background colour, so measure the raw rows: the Codex row's Wk bar spans
+  // bar + `  Wk ` + bar, ends where the Claude row's Wk bar ends, and is the
+  // last thing on its row.
+  const [cl, cx] = [drawn.find(r => r.idx === 0), drawn.find(r => r.idx === 1)];
+  assert.ok(cl && cx && !cl.pane && !cx.pane, 'one column at 100');
+  assert.equal(cx.bw, cl.bw, 'both rows are budgeted from the same category');
+  const wideEnd = cx.text.indexOf('Wk ') + 3 + (2 * cx.bw + 6);
+  assert.equal(cx.text.length, wideEnd, `${cl.text}\n${cx.text}`);
+  assert.equal(cl.text.indexOf('  Wk ') + 5 + cl.bw, wideEnd, `${cl.text}\n${cx.text}`);
 });
 
 test('selection walks the Anthropic pane, then the Codex pane, and stores manager indices', () => {
