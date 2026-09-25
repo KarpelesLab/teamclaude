@@ -14,7 +14,9 @@ Run it once per account. You can add accounts while the server is running — pr
 
 If the profile cannot be identified, login stops without adding a placeholder
 account. Retry after confirming the credential is valid, or pass
-`teamclaude login --name <name>` to add it without profile detection.
+`teamclaude login --name <name>` to add it without profile detection. A
+credential the upstream rejects with 401 (and that cannot be refreshed) is
+refused regardless of `--name` — log in again to get a fresh one.
 
 ## Import from Claude Code
 
@@ -34,7 +36,10 @@ teamclaude import --from /path/to/credentials.json
 Automatic naming requires a successful profile lookup. If credentials are
 invalid or the profile cannot be identified, the import stops without adding a
 placeholder account. Pass `--name <name>` to explicitly import without profile
-detection.
+detection. An expired access token is refreshed on import when the file carries
+a refresh token; a credential the upstream rejects with 401 (and that cannot be
+refreshed) is refused regardless of `--name` — run `claude /login` and import
+again, or `teamclaude login`.
 
 ## Delegating credentials to a file (`importFrom`)
 
@@ -75,11 +80,96 @@ teamclaude enable <name>        # re-enable it (also clears a stuck error state)
 teamclaude priority <name> 1    # rotation preference, lower = preferred
 teamclaude priority <name> --first
 teamclaude priority <name> --last
+teamclaude routing <name> <url> # route ALL of the account's traffic via its own proxy
+teamclaude routing <name> none  # clear it
+teamclaude routing <name> --check  # test the proxy the account already has
 ```
 
-`login`, `import`, `enable`, `disable` and `priority` notify a running server to reload, so credential, priority and enable/disable changes are picked up live; the same reload (POST `/teamclaude/reload`, or **R** in the TUI) also applies hand edits to an account's `upstream`/`modelMap`. Account **removals** made on disk (`teamclaude remove` from another shell, or a hand edit) are applied by the same reload: a running account whose entry is gone from the file is dropped from the fleet, and the reload reports how many it added and how many it removed. An account added in the TUI is safe during the moment between its addition and its save — a reload that reads the file first leaves it alone rather than treating the missing row as a removal. Removing one from the TUI or through the [MCP endpoint](usage.md#mcp-endpoint)'s `remove_account` takes effect at once.
+`login`, `import`, `enable`, `disable`, `priority` and `routing` notify a running server to reload, so credential, priority, enable/disable and routing changes are picked up live; the same reload (POST `/teamclaude/reload`, or **R** in the TUI) also applies hand edits to an account's `upstream`/`modelMap`. Account **removals** made on disk (`teamclaude remove` from another shell, or a hand edit) are applied by the same reload: a running account whose entry is gone from the file is dropped from the fleet, and the reload reports how many it added and how many it removed. An account added in the TUI is safe during the moment between its addition and its save — a reload that reads the file first leaves it alone rather than treating the missing row as a removal. Removing one from the TUI or through the [MCP endpoint](usage.md#mcp-endpoint)'s `remove_account` takes effect at once.
+
+## Per-account routing (`routing`)
+
+One account can leave through its own proxy while the rest of the fleet goes direct (or through the fleet [upstream proxy](proxy-modes.md#upstream-proxy)):
+
+```bash
+teamclaude login --name "waffles@waffle.com" --routing "socks5h://alice:s3cret@proxy.example.com:1080"
+teamclaude routing waffles@waffle.com socks5h://alice:s3cret@proxy.example.com:1080
+teamclaude routing waffles@waffle.com        # show it (password masked)
+teamclaude routing waffles@waffle.com --check  # show it, and test the proxy
+teamclaude routing waffles@waffle.com none   # clear it
+```
+
+Or in the config:
+
+```json
+{ "name": "waffles@waffle.com", "type": "oauth", "routing": "socks5h://alice:s3cret@proxy.example.com:1080" }
+```
+
+**Every** connection made for that account (request forwarding, OAuth login and token refresh, profile, usage and quota probes) tunnels through the proxy with TLS end to end, and no other account is touched. A routed account bypasses both the fleet upstream proxy and sx.org: the contract is that its traffic never leaves by another path, so even a post-429 sx retry goes through the account's own proxy.
+
+Schemes:
+
+| Scheme | Protocol | Hostname resolution |
+| --- | --- | --- |
+| `http` | HTTP `CONNECT` | at the proxy |
+| `socks5` | SOCKS5 | locally |
+| `socks5h` | SOCKS5 | at the proxy |
+| `socks4` | SOCKS4 | locally (IPv4 only) |
+| `socks4a` | SOCKS4 | at the proxy |
+
+Optional `user:pass@` auth works for `http` and `socks5`/`socks5h` (SOCKS4 carries a username only, so a password there is refused with a message). A bare `host:port` is read as `http`. The `h`/`a` forms are usually what you want for a remote exit: the proxy resolves the hostname, so the exit's DNS view matches its geography.
+
+The value is validated when the account is read: a bad URL is reported once and ignored, never fatal, and so is a URL that names this server's own address, which would send the account's requests straight back into the proxy (the CLI, the TUI and the MCP tool refuse to store one). It shows masked in `teamclaude accounts`, `status`, the TUI and the web dashboard, and the reload note above applies to disk edits and `routing` changes alike. The proxy password is masked everywhere it is printed, error messages and the MCP write log included. `teamclaude api --account <name>` sends the account's credential, so it leaves through the account's proxy as well. Changed alongside: `teamclaude api` used to bypass the fleet [upstream proxy](proxy-modes.md#upstream-proxy) too, and now goes through it when one is configured, like every other call TeamClaude makes with an account's credential.
+
+Besides the CLI there are two more places to set it. In the TUI, **`g`** then **Account proxy** picks an account and asks for the URL (`none` clears it). Over the [MCP endpoint](usage.md#mcp-endpoint) the tool is `set_account_routing`.
+
+### What is not routed
+
+Routing covers what TeamClaude does with the account's own credential. Two kinds of traffic are outside that, and both keep the fleet path:
+
+- Claude Code's own identity calls (`/api/oauth/*`, `/v1/code/*` and its token refresh) are relayed with the credential of the Claude Code login, never with a pooled account's, so they belong to no account here. That holds even when the login is the same person as a routed account.
+- A sign-in or import that names no account. Which account it belongs to is only known once the profile has been read, so that lookup cannot use a proxy it has not found yet. Pass `--name` (or `--routing`) and it can.
+
+### The proxy is tested before anything depends on it
+
+`login --routing`, `import --routing`, `routing <name> <url>` and the TUI row all open a tunnel through the proxy to the account's upstream and finish the TLS handshake before they change anything. No request is sent, so the only credential that leaves the machine is the proxy's own. If the test fails the command stops and nothing is saved:
+
+```
+$ teamclaude routing waffles@waffle.com socks5h://alice:wrong@proxy.example.com:1080
+Routing proxy check failed: account routing proxy socks5h://alice:***@proxy.example.com:1080: SOCKS5 authentication failed
+Nothing was changed. Fix the proxy or the URL, or pass --no-check to skip this test.
+```
+
+For an OAuth login this is what saves the sign-in. The authorisation code works once, so a wrong proxy password found at the token exchange would cost you the whole browser flow. Pass `--no-check` when the proxy is not up yet.
+
+`--routing URL` and `--routing=URL` both work. A `--routing` with nothing after it is an error and is never ignored: the account would otherwise be added from this machine's own address, and that is the one outcome the flag exists to prevent.
+
+### Signing a routed account in again
+
+`teamclaude login --name "waffles@waffle.com"` reuses the routing that account already has, so a re-login leaves through the same proxy without the URL being typed again. The stored value is only borrowed for the sign-in and is left as it was.
+
+If that proxy is dead and the account needs a new sign-in now, add `--routing none`. That signs in without a proxy and clears the stored routing, the same way `teamclaude routing <name> none` does.
+
+Without `--name`, TeamClaude cannot know which account a sign-in belongs to until it is over. If it turns out to be a routed account, the command says that the sign-in went out unrouted and how to route the next one.
+
+### When the proxy is down
+
+A proxy that refuses connections, times out or rejects its credentials takes only its own account with it. The request that found out fails over to the next account. The routed account is then held out of rotation for 30 seconds, so the requests behind it do not each wait on a dead proxy, and the first request after the hold tries the proxy again.
+
+While the hold lasts, `status`, the TUI and the dashboard show the account as blocked with "the account's routing proxy is unreachable", and the server log names the account and its masked proxy. When every eligible account is in that state the client gets a `429` whose message says so and whose `retry-after` is the rest of the hold, not a quota reset. A request pinned to the account (`TC_ACCT`) still goes to it. Changing the account's routing lifts the hold at once.
+
+Two fleet features reason about this machine's own exit address, which a routed account no longer uses. A `429` on a routed account does not trigger the [sx.org](proxy-modes.md#sxorg-proxy-mode) retry or its sticky window. The `egress.pin` check runs before an account is chosen, so while the machine's own exit IP is wrong it holds every request, including ones a routed account could have served.
+
 
 Accounts can also be added, removed and reordered from the TUI settings screen: **`g`** → **Add account** / **Remove account** / **Reorder accounts**.
+
+### Signing in again from the TUI
+
+An OAuth account whose refresh token upstream has rejected — typically because the same account was signed in somewhere else, which rotates the token and kills the copy TeamClaude holds — shows as `error` and stays that way until someone signs in again. Press **`l`** on the dashboard: the picker opens on the first account in `error`, and **Enter** opens the provider's sign-in page in your browser (Claude or Codex, by the account's provider). The dashboard stays live while it waits, up to two minutes.
+
+The tokens go to the account the browser actually signed in as, matched by identity exactly as `teamclaude login` does — not to whichever row was highlighted. Sign in as a different account and that account is updated (or added) instead, the activity pane says so, and the row you picked still needs its login.
+
+The key needs a browser on the machine running the server, so it is not offered in `teamclaude attach`, and on a headless host `teamclaude login --token` remains the way.
 
 **Reorder accounts** sets the order the account list is drawn in — `↑`/`↓` pick an account, `←`/`→` move it up and down, each move saved as you make it. It writes a `displayOrder` on the entry and touches nothing else: an account keeps its place in the `accounts` array, so route pins, session pins and `TC_ACCT` all go on naming the same accounts, and rotation order stays `priority`'s business alone. An account with no `displayOrder` — every account, until the first time you arrange them, and every one added afterwards — lists after the ones that have one, which is where a newly added account appeared anyway. A [third-party backend](#third-party-backend-accounts) served by a local process is infrastructure rather than a seat to rotate between: the TUI keeps those at the end of the list, and the screen leaves them there.
 
@@ -208,14 +298,12 @@ Two details are worth knowing if you read the raw headers:
 OpenAI occasionally grants a ChatGPT account a free **rate-limit reset credit**:
 redeeming one clears the account's spent windows ahead of their own reset. The
 Codex CLI offers it as a manual action only, so a pooled account that runs dry
-sits out the rest of its week holding one unless somebody notices it is there.
+would otherwise sit out the rest of its week holding one.
 
 The count an account holds comes free with the quota probe — it rides on the
 same `/wham/usage` payload the quota reading does — and shows up as `RC1` on the
 TUI row, a `Reset` line in `teamclaude status`, and a badge on the dashboard
-card. It survives a restart, which matters because the probe is off by default:
-without that, nothing would say a credit exists until something next happened to
-read the usage endpoint.
+card. It survives a restart, which matters because the probe is off by default.
 
 Only the probe refreshes the count, so a reading can outlive the credit it
 describes — redeemed in the Codex CLI, or expired. The `status` line therefore
@@ -225,8 +313,55 @@ is more than 7 days old.
 The count is what the account **holds**. Whether a particular credit can be
 spent is a separate question — the payload's `applicable_available_count` is
 upstream's own view of how many would reset a window right now, and is named on
-the `status` line when it is zero — and spending one remains a manual action in
-the Codex CLI.
+the `status` line when it is zero — and spending one is a manual action in the
+Codex CLI unless you arm the switch below.
+
+Spending one is **opt-in**, and the switch is fleet-wide: set
+[`autoRedeemResets`](configuration.md) to `true`, or toggle it from the TUI
+settings screen (**g** → **Auto-redeem**). It is `false` by default, and stays
+that way until you say otherwise: a redemption cannot be undone and the credits
+are scarce, so a fleet nobody has armed holds its credits for manual use however
+dry it runs. The switch is fleet-scoped because the policy below is — "only when
+the whole pool is dry" is a statement about the fleet, not about one account —
+and it applies live, so it can be armed or killed without a restart.
+
+One account can be exempted with `accounts[].autoRedeemReset: false`, and that
+is **all** that key can do. A per-account `true` arms nothing on its own: with
+`autoRedeemResets` off, no account spends anything.
+
+A redemption is considered at the moment a spent weekly window turns a request
+away with nothing chosen to serve it: every Codex account the request is
+eligible for is out of quota, so selection refuses it before picking one and
+nothing is ever sent upstream. On a pool of two this is what almost every
+request gets. Only the accounts a reset would actually return to service are
+considered — an account you disabled or capped stays out whatever its windows
+say — and when several qualify, the one whose credit expires soonest is asked
+first.
+
+While it is on, a credit is spent only when **all** of this holds:
+
+1. The account's **weekly** window is exhausted. A spent 5-hour window never
+   triggers it — that one comes back on its own within hours, while the weekly
+   one is what walls an account off for days, and a full reset is too scarce to
+   burn on the short window.
+2. The account holds a credit that is `available` **and** supported by its plan.
+3. Either every other Codex account is unavailable too — so the credit actually
+   unblocks work rather than topping up an account rotation would have stepped
+   past — or the credit expires within three days.
+
+At most one credit is spent, per dry pool rather than per account. Refusals
+arriving together join a single attempt rather than each starting one, and an
+attempt that has spent a credit — or that failed in a way that cannot rule out
+having spent one — holds **every** account off for hours afterwards, not just
+the one it touched. That hold is deliberately not left to the account a
+redemption returned to service making condition 3 answer "no" for the others:
+that depends on a quota re-read, and a re-read can fail.
+
+The request is then re-selected and served on the account whose windows were
+just reset. The whole decision — token refresh, credit read and redemption — is
+held to a 10-second budget, because the waiting client's patience for the
+response head is finite and the retry needs the rest of it. Every attempt and outcome is
+logged.
 
 ## Third-party backend accounts
 
@@ -277,9 +412,9 @@ The flag the client sets is keyed on the model, not on the account serving it. I
 
 An `upstream` whose host is Anthropic's own is left alone without any flag — a region pin or a mirror reaches the real thread store, so there is nothing to repair. The host is what decides it: a third-party API serving the Anthropic shape does that under its own host.
 
-Only a per-account `upstream` arms this. A fleet pointed at a third-party host through the global `upstream` is not covered, and there is no setting to turn the refusal on for it.
+The effective upstream is what counts. A fleet pointed at a third-party host through the global `upstream` is covered the same way: every account without an `upstream` of its own is refused continues there. (Before 1.1.22 only a per-account `upstream` armed this; a fleet on a third-party global upstream now gets the repair without a setting.)
 
-A relay that forwards to Anthropic does keep thread state, and for it the refusal is pure overhead — the client would re-send a full history each turn for nothing. Declare it with `"messageThreads": true` and continues are forwarded untouched.
+A relay that forwards to Anthropic does keep thread state, and for it the refusal is pure overhead — the client would re-send a full history each turn for nothing. Declare it with `"messageThreads": true` on the account, or at the top level of the config for the global `upstream`, and continues are forwarded untouched.
 
 ### `accounts[].models` is deprecated
 
