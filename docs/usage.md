@@ -10,7 +10,7 @@ teamclaude server
 
 From a TTY this shows the interactive TUI: an account table with session/weekly quota bars and reset countdowns, a real-time activity log, and keyboard controls.
 
-With accounts from two providers (Claude and Codex) and a terminal at least 127 columns wide, the account table is drawn as two panes side by side, one per provider, each titled with its provider. Each pane carries its own `►` current-account marker, because each provider pool keeps its own cursor. The panes are used only when both can draw every quota bar their rows have, so a fleet with per-model bars, route columns or blocked-family tags needs a little more than 127 columns; a narrower terminal keeps the single list, with the provider named in the type column (and still one `►` per provider). A list whose Codex accounts have all reported without a 5-hour window drops the `Ses` bar column and draws the weekly bar alone.
+With accounts from two providers (Claude and Codex) and a terminal at least 127 columns wide, the account table is drawn as two panes side by side, one per provider, each titled with its provider. Each pane carries its own `►` current-account marker, because each provider pool keeps its own cursor. The panes are used only when both can draw every quota bar their rows have, so a fleet with per-model bars, route columns or blocked-family tags needs a little more than 127 columns; a narrower terminal keeps the single list, with the provider named in the type column (and still one `►` per provider). A Codex row whose subscription has reported a weekly window and no 5-hour one draws the weekly bar alone, at the width of both cells, while the Claude rows beside it keep `Ses` and `Wk`; a list made only of such rows drops the `Ses` column outright. An account that has not reported yet keeps both cells, and a row keeps them when its 5-hour window merely runs out.
 
 It falls back to plain log output when stdout is not a TTY (e.g. running as a service). Pass `--headless` (or `--no-tui`) to force plain-log mode from a terminal — useful for backgrounding the proxy.
 
@@ -108,7 +108,7 @@ Warning: "me@example.com" is disabled, so requests will not route to it until th
 | `d` | Enable/disable an account |
 | `p` | Refresh quota on all accounts (one-shot probe of the zero-spend usage endpoint) |
 | `R` | Reload accounts from config |
-| `g` | Settings (threshold, quota probe, quota-bar contents, routing, add/remove/reorder accounts, sx.org) |
+| `g` | Settings (threshold, quota probe, quota-bar contents, routing, add/remove/reorder accounts, upstream and account proxies, sx.org) |
 | `q` | Quit |
 
 In selection mode, use `j`/`k` or the arrow keys to navigate, `Enter` to confirm, `Esc` to cancel.
@@ -244,7 +244,7 @@ The running server can expose its control plane to Claude Code (or any other MCP
 { "proxy": { "mcp": "read" } }
 ```
 
-`"read"` serves `get_status` (the fleet at a glance: server version, current account, and for each account its priority, whether it is disabled, whether rotation can use it and why not, sessions and known quota windows), `get_quota` and `get_settings`. `"full"` adds everything the CLI's management commands can do: `switch_account`, `reload_config`, `probe_quota`, `set_account_enabled`, `set_account_priority`, `remove_account`, `set_threshold`, `set_distribution`, `set_probe_interval`, `set_warmup`, `set_route`, `remove_route`, `set_blocked_models` and `set_client_mode`. There is no tool for adding accounts or handling credentials, and none for changing `proxy.mcp` itself. A reload picks the setting up, so the endpoint can be opened, narrowed or closed while the server runs.
+`"read"` serves `get_status` (the fleet at a glance: server version, current account, and for each account its priority, whether it is disabled, whether rotation can use it and why not, sessions and known quota windows), `get_quota` and `get_settings`. `"full"` adds everything the CLI's management commands can do: `switch_account`, `reload_config`, `probe_quota`, `set_account_enabled`, `set_account_priority`, `set_account_routing`, `remove_account`, `set_threshold`, `set_distribution`, `set_probe_interval`, `set_warmup`, `set_route`, `remove_route`, `set_blocked_models` and `set_client_mode`. There is no tool for adding accounts or handling account credentials, and none for changing `proxy.mcp` itself. `set_account_routing` does take a proxy URL with its password, and the write log prints that URL masked. A reload picks the setting up, so the endpoint can be opened, narrowed or closed while the server runs.
 
 Point Claude Code at it once; `teamclaude run` and `teamclaude env` already keep loopback out of the proxy variables, so the connection goes straight to the server and is key-exempt like every other loopback caller:
 

@@ -98,6 +98,8 @@ export async function fetchBackendQuota(account, { fetchImpl = proxyFetch, timeo
     const res = await fetchImpl(url, {
       headers: { Authorization: `Bearer ${account.credential}`, Accept: 'application/json' },
       signal,
+      // The account's own egress proxy, when it has one (account-routing.js).
+      routing: account.routing ?? null,
     });
     if (!res.ok) return { error: `HTTP ${res.status}` };
     const body = await readJsonBounded(res, RESPONSE_LIMIT);

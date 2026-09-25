@@ -211,6 +211,10 @@ export function accountBadges(account, current, currentAccounts, now, fleetThres
   // or the comparison falls back to thresholdBadgeText's own 0.98 default.
   var thresholdText = thresholdBadgeText(a.switchThreshold, fleetThreshold, fleetThresholds);
   if (thresholdText) badges.push({ cls: 'meta threshold', text: thresholdText });
+  // The account's own egress proxy, as the status payload carries it: already
+  // password-masked (describeRouting), and absent for an account on the fleet
+  // path, which is the default and earns no badge.
+  if (typeof a.routing === 'string' && a.routing) badges.push({ cls: 'meta routing', text: 'via ' + a.routing });
   return badges;
 }
 
