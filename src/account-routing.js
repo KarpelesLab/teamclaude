@@ -31,8 +31,20 @@ import https from 'node:https';
 import net from 'node:net';
 import dns from 'node:dns/promises';
 import { connectThroughProxy, handshakeOverTunnel } from './sx.js';
+import { v6Groups } from './forward-target.js';
 
 const CONNECT_TIMEOUT_MS = 30000; // same budget as the CONNECT tunnel
+
+// What routingAgent gives the tunnel (dial + proxy handshake) and then the TLS
+// handshake over it, each. Deliberately SHORTER than the abort signal of any
+// caller that goes through the agent: the OAuth refresh wraps its fetch in
+// AbortSignal.timeout(30s) (oauth.js), and a tunnel budget of 30s would let
+// that signal win the race against a black-holed proxy, so the failure would
+// surface as the caller's generic timeout (retried as transient, on the same
+// dead proxy) instead of the ROUTING_FAILED that fails the account over and
+// arms its cooldown. The environment override exists for the tests, which
+// cannot wait 20s on a proxy that never answers.
+const AGENT_TIMEOUT_MS = Number(process.env.TEAMCLAUDE_ROUTING_TIMEOUT_MS) || 20_000;
 
 export const ROUTING_SCHEMES = ['http', 'socks4', 'socks4a', 'socks5', 'socks5h'];
 
@@ -240,24 +252,27 @@ async function socks5Target({ protocol, targetHost, targetPort, label }) {
     ip = found.address;
   }
   if (net.isIP(ip) === 6) {
-    return Buffer.concat([Buffer.from([0x04]), ipv6Bytes(ip), portBytes(targetPort)]);
+    return Buffer.concat([Buffer.from([0x04]), ipv6Bytes(ip, label), portBytes(targetPort)]);
   }
   return Buffer.concat([Buffer.from([0x01]), Buffer.from(ip.split('.').map(Number)), portBytes(targetPort)]);
 }
 
-/** @param {string} ip
+/** The sixteen bytes of an IPv6 literal, for a SOCKS5 ATYP=4 address.
+ * @param {string} ip
+ * @param {string} label
  * @returns {Buffer}
  */
-function ipv6Bytes(ip) {
-  // Expand :: runs, then pack eight 16-bit groups. A zone id (fe80::1%lo0) is
-  // link-local addressing and means nothing to a remote proxy — drop it.
-  const [head, tail] = ip.split('%', 1)[0].split('::');
-  const headParts = head ? head.split(':') : [];
-  const tailParts = tail ? tail.split(':') : [];
-  const missing = 8 - headParts.length - tailParts.length;
-  const parts = [...headParts, ...Array(Math.max(missing, 0)).fill('0'), ...tailParts];
+function ipv6Bytes(ip, label) {
+  // v6Groups (forward-target.js) expands `::`, drops a zone id (fe80::1%lo0 is
+  // link-local addressing and means nothing to a remote proxy) and folds an
+  // embedded IPv4 tail into its two groups. That last one is why it is shared
+  // rather than re-done here: `::ffff:1.2.3.4` is how a dual-stack resolver
+  // reports a mapped address, and a splitter that only knew about hex groups
+  // packed the dotted quad as a single garbage group.
+  const groups = v6Groups(ip);
+  if (!groups) throw new Error(`${label}: cannot encode ${ip} as a SOCKS5 IPv6 address`);
   const out = Buffer.alloc(16);
-  parts.forEach((p, i) => out.writeUInt16BE(parseInt(p || '0', 16), i * 2));
+  groups.forEach((g, i) => out.writeUInt16BE(g, i * 2));
   return out;
 }
 
@@ -332,14 +347,19 @@ function connectThroughSocks5({ proxy, targetHost, targetPort, timeout, label })
         sendConnect();
         return;
       }
-      // stage === 'connect': VER, REP, RSV, ATYP, BND.ADDR, BND.PORT
+      // stage === 'connect': VER, REP, RSV, ATYP, BND.ADDR, BND.PORT. The
+      // version and REP are judged BEFORE the reply is sized by ATYP: a proxy
+      // refusing the CONNECT owes no valid BND.ADDR, and some send ATYP 0 (or
+      // stop after REP), so reading ATYP first turned "connection refused"
+      // into "unknown address type", or into a wait for bytes never coming.
+      if (buf.length < 2) return;
+      if (buf[0] !== 0x05) { fail(new Error(`${label}: not a SOCKS5 proxy (reply version ${buf[0]})`)); return; }
+      const rep = buf[1];
+      if (rep !== 0x00) { fail(new Error(`${label}: SOCKS5 CONNECT to ${targetHost}:${targetPort} failed — ${SOCKS5_ERRORS[rep] || `code ${rep}`}`)); return; }
       const want = socks5ReplyLength(buf, 3);
       if (want < 0) { fail(new Error(`${label}: SOCKS5 reply has unknown address type ${buf[3]}`)); return; }
       if (want === 0 || buf.length < want) return;
-      const rep = buf[1];
       const rest = buf.subarray(want);
-      if (buf[0] !== 0x05) { fail(new Error(`${label}: not a SOCKS5 proxy (reply version ${buf[0]})`)); return; }
-      if (rep !== 0x00) { fail(new Error(`${label}: SOCKS5 CONNECT to ${targetHost}:${targetPort} failed — ${SOCKS5_ERRORS[rep] || `code ${rep}`}`)); return; }
       cleanup();
       sock.pause(); // stop flowing so the TLS layer we hand it to sees every byte
       if (rest.length) sock.unshift(rest);
@@ -397,6 +417,11 @@ function connectThroughSocks4({ proxy, targetHost, targetPort, timeout, label })
     const onData = (chunk) => {
       buf = Buffer.concat([buf, chunk]);
       if (buf.length < 8) return;
+      // VN is 0 in every SOCKS4 reply. Anything else is not a SOCKS4 proxy
+      // talking (an HTTP proxy answering "HTTP/1.1 400" starts with 0x48),
+      // and reading its second byte as a result code would name a SOCKS
+      // failure that never happened.
+      if (buf[0] !== 0x00) { fail(new Error(`${label}: not a SOCKS4 proxy (reply version ${buf[0]})`)); return; }
       const rest = buf.subarray(8);
       const code = buf[1];
       if (code !== 0x5a) { fail(new Error(`${label}: SOCKS4 CONNECT to ${targetHost}:${targetPort} failed — ${SOCKS4_ERRORS[code] || `code ${code}`}`)); return; }
@@ -484,19 +509,25 @@ export function connectThroughRouting(proxy, { targetHost, targetPort, timeout =
  * @returns {Promise<{ ok: boolean, host: string, ms?: number, error?: string }>} `ms` when ok, `error` when not
  */
 export async function checkRouting(routing, url, { timeout = 10000, tlsOptions = {} } = {}) {
-  const u = new URL(url);
-  const useTls = u.protocol !== 'http:';
   const label = `account routing proxy ${describeRouting(routing)}`;
   const started = Date.now();
+  // The URL parse sits inside the try with everything else: an unparseable
+  // upstream (a mistyped accounts[].upstream, say) is one more way the check
+  // can fail, and "never rejects" has to hold for it too. Until it parses the
+  // text as given is the only name there is for the host.
+  let host = String(url);
   try {
+    const u = new URL(url);
+    host = u.host;
+    const useTls = u.protocol !== 'http:';
     const sock = await connectThroughRouting(routing, {
       targetHost: u.hostname, targetPort: Number(u.port) || (useTls ? 443 : 80), timeout, label,
     });
     if (useTls) (await handshakeOverTunnel(sock, { servername: u.hostname, tlsOptions, timeout })).destroy();
     else sock.destroy();
-    return { ok: true, host: u.host, ms: Date.now() - started };
+    return { ok: true, host, ms: Date.now() - started };
   } catch (err) {
-    return { ok: false, host: u.host, error: routingFailure(err, label).message };
+    return { ok: false, host, error: routingFailure(err, label).message };
   }
 }
 
@@ -510,11 +541,14 @@ export async function checkRouting(routing, url, { timeout = 10000, tlsOptions =
  *
  * `routing` may be the parsed object or the stored URL string; the string is
  * parsed here so a caller holding the config shape need not care.
+ *
+ * `timeout` bounds the tunnel and then the TLS handshake over it, each; see
+ * AGENT_TIMEOUT_MS for why the default is shorter than the callers' own.
  * @param {RoutingProxy|string} routing
- * @param {{ targetHost: string, targetPort: number, tls?: boolean, tlsOptions?: Record<string, any> }} options
+ * @param {{ targetHost: string, targetPort: number, tls?: boolean, tlsOptions?: Record<string, any>, timeout?: number }} options
  * @returns {http.Agent | https.Agent}
  */
-export function routingAgent(routing, { targetHost, targetPort, tls: useTls = true, tlsOptions = {} }) {
+export function routingAgent(routing, { targetHost, targetPort, tls: useTls = true, tlsOptions = {}, timeout = AGENT_TIMEOUT_MS }) {
   const proxy = /** @type {RoutingProxy} */ (typeof routing === 'string' ? parseRoutingUrl(routing) : routing);
   // Names WHICH proxy in every failure: a fleet may hold several, and "SOCKS5
   // authentication failed" alone sends the operator to the wrong one.
@@ -525,7 +559,7 @@ export function routingAgent(routing, { targetHost, targetPort, tls: useTls = tr
     /** @type {(err: Error | null, sock: import('node:stream').Duplex) => void} */ cb,
   ) => {
     const failed = (/** @type {any} */ err) => cb(routingFailure(err, label), /** @type {any} */ (null));
-    connectThroughRouting(proxy, { targetHost, targetPort, label })
+    connectThroughRouting(proxy, { targetHost, targetPort, label, timeout })
       .then((sock) => {
         if (!useTls) {
           // The tunnel pauses the socket so a TLS layer sees every byte. On the
@@ -535,7 +569,7 @@ export function routingAgent(routing, { targetHost, targetPort, tls: useTls = tr
           sock.resume();
           return;
         }
-        handshakeOverTunnel(sock, { servername: targetHost, tlsOptions })
+        handshakeOverTunnel(sock, { servername: targetHost, tlsOptions, timeout })
           .then((tlsSock) => cb(null, tlsSock), failed);
       })
       .catch(failed);

@@ -15,6 +15,12 @@ import { join } from 'node:path';
 
 const TMP = mkdtempSync(join(tmpdir(), 'tc-routing-failover-'));
 process.env.TEAMCLAUDE_CONFIG = join(TMP, 'config.json');
+// Before the imports: the budget routingAgent gives a tunnel is read once, at
+// module load. Its 20s default is what a black-holed proxy costs a request in
+// production; the test that needs one cannot wait that long. Nothing else in
+// this file comes near it (a refused port fails at once, the mock relays at
+// once).
+process.env.TEAMCLAUDE_ROUTING_TIMEOUT_MS = '800';
 
 const { AccountManager } = await import('../src/account-manager.js');
 const { createProxyServer, isTransientUpstreamError } = await import('../src/server.js');
@@ -78,6 +84,19 @@ function startSocks5() {
     });
   });
   return { srv, connects };
+}
+
+// Accepts the TCP connection and never writes a byte: a proxy that is up but
+// wedged, which is what a black-holed or firewalled proxy looks like from here
+// and the one failure a bare connect cannot tell from success.
+function startBlackHole() {
+  const sockets = new Set();
+  const srv = net.createServer((c) => {
+    sockets.add(c);
+    c.on('error', () => {});
+    c.on('close', () => sockets.delete(c));
+  });
+  return { srv, close: () => { for (const s of sockets) s.destroy(); srv.close(); } };
 }
 
 // Resolves with the HTTP response, or with the socket error when the proxy
@@ -205,6 +224,41 @@ test('a routed account with a dead proxy fails over to the next account and is h
     assert.match(rendered, /routing proxy down, retry in/);
   } finally {
     proxy.close(); upstream.srv.close();
+    proxy.closeAllConnections?.(); upstream.srv.closeAllConnections?.();
+  }
+});
+
+test('a proxy that accepts the connection and never answers is a routing failure: the forward fails over and the hold is armed', T, async () => {
+  setUpstreamProxy(resolveUpstreamProxy({ upstreamProxy: false }, {}));
+  const upstream = startUpstream();
+  const upstreamPort = await listen(upstream.srv);
+  const hole = startBlackHole();
+  const holePort = await listen(hole.srv);
+
+  const am = new AccountManager([
+    { name: 'routed', type: 'apikey', apiKey: 'sk-routed', priority: 0, routing: `socks5h://127.0.0.1:${holePort}` },
+    { name: 'direct', type: 'apikey', apiKey: 'sk-direct', priority: 1 },
+  ], 0.98);
+  const proxy = createProxyServer(am, { proxy: {}, upstream: `http://127.0.0.1:${upstreamPort}` }, {});
+  const port = await listen(proxy);
+  try {
+    let first;
+    const started = Date.now();
+    const lines = await captureLogs(async () => { first = await post(port); });
+    assert.equal(first.type, 'response', `reset instead of failing over: ${JSON.stringify(first)}\n${lines.join('\n')}`);
+    assert.equal(first.status, 200, lines.join('\n'));
+    assert.deepEqual(upstream.hits.map(h => h.key), ['sk-direct'], 'served by the account whose path works');
+    // The tunnel's own budget gave up, not some caller's longer signal (which
+    // would have surfaced as a generic timeout and been retried as transient).
+    assert.ok(Date.now() - started < 10_000, `the forward waited ${Date.now() - started}ms on the wedged proxy`);
+
+    const failed = lines.filter(l => l.includes('Routing proxy failed for account "routed"'));
+    assert.equal(failed.length, 1, lines.join('\n'));
+    assert.match(failed[0], /SOCKS5 handshake timed out after 800ms/);
+    assert.equal(am.unavailableReason(am.accounts[0]), 'routing');
+    assert.ok(am.accounts[0].routingFailedUntil > Date.now(), 'the account sits out the cooldown');
+  } finally {
+    proxy.close(); upstream.srv.close(); hole.close();
     proxy.closeAllConnections?.(); upstream.srv.closeAllConnections?.();
   }
 });

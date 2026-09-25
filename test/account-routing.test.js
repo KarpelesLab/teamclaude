@@ -330,7 +330,42 @@ test('socks5 CONNECT failure surfaces the reply code', T, async () => {
   } finally { closeHard(srv); }
 });
 
+test('a SOCKS5 refusal is read off REP before the reply is sized by its address type', T, async () => {
+  // A proxy that refuses owes no BND.ADDR, and this one sends ATYP 0 and
+  // stops. Sized by ATYP first, that read as "unknown address type" (or one
+  // byte shorter, as a reply that never completes); the refusal is the news.
+  const srv = net.createServer((c) => {
+    c.on('error', () => {});
+    c.once('data', () => {
+      c.write(Buffer.from([0x05, 0x00]));
+      c.once('data', () => c.write(Buffer.from([0x05, 0x02, 0x00, 0x00])));
+    });
+  });
+  const port = await listen(srv);
+  try {
+    await assert.rejects(
+      connectThroughRouting(parseRoutingUrl(`socks5h://127.0.0.1:${port}`), { targetHost: 'example.com', targetPort: 443, timeout: 3000 }),
+      /SOCKS5 CONNECT to example.com:443 failed — connection not allowed by ruleset/);
+  } finally { closeHard(srv); }
+});
+
 // ── SOCKS4 end to end ────────────────────────────────────────
+
+test('a SOCKS4 reply from something that is not SOCKS4 is named, not read as a result code', T, async () => {
+  // An HTTP proxy behind a socks4:// URL answers the binary request in text.
+  // Its "H" (0x48) is not the VN of 0 every SOCKS4 reply carries, and the "T"
+  // behind it is not a result code to look up.
+  const srv = net.createServer((c) => {
+    c.on('error', () => {});
+    c.once('data', () => c.end('HTTP/1.1 400 Bad Request\r\n\r\n'));
+  });
+  const port = await listen(srv);
+  try {
+    await assert.rejects(
+      connectThroughRouting(parseRoutingUrl(`socks4://127.0.0.1:${port}`), { targetHost: '127.0.0.1', targetPort: 9, timeout: 3000 }),
+      /not a SOCKS4 proxy \(reply version 72\)/);
+  } finally { closeHard(srv); }
+});
 
 test('socks4a: the domain travels after the 0.0.0.x marker', T, async () => {
   const origin = jsonOrigin();
@@ -465,6 +500,15 @@ test('checkRouting resolves with a masked reason instead of rejecting', T, async
   } finally { closeHard(srv); closeHard(origin); }
 });
 
+test('checkRouting answers an unparseable upstream URL the same way, never throwing', async () => {
+  // "Resolves either way" has to hold before the network is touched too: a
+  // mistyped accounts[].upstream is one more thing the check can find.
+  const result = await checkRouting(parseRoutingUrl('socks5://127.0.0.1:1'), 'not a url');
+  assert.equal(result.ok, false);
+  assert.equal(result.host, 'not a url');
+  assert.match(result.error, /^account routing proxy socks5:\/\/127\.0\.0\.1:1: .*Invalid URL/);
+});
+
 test('an IPv6 literal target reaches SOCKS as an address and CONNECT in brackets', T, async () => {
   // URL.hostname hands an IPv6 literal over bracketed. Left that way, SOCKS
   // would send "[::1]" to DNS as a hostname.
@@ -477,6 +521,13 @@ test('an IPv6 literal target reaches SOCKS as an address and CONNECT in brackets
       .then((s) => s.destroy(), () => {});
     assert.equal(socks.seen.atyp, 0x04, 'sent as an IPv6 address, not a domain');
     assert.equal(socks.seen.host, '0:0:0:0:0:0:0:1');
+
+    // A mapped address (how a dual-stack resolver reports an IPv4 answer)
+    // carries its dotted quad in the last two groups, not as one hex group.
+    await connectThroughRouting(parseRoutingUrl(`socks5://127.0.0.1:${socksPort}`), { targetHost: '[::ffff:127.0.0.1]', targetPort: 9, timeout: 3000 })
+      .then((s) => s.destroy(), () => {});
+    assert.equal(socks.seen.atyp, 0x04);
+    assert.equal(socks.seen.host, '0:0:0:0:0:ffff:7f00:1');
 
     // The counting proxy cannot dial this target and never answers; what it
     // was ASKED for is the whole assertion, so a short wait is enough.
