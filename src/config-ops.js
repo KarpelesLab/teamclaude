@@ -372,7 +372,9 @@ export function setAccountPriority(config, query, spec = {}) {
   if (spec.place === 'first') priority = Math.min(0, ...priorities) - 1;
   else if (spec.place === 'last') priority = Math.max(0, ...priorities) + 1;
   else priority = spec.priority;
-  if (!Number.isInteger(priority)) throw new ConfigOpError('priority must be an integer, or place must be "first" or "last"');
+  // `typeof` first: isSafeInteger takes unknown and narrows nothing, and the
+  // number the callers store and echo must not be typed as possibly absent.
+  if (typeof priority !== 'number' || !Number.isSafeInteger(priority)) throw new ConfigOpError('priority must be an integer, or place must be "first" or "last"');
   account.priority = priority;
   return { name: account.name, priority };
 }

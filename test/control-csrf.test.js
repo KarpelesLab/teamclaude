@@ -79,6 +79,33 @@ test('reload is refused cross-origin as well', async () => {
   }, { reload: async () => { reloads++; return 0; } });
 });
 
+// The account controls are config writes reachable by the identical route, so
+// the guard has to cover them too — and a refusal must land before any hook,
+// not after a write that then gets reported as refused.
+test('priority and disable are refused cross-origin, before any hook runs', async () => {
+  const ran = [];
+  const hooks = {
+    setAccountPriority: async () => { ran.push('priority'); return { name: 'bob@example.com', priority: -1 }; },
+    setAccountDisabled: async () => { ran.push('disabled'); return { name: 'bob@example.com', disabled: true }; },
+    reload: async () => { ran.push('reload'); return 0; },
+  };
+  await withServer(async (_am, port) => {
+    for (const [path, body] of [
+      ['/teamclaude/priority', { account: 'bob@example.com', place: 'first' }],
+      ['/teamclaude/disable', { account: 'bob@example.com', disabled: true }],
+    ]) {
+      const res = await fetch(`http://127.0.0.1:${port}${path}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Origin: 'https://evil.example' },
+        body: JSON.stringify(body),
+      });
+      assert.equal(res.status, 403, path);
+      assert.match((await res.json()).error, /cross-origin/);
+    }
+    assert.deepEqual(ran, [], 'a refused request must not have reached a hook');
+  }, hooks);
+});
+
 // The guard is worthless if it also blocks the CLI. curl and teamclaude attach
 // send neither header.
 test('a request with no browser headers still works', async () => {

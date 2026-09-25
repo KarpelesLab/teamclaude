@@ -399,6 +399,18 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         return;
       }
 
+      // A client key is a credential for *using* the fleet, not for shaping
+      // it: a CI job or a teammate holding one may switch and reload (both
+      // predate client keys and are runtime-only), but must not be able to
+      // rewrite which accounts the config allows rotation to reach. Only the
+      // shared proxy key and the loopback exemption reach the account
+      // controls; `req.tcClient` is set only when a clientKeys entry matched.
+      if (req.tcClient && req.method === 'POST' && (req.url === '/teamclaude/priority' || req.url === '/teamclaude/disable')) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'a client key cannot change accounts' }));
+        return;
+      }
+
       // Forward-proxy request (HTTP_PROXY): an absolute-form URL is a tool
       // proxying plain HTTP to some host. Account logic is only for hosts we
       // manage (the Anthropic upstream, which is HTTPS-only and never arrives
@@ -502,9 +514,18 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           res.end(JSON.stringify({ ok: false, error: `${isPriority ? 'priority' : 'enable/disable'} not supported` }));
           return;
         }
+        // Checked before the write, not after: a change that lands on disk but
+        // never takes effect in the running server is the worst of both, and
+        // a server with no reload hook has nothing to make it take effect.
+        if (!hooks.reload) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'reload not supported' }));
+          return;
+        }
         let body;
         try {
-          body = JSON.parse(await readControlBody(req) || '{}');
+          // `?? {}`: JSON.parse('null') is a value, and `.account` of it throws.
+          body = JSON.parse(await readControlBody(req) || '{}') ?? {};
         } catch (err) {
           const tooLarge = /** @type {Error} */ (err).message === 'body too large';
           res.writeHead(tooLarge ? 413 : 400, { 'Content-Type': 'application/json' });
@@ -520,6 +541,17 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           const result = isPriority
             ? await hook(body.account.trim(), { priority: body.priority, place: body.place, orgFilter: body.org })
             : await hook(body.account.trim(), body.disabled, { orgFilter: body.org });
+          // The write is on disk; the reload is what makes it live. Same
+          // split as the MCP changeSetting tool: a reload failure is reported
+          // as such, not as a refused change, because the file did change.
+          try {
+            await hooks.reload();
+          } catch (err) {
+            console.error('[TeamClaude] Reload after an account change failed:', /** @type {Error} */ (err).message);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'saved to the config file, but the reload failed; see the proxy log' }));
+            return;
+          }
           // Leave a trace where the manual switch already leaves one: on a
           // headless deployment this endpoint is the only way the change
           // happens, and an account leaving rotation should never be silent.

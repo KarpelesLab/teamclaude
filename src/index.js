@@ -589,17 +589,19 @@ async function serverCommand() {
   // Account controls for the dashboard's POST /teamclaude/{priority,disable}.
   // Written through atomicConfigUpdate under the config lock, so a concurrent
   // TUI edit cannot be clobbered and an op that throws leaves the file as it
-  // was; the reload after it is what makes the change take effect live.
+  // was. The endpoint runs hooks.reload afterwards, which is what makes the
+  // change take effect live — not done here, so a failed reload is reported
+  // separately from a refused write.
   hooks.setAccountPriority = async (/** @type {string} */ account, /** @type {any} */ spec) => {
-    let result = null;
+    /** @type {{ name: string, priority: number }|undefined} */
+    let result;
     await atomicConfigUpdate((/** @type {any} */ diskConfig) => { result = setAccountPriority(diskConfig, account, spec); });
-    await reloadAccounts();
     return result;
   };
   hooks.setAccountDisabled = async (/** @type {string} */ account, /** @type {boolean} */ disabled, /** @type {any} */ spec) => {
-    let result = null;
+    /** @type {{ name: string, disabled: boolean }|undefined} */
+    let result;
     await atomicConfigUpdate((/** @type {any} */ diskConfig) => { result = setAccountDisabled(diskConfig, account, disabled, spec); });
-    await reloadAccounts();
     return result;
   };
   hooks.getStatusExtra = () => ({
@@ -1980,21 +1982,31 @@ async function priorityCommand() {
     process.exit(1);
   }
 
-  // Accept the integer in any position (e.g. after --org) — first int-looking token.
-  const numTok = args.slice(2).find(t => /^-?\d+$/.test(t));
-  const spec = args.includes('--first') ? { place: /** @type {'first'} */ ('first') }
-    : args.includes('--last') ? { place: /** @type {'last'} */ ('last') }
-    : { priority: numTok != null ? parseInt(numTok, 10) : NaN };
-
-  let result;
-  try {
-    result = setAccountPriority(config, name, { ...spec, orgFilter: argValue('--org') ?? undefined });
-  } catch (err) {
-    console.error(/** @type {Error} */ (err).message);
+  const account = resolveAccount(config.accounts, name, argValue('--org'));
+  if (!account) {
+    console.error(`Account "${name}" not found`);
     process.exit(1);
   }
+
+  const priorities = config.accounts.map(a => a.priority || 0);
+  let priority;
+  if (args.includes('--first')) {
+    priority = Math.min(0, ...priorities) - 1;
+  } else if (args.includes('--last')) {
+    priority = Math.max(0, ...priorities) + 1;
+  } else {
+    // Accept the integer in any position (e.g. after --org) — first int-looking token.
+    const numTok = args.slice(2).find(t => /^-?\d+$/.test(t));
+    priority = numTok != null ? parseInt(numTok, 10) : NaN;
+    if (Number.isNaN(priority)) {
+      console.error('Provide an integer priority, or --first / --last.');
+      process.exit(1);
+    }
+  }
+
+  account.priority = priority;
   await saveConfig(config);
-  console.log(`Set priority of "${result.name}" to ${result.priority} (lower = preferred)`);
+  console.log(`Set priority of "${account.name}" to ${priority} (lower = preferred)`);
   await notifyRunningServer(config);
 }
 
@@ -2010,15 +2022,19 @@ async function setDisabledCommand(disabled) {
     process.exit(1);
   }
 
-  let result;
-  try {
-    result = setAccountDisabled(config, name, disabled, { orgFilter: argValue('--org') ?? undefined });
-  } catch (err) {
-    console.error(/** @type {Error} */ (err).message);
+  const account = resolveAccount(config.accounts, name, argValue('--org'));
+  if (!account) {
+    console.error(`Account "${name}" not found`);
     process.exit(1);
   }
+
+  if (disabled) {
+    account.disabled = true;
+  } else {
+    delete account.disabled;
+  }
   await saveConfig(config);
-  console.log(`${disabled ? 'Disabled' : 'Enabled'} account "${result.name}"`);
+  console.log(`${disabled ? 'Disabled' : 'Enabled'} account "${account.name}"`);
   await notifyRunningServer(config);
 }
 
