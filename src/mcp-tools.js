@@ -185,9 +185,9 @@ function accountIndexFor({ accountManager }, { account, org }) {
 
 /**
  * Change one account in the running fleet and in its config entry, then save,
- * the way the TUI does. Not a file edit plus reload: a reload never drops an
- * account, and it applies a disk-side priority or disabled flag to the manager
- * without mirroring it onto the entry the next save is built from.
+ * the way the TUI does. Not a file edit plus reload: a reload applies a
+ * disk-side priority or disabled flag to the manager without mirroring it onto
+ * the entry the next save is built from.
  * @param {ToolContext} ctx
  * @param {Record<string, any>} args
  * @param {(index: number, entry: Record<string, any>|null, entryIndex: number) => void} mutate
@@ -254,11 +254,12 @@ const WRITE_TOOLS = [
   {
     name: 'reload_config',
     title: 'Reload config',
-    description: 'Re-read the config file and apply it to the running server without a restart: accounts added or edited on disk, client keys, routes, thresholds and the other settings. Returns how many accounts were added.',
+    description: 'Re-read the config file and apply it to the running server without a restart: accounts added, removed or edited on disk, client keys, routes, thresholds and the other settings. Returns how many accounts were added and how many were removed.',
     write: true,
     run: async (_args, { hooks }) => {
       if (!hooks.reload) throw new ToolFailure('reload is not available on this server');
-      return { added: (await hooks.reload()) || 0 };
+      const r = await hooks.reload();
+      return { added: r?.added || 0, removed: r?.removed || 0 };
     },
   },
   {

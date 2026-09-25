@@ -1,7 +1,7 @@
 import { importCredentials } from './oauth.js';
 import { sameIdentity } from './identity.js';
 import { safeLine } from './safe-text.js';
-import { removedAccountIds } from './account-pairing.js';
+import { removedAccountIds, addedAccountIds, configIndexFor } from './account-pairing.js';
 import { ensureAccountIds } from './account-id.js';
 import { accountSwitchThreshold } from './account-manager.js';
 
@@ -204,11 +204,24 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
   // from the manager and from the in-memory config, highest index first so
   // the indices already claimed stay valid. The TUI's own in-flight removal
   // (memory first, disk second) is the opposite direction and untouched.
+  //
+  // The mirror image of the removal window above: the TUI and the MCP endpoint
+  // add into memory first and save second, so a reload landing between the two
+  // finds a running account the file does not list yet. Those ids are recorded
+  // for exactly that window (cleared once the save lands), and an account
+  // naming one is the addition itself, not a removal.
+  //
+  // The config row goes by id (configIndexFor), resolved before removeAccount
+  // splices and renumbers the manager list — the same order the TUI's remove
+  // uses. Matching by identity instead could take a namesake's row: the two
+  // lists are not positionally aligned, and resolveAccounts may have dropped a
+  // credential-less entry that agrees with this account on everything else.
+  const pendingAdds = addedAccountIds(memConfig);
   let dropped = 0;
   for (let i = accountManager.accounts.length - 1; i >= 0; i--) {
-    if (claimed.has(i)) continue;
     const gone = accountManager.accounts[i];
-    const cfgIdx = memConfig.accounts.findIndex((c, k) => !cfgClaimed.has(k) && sameIdentity(c, gone));
+    if (claimed.has(i) || pendingAdds.has(gone.id)) continue;
+    const cfgIdx = configIndexFor(memConfig.accounts, accountManager.accounts, i);
     console.log(`[TeamClaude] Removed account "${safeLine(gone.name, 64)}": its config entry is gone from disk`);
     accountManager.removeAccount(i);
     if (cfgIdx >= 0) memConfig.accounts.splice(cfgIdx, 1);

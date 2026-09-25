@@ -8,7 +8,7 @@ import {
   canUpsertOAuthAccount,
   oauthIdentityFields,
 } from './identity.js';
-import { configIndexFor, managerAccountFor, markAccountRemoved } from './account-pairing.js';
+import { configIndexFor, managerAccountFor, markAccountRemoved, markAccountAdded } from './account-pairing.js';
 import { PROVIDERS, providerOf, isSubscriptionAccount } from './provider.js';
 import { mintAccountId } from './account-id.js';
 import { formatPercent, heldResetCredits } from './status-renderer.js';
@@ -1314,9 +1314,15 @@ export class TUI {
 
   async _doSync() {
     try {
-      const count = await this.syncAccounts();
-      if (count > 0) {
-        this._addLog(`Synced ${count} new account(s) from config`);
+      const r = await this.syncAccounts();
+      // { added, removed } from the server's reload; a bare count from an
+      // older hook still reads as additions only.
+      const added = typeof r === 'number' ? r : (r?.added || 0);
+      const removed = typeof r === 'number' ? 0 : (r?.removed || 0);
+      // A removal shortens the list under the cursor, the same as _doRemove.
+      if (this.selIdx >= this.am.accounts.length) this.selIdx = Math.max(0, this.am.accounts.length - 1);
+      if (added > 0 || removed > 0) {
+        this._addLog(`Synced from config: +${added} account(s), -${removed} account(s)`);
       } else {
         this._addLog('Config reloaded, credentials refreshed');
       }
@@ -1532,6 +1538,9 @@ export class TUI {
         entry.id = mintAccountId();
         this.config.accounts.push(entry);
         this.am.addAccount(entry);
+        // Recorded until the save below lands: a reload that reads the file
+        // first would find a running account with no row and drop it.
+        markAccountAdded(this.config, entry.id);
         this._addLog(`Imported account "${entry.name}"`);
       }
 
@@ -1549,6 +1558,9 @@ export class TUI {
     const entry = { id: mintAccountId(), name, type: 'apikey', apiKey };
     this.config.accounts.push(entry);
     this.am.addAccount(entry);
+    // Same window as in _doImport: the account exists here before it does on
+    // disk, and a reload in between must not read the file as a removal.
+    markAccountAdded(this.config, entry.id);
     await this.saveConfig(this.config);
     this._addLog(`Added API key account "${name}"`);
   }

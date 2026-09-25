@@ -152,8 +152,8 @@ test('arguments that do not fit a tool are a tool error the model can read, and 
 });
 
 test('reload_config and probe_quota call through to the server hooks', async () => {
-  const { tools, calls } = await fixture({ hooks: { reload: async () => { calls.push('reload'); return 2; } } });
-  assert.deepEqual(await ok(tools, 'reload_config'), { added: 2 });
+  const { tools, calls } = await fixture({ hooks: { reload: async () => { calls.push('reload'); return { added: 2, removed: 1 }; } } });
+  assert.deepEqual(await ok(tools, 'reload_config'), { added: 2, removed: 1 });
   assert.deepEqual(await ok(tools, 'probe_quota'), { ok: true });
   assert.deepEqual(calls, ['reload', 'probe']);
 });

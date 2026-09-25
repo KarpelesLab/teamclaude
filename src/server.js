@@ -473,10 +473,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           return;
         }
         try {
-          const r = await hooks.reload();
-          // Older hooks return a bare count; the current one a { added, removed } pair.
-          const added = typeof r === 'number' ? r : (r?.added || 0);
-          const removed = typeof r === 'number' ? 0 : (r?.removed || 0);
+          const { added = 0, removed = 0 } = await hooks.reload() || {};
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: true, added, removed }));
         } catch (err) {
