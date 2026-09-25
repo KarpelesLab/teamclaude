@@ -231,7 +231,7 @@ teamclaude help              # Show all commands
 
 `GET /teamclaude/dashboard` serves a self-contained HTML page rendering the same data as `teamclaude status`: per-account quota bars (session and weekly, plus one bar per model-scoped weekly bucket upstream reports), rotation state, and active sessions — refreshed every few seconds.
 
-`teamclaude dashboard` opens this page in the system browser against a running server (it starts none; use `teamclaude server` or `teamclaude service install` for that). The page's **Reload config** and **Probe quotas** buttons mirror the corresponding TUI actions without spending message quota.
+`teamclaude dashboard` opens this page in the system browser against a running server (it starts none; use `teamclaude server` or `teamclaude service install` for that). The page's **Reload config** and **Probe quotas** buttons mirror the corresponding TUI actions without spending message quota. The **Theme** button cycles system → light → dark; the choice is kept in the browser's localStorage, and "system" follows the browser's `prefers-color-scheme`.
 
 With `proxy.usageDimensions` configured, each dimension gets its own sortable table. With `proxy.sessionDetail` on, a per-conversation table shows each conversation's session, client, project, serving accounts, and what it actually spent per weekly bucket — cache reads and cache creation included — filterable by project or client. A client session that fans out to subagents is one row per agent: the rows carry the same **Session** and are told apart by **Conv**, a short digest of the conversation each one is (see [Session-aware routing](routing.md#session-aware-routing)). That table is off by default; see [Configuration](configuration.md#usage-dimensions).
 
