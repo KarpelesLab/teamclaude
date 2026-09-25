@@ -8,6 +8,7 @@ import { ensureCerts, createConnectHandler, mitmHosts } from './mitm.js';
 import { patchAccountUuid } from './account-uuid-rewrite.js';
 import { sanitizeToolPairs } from './tool-pair-sanitize.js';
 import { sanitizeCacheControl, cacheControlSubfieldsToStrip } from './cache-control-sanitize.js';
+import { sanitizeContentBlocks, contentBlockTypesToStrip } from './content-block-sanitize.js';
 import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
 import { TopLevelFieldFinder, modelGlobMatches } from './model.js';
 import { conversationDigest, pinKeyFor } from './conversation.js';
@@ -3539,6 +3540,13 @@ export function rewriteRequestBody(body, account, url, contentType) {
     // Align the body's account_uuid (in metadata.user_id) with the account whose
     // token we're injecting (same-length patch; no-op if absent).
     if (account.accountUuid) sendBody = patchAccountUuid(sendBody, account.accountUuid);
+    // Block types a strict upstream rejects (`tool_addition` once a tool appears
+    // mid-conversation) stay in the history, so one of them fails every later
+    // turn too. Opt-in: `stripRequestFields: ["content.tool_addition"]`. Runs
+    // before the cache_control pass because it can move a breakpoint onto a
+    // block that stays, and that breakpoint still needs its subfields stripped.
+    const blockTypes = contentBlockTypesToStrip(account.stripRequestFields);
+    if (blockTypes.size) sendBody = sanitizeContentBlocks(sendBody, url, contentType, blockTypes);
     // Some strict Anthropic-compatible upstreams reject `cache_control`
     // subfields Claude Code sends (`scope`; `ttl: "1h"` on a few) with a
     // non-retryable 400, breaking EVERY request once such an account is
