@@ -136,8 +136,13 @@ const DEFAULT_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 /**
  * Refresh an expired OAuth access token using the refresh token.
  * Retries on 5xx and network errors with exponential backoff.
+ * `routing` is the account's own egress proxy (account-routing.js); null goes
+ * by the fleet path (upstream proxy when configured, direct otherwise).
+ * @param {string} refreshToken
+ * @param {string} [endpoint]
+ * @param {import('./account-routing.js').RoutingProxy|null} [routing]
  */
-export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_ENDPOINT) {
+export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_ENDPOINT, routing = null) {
   const maxRetries = 2;
   const baseDelayMs = 500;
   // Bound each attempt so a dead pooled socket (after a network drop/reconnect)
@@ -166,6 +171,7 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
           client_id: DEFAULT_CLIENT_ID,
         }),
         signal: AbortSignal.timeout(timeoutMs),
+        routing,
       });
 
       if (!res.ok) {
@@ -287,11 +293,14 @@ export function normalizeProfile(data) {
  * Fetch account profile for an OAuth token.
  * Returns { email, name, orgName, orgType, ... } on success,
  * or { error: 'reason' } on failure.
+ * @param {string} accessToken
+ * @param {import('./account-routing.js').RoutingProxy|null} [routing] - the account's own egress proxy
  */
-export async function fetchProfile(accessToken) {
+export async function fetchProfile(accessToken, routing = null) {
   try {
     const res = await proxyFetch(PROFILE_URL, {
       headers: { 'Authorization': `Bearer ${accessToken}` },
+      routing,
     });
     if (!res.ok) {
       let detail = '';
@@ -301,13 +310,88 @@ export async function fetchProfile(accessToken) {
       } catch {
         detail = await res.text().catch(() => '');
       }
-      return { error: `HTTP ${res.status}${detail ? ': ' + detail : ''}` };
+      // Carry the status alongside the message, as fetchUsage already does:
+      // a caller has to tell "this token is dead" (401) from "we could not
+      // reach the endpoint" (5xx, network), and parsing that back out of the
+      // string would be fragile. What the status means is decided by the
+      // caller (identity.js isTokenRejection); this only reports it.
+      return { error: `HTTP ${res.status}${detail ? ': ' + detail : ''}`, status: res.status };
     }
     const data = await res.json();
     return normalizeProfile(data);
   } catch (err) {
-    return { error: err.message || String(err) };
+    return { error: err.message || String(err), status: null };
   }
+}
+
+/**
+ * The profile behind a credential set, renewing a stale access token first.
+ *
+ * An import hands over whatever Claude Code left on disk, and that access
+ * token is routinely past its hour while the refresh token beside it is still
+ * good. A 401 from the profile endpoint on such a token says nothing about the
+ * account — the refresh token is what proves it — so the token is refreshed
+ * (straight away when the clock already says it has expired, sparing the
+ * doomed round trip) and the profile fetched again with the new one. The
+ * credentials that come back are the ones to save: the renewed pair over every
+ * other field the set came with.
+ *
+ * `profile.status` is then the upstream's verdict on the set as a whole, which
+ * is what identity.js isTokenRejection keys on:
+ *   - 401 when the credential is dead: the profile endpoint rejected the access
+ *     token and there was no refresh token to renew it with, or the token
+ *     endpoint rejected the refresh (400/401/403 — the same reading
+ *     account-manager gives a refresh that needs a re-login);
+ *   - the token endpoint's status, or null, when the refresh failed for a
+ *     reason that says nothing about the token (network, 5xx after retries):
+ *     the credential is unreachable, not refused, and stays importable by name.
+ * A 403 is neither refreshed nor a rejection: the upstream answers 403 to a
+ * valid token from an unexpected region (see egress-guard.js) and under an org
+ * policy, and a new token would meet the same answer.
+ *
+ * @param {Record<string, any>} creds - { accessToken, refreshToken?, expiresAt?, ... }
+ * @param {import('./account-routing.js').RoutingProxy|null} [routing] - the
+ * account's own egress proxy; every call here (the profile, and the refresh it
+ * may need first) is that account's traffic. Null goes by the fleet path.
+ * @returns {Promise<{ creds: Record<string, any>, profile: Record<string, any> }>}
+ */
+export async function profileForCredentials(creds, routing = null) {
+  /** @type {Record<string, any>|null} */
+  let profile = isTokenExpired(creds.expiresAt) ? null : await fetchProfile(creds.accessToken, routing);
+  if (profile && profile.status !== 401) return { creds, profile };
+
+  if (!creds.refreshToken) {
+    // Nothing to renew with: the upstream's answer on the access token is final.
+    profile ??= await fetchProfile(creds.accessToken, routing);
+    if (profile.status === 401) {
+      profile = { ...profile, error: `${profile.error}; no refresh token to renew it with` };
+    }
+    return { creds, profile };
+  }
+
+  let renewed;
+  try {
+    renewed = await refreshAccessToken(creds.refreshToken, undefined, routing);
+  } catch (err) {
+    // The refresh did not go through. The upstream keeps the last word on the
+    // access token itself, so one the clock wrote off is still presented once:
+    // a skewed clock must not refuse a token the upstream accepts.
+    profile ??= await fetchProfile(creds.accessToken, routing);
+    if (profile.status !== 401) return { creds, profile };
+    const e = /** @type {CodedError} */ (err);
+    const rejected = e.status === 400 || e.status === 401 || e.status === 403;
+    return {
+      creds,
+      profile: rejected
+        ? { ...profile, error: `${profile.error}; token refresh rejected: ${e.message}` }
+        // Not a verdict: the refresh token may well be good, so this is the
+        // unreachable shape, carrying the token endpoint's status if it gave one.
+        : { error: `${profile.error}; token refresh failed: ${e.message}`, status: e.status ?? null },
+    };
+  }
+
+  const fresh = { ...creds, ...renewed };
+  return { creds: fresh, profile: await fetchProfile(fresh.accessToken, routing) };
 }
 
 // Pull a per-model weekly limit out of the payload's `limits[]` array, which is
@@ -465,8 +549,10 @@ export function normalizeUsageBucket(bucket) {
  * poll. Returns normalized { fiveHour, sevenDay, sevenDaySonnet, sevenDayFable } buckets
  * plus scopedWeeklyListed (whether the payload enumerated its model-scoped
  * weekly caps), or { error, status } on failure.
+ * @param {string} accessToken
+ * @param {import('./account-routing.js').RoutingProxy|null} [routing] - the account's own egress proxy
  */
-export async function fetchUsage(accessToken) {
+export async function fetchUsage(accessToken, routing = null) {
   try {
     const res = await proxyFetch(USAGE_URL, {
       headers: {
@@ -474,6 +560,7 @@ export async function fetchUsage(accessToken) {
         'anthropic-beta': OAUTH_USAGE_BETA,
         'Accept': 'application/json',
       },
+      routing,
     });
 
     if (!res.ok) {
@@ -532,8 +619,17 @@ const MANUAL_LOGIN_REDIRECT_URI = 'https://console.anthropic.com/oauth/code/call
 /**
  * Exchange an OAuth authorization code for access/refresh tokens.
  * Shared by both browser-callback and manual/paste login paths.
+ * `routing` is the about-to-be-added account's own egress proxy (the login
+ * CLI's --routing): the exchange and the profile fetch that follows are that
+ * account's traffic too.
+ * @param {string} code
+ * @param {string} state
+ * @param {string} codeVerifier
+ * @param {string} redirectUri
+ * @param {string} [tokenEndpoint]
+ * @param {import('./account-routing.js').RoutingProxy|null} [routing]
  */
-async function exchangeCodeForTokens(code, state, codeVerifier, redirectUri, tokenEndpoint = DEFAULT_TOKEN_ENDPOINT) {
+async function exchangeCodeForTokens(code, state, codeVerifier, redirectUri, tokenEndpoint = DEFAULT_TOKEN_ENDPOINT, routing = null) {
   const tokenRes = await proxyFetch(tokenEndpoint, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -545,6 +641,7 @@ async function exchangeCodeForTokens(code, state, codeVerifier, redirectUri, tok
       redirect_uri: redirectUri,
       code_verifier: codeVerifier,
     }),
+    routing,
   });
 
   if (!tokenRes.ok) {
@@ -606,8 +703,9 @@ export function parseAuthCode(input, expectedState) {
 /**
  * Perform OAuth login via browser with PKCE flow.
  * Opens the user's browser, waits for the callback, exchanges the code for tokens.
+ * @param {{ routing?: import('./account-routing.js').RoutingProxy|null }} [opts]
  */
-export async function loginOAuth() {
+export async function loginOAuth({ routing = null } = {}) {
   // Generate PKCE
   const codeVerifier = randomBytes(32).toString('base64url');
   const codeChallenge = createHash('sha256').update(codeVerifier).digest('base64url');
@@ -643,7 +741,7 @@ export async function loginOAuth() {
 
   // Exchange code for tokens
   console.log('Exchanging authorization code for tokens...');
-  return exchangeCodeForTokens(code, state, codeVerifier, redirectUri);
+  return exchangeCodeForTokens(code, state, codeVerifier, redirectUri, DEFAULT_TOKEN_ENDPOINT, routing);
 }
 
 /**
@@ -651,8 +749,9 @@ export async function loginOAuth() {
  * User opens the authorization URL on any device, logs in, and pastes back
  * the authorization code shown on the success page. Useful for headless
  * machines, remote servers, or when localhost callbacks are unavailable.
+ * @param {{ routing?: import('./account-routing.js').RoutingProxy|null }} [opts]
  */
-export async function loginOAuthWithPastedCode() {
+export async function loginOAuthWithPastedCode({ routing = null } = {}) {
   // Generate PKCE
   const codeVerifier = randomBytes(32).toString('base64url');
   const codeChallenge = createHash('sha256').update(codeVerifier).digest('base64url');
@@ -694,7 +793,7 @@ export async function loginOAuthWithPastedCode() {
 
   // Exchange code for tokens
   console.log('Exchanging authorization code for tokens...');
-  return exchangeCodeForTokens(parsed.code, parsed.state, codeVerifier, redirectUri);
+  return exchangeCodeForTokens(parsed.code, parsed.state, codeVerifier, redirectUri, DEFAULT_TOKEN_ENDPOINT, routing);
 }
 
 /**

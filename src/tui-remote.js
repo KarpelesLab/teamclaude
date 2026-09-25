@@ -253,6 +253,9 @@ export class RemoteAccountManager {
       status: text(a?.status, 16, a?.status == null ? undefined : '?'),
       orgName: a?.orgName == null ? a?.orgName : text(a.orgName, NAME_MAX),
       unavailable: a?.unavailable == null ? a?.unavailable : text(a.unavailable, 64),
+      // Already password-masked by the server; still a payload string drawn
+      // into the frame, so it gets the same scrub as everything else.
+      routing: a?.routing == null ? a?.routing : text(a.routing, 128),
       quota: { ...(a?.quota || {}) },
     }));
     // -1 when the payload names an account that is no longer listed: nothing is
