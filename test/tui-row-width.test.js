@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
-import { TUI, blockedFamilies, switchThresholdTag } from '../src/tui.js';
+import { TUI, blockedFamilies, switchThresholdTag, routingTag } from '../src/tui.js';
 
 // The account row is laid out against a width budget. The budget used to count
 // only the first two bars, so the S7/F7 bars a Fable/Sonnet fleet draws ran past
@@ -157,6 +157,20 @@ test('switchThresholdTag names a bare-number override "at", and a table by bucke
     switchThresholdTag({ switchThreshold: { unified7d: 0.9, unified7dFable: 0.8 } }, fleetFor),
     'switch 7d 90%, fable 80%',
   );
+});
+
+// ── routing tag ─────────────────────────────────────────────
+
+test('routingTag is silent on the fleet path, and masked in both shapes it can arrive', () => {
+  assert.equal(routingTag({}), '');
+  assert.equal(routingTag({ routing: null }), '');
+  // The live manager holds the parsed object...
+  assert.equal(
+    routingTag({ routing: { protocol: 'socks5h', host: 'proxy.example.com', port: 1080, username: 'alice', password: 's3cret' } }),
+    'via socks5h://alice:***@proxy.example.com:1080',
+  );
+  // ...an attached dashboard holds the payload's already-masked string.
+  assert.equal(routingTag({ routing: 'http://proxy.example.com:3128' }), 'via http://proxy.example.com:3128');
 });
 
 test('no account row overflows with a per-account switch-threshold tag', () => {

@@ -1,6 +1,6 @@
 import { createWriteStream } from 'node:fs';
 import { gatingUtilization } from './model.js';
-import { importCredentials, fetchProfile } from './oauth.js';
+import { importCredentials, fetchProfile, formatMoney } from './oauth.js';
 import {
   sameIdentity,
   findUpsertTarget,
@@ -8,12 +8,13 @@ import {
   canUpsertOAuthAccount,
   oauthIdentityFields,
 } from './identity.js';
-import { configIndexFor, managerAccountFor, markAccountRemoved } from './account-pairing.js';
-import { PROVIDERS, providerOf, isSubscriptionAccount } from './provider.js';
+import { configIndexFor, managerAccountFor, markAccountRemoved, markAccountAdded } from './account-pairing.js';
+import { PROVIDERS, providerOf, isSubscriptionAccount, upstreamFor } from './provider.js';
 import { mintAccountId } from './account-id.js';
 import { formatPercent, heldResetCredits } from './status-renderer.js';
-import { resolveMaxUsage, switchThresholdDiffs } from './model.js';
-import { parseProxyUrl, proxyToUrl, describeProxy, describeSelfProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy } from './upstream-proxy.js';
+import { resolveMaxUsage, resolveMaxSpendMinor, switchThresholdDiffs } from './model.js';
+import { parseProxyUrl, proxyToUrl, describeProxy, describeSelfProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy, localListener, isSelfProxy } from './upstream-proxy.js';
+import { describeRouting, parseRoutingUrl, routingToUrl, checkRouting } from './account-routing.js';
 import { sanitizeText, safeLine } from './safe-text.js';
 // The setting rules live in one module; the CLI, the MCP tools and this screen
 // all read them from there, so they cannot drift apart (#426).
@@ -263,19 +264,38 @@ function rowCategory(/** @type {any} */ account) {
 // `threshold` is a number, or a per-bucket lookup (bucket → number) so a family
 // is judged against its OWN configured threshold rather than the global one.
 /**
- * Short row tag for an account that bills real money past its plan limits:
- * `$!` once something has actually been billed, `$` while it merely can be,
- * '' when it cannot. ASCII on purpose — the row is width-budgeted to the cell,
- * and a glyph whose width varies by terminal would push it past the edge.
+ * Short row tag for an account that bills real money past its plan limits: the
+ * month-to-date amount once something has actually been billed (`$14.35`), `$`
+ * while it merely can be, '' when it cannot. With a money cap configured
+ * (accounts[].maxSpend) the cap trails it, `$14.35/20`, so the row shows how
+ * much of the budget is gone without a trip to the status screen. ASCII on
+ * purpose — the row is width-budgeted to the cell, and a glyph whose width
+ * varies by terminal would push it past the edge; the budget takes this tag's
+ * width from the same call, so a longer amount widens the column, never the row.
  *
  * Deliberately not shown for an account that spent earlier and has since been
  * switched off: the row reports what rotating onto this account costs now, and
  * the status screen carries the fuller history.
+ *
+ * @param {any} quota
+ * @param {number | null} [maxSpend] the account's accounts[].maxSpend, if any
  */
-export function spendTag(quota) {
+export function spendTag(quota, maxSpend = null) {
   const spend = quota?.spend;
   if (!spend?.enabled) return '';
-  return (spend.usedMinor || 0) > 0 ? '$!' : '$';
+  const used = spend.usedMinor || 0;
+  const capMinor = resolveMaxSpendMinor(maxSpend, spend);
+  const cap = capMinor == null ? '' : `/${compactMoney(capMinor, spend)}`;
+  if (used <= 0) return `$${cap}`;
+  return `${formatMoney({ ...spend, limitMinor: null })}${cap}`;
+}
+
+// `20` for a whole-unit cap, `12.5` otherwise: the cap is the operator's own
+// round number, so the cents that formatMoney always carries would only be
+// noise after the slash.
+/** @param {number} minor @param {{ exponent?: number } | null | undefined} spend */
+function compactMoney(minor, spend) {
+  return String(minor / 10 ** (spend?.exponent ?? 2));
 }
 
 // The type column: the auth kind (7 columns), or the provider in a mixed pool.
@@ -294,9 +314,9 @@ function typeColumn(/** @type {any[]} */ accounts) {
  * terminal pushes it past the edge.
  *
  * The number is what the account HOLDS. It is deliberately not the number that
- * could be redeemed right now: only the account's own credit rows say whether a
- * given credit is supported by the plan, and they cost a request nobody should
- * make to draw a badge.
+ * could be redeemed right now: only the detail rows say whether a given credit
+ * is supported by the plan, and they cost a request nobody should make to draw
+ * a badge. See codex-reset-credits.js.
  *
  * A reading older than RESET_CREDIT_MAX_AGE_MS draws nothing: the row has no
  * room to say how old the count is, so past the point where it stops being
@@ -354,6 +374,21 @@ export function switchThresholdTag(account, fleetFor) {
     return `${label} ${formatPercent(value)}`;
   });
   return `switch ${parts.join(', ')}`;
+}
+
+/**
+ * "via socks5h://alice:***@host:1080" — the account's OWN egress proxy, or ''
+ * when it has none: the fleet path is the default and earns no tag. The live
+ * TUI reads the parsed object the manager holds; an attached dashboard reads
+ * the already-masked string the status payload carries (passwords never cross
+ * that boundary) — both land here.
+ * @param {any} account
+ */
+export function routingTag(account) {
+  const r = account?.routing;
+  if (!r) return '';
+  const text = typeof r === 'string' ? r : describeRouting(r);
+  return text ? `via ${text}` : '';
 }
 
 /** Fit a line to exactly w columns: truncate if too long, pad if too short.
@@ -517,7 +552,10 @@ function timestamp() {
 // ── TUI class ────────────────────────────────────────────────
 
 export class TUI {
-  constructor({ accountManager, config, saveConfig, syncAccounts, onQuit, sx = null, probeQuota = null, activityLogPath = null,
+  constructor({ accountManager, config, saveConfig, syncAccounts, onQuit, sx = null, probeQuota = null,
+    // Cast so the destructured binding is the callback type, not `null`: index.js passes a function here.
+    loginAccount = /** @type {null | ((account: Record<string, any>) => Promise<{ action: 'updated' | 'added', name: string }>)} */ (null),
+    activityLogPath = null,
     // Attach mode: the accounts belong to a server in another process, reached
     // over its control plane. Everything that would mutate local state is off,
     // and a switch becomes a request (applySwitch) instead of an assignment.
@@ -525,6 +563,8 @@ export class TUI {
     // Injectable so the import path can be exercised without a real credentials
     // file or a live profile call.
     readCredentials = importCredentials, readProfile = fetchProfile,
+    // Injectable so setting an account's proxy can be exercised without one.
+    testRouting = checkRouting,
     // Names the activity column against the session id the client sent. Absent
     // or disabled leaves every row showing the short id.
     sessionTitles = null,
@@ -542,9 +582,12 @@ export class TUI {
     this.sx = sx;            // sx.org proxy manager (may be null)
     this.sxBalance = null;   // last fetched sx.org balance, for the settings screen
     this.probeQuota = probeQuota; // on-demand fleet-wide quota refresh (may be null)
+    /** @type {null | ((account: Record<string, any>) => Promise<{ action: 'updated' | 'added', name: string }>)} */
+    this.loginAccount = loginAccount; // browser (re-)login for a chosen account (may be null)
     this.activityLogPath = activityLogPath;
     this._readCredentials = readCredentials;
     this._readProfile = readProfile;
+    this._testRouting = testRouting;
     this._activityStream = null;
     this.sessionTitles = sessionTitles;
     this.versionLabel = versionLabel;
@@ -555,11 +598,12 @@ export class TUI {
     this.mode = 'normal';    // normal | select | add | input | settings | pick
     this.pick = null;        // active list picker (routes editor accounts/bucket/color)
     this.pickReturn = 'routes'; // mode to fall back to when the picker closes
-    this.selAction = null;   // switch | remove | toggle | reorder
+    this.selAction = null;   // switch | remove | toggle | reorder | routing
     this.selIdx = 0;
     this.selRoute = null;    // in switch mode: null = global default, else a getRoutes() entry to pin
     this.selReturn = 'normal'; // mode to fall back to when select mode closes
     this.setIdx = 0;         // cursor row on the settings screen (BIOS-style nav)
+    this.setScroll = 0;      // first body line the settings screen shows (see _viewport)
     this.blockIdx = 0;       // cursor row on the blocked-models editor
     this.inputPrompt = '';
     this.inputBuf = '';
@@ -831,6 +875,17 @@ export class TUI {
     if (d === '\x03') return this._key('ctrl-c');
     if (d === '\x7f' || d === '\x08') return this._key('bs');
     if (d.length === 1 && d >= ' ') return this._key(d);
+    // A paste arrives as ONE chunk of many characters, which the line above
+    // turns away, so a pasted proxy URL or API key vanished without a sign,
+    // and those are exactly the values nobody types by hand. Only a text
+    // prompt takes it, and never anything holding an escape: that is a key
+    // sequence this parser does not know, not text. Control characters are
+    // dropped, the clipboard's trailing newline among them, so a paste fills
+    // the prompt and the operator still presses Enter on what they can see.
+    if (this.mode === 'input' && d.length > 1 && !d.includes('\x1b')) {
+      this.inputBuf += d.replace(/[\x00-\x1f\x7f]/g, '');
+      this.render();
+    }
   }
 
   _key(k) {
@@ -864,6 +919,16 @@ export class TUI {
       this.mode = 'select'; this.selAction = 'toggle'; this.selIdx = this.am.currentIndex; this.selReturn = 'normal';
     }
     else if (k === 'p' && this.am.accounts.length > 0) { this._doProbe(); }
+    // Re-login: an OAuth account whose refresh token upstream has rejected stays
+    // in 'error' until someone signs in again, and that someone is usually
+    // looking at this screen. The cursor starts on the first account that needs
+    // it, so the common case is `l`, Enter.
+    else if (k === 'l' && this.loginAccount && this.am.accounts.length > 0) {
+      const order = this._displayOrder();
+      const broken = order.find((/** @type {number} */ i) => this.am.accounts[i]?.status === 'error');
+      this.mode = 'select'; this.selAction = 'login'; this.selReturn = 'normal';
+      this.selIdx = broken ?? order[0] ?? 0;
+    }
     else if (k === 'g') { this.mode = 'settings'; this.setIdx = 0; this._loadSxBalance(); }
   }
 
@@ -891,6 +956,20 @@ export class TUI {
       left: () => this._nudgeThreshold(-1),
       right: () => this._nudgeThreshold(+1),
       enter: () => this._promptInput('Switch threshold % (1-100, tenths allowed)', v => this._doSetThreshold(v.trim())),
+    });
+
+    // Fleet-scoped because the policy behind it is: a credit is spent only when
+    // the whole Codex pool is dry. It sits here, on the screen, rather than in
+    // the config file alone because the one thing an operator needs from this
+    // setting is to be able to kill it at once.
+    fields.push({
+      id: 'autoRedeemResets',
+      label: 'Auto-redeem',
+      hint: '←→ toggle',
+      value: () => (this.config.autoRedeemResets === true ? green('on') : gray('off')),
+      left: () => this._toggleAutoRedeemResets(),
+      right: () => this._toggleAutoRedeemResets(),
+      enter: () => this._toggleAutoRedeemResets(),
     });
 
     fields.push({
@@ -1027,6 +1106,23 @@ export class TUI {
       enter: () => this._promptInput('Upstream proxy (host:port, or blank for direct)', v => this._doSetUpstreamProxy(v.trim())),
     });
 
+    // ONE account's own proxy (accounts[].routing), beside the fleet's: the two
+    // answer the same question at different scopes. Named "proxy", not
+    // "routing": "Manage routing" above is the per-model routes screen, and two
+    // rows sharing a word would send the operator to the wrong one.
+    if (this.am.accounts.length > 0) {
+      fields.push({
+        id: 'accountProxy',
+        label: 'Account proxy',
+        hint: 'Enter to pick',
+        value: () => {
+          const n = this.am.accounts.filter((/** @type {any} */ a) => a.routing).length;
+          return n ? green(`${n} of ${this.am.accounts.length} routed`) : dim('(none)');
+        },
+        enter: () => { this.mode = 'select'; this.selAction = 'routing'; this.selIdx = this._displayOrder()[0] ?? 0; this.selReturn = 'settings'; },
+      });
+    }
+
     if (this.sx) {
       fields.push({
         id: 'sxmode',
@@ -1127,10 +1223,13 @@ export class TUI {
     // Tenths of a percent are kept; anything finer is quantised so the stored
     // value is the one the screen shows.
     const v = Math.round(pct * 10) / 1000;
+    const prev = { config: this.config.switchThreshold, live: this.am.switchThreshold };
     this.config.switchThreshold = v;
     this.am.switchThreshold = v; // apply to the running rotation immediately
-    try { await this.saveConfig(this.config); }
-    catch (e) { this._addLog(`Failed to save: ${e.message}`); }
+    if (!await this._saveSetting('switch threshold', () => {
+      this.config.switchThreshold = prev.config;
+      this.am.switchThreshold = prev.live;
+    })) { this.mode = 'settings'; if (this.running) this.render(); return; }
     this._addLog(`Switch threshold set to ${formatPercent(v)}`);
     this.mode = 'settings';
     if (this.running) this.render();
@@ -1186,10 +1285,16 @@ export class TUI {
         this._doSwitchSelection();
       } else if (this.selAction === 'toggle') {
         this._doToggleDisabled(this.selIdx);
+      } else if (this.selAction === 'login') {
+        this._doLogin(this.selIdx);
       } else if (this.selAction === 'reorder') {
         // Every move is already applied, so Enter only means "done" — and it
         // has to be caught here, ahead of the remove branch below, which is
         // what an unlisted action falls into.
+      } else if (this.selAction === 'routing') {
+        // Opens the URL prompt, which leaves select mode by itself; the mode
+        // check below then has nothing to undo.
+        this._promptAccountRouting(this.selIdx);
       } else {
         this._doRemove(this.selIdx);
       }
@@ -1324,11 +1429,56 @@ export class TUI {
     }
   }
 
+  // Browser login for the account under the cursor (the `l` key). The row
+  // chooses the PROVIDER's sign-in page and tells the operator which identity to
+  // sign in as; it does not choose where the tokens go. They go to the account
+  // the browser actually signed in as — the same identity match `teamclaude
+  // login` makes — because writing one person's tokens onto the row that was
+  // merely highlighted would be a credential crossing. So a sign-in as someone
+  // else is reported as exactly that, and the picked row stays in need of one.
+  // Fire-and-forget: the flow waits on a human for up to two minutes, and the
+  // dashboard has to stay live meanwhile.
+  async _doLogin(/** @type {number} */ idx) {
+    const acct = this.am.accounts[idx];
+    if (!acct) { this._addLog('That account is no longer listed'); return; }
+    if (!this.loginAccount) { this._addLog('Login unavailable'); return; }
+    if (acct.type !== 'oauth') { this._addLog(`"${acct.name}" is not an OAuth account — nothing to sign in to`); return; }
+    // An importFrom row owns no tokens of its own: every reload re-reads the
+    // file it points at, so tokens the upsert wrote onto the row would be
+    // ignored on the next reload and the account would land back in `error`.
+    const entry = acct.id ? this.config?.accounts?.find((/** @type {any} */ c) => c.id === acct.id) : null;
+    if (entry?.importFrom) { this._addLog(`"${acct.name}" reads its tokens from ${entry.importFrom} — sign in there instead`); return; }
+    // One at a time: a second flow would race the first for the browser, and
+    // for Codex for the fixed callback port as well.
+    if (this._loggingIn) { this._addLog(`Still waiting on the sign-in for "${this._loggingIn}"`); return; }
+    this._loggingIn = acct.name;
+    this._addLog(`Sign in as "${acct.name}" in the browser (waits 2 minutes)...`);
+    try {
+      const outcome = await this.loginAccount(acct);
+      if (outcome?.name && outcome.name !== acct.name) {
+        this._addLog(`Signed in as "${outcome.name}" (${outcome.action}), not "${acct.name}" — that one still needs a login`);
+      } else {
+        this._addLog(`Logged in "${acct.name}"`);
+      }
+    } catch (/** @type {any} */ e) {
+      this._addLog(`Login failed for "${acct.name}": ${e?.message || e}`);
+    } finally {
+      this._loggingIn = null;
+      if (this.running) this.render();
+    }
+  }
+
   async _doSync() {
     try {
-      const count = await this.syncAccounts();
-      if (count > 0) {
-        this._addLog(`Synced ${count} new account(s) from config`);
+      const r = await this.syncAccounts();
+      // { added, removed } from the server's reload; a bare count from an
+      // older hook still reads as additions only.
+      const added = typeof r === 'number' ? r : (r?.added || 0);
+      const removed = typeof r === 'number' ? 0 : (r?.removed || 0);
+      // A removal shortens the list under the cursor, the same as _doRemove.
+      if (this.selIdx >= this.am.accounts.length) this.selIdx = Math.max(0, this.am.accounts.length - 1);
+      if (added > 0 || removed > 0) {
+        this._addLog(`Synced from config: +${added} account(s), -${removed} account(s)`);
       } else {
         this._addLog('Config reloaded, credentials refreshed');
       }
@@ -1371,6 +1521,65 @@ export class TUI {
     this.mode = 'settings';
   }
 
+  /** @param {number} idx */
+  _promptAccountRouting(idx) {
+    const acct = this.am.accounts[idx];
+    if (!acct) return;
+    // `none`, as the CLI and the MCP tool spell it: _promptInput drops a blank
+    // entry, which is the right meaning for blank here too (no change).
+    this._promptInput(`Proxy for ${safeLine(acct.name, 40)} (URL${acct.routing ? ', or none to clear' : ''})`,
+      (/** @type {string} */ v) => this._doSetAccountRouting(idx, v.trim()));
+  }
+
+  /** Set or clear one account's own proxy. A new URL is tested first, as the
+   *  CLI does, and for a stronger reason: here the change is live the moment it
+   *  is made, so a mistyped password would take a serving account out of
+   *  rotation with the operator watching.
+   *  @param {number} idx
+   *  @param {string} value */
+  async _doSetAccountRouting(idx, value) {
+    const acct = this.am.accounts[idx];
+    if (!acct) return;
+    let routing = null;
+    if (!/^(none|off|-)$/i.test(value)) {
+      try {
+        routing = parseRoutingUrl(value);
+      } catch (/** @type {any} */ e) {
+        this._addLog(`Invalid proxy: ${e.message}`);
+        return;
+      }
+      if (!routing) return;
+      // Our own listener would pass the test below (this server answers a
+      // CONNECT) and then loop every request straight back in.
+      if (isSelfProxy(routing, localListener(this.config))) {
+        this._addLog(`Proxy not set: ${describeRouting(routing)} is this server's own address, and would loop back into it`);
+        return;
+      }
+      this._addLog(`Testing ${describeRouting(routing)}...`);
+      if (this.running) this.render();
+      const check = await this._testRouting(routing, upstreamFor(acct, this.config.upstream));
+      if (!check.ok) {
+        this._addLog(`Proxy not set: ${check.error}`);
+        if (this.running) this.render();
+        return;
+      }
+    }
+
+    // Resolved before the await below: a manager index is not a config index
+    // (see _doToggleDisabled).
+    const cfgIdx = configIndexFor(this.config.accounts, this.am.accounts, idx);
+    this.am.setRouting(idx, routing);
+    // An explicit null, not a deleted key: the save merges over the on-disk
+    // entry, and a missing key would leave the old `routing` standing.
+    if (cfgIdx >= 0) this.config.accounts[cfgIdx].routing = routing ? routingToUrl(routing) : null;
+    try { await this.saveConfig(this.config); }
+    catch (/** @type {any} */ e) { this._addLog(`Failed to save: ${e.message}`); }
+    this._addLog(routing
+      ? `"${safeLine(acct.name, 64)}" now leaves through ${describeRouting(routing)}`
+      : `Cleared the proxy for "${safeLine(acct.name, 64)}"; it uses the fleet egress`);
+    if (this.running) this.render();
+  }
+
   // ── sx.org settings ────────────────────────────────
 
   _loadSxBalance() {
@@ -1398,14 +1607,36 @@ export class TUI {
     if (this.running) this.render();
   }
 
+  /**
+   * Save the shared config after a settings change; on a failed save, put the
+   * old value back. The gates (event logging, the blocklist, session titles, the
+   * sx mode) are read live off the same object, so a value that stayed in memory
+   * after the save failed would change what the running server does while disk
+   * still said otherwise, and the settings row would show the new value the
+   * whole time. Restoring it keeps memory, screen and file in step, and the log
+   * line says which setting was left alone (#443).
+   * @param {string} label what the row is called, for the log line
+   * @param {() => void} revert puts the previous value back in memory
+   * @returns {Promise<boolean>} whether the save landed
+   */
+  async _saveSetting(label, revert) {
+    try { await this.saveConfig(this.config); return true; }
+    catch (/** @type {any} */ e) {
+      revert();
+      this._addLog(`Failed to save: ${e.message} — ${label} left unchanged`);
+      if (this.running) this.render();
+      return false;
+    }
+  }
+
   // Cycle off → on-429 → always (dir +1) or the reverse (dir -1). Keeps the API
   // key, so the user can disable sx.org without deconfiguring it.
   async _cycleSxMode(dir = 1) {
     const order = ['off', '429', 'always'];
     const next = order[(order.indexOf(this.sx.getMode()) + dir + order.length) % order.length];
+    const prev = this.config.sx;
     this.config.sx = { ...(this.config.sx || {}), mode: next };
-    try { await this.saveConfig(this.config); }
-    catch (e) { this._addLog(`Failed to save: ${e.message}`); }
+    if (!await this._saveSetting('sx.org mode', () => { this.config.sx = prev; })) return;
     const r = await this.sx.setMode(next);
     this._addLog(`sx.org mode: ${this._sxModeLabel(next)}${r.ok ? '' : ` — ${r.error}`}`);
     if (next !== 'off') this._loadSxBalance();
@@ -1416,21 +1647,41 @@ export class TUI {
     // The shared config object is what a save writes and a reload re-applies,
     // so it is the record; the store is configured from it, never the reverse.
     const enabled = !this.sessionTitles.enabled;
+    const prev = this.config.sessionTitles;
     this.config.sessionTitles = { ...this.config.sessionTitles, enabled };
     this.sessionTitles.configure(this.config.sessionTitles);
-    try { await this.saveConfig(this.config); }
-    catch (e) { this._addLog(`Failed to save: ${e.message}`); }
+    if (!await this._saveSetting('session titles', () => {
+      this.config.sessionTitles = prev;
+      this.sessionTitles.configure(prev);
+    })) return;
     this._addLog(`Session titles: ${enabled ? 'on' : 'off'}`);
+    if (this.running) this.render();
+  }
+
+  async _toggleAutoRedeemResets() {
+    // Whether a spent weekly Codex window may spend one of that account's free
+    // rate-limit reset credits. Fleet-scoped: the policy it arms is about the
+    // whole pool being dry, so its switch is too. The redeemer reads it off the
+    // shared config per refusal, so the assignment is the whole application and
+    // the save is only what survives a restart.
+    //
+    // A per-account `autoRedeemReset: false` still exempts its account while
+    // this is on; nothing per-account can switch it ON.
+    const prev = this.config.autoRedeemResets;
+    const next = prev !== true;
+    this.config.autoRedeemResets = next;
+    if (!await this._saveSetting('auto-redeem', () => { this.config.autoRedeemResets = prev; })) return;
+    this._addLog(`Auto-redeem Codex reset credits: ${next ? 'on' : 'off'}`);
     if (this.running) this.render();
   }
 
   async _toggleQuotaBarPercent() {
     // Absent means on, so the first toggle from a config that predates the key
     // has to write `false` — hence the comparison rather than a negation.
-    const on = this.config.quotaBarPercent === false;
+    const prev = this.config.quotaBarPercent;
+    const on = prev === false;
     this.config.quotaBarPercent = on;
-    try { await this.saveConfig(this.config); }
-    catch (/** @type {any} */ e) { this._addLog(`Failed to save: ${e.message}`); }
+    if (!await this._saveSetting('bar percentage', () => { this.config.quotaBarPercent = prev; })) return;
     this._addLog(`Quota bar percentage: ${on ? 'on' : 'off'}`);
     if (this.running) this.render();
   }
@@ -1438,11 +1689,11 @@ export class TUI {
   async _cycleEventLogging(dir = 1) {
     // Claude Code telemetry display/handling: show → hide → block → show.
     const order = ['show', 'hide', 'block'];
-    const cur = this.config.eventLogging || 'hide';
+    const prev = this.config.eventLogging;
+    const cur = prev || 'hide';
     const next = order[(order.indexOf(cur) + dir + order.length) % order.length];
     this.config.eventLogging = next; // shared config object; the server reads it live
-    try { await this.saveConfig(this.config); }
-    catch (e) { this._addLog(`Failed to save: ${e.message}`); }
+    if (!await this._saveSetting('event logging', () => { this.config.eventLogging = prev; })) return;
     this._addLog(`Event logging: ${next}`);
     if (this.running) this.render();
   }
@@ -1452,10 +1703,10 @@ export class TUI {
     // Base-URL keeps a shell's other tools off the proxy (#382); MITM covers the
     // hard-coded endpoints and the Codex CLI. Read from disk by those commands,
     // so the save is the whole application.
-    const next = this.config.defaultClientMode === 'base-url' ? 'mitm' : 'base-url';
+    const prev = this.config.defaultClientMode;
+    const next = prev === 'base-url' ? 'mitm' : 'base-url';
     this.config.defaultClientMode = next;
-    try { await this.saveConfig(this.config); }
-    catch (/** @type {any} */ e) { this._addLog(`Failed to save: ${e.message}`); }
+    if (!await this._saveSetting('client mode', () => { this.config.defaultClientMode = prev; })) return;
     this._addLog(`Default client mode: ${next} (run/env without a flag)`);
     if (this.running) this.render();
   }
@@ -1536,6 +1787,11 @@ export class TUI {
           if (amAcct.status === 'error') amAcct.status = 'active';
         }
         this._addLog(`Updated account "${prev.name}"`);
+        // Which account a credential belongs to is only known once its profile
+        // has been read, so that one lookup cannot go through a proxy it has
+        // not found yet. Said, because the operator routed this account to
+        // keep its traffic off this machine's address.
+        if (prev.routing) this._addLog(`Note: "${safeLine(prev.name, 64)}" has its own proxy, and this import's profile lookup did not go through it`);
       } else {
         // New org for this person: disambiguate colliding email names with " (org)".
         if (profile?.accountUuid) {
@@ -1555,6 +1811,9 @@ export class TUI {
         entry.id = mintAccountId();
         this.config.accounts.push(entry);
         this.am.addAccount(entry);
+        // Recorded until the save below lands: a reload that reads the file
+        // first would find a running account with no row and drop it.
+        markAccountAdded(this.config, entry.id);
         this._addLog(`Imported account "${entry.name}"`);
       }
 
@@ -1572,6 +1831,9 @@ export class TUI {
     const entry = { id: mintAccountId(), name, type: 'apikey', apiKey };
     this.config.accounts.push(entry);
     this.am.addAccount(entry);
+    // Same window as in _doImport: the account exists here before it does on
+    // disk, and a reload in between must not read the file as a removal.
+    markAccountAdded(this.config, entry.id);
     await this.saveConfig(this.config);
     this._addLog(`Added API key account "${name}"`);
   }
@@ -1805,7 +2067,14 @@ export class TUI {
       : this.mode === 'add' ? 'settings'
       : this.mode;
     if (view === 'settings') {
-      this._renderSettings(lines);
+      const selLine = this._renderSettings(lines);
+      // The settings body grows with every account and every setting, and a
+      // short terminal used to cut it off silently: the footer, and the rows
+      // past the fold, were pushed off the buffer with nothing said (#445).
+      // The body scrolls instead, following the cursor row.
+      const headerH = 2;   // the title line and its rule, drawn above
+      const body = lines.splice(headerH);
+      lines.push(...this._viewport(body, selLine - headerH, H - footerH - headerH));
     } else if (view === 'routes') {
       this._renderRoutes(lines);
     } else if (view === 'pick') {
@@ -1874,6 +2143,21 @@ export class TUI {
     }
     } // end non-settings body
 
+    // A body taller than the terminal used to push the footer off the bottom,
+    // and the footer is where a prompt is typed: on a settings screen longer
+    // than the window, the operator typed a value they could not see into a
+    // prompt they could not read. The header and footer now always stay, and
+    // the body between them is a window that follows the cursor row.
+    const HEADER_H = 2;
+    const bodyRoom = H - footerH - HEADER_H;
+    if (lines.length - HEADER_H > bodyRoom) {
+      const body = lines.slice(HEADER_H);
+      const at = Math.max(0, body.findIndex(l => strip(l).includes('▸')));
+      const from = Math.max(0, Math.min(body.length - bodyRoom, at - Math.floor(bodyRoom / 2)));
+      lines.length = HEADER_H;
+      lines.push(...body.slice(from, from + bodyRoom));
+    }
+
     // Pad to fill
     while (lines.length < H - footerH) lines.push('');
 
@@ -1939,11 +2223,11 @@ export class TUI {
         const names = blockedFamilies(a.quota, key => this.am.thresholdFor(key, a));
         return names.length ? Math.max(w, 4 + vw(names.join(' '))) : w;
       }, 0);
-      // Same rule for the `$`/`$!` money tag: a column the row can draw is a
-      // column the budget has to know about, or the row overflows exactly the
-      // way #228 fixed.
+      // Same rule for the money tag (`$`, or the billed amount with its `/cap`):
+      // a column the row can draw is a column the budget has to know about, or
+      // the row overflows exactly the way #228 fixed.
       const spendW = members.reduce((w, a) => {
-        const tag = spendTag(a.quota);
+        const tag = spendTag(a.quota, a.maxSpend);
         return tag ? Math.max(w, 2 + vw(tag)) : w;
       }, 0);
       // Same rule again for the switch-threshold tag (#409) — silent on the
@@ -1955,13 +2239,21 @@ export class TUI {
         const tag = switchThresholdTag(a, key => this.am.thresholdFor(key));
         return tag ? Math.max(w, 2 + vw(tag)) : w;
       }, 0);
-      const fixed = 20 + typeCell + NAME_MIN + routeCells + tagW + spendW + switchW;
+      // Same rule again for the routing tag: silent for every account on the
+      // fleet path, so it costs the budget nothing there.
+      const routeW = members.reduce((/** @type {number} */ w, /** @type {any} */ a) => {
+        const tag = routingTag(a);
+        return tag ? Math.max(w, 2 + vw(tag)) : w;
+      }, 0);
+      const fixed = 20 + typeCell + NAME_MIN + routeCells + tagW + spendW + switchW + routeW;
       const span = (/** @type {number} */ n, /** @type {number} */ bar) => fixed + 6 * (n - 1) + n * bar;
       const roomFor = (/** @type {number} */ n) => span(n, BAR_MIN) <= W;
-      // No Ses bar once every Codex account here has reported without a 5h window;
-      // a Claude row or an unreported account keeps it.
+      // No Ses bar once every Codex account here has said it meters no 5h window
+      // (`sessionWindowStated`, the fact a reading leaves behind; not
+      // `unified5h` itself, which the expiry sweep nulls every five hours on a
+      // row that does have one); a Claude row or an unreported account keeps it.
       const shortBar = cat !== 'unified'
-        || members.some(a => providerOf(a) !== 'codex' || a.quota.unified5h != null || a.quota.unified7d == null);
+        || members.some(a => providerOf(a) !== 'codex' || a.quota.sessionWindowStated !== false || a.quota.unified7d == null);
       // The family bars are the first thing to go: below the width where they
       // fit even at BAR_MIN they would push the row past the edge, and a row
       // cut mid-bar reads worse than one that simply doesn't draw them (the
@@ -2211,9 +2503,23 @@ export class TUI {
     const type = compact ? '' : `${gray((mixed ? PROVIDERS[providerOf(a)].label : a.type).padEnd(typeW))} `;
 
     // Status — a disabled account is shown as such regardless of its quota state.
+    // So is one rotation will not reach although its own status says active: the
+    // entitlement cooldown a 403 arms and the usage caps live beside the status,
+    // not in it, and a row reading `active` for an account that receives nothing
+    // sent operators looking at the wrong thing (#468). Live, the manager says;
+    // in attach mode the status payload carries the same reason.
+    const barred = typeof this.am.unavailableReason === 'function'
+      ? this.am.unavailableReason(a)
+      : (a.unavailable ?? null);
     let status;
     if (a.disabled) {
       status = gray('disabled');
+    } else if (barred === 'entitlement') {
+      const until = typeof a.entitlementDeniedUntil === 'string' ? Date.parse(a.entitlementDeniedUntil) : a.entitlementDeniedUntil;
+      const left = formatReset(until);
+      status = yellow(left ? `denied ${left}` : 'denied');
+    } else if (typeof barred === 'string' && /capped$/.test(barred)) {
+      status = yellow('capped');
     } else switch (a.status) {
       case 'active':    status = isCur ? green('active') : 'active'; break;
       case 'throttled': status = yellow('throttled'); break;
@@ -2268,15 +2574,27 @@ export class TUI {
     // A list with no five-hour window to draw (see _listLayout) starts the row
     // at the weekly bar.
     const weeklyFirst = !shortBar && rowCategory(a) === 'unified';
-    if (weeklyFirst) [l1, r1, t1, w1, th1] = [l2, r2, t2, w2, th2];
+    // A Codex row whose subscription meters no five-hour window draws only the
+    // weekly bar even while Claude rows on the same list keep Ses/Wk: a `Ses -`
+    // cell there said nothing. Keyed on the fact the reading left behind
+    // (`sessionWindowStated`, see _updateCodexQuota), never on `unified5h`
+    // being empty: the expiry sweep nulls that every five hours on a row that
+    // does have a session window, and the row would swing between the two
+    // shapes. An account that has not reported keeps both cells, so the row
+    // does not change shape at startup. The weekly bar takes the two cells'
+    // width (bar + `  Wk ` + bar) so the row still ends where its neighbours do.
+    const weeklyOnly = !weeklyFirst && showBoth && rowCategory(a) === 'unified'
+      && providerOf(a) === 'codex' && q.sessionWindowStated === false && q.unified7d != null;
+    if (weeklyFirst || weeklyOnly) [l1, r1, t1, w1, th1] = [l2, r2, t2, w2, th2];
+    const bw1 = weeklyOnly ? bw * 2 + 6 : bw;
 
     // Keep the optional chaining: _renderAcct is called on instances built
     // without a config, and it read none before this line existed.
     const pctInBar = this.config?.quotaBarPercent !== false;
 
-    let line = ` ${sel}${cur} ${startSlot}${name} ${type}${status} ${l1} ${bar(r1, bw, t1, w1, th1, pctInBar)}`;
+    let line = ` ${sel}${cur} ${startSlot}${name} ${type}${status} ${l1} ${bar(r1, bw1, t1, w1, th1, pctInBar)}`;
     if (showBoth) {
-      if (!weeklyFirst) line += `  ${l2} ${bar(r2, bw, t2, w2, th2, pctInBar)}`;
+      if (!weeklyFirst && !weeklyOnly) line += `  ${l2} ${bar(r2, bw, t2, w2, th2, pctInBar)}`;
       // Sonnet weekly bar — only shown when the usage probe has populated it. A
       // leading ► (in place of a padding space) marks a Sonnet route on this account.
       if (showFamily && q.unified7dSonnet != null) {
@@ -2299,8 +2617,10 @@ export class TUI {
     if (blocked.length) line += `  ${red('⊘ ' + blocked.join(' '))}`;
     // Money tag last, so it sits at the end of the row where the eye lands after
     // the bars. Red once real money has moved, yellow while it only could.
-    const money = spendTag(q);
-    if (money) line += `  ${(money === '$!' ? red : yellow)(money)}`;
+    const money = spendTag(q, a.maxSpend);
+    // Red once real money has moved (the tag then carries an amount), yellow
+    // while it only could (a bare `$`, with or without its `/cap`).
+    if (money) line += `  ${(/\d/.test(money.split('/')[0]) ? red : yellow)(money)}`;
     // Free reset credits sit beside the money tag: both report what this
     // account holds in reserve rather than what it is currently spending.
     const credits = resetCreditTag(q);
@@ -2311,13 +2631,52 @@ export class TUI {
     // the fleet's own numbers) — see switchThresholdTag.
     const switchTag = switchThresholdTag(a, key => this.am.thresholdFor(key));
     if (switchTag) line += `  ${cyan(switchTag)}`;
+    // Routing tag trails even that: where the account's traffic physically
+    // leaves the machine, when the operator pinned it to its own proxy.
+    const routeTag = routingTag(a);
+    if (routeTag) line += `  ${cyan(routeTag)}`;
     return line;
   }
 
+  /**
+   * The `viewH` lines of `body` to draw, scrolled so that line `sel` (the
+   * cursor row, or -1 for none) is on screen and never under the edge markers.
+   * A body that fits is returned as is. Otherwise the first and last visible
+   * lines become `↑ N more` / `↓ N more` markers whenever there is something
+   * past them, so the fold is never silent. The scroll position persists
+   * between frames (`setScroll`) and only moves when the cursor would leave
+   * the window, so paging with ↑↓ reads like a list, not a jump per keypress.
+   * @param {string[]} body
+   * @param {number} sel
+   * @param {number} viewH
+   */
+  _viewport(body, sel, viewH) {
+    const n = body.length;
+    if (n <= viewH || viewH < 3) { this.setScroll = 0; return body.slice(0, Math.max(0, viewH)); }
+    let top = Math.min(Math.max(0, this.setScroll || 0), n - viewH);
+    if (sel >= 0) {
+      // One line of margin at each edge is where a marker may be drawn; the
+      // cursor row must never be the line a marker replaces.
+      if (sel < top + 1) top = Math.max(0, sel - 1);
+      if (sel > top + viewH - 2) top = Math.min(n - viewH, sel - viewH + 2);
+    }
+    this.setScroll = top;
+    const out = body.slice(top, top + viewH);
+    if (top > 0) out[0] = dim(`  ↑ ${top} more`);
+    if (top + viewH < n) out[viewH - 1] = dim(`  ↓ ${n - top - viewH} more`);
+    return out;
+  }
+
+  /**
+   * Draws the settings screen into `lines`; returns the index in `lines` of the
+   * cursor row, or -1 when no row is selected (so the caller can keep it on screen).
+   * @param {string[]} lines
+   */
   _renderSettings(lines) {
     const fields = this._settingsFields();
     if (this.setIdx >= fields.length) this.setIdx = Math.max(0, fields.length - 1);
     const selId = fields[this.setIdx]?.id;
+    let selLine = -1;
     const byId = id => fields.find(f => f.id === id);
 
     // Render a navigable setting row with a BIOS-style highlight bar on the
@@ -2327,6 +2686,7 @@ export class TUI {
       const label = (field ? field.label : '').padEnd(16);
       const value = field ? field.value() : '';
       if (selected) {
+        selLine = lines.length;   // the row is pushed right after this returns
         const hint = field.hint ? `   ${dim(field.hint)}` : '';
         const inner = rpad(` ${label}  ${strip(value)} `, 34);
         return `  ${cyan('▸')}${REV}${inner}${RESET}${hint}`;
@@ -2340,6 +2700,9 @@ export class TUI {
     // ── Rotation
     lines.push(bold('  Rotation') + dim('  — switch accounts when quota crosses the threshold'));
     lines.push(row(byId('threshold')));
+    lines.push(row(byId('autoRedeemResets')));
+    lines.push(dim('  Spend a free Codex rate-limit reset credit when the whole pool'));
+    lines.push(dim('  is dry. Irreversible and scarce — off unless you say otherwise.'));
     lines.push('');
     // ── Quota probe
     lines.push(bold('  Quota probe') + dim('  — refresh idle accounts from the usage endpoint'));
@@ -2375,13 +2738,18 @@ export class TUI {
     // not disappear along with an unrelated integration.
     lines.push(bold('  Network') + dim('  — how this machine reaches Anthropic'));
     lines.push(row(byId('upstreamProxy')));
+    if (byId('accountProxy')) lines.push(row(byId('accountProxy')));
     lines.push(dim('  Set when the machine has no direct route out (HTTPS_PROXY is'));
     lines.push(dim('  picked up automatically). Applies to requests, login and refresh.'));
+    if (byId('accountProxy')) {
+      lines.push(dim('  An account proxy carries ONE account instead, all of its traffic:'));
+      lines.push(dim('  socks5h://user:pass@host:1080 (also socks5, socks4a, socks4, http).'));
+    }
     lines.push('');
     // ── sx.org
     lines.push(bold('  sx.org proxy') + dim('  — route upstream via a residential IP (429 workaround)'));
     lines.push('');
-    if (!this.sx) { lines.push(yellow('  Unavailable in this build.')); return; }
+    if (!this.sx) { lines.push(yellow('  Unavailable in this build.')); return selLine; }
     const key = this.config.sx?.apiKey;
     const mode = this.sx.getMode();
     const p = this.sx.getProxy?.();
@@ -2406,6 +2774,7 @@ export class TUI {
       lines.push(dim('  No sx.org account yet? Signing up via https://sx.org/c/ufVrLW'));
       lines.push(dim('  costs nothing extra and supports TeamClaude development.'));
     }
+    return selLine;
   }
 
   // ── routes editor ──────────────────────────────────
@@ -2695,7 +3064,7 @@ export class TUI {
       case 'normal':
         return this.remote
           ? ` ${bold('s')}witch  ${bold('R')}eload  ${bold('q')}uit`
-          : ` ${bold('s')}witch  ${bold('d')}isable  ${bold('p')}robe quota  ${bold('R')}eload  ${bold('g')} settings  ${bold('q')}uit`;
+          : ` ${bold('s')}witch  ${bold('d')}isable  ${this.loginAccount ? `${bold('l')}ogin  ` : ''}${bold('p')}robe quota  ${bold('R')}eload  ${bold('g')} settings  ${bold('q')}uit`;
       case 'settings':
         return ` ${dim('↑↓')} navigate  ${dim('←→')} change  ${bold('Enter')} edit  ${bold('Esc')} back`;
       case 'routes':
@@ -2723,7 +3092,11 @@ export class TUI {
         if (this.selAction === 'reorder') {
           return ` ${dim('↑↓')} select  ${dim('←→')} move  ${bold('Enter')}/${bold('Esc')} done`;
         }
-        const act = this.selAction === 'toggle' ? 'enable/disable' : 'remove';
+        if (this.selAction === 'login') {
+          return ` ${dim('↑↓')} select  ${bold('Enter')} sign in via browser  ${bold('Esc')} cancel`;
+        }
+        const act = this.selAction === 'toggle' ? 'enable/disable'
+          : this.selAction === 'routing' ? 'set its proxy' : 'remove';
         return ` ${dim('↑↓')} select  ${bold('Enter')} ${act}  ${bold('Esc')} cancel`;
       }
       case 'add':

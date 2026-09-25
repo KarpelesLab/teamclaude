@@ -223,6 +223,21 @@ test('re-importing the same account+org still updates in place', async () => {
   assert.equal(am.accounts[0].credential, 'fresh');
 });
 
+test('re-importing a routed account keeps its proxy and says the profile lookup went around it', async () => {
+  const accounts = [{ name: 'a@x.com', index: 0, type: 'oauth', credential: 'old', accountUuid: 'u1', orgUuid: 'o-acme', orgName: 'Acme' }];
+  const { tui, config } = makeTUI({ accounts });
+  config.accounts = [{ id: accounts[0].id, name: 'a@x.com', type: 'oauth', accountUuid: 'u1', orgUuid: 'o-acme', orgName: 'Acme', routing: 'socks5h://alice:s3cret@proxy.example.com:1080' }];
+  tui._readCredentials = async () => ({ accessToken: 'fresh', refreshToken: 'r2', expiresAt: Date.now() + 3600_000 });
+  tui._readProfile = async () => ({ email: 'a@x.com', accountUuid: 'u1', orgUuid: 'o-acme', orgName: 'Acme' });
+
+  await tui._doImport();
+
+  assert.equal(config.accounts[0].routing, 'socks5h://alice:s3cret@proxy.example.com:1080', 'the import carries no routing key, so the entry keeps its own');
+  const lines = tui.log.map(l => l.msg);
+  assert.ok(lines.some(l => /"a@x\.com" has its own proxy, and this import's profile lookup did not go through it/.test(l)), lines.join('\n'));
+  assert.equal(lines.some(l => l.includes('s3cret')), false);
+});
+
 test('import with an unidentified profile adds no placeholder account', async () => {
   const { tui, am, config, calls } = makeTUI();
   tui._readCredentials = async () => ({

@@ -85,7 +85,7 @@ test('a genuinely new account is still picked up', async () => {
 
   disk.accounts.push({ name: 'new@example.com', type: 'apikey', apiKey: 'k2' });
   ensureAccountIds(disk.accounts);
-  const added = await syncAccountsFromDisk(disk, memConfig, am);
+  const { added } = await syncAccountsFromDisk(disk, memConfig, am);
 
   assert.equal(added, 1);
   assert.equal(memConfig.accounts.length, before + 1);

@@ -106,6 +106,28 @@ test('priority and disable are refused cross-origin, before any hook runs', asyn
   }, hooks);
 });
 
+// The threshold endpoint is the one control-plane mutation that writes to the
+// config FILE, so a page reaching it would change a setting that outlives the
+// process — and a low enough number takes the whole fleet out of rotation. The
+// guard has to run before any of that: the reload hook standing in for "nothing
+// happened" is what says the request was stopped at the gate, not merely
+// answered with a 403 afterwards. (The same-origin path, which the dashboard's
+// own button uses, is covered in server-threshold.test.js against a throwaway
+// config.)
+test('the threshold cannot be set cross-origin', async () => {
+  let reloads = 0;
+  await withServer(async (_am, port) => {
+    const res = await fetch(`http://127.0.0.1:${port}/teamclaude/threshold`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Origin: 'https://evil.example' },
+      body: JSON.stringify({ percent: 1 }),
+    });
+    assert.equal(res.status, 403);
+    assert.match((await res.json()).error, /cross-origin/);
+    assert.equal(reloads, 0, 'a refused threshold change must not have been applied');
+  }, { reload: async () => { reloads++; return 0; } });
+});
+
 // The guard is worthless if it also blocks the CLI. curl and teamclaude attach
 // send neither header.
 test('a request with no browser headers still works', async () => {

@@ -165,10 +165,35 @@ export function matchAccounts(accounts, query, orgFilter) {
 }
 
 /**
+ * Whether a failed fetchProfile proves the token is dead, as opposed to merely
+ * unreachable. Only a 401 counts. A 5xx, a timeout or a DNS failure says
+ * nothing about the token, and neither does a 403: the upstream answers 403
+ * "Request not allowed" to a valid token from an unexpected region (see
+ * egress-guard.js), and an org-policy 403 is a cooldown at request time, not a
+ * dead credential — a fresh token would meet the same answer.
+ *
+ * @param {Record<string, any>|null|undefined} profile - a fetchProfile result, success or error
+ */
+export function isTokenRejection(profile) {
+  return profile?.status === 401;
+}
+
+/**
  * Automatic naming is safe only when the profile identifies the account.
  * An explicit name is the caller's opt-in to importing without detection.
  */
 export function canUpsertOAuthAccount(profile, userNamed) {
+  // A token the upstream has REJECTED is dead, and --name must not override
+  // that. The import reports success and then every request 401s, with nothing
+  // pointing back at the account that was already known to be bad at the moment
+  // it was added.
+  //
+  // Only a definitive refusal counts — a 401 the caller could not refresh away
+  // (oauth.js profileForCredentials renews a stale access token before the
+  // profile gets here). A 5xx, a 403, a timeout or a DNS failure says nothing
+  // about the token, and a healthy one must stay importable from a restricted
+  // network — which is what `userNamed` is for, and still is.
+  if (isTokenRejection(profile)) return false;
   return Boolean(
     userNamed
     || (profile && !profile.error && (profile.accountUuid || profile.email))

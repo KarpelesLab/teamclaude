@@ -3,6 +3,18 @@ import assert from 'node:assert/strict';
 import { TUI } from '../src/tui.js';
 import { AccountManager } from '../src/account-manager.js';
 
+// A real TUI over the manager, as the dashboard builds one, so the row renderer
+// may read any instance field (config, sx, ...) without these tests noticing
+// (#444). Rendering is stubbed: only _renderAcct is exercised here.
+function rowTUI(am) {
+  const tui = new TUI({
+    accountManager: am, config: { proxy: { port: 1 }, accounts: [], routes: [] },
+    saveConfig: async () => {}, syncAccounts: async () => 0, onQuit: () => {},
+  });
+  tui.render = () => {};
+  return tui;
+}
+
 const stripAnsi = s => s.replace(/\x1b\[[0-9;]*m/g, '');
 
 // Minimal AccountManager stand-in for the routes editor: it only needs the
@@ -213,8 +225,8 @@ test('TUI: the F7 (Fable) marker sits on exactly one account — the routing tar
   // a's Fable weekly is spent → Fable routes elsewhere, but a stays the default current.
   am.accounts[0].quota.unified7dFable = 1.0;
 
-  const tui = Object.create(TUI.prototype);
-  tui.am = am; tui.mode = 'normal'; tui.selIdx = -1;
+  const tui = rowTUI(am);
+  tui.mode = 'normal'; tui.selIdx = -1;
   const routes = am.getRoutes();
   const familyTarget = { fable: am.previewRouteIndex('claude-fable-5'), sonnet: null };
 
@@ -255,8 +267,8 @@ test('TUI: targeting a family route moves the cursor to its bar and dims the row
   const sonnet = routes.find(r => r.name === 'sonnet');
   assert.ok(fable && sonnet, 'auto routes exist');
 
-  const tui = Object.create(TUI.prototype);
-  tui.am = am; tui.mode = 'select'; tui.selAction = 'switch'; tui.selIdx = 1;
+  const tui = rowTUI(am);
+  tui.mode = 'select'; tui.selAction = 'switch'; tui.selIdx = 1;
   const render = (i) => tui._renderAcct(i, 8, true, routes, [], { fable: null, sonnet: null });
   const CYAN_CURSOR = '\x1b[36m>\x1b[0m';
   const DIM_CURSOR = '\x1b[2m>\x1b[0m';
