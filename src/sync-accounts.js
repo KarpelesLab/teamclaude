@@ -4,6 +4,7 @@ import { safeLine } from './safe-text.js';
 import { removedAccountIds } from './account-pairing.js';
 import { ensureAccountIds } from './account-id.js';
 import { accountSwitchThreshold, accountRouting } from './account-manager.js';
+import { localListener } from './upstream-proxy.js';
 
 /**
  * Sync accounts from disk config: add new accounts and refresh credentials
@@ -123,8 +124,10 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     // object (server.js forwardRequest, ensureTokenFresh, the prober), so a
     // disk edit or a `teamclaude routing` change takes effect on the very next
     // request without a restart. Through the constructor's own parse, so a bad
-    // URL is refused and reported here as it would be at startup.
-    accountManager.setRouting(mgr.index, accountRouting(diskAcct));
+    // URL is refused and reported here as it would be at startup, and so is
+    // one that points back at this server's own listener (memConfig's port is
+    // the one the server is bound to; a port edit on disk needs a restart).
+    accountManager.setRouting(mgr.index, accountRouting(diskAcct, localListener(memConfig)));
     // Third-party-backend bindings are read per request off this object
     // (`account.upstream || upstream`, `account.modelMap` in server.js), so a
     // disk edit must land here to take effect on reload. `|| null` mirrors the

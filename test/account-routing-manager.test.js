@@ -36,6 +36,40 @@ test('an invalid routing URL is ignored with one named log line, never thrown', 
   assert.equal(lines.filter(l => l.includes('ignoring routing') && l.includes('"a"')).length, 1);
 });
 
+test('a routing that names this server\'s own listener is ignored, with the reason', async () => {
+  // The MITM listener intercepts the upstream host, so a request tunnelled
+  // through it would come straight back in and go around again.
+  const listener = { host: '127.0.0.1', port: 3456 };
+  let am = null;
+  const lines = await logged(() => {
+    am = new AccountManager([
+      oauth('a', { routing: 'http://localhost:3456' }),
+      oauth('b', { routing: 'socks5://127.0.0.1:1080' }),
+    ], 0.98, { listener });
+  });
+  assert.equal(am.accounts[0].routing, null);
+  assert.equal(am.accounts[1].routing.port, 1080, 'another port on loopback is some other proxy');
+  assert.equal(lines.filter(l => l.includes('"a"') && l.includes('ignoring routing') && l.includes('that address is this server')).length, 1, lines.join('\n'));
+
+  // The guard follows the manager to accounts added at runtime.
+  await logged(() => am.addAccount(oauth('c', { routing: 'http://127.0.0.1:3456' })));
+  assert.equal(am.accounts[2].routing, null);
+
+  // A manager built without a config has no address to compare against and
+  // second-guesses nothing (the tests build most of theirs this way).
+  const bare = new AccountManager([oauth('a', { routing: 'http://localhost:3456' })], 0.98);
+  assert.equal(bare.accounts[0].routing.port, 3456);
+});
+
+test('reload drops a routing edit that points back at the server\'s own port', async () => {
+  const mem = [oauth('a')];
+  const am = new AccountManager(mem.map(a => ({ ...a })), 0.98);
+  const disk = [{ ...mem[0], routing: 'socks5://localhost:3456' }];
+  const lines = await logged(() => syncAccountsFromDisk({ accounts: disk }, { proxy: { port: 3456 }, accounts: mem }, am));
+  assert.equal(am.accounts[0].routing, null, 'the running account stays on the fleet path');
+  assert.ok(lines.some(l => l.includes('"a"') && l.includes('that address is this server')), lines.join('\n'));
+});
+
 test('an account without routing has null, and the status payload masks the password', () => {
   const am = new AccountManager([
     oauth('a'),

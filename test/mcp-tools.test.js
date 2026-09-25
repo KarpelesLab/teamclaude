@@ -203,6 +203,19 @@ test('set_account_routing sets, masks, and clears the account proxy', async () =
   assert.match(await refused(tools, 'set_account_routing', { account: 'bob@example.com', org: 'Acme', routing: 'https://proxy.example.com' }), /unsupported routing protocol/);
 });
 
+test('set_account_routing refuses this server\'s own address, and stores nothing', async () => {
+  // The MITM listener intercepts the upstream host, so a routing through it
+  // would loop every request straight back in. The fixture's config carries
+  // no port; give it the one the server would be bound to.
+  const { tools, am, config, calls } = await fixture();
+  config.proxy.port = 3456;
+  const text = await refused(tools, 'set_account_routing', { account: 'bob@example.com', org: 'Acme', routing: 'http://localhost:3456' });
+  assert.match(text, /http:\/\/localhost:3456 is this server's own address/);
+  assert.equal(am.accounts[1].routing, null);
+  assert.equal('routing' in config.accounts[1], false, 'the entry is untouched');
+  assert.deepEqual(calls, [], 'nothing was persisted or reloaded');
+});
+
 test('set_account_routing keeps the proxy password out of the write log', async () => {
   const lines = [];
   const original = console.log;

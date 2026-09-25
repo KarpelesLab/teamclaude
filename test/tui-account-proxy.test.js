@@ -119,6 +119,23 @@ test('a proxy that fails its test changes nothing, and the log says why', async 
   assert.ok(logged(tui).some(l => l.includes('Proxy not set: account routing proxy socks5://alice:***@127.0.0.1:9: SOCKS5 authentication failed')));
 });
 
+test('this server\'s own address is refused before the test, which it would have passed', async () => {
+  // makeTUI's config listens on port 1; a routing at 127.0.0.1:1 is the
+  // server itself, and its CONNECT answer would satisfy the proxy test.
+  const { tui, am, config, saves, tested } = makeTUI();
+  openPicker(tui);
+  tui._key('enter'); // alice
+  type(tui, 'http://127.0.0.1:1');
+  tui._key('enter');
+  await settle();
+
+  assert.equal(tested.length, 0, 'never tested: the answer would have been a false pass');
+  assert.equal(am.accounts[0].routing, null);
+  assert.equal('routing' in config.accounts[0], false);
+  assert.equal(saves.length, 0);
+  assert.ok(logged(tui).some(l => l.includes('Proxy not set: http://127.0.0.1:1 is this server\'s own address')), logged(tui).join('\n'));
+});
+
 test('none clears it, without a test, and lifts a cooldown the old proxy earned', async () => {
   const { tui, am, config, saves, tested } = makeTUI();
   am.markRoutingFailed(1);

@@ -22,6 +22,7 @@ import { sanitizeText } from './safe-text.js';
 import { currentVersion } from './updater.js';
 import { upstreamPoolStatus } from './upstream-fetch.js';
 import { parseRoutingUrl, routingToUrl, describeRouting, maskRoutingUrl } from './account-routing.js';
+import { isSelfProxy, localListener } from './upstream-proxy.js';
 
 /**
  * The management tools served at /teamclaude/mcp, and the `proxy.mcp` gate in
@@ -321,6 +322,13 @@ const WRITE_TOOLS = [
           routing = parseRoutingUrl(String(args.routing));
         } catch (/** @type {any} */ err) {
           throw new ToolFailure(err?.message || String(err));
+        }
+        // This server's own listener: a request tunnelled through it would
+        // come straight back in (the MITM listener intercepts the upstream
+        // host). The server drops such a routing on load anyway, so saving it
+        // would only store a value it then ignores.
+        if (isSelfProxy(routing, localListener(ctx.config))) {
+          throw new ToolFailure(`${describeRouting(routing)} is this server's own address; routing an account through it would loop back into this proxy`);
         }
       }
       return changeAccount(ctx, args, (index, entry) => {

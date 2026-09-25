@@ -42,7 +42,7 @@ import { ClientUsageTracker, UsageDimensionTracker } from './client-usage.js';
 import { buildClaudeEnvLines, bypassesAllHosts, clearSelfProxyEnvLines, encodePinComponent, mergeNoProxy, resolveClientMode } from './claude-env.js';
 import { serviceKind, installService, uninstallService, serviceStatus, renderService, logPath } from './service.js';
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
-import { getUpstreamProxy, describeProxy, describeSelfProxy } from './upstream-proxy.js';
+import { getUpstreamProxy, describeProxy, describeSelfProxy, localListener, isSelfProxy } from './upstream-proxy.js';
 import { parseRoutingUrl, routingToUrl, describeRouting, checkRouting } from './account-routing.js';
 import { proxyFetch } from './upstream-fetch.js';
 import { upstreamFor } from './provider.js';
@@ -302,7 +302,7 @@ async function serverCommand() {
     console.error(`[TeamClaude] Bad adaptiveDistribution setting in ${getConfigPath()}: ${err.message}`);
     process.exit(1);
   }
-  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp, distributeSessions: config.distributeSessions, expiryRouting: config.expiryRouting, adaptive });
+  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp, distributeSessions: config.distributeSessions, expiryRouting: config.expiryRouting, adaptive, listener: localListener(config) });
   // Names the activity log's session column from Claude Code's own on-disk
   // session titles. Built whether or not the TUI runs, so a reload has one
   // object to reconfigure.
@@ -878,12 +878,32 @@ function routingFlag() {
  */
 function loginRouting(config) {
   const flag = routingFlag();
-  if (flag.given) return { routing: flag.routing, store: true };
+  if (flag.given) {
+    refuseSelfRouting(flag.routing, config);
+    return { routing: flag.routing, store: true };
+  }
   const name = argValue('--name');
   const named = name ? matchAccounts(config.accounts || [], name, argValue('--org')) : [];
-  const stored = named.length === 1 ? accountRouting(named[0]) : null;
+  const stored = named.length === 1 ? accountRouting(named[0], localListener(config)) : null;
   if (stored) console.log(`Using the routing stored on "${named[0].name}": ${describeRouting(stored)}`);
   return { routing: stored, store: false };
+}
+
+/**
+ * Exit when `routing` names this server's own listener. The MITM listener
+ * intercepts api.anthropic.com, so a request tunnelled through it would come
+ * straight back into forwardRequest and go around again; the fleet
+ * upstreamProxy setting refuses the same address (resolveUpstreamProxy), and
+ * the server drops such a routing on load (accountRouting), so writing it
+ * would only store a value the server then ignores. Before the proxy test:
+ * that test would pass, because this server does answer a CONNECT.
+ * @param {import('./account-routing.js').RoutingProxy|null} routing
+ * @param {Record<string, any>} config
+ */
+function refuseSelfRouting(routing, config) {
+  if (!routing || !isSelfProxy(routing, localListener(config))) return;
+  console.error(`${describeRouting(routing)} is this server's own address; routing an account through it would loop back into this proxy.`);
+  process.exit(1);
 }
 
 /**
@@ -1045,6 +1065,7 @@ async function loginApiCommand() {
   // The flag alone: an API key is always a NEW entry, so there is no stored
   // routing for it to borrow (and `none` is what it gets without the flag).
   const { routing } = routingFlag();
+  refuseSelfRouting(routing, loaded);
   await requireWorkingRouting(routing, upstreamFor({ type: 'apikey' }, loaded.upstream));
 
   const rl = createInterface({ input: process.stdin, output: process.stderr });
@@ -1519,7 +1540,7 @@ async function accountsCommand() {
     if (a.type !== 'oauth' || !a.refreshToken) return;
     if (!isTokenExpiringSoon(a.expiresAt)) return;
     try {
-      const newTokens = await refreshAccessToken(a.refreshToken, undefined, accountRouting(a));
+      const newTokens = await refreshAccessToken(a.refreshToken, undefined, accountRouting(a, localListener(config)));
       a.accessToken = newTokens.accessToken;
       a.refreshToken = newTokens.refreshToken;
       a.expiresAt = newTokens.expiresAt;
@@ -1547,7 +1568,7 @@ async function accountsCommand() {
   // Fetch profiles in parallel for all OAuth accounts
   const profiles = await Promise.all(
     config.accounts.map(a =>
-      a.type === 'oauth' && a.accessToken ? fetchProfile(a.accessToken, accountRouting(a)) : null
+      a.type === 'oauth' && a.accessToken ? fetchProfile(a.accessToken, accountRouting(a, localListener(config))) : null
     )
   );
 
@@ -1618,7 +1639,7 @@ async function accountsCommand() {
   for (const [i, a] of config.accounts.entries()) {
     const p = profiles[i];
     // The account's own egress proxy, password masked; absent = fleet path.
-    const routeTag = describeRouting(accountRouting(a));
+    const routeTag = describeRouting(accountRouting(a, localListener(config)));
 
     if (a.type === 'apikey') {
       console.log(`  [${i + 1}] ${a.name} (apikey)  ${a.apiKey?.slice(0, 15)}...`);
@@ -1696,7 +1717,7 @@ async function apiCommand() {
   // This call carries the account's credential, so it is that account's
   // traffic: it leaves by the account's own routing when it has one, and by
   // the fleet path (the upstream proxy when configured) otherwise.
-  const routing = accountRouting(account);
+  const routing = accountRouting(account, localListener(config));
   if (routing) console.error(`(via ${describeRouting(routing)})`);
   const res = await proxyFetch(url, { ...fetchOpts, routing });
 
@@ -2186,7 +2207,7 @@ async function routingCommand() {
   const upstreamUrl = upstreamFor(account, config.upstream);
 
   if (!value) {
-    const current = accountRouting(account);
+    const current = accountRouting(account, localListener(config));
     console.log(current
       ? `${account.name}: ${describeRouting(current)}`
       : `${account.name}: no routing — the account uses the fleet egress (the upstream proxy when configured, direct otherwise)`);
@@ -2221,6 +2242,7 @@ async function routingCommand() {
     console.error(ROUTING_USAGE);
     process.exit(1);
   }
+  refuseSelfRouting(routing, config);
   // Before the save, not after: on a running server the change is live at
   // once, and a mistyped password would take a working account out of rotation.
   await requireWorkingRouting(routing, upstreamUrl);

@@ -13,7 +13,7 @@ import { PROVIDERS, providerOf, isSubscriptionAccount, upstreamFor } from './pro
 import { mintAccountId } from './account-id.js';
 import { formatPercent, heldResetCredits } from './status-renderer.js';
 import { resolveMaxUsage, switchThresholdDiffs } from './model.js';
-import { parseProxyUrl, proxyToUrl, describeProxy, describeSelfProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy } from './upstream-proxy.js';
+import { parseProxyUrl, proxyToUrl, describeProxy, describeSelfProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy, localListener, isSelfProxy } from './upstream-proxy.js';
 import { describeRouting, parseRoutingUrl, routingToUrl, checkRouting } from './account-routing.js';
 import { sanitizeText, safeLine } from './safe-text.js';
 // The setting rules live in one module; the CLI, the MCP tools and this screen
@@ -1438,6 +1438,12 @@ export class TUI {
         return;
       }
       if (!routing) return;
+      // Our own listener would pass the test below (this server answers a
+      // CONNECT) and then loop every request straight back in.
+      if (isSelfProxy(routing, localListener(this.config))) {
+        this._addLog(`Proxy not set: ${describeRouting(routing)} is this server's own address, and would loop back into it`);
+        return;
+      }
       this._addLog(`Testing ${describeRouting(routing)}...`);
       if (this.running) this.render();
       const check = await this._testRouting(routing, upstreamFor(acct, this.config.upstream));
