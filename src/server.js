@@ -1326,7 +1326,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // are dropped with the other proxy-control headers.
       const stripHeaders = usageDimensionHeaderNames(config.proxy);
 
-      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), pinnedIndex, provider, holdBudgetMs: holdMs, pinKey, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
+      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, provider, holdBudgetMs: holdMs, pinKey, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -2650,7 +2650,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // the full history (see refusesThreadContinue). Placed before admit() so the
   // early return holds no concurrency slot, and after recordSession so the
   // resend that follows lands on this same account and reuses its cache.
-  if (refusesThreadContinue(body, account, req.url) && !res.headersSent && !clientGone(res)) {
+  if (refusesThreadContinue(body, account, req.url, upstream, ctx.fleetMessageThreads) && !res.headersSent && !clientGone(res)) {
     ctx.status = 400;
     ctx.delivered = true;   // a 4xx IS an answer — see answeredStatus
     // Said once per account: the client stops sending threads for that model
@@ -2660,7 +2660,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // reports on (see syncAccountsFromDisk).
     if (!account.threadRefusalReported) {
       account.threadRefusalReported = true;
-      console.error(`[TeamClaude] ${safeLine(account.name, 64)}: refusing message-thread continues (this upstream keeps no thread state; set "messageThreads": true if it does)`);
+      console.error(`[TeamClaude] ${safeLine(account.name, 64)}: refusing message-thread continues (this upstream keeps no thread state; set "messageThreads": true ${account.upstream ? 'on the account' : 'at the top level of the config'} if it does)`);
     }
     res.writeHead(400, { 'Content-Type': 'application/json', 'x-should-retry': 'false' });
     res.end(JSON.stringify({
@@ -3743,11 +3743,18 @@ function pointsAtAnthropic(upstream) {
  * @param {Buffer|null|undefined} body fully-buffered request body
  * @param {Record<string, any>|null|undefined} account the account about to serve it
  * @param {string|undefined} url req.url
+ * @param {string|null} [configuredUpstream] the fleet's global `upstream`, for an account without its own
+ * @param {boolean} [fleetKeepsThreads] the top-level `messageThreads`: the global upstream keeps thread state
  * @returns {boolean}
  */
-export function refusesThreadContinue(body, account, url) {
-  if (!account?.upstream || !rewritesBody(account)) return false;
+export function refusesThreadContinue(body, account, url, configuredUpstream = null, fleetKeepsThreads = false) {
+  if (!account || !rewritesBody(account)) return false;
   if (account.messageThreads) return false;
+  // An account without an upstream of its own goes wherever the fleet points
+  // (the global `upstream`), and a fleet sent to a third party has the same
+  // problem as one account sent there (#379). The top-level `messageThreads`
+  // is the fleet-wide counterpart of the per-account flag for that case.
+  if (!account.upstream && fleetKeepsThreads) return false;
   if (!Buffer.isBuffer(body) || body.length === 0) return false;
   // Only a completion continues a thread. count_tokens carries a body of the
   // same shape, and a refusal there is unrecoverable — there is no conversation
@@ -3757,8 +3764,10 @@ export function refusesThreadContinue(body, account, url) {
   if (!isCompletionPath(classificationPath(url))) return false;
   if (!body.includes(THREAD_MARKER) || !body.includes(CONTINUE_MARKER)) return false;
   // Last of the cheap gates because it parses two URLs: by here the request is
-  // already known to be a completion whose body could carry a continue.
-  if (pointsAtAnthropic(account.upstream)) return false;
+  // already known to be a completion whose body could carry a continue. The
+  // effective upstream, so a fleet on a third-party global `upstream` is
+  // covered too; the default is Anthropic's own host, which is exempt.
+  if (pointsAtAnthropic(upstreamFor(account, configuredUpstream))) return false;
   try {
     return JSON.parse(body.toString('utf8'))?.thread?.type === 'continue';
   } catch {

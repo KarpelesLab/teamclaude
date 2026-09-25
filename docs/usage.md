@@ -141,6 +141,8 @@ Arguments after `--` go to `claude`:
 teamclaude run -- --model opus
 ```
 
+**Claude Code still needs a login of its own.** In both modes the client checks its local login (`~/.claude/.credentials.json`, or the Keychain on macOS) before it sends anything, and the proxy only sees a request once that check passes. The pool's accounts do not stand in for it: they are what the proxy uses upstream, and the two expire independently. So a `claude` that exits at once with `Failed to authenticate: OAuth session expired and could not be refreshed` is reporting its own login, not the pool — run `claude auth login` and launch again. `run` prints a hint to that effect when `claude` dies within seconds of launch and the local login is missing or past its expiry.
+
 ### Setting the environment yourself
 
 `teamclaude env` prints the same export lines `run` uses:

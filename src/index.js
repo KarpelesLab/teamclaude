@@ -10,7 +10,7 @@ import { installCrashHandlers } from './crash-log.js';
 import { AccountManager, distributionMode, accountRouting } from './account-manager.js';
 import { validateAdaptiveConfig } from './adaptive-distribution.js';
 import { createProxyServer } from './server.js';
-import { importCredentials, loginOAuth, loginOAuthWithPastedCode, fetchProfile, profileForCredentials, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
+import { importCredentials, loginOAuth, loginOAuthWithPastedCode, fetchProfile, profileForCredentials, refreshAccessToken, isTokenExpired, isTokenExpiringSoon } from './oauth.js';
 import {
   sameIdentity,
   orgKey,
@@ -41,7 +41,7 @@ import { autoUpdate, checkForUpdate, currentVersion, resolveVersionLabel, runUpd
 import { renderStatus, formatPercent } from './status-renderer.js';
 import { sanitizeText } from './safe-text.js';
 import { ClientUsageTracker, UsageDimensionTracker } from './client-usage.js';
-import { buildClaudeEnvLines, bypassesAllHosts, clearSelfProxyEnvLines, encodePinComponent, mergeNoProxy, resolveClientMode } from './claude-env.js';
+import { buildClaudeEnvLines, bypassesAllHosts, clearSelfProxyEnvLines, encodePinComponent, LOCAL_LOGIN_HINT_WINDOW_MS, localLoginHint, mergeNoProxy, resolveClientMode } from './claude-env.js';
 import { serviceKind, installService, uninstallService, serviceStatus, renderService, logPath } from './service.js';
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
 import { getUpstreamProxy, describeProxy, describeSelfProxy, localListener, isSelfProxy } from './upstream-proxy.js';
@@ -468,6 +468,15 @@ async function serverCommand() {
     // Both are read per request off this object (server.js) and the TUI already
     // persists them; without this a hand edit or another writer waited for a restart.
     config.eventLogging = diskConfig.eventLogging || 'hide';
+    // The fleet-wide message-thread declaration (see refusesThreadContinue) is
+    // read per request off this object as well. When it changes, the accounts
+    // on the global upstream get to report a refusal again, as they do when
+    // their own flag changes (syncAccountsFromDisk).
+    const fleetThreads = diskConfig.messageThreads === true;
+    if ((config.messageThreads === true) !== fleetThreads) {
+      for (const a of accountManager.accounts) if (!a.upstream) a.threadRefusalReported = false;
+    }
+    config.messageThreads = fleetThreads;
     // Read by the TUI on every frame, so a hand edit lands on the next reload.
     config.quotaBarPercent = diskConfig.quotaBarPercent !== false;
     // Read by `run`/`env` from disk, but the TUI settings screen shows it live.
@@ -1327,6 +1336,7 @@ async function runCommand() {
   }
 
   // Use spawnSync so the Node process blocks entirely — behaves like execvp.
+  const startedAt = Date.now();
   const result = spawnSync('claude', claudeArgs, {
     stdio: 'inherit',
     shell: process.platform === 'win32',
@@ -1340,6 +1350,18 @@ async function runCommand() {
       console.error(`Failed to start claude: ${result.error.message}`);
     }
     process.exit(1);
+  }
+
+  // Claude Code checks its own login before it sends anything, in either mode:
+  // with that login expired and unrefreshable it exits at once with "OAuth
+  // session expired and could not be refreshed", and nothing reaches the proxy
+  // (#395). That reads like the pool being broken, so when the session ended
+  // that quickly and that badly, say which login it was. Only a hint: the
+  // child's own output is what was shown, and a fast non-zero exit with a
+  // stale local login is the shape of that failure, not proof of it.
+  if (result.status && Date.now() - startedAt < LOCAL_LOGIN_HINT_WINDOW_MS && !env.ANTHROPIC_API_KEY && !env.CLAUDE_CODE_OAUTH_TOKEN) {
+    const hint = await localLoginHint({ read: importCredentials, expired: isTokenExpired });
+    if (hint) console.error(`[TeamClaude] ${hint}`);
   }
 
   // Session over — check for a newer teamclaude and (for a global npm install)

@@ -210,3 +210,32 @@ export function buildClaudeEnvLines({ port, useMitm = true, caPath = null, holdS
 
   return lines;
 }
+
+// A claude that died within this long of launch did not get to a prompt.
+export const LOCAL_LOGIN_HINT_WINDOW_MS = 20_000;
+
+const NO_LOGIN = 'Claude Code has no login of its own on this machine, and it needs one before it will talk to the proxy (the pool\'s accounts are separate). Run `claude auth login`, then try again.';
+const STALE_LOGIN = 'If claude reported an expired OAuth session: that is Claude Code\'s own login (~/.claude/.credentials.json), which it checks before it sends anything, not the proxy\'s accounts. Run `claude auth login`, then try again.';
+
+/**
+ * One line naming Claude Code's own login as the likely cause of a launch that
+ * failed straight away, or null when that login looks fine. Claude Code checks
+ * its local login before it sends anything, in either client mode: with that
+ * login expired and unrefreshable it exits at once with "OAuth session expired
+ * and could not be refreshed", and nothing reaches the proxy (#395). That reads
+ * like the pool being broken, so `run` says which login it was when the session
+ * ended that quickly and that badly. Only a hint: a fast non-zero exit with a
+ * stale local login is the shape of that failure, not proof of it. The pool's
+ * accounts are the proxy's; the client's own login expires independently.
+ * @param {{ read: (path: string) => Promise<Record<string, any>>, expired: (expiresAt: unknown) => boolean }} deps
+ *   the credentials reader (oauth.js importCredentials) and the expiry test
+ * @returns {Promise<string|null>}
+ */
+export async function localLoginHint({ read, expired }) {
+  let creds;
+  try { creds = await read('~/.claude/.credentials.json'); }
+  catch { return NO_LOGIN; }
+  if (!creds?.accessToken && !creds?.refreshToken) return NO_LOGIN;
+  if (expired(creds.expiresAt)) return STALE_LOGIN;
+  return null;
+}
