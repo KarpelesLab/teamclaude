@@ -273,6 +273,54 @@ test('a stream carrying junk still delivers and records what it can', async () =
   assert.equal(tokensOf(am).reports, 1);
 });
 
+// The ChatGPT backend sends a Responses stream with no Content-Type at all
+// (issue #456). Keyed on the header alone the relay buffered the whole turn and,
+// since the usage booking lives on the streaming branch, counted nothing. A
+// headerless success to a request that asked for a stream is a stream.
+test('a Codex stream sent without a Content-Type is relayed as one and booked', async () => {
+  const upstream = http.createServer(async (req, res) => {
+    for await (const c of req) void c;
+    res.writeHead(200, { 'cache-control': 'no-cache' });   // no content-type, as the backend does
+    for (const e of [CREATED, DELTA, COMPLETED]) {
+      res.write(`event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`);
+      await new Promise(r => setTimeout(r, 2));
+    }
+    res.end();
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([codexAccount(upstreamPort)], 0.98);
+  const proxy = createProxyServer(am, { proxy: {} });
+  const port = await listen(proxy);
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/backend-api/codex/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'session-id': SID },
+      body: JSON.stringify({ model: MODEL, input: [], stream: true }),
+    });
+    // The client keys on the same header the backend left out, so it is set.
+    assert.equal(res.headers.get('content-type'), 'text/event-stream');
+    const text = await res.text();
+    assert.match(text, /response\.completed/);
+  } finally {
+    proxy.close(); upstream.close();
+  }
+  assert.equal(am.accounts[0].usage.totalInputTokens, FRESH, 'a headerless stream still books its usage');
+  assert.equal(am.accounts[0].usage.totalOutputTokens, WIRE.output_tokens);
+  assert.equal(tokensOf(am).reports, 1);
+});
+
+// Without `stream: true` a headerless reply stays buffered: nothing says it is
+// an event stream, and a JSON body relayed as one would confuse the client.
+test('a headerless reply to a non-streaming request is still buffered', async () => {
+  const upstream = http.createServer(async (req, res) => {
+    for await (const c of req) void c;
+    res.writeHead(200, {});
+    res.end(JSON.stringify({ id: 'resp_1', object: 'response', status: 'completed', output: [], usage: WIRE }));
+  });
+  const am = await codexTurn(upstream, { stream: false });
+  assert.equal(am.accounts[0].usage.totalInputTokens, FRESH);
+});
+
 test('a buffered Codex response books its tokens too', async () => {
   const upstream = http.createServer(async (req, res) => {
     for await (const c of req) void c;
