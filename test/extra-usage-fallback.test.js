@@ -690,8 +690,14 @@ test('the extra-usage tag is drawn and never pushes a TUI row past the edge', as
     oauth('billing@example.com', { allowExtraUsage: true, priority: -1 }),
   ]);
   for (const a of am.accounts) {
+    // No family bucket: the shared weekly is spent (spentFleet), and a family
+    // the fleet reports would then carry a `⊘` tag on every row — nine more
+    // fixed columns, which with the money amount and `xu!` fill all sixty
+    // before the bar gets its one-column floor. The layout never promises a
+    // fit past that floor; the tag's budget is what is under test, and the
+    // family bars have no bearing on it.
     setQuota(a, { unified5h: 0.4, unified5hReset: Date.now() + 3600_000, unified7dReset: Date.now() + 86400_000,
-      unified7dFable: 0.2, unified7dFableReset: Date.now() + 86400_000, spend: { enabled: true, usedMinor: 5 } });
+      spend: { enabled: true, usedMinor: 5 } });
   }
   quietly(() => am.getActiveAccount(null, OPUS));
   assert.equal(am.onExtraUsage(2), true);
