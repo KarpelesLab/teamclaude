@@ -297,6 +297,7 @@ function makeAccount(acct, index, listener = null) {
     // that id. The Anthropic counterpart is `accountUuid`, which is patched
     // into the request body instead.
     accountId: acct.accountId || null,
+    userId: acct.userId || null,
     accountUuid: acct.accountUuid || null,
     orgUuid: acct.orgUuid || null,
     orgName: acct.orgName || null,
@@ -4603,7 +4604,7 @@ export class AccountManager {
       // `accountUuid`: a row saved without them reads as Anthropic and stops
       // matching the account it was written for. Rows from an older version
       // therefore stop restoring Codex quota, which is re-learned from traffic.
-      return { accountUuid: a.accountUuid, accountId: a.accountId, provider: providerOf(a), orgUuid: a.orgUuid, orgName: a.orgName, name: a.name, profile, quota, adaptive };
+      return { accountUuid: a.accountUuid, accountId: a.accountId, userId: a.userId, provider: providerOf(a), orgUuid: a.orgUuid, orgName: a.orgName, name: a.name, profile, quota, adaptive };
     });
   }
 

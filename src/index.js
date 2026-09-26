@@ -1094,6 +1094,7 @@ async function upsertCodexAccount(requestedName, creds, routing = null, storeRou
       provider: 'codex',
       source: 'login',
       accountId: creds.accountId,
+      userId: creds.userId,
       accessToken: creds.accessToken,
       refreshToken: creds.refreshToken,
       expiresAt: creds.expiresAt,
@@ -1103,12 +1104,10 @@ async function upsertCodexAccount(requestedName, creds, routing = null, storeRou
       ...(routing && storeRouting ? { routing: routingToUrl(routing) } : {}),
     };
 
-    // Identity for a Codex account is its ChatGPT account id; fall back to the
-    // display name when upstream did not supply one.
+    // Identity for a Codex account is its ChatGPT account id and user id; fall
+    // back to the display name when upstream did not supply one.
     const idx = config.accounts.findIndex(a => (
-      a.provider === 'codex' && (
-        (account.accountId && a.accountId === account.accountId) || a.name === account.name
-      )
+      a.provider === 'codex' && (sameIdentity(a, account) || a.name === account.name)
     ));
     if (idx >= 0) {
       const prev = config.accounts[idx];

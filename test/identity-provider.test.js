@@ -23,6 +23,16 @@ test('two Codex accounts are told apart by their ChatGPT account id', () => {
   assert.equal(distinctAccounts(codex, other), true);
 });
 
+test('two members of one ChatGPT workspace are told apart by their user id', () => {
+  const member1 = { ...codex, userId: 'user-1' };
+  const member2 = { ...codex, name: 'you@example.com', userId: 'user-2' };
+  assert.equal(sameIdentity(member1, member2), false);
+  assert.equal(distinctAccounts(member1, member2), true);
+  assert.equal(sameIdentity(member1, { ...member1 }), true);
+  // An entry saved before userId existed still matches by accountId.
+  assert.equal(sameIdentity(codex, member1), true);
+});
+
 test('a Codex login does not upsert onto the Claude entry with the same name', () => {
   const accounts = [claude];
   assert.equal(findUpsertTarget(accounts, codex), -1);
