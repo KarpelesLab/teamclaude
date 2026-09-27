@@ -1983,7 +1983,12 @@ async function refuseOversizedBody(req, res) {
 }
 
 /**
- * Relay a request to upstream with no header rewriting — pure passthrough.
+ * Relay a request to upstream on the client's own terms: no pooled account
+ * credentials are injected and the body goes through unchanged, with only
+ * content-type, accept and user-agent forwarded. On the way back the
+ * connection-specific and stale framing headers (transfer-encoding,
+ * connection, content-encoding, content-length) are dropped, and so is the
+ * per-org billing family when `stripOverage` is set (see isOverageHeader).
  */
 async function relayRaw(req, res, upstream, sx, maxBodyBytes = DEFAULT_MAX_BODY_BYTES, stripOverage = false) {
   const bodyChunks = [];

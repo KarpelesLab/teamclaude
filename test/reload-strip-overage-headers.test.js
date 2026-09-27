@@ -62,7 +62,9 @@ async function waitForServer(port, childOutput) {
   const deadline = Date.now() + 10_000;
   for (;;) {
     try {
-      const res = await fetch(`http://127.0.0.1:${port}/teamclaude/status`);
+      // Bounded per attempt: a child that accepts but never answers must not
+      // hold the loop past the deadline.
+      const res = await fetch(`http://127.0.0.1:${port}/teamclaude/status`, { signal: AbortSignal.timeout(2_000) });
       if (res.ok) return;
     } catch { /* not up yet */ }
     if (Date.now() > deadline) throw new Error(`server did not start:\n${childOutput()}`);
@@ -87,7 +89,7 @@ async function editConfig(configPath, mutate) {
 }
 
 async function reload(proxyPort) {
-  const res = await fetch(`http://127.0.0.1:${proxyPort}/teamclaude/reload`, { method: 'POST' });
+  const res = await fetch(`http://127.0.0.1:${proxyPort}/teamclaude/reload`, { method: 'POST', signal: AbortSignal.timeout(10_000) });
   const text = await res.text();
   assert.equal(res.status, 200, text);
   assert.equal(JSON.parse(text).ok, true, text);

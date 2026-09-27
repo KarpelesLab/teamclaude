@@ -481,10 +481,27 @@ test('createProxyServer upgrade listener: a refused handshake whose headers all 
 // the flag to relayUpgrade separately from createProxyServer. These drive a
 // handshake through a real terminated CONNECT tunnel, as
 // mitm-upgrade-host.test.js does, so a dropped argument there fails here.
-function connectThroughProxy(proxyPort, target, caCertPem) {
+// Bounded: a CONNECT reply or TLS handshake that stalls, or a socket that
+// closes first, rejects within `timeoutMs` and destroys both sockets, so the
+// caller's teardown runs instead of waiting on the test timeout.
+function connectThroughProxy(proxyPort, target, caCertPem, timeoutMs = 10_000) {
   return new Promise((resolve, reject) => {
     const raw = net.connect(proxyPort, '127.0.0.1');
-    raw.once('error', reject);
+    /** @type {tls.TLSSocket | null} */
+    let sock = null;
+    let settled = false;
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      sock?.destroy();
+      raw.destroy();
+      reject(err);
+    };
+    const timer = setTimeout(() => fail(new Error(`CONNECT/TLS setup did not finish within ${timeoutMs} ms`)), timeoutMs);
+    const onClose = () => fail(new Error('socket closed before the TLS handshake finished'));
+    raw.once('error', fail);
+    raw.once('close', onClose);
     raw.once('connect', () => raw.write(`CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\n\r\n`));
     let buf = Buffer.alloc(0);
     const onData = (d) => {
@@ -492,23 +509,46 @@ function connectThroughProxy(proxyPort, target, caCertPem) {
       if (!buf.includes('\r\n\r\n')) return;
       raw.removeListener('data', onData);
       const status = buf.toString('utf8').split('\r\n')[0];
-      if (!/ 200 /.test(status)) { raw.destroy(); reject(new Error(status)); return; }
-      const sock = tls.connect({ socket: raw, servername: 'localhost', ca: [caCertPem], ALPNProtocols: ['http/1.1'] }, () => resolve(sock));
-      sock.once('error', reject);
+      if (!/ 200 /.test(status)) { fail(new Error(status)); return; }
+      sock = tls.connect({ socket: raw, servername: 'localhost', ca: [caCertPem], ALPNProtocols: ['http/1.1'] }, () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        raw.removeListener('error', fail);
+        raw.removeListener('close', onClose);
+        resolve(sock);
+      });
+      sock.once('error', fail);
+      sock.once('close', onClose);
     };
     raw.on('data', onData);
   });
 }
 
+// closeAllConnections() skips sockets handed off to an 'upgrade' or 'connect'
+// listener, so a test that upgrades records every accepted socket itself and
+// destroys them in teardown.
+function trackSockets(server) {
+  /** @type {Set<net.Socket>} */
+  const sockets = new Set();
+  server.on('connection', (s) => {
+    sockets.add(s);
+    s.once('close', () => sockets.delete(s));
+  });
+  return () => { for (const s of sockets) s.destroy(); };
+}
+
 async function handshakeThroughMitm(extraConfig = {}) {
   const { caCertPem, leafCertPem, leafKeyPem } = generateCertChain('localhost');
   const upstream = upgradeUpstream('101 Switching Protocols');
+  const destroyUpstreamSockets = trackSockets(upstream);
   const upPort = await listen(upstream);
   const am = new AccountManager(
     [{ name: 'a', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + HOUR }],
     0.98,
   );
   const proxy = http.createServer();
+  const destroyProxySockets = trackSockets(proxy);
   proxy.on('connect', createConnectHandler({
     config: { upstream: `http://127.0.0.1:${upPort}`, mitm: { http1Only: true }, ...extraConfig },
     accountManager: am,
@@ -529,8 +569,10 @@ async function handshakeThroughMitm(extraConfig = {}) {
     return await readHead(tlsSock);
   } finally {
     tlsSock?.destroy();
+    destroyProxySockets();
     proxy.closeAllConnections?.();
     proxy.close();
+    destroyUpstreamSockets();
     upstream.closeAllConnections();
     upstream.close();
   }
@@ -551,3 +593,78 @@ test('MITM upgrade listener: stripOverageHeaders unset keeps overage headers on 
   assert.match(text, /anthropic-ratelimit-unified-upgrade-paths: extra_usage/);
   assert.match(text, /anthropic-ratelimit-unified-5h-status: allowed/);
 });
+
+// The flag is sampled once per request, at dispatch (forwardRequest's ctx), so
+// a reload that flips it mid-request must not change what that request's
+// failover hop does, and the next request must see the new value. Drives the
+// in-stream failover of stream-failure-failover.test.js: the first account
+// answers 200 and reports overloaded_error as its first event, the proxy hops
+// once to the sibling, and the config is flipped while the first attempt is
+// in flight.
+const SSE_START = { type: 'message_start', message: { id: 'msg_1', type: 'message', role: 'assistant', content: [], model: 'claude-x', usage: { input_tokens: 5, output_tokens: 1 } } };
+const SSE_STOP = { type: 'message_stop' };
+const SSE_OVERLOADED = { type: 'error', error: { type: 'overloaded_error', message: 'Overloaded' } };
+const sseFrame = (e) => `event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`;
+
+for (const dispatched of [false, true]) {
+  test(`stream failover keeps the stripOverageHeaders value it was dispatched with (${dispatched}), the next request sees the new one`, async () => {
+    /** @type {string[]} */
+    const seen = [];
+    /** @type {{ proxy: {}, stripOverageHeaders: boolean }} */
+    const config = { proxy: {}, stripOverageHeaders: dispatched };
+    const upstream = http.createServer(async (req, res) => {
+      for await (const c of req) void c;
+      seen.push(String(req.headers.authorization || '').replace(/^Bearer t-/, ''));
+      res.writeHead(200, { 'content-type': 'text/event-stream', ...OVERAGE, ...PLAN });
+      if (seen.length === 1) {
+        // A reload lands while the first attempt is in flight.
+        config.stripOverageHeaders = !dispatched;
+        res.end(sseFrame(SSE_OVERLOADED));
+        return;
+      }
+      res.end(sseFrame(SSE_START) + sseFrame(SSE_STOP));
+    });
+    const upstreamPort = await listen(upstream);
+    const account = (name) => ({
+      name, type: 'oauth', accountId: `acct-${name}`, accessToken: `t-${name}`, refreshToken: 'r',
+      expiresAt: Date.now() + HOUR, upstream: `http://127.0.0.1:${upstreamPort}`,
+    });
+    const am = new AccountManager([account('one'), account('two')], 0.98);
+    const proxy = createProxyServer(am, config);
+    const proxyPort = await listen(proxy);
+    const post = async () => {
+      const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'claude-x', messages: [], stream: true }),
+        signal: AbortSignal.timeout(10_000),
+      });
+      const body = await res.text();
+      return { res, body };
+    };
+    const assertOverage = (headers, stripped, label) => {
+      for (const [name, value] of Object.entries(OVERAGE)) {
+        assert.equal(headers.get(name), stripped ? null : value, `${label}: ${name}`);
+      }
+      assertPlanPassedThrough(headers);
+    };
+
+    try {
+      const first = await post();
+      assert.equal(first.res.status, 200);
+      assert.equal(seen.length, 2, 'the in-stream refusal hopped once');
+      assert.notEqual(seen[0], seen[1], 'the hop went to the sibling');
+      assert.equal(first.body, sseFrame(SSE_START) + sseFrame(SSE_STOP), "the client reads the sibling's stream");
+      assert.equal(config.stripOverageHeaders, !dispatched, 'the config did change mid-request');
+      assertOverage(first.res.headers, dispatched, 'the hop keeps the dispatch-time value');
+
+      const second = await post();
+      assert.equal(second.res.status, 200);
+      assert.equal(seen.length, 3);
+      assertOverage(second.res.headers, !dispatched, 'the next request samples the new value');
+    } finally {
+      proxy.close();
+      upstream.close();
+    }
+  });
+}
