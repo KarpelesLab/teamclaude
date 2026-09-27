@@ -15,6 +15,7 @@
   },
   "upstream": "https://api.anthropic.com",
   "switchThreshold": 0.98,
+  "stripOverageHeaders": false,
   "distributeSessions": false,
   "quotaProbeSeconds": 0,
   "autoUpdate": true,

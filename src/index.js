@@ -491,6 +491,9 @@ async function serverCommand() {
     // not wait for a restart.
     config.autoRedeemResets = diskConfig.autoRedeemResets === true;
     config.blockedModels = Array.isArray(diskConfig.blockedModels) ? diskConfig.blockedModels : [];
+    // Sampled off this object when each request is dispatched (server.js
+    // shouldStripOverageHeaders), so the reload applies to subsequent requests.
+    config.stripOverageHeaders = diskConfig.stripOverageHeaders === true;
     // Apply an sx.org key/mode change made on disk (e.g. via POST /teamclaude/reload).
     const diskSxKey = diskConfig.sx?.apiKey || null;
     const diskSxMode = diskConfig.sx?.mode || 'always';
