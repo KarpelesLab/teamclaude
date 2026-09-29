@@ -1139,7 +1139,7 @@ function relayStream(req, res, upstream, sx) {
  * handshake (emits its own 'upgrade' event on a 101); once that fires it's
  * just two raw sockets spliced together.
  */
-export function relayUpgrade(req, socket, head, upstream, sx) {
+export function relayUpgrade(req, socket, head, upstream, sx, { log = console.log } = {}) {
   const target = new URL(`${upstream}${req.url}`);
   const headers = {};
   for (const [key, value] of Object.entries(req.headers)) {
@@ -1159,8 +1159,10 @@ export function relayUpgrade(req, socket, head, upstream, sx) {
 
   upstreamReq.on('upgrade', (upstreamRes, upstreamSocket, upstreamHead) => {
     const headerLines = Object.entries(upstreamRes.headers)
-      .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(', ') : v}`).join('\r\n');
-    socket.write(`HTTP/1.1 ${upstreamRes.statusCode} ${upstreamRes.statusMessage}\r\n${headerLines}\r\n\r\n`);
+      .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(', ') : v}`);
+    // Lines joined, one terminator: an empty header set must not leave a blank
+    // line inside (or an extra CRLF after) the response head.
+    socket.write([`HTTP/1.1 ${upstreamRes.statusCode} ${upstreamRes.statusMessage}`, ...headerLines].join('\r\n') + '\r\n\r\n');
     if (upstreamHead?.length) socket.write(upstreamHead);
     if (head?.length) upstreamSocket.write(head);
     socket.pipe(upstreamSocket);
@@ -1174,6 +1176,28 @@ export function relayUpgrade(req, socket, head, upstream, sx) {
     upstreamSocket.on('end', () => socket.destroy());
     socket.on('close', () => upstreamSocket.destroy());
     upstreamSocket.on('close', () => socket.destroy());
+    // The 101 detaches this socket from upstreamReq, so the request's 'error'
+    // listener no longer covers it. A link that flaps mid-session then raises
+    // 'error' (write EPIPE / read ECONNRESET) on a socket nobody listens to,
+    // which Node escalates to an uncaught exception — one dropped WebSocket
+    // would kill the proxy for every other session. Close the pair instead.
+    upstreamSocket.on('error', () => socket.destroy());
+  });
+
+  // Upstream answered with a plain response instead of the 101: the handshake
+  // was refused (an expired credential, an unknown session). Without this the
+  // client socket hung with no answer until it timed out, and nothing was
+  // logged. Relay the status so the client sees the refusal it was given.
+  upstreamReq.on('response', (upstreamRes) => {
+    log(`[TeamClaude] WebSocket refused by upstream (${upstreamRes.statusCode})`);
+    const headerLines = Object.entries(upstreamRes.headers)
+      .filter(([k]) => !CONNECTION_SPECIFIC_HEADERS.has(k.toLowerCase()) && k.toLowerCase() !== 'content-length')
+      .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(', ') : v}`);
+    try {
+      socket.write([`HTTP/1.1 ${upstreamRes.statusCode} ${upstreamRes.statusMessage}`, ...headerLines, 'Connection: close'].join('\r\n') + '\r\n\r\n');
+    } catch { /* already gone */ }
+    upstreamRes.resume();
+    socket.destroy();
   });
 
   upstreamReq.on('error', (err) => {
