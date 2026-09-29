@@ -47,8 +47,10 @@ export function sameOrg(a, b) {
  *   UUID. Checked first because the name fallback below is what a cross-provider
  *   pair reaches — a Codex account has no accountUuid to tell it apart from its
  *   Claude namesake, so one email holding both subscriptions read as one account.
- * - Both have an accountId (the ChatGPT one): it must match. Same evidence class
- *   as the accountUuid below, so it decides before the name.
+ * - Both have an accountId (the ChatGPT one): it must match, and so must the
+ *   userId when both sides have one (members of one ChatGPT workspace share an
+ *   accountId). Same evidence class as the accountUuid below, so it decides
+ *   before the name.
  * - Both have an accountUuid: it must match. If the organizations can be
  *   compared (see sameOrg) they must also match; but if either side's org is
  *   still unknown we treat them as the same. This lets a freshly-profiled login
@@ -59,7 +61,9 @@ export function sameOrg(a, b) {
  */
 export function sameIdentity(a, b) {
   if (providerOf(a) !== providerOf(b)) return false;
-  if (a?.accountId && b?.accountId) return a.accountId === b.accountId;
+  if (a?.accountId && b?.accountId) {
+    return a.accountId === b.accountId && (!a.userId || !b.userId || a.userId === b.userId);
+  }
   if (a?.accountUuid && b?.accountUuid) {
     if (a.accountUuid !== b.accountUuid) return false;
     return sameOrg(a, b) !== false;
@@ -75,7 +79,9 @@ export function sameIdentity(a, b) {
  */
 export function distinctAccounts(a, b) {
   if (providerOf(a) !== providerOf(b)) return true;
-  if (a?.accountId && b?.accountId) return a.accountId !== b.accountId;
+  if (a?.accountId && b?.accountId) {
+    return a.accountId !== b.accountId || (!!a.userId && !!b.userId && a.userId !== b.userId);
+  }
   if (!a?.accountUuid || !b?.accountUuid) return false;
   if (a.accountUuid !== b.accountUuid) return true;
   return sameOrg(a, b) === false;

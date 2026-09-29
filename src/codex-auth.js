@@ -73,6 +73,7 @@ export async function importCodexCredentials(filePath = DEFAULT_CODEX_CREDENTIAL
     accountId: auth.chatgpt_account_id || tokens.account_id,
     email: claims.email,
     planType: auth.chatgpt_plan_type,
+    userId: auth.chatgpt_user_id || auth.user_id,
   };
 }
 
@@ -177,6 +178,7 @@ export function credentialsFromTokenResponse(data) {
     accountId: auth.chatgpt_account_id,
     email: claims.email,
     planType: auth.chatgpt_plan_type,
+    userId: auth.chatgpt_user_id || auth.user_id,
   };
 }
 

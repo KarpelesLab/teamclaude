@@ -16,7 +16,7 @@ test('exportQuotaState carries only persistable fields and identity, no credenti
   // identifies an account that has no Anthropic uuid to be matched by.
   assert.deepEqual(
     Object.keys(entry).sort(),
-    ['accountUuid', 'accountId', 'provider', 'name', 'orgName', 'orgUuid', 'profile', 'quota', 'adaptive'].sort(),
+    ['accountUuid', 'accountId', 'userId', 'provider', 'name', 'orgName', 'orgUuid', 'profile', 'quota', 'adaptive'].sort(),
   );
   assert.equal(entry.accountUuid, 'p1');
   assert.equal(entry.provider, 'anthropic');
