@@ -1,4 +1,5 @@
 import { DEFAULT_SWITCH_THRESHOLD, distributionMode } from './account-manager.js';
+import { matchAccounts } from './identity.js';
 import { THRESHOLD_BUCKET_KEYS, WEEKLY_BUCKET_KEYS } from './model.js';
 import { createRollingWarmupSchedule, resolveWarmupSchedule } from './warmup-schedule.js';
 
@@ -323,4 +324,76 @@ export function setDefaultClientMode(config, mode) {
     throw new ConfigOpError('The default client mode is mitm or base-url.');
   }
   config.defaultClientMode = mode;
+}
+
+// ── account controls ─────────────────────────────────────────────────────────
+//
+// `teamclaude priority` / `disable` / `enable` resolved and mutated the account
+// inline, which left the same three steps — match, disambiguate, mutate — with
+// no home a non-CLI caller could reach. These are that, as operations, so the
+// CLI, the MCP tools and the dashboard all decide "which account" the same way.
+
+/**
+ * The one account `query` names, or a ConfigOpError saying why not.
+ *
+ * Ambiguity is an error rather than a pick: an email shared by two orgs names a
+ * different account in each, and silently taking the first would disable or
+ * reprioritize the wrong one.
+ *
+ * @param {any} config
+ * @param {string} query - account name, or the email portion of one
+ * @param {string} [orgFilter] - org name or uuid, when the query alone is ambiguous
+ */
+export function resolveConfiguredAccount(config, query, orgFilter) {
+  if (typeof query !== 'string' || !query.trim()) throw new ConfigOpError('name an account');
+  const matches = matchAccounts(config.accounts || [], query, orgFilter);
+  if (matches.length === 1) return matches[0];
+  if (matches.length === 0) throw new ConfigOpError(`no account matches "${query}"`);
+  const orgs = matches.map((/** @type {any} */ a) => a.orgName || a.orgUuid || '(no org)').join(', ');
+  throw new ConfigOpError(`"${query}" matches ${matches.length} accounts (${orgs}) — name the org too`);
+}
+
+/**
+ * Set an account's rotation priority. Lower is preferred.
+ *
+ * `place` moves the account relative to the rest instead of naming a number,
+ * which is what a caller with buttons rather than a number field has: 'first'
+ * goes one below the lowest, 'last' one above the highest. Same arithmetic the
+ * CLI's --first/--last already used, so the two agree.
+ *
+ * @param {any} config
+ * @param {string} query
+ * @param {{ priority?: number, place?: 'first'|'last', orgFilter?: string }} spec
+ */
+export function setAccountPriority(config, query, spec = {}) {
+  const account = resolveConfiguredAccount(config, query, spec.orgFilter);
+  const priorities = (config.accounts || []).map((/** @type {any} */ a) => a.priority || 0);
+  let priority;
+  if (spec.place === 'first') priority = Math.min(0, ...priorities) - 1;
+  else if (spec.place === 'last') priority = Math.max(0, ...priorities) + 1;
+  else priority = spec.priority;
+  // `typeof` first: isSafeInteger takes unknown and narrows nothing, and the
+  // number the callers store and echo must not be typed as possibly absent.
+  if (typeof priority !== 'number' || !Number.isSafeInteger(priority)) throw new ConfigOpError('priority must be an integer, or place must be "first" or "last"');
+  account.priority = priority;
+  return { name: account.name, priority };
+}
+
+/**
+ * Take an account out of rotation, or put it back.
+ *
+ * Enabling deletes the key rather than writing `false`, because that is what
+ * the CLI has always written and an absent key is the configured default.
+ *
+ * @param {any} config
+ * @param {string} query
+ * @param {boolean} disabled
+ * @param {{ orgFilter?: string }} [spec]
+ */
+export function setAccountDisabled(config, query, disabled, spec = {}) {
+  if (typeof disabled !== 'boolean') throw new ConfigOpError('disabled must be true or false');
+  const account = resolveConfiguredAccount(config, query, spec.orgFilter);
+  if (disabled) account.disabled = true;
+  else delete account.disabled;
+  return { name: account.name, disabled: !!account.disabled };
 }

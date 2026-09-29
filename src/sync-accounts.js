@@ -3,7 +3,7 @@ import { sameIdentity } from './identity.js';
 import { safeLine } from './safe-text.js';
 import { removedAccountIds, addedAccountIds, configIndexFor } from './account-pairing.js';
 import { ensureAccountIds } from './account-id.js';
-import { accountSwitchThreshold, accountRouting } from './account-manager.js';
+import { accountSwitchThreshold, accountAllowsExtraUsage, accountRouting } from './account-manager.js';
 import { localListener } from './upstream-proxy.js';
 
 /**
@@ -122,6 +122,12 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     // and reported here as it would be at startup. The config entry below keeps
     // the operator's text as written: this only decides what the gate reads.
     mgr.switchThreshold = accountSwitchThreshold(diskAcct);
+    // Same for the extra-usage opt-in, and more so: it decides whether the
+    // fleet may spend money, so turning it off on disk must stop that now.
+    // Through the constructor's own test, so an entry the fallback cannot bill
+    // (an API key, a third-party backend, a Codex login) stays opted out on
+    // reload as it was at startup; the warning was makeAccount's to give.
+    mgr.allowExtraUsage = accountAllowsExtraUsage(diskAcct);
     // Same for a per-account routing proxy: it is read per request off this
     // object (server.js forwardRequest, ensureTokenFresh, the prober), so a
     // disk edit or a `teamclaude routing` change takes effect on the very next
@@ -176,6 +182,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       // arrangement every entry carries a value for a hand edit to lose to.
       if (Number.isFinite(diskAcct.displayOrder)) cfgAcct.displayOrder = diskAcct.displayOrder; else delete cfgAcct.displayOrder;
       if (diskAcct.disabled) cfgAcct.disabled = true; else delete cfgAcct.disabled;
+      if (diskAcct.allowExtraUsage === true) cfgAcct.allowExtraUsage = true; else delete cfgAcct.allowExtraUsage;
       // Both polarities are mirrored, unlike the flags above: `false` is the
       // side of this key that does something, so a stale mirror of either value
       // would win the save stencil's spread and undo the disk edit.

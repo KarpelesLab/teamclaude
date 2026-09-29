@@ -5,12 +5,14 @@ import { createHash } from 'node:crypto';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
 import {
-  renderDashboardHtml, dashboardCsp, scopedWeeklyRows, accountTokens,
+  renderDashboardHtml, dashboardCsp, inlineScripts, scopedWeeklyRows, accountTokens,
   accountBadges, thresholdBadgeText,
   sessionRows, filterSessionRows, sortRows, uniqSorted,
-  switchRequest, switchOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
+  switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
   thresholdRequest, thresholdPercentText, thresholdOutcome,
+  usageFor, USAGE_VIEWS,
 } from '../src/dashboard.js';
+import { USAGE_WINDOWS } from '../src/client-usage.js';
 
 function listen(server) {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
@@ -567,7 +569,7 @@ test('the serialized helpers run in the page\'s own scope, not just parse', () =
   // constant the page never ships — it would ReferenceError at first render.
   // Evaluate ONLY the serialized bundle and call into it.
   const html = renderDashboardHtml();
-  const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
+  const script = inlineScripts(html).at(-1);
   const bundle = script.slice(script.indexOf('var STARVED_MIN'), script.indexOf('function el('));
   const isolated = new Function(`${bundle}; return problems;`)();
   const payload = { sessions: { items: [{ id: 'deadbeef1234', client: 'alice', active: true, starved: 9, requests: 9, pins: {}, tokens: {} }] } };
@@ -581,7 +583,7 @@ test('the serialized helpers run in the page\'s own scope, not just parse', () =
 // grepping the source would not catch — only running the bundle does.
 test('accountBadges calls thresholdBadgeText inside the same serialized bundle', () => {
   const html = renderDashboardHtml();
-  const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
+  const script = inlineScripts(html).at(-1);
   const bundle = script.slice(script.indexOf('var STARVED_MIN'), script.indexOf('function el('));
   const isolated = new Function(`${bundle}; return accountBadges;`)();
   const account = { name: 'a', type: 'oauth', switchThreshold: 1.0 };
@@ -595,7 +597,7 @@ test('accountBadges calls thresholdBadgeText inside the same serialized bundle',
 // it threw a ReferenceError from render() and blanked the accounts pane.
 test('a table-form override renders its badge inside the serialized bundle', () => {
   const html = renderDashboardHtml();
-  const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
+  const script = inlineScripts(html).at(-1);
   const bundle = script.slice(script.indexOf('var STARVED_MIN'), script.indexOf('function el('));
   const isolated = new Function(`${bundle}; return accountBadges;`)();
   const account = { name: 'a', type: 'oauth', switchThreshold: { unified7d: 0.9, unified7dFable: 0.8 } };
@@ -670,24 +672,47 @@ test('the page ships the same helper implementations it is tested against', () =
   // The serialization is the contract: if a helper stops being self-contained
   // (closes over module scope), the page would silently ReferenceError.
   const html = renderDashboardHtml();
-  for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems]) {
+  for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
-  const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
-  assert.doesNotThrow(() => new Function(script), 'inline script must parse');
+  // Both the head bootstrap and the main script must parse, not just the last.
+  for (const script of inlineScripts(html)) {
+    assert.doesNotThrow(() => new Function(script), 'inline script must parse');
+  }
 });
 
 // Run the page's whole inline script against a stub DOM, a stub localStorage and
 // a fetch the test answers by hand. Elements absorb any method call, so render()
 // runs without a real DOM; only the style and text the startup path sets are read.
-function bootPage({ storedKey = null } = {}) {
+function bootPage({ storedKey = null, storedTheme = null } = {}) {
   const els = new Map();
+  // Listeners are recorded rather than absorbed, and every element built is
+  // kept, so a test can drive a control the page created for itself — the
+  // window buttons have no id to look up.
+  const built = [];
   const stubEl = () => {
-    const target = { style: {}, value: '', textContent: '', className: '', disabled: false };
-    return new Proxy(target, { get: (t, p) => (p in t ? t[p] : () => stubEl()) });
+    // Listeners are recorded rather than absorbed, so a test can fire a click
+    // the way the page registered it instead of reaching for an onclick the
+    // page never sets. Every listener for a type is kept, in registration
+    // order, since a page may attach more than one to the same element.
+    const listeners = new Map();
+    const target = {
+      style: {}, value: '', textContent: '', className: '', disabled: false,
+      addEventListener: (type, fn) => { if (!listeners.has(type)) listeners.set(type, []); listeners.get(type).push(fn); },
+      listens: type => (listeners.get(type) || []).length > 0,
+    };
+    const proxy = new Proxy(target, { get: (t, p) => (p in t ? t[p] : () => stubEl()) });
+    // Fire with the proxy as `this`, the way the page sees the element, so a
+    // handler that touches an unstubbed property gets the absorbing stub.
+    target.fire = type => { for (const fn of listeners.get(type) || []) fn.call(proxy); };
+    built.push(proxy);
+    return proxy;
   };
   const byId = id => { if (!els.has(id)) els.set(id, stubEl()); return els.get(id); };
-  const store = new Map(storedKey ? [['teamclaude-dashboard-key', storedKey]] : []);
+  const store = new Map([
+    ...(storedKey ? [['teamclaude-dashboard-key', storedKey]] : []),
+    ...(storedTheme ? [['teamclaude-dashboard-theme', storedTheme]] : []),
+  ]);
   const localStorage = {
     getItem: k => (store.has(k) ? store.get(k) : null),
     setItem: (k, v) => store.set(k, String(v)),
@@ -695,16 +720,36 @@ function bootPage({ storedKey = null } = {}) {
   };
   const requests = [];
   const fetch = (url, init) => new Promise(resolve => requests.push({ url, init, resolve }));
-  const document = { getElementById: byId, createElement: () => stubEl() };
+  // documentElement is real enough to record the theme attribute, so a test can
+  // assert what the page actually sets rather than that it merely did not throw.
+  const rootAttrs = new Map();
+  const documentElement = {
+    setAttribute: (k, v) => rootAttrs.set(k, String(v)),
+    removeAttribute: k => rootAttrs.delete(k),
+    getAttribute: k => (rootAttrs.has(k) ? rootAttrs.get(k) : null),
+  };
+  const document = { getElementById: byId, createElement: () => stubEl(), documentElement };
   const html = renderDashboardHtml();
-  const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
+  const script = inlineScripts(html).at(-1);
   new Function('document', 'localStorage', 'fetch', 'setInterval', 'clearInterval', script)(
     document, localStorage, fetch, () => 1, () => {});
   const answer = async (status, body = {}) => {
     requests.shift().resolve({ status, ok: status >= 200 && status < 300, json: async () => body });
     await new Promise(r => setImmediate(r));
   };
-  return { byId, store, requests, answer };
+  // Click the control carrying this label, whoever built it. A render replaces
+  // a table by building new elements rather than mutating the old ones, so the
+  // mark is what keeps `labelled` counting what is on the page now instead of
+  // everything ever built.
+  let mark = 0;
+  const click = label => {
+    const el = built.find(e => e.textContent === label && e.listens('click'));
+    assert.ok(el, `no clickable element labelled ${label}`);
+    mark = built.length;
+    el.fire('click');
+  };
+  const labelled = label => built.slice(mark).filter(e => e.textContent === label).length;
+  return { byId, store, requests, answer, rootAttrs, click, labelled };
 }
 
 test('the page polls status before asking for a key, so a key-exempt browser is never prompted', async () => {
@@ -778,9 +823,15 @@ test('GET /teamclaude/dashboard serves HTML without a key; other methods are a l
     assert.match(csp, /(^|; )connect-src 'self'(;|$)/);
     assert.match(csp, /(^|; )frame-ancestors 'none'(;|$)/);
     assert.doesNotMatch(csp, /script-src[^;]*'unsafe-inline'/);
-    const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
-    const hash = createHash('sha256').update(script, 'utf8').digest('base64');
-    assert.match(csp, new RegExp(`script-src 'sha256-${hash.replace(/[+/=]/g, '\\$&')}'`));
+    // Every inline script is admitted by hash, not just the first: the theme
+    // is applied by a short script in <head>, and a policy covering only the
+    // main script would block it and paint the page dark for a light viewer.
+    const scripts = inlineScripts(html);
+    assert.ok(scripts.length >= 2, 'the page has a head script and a main script');
+    for (const script of scripts) {
+      const hash = createHash('sha256').update(script, 'utf8').digest('base64');
+      assert.match(csp, new RegExp(`'sha256-${hash.replace(/[+/=]/g, '\\$&')}'`));
+    }
     assert.equal(page.headers.get('x-content-type-options'), 'nosniff');
 
     // The asset route is GET + exact path only — a POST to the same path must
@@ -795,4 +846,162 @@ test('GET /teamclaude/dashboard serves HTML without a key; other methods are a l
     proxy.close();
     upstream.close();
   }
+});
+
+test('the theme starts from what was stored, and system means no attribute', () => {
+  // No stored choice: the attribute is absent, so the media query decides and a
+  // viewer who never touches this keeps following their desktop.
+  assert.equal(bootPage().rootAttrs.get('data-theme'), undefined);
+  assert.equal(bootPage({ storedTheme: 'light' }).rootAttrs.get('data-theme'), 'light');
+  assert.equal(bootPage({ storedTheme: 'dark' }).rootAttrs.get('data-theme'), 'dark');
+  // Junk in storage is not a theme; fall back to following the system rather
+  // than writing an attribute no stylesheet matches.
+  assert.equal(bootPage({ storedTheme: 'neon' }).rootAttrs.get('data-theme'), undefined);
+});
+
+test('the theme button cycles system -> light -> dark and persists each step', () => {
+  const page = bootPage();
+  const click = () => page.byId('theme').fire('click');
+  const stored = () => page.store.get('teamclaude-dashboard-theme');
+
+  assert.equal(page.byId('theme').textContent, 'Theme: system');
+  assert.equal(stored(), undefined, 'following the system stores nothing');
+
+  click();
+  assert.equal(page.rootAttrs.get('data-theme'), 'light');
+  assert.equal(stored(), 'light');
+  assert.equal(page.byId('theme').textContent, 'Theme: light');
+
+  click();
+  assert.equal(page.rootAttrs.get('data-theme'), 'dark');
+  assert.equal(stored(), 'dark');
+
+  // Back to system: the attribute goes away AND the stored value is removed,
+  // so the page does not keep re-applying a choice the viewer just dropped.
+  click();
+  assert.equal(page.rootAttrs.get('data-theme'), undefined);
+  assert.equal(stored(), undefined);
+  assert.equal(page.byId('theme').textContent, 'Theme: system');
+});
+
+test('a stored dark choice survives a reload', () => {
+  const first = bootPage();
+  first.byId('theme').fire('click');
+  first.byId('theme').fire('click');
+  assert.equal(first.store.get('teamclaude-dashboard-theme'), 'dark');
+  // A fresh page with that storage comes up dark without another click.
+  const reloaded = bootPage({ storedTheme: first.store.get('teamclaude-dashboard-theme') });
+  assert.equal(reloaded.rootAttrs.get('data-theme'), 'dark');
+  assert.equal(reloaded.byId('theme').textContent, 'Theme: dark');
+});
+
+test('accountControlRequest picks the endpoint and body from the spec', () => {
+  // A relative move sends `place` and no number: the caller has buttons, not a
+  // number field, and the server is the one that knows the other priorities.
+  const first = accountControlRequest('a@x.com', { place: 'first' }, 'k');
+  assert.equal(first.url, '/teamclaude/priority');
+  assert.deepEqual(JSON.parse(first.init.body), { account: 'a@x.com', place: 'first' });
+  assert.equal(first.init.headers['x-api-key'], 'k');
+
+  const exact = accountControlRequest('a@x.com', { priority: 3 }, 'k');
+  assert.deepEqual(JSON.parse(exact.init.body), { account: 'a@x.com', priority: 3 });
+
+  // disabled:false is a real value, not an absent one — it must still route to
+  // the disable endpoint rather than being read as a priority change.
+  const off = accountControlRequest('a@x.com', { disabled: true }, 'k');
+  assert.equal(off.url, '/teamclaude/disable');
+  assert.deepEqual(JSON.parse(off.init.body), { account: 'a@x.com', disabled: true });
+  const on = accountControlRequest('a@x.com', { disabled: false }, 'k');
+  assert.equal(on.url, '/teamclaude/disable');
+  assert.deepEqual(JSON.parse(on.init.body), { account: 'a@x.com', disabled: false });
+
+  // No key configured is not an error here; the server decides.
+  assert.equal(accountControlRequest('a@x.com', { place: 'last' }, null).init.headers['x-api-key'], '');
+});
+
+test('accountControlOutcome reports the number a relative move landed on', () => {
+  assert.deepEqual(
+    accountControlOutcome({ ok: true, name: 'a@x.com', priority: -1 }, { place: 'first' }),
+    { kind: 'ok', text: 'a@x.com priority -1' });
+  assert.deepEqual(
+    accountControlOutcome({ ok: true, name: 'a@x.com', disabled: true }, { disabled: true }),
+    { kind: 'ok', text: 'disabled a@x.com' });
+  assert.deepEqual(
+    accountControlOutcome({ ok: true, name: 'a@x.com', disabled: false }, { disabled: false }),
+    { kind: 'ok', text: 'enabled a@x.com' });
+  assert.deepEqual(
+    accountControlOutcome({ ok: false, error: 'no account matches "z"' }, { place: 'first' }),
+    { kind: 'error', text: 'change failed: no account matches "z"' });
+  assert.deepEqual(
+    accountControlOutcome(null, { place: 'first' }),
+    { kind: 'error', text: 'change failed' });
+});
+
+// ── usage windows ───────────────────────────────────────────
+
+const ENTRY = {
+  requests: 100, connections: 4, inputTokens: 9000, outputTokens: 500,
+  windows: {
+    '5h': { requests: 3, connections: 0, inputTokens: 300, outputTokens: 20 },
+    '24h': { requests: 12, connections: 1, inputTokens: 1200, outputTokens: 80 },
+  },
+};
+
+test('the total view reads the lifetime counters', () => {
+  assert.deepEqual(usageFor(ENTRY, 'total'), { requests: 100, connections: 4, inputTokens: 9000, outputTokens: 500 });
+  // No view at all is the same question, asked before the page has state.
+  assert.deepEqual(usageFor(ENTRY), usageFor(ENTRY, 'total'));
+});
+
+test('a window view reads that window, not the lifetime counters', () => {
+  assert.deepEqual(usageFor(ENTRY, '24h'), { requests: 12, connections: 1, inputTokens: 1200, outputTokens: 80 });
+  assert.equal(usageFor(ENTRY, '5h').inputTokens, 300);
+});
+
+test('a window the payload does not carry reads as zero, never as the total', () => {
+  // The alternative — falling back to the lifetime figure — would label an
+  // all-time number as a five-hour one, which is the one answer that misleads
+  // rather than merely disappoints.
+  assert.deepEqual(usageFor({ requests: 7, inputTokens: 5 }, '24h'), { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0 });
+  assert.deepEqual(usageFor(null, '5h'), { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0 });
+  assert.deepEqual(usageFor(undefined, 'total'), { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0 });
+});
+
+test('every offered view names a window the tracker actually keeps', () => {
+  // The buttons are derived from USAGE_WINDOWS rather than listed twice: a
+  // renamed window must not leave behind a button that reads zero for everyone.
+  assert.equal(USAGE_VIEWS[0].key, 'total');
+  assert.deepEqual(USAGE_VIEWS.slice(1).map(v => v.key), Object.keys(USAGE_WINDOWS));
+  for (const view of USAGE_VIEWS) assert.ok(view.label, 'every view carries a button label');
+});
+
+test('the page ships the view list it renders buttons from', () => {
+  assert.ok(renderDashboardHtml().includes(`var USAGE_VIEWS = ${JSON.stringify(USAGE_VIEWS)};`));
+});
+
+test('selecting a window relabels every table it governs', async () => {
+  const page = bootPage();
+  const windows = { '5h': { requests: 1, connections: 0, inputTokens: 10, outputTokens: 2 },
+    '24h': { requests: 9, connections: 0, inputTokens: 900, outputTokens: 40 } };
+  await page.answer(200, {
+    accounts: [],
+    clients: { alice: { requests: 99, connections: 0, inputTokens: 9000, outputTokens: 400, lastUsed: new Date().toISOString(), windows } },
+    usageDimensions: { project: { widgets: { requests: 99, inputTokens: 9000, outputTokens: 400, windows } } },
+  });
+
+  assert.equal(page.byId('clientsHeading').textContent, 'Clients');
+  assert.equal(page.labelled('Last used'), 2, 'both tables label the column plainly under Total');
+  assert.equal(page.labelled('Project'), 2, 'the dimension heading and its first column');
+
+  page.click('Last 24h');
+
+  // The heading is what stops a windowed figure being read as a lifetime one
+  // once the control itself is scrolled out of view.
+  assert.equal(page.byId('clientsHeading').textContent, 'Clients · last 24h');
+  assert.equal(page.labelled('Project · last 24h'), 1, 'the dimension table names the window too');
+  assert.equal(page.labelled('Last used (all time)'), 2, 'and the one lifetime column says so');
+  assert.equal(page.labelled('Last used'), 0);
+
+  page.click('Total');
+  assert.equal(page.byId('clientsHeading').textContent, 'Clients', 'and back again');
 });

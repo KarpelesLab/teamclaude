@@ -13,10 +13,20 @@ import {
   usageDimensionHeaderNames,
   sanitizeUsageDimensionValue,
   createUsageRecorder,
+  USAGE_SLOT_MS,
+  USAGE_WINDOWS,
 } from '../src/client-usage.js';
 
 function listen(server) {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
+}
+
+// The same counters in every window — what an exact-shape assertion expects
+// when all of an entry's traffic is recent enough to sit inside all of them.
+// Derived from the tracker's own window list, so adding a window does not
+// silently weaken these assertions into ones that skip the new key.
+function everyWindow(usage) {
+  return Object.fromEntries(Object.keys(USAGE_WINDOWS).map(label => [label, { ...usage }]));
 }
 
 const PROXY = { apiKey: 'shared-key', clientKeys: [{ name: 'alice', key: 'alice-key' }, { name: 'bob', key: 'bob-key' }] };
@@ -30,7 +40,11 @@ test('tracker aggregates per name and drops unattributed records', () => {
   t.record(null, { requests: 1, inputTokens: 99 });   // unattributed → dropped
   t.record('', { requests: 1 });                       // ditto
   assert.deepEqual(t.export(), {
-    alice: { requests: 1, connections: 0, inputTokens: 7, outputTokens: 3, lastUsed: new Date(1000).toISOString() },
+    alice: {
+      requests: 1, connections: 0, inputTokens: 7, outputTokens: 3, lastUsed: new Date(1000).toISOString(),
+      // Recorded at one instant, so every window holds all of it.
+      windows: everyWindow({ requests: 1, connections: 0, inputTokens: 7, outputTokens: 3 }),
+    },
   });
 });
 
@@ -360,4 +374,216 @@ test('a dimension header is booked here and NOT forwarded upstream', async () =>
     proxy.close();
     upstream.close();
   }
+});
+
+// ── windowed usage ──────────────────────────────────────────
+//
+// A clock far from the epoch, so a slot number is a realistic magnitude and a
+// window boundary does not land on slot 0 by accident.
+const T0 = 400 * 24 * 3600_000;
+
+test('a window rolls up only the traffic inside it, and the total keeps everything', () => {
+  let now = T0;
+  const t = new ClientUsageTracker({ now: () => now });
+  t.record('alice', { requests: 1, inputTokens: 100 });
+  now += 6 * 3600_000;
+  t.record('alice', { requests: 1, inputTokens: 10 });
+  now += 3600_000;                                   // 7h after the first record
+
+  const e = t.export().alice;
+  assert.equal(e.inputTokens, 110, 'the lifetime counter is unchanged by windowing');
+  assert.equal(e.windows['24h'].inputTokens, 110);
+  assert.equal(e.windows['24h'].requests, 2);
+  assert.equal(e.windows['5h'].inputTokens, 10, 'the 7h-old record is outside the 5h window');
+  assert.equal(e.windows['5h'].requests, 1);
+});
+
+test('a slot that leaves the longest window is deleted, not merely unsummed', () => {
+  let now = T0;
+  const t = new ClientUsageTracker({ now: () => now });
+  t.record('alice', { requests: 1, inputTokens: 100 });
+  now += 25 * 3600_000;
+  t.record('alice', { requests: 1, inputTokens: 5 });
+
+  const e = t.export().alice;
+  assert.equal(e.inputTokens, 105, 'the lifetime counter still holds both');
+  assert.equal(e.windows['24h'].inputTokens, 5);
+  assert.deepEqual(Object.keys(t.exportState().alice.slots).length, 1, 'the aged slot is gone from memory');
+});
+
+test('the status snapshot ships windows, the state snapshot ships slots', () => {
+  const t = new ClientUsageTracker({ now: () => T0 });
+  t.record('alice', { requests: 1 });
+  // The two have different readers: a dashboard polling every few seconds must
+  // not be handed a hundred rows to re-sum, and a state file must not be handed
+  // a rollup it cannot resume from.
+  assert.ok(t.export().alice.windows, 'status carries the rollups');
+  assert.equal(t.export().alice.slots, undefined, 'status does not carry the tally');
+  assert.ok(t.exportState().alice.slots, 'state carries the tally');
+  assert.equal(t.exportState().alice.windows, undefined, 'state does not carry the rollups');
+});
+
+test('a restart resumes the window from the state file', () => {
+  let now = T0;
+  const before = new ClientUsageTracker({ now: () => now });
+  before.record('alice', { requests: 1, inputTokens: 100 });
+  const saved = before.exportState();
+
+  now += 3600_000;
+  const after = new ClientUsageTracker({ now: () => now });
+  after.restore(saved);
+
+  const e = after.export().alice;
+  assert.equal(e.windows['5h'].inputTokens, 100, 'an hour-old slot is still inside both windows');
+  assert.equal(e.windows['24h'].inputTokens, 100);
+});
+
+test('restore drops slots that aged out while the proxy was down', () => {
+  let now = T0;
+  const before = new ClientUsageTracker({ now: () => now });
+  before.record('alice', { requests: 1, inputTokens: 100 });
+  const saved = before.exportState();
+
+  now += 48 * 3600_000;
+  const after = new ClientUsageTracker({ now: () => now });
+  after.restore(saved);
+
+  const e = after.export().alice;
+  assert.equal(e.inputTokens, 100, 'the lifetime counters restore in full');
+  assert.equal(e.windows, undefined, 'a two-day-old slot leaves nothing in any window');
+  assert.equal(after.exportState().alice.slots, undefined, 'and is not carried into the next state file');
+});
+
+test('a state file written before slots existed restores without inventing a window', () => {
+  const t = new ClientUsageTracker({ now: () => T0 });
+  t.restore({ alice: { requests: 2, inputTokens: 5, lastUsed: new Date(T0 - 1000).toISOString() } });
+  const e = t.export().alice;
+  assert.equal(e.requests, 2);
+  assert.equal(e.windows, undefined, 'traffic with no recorded time counts in no window');
+});
+
+test('restore ignores a malformed or expired slot key instead of throwing', () => {
+  const t = new ClientUsageTracker({ now: () => T0 });
+  const current = Math.floor(T0 / USAGE_SLOT_MS);
+  t.restore({
+    alice: {
+      requests: 1,
+      slots: {
+        'not-a-slot': { requests: 5 },
+        [String(current)]: { requests: 1, inputTokens: 9 },
+        [String(current - 10_000)]: { requests: 7 },
+        [String(current - 1)]: 'nonsense',
+      },
+    },
+  });
+  assert.equal(t.export().alice.windows['5h'].requests, 1, 'only the valid current slot lands');
+  assert.equal(t.export().alice.windows['5h'].inputTokens, 9);
+});
+
+test('a dimension tracker windows and persists its slots the same way', () => {
+  const now = T0;
+  const before = new UsageDimensionTracker({ now: () => now });
+  before.record('project', 'widgets', { requests: 1, inputTokens: 40 });
+
+  const after = new UsageDimensionTracker({ now: () => now });
+  after.restore(before.exportState());
+  assert.equal(after.export().project['widgets'].windows['24h'].inputTokens, 40);
+});
+
+test('a client with traffic in any window carries every window, zeros included', () => {
+  let now = T0;
+  const t = new ClientUsageTracker({ now: () => now });
+  t.record('alice', { requests: 1, inputTokens: 5 });
+  now += 6 * 3600_000;   // outside 5h, inside 24h
+
+  const windows = t.export().alice.windows;
+  assert.deepEqual(Object.keys(windows).sort(), Object.keys(USAGE_WINDOWS).sort(), 'no window is dropped for being empty');
+  assert.deepEqual(windows['5h'], { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0 });
+  assert.equal(windows['24h'].inputTokens, 5);
+});
+
+test('a client with nothing in any window carries no windows at all', () => {
+  let now = T0;
+  const t = new ClientUsageTracker({ now: () => now });
+  t.record('alice', { requests: 1 });
+  now += 30 * 3600_000;
+  // The windows nest, so an empty longest window means every window is empty
+  // and the key can be left out. On a dimension holding a value per git ref
+  // these are the majority, and they were the bulk of the status payload.
+  assert.equal(t.export().alice.windows, undefined);
+  assert.equal(t.export().alice.requests, 1, 'the lifetime counters are still reported');
+});
+
+test('a slot is retained for exactly as long as the longest window still reads it', () => {
+  let now = T0;
+  const t = new ClientUsageTracker({ now: () => now });
+  t.record('alice', { inputTokens: 100 });
+
+  // Exactly 24h on, the first record sits in the oldest slot the window still
+  // covers. This is what the +1 in the retention bound buys: without it the
+  // slot is evicted one tick before the window stops asking for it, and every
+  // other test here advances the clock too far to notice.
+  now += 24 * 3600_000;
+  t.record('alice', { inputTokens: 1 });
+  assert.equal(t.export().alice.windows['24h'].inputTokens, 101, 'the boundary slot is still counted');
+
+  now += USAGE_SLOT_MS;
+  t.record('alice', { inputTokens: 1 });
+  assert.equal(t.export().alice.windows['24h'].inputTokens, 2, 'one slot later it has left the window');
+});
+
+test('restore refuses a slot from the future instead of evicting the window behind it', () => {
+  const now = T0;
+  const current = Math.floor(now / USAGE_SLOT_MS);
+  const slots = {};
+  for (let i = 0; i < 96; i++) slots[String(current - i)] = { inputTokens: 1000 };
+  // A state file written before the clock was corrected backwards. Eviction
+  // anchored on the slot being written would take the cutoff into the future
+  // with it and drop all 96 real slots; measured at 1 survivor before the fix.
+  slots[String(current + 200)] = { inputTokens: 1 };
+
+  const t = new ClientUsageTracker({ now: () => now });
+  t.restore({ alice: { requests: 1, slots } });
+  assert.equal(t.export().alice.windows['24h'].inputTokens, 96_000, 'the retained window survives it');
+  assert.equal(Object.keys(t.exportState().alice.slots).length, 96, 'and the future slot is not admitted');
+});
+
+test('a forward clock step ages the window by the step, and no further', () => {
+  let now = T0;
+  const t = new ClientUsageTracker({ now: () => now });
+  for (let i = 0; i < 96; i++) { t.record('alice', { inputTokens: 1000 }); now += USAGE_SLOT_MS; }
+  now -= USAGE_SLOT_MS;
+
+  // A clock that runs 3h fast for one request, then is corrected. Bucketing by
+  // wall clock cannot detect this: the request is booked 12 slots ahead and
+  // eviction runs against a cutoff 12 slots later than it should be, so the 11
+  // oldest slots age out early. That is proportional to the step and heals as
+  // the clock advances. It is pinned here so it cannot regress into the
+  // disproportionate case the restore guard above covers, where ONE bad slot
+  // took the whole window with it.
+  now += 3 * 3600_000;
+  t.record('alice', { inputTokens: 1 });
+  now -= 3 * 3600_000;
+
+  assert.equal(Object.keys(t.exportState().alice.slots).length, 86, '85 of 96 slots survive, plus the misdated one');
+  assert.equal(t.export().alice.inputTokens, 96_001, 'the lifetime counter is untouched either way');
+});
+
+test('a key that stops recording does not hold its slots for the life of the process', () => {
+  let now = T0;
+  const t = new ClientUsageTracker({ now: () => now });
+  t.record('alice', { requests: 1, inputTokens: 100 });
+  t.record('bob', { requests: 1, inputTokens: 100 });
+
+  // Eviction on write alone never runs for a key that has gone quiet, and a
+  // dimension keyed on something like a git ref is mostly keys that went quiet
+  // for good. Reading has to prune too, or the cost is set by every distinct
+  // key seen since the last restart rather than by the window.
+  now += 48 * 3600_000;
+  t.record('alice', { requests: 1 });
+
+  const state = t.exportState();
+  assert.equal(state.bob.slots, undefined, 'the silent key drops its slots when read, and writes none');
+  assert.equal(state.bob.requests, 1, 'its lifetime counters are untouched');
+  assert.equal(Object.keys(state.alice.slots).length, 1, 'the live key keeps only its current slot');
 });
