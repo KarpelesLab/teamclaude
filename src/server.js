@@ -1852,8 +1852,10 @@ export function relayUpgrade(req, socket, head, upstream, sx, { client = null, c
 
   upstreamReq.on('upgrade', (upstreamRes, upstreamSocket, upstreamHead) => {
     const headerLines = Object.entries(upstreamRes.headers)
-      .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(', ') : v}`).join('\r\n');
-    socket.write(`HTTP/1.1 ${upstreamRes.statusCode} ${upstreamRes.statusMessage}\r\n${headerLines}\r\n\r\n`);
+      .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(', ') : v}`);
+    // Lines joined, one terminator: an empty header set must not leave a blank
+    // line inside (or an extra CRLF after) the response head.
+    socket.write([`HTTP/1.1 ${upstreamRes.statusCode} ${upstreamRes.statusMessage}`, ...headerLines].join('\r\n') + '\r\n\r\n');
     if (upstreamHead?.length) socket.write(upstreamHead);
     if (head?.length) upstreamSocket.write(head);
     socket.pipe(upstreamSocket);
@@ -1887,9 +1889,9 @@ export function relayUpgrade(req, socket, head, upstream, sx, { client = null, c
     log(`[TeamClaude] ${tag}WebSocket ${path} refused by upstream (${upstreamRes.statusCode})`);
     const headerLines = Object.entries(upstreamRes.headers)
       .filter(([k]) => !CONNECTION_SPECIFIC_HEADERS.has(k.toLowerCase()) && k.toLowerCase() !== 'content-length')
-      .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(', ') : v}`).join('\r\n');
+      .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(', ') : v}`);
     try {
-      socket.write(`HTTP/1.1 ${upstreamRes.statusCode} ${upstreamRes.statusMessage}\r\n${headerLines}\r\nConnection: close\r\n\r\n`);
+      socket.write([`HTTP/1.1 ${upstreamRes.statusCode} ${upstreamRes.statusMessage}`, ...headerLines, 'Connection: close'].join('\r\n') + '\r\n\r\n');
     } catch { /* already gone */ }
     upstreamRes.resume();
     socket.destroy();
