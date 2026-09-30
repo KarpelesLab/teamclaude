@@ -397,6 +397,26 @@ Any Anthropic-compatible API can be added as an account alongside your Claude ac
 
 Where the provider publishes one, its own balance or quota is shown in `teamclaude status` — see [third-party backend quota](quota.md#third-party-backend-quota).
 
+A [NanoGPT](https://docs.nano-gpt.com/integrations/claude-code) account is the same shape. Its Anthropic-compatible endpoint is `/api/v1/messages`, so the `upstream` is `https://api.nano-gpt.com/api` — Claude Code's SDK appends `/v1/messages` itself, and the `/api/v1` base in NanoGPT's integration page would double it. Claude model names are accepted as they are, so no `modelMap` is needed for Claude; a non-Claude model is named `provider/model`, for example `z-ai/glm-5.3`:
+
+```json
+{
+  "name": "nano-gpt",
+  "type": "oauth",
+  "accessToken": "your-nanogpt-api-key",
+  "upstream": "https://api.nano-gpt.com/api",
+  "priority": 100
+}
+```
+
+`priority: 100` makes it a fallback for **every** model once the Claude accounts are spent — Claude names included, which NanoGPT passes through to Anthropic and bills by its own rules. A [route](routing.md#model-routes) is what sends a session to it on purpose, but a route only restricts who serves the models it matches; it does not keep the account out of ordinary rotation for the rest, so leave the priority high whichever you choose:
+
+```json
+{ "name": "nano", "match": ["z-ai/*", "moonshotai/*", "deepseek/*"], "accounts": ["nano-gpt"] }
+```
+
+Which models a NanoGPT subscription covers, and which are billed from the balance on top, is set by NanoGPT and not published per model; its `Plan` line in `teamclaude status` (see [third-party backend quota](quota.md#third-party-backend-quota)) shows when a request has started to bill the balance.
+
 Reserve the backend for sessions that explicitly ask for its models with a [route](routing.md#model-routes):
 
 ```json

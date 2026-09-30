@@ -235,7 +235,18 @@ A [third-party backend account](accounts.md#third-party-backend-accounts) has no
 
 The reading is normalized to `{ label, text, utilization }`. A provider that reports a 0-1 fraction gets a bar like any other bucket; one that reports money or credits shows its text. A provider that publishes nothing keeps reading `unknown` — nothing is invented.
 
-Provider support lives entirely in `src/backend-quota.js`, matched by the host of the account's `upstream`. Adding one is a single entry there (a path and a parse function); the prober, the quota field and the renderer never name a provider. DeepSeek is supported today.
+Provider support lives entirely in `src/backend-quota.js`, matched by the host of the account's `upstream`. Adding one is a single entry there (a path and a parse function); the prober, the quota field and the renderer never name a provider. Supported today:
+
+- **DeepSeek** — the account balance, as money.
+- **NanoGPT** (`api.nano-gpt.com`) — the subscription's daily and weekly token windows in one reading: the bar is the fuller of the two, the text names each with its reset, and NanoGPT's own billing advice is appended when it is not the ordinary case:
+
+  ```
+    nano-gpt (oauth, prio 100) active
+    Plan     [██░░░░░░░░░░░░░░░░] 37% · day 12% (resets 5h10m) · week 37% (resets 3d4h)
+    Plan     [██████████████████] 100% · day 104% (resets 1h) · week 37% (resets 3d4h) · billing balance
+  ```
+
+  `billing balance` means the subscription window is spent and the gateway will serve the next request from the pay-as-you-go balance instead of refusing it — the one line to watch on a metered plan. `balance not allowed` means your NanoGPT spend policy forbids that and requests will fail instead.
 
 ## Hold on exhaustion
 
