@@ -397,6 +397,26 @@ Any Anthropic-compatible API can be added as an account alongside your Claude ac
 
 Where the provider publishes one, its own balance or quota is shown in `teamclaude status` — see [third-party backend quota](quota.md#third-party-backend-quota).
 
+A [Z.ai GLM Coding Plan](https://docs.z.ai/devpack/tool/claude) is the same shape. Its endpoint serves only its own model names, so map the Claude names your sessions send onto them, and it takes the key as a bearer exactly as Claude Code's `ANTHROPIC_AUTH_TOKEN` would send it:
+
+```json
+{
+  "name": "z.ai",
+  "type": "oauth",
+  "accessToken": "your-z.ai-api-key",
+  "upstream": "https://api.z.ai/api/anthropic",
+  "priority": 100,
+  "modelMap": {
+    "claude-haiku-4-5-20251001": "glm-5.3-flash",
+    "claude-sonnet-5": "glm-5.3",
+    "claude-opus-5": "glm-5.3",
+    "claude-fable-5-1": "glm-5.3"
+  }
+}
+```
+
+Its 5-hour and weekly windows show up in `teamclaude status` (see [third-party backend quota](quota.md#third-party-backend-quota)). Leave `priority` off and add a route matching `glm-*` instead if you want it only for sessions that ask for GLM by name rather than as a fallback.
+
 Reserve the backend for sessions that explicitly ask for its models with a [route](routing.md#model-routes):
 
 ```json

@@ -235,7 +235,15 @@ A [third-party backend account](accounts.md#third-party-backend-accounts) has no
 
 The reading is normalized to `{ label, text, utilization }`. A provider that reports a 0-1 fraction gets a bar like any other bucket; one that reports money or credits shows its text. A provider that publishes nothing keeps reading `unknown` — nothing is invented.
 
-Provider support lives entirely in `src/backend-quota.js`, matched by the host of the account's `upstream`. Adding one is a single entry there (a path and a parse function); the prober, the quota field and the renderer never name a provider. DeepSeek is supported today.
+Provider support lives entirely in `src/backend-quota.js`, matched by the host of the account's `upstream`. Adding one is a single entry there (a path and a parse function, plus a header shape when the provider's monitor wants something other than a bearer); the prober, the quota field and the renderer never name a provider. Supported today:
+
+- **DeepSeek** — the account balance, as money.
+- **Z.ai GLM Coding Plan** (`api.z.ai`, and `open.bigmodel.cn` for the mainland plan) — the plan's two token windows as used-percentages, in one reading: the bar is the fuller of the two, the text names each with its reset:
+
+  ```
+    z.ai (oauth, prio 100) active
+    Plan     [██░░░░░░░░░░░░░░░░] 12% · 5h 12% (resets 2h10m) · week 37% (resets 3d4h)
+  ```
 
 ## Hold on exhaustion
 
