@@ -415,7 +415,7 @@ A [Z.ai GLM Coding Plan](https://docs.z.ai/devpack/tool/claude) is the same shap
 }
 ```
 
-Its 5-hour and weekly windows show up in `teamclaude status` (see [third-party backend quota](quota.md#third-party-backend-quota)). Leave `priority` off and add a route matching `glm-*` instead if you want it only for sessions that ask for GLM by name rather than as a fallback.
+Its 5-hour and weekly windows show up in `teamclaude status` (see [third-party backend quota](quota.md#third-party-backend-quota)). `priority: 100` makes it a fallback once the Claude accounts are spent — and then the `modelMap` above rewrites the Claude names onto GLM. A [route](routing.md#model-routes) matching `glm-*` sends a session to it on purpose, but a route only restricts who serves the models it matches; it does not keep the account out of ordinary rotation for the rest, so keep the priority high either way.
 
 Reserve the backend for sessions that explicitly ask for its models with a [route](routing.md#model-routes):
 
