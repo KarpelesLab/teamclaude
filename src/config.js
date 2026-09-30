@@ -107,6 +107,7 @@ export function createDefaultConfig() {
     distributeSessions: false,
     sessionTitles: { enabled: false, width: 18 },
     quotaBarPercent: true,
+    accountSort: 'arranged',
     eventLogging: 'hide',
     defaultClientMode: 'mitm',
     // Written out rather than left absent, so a fresh config states the one
