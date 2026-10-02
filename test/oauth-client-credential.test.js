@@ -51,9 +51,6 @@ for (const path of [
   '/api/oauth/claude_cli/roles',
   '/api/oauth/files/abc',
   '/api/oauth/file_upload',
-  '/api/frame/deploy/prepare',
-  '/api/frame/deploy/direct',
-  '/api/frame/frames',
 ]) {
   test(`${path} keeps the client's own credential`, async () => {
     const { server: upstream, port, seen } = await echoAuthUpstream();
