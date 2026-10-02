@@ -137,7 +137,7 @@ Besides the CLI there are two more places to set it. In the TUI, **`g`** then **
 
 Routing covers what TeamClaude does with the account's own credential. Two kinds of traffic are outside that, and both keep the fleet path:
 
-- Claude Code's own identity calls (`/api/oauth/*`, `/v1/code/*` and its token refresh) are relayed with the credential of the Claude Code login, never with a pooled account's, so they belong to no account here. That holds even when the login is the same person as a routed account.
+- Claude Code's own identity calls (`/api/oauth/*`, `/v1/code/*`, the Remote Control bridge's `/v1/environments/*`, `/v1/sessions/*`, `/v2/session_ingress/*` and `/v2/ccr-sessions/*`, and its token refresh) are relayed with the credential of the Claude Code login, never with a pooled account's, so they belong to no account here. That holds even when the login is the same person as a routed account.
 - A sign-in or import that names no account. Which account it belongs to is only known once the profile has been read, so that lookup cannot use a proxy it has not found yet. Pass `--name` (or `--routing`) and it can.
 
 ### The proxy is tested before anything depends on it
