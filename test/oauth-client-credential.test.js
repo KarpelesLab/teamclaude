@@ -51,6 +51,9 @@ for (const path of [
   '/api/oauth/claude_cli/roles',
   '/api/oauth/files/abc',
   '/api/oauth/file_upload',
+  '/api/frame/deploy/prepare',
+  '/api/frame/deploy/direct',
+  '/api/frame/frames',
 ]) {
   test(`${path} keeps the client's own credential`, async () => {
     const { server: upstream, port, seen } = await echoAuthUpstream();
@@ -125,6 +128,7 @@ for (const path of [
   '/api/oauth%2fprofile',
   '/api/oauth%2Fprofile',
   '/%76%31/code/sessions/abc/worker/events/stream',
+  '/%61pi/frame/deploy/prepare',
 ]) {
   test(`${path} keeps the client's own credential`, async () => {
     const { server: upstream, port, seen } = await echoAuthUpstream();
@@ -213,6 +217,7 @@ for (const [path, onWire] of [
   ['/tc-acct/a/api/oauth/file_upload', '/api/oauth/file_upload'],
   ['/tc-acct/a/v1/code/sessions/abc/worker/events/stream', '/v1/code/sessions/abc/worker/events/stream'],
   ['/tc-acct/a/%61pi/oauth/profile', '/%61pi/oauth/profile'],
+  ['/tc-acct/a/api/frame/deploy/direct', '/api/frame/deploy/direct'],
 ]) {
   test(`${path} keeps the client's own credential`, async () => {
     const { server: upstream, port, seen } = await echoAuthUpstream();

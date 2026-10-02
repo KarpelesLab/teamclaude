@@ -1175,7 +1175,10 @@ export function relayHttpForward(req, res, stripOverage = false) {
 // different account than the one you're logged in as"), Remote Control binds to
 // the wrong account, and artifacts get published under it. Observed on a live
 // fleet; the whole prefix is the fix, not a growing allowlist of sub-paths.
-const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/'];
+// Artifacts (deploy, read, list, comments) are served under /api/frame/*, owned
+// by the client's user like the identity plane above; a rotated account's token
+// sees them as not found.
+const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/', '/api/frame/'];
 
 // Claude Code's session id is a UUID, but other clients tag sessions too, so
 // the shape is a conservative charset rather than the UUID grammar: wide enough
