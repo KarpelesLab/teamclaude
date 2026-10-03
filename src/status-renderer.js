@@ -219,6 +219,7 @@ export function resetCreditLine(account, paint, now = Date.now()) {
   const noun = `free rate-limit reset ${available === 1 ? 'credit' : 'credits'}`;
   const notes = [];
   if (credits.applicable === 0) notes.push('none applicable to a window right now');
+  if (Number.isFinite(credits.expiresAt)) notes.push(`expires ${formatDuration(credits.expiresAt - now)}`);
   if (Number.isFinite(credits.seenAt)) notes.push(`as of ${formatAgo(Math.min(credits.seenAt, now), now)}`);
   const note = notes.length ? ` — ${notes.join(', ')}` : '';
   return `${paint.dim('Reset'.padEnd(8))} ${paint.cyan(`${available} ${noun}`)}${paint.gray(note)}`;
@@ -233,8 +234,8 @@ export const RESET_CREDIT_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
 /**
  * How many reset credits to REPORT for this quota: the held count while the
- * reading is fresh, 0 once it is older than RESET_CREDIT_MAX_AGE_MS or states
- * no positive count. One rule for the status screen and the TUI row, so the two
+ * reading is fresh, 0 once it is older than RESET_CREDIT_MAX_AGE_MS, past its
+ * stated `expiresAt`, or states no positive count. One rule for the status screen and the TUI row, so the two
  * cannot disagree about whether a credit is there (the dashboard page applies
  * the same cut-off in its own serialized helper).
  *
@@ -250,6 +251,8 @@ export function heldResetCredits(quota, now = Date.now()) {
   const available = credits?.available;
   if (!Number.isFinite(available) || available <= 0) return 0;
   if (Number.isFinite(credits.seenAt) && now - credits.seenAt > RESET_CREDIT_MAX_AGE_MS) return 0;
+  // A grant past its stated expiry is gone whatever the last reading said.
+  if (Number.isFinite(credits.expiresAt) && credits.expiresAt <= now) return 0;
   return available;
 }
 

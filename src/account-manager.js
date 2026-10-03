@@ -124,10 +124,11 @@ const PERSISTED_QUOTA_FIELDS = [
   'unifiedStatus', 'unifiedStatusSeenAt',
   'tokensLimit', 'tokensRemaining', 'requestsLimit', 'requestsRemaining', 'resetsAt',
   'scopedWeekly',
-  // Codex free rate-limit reset credits, `{ available, applicable, seenAt }`.
+  // Codex free rate-limit reset credits and Claude banked usage-limit resets,
+  // `{ available, applicable, seenAt, expiresAt? }`.
   // Worth persisting although it is not a quota: the usage probe is off by
   // default, so without this a restart forgets that an account holds a credit
-  // until something next reads /wham/usage — and the row that says so is the
+  // until something next reads the usage endpoint — and the row that says so is the
   // only place an operator sees one at all.
   'resetCredits',
   // Whether the last Codex reading stated a 5-hour window at all (see
@@ -160,7 +161,7 @@ const FAMILY_WEEKLY_BUCKETS = [
  *
  * @typedef {object} CodexLearnedQuota
  * @property {string} [planType]  the Codex subscription tier
- * @property {{available: number, applicable: number|null, seenAt: number}} [resetCredits]  free rate-limit reset credits held, and when that was last seen
+ * @property {{available: number, applicable: number|null, seenAt: number, expiresAt?: number|null}} [resetCredits]  free rate-limit reset credits (Codex) or banked usage-limit resets (Claude) held, when that was last seen, and when the soonest one lapses where the provider says
  * @property {Record<string, {name: string, utilization: number, resetAt: number|null, seenAt: number}>} [codexModelBuckets]  model-scoped weekly buckets, keyed by slug
  * @property {Record<string, string>} [codexModelLimits]  which limit each model was last metered on, from `x-codex-active-limit`: a `codexModelBuckets` slug, or the name upstream gives the account-wide limit
  * @property {boolean} [sessionWindowStated]  whether the last reading that stated a window stated a 5-hour one; `false` says the subscription meters no session window
@@ -4468,6 +4469,15 @@ export class AccountManager {
     // A probe provides fresh utilization points without spending quota itself.
     // Feed only the windows actually present in this payload.
     this._observeBurnRate(account, observed);
+
+    // Banked usage-limit resets (issue #493), stamped exactly as the Codex
+    // path stamps its reset credits: a payload with no usable reset block
+    // leaves the last reading alone, so its age is what says how much it is
+    // still worth. Typed through CodexLearnedQuota, which declares the field
+    // for both providers; the empty-quota shape does not seed it.
+    if (usage.resetCredits) {
+      /** @type {typeof q & CodexLearnedQuota} */ (q).resetCredits = { ...usage.resetCredits, seenAt: now };
+    }
 
     // Paid overage. Replaced wholesale like the buckets above, and announced
     // once on the transition into billing: an account that starts drawing real

@@ -7,6 +7,7 @@ import { createInterface } from 'node:readline';
 import http from 'node:http';
 import { proxyFetch } from './upstream-fetch.js';
 import { envVar } from './brand.js';
+import { creditCount } from './codex-usage.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 const execFileAsync = promisify(execFile);
@@ -129,8 +130,17 @@ export async function importCredentials(filePath, {
 }
 
 const PROFILE_URL = 'https://api.anthropic.com/api/oauth/profile';
-const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
+// `cedar_ember=1` asks the endpoint to add its banked-reset block (issue #493).
+// It is additive: every other field comes back unchanged.
+const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage?cedar_ember=1';
 const OAUTH_USAGE_BETA = 'oauth-2025-04-20';
+// The banked-reset block is gated on the User-Agent alone, measured against
+// the live endpoint: a non-Claude-Code agent reads `ineligible_reason:
+// "surface"`, a claude-cli older than 2.1.280 reads `"cli_version"`. This is a
+// published Claude Code release. If upstream raises the floor, the block comes
+// back ineligible, bankedResets() yields null, and only the reset reading goes
+// quiet; the quota buckets do not depend on it.
+const USAGE_USER_AGENT = 'claude-cli/2.1.288 (external, cli)';
 const DEFAULT_TOKEN_ENDPOINT = 'https://platform.claude.com/v1/oauth/token';
 const DEFAULT_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 
@@ -552,14 +562,16 @@ export function normalizeUsageBucket(bucket) {
  * weekly caps), or { error, status } on failure.
  * @param {string} accessToken
  * @param {import('./account-routing.js').RoutingProxy|null} [routing] - the account's own egress proxy
+ * @param {{ fetchImpl?: Function }} [opts]
  */
-export async function fetchUsage(accessToken, routing = null) {
+export async function fetchUsage(accessToken, routing = null, { fetchImpl = proxyFetch } = {}) {
   try {
-    const res = await proxyFetch(USAGE_URL, {
+    const res = await fetchImpl(USAGE_URL, {
       headers: {
         'Authorization': `Bearer ${accessToken}`,
         'anthropic-beta': OAUTH_USAGE_BETA,
         'Accept': 'application/json',
+        'User-Agent': USAGE_USER_AGENT,
       },
       routing,
     });
@@ -608,7 +620,66 @@ export function normalizeUsagePayload(data) {
     // caps and that family was not among them. Without the list, a missing
     // family is our own ignorance and nothing may be concluded from it.
     scopedWeeklyListed: Array.isArray(data?.limits),
+    // Banked usage-limit resets (the claude.ai "Resets" offer), in the same
+    // shape the Codex probe reports its free reset credits, so the status
+    // line, the TUI tag and the dashboard badge read both without knowing
+    // which provider the account is on.
+    resetCredits: bankedResets(data?.cedar_ember),
   };
+}
+
+/**
+ * The banked usage-limit resets this account holds, from the `cedar_ember`
+ * block, or null when the payload says nothing usable about them. Observed
+ * shape (Max account, 2026-10-04):
+ *
+ *   { eligible: true, ineligible_reason: null, grants: [{
+ *       label, resets_total: 1, resets_left: 1,
+ *       starts_at: '2026-09-22T16:00:00+00:00', ends_at: '2026-10-22T16:00:00+00:00',
+ *       clears: ['five_hour', 'seven_day', ...], paused: false, usable_now: true, ... }] }
+ *
+ * Mapped onto the Codex counts:
+ *
+ *  - `available` is every reset a live grant still holds, which is what the
+ *    claude.ai Resets page shows.
+ *  - `applicable` is the subset upstream says can be spent this instant
+ *    (`usable_now`, not `paused`); a grant whose `starts_at` is still ahead
+ *    reads `usable_now: false`.
+ *  - `expiresAt` is the soonest `ends_at` among the grants counted, so the
+ *    displays can say when the reset lapses and drop it once it has.
+ *
+ * An ineligible block is null, not zero. Its reason so far has always been
+ * about the caller (`surface`, `cli_version`), not the account, so "none" would
+ * be a claim the payload does not make. An eligible block with no live grant is
+ * a real zero: the reset was spent or has expired.
+ *
+ * Grant ids (and the payload's `next_grant_id`) are never read. They are the
+ * handle that spends a reset, and spending one stays a manual action in
+ * claude.ai or Claude Code.
+ *
+ * @param {any} block  the payload's `cedar_ember` object
+ * @param {number} [now]  ms epoch a grant's expiry is measured against
+ * @returns {{available: number, applicable: number, expiresAt: number|null}|null}
+ */
+export function bankedResets(block, now = Date.now()) {
+  if (!block || typeof block !== 'object' || block.eligible !== true) return null;
+  if (!Array.isArray(block.grants)) return null;
+  let available = 0;
+  let applicable = 0;
+  /** @type {number|null} */
+  let expiresAt = null;
+  for (const grant of block.grants) {
+    if (!grant || typeof grant !== 'object') continue;
+    const left = creditCount(grant.resets_left);
+    if (!left) continue;
+    const ends = typeof grant.ends_at === 'string' ? Date.parse(grant.ends_at) : NaN;
+    if (Number.isFinite(ends) && ends <= now) continue;
+    available += left;
+    if (grant.usable_now === true && grant.paused !== true) applicable += left;
+    if (Number.isFinite(ends) && (expiresAt == null || ends < expiresAt)) expiresAt = ends;
+  }
+  // Re-capped after summing, for the same width budget creditCount guards.
+  return { available: creditCount(available) ?? 0, applicable: creditCount(applicable) ?? 0, expiresAt };
 }
 
 // OAuth config (extracted from Claude Code). Client id + token endpoint are
