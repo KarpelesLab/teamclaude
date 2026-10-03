@@ -218,8 +218,9 @@ const PROVIDER_ORDER = Object.keys(PROVIDERS);
 // Two provider pools side by side: the gutter between the panes.
 const PANE_GUTTER = ' │ ';
 // Pane bars: at least wide enough for `10h23m`, and past that only once every
-// name is whole.
-const PANE_BAR_MAX = 12;
+// name is whole. From there they grow to BAR_MAX, as the list's bars do: a
+// narrower cap left a 600-column terminal drawing 12-column bars beside
+// hundreds of blank columns.
 const PANE_BAR_FLOOR = 8;
 // The narrowest a list draws both shared bars in, full width and in a pane.
 const LIST_MIN = 70;
@@ -240,6 +241,38 @@ const HEAD_GAP = 2;
 // answer to "where does the one I just logged in with go" does not change with
 // the feature, and there is nothing to migrate.
 const listRank = (/** @type {any} */ a) => (Number.isFinite(a?.displayOrder) ? a.displayOrder : Infinity);
+
+// How the account list is ordered inside each provider group (`accountSort`).
+// `arranged` is the operator's own order (listRank). Each of the others puts
+// the account whose window ends soonest first, so quota that is about to
+// expire unspent is at the top of the list.
+//
+// The window each sort reads. S7 and F7 are the family's own weekly bucket
+// where the account has one, else the all-models weekly, which is what governs
+// that family on such an account — the rule quota-summary.js resolves a
+// family's window by.
+/** @type {Record<string, (q: any) => any>} */
+const SORT_RESET = {
+  'session-reset': q => q.unified5hReset,
+  'weekly-reset': q => q.unified7dReset,
+  'sonnet-reset': q => (q.unified7dSonnet != null ? q.unified7dSonnetReset : q.unified7dReset),
+  'fable-reset': q => (q.unified7dFable != null ? q.unified7dFableReset : q.unified7dReset),
+};
+export const ACCOUNT_SORTS = ['arranged', ...Object.keys(SORT_RESET)];
+/** @type {Record<string, string>} */
+const ACCOUNT_SORT_LABELS = {
+  arranged: 'arranged',
+  'session-reset': 'session reset',
+  'weekly-reset': 'weekly reset',
+  'sonnet-reset': 'S7 reset',
+  'fable-reset': 'F7 reset',
+};
+
+// The sort key: when the window resets. No reading (an API-key account, one
+// that has not reported, a five-hour window nothing has opened) and a reset
+// that has already passed both sort last: the second is a window that has just
+// started over, so its next reset is the one furthest away.
+const resetRank = (/** @type {any} */ t, /** @type {number} */ now) => (Number.isFinite(t) && t > now ? t : Infinity);
 
 // How long a reorder waits after the last move before it is written. Longer
 // than a terminal's key-repeat interval, so a held arrow is one write; short
@@ -1100,6 +1133,21 @@ export class TUI {
       });
     }
 
+    if (this.am.accounts.length > 1) {
+      fields.push({
+        id: 'accountSort',
+        label: 'Sort accounts',
+        hint: '←→ cycle',
+        value: () => {
+          const s = this._accountSort();
+          return s === 'arranged' ? gray(ACCOUNT_SORT_LABELS[s]) : green(ACCOUNT_SORT_LABELS[s]);
+        },
+        left: () => this._cycleAccountSort(-1),
+        right: () => this._cycleAccountSort(+1),
+        enter: () => this._cycleAccountSort(+1),
+      });
+    }
+
     fields.push({
       id: 'upstreamProxy',
       label: 'Upstream proxy',
@@ -1699,6 +1747,24 @@ export class TUI {
     if (this.running) this.render();
   }
 
+  /** The configured account sort; anything unknown reads as `arranged`. */
+  _accountSort() {
+    const s = this.config?.accountSort;
+    return ACCOUNT_SORTS.includes(s) ? s : 'arranged';
+  }
+
+  async _cycleAccountSort(dir = 1) {
+    // Read by _displayOrder on every frame, so the assignment is the whole
+    // application and the save is only what survives a restart.
+    const prev = this.config.accountSort;
+    const cur = this._accountSort();
+    const next = ACCOUNT_SORTS[(ACCOUNT_SORTS.indexOf(cur) + dir + ACCOUNT_SORTS.length) % ACCOUNT_SORTS.length];
+    this.config.accountSort = next;
+    if (!await this._saveSetting('account sort', () => { this.config.accountSort = prev; })) return;
+    this._addLog(`Account sort: ${ACCOUNT_SORT_LABELS[next]}`);
+    if (this.running) this.render();
+  }
+
   async _cycleEventLogging(dir = 1) {
     // Claude Code telemetry display/handling: show → hide → block → show.
     const order = ['show', 'hide', 'block'];
@@ -2224,7 +2290,6 @@ export class TUI {
     // The type cell and the space after it, at the width the row pads it to.
     const typeCell = pane == null ? typeColumn(this.am.accounts).width + 1 : 0;
     const floor = pane == null ? LIST_MIN : PANE_MIN;
-    const barCap = pane == null ? BAR_MAX : PANE_BAR_MAX;
     // The columns every name needs past NAME_MIN to be whole.
     const longestName = Math.max(0, ...accts.map(a => vw(a.name)));
     const nameWant = Math.max(0, longestName - NAME_MIN);
@@ -2291,11 +2356,11 @@ export class TUI {
       const avail = barRoom(0);
       let bw = avail < BAR_MIN
         ? Math.max(1, avail)
-        : Math.min(barCap, avail);
+        : Math.min(BAR_MAX, avail);
       // A pane gives names the columns before bars grow past the floor.
       if (pane != null && avail >= BAR_MIN) {
         const named = barRoom(nameWant);
-        bw = named >= PANE_BAR_FLOOR ? Math.min(barCap, named) : Math.min(PANE_BAR_FLOOR, avail);
+        bw = named >= PANE_BAR_FLOOR ? Math.min(BAR_MAX, named) : Math.min(PANE_BAR_FLOOR, avail);
       }
       const slack = Math.max(0, W - fixed - 6 * (nbars - 1) - nbars * bw);
       const drawn = (shortBar ? 2 : 1) + families;
@@ -2303,7 +2368,7 @@ export class TUI {
       // width that reaches it draws every bar.
       const s1 = Math.max(floor, span(2 + families, BAR_MIN), span(drawn, PANE_BAR_FLOOR));
       const s2 = Math.max(s1, span(drawn, PANE_BAR_FLOOR) + nameWant);
-      const s3 = Math.max(s2, span(drawn, barCap) + nameWant);
+      const s3 = Math.max(s2, span(drawn, BAR_MAX) + nameWant);
       return {
         bw, showBoth, showFamily, anyFable, anySonnet, slack, shortBar,
         complete: showBoth && (families === 0 || showFamily),
@@ -2362,7 +2427,9 @@ export class TUI {
   }
 
   /** Two pane layouts, or null when `W` cannot fit both. Width goes stage by stage,
-   *  both panes reaching one before either starts the next, a partial one shared pro rata. */
+   *  both panes reaching one before either starts the next, a partial one shared pro rata.
+   *  Width past the last stage stays unused on the right: shared between the panes, it
+   *  set the Codex pane mid-screen on an ultrawide, hundreds of columns from its neighbour. */
   _splitLayout(/** @type {{ provider: string, indices: number[] }[]} */ groups, /** @type {number} */ W) {
     const [a, b] = groups;
     const avail = W - vw(PANE_GUTTER);
@@ -2385,8 +2452,6 @@ export class TUI {
       leftW += wantA;
       rightW += wantB;
     }
-    leftW += Math.floor((avail - leftW - rightW) / 2);
-    rightW = avail - leftW;
     const left = this._listLayout(a.indices, leftW, { pane: a.provider });
     const right = this._listLayout(b.indices, rightW, { pane: b.provider });
     return left.complete && right.complete ? { leftW, rightW, left, right } : null;
@@ -2408,8 +2473,18 @@ export class TUI {
    *  rows — see _keySelect, which walks this order but still stores an index.
    *  Which is also why the arrangement is a sort key rather than a permutation
    *  of `am.accounts`: see _doMoveAccount.
+   *
+   *  With a reset sort (`accountSort`) the soonest reset goes before the
+   *  arrangement, which then only breaks ties. Not on the reorder screen, and
+   *  not when `arranged` is asked for: the arrangement is what that screen
+   *  edits, so it must see that order.
+   *
+   *  @param {{ arranged?: boolean }} [opts]
    */
-  _displayOrder() {
+  _displayOrder({ arranged = false } = {}) {
+    const resetOf = arranged || (this.mode === 'select' && this.selAction === 'reorder')
+      ? null : SORT_RESET[this._accountSort()];
+    const now = Date.now();
     return this.am.accounts
       .map((/** @type {any} */ _, /** @type {number} */ i) => i)
       .sort((/** @type {number} */ x, /** @type {number} */ y) => {
@@ -2417,10 +2492,15 @@ export class TUI {
         const py = PROVIDER_ORDER.indexOf(providerOf(this.am.accounts[y]));
         const sx = isLocalUpstream(this.am.accounts[x]) ? 1 : 0;
         const sy = isLocalUpstream(this.am.accounts[y]) ? 1 : 0;
-        // Provider, then the local category, then the arrangement: the first two
-        // are what a row IS, so a number the operator set never crosses them.
+        // Provider, then the local category, then the sort: the first two are
+        // what a row IS, so no sort and no number the operator set crosses them.
         if (px !== py) return px - py;
         if (sx !== sy) return sx - sy;
+        if (resetOf) {
+          const tx = resetRank(resetOf(this.am.accounts[x].quota || {}), now);
+          const ty = resetRank(resetOf(this.am.accounts[y].quota || {}), now);
+          if (tx !== ty) return tx < ty ? -1 : 1; // Infinity - Infinity is NaN, so compare
+        }
         const rx = listRank(this.am.accounts[x]);
         const ry = listRank(this.am.accounts[y]);
         // Infinity !== Infinity is false, so two unplaced accounts fall through
@@ -2434,9 +2514,13 @@ export class TUI {
    *  Every account except the locally-served ones: _displayOrder pins those to
    *  the end of the list whatever a number says, so they hold no position and
    *  their array slots are simply stepped over.
+   *
+   *  Always in the arranged order, whatever `accountSort` says: a move
+   *  renumbers every account from this list, so a sorted list here would
+   *  write the sort into `displayOrder`.
    */
   _arrangeable() {
-    return this._displayOrder().filter((/** @type {number} */ i) => !isLocalUpstream(this.am.accounts[i]));
+    return this._displayOrder({ arranged: true }).filter((/** @type {number} */ i) => !isLocalUpstream(this.am.accounts[i]));
   }
 
   /** The rows that carry ►: the cursor, or in a mixed pool each provider's current
@@ -2758,6 +2842,12 @@ export class TUI {
     lines.push(row(byId('addAccount')));
     if (byId('removeAccount')) lines.push(row(byId('removeAccount')));
     if (byId('orderAccounts')) lines.push(row(byId('orderAccounts')));
+    if (byId('accountSort')) {
+      lines.push(row(byId('accountSort')));
+      lines.push(dim('  A reset sort lists the account whose window ends soonest first;'));
+      lines.push(dim('  S7/F7 read the weekly window on an account without one. The'));
+      lines.push(dim('  arranged order breaks ties.'));
+    }
     lines.push('');
     // ── Network
     // Drawn before the sx.org block, which returns early when sx is unavailable:

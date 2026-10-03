@@ -1175,6 +1175,9 @@ export function relayHttpForward(req, res, stripOverage = false) {
 // different account than the one you're logged in as"), Remote Control binds to
 // the wrong account, and artifacts get published under it. Observed on a live
 // fleet; the whole prefix is the fix, not a growing allowlist of sub-paths.
+// Artifacts (deploy, read, list, comments) are served under /api/frame/*, owned
+// by the client's user like the identity plane above; a rotated account's token
+// sees them as not found.
 //
 // The Remote Control bridge is the same plane under other prefixes. Since
 // Claude Code 2.1.287 `claude remote-control` honours HTTPS_PROXY
@@ -1200,7 +1203,7 @@ export function relayHttpForward(req, res, stripOverage = false) {
 // does not take `/v1/sessionsX`. The entry without that slash, the collection
 // itself, matches as well, since a session is created with a bare
 // POST /v1/sessions (classificationPath has already dropped any `?beta=true`).
-const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/', '/v1/environments/', '/v1/sessions/', '/v2/session_ingress/', '/v2/ccr-sessions/'];
+const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/', '/api/frame/', '/v1/environments/', '/v1/sessions/', '/v2/session_ingress/', '/v2/ccr-sessions/'];
 
 /**
  * Whether a classified path is on the client's own identity plane: below an
