@@ -525,7 +525,7 @@ test('MITM h2: a cancelled stream does not strand the request handler', { ...T, 
 // same server closes an idle h1 connection after 6s. Half of one proxy answered
 // to a number nobody chose. Asserted on the header the client actually reads,
 // through a real tunnel, because that is what a connection pool schedules against.
-test('MITM h1: the terminating server holds an idle connection as long as the base listener', T, async () => {
+test('MITM h1: the terminating server advertises the base idle window and reuses the connection', T, async () => {
   const { caCertPem, leafCertPem, leafKeyPem } = generateCertChain('localhost');
   const upstream = makeUpstream(() => ({ status: 200, headers: { 'content-type': 'text/plain' }, body: 'ok' }));
   const upPort = await listen(upstream);
@@ -535,24 +535,35 @@ test('MITM h1: the terminating server holds an idle connection as long as the ba
   const proxyPort = await listen(proxy);
 
   const tlsSock = await connectThroughProxy(proxyPort, `127.0.0.1:${upPort}`, caCertPem, ['http/1.1']);
+  const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
+  agent.createConnection = () => tlsSock;
   try {
-    const res = await new Promise((resolve, reject) => {
-      const r = http.request({
-        createConnection: () => tlsSock, method: 'POST', path: '/v1/messages',
-        headers: { 'content-type': 'application/json', connection: 'keep-alive' },
-      }, (response) => {
-        response.resume();
-        response.on('end', () => resolve(response));
+    // Completing a keep-alive response arms Node's socket timer. On Node
+    // 24.6.0 an unset HTTP/2 keepAliveTimeoutBuffer makes that timeout NaN;
+    // reading only the advertised header does not prove the socket is reusable.
+    for (let i = 0; i < 3; i++) {
+      const { res, body, reusedSocket } = await new Promise((resolve, reject) => {
+        const r = http.request({
+          agent, method: 'POST', path: '/v1/messages',
+          headers: { 'content-type': 'application/json' },
+        }, (response) => {
+          let body = '';
+          response.setEncoding('utf8');
+          response.on('data', (chunk) => { body += chunk; });
+          response.once('error', reject);
+          response.on('end', () => resolve({ res: response, body, reusedSocket: r.reusedSocket }));
+        });
+        r.once('error', reject);
+        r.end('{"model":"x"}');
       });
-      r.once('error', reject);
-      r.end('{"model":"x"}');
-    });
-    // Node derives this header from the server's keepAliveTimeout, so it is the
-    // client-visible proof the knob reached the internal HTTP/1 server that
-    // allowHTTP1 connections land on.
-    assert.equal(res.headers['keep-alive'], `timeout=${KEEP_ALIVE_TIMEOUT_MS / 1000}`,
-      'the MITM half of the proxy must not keep its own idle window');
+      assert.equal(res.statusCode, 200);
+      assert.equal(body, 'ok');
+      assert.equal(reusedSocket, i > 0, 'subsequent requests must reuse the same tunnel');
+      assert.equal(res.headers['keep-alive'], `timeout=${KEEP_ALIVE_TIMEOUT_MS / 1000}`,
+        'the MITM half of the proxy must not keep its own idle window');
+    }
   } finally {
+    agent.destroy();
     tlsSock.destroy(); closeHard(proxy); closeHard(upstream);
   }
 });

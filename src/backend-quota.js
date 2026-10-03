@@ -10,6 +10,9 @@
 // endpoint on top. No other provider we route to does. DeepSeek answers with a
 // dollar balance at its own path and its own JSON shape; a provider that
 // reports nothing simply has no entry and reads as unknown, exactly as now.
+// NanoGPT publishes its subscription windows and its own billing advice.
+// Z.ai publishes its coding plan's windows as used-percentages at a monitor
+// path of its own, with its own authentication quirk (see ZAI below).
 
 import { proxyFetch } from './upstream-fetch.js';
 import { safeLine } from './safe-text.js';
@@ -28,6 +31,63 @@ const RESPONSE_LIMIT = 64 * 1024;
  * @typedef {{ label: string, text: string, utilization: number|null, at: number }} BackendQuota
  */
 
+// Z.ai publishes the coding plan's windows at /api/monitor/usage/quota/limit:
+// `{ code, data: { level, limits: [...] } }`, where each TOKENS_LIMIT row is one
+// window — `unit: 3, number: 5` the five-hour one, `unit: 6, number: 1` the
+// weekly one — carrying `percentage` (0-100, used) and `nextResetTime` (ms). A
+// TIME_LIMIT row is the monthly MCP-tool allowance and is not a token quota,
+// so it is left out. Both windows go into one reading: the bar is the fuller
+// of the two — the one that decides whether the account can serve — and the
+// text names each with its reset.
+const ZAI = {
+  path: '/api/monitor/usage/quota/limit',
+  headers: (/** @type {string} */ credential) => ({ Authorization: credential, 'Accept-Language': 'en-US,en' }),
+  parse(/** @type {any} */ body) {
+    const limits = Array.isArray(body?.data?.limits) ? body.data.limits : null;
+    if (!limits) return null;
+    /** @type {Array<{ name: string, used: number, resetAt: number|null }>} */
+    const windows = [];
+    for (const row of limits) {
+      if (row?.type !== 'TOKENS_LIMIT') continue;
+      const pct = Number(row.percentage);
+      if (!Number.isFinite(pct)) continue;
+      const name = row.unit === 3 && row.number === 5 ? '5h'
+        : row.unit === 6 && row.number === 1 ? 'week'
+        : null;
+      if (!name) continue;
+      const reset = Number(row.nextResetTime);
+      windows.push({ name, used: Math.min(1, Math.max(0, pct / 100)), resetAt: Number.isFinite(reset) && reset > 0 ? reset : null });
+    }
+    if (!windows.length) return null;
+    const text = windows.map(w => {
+      const until = w.resetAt ? formatUntil(w.resetAt - Date.now()) : '';
+      return `${w.name} ${Math.round(w.used * 100)}%${until ? ` (resets ${until})` : ''}`;
+    }).join(' · ');
+    return { label: 'Plan', text, utilization: Math.max(...windows.map(w => w.used)) };
+  },
+};
+
+// `2h10m`, `3d4h`, `now` — the shape the rest of the status screen uses for a
+// reset countdown, without importing the TUI to get it.
+function formatUntil(/** @type {number} */ ms) {
+  if (!(ms > 0)) return 'now';
+  const m = Math.floor(ms / 60_000);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h${m % 60 ? `${m % 60}m` : ''}`;
+  const d = Math.floor(h / 24);
+  return `${d}d${h % 24 ? `${h % 24}h` : ''}`;
+}
+
+/**
+ * @typedef {Object} BackendQuotaProvider
+ * @property {string} host  the upstream host this entry answers for (exact match)
+ * @property {string} path  the quota endpoint, resolved against the upstream origin
+ * @property {(credential: string) => Record<string, string>} [headers]  the auth header shape, when it is not `Authorization: Bearer`
+ * @property {(body: any) => ({ label: string, text: string, utilization: number|null } | null)} parse  the normalized reading, or null for a reply it does not recognize
+ */
+
+/** @type {BackendQuotaProvider[]} */
 const PROVIDERS = [
   {
     // DeepSeek: the Anthropic-compatible endpoint lives under /anthropic on the
@@ -56,6 +116,57 @@ const PROVIDERS = [
       };
     },
   },
+  {
+    // NanoGPT subscription: GET /api/subscription/v1/usage answers with the
+    // plan's token windows as USED FRACTIONS (`percentUsed`, 0-1, and it "may
+    // exceed 1") each with a `resetAt` in epoch milliseconds, plus `routing`,
+    // the gateway's own advice on whether the next request is served from the
+    // subscription or billed to the pay-as-you-go balance. That advice is the
+    // part worth showing: a subscription that has run out does not stop, it
+    // starts spending. The reply is bearer- or x-api-key-authenticated, so the
+    // default bearer header applies. The path is absolute on purpose — the
+    // Anthropic endpoint lives under /api and the usage one beside it.
+    host: 'api.nano-gpt.com',
+    path: '/api/subscription/v1/usage',
+    parse(/** @type {any} */ body) {
+      if (!body || typeof body !== 'object' || typeof body.active !== 'boolean') return null;
+      if (!body.active) {
+        return { label: 'Plan', text: `subscription ${safeLine(String(body.state || 'inactive'), 16)}`, utilization: null };
+      }
+      /** @type {Array<{ name: string, used: number, resetAt: number|null, degraded: boolean }>} */
+      const windows = [];
+      // A token-based trial reports one `tokens` window instead of daily/weekly.
+      for (const [name, w] of [['day', body.dailyInputTokens], ['week', body.weeklyInputTokens], ['trial', body.tokens]]) {
+        if (!w || typeof w !== 'object') continue;
+        const used = Number(w.percentUsed);
+        if (!Number.isFinite(used) || used < 0) continue;
+        const reset = Number(w.resetAt);
+        windows.push({ name: /** @type {string} */ (name), used, resetAt: Number.isFinite(reset) && reset > 0 ? reset : null, degraded: w.degraded === true });
+      }
+      if (!windows.length) return null;
+      const parts = windows.map(w => {
+        const until = w.resetAt ? formatUntil(w.resetAt - Date.now()) : '';
+        return `${w.degraded ? '~' : ''}${w.name} ${Math.round(w.used * 100)}%${until ? ` (resets ${until})` : ''}`;
+      });
+      // Only the two non-default advice values are worth a word; 'subscription'
+      // is the normal case and stays silent.
+      const mode = body.routing?.recommendedMode;
+      if (mode === 'paygo') parts.push(body.routing?.paidSpendPolicyAllowsBalance === false ? 'balance not allowed' : 'billing balance');
+      else if (mode === 'unavailable') parts.push('unavailable');
+      if (body.state === 'grace') parts.push('grace period');
+      return {
+        label: 'Plan',
+        text: parts.join(' · '),
+        utilization: Math.min(1, Math.max(...windows.map(w => w.used))),
+      };
+    },
+  },
+  // Z.ai GLM Coding Plan (international host) and its mainland twin. Same
+  // monitor endpoint, same reply, same quirk: the monitor wants the raw key
+  // in `Authorization`, not `Bearer <key>` — the Anthropic-shaped chat
+  // endpoint on the same host accepts either, the monitor only the former.
+  { host: 'api.z.ai', ...ZAI },
+  { host: 'open.bigmodel.cn', ...ZAI },
 ];
 
 /**
@@ -96,7 +207,9 @@ export async function fetchBackendQuota(account, { fetchImpl = proxyFetch, timeo
   const signal = AbortSignal.timeout(timeoutMs);
   try {
     const res = await fetchImpl(url, {
-      headers: { Authorization: `Bearer ${account.credential}`, Accept: 'application/json' },
+      // A provider that names its own header shape (z.ai's monitor wants the raw
+      // key) overrides the bearer default every other backend takes.
+      headers: { Accept: 'application/json', ...(provider.headers ? provider.headers(account.credential) : { Authorization: `Bearer ${account.credential}` }) },
       signal,
       // The account's own egress proxy, when it has one (account-routing.js).
       routing: account.routing ?? null,

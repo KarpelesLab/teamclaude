@@ -420,7 +420,10 @@ function defaultSpawn({ command, args, env, timeoutMs, signal }) {
     if (signal?.aborted) { reject(new Error('warm-up aborted')); return; }
     let child;
     try {
-      child = spawn(command, args, { env, stdio: 'ignore' });
+      // On Windows the `claude` on PATH is npm's .cmd shim, which a shell-less
+      // spawn never resolves (it only tries .exe), so warming failed with ENOENT.
+      // Same platform guard `teamclaude run` applies to its own spawnSync.
+      child = spawn(command, args, { env, stdio: 'ignore', shell: process.platform === 'win32' });
     } catch (err) {
       reject(err);
       return;

@@ -21,7 +21,7 @@ import http2 from 'node:http2';
 import { getConfigPath } from './config.js';
 import { generateCertChain } from './x509.js';
 import { createProxyRequestListener, resolveClientAuth, loopbackExempt, relayUpgrade, resolveAccountPin, describeConnectError, KEEP_ALIVE_TIMEOUT_MS, shouldStripOverageHeaders } from './server.js';
-import { interceptHostsFor, isNeverIntercepted } from './provider.js';
+import { interceptHostsFor, isNeverIntercepted, providerForPath, DEFAULT_PROVIDER } from './provider.js';
 import { forwardRefusal, guardedLookup, FORBIDDEN_FORWARD } from './forward-target.js';
 import { safeLine } from './safe-text.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
@@ -264,6 +264,9 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
     // asserted end-to-end through a real tunnel in mitm-integration.test.js,
     // so the cast is checked by a test rather than taken on trust.
     /** @type {any} */ (srv).keepAliveTimeout = KEEP_ALIVE_TIMEOUT_MS;
+    // Node 24.6 adds this buffer when an HTTP/1 response finishes, but its
+    // HTTP/2 server leaves it undefined; timeout + undefined would be NaN.
+    /** @type {any} */ (srv).keepAliveTimeoutBuffer ??= 1_000;
     srv.on('request', createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, forcedPin: pin || null, egress, clientUsage, forcedClient: client, dimensionUsage }));
     // Remote Control's real-time channel is a WebSocket (Upgrade handshake),
     // which never fires 'request' — only 'upgrade', with a raw socket instead
@@ -277,6 +280,20 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
         if (!target) {
           log(`[TeamClaude] MITM: refusing a WebSocket Upgrade for host ${JSON.stringify(safeLine(req.headers.host, 64))}, which this proxy does not intercept`);
           try { socket.write('HTTP/1.1 421 Misdirected Request\r\nConnection: close\r\n\r\n'); } catch { /* client already gone */ }
+          socket.destroy();
+          return;
+        }
+        // A provider's inference over a WebSocket — the Codex Responses channel
+        // — cannot be pooled here: relayUpgrade carries the client's own headers,
+        // so the turn would run on the client's login with nothing booked
+        // against the fleet (#492: a 12,727-token turn, 0 booked). Refused with
+        // a status the client reads as "no WebSocket here", so it falls back to
+        // HTTPS, where the pool serves it. Anthropic's path is the Remote
+        // Control channel, which is the client's own and still relayed.
+        const wsProvider = providerForPath(req.url);
+        if (wsProvider !== DEFAULT_PROVIDER) {
+          log(`[TeamClaude] MITM: refusing a ${wsProvider} WebSocket for ${safeLine(req.url, 96)} — it would run on the client's own login, not the pool; the client falls back to HTTPS`);
+          try { socket.write('HTTP/1.1 501 Not Implemented\r\nConnection: close\r\n\r\n'); } catch { /* client already gone */ }
           socket.destroy();
           return;
         }
