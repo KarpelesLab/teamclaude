@@ -51,6 +51,16 @@ import { proxyFetch } from './upstream-fetch.js';
 import { upstreamFor } from './provider.js';
 import { startEventLoopMonitor } from './event-loop-monitor.js';
 import { envVar } from './brand.js';
+
+// Where a new API key joins the rotation. A key is metered: every token it
+// serves is billed, while a subscription's quota is paid for whether it is
+// spent or not. At the default priority a key sat level with the subscriptions
+// and, once rotation landed on it, stayed there while plan quota went unspent
+// (#497). So a key is added as a LAST RESORT: the fallback tier the backend
+// docs already use, reached only when every account above it is spent, and
+// left again the moment one of them has quota, since a higher-priority
+// account preempts on the next selection.
+const APIKEY_DEFAULT_PRIORITY = 100;
 import {
   ConfigOpError,
   DISTRIBUTE_MODES,
@@ -272,7 +282,7 @@ async function serverCommand() {
     console.error('Add an account first:');
     console.error('  teamclaude import           Import from Claude Code');
     console.error('  teamclaude login            OAuth login via browser');
-    console.error('  teamclaude login --api      Add an API key');
+    console.error('  teamclaude login --api      Add an API key (last resort by default; --priority <n>)');
     process.exit(1);
   }
 
@@ -1186,6 +1196,14 @@ async function loginCommand() {
 async function loginApiCommand() {
   const loaded = await loadOrCreateConfig(); // first run: create the file; the save re-reads it
   let name = argValue('--name');
+  // `--priority 0` puts the key level with the subscriptions, which is what an
+  // added key did before; any integer is taken as given.
+  const priorityArg = argValue('--priority');
+  const priority = priorityArg == null ? APIKEY_DEFAULT_PRIORITY : Number(priorityArg);
+  if (!Number.isInteger(priority)) {
+    console.error(`--priority wants an integer (lower = preferred, default ${APIKEY_DEFAULT_PRIORITY}), got "${priorityArg}"`);
+    process.exit(1);
+  }
   // The flag alone: an API key is always a NEW entry, so there is no stored
   // routing for it to borrow (and `none` is what it gets without the flag).
   const { routing } = routingFlag();
@@ -1211,11 +1229,14 @@ async function loginApiCommand() {
       name = `api-${n}`;
     }
     disk.accounts.push({
-      name, type: 'apikey', apiKey: apiKey.trim(),
+      name, type: 'apikey', apiKey: apiKey.trim(), priority,
       ...(routing ? { routing: routingToUrl(routing) } : {}),
     });
   });
-  console.log(`Added API key account "${name}"${routing ? ` (routed via ${describeRouting(routing)})` : ''}`);
+  console.log(`Added API key account "${name}" at priority ${priority}${routing ? ` (routed via ${describeRouting(routing)})` : ''}`);
+  if (priority === APIKEY_DEFAULT_PRIORITY) {
+    console.log(`A last resort: the key serves only while every account ahead of it is spent, and rotation leaves it as soon as one of them has quota again. \`teamclaude priority ${name} 0\` rotates it like the others.`);
+  }
   console.log(`Saved to ${getConfigPath()}`);
   await notifyRunningServer(config);
 }
@@ -2402,7 +2423,8 @@ Commands:
   import              Import credentials from Claude Code
   login               OAuth login via browser
   login --token       OAuth login via copy/paste (no local callback; for headless/remote)
-  login --api         Add an API key account
+  login --api         Add an API key account (a last resort by default:
+                      --priority <n> to place it, 0 = level with the rest)
   env [--mitm|--no-mitm]
                       Print export lines to point Claude Code at the proxy, for
                       'eval "$(teamclaude env)"'. MITM forward-proxy unless the
