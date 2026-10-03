@@ -112,6 +112,45 @@ test('login --api saves onto a fresh read of the config, not the copy it loaded'
   assert.equal(saved.accounts.length, 2);
 });
 
+// A key is metered, a subscription is not: level with the subscriptions, the key
+// served while plan quota sat idle (#497). It joins as a last resort unless placed.
+test('login --api adds the key as a last resort, and --priority places it', async () => {
+  const port = await closedPort();
+  const configPath = await writeConfig(baseConfig(port));
+
+  const cli = runCli(configPath, ['login', '--api', '--name', 'api-test']);
+  await cli.prompted;
+  cli.answer('sk-ant-test-key');
+  const res = await cli.done;
+  assert.equal(res.code, 0, res.stderr);
+  assert.match(res.stdout, /Added API key account "api-test" at priority 100/);
+  assert.match(res.stdout, /last resort/);
+  let saved = JSON.parse(await readFile(configPath, 'utf8'));
+  assert.equal(saved.accounts.find(a => a.name === 'api-test').priority, 100);
+
+  const placed = runCli(configPath, ['login', '--api', '--name', 'api-level', '--priority', '0']);
+  await placed.prompted;
+  placed.answer('sk-ant-other-key');
+  const res2 = await placed.done;
+  assert.equal(res2.code, 0, res2.stderr);
+  assert.match(res2.stdout, /Added API key account "api-level" at priority 0/);
+  assert.doesNotMatch(res2.stdout, /last resort/);
+  saved = JSON.parse(await readFile(configPath, 'utf8'));
+  assert.equal(saved.accounts.find(a => a.name === 'api-level').priority, 0);
+});
+
+test('login --api refuses a priority that is not an integer before asking for the key', async () => {
+  const port = await closedPort();
+  const configPath = await writeConfig(baseConfig(port));
+  const cli = runCli(configPath, ['login', '--api', '--name', 'api-test', '--priority', 'high']);
+  await assert.rejects(cli.prompted, /CLI exited before prompting/);
+  const res = await cli.done;
+  assert.equal(res.code, 1);
+  assert.match(res.stderr, /--priority wants an integer/);
+  const saved = JSON.parse(await readFile(configPath, 'utf8'));
+  assert.equal(saved.accounts.length, 1, 'nothing was added');
+});
+
 test('login --api tells a running server to reload once the key is saved', async (t) => {
   const server = await fakeServer(t);
   const configPath = await writeConfig(baseConfig(server.port));
