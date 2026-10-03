@@ -103,6 +103,40 @@ export function accountTokens(usage) {
     + (u.totalCacheReadTokens || 0) + (u.totalCacheCreationTokens || 0);
 }
 
+// A model id as a person would say it: claude-opus-5-5 -> "Opus 5.5",
+// claude-haiku-4-5-20251001 -> "Haiku 4.5", gpt-6.1-sol -> "GPT 6.1 Sol".
+// A context suffix ("[1m]") is dropped; any other shape is shown as sent.
+export function modelLabel(id) {
+  var s = String(id);
+  var br = s.indexOf('[');
+  if (br > 0) s = s.slice(0, br);
+  var parts = s.split('-');
+  var isNum = function (p) { return p !== '' && !isNaN(Number(p)); };
+  var cap = function (w) { return w.charAt(0).toUpperCase() + w.slice(1); };
+  if (parts[0] === 'claude' && parts.length >= 3) {
+    // Date stamps (8 digits) are a snapshot id, not part of the version.
+    var nums = parts.slice(2).filter(function (p) { return isNum(p) && p.length < 8; });
+    if (nums.length) return cap(parts[1]) + ' ' + nums.slice(0, 2).join('.');
+  }
+  if (parts[0] === 'gpt' && parts.length >= 2) {
+    return 'GPT ' + parts[1] + (parts.length > 2 ? ' ' + parts.slice(2).map(cap).join(' ') : '');
+  }
+  return s;
+}
+
+// The models an account served in the last 15 minutes, newest first, at most
+// three. Haiku is what Claude Code uses for side requests (titles, summaries),
+// so it is listed only when nothing else ran — otherwise it would crowd out
+// the model the sessions on that account are actually working with.
+export function recentModelLabels(usage, now) {
+  var seen = (usage && usage.recentModels) || {};
+  var at = now == null ? Date.now() : now;
+  var ids = Object.keys(seen).filter(function (k) { return at - seen[k] < 15 * 60 * 1000; })
+    .sort(function (x, y) { return seen[y] - seen[x]; });
+  var main = ids.filter(function (k) { return k.toLowerCase().indexOf('haiku') < 0; });
+  return (main.length ? main : ids).slice(0, 3).map(modelLabel);
+}
+
 export function providerLabel(provider) {
   if (provider === 'codex') return 'Codex';
   if (provider === 'anthropic') return 'Claude';
@@ -609,7 +643,7 @@ export function usageFor(entry, view) {
 }
 
 const SHARED_HELPERS = [
-  scopedWeeklyRows, accountTokens, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
+  scopedWeeklyRows, accountTokens, modelLabel, recentModelLabels, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
 ].map(fn => fn.toString()).join('\n\n');
 
@@ -685,6 +719,8 @@ const PAGE = `<!doctype html>
   .quota { display: grid; grid-template-columns: 64px 1fr 170px; gap: 8px; align-items: center; margin-top: 6px; }
   .quota .lbl { color: var(--dim); font-size: 12px; }
   .quota .val { color: var(--dim); font-size: 12px; text-align: right; font-variant-numeric: tabular-nums; }
+  .quota.models .names { grid-column: 2 / 4; display: flex; flex-wrap: wrap; gap: 6px; }
+  .badge.model { color: var(--accent); border-color: var(--accent); }
   .bar { height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; }
   .bar i { display: block; height: 100%; border-radius: 4px; background: var(--ok); }
   .bar i.warn { background: var(--warn); }
@@ -889,6 +925,18 @@ ${SHARED_HELPERS}
     return row;
   }
 
+  // A "Model" row under Session: what this account is serving right now.
+  function modelsRow(usage) {
+    var labels = recentModelLabels(usage);
+    if (!labels.length) return null;
+    var row = el('div', 'quota models');
+    row.appendChild(el('span', 'lbl', 'Model'));
+    var names = el('span', 'names');
+    labels.forEach(function (l) { names.appendChild(el('span', 'badge model', l)); });
+    row.appendChild(names);
+    return row;
+  }
+
   function renderAccount(a, current, currentAccounts, fleetThreshold, fleetThresholds) {
     var card = el('div', 'card');
     var head = el('div', 'row');
@@ -926,8 +974,11 @@ ${SHARED_HELPERS}
     card.appendChild(head);
     if (a.unavailable) card.appendChild(el('div', 'blocked', 'blocked: ' + (UNAVAILABLE_TEXT[a.unavailable] || a.unavailable)));
     var q = a.quota || {};
+    var models = modelsRow(a.usage);
     if (q.unified5h != null || q.unified7d != null) {
       card.appendChild(quotaRow('Session', q.unified5h, q.unified5hReset));
+      if (models) card.appendChild(models);
+      models = null;
       card.appendChild(quotaRow('Weekly', q.unified7d, q.unified7dReset));
       // Model-scoped weekly buckets are learned from the usage endpoint rather
       // than declared, so hard-coding the two families that have dedicated
@@ -938,6 +989,7 @@ ${SHARED_HELPERS}
     } else {
       card.appendChild(el('div', 'usage', 'quota unknown (no traffic observed yet)'));
     }
+    if (models) card.appendChild(models);
     var u = a.usage || {};
     var last = u.lastUsed ? ' · last ' + fmtAgo(u.lastUsed) : '';
     card.appendChild(el('div', 'usage', (u.totalRequests || 0) + ' req · ' + fmtNum(accountTokens(u)) + ' tok' + last));
