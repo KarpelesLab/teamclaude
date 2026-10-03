@@ -68,6 +68,17 @@ retry if `sx.mode` is `429`, otherwise the inline wait, otherwise a 429 to the
 client with its `retry-after`. An IP-scoped limit is logged as such, since that
 is what an operator chasing a fleet-wide throttle is looking for.
 
+## Thinking blocks across accounts
+
+Since Claude Sonnet 5.5, a thinking block is bound to the **organization** whose account produced it ([preserved thinking](https://platform.claude.com/docs/en/build-with-claude/preserved-thinking), "Thinking blocks stay with the account that produced them"). When a later request in the same conversation goes out on an account of a *different* organization, the API drops those earlier Sonnet 5.5 thinking blocks before the model sees them. The request succeeds and the answer comes back; the model simply answers that turn without the reasoning it had built up, and rebuilds it from the visible history. With the `thinking-binding-controls-2026-08-01` beta header the response lists each dropped block in `input_transformations` with the reason `organization_binding_mismatch`. Blocks from other models are not organization-bound (a model switch has its own, separate rules on that page).
+
+What that means for a pool:
+
+- **Accounts of one organization** (seats on a Team or Enterprise plan) are unaffected: the blocks stay readable on every account the conversation lands on.
+- **Accounts of different organizations** — the usual shape for a pool of personal Max subscriptions, where each login is its own org — pay the drop once per switch of a Sonnet 5.5 conversation: the threshold rotation, the [failover hop](#one-failover-hop-on-a-rate-limit), a re-routed [pin](#session-aware-routing), or a [`TC_ACCT`](#pin-a-session-to-one-account) change. It is the same shape as the cold prompt cache a switch already costs, and it costs nothing on the turns that stay put.
+
+TeamClaude does not strip or rewrite thinking blocks, so nothing is lost for good: the blocks stay in the client's history, and a conversation that moves back to its original organization reads them again. Which organization each account belongs to is on its row in `teamclaude status` and in the dashboard. Nothing here needs configuring; the levers that keep a conversation on one account — `switchThreshold`, `distributeSessions`, a route or a pin — are the ones that keep its reasoning too.
+
 ## Storm control
 
 When you run many agents at once and the active account runs out, every in-flight request fails over to the next account **at the same instant** — a thundering herd that can spend a big chunk of the fresh account's quota (large contexts) and instantly throttle it, cascading down the fleet ([#84](https://github.com/KarpelesLab/teamclaude/issues/84)).
