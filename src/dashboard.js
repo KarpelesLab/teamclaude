@@ -106,13 +106,13 @@ export function accountTokens(usage) {
 // A model id as a person would say it: claude-opus-5-5 -> "Opus 5.5",
 // claude-haiku-4-5-20251001 -> "Haiku 4.5", gpt-6.1-sol -> "GPT 6.1 Sol".
 // A context suffix ("[1m]") is dropped; any other shape is shown as sent.
-export function modelLabel(id) {
+export function modelLabel(/** @type {string} */ id) {
   var s = String(id);
   var br = s.indexOf('[');
   if (br > 0) s = s.slice(0, br);
   var parts = s.split('-');
-  var isNum = function (p) { return p !== '' && !isNaN(Number(p)); };
-  var cap = function (w) { return w.charAt(0).toUpperCase() + w.slice(1); };
+  var isNum = function (/** @type {string} */ p) { return p !== '' && !isNaN(Number(p)); };
+  var cap = function (/** @type {string} */ w) { return w.charAt(0).toUpperCase() + w.slice(1); };
   if (parts[0] === 'claude' && parts.length >= 3) {
     // Date stamps (8 digits) are a snapshot id, not part of the version.
     var nums = parts.slice(2).filter(function (p) { return isNum(p) && p.length < 8; });
@@ -128,7 +128,8 @@ export function modelLabel(id) {
 // three. Haiku is what Claude Code uses for side requests (titles, summaries),
 // so it is listed only when nothing else ran — otherwise it would crowd out
 // the model the sessions on that account are actually working with.
-export function recentModelLabels(usage, now) {
+export function recentModelLabels(/** @type {any} */ usage, /** @type {number} */ now) {
+  /** @type {Record<string, number>} */
   var seen = (usage && usage.recentModels) || {};
   var at = now == null ? Date.now() : now;
   var ids = Object.keys(seen).filter(function (k) { return at - seen[k] < 15 * 60 * 1000; })

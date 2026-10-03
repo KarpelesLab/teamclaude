@@ -4171,8 +4171,12 @@ export class AccountManager {
     // the table keeps only the most recently seen few.
     const modelName = typeof model === 'string' ? safeLine(model, 64) : '';
     if (modelName) {
-      const seen = { ...(account.usage.recentModels || {}), [modelName]: Date.now() };
-      account.usage.recentModels = Object.fromEntries(
+      // `usage` is built without the table (see makeAccount), so it is added
+      // here on first sight.
+      const usage = /** @type {Record<string, any>} */ (account.usage);
+      /** @type {Record<string, number>} */
+      const seen = { ...(usage.recentModels || {}), [modelName]: Date.now() };
+      usage.recentModels = Object.fromEntries(
         Object.entries(seen).sort((a, b) => b[1] - a[1]).slice(0, MAX_RECENT_MODELS));
     }
 
