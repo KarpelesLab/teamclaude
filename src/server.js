@@ -521,7 +521,15 @@ export function relayHttpForward(req, res) {
   else req.pipe(upstreamReq);
 }
 
-const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/files/', '/api/oauth/file_upload'];
+// Identity-bound Remote Control traffic must keep the client's own credential.
+const CLIENT_CREDENTIAL_PATHS = [
+  '/v1/code/', '/api/oauth/', '/api/frame/', '/v1/environments/',
+  '/v1/sessions/', '/v2/session_ingress/', '/v2/ccr-sessions/',
+];
+function isClientCredentialPath(url) {
+  const path = (url || '').split('?')[0];
+  return CLIENT_CREDENTIAL_PATHS.some(p => path.startsWith(p) || path === p.slice(0, -1));
+}
 
 /** True only for the native Anthropic API root. Request transforms must classify
  * the same effective upstream URL that transport will dial: an account with no
@@ -662,7 +670,7 @@ export function createProxyRequestListener({
       // likewise account-bound: files uploaded from claude.ai belong to the
       // paired identity, so fetching them with a rotated token 403s and Claude
       // Code silently drops the image from the message.
-      if (CLIENT_CREDENTIAL_PATHS.some((p) => (req.url || '').startsWith(p))) { await relayStream(req, res, upstream, sx); return; }
+      if (isClientCredentialPath(req.url)) { await relayStream(req, res, upstream, sx); return; }
 
       // Anthropic-native control plane (see CONTROL_PLANE_PREFIXES): startup
       // connectivity gate, org model entitlements, identity, usage. Relayed to
