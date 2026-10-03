@@ -264,6 +264,9 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
     // asserted end-to-end through a real tunnel in mitm-integration.test.js,
     // so the cast is checked by a test rather than taken on trust.
     /** @type {any} */ (srv).keepAliveTimeout = KEEP_ALIVE_TIMEOUT_MS;
+    // Node 24.6 adds this buffer when an HTTP/1 response finishes, but its
+    // HTTP/2 server leaves it undefined; timeout + undefined would be NaN.
+    /** @type {any} */ (srv).keepAliveTimeoutBuffer ??= 1_000;
     srv.on('request', createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, forcedPin: pin || null, egress, clientUsage, forcedClient: client, dimensionUsage }));
     // Remote Control's real-time channel is a WebSocket (Upgrade handshake),
     // which never fires 'request' — only 'upgrade', with a raw socket instead

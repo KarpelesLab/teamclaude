@@ -59,6 +59,8 @@ For Anthropic API key accounts (billed via Console):
 teamclaude login --api
 ```
 
+A key is **metered** — every token it serves is billed — while a subscription's quota is paid for whether it is spent or not. So a key is added at `priority: 100`, the fallback tier: rotation reaches it only when every account ahead of it is spent, and leaves it the moment one of them has quota again (a higher-priority account preempts on the next selection, so a reset elsewhere moves traffic back off the key). Pass `--priority <n>` to place it yourself; `--priority 0` puts it level with the subscriptions, which is where an added key sat before 1.1.23. A key already in the config keeps whatever priority it has: `teamclaude priority <name> 100` (or `--last`) moves it to the back.
+
 ### When the key is rejected (401)
 
 A 401 on an API-key account never reaches the client. The request fails over to the next account, and the account that answered it is held out of rotation for a cooldown, then tried again. It is not benched for good, because a 401 does not always mean the key is bad: a gateway such as LiteLLM, set as the account's `upstream`, can answer one while its own upstream is unreachable.
@@ -137,7 +139,7 @@ Besides the CLI there are two more places to set it. In the TUI, **`g`** then **
 
 Routing covers what TeamClaude does with the account's own credential. Two kinds of traffic are outside that, and both keep the fleet path:
 
-- Claude Code's own identity calls (`/api/oauth/*`, `/v1/code/*` and its token refresh) are relayed with the credential of the Claude Code login, never with a pooled account's, so they belong to no account here. That holds even when the login is the same person as a routed account.
+- Claude Code's own identity calls (`/api/oauth/*`, `/v1/code/*`, the Remote Control bridge's `/v1/environments/*`, `/v1/sessions/*`, `/v2/session_ingress/*` and `/v2/ccr-sessions/*`, and its token refresh) are relayed with the credential of the Claude Code login, never with a pooled account's, so they belong to no account here. That holds even when the login is the same person as a routed account.
 - A sign-in or import that names no account. Which account it belongs to is only known once the profile has been read, so that lookup cannot use a proxy it has not found yet. Pass `--name` (or `--routing`) and it can.
 
 ### The proxy is tested before anything depends on it
