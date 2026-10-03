@@ -10,6 +10,7 @@
 // endpoint on top. No other provider we route to does. DeepSeek answers with a
 // dollar balance at its own path and its own JSON shape; a provider that
 // reports nothing simply has no entry and reads as unknown, exactly as now.
+// NanoGPT publishes its subscription windows and its own billing advice.
 // Z.ai publishes its coding plan's windows as used-percentages at a monitor
 // path of its own, with its own authentication quirk (see ZAI below).
 
@@ -112,6 +113,51 @@ const PROVIDERS = [
         label: 'Balance',
         text: body?.is_available === false ? `${text} (unavailable)` : text,
         utilization: null,
+      };
+    },
+  },
+  {
+    // NanoGPT subscription: GET /api/subscription/v1/usage answers with the
+    // plan's token windows as USED FRACTIONS (`percentUsed`, 0-1, and it "may
+    // exceed 1") each with a `resetAt` in epoch milliseconds, plus `routing`,
+    // the gateway's own advice on whether the next request is served from the
+    // subscription or billed to the pay-as-you-go balance. That advice is the
+    // part worth showing: a subscription that has run out does not stop, it
+    // starts spending. The reply is bearer- or x-api-key-authenticated, so the
+    // default bearer header applies. The path is absolute on purpose — the
+    // Anthropic endpoint lives under /api and the usage one beside it.
+    host: 'api.nano-gpt.com',
+    path: '/api/subscription/v1/usage',
+    parse(/** @type {any} */ body) {
+      if (!body || typeof body !== 'object' || typeof body.active !== 'boolean') return null;
+      if (!body.active) {
+        return { label: 'Plan', text: `subscription ${safeLine(String(body.state || 'inactive'), 16)}`, utilization: null };
+      }
+      /** @type {Array<{ name: string, used: number, resetAt: number|null, degraded: boolean }>} */
+      const windows = [];
+      // A token-based trial reports one `tokens` window instead of daily/weekly.
+      for (const [name, w] of [['day', body.dailyInputTokens], ['week', body.weeklyInputTokens], ['trial', body.tokens]]) {
+        if (!w || typeof w !== 'object') continue;
+        const used = Number(w.percentUsed);
+        if (!Number.isFinite(used) || used < 0) continue;
+        const reset = Number(w.resetAt);
+        windows.push({ name: /** @type {string} */ (name), used, resetAt: Number.isFinite(reset) && reset > 0 ? reset : null, degraded: w.degraded === true });
+      }
+      if (!windows.length) return null;
+      const parts = windows.map(w => {
+        const until = w.resetAt ? formatUntil(w.resetAt - Date.now()) : '';
+        return `${w.degraded ? '~' : ''}${w.name} ${Math.round(w.used * 100)}%${until ? ` (resets ${until})` : ''}`;
+      });
+      // Only the two non-default advice values are worth a word; 'subscription'
+      // is the normal case and stays silent.
+      const mode = body.routing?.recommendedMode;
+      if (mode === 'paygo') parts.push(body.routing?.paidSpendPolicyAllowsBalance === false ? 'balance not allowed' : 'billing balance');
+      else if (mode === 'unavailable') parts.push('unavailable');
+      if (body.state === 'grace') parts.push('grace period');
+      return {
+        label: 'Plan',
+        text: parts.join(' · '),
+        utilization: Math.min(1, Math.max(...windows.map(w => w.used))),
       };
     },
   },

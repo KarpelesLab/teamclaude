@@ -25,7 +25,12 @@ function captureLog(fn) {
 
 test('an unparseable 5h reset is ignored, so the bucket still clears on the reset we knew', () => {
   const am = new AccountManager([oauth('a')], 0.98);
-  const past = Math.floor((Date.now() + 1000) / 1000); // a reset just ahead of us
+  // A reset well ahead of us. It was one second ahead, which made the 'still
+  // spent' assertion below a race against the wall clock: on a loaded runner the
+  // second elapsed first, the window rolled over on its own and the bucket
+  // cleared before the test got to ask. The rollover this test wants to see is
+  // staged explicitly further down, so the real reset can sit anywhere ahead.
+  const past = Math.floor((Date.now() + 3600_000) / 1000);
   am.updateQuota(0, {
     'anthropic-ratelimit-unified-5h-utilization': '1',
     'anthropic-ratelimit-unified-5h-reset': String(past),

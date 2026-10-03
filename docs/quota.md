@@ -238,6 +238,15 @@ The reading is normalized to `{ label, text, utilization }`. A provider that rep
 Provider support lives entirely in `src/backend-quota.js`, matched by the host of the account's `upstream`. Adding one is a single entry there (a path and a parse function, plus a header shape when the provider's monitor wants something other than a bearer); the prober, the quota field and the renderer never name a provider. Supported today:
 
 - **DeepSeek** — the account balance, as money.
+- **NanoGPT** (`api.nano-gpt.com`) — the subscription's daily and weekly token windows in one reading: the bar is the fuller of the two, the text names each with its reset, and NanoGPT's own billing advice is appended when it is not the ordinary case:
+
+  ```
+    nano-gpt (oauth, prio 100) active
+    Plan     [██░░░░░░░░░░░░░░░░] 37% · day 12% (resets 5h10m) · week 37% (resets 3d4h)
+    Plan     [██████████████████] 100% · day 104% (resets 1h) · week 37% (resets 3d4h) · billing balance
+  ```
+
+  `billing balance` means the subscription window is spent and the gateway will serve the next request from the pay-as-you-go balance instead of refusing it — the one line to watch on a metered plan. `balance not allowed` means your NanoGPT spend policy forbids that and requests will fail instead.
 - **Z.ai GLM Coding Plan** (`api.z.ai`, and `open.bigmodel.cn` for the mainland plan) — the plan's two token windows as used-percentages, in one reading: the bar is the fuller of the two, the text names each with its reset:
 
   ```
