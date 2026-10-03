@@ -62,6 +62,8 @@ const ADAPTIVE_STATS_CACHE_MS = 1000;
 // when the token turned over, short enough that a genuinely bad new token
 // recovers on the next request rather than staying stuck.
 const FORCED_REFRESH_FLOOR_MS = 10_000;
+// How many distinct models an account's recentModels table remembers.
+const MAX_RECENT_MODELS = 8;
 // An organization-level OAuth policy denial is not repaired by an immediate
 // retry. Keep the account out of automatic rotation long enough for other
 // members to serve, then re-admit it so an administrator's policy change is
@@ -4162,6 +4164,21 @@ export class AccountManager {
   updateQuota(accountIndex, headers, model = null) {
     const account = this.accounts[accountIndex];
     if (!account) return;
+
+    // Which models this account served, and when each was last seen, so the
+    // dashboard can say what an account is busy with right now. The model is
+    // client-supplied, so it is stripped like every other rendered string, and
+    // the table keeps only the most recently seen few.
+    const modelName = typeof model === 'string' ? safeLine(model, 64) : '';
+    if (modelName) {
+      // `usage` is built without the table (see makeAccount), so it is added
+      // here on first sight.
+      const usage = /** @type {Record<string, any>} */ (account.usage);
+      /** @type {Record<string, number>} */
+      const seen = { ...(usage.recentModels || {}), [modelName]: Date.now() };
+      usage.recentModels = Object.fromEntries(
+        Object.entries(seen).sort((a, b) => b[1] - a[1]).slice(0, MAX_RECENT_MODELS));
+    }
 
     // Codex reports the same information under its own header names, so it is
     // normalised into the very fields the Anthropic path fills. Everything
