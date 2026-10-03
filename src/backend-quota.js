@@ -78,6 +78,15 @@ function formatUntil(/** @type {number} */ ms) {
   return `${d}d${h % 24 ? `${h % 24}h` : ''}`;
 }
 
+/**
+ * @typedef {Object} BackendQuotaProvider
+ * @property {string} host  the upstream host this entry answers for (exact match)
+ * @property {string} path  the quota endpoint, resolved against the upstream origin
+ * @property {(credential: string) => Record<string, string>} [headers]  the auth header shape, when it is not `Authorization: Bearer`
+ * @property {(body: any) => ({ label: string, text: string, utilization: number|null } | null)} parse  the normalized reading, or null for a reply it does not recognize
+ */
+
+/** @type {BackendQuotaProvider[]} */
 const PROVIDERS = [
   {
     // DeepSeek: the Anthropic-compatible endpoint lives under /anthropic on the
