@@ -120,7 +120,7 @@ curl -X POST http://localhost:3456/teamclaude/priority \
 | `l` | Sign an account in again via the browser (opens on the first account in `error`; not in attach mode) |
 | `p` | Refresh quota on all accounts (one-shot probe of the zero-spend usage endpoint) |
 | `R` | Reload accounts from config |
-| `g` | Settings (threshold, quota probe, quota-bar contents, routing, add/remove/reorder accounts, upstream and account proxies, sx.org) |
+| `g` | Settings (threshold, quota probe, quota-bar contents, routing, add/remove/reorder/sort accounts, upstream and account proxies, sx.org) |
 | `q` | Quit |
 
 In selection mode, use `j`/`k` or the arrow keys to navigate, `Enter` to confirm, `Esc` to cancel.
@@ -128,6 +128,8 @@ In selection mode, use `j`/`k` or the arrow keys to navigate, `Enter` to confirm
 The settings screen is a list, not a set of letter shortcuts: `↑`/`↓` move between rows, `←`/`→` change the value in place (threshold by 1%, probe by 30s, modes cycle), `Enter` opens a row that needs typing or a sub-screen, `Esc` goes back.
 
 **Reorder accounts** opens the account list with the same two pairs of keys and one extra job for them: `↑`/`↓` pick the account, `←`/`→` move *that account* up and down the list, `Enter` or `Esc` goes back. Every move applies as you make it and is written a moment after the keys stop (or on leaving the screen), so there is nothing to confirm and nothing to cancel. An account moves among the accounts of its own provider: a mixed Claude and Codex fleet is drawn grouped by provider, so a move that would cross into the other group does nothing. This is the order the list is **drawn** in and nothing else — rotation order is [`priority`](routing.md#choosing-an-account), which the screen never touches. `teamclaude attach` draws the same order: each account in `/teamclaude/status` carries its `displayOrder` (`null` until it has been placed).
+
+**Sort accounts** chooses what orders the list inside each provider group: **arranged** (your order, above), or the soonest reset of one window — **session reset** (five-hour), **weekly reset**, **S7 reset** or **F7 reset** — which puts the account whose window ends soonest at the top: the quota you lose first if nothing spends it. S7 and F7 read the all-models weekly on an account that has no Sonnet or Fable bucket of its own, since that is the window its Sonnet or Fable use counts against. Accounts with no reading for the window go last (for the session sort, that includes every account with no five-hour window open), and your arrangement breaks ties. The reorder screen always shows the arranged order, because that is the order it edits. `teamclaude attach` reads the same `accountSort` from its own config file.
 
 ## Run Claude Code through the proxy
 
