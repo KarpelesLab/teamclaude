@@ -387,6 +387,32 @@ held to a 10-second budget, because the waiting client's patience for the
 response head is finite and the retry needs the rest of it. Every attempt and outcome is
 logged.
 
+## Claude banked usage-limit resets
+
+Claude sometimes grants an account a **banked usage-limit reset**, shown under
+**Resets** on the claude.ai usage page (for example "Full reset — Expires
+Oct 23"). Spending one clears the account's 5-hour and 7-day windows ahead of
+their own reset, whenever you choose.
+
+The [quota probe](quota.md#quota-probe) reads the count from the same
+zero-spend `/api/oauth/usage` call it already makes. It asks with
+`?cedar_ember=1` and a Claude Code `User-Agent`, because the endpoint only
+includes the reset block for a recent Claude Code client. The count shows up on
+the same surfaces as the
+[Codex reset credits](#free-rate-limit-reset-credits): `RC1` on the TUI row, a
+`Reset` line in `teamclaude status` with when the reset lapses
+(`expires 18d 23h`), and a badge with the date on the dashboard card. A reset
+past its expiry date is dropped from every surface, as is a reading more than
+7 days old.
+
+The probe is off by default, so the count is only as fresh as the last probe:
+`p` in the TUI, or `curl -X POST localhost:3456/teamclaude/probe`, refreshes
+it once.
+
+TeamClaude only **reports** a banked reset; it never spends one.
+`autoRedeemResets` applies to Codex accounts only. Spend a Claude reset
+yourself, on the claude.ai usage page or with `/limit-reset` in Claude Code.
+
 ## Third-party backend accounts
 
 Any Anthropic-compatible API can be added as an account alongside your Claude accounts. Give it a higher `priority` value (lower = preferred, so use e.g. `100`) and it will be used as a fallback when all Claude accounts are exhausted.

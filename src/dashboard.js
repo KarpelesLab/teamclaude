@@ -254,9 +254,16 @@ export function accountBadges(account, current, currentAccounts, now, fleetThres
   // one may describe a credit that has since been redeemed or has expired.
   var reading = (a.quota || {}).resetCredits || {};
   var credits = reading.available;
-  var stale = Number.isFinite(reading.seenAt) && (now == null ? Date.now() : now) - reading.seenAt > RESET_CREDIT_MAX_AGE_MS;
-  if (Number.isFinite(credits) && credits > 0 && !stale) {
-    badges.push({ cls: 'meta', text: credits + ' reset credit' + (credits === 1 ? '' : 's') });
+  var at = now == null ? Date.now() : now;
+  var stale = Number.isFinite(reading.seenAt) && at - reading.seenAt > RESET_CREDIT_MAX_AGE_MS;
+  // A Claude banked reset states when it lapses: drop it past then, and say
+  // the date while it stands (the claude.ai Resets page names it the same way).
+  var expired = Number.isFinite(reading.expiresAt) && reading.expiresAt <= at;
+  if (Number.isFinite(credits) && credits > 0 && !stale && !expired) {
+    var expires = Number.isFinite(reading.expiresAt)
+      ? ' \u00b7 expires ' + new Date(reading.expiresAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+      : '';
+    badges.push({ cls: 'meta', text: credits + ' reset credit' + (credits === 1 ? '' : 's') + expires });
   }
   // Arguments 5/6 are optional (the pre-#409 unit test above omits them): with
   // no account switchThreshold at all — the common case — thresholdBadgeText

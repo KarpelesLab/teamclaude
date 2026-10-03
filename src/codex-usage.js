@@ -109,7 +109,7 @@ const RESET_CREDIT_COUNT_MAX = 99;
  * @param {unknown} value
  * @returns {number|null}
  */
-function creditCount(value) {
+export function creditCount(value) {
   const n = Number(value);
   if (!Number.isFinite(n) || n < 0) return null;
   return Math.min(Math.trunc(n), RESET_CREDIT_COUNT_MAX);
