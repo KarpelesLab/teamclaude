@@ -185,6 +185,19 @@ test('a width short of whole names on both sides is shared, not given to one pan
   assert.ok(right.nameW > 20, `the Codex pane got name columns past its minimum: ${right.nameW}`);
 });
 
+test('past the width both panes need, more columns change nothing: bars stop at the list cap, the rest stays blank', () => {
+  // Shared between the panes, the spare width set the Codex pane mid-screen on
+  // an ultrawide, with 12-column bars at both ends of the gap.
+  const am = fleet([claude('someone.long@example.com'), claude('b@x.com'), codex('k1@x.com'), codex('k2@x.com')]);
+  const panes = ({ lines }) => listLines(lines).map(l => l.trimEnd());
+  const wide = screen(am, 300);
+  const ultra = screen(am, 660);
+  assert.ok(ultra.drawn.length && ultra.drawn.every(r => r.pane), 'it splits');
+  // 20 is BAR_MAX, where the one-column list's bars stop too.
+  for (const row of ultra.drawn) assert.equal(row.bw, 20, row.text);
+  assert.deepEqual(panes(ultra), panes(wide));
+});
+
 test('each pane marks the account its own provider cursor names', () => {
   const am = fleet([claude('a@x.com'), claude('b@x.com'), codex('k1@x.com'), codex('k2@x.com')]);
   am.setCurrentAccount(1);

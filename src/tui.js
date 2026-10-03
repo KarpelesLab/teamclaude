@@ -218,8 +218,9 @@ const PROVIDER_ORDER = Object.keys(PROVIDERS);
 // Two provider pools side by side: the gutter between the panes.
 const PANE_GUTTER = ' │ ';
 // Pane bars: at least wide enough for `10h23m`, and past that only once every
-// name is whole.
-const PANE_BAR_MAX = 12;
+// name is whole. From there they grow to BAR_MAX, as the list's bars do: a
+// narrower cap left a 600-column terminal drawing 12-column bars beside
+// hundreds of blank columns.
 const PANE_BAR_FLOOR = 8;
 // The narrowest a list draws both shared bars in, full width and in a pane.
 const LIST_MIN = 70;
@@ -2289,7 +2290,6 @@ export class TUI {
     // The type cell and the space after it, at the width the row pads it to.
     const typeCell = pane == null ? typeColumn(this.am.accounts).width + 1 : 0;
     const floor = pane == null ? LIST_MIN : PANE_MIN;
-    const barCap = pane == null ? BAR_MAX : PANE_BAR_MAX;
     // The columns every name needs past NAME_MIN to be whole.
     const longestName = Math.max(0, ...accts.map(a => vw(a.name)));
     const nameWant = Math.max(0, longestName - NAME_MIN);
@@ -2356,11 +2356,11 @@ export class TUI {
       const avail = barRoom(0);
       let bw = avail < BAR_MIN
         ? Math.max(1, avail)
-        : Math.min(barCap, avail);
+        : Math.min(BAR_MAX, avail);
       // A pane gives names the columns before bars grow past the floor.
       if (pane != null && avail >= BAR_MIN) {
         const named = barRoom(nameWant);
-        bw = named >= PANE_BAR_FLOOR ? Math.min(barCap, named) : Math.min(PANE_BAR_FLOOR, avail);
+        bw = named >= PANE_BAR_FLOOR ? Math.min(BAR_MAX, named) : Math.min(PANE_BAR_FLOOR, avail);
       }
       const slack = Math.max(0, W - fixed - 6 * (nbars - 1) - nbars * bw);
       const drawn = (shortBar ? 2 : 1) + families;
@@ -2368,7 +2368,7 @@ export class TUI {
       // width that reaches it draws every bar.
       const s1 = Math.max(floor, span(2 + families, BAR_MIN), span(drawn, PANE_BAR_FLOOR));
       const s2 = Math.max(s1, span(drawn, PANE_BAR_FLOOR) + nameWant);
-      const s3 = Math.max(s2, span(drawn, barCap) + nameWant);
+      const s3 = Math.max(s2, span(drawn, BAR_MAX) + nameWant);
       return {
         bw, showBoth, showFamily, anyFable, anySonnet, slack, shortBar,
         complete: showBoth && (families === 0 || showFamily),
@@ -2427,7 +2427,9 @@ export class TUI {
   }
 
   /** Two pane layouts, or null when `W` cannot fit both. Width goes stage by stage,
-   *  both panes reaching one before either starts the next, a partial one shared pro rata. */
+   *  both panes reaching one before either starts the next, a partial one shared pro rata.
+   *  Width past the last stage stays unused on the right: shared between the panes, it
+   *  set the Codex pane mid-screen on an ultrawide, hundreds of columns from its neighbour. */
   _splitLayout(/** @type {{ provider: string, indices: number[] }[]} */ groups, /** @type {number} */ W) {
     const [a, b] = groups;
     const avail = W - vw(PANE_GUTTER);
@@ -2450,8 +2452,6 @@ export class TUI {
       leftW += wantA;
       rightW += wantB;
     }
-    leftW += Math.floor((avail - leftW - rightW) / 2);
-    rightW = avail - leftW;
     const left = this._listLayout(a.indices, leftW, { pane: a.provider });
     const right = this._listLayout(b.indices, rightW, { pane: b.provider });
     return left.complete && right.complete ? { leftW, rightW, left, right } : null;
