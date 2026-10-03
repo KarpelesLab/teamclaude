@@ -26,7 +26,7 @@ MITM mode launches claude pointed at TeamClaude as an **HTTPS forward proxy** (`
 
 Because the request is buffered, the retry is transparent to claude. Client token refreshes (`/v1/oauth/token`), Remote Control (`/v1/code/*`) and claude.ai attachment transfers (`/api/oauth/files/*`, `/api/oauth/file_upload`) are passed through with the client's own credential, since they are bound to the paired identity and would 403 under a rotated token. Any host other than the upstream is blind-tunnelled. The server accepts *both* base-URL and proxy clients at once, so instances launched with and without `--no-mitm` can share one server.
 
-A pool with Codex accounts also intercepts `chatgpt.com`, which is where ChatGPT Desktop talks to as well. On a machine running that app, set `proxy.terminalOnly` to `true` to tunnel that host untouched: the terminal Codex CLI keeps reaching the pool through its explicit `/backend-api/codex` base URL, and the desktop app keeps its own login.
+A pool with Codex accounts also intercepts `chatgpt.com`. Inside that tunnel only `/backend-api/codex/*` is pooled; every other request (workspace discovery, plugins, settings) is passed through to `chatgpt.com` with the client's own login, and the Codex Responses WebSocket is refused so the CLI falls back to pooled HTTPS — see [Codex accounts](accounts.md#through-the-mitm-proxy-no-codex-config-needed). `chatgpt.com` is where ChatGPT Desktop talks to as well. On a machine running that app, set `proxy.terminalOnly` to `true` to tunnel that host untouched: the terminal Codex CLI keeps reaching the pool through its explicit `/backend-api/codex` base URL, and the desktop app keeps its own login.
 
 ### Trust model
 

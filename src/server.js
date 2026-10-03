@@ -14,7 +14,7 @@ import { TopLevelFieldFinder, modelGlobMatches, parseRequestStream } from './mod
 import { conversationDigest, pinKeyFor } from './conversation.js';
 import { BodyWriter, truncationNote } from './request-log.js';
 import { upstreamFetch, upstreamPoolStatus } from './upstream-fetch.js';
-import { applyAuthHeaders, upstreamFor, rewritesBody, defaultHeadersTimeoutFor, providerForPath, providerOf, isSubscriptionAccount, canServeProvider, DEFAULT_PROVIDER, PROVIDERS } from './provider.js';
+import { applyAuthHeaders, upstreamFor, rewritesBody, defaultHeadersTimeoutFor, providerForPath, providerForHost, interceptHostsFor, providerOf, isSubscriptionAccount, canServeProvider, DEFAULT_PROVIDER, PROVIDERS } from './provider.js';
 import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
 import { isRoutingFailure, describeRouting } from './account-routing.js';
@@ -1177,6 +1177,65 @@ export function relayHttpForward(req, res, stripOverage = false) {
 // fleet; the whole prefix is the fix, not a growing allowlist of sub-paths.
 const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/'];
 
+/**
+ * The authority a request was addressed to, as the client wrote it: the
+ * `:authority` pseudo-header under HTTP/2 (the compat layer exposes it as
+ * `req.authority`, falling back to `host`), the Host header under HTTP/1.
+ * Under a terminated MITM tunnel that is the CONNECT target as the client sees
+ * it; on the base listener it is this proxy's own address.
+ * @param {any} req
+ * @returns {string|undefined}
+ */
+export function requestAuthority(req) {
+  return req?.authority || req?.headers?.host || req?.headers?.[':authority'];
+}
+
+/**
+ * The hostname inside an authority (`chatgpt.com:443`, `CHATGPT.COM.`), or null.
+ * @param {unknown} authority
+ */
+function hostOfAuthority(authority) {
+  if (typeof authority !== 'string' || !authority) return null;
+  // Lower-cased by the parser; a trailing dot is the same name, as in a CONNECT.
+  try { return new URL(`http://${authority}`).hostname.replace(/\.$/, '') || null; } catch { return null; }
+}
+
+/**
+ * Where a request that arrived on ANOTHER provider's intercepted host, but is
+ * not that provider's inference, is relayed with the client's own credential —
+ * or null when the request is ours to route.
+ *
+ * MITM terminates every intercepted host on one server, and the request path
+ * routes by its PATH alone (providerForPath): `/backend-api/codex/*` is Codex,
+ * everything else is Anthropic. That left every other request a Codex client
+ * makes on chatgpt.com — codex-cli 0.156's workspace discovery
+ * (`/backend-api/wham/accounts/check`), its plugin, MCP and settings calls —
+ * classified as Anthropic and sent to api.anthropic.com with a pooled Claude
+ * token, which answered 404; 0.156 refuses to start on that (#492). None of
+ * it is inference, and all of it belongs to the client's own ChatGPT login, so
+ * it goes to the host the client asked for, headers intact, the way
+ * `/v1/oauth/token` is relayed raw.
+ *
+ * The origin is the one that provider's accounts are reached at: the provider
+ * default (https://chatgpt.com) unless an account overrides `upstream`, in
+ * which case that gateway stands in for the host and gets the lot. Only a host
+ * this config intercepts qualifies — the rule hostMode applies to the CONNECT —
+ * and never the default provider's, whose traffic is routed as it always was.
+ *
+ * @param {{ authority: string|undefined, url: string|undefined, config: any, accounts?: any[] }} opts
+ * @returns {string|null}
+ */
+export function clientPassthroughOrigin({ authority, url, config, accounts = [] }) {
+  const host = hostOfAuthority(authority);
+  if (!host) return null;
+  const provider = providerForHost(host);
+  if (!provider || provider === DEFAULT_PROVIDER) return null;
+  if (!interceptHostsFor(config?.accounts || []).includes(host)) return null;
+  if (providerForPath(url || '/') === provider) return null;
+  const sample = accounts.find((a) => providerOf(a) === provider) || null;
+  return upstreamFor(sample || { provider }, null);
+}
+
 // Claude Code's session id is a UUID, but other clients tag sessions too, so
 // the shape is a conservative charset rather than the UUID grammar: wide enough
 // that a non-UUID client keeps its session tracking, tight enough that nothing
@@ -1342,6 +1401,14 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // Still ABOVE the TC_ACCT branch below, which does not touch req.url —
       // moving past it would turn an unknown TC_ACCT pin on an identity-plane
       // request into a 404 that it does not return today.
+      // A request on another provider's intercepted host that is not that
+      // provider's inference — a Codex client's workspace, plugin and settings
+      // calls on chatgpt.com — belongs to the client's own login there, not to
+      // either pool, and goes to that host as sent (#492). Before the identity
+      // plane below, which is Anthropic's.
+      const passthrough = clientPassthroughOrigin({ authority: requestAuthority(req), url: req.url, config, accounts: /** @type {any} */ (accountManager).accounts });
+      if (passthrough) { await relayStream(req, res, passthrough, sx, shouldStripOverageHeaders(config)); return; }
+
       const classifiedPath = classificationPath(req.url);
       if (CLIENT_CREDENTIAL_PATHS.some((p) => classifiedPath.startsWith(p))) { await relayStream(req, res, upstream, sx, shouldStripOverageHeaders(config)); return; }
 

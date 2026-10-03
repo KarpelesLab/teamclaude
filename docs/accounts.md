@@ -248,6 +248,18 @@ Two boundaries worth knowing:
   the proxy to read is not a neutral default.
 - `ab.chatgpt.com` is never intercepted. It is OpenAI's telemetry endpoint,
   carries no inference, and there is nothing there to rewrite.
+- On the intercepted `chatgpt.com`, only `/backend-api/codex/*` is pooled.
+  Everything else the CLI sends there — the workspace discovery codex-cli
+  0.156 makes before every turn (`/backend-api/wham/accounts/check`), its
+  plugin, MCP and settings calls — goes through to `chatgpt.com` with the
+  client's own login, untouched. Those calls are not inference and belong to
+  that login; they used to be classified as Anthropic traffic and answered 404
+  by `api.anthropic.com` ([#492](https://github.com/KarpelesLab/teamclaude/issues/492)).
+- The Codex **Responses WebSocket** is refused (`501`). A WebSocket is relayed
+  with the client's own headers, so a turn over it would run on the client's
+  login and book nothing against the pool. Refused, the CLI falls back to
+  HTTPS, where the pool serves it — the cost is its reconnect attempts before
+  it does.
 
 The base-URL route below still works and is the way to pool Codex without MITM.
 
