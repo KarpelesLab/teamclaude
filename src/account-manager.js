@@ -4512,7 +4512,17 @@ export class AccountManager {
     }
     // Same sticky fact the header path records; see _updateCodexQuota.
     if (usage.fiveHour) q.sessionWindowStated = true;
-    else if (usage.sevenDay) q.sessionWindowStated = false;
+    else if (usage.sevenDay) {
+      q.sessionWindowStated = false;
+      // The probe reads every limit at once, so its word that a plan has no
+      // session window is what clears a reading left from before a plan
+      // change, which would otherwise keep gating selection until its reset.
+      // The header path does not clear: one response's headers are weaker
+      // evidence of absence than the whole usage payload.
+      q.unified5h = null;
+      q.unified5hReset = null;
+      q.unified5hSeenAt = null;
+    }
     if (usage.planType) q.planType = safeLine(usage.planType, 64);
     // Stamped, because nothing else refreshes it: a payload that mentions no
     // credits leaves the last reading alone rather than blanking it, so the
