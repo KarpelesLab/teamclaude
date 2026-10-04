@@ -235,6 +235,8 @@ A [third-party backend account](accounts.md#third-party-backend-accounts) has no
 
 The reading is normalized to `{ label, text, utilization }`, with a `windows` map when the provider reports distinct windows. A provider that reports a 0-1 fraction gets a bar like any other bucket; one that reports money or credits shows its text. A provider that publishes nothing keeps reading `unknown` — nothing is invented.
 
+With `synthesizeQuotaHeaders: true` the probed 5-hour and weekly windows are also stated to the client as `anthropic-ratelimit-unified-*` headers, so Claude Code shows them in its own `rate_limits` like an Anthropic account's. A monthly window has no such header and is only on `GET /teamclaude/quota`. See [configuration](configuration.md).
+
 Provider support lives entirely in `src/backend-quota.js`, matched by the host of the account's `upstream`. Adding one is a single entry there (a path and a parse function, plus a header shape when the provider's monitor wants something other than a bearer, plus an optional balance hook); the prober, the quota field and the renderer never name a provider. Supported today:
 
 - **DeepSeek** — the account balance, as money.

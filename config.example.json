@@ -16,6 +16,7 @@
   "upstream": "https://api.anthropic.com",
   "switchThreshold": 0.98,
   "stripOverageHeaders": false,
+  "synthesizeQuotaHeaders": false,
   "distributeSessions": false,
   "advisorEligibility": "strict",
   "quotaProbeSeconds": 0,
