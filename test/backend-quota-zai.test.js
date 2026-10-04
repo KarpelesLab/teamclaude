@@ -45,6 +45,10 @@ test('both windows land in one reading: the bar is the fuller one, the text name
   assert.equal(r.label, 'Plan');
   assert.equal(r.text, '5h 12% (resets 2h10m) · week 37% (resets 3d4h)');
   assert.equal(r.utilization, 0.37);
+  assert.deepEqual(r.windows, {
+    fiveHour: { utilization: 0.12, resetAt: LIMITS.data.limits[0].nextResetTime },
+    weekly: { utilization: 0.37, resetAt: LIMITS.data.limits[1].nextResetTime },
+  });
   assert.ok(r.at > 0);
 });
 
@@ -64,6 +68,10 @@ test('a percentage past 100 or below 0 is clamped, and a missing reset drops onl
   const r = await fetchBackendQuota({ upstream: ZAI, credential: 'zk' }, { fetchImpl: okFetch(odd) });
   assert.equal(r.text, '5h 100% · week 0%');
   assert.equal(r.utilization, 1);
+  assert.deepEqual(r.windows, {
+    fiveHour: { utilization: 1, resetAt: null },
+    weekly: { utilization: 0, resetAt: null },
+  });
 });
 
 test('an HTTP failure is reported as such, never as a reading', async () => {

@@ -26,9 +26,14 @@ const RESPONSE_LIMIT = 64 * 1024;
 /**
  * A normalized reading. `text` is what the operator reads; `utilization` is set
  * only when a provider actually reports a 0-1 fraction, so a renderer can draw
- * a bar for it and fall back to text for everything else.
+ * a bar for it and fall back to text for everything else. `windows` carries the
+ * same utilization per machine-readable window when the provider reports
+ * distinct ones, so /teamclaude/quota can bucket it; a balance-only provider
+ * has none.
  *
- * @typedef {{ label: string, text: string, utilization: number|null, at: number }} BackendQuota
+ * @typedef {{ utilization: number, resetAt: number|null }} BackendQuotaWindow
+ * @typedef {{ fiveHour?: BackendQuotaWindow, weekly?: BackendQuotaWindow, monthly?: BackendQuotaWindow }} BackendQuotaWindows
+ * @typedef {{ label: string, text: string, utilization: number|null, at: number, windows?: BackendQuotaWindows }} BackendQuota
  */
 
 // Z.ai publishes the coding plan's windows at /api/monitor/usage/quota/limit:
@@ -63,7 +68,13 @@ const ZAI = {
       const until = w.resetAt ? formatUntil(w.resetAt - Date.now()) : '';
       return `${w.name} ${Math.round(w.used * 100)}%${until ? ` (resets ${until})` : ''}`;
     }).join(' · ');
-    return { label: 'Plan', text, utilization: Math.max(...windows.map(w => w.used)) };
+    /** @type {BackendQuotaWindows} */
+    const structured = {};
+    for (const w of windows) {
+      if (w.name === '5h') structured.fiveHour = { utilization: w.used, resetAt: w.resetAt };
+      else if (w.name === 'week') structured.weekly = { utilization: w.used, resetAt: w.resetAt };
+    }
+    return { label: 'Plan', text, utilization: Math.max(...windows.map(w => w.used)), windows: structured };
   },
 };
 
@@ -84,7 +95,7 @@ function formatUntil(/** @type {number} */ ms) {
  * @property {string} host  the upstream host this entry answers for (exact match)
  * @property {string} path  the quota endpoint, resolved against the upstream origin
  * @property {(credential: string) => Record<string, string>} [headers]  the auth header shape, when it is not `Authorization: Bearer`
- * @property {(body: any) => ({ label: string, text: string, utilization: number|null } | null)} parse  the normalized reading, or null for a reply it does not recognize
+ * @property {(body: any) => ({ label: string, text: string, utilization: number|null, windows?: BackendQuotaWindows } | null)} parse  the normalized reading, or null for a reply it does not recognize
  */
 
 /** @type {BackendQuotaProvider[]} */
