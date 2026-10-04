@@ -13,6 +13,8 @@
 // NanoGPT publishes its subscription windows and its own billing advice.
 // Z.ai publishes its coding plan's windows as used-percentages at a monitor
 // path of its own, with its own authentication quirk (see ZAI below).
+// Kimi reports windows as ratios that lag behind its own counters (see
+// kimiResolve); Moonshot's open platform answers with a balance alone.
 
 import { proxyFetch } from './upstream-fetch.js';
 import { safeLine } from './safe-text.js';
@@ -97,6 +99,23 @@ const zaiBalance = (/** @type {string} */ symbol, /** @type {string|undefined} *
     const amount = Number.isFinite(available) ? available : Number.isFinite(current) ? current : null;
     if (amount === null) return null;
     return { amount, text: moneyText(symbol, amount) };
+  },
+});
+
+// Moonshot Open Platform (pay-as-you-go, the kimi.com coding subscription is
+// a different keyspace): the balance is the whole reading. The currency
+// follows the region — .ai bills USD, .cn CNY — and a negative cash balance
+// is a deficit in collection, worth saying beside the number.
+const moonshot = (/** @type {string} */ symbol) => ({
+  path: '/v1/users/me/balance',
+  parse(/** @type {any} */ body) {
+    if (body?.status !== true || body?.code !== 0) return null;
+    const raw = body?.data?.available_balance;
+    const balance = raw === null || raw === undefined ? NaN : Number(raw);
+    if (!Number.isFinite(balance)) return null;
+    const cash = Number(body?.data?.cash_balance);
+    const deficit = Number.isFinite(cash) && cash < 0 ? ` · ${moneyText(symbol, Math.abs(cash))} in deficit` : '';
+    return { label: 'Balance', text: `${moneyText(symbol, balance)}${deficit}`, utilization: null };
   },
 });
 
@@ -301,6 +320,8 @@ const PROVIDERS = [
   // origin, so an upstream of https://api.kimi.com/coding resolves correctly.
   { host: 'api.kimi.com', ...KIMI },
   { host: 'api.kimi.ai', ...KIMI },
+  { host: 'api.moonshot.ai', ...moonshot('$') },
+  { host: 'api.moonshot.cn', ...moonshot('¥') },
 ];
 
 /**
