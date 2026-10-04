@@ -30,14 +30,15 @@ test('z.ai is found by host on both the international and mainland origins', () 
 });
 
 test('the monitor is called on the upstream origin with the raw key, not a bearer', async () => {
-  let seen = null;
+  const seen = [];
   await fetchBackendQuota({ upstream: ZAI, credential: 'zk' }, {
-    fetchImpl: async (url, opts) => { seen = { url, headers: opts.headers }; return okFetch(LIMITS)(); },
+    fetchImpl: async (url, opts) => { seen.push({ url: String(url), headers: opts.headers }); return okFetch(LIMITS)(); },
   });
-  assert.equal(seen.url, 'https://api.z.ai/api/monitor/usage/quota/limit');
-  assert.equal(seen.headers.Authorization, 'zk');
-  assert.equal(seen.headers['Accept-Language'], 'en-US,en');
-  assert.equal(seen.headers.Accept, 'application/json');
+  const monitor = seen.find(c => c.url.includes('quota/limit'));
+  assert.equal(monitor.url, 'https://api.z.ai/api/monitor/usage/quota/limit');
+  assert.equal(monitor.headers.Authorization, 'zk');
+  assert.equal(monitor.headers['Accept-Language'], 'en-US,en');
+  assert.equal(monitor.headers.Accept, 'application/json');
 });
 
 test('both windows land in one reading: the bar is the fuller one, the text names each with its reset', async () => {
@@ -77,6 +78,101 @@ test('a percentage past 100 or below 0 is clamped, and a missing reset drops onl
 test('an HTTP failure is reported as such, never as a reading', async () => {
   const r = await fetchBackendQuota({ upstream: ZAI, credential: 'zk' }, { fetchImpl: okFetch({}, 401) });
   assert.deepEqual(r, { error: 'HTTP 401' });
+});
+
+// The console's account report: undocumented, but it answers on both the
+// global and the mainland host (the mainland one on www., not open.). A
+// subscription account simply reads zero.
+const BALANCE = { success: true, data: { availableBalance: 5.5, balance: 5.5, rechargeAmount: 0, giveAmount: 0, totalSpendAmount: 0 } };
+const routedFetch = (quotaBody, balanceBody, seen = []) => async (url, opts) => {
+  if (String(url).includes('query-customer-account-report')) {
+    seen.push({ url: String(url), auth: opts?.headers?.Authorization });
+    return okFetch(balanceBody)();
+  }
+  return okFetch(quotaBody)();
+};
+
+test('a non-zero balance rides beside the plan windows, on the raw key', async () => {
+  const seen = [];
+  const r = await fetchBackendQuota({ upstream: ZAI, credential: 'zk' }, { fetchImpl: routedFetch(LIMITS, BALANCE, seen) });
+  assert.equal(r.text, '5h 12% (resets 2h10m) · week 37% (resets 3d4h) · balance $5.50');
+  assert.equal(r.utilization, 0.37);
+  assert.deepEqual(seen, [{ url: 'https://api.z.ai/api/biz/account/query-customer-account-report', auth: 'zk' }]);
+});
+
+test('a zero balance adds nothing to a plan reading', async () => {
+  const zero = { success: true, data: { availableBalance: 0, balance: 0 } };
+  const r = await fetchBackendQuota({ upstream: ZAI, credential: 'zk' }, { fetchImpl: routedFetch(LIMITS, zero) });
+  assert.equal(r.text, '5h 12% (resets 2h10m) · week 37% (resets 3d4h)');
+});
+
+test('a reply with no window falls back to a non-zero balance only', async () => {
+  const r = await fetchBackendQuota({ upstream: ZAI, credential: 'zk' }, { fetchImpl: routedFetch({ code: 401, message: 'no' }, BALANCE) });
+  assert.equal(r.label, 'Balance');
+  assert.equal(r.text, '$5.50');
+  assert.equal(r.utilization, null);
+  const zero = { success: true, data: { availableBalance: 0, balance: 0 } };
+  const r2 = await fetchBackendQuota({ upstream: ZAI, credential: 'zk' }, { fetchImpl: routedFetch({ code: 401, message: 'no' }, zero) });
+  assert.deepEqual(r2, { error: 'unrecognized response' }, 'a zero balance is what a healthy plan account reads — it would mask an outage');
+});
+
+test('a null availableBalance falls back to balance, not to zero', async () => {
+  const body = { success: true, data: { availableBalance: null, balance: 3.25 } };
+  const r = await fetchBackendQuota({ upstream: ZAI, credential: 'zk' }, { fetchImpl: routedFetch({ code: 401, message: 'no' }, body) });
+  assert.equal(r.text, '$3.25');
+});
+
+test('a negative amount leads with the minus, not the symbol', async () => {
+  const body = { success: true, data: { availableBalance: -3, balance: -3 } };
+  const r = await fetchBackendQuota({ upstream: ZAI, credential: 'zk' }, { fetchImpl: routedFetch({ code: 401, message: 'no' }, body) });
+  assert.equal(r.text, '-$3.00');
+});
+
+test('the mainland plan reads its balance from the console host, in yuan', async () => {
+  const seen = [];
+  const r = await fetchBackendQuota({ upstream: CN, credential: 'zk' }, { fetchImpl: routedFetch({ code: 401, message: 'no' }, BALANCE, seen) });
+  assert.equal(r.text, '¥5.50');
+  assert.deepEqual(seen, [{ url: 'https://www.bigmodel.cn/api/biz/account/query-customer-account-report', auth: 'zk' }]);
+});
+
+test('a failed balance lookup never breaks the plan reading', async () => {
+  const failing = async (url) => {
+    if (String(url).includes('query-customer-account-report')) throw new Error('ECONNRESET');
+    return okFetch(LIMITS)();
+  };
+  const r = await fetchBackendQuota({ upstream: ZAI, credential: 'zk' }, { fetchImpl: failing });
+  assert.equal(r.text, '5h 12% (resets 2h10m) · week 37% (resets 3d4h)');
+  assert.equal(r.utilization, 0.37);
+});
+
+test('a balance reply that is not ok is ignored, whatever the body says', async () => {
+  const fiveHundred = async (url) => String(url).includes('query-customer-account-report')
+    ? okFetch({ success: true, data: { availableBalance: 9 } }, 500)()
+    : okFetch(LIMITS)();
+  const r = await fetchBackendQuota({ upstream: ZAI, credential: 'zk' }, { fetchImpl: fiveHundred });
+  assert.equal(r.text, '5h 12% (resets 2h10m) · week 37% (resets 3d4h)');
+});
+
+test('a negative balance rides beside the plan windows too', async () => {
+  const debt = { success: true, data: { availableBalance: -3, balance: -3 } };
+  const r = await fetchBackendQuota({ upstream: ZAI, credential: 'zk' }, { fetchImpl: routedFetch(LIMITS, debt) });
+  assert.equal(r.text, '5h 12% (resets 2h10m) · week 37% (resets 3d4h) · balance -$3.00');
+});
+
+test('an HTTP failure on the monitor is an error, whatever the balance says', async () => {
+  // A stored plan reading must survive a monitor outage; a balance — even a
+  // non-zero one — says nothing about whether the plan windows moved.
+  const notFound = async (url) => String(url).includes('query-customer-account-report')
+    ? okFetch(BALANCE)()
+    : okFetch({}, 404)();
+  const r = await fetchBackendQuota({ upstream: ZAI, credential: 'zk' }, { fetchImpl: notFound });
+  assert.deepEqual(r, { error: 'HTTP 404' });
+  const zero = { success: true, data: { availableBalance: 0, balance: 0 } };
+  const fiveHundred = async (url) => String(url).includes('query-customer-account-report')
+    ? okFetch(zero)()
+    : okFetch({}, 500)();
+  const r2 = await fetchBackendQuota({ upstream: ZAI, credential: 'zk' }, { fetchImpl: fiveHundred });
+  assert.deepEqual(r2, { error: 'HTTP 500' });
 });
 
 test('DeepSeek still authenticates with a bearer — the header override is per provider', async () => {

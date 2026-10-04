@@ -78,6 +78,28 @@ const ZAI = {
   },
 };
 
+// `-$3.00`, not `$-3.00` — the minus leads the symbol.
+const moneyText = (/** @type {string} */ symbol, /** @type {number} */ amount) =>
+  amount < 0 ? `-${symbol}${Math.abs(amount).toFixed(2)}` : `${symbol}${amount.toFixed(2)}`;
+
+// The console's account report: undocumented, but it answers on both the
+// global and the mainland host — the mainland one on www.bigmodel.cn, which
+// open.bigmodel.cn does not serve. A subscription account simply reads zero.
+// `availableBalance` wins over `balance`, with an explicit null check first:
+// Number(null) is 0 and would silently read as an empty account.
+const zaiBalance = (/** @type {string} */ symbol, /** @type {string|undefined} */ origin = undefined) => ({
+  url: (/** @type {string} */ upstream) => new URL('/api/biz/account/query-customer-account-report', origin ?? upstream).toString(),
+  parse(/** @type {any} */ body) {
+    if (body?.success !== true) return null;
+    const data = body?.data && typeof body.data === 'object' ? body.data : {};
+    const available = data.availableBalance === null || data.availableBalance === undefined ? NaN : Number(data.availableBalance);
+    const current = data.balance === null || data.balance === undefined ? NaN : Number(data.balance);
+    const amount = Number.isFinite(available) ? available : Number.isFinite(current) ? current : null;
+    if (amount === null) return null;
+    return { amount, text: moneyText(symbol, amount) };
+  },
+});
+
 // `2h10m`, `3d4h`, `now` — the shape the rest of the status screen uses for a
 // reset countdown, without importing the TUI to get it.
 function formatUntil(/** @type {number} */ ms) {
@@ -189,6 +211,7 @@ const KIMI = {
  * @property {string} path  the quota endpoint, resolved against the upstream origin
  * @property {(credential: string) => Record<string, string>} [headers]  the auth header shape, when it is not `Authorization: Bearer`
  * @property {(body: any) => ({ label: string, text: string, utilization: number|null, windows?: BackendQuotaWindows } | null)} parse  the normalized reading, or null for a reply it does not recognize
+ * @property {{ url: (upstream: string) => string, parse: (body: any) => ({ amount: number, text: string } | null) }} [balance]  a pay-as-you-go balance endpoint, fetched best-effort after the quota one
  */
 
 /** @type {BackendQuotaProvider[]} */
@@ -210,7 +233,7 @@ const PROVIDERS = [
       // is stripped and bounded like every other externally sourced string.
       const currency = safeLine(String(info.currency || ''), 8).toUpperCase();
       const symbol = currency === 'USD' ? '$' : currency === 'CNY' ? '¥' : '';
-      const text = symbol ? `${symbol}${amount.toFixed(2)}` : `${amount.toFixed(2)} ${currency}`;
+      const text = symbol ? moneyText(symbol, amount) : `${moneyText('', amount)} ${currency}`;
       // `is_available: false` means the account cannot spend, whatever the
       // number says — worth showing, since the balance alone would look fine.
       return {
@@ -269,8 +292,10 @@ const PROVIDERS = [
   // monitor endpoint, same reply, same quirk: the monitor wants the raw key
   // in `Authorization`, not `Bearer <key>` — the Anthropic-shaped chat
   // endpoint on the same host accepts either, the monitor only the former.
-  { host: 'api.z.ai', ...ZAI },
-  { host: 'open.bigmodel.cn', ...ZAI },
+  // The balance report sits on the console path; for the mainland plan that
+  // is www.bigmodel.cn, not the API host.
+  { host: 'api.z.ai', ...ZAI, balance: zaiBalance('$') },
+  { host: 'open.bigmodel.cn', ...ZAI, balance: zaiBalance('¥', 'https://www.bigmodel.cn') },
   // Kimi for Coding (Moonshot), China and international hosts: same usages
   // endpoint, default bearer. The endpoint rides under /coding on the same
   // origin, so an upstream of https://api.kimi.com/coding resolves correctly.
@@ -314,11 +339,15 @@ export async function fetchBackendQuota(account, { fetchImpl = proxyFetch, timeo
 
   const url = new URL(provider.path, account.upstream).toString();
   const signal = AbortSignal.timeout(timeoutMs);
+  const headers = {
+    Accept: 'application/json',
+    // A provider that names its own header shape (z.ai's monitor wants the raw
+    // key) overrides the bearer default every other backend takes.
+    ...(provider.headers ? provider.headers(account.credential) : { Authorization: `Bearer ${account.credential}` }),
+  };
   try {
     const res = await fetchImpl(url, {
-      // A provider that names its own header shape (z.ai's monitor wants the raw
-      // key) overrides the bearer default every other backend takes.
-      headers: { Accept: 'application/json', ...(provider.headers ? provider.headers(account.credential) : { Authorization: `Bearer ${account.credential}` }) },
+      headers,
       signal,
       // The account's own egress proxy, when it has one (account-routing.js).
       routing: account.routing ?? null,
@@ -326,7 +355,27 @@ export async function fetchBackendQuota(account, { fetchImpl = proxyFetch, timeo
     if (!res.ok) return { error: `HTTP ${res.status}` };
     const body = await readJsonBounded(res, RESPONSE_LIMIT);
     if (body === undefined) return { error: 'response too large' };
-    const reading = provider.parse(body);
+    let reading = provider.parse(body);
+    if (provider.balance) {
+      // Best-effort: a failing balance service must not discard the quota
+      // reading, and its own short deadline bounds the delay it adds. Only a
+      // non-zero balance may stand in for a plan reply without windows: a
+      // zero is what a healthy subscription account reads, and '$0.00' would
+      // mask the monitor having said nothing we understand.
+      try {
+        const bres = await fetchImpl(provider.balance.url(account.upstream), {
+          headers,
+          signal: AbortSignal.timeout(Math.min(timeoutMs, 5000)),
+          routing: account.routing ?? null,
+        });
+        const bbody = bres.ok ? await readJsonBounded(bres, RESPONSE_LIMIT) : undefined;
+        const balance = bbody === undefined ? null : provider.balance.parse(bbody);
+        if (balance && balance.amount !== 0) {
+          if (reading) reading = { ...reading, text: `${reading.text} · balance ${balance.text}` };
+          else reading = { label: 'Balance', text: balance.text, utilization: null };
+        }
+      } catch { /* the quota reading stands on its own */ }
+    }
     return reading ? { ...reading, at: Date.now() } : { error: 'unrecognized response' };
   } catch (/** @type {any} */ err) {
     return { error: err?.message || String(err) };
