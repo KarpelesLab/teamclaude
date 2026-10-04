@@ -497,7 +497,7 @@ async function serverCommand() {
     }
     config.messageThreads = fleetThreads;
     // Read by the TUI on every frame, so a hand edit lands on the next reload.
-    config.quotaBarPercent = diskConfig.quotaBarPercent !== false;
+    config.quotaBarPercent = diskConfig.quotaBarPercent === true;
     config.accountSort = ACCOUNT_SORTS.includes(diskConfig.accountSort) ? diskConfig.accountSort : 'arranged';
     // Read by `run`/`env` from disk, but the TUI settings screen shows it live.
     config.defaultClientMode = diskConfig.defaultClientMode === 'base-url' ? 'base-url' : 'mitm';
