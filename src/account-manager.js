@@ -195,7 +195,9 @@ function emptyQuota() {
     unified7dFableSeenAt: null,
     unifiedStatus: null,        // allowed | allowed_warning | rejected
     // Normalized reading from a third-party backend (see backend-quota.js).
-    // { label, text, utilization, at } — nothing here knows which provider.
+    // { label, text, utilization, at, windows? } — nothing here knows which
+    // provider. windows feeds the fiveHour/weeklyShared/monthly buckets of
+    // /teamclaude/quota (quota-summary.js).
     backend: null,
     unifiedStatusSeenAt: null,  // ms timestamp of the response that reported it
     // Every model-scoped weekly bucket the usage endpoint named, keyed by its
