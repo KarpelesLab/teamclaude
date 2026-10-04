@@ -20,6 +20,7 @@
 
 import { spawn } from 'node:child_process';
 import { encodePinComponent } from './claude-env.js';
+import { providerOf } from './provider.js';
 import {
   ROLLING_NEAR_RESET_TOLERANCE_MS,
   ROLLING_POST_RESET_BUFFER_MS,
@@ -27,6 +28,13 @@ import {
 } from './warmup-schedule.js';
 
 const SCHEDULE_TIMER_GRACE_MS = 60_000;
+
+// The warm-up is a `claude` run, so only an Anthropic subscription can take
+// it: a third-party backend has no 5-hour window of Anthropic's, and the server
+// refuses a Codex account outright.
+export function warmApplicable(/** @type {any} */ account) {
+  return account.type === 'oauth' && !account.upstream && providerOf(account) === 'anthropic';
+}
 
 export class Warmer {
   /**
@@ -182,16 +190,14 @@ export class Warmer {
   /**
    * True when `account` is a healthy, idle Anthropic OAuth account whose 5h
    * window is NOT already running. We skip:
-   *  - non-OAuth and third-party-backend accounts (`upstream` set) — the 5h
-   *    concept is Anthropic-specific;
+   *  - non-OAuth, third-party-backend and Codex accounts (see warmApplicable);
    *  - disabled / errored / exhausted / throttled accounts — warming them is
    *    pointless or would just 429;
    *  - accounts with a live 5h window — already warm, so warming again only burns
    *    quota for nothing.
    */
   _isWarmCandidate(account) {
-    if (account.type !== 'oauth' || !account.credential) return false;
-    if (account.upstream) return false;
+    if (!warmApplicable(account) || !account.credential) return false;
     if (account.disabled) return false;
     if (account.status === 'error' || account.status === 'exhausted' || account.status === 'throttled') return false;
     return true;
@@ -390,7 +396,7 @@ export class Warmer {
       nextRunAt: iso(this.nextRunAt),
       accounts: this.am.accounts.map(account => {
         const status = this.accountStatus.get(account.name);
-        const applicable = account.type === 'oauth' && !account.upstream;
+        const applicable = warmApplicable(account);
         return {
           name: account.name,
           status: applicable ? (status?.status || 'never') : 'not-applicable',

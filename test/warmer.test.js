@@ -45,6 +45,21 @@ test('warms only healthy, idle Anthropic OAuth accounts with no live 5h window',
   assert.ok(spawn.calls[0].env.ANTHROPIC_BASE_URL.endsWith('/tc-acct/idle'), spawn.calls[0].env.ANTHROPIC_BASE_URL);
 });
 
+// The warm-up is a `claude` run, which the server refuses on a Codex account,
+// and a Codex plan may have no 5-hour window to start at all: with no reset
+// ever recorded it would be a target on every cycle, forever.
+test('a Codex subscription is never a warm target', async () => {
+  const am = new AccountManager([
+    oauth('codex', { provider: 'codex', accountId: 'acct-1' }),
+  ], 0.98);
+  const spawn = fakeSpawner();
+  const warmer = makeWarmer(am, spawn);
+  await warmer.warmAll();
+
+  assert.equal(spawn.calls.length, 0);
+  assert.equal(warmer.getStatus().accounts[0].status, 'not-applicable');
+});
+
 test('an expired 5h window is a warm target again (keeps the timer going)', async () => {
   const am = new AccountManager([oauth('a')], 0.98);
   am.accounts[0].quota.unified5hReset = Date.now() - 1000; // window already reset

@@ -31,7 +31,7 @@ import * as alias from './alias.js';
 import { ensureCerts, mitmHosts } from './mitm.js';
 import { Prober } from './prober.js';
 import { ResetCreditRedeemer } from './codex-reset-credits.js';
-import { Warmer } from './warmer.js';
+import { Warmer, warmApplicable } from './warmer.js';
 import { formatWarmupScheduleConfirmation, resolveWarmupConfig } from './warmup-schedule.js';
 import { TUI, ACCOUNT_SORTS } from './tui.js';
 import { SessionTitles } from './session-titles.js';
@@ -750,7 +750,7 @@ async function serverCommand() {
       running: false,
       accounts: accountManager.accounts.map(account => ({
         name: account.name,
-        status: (account.type === 'oauth' && !account.upstream) ? 'never' : 'not-applicable',
+        status: warmApplicable(account) ? 'never' : 'not-applicable',
         lastWarmedAt: null,
         startedAt: null,
         durationMs: null,
