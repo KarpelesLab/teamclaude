@@ -176,6 +176,12 @@ Only the export lines go to stdout (so `eval` is safe); a short summary and any 
 
 **Using an agent multiplexer or a tool that spawns `claude` itself?** Export this environment in the process that launches those `claude` instances — e.g. `eval "$(teamclaude env)"` in the shell you start the multiplexer from. Every spawned `claude` then gets the same routing (and MITM interception of hardcoded endpoints) without going through `teamclaude run`. The trade-off: `run`'s proxy-up/down guard only applies when you launch via `run`, so start the server before the multiplexer.
 
+### Keep other Claude sessions direct on macOS
+
+Set TeamClaude's proxy variables only in launchers that should use TeamClaude, such as a project-specific agent process. Do not set `HTTPS_PROXY`, `HTTP_PROXY`, and `NODE_EXTRA_CA_CERTS` for the entire login session with `launchctl setenv`. Claude Desktop and terminal sessions launched from that login session can inherit the proxy. Desktop's bundled Claude Code process may then reach TeamClaude without trusting its local CA and fail with `UNABLE_TO_VERIFY_LEAF_SIGNATURE`.
+
+If you already set those variables globally, disable the LaunchAgent or login script that sets them and run `launchctl unsetenv` for `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY`, and `NODE_EXTRA_CA_CERTS` (plus any lowercase proxy variables you set). Quit and reopen affected apps and terminal windows: existing processes keep the environment they had at launch. Use `teamclaude run` or `teamclaude env` in each intended launcher instead. Sharing Claude Code's session directory does not by itself route another session through TeamClaude.
+
 ### Routing plain `claude` automatically
 
 So you don't have to type `teamclaude run` every time, add a shell alias that sends plain `claude` through the proxy:
