@@ -151,3 +151,87 @@ test('quota summary does not report an expired cached window', () => {
   assert.equal(summary.accounts[0].buckets.fiveHour, null);
   assert.equal(summary.aggregate.fiveHour, null);
 });
+
+test('backend windows fill the buckets no unified field covers', () => {
+  const am = new AccountManager([{ name: 'kimi', type: 'apikey', apiKey: 'sk-test' }], 0.98);
+  const fiveReset = Date.now() + 3_600_000;
+  const weekReset = Date.now() + 3 * 86_400_000;
+  const monthReset = Date.now() + 22 * 86_400_000;
+  Object.assign(am.accounts[0].quota, {
+    backend: {
+      label: 'Plan', text: '5h 52% · week 12%', utilization: 0.52, at: Date.now(),
+      windows: {
+        fiveHour: { utilization: 0.52, resetAt: fiveReset },
+        weekly: { utilization: 0.12, resetAt: weekReset },
+        monthly: { utilization: 0.05, resetAt: monthReset },
+      },
+    },
+  });
+
+  const summary = am.getQuotaSummary();
+  const buckets = summary.accounts[0].buckets;
+  assert.deepEqual(buckets.fiveHour, { utilization: 0.52, remaining: 0.48, resetAt: fiveReset, source: 'backendFiveHour' });
+  assert.deepEqual(buckets.weeklyShared, { utilization: 0.12, remaining: 0.88, resetAt: weekReset, source: 'backendWeekly' });
+  assert.deepEqual(buckets.monthly, { utilization: 0.05, remaining: 0.95, resetAt: monthReset, source: 'backendMonthly' });
+  assert.equal(buckets.weeklySonnet, null, 'a backend account has no family split');
+  assert.equal(summary.aggregate.monthly, undefined, 'backend windows never join the aggregates');
+});
+
+test('a backend bucket never moves the aggregate, even with a tier configured', () => {
+  const am = new AccountManager([{ name: 'kimi', type: 'apikey', apiKey: 'sk-test', rateLimitTier: 'default_claude_ai' }], 0.98);
+  Object.assign(am.accounts[0].quota, {
+    backend: {
+      label: 'Plan', text: '5h 52%', utilization: 0.52, at: Date.now(),
+      windows: { fiveHour: { utilization: 0.52, resetAt: Date.now() + 3_600_000 } },
+    },
+  });
+
+  const summary = am.getQuotaSummary();
+  assert.equal(summary.accounts[0].tier.weight, 1, 'the configured tier is read');
+  assert.equal(summary.aggregate.fiveHour, null, 'but a backend source is not aggregated');
+});
+
+test('a unified reading outranks a backend window', () => {
+  const am = new AccountManager([oauth('pro', { rateLimitTier: 'default_claude_ai' })], 0.98);
+  const unifiedReset = Date.now() + 3_600_000;
+  const backendReset = Date.now() + 7_200_000;
+  Object.assign(am.accounts[0].quota, {
+    unified5h: 0.9, unified5hReset: unifiedReset,
+    backend: { label: 'Plan', text: '5h 52%', utilization: 0.52, at: Date.now(), windows: { fiveHour: { utilization: 0.52, resetAt: backendReset } } },
+  });
+
+  const summary = am.getQuotaSummary();
+
+  assert.deepEqual(summary.accounts[0].buckets.fiveHour, {
+    utilization: 0.9, remaining: 0.1, resetAt: unifiedReset, source: 'unified5h',
+  });
+});
+
+test('an expired backend window is not reported', () => {
+  const am = new AccountManager([{ name: 'kimi', type: 'apikey', apiKey: 'sk-test' }], 0.98);
+  Object.assign(am.accounts[0].quota, {
+    backend: {
+      label: 'Plan', text: '5h 52% · week 12%', utilization: 0.52, at: Date.now(),
+      windows: {
+        fiveHour: { utilization: 0.52, resetAt: Date.now() - 1 },
+        weekly: { utilization: 0.12, resetAt: Date.now() + 86_400_000 },
+      },
+    },
+  });
+
+  const summary = am.getQuotaSummary();
+  assert.equal(summary.accounts[0].buckets.fiveHour, null);
+  assert.equal(summary.accounts[0].buckets.weeklyShared.utilization, 0.12);
+});
+
+test('a balance-only backend reading adds no buckets', () => {
+  const am = new AccountManager([{ name: 'deepseek', type: 'apikey', apiKey: 'sk-test' }], 0.98);
+  Object.assign(am.accounts[0].quota, {
+    backend: { label: 'Balance', text: '$25.81', utilization: null, at: Date.now() },
+  });
+
+  const summary = am.getQuotaSummary();
+  const buckets = summary.accounts[0].buckets;
+  assert.equal(buckets.fiveHour, null);
+  assert.equal(buckets.monthly, undefined, 'a monthly key appears only with a monthly window');
+});

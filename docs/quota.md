@@ -10,7 +10,7 @@ Observed quota is persisted to `teamclaude.state.json` next to the config, so ro
 
 ## Fleet quota endpoint
 
-`GET /teamclaude/quota` returns the quota data intended for lightweight consumers such as a Claude Code status line. It includes every account's observed limits plus tier-weighted fleet aggregates for the shared 5-hour window, shared weekly window, Sonnet weekly window, and Fable weekly window. Sonnet and Fable fall back to the shared weekly bucket on accounts where Anthropic does not report a dedicated bucket. Its top-level `warmup` object reports whether keep-warm is off, interval-based, scheduled for a daily reset target, or running on an anchored five-hour cadence. Scheduled modes include the configured timezone, missed-run policy, and next warm-up/reset timestamps; rolling mode also includes `anchorResetAt`, `cadenceSeconds`, `nearResetToleranceSeconds`, and `postResetBufferSeconds`.
+`GET /teamclaude/quota` returns the quota data intended for lightweight consumers such as a Claude Code status line. It includes every account's observed limits plus tier-weighted fleet aggregates for the shared 5-hour window, shared weekly window, Sonnet weekly window, and Fable weekly window. Sonnet and Fable fall back to the shared weekly bucket on accounts where Anthropic does not report a dedicated bucket. Windows reported by a third-party backend (see below) fill the `fiveHour`, `weeklyShared` and `monthly` buckets with a `backend*` source on accounts that have no Anthropic readings of their own; `monthly` exists only for such backends. Backend windows join only the per-account buckets: they are excluded from the aggregates by source, whatever tier the account claims. Its top-level `warmup` object reports whether keep-warm is off, interval-based, scheduled for a daily reset target, or running on an anchored five-hour cadence. Scheduled modes include the configured timezone, missed-run policy, and next warm-up/reset timestamps; rolling mode also includes `anchorResetAt`, `cadenceSeconds`, `nearResetToleranceSeconds`, and `postResetBufferSeconds`.
 
 Subscription capacity is weighted relative to Claude Pro: Pro and Team Standard are `1`, Max 5x and Team tier 1 are `5`, and Max 20x and Team tier 2 are `20`. TeamClaude reads the organization and seat tier from the OAuth profile. An unrecognized tier remains visible under `accounts` and `unknownTiers` but is excluded from the aggregate instead of being assigned a guessed weight. API-key token and request limits remain per-account because their units cannot be combined with subscription utilization.
 
@@ -62,7 +62,7 @@ teamclaude warmup off                                      # disable either mode
 teamclaude warmup                                          # show current setting
 ```
 
-> ⚠️ **This spends a little quota — unlike the passive quota probe.** The 5h timer can't be started by a read-only call, so keep-warm sends a real (minimal) message: for each eligible idle account it spawns a one-shot `claude -p --bare --model haiku --output-format text "hi"` pointed at this proxy, pinned to that account. It only warms accounts whose 5h window is **not already running**, skips disabled/throttled/errored and third-party-backend accounts, and uses the cheapest model — but it does consume a few tokens and a slice of the 5h/weekly buckets per account per window. Requires the `claude` CLI on `PATH`. Minimum interval 60s; changes apply live. Status shows under `warm` in `teamclaude status --json`.
+> ⚠️ **This spends a little quota — unlike the passive quota probe.** The 5h timer can't be started by a read-only call, so keep-warm sends a real (minimal) message: for each eligible idle account it spawns a one-shot `claude -p --bare --model haiku --output-format text "hi"` pointed at this proxy, pinned to that account. It only warms accounts whose 5h window is **not already running**, skips disabled/throttled/errored, third-party-backend and Codex accounts, and uses the cheapest model — but it does consume a few tokens and a slice of the 5h/weekly buckets per account per window. Requires the `claude` CLI on `PATH`. Minimum interval 60s; changes apply live. Status shows under `warm` in `teamclaude status --json`.
 
 Reset mode stores the target wall time and IANA timezone in the config, then subtracts Anthropic's fixed five-hour window to find each warm-up. It recalculates the next calendar occurrence after startup, config reload, and every run, so daylight-saving changes do not drift the schedule. It follows cron semantics: if TeamClaude was stopped at the scheduled time, that run is skipped and the server waits for the next future occurrence. The CLI confirmation prints the resolved local time, UTC time, timezone offset, and next occurrence.
 
@@ -235,9 +235,9 @@ A [third-party backend account](accounts.md#third-party-backend-accounts) has no
   Probe    ok 2m ago, 210ms
 ```
 
-The reading is normalized to `{ label, text, utilization }`. A provider that reports a 0-1 fraction gets a bar like any other bucket; one that reports money or credits shows its text. A provider that publishes nothing keeps reading `unknown` — nothing is invented.
+The reading is normalized to `{ label, text, utilization }`, with a `windows` map when the provider reports distinct windows. A provider that reports a 0-1 fraction gets a bar like any other bucket; one that reports money or credits shows its text. A provider that publishes nothing keeps reading `unknown` — nothing is invented.
 
-Provider support lives entirely in `src/backend-quota.js`, matched by the host of the account's `upstream`. Adding one is a single entry there (a path and a parse function, plus a header shape when the provider's monitor wants something other than a bearer); the prober, the quota field and the renderer never name a provider. Supported today:
+Provider support lives entirely in `src/backend-quota.js`, matched by the host of the account's `upstream`. Adding one is a single entry there (a path and a parse function, plus a header shape when the provider's monitor wants something other than a bearer, plus an optional balance hook); the prober, the quota field and the renderer never name a provider. Supported today:
 
 - **DeepSeek** — the account balance, as money.
 - **NanoGPT** (`api.nano-gpt.com`) — the subscription's daily and weekly token windows in one reading: the bar is the fuller of the two, the text names each with its reset, and NanoGPT's own billing advice is appended when it is not the ordinary case:
@@ -249,12 +249,14 @@ Provider support lives entirely in `src/backend-quota.js`, matched by the host o
   ```
 
   `billing balance` means the subscription window is spent and the gateway will serve the next request from the pay-as-you-go balance instead of refusing it — the one line to watch on a metered plan. `balance not allowed` means your NanoGPT spend policy forbids that and requests will fail instead.
-- **Z.ai GLM Coding Plan** (`api.z.ai`, and `open.bigmodel.cn` for the mainland plan) — the plan's two token windows as used-percentages, in one reading: the bar is the fuller of the two, the text names each with its reset:
+- **Z.ai GLM Coding Plan** (`api.z.ai`, and `open.bigmodel.cn` for the mainland plan) — the plan's two token windows as used-percentages, in one reading: the bar is the fuller of the two, the text names each with its reset. A pay-as-you-go balance, when the account carries one, is appended to the text; when the plan reports no usable windows, a non-zero balance is the reading instead. A zero balance never stands in for the windows: that is what a healthy subscription account reads, and it would mask a monitor outage. For the mainland plan the balance report lives on the console host `www.bigmodel.cn`, so the account's key goes there rather than to the API host.
 
   ```
     z.ai (oauth, prio 100) active
     Plan     [██░░░░░░░░░░░░░░░░] 12% · 5h 12% (resets 2h10m) · week 37% (resets 3d4h)
   ```
+- **Kimi for Coding** (`api.kimi.com`, `api.kimi.ai`) — whichever of the 5-hour, weekly and monthly windows the plan reports, in one reading. Plans differ here (newer ones drop the weekly window for a monthly one), so any of the three may be absent, and an absent one is never filled in from Kimi's legacy counters. Kimi's ratio pools lag behind an active session and can read zero while the legacy counters move; a zero ratio beside a moved counter with the same reset is treated as a placeholder and the counter wins.
+- **Moonshot Open Platform** (`api.moonshot.ai`, `api.moonshot.cn`) — the pay-as-you-go balance, as money in the region's currency.
 
 ## Hold on exhaustion
 

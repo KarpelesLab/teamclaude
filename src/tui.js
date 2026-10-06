@@ -520,7 +520,8 @@ function barColor(ratio, resetTs, windowMs, threshold) {
  * burn rate instead of raw fill. threshold is the routing switch threshold, at
  * or above which the bar goes red regardless of pace. showPct false drops the
  * percentage wherever a countdown can stand in its place (config
- * `quotaBarPercent`); with no countdown the percentage is the label either way.
+ * `quotaBarPercent`, off unless set); with no countdown the percentage is the
+ * label either way.
  */
 export function bar(ratio, w = 10, resetTs, windowMs, threshold, showPct = true) {
   const rst = formatReset(resetTs);
@@ -1035,7 +1036,7 @@ export class TUI {
       id: 'quotaBarPercent',
       label: 'Bar percentage',
       hint: '←→ toggle',
-      value: () => (this.config.quotaBarPercent !== false ? green('on') : gray('off')),
+      value: () => (this.config.quotaBarPercent === true ? green('on') : gray('off')),
       left: () => this._toggleQuotaBarPercent(),
       right: () => this._toggleQuotaBarPercent(),
       enter: () => this._toggleQuotaBarPercent(),
@@ -1737,10 +1738,11 @@ export class TUI {
   }
 
   async _toggleQuotaBarPercent() {
-    // Absent means on, so the first toggle from a config that predates the key
-    // has to write `false` — hence the comparison rather than a negation.
+    // Absent means off (it is opt-in), so the first toggle from a config that
+    // predates the key has to write `true` — hence the comparison rather than a
+    // negation.
     const prev = this.config.quotaBarPercent;
-    const on = prev === false;
+    const on = prev !== true;
     this.config.quotaBarPercent = on;
     if (!await this._saveSetting('bar percentage', () => { this.config.quotaBarPercent = prev; })) return;
     this._addLog(`Quota bar percentage: ${on ? 'on' : 'off'}`);
@@ -2690,7 +2692,7 @@ export class TUI {
 
     // Keep the optional chaining: _renderAcct is called on instances built
     // without a config, and it read none before this line existed.
-    const pctInBar = this.config?.quotaBarPercent !== false;
+    const pctInBar = this.config?.quotaBarPercent === true;
 
     let line = ` ${sel}${cur} ${startSlot}${name} ${type}${status} ${l1} ${bar(r1, bw1, t1, w1, th1, pctInBar)}`;
     if (showBoth) {

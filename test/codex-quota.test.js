@@ -167,3 +167,39 @@ test('the plan type is surfaced when present', () => {
   assert.equal(parseCodexPlanType(LIVE), 'pro');
   assert.equal(parseCodexPlanType({}), null);
 });
+
+test('a probe with no session window clears a stale session reading; headers never do', () => {
+  const codex = () => new AccountManager(
+    [{ name: 'c', type: 'oauth', provider: 'codex', accountId: 'acct-c', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 }],
+    0.98,
+  );
+  const sessionReset = Date.now() + 3600_000;
+  const seenAt = Date.now() - 60_000;
+  const stale = { unified5h: 0.99, unified5hReset: sessionReset, unified5hSeenAt: seenAt, sessionWindowStated: true };
+  const week = { utilization: 0.1, resetAt: Date.now() + 86_400_000 };
+
+  const weeklyOnlyProbe = codex();
+  Object.assign(weeklyOnlyProbe.accounts[0].quota, stale);
+  weeklyOnlyProbe.applyCodexUsageData(0, { fiveHour: null, sevenDay: week });
+  assert.equal(weeklyOnlyProbe.accounts[0].quota.unified5h, null);
+  assert.equal(weeklyOnlyProbe.accounts[0].quota.unified5hReset, null);
+  assert.equal(weeklyOnlyProbe.accounts[0].quota.unified5hSeenAt, null, 'no reading, no age');
+
+  const bothProbe = codex();
+  Object.assign(bothProbe.accounts[0].quota, stale);
+  const freshReset = Date.now() + 7200_000;
+  bothProbe.applyCodexUsageData(0, { fiveHour: { utilization: 0.4, resetAt: freshReset }, sevenDay: week });
+  assert.equal(bothProbe.accounts[0].quota.unified5h, 0.4, 'a probe stating the window keeps it');
+  assert.equal(bothProbe.accounts[0].quota.unified5hReset, freshReset);
+
+  const weeklyOnlyHeaders = codex();
+  Object.assign(weeklyOnlyHeaders.accounts[0].quota, stale);
+  weeklyOnlyHeaders.updateQuota(0, {
+    'x-codex-primary-used-percent': '10',
+    'x-codex-primary-window-minutes': '10080',
+    'x-codex-primary-reset-at': String(Math.floor(Date.now() / 1000) + 86400),
+  });
+  assert.equal(weeklyOnlyHeaders.accounts[0].quota.unified5h, 0.99, 'a spent session window still gates');
+  assert.equal(weeklyOnlyHeaders.accounts[0].quota.unified5hReset, sessionReset);
+  assert.equal(weeklyOnlyHeaders.accounts[0].quota.unified5hSeenAt, seenAt);
+});

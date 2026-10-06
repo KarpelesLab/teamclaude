@@ -58,6 +58,12 @@ test('an account that cannot spend says so beside the number', async () => {
   assert.match(r.text, /\$26\.11 \(unavailable\)/);
 });
 
+test('a negative balance leads with the minus, not the symbol', async () => {
+  const body = { balance_infos: [{ currency: 'USD', total_balance: '-3' }] };
+  const r = await fetchBackendQuota({ upstream: DS, credential: 'k' }, { fetchImpl: okFetch(body) });
+  assert.equal(r.text, '-$3.00');
+});
+
 test('a failure is reported, never guessed', async () => {
   const bad = await fetchBackendQuota({ upstream: DS, credential: 'k' }, { fetchImpl: okFetch({}, 401) });
   assert.equal(bad.error, 'HTTP 401');

@@ -684,7 +684,12 @@ function quotaLines(account, now, paint) {
   const cap = bucket => resolveMaxUsage(account.maxUsage, bucket);
 
   if (quota.unified5h != null || quota.unified7d != null || quota.unified7dSonnet != null || quota.unified7dFable != null) {
-    lines.push(formatQuotaLine('Session', quota.unified5h, quota.unified5hReset, now, paint, cap('unified5h')));
+    // A plan that meters no session window has no Session row to draw. A
+    // reading that is still there is drawn whatever the flag says: it may be
+    // the one keeping the account out of rotation.
+    if (quota.sessionWindowStated !== false || quota.unified5h != null) {
+      lines.push(formatQuotaLine('Session', quota.unified5h, quota.unified5hReset, now, paint, cap('unified5h')));
+    }
     lines.push(formatQuotaLine('Weekly', quota.unified7d, quota.unified7dReset, now, paint, cap('unified7d')));
     if (quota.unified7dSonnet != null) {
       lines.push(formatQuotaLine('Sonnet', quota.unified7dSonnet, quota.unified7dSonnetReset, now, paint, cap('unified7dSonnet')));

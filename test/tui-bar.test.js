@@ -188,8 +188,9 @@ function renderRow(quota, threshold = 0.98, config = {}) {
 }
 
 // The switch is read once per row and handed to every bar on it, so a row with
-// the family bars drawn has four call sites to get wrong.
-test('the row drops the percentage from every bar when the switch is off', () => {
+// the family bars drawn has four call sites to get wrong. Off is the default:
+// a row with no setting reads as the switch off.
+test('the row carries the percentage on every bar only when the switch is on', () => {
   const h = 3600_000;
   const quota = {
     unified5h: 0.42, unified5hReset: Date.now() + 2.5 * h,
@@ -197,9 +198,10 @@ test('the row drops the percentage from every bar when the switch is off', () =>
     unified7dSonnet: 0.22, unified7dSonnetReset: Date.now() + 3 * 24 * h,
     unified7dFable: 0.11, unified7dFableReset: Date.now() + 3 * 24 * h,
   };
-  assert.match(plain(renderRow(quota)), /31% \u00b7 3d/);
-  const off = plain(renderRow(quota, 0.98, { quotaBarPercent: false }));
+  assert.match(plain(renderRow(quota, 0.98, { quotaBarPercent: true })), /31% \u00b7 3d/);
+  const off = plain(renderRow(quota));
   assert.doesNotMatch(off, /%/);
+  assert.doesNotMatch(plain(renderRow(quota, 0.98, { quotaBarPercent: false })), /%/);
   // The countdowns stay: the percentage is the only field the switch removes.
   assert.match(off, /2h30m/);
 });
