@@ -11,7 +11,7 @@ import {
 import { configIndexFor, managerAccountFor, markAccountRemoved, markAccountAdded } from './account-pairing.js';
 import { PROVIDERS, providerOf, isSubscriptionAccount, upstreamFor } from './provider.js';
 import { mintAccountId } from './account-id.js';
-import { formatPercent, heldResetCredits } from './status-renderer.js';
+import { formatPercent, heldResetCredits, showSessionRow } from './status-renderer.js';
 import { resolveMaxUsage, resolveMaxSpendMinor, switchThresholdDiffs } from './model.js';
 import { parseProxyUrl, proxyToUrl, describeProxy, describeSelfProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy, localListener, isSelfProxy } from './upstream-proxy.js';
 import { describeRouting, parseRoutingUrl, routingToUrl, checkRouting } from './account-routing.js';
@@ -2334,9 +2334,10 @@ export class TUI {
       // No Ses bar once every Codex account here has said it meters no 5h window
       // (`sessionWindowStated`, the fact a reading leaves behind; not
       // `unified5h` itself, which the expiry sweep nulls every five hours on a
-      // row that does have one); a Claude row or an unreported account keeps it.
+      // row that does have one); a Claude row or an unreported account keeps it,
+      // and so does a reading that is still there (showSessionRow).
       const shortBar = cat !== 'unified'
-        || members.some(a => providerOf(a) !== 'codex' || a.quota.sessionWindowStated !== false || a.quota.unified7d == null);
+        || members.some(a => providerOf(a) !== 'codex' || showSessionRow(a.quota) || a.quota.unified7d == null);
       // The family bars are the first thing to go: below the width where they
       // fit even at BAR_MIN they would push the row past the edge, and a row
       // cut mid-bar reads worse than one that simply doesn't draw them (the
@@ -2683,10 +2684,12 @@ export class TUI {
     // being empty: the expiry sweep nulls that every five hours on a row that
     // does have a session window, and the row would swing between the two
     // shapes. An account that has not reported keeps both cells, so the row
-    // does not change shape at startup. The weekly bar takes the two cells'
+    // does not change shape at startup. A reading that is still present keeps
+    // its cell whatever the flag says (showSessionRow): it may be the one
+    // holding the account out of rotation. The weekly bar takes the two cells'
     // width (bar + `  Wk ` + bar) so the row still ends where its neighbours do.
     const weeklyOnly = !weeklyFirst && showBoth && rowCategory(a) === 'unified'
-      && providerOf(a) === 'codex' && q.sessionWindowStated === false && q.unified7d != null;
+      && providerOf(a) === 'codex' && !showSessionRow(q) && q.unified7d != null;
     if (weeklyFirst || weeklyOnly) [l1, r1, t1, w1, th1] = [l2, r2, t2, w2, th2];
     const bw1 = weeklyOnly ? bw * 2 + 6 : bw;
 

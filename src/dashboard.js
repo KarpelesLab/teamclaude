@@ -15,7 +15,7 @@
 // operator/OAuth-derived, but they still never reach innerHTML.
 
 import { createHash } from 'node:crypto';
-import { UNAVAILABLE_TEXT, RESET_CREDIT_MAX_AGE_MS } from './status-renderer.js';
+import { UNAVAILABLE_TEXT, RESET_CREDIT_MAX_AGE_MS, showSessionRow } from './status-renderer.js';
 import { USAGE_WINDOWS } from './client-usage.js';
 
 export function renderDashboardHtml() {
@@ -646,6 +646,7 @@ export function usageFor(entry, view) {
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, modelLabel, recentModelLabels, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
+  showSessionRow,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -977,7 +978,8 @@ ${SHARED_HELPERS}
     var q = a.quota || {};
     var models = modelsRow(a.usage);
     if (q.unified5h != null || q.unified7d != null) {
-      card.appendChild(quotaRow('Session', q.unified5h, q.unified5hReset));
+      // No Session row for a plan with no session window (see showSessionRow).
+      if (showSessionRow(q)) card.appendChild(quotaRow('Session', q.unified5h, q.unified5hReset));
       if (models) card.appendChild(models);
       models = null;
       card.appendChild(quotaRow('Weekly', q.unified7d, q.unified7dReset));

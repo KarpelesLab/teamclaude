@@ -196,6 +196,24 @@ export function spendLine(account, paint) {
 }
 
 /**
+ * Whether an account's Session (five-hour) row is drawn. A plan that meters no
+ * session window (`sessionWindowStated === false`) has none to draw, and an
+ * empty row would read as "unknown" for something that does not exist. A
+ * reading that is still there is drawn whatever the flag says: it may be the
+ * one keeping the account out of rotation.
+ *
+ * One rule for `teamclaude status`, the TUI row and the dashboard card (#511).
+ * Closure-free: the dashboard serializes it into its page with toString().
+ *
+ * @param {{sessionWindowStated?: boolean, unified5h?: number|null}|null|undefined} quota
+ * @returns {boolean}
+ */
+export function showSessionRow(quota) {
+  var q = quota || {};
+  return q.sessionWindowStated !== false || q.unified5h != null;
+}
+
+/**
  * The free-reset-credit line, or null when this account holds none.
  *
  * Its own line rather than another bar: every bar above measures an allowance
@@ -681,10 +699,7 @@ function quotaLines(account, now, paint) {
   const cap = bucket => resolveMaxUsage(account.maxUsage, bucket);
 
   if (quota.unified5h != null || quota.unified7d != null || quota.unified7dSonnet != null || quota.unified7dFable != null) {
-    // A plan that meters no session window has no Session row to draw. A
-    // reading that is still there is drawn whatever the flag says: it may be
-    // the one keeping the account out of rotation.
-    if (quota.sessionWindowStated !== false || quota.unified5h != null) {
+    if (showSessionRow(quota)) {
       lines.push(formatQuotaLine('Session', quota.unified5h, quota.unified5hReset, now, paint, cap('unified5h')));
     }
     lines.push(formatQuotaLine('Weekly', quota.unified7d, quota.unified7dReset, now, paint, cap('unified7d')));

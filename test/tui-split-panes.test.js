@@ -266,6 +266,19 @@ test('a Codex pane whose accounts state no five-hour window drops Ses; Wk takes 
   assert.match(rows[1], /k2@x\.com +active +Ses .*Wk /);
 });
 
+// #511: the flag says the plan meters no session window, but a reading is
+// still on the account (the header path never clears one). It may be what
+// keeps the account out of rotation, so its cell stays visible.
+test('a Codex row keeps its Ses cell while a session reading is still present', () => {
+  const am = fleet([claude('a@x.com'), codex('k1@x.com'), codex('k2@x.com')]);
+  noSessionWindow(am.accounts[1]);
+  Object.assign(am.accounts[2].quota, { unified5h: 0.99, unified5hReset: Date.now() + h, sessionWindowStated: false });
+  const rows = accountRows(screen(am, 160).lines).map(r => halves(r)[1]).filter(r => r.trim());
+  assert.match(rows[0], /k1@x\.com +active +Wk /, rows[0]);
+  assert.doesNotMatch(rows[0], /Ses/);
+  assert.match(rows[1], /k2@x\.com .*Ses .*Wk /, rows[1]);
+});
+
 test('an account that has not reported yet keeps the Ses column, so it does not come and go at startup', () => {
   const am = fleet([claude('a@x.com'), codex('k1@x.com'), codex('k2@x.com')]);
   noSessionWindow(am.accounts[1]);

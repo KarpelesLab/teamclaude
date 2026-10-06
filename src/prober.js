@@ -22,6 +22,28 @@ function clampInterval(ms) {
   return ms > 0 ? Math.min(ms, MAX_PROBE_INTERVAL_MS) : 0;
 }
 
+// Which accounts the probe reads, one rule per source. Exported so the status
+// payload a server builds before its Prober exists states the same answer the
+// Prober will (#512), instead of keeping a copy of the rule.
+const isAnthropicProbeTarget = (/** @type {any} */ account) => !!account && providerOf(account) === 'anthropic'
+  && account.type === 'oauth' && !!account.credential && !account.upstream;
+
+const isCodexProbeTarget = (/** @type {any} */ account) => !!account && providerOf(account) === 'codex'
+  && account.type === 'oauth' && !!account.credential && !!account.accountId && !account.upstream;
+
+const isBackendProbeTarget = (/** @type {any} */ account) => !!account?.credential && hasBackendQuota(account);
+
+/**
+ * True when the quota probe has something to read for this account: an
+ * Anthropic or Codex subscription, or a third-party backend that publishes a
+ * quota of its own. Anything else reads `not-applicable` in the probe status.
+ * @param {any} account
+ * @returns {boolean}
+ */
+export function probeApplicable(account) {
+  return isAnthropicProbeTarget(account) || isCodexProbeTarget(account) || isBackendProbeTarget(account);
+}
+
 export class Prober {
   // `log` resolves the console per call rather than capturing it. A default
   // parameter is evaluated when the constructor runs, and the server builds its
@@ -105,19 +127,17 @@ export class Prober {
    * this line (warmer.js `_isWarmTarget`); the probe did not.
    */
   _isProbeTarget(account) {
-    return !!account && providerOf(account) === 'anthropic'
-      && account.type === 'oauth' && !!account.credential && !account.upstream;
+    return isAnthropicProbeTarget(account);
   }
 
   _isCodexProbeTarget(account) {
-    return !!account && providerOf(account) === 'codex'
-      && account.type === 'oauth' && !!account.credential && !!account.accountId && !account.upstream;
+    return isCodexProbeTarget(account);
   }
 
   /** A third-party backend that publishes a quota of its own. The provider
    * module decides which; nothing in this file knows one by name. */
   _isBackendTarget(account) {
-    return !!account?.credential && hasBackendQuota(account);
+    return isBackendProbeTarget(account);
   }
 
   // Only accounts in rotation are probed. A probe forces a token refresh and
@@ -238,8 +258,7 @@ export class Prober {
         const status = this.accountStatus.get(account.name);
         return {
           name: account.name,
-          status: (this._isProbeTarget(account) || this._isCodexProbeTarget(account) || this._isBackendTarget(account))
-            ? (status?.status || 'never') : 'not-applicable',
+          status: probeApplicable(account) ? (status?.status || 'never') : 'not-applicable',
           lastProbedAt: iso(status?.finishedAt),
           startedAt: iso(status?.startedAt),
           durationMs: status?.durationMs ?? null,
