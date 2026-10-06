@@ -28,15 +28,16 @@ Where a provider's terms are stricter than this page, the provider's terms win.
 In particular:
 
 - **Use the provider's genuine CLI.** Pointing a third-party frontend (opencode and similar) at Pro/Max OAuth credentials is the pattern Anthropic explicitly restricts.
-- **Keep a human in the loop.** The terms expect interactive, human-present use rather than fully unattended automation. The two features that make background calls on their own — [keep-warm](quota.md#keep-warm) and the [quota probe](quota.md#quota-probe) — are **off by default**.
+- **How much may run unattended is the client's call, not the proxy's.** Each provider decides what its own CLI may do without a person at the keyboard — background work, scheduled tasks, long runs — and builds those limits into that CLI. TeamClaude routes requests between your subscriptions and that client; it neither widens what the client allows nor narrows it. A long run the client permits can be carried across an account switch or a quota reset ([`holdSeconds`](quota.md#hold-on-exhaustion)); a run the client does not permit does not become permitted by going through a proxy.
+- **The proxy's own background calls are off by default.** Two features make requests that no client asked for — [keep-warm](quota.md#keep-warm) and the [quota probe](quota.md#quota-probe) — and you turn them on yourself.
 - **Only use subscriptions you legitimately purchased.**
 
 ## Anthropic: rotating across multiple subscriptions
 
 This is the question people ask most. Note that Claude Code's own `/extra-usage` flow already offers signing into a *different* account when you hit a limit. "Switch to another account you own to get more usage" is a move the native client itself surfaces; TeamClaude automates that same switch. Anthropic hasn't explicitly blessed *automated* pooling, so weigh it against the current [Claude Code legal terms](https://code.claude.com/docs/en/legal-and-compliance) — but the idea that using more than one of your own subscriptions is inherently off-limits is hard to square with the first-party client offering to do the same thing by hand.
 
-To the best of the maintainer's knowledge, using TeamClaude as intended — the real Claude Code CLI, your own subscriptions, a human present — is consistent with Claude Code's Terms. See [#107](https://github.com/KarpelesLab/teamclaude/issues/107) for the full write-up.
+To the best of the maintainer's knowledge, using TeamClaude as intended — the real Claude Code CLI, used as it allows, on your own subscriptions — is consistent with Claude Code's Terms. See [#107](https://github.com/KarpelesLab/teamclaude/issues/107) for the full write-up.
 
 ## Other providers
 
-No equivalent write-up exists yet for OpenAI's or the backend vendors' terms. The intended use is the same — your own accounts, the provider's own client, a human present — and whether that satisfies a given provider's current terms is for you to check with that provider.
+No equivalent write-up exists yet for OpenAI's or the backend vendors' terms. The intended use is the same — your own accounts, the provider's own client, used as that client allows — and whether that satisfies a given provider's current terms is for you to check with that provider.
