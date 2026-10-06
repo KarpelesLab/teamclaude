@@ -34,6 +34,20 @@ const WINDOW_TOLERANCE = 0.1;
 
 const near = (value, target) => Math.abs(value - target) <= target * WINDOW_TOLERANCE;
 
+/**
+ * The bucket a window of this many minutes belongs to, or null for any other
+ * length — a monthly or hourly window is neither, and is dropped rather than
+ * filed under the nearest one.
+ *
+ * @param {number} minutes
+ * @returns {'fiveHour'|'weekly'|null}
+ */
+export function windowBucket(minutes) {
+  return near(minutes, FIVE_HOUR_MINUTES) ? 'fiveHour'
+    : near(minutes, SEVEN_DAY_MINUTES) ? 'weekly'
+      : null;
+}
+
 const HEADER_RE = /^x-codex-(?:(.+)-)?(primary|secondary)-(used-percent|window-minutes|reset-at)$/;
 const LIMIT_NAME_RE = /^x-codex-(.+)-limit-name$/;
 
@@ -93,9 +107,7 @@ function classify(windows) {
     if (!Number.isFinite(minutes) || minutes <= 0) continue;
     if (!Number.isFinite(percent)) continue;
 
-    const bucket = near(minutes, FIVE_HOUR_MINUTES) ? 'fiveHour'
-      : near(minutes, SEVEN_DAY_MINUTES) ? 'weekly'
-        : null;
+    const bucket = windowBucket(minutes);
     if (!bucket) continue;
 
     out[bucket] = {

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { createWriteStream } from 'node:fs';
 import { readFile } from 'node:fs/promises';
@@ -25,13 +25,13 @@ import { resolveAccounts } from './resolve-accounts.js';
 import { loginCodex } from './codex-auth.js';
 import { providerOf } from './provider.js';
 import { syncAccountsFromDisk } from './sync-accounts.js';
-import { mergeAccountsForSave, syncRefreshedTokens, removedAccountIds, clearRemovedAccountIds, clearAddedAccountIds } from './account-pairing.js';
+import { mergeAccountsForSave, syncRefreshedTokens, removedAccountIds, clearRemovedAccountIds, clearAddedAccountIds, markAccountRemoved, configIndexFor } from './account-pairing.js';
 import { ensureAccountIds } from './account-id.js';
 import * as alias from './alias.js';
 import { ensureCerts, mitmHosts } from './mitm.js';
 import { Prober } from './prober.js';
 import { ResetCreditRedeemer } from './codex-reset-credits.js';
-import { Warmer } from './warmer.js';
+import { Warmer, warmApplicable } from './warmer.js';
 import { formatWarmupScheduleConfirmation, resolveWarmupConfig } from './warmup-schedule.js';
 import { TUI, ACCOUNT_SORTS } from './tui.js';
 import { SessionTitles } from './session-titles.js';
@@ -51,6 +51,45 @@ import { proxyFetch } from './upstream-fetch.js';
 import { upstreamFor } from './provider.js';
 import { startEventLoopMonitor } from './event-loop-monitor.js';
 import { envVar } from './brand.js';
+import { loginCallback, loadCallbackToken, saveCallbackToken, callbackWhoami, logoutCallback, callbackClientId, getCallbackAuthPath } from './callback-auth.js';
+import { CredentialSync } from './credential-sync.js';
+
+// The server's credential sync, once it runs; a CLI command that changes an
+// account on disk talks to the store through a sync of its own instead.
+/** @type {CredentialSync|null} */
+let activeCredentialSync = null;
+
+/** A sync over the config alone, for a command running outside the server. */
+function standaloneCredentialSync() {
+  return activeCredentialSync || new CredentialSync({ accountManager: /** @type {any} */ ({ accounts: [], updateAccountTokens() {} }), addAccount: () => null, log: () => {} });
+}
+
+/**
+ * An explicit sign-in (`login`, `import`): store the entry's tokens, over a
+ * tombstone included, when this install is signed in to callback.net. Never
+ * fatal — the account is in the config either way, and the next pass stores it.
+ * @param {Record<string, any>} entry
+ */
+async function recordSignInWithCallback(entry) {
+  try {
+    if (await standaloneCredentialSync().storeSignIn(entry)) console.log('Stored on callback.net for your other installs.');
+  } catch (/** @type {any} */ err) {
+    console.error(`Could not store the sign-in on callback.net (${err?.message || err}); the next sync pass will.`);
+  }
+}
+
+/**
+ * An account removed by hand (`remove`): leave the tombstone the other
+ * installs act on, when this install is signed in to callback.net.
+ * @param {Record<string, any>} entry
+ */
+async function recordRemovalWithCallback(entry) {
+  try {
+    if (await standaloneCredentialSync().onAccountRemoved({ ...entry, credential: entry.accessToken })) console.log('Recorded on callback.net: your other installs will remove it too.');
+  } catch (/** @type {any} */ err) {
+    console.error(`Could not record the removal on callback.net: ${err?.message || err}`);
+  }
+}
 
 // Where a new API key joins the rotation. A key is metered: every token it
 // serves is billed, while a subscription's quota is paid for whether it is
@@ -120,6 +159,13 @@ const ROUTING_USAGE = [
   'is http. A new URL is tested first (a tunnel to the account\'s upstream; no',
   'request is sent) and refused if the proxy does not answer. Changes apply to a',
   'running server immediately.',
+].join('\n');
+
+const CALLBACK_USAGE = [
+  'Usage: teamclaude callback login [--no-browser] [--force]   Sign this install in to callback.net',
+  '       teamclaude callback status                            Show who is signed in',
+  '       teamclaude callback sync                              Reconcile the running server with the credential store now',
+  '       teamclaude callback logout                            Revoke the session and forget it',
 ].join('\n');
 
 const args = process.argv.slice(2);
@@ -221,6 +267,10 @@ switch (command) {
     await updateCommand();
     process.exit(0);
     break;
+  case 'callback':
+    await callbackCommand();
+    process.exit(0);
+    break;
   case 'version':
   case '--version':
   case '-V':
@@ -277,20 +327,26 @@ async function serverCommand() {
   // --activity-log <file>
   const activityLogPath = argValue('--activity-log') || null;
 
-  if (config.accounts.length === 0) {
+  // An empty pool is a configuration error — unless this install is signed in
+  // to callback.net, where the credential store may hold the accounts: a fresh
+  // machine gets them from the first sync pass, which needs a running server.
+  const syncMayFill = config.accounts.length === 0 && !!(await loadCallbackToken().catch(() => null));
+  if (config.accounts.length === 0 && !syncMayFill) {
     console.error('No accounts configured.\n');
     console.error('Add an account first:');
     console.error('  teamclaude import           Import from Claude Code');
     console.error('  teamclaude login            OAuth login via browser');
     console.error('  teamclaude login --api      Add an API key (last resort by default; --priority <n>)');
+    console.error('  teamclaude callback login   Sign in to callback.net and take the accounts of your other installs');
     process.exit(1);
   }
 
   const accounts = await resolveAccounts(config);
-  if (accounts.length === 0) {
+  if (accounts.length === 0 && !syncMayFill) {
     console.error('No valid accounts after initialization');
     process.exit(1);
   }
+  if (syncMayFill) console.log('[TeamClaude] No accounts configured; signed in to callback.net, so the credential store will be checked for them');
 
   // `accounts[].models` (#74) is superseded by the `routes` table (#86). Routes
   // do the same job with glob matching, several accounts per rule and a bucket
@@ -350,6 +406,49 @@ async function serverCommand() {
       .catch(err => console.error(`[TeamClaude] Failed to save quota state: ${err.message}`));
   let quotaSaveInterval = null;
 
+  // An account admitted from somewhere other than this install's config: the
+  // callback.net credential store (credential-sync.js). Same three lists the
+  // refresh persistence below keeps in step for an account found on disk —
+  // config, manager, disk — and the same guard against an entry already there.
+  const admitAccount = (/** @type {Record<string, any>} */ entry) => {
+    if (config.accounts.some((/** @type {any} */ a) => sameIdentity(a, entry)) || accountManager.accounts.some((/** @type {any} */ a) => sameIdentity(a, entry))) return null;
+    config.accounts.push(entry);
+    ensureAccountIds(config.accounts);
+    const idx = accountManager.addAccount(entry);
+    atomicConfigUpdate((/** @type {any} */ diskConfig) => {
+      if (!diskConfig.accounts.some((/** @type {any} */ a) => sameIdentity(a, entry))) diskConfig.accounts.push(entry);
+    }).catch((/** @type {any} */ err) => console.error(`[TeamClaude] Failed to save an account added from callback.net: ${err.message}`));
+    return idx;
+  };
+
+  // The reverse: an account the store says was removed on another install
+  // leaves this one — manager, config and disk, the way the TUI removes one.
+  const evictAccount = (/** @type {Record<string, any>} */ account) => {
+    const idx = accountManager.accounts.indexOf(/** @type {any} */ (account));
+    if (idx < 0) return;
+    const cfgIdx = configIndexFor(config.accounts, accountManager.accounts, idx);
+    const entryId = cfgIdx >= 0 ? config.accounts[cfgIdx]?.id : null;
+    accountManager.removeAccount(idx);
+    if (cfgIdx >= 0) {
+      markAccountRemoved(config, entryId);
+      config.accounts.splice(cfgIdx, 1);
+    }
+    atomicConfigUpdate((/** @type {any} */ diskConfig) => {
+      diskConfig.accounts = diskConfig.accounts.filter((/** @type {any} */ a) => (entryId ? a.id !== entryId : !sameIdentity(a, account)));
+    }).catch((/** @type {any} */ err) => console.error(`[TeamClaude] Failed to save the removal of "${account.name}": ${err.message}`));
+  };
+
+  // Credential sync through callback.net: active only while this install is
+  // signed in (`teamclaude callback login`); dormant otherwise. Every token
+  // refresh goes through its lock, every local token change is stored, a
+  // removal here leaves a tombstone the other installs act on, and a pass at
+  // start, on reload and daily brings the fleet level with the store.
+  const credentialSync = new CredentialSync({ accountManager, addAccount: admitAccount, evictAccount });
+  activeCredentialSync = credentialSync;
+  accountManager.setRefreshCoordinator((account, refresh) => credentialSync.coordinateRefresh(account, refresh));
+  // Not awaited: the removal is done; the tombstone follows.
+  accountManager.onAccountRemoved((account) => { credentialSync.onAccountRemoved(account).catch(() => {}); });
+
   // Persist refreshed tokens back to config (re-read from disk to avoid clobbering
   // accounts added externally, e.g. by `teamclaude import` while server is running)
   accountManager.onTokenRefresh((idx, newTokens) => {
@@ -386,6 +485,9 @@ async function serverCommand() {
         diskConfig.accounts[cfgIdx].expiresAt = newTokens.expiresAt;
       }
     }).catch(err => console.error(`[TeamClaude] Failed to save refreshed token: ${err.message}`));
+    // And to the credential store, when signed in. Not awaited: the disk
+    // write above is the one that must land; the store follows.
+    credentialSync.onLocalTokens(idx, newTokens).catch(() => {});
   });
   const port = config.proxy.port;
   // Bind loopback by default so the proxy isn't reachable off-box (it injects
@@ -439,6 +541,10 @@ async function serverCommand() {
     const diskConfig = await loadConfig();
     if (!diskConfig) return { added: 0, removed: 0 };
     const { added, removed } = await syncAccountsFromDisk(diskConfig, config, accountManager);
+    // `teamclaude callback login` notifies through a reload, so this is where a
+    // fresh sign-in brings the store's accounts in; the pass is also what makes
+    // an import or login on this install reach the other ones.
+    credentialSync.sync('reload').catch(() => {});
     // Pick up client-key edits (proxy.clientKeys is read live by both auth
     // gates through the shared config object, so refreshing it here is all a
     // key add/rotate/revoke needs — no restart).
@@ -497,7 +603,7 @@ async function serverCommand() {
     }
     config.messageThreads = fleetThreads;
     // Read by the TUI on every frame, so a hand edit lands on the next reload.
-    config.quotaBarPercent = diskConfig.quotaBarPercent !== false;
+    config.quotaBarPercent = diskConfig.quotaBarPercent === true;
     config.accountSort = ACCOUNT_SORTS.includes(diskConfig.accountSort) ? diskConfig.accountSort : 'arranged';
     // Read by `run`/`env` from disk, but the TUI settings screen shows it live.
     config.defaultClientMode = diskConfig.defaultClientMode === 'base-url' ? 'base-url' : 'mitm';
@@ -729,6 +835,7 @@ async function serverCommand() {
       upstream: config.upstream || 'https://api.anthropic.com',
       eventLoop: eventLoopMonitor.status(),
     },
+    callbackSync: credentialSync.summary(),
     probe: prober?.getStatus() || {
       enabled: false,
       intervalSeconds: config.quotaProbeSeconds || 0,
@@ -750,7 +857,7 @@ async function serverCommand() {
       running: false,
       accounts: accountManager.accounts.map(account => ({
         name: account.name,
-        status: (account.type === 'oauth' && !account.upstream) ? 'never' : 'not-applicable',
+        status: warmApplicable(account) ? 'never' : 'not-applicable',
         lastWarmedAt: null,
         startedAt: null,
         durationMs: null,
@@ -852,6 +959,10 @@ async function serverCommand() {
   });
   warmer.start();
 
+  // The first credential-sync pass, and the daily one after it. Not awaited:
+  // the store is reached over the network and the proxy serves meanwhile.
+  credentialSync.start().catch(() => {});
+
   // Background self-update for a backgrounded (headless) server. Skipped under
   // the TUI, where npm's install output would corrupt the display — interactive
   // users update via `teamclaude run` (post-session) or `teamclaude update`.
@@ -875,6 +986,7 @@ async function serverCommand() {
     if (!tui) console.log('\n[TeamClaude] Shutting down...');
     prober?.stop();
     warmer?.stop();
+    credentialSync.stop();
     eventLoopMonitor.stop();
     if (quotaSaveInterval) clearInterval(quotaSaveInterval);
     await persistQuotaState();
@@ -1107,6 +1219,8 @@ async function loginCodexCommand() {
 async function upsertCodexAccount(requestedName, creds, routing = null, storeRouting = false) {
   /** @type {{ action: 'updated' | 'added', name: string }} */
   let outcome = { action: 'added', name: requestedName || '' };
+  /** @type {Record<string, any>|null} */
+  let signedIn = null;
   await atomicConfigUpdate(config => {
     const name = requestedName || creds.email
       || `codex-${config.accounts.filter(a => a.provider === 'codex').length + 1}`;
@@ -1144,8 +1258,10 @@ async function upsertCodexAccount(requestedName, creds, routing = null, storeRou
       outcome = { action: 'added', name: account.name };
       console.log(`Added account "${account.name}"${creds.planType ? ` (${creds.planType})` : ''}`);
     }
+    signedIn = config.accounts[idx >= 0 ? idx : config.accounts.length - 1];
   });
   console.log(`Saved to ${getConfigPath()}`);
+  if (signedIn) await recordSignInWithCallback(signedIn);
   return outcome;
 }
 
@@ -2146,6 +2262,134 @@ async function distributeCommand() {
 
 // ── update ──────────────────────────────────────────────────
 
+// ── callback.net ────────────────────────────────────────────
+
+/** `Name <email>`, whichever parts the profile has. */
+function describeCallbackUser(/** @type {{ id: string|null, email: string|null, name: string|null }} */ me) {
+  if (me.name && me.email) return `${me.name} <${me.email}>`;
+  return me.name || me.email || me.id || 'an unnamed user';
+}
+
+// Best effort and never in the way: the URL is printed before this runs, so a
+// machine with no browser (SSH, a container) loses nothing. Detached with no
+// stdio, so an opener that falls back to a text browser cannot take the
+// terminal, and one that hangs cannot hold the sign-in up.
+function openInBrowser(/** @type {string} */ url) {
+  const win = process.platform === 'win32';
+  const opener = process.platform === 'darwin' ? 'open' : win ? 'start' : 'xdg-open';
+  try {
+    // `start` reads its first quoted argument as a window title, and cmd would
+    // split an unquoted URL at `&`.
+    const child = spawn(opener, win ? ['""', `"${url}"`] : [url], { stdio: 'ignore', shell: win, detached: !win });
+    child.on('error', () => {});
+    child.unref();
+  } catch { /* no opener: the URL is on the screen */ }
+}
+
+// Sign-in to callback.net: a poll-token OAuth2 flow (see callback-auth.js), so
+// the browser that approves it can be on any machine. The token is this
+// install's own and lives beside the config, apart from the pooled accounts.
+async function callbackCommand() {
+  const sub = args[1];
+  if (sub === 'login') {
+    if (!args.includes('--force') && await loadCallbackToken()) {
+      try {
+        const me = await callbackWhoami();
+        console.log(`Already signed in to callback.net as ${describeCallbackUser(me)}.`);
+        console.log('Run `teamclaude callback logout` first, or pass --force to sign in again.');
+        return;
+      } catch (/** @type {any} */ err) {
+        // A session the server no longer honours is replaced; anything else
+        // (network down) is not a reason to throw a working token away.
+        if (!err?.loginRequired) {
+          console.error(`Could not check the existing callback.net session: ${err?.message || err}`);
+          console.error('Pass --force to sign in again regardless.');
+          process.exit(1);
+        }
+      }
+    }
+    if (!callbackClientId()) {
+      console.error('No callback.net client id is configured. Set TEAMROUTER_CALLBACK_CLIENT_ID to the OAuth2 app id to sign in as.');
+      process.exit(1);
+    }
+    let token;
+    try {
+      token = await loginCallback({
+        onUrl: (url, { lifetimeSeconds }) => {
+          console.log('Open this URL to sign in to callback.net:');
+          console.log('');
+          console.log(`  ${url}`);
+          console.log('');
+          console.log(`Waiting for approval (the link is good for ${Math.round(lifetimeSeconds / 60)} minutes; Ctrl-C to cancel)...`);
+          if (!args.includes('--no-browser')) openInBrowser(url);
+        },
+      });
+    } catch (/** @type {any} */ err) {
+      console.error(`callback.net sign-in failed: ${err?.message || err}`);
+      process.exit(1);
+    }
+    await saveCallbackToken(token);
+    const me = await callbackWhoami().catch(() => null);
+    console.log(`Signed in to callback.net${me ? ` as ${describeCallbackUser(me)}` : ''}`);
+    console.log(`Token saved to ${getCallbackAuthPath()}`);
+    // A running server syncs on reload, so the store's accounts arrive now
+    // rather than at the next start. Only an existing config names a server;
+    // signing in is not a reason to create one.
+    const existing = await loadConfig().catch(() => null);
+    if (existing) await notifyRunningServer(existing);
+    return;
+  }
+  if (sub === 'status' || sub === undefined) {
+    try {
+      const me = await callbackWhoami();
+      console.log(`Signed in to callback.net as ${describeCallbackUser(me)}`);
+    } catch (/** @type {any} */ err) {
+      if (err?.loginRequired) {
+        console.error((await loadCallbackToken())
+          ? 'The callback.net session has expired. Run `teamclaude callback login`.'
+          : 'Not signed in to callback.net. Run `teamclaude callback login`.');
+      } else {
+        console.error(`Could not reach callback.net: ${err?.message || err}`);
+      }
+      process.exit(1);
+    }
+    return;
+  }
+  if (sub === 'logout') {
+    const { wasSignedIn, revoked } = await logoutCallback();
+    if (!wasSignedIn) console.log('Not signed in to callback.net.');
+    else console.log(revoked ? 'Signed out of callback.net.' : 'Signed out of callback.net locally (the session could not be revoked upstream; it expires on its own).');
+    return;
+  }
+  if (sub === 'sync') {
+    // The running server owns the fleet, so the pass runs there: a reload is
+    // what triggers it. Without a server there is nothing to reconcile yet;
+    // the next start does the pass.
+    const config = await loadOrCreateConfig();
+    if (!await isProxyUp(config.proxy.port)) {
+      console.error('No server is running; it syncs with callback.net when it starts, on every reload, and daily.');
+      process.exit(1);
+    }
+    await notifyRunningServer(config);
+    // The reload hands the pass off without waiting for it, so status is read
+    // after the pass has had the time a list and a few writes take.
+    /** @type {any} */
+    let status = null;
+    for (let i = 0; i < 20 && !status?.callbackSync?.lastSyncAt && !status?.callbackSync?.lastError; i++) {
+      await new Promise(resolve => setTimeout(resolve, 500));
+      status = await fetch(`http://localhost:${config.proxy.port}/teamclaude/status`, { headers: { 'x-api-key': config.proxy.apiKey }, signal: AbortSignal.timeout(5_000) })
+        .then(r => r.json()).catch(() => null);
+    }
+    const s = status?.callbackSync;
+    if (!s) { console.log('Reload sent.'); return; }
+    if (s.lastError) { console.error(`Sync failed: ${s.lastError}`); process.exit(1); }
+    console.log(`Synced with callback.net: ${s.rows} account${s.rows === 1 ? '' : 's'} in the store${s.lastSyncAt ? ` (last pass ${new Date(s.lastSyncAt).toISOString()})` : ''}.`);
+    return;
+  }
+  console.error(CALLBACK_USAGE);
+  process.exit(1);
+}
+
 async function updateCommand() {
   const cur = currentVersion();
   console.log(`Current version: ${cur || 'unknown'}`);
@@ -2216,6 +2460,10 @@ async function removeCommand() {
   config.accounts.splice(config.accounts.indexOf(account), 1);
   await saveConfig(config);
   console.log(`Removed account "${account.name}"`);
+  // The tombstone first, then the server: told of the removal, it finds the
+  // tombstone already there and leaves it alone.
+  await recordRemovalWithCallback(account);
+  await notifyRunningServer(config);
 }
 
 // ── route ───────────────────────────────────────────────────
@@ -2478,6 +2726,13 @@ Commands:
   warmup rolling HH:MM --timezone Area/City
                       Anchor a continuous five-hour reset cadence in an IANA zone
   api <path>          Call an API endpoint with account credentials
+  callback login      Sign this install in to callback.net (prints a URL to
+                      approve in any browser; --no-browser to not open one).
+                      While signed in, OAuth account tokens are kept in step
+                      with every other signed-in install of yours
+  callback status     Show who is signed in to callback.net
+  callback sync       Reconcile the running server with the store now
+  callback logout     Revoke that session and forget it
   update              Check npm for a newer teamclaude and install it
   version             Print the installed version
   help                Show this help
@@ -2650,6 +2905,8 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
   // disk.
   /** @type {{ action: 'updated' | 'added', name: string }} */
   let outcome = { action: 'added', name: name || '' };
+  /** @type {Record<string, any>|null} */
+  let signedIn = null;
   const config = await atomicConfigUpdate(config => {
     if (!name) {
       const n = config.accounts.filter(a => a.name.startsWith('account-')).length + 1;
@@ -2707,8 +2964,12 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
       outcome = { action: 'added', name: account.name };
       console.log(`Added account "${account.name}"`);
     }
+    signedIn = config.accounts[idx >= 0 ? idx : config.accounts.length - 1];
   });
   console.log(`Saved to ${getConfigPath()}`);
+  // Before the server is told: its reload pass would otherwise read a tombstone
+  // for an account that was just signed in again and remove it.
+  if (signedIn) await recordSignInWithCallback(signedIn);
   if (notify) await notifyRunningServer(config);
   return outcome;
 }
