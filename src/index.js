@@ -448,6 +448,8 @@ async function serverCommand() {
   accountManager.setRefreshCoordinator((account, refresh) => credentialSync.coordinateRefresh(account, refresh));
   // Not awaited: the removal is done; the tombstone follows.
   accountManager.onAccountRemoved((account) => { credentialSync.onAccountRemoved(account).catch(() => {}); });
+  // An account in error looks in the store for a token another install holds.
+  accountManager.onAccountError((account) => { credentialSync.onAccountError(account).catch(() => {}); });
 
   // Persist refreshed tokens back to config (re-read from disk to avoid clobbering
   // accounts added externally, e.g. by `teamclaude import` while server is running)

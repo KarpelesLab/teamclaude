@@ -33,6 +33,14 @@
 // the account, a refresh never writes over a tombstone, and only an explicit
 // sign-in (`login`, `import`) does. A pass deletes a tombstone older than a
 // week, by which time every install that was going to see it has.
+//
+// An account IN ERROR (upstream rejected its token; it needs a re-login) is
+// never written to the store: what it holds is dead, and stored it would
+// overwrite the good token another install holds, or plant a dead account on
+// all of them. It only ever reads: a row holding a token different from the
+// one it has is adopted whatever its expiry — a sign-in elsewhere mints a
+// token the dead one could never be newer than — and the account is back in
+// rotation. The pass looks, and so does the moment the account goes into error.
 
 import { hostname } from 'node:os';
 import { callbackCall, loadCallbackToken } from './callback-auth.js';
@@ -176,6 +184,27 @@ function supersedes(/** @type {Blob|null} */ blob, /** @type {Record<string, any
   return blob.expiresAt > (Number(account.expiresAt) || 0);
 }
 
+/**
+ * Whether an account holds a token upstream rejected: marked 'error', or still
+ * carrying the refresh token the token endpoint turned down (the manager's
+ * dead-token guard, which a re-import of the same refresh token does not lift).
+ * @param {Record<string, any>} account
+ */
+export function isInError(account) {
+  return account.status === 'error' || (!!account._deadRefreshToken && account._deadRefreshToken === account.refreshToken);
+}
+
+/**
+ * Whether a blob can bring an account in error back: it carries tokens other
+ * than the ones the account holds, and not the refresh token already rejected.
+ * Expiry does not enter into it — the account's own token is dead either way.
+ */
+function revives(/** @type {Blob|null} */ blob, /** @type {Record<string, any>} */ account) {
+  if (!blob) return false;
+  if (blob.accessToken === account.credential && blob.refreshToken === account.refreshToken) return false;
+  return !account._deadRefreshToken || blob.refreshToken !== account._deadRefreshToken;
+}
+
 /** @param {any} r @returns {Row} */
 function rowOf(r) {
   return { id: String(r.User_Credential__), key: String(r.Key), blob: decodeBlob(r.Data), deletedAt: tombstoneOf(r.Data), updated: Number(r?.Updated?.unixms) || 0 };
@@ -288,7 +317,9 @@ export class CredentialSync {
         const key = syncKeyFor(account);
         if (!key) continue;
         const row = this._rowFor(account);
+        const broken = isInError(account);
         if (!row) {
+          if (broken) continue; // a dead token is not stored for the others to pick up
           await this._create(account, this._tokens(account));
           result.created++;
           continue;
@@ -300,6 +331,14 @@ export class CredentialSync {
           this.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" was removed on another install (${new Date(row.deletedAt).toISOString()}); removing it here`);
           this.evictAccount(account);
           result.evicted++;
+          continue;
+        }
+        if (broken) {
+          // Read only: never written over with what this install holds.
+          if (revives(row.blob, account)) {
+            this._adopt(account, /** @type {Blob} */ (row.blob), `sync (${reason}), replacing a rejected token`);
+            result.adopted++;
+          }
           continue;
         }
         if (supersedes(row.blob, account)) {
@@ -400,6 +439,8 @@ export class CredentialSync {
   async onLocalTokens(index, tokens) {
     const account = this.am.accounts[index];
     if (!account || !syncKeyFor(account) || !tokens?.accessToken || !tokens?.refreshToken) return;
+    // A re-import of a rejected refresh token, say: nothing the others can use.
+    if (isInError(account)) return;
     if (!await this.isSignedIn()) return;
     try {
       const row = this._rowFor(account);
@@ -410,6 +451,34 @@ export class CredentialSync {
       else await this._create(account, tokens);
     } catch (/** @type {any} */ err) {
       this.log(`[TeamClaude] callback.net: could not store the new token for "${safeLine(account.name, 64)}": ${safeLine(err?.message || String(err), 160)}`);
+    }
+  }
+
+  /**
+   * An account just went into error here. Before it waits for a re-login, look
+   * at its row: another install may hold a token renewed or signed in since,
+   * which is adopted and puts the account back in rotation. Never writes.
+   * Resolves with whether a token was adopted.
+   * @param {Record<string, any>} account
+   * @returns {Promise<boolean>}
+   */
+  async onAccountError(account) {
+    if (!syncKeyFor(account) || !await this.isSignedIn()) return false;
+    try {
+      if (!this.rows.size) this.rows = await this._list();
+      let row = this._rowFor(account);
+      if (!row) return false;
+      row = rowOf(await this.api('GET', `User/Credential/${row.id}`));
+      this.rows.set(row.key, row);
+      // Removed elsewhere: the next pass takes it out. Recovered meanwhile (a
+      // reload, an import): nothing to do.
+      if (row.deletedAt != null || !isInError(account) || !revives(row.blob, account)) return false;
+      if (!this.am.accounts.includes(/** @type {any} */ (account))) return false;
+      this._adopt(account, /** @type {Blob} */ (row.blob), 'its own token was rejected');
+      return true;
+    } catch (/** @type {any} */ err) {
+      this.log(`[TeamClaude] callback.net: could not look for a newer token for "${safeLine(account.name, 64)}": ${safeLine(err?.message || String(err), 160)}`);
+      return false;
     }
   }
 

@@ -4851,6 +4851,7 @@ export class AccountManager {
           }
           account.status = 'error';
           console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}" needs re-login (refresh token rejected) — run: teamclaude login`);
+          this._onAccountError?.(account);
         }
       } finally {
         account._refreshPromise = null;
@@ -4870,6 +4871,11 @@ export class AccountManager {
   /** Replace the refresh coordinator (see the constructor option). */
   setRefreshCoordinator(/** @type {(account: Record<string, any>, refresh: () => Promise<any>, info: { force: boolean }) => Promise<any>} */ fn) {
     this._refreshCoordinator = fn;
+  }
+
+  /** Set a callback told of every OAuth account that goes into error (needs a re-login). */
+  onAccountError(/** @type {(account: Record<string, any>) => void} */ callback) {
+    this._onAccountError = callback;
   }
 
   /** Set a callback told of every account that leaves the fleet (removeAccount). */
@@ -4921,6 +4927,7 @@ export class AccountManager {
     account.status = 'error';
     const remedy = account.type === 'oauth' ? 'run: teamclaude login' : 'check the key in the config';
     console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}" taken out of rotation: ${why} — ${remedy}`);
+    this._onAccountError?.(account);
   }
 
   /**

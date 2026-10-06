@@ -98,9 +98,11 @@ function setup(entries, { store = makeStore(), signedIn = true, refresh } = {}) 
   });
   am.setRefreshCoordinator((account, refresh) => sync.coordinateRefresh(account, refresh));
   am.onAccountRemoved((account) => { removals.push(sync.onAccountRemoved(account)); });
+  const recoveries = [];
+  am.onAccountError((account) => { recoveries.push(sync.onAccountError(account)); });
   // Every tombstone write a removal started, settled.
   const settled = () => Promise.all(removals);
-  return { am, sync, store, refreshed, persisted, admitted, evicted, logs, sleeps, settled, signOut: () => { signed = false; }, signIn: () => { signed = true; } };
+  return { am, sync, store, refreshed, persisted, admitted, evicted, logs, sleeps, settled, recoveries, signOut: () => { signed = false; }, signIn: () => { signed = true; } };
 }
 
 const tokensOf = (a) => ({ accessToken: a.credential, refreshToken: a.refreshToken, expiresAt: a.expiresAt });
@@ -487,6 +489,82 @@ test('a refresh the provider rejects releases the lock and leaves the row as it 
   assert.equal(am.accounts[0].status, 'error');
   assert.equal(store.byKey(syncKeyFor(am.accounts[0])).Locked, null);
   assert.equal(store.blob(syncKeyFor(am.accounts[0])).accessToken, 'at-a-1');
+});
+
+// ── an account in error ──────────────────────────────────────
+
+test('a pass never writes an account in error over its row, and adopts a different token whatever its expiry', async () => {
+  const store = makeStore();
+  const a = claude('a');
+  // The store holds an older token than the dead one here — a sign-in elsewhere
+  // that this install's rejected copy would otherwise "beat" on expiry.
+  const elsewhere = { ...a, credential: 'at-a-elsewhere', refreshToken: 'rt-a-elsewhere', expiresAt: T0 + 2 * H };
+  store.put(syncKeyFor(a), encodeBlob(elsewhere, tokensOf(elsewhere), { now: T0, by: 'office' }));
+  const { sync, am } = setup([a], { store });
+  am.accounts[0].status = 'error';
+  am.accounts[0]._deadRefreshToken = 'rt-a-1';
+
+  const r = await sync.sync();
+  assert.equal(r.adopted, 1);
+  assert.equal(r.pushed, 0);
+  assert.ok(!store.calls.some((c) => c.method === 'PATCH'), 'the row is not written');
+  assert.equal(store.blob(syncKeyFor(a)).accessToken, 'at-a-elsewhere');
+  assert.equal(am.accounts[0].credential, 'at-a-elsewhere');
+  assert.equal(am.accounts[0].refreshToken, 'rt-a-elsewhere');
+  assert.equal(am.accounts[0].status, 'active');
+});
+
+test('an account in error whose row holds the same token, or the rejected one, is left in error and the row untouched', async () => {
+  const store = makeStore();
+  const a = claude('a');
+  store.put(syncKeyFor(a), encodeBlob({ ...a, credential: a.accessToken }, { accessToken: 'at-a-0', refreshToken: 'rt-a-dead', expiresAt: T0 }, { now: T0, by: 'office' }));
+  const { sync, am } = setup([a], { store });
+  am.accounts[0].status = 'error';
+  am.accounts[0]._deadRefreshToken = 'rt-a-dead';
+  const r = await sync.sync();
+  assert.equal(r.adopted + r.pushed, 0);
+  assert.equal(am.accounts[0].status, 'error');
+  assert.equal(am.accounts[0].credential, 'at-a-1');
+  assert.ok(!store.calls.some((c) => c.method === 'PATCH'));
+});
+
+test('an account in error with no row is not stored, and a re-import of its rejected refresh token is not either', async () => {
+  const { sync, am, store } = setup([claude('a'), claude('b')]);
+  am.accounts[0].status = 'error';
+  const r = await sync.sync();
+  assert.equal(r.created, 1, 'b only');
+  assert.equal(store.byKey(syncKeyFor(am.accounts[0])), null);
+
+  // b's refresh token was rejected; an import brings a new access token with it.
+  am.accounts[1]._deadRefreshToken = 'rt-b-1';
+  am.updateAccountTokens(1, { accessToken: 'at-b-2', refreshToken: 'rt-b-1', expiresAt: T0 + 30 * H });
+  await new Promise((res) => setImmediate(res));
+  assert.equal(store.blob(syncKeyFor(am.accounts[1])).accessToken, 'at-b-1');
+});
+
+test('an account that goes into error takes a token another install stored since, and is back in rotation', async () => {
+  const { sync, am, store, recoveries } = setup([claude('a')], { refresh: async () => { throw Object.assign(new Error('refresh 400'), { status: 400 }); } });
+  await sync.sync();
+  // Signed in again on another install, which stored the new token.
+  const key = syncKeyFor(am.accounts[0]);
+  const row = store.byKey(key);
+  const elsewhere = { ...claude('a'), credential: 'at-a-new', refreshToken: 'rt-a-new', expiresAt: T0 + 9 * H };
+  row.Data = JSON.stringify(encodeBlob(elsewhere, tokensOf(elsewhere), { now: T0, by: 'office' }));
+  // This install's own token still looks the newest by expiry.
+  am.accounts[0].expiresAt = T0 + 50 * H;
+
+  await am.ensureTokenFresh(0, true);
+  await Promise.all(recoveries);
+  assert.equal(recoveries.length, 1);
+  assert.equal(am.accounts[0].status, 'active');
+  assert.equal(am.accounts[0].credential, 'at-a-new');
+  assert.equal(am.accounts[0].refreshToken, 'rt-a-new');
+  assert.equal(store.blob(key).accessToken, 'at-a-new', 'the row is never written back over');
+
+  // A credential rejection with nothing new in the store: it stays in error.
+  am.markCredentialRejected(0, '401');
+  assert.equal(await recoveries[1], false);
+  assert.equal(am.accounts[0].status, 'error');
 });
 
 test('an account the store has never seen is renewed plainly, then stored', async () => {
