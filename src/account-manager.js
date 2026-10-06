@@ -413,6 +413,16 @@ function planOf(/** @type {Record<string, any>} */ account) {
   return account.hasClaudeMax === true ? 'Max' : account.hasClaudePro === true ? 'Pro' : null;
 }
 
+/**
+ * Whether an entry holds a `login --long-lived` token, which is never refreshed.
+ * An `importFrom` entry takes its token from a refreshing Claude Code login, so
+ * the marker means nothing there.
+ * @param {Record<string, any>} acct
+ */
+export function isLongLived(acct) {
+  return acct?.longLived === true && !acct.importFrom;
+}
+
 // Build a fresh in-memory account record from a config/disk account object.
 // Shared by the constructor and addAccount() so the field set can never drift
 // between startup accounts and runtime-added ones (a divergence here once left
@@ -515,8 +525,9 @@ function makeAccount(acct, index, listener = null) {
     // state, so the line is printed once rather than per refusal.
     threadRefusalReported: false,
     models: acct.models || null,
+    longLived: isLongLived(acct),
     credential: acct.accessToken || acct.apiKey,
-    refreshToken: acct.refreshToken || null,
+    refreshToken: isLongLived(acct) ? null : acct.refreshToken || null,
     expiresAt: acct.expiresAt || null,
     status: 'active',
     // Why the account last went to 'error' (see _needsLogin); read only while
@@ -6189,7 +6200,8 @@ export class AccountManager {
       code,
       detail,
       since: Date.now(),
-      remedy: providerOf(account) === 'codex' ? 'teamclaude login --codex' : 'teamclaude login',
+      remedy: providerOf(account) === 'codex' ? 'teamclaude login --codex'
+        : account.longLived ? 'teamclaude login --long-lived' : 'teamclaude login',
       link,
     };
     return account.errorReason;
@@ -6221,7 +6233,7 @@ export class AccountManager {
     if (!account || account.type !== 'oauth') return;
 
     account.credential = accessToken;
-    if (refreshToken) account.refreshToken = refreshToken;
+    if (refreshToken && !account.longLived) account.refreshToken = refreshToken;
     account.expiresAt = expiresAt;
     // Tokens from elsewhere (the store, a reload from disk) were not minted here.
     account._minted = false;

@@ -20,6 +20,32 @@ account. Retry after confirming the credential is valid, or pass
 credential the upstream rejects with 401 (and that cannot be refreshed) is
 refused regardless of `--name` — log in again to get a fresh one.
 
+## Long-lived login
+
+```bash
+teamclaude login --long-lived
+```
+
+The copy/paste flow of `login --token`, for a token that lasts a year instead of
+one that has to be refreshed. It asks for only `user:inference` and
+`user:profile` — the token endpoint grants a custom lifetime to nothing wider —
+and saves the entry with `"longLived": true` and no refresh token. A marked
+account is never refreshed; it needs a fresh `login --long-lived` when the year
+runs out, and an ordinary `login` or `import` of the same account clears the
+mark and returns it to refreshing. The login fails rather than saving anything
+when the server grants more than a day short of the year, and on an account whose entry names
+an `importFrom` file it replaces that delegation.
+
+The two scopes serve inference and the profile and usage reads. Claude Code's
+identity and control-plane calls go out on its own login (see
+[MITM mode](proxy-modes.md#mitm-proxy-mode-default)), and any other `GET` the
+two scopes do not reach takes the [scope-denial retry](routing.md#token-scope-denials)
+on that login.
+
+The mark only holds on an entry without `importFrom`: a delegated credentials
+file is a refreshing login, and an entry that names one is refreshed whatever
+the mark says.
+
 ## Import from Claude Code
 
 If you already have Claude Code set up, import its credentials directly:

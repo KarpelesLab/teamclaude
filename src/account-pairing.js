@@ -219,7 +219,12 @@ export function mergeAccountsForSave(configAccounts, managerAccounts, diskAccoun
       expiresAt: am.expiresAt,
     } : a;
     const diskAcct = diskAccounts[rowFor.get(i)];
-    return diskAcct ? { ...diskAcct, ...live } : live;
+    if (!diskAcct) return live;
+    const row = { ...diskAcct, ...live };
+    // The spread cannot delete a key, and an import clears the long-lived mark on
+    // the running entry only; left on disk, it would stop the account refreshing.
+    if (live.longLived !== true) delete row.longLived;
+    return row;
   });
 
   // Carry over rows that exist on disk and not in memory. The list used to be
