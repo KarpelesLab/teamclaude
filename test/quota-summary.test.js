@@ -157,9 +157,10 @@ test('backend windows fill the buckets no unified field covers', () => {
   const fiveReset = Date.now() + 3_600_000;
   const weekReset = Date.now() + 3 * 86_400_000;
   const monthReset = Date.now() + 22 * 86_400_000;
+  const at = Date.now() - 4 * 3_600_000;
   Object.assign(am.accounts[0].quota, {
     backend: {
-      label: 'Plan', text: '5h 52% · week 12%', utilization: 0.52, at: Date.now(),
+      label: 'Plan', text: '5h 52% · week 12%', utilization: 0.52, at,
       windows: {
         fiveHour: { utilization: 0.52, resetAt: fiveReset },
         weekly: { utilization: 0.12, resetAt: weekReset },
@@ -170,11 +171,32 @@ test('backend windows fill the buckets no unified field covers', () => {
 
   const summary = am.getQuotaSummary();
   const buckets = summary.accounts[0].buckets;
-  assert.deepEqual(buckets.fiveHour, { utilization: 0.52, remaining: 0.48, resetAt: fiveReset, source: 'backendFiveHour' });
-  assert.deepEqual(buckets.weeklyShared, { utilization: 0.12, remaining: 0.88, resetAt: weekReset, source: 'backendWeekly' });
-  assert.deepEqual(buckets.monthly, { utilization: 0.05, remaining: 0.95, resetAt: monthReset, source: 'backendMonthly' });
+  assert.deepEqual(buckets.fiveHour, { utilization: 0.52, remaining: 0.48, resetAt: fiveReset, source: 'backendFiveHour', observedAt: at });
+  assert.deepEqual(buckets.weeklyShared, { utilization: 0.12, remaining: 0.88, resetAt: weekReset, source: 'backendWeekly', observedAt: at });
+  assert.deepEqual(buckets.monthly, { utilization: 0.05, remaining: 0.95, resetAt: monthReset, source: 'backendMonthly', observedAt: at });
   assert.equal(buckets.weeklySonnet, null, 'a backend account has no family split');
   assert.equal(summary.aggregate.monthly, undefined, 'backend windows never join the aggregates');
+});
+
+// #510: a probe that keeps failing leaves the last good reading in place, and
+// a window with no reset never expires. The bucket states when it was read, so
+// the consumer can decide what "too old" means.
+test('a backend bucket states the age of its reading, and survives a failed probe with it', () => {
+  const am = new AccountManager([{ name: 'zai', type: 'apikey', apiKey: 'sk-test' }], 0.98);
+  const at = Date.now() - 6 * 3_600_000;
+  am.applyBackendQuota(0, { label: 'Plan', text: '5h 40%', utilization: 0.4, at, windows: { fiveHour: { utilization: 0.4, resetAt: null } } });
+  am.applyBackendQuota(0, { error: 'HTTP 503' });
+
+  const five = am.getQuotaSummary().accounts[0].buckets.fiveHour;
+  assert.equal(five.utilization, 0.4, 'the failed probe cleared nothing');
+  assert.equal(five.resetAt, null, 'and with no reset the window never expires');
+  assert.equal(five.observedAt, at, 'so its age is what says how much it is worth');
+});
+
+test('a unified bucket carries no observedAt: the key is the backend reading\'s own', () => {
+  const am = new AccountManager([oauth('pro', { rateLimitTier: 'default_claude_ai' })], 0.98);
+  Object.assign(am.accounts[0].quota, { unified5h: 0.9, unified5hReset: Date.now() + 3_600_000 });
+  assert.equal('observedAt' in am.getQuotaSummary().accounts[0].buckets.fiveHour, false);
 });
 
 test('a backend bucket never moves the aggregate, even with a tier configured', () => {
