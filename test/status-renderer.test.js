@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { renderStatus } from '../src/status-renderer.js';
+import { renderStatus, showSessionRow } from '../src/status-renderer.js';
+import { renderDashboardHtml } from '../src/dashboard.js';
 
 const now = Date.parse('2026-07-03T12:00:00Z');
 
@@ -606,4 +607,23 @@ test('renderStatus strips control characters out of account and route strings', 
   assert.match(output, /Blocked\s+custom/);
   assert.match(output, /pinned: a/);
   assert.equal(output.split('\n').filter(l => /forged/.test(l)).length, 1);   // no forged line
+});
+
+// #511: status, the TUI row and the dashboard card all ask this one function,
+// so they cannot disagree about a plan with no session window.
+test('showSessionRow hides the row only for a plan with no session window and no reading', () => {
+  assert.equal(showSessionRow({ sessionWindowStated: false, unified5h: null }), false);
+  assert.equal(showSessionRow({ sessionWindowStated: false }), false);
+  assert.equal(showSessionRow({ sessionWindowStated: false, unified5h: 0.99 }), true, 'a reading still present is drawn');
+  assert.equal(showSessionRow({ sessionWindowStated: false, unified5h: 0 }), true, 'zero is a reading');
+  assert.equal(showSessionRow({ sessionWindowStated: true, unified5h: null }), true);
+  assert.equal(showSessionRow({ unified5h: null }), true, 'an account that has not said keeps the row');
+  assert.equal(showSessionRow(null), true);
+});
+
+test('the dashboard card draws its Session row by the same rule', () => {
+  const html = renderDashboardHtml();
+  assert.ok(html.includes(showSessionRow.toString()), 'the page carries the shared helper');
+  assert.match(html, /if \(showSessionRow\(q\)\) card\.appendChild\(quotaRow\('Session'/);
+  assert.doesNotMatch(html, /^\s*card\.appendChild\(quotaRow\('Session'/m, 'no unconditional Session row is left');
 });

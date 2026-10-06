@@ -29,7 +29,7 @@ import { mergeAccountsForSave, syncRefreshedTokens, removedAccountIds, clearRemo
 import { ensureAccountIds } from './account-id.js';
 import * as alias from './alias.js';
 import { ensureCerts, mitmHosts } from './mitm.js';
-import { Prober } from './prober.js';
+import { Prober, probeApplicable } from './prober.js';
 import { ResetCreditRedeemer } from './codex-reset-credits.js';
 import { Warmer, warmApplicable } from './warmer.js';
 import { formatWarmupScheduleConfirmation, resolveWarmupConfig } from './warmup-schedule.js';
@@ -843,9 +843,8 @@ async function serverCommand() {
       running: false,
       accounts: accountManager.accounts.map(account => ({
         name: account.name,
-        // Same rule as Prober._isProbeTarget: a third-party backend has no
-        // Anthropic usage to read, so it is not-applicable rather than pending.
-        status: (account.type === 'oauth' && !account.upstream) ? 'never' : 'not-applicable',
+        // The Prober's own rule, not a copy of it (#512).
+        status: probeApplicable(account) ? 'never' : 'not-applicable',
         lastProbedAt: null,
         startedAt: null,
         durationMs: null,

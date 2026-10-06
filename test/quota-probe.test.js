@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { normalizeUsageBucket, findScopedWeeklyLimit, normalizeUsagePayload } from '../src/oauth.js';
 import { AccountManager, isFableModel, parseRequestModel } from '../src/account-manager.js';
-import { Prober, MAX_PROBE_INTERVAL_MS } from '../src/prober.js';
+import { Prober, MAX_PROBE_INTERVAL_MS, probeApplicable } from '../src/prober.js';
 
 function oauth(name, extra = {}) {
   return { name, type: 'oauth', accessToken: 't-' + name, expiresAt: Date.now() + 3600_000, ...extra };
@@ -334,6 +334,23 @@ test('a third-party backend reads not-applicable, not a pending probe', () => {
   const rows = new Prober(am, { intervalMs: 300_000, log: () => {} }).getStatus().accounts;
   assert.equal(rows[0].status, 'never');            // probed, just not yet
   assert.equal(rows[1].status, 'not-applicable');   // nothing to probe, ever
+});
+
+// #512: the status a server reports before its Prober exists is built from
+// probeApplicable, so it has to give the Prober's own answer for every kind of
+// account — a backend with a quota provider included, which the old copy of the
+// rule in index.js called not-applicable.
+test('probeApplicable agrees with the Prober for every kind of account', () => {
+  const am = new AccountManager([
+    oauth('claude'),
+    { ...oauth('codex'), provider: 'codex', accountId: 'acct-1' },
+    { name: 'deepseek', type: 'apikey', apiKey: 'sk', upstream: 'https://api.deepseek.com/anthropic' },
+    { name: 'silent', type: 'apikey', apiKey: 'sk', upstream: 'https://api.example.invalid/anthropic' },
+    { name: 'key', type: 'apikey', apiKey: 'sk' },
+  ], 0.98);
+  const rows = new Prober(am, { intervalMs: 300_000, log: () => {} }).getStatus().accounts;
+  assert.deepEqual(rows.map(r => r.status), ['never', 'never', 'never', 'not-applicable', 'not-applicable']);
+  assert.deepEqual(am.accounts.map(a => probeApplicable(a)), [true, true, true, false, false]);
 });
 
 test('prober skips API-key accounts', async () => {
