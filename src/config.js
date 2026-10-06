@@ -116,6 +116,7 @@ export function createDefaultConfig() {
     autoRedeemResets: false,
     blockedModels: [],
     stripOverageHeaders: false,
+    synthesizeQuotaHeaders: false,
     accounts: [],
   };
 }
