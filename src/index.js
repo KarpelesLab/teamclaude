@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { createWriteStream } from 'node:fs';
 import { readFile } from 'node:fs/promises';
@@ -51,6 +51,8 @@ import { proxyFetch } from './upstream-fetch.js';
 import { upstreamFor } from './provider.js';
 import { startEventLoopMonitor } from './event-loop-monitor.js';
 import { envVar } from './brand.js';
+import { loginCallback, loadCallbackToken, saveCallbackToken, callbackWhoami, logoutCallback, callbackClientId, getCallbackAuthPath, callbackCall } from './callback-auth.js';
+import { CredentialSync, syncKeyFor } from './credential-sync.js';
 
 // Where a new API key joins the rotation. A key is metered: every token it
 // serves is billed, while a subscription's quota is paid for whether it is
@@ -120,6 +122,14 @@ const ROUTING_USAGE = [
   'is http. A new URL is tested first (a tunnel to the account\'s upstream; no',
   'request is sent) and refused if the proxy does not answer. Changes apply to a',
   'running server immediately.',
+].join('\n');
+
+const CALLBACK_USAGE = [
+  'Usage: teamclaude callback login [--no-browser] [--force]   Sign this install in to callback.net',
+  '       teamclaude callback status                            Show who is signed in',
+  '       teamclaude callback sync                              Reconcile the running server with the credential store now',
+  '       teamclaude callback forget <account> [--org <org>]    Remove the account here and delete its tokens from the store',
+  '       teamclaude callback logout                            Revoke the session and forget it',
 ].join('\n');
 
 const args = process.argv.slice(2);
@@ -221,6 +231,10 @@ switch (command) {
     await updateCommand();
     process.exit(0);
     break;
+  case 'callback':
+    await callbackCommand();
+    process.exit(0);
+    break;
   case 'version':
   case '--version':
   case '-V':
@@ -277,20 +291,26 @@ async function serverCommand() {
   // --activity-log <file>
   const activityLogPath = argValue('--activity-log') || null;
 
-  if (config.accounts.length === 0) {
+  // An empty pool is a configuration error — unless this install is signed in
+  // to callback.net, where the credential store may hold the accounts: a fresh
+  // machine gets them from the first sync pass, which needs a running server.
+  const syncMayFill = config.accounts.length === 0 && !!(await loadCallbackToken().catch(() => null));
+  if (config.accounts.length === 0 && !syncMayFill) {
     console.error('No accounts configured.\n');
     console.error('Add an account first:');
     console.error('  teamclaude import           Import from Claude Code');
     console.error('  teamclaude login            OAuth login via browser');
     console.error('  teamclaude login --api      Add an API key (last resort by default; --priority <n>)');
+    console.error('  teamclaude callback login   Sign in to callback.net and take the accounts of your other installs');
     process.exit(1);
   }
 
   const accounts = await resolveAccounts(config);
-  if (accounts.length === 0) {
+  if (accounts.length === 0 && !syncMayFill) {
     console.error('No valid accounts after initialization');
     process.exit(1);
   }
+  if (syncMayFill) console.log('[TeamClaude] No accounts configured; signed in to callback.net, so the credential store will be checked for them');
 
   // `accounts[].models` (#74) is superseded by the `routes` table (#86). Routes
   // do the same job with glob matching, several accounts per rule and a bucket
@@ -346,9 +366,35 @@ async function serverCommand() {
 
   // Periodically persist quota (and once more on shutdown) to the state file.
   const persistQuotaState = () =>
-    saveState({ quota: accountManager.exportQuotaState(), clients: clientUsage.exportState(), usageDimensions: dimensionUsage.exportState() })
+    saveState({ quota: accountManager.exportQuotaState(), clients: clientUsage.exportState(), usageDimensions: dimensionUsage.exportState(), callbackSync: credentialSync.exportState() })
       .catch(err => console.error(`[TeamClaude] Failed to save quota state: ${err.message}`));
   let quotaSaveInterval = null;
+
+  // An account admitted from somewhere other than this install's config: the
+  // callback.net credential store (credential-sync.js). Same three lists the
+  // refresh persistence below keeps in step for an account found on disk —
+  // config, manager, disk — and the same guard against an entry already there.
+  const admitAccount = (/** @type {Record<string, any>} */ entry) => {
+    if (config.accounts.some((/** @type {any} */ a) => sameIdentity(a, entry)) || accountManager.accounts.some((/** @type {any} */ a) => sameIdentity(a, entry))) return null;
+    config.accounts.push(entry);
+    ensureAccountIds(config.accounts);
+    const idx = accountManager.addAccount(entry);
+    atomicConfigUpdate((/** @type {any} */ diskConfig) => {
+      if (!diskConfig.accounts.some((/** @type {any} */ a) => sameIdentity(a, entry))) diskConfig.accounts.push(entry);
+    }).catch((/** @type {any} */ err) => console.error(`[TeamClaude] Failed to save an account added from callback.net: ${err.message}`));
+    return idx;
+  };
+
+  // Credential sync through callback.net: active only while this install is
+  // signed in (`teamclaude callback login`); dormant otherwise. Every token
+  // refresh goes through its lock, every local token change is stored, and a
+  // pass at start, on reload and daily brings the fleet level with the store.
+  const credentialSync = new CredentialSync({
+    accountManager, addAccount: admitAccount, state: savedState?.callbackSync || null,
+    onStateChange: () => { persistQuotaState(); },
+  });
+  accountManager.setRefreshCoordinator((account, refresh) => credentialSync.coordinateRefresh(account, refresh));
+  accountManager.onAccountRemoved((account) => credentialSync.onAccountRemoved(account));
 
   // Persist refreshed tokens back to config (re-read from disk to avoid clobbering
   // accounts added externally, e.g. by `teamclaude import` while server is running)
@@ -386,6 +432,9 @@ async function serverCommand() {
         diskConfig.accounts[cfgIdx].expiresAt = newTokens.expiresAt;
       }
     }).catch(err => console.error(`[TeamClaude] Failed to save refreshed token: ${err.message}`));
+    // And to the credential store, when signed in. Not awaited: the disk
+    // write above is the one that must land; the store follows.
+    credentialSync.onLocalTokens(idx, newTokens).catch(() => {});
   });
   const port = config.proxy.port;
   // Bind loopback by default so the proxy isn't reachable off-box (it injects
@@ -439,6 +488,10 @@ async function serverCommand() {
     const diskConfig = await loadConfig();
     if (!diskConfig) return { added: 0, removed: 0 };
     const { added, removed } = await syncAccountsFromDisk(diskConfig, config, accountManager);
+    // `teamclaude callback login` notifies through a reload, so this is where a
+    // fresh sign-in brings the store's accounts in; the pass is also what makes
+    // an import or login on this install reach the other ones.
+    credentialSync.sync('reload').catch(() => {});
     // Pick up client-key edits (proxy.clientKeys is read live by both auth
     // gates through the shared config object, so refreshing it here is all a
     // key add/rotate/revoke needs — no restart).
@@ -729,6 +782,7 @@ async function serverCommand() {
       upstream: config.upstream || 'https://api.anthropic.com',
       eventLoop: eventLoopMonitor.status(),
     },
+    callbackSync: credentialSync.summary(),
     probe: prober?.getStatus() || {
       enabled: false,
       intervalSeconds: config.quotaProbeSeconds || 0,
@@ -852,6 +906,10 @@ async function serverCommand() {
   });
   warmer.start();
 
+  // The first credential-sync pass, and the daily one after it. Not awaited:
+  // the store is reached over the network and the proxy serves meanwhile.
+  credentialSync.start().catch(() => {});
+
   // Background self-update for a backgrounded (headless) server. Skipped under
   // the TUI, where npm's install output would corrupt the display — interactive
   // users update via `teamclaude run` (post-session) or `teamclaude update`.
@@ -875,6 +933,7 @@ async function serverCommand() {
     if (!tui) console.log('\n[TeamClaude] Shutting down...');
     prober?.stop();
     warmer?.stop();
+    credentialSync.stop();
     eventLoopMonitor.stop();
     if (quotaSaveInterval) clearInterval(quotaSaveInterval);
     await persistQuotaState();
@@ -2146,6 +2205,160 @@ async function distributeCommand() {
 
 // ── update ──────────────────────────────────────────────────
 
+// ── callback.net ────────────────────────────────────────────
+
+/** `Name <email>`, whichever parts the profile has. */
+function describeCallbackUser(/** @type {{ id: string|null, email: string|null, name: string|null }} */ me) {
+  if (me.name && me.email) return `${me.name} <${me.email}>`;
+  return me.name || me.email || me.id || 'an unnamed user';
+}
+
+// Best effort and never in the way: the URL is printed before this runs, so a
+// machine with no browser (SSH, a container) loses nothing. Detached with no
+// stdio, so an opener that falls back to a text browser cannot take the
+// terminal, and one that hangs cannot hold the sign-in up.
+function openInBrowser(/** @type {string} */ url) {
+  const win = process.platform === 'win32';
+  const opener = process.platform === 'darwin' ? 'open' : win ? 'start' : 'xdg-open';
+  try {
+    // `start` reads its first quoted argument as a window title, and cmd would
+    // split an unquoted URL at `&`.
+    const child = spawn(opener, win ? ['""', `"${url}"`] : [url], { stdio: 'ignore', shell: win, detached: !win });
+    child.on('error', () => {});
+    child.unref();
+  } catch { /* no opener: the URL is on the screen */ }
+}
+
+// Sign-in to callback.net: a poll-token OAuth2 flow (see callback-auth.js), so
+// the browser that approves it can be on any machine. The token is this
+// install's own and lives beside the config, apart from the pooled accounts.
+async function callbackCommand() {
+  const sub = args[1];
+  if (sub === 'login') {
+    if (!args.includes('--force') && await loadCallbackToken()) {
+      try {
+        const me = await callbackWhoami();
+        console.log(`Already signed in to callback.net as ${describeCallbackUser(me)}.`);
+        console.log('Run `teamclaude callback logout` first, or pass --force to sign in again.');
+        return;
+      } catch (/** @type {any} */ err) {
+        // A session the server no longer honours is replaced; anything else
+        // (network down) is not a reason to throw a working token away.
+        if (!err?.loginRequired) {
+          console.error(`Could not check the existing callback.net session: ${err?.message || err}`);
+          console.error('Pass --force to sign in again regardless.');
+          process.exit(1);
+        }
+      }
+    }
+    if (!callbackClientId()) {
+      console.error('No callback.net client id is configured. Set TEAMROUTER_CALLBACK_CLIENT_ID to the OAuth2 app id to sign in as.');
+      process.exit(1);
+    }
+    let token;
+    try {
+      token = await loginCallback({
+        onUrl: (url, { lifetimeSeconds }) => {
+          console.log('Open this URL to sign in to callback.net:');
+          console.log('');
+          console.log(`  ${url}`);
+          console.log('');
+          console.log(`Waiting for approval (the link is good for ${Math.round(lifetimeSeconds / 60)} minutes; Ctrl-C to cancel)...`);
+          if (!args.includes('--no-browser')) openInBrowser(url);
+        },
+      });
+    } catch (/** @type {any} */ err) {
+      console.error(`callback.net sign-in failed: ${err?.message || err}`);
+      process.exit(1);
+    }
+    await saveCallbackToken(token);
+    const me = await callbackWhoami().catch(() => null);
+    console.log(`Signed in to callback.net${me ? ` as ${describeCallbackUser(me)}` : ''}`);
+    console.log(`Token saved to ${getCallbackAuthPath()}`);
+    // A running server syncs on reload, so the store's accounts arrive now
+    // rather than at the next start. Only an existing config names a server;
+    // signing in is not a reason to create one.
+    const existing = await loadConfig().catch(() => null);
+    if (existing) await notifyRunningServer(existing);
+    return;
+  }
+  if (sub === 'status' || sub === undefined) {
+    try {
+      const me = await callbackWhoami();
+      console.log(`Signed in to callback.net as ${describeCallbackUser(me)}`);
+    } catch (/** @type {any} */ err) {
+      if (err?.loginRequired) {
+        console.error((await loadCallbackToken())
+          ? 'The callback.net session has expired. Run `teamclaude callback login`.'
+          : 'Not signed in to callback.net. Run `teamclaude callback login`.');
+      } else {
+        console.error(`Could not reach callback.net: ${err?.message || err}`);
+      }
+      process.exit(1);
+    }
+    return;
+  }
+  if (sub === 'logout') {
+    const { wasSignedIn, revoked } = await logoutCallback();
+    if (!wasSignedIn) console.log('Not signed in to callback.net.');
+    else console.log(revoked ? 'Signed out of callback.net.' : 'Signed out of callback.net locally (the session could not be revoked upstream; it expires on its own).');
+    return;
+  }
+  if (sub === 'sync') {
+    // The running server owns the fleet, so the pass runs there: a reload is
+    // what triggers it. Without a server there is nothing to reconcile yet;
+    // the next start does the pass.
+    const config = await loadOrCreateConfig();
+    if (!await isProxyUp(config.proxy.port)) {
+      console.error('No server is running; it syncs with callback.net when it starts, on every reload, and daily.');
+      process.exit(1);
+    }
+    await notifyRunningServer(config);
+    // The reload hands the pass off without waiting for it, so status is read
+    // after the pass has had the time a list and a few writes take.
+    /** @type {any} */
+    let status = null;
+    for (let i = 0; i < 20 && !status?.callbackSync?.lastSyncAt && !status?.callbackSync?.lastError; i++) {
+      await new Promise(resolve => setTimeout(resolve, 500));
+      status = await fetch(`http://localhost:${config.proxy.port}/teamclaude/status`, { headers: { 'x-api-key': config.proxy.apiKey }, signal: AbortSignal.timeout(5_000) })
+        .then(r => r.json()).catch(() => null);
+    }
+    const s = status?.callbackSync;
+    if (!s) { console.log('Reload sent.'); return; }
+    if (s.lastError) { console.error(`Sync failed: ${s.lastError}`); process.exit(1); }
+    console.log(`Synced with callback.net: ${s.rows} account${s.rows === 1 ? '' : 's'} in the store${s.lastSyncAt ? ` (last pass ${new Date(s.lastSyncAt).toISOString()})` : ''}.`);
+    return;
+  }
+  if (sub === 'forget') {
+    // `teamclaude remove` plus the store: the account leaves this install and
+    // its row is deleted, so no install re-creates it from here. The other
+    // installs keep their copy until they remove it themselves. Local first:
+    // a running server told of the removal remembers the key, so its own pass
+    // does not put the row straight back.
+    const config = await loadOrCreateConfig();
+    const name = args[2];
+    if (!name) { console.error('Usage: teamclaude callback forget <account-name|email> [--org <name|uuid>]'); process.exit(1); }
+    const account = resolveAccount(config.accounts, name, argValue('--org'));
+    if (!account) { console.error(`Account "${name}" not found`); process.exit(1); }
+    if (!syncKeyFor(account)) { console.error(`Account "${account.name}" is not one the sync carries (only OAuth logins are); use \`teamclaude remove\`.`); process.exit(1); }
+    config.accounts.splice(config.accounts.indexOf(account), 1);
+    await saveConfig(config);
+    console.log(`Removed account "${account.name}" from this install`);
+    await notifyRunningServer(config);
+    const sync = new CredentialSync({ accountManager: /** @type {any} */ ({ accounts: [], updateAccountTokens() {} }), addAccount: () => null, api: callbackCall, log: () => {} });
+    try {
+      const deleted = await sync.forget(account);
+      console.log(deleted ? `Removed "${account.name}" from the callback.net credential store.` : `"${account.name}" was not in the callback.net credential store.`);
+    } catch (/** @type {any} */ err) {
+      console.error(err?.loginRequired ? 'Not signed in to callback.net, so the store still holds it. Run `teamclaude callback login` and forget it again.' : `Could not reach callback.net, so the store still holds it: ${err?.message || err}`);
+      process.exit(1);
+    }
+    return;
+  }
+  console.error(CALLBACK_USAGE);
+  process.exit(1);
+}
+
 async function updateCommand() {
   const cur = currentVersion();
   console.log(`Current version: ${cur || 'unknown'}`);
@@ -2478,6 +2691,15 @@ Commands:
   warmup rolling HH:MM --timezone Area/City
                       Anchor a continuous five-hour reset cadence in an IANA zone
   api <path>          Call an API endpoint with account credentials
+  callback login      Sign this install in to callback.net (prints a URL to
+                      approve in any browser; --no-browser to not open one).
+                      While signed in, OAuth account tokens are kept in step
+                      with every other signed-in install of yours
+  callback status     Show who is signed in to callback.net
+  callback sync       Reconcile the running server with the store now
+  callback forget <account>
+                      Remove the account here and delete its tokens from the store
+  callback logout     Revoke that session and forget it
   update              Check npm for a newer teamclaude and install it
   version             Print the installed version
   help                Show this help

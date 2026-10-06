@@ -111,6 +111,8 @@ Every `TEAMCLAUDE_*` variable below is also read under the name `TEAMROUTER_*`, 
 | `TEAMCLAUDE_HOST` | Override `proxy.host` |
 | `TEAMCLAUDE_DISABLE_AUTOUPDATE` | Set to `1` to skip the background self-update check |
 | `TEAMCLAUDE_CONFIG_LOCK_WAIT_MS` | How long a writer waits for another process's `<config>.lock` before writing without it (default `2000`). See [Where it lives](#where-it-lives) |
+| `TEAMCLAUDE_CALLBACK_CLIENT_ID` | The OAuth2 app `teamclaude callback login` signs in to callback.net as, for a self-registered app or a test realm. The built-in id is the project's own |
+| `TEAMCLAUDE_CALLBACK_API_BASE` | Where the callback.net API is reached (default `https://www.callback.net`). Must be `https://`, or plain `http://` to this machine only, since the session token travels to whatever this names. See [Syncing accounts across machines](accounts.md#syncing-accounts-across-machines-callbacknet) |
 | `TEAMCLAUDE_STATUS_TIMEOUT_MS` | How long `teamclaude status` waits for the server's answer before giving up (default `5000`). A connection that is accepted but never answered is reported as a stalled or overloaded server, distinct from a refused one ("Is the server running?") |
 | `HTTPS_PROXY` / `ALL_PROXY` | Outbound proxy used when the config sets no `upstreamProxy` (lowercase forms honoured too) |
 | `NO_PROXY` | Hosts that bypass the outbound proxy, when the config sets no `noProxy`. Also inherited by clients that `teamclaude run`/`env` launch — their loopback entries are added to yours, and `*` is ignored |
