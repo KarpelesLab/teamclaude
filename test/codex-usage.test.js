@@ -21,6 +21,40 @@ test('normalizes Codex wham usage windows and model buckets', () => {
   assert.equal(usage.planType, 'pro');
 });
 
+// Plans differ in which windows they carry, so a window is filed by its own
+// length, with the same tolerance the header path uses — never by "anything
+// long is weekly". A monthly window is not a weekly one, and must not land in
+// the weekly bucket the selection gates on.
+test('a window that is neither five hours nor seven days is dropped, not misfiled', () => {
+  const monthly = normalizeCodexUsagePayload({
+    rate_limit: { primary_window: { used_percent: 40, limit_window_seconds: 2592000, reset_at: 1702000000 }, secondary_window: null },
+  });
+  assert.equal(monthly.sevenDay, null, 'a 30-day window is not weekly');
+  assert.equal(monthly.fiveHour, null);
+
+  const hourly = normalizeCodexUsagePayload({
+    rate_limit: { primary_window: { used_percent: 40, limit_window_seconds: 3600, reset_at: 1700000000 } },
+  });
+  assert.equal(hourly.fiveHour, null, 'a one-hour window is not the five-hour one');
+
+  // A monthly window listed first must not shadow the weekly one behind it.
+  const both = normalizeCodexUsagePayload({
+    rate_limit: {
+      primary_window: { used_percent: 90, limit_window_seconds: 2592000, reset_at: 1702000000 },
+      secondary_window: { used_percent: 40, limit_window_seconds: 604800, reset_at: 1700604800 },
+    },
+  });
+  assert.deepEqual(both.sevenDay, { utilization: 0.4, resetAt: 1700604800000 });
+});
+
+test('a weekly-only plan reads as weekly with no five-hour window', () => {
+  const usage = normalizeCodexUsagePayload({
+    rate_limit: { primary_window: { used_percent: 40, limit_window_seconds: 604800, reset_at: 1700604800 }, secondary_window: null },
+  });
+  assert.equal(usage.fiveHour, null);
+  assert.deepEqual(usage.sevenDay, { utilization: 0.4, resetAt: 1700604800000 });
+});
+
 // The shape a live subscription actually sends: a LIST whose entries name
 // themselves. `Object.entries` over it yields array indices, so before this was
 // handled every bucket was filed as "0" and "1" — names that identify nothing,

@@ -35,6 +35,24 @@ test('renderStatus prints core status', () => {
   assert.match(output, /2 req, 1.5k tok/);
 });
 
+// A subscription that meters no session window says so (sessionWindowStated
+// false); an empty Session row would read as "unknown" for something that does
+// not exist.
+test('renderStatus leaves out the Session row for a plan with no session window', () => {
+  const status = sampleStatus();
+  status.accounts[0].quota = { unified5h: null, unified7d: 0.4, unified7dReset: now + 86_400_000, sessionWindowStated: false };
+  const output = renderStatus(status, { color: false, now });
+  assert.doesNotMatch(output, /Session/);
+  assert.match(output, /Weekly\s+\[/);
+});
+
+test('renderStatus still draws a Session reading the plan flag says it lacks', () => {
+  const status = sampleStatus();
+  status.accounts[0].quota = { unified5h: 0.99, unified5hReset: now + 3_600_000, unified7d: 0.1, unified7dReset: now + 86_400_000, sessionWindowStated: false };
+  const output = renderStatus(status, { color: false, now });
+  assert.match(output, /Session\s+\[.*\] 99%/);
+});
+
 test('renderStatus shows an OAuth entitlement cooldown separately from account status', () => {
   const status = sampleStatus();
   status.accounts[0].entitlementDeniedUntil = new Date(now + 4 * 60_000).toISOString();
