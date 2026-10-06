@@ -25,9 +25,11 @@
 // third-party backend accounts are not synced: a key does not expire, and a
 // backend credential is not ours to renew.
 //
-// Removal is local: an account removed here is remembered by its key so its
-// row does not bring it back, and `teamclaude callback forget` deletes the row
-// for every install.
+// Removal travels too. An account removed on one install leaves a TOMBSTONE in
+// its row (`{"_deleted": "<time>"}`); every other install's next pass removes
+// the account, a refresh never writes over a tombstone, and only an explicit
+// sign-in (`login`, `import`) does. A pass deletes a tombstone older than a
+// week, by which time every install that was going to see it has.
 
 import { hostname } from 'node:os';
 import { callbackCall, loadCallbackToken } from './callback-auth.js';
@@ -48,6 +50,8 @@ const MAX_LOCK_ROUNDS = 3;
 export const SYNC_INTERVAL_MS = 24 * 3600 * 1000;
 const PAGE_SIZE = 100;
 const MAX_PAGES = 50;
+/** A tombstone this old has been seen by every install that still runs, and goes. */
+export const TOMBSTONE_TTL_MS = 7 * 24 * 3600 * 1000;
 
 /**
  * @typedef {{ accessToken: string, refreshToken: string, expiresAt: number }} Tokens
@@ -55,7 +59,7 @@ const MAX_PAGES = 50;
  *   accountId?: string, userId?: string, organizationType?: string, rateLimitTier?: string, seatTier?: string,
  *   hasClaudeMax?: boolean|null, hasClaudePro?: boolean|null, accessToken: string, refreshToken: string,
  *   expiresAt: number, updatedAt: number, by: string }} Blob
- * @typedef {{ id: string, key: string, blob: Blob|null, updated: number }} Row
+ * @typedef {{ id: string, key: string, blob: Blob|null, deletedAt: number|null, updated: number }} Row
  * @typedef {(method: string, path: string, params?: Record<string, any>|null, opts?: any) => Promise<any>} Api
  */
 
@@ -127,6 +131,25 @@ export function decodeBlob(text) {
   return b;
 }
 
+/**
+ * When a row's contents are a tombstone, the time of the removal (epoch ms);
+ * null for anything else, including a tombstone whose time does not parse.
+ * @param {unknown} text
+ */
+export function tombstoneOf(text) {
+  if (typeof text !== 'string') return null;
+  let b;
+  try { b = JSON.parse(text); } catch { return null; }
+  if (!b || typeof b !== 'object' || b._deleted == null) return null;
+  const at = typeof b._deleted === 'number' ? b._deleted : Date.parse(String(b._deleted));
+  return Number.isFinite(at) ? at : null;
+}
+
+/** The row contents that say "removed", as of `now`. */
+export function tombstone(now = Date.now()) {
+  return { _deleted: new Date(now).toISOString() };
+}
+
 /** The account entry a row describes, for an install that does not have it. */
 export function entryFromBlob(/** @type {Blob} */ blob) {
   /** @type {Record<string, any>} */
@@ -151,7 +174,7 @@ function supersedes(/** @type {Blob|null} */ blob, /** @type {Record<string, any
 
 /** @param {any} r @returns {Row} */
 function rowOf(r) {
-  return { id: String(r.User_Credential__), key: String(r.Key), blob: decodeBlob(r.Data), updated: Number(r?.Updated?.unixms) || 0 };
+  return { id: String(r.User_Credential__), key: String(r.Key), blob: decodeBlob(r.Data), deletedAt: tombstoneOf(r.Data), updated: Number(r?.Updated?.unixms) || 0 };
 }
 
 export class CredentialSync {
@@ -159,27 +182,24 @@ export class CredentialSync {
    * @param {Object} opts
    * @param {import('./account-manager.js').AccountManager} opts.accountManager
    * @param {(entry: Record<string, any>) => number|null} opts.addAccount  admit a new account (config, disk, manager); its manager index, or null when refused
+   * @param {(account: Record<string, any>) => void} [opts.evictAccount]  remove an account the store says is gone (config, disk, manager)
    * @param {Api} [opts.api]
    * @param {() => Promise<boolean>} [opts.isSignedIn]
    * @param {(line: string) => void} [opts.log]
    * @param {() => number} [opts.now]
    * @param {(ms: number) => Promise<void>} [opts.sleep]
    * @param {string} [opts.by]
-   * @param {{ ignored?: Record<string, number> }|null} [opts.state]
-   * @param {() => void} [opts.onStateChange]
    */
-  constructor({ accountManager, addAccount, api = callbackCall, isSignedIn = async () => !!(await loadCallbackToken()), log = (l) => console.log(l), now = Date.now, sleep = (ms) => new Promise((r) => { setTimeout(r, ms); }), by = hostname(), state = null, onStateChange = () => {} }) {
+  constructor({ accountManager, addAccount, evictAccount = () => {}, api = callbackCall, isSignedIn = async () => !!(await loadCallbackToken()), log = (l) => console.log(l), now = Date.now, sleep = (ms) => new Promise((r) => { setTimeout(r, ms); }), by = hostname() }) {
     this.am = accountManager;
     this.addAccount = addAccount;
+    this.evictAccount = evictAccount;
     this.api = api;
     this.isSignedIn = isSignedIn;
     this.log = log;
     this.now = now;
     this.sleep = sleep;
     this.by = by;
-    this.onStateChange = onStateChange;
-    /** Keys of accounts removed on this install: their rows must not bring them back. */
-    this.ignored = new Map(Object.entries(state?.ignored || {}).filter(([, t]) => Number.isFinite(t)));
     /** What the store holds, as last seen: key → row. */
     this.rows = new Map();
     /** @type {Promise<any>|null} */
@@ -190,13 +210,12 @@ export class CredentialSync {
     this.lastError = null;
   }
 
-  exportState() {
-    return { ignored: Object.fromEntries(this.ignored) };
-  }
-
   /** What status reports. */
   summary() {
-    return { lastSyncAt: this.lastSyncAt, lastError: this.lastError, rows: this.rows.size, ignored: this.ignored.size };
+    let rows = 0;
+    let tombstones = 0;
+    for (const r of this.rows.values()) { if (r.deletedAt != null) tombstones++; else rows++; }
+    return { lastSyncAt: this.lastSyncAt, lastError: this.lastError, rows, tombstones };
   }
 
   /** Run a pass now and every SYNC_INTERVAL_MS from then on. */
@@ -235,7 +254,7 @@ export class CredentialSync {
    * rejects, and nothing it did before failing is undone.
    *
    * @param {string} [reason]
-   * @returns {Promise<{ signedIn: boolean, adopted: number, pushed: number, created: number, added: number, rows: number }>}
+   * @returns {Promise<{ signedIn: boolean, adopted: number, pushed: number, created: number, added: number, evicted: number, expired: number, rows: number }>}
    */
   sync(reason = 'manual') {
     if (this._syncing) return this._syncing;
@@ -245,19 +264,25 @@ export class CredentialSync {
 
   /** @param {string} reason */
   async _sync(reason) {
-    const result = { signedIn: false, adopted: 0, pushed: 0, created: 0, added: 0, rows: 0 };
+    const result = { signedIn: false, adopted: 0, pushed: 0, created: 0, added: 0, evicted: 0, expired: 0, rows: 0 };
     if (!await this.isSignedIn()) { this.rows.clear(); return result; }
     result.signedIn = true;
     try {
       this.rows = await this._list();
-      result.rows = this.rows.size;
       const matched = new Set();
+
+      // A tombstone every install has had a week to see is done with.
+      for (const row of [...this.rows.values()]) {
+        if (row.deletedAt == null || this.now() - row.deletedAt < TOMBSTONE_TTL_MS) continue;
+        await this.api('DELETE', `User/Credential/${row.id}`);
+        this.rows.delete(row.key);
+        result.expired++;
+      }
+      result.rows = this.rows.size;
 
       for (const account of [...this.am.accounts]) {
         const key = syncKeyFor(account);
         if (!key) continue;
-        // The account is here, so its removal is no longer something to remember.
-        if (this.ignored.delete(key)) this.onStateChange();
         const row = this._rowFor(account);
         if (!row) {
           await this._create(account, this._tokens(account));
@@ -265,6 +290,14 @@ export class CredentialSync {
           continue;
         }
         matched.add(row.key);
+        if (row.deletedAt != null) {
+          // Removed on another install. A sign-in since would have replaced the
+          // tombstone (storeSignIn), so the account here is a copy to drop.
+          this.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" was removed on another install (${new Date(row.deletedAt).toISOString()}); removing it here`);
+          this.evictAccount(account);
+          result.evicted++;
+          continue;
+        }
         if (supersedes(row.blob, account)) {
           this._adopt(account, /** @type {Blob} */ (row.blob), `sync (${reason})`);
           result.adopted++;
@@ -281,7 +314,6 @@ export class CredentialSync {
 
       for (const row of this.rows.values()) {
         if (matched.has(row.key) || !row.blob) continue;
-        if (this.ignored.has(row.key)) continue;
         // Matched above by identity, so a row left over names an account this
         // install does not have.
         if (this.am.accounts.some((a) => sameIdentity(a, row.blob))) continue;
@@ -293,8 +325,8 @@ export class CredentialSync {
       }
       this.lastSyncAt = this.now();
       this.lastError = null;
-      if (result.adopted || result.pushed || result.created || result.added) {
-        this.log(`[TeamClaude] callback.net sync (${reason}): ${result.adopted} adopted, ${result.pushed} updated, ${result.created} stored, ${result.added} added`);
+      if (result.adopted || result.pushed || result.created || result.added || result.evicted || result.expired) {
+        this.log(`[TeamClaude] callback.net sync (${reason}): ${result.adopted} adopted, ${result.pushed} updated, ${result.created} stored, ${result.added} added, ${result.evicted} removed, ${result.expired} tombstones expired`);
       }
       return result;
     } catch (/** @type {any} */ err) {
@@ -367,6 +399,7 @@ export class CredentialSync {
     if (!await this.isSignedIn()) return;
     try {
       const row = this._rowFor(account);
+      if (row?.deletedAt != null) return; // removed elsewhere; a refresh does not bring it back, a sign-in (storeSignIn) does
       if (row?.blob && row.blob.accessToken === tokens.accessToken) return;
       if (row?.blob && row.blob.expiresAt > tokens.expiresAt) return; // the store is ahead; the next pass brings it here
       if (row) await this._patch(row, account, tokens);
@@ -376,29 +409,50 @@ export class CredentialSync {
     }
   }
 
-  /** An account left this install. Its row stays for the others, and must not bring it back here. */
-  onAccountRemoved(/** @type {Record<string, any>} */ account) {
-    const key = syncKeyFor(account);
-    if (!key) return;
-    this.ignored.set(key, this.now());
-    this.onStateChange();
+  /**
+   * An account left this install: its row becomes a tombstone, which the other
+   * installs act on at their next pass. Re-read before writing, so a removal
+   * another install already recorded (or a sign-in since) is left as it is.
+   * Resolves with whether a tombstone was written.
+   * @param {Record<string, any>} account
+   * @returns {Promise<boolean>}
+   */
+  async onAccountRemoved(account) {
+    if (!syncKeyFor(account) || !await this.isSignedIn()) return false;
+    try {
+      if (!this.rows.size) this.rows = await this._list();
+      let row = this._rowFor(account);
+      if (!row) return false;
+      row = rowOf(await this.api('GET', `User/Credential/${row.id}`));
+      this.rows.set(row.key, row);
+      if (row.deletedAt != null) return false;
+      const stone = tombstone(this.now());
+      const r = await this.api('PATCH', `User/Credential/${row.id}`, { Data: JSON.stringify(stone) });
+      const fresh = rowOf({ ...r, Data: JSON.stringify(stone) });
+      this.rows.set(fresh.key, fresh);
+      return true;
+    } catch (/** @type {any} */ err) {
+      this.log(`[TeamClaude] callback.net: could not record the removal of "${safeLine(account.name, 64)}": ${safeLine(err?.message || String(err), 160)}`);
+      return false;
+    }
   }
 
   /**
-   * Delete an account's row for every install. The local account, when there
-   * is one, is untouched; its key is remembered so nothing re-creates the row
-   * from here until the account is signed in again.
-   * @param {Record<string, any>} account
-   * @returns {Promise<boolean>} whether a row was there to delete
+   * An explicit sign-in (`login`, `import`): the row takes these tokens
+   * whatever it held, a tombstone included — this is the one thing that brings
+   * a removed account back.
+   * @param {Record<string, any>} entry  the config entry, tokens included
+   * @returns {Promise<boolean>} whether the store was written
    */
-  async forget(account) {
-    const key = syncKeyFor(account);
-    if (!key) return false;
-    if (!this.rows.size) this.rows = await this._list();
+  async storeSignIn(entry) {
+    const account = { ...entry, credential: entry.accessToken, index: -1 };
+    if (!syncKeyFor(account) || !await this.isSignedIn()) return false;
+    const tokens = this._tokens(account);
+    if (!tokens.accessToken || !tokens.refreshToken) return false;
+    this.rows = await this._list();
     const row = this._rowFor(account);
-    if (!row) return false;
-    await this.api('DELETE', `User/Credential/${row.id}`);
-    this.rows.delete(row.key);
+    if (row) await this._patch(row, account, tokens);
+    else await this._create(account, tokens);
     return true;
   }
 
@@ -450,6 +504,14 @@ export class CredentialSync {
       }
       const current = rowOf({ ...locked, Data: locked?.Data ?? '' });
       this.rows.set(current.key, current);
+      if (current.deletedAt != null) {
+        // Removed on another install since the last pass. This request still
+        // gets its token; the pass that follows takes the account out.
+        await this._unlock(row);
+        this.log(`[TeamClaude] Account "${name}" was removed on another install; renewing this once, then removing it here`);
+        this.sync('tombstone').catch(() => {});
+        return refresh();
+      }
       if (supersedes(current.blob, account)) {
         await this._unlock(row);
         this.log(`[TeamClaude] Account "${name}": already renewed on ${safeLine(/** @type {Blob} */ (current.blob).by, 48)}; taking that token`);

@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
-import { CredentialSync, syncKeyFor, isSyncable, encodeBlob, decodeBlob, entryFromBlob, KEY_PREFIX } from '../src/credential-sync.js';
+import { CredentialSync, syncKeyFor, isSyncable, encodeBlob, decodeBlob, entryFromBlob, tombstoneOf, tombstone, KEY_PREFIX, TOMBSTONE_TTL_MS } from '../src/credential-sync.js';
 
 // Credential sync through callback.net: every signed-in install keeps its OAuth
 // account tokens in the user's credential store and follows it. The store here
@@ -84,18 +84,23 @@ function setup(entries, { store = makeStore(), signedIn = true, refresh } = {}) 
   const persisted = [];
   am.onTokenRefresh((idx, tokens) => { persisted.push([am.accounts[idx].name, tokens]); sync.onLocalTokens(idx, tokens); });
   const admitted = [];
+  const evicted = [];
   const logs = [];
   let signed = signedIn;
   const sleeps = [];
+  const removals = [];
   const sync = new CredentialSync({
     accountManager: am, api: store.api, by: 'this-box', now: store.now, log: (l) => logs.push(l),
     isSignedIn: async () => signed,
     sleep: async (ms) => { sleeps.push(ms); store.tick(ms); },
     addAccount: (entry) => { admitted.push(entry); return am.addAccount(entry); },
+    evictAccount: (account) => { evicted.push(account.name); am.removeAccount(account.index); },
   });
   am.setRefreshCoordinator((account, refresh) => sync.coordinateRefresh(account, refresh));
-  am.onAccountRemoved((account) => sync.onAccountRemoved(account));
-  return { am, sync, store, refreshed, persisted, admitted, logs, sleeps, signOut: () => { signed = false; }, signIn: () => { signed = true; } };
+  am.onAccountRemoved((account) => { removals.push(sync.onAccountRemoved(account)); });
+  // Every tombstone write a removal started, settled.
+  const settled = () => Promise.all(removals);
+  return { am, sync, store, refreshed, persisted, admitted, evicted, logs, sleeps, settled, signOut: () => { signed = false; }, signIn: () => { signed = true; } };
 }
 
 const tokensOf = (a) => ({ accessToken: a.credential, refreshToken: a.refreshToken, expiresAt: a.expiresAt });
@@ -135,13 +140,19 @@ test('a row carries identity and tokens, and only a blob of this version reads b
   for (const bad of ['', 'nope', '{}', JSON.stringify({ ...blob, v: 2 }), JSON.stringify({ ...blob, accessToken: '' }), JSON.stringify({ ...blob, expiresAt: 'soon' }), 7, null]) {
     assert.equal(decodeBlob(bad), null, String(bad));
   }
+  // A tombstone is the other thing a row can hold: a time, and nothing else.
+  assert.deepEqual(tombstone(T0), { _deleted: new Date(T0).toISOString() });
+  assert.equal(tombstoneOf(JSON.stringify(tombstone(T0))), T0);
+  assert.equal(tombstoneOf(JSON.stringify({ _deleted: T0 })), T0);
+  assert.equal(decodeBlob(JSON.stringify(tombstone(T0))), null);
+  for (const not of [JSON.stringify(blob), '{}', JSON.stringify({ _deleted: 'whenever' }), 'nope', null]) assert.equal(tombstoneOf(not), null, String(not));
 });
 
 // ── the pass ─────────────────────────────────────────────────
 
 test('signed out, nothing happens', async () => {
   const { sync, store, am } = setup([claude('a')], { signedIn: false });
-  assert.deepEqual(await sync.sync(), { signedIn: false, adopted: 0, pushed: 0, created: 0, added: 0, rows: 0 });
+  assert.deepEqual(await sync.sync(), { signedIn: false, adopted: 0, pushed: 0, created: 0, added: 0, evicted: 0, expired: 0, rows: 0 });
   assert.equal(store.calls.length, 0);
   // A refresh is a plain refresh.
   await am.ensureTokenFresh(0, true);
@@ -152,13 +163,13 @@ test('signed out, nothing happens', async () => {
 test('the first pass stores every syncable account, and only those', async () => {
   const { sync, store } = setup([claude('a'), codex('c'), { name: 'k', type: 'apikey', apiKey: 'k' }, claude('g', { upstream: 'https://gw.example' })]);
   const r = await sync.sync('start');
-  assert.deepEqual(r, { signedIn: true, adopted: 0, pushed: 0, created: 2, added: 0, rows: 0 });
+  assert.deepEqual(r, { signedIn: true, adopted: 0, pushed: 0, created: 2, added: 0, evicted: 0, expired: 0, rows: 0 });
   assert.deepEqual([...store.rows.values()].map((x) => x.Key).sort(), [`${KEY_PREFIX}anthropic.uuid-a.org-a`, `${KEY_PREFIX}codex.acct-c`]);
   const blob = store.blob(`${KEY_PREFIX}anthropic.uuid-a.org-a`);
   assert.equal(blob.accessToken, 'at-a-1');
   assert.equal(blob.by, 'this-box');
   // A second pass changes nothing.
-  assert.deepEqual(await sync.sync(), { signedIn: true, adopted: 0, pushed: 0, created: 0, added: 0, rows: 2 });
+  assert.deepEqual(await sync.sync(), { signedIn: true, adopted: 0, pushed: 0, created: 0, added: 0, evicted: 0, expired: 0, rows: 2 });
 });
 
 test('a row with no local account becomes one, with its tokens and identity but none of another install\'s settings', async () => {
@@ -168,7 +179,7 @@ test('a row with no local account becomes one, with its tokens and identity but 
   store.put('someone-elses-key', { whatever: true });
   const { sync, am, admitted, logs } = setup([claude('a')], { store });
   const r = await sync.sync('start');
-  assert.deepEqual(r, { signedIn: true, adopted: 0, pushed: 0, created: 1, added: 1, rows: 1 });
+  assert.deepEqual(r, { signedIn: true, adopted: 0, pushed: 0, created: 1, added: 1, evicted: 0, expired: 0, rows: 1 });
   assert.deepEqual(admitted, [{ name: 'b', type: 'oauth', accountUuid: 'uuid-b', orgUuid: 'org-b', orgName: 'Org b', accessToken: 'at-b-7', refreshToken: 'rt-b-7', expiresAt: T0 + 6 * H }]);
   assert.equal(am.accounts[1].name, 'b');
   assert.equal(am.accounts[1].priority, 0);
@@ -187,7 +198,7 @@ test('the newer token wins each way: the store\'s is adopted, this install\'s is
   const { sync, am, persisted, store: s } = setup([a, b], { store });
 
   const r = await sync.sync('start');
-  assert.deepEqual(r, { signedIn: true, adopted: 1, pushed: 1, created: 0, added: 0, rows: 2 });
+  assert.deepEqual(r, { signedIn: true, adopted: 1, pushed: 1, created: 0, added: 0, evicted: 0, expired: 0, rows: 2 });
   assert.equal(am.accounts[0].credential, 'at-a-9');
   assert.equal(am.accounts[0].refreshToken, 'rt-a-9');
   assert.equal(am.accounts[0].expiresAt, T0 + 20 * H);
@@ -218,7 +229,7 @@ test('a row of ours that does not read is rewritten; a store that fails leaves t
   const store = makeStore();
   store.put(syncKeyFor(claude('a')), { v: 99, garbage: true });
   const { sync, am } = setup([claude('a')], { store });
-  assert.deepEqual(await sync.sync(), { signedIn: true, adopted: 0, pushed: 1, created: 0, added: 0, rows: 1 });
+  assert.deepEqual(await sync.sync(), { signedIn: true, adopted: 0, pushed: 1, created: 0, added: 0, evicted: 0, expired: 0, rows: 1 });
   assert.equal(store.blob(syncKeyFor(am.accounts[0])).accessToken, 'at-a-1');
 
   const broken = setup([claude('b')], { store: { ...makeStore(), api: async () => { throw new Error('fetch failed'); } } });
@@ -227,37 +238,99 @@ test('a row of ours that does not read is rewritten; a store that fails leaves t
   assert.equal(broken.am.accounts[0].credential, 'at-b-1');
 });
 
-test('an account removed here stays out, until it is signed in here again', async () => {
+test('an account removed here leaves a tombstone, and the other installs remove it at their next pass', async () => {
   const store = makeStore();
-  const { sync, am, admitted } = setup([claude('a'), claude('b')], { store });
-  await sync.sync();
-  assert.equal(store.rows.size, 2);
+  const home = setup([claude('a'), claude('b')], { store });
+  const office = setup([claude('a'), claude('b')], { store });
+  await home.sync.sync();
+  await office.sync.sync();
 
-  am.removeAccount(1); // b leaves this install
-  assert.deepEqual(Object.keys(sync.exportState().ignored), [syncKeyFor(claude('b'))]);
-  await sync.sync();
-  assert.equal(admitted.length, 0, 'the row did not bring b back');
-  assert.equal(store.rows.size, 2, 'the row is still there for the other installs');
+  home.am.removeAccount(1); // b leaves the home install
+  await home.settled();
+  const row = store.byKey(syncKeyFor(claude('b')));
+  assert.deepEqual(JSON.parse(row.Data), { _deleted: new Date(store.now()).toISOString() });
+  // Home's own next pass: nothing comes back.
+  assert.deepEqual(await home.sync.sync(), { signedIn: true, adopted: 0, pushed: 0, created: 0, added: 0, evicted: 0, expired: 0, rows: 2 });
+  assert.deepEqual(home.am.accounts.map((a) => a.name), ['a']);
 
-  // Signed in again here: the account is back, so its removal is forgotten.
-  am.addAccount(claude('b', { accessToken: 'at-b-5', refreshToken: 'rt-b-5', expiresAt: T0 + 30 * H }));
-  await sync.sync();
-  assert.deepEqual(sync.exportState().ignored, {});
-  assert.equal(store.blob(syncKeyFor(claude('b'))).accessToken, 'at-b-5');
-
-  // The remembered removals survive a restart through the state file.
-  const again = new CredentialSync({ accountManager: am, addAccount: () => null, api: store.api, state: { ignored: { k1: T0, bad: 'x' } } });
-  assert.deepEqual(again.exportState(), { ignored: { k1: T0 } });
+  // The office install follows.
+  const r = await office.sync.sync('daily');
+  assert.equal(r.evicted, 1);
+  assert.deepEqual(office.evicted, ['b']);
+  assert.deepEqual(office.am.accounts.map((a) => a.name), ['a']);
+  assert.ok(office.logs.some((l) => /"b" was removed on another install .*; removing it here/.test(l)), office.logs.join('\n'));
+  // Its eviction does not write a second tombstone over the first.
+  await office.settled();
+  assert.equal(JSON.parse(store.byKey(syncKeyFor(claude('b'))).Data)._deleted, new Date(store.now()).toISOString());
+  assert.equal(store.calls.filter((c) => c.method === 'PATCH' && c.params.Data.includes('_deleted')).length, 1);
+  assert.deepEqual(office.sync.summary(), { lastSyncAt: store.now(), lastError: null, rows: 1, tombstones: 1 });
 });
 
-test('forget deletes the row for everyone and leaves the local account alone', async () => {
-  const { sync, am, store } = setup([claude('a'), claude('b')]);
+test('a refresh never brings a removed account back; a sign-in does', async () => {
+  const store = makeStore();
+  const home = setup([claude('a')], { store });
+  const office = setup([claude('a')], { store });
+  await home.sync.sync();
+  await office.sync.sync();
+  home.am.removeAccount(0);
+  await home.settled();
+
+  // The office install, not yet synced, has the token expire: the lock finds
+  // the tombstone, the request is served with a plain renewal, and the pass
+  // that follows takes the account out.
+  await office.am.ensureTokenFresh(0, true);
+  assert.deepEqual(office.refreshed, ['rt-a-1']);
+  await new Promise((r) => setImmediate(r));
+  await office.sync.sync(); // the pass the coordinator started, or this one — either removes it
+  assert.deepEqual(office.am.accounts, []);
+  assert.notEqual(tombstoneOf(store.byKey(syncKeyFor(claude('a'))).Data), null, 'the renewal did not write over the tombstone');
+
+  // A token change that is not a sign-in (a relayed client refresh) does not either.
+  const third = setup([claude('a')], { store });
+  third.am.updateAccountTokens(0, { accessToken: 'at-a-5', refreshToken: 'rt-a-5', expiresAt: T0 + 30 * H });
+  await new Promise((r) => setImmediate(r));
+  assert.notEqual(tombstoneOf(store.byKey(syncKeyFor(claude('a'))).Data), null);
+
+  // Signing in again anywhere replaces the tombstone, and the account is back
+  // on every install's next pass.
+  store.tick(H);
+  const entry = claude('a', { accessToken: 'at-a-new', refreshToken: 'rt-a-new', expiresAt: store.now() + 8 * H });
+  assert.equal(await home.sync.storeSignIn(entry), true);
+  assert.equal(store.blob(syncKeyFor(claude('a'))).accessToken, 'at-a-new');
+  const r = await office.sync.sync();
+  assert.equal(r.added, 1);
+  assert.equal(office.am.accounts[0].credential, 'at-a-new');
+  // Not for an account the sync does not carry, and not when signed out.
+  assert.equal(await home.sync.storeSignIn({ name: 'k', type: 'apikey', apiKey: 'k' }), false);
+  home.signOut();
+  assert.equal(await home.sync.storeSignIn(entry), false);
+});
+
+test('a tombstone older than a week is deleted by whichever pass sees it', async () => {
+  const store = makeStore();
+  store.put(syncKeyFor(claude('old')), tombstone(store.now() - TOMBSTONE_TTL_MS - 1));
+  store.put(syncKeyFor(claude('recent')), tombstone(store.now() - TOMBSTONE_TTL_MS + 60_000));
+  const { sync, store: s } = setup([], { store });
+  const r = await sync.sync();
+  assert.equal(r.expired, 1);
+  assert.equal(r.rows, 1);
+  assert.equal(s.rows.size, 1);
+  assert.equal(s.byKey(syncKeyFor(claude('old'))), null);
+  assert.notEqual(s.byKey(syncKeyFor(claude('recent'))), null);
+  // A week on, the other goes too.
+  s.tick(2 * 60_000);
+  assert.equal((await sync.sync()).expired, 1);
+  assert.equal(s.rows.size, 0);
+});
+
+test('a removal with no row, or while signed out, records nothing and is not an error', async () => {
+  const { am, sync, store, settled, signOut } = setup([claude('a'), claude('b')]);
   await sync.sync();
-  assert.equal(await sync.forget(am.accounts[1]), true);
-  assert.equal(store.rows.size, 1);
-  assert.equal(am.accounts.length, 2);
-  assert.equal(await sync.forget(am.accounts[1]), false);
-  assert.equal(await sync.forget({ name: 'k', type: 'apikey' }), false);
+  signOut();
+  am.removeAccount(1);
+  await settled();
+  assert.equal(tombstoneOf(store.byKey(syncKeyFor(claude('b'))).Data), null);
+  assert.equal(await sync.onAccountRemoved({ name: 'k', type: 'apikey' }), false);
 });
 
 test('the store is read in pages', async () => {
@@ -414,5 +487,5 @@ test('the daily pass is scheduled and stopped', async () => {
   assert.ok(sync._timer, 'armed');
   sync.stop();
   assert.equal(sync._timer, null);
-  assert.deepEqual(sync.summary(), { lastSyncAt: store.now(), lastError: null, rows: 1, ignored: 0 });
+  assert.deepEqual(sync.summary(), { lastSyncAt: store.now(), lastError: null, rows: 1, tombstones: 0 });
 });

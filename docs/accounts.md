@@ -107,7 +107,6 @@ A pooled OAuth token lives a few days, and then has to be signed in again — on
 teamclaude callback login      # prints a URL to approve in any browser (--no-browser to not open one)
 teamclaude callback status     # who this install is signed in as
 teamclaude callback sync       # reconcile the running server with the store now
-teamclaude callback forget <name>   # remove the account here and delete its tokens from the store
 teamclaude callback logout     # revoke the session and stop syncing
 ```
 
@@ -118,9 +117,9 @@ While signed in, every **OAuth** account (Claude and Codex) is kept as one row o
 - **A pass** runs when the server starts, on every reload (`callback login`, `login`, `import` and `callback sync` all trigger one) and once a day. A row with no local account becomes one, so signing in on a new machine brings every account over. A row whose token is newer than the local one — the later `expiresAt`, which a renewal always pushes forward — replaces it. A local account newer than its row updates the row, and one with no row creates it.
 - **A token refresh** goes through the row's advisory lock, so one install renews and the rest adopt. A refresh rotates the token family, and two installs renewing one account at once would each invalidate the other's copy — which is exactly the "sign in again everywhere" this exists to end. With the lock taken, the row is read first: if another install has already renewed, that token is adopted and the provider is not called. Refused, the install waits, re-reading every 5 seconds for 30 seconds, adopts what the holder stores, and otherwise tries the lock again; a lock that nobody releases times out after a minute. A store that cannot be reached never stops a refresh: the account is renewed without it and stored on the next pass.
 - **Every other token change** on an install — a `login`, an `import`, a refresh Claude Code made itself that the proxy relayed — is stored the same way.
-- **Removal is local.** `teamclaude remove` (or the TUI) takes the account off this install and remembers it, so its row does not bring it back; the other installs keep theirs, and the row stays for them. `teamclaude callback forget <name>` removes the account here *and* deletes the row, so no install re-creates it from here; an install that still holds the account stores it again on its next pass unless it removes it too. Signing an account in again on an install forgets its removal there.
+- **Removal travels.** `teamclaude remove` (or the TUI, or the MCP endpoint) writes a tombstone into the account's row — `{"_deleted": "<time>"}` — and every other install removes the account at its next pass. A token refresh on an install that has not yet seen the tombstone still goes through, but never writes over it; only an explicit sign-in (`login`, `import`) does, which is how a removed account comes back everywhere. A tombstone older than a week is deleted by whichever pass sees it.
 
-`teamclaude status --json` carries the sync's state under `callbackSync`: the last pass, its error if it failed, how many rows the store holds and how many removals this install remembers.
+`teamclaude status --json` carries the sync's state under `callbackSync`: the last pass, its error if it failed, how many accounts the store holds and how many tombstones.
 
 ## Per-account routing (`routing`)
 

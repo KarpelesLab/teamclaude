@@ -25,7 +25,7 @@ import { resolveAccounts } from './resolve-accounts.js';
 import { loginCodex } from './codex-auth.js';
 import { providerOf } from './provider.js';
 import { syncAccountsFromDisk } from './sync-accounts.js';
-import { mergeAccountsForSave, syncRefreshedTokens, removedAccountIds, clearRemovedAccountIds, clearAddedAccountIds } from './account-pairing.js';
+import { mergeAccountsForSave, syncRefreshedTokens, removedAccountIds, clearRemovedAccountIds, clearAddedAccountIds, markAccountRemoved, configIndexFor } from './account-pairing.js';
 import { ensureAccountIds } from './account-id.js';
 import * as alias from './alias.js';
 import { ensureCerts, mitmHosts } from './mitm.js';
@@ -51,8 +51,45 @@ import { proxyFetch } from './upstream-fetch.js';
 import { upstreamFor } from './provider.js';
 import { startEventLoopMonitor } from './event-loop-monitor.js';
 import { envVar } from './brand.js';
-import { loginCallback, loadCallbackToken, saveCallbackToken, callbackWhoami, logoutCallback, callbackClientId, getCallbackAuthPath, callbackCall } from './callback-auth.js';
-import { CredentialSync, syncKeyFor } from './credential-sync.js';
+import { loginCallback, loadCallbackToken, saveCallbackToken, callbackWhoami, logoutCallback, callbackClientId, getCallbackAuthPath } from './callback-auth.js';
+import { CredentialSync } from './credential-sync.js';
+
+// The server's credential sync, once it runs; a CLI command that changes an
+// account on disk talks to the store through a sync of its own instead.
+/** @type {CredentialSync|null} */
+let activeCredentialSync = null;
+
+/** A sync over the config alone, for a command running outside the server. */
+function standaloneCredentialSync() {
+  return activeCredentialSync || new CredentialSync({ accountManager: /** @type {any} */ ({ accounts: [], updateAccountTokens() {} }), addAccount: () => null, log: () => {} });
+}
+
+/**
+ * An explicit sign-in (`login`, `import`): store the entry's tokens, over a
+ * tombstone included, when this install is signed in to callback.net. Never
+ * fatal — the account is in the config either way, and the next pass stores it.
+ * @param {Record<string, any>} entry
+ */
+async function recordSignInWithCallback(entry) {
+  try {
+    if (await standaloneCredentialSync().storeSignIn(entry)) console.log('Stored on callback.net for your other installs.');
+  } catch (/** @type {any} */ err) {
+    console.error(`Could not store the sign-in on callback.net (${err?.message || err}); the next sync pass will.`);
+  }
+}
+
+/**
+ * An account removed by hand (`remove`): leave the tombstone the other
+ * installs act on, when this install is signed in to callback.net.
+ * @param {Record<string, any>} entry
+ */
+async function recordRemovalWithCallback(entry) {
+  try {
+    if (await standaloneCredentialSync().onAccountRemoved({ ...entry, credential: entry.accessToken })) console.log('Recorded on callback.net: your other installs will remove it too.');
+  } catch (/** @type {any} */ err) {
+    console.error(`Could not record the removal on callback.net: ${err?.message || err}`);
+  }
+}
 
 // Where a new API key joins the rotation. A key is metered: every token it
 // serves is billed, while a subscription's quota is paid for whether it is
@@ -128,7 +165,6 @@ const CALLBACK_USAGE = [
   'Usage: teamclaude callback login [--no-browser] [--force]   Sign this install in to callback.net',
   '       teamclaude callback status                            Show who is signed in',
   '       teamclaude callback sync                              Reconcile the running server with the credential store now',
-  '       teamclaude callback forget <account> [--org <org>]    Remove the account here and delete its tokens from the store',
   '       teamclaude callback logout                            Revoke the session and forget it',
 ].join('\n');
 
@@ -366,7 +402,7 @@ async function serverCommand() {
 
   // Periodically persist quota (and once more on shutdown) to the state file.
   const persistQuotaState = () =>
-    saveState({ quota: accountManager.exportQuotaState(), clients: clientUsage.exportState(), usageDimensions: dimensionUsage.exportState(), callbackSync: credentialSync.exportState() })
+    saveState({ quota: accountManager.exportQuotaState(), clients: clientUsage.exportState(), usageDimensions: dimensionUsage.exportState() })
       .catch(err => console.error(`[TeamClaude] Failed to save quota state: ${err.message}`));
   let quotaSaveInterval = null;
 
@@ -385,16 +421,33 @@ async function serverCommand() {
     return idx;
   };
 
+  // The reverse: an account the store says was removed on another install
+  // leaves this one — manager, config and disk, the way the TUI removes one.
+  const evictAccount = (/** @type {Record<string, any>} */ account) => {
+    const idx = accountManager.accounts.indexOf(/** @type {any} */ (account));
+    if (idx < 0) return;
+    const cfgIdx = configIndexFor(config.accounts, accountManager.accounts, idx);
+    const entryId = cfgIdx >= 0 ? config.accounts[cfgIdx]?.id : null;
+    accountManager.removeAccount(idx);
+    if (cfgIdx >= 0) {
+      markAccountRemoved(config, entryId);
+      config.accounts.splice(cfgIdx, 1);
+    }
+    atomicConfigUpdate((/** @type {any} */ diskConfig) => {
+      diskConfig.accounts = diskConfig.accounts.filter((/** @type {any} */ a) => (entryId ? a.id !== entryId : !sameIdentity(a, account)));
+    }).catch((/** @type {any} */ err) => console.error(`[TeamClaude] Failed to save the removal of "${account.name}": ${err.message}`));
+  };
+
   // Credential sync through callback.net: active only while this install is
   // signed in (`teamclaude callback login`); dormant otherwise. Every token
-  // refresh goes through its lock, every local token change is stored, and a
-  // pass at start, on reload and daily brings the fleet level with the store.
-  const credentialSync = new CredentialSync({
-    accountManager, addAccount: admitAccount, state: savedState?.callbackSync || null,
-    onStateChange: () => { persistQuotaState(); },
-  });
+  // refresh goes through its lock, every local token change is stored, a
+  // removal here leaves a tombstone the other installs act on, and a pass at
+  // start, on reload and daily brings the fleet level with the store.
+  const credentialSync = new CredentialSync({ accountManager, addAccount: admitAccount, evictAccount });
+  activeCredentialSync = credentialSync;
   accountManager.setRefreshCoordinator((account, refresh) => credentialSync.coordinateRefresh(account, refresh));
-  accountManager.onAccountRemoved((account) => credentialSync.onAccountRemoved(account));
+  // Not awaited: the removal is done; the tombstone follows.
+  accountManager.onAccountRemoved((account) => { credentialSync.onAccountRemoved(account).catch(() => {}); });
 
   // Persist refreshed tokens back to config (re-read from disk to avoid clobbering
   // accounts added externally, e.g. by `teamclaude import` while server is running)
@@ -1166,6 +1219,8 @@ async function loginCodexCommand() {
 async function upsertCodexAccount(requestedName, creds, routing = null, storeRouting = false) {
   /** @type {{ action: 'updated' | 'added', name: string }} */
   let outcome = { action: 'added', name: requestedName || '' };
+  /** @type {Record<string, any>|null} */
+  let signedIn = null;
   await atomicConfigUpdate(config => {
     const name = requestedName || creds.email
       || `codex-${config.accounts.filter(a => a.provider === 'codex').length + 1}`;
@@ -1203,8 +1258,10 @@ async function upsertCodexAccount(requestedName, creds, routing = null, storeRou
       outcome = { action: 'added', name: account.name };
       console.log(`Added account "${account.name}"${creds.planType ? ` (${creds.planType})` : ''}`);
     }
+    signedIn = config.accounts[idx >= 0 ? idx : config.accounts.length - 1];
   });
   console.log(`Saved to ${getConfigPath()}`);
+  if (signedIn) await recordSignInWithCallback(signedIn);
   return outcome;
 }
 
@@ -2329,32 +2386,6 @@ async function callbackCommand() {
     console.log(`Synced with callback.net: ${s.rows} account${s.rows === 1 ? '' : 's'} in the store${s.lastSyncAt ? ` (last pass ${new Date(s.lastSyncAt).toISOString()})` : ''}.`);
     return;
   }
-  if (sub === 'forget') {
-    // `teamclaude remove` plus the store: the account leaves this install and
-    // its row is deleted, so no install re-creates it from here. The other
-    // installs keep their copy until they remove it themselves. Local first:
-    // a running server told of the removal remembers the key, so its own pass
-    // does not put the row straight back.
-    const config = await loadOrCreateConfig();
-    const name = args[2];
-    if (!name) { console.error('Usage: teamclaude callback forget <account-name|email> [--org <name|uuid>]'); process.exit(1); }
-    const account = resolveAccount(config.accounts, name, argValue('--org'));
-    if (!account) { console.error(`Account "${name}" not found`); process.exit(1); }
-    if (!syncKeyFor(account)) { console.error(`Account "${account.name}" is not one the sync carries (only OAuth logins are); use \`teamclaude remove\`.`); process.exit(1); }
-    config.accounts.splice(config.accounts.indexOf(account), 1);
-    await saveConfig(config);
-    console.log(`Removed account "${account.name}" from this install`);
-    await notifyRunningServer(config);
-    const sync = new CredentialSync({ accountManager: /** @type {any} */ ({ accounts: [], updateAccountTokens() {} }), addAccount: () => null, api: callbackCall, log: () => {} });
-    try {
-      const deleted = await sync.forget(account);
-      console.log(deleted ? `Removed "${account.name}" from the callback.net credential store.` : `"${account.name}" was not in the callback.net credential store.`);
-    } catch (/** @type {any} */ err) {
-      console.error(err?.loginRequired ? 'Not signed in to callback.net, so the store still holds it. Run `teamclaude callback login` and forget it again.' : `Could not reach callback.net, so the store still holds it: ${err?.message || err}`);
-      process.exit(1);
-    }
-    return;
-  }
   console.error(CALLBACK_USAGE);
   process.exit(1);
 }
@@ -2429,6 +2460,10 @@ async function removeCommand() {
   config.accounts.splice(config.accounts.indexOf(account), 1);
   await saveConfig(config);
   console.log(`Removed account "${account.name}"`);
+  // The tombstone first, then the server: told of the removal, it finds the
+  // tombstone already there and leaves it alone.
+  await recordRemovalWithCallback(account);
+  await notifyRunningServer(config);
 }
 
 // ── route ───────────────────────────────────────────────────
@@ -2697,8 +2732,6 @@ Commands:
                       with every other signed-in install of yours
   callback status     Show who is signed in to callback.net
   callback sync       Reconcile the running server with the store now
-  callback forget <account>
-                      Remove the account here and delete its tokens from the store
   callback logout     Revoke that session and forget it
   update              Check npm for a newer teamclaude and install it
   version             Print the installed version
@@ -2872,6 +2905,8 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
   // disk.
   /** @type {{ action: 'updated' | 'added', name: string }} */
   let outcome = { action: 'added', name: name || '' };
+  /** @type {Record<string, any>|null} */
+  let signedIn = null;
   const config = await atomicConfigUpdate(config => {
     if (!name) {
       const n = config.accounts.filter(a => a.name.startsWith('account-')).length + 1;
@@ -2929,8 +2964,12 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
       outcome = { action: 'added', name: account.name };
       console.log(`Added account "${account.name}"`);
     }
+    signedIn = config.accounts[idx >= 0 ? idx : config.accounts.length - 1];
   });
   console.log(`Saved to ${getConfigPath()}`);
+  // Before the server is told: its reload pass would otherwise read a tombstone
+  // for an account that was just signed in again and remove it.
+  if (signedIn) await recordSignInWithCallback(signedIn);
   if (notify) await notifyRunningServer(config);
   return outcome;
 }
