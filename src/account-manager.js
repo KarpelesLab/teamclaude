@@ -489,7 +489,7 @@ export class AccountManager {
    * @param {number|Object<string, number>} [switchThreshold]  one number, or per bucket with a `default`
    * @param {Object} [opts]
    * @param {Function} [opts.refreshFn]
-   * @param {(account: Record<string, any>, refresh: () => Promise<any>) => Promise<any>} [opts.refreshCoordinator]  wraps every token refresh (credential-sync.js takes it through a shared lock); the default just refreshes
+   * @param {(account: Record<string, any>, refresh: () => Promise<any>, info: { force: boolean }) => Promise<any>} [opts.refreshCoordinator]  wraps every token refresh (credential-sync.js takes it through a shared lock); the default just refreshes. Resolving null keeps the current token: nothing is written and nothing is announced
    * @param {Function} [opts.codexRefreshFn]
    * @param {number} [opts.throttleProbeFloorMs]
    * @param {number} [opts.familyStaleMs]
@@ -504,7 +504,7 @@ export class AccountManager {
    * @param {string} [opts.advisorEligibility]  'strict' (default) or 'prefer'
    * @param {{ host: string, port: number }|null} [opts.listener]  this server's own address, so an accounts[].routing that points back at it is refused (see accountRouting)
    */
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, refreshCoordinator = (_account, refresh) => refresh(), throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, advisorEligibility, listener = null } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, refreshCoordinator = (_account, refresh, _info) => refresh(), throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, advisorEligibility, listener = null } = {}) {
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
@@ -4664,11 +4664,14 @@ export class AccountManager {
         // routing applies here too: a token refresh is that account's traffic.
         // The coordinator may answer with a token another install renewed
         // instead of calling `refresh` at all; either way the result lands the
-        // same, below, and is persisted the same.
+        // same, below, and is persisted the same. Or with nothing: the token
+        // is still good and another install is renewing it, so this one keeps
+        // what it has and asks again on the next request.
         const refresh = () => (providerOf(account) === 'codex'
           ? this._codexRefreshFn(sent, undefined, account.routing || null)
           : this._refreshFn(sent, undefined, account.routing || null));
-        const newTokens = await this._refreshCoordinator(account, refresh);
+        const newTokens = await this._refreshCoordinator(account, refresh, { force });
+        if (newTokens == null) return;
         if (account.refreshToken !== sent) {
           console.log(`[TeamClaude] Discarding refresh result for account "${safeLine(account.name, 64)}" — its tokens were replaced while the refresh was in flight`);
           return;
@@ -4723,7 +4726,7 @@ export class AccountManager {
   }
 
   /** Replace the refresh coordinator (see the constructor option). */
-  setRefreshCoordinator(/** @type {(account: Record<string, any>, refresh: () => Promise<any>) => Promise<any>} */ fn) {
+  setRefreshCoordinator(/** @type {(account: Record<string, any>, refresh: () => Promise<any>, info: { force: boolean }) => Promise<any>} */ fn) {
     this._refreshCoordinator = fn;
   }
 

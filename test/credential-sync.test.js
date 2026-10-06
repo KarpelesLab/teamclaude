@@ -404,6 +404,52 @@ test('lock refused: wait, re-read every 5s, adopt what the holder stores', async
   assert.deepEqual(sleeps, [5000, 5000, 5000], 'three waits of five seconds, then the renewal was there');
 });
 
+test('lock refused while the token is still good: keep it, nothing waits, the next request asks again', async () => {
+  // Expiry checks read the real clock, so the token is placed against it:
+  // inside the five-minute window that triggers a refresh, not yet expired.
+  const soon = Date.now() + 2 * 60_000;
+  const { sync, am, store, refreshed, sleeps, persisted, logs } = setup([claude('a', { expiresAt: soon })]);
+  await sync.sync();
+  const row = store.byKey(syncKeyFor(am.accounts[0]));
+  row.Locked = { unixms: String(store.now()) };
+  await am.ensureTokenFresh(0);
+  assert.deepEqual(refreshed, [], 'the provider was not asked');
+  assert.deepEqual(sleeps, [], 'and nothing waited');
+  assert.equal(am.accounts[0].credential, 'at-a-1', 'the token in hand still serves');
+  assert.equal(am.accounts[0].expiresAt, soon);
+  assert.deepEqual(persisted, [], 'nothing changed, so nothing was written or announced');
+  assert.equal(am.accounts[0]._lastRefreshAt, null);
+  assert.ok(logs.some((l) => /another install is renewing its token; keeping the current one/.test(l)), logs.join('\n'));
+  // The holder stores its renewal; the next request takes it through the lock
+  // path, the row being readable again.
+  const renewed = { ...am.accounts[0], credential: 'at-a-office', refreshToken: 'rt-a-office', expiresAt: Date.now() + 8 * H };
+  row.Data = JSON.stringify(encodeBlob(renewed, tokensOf(renewed), { now: store.now(), by: 'office' }));
+  row.Locked = null;
+  await am.ensureTokenFresh(0);
+  assert.equal(am.accounts[0].credential, 'at-a-office');
+  assert.deepEqual(refreshed, []);
+});
+
+test('lock refused on a token that has expired, or that upstream rejected: wait for the holder', async () => {
+  const expired = Date.now() - 60_000;
+  const { sync, am, store, sleeps } = setup([claude('a', { expiresAt: expired })]);
+  await sync.sync();
+  const row = store.byKey(syncKeyFor(am.accounts[0]));
+  row.Locked = { unixms: String(store.now()) };
+  const renewed = { ...am.accounts[0], credential: 'at-a-mac', refreshToken: 'rt-a-mac', expiresAt: Date.now() + 8 * H };
+  const origApi = store.api;
+  sync.api = async (method, path, params, opts) => {
+    if (method === 'GET' && path.endsWith(row.User_Credential__) && sleeps.length >= 2 && !row.Data.includes('at-a-mac')) {
+      row.Data = JSON.stringify(encodeBlob(renewed, tokensOf(renewed), { now: store.now(), by: 'mac' }));
+      row.Locked = null;
+    }
+    return origApi(method, path, params, opts);
+  };
+  await am.ensureTokenFresh(0); // not forced: the expiry alone is what makes it wait
+  assert.deepEqual(sleeps, [5000, 5000]);
+  assert.equal(am.accounts[0].credential, 'at-a-mac');
+});
+
 test('lock refused and nothing stored within 30s: the lock is tried again, and taken once it has timed out', async () => {
   const { sync, am, store, refreshed, sleeps, logs } = setup([claude('a')]);
   await sync.sync();

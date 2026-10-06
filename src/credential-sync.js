@@ -14,8 +14,11 @@
 //   renews a token the others then adopt — a refresh rotates the token family,
 //   and two installs renewing one account at once would each kill the other's
 //   copy. Lock taken: adopt the row's token if it is already newer, else renew,
-//   PATCH, unlock. Lock refused: another install is renewing; re-read every 5s
-//   for 30s and adopt what it stored, then try the lock again.
+//   PATCH, unlock. Lock refused: another install is renewing. A token that is
+//   still good (the refresh runs five minutes ahead of expiry) is simply kept,
+//   and the next request asks again; one that has expired, or that upstream
+//   just rejected, waits — re-reading every 5s for 30s and adopting what the
+//   holder stored, then trying the lock again.
 //
 // "Newer" is the later `expiresAt`: a renewal always pushes it forward, and it
 // is the one field both the token endpoint and the store agree on.
@@ -33,6 +36,7 @@
 
 import { hostname } from 'node:os';
 import { callbackCall, loadCallbackToken } from './callback-auth.js';
+import { isTokenExpired } from './oauth.js';
 import { providerOf } from './provider.js';
 import { sameIdentity } from './identity.js';
 import { safeLine } from './safe-text.js';
@@ -459,15 +463,18 @@ export class CredentialSync {
   /**
    * Renew an account's token through the store's lock, so one install renews
    * and the rest adopt. `refresh` is the provider call; it runs at most once.
+   * Resolves null to keep the current token: another install holds the lock
+   * and this one's token is still good, so there is nothing to wait for.
    *
    * Any failure to reach the store falls back to a plain refresh: the pool
    * must not stop serving because callback.net is unreachable.
    *
    * @param {Record<string, any>} account
    * @param {() => Promise<Tokens>} refresh
-   * @returns {Promise<Tokens>}
+   * @param {{ force?: boolean }} [info]  force: the token was just rejected, so keeping it is not an option
+   * @returns {Promise<Tokens|null>}
    */
-  async coordinateRefresh(account, refresh) {
+  async coordinateRefresh(account, refresh, { force = false } = {}) {
     if (!syncKeyFor(account) || !await this.isSignedIn()) return refresh();
     let row = this._rowFor(account);
     if (!row) {
@@ -487,7 +494,14 @@ export class CredentialSync {
           this.log(`[TeamClaude] callback.net: lock for "${name}" failed (${safeLine(err?.message || String(err), 120)}); renewing without it`);
           return refresh();
         }
-        // Another install is renewing: wait for what it stores.
+        // Another install is renewing. A token that still works serves this
+        // request as it is; the renewal arrives through the store, and the
+        // next request asks again. Only a dead token has to wait.
+        if (!force && !isTokenExpired(account.expiresAt)) {
+          this.log(`[TeamClaude] Account "${name}": another install is renewing its token; keeping the current one until then`);
+          return null;
+        }
+        // Wait for what it stores.
         const until = this.now() + LOCKED_WAIT_MS;
         while (this.now() < until) {
           await this.sleep(LOCKED_RECHECK_MS);
