@@ -410,7 +410,7 @@ test('lock refused and nothing stored within 30s: the lock is tried again, and t
   const row = store.byKey(syncKeyFor(am.accounts[0]));
   row.Locked = { unixms: String(store.now()) }; // a holder that never stores anything (crashed mid-renewal)
   await am.ensureTokenFresh(0, true);
-  // 30s of waiting (six re-reads), then the lock — 60s old by the second round — is taken.
+  // 30s of waiting (six re-reads), then the lock — 30s old by the second round — is taken.
   assert.equal(sleeps.filter((ms) => ms === 5000).length >= 6, true, String(sleeps));
   assert.deepEqual(refreshed, ['rt-a-1']);
   assert.equal(am.accounts[0].credential, 'rt-a-1-renewed-at');

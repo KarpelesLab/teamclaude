@@ -40,8 +40,8 @@ import { safeLine } from './safe-text.js';
 /** Rows this proxy owns start with this; anything else in the store is left alone. */
 export const KEY_PREFIX = 'teamrouter.';
 const BLOB_VERSION = 1;
-/** How long a taken lock holds off the others before it can be taken over. */
-const LOCK_TIMEOUT_S = 60;
+/** How long a taken lock holds off the others before it can be taken over: a renewal takes seconds. */
+const LOCK_TIMEOUT_S = 30;
 /** Lock refused: re-read this often, for this long, before trying the lock again. */
 const LOCKED_RECHECK_MS = 5_000;
 const LOCKED_WAIT_MS = 30_000;
