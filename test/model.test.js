@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { findFamilyBlock, isFableModel, modelGlobOverlaps, parseRequestModel, parseRequestStream, TopLevelFieldFinder } from '../src/model.js';
+import { findFamilyBlock, isFableModel, modelGlobOverlaps, modelLabel, NestedFieldFinder, parseRequestEffort, parseRequestModel, parseRequestStream, TopLevelFieldFinder } from '../src/model.js';
 
 test('isFableModel matches the Fable family only', () => {
   assert.equal(isFableModel('claude-fable-5'), true);
@@ -87,4 +87,97 @@ test('parseRequestStream reads only the top-level stream field', () => {
   // The finder still reads string fields as before, scalar support notwithstanding.
   assert.equal(new TopLevelFieldFinder('n').push(Buffer.from('{"n": 42, "model":"m"}')), '42');
   assert.equal(new TopLevelFieldFinder('model').push(Buffer.from('{"n": 42, "model":"m"}')), 'm');
+});
+
+// The reasoning effort sits one level under the root: `output_config.effort` on
+// an Anthropic Messages body, `reasoning.effort` on a Codex Responses body. The
+// same key turns up in conversation text and tool schemas, and those must
+// never be read as the request's own setting.
+
+test('parseRequestEffort reads output_config.effort on an Anthropic body', () => {
+  const body = JSON.stringify({ model: 'claude-opus-5-5', messages: [], output_config: { effort: 'xhigh' } });
+  assert.equal(parseRequestEffort(body), 'xhigh');
+  assert.equal(parseRequestEffort(Buffer.from(body), 'anthropic'), 'xhigh');
+});
+
+test('parseRequestEffort reads reasoning.effort on a Codex body, and only there', () => {
+  const codex = JSON.stringify({ model: 'gpt-6', input: [], reasoning: { summary: 'auto', effort: 'max' } });
+  assert.equal(parseRequestEffort(codex, 'codex'), 'max');
+  // Each provider reads its own parent, so the other's spelling is absent.
+  assert.equal(parseRequestEffort(codex, 'anthropic'), null);
+  assert.equal(parseRequestEffort(JSON.stringify({ output_config: { effort: 'low' } }), 'codex'), null);
+  // `reasoning` with no effort (the Responses Lite lane) is a request that set none.
+  assert.equal(parseRequestEffort(JSON.stringify({ reasoning: { summary: 'auto' } }), 'codex'), null);
+  // An unknown provider has no known place for it.
+  assert.equal(parseRequestEffort(JSON.stringify({ output_config: { effort: 'low' } }), 'nope'), null);
+});
+
+test('parseRequestEffort is null when the body sets no effort', () => {
+  assert.equal(parseRequestEffort(JSON.stringify({ model: 'm', messages: [] })), null);
+  assert.equal(parseRequestEffort(JSON.stringify({ model: 'm', output_config: {} })), null);
+  assert.equal(parseRequestEffort(JSON.stringify({ model: 'm', output_config: { effort: '' } })), null);
+  assert.equal(parseRequestEffort(''), null);
+  assert.equal(parseRequestEffort(null), null);
+});
+
+test('parseRequestEffort ignores an effort key nested in messages and tools', () => {
+  const body = JSON.stringify({
+    model: 'm',
+    messages: [{ role: 'user', content: [{ type: 'text', text: '{"output_config":{"effort":"low"}}' }] },
+      { role: 'user', content: [{ type: 'tool_result', content: { output_config: { effort: 'low' } } }] }],
+    tools: [{ name: 't', input_schema: { properties: { output_config: { effort: 'medium' } } } }],
+    metadata: { output_config: { effort: 'high' } },
+    effort: 'top-level',
+  });
+  assert.equal(parseRequestEffort(body), null);
+  // And with the real field after all the decoys, it is the one read.
+  const real = JSON.stringify({ ...JSON.parse(body), output_config: { effort: 'xhigh' } });
+  assert.equal(parseRequestEffort(real), 'xhigh');
+});
+
+test('parseRequestEffort does not depend on key order', () => {
+  assert.equal(parseRequestEffort('{"output_config":{"effort":"low","format":{"type":"json"}},"model":"m"}'), 'low');
+  assert.equal(parseRequestEffort('{"model":"m","output_config":{"format":{"type":"json","effort":"no"},"effort":"high"}}'), 'high');
+  assert.equal(parseRequestEffort('{ "output_config" : { "task_budget" : 9 , "effort" : "medium" } }'), 'medium');
+});
+
+test('parseRequestEffort reads a non-string effort as absent', () => {
+  assert.equal(parseRequestEffort('{"output_config":{"effort":5}}'), null);
+  assert.equal(parseRequestEffort('{"output_config":{"effort":null}}'), null);
+  assert.equal(parseRequestEffort('{"output_config":{"effort":{"level":"high"}}}'), null);
+  assert.equal(parseRequestEffort('{"output_config":{"effort":["high"]}}'), null);
+  // A parent that is not an object holds no child field.
+  assert.equal(parseRequestEffort('{"output_config":"effort"}'), null);
+  assert.equal(parseRequestEffort('{"output_config":[{"effort":"high"}]}'), null);
+});
+
+test('parseRequestEffort keeps a client-supplied value as sent, with no list of known levels', () => {
+  assert.equal(parseRequestEffort('{"output_config":{"effort":"ludicrous"}}'), 'ludicrous');
+});
+
+test('NestedFieldFinder resolves across chunk boundaries, mid-key and mid-value', () => {
+  const body = Buffer.from('{"model":"m","output_config":{"effort":"xhigh"}}');
+  for (let cut = 1; cut < body.length; cut++) {
+    const finder = new NestedFieldFinder('output_config', 'effort');
+    finder.push(body.subarray(0, cut));
+    assert.equal(finder.push(body.subarray(cut)), 'xhigh', `split at byte ${cut}`);
+  }
+  // A byte at a time, through an escaped quote inside a decoy string.
+  const finder = new NestedFieldFinder('reasoning', 'effort');
+  for (const b of Buffer.from('{"input":"say \\"reasoning\\": {","reasoning":{"effort":"low"}}')) finder.push(Buffer.from([b]));
+  assert.equal(finder.value, 'low');
+});
+
+test('NestedFieldFinder stops once the parent object closes without the field', () => {
+  const finder = new NestedFieldFinder('output_config', 'effort');
+  finder.push(Buffer.from('{"output_config":{"format":{}}'));
+  assert.equal(finder.done, true);
+  assert.equal(finder.value, null);
+});
+
+test('modelLabel joins model and effort, and never shows an effort on its own', () => {
+  assert.equal(modelLabel('claude-opus-5-5', 'xhigh'), 'claude-opus-5-5·xhigh');
+  assert.equal(modelLabel('claude-opus-5-5', null), 'claude-opus-5-5');
+  assert.equal(modelLabel('claude-opus-5-5'), 'claude-opus-5-5');
+  assert.equal(modelLabel(null, 'xhigh'), '');
 });
