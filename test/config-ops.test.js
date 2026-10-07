@@ -8,6 +8,7 @@ import {
   setAccountDisabled,
   setAccountPriority,
   removeRoute,
+  renameAccount,
   setBlockedModels,
   setBucketThresholds,
   setDefaultClientMode,
@@ -275,4 +276,36 @@ test('setAccountDisabled deletes the key when enabling, as the CLI always has', 
   // A throwing op must not have half-applied.
   assert.throws(() => setAccountDisabled(config, 'solo@x.com', 'yes'), ConfigOpError);
   assert.ok(!('disabled' in config.accounts[2]));
+});
+
+test('renameAccount carries the new name into every route that listed the old one', () => {
+  const config = acctConfig();
+  config.routes = [
+    { name: 'fable', match: ['*fable*'], accounts: ['solo@x.com', 'a@x.com (Acme)'] },
+    { name: 'opus', match: ['*opus*'], accounts: ['a@x.com (Beta)'] },
+    // Written ahead of the account, so it already holds the new name.
+    { name: 'ahead', match: ['*'], accounts: ['solo@x.com', 'S1'] },
+  ];
+  assert.deepEqual(renameAccount(config, 'solo@x.com', '  S1 '), { from: 'solo@x.com', name: 'S1', routes: ['fable', 'ahead'] });
+  assert.equal(config.accounts[2].name, 'S1');
+  assert.deepEqual(config.routes[0].accounts, ['S1', 'a@x.com (Acme)']);
+  assert.deepEqual(config.routes[1].accounts, ['a@x.com (Beta)']);
+  assert.deepEqual(config.routes[2].accounts, ['S1'], 'the old and new name do not both stay');
+  // The same email in two orgs still needs the org named.
+  refused(() => renameAccount(config, 'a@x.com', 'A'), /matches 2 accounts/);
+  assert.equal(renameAccount(config, 'a@x.com', 'A', { orgFilter: 'Beta' }).from, 'a@x.com (Beta)');
+});
+
+test('renameAccount refuses a name that would reach another account, and changes nothing', () => {
+  const config = acctConfig();
+  config.routes = [{ name: 'r', match: ['*'], accounts: ['solo@x.com'] }];
+  const before = JSON.parse(JSON.stringify(config));
+  refused(() => renameAccount(config, 'solo@x.com', 'a@x.com (Acme)'), /already names another account/);
+  // An email resolves to its account too, so it is taken as well.
+  refused(() => renameAccount(config, 'solo@x.com', 'a@x.com'), /already names another account/);
+  refused(() => renameAccount(config, 'solo@x.com', '2'), /all digits/);
+  refused(() => renameAccount(config, 'solo@x.com', '   '), /new account name/);
+  refused(() => renameAccount(config, 'solo@x.com', 'S\n1'), /control characters/);
+  refused(() => renameAccount(config, 'nobody@x.com', 'S1'), /no account matches/);
+  assert.deepEqual(config, before);
 });
