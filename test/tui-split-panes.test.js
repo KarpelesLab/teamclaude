@@ -28,7 +28,7 @@ function fill(am) {
 }
 const fleet = (accounts, opts = {}) => fill(new AccountManager(accounts, 0.98, opts));
 // The budget a row is drawn from: the layout keys its budgets by this category.
-const rowCategoryOf = (a) => (a.type === 'oauth' || a.quota.unified5h != null || a.quota.unified7d != null ? 'unified' : 'metered');
+const rowCategoryOf = (a) => (a.type === 'oauth' || a.quota.unified5h != null || a.quota.unified7d != null ? 'unified' : a.quota.backend?.windows != null ? 'backend' : 'metered');
 
 /** Render at `width`: the frame's lines, and each row before fitLine cuts it, since the
  *  frame is always exactly `width` wide and only raw rows can show an overrun. */

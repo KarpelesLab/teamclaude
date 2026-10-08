@@ -272,7 +272,7 @@ A [third-party backend account](accounts.md#third-party-backend-accounts) has no
   Probe    ok 2m ago, 210ms
 ```
 
-The reading is normalized to `{ label, text, utilization }`, with a `windows` map when the provider reports distinct windows. A provider that reports a 0-1 fraction gets a bar like any other bucket; one that reports money or credits shows its text. A provider that publishes nothing keeps reading `unknown` — nothing is invented.
+The reading is normalized to `{ label, text, utilization }`, with a `windows` map when the provider reports distinct windows. The TUI draws those windows as the account row's Ses/Wk bars, plus a Mon bar when a monthly window exists; rotation thresholds do not apply to them, since nothing gates a backend on them. A row with probed windows draws them in place of the metered Tok/Req pair. A plan with a monthly window and no weekly one draws the month in the Wk slot. A provider that reports a 0-1 fraction gets a bar like any other bucket; one that reports money or credits shows its text. A provider that publishes nothing keeps reading `unknown` — nothing is invented.
 
 With `synthesizeQuotaHeaders: true` the probed 5-hour and weekly windows are also stated to the client as `anthropic-ratelimit-unified-*` headers, so Claude Code shows them in its own `rate_limits` like an Anthropic account's. A monthly window has no such header and is only on `GET /teamclaude/quota`. See [configuration](configuration.md).
 

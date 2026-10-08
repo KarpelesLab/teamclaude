@@ -251,12 +251,23 @@ const listRank = (/** @type {any} */ a) => (Number.isFinite(a?.displayOrder) ? a
 // where the account has one, else the all-models weekly, which is what governs
 // that family on such an account — the rule quota-summary.js resolves a
 // family's window by.
+
+// The window the weekly sorts read, backend windows included (a backend row
+// draws these same resets). A live window without a reset stays unknown: it
+// does not fall through to the monthly one, which the row draws separately.
+const weeklyResetOf = (/** @type {any} */ q) => {
+  if (q.unified7dReset != null) return q.unified7dReset;
+  const bw = q.backend?.windows;
+  const weekly = bwLive(bw?.weekly);
+  if (weekly) return weekly.resetAt;
+  return bwLive(bw?.monthly)?.resetAt;
+};
 /** @type {Record<string, (q: any) => any>} */
 const SORT_RESET = {
-  'session-reset': q => q.unified5hReset,
-  'weekly-reset': q => q.unified7dReset,
-  'sonnet-reset': q => (q.unified7dSonnet != null ? q.unified7dSonnetReset : q.unified7dReset),
-  'fable-reset': q => (q.unified7dFable != null ? q.unified7dFableReset : q.unified7dReset),
+  'session-reset': q => q.unified5hReset ?? bwLive(q.backend?.windows?.fiveHour)?.resetAt,
+  'weekly-reset': weeklyResetOf,
+  'sonnet-reset': q => (q.unified7dSonnet != null ? q.unified7dSonnetReset : weeklyResetOf(q)),
+  'fable-reset': q => (q.unified7dFable != null ? q.unified7dFableReset : weeklyResetOf(q)),
 };
 export const ACCOUNT_SORTS = ['arranged', ...Object.keys(SORT_RESET)];
 /** @type {Record<string, string>} */
@@ -279,15 +290,18 @@ const resetRank = (/** @type {any} */ t, /** @type {number} */ now) => (Number.i
 // enough that the file is current by the time anyone looks at it.
 const ORDER_SAVE_DELAY_MS = 400;
 
-// Which pair of bars a row draws: the subscription buckets (Ses/Wk, plus the
-// S7/F7 family bars) for a subscription or any unified reading, else the metered
-// Tok/Req pair an API-key account reports. The account row budget is drawn per
-// category (#234): the two kinds of row share no bar, so sizing an API-key row
-// for family bars it never draws only left it short of the edge.
+// Which bars a row draws: the subscription buckets (Ses/Wk, plus the S7/F7
+// family bars) for a subscription or any unified reading; the same slots filled
+// from the probed windows (plus Mon) for a third-party backend; else the
+// metered Tok/Req pair an API-key account reports. The account row budget is
+// drawn per category (#234): the three kinds of row share no bar, so sizing a
+// backend row for the family bars it never draws — or a Claude row for a
+// backend's Mon bar — only leaves the others short of the edge.
 function rowCategory(/** @type {any} */ account) {
   const q = account.quota;
-  return (isSubscriptionAccount(account) || q.unified5h != null || q.unified7d != null || q.unified7dSonnet != null || q.unified7dFable != null)
-    ? 'unified' : 'metered';
+  if (isSubscriptionAccount(account) || q.unified5h != null || q.unified7d != null || q.unified7dSonnet != null || q.unified7dFable != null) return 'unified';
+  if (q.backend?.windows != null) return 'backend';
+  return 'metered';
 }
 
 // Families this account can't serve right now: a family whose own weekly bucket
@@ -476,6 +490,13 @@ function formatReset(resetTs) {
 // and the seven-day weekly buckets (unified, Sonnet, Fable) reset on these.
 const FIVE_HOUR_MS = 5 * 60 * 60 * 1000;
 const SEVEN_DAY_MS = 7 * 24 * 60 * 60 * 1000;
+// A calendar month is 28-31 days; pace colouring off by a few percent at the
+// edges is the price of not knowing which one the provider means.
+const MONTH_MS = 30 * 24 * 60 * 60 * 1000;
+
+// A backend window past its reset is stale, not current (the probe may be
+// off); a window without a reset is live but unpaced.
+const bwLive = (/** @type {{ utilization: number, resetAt: number|null }|null|undefined} */ w) => (w && (w.resetAt == null || w.resetAt > Date.now()) ? w : null);
 
 // { bg, fg } SGR params per severity. White label on red (dark everywhere),
 // black on the lighter green/yellow/orange (bright-white would vanish on the
@@ -2267,15 +2288,15 @@ export class TUI {
     const genRoutes = routes.filter((/** @type {any} */ r) => routeFamily(r) === null
       && (pane == null || providerOf(r) === pane)); // a pane only holds its own provider's routes
     // Bar width, budgeted PER ROW CATEGORY (#234). A subscription row draws
-    // Ses/Wk and the S7/F7 family bars; an API-key row draws Tok/Req and
-    // nothing else. Neither shares a bar with the other, so the two are laid
-    // out against separate budgets: every subscription row lines up with the
-    // other subscription rows, every API-key row with the other API-key rows,
-    // and an API-key row no longer pays for family columns it never draws (or
-    // for a blocked-family tag only a subscription row can carry). Within a
-    // category the budget is still shared, on purpose: bars line up and equal
-    // lengths mean equal percentages, and the whitespace that costs a row
-    // without a tag is the price of that.
+    // Ses/Wk and the S7/F7 family bars; a third-party backend row draws the
+    // same slots from its probed windows plus Mon; an API-key row draws
+    // Tok/Req and nothing else. The three share no bar, so the three are laid
+    // out against separate budgets: rows line up within a category, and no
+    // category pays for bars it never draws (or for a blocked-family tag only
+    // a subscription row can carry). Within a category the budget is still
+    // shared, on purpose: bars line up and equal lengths mean equal
+    // percentages, and the whitespace that costs a row without a tag is the
+    // price of that.
     //
     // The budget must count every column the widest row in the category
     // actually draws, or the row overruns the terminal and fitLine cuts the
@@ -2298,7 +2319,8 @@ export class TUI {
     const budgetFor = (/** @type {string} */ cat, /** @type {any[]} */ members) => {
       const anyFable = members.some(a => a.quota.unified7dFable != null);
       const anySonnet = members.some(a => a.quota.unified7dSonnet != null);
-      const families = (anyFable ? 1 : 0) + (anySonnet ? 1 : 0);
+      const anyMonthly = members.some(a => bwLive(a.quota.backend?.windows?.monthly) != null && bwLive(a.quota.backend?.windows?.weekly) != null);
+      const families = (anyFable ? 1 : 0) + (anySonnet ? 1 : 0) + (anyMonthly ? 1 : 0);
       const tagW = members.reduce((w, a) => {
         const names = blockedFamilies(a.quota, key => this.am.thresholdFor(key, a));
         return names.length ? Math.max(w, 4 + vw(names.join(' '))) : w;
@@ -2632,16 +2654,32 @@ export class TUI {
     }
     status = rpad(status, 10);
 
-    // Quota ratios — prefer unified (Claude Max), fall back to standard (API key)
     let r1 = null, r2 = null, l1 = 'Ses', l2 = 'Wk ', t1 = null, t2 = null, w1 = null, w2 = null;
 
-    if (rowCategory(a) === 'unified') {
-      r1 = q.unified5h;
-      r2 = q.unified7d;
-      t1 = q.unified5hReset;
-      t2 = q.unified7dReset;
+    const backendWindows = q.backend?.windows
+      ? { fiveHour: bwLive(q.backend.windows.fiveHour), weekly: bwLive(q.backend.windows.weekly), monthly: bwLive(q.backend.windows.monthly) }
+      : undefined;
+    let r2BackendMonthly = false;
+    const category = rowCategory(a);
+    if (category !== 'metered') {
+      // A third-party backend has no unified readings; its probed windows fill
+      // the same slots. No threshold: rotation gates nothing on a backend, so
+      // its bars never redden at one.
+      r1 = q.unified5h ?? backendWindows?.fiveHour?.utilization ?? null;
+      r2 = q.unified7d ?? backendWindows?.weekly?.utilization ?? null;
+      t1 = q.unified5hReset ?? backendWindows?.fiveHour?.resetAt ?? null;
+      t2 = q.unified7dReset ?? backendWindows?.weekly?.resetAt ?? null;
       w1 = FIVE_HOUR_MS;
       w2 = SEVEN_DAY_MS;
+      // A plan with a monthly window and no weekly one (the newer Kimi plans)
+      // puts the month in the Wk slot rather than leaving it empty.
+      if (r2 == null && q.unified7d == null && backendWindows?.monthly != null) {
+        l2 = 'Mon';
+        r2 = backendWindows.monthly.utilization;
+        t2 = backendWindows.monthly.resetAt;
+        w2 = MONTH_MS;
+        r2BackendMonthly = true;
+      }
     } else {
       l1 = 'Tok';
       l2 = 'Req';
@@ -2671,12 +2709,16 @@ export class TUI {
       const th = thFor(k);
       return cap == null ? th : (typeof th === 'number' ? Math.min(th, cap) : cap);
     };
-    let th1 = limFor(r1 === q.unified5h ? 'unified5h' : 'tokens');
-    const th2 = limFor(r2 === q.unified7d ? 'unified7d' : 'requests');
+    // Per slot, not per row: a slot filled from a backend window carries no
+    // threshold (rotation gates nothing on it), whatever its neighbour holds.
+    const r1Backend = q.unified5h == null && backendWindows?.fiveHour != null;
+    const r2Backend = q.unified7d == null && backendWindows?.weekly != null;
+    let th1 = r1Backend ? null : limFor(r1 === q.unified5h ? 'unified5h' : 'tokens');
+    const th2 = (r2Backend || r2BackendMonthly) ? null : limFor(r2 === q.unified7d ? 'unified7d' : 'requests');
 
     // A list with no five-hour window to draw (see _listLayout) starts the row
     // at the weekly bar.
-    const weeklyFirst = !shortBar && rowCategory(a) === 'unified';
+    const weeklyFirst = !shortBar && category !== 'metered';
     // A Codex row whose subscription meters no five-hour window draws only the
     // weekly bar even while Claude rows on the same list keep Ses/Wk: a `Ses -`
     // cell there said nothing. Keyed on the fact the reading left behind
@@ -2688,7 +2730,7 @@ export class TUI {
     // its cell whatever the flag says (showSessionRow): it may be the one
     // holding the account out of rotation. The weekly bar takes the two cells'
     // width (bar + `  Wk ` + bar) so the row still ends where its neighbours do.
-    const weeklyOnly = !weeklyFirst && showBoth && rowCategory(a) === 'unified'
+    const weeklyOnly = !weeklyFirst && showBoth && category === 'unified'
       && providerOf(a) === 'codex' && !showSessionRow(q) && q.unified7d != null;
     if (weeklyFirst || weeklyOnly) [l1, r1, t1, w1, th1] = [l2, r2, t2, w2, th2];
     const bw1 = weeklyOnly ? bw * 2 + 6 : bw;
@@ -2700,6 +2742,11 @@ export class TUI {
     let line = ` ${sel}${cur} ${startSlot}${name} ${type}${status} ${l1} ${bar(r1, bw1, t1, w1, th1, pctInBar)}`;
     if (showBoth) {
       if (!weeklyFirst && !weeklyOnly) line += `  ${l2} ${bar(r2, bw, t2, w2, th2, pctInBar)}`;
+      // A backend's monthly window has no unified slot; it draws its own bar
+      // and is budgeted as a family column, like S7/F7.
+      if (showFamily && backendWindows?.monthly != null && l2 !== 'Mon') {
+        line += `  Mon ${bar(backendWindows.monthly.utilization, bw, backendWindows.monthly.resetAt, MONTH_MS, null, pctInBar)}`;
+      }
       // Sonnet weekly bar — only shown when the usage probe has populated it. A
       // leading ► (in place of a padding space) marks a Sonnet route on this account.
       if (showFamily && q.unified7dSonnet != null) {
