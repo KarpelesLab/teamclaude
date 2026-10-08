@@ -183,3 +183,51 @@ test('cascade: dropping one turn exposes the next orphan, valid pair is preserve
   assert.ok(JSON.stringify(body).includes('toolu_A'));
   assert.ok(!JSON.stringify(body).includes('toolu_B'));
 });
+
+// A message-thread continue carries only the turn's delta: the assistant turn
+// holding the tool_use stays in the thread upstream, so the tool_result that
+// opens the delta answers a message this body does not contain. The shape below
+// is what Claude Code 2.1.293 sends after a tool call (block order and roles as
+// captured, text replaced).
+const continueDelta = (extra = {}) => ({
+  model: 'claude',
+  messages: [
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_thread', content: 'one' }] },
+    { role: 'system', content: [{ type: 'text', text: 'a mid-conversation directive' }] },
+  ],
+  thread: { type: 'continue', previous_message_id: 'msg_prev' },
+  ...extra,
+});
+
+test('a thread continue keeps the tool_result its thread grounds', () => {
+  // Stripping it emptied the user turn, left the system directive first, and
+  // Anthropic answered every such continue with a 400.
+  const input = buf(continueDelta());
+  assert.equal(sanitizeToolPairs(input, MESSAGES, JSON_CT), input);
+});
+
+test('without a continue the same opening tool_result is still an orphan', () => {
+  // A create, or a body with no thread at all, carries the whole history: a
+  // tool_result with nothing before it is answered by nothing.
+  for (const thread of [undefined, { type: 'create' }]) {
+    const body = parse(run({ ...continueDelta(), thread }));
+    assert.ok(!JSON.stringify(body).includes('toolu_thread'), `kept with thread ${JSON.stringify(thread)}`);
+  }
+});
+
+test('a thread continue still strips an orphan later in its delta', () => {
+  // Only the delta's opening faces the thread; past it, the body holds both
+  // halves of every pair and the positional rule applies as usual.
+  const out = run({
+    model: 'claude',
+    messages: [
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_thread', content: 'one' }] },
+      { role: 'assistant', content: [{ type: 'text', text: 'ok' }, { type: 'tool_use', id: 'toolu_lost', name: 'noop', input: {} }] },
+      { role: 'user', content: 'no result for it' },
+    ],
+    thread: { type: 'continue', previous_message_id: 'msg_prev' },
+  });
+  const text = JSON.stringify(parse(out));
+  assert.ok(text.includes('toolu_thread'));
+  assert.ok(!text.includes('toolu_lost'));
+});

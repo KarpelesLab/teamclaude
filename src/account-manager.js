@@ -1972,6 +1972,30 @@ export class AccountManager {
   }
 
   /**
+   * A threaded request filed under `pinKey` was answered with `messageId`
+   * (after `previousId`, for a continue), so a continue naming it can find its
+   * conversation (see SessionTracker.threadOwner).
+   *
+   * @param {string|null} pinKey
+   * @param {string} messageId
+   * @param {string|null} [previousId]
+   */
+  recordThreadMessage(pinKey, messageId, previousId = null) {
+    if (pinKey) this.sessionTracker.recordThreadMessage(pinKey, messageId, previousId);
+  }
+
+  /**
+   * The conversation of `sessionId` that produced message `messageId`, or null.
+   *
+   * @param {string|null} sessionId
+   * @param {unknown} messageId
+   * @returns {{ key: string, conversation: string|null }|null}
+   */
+  threadOwner(sessionId, messageId) {
+    return this.sessionTracker.threadOwner(sessionId, messageId);
+  }
+
+  /**
    * Record a client request's outcome WITHOUT closing an in-flight hold — for
    * the exits that answer or refuse before beginSession ever opened one.
    */

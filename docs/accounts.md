@@ -529,6 +529,8 @@ An `upstream` whose host is Anthropic's own is left alone without any flag — a
 
 The effective upstream is what counts. A fleet pointed at a third-party host through the global `upstream` is covered the same way: every account without an `upstream` of its own is refused continues there. (Before 1.1.22 only a per-account `upstream` armed this; a fleet on a third-party global upstream now gets the repair without a setting.)
 
+On Anthropic accounts a continue is forwarded as sent. Its delta opens with the `tool_result` answering the last tool call, whose `tool_use` is in the thread rather than in the body, so the tool-pair repair leaves that opening alone instead of stripping it as an orphan; and session-aware routing sends the continue to the account holding the thread (see [Session-aware routing](routing.md#session-aware-routing)).
+
 A relay that forwards to Anthropic does keep thread state, and for it the refusal is pure overhead — the client would re-send a full history each turn for nothing. Declare it with `"messageThreads": true` on the account, or at the top level of the config for the global `upstream`, and continues are forwarded untouched.
 
 ### `accounts[].models` is deprecated
