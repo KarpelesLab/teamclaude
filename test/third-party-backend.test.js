@@ -35,6 +35,13 @@ test('constructor carries upstream/modelMap/models onto the account (and default
   assert.equal(cl.upstream, null);
   assert.equal(cl.modelMap, null);
   assert.equal(cl.models, null);
+  assert.equal(ds.supportsAdvisorTools, false, 'custom upstream defaults closed for beta advisor tools');
+  assert.equal(cl.supportsAdvisorTools, false);
+});
+
+test('constructor preserves explicit advisor-tool capability opt-in', () => {
+  const am = new AccountManager([deepseek({ supportsAdvisorTools: true })], 0.98);
+  assert.equal(am.accounts[0].supportsAdvisorTools, true);
 });
 
 // ── model-ownership routing ──────────────────────────────────────────────────

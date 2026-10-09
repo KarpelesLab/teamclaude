@@ -31,6 +31,7 @@ test('reload updates modelMap/upstream/capability/tier in manager AND mem config
       modelMap: { new: 'deepseek-v4-pro' },
       acceptsModels: ['deepseek-v4-flash', 'deepseek-v4-pro'],
       strictModelMap: true,
+      supportsAdvisorTools: true,
     })],
     routes: [{ name: 'default', match: ['*'], tiers: [
       { name: 'paid', accounts: ['deepseek'] },
@@ -46,6 +47,7 @@ test('reload updates modelMap/upstream/capability/tier in manager AND mem config
   assert.deepEqual(a.modelMap, { new: 'deepseek-v4-pro' });
   assert.deepEqual(a.acceptsModels, ['deepseek-v4-flash', 'deepseek-v4-pro']);
   assert.equal(a.strictModelMap, true);
+  assert.equal(a.supportsAdvisorTools, true);
   assert.deepEqual(mem.accounts[0].modelMap, { new: 'deepseek-v4-pro' },
     'later TUI save cannot clobber disk with startup map');
 

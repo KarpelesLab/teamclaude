@@ -175,6 +175,18 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
     const port = parseInt(portStr, 10) || 443;
     const mode = hostMode(host, config);
 
+    // no-forwarding hardening (opt-in; default OFF).
+    // 'tunnel' mode is the blind relay to an arbitrary host — the CONNECT half
+    // of the confused-deputy egress hole. Refuse it when hardened, while
+    // leaving the MITM/intercept path (the legitimate upstream) untouched.
+    if (config.proxy?.noForwarding === true && mode === 'tunnel') {
+      try {
+        clientSocket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
+      } catch { /* client already gone */ }
+      clientSocket.destroy();
+      return;
+    }
+
     if (mode === 'tunnel') {
       // Until the upstream connects we still owe the client a CONNECT status
       // line. If we tore the socket down on an upstream failure without one,

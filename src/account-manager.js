@@ -135,6 +135,10 @@ function makeAccount(acct, index) {
     upstream: acct.upstream || null,
     modelMap: acct.modelMap || null,
     models: acct.models || null,
+    // Custom upstreams default closed for Claude Code's beta advisor tool. A
+    // provider that implements the variant can opt in explicitly; absence must
+    // stay false so an unknown backend enum cannot take down the executor turn.
+    supportsAdvisorTools: acct.supportsAdvisorTools === true,
     // Closed provider capability contract. Most Anthropic-compatible upstreams
     // are open/opaque — absence means "do not guess". Adapters like DeepSeek
     // expose a finite model set; for those, configure acceptsModels +
@@ -259,6 +263,15 @@ export class AccountManager {
     this._refreshFn = refreshFn;
     this.accounts = accounts.map((acct, index) => makeAccount(acct, index));
     this.currentIndex = 0;
+    // Dynrank recovery pull-back (2026-09-19 #7 review, revised): the account
+    // field is a TIMESTAMP (requalifiedAt), not a one-shot boolean. A boolean
+    // consumed by the first _selectForSession call that looks at it meant a
+    // second session pinned to the SAME fallback could never see the same
+    // recovery event — sessionTracker now tracks a per-session watermark
+    // instead (recoveryCheckedThrough / markRecoveryChecked). This manager-
+    // level watermark is a pure O(1) fast path: skip the per-account scan
+    // entirely when nothing has recovered since a session last checked.
+    this._lastRecoveryAt = 0;
     // T2: per-session served-family ledger. Own TTL (24h), NOT SessionTracker's
     // 1h — poison outlives prompt cache. Default mode enforce is inert until
     // some account declares acceptsHistoryFamilies.
@@ -708,6 +721,61 @@ export class AccountManager {
               this._isAvailable(a, model, advisorModel)
               && !exclude?.has(a.index)
               && this._costTierFor(a, model) < pinnedTier);
+            // Recovery pull-back (2026-09-19, Eddie-approved; revised after #7
+            // review). `_lastRecoveryAt` / `account.requalifiedAt` are TIMESTAMPS
+            // an account gets whenever it transitions back to eligible (see
+            // _markRequalified — error clear, ordinary disabled->enabled,
+            // rate-limit clear, AUTOMATIC rate-limit expiry, OAuth token
+            // refresh). Without this, a session that failed over while its home
+            // account was down stays on the fallback FOREVER — costTier
+            // comparison alone cannot catch this when tiers are unconfigured
+            // (every account defaults costTier=0, so `cheaperEligible` above is
+            // permanently false).
+            //
+            // Per-SESSION watermark, not a one-shot flag consumed globally: two
+            // sessions pinned to the same fallback must each get an independent
+            // look at the SAME recovery event. sessionTracker owns
+            // `lastRecoveryCheckAt` per session; this manager only stamps
+            // `requalifiedAt` on accounts and reads it (coderabbitai + macroscope,
+            // PR #7 — a shared boolean meant the first session to check cleared
+            // it, starving every other session sharing that fallback).
+            //
+            // Fast path: skip the per-account scan entirely when nothing has
+            // recovered since this session last checked (`_lastRecoveryAt` is
+            // the newest `requalifiedAt` across all accounts).
+            let recovered = null;
+            if (this._lastRecoveryAt > 0
+                && !this.sessionTracker.recoveryCheckedThrough(sessionId, this._lastRecoveryAt)) {
+              // Ranking uses dynamicCompare — the same comparator dynamic mode
+              // uses everywhere else — not the strict tier `<` above, so a
+              // recovery that is merely tied on tier (the common case: costTier
+              // unconfigured, or same tier by design) can still win on the
+              // comparator's later keys (fidelity, weekly/session reset,
+              // utilization, priority). A recovery ranked WORSE than the current
+              // pin is correctly left alone — this is "pull back the true home
+              // account", not "prefer anything that just changed state".
+              for (const a of this.accounts) {
+                if (!a.requalifiedAt || a.index === pinned.index) continue;
+                if (!this._isAvailable(a, model, advisorModel) || exclude?.has(a.index)) continue;
+                if (this.dynamicCompare(a, pinned, model) < 0
+                    && (!recovered || this.dynamicCompare(a, recovered, model) < 0)) {
+                  recovered = a;
+                }
+              }
+              // This session has now evaluated every recovery up to the current
+              // high-water mark, regardless of outcome — it will not re-scan on
+              // every subsequent request (the polling/thrash
+              // preserveSessionAffinity exists to prevent), but a DIFFERENT
+              // session sharing this fallback still has its own watermark and
+              // will evaluate the same recovery independently.
+              this.sessionTracker.markRecoveryChecked(sessionId, this._lastRecoveryAt);
+            }
+            if (recovered) {
+              this._rememberDynamic(this._dynamicKey(model, advisorModel), recovered);
+              this._beginRamp(recovered);
+              console.log(`[TeamClaude] Session pin recovery: "${recovered.name}" is back and ranks ahead of "${pinned.name}" — pulling the session back`);
+              return recovered;
+            }
             if (!cheaperEligible) return pinned;
           }
         } else {
@@ -1550,6 +1618,13 @@ export class AccountManager {
         account.status = 'active';
         account.rateLimitedUntil = null;
         account.throttledAt = null;
+        // Recovery pull-back (2026-09-19 #7 review): this is the AUTOMATIC
+        // throttle-expiry path, distinct from clearRateLimited's manual/probe
+        // path, and it runs on every getActiveAccount call (see
+        // refreshExpiredQuotas's call site) — the most common recovery trigger
+        // in practice. The original fix covered the manual path and missed
+        // this one entirely (coderabbitai, PR #7).
+        this._markRequalified(account);
         console.log(`[TeamClaude] Account "${account.name}" rate limit expired, marking active`);
         changed = true;
       }
@@ -1715,6 +1790,19 @@ export class AccountManager {
   /** The cost/fallback tier for this account on THIS model's route. Route tiers
    * are authoritative; account.costTier is the backward-compatible fallback.
    * Numeric account tokens resolve the same way route eligibility does. */
+  /** Stamp `account` as having just RECOVERED to an eligible state (error
+   * cleared, disabled->enabled, rate-limit cleared or expired, OAuth token
+   * refreshed). Advances the manager-wide high-water mark used as an O(1)
+   * fast-path skip in `_selectForSession`; per-session evaluation of what
+   * recovered is tracked separately by sessionTracker (see
+   * recoveryCheckedThrough / markRecoveryChecked) so multiple sessions
+   * sharing one fallback each get an independent look at the same event. */
+  _markRequalified(account) {
+    const now = Date.now();
+    account.requalifiedAt = now;
+    if (now > this._lastRecoveryAt) this._lastRecoveryAt = now;
+  }
+
   _costTierFor(account, model) {
     const route = this._routeForModel(model);
     if (route?.tiers?.length) {
@@ -2177,12 +2265,20 @@ export class AccountManager {
   setDisabled(accountIndex, disabled) {
     const account = this.accounts[accountIndex];
     if (!account) return;
+    const wasDisabled = account.disabled;
     account.disabled = disabled;
     if (!disabled && account.status === 'error') {
       account.status = 'active';
       account.rateLimitedUntil = null;
       console.log(`[TeamClaude] Account "${account.name}" re-enabled — clearing error state`);
     }
+    // Recovery pull-back (2026-09-19 #7 review): an ORDINARY disabled->enabled
+    // transition (status already active/etc, just operator-toggled) is a
+    // recovery too — a pinned session lost this account to `disabled` the same
+    // way it loses one to `error`, and needs the same chance to pull back.
+    // The original fix only armed this inside the error-clearing branch above
+    // and missed the plain toggle (coderabbitai, PR #7).
+    if (wasDisabled && !disabled) this._markRequalified(account);
   }
 
   /**
@@ -2246,6 +2342,9 @@ export class AccountManager {
     account.status = 'active';
     account.rateLimitedUntil = null;
     account.throttledAt = null;
+    // See setDisabled: a pinned session may be on the fallback that covered
+    // this account while it was throttled — recovery pull-back offers it back.
+    this._markRequalified(account);
     console.log(`[TeamClaude] Account "${account.name}" revalidated — rate limit no longer applies, back in rotation`);
   }
 
@@ -2326,7 +2425,13 @@ export class AccountManager {
     account.credential = accessToken;
     if (refreshToken) account.refreshToken = refreshToken;
     account.expiresAt = expiresAt;
-    if (account.status === 'error') account.status = 'active';
+    if (account.status === 'error') {
+      account.status = 'active';
+      // See setDisabled: an OAuth token refresh (e.g. after re-auth clears a
+      // revoked-grant error) is exactly the "recovered" event a pinned session
+      // needs offered back to it.
+      this._markRequalified(account);
+    }
     console.log(`[TeamClaude] Updated tokens for account "${account.name}"`);
     this._onTokenRefresh?.(accountIndex, {
       accessToken,
@@ -2356,6 +2461,7 @@ export class AccountManager {
     set('upstream', disk.upstream || null);
     set('modelMap', disk.modelMap || null);
     set('models', disk.models || null);
+    set('supportsAdvisorTools', disk.supportsAdvisorTools === true);
     set('acceptsModels', Array.isArray(disk.acceptsModels) ? disk.acceptsModels.map(String) : null);
     set('strictModelMap', !!disk.strictModelMap);
     set('historyFamily', resolveHistoryFamily(disk));

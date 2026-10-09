@@ -156,7 +156,10 @@ test('ingress strips a provable advisor-id collision and still forwards the exec
     assert.equal(t.hits, 1);
     const forwarded = JSON.parse(t.lastBody);
     assert.equal(forwarded.model, 'claude-opus-4-8');
-    assert.equal('model' in forwarded.tools[1], false, 'colliding advisor id must never egress');
+    // The winning account inherits the custom top-level upstream, so drop
+    // supersedes the collision strip: the whole advisor tool is gone.
+    assert.equal(forwarded.tools.length, 1, 'colliding advisor must never egress — whole tool dropped on custom upstream');
+    assert.equal(forwarded.tools[0].name, 'Bash');
     assert.ok(t.am.getStatus().advisorDegrades >= 1);
   } finally {
     await t.close();

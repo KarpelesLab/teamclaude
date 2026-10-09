@@ -137,6 +137,20 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
     mkdir(logDir, { recursive: true }).catch(() => {});
   }
 
+  // --- no-forwarding hardening (opt-in; default OFF) ---
+  // Closes the confused-deputy egress hole: a loopback caller is auth-exempt
+  // (isLoopbackAddr), so ANY local process — including a sandbox handed a
+  // bridge to this port — can ask the proxy to dial arbitrary destinations,
+  // in BOTH modes (absolute-URI GET -> relayHttpForward, and CONNECT).
+  // Hardening is destination-scoped, NOT a blanket ban: the MITM path needs
+  // CONNECT to the upstream host to keep working, so that host stays allowed
+  // and everything else is refused. Enable with proxy.noForwarding = true.
+  const noForwarding = config.proxy?.noForwarding === true;
+  const upstreamHost = (() => {
+    try { return new URL(upstream).hostname; } catch { return 'api.anthropic.com'; }
+  })();
+  const forwardTargetAllowed = (hostname) => !noForwarding || hostname === upstreamHost;
+
   const requestHandler = async (req, res) => {
     try {
       // Auth check — skip for localhost connections.
@@ -155,7 +169,21 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
       // proxying plain HTTP to some host. Account logic is only for hosts we
       // manage (the Anthropic upstream, which is HTTPS-only and never arrives
       // this way); forward anything else transparently instead of hijacking it.
-      if (/^https?:\/\//i.test(req.url || '')) { relayHttpForward(req, res); return; }
+      if (/^https?:\/\//i.test(req.url || '')) {
+        if (noForwarding) {
+          let host = null;
+          try { host = new URL(req.url).hostname; } catch { /* malformed -> refuse */ }
+          if (host === null || !forwardTargetAllowed(host)) {
+            res.writeHead(403, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+              type: 'error',
+              error: { type: 'forbidden', message: 'Forward-proxying is disabled on this proxy' },
+            }));
+            return;
+          }
+        }
+        relayHttpForward(req, res); return;
+      }
 
       // Status endpoint. B19: routes[] may include `tiers` (configured fallback
       // structure). Field ABSENT when the route is untiered — not null, not [].
@@ -490,6 +518,46 @@ export function relayHttpForward(req, res) {
 
 const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/files/', '/api/oauth/file_upload'];
 
+/** True only for the native Anthropic API root. Request transforms must classify
+ * the same effective upstream URL that transport will dial: an account with no
+ * per-account override can still inherit a custom top-level upstream. */
+export function isNativeAnthropicUpstream(raw) {
+  if (!raw) return false;
+  try {
+    const u = new URL(raw);
+    return u.protocol === 'https:'
+      && u.hostname.toLowerCase() === 'api.anthropic.com'
+      && (u.port === '' || u.port === '443')
+      && (u.pathname === '' || u.pathname === '/')
+      && !u.search
+      && !u.hash;
+  } catch {
+    return false;
+  }
+}
+
+// Anthropic-native CONTROL PLANE. These are not inference: they describe the
+// signed-in identity and what the org entitles it to. They must never ride the
+// account rotation — a custom adapter upstream (codex/antigravity/deepseek)
+// implements none of them and answers 404, which the client reads as "this
+// model is not available" and then walks its whole fallbackModel chain down
+// (2026-08-21 "Switched to X because Y is not available" cascade).
+// Relayed with the CLIENT's own credential, like CLIENT_CREDENTIAL_PATHS: the
+// answer must describe the user's real account, not whichever account rotation
+// happened to pick.
+const CONTROL_PLANE_PREFIXES = [
+  '/api/claude_cli/',            // bootstrap: org model entitlements
+  '/api/claude_code/',           // notification prefs & other client config
+  '/api/oauth/profile',          // signed-in identity
+  '/api/oauth/usage',            // quota readback for the real account
+];
+const CONTROL_PLANE_EXACT = new Set(['/api/hello']);
+function isControlPlanePath(url) {
+  const path = (url || '').split('?')[0];
+  if (CONTROL_PLANE_EXACT.has(path)) return true;
+  return CONTROL_PLANE_PREFIXES.some((p) => path.startsWith(p));
+}
+
 /** Hostname of account.upstream || default upstream — never a full URL. */
 function provenanceUpstreamHost(account, defaultUpstream) {
   const raw = account?.upstream || defaultUpstream;
@@ -591,6 +659,11 @@ export function createProxyRequestListener({
       // paired identity, so fetching them with a rotated token 403s and Claude
       // Code silently drops the image from the message.
       if (CLIENT_CREDENTIAL_PATHS.some((p) => (req.url || '').startsWith(p))) { await relayStream(req, res, upstream, sx); return; }
+
+      // Anthropic-native control plane (see CONTROL_PLANE_PREFIXES): startup
+      // connectivity gate, org model entitlements, identity, usage. Relayed to
+      // the default upstream with the client's own credential — never rotated.
+      if (isControlPlanePath(req.url)) { await relayStream(req, res, upstream, sx); return; }
 
       // Account pin: a request to `/tc-acct/<name-or-index>/...` (e.g. via
       // ANTHROPIC_BASE_URL=http://host:port/tc-acct/deepseek) is forced onto that
@@ -1321,7 +1394,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     headers['x-api-key'] = account.credential;
   }
 
-  const upstreamUrl = `${account.upstream || upstream}${req.url}`;
+  const effectiveUpstream = account.upstream || upstream;
+  const upstreamUrl = `${effectiveUpstream}${req.url}`;
+  const customUpstream = !isNativeAnthropicUpstream(effectiveUpstream);
   const method = req.method;
 
   // Strip orphaned tool_use / tool_result blocks so a client that compacted or
@@ -1359,16 +1434,36 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // Rewrite the model name for accounts that target a different upstream (e.g.
   // GLM), which uses different model identifiers than Anthropic. Advisor
   // tools[].model walks the same map; on a custom upstream an unmapped advisor
-  // id is stripped (never egressed verbatim) — G9 strip-and-degrade.
-  if (account.modelMap) {
-    sendBody = rewriteModel(sendBody, account.modelMap, {
-      stripUnmappedAdvisor: !!account.upstream,
+  // id is stripped (never egressed verbatim) — G9 strip-and-degrade. Custom
+  // upstreams also cannot accept the advisor tool *type* (codex-shaped tool
+  // enums reject `advisor_20260301` with a 400), so the whole advisor tool is
+  // dropped there — with or without a modelMap (e.g. codex-gpt56 → local
+  // anthropic-proxy has no modelMap but still must not egress the variant).
+  // A custom provider that implements the beta tool can opt in explicitly with
+  // supportsAdvisorTools:true; custom effective upstreams default closed. The
+  // classification uses the same effective URL as transport so an account that
+  // inherits a custom top-level upstream cannot bypass the compatibility gate.
+  if (account.modelMap || customUpstream) {
+    sendBody = rewriteModel(sendBody, account.modelMap || {}, {
+      stripUnmappedAdvisor: customUpstream && !account.supportsAdvisorTools,
+      dropAdvisorTools: customUpstream && !account.supportsAdvisorTools,
       onAdvisorStrip: (id) => {
         accountManager.noteAdvisorDegrade('unmapped', id, account.name);
         ctx.advisorDegraded = true;
       },
+      onAdvisorDrop: (id) => {
+        accountManager.noteAdvisorDegrade('unsupported-tool', id, account.name);
+        ctx.advisorDegraded = true;
+      },
     });
   }
+  // Custom upstreams that cannot parse a `pattern` escape reject the WHOLE request
+  // (DeepSeek: `"^[^\\0]*$" is not a "regex"`), so sanitize tool schemas before
+  // egress. Gated on customUpstream — native Anthropic accepts the guard as-is.
+  if (customUpstream && sendBody.length > 0) {
+    sendBody = stripUnparseablePatterns(sendBody);
+  }
+
   // Content-Length must match the bytes we actually send. Gate-time advisor
   // strip, sanitize, uuid patch, and model rewrite can all change the length
   // relative to the client's original header — always recompute from sendBody.
@@ -1397,7 +1492,11 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     if (safeHeaders['x-api-key']) safeHeaders['x-api-key'] = safeHeaders['x-api-key'].slice(0, 15) + '...';
     if (safeHeaders['authorization']) safeHeaders['authorization'] = safeHeaders['authorization'].slice(0, 20) + '...';
     l.write(`=== REQUEST (account: ${account.name}, retry: ${retryCount}) ===\n${method} ${upstreamUrl}\n${formatHeaders(safeHeaders)}`);
-    if (body.length > 0) l.body('REQUEST BODY', body, req.headers['content-type']);
+    // Record the POST-rewrite sendBody — exactly what egresses. Logging the
+    // pre-rewrite `body` here would falsely show a dropped advisor tool as
+    // still present (2026-09-01 audit finding: logs claimed advisor egress on
+    // requests where dropAdvisorTools had spliced it off).
+    if (sendBody.length > 0) l.body('REQUEST BODY', sendBody, req.headers['content-type']);
   };
 
   try {
@@ -2164,14 +2263,55 @@ function extractUsageFromBody(buffer, accountIndex, accountManager, sessionCtx =
 
 // Rewrite model ids in a JSON request body using a per-account map. Walks both
 // the executor `model` and any advisor tools[].model. Returns the original
-// buffer when nothing changes (or the body isn't JSON). When
-// `stripUnmappedAdvisor` is set, an advisor id absent from the map has its
-// `model` field dropped rather than egressing verbatim — the Content-Length
-// update at the write site already handles the size change.
+// buffer when nothing changes (or the body isn't JSON). `stripUnmappedAdvisor`
+// preserves the legacy G9 behavior: an advisor id absent from the map has its
+// `model` field dropped. `dropAdvisorTools` removes the whole advisor tool for
+// custom upstreams whose tool enum does not recognize Claude Code's beta
+// `advisor_20260301` variant. The Content-Length update at the write site
+// already handles either size change.
 // Exported for tests.
+// Custom-upstream tool-schema compatibility (2026-09-18).
+// Some third-party Anthropic-compatible backends PARSE a schema's `pattern` value
+// as a regular expression and reject escapes their regex engine does not
+// implement. DeepSeek rejects Claude Code's NUL-guard `^[^\0]*$` with
+//   Invalid schema for function 'Artifact': "^[^\\0]*$" is not a "regex"  (400)
+// which kills EVERY tool-bearing Claude Code turn on that route — the client
+// surfaces it as a Fable error, falls back to Sonnet 5, and fails identically
+// because both map to the same backend. Diagnosed live 2026-09-18 when bene-6's
+// successor turn died ~90s after its handoff.
+// We drop ONLY the patterns the backend provably cannot parse (`\0` escapes) —
+// every other keyword, including other `pattern`s, is preserved, so the tool
+// definition stays as close to the client's as the upstream allows. Native
+// Anthropic upstreams accept the guard and are never touched (see the
+// customUpstream gate at the call site).
+// Exported for tests.
+export function stripUnparseablePatterns(body) {
+  try {
+    const obj = JSON.parse(body.toString('utf8'));
+    let changed = false;
+    const walk = (node) => {
+      if (Array.isArray(node)) {
+        for (const item of node) walk(item);
+        return;
+      }
+      if (!node || typeof node !== 'object') return;
+      if (typeof node.pattern === 'string' && node.pattern.includes('\\0')) {
+        delete node.pattern;
+        changed = true;
+      }
+      for (const v of Object.values(node)) walk(v);
+    };
+    if (Array.isArray(obj.tools)) walk(obj.tools);
+    if (changed) return Buffer.from(JSON.stringify(obj), 'utf8');
+  } catch { /* not JSON — pass through unchanged */ }
+  return body;
+}
+
 export function rewriteModel(body, modelMap, {
   stripUnmappedAdvisor = false,
+  dropAdvisorTools = false,
   onAdvisorStrip = null,
+  onAdvisorDrop = null,
 } = {}) {
   try {
     const obj = JSON.parse(body.toString('utf8'));
@@ -2181,9 +2321,31 @@ export function rewriteModel(body, modelMap, {
       changed = true;
     }
     if (Array.isArray(obj.tools)) {
-      for (const t of obj.tools) {
-        if (!t || typeof t !== 'object' || typeof t.type !== 'string' || !/^advisor/i.test(t.type)) continue;
-        if (typeof t.model !== 'string' || !t.model) continue;
+      for (let i = 0; i < obj.tools.length; ) {
+        const t = obj.tools[i];
+        if (!t || typeof t !== 'object' || typeof t.type !== 'string' || !/^advisor/i.test(t.type)) {
+          i += 1;
+          continue;
+        }
+        // Custom upstream (codex-shaped backend — e.g. sakana / api.sakana.ai,
+        // or the local anthropic-proxy / deepseek-adapter relays): the advisor
+        // tool *variant itself* is not in the backend's tool enum. Egressing
+        // `type: "advisor_20260301"` 400s with "unknown variant
+        // `advisor_20260301`, expected `web_search_20250305` or
+        // `web_search_20260209`" (fleet incident 2026-08-21, recurrences killed
+        // turns across ai-scientist/tc-fugu). The tool is a Claude-Code beta
+        // feature (second-model routing) with no meaning for a third-party
+        // backend, so drop the whole tool — not just its model (G9 completion).
+        if (dropAdvisorTools) {
+          obj.tools.splice(i, 1);
+          changed = true;
+          onAdvisorDrop?.(typeof t.model === 'string' && t.model ? t.model : t.type);
+          continue; // next element shifted into index i — do not advance
+        }
+        if (typeof t.model !== 'string' || !t.model) {
+          i += 1;
+          continue;
+        }
         if (modelMap[t.model]) {
           t.model = modelMap[t.model];
           changed = true;
@@ -2192,6 +2354,48 @@ export function rewriteModel(body, modelMap, {
           delete t.model;
           changed = true;
           onAdvisorStrip?.(stripped);
+        }
+        i += 1;
+      }
+    }
+    // Adapt only this outbound copy: a later native retry needs the original
+    // server-tool history, including its encrypted advisor results, unchanged.
+    // Pairs are linked within one assistant content array by
+    // server_tool_use.id == advisor_tool_result.tool_use_id (NOT the ordinary
+    // assistant-call/next-user-result pattern), so they are removed together.
+    if (dropAdvisorTools && Array.isArray(obj.messages)) {
+      const advisorIds = new Set();
+      for (const message of obj.messages) {
+        if (!Array.isArray(message?.content)) continue;
+        for (const block of message.content) {
+          if (block?.type === 'advisor_tool_result' && block.tool_use_id) advisorIds.add(block.tool_use_id);
+          if (block?.type === 'server_tool_use' && block.name === 'advisor' && block.id) advisorIds.add(block.id);
+        }
+      }
+      for (const message of obj.messages) {
+        if (!Array.isArray(message?.content)) continue;
+        const content = [];
+        let removed = false;
+        for (const block of message.content) {
+          if (block?.type === 'server_tool_use' && (block.name === 'advisor' || advisorIds.has(block.id))) {
+            removed = true;
+            continue;
+          }
+          if (block?.type !== 'advisor_tool_result') { content.push(block); continue; }
+          removed = true;
+          // Only the documented plaintext result is readable. Never stringify
+          // encrypted_content, error objects, or unknown variants as invented
+          // reasoning; the marker states only that history was dropped.
+          const result = block.content;
+          if (result?.type === 'advisor_result' && typeof result.text === 'string' && result.text.trim()) {
+            content.push({ type: 'text', text: '[Historical advisor result]\n' + result.text });
+          } else {
+            content.push({ type: 'text', text: '[Historical advisor result unavailable on this backend.]' });
+          }
+        }
+        if (removed) {
+          message.content = content.length ? content : [{ type: 'text', text: '[Historical advisor call result omitted on this backend.]' }];
+          changed = true;
         }
       }
     }

@@ -55,6 +55,63 @@ test('reverse-proxy logs a non-streaming JSON response (pretty, masked)', { time
   }
 });
 
+test('request log records the post-rewrite body after advisor-tool drop', { timeout: 20000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tc-revlog-advisor-'));
+  let seenBody = null;
+  const upstream = http.createServer((req, res) => {
+    const chunks = [];
+    req.on('data', c => chunks.push(c));
+    req.on('end', () => {
+      seenBody = Buffer.concat(chunks).toString();
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"ok":true}');
+    });
+  });
+  const upPort = await listen(upstream);
+  // No per-account upstream/modelMap: this account inherits the custom global
+  // upstream and exercises the effective-upstream compatibility gate.
+  const am = new AccountManager([{ name: 'inherited-custom', type: 'apikey', apiKey: 'provider-k' }]);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upPort}`,
+    logDir: dir,
+  });
+  const proxyPort = await listen(proxy);
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude-sonnet-5',
+        max_tokens: 16,
+        tools: [
+          { name: 'Bash', description: 'x', input_schema: { type: 'object', properties: {} } },
+          { type: 'advisor_20260301', name: 'advisor', model: 'claude-opus-5' },
+        ],
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    assert.equal(res.status, 200);
+    await res.text();
+    await new Promise(r => setTimeout(r, 150));
+
+    const forwarded = JSON.parse(seenBody);
+    assert.equal(forwarded.tools.length, 1, 'advisor tool is absent from actual egress');
+    assert.equal(forwarded.tools[0].name, 'Bash');
+
+    const file = readdirSync(dir).find(f => f.endsWith('.log'));
+    assert.ok(file, 'a log file was written');
+    const content = readFileSync(join(dir, file), 'utf8');
+    const requestSection = content.match(/=== REQUEST BODY ===\n([\s\S]*?)\n\n=== RESPONSE 200 ===/);
+    assert.ok(requestSection, 'request body section is delimited before the response');
+    const logged = JSON.parse(requestSection[1]);
+    assert.deepEqual(logged, forwarded, 'audit log must equal the post-rewrite body that egressed');
+    assert.ok(!requestSection[1].includes('advisor_20260301'));
+  } finally {
+    proxy.close(); upstream.close(); rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('reverse-proxy streams an SSE response to the log as it arrives', { timeout: 20000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), 'tc-revlog-sse-'));
   const { upstream, am } = makeStack(async (_req, res) => {

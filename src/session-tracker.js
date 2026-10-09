@@ -84,10 +84,36 @@ export class SessionTracker {
   _ensure(sessionId, now) {
     let s = this.sessions.get(sessionId);
     if (!s) {
-      s = { accountIndex: null, firstSeen: now, lastSeen: now, count: 0, inFlight: 0 };
+      // lastRecoveryCheckAt: watermark for dynrank recovery pull-back (2026-09-19
+      // #7 review). A recovered account is timestamped, not one-shot-consumed —
+      // see recoveryCheckedThrough / markRecoveryChecked — so two sessions
+      // pinned to the same fallback each get their own independent evaluation
+      // of the SAME recovery event instead of racing to clear a shared flag.
+      s = { accountIndex: null, firstSeen: now, lastSeen: now, count: 0, inFlight: 0, lastRecoveryCheckAt: 0 };
       this.sessions.set(sessionId, s);
     }
     return s;
+  }
+
+  // Has this session already evaluated every recovery up to `requalifiedAt`?
+  // Read-only; account-manager calls this before deciding whether a recovered
+  // account is a NEW opportunity for this specific session.
+  recoveryCheckedThrough(sessionId, requalifiedAt, now = this._now()) {
+    const s = this.sessions.get(sessionId);
+    if (!s) return false; // unknown session: nothing to skip, evaluate it
+    if (this._isExpired(s, now)) return false;
+    return s.lastRecoveryCheckAt >= requalifiedAt;
+  }
+
+  // Advance this session's recovery watermark. Called once per
+  // _selectForSession decision (whether or not a pull-back happened), so the
+  // SAME session never re-evaluates the SAME recovery event twice, while a
+  // DIFFERENT session sharing the fallback is untouched and still sees it as
+  // unevaluated.
+  markRecoveryChecked(sessionId, requalifiedAt, now = this._now()) {
+    if (!sessionId) return;
+    const s = this._ensure(sessionId, now);
+    if (requalifiedAt > s.lastRecoveryCheckAt) s.lastRecoveryCheckAt = requalifiedAt;
   }
 
   // ── T5 evidence (separate from routing pins) ───────────────────────────
