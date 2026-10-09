@@ -548,11 +548,10 @@ export function isNativeAnthropicUpstream(raw) {
 const CONTROL_PLANE_PREFIXES = [
   '/api/claude_cli/',            // bootstrap: org model entitlements
   '/api/claude_code/',           // notification prefs & other client config
-  '/api/oauth/profile',          // signed-in identity
-  '/api/oauth/usage',            // quota readback for the real account
+  '/api/oauth/',                 // identity/control plane: profile, usage, validate, …
 ];
 const CONTROL_PLANE_EXACT = new Set(['/api/hello']);
-function isControlPlanePath(url) {
+export function isControlPlanePath(url) {
   const path = (url || '').split('?')[0];
   if (CONTROL_PLANE_EXACT.has(path)) return true;
   return CONTROL_PLANE_PREFIXES.some((p) => path.startsWith(p));
