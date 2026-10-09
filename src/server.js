@@ -3266,6 +3266,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       }
     }
     accountManager.updateQuota(account.index, rateLimitHeaders, ctx.model);
+    // Anything but a rejection of the token says the token works.
+    if (upstreamRes.status !== 401 && upstreamRes.status !== 403) accountManager.markAccessed(account.index);
 
     // Any response at all came back through the account's routing proxy.
     accountManager.clearRoutingFailed(account.index);

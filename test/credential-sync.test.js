@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
-import { CredentialSync, refreshOutsideProxy, syncKeyFor, isSyncable, encodeBlob, decodeBlob, entryFromBlob, tombstoneOf, tombstone, KEY_PREFIX, TOMBSTONE_TTL_MS } from '../src/credential-sync.js';
+import { CredentialSync, refreshOutsideProxy, syncKeyFor, isSyncable, encodeBlob, decodeBlob, entryFromBlob, needsSignIn, tombstoneOf, tombstone, KEY_PREFIX, TOMBSTONE_TTL_MS } from '../src/credential-sync.js';
 
 // Credential sync through callback.net: every signed-in install keeps its OAuth
 // account tokens in the user's credential store and follows it. The store here
@@ -77,7 +77,9 @@ function makeStore() {
 }
 
 /** A fleet and a sync over a store. */
-function setup(entries, { store = makeStore(), signedIn = true, refresh } = {}) {
+// `accessed`: the fleet's tokens have already worked this launch, so the sync
+// may store them (see isAccessed); false for a fleet fresh from its config.
+function setup(entries, { store = makeStore(), signedIn = true, refresh, accessed = true } = {}) {
   const refreshed = [];
   // Each provider call, with the lock state of its row as the call went out.
   const sent = [];
@@ -108,9 +110,12 @@ function setup(entries, { store = makeStore(), signedIn = true, refresh } = {}) 
   am.onAccountRemoved((account) => { removals.push(sync.onAccountRemoved(account)); });
   const recoveries = [];
   am.onAccountError((account) => { recoveries.push(sync.onAccountError(account)); });
+  const firstAccesses = [];
+  am.onAccountAccessed((account) => { firstAccesses.push(sync.onAccountAccessed(account)); });
+  if (accessed) for (const a of am.accounts) a._accessed = true;
   // Every tombstone write a removal started, settled.
   const settled = () => Promise.all(removals);
-  return { am, sync, store, refreshed, sent, persisted, admitted, evicted, logs, sleeps, settled, recoveries, signOut: () => { signed = false; }, signIn: () => { signed = true; } };
+  return { am, sync, store, refreshed, sent, persisted, admitted, evicted, logs, sleeps, settled, recoveries, firstAccesses, signOut: () => { signed = false; }, signIn: () => { signed = true; } };
 }
 
 const tokensOf = (a) => ({ accessToken: a.credential, refreshToken: a.refreshToken, expiresAt: a.expiresAt });
@@ -162,7 +167,7 @@ test('a row carries identity and tokens, and only a blob of this version reads b
 
 test('signed out, nothing happens', async () => {
   const { sync, store, am } = setup([claude('a')], { signedIn: false });
-  assert.deepEqual(await sync.sync(), { signedIn: false, adopted: 0, pushed: 0, created: 0, added: 0, evicted: 0, expired: 0, rows: 0 });
+  assert.deepEqual(await sync.sync(), { signedIn: false, adopted: 0, pushed: 0, created: 0, added: 0, evicted: 0, expired: 0, emptied: 0, rows: 0 });
   assert.equal(store.calls.length, 0);
   // A refresh is a plain refresh.
   await am.ensureTokenFresh(0, true);
@@ -173,13 +178,13 @@ test('signed out, nothing happens', async () => {
 test('the first pass stores every syncable account, and only those', async () => {
   const { sync, store } = setup([claude('a'), codex('c'), { name: 'k', type: 'apikey', apiKey: 'k' }, claude('g', { upstream: 'https://gw.example' })]);
   const r = await sync.sync('start');
-  assert.deepEqual(r, { signedIn: true, adopted: 0, pushed: 0, created: 2, added: 0, evicted: 0, expired: 0, rows: 0 });
+  assert.deepEqual(r, { signedIn: true, adopted: 0, pushed: 0, created: 2, added: 0, evicted: 0, expired: 0, emptied: 0, rows: 0 });
   assert.deepEqual([...store.rows.values()].map((x) => x.Key).sort(), [`${KEY_PREFIX}anthropic.uuid-a.org-a`, `${KEY_PREFIX}codex.acct-c`]);
   const blob = store.blob(`${KEY_PREFIX}anthropic.uuid-a.org-a`);
   assert.equal(blob.accessToken, 'at-a-1');
   assert.equal(blob.by, 'this-box');
   // A second pass changes nothing.
-  assert.deepEqual(await sync.sync(), { signedIn: true, adopted: 0, pushed: 0, created: 0, added: 0, evicted: 0, expired: 0, rows: 2 });
+  assert.deepEqual(await sync.sync(), { signedIn: true, adopted: 0, pushed: 0, created: 0, added: 0, evicted: 0, expired: 0, emptied: 0, rows: 2 });
 });
 
 test('a row with no local account becomes one, with its tokens and identity but none of another install\'s settings', async () => {
@@ -189,7 +194,7 @@ test('a row with no local account becomes one, with its tokens and identity but 
   store.put('someone-elses-key', { whatever: true });
   const { sync, am, admitted, logs } = setup([claude('a')], { store });
   const r = await sync.sync('start');
-  assert.deepEqual(r, { signedIn: true, adopted: 0, pushed: 0, created: 1, added: 1, evicted: 0, expired: 0, rows: 1 });
+  assert.deepEqual(r, { signedIn: true, adopted: 0, pushed: 0, created: 1, added: 1, evicted: 0, expired: 0, emptied: 0, rows: 1 });
   assert.deepEqual(admitted, [{ name: 'b', type: 'oauth', accountUuid: 'uuid-b', orgUuid: 'org-b', orgName: 'Org b', accessToken: 'at-b-7', refreshToken: 'rt-b-7', expiresAt: T0 + 6 * H }]);
   assert.equal(am.accounts[1].name, 'b');
   assert.equal(am.accounts[1].priority, 0);
@@ -208,7 +213,7 @@ test('the newer token wins each way: the store\'s is adopted, this install\'s is
   const { sync, am, persisted, store: s } = setup([a, b], { store });
 
   const r = await sync.sync('start');
-  assert.deepEqual(r, { signedIn: true, adopted: 1, pushed: 1, created: 0, added: 0, evicted: 0, expired: 0, rows: 2 });
+  assert.deepEqual(r, { signedIn: true, adopted: 1, pushed: 1, created: 0, added: 0, evicted: 0, expired: 0, emptied: 0, rows: 2 });
   assert.equal(am.accounts[0].credential, 'at-a-9');
   assert.equal(am.accounts[0].refreshToken, 'rt-a-9');
   assert.equal(am.accounts[0].expiresAt, T0 + 20 * H);
@@ -219,19 +224,24 @@ test('the newer token wins each way: the store\'s is adopted, this install\'s is
   assert.equal(s.blob(syncKeyFor(b)).by, 'this-box');
 });
 
-test('a local token change is stored; one the store already holds is not echoed', async () => {
-  const { sync, am, store } = setup([claude('a')]);
+test('a local token change is stored once it has worked; one the store already holds is not echoed', async () => {
+  const { sync, am, store, firstAccesses } = setup([claude('a')]);
   await sync.sync();
   const writes = () => store.calls.filter((c) => c.method === 'PATCH' || (c.method === 'POST' && c.path === 'User/Credential')).length;
   const before = writes();
-  // An import or a client refresh the proxy saw.
+  // New tokens from disk (a reload): untried here, so not stored yet.
   am.updateAccountTokens(0, { accessToken: 'at-a-2', refreshToken: 'rt-a-2', expiresAt: T0 + 9 * H });
   await new Promise((r) => setImmediate(r));
+  assert.equal(writes(), before);
+  // The first request they serve stores them.
+  am.markAccessed(0);
+  assert.equal(await firstAccesses[0], true);
   assert.equal(writes(), before + 1);
   assert.equal(store.blob(syncKeyFor(am.accounts[0])).accessToken, 'at-a-2');
   // The same tokens again: nothing to store.
   am.updateAccountTokens(0, { accessToken: 'at-a-2', refreshToken: 'rt-a-2', expiresAt: T0 + 9 * H });
-  await new Promise((r) => setImmediate(r));
+  am.markAccessed(0);
+  await Promise.all(firstAccesses);
   assert.equal(writes(), before + 1);
 });
 
@@ -239,7 +249,7 @@ test('a row of ours that does not read is rewritten; a store that fails leaves t
   const store = makeStore();
   store.put(syncKeyFor(claude('a')), { v: 99, garbage: true });
   const { sync, am } = setup([claude('a')], { store });
-  assert.deepEqual(await sync.sync(), { signedIn: true, adopted: 0, pushed: 1, created: 0, added: 0, evicted: 0, expired: 0, rows: 1 });
+  assert.deepEqual(await sync.sync(), { signedIn: true, adopted: 0, pushed: 1, created: 0, added: 0, evicted: 0, expired: 0, emptied: 0, rows: 1 });
   assert.equal(store.blob(syncKeyFor(am.accounts[0])).accessToken, 'at-a-1');
 
   const broken = setup([claude('b')], { store: { ...makeStore(), api: async () => { throw new Error('fetch failed'); } } });
@@ -260,7 +270,7 @@ test('an account removed here leaves a tombstone, and the other installs remove 
   const row = store.byKey(syncKeyFor(claude('b')));
   assert.deepEqual(JSON.parse(row.Data), { _deleted: new Date(store.now()).toISOString() });
   // Home's own next pass: nothing comes back.
-  assert.deepEqual(await home.sync.sync(), { signedIn: true, adopted: 0, pushed: 0, created: 0, added: 0, evicted: 0, expired: 0, rows: 2 });
+  assert.deepEqual(await home.sync.sync(), { signedIn: true, adopted: 0, pushed: 0, created: 0, added: 0, evicted: 0, expired: 0, emptied: 0, rows: 2 });
   assert.deepEqual(home.am.accounts.map((a) => a.name), ['a']);
 
   // The office install follows.
@@ -273,7 +283,7 @@ test('an account removed here leaves a tombstone, and the other installs remove 
   await office.settled();
   assert.equal(JSON.parse(store.byKey(syncKeyFor(claude('b'))).Data)._deleted, new Date(store.now()).toISOString());
   assert.equal(store.calls.filter((c) => c.method === 'PATCH' && c.params.Data.includes('_deleted')).length, 1);
-  assert.deepEqual(office.sync.summary(), { lastSyncAt: store.now(), lastError: null, rows: 1, tombstones: 1 });
+  assert.deepEqual(office.sync.summary(), { lastSyncAt: store.now(), lastError: null, rows: 1, tombstones: 1, signInNeeded: 0 });
 });
 
 test('a refresh never brings a removed account back; a sign-in does', async () => {
@@ -752,13 +762,145 @@ test('a CLI renewal goes through the same lock: refused while an install holds i
   assert.equal(store.calls.length, before);
 });
 
-test('a refresh the provider rejects releases the lock and leaves the row as it was', async () => {
-  const { sync, am, store } = setup([claude('a')], { refresh: async () => { throw Object.assign(new Error('refresh 400'), { status: 400 }); } });
+test('a refresh the provider rejects releases the lock, then empties the row that held the rejected token', async () => {
+  const { sync, am, store, recoveries } = setup([claude('a')], { refresh: async () => { throw Object.assign(new Error('refresh 400'), { status: 400 }); } });
   await sync.sync();
   await am.ensureTokenFresh(0, true);
   assert.equal(am.accounts[0].status, 'error');
-  assert.equal(store.byKey(syncKeyFor(am.accounts[0])).Locked, null);
+  assert.equal(await recoveries[0], false, 'nothing to adopt');
+  const key = syncKeyFor(am.accounts[0]);
+  assert.equal(store.byKey(key).Locked, null, 'locked to empty it, and released');
+  assert.equal(store.blob(key).refreshToken, '');
+  assert.equal(needsSignIn(decodeBlob(store.byKey(key).Data)), true);
+  // Emptied under its own lock, taken after the refresh released its own.
+  const tail = store.calls.slice(-3).map((c) => `${c.method} ${c.path.replace(/^User\/Credential\/[^:]+/, 'row')}`);
+  assert.deepEqual(tail, ['POST row:lock', 'PATCH row', 'POST row:unlock']);
+  assert.equal(sync.summary().signInNeeded, 1);
+});
+
+test('a row another install holds the lock on, or has written a working token to since, is not emptied', async () => {
+  const one = setup([claude('a')], { refresh: async () => { throw Object.assign(new Error('refresh 400'), { status: 400 }); } });
+  await one.sync.sync();
+  await one.am.ensureTokenFresh(0, true);
+  await Promise.all(one.recoveries);
+  const { store } = one;
+  const key = syncKeyFor(one.am.accounts[0]);
+  const rejected = JSON.stringify(encodeBlob(claude('a'), { accessToken: 'at-a-1', refreshToken: 'rt-a-1', expiresAt: T0 + 8 * H }, { now: T0, by: 'office' }));
+
+  // The row holds the rejected token again, but another install holds its lock: left alone.
+  store.byKey(key).Data = rejected;
+  store.byKey(key).Locked = { unixms: String(store.now()) };
+  assert.equal(await one.sync._markNeedsSignIn(one.am.accounts[0], one.sync.rows.get(key)), false);
+  assert.equal(store.blob(key).refreshToken, 'rt-a-1');
+
+  // Unlocked, but a working token was stored between our read and our lock: adopted, not emptied.
+  store.byKey(key).Locked = null;
+  const stale = { ...one.sync.rows.get(key) };
+  store.byKey(key).Data = JSON.stringify(encodeBlob(claude('a'), { accessToken: 'at-a-new', refreshToken: 'rt-a-new', expiresAt: T0 + 9 * H }, { now: T0, by: 'office' }));
+  assert.equal(await one.sync._markNeedsSignIn(one.am.accounts[0], stale), false);
+  assert.equal(store.blob(key).refreshToken, 'rt-a-new');
+  assert.equal(one.am.accounts[0].refreshToken, 'rt-a-new');
+  assert.equal(one.am.accounts[0].status, 'active');
+  assert.equal(store.byKey(key).Locked, null);
+});
+
+test('a pass of an account whose rejected token is still the stored one empties the row; one rejected only for its access token does not', async () => {
+  const store = makeStore();
+  store.put(syncKeyFor(claude('a')), encodeBlob(claude('a'), { accessToken: 'at-a-1', refreshToken: 'rt-a-1', expiresAt: T0 + 8 * H }, { now: T0, by: 'office' }));
+  store.put(syncKeyFor(claude('b')), encodeBlob(claude('b'), { accessToken: 'at-b-1', refreshToken: 'rt-b-1', expiresAt: T0 + 8 * H }, { now: T0, by: 'office' }));
+  const { sync, am } = setup([claude('a'), claude('b')], { store });
+  am.accounts[0].status = 'error';
+  am.accounts[0]._deadRefreshToken = 'rt-a-1';
+  am.accounts[1].status = 'error'; // a 401 on the access token: its refresh token is not known dead
+  const r = await sync.sync();
+  assert.equal(r.emptied, 1);
+  assert.equal(store.blob(syncKeyFor(claude('a'))).refreshToken, '');
+  assert.equal(store.blob(syncKeyFor(claude('b'))).refreshToken, 'rt-b-1');
+  // Once emptied, the next pass has nothing more to do with it.
+  assert.equal((await sync.sync()).emptied, 0);
+});
+
+test('an emptied row is never taken: not adopted, not added, not a lock answer; a working token overwrites it, an untried one does not', async () => {
+  const store = makeStore();
+  const dead = encodeBlob(claude('a'), { accessToken: 'at-a-0', refreshToken: '', expiresAt: T0 + 50 * H }, { now: T0, by: 'office' });
+  store.put(syncKeyFor(claude('a')), dead);
+  store.put(syncKeyFor(claude('n')), encodeBlob(claude('n'), { accessToken: 'at-n-0', refreshToken: '', expiresAt: T0 + 50 * H }, { now: T0, by: 'office' }));
+
+  // An install that has not tried its token: reads, takes nothing, writes nothing.
+  const fresh = setup([claude('a')], { store, accessed: false });
+  const r1 = await fresh.sync.sync();
+  assert.equal(r1.adopted + r1.added + r1.pushed, 0);
+  assert.equal(fresh.am.accounts.length, 1, 'no account made from an emptied row');
+  assert.equal(fresh.am.accounts[0].credential, 'at-a-1', 'a later expiry does not make it newer');
+  assert.equal(store.blob(syncKeyFor(claude('a'))).refreshToken, '');
+
+  // Its first access: the working token replaces the marker, whatever the expiry.
+  fresh.am.markAccessed(0);
+  assert.equal(await fresh.firstAccesses[0], true);
+  assert.equal(store.blob(syncKeyFor(claude('a'))).refreshToken, 'rt-a-1');
+
+  // A pass of an install with a working token replaces it too.
+  store.byKey(syncKeyFor(claude('a'))).Data = JSON.stringify(dead);
+  const renewing = setup([claude('a')], { store });
+  assert.equal((await renewing.sync.sync()).pushed, 1);
+  assert.equal(store.blob(syncKeyFor(claude('a'))).refreshToken, 'rt-a-1');
+
+  // Under the lock, an emptied row is renewed over, never adopted.
+  store.byKey(syncKeyFor(claude('a'))).Data = JSON.stringify(dead);
+  await renewing.am.ensureTokenFresh(0, true);
+  assert.deepEqual(renewing.refreshed, ['rt-a-1']);
+  assert.equal(store.blob(syncKeyFor(claude('a'))).refreshToken, 'rt-a-1-renewed-rt');
+});
+
+// ── an account not accessed since launch ──────────────────────
+
+test('a pass stores no account this launch has not accessed, and still adopts into it', async () => {
+  const store = makeStore();
+  const b = claude('b');
+  const fresher = { ...b, credential: 'at-b-9', refreshToken: 'rt-b-9', expiresAt: T0 + 20 * H };
+  store.put(syncKeyFor(b), encodeBlob(fresher, tokensOf(fresher), { now: T0, by: 'office' }));
+  const c = claude('c');
+  const staler = { ...c, credential: 'at-c-0', refreshToken: 'rt-c-0', expiresAt: T0 };
+  store.put(syncKeyFor(c), encodeBlob(staler, tokensOf(staler), { now: T0, by: 'office' }));
+  const { sync, am } = setup([claude('a'), b, c], { store, accessed: false });
+
+  const r = await sync.sync('start');
+  assert.equal(r.created, 0, 'a: no row made from an untried token');
+  assert.equal(r.pushed, 0, 'c: its row is not overwritten by an untried token, newer or not');
+  assert.equal(r.adopted, 1, 'b: reading is unchanged');
+  assert.equal(am.accounts[1].credential, 'at-b-9');
+  assert.equal(store.byKey(syncKeyFor(am.accounts[0])), null);
+  assert.equal(store.blob(syncKeyFor(c)).accessToken, 'at-c-0');
+  assert.ok(!store.calls.some((x) => x.method === 'PATCH' || (x.method === 'POST' && x.path === 'User/Credential')));
+});
+
+test('the first access stores what the pass held back: a row made, or one this install is ahead of updated', async () => {
+  const store = makeStore();
+  const c = claude('c');
+  const staler = { ...c, credential: 'at-c-0', refreshToken: 'rt-c-0', expiresAt: T0 };
+  store.put(syncKeyFor(c), encodeBlob(staler, tokensOf(staler), { now: T0, by: 'office' }));
+  const { sync, am, firstAccesses } = setup([claude('a'), c], { store, accessed: false });
+  await sync.sync('start');
+
+  // A request upstream answered (server.js), and a quota reading (prober).
+  am.markAccessed(0);
+  am.applyUsageData(1, { five_hour: { utilization: 10 } });
+  assert.deepEqual(await Promise.all(firstAccesses), [true, true]);
   assert.equal(store.blob(syncKeyFor(am.accounts[0])).accessToken, 'at-a-1');
+  assert.equal(store.blob(syncKeyFor(c)).accessToken, 'at-c-1');
+  // Only the first access writes.
+  am.markAccessed(0);
+  assert.equal(firstAccesses.length, 2);
+});
+
+test('an untried token with no row is renewed without a lock, and the renewal is what gets stored', async () => {
+  const { am, store, refreshed } = setup([claude('a')], { accessed: false });
+  await am.ensureTokenFresh(0, true);
+  assert.deepEqual(refreshed, ['rt-a-1']);
+  assert.ok(!store.calls.some((c) => c.path.endsWith(':lock')), 'no row was made from the untried token to lock');
+  await new Promise((r) => setImmediate(r));
+  assert.equal(store.blob(syncKeyFor(am.accounts[0])).accessToken, 'rt-a-1-renewed-at');
+  assert.equal(am.accounts[0]._accessed, true);
 });
 
 // ── an account in error ──────────────────────────────────────
@@ -874,5 +1016,5 @@ test('the daily pass is scheduled and stopped', async () => {
   assert.ok(sync._timer, 'armed');
   sync.stop();
   assert.equal(sync._timer, null);
-  assert.deepEqual(sync.summary(), { lastSyncAt: store.now(), lastError: null, rows: 1, tombstones: 0 });
+  assert.deepEqual(sync.summary(), { lastSyncAt: store.now(), lastError: null, rows: 1, tombstones: 0, signInNeeded: 0 });
 });

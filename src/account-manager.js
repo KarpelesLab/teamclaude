@@ -447,6 +447,11 @@ function makeAccount(acct, index, listener = null) {
     // The refresh token upstream last rejected as invalid, if it is still the
     // one we hold — see the dead-token guard in ensureTokenFresh.
     _deadRefreshToken: null,
+    // Whether this process has seen the token it holds work: upstream answered
+    // a request on it without rejecting it, the quota probe read with it, or the
+    // token endpoint minted it. Never persisted, so false at every launch, and
+    // false again whenever tokens arrive from elsewhere — see markAccessed.
+    _accessed: false,
   };
 }
 
@@ -4519,6 +4524,7 @@ export class AccountManager {
     // A failed probe carries no readings. Treating one as data would let a
     // transient HTTP error clear a bucket below.
     if (!account || !usage || usage.error) return;
+    this.markAccessed(accountIndex);
     const q = account.quota;
     const observed = new Set();
     const now = Date.now();
@@ -4628,6 +4634,7 @@ export class AccountManager {
   applyCodexUsageData(accountIndex, usage) {
     const account = this.accounts[accountIndex];
     if (!account || !usage || usage.error) return;
+    this.markAccessed(accountIndex);
     // The Codex-learned fields below are written here for the first time, so the
     // empty-quota shape does not carry them. See CodexLearnedQuota.
     /** @type {typeof account.quota & CodexLearnedQuota} */
@@ -4811,9 +4818,16 @@ export class AccountManager {
         // what it has and asks again on the next request.
         // `budgetMs`: how long the grant may take, from the coordinator holding
         // a lock that lapses (credential-sync.js); none means the default.
-        const refresh = (/** @type {{ budgetMs?: number }} */ opts = {}) => (providerOf(account) === 'codex'
-          ? this._codexRefreshFn(sent, undefined, account.routing || null, opts)
-          : this._refreshFn(sent, undefined, account.routing || null, opts));
+        // `minted`: the token endpoint answered this call, so the tokens are
+        // known good. A coordinator answer taken from the store is not.
+        let minted = false;
+        const refresh = async (/** @type {{ budgetMs?: number }} */ opts = {}) => {
+          const tokens = await (providerOf(account) === 'codex'
+            ? this._codexRefreshFn(sent, undefined, account.routing || null, opts)
+            : this._refreshFn(sent, undefined, account.routing || null, opts));
+          minted = true;
+          return tokens;
+        };
         const newTokens = await this._refreshCoordinator(account, refresh, { force });
         if (newTokens == null) return;
         if (account.refreshToken !== sent) {
@@ -4825,6 +4839,8 @@ export class AccountManager {
         account.expiresAt = newTokens.expiresAt;
         account._lastRefreshAt = Date.now();
         account._deadRefreshToken = null; // this token works; clear any stale guard
+        // Set before the listener runs: it is what lets the sync store them.
+        account._accessed = minted;
         console.log(`[TeamClaude] Token refreshed for account "${safeLine(account.name, 64)}"`);
         this._onTokenRefresh?.(accountIndex, newTokens);
       } catch (err) {
@@ -4873,6 +4889,24 @@ export class AccountManager {
   /** Replace the refresh coordinator (see the constructor option). */
   setRefreshCoordinator(/** @type {(account: Record<string, any>, refresh: () => Promise<any>, info: { force: boolean }) => Promise<any>} */ fn) {
     this._refreshCoordinator = fn;
+  }
+
+  /**
+   * The token an account holds just worked upstream: a response that was not a
+   * rejection, or a quota reading. The first time since launch (or since its
+   * tokens last came from elsewhere), the accessed listener hears of it.
+   * @param {number} accountIndex
+   */
+  markAccessed(accountIndex) {
+    const account = this.accounts[accountIndex];
+    if (!account || account._accessed) return;
+    account._accessed = true;
+    this._onAccountAccessed?.(account);
+  }
+
+  /** Set a callback told when an account is first accessed (see markAccessed). */
+  onAccountAccessed(/** @type {(account: Record<string, any>) => void} */ callback) {
+    this._onAccountAccessed = callback;
   }
 
   /** Set a callback told of every OAuth account that goes into error (needs a re-login). */
@@ -4944,6 +4978,8 @@ export class AccountManager {
     account.credential = accessToken;
     if (refreshToken) account.refreshToken = refreshToken;
     account.expiresAt = expiresAt;
+    // Tokens from elsewhere (the store, a reload from disk) are untried here.
+    account._accessed = false;
     if (account.status === 'error') account.status = 'active';
     console.log(`[TeamClaude] Updated tokens for account "${safeLine(account.name, 64)}"`);
     this._onTokenRefresh?.(accountIndex, {
