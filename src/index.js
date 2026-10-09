@@ -40,7 +40,8 @@ import { RemoteControl, createAttachSession } from './tui-remote.js';
 import { SxManager } from './sx.js';
 import { autoUpdate, checkForUpdate, currentVersion, resolveVersionLabel, runUpdate, installKind, updateAvailableFromCache, PKG_NAME } from './updater.js';
 import { renderStatus, formatPercent } from './status-renderer.js';
-import { sanitizeText } from './safe-text.js';
+import { sanitizeText, safeLine } from './safe-text.js';
+import { modelLabel } from './model.js';
 import { ClientUsageTracker, UsageDimensionTracker } from './client-usage.js';
 import { buildClaudeEnvLines, bypassesAllHosts, clearSelfProxyEnvLines, encodePinComponent, LOCAL_LOGIN_HINT_WINDOW_MS, localLoginHint, mergeNoProxy, resolveClientMode } from './claude-env.js';
 import { serviceKind, installService, uninstallService, serviceStatus, renderService, logPath } from './service.js';
@@ -760,6 +761,7 @@ async function serverCommand() {
     hooks.onRequestModel = (id, info) => {
       const r = inFlight.get(id);
       if (r && info.model) r.model = info.model;
+      if (r && info.effort) r.effort = info.effort;
     };
     hooks.onRequestRouted = (id, info) => {
       const r = inFlight.get(id);
@@ -770,7 +772,10 @@ async function serverCommand() {
       inFlight.delete(id);
       const dur = r ? ((Date.now() - r.started) / 1000).toFixed(1) : '?';
       const acct = info.account || r?.account || '?';
-      const model = info.model ? ` (${info.model})` : '';
+      // The effort is client-supplied and has no fixed set of values, so it is
+      // bounded here; the whole line is sanitised on the way out.
+      const label = modelLabel(info.model, info.effort ? safeLine(info.effort, 16) : null);
+      const model = label ? ` (${label})` : '';
       const sid = info.sessionId ? `${info.sessionId.slice(0, 6)} ` : '';
       const client = (info.client || r?.client) ? `[${info.client || r.client}] ` : '';
       const pin = (info.pinned || r?.pinned) ? ' [pin]' : '';
