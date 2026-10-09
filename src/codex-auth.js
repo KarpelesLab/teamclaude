@@ -88,9 +88,11 @@ export async function importCodexCredentials(filePath = DEFAULT_CODEX_CREDENTIAL
  * @param {string} refreshToken
  * @param {string} [endpoint]
  * @param {import('./account-routing.js').RoutingProxy|null} [routing] - the account's own egress proxy
+ * @param {{ budgetMs?: number }} [opts] - the call is bounded by it as well, as the Anthropic one is
  */
-export async function refreshCodexToken(refreshToken, endpoint = TOKEN_ENDPOINT, routing = null) {
-  const timeoutMs = Number(envVar('REFRESH_TIMEOUT_MS')) || 30_000;
+export async function refreshCodexToken(refreshToken, endpoint = TOKEN_ENDPOINT, routing = null, { budgetMs = Infinity } = {}) {
+  const timeoutMs = Math.min(Number(envVar('REFRESH_TIMEOUT_MS')) || 30_000, budgetMs);
+  if (!(timeoutMs > 0)) throw new Error('Codex token refresh ran out of time');
   const res = await proxyFetch(endpoint, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },

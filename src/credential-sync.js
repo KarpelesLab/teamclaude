@@ -19,7 +19,10 @@
 //   still good (the refresh runs five minutes ahead of expiry) is simply kept,
 //   and the next request asks again; one that has expired, or that upstream
 //   just rejected, waits — re-reading every 5s for 30s and adopting what the
-//   holder stored, then trying the lock again.
+//   holder stored, then trying the lock again. Signed in, nothing renews a
+//   token the store holds without the lock: not the store being unreachable,
+//   not a lock that stays refused, not a CLI command (refreshOutsideProxy). It
+//   keeps the token it has, or fails that refresh, and the next request asks.
 //
 // "Newer" is the later `expiresAt`: a renewal always pushes it forward, and it
 // is the one field both the token endpoint and the store agree on.
@@ -53,12 +56,22 @@ import { safeLine } from './safe-text.js';
 /** Rows this proxy owns start with this; anything else in the store is left alone. */
 export const KEY_PREFIX = 'teamrouter.';
 const BLOB_VERSION = 1;
-/** How long a taken lock holds off the others before it can be taken over: a renewal takes seconds. */
+/**
+ * How long a taken lock holds off the others before it can be taken over. The
+ * TAKER's figure decides (the store hands the lock over once it is older than
+ * the timeout the new :lock names), so every caller has to name the same one.
+ */
 const LOCK_TIMEOUT_S = 30;
+/** Of the lease, kept back for the clocks: past this, the lock is treated as gone. */
+const LEASE_SAFETY_MS = 2_000;
+/** Of the lease, kept back to store the renewal before it runs out. */
+const STORE_RESERVE_MS = 8_000;
+/** Less than this left of the lease for the provider call, and it is not sent. */
+const MIN_REFRESH_BUDGET_MS = 5_000;
 /** Lock refused: re-read this often, for this long, before trying the lock again. */
 const LOCKED_RECHECK_MS = 5_000;
 const LOCKED_WAIT_MS = 30_000;
-/** Rounds of lock-or-wait before the refresh goes ahead unsynchronized. */
+/** Rounds of lock-or-wait before this refresh gives up (the next request asks again). */
 const MAX_LOCK_ROUNDS = 3;
 export const SYNC_INTERVAL_MS = 24 * 3600 * 1000;
 const PAGE_SIZE = 100;
@@ -552,37 +565,61 @@ export class CredentialSync {
 
   /**
    * Renew an account's token through the store's lock, so one install renews
-   * and the rest adopt. `refresh` is the provider call; it runs at most once.
-   * Resolves null to keep the current token: another install holds the lock
-   * and this one's token is still good, so there is nothing to wait for.
+   * and the rest adopt. `refresh` is the provider call; it runs at most once,
+   * and only while this install holds the lock: signed in, NO renewal of a
+   * token the store holds goes out without it. Resolves null to keep the
+   * current token: the lock is not to be had and this one is still good.
    *
-   * Any failure to reach the store falls back to a plain refresh: the pool
-   * must not stop serving because callback.net is unreachable.
+   * The lock is a lease: callback.net hands it to the next taker once it is
+   * LOCK_TIMEOUT_S old, whoever held it. So the provider call is given what is
+   * left of the lease, less the time to store its answer (`budgetMs`), and is
+   * never sent once that is spent; and a lease that has run out is not
+   * unlocked, the release being anyone's and possibly the next holder's.
+   *
+   * When the lock cannot be had — the store unreachable, our session there
+   * refused, every round refused — nothing is renewed: a still-good token is
+   * kept (null), a dead one fails this refresh as a transient error, and the
+   * next request asks again. Renewing without the lock is what would kill the
+   * other installs' copy. The one renewal without a lock is of a token the
+   * store has no row for — an account it does not carry, or one in error —
+   * which no other install can hold.
    *
    * @param {Record<string, any>} account
-   * @param {() => Promise<Tokens>} refresh
+   * @param {(opts?: { budgetMs?: number }) => Promise<Tokens>} refresh
    * @param {{ force?: boolean }} [info]  force: the token was just rejected, so keeping it is not an option
    * @returns {Promise<Tokens|null>}
    */
   async coordinateRefresh(account, refresh, { force = false } = {}) {
-    if (!syncKeyFor(account) || !await this.isSignedIn()) return refresh();
-    let row = this._rowFor(account);
-    if (!row) {
-      // Never listed, or created elsewhere since. One look; still nothing means
-      // this install is first, and onLocalTokens stores what it renews.
-      try { this.rows = await this._list(); } catch { return refresh(); }
-      row = this._rowFor(account);
-      if (!row) return refresh();
-    }
+    if (!await this.isSignedIn()) return refresh();
     const name = safeLine(account.name, 64);
+    let row;
+    try {
+      row = await this._rowToLock(account);
+    } catch (/** @type {any} */ err) {
+      return this._standDown(account, force, `callback.net could not be read (${safeLine(err?.message || String(err), 120)})`);
+    }
+    // No copy of this token in the store, so none on any other install.
+    if (!row) return refresh();
     for (let round = 1; round <= MAX_LOCK_ROUNDS; round++) {
+      // Taken before the call goes out: the lease starts no earlier on the
+      // store's side, so what is left of it is never overestimated.
+      const leaseStart = this.now();
       let locked;
       try {
         locked = await this.api('POST', `User/Credential/${row.id}:lock`, { timeout: LOCK_TIMEOUT_S });
       } catch (/** @type {any} */ err) {
+        if (err?.token === 'error_not_found') {
+          // Deleted since it was read (a tombstone expired, say): find, or
+          // make, the row it is now.
+          this.rows.delete(row.key);
+          try { row = await this._rowToLock(account); } catch { row = null; }
+          if (!row) return this._standDown(account, force, 'its callback.net row went away');
+          continue;
+        }
         if (err?.token !== 'error_credential_locked') {
-          this.log(`[TeamClaude] callback.net: lock for "${name}" failed (${safeLine(err?.message || String(err), 120)}); renewing without it`);
-          return refresh();
+          // A lock call that failed in flight may still have taken it; either
+          // way this install does not hold it, so it does not renew.
+          return this._standDown(account, force, `the callback.net lock could not be taken (${safeLine(err?.message || String(err), 120)})`);
         }
         // Another install is renewing. A token that still works serves this
         // request as it is; the renewal arrives through the store, and the
@@ -606,23 +643,32 @@ export class CredentialSync {
         this.log(`[TeamClaude] Account "${name}": the lock holder stored no renewal in ${LOCKED_WAIT_MS / 1000}s; trying the lock again`);
         continue;
       }
+      const leaseEnd = leaseStart + LOCK_TIMEOUT_S * 1000 - LEASE_SAFETY_MS;
       const current = rowOf({ ...locked, Data: locked?.Data ?? '' });
       this.rows.set(current.key, current);
-      if (current.deletedAt != null) {
-        // Removed on another install since the last pass. This request still
-        // gets its token; the pass that follows takes the account out.
-        await this._unlock(row);
-        this.log(`[TeamClaude] Account "${name}" was removed on another install; renewing this once, then removing it here`);
-        this.sync('tombstone').catch(() => {});
-        return refresh();
-      }
-      if (heldElsewhere(current.blob, account, this.by)) {
-        await this._unlock(row);
+      if (current.deletedAt == null && heldElsewhere(current.blob, account, this.by)) {
+        await this._unlock(row, leaseEnd);
         this.log(`[TeamClaude] Account "${name}": already renewed on ${safeLine(/** @type {Blob} */ (current.blob).by, 48)}; taking that token`);
         return tokensOf(/** @type {Blob} */ (current.blob));
       }
+      const budgetMs = leaseEnd - STORE_RESERVE_MS - this.now();
+      if (budgetMs < MIN_REFRESH_BUDGET_MS) {
+        // The lock call itself ate the lease.
+        await this._unlock(row, leaseEnd);
+        this.log(`[TeamClaude] Account "${name}": the callback.net lock took too long to answer; trying it again`);
+        continue;
+      }
       try {
-        const tokens = await refresh();
+        const tokens = await refresh({ budgetMs });
+        if (this.now() > leaseEnd) this.log(`[TeamClaude] Account "${name}": the renewal outlasted the callback.net lock (${LOCK_TIMEOUT_S}s)`);
+        if (current.deletedAt != null) {
+          // Removed on another install since the last pass. This request still
+          // gets its token, renewed under the lock and never written over the
+          // tombstone; the pass that follows takes the account out.
+          this.log(`[TeamClaude] Account "${name}" was removed on another install; renewed this once, removing it here`);
+          this.sync('tombstone').catch(() => {});
+          return tokens;
+        }
         try {
           await this._patch(current, account, tokens);
         } catch (/** @type {any} */ err) {
@@ -630,14 +676,88 @@ export class CredentialSync {
         }
         return tokens;
       } finally {
-        await this._unlock(row);
+        await this._unlock(row, leaseEnd);
       }
     }
-    this.log(`[TeamClaude] Account "${name}": could not take the callback.net lock after ${MAX_LOCK_ROUNDS} rounds; renewing without it`);
-    return refresh();
+    return this._standDown(account, force, `the callback.net lock was not to be had in ${MAX_LOCK_ROUNDS} rounds`);
   }
 
-  async _unlock(/** @type {Row} */ row) {
+  /**
+   * The row whose lock orders this account's renewals: the account's own (made
+   * now when the store does not have it yet, so there is one to lock), or, for
+   * an account the store does not carry by identity, the row holding its
+   * refresh token. Null when the store holds no copy of the token at all.
+   * Throws when the store cannot be read.
+   * @param {Record<string, any>} account
+   * @returns {Promise<Row|null>}
+   */
+  async _rowToLock(account) {
+    const keyed = !!syncKeyFor(account);
+    const find = () => (keyed ? this._rowFor(account) : null) || this._rowHolding(account.refreshToken);
+    let row = find();
+    if (row) return row;
+    this.rows = await this._list();
+    row = find();
+    // A dead token is not stored for the others to pick up (see isInError).
+    if (row || !keyed || isInError(account)) return row;
+    // First here: stored as it stands, then locked like any other. Created by
+    // another install meanwhile, theirs is the row — which a create racing it
+    // on the live API can also learn as a plain database error, not only as
+    // error_key_exists: whatever the failure, look again before giving up.
+    let created = null;
+    try {
+      created = await this._create(account, this._tokens(account));
+    } catch (err) {
+      this.rows = await this._list();
+      row = find();
+      if (row) return row;
+      throw err;
+    }
+    if (!created) this.rows = await this._list();
+    return find();
+  }
+
+  /** The row holding this refresh token, whatever account it names. */
+  _rowHolding(/** @type {unknown} */ refreshToken) {
+    if (typeof refreshToken !== 'string' || !refreshToken) return null;
+    for (const row of this.rows.values()) if (row.blob?.refreshToken === refreshToken) return row;
+    return null;
+  }
+
+  /**
+   * No lock, so no renewal: keep a token that still works (null), fail the
+   * refresh — as a transient error, never as a rejection — for one that does not.
+   * @param {Record<string, any>} account
+   * @param {boolean} force
+   * @param {string} why
+   * @returns {null}
+   */
+  _standDown(account, force, why) {
+    const name = safeLine(account.name, 64);
+    if (!force && !isTokenExpired(account.expiresAt)) {
+      this.log(`[TeamClaude] Account "${name}": not renewing, ${why}; keeping the current token`);
+      return null;
+    }
+    this.log(`[TeamClaude] Account "${name}": not renewing, ${why}; it waits for the lock (\`teamclaude callback logout\` renews without one)`);
+    throw Object.assign(new Error(`not renewed without the callback.net lock: ${why}`), { code: 'CALLBACK_LOCK_UNAVAILABLE' });
+  }
+
+  /** Release the lock, unless the lease has run out: then it may be someone else's. */
+  async _unlock(/** @type {Row} */ row, /** @type {number} */ leaseEnd) {
+    if (this.now() >= leaseEnd) return;
     try { await this.api('POST', `User/Credential/${row.id}:unlock`, {}); } catch { /* the lock times out on its own */ }
   }
+}
+
+/**
+ * A renewal from outside the running proxy — a CLI command holding a copy of
+ * an account's tokens — through the same lock the proxy's go through.
+ * @param {Record<string, any>} entry  config-entry shaped: accessToken, refreshToken, expiresAt, and the identity when known
+ * @param {(opts?: { budgetMs?: number }) => Promise<Tokens>} refresh
+ * @param {{ force?: boolean, log?: (line: string) => void, api?: Api, isSignedIn?: () => Promise<boolean> }} [opts]
+ * @returns {Promise<Tokens|null>}
+ */
+export function refreshOutsideProxy(entry, refresh, { force = false, ...opts } = {}) {
+  const sync = new CredentialSync({ accountManager: /** @type {any} */ ({ accounts: [] }), addAccount: () => null, ...opts });
+  return sync.coordinateRefresh({ ...entry, credential: entry.accessToken, index: -1 }, refresh, { force });
 }

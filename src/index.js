@@ -52,7 +52,7 @@ import { upstreamFor } from './provider.js';
 import { startEventLoopMonitor } from './event-loop-monitor.js';
 import { envVar } from './brand.js';
 import { loginCallback, loadCallbackToken, saveCallbackToken, callbackWhoami, logoutCallback, callbackClientId, getCallbackAuthPath } from './callback-auth.js';
-import { CredentialSync } from './credential-sync.js';
+import { CredentialSync, refreshOutsideProxy } from './credential-sync.js';
 
 // The server's credential sync, once it runs; a CLI command that changes an
 // account on disk talks to the store through a sync of its own instead.
@@ -445,7 +445,7 @@ async function serverCommand() {
   // start, on reload and daily brings the fleet level with the store.
   const credentialSync = new CredentialSync({ accountManager, addAccount: admitAccount, evictAccount });
   activeCredentialSync = credentialSync;
-  accountManager.setRefreshCoordinator((account, refresh) => credentialSync.coordinateRefresh(account, refresh));
+  accountManager.setRefreshCoordinator((account, refresh, info) => credentialSync.coordinateRefresh(account, refresh, info));
   // Not awaited: the removal is done; the tombstone follows.
   accountManager.onAccountRemoved((account) => { credentialSync.onAccountRemoved(account).catch(() => {}); });
   // An account in error looks in the store for a token another install holds.
@@ -1816,7 +1816,12 @@ async function accountsCommand() {
     if (a.type !== 'oauth' || !a.refreshToken) return;
     if (!isTokenExpiringSoon(a.expiresAt)) return;
     try {
-      const newTokens = await refreshAccessToken(a.refreshToken, undefined, accountRouting(a, localListener(config)));
+      // Through the callback.net lock when signed in there, as the running
+      // proxy's own refreshes are: another install, or the proxy on this one,
+      // may be renewing this same token.
+      const routing = accountRouting(a, localListener(config));
+      const newTokens = await refreshOutsideProxy(a, (o) => refreshAccessToken(a.refreshToken, undefined, routing, o));
+      if (!newTokens) return; // another install is renewing it, and the current one still serves
       a.accessToken = newTokens.accessToken;
       a.refreshToken = newTokens.refreshToken;
       a.expiresAt = newTokens.expiresAt;
@@ -2869,7 +2874,13 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
   // refresh token is still good, so a stale token is renewed first and the
   // renewed pair is what gets saved below — `creds` is the set to write.
   const userNamed = !!name;
-  const identified = await profileForCredentials(creds, routing);
+  // The refresh goes through the callback.net lock when this install is
+  // signed in there: the token being imported may be one the store holds, and
+  // so one other installs hold too.
+  const identified = await profileForCredentials(creds, routing, {
+    renew: (c) => refreshOutsideProxy({ name: name || 'imported account', type: 'oauth', accessToken: c.accessToken, refreshToken: c.refreshToken, expiresAt: c.expiresAt }, (o) => refreshAccessToken(c.refreshToken, undefined, routing, o), { force: true })
+      .then((t) => t ?? Promise.reject(new Error('token not renewed'))),
+  });
   creds = identified.creds;
   const profile = identified.profile;
   const profileOk = profile && !profile.error;

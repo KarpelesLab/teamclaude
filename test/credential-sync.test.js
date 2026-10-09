@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
-import { CredentialSync, syncKeyFor, isSyncable, encodeBlob, decodeBlob, entryFromBlob, tombstoneOf, tombstone, KEY_PREFIX, TOMBSTONE_TTL_MS } from '../src/credential-sync.js';
+import { CredentialSync, refreshOutsideProxy, syncKeyFor, isSyncable, encodeBlob, decodeBlob, entryFromBlob, tombstoneOf, tombstone, KEY_PREFIX, TOMBSTONE_TTL_MS } from '../src/credential-sync.js';
 
 // Credential sync through callback.net: every signed-in install keeps its OAuth
 // account tokens in the user's credential store and follows it. The store here
@@ -54,11 +54,13 @@ function makeStore() {
     const row = rows.get(id);
     if (!row) throw err(404, 'error_not_found', `Not Found: User\\Credential(${id})`);
     if (fn === 'lock') {
-      if (row.Locked && clock - Number(row.Locked.unixms) < (params?.timeout ?? 60) * 1000) throw err(0, 'error_credential_locked', 'Credential is locked');
+      // As measured on the live API: the TAKER's timeout (30s when it names
+      // none) decides whether a held lock has lapsed, whoever took it.
+      if (row.Locked && clock - Number(row.Locked.unixms) < (params?.timeout ?? 30) * 1000) throw err(0, 'error_credential_locked', 'Credential is locked');
       row.Locked = stamp();
       return view(row);
     }
-    if (fn === 'unlock') { row.Locked = null; return view(row); }
+    if (fn === 'unlock') { row.Locked = null; return view(row); } // anyone's, held or not, as live
     if (method === 'GET') return view(row);
     if (method === 'PATCH') { row.Data = params.Data; row.Updated = stamp(); return view(row); }
     if (method === 'DELETE') { rows.delete(id); return true; }
@@ -77,8 +79,14 @@ function makeStore() {
 /** A fleet and a sync over a store. */
 function setup(entries, { store = makeStore(), signedIn = true, refresh } = {}) {
   const refreshed = [];
+  // Each provider call, with the lock state of its row as the call went out.
+  const sent = [];
   const am = new AccountManager(entries, 0.98, {
-    refreshFn: async (rt) => { refreshed.push(rt); return refresh ? refresh(rt) : { accessToken: `${rt}-renewed-at`, refreshToken: `${rt}-renewed-rt`, expiresAt: store.now() + 8 * H }; },
+    refreshFn: async (rt, _endpoint, _routing, opts) => {
+      refreshed.push(rt);
+      sent.push({ rt, budgetMs: opts?.budgetMs, locked: [...store.rows.values()].some((r) => r.Locked) });
+      return refresh ? refresh(rt) : { accessToken: `${rt}-renewed-at`, refreshToken: `${rt}-renewed-rt`, expiresAt: store.now() + 8 * H };
+    },
     codexRefreshFn: async (rt) => { refreshed.push(rt); return { accessToken: `${rt}-renewed-at`, refreshToken: `${rt}-renewed-rt`, expiresAt: store.now() + 8 * H }; },
   });
   const persisted = [];
@@ -96,13 +104,13 @@ function setup(entries, { store = makeStore(), signedIn = true, refresh } = {}) 
     addAccount: (entry) => { admitted.push(entry); return am.addAccount(entry); },
     evictAccount: (account) => { evicted.push(account.name); am.removeAccount(account.index); },
   });
-  am.setRefreshCoordinator((account, refresh) => sync.coordinateRefresh(account, refresh));
+  am.setRefreshCoordinator((account, refresh, info) => sync.coordinateRefresh(account, refresh, info)); // as index.js wires it
   am.onAccountRemoved((account) => { removals.push(sync.onAccountRemoved(account)); });
   const recoveries = [];
   am.onAccountError((account) => { recoveries.push(sync.onAccountError(account)); });
   // Every tombstone write a removal started, settled.
   const settled = () => Promise.all(removals);
-  return { am, sync, store, refreshed, persisted, admitted, evicted, logs, sleeps, settled, recoveries, signOut: () => { signed = false; }, signIn: () => { signed = true; } };
+  return { am, sync, store, refreshed, sent, persisted, admitted, evicted, logs, sleeps, settled, recoveries, signOut: () => { signed = false; }, signIn: () => { signed = true; } };
 }
 
 const tokensOf = (a) => ({ accessToken: a.credential, refreshToken: a.refreshToken, expiresAt: a.expiresAt });
@@ -497,20 +505,251 @@ test('lock refused and nothing stored within 30s: the lock is tried again, and t
   assert.ok(logs.some((l) => /stored no renewal in 30s; trying the lock again/.test(l)), logs.join('\n'));
 });
 
-test('the store being unreachable never stops a refresh', async () => {
-  const { sync, am, store, refreshed, logs } = setup([claude('a')]);
+test('the store unreachable: nothing is renewed without the lock — a good token is kept, a dead one waits', async () => {
+  // Expiry checks read the real clock, so the tokens are placed against it.
+  const soon = Date.now() + 2 * 60_000;
+  const { sync, am, store, refreshed, logs } = setup([claude('a', { expiresAt: soon })]);
   await sync.sync();
   sync.api = async () => { throw new Error('fetch failed'); };
-  store.tick(H); // the renewal, when it comes, expires later than the stored token
+  await am.ensureTokenFresh(0);
+  assert.deepEqual(refreshed, [], 'the provider was not asked');
+  assert.equal(am.accounts[0].credential, 'at-a-1', 'the token in hand still serves');
+  assert.ok(logs.some((l) => /not renewing, the callback\.net lock could not be taken \(fetch failed\); keeping the current token/.test(l)), logs.join('\n'));
+
+  // Upstream rejects it: still no renewal, and the account is not put in error
+  // for it — the failure is the store's, and the next request asks again.
+  await am.ensureTokenFresh(0, true);
+  assert.deepEqual(refreshed, []);
+  assert.equal(am.accounts[0].status, 'active');
+  assert.equal(am.accounts[0]._deadRefreshToken, null);
+
+  // Back: renewed, under the lock.
+  sync.api = store.api;
   await am.ensureTokenFresh(0, true);
   assert.deepEqual(refreshed, ['rt-a-1']);
-  assert.equal(am.accounts[0].credential, 'rt-a-1-renewed-at');
-  assert.ok(logs.some((l) => /lock for "a" failed \(fetch failed\); renewing without it/.test(l)), logs.join('\n'));
-  // Back later, the next pass stores what was renewed meanwhile.
-  sync.api = store.api;
-  const r = await sync.sync();
-  assert.equal(r.pushed, 1);
   assert.equal(store.blob(syncKeyFor(am.accounts[0])).accessToken, 'rt-a-1-renewed-at');
+});
+
+test('the store unreadable before the lock (the first listing fails): nothing is renewed', async () => {
+  const { sync, am, refreshed } = setup([claude('a')]);
+  // No pass yet, so the coordinator has to list; the listing fails.
+  sync.api = async () => { throw new Error('fetch failed'); };
+  await am.ensureTokenFresh(0, true);
+  assert.deepEqual(refreshed, []);
+  assert.equal(am.accounts[0].status, 'active');
+});
+
+test('a lock call refused for any reason but "locked" (our callback.net session gone, say) renews nothing', async () => {
+  const { sync, am, store, refreshed } = setup([claude('a')]);
+  await sync.sync();
+  sync.api = async (method, path, params, opts) => {
+    if (path.endsWith(':lock')) throw Object.assign(new Error('Login required'), { token: 'error_login_required', loginRequired: true });
+    return store.api(method, path, params, opts);
+  };
+  await am.ensureTokenFresh(0, true);
+  assert.deepEqual(refreshed, []);
+});
+
+test('a lock refused every round: the refresh gives up rather than renewing without it', async () => {
+  const { sync, am, store, refreshed, logs } = setup([claude('a')]);
+  await sync.sync();
+  // A holder that takes the lock again every time it lapses and never stores.
+  sync.api = async (method, path, params, opts) => {
+    if (path.endsWith(':lock')) throw Object.assign(new Error('Credential is locked'), { token: 'error_credential_locked', code: 0 });
+    return store.api(method, path, params, opts);
+  };
+  await am.ensureTokenFresh(0, true);
+  assert.deepEqual(refreshed, [], 'never renewed without the lock');
+  assert.equal(am.accounts[0].status, 'active');
+  assert.ok(logs.some((l) => /not renewing, the callback\.net lock was not to be had in 3 rounds/.test(l)), logs.join('\n'));
+});
+
+test('an account the store has never seen gets its row first, and is renewed under that row\'s lock', async () => {
+  const { am, store, refreshed, sent } = setup([claude('a')]);
+  // No pass has run: the row does not exist.
+  await am.ensureTokenFresh(0, true);
+  assert.deepEqual(refreshed, ['rt-a-1']);
+  assert.equal(sent[0].locked, true, 'the lock was held as the grant went out');
+  const fns = store.calls.map((c) => `${c.method} ${c.path.replace(/uscrd-\d+/, 'ID')}`);
+  assert.deepEqual(fns, ['GET User/Credential', 'POST User/Credential', 'POST User/Credential/ID:lock', 'PATCH User/Credential/ID', 'POST User/Credential/ID:unlock']);
+  assert.equal(store.blob(syncKeyFor(am.accounts[0])).accessToken, 'rt-a-1-renewed-at');
+});
+
+test('two installs first seeing one account at once: one row, one renewal, the other adopts', async () => {
+  const store = makeStore();
+  const office = setup([claude('a')], { store });
+  const home = setup([claude('a')], { store });
+  // Neither has run a pass. Office creates the row and takes the lock; home's
+  // create meets the key, it reads office's row and is refused its lock.
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  office.am._refreshFn = async (rt) => { office.refreshed.push(rt); await gate; return { accessToken: 'at-office', refreshToken: 'rt-office', expiresAt: store.now() + 8 * H }; };
+  const officeDone = office.am.ensureTokenFresh(0, true);
+  for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r));
+  assert.ok(store.byKey(syncKeyFor(claude('a'))).Locked, 'office holds the lock');
+  home.sync.sleep = async (ms) => { store.tick(ms); release(); await officeDone; };
+  await home.am.ensureTokenFresh(0, true);
+  await officeDone;
+  assert.deepEqual(office.refreshed, ['rt-a-1']);
+  assert.deepEqual(home.refreshed, [], 'home never called the provider');
+  assert.equal(home.am.accounts[0].credential, 'at-office');
+  assert.equal(store.rows.size, 1);
+});
+
+test('a create that races another install\'s and fails with a plain error still finds that row, and waits on its lock', async () => {
+  // Seen live: two installs creating one key at once, the loser told "There
+  // was a database error", not error_key_exists.
+  const store = makeStore();
+  const { am, sync, refreshed } = setup([claude('a')], { store });
+  const theirs = { ...claude('a'), credential: 'at-a-office', refreshToken: 'rt-a-office', expiresAt: T0 + 16 * H };
+  sync.api = async (method, path, params, opts) => {
+    if (method === 'POST' && path === 'User/Credential') {
+      store.put(params.Key, encodeBlob(theirs, tokensOf(theirs), { now: T0, by: 'office' }));
+      throw Object.assign(new Error('There was a database error while processing your request'), { code: 500 });
+    }
+    return store.api(method, path, params, opts);
+  };
+  await am.ensureTokenFresh(0, true);
+  assert.deepEqual(refreshed, [], 'office\'s row holds a renewal: taken, nothing sent');
+  assert.equal(am.accounts[0].credential, 'at-a-office');
+});
+
+test('the renewal gets what is left of the lease, and a lease that ran out is not released', async () => {
+  const store = makeStore();
+  const { sync, am, sent } = setup([claude('a')], { store });
+  await sync.sync();
+  await am.ensureTokenFresh(0, true);
+  // 30s lease, 2s kept for the clocks, 8s for storing the answer.
+  assert.equal(sent[0].budgetMs, 20_000);
+
+  // A provider call that overruns anyway: by the time it answers, the lease
+  // has lapsed and another install has taken the lock. Releasing it now would
+  // hand the lock to a third.
+  const row = store.byKey(syncKeyFor(claude('a')));
+  am.accounts[0]._lastRefreshAt = null;
+  am._refreshFn = async (rt) => {
+    store.tick(31_000);
+    await store.api('POST', `User/Credential/${row.User_Credential__}:lock`, { timeout: 30 }); // office's
+    return { accessToken: `${rt}-late-at`, refreshToken: `${rt}-late-rt`, expiresAt: store.now() + 8 * H };
+  };
+  const officeLock = () => row.Locked;
+  await am.ensureTokenFresh(0, true);
+  assert.ok(officeLock(), 'the other install\'s lock still stands');
+  assert.ok(!store.calls.slice(-3).some((c) => c.path.endsWith(':unlock')), 'no release after the lease');
+});
+
+test('a lock call that eats the lease is not followed by a renewal', async () => {
+  const { sync, am, store, refreshed } = setup([claude('a')]);
+  await sync.sync();
+  let slow = true;
+  sync.api = async (method, path, params, opts) => {
+    const r = await store.api(method, path, params, opts);
+    if (path.endsWith(':lock') && slow) { slow = false; store.tick(20_000); } // the answer took 20s
+    return r;
+  };
+  await am.ensureTokenFresh(0, true);
+  // The first lock left 8s: too little, so it was released and taken again.
+  assert.deepEqual(refreshed, ['rt-a-1']);
+  assert.equal(store.calls.filter((c) => c.path.endsWith(':lock')).length, 2);
+});
+
+test('a removed account is renewed under the lock, then released', async () => {
+  const store = makeStore();
+  const home = setup([claude('a')], { store });
+  const office = setup([claude('a')], { store });
+  await home.sync.sync();
+  await office.sync.sync();
+  home.am.removeAccount(0);
+  await home.settled();
+  await office.am.ensureTokenFresh(0, true);
+  assert.deepEqual(office.refreshed, ['rt-a-1']);
+  assert.equal(office.sent[0].locked, true, 'the lock was held as the grant went out');
+  const row = store.byKey(syncKeyFor(claude('a')));
+  assert.equal(row.Locked, null, 'released after');
+  const fns = store.calls.filter((c) => c.path.includes(row.User_Credential__)).map((c) => `${c.method} ${c.path.split(':')[1] || ''}`);
+  const lockAt = fns.lastIndexOf('POST lock');
+  assert.ok(lockAt >= 0 && fns.slice(lockAt + 1).includes('POST unlock'), fns.join(', '));
+});
+
+test('a row gone between its read and its lock is found again, and locked', async () => {
+  const { sync, am, store, refreshed, sent } = setup([claude('a')]);
+  await sync.sync();
+  // Deleted on the store's side; this install still has it cached.
+  store.rows.clear();
+  await am.ensureTokenFresh(0, true);
+  assert.deepEqual(refreshed, ['rt-a-1']);
+  assert.equal(sent[0].locked, true);
+  assert.equal(store.blob(syncKeyFor(claude('a'))).accessToken, 'rt-a-1-renewed-at');
+});
+
+test('an account the store does not carry by identity is still renewed under the lock of the row that holds its token', async () => {
+  const store = makeStore();
+  const a = claude('a');
+  store.put(syncKeyFor(a), encodeBlob({ ...a, credential: a.accessToken }, { accessToken: a.accessToken, refreshToken: a.refreshToken, expiresAt: a.expiresAt }, { now: T0, by: 'office' }));
+  // The same tokens here, imported without an identity.
+  const { am, refreshed, sent } = setup([{ ...a, accountUuid: undefined, orgUuid: undefined }], { store });
+  await am.ensureTokenFresh(0, true);
+  assert.deepEqual(refreshed, ['rt-a-1']);
+  assert.equal(sent[0].locked, true);
+
+  // One whose token is nowhere in the store has nothing to race: renewed as it is.
+  const lone = setup([{ ...claude('n'), accountUuid: undefined }], { store });
+  await lone.am.ensureTokenFresh(0, true);
+  assert.deepEqual(lone.refreshed, ['rt-n-1']);
+});
+
+test('a forced refresh waits for the lock holder even while the clock calls the token good', async () => {
+  // The 401 said it is dead whatever the clock says; "keep it" is no answer.
+  const { sync, am, store, refreshed, sleeps } = setup([claude('a', { expiresAt: Date.now() + 2 * 60_000 })]);
+  await sync.sync();
+  const row = store.byKey(syncKeyFor(am.accounts[0]));
+  row.Locked = { unixms: String(store.now()) };
+  const renewed = { ...am.accounts[0], credential: 'at-a-mac', refreshToken: 'rt-a-mac', expiresAt: Date.now() + 8 * H };
+  sync.api = async (method, path, params, opts) => {
+    if (method === 'GET' && path.endsWith(row.User_Credential__) && sleeps.length >= 1) {
+      row.Data = JSON.stringify(encodeBlob(renewed, tokensOf(renewed), { now: store.now(), by: 'mac' }));
+    }
+    return store.api(method, path, params, opts);
+  };
+  await am.ensureTokenFresh(0, true);
+  assert.deepEqual(refreshed, []);
+  assert.equal(am.accounts[0].credential, 'at-a-mac');
+});
+
+test('a CLI renewal goes through the same lock: refused while an install holds it, plain when signed out', async () => {
+  const store = makeStore();
+  const { sync } = setup([claude('a')], { store });
+  await sync.sync();
+  const row = store.byKey(syncKeyFor(claude('a')));
+  const calls = [];
+  const refresh = async (o) => { calls.push(o); return { accessToken: 'at-cli', refreshToken: 'rt-cli', expiresAt: store.now() + 8 * H }; };
+  const opts = { api: store.api, now: store.now, isSignedIn: async () => true, log: () => {}, by: 'cli', sleep: async (ms) => { store.tick(ms); } };
+
+  row.Locked = { unixms: String(store.now()) };
+  // Still good by the clock: kept.
+  assert.equal(await refreshOutsideProxy(claude('a', { expiresAt: Date.now() + 2 * 60_000 }), refresh, opts), null);
+  // Expired, and the holder never stores: it gives up after its rounds, unrenewed.
+  // (Each round's wait outlasts the lease, so it is re-taken in the fake: hold it.)
+  const holdApi = async (method, path, params, o) => {
+    if (path.endsWith(':lock')) throw Object.assign(new Error('Credential is locked'), { token: 'error_credential_locked' });
+    return store.api(method, path, params, o);
+  };
+  await assert.rejects(refreshOutsideProxy(claude('a', { expiresAt: Date.now() - 1000 }), refresh, { ...opts, api: holdApi }), { code: 'CALLBACK_LOCK_UNAVAILABLE' });
+  assert.deepEqual(calls, []);
+
+  // Free: renewed under it, stored, released.
+  row.Locked = null;
+  const t = await refreshOutsideProxy(claude('a', { expiresAt: Date.now() - 1000 }), refresh, { ...opts, force: true });
+  assert.equal(t.accessToken, 'at-cli');
+  assert.equal(calls.length, 1);
+  assert.equal(store.blob(syncKeyFor(claude('a'))).accessToken, 'at-cli');
+  assert.equal(row.Locked, null);
+
+  // Signed out of callback.net: a plain refresh, no store involved.
+  const before = store.calls.length;
+  await refreshOutsideProxy(claude('a'), refresh, { ...opts, isSignedIn: async () => false });
+  assert.equal(calls.length, 2);
+  assert.equal(store.calls.length, before);
 });
 
 test('a refresh the provider rejects releases the lock and leaves the row as it was', async () => {
@@ -599,16 +838,6 @@ test('an account that goes into error takes a token another install stored since
   am.markCredentialRejected(0, '401');
   assert.equal(await recoveries[1], false);
   assert.equal(am.accounts[0].status, 'error');
-});
-
-test('an account the store has never seen is renewed plainly, then stored', async () => {
-  const { am, store, refreshed } = setup([claude('a')]);
-  // No pass has run: the row does not exist.
-  await am.ensureTokenFresh(0, true);
-  assert.deepEqual(refreshed, ['rt-a-1']);
-  await new Promise((r) => setImmediate(r));
-  assert.equal(store.blob(syncKeyFor(am.accounts[0]))?.accessToken, 'rt-a-1-renewed-at');
-  assert.ok(!store.calls.some((c) => c.path.endsWith(':lock')), 'nothing to lock yet');
 });
 
 test('two installs renewing one account at once: one renews, the other adopts', async () => {
