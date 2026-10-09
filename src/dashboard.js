@@ -466,6 +466,54 @@ export function accountControlOutcome(res, spec) {
   return { kind: 'ok', text: res.name + ' priority ' + res.priority };
 }
 
+/**
+ * Whether the caller may use the control behind `path`. A status without the
+ * `caller` field keeps every control: the server still refuses what it must.
+ *
+ * @param {any} caller  status.caller
+ * @param {string} path
+ */
+export function callerCan(caller, path) {
+  var refused = caller && caller.refused;
+  return !Array.isArray(refused) || refused.indexOf(path) < 0;
+}
+
+/**
+ * The one line that explains the hidden controls, or null when nothing is
+ * hidden. Said once at the top instead of on every card.
+ *
+ * @param {any} caller  status.caller
+ */
+export function callerNotice(caller) {
+  if (!caller || !Array.isArray(caller.refused) || !caller.refused.length) return null;
+  return 'Signed in with the client key "' + caller.client + '". Changes to accounts and settings need the proxy key (proxy.apiKey), or the page opened without a key on the proxy\'s own machine, so those controls are hidden.';
+}
+
+/**
+ * Which card a note belongs to. One email can hold accounts in several orgs,
+ * and providers may reuse a name, so the name alone can match two cards.
+ *
+ * @param {any} account  one entry of status.accounts
+ */
+export function cardNoteKey(account) {
+  return [account.name, account.orgUuid || '', account.provider || ''].join('\n');
+}
+
+/**
+ * The result of the last action on one account card, while it is recent
+ * enough to show. Kept outside the card, which the poll rebuilds every few
+ * seconds.
+ *
+ * @param {any} notes  { [cardNoteKey]: { kind, text, at } }
+ * @param {string} key  cardNoteKey of the card
+ * @param {number} now
+ */
+export function cardNoteFor(notes, key, now) {
+  var n = notes && Object.prototype.hasOwnProperty.call(notes, key) ? notes[key] : null;
+  if (!n || now - n.at > CARD_NOTE_MAX_AGE_MS) return null;
+  return n;
+}
+
 export function switchOutcome(res) {
   if (!res || !res.ok) return { kind: 'error', text: 'switch failed' + (res && res.error ? ': ' + res.error : '') };
   if (res.eligible === false) return { kind: 'warn', text: 'switched to ' + res.account + ', but rotation will not use it' + (res.reason ? ': ' + res.reason : '') };
@@ -650,10 +698,13 @@ export function usageFor(entry, view) {
   };
 }
 
+/** How long an action's result stays above its account card. */
+export const CARD_NOTE_MAX_AGE_MS = 60 * 1000;
+
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, modelLabel, recentModelLabels, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
-  outsideSpendText, showSessionRow,
+  outsideSpendText, showSessionRow, callerCan, callerNotice, cardNoteKey, cardNoteFor,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -668,6 +719,7 @@ const SHARED_CONSTS = [
   `var THRESHOLD_BUCKET_KEYS = ${JSON.stringify(THRESHOLD_BUCKET_KEYS)};`,
   `var THRESHOLD_BUCKET_LABELS = ${JSON.stringify(THRESHOLD_BUCKET_LABELS)};`,
   `var USAGE_VIEWS = ${JSON.stringify(USAGE_VIEWS)};`,
+  `var CARD_NOTE_MAX_AGE_MS = ${CARD_NOTE_MAX_AGE_MS};`,
 ].join('\n');
 
 const PAGE = `<!doctype html>
@@ -746,7 +798,9 @@ const PAGE = `<!doctype html>
   .act:hover { background: var(--accent); color: var(--bg); }
   .act:disabled { opacity: .5; cursor: default; }
   #note { font-size: 12px; margin: 8px 0; display: none; }
-  #note.ok { color: var(--ok); } #note.warn { color: var(--warn); } #note.error { color: var(--bad); }
+  #note.ok, .cardnote.ok { color: var(--ok); } #note.warn, .cardnote.warn { color: var(--warn); } #note.error, .cardnote.error { color: var(--bad); }
+  .cardnote { font-size: 12px; margin: 8px 0 4px; }
+  #caller { font-size: 12px; margin: 8px 0; color: var(--dim); }
   .filters { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; padding: 8px 10px; border-bottom: 1px solid var(--line); }
   .filters label { color: var(--dim); font-size: 12px; display: flex; align-items: center; gap: 6px; }
   .filters select { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; color: var(--text); font: inherit; font-size: 12px; padding: 4px 8px; }
@@ -814,6 +868,7 @@ const PAGE = `<!doctype html>
     <div id="err"></div>
     <div id="problems"></div>
     <div id="note"></div>
+    <div id="caller" style="display:none"><span id="callerText"></span> <button id="changeKey" class="act" type="button">Change key</button></div>
     <div id="routesWrap" style="display:none">
       <h2>Routing</h2>
       <div class="card" style="padding:4px 6px"><table id="routes"></table></div>
@@ -946,7 +1001,7 @@ ${SHARED_HELPERS}
     return row;
   }
 
-  function renderAccount(a, current, currentAccounts, fleetThreshold, fleetThresholds) {
+  function renderAccount(a, current, currentAccounts, fleetThreshold, fleetThresholds, caller) {
     var card = el('div', 'card');
     var head = el('div', 'row');
     head.appendChild(el('span', 'name', a.name));
@@ -959,7 +1014,7 @@ ${SHARED_HELPERS}
     // Last in the row so the badges sit in the same place on every card.
     if (!isCurrent) {
       var btn = el('button', 'act', 'switch');
-      btn.addEventListener('click', function () { doSwitch(a.name, btn); });
+      btn.addEventListener('click', function () { doSwitch(a.name, cardNoteKey(a), btn); });
       head.appendChild(btn);
     }
     // Account controls, in the order an operator reaches for them: take it out
@@ -969,15 +1024,19 @@ ${SHARED_HELPERS}
     // Named ctl* deliberately: var is function-scoped, and this builder already
     // declares a "last" further down (the last-used string). A button named
     // last here is overwritten by that before any click can fire.
-    var ctlDisable = el('button', 'act', a.disabled ? 'enable' : 'disable');
-    ctlDisable.addEventListener('click', function () { doControlAccount(a.name, { disabled: !a.disabled }, ctlDisable); });
-    head.appendChild(ctlDisable);
-    if (!a.disabled) {
+    // A control this key would be refused is not drawn at all; the line under
+    // the actions says why, once (callerNotice).
+    if (callerCan(caller, '/teamclaude/disable')) {
+      var ctlDisable = el('button', 'act', a.disabled ? 'enable' : 'disable');
+      ctlDisable.addEventListener('click', function () { doControlAccount(a.name, cardNoteKey(a), { disabled: !a.disabled }, ctlDisable); });
+      head.appendChild(ctlDisable);
+    }
+    if (!a.disabled && callerCan(caller, '/teamclaude/priority')) {
       var ctlFirst = el('button', 'act', 'prioritize');
-      ctlFirst.addEventListener('click', function () { doControlAccount(a.name, { place: 'first' }, ctlFirst); });
+      ctlFirst.addEventListener('click', function () { doControlAccount(a.name, cardNoteKey(a), { place: 'first' }, ctlFirst); });
       head.appendChild(ctlFirst);
       var ctlLast = el('button', 'act', 'deprioritize');
-      ctlLast.addEventListener('click', function () { doControlAccount(a.name, { place: 'last' }, ctlLast); });
+      ctlLast.addEventListener('click', function () { doControlAccount(a.name, cardNoteKey(a), { place: 'last' }, ctlLast); });
       head.appendChild(ctlLast);
     }
     card.appendChild(head);
@@ -1279,6 +1338,13 @@ ${SHARED_HELPERS}
     // TUI or another browser shows up here without a refresh.
     var thrInput = document.getElementById('thrVal');
     if (document.activeElement !== thrInput) thrInput.value = thresholdPercentText(s.switchThreshold);
+    // Kept visible read-only: the number still tells a client where the fleet switches.
+    var canThreshold = callerCan(s.caller, '/teamclaude/threshold');
+    thrInput.disabled = !canThreshold;
+    document.getElementById('thrSet').style.display = canThreshold ? '' : 'none';
+    var notice = callerNotice(s.caller);
+    document.getElementById('callerText').textContent = notice || '';
+    document.getElementById('caller').style.display = notice ? 'block' : 'none';
     var sess = s.sessions || {};
     var up = s.server && s.server.uptimeSeconds != null ? 'up ' + fmtIn(s.server.uptimeSeconds) : '';
     var sum = document.getElementById('summary');
@@ -1309,7 +1375,12 @@ ${SHARED_HELPERS}
     probeBtn.disabled = !!probe.running;
     var acc = document.getElementById('accounts');
     acc.textContent = '';
-    (s.accounts || []).forEach(function (a) { acc.appendChild(renderAccount(a, s.currentAccount, currentAccounts, s.switchThreshold, s.switchThresholds)); });
+    var now = Date.now();
+    (s.accounts || []).forEach(function (a) {
+      var cn = cardNoteFor(cardNotes, cardNoteKey(a), now);
+      if (cn) acc.appendChild(el('div', 'cardnote ' + cn.kind, cn.text));
+      acc.appendChild(renderAccount(a, s.currentAccount, currentAccounts, s.switchThreshold, s.switchThresholds, s.caller));
+    });
     renderProblems(s);
     renderRoutes(s);
     renderClients(s.clients);
@@ -1322,6 +1393,19 @@ ${SHARED_HELPERS}
     document.getElementById('foot').textContent = 'refreshes every ' + (POLL_MS / 1000) + 's · ' + new Date().toLocaleTimeString();
   }
 
+  // An account action reports above its own card, where the click was: the
+  // page-wide note sits above the cards and is off screen for a card further down.
+  // No prototype: an account named __proto__ would otherwise set it.
+  var cardNotes = Object.create(null);
+  // With now set it re-renders at once, for a failure no poll follows. Otherwise the
+  // poll the caller starts shows it: re-rendering the stale status here would
+  // rebuild the card and re-enable a switch button that must stay disabled
+  // until the poll reports the switch.
+  function cardNote(key, kind, text, now) {
+    cardNotes[key] = { kind: kind, text: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) + ' · ' + text, at: Date.now() };
+    if (now && lastStatus) render(lastStatus);
+  }
+
   function note(kind, text) {
     var n = document.getElementById('note');
     n.className = kind;
@@ -1332,7 +1416,7 @@ ${SHARED_HELPERS}
   // One manual switch. The endpoint is a nudge, not a pin: it sets the current
   // account and normal rotation resumes from there (see the handler's comment
   // in server.js for what "eligible" means).
-  function doSwitch(name, btn) {
+  function doSwitch(name, noteKey, btn) {
     btn.disabled = true;
     var r = switchRequest(name, localStorage.getItem(KEY));
     fetch(r.url, r.init)
@@ -1343,16 +1427,16 @@ ${SHARED_HELPERS}
       .then(function (json) {
         if (!json) return;
         var out = switchOutcome(json);
-        note(out.kind, out.text);
+        cardNote(noteKey, out.kind, out.text, false);
         // Re-enabled on any non-success, whether the server refused or the
         // fetch threw, so the two failure paths leave the button in one state.
         if (out.kind !== 'ok') btn.disabled = false;
         poll();
       })
-      .catch(function (e) { note('error', 'switch failed: ' + e.message); btn.disabled = false; });
+      .catch(function (e) { cardNote(noteKey, 'error', 'switch failed: ' + e.message, true); btn.disabled = false; });
   }
 
-  function doControlAccount(name, spec, btn) {
+  function doControlAccount(name, noteKey, spec, btn) {
     btn.disabled = true;
     var r = accountControlRequest(name, spec, localStorage.getItem(KEY));
     fetch(r.url, r.init)
@@ -1363,10 +1447,10 @@ ${SHARED_HELPERS}
       .then(function (json) {
         if (!json) return;
         var out = accountControlOutcome(json, spec);
-        note(out.kind, out.text);
+        cardNote(noteKey, out.kind, out.text, false);
         poll();
       })
-      .catch(function (e) { note('error', 'change failed: ' + e.message); })
+      .catch(function (e) { cardNote(noteKey, 'error', 'change failed: ' + e.message, true); })
       // Unlike doSwitch, always re-enabled: the card is rebuilt by the poll
       // above, and a button that stayed dead after a refused change would be
       // the only control an operator could not retry.
@@ -1509,6 +1593,9 @@ ${SHARED_HELPERS}
   document.getElementById('reload').addEventListener('click', function () { doControl('/teamclaude/reload', 'config reload', this); });
   document.getElementById('probe').addEventListener('click', function () { doControl('/teamclaude/probe', 'quota probe', this); });
   document.getElementById('thrSet').addEventListener('click', function () { doThreshold(this); });
+  // A client key is a valid key, so nothing else on the page would ever ask for
+  // another one: the operator needs a way back to the key box.
+  document.getElementById('changeKey').addEventListener('click', function () { localStorage.removeItem(KEY); document.getElementById('key').value = ''; showKeybox(); });
   document.getElementById('thrVal').addEventListener('keydown', function (e) {
     if (e.key === 'Enter') document.getElementById('thrSet').click();
   });

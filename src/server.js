@@ -416,6 +416,21 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
 ]);
 
 /**
+ * The caller of /teamclaude/status as the control plane sees it, so the
+ * dashboard can hide the controls this key would be refused instead of letting
+ * the operator find out by clicking. `refused` is read from the refusal map
+ * above, so the page and the gate cannot disagree. A key-less loopback caller
+ * and the shared proxy.apiKey are the operator; only a client key is refused.
+ *
+ * @param {string|null|undefined} client  the client-key name, or null
+ * @returns {{ kind: 'operator'|'client', client: string|null, refused: string[] }}
+ */
+export function callerView(client) {
+  if (!client) return { kind: 'operator', client: null, refused: [] };
+  return { kind: 'client', client, refused: [...CLIENT_KEY_REFUSED_PATHS.keys()] };
+}
+
+/**
  * @param {any} accountManager
  * @param {any} config
  * @param {any} [hooks]
@@ -589,7 +604,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         res.writeHead(200, { 'Content-Type': 'application/json' });
         // Counters only: how full the upstream admission gate is (see
         // upstream-fetch.js), never which origins or requests.
-        res.end(JSON.stringify({ ...extra, ...status, upstreamPool: upstreamPoolStatus() }, null, 2));
+        res.end(JSON.stringify({ ...extra, ...status, caller: callerView(req.tcClient), upstreamPool: upstreamPoolStatus() }, null, 2));
         return;
       }
 

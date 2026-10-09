@@ -11,6 +11,7 @@ import {
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
   thresholdRequest, thresholdPercentText, thresholdOutcome,
   usageFor, USAGE_VIEWS,
+  callerCan, callerNotice, cardNoteKey, cardNoteFor, CARD_NOTE_MAX_AGE_MS,
 } from '../src/dashboard.js';
 import { USAGE_WINDOWS } from '../src/client-usage.js';
 
@@ -672,9 +673,11 @@ test('the page ships the same helper implementations it is tested against', () =
   // The serialization is the contract: if a helper stops being self-contained
   // (closes over module scope), the page would silently ReferenceError.
   const html = renderDashboardHtml();
-  for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor]) {
+  for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, callerCan, callerNotice, cardNoteKey, cardNoteFor]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
+  // cardNoteFor reads it from page scope; without it the first render throws.
+  assert.ok(html.includes(`var CARD_NOTE_MAX_AGE_MS = ${CARD_NOTE_MAX_AGE_MS};`), 'the card-note age constant');
   // Both the head bootstrap and the main script must parse, not just the last.
   for (const script of inlineScripts(html)) {
     assert.doesNotThrow(() => new Function(script), 'inline script must parse');
@@ -1004,4 +1007,60 @@ test('selecting a window relabels every table it governs', async () => {
 
   page.click('Total');
   assert.equal(page.byId('clientsHeading').textContent, 'Clients', 'and back again');
+});
+
+// A client key is refused the account controls and the threshold (server.js,
+// CLIENT_KEY_REFUSED_PATHS). The page hides what would be refused, and says so
+// once, instead of drawing buttons that answer a click with a line off screen.
+const CLIENT_CALLER = {
+  kind: 'client',
+  client: 'ci',
+  refused: ['/teamclaude/threshold', '/teamclaude/priority', '/teamclaude/disable'],
+};
+
+test('callerCan hides exactly the refused controls', () => {
+  assert.equal(callerCan(CLIENT_CALLER, '/teamclaude/priority'), false);
+  assert.equal(callerCan(CLIENT_CALLER, '/teamclaude/disable'), false);
+  assert.equal(callerCan(CLIENT_CALLER, '/teamclaude/threshold'), false);
+  // A client key may still switch and reload.
+  assert.equal(callerCan(CLIENT_CALLER, '/teamclaude/switch'), true);
+  assert.equal(callerCan(CLIENT_CALLER, '/teamclaude/reload'), true);
+  assert.equal(callerCan({ kind: 'operator', client: null, refused: [] }, '/teamclaude/priority'), true);
+  // No caller field: every control stays, and the server still refuses.
+  assert.equal(callerCan(undefined, '/teamclaude/priority'), true);
+  assert.equal(callerCan({ kind: 'client', client: 'ci' }, '/teamclaude/priority'), true);
+});
+
+test('callerNotice names the client key only when something is hidden', () => {
+  const text = callerNotice(CLIENT_CALLER);
+  assert.match(text, /client key "ci"/);
+  assert.match(text, /proxy\.apiKey/);
+  assert.equal(callerNotice({ kind: 'operator', client: null, refused: [] }), null);
+  assert.equal(callerNotice({ kind: 'client', client: 'ci', refused: [] }), null);
+  assert.equal(callerNotice(undefined), null);
+});
+
+test('cardNoteFor shows a result for its own card only, and only while recent', () => {
+  const at = 1_000_000;
+  const notes = { 'alice@example.com': { kind: 'error', text: 'change failed', at } };
+  assert.deepEqual(cardNoteFor(notes, 'alice@example.com', at + 1000), notes['alice@example.com']);
+  assert.equal(cardNoteFor(notes, 'bob@example.com', at + 1000), null);
+  assert.equal(cardNoteFor(notes, 'alice@example.com', at + CARD_NOTE_MAX_AGE_MS), notes['alice@example.com']);
+  assert.equal(cardNoteFor(notes, 'alice@example.com', at + CARD_NOTE_MAX_AGE_MS + 1), null);
+  // An account name is operator data: an inherited key is not a note.
+  assert.equal(cardNoteFor(notes, 'constructor', at), null);
+  // The page's own store has no prototype, so even __proto__ is an ordinary key.
+  const bare = Object.create(null);
+  bare['__proto__'] = { kind: 'ok', text: 'x', at };
+  assert.equal(cardNoteFor(bare, '__proto__', at).text, 'x');
+  assert.equal(cardNoteFor(undefined, 'alice@example.com', at), null);
+});
+
+test('cardNoteKey tells apart two cards with one name', () => {
+  const a = cardNoteKey({ name: 'alice@example.com', orgUuid: 'org-1', provider: 'anthropic' });
+  const b = cardNoteKey({ name: 'alice@example.com', orgUuid: 'org-2', provider: 'anthropic' });
+  const c = cardNoteKey({ name: 'alice@example.com', orgUuid: 'org-1', provider: 'codex' });
+  assert.notEqual(a, b);
+  assert.notEqual(a, c);
+  assert.equal(a, cardNoteKey({ name: 'alice@example.com', orgUuid: 'org-1', provider: 'anthropic' }));
 });
