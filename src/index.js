@@ -450,6 +450,8 @@ async function serverCommand() {
   accountManager.onAccountRemoved((account) => { credentialSync.onAccountRemoved(account).catch(() => {}); });
   // An account in error looks in the store for a token another install holds.
   accountManager.onAccountError((account) => { credentialSync.onAccountError(account).catch(() => {}); });
+  // An account is only stored once this launch has seen its token work.
+  accountManager.onAccountAccessed((account) => { credentialSync.onAccountAccessed(account).catch(() => {}); });
 
   // Persist refreshed tokens back to config (re-read from disk to avoid clobbering
   // accounts added externally, e.g. by `teamclaude import` while server is running)

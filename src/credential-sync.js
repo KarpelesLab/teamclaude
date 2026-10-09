@@ -45,6 +45,20 @@
 // one it has is adopted whatever its expiry — a sign-in elsewhere mints a
 // token the dead one could never be newer than — and the account is back in
 // rotation. The pass looks, and so does the moment the account goes into error.
+// When the row still holds the very refresh token the token endpoint rejected,
+// the row is EMPTIED instead — its refresh token set to "", under the row's
+// lock and only if the row is still unchanged once locked. An empty refresh
+// token says "needs a sign-in": no install adopts it or adds an account from
+// it, and the first install holding a working token overwrites it whatever its
+// expiry, the way a renewal or a sign-in there does.
+//
+// Nor is an account written before this launch has ACCESSED it: until its
+// token has worked here (a request upstream did not reject, a quota reading,
+// a renewal the token endpoint answered), nothing says it is valid — a config
+// can hold a token that died while the proxy was down. Such an account reads
+// like any other (adopts, follows a tombstone) but neither creates nor updates
+// its row; the moment it is first accessed, the row catches up. An explicit
+// sign-in (`login`, `import`) is the exception: those tokens were just minted.
 
 import { hostname } from 'node:os';
 import { callbackCall, loadCallbackToken } from './callback-auth.js';
@@ -152,7 +166,8 @@ export function decodeBlob(text) {
   let b;
   try { b = JSON.parse(text); } catch { return null; }
   if (!b || typeof b !== 'object' || b.v !== BLOB_VERSION) return null;
-  if (typeof b.accessToken !== 'string' || !b.accessToken || typeof b.refreshToken !== 'string' || !b.refreshToken) return null;
+  // An empty refresh token is the "needs a sign-in" marker (see needsSignIn).
+  if (typeof b.accessToken !== 'string' || !b.accessToken || typeof b.refreshToken !== 'string') return null;
   if (!Number.isFinite(b.expiresAt) || typeof b.name !== 'string') return null;
   return b;
 }
@@ -188,12 +203,21 @@ export function entryFromBlob(/** @type {Blob} */ blob) {
   return entry;
 }
 
+/**
+ * Whether a row's blob is the "needs a sign-in" marker: emptied by an install
+ * whose copy of that token upstream rejected. Nothing is taken from it.
+ * @param {Blob|null|undefined} blob
+ */
+export function needsSignIn(blob) {
+  return !!blob && blob.refreshToken === '';
+}
+
 /** @param {Blob} blob @returns {Tokens} */
 const tokensOf = (blob) => ({ accessToken: blob.accessToken, refreshToken: blob.refreshToken, expiresAt: blob.expiresAt });
 
 /** Whether a blob carries a token that supersedes what an account holds. */
 function supersedes(/** @type {Blob|null} */ blob, /** @type {Record<string, any>} */ account) {
-  if (!blob) return false;
+  if (!blob || needsSignIn(blob)) return false;
   if (blob.accessToken === account.credential && blob.refreshToken === account.refreshToken) return false;
   return blob.expiresAt > (Number(account.expiresAt) || 0);
 }
@@ -213,7 +237,7 @@ function supersedes(/** @type {Blob|null} */ blob, /** @type {Record<string, any
  * @param {string} by  this install's name, as it signs the rows it writes
  */
 function heldElsewhere(blob, account, by) {
-  if (!blob) return false;
+  if (!blob || needsSignIn(blob)) return false;
   if (blob.accessToken === account.credential && blob.refreshToken === account.refreshToken) return false;
   return !(blob.by === by && blob.expiresAt < (Number(account.expiresAt) || 0));
 }
@@ -228,13 +252,29 @@ export function isInError(account) {
   return account.status === 'error' || (!!account._deadRefreshToken && account._deadRefreshToken === account.refreshToken);
 }
 
+/** Whether this launch has seen the account's current token work (see AccountManager.markAccessed). */
+export function isAccessed(/** @type {Record<string, any>} */ account) {
+  return account._accessed === true;
+}
+
+/**
+ * Whether a row holds exactly the refresh token upstream rejected on this
+ * install — the account's own, still held, and already dead.
+ * @param {Blob|null} blob
+ * @param {Record<string, any>} account
+ */
+function holdsRejectedToken(blob, account) {
+  const dead = account._deadRefreshToken;
+  return !!blob && !!dead && dead === account.refreshToken && blob.refreshToken === dead;
+}
+
 /**
  * Whether a blob can bring an account in error back: it carries tokens other
  * than the ones the account holds, and not the refresh token already rejected.
  * Expiry does not enter into it — the account's own token is dead either way.
  */
 function revives(/** @type {Blob|null} */ blob, /** @type {Record<string, any>} */ account) {
-  if (!blob) return false;
+  if (!blob || needsSignIn(blob)) return false;
   if (blob.accessToken === account.credential && blob.refreshToken === account.refreshToken) return false;
   return !account._deadRefreshToken || blob.refreshToken !== account._deadRefreshToken;
 }
@@ -281,8 +321,13 @@ export class CredentialSync {
   summary() {
     let rows = 0;
     let tombstones = 0;
-    for (const r of this.rows.values()) { if (r.deletedAt != null) tombstones++; else rows++; }
-    return { lastSyncAt: this.lastSyncAt, lastError: this.lastError, rows, tombstones };
+    let signInNeeded = 0;
+    for (const r of this.rows.values()) {
+      if (r.deletedAt != null) tombstones++;
+      else rows++;
+      if (needsSignIn(r.blob)) signInNeeded++;
+    }
+    return { lastSyncAt: this.lastSyncAt, lastError: this.lastError, rows, tombstones, signInNeeded };
   }
 
   /** Run a pass now and every SYNC_INTERVAL_MS from then on. */
@@ -321,7 +366,7 @@ export class CredentialSync {
    * rejects, and nothing it did before failing is undone.
    *
    * @param {string} [reason]
-   * @returns {Promise<{ signedIn: boolean, adopted: number, pushed: number, created: number, added: number, evicted: number, expired: number, rows: number }>}
+   * @returns {Promise<{ signedIn: boolean, adopted: number, pushed: number, created: number, added: number, evicted: number, expired: number, emptied: number, rows: number }>}
    */
   sync(reason = 'manual') {
     if (this._syncing) return this._syncing;
@@ -331,7 +376,7 @@ export class CredentialSync {
 
   /** @param {string} reason */
   async _sync(reason) {
-    const result = { signedIn: false, adopted: 0, pushed: 0, created: 0, added: 0, evicted: 0, expired: 0, rows: 0 };
+    const result = { signedIn: false, adopted: 0, pushed: 0, created: 0, added: 0, evicted: 0, expired: 0, emptied: 0, rows: 0 };
     if (!await this.isSignedIn()) { this.rows.clear(); return result; }
     result.signedIn = true;
     try {
@@ -353,7 +398,8 @@ export class CredentialSync {
         const row = this._rowFor(account);
         const broken = isInError(account);
         if (!row) {
-          if (broken) continue; // a dead token is not stored for the others to pick up
+          // Neither a dead token nor an untried one is stored for the others to pick up.
+          if (broken || !isAccessed(account)) continue;
           await this._create(account, this._tokens(account));
           result.created++;
           continue;
@@ -368,29 +414,28 @@ export class CredentialSync {
           continue;
         }
         if (broken) {
-          // Read only: never written over with what this install holds.
+          // Never written over with what this install holds — but a row still
+          // holding the rejected token is emptied, so no install takes it.
           if (revives(row.blob, account)) {
             this._adopt(account, /** @type {Blob} */ (row.blob), `sync (${reason}), replacing a rejected token`);
             result.adopted++;
+          } else if (holdsRejectedToken(row.blob, account) && await this._markNeedsSignIn(account, row)) {
+            result.emptied++;
           }
           continue;
         }
         if (supersedes(row.blob, account)) {
           this._adopt(account, /** @type {Blob} */ (row.blob), `sync (${reason})`);
           result.adopted++;
-        } else if (row.blob && (row.blob.expiresAt < (Number(account.expiresAt) || 0) || !row.blob.refreshToken)) {
-          await this._patch(row, account, this._tokens(account));
-          result.pushed++;
-        } else if (!row.blob) {
-          // Ours by key but unreadable (an older or newer format): rewritten
-          // with what this install holds, which is the one copy it can vouch for.
+        } else if (isAccessed(account) && this._isAhead(row, account)) {
           await this._patch(row, account, this._tokens(account));
           result.pushed++;
         }
       }
 
       for (const row of this.rows.values()) {
-        if (matched.has(row.key) || !row.blob) continue;
+        // An emptied row names an account that needs a sign-in: nothing to add.
+        if (matched.has(row.key) || !row.blob || needsSignIn(row.blob)) continue;
         // Matched above by identity, so a row left over names an account this
         // install does not have.
         if (this.am.accounts.some((a) => sameIdentity(a, row.blob))) continue;
@@ -402,8 +447,8 @@ export class CredentialSync {
       }
       this.lastSyncAt = this.now();
       this.lastError = null;
-      if (result.adopted || result.pushed || result.created || result.added || result.evicted || result.expired) {
-        this.log(`[TeamClaude] callback.net sync (${reason}): ${result.adopted} adopted, ${result.pushed} updated, ${result.created} stored, ${result.added} added, ${result.evicted} removed, ${result.expired} tombstones expired`);
+      if (result.adopted || result.pushed || result.created || result.added || result.evicted || result.expired || result.emptied) {
+        this.log(`[TeamClaude] callback.net sync (${reason}): ${result.adopted} adopted, ${result.pushed} updated, ${result.created} stored, ${result.added} added, ${result.evicted} removed, ${result.expired} tombstones expired, ${result.emptied} emptied`);
       }
       return result;
     } catch (/** @type {any} */ err) {
@@ -411,6 +456,18 @@ export class CredentialSync {
       this.log(`[TeamClaude] callback.net sync (${reason}) failed: ${this.lastError}`);
       throw err;
     }
+  }
+
+  /**
+   * Whether a row should take what an account holds: its token is newer, or
+   * the row is ours by key but unreadable (an older or newer format), and this
+   * install's copy is the one it can vouch for.
+   * @param {Row} row
+   * @param {Record<string, any>} account
+   */
+  _isAhead(row, account) {
+    if (!row.blob) return true;
+    return row.blob.expiresAt < (Number(account.expiresAt) || 0) || !row.blob.refreshToken;
   }
 
   /** @param {Record<string, any>} account @returns {Tokens} */
@@ -474,17 +531,44 @@ export class CredentialSync {
     const account = this.am.accounts[index];
     if (!account || !syncKeyFor(account) || !tokens?.accessToken || !tokens?.refreshToken) return;
     // A re-import of a rejected refresh token, say: nothing the others can use.
-    if (isInError(account)) return;
+    // Nor are tokens this launch has not seen work (see isAccessed).
+    if (isInError(account) || !isAccessed(account)) return;
     if (!await this.isSignedIn()) return;
     try {
       const row = this._rowFor(account);
       if (row?.deletedAt != null) return; // removed elsewhere; a refresh does not bring it back, a sign-in (storeSignIn) does
       if (row?.blob && row.blob.accessToken === tokens.accessToken) return;
-      if (row?.blob && row.blob.expiresAt > tokens.expiresAt) return; // the store is ahead; the next pass brings it here
+      // The store is ahead; the next pass brings it here. An emptied row is
+      // never ahead: any working token replaces it.
+      if (row?.blob && !needsSignIn(row.blob) && row.blob.expiresAt > tokens.expiresAt) return;
       if (row) await this._patch(row, account, tokens);
       else await this._create(account, tokens);
     } catch (/** @type {any} */ err) {
       this.log(`[TeamClaude] callback.net: could not store the new token for "${safeLine(account.name, 64)}": ${safeLine(err?.message || String(err), 160)}`);
+    }
+  }
+
+  /**
+   * An account's token just worked here for the first time since launch (or
+   * since it last came from elsewhere): what the pass held back for it is
+   * written now — its row created, or updated when this install is ahead.
+   * Resolves with whether the store was written.
+   * @param {Record<string, any>} account
+   * @returns {Promise<boolean>}
+   */
+  async onAccountAccessed(account) {
+    if (!syncKeyFor(account) || !isAccessed(account) || isInError(account)) return false;
+    if (!await this.isSignedIn()) return false;
+    try {
+      if (!this.rows.size) this.rows = await this._list();
+      const row = this._rowFor(account);
+      if (!row) return !!await this._create(account, this._tokens(account));
+      if (row.deletedAt != null || supersedes(row.blob, account) || !this._isAhead(row, account)) return false;
+      await this._patch(row, account, this._tokens(account));
+      return true;
+    } catch (/** @type {any} */ err) {
+      this.log(`[TeamClaude] callback.net: could not store "${safeLine(account.name, 64)}": ${safeLine(err?.message || String(err), 160)}`);
+      return false;
     }
   }
 
@@ -506,13 +590,64 @@ export class CredentialSync {
       this.rows.set(row.key, row);
       // Removed elsewhere: the next pass takes it out. Recovered meanwhile (a
       // reload, an import): nothing to do.
-      if (row.deletedAt != null || !isInError(account) || !revives(row.blob, account)) return false;
+      if (row.deletedAt != null || !isInError(account)) return false;
       if (!this.am.accounts.includes(/** @type {any} */ (account))) return false;
-      this._adopt(account, /** @type {Blob} */ (row.blob), 'its own token was rejected');
-      return true;
+      if (revives(row.blob, account)) {
+        this._adopt(account, /** @type {Blob} */ (row.blob), 'its own token was rejected');
+        return true;
+      }
+      // The store holds the very token just rejected: empty it, so no other
+      // install takes it, and wait for one with a working token to write.
+      if (holdsRejectedToken(row.blob, account)) await this._markNeedsSignIn(account, row);
+      return false;
     } catch (/** @type {any} */ err) {
       this.log(`[TeamClaude] callback.net: could not look for a newer token for "${safeLine(account.name, 64)}": ${safeLine(err?.message || String(err), 160)}`);
       return false;
+    }
+  }
+
+  /**
+   * Empty a row holding the refresh token upstream rejected here: its refresh
+   * token becomes "" (see needsSignIn). Under the row's lock, and only if the
+   * row as the lock returns it still holds that token — another install may be
+   * renewing, or have stored a working token since, and that is never touched.
+   * A token the locked row holds that is not the dead one is adopted. Resolves
+   * with whether the row was emptied.
+   * @param {Record<string, any>} account
+   * @param {Row} row
+   * @returns {Promise<boolean>}
+   */
+  async _markNeedsSignIn(account, row) {
+    const name = safeLine(account.name, 64);
+    const leaseStart = this.now();
+    let locked;
+    try {
+      locked = await this.api('POST', `User/Credential/${row.id}:lock`, { timeout: LOCK_TIMEOUT_S });
+    } catch (/** @type {any} */ err) {
+      // Locked: another install is renewing, and what it stores settles it.
+      // Anything else: the row is left as it is, and the next pass tries again.
+      if (err?.token !== 'error_credential_locked') this.log(`[TeamClaude] callback.net: could not lock "${name}" to mark it as needing a sign-in: ${safeLine(err?.message || String(err), 120)}`);
+      return false;
+    }
+    const leaseEnd = leaseStart + LOCK_TIMEOUT_S * 1000 - LEASE_SAFETY_MS;
+    try {
+      const current = rowOf({ ...locked, Data: locked?.Data ?? '' });
+      this.rows.set(current.key, current);
+      if (current.deletedAt != null || !holdsRejectedToken(current.blob, account)) {
+        if (current.deletedAt == null && revives(current.blob, account) && this.am.accounts.includes(/** @type {any} */ (account))) {
+          this._adopt(account, /** @type {Blob} */ (current.blob), 'stored while its own token was being rejected');
+        }
+        return false;
+      }
+      const blob = /** @type {Blob} */ (current.blob);
+      await this._patch(current, account, { accessToken: blob.accessToken, refreshToken: '', expiresAt: blob.expiresAt });
+      this.log(`[TeamClaude] Account "${name}": its token on callback.net was rejected; emptied it there, so it waits for a sign-in or an install with a working token`);
+      return true;
+    } catch (/** @type {any} */ err) {
+      this.log(`[TeamClaude] callback.net: could not mark "${name}" as needing a sign-in: ${safeLine(err?.message || String(err), 120)}`);
+      return false;
+    } finally {
+      await this._unlock(row, leaseEnd);
     }
   }
 
@@ -698,8 +833,10 @@ export class CredentialSync {
     if (row) return row;
     this.rows = await this._list();
     row = find();
-    // A dead token is not stored for the others to pick up (see isInError).
-    if (row || !keyed || isInError(account)) return row;
+    // A dead token is not stored for the others to pick up (see isInError),
+    // nor an untried one (isAccessed): renewed without a lock, which no other
+    // install can need, and stored once the renewal proves it.
+    if (row || !keyed || isInError(account) || !isAccessed(account)) return row;
     // First here: stored as it stands, then locked like any other. Created by
     // another install meanwhile, theirs is the row — which a create racing it
     // on the live API can also learn as a plain database error, not only as
