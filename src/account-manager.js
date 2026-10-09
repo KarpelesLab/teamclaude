@@ -4809,9 +4809,11 @@ export class AccountManager {
         // same, below, and is persisted the same. Or with nothing: the token
         // is still good and another install is renewing it, so this one keeps
         // what it has and asks again on the next request.
-        const refresh = () => (providerOf(account) === 'codex'
-          ? this._codexRefreshFn(sent, undefined, account.routing || null)
-          : this._refreshFn(sent, undefined, account.routing || null));
+        // `budgetMs`: how long the grant may take, from the coordinator holding
+        // a lock that lapses (credential-sync.js); none means the default.
+        const refresh = (/** @type {{ budgetMs?: number }} */ opts = {}) => (providerOf(account) === 'codex'
+          ? this._codexRefreshFn(sent, undefined, account.routing || null, opts)
+          : this._refreshFn(sent, undefined, account.routing || null, opts));
         const newTokens = await this._refreshCoordinator(account, refresh, { force });
         if (newTokens == null) return;
         if (account.refreshToken !== sent) {

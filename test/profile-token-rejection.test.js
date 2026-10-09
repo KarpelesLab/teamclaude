@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { fetchProfile, profileForCredentials } from '../src/oauth.js';
+import { fetchProfile, profileForCredentials, refreshAccessToken } from '../src/oauth.js';
 import { canUpsertOAuthAccount, isTokenRejection } from '../src/identity.js';
 import { setUpstreamProxy, resolveUpstreamProxy, resetUpstreamProxy } from '../src/upstream-proxy.js';
 
@@ -204,4 +204,28 @@ test('a 403 is not refreshed and not refused', async () => {
   assert.equal(profile.status, 403);
   assert.equal(isTokenRejection(profile), false);
   assert.equal(canUpsertOAuthAccount(profile, true), true);
+});
+
+// The renewal an import needs is the caller's to make: index.js puts it behind
+// the callback.net lock, since the token may be one other installs hold.
+test('the renewal an import needs goes through the renew the caller hands in', async () => {
+  const up = upstream({ profiles: { 'at-new': identified } });
+  const creds = { accessToken: 'at-old', refreshToken: 'rt-old', expiresAt: Date.now() - 1000 };
+  const asked = [];
+  const renew = async (c) => { asked.push(c.refreshToken); return { accessToken: 'at-new', refreshToken: 'rt-new', expiresAt: Date.now() + 3600_000 }; };
+  const { creds: saved, profile } = await withFetch(up.fetch, () => profileForCredentials(creds, null, { renew }));
+  assert.deepEqual(asked, ['rt-old']);
+  assert.deepEqual(up.refreshes(), [], 'the token endpoint was not called directly');
+  assert.equal(saved.accessToken, 'at-new');
+  assert.equal(profile.error, undefined);
+});
+
+// Under a lock that lapses, the grant may not go out once its time is spent.
+test('a refresh with its budget spent is never sent, and a retry is not sent past it', async () => {
+  const up = upstream({ refresh: () => reply(503, {}) });
+  await assert.rejects(withFetch(up.fetch, () => refreshAccessToken('rt-x', undefined, null, { budgetMs: 0 })), /ran out of time/);
+  assert.equal(up.refreshes().length, 0);
+  // 5xx is retried after 500ms; a 200ms budget allows the first attempt only.
+  await assert.rejects(withFetch(up.fetch, () => refreshAccessToken('rt-x', undefined, null, { budgetMs: 200 })));
+  assert.equal(up.refreshes().length, 1);
 });
