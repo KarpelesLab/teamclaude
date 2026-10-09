@@ -13,8 +13,9 @@
 // - A TOKEN REFRESH goes through the row's advisory lock, so only one install
 //   renews a token the others then adopt — a refresh rotates the token family,
 //   and two installs renewing one account at once would each kill the other's
-//   copy. Lock taken: adopt the row's token if it is already newer, else renew,
-//   PATCH, unlock. Lock refused: another install is renewing. A token that is
+//   copy. Lock taken: the lock answers with the row as it stands, and tokens
+//   there other than ours are adopted (see heldElsewhere), else renew, PATCH,
+//   unlock. Lock refused: another install is renewing. A token that is
 //   still good (the refresh runs five minutes ahead of expiry) is simply kept,
 //   and the next request asks again; one that has expired, or that upstream
 //   just rejected, waits — re-reading every 5s for 30s and adopting what the
@@ -182,6 +183,26 @@ function supersedes(/** @type {Blob|null} */ blob, /** @type {Record<string, any
   if (!blob) return false;
   if (blob.accessToken === account.credential && blob.refreshToken === account.refreshToken) return false;
   return blob.expiresAt > (Number(account.expiresAt) || 0);
+}
+
+/**
+ * Whether a row read under the lock (or while another install holds it)
+ * carries tokens this install should take instead of renewing its own. The
+ * lock is what orders renewals, so a row holding tokens other than ours was
+ * written by another install since we last took ours, and ours are the stale
+ * copy — expiry does not enter into it: another install's clock, or a sign-in
+ * there, can stamp a renewal with an earlier expiresAt than the token it
+ * rotated away. The one exception is a row this install wrote itself with an
+ * older token than it now holds: its own renewal whose PATCH did not land, and
+ * taking that back would revive a refresh token it already rotated.
+ * @param {Blob|null} blob
+ * @param {Record<string, any>} account
+ * @param {string} by  this install's name, as it signs the rows it writes
+ */
+function heldElsewhere(blob, account, by) {
+  if (!blob) return false;
+  if (blob.accessToken === account.credential && blob.refreshToken === account.refreshToken) return false;
+  return !(blob.by === by && blob.expiresAt < (Number(account.expiresAt) || 0));
 }
 
 /**
@@ -577,7 +598,7 @@ export class CredentialSync {
           let r;
           try { r = rowOf(await this.api('GET', `User/Credential/${row.id}`)); } catch { continue; }
           this.rows.set(r.key, r);
-          if (supersedes(r.blob, account)) {
+          if (heldElsewhere(r.blob, account, this.by)) {
             this.log(`[TeamClaude] Account "${name}": renewed on ${safeLine(/** @type {Blob} */ (r.blob).by, 48)} while this install waited`);
             return tokensOf(/** @type {Blob} */ (r.blob));
           }
@@ -595,7 +616,7 @@ export class CredentialSync {
         this.sync('tombstone').catch(() => {});
         return refresh();
       }
-      if (supersedes(current.blob, account)) {
+      if (heldElsewhere(current.blob, account, this.by)) {
         await this._unlock(row);
         this.log(`[TeamClaude] Account "${name}": already renewed on ${safeLine(/** @type {Blob} */ (current.blob).by, 48)}; taking that token`);
         return tokensOf(/** @type {Blob} */ (current.blob));

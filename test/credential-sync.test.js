@@ -383,6 +383,37 @@ test('lock taken but the row already renewed: the other install\'s token is adop
   assert.ok(logs.some((l) => /already renewed on office; taking that token/.test(l)), logs.join('\n'));
 });
 
+test('lock taken and the row holds other tokens with an earlier expiry: still adopted, no refresh is sent', async () => {
+  // Another install renewed, but its clock (or a sign-in there) stamped an
+  // expiry earlier than the one this install holds. Under the lock, a
+  // different token is the other install's renewal, and ours the stale copy.
+  const { sync, am, store, refreshed } = setup([claude('a')]);
+  await sync.sync();
+  const row = store.byKey(syncKeyFor(am.accounts[0]));
+  const renewed = { ...am.accounts[0], credential: 'at-a-office', refreshToken: 'rt-a-office', expiresAt: T0 + 7 * H };
+  row.Data = JSON.stringify(encodeBlob(renewed, tokensOf(renewed), { now: T0 + H, by: 'office' }));
+  await am.ensureTokenFresh(0, true);
+  assert.deepEqual(refreshed, [], 'the provider was not asked');
+  assert.equal(am.accounts[0].credential, 'at-a-office');
+  assert.equal(am.accounts[0].refreshToken, 'rt-a-office');
+  assert.equal(row.Locked, null, 'released');
+});
+
+test('lock taken and the row is this install\'s own older write: renewed, not taken back', async () => {
+  // This install renewed but its PATCH never landed: the row still holds the
+  // token it rotated away, signed by this install. Taking it would revive a
+  // dead refresh token.
+  const { sync, am, store, refreshed } = setup([claude('a')]);
+  await sync.sync();
+  const row = store.byKey(syncKeyFor(am.accounts[0]));
+  const older = { ...am.accounts[0], credential: 'at-a-0', refreshToken: 'rt-a-0', expiresAt: T0 };
+  row.Data = JSON.stringify(encodeBlob(older, tokensOf(older), { now: T0 - 8 * H, by: 'this-box' }));
+  await am.ensureTokenFresh(0, true);
+  assert.deepEqual(refreshed, ['rt-a-1']);
+  assert.equal(am.accounts[0].credential, 'rt-a-1-renewed-at');
+  assert.equal(store.blob(syncKeyFor(am.accounts[0])).accessToken, 'rt-a-1-renewed-at');
+});
+
 test('lock refused: wait, re-read every 5s, adopt what the holder stores', async () => {
   const { sync, am, store, refreshed, sleeps } = setup([claude('a')]);
   await sync.sync();
