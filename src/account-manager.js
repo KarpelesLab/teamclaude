@@ -138,6 +138,10 @@ const PERSISTED_QUOTA_FIELDS = [
   // would draw Ses/Wk until its first reading and then snap to one wide
   // weekly bar — the startup flicker the TUI rule is written to avoid.
   'sessionWindowStated',
+  // Whether the last Claude reading that stated a shared window stated a
+  // weekly one (see updateQuota). The same kind of fact: a plan with no shared
+  // weekly window must not be re-discovered as an unknown after every restart.
+  'weeklyWindowStated',
 ];
 
 // The family (Fable/Sonnet) weekly buckets and the field holding when each was
@@ -196,6 +200,9 @@ function emptyQuota() {
     unified7dSonnetSeenAt: null,
     unified7dFableSeenAt: null,
     unifiedStatus: null,        // allowed | allowed_warning | rejected
+    // Whether the plan meters a shared weekly window: null until a reading
+    // states the shared windows (see updateQuota), false for a plan without one.
+    weeklyWindowStated: /** @type {boolean|null} */ (null),
     // Normalized reading from a third-party backend (see backend-quota.js).
     // { label, text, utilization, at, windows? } — nothing here knows which
     // provider. windows feeds the fiveHour/weeklyShared/monthly buckets of
@@ -1867,7 +1874,9 @@ export class AccountManager {
       // Soonest weekly reset breaks a tie, matching the rest of selection: on
       // an idle fleet every candidate scores identically, and without this the
       // winner would be array order.
-      const reset = this._governingWeeklyReset(c.account, model) || -Infinity;
+      const reset = this._weeklyWindowAbsent(c.account, model)
+        ? Infinity
+        : this._governingWeeklyReset(c.account, model) || -Infinity;
       if (score > bestScore || (score === bestScore && reset < bestReset)) {
         best = c.account;
         bestScore = score;
@@ -2998,6 +3007,20 @@ export class AccountManager {
   }
 
   /**
+   * True when the window governing `model` here reports nothing because the
+   * plan has none, not because nobody has read it: the account stated its
+   * shared windows without a weekly one, and no family or scoped bucket governs
+   * this model. Such a window never resets and nothing in it expires, so it is
+   * not a discovery candidate: using it would never make it known.
+   * @param {Record<string, any>} account
+   * @param {string|null} model
+   */
+  _weeklyWindowAbsent(account, model) {
+    return account.quota.weeklyWindowStated === false
+      && this._governingWindow(account, model).utilization == null;
+  }
+
+  /**
    * The same order, before the unknown-sorts-first coercion. The session-reset
    * switch needs the order and not the coercion: it treats an account whose
    * weekly it has never read as ineligible rather than as the soonest, the
@@ -3006,6 +3029,9 @@ export class AccountManager {
    * known here", never "resets at the epoch".
    */
   _rankingReset(account, model) {
+    // A window the plan does not have resets never: after every real reset,
+    // and never "unknown", which the session-reset switch would read as probing.
+    if (this._weeklyWindowAbsent(account, model)) return Infinity;
     if (!this.expiryRouting.enabled) return this._governingWeeklyReset(account, model);
     return this._governingWindow(account, model).resetAt ?? null;
   }
@@ -3070,6 +3096,7 @@ export class AccountManager {
           // as a window nobody has reported yet, which wants a different action.
           utilization: typeof used === 'number' ? used : (used == null ? null : NaN),
           resetAt: typeof reset === 'number' && reset ? reset : null,
+          windowAbsent: this._weeklyWindowAbsent(a, model),
         };
       }),
     };
@@ -4224,6 +4251,12 @@ export class AccountManager {
       account.quota.unified7dSeenAt = Date.now();
       observed.add('unified7d');
     }
+    // Whether this plan meters a shared weekly window at all, kept apart from
+    // the reading for the reason sessionWindowStated is: the reading is nulled
+    // at every weekly reset. A response that states the 5-hour window and no
+    // 7-day one is how a plan without a shared weekly reads (a Team seat).
+    if (!isNaN(u7d)) account.quota.weeklyWindowStated = true;
+    else if (!isNaN(u5h)) account.quota.weeklyWindowStated = false;
 
     // A reset that does not parse is treated as absent, never stored: parseInt
     // of a non-numeric value is NaN, and `now >= NaN` is false forever, so a
@@ -4544,6 +4577,9 @@ export class AccountManager {
       }
       if (usage.sevenDay.resetAt != null) q.unified7dReset = usage.sevenDay.resetAt;
     }
+    // The same fact the header path records, from the whole payload at once.
+    if (usage.sevenDay?.utilization != null) q.weeklyWindowStated = true;
+    else if (usage.fiveHour?.utilization != null) q.weeklyWindowStated = false;
 
     // The family buckets carry a "last confirmed" stamp (see _clearExpiredQuotas).
     // A probe is upstream evidence just like a response header, so it refreshes

@@ -17,7 +17,7 @@ const WEEKLY_WINDOW_SECONDS = 7 * 24 * 3600;
  * Why an account has no comparable pressure. Each names an upstream state
  * rather than a failure, so a caller branches on a value rather than a message.
  *
- * @typedef {'no-utilization' | 'no-reset' | 'utilization-not-finite'
+ * @typedef {'no-utilization' | 'no-window' | 'no-reset' | 'utilization-not-finite'
  *         | 'expiry-routing-off'} AbsentReason
  */
 
@@ -34,8 +34,11 @@ const WEEKLY_WINDOW_SECONDS = 7 * 24 * 3600;
  * One account as the decision sees it, deliberately not an account object: the
  * decision layer cannot reach anything it was not handed.
  *
+ * `windowAbsent` says a null utilization is the plan having no such window,
+ * as stated by the account's own readings, rather than nobody having read it.
+ *
  * @typedef {{ index: number, priority: number, utilization: number | null,
- *             resetAt: number | null }} BandAccount
+ *             resetAt: number | null, windowAbsent?: boolean }} BandAccount
  */
 
 /**
@@ -76,7 +79,9 @@ export function assertNever(value, context) {
  * @returns {Pressure}
  */
 export function pressureOf(account, now) {
-  if (account.utilization == null) return { kind: 'absent', reason: 'no-utilization' };
+  if (account.utilization == null) {
+    return { kind: 'absent', reason: account.windowAbsent ? 'no-window' : 'no-utilization' };
+  }
   // Ahead of the reset check, so that `no-reset` means the utilization is known
   // and only the clock is missing: the whole basis on which it is rankable.
   // Clamping a non-finite utilization would read as 0, a completely unspent
@@ -119,7 +124,10 @@ function spendableFraction(utilization) {
 export function pressureRank(pressure) {
   switch (pressure.kind) {
     case 'known': return -pressure.value;
-    case 'absent': return pressure.lowerBound == null ? -Infinity : -pressure.lowerBound;
+    // No window, nothing expiring in it: it sorts after every measured account.
+    case 'absent':
+      if (pressure.reason === 'no-window') return Infinity;
+      return pressure.lowerBound == null ? -Infinity : -pressure.lowerBound;
     default: return assertNever(pressure, 'pressureRank');
   }
 }

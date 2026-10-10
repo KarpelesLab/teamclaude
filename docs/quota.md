@@ -6,6 +6,8 @@ How TeamClaude learns each account's quota, the two optional background jobs, an
 
 TeamClaude is **passive** by default: it reads `anthropic-ratelimit-unified-*` headers off the responses that flow through it. An account that hasn't served a request yet shows unknown quota until rotation first reaches it.
 
+A plan without a shared weekly window (a Team seat) never sends the 7-day reading, which would otherwise look unknown forever. The first response or [probe](#quota-probe) that states the five-hour window without a 7-day one records that the plan has none, and [routing](routing.md#choosing-an-account) ranks such an account after the ones that do. The record is persisted, a weekly reset does not clear it, and the next reading that carries a 7-day window flips it back.
+
 Observed quota is persisted to `teamclaude.state.json` next to the config, so rotation state survives a restart. Stale windows are discarded automatically, and the file is safe to delete — quota is simply re-learned from traffic.
 
 ## Fleet quota endpoint
