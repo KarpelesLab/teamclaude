@@ -10,6 +10,7 @@ import { ROLLOVER_MIN_JUMP_MS, remapHeld, findHeld, dropHeld, newObservation } f
 import { decideBand, pressureOf, pressureRank, assertNever } from './band-decision.js';
 import { BurnRateLearner, ConcurrencyLearner, scoreCandidate } from './adaptive-distribution.js';
 import { OutsideSpendTracker, OUTSIDE_SPEND_STATES, OUTSIDE_SPEND_SETTLE_MS, outsideSpendKey } from './outside-spend.js';
+import { forecastWindow } from './forecast.js';
 import { safeLine } from './safe-text.js';
 import { parseRoutingUrl, describeRouting, routingToUrl, isRoutingFailure } from './account-routing.js';
 import { isSelfProxy } from './upstream-proxy.js';
@@ -4420,6 +4421,60 @@ export class AccountManager {
   }
 
   /**
+   * `quota.forecast` for status: `{ [bucket]: { ratePerHour, threshold,
+   * reachesThresholdAt, resetAt } }`, one entry per weekly window the account
+   * reports, keyed like `quota.outsideSpend` (#475). In every distribution
+   * mode: the learner runs in all of them, and this only reads it.
+   * @param {Record<string, any>} account
+   * @param {number} [now]
+   */
+  forecastStatus(account, now = Date.now()) {
+    /** @type {Record<string, any>} */
+    const q = account.quota || {};
+    /** @type {Record<string, import('./forecast.js').ForecastView>} */
+    const out = {};
+    /**
+     * @param {string} key  the window's status key
+     * @param {number} utilization
+     * @param {number|null} resetAt
+     * @param {string[]} learnerBuckets  where the learner may hold its rate, in order
+     */
+    const add = (key, utilization, resetAt, learnerBuckets) => {
+      const safeKey = safeLine(key, 64);
+      if (out[safeKey]) return;
+      let ratePerMs = null;
+      for (const b of learnerBuckets) {
+        ratePerMs = this.burnRateLearner.learnedRate(account.index, b);
+        if (ratePerMs != null) break;
+      }
+      // A scoped family with no dedicated field is gated against the shared
+      // weekly's threshold (_governingWeekly + _isNearQuota): `scoped:*` is
+      // not a threshold key, so asking for it would always read `default`.
+      const thresholdKey = key.startsWith('scoped:') ? 'unified7d' : key;
+      // When the reading was taken: the dedicated fields stamp it, a scoped
+      // bucket does not, and the learner saw it on the same fresh-reading path.
+      let seenAt = q[`${key}SeenAt`] ?? null;
+      for (const b of learnerBuckets) {
+        if (seenAt != null) break;
+        seenAt = this.burnRateLearner.lastReadingAt(account.index, b);
+      }
+      out[safeKey] = forecastWindow({ utilization, threshold: this.thresholdFor(thresholdKey, account), ratePerMs, resetAt, seenAt, now });
+    };
+    // A probe reports Fable and Sonnet both as the dedicated field and in
+    // scopedWeekly; the learner may have learned either, so both are asked.
+    for (const [key, family] of /** @type {const} */ ([['unified7d', null], ['unified7dFable', 'fable'], ['unified7dSonnet', 'sonnet']])) {
+      if (q[key] == null) continue;
+      add(key, q[key], q[`${key}Reset`] ?? null, family ? [key, `scoped:${family}`] : [key]);
+    }
+    for (const [family, bucket] of Object.entries(q.scopedWeekly || {})) {
+      if (bucket?.utilization == null) continue;
+      const key = outsideSpendKey(`scoped:${family}`);
+      add(key, bucket.utilization, bucket.resetAt ?? null, key === `scoped:${family}` ? [key] : [key, `scoped:${family}`]);
+    }
+    return out;
+  }
+
+  /**
    * Feed only weekly windows refreshed by this response to the burn learner.
    *
    * Called from all three paths that learn a utilization — response headers
@@ -5218,7 +5273,7 @@ export class AccountManager {
         // Omitted rather than sent empty when the account carries none, so the
         // renderer's "is there a breakdown" test stays a plain truthiness check.
         sessionsByBucket: sessions.perAccountBucket?.[a.index] || null,
-        quota: { ...a.quota, outsideSpend: this.outsideSpendStatus(a) },
+        quota: { ...a.quota, outsideSpend: this.outsideSpendStatus(a), forecast: this.forecastStatus(a) },
         // `byBucket` is the one nested value under `usage`, so the shallow copy
         // that covers every flat counter beside it would hand the caller a live
         // reference into the account, leaving the payload half snapshot and half

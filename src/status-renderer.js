@@ -80,6 +80,8 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
     if (resetCredits) lines.push(`  ${resetCredits}`);
     const outside = outsideSpendText(account.quota?.outsideSpend);
     if (outside) lines.push(`  ${paint.dim('Outside'.padEnd(8))} ${outside}`);
+    const forecast = forecastText(account.quota?.forecast, now);
+    if (forecast) lines.push(`  ${paint.dim('Forecast'.padEnd(8))} ${forecast}`);
     lines.push(`  ${paint.dim('Usage'.padEnd(8))} ${formatUsage(account.usage, now)}`);
     lines.push(`  ${paint.dim('Probe'.padEnd(8))} ${formatAccountProbe(nameText(account.name), probe, now, paint)}`);
     const adaptive = adaptiveFor(status, nameText(account.name));
@@ -238,6 +240,65 @@ export function outsideSpendText(outsideSpend) {
     return label + ': not observed (quota probe off?)';
   });
   return parts.join(' \u00b7 ');
+}
+
+/**
+ * The burn-rate forecast for one account, or null when there is nothing to
+ * warn about (#475). One phrase per weekly window that, at the learned rate,
+ * reaches its switch threshold before it resets:
+ *
+ *   "week reaches 98% in ~31h, resets in 52h"
+ *   "Fable week reaches 95% in ~5h, resets in 2d4h"
+ *
+ * A window that resets first is the good case and gets no sentence; so does a
+ * window the learner has no rate for yet. A window with no known reset still
+ * gets the first half, since nothing says it resets first.
+ *
+ * Pure and closure-free on purpose, like outsideSpendText: the dashboard
+ * serializes it into its page with toString().
+ *
+ * @param {Record<string, {ratePerHour?: number|null, threshold?: number, reachesThresholdAt?: number|null, resetAt?: number|null}>|null|undefined} forecast
+ * @param {number} now  ms epoch
+ * @returns {string|null}
+ */
+export function forecastText(forecast, now) {
+  var f = forecast || {};
+  /** @param {number} ms */
+  var dur = function (ms) {
+    var minutes = Math.max(1, Math.round(ms / 60000));
+    if (minutes < 60) return minutes + 'm';
+    var hours = Math.round(minutes / 60);
+    if (hours < 48) return hours + 'h';
+    var days = Math.floor(hours / 24);
+    var rem = hours % 24;
+    return rem ? days + 'd' + rem + 'h' : days + 'd';
+  };
+  var keys = Object.keys(f).sort(function (a, b) {
+    if (a === 'unified7d') return -1;
+    if (b === 'unified7d') return 1;
+    return a < b ? -1 : a > b ? 1 : 0;
+  });
+  var parts = [];
+  for (var i = 0; i < keys.length; i++) {
+    var key = keys[i];
+    var v = f[key] || {};
+    var at = v.reachesThresholdAt;
+    if (typeof at !== 'number' || !(at > now)) continue;
+    var reset = typeof v.resetAt === 'number' && v.resetAt > now ? v.resetAt : null;
+    if (reset != null && at >= reset) continue;
+    var family = key === 'unified7d' ? ''
+      : key === 'unified7dFable' ? 'fable'
+      : key === 'unified7dSonnet' ? 'sonnet'
+      : key.indexOf('scoped:') === 0 ? key.slice(7) : key;
+    var label = family ? family.charAt(0).toUpperCase() + family.slice(1) + ' week' : 'week';
+    var pct = typeof v.threshold === 'number' ? Math.round(v.threshold * 100) + '%' : 'its threshold';
+    var reach = dur(at - now);
+    var resetText = reset != null ? dur(reset - now) : null;
+    // Rounded separately, the two can print alike; the threshold still comes first.
+    parts.push(label + ' reaches ' + pct + ' in ~' + reach
+      + (resetText == null ? '' : resetText === reach ? ', just before it resets' : ', resets in ' + resetText));
+  }
+  return parts.length ? parts.join(' \u00b7 ') : null;
 }
 
 /**
