@@ -102,6 +102,62 @@ test('the arranged order breaks ties', () => {
   assert.deepEqual(shown(tui), ['bravo', 'alpha', 'charlie']);
 });
 
+// A backend account's windows live in quota.backend, not the unified fields;
+// sorting by reset must read the same value the row draws.
+test('session and weekly sorts read a backend window reset too', () => {
+  const now = Date.now();
+  const { tui, am } = makeTUI({
+    accountSort: 'session-reset',
+    resets: { alpha: now + 3 * DAY, bravo: now + 5 * DAY },
+    quotas: { alpha: { unified5h: 0.4, unified5hReset: now + 4 * HOUR }, bravo: { unified5h: 0.4, unified5hReset: now + HOUR } },
+  });
+  am.accounts.push({ index: 3, id: 'entry-kimi', name: 'kimi', type: 'apikey', credential: 'k', provider: undefined, priority: 0, displayOrder: null, upstream: 'https://api.kimi.com/coding',
+    quota: { unified7d: null, unified7dReset: null, backend: { label: 'Plan', text: 'x', utilization: 0.5, at: now, windows: { fiveHour: { utilization: 0.5, resetAt: now + 2 * HOUR }, weekly: { utilization: 0.1, resetAt: now + 2 * DAY } } } } });
+  assert.deepEqual(shown(tui), ['bravo', 'kimi', 'alpha', 'charlie']);
+
+  // Same for the weekly sort: alpha 3d, kimi 2d, bravo 5d.
+  tui.config.accountSort = 'weekly-reset';
+  assert.deepEqual(shown(tui), ['kimi', 'alpha', 'bravo', 'charlie']);
+
+  // A plan with no weekly window shows its monthly reset in the Wk slot, and
+  // the sort reads the same value.
+  am.accounts.find(a => a.name === 'kimi').quota.backend.windows = {
+    fiveHour: { utilization: 0.5, resetAt: now + 2 * HOUR },
+    monthly: { utilization: 0.1, resetAt: now + 2 * DAY },
+  };
+  assert.deepEqual(shown(tui), ['kimi', 'alpha', 'bravo', 'charlie']);
+
+  // The row hides a stale weekly window and draws the monthly one; the sort
+  // reads the same value, not the stale one.
+  am.accounts.find(a => a.name === 'kimi').quota.backend.windows = {
+    weekly: { utilization: 0.1, resetAt: now - 1000 },
+    monthly: { utilization: 0.1, resetAt: now + DAY },
+  };
+  assert.deepEqual(shown(tui), ['kimi', 'alpha', 'bravo', 'charlie']);
+
+  // A live weekly window without a reset (an idle z.ai one) is not a monthly
+  // reading either: the row draws it in the Wk slot, and the sort has nothing
+  // to order by.
+  am.accounts.find(a => a.name === 'kimi').quota.backend.windows = {
+    weekly: { utilization: 0.1, resetAt: null },
+    monthly: { utilization: 0.1, resetAt: now + DAY },
+  };
+  assert.deepEqual(shown(tui), ['alpha', 'bravo', 'charlie', 'kimi']);
+});
+
+// A backend row has no Sonnet/Fable buckets, so the family sorts read its
+// probed weekly window — the same value the Wk slot draws.
+test('family sorts fall back to a backend weekly window like to the all-models weekly', () => {
+  const now = Date.now();
+  const { tui, am } = makeTUI({
+    accountSort: 'sonnet-reset',
+    resets: { alpha: now + DAY, bravo: now + 5 * DAY, charlie: null },
+  });
+  am.accounts.push({ index: 3, id: 'entry-kimi', name: 'kimi', type: 'apikey', credential: 'k', provider: undefined, priority: 0, displayOrder: null, upstream: 'https://api.kimi.com/coding',
+    quota: { unified7d: null, unified7dReset: null, backend: { label: 'Plan', text: 'x', utilization: 0.5, at: now, windows: { weekly: { utilization: 0.1, resetAt: now + 2 * DAY } } } } });
+  assert.deepEqual(shown(tui), ['alpha', 'kimi', 'bravo', 'charlie']);
+});
+
 test('session reset lists the soonest five-hour reset first, and an unopened window last', () => {
   const now = Date.now();
   const { tui } = makeTUI({
