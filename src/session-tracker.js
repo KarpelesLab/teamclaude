@@ -59,6 +59,19 @@ export const MAX_SESSION_ID_LENGTH = 128;
 // depend on the caller it is guarding against.
 export const MAX_KEY_LENGTH = MAX_SESSION_ID_LENGTH + 1 + 22;
 
+// A message-thread continue names the message it follows and nothing else, so a
+// conversation keeps the ids of its threaded messages that a continue may still
+// name: the newest message of each thread running in it. That is one id for an
+// ordinary conversation and one per agent for a fan-out of forks, which share
+// their parent's conversation. The cap is for a client that keeps starting
+// threads it never continues; the oldest id goes first. An id is an upstream
+// message id, a few dozen characters, so one longer than the bound is no id.
+export const MAX_THREAD_MESSAGES = 32;
+const MAX_MESSAGE_ID_LENGTH = 128;
+
+/** @param {unknown} id @returns {id is string} */
+const isMessageId = (id) => typeof id === 'string' && id.length > 0 && id.length <= MAX_MESSAGE_ID_LENGTH;
+
 // The Map key for a client-supplied pin key. Bounded here so every entry point
 // keys the same way and a long key cannot hold more memory than a short one.
 function keyOf(key) {
@@ -333,6 +346,61 @@ export class SessionTracker {
     return touched;
   }
 
+  /**
+   * Record that a threaded request filed under `key` was answered with message
+   * `messageId`, after `previousId` when it continued a thread. The id it
+   * followed is dropped: a continue moves its thread to the new message, and
+   * the next continue names that one.
+   *
+   * Like recordTokens this never creates a record. The request that produced
+   * the message opened its conversation before it was forwarded, so a missing
+   * record is one already forgotten.
+   *
+   * @param {string|null} key
+   * @param {string} messageId
+   * @param {string|null} [previousId]
+   * @param {number} [now]
+   */
+  recordThreadMessage(key, messageId, previousId = null, now = this._now()) {
+    const s = this._live(key, now);
+    if (!s || !isMessageId(messageId)) return;
+    if (previousId) s.threads.delete(previousId);
+    s.threads.delete(messageId);
+    s.threads.add(messageId);
+    while (s.threads.size > MAX_THREAD_MESSAGES) s.threads.delete(s.threads.values().next().value);
+  }
+
+  /**
+   * The conversation a thread continue belongs to: the one, within the same
+   * client session, that produced the message the continue names. Null when no
+   * live conversation of that session did.
+   *
+   * The body of a continue carries only the turn's delta, so its opening names
+   * nothing and the conversation has to be found through the message id. The id
+   * comes from the client, so the walk stays inside the client session that sent
+   * it: it can move a request between that session's own conversations, never
+   * into another one.
+   *
+   * Walks rather than keeping an index, like recordOutcomeForSession: the map is
+   * bounded by MAX_SESSIONS, and an index keyed by message id would need its own
+   * lifetime and its own sweep to stay in step with the records holding them.
+   * One walk per continue is one per agent turn.
+   *
+   * @param {string|null} sessionId
+   * @param {unknown} messageId
+   * @param {number} [now]
+   * @returns {{ key: string, conversation: string|null }|null}
+   */
+  threadOwner(sessionId, messageId, now = this._now()) {
+    if (!sessionId || !isMessageId(messageId)) return null;
+    for (const [key, s] of this.sessions) {
+      if (s.sessionId !== sessionId || !s.threads.has(messageId)) continue;
+      if (this._isExpired(s, now)) { this.sessions.delete(key); return null; }
+      return { key, conversation: s.conversation };
+    }
+    return null;
+  }
+
   // A known, non-expired session's record, or null. Never creates one, and
   // drops an expired one on read like pinnedAccount does.
   _live(sessionId, now) {
@@ -360,6 +428,10 @@ export class SessionTracker {
         // The same key space as `pins`, so a family's spend and the account it
         // is pinned to are looked up by one bucket key.
         tokens: new Map(),
+        // Ids of the threaded messages a continue may name (see
+        // MAX_THREAD_MESSAGES), oldest first. On the record for the same reason
+        // as `tokens`: a thread lives exactly as long as its conversation does.
+        threads: new Set(),
         // Consecutive CLIENT requests that ended without a usable answer; any
         // usable answer resets it. A streak rather than a total, so a blip
         // during an upstream wobble never accumulates on a session that is

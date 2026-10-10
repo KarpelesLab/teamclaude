@@ -1581,8 +1581,9 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // no `messages`, so the walk could only ever come back empty-handed — after
       // reading as far into a multi-megabyte body as its bound allows.
       const provider = providerForPath(req.url);
-      const conversation = sessionId && provider === DEFAULT_PROVIDER ? conversationDigest(body) : null;
-      const pinKey = pinKeyFor(sessionId, conversation);
+      const { conversation, pinKey, onMessage } = sessionId && provider === DEFAULT_PROVIDER
+        ? placeConversation(accountManager, body, sessionId)
+        : { conversation: null, pinKey: pinKeyFor(sessionId, null), onMessage: null };
 
       // Model blocklist (issue #116): reject a request for a blocked model right
       // here instead of forwarding it. A model no account can serve (e.g. Fable
@@ -1625,7 +1626,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // stripOverage and synthesizeQuota are sampled once here, at dispatch:
       // retries and holds of this request keep them, and a reload applies to
       // subsequent requests.
-      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, provider, holdBudgetMs: holdMs, pinKey, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), synthesizeQuota: shouldSynthesizeQuotaHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
+      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, provider, holdBudgetMs: holdMs, pinKey, onMessage, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), synthesizeQuota: shouldSynthesizeQuotaHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -3779,7 +3780,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       const l = getLog();
       const bw = l ? l.bodyWriter('RESPONSE BODY (streamed)', contentType) : null;
       try {
-        await streamResponse(upstreamBody, res, account.index, accountManager, bw, ctx.onUsage, ctx.pinKey, ctx.model);
+        await streamResponse(upstreamBody, res, account.index, accountManager, bw, ctx.onUsage, ctx.pinKey, ctx.model, ctx.onMessage);
         // Reached only when the stream completed. A stream that dies upstream
         // throws out of streamResponse, so it never marks itself delivered —
         // which is the failure the token counters cannot see, since a stream
@@ -3794,7 +3795,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       l?.end();
     } else {
       const buf = Buffer.from(await upstreamRes.arrayBuffer());
-      extractUsageFromBody(buf, account.index, accountManager, ctx.onUsage, ctx.pinKey, ctx.model);
+      extractUsageFromBody(buf, account.index, accountManager, ctx.onUsage, ctx.pinKey, ctx.model, ctx.onMessage);
       const l = getLog();
       if (l) { l.body('RESPONSE BODY', buf, contentType); l.end(); }
       res.end(buf);
@@ -3970,7 +3971,7 @@ export function readWithIdleTimeout(reader, ms) {
 /**
  * Stream an SSE response to the client, parsing usage data along the way.
  */
-export async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter, onUsage = null, pinKey = null, model = null) {
+export async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter, onUsage = null, pinKey = null, model = null, onMessage = null) {
   const reader = webStream.getReader();
   // A client that leaves while upstream is silent must not hold the pending
   // read — and with it the upstream socket and its admission permit — until
@@ -3990,7 +3991,7 @@ export async function streamResponse(webStream, res, accountIndex, accountManage
   // remembers that it did — the incremental counters would book the turn again
   // if a second terminal event arrived. See parseSSEDataLine.
   const responsesTurn = { settled: false };
-  const usage = createSseLineScanner(line => parseSSEDataLine(line, accountIndex, accountManager, onUsage, merged, responsesTurn));
+  const usage = createSseLineScanner(line => parseSSEDataLine(line, accountIndex, accountManager, onUsage, merged, responsesTurn, onMessage));
 
   try {
     while (true) {
@@ -4146,12 +4147,14 @@ export function createSseLineScanner(onLine, maxChars = SSE_MAX_LINE_CHARS) {
  * @param {((inputTokens: number, outputTokens: number) => void)|null} [onUsage]
  * @param {Record<string, any>|null} [merged]
  * @param {{settled: boolean}|null} [responsesTurn] this stream's "already booked" flag
+ * @param {((messageId: string) => void)|null} [onMessage] told the id `message_start` names
  */
-function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, merged = null, responsesTurn = null) {
+function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, merged = null, responsesTurn = null, onMessage = null) {
   if (!line.startsWith('data: ')) return;
 
   try {
     const data = JSON.parse(line.slice(6));
+    if (data.type === 'message_start' && typeof data.message?.id === 'string') onMessage?.(data.message.id);
     if (data.type === 'message_start' && data.message?.usage) {
       accountManager.updateUsage(accountIndex, data.message.usage.input_tokens, 0);
       onUsage?.(data.message.usage.input_tokens || 0, 0);
@@ -4180,9 +4183,19 @@ function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, me
   }
 }
 
-function extractUsageFromBody(buffer, accountIndex, accountManager, onUsage = null, pinKey = null, model = null) {
+/**
+ * @param {Buffer} buffer
+ * @param {number} accountIndex
+ * @param {any} accountManager
+ * @param {((inputTokens: number, outputTokens: number) => void)|null} [onUsage]
+ * @param {string|null} [pinKey]
+ * @param {string|null} [model]
+ * @param {((messageId: string) => void)|null} [onMessage] told the id of the message the body is
+ */
+function extractUsageFromBody(buffer, accountIndex, accountManager, onUsage = null, pinKey = null, model = null, onMessage = null) {
   try {
     const json = JSON.parse(buffer.toString());
+    if (json?.type === 'message' && typeof json.id === 'string') onMessage?.(json.id);
     if (json.usage) {
       // A buffered Responses body reports under the same two field NAMES with a
       // different meaning, so reading it as Anthropic's would book the cached
@@ -4259,6 +4272,62 @@ export function rewriteRequestBody(body, account, url, contentType) {
 // gets parsed for nothing. The parse below is what decides.
 const THREAD_MARKER = Buffer.from('"thread"');
 const CONTINUE_MARKER = Buffer.from('"continue"');
+
+/**
+ * The conversation an Anthropic request belongs to, the key it pins on, and,
+ * for a request in a message thread, how to remember the message answering it.
+ *
+ * A message-thread continue carries only the turn's delta, so its first message
+ * is not the conversation's opening: digesting it filed every turn as a new
+ * conversation, routed wherever a new one goes and away from the account holding
+ * the thread, which Anthropic answers with 404 `thread_not_found`. A continue
+ * belongs to the conversation that produced the message it follows, and one that
+ * cannot be traced names no conversation and pins by session, like any body
+ * without an opening.
+ *
+ * @param {any} accountManager
+ * @param {Buffer} body
+ * @param {string} sessionId
+ * @returns {{ conversation: string|null, pinKey: string|null, onMessage: ((messageId: string) => void)|null }}
+ */
+function placeConversation(accountManager, body, sessionId) {
+  const thread = requestThread(body);
+  const conversation = thread?.continues
+    ? accountManager.threadOwner(sessionId, thread.continues)?.conversation ?? null
+    : conversationDigest(body);
+  const pinKey = pinKeyFor(sessionId, conversation);
+  // What a later continue will name: the id of the message answering this one.
+  const onMessage = thread && pinKey
+    ? (/** @type {string} */ id) => accountManager.recordThreadMessage(pinKey, id, thread.continues)
+    : null;
+  return { conversation, pinKey, onMessage };
+}
+
+/**
+ * The message thread a request takes part in: null when its body names none,
+ * else `continues`, the id of the message a continue follows (null for a
+ * create). Read from the markers alone unless the body could be a continue, so a
+ * create, which carries the whole conversation, is never parsed for it. A body
+ * that merely mentions `"thread"` reads as a create; the cost is one message id
+ * remembered for a conversation that never continues it.
+ *
+ * Exported for tests.
+ *
+ * @param {Buffer|null|undefined} body
+ * @returns {{ continues: string|null }|null}
+ */
+export function requestThread(body) {
+  if (!Buffer.isBuffer(body) || !body.includes(THREAD_MARKER)) return null;
+  if (!body.includes(CONTINUE_MARKER)) return { continues: null };
+  try {
+    const thread = JSON.parse(body.toString('utf8'))?.thread;
+    if (!thread || typeof thread !== 'object') return null;
+    const continues = thread.type === 'continue' && typeof thread.previous_message_id === 'string';
+    return { continues: continues ? thread.previous_message_id : null };
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Whether an `upstream` names Anthropic itself — a region pin or a mirror rather

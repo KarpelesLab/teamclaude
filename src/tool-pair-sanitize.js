@@ -117,17 +117,22 @@ function coalesceSameRole(messages) {
 // message it empties, and (only when it dropped something) coalesces same-role
 // neighbors so roles still alternate. Returns the possibly-new array plus whether
 // it changed anything. Mutates the `content` arrays of the (already-cloned) input.
+//
+// `threadAhead` says the body continues a message thread: the turn before its
+// first message lives upstream, in the thread, so a tool_result there answers a
+// tool_use this body cannot show and is not evidence of anything.
 /**
  * @param {any[]} messages
+ * @param {boolean} threadAhead
  */
-function pruneOnce(messages) {
+function pruneOnce(messages, threadAhead) {
   let changed = false;
 
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
     if (!msg || !Array.isArray(msg.content)) continue;
     const answeredByNext = toolResultIds(messages[i + 1]); // results that answer THIS msg's tool_use
-    const groundedByPrev = toolUseIds(messages[i - 1]); // tool_use that grounds THIS msg's tool_result
+    const groundedByPrev = i === 0 && threadAhead ? null : toolUseIds(messages[i - 1]); // tool_use that grounds THIS msg's tool_result
     const kept = [];
     for (const b of msg.content) {
       if (b && typeof b === 'object') {
@@ -137,7 +142,7 @@ function pruneOnce(messages) {
           continue;
         }
         // A tool_result whose tool_use is not in the immediately preceding message.
-        if (b.type === 'tool_result' && typeof b.tool_use_id === 'string' && !groundedByPrev.has(b.tool_use_id)) {
+        if (b.type === 'tool_result' && typeof b.tool_use_id === 'string' && groundedByPrev && !groundedByPrev.has(b.tool_use_id)) {
           changed = true;
           continue;
         }
@@ -169,12 +174,13 @@ function pruneOnce(messages) {
 // body was already valid (so the caller can forward the original bytes untouched).
 /**
  * @param {any[]} messages
+ * @param {boolean} threadAhead the body continues a message thread (see pruneOnce)
  */
-function pruneOrphans(messages) {
+function pruneOrphans(messages, threadAhead) {
   let current = messages;
   let everChanged = false;
   for (let guard = 0; guard < 1000; guard++) {
-    const { messages: next, changed } = pruneOnce(current);
+    const { messages: next, changed } = pruneOnce(current, threadAhead);
     current = next;
     if (!changed) break;
     everChanged = true;
@@ -206,7 +212,11 @@ export function sanitizeToolPairs(body, url, contentType) {
   if (!payload || !Array.isArray(payload.messages)) return body;
 
   try {
-    const pruned = pruneOrphans(payload.messages);
+    // A continue sends only the turn's delta (see pruneOnce). Stripping the
+    // tool_result that opens it emptied the turn, and Anthropic answered every
+    // such continue with a 400 the client could only recover from by resending
+    // the whole conversation.
+    const pruned = pruneOrphans(payload.messages, payload.thread?.type === 'continue');
     if (!pruned) return body;
     payload.messages = pruned;
     return Buffer.from(JSON.stringify(payload), 'utf8');
