@@ -129,6 +129,9 @@ export const KEEP_ALIVE_TIMEOUT_MS = 120_000;
 // own decision (disabled, capped), a credential or policy problem (error,
 // entitlement), or an eligibility rule (route) that no quota window governs.
 const RESET_CLEARS = new Set(['quota', 'throttled']);
+// The same for a banked Claude usage-limit reset, which also clears the windows
+// behind upstream's own `rejected` verdict.
+const CLAUDE_RESET_CLEARS = new Set(['quota', 'throttled', 'upstream-rejected']);
 
 /** Classify only the structured organization-policy denial observed upstream.
  * Message text and generic permission errors are deliberately not enough. */
@@ -3015,11 +3018,21 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // window, and an account this request has already tried stays excluded from
     // the re-selection below whatever its windows then say. A credit spent on
     // any of those buys this request nothing.
-    const resettable = hooks.redeemCodexResetForPool && !ctx.resetRedeemTried
-      && (ctx.provider || DEFAULT_PROVIDER) === 'codex'
+    //
+    // A dry Claude pool is offered the same way, to the Claude redeemer, for a
+    // banked usage-limit reset — which also answers upstream's own `rejected`
+    // verdict, since a reset clears exactly the windows that verdict is about.
+    const resetProvider = ctx.provider || DEFAULT_PROVIDER;
+    const redeemHook = resetProvider === 'codex' ? hooks.redeemCodexResetForPool
+      : resetProvider === DEFAULT_PROVIDER ? hooks.redeemClaudeResetForPool : null;
+    const clears = resetProvider === 'codex' ? RESET_CLEARS : CLAUDE_RESET_CLEARS;
+    const resettable = redeemHook && !ctx.resetRedeemTried
       ? accountManager.accounts.filter((/** @type {Record<string, any>} */ a) =>
-        providerOf(a) === 'codex' && !ctx.tried.has(a.index)
-        && RESET_CLEARS.has(accountManager.unavailableReason(a, ctx.model) ?? ''))
+        providerOf(a) === resetProvider && !ctx.tried.has(a.index)
+        // A third-party backend is an Anthropic-shaped account with no Anthropic
+        // reset to spend; Codex rows never carry one, so the test is Claude's alone.
+        && !(resetProvider === DEFAULT_PROVIDER && a.upstream)
+        && clears.has(accountManager.unavailableReason(a, ctx.model) ?? ''))
       : [];
     if (resettable.length) {
       // Once per request, whatever it decides: a redemption that reports success
@@ -3028,7 +3041,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       ctx.resetRedeemTried = true;
       let redeemed = false;
       try {
-        redeemed = !!(await hooks.redeemCodexResetForPool(resettable))?.redeemed;
+        redeemed = !!(await redeemHook?.(resettable))?.redeemed;
       } catch { /* a failed redemption must leave the refusal exactly as it was */ }
       if (redeemed) {
         // No upstream attempt was made, so this costs no retry from the budget:

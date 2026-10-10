@@ -435,9 +435,38 @@ The probe is off by default, so the count is only as fresh as the last probe:
 `p` in the TUI, or `curl -X POST localhost:3456/teamclaude/probe`, refreshes
 it once.
 
-TeamClaude only **reports** a banked reset; it never spends one.
-`autoRedeemResets` applies to Codex accounts only. Spend a Claude reset
-yourself, on the claude.ai usage page or with `/limit-reset` in Claude Code.
+### Spending a Claude reset automatically
+
+With [`autoRedeemResets`](configuration.md) on — the same switch, and the same
+**g** → **Auto-redeem** toggle, as the Codex credits — a request that no Claude
+account can serve because their windows are spent may spend **one** banked
+reset, at the same moment the Codex redeemer would: selection refuses the
+request before choosing anyone, the redeemer spends a reset, and the request is
+selected again against the account it cleared.
+
+- It spends on the account that would otherwise wait longest for its own
+  windows to reset, since that is where a reset buys the most.
+- Only on an account upstream itself reports **at** a limit, and only when the
+  grant clears every limit the account is at — a reset that would leave it
+  blocked buys the request nothing.
+- Only the grant upstream names as next (`next_grant_id`), exactly as
+  `/limit-reset` in Claude Code does.
+- `accounts[].autoRedeemReset: false` exempts an account, as it does for Codex;
+  so does being disabled, having no organization id, or last reading zero held
+  resets.
+
+After a reset the Claude pool holds off for an hour, so one dry pool costs one
+reset. A claim whose answer never arrived may still have spent the grant: its
+request id is kept and replayed by the next attempt — upstream then answers
+`already_used` instead of spending a second grant — and nothing else is spent
+for 30 minutes. `cooldown`, `not_limited`, `ineligible` and `unavailable` spend
+nothing.
+
+The claim is `POST /api/organizations/<org>/reset_rate_limits` with
+`{ program: "cedar_ember", grant_id, request_id }`, as Claude Code sends it.
+It is not a documented API, so it is worth watching the activity log the first
+time it fires. With the switch off — the default — a Claude reset is still
+yours to spend, on the claude.ai usage page or with `/limit-reset`.
 
 ## Third-party backend accounts
 

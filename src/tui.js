@@ -1006,7 +1006,8 @@ export class TUI {
     });
 
     // Fleet-scoped because the policy behind it is: a credit is spent only when
-    // the whole Codex pool is dry. It sits here, on the screen, rather than in
+    // the whole Codex pool is dry (and, for a banked Claude reset, the whole
+    // Claude pool). It sits here, on the screen, rather than in
     // the config file alone because the one thing an operator needs from this
     // setting is to be able to kill it at once.
     fields.push({
@@ -1733,7 +1734,7 @@ export class TUI {
     const next = prev !== true;
     this.config.autoRedeemResets = next;
     if (!await this._saveSetting('auto-redeem', () => { this.config.autoRedeemResets = prev; })) return;
-    this._addLog(`Auto-redeem Codex reset credits: ${next ? 'on' : 'off'}`);
+    this._addLog(`Auto-redeem reset credits (Codex and Claude): ${next ? 'on' : 'off'}`);
     if (this.running) this.render();
   }
 
