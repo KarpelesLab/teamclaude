@@ -373,7 +373,9 @@ that way until you say otherwise: a redemption cannot be undone and the credits
 are scarce, so a fleet nobody has armed holds its credits for manual use however
 dry it runs. The switch is fleet-scoped because the policy below is — "only when
 the whole pool is dry" is a statement about the fleet, not about one account —
-and it applies live, so it can be armed or killed without a restart.
+and it applies live, so it can be armed or killed without a restart. The same
+switch arms the spending of a Claude account's banked usage-limit resets; see
+[Claude accounts](#claude-accounts) below.
 
 One account can be exempted with `accounts[].autoRedeemReset: false`, and that
 is **all** that key can do. A per-account `true` arms nothing on its own: with
@@ -413,6 +415,105 @@ held to a 10-second budget, because the waiting client's patience for the
 response head is finite and the retry needs the rest of it. Every attempt and outcome is
 logged.
 
+#### Claude accounts
+
+With the switch on, a Claude subscription account spends one of its
+[banked usage-limit resets](#claude-banked-usage-limit-resets) under the same
+policy: same `accounts[].autoRedeemReset: false` exemption, same "only when the
+pool is dry, or the reset is about to lapse" rule, same joined attempts and the
+same fleet-wide hold. It is a separate redeemer for a separate pool: a dry
+Claude pool never spends a Codex credit, and the reverse. Only Claude logins
+take part — never an API-key account, a third-party backend or a Codex account —
+and their token is only ever sent to `api.anthropic.com`.
+
+**What is read.** Nothing the probe stored. When a dry Claude pool refuses a
+request, each candidate's reset status is read fresh from
+`GET /api/oauth/usage?cedar_ember=1&skip_spend=1`, with the probe's headers and
+the account's own token, and a reading is reused for at most 20 seconds. The
+same payload carries the account's 5-hour and 7-day usage, which is applied as
+the probe would apply it, so an account refilled since its last reading counts
+as able to serve again. The grant ids in it are used for the claim and nothing
+else: they are never written to the account's quota, the saved state or the
+status payload. A probe count of zero skips the read; a missing count does not.
+A status that offers nothing to spend is not read again for 30 minutes, or
+until the reset cooldown it reports ends, if that is sooner. A reset cooldown in
+any account's status means a reset is under way there, so the whole pool holds
+off for 30 minutes. One saying upstream cannot report its resets right now
+(`unavailable`) counts as a failed read.
+
+**When.** All of this has to hold:
+
+1. The account's shared **weekly** window reads fully spent, and that window
+   has not rolled over yet. A 5-hour wall never qualifies, and neither does an
+   account taken out of rotation by a local `switchThreshold` or `maxUsage`:
+   upstream has not limited it.
+2. The status is eligible, lists the weekly limit as exhausted, and reports no
+   reset cooldown in progress. A status with no `exhausted` list lists nothing,
+   as Claude Code reads it.
+3. The grant upstream names as **next** — the only one ever claimed — is usable
+   now, not paused, has a reset left, has not expired, and clears the weekly
+   (`seven_day`) limit. A grant that upstream would let you spend before any
+   limit is hit is skipped unless the status lists a limit it clears as spent,
+   as Claude Code does.
+4. Either every other Claude account is unavailable for the refused request's
+   model, or the grant expires within three days. Another account counts as
+   unavailable only when it is disabled, capped, in error or out of rotation
+   for a lasting reason, or when this walk's status read or a reading under 10
+   minutes old shows it at a limit. A 429 hold or a stored upstream rejection
+   alone does not count, and an eligible status listing nothing as exhausted
+   counts as available: in doubt, nothing is spent. When several accounts
+   qualify, the grant that ends soonest is spent first.
+
+**The claim** is `POST /api/organizations/{org}/reset_rate_limits` for the
+account's organization, so an account with no recorded organization id is never
+claimed for. It **cannot be undone**. Once it lands, the account's rate-limit
+hold and any stored upstream `rejected` verdict are dropped, its quota is
+re-read, and the refused request is re-selected once. The token refresh, status
+read, claim and re-read share one 30-second budget: Claude Code gives the claim
+25 seconds, and a Claude client waits minutes for the response head. The reads
+stop short of the last 10 seconds, and a claim is never started with less: one
+cut off mid-flight may have spent a reset, one never sent has spent nothing.
+Both switches are checked once more right before a claim or a replay is sent.
+
+**Unconfirmed claims.** Every claim carries a request id. An answer that never
+arrives — a timeout, a dropped connection, a 5xx, an unreadable body — or
+upstream's own `unavailable` means the reset may have been spent. The account's
+quota is then re-read, the whole pool holds off for 30 minutes, and the retry
+replays the **same** request id for the same grant. That retry comes at least
+30 minutes later, while Claude Code keeps an id for about 10, so upstream may no
+longer tie the two: what guards against a second spend is the fresh status in
+front of the retry, which must still name the same grant next with as many
+resets left, and the weekly still reading spent. Until that claim is settled no
+other account's reset is claimed, and no new id is minted for its grant. The
+pool hold is saved with the account state, so it survives a restart; the
+request id is not saved.
+
+- A replay answered `reset` or `already_used` is the first claim landing.
+- A replay answered `ineligible` or `not_limited` settles it without saying
+  whether it went through, and one answered `cooldown`, 429, 401 or 403 leaves
+  it unsettled; either way the pool holds off another 30 minutes.
+- A status settles it when, with no cooldown running, it no longer names the
+  claimed grant as next — eligible or not — or shows fewer resets left on that
+  grant than at the claim. Either may mean it went through, so the pool holds
+  off again.
+- A claim still unsettled after 6 hours, as long as a reset that landed holds
+  the pool, is let go, and its request id with it.
+
+A fresh `not_limited` means the reading that made the pool look dry was wrong:
+the account's hold and stored rejection are dropped, its quota is re-read, and
+the pool holds off for 30 minutes. A fresh `already_used` or `cooldown` means
+a reset there was just spent or started by someone else: its quota is re-read
+and the pool holds off for 30 minutes. Other answers that spend nothing (a fresh
+`ineligible`, HTTP 429, 401 or 403) hold only that account off for 30 minutes.
+
+**Token scope.** The status read needs the `user:profile` scope. A token
+without it — a `setup-token`, for instance, carries only `user:inference` —
+cannot read grants, so nothing is ever claimed with it. Logins made through
+TeamClaude request `user:profile`, but whether the claim endpoint accepts their
+tokens has **not** been verified against a live account. A 401 or 403 on the
+claim spends nothing, is logged as a possible scope problem, and holds that
+account off for 30 minutes.
+
 ## Claude banked usage-limit resets
 
 Claude sometimes grants an account a **banked usage-limit reset**, shown under
@@ -435,9 +536,11 @@ The probe is off by default, so the count is only as fresh as the last probe:
 `p` in the TUI, or `curl -X POST localhost:3456/teamclaude/probe`, refreshes
 it once.
 
-TeamClaude only **reports** a banked reset; it never spends one.
-`autoRedeemResets` applies to Codex accounts only. Spend a Claude reset
-yourself, on the claude.ai usage page or with `/limit-reset` in Claude Code.
+With [`autoRedeemResets`](configuration.md) off — the default — TeamClaude
+only **reports** a banked reset. Spend one yourself, on the claude.ai usage page
+or with `/limit-reset` in Claude Code. With it on, TeamClaude spends one when a
+dry Claude pool needs it; see [Claude accounts](#claude-accounts) under the
+reset credits above.
 
 ## Third-party backend accounts
 

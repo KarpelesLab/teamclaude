@@ -29,7 +29,7 @@ In particular:
 
 - **Use the provider's genuine CLI.** Pointing a third-party frontend (opencode and similar) at Pro/Max OAuth credentials is the pattern Anthropic explicitly restricts.
 - **How much may run unattended is the client's call, not the proxy's.** Each provider decides what its own CLI may do without a person at the keyboard — background work, scheduled tasks, long runs — and builds those limits into that CLI. TeamClaude routes requests between your subscriptions and that client; it neither widens what the client allows nor narrows it. A long run the client permits can be carried across an account switch or a quota reset ([`holdSeconds`](quota.md#hold-on-exhaustion)); a run the client does not permit does not become permitted by going through a proxy.
-- **The proxy's own background calls are off by default.** Two features make requests that no client asked for — [keep-warm](quota.md#keep-warm) and the [quota probe](quota.md#quota-probe) — and you turn them on yourself.
+- **The proxy's own background calls are off by default.** Two features make requests that no client asked for — [keep-warm](quota.md#keep-warm) and the [quota probe](quota.md#quota-probe) — and you turn them on yourself. The same goes for [`autoRedeemResets`](accounts.md#free-rate-limit-reset-credits), which, once a spent weekly window turns a request away, reads that account's reset status and may claim a free reset — something Claude Code itself does only when a person chooses to spend a Claude reset.
 - **Only use subscriptions you legitimately purchased.**
 
 ## Anthropic: rotating across multiple subscriptions

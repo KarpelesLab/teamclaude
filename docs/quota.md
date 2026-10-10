@@ -38,7 +38,7 @@ It reads each OAuth account's utilization from its provider's read-only usage en
 
 The probe is also the only source for the **Sonnet 7-day** bucket, when your plan exposes it. The Fable weekly bucket arrives passively in the response headers (`anthropic-ratelimit-unified-7d_oi-*`), so Fable-aware routing works without turning the probe on. Both families are read from the payload's `limits[]`, where upstream enumerates the model-scoped weekly caps an account actually has.
 
-It is likewise the only source for Claude's [banked usage-limit resets](accounts.md#claude-banked-usage-limit-resets), read from the same call.
+It is likewise the only source for Claude's [banked usage-limit resets](accounts.md#claude-banked-usage-limit-resets), read from the same call. The probe keeps only their count: the grant ids that spend one are read by the [reset redeemer](accounts.md#claude-accounts) alone, from a fresh read of its own, and are never stored.
 
 ### Revalidating a spent family bucket
 

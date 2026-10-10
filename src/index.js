@@ -30,6 +30,7 @@ import { ensureAccountIds } from './account-id.js';
 import * as alias from './alias.js';
 import { ensureCerts, mitmHosts } from './mitm.js';
 import { Prober, probeApplicable } from './prober.js';
+import { ClaudeResetRedeemer } from './claude-reset-credits.js';
 import { ResetCreditRedeemer } from './codex-reset-credits.js';
 import { Warmer, warmApplicable } from './warmer.js';
 import { formatWarmupScheduleConfirmation, resolveWarmupConfig } from './warmup-schedule.js';
@@ -611,10 +612,10 @@ async function serverCommand() {
     config.accountSort = ACCOUNT_SORTS.includes(diskConfig.accountSort) ? diskConfig.accountSort : 'arranged';
     // Read by `run`/`env` from disk, but the TUI settings screen shows it live.
     config.defaultClientMode = diskConfig.defaultClientMode === 'base-url' ? 'base-url' : 'mitm';
-    // The fleet switch for spending Codex reset credits. The redeemer reads it
-    // off this object per refusal, so the assignment is the whole application —
-    // and this one has to hot-apply in particular: "stop spending credits" must
-    // not wait for a restart.
+    // The fleet switch for spending a free rate-limit reset (Codex credits or a
+    // Claude cedar_ember grant). Each redeemer reads it off this object per
+    // refusal, so the assignment is the whole application — and this one has to
+    // hot-apply in particular: "stop spending resets" must not wait for a restart.
     config.autoRedeemResets = diskConfig.autoRedeemResets === true;
     config.blockedModels = Array.isArray(diskConfig.blockedModels) ? diskConfig.blockedModels : [];
     // Sampled off this object when each request is dispatched (server.js
@@ -818,6 +819,13 @@ async function serverCommand() {
   // binds on the next refusal, not the next restart.
   const redeemer = new ResetCreditRedeemer(accountManager, { config });
   hooks.redeemCodexResetForPool = (/** @type {Record<string, any>[]} */ accounts) => redeemer.maybeRedeemForPool(accounts);
+  // The same for a Claude subscription's banked usage-limit resets, behind the
+  // same fleet switch. A redeemer of its own: the two providers' resets are
+  // different grants on different endpoints, and neither pool's dry state says
+  // anything about the other's.
+  const claudeRedeemer = new ClaudeResetRedeemer(accountManager, { config });
+  hooks.redeemClaudeResetForPool = (/** @type {Record<string, any>[]} */ accounts, /** @type {{model?: string|null}} */ opts) =>
+    claudeRedeemer.maybeRedeemForPool(accounts, opts);
   hooks.getStatusExtra = () => ({
     // Read live from the shared config (not a startup snapshot) so the TUI's
     // blocklist editor shows up in `status` immediately, the same way the

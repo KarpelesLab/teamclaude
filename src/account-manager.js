@@ -132,6 +132,10 @@ const PERSISTED_QUOTA_FIELDS = [
   // until something next reads the usage endpoint — and the row that says so is the
   // only place an operator sees one at all.
   'resetCredits',
+  // Until when a Claude reset attempt on this account holds the whole Claude
+  // pool (claude-reset-credits.js): a bare timestamp, so a restart minutes
+  // after a claim that may have landed does not spend a sibling's on top of it.
+  'claudeResetHoldUntil',
   // Whether the last Codex reading stated a 5-hour window at all (see
   // _updateCodexQuota). A fact about the subscription's shape rather than a
   // counter, so it holds across a restart: without it a restored Codex row
@@ -359,16 +363,17 @@ function makeAccount(acct, index, listener = null) {
     // and the fleet upstream proxy for this account. Null goes by the fleet
     // path. See account-routing.js.
     routing: accountRouting(acct, listener),
-    // Whether this account is EXEMPT from spending one of its free Codex
-    // rate-limit reset credits (see codex-reset-credits.js). Negative-only, and
-    // the polarity is the opposite of what the name suggests: the switch that
-    // arms anything is the fleet-wide `autoRedeemResets`, because the policy it
-    // arms ("only when the whole Codex pool is dry") is a statement about the
-    // fleet. All this key can say is "never this one", so `true` and an absent
-    // key mean exactly the same thing here. Meaningless on an Anthropic
-    // account, which has no such credits — the redeemer checks the provider
-    // rather than making the field's default depend on it, so a config moved
-    // between providers keeps saying the same thing.
+    // Whether this account is EXEMPT from spending one of its free rate-limit
+    // resets — a Codex reset credit (codex-reset-credits.js) or a banked Claude
+    // usage-limit reset (claude-reset-credits.js). Negative-only, and the
+    // polarity is the opposite of what the name suggests: the switch that arms
+    // anything is the fleet-wide `autoRedeemResets`, because the policy it arms
+    // ("only when the whole pool is dry") is a statement about the fleet. All
+    // this key can say is "never this one", so `true` and an absent key mean
+    // exactly the same thing here. Meaningless on an account that holds no such
+    // resets (an API key, a third-party backend) — each redeemer checks the
+    // account kind rather than making the field's default depend on it, so a
+    // config moved between providers keeps saying the same thing.
     autoRedeemReset: acct.autoRedeemReset !== false,
     upstream: acct.upstream || null,
     modelMap: acct.modelMap || null,
@@ -2511,6 +2516,34 @@ export class AccountManager {
 
   _isAvailable(account, model = null, advisorModel = null) {
     return this.unavailableReason(account, model, advisorModel) === null;
+  }
+
+  /**
+   * When upstream last showed `account` at a limit that bars `model`: the
+   * newest stamp among the readings over their threshold — the shared 5-hour
+   * bucket and the weekly value that governs the model — or null when no
+   * stamped reading bars it. A 429 hold and a stored `rejected` are verdicts,
+   * not readings, and can outlive the limit behind them; a 429 at a real limit
+   * carries a reading of its own.
+   *
+   * @param {Record<string, any>} account
+   * @param {string|null} [model]
+   * @returns {number|null}
+   */
+  limitSeenAt(account, model = null) {
+    const q = account.quota;
+    this._clearExpiredQuotas(account);
+    /** @type {number[]} */
+    const stamps = [];
+    const over = (/** @type {any} */ value, /** @type {string} */ bucket) => value != null && value >= this.thresholdFor(bucket, account);
+    const stamp = (/** @type {any} */ at) => { if (Number.isFinite(at)) stamps.push(at); };
+    if (over(q.unified5h, 'unified5h')) stamp(q.unified5hSeenAt);
+    // Mirrors _isNearQuota: the governing bucket's threshold, applied to it and
+    // to the shared weekly one alike.
+    const bucket = this._weeklyBucketFor(model);
+    if (over(q.unified7d, bucket)) stamp(q.unified7dSeenAt);
+    if (bucket !== 'unified7d' && over(q[bucket], bucket)) stamp(q[`${bucket}SeenAt`]);
+    return stamps.length ? Math.max(...stamps) : null;
   }
 
   /**
@@ -4735,6 +4768,22 @@ export class AccountManager {
     account.rateLimitedUntil = null;
     account.throttledAt = null;
     console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" revalidated — rate limit no longer applies, back in rotation`);
+  }
+
+  /**
+   * Drop a stored upstream `rejected` verdict after live proof it no longer
+   * binds — a usage-limit reset that landed, or upstream answering a reset
+   * claim with `not_limited`. A quota re-read does not touch the verdict, so
+   * without this the account would read `upstream-rejected` until it went
+   * stale. No-op for any other verdict.
+   * @param {number} accountIndex
+   */
+  clearUpstreamRejected(accountIndex) {
+    const account = this.accounts[accountIndex];
+    if (!account || account.quota.unifiedStatus !== 'rejected') return;
+    account.quota.unifiedStatus = null;
+    account.quota.unifiedStatusSeenAt = null;
+    console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" upstream rejection cleared — it no longer applies`);
   }
 
   /**
