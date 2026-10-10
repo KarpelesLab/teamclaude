@@ -565,25 +565,37 @@ export function normalizeUsageBucket(bucket) {
 }
 
 /**
+ * The headers the usage endpoint is read with. Exported for the reset redeemer
+ * (claude-reset-credits.js), whose status read is gated on the same User-Agent
+ * and whose claim speaks the same beta.
+ * @param {string} accessToken
+ */
+export function oauthUsageHeaders(accessToken) {
+  return {
+    'Authorization': `Bearer ${accessToken}`,
+    'anthropic-beta': OAUTH_USAGE_BETA,
+    'Accept': 'application/json',
+    'User-Agent': USAGE_USER_AGENT,
+  };
+}
+
+/**
  * Fetch OAuth subscription usage from the usage endpoint. This reports quota
  * utilization WITHOUT spending message quota, which is what makes it safe to
  * poll. Returns normalized { fiveHour, sevenDay, sevenDaySonnet, sevenDayFable } buckets
  * plus scopedWeeklyListed (whether the payload enumerated its model-scoped
- * weekly caps), or { error, status } on failure.
+ * weekly caps), or { error, status } on failure. `timeoutMs` bounds the read
+ * for a caller with a client waiting on it; the background probe passes none.
  * @param {string} accessToken
  * @param {import('./account-routing.js').RoutingProxy|null} [routing] - the account's own egress proxy
- * @param {{ fetchImpl?: Function }} [opts]
+ * @param {{ fetchImpl?: Function, timeoutMs?: number }} [opts]
  */
-export async function fetchUsage(accessToken, routing = null, { fetchImpl = proxyFetch } = {}) {
+export async function fetchUsage(accessToken, routing = null, { fetchImpl = proxyFetch, timeoutMs = 0 } = {}) {
   try {
     const res = await fetchImpl(USAGE_URL, {
-      headers: {
-        'Authorization': `Bearer ${accessToken}`,
-        'anthropic-beta': OAUTH_USAGE_BETA,
-        'Accept': 'application/json',
-        'User-Agent': USAGE_USER_AGENT,
-      },
+      headers: oauthUsageHeaders(accessToken),
       routing,
+      ...(timeoutMs > 0 && { signal: AbortSignal.timeout(timeoutMs) }),
     });
 
     if (!res.ok) {
@@ -663,9 +675,10 @@ export function normalizeUsagePayload(data) {
  * be a claim the payload does not make. An eligible block with no live grant is
  * a real zero: the reset was spent or has expired.
  *
- * Grant ids (and the payload's `next_grant_id`) are never read. They are the
- * handle that spends a reset, and spending one stays a manual action in
- * claude.ai or Claude Code.
+ * Grant ids (and the payload's `next_grant_id`) are never read here. They are
+ * the handle that spends a reset: only the opt-in redeemer
+ * (claude-reset-credits.js) reads them, from a fresh status of its own, and
+ * none is ever stored.
  *
  * @param {any} block  the payload's `cedar_ember` object
  * @param {number} [now]  ms epoch a grant's expiry is measured against

@@ -1005,10 +1005,10 @@ export class TUI {
       enter: () => this._promptInput('Switch threshold % (1-100, tenths allowed)', v => this._doSetThreshold(v.trim())),
     });
 
-    // Fleet-scoped because the policy behind it is: a credit is spent only when
-    // the whole Codex pool is dry. It sits here, on the screen, rather than in
-    // the config file alone because the one thing an operator needs from this
-    // setting is to be able to kill it at once.
+    // Fleet-scoped because the policy behind it is: a reset is spent only when
+    // the whole pool is dry, Codex and Claude alike. It sits here, on the
+    // screen, rather than in the config file alone because the one thing an
+    // operator needs from this setting is to be able to kill it at once.
     fields.push({
       id: 'autoRedeemResets',
       label: 'Auto-redeem',
@@ -1721,11 +1721,12 @@ export class TUI {
   }
 
   async _toggleAutoRedeemResets() {
-    // Whether a spent weekly Codex window may spend one of that account's free
-    // rate-limit reset credits. Fleet-scoped: the policy it arms is about the
-    // whole pool being dry, so its switch is too. The redeemer reads it off the
-    // shared config per refusal, so the assignment is the whole application and
-    // the save is only what survives a restart.
+    // Whether a spent weekly window may spend one of that account's free
+    // rate-limit resets: a Codex reset credit or a banked Claude usage-limit
+    // reset. Fleet-scoped: the policy it arms is about the whole pool being
+    // dry, so its switch is too. Each redeemer reads it off the shared config
+    // per refusal, so the assignment is the whole application and the save is
+    // only what survives a restart.
     //
     // A per-account `autoRedeemReset: false` still exempts its account while
     // this is on; nothing per-account can switch it ON.
@@ -1733,7 +1734,7 @@ export class TUI {
     const next = prev !== true;
     this.config.autoRedeemResets = next;
     if (!await this._saveSetting('auto-redeem', () => { this.config.autoRedeemResets = prev; })) return;
-    this._addLog(`Auto-redeem Codex reset credits: ${next ? 'on' : 'off'}`);
+    this._addLog(`Auto-redeem reset credits: ${next ? 'on' : 'off'}`);
     if (this.running) this.render();
   }
 
@@ -2817,8 +2818,8 @@ export class TUI {
     lines.push(bold('  Rotation') + dim('  — switch accounts when quota crosses the threshold'));
     lines.push(row(byId('threshold')));
     lines.push(row(byId('autoRedeemResets')));
-    lines.push(dim('  Spend a free Codex rate-limit reset credit when the whole pool'));
-    lines.push(dim('  is dry. Irreversible and scarce — off unless you say otherwise.'));
+    lines.push(dim('  Spend a free rate-limit reset (Codex or Claude) when the whole'));
+    lines.push(dim('  pool is dry. Irreversible and scarce — off unless you say otherwise.'));
     lines.push('');
     // ── Quota probe
     lines.push(bold('  Quota probe') + dim('  — refresh idle accounts from the usage endpoint'));

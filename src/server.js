@@ -130,6 +130,11 @@ export const KEEP_ALIVE_TIMEOUT_MS = 120_000;
 // entitlement), or an eligibility rule (route) that no quota window governs.
 const RESET_CLEARS = new Set(['quota', 'throttled']);
 
+// The same, for a claimed Claude usage-limit reset. One verdict more: the claim
+// also drops a stored upstream `rejected`, which a spent weekly window leaves
+// behind and which would otherwise bar the account after its limits refilled.
+const CLAUDE_RESET_CLEARS = new Set(['quota', 'throttled', 'upstream-rejected']);
+
 /** Classify only the structured organization-policy denial observed upstream.
  * Message text and generic permission errors are deliberately not enough. */
 export function isOAuthEntitlementDenied(body) {
@@ -3033,6 +3038,30 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       if (redeemed) {
         // No upstream attempt was made, so this costs no retry from the budget:
         // re-select against the account whose windows were just cleared.
+        if (clientGone(res)) { ctx.abandoned = true; return; }
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
+      }
+    }
+
+    // The Claude twin of the branch above: a pool of Claude subscriptions dry
+    // because their weekly windows are spent, and a banked usage-limit reset
+    // that can undo it. Only the logins a reset would return to service, and
+    // only subscription logins on Anthropic's own endpoint — an API key or a
+    // third-party backend holds no such reset. Its own once-per-request flag,
+    // so neither redeemer can spend the other's re-selection.
+    const claudeResettable = hooks.redeemClaudeResetForPool && !ctx.claudeResetRedeemTried
+      && (ctx.provider || DEFAULT_PROVIDER) === 'anthropic'
+      ? accountManager.accounts.filter((/** @type {Record<string, any>} */ a) =>
+        providerOf(a) === 'anthropic' && isSubscriptionAccount(a) && !a.upstream && !ctx.tried.has(a.index)
+        && CLAUDE_RESET_CLEARS.has(accountManager.unavailableReason(a, ctx.model) ?? ''))
+      : [];
+    if (claudeResettable.length) {
+      ctx.claudeResetRedeemTried = true;
+      let redeemed = false;
+      try {
+        redeemed = !!(await hooks.redeemClaudeResetForPool(claudeResettable, { model: ctx.model }))?.redeemed;
+      } catch { /* a failed claim must leave the refusal exactly as it was */ }
+      if (redeemed) {
         if (clientGone(res)) { ctx.abandoned = true; return; }
         return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
       }
