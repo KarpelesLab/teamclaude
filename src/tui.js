@@ -20,6 +20,8 @@ import { sanitizeText, safeLine } from './safe-text.js';
 // all read them from there, so they cannot drift apart (#426).
 import { MAX_PROBE_SECONDS, ROUTE_COLORS } from './config-ops.js';
 import { isLocalUpstream } from './provider.js';
+import { hyperlink, clipboardSequence } from './osc.js';
+/** @typedef {import('./login-flow.js').LoginPrompt} LoginPrompt */
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -596,12 +598,108 @@ function timestamp() {
   return new Date().toLocaleTimeString('en-US', { hour12: false });
 }
 
+// ── Login panel helpers ──────────────────────────────────────
+
+// Bracketed paste (DEC mode 2004): while the login panel is open the terminal
+// is asked to wrap a paste in these markers, so the TUI can tell a paste from
+// typing however the terminal chunks it.
+const PASTE_ON = `${ESC}?2004h`;
+const PASTE_OFF = `${ESC}?2004l`;
+const PASTE_START = `${ESC}200~`;
+const PASTE_END = `${ESC}201~`;
+const PASTE_MARKERS = [PASTE_START, PASTE_END];
+// A read can end part-way through a marker (over SSH, at any byte), so the
+// panel holds back a tail that could be a marker's start until the next read
+// says what it was. A lone ESC is also the Esc key: held this long with
+// nothing after it, it is taken as the key. Long enough for the rest of a
+// marker split across reads to arrive, short enough not to be felt.
+const ESC_WAIT_MS = 100;
+// A paste arrives in one burst. Still without its closing marker after this
+// long, the marker was lost, and the field stops treating keys as paste.
+const PASTE_IDLE_MS = 2_000;
+
+/** How many characters at the end of `s` could be the start of one of
+ *  `markers`, cut off by the end of the read.
+ *  @param {string} s
+ *  @param {string[]} markers */
+function markerTail(s, markers) {
+  for (let n = Math.min(s.length, PASTE_START.length - 1); n > 0; n--) {
+    const tail = s.slice(-n);
+    if (markers.some(m => m.startsWith(tail))) return n;
+  }
+  return 0;
+}
+const UNDERLINE = `${ESC}4m`;
+/** How a link looks: underlined, in the cyan the rest of the screen uses for
+ *  things to act on. The OSC 8 sequence itself is added after the line is
+ *  fitted (see _render).
+ *  @param {string} s */
+const linkText = s => `${UNDERLINE}${cyan(s)}`;
+
+/** What the login field keeps of a paste or a key: no control or format
+ *  character of any kind. C1 included, since U+009B is a CSI by itself, and
+ *  the field is drawn into the frame as it stands. No sign-in code or address
+ *  holds one.
+ *  @param {string} s */
+const fieldText = s => s.replace(/\p{C}/gu, '');
+
+/** Plain text wrapped at spaces to lines of at most `w` columns. A word longer
+ *  than a line keeps a line to itself, and fitLine cuts it.
+ *  @param {string} text
+ *  @param {number} w */
+function wrapWords(text, w) {
+  /** @type {string[]} */
+  const out = [];
+  let line = '';
+  for (const word of String(text).split(/\s+/).filter(Boolean)) {
+    if (!line) line = word;
+    else if (vw(line) + 1 + vw(word) <= w) line += ` ${word}`;
+    else { out.push(line); line = word; }
+  }
+  if (line) out.push(line);
+  return out;
+}
+
+/** The end of `s` in at most `w` columns, led by `…` when the start is cut: a
+ *  pasted address is several hundred characters, and its end is the part that
+ *  differs from one paste to the next.
+ *  @param {string} s
+ *  @param {number} w */
+function tailText(s, w) {
+  if (vw(s) <= w) return s;
+  if (w <= 1) return '…';
+  return `…${[...s].slice(-(w - 1)).join('')}`;
+}
+
+/**
+ * The `l` key's callback, wired by index.js. It runs the whole sign-in and the
+ * save; `onPrompt` hands the panel the link and the paste target once the flow
+ * is ready, and aborting `signal` cancels it.
+ * @typedef {(account: Record<string, any>, opts?: { signal?: AbortSignal, onPrompt?: (prompt: LoginPrompt) => void }) => Promise<{ action: 'updated' | 'added', name: string }>} LoginAccount
+ */
+
+/**
+ * The login panel's state, for as long as it is open.
+ * @typedef {object} LoginPanel
+ * @property {string} account  the row that was picked, for the title
+ * @property {AbortController} controller  Esc aborts it; it is how the panel cancels the flow
+ * @property {LoginPrompt | null} prompt  null until the flow is listening
+ * @property {string} buf  the paste field
+ * @property {string | null} error  why the last paste was refused
+ * @property {string | null} notice  a one-off confirmation (the link copied again)
+ * @property {boolean} pasting  inside a bracketed paste that has not ended yet
+ * @property {string} held  the end of the last read, held back as a possible marker's start
+ * @property {ReturnType<typeof setTimeout> | null} timer  the ESC wait or the paste watchdog
+ * @property {number} timerGen  bumped on every arm and disarm, so a stale timer does nothing
+ * @property {string} linkId  joins the pieces of a wrapped URL into one link
+ */
+
 // ── TUI class ────────────────────────────────────────────────
 
 export class TUI {
   constructor({ accountManager, config, saveConfig, syncAccounts, onQuit, sx = null, probeQuota = null,
     // Cast so the destructured binding is the callback type, not `null`: index.js passes a function here.
-    loginAccount = /** @type {null | ((account: Record<string, any>) => Promise<{ action: 'updated' | 'added', name: string }>)} */ (null),
+    loginAccount = /** @type {LoginAccount | null} */ (null),
     activityLogPath = null,
     // Attach mode: the accounts belong to a server in another process, reached
     // over its control plane. Everything that would mutate local state is off,
@@ -618,7 +716,10 @@ export class TUI {
     // How the header names this build, and whether a newer release is known.
     // In attach mode the account manager carries the server's own answer and
     // these are unused; the empty defaults keep the label hidden until it does.
-    versionLabel = '', updateAvailable = false }) {
+    versionLabel = '', updateAvailable = false,
+    // Read for TMUX when the login panel copies its link. Injectable so the
+    // tmux wrapping can be exercised without running inside tmux.
+    env = /** @type {Record<string, string | undefined>} */ (process.env) }) {
     this.am = accountManager;
     this.remote = remote;
     this.applySwitch = applySwitch;
@@ -629,8 +730,9 @@ export class TUI {
     this.sx = sx;            // sx.org proxy manager (may be null)
     this.sxBalance = null;   // last fetched sx.org balance, for the settings screen
     this.probeQuota = probeQuota; // on-demand fleet-wide quota refresh (may be null)
-    /** @type {null | ((account: Record<string, any>) => Promise<{ action: 'updated' | 'added', name: string }>)} */
-    this.loginAccount = loginAccount; // browser (re-)login for a chosen account (may be null)
+    /** @type {LoginAccount | null} */
+    this.loginAccount = loginAccount; // (re-)login for a chosen account (may be null)
+    this._env = env;
     this.activityLogPath = activityLogPath;
     this._readCredentials = readCredentials;
     this._readProfile = readProfile;
@@ -642,7 +744,7 @@ export class TUI {
 
     this.log = [];           // completed activity entries
     this.active = new Map(); // in-flight requests
-    this.mode = 'normal';    // normal | select | add | input | settings | pick
+    this.mode = 'normal';    // normal | select | add | input | settings | pick | login
     this.pick = null;        // active list picker (routes editor accounts/bucket/color)
     this.pickReturn = 'routes'; // mode to fall back to when the picker closes
     this.selAction = null;   // switch | remove | toggle | reorder | routing
@@ -671,6 +773,10 @@ export class TUI {
     // Set once the terminal has reported a failure. Everything that would
     // write to it checks this first.
     this._stdoutDead = false;
+    // The sign-in the login panel is showing (mode 'login'), or null. See _doLogin.
+    /** @type {LoginPanel | null} */
+    this.login = null;
+    this._loginSeq = 0;   // numbers each panel's link id, so two logins' links are never one
   }
 
   // ── lifecycle ──────────────────────────────────────
@@ -810,6 +916,12 @@ export class TUI {
   }
 
   stop() {
+    // A login still waiting holds a listener (port 1455, for Codex) and the
+    // terminal's bracketed-paste mode; neither may outlive the dashboard.
+    const pasteOff = this.login ? PASTE_OFF : '';
+    if (this.login) this._loginTimerOff(this.login);
+    this.login?.controller.abort();
+    this.login = null;
     this.running = false;
     if (this.timer) { clearTimeout(this.timer); this.timer = null; }
     // Written now rather than dropped: quitting inside the debounce window
@@ -845,7 +957,7 @@ export class TUI {
       this._stdoutErrorHandler = null;
     };
     if (!this._stdoutDead) {
-      try { process.stdout.write(`${ESC}?25h${ESC}?1049l`, release); } catch { /* terminal already gone */ }
+      try { process.stdout.write(`${pasteOff}${ESC}?25h${ESC}?1049l`, release); } catch { /* terminal already gone */ }
     }
     try { process.stdin.setRawMode(false); } catch {}
     process.stdin.pause();
@@ -912,6 +1024,15 @@ export class TUI {
   // ── input handling ─────────────────────────────────
 
   _onData(d) {
+    // The login panel reads its input as a stream: see _loginInput.
+    if (this.mode === 'login' && this.login) return this._loginInput(this.login, d);
+    this._onKeys(d);
+  }
+
+  /** One read of keyboard input, as keys. A read is taken whole: an arrow
+   *  key's sequence arrives in one read, and a lone ESC is the Esc key.
+   *  @param {string} d */
+  _onKeys(d) {
     if (d === '\x1b[A') return this._key('up');
     if (d === '\x1b[B') return this._key('down');
     if (d === '\x1b[C') return this._key('right');
@@ -929,10 +1050,121 @@ export class TUI {
     // sequence this parser does not know, not text. Control characters are
     // dropped, the clipboard's trailing newline among them, so a paste fills
     // the prompt and the operator still presses Enter on what they can see.
-    if (this.mode === 'input' && d.length > 1 && !d.includes('\x1b')) {
-      this.inputBuf += d.replace(/[\x00-\x1f\x7f]/g, '');
+    // The login panel's field takes one the same way, for a terminal that does
+    // not do bracketed paste.
+    if ((this.mode === 'input' || this.mode === 'login') && d.length > 1 && !d.includes('\x1b')) {
+      if (this.mode === 'input') this.inputBuf += d.replace(/[\x00-\x1f\x7f]/g, '');
+      else if (this.login) { this.login.buf += fieldText(d); this.login.error = null; }
       this.render();
     }
+  }
+
+  /**
+   * One read of input while the login panel is open.
+   *
+   * The panel turns bracketed paste on, so a paste arrives between markers,
+   * and everything inside them is text, even where one character of it would
+   * otherwise read as a key. Reads can split anywhere, a marker included, so
+   * this is a stream: a tail that could be a marker's start is held back
+   * (`held`) until the next read completes it or shows it was not one. What
+   * lies outside the markers is keys, handled as _onKeys always has.
+   *
+   * A new paste replaces what is in the field: pasting again is how a wrong
+   * paste is put right. Control characters are dropped, the clipboard's
+   * trailing newline among them, so the paste is submitted by an Enter the
+   * operator presses on what they can see. An end marker with no start (the
+   * start was lost, or the watchdog gave up on it) still ends a paste: what
+   * came before it is kept as text.
+   *
+   * @param {LoginPanel} login
+   * @param {string} d
+   */
+  _loginInput(login, d) {
+    this._loginTimerOff(login);
+    let data = d;
+    if (login.held) {
+      const joined = login.held + d;
+      if (login.pasting || PASTE_MARKERS.some(m => joined.startsWith(m) || m.startsWith(joined))) {
+        data = joined;
+        login.held = '';
+      } else {
+        // What was held was a key of its own (Esc, most likely), not the
+        // start of a marker; it goes first, then this read.
+        const key = login.held;
+        login.held = '';
+        this._onKeys(key);
+        if (this.login !== login) { if (d) this._onData(d); return; }
+      }
+    }
+    while (data) {
+      if (login.pasting) {
+        const end = data.indexOf(PASTE_END);
+        if (end < 0) {
+          const keep = markerTail(data, [PASTE_END]);
+          login.buf += fieldText(data.slice(0, data.length - keep));
+          login.held = data.slice(data.length - keep);
+          this._loginTimer(login, PASTE_IDLE_MS, () => { login.pasting = false; login.held = ''; });
+          break;
+        }
+        login.buf += fieldText(data.slice(0, end));
+        login.pasting = false;
+        data = data.slice(end + PASTE_END.length);
+        continue;
+      }
+      const start = data.indexOf(PASTE_START);
+      const end = data.indexOf(PASTE_END);
+      if (end >= 0 && (start < 0 || end < start)) {
+        login.buf += fieldText(data.slice(0, end));
+        login.error = null;
+        data = data.slice(end + PASTE_END.length);
+        continue;
+      }
+      if (start >= 0) {
+        if (start > 0) {
+          this._onKeys(data.slice(0, start));
+          if (this.login !== login) { this._onData(data.slice(start)); return; }
+        }
+        login.buf = '';
+        login.error = null;
+        login.pasting = true;
+        data = data.slice(start + PASTE_START.length);
+        continue;
+      }
+      const keep = markerTail(data, PASTE_MARKERS);
+      login.held = data.slice(data.length - keep);
+      if (keep < data.length) this._onKeys(data.slice(0, data.length - keep));
+      if (login.held && this.login === login) {
+        this._loginTimer(login, ESC_WAIT_MS, () => {
+          const key = login.held;
+          login.held = '';
+          this._onKeys(key);
+        });
+      }
+      break;
+    }
+    this.render();
+  }
+
+  /** Arm the panel's one timer. Only the newest arming may fire, and only
+   *  while its panel is still the open one.
+   *  @param {LoginPanel} login
+   *  @param {number} ms
+   *  @param {() => void} fire */
+  _loginTimer(login, ms, fire) {
+    const gen = ++login.timerGen;
+    login.timer = this._setTimeout(() => {
+      if (this.login !== login || login.timerGen !== gen) return;
+      login.timer = null;
+      fire();
+      if (this.running) this.render();
+    }, ms);
+    login.timer?.unref?.();
+  }
+
+  /** @param {LoginPanel} login */
+  _loginTimerOff(login) {
+    login.timerGen++;
+    if (login.timer) { clearTimeout(login.timer); login.timer = null; }
   }
 
   _key(k) {
@@ -947,6 +1179,7 @@ export class TUI {
       case 'routes': this._keyRoutes(k); break;
       case 'pick': this._keyPick(k); break;
       case 'blocklist': this._keyBlocklist(k); break;
+      case 'login': this._keyLogin(k); break;
     }
     this.render();
   }
@@ -1469,6 +1702,48 @@ export class TUI {
     else if (k.length === 1) { this.inputBuf += k; }
   }
 
+  // The login panel. Esc cancels the sign-in and Enter submits the field. `c`
+  // (copy the link again) acts only while the field is empty: typing must work
+  // in it, and nobody types a code that starts with it before pasting has been
+  // tried.
+  _keyLogin(/** @type {string} */ k) {
+    const login = this.login;
+    if (!login) { this.mode = 'normal'; return; }
+    if (k === 'esc') {
+      login.controller.abort();
+      this._closeLogin();
+    } else if (k === 'enter') {
+      this._submitLogin(login);
+    } else if (k === 'bs') {
+      login.buf = login.buf.slice(0, -1);
+      login.error = null;
+    } else if (!login.buf && k === 'c') {
+      if (this._copyLoginUrl(login)) login.notice = 'Sent again.';
+    } else if (k.length === 1 && fieldText(k)) {
+      login.buf += k;
+      login.error = null;
+    }
+  }
+
+  /**
+   * Enter in the login panel. A paste the flow takes closes the panel: the
+   * token exchange runs on, and _doLogin reports how it ended. One it refuses
+   * stays open with the reason, and the field is emptied for the next try.
+   * @param {LoginPanel} login
+   */
+  _submitLogin(login) {
+    if (!login.prompt || !login.buf.trim()) return;
+    try {
+      // false means nothing was left to settle (the browser got there first),
+      // so the panel has nothing more to wait for either.
+      login.prompt.submit(login.buf);
+      this._closeLogin();
+    } catch (/** @type {any} */ e) {
+      login.error = safeLine(e?.message || String(e), 300);
+      login.buf = '';
+    }
+  }
+
   // ── account operations ─────────────────────────────
 
   // On-demand fleet-wide quota refresh (the `p` key): probe every OAuth
@@ -1491,15 +1766,19 @@ export class TUI {
     }
   }
 
-  // Browser login for the account under the cursor (the `l` key). The row
-  // chooses the PROVIDER's sign-in page and tells the operator which identity to
-  // sign in as; it does not choose where the tokens go. They go to the account
-  // the browser actually signed in as — the same identity match `teamclaude
-  // login` makes — because writing one person's tokens onto the row that was
-  // merely highlighted would be a credential crossing. So a sign-in as someone
-  // else is reported as exactly that, and the picked row stays in need of one.
-  // Fire-and-forget: the flow waits on a human for up to two minutes, and the
-  // dashboard has to stay live meanwhile.
+  // Sign-in for the account under the cursor (the `l` key). The row chooses
+  // the PROVIDER's sign-in page and tells the operator which identity to sign
+  // in as; it does not choose where the tokens go. They go to the account the
+  // browser actually signed in as — the same identity match `teamclaude login`
+  // makes — because writing one person's tokens onto the row that was merely
+  // highlighted would be a credential crossing. So a sign-in as someone else is
+  // reported as exactly that, and the picked row stays in need of one.
+  //
+  // The login panel opens at once and holds the keyboard until the flow is
+  // decided: it shows the link (the browser may be on another machine), copies
+  // it, and takes the pasted answer. Fire-and-forget all the same: the flow
+  // waits on a human for minutes, and the requests and the activity pane go on
+  // meanwhile.
   async _doLogin(/** @type {number} */ idx) {
     const acct = this.am.accounts[idx];
     if (!acct) { this._addLog('That account is no longer listed'); return; }
@@ -1514,20 +1793,84 @@ export class TUI {
     // for Codex for the fixed callback port as well.
     if (this._loggingIn) { this._addLog(`Still waiting on the sign-in for "${this._loggingIn}"`); return; }
     this._loggingIn = acct.name;
-    this._addLog(`Sign in as "${acct.name}" in the browser (waits 2 minutes)...`);
+    const controller = new AbortController();
+    this._openLogin(acct.name, controller);
     try {
-      const outcome = await this.loginAccount(acct);
+      const outcome = await this.loginAccount(acct, {
+        signal: controller.signal,
+        onPrompt: prompt => this._loginPrompted(controller, prompt),
+      });
       if (outcome?.name && outcome.name !== acct.name) {
         this._addLog(`Signed in as "${outcome.name}" (${outcome.action}), not "${acct.name}" — that one still needs a login`);
       } else {
         this._addLog(`Logged in "${acct.name}"`);
       }
     } catch (/** @type {any} */ e) {
-      this._addLog(`Login failed for "${acct.name}": ${e?.message || e}`);
+      // A cancel is the operator's own Esc: one line saying so, not a failure.
+      this._addLog(e?.name === 'AbortError'
+        ? `Sign-in cancelled for "${acct.name}"`
+        : `Login failed for "${acct.name}": ${e?.message || e}`);
     } finally {
       this._loggingIn = null;
+      if (this.login?.controller === controller) this._closeLogin();
       if (this.running) this.render();
     }
+  }
+
+  /** Open the login panel for `account`, before the flow is even listening, so
+   *  Esc can cancel it from the first moment.
+   *  @param {string} account
+   *  @param {AbortController} controller */
+  _openLogin(account, controller) {
+    this.login = {
+      account, controller, prompt: null, buf: '', error: null, notice: null,
+      pasting: false, held: '', timer: null, timerGen: 0,
+      linkId: `teamclaude-login-${++this._loginSeq}`,
+    };
+    this.mode = 'login';
+    this._writeTerminal(PASTE_ON);
+  }
+
+  /** The flow is listening: show its link and copy it, unless the panel was
+   *  closed (or another login opened) in the meantime.
+   *  @param {AbortController} controller
+   *  @param {LoginPrompt} prompt */
+  _loginPrompted(controller, prompt) {
+    const login = this.login;
+    if (login?.controller !== controller) return;
+    login.prompt = prompt;
+    this._copyLoginUrl(login);
+    if (this.running) this.render();
+  }
+
+  _closeLogin() {
+    if (!this.login) return;
+    this._loginTimerOff(this.login);
+    this.login = null;
+    if (this.mode === 'login') this.mode = 'normal';
+    this._writeTerminal(PASTE_OFF);
+  }
+
+  /** Put the panel's link on the clipboard (OSC 52). True when it was sent;
+   *  whether the terminal honoured it is not something a terminal reports.
+   *  @param {LoginPanel} login */
+  _copyLoginUrl(login) {
+    if (!login.prompt) return false;
+    return this._writeTerminal(clipboardSequence(login.prompt.url, { tmux: Boolean(this._env.TMUX) }));
+  }
+
+  /**
+   * A control sequence for the terminal itself rather than for the frame: a
+   * mode switch or a clipboard write. Through the same stdout the frame is
+   * painted on, and under the same rule: nothing once the terminal is gone.
+   * Not dropped while the terminal is behind, as a frame is: it is a few
+   * hundred bytes, written once, and the next frame does not repeat it.
+   * @param {string} seq
+   */
+  _writeTerminal(seq) {
+    if (!this.running || this._stdoutDead) return false;
+    try { process.stdout.write(seq); } catch { return false; }
+    return true;
   }
 
   async _doSync() {
@@ -2101,6 +2444,10 @@ export class TUI {
     }
 
     const lines = [];
+    // Links to draw on this frame, keyed by the exact line that carries one
+    // (see the paint loop at the end).
+    /** @type {Map<string, { text: string, url: string, id: string }>} */
+    let links = new Map();
 
     // ── Header
     const left = bold(' TeamClaude');
@@ -2163,8 +2510,13 @@ export class TUI {
     } else if (view === 'blocklist') {
       this._renderBlocklist(lines);
     } else {
-    // ── Accounts
-    if (this.am.accounts.length === 0) {
+    // ── Accounts, or the login panel in their place. The activity pane stays
+    // under the panel: the sign-in's own progress lines land there.
+    if (view === 'login') {
+      const panel = this._loginLines(W);
+      lines.push(...panel.lines);
+      links = panel.links;
+    } else if (this.am.accounts.length === 0) {
       lines.push('');
       // Attach mode cannot add an account, and pointing at a key that does
       // nothing here would be worse than saying only what is known.
@@ -2249,12 +2601,99 @@ export class TUI {
     // Write buffer
     let buf = `${ESC}H`;
     for (let i = 0; i < H; i++) {
-      buf += fitLine(lines[i] || '', W);
+      // A link is spliced in only after the line is fitted. Neither the width
+      // measure nor truncate knows OSC 8, and truncate must not learn it: it is
+      // the last guard against an escape in a foreign value reaching the
+      // terminal. A link line whose text was cut to fit simply stays plain.
+      const link = links.get(lines[i]);
+      const row = fitLine(lines[i] || '', W);
+      buf += link ? row.replace(link.text, () => hyperlink(link.url, link.text, { id: link.id })) : row;
       if (i < H - 1) buf += '\r\n';
     }
     // Show cursor only in input mode
     buf += this.mode === 'input' ? `${ESC}?25h` : `${ESC}?25l`;
     this._paint(buf, force);
+  }
+
+  /**
+   * The login panel, drawn where the account rows go while a sign-in waits.
+   *
+   * The URL is drawn in full under a bold label, one piece per line, every
+   * piece the same OSC 8 link. The link and the clipboard copy both depend on
+   * the terminal (and on tmux passing them through); the text does not, so a
+   * terminal that does neither still leaves the URL to select by hand. The
+   * pieces start at column 0 and fill the width, so a selection across them
+   * picks up nothing but the URL and the line breaks, which a browser's
+   * address bar drops on paste.
+   *
+   * The paste line carries the ▸ the body scroll follows, so on a terminal too
+   * short for the whole panel the field is what stays in view.
+   *
+   * @param {number} W
+   * @returns {{ lines: string[], links: Map<string, { text: string, url: string, id: string }> }}
+   */
+  _loginLines(W) {
+    /** @type {string[]} */
+    const lines = [''];
+    /** @type {Map<string, { text: string, url: string, id: string }>} */
+    const links = new Map();
+    const login = this.login;
+    if (!login) return { lines, links };
+    const prompt = login.prompt;
+    const brand = prompt?.provider === 'codex' ? 'OpenAI' : prompt ? 'Claude' : '';
+    lines.push(` ${bold(`Sign in "${safeLine(login.account, 60)}"`)}${brand ? dim(` · ${brand}`) : ''}`);
+    lines.push('');
+    if (!prompt) {
+      lines.push(dim('   Starting the sign-in...'));
+      return { lines, links };
+    }
+
+    const textW = Math.max(20, W - 4);
+    // A numbered step wraps under its own text, not under its number.
+    const prose = (/** @type {string} */ text, paint = (/** @type {string} */ l) => l) => {
+      const hang = /^\d+\. /.test(text) ? 3 : 0;
+      wrapWords(text, textW - hang).forEach((l, i) => lines.push(`   ${i && hang ? ' '.repeat(hang) : ''}${paint(l)}`));
+    };
+    /** @param {string} text */
+    const linkLine = text => {
+      lines.push(text);
+      links.set(text, { text, url: prompt.url, id: login.linkId });
+    };
+
+    lines.push(`   ${bold(`Open the ${brand} sign-in page:`)}`);
+    for (let i = 0; i < prompt.url.length; i += W) linkLine(linkText(prompt.url.slice(i, i + W)));
+    prose(`Link sent to your clipboard (if your terminal allows OSC 52).${login.notice ? ` ${login.notice}` : ''}`, dim);
+    lines.push('');
+
+    // A browser was opened here only when the flow is listening for it on a
+    // local terminal; otherwise the link is the whole way in. Said as what
+    // was done on this machine, not as what the person sees: a server whose
+    // terminal only looks local (see isRemoteSession) opened it where nobody is.
+    const automatic = prompt.listening && !prompt.remote;
+    if (automatic) prose('A browser was opened on this machine. Approving the sign-in there finishes it by itself.');
+    if (prompt.provider === 'claude') {
+      if (automatic) prose('Not at this machine? Open the link on your device, sign in, and paste the code the page shows.');
+      else {
+        prose('1. Open the link on any device and sign in.');
+        prose('2. The page then shows a code. Copy it and paste it below.');
+      }
+    } else {
+      if (automatic) prose('Not at this machine? Open the link on your device. Its browser ends on a localhost:1455 page that does not load; copy that address and paste it below.');
+      else {
+        prose('1. Open the link on any device and sign in.');
+        prose('2. The browser then lands on a localhost:1455 page that does not load. Copy that address from the address bar and paste it below.');
+      }
+      // The listener is up but out of reach of a browser on another machine,
+      // and one ssh flag puts it within reach.
+      if (prompt.listening && prompt.remote) prose('Tip: connect with ssh -L 1455:localhost:1455 and the browser reaches this machine, so the sign-in finishes by itself.', dim);
+      if (prompt.note) prose(`${safeLine(prompt.note, 200)}, so only a pasted address can finish this sign-in.`, yellow);
+    }
+
+    lines.push('');
+    const label = `   ${bold('Paste')} ${cyan('▸')} `;
+    lines.push(`${label}${tailText(login.buf, Math.max(1, W - vw(label) - 2))}█`);
+    if (login.error) prose(`✗ ${login.error}`, red);
+    return { lines, links };
   }
 
   /** Width budget for a list `W` wide, per row category, as one provider's pane when
@@ -3225,6 +3664,13 @@ export class TUI {
         return ` ${bold('i')}mport Claude Code  ${bold('k')} API key  ${bold('Esc')} cancel`;
       case 'input':
         return ` ${this.inputPrompt}: ${this.inputSecret ? '*'.repeat(this.inputBuf.length) : this.inputBuf}█`;
+      case 'login': {
+        // `c` is only a key while the field is empty (see _keyLogin), so it
+        // is only offered then.
+        const login = this.login;
+        const panelKeys = login?.prompt && !login.buf ? `  ${bold('c')} copy link` : '';
+        return ` ${bold('Enter')} submit  ${bold('Esc')} cancel${panelKeys}`;
+      }
       default:
         return '';
     }

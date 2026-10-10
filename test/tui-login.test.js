@@ -64,11 +64,12 @@ test('login: Enter runs the login for the picked account and reports it', async 
   const tui = makeTUI({ loginAccount: async a => { seen.push(a.name); return { action: 'updated', name: a.name }; } });
   tui._key('l');
   tui._key('enter');
-  assert.equal(tui.mode, 'normal', 'the dashboard comes back while the browser flow waits');
+  assert.equal(tui.mode, 'login', 'the login panel holds the screen while the flow waits');
   await new Promise(r => setImmediate(r));
   assert.deepEqual(seen, ['dead@example.com']);
   assert.ok(logged(tui).some(m => m.includes('Logged in "dead@example.com"')));
   assert.equal(tui._loggingIn, null);
+  assert.equal(tui.mode, 'normal', 'and gives it back once the flow is decided');
 });
 
 test('login: signing in as someone else is said plainly, not reported as success', async () => {
@@ -95,8 +96,17 @@ test('login: a failed or timed-out flow is a log line, and the key works again',
 test('login: one browser flow at a time', async () => {
   let release;
   let calls = 0;
-  const tui = makeTUI({ loginAccount: () => { calls++; return new Promise(r => { release = () => r({ action: 'updated', name: 'dead@example.com' }); }); } });
+  // A paste the flow takes closes the panel, but the token exchange behind it
+  // is still running: that is the window a second `l` can reach.
+  const tui = makeTUI({ loginAccount: (_a, { onPrompt }) => {
+    calls++;
+    onPrompt({ provider: 'claude', url: 'https://claude.ai/oauth/authorize?x=1', remote: true, listening: false, note: null, submit: () => true });
+    return new Promise(r => { release = () => r({ action: 'updated', name: 'dead@example.com' }); });
+  } });
   tui._key('l'); tui._key('enter');
+  tui._onData('code#state');
+  tui._key('enter');
+  assert.equal(tui.mode, 'normal');
   tui._key('l'); tui._key('enter');
   assert.equal(calls, 1);
   assert.ok(logged(tui).some(m => m.includes('Still waiting on the sign-in')));
