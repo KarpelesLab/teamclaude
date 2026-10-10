@@ -132,15 +132,15 @@ export async function importCredentials(filePath, {
 const PROFILE_URL = 'https://api.anthropic.com/api/oauth/profile';
 // `cedar_ember=1` asks the endpoint to add its banked-reset block (issue #493).
 // It is additive: every other field comes back unchanged.
-const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage?cedar_ember=1';
-const OAUTH_USAGE_BETA = 'oauth-2025-04-20';
+export const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage?cedar_ember=1';
+export const OAUTH_USAGE_BETA = 'oauth-2025-04-20';
 // The banked-reset block is gated on the User-Agent alone, measured against
 // the live endpoint: a non-Claude-Code agent reads `ineligible_reason:
 // "surface"`, a claude-cli older than 2.1.280 reads `"cli_version"`. This is a
 // published Claude Code release. If upstream raises the floor, the block comes
 // back ineligible, bankedResets() yields null, and only the reset reading goes
 // quiet; the quota buckets do not depend on it.
-const USAGE_USER_AGENT = 'claude-cli/2.1.288 (external, cli)';
+export const USAGE_USER_AGENT = 'claude-cli/2.1.288 (external, cli)';
 const DEFAULT_TOKEN_ENDPOINT = 'https://platform.claude.com/v1/oauth/token';
 const DEFAULT_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 
