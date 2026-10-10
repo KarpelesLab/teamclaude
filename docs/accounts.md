@@ -201,6 +201,10 @@ Two fleet features reason about this machine's own exit address, which a routed 
 
 Accounts can also be added, removed and reordered from the TUI settings screen: **`g`** → **Add account** / **Remove account** / **Reorder accounts**.
 
+### Why an account is in `error`
+
+An account leaves rotation as `error` when upstream rejects its refresh token, or answers 401 to a token that has none to refresh with. `teamclaude status` names which, instead of pointing at the logs — `needs a re-login: upstream rejected its refresh token (400) — run: teamclaude login` — and `GET /teamclaude/status` carries the same under `accounts[].errorReason`: `code` (`refresh_rejected` or `credential_rejected`), `detail`, `since` (epoch ms) and `remedy`, the login command that brings it back. It is `null` whenever the account is not in `error`.
+
 ### Signing in again from the TUI
 
 An OAuth account whose refresh token upstream has rejected — typically because the same account was signed in somewhere else, which rotates the token and kills the copy TeamClaude holds — shows as `error` and stays that way until someone signs in again. Press **`l`** on the dashboard: the picker opens on the first account in `error`, and **Enter** opens the provider's sign-in page in your browser (Claude or Codex, by the account's provider). The dashboard stays live while it waits, up to two minutes.

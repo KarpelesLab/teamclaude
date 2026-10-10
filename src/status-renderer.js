@@ -322,7 +322,10 @@ export function heldResetCredits(quota, now = Date.now()) {
 export function unavailableLine(account, paint) {
   const reason = account?.unavailable;
   if (!reason) return null;
-  const text = UNAVAILABLE_TEXT[reason] || safeLine(reason, 64);
+  const err = reason === 'error' ? account.errorReason : null;
+  const text = err
+    ? `needs a re-login: ${safeLine(err.detail, 120)} — run: ${safeLine(err.remedy, 40)}`
+    : UNAVAILABLE_TEXT[reason] || safeLine(reason, 64);
   // An account serving as the extra-usage fallback reads as out of quota like
   // any other, yet is taking traffic and billing for it. Say so on the line
   // that would otherwise tell the operator it is idle.
