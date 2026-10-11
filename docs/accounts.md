@@ -532,6 +532,8 @@ The effective upstream is what counts. A fleet pointed at a third-party host thr
 
 A relay that forwards to Anthropic does keep thread state, and for it the refusal is pure overhead — the client would re-send a full history each turn for nothing. Declare it with `"messageThreads": true` on the account, or at the top level of the config for the global `upstream`, and continues are forwarded untouched.
 
+Untouched includes the proxy's tool-pair repair, which strips a `tool_use` or `tool_result` left without its counterpart so a compacted or interrupted conversation is not rejected. It reads a body as the whole conversation, and a delta is not one: after a tool call it opens with the `tool_result`, whose `tool_use` is in the thread. Through 1.1.24 the repair stripped that `tool_result`, Anthropic answered `400` (`messages.0: use the top-level 'system' parameter for the initial system prompt`), and every continue that followed a tool call was resent in full. A continue is now left to the upstream that holds its thread; a create, and a body with no thread, are repaired as before.
+
 ### `accounts[].models` is deprecated
 
 The older per-account `models` list still works, but use a [route](routing.md#model-routes) instead. Routes are more flexible (glob matching, multiple accounts, bucket override) and less surprising: a `models` list changes eligibility across the *whole fleet* — once any account claims a model, every account that doesn't claim it is skipped for that model. The server prints a deprecation notice at startup naming the route to replace it with, and the field may be removed in a future version.
