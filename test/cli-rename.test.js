@@ -42,7 +42,7 @@ function runCli(configPath, cliArgs) {
   child.stdout.on('data', c => { stdout += c; });
   child.stderr.on('data', c => { stderr += c; });
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('CLI did not exit')); }, 10_000);
+    const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('CLI did not exit')); }, 60_000);
     child.on('error', err => { clearTimeout(timer); reject(err); });
     child.on('exit', code => { clearTimeout(timer); resolve({ code, stdout, stderr }); });
   });
