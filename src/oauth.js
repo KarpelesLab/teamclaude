@@ -149,11 +149,15 @@ const DEFAULT_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
  * Retries on 5xx and network errors with exponential backoff.
  * `routing` is the account's own egress proxy (account-routing.js); null goes
  * by the fleet path (upstream proxy when configured, direct otherwise).
+ * `budgetMs` bounds the whole call, retries included: no attempt goes out once
+ * it is spent, and none outlives it — the time a lock held for this renewal
+ * has left (credential-sync.js).
  * @param {string} refreshToken
  * @param {string} [endpoint]
  * @param {import('./account-routing.js').RoutingProxy|null} [routing]
+ * @param {{ budgetMs?: number }} [opts]
  */
-export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_ENDPOINT, routing = null) {
+export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_ENDPOINT, routing = null, { budgetMs = Infinity } = {}) {
   const maxRetries = 2;
   const baseDelayMs = 500;
   // Bound each attempt so a dead pooled socket (after a network drop/reconnect)
@@ -161,6 +165,7 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
   // ensureTokenFresh coalesces callers into a single _refreshPromise, so one
   // stuck refresh wedges every request for that account until a restart.
   const timeoutMs = Number(envVar('REFRESH_TIMEOUT_MS')) || 30_000;
+  const deadline = Date.now() + budgetMs;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
@@ -168,6 +173,8 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
         const delay = baseDelayMs * 2 ** (attempt - 1);
         await new Promise(resolve => setTimeout(resolve, delay));
       }
+      const left = deadline - Date.now();
+      if (left <= 0) throw new Error('Token refresh ran out of time');
 
       const res = await proxyFetch(endpoint, {
         method: 'POST',
@@ -181,7 +188,7 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
           refresh_token: refreshToken,
           client_id: DEFAULT_CLIENT_ID,
         }),
-        signal: AbortSignal.timeout(timeoutMs),
+        signal: AbortSignal.timeout(Math.min(timeoutMs, left)),
         routing,
       });
 
@@ -364,9 +371,12 @@ export async function fetchProfile(accessToken, routing = null) {
  * @param {import('./account-routing.js').RoutingProxy|null} [routing] - the
  * account's own egress proxy; every call here (the profile, and the refresh it
  * may need first) is that account's traffic. Null goes by the fleet path.
+ * @param {{ renew?: (creds: Record<string, any>) => Promise<{ accessToken: string, refreshToken: string, expiresAt: number }> }} [opts]
+ * renew: the refresh itself, which the caller can put behind the callback.net
+ * lock (credential-sync.js refreshOutsideProxy); the default is a plain one.
  * @returns {Promise<{ creds: Record<string, any>, profile: Record<string, any> }>}
  */
-export async function profileForCredentials(creds, routing = null) {
+export async function profileForCredentials(creds, routing = null, { renew = (c) => refreshAccessToken(c.refreshToken, undefined, routing) } = {}) {
   /** @type {Record<string, any>|null} */
   let profile = isTokenExpired(creds.expiresAt) ? null : await fetchProfile(creds.accessToken, routing);
   if (profile && profile.status !== 401) return { creds, profile };
@@ -382,7 +392,7 @@ export async function profileForCredentials(creds, routing = null) {
 
   let renewed;
   try {
-    renewed = await refreshAccessToken(creds.refreshToken, undefined, routing);
+    renewed = await renew(creds);
   } catch (err) {
     // The refresh did not go through. The upstream keeps the last word on the
     // access token itself, so one the clock wrote off is still presented once:

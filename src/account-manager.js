@@ -447,6 +447,12 @@ function makeAccount(acct, index, listener = null) {
     // The refresh token upstream last rejected as invalid, if it is still the
     // one we hold — see the dead-token guard in ensureTokenFresh.
     _deadRefreshToken: null,
+    // Whether the token it holds was minted by the token endpoint for this
+    // process — a renewal here, not one taken from the store. Only such a token
+    // is fresh enough to store on callback.net (credential-sync.js). Never
+    // persisted, so false at every launch, and false again whenever tokens
+    // arrive from elsewhere (updateAccountTokens).
+    _minted: false,
   };
 }
 
@@ -4809,9 +4815,18 @@ export class AccountManager {
         // same, below, and is persisted the same. Or with nothing: the token
         // is still good and another install is renewing it, so this one keeps
         // what it has and asks again on the next request.
-        const refresh = () => (providerOf(account) === 'codex'
-          ? this._codexRefreshFn(sent, undefined, account.routing || null)
-          : this._refreshFn(sent, undefined, account.routing || null));
+        // `budgetMs`: how long the grant may take, from the coordinator holding
+        // a lock that lapses (credential-sync.js); none means the default.
+        // `minted`: the token endpoint answered this call, so the tokens are
+        // known good. A coordinator answer taken from the store is not.
+        let minted = false;
+        const refresh = async (/** @type {{ budgetMs?: number }} */ opts = {}) => {
+          const tokens = await (providerOf(account) === 'codex'
+            ? this._codexRefreshFn(sent, undefined, account.routing || null, opts)
+            : this._refreshFn(sent, undefined, account.routing || null, opts));
+          minted = true;
+          return tokens;
+        };
         const newTokens = await this._refreshCoordinator(account, refresh, { force });
         if (newTokens == null) return;
         if (account.refreshToken !== sent) {
@@ -4823,6 +4838,8 @@ export class AccountManager {
         account.expiresAt = newTokens.expiresAt;
         account._lastRefreshAt = Date.now();
         account._deadRefreshToken = null; // this token works; clear any stale guard
+        // Set before the listener runs: it is what lets the sync store them.
+        account._minted = minted;
         console.log(`[TeamClaude] Token refreshed for account "${safeLine(account.name, 64)}"`);
         this._onTokenRefresh?.(accountIndex, newTokens);
       } catch (err) {
@@ -4942,6 +4959,8 @@ export class AccountManager {
     account.credential = accessToken;
     if (refreshToken) account.refreshToken = refreshToken;
     account.expiresAt = expiresAt;
+    // Tokens from elsewhere (the store, a reload from disk) were not minted here.
+    account._minted = false;
     if (account.status === 'error') account.status = 'active';
     console.log(`[TeamClaude] Updated tokens for account "${safeLine(account.name, 64)}"`);
     this._onTokenRefresh?.(accountIndex, {
