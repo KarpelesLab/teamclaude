@@ -81,10 +81,22 @@ export function openBrowser(url) {
   const win = process.platform === 'win32';
   const opener = process.platform === 'darwin' ? 'open' : win ? 'start' : 'xdg-open';
   const report = (/** @type {string} */ why) => console.error(`Could not open a browser (${opener}): ${why}. Open the link by hand instead.`);
+  // The callback.net verification link comes from that server, not from us.
+  // Re-serialized through URL, a quote or space in it is percent-encoded and
+  // cannot break out of cmd's quoting below; anything but http(s) is refused.
+  let href;
+  try {
+    const u = new URL(url);
+    if (u.protocol !== 'https:' && u.protocol !== 'http:') throw new Error(`refusing a ${u.protocol} link`);
+    href = u.href;
+  } catch (err) {
+    report(err instanceof Error ? err.message : String(err));
+    return;
+  }
   try {
     // `start` reads its first quoted argument as a window title, and cmd would
     // split an unquoted URL at `&`.
-    const child = spawn(opener, win ? ['""', `"${url}"`] : [url], { stdio: 'ignore', shell: win, detached: !win });
+    const child = spawn(opener, win ? ['""', `"${href}"`] : [href], { stdio: 'ignore', shell: win, detached: !win });
     child.on('error', err => report(err.message));
     child.on('exit', code => { if (code) report(`exit code ${code}`); });
     child.unref();
