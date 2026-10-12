@@ -47,6 +47,10 @@ const MAX_REPLY_BYTES = 1 << 20;
 const POLL_PAUSE_MS = 1000;
 // Used when token_create does not say how long its poll token lives.
 const DEFAULT_POLL_LIFETIME_S = 900;
+// An access token this close to the end of its stated lifetime is renewed
+// before the call rather than after a refusal: not every endpoint reports a
+// lapsed token as one (`:lock` answers "Access denied").
+const RENEW_AHEAD_MS = 120_000;
 
 /**
  * @typedef {Object} CallbackToken
@@ -344,9 +348,61 @@ export async function refreshCallbackToken(token, { now = Date.now, ...call } = 
 }
 
 /**
- * An authenticated API call as the signed-in user. An expired access token is
- * renewed once, saved, and the call repeated; a session that cannot be renewed
- * rejects with `loginRequired` set.
+ * Whether the access token is within `marginMs` of the end of the lifetime it
+ * was issued with. A token that states no lifetime never is: only the server
+ * can say it has lapsed.
+ *
+ * @param {CallbackToken} token
+ * @param {number} at      epoch ms
+ * @param {number} [marginMs]
+ * @returns {boolean}
+ */
+export function callbackTokenLapsed(token, at, marginMs = 0) {
+  const lifetime = Number(token?.expires_in);
+  const issued = Number(token?.obtained_at);
+  if (!Number.isFinite(lifetime) || lifetime <= 0 || !Number.isFinite(issued)) return false;
+  return at >= issued + lifetime * 1000 - marginMs;
+}
+
+// One renewal in flight per refresh token: the calls that find the token
+// lapsed together share it, rather than each spending the refresh token.
+/** @type {Map<string, Promise<CallbackToken>>} */
+const renewing = new Map();
+
+/**
+ * Renew the stored token and save what comes back.
+ *
+ * @param {CallbackToken} token
+ * @param {CallOptions & { now?: () => number }} opts
+ * @returns {Promise<CallbackToken>}
+ */
+function renewCallbackToken(token, opts) {
+  const key = token.refresh_token || '';
+  const pending = renewing.get(key);
+  if (pending) return pending;
+  const renewal = (async () => {
+    let fresh;
+    try {
+      fresh = await refreshCallbackToken(token, opts);
+    } catch (/** @type {any} */ err) {
+      // A refresh the server REFUSED is a dead session; one that never reached
+      // it (network, timeout) is not, and must not read as "sign in again".
+      if (err && typeof err.code === 'number' && err.code >= 400 && err.code < 500) err.loginRequired = true;
+      throw err;
+    }
+    await saveCallbackToken(fresh);
+    return fresh;
+  })().finally(() => { renewing.delete(key); });
+  renewing.set(key, renewal);
+  return renewal;
+}
+
+/**
+ * An authenticated API call as the signed-in user. A token near the end of its
+ * stated lifetime is renewed first; one the call finds expired — reported as
+ * such, or refused (401/403) once past that lifetime — is renewed then, and the
+ * call repeated. At most one renewal per call. A session that cannot be
+ * renewed rejects with `loginRequired` set.
  *
  * @param {string} method
  * @param {string} path
@@ -357,28 +413,32 @@ export async function refreshCallbackToken(token, { now = Date.now, ...call } = 
 export async function callbackCall(method, path, params = null, opts = {}) {
   // `opts` goes to the plain calls as it is: they read only the fields they know.
   const call = opts;
-  const token = await loadCallbackToken();
+  const now = opts.now || Date.now;
+  let token = await loadCallbackToken();
   if (!token) {
     /** @type {CallbackApiError} */
     const err = new Error('not signed in to callback.net');
     err.loginRequired = true;
     throw err;
   }
+  let renewed = false;
+  if (token.refresh_token && callbackTokenLapsed(token, now(), RENEW_AHEAD_MS)) {
+    try {
+      token = await renewCallbackToken(token, opts);
+      renewed = true;
+    } catch (/** @type {any} */ err) {
+      // Refused: the session is over. Unreached: the current token has a
+      // little life left, so the call goes out with it.
+      if (err?.loginRequired) throw err;
+    }
+  }
   try {
     return await callbackApi(method, path, params, { ...call, accessToken: token.access_token });
   } catch (/** @type {any} */ err) {
-    if (!err?.tokenExpired) throw err;
+    const refused = err?.code === 401 || err?.code === 403;
+    if (renewed || !(err?.tokenExpired || (refused && callbackTokenLapsed(token, now())))) throw err;
   }
-  let fresh;
-  try {
-    fresh = await refreshCallbackToken(token, opts);
-  } catch (/** @type {any} */ err) {
-    // A refresh the server REFUSED is a dead session; one that never reached
-    // it (network, timeout) is not, and must not read as "sign in again".
-    if (err && typeof err.code === 'number' && err.code >= 400 && err.code < 500) err.loginRequired = true;
-    throw err;
-  }
-  await saveCallbackToken(fresh);
+  const fresh = await renewCallbackToken(token, opts);
   return callbackApi(method, path, params, { ...call, accessToken: fresh.access_token });
 }
 
