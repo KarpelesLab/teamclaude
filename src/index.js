@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { spawn, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { createWriteStream } from 'node:fs';
 import { readFile } from 'node:fs/promises';
@@ -10,7 +10,7 @@ import { installCrashHandlers } from './crash-log.js';
 import { AccountManager, distributionMode, accountRouting } from './account-manager.js';
 import { validateAdaptiveConfig } from './adaptive-distribution.js';
 import { createProxyServer, reloadedHeaderFlags } from './server.js';
-import { importCredentials, loginOAuth, loginOAuthWithPastedCode, fetchProfile, profileForCredentials, refreshAccessToken, isTokenExpired, isTokenExpiringSoon } from './oauth.js';
+import { importCredentials, loginOAuth, loginOAuthWithPastedCode, startOAuthLogin, fetchProfile, profileForCredentials, refreshAccessToken, isTokenExpired, isTokenExpiringSoon } from './oauth.js';
 import {
   sameIdentity,
   orgKey,
@@ -22,7 +22,8 @@ import {
   oauthIdentityFields,
 } from './identity.js';
 import { resolveAccounts } from './resolve-accounts.js';
-import { loginCodex } from './codex-auth.js';
+import { loginCodex, startCodexLogin } from './codex-auth.js';
+import { isRemoteSession, openBrowser, PANEL_LOGIN_TIMEOUT_MS } from './login-flow.js';
 import { providerOf } from './provider.js';
 import { syncAccountsFromDisk } from './sync-accounts.js';
 import { mergeAccountsForSave, syncRefreshedTokens, removedAccountIds, clearRemovedAccountIds, clearAddedAccountIds, markAccountRemoved, configIndexFor } from './account-pairing.js';
@@ -52,7 +53,7 @@ import { upstreamFor } from './provider.js';
 import { startEventLoopMonitor } from './event-loop-monitor.js';
 import { envVar } from './brand.js';
 import { loginCallback, loadCallbackToken, saveCallbackToken, callbackWhoami, logoutCallback, callbackClientId, getCallbackAuthPath } from './callback-auth.js';
-import { CredentialSync } from './credential-sync.js';
+import { CredentialSync, refreshOutsideProxy } from './credential-sync.js';
 
 // The server's credential sync, once it runs; a CLI command that changes an
 // account on disk talks to the store through a sync of its own instead.
@@ -67,14 +68,14 @@ function standaloneCredentialSync() {
 /**
  * An explicit sign-in (`login`, `import`): store the entry's tokens, over a
  * tombstone included, when this install is signed in to callback.net. Never
- * fatal — the account is in the config either way, and the next pass stores it.
+ * fatal — the account is in the config either way, and its next renewal stores it.
  * @param {Record<string, any>} entry
  */
 async function recordSignInWithCallback(entry) {
   try {
     if (await standaloneCredentialSync().storeSignIn(entry)) console.log('Stored on callback.net for your other installs.');
   } catch (/** @type {any} */ err) {
-    console.error(`Could not store the sign-in on callback.net (${err?.message || err}); the next sync pass will.`);
+    console.error(`Could not store the sign-in on callback.net (${err?.message || err}); its next renewal will.`);
   }
 }
 
@@ -445,7 +446,7 @@ async function serverCommand() {
   // start, on reload and daily brings the fleet level with the store.
   const credentialSync = new CredentialSync({ accountManager, addAccount: admitAccount, evictAccount });
   activeCredentialSync = credentialSync;
-  accountManager.setRefreshCoordinator((account, refresh) => credentialSync.coordinateRefresh(account, refresh));
+  accountManager.setRefreshCoordinator((account, refresh, info) => credentialSync.coordinateRefresh(account, refresh, info));
   // Not awaited: the removal is done; the tombstone follows.
   accountManager.onAccountRemoved((account) => { credentialSync.onAccountRemoved(account).catch(() => {}); });
   // An account in error looks in the store for a token another install holds.
@@ -713,15 +714,34 @@ async function serverCommand() {
         if (config.routes != null) diskConfig.routes = config.routes;
       }),
       syncAccounts: reloadAccounts,
-      // `l` key: browser login for the chosen account's provider, from inside
-      // the running server. Same upsert the CLI uses — the account the BROWSER
-      // signed in as is the one that gets the tokens, whichever row was picked —
-      // then an in-process reload instead of the CLI's HTTP notify. Never exits:
-      // a failed login is a line in the activity pane, not the end of the proxy.
-      loginAccount: async (/** @type {Record<string, any>} */ account) => {
-        const outcome = account && providerOf(account) === 'codex'
-          ? await upsertCodexAccount(undefined, await loginCodex({ showUrl: false }), null, false)
-          : await upsertOAuthAccount(undefined, await loginOAuth({ interactive: false }), 'login', null, false, { fatal: false, notify: false });
+      // `l` key: sign in the chosen account's provider from inside the running
+      // server. Same upsert the CLI uses — the account the BROWSER signed in as
+      // is the one that gets the tokens, whichever row was picked — then an
+      // in-process reload instead of the CLI's HTTP notify. Never exits: a
+      // failed or cancelled login is a line in the activity pane, not the end of
+      // the proxy.
+      //
+      // The TUI's login panel shows the link, copies it and takes the paste;
+      // `onPrompt` hands it what it needs once the flow is listening. A browser
+      // is opened here only when the terminal looks local. For Claude, that is
+      // also the only case with a loopback listener: on a remote session it
+      // could not be reached, and the code page's paste is the whole flow. Codex
+      // always listens on 1455, because `ssh -L 1455:localhost:1455` makes it
+      // reachable from the laptop.
+      loginAccount: async (/** @type {Record<string, any>} */ account, /** @type {{ signal?: AbortSignal, onPrompt?: (prompt: import('./login-flow.js').LoginPrompt) => void }} */ { signal, onPrompt } = {}) => {
+        const remote = isRemoteSession();
+        let outcome;
+        if (account && providerOf(account) === 'codex') {
+          const flow = await startCodexLogin({ signal, timeoutMs: PANEL_LOGIN_TIMEOUT_MS });
+          if (!remote && !signal?.aborted) openBrowser(flow.url);
+          onPrompt?.({ provider: 'codex', url: flow.url, remote, listening: flow.listening, note: flow.listenError?.message ?? null, submit: flow.submit });
+          outcome = await upsertCodexAccount(undefined, await flow.credentials, null, false);
+        } else {
+          const flow = await startOAuthLogin({ loopback: !remote, signal, timeoutMs: PANEL_LOGIN_TIMEOUT_MS });
+          if (flow.browserUrl && !signal?.aborted) openBrowser(flow.browserUrl);
+          onPrompt?.({ provider: 'claude', url: flow.url, remote, listening: Boolean(flow.browserUrl), note: null, submit: flow.submit });
+          outcome = await upsertOAuthAccount(undefined, await flow.tokens, 'login', null, false, { fatal: false, notify: false });
+        }
         await reloadAccounts();
         return outcome;
       },
@@ -1185,11 +1205,18 @@ async function loginCodexCommand() {
   const loaded = await loadOrCreateConfig();
   const { routing, store } = loginRouting(loaded);
   await requireWorkingRouting(routing, upstreamFor({ type: 'oauth', provider: 'codex' }, loaded.upstream));
+  // Over SSH a browser opened here is one nobody sees: print the URL instead,
+  // and the paste prompt loginCodex shows on a terminal finishes the sign-in.
+  const remote = isRemoteSession();
+  if (remote && !args.includes('--no-browser')) console.log('This looks like a remote session (SSH, or no display), so no browser is opened here.');
   let creds;
   try {
-    creds = await loginCodex({ noBrowser: args.includes('--no-browser'), routing });
+    creds = await loginCodex({ noBrowser: args.includes('--no-browser') || remote, routing });
   } catch (err) {
-    console.error(`Codex login failed: ${err.message}`);
+    // sanitizeText: the reason can quote the provider (a token endpoint's
+    // response body, an OAuth error description), and a terminal would act
+    // on any escape sequence in it.
+    console.error(`Codex login failed: ${sanitizeText(err?.message || err)}`);
     console.error('');
     console.error('Alternative: sign in with the Codex CLI and import that login instead —');
     console.error('  CODEX_HOME=~/.codex-second codex login');
@@ -1365,12 +1392,18 @@ async function loginOAuthCommand({ pasteOnly = false } = {}) {
   const { routing, store } = loginRouting(loaded);
   await requireWorkingRouting(routing, upstreamFor({ type: 'oauth' }, loaded.upstream));
 
+  // Over SSH the browser flow cannot work: a browser opened here is one nobody
+  // sees, and the laptop's browser cannot reach this machine's loopback
+  // listener. The paste-only flow is the one that can, so it is the default.
+  const remote = !pasteOnly && isRemoteSession();
   console.log('Starting OAuth login...');
+  if (remote) console.log('This looks like a remote session (SSH, or no display): sign in on any device and paste the code back here.\n');
   let creds;
   try {
-    creds = pasteOnly ? await loginOAuthWithPastedCode({ routing }) : await loginOAuth({ routing });
+    creds = pasteOnly || remote ? await loginOAuthWithPastedCode({ routing }) : await loginOAuth({ routing });
   } catch (err) {
-    console.error(`OAuth login failed: ${err.message}`);
+    // sanitizeText: as for Codex, the reason can quote the provider.
+    console.error(`OAuth login failed: ${sanitizeText(err?.message || err)}`);
     console.error('');
     console.error('Alternatives:');
     console.error('  teamclaude import        Import from existing Claude Code credentials');
@@ -1816,7 +1849,12 @@ async function accountsCommand() {
     if (a.type !== 'oauth' || !a.refreshToken) return;
     if (!isTokenExpiringSoon(a.expiresAt)) return;
     try {
-      const newTokens = await refreshAccessToken(a.refreshToken, undefined, accountRouting(a, localListener(config)));
+      // Through the callback.net lock when signed in there, as the running
+      // proxy's own refreshes are: another install, or the proxy on this one,
+      // may be renewing this same token.
+      const routing = accountRouting(a, localListener(config));
+      const newTokens = await refreshOutsideProxy(a, (o) => refreshAccessToken(a.refreshToken, undefined, routing, o));
+      if (!newTokens) return; // another install is renewing it, and the current one still serves
       a.accessToken = newTokens.accessToken;
       a.refreshToken = newTokens.refreshToken;
       a.expiresAt = newTokens.expiresAt;
@@ -2272,22 +2310,6 @@ function describeCallbackUser(/** @type {{ id: string|null, email: string|null, 
   return me.name || me.email || me.id || 'an unnamed user';
 }
 
-// Best effort and never in the way: the URL is printed before this runs, so a
-// machine with no browser (SSH, a container) loses nothing. Detached with no
-// stdio, so an opener that falls back to a text browser cannot take the
-// terminal, and one that hangs cannot hold the sign-in up.
-function openInBrowser(/** @type {string} */ url) {
-  const win = process.platform === 'win32';
-  const opener = process.platform === 'darwin' ? 'open' : win ? 'start' : 'xdg-open';
-  try {
-    // `start` reads its first quoted argument as a window title, and cmd would
-    // split an unquoted URL at `&`.
-    const child = spawn(opener, win ? ['""', `"${url}"`] : [url], { stdio: 'ignore', shell: win, detached: !win });
-    child.on('error', () => {});
-    child.unref();
-  } catch { /* no opener: the URL is on the screen */ }
-}
-
 // Sign-in to callback.net: a poll-token OAuth2 flow (see callback-auth.js), so
 // the browser that approves it can be on any machine. The token is this
 // install's own and lives beside the config, apart from the pooled accounts.
@@ -2323,11 +2345,13 @@ async function callbackCommand() {
           console.log(`  ${url}`);
           console.log('');
           console.log(`Waiting for approval (the link is good for ${Math.round(lifetimeSeconds / 60)} minutes; Ctrl-C to cancel)...`);
-          if (!args.includes('--no-browser')) openInBrowser(url);
+          // The URL is on the screen either way; over SSH a browser opened
+          // here is one nobody would see.
+          if (!args.includes('--no-browser') && !isRemoteSession()) openBrowser(url);
         },
       });
     } catch (/** @type {any} */ err) {
-      console.error(`callback.net sign-in failed: ${err?.message || err}`);
+      console.error(`callback.net sign-in failed: ${sanitizeText(err?.message || err)}`);
       process.exit(1);
     }
     await saveCallbackToken(token);
@@ -2671,8 +2695,10 @@ Usage: teamclaude [command] [options]
 Commands:
   server              Start the proxy server (default; --headless to skip the TUI)
   import              Import credentials from Claude Code
-  login               OAuth login via browser
+  login               OAuth login via browser (over SSH: copy/paste, as --token)
   login --token       OAuth login via copy/paste (no local callback; for headless/remote)
+  login --codex       Codex (ChatGPT) login via browser; on a terminal the address
+                      the browser lands on can be pasted instead (--no-browser)
   login --api         Add an API key account (a last resort by default:
                       --priority <n> to place it, 0 = level with the rest)
   env [--mitm|--no-mitm]
@@ -2869,13 +2895,20 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
   // refresh token is still good, so a stale token is renewed first and the
   // renewed pair is what gets saved below — `creds` is the set to write.
   const userNamed = !!name;
-  const identified = await profileForCredentials(creds, routing);
+  // The refresh goes through the callback.net lock when this install is
+  // signed in there: the token being imported may be one the store holds, and
+  // so one other installs hold too.
+  const identified = await profileForCredentials(creds, routing, {
+    renew: (c) => refreshOutsideProxy({ name: name || 'imported account', type: 'oauth', accessToken: c.accessToken, refreshToken: c.refreshToken, expiresAt: c.expiresAt }, (o) => refreshAccessToken(c.refreshToken, undefined, routing, o), { force: true })
+      .then((t) => t ?? Promise.reject(new Error('token not renewed'))),
+  });
   creds = identified.creds;
   const profile = identified.profile;
   const profileOk = profile && !profile.error;
 
   if (!canUpsertOAuthAccount(profile, userNamed)) {
-    const why = `Could not identify OAuth account — ${profile?.error || 'profile unavailable'}`;
+    // The profile error quotes the upstream's response body: one plain line.
+    const why = `Could not identify OAuth account — ${profile?.error ? sanitizeText(profile.error) : 'profile unavailable'}`;
     // --name is the documented way past a profile the proxy could not read, but
     // it is not a way past a token the upstream refused: suggesting it there
     // would be pointing at the one door this no longer opens.
@@ -2890,7 +2923,7 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
   }
 
   if (!profileOk) {
-    console.error(`Warning: importing named account without profile detection — ${profile?.error || 'profile unavailable'}`);
+    console.error(`Warning: importing named account without profile detection — ${profile?.error ? sanitizeText(profile.error) : 'profile unavailable'}`);
   }
   if (!name && profile?.email) {
     name = profile.email;
