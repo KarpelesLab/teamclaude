@@ -87,6 +87,30 @@ Each window is in one of three states, and only the first carries a number:
 
 `since` is when tracking of the current window started (the first fresh reading of it). Only weekly windows are tracked — the all-models weekly and any family bucket the account reports. The 5h window rolls over too often for a floor to say anything. The sums persist in `teamclaude.state.json`; the interval spanning a restart is never attributed to the outside, since the proxy cannot know what it served while it was down.
 
+## Burn-rate forecast
+
+The burn-rate learner behind [adaptive distribution](routing.md#adaptive-distribution) runs in every mode. `quota.forecast` in `/teamclaude/status` reads it out per weekly window: the learned rate, and when the account reaches its switch threshold at that rate, next to when the window resets.
+
+```json
+"forecast": {
+  "unified7d": { "ratePerHour": 0.0029, "threshold": 0.98, "reachesThresholdAt": 1780000000000, "resetAt": 1780090000000 }
+}
+```
+
+`ratePerHour` is a share of the window per hour (`0.0029` is 0.29% an hour). `reachesThresholdAt` and `resetAt` are ms epoch, like the quota's own `*Reset` fields. `threshold` is the account's own [switch threshold](#switch-threshold) for that window. A family bucket that has no field of its own (`scoped:opus`) is gated against the shared weekly threshold, and is forecast against it too.
+
+`teamclaude status` and the dashboard say something only when it matters: `week reaches 98% in ~31h, resets in 52h`. A window that resets before it reaches the threshold is the good case and gets no sentence.
+
+`null` means "no answer", never "never":
+
+| field | `null` when |
+|---|---|
+| `ratePerHour` | the learner has no rate for this window yet; the assumed starting rate (`initialBurnRate`) is never reported as one |
+| `reachesThresholdAt` | no rate, a rate of zero, the account is already at or above its threshold, or the window's reset has passed and the reading is from the old window. It can lie in the past when the reading is old |
+| `resetAt` | the window reports no reset, or it has passed |
+
+What the rate is. It is the learner's moving average of how fast utilization rose, measured over windows of `burnWindowMs` between readings no more than `maxSampleAgeMs` apart (see [`adaptiveDistribution`](configuration.md)). It counts all spend on the account, the proxy's and [outside spend](#spend-from-outside-the-proxy) alike. Like any moving average it reflects the recent past: a burst that has stopped keeps the forecast short until flat readings bring the rate down, and an account with no fresh readings keeps its last rate. The projection starts when the utilization was read, not at the status read, so an old reading counts down rather than repeating the same distance; once its projected time has passed, the status text drops it. With the [quota probe](#quota-probe) off, an idle account gets no readings, so its forecast is as old as its last traffic.
+
 ## Keep-warm
 
 The rolling **5-hour session window** only starts once an account sends a real message. So when your active account runs out and rotation moves to a cold account, that account's 5h window starts *then* — right when you need its full headroom. Keep-warm ([#76](https://github.com/KarpelesLab/teamclaude/issues/76)) starts the timer on idle accounts ahead of time, so the next account is already partway (or fully) through a fresh window when it's needed.
@@ -272,7 +296,7 @@ A [third-party backend account](accounts.md#third-party-backend-accounts) has no
   Probe    ok 2m ago, 210ms
 ```
 
-The reading is normalized to `{ label, text, utilization }`, with a `windows` map when the provider reports distinct windows. A provider that reports a 0-1 fraction gets a bar like any other bucket; one that reports money or credits shows its text. A provider that publishes nothing keeps reading `unknown` — nothing is invented.
+The reading is normalized to `{ label, text, utilization }`, with a `windows` map when the provider reports distinct windows. The TUI draws those windows as the account row's Ses/Wk bars, plus a Mon bar when a monthly window exists; rotation thresholds do not apply to them, since nothing gates a backend on them. A row with probed windows draws them in place of the metered Tok/Req pair. A plan with a monthly window and no weekly one draws the month in the Wk slot. A provider that reports a 0-1 fraction gets a bar like any other bucket; one that reports money or credits shows its text. A provider that publishes nothing keeps reading `unknown` — nothing is invented.
 
 With `synthesizeQuotaHeaders: true` the probed 5-hour and weekly windows are also stated to the client as `anthropic-ratelimit-unified-*` headers, so Claude Code shows them in its own `rate_limits` like an Anthropic account's. A monthly window has no such header and is only on `GET /teamclaude/quota`. See [configuration](configuration.md).
 
