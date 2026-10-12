@@ -494,8 +494,32 @@ export class NestedFieldFinder {
    */
   push(chunk) {
     if (this.done) return this.value;
-    for (let i = 0; i < chunk.length && !this.done; i++) this.#byte(chunk[i]);
+    for (let i = 0; i < chunk.length && !this.done; i++) {
+      // Inside a string nobody reads — a message's text, a base64 image — jump
+      // to the next quote rather than walking it a byte at a time: the effort
+      // sits after `messages` and `tools`, so the whole body passes through
+      // here on nearly every request. `esc` is false at `i`, so the backslash
+      // run right before the quote decides it: odd escapes the quote, even
+      // leaves it closing the string.
+      if (this.inStr && !this.reading && !this.esc) {
+        const q = chunk.indexOf(0x22, i);
+        const end = q === -1 ? chunk.length : q;
+        let run = 0;
+        while (end - run - 1 >= i && chunk[end - run - 1] === 0x5c) run++;
+        if (q === -1) { this.esc = run % 2 === 1; break; }
+        if (run % 2 === 1) { i = q; continue; }                    // escaped quote: still inside
+        i = q;                                                     // closing quote: handled below
+      }
+      this.#byte(chunk[i]);
+    }
     return this.value;
+  }
+
+  // A string's raw bytes as JSON reads them (`\"` → `"`, `\u00e9` → `é`), or
+  // null for bytes no JSON string could hold.
+  /** @param {string} raw @returns {string|null} */
+  static #unescape(raw) {
+    try { return JSON.parse('"' + raw + '"'); } catch { return null; }
   }
 
   // The stack is exactly [root object (last key parentKey), parent object].
@@ -512,9 +536,10 @@ export class NestedFieldFinder {
       if (b === 0x22) {                                            // closing quote
         this.inStr = false;
         if (this.reading === 'key') {
-          this.stack[this.stack.length - 1].key = Buffer.from(this.buf).toString('utf8');
+          const raw = Buffer.from(this.buf).toString('utf8');
+          this.stack[this.stack.length - 1].key = NestedFieldFinder.#unescape(raw) ?? raw;
         } else if (this.reading === 'value') {
-          this.value = Buffer.from(this.buf).toString('utf8');
+          this.value = NestedFieldFinder.#unescape(Buffer.from(this.buf).toString('utf8'));
           this.done = true;
         }
         this.reading = null;

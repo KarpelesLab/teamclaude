@@ -181,3 +181,45 @@ test('modelLabel joins model and effort, and never shows an effort on its own', 
   assert.equal(modelLabel('claude-opus-5-5'), 'claude-opus-5-5');
   assert.equal(modelLabel(null, 'xhigh'), '');
 });
+
+// Feed `text` split at every position, and a byte at a time, so a boundary
+// lands inside every escape and next to every quote at least once.
+function effortAllSplits(text, parent = 'output_config') {
+  const buf = Buffer.from(text);
+  const seen = new Set();
+  for (let cut = 0; cut <= buf.length; cut++) {
+    const f = new NestedFieldFinder(parent, 'effort');
+    f.push(buf.subarray(0, cut));
+    seen.add(f.push(buf.subarray(cut)));
+  }
+  const f = new NestedFieldFinder(parent, 'effort');
+  for (const b of buf) f.push(Buffer.from([b]));
+  seen.add(f.value);
+  return [...seen];
+}
+
+test('NestedFieldFinder decodes the escapes of a value it reads', () => {
+  assert.deepEqual(effortAllSplits('{"output_config":{"effort":"x\\"y\\\\z\\u00e9"}}'), ['x"y\\zé']);
+  // A key spelled with an escape is still the key.
+  assert.deepEqual(effortAllSplits('{"output_config":{"eff\\u006frt":"high"}}'), ['high']);
+  // Bytes no JSON string can hold read as absent, not as raw bytes.
+  const f = new NestedFieldFinder('output_config', 'effort');
+  assert.equal(f.push(Buffer.from('{"output_config":{"effort":"a\\qb"}}')), null);
+});
+
+test('NestedFieldFinder skips a long string by its quotes, with any backslash run before them', () => {
+  // Even runs close the decoy string, odd runs escape the quote. A decoy that
+  // leaks would turn its text into keys and find the planted effort.
+  for (const run of [0, 1, 2, 3, 4, 5]) {
+    const slashes = '\\'.repeat(run);
+    const decoy = run % 2 === 0
+      ? `"text":"pad ${slashes}"`
+      : `"text":"pad ${slashes}" , \\"output_config\\": {\\"effort\\": \\"planted\\"} "`;
+    const body = `{${decoy},"messages":["${'x'.repeat(5000)}"],"output_config":{"effort":"low"}}`;
+    assert.deepEqual(effortAllSplits(body), ['low'], `run of ${run}`);
+  }
+});
+
+test('NestedFieldFinder keeps multi-byte UTF-8 split across chunks', () => {
+  assert.deepEqual(effortAllSplits('{"messages":["héllo 😀"],"output_config":{"effort":"é😀"}}'), ['é😀']);
+});
