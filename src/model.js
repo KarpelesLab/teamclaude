@@ -459,6 +459,162 @@ export function parseRequestModel(body) {
   } catch { return null; }
 }
 
+// Byte-exact locator for a string field exactly ONE level under the root:
+// `root[parentKey][childKey]`, e.g. `output_config.effort`. Same discipline as
+// the finders around it: it walks the container stack and only reads a string
+// that is a direct field of the object under the root's `parentKey`, so a
+// matching key deeper down (in a message, a tool's input_schema) or under
+// another root key never matches. A value that is not a string (a number, an
+// object) is not an answer and reads as absent.
+//
+// The parent is usually small and the body around it is not, so the scan stops
+// as soon as the parent object closes, found or not.
+export class NestedFieldFinder {
+  /** @param {string} parentKey  @param {string} childKey */
+  constructor(parentKey, childKey) {
+    this.parentKey = parentKey;
+    this.childKey = childKey;
+    /** @type {{ isObj: boolean, key: string|null, awaitingKey: boolean }[]} */
+    this.stack = [];
+    this.inStr = false;
+    this.esc = false;
+    /** @type {'key'|'value'|null} */
+    this.reading = null;              // set while in a string worth keeping
+    /** @type {number[]} */
+    this.buf = [];
+    /** @type {string|null} */
+    this.value = null;                // the found value, or null
+    this.done = false;                // found it, or its parent / the root closed without it
+  }
+
+  /**
+   * Feed a chunk. Returns the found value so far, or null.
+   * @param {Buffer} chunk
+   * @returns {string|null}
+   */
+  push(chunk) {
+    if (this.done) return this.value;
+    for (let i = 0; i < chunk.length && !this.done; i++) {
+      // Inside a string nobody reads — a message's text, a base64 image — jump
+      // to the next quote rather than walking it a byte at a time: the effort
+      // sits after `messages` and `tools`, so the whole body passes through
+      // here on nearly every request. `esc` is false at `i`, so the backslash
+      // run right before the quote decides it: odd escapes the quote, even
+      // leaves it closing the string.
+      if (this.inStr && !this.reading && !this.esc) {
+        const q = chunk.indexOf(0x22, i);
+        const end = q === -1 ? chunk.length : q;
+        let run = 0;
+        while (end - run - 1 >= i && chunk[end - run - 1] === 0x5c) run++;
+        if (q === -1) { this.esc = run % 2 === 1; break; }
+        if (run % 2 === 1) { i = q; continue; }                    // escaped quote: still inside
+        i = q;                                                     // closing quote: handled below
+      }
+      this.#byte(chunk[i]);
+    }
+    return this.value;
+  }
+
+  // A string's raw bytes as JSON reads them (`\"` → `"`, `\u00e9` → `é`), or
+  // null for bytes no JSON string could hold.
+  /** @param {string} raw @returns {string|null} */
+  static #unescape(raw) {
+    try { return JSON.parse('"' + raw + '"'); } catch { return null; }
+  }
+
+  // The stack is exactly [root object (last key parentKey), parent object].
+  #inParent() {
+    const s = this.stack;
+    return s.length === 2 && s[0].isObj && s[0].key === this.parentKey && s[1].isObj;
+  }
+
+  /** @param {number} b */
+  #byte(b) {
+    if (this.inStr) {
+      if (this.esc) { this.esc = false; if (this.reading) this.buf.push(b); return; }
+      if (b === 0x5c) { this.esc = true; if (this.reading) this.buf.push(b); return; } // backslash
+      if (b === 0x22) {                                            // closing quote
+        this.inStr = false;
+        if (this.reading === 'key') {
+          const raw = Buffer.from(this.buf).toString('utf8');
+          this.stack[this.stack.length - 1].key = NestedFieldFinder.#unescape(raw) ?? raw;
+        } else if (this.reading === 'value') {
+          this.value = NestedFieldFinder.#unescape(Buffer.from(this.buf).toString('utf8'));
+          this.done = true;
+        }
+        this.reading = null;
+        this.buf = [];
+        return;
+      }
+      if (this.reading) this.buf.push(b);
+      return;
+    }
+
+    switch (b) {
+      case 0x7b: this.stack.push({ isObj: true, key: null, awaitingKey: true }); break;   // {
+      case 0x5b: this.stack.push({ isObj: false, key: null, awaitingKey: false }); break; // [
+      case 0x7d: case 0x5d:                                        // } ]
+        if (this.#inParent()) this.done = true;                    // parent closed → absent
+        this.stack.pop();
+        if (this.stack.length === 0) this.done = true;             // root closed → absent
+        break;
+      case 0x3a: { const t = this.stack[this.stack.length - 1]; if (t?.isObj) t.awaitingKey = false; break; } // :
+      case 0x2c: { const t = this.stack[this.stack.length - 1]; if (t?.isObj) t.awaitingKey = true; break; }  // ,
+      case 0x22: {                                                 // string begins
+        const t = this.stack[this.stack.length - 1];
+        if (t?.isObj && t.awaitingKey) this.reading = 'key';
+        else if (this.#inParent() && t.key === this.childKey) this.reading = 'value';
+        else this.reading = null;                                  // uninteresting string: skip bytes
+        this.buf = [];
+        this.inStr = true;
+        this.esc = false;
+        break;
+      }
+      default: break;                                              // scalars / whitespace
+    }
+  }
+}
+
+// Where each provider's request body carries the reasoning effort. Anthropic's
+// Messages API has it in `output_config.effort`; the Codex Responses API in
+// `reasoning.effort`. Keyed by provider id (see provider.js).
+const EFFORT_PARENT = new Map([['anthropic', 'output_config'], ['codex', 'reasoning']]);
+
+// The reasoning effort a JSON request body asks for, or null when it sets none.
+// Read for display only, and as the client sent it: no list of known levels,
+// since a new one should show up rather than vanish, and no API default filled
+// in for a request that leaves it out. Gated on a cheap byte search for the key,
+// like parseAdvisorModel, so most bodies cost one Buffer.includes.
+/**
+ * @param {Buffer|string|null|undefined} body
+ * @param {string} [provider]  provider id the request path belongs to
+ * @returns {string|null}
+ */
+export function parseRequestEffort(body, provider = 'anthropic') {
+  const parentKey = EFFORT_PARENT.get(provider);
+  if (!body || !parentKey) return null;
+  try {
+    const buf = Buffer.isBuffer(body) ? body : Buffer.from(String(body), 'utf8');
+    if (!buf.includes('"effort"')) return null;
+    return new NestedFieldFinder(parentKey, 'effort').push(buf) || null;
+  } catch { return null; }
+}
+
+// How the activity view names what a request runs on: `model·effort`, or just
+// the model when the request set no effort. Empty when there is no model, as
+// before: an effort on its own says too little to be worth a column. A middle
+// dot, unspaced, so the effort reads as a quiet suffix rather than a column.
+export const EFFORT_SEP = '·';
+
+/**
+ * @param {string|null|undefined} model
+ * @param {string|null|undefined} [effort]
+ */
+export function modelLabel(model, effort) {
+  if (!model) return '';
+  return effort ? `${model}${EFFORT_SEP}${effort}` : model;
+}
+
 // Byte-exact locator for the SECOND model an advisor request carries: Claude
 // Code's advisor tool (`anthropic-beta: advisor-tool-…`) keeps the executor in
 // the top-level `model` field and nests the advisor's model inside the tools

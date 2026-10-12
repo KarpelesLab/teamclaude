@@ -188,8 +188,9 @@ function pruneOrphans(messages) {
  * @param {Buffer} body fully-buffered request body
  * @param {string} url req.url (only /v1/messages bodies are inspected)
  * @param {string} [contentType] the request's content-type header
- * @returns {Buffer} the original buffer when nothing was unpaired (or on any
- *   parse / shape surprise), else a re-serialized buffer with orphans removed.
+ * @returns {Buffer} the original buffer when nothing was unpaired (or on a
+ *   message-thread continue, or any parse / shape surprise), else a
+ *   re-serialized buffer with orphans removed.
  */
 export function sanitizeToolPairs(body, url, contentType) {
   if (!Buffer.isBuffer(body) || body.length === 0) return body;
@@ -204,6 +205,24 @@ export function sanitizeToolPairs(body, url, contentType) {
     return body; // not JSON we can reason about — never break it
   }
   if (!payload || !Array.isArray(payload.messages)) return body;
+  // A message-thread continue is forwarded as it arrived. It carries only the
+  // turn's delta — the conversation is in the thread upstream — and after a tool
+  // call that delta OPENS with the tool_result, whose tool_use is in the
+  // assistant turn the thread holds. Read as a whole conversation that is an
+  // orphan: it was stripped, the emptied user turn was dropped, and Anthropic
+  // answered what was left, a body opening on a system turn, with
+  //
+  //   messages.0: use the top-level 'system' parameter for the initial system prompt
+  //
+  // on every continue that followed a tool call. The rule above needs BOTH
+  // neighbors of a message, and a delta's first message has one of them where
+  // this pass cannot see it, so nothing there is provably unpaired. The rest of
+  // a delta could be judged and is left alone all the same, because a rejected
+  // continue is not the wedge this pass exists for: the client answers it by
+  // resending the conversation as a create (see refusesThreadContinue in
+  // server.js), that body is whole, and it is repaired here like any other.
+  // Costs no parse of its own — only a body with tool blocks gets this far.
+  if (payload.thread?.type === 'continue') return body;
 
   try {
     const pruned = pruneOrphans(payload.messages);

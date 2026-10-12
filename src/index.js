@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { spawn, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { createWriteStream } from 'node:fs';
 import { readFile } from 'node:fs/promises';
@@ -10,7 +10,7 @@ import { installCrashHandlers } from './crash-log.js';
 import { AccountManager, distributionMode, accountRouting } from './account-manager.js';
 import { validateAdaptiveConfig } from './adaptive-distribution.js';
 import { createProxyServer, reloadedHeaderFlags } from './server.js';
-import { importCredentials, loginOAuth, loginOAuthWithPastedCode, fetchProfile, profileForCredentials, refreshAccessToken, isTokenExpired, isTokenExpiringSoon } from './oauth.js';
+import { importCredentials, loginOAuth, loginOAuthWithPastedCode, startOAuthLogin, fetchProfile, profileForCredentials, refreshAccessToken, isTokenExpired, isTokenExpiringSoon } from './oauth.js';
 import {
   sameIdentity,
   orgKey,
@@ -22,7 +22,8 @@ import {
   oauthIdentityFields,
 } from './identity.js';
 import { resolveAccounts } from './resolve-accounts.js';
-import { loginCodex } from './codex-auth.js';
+import { loginCodex, startCodexLogin } from './codex-auth.js';
+import { isRemoteSession, openBrowser, PANEL_LOGIN_TIMEOUT_MS } from './login-flow.js';
 import { providerOf } from './provider.js';
 import { syncAccountsFromDisk } from './sync-accounts.js';
 import { mergeAccountsForSave, syncRefreshedTokens, removedAccountIds, clearRemovedAccountIds, clearAddedAccountIds, markAccountRemoved, configIndexFor } from './account-pairing.js';
@@ -41,7 +42,8 @@ import { RemoteControl, createAttachSession } from './tui-remote.js';
 import { SxManager } from './sx.js';
 import { autoUpdate, checkForUpdate, currentVersion, resolveVersionLabel, runUpdate, installKind, updateAvailableFromCache, PKG_NAME } from './updater.js';
 import { renderStatus, formatPercent } from './status-renderer.js';
-import { sanitizeText } from './safe-text.js';
+import { sanitizeText, safeLine } from './safe-text.js';
+import { modelLabel } from './model.js';
 import { ClientUsageTracker, UsageDimensionTracker } from './client-usage.js';
 import { buildClaudeEnvLines, bypassesAllHosts, clearSelfProxyEnvLines, encodePinComponent, LOCAL_LOGIN_HINT_WINDOW_MS, localLoginHint, mergeNoProxy, resolveClientMode } from './claude-env.js';
 import { serviceKind, installService, uninstallService, serviceStatus, renderService, logPath } from './service.js';
@@ -116,6 +118,7 @@ import {
   upsertRoute,
   setAccountDisabled,
   setAccountPriority,
+  renameAccount,
 } from './config-ops.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
@@ -217,6 +220,10 @@ switch (command) {
     break;
   case 'priority':
     await priorityCommand();
+    process.exit(0);
+    break;
+  case 'rename':
+    await renameCommand();
     process.exit(0);
     break;
   case 'disable':
@@ -714,15 +721,34 @@ async function serverCommand() {
         if (config.routes != null) diskConfig.routes = config.routes;
       }),
       syncAccounts: reloadAccounts,
-      // `l` key: browser login for the chosen account's provider, from inside
-      // the running server. Same upsert the CLI uses — the account the BROWSER
-      // signed in as is the one that gets the tokens, whichever row was picked —
-      // then an in-process reload instead of the CLI's HTTP notify. Never exits:
-      // a failed login is a line in the activity pane, not the end of the proxy.
-      loginAccount: async (/** @type {Record<string, any>} */ account) => {
-        const outcome = account && providerOf(account) === 'codex'
-          ? await upsertCodexAccount(undefined, await loginCodex({ showUrl: false }), null, false)
-          : await upsertOAuthAccount(undefined, await loginOAuth({ interactive: false }), 'login', null, false, { fatal: false, notify: false });
+      // `l` key: sign in the chosen account's provider from inside the running
+      // server. Same upsert the CLI uses — the account the BROWSER signed in as
+      // is the one that gets the tokens, whichever row was picked — then an
+      // in-process reload instead of the CLI's HTTP notify. Never exits: a
+      // failed or cancelled login is a line in the activity pane, not the end of
+      // the proxy.
+      //
+      // The TUI's login panel shows the link, copies it and takes the paste;
+      // `onPrompt` hands it what it needs once the flow is listening. A browser
+      // is opened here only when the terminal looks local. For Claude, that is
+      // also the only case with a loopback listener: on a remote session it
+      // could not be reached, and the code page's paste is the whole flow. Codex
+      // always listens on 1455, because `ssh -L 1455:localhost:1455` makes it
+      // reachable from the laptop.
+      loginAccount: async (/** @type {Record<string, any>} */ account, /** @type {{ signal?: AbortSignal, onPrompt?: (prompt: import('./login-flow.js').LoginPrompt) => void }} */ { signal, onPrompt } = {}) => {
+        const remote = isRemoteSession();
+        let outcome;
+        if (account && providerOf(account) === 'codex') {
+          const flow = await startCodexLogin({ signal, timeoutMs: PANEL_LOGIN_TIMEOUT_MS });
+          if (!remote && !signal?.aborted) openBrowser(flow.url);
+          onPrompt?.({ provider: 'codex', url: flow.url, remote, listening: flow.listening, note: flow.listenError?.message ?? null, submit: flow.submit });
+          outcome = await upsertCodexAccount(undefined, await flow.credentials, null, false);
+        } else {
+          const flow = await startOAuthLogin({ loopback: !remote, signal, timeoutMs: PANEL_LOGIN_TIMEOUT_MS });
+          if (flow.browserUrl && !signal?.aborted) openBrowser(flow.browserUrl);
+          onPrompt?.({ provider: 'claude', url: flow.url, remote, listening: Boolean(flow.browserUrl), note: null, submit: flow.submit });
+          outcome = await upsertOAuthAccount(undefined, await flow.tokens, 'login', null, false, { fatal: false, notify: false });
+        }
         await reloadAccounts();
         return outcome;
       },
@@ -761,6 +787,7 @@ async function serverCommand() {
     hooks.onRequestModel = (id, info) => {
       const r = inFlight.get(id);
       if (r && info.model) r.model = info.model;
+      if (r && info.effort) r.effort = info.effort;
     };
     hooks.onRequestRouted = (id, info) => {
       const r = inFlight.get(id);
@@ -771,7 +798,10 @@ async function serverCommand() {
       inFlight.delete(id);
       const dur = r ? ((Date.now() - r.started) / 1000).toFixed(1) : '?';
       const acct = info.account || r?.account || '?';
-      const model = info.model ? ` (${info.model})` : '';
+      // The effort is client-supplied and has no fixed set of values, so it is
+      // bounded here; the whole line is sanitised on the way out.
+      const label = modelLabel(info.model, info.effort ? safeLine(info.effort, 16) : null);
+      const model = label ? ` (${label})` : '';
       const sid = info.sessionId ? `${info.sessionId.slice(0, 6)} ` : '';
       const client = (info.client || r?.client) ? `[${info.client || r.client}] ` : '';
       const pin = (info.pinned || r?.pinned) ? ' [pin]' : '';
@@ -1189,11 +1219,18 @@ async function loginCodexCommand() {
   const loaded = await loadOrCreateConfig();
   const { routing, store } = loginRouting(loaded);
   await requireWorkingRouting(routing, upstreamFor({ type: 'oauth', provider: 'codex' }, loaded.upstream));
+  // Over SSH a browser opened here is one nobody sees: print the URL instead,
+  // and the paste prompt loginCodex shows on a terminal finishes the sign-in.
+  const remote = isRemoteSession();
+  if (remote && !args.includes('--no-browser')) console.log('This looks like a remote session (SSH, or no display), so no browser is opened here.');
   let creds;
   try {
-    creds = await loginCodex({ noBrowser: args.includes('--no-browser'), routing });
+    creds = await loginCodex({ noBrowser: args.includes('--no-browser') || remote, routing });
   } catch (err) {
-    console.error(`Codex login failed: ${err.message}`);
+    // sanitizeText: the reason can quote the provider (a token endpoint's
+    // response body, an OAuth error description), and a terminal would act
+    // on any escape sequence in it.
+    console.error(`Codex login failed: ${sanitizeText(err?.message || err)}`);
     console.error('');
     console.error('Alternative: sign in with the Codex CLI and import that login instead —');
     console.error('  CODEX_HOME=~/.codex-second codex login');
@@ -1369,12 +1406,18 @@ async function loginOAuthCommand({ pasteOnly = false } = {}) {
   const { routing, store } = loginRouting(loaded);
   await requireWorkingRouting(routing, upstreamFor({ type: 'oauth' }, loaded.upstream));
 
+  // Over SSH the browser flow cannot work: a browser opened here is one nobody
+  // sees, and the laptop's browser cannot reach this machine's loopback
+  // listener. The paste-only flow is the one that can, so it is the default.
+  const remote = !pasteOnly && isRemoteSession();
   console.log('Starting OAuth login...');
+  if (remote) console.log('This looks like a remote session (SSH, or no display): sign in on any device and paste the code back here.\n');
   let creds;
   try {
-    creds = pasteOnly ? await loginOAuthWithPastedCode({ routing }) : await loginOAuth({ routing });
+    creds = pasteOnly || remote ? await loginOAuthWithPastedCode({ routing }) : await loginOAuth({ routing });
   } catch (err) {
-    console.error(`OAuth login failed: ${err.message}`);
+    // sanitizeText: as for Codex, the reason can quote the provider.
+    console.error(`OAuth login failed: ${sanitizeText(err?.message || err)}`);
     console.error('');
     console.error('Alternatives:');
     console.error('  teamclaude import        Import from existing Claude Code credentials');
@@ -2281,22 +2324,6 @@ function describeCallbackUser(/** @type {{ id: string|null, email: string|null, 
   return me.name || me.email || me.id || 'an unnamed user';
 }
 
-// Best effort and never in the way: the URL is printed before this runs, so a
-// machine with no browser (SSH, a container) loses nothing. Detached with no
-// stdio, so an opener that falls back to a text browser cannot take the
-// terminal, and one that hangs cannot hold the sign-in up.
-function openInBrowser(/** @type {string} */ url) {
-  const win = process.platform === 'win32';
-  const opener = process.platform === 'darwin' ? 'open' : win ? 'start' : 'xdg-open';
-  try {
-    // `start` reads its first quoted argument as a window title, and cmd would
-    // split an unquoted URL at `&`.
-    const child = spawn(opener, win ? ['""', `"${url}"`] : [url], { stdio: 'ignore', shell: win, detached: !win });
-    child.on('error', () => {});
-    child.unref();
-  } catch { /* no opener: the URL is on the screen */ }
-}
-
 // Sign-in to callback.net: a poll-token OAuth2 flow (see callback-auth.js), so
 // the browser that approves it can be on any machine. The token is this
 // install's own and lives beside the config, apart from the pooled accounts.
@@ -2332,11 +2359,13 @@ async function callbackCommand() {
           console.log(`  ${url}`);
           console.log('');
           console.log(`Waiting for approval (the link is good for ${Math.round(lifetimeSeconds / 60)} minutes; Ctrl-C to cancel)...`);
-          if (!args.includes('--no-browser')) openInBrowser(url);
+          // The URL is on the screen either way; over SSH a browser opened
+          // here is one nobody would see.
+          if (!args.includes('--no-browser') && !isRemoteSession()) openBrowser(url);
         },
       });
     } catch (/** @type {any} */ err) {
-      console.error(`callback.net sign-in failed: ${err?.message || err}`);
+      console.error(`callback.net sign-in failed: ${sanitizeText(err?.message || err)}`);
       process.exit(1);
     }
     await saveCallbackToken(token);
@@ -2572,6 +2601,25 @@ async function priorityCommand() {
   await notifyRunningServer(config);
 }
 
+// ── rename ──────────────────────────────────────────────────
+
+async function renameCommand() {
+  const config = await loadOrCreateConfig();
+  const name = args[1];
+  const newName = args[2];
+
+  if (!name || !newName || newName.startsWith('--')) {
+    console.error('Usage: teamclaude rename <account-name|email> <new-name> [--org <name|uuid>]');
+    process.exit(1);
+  }
+
+  const renamed = applyOrExit(() => renameAccount(config, name, newName, { orgFilter: argValue('--org') ?? undefined }));
+  await saveConfig(config);
+  const routes = renamed.routes.length ? ` (updated route${renamed.routes.length > 1 ? 's' : ''}: ${renamed.routes.join(', ')})` : '';
+  console.log(`Renamed "${renamed.from}" to "${renamed.name}"${routes}`);
+  await notifyRunningServer(config);
+}
+
 // ── enable / disable ────────────────────────────────────────
 
 async function setDisabledCommand(disabled) {
@@ -2680,8 +2728,10 @@ Usage: teamclaude [command] [options]
 Commands:
   server              Start the proxy server (default; --headless to skip the TUI)
   import              Import credentials from Claude Code
-  login               OAuth login via browser
+  login               OAuth login via browser (over SSH: copy/paste, as --token)
   login --token       OAuth login via copy/paste (no local callback; for headless/remote)
+  login --codex       Codex (ChatGPT) login via browser; on a terminal the address
+                      the browser lands on can be pasted instead (--no-browser)
   login --api         Add an API key account (a last resort by default:
                       --priority <n> to place it, 0 = level with the rest)
   env [--mitm|--no-mitm]
@@ -2715,6 +2765,7 @@ Commands:
   disable <name>      Temporarily exclude an account from rotation
   enable <name>       Re-enable a disabled account (also clears a stuck error)
   priority <name> <n> Set rotation priority (lower = preferred; --first/--last)
+  rename <name> <new> Rename an account, updating the routes that list it
   route [list|add|rm] Per-model routing: pin model globs to specific accounts
                       (add <name> --match "<glob>" [--accounts "<name>"] [--bucket <b>])
   routing <name> [url|none]
@@ -2890,7 +2941,8 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
   const profileOk = profile && !profile.error;
 
   if (!canUpsertOAuthAccount(profile, userNamed)) {
-    const why = `Could not identify OAuth account — ${profile?.error || 'profile unavailable'}`;
+    // The profile error quotes the upstream's response body: one plain line.
+    const why = `Could not identify OAuth account — ${profile?.error ? sanitizeText(profile.error) : 'profile unavailable'}`;
     // --name is the documented way past a profile the proxy could not read, but
     // it is not a way past a token the upstream refused: suggesting it there
     // would be pointing at the one door this no longer opens.
@@ -2905,7 +2957,7 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
   }
 
   if (!profileOk) {
-    console.error(`Warning: importing named account without profile detection — ${profile?.error || 'profile unavailable'}`);
+    console.error(`Warning: importing named account without profile detection — ${profile?.error ? sanitizeText(profile.error) : 'profile unavailable'}`);
   }
   if (!name && profile?.email) {
     name = profile.email;

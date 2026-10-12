@@ -10,6 +10,7 @@ import { ROLLOVER_MIN_JUMP_MS, remapHeld, findHeld, dropHeld, newObservation } f
 import { decideBand, pressureOf, pressureRank, assertNever } from './band-decision.js';
 import { BurnRateLearner, ConcurrencyLearner, scoreCandidate } from './adaptive-distribution.js';
 import { OutsideSpendTracker, OUTSIDE_SPEND_STATES, OUTSIDE_SPEND_SETTLE_MS, outsideSpendKey } from './outside-spend.js';
+import { forecastWindow } from './forecast.js';
 import { safeLine } from './safe-text.js';
 import { parseRoutingUrl, describeRouting, routingToUrl, isRoutingFailure } from './account-routing.js';
 import { isSelfProxy } from './upstream-proxy.js';
@@ -391,6 +392,9 @@ function makeAccount(acct, index, listener = null) {
     refreshToken: acct.refreshToken || null,
     expiresAt: acct.expiresAt || null,
     status: 'active',
+    // Why the account last went to 'error' (see _needsLogin); read only while
+    // status is 'error', so a recovery path need not clear it.
+    errorReason: /** @type {{ code: string, detail: string, since: number, remedy: string }|null} */ (null),
     // No quota is known at startup, so start probing: the first response for
     // an account reveals its weekly limit and triggers re-evaluation.
     probing: true,
@@ -1979,6 +1983,30 @@ export class AccountManager {
     if (!sessionId) return;
     if (usable !== null) this.sessionTracker.recordOutcome(sessionId, usable);
     this.sessionTracker.endRequest(sessionId);
+  }
+
+  /**
+   * A threaded request filed under `pinKey` was answered with `messageId`
+   * (after `previousId`, for a continue), so a continue naming it can find its
+   * conversation (see SessionTracker.threadOwner).
+   *
+   * @param {string|null} pinKey
+   * @param {string} messageId
+   * @param {string|null} [previousId]
+   */
+  recordThreadMessage(pinKey, messageId, previousId = null) {
+    if (pinKey) this.sessionTracker.recordThreadMessage(pinKey, messageId, previousId);
+  }
+
+  /**
+   * The conversation of `sessionId` that produced message `messageId`, or null.
+   *
+   * @param {string|null} sessionId
+   * @param {unknown} messageId
+   * @returns {{ key: string, conversation: string|null }|null}
+   */
+  threadOwner(sessionId, messageId) {
+    return this.sessionTracker.threadOwner(sessionId, messageId);
   }
 
   /**
@@ -4425,6 +4453,60 @@ export class AccountManager {
   }
 
   /**
+   * `quota.forecast` for status: `{ [bucket]: { ratePerHour, threshold,
+   * reachesThresholdAt, resetAt } }`, one entry per weekly window the account
+   * reports, keyed like `quota.outsideSpend` (#475). In every distribution
+   * mode: the learner runs in all of them, and this only reads it.
+   * @param {Record<string, any>} account
+   * @param {number} [now]
+   */
+  forecastStatus(account, now = Date.now()) {
+    /** @type {Record<string, any>} */
+    const q = account.quota || {};
+    /** @type {Record<string, import('./forecast.js').ForecastView>} */
+    const out = {};
+    /**
+     * @param {string} key  the window's status key
+     * @param {number} utilization
+     * @param {number|null} resetAt
+     * @param {string[]} learnerBuckets  where the learner may hold its rate, in order
+     */
+    const add = (key, utilization, resetAt, learnerBuckets) => {
+      const safeKey = safeLine(key, 64);
+      if (out[safeKey]) return;
+      let ratePerMs = null;
+      for (const b of learnerBuckets) {
+        ratePerMs = this.burnRateLearner.learnedRate(account.index, b);
+        if (ratePerMs != null) break;
+      }
+      // A scoped family with no dedicated field is gated against the shared
+      // weekly's threshold (_governingWeekly + _isNearQuota): `scoped:*` is
+      // not a threshold key, so asking for it would always read `default`.
+      const thresholdKey = key.startsWith('scoped:') ? 'unified7d' : key;
+      // When the reading was taken: the dedicated fields stamp it, a scoped
+      // bucket does not, and the learner saw it on the same fresh-reading path.
+      let seenAt = q[`${key}SeenAt`] ?? null;
+      for (const b of learnerBuckets) {
+        if (seenAt != null) break;
+        seenAt = this.burnRateLearner.lastReadingAt(account.index, b);
+      }
+      out[safeKey] = forecastWindow({ utilization, threshold: this.thresholdFor(thresholdKey, account), ratePerMs, resetAt, seenAt, now });
+    };
+    // A probe reports Fable and Sonnet both as the dedicated field and in
+    // scopedWeekly; the learner may have learned either, so both are asked.
+    for (const [key, family] of /** @type {const} */ ([['unified7d', null], ['unified7dFable', 'fable'], ['unified7dSonnet', 'sonnet']])) {
+      if (q[key] == null) continue;
+      add(key, q[key], q[`${key}Reset`] ?? null, family ? [key, `scoped:${family}`] : [key]);
+    }
+    for (const [family, bucket] of Object.entries(q.scopedWeekly || {})) {
+      if (bucket?.utilization == null) continue;
+      const key = outsideSpendKey(`scoped:${family}`);
+      add(key, bucket.utilization, bucket.resetAt ?? null, key === `scoped:${family}` ? [key] : [key, `scoped:${family}`]);
+    }
+    return out;
+  }
+
+  /**
    * Feed only weekly windows refreshed by this response to the burn learner.
    *
    * Called from all three paths that learn a utilization — response headers
@@ -4788,7 +4870,7 @@ export class AccountManager {
     // rotating to another account.
     if (account._deadRefreshToken && account._deadRefreshToken === account.refreshToken) {
       if (account.status !== 'error') {
-        account.status = 'error';
+        this._needsLogin(account, 'refresh_rejected', 'its refresh token was already rejected');
         console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}" still holds a rejected refresh token — run: teamclaude login`);
       }
       return;
@@ -4861,7 +4943,7 @@ export class AccountManager {
         account._minted = minted;
         console.log(`[TeamClaude] Token refreshed for account "${safeLine(account.name, 64)}"`);
         this._onTokenRefresh?.(accountIndex, newTokens);
-      } catch (err) {
+      } catch (/** @type {any} */ err) {
         console.error(`[TeamClaude] Token refresh failed for "${safeLine(account.name, 64)}": ${err.message}`);
         // The refresh never reached the token endpoint: the account's own
         // routing proxy is down. The forward that follows would fail the same
@@ -4885,7 +4967,7 @@ export class AccountManager {
             console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" received new tokens while its old refresh token was being rejected — keeping the new ones`);
             return;
           }
-          account.status = 'error';
+          this._needsLogin(account, 'refresh_rejected', `upstream rejected its refresh token (${err.status})`);
           console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}" needs re-login (refresh token rejected) — run: teamclaude login`);
           this._onAccountError?.(account);
         }
@@ -4960,10 +5042,29 @@ export class AccountManager {
       console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}" held out of rotation for ${seconds}s: ${why}${nth} — it will be retried after that; if it keeps failing, check the key in the config`);
       return;
     }
-    account.status = 'error';
-    const remedy = account.type === 'oauth' ? 'run: teamclaude login' : 'check the key in the config';
-    console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}" taken out of rotation: ${why} — ${remedy}`);
+    const { remedy } = this._needsLogin(account, 'credential_rejected', why);
+    console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}" taken out of rotation: ${why} — run: ${remedy}`);
     this._onAccountError?.(account);
+  }
+
+  /**
+   * Put an OAuth account in 'error' and keep why beside it. Until now the
+   * reason went to the server log only, so a status reader (the dashboard,
+   * `status --json`, a remote client) saw a bare `error` and could not tell a
+   * dead refresh token from a 401 on a refresh-less token, nor say when.
+   * @param {Record<string, any>} account
+   * @param {'refresh_rejected'|'credential_rejected'} code
+   * @param {string} detail  one clause, no credential in it
+   */
+  _needsLogin(account, code, detail) {
+    account.status = 'error';
+    account.errorReason = {
+      code,
+      detail,
+      since: Date.now(),
+      remedy: providerOf(account) === 'codex' ? 'teamclaude login --codex' : 'teamclaude login',
+    };
+    return account.errorReason;
   }
 
   /**
@@ -5203,6 +5304,8 @@ export class AccountManager {
         // `status --json`, and a credential has no business in either.
         routing: describeRouting(a.routing),
         status: a.status,
+        // What put it in 'error' and what brings it back; null in every other state.
+        errorReason: a.status === 'error' && a.errorReason ? { ...a.errorReason } : null,
         // Why the account is out of rotation right now (null = it can serve).
         // Distinguishes a local threshold decision from an upstream rejection —
         // without it the two are indistinguishable in status output (#166).
@@ -5218,7 +5321,7 @@ export class AccountManager {
         // Omitted rather than sent empty when the account carries none, so the
         // renderer's "is there a breakdown" test stays a plain truthiness check.
         sessionsByBucket: sessions.perAccountBucket?.[a.index] || null,
-        quota: { ...a.quota, outsideSpend: this.outsideSpendStatus(a) },
+        quota: { ...a.quota, outsideSpend: this.outsideSpendStatus(a), forecast: this.forecastStatus(a) },
         // `byBucket` is the one nested value under `usage`, so the shallow copy
         // that covers every flat counter beside it would hand the caller a live
         // reference into the account, leaving the payload half snapshot and half
