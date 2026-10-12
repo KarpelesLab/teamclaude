@@ -77,9 +77,9 @@ function makeStore() {
 }
 
 /** A fleet and a sync over a store. */
-// `accessed`: the fleet's tokens have already worked this launch, so the sync
-// may store them (see isAccessed); false for a fleet fresh from its config.
-function setup(entries, { store = makeStore(), signedIn = true, refresh, accessed = true } = {}) {
+// `minted`: the fleet's tokens were renewed on this install, so the sync may
+// store them (see isMinted); false for a fleet fresh from its config.
+function setup(entries, { store = makeStore(), signedIn = true, refresh, minted = true } = {}) {
   const refreshed = [];
   // Each provider call, with the lock state of its row as the call went out.
   const sent = [];
@@ -110,12 +110,10 @@ function setup(entries, { store = makeStore(), signedIn = true, refresh, accesse
   am.onAccountRemoved((account) => { removals.push(sync.onAccountRemoved(account)); });
   const recoveries = [];
   am.onAccountError((account) => { recoveries.push(sync.onAccountError(account)); });
-  const firstAccesses = [];
-  am.onAccountAccessed((account) => { firstAccesses.push(sync.onAccountAccessed(account)); });
-  if (accessed) for (const a of am.accounts) a._accessed = true;
+  if (minted) for (const a of am.accounts) a._minted = true;
   // Every tombstone write a removal started, settled.
   const settled = () => Promise.all(removals);
-  return { am, sync, store, refreshed, sent, persisted, admitted, evicted, logs, sleeps, settled, recoveries, firstAccesses, signOut: () => { signed = false; }, signIn: () => { signed = true; } };
+  return { am, sync, store, refreshed, sent, persisted, admitted, evicted, logs, sleeps, settled, recoveries, signOut: () => { signed = false; }, signIn: () => { signed = true; } };
 }
 
 const tokensOf = (a) => ({ accessToken: a.credential, refreshToken: a.refreshToken, expiresAt: a.expiresAt });
@@ -224,24 +222,25 @@ test('the newer token wins each way: the store\'s is adopted, this install\'s is
   assert.equal(s.blob(syncKeyFor(b)).by, 'this-box');
 });
 
-test('a local token change is stored once it has worked; one the store already holds is not echoed', async () => {
-  const { sync, am, store, firstAccesses } = setup([claude('a')]);
+test('a local token change is stored only once renewed here; one the store already holds is not echoed', async () => {
+  const { sync, am, store } = setup([claude('a')]);
   await sync.sync();
   const writes = () => store.calls.filter((c) => c.method === 'PATCH' || (c.method === 'POST' && c.path === 'User/Credential')).length;
   const before = writes();
-  // New tokens from disk (a reload): untried here, so not stored yet.
+  // New tokens from disk (a reload): not minted here, so not stored, nor by a pass.
   am.updateAccountTokens(0, { accessToken: 'at-a-2', refreshToken: 'rt-a-2', expiresAt: T0 + 9 * H });
   await new Promise((r) => setImmediate(r));
+  await sync.sync();
   assert.equal(writes(), before);
-  // The first request they serve stores them.
-  am.markAccessed(0);
-  assert.equal(await firstAccesses[0], true);
+  assert.equal(store.blob(syncKeyFor(am.accounts[0])).accessToken, 'at-a-1');
+  // Their renewal stores what it minted.
+  await am.ensureTokenFresh(0, true);
   assert.equal(writes(), before + 1);
-  assert.equal(store.blob(syncKeyFor(am.accounts[0])).accessToken, 'at-a-2');
+  assert.equal(store.blob(syncKeyFor(am.accounts[0])).accessToken, 'rt-a-2-renewed-at');
   // The same tokens again: nothing to store.
-  am.updateAccountTokens(0, { accessToken: 'at-a-2', refreshToken: 'rt-a-2', expiresAt: T0 + 9 * H });
-  am.markAccessed(0);
-  await Promise.all(firstAccesses);
+  am.updateAccountTokens(0, { accessToken: 'rt-a-2-renewed-at', refreshToken: 'rt-a-2-renewed-rt', expiresAt: am.accounts[0].expiresAt });
+  await new Promise((r) => setImmediate(r));
+  await sync.sync();
   assert.equal(writes(), before + 1);
 });
 
@@ -820,26 +819,26 @@ test('a pass of an account whose rejected token is still the stored one empties 
   assert.equal((await sync.sync()).emptied, 0);
 });
 
-test('an emptied row is never taken: not adopted, not added, not a lock answer; a working token overwrites it, an untried one does not', async () => {
+test('an emptied row is never taken: not adopted, not added, not a lock answer; a renewed token overwrites it, an unrenewed one does not', async () => {
   const store = makeStore();
   const dead = encodeBlob(claude('a'), { accessToken: 'at-a-0', refreshToken: '', expiresAt: T0 + 50 * H }, { now: T0, by: 'office' });
   store.put(syncKeyFor(claude('a')), dead);
   store.put(syncKeyFor(claude('n')), encodeBlob(claude('n'), { accessToken: 'at-n-0', refreshToken: '', expiresAt: T0 + 50 * H }, { now: T0, by: 'office' }));
 
-  // An install that has not tried its token: reads, takes nothing, writes nothing.
-  const fresh = setup([claude('a')], { store, accessed: false });
+  // An install that has not renewed its token: reads, takes nothing, writes nothing.
+  const fresh = setup([claude('a')], { store, minted: false });
   const r1 = await fresh.sync.sync();
   assert.equal(r1.adopted + r1.added + r1.pushed, 0);
   assert.equal(fresh.am.accounts.length, 1, 'no account made from an emptied row');
   assert.equal(fresh.am.accounts[0].credential, 'at-a-1', 'a later expiry does not make it newer');
   assert.equal(store.blob(syncKeyFor(claude('a'))).refreshToken, '');
 
-  // Its first access: the working token replaces the marker, whatever the expiry.
-  fresh.am.markAccessed(0);
-  assert.equal(await fresh.firstAccesses[0], true);
-  assert.equal(store.blob(syncKeyFor(claude('a'))).refreshToken, 'rt-a-1');
+  // Its renewal, under the lock: the fresh token replaces the marker, whatever the expiry.
+  await fresh.am.ensureTokenFresh(0, true);
+  assert.deepEqual(fresh.refreshed, ['rt-a-1']);
+  assert.equal(store.blob(syncKeyFor(claude('a'))).refreshToken, 'rt-a-1-renewed-rt');
 
-  // A pass of an install with a working token replaces it too.
+  // A pass of an install holding a token it renewed replaces it too.
   store.byKey(syncKeyFor(claude('a'))).Data = JSON.stringify(dead);
   const renewing = setup([claude('a')], { store });
   assert.equal((await renewing.sync.sync()).pushed, 1);
@@ -852,9 +851,9 @@ test('an emptied row is never taken: not adopted, not added, not a lock answer; 
   assert.equal(store.blob(syncKeyFor(claude('a'))).refreshToken, 'rt-a-1-renewed-rt');
 });
 
-// ── an account not accessed since launch ──────────────────────
+// ── an account whose token was not renewed here ──────────────
 
-test('a pass stores no account this launch has not accessed, and still adopts into it', async () => {
+test('a pass stores no account whose token this install did not renew, and still adopts into it', async () => {
   const store = makeStore();
   const b = claude('b');
   const fresher = { ...b, credential: 'at-b-9', refreshToken: 'rt-b-9', expiresAt: T0 + 20 * H };
@@ -862,11 +861,11 @@ test('a pass stores no account this launch has not accessed, and still adopts in
   const c = claude('c');
   const staler = { ...c, credential: 'at-c-0', refreshToken: 'rt-c-0', expiresAt: T0 };
   store.put(syncKeyFor(c), encodeBlob(staler, tokensOf(staler), { now: T0, by: 'office' }));
-  const { sync, am } = setup([claude('a'), b, c], { store, accessed: false });
+  const { sync, am } = setup([claude('a'), b, c], { store, minted: false });
 
   const r = await sync.sync('start');
-  assert.equal(r.created, 0, 'a: no row made from an untried token');
-  assert.equal(r.pushed, 0, 'c: its row is not overwritten by an untried token, newer or not');
+  assert.equal(r.created, 0, 'a: no row made from a token read at launch');
+  assert.equal(r.pushed, 0, 'c: its row is not overwritten by a token read at launch, newer or not');
   assert.equal(r.adopted, 1, 'b: reading is unchanged');
   assert.equal(am.accounts[1].credential, 'at-b-9');
   assert.equal(store.byKey(syncKeyFor(am.accounts[0])), null);
@@ -874,33 +873,32 @@ test('a pass stores no account this launch has not accessed, and still adopts in
   assert.ok(!store.calls.some((x) => x.method === 'PATCH' || (x.method === 'POST' && x.path === 'User/Credential')));
 });
 
-test('the first access stores what the pass held back: a row made, or one this install is ahead of updated', async () => {
+test('a token that works is still not stored until renewed: a quota reading and the passes after it write nothing', async () => {
   const store = makeStore();
   const c = claude('c');
   const staler = { ...c, credential: 'at-c-0', refreshToken: 'rt-c-0', expiresAt: T0 };
   store.put(syncKeyFor(c), encodeBlob(staler, tokensOf(staler), { now: T0, by: 'office' }));
-  const { sync, am, firstAccesses } = setup([claude('a'), c], { store, accessed: false });
+  const { sync, am } = setup([claude('a'), c], { store, minted: false });
   await sync.sync('start');
 
-  // A request upstream answered (server.js), and a quota reading (prober).
-  am.markAccessed(0);
+  am.applyUsageData(0, { five_hour: { utilization: 10 } });
   am.applyUsageData(1, { five_hour: { utilization: 10 } });
-  assert.deepEqual(await Promise.all(firstAccesses), [true, true]);
-  assert.equal(store.blob(syncKeyFor(am.accounts[0])).accessToken, 'at-a-1');
-  assert.equal(store.blob(syncKeyFor(c)).accessToken, 'at-c-1');
-  // Only the first access writes.
-  am.markAccessed(0);
-  assert.equal(firstAccesses.length, 2);
+  await new Promise((r) => setImmediate(r));
+  const r = await sync.sync('daily');
+  assert.equal(r.created + r.pushed, 0);
+  assert.equal(store.byKey(syncKeyFor(am.accounts[0])), null);
+  assert.equal(store.blob(syncKeyFor(c)).accessToken, 'at-c-0');
+  assert.ok(!store.calls.some((x) => x.method === 'PATCH' || (x.method === 'POST' && x.path === 'User/Credential')));
 });
 
-test('an untried token with no row is renewed without a lock, and the renewal is what gets stored', async () => {
-  const { am, store, refreshed } = setup([claude('a')], { accessed: false });
+test('a token read at launch with no row is renewed without a lock, and the renewal is what gets stored', async () => {
+  const { am, store, refreshed } = setup([claude('a')], { minted: false });
   await am.ensureTokenFresh(0, true);
   assert.deepEqual(refreshed, ['rt-a-1']);
-  assert.ok(!store.calls.some((c) => c.path.endsWith(':lock')), 'no row was made from the untried token to lock');
+  assert.ok(!store.calls.some((c) => c.path.endsWith(':lock')), 'no row was made from the launch token to lock');
   await new Promise((r) => setImmediate(r));
   assert.equal(store.blob(syncKeyFor(am.accounts[0])).accessToken, 'rt-a-1-renewed-at');
-  assert.equal(am.accounts[0]._accessed, true);
+  assert.equal(am.accounts[0]._minted, true);
 });
 
 // ── an account in error ──────────────────────────────────────

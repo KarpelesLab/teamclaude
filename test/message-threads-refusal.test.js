@@ -208,8 +208,12 @@ const SESSION = 'session-under-test';
 // turns that off for the tests of the repair itself.
 async function post(accounts, body, pickUpstream, { fleetKeepsThreads = true } = {}) {
   const seen = [];
-  const { server: upstream, port } = await listen((req, res) => {
+  const received = [];
+  const { server: upstream, port } = await listen(async (req, res) => {
     seen.push(req.url);
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    received.push(Buffer.concat(chunks).toString('utf8'));
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end('{"ok":true}');
   });
@@ -225,7 +229,7 @@ async function post(accounts, body, pickUpstream, { fleetKeepsThreads = true } =
     const text = await res.text();
     return {
       status: res.status, text, headers: res.headers,
-      reachedUpstream: seen.length,
+      reachedUpstream: seen.length, received,
       starved: am.sessionTracker.sessions.get(SESSION)?.starved ?? 0,
     };
   } finally {
@@ -295,6 +299,24 @@ test('an Anthropic continue is forwarded untouched', async () => {
   );
   assert.equal(status, 200);
   assert.equal(reachedUpstream, 1);
+});
+
+// Untouched has to hold for the delta that follows a tool call, which is most
+// of them: it opens with the tool_result, and the tool_use that grounds it is
+// in the thread. The tool-pair repair read that as an orphan, and what reached
+// Anthropic was the system turn alone (see tool-pair-sanitize.js).
+test('an Anthropic continue after a tool call reaches the upstream as sent', async () => {
+  const delta = JSON.stringify({
+    model: 'k3',
+    thread: { type: 'continue', previous_message_id: 'msg_1' },
+    messages: [
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'done' }] },
+      { role: 'system', content: [{ type: 'text', text: 'a mid-conversation reminder' }] },
+    ],
+  });
+  const { status, received } = await post([{ name: 'anthropic', type: 'apikey', apiKey: 'k' }], delta, (a) => a);
+  assert.equal(status, 200);
+  assert.deepEqual(received, [delta]);
 });
 
 // The fleet case end to end (#379): the same account on a global upstream that

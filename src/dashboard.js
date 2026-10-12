@@ -94,6 +94,28 @@ export function scopedWeeklyRows(quota) {
   return rows;
 }
 
+// The rows a third-party backend's own reading draws on its card (#530). The
+// probe stores it as `quota.backend` (backend-quota.js): per-window fractions
+// when the provider reports distinct windows, else one fraction, else text
+// alone. A window past its reset is left out — the reading predates the reset,
+// so its fraction no longer describes anything. `text` is what is left to say
+// when no bar can be drawn: a balance has no fraction to fill a bar with.
+/** @param {any} backend @param {number} [now] */
+export function backendQuotaRows(backend, now) {
+  var b = backend || {};
+  var at = now == null ? Date.now() : now;
+  var w = b.windows || {};
+  var rows = [];
+  [{ key: 'fiveHour', label: 'Session' }, { key: 'weekly', label: 'Weekly' }, { key: 'monthly', label: 'Monthly' }].forEach(function (d) {
+    var win = w[d.key];
+    if (!win || win.utilization == null) return;
+    if (win.resetAt != null && win.resetAt <= at) return;
+    rows.push({ label: d.label, utilization: win.utilization, resetAt: win.resetAt == null ? null : win.resetAt });
+  });
+  if (!rows.length && b.utilization != null) rows.push({ label: b.label || 'Quota', utilization: b.utilization, resetAt: null });
+  return { rows: rows, text: !rows.length && b.text ? (b.label || 'Quota') + ': ' + b.text : null };
+}
+
 // What an account has spent, cache included. `totalInputTokens` counts uncached
 // input only, which on Claude Code traffic is ~0.05% of the input side — a
 // total without the cache fields understates the account by orders of magnitude.
@@ -653,7 +675,7 @@ export function usageFor(entry, view) {
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, modelLabel, recentModelLabels, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
-  outsideSpendText, showSessionRow,
+  outsideSpendText, showSessionRow, backendQuotaRows,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -996,6 +1018,10 @@ ${SHARED_HELPERS}
       scopedWeeklyRows(q).forEach(function (r) { card.appendChild(quotaRow(r.label, r.utilization, r.resetAt)); });
     } else if (q.tokensLimit != null && q.tokensRemaining != null) {
       card.appendChild(quotaRow('Tokens', 1 - q.tokensRemaining / q.tokensLimit, q.resetsAt));
+    } else if (q.backend && (q.backend.text || q.backend.utilization != null)) {
+      var bq = backendQuotaRows(q.backend);
+      bq.rows.forEach(function (r) { card.appendChild(quotaRow(r.label, r.utilization, r.resetAt)); });
+      if (bq.text) card.appendChild(el('div', 'usage', bq.text));
     } else {
       card.appendChild(el('div', 'usage', 'quota unknown (no traffic observed yet)'));
     }
