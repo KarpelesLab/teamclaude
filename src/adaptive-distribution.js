@@ -214,6 +214,30 @@ export class BurnRateLearner {
   }
 
   /**
+   * The learned utilization-per-ms, or null while nothing has been learned.
+   * Unlike burnRate() there is no cold-start fallback: a read-out must not
+   * present the assumed starting rate as something this account did.
+   * @param {number} index
+   * @param {string} bucket
+   * @returns {number|null}
+   */
+  learnedRate(index, bucket) {
+    const rate = this.state.get(`${index}:${bucket}`)?.burnRate;
+    return Number.isFinite(rate) ? rate : null;
+  }
+
+  /**
+   * When the learner last took a fresh reading of this window, or null.
+   * @param {number} index
+   * @param {string} bucket
+   * @returns {number|null}
+   */
+  lastReadingAt(index, bucket) {
+    const at = this.state.get(`${index}:${bucket}`)?.lastAt;
+    return Number.isFinite(at) ? at : null;
+  }
+
+  /**
    * How much headroom to hold back from the threshold for this bucket, as a
    * fraction of the window: what the account would spend over `lookaheadMs` at
    * its own observed rate, bounded so neither an idle account nor a runaway one

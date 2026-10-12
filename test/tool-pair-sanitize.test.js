@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { sanitizeToolPairs } from '../src/tool-pair-sanitize.js';
+import { rewriteRequestBody } from '../src/server.js';
 
 const MESSAGES = '/v1/messages';
 const JSON_CT = 'application/json';
@@ -182,4 +183,75 @@ test('cascade: dropping one turn exposes the next orphan, valid pair is preserve
   assert.ok(rolesAlternate(body));
   assert.ok(JSON.stringify(body).includes('toolu_A'));
   assert.ok(!JSON.stringify(body).includes('toolu_B'));
+});
+
+// A message-thread continue carries only the turn's delta: the conversation, and
+// with it the assistant turn holding the tool_use, stays in the thread upstream.
+// The two messages below are what Claude Code 2.1.296 sends after a tool call
+// (roles and block types as captured, text replaced).
+const CONTINUE = { type: 'continue', previous_message_id: 'msg_prev' };
+const toolResult = { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_thread', content: 'done' }] };
+const reminder = { role: 'system', content: [{ type: 'text', text: 'a mid-conversation reminder' }] };
+const threaded = (thread, messages) => ({ model: 'claude', ...(thread === undefined ? {} : { thread }), messages });
+
+test('a thread continue keeps the tool_result its thread grounds', () => {
+  const original = buf(threaded(CONTINUE, [toolResult]));
+  assert.equal(sanitizeToolPairs(original, MESSAGES, JSON_CT), original);
+});
+
+test('a thread continue is not left opening on its system turn', () => {
+  // Stripping the tool_result emptied the user turn, the emptied turn was
+  // dropped, and Anthropic answered what was left with 400 "messages.0: use the
+  // top-level 'system' parameter for the initial system prompt".
+  const original = buf(threaded(CONTINUE, [toolResult, reminder]));
+  const out = sanitizeToolPairs(original, MESSAGES, JSON_CT);
+  assert.deepEqual(parse(out).messages.map((m) => m.role), ['user', 'system']);
+  assert.equal(out, original);
+});
+
+test('a create, and a body with no thread, are still repaired', () => {
+  // Both carry the whole conversation, so a tool_result with nothing before it
+  // is answered by nothing. A thread of any other shape is not a continue.
+  for (const thread of [undefined, { type: 'create' }, {}, 'continue', null]) {
+    const body = parse(run(threaded(thread, [toolResult, reminder])));
+    assert.ok(isPaired(body), `left unpaired with thread ${JSON.stringify(thread)}`);
+    assert.ok(!JSON.stringify(body).includes('toolu_thread'), `kept with thread ${JSON.stringify(thread)}`);
+  }
+});
+
+test('a thread continue is forwarded as sent past its first message too', () => {
+  // Nothing else in a delta is this pass's to rewrite either: not a turn that
+  // arrived empty (the directive-only system form), and not a pair the delta
+  // holds in full. Upstream judges the continue against the thread, and the
+  // client answers a rejected one by resending the conversation as a create,
+  // which is the body repaired below.
+  const directive = { role: 'system', content: [], output_config: { effort: 'high' } };
+  const lost = { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_lost', name: 'noop', input: {} }] };
+  const next = { role: 'user', content: 'no result for it' };
+
+  const original = buf(threaded(CONTINUE, [toolResult, directive, lost, next]));
+  assert.equal(sanitizeToolPairs(original, MESSAGES, JSON_CT), original);
+
+  const resent = parse(run(threaded({ type: 'create' }, [
+    { role: 'user', content: 'go' },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_thread', name: 'noop', input: {} }] },
+    toolResult, lost, next,
+  ])));
+  assert.ok(isPaired(resent));
+  assert.ok(JSON.stringify(resent).includes('toolu_thread'));
+  assert.ok(!JSON.stringify(resent).includes('toolu_lost'));
+});
+
+test('a thread continue is kept on /v1/messages/count_tokens as well', () => {
+  // The body has the same shape there, and a count the upstream refuses has no
+  // conversation to resend.
+  const original = buf(threaded(CONTINUE, [toolResult, reminder]));
+  assert.equal(sanitizeToolPairs(original, '/v1/messages/count_tokens', JSON_CT), original);
+});
+
+test('rewriteRequestBody forwards a continue after a tool call byte for byte', () => {
+  // The level the proxy calls: with no other rewrite configured for the account,
+  // the bytes Claude Code sent are the bytes that go upstream.
+  const original = buf({ ...threaded(CONTINUE, [toolResult, reminder]), max_tokens: 100 });
+  assert.equal(rewriteRequestBody(original, { type: 'oauth' }, '/v1/messages?beta=true', JSON_CT), original);
 });
