@@ -663,9 +663,9 @@ export function normalizeUsagePayload(data) {
  * be a claim the payload does not make. An eligible block with no live grant is
  * a real zero: the reset was spent or has expired.
  *
- * Grant ids (and the payload's `next_grant_id`) are never read. They are the
- * handle that spends a reset, and spending one stays a manual action in
- * claude.ai or Claude Code.
+ * Grant ids (and the payload's `next_grant_id`) are never read here. They are
+ * the handle that spends a reset: only the opt-in redeemer (claude-resets.js)
+ * reads them, from a fresh status of its own, and none is ever stored.
  *
  * @param {any} block  the payload's `cedar_ember` object
  * @param {number} [now]  ms epoch a grant's expiry is measured against

@@ -132,6 +132,10 @@ const PERSISTED_QUOTA_FIELDS = [
   // until something next reads the usage endpoint — and the row that says so is the
   // only place an operator sees one at all.
   'resetCredits',
+  // Until when a Claude reset attempt on this account holds the whole Claude
+  // pool (claude-resets.js): a bare timestamp, so a restart minutes after a
+  // claim that may have landed does not spend a sibling's on top of it.
+  'claudeResetHoldUntil',
   // Whether the last Codex reading stated a 5-hour window at all (see
   // _updateCodexQuota). A fact about the subscription's shape rather than a
   // counter, so it holds across a restart: without it a restored Codex row
@@ -4734,6 +4738,21 @@ export class AccountManager {
     account.rateLimitedUntil = null;
     account.throttledAt = null;
     console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" revalidated — rate limit no longer applies, back in rotation`);
+  }
+
+  /**
+   * Drop a stored upstream `rejected` verdict after live proof it no longer
+   * binds — a usage-limit reset that landed. A quota re-read does not touch the
+   * verdict, so without this the account would read `upstream-rejected` until
+   * it went stale. No-op for any other verdict.
+   * @param {number} accountIndex
+   */
+  clearUpstreamRejected(accountIndex) {
+    const account = this.accounts[accountIndex];
+    if (!account || account.quota.unifiedStatus !== 'rejected') return;
+    account.quota.unifiedStatus = null;
+    account.quota.unifiedStatusSeenAt = null;
+    console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" upstream rejection cleared — it no longer applies`);
   }
 
   /**

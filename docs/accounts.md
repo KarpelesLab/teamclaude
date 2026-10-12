@@ -446,9 +446,12 @@ selected again against the account it cleared.
 
 - It spends on the account that would otherwise wait longest for its own
   windows to reset, since that is where a reset buys the most.
-- Only on an account upstream itself reports **at** a limit, and only when the
-  grant clears every limit the account is at — a reset that would leave it
-  blocked buys the request nothing.
+- Only on an account upstream itself reports **at** a limit, and only when a
+  **weekly** limit (the all-models week or a model family's) is among them — a
+  5-hour wall lifts on its own and is never worth a grant — and only when the
+  grant clears every limit the account is at, since a reset that would leave it
+  blocked buys the request nothing. While upstream reports a reset cooldown,
+  nothing is claimed.
 - Only the grant upstream names as next (`next_grant_id`), exactly as
   `/limit-reset` in Claude Code does.
 - `accounts[].autoRedeemReset: false` exempts an account, as it does for Codex;
@@ -459,13 +462,16 @@ After a reset the Claude pool holds off for an hour, so one dry pool costs one
 reset. A claim whose answer never arrived may still have spent the grant: its
 request id is kept and replayed by the next attempt — upstream then answers
 `already_used` instead of spending a second grant — and nothing else is spent
-for 30 minutes. `cooldown`, `not_limited`, `ineligible` and `unavailable` spend
+for 30 minutes. Both holds are saved with the account's quota state, so a
+restart does not lift them. `cooldown`, `not_limited`, `ineligible` and `unavailable` spend
 nothing.
 
 The claim is `POST /api/organizations/<org>/reset_rate_limits` with
 `{ program: "cedar_ember", grant_id, request_id }`, as Claude Code sends it.
 It is not a documented API, so it is worth watching the activity log the first
-time it fires. With the switch off — the default — a Claude reset is still
+time it fires. A fleet that already turned `autoRedeemResets` on for Codex
+credits now spends Claude resets too; exempt an account with
+`autoRedeemReset: false` if that is not wanted. With the switch off — the default — a Claude reset is still
 yours to spend, on the claude.ai usage page or with `/limit-reset`.
 
 ## Third-party backend accounts

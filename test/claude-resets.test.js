@@ -169,6 +169,40 @@ test('no verdict on one account: no sibling is spent in the same refusal', async
   assert.equal(calls.claim.length, 1);
 });
 
+test('a 5-hour wall alone is never worth a grant', async () => {
+  const { am, redeemer, calls } = harness({ status: () => block({ exhausted: ['five_hour'] }) });
+  const r = await redeemer.maybeRedeemForPool(am.accounts);
+  assert.equal(r.redeemed, false); assert.match(r.reason, /no weekly limit/);
+  assert.equal(calls.claim.length, 0);
+});
+
+test('a cooldown upstream already reports is honoured without a claim', async () => {
+  const until = Date.now() + H;
+  const { am, redeemer, calls } = harness({ status: () => block({ cooldown_until: new Date(until).toISOString() }) });
+  const r = await redeemer.maybeRedeemForPool(am.accounts);
+  assert.equal(r.redeemed, false); assert.match(r.reason, /cooldown/);
+  assert.equal(calls.claim.length, 0);
+});
+
+test('a reset that landed also lifts a stored upstream rejection', async () => {
+  const { am, redeemer } = harness();
+  Object.assign(am.accounts[0].quota, { unifiedStatus: 'rejected', unifiedStatusSeenAt: Date.now() });
+  assert.equal((await redeemer.maybeRedeemForPool(am.accounts)).redeemed, true);
+  assert.equal(am.accounts[0].quota.unifiedStatus, null);
+});
+
+test('the fleet hold is saved with the quota state, so a restart does not lift it', async () => {
+  const { am, redeemer } = harness({ accounts: [oauth('a'), oauth('b')], claim: () => ({ error: 'socket hang up' }) });
+  await redeemer.maybeRedeemForPool(am.accounts);
+  const saved = am.exportQuotaState();
+  // A fresh process: new manager, new redeemer, nothing held in memory.
+  const { am: am2, redeemer: r2, calls } = harness({ accounts: [oauth('a'), oauth('b')] });
+  am2.restoreQuotaState(saved);
+  const r = await r2.maybeRedeemForPool(am2.accounts);
+  assert.equal(r.redeemed, false); assert.match(r.reason, /holding off/);
+  assert.equal(calls.claim.length, 0);
+});
+
 test('a Codex row or a third-party backend is never a Claude candidate', async () => {
   const { am, redeemer, calls } = harness({ accounts: [oauth('cx', { provider: 'codex', accountId: 'x' }), oauth('nano', { upstream: 'https://api.nano-gpt.com/api' })] });
   assert.equal((await redeemer.maybeRedeemForPool(am.accounts)).redeemed, false);
