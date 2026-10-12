@@ -8,8 +8,8 @@
 //
 // - A SYNC PASS (at start, on reload, and every 24h) lists the rows. A row with
 //   no local account becomes one; a row whose token is newer than the local one
-//   replaces it; a local account newer than its row updates the row; a local
-//   account with no row creates one.
+//   replaces it; a local account renewed here and newer than its row updates
+//   the row; a local account renewed here with no row creates one.
 // - A TOKEN REFRESH goes through the row's advisory lock, so only one install
 //   renews a token the others then adopt — a refresh rotates the token family,
 //   and two installs renewing one account at once would each kill the other's
@@ -52,13 +52,13 @@
 // it, and the first install holding a working token overwrites it whatever its
 // expiry, the way a renewal or a sign-in there does.
 //
-// Nor is an account written before this launch has ACCESSED it: until its
-// token has worked here (a request upstream did not reject, a quota reading,
-// a renewal the token endpoint answered), nothing says it is valid — a config
-// can hold a token that died while the proxy was down. Such an account reads
-// like any other (adopts, follows a tombstone) but neither creates nor updates
-// its row; the moment it is first accessed, the row catches up. An explicit
-// sign-in (`login`, `import`) is the exception: those tokens were just minted.
+// Nor is a token written that was not MINTED here: only one the token endpoint
+// just issued — a renewal on this install, or an explicit sign-in (`login`,
+// `import`, see storeSignIn) — is known to be fresh. A token read from the
+// config at launch or from disk on a reload may have died while the proxy was
+// down, and one that served a request may still have been revoked since. An
+// account holding such a token reads like any other (adopts, follows a
+// tombstone) but neither creates nor updates its row; its next renewal does.
 
 import { hostname } from 'node:os';
 import { callbackCall, loadCallbackToken } from './callback-auth.js';
@@ -252,9 +252,9 @@ export function isInError(account) {
   return account.status === 'error' || (!!account._deadRefreshToken && account._deadRefreshToken === account.refreshToken);
 }
 
-/** Whether this launch has seen the account's current token work (see AccountManager.markAccessed). */
-export function isAccessed(/** @type {Record<string, any>} */ account) {
-  return account._accessed === true;
+/** Whether the account's current token was minted by a renewal on this install, this launch. */
+export function isMinted(/** @type {Record<string, any>} */ account) {
+  return account._minted === true;
 }
 
 /**
@@ -398,8 +398,8 @@ export class CredentialSync {
         const row = this._rowFor(account);
         const broken = isInError(account);
         if (!row) {
-          // Neither a dead token nor an untried one is stored for the others to pick up.
-          if (broken || !isAccessed(account)) continue;
+          // Only a token renewed here is stored for the others to pick up.
+          if (broken || !isMinted(account)) continue;
           await this._create(account, this._tokens(account));
           result.created++;
           continue;
@@ -427,7 +427,7 @@ export class CredentialSync {
         if (supersedes(row.blob, account)) {
           this._adopt(account, /** @type {Blob} */ (row.blob), `sync (${reason})`);
           result.adopted++;
-        } else if (isAccessed(account) && this._isAhead(row, account)) {
+        } else if (isMinted(account) && this._isAhead(row, account)) {
           await this._patch(row, account, this._tokens(account));
           result.pushed++;
         }
@@ -521,9 +521,9 @@ export class CredentialSync {
   }
 
   /**
-   * Tokens changed on this install — a refresh, a login, an import, a client
-   * refresh the proxy saw. The row follows, unless it already holds them (an
-   * adoption coming back round).
+   * Tokens changed on this install. The row follows only when this install
+   * minted them (a renewal); tokens from a reload or the store itself do not
+   * travel, and a sign-in is stored by storeSignIn.
    * @param {number} index
    * @param {Tokens} tokens
    */
@@ -531,8 +531,8 @@ export class CredentialSync {
     const account = this.am.accounts[index];
     if (!account || !syncKeyFor(account) || !tokens?.accessToken || !tokens?.refreshToken) return;
     // A re-import of a rejected refresh token, say: nothing the others can use.
-    // Nor are tokens this launch has not seen work (see isAccessed).
-    if (isInError(account) || !isAccessed(account)) return;
+    // Nor are tokens this install did not mint (see isMinted).
+    if (isInError(account) || !isMinted(account)) return;
     if (!await this.isSignedIn()) return;
     try {
       const row = this._rowFor(account);
@@ -545,30 +545,6 @@ export class CredentialSync {
       else await this._create(account, tokens);
     } catch (/** @type {any} */ err) {
       this.log(`[TeamClaude] callback.net: could not store the new token for "${safeLine(account.name, 64)}": ${safeLine(err?.message || String(err), 160)}`);
-    }
-  }
-
-  /**
-   * An account's token just worked here for the first time since launch (or
-   * since it last came from elsewhere): what the pass held back for it is
-   * written now — its row created, or updated when this install is ahead.
-   * Resolves with whether the store was written.
-   * @param {Record<string, any>} account
-   * @returns {Promise<boolean>}
-   */
-  async onAccountAccessed(account) {
-    if (!syncKeyFor(account) || !isAccessed(account) || isInError(account)) return false;
-    if (!await this.isSignedIn()) return false;
-    try {
-      if (!this.rows.size) this.rows = await this._list();
-      const row = this._rowFor(account);
-      if (!row) return !!await this._create(account, this._tokens(account));
-      if (row.deletedAt != null || supersedes(row.blob, account) || !this._isAhead(row, account)) return false;
-      await this._patch(row, account, this._tokens(account));
-      return true;
-    } catch (/** @type {any} */ err) {
-      this.log(`[TeamClaude] callback.net: could not store "${safeLine(account.name, 64)}": ${safeLine(err?.message || String(err), 160)}`);
-      return false;
     }
   }
 
@@ -834,9 +810,9 @@ export class CredentialSync {
     this.rows = await this._list();
     row = find();
     // A dead token is not stored for the others to pick up (see isInError),
-    // nor an untried one (isAccessed): renewed without a lock, which no other
-    // install can need, and stored once the renewal proves it.
-    if (row || !keyed || isInError(account) || !isAccessed(account)) return row;
+    // nor one not minted here (isMinted): renewed without a lock, which no
+    // other install can need, and the fresh token stored (onLocalTokens).
+    if (row || !keyed || isInError(account) || !isMinted(account)) return row;
     // First here: stored as it stands, then locked like any other. Created by
     // another install meanwhile, theirs is the row — which a create racing it
     // on the live API can also learn as a plain database error, not only as

@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import {
   approvalUrl, callbackBase, callbackClientId, CALLBACK_CLIENT_ID, loginCallback, refreshCallbackToken,
   getCallbackAuthPath, loadCallbackToken, saveCallbackToken, clearCallbackToken,
-  callbackCall, callbackWhoami, logoutCallback,
+  callbackCall, callbackWhoami, logoutCallback, callbackTokenLapsed,
 } from '../src/callback-auth.js';
 
 // Sign-in to callback.net: a poll-token OAuth2 flow. The client asks for a poll
@@ -80,6 +80,12 @@ async function mockApi(t, overrides = {}) {
       if (auth !== `Bearer ${state.access}`) return json(res, 401, { result: 'error', code: 401, token: 'invalid_request_token', extra: 'token_expired', error: 'The access token has expired' });
       // OpenID claims, no envelope — the shape the live endpoint answers with.
       return json(res, 200, { iss: 'https://x', sub: 'oaur-1', aud: [CLIENT], exp: 1, iat: 0, email: 'someone@example.com', name: 'Some\x1b[2JOne' });
+    }
+    if (path === 'User/Credential/c1:lock') {
+      // Not every endpoint says token_expired: this one, given a lapsed token,
+      // answers the way the live :lock does.
+      if (auth !== `Bearer ${state.access}`) return json(res, 403, { result: 'error', code: 403, token: 'error_access_denied', error: 'Access denied' });
+      return json(res, 200, { result: 'success', data: { User_Credential__: 'c1' } });
     }
     if (path === 'User/@') {
       return json(res, 403, { result: 'error', code: 403, token: 'error_access_denied', error: 'Access denied to this API, missing appropriate scope' });
@@ -251,6 +257,81 @@ test('an expired access token is renewed once, saved, and the call repeated', as
   ]);
   // The refresh token was not restated by the server and is kept.
   assert.deepEqual(await loadCallbackToken(), { access_token: 'at-2', refresh_token: 'rt-1', token_type: 'Bearer', expires_in: 3600, client_id: CLIENT, obtained_at: 5 });
+});
+
+test('a token near the end of its stated lifetime is renewed before the call, not after a refusal', async (t) => {
+  await tempConfig(t);
+  const api = await mockApi(t, { access: 'at-1' });
+  const HOUR = 3600 * 1000;
+  // Still honoured, but two minutes or less from the end of its hour.
+  await saveCallbackToken({ access_token: 'at-1', refresh_token: 'rt-1', expires_in: 3600, client_id: CLIENT, obtained_at: 0 });
+  await callbackCall('POST', 'User/Credential/c1:lock', {}, { base: api.base, now: () => HOUR - 60_000 });
+  assert.deepEqual(api.state.seen.map((s) => [s.path, s.auth]), [
+    ['OAuth2:token', null],
+    ['User/Credential/c1:lock', 'Bearer at-2'],
+  ]);
+  assert.equal((await loadCallbackToken()).obtained_at, HOUR - 60_000);
+
+  // Well inside its lifetime: no renewal.
+  api.state.seen.length = 0;
+  await callbackCall('POST', 'User/Credential/c1:lock', {}, { base: api.base, now: () => HOUR });
+  assert.deepEqual(api.state.seen.map((s) => s.path), ['User/Credential/c1:lock']);
+});
+
+test('a refusal within the token\'s stated lifetime is a refusal, not a lapse', async (t) => {
+  await tempConfig(t);
+  const api = await mockApi(t, { access: 'at-current' });
+  await saveCallbackToken({ access_token: 'at-other', refresh_token: 'rt-1', expires_in: 3600, client_id: CLIENT, obtained_at: 0 });
+  await assert.rejects(
+    callbackCall('POST', 'User/Credential/c1:lock', {}, { base: api.base, now: () => 1000 }),
+    (err) => err.token === 'error_access_denied' && !err.loginRequired,
+  );
+  assert.deepEqual(api.state.seen.map((s) => s.path), ['User/Credential/c1:lock']);
+});
+
+test('renewing ahead that cannot reach the server still makes the call; refused past its lifetime, it renews then', async (t) => {
+  await tempConfig(t);
+  const api = await mockApi(t, { access: 'at-current' });
+  const HOUR = 3600 * 1000;
+  let tokenCalls = 0;
+  // OAuth2:token unreachable the first time only.
+  const fetchImpl = (url, init) => {
+    if (String(url).endsWith('OAuth2:token') && tokenCalls++ === 0) return Promise.reject(new TypeError('fetch failed'));
+    return fetch(url, init);
+  };
+  await saveCallbackToken({ access_token: 'at-stale', refresh_token: 'rt-1', expires_in: 3600, client_id: CLIENT, obtained_at: 0 });
+  await callbackCall('POST', 'User/Credential/c1:lock', {}, { base: api.base, fetchImpl, now: () => HOUR + 1 });
+  assert.deepEqual(api.state.seen.map((s) => [s.path, s.auth]), [
+    ['User/Credential/c1:lock', 'Bearer at-stale'],
+    ['OAuth2:token', null],
+    ['User/Credential/c1:lock', 'Bearer at-2'],
+  ]);
+  assert.equal((await loadCallbackToken()).access_token, 'at-2');
+
+  // Refused ahead: the session is over, and the call is not made.
+  api.state.seen.length = 0;
+  api.state.refuseRefresh = true;
+  await saveCallbackToken({ access_token: 'at-stale', refresh_token: 'rt-1', expires_in: 3600, client_id: CLIENT, obtained_at: 0 });
+  await assert.rejects(callbackCall('POST', 'User/Credential/c1:lock', {}, { base: api.base, now: () => HOUR + 1 }), (err) => err.loginRequired === true);
+  assert.deepEqual(api.state.seen.map((s) => s.path), ['OAuth2:token']);
+});
+
+test('calls that find the token lapsed together share one renewal', async (t) => {
+  await tempConfig(t);
+  const api = await mockApi(t, { access: 'at-1' });
+  await saveCallbackToken({ access_token: 'at-1', refresh_token: 'rt-1', expires_in: 3600, client_id: CLIENT, obtained_at: 0 });
+  const opts = { base: api.base, now: () => 3600 * 1000 };
+  await Promise.all([1, 2, 3].map(() => callbackCall('POST', 'User/Credential/c1:lock', {}, opts)));
+  assert.equal(api.state.seen.filter((s) => s.path === 'OAuth2:token').length, 1);
+  assert.deepEqual(api.state.seen.filter((s) => s.path !== 'OAuth2:token').map((s) => s.auth), ['Bearer at-2', 'Bearer at-2', 'Bearer at-2']);
+});
+
+test('a token that states no lifetime is never taken as lapsed', () => {
+  assert.equal(callbackTokenLapsed({ access_token: 'a', client_id: CLIENT, obtained_at: 0 }, 1e15), false);
+  assert.equal(callbackTokenLapsed({ access_token: 'a', client_id: CLIENT, expires_in: 3600 }, 1e15), false);
+  assert.equal(callbackTokenLapsed({ access_token: 'a', client_id: CLIENT, expires_in: 3600, obtained_at: 0 }, 3599_999), false);
+  assert.equal(callbackTokenLapsed({ access_token: 'a', client_id: CLIENT, expires_in: 3600, obtained_at: 0 }, 3600_000), true);
+  assert.equal(callbackTokenLapsed({ access_token: 'a', client_id: CLIENT, expires_in: 3600, obtained_at: 0 }, 3480_000, 120_000), true);
 });
 
 test('a session the server will not renew asks for a new sign-in; no token at all does too', async (t) => {
