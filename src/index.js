@@ -68,14 +68,14 @@ function standaloneCredentialSync() {
 /**
  * An explicit sign-in (`login`, `import`): store the entry's tokens, over a
  * tombstone included, when this install is signed in to callback.net. Never
- * fatal — the account is in the config either way, and the next pass stores it.
+ * fatal — the account is in the config either way, and its next renewal stores it.
  * @param {Record<string, any>} entry
  */
 async function recordSignInWithCallback(entry) {
   try {
     if (await standaloneCredentialSync().storeSignIn(entry)) console.log('Stored on callback.net for your other installs.');
   } catch (/** @type {any} */ err) {
-    console.error(`Could not store the sign-in on callback.net (${err?.message || err}); the next sync pass will.`);
+    console.error(`Could not store the sign-in on callback.net (${err?.message || err}); its next renewal will.`);
   }
 }
 
@@ -451,8 +451,6 @@ async function serverCommand() {
   accountManager.onAccountRemoved((account) => { credentialSync.onAccountRemoved(account).catch(() => {}); });
   // An account in error looks in the store for a token another install holds.
   accountManager.onAccountError((account) => { credentialSync.onAccountError(account).catch(() => {}); });
-  // An account is only stored once this launch has seen its token work.
-  accountManager.onAccountAccessed((account) => { credentialSync.onAccountAccessed(account).catch(() => {}); });
 
   // Persist refreshed tokens back to config (re-read from disk to avoid clobbering
   // accounts added externally, e.g. by `teamclaude import` while server is running)
