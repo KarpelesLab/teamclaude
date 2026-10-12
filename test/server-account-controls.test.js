@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
-import { createProxyServer } from '../src/server.js';
+import { createProxyServer, callerView } from '../src/server.js';
 import { ConfigOpError } from '../src/config-ops.js';
 
 // POST /teamclaude/priority and /teamclaude/disable are what the dashboard's
@@ -230,4 +230,33 @@ test('a client key cannot change accounts; the shared proxy key can', async () =
     assert.equal(ok.status, 200);
     assert.equal(calls.disabled.length, 1);
   });
+});
+
+// The status tells the page who is asking, so it can hide what this key would
+// be refused. The list must be the gate's own: a path in it must really be
+// refused to a client key, and the operator must be refused nothing.
+test('status reports the caller, and its refused list is what the gate refuses', async () => {
+  const { hooks } = stubHooks();
+  await withServer(hooks, async (port) => {
+    const status = async (headers) => (await (await fetch(`http://127.0.0.1:${port}/teamclaude/status`, { headers })).json()).caller;
+
+    const client = await status({ 'x-api-key': CLIENT_KEY });
+    assert.equal(client.kind, 'client');
+    assert.equal(client.client, 'ci');
+    assert.deepEqual([...client.refused].sort(), ['/teamclaude/disable', '/teamclaude/priority', '/teamclaude/threshold']);
+    for (const path of client.refused) {
+      const res = await post(port, path, {}, { 'x-api-key': CLIENT_KEY });
+      assert.equal(res.status, 403, path);
+    }
+
+    assert.deepEqual(await status({ 'x-api-key': PROXY_KEY }), { kind: 'operator', client: null, refused: [] });
+    // The key-less loopback caller is the operator too.
+    assert.deepEqual(await status({}), { kind: 'operator', client: null, refused: [] });
+  });
+});
+
+test('callerView', () => {
+  assert.deepEqual(callerView(null), { kind: 'operator', client: null, refused: [] });
+  assert.deepEqual(callerView(''), { kind: 'operator', client: null, refused: [] });
+  assert.equal(callerView('ci').kind, 'client');
 });

@@ -397,3 +397,39 @@ export function setAccountDisabled(config, query, disabled, spec = {}) {
   else delete account.disabled;
   return { name: account.name, disabled: !!account.disabled };
 }
+
+/**
+ * Give an account a new name, and carry it into every route that lists the old one.
+ *
+ * A route names its accounts by exact name, so renaming the account alone would
+ * drop it from those routes without a word. The new name is refused when it
+ * would resolve to another account (as a name or as an email), since every
+ * command looks accounts up that way, and when it is all digits, which a route
+ * reads as an account index.
+ *
+ * @param {any} config
+ * @param {string} query
+ * @param {unknown} newName
+ * @param {{ orgFilter?: string }} [spec]
+ * @returns {{ from: string, name: string, routes: string[] }} `routes` names the routes that were updated
+ */
+export function renameAccount(config, query, newName, spec = {}) {
+  const account = resolveConfiguredAccount(config, query, spec.orgFilter);
+  if (typeof newName === 'string') refuseControlCharacters(newName, 'An account name');
+  const name = typeof newName === 'string' ? newName.trim() : '';
+  if (!name) throw new ConfigOpError('name the new account name');
+  if (/^\d+$/.test(name)) throw new ConfigOpError(`"${name}" is all digits, which a route reads as an account index`);
+  const others = (config.accounts || []).filter((/** @type {any} */ a) => a !== account);
+  if (matchAccounts(others, name).length) throw new ConfigOpError(`"${name}" already names another account`);
+
+  const from = account.name;
+  account.name = name;
+  /** @type {string[]} */
+  const routes = [];
+  for (const r of Array.isArray(config.routes) ? config.routes : []) {
+    if (!Array.isArray(r.accounts) || !r.accounts.includes(from)) continue;
+    r.accounts = [...new Set(r.accounts.map((/** @type {string} */ a) => a === from ? name : a))];
+    routes.push(r.name);
+  }
+  return { from, name, routes };
+}

@@ -10,6 +10,8 @@ teamclaude login
 
 Opens your browser and uses the same OAuth flow as Claude Code. Auto-detects the account email and subscription tier. Logging in with the same account again updates its credentials.
 
+The browser is sent back to a listener on this machine, so it has to run here. On a terminal the command also prints a second link, which works from any device: open it there, sign in, and paste the code the page shows at the prompt. Whichever arrives first is used. Over SSH, or on Linux with no display (`DISPLAY`/`WAYLAND_DISPLAY` unset), no browser is opened and the paste is the whole flow, the same as `teamclaude login --token`.
+
 Run it once per account. You can add accounts while the server is running — press **R** in the TUI to reload.
 
 If the profile cannot be identified, login stops without adding a placeholder
@@ -92,12 +94,15 @@ teamclaude enable <name>        # re-enable it (also clears a stuck error state)
 teamclaude priority <name> 1    # rotation preference, lower = preferred
 teamclaude priority <name> --first
 teamclaude priority <name> --last
+teamclaude rename <name> <new>  # rename it; routes that list it are updated too
 teamclaude routing <name> <url> # route ALL of the account's traffic via its own proxy
 teamclaude routing <name> none  # clear it
 teamclaude routing <name> --check  # test the proxy the account already has
 ```
 
-`login`, `import`, `enable`, `disable`, `priority` and `routing` notify a running server to reload, so credential, priority, enable/disable and routing changes are picked up live; the same reload (POST `/teamclaude/reload`, or **R** in the TUI) also applies hand edits to an account's `upstream`/`modelMap`. Account **removals** made on disk (`teamclaude remove` from another shell, or a hand edit) are applied by the same reload: a running account whose entry is gone from the file is dropped from the fleet, and the reload reports how many it added and how many it removed. An account added in the TUI is safe during the moment between its addition and its save — a reload that reads the file first leaves it alone rather than treating the missing row as a removal. Removing one from the TUI or through the [MCP endpoint](usage.md#mcp-endpoint)'s `remove_account` takes effect at once.
+Rename while the server runs: an API-key account's saved quota readings are matched by name, so a rename made with the server stopped loses them on the next start. Sessions launched with `TC_ACCT=<old name>` pin by name and need relaunching with the new one.
+
+`login`, `import`, `enable`, `disable`, `priority`, `rename` and `routing` notify a running server to reload, so credential, priority, enable/disable, name and routing changes are picked up live; the same reload (POST `/teamclaude/reload`, or **R** in the TUI) also applies hand edits to an account's `upstream`/`modelMap`. Account **removals** made on disk (`teamclaude remove` from another shell, or a hand edit) are applied by the same reload: a running account whose entry is gone from the file is dropped from the fleet, and the reload reports how many it added and how many it removed. An account added in the TUI is safe during the moment between its addition and its save — a reload that reads the file first leaves it alone rather than treating the missing row as a removal. Removing one from the TUI or through the [MCP endpoint](usage.md#mcp-endpoint)'s `remove_account` takes effect at once.
 
 ## Syncing accounts across machines (callback.net)
 
@@ -201,15 +206,83 @@ Two fleet features reason about this machine's own exit address, which a routed 
 
 Accounts can also be added, removed and reordered from the TUI settings screen: **`g`** → **Add account** / **Remove account** / **Reorder accounts**.
 
+### Why an account is in `error`
+
+An account leaves rotation as `error` when upstream rejects its refresh token, or answers 401 to a token that has none to refresh with. `teamclaude status` names which, instead of pointing at the logs — `needs a re-login: upstream rejected its refresh token (400) — run: teamclaude login` — and `GET /teamclaude/status` carries the same under `accounts[].errorReason`: `code` (`refresh_rejected` or `credential_rejected`), `detail`, `since` (epoch ms) and `remedy`, the login command that brings it back. It is `null` whenever the account is not in `error`.
+
 ### Signing in again from the TUI
 
-An OAuth account whose refresh token upstream has rejected — typically because the same account was signed in somewhere else, which rotates the token and kills the copy TeamClaude holds — shows as `error` and stays that way until someone signs in again. Press **`l`** on the dashboard: the picker opens on the first account in `error`, and **Enter** opens the provider's sign-in page in your browser (Claude or Codex, by the account's provider). The dashboard stays live while it waits, up to two minutes.
+An OAuth account whose refresh token upstream has rejected — typically because the same account was signed in somewhere else, which rotates the token and kills the copy TeamClaude holds — shows as `error` and stays that way until someone signs in again. Press **`l`** on the dashboard: the picker opens on the first account in `error`, and **Enter** opens the login panel for the account's provider (Claude or Codex). The panel works when the server is on another machine, reached over SSH:
+
+- **The link.** The full sign-in URL is drawn under the label, wrapped across lines and starting at the left edge, so you can select it by hand in any terminal. It is also an OSC 8 hyperlink: click it in a terminal that supports them.
+- **The clipboard.** The panel sends the link to your clipboard with OSC 52 when it opens, and again on **`c`**. Your terminal must allow OSC 52 (some, iTerm2 among them, have it off by default). `c` is a key only while the paste field is empty.
+- **The paste field.** After you sign in, paste what the sign-in left you and press **Enter**:
+  - Claude: the code the page shows.
+  - Codex: OpenAI sends the browser to `http://localhost:1455/auth/callback`, which does not load on another machine. Copy that whole address from the browser's address bar and paste it.
+
+  A paste that cannot be used (one from another attempt, or the link itself) is refused with the reason, and you can paste again.
+- **Esc** cancels the sign-in and closes the listener.
+
+On a local terminal a browser also opens on this machine, and the sign-in finishes by itself when you approve it there. Over SSH, or on Linux with no display, no browser is opened. For Codex, connect with `ssh -L 1455:localhost:1455 <host>` and the laptop's browser reaches the server's listener, so the sign-in finishes without the paste. The panel waits up to five minutes, and the proxy keeps serving meanwhile.
+
+The server decides whether its terminal is remote from its own environment (`SSH_CONNECTION` or `SSH_TTY`; on Linux, no `DISPLAY` or `WAYLAND_DISPLAY`). A server that a service started inside tmux, and that you attach to over SSH later, still has the service's environment. It then opens a browser on the host as well, which nobody sees; the link and the paste work as usual. Start such a server with `TEAMCLAUDE_REMOTE=1` to say it is remote (`0` says local). Inside tmux, the clipboard and the link only reach your terminal with the tmux options in [Signing accounts in over SSH](#signing-accounts-in-over-ssh).
 
 The tokens go to the account the browser actually signed in as, matched by identity exactly as `teamclaude login` does — not to whichever row was highlighted. Sign in as a different account and that account is updated (or added) instead, the activity pane says so, and the row you picked still needs its login.
 
-The key needs a browser on the machine running the server, so it is not offered in `teamclaude attach`, and on a headless host `teamclaude login --token` remains the way.
+The sign-in runs in the server's process, so the key is not offered in `teamclaude attach`. You can also sign in on a machine that has a browser: if that install and the server are both signed in to [callback.net](#syncing-accounts-across-machines-callbacknet), run `teamclaude login` there, and the server takes the new token at its next pass (press **R** in its TUI, or run `teamclaude callback sync` on it, to start one now).
 
 **Reorder accounts** sets the order the account list is drawn in — `↑`/`↓` pick an account, `←`/`→` move it up and down, each move saved as you make it. It writes a `displayOrder` on the entry and touches nothing else: an account keeps its place in the `accounts` array, so route pins, session pins and `TC_ACCT` all go on naming the same accounts, and rotation order stays `priority`'s business alone. An account with no `displayOrder` — every account, until the first time you arrange them, and every one added afterwards — lists after the ones that have one, which is where a newly added account appeared anyway. A [third-party backend](#third-party-backend-accounts) served by a local process is infrastructure rather than a seat to rotate between: the TUI keeps those at the end of the list, and the screen leaves them there.
+
+## Signing accounts in over SSH
+
+A login normally ends with the browser sent back to a listener on the machine that started it,
+and the browser on your laptop cannot reach the server's loopback. So over SSH TeamClaude opens
+no browser on the host. It gives you a link to open on the laptop, and you paste the answer back:
+
+- `teamclaude login` prints the link. Paste back the code the page shows after you sign in.
+- `teamclaude login --codex` prints the link. After you sign in, the browser is sent to
+  `http://localhost:1455/auth/callback`, which does not load. Paste that whole address at the
+  prompt.
+- **`l`** in the attached TUI opens a panel with the link (clickable, and sent to your clipboard)
+  and a paste field. See [Signing in again from the TUI](#signing-in-again-from-the-tui).
+
+TeamClaude tells an SSH session from its environment (`SSH_CONNECTION`, `SSH_TTY`), and on Linux
+also treats a missing display (`DISPLAY`, `WAYLAND_DISPLAY`) as remote. A server that a service
+started inside tmux never sees your SSH session: it runs with the service's environment, however
+you attach to it later. It would then open a browser on the host, where nobody sees it. Start it
+with `TEAMCLAUDE_REMOTE=1` to say it is remote (for example `tmux new-session -e TEAMCLAUDE_REMOTE=1 ...`);
+`0` says local whatever the environment shows. `TEAMROUTER_REMOTE` is the same setting.
+
+For Codex, forward the callback port and the sign-in finishes without the paste:
+
+```sh
+ssh -t -L 1455:localhost:1455 <host> 'tmux attach -t teamclaude'
+```
+
+The TUI sends the link to the clipboard (OSC 52) and draws it as a hyperlink (OSC 8). Inside tmux
+neither reaches your terminal by default. Add these lines to `~/.tmux.conf` on the host:
+
+```
+# Accept OSC 52 from applications and pass it on. The default, external,
+# drops an application's clipboard write.
+set -g set-clipboard on
+# Pass OSC 8 hyperlinks on (tmux 3.4 or later). The pattern is matched against
+# your terminal's TERM: xterm* covers xterm-256color and xterm-ghostty, and *
+# covers every terminal.
+set -as terminal-features ',xterm*:hyperlinks'
+```
+
+Then run `tmux source-file ~/.tmux.conf`, and detach and attach again: tmux reads
+`terminal-features` when a client attaches. OSC 52 also needs the `clipboard` feature for your
+terminal; tmux's default `terminal-features` already gives it to `xterm*`. `allow-passthrough on`
+carries the clipboard write too, because the TUI sends it in both forms. Your terminal must allow
+OSC 52 as well; some have it off by default.
+
+You can also sign in on the laptop. If the laptop and the server are both signed in to
+callback.net (`teamclaude callback login` on each), run `teamclaude login` on the laptop. The
+server takes the new token at its next pass, and **R** in its TUI starts one. The laptop's config
+then holds the account too, which is safe: callback.net makes the installs take turns to refresh a
+token. See [Syncing accounts across machines](#syncing-accounts-across-machines-callbacknet).
 
 ## The `id` field
 
@@ -226,7 +299,17 @@ teamclaude login --codex     # browser sign-in, repeat per account
 ```
 
 Add `--no-browser` to print the URL instead of opening one, and `--name` to
-label the account yourself (it defaults to the email on the login).
+label the account yourself (it defaults to the email on the login). Over SSH,
+or on Linux with no display, no browser is opened.
+
+On a terminal you can finish the sign-in from another device. Open the URL
+there and sign in. The browser is then sent to
+`http://localhost:1455/auth/callback`, which does not load on that device:
+copy the whole address from its address bar and paste it at the prompt. With
+`ssh -L 1455:localhost:1455 <host>` the browser reaches the listener instead,
+and the sign-in finishes by itself. If port 1455 is in use (a running
+`codex login` holds it), the paste still works; without a terminal to paste
+into, the login fails, because nothing else can finish it.
 
 To pool a login you already have, or to add one without a browser, point an
 account at the Codex CLI's own credentials file instead — it defaults to
@@ -530,7 +613,11 @@ An `upstream` whose host is Anthropic's own is left alone without any flag — a
 
 The effective upstream is what counts. A fleet pointed at a third-party host through the global `upstream` is covered the same way: every account without an `upstream` of its own is refused continues there. (Before 1.1.22 only a per-account `upstream` armed this; a fleet on a third-party global upstream now gets the repair without a setting.)
 
+On Anthropic accounts session-aware routing sends a continue to the account holding its thread (see [Session-aware routing](routing.md#session-aware-routing)).
+
 A relay that forwards to Anthropic does keep thread state, and for it the refusal is pure overhead — the client would re-send a full history each turn for nothing. Declare it with `"messageThreads": true` on the account, or at the top level of the config for the global `upstream`, and continues are forwarded untouched.
+
+Untouched includes the proxy's tool-pair repair, which strips a `tool_use` or `tool_result` left without its counterpart so a compacted or interrupted conversation is not rejected. It reads a body as the whole conversation, and a delta is not one: after a tool call it opens with the `tool_result`, whose `tool_use` is in the thread. Through 1.1.24 the repair stripped that `tool_result`, Anthropic answered `400` (`messages.0: use the top-level 'system' parameter for the initial system prompt`), and every continue that followed a tool call was resent in full. A continue is now left to the upstream that holds its thread; a create, and a body with no thread, are repaired as before.
 
 ### `accounts[].models` is deprecated
 
