@@ -2908,6 +2908,27 @@ export async function peekStreamFailure(stream, bounds = {}) {
   };
 }
 
+/**
+ * Why each refused account failed, for the client. An account whose last token
+ * refresh failed (and none has succeeded since) was refused because its token
+ * could not be renewed, and that reason is named — the coordinator's (the store's
+ * lock denied) or the token endpoint's (a 429). A re-login does not touch either,
+ * so it is advised only when the endpoint rejected the refresh token itself, and
+ * for a refusal with no failed renewal behind it, with the status upstream
+ * actually answered.
+ */
+function refusalMessage(accountManager, rejected, statuses) {
+  const parts = [...rejected].map((name) => {
+    const account = accountManager.accounts.find(a => a.name === name);
+    const failure = account?._lastRefreshFailure;
+    // A refresh token the endpoint rejected IS fixed by a re-login; say so then.
+    if (failure) return `the token of "${name}" could not be renewed: ${failure.reason}${[400, 401, 403].includes(failure.status) ? '. Re-add it with: teamclaude login' : ''}`;
+    return `upstream refused the credential for account "${name}" (${statuses?.get(name) ?? 403}). Check the account, then re-add it with: teamclaude login`;
+  });
+  const text = parts.join('; ');
+  return `${text.charAt(0).toUpperCase()}${text.slice(1)}`;
+}
+
 export async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, useSx) {
   const maxRetries = accountManager.accounts.length;
   // This function is exported, so a caller may hand us a ctx built elsewhere.
@@ -3017,7 +3038,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       } else if (allEntitlementDenied) {
         message = `No account served this request. Every configured account returned OAuth entitlement denial (${OAUTH_ENTITLEMENT_ERROR_CODE}): ${names}. TeamClaude temporarily removed them from automatic rotation; retry after the cooldown or pin a different eligible account.`;
       } else {
-        message = `Upstream refused the credential for account ${names} (403). Check the account, then re-add it with: teamclaude login`;
+        message = refusalMessage(accountManager, rejected, ctx.rejectedStatus);
       }
       ctx.status = 502;
       ctx.account = `(${[...rejected].join(', ')} refused)`;
@@ -3679,6 +3700,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // refused" (fail fast, nothing to wait for) from "this one was, others are
       // just out of quota" (still worth holding for a reset).
       (ctx.credentialRejected ??= new Set()).add(account.name);
+      (ctx.rejectedStatus ??= new Map()).set(account.name, 403);
       if (entitlementDenied) (ctx.entitlementDenied ??= new Set()).add(account.name);
       ctx.tried.add(account.index);
       const cooldown = deniedUntil
@@ -3723,6 +3745,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
           : 'upstream rejected its token (401) and it has no refresh token');
       }
       (ctx.credentialRejected ??= new Set()).add(account.name);
+      (ctx.rejectedStatus ??= new Map()).set(account.name, 401);
       ctx.tried.add(account.index);
       console.error(`[TeamClaude] 401 on "${safeLine(account.name, 64)}"; failing over to another account`);
       if (clientGone(res)) { ctx.abandoned = true; return; }
