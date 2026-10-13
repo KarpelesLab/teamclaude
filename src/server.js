@@ -1798,8 +1798,9 @@ function reportFailure(...args) {
 
 // A status the client can act on: upstream said something about THIS request.
 // A 4xx IS an answer — it tells the client something true about what it sent,
-// and a session getting legitimate 400s is working, not starving. A 429 is a
-// refusal to answer and a 5xx is a failure to.
+// and a session getting legitimate 400s is working, not starving. An ordinary
+// 429 is a refusal to answer (an explicit x-should-retry: false is handled at
+// the relay), and a 5xx is a failure to.
 function answeredStatus(status) {
   // 401 is excluded on purpose. It is about the credential the PROXY injected,
   // which the client never sees and cannot act on — a fleet whose keys have all
@@ -3321,7 +3322,11 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         rateLimitHeaders[key] = value;
       }
     }
-    accountManager.updateQuota(account.index, rateLimitHeaders, ctx.model);
+    const nonRetryable429 = upstreamRes.status === 429
+      && upstreamRes.headers.get('x-should-retry')?.trim().toLowerCase() === 'false';
+    // This refusal is about the request, even if it carries incidental quota
+    // headers. Do not store those headers as an account-wide quota verdict.
+    if (!nonRetryable429) accountManager.updateQuota(account.index, rateLimitHeaders, ctx.model);
 
     // Any response at all came back through the account's routing proxy.
     accountManager.clearRoutingFailed(account.index);
@@ -3336,10 +3341,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // _selectProbe) clear its own hold and return the fleet to service.
     if (upstreamRes.status !== 429) accountManager.clearRateLimited(account.index);
 
-    // Two kinds of 429 are handled differently below: a quota rejection rotates
-    // to another account; a transient rate-limit throttle pauses + retries the
-    // same account (never rotates — see #84).
-    if (upstreamRes.status === 429) {
+    // Other 429s retain their established classification: quota rejection
+    // rotates, while a transient throttle pauses and retries.
+    // An explicit no-retry response reaches the normal relay untouched instead.
+    if (upstreamRes.status === 429 && !nonRetryable429) {
       // Clamp Retry-After to a sane window: missing/invalid falls back to 60s,
       // and out-of-range values are bounded to [1, 300]. A negative value would
       // otherwise bypass the wait cap — setTimeout returns immediately and a
@@ -3782,6 +3787,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     getLog()?.write(`\n\n=== RESPONSE ${upstreamRes.status} ===\n${formatHeaders(upstreamRes.headers)}`);
 
     ctx.status = upstreamRes.status;
+    // A request-specific refusal is an answer, not a starving session.
+    const deliveredStatus = nonRetryable429 || answeredStatus(upstreamRes.status);
 
     // Build response headers (skip hop-by-hop and encoding headers). The
     // connection-specific names are also illegal on an HTTP/2 response — when
@@ -3823,7 +3830,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       const l = getLog();
       if (l) { l.body('RESPONSE BODY', null); l.end(); }
       res.end();
-      ctx.delivered = answeredStatus(upstreamRes.status);
+      ctx.delivered = deliveredStatus;
       return;
     }
 
@@ -3839,7 +3846,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         // which is the failure the token counters cannot see, since a stream
         // that emitted message_start has already recorded a usage report.
         if (clientGone(res)) ctx.abandoned = true;
-        else ctx.delivered = answeredStatus(upstreamRes.status);
+        else ctx.delivered = deliveredStatus;
       } finally {
         // Also on the failure path: without the note a capped body reads as a
         // stream that simply stopped, which is the other thing that happens here.
@@ -3852,7 +3859,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       const l = getLog();
       if (l) { l.body('RESPONSE BODY', buf, contentType); l.end(); }
       res.end(buf);
-      ctx.delivered = answeredStatus(upstreamRes.status);
+      ctx.delivered = deliveredStatus;
     }
   } catch (err) {
     // Two of the things that can throw here are not upstream errors at all:
