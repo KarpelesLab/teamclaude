@@ -64,6 +64,10 @@ const ADAPTIVE_STATS_CACHE_MS = 1000;
 // when the token turned over, short enough that a genuinely bad new token
 // recovers on the next request rather than staying stuck.
 const FORCED_REFRESH_FLOOR_MS = 10_000;
+// How long a token-endpoint 429 holds an account's refreshes when it carries no
+// Retry-After: long enough that the 401 and the retry of the same request do not
+// ask again, short enough that a renewal is not put off for long.
+const REFRESH_429_HOLD_MS = 30_000;
 // How many distinct models an account's recentModels table remembers.
 const MAX_RECENT_MODELS = 8;
 // An organization-level OAuth policy denial is not repaired by an immediate
@@ -4876,6 +4880,12 @@ export class AccountManager {
       return;
     }
 
+    // The token endpoint answered 429: leave it alone until it said to come back
+    // (or REFRESH_429_HOLD_MS when it did not say), forced or not. Without this a
+    // request with an expired token asks once, its 401 forces another, and its
+    // retry a third — every one of them refused, each one making it worse.
+    if (account._refreshHeldUntil && Date.now() < account._refreshHeldUntil) return;
+
     if (!force && !isTokenExpiringSoon(account.expiresAt)) return;
 
     // A forced refresh answers a 401, but 401s arrive in bursts: every request
@@ -4939,6 +4949,7 @@ export class AccountManager {
         account.expiresAt = newTokens.expiresAt;
         account._lastRefreshAt = Date.now();
         account._deadRefreshToken = null; // this token works; clear any stale guard
+        account._refreshHeldUntil = null;
         // Set before the listener runs: it is what lets the sync store them.
         account._minted = minted;
         console.log(`[TeamClaude] Token refreshed for account "${safeLine(account.name, 64)}"`);
@@ -4955,6 +4966,11 @@ export class AccountManager {
         // transient failure (network, 5xx, timeout) must NOT sideline a healthy
         // account: keep its current token and retry on the next request. This is
         // what kept accounts wrongly "errored" after a momentary refresh blip.
+        if (err.status === 429) {
+          const holdMs = Number.isFinite(err.retryAfterMs) ? err.retryAfterMs : REFRESH_429_HOLD_MS;
+          account._refreshHeldUntil = Date.now() + holdMs;
+          console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}": the token endpoint asked to wait (429); no refresh before ${new Date(account._refreshHeldUntil).toISOString()}`);
+        }
         const isAuthRejection = err.status === 400 || err.status === 401 || err.status === 403;
         if (isAuthRejection) {
           // Remember WHICH token was rejected so we stop re-sending it (see the
