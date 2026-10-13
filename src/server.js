@@ -10,6 +10,7 @@ import { sanitizeToolPairs } from './tool-pair-sanitize.js';
 import { sanitizeCacheControl, cacheControlSubfieldsToStrip } from './cache-control-sanitize.js';
 import { sanitizeContentBlocks, contentBlockTypesToStrip } from './content-block-sanitize.js';
 import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
+import { isTokenExpired } from './oauth.js';
 import { TopLevelFieldFinder, modelGlobMatches, parseRequestEffort, parseRequestStream } from './model.js';
 import { conversationDigest, pinKeyFor } from './conversation.js';
 import { BodyWriter, truncationNote } from './request-log.js';
@@ -2908,6 +2909,25 @@ export async function peekStreamFailure(stream, bounds = {}) {
   };
 }
 
+/**
+ * The answer when the accounts a request reached all held an expired token that
+ * could not be renewed. 503 with a short Retry-After: the renewal may go through
+ * on the next request (the lock freed, the token endpoint back). Never a 401 or
+ * a 403 — the client's own credential is fine.
+ */
+function respondUnrenewed(res, ctx) {
+  const names = [...ctx.unrenewed].map(n => `"${n}"`).join(', ');
+  ctx.status = 503;
+  ctx.account = `(${[...ctx.unrenewed].join(', ')} not renewed)`;
+  if (!res.headersSent) {
+    res.writeHead(503, { 'Content-Type': 'application/json', 'retry-after': '30' });
+    res.end(JSON.stringify({
+      type: 'error',
+      error: { type: 'overloaded_error', message: `No account served this request: the token of ${names} has expired and could not be renewed. Retry shortly.` },
+    }));
+  }
+}
+
 export async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, useSx) {
   const maxRetries = accountManager.accounts.length;
   // This function is exported, so a caller may hand us a ctx built elsewhere.
@@ -2991,6 +3011,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     return;
   }
   if (!account) {
+    // Every account this request reached held an expired token that could not be
+    // renewed, and nothing else was tried: say that, not a refusal or a quota.
+    if (ctx.unrenewed?.size && [...ctx.tried].every(i => ctx.unrenewed.has(accountManager.accounts[i]?.name))
+        && (ctx.pinnedIndex != null || ctx.tried.size === accountManager.accounts.length)) {
+      return respondUnrenewed(res, ctx);
+    }
     // Every candidate was refused by upstream (403). Waiting will not help — the
     // account needs attention, not a retry — so say so plainly rather than
     // reporting a rate limit. Not a 403 either: the client's own credential is
@@ -3151,6 +3177,20 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   if (account.status === 'error' && retryCount < maxRetries) {
     ctx.tried.add(account.index);
     return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+  }
+  // The token has expired and the refresh did not replace it: the coordinator
+  // stood down (another install renewing, the store's lock not to be had) or the
+  // token endpoint failed for now. Upstream will not take it, so it is not sent:
+  // its 401 would force a refresh that fails the same way, and the retry would
+  // send it again. The account sits this request out.
+  if (account.type === 'oauth' && account.refreshToken && !account.upstream && isTokenExpired(account.expiresAt)) {
+    (ctx.unrenewed ??= new Set()).add(account.name);
+    ctx.tried.add(account.index);
+    console.error(`[TeamClaude] "${account.name}": token expired and not renewed; not sending it upstream`);
+    if (ctx.pinnedIndex == null && retryCount < maxRetries) {
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+    }
+    return respondUnrenewed(res, ctx);
   }
   // The refresh just found this account's routing proxy down (it arms the
   // cooldown). The forward would leave by the same proxy and fail the same
