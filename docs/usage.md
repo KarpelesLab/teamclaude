@@ -187,6 +187,8 @@ teamclaude alias --install    # or write it to your shell rc (--uninstall to rem
 
 This is an interactive-shell alias — it affects `claude` typed at a prompt, not `claude` spawned by editors or scripts. It's a thin passthrough to `teamclaude run`, which holds the proxy-up/down logic (so it errors when the proxy is down; add `--auto-fallback` to launch claude directly instead).
 
+The Claude Code extension for VS Code starts `claude` itself, so neither the alias nor `run` reaches it. It takes the proxy settings from its own setting instead: see [VS Code extension](vscode.md).
+
 ## Command reference
 
 ```bash
