@@ -1246,6 +1246,14 @@ export function relayHttpForward(req, res, stripOverage = false) {
 // by the client's user like the identity plane above; a rotated account's token
 // sees them as not found.
 //
+// The claude.ai connector list (/v1/mcp_servers) is the same plane. Claude Code
+// calls each listed connector on mcp-proxy.anthropic.com, a host this proxy
+// blind-tunnels, so those calls always carry the client's own credential. A
+// list fetched under a rotated account names THAT account's connector ids, and
+// mcp-proxy answers each one "Server not found" under the client's login: the
+// session starts without its claude.ai connectors whenever rotation is off the
+// client's own account.
+//
 // The Remote Control bridge is the same plane under other prefixes. Since
 // Claude Code 2.1.287 `claude remote-control` honours HTTPS_PROXY
 // (anthropics/claude-code#97352), so its control calls arrive here too:
@@ -1270,7 +1278,7 @@ export function relayHttpForward(req, res, stripOverage = false) {
 // does not take `/v1/sessionsX`. The entry without that slash, the collection
 // itself, matches as well, since a session is created with a bare
 // POST /v1/sessions (classificationPath has already dropped any `?beta=true`).
-const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/', '/api/frame/', '/v1/environments/', '/v1/sessions/', '/v2/session_ingress/', '/v2/ccr-sessions/'];
+const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/', '/api/frame/', '/v1/mcp_servers/', '/v1/environments/', '/v1/sessions/', '/v2/session_ingress/', '/v2/ccr-sessions/'];
 
 /**
  * Whether a classified path is on the client's own identity plane: below an
