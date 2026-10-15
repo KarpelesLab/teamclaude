@@ -40,7 +40,7 @@ import { SessionTitles } from './session-titles.js';
 import { captureEarlyConsole } from './early-log.js';
 import { RemoteControl, createAttachSession } from './tui-remote.js';
 import { SxManager } from './sx.js';
-import { autoUpdate, checkForUpdate, currentVersion, resolveVersionLabel, runUpdate, installKind, updateAvailableFromCache, PKG_NAME } from './updater.js';
+import { autoUpdate, checkForUpdate, currentVersion, resolveVersionLabel, runUpdate, installKind, updateAvailableFromCache, updateCommandFor, PKG_NAME } from './updater.js';
 import { renderStatus, formatPercent } from './status-renderer.js';
 import { sanitizeText, safeLine } from './safe-text.js';
 import { modelLabel } from './model.js';
@@ -2437,6 +2437,12 @@ async function updateCommand() {
   const kind = await installKind();
   if (kind === 'git') {
     console.log('This is a git checkout — update it with `git pull`, not npm.');
+    return;
+  }
+  // `npm install -g` would put a second copy in npm's global directory and
+  // leave this one, the one on PATH, as it is.
+  if (kind === 'pnpm') {
+    console.log(`This copy was installed with pnpm, which npm cannot update. Run: ${updateCommandFor(kind)}`);
     return;
   }
 
