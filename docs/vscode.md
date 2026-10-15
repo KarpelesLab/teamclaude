@@ -2,7 +2,7 @@
 
 Running the Claude Code extension for VS Code through TeamClaude.
 
-The extension starts its own Claude Code processes. `teamclaude run` and the shell alias never see them, so the extension gets the proxy settings from its own `claudeCode.environmentVariables` setting instead. This page sets that up in [MITM mode](proxy-modes.md#mitm-proxy-mode-default), the mode `teamclaude run` uses by default.
+In its chat panel, the extension starts its own Claude Code processes. `teamclaude run` and the shell alias never see them, so the extension gets the proxy settings from its own `claudeCode.environmentVariables` setting instead. This page sets that up in [MITM mode](proxy-modes.md#mitm-proxy-mode-default), the mode `teamclaude run` uses by default.
 
 ## 1. Keep the proxy running
 
@@ -90,7 +90,7 @@ On the proxy side, `teamclaude status` (or the TUI) counts the conversation unde
 
 ## Why MITM mode, not a base URL
 
-`teamclaude env --no-mitm` gives a single variable, `ANTHROPIC_BASE_URL=http://localhost:3456`, and the extension accepts that too. But Claude Code treats a base URL that is not Anthropic's as a gateway:
+`teamclaude env --no-mitm` gives `ANTHROPIC_BASE_URL=http://localhost:3456` (plus `API_TIMEOUT_MS` when `holdSeconds` is set), and the extension accepts that too. But Claude Code treats a base URL that is not Anthropic's as a gateway:
 
 - [MCP tool search](https://code.claude.com/docs/en/mcp#configure-tool-search) is off by default (`ENABLE_TOOL_SEARCH=true` turns it back on).
 - [Remote Control](https://code.claude.com/docs/en/remote-control#requirements) is off.
@@ -105,14 +105,14 @@ In MITM mode the API host stays `api.anthropic.com`, so none of that applies. [P
 ## Notes
 
 - **Claude Code still needs its own login.** Sign in to the extension as usual. The pool's accounts are what the proxy uses upstream; see [Run Claude Code through the proxy](usage.md#run-claude-code-through-the-proxy).
-- **Terminal mode** (`claudeCode.useTerminal`) runs Claude Code in an integrated terminal, and that terminal does not get these variables. This page covers the default chat panel.
+- **Terminal mode** (`claudeCode.useTerminal`) runs Claude Code in an integrated terminal, and that terminal does not get these variables. It does type `claude` into your shell, so the shell alias (`teamclaude alias --install`) routes it through the proxy there. This page covers the default chat panel.
 - **Tools that Claude runs inherit the variables.** Their traffic to other hosts is tunneled untouched. A program that is not Node.js and calls `api.anthropic.com` itself does not read `NODE_EXTRA_CA_CERTS`, so it rejects the proxy's certificate.
 - **Background sessions** (`/background`, `claude agents`) run in a shared supervisor process that may not have these variables. Claude Code's docs recommend the `env` block of `~/.claude/settings.json` for them ([network configuration](https://code.claude.com/docs/en/network-config#apply-network-settings-to-background-agents)). That file is shared with the CLI, so then every `claude` you start, in any terminal, goes through the proxy too, without the check `teamclaude run` makes that the proxy is up.
 - **Remote Control:** if messages from your phone never arrive, set `mitm.http1Only` (see [Configuration](configuration.md) and [#164](https://github.com/KarpelesLab/teamclaude/issues/164)).
 
 ## After updating TeamClaude
 
-The service keeps running the code it started with. After `teamclaude update` or an auto-update, restart it:
+The service keeps running the code it started with. After `teamclaude update` or an auto-update, restart it. A copy installed with another package manager, such as pnpm, is updated with that tool (`pnpm add -g @karpeleslab/teamclaude@latest`), since `teamclaude update` runs npm:
 
 ```bash
 teamclaude service install                    # macOS: rewrites the LaunchAgent and restarts the proxy
@@ -120,6 +120,8 @@ systemctl --user restart teamclaude.service   # Linux: run after `teamclaude ser
 ```
 
 On Linux, `service install` rewrites the unit but does not restart a unit that is already running, hence the second command. A restart drops requests in flight, so do it between tasks. `teamclaude version` names the installed version and `teamclaude status --json` names the running one (`server.version`). While they differ, the restart is still due.
+
+Restart it the same way after `teamclaude env` or `teamclaude run` wrote a new CA. They do that when the stored certificate no longer names a host the proxy intercepts, such as `chatgpt.com` once the first Codex account is added, or has less than 30 days left. The running service keeps presenting the certificate it started with, so a new conversation that trusts the new CA fails its TLS handshake until the service restarts.
 
 ## Turning it off
 
