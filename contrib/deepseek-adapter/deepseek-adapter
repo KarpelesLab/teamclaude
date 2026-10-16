@@ -1,0 +1,709 @@
+#!/usr/bin/env python3
+"""deepseek-adapter — loopback Anthropic->Anthropic shim for DeepSeek.
+
+Why this exists
+---------------
+TeamClaude forwards an account's own credential upstream, which would mean
+pasting the live DeepSeek key into ~/.config/teamclaude.json. Fleet secrets
+discipline forbids that: watchtowers snapshot panes and configs to disk, so a
+key written once propagates to N files.
+
+This shim inverts the topology. It holds the key -- read once at process start
+from a 0600 file, never logged, never echoed -- and injects it at egress.
+TeamClaude then holds only a NON-SECRET local placeholder for the
+`deepseek-droid` account.
+
+DeepSeek speaks the Anthropic wire protocol natively at
+https://api.deepseek.com/anthropic, so this is a pass-through, not a translator.
+Contrast the sibling :8083/:8084 anthropic-proxy-rs instances, which translate
+Anthropic->OpenAI and rely on UPSTREAM_API_KEY_PASSTHROUGH -- the exact pattern
+this file exists to avoid.
+
+Hardening
+---------
+* Bind is pinned to loopback; there is no flag to expose it.
+* Inbound requests must present the placeholder credential. Without this the
+  shim would be an open, unauthenticated DeepSeek relay for any local process
+  (the TeamClaude gateway itself accepts unauthenticated loopback requests), and
+  the user's credits would be spendable by anything on the box.
+* Model ids are validated against an allowlist. An unrecognized id is rejected
+  loudly rather than passed through -- DeepSeek silently maps unknown ids to its
+  flash tier, which would look like success while quietly serving the wrong
+  model.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hmac
+import http.client
+import json
+import os
+import stat
+import sys
+import threading
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+DEFAULT_PORT = 8085
+DEFAULT_UPSTREAM = "https://api.deepseek.com/anthropic"
+DEFAULT_TOKEN_FILE = "~/.deepseek-token"
+DEFAULT_PLACEHOLDER_FILE = "~/.config/openfugu/deepseek-placeholder"
+
+# Upstream statuses whose bodies are replaced rather than relayed. DeepSeek's
+# auth-failure bodies echo the last 4 characters of the submitted key; billing
+# (402) and quota (429) errors are the same class of credential-adjacent message,
+# so they are scrubbed too rather than assumed safe.
+CREDENTIAL_ERROR_STATUSES = frozenset({401, 402, 403, 429})
+
+# The only paths this shim will relay. Anything else is refused rather than
+# forwarded -- see do_POST for why non-inference traffic can reach this account.
+ALLOWED_POST_PATHS = frozenset({"/v1/messages", "/v1/messages/count_tokens"})
+
+# Canonical internal ids this shim accepts from its callers (teamclaude account
+# labels / --model-map targets). Anything else is a config error we want to hear
+# about immediately -- see module docstring on silent flash-tier fallback.
+#
+# These are NOT necessarily the ids DeepSeek currently serves on the wire --
+# DeepSeek renames/retires model ids over time. Checked against
+# api-docs.deepseek.com/quick_start/pricing on 2026-10-13: "deepseek-v4-flash" is
+# RETIRED (DeepSeek still serves it via a server-side redirect to
+# DeepSeek-V4.1-Flash, billed at the flash price, with no stated date for when
+# that redirect stops); "deepseek-v4-pro" (DeepSeek-V4-Pro-0813) is current.
+# UPSTREAM_MODEL_RENAME below is the one place that tracks the live wire id --
+# update that when DeepSeek renames a tier, not this set and not any caller
+# (teamclaude.json account names, ~/.claude/settings.json availableModels, this
+# file's --model-map), so a DeepSeek rename never requires a fleet-wide rename.
+ALLOWED_UPSTREAM_MODELS = {"deepseek-v4-pro", "deepseek-v4-flash"}
+
+# Canonical internal id -> live DeepSeek wire id. Omitted = unchanged (the
+# internal id still matches what DeepSeek expects today).
+UPSTREAM_MODEL_RENAME = {
+    "deepseek-v4-flash": "deepseek-flash",  # retired alias -> DeepSeek-V4.1-Flash
+}
+
+# Hop-by-hop headers must not be forwarded (RFC 9110 s7.6.1). Auth headers are
+# dropped deliberately: the inbound placeholder must never reach DeepSeek, and
+# we supply our own. Content-Length is recomputed after any model rewrite.
+STRIP_REQUEST_HEADERS = {
+    "host",
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "content-length",
+    "x-api-key",
+    "authorization",
+}
+
+# Hop-by-hop only. Content-Encoding is deliberately NOT here: it is an
+# end-to-end header, and stripping it while relaying the still-compressed body
+# hands the client gzip bytes labelled application/json. Content-Length is
+# dropped because we always recompute or re-frame the body.
+STRIP_RESPONSE_HEADERS = {
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "content-length",
+}
+
+MAX_BODY_BYTES = 32 * 1024 * 1024
+
+
+def _read_secret_file(path: str, *, require_strict_perms: bool) -> str:
+    """Read a credential file. Never returns it via logging; caller must not print."""
+    resolved = os.path.expanduser(path)
+    if not os.path.exists(resolved):
+        raise SystemExit(f"deepseek-adapter: credential file not found: {resolved}")
+
+    mode = os.stat(resolved).st_mode
+    if require_strict_perms and mode & (stat.S_IRWXG | stat.S_IRWXO):
+        raise SystemExit(
+            f"deepseek-adapter: refusing to read {resolved}: mode "
+            f"{oct(stat.S_IMODE(mode))} is group/other-accessible; chmod 600 it"
+        )
+
+    value = open(resolved, encoding="utf-8").read().strip()
+    if not value:
+        raise SystemExit(f"deepseek-adapter: credential file is empty: {resolved}")
+
+    # Reject anything that cannot be sent as an HTTP header value. http.client's
+    # putheader() raises ValueError whose message INTERPOLATES THE VALUE VERBATIM
+    # -- so a token file with an inner CR/LF (a two-line file, a CRLF paste, an
+    # editor line-wrap during rotation) would print the key into stderr and thus
+    # into journald and watchtower snapshots, defeating the one constraint this
+    # whole file exists to enforce. .strip() only removes leading/trailing space.
+    # Fail loudly at startup, naming the PATH and never the value.
+    if any(c in value for c in "\r\n\t") or not value.isprintable():
+        raise SystemExit(
+            f"deepseek-adapter: credential in {resolved} contains newline, tab or "
+            f"non-printable characters and cannot be sent as an HTTP header. "
+            f"Rewrite it as a single line (value intentionally not shown)."
+        )
+    return value
+
+
+class Config:
+    def __init__(self, args: argparse.Namespace) -> None:
+        # Read once at start. If the key is rotated, restart the unit -- that is
+        # deliberate: a long-lived process re-reading a secret per request widens
+        # the window where a bad file yields confusing per-request failures.
+        self.api_key = _read_secret_file(args.token_file, require_strict_perms=True)
+        # The placeholder is NOT a secret -- it exists to stop unrelated local
+        # processes from using this port as a free DeepSeek relay, not to protect
+        # the key. Strict perms are therefore not required.
+        self.placeholder = _read_secret_file(
+            args.placeholder_file, require_strict_perms=False
+        )
+
+        parsed = urllib.parse.urlparse(args.upstream)
+        if parsed.scheme != "https":
+            raise SystemExit("deepseek-adapter: upstream must be https")
+        self.upstream_host = parsed.netloc
+        self.upstream_base = parsed.path.rstrip("/")
+
+        self.model_map = dict(
+            pair.split("=", 1) for pair in args.model_map if "=" in pair
+        )
+        self.model_map_lower = {k.lower(): v for k, v in self.model_map.items()}
+        self.disable_thinking_for = set(args.disable_thinking_for)
+        self.disable_thinking_for_lower = {m.lower() for m in args.disable_thinking_for}
+        # Distinct from disable_thinking_for: that one only DEFAULTS thinking off
+        # and lets an explicit caller `thinking` win. Native Claude clients always
+        # send `thinking` explicitly, so the default never fires for them, and
+        # their history carries assistant `thinking` blocks DeepSeek rejects
+        # ("content[].thinking in the thinking mode must be passed back").
+        # This set FORCES thinking off and strips those blocks. Kept separate so
+        # OpenFugu's alias semantics are unchanged.
+        self.force_no_thinking_for_lower = {
+            m.lower() for m in getattr(args, "force_no_thinking_for", []) or []
+        }
+        self.timeout = args.timeout
+        self.verbose = args.verbose
+
+
+_THINKING_BLOCK_TYPES = frozenset({"thinking", "redacted_thinking"})
+
+
+def _strip_thinking_blocks(payload: dict) -> bool:
+    """Drop assistant `thinking`/`redacted_thinking` content blocks in place.
+
+    Returns True when anything changed. A message whose content becomes empty
+    keeps a single empty text block rather than being deleted: removing the
+    message entirely would break user/assistant alternation, which is a harder
+    failure than an empty turn. Non-list content (a plain string) is untouched.
+    """
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return False
+    changed = False
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        kept = [
+            b
+            for b in content
+            if not (isinstance(b, dict) and b.get("type") in _THINKING_BLOCK_TYPES)
+        ]
+        if len(kept) == len(content):
+            continue
+        msg["content"] = kept or [{"type": "text", "text": ""}]
+        changed = True
+    return changed
+
+
+def _strip_orphaned_advisor_deltas(payload: dict) -> bool:
+    """Remove history declarations for an advisor tool absent from this request.
+
+    TeamClaude removes unsupported advisor tools before DeepSeek egress, but
+    Claude Code also records tool_addition/tool_removal blocks in history.
+    DeepSeek rejects those references when the tool is no longer declared.
+    Ordinary tools and message order are preserved; only this outbound payload
+    is changed, never the client's transcript.
+    """
+    tools = payload.get("tools")
+    if isinstance(tools, list) and any(
+        isinstance(tool, dict) and tool.get("name") == "advisor" for tool in tools
+    ):
+        return False
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return False
+    changed = False
+    for message in messages:
+        if not isinstance(message, dict) or not isinstance(message.get("content"), list):
+            continue
+        kept = []
+        for block in message["content"]:
+            tool = block.get("tool") if isinstance(block, dict) else None
+            if (
+                isinstance(block, dict)
+                and block.get("type") in {"tool_addition", "tool_removal"}
+                and isinstance(tool, dict)
+                and tool.get("name") == "advisor"
+            ):
+                changed = True
+                continue
+            kept.append(block)
+        if len(kept) != len(message["content"]):
+            message["content"] = kept or [{
+                "type": "text", "text": "[Earlier consultation tool declaration omitted.]"
+            }]
+    return changed
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "deepseek-adapter"
+    sys_version = ""
+
+    config: Config  # injected on the server, mirrored per-handler below
+
+    def log_message(self, fmt: str, *args) -> None:  # noqa: A003 - stdlib name
+        # Default BaseHTTPRequestHandler logging writes the full request line.
+        # Paths here never carry credentials, but keep it quiet and explicit.
+        sys.stderr.write(
+            "deepseek-adapter %s - %s\n" % (self.address_string(), fmt % args)
+        )
+
+    # -- helpers ---------------------------------------------------------
+
+    def _send_json(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        if self.close_connection:
+            # Tell the client too, so its pool discards the socket instead of
+            # discovering the close on the next reuse attempt.
+            self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _error(self, status: int, kind: str, message: str) -> None:
+        # Error paths may not have consumed the request body (e.g. a refused
+        # POST path whose Content-Length body was never read). On a keep-alive
+        # socket the NEXT request line would then be parsed from inside the
+        # unread body — observed as garbage 'Unsupported method' 501s corrupting
+        # the request AFTER a refused telemetry POST on teamclaude's pooled
+        # upstream connection. Closing on error makes desync impossible; the
+        # success path keeps keep-alive.
+        self.close_connection = True
+        self._send_json(status, {"type": "error", "error": {"type": kind, "message": message}})
+
+    def _authorized(self) -> bool:
+        presented = self.headers.get("x-api-key")
+        if not presented:
+            auth = self.headers.get("authorization", "")
+            if auth.lower().startswith("bearer "):
+                presented = auth[7:].strip()
+        if not presented:
+            return False
+        # Constant-time compare so a local process cannot byte-search the
+        # placeholder out of the adapter. Compare as BYTES: compare_digest raises
+        # TypeError on non-ASCII str arguments, and a non-ASCII credential header
+        # would otherwise kill the handler thread before any response is written.
+        return hmac.compare_digest(
+            presented.encode("utf-8", "surrogateescape"),
+            self.config.placeholder.encode("utf-8", "surrogateescape"),
+        )
+
+    # -- routes ----------------------------------------------------------
+
+    def do_GET(self) -> None:  # noqa: N802 - stdlib name
+        path = urllib.parse.urlparse(self.path).path
+        if path == "/health":
+            # Deliberately does NOT call upstream: health must stay free and must
+            # not burn quota or fail on a transient DeepSeek blip.
+            self._send_json(200, {"status": "ok", "upstream": self.config.upstream_host})
+            return
+        self._error(404, "not_found", f"no route for GET {path}")
+
+    def do_POST(self) -> None:  # noqa: N802 - stdlib name
+        # Structural guard: an uncaught exception in a BaseHTTPRequestHandler
+        # method kills the thread having written nothing, so the client gets a
+        # destroyed socket with no status line -- the least diagnosable failure
+        # there is. Two such crashes (non-ASCII credential, non-object JSON body)
+        # were found in review; this makes the class of bug impossible rather
+        # than fixing them one at a time.
+        try:
+            self._do_post()
+        except Exception as exc:  # noqa: BLE001 - deliberate catch-all
+            # Type only, never str(exc): some exception messages (notably
+            # http.client's "Invalid header value %r") embed the header value,
+            # i.e. the API key, and this line goes to stderr -> journald.
+            self.log_message("unhandled error: %s", type(exc).__name__)
+            if getattr(self, "_response_started", False):
+                self.close_connection = True
+                return
+            try:
+                self._error(500, "api_error", f"adapter error: {type(exc).__name__}")
+            except Exception:  # noqa: BLE001 - response already partly written
+                pass
+
+    def _do_post(self) -> None:
+        path = urllib.parse.urlparse(self.path).path
+
+        if path not in ALLOWED_POST_PATHS:
+            # Do not relay arbitrary paths upstream. TeamClaude skips its route
+            # checks entirely for requests with no top-level `model` (the guards
+            # read `if (model && !_routeAllows(...))`), so non-inference traffic
+            # such as /api/event_logging/v2/batch can be handed to any account,
+            # including this one. Refusing unknown paths keeps this from becoming
+            # a general-purpose relay to api.deepseek.com.
+            self._error(404, "not_found", f"no route for POST {path}")
+            return
+
+        if not self._authorized():
+            self._error(401, "authentication_error", "invalid or missing adapter credential")
+            return
+
+        raw_length = self.headers.get("Content-Length")
+        if raw_length is None:
+            # No chunked-inbound support. Reading 0 bytes here would surface later
+            # as a baffling "model None" rejection, so name the real cause. Both
+            # real callers (teamclaude, LiteLLM) always set Content-Length.
+            self._error(
+                411,
+                "invalid_request_error",
+                "Content-Length required; chunked request bodies are not supported",
+            )
+            return
+
+        try:
+            length = int(raw_length)
+        except ValueError:
+            self._error(400, "invalid_request_error", "malformed Content-Length")
+            return
+
+        if length < 0:
+            # rfile.read(-1) reads to EOF with no bound. A negative Content-Length
+            # slips past the size guard below (-1 > MAX_BODY_BYTES is False) and
+            # is truthy, so without this a single request can pull unbounded bytes
+            # into memory -- verified at +63 MB RSS from one 64 MB POST.
+            self._error(400, "invalid_request_error", "negative Content-Length")
+            return
+
+        if length > MAX_BODY_BYTES:
+            self._error(413, "request_too_large", "body exceeds adapter limit")
+            return
+        raw = self.rfile.read(length) if length else b""
+
+        try:
+            payload = json.loads(raw) if raw else {}
+        except json.JSONDecodeError as exc:
+            self._error(400, "invalid_request_error", f"body is not valid JSON: {exc}")
+            return
+
+        if not isinstance(payload, dict):
+            # `[]` and `"hello"` are valid JSON but have no .get -- without this
+            # the AttributeError would kill the handler thread and the client
+            # would see a closed socket rather than a 400.
+            self._error(
+                400,
+                "invalid_request_error",
+                f"body must be a JSON object, got {type(payload).__name__}",
+            )
+            return
+
+        requested = payload.get("model")
+        # TeamClaude's route globs are case-INSENSITIVE (model.js:45-49), so an id
+        # like "OpenFugu-DeepSeek" routes here but would miss a case-sensitive
+        # dict lookup. Match the upstream layer's semantics instead of
+        # disagreeing with it.
+        mapped = self.config.model_map.get(requested, requested)
+        if mapped == requested and isinstance(requested, str):
+            mapped = self.config.model_map_lower.get(requested.lower(), requested)
+
+        if mapped not in ALLOWED_UPSTREAM_MODELS:
+            # Loud failure by design. DeepSeek would accept this and silently
+            # serve its flash tier; that reads as success while the heterogeneous
+            # routing claim quietly becomes false.
+            self._error(
+                400,
+                "invalid_request_error",
+                f"model {requested!r} maps to {mapped!r}, which is not a known DeepSeek "
+                f"model ({sorted(ALLOWED_UPSTREAM_MODELS)}). Refusing to forward.",
+            )
+            return
+
+        # Claude Code 2.1.301 can omit tools/system/history on a thread
+        # continuation. DeepSeek ignores `thread`, so accepting it silently
+        # loses those fields and makes tool calls appear as plain DSML text.
+        # Use the client's explicit compatibility error to retry with the full
+        # stateless request and disable threads for this model/session. Merely
+        # deleting `thread` cannot recover the omitted fields.
+        if "thread" in payload:
+            self.close_connection = True
+            self._send_json(400, {
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "thread requests are not supported by this DeepSeek adapter; resend the complete stateless request",
+                    "details": {"error_code": "thread_unsupported_request"},
+                },
+            })
+            return
+
+        # Translate the canonical internal id to whatever DeepSeek actually
+        # expects on the wire today (UPSTREAM_MODEL_RENAME). Callers keep using
+        # the stable internal id; only the outgoing byte changes when DeepSeek
+        # renames a tier.
+        upstream_model = UPSTREAM_MODEL_RENAME.get(mapped, mapped)
+
+        mutated = _strip_orphaned_advisor_deltas(payload)
+
+        if upstream_model != requested:
+            payload["model"] = upstream_model
+            mutated = True
+
+        if (
+            isinstance(requested, str)
+            and requested.lower() in self.config.disable_thinking_for_lower
+            and "thinking" not in payload
+        ):
+            # DeepSeek emits a `thinking` block before the text block and it is
+            # billed against max_tokens. LiteLLM files that block under
+            # reasoning_content, and OpenFugu reads only .message.content -- so
+            # for this alias the reasoning is generated, paid for, and discarded.
+            # Worse, a large enough thinking block exhausts max_tokens and the
+            # response comes back 200 with NO text block at all, which OpenFugu
+            # turns into an empty-string reply: a silent degraded turn.
+            # Only defaulted, never forced: an explicit caller `thinking` wins.
+            payload["thinking"] = {"type": "disabled"}
+            mutated = True
+
+        if (
+            isinstance(requested, str)
+            and requested.lower() in self.config.force_no_thinking_for_lower
+        ):
+            # Bridging a NATIVE Claude client (Claude Code) onto DeepSeek. Such a
+            # client sends `thinking` explicitly, so the default above never
+            # fires, and its transcript carries assistant `thinking` /
+            # `redacted_thinking` blocks. DeepSeek then 400s with "The
+            # content[].thinking in the thinking mode must be passed back to the
+            # API." Force thinking off and drop the blocks so the transcript is
+            # self-consistent for a non-thinking request.
+            if payload.get("thinking") != {"type": "disabled"}:
+                payload["thinking"] = {"type": "disabled"}
+                mutated = True
+            if _strip_thinking_blocks(payload):
+                mutated = True
+
+        if mutated:
+            raw = json.dumps(payload).encode()
+
+        streaming = bool(payload.get("stream"))
+        self._proxy(self.path, raw, streaming=streaming)
+
+    # -- egress ----------------------------------------------------------
+
+    def _proxy(self, path_and_query: str, body: bytes, *, streaming: bool) -> None:
+        cfg = self.config
+        headers = {
+            k: v
+            for k, v in self.headers.items()
+            if k.lower() not in STRIP_REQUEST_HEADERS
+        }
+        # The only place the key is ever used. Not logged, not echoed.
+        headers["x-api-key"] = cfg.api_key
+        headers.setdefault("anthropic-version", "2023-06-01")
+        headers["content-length"] = str(len(body))
+        headers["host"] = cfg.upstream_host
+
+        # Forward the query string too. Routing and the path allowlist are decided
+        # on the path alone, but silently dropping params (Anthropic clients send
+        # things like ?beta=true) would make this an unfaithful proxy.
+        target = cfg.upstream_base + path_and_query
+
+        conn = http.client.HTTPSConnection(cfg.upstream_host, timeout=cfg.timeout)
+        try:
+            conn.request("POST", target, body=body, headers=headers)
+            upstream = conn.getresponse()
+
+            # When we substitute our own body (the 401/403 scrub) we must also
+            # drop the headers that described upstream's body, or the client will
+            # try to gunzip plain JSON.
+            replacing_body = upstream.status in CREDENTIAL_ERROR_STATUSES
+            strip = STRIP_RESPONSE_HEADERS | (
+                {"content-encoding", "content-type"} if replacing_body else set()
+            )
+
+            # From here on a status line is committed to _headers_buffer, and any
+            # later failure must NOT try to write a second response -- see except.
+            self._response_started = True
+            self.send_response(upstream.status)
+            for key, value in upstream.getheaders():
+                if key.lower() in strip:
+                    continue
+                self.send_header(key, value)
+
+            if replacing_body:
+                self.send_header("Content-Type", "application/json")
+                # DeepSeek's auth-failure bodies echo the last 4 characters of the
+                # submitted key. Relaying that verbatim would put key fragments in
+                # teamclaude's request log and from there into watchtower pane
+                # snapshots. Substitute a body that carries the status without the
+                # fragment.
+                upstream.read()
+                scrubbed = json.dumps(
+                    {
+                        "type": "error",
+                        "error": {
+                            "type": "authentication_error",
+                            "message": (
+                                f"upstream returned HTTP {upstream.status} (credential, "
+                                f"billing or quota); body withheld because DeepSeek echoes "
+                                f"key material. Check ~/.deepseek-token and the account "
+                                f"balance, then restart deepseek-adapter."
+                            ),
+                        },
+                    }
+                ).encode()
+                self.send_header("Content-Length", str(len(scrubbed)))
+                self.end_headers()
+                self.wfile.write(scrubbed)
+                return
+
+            if streaming:
+                # Chunked passthrough keeps SSE events flowing as they arrive.
+                # Buffering here would stall message_start/content_block_delta
+                # until completion and defeat streaming entirely.
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                while True:
+                    chunk = upstream.read(4096)
+                    if not chunk:
+                        break
+                    self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
+                    self.wfile.flush()
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            else:
+                payload = upstream.read()
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+        except Exception as exc:  # noqa: BLE001 - deliberate catch-all, see below
+            # Catch EVERYTHING. A ValueError from http.client.putheader ("Invalid
+            # header value %r") would otherwise escape to socketserver.handle_error,
+            # which prints a traceback containing the offending header value -- the
+            # API key -- to stderr and thus journald. For the same reason only the
+            # exception TYPE is ever reported: str(exc) can embed the key.
+            self.log_message("upstream request failed: %s", type(exc).__name__)
+            if getattr(self, "_response_started", False):
+                # send_response() has already buffered (or flushed) a status line.
+                # Calling _error() now would append a SECOND status line to the same
+                # never-reset _headers_buffer -- the client would parse a 200 with an
+                # embedded "502" header line and no usable Content-Length. Mid-stream
+                # it is worse: a raw HTTP response injected into the chunked body
+                # with no framing and no terminating 0-chunk. Drop the connection so
+                # the caller sees a clean transport error it can retry.
+                self.close_connection = True
+            else:
+                self._error(502, "api_error", f"upstream request failed: {type(exc).__name__}")
+        finally:
+            conn.close()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Loopback Anthropic->Anthropic shim that holds the DeepSeek key."
+    )
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--token-file", default=DEFAULT_TOKEN_FILE)
+    parser.add_argument("--placeholder-file", default=DEFAULT_PLACEHOLDER_FILE)
+    parser.add_argument("--upstream", default=DEFAULT_UPSTREAM)
+    parser.add_argument("--timeout", type=float, default=300.0)
+    parser.add_argument(
+        "--model-map",
+        action="append",
+        default=[],
+        metavar="FROM=TO",
+        help="repeatable; e.g. openfugu-deepseek=deepseek-v4-pro",
+    )
+    parser.add_argument(
+        "--disable-thinking-for",
+        action="append",
+        default=[],
+        metavar="MODEL",
+        help=(
+            "repeatable; requested model ids for which to default "
+            "thinking={'type':'disabled'} when the caller did not set it"
+        ),
+    )
+    parser.add_argument(
+        "--force-no-thinking-for",
+        action="append",
+        default=[],
+        metavar="MODEL",
+        help=(
+            "repeatable; requested model ids to bridge from a NATIVE Claude "
+            "client. Unlike --disable-thinking-for this FORCES "
+            "thinking={'type':'disabled'} even when the caller sent its own "
+            "thinking, and strips assistant thinking/redacted_thinking blocks "
+            "from the transcript (DeepSeek 400s on those)"
+        ),
+    )
+    parser.add_argument("--verbose", action="store_true")
+    args = parser.parse_args()
+
+    config = Config(args)
+    Handler.config = config
+
+    class Server(ThreadingHTTPServer):
+        # Default backlog of 5 is thin when TRINITY fans out across agent slots
+        # and every turn opens a fresh connection.
+        request_queue_size = 128
+        daemon_threads = True
+
+        def handle_error(self, request, client_address):
+            # socketserver's default prints a full traceback to stderr, which
+            # systemd routes to journald and watchtowers snapshot to disk. Two
+            # reasons that is unacceptable here: routine client disconnects
+            # (ConnectionResetError/BrokenPipeError, raised in handle_one_request
+            # OUTSIDE do_POST so the per-request guard cannot catch them) are pure
+            # noise; and an exception *message* can embed a header value -- which
+            # for this process means the API key (http.client raises
+            # ValueError("Invalid header value %r") interpolating it verbatim).
+            # Log the type only: never the message, never the traceback.
+            exc = sys.exc_info()[1]
+            sys.stderr.write(
+                f"deepseek-adapter {client_address[0]} - connection error: "
+                f"{type(exc).__name__}\n"
+            )
+            sys.stderr.flush()
+
+    # Loopback is not configurable. An adapter holding a live API key must not be
+    # one flag away from listening on a routable address.
+    server = Server(("127.0.0.1", args.port), Handler)
+
+    sys.stderr.write(
+        f"deepseek-adapter listening on 127.0.0.1:{args.port} -> "
+        f"{config.upstream_host}{config.upstream_base} "
+        f"(map: {config.model_map or 'none'})\n"
+    )
+    sys.stderr.flush()
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.shutdown()
+
+
+if __name__ == "__main__":
+    main()
