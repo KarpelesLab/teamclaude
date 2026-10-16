@@ -2797,6 +2797,15 @@ export class TUI {
         const xu = extraUsageTag(a.allowExtraUsage === true, this._onExtraUsage(a));
         return Math.max(w, (tag ? 2 + vw(tag) : 0) + (xu ? 2 + vw(xu) : 0));
       }, 0);
+      // And for the reset-credit tag (`RC1`), drawn after the two above. It went
+      // unbudgeted once: the bars were sized to the edge, fitLine cut the tag, and
+      // an account holding a reset credit showed nothing on any row that drew a
+      // family bar. Counted through resetCreditTag, so a stale reading that draws
+      // no tag reserves no column either.
+      const creditW = members.reduce((/** @type {number} */ w, /** @type {any} */ a) => {
+        const tag = resetCreditTag(a.quota);
+        return tag ? Math.max(w, 2 + vw(tag)) : w;
+      }, 0);
       // Same rule again for the switch-threshold tag (#409) — silent on the
       // common (no override, or one that matches the fleet) row, so it costs
       // the budget nothing there, exactly like the two tags above it. It sits
@@ -2812,7 +2821,7 @@ export class TUI {
         const tag = routingTag(a);
         return tag ? Math.max(w, 2 + vw(tag)) : w;
       }, 0);
-      const fixed = 20 + typeCell + NAME_MIN + routeCells + tagW + spendW + switchW + routeW;
+      const fixed = 20 + typeCell + NAME_MIN + routeCells + tagW + spendW + creditW + switchW + routeW;
       const span = (/** @type {number} */ n, /** @type {number} */ bar) => fixed + 6 * (n - 1) + n * bar;
       const roomFor = (/** @type {number} */ n) => span(n, BAR_MIN) <= W;
       // No Ses bar once every Codex account here has said it meters no 5h window
