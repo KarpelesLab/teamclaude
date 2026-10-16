@@ -11,7 +11,7 @@ test('browser discovery stays local and model discovery defaults only missing na
   globalThis.fetch = async (url, options) => {
     if (String(url).startsWith('http://127.0.0.1:')) return originalFetch(url, options);
     seen.push(options.headers);
-    return new Response('{"data":[]}', { headers: { 'content-type': 'application/json' } });
+    return new globalThis.Response('{"data":[]}', { headers: { 'content-type': 'application/json' } });
   };
   const am = new AccountManager([{ name: 'test', type: 'apikey', apiKey: 'test-key' }]);
   const server = createProxyServer(am, {});
