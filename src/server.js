@@ -563,7 +563,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // Dispatched BEFORE the loopback-only checks below: a page cannot make a
       // browser emit an absolute-form request line, the relay injects no fleet
       // credential, and its Host header names the TARGET, not this proxy.
-      if (/^https?:\/\//i.test(req.url || '')) { relayHttpForward(req, res, shouldStripOverageHeaders(config)); return; }
+      if (/^https?:\/\//i.test(req.url || '')) { relayHttpForward(req, res, shouldStripOverageHeaders(config), config.proxy); return; }
 
       // A request admitted ONLY by the loopback exemption — no valid key — is
       // held to two more conditions. Both target the same actor: a web page in
@@ -1175,7 +1175,7 @@ export function describeConnectError(err) {
 // client's own headers — no account selection, no token injection,
 // content-encoding passed through (a transparent forward proxy). Anthropic is
 // HTTPS-only, so in practice this only ever sees third-party hosts.
-export function relayHttpForward(req, res, stripOverage = false) {
+export function relayHttpForward(req, res, stripOverage = false, /** @type {Record<string, any>|null} */ proxyConfig = null) {
   let target;
   try { target = new URL(req.url); } catch {
     res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -1207,6 +1207,10 @@ export function relayHttpForward(req, res, stripOverage = false) {
     const lk = key.toLowerCase();
     // Drop hop-by-hop + proxy-control headers; `host` is reset from the target.
     if (lk.startsWith(':') || HOP_BY_HOP_HEADERS.has(lk) || lk === 'proxy-connection') continue;
+    // x-api-key may authenticate to this proxy or to the destination API.
+    // Consume our own keys, preserving unrelated application credentials.
+    if (lk === 'x-api-key' && (proxyConfig?.apiKey || proxyConfig?.clientKeys?.length)
+      && resolveClientAuth(proxyConfig, value).ok) continue;
     headers[key] = value;
   }
 

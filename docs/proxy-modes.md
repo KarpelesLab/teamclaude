@@ -32,6 +32,7 @@ A pool with Codex accounts also intercepts `chatgpt.com`. Inside that tunnel onl
 
 - The CA is generated locally, stored in the config dir, and trusted **only** by the claude process you launch via `teamclaude run` (through `NODE_EXTRA_CA_CERTS`) — it is **never** added to your system trust store. The leaf private key is `0600`; the CA private key is never written to disk.
 - TeamClaude still verifies the **real** Anthropic certificate on the upstream leg.
+- Plain-HTTP forwarding consumes `x-api-key` values matching the shared proxy key or a configured client key instead of sending them to the destination. Unrelated application API keys remain intact, including on key-exempt loopback connections and when no proxy key is configured.
 
 Verify the proxy and CA without any credentials — the proxy always answers a built-in test host:
 
