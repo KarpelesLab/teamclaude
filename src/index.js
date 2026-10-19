@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { BUILD_VERSION, BUILD_COMMIT, BUILD_BACKPORT_NOTE } from './build-identity.js';
 import { spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { createWriteStream, readFileSync } from 'node:fs';
@@ -496,12 +497,15 @@ async function serverCommand() {
     server.on('error', err => console.error(`[TeamClaude] Server error: ${err.message}`));
     if (tui) {
       tui.start();
+      console.log(`Build ${BUILD_VERSION} (${BUILD_COMMIT || 'unknown commit'})`);
+      if (BUILD_BACKPORT_NOTE) console.log(BUILD_BACKPORT_NOTE);
       console.log(`Listening on port ${port} with ${accounts.length} account(s)`);
     } else {
       const sep = '='.repeat(60);
       console.log('');
       console.log(sep);
-      console.log('  TeamClaude Proxy');
+      console.log(`  TeamClaude ${BUILD_VERSION} (${BUILD_COMMIT || 'unknown commit'})`);
+      if (BUILD_BACKPORT_NOTE) console.log(`  ${BUILD_BACKPORT_NOTE}`);
       console.log(sep);
       console.log(`  Bind:       ${bindHost}:${port}${bindHost === '127.0.0.1' ? ' (localhost only)' : ' (reachable off-box — ensure proxy.apiKey is set)'}`);
       console.log(`  Accounts:   ${accounts.length}`);

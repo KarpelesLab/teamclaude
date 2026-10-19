@@ -6,6 +6,7 @@
 // each layer calls registerBuildFeature() once at module load. The registry is
 // additive-only: dropping a module from a build visibly changes the tag set.
 
+import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -16,6 +17,17 @@ const pkg = JSON.parse(
 
 /** package.json version of this build — not compared in-process. */
 export const BUILD_VERSION = pkg.version;
+export const BUILD_BACKPORT_NOTE = pkg.backportNote || '';
+
+// Read once at startup; packaged installs without Git have no source revision.
+export const BUILD_COMMIT = (() => {
+  try {
+    return execFileSync('git', ['rev-parse', '--short=12', 'HEAD'], {
+      cwd: join(dirname(fileURLToPath(import.meta.url)), '..'),
+      encoding: 'utf8', timeout: 1000, stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+  } catch { return null; }
+})();
 
 /** ISO timestamp captured once at process start (module load). */
 export const PROCESS_STARTED_AT = new Date().toISOString();
@@ -33,6 +45,8 @@ export function registerBuildFeature(tag) {
 export function buildIdentity() {
   return {
     version: BUILD_VERSION,
+    commit: BUILD_COMMIT,
+    backportNote: BUILD_BACKPORT_NOTE,
     features: [...BUILD_FEATURE_TAGS],
     startedAt: PROCESS_STARTED_AT,
   };

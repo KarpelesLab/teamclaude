@@ -1,3 +1,4 @@
+import { BUILD_VERSION } from './build-identity.js';
 import { createWriteStream } from 'node:fs';
 import { importCredentials, fetchProfile } from './oauth.js';
 import { sameIdentity } from './identity.js';
@@ -938,13 +939,15 @@ export class TUI {
     const lines = [];
 
     // ── Header
-    const left = bold(' TeamClaude');
+    let left = bold(' TeamClaude');
     const port = this.config.proxy?.port || 3456;
     const sess = this.am.sessionStats();
     const sessStr = (sess.active || sess.known)
       ? `${sess.active} sess${this.am.distributeSessions ? green(' dist') : ''}  `
       : '';
     const right = `${sessStr}Port ${port} ${green('▲')} `;
+    const versionLabel = ` ${BUILD_VERSION}`;
+    if (vw(left) + versionLabel.length + vw(right) + 1 <= W) left += dim(versionLabel);
     lines.push(left + ' '.repeat(Math.max(1, W - vw(left) - vw(right))) + right);
     lines.push(' ' + dim('─'.repeat(W - 2)));
 

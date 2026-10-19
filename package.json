@@ -1,6 +1,6 @@
 {
   "name": "@karpeleslab/teamclaude",
-  "version": "1.1.11",
+  "version": "1.1.11-oppie.20261019",
   "description": "Multi-account Claude proxy with automatic quota-based rotation",
   "type": "module",
   "main": "src/index.js",
@@ -36,5 +36,6 @@
   },
   "devDependencies": {
     "eslint": "^9.0.0"
-  }
+  },
+  "backportNote": "Selected fixes backported from TeamClaude 1.1.25; not a full 1.1.25 upgrade."
 }
