@@ -7,3 +7,5 @@ Keep live configuration and credentials outside the checkout. Restore local cred
 The examples retain endpoint model maps and route priority, `quotaAdmission`, `balanceSource`, and each endpoint's `usageDisplay`. DeepSeek defaults to Balance; Antigravity defaults to Session. Press `u` in the running gateway to choose another format for an individual endpoint. The display preference is independent of inference quota admission.
 
 This branch includes the essential upstream Remote Control credential-isolation fix from KarpelesLab/teamclaude commit `15b33ff5a11ddd59c920d96570d5aeca416c5347`. It retains the local advisor, native quota, compatibility, and usage-reporting improvements.
+
+The gateway launch examples load source from the clean `gh/teamclaude` main checkout. Europa uses Node 24; Windows uses the installed native Node. The Windows agent launch wrapper should likewise point its `src/index.js` path at `$env:USERPROFILE\gh\teamclaude`. Configuration, logs and credentials stay outside that checkout.
