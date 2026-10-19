@@ -148,7 +148,7 @@ const THRESHOLD_USAGE = [
   'server immediately.',
 ].join('\n');
 
-const DISTRIBUTE_USAGE = 'Usage: teamclaude distribute <on|off|adaptive>';
+const DISTRIBUTE_USAGE = 'Usage: teamclaude distribute <on|off|adaptive|load>';
 
 const ROUTING_USAGE = [
   'Usage: teamclaude routing <account-name|email> [--check]      (show the account\'s routing; --check tests it)',
@@ -2301,6 +2301,7 @@ async function distributeCommand() {
   if (['on', 'true', 'yes', '1'].includes(arg)) next = 'even';
   else if (['off', 'false', 'no', '0'].includes(arg)) next = 'off';
   else if (arg === 'adaptive') next = 'adaptive';
+  else if (arg === 'load') next = 'load';
   if (!next) {
     console.error(DISTRIBUTE_USAGE);
     process.exit(1);
@@ -2775,10 +2776,12 @@ Commands:
                       user:pass@ auth; 'none' clears it (also: login --routing)
   threshold [pct]     Utilization at which rotation leaves an account (1-100);
                       per bucket with 'unified7d=90', and '=default' drops one
-  distribute [on|off|adaptive]
+  distribute [on|off|adaptive|load]
                       Spread new sessions across equal-priority accounts, each
                       pinned to its own for cache reuse (off by default);
-                      'adaptive' spreads by remaining weekly credit and load
+                      'adaptive' spreads by remaining weekly credit and load;
+                      'load' places each new session on the account that served
+                      the fewest requests in the last ten minutes
   probe [off|secs]    Opt-in background quota refresh for idle accounts
                       (off by default; reads usage endpoint, spends no quota)
   warmup [off|secs]   Opt-in: keep idle accounts' 5h timers running by sending

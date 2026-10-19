@@ -219,6 +219,16 @@ The `sess` in both lines is the display's short label and counts **conversations
 
 With `expiryRouting.preempt` on, a governing-window **rollover** also ends the drain for the conversation whose account rolled, and it rejoins normal rotation there and then. The drain trades expiring quota for a warm prompt cache, and that trade is priced on the window the account had when the drain started; once that window has gained a full week the account is the one the fleet should be spending last. Nothing else bounds it — a conversation making requests never idles out — so without this a long-lived one rides a rolled-over account for as long as it keeps talking.
 
+### Load distribution
+
+```json
+"distributeSessions": "load"
+```
+
+The even mode counts conversations, and conversations are not interchangeable: an agent lane in a build-and-test loop sends a request every few seconds, an interactive session sends one a minute. On a pool of 14 Codex accounts with 24 even-placed sessions, one account was measured serving 31% of the requests and six were serving none. The `load` mode places each **new** conversation on the eligible account that served the **fewest requests in the last ten minutes** (`LOAD_WINDOW_MS`), then falls through to the even keys (fewest active conversations, fewest in-flight, expiry pressure, soonest reset) as tie-breaks. The conversation is then pinned exactly as in the other modes, so prompt caching is unaffected; only placement changes.
+
+The count is of requests the proxy forwarded, kept in a bounded ring per account and pruned on read, so it needs no probe and no persisted state; switching into `load` from another mode starts from the traffic of the last ten minutes. `teamclaude status` reports it per account as `recentRequests`. Like the even mode, `load` only moves traffic by placing new conversations: an existing skew drains as long-lived conversations end and are replaced.
+
 ## Expiry-pressure routing
 
 > **The config key `expiryRouting` is provisional.** [#176](https://github.com/KarpelesLab/teamclaude/issues/176) proposes a `routingStrategy` enum for the adjacent drain-concentration problem, and a strategy value such as `"expiry"` is a plausible home for this behaviour. The mechanism below is settled; only its spelling on disk is open, and it will follow whatever shape that discussion settles on.

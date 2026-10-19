@@ -2499,7 +2499,7 @@ export class TUI {
     const sess = this.am.sessionStats();
     const sessStr = (sess.active || sess.known)
       ? `${sess.active} sess${this.am.distributeSessions
-        ? green(this.am.distributionMode === 'adaptive' ? ' adapt' : ' dist')
+        ? green(this.am.distributionMode === 'adaptive' ? ' adapt' : this.am.distributionMode === 'load' ? ' load' : ' dist')
         : (sess.draining ? yellow(` drain ${sess.draining}`) : '')}  `
       : '';
     // ▼ marks a dashboard that lost contact with the server it polls (attach

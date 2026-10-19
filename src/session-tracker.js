@@ -53,6 +53,14 @@ const SWEEP_INTERVAL_MS = 60 * 1000; // bound growth without an external timer
 // bounding: the entries exist to hold a pin and a prompt cache each, and a
 // client with ten thousand live conversations has bigger problems than this map.
 export const MAX_SESSIONS = 10_000;
+// The window `recentRequestsFor` counts over: long enough that a lane's turn
+// cadence (one request every few seconds while it works, none while it thinks)
+// averages out, short enough that a session that went quiet stops weighing on
+// its account's placement score within the time a new session would notice.
+export const LOAD_WINDOW_MS = 10 * 60 * 1000;
+// Bound on the routed-request ring, independent of MAX_SESSIONS: a fleet of
+// 40 lanes at one request every 10 s is 2,400 entries per window.
+export const MAX_ROUTED = 50_000;
 export const MAX_SESSION_ID_LENGTH = 128;
 // The session id, the separator and the digest conversation.js appends. Bounded
 // rather than derived from that module so the tracker's own guard does not
@@ -157,6 +165,11 @@ export class SessionTracker {
    * @param {() => number} [opts.now]
    */
   constructor({ knownTtlMs, activeTtlMs, now } = {}) {
+    // Requests routed per account, oldest first: [timestamp, accountIndex],
+    // with a running count per account so a read is O(1) after the prune.
+    // Fed by noteRouted() from recordSession(), read by recentRequestsFor().
+    this._routed = [];
+    this._routedCounts = new Map();
     // id -> { pins: Map<bucketKey, { idx, at }>,
     //         refs: Map<bucketKey, Observation>,
     //         firstSeen, lastSeen, count, inFlight, tokens: Map<bucketKey, ...> }
@@ -598,6 +611,9 @@ export class SessionTracker {
         ref.unescaped = held;
       }
     }
+    this._routed = this._routed.map(([at, idx]) => [at, mapFn(idx)]).filter(([, idx]) => idx != null);
+    this._routedCounts = new Map();
+    for (const [, idx] of this._routed) this._routedCounts.set(idx, (this._routedCounts.get(idx) || 0) + 1);
   }
 
   // Does this pin count as load on `accountIndex` right now? A pin outlives the
@@ -632,6 +648,45 @@ export class SessionTracker {
   // spread new sessions across accounts. Counts in-flight sessions regardless of
   // how long their request has been streaming. A session spending two accounts
   // is load on both: it counts once per account, not once overall.
+  /** Record that a request was routed to an account. One entry per forward
+   * decision, which is what the proxy charges upstream, so the count is in the
+   * unit the account's rate limits are in. Pruned to LOAD_WINDOW_MS on read and
+   * capped at MAX_ROUTED on write (oldest dropped), so the ring is bounded even
+   * when nothing reads it. */
+  noteRouted(accountIndex, now = this._now()) {
+    if (accountIndex == null) return;
+    this._routed.push([now, accountIndex]);
+    this._routedCounts.set(accountIndex, (this._routedCounts.get(accountIndex) || 0) + 1);
+    if (this._routed.length > MAX_ROUTED) this._dropRouted(this._routed.length - MAX_ROUTED);
+  }
+
+  /** Requests routed to `accountIndex` within the last LOAD_WINDOW_MS. The
+   * load an account is actually carrying, as opposed to activeCountFor's
+   * session count: a lane that fires a request every ten seconds and a TUI
+   * that fires one a minute are both one session, and the difference between
+   * them is what this measures. */
+  recentRequestsFor(accountIndex, now = this._now()) {
+    this._pruneRouted(now);
+    return this._routedCounts.get(accountIndex) || 0;
+  }
+
+  // Drop entries older than the window. Entries are appended in time order,
+  // so the stale ones are a prefix.
+  _pruneRouted(now) {
+    const cutoff = now - LOAD_WINDOW_MS;
+    let i = 0;
+    while (i < this._routed.length && this._routed[i][0] < cutoff) i += 1;
+    if (i > 0) this._dropRouted(i);
+  }
+
+  // Remove the oldest `n` entries, keeping the per-account counts in step.
+  _dropRouted(n) {
+    for (const [, idx] of this._routed.splice(0, n)) {
+      const left = (this._routedCounts.get(idx) || 1) - 1;
+      if (left > 0) this._routedCounts.set(idx, left); else this._routedCounts.delete(idx);
+    }
+  }
+
   activeCountFor(accountIndex, now = this._now()) {
     let n = 0;
     for (const s of this.sessions.values()) {
@@ -655,6 +710,7 @@ export class SessionTracker {
 
   // Drop sessions idle longer than the known window (but never one still in flight).
   sweep(now = this._now()) {
+    this._pruneRouted(now);
     this._lastSweep = now;
     for (const [id, s] of this.sessions) {
       if (this._isExpired(s, now)) this.sessions.delete(id);
