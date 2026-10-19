@@ -22,7 +22,7 @@
       "type": "apikey",
       "apiKey": "SET_LOCALLY",
       "upstream": "http://127.0.0.1:8084",
-      "priority": 40,
+      "priority": -30,
       "disabled": false,
       "accessToken": "SET_LOCALLY",
       "refreshToken": "SET_LOCALLY",
@@ -34,7 +34,7 @@
       "type": "apikey",
       "apiKey": "SET_LOCALLY",
       "upstream": "http://127.0.0.1:8085",
-      "priority": 35,
+      "priority": -20,
       "accessToken": "SET_LOCALLY",
       "modelMap": {
         "claude-opus-5": "deepseek-v4-pro",
@@ -87,7 +87,7 @@
       "type": "apikey",
       "apiKey": "SET_LOCALLY",
       "upstream": "http://127.0.0.1:8085",
-      "priority": 45,
+      "priority": -10,
       "accessToken": "SET_LOCALLY",
       "modelMap": {
         "claude-fable-5": "deepseek-v4-flash",
