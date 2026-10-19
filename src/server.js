@@ -121,22 +121,6 @@ export function safeKeyEqual(a, b) {
   return timingSafeEqual(ba, bb);
 }
 
-/** True only for the native Anthropic API root (https://api.anthropic.com).
- * Used to scope request transforms that must not touch custom upstreams. */
-export function isNativeAnthropicUpstream(raw) {
-  if (!raw) return false;
-  try {
-    const u = new URL(raw);
-    return u.protocol === 'https:'
-      && u.hostname.toLowerCase() === 'api.anthropic.com'
-      && (u.port === '' || u.port === '443')
-      && (u.pathname === '' || u.pathname === '/')
-      && !u.search
-      && !u.hash;
-  } catch {
-    return false;
-  }
-}
 
 // True if a socket's remote address is loopback — the proxy-key gate exempts
 // localhost on both the HTTP and CONNECT paths.
