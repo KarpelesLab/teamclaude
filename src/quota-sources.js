@@ -41,7 +41,7 @@ function bucketFromRemaining(remainingFraction, resetTime) {
     const parsed = Date.parse(resetTime);
     if (Number.isFinite(parsed)) resetAt = parsed;
   }
-  return { utilization: Math.max(0, 1 - remainingFraction), resetAt };
+  return { utilization: Math.max(0, Math.min(1, 1 - remainingFraction)), resetAt };
 }
 
 async function readJson(filePath) {

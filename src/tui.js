@@ -133,6 +133,22 @@ function formatReset(resetTs) {
   return rh > 0 ? `${days}d${rh}h` : `${days}d`;
 }
 
+/** A quota reading older than this is shown as last-good rather than current.
+ *  One hour matches the anthropic-proxy quota-state contract (MAX_STATE_AGE_SECS),
+ *  and is comfortably above the default 120s probe cadence, so an ordinary
+ *  missed probe does not flap the tag. */
+const QUOTA_STALE_MS = 3600_000;
+
+/** Coarse elapsed-time label for the freshness tag ("14m", "3h", "12d"). */
+function formatAge(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return '?';
+  const mins = Math.floor(ms / 60000);
+  if (mins < 60) return `${mins}m`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h`;
+  return `${Math.floor(hrs / 24)}d`;
+}
+
 /**
  * Render a progress bar using background colors with text overlaid.
  * The label (e.g. "Ses 2h30m" or "45%") is drawn on top of the bar.
@@ -1128,6 +1144,33 @@ export class TUI {
     if (q.unified7dSonnet != null && q.unified7dSonnet >= th) blocked.push('Sonnet');
     if (q.unified7dFable != null && q.unified7dFable >= th) blocked.push('Fable');
     if (blocked.length) line += `  ${red('⊘ ' + blocked.join(' '))}`;
+
+    // Quota freshness tag. Three states, mirroring the reading's actual origin:
+    //   (none)  a live reading, refreshed within quotaStaleMs
+    //   ~<age>  last-good: we still show the numbers, but they are old. A bar
+    //           with no freshness tag reads as "current"; a days-old reading
+    //           rendered that way is actively misleading (a spent weekly window
+    //           can look like free capacity), so age is stated instead of hidden.
+    //   ? no quota data  nothing was ever learned for this account — distinct
+    //           from "0% used". bar() already renders a bare "-" per window; this
+    //           says why, once, at row level.
+    // Suffix (not a column) so existing alignment is untouched.
+    const hasQuota = q.unified5h != null || q.unified7d != null
+      || q.unified7dSonnet != null || q.unified7dFable != null
+      || q.tokensLimit != null || q.requestsLimit != null;
+    if (!hasQuota) {
+      if (!a.disabled) line += `  ${yellow('? no quota data')}`;
+    } else if (q.observedAt == null) {
+      // Numbers with no observation time. Reached when a value arrives by some
+      // path that never stamped one -- a restore written before observedAt was
+      // persisted, or any future writer that forgets to stamp. Untagged, such a
+      // value renders exactly like a live reading, which is the confusion this
+      // whole tag exists to remove, so it is called out rather than trusted.
+      if (!a.disabled) line += `  ${yellow('? unverified')}`;
+    } else {
+      const age = Date.now() - q.observedAt;
+      if (age > QUOTA_STALE_MS) line += `  ${yellow('~ ' + formatAge(age) + ' old')}`;
+    }
     return line;
   }
 

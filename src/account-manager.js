@@ -74,6 +74,10 @@ const PERSISTED_QUOTA_FIELDS = [
   'unified5h', 'unified7d', 'unified7dSonnet', 'unified7dFable',
   'unified5hReset', 'unified7dReset', 'unified7dSonnetReset', 'unified7dFableReset', 'unifiedStatus',
   'tokensLimit', 'tokensRemaining', 'requestsLimit', 'requestsRemaining', 'resetsAt',
+  // Persisted so a restored reading keeps its real age across a restart. Without
+  // it, restore produces values with no observation time, which then render as
+  // if they were fresh — the exact confusion `observedAt` exists to remove.
+  'observedAt',
 ];
 
 function emptyQuota() {
@@ -2118,6 +2122,10 @@ export class AccountManager {
     const u7d = parseFloat(headers['anthropic-ratelimit-unified-7d-utilization']);
     if (!isNaN(u5h)) account.quota.unified5h = u5h;
     if (!isNaN(u7d)) account.quota.unified7d = u7d;
+    // Only a response that actually carried a unified value refreshes the
+    // observation time. Stamping on every response would keep `observedAt`
+    // permanently current even while the upstream stopped reporting quota.
+    if (!isNaN(u5h) || !isNaN(u7d)) account.quota.observedAt = Date.now();
 
     const r5h = headers['anthropic-ratelimit-unified-5h-reset'];
     const r7d = headers['anthropic-ratelimit-unified-7d-reset'];
@@ -2297,6 +2305,18 @@ export class AccountManager {
     if (!account || !usage) return;
     const q = account.quota;
     if (usage.balance) q.balance = structuredClone(usage.balance);
+
+    // Quota freshness. `observedAt` is when the READING was taken, which is not
+    // always when we applied it: a state-file-backed probe can succeed right now
+    // while the file it read is days old. Sources that know their observation
+    // time pass it through (usage.observedAt, epoch ms); everything else is
+    // observed at apply time. Without this, a stale reading is indistinguishable
+    // from a live one in every consumer (TUI bars, /teamclaude/status).
+    if (usage.observedAt != null && Number.isFinite(usage.observedAt)) {
+      q.observedAt = usage.observedAt;
+    } else {
+      q.observedAt = Date.now();
+    }
 
     if (usage.fiveHour) {
       if (usage.fiveHour.utilization != null) q.unified5h = usage.fiveHour.utilization;

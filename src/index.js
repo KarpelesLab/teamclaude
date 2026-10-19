@@ -30,6 +30,7 @@ import { readAvailableModels } from './claude-settings.js';
 import { checkConfig, formatFindings, doctorExitCode } from './config-doctor.js';
 import { replayRank, formatRankReplay } from './rank-replay.js';
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
+import { buildUsageDocument, formatUsageReport, createUsageServer } from './usage.js';
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -64,8 +65,21 @@ const EXPLAIN_USAGE = [
   'Quota-blind and read-only: it explains the config, not the live server.',
 ].join('\n');
 
+const USAGE_CMD_USAGE = [
+  'Usage: teamclaude usage [--json]',
+  '       teamclaude usage serve [--port <port>] [--host <host>] [--token <token>]',
+  '',
+  'Aggregate quota, accounts, soak/burn history, and model routing telemetry.',
+  '`--json` emits a versioned document ({schemaVersion, generatedAt, staleAfterSeconds, providers[]}).',
+  '`serve` starts a loopback HTTP server exposing /usage and /health.',
+].join('\n');
+
 
 switch (command) {
+  case 'usage':
+    await usageCommand();
+    process.exit(0);
+    break;
   case 'server':
     await serverCommand();
     break;
@@ -1244,6 +1258,79 @@ function wrapForStderr(text, width) {
   return out;
 }
 
+// ── usage ───────────────────────────────────────────────────
+
+async function usageCommand() {
+  const sub = args[1];
+  if (sub === 'help' || sub === '--help' || sub === '-h') {
+    console.log(USAGE_CMD_USAGE);
+    return;
+  }
+
+  if (sub === 'serve') {
+    const portArg = argValue('--port') || argValue('-p') || args.find(a => a.startsWith('--port='))?.slice('--port='.length);
+    const hostArg = argValue('--host') || args.find(a => a.startsWith('--host='))?.slice('--host='.length);
+    const tokenArg = argValue('--token') || args.find(a => a.startsWith('--token='))?.slice('--token='.length);
+
+    const resolvedHost = hostArg || process.env.TEAMCLAUDE_USAGE_HOST || '127.0.0.1';
+    const resolvedToken = tokenArg || process.env.TEAMCLAUDE_USAGE_TOKEN || process.env.USAGE_TOKEN || null;
+    const isLoopback = resolvedHost === '127.0.0.1' || resolvedHost === 'localhost' || resolvedHost === '::1';
+
+    if (!isLoopback && !resolvedToken) {
+      console.error('Error: Non-loopback usage serve requires --token <token> or TEAMCLAUDE_USAGE_TOKEN in environment.');
+      process.exit(1);
+    }
+
+    const config = await loadOrCreateConfig();
+    const serverInstance = createUsageServer({
+      port: portArg ? Number(portArg) : undefined,
+      host: hostArg,
+      token: tokenArg,
+      usageOptions: { config },
+    });
+
+    try {
+      const bound = await serverInstance.listen();
+      console.log(`TeamClaude usage server listening on http://${bound.host}:${bound.port}`);
+      console.log('Endpoints:');
+      console.log(`  http://${bound.host}:${bound.port}/usage  (JSON usage document)`);
+      console.log(`  http://${bound.host}:${bound.port}/health (health probe)`);
+
+      const shutdown = async () => {
+        await serverInstance.close();
+        process.exit(0);
+      };
+      process.on('SIGINT', shutdown);
+      process.on('SIGTERM', shutdown);
+
+      // Keep event loop alive while server is listening
+      await new Promise(() => {});
+    } catch (err) {
+      console.error(`Failed to start usage server: ${err.message}`);
+      process.exit(1);
+    }
+    return;
+  }
+
+  const json = args.includes('--json');
+  const colorArg = argValue('--color') || args.find(arg => arg.startsWith('--color='))?.slice('--color='.length);
+  const color = colorArg === 'always'
+    || (colorArg !== 'never' && process.stdout.isTTY);
+
+  try {
+    const config = await loadOrCreateConfig();
+    const doc = await buildUsageDocument({ config });
+    if (json) {
+      console.log(JSON.stringify(doc, null, 2));
+      return;
+    }
+    console.log(formatUsageReport(doc, { color }));
+  } catch (err) {
+    console.error(`Failed to generate usage report: ${err.message}`);
+    process.exit(1);
+  }
+}
+
 // ── status ──────────────────────────────────────────────────
 
 async function statusCommand() {
@@ -1771,6 +1858,9 @@ Commands:
                       (--install to write it to your shell rc; --uninstall to remove)
   status [--json]     Show rich proxy/account/probe status (live)
                       Use --color=always|never to control ANSI colors
+  usage [--json]      Aggregate quota, state files, soak/burn history & model routing
+  usage serve         Start loopback HTTP server exposing /usage & /health
+                      (--port <port>, --host <host>)
   accounts            List configured accounts
   remove <name>       Remove an account (by name or email; --org to disambiguate)
   disable <name>      Temporarily exclude an account from rotation

@@ -2,3 +2,9 @@ node_modules/
 config.json
 *.log
 package-lock.json
+*.db
+*.db-*
+.serena/
+.weco/
+data/
+LATEST_HIGHLIGHTS.md

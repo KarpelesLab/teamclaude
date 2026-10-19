@@ -197,6 +197,8 @@ This is an interactive-shell alias — it affects `claude` typed at a prompt, no
 teamclaude accounts          # List accounts with subscription tier and token status
 teamclaude accounts -v       # Also show token expiry times
 teamclaude status            # Show live proxy status (requires running server)
+teamclaude usage             # Aggregate quota, state files, soak/burn history & model routing (--json)
+teamclaude usage serve       # Start loopback HTTP server exposing /usage & /health (:3457)
 teamclaude remove <name>     # Remove an account (by name or email)
 teamclaude disable <name>    # Temporarily exclude an account from rotation
 teamclaude enable <name>     # Re-enable it (also clears a stuck error state)
