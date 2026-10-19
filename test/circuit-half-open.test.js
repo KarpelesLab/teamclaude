@@ -91,12 +91,15 @@ test('status reads during a stale probe claim do not mutate', () => {
   assert.equal(a.circuitOpenUntil, expiredUntil, 'breaker timestamp untouched by status');
 });
 
-test('half-open allows exactly one concurrent trial request', async () => {
+test('half-open allows exactly one concurrent trial request', { timeout: 10000 }, async () => {
   let hits = 0;
+  let upstreamReached;
+  const firstUpstreamRequest = new Promise(resolve => { upstreamReached = resolve; });
   let releaseUpstream;
   const gate = new Promise(r => { releaseUpstream = r; });
   const upstream = http.createServer((_req, res) => {
     hits++;
+    upstreamReached();
     gate.then(() => {
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end('{"ok":true}');
@@ -121,8 +124,9 @@ test('half-open allows exactly one concurrent trial request', async () => {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ model: 'claude-sonnet-5', max_tokens: 8, messages: [{ role: 'user', content: 'a' }] }),
     });
-    // Let the first request select and acquire the probe before the second starts.
-    await new Promise(r => setTimeout(r, 30));
+    // Wait for actual upstream dispatch, which proves the probe was acquired.
+    // A fixed delay races connection setup and scheduling under load.
+    await firstUpstreamRequest;
     assert.ok(am.accounts[0].circuitProbeInFlightAt != null, 'probe claim timestamp set');
 
     const p2 = fetch(`http://127.0.0.1:${port}/v1/messages`, {
