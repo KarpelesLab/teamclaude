@@ -121,6 +121,23 @@ export function safeKeyEqual(a, b) {
   return timingSafeEqual(ba, bb);
 }
 
+/** True only for the native Anthropic API root (https://api.anthropic.com).
+ * Used to scope request transforms that must not touch custom upstreams. */
+export function isNativeAnthropicUpstream(raw) {
+  if (!raw) return false;
+  try {
+    const u = new URL(raw);
+    return u.protocol === 'https:'
+      && u.hostname.toLowerCase() === 'api.anthropic.com'
+      && (u.port === '' || u.port === '443')
+      && (u.pathname === '' || u.pathname === '/')
+      && !u.search
+      && !u.hash;
+  } catch {
+    return false;
+  }
+}
+
 // True if a socket's remote address is loopback — the proxy-key gate exempts
 // localhost on both the HTTP and CONNECT paths.
 export function isLoopbackAddr(addr) {
@@ -188,6 +205,18 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
           }
         }
         relayHttpForward(req, res); return;
+      }
+
+      // Browser probes are local service metadata, not upstream API requests.
+      if (req.method === 'GET' && req.url === '/') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ service: 'TeamClaude', status: 'running', status_url: '/teamclaude/status', models_url: '/v1/models' }));
+        return;
+      }
+      if (req.method === 'GET' && req.url === '/favicon.ico') {
+        res.writeHead(204);
+        res.end();
+        return;
       }
 
       // Status endpoint. B19: routes[] may include `tiers` (configured fallback
@@ -1436,6 +1465,13 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   const effectiveUpstream = account.upstream || upstream;
   const upstreamUrl = `${effectiveUpstream}${req.url}`;
   const customUpstream = !isNativeAnthropicUpstream(effectiveUpstream);
+  // Model discovery from browsers and generic clients omits this required
+  // Anthropic header. Preserve explicit client versions and custom providers.
+  if (isNativeAnthropicUpstream(effectiveUpstream) && req.method === 'GET'
+      && (req.url || '').split('?')[0] === '/v1/models'
+      && !headers['anthropic-version']) {
+    headers['anthropic-version'] = '2023-06-01';
+  }
   const method = req.method;
 
   // Strip orphaned tool_use / tool_result blocks so a client that compacted or
