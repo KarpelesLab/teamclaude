@@ -34,8 +34,10 @@ test('mixed assistant content drops only the advisor pair and keeps text and ord
       { type: 'text', text: 'after' },
     ] },
     { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'ok' }] },
-  ] }, { dropAdvisorTools: true });
-  assert.deepEqual(out.tools, [bash]);
+  ] }, { normalizeAdvisorHistory: true });
+  // This tree retains its G9 strip semantics for tools[]; only history is
+  // normalized here. (The deployed tree additionally drops the tool type.)
+  assert.equal(out.tools.length, 2);
   assert.deepEqual(out.messages[0].content.map(b => b.type), ['text', 'tool_use', 'text', 'text']);
   assert.equal(out.messages[0].content[0].text, 'before');
   assert.ok(out.messages[0].content[2].text.includes('readable history'));
@@ -43,7 +45,7 @@ test('mixed assistant content drops only the advisor pair and keeps text and ord
 });
 
 test('empty and advisor-only messages get an explicit placeholder', () => {
-  const out = read({ messages: [{ role: 'assistant', content: pair('srvtoolu_1', { type: 'advisor_redacted_result', encrypted_content: 'never-forward' }) }, { role: 'user', content: [] }] }, { dropAdvisorTools: true });
+  const out = read({ messages: [{ role: 'assistant', content: pair('srvtoolu_1', { type: 'advisor_redacted_result', encrypted_content: 'never-forward' }) }, { role: 'user', content: [] }] }, { normalizeAdvisorHistory: true });
   assert.deepEqual(out.messages[0].content, [{ type: 'text', text: '[Historical advisor result unavailable on this backend.]' }]);
   assert.deepEqual(out.messages[1].content, []);
 });
@@ -54,14 +56,14 @@ test('multiple interleaved pairs are removed without dangling calls', () => {
     { type: 'text', text: 'mid' },
     ...pair('b', { type: 'advisor_redacted_result', encrypted_content: 'sealed' }),
     ...pair('c', { type: 'advisor_result', stop_reason: 'end_turn' }),
-  ] }] }, { dropAdvisorTools: true });
+  ] }] }, { normalizeAdvisorHistory: true });
   const types = out.messages[0].content.map(b => b.type);
   assert.ok(!types.some(t => t === 'server_tool_use' || t === 'advisor_tool_result'));
   assert.equal(types.filter(t => t === 'text').length, 4, 'mid text + one result/placeholder per pair (c has no plaintext)');
 });
 
 test('result-only history is removed and plaintext is preserved, never ciphertext', () => {
-  const out = read({ messages: [{ role: 'user', content: [{ type: 'advisor_tool_result', tool_use_id: 'missing', content: { type: 'advisor_redacted_result', encrypted_content: 'SECRET-CIPHERTEXT' } }] }] }, { dropAdvisorTools: true });
+  const out = read({ messages: [{ role: 'user', content: [{ type: 'advisor_tool_result', tool_use_id: 'missing', content: { type: 'advisor_redacted_result', encrypted_content: 'SECRET-CIPHERTEXT' } }] }] }, { normalizeAdvisorHistory: true });
   assert.ok(!JSON.stringify(out).includes('SECRET-CIPHERTEXT'));
   assert.deepEqual(out.messages[0].content, [{ type: 'text', text: '[Historical advisor result unavailable on this backend.]' }]);
 });
@@ -72,12 +74,12 @@ test('non-advisor server tools pass through byte-for-byte', () => {
     { type: 'web_search_tool_result', tool_use_id: 'srvtoolu_x', content: [{ type: 'web_search_result', url: 'u' }] },
   ] }] };
   const copied = structuredClone(body);
-  assert.equal(rewrite(body, { dropAdvisorTools: true }).toString(), JSON.stringify(copied));
+  assert.equal(rewrite(body, { normalizeAdvisorHistory: true }).toString(), JSON.stringify(copied));
 });
 
 test('every rewritten body reports its true byte length', () => {
   const body = { tools: [advisor], messages: [{ role: 'assistant', content: pair('srvtoolu_1', { type: 'advisor_result', text: 'x'.repeat(400) }) }] };
-  const out = rewrite(body, { dropAdvisorTools: true });
+  const out = rewrite(body, { normalizeAdvisorHistory: true });
   assert.equal(out.length, Buffer.byteLength(out.toString(), 'utf8'));
   assert.ok(out.length < Buffer.byteLength(JSON.stringify(body), 'utf8'), 'ciphertext/declaration removal shrinks the body');
 });

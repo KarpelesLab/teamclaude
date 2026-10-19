@@ -1525,7 +1525,7 @@ export class TUI {
   _renderFooter() {
     switch (this.mode) {
       case 'normal':
-        return ` ${bold('s')}witch  ${bold('d')}isable  ${bold('p')} refresh  ${bold('u')} usage display  ${bold('R')}eload  ${bold('g')} settings  ${bold('q')}uit`;
+        return ` ${bold('s')}witch  ${bold('d')}isable  ${bold('p')} refresh  ${bold('u')} display  ${bold('R')}eload  ${bold('g')} settings  ${bold('q')}uit`;
       case 'usage':
         return ` ${dim('↑↓')} endpoint  ${dim('←→')} format  ${bold('Enter')} change  ${bold('Esc')} back`;
       case 'settings':

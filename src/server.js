@@ -2392,6 +2392,7 @@ export function stripUnparseablePatterns(body) {
 export function rewriteModel(body, modelMap, {
   stripUnmappedAdvisor = false,
   dropAdvisorTools = false,
+  normalizeAdvisorHistory = false,
   onAdvisorStrip = null,
   onAdvisorDrop = null,
 } = {}) {
@@ -2445,7 +2446,7 @@ export function rewriteModel(body, modelMap, {
     // Pairs are linked within one assistant content array by
     // server_tool_use.id == advisor_tool_result.tool_use_id (NOT the ordinary
     // assistant-call/next-user-result pattern), so they are removed together.
-    if (dropAdvisorTools && Array.isArray(obj.messages)) {
+    if ((dropAdvisorTools || normalizeAdvisorHistory) && Array.isArray(obj.messages)) {
       const advisorIds = new Set();
       for (const message of obj.messages) {
         if (!Array.isArray(message?.content)) continue;
