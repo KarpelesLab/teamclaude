@@ -19,6 +19,7 @@ function close(server) {
 
 const EXPECTED_FEATURES = [
   'audit-b1-b6',
+  'custom-advisor',
   'dynamic-routing',
   'dynrank-model-fidelity',
   'fleet-agent-name',

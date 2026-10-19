@@ -771,12 +771,16 @@ export function createProxyRequestListener({
       // set {model, advisorModel} — see requestModelIds in model-namespace.js.
       let advisorModel = parseAdvisorModel(body);
       const advisor = advisorDefinition(body);
-      const bridgeNeeded = advisor && typeof advisor.model === 'string' && (config.customAdvisorBridge !== false) && (
-        accountManager.accounts.some(a => !a.disabled && !a.retired && !a.supportsAdvisorTools &&
-          !isNativeAnthropicUpstream(a.upstream || upstream) &&
-          (a.modelMap?.[model] || a.modelMap?.[advisor.model] ||
-            a.acceptsModels?.includes(model) || a.acceptsModels?.includes(advisor.model)))
-      );
+      const bridgeNeeded = advisor && typeof advisor.model === 'string' && (config.customAdvisorBridge !== false)
+        && accountManager.accounts.some(a => !a.disabled && !a.retired && !a.supportsAdvisorTools
+          && !isNativeAnthropicUpstream(a.upstream || upstream)
+          && (a.modelMap?.[model] || a.modelMap?.[advisor.model]
+            || a.acceptsModels?.includes(model) || a.acceptsModels?.includes(advisor.model)))
+        // Do not turn an executor-only adapter into an advisor backend. When
+        // no declared advisor route is available, keep the existing degrade path.
+        && accountManager.accounts.some(a => accountManager._isAvailable(a, advisor.model)
+          && (a.modelMap?.[advisor.model] || a.acceptsModels?.includes(advisor.model)
+            || (isNativeAnthropicUpstream(a.upstream || upstream) && /^claude-/.test(advisor.model))));
       if (req.method === 'POST' && classifySessionPath(req.url) === 'messages' && bridgeNeeded) {
         const executorUrl = pinnedIndex == null ? req.url
           : `${PIN_PREFIX}${encodeURIComponent(accountManager.accounts[pinnedIndex].name)}${req.url}`;
