@@ -371,6 +371,22 @@
       "_note": "2026-10-15: antigravity serves claude-sonnet-5-5 directly via Google AI Ultra (CLIProxyAPI :8318) and gemini-3.8-flash-high for older sonnet aliases."
     },
     {
+      "name": "haiku-5-5",
+      "match": [
+        "claude-haiku-5-5",
+        "claude-haiku-5-5[1m]"
+      ],
+      "accounts": [
+        "tangeddie1024@gmail.com",
+        "tangeddie1024-platform-api",
+        "antigravity",
+        "deepseek-v4-flash",
+        "deepseek-v4-pro"
+      ],
+      "bucket": "unified7d",
+      "color": "cyan"
+    },
+    {
       "name": "haiku",
       "match": [
         "*haiku*"

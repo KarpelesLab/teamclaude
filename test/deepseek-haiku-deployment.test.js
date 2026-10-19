@@ -11,6 +11,14 @@ const close = s => new Promise(resolve => { s.close(resolve); s.closeAllConnecti
 for (const host of ['europa', 'win11']) {
   test(`${host}: Haiku 5.5 reaches DeepSeek as a supported model; unknown models never reach it`, async () => {
     const config = JSON.parse(await readFile(new URL(`../deploy/examples/${host}/teamclaude.json`, import.meta.url), 'utf8'));
+    // Codex's higher live priority must not send this Claude-only alias to Codex.
+    const routingAccounts = config.accounts.filter(a => a.name === 'codex-gpt56' || a.name.startsWith('deepseek-v4-'))
+      .map(a => ({ ...a, priority: a.name === 'codex-gpt56' ? -30 : a.name === 'deepseek-v4-pro' ? -20 : -10 }));
+    const routing = new AccountManager(routingAccounts, config.switchThreshold, { routes: config.routes });
+    for (const model of ['claude-haiku-5-5', 'claude-haiku-5-5[1m]']) {
+      assert.equal(routing.getActiveAccount(null, model)?.name, 'deepseek-v4-pro');
+    }
+    assert.equal(routing.getActiveAccount(null, 'gpt-6-astra')?.name, 'codex-gpt56');
     const seen = [];
     const upstream = http.createServer(async (req, res) => {
       let body = ''; for await (const chunk of req) body += chunk;

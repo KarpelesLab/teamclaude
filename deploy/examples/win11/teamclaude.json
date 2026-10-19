@@ -359,6 +359,22 @@
       "_note_order": "2026-10-17: latency was NOT a routing-order problem \u2014 the OAuth account 429s and the old transient429RotateAfter=3 waited 60s x3 before failover. Fixed at top level (now 1). Array order here is only a tiebreak; account priority governs."
     },
     {
+      "name": "haiku-5-5",
+      "match": [
+        "claude-haiku-5-5",
+        "claude-haiku-5-5[1m]"
+      ],
+      "accounts": [
+        "tangeddie1024@gmail.com",
+        "tangeddie1024-platform-api",
+        "antigravity",
+        "deepseek-v4-pro",
+        "deepseek-v4-flash"
+      ],
+      "bucket": "unified7d",
+      "color": "cyan"
+    },
+    {
       "name": "haiku",
       "match": [
         "*haiku*"
