@@ -1,6 +1,7 @@
 import { createWriteStream } from 'node:fs';
 import { importCredentials, fetchProfile } from './oauth.js';
 import { sameIdentity } from './identity.js';
+import { USAGE_DISPLAYS, normalizeUsageDisplay, usesBalanceDisplay, balanceSummary } from './usage-display.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -326,6 +327,7 @@ export class TUI {
       case 'routes': this._keyRoutes(k); break;
       case 'pick': this._keyPick(k); break;
       case 'blocklist': this._keyBlocklist(k); break;
+      case 'usage': this._keyUsage(k); break;
     }
     this.render();
   }
@@ -341,6 +343,7 @@ export class TUI {
     else if (k === 'p' && this.am.accounts.length > 0) { this._doProbe(); }
     else if (k === 'R') { this._doSync(); }
     else if (k === 'g') { this.mode = 'settings'; this.setIdx = 0; this._loadSxBalance(); }
+    else if (k === 'u') { this.mode = 'usage'; this.usageIdx = 0; this.usageReturn = 'normal'; }
   }
 
   // Navigable rows on the settings screen, top to bottom. Both the renderer and
@@ -349,6 +352,12 @@ export class TUI {
   // so always index through the returned array — never hard-code positions.
   _settingsFields() {
     const fields = [];
+
+    fields.push({
+      id: 'usageDisplay', label: 'Usage display', hint: 'Enter to choose per endpoint',
+      value: () => cyan('Auto / Session / Balance'),
+      enter: () => { this.mode = 'usage'; this.usageIdx = 0; this.usageReturn = 'settings'; },
+    });
 
     fields.push({
       id: 'threshold',
@@ -487,6 +496,53 @@ export class TUI {
     else if (k === 'right') f?.right?.();
     else if (k === 'enter') f?.enter?.();
     else if (k === 'esc' || k === 'q') { this.mode = 'normal'; }
+  }
+
+  _keyUsage(k) {
+    const n = this.am.accounts.length;
+    if (k === 'esc' || k === 'q') { this.mode = this.usageReturn || 'normal'; return; }
+    if (!n) return;
+    if (k === 'up' || k === 'k') this.usageIdx = ((this.usageIdx || 0) - 1 + n) % n;
+    else if (k === 'down' || k === 'j') this.usageIdx = ((this.usageIdx || 0) + 1) % n;
+    else if (['left', 'right', 'enter', ' '].includes(k)) this._cycleUsageDisplay(k === 'left' ? -1 : 1);
+  }
+
+  async _cycleUsageDisplay(direction) {
+    if (this._savingUsageDisplay) return;
+    const a = this.am.accounts[this.usageIdx || 0];
+    const disk = a && this.config.accounts.find(x => sameIdentity(x, a));
+    if (!disk) { this._addLog('Endpoint configuration unavailable'); return; }
+    const previous = normalizeUsageDisplay(a.usageDisplay);
+    const previousDisk = disk.usageDisplay;
+    const next = USAGE_DISPLAYS[(USAGE_DISPLAYS.indexOf(previous) + direction + USAGE_DISPLAYS.length) % USAGE_DISPLAYS.length];
+    a.usageDisplay = disk.usageDisplay = next;
+    this._savingUsageDisplay = true;
+    try {
+      await this.saveConfig(this.config);
+      this._addLog(`Usage display for ${a.name}: ${next}`);
+    } catch {
+      a.usageDisplay = previous;
+      if (previousDisk === undefined) delete disk.usageDisplay; else disk.usageDisplay = previousDisk;
+      this._addLog('Unable to save usage display');
+    } finally {
+      this._savingUsageDisplay = false;
+      if (this.running) this.render();
+    }
+  }
+
+  _renderUsage(lines) {
+    lines.push('', bold('  Usage display'), dim('  Choose a format for each endpoint. Changes save automatically.'), '');
+    this.am.accounts.forEach((a, i) => {
+      const mode = normalizeUsageDisplay(a.usageDisplay);
+      const label = mode[0].toUpperCase() + mode.slice(1);
+      const cursor = i === (this.usageIdx || 0) ? cyan('▸') : ' ';
+      lines.push(`  ${cursor} ${rpad(a.name, 32)} ${cyan(label)}`);
+    });
+    const selected = this.am.accounts[this.usageIdx || 0];
+    lines.push('', dim('  Session: session and weekly quota. Balance: API account credit.'),
+      dim('  Auto: balance when available; otherwise the existing quota display.'),
+      dim('  Display format does not change routing or quota limits.'));
+    if (selected) lines.push('', `  ${balanceSummary(selected)}`);
   }
 
   // Open the text-input prompt and return to the settings screen afterward.
@@ -638,7 +694,8 @@ export class TUI {
   async _doProbe() {
     if (!this.probeQuota) { this._addLog('Quota probe unavailable'); return; }
     if (this._probing) return; // one refresh at a time
-    const n = this.am.accounts.filter(a => a.type === 'oauth' && a.credential).length;
+    const n = this.am.accounts.filter(a => (a.type === 'oauth' && a.credential)
+      || a.probeCommand || a.quotaSource || a.balanceSource).length;
     if (n === 0) { this._addLog('No OAuth accounts to probe'); return; }
     this._probing = true;
     this._addLog(`Refreshing quota on ${n} account${n === 1 ? '' : 's'}...`);
@@ -887,6 +944,8 @@ export class TUI {
       : this.mode;
     if (view === 'settings') {
       this._renderSettings(lines);
+    } else if (view === 'usage') {
+      this._renderUsage(lines);
     } else if (view === 'routes') {
       this._renderRoutes(lines);
     } else if (view === 'pick') {
@@ -1023,11 +1082,15 @@ export class TUI {
     }
     status = rpad(status, 10);
 
+    if (usesBalanceDisplay(a)) {
+      return ` ${sel}${cur} ${startSlot}${name} ${type} ${status} ${balanceSummary(a)}`;
+    }
+
     // Quota ratios — prefer unified (Claude Max), fall back to standard (API key)
     const q = a.quota;
     let r1 = null, r2 = null, l1 = 'Ses', l2 = 'Wk ', t1 = null, t2 = null;
 
-    if (q.unified5h != null || q.unified7d != null || q.unified7dSonnet != null || q.unified7dFable != null) {
+    if (a.usageDisplay === 'session' || q.unified5h != null || q.unified7d != null || q.unified7dSonnet != null || q.unified7dFable != null) {
       r1 = q.unified5h;
       r2 = q.unified7d;
       t1 = q.unified5hReset;
@@ -1098,6 +1161,7 @@ export class TUI {
     // ── Quota probe
     lines.push(bold('  Quota probe') + dim('  — refresh idle accounts from the usage endpoint'));
     lines.push(row(byId('probe')));
+    lines.push(row(byId('usageDisplay')));
     lines.push('');
     // ── Routing
     lines.push(bold('  Routing') + dim('  — pin model families to specific accounts'));
@@ -1418,7 +1482,9 @@ export class TUI {
   _renderFooter() {
     switch (this.mode) {
       case 'normal':
-        return ` ${bold('s')}witch  ${bold('d')}isable  ${bold('p')}robe quota  ${bold('R')}eload  ${bold('g')} settings  ${bold('q')}uit`;
+        return ` ${bold('s')}witch  ${bold('d')}isable  ${bold('p')} refresh  ${bold('u')} usage display  ${bold('R')}eload  ${bold('g')} settings  ${bold('q')}uit`;
+      case 'usage':
+        return ` ${dim('↑↓')} endpoint  ${dim('←→')} format  ${bold('Enter')} change  ${bold('Esc')} back`;
       case 'settings':
         return ` ${dim('↑↓')} navigate  ${dim('←→')} change  ${bold('Enter')} edit  ${bold('Esc')} back`;
       case 'routes':

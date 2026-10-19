@@ -71,10 +71,13 @@ export class Prober {
         (account.type === 'apikey') && account.probeCommand && !account.retired && !account.disabled);
       const src = this.am.accounts.filter(account =>
         (account.type === 'apikey') && account.quotaSource && !account.retired && !account.disabled);
+      const balance = this.am.accounts.filter(account =>
+        account.balanceSource && !account.retired && !account.disabled);
       await Promise.all([
         ...oauth.map(account => this.probeAccount(account)),
         ...cmd.map(account => this.probeCommandAccount(account)),
         ...src.map(account => this.probeQuotaSourceAccount(account)),
+        ...balance.map(account => this.probeQuotaSourceAccount(account, account.balanceSource)),
       ]);
     } finally {
       this.lastRunFinishedAt = Date.now();
@@ -123,13 +126,14 @@ export class Prober {
    *  Runs in-process — no shell, no external state file — and applies the
    *  result via applyUsageData. On error the account's existing quota is left
    *  untouched (fail-safe: unknown ranks at Infinity, never 0% used). */
-  async probeQuotaSourceAccount(account) {
+  async probeQuotaSourceAccount(account, source = account.quotaSource) {
     const startedAt = Date.now();
     this._recordAccount(account, { status: 'running', startedAt });
     try {
       const usage = await this._withTimeout(
-        fetchQuotaFor(account.quotaSource, { switchThreshold: this.am.switchThreshold }));
+        fetchQuotaFor(source, { switchThreshold: this.am.switchThreshold }));
       if (!usage || usage.error) {
+        if (source === account.balanceSource) account.balanceError = usage?.error || 'Balance refresh timed out';
         const finishedAt = Date.now();
         this._recordAccount(account, {
           status: usage?.error ? 'error' : 'timeout',
@@ -141,6 +145,7 @@ export class Prober {
         return;
       }
       this.am.applyUsageData(account.index, usage);
+      if (source === account.balanceSource) account.balanceError = null;
       const finishedAt = Date.now();
       this._recordAccount(account, {
         status: 'ok',
@@ -150,6 +155,7 @@ export class Prober {
         durationMs: finishedAt - startedAt,
       });
     } catch (err) {
+      if (source === account.balanceSource) account.balanceError = 'Balance refresh failed';
       const finishedAt = Date.now();
       this._recordAccount(account, {
         status: 'error',
@@ -218,6 +224,7 @@ export class Prober {
         const status = this.accountStatus.get(account.name);
         const probeType = account.type === 'oauth' ? 'oauth-usage'
           : account.probeCommand ? 'probeCommand'
+          : account.balanceSource ? 'balance'
           : account.quotaSource ? 'quotaSource'
           : 'not-applicable';
         return {

@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { advisorDefinition, dispatchAdvisorRequest, runAdvisorBridge } from './advisor-bridge.js';
 import https from 'node:https';
 import { timingSafeEqual } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
@@ -7,6 +8,9 @@ import { join } from 'node:path';
 import { ensureCerts, createConnectHandler } from './mitm.js';
 import { patchAccountUuid } from './account-uuid-rewrite.js';
 import { sanitizeToolPairs } from './tool-pair-sanitize.js';
+import { foldSystemMessages } from './system-message-fold.js';
+import { logBodyShape } from './body-shape-log.js';
+import { normalizeGeminiArgonRequest } from './gemini-argon-compat.js';
 import { shouldStripForeignThinking, stripThinkingBlocks } from './thinking-strip.js';
 import { resolveHistoryFamily } from './rotation-ledger.js';
 import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
@@ -30,6 +34,7 @@ registerBuildFeature('provenance-t7');
 registerBuildFeature('rotation-gate');
 registerBuildFeature('ingress-thinking-strip');
 registerBuildFeature('fleet-agent-name');
+registerBuildFeature('custom-advisor');
 
 /** Path class for T5 last_request / ctx gating. */
 export function classifySessionPath(url) {
@@ -632,7 +637,7 @@ export function createProxyRequestListener({
   forcedPin = null, provenance = null, listenerTag = 'b',
 }) {
   let counter = 0;
-  return async (req, res) => {
+  const listener = async (req, res) => {
     try {
       // Claude Code's telemetry (`/api/event_logging/*`) is high-volume noise in
       // the activity log. `config.eventLogging` (read live so the TUI toggle takes
@@ -757,6 +762,28 @@ export function createProxyRequestListener({
       // nested in tools[]; every request-path gate quantifies over the full id
       // set {model, advisorModel} — see requestModelIds in model-namespace.js.
       let advisorModel = parseAdvisorModel(body);
+      const advisor = advisorDefinition(body);
+      const bridgeNeeded = advisor && typeof advisor.model === 'string' && (config.customAdvisorBridge !== false) && (
+        accountManager.accounts.some(a => !a.disabled && !a.retired && !a.supportsAdvisorTools &&
+          !isNativeAnthropicUpstream(a.upstream || upstream) &&
+          (a.modelMap?.[model] || a.modelMap?.[advisor.model] ||
+            a.acceptsModels?.includes(model) || a.acceptsModels?.includes(advisor.model)))
+      );
+      if (req.method === 'POST' && classifySessionPath(req.url) === 'messages' && bridgeNeeded) {
+        const executorUrl = pinnedIndex == null ? req.url
+          : `${PIN_PREFIX}${encodeURIComponent(accountManager.accounts[pinnedIndex].name)}${req.url}`;
+        accountManager.beginSession(sessionId, { semantic: true, pathClass: 'messages', model });
+        try {
+          await runAdvisorBridge({ body, res,
+            execute: (payload, role, signal) => dispatchAdvisorRequest(listener, req, payload,
+              role === 'executor' ? executorUrl : req.url, signal, { advisor: role === 'advisor' }),
+            onAdvisor: (id, state) => console.log(`[TeamClaude] Advisor "${id}" ${state}`),
+          });
+        } finally { accountManager.endSession(sessionId, { semantic: true }); }
+        if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url,
+          account: '(advisor)', status: res.statusCode, model, sessionId, fleetAgent, pinned: pinnedIndex != null });
+        return;
+      }
       // Capture PRE-STRIP advisor id so G9 degrade remains visible in provenance.
       const advisorModelRequested = advisorModel;
       let advisorDegraded = false;
@@ -1013,6 +1040,7 @@ export function createProxyRequestListener({
       console.error('[TeamClaude] Unhandled error:', err);
     }
   };
+  return listener;
 }
 
 // Per-request https.Agent tunneled through sx.org — one-shot (no keep-alive
@@ -1402,7 +1430,29 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // interrupted a turn can't wedge the session with Anthropic's non-retryable
   // 400 ("tool_use ids were found without tool_result blocks"). No-op (same
   // Buffer) for a well-formed body.
-  let sendBody = sanitizeToolPairs(body, req.url, req.headers['content-type']);
+  // Move role:"system" entries out of messages[] into top-level `system`
+  // (Anthropic 400s on them: "use the top-level 'system' parameter"). Runs
+  // first so the tool-pair pass sees the real message list. Same Buffer when
+  // there is nothing to move.
+  const shapeMeta = { reqId, account: account.name, model: ctx.model };
+  logBodyShape('ingress', body, shapeMeta);
+  const folded = foldSystemMessages(body, req.url, req.headers['content-type']);
+  logBodyShape('after-system-fold', folded.body, shapeMeta);
+  if (folded.count > 0) {
+    emitProvenance(ctx, {
+      _account: account,
+      final: false,
+      outcome: 'system-message-folded',
+      count: folded.count,
+      attempt: ctx.attempt || 0,
+    });
+  }
+  let sendBody = sanitizeToolPairs(folded.body, req.url, req.headers['content-type']);
+  logBodyShape('after-tool-pair-sanitize', sendBody, shapeMeta);
+  sendBody = normalizeGeminiArgonRequest(sendBody, {
+    model: account.modelMap?.[ctx.model] || ctx.model,
+    native: !customUpstream,
+  });
   // D3: when rotating onto Anthropic after a foreign family served this
   // session, drop thinking/redacted_thinking so Anthropic does not 400 on
   // foreign signatures. Ledger-based; empty ledger ⇒ inert.
@@ -1469,6 +1519,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   if (!['GET', 'HEAD'].includes(method)) {
     headers['content-length'] = String(sendBody.length);
   }
+  // Last stage: the exact bytes that go to the upstream on this attempt.
+  logBodyShape('final-egress', sendBody, shapeMeta);
 
   // Streaming request log, opened lazily on the first terminal outcome (a
   // pure-429-then-retry attempt writes no file, matching prior behavior). The
@@ -1956,13 +2008,36 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     const l = getLog();
     if (l) { l.write(`\n\n=== ERROR ===\n${err.stack || err.message}`); l.end(); }
 
+    // h250 2026-10-15: a corrupted TLS record ("bad record mac", seen ~10-40% of
+    // large uploads from a Hyper-V-bridged Wi-Fi host) is a property of THIS
+    // connection, not of the account. Retry the same request on a fresh
+    // connection WITHOUT marking the account tried, so routing picks the same
+    // (best) account again instead of failing over to a pay-per-use key or a
+    // different model provider. Out of retries -> handled as transient below.
+    const isTlsCorruption = err instanceof Error &&
+      ((typeof err.code === 'string' && /^ERR_SSL_(SSLV3_ALERT_BAD_RECORD_MAC|DECRYPTION_FAILED|BAD_RECORD_MAC|WRONG_VERSION_NUMBER)/.test(err.code)) ||
+        /bad record mac|decryption failed or bad record mac/i.test(err.message || '') ||
+        /bad record mac/i.test(String(err.cause?.message || '')));
+    if (isTlsCorruption && retryCount < maxRetries && !res.headersSent && ctx.pinnedIndex == null) {
+      console.log(`[TeamClaude] TLS record corruption on "${account.name}" — retrying same route on a fresh connection (attempt ${retryCount + 1}/${maxRetries}, no account switch)`);
+      emitProvenance(ctx, {
+        _account: account,
+        final: false,
+        outcome: 'tls-corruption-retry',
+        attempt: ctx.attempt || 0,
+        err_code: err?.code ?? null,
+      });
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+    }
+
     const isTransient = err instanceof Error &&
       (err.code === 'TEAMCLAUDE_HEADERS_TIMEOUT' || err.code === 'TEAMCLAUDE_BODY_TIMEOUT' ||
         err.name === 'TimeoutError' || err.name === 'AbortError' ||
         err.message.includes('fetch failed') ||
         err.code === 'ECONNRESET' || err.code === 'ECONNREFUSED' ||
         err.code === 'ETIMEDOUT' || err.code === 'UND_ERR_CONNECT_TIMEOUT' ||
-        err.code === 'UND_ERR_HEADERS_TIMEOUT' || err.code === 'UND_ERR_BODY_TIMEOUT');
+        err.code === 'UND_ERR_HEADERS_TIMEOUT' || err.code === 'UND_ERR_BODY_TIMEOUT' ||
+        isTlsCorruption);
 
     const errOutcome = err?.code === 'TEAMCLAUDE_BODY_TIMEOUT'
       ? 'stream-idle-timeout'

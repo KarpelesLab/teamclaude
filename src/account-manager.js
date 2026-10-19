@@ -121,6 +121,9 @@ function makeAccount(acct, index) {
     orgUuid: acct.orgUuid || null,
     orgName: acct.orgName || null,
     priority: acct.priority || 0,
+    // Opt in when rounded usage meters reject an account that inference still
+    // accepts. Actual 429 holds, auth failures and token budgets remain enforced.
+    quotaAdmission: acct.quotaAdmission === 'upstream' ? 'upstream' : 'usage',
     // Hard economic boundary. Dynamic ranking NEVER crosses to a higher-cost
     // tier while a cheaper tier has an eligible account. This is deliberately
     // separate from `priority`: priority is a deterministic fallback/tiebreak,
@@ -168,6 +171,8 @@ function makeAccount(acct, index) {
     // unified values are ignored (see updateQuota). Mutually exclusive with
     // probeCommand: an account declares one quota authority.
     quotaSource: acct.quotaSource || null,
+    balanceSource: acct.balanceSource || null,
+    usageDisplay: ['auto', 'session', 'balance'].includes(acct.usageDisplay) ? acct.usageDisplay : 'auto',
     // Model fidelity hint for dynrank. When unset it is DETECTED from the
     // modelMap (identity = faithful, remap = translated) or the account type
     // (oauth = native Anthropic = faithful; apikey = opaque adapter =
@@ -1670,6 +1675,7 @@ export class AccountManager {
   }
 
   _isNearQuota(account, model = null) {
+    if (account.quotaAdmission === 'upstream') return false;
     const q = account.quota;
     const now = Date.now();
     // PURE: treat an expired window as non-constraining without clearing.
@@ -2290,6 +2296,7 @@ export class AccountManager {
     const account = this.accounts[accountIndex];
     if (!account || !usage) return;
     const q = account.quota;
+    if (usage.balance) q.balance = structuredClone(usage.balance);
 
     if (usage.fiveHour) {
       if (usage.fiveHour.utilization != null) q.unified5h = usage.fiveHour.utilization;
@@ -2457,6 +2464,9 @@ export class AccountManager {
       changed.push(field);
     };
     set('priority', disk.priority || 0);
+    set('quotaAdmission', disk.quotaAdmission === 'upstream' ? 'upstream' : 'usage');
+    set('usageDisplay', ['auto', 'session', 'balance'].includes(disk.usageDisplay) ? disk.usageDisplay : 'auto');
+    set('balanceSource', disk.balanceSource || null);
     set('costTier', Number.isFinite(disk.costTier) ? disk.costTier : 0);
     set('upstream', disk.upstream || null);
     set('modelMap', disk.modelMap || null);
@@ -2624,6 +2634,8 @@ export class AccountManager {
           ? [...a.acceptsHistoryFamilies] : null,
         sessions: sessions.perAccount[a.index] || 0,
         quota: { ...a.quota },
+        usageDisplay: a.usageDisplay,
+        balanceError: a.balanceError || null,
         usage: { ...a.usage },
         rateLimitedUntil: a.rateLimitedUntil
           ? new Date(a.rateLimitedUntil).toISOString()

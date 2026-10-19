@@ -285,6 +285,8 @@ export async function fetchSakanaUsage(source) {
  *  for the codex synthetic-5h cap). */
 export async function fetchQuotaFor(source, ctx = {}) {
   switch (source?.type) {
+    case 'deepseek-balance':
+      return fetchDeepSeekBalance(source);
     case 'google-antigravity':
       return fetchGoogleAntigravityUsage(source);
     case 'openai-codex':
@@ -293,5 +295,33 @@ export async function fetchQuotaFor(source, ctx = {}) {
       return fetchSakanaUsage(source);
     default:
       return { error: `quotaSource: unknown type ${source?.type || '<missing>'}`, status: null };
+  }
+}
+
+/** DeepSeek's balance is an amount per currency, never a session percentage. */
+export async function fetchDeepSeekBalance(source) {
+  try {
+    if (!source?.tokenFile) return { error: 'DeepSeek balance: token file not configured', status: null };
+    const token = (await readFile(resolvePath(source.tokenFile), 'utf-8')).trim();
+    if (!token) return { error: 'DeepSeek balance: token file is empty', status: null };
+    const res = await fetch('https://api.deepseek.com/user/balance', {
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+      signal: AbortSignal.timeout(10_000),
+    });
+    // Never expose the error body: providers may echo credential material.
+    if (!res.ok) return { error: `DeepSeek balance: HTTP ${res.status}`, status: res.status };
+    const data = await res.json();
+    const entries = data.balance_infos;
+    if (typeof data.is_available !== 'boolean' || !Array.isArray(entries) || !entries.length
+        || entries.some(b => !['USD', 'CNY'].includes(b.currency)
+          || ['total_balance', 'granted_balance', 'topped_up_balance'].some(k =>
+            !['string', 'number'].includes(typeof b[k]) || String(b[k]).trim() === '' || !Number.isFinite(Number(b[k]))))) {
+      return { error: 'DeepSeek balance: invalid balance response', status: null };
+    }
+    return { balance: { available: data.is_available, updatedAt: Date.now(), balances: entries.map(b => ({
+      currency: b.currency, total: b.total_balance, granted: b.granted_balance, toppedUp: b.topped_up_balance,
+    })) } };
+  } catch {
+    return { error: 'DeepSeek balance: unable to read token file or reach service', status: null };
   }
 }
