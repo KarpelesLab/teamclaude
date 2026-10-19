@@ -1,0 +1,458 @@
+{
+  "proxy": {
+    "port": 3456,
+    "apiKey": "SET_LOCALLY",
+    "noForwarding": true
+  },
+  "upstream": "https://api.anthropic.com",
+  "switchThreshold": 0.99,
+  "accounts": [
+    {
+      "name": "codex-gpt56",
+      "modelMap": {
+        "gpt-6-astra": "gpt-6-astra",
+        "gpt-6-astra[1m]": "gpt-6-astra",
+        "claude-gpt-6-astra": "gpt-6-astra",
+        "claude-gpt-6-astra[1m]": "gpt-6-astra",
+        "gpt-6-sol": "gpt-6-sol",
+        "gpt-6.1-sol": "gpt-6.1-sol",
+        "gpt-6-luna": "gpt-6-luna",
+        "gpt-5.6-terra": "gpt-5.6-terra"
+      },
+      "type": "apikey",
+      "apiKey": "SET_LOCALLY",
+      "upstream": "http://127.0.0.1:8084",
+      "priority": 40,
+      "disabled": false,
+      "accessToken": "SET_LOCALLY",
+      "refreshToken": "SET_LOCALLY",
+      "quotaStateFile": "~/.local/state/quota/codex-gpt56.json",
+      "probeCommand": "bash ~/.local/bin/codex-quota-probe.sh"
+    },
+    {
+      "name": "deepseek-v4-pro",
+      "type": "apikey",
+      "apiKey": "SET_LOCALLY",
+      "upstream": "http://127.0.0.1:8085",
+      "priority": 35,
+      "accessToken": "SET_LOCALLY",
+      "modelMap": {
+        "claude-opus-5": "deepseek-v4-pro",
+        "claude-opus-5[1m]": "deepseek-v4-pro",
+        "claude-opus-5-5": "deepseek-v4-pro",
+        "claude-opus-4-8": "deepseek-v4-pro",
+        "claude-opus-4-8[1m]": "deepseek-v4-pro",
+        "claude-fable-5": "deepseek-v4-pro",
+        "claude-fable-5[1m]": "deepseek-v4-pro",
+        "claude-fable-5-1": "deepseek-v4-pro",
+        "claude-fable-5-1[1m]": "deepseek-v4-pro",
+        "fable": "deepseek-v4-pro",
+        "claude-sonnet-5": "deepseek-v4-pro",
+        "claude-sonnet-5[1m]": "deepseek-v4-pro",
+        "claude-haiku-4-5": "deepseek-v4-pro",
+        "haiku": "deepseek-v4-pro",
+        "opus": "deepseek-v4-pro",
+        "sonnet": "deepseek-v4-pro",
+        "sonnet5": "deepseek-v4-pro",
+        "claude-kimi-k3": "deepseek-v4-pro",
+        "claude-kimi-k3[1m]": "deepseek-v4-pro",
+        "kimi": "deepseek-v4-pro",
+        "kimi-k3": "deepseek-v4-pro",
+        "claude-haiku-4-5-20251001": "deepseek-v4-pro",
+        "claude-opus-4-7": "deepseek-v4-pro",
+        "claude-opus-4-7[1m]": "deepseek-v4-pro",
+        "claude-opus-4-6": "deepseek-v4-pro",
+        "claude-sonnet-4-5": "deepseek-v4-pro",
+        "claude-gpt-5.6-sol": "deepseek-v4-pro",
+        "claude-gpt-5.6-terra": "deepseek-v4-pro",
+        "gpt-6-astra": "deepseek-v4-pro",
+        "gpt-6-astra[1m]": "deepseek-v4-pro",
+        "claude-gpt-6-astra": "deepseek-v4-pro",
+        "claude-gpt-6-astra[1m]": "deepseek-v4-pro",
+        "deepseek": "deepseek-v4-pro",
+        "deepseek-v4-pro": "deepseek-v4-pro",
+        "deepseek-v4-flash": "deepseek-v4-flash",
+        "deepseek-v4.1-flash-1017": "deepseek-v4-flash",
+        "DeepSeek-V4.1-Flash-1017": "deepseek-v4-flash"
+      },
+      "refreshToken": "SET_LOCALLY",
+      "usageDisplay": "balance",
+      "balanceSource": {
+        "type": "deepseek-balance",
+        "tokenFile": "~/.deepseek-token"
+      }
+    },
+    {
+      "name": "deepseek-v4-flash",
+      "type": "apikey",
+      "apiKey": "SET_LOCALLY",
+      "upstream": "http://127.0.0.1:8085",
+      "priority": 45,
+      "accessToken": "SET_LOCALLY",
+      "modelMap": {
+        "claude-fable-5": "deepseek-v4-flash",
+        "claude-fable-5[1m]": "deepseek-v4-flash",
+        "claude-fable-5-1": "deepseek-v4-flash",
+        "claude-fable-5-1[1m]": "deepseek-v4-flash",
+        "fable": "deepseek-v4-flash",
+        "claude-opus-5": "deepseek-v4-flash",
+        "claude-opus-5[1m]": "deepseek-v4-flash",
+        "claude-opus-5-5": "deepseek-v4-flash",
+        "claude-opus-4-8": "deepseek-v4-flash",
+        "claude-opus-4-8[1m]": "deepseek-v4-flash",
+        "opus": "deepseek-v4-flash",
+        "claude-opus-4-7": "deepseek-v4-flash",
+        "claude-opus-4-7[1m]": "deepseek-v4-flash",
+        "claude-opus-4-6": "deepseek-v4-flash",
+        "claude-sonnet-5": "deepseek-v4-flash",
+        "claude-sonnet-5[1m]": "deepseek-v4-flash",
+        "sonnet": "deepseek-v4-flash",
+        "sonnet5": "deepseek-v4-flash",
+        "claude-sonnet-4-5": "deepseek-v4-flash",
+        "claude-gpt-5.6-sol": "deepseek-v4-flash",
+        "claude-gpt-5.6-terra": "deepseek-v4-flash",
+        "gpt-6-astra": "deepseek-v4-flash",
+        "gpt-6-astra[1m]": "deepseek-v4-flash",
+        "gpt-6-sol": "deepseek-v4-flash",
+        "gpt-6-luna": "deepseek-v4-flash",
+        "gpt-5.6-terra": "deepseek-v4-flash",
+        "claude-gpt-6-astra": "deepseek-v4-flash",
+        "claude-gpt-6-astra[1m]": "deepseek-v4-flash",
+        "claude-haiku-4-5-20251001": "deepseek-v4-flash",
+        "claude-haiku-4-5": "deepseek-v4-flash",
+        "haiku": "deepseek-v4-flash",
+        "claude-kimi-k3": "deepseek-v4-flash",
+        "claude-kimi-k3[1m]": "deepseek-v4-flash",
+        "kimi": "deepseek-v4-flash",
+        "kimi-k3": "deepseek-v4-flash",
+        "deepseek": "deepseek-v4-flash",
+        "deepseek-v4-flash": "deepseek-v4-flash",
+        "deepseek-v4-pro": "deepseek-v4-pro",
+        "gpt-6.1-sol": "deepseek-v4-flash",
+        "deepseek-v4.1-flash-1017": "deepseek-v4-flash",
+        "DeepSeek-V4.1-Flash-1017": "deepseek-v4-flash"
+      },
+      "refreshToken": "SET_LOCALLY",
+      "usageDisplay": "balance",
+      "balanceSource": {
+        "type": "deepseek-balance",
+        "tokenFile": "~/.deepseek-token"
+      }
+    },
+    {
+      "name": "kimi-k3",
+      "type": "apikey",
+      "apiKey": "SET_LOCALLY",
+      "upstream": "http://127.0.0.1:8086",
+      "priority": 60,
+      "disabled": true,
+      "modelMap": {
+        "claude-fable-5": "kimi-k3",
+        "claude-fable-5[1m]": "kimi-k3",
+        "claude-opus-5": "kimi-k3",
+        "claude-opus-5[1m]": "kimi-k3",
+        "fable": "kimi-k3",
+        "claude-kimi-k3": "kimi-k3",
+        "claude-kimi-k3[1m]": "kimi-k3",
+        "kimi": "kimi-k3",
+        "kimi-k3": "kimi-k3"
+      },
+      "accessToken": "SET_LOCALLY",
+      "refreshToken": "SET_LOCALLY"
+    },
+    {
+      "name": "antigravity",
+      "modelMap": {
+        "claude-opus-5-5-ultra": "claude-opus-5-5-ultra",
+        "claude-opus-5-5-ultra[1m]": "claude-opus-5-5-ultra",
+        "claude-opus-5-5-high": "claude-opus-5-5-high",
+        "claude-opus-5-5": "claude-opus-5-5",
+        "claude-opus-5-5[1m]": "claude-opus-5-5",
+        "claude-sonnet-5-5-ultra": "claude-sonnet-5-5-ultra",
+        "claude-sonnet-5-5-ultra[1m]": "claude-sonnet-5-5-ultra",
+        "claude-sonnet-5-5-high": "claude-sonnet-5-5-high",
+        "claude-sonnet-5-5": "claude-sonnet-5-5",
+        "claude-sonnet-5-5[1m]": "claude-sonnet-5-5",
+        "gemini-3.7-flash": "gemini-3.7-flash",
+        "gemini-3.7-flash[1m]": "gemini-3.7-flash",
+        "claude-gemini-3.7-flash": "gemini-3.7-flash",
+        "claude-gemini-3.7-flash[1m]": "gemini-3.7-flash",
+        "gemini-3.7-flash-high": "gemini-3.7-flash",
+        "claude-sonnet-5": "claude-sonnet-5",
+        "claude-sonnet-5[1m]": "claude-sonnet-5",
+        "claude-sonnet-4-5": "claude-sonnet-4-5-20250929",
+        "sonnet": "claude-sonnet-5",
+        "sonnet5": "claude-sonnet-5",
+        "gemini-4-argon": "gemini-4-argon",
+        "gemini-4-argon[1m]": "gemini-4-argon",
+        "gemini-4-argon-high": "gemini-4-argon",
+        "gemini-3.8-flash": "gemini-3.8-flash",
+        "gemini-3.8-flash[1m]": "gemini-3.8-flash",
+        "claude-gemini-3.8-flash": "gemini-3.8-flash",
+        "claude-gemini-3.8-flash[1m]": "gemini-3.8-flash",
+        "gemini-3.8-flash-high": "gemini-3.8-flash",
+        "claude-haiku-4-5": "claude-haiku-4-5-20251001",
+        "claude-haiku-4-5[1m]": "claude-haiku-4-5-20251001",
+        "claude-haiku-4-5-20251001": "claude-haiku-4-5-20251001",
+        "haiku": "claude-haiku-4-5-20251001",
+        "gemini": "gemini-3.7-flash",
+        "gemini-3.5-flash": "gemini-3.5-flash",
+        "claude-haiku-5-5": "claude-haiku-5-5",
+        "claude-haiku-5-5[1m]": "claude-haiku-5-5"
+      },
+      "type": "apikey",
+      "apiKey": "SET_LOCALLY",
+      "upstream": "http://127.0.0.1:8318",
+      "priority": 20,
+      "disabled": false,
+      "accessToken": "SET_LOCALLY",
+      "refreshToken": "SET_LOCALLY",
+      "quotaStateFile": "~/.local/state/quota/antigravity.json",
+      "probeCommand": "bash ~/.local/bin/antigravity-quota-probe.sh",
+      "usageDisplay": "session"
+    },
+    {
+      "name": "tangeddie1024@gmail.com",
+      "type": "oauth",
+      "accessToken": "SET_LOCALLY",
+      "refreshToken": "SET_LOCALLY",
+      "organizationType": "claude_max",
+      "rateLimitTier": "default_claude_max_20x",
+      "hasClaudeMax": true,
+      "hasClaudePro": false,
+      "seatTier": null,
+      "priority": 0,
+      "quotaAdmission": "upstream"
+    },
+    {
+      "name": "tangeddie1024-platform-api",
+      "type": "apikey",
+      "apiKey": "SET_LOCALLY",
+      "accessToken": "SET_LOCALLY",
+      "priority": 10,
+      "disabled": true,
+      "fidelity": "faithful",
+      "modelMap": {
+        "fable": "claude-fable-5-1",
+        "claude-fable-5[1m]": "claude-fable-5",
+        "claude-fable-5-1[1m]": "claude-fable-5-1",
+        "opus": "claude-opus-5-5",
+        "claude-opus-5-5[1m]": "claude-opus-5-5",
+        "claude-opus-5[1m]": "claude-opus-5",
+        "claude-opus-4-8[1m]": "claude-opus-4-8",
+        "claude-opus-4-7[1m]": "claude-opus-4-7",
+        "sonnet": "claude-sonnet-5-5",
+        "sonnet5": "claude-sonnet-5",
+        "claude-sonnet-5-5[1m]": "claude-sonnet-5-5",
+        "claude-sonnet-5[1m]": "claude-sonnet-5",
+        "claude-sonnet-4-5": "claude-sonnet-4-6",
+        "haiku": "claude-haiku-5-5",
+        "claude-fable-5-1": "claude-fable-5-1",
+        "claude-fable-5": "claude-fable-5",
+        "claude-opus-5-5": "claude-opus-5-5",
+        "claude-opus-5": "claude-opus-5",
+        "claude-opus-4-8": "claude-opus-4-8",
+        "claude-opus-4-7": "claude-opus-4-7",
+        "claude-opus-4-6": "claude-opus-4-6",
+        "claude-sonnet-5-5": "claude-sonnet-5-5",
+        "claude-sonnet-5": "claude-sonnet-5",
+        "claude-sonnet-4-6": "claude-sonnet-4-6",
+        "claude-haiku-5-5": "claude-haiku-5-5",
+        "claude-haiku-4-5": "claude-haiku-4-5-20251001",
+        "claude-haiku-4-5-20251001": "claude-haiku-4-5-20251001",
+        "claude-haiku-4-5[1m]": "claude-haiku-4-5-20251001"
+      },
+      "refreshToken": "SET_LOCALLY"
+    }
+  ],
+  "routes": [
+    {
+      "name": "fable",
+      "match": [
+        "*fable*",
+        "*fable-5*"
+      ],
+      "accounts": [
+        "tangeddie1024@gmail.com",
+        "tangeddie1024-platform-api",
+        "codex-gpt56",
+        "deepseek-v4-flash",
+        "deepseek-v4-pro",
+        "kimi-k3"
+      ],
+      "bucket": "unified7d",
+      "color": "yellow"
+    },
+    {
+      "name": "claude-5-5-ultra",
+      "match": [
+        "claude-opus-5-5-ultra*",
+        "claude-opus-5-5-high*",
+        "claude-sonnet-5-5-ultra*",
+        "claude-sonnet-5-5-high*"
+      ],
+      "accounts": [
+        "antigravity"
+      ],
+      "bucket": "unified7d",
+      "color": "green",
+      "_note": "2026-10-15: Direct Google AI Ultra (Antigravity via CLIProxyAPI :8318) route for Claude Opus 5.5 and Sonnet 5.5"
+    },
+    {
+      "name": "agh-local",
+      "match": [
+        "claude-opus-4-6"
+      ],
+      "accounts": [
+        "deepseek-v4-pro",
+        "deepseek-v4-flash"
+      ],
+      "bucket": "unified7d",
+      "color": "magenta",
+      "_note": "2026-10-17 harness-250: agnes-harness (AGH, a third-party client) is pinned to this exact, otherwise-unused model id and kept OFF tangeddie1024@gmail.com / tangeddie1024-platform-api on purpose. Anthropic's real API returns 400 'Third-party apps now draw from your extra usage, not your plan limits' for AGH's traffic on that account (verified in ~/.teamclaude/20261016_234941.029_00835.log), and that error is x-should-retry:false so auto-fallback never kicks in. Eddie 2026-10-17: 'agh\u4e0d\u7528 tangeddie1024 claude max sub, \u7528\u5176\u4ed6\u7684' / '\u7528 teamclaude \u5176\u4ed6\u7684 proxies'. Must stay BEFORE the 'opus'/'default' routes (routes.find is first-match-wins, model-namespace.js:192) since 'claude-opus-4-6' would otherwise fall into '*opus*'. AGH's own saved model (~/.agh/profiles/local-dev/configuration.json) was changed to match this id in the same pass. CORRECTION same pass: antigravity (priority 20, CLIProxyAPI/Gemini) does NOT recognize this alias in its own model table (returned 'unknown provider for model claude-opus-4-6' when picked, confirmed in gateway activity log at 24:22:44); dropped it. codex-gpt56's modelMap also lacks this id. Left with only the two deepseek accounts, which both carry claude-opus-4-6 in their modelMap."
+    },
+    {
+      "name": "opus-5-5",
+      "match": [
+        "claude-opus-5-5"
+      ],
+      "accounts": [
+        "tangeddie1024@gmail.com",
+        "tangeddie1024-platform-api",
+        "antigravity"
+      ],
+      "bucket": "unified7d",
+      "color": "yellow"
+    },
+    {
+      "name": "opus",
+      "match": [
+        "*opus*"
+      ],
+      "accounts": [
+        "tangeddie1024@gmail.com",
+        "tangeddie1024-platform-api",
+        "antigravity",
+        "codex-gpt56",
+        "deepseek-v4-flash",
+        "deepseek-v4-pro",
+        "kimi-k3"
+      ],
+      "bucket": "unified7d",
+      "color": "yellow"
+    },
+    {
+      "name": "sonnet",
+      "match": [
+        "*sonnet*"
+      ],
+      "accounts": [
+        "tangeddie1024@gmail.com",
+        "tangeddie1024-platform-api",
+        "antigravity",
+        "codex-gpt56",
+        "deepseek-v4-flash",
+        "deepseek-v4-pro"
+      ],
+      "bucket": "unified7d",
+      "color": "yellow",
+      "_note": "2026-10-15: antigravity serves claude-sonnet-5-5 directly via Google AI Ultra (CLIProxyAPI :8318) and gemini-3.8-flash-high for older sonnet aliases."
+    },
+    {
+      "name": "haiku",
+      "match": [
+        "*haiku*"
+      ],
+      "accounts": [
+        "tangeddie1024@gmail.com",
+        "tangeddie1024-platform-api",
+        "antigravity",
+        "codex-gpt56",
+        "deepseek-v4-flash",
+        "deepseek-v4-pro"
+      ],
+      "bucket": "unified7d",
+      "color": "cyan"
+    },
+    {
+      "name": "kimi",
+      "match": [
+        "*kimi*",
+        "*k3*"
+      ],
+      "accounts": [
+        "kimi-k3"
+      ],
+      "bucket": "unified7d",
+      "color": "blue",
+      "_note": "dynrank override: kimi/k3 pinned to kimi-k3 only, no deepseek fallback (2026-08-08). Restore from bak to re-enable fallback."
+    },
+    {
+      "name": "gpt",
+      "match": [
+        "*gpt*",
+        "*gpt-5.6*",
+        "*sol*",
+        "*terra*"
+      ],
+      "accounts": [
+        "codex-gpt56"
+      ],
+      "bucket": "unified7d",
+      "color": "cyan",
+      "_note": "2026-10-19: Preserve requested GPT identity. DeepSeek fallback returned HTTP 402 and caused clients to abandon Astra; GPT models use only codex-gpt56."
+    },
+    {
+      "name": "deepseek",
+      "match": [
+        "*deepseek*"
+      ],
+      "accounts": [
+        "deepseek-v4-pro",
+        "deepseek-v4-flash"
+      ],
+      "_note": "official slug promotion 2026-08-12: deepseek-v4-pro is the primary (priority 35 < flash 45); bare deepseek maps to pro on the pro account, degrades to flash"
+    },
+    {
+      "name": "gemini",
+      "match": [
+        "*gemini*"
+      ],
+      "accounts": [
+        "antigravity"
+      ],
+      "bucket": "unified7d",
+      "color": "green",
+      "_note": "2026-10-09: Gemini uses CLIProxyAPI native Anthropic translation on :8318; filters Claude billing attribution before Antigravity. Preserves explicit model mappings."
+    },
+    {
+      "name": "default (MUST stay last: pins unrouted models off deepseek-v4-flash)",
+      "match": [
+        "*"
+      ],
+      "accounts": [
+        "tangeddie1024@gmail.com",
+        "tangeddie1024-platform-api",
+        "codex-gpt56",
+        "deepseek-v4-flash"
+      ]
+    }
+  ],
+  "quotaProbeSeconds": 120,
+  "sx": {
+    "mode": "off"
+  },
+  "warmupSeconds": 300,
+  "routingPolicy": {
+    "mode": "priority-first",
+    "preserveSessionAffinity": false,
+    "reevaluateMs": 300000
+  },
+  "rotationGate": {
+    "mode": "shadow"
+  },
+  "ingressThinkingStrip": true,
+  "blockedModels": [
+    "*fugu*"
+  ]
+}
