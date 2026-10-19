@@ -84,14 +84,20 @@
         "claude-gpt-6-astra[1m]": "deepseek-v4-pro",
         "deepseek": "deepseek-v4-pro",
         "deepseek-v4-pro": "deepseek-v4-pro",
-        "deepseek-v4-flash": "deepseek-v4-flash"
+        "deepseek-v4-flash": "deepseek-v4-flash",
+        "claude-haiku-5-5": "deepseek-v4-pro",
+        "claude-haiku-5-5[1m]": "deepseek-v4-pro"
       },
       "refreshToken": "SET_LOCALLY",
       "usageDisplay": "balance",
       "balanceSource": {
         "type": "deepseek-balance",
         "tokenFile": "//wsl.localhost/Ubuntu/home/tyb90/.deepseek-token"
-      }
+      },
+      "acceptsModels": [
+        "deepseek-v4-flash",
+        "deepseek-v4-pro"
+      ]
     },
     {
       "name": "deepseek-v4-flash",
@@ -139,14 +145,20 @@
         "deepseek": "deepseek-v4-flash",
         "deepseek-v4-flash": "deepseek-v4-flash",
         "deepseek-v4-pro": "deepseek-v4-pro",
-        "gpt-6.1-sol": "deepseek-v4-flash"
+        "gpt-6.1-sol": "deepseek-v4-flash",
+        "claude-haiku-5-5": "deepseek-v4-flash",
+        "claude-haiku-5-5[1m]": "deepseek-v4-flash"
       },
       "refreshToken": "SET_LOCALLY",
       "usageDisplay": "balance",
       "balanceSource": {
         "type": "deepseek-balance",
         "tokenFile": "//wsl.localhost/Ubuntu/home/tyb90/.deepseek-token"
-      }
+      },
+      "acceptsModels": [
+        "deepseek-v4-flash",
+        "deepseek-v4-pro"
+      ]
     },
     {
       "name": "kimi-k3",

@@ -73,14 +73,20 @@
         "deepseek-v4-pro": "deepseek-v4-pro",
         "deepseek-v4-flash": "deepseek-v4-flash",
         "deepseek-v4.1-flash-1017": "deepseek-v4-flash",
-        "DeepSeek-V4.1-Flash-1017": "deepseek-v4-flash"
+        "DeepSeek-V4.1-Flash-1017": "deepseek-v4-flash",
+        "claude-haiku-5-5": "deepseek-v4-pro",
+        "claude-haiku-5-5[1m]": "deepseek-v4-pro"
       },
       "refreshToken": "SET_LOCALLY",
       "usageDisplay": "balance",
       "balanceSource": {
         "type": "deepseek-balance",
         "tokenFile": "~/.deepseek-token"
-      }
+      },
+      "acceptsModels": [
+        "deepseek-v4-flash",
+        "deepseek-v4-pro"
+      ]
     },
     {
       "name": "deepseek-v4-flash",
@@ -130,14 +136,20 @@
         "deepseek-v4-pro": "deepseek-v4-pro",
         "gpt-6.1-sol": "deepseek-v4-flash",
         "deepseek-v4.1-flash-1017": "deepseek-v4-flash",
-        "DeepSeek-V4.1-Flash-1017": "deepseek-v4-flash"
+        "DeepSeek-V4.1-Flash-1017": "deepseek-v4-flash",
+        "claude-haiku-5-5": "deepseek-v4-flash",
+        "claude-haiku-5-5[1m]": "deepseek-v4-flash"
       },
       "refreshToken": "SET_LOCALLY",
       "usageDisplay": "balance",
       "balanceSource": {
         "type": "deepseek-balance",
         "tokenFile": "~/.deepseek-token"
-      }
+      },
+      "acceptsModels": [
+        "deepseek-v4-flash",
+        "deepseek-v4-pro"
+      ]
     },
     {
       "name": "kimi-k3",
