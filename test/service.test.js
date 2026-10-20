@@ -180,7 +180,12 @@ test('a failed load is reported as a failure, not a silent success', async () =>
   }
 });
 
-test('installing on systemd reloads the daemon before enabling', async () => {
+// `enable --now` only starts the unit, and starting a unit that is already
+// running does nothing: a reinstall (after an update, or to change the config
+// path) left the old process running the old ExecStart and Environment while
+// reporting success. `restart` starts a stopped unit and restarts a running
+// one, as bootout + bootstrap do on macOS.
+test('installing on systemd reloads the daemon, enables the unit and restarts it', async () => {
   const home = await mkdtemp(join(tmpdir(), 'tc-svc-'));
   try {
     const { run, calls } = recorder();
@@ -196,8 +201,24 @@ test('installing on systemd reloads the daemon before enabling', async () => {
     assert.match(await readFile(systemdUnitPath(home, null), 'utf8'), /ExecStart=/);
     assert.deepEqual(calls, [
       'systemctl --user daemon-reload',
-      'systemctl --user enable --now teamclaude.service',
+      'systemctl --user enable teamclaude.service',
+      'systemctl --user restart teamclaude.service',
     ]);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('a failed systemd restart is reported as a failure, not a silent success', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'tc-svc-'));
+  try {
+    const { run } = recorder({ restart: { code: 1, stdout: '', stderr: 'Job for teamclaude.service failed.' } });
+    const res = await installService({
+      kind: 'systemd', home, platform: 'linux', run, log: () => {}, xdgConfig: null,
+      exec: { node: '/usr/bin/node', entry: '/usr/bin/teamclaude' },
+    });
+    assert.equal(res.ok, false);
+    assert.match(res.error, /Job for teamclaude\.service failed/);
   } finally {
     await rm(home, { recursive: true, force: true });
   }
