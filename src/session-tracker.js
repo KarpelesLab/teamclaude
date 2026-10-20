@@ -168,7 +168,9 @@ export class SessionTracker {
     // Requests routed per account, oldest first: [timestamp, accountIndex],
     // with a running count per account so a read is O(1) after the prune.
     // Fed by noteRouted() from recordSession(), read by recentRequestsFor().
+    /** @type {Array<[number, number]>} */
     this._routed = [];
+    /** @type {Map<number, number>} */
     this._routedCounts = new Map();
     // id -> { pins: Map<bucketKey, { idx, at }>,
     //         refs: Map<bucketKey, Observation>,
@@ -611,9 +613,17 @@ export class SessionTracker {
         ref.unescaped = held;
       }
     }
-    this._routed = this._routed.map(([at, idx]) => [at, mapFn(idx)]).filter(([, idx]) => idx != null);
+    // The routed ring follows the same shift; a removed account's entries go.
+    /** @type {Array<[number, number]>} */
+    const routed = [];
     this._routedCounts = new Map();
-    for (const [, idx] of this._routed) this._routedCounts.set(idx, (this._routedCounts.get(idx) || 0) + 1);
+    for (const [at, idx] of this._routed) {
+      const moved = mapFn(idx);
+      if (moved == null) continue;
+      routed.push([at, moved]);
+      this._routedCounts.set(moved, (this._routedCounts.get(moved) || 0) + 1);
+    }
+    this._routed = routed;
   }
 
   // Does this pin count as load on `accountIndex` right now? A pin outlives the
@@ -644,15 +654,13 @@ export class SessionTracker {
     return out;
   }
 
-  // Active sessions currently pinned to `accountIndex` — the load metric used to
-  // spread new sessions across accounts. Counts in-flight sessions regardless of
-  // how long their request has been streaming. A session spending two accounts
-  // is load on both: it counts once per account, not once overall.
   /** Record that a request was routed to an account. One entry per forward
    * decision, which is what the proxy charges upstream, so the count is in the
    * unit the account's rate limits are in. Pruned to LOAD_WINDOW_MS on read and
    * capped at MAX_ROUTED on write (oldest dropped), so the ring is bounded even
-   * when nothing reads it. */
+   * when nothing reads it.
+   * @param {number|null|undefined} accountIndex
+   * @param {number} [now] */
   noteRouted(accountIndex, now = this._now()) {
     if (accountIndex == null) return;
     this._routed.push([now, accountIndex]);
@@ -664,7 +672,9 @@ export class SessionTracker {
    * load an account is actually carrying, as opposed to activeCountFor's
    * session count: a lane that fires a request every ten seconds and a TUI
    * that fires one a minute are both one session, and the difference between
-   * them is what this measures. */
+   * them is what this measures.
+   * @param {number} accountIndex
+   * @param {number} [now] */
   recentRequestsFor(accountIndex, now = this._now()) {
     this._pruneRouted(now);
     return this._routedCounts.get(accountIndex) || 0;
@@ -672,6 +682,7 @@ export class SessionTracker {
 
   // Drop entries older than the window. Entries are appended in time order,
   // so the stale ones are a prefix.
+  /** @param {number} now */
   _pruneRouted(now) {
     const cutoff = now - LOAD_WINDOW_MS;
     let i = 0;
@@ -680,6 +691,7 @@ export class SessionTracker {
   }
 
   // Remove the oldest `n` entries, keeping the per-account counts in step.
+  /** @param {number} n */
   _dropRouted(n) {
     for (const [, idx] of this._routed.splice(0, n)) {
       const left = (this._routedCounts.get(idx) || 1) - 1;
@@ -687,6 +699,10 @@ export class SessionTracker {
     }
   }
 
+  // Active sessions currently pinned to `accountIndex` — the load metric used to
+  // spread new sessions across accounts. Counts in-flight sessions regardless of
+  // how long their request has been streaming. A session spending two accounts
+  // is load on both: it counts once per account, not once overall.
   activeCountFor(accountIndex, now = this._now()) {
     let n = 0;
     for (const s of this.sessions.values()) {

@@ -567,6 +567,7 @@ function formatSessions(sessions, paint) {
   // different accounts for the same fleet, so an operator reading the line
   // needs to know which rule produced what they are looking at.
   if (sessions.mode === 'adaptive') mode = paint.green('adapting');
+  else if (sessions.mode === 'load') mode = paint.green('distributing by load');
   else if (sessions.distribute) mode = paint.green('distributing');
   else if (draining) mode = paint.yellow(`draining ${draining}`);
   else mode = paint.dim('single-account');

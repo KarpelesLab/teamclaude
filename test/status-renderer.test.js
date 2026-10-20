@@ -109,6 +109,13 @@ test('renderStatus shows the sessions line and per-account session count when pr
   assert.match(output, /a \(oauth, prio 0\).*2 sess/);
 });
 
+test('renderStatus names the load distribution mode', () => {
+  const status = sampleStatus();
+  status.sessions = { known: 3, active: 2, perAccount: { 0: 2 }, distribute: true, mode: 'load' };
+  const output = renderStatus(status, { color: false, now });
+  assert.match(output, /Sessions\s+2 active \/ 3 known · distributing by load/);
+});
+
 test('renderStatus reports a draining distribution toggle instead of single-account', () => {
   const status = sampleStatus();
   status.sessions = { known: 3, active: 2, perAccount: { 0: 2 }, distribute: false, draining: 2 };

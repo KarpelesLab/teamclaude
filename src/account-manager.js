@@ -30,6 +30,9 @@ export { isFableModel, parseRequestModel, parseAdvisorModel } from './model.js';
  *   'adaptive'     → 'adaptive' spend the least-remaining window down first,
  *                               tapering at the threshold and backing off when
  *                               the account is busy (see adaptive-distribution.js)
+ *   'load'         → 'load'     spread new sessions by the requests each account
+ *                               served in the last LOAD_WINDOW_MS, even keys as
+ *                               tie-breaks (see SessionTracker.recentRequestsFor)
  * An unrecognised string is treated as 'even' rather than rejected: it is
  * plainly a request to distribute, and refusing to distribute at all would be
  * the worse reading of a typo. It is still said once, naming the value: an
@@ -549,7 +552,7 @@ export class AccountManager {
     // accounts by load instead of funnelling them all onto the current one.
     /** @type {SessionTracker} */
     this.sessionTracker = sessionTracker || new SessionTracker();
-    // 'off' | 'even' | 'adaptive'. `distributeSessions` stays a boolean beside
+    // 'off' | 'even' | 'adaptive' | 'load'. `distributeSessions` stays a boolean beside
     // it ("is distribution on at all") because the status readout, the TUI
     // header and the remote dashboard all ask only that question.
     this.distributionMode = distributionMode(distributeSessions);
@@ -2710,8 +2713,8 @@ export class AccountManager {
   setDistributeSessions(enabled, { drain = true } = {}) {
     const mode = distributionMode(enabled);
     if (mode !== 'off') {
-      // Includes switching BETWEEN 'even' and 'adaptive'. Neither drains: both
-      // keep a session pinned to its account, so only the choice made for the
+      // Includes switching BETWEEN 'even', 'adaptive' and 'load'. None drains:
+      // each keeps a session pinned to its account, so only the choice made for the
       // NEXT new session changes and no running session loses its prompt cache.
       this.distributionMode = mode;
       this.distributeSessions = true;
