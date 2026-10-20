@@ -112,18 +112,17 @@ In MITM mode the API host stays `api.anthropic.com`, so none of that applies. [P
 
 ## After updating TeamClaude
 
-The service keeps running the code it started with. After `teamclaude update` or an auto-update, restart it:
+The service keeps running the code it started with. After `teamclaude update` or an auto-update, restart it by re-running the install, which rewrites the LaunchAgent or `systemd --user` unit and restarts the proxy:
 
 ```bash
-teamclaude service install                    # macOS: rewrites the LaunchAgent and restarts the proxy
-systemctl --user restart teamclaude.service   # Linux: run after `teamclaude service install`
+teamclaude service install
 ```
 
-On Linux, `service install` rewrites the unit but does not restart a unit that is already running, hence the second command. A restart drops requests in flight, so do it between tasks. `teamclaude version` names the installed version and `teamclaude status --json` names the running one (`server.version`). While they differ, the restart is still due.
+A restart drops requests in flight, so do it between tasks. `teamclaude version` names the installed version and `teamclaude status --json` names the running one (`server.version`). While they differ, the restart is still due.
 
-A copy installed with another package manager, such as pnpm, is updated with that tool (`pnpm add -g @karpeleslab/teamclaude@latest`), since `teamclaude update` runs npm. Restart the service after that update too.
+A copy installed with pnpm is updated with pnpm (`pnpm add -g @karpeleslab/teamclaude@latest`, which `teamclaude update` prints for such a copy); one installed with another tool, such as Yarn or Bun, with that tool. Restart the service after that update too.
 
-Restart it the same way after `teamclaude env` or `teamclaude run` wrote a new CA. They do that when the stored certificate no longer names a host the proxy intercepts, such as `chatgpt.com` once the first Codex account is added, or has less than 30 days left. The running service keeps presenting the certificate it started with, so a new conversation that trusts the new CA fails its TLS handshake until the service restarts.
+Restart it as well when `teamclaude env` or `teamclaude run` warns that the MITM certificate is due for renewal: it no longer names a host the proxy intercepts (such as `chatgpt.com` once the first Codex account is added) or has less than 30 days left. While the proxy runs they keep the certificate it presents, and a starting proxy renews it. The renewal comes with a new CA, so after the restart, run `teamclaude env --mitm` again and check that the `NODE_EXTRA_CA_CERTS` path is unchanged (it is, unless you moved the config); conversations opened before the restart need reopening.
 
 ## Turning it off
 
