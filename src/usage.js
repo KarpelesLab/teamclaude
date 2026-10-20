@@ -18,6 +18,7 @@ import { join } from 'node:path';
 import { timingSafeEqual } from 'node:crypto';
 import { registerBuildFeature, BUILD_VERSION } from './build-identity.js';
 import { loadOrCreateConfig, loadState } from './config.js';
+import { quotaWindowDisplay, nativeQuotaWindows } from './usage-display.js';
 
 registerBuildFeature('usage-serve');
 
@@ -274,6 +275,8 @@ async function getStatusOrOffline(options = {}) {
       disabled: Boolean(a.disabled),
       status: a.disabled ? 'disabled' : 'active',
       quota: a.quota || {},
+      usageDisplay: a.usageDisplay,
+      quotaSourceType: a.quotaSource?.type || null,
       usage: a.usage || {},
       health: a.health || {},
     })),
@@ -388,6 +391,23 @@ export async function buildUsageDocument(options = {}) {
       });
     }
 
+    // Explicit provider profiles replace the legacy 5h/7d presentation.
+    // An absent native window is unknown, never an invented quota.
+    const windowProfile = quotaWindowDisplay(account);
+    if (windowProfile) {
+      const native = nativeQuotaWindows(account);
+      windows.splice(0, windows.length, ...native.map(w => ({
+        kind: w.bucketId || `${w.pool} ${w.period}`,
+        name: w.bucketId || `${w.pool} ${w.period}`,
+        disabled: Boolean(w.disabled),
+        observedUsedPercent: w.usedPercent ?? null,
+        usedPercent: w.disabled ? null : w.usedPercent ?? null,
+        remainingPercent: w.disabled || w.usedPercent == null ? null : Math.max(0, 100 - w.usedPercent),
+        resetsAt: formatIso(w.resetAt),
+        resetCountdownSeconds: computeCountdownSeconds(w.resetAt, now),
+      })));
+    }
+
     // Credits / Plan info
     let credits = null;
     if (tierFile?.planType || tierFile?.resetCredits != null) {
@@ -427,7 +447,7 @@ export async function buildUsageDocument(options = {}) {
       const resetText = w.resetCountdownSeconds != null ? `reset in ${formatDurationSimple(w.resetCountdownSeconds * 1000)}` : undefined;
       detailRows.push({
         label: w.name,
-        value: w.usedPercent != null ? `${w.usedPercent}% used` : 'n/a',
+        value: w.disabled ? 'inactive' : w.usedPercent != null ? `${w.usedPercent}% used` : 'n/a',
         secondaryValue: resetText,
       });
     }
@@ -474,6 +494,8 @@ export async function buildUsageDocument(options = {}) {
       current: isCurrent,
       isLastServed,
       windows,
+      windowProfile,
+      sessions: account.sessions ?? null,
       credits,
       usage: {
         inputTokens,
@@ -704,6 +726,10 @@ export function formatUsageReport(doc, { color = process.stdout.isTTY } = {}) {
     lines.push(`${prefix}${nameStr} ${typeStr} ${statusStr}${lastServedBadge}`);
 
     for (const w of p.windows || []) {
+      if (w.disabled) {
+        lines.push(`    ${cDim}${w.name.padEnd(16)}${cReset} inactive`);
+        continue;
+      }
       const bar = renderBar(w.usedPercent, 16);
       const used = w.usedPercent != null ? `${String(w.usedPercent).padStart(5)}% used` : '    -% used';
       const rem = w.remainingPercent != null ? `${String(w.remainingPercent).padStart(5)}% left` : '';

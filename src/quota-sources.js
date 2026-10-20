@@ -19,6 +19,7 @@
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { registerBuildFeature } from './build-identity.js';
+import { fetchSubscriptionQuota } from './subscription-quota.js';
 
 registerBuildFeature('native-quota-sources');
 
@@ -94,6 +95,13 @@ export async function fetchGoogleAntigravityUsage(source) {
     const usage = {
       fiveHour: bucketFromRemaining(found.fiveHour?.remainingFraction, found.fiveHour?.resetTime),
       sevenDay: bucketFromRemaining(found.sevenDay?.remainingFraction, found.sevenDay?.resetTime),
+      nativeWindowProvider: 'antigravity',
+      nativeWindows: (data.groups || []).flatMap(group => (group.buckets || []).flatMap(bucket => {
+        const window = bucketFromRemaining(bucket.remainingFraction, bucket.resetTime);
+        return window ? [{ bucketId: bucket.bucketId, usedPercent: window.utilization * 100,
+          group: group.displayName || null, period: bucket.window || null,
+          resetAt: window.resetAt }] : [];
+      })),
     };
     if (!usage.fiveHour && !usage.sevenDay) {
       return { error: `google-antigravity: no buckets matched ${JSON.stringify(bucketMap)}`, status: null };
@@ -107,55 +115,16 @@ export async function fetchGoogleAntigravityUsage(source) {
 // ── openai-codex ─────────────────────────────────────────────
 // GET chatgpt.com/backend-api/wham/usage with the codex access_token +
 // chatgpt-account-id (from the CLIProxyAPI codex auth file). The weekly
-// primary_window is real; this plan has NO real 5h window (secondary_window
-// null), so the Ses bucket is a SYNTHETIC burn-rate proxy computed from an
-// in-memory history of weekly-utilization samples (the proxy's jsonl, kept in
-// process instead of on disk). The synthetic value can NEVER reach
-// switchThreshold: it is capped at min(switchThreshold − 0.02, 0.95) so it
-// cannot trip account rotation (codex is the sole gpt56-route account).
-// A real ≤6h window, if the plan ever grows one, takes precedence.
+// Preserve only windows actually returned by the provider. No synthetic 5h quota.
 
 const CODEX_WHAM_URL = 'https://chatgpt.com/backend-api/wham/usage';
 const CODEX_UA = 'codex-quota-probe/2.0';
-// tokenFile (resolved) → [{t: epochSec, u: weeklyUtilization}] — pruned to a 6h
-// horizon each tick so it never grows unbounded.
-const codexBurnHistory = new Map();
-
 function secToMs(v) {
   if (typeof v !== 'number' || !Number.isFinite(v)) return null;
   return v < 1e12 ? v * 1000 : v;   // OpenAI resets are unix seconds → ms
 }
 
-/** Synthetic Ses burn-rate: (Δ weekly-utilization over the trailing ≤5h window)
- *  scaled to a full week. 1.0 == burning at the sustainable pace that consumes
- *  100% of weekly quota; >1.0 == on track to exhaust early. Needs ≥15min of
- *  history; a weekly reset (utilization drop) discards pre-reset samples. */
-function codexSynthetic5h(source, u7d, switchThreshold) {
-  const key = resolvePath(source?.tokenFile || '');
-  const nowSec = Math.floor(Date.now() / 1000);
-  const thresh = typeof switchThreshold === 'number' ? switchThreshold : 0.97;
-  const cap = Math.min(Math.max(thresh - 0.02, 0), 0.95);
-
-  const hist = codexBurnHistory.get(key) || [];
-  hist.push({ t: nowSec, u: u7d });
-  const recent = hist.filter(s => s.t >= nowSec - 21600);
-  // Most recent sample whose utilization exceeds current = the last weekly
-  // reset; drop it and everything before it so pace is measured post-reset.
-  const cut = recent.reduce((m, s) => (s.u > u7d ? Math.max(m, s.t) : m), 0);
-  const window5h = recent.filter(s => s.t > cut && s.t >= nowSec - 18000)
-    .sort((a, b) => a.t - b.t);
-  const old = window5h[0];
-
-  let ses = null;
-  if (old && nowSec - old.t >= 900) {
-    const pace = (u7d - old.u) / ((nowSec - old.t) / 604800);
-    ses = Math.round(Math.min(Math.max(pace, 0), cap) * 1000) / 1000;
-  }
-  codexBurnHistory.set(key, recent);
-  return ses != null ? { utilization: ses, resetAt: null } : null;
-}
-
-export async function fetchCodexUsage(source, ctx = {}) {
+export async function fetchCodexUsage(source) {
   try {
     const auth = await readJson(source?.tokenFile);
     if (!auth) return { error: 'openai-codex: no tokenFile', status: null };
@@ -193,20 +162,23 @@ export async function fetchCodexUsage(source, ctx = {}) {
       resetAt: secToMs(weeklyWin.reset_at),
     } : null;
 
-    // Real 5h: a window ≤6h, if one exists. Takes precedence over the proxy.
+    // Compatibility fields for routing; display retains exact native durations.
     const fiveWin = windows.find(w => isWindow(w) && w.limit_window_seconds <= 21600) || null;
-    let fiveHour = fiveWin ? {
+    const fiveHour = fiveWin ? {
       utilization: (fiveWin.used_percent ?? 0) / 100,
       resetAt: secToMs(fiveWin.reset_at),
     } : null;
 
-    if (!fiveHour && sevenDay) {
-      fiveHour = codexSynthetic5h(source, sevenDay.utilization, ctx?.switchThreshold);
-    }
     if (!fiveHour && !sevenDay) {
       return { error: 'openai-codex: no rate_limit windows in response', status: null };
     }
-    return { fiveHour, sevenDay };
+    return { fiveHour, sevenDay, nativeWindowProvider: 'codex',
+      nativeWindows: windows.filter(isWindow).map(w => ({
+        bucketId: `${w.limit_window_seconds / 3600}h`,
+        windowSeconds: w.limit_window_seconds,
+        usedPercent: typeof w.used_percent === 'number' ? w.used_percent : null,
+        resetAt: secToMs(w.reset_at),
+      })) };
   } catch (err) {
     return { error: err?.message || String(err), status: null };
   }
@@ -285,6 +257,10 @@ export async function fetchSakanaUsage(source) {
  *  for the codex synthetic-5h cap). */
 export async function fetchQuotaFor(source, ctx = {}) {
   switch (source?.type) {
+    case 'cursor-subscription':
+    case 'antigravity-subscription':
+    case 'codex-subscription':
+      return fetchSubscriptionQuota(source);
     case 'deepseek-balance':
       return fetchDeepSeekBalance(source);
     case 'google-antigravity':

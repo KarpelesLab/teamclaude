@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { AccountManager } from '../src/account-manager.js';
 import { renderStatus } from '../src/status-renderer.js';
 
 const now = Date.parse('2026-07-03T12:00:00Z');
@@ -125,4 +126,49 @@ test('renderStatus sanitizes probe errors', () => {
   const output = renderStatus(status, { color: false, now });
   assert.match(output, /bad red/);
   assert.doesNotMatch(output, /\x1b\[31m/);
+});
+
+test('provider display switch preserves actual windows, usage and session counts', () => {
+  const status = sampleStatus();
+  status.sessions = { active: 1, known: 2 };
+  const account = status.accounts[0];
+  account.sessions = 1;
+  account.usageDisplay = 'codex';
+  account.quota = { unified5h: 0.95, nativeWindowProvider: 'codex', nativeWindows: [
+    { bucketId: '168h', windowSeconds: 604800, usedPercent: 26, resetAt: now + 60000 },
+  ] };
+  let output = renderStatus(status, { color: false, now });
+  assert.match(output, /168h.*26%/);
+  assert.doesNotMatch(output, /5h|95%|Session\s+\[/);
+  assert.match(output, /1 sess/);
+  assert.match(output, /2 req, 1.5k tok/);
+  account.usageDisplay = 'antigravity';
+  output = renderStatus(status, { color: false, now });
+  assert.match(output, /antigravity quota unknown/);
+  assert.doesNotMatch(output, /168h/);
+});
+
+test('Cursor renders monthly native windows selected by configuration', () => {
+  const status = sampleStatus();
+  const a = status.accounts[0];
+  a.usageDisplay = 'cursor';
+  a.quota = { subscription: { provider: 'cursor', windows: [
+    { pool: 'auto', period: 'monthly', usedPercent: 12, resetAt: now + 60000 },
+  ] } };
+  const output = renderStatus(status, { color: false, now });
+  assert.match(output, /auto monthly.*12%/);
+  assert.doesNotMatch(output, /Session\s+\[|Weekly\s+\[/);
+
+});
+
+test('status retains configured Antigravity family when the other family has capacity', () => {
+  const time = Date.now();
+  const am = new AccountManager([{ name: 'gemini-only', type: 'apikey', apiKey: 'test',
+    quotaSource: { type: 'antigravity-subscription', family: 'gemini' } }]);
+  am.applyUsageData(0, { subscription: { provider: 'antigravity', observedAt: time,
+    windows: ['gemini', '3p'].flatMap(pool => ['5h', 'weekly'].map(period =>
+      ({ pool, period, usedPercent: pool === 'gemini' ? 100 : 0, resetAt: time + 100000 }))) } });
+  const status = am.getStatus();
+  assert.equal(status.accounts[0].subscriptionSource.family, 'gemini');
+  assert.match(renderStatus(status, { color: false, now: time }), /subscription-quota-exhausted/);
 });

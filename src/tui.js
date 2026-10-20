@@ -1,8 +1,9 @@
 import { BUILD_VERSION } from './build-identity.js';
+import { subscriptionSummary } from './subscription-quota.js';
 import { createWriteStream } from 'node:fs';
 import { importCredentials, fetchProfile } from './oauth.js';
 import { sameIdentity } from './identity.js';
-import { USAGE_DISPLAYS, normalizeUsageDisplay, usesBalanceDisplay, balanceSummary } from './usage-display.js';
+import { USAGE_DISPLAYS, normalizeUsageDisplay, usesBalanceDisplay, balanceSummary, quotaWindowDisplay, nativeQuotaSummary } from './usage-display.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -557,7 +558,8 @@ export class TUI {
     });
     const selected = this.am.accounts[this.usageIdx || 0];
     lines.push('', dim('  Session: session and weekly quota. Balance: API account credit.'),
-      dim('  Auto: balance when available; otherwise the existing quota display.'),
+      dim('  Antigravity / Cursor / Codex: provider-specific quota windows.'),
+      dim('  Auto: use the configured quota source, then balance or legacy display.'),
       dim('  Display format does not change routing or quota limits.'));
     if (selected) lines.push('', `  ${balanceSummary(selected)}`);
   }
@@ -1101,6 +1103,17 @@ export class TUI {
     }
     status = rpad(status, 10);
 
+    if (quotaWindowDisplay(a)) {
+      const mode = quotaWindowDisplay(a);
+      const matches = a.quota?.subscription?.provider === mode;
+      let summary = matches && a.quota?.subscription ? subscriptionSummary(a) : nativeQuotaSummary(a);
+      if (!matches && a.quota?.nativeWindows?.length) {
+        const observed = a.quota.observedAt;
+        if (!Number.isFinite(observed)) summary += ' (? unverified)';
+        else if (Date.now() - observed > QUOTA_STALE_MS) summary += ` (~ ${formatAge(Date.now() - observed)} old)`;
+      }
+      return ` ${sel}${cur} ${startSlot}${name} ${type} ${status} ${summary}`;
+    }
     if (usesBalanceDisplay(a)) {
       return ` ${sel}${cur} ${startSlot}${name} ${type} ${status} ${balanceSummary(a)}`;
     }

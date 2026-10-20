@@ -1,4 +1,5 @@
-import { usesBalanceDisplay, balanceSummary } from './usage-display.js';
+import { usesBalanceDisplay, balanceSummary, quotaWindowDisplay, nativeQuotaWindows } from './usage-display.js';
+import { subscriptionAdmission } from './subscription-quota.js';
 
 const ESC = '\x1b[';
 const RESET = `${ESC}0m`;
@@ -154,6 +155,17 @@ function modelRoutingLine(account, threshold, now, paint) {
 }
 
 function quotaLines(account, now, paint) {
+  if (quotaWindowDisplay(account)) {
+    const windows = nativeQuotaWindows(account);
+    if (!windows.length) return [`${paint.dim('Quota'.padEnd(8))} ${paint.gray(`${quotaWindowDisplay(account)} quota unknown`)}`];
+    const labels = { fiveHour: '5h', weekly: 'weekly', monthly: 'monthly' };
+    const lines = windows.map(w => w.disabled ? `${w.bucketId || `${w.pool} ${labels[w.period] || w.period}`} inactive` : formatQuotaLine(
+      w.bucketId || `${w.pool} ${labels[w.period] || w.period}`,
+      w.usedPercent == null ? null : w.usedPercent / 100, w.resetAt, now, paint));
+    const admission = subscriptionAdmission({ ...account, quotaSource: account.subscriptionSource || account.quotaSource }, null, now);
+    if (!admission.allowed) lines.push(paint.yellow(admission.reason));
+    return lines;
+  }
   if (usesBalanceDisplay(account)) return [balanceSummary(account, now)];
   const quota = account.quota || {};
   const lines = [];

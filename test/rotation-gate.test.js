@@ -336,7 +336,7 @@ test('failed failover attempt does not self-mark (mark only status<300)', () => 
 
 // ── typed 409 before hold loop (fix #3) ──────────────────────
 
-test('gate-blocked session gets typed 409 BEFORE holdBudget sleep (no lying 429)', async () => {
+for (const includeUnknown of [false, true]) test(`gate-blocked session gets typed 409 before hold and unknown-quota fallback (${includeUnknown})`, async () => {
   const upstream = http.createServer((_req, res) => {
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end('{"ok":true}');
@@ -347,6 +347,9 @@ test('gate-blocked session gets typed 409 BEFORE holdBudget sleep (no lying 429)
     custom('sakana', `http://127.0.0.1:${upPort}`, {
       priority: 10, acceptsHistoryFamilies: ['anthropic', 'sakana'],
     }),
+    ...(includeUnknown ? [custom('cursor', `http://127.0.0.1:${upPort}`, {
+      quotaSource: { type: 'cursor-subscription' }, acceptsHistoryFamilies: ['kimi'],
+    })] : []),
   ], 0.98);
   // Poison session, then disable the only compatible account.
   am.noteServedFamily('poison', 0);

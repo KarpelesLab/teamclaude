@@ -236,3 +236,23 @@ test('TUI routes editor: delete removes the selected route', async () => {
   assert.deepEqual(config.routes, [{ name: 'bulk', match: ['*opus*'] }]);
   assert.deepEqual(applied.routes, config.routes);
 });
+
+test('native quota rows mark failed canonical probes and old legacy readings', () => {
+  const am = new AccountManager(['codex', 'antigravity'].map(provider => ({ name: provider,
+    type: 'apikey', apiKey: 'test', quotaSource: { type: `${provider}-subscription` } })));
+  for (const a of am.accounts) {
+    a.quota.subscription = { provider: a.name, observedAt: Date.now(),
+      windows: [{ pool: 'primary', period: 'weekly', usedPercent: 10, resetAt: Date.now() + 100000 }] };
+    a.subscriptionError = 'probe failed';
+  }
+  const tui = Object.create(TUI.prototype); tui.am = am; tui.mode = 'normal'; tui.selIdx = -1;
+  for (const i of [0, 1]) assert.match(stripAnsi(tui._renderAcct(i, 8, true, [])), /stale\/unavailable/);
+  const a = am.accounts[0]; delete a.quota.subscription;
+  a.quotaSource = { type: 'openai-codex' };
+  a.quota.nativeWindowProvider = 'codex';
+  a.quota.nativeWindows = [{ bucketId: '168h', usedPercent: 10 }];
+  a.quota.observedAt = Date.now() - 86400000;
+  assert.match(stripAnsi(tui._renderAcct(0, 8, true, [])), /old/);
+  a.quota.observedAt = null;
+  assert.match(stripAnsi(tui._renderAcct(0, 8, true, [])), /unverified/);
+});

@@ -58,83 +58,29 @@ test('fetchCodexUsage parses the real wham/usage weekly window', async (t) => {
     assert.ok(!usage.error, `unexpected error: ${usage.error}`);
     assert.equal(Math.round(usage.sevenDay.utilization * 100) / 100, 0.26);   // 26%
     assert.equal(usage.sevenDay.resetAt, 1786160027 * 1000);                  // seconds → ms
-    assert.equal(usage.fiveHour, null);    // fresh history → synthetic 5h not yet available
+    assert.equal(usage.fiveHour, null);    // provider reports no short window
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test('codex synthetic 5h builds from history and respects the cap', async (t) => {
+test('weekly-only Codex never invents a short window as usage increases', async (t) => {
   const { file, dir } = makeCodexTokenFile();
-  let nowMs = Date.parse('2026-08-02T00:00:00Z');
-  let call = 0;
-  const pct = [26, 30];   // utilization climbs hard over 20 min
+  let percent = 26;
   try {
-    t.mock.method(Date, 'now', () => nowMs);
-    t.mock.method(globalThis, 'fetch', async () =>
-      fakeRes(JSON.stringify(wham(pct[Math.min(call++, pct.length - 1)])), 200));
-    const src = { type: 'openai-codex', tokenFile: file };
-
-    const u1 = await fetchCodexUsage(src, { switchThreshold: 0.98 });
-    assert.equal(u1.fiveHour, null);                 // <15min history
-
-    nowMs += 20 * 60 * 1000;                          // +20 min
-    const u2 = await fetchCodexUsage(src, { switchThreshold: 0.98 });
-    // pace = (0.30-0.26) / (1200/604800) = 20.16 → clamped to
-    // min(switchThreshold-0.02, 0.95) = min(0.96, 0.95) = 0.95 (ceiling dominates)
-    assert.equal(u2.fiveHour.utilization, 0.95);
-    assert.equal(u2.fiveHour.resetAt, null);
-    assert.equal(u2.sevenDay.utilization, 0.30);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+    t.mock.method(globalThis, 'fetch', async () => fakeRes(JSON.stringify(wham(percent))));
+    const source = { type: 'openai-codex', tokenFile: file };
+    await fetchCodexUsage(source);
+    percent = 30;
+    const usage = await fetchCodexUsage(source);
+    assert.equal(usage.fiveHour, null);
+    assert.equal(usage.nativeWindows.length, 1);
+    assert.equal(usage.nativeWindows[0].windowSeconds, 604800);
+    assert.equal(usage.nativeWindows[0].usedPercent, 30);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('codex synthetic 5h computes a sub-cap pace', async (t) => {
-  const { file, dir } = makeCodexTokenFile();
-  let nowMs = Date.parse('2026-08-02T00:00:00Z');
-  let call = 0;
-  const pct = [26, 26.1];   // gentle climb over 30 min
-  try {
-    t.mock.method(Date, 'now', () => nowMs);
-    t.mock.method(globalThis, 'fetch', async () =>
-      fakeRes(JSON.stringify(wham(pct[Math.min(call++, pct.length - 1)])), 200));
-    const src = { type: 'openai-codex', tokenFile: file };
-
-    await fetchCodexUsage(src, { switchThreshold: 0.98 });   // seed sample
-    nowMs += 30 * 60 * 1000;                                  // +30 min
-    const u2 = await fetchCodexUsage(src, { switchThreshold: 0.98 });
-    // pace = (0.261-0.26)/(1800/604800) = 0.336 — below cap, kept as-is
-    assert.equal(Math.round(u2.fiveHour.utilization * 1000) / 1000, 0.336);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test('codex synthetic 5h discards pre-reset samples', async (t) => {
-  const { file, dir } = makeCodexTokenFile();
-  let nowMs = Date.parse('2026-08-02T00:00:00Z');
-  let call = 0;
-  const pct = [26, 30, 10];   // weekly reset drops utilization back to 10%
-  try {
-    t.mock.method(Date, 'now', () => nowMs);
-    t.mock.method(globalThis, 'fetch', async () =>
-      fakeRes(JSON.stringify(wham(pct[Math.min(call++, pct.length - 1)])), 200));
-    const src = { type: 'openai-codex', tokenFile: file };
-
-    await fetchCodexUsage(src, { switchThreshold: 0.98 });
-    nowMs += 20 * 60 * 1000;
-    await fetchCodexUsage(src, { switchThreshold: 0.98 });   // climbs to 30%
-    nowMs += 20 * 60 * 1000;
-    const u3 = await fetchCodexUsage(src, { switchThreshold: 0.98 });   // reset to 10%
-    assert.equal(u3.sevenDay.utilization, 0.10);
-    assert.equal(u3.fiveHour, null);    // pre-reset samples discarded → no old sample
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test('real secondary_window takes precedence over the synthetic 5h', async (t) => {
+test('real secondary_window is retained when actually returned', async (t) => {
   const { file, dir } = makeCodexTokenFile();
   try {
     t.mock.method(globalThis, 'fetch', async () =>
@@ -202,15 +148,12 @@ test('fetchQuotaFor dispatches openai-codex', async (t) => {
   }
 });
 
-test('Prober.probeQuotaSourceAccount applies codex quota with the real switchThreshold', async (t) => {
+test('Codex refresh clears legacy synthetic 5h values', async (t) => {
   const { file, dir } = makeCodexTokenFile();
   let nowMs = Date.parse('2026-08-02T00:00:00Z');
   let call = 0;
   const pct = [26, 30];
   try {
-    // switchThreshold 0.50 → synthetic cap = min(0.48, 0.95) = 0.48. If the cap
-    // instead used the default 0.97 it would be 0.95 — so 0.48 proves the
-    // accountManager's real switchThreshold reached the synthetic 5h.
     const am = new AccountManager(
       [{ name: 'codex-gpt56', type: 'apikey', apiKey: 'k', quotaSource: { type: 'openai-codex', tokenFile: file } }],
       0.50);
@@ -219,12 +162,13 @@ test('Prober.probeQuotaSourceAccount applies codex quota with the real switchThr
     t.mock.method(globalThis, 'fetch', async () =>
       fakeRes(JSON.stringify(wham(pct[Math.min(call++, pct.length - 1)])), 200));
 
+    am.accounts[0].quota.unified5h = 0.48;
     await prober.probeQuotaSourceAccount(am.accounts[0]);
     assert.equal(Math.round(am.accounts[0].quota.unified7d * 100) / 100, 0.26);
 
     nowMs += 20 * 60 * 1000;
     await prober.probeQuotaSourceAccount(am.accounts[0]);
-    assert.equal(am.accounts[0].quota.unified5h, 0.48);
+    assert.equal(am.accounts[0].quota.unified5h, null);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

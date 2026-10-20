@@ -10,6 +10,7 @@
 import { execFile } from 'node:child_process';
 import { fetchUsage } from './oauth.js';
 import { fetchQuotaFor } from './quota-sources.js';
+import { isSubscriptionSource } from './subscription-quota.js';
 
 export class Prober {
   constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, timeoutMs = 10_000, log = console.log } = {}) {
@@ -30,11 +31,19 @@ export class Prober {
   }
 
   start() {
-    if (this.intervalMs > 0) this.reschedule(this.intervalMs);
+    this.reschedule(this.intervalMs);
   }
 
   /** Change interval at runtime (0 = off). Probes once immediately when on. */
   reschedule(intervalMs) {
+    for (const account of this.am.accounts) {
+      if (account.disabled || account.retired || !isSubscriptionSource(account.quotaSource)) continue;
+      const maxAge = account.quotaSource.maxAgeMs ?? 90000;
+      if (!Number.isFinite(maxAge) || maxAge <= 0 || !Number.isFinite(intervalMs)
+          || intervalMs <= 0 || intervalMs > maxAge / 3) {
+        throw new Error('Subscription quota sources require positive quotaProbeSeconds <= maxAgeMs / 3000 (default: 30 seconds)');
+      }
+    }
     const wasOn = this.intervalMs > 0 && this.timer;
     this.intervalMs = intervalMs;
     if (this.timer) { clearInterval(this.timer); this.timer = null; }
@@ -132,7 +141,9 @@ export class Prober {
     try {
       const usage = await this._withTimeout(
         fetchQuotaFor(source, { switchThreshold: this.am.switchThreshold }));
+      if (isSubscriptionSource(source) && source !== account.quotaSource) return;
       if (!usage || usage.error) {
+        if (isSubscriptionSource(source)) account.subscriptionError = usage?.error || 'Subscription quota probe timed out';
         if (source === account.balanceSource) account.balanceError = usage?.error || 'Balance refresh timed out';
         const finishedAt = Date.now();
         this._recordAccount(account, {
@@ -155,6 +166,8 @@ export class Prober {
         durationMs: finishedAt - startedAt,
       });
     } catch (err) {
+      if (isSubscriptionSource(source) && source !== account.quotaSource) return;
+      if (isSubscriptionSource(source)) account.subscriptionError = 'Subscription quota refresh failed';
       if (source === account.balanceSource) account.balanceError = 'Balance refresh failed';
       const finishedAt = Date.now();
       this._recordAccount(account, {

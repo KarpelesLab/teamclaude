@@ -17,6 +17,46 @@ import {
 const CLI = join(dirname(fileURLToPath(import.meta.url)), '..', 'src', 'index.js');
 const FIXTURE_TIME = Date.parse('2026-08-14T10:00:00.000Z');
 
+test('native usage document preserves inactive windows and never invents a Codex 5h window', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'tc-native-usage-'));
+  try {
+    const doc = await buildUsageDocument({
+      status: { accounts: [
+        { name: 'antigravity', usageDisplay: 'antigravity', quota: { subscription: {
+          provider: 'antigravity', windows: [
+            { pool: '3p', period: '5h', usedPercent: 0, disabled: true },
+            { pool: '3p', period: 'weekly', usedPercent: 100 },
+          ],
+        } } },
+        { name: 'codex', usageDisplay: 'codex', quota: {
+          unified5h: 0.15, subscription: { provider: 'codex', windows: [
+            { pool: 'standard', period: 'weekly', usedPercent: 15 },
+          ] },
+        } },
+        { name: 'cursor', usageDisplay: 'cursor', quota: { subscription: {
+          provider: 'cursor', windows: ['auto', 'api', 'total'].map(pool =>
+            ({ pool, period: 'monthly', usedPercent: 10 })),
+        } } },
+      ] },
+      config: {}, quotaDir: dir, modelRouteDir: dir, now: FIXTURE_TIME,
+    });
+    const inactive = doc.providers[0].windows[0];
+    assert.equal(inactive.disabled, true);
+    assert.equal(inactive.observedUsedPercent, 0);
+    assert.equal(inactive.usedPercent, null);
+    assert.equal(inactive.remainingPercent, null);
+    assert.equal(doc.providers[0].details.rows.find(row => row.label === '3p 5h').value, 'inactive');
+    assert.equal(doc.providers[0].details.bars.length, 1);
+    assert.deepEqual(doc.providers[1].windows.map(w => w.kind), ['standard weekly']);
+    assert.deepEqual(doc.providers[2].details.bars.map(b => b.label), ['auto monthly', 'api monthly', 'total monthly']);
+    const report = formatUsageReport(doc, { color: false });
+    assert.match(report, /3p 5h\s+inactive/);
+    assert.doesNotMatch(report, /100% left/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 function createSampleFixture() {
   return {
     config: {
