@@ -9,7 +9,7 @@ How TeamClaude decides which account serves a request, and what it does when tha
 3. OAuth tokens expiring within 5 minutes are automatically refreshed and persisted to config.
 4. Rate limit headers from the API (`anthropic-ratelimit-unified-*`) track session (5h) and weekly (7d) quota utilization.
 5. When usage reaches the threshold, the proxy switches to the best available account (see [Choosing an account](#choosing-an-account)).
-6. On retryable 429 responses, the proxy uses the quota or throttle rules below. An upstream 429 with `x-should-retry: false` goes straight to the client.
+6. On retryable 429 responses, the proxy uses the quota or throttle rules below. An upstream 429 with `x-should-retry: false` and no spent quota window goes straight to the client.
 7. Transient network errors (connection reset, timeout) drop the connection so the client can retry.
 8. If all accounts are exhausted, returns 429 with the soonest reset time — or, with [`holdSeconds`](quota.md#hold-on-exhaustion) set, holds the connection open and retries silently until an account recovers.
 9. Client token refresh requests (`/v1/oauth/token`) are relayed to upstream untouched — the proxy and client manage their own token lifecycles independently.
@@ -24,7 +24,7 @@ When it does have to pick, ranking is: lowest `priority` number first, then, amo
 
 Reacting the wrong way to either one makes things worse, so they are handled separately.
 
-- An upstream **`429` with `x-should-retry: false`** is an explicit refusal of this request. TeamClaude returns its original status, body, and allowed response headers, even if `retry-after` or quota headers are present. It does not retry, switch accounts, or pause the account: unrelated requests can still use it. The client decides what to do with the refusal.
+- An upstream **`429` with `x-should-retry: false`** is an explicit refusal of this request. TeamClaude returns its original status, body, and allowed response headers, even if `retry-after` is present. A 429 that also marks a quota window spent (`5h`, `7d` or `7d_oi` status `rejected`, or a spent Codex window) is still a quota rejection and switches accounts as below. It does not retry, switch accounts, or pause the account: unrelated requests can still use it. The client decides what to do with the refusal.
 
 - A **quota rejection** (a spent 5h or weekly bucket, `unified-…-status: rejected`) switches accounts immediately.
 - A **rate-limit 429** (the per-minute throttle) does **not** switch. It pauses the account so concurrent requests wait instead of flooding, retries the same account (absorbing short `retry-after`s inline, default ≤ 60s via `TEAMCLAUDE_RATE_LIMIT_ABSORB_MAX_SECONDS`), and only surfaces a 429 to the client for longer waits.
