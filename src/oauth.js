@@ -146,6 +146,19 @@ const DEFAULT_TOKEN_ENDPOINT = 'https://platform.claude.com/v1/oauth/token';
 const DEFAULT_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 
 /**
+ * A Retry-After header in milliseconds: delta-seconds or an HTTP date (RFC 9110
+ * §10.2.3). Undefined when absent or unparseable.
+ * @param {string|null|undefined} value
+ * @param {number} [now]
+ */
+export function parseRetryAfterMs(value, now = Date.now()) {
+  if (typeof value !== 'string' || !value.trim()) return undefined;
+  if (/^\d+$/.test(value.trim())) return Number(value.trim()) * 1000;
+  const at = Date.parse(value);
+  return Number.isFinite(at) ? Math.max(0, at - now) : undefined;
+}
+
+/**
  * Refresh an expired OAuth access token using the refresh token.
  * Retries on 5xx and network errors with exponential backoff.
  * `routing` is the account's own egress proxy (account-routing.js); null goes
@@ -205,6 +218,12 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
         // transient server error. 5xx is retried above; reaching here with a 5xx
         // means retries were exhausted, which is still transient, not auth.
         err.status = res.status;
+        // A 429 says how long to stay away; the account holds its refreshes
+        // for that long (AccountManager.ensureTokenFresh).
+        if (res.status === 429) {
+          const retryAfterMs = parseRetryAfterMs(res.headers.get('retry-after'));
+          if (retryAfterMs !== undefined) /** @type {any} */ (err).retryAfterMs = retryAfterMs;
+        }
         throw err;
       }
 

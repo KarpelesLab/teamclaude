@@ -891,14 +891,69 @@ test('a token that works is still not stored until renewed: a quota reading and 
   assert.ok(!store.calls.some((x) => x.method === 'PATCH' || (x.method === 'POST' && x.path === 'User/Credential')));
 });
 
-test('a token read at launch with no row is renewed without a lock, and the renewal is what gets stored', async () => {
-  const { am, store, refreshed } = setup([claude('a')], { minted: false });
+test('a token read at launch with no row is renewed under the lock of a placeholder holding no token, which the renewal fills', async () => {
+  const { am, store, refreshed, sent } = setup([claude('a')], { minted: false });
+  const key = syncKeyFor(am.accounts[0]);
+  let atGrant = null;
+  am._refreshFn = async (rt) => {
+    refreshed.push(rt);
+    sent.push({ locked: !!store.byKey(key)?.Locked });
+    atGrant = store.blob(key);
+    return { accessToken: `${rt}-renewed-at`, refreshToken: `${rt}-renewed-rt`, expiresAt: store.now() + 8 * H };
+  };
   await am.ensureTokenFresh(0, true);
   assert.deepEqual(refreshed, ['rt-a-1']);
-  assert.ok(!store.calls.some((c) => c.path.endsWith(':lock')), 'no row was made from the launch token to lock');
-  await new Promise((r) => setImmediate(r));
-  assert.equal(store.blob(syncKeyFor(am.accounts[0])).accessToken, 'rt-a-1-renewed-at');
+  assert.equal(sent[0].locked, true, 'the lock was held as the grant went out');
+  assert.equal(atGrant.pending, true);
+  assert.equal(atGrant.accountUuid, 'uuid-a');
+  assert.ok(!('accessToken' in atGrant) && !('refreshToken' in atGrant), 'the launch token was never stored');
+  assert.equal(decodeBlob(JSON.stringify(atGrant)), null, 'a placeholder reads as no blob');
+  assert.equal(store.blob(key).accessToken, 'rt-a-1-renewed-at');
+  assert.equal(store.byKey(key).Locked, null, 'released');
   assert.equal(am.accounts[0]._minted, true);
+});
+
+test('two installs holding the same launch token with no row: one renews, the other adopts (#554)', async () => {
+  const store = makeStore();
+  const one = setup([claude('a')], { store, minted: false });
+  const two = setup([claude('a')], { store, minted: false });
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  one.am._refreshFn = async (rt) => { one.refreshed.push(rt); await gate; return { accessToken: 'at-one', refreshToken: 'rt-one', expiresAt: store.now() + 8 * H }; };
+  const oneDone = one.am.ensureTokenFresh(0, true);
+  for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r));
+  assert.ok(store.byKey(syncKeyFor(claude('a'))).Locked, 'one holds the placeholder\'s lock');
+  two.sync.sleep = async (ms) => { store.tick(ms); release(); await oneDone; };
+  await two.am.ensureTokenFresh(0, true);
+  await oneDone;
+  assert.deepEqual(one.refreshed, ['rt-a-1']);
+  assert.deepEqual(two.refreshed, [], 'two never called the provider');
+  assert.equal(two.am.accounts[0].credential, 'at-one');
+  assert.equal(two.am.accounts[0].refreshToken, 'rt-one');
+  assert.equal(store.rows.size, 1);
+  assert.equal(store.blob(syncKeyFor(claude('a'))).accessToken, 'at-one');
+});
+
+test('a placeholder left by a renewal that failed for now is no account, no sign-in needed, and the next renewal locks it', async () => {
+  const store = makeStore();
+  const one = setup([claude('a')], { store, minted: false, refresh: () => { throw Object.assign(new Error('Token refresh failed (429)'), { status: 429 }); } });
+  await one.am.ensureTokenFresh(0, true);
+  assert.equal(one.am.accounts[0].status !== 'error', true, 'a 429 is not a rejection');
+  const key = syncKeyFor(claude('a'));
+  assert.equal(store.blob(key).pending, true);
+
+  await one.sync.sync();
+  assert.deepEqual(one.sync.summary().signInNeeded, 0);
+  assert.equal(store.blob(key).pending, true, 'a pass of the unrenewed account writes nothing');
+  const other = setup([claude('b')], { store });
+  assert.equal((await other.sync.sync()).added, 0, 'no account made from a placeholder');
+
+  const two = setup([claude('a')], { store, minted: false });
+  await two.am.ensureTokenFresh(0, true);
+  assert.deepEqual(two.refreshed, ['rt-a-1']);
+  assert.ok(store.calls.filter((c) => c.path.endsWith(':lock')).length >= 2, 'both renewals took the lock');
+  assert.equal(store.blob(key).accessToken, 'rt-a-1-renewed-at');
+  assert.equal(store.rows.size, 2);
 });
 
 // ── an account in error ──────────────────────────────────────

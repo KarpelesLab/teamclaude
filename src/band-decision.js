@@ -34,8 +34,12 @@ const WEEKLY_WINDOW_SECONDS = 7 * 24 * 3600;
  * One account as the decision sees it, deliberately not an account object: the
  * decision layer cannot reach anything it was not handed.
  *
+ * `limit` is how far the window may be spent: the account's `maxUsage` cap where
+ * it has one, 1 (or absent) otherwise. Pressure is the room under it, so a
+ * capped account is not priced on quota it is not allowed to use.
+ *
  * @typedef {{ index: number, priority: number, utilization: number | null,
- *             resetAt: number | null }} BandAccount
+ *             resetAt: number | null, limit?: number | null }} BandAccount
  */
 
 /**
@@ -84,7 +88,7 @@ export function pressureOf(account, now) {
   if (!Number.isFinite(account.utilization)) {
     return { kind: 'absent', reason: 'utilization-not-finite' };
   }
-  const spendable = spendableFraction(account.utilization);
+  const spendable = spendableFraction(account.utilization, account.limit ?? 1);
   if (!account.resetAt) {
     return { kind: 'absent', reason: 'no-reset', lowerBound: spendable / WEEKLY_WINDOW_SECONDS };
   }
@@ -98,13 +102,16 @@ export function pressureOf(account, now) {
     : { kind: 'absent', reason: 'utilization-not-finite' };
 }
 
-/** How much of a window is left to spend. Clamped at both ends: above 1 is real
- * overage and leaves nothing, below 0 would read as MORE headroom than the
- * window has. Shared by the measured pressure and the unknown-reset bound so the
+/** How much of a window is left to spend, up to `limit`. Clamped at both ends:
+ * past the limit is overage and leaves nothing, below 0 would read as MORE
+ * headroom than the window has. Shared by the measured pressure and the
+ * unknown-reset bound so the two cannot disagree about what an account is
+ * holding.
  * @param {number} utilization
- * two cannot disagree about what an account is holding. */
-function spendableFraction(utilization) {
-  return 1 - Math.min(1, Math.max(0, utilization));
+ * @param {number} limit */
+function spendableFraction(utilization, limit) {
+  const cap = Math.min(1, Math.max(0, limit));
+  return Math.max(0, cap - Math.min(1, Math.max(0, utilization)));
 }
 
 /**

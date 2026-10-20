@@ -279,6 +279,20 @@ test('a Codex row keeps its Ses cell while a session reading is still present', 
   assert.match(rows[1], /k2@x\.com .*Ses .*Wk /, rows[1]);
 });
 
+test('a Claude row that reports a five-hour window and no weekly window draws only the Ses bar', () => {
+  const am = fleet([claude('a@x.com'), claude('team@x.com'), claude('idle@x.com'), codex('k@x.com')]);
+  am.accounts[0].quota = { unified5h: 0.1, unified5hReset: Date.now() + h, unified7d: 0.2, unified7dReset: Date.now() + 24 * h, weeklyWindowStated: true };
+  am.accounts[1].quota = { unified5h: 0.38, unified5hReset: Date.now() + h, unified7d: null, weeklyWindowStated: false };
+  // Its session window expired: the row keeps its shape rather than swinging back to Ses/Wk.
+  am.accounts[2].quota = { unified5h: null, unified7d: null, weeklyWindowStated: false };
+  const rows = accountRows(screen(am, 160).lines).map(r => halves(r)[0]).filter(r => r.trim());
+  assert.match(rows[0], /a@x\.com +active +Ses .*Wk /);
+  assert.match(rows[1], /team@x\.com +active +Ses /);
+  assert.doesNotMatch(rows[1], /Wk/);
+  assert.match(rows[2], /idle@x\.com +active +Ses /);
+  assert.doesNotMatch(rows[2], /Wk/);
+});
+
 test('an account that has not reported yet keeps the Ses column, so it does not come and go at startup', () => {
   const am = fleet([claude('a@x.com'), codex('k1@x.com'), codex('k2@x.com')]);
   noSessionWindow(am.accounts[1]);

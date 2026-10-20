@@ -10,6 +10,7 @@ import { sanitizeToolPairs } from './tool-pair-sanitize.js';
 import { sanitizeCacheControl, cacheControlSubfieldsToStrip } from './cache-control-sanitize.js';
 import { sanitizeContentBlocks, contentBlockTypesToStrip } from './content-block-sanitize.js';
 import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
+import { isTokenExpired } from './oauth.js';
 import { TopLevelFieldFinder, modelGlobMatches, parseRequestEffort, parseRequestStream } from './model.js';
 import { conversationDigest, pinKeyFor } from './conversation.js';
 import { BodyWriter, truncationNote } from './request-log.js';
@@ -566,7 +567,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // Dispatched BEFORE the loopback-only checks below: a page cannot make a
       // browser emit an absolute-form request line, the relay injects no fleet
       // credential, and its Host header names the TARGET, not this proxy.
-      if (/^https?:\/\//i.test(req.url || '')) { relayHttpForward(req, res, shouldStripOverageHeaders(config)); return; }
+      if (/^https?:\/\//i.test(req.url || '')) { relayHttpForward(req, res, shouldStripOverageHeaders(config), config.proxy); return; }
 
       // A request admitted ONLY by the loopback exemption — no valid key — is
       // held to two more conditions. Both target the same actor: a web page in
@@ -1234,7 +1235,7 @@ export function describeConnectError(err) {
 // client's own headers — no account selection, no token injection,
 // content-encoding passed through (a transparent forward proxy). Anthropic is
 // HTTPS-only, so in practice this only ever sees third-party hosts.
-export function relayHttpForward(req, res, stripOverage = false) {
+export function relayHttpForward(req, res, stripOverage = false, /** @type {Record<string, any>|null} */ proxyConfig = null) {
   let target;
   try { target = new URL(req.url); } catch {
     res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -1266,6 +1267,11 @@ export function relayHttpForward(req, res, stripOverage = false) {
     const lk = key.toLowerCase();
     // Drop hop-by-hop + proxy-control headers; `host` is reset from the target.
     if (lk.startsWith(':') || HOP_BY_HOP_HEADERS.has(lk) || lk === 'proxy-connection') continue;
+    // x-api-key may authenticate to this proxy or to the destination API.
+    // Consume our own keys, preserving unrelated application credentials. With
+    // no usable key configured every value "resolves", so that case keeps it.
+    if (lk === 'x-api-key' && !resolveClientAuth(proxyConfig, undefined).ok
+      && resolveClientAuth(proxyConfig, value).ok) continue;
     headers[key] = value;
   }
 
@@ -1305,6 +1311,14 @@ export function relayHttpForward(req, res, stripOverage = false) {
 // by the client's user like the identity plane above; a rotated account's token
 // sees them as not found.
 //
+// The claude.ai connector list (/v1/mcp_servers) is the same plane. Claude Code
+// calls each listed connector on mcp-proxy.anthropic.com, a host this proxy
+// blind-tunnels, so those calls always carry the client's own credential. A
+// list fetched under a rotated account names THAT account's connector ids, and
+// mcp-proxy answers each one "Server not found" under the client's login: the
+// session starts without its claude.ai connectors whenever rotation is off the
+// client's own account.
+//
 // The Remote Control bridge is the same plane under other prefixes. Since
 // Claude Code 2.1.287 `claude remote-control` honours HTTPS_PROXY
 // (anthropics/claude-code#97352), so its control calls arrive here too:
@@ -1329,7 +1343,7 @@ export function relayHttpForward(req, res, stripOverage = false) {
 // does not take `/v1/sessionsX`. The entry without that slash, the collection
 // itself, matches as well, since a session is created with a bare
 // POST /v1/sessions (classificationPath has already dropped any `?beta=true`).
-const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/', '/api/frame/', '/v1/environments/', '/v1/sessions/', '/v2/session_ingress/', '/v2/ccr-sessions/'];
+const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/', '/api/frame/', '/v1/mcp_servers/', '/v1/environments/', '/v1/sessions/', '/v2/session_ingress/', '/v2/ccr-sessions/'];
 
 /**
  * Whether a classified path is on the client's own identity plane: below an
@@ -1879,8 +1893,9 @@ function reportFailure(...args) {
 
 // A status the client can act on: upstream said something about THIS request.
 // A 4xx IS an answer — it tells the client something true about what it sent,
-// and a session getting legitimate 400s is working, not starving. A 429 is a
-// refusal to answer and a 5xx is a failure to.
+// and a session getting legitimate 400s is working, not starving. An ordinary
+// 429 is a refusal to answer (an explicit x-should-retry: false is handled at
+// the relay), and a 5xx is a failure to.
 function answeredStatus(status) {
   // 401 is excluded on purpose. It is about the credential the PROXY injected,
   // which the client never sees and cannot act on — a fleet whose keys have all
@@ -2989,6 +3004,58 @@ export async function peekStreamFailure(stream, bounds = {}) {
   };
 }
 
+/**
+ * Why each refused account failed, for the client. An account whose last token
+ * refresh failed (and none has succeeded since) was refused because its token
+ * could not be renewed, and that reason is named — the coordinator's (the store's
+ * lock denied) or the token endpoint's (a 429). A re-login does not touch either,
+ * so it is advised only when the endpoint rejected the refresh token itself, and
+ * for a refusal with no failed renewal behind it, with the status upstream
+ * actually answered.
+ * @param {{ accounts: Record<string, any>[] }} accountManager
+ * @param {Set<string>} rejected  the refused accounts' names
+ * @param {Map<string, number>|undefined} statuses  the status each one got
+ */
+function refusalMessage(accountManager, rejected, statuses) {
+  const parts = [...rejected].map((name) => {
+    const account = accountManager.accounts.find(a => a.name === name);
+    const failure = account?._lastRefreshFailure;
+    // A refresh token the endpoint rejected IS fixed by a re-login; say so then.
+    if (failure) return `the token of "${name}" could not be renewed: ${failure.reason}${[400, 401, 403].includes(failure.status) ? '. Re-add it with: teamclaude login' : ''}`;
+    return `upstream refused the credential for account "${name}" (${statuses?.get(name) ?? 403}). Check the account, then re-add it with: teamclaude login`;
+  });
+  const text = parts.join('; ');
+  return `${text.charAt(0).toUpperCase()}${text.slice(1)}`;
+}
+
+/**
+ * The answer when the accounts a request reached all held an expired token that
+ * could not be renewed. 503 with a short Retry-After: the renewal may go through
+ * on the next request (the lock freed, the token endpoint back). Never a 401 or
+ * a 403 — the client's own credential is fine.
+ * @param {import('node:http').ServerResponse} res
+ * @param {Record<string, any>} ctx
+ * @param {{ accounts: Record<string, any>[] }} accountManager
+ */
+function respondUnrenewed(res, ctx, accountManager) {
+  const names = [...ctx.unrenewed].map((/** @type {string} */ n) => `"${safeLine(n, 64)}"`).join(', ');
+  // Each renewal's own failure, as refusalMessage names it: the store's lock
+  // denied, or the token endpoint's answer.
+  const failures = [...ctx.unrenewed].map((/** @type {string} */ n) => accountManager.accounts.find((a) => a.name === n)?._lastRefreshFailure).filter(Boolean);
+  const reasons = failures.map(f => f.reason);
+  // A refresh token the endpoint rejected IS fixed by a re-login; say so then.
+  const relogin = failures.some(f => [400, 401, 403].includes(f.status)) ? ' Re-add it with: teamclaude login' : '';
+  ctx.status = 503;
+  ctx.account = `(${[...ctx.unrenewed].join(', ')} not renewed)`;
+  if (!res.headersSent) {
+    res.writeHead(503, { 'Content-Type': 'application/json', 'retry-after': '30' });
+    res.end(JSON.stringify({
+      type: 'error',
+      error: { type: 'overloaded_error', message: `No account served this request: the token of ${names} has expired and could not be renewed${reasons.length ? ` (${reasons.join('; ')})` : ''}.${relogin || ' Retry shortly.'}` },
+    }));
+  }
+}
+
 export async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, useSx) {
   const maxRetries = accountManager.accounts.length;
   // This function is exported, so a caller may hand us a ctx built elsewhere.
@@ -3046,7 +3113,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   const account = hopTo != null
     ? accountManager.accounts[hopTo]
     : ctx.pinnedIndex != null
-      ? (pinned && !pinnedWrongProvider && !accountManager.capExceeded(pinned, ctx.model) ? pinned : null)
+      ? (pinned && !pinnedWrongProvider && !accountManager.capBars(pinned, ctx.model, ctx.advisorModel) ? pinned : null)
       : accountManager.getActiveAccount(
         ctx.tried, ctx.model, ctx.advisorModel, ctx.pinKey, ctx.provider, selection,
       );
@@ -3072,6 +3139,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     return;
   }
   if (!account) {
+    // Every account this request reached held an expired token that could not be
+    // renewed, and nothing else was tried: say that, not a refusal or a quota.
+    if (ctx.unrenewed?.size && [...ctx.tried].every(i => ctx.unrenewed.has(accountManager.accounts[i]?.name))
+        && (ctx.pinnedIndex != null || ctx.tried.size === accountManager.accounts.length)) {
+      return respondUnrenewed(res, ctx, accountManager);
+    }
     // Every candidate was refused by upstream (403). Waiting will not help — the
     // account needs attention, not a retry — so say so plainly rather than
     // reporting a rate limit. Not a 403 either: the client's own credential is
@@ -3098,7 +3171,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       } else if (allEntitlementDenied) {
         message = `No account served this request. Every configured account returned OAuth entitlement denial (${OAUTH_ENTITLEMENT_ERROR_CODE}): ${names}. TeamClaude temporarily removed them from automatic rotation; retry after the cooldown or pin a different eligible account.`;
       } else {
-        message = `Upstream refused the credential for account ${names} (403). Check the account, then re-add it with: teamclaude login`;
+        message = refusalMessage(accountManager, rejected, ctx.rejectedStatus);
       }
       ctx.status = 502;
       ctx.account = `(${[...rejected].join(', ')} refused)`;
@@ -3233,6 +3306,20 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     ctx.tried.add(account.index);
     return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
   }
+  // The token has expired and the refresh did not replace it: the coordinator
+  // stood down (another install renewing, the store's lock not to be had) or the
+  // token endpoint failed for now. Upstream will not take it, so it is not sent:
+  // its 401 would force a refresh that fails the same way, and the retry would
+  // send it again. The account sits this request out.
+  if (account.type === 'oauth' && account.refreshToken && !account.upstream && isTokenExpired(account.expiresAt)) {
+    (ctx.unrenewed ??= new Set()).add(account.name);
+    ctx.tried.add(account.index);
+    console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}": token expired and not renewed; not sending it upstream`);
+    if (ctx.pinnedIndex == null && retryCount < maxRetries) {
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+    }
+    return respondUnrenewed(res, ctx, accountManager);
+  }
   // The refresh just found this account's routing proxy down (it arms the
   // cooldown). The forward would leave by the same proxy and fail the same
   // way, up to a full connect timeout later, so move on now. A pin still
@@ -3362,6 +3449,16 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       ctx.tried.add(account.index);
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
+    // Same for a cap: a reading that arrived while this request waited can have
+    // put the account at its maxUsage, and a cap is zero requests past it. Not
+    // a retry — nothing was sent — so the budget is not spent; `tried` grows by
+    // one account each time, which bounds the re-selection. A pin re-enters
+    // its own check and is refused there.
+    if (accountManager.capBars(account, ctx.model, ctx.advisorModel)) {
+      accountManager.release(account.index, { successful: false });
+      ctx.tried.add(account.index);
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
+    }
     let upstreamRes;
     let admittedLoad = 0;
     try {
@@ -3402,7 +3499,18 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         rateLimitHeaders[key] = value;
       }
     }
-    accountManager.updateQuota(account.index, rateLimitHeaders, ctx.model);
+    // A spent quota window is still the account's verdict whatever
+    // x-should-retry says: that 429 is the one rotation exists for, so it keeps
+    // the quota path below. Only the windows that path acts on count; an
+    // overage status of `rejected` is the normal state of a subscription
+    // without extra usage and says nothing about this request.
+    const quotaWindowRejected = ['5h', '7d', '7d_oi'].some(w => rateLimitHeaders[`anthropic-ratelimit-unified-${w}-status`] === 'rejected')
+      || codexSpentWindows(rateLimitHeaders).length > 0;
+    const nonRetryable429 = upstreamRes.status === 429 && !quotaWindowRejected
+      && upstreamRes.headers.get('x-should-retry')?.trim().toLowerCase() === 'false';
+    // This refusal is about the request, even if it carries incidental quota
+    // headers. Do not store those headers as an account-wide quota verdict.
+    if (!nonRetryable429) accountManager.updateQuota(account.index, rateLimitHeaders, ctx.model);
 
     // Any response at all came back through the account's routing proxy.
     accountManager.clearRoutingFailed(account.index);
@@ -3417,10 +3525,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // _selectProbe) clear its own hold and return the fleet to service.
     if (upstreamRes.status !== 429) accountManager.clearRateLimited(account.index);
 
-    // Two kinds of 429 are handled differently below: a quota rejection rotates
-    // to another account; a transient rate-limit throttle pauses + retries the
-    // same account (never rotates — see #84).
-    if (upstreamRes.status === 429) {
+    // Other 429s retain their established classification: quota rejection
+    // rotates, while a transient throttle pauses and retries.
+    // An explicit no-retry response reaches the normal relay untouched instead.
+    if (upstreamRes.status === 429 && !nonRetryable429) {
       // Clamp Retry-After to a sane window: missing/invalid falls back to 60s,
       // and out-of-range values are bounded to [1, 300]. A negative value would
       // otherwise bypass the wait cap — setTimeout returns immediately and a
@@ -3760,6 +3868,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // refused" (fail fast, nothing to wait for) from "this one was, others are
       // just out of quota" (still worth holding for a reset).
       (ctx.credentialRejected ??= new Set()).add(account.name);
+      (ctx.rejectedStatus ??= new Map()).set(account.name, 403);
       if (entitlementDenied) (ctx.entitlementDenied ??= new Set()).add(account.name);
       ctx.tried.add(account.index);
       const cooldown = deniedUntil
@@ -3804,6 +3913,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
           : 'upstream rejected its token (401) and it has no refresh token');
       }
       (ctx.credentialRejected ??= new Set()).add(account.name);
+      (ctx.rejectedStatus ??= new Map()).set(account.name, 401);
       ctx.tried.add(account.index);
       console.error(`[TeamClaude] 401 on "${safeLine(account.name, 64)}"; failing over to another account`);
       if (clientGone(res)) { ctx.abandoned = true; return; }
@@ -3863,6 +3973,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     getLog()?.write(`\n\n=== RESPONSE ${upstreamRes.status} ===\n${formatHeaders(upstreamRes.headers)}`);
 
     ctx.status = upstreamRes.status;
+    // A request-specific refusal is an answer, not a starving session.
+    const deliveredStatus = nonRetryable429 || answeredStatus(upstreamRes.status);
 
     // Build response headers (skip hop-by-hop and encoding headers). The
     // connection-specific names are also illegal on an HTTP/2 response — when
@@ -3904,7 +4016,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       const l = getLog();
       if (l) { l.body('RESPONSE BODY', null); l.end(); }
       res.end();
-      ctx.delivered = answeredStatus(upstreamRes.status);
+      ctx.delivered = deliveredStatus;
       return;
     }
 
@@ -3920,7 +4032,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         // which is the failure the token counters cannot see, since a stream
         // that emitted message_start has already recorded a usage report.
         if (clientGone(res)) ctx.abandoned = true;
-        else ctx.delivered = answeredStatus(upstreamRes.status);
+        else ctx.delivered = deliveredStatus;
       } finally {
         // Also on the failure path: without the note a capped body reads as a
         // stream that simply stopped, which is the other thing that happens here.
@@ -3933,7 +4045,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       const l = getLog();
       if (l) { l.body('RESPONSE BODY', buf, contentType); l.end(); }
       res.end(buf);
-      ctx.delivered = answeredStatus(upstreamRes.status);
+      ctx.delivered = deliveredStatus;
     }
   } catch (err) {
     // Two of the things that can throw here are not upstream errors at all:

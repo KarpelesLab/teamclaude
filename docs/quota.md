@@ -106,7 +106,7 @@ The burn-rate learner behind [adaptive distribution](routing.md#adaptive-distrib
 | field | `null` when |
 |---|---|
 | `ratePerHour` | the learner has no rate for this window yet; the assumed starting rate (`initialBurnRate`) is never reported as one |
-| `reachesThresholdAt` | no rate, a rate of zero, the account is already at or above its threshold, or the window's reset has passed and the reading is from the old window. It can lie in the past when the reading is old |
+| `reachesThresholdAt` | no rate, a rate of zero, the account is already at or above its threshold, the window's reset has passed and the reading is from the old window, or the reach time is more than 14 days ahead. The learned rate decays toward zero on an idle account without reaching it, so without that limit an idle account would report a time centuries away, or one that is not a valid date. A weekly window resets within 7 days, so a time past 14 days never comes before a reset. It can lie in the past when the reading is old |
 | `resetAt` | the window reports no reset, or it has passed |
 
 What the rate is. It is the learner's moving average of how fast utilization rose, measured over windows of `burnWindowMs` between readings no more than `maxSampleAgeMs` apart (see [`adaptiveDistribution`](configuration.md)). It counts all spend on the account, the proxy's and [outside spend](#spend-from-outside-the-proxy) alike. Like any moving average it reflects the recent past: a burst that has stopped keeps the forecast short until flat readings bring the rate down, and an account with no fresh readings keeps its last rate. The projection starts when the utilization was read, not at the status read, so an old reading counts down rather than repeating the same distance; once its projected time has passed, the status text drops it. With the [quota probe](#quota-probe) off, an idle account gets no readings, so its forecast is as old as its last traffic.
@@ -214,7 +214,14 @@ At the cap, that account receives **nothing**:
 
 - rotation skips it, reporting `capped` (or `advisor-capped`) in `teamclaude status`;
 - the all-exhausted revalidation probe skips it, unlike a `switchThreshold` decision;
-- a pinned request (`TC_ACCT`, `/tc-acct/<name>`) gets the exhausted answer rather than spending past the cap. A pin still never leaks to another account.
+- a pinned request (`TC_ACCT`, `/tc-acct/<name>`) gets the exhausted answer rather than spending past the cap. A pin still never leaks to another account;
+- the paid fallback, and the last-resort revival of a throttled account when nothing is available, skip it too;
+- a request that waited in admission is checked again before it is sent, and moves elsewhere if a reading during the wait put the account at its cap;
+- an advisor request also checks the advisor model's own family cap on every one of these paths (under `advisorEligibility: "prefer"` the advisor is a preference, so only the executor's caps apply).
+
+A family reading (Fable, Sonnet) at or past the cap is kept until its window resets, or for a week when no reset time is known. An uncapped spent family reading is revalidated after 30 minutes instead, because only a request of that family can refresh it; for a capped one that request would go past the cap.
+
+With [expiry-pressure routing](routing.md#expiry-pressure-routing) on, a capped account's pressure is the room left under its cap, not under 100%: an account at 0.6 with a 0.7 cap has 0.1 to spend before its reset. For a family window the shared weekly cap also bounds that room, since family spend counts against both.
 
 Caps are model-scoped exactly like thresholds. `unified5h` and `unified7d` stop every model; `unified7dFable` stops only Fable, so the example above keeps serving Opus and Sonnet from the same account after Fable is done. The cap binds at the level you set (`>=`), and a window that has reset is never capped on the old reading.
 
