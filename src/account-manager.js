@@ -2517,6 +2517,8 @@ export class AccountManager {
       delete a.quota.subscription;
       delete a.quota.nativeWindows;
       delete a.quota.nativeWindowProvider;
+      for (const key of ['unified5h', 'unified7d', 'unified7dSonnet', 'unified7dFable',
+        'unified5hReset', 'unified7dReset', 'unified7dSonnetReset', 'unified7dFableReset']) a.quota[key] = null;
       a.subscriptionError = null;
     }
     set('costTier', Number.isFinite(disk.costTier) ? disk.costTier : 0);

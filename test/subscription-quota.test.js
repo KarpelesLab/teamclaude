@@ -99,6 +99,28 @@ test('failed refresh blocks a previously healthy subscription until a successful
   assert.equal(am._isAvailable(am.accounts[0], 'probe'), true);
 });
 
+test('replacing or removing a quota source clears its exhausted legacy windows', () => {
+  for (const quotaSource of [null, { type: 'codex-subscription' }]) {
+    const config = { ...account(), quotaAdmission: 'usage' };
+    const am = new AccountManager([config]);
+    const a = am.accounts[0];
+    for (const key of ['unified5h', 'unified7d', 'unified7dSonnet', 'unified7dFable']) {
+      a.quota[key] = 1;
+      a.quota[`${key}Reset`] = Date.now() + 7 * 86400000;
+    }
+    am.updateAccountPolicy(0, { ...config, quotaSource });
+    if (quotaSource) am.applyUsageData(0, { subscription: {
+      provider: 'codex', observedAt: Date.now(), admissionAllowed: true,
+      windows: [{ pool: 'primary', period: 'weekly', windowSeconds: 604800, usedPercent: 10, resetAt: Date.now() + 86400000 }],
+    } });
+    assert.equal(am._isAvailable(a, 'probe'), true);
+    for (const key of ['unified5h', 'unified7d', 'unified7dSonnet', 'unified7dFable']) {
+      assert.equal(a.quota[key], null);
+      assert.equal(a.quota[`${key}Reset`], null);
+    }
+  }
+});
+
 test('a failed probe for a replaced source cannot poison the new account observation', async () => {
   const config = account();
   config.quotaSource.tokenFile = '/nonexistent-teamclaude-test-token';
