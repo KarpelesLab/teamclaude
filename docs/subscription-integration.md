@@ -41,6 +41,8 @@ The primary live target is Cursor Grok 4.7. The required order is real-machine a
 
 Cursor sources consume the authenticated CLIProxyAPI management endpoint. TeamClaude does not read their provider credentials.
 
+Enable probing with top-level `quotaProbeSeconds: 30`. Subscription sources require a positive probe interval no greater than `maxAgeMs / 3000` seconds, leaving two-thirds of the freshness budget for scheduling and fetch delays. With the default `maxAgeMs: 90000`, use `30` seconds or less. Startup and interval changes reject disabled or slower probing while an enabled subscription account exists. Failed observations still deny routing.
+
 ```json
 {
   "usageDisplay": "cursor",

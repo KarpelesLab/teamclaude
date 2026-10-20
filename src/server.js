@@ -1336,7 +1336,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       !a.disabled && (ctx.pinnedIndex == null || a.index === ctx.pinnedIndex)
       && accountManager._routeAllows(a, ctx.model)
       && subscriptionAdmission(a, ctx.model).reason === 'subscription-quota-unknown');
-    if (unknownSubscription) {
+    if (ctx.pinnedIndex != null && unknownSubscription) {
       ctx.status = 503;
       res.writeHead(503, { 'Content-Type': 'application/json', 'retry-after': '30' });
       res.end(JSON.stringify({ type: 'error', error: {
@@ -1400,6 +1400,15 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         final: true, outcome: 'session-history-incompatible', response_status: 409,
         account: ctx.account, attempt: ctx.attempt || 0,
       });
+      return;
+    }
+
+    if (unknownSubscription) {
+      ctx.status = 503;
+      res.writeHead(503, { 'Content-Type': 'application/json', 'retry-after': '30' });
+      res.end(JSON.stringify({ type: 'error', error: {
+        type: 'api_error', message: 'Subscription quota unavailable; request not admitted.',
+      } }));
       return;
     }
 

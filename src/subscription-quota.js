@@ -2,6 +2,12 @@ import { readFile } from 'node:fs/promises';
 
 export const isSubscriptionSource = source =>
   ['cursor-subscription', 'antigravity-subscription', 'codex-subscription'].includes(source?.type);
+function mappedModel(account, model) {
+  if (model == null) return null;
+  const value = Object.hasOwn(account.modelMap || {}, model) ? account.modelMap[model] : model;
+  return typeof value === 'string' ? value : null;
+}
+const ownFamily = (families, model) => Object.hasOwn(families || {}, model) ? families[model] : null;
 const validPercent = n => typeof n === 'number' && Number.isFinite(n) && n >= 0;
 
 /** Consume CLIProxyAPI's canonical observation; provider auth/parsing stays there. */
@@ -66,7 +72,8 @@ export function subscriptionAdmission(account, model = null, now = Date.now()) {
       return { allowed: false, reason: 'subscription-quota-unknown' };
     }
     if (q.includedRemaining <= 0) return { allowed: false, reason: 'subscription-quota-exhausted' };
-    const actual = account.modelMap?.[model] || model;
+    const actual = mappedModel(account, model);
+    if (model != null && actual == null) return { allowed: false, reason: 'subscription-quota-unknown' };
     const nativeModel = actual?.replace(/^cursor\//, '');
     const pool = q.autoBucketModels.includes(nativeModel) ? 'auto' : 'api';
     windows = windows.filter(w => w.pool === 'total' || (model ? w.pool === pool : false));
@@ -115,9 +122,10 @@ function antigravityAdmission(account, model, now) {
   const unknown = { allowed: false, reason: 'subscription-quota-unknown' };
   if (!validAntigravityObservation(q)) return unknown;
   const source = account.quotaSource;
-  const actual = account.modelMap?.[model] || model;
+  const actual = mappedModel(account, model);
+  if (model != null && actual == null) return unknown;
   const native = actual?.replace(/^antigravity\//, '');
-  const selected = source.modelFamilies?.[actual] || source.modelFamilies?.[model]
+  const selected = ownFamily(source.modelFamilies, actual) || ownFamily(source.modelFamilies, model)
     || source.family || (native?.startsWith('gemini-') ? 'gemini' : native?.startsWith('claude-') ? '3p' : null);
   const check = pool => {
     const windows = q.windows.filter(w => w.pool === pool);

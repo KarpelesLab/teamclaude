@@ -285,3 +285,42 @@ test('canonical quota accounts still record request counts without reading adapt
   assert.equal(a.quota.unified5h, null);
   assert.deepEqual(a.quota.subscription, snapshot);
 });
+
+test('quota model resolution ignores prototype names and rejects non-string mappings', () => {
+  const now = Date.now(), a = account();
+  a.quota.subscription = cursorSnapshot(cursorData(now), now);
+  for (const model of ['constructor', 'toString', '__proto__']) {
+    assert.doesNotThrow(() => subscriptionAdmission(a, model, now));
+  }
+  a.modelMap.broken = {};
+  assert.equal(subscriptionAdmission(a, 'broken', now).reason, 'subscription-quota-unknown');
+  const ag = { quotaSource: { type: 'antigravity-subscription', modelFamilies: {} }, modelMap: {},
+    quota: { subscription: { provider: 'antigravity', observedAt: now, windows: ['5h', 'weekly']
+      .map(period => ({ pool: 'gemini', period, usedPercent: 10, resetAt: now + 100000 })) } } };
+  for (const model of ['constructor', 'toString', '__proto__']) {
+    assert.equal(subscriptionAdmission(ag, model, now).reason, 'subscription-quota-unknown');
+  }
+  ag.modelMap.broken = 5;
+  assert.equal(subscriptionAdmission(ag, 'broken', now).reason, 'subscription-quota-unknown');
+});
+
+test('subscription probing rejects disabled or stale schedules before creating a timer', async () => {
+  const { Prober } = await import('../src/prober.js');
+  const am = new AccountManager([account()]);
+  for (const intervalMs of [0, -1, 60000, 90000, NaN]) {
+    const prober = new Prober(am, { intervalMs, log: () => {} });
+    assert.throws(() => prober.start(), /positive quotaProbeSeconds/);
+    assert.equal(prober.timer, null);
+  }
+  const prober = new Prober(am, { intervalMs: 30000, log: () => {} });
+  let probes = 0;
+  prober.probeAll = async () => { probes++; };
+  try {
+    prober.start();
+    assert.equal(probes, 1);
+    assert.ok(prober.timer);
+    const timer = prober.timer;
+    assert.throws(() => prober.reschedule(0), /positive quotaProbeSeconds/);
+    assert.equal(prober.timer, timer);
+  } finally { prober.stop(); }
+});

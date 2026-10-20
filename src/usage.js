@@ -397,7 +397,7 @@ export async function buildUsageDocument(options = {}) {
     if (windowProfile) {
       const native = nativeQuotaWindows(account);
       windows.splice(0, windows.length, ...native.map(w => ({
-        kind: w.period || w.bucketId,
+        kind: w.bucketId || `${w.pool} ${w.period}`,
         name: w.bucketId || `${w.pool} ${w.period}`,
         disabled: Boolean(w.disabled),
         observedUsedPercent: w.usedPercent ?? null,

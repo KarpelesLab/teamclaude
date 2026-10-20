@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { AccountManager } from '../src/account-manager.js';
 import { renderStatus } from '../src/status-renderer.js';
 
 const now = Date.parse('2026-07-03T12:00:00Z');
@@ -158,4 +159,16 @@ test('Cursor renders monthly native windows selected by configuration', () => {
   assert.match(output, /auto monthly.*12%/);
   assert.doesNotMatch(output, /Session\s+\[|Weekly\s+\[/);
 
+});
+
+test('status retains configured Antigravity family when the other family has capacity', () => {
+  const time = Date.now();
+  const am = new AccountManager([{ name: 'gemini-only', type: 'apikey', apiKey: 'test',
+    quotaSource: { type: 'antigravity-subscription', family: 'gemini' } }]);
+  am.applyUsageData(0, { subscription: { provider: 'antigravity', observedAt: time,
+    windows: ['gemini', '3p'].flatMap(pool => ['5h', 'weekly'].map(period =>
+      ({ pool, period, usedPercent: pool === 'gemini' ? 100 : 0, resetAt: time + 100000 }))) } });
+  const status = am.getStatus();
+  assert.equal(status.accounts[0].subscriptionSource.family, 'gemini');
+  assert.match(renderStatus(status, { color: false, now: time }), /subscription-quota-exhausted/);
 });

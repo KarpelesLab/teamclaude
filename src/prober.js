@@ -31,11 +31,19 @@ export class Prober {
   }
 
   start() {
-    if (this.intervalMs > 0) this.reschedule(this.intervalMs);
+    this.reschedule(this.intervalMs);
   }
 
   /** Change interval at runtime (0 = off). Probes once immediately when on. */
   reschedule(intervalMs) {
+    for (const account of this.am.accounts) {
+      if (account.disabled || account.retired || !isSubscriptionSource(account.quotaSource)) continue;
+      const maxAge = account.quotaSource.maxAgeMs ?? 90000;
+      if (!Number.isFinite(maxAge) || maxAge <= 0 || !Number.isFinite(intervalMs)
+          || intervalMs <= 0 || intervalMs > maxAge / 3) {
+        throw new Error('Subscription quota sources require positive quotaProbeSeconds <= maxAgeMs / 3000 (default: 30 seconds)');
+      }
+    }
     const wasOn = this.intervalMs > 0 && this.timer;
     this.intervalMs = intervalMs;
     if (this.timer) { clearInterval(this.timer); this.timer = null; }

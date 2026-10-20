@@ -919,6 +919,8 @@ export class AccountManager {
 
   _isProbeable(account) {
     if (!account) return false;
+    // Canonical subscriptions refresh through the quota reader, never inference.
+    if (isSubscriptionSource(account.quotaSource)) return false;
     // Never probe an account the operator has taken out of rotation or one
     // whose token is broken — those are hard states, not stale guesses.
     if (account.disabled) return false;
@@ -2692,6 +2694,7 @@ export class AccountManager {
         subscriptionSource: isSubscriptionSource(a.quotaSource) ? {
           type: a.quotaSource.type,
           pool: a.quotaSource.pool || null,
+          family: a.quotaSource.family || null,
           maxAgeMs: a.quotaSource.maxAgeMs ?? 90000,
         } : null,
         usage: { ...a.usage },
