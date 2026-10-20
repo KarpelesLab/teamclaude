@@ -73,7 +73,11 @@ test('fetchGoogleAntigravityUsage parses the real summary payload', async (t) =>
     // gemini-weekly → unified7d
     assert.equal(Math.round(usage.sevenDay.utilization * 10000) / 10000, 0.0052);
     assert.equal(usage.sevenDay.resetAt, Date.parse('2026-08-05T18:42:51Z'));
-    // 3p buckets are NOT picked up by the default gemini bucketMap
+    // Legacy routing map is Gemini-only, but dashboard retains both families.
+    assert.equal(usage.nativeWindows.length, 4);
+    assert.deepEqual(usage.nativeWindows.map(w => w.bucketId),
+      ['gemini-weekly', 'gemini-5h', '3p-weekly', '3p-5h']);
+    assert.equal(usage.nativeWindows[2].group, 'Claude and GPT models');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

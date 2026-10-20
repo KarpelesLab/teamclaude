@@ -5,6 +5,8 @@ import { SessionTracker } from './session-tracker.js';
 import { invalidateNormalizedConfigView } from './model-namespace.js';
 import { registerBuildFeature } from './build-identity.js';
 import { RotationLedger, resolveHistoryFamily } from './rotation-ledger.js';
+import { subscriptionAdmission, isSubscriptionSource } from './subscription-quota.js';
+import { normalizeUsageDisplay } from './usage-display.js';
 
 registerBuildFeature('dynamic-routing');
 registerBuildFeature('dynrank-model-fidelity');
@@ -176,7 +178,7 @@ function makeAccount(acct, index) {
     // probeCommand: an account declares one quota authority.
     quotaSource: acct.quotaSource || null,
     balanceSource: acct.balanceSource || null,
-    usageDisplay: ['auto', 'session', 'balance'].includes(acct.usageDisplay) ? acct.usageDisplay : 'auto',
+    usageDisplay: normalizeUsageDisplay(acct.usageDisplay),
     // Model fidelity hint for dynrank. When unset it is DETECTED from the
     // modelMap (identity = faithful, remap = translated) or the account type
     // (oauth = native Anthropic = faithful; apikey = opaque adapter =
@@ -1174,6 +1176,8 @@ export class AccountManager {
       return 'circuit-open';
     }
     if (account.upstream && circuitProbeClaimFresh(account)) return 'probe-held';
+    const subscription = subscriptionAdmission(account, model);
+    if (!subscription.allowed) return subscription.reason;
     if (this._isNearQuota(account, model)) return 'quota-exhausted';
     if (this._isTokenBudgetTripped(account)) return 'token-budget';
     if (model && !this._routeAllows(account, model)) return 'route-excluded';
@@ -1679,6 +1683,7 @@ export class AccountManager {
   }
 
   _isNearQuota(account, model = null) {
+    if (!subscriptionAdmission(account, model).allowed) return true;
     if (account.quotaAdmission === 'upstream') return false;
     const q = account.quota;
     const now = Date.now();
@@ -2112,6 +2117,9 @@ export class AccountManager {
     const account = this.accounts[accountIndex];
     if (!account) return;
 
+    account.usage.totalRequests++;
+    account.usage.lastUsed = new Date().toISOString();
+
     // Native quotaSource is the single authority for this account's unified
     // quota. Skip header parsing so an adapter-stamped value cannot fight the
     // in-process probe (which is fresher and runs on the probe cadence).
@@ -2168,8 +2176,6 @@ export class AccountManager {
     if (tokensReset) account.quota.resetsAt = tokensReset;
     else if (requestsReset) account.quota.resetsAt = requestsReset;
 
-    account.usage.totalRequests++;
-    account.usage.lastUsed = new Date().toISOString();
 
     // Log when approaching quota
     if (this._isNearQuota(account)) {
@@ -2304,7 +2310,24 @@ export class AccountManager {
     const account = this.accounts[accountIndex];
     if (!account || !usage) return;
     const q = account.quota;
-    if (usage.balance) q.balance = structuredClone(usage.balance);
+    if (usage.balance) q.balance = globalThis.structuredClone(usage.balance);
+    if (usage.nativeWindows) {
+      q.nativeWindows = globalThis.structuredClone(usage.nativeWindows);
+      q.nativeWindowProvider = usage.nativeWindowProvider;
+      // Clear a missing short window, including old synthetic Codex readings.
+      if (usage.nativeWindowProvider === 'codex' && !usage.fiveHour) {
+        q.unified5h = null;
+        q.unified5hReset = null;
+      }
+    }
+    if (usage.subscription) {
+      q.subscription = globalThis.structuredClone(usage.subscription);
+      // Canonical pools replace legacy Claude-shaped probe readings. Retaining
+      // those fields could gate Gemini on Claude or invent a Codex 5h limit.
+      for (const key of ['unified5h', 'unified7d', 'unified7dSonnet', 'unified7dFable',
+        'unified5hReset', 'unified7dReset', 'unified7dSonnetReset', 'unified7dFableReset']) q[key] = null;
+      account.subscriptionError = null;
+    }
 
     // Quota freshness. `observedAt` is when the READING was taken, which is not
     // always when we applied it: a state-file-backed probe can succeed right now
@@ -2485,8 +2508,15 @@ export class AccountManager {
     };
     set('priority', disk.priority || 0);
     set('quotaAdmission', disk.quotaAdmission === 'upstream' ? 'upstream' : 'usage');
-    set('usageDisplay', ['auto', 'session', 'balance'].includes(disk.usageDisplay) ? disk.usageDisplay : 'auto');
+    set('usageDisplay', normalizeUsageDisplay(disk.usageDisplay));
     set('balanceSource', disk.balanceSource || null);
+    if (JSON.stringify(a.quotaSource) !== JSON.stringify(disk.quotaSource || null)) {
+      set('quotaSource', disk.quotaSource || null);
+      delete a.quota.subscription;
+      delete a.quota.nativeWindows;
+      delete a.quota.nativeWindowProvider;
+      a.subscriptionError = null;
+    }
     set('costTier', Number.isFinite(disk.costTier) ? disk.costTier : 0);
     set('upstream', disk.upstream || null);
     set('modelMap', disk.modelMap || null);
@@ -2655,7 +2685,15 @@ export class AccountManager {
         sessions: sessions.perAccount[a.index] || 0,
         quota: { ...a.quota },
         usageDisplay: a.usageDisplay,
+        quotaSourceType: a.quotaSource?.type || null,
         balanceError: a.balanceError || null,
+        subscriptionAdmission: a.quotaSource ? subscriptionAdmission(a) : null,
+        subscriptionError: a.subscriptionError || null,
+        subscriptionSource: isSubscriptionSource(a.quotaSource) ? {
+          type: a.quotaSource.type,
+          pool: a.quotaSource.pool || null,
+          maxAgeMs: a.quotaSource.maxAgeMs ?? 90000,
+        } : null,
         usage: { ...a.usage },
         rateLimitedUntil: a.rateLimitedUntil
           ? new Date(a.rateLimitedUntil).toISOString()

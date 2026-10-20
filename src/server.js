@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { subscriptionAdmission } from './subscription-quota.js';
 import { advisorDefinition, dispatchAdvisorRequest, runAdvisorBridge } from './advisor-bridge.js';
 import https from 'node:https';
 import { timingSafeEqual } from 'node:crypto';
@@ -950,8 +951,20 @@ export function createProxyRequestListener({
       // the legacy null-selection 429 shape. Pins keep their dedicated path.
       if (pinnedIndex == null && accountManager.accounts.length
           && !accountManager.accounts.some(a => accountManager._isAvailable(a, model, null))) {
+        if (accountManager.accounts.some(a => !a.disabled
+            && accountManager._routeAllows(a, model)
+            && subscriptionAdmission(a, model).reason === 'subscription-quota-unknown')) {
+          res.writeHead(503, { 'Content-Type': 'application/json', 'retry-after': '30' });
+          res.end(JSON.stringify({ type: 'error', error: {
+            type: 'api_error', message: 'Subscription quota unavailable; request not admitted.',
+          } }));
+          hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url,
+            account: '(quota unknown)', status: 503, model, sessionId });
+          emitGate('subscription-quota-unknown', { response_status: 503, account: '(none available)' });
+          return;
+        }
         const CAPACITY = new Set([
-          'quota-exhausted', 'token-budget', 'circuit-open', 'probe-held', 'disabled', 'token-expired',
+          'quota-exhausted', 'subscription-quota-exhausted', 'token-budget', 'circuit-open', 'probe-held', 'disabled', 'token-expired',
         ]);
         const reasons = accountManager.accounts.map(a => ({
           name: a.name,
@@ -1319,6 +1332,18 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     ctx.selectionSkippedMore = null;
   }
   if (!account) {
+    const unknownSubscription = accountManager.accounts.some(a =>
+      !a.disabled && (ctx.pinnedIndex == null || a.index === ctx.pinnedIndex)
+      && accountManager._routeAllows(a, ctx.model)
+      && subscriptionAdmission(a, ctx.model).reason === 'subscription-quota-unknown');
+    if (unknownSubscription) {
+      ctx.status = 503;
+      res.writeHead(503, { 'Content-Type': 'application/json', 'retry-after': '30' });
+      res.end(JSON.stringify({ type: 'error', error: {
+        type: 'api_error', message: 'Subscription quota unavailable; request not admitted.',
+      } }));
+      return;
+    }
     // A pinned request concerns exactly one account: don't compute a fleet-wide
     // retry-after or sleep on other accounts' windows — return immediately.
     if (ctx.pinnedIndex != null) {
@@ -1431,6 +1456,18 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     return;
   }
 
+  const subscriptionGate = subscriptionAdmission(account, ctx.model);
+  if (!subscriptionGate.allowed) {
+    const status = subscriptionGate.reason === 'subscription-quota-unknown' ? 503 : 429;
+    ctx.status = status;
+    ctx.account = account.name;
+    res.writeHead(status, { 'Content-Type': 'application/json', 'retry-after': '30' });
+    res.end(JSON.stringify({ type: 'error', error: {
+      type: status === 429 ? 'rate_limit_error' : 'api_error',
+      message: subscriptionGate.reason,
+    } }));
+    return;
+  }
   // Track which account handles this request
   ctx.account = account.name;
   // Pin this session to the serving account (for affinity) and keep it "active"
@@ -2251,6 +2288,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
   const idleMs = resolveBodyIdleTimeout();
   const decoder = new TextDecoder();
   let sseBuffer = '';
+  const usageState = {};
   let errored = false;
 
   try {
@@ -2275,7 +2313,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
       sseBuffer = events.pop(); // keep incomplete event
 
       for (const event of events) {
-        parseSSEUsage(event, accountIndex, accountManager, sessionCtx, attemptRec);
+        parseSSEUsage(event, accountIndex, accountManager, sessionCtx, attemptRec, usageState);
       }
 
       // Handle backpressure — also bail out if client disconnects,
@@ -2295,7 +2333,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
 
     // Parse any remaining buffer
     if (sseBuffer.trim()) {
-      parseSSEUsage(sseBuffer, accountIndex, accountManager, sessionCtx, attemptRec);
+      parseSSEUsage(sseBuffer, accountIndex, accountManager, sessionCtx, attemptRec, usageState);
     }
   } catch (err) {
     // A mid-stream idle timeout (or any read error) means the upstream went
@@ -2313,46 +2351,33 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
   }
 }
 
-function parseSSEUsage(event, accountIndex, accountManager, sessionCtx = null, attemptRec = null) {
+export function parseSSEUsage(event, accountIndex, accountManager, sessionCtx = null, attemptRec = null, state = {}) {
   const dataLine = event.split('\n').find(l => l.startsWith('data: '));
   if (!dataLine) return;
-
-  try {
-    const data = JSON.parse(dataLine.slice(6));
-    if (data.type === 'message_start' && data.message) {
-      if (attemptRec && data.message.model != null) {
-        attemptRec.response_reported_model = data.message.model;
-      }
-      if (data.message.usage) {
-        const u = data.message.usage;
-        accountManager.updateUsage(accountIndex, u.input_tokens, 0);
-        if (attemptRec) {
-          attemptRec.usage = attemptRec.usage || { input: null, output: null };
-          attemptRec.usage.input = u.input_tokens ?? attemptRec.usage.input;
-        }
-        // T5: observed window occupancy = input + cache_read + cache_creation.
-        // Excludes current-turn output (see absent.current_turn_output_tokens).
-        if (sessionCtx?.sessionId && sessionCtx.pathClass !== 'count_tokens') {
-          const contextTokens = (u.input_tokens || 0)
-            + (u.cache_read_input_tokens || 0)
-            + (u.cache_creation_input_tokens || 0);
-          accountManager.sessionTracker.noteUsage(
-            sessionCtx.sessionId,
-            sessionCtx.model,
-            contextTokens,
-            { pathClass: sessionCtx.pathClass || 'messages' },
-          );
-        }
-      }
-    } else if (data.type === 'message_delta' && data.usage) {
-      accountManager.updateUsage(accountIndex, 0, data.usage.output_tokens);
-      if (attemptRec) {
-        attemptRec.usage = attemptRec.usage || { input: null, output: null };
-        attemptRec.usage.output = data.usage.output_tokens ?? attemptRec.usage.output;
-      }
-    }
-  } catch {
-    // not valid JSON, skip
+  let data;
+  try { data = JSON.parse(dataLine.slice(6)); } catch { return; }
+  if (data.type === 'message_start' && data.message && attemptRec && data.message.model != null) {
+    attemptRec.response_reported_model = data.message.model;
+  }
+  const usage = data.type === 'message_start' ? data.message?.usage
+    : data.type === 'message_delta' ? data.usage : null;
+  if (!usage) return;
+  // Anthropic usage counters are cumulative. Some gateways only supply input
+  // counts in the final delta, after message_start reported zero.
+  const previousInput = state.input_tokens || 0, previousOutput = state.output_tokens || 0;
+  for (const key of ['input_tokens', 'output_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens']) {
+    if (Number.isFinite(usage[key]) && usage[key] >= 0) state[key] = Math.max(state[key] || 0, usage[key]);
+  }
+  accountManager.updateUsage(accountIndex, (state.input_tokens || 0) - previousInput,
+    (state.output_tokens || 0) - previousOutput);
+  if (attemptRec) {
+    attemptRec.usage = { input: state.input_tokens ?? null, output: state.output_tokens ?? null };
+  }
+  if (sessionCtx?.sessionId && sessionCtx.pathClass !== 'count_tokens'
+      && ['input_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens'].some(key => Number.isFinite(usage[key]))) {
+    accountManager.sessionTracker.noteUsage(sessionCtx.sessionId, sessionCtx.model,
+      (state.input_tokens || 0) + (state.cache_read_input_tokens || 0) + (state.cache_creation_input_tokens || 0),
+      { pathClass: sessionCtx.pathClass || 'messages' });
   }
 }
 

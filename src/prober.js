@@ -10,6 +10,7 @@
 import { execFile } from 'node:child_process';
 import { fetchUsage } from './oauth.js';
 import { fetchQuotaFor } from './quota-sources.js';
+import { isSubscriptionSource } from './subscription-quota.js';
 
 export class Prober {
   constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, timeoutMs = 10_000, log = console.log } = {}) {
@@ -132,7 +133,9 @@ export class Prober {
     try {
       const usage = await this._withTimeout(
         fetchQuotaFor(source, { switchThreshold: this.am.switchThreshold }));
+      if (isSubscriptionSource(source) && source !== account.quotaSource) return;
       if (!usage || usage.error) {
+        if (isSubscriptionSource(source)) account.subscriptionError = usage?.error || 'Subscription quota probe timed out';
         if (source === account.balanceSource) account.balanceError = usage?.error || 'Balance refresh timed out';
         const finishedAt = Date.now();
         this._recordAccount(account, {
@@ -155,6 +158,8 @@ export class Prober {
         durationMs: finishedAt - startedAt,
       });
     } catch (err) {
+      if (isSubscriptionSource(source) && source !== account.quotaSource) return;
+      if (isSubscriptionSource(source)) account.subscriptionError = 'Subscription quota refresh failed';
       if (source === account.balanceSource) account.balanceError = 'Balance refresh failed';
       const finishedAt = Date.now();
       this._recordAccount(account, {
