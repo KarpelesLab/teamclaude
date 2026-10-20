@@ -12,7 +12,7 @@ import { X509Certificate } from 'node:crypto';
 const TMP = mkdtempSync(join(tmpdir(), 'tc-mitm-'));
 process.env.TEAMCLAUDE_CONFIG = join(TMP, 'config.json');
 
-const { ensureCerts, caCertPath, TEST_HOST, leafCovers, parseConnectAuthority } = await import('../src/mitm.js');
+const { ensureCerts, caCertPath, TEST_HOST, leafCovers, chainShortfall, parseConnectAuthority } = await import('../src/mitm.js');
 const { AccountManager } = await import('../src/account-manager.js');
 const { createProxyServer } = await import('../src/server.js');
 const { allowLoopbackForward } = await import('../src/forward-target.js');
@@ -232,4 +232,63 @@ test('ensureCerts regenerates a stored chain that is about to expire', async () 
   // And the renewed chain is then kept.
   const again = await ensureCerts('api.anthropic.com');
   assert.equal(again.leafCertPem, renewed.leafCertPem);
+});
+
+// A client handed the CA while a proxy runs has to get the CA that proxy's
+// leaf is signed by. Regenerating replaces the CA too, so `env` and `run`
+// keep a stored chain that falls short and say why (`keep`); they still
+// replace a pair that no server could be presenting.
+
+async function storeChain(chain) {
+  const { writeFile } = await import('node:fs/promises');
+  const dir = join(caCertPath(), '..');
+  await writeFile(join(dir, 'teamclaude-ca.pem'), chain.caCertPem);
+  await writeFile(join(dir, 'teamclaude-leaf.pem'), chain.leafCertPem);
+  await writeFile(join(dir, 'teamclaude-leaf.key'), chain.leafKeyPem);
+}
+
+test('chainShortfall names the missing host or the expiry, and nothing for a fit chain', () => {
+  const hosts = ['api.anthropic.com', TEST_HOST];
+  const fresh = generateCertChain(hosts);
+  assert.deepEqual(chainShortfall(fresh.caCertPem, fresh.leafCertPem, hosts), { signed: true, shortfall: null });
+  assert.deepEqual(chainShortfall(fresh.caCertPem, fresh.leafCertPem, [...hosts, 'chatgpt.com']),
+    { signed: true, shortfall: 'does not name chatgpt.com' });
+  const short = generateCertChain(hosts, { leafDays: 10 });
+  assert.match(chainShortfall(short.caCertPem, short.leafCertPem, hosts).shortfall, /^expires on \d{4}-\d{2}-\d{2}$/);
+  const other = generateCertChain(hosts);
+  assert.equal(chainShortfall(other.caCertPem, fresh.leafCertPem, hosts).signed, false);
+});
+
+test('ensureCerts with keep reuses a stored chain that falls short, and says why', async () => {
+  const stored = generateCertChain(['api.anthropic.com', TEST_HOST]);
+  await storeChain(stored);
+  const kept = await ensureCerts(['api.anthropic.com', 'chatgpt.com'], { keep: true });
+  assert.equal(kept.caCertPem, stored.caCertPem);
+  assert.equal(kept.leafCertPem, stored.leafCertPem);
+  assert.equal(kept.renewal, 'does not name chatgpt.com');
+
+  const short = generateCertChain(['api.anthropic.com', TEST_HOST], { leafDays: 5 });
+  await storeChain(short);
+  const keptShort = await ensureCerts('api.anthropic.com', { keep: true });
+  assert.equal(keptShort.caCertPem, short.caCertPem);
+  assert.match(keptShort.renewal, /^expires on /);
+
+  // Without keep, the same chain is renewed, as before.
+  const renewed = await ensureCerts('api.anthropic.com');
+  assert.notEqual(renewed.caCertPem, short.caCertPem);
+  assert.equal(renewed.renewal, null);
+});
+
+test('ensureCerts with keep reports nothing for a fit chain, and still replaces a mismatched pair', async () => {
+  const fit = await ensureCerts('api.anthropic.com', { keep: true });
+  assert.equal(fit.renewal, null);
+
+  // A leaf the stored CA did not sign is no chain any server presents.
+  const a = generateCertChain(['api.anthropic.com', TEST_HOST]);
+  const b = generateCertChain(['api.anthropic.com', TEST_HOST]);
+  await storeChain({ ...a, leafCertPem: b.leafCertPem, leafKeyPem: b.leafKeyPem });
+  const replaced = await ensureCerts('api.anthropic.com', { keep: true });
+  assert.notEqual(replaced.caCertPem, a.caCertPem);
+  assert.equal(replaced.renewal, null);
+  assert.equal(leafCovers(replaced.caCertPem, replaced.leafCertPem, ['api.anthropic.com', TEST_HOST]), true);
 });
