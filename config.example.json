@@ -18,6 +18,9 @@
   "stripOverageHeaders": false,
   "synthesizeQuotaHeaders": false,
   "distributeSessions": false,
+  "adaptiveDistribution": {
+    "scoring": "burndown"
+  },
   "advisorEligibility": "strict",
   "quotaProbeSeconds": 0,
   "autoUpdate": true,

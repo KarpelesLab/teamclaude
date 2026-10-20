@@ -215,11 +215,29 @@ Quota response headers supply utilization and reset time. Burn rate is learned f
 
 The `sess` in both lines is the display's short label and counts **conversations**, not client sessions: `active 3 sess` is three active conversations pinned to that account, which may all belong to one Claude Code session and its subagents. The TUI's session figures count the same thing.
 
-`next` names the account the deterministic picker would choose for the next new conversation. `weight` is that account's score normalized across the competing tier; it explains how strongly the inputs favor an account, but is not a routing probability. `plan` is the subscription multiplier read from the OAuth profile, not inferred from traffic. An unknown future tier is shown as `plan unknown`, and its competing tier falls back to plain utilization fractions rather than guessing. `weight n/a (all reserved)` means every account in the tier is inside its reserve, so the even fallback decides the next target.
+`next` names the account the deterministic picker would choose for the next new conversation. `weight` is that account's score normalized across the competing tier; it explains how strongly the inputs favor an account, but is not a routing probability. `plan` is the subscription multiplier read from the OAuth profile, not inferred from traffic. An unknown future tier is shown as `plan unknown`, and its competing tier falls back to plain utilization fractions rather than guessing. `weight n/a (all reserved)` means every account in the tier is inside its reserve, so the even fallback decides the next target. Under `"scoring": "pressure"` the `head`, `plan` and `conc` fields give way to `P 3.85e-6`, the pressure per second the score was taken from, and `weight n/a (all zero)` means every account scored 0.
 
 **Turning it off drains, it doesn't cut.** The setting is applied live on config reload, and switching it off would otherwise move every distributed conversation to the current account on its *next* request — each one throwing away the prompt cache it built on its old account, and all of them arriving at one account at once. Instead, the conversations running at that moment keep their accounts, and only **new** ones go back to plain quota-driven rotation. Affinity therefore winds down as those conversations finish rather than snapping, and a draining conversation whose account becomes ineligible simply rejoins normal rotation. While this is happening `teamclaude status` reads `draining N` (the TUI header shows `drain N`) instead of `single-account`, and it clears itself once the last of them is done or idles out.
 
 With `expiryRouting.preempt` on, a governing-window **rollover** also ends the drain for the conversation whose account rolled, and it rejoins normal rotation there and then. The drain trades expiring quota for a warm prompt cache, and that trade is priced on the window the account had when the drain started; once that window has gained a full week the account is the one the fleet should be spending last. Nothing else bounds it — a conversation making requests never idles out — so without this a long-lived one rides a rolled-over account for as long as it keeps talking.
+
+#### Scoring by expiry pressure
+
+```json
+"distributeSessions": "adaptive",
+"adaptiveDistribution": { "scoring": "pressure" },
+"expiryRouting": { "enabled": true, "tolerance": 3, "preempt": false }
+```
+
+The default score (`"scoring": "burndown"`, everything above) ranks accounts by the weekly room they have left. With [`expiryRouting`](#expiry-pressure-routing) on, the reset time then only decides who is in the top pressure band, so spreading across expiring windows is all-or-nothing and `tolerance` is the only dial. `"scoring": "pressure"` ranks inside the band by the pressure the band already computes:
+
+```
+score = P ÷ (1 + load)
+```
+
+`P` is the same figure the band uses: the room under the account's [`maxUsage`](quota.md#per-account-usage-caps) caps (the whole window with none) per second until the governing weekly window resets. `load` is active conversations plus requests in flight, as above. New conversations then land in proportion to how soon each account's quota expires, instead of all on the most urgent account or by room left. The burn boost, taper and concurrency cap are not part of this score.
+
+Every candidate needs a score, so the states the band leaves open are priced: a reset that has already passed, or no reading, counts as a fresh window (the cap, or 1, over one week); a reading with no reset time uses the band's own lower bound; and an account with nothing left under its caps scores 0. When every candidate scores 0 the even walk places the conversation, as it does when every account is reserved. Nothing else changes: availability, priority, the band, pins and the decision whether a pinned conversation moves (the `preempt` rollover above) are untouched. When that decision has moved a conversation, `"pressure"` picks the destination among the other accounts. With `expiryRouting` off the band lets every account through and only the score changes. The setting applies to `"adaptive"` only and is read at startup.
 
 ### Load distribution
 
