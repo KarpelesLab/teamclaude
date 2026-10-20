@@ -51,3 +51,15 @@ export function ensureAccountIds(accounts) {
   }
   return accounts;
 }
+
+/**
+ * Whether every entry in `accounts` already carries an id no other entry holds,
+ * so that ensureAccountIds would change nothing. A missing list counts as
+ * complete: there is nothing to mint.
+ * @param {unknown} accounts
+ */
+export function accountIdsComplete(accounts) {
+  if (!Array.isArray(accounts)) return true;
+  const ids = accounts.filter(a => a).map(a => a.id);
+  return ids.every(id => typeof id === 'string' && id !== '') && new Set(ids).size === ids.length;
+}

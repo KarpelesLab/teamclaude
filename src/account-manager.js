@@ -30,6 +30,9 @@ export { isFableModel, parseRequestModel, parseAdvisorModel } from './model.js';
  *   'adaptive'     → 'adaptive' spend the least-remaining window down first,
  *                               tapering at the threshold and backing off when
  *                               the account is busy (see adaptive-distribution.js)
+ *   'load'         → 'load'     spread new sessions by the requests each account
+ *                               served in the last LOAD_WINDOW_MS, even keys as
+ *                               tie-breaks (see SessionTracker.recentRequestsFor)
  * An unrecognised string is treated as 'even' rather than rejected: it is
  * plainly a request to distribute, and refusing to distribute at all would be
  * the worse reading of a typo. It is still said once, naming the value: an
@@ -43,10 +46,11 @@ export function distributionMode(setting) {
   if (typeof setting === 'string') {
     const value = setting.trim().toLowerCase();
     if (value === 'adaptive') return 'adaptive';
+    if (value === 'load') return 'load';
     if (['off', 'false', 'no', '0'].includes(value)) return 'off';
     if (!EVEN_SPELLINGS.includes(value) && !warnedDistributeValues.has(value)) {
       warnedDistributeValues.add(value);
-      console.warn(`[TeamClaude] distributeSessions: unrecognised value ${JSON.stringify(setting)}, distributing evenly (valid: true, false, "adaptive")`);
+      console.warn(`[TeamClaude] distributeSessions: unrecognised value ${JSON.stringify(setting)}, distributing evenly (valid: true, false, "adaptive", "load")`);
     }
     return 'even';
   }
@@ -64,6 +68,10 @@ const ADAPTIVE_STATS_CACHE_MS = 1000;
 // when the token turned over, short enough that a genuinely bad new token
 // recovers on the next request rather than staying stuck.
 const FORCED_REFRESH_FLOOR_MS = 10_000;
+// How long a token-endpoint 429 holds an account's refreshes when it carries no
+// Retry-After: long enough that the 401 and the retry of the same request do not
+// ask again, short enough that a renewal is not put off for long.
+const REFRESH_429_HOLD_MS = 30_000;
 // How many distinct models an account's recentModels table remembers.
 const MAX_RECENT_MODELS = 8;
 // An organization-level OAuth policy denial is not repaired by an immediate
@@ -143,6 +151,9 @@ const PERSISTED_QUOTA_FIELDS = [
   // would draw Ses/Wk until its first reading and then snap to one wide
   // weekly bar — the startup flicker the TUI rule is written to avoid.
   'sessionWindowStated',
+  // Same reason: a Team seat (no shared weekly window) would draw `Wk ?` until
+  // its first reading.
+  'weeklyWindowStated',
 ];
 
 // The family (Fable/Sonnet) weekly buckets and the field holding when each was
@@ -205,6 +216,8 @@ function emptyQuota() {
     unified7dSonnetSeenAt: null,
     unified7dFableSeenAt: null,
     unifiedStatus: null,        // allowed | allowed_warning | rejected
+    // false: the plan meters no shared weekly window (a Team seat).
+    weeklyWindowStated: /** @type {boolean|null} */ (null),
     // Normalized reading from a third-party backend (see backend-quota.js).
     // { label, text, utilization, at, windows? } — nothing here knows which
     // provider. windows feeds the fiveHour/weeklyShared/monthly buckets of
@@ -459,12 +472,19 @@ function makeAccount(acct, index, listener = null) {
     // The refresh token upstream last rejected as invalid, if it is still the
     // one we hold — see the dead-token guard in ensureTokenFresh.
     _deadRefreshToken: null,
+    // Until when (epoch ms) the token endpoint asked, with a 429, not to be
+    // asked again for this account — see ensureTokenFresh.
+    _refreshHeldUntil: /** @type {number|null} */ (null),
     // Whether the token it holds was minted by the token endpoint for this
     // process — a renewal here, not one taken from the store. Only such a token
     // is fresh enough to store on callback.net (credential-sync.js). Never
     // persisted, so false at every launch, and false again whenever tokens
     // arrive from elsewhere (updateAccountTokens).
     _minted: false,
+    // Why the last token refresh failed ({ at, reason, status }), until one
+    // succeeds or tokens arrive from elsewhere: the client is told this when
+    // the account is then refused (server.js refusalMessage). Never persisted.
+    _lastRefreshFailure: /** @type {{ at: number, reason: string, status: any } | null} */ (null),
   };
 }
 
@@ -552,7 +572,7 @@ export class AccountManager {
     // accounts by load instead of funnelling them all onto the current one.
     /** @type {SessionTracker} */
     this.sessionTracker = sessionTracker || new SessionTracker();
-    // 'off' | 'even' | 'adaptive'. `distributeSessions` stays a boolean beside
+    // 'off' | 'even' | 'adaptive' | 'load'. `distributeSessions` stays a boolean beside
     // it ("is distribution on at all") because the status readout, the TUI
     // header and the remote dashboard all ask only that question.
     this.distributionMode = distributionMode(distributeSessions);
@@ -1773,8 +1793,12 @@ export class AccountManager {
 
   /** Where a new session goes, per the configured distribution mode. Adaptive
    * scores the tier by remaining credit and congestion; even (the original)
-   * spreads by active-session count. */
+   * spreads by active-session count; load spreads by the requests each account
+   * carried in the last LOAD_WINDOW_MS, with the even keys as tie-breaks. */
   _pickLeastLoaded(exclude = null, model = null, advisorModel = null) {
+    if (this.distributionMode === 'load') {
+      return this._pickLeastLoadedEven(exclude, model, advisorModel, { byRequests: true });
+    }
     if (this.distributionMode === 'adaptive') {
       const picked = this._pickAdaptive(exclude, model, advisorModel);
       // Adaptive can legitimately score every candidate at zero — the whole
@@ -1917,8 +1941,17 @@ export class AccountManager {
    * spread across equal-priority accounts instead of funnelling onto one. Order:
    * priority → [top pressure band, when expiry routing is on] → fewest active
    * sessions → fewest in-flight → highest expiry pressure (inert when expiry
-   * routing is off) → soonest weekly reset (the existing tiebreak). */
-  _pickLeastLoadedEven(exclude = null, model = null, advisorModel = null) {
+   * routing is off) → soonest weekly reset (the existing tiebreak).
+   *
+   * With `byRequests` (the load mode) one key goes ahead of the session count:
+   * fewest requests routed to the account in the last LOAD_WINDOW_MS. Sessions
+   * are not interchangeable — a fleet lane in a build loop sends a hundred
+   * requests in the time an interactive session sends five — so equal session
+   * counts left one account carrying a third of a 14-account pool's traffic.
+   * Counting what each account actually served places the next session where
+   * the least work is, and the session stays pinned there for cache reuse as
+   * in every other mode. */
+  _pickLeastLoadedEven(exclude = null, model = null, advisorModel = null, { byRequests = false } = {}) {
     const now = Date.now();
     const candidates = this._bandedCandidates(exclude, model, advisorModel);
     // One clock for every candidate: pressure rises continuously as a window
@@ -1931,6 +1964,7 @@ export class AccountManager {
     let best = null;
     let bestPriority = Infinity;
     let bestSpent = Infinity;
+    let bestRequests = Infinity;
     let bestSessions = Infinity;
     let bestInFlight = Infinity;
     let bestPressure = Infinity;
@@ -1938,21 +1972,25 @@ export class AccountManager {
     candidates.forEach((account, i) => {
       const priority = account.priority || 0;
       const heldOff = spent[i];
+      const requests = byRequests ? this.sessionTracker.recentRequestsFor(account.index, now) : 0;
       const sessions = this.sessionTracker.activeCountFor(account.index, now);
       const inFlight = account.inFlight || 0;
       const pressure = pressures[i];
       const reset = this._rankedReset(account, model);
       const samePriority = priority === bestPriority;
       const sameSpend = samePriority && heldOff === bestSpent;
+      const sameLoad = sameSpend && requests === bestRequests;
       if (priority < bestPriority
         || (samePriority && heldOff < bestSpent)
-        || (sameSpend && sessions < bestSessions)
-        || (sameSpend && sessions === bestSessions && inFlight < bestInFlight)
-        || (sameSpend && sessions === bestSessions && inFlight === bestInFlight && pressure < bestPressure)
-        || (sameSpend && sessions === bestSessions && inFlight === bestInFlight && pressure === bestPressure && reset < bestReset)) {
+        || (sameSpend && requests < bestRequests)
+        || (sameLoad && sessions < bestSessions)
+        || (sameLoad && sessions === bestSessions && inFlight < bestInFlight)
+        || (sameLoad && sessions === bestSessions && inFlight === bestInFlight && pressure < bestPressure)
+        || (sameLoad && sessions === bestSessions && inFlight === bestInFlight && pressure === bestPressure && reset < bestReset)) {
         best = account;
         bestPriority = priority;
         bestSpent = heldOff;
+        bestRequests = requests;
         bestSessions = sessions;
         bestInFlight = inFlight;
         bestPressure = pressure;
@@ -1983,6 +2021,9 @@ export class AccountManager {
     // taken where the evidence is, at the start of the NEXT request from
     // wherever this one left the pin (see _restOn).
     this.sessionTracker.touch(sessionId, accountIndex, bucket);
+    // The load mode's input: one entry per routed request that carries a
+    // session id, in every mode, so switching to load starts from a warm picture.
+    this.sessionTracker.noteRouted(accountIndex);
     // Except the FIRST one, which discards nothing: otherwise a session's
     // opening window is first-sighted a request late (see _firstSightOn).
     if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) return;
@@ -2717,8 +2758,8 @@ export class AccountManager {
   setDistributeSessions(enabled, { drain = true } = {}) {
     const mode = distributionMode(enabled);
     if (mode !== 'off') {
-      // Includes switching BETWEEN 'even' and 'adaptive'. Neither drains: both
-      // keep a session pinned to its account, so only the choice made for the
+      // Includes switching BETWEEN 'even', 'adaptive' and 'load'. None drains:
+      // each keeps a session pinned to its account, so only the choice made for the
       // NEXT new session changes and no running session loses its prompt cache.
       this.distributionMode = mode;
       this.distributeSessions = true;
@@ -4328,6 +4369,10 @@ export class AccountManager {
       account.quota.unified7dSeenAt = Date.now();
       observed.add('unified7d');
     }
+    // Kept apart from the reading, which is nulled at every weekly reset (see
+    // sessionWindowStated). A 5-hour window with no 7-day one is a Team seat.
+    if (!isNaN(u7d)) account.quota.weeklyWindowStated = true;
+    else if (!isNaN(u5h)) account.quota.weeklyWindowStated = false;
 
     // A reset that does not parse is treated as absent, never stored: parseInt
     // of a non-numeric value is NaN, and `now >= NaN` is false forever, so a
@@ -4701,6 +4746,9 @@ export class AccountManager {
       }
       if (usage.sevenDay.resetAt != null) q.unified7dReset = usage.sevenDay.resetAt;
     }
+    // The same fact the header path records, from the whole payload at once.
+    if (usage.sevenDay?.utilization != null) q.weeklyWindowStated = true;
+    else if (usage.fiveHour?.utilization != null) q.weeklyWindowStated = false;
 
     // The family buckets carry a "last confirmed" stamp (see _clearExpiredQuotas).
     // A probe is upstream evidence just like a response header, so it refreshes
@@ -4947,6 +4995,12 @@ export class AccountManager {
       return;
     }
 
+    // The token endpoint answered 429: leave it alone until it said to come back
+    // (or REFRESH_429_HOLD_MS when it did not say), forced or not. Without this a
+    // request with an expired token asks once, its 401 forces another, and its
+    // retry a third — every one of them refused, each one making it worse.
+    if (account._refreshHeldUntil && Date.now() < account._refreshHeldUntil) return;
+
     if (!force && !isTokenExpiringSoon(account.expiresAt)) return;
 
     // A forced refresh answers a 401, but 401s arrive in bursts: every request
@@ -5010,12 +5064,17 @@ export class AccountManager {
         account.expiresAt = newTokens.expiresAt;
         account._lastRefreshAt = Date.now();
         account._deadRefreshToken = null; // this token works; clear any stale guard
+        account._refreshHeldUntil = null;
+        account._lastRefreshFailure = null;
         // Set before the listener runs: it is what lets the sync store them.
         account._minted = minted;
         console.log(`[TeamClaude] Token refreshed for account "${safeLine(account.name, 64)}"`);
         this._onTokenRefresh?.(accountIndex, newTokens);
       } catch (/** @type {any} */ err) {
         console.error(`[TeamClaude] Token refresh failed for "${safeLine(account.name, 64)}": ${err.message}`);
+        // Why, until a refresh succeeds: what the client is told when this
+        // account then fails its request (the coordinator's reason, a 429).
+        account._lastRefreshFailure = { at: Date.now(), reason: safeLine(String(err?.message || err), 300), status: err?.status };
         // The refresh never reached the token endpoint: the account's own
         // routing proxy is down. The forward that follows would fail the same
         // way, so hold the account out of rotation now rather than after it.
@@ -5026,6 +5085,12 @@ export class AccountManager {
         // transient failure (network, 5xx, timeout) must NOT sideline a healthy
         // account: keep its current token and retry on the next request. This is
         // what kept accounts wrongly "errored" after a momentary refresh blip.
+        if (err.status === 429) {
+          const holdMs = Number.isFinite(err.retryAfterMs) ? err.retryAfterMs : REFRESH_429_HOLD_MS;
+          const until = Date.now() + holdMs;
+          account._refreshHeldUntil = until;
+          console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}": the token endpoint asked to wait (429); no refresh before ${new Date(until).toISOString()}`);
+        }
         const isAuthRejection = err.status === 400 || err.status === 401 || err.status === 403;
         if (isAuthRejection) {
           // Remember WHICH token was rejected so we stop re-sending it (see the
@@ -5152,6 +5217,8 @@ export class AccountManager {
     account.expiresAt = expiresAt;
     // Tokens from elsewhere (the store, a reload from disk) were not minted here.
     account._minted = false;
+    // A failed renewal of the tokens these replace no longer explains anything.
+    account._lastRefreshFailure = null;
     if (account.status === 'error') account.status = 'active';
     console.log(`[TeamClaude] Updated tokens for account "${safeLine(account.name, 64)}"`);
     this._onTokenRefresh?.(accountIndex, {
@@ -5353,6 +5420,10 @@ export class AccountManager {
         provider: providerOf(a),
         orgName: a.orgName || null,
         priority: a.priority || 0,
+        // Requests forwarded to this account in the last LOAD_WINDOW_MS: the
+        // load mode's placement input, reported in every mode so an operator
+        // can see the skew before switching to it.
+        recentRequests: this.sessionTracker.recentRequestsFor(a.index),
         // The attached TUI spreads these fields onto its own account objects
         // and sorts its rows by this one, so without it `teamclaude attach`
         // draws array order beside a server TUI drawing the arrangement.
