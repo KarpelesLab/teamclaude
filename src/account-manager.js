@@ -147,6 +147,9 @@ const PERSISTED_QUOTA_FIELDS = [
   // would draw Ses/Wk until its first reading and then snap to one wide
   // weekly bar — the startup flicker the TUI rule is written to avoid.
   'sessionWindowStated',
+  // Same reason: a Team seat (no shared weekly window) would draw `Wk ?` until
+  // its first reading.
+  'weeklyWindowStated',
 ];
 
 // The family (Fable/Sonnet) weekly buckets and the field holding when each was
@@ -205,6 +208,8 @@ function emptyQuota() {
     unified7dSonnetSeenAt: null,
     unified7dFableSeenAt: null,
     unifiedStatus: null,        // allowed | allowed_warning | rejected
+    // false: the plan meters no shared weekly window (a Team seat).
+    weeklyWindowStated: /** @type {boolean|null} */ (null),
     // Normalized reading from a third-party backend (see backend-quota.js).
     // { label, text, utilization, at, windows? } — nothing here knows which
     // provider. windows feeds the fiveHour/weeklyShared/monthly buckets of
@@ -4282,6 +4287,10 @@ export class AccountManager {
       account.quota.unified7dSeenAt = Date.now();
       observed.add('unified7d');
     }
+    // Kept apart from the reading, which is nulled at every weekly reset (see
+    // sessionWindowStated). A 5-hour window with no 7-day one is a Team seat.
+    if (!isNaN(u7d)) account.quota.weeklyWindowStated = true;
+    else if (!isNaN(u5h)) account.quota.weeklyWindowStated = false;
 
     // A reset that does not parse is treated as absent, never stored: parseInt
     // of a non-numeric value is NaN, and `now >= NaN` is false forever, so a
@@ -4655,6 +4664,9 @@ export class AccountManager {
       }
       if (usage.sevenDay.resetAt != null) q.unified7dReset = usage.sevenDay.resetAt;
     }
+    // The same fact the header path records, from the whole payload at once.
+    if (usage.sevenDay?.utilization != null) q.weeklyWindowStated = true;
+    else if (usage.fiveHour?.utilization != null) q.weeklyWindowStated = false;
 
     // The family buckets carry a "last confirmed" stamp (see _clearExpiredQuotas).
     // A probe is upstream evidence just like a response header, so it refreshes

@@ -320,6 +320,17 @@ export function showSessionRow(quota) {
 }
 
 /**
+ * showSessionRow's rule for the shared weekly window, which a Team seat lacks.
+ *
+ * @param {{weeklyWindowStated?: boolean, unified7d?: number|null}|null|undefined} quota
+ * @returns {boolean}
+ */
+export function showWeeklyRow(quota) {
+  var q = quota || {};
+  return q.weeklyWindowStated !== false || q.unified7d != null;
+}
+
+/**
  * The free-reset-credit line, or null when this account holds none.
  *
  * Its own line rather than another bar: every bar above measures an allowance
@@ -815,7 +826,9 @@ function quotaLines(account, now, paint) {
     if (showSessionRow(quota)) {
       lines.push(formatQuotaLine('Session', quota.unified5h, quota.unified5hReset, now, paint, cap('unified5h')));
     }
-    lines.push(formatQuotaLine('Weekly', quota.unified7d, quota.unified7dReset, now, paint, cap('unified7d')));
+    if (showWeeklyRow(quota)) {
+      lines.push(formatQuotaLine('Weekly', quota.unified7d, quota.unified7dReset, now, paint, cap('unified7d')));
+    }
     if (quota.unified7dSonnet != null) {
       lines.push(formatQuotaLine('Sonnet', quota.unified7dSonnet, quota.unified7dSonnetReset, now, paint, cap('unified7dSonnet')));
     }
