@@ -1208,8 +1208,9 @@ export function relayHttpForward(req, res, stripOverage = false, /** @type {Reco
     // Drop hop-by-hop + proxy-control headers; `host` is reset from the target.
     if (lk.startsWith(':') || HOP_BY_HOP_HEADERS.has(lk) || lk === 'proxy-connection') continue;
     // x-api-key may authenticate to this proxy or to the destination API.
-    // Consume our own keys, preserving unrelated application credentials.
-    if (lk === 'x-api-key' && (proxyConfig?.apiKey || proxyConfig?.clientKeys?.length)
+    // Consume our own keys, preserving unrelated application credentials. With
+    // no usable key configured every value "resolves", so that case keeps it.
+    if (lk === 'x-api-key' && !resolveClientAuth(proxyConfig, undefined).ok
       && resolveClientAuth(proxyConfig, value).ok) continue;
     headers[key] = value;
   }

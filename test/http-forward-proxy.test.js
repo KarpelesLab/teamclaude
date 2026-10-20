@@ -96,6 +96,7 @@ for (const { name, proxyConfig, presented, expected, status = 200 } of [
   { name: 'proxy key on an exempt loopback connection', proxyConfig: { apiKey: 'tc-shared' }, presented: 'tc-shared', expected: undefined },
   { name: 'destination key on an exempt loopback connection', proxyConfig: { apiKey: 'tc-shared' }, presented: 'destination-key', expected: 'destination-key' },
   { name: 'destination key with no proxy keys configured', proxyConfig: {}, presented: 'destination-key', expected: 'destination-key' },
+  { name: 'destination key when every client key entry is unusable', proxyConfig: { clientKeys: [{ name: '', key: 'x' }] }, presented: 'destination-key', expected: 'destination-key' },
   { name: 'no x-api-key', proxyConfig: { apiKey: 'tc-shared' }, presented: undefined, expected: undefined },
   { name: 'invalid proxy key with loopback exemption disabled', proxyConfig: { apiKey: 'tc-shared', trustLoopback: false }, presented: 'wrong-key', expected: undefined, status: 401 },
 ]) {
