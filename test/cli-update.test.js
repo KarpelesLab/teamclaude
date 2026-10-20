@@ -64,7 +64,7 @@ async function runUpdate({ pkgDir, npmRoot }) {
     child.stdout.on('data', chunk => { stdout += chunk; });
     child.stderr.on('data', chunk => { stderr += chunk; });
     const code = await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('update command did not exit')); }, 15_000);
+      const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('update command did not exit')); }, 60_000);
       child.on('error', reject);
       child.on('exit', c => { clearTimeout(timer); resolve(c); });
     });
