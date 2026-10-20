@@ -154,6 +154,10 @@ const FAMILY_WEEKLY_BUCKETS = [
   { key: 'unified7dSonnet', label: 'Sonnet', usageKey: 'sevenDaySonnet' },
 ];
 
+// How long a family reading at its account's `maxUsage` cap is kept when no
+// reset time is known for it: one weekly window (see _clearExpiredQuotas).
+const CAPPED_FAMILY_HOLD_MS = 7 * 24 * 3600_000;
+
 /**
  * The quota fields a Codex account only ever LEARNS — from a `/wham/usage`
  * payload, or for `resetCredits` from the state restored off disk — so
@@ -767,6 +771,9 @@ export class AccountManager {
    * The shared buckets (unified5h, unified7d) cap every request; a family bucket
    * caps only the family it meters, so a Fable cap stops Fable and leaves Opus
    * alone. Both apply: a Fable request is capped by whichever binds first.
+   *
+   * @param {Record<string, any>} account
+   * @param {string|null} [model]
    */
   capExceeded(account, model = null) {
     // The money cap first: it is the budget the usage caps exist to protect, and
@@ -825,6 +832,24 @@ export class AccountManager {
     const cap = this.capFor(key, account);
     const val = account.quota[key];
     return cap != null && val != null && val >= cap ? key : null;
+  }
+
+  /**
+   * The cap that bars this request from `account`, or null: the executor's
+   * caps and, when the request declares one, the advisor model's own family
+   * cap. For the paths that pick an account without unavailableReason — the
+   * exhausted-fleet probe, the paid fallback, the all-unavailable revival, a
+   * pin, the re-check after admission — so a cap binds on every path a request
+   * can take. Under `advisorEligibility: "prefer"` the advisor is a preference
+   * rather than a requirement, so only the executor's caps apply.
+   *
+   * @param {Record<string, any>} account
+   * @param {string|null} [model]
+   * @param {string|null} [advisorModel]
+   */
+  capBars(account, model = null, advisorModel = null) {
+    return this.capExceeded(account, model)
+      || (advisorModel && this.advisorEligibility !== 'prefer' ? this._familyCapExceeded(account, advisorModel) : null);
   }
 
   /** Start (or restart) the ramp window for an account that just became current,
@@ -1367,7 +1392,7 @@ export class AccountManager {
       ? this._advisorReach(excluded, model, advisorModel) : null;
     const normal = this._pickBestAvailable(excluded, model, reach && reach.eligible < reach.of ? null : advisorModel);
     if (normal) return normal;
-    const pick = this._pickFallback(excluded, model, provider);
+    const pick = this._pickFallback(excluded, model, provider, reach && reach.eligible < reach.of ? null : advisorModel);
     if (!pick) return null;
     // A paid hop must not bill silently, yet it is still a detour: no cursor,
     // no ramp. So it only records the scope's episode — bookkeeping that feeds
@@ -1626,7 +1651,7 @@ export class AccountManager {
     // Only the final pass: the advisor-constrained one fails soft by design, and
     // spending money to honour an advisor's family is not a trade to make here.
     if (!allowProbe) return null;
-    return this._selectProbe(exclude, model) ?? this._selectFallback(exclude, model);
+    return this._selectProbe(exclude, model, advisorModel) ?? this._selectFallback(exclude, model, advisorModel);
   }
 
   /** Session-affinity selection (opt-in, issue #109). Honor a known session's
@@ -1872,7 +1897,9 @@ export class AccountManager {
     let bestScore = -Infinity;
     let bestReset = Infinity;
     for (const c of candidates) {
-      const { score } = scoreCandidate({ ...c, maxRemaining });
+      // The operator's adaptive settings, maxBurnBoost among them; the learner
+      // holds them merged over the defaults.
+      const { score } = scoreCandidate({ ...c, maxRemaining }, this.burnRateLearner.opts);
       // Soonest weekly reset breaks a tie, matching the rest of selection: on
       // an idle fleet every candidate scores identically, and without this the
       // winner would be array order.
@@ -2146,7 +2173,7 @@ export class AccountManager {
         load: r.sessions + r.inFlight,
         concCap: r.concCap,
         maxRemaining,
-      });
+      }, this.burnRateLearner.opts);
       r.score = score;
       total += score;
     }
@@ -2389,7 +2416,7 @@ export class AccountManager {
    * The chosen account is the least-utilized probeable one (most likely to have
    * stale headroom), so the refreshed quota corrects the cache fastest.
    */
-  _selectProbe(exclude = null, model = null) {
+  _selectProbe(exclude = null, model = null, advisorModel = null) {
     const now = Date.now();
     if (now < this._nextProbeAt) return null;
 
@@ -2406,7 +2433,7 @@ export class AccountManager {
       // A cap is the operator's own decision, not a reading that a live request
       // might refresh, so the exhausted-fleet probe does not get to override it.
       // Checked here rather than in _isProbeable because a cap is model-scoped.
-      if (this.capExceeded(account, model)) continue;
+      if (this.capBars(account, model, advisorModel)) continue;
       // Same for routing/ownership: a probe for a routed or owned model must not
       // land on an ineligible account (it would just reject the unknown model id).
       if (model && !this._routeAllows(account, model)) continue;
@@ -2448,9 +2475,9 @@ export class AccountManager {
    * same one stepping from free quota onto paid — is announced and ramped like
    * any switch (see _noteFallback).
    */
-  _selectFallback(exclude = null, model = null) {
+  _selectFallback(exclude = null, model = null, advisorModel = null) {
     const provider = this._selectingProvider ?? DEFAULT_PROVIDER;
-    const pick = this._pickFallback(exclude, model, provider);
+    const pick = this._pickFallback(exclude, model, provider, advisorModel);
     if (!pick) return null;
     if (!this._currentBarredOnlyFor(model, null, exclude)) this._setCurrent(pick.account);
     if (this._noteFallback(this._cursorKey(model, null, provider), pick, model, false)) this._beginRamp(pick.account);
@@ -2507,7 +2534,7 @@ export class AccountManager {
    * @param {Set<number>|null} [exclude]
    * @returns {{ account: Record<string, any>, paid: boolean } | null}
    */
-  _pickFallback(exclude = null, model = null, provider = DEFAULT_PROVIDER) {
+  _pickFallback(exclude = null, model = null, provider = DEFAULT_PROVIDER, advisorModel = null) {
     if (!this.accounts.some(a => a.allowExtraUsage)) return null;
     const partition = this._excludeOtherProviders(null, provider);
     if (this.accounts.some(a => !partition?.has(a.index) && this._isAvailable(a, model))) return null;
@@ -2523,6 +2550,8 @@ export class AccountManager {
       const reason = this.unavailableReason(account, model);
       if (reason !== 'quota' && reason !== 'upstream-rejected') continue;
       if (model && !this._routeAllows(account, model)) continue;
+      // The executor's caps were read above; the advisor's family is its own.
+      if (this.capBars(account, model, advisorModel)) continue;
       const priority = account.priority || 0;
       const usage = this._maxUtilization(account, model);
       // `quota` is reported ahead of `upstream-rejected`, so a rejected account
@@ -3094,7 +3123,7 @@ export class AccountManager {
       enabled: !!this.expiryRouting.enabled,
       tolerance: this.expiryRouting.tolerance,
       accounts: candidates.map(a => {
-        const { utilization: used, resetAt: reset } = this._governingWindow(a, model);
+        const { window, utilization: used, resetAt: reset } = this._governingWindow(a, model);
         return {
           index: a.index,
           priority: a.priority || 0,
@@ -3103,9 +3132,39 @@ export class AccountManager {
           // as a window nobody has reported yet, which wants a different action.
           utilization: typeof used === 'number' ? used : (used == null ? null : NaN),
           resetAt: typeof reset === 'number' && reset ? reset : null,
+          limit: this._spendLimit(a, window, used),
         };
       }),
     };
+  }
+
+  /**
+   * How far `account`'s governing window may be spent under its `maxUsage`
+   * caps, as a level of that window, or null when nothing caps it. A family
+   * window is bound by its own cap and by the shared weekly's, since family
+   * spend meters into both (see capExceeded): the room is the smaller of the
+   * two, expressed on the family window's scale. Uncapped accounts get null,
+   * so their pressure is unchanged.
+   *
+   * @param {Record<string, any>} account
+   * @param {string} window  the key _governingWindow resolved
+   * @param {unknown} used   that window's utilization
+   * @returns {number|null}
+   */
+  _spendLimit(account, window, used) {
+    if (!account.maxUsage) return null;
+    // A learned scoped bucket stands in for a family the shared weekly meters,
+    // so the shared weekly's cap is the one that applies to it.
+    const key = window.startsWith('scoped:') ? 'unified7d' : window;
+    let limit = this.capFor(key, account);
+    if (key !== 'unified7d' && typeof used === 'number') {
+      const capWeekly = this.capFor('unified7d', account);
+      const weekly = account.quota.unified7d;
+      if (capWeekly != null && typeof weekly === 'number') {
+        limit = Math.min(limit ?? 1, used + Math.max(0, capWeekly - weekly));
+      }
+    }
+    return limit;
   }
 
   /**
@@ -3733,6 +3792,14 @@ export class AccountManager {
       // so a reading is never discarded before it has had a window to prove out.
       if (!q[seenField]) { q[seenField] = now; continue; }
       if (now < q[seenField] + this.familyStaleMs) continue;
+      // A reading at the operator's cap is different: the cap is a decision,
+      // not an estimate a fresh request could correct, and usage cannot fall
+      // before the window resets. Revalidating it would send a request past the
+      // cap every staleness period, so it holds until its reset clears it above
+      // — or, with no reset known, for one weekly window after it was seen.
+      const cap = this.capFor(key, account);
+      if (cap != null && q[key] >= cap
+        && (q[`${key}Reset`] || now < q[seenField] + CAPPED_FAMILY_HOLD_MS)) continue;
       console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" ${label} weekly reading is stale — revalidating on the next ${label} request`);
       q[key] = null;
       q[`${key}Reset`] = null;
@@ -4091,6 +4158,10 @@ export class AccountManager {
       // neither the executor's nor an advisor's.
       if (model && !this._routeAllows(account, model)) continue;
       if (advisorModel && !this._routeAllows(account, advisorModel)) continue;
+      // Nor one at its cap (or over its spend cap): a lapsed throttle would
+      // otherwise read as the soonest reset and hand a capped account the
+      // request, clearing its throttle on the way. The probe skips these too.
+      if (this.capBars(account, model, advisorModel)) continue;
       const resetTime = account.rateLimitedUntil
         || account.quota.unified5hReset
         || account.quota.unified7dReset

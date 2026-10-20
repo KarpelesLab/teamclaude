@@ -2965,7 +2965,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   const account = hopTo != null
     ? accountManager.accounts[hopTo]
     : ctx.pinnedIndex != null
-      ? (pinned && !pinnedWrongProvider && !accountManager.capExceeded(pinned, ctx.model) ? pinned : null)
+      ? (pinned && !pinnedWrongProvider && !accountManager.capBars(pinned, ctx.model, ctx.advisorModel) ? pinned : null)
       : accountManager.getActiveAccount(
         ctx.tried, ctx.model, ctx.advisorModel, ctx.pinKey, ctx.provider, selection,
       );
@@ -3280,6 +3280,16 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       accountManager.release(account.index, { successful: false });
       ctx.tried.add(account.index);
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+    }
+    // Same for a cap: a reading that arrived while this request waited can have
+    // put the account at its maxUsage, and a cap is zero requests past it. Not
+    // a retry — nothing was sent — so the budget is not spent; `tried` grows by
+    // one account each time, which bounds the re-selection. A pin re-enters
+    // its own check and is refused there.
+    if (accountManager.capBars(account, ctx.model, ctx.advisorModel)) {
+      accountManager.release(account.index, { successful: false });
+      ctx.tried.add(account.index);
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
     }
     let upstreamRes;
     let admittedLoad = 0;
