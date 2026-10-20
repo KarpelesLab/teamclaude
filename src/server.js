@@ -963,13 +963,7 @@ export function createProxyRequestListener({
               status: 429, reason: 'quota-admission', model, pathClass: classifySessionPath(req.url),
             });
           }
-          const snap = accountManager.getServeable(model);
-          let retryAfter = 60;
-          if (snap.soonestResetAt) {
-            const secs = Math.ceil((Date.parse(snap.soonestResetAt) - Date.now()) / 1000);
-            if (Number.isFinite(secs)) retryAfter = Math.max(1, secs);
-          }
-          retryAfter = Math.min(3600, retryAfter);
+          const retryAfter = capacityRetryAfter(accountManager, model);
           const detail = reasons.map(r => `${r.name}: ${r.reason}`).join('; ');
           const message = `No serveable account for "${model || '<default>'}" (${detail}). Retry in ${retryAfter}s.`;
           if (!res.headersSent) {
@@ -2533,6 +2527,25 @@ export function rewriteModel(body, modelMap, {
     if (changed) return Buffer.from(JSON.stringify(obj), 'utf8');
   } catch { /* not JSON — pass through unchanged */ }
   return body;
+}
+
+// Retry the blocking condition for eligible routes, not unrelated billing resets.
+export function capacityRetryAfter(accountManager, model, now = Date.now()) {
+  const waits = [];
+  for (const account of accountManager.accounts) {
+    if (account.disabled || account.retired || !accountManager._routeAllows(account, model)
+        || !accountManager._acceptsModel(account, model)) continue;
+    const reason = accountManager._unavailableReason(account, model);
+    let readyAt = null;
+    if (reason === 'circuit-open') readyAt = account.circuitOpenUntil;
+    else if (reason === 'quota-exhausted' || reason === 'token-budget') {
+      readyAt = accountManager._soonestResetMs(account, model);
+    }
+    // Unknown recovery times get a short recheck; they must not borrow another
+    // account's weekly reset and turn a transport outage into an hour-long hold.
+    waits.push(Number.isFinite(readyAt) ? Math.max(1, Math.ceil((readyAt - now) / 1000)) : 60);
+  }
+  return Math.min(3600, waits.length ? Math.min(...waits) : 60);
 }
 
 function computeRetryAfter(accounts) {
