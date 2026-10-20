@@ -332,6 +332,10 @@ class Handler(BaseHTTPRequestHandler):
         self._error(404, "not_found", f"no route for GET {path}")
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib name
+        # A handler serves multiple requests on a keep-alive connection. A
+        # previous response must not turn this request's pre-header failure
+        # into a silent disconnect instead of a structured 502.
+        self._response_started = False
         # Structural guard: an uncaught exception in a BaseHTTPRequestHandler
         # method kills the thread having written nothing, so the client gets a
         # destroyed socket with no status line -- the least diagnosable failure
