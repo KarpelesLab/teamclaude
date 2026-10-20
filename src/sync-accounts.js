@@ -103,7 +103,11 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     for (const field of /** @type {const} */ (['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro'])) {
       if (diskAcct[field] != null) mgr[field] = diskAcct[field];
     }
-    if (diskAcct.name && mgr.name !== diskAcct.name) mgr.name = diskAcct.name;
+    if (diskAcct.name && mgr.name !== diskAcct.name) {
+      // A session pin names its account, so it follows the rename (#543).
+      accountManager.sessionPins?.rename(mgr.name, diskAcct.name);
+      mgr.name = diskAcct.name;
+    }
     if (diskAcct.priority != null && mgr.priority !== diskAcct.priority) mgr.priority = diskAcct.priority;
     // A list position edited on disk applies on reload for the same reason a
     // priority edit does, and `null` rather than `??` so deleting the field

@@ -5,6 +5,7 @@ import { parseCodexQuota, parseCodexPlanType, parseCodexActiveLimit } from './co
 import { sameIdentity } from './identity.js';
 import { weeklyBucketForModel, modelGlobMatches, modelFamily, gatingUtilization, resolveMaxUsage, spendCapReached, resolveSwitchThreshold, sanitizeSwitchThreshold, WEEKLY_BUCKET_KEYS } from './model.js';
 import { SessionTracker } from './session-tracker.js';
+import { SessionPins } from './session-pins.js';
 import { buildQuotaSummary, quotaTier } from './quota-summary.js';
 import { ROLLOVER_MIN_JUMP_MS, remapHeld, findHeld, dropHeld, newObservation } from './rollover.js';
 import { decideBand, pressureOf, pressureRank, assertNever } from './band-decision.js';
@@ -548,6 +549,11 @@ export class AccountManager {
     // accounts by load instead of funnelling them all onto the current one.
     /** @type {SessionTracker} */
     this.sessionTracker = sessionTracker || new SessionTracker();
+    // Sessions the operator moved onto a named account (`teamclaude switch
+    // --session`, issue #543). Applied by the request path like a TC_ACCT pin;
+    // nothing in selection reads it.
+    /** @type {SessionPins} */
+    this.sessionPins = new SessionPins();
     // 'off' | 'even' | 'adaptive'. `distributeSessions` stays a boolean beside
     // it ("is distribution on at all") because the status readout, the TUI
     // header and the remote dashboard all ask only that question.
@@ -5273,6 +5279,10 @@ export class AccountManager {
       advisorNarrowing: this._advisorNarrowing ? { ...this._advisorNarrowing } : null,
       routes: this.getRoutes(),
       sessions: { ...sessions, distribute: this.distributeSessions, mode: this.distributionMode, draining: this.drainingCount() },
+      // Operator session pins, so a session held on one account is never a
+      // mystery. Session ids are shortened unless sessionDetail is on, as the
+      // rest of the session readout withholds them.
+      sessionPins: this.sessionPins.list({ detail: sessionDetail }),
       // Empty outside adaptive mode, so the renderer needs no mode check of its
       // own and an older client simply sees nothing extra.
       adaptive: this._adaptiveStatsCached(),

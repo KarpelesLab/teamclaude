@@ -1780,6 +1780,11 @@ async function switchCommand() {
   const headers = { 'x-api-key': config.proxy.apiKey };
   const name = args[1] && !args[1].startsWith('-') ? args[1] : null;
 
+  if (args.includes('--session')) {
+    await switchSessionCommand(port, headers, name);
+    return;
+  }
+
   try {
     if (!name) {
       const res = await fetch(`http://localhost:${port}/teamclaude/status`, { headers });
@@ -1832,11 +1837,80 @@ async function switchCommand() {
     if (data.eligible === false) {
       console.error(`Warning: "${data.account}" is ${data.reason || 'not currently eligible'}, so requests will not route to it until that changes.`);
     }
+    // Run from inside a Claude Code session (a `!` command, a tool), this is
+    // easy to mistake for moving just that session (#543).
+    if (process.env.CLAUDE_CODE_SESSION_ID) {
+      console.log(`This moved every session that is not pinned. To move only this one: teamclaude switch ${/^[\w.@+-]+$/.test(name) ? name : JSON.stringify(name)} --session`);
+    }
   } catch (err) {
     console.error('Cannot connect to proxy at localhost:' + port);
     console.error('Is the server running? Start with: teamclaude server');
     if (err?.message) console.error(`Details: ${err.message}`);
     process.exit(1);
+  }
+}
+
+/**
+ * `teamclaude switch <account> --session [<id>]`: hold one client session on an
+ * account, leaving the rest of the fleet alone (#543). `--clear` drops the pin.
+ * The id defaults to $CLAUDE_CODE_SESSION_ID, which Claude Code exports to the
+ * commands it runs, so from inside a session the flag alone names it.
+ * @param {number} port
+ * @param {Record<string, string>} headers
+ * @param {string|null} name
+ */
+async function switchSessionCommand(port, headers, name) {
+  const at = args.indexOf('--session');
+  const given = args[at + 1] && !args[at + 1].startsWith('-') ? args[at + 1] : null;
+  const sessionId = given || process.env.CLAUDE_CODE_SESSION_ID || null;
+  const clear = args.includes('--clear');
+  if (!sessionId) {
+    console.error('No session to pin: pass --session <id>, or run this from inside a Claude Code session (it reads $CLAUDE_CODE_SESSION_ID).');
+    process.exit(1);
+  }
+  if (!clear && !name) {
+    console.error('Usage: teamclaude switch <account> --session [<id>]   (or: teamclaude switch --session [<id>] --clear)');
+    process.exit(1);
+  }
+  const shown = sessionId.slice(0, 8);
+  let res;
+  try {
+    res = await fetch(`http://localhost:${port}/teamclaude/session-pin`, {
+      method: 'POST',
+      headers: { ...headers, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId, account: clear ? null : name }),
+    });
+  } catch (/** @type {any} */ err) {
+    console.error('Cannot connect to proxy at localhost:' + port);
+    console.error('Is the server running? Start with: teamclaude server');
+    if (err?.message) console.error(`Details: ${err.message}`);
+    process.exit(1);
+  }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const detail = typeof data.error === 'string' ? data.error : null;
+    console.error(detail || `Session pin failed: unexpected reply from localhost:${port} (HTTP ${res.status}).`);
+    if (!detail) console.error('An older server without this endpoint answers this way; restart it to pick up the new version.');
+    if (data.accounts?.length) {
+      console.error('Known accounts:');
+      for (const n of data.accounts) console.error(`  ${n}`);
+    }
+    process.exit(1);
+  }
+  if (clear) {
+    console.log(data.cleared ? `Session ${shown} unpinned; it follows the fleet again.` : `Session ${shown} had no pin.`);
+    return;
+  }
+  console.log(`Session ${shown} pinned to "${data.account}"; other sessions are unchanged.`);
+  if (data.eligible === false) {
+    console.error(`Warning: "${data.account}" is ${data.reason || 'not currently eligible'}, and a pinned session does not rotate away, so its requests will fail until that changes.`);
+  }
+  // A pin on an id no request carries pins nothing. Said rather than left to be
+  // discovered: the id may not be the one this session sends the proxy, or the
+  // session may not go through the proxy at all.
+  if (data.seen === false) {
+    console.error(`Warning: the proxy has not seen a request from session ${shown} in the last hour. The pin applies once one arrives;`
+      + ' if this session does not run through teamclaude, or sends a different session id, it never will.');
   }
 }
 
@@ -2761,6 +2835,8 @@ Commands:
   accounts            List configured accounts
   switch [NAME]       Make the running server prefer one account (as 's' in the
                       TUI does); with no NAME, list accounts and mark the current
+                      --session [ID] moves only that session ($CLAUDE_CODE_SESSION_ID
+                      by default); --session --clear drops its pin
   remove <name>       Remove an account (by name or email; --org to disambiguate)
   disable <name>      Temporarily exclude an account from rotation
   enable <name>       Re-enable a disabled account (also clears a stuck error)

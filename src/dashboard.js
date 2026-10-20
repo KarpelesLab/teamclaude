@@ -353,6 +353,14 @@ export function sessionRows(sessions) {
   });
 }
 
+// "pinned: 3f2a1b9c → api-1, 9d0e4c11 → work" — the sessions an operator held
+// on one account (`teamclaude switch --session`), or '' when there are none.
+/** @param {any} pins */
+export function sessionPinsText(pins) {
+  if (!Array.isArray(pins) || !pins.length) return '';
+  return 'pinned: ' + pins.map(function (p) { return (p && p.session || '?') + ' \u2192 ' + (p && p.account || '?'); }).join(', ');
+}
+
 export function filterSessionRows(rows, filters) {
   var f = filters || {};
   return (rows || []).filter(function (r) {
@@ -724,7 +732,7 @@ export function usageFor(entry, view) {
 export const CARD_NOTE_MAX_AGE_MS = 60 * 1000;
 
 const SHARED_HELPERS = [
-  scopedWeeklyRows, accountTokens, modelLabel, recentModelLabels, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
+  scopedWeeklyRows, accountTokens, modelLabel, recentModelLabels, providerLabel, thresholdBadgeText, accountBadges, sessionRows, sessionPinsText, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
   outsideSpendText, forecastText, showSessionRow, callerCan, callerNotice, cardNoteKey, cardNoteFor, backendQuotaRows,
 ].map(fn => fn.toString()).join('\n\n');
@@ -1397,6 +1405,8 @@ ${SHARED_HELPERS}
     // one page saying "sessions" here and "conversations" there would read as
     // two different quantities rather than one counted twice.
     sum.appendChild(el('span', '', ' · ' + (sess.active || 0) + ' active / ' + (sess.known || 0) + ' known conversations' + (up ? ' · ' + up : '')));
+    var pinsText = sessionPinsText(s.sessionPins);
+    if (pinsText) sum.appendChild(el('span', 'pin', ' · ' + pinsText));
     var probe = s.probe || {};
     var probeBtn = document.getElementById('probe');
     probeBtn.textContent = probe.running ? 'Probe running…' : 'Probe quotas';

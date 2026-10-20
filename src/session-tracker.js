@@ -653,6 +653,20 @@ export class SessionTracker {
     return ids;
   }
 
+  // Whether a client session with this id has made a request within the known
+  // window. Records are keyed by conversation, so it is matched against the
+  // session id each one carries, and against the key for one that names no
+  // conversation. A scan, for the control plane only: never on the request path.
+  /** @param {string|null} sessionId */
+  knowsSession(sessionId, now = this._now()) {
+    if (!sessionId) return false;
+    for (const [id, s] of this.sessions) {
+      if (this._isExpired(s, now)) continue;
+      if (id === sessionId || s.sessionId === sessionId) return true;
+    }
+    return false;
+  }
+
   // Drop sessions idle longer than the known window (but never one still in flight).
   sweep(now = this._now()) {
     this._lastSweep = now;

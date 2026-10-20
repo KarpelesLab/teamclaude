@@ -416,6 +416,9 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
   ['/teamclaude/threshold', 'a client key cannot change settings'],
   ['/teamclaude/priority', 'a client key cannot change accounts'],
   ['/teamclaude/disable', 'a client key cannot change accounts'],
+  // Not a config write, but it names a session and moves it: one tenant must
+  // not be able to put another tenant's session on an account of its choosing.
+  ['/teamclaude/session-pin', 'a client key cannot pin sessions'],
 ]);
 
 /**
@@ -788,6 +791,62 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           + (eligible ? '' : ` — ${reason}, so rotation will not use it`));
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true, account: name, eligible, ...(reason ? { reason } : {}) }));
+        return;
+      }
+
+      // Session pin — move ONE client session onto a named account, leaving the
+      // rest of the fleet where it is (`teamclaude switch <account> --session`,
+      // issue #543). Body: {"sessionId": "<x-claude-code-session-id>",
+      // "account": "<as for /switch>" | null}; null clears the pin. Runtime
+      // only, like /switch: it lives in the manager and dies with the process.
+      // The answer says whether the proxy has seen the session, because a pin on
+      // an id no request carries pins nothing, and the CLI says so.
+      if (req.method === 'POST' && req.url === '/teamclaude/session-pin') {
+        const names = () => (accountManager.accounts || []).map((/** @type {any} */ a) => a.name);
+        let body;
+        try {
+          body = JSON.parse((await readControlBody(req)) || '{}');
+        } catch (/** @type {any} */ err) {
+          const tooLarge = err.message === 'body too large';
+          res.writeHead(tooLarge ? 413 : 400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: tooLarge ? 'request body too large' : 'invalid request body' }));
+          return;
+        }
+        const sessionId = body?.sessionId;
+        if (typeof sessionId !== 'string' || !SESSION_ID_SHAPE.test(sessionId)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'missing or malformed "sessionId"' }));
+          return;
+        }
+        const target = body.account;
+        if (target !== null && (typeof target !== 'string' || !target.trim())) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'missing "account" (null clears the pin)', accounts: names() }));
+          return;
+        }
+        const seen = accountManager.sessionTracker.knowsSession(sessionId);
+        const shown = sessionId.slice(0, 8);
+        if (target === null) {
+          const cleared = accountManager.sessionPins.set(sessionId, null);
+          if (cleared) console.log(`[TeamClaude] Session ${shown} unpinned (manual)`);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, sessionId, account: null, cleared, seen }));
+          return;
+        }
+        const index = resolveAccountPin(accountManager, target);
+        if (index == null) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: `no such account "${target}"`, accounts: names() }));
+          return;
+        }
+        // The name, not the index: see session-pins.js.
+        const name = accountManager.accounts[index].name;
+        accountManager.sessionPins.set(sessionId, name);
+        const { eligible, reason } = accountManager.eligibility(index);
+        console.log(`[TeamClaude] Session ${shown} pinned to account "${name}" (manual)`
+          + (eligible ? '' : ` — ${reason}, so its requests will fail until that changes`));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, sessionId, account: name, seen, eligible, ...(reason ? { reason } : {}) }));
         return;
       }
 
@@ -1553,6 +1612,28 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
           res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: `Unknown account pin "${forcedPin}" (from TC_ACCT)` } }));
           recordEarlyOutcome(accountManager, { sessionId }, req.url, true);
           return;
+        }
+      }
+
+      // Operator session pin (`teamclaude switch --session`, issue #543): the
+      // same hard pin, set at runtime for one session instead of at launch. A
+      // launch pin above wins, being the more specific choice for this client.
+      // Resolved by name per request for the same reason as TC_ACCT, and an
+      // account that has since gone answers the same honest 404 rather than
+      // quietly routing the session somewhere the operator did not choose.
+      if (pinnedIndex == null) {
+        const sessionId = clientSessionId(req.headers);
+        const sessionPin = /** @type {any} */ (accountManager).sessionPins?.get(sessionId) ?? null;
+        if (sessionPin != null) {
+          pinnedIndex = resolveAccountPin(accountManager, sessionPin);
+          if (pinnedIndex == null) {
+            const reqId = ++counter;
+            if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(unknown pin: "${safeLine(sessionPin)}")`, status: 404, model: null, sessionId, pinned: false });
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: `Unknown account pin "${sessionPin}" (session pin; clear it with: teamclaude switch --session --clear)` } }));
+            recordEarlyOutcome(accountManager, { sessionId }, req.url, true);
+            return;
+          }
         }
       }
 

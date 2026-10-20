@@ -287,6 +287,25 @@ The rotation index is **not** accepted — it is array position, so deleting an 
 
 > If you hold the *same* account in two orgs, a bare uuid or email matches the first one. `TC_ACCT=<accountUuid>/<orgUuid>` picks a specific one — rarely needed.
 
+### Move one running session
+
+`TC_ACCT` is chosen at launch. To move a session that is already running, without moving the rest of the fleet the way `teamclaude switch <account>` does, pin it by its session id:
+
+```bash
+# From inside the session (a `!` command): Claude Code exports $CLAUDE_CODE_SESSION_ID
+teamclaude switch api-1 --session
+
+# From anywhere else, naming the session
+teamclaude switch api-1 --session 3f2a1b9c-…
+
+# Back to following the fleet
+teamclaude switch --session --clear
+```
+
+The pin behaves like `TC_ACCT`: the session's requests go to that account only and never fail over, and an account that has since been removed is refused with a `404` rather than quietly replaced. A launch-time `TC_ACCT` pin wins over it. The account is accepted in every form `TC_ACCT` accepts and stored by name, so it follows a rename.
+
+It is runtime state, like `switch`: kept in the server's memory, gone on a restart, and forgotten once the session has been idle for an hour. `teamclaude status` lists the pinned sessions on its **Pinned** line, the dashboard in its summary, and the activity view marks their requests `[pin]`. The command warns when the proxy has not seen a request from that session id in the last hour, since a pin on an id no request carries pins nothing. A caller holding a [client key](configuration.md) is refused, as for the other control-plane writes. The command wraps `POST /teamclaude/session-pin` with `{"sessionId": "<id>", "account": "<name>"}`, where `"account": null` clears the pin.
+
 <details>
 <summary>Pinning without <code>teamclaude run</code> (<code>/tc-acct/</code>, deprecated)</summary>
 

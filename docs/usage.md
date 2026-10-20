@@ -80,7 +80,7 @@ It is a setting, not a nudge: the number is written to the config file (under it
 
 You usually don't need to call it directly. `login`, `import`, `enable`, `disable`, `priority`, `route`, `threshold`, `distribute`, `probe` and `warmup` notify a running server themselves.
 
-Control-plane **writes** (`reload`, `switch`, `threshold`, `priority`, `disable`) are refused when the request carries a browser `Origin` or a cross-site `Sec-Fetch-Site`. Loopback is exempt from the proxy API key so the CLI needs no configuration, but that exemption also covers any web page you happen to visit: a page can POST to `127.0.0.1` cross-origin without a preflight, and while it cannot read the reply, the write would still land. `curl` and the CLI send neither header and are unaffected. Reads (`status`) are not restricted — the same-origin policy already stops a page from seeing the response.
+Control-plane **writes** (`reload`, `switch`, `session-pin`, `threshold`, `priority`, `disable`) are refused when the request carries a browser `Origin` or a cross-site `Sec-Fetch-Site`. Loopback is exempt from the proxy API key so the CLI needs no configuration, but that exemption also covers any web page you happen to visit: a page can POST to `127.0.0.1` cross-origin without a preflight, and while it cannot read the reply, the write would still land. `curl` and the CLI send neither header and are unaffected. Reads (`status`) are not restricted — the same-origin policy already stops a page from seeing the response.
 
 `GET /teamclaude/quota` is the compact read endpoint for status-line integrations. It returns tier-weighted fleet aggregates and the underlying per-account limits; see [Fleet quota endpoint](quota.md#fleet-quota-endpoint).
 
@@ -89,7 +89,10 @@ Switching the account by hand has the same headless path — the equivalent of p
 ```bash
 teamclaude switch                 # list accounts, marking the current one
 teamclaude switch me@example.com  # make that account the preferred one
+teamclaude switch me@example.com --session   # move only the session this runs in
 ```
+
+`--session [<id>]` moves one session instead of the fleet; see [Move one running session](routing.md#move-one-running-session).
 
 Both forms need a running server: the choice is runtime state and is never written to the config, so there is nothing to apply on a later restart. The command wraps `POST /teamclaude/switch` with a `{"account": "<name>"}` body, and the account can be given as its display name, its bare email, its `accountUuid`, its `orgUuid`, or the fully qualified `accountUuid/orgUuid` — the last being the only form that tells apart one email that holds accounts in several orgs. The rotation index is deliberately not accepted — it is array position, so a script pinned to `1` would silently follow a different account after a removal.
 

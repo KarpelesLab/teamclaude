@@ -233,3 +233,43 @@ test('status diagnoses an accepted connection whose server never answers', async
     silent.close();
   }
 });
+
+// `--session` (#543): one session moves, the fleet does not. The id comes from
+// $CLAUDE_CODE_SESSION_ID, which Claude Code exports to the commands it runs.
+const SID = '3f2a1b9c-0000-4000-8000-000000000001';
+
+test('switch NAME --session pins only that session, from $CLAUDE_CODE_SESSION_ID', async () => {
+  await withProxy(async (am, configPath) => {
+    const res = await runCli(configPath, ['switch', 'bob@example.com (Acme)', '--session'], { CLAUDE_CODE_SESSION_ID: SID });
+    assert.equal(res.code, 0, res.stderr);
+    assert.match(res.stdout, /Session 3f2a1b9c pinned to "bob@example\.com \(Acme\)"/);
+    assert.equal(am.currentIndex, 0, 'the fleet did not move');
+    assert.equal(am.sessionPins.get(SID), 'bob@example.com (Acme)');
+    // Nothing has carried this id yet, and the command says so.
+    assert.match(res.stderr, /has not seen a request from session 3f2a1b9c/);
+
+    const cleared = await runCli(configPath, ['switch', '--session', SID, '--clear'], { CLAUDE_CODE_SESSION_ID: '' });
+    assert.equal(cleared.code, 0, cleared.stderr);
+    assert.match(cleared.stdout, /Session 3f2a1b9c unpinned/);
+    assert.equal(am.sessionPins.get(SID), null);
+  });
+});
+
+test('switch --session with no session id to use fails with a usable message', async () => {
+  await withProxy(async (_am, configPath) => {
+    const res = await runCli(configPath, ['switch', 'alice@example.com', '--session'], { CLAUDE_CODE_SESSION_ID: '' });
+    assert.equal(res.code, 1);
+    assert.match(res.stderr, /pass --session <id>/);
+  });
+});
+
+test('a plain switch from inside a session says it moved every session', async () => {
+  await withProxy(async (am, configPath) => {
+    const res = await runCli(configPath, ['switch', 'bob@example.com (Acme)'], { CLAUDE_CODE_SESSION_ID: SID });
+    assert.equal(res.code, 0, res.stderr);
+    assert.equal(am.currentIndex, 1);
+    assert.match(res.stdout, /moved every session that is not pinned/);
+    const outside = await runCli(configPath, ['switch', 'alice@example.com'], { CLAUDE_CODE_SESSION_ID: '' });
+    assert.doesNotMatch(outside.stdout, /moved every session/);
+  });
+});

@@ -42,6 +42,12 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
   if (status.sessions) {
     lines.push(`${paint.dim('Sessions'.padEnd(12))} ${formatSessions(status.sessions, paint)}`);
   }
+  // Sessions the operator held on one account (`switch --session`), so one
+  // that will not follow the fleet is never a mystery. Absent when there are none.
+  const sessionPins = Array.isArray(status.sessionPins) ? status.sessionPins : [];
+  if (sessionPins.length) {
+    lines.push(`${paint.dim('Pinned'.padEnd(12))} ${formatSessionPins(sessionPins, paint)}`);
+  }
   lines.push(`${paint.dim('Probe'.padEnd(12))} ${formatProbeSummary(probe, now, paint)}`);
   if (warm.enabled) {
     lines.push(`${paint.dim('Keep-warm'.padEnd(12))} ${formatProbeSummary(warm, now, paint)}`);
@@ -553,6 +559,13 @@ function renderAccountHeader(account, currentAccount, paint, now, followSessions
   // in red on the Blocked line (see unavailableLine).
   const xu = account.allowExtraUsage === true ? ', extra usage allowed' : '';
   return `${marker} ${shown} ${paint.dim(`(${safeLine(account.type, 16)}, prio ${account.priority || 0}${xu})`)} ${status}${org}${sess}`;
+}
+
+// "3f2a1b9c → api-1, 9d0e4c11 → work" — each pinned session by the prefix the
+// activity view shows, and the account it is held on.
+/** @param {any[]} pins @param {any} paint */
+export function formatSessionPins(pins, paint) {
+  return pins.map((/** @type {any} */ p) => `${nameText(String(p?.session ?? ''))} → ${paint.cyan(nameText(String(p?.account ?? '')))}`).join(', ');
 }
 
 // "2 active / 3 known · distributing" — the running-sessions readout. While a
