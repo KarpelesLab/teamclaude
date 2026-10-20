@@ -5,7 +5,7 @@ import { createInterface } from 'node:readline';
 import { createWriteStream } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import net from 'node:net';
-import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, loadState, saveState } from './config.js';
+import { loadOrCreateConfig, loadConfig, loadConfigPersistingIds, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, loadState, saveState } from './config.js';
 import { installCrashHandlers } from './crash-log.js';
 import { AccountManager, distributionMode, accountRouting } from './account-manager.js';
 import { validateAdaptiveConfig } from './adaptive-distribution.js';
@@ -27,7 +27,7 @@ import { isRemoteSession, openBrowser, PANEL_LOGIN_TIMEOUT_MS } from './login-fl
 import { providerOf } from './provider.js';
 import { syncAccountsFromDisk } from './sync-accounts.js';
 import { mergeAccountsForSave, syncRefreshedTokens, removedAccountIds, clearRemovedAccountIds, clearAddedAccountIds, markAccountRemoved, configIndexFor } from './account-pairing.js';
-import { ensureAccountIds } from './account-id.js';
+import { ensureAccountIds, accountIdsComplete } from './account-id.js';
 import * as alias from './alias.js';
 import { ensureCerts, mitmHosts } from './mitm.js';
 import { Prober, probeApplicable } from './prober.js';
@@ -493,6 +493,11 @@ async function serverCommand() {
         diskConfig.accounts[cfgIdx].accessToken = newTokens.accessToken;
         diskConfig.accounts[cfgIdx].refreshToken = newTokens.refreshToken;
         diskConfig.accounts[cfgIdx].expiresAt = newTokens.expiresAt;
+      } else {
+        // Said out loud: the account keeps serving on the new token, so nothing
+        // else shows that the file still holds the old one until a restart
+        // fails on it.
+        console.error(`[TeamClaude] Refreshed token for "${safeLine(account.name, 64)}" not saved: no row in ${getConfigPath()} carries its entry id`);
       }
     }).catch(err => console.error(`[TeamClaude] Failed to save refreshed token: ${err.message}`));
     // And to the credential store, when signed in. Not awaited: the disk
@@ -548,7 +553,9 @@ async function serverCommand() {
   // disk and running accounts dropped because their entry is gone. Also picks
   // up a changed probe interval so `teamclaude probe` applies live.
   const doReload = async () => {
-    const diskConfig = await loadConfig();
+    // With any id the file lacked written back: an account picked up here keeps
+    // its entry's id, and its token writes find their row by it (#564).
+    const diskConfig = await loadConfigPersistingIds();
     if (!diskConfig) return { added: 0, removed: 0 };
     const { added, removed } = await syncAccountsFromDisk(diskConfig, config, accountManager);
     // `teamclaude callback login` notifies through a reload, so this is where a
@@ -3086,9 +3093,7 @@ async function persistMintedAccountIds(config) {
   } catch {
     return; // nothing on disk to reconcile with (or unreadable — the next save will tell)
   }
-  const ids = (Array.isArray(raw?.accounts) ? raw.accounts : []).map(a => a?.id);
-  const complete = ids.every(id => typeof id === 'string' && id !== '') && new Set(ids).size === ids.length;
-  if (!complete) await saveConfig(config);
+  if (!accountIdsComplete(raw?.accounts)) await saveConfig(config);
 }
 
 // ── helpers ─────────────────────────────────────────────────
