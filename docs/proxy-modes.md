@@ -32,6 +32,7 @@ A pool with Codex accounts also intercepts `chatgpt.com`. Inside that tunnel onl
 
 - The CA is generated locally, stored in the config dir, and trusted **only** by the claude process you launch via `teamclaude run` (through `NODE_EXTRA_CA_CERTS`) — it is **never** added to your system trust store. The leaf private key is `0600`; the CA private key is never written to disk.
 - TeamClaude still verifies the **real** Anthropic certificate on the upstream leg.
+- The chain is renewed when the leaf no longer names every intercepted host (the first Codex account adds `chatgpt.com`) or either certificate has under 30 days left. Since the CA key is not kept, a renewal always brings a new CA. So while the proxy runs, `teamclaude env` and `teamclaude run` keep the stored chain, which is the one the proxy presents, and print a warning that a renewal is due. Restart the proxy to renew it: a starting server renews a stored chain that falls short before it opens its port. Clients launched before a renewal still trust the old CA and need a restart of their own.
 
 Verify the proxy and CA without any credentials — the proxy always answers a built-in test host:
 

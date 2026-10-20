@@ -11,7 +11,7 @@ import {
 import { configIndexFor, managerAccountFor, markAccountRemoved, markAccountAdded } from './account-pairing.js';
 import { PROVIDERS, providerOf, isSubscriptionAccount, upstreamFor } from './provider.js';
 import { mintAccountId } from './account-id.js';
-import { formatPercent, heldResetCredits, showSessionRow } from './status-renderer.js';
+import { formatPercent, heldResetCredits, showSessionRow, showWeeklyRow } from './status-renderer.js';
 import { resolveMaxUsage, resolveMaxSpendMinor, switchThresholdDiffs, modelLabel, EFFORT_SEP } from './model.js';
 import { parseProxyUrl, proxyToUrl, describeProxy, describeSelfProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy, localListener, isSelfProxy } from './upstream-proxy.js';
 import { describeRouting, parseRoutingUrl, routingToUrl, checkRouting } from './account-routing.js';
@@ -2499,7 +2499,7 @@ export class TUI {
     const sess = this.am.sessionStats();
     const sessStr = (sess.active || sess.known)
       ? `${sess.active} sess${this.am.distributeSessions
-        ? green(this.am.distributionMode === 'adaptive' ? ' adapt' : ' dist')
+        ? green(this.am.distributionMode === 'adaptive' ? ' adapt' : this.am.distributionMode === 'load' ? ' load' : ' dist')
         : (sess.draining ? yellow(` drain ${sess.draining}`) : '')}  `
       : '';
     // ▼ marks a dashboard that lost contact with the server it polls (attach
@@ -2797,6 +2797,15 @@ export class TUI {
         const xu = extraUsageTag(a.allowExtraUsage === true, this._onExtraUsage(a));
         return Math.max(w, (tag ? 2 + vw(tag) : 0) + (xu ? 2 + vw(xu) : 0));
       }, 0);
+      // And for the reset-credit tag (`RC1`), drawn after the two above. It went
+      // unbudgeted once: the bars were sized to the edge, fitLine cut the tag, and
+      // an account holding a reset credit showed nothing on any row that drew a
+      // family bar. Counted through resetCreditTag, so a stale reading that draws
+      // no tag reserves no column either.
+      const creditW = members.reduce((/** @type {number} */ w, /** @type {any} */ a) => {
+        const tag = resetCreditTag(a.quota);
+        return tag ? Math.max(w, 2 + vw(tag)) : w;
+      }, 0);
       // Same rule again for the switch-threshold tag (#409) — silent on the
       // common (no override, or one that matches the fleet) row, so it costs
       // the budget nothing there, exactly like the two tags above it. It sits
@@ -2812,7 +2821,7 @@ export class TUI {
         const tag = routingTag(a);
         return tag ? Math.max(w, 2 + vw(tag)) : w;
       }, 0);
-      const fixed = 20 + typeCell + NAME_MIN + routeCells + tagW + spendW + switchW + routeW;
+      const fixed = 20 + typeCell + NAME_MIN + routeCells + tagW + spendW + creditW + switchW + routeW;
       const span = (/** @type {number} */ n, /** @type {number} */ bar) => fixed + 6 * (n - 1) + n * bar;
       const roomFor = (/** @type {number} */ n) => span(n, BAR_MIN) <= W;
       // No Ses bar once every Codex account here has said it meters no 5h window
@@ -3194,8 +3203,10 @@ export class TUI {
     // width (bar + `  Wk ` + bar) so the row still ends where its neighbours do.
     const weeklyOnly = !weeklyFirst && showBoth && category === 'unified'
       && providerOf(a) === 'codex' && !showSessionRow(q) && q.unified7d != null;
+    // The mirror case: a plan with no shared weekly window (a Team seat).
+    const sessionOnly = !weeklyFirst && showBoth && category === 'unified' && !showWeeklyRow(q);
     if (weeklyFirst || weeklyOnly) [l1, r1, t1, w1, th1] = [l2, r2, t2, w2, th2];
-    const bw1 = weeklyOnly ? bw * 2 + 6 : bw;
+    const bw1 = (weeklyOnly || sessionOnly) ? bw * 2 + 6 : bw;
 
     // Keep the optional chaining: _renderAcct is called on instances built
     // without a config, and it read none before this line existed.
@@ -3203,7 +3214,7 @@ export class TUI {
 
     let line = ` ${sel}${cur} ${startSlot}${name} ${type}${status} ${l1} ${bar(r1, bw1, t1, w1, th1, pctInBar)}`;
     if (showBoth) {
-      if (!weeklyFirst && !weeklyOnly) line += `  ${l2} ${bar(r2, bw, t2, w2, th2, pctInBar)}`;
+      if (!weeklyFirst && !weeklyOnly && !sessionOnly) line += `  ${l2} ${bar(r2, bw, t2, w2, th2, pctInBar)}`;
       // A backend's monthly window has no unified slot; it draws its own bar
       // and is budgeted as a family column, like S7/F7.
       if (showFamily && backendWindows?.monthly != null && l2 !== 'Mon') {

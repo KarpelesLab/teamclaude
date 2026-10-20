@@ -17,7 +17,7 @@ function oauth(name) {
 
 /** Render the dashboard at `width` and return the account rows, ANSI stripped,
  * exactly as _renderAcct produced them (before fitLine pads or truncates). */
-function renderRows(width, { fable = [], sonnet = [], accounts = 6, routes = [], apikey = [], switchThreshold = [] } = {}) {
+function renderRows(width, { fable = [], sonnet = [], accounts = 6, routes = [], apikey = [], switchThreshold = [], resetCredits = [] } = {}) {
   const names = Array.from({ length: accounts }, (_, i) => `acct${i}@example.com`);
   const entries = names.map((name, i) => apikey.includes(i)
     ? { name, type: 'apikey', apiKey: `k-${i}` }
@@ -47,6 +47,10 @@ function renderRows(width, { fable = [], sonnet = [], accounts = 6, routes = [],
     if (sonnet[i] != null) {
       a.quota.unified7dSonnet = sonnet[i];
       a.quota.unified7dSonnetReset = Date.now() + (i + 1) * 24 * h;
+    }
+    // Held reset credits (Codex free credits, Claude banked resets), fresh.
+    if (resetCredits[i] != null) {
+      a.quota.resetCredits = { available: resetCredits[i], applicable: resetCredits[i], expiresAt: Date.now() + 19 * 24 * h, seenAt: Date.now() };
     }
   });
 
@@ -186,6 +190,21 @@ test('the switch tag gets its own room rather than being cut off', () => {
     assert.ok(widest(rows) <= w, `W=${w}: widest row is ${widest(rows)} columns`);
     assert.ok(rows.some(r => r.includes('switch at 100%')), `W=${w}: the bare-number tag survives intact`);
     assert.ok(rows.some(r => r.includes('switch fable 50%')), `W=${w}: the per-bucket tag survives intact`);
+  }
+});
+
+test('the reset-credit tag gets its own room rather than being cut off', () => {
+  // The bars were sized to the edge without counting `RC1`, so fitLine cut it
+  // off every row that drew a family bar (and any row at 80 columns).
+  const fable = [0.1, 0.29, 0.02, 0.0, 0.11, 0.0];
+  const sonnet = [0.2, 0.3, 0.4, 0.1, 0.2, 0.3];
+  for (const w of [80, 86, 100, 120, 160]) {
+    for (const family of [{}, { fable }, { fable, sonnet }]) {
+      const rows = renderRows(w, { ...family, resetCredits: [null, 1, null, 2] });
+      assert.ok(widest(rows) <= w, `W=${w}: widest row is ${widest(rows)} columns`);
+      assert.ok(rows.some(r => r.includes('RC1')), `W=${w}: RC1 survives intact`);
+      assert.ok(rows.some(r => r.includes('RC2')), `W=${w}: RC2 survives intact`);
+    }
   }
 });
 
