@@ -1406,6 +1406,21 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       return;
     }
 
+    if (ctx.transientUpstreamFailure) {
+      const retryAfter = capacityRetryAfter(accountManager, ctx.model);
+      ctx.status = 503;
+      ctx.account = '(upstreams unavailable)';
+      res.writeHead(503, { 'Content-Type': 'application/json', 'retry-after': String(retryAfter) });
+      res.end(JSON.stringify({ type: 'error', error: {
+        type: 'api_error', message: `Model upstreams are temporarily unavailable. Retry in ${retryAfter}s.`,
+      } }));
+      emitProvenance(ctx, {
+        final: true, outcome: 'upstreams-unavailable', response_status: 503,
+        account: ctx.account, attempt: ctx.attempt || 0,
+      });
+      return;
+    }
+
     ctx.status = 429;
     ctx.account = '(none available)';
     const status = accountManager.getStatus();
@@ -1770,6 +1785,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
           },
         });
         ctx.tried.add(account.index);
+        ctx.transientUpstreamFailure = true;
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
       }
       // Fall through: retries exhausted, pinned, or headersSent — relay as upstream-error.
@@ -2157,6 +2173,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       });
       ctx.tried.add(account.index);
       console.log(`[TeamClaude] Custom upstream transport failure on "${account.name}" — circuit open, failing over`);
+      ctx.transientUpstreamFailure = true;
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
 
