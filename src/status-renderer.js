@@ -647,7 +647,7 @@ function adaptiveFor(status, name) {
 }
 
 // "next · weight 62%  ·  3 sess / 1 inflight  ·  head 38.0% of 98%  ·  plan 20x
-//  ·  conc 6"
+//  ·  conc 6"; under scoring "pressure" the last three give way to "P 3.85e-6".
 //
 // `next` is the deterministic routing result. `weight` is the account's score
 // normalized across competitors, useful for explaining why it won without
@@ -660,14 +660,19 @@ function formatAdaptive(a, paint) {
     // Every candidate scored zero: the whole tier is inside its reserve, so
     // there is no weight to report and saying "0%" everywhere would imply the
     // router had stopped, which it has not.
-    ? `${prefix}${paint.yellow(`weight n/a (all reserved, ${family})`)}`
+    ? `${prefix}${paint.yellow(`weight n/a (${a.scoring === 'pressure' ? 'all zero' : 'all reserved'}, ${family})`)}`
     : `${prefix}${paint.bold(`weight ${pct(a.weight, 0)} of ${family}`)}`);
   parts.push(`${num(a.sessions)} sess / ${num(a.inFlight)} inflight`);
-  parts.push(`head ${pct(a.headroom, 1)} of ${pct(a.threshold, 0)}`);
-  parts.push(a.planWeight == null
-    ? paint.dim('plan unknown')
-    : `plan ${Number.isFinite(a.planWeight) ? a.planWeight : '?'}x`);
-  parts.push(`conc ${num(a.concCap, 1)}`);
+  if (a.scoring === 'pressure') {
+    // The score is P over load: no head, plan weight or concurrency cap went into it.
+    parts.push(`P ${Number.isFinite(a.placementPressure) ? a.placementPressure.toExponential(2) : '?'}`);
+  } else {
+    parts.push(`head ${pct(a.headroom, 1)} of ${pct(a.threshold, 0)}`);
+    parts.push(a.planWeight == null
+      ? paint.dim('plan unknown')
+      : `plan ${Number.isFinite(a.planWeight) ? a.planWeight : '?'}x`);
+    parts.push(`conc ${num(a.concCap, 1)}`);
+  }
   const line = parts.join(paint.dim('  ·  '));
   return a.competing ? line : `${paint.dim('(not competing)')} ${line}`;
 }
