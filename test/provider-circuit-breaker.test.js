@@ -207,3 +207,40 @@ test('noteProviderResult backoff formula hits the 60s cap and stays there', () =
   for (let i = 0; i < 8; i++) opens.push(am.noteProviderResult(0, { ok: false, status: 500 }));
   assert.deepEqual(opens, [2000, 4000, 8000, 16000, 32000, 60000, 60000, 60000]);
 });
+
+test('failed route upstreams return temporary 503 with circuit retry, not fleet quota exhaustion', async () => {
+  for (const disconnect of [false, true]) {
+    const bad = http.createServer((req, res) => {
+      if (disconnect) { req.socket.destroy(); return; }
+      res.writeHead(502, { 'content-type': 'application/json' }); res.end('{"error":"unavailable"}');
+    });
+    const port = await listen(bad);
+    const am = new AccountManager([
+      { name: 'a', type: 'apikey', apiKey: 'test', upstream: `http://127.0.0.1:${port}` },
+      { name: 'b', type: 'apikey', apiKey: 'test', upstream: `http://127.0.0.1:${port}` },
+      { name: 'unrelated', type: 'apikey', apiKey: 'test' },
+    ]);
+    am.setRoutes([{ name: 'deepseek', match: ['deepseek-*'], accounts: ['a', 'b'] }]);
+    am.accounts[2].quota.unified7d = 1;
+    am.accounts[2].quota.unified7dReset = Date.now() + 604800000;
+    const proxy = createProxyServer(am, { proxy: { apiKey: 'test' }, upstream: 'http://invalid' });
+    const proxyPort = await listen(proxy);
+    try {
+      const response = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'deepseek-v4-pro', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] }),
+      });
+      assert.equal(response.status, 503, `disconnect=${disconnect}`);
+      assert.ok(Number(response.headers.get('retry-after')) >= 1);
+      assert.ok(Number(response.headers.get('retry-after')) <= 2);
+      const body = await response.json();
+      assert.equal(body.error.type, 'api_error');
+      assert.doesNotMatch(body.error.message, /quota|exhausted|3600/);
+      assert.equal(am.accounts[0].consecutiveFailures, 1);
+      assert.equal(am.accounts[1].consecutiveFailures, 1);
+    } finally {
+      proxy.closeAllConnections(); bad.closeAllConnections();
+      await close(proxy); await close(bad);
+    }
+  }
+});
