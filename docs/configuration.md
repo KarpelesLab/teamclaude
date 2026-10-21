@@ -4,7 +4,7 @@
 
 Config is stored at `~/.config/teamclaude.json` (or `$XDG_CONFIG_HOME/teamclaude.json`). A random proxy API key is generated on first use.
 
-Volatile runtime state (observed quota, per-client and per-dimension usage) is written separately to `teamclaude.state.json` alongside the config, so the config file stays clean and hand-editable. The state file is safe to delete — quota is simply re-learned from traffic, and usage windows refill from the next day's traffic (the lifetime counters do not come back).
+Volatile runtime state (observed quota, per-client and per-dimension usage) is written separately to `teamclaude.state.json` alongside the config, so the config file stays clean and hand-editable. The state file is safe to delete — quota is simply re-learned from traffic, and usage windows refill from the next day's traffic (the lifetime counters do not come back). The samples behind the [fleet forecast](quota.md#fleet-forecast) go to `teamclaude.quota-series.json` beside it, bounded to 7 days and equally safe to delete.
 
 That file is small for a typical fleet, but it is no longer trivially small: usage is kept per 15-minute slot for a day (see [Usage windows](usage.md#status-dashboard-browser)). Every client key and dimension value ever seen keeps a row of lifetime counters, as it always has, and those are never deleted; what the day of slots adds is carried only by the keys **active in the last 24 hours**, because a key that goes quiet drops its slots the next time it is read or written. So a dimension that merely accumulates stale values does not accumulate slots with them.
 

@@ -5,7 +5,8 @@ import { createInterface } from 'node:readline';
 import { createWriteStream, existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import net from 'node:net';
-import { loadOrCreateConfig, loadConfig, loadConfigPersistingIds, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, loadState, saveState } from './config.js';
+import { loadOrCreateConfig, loadConfig, loadConfigPersistingIds, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, getQuotaSeriesPath, loadState, saveState } from './config.js';
+import { loadQuotaSeries, saveQuotaSeries } from './quota-series.js';
 import { installCrashHandlers } from './crash-log.js';
 import { AccountManager, distributionMode, accountRouting } from './account-manager.js';
 import { validateAdaptiveConfig } from './adaptive-distribution.js';
@@ -404,6 +405,10 @@ async function serverCommand() {
   const dimensionUsage = new UsageDimensionTracker();
   if (savedState?.usageDimensions) dimensionUsage.restore(savedState.usageDimensions);
 
+  // The quota series behind the fleet forecast (#550), in its own file beside
+  // the state file. Missing or corrupt reads as empty history.
+  accountManager.quotaSeries = await loadQuotaSeries(getQuotaSeriesPath());
+
   // With quota restored, pick the best account up front (highest priority /
   // soonest-resetting weekly window) instead of defaulting to the first one.
   accountManager.selectActiveAccount();
@@ -413,6 +418,15 @@ async function serverCommand() {
     saveState({ quota: accountManager.exportQuotaState(), clients: clientUsage.exportState(), usageDimensions: dimensionUsage.exportState() })
       .catch(err => console.error(`[TeamClaude] Failed to save quota state: ${err.message}`));
   let quotaSaveInterval = null;
+  // Sampled on the same minute tick, but only written when a sample was taken
+  // or something was pruned: about once per SAMPLE_INTERVAL_MS.
+  const sampleQuotaSeries = () => {
+    if (!accountManager.sampleQuotaSeries()) return;
+    saveQuotaSeries(getQuotaSeriesPath(), accountManager.quotaSeries)
+      .catch(err => console.error(`[TeamClaude] Failed to save the quota series: ${err.message}`));
+  };
+  /** @type {ReturnType<typeof setInterval>|null} */
+  let quotaSeriesInterval = null;
 
   // An account admitted from somewhere other than this install's config: the
   // callback.net credential store (credential-sync.js). Same three lists the
@@ -984,6 +998,8 @@ async function serverCommand() {
   // Persist quota every minute; unref so it never keeps the process alive.
   quotaSaveInterval = setInterval(persistQuotaState, 60_000);
   quotaSaveInterval.unref?.();
+  quotaSeriesInterval = setInterval(sampleQuotaSeries, 60_000);
+  quotaSeriesInterval.unref?.();
 
   // Start the opt-in quota probe (no-op when quotaProbeSeconds is 0).
   prober = new Prober(accountManager, {
@@ -1044,6 +1060,7 @@ async function serverCommand() {
     credentialSync.stop();
     eventLoopMonitor.stop();
     if (quotaSaveInterval) clearInterval(quotaSaveInterval);
+    if (quotaSeriesInterval) clearInterval(quotaSeriesInterval);
     await persistQuotaState();
     // Don't linger waiting on keep-alive / streaming connections: actively
     // destroy them so server.close() can complete promptly, and hard-exit after a

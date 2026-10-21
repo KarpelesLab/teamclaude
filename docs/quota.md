@@ -111,6 +111,30 @@ The burn-rate learner behind [adaptive distribution](routing.md#adaptive-distrib
 
 What the rate is. It is the learner's moving average of how fast utilization rose, measured over windows of `burnWindowMs` between readings no more than `maxSampleAgeMs` apart (see [`adaptiveDistribution`](configuration.md)). It counts all spend on the account, the proxy's and [outside spend](#spend-from-outside-the-proxy) alike. Like any moving average it reflects the recent past: a burst that has stopped keeps the forecast short until flat readings bring the rate down, and an account with no fresh readings keeps its last rate. The projection starts when the utilization was read, not at the status read, so an old reading counts down rather than repeating the same distance; once its projected time has passed, the status text drops it. With the [quota probe](#quota-probe) off, an idle account gets no readings, so its forecast is as old as its last traffic.
 
+## Fleet forecast
+
+The burn-rate forecast answers for one account. The fleet forecast ([#550](https://github.com/KarpelesLab/teamclaude/issues/550)) answers for the whole pool: when is every account out at once, and when does the first one come back? `fleetForecast` in `/teamclaude/status`:
+
+```json
+"fleetForecast": { "allOutAt": 1780000000000, "firstBackAt": 1780014400000, "boundBy": "weekly", "ratePerDay": 1.38 }
+```
+
+`allOutAt` is the first moment every account is blocked (the current time when they all already are), and `firstBackAt` the first moment after it that one is usable again; both are ms epoch. `boundBy` is the bucket that blocks most of the fleet at `allOutAt`: `weekly` or `5h`. `ratePerDay` is the fleet's measured weekly spend, in shares of one account's week per day (`1.38` uses 138% of a week per day, spread over the accounts).
+
+`teamclaude status` and the dashboard show it as one line, only when there is a forecast: `all accounts out in ~31h (weekly), first back 4h later`.
+
+It is `null` until the proxy has 48 hours of samples, `null` when the samples cover too little of a rate window to trust (under 6 hours of the weekly window, or under 1 hour of the last 6 hours), and `null` when nothing runs out within 14 days.
+
+How it works. Every 15 minutes the proxy stores one sample per account from the readings it already has: weekly and 5-hour utilization and when each window resets. It makes no extra upstream call, so an account is sampled only once the proxy has read it, from traffic or the [quota probe](#quota-probe). The forecast then simulates the fleet forward from the current readings:
+
+- Each bucket has its own measured rate. The weekly rate is the fleet's summed weekly increase over the last 24 hours, or the last 7 days once the samples cover at least 6 of them, shaped by hour of day (UTC): a flat evening rate carried through the night would call the wall too early. The 5-hour rate is the summed increase over the last 6 hours, flat. Each rate is divided by the time the samples actually cover inside its window, not by the whole window: two samples more than 30 minutes apart are a gap, such as a stopped proxy, and a gap does not count as a quiet fleet.
+- Spend goes to the fullest account still under its [switch thresholds](#switch-threshold), as rotation does, so the order in which accounts fill is the order they would be used.
+- An account is blocked while either bucket is at or over its threshold, and comes back at that bucket's reset. A weekly reset is followed by the next one 7 days later, a 5-hour reset by the next one 5 hours later.
+
+A window reset shows in the samples as a drop, or as an empty reading where the proxy had cleared the window at its reset; a drop is never counted as negative spend, and the first reading of the new window counts in full. The forecast covers Anthropic subscription accounts in rotation. Codex accounts are a separate pool, a disabled account is not in rotation, and an API key meters no window.
+
+The samples are kept in `teamclaude.quota-series.json` next to the config, not in the state file. The file is written atomically, keeps 7 days and at most 800 samples per account, and drops the history of an account at the next sample after it is removed. A missing or corrupt file is empty history, so it is safe to delete; the forecast is `null` again until 48 hours of new samples accumulate.
+
 ## Keep-warm
 
 The rolling **5-hour session window** only starts once an account sends a real message. So when your active account runs out and rotation moves to a cold account, that account's 5h window starts *then* — right when you need its full headroom. Keep-warm ([#76](https://github.com/KarpelesLab/teamclaude/issues/76)) starts the timer on idle accounts ahead of time, so the next account is already partway (or fully) through a fresh window when it's needed.

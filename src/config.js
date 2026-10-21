@@ -31,6 +31,16 @@ export function getStatePath() {
 }
 
 /**
+ * Path to the quota series behind the fleet forecast (a sibling of the state
+ * file, see quota-series.js). Kept out of the state file: it is the one piece
+ * of runtime state that grows with time, so it carries bounds of its own.
+ */
+export function getQuotaSeriesPath() {
+  const cfg = getConfigPath();
+  return cfg.endsWith('.json') ? cfg.replace(/\.json$/, '.quota-series.json') : cfg + '.quota-series';
+}
+
+/**
  * Path to the crash log (a sibling of the config), where a fatal error is
  * recorded before the process exits.
  */
@@ -68,8 +78,12 @@ export async function saveState(state) {
  * "enforce 0600 on every save" behaviour of the old code holds: a config that
  * was once world-readable becomes 0600 on the next save, and the tokens are
  * never on disk under a looser mode even for an instant.
+ *
+ * `space` is JSON.stringify's indent: 2 for the hand-readable files, 0 for
+ * the quota series, whose thousands of rows would otherwise take a line per
+ * number.
  */
-export async function writeJsonAtomic(path, value) {
+export async function writeJsonAtomic(path, value, { space = 2 } = {}) {
   // A rename replaces the NAME, so a config that is a symlink (a dotfiles
   // checkout, say) would silently become a regular file where the old in-place
   // write followed the link. Resolve it first; a dangling or absent path is
@@ -80,7 +94,7 @@ export async function writeJsonAtomic(path, value) {
   try {
     const fh = await open(tmp, 'w', 0o600);
     try {
-      await fh.writeFile(JSON.stringify(value, null, 2) + '\n');
+      await fh.writeFile(JSON.stringify(value, null, space) + '\n');
       await fh.sync();
     } finally {
       await fh.close();
