@@ -3030,8 +3030,9 @@ function refusalMessage(accountManager, rejected, statuses) {
 
 /**
  * The answer when the accounts a request reached all held an expired token that
- * could not be renewed. 503 with a short Retry-After: the renewal may go through
- * on the next request (the lock freed, the token endpoint back). Never a 401 or
+ * could not be renewed. 503 with the Retry-After of the token endpoint's 429 hold
+ * when there is one, else a short one: the renewal may go through on the next
+ * request (the lock freed, the token endpoint back). Never a 401 or
  * a 403 — the client's own credential is fine.
  * @param {import('node:http').ServerResponse} res
  * @param {Record<string, any>} ctx
@@ -3045,10 +3046,15 @@ function respondUnrenewed(res, ctx, accountManager) {
   const reasons = failures.map(f => f.reason);
   // A refresh token the endpoint rejected IS fixed by a re-login; say so then.
   const relogin = failures.some(f => [400, 401, 403].includes(f.status)) ? ' Re-add it with: teamclaude login' : '';
+  // Come back when a renewal may be tried again: the longest 429 hold among these
+  // accounts (the token endpoint's Retry-After), or 30 s when none is held.
+  const now = Date.now();
+  const held = Math.max(0, ...[...ctx.unrenewed].map((/** @type {string} */ n) => (accountManager.accounts.find((a) => a.name === n)?._refreshHeldUntil ?? 0) - now));
+  const retryAfter = held > 0 ? Math.ceil(held / 1000) : 30;
   ctx.status = 503;
   ctx.account = `(${[...ctx.unrenewed].join(', ')} not renewed)`;
   if (!res.headersSent) {
-    res.writeHead(503, { 'Content-Type': 'application/json', 'retry-after': '30' });
+    res.writeHead(503, { 'Content-Type': 'application/json', 'retry-after': String(retryAfter) });
     res.end(JSON.stringify({
       type: 'error',
       error: { type: 'overloaded_error', message: `No account served this request: the token of ${names} has expired and could not be renewed${reasons.length ? ` (${reasons.join('; ')})` : ''}.${relogin || ' Retry shortly.'}` },
