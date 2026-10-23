@@ -163,6 +163,17 @@ function nodeRequest(u, opts, timeoutMs, { transport, agent }) {
     const timer = setTimeout(() => req.destroy(headersTimeoutError(timeoutMs)), timeoutMs);
     timer.unref?.();
     req.once('error', (err) => { clearTimeout(timer); reject(err); });
+    if (opts.signal) {
+      const onAbort = () => {
+        clearTimeout(timer);
+        const reason = opts.signal.reason;
+        const err = reason instanceof Error ? reason : new Error('aborted');
+        if (!err.code) err.code = 'ABORT_ERR';
+        req.destroy(err);
+      };
+      if (opts.signal.aborted) onAbort();
+      else opts.signal.addEventListener('abort', onAbort, { once: true });
+    }
 
     const body = opts.body;
     const method = (opts.method || 'GET').toUpperCase();

@@ -143,6 +143,39 @@ export function isLoopbackUpstreamUrl(url) {
   }
 }
 
+// Cursor Auto on loopback CLIProxy often pauses >120s between thinking tokens.
+// The remote Anthropic body-idle budget would cut that stream, Claude Code would
+// open a second /v1/messages, and both hang on the same Cursor Connect session
+// until headers-timeout circuit-opens the only cursor-pro account.
+const DEFAULT_BODY_IDLE_TIMEOUT_MS = 120_000;
+const LOOPBACK_BODY_IDLE_TIMEOUT_MS = 600_000;
+
+export function defaultBodyIdleTimeoutMs(url) {
+  const env = Number(process.env.TEAMCLAUDE_UPSTREAM_BODY_TIMEOUT_MS);
+  if (env > 0) return env;
+  return isLoopbackUpstreamUrl(url) ? LOOPBACK_BODY_IDLE_TIMEOUT_MS : DEFAULT_BODY_IDLE_TIMEOUT_MS;
+}
+
+const messagesAbortBySession = new Map();
+
+export function abortPriorMessages(sessionId) {
+  const next = new AbortController();
+  if (sessionId) {
+    const prev = messagesAbortBySession.get(sessionId);
+    if (prev && !prev.signal.aborted) {
+      const err = new Error('superseded by a newer /v1/messages for this session');
+      err.code = 'TEAMCLAUDE_SESSION_SUPERSEDED';
+      prev.abort(err);
+      console.log(`[TeamClaude] aborted prior /v1/messages for session ${String(sessionId).slice(0, 8)}…`);
+    }
+    messagesAbortBySession.set(sessionId, next);
+    next.signal.addEventListener('abort', () => {
+      if (messagesAbortBySession.get(sessionId) === next) messagesAbortBySession.delete(sessionId);
+    }, { once: true });
+  }
+  return next;
+}
+
 export function createProxyServer(accountManager, config, hooks = {}, sx = null) {
   const upstream = config.upstream || 'https://api.anthropic.com';
   const proxyApiKey = config.proxy?.apiKey;
@@ -1076,6 +1109,7 @@ export function createProxyRequestListener({
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request. Semantic stamp/hint-clear only for /v1/messages*.
       accountManager.beginSession(sessionId, { semantic, pathClass, model });
+      if (pathClass === 'messages' && sessionId) ctx.sessionAbort = abortPriorMessages(sessionId);
       try {
         await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir, sx);
       } catch (err) {
@@ -1785,6 +1819,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         headers,
         body: ['GET', 'HEAD'].includes(method) ? undefined : sendBody,
         redirect: 'manual',
+        signal: ctx.sessionAbort?.signal,
       }, sx, route);
       ctx.attemptRec.headers_ms = Date.now() - attemptStartedAt;
     } finally {
@@ -2163,6 +2198,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         sessionId: ctx.sessionId,
         model: ctx.model,
         pathClass: ctx.pathClass,
+        upstreamUrl: account.upstream,
       }, ctx.attemptRec, argonStream);
       if (argonStream?.rewrote) {
         l?.write('\n\n=== PLAINTEXT TOOL CALL REPAIRED: client received a tool_use block ===');
@@ -2271,6 +2307,26 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // budget before the first SSE byte. Circuit-opening cursor-pro then failovers
     // to "none available" and Claude Code retries forever. Do not treat that
     // hang as a dead adapter.
+    if (err?.code === 'TEAMCLAUDE_SESSION_SUPERSEDED') {
+      if (!res.headersSent && !res.destroyed) {
+        ctx.status = 499;
+        res.writeHead(499, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: { type: 'proxy_error', message: err.message },
+        }));
+      }
+      emitProvenance(ctx, {
+        _account: account,
+        final: true,
+        outcome: 'session-superseded',
+        response_status: ctx.status || 499,
+        attempt: ctx.attempt || 0,
+        err_code: err.code,
+      });
+      return;
+    }
+
     const loopbackSlowFirstByte = isTransient
       && err?.code === 'TEAMCLAUDE_HEADERS_TIMEOUT'
       && isLoopbackUpstreamUrl(account.upstream);
@@ -2406,12 +2462,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
 // converting a mid-stream hang into a fast failure that evicts the dead socket
 // (reader.cancel destroys the underlying connection on both the direct-fetch and
 // the sx-tunnel path, since both hand back a web ReadableStream). Override with
-// TEAMCLAUDE_UPSTREAM_BODY_TIMEOUT_MS.
-const DEFAULT_BODY_IDLE_TIMEOUT_MS = 120_000;
-
-function resolveBodyIdleTimeout() {
-  const env = Number(process.env.TEAMCLAUDE_UPSTREAM_BODY_TIMEOUT_MS);
-  return env > 0 ? env : DEFAULT_BODY_IDLE_TIMEOUT_MS;
+// TEAMCLAUDE_UPSTREAM_BODY_TIMEOUT_MS. Loopback adapters use 600s (see
+// defaultBodyIdleTimeoutMs) so Cursor Auto thinking gaps do not cut the stream.
+function resolveBodyIdleTimeout(url) {
+  return defaultBodyIdleTimeoutMs(url);
 }
 
 // Race a single reader.read() against an inactivity deadline. Resolves to the
@@ -2442,7 +2496,7 @@ export function readWithIdleTimeout(reader, ms) {
  */
 async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter, sessionCtx = null, attemptRec = null, transform = null) {
   const reader = webStream.getReader();
-  const idleMs = resolveBodyIdleTimeout();
+  const idleMs = resolveBodyIdleTimeout(sessionCtx?.upstreamUrl);
   const decoder = new TextDecoder();
   let sseBuffer = '';
   const usageState = {};

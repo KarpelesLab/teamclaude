@@ -5,7 +5,7 @@ import { once } from 'node:events';
 import { ReadableStream } from 'node:stream/web';
 import { TextEncoder, TextDecoder } from 'node:util';
 import { defaultHeadersTimeoutMs, upstreamFetch } from '../src/upstream-fetch.js';
-import { isLoopbackUpstreamUrl, readWithIdleTimeout } from '../src/server.js';
+import { isLoopbackUpstreamUrl, defaultBodyIdleTimeoutMs, abortPriorMessages, readWithIdleTimeout } from '../src/server.js';
 
 test('loopback custom adapters wait longer for first SSE byte than remote Anthropic', () => {
   assert.equal(defaultHeadersTimeoutMs('https://api.anthropic.com/v1/messages'), 120_000);
@@ -13,6 +13,21 @@ test('loopback custom adapters wait longer for first SSE byte than remote Anthro
   assert.equal(defaultHeadersTimeoutMs('http://localhost:8318/v1/messages'), 600_000);
   assert.equal(isLoopbackUpstreamUrl('http://127.0.0.1:8318'), true);
   assert.equal(isLoopbackUpstreamUrl('https://api.anthropic.com'), false);
+});
+
+test('loopback adapters also get a 600s body-idle budget', () => {
+  assert.equal(defaultBodyIdleTimeoutMs('https://api.anthropic.com/v1/messages'), 120_000);
+  assert.equal(defaultBodyIdleTimeoutMs('http://127.0.0.1:8318/v1/messages'), 600_000);
+});
+
+test('a newer /v1/messages aborts the prior in-flight for the same session', () => {
+  const first = abortPriorMessages('sess-operator');
+  const second = abortPriorMessages('sess-operator');
+  assert.equal(first.signal.aborted, true);
+  assert.equal(first.signal.reason?.code, 'TEAMCLAUDE_SESSION_SUPERSEDED');
+  assert.equal(second.signal.aborted, false);
+  abortPriorMessages('sess-other');
+  assert.equal(second.signal.aborted, false);
 });
 
 // Bring up an HTTP server on an ephemeral port and hand back {server, port}.
