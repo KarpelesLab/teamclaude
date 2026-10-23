@@ -490,6 +490,16 @@ async function serverCommand() {
   const onListenError = err => handleServerListenError(err, port);
   server.once('error', onListenError);
 
+  // Probe subscription windows before accept() so cursor/auto does not 503
+  // "quota unknown" for the first few seconds and kick Claude Code into a retry.
+  prober = new Prober(accountManager, { intervalMs: (config.quotaProbeSeconds || 0) * 1000 });
+  if ((config.quotaProbeSeconds || 0) > 0) {
+    console.log('[TeamClaude] Waiting for initial subscription quota probe before listen');
+    try { await prober.probeAll(); }
+    catch (err) { console.error(`[TeamClaude] Initial quota probe failed: ${err.message}`); }
+  }
+  prober.start();
+
   server.listen(port, bindHost, () => {
     // Bind succeeded: stop treating errors as listen failures, but keep a
     // benign runtime handler so a later 'error' is logged rather than thrown.
@@ -530,10 +540,6 @@ async function serverCommand() {
   // Persist quota every minute; unref so it never keeps the process alive.
   quotaSaveInterval = setInterval(persistQuotaState, 60_000);
   quotaSaveInterval.unref?.();
-
-  // Start the opt-in quota probe (no-op when quotaProbeSeconds is 0).
-  prober = new Prober(accountManager, { intervalMs: (config.quotaProbeSeconds || 0) * 1000 });
-  prober.start();
 
   // Start the opt-in keep-warm scheduler (no-op when warmupSeconds is 0). It
   // spawns a minimal `claude` per idle account through this proxy, pinned via

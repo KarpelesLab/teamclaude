@@ -52,7 +52,9 @@ export class Prober {
       this.nextRunAt = Date.now() + intervalMs;
       // Immediate probe only on an off→on transition — not on every interval
       // change (mirrors warmer.js; avoids an extra burst when the interval is edited).
-      if (!wasOn) this.probeAll().catch(() => {});
+      // Skip if the caller already awaited probeAll() before listen so a
+      // restart does not double-hit CLIProxy management.
+      if (!wasOn && !this.lastRunFinishedAt) this.probeAll().catch(() => {});
       this.timer = setInterval(() => this.probeAll().catch(() => {}), intervalMs);
       this.timer.unref?.();
       this.log(`[TeamClaude] Quota probe enabled (every ${Math.round(intervalMs / 1000)}s)`);
