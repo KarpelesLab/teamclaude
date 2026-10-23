@@ -131,6 +131,27 @@ test('D4b: routingPolicy PRESENT with different mode applies; absent sibling key
   assert.equal(am.routingPolicy.reevaluateMs, 12_345, 'absent key preserves running');
 });
 
+test('D4b: distributeSessions PRESENT applies; ABSENT preserves running', () => {
+  const mem = {
+    accounts: [apikey('a')],
+    distributeSessions: false,
+  };
+  const am = new AccountManager(mem.accounts, 0.98, { distributeSessions: false });
+  assert.equal(am.distributeSessions, false);
+
+  applyTopLevelReload({ accounts: [apikey('a')] }, mem, am);
+  assert.equal(am.distributeSessions, false, 'absent key preserves running');
+  assert.equal(mem.distributeSessions, false);
+
+  applyTopLevelReload({ accounts: [apikey('a')], distributeSessions: true }, mem, am);
+  assert.equal(am.distributeSessions, true, 'explicit true is operator intent');
+  assert.equal(mem.distributeSessions, true);
+
+  applyTopLevelReload({ accounts: [apikey('a')], distributeSessions: false }, mem, am);
+  assert.equal(am.distributeSessions, false, 'explicit false is operator intent');
+  assert.equal(mem.distributeSessions, false);
+});
+
 // ── (c) syncAccountsFromDisk prunes removed accounts ───────────────────────
 
 test('D4c: removed account leaves rotation; pin refuses; sibling indices stable', async () => {

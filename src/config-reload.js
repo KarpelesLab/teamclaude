@@ -51,6 +51,15 @@ export function applyTopLevelReload(diskConfig, memConfig, accountManager) {
     accountManager.setRoutingPolicy(merged);
   }
 
+  // Same D4b contract as routingPolicy: absent ⇒ preserve running; present
+  // (including explicit false) is operator intent. Without this, equal-priority
+  // OAuth fleets stay sticky-to-currentIndex until a full process restart.
+  if (hasOwn(diskConfig, 'distributeSessions')) {
+    const val = !!diskConfig.distributeSessions;
+    memConfig.distributeSessions = val;
+    accountManager.distributeSessions = val;
+  }
+
   if (hasOwn(diskConfig, 'rotationGate')) {
     const disk = (diskConfig.rotationGate && typeof diskConfig.rotationGate === 'object')
       ? diskConfig.rotationGate : {};
