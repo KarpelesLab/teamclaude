@@ -4,8 +4,16 @@ import http from 'node:http';
 import { once } from 'node:events';
 import { ReadableStream } from 'node:stream/web';
 import { TextEncoder, TextDecoder } from 'node:util';
-import { upstreamFetch } from '../src/upstream-fetch.js';
-import { readWithIdleTimeout } from '../src/server.js';
+import { defaultHeadersTimeoutMs, upstreamFetch } from '../src/upstream-fetch.js';
+import { isLoopbackUpstreamUrl, readWithIdleTimeout } from '../src/server.js';
+
+test('loopback custom adapters wait longer for first SSE byte than remote Anthropic', () => {
+  assert.equal(defaultHeadersTimeoutMs('https://api.anthropic.com/v1/messages'), 120_000);
+  assert.equal(defaultHeadersTimeoutMs('http://127.0.0.1:8318/v1/messages'), 600_000);
+  assert.equal(defaultHeadersTimeoutMs('http://localhost:8318/v1/messages'), 600_000);
+  assert.equal(isLoopbackUpstreamUrl('http://127.0.0.1:8318'), true);
+  assert.equal(isLoopbackUpstreamUrl('https://api.anthropic.com'), false);
+});
 
 // Bring up an HTTP server on an ephemeral port and hand back {server, port}.
 async function listen(handler) {

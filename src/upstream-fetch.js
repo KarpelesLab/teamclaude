@@ -61,13 +61,31 @@ const USE_GLOBAL_FETCH = /^(1|true|yes|on)$/i.test(process.env.TEAMCLAUDE_UPSTRE
 // Default is generous (well above Claude's realistic first-byte, even when
 // queued or under load) so a slow-but-legitimate response is never mistaken for
 // a dead socket. Override with TEAMCLAUDE_UPSTREAM_HEADERS_TIMEOUT_MS (or
-// per-call opts).
+// per-call opts). Loopback custom adapters (CLIProxy cursor-pro) can think for
+// minutes before the first SSE byte; 120s there circuit-opens the only eligible
+// account for cursor/auto and Claude Code dead-loops on 429.
 const DEFAULT_HEADERS_TIMEOUT_MS = 120_000;
+const LOOPBACK_HEADERS_TIMEOUT_MS = 600_000;
 
-function resolveHeadersTimeout(perCall) {
+function isLoopbackUrl(url) {
+  try {
+    const host = new URL(url).hostname;
+    return host === '127.0.0.1' || host === 'localhost' || host === '::1' || host === '[::1]';
+  } catch {
+    return false;
+  }
+}
+
+export function defaultHeadersTimeoutMs(url) {
+  return resolveHeadersTimeout(undefined, url);
+}
+
+function resolveHeadersTimeout(perCall, url) {
   if (perCall != null) return perCall;
   const env = Number(process.env.TEAMCLAUDE_UPSTREAM_HEADERS_TIMEOUT_MS);
-  return env > 0 ? env : DEFAULT_HEADERS_TIMEOUT_MS;
+  if (env > 0) return env;
+  if (url && isLoopbackUrl(url)) return LOOPBACK_HEADERS_TIMEOUT_MS;
+  return DEFAULT_HEADERS_TIMEOUT_MS;
 }
 
 function headersTimeoutError(ms) {
@@ -83,7 +101,7 @@ function headersTimeoutError(ms) {
 // (plus the headers-timeout guard).
 export function upstreamFetch(url, opts = {}, sx = null, useProxy = false) {
   const { headersTimeoutMs, ...fetchOpts } = opts;
-  const timeoutMs = resolveHeadersTimeout(headersTimeoutMs);
+  const timeoutMs = resolveHeadersTimeout(headersTimeoutMs, url);
   if (sx && useProxy && sx.isProvisioned()) return proxiedFetch(url, fetchOpts, sx, timeoutMs);
   return USE_GLOBAL_FETCH ? directFetch(url, fetchOpts, timeoutMs) : pooledFetch(url, fetchOpts, timeoutMs);
 }
