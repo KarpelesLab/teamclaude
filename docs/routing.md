@@ -44,6 +44,10 @@ If every configured account returns that exact denial, TeamClaude's terminal `50
 
 An explicit [`TC_ACCT` pin](#pin-a-session-to-one-account) continues to target exactly the requested account and never fails over, even while that account is excluded from automatic rotation.
 
+## Token scope denials
+
+A `403` with `error.details.error_code: oauth_scope_insufficient` is about the token, not the account. A `claude setup-token` token carries `user:inference` only, so Claude Code's bootstrap, settings and connector-registry calls draw this on every such account. TeamClaude does not fail those over: a `GET` that draws one goes out once more on the client's own bearer, like the [identity plane](proxy-modes.md), over the same upstream proxy, sx route and admission queue as any forwarded request, and rotation stays where it was. Any other method, which includes every completion, a [pinned](#pin-a-session-to-one-account) request, and a client with no bearer of its own get the normal handling.
+
 ## One failover hop on a rate limit
 
 A **quota rejection** (a 429 carrying `...unified-*-status: rejected`) is durable

@@ -110,6 +110,8 @@ function resolveHeaderless429RetryDelayMs() {
   return env > 0 ? env : DEFAULT_HEADERLESS_429_RETRY_DELAY_MS;
 }
 const OAUTH_ENTITLEMENT_ERROR_CODE = 'oauth_not_allowed_for_organization';
+// A token missing a scope the endpoint needs (see isOAuthScopeInsufficient).
+const OAUTH_SCOPE_ERROR_CODE = 'oauth_scope_insufficient';
 const ERROR_BODY_INSPECTION_LIMIT = 64 * 1024;
 // How long an idle keep-alive connection is held open.
 //
@@ -134,15 +136,30 @@ const RESET_CLEARS = new Set(['quota', 'throttled']);
 // behind upstream's own `rejected` verdict.
 const CLAUDE_RESET_CLEARS = new Set(['quota', 'throttled', 'upstream-rejected']);
 
+/**
+ * The structured `error.details.error_code` of an upstream error body, or null.
+ * @param {Uint8Array} body
+ */
+function upstreamErrorCode(body) {
+  try {
+    return JSON.parse(Buffer.from(body).toString('utf8'))?.error?.details?.error_code ?? null;
+  } catch {
+    return null;
+  }
+}
+
 /** Classify only the structured organization-policy denial observed upstream.
  * Message text and generic permission errors are deliberately not enough. */
 export function isOAuthEntitlementDenied(body) {
-  try {
-    const parsed = JSON.parse(Buffer.from(body).toString('utf8'));
-    return parsed?.error?.details?.error_code === OAUTH_ENTITLEMENT_ERROR_CODE;
-  } catch {
-    return false;
-  }
+  return upstreamErrorCode(body) === OAUTH_ENTITLEMENT_ERROR_CODE;
+}
+
+/** A 403 about the token's scopes, not the account: a `claude setup-token`
+ * token carries user:inference only, and Claude Code's bootstrap, settings and
+ * connector-registry calls need user:profile, so every such account draws one.
+ * @param {Uint8Array} body */
+export function isOAuthScopeInsufficient(body) {
+  return upstreamErrorCode(body) === OAUTH_SCOPE_ERROR_CODE;
 }
 
 // Error payloads are normally tiny, but an alternate upstream is configurable.
@@ -2026,6 +2043,27 @@ function sxAgent(sx, targetHost) {
 }
 
 /**
+ * The client's request headers as they go upstream on its OWN credential.
+ * @param {import('node:http').IncomingHttpHeaders} reqHeaders
+ * @param {Set<string>|null} [strip] further names to drop (usage dimensions)
+ */
+function clientCredentialHeaders(reqHeaders, strip = null) {
+  /** @type {import('node:http').OutgoingHttpHeaders} */
+  const headers = {};
+  for (const [key, value] of Object.entries(reqHeaders)) {
+    const lk = key.toLowerCase();
+    if (lk.startsWith(':') || HOP_BY_HOP_HEADERS.has(lk) || lk === 'accept-encoding') continue;
+    // The client's identity on this path is its bearer; x-api-key is how it
+    // authenticated to THIS proxy, so relaying it would hand the operator's
+    // proxy key to upstream.
+    if (lk === 'x-api-key') continue;
+    if (strip?.has(lk)) continue;
+    headers[key] = value;
+  }
+  return headers;
+}
+
+/**
  * Relay a request to upstream with the client's OWN headers intact (including
  * its authorization) — used for Remote Control (/v1/code/*), whose event
  * stream is a long-poll: the client keeps the request open indefinitely and
@@ -2035,17 +2073,7 @@ function sxAgent(sx, targetHost) {
  */
 function relayStream(req, res, upstream, sx, stripOverage = false) {
   const target = new URL(`${upstream}${req.url}`);
-  /** @type {import('node:http').OutgoingHttpHeaders} */
-  const headers = {};
-  for (const [key, value] of Object.entries(req.headers)) {
-    const lk = key.toLowerCase();
-    if (lk.startsWith(':') || HOP_BY_HOP_HEADERS.has(lk) || lk === 'accept-encoding') continue;
-    // The client's identity on this path is its bearer; x-api-key is how it
-    // authenticated to THIS proxy, so relaying it would hand the operator's
-    // proxy key to upstream.
-    if (lk === 'x-api-key') continue;
-    headers[key] = value;
-  }
+  const headers = clientCredentialHeaders(req.headers);
 
   const useProxy = !!(sx?.useByDefault() && sx.isProvisioned());
   const agent = useProxy ? sxAgent(sx, target.hostname) : undefined;
@@ -3056,6 +3084,56 @@ function respondUnrenewed(res, ctx, accountManager) {
   }
 }
 
+/**
+ * A GET the pooled token was not scoped for, sent once on the client's own
+ * credential (the scope branch of forwardRequest). It takes the forward path's
+ * transport, not relayStream's: the admission gate, the fleet upstream proxy,
+ * this attempt's sx route and the default headers deadline all apply, since
+ * this is an ordinary request and not a Remote Control long-poll. The body is
+ * buffered the way the forward path buffers a non-streaming answer.
+ * @param {any} req
+ * @param {any} res
+ * @param {string} upstream
+ * @param {any} sx
+ * @param {boolean} route
+ * @param {Record<string, any>} ctx
+ */
+async function relayOnClientCredential(req, res, upstream, sx, route, ctx) {
+  try {
+    const upstreamRes = await upstreamFetch(`${upstream}${req.url}`, {
+      method: 'GET',
+      headers: clientCredentialHeaders(req.headers, ctx.stripHeaders),
+      signal: ctx.signal,
+      redirect: 'manual',
+    }, sx, route);
+    /** @type {Record<string, string>} */
+    const responseHeaders = {};
+    for (const [key, value] of upstreamRes.headers.entries()) {
+      if (CONNECTION_SPECIFIC_HEADERS.has(key) || key === 'content-encoding' || key === 'content-length') continue;
+      if (ctx.stripOverage === true && isOverageHeader(key)) continue;
+      responseHeaders[key] = value;
+    }
+    const buf = Buffer.from(await upstreamRes.arrayBuffer());
+    ctx.status = upstreamRes.status;
+    res.writeHead(upstreamRes.status, responseHeaders);
+    res.end(buf);
+  } catch (err) {
+    const code = /** @type {{ code?: string }|null} */ (err)?.code;
+    if (code === 'TEAMCLAUDE_CLIENT_GONE') { ctx.abandoned = true; ctx.status = 499; return; }
+    const overloaded = code === 'TEAMCLAUDE_UPSTREAM_OVERLOADED';
+    console.error('[TeamClaude] Client-credential relay error:', describeConnectError(err));
+    ctx.status = overloaded ? 503 : 502;
+    if (!res.headersSent && !clientGone(res)) {
+      res.writeHead(ctx.status, overloaded
+        ? { 'Content-Type': 'application/json', 'Retry-After': '1' }
+        : { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(overloaded
+        ? { type: 'error', error: { type: 'overloaded_error', message: 'Proxy upstream queue is full; retry shortly.' } }
+        : { type: 'error', error: { type: 'proxy_error', message: 'Upstream unreachable' } }));
+    }
+  }
+}
+
 export async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, useSx) {
   const maxRetries = accountManager.accounts.length;
   // This function is exported, so a caller may hand us a ctx built elsewhere.
@@ -3858,6 +3936,24 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // account left, the no-account branch reports a proxy error instead.
     if (upstreamRes.status === 403 && !res.headersSent) {
       const responseBody = await readErrorBody(upstreamRes.body);
+      // Except a scope 403: the account is fine, its token just cannot reach
+      // this endpoint. A `claude setup-token` token is inference-only, so
+      // Claude Code's bootstrap, settings and connector-registry calls draw one
+      // on every such account. Failing over walked the whole fleet for each of
+      // them and moved the shared cursor every time, taking running sessions
+      // off the account they were on. Those calls are the client's own, like
+      // the identity plane, so they go out once more on the client's own
+      // credential. GET only: those calls are, and a completion never is, so
+      // the client's login is never spent on inference. A pin keeps its
+      // account for every request, as before.
+      if (req.method === 'GET' && ctx.pinnedIndex == null
+          && account.type === 'oauth' && providerOf(account) === DEFAULT_PROVIDER
+          && responseBody != null && isOAuthScopeInsufficient(responseBody)
+          && /^Bearer \S/i.test(String(req.headers.authorization || ''))) {
+        ctx.account = '(client credential)';
+        await relayOnClientCredential(req, res, upstream, sx, route, ctx);
+        return;
+      }
       const entitlementDenied = account.type === 'oauth'
         && responseBody != null
         && isOAuthEntitlementDenied(responseBody);
