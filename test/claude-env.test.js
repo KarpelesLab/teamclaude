@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildClaudeEnvLines, directLaunchEnvPlan, redactUrlUserinfo } from '../src/claude-env.js';
+import { buildClaudeEnvLines, directLaunchEnvPlan, redactUrlUserinfo, MITM_NO_PROXY } from '../src/claude-env.js';
 
 test('MITM mode (default) emits proxy vars + CA cert, and clears ANTHROPIC_BASE_URL', () => {
   const lines = buildClaudeEnvLines({ port: 3456, caPath: '/home/u/.config/teamclaude-ca.pem' });
@@ -9,11 +9,18 @@ test('MITM mode (default) emits proxy vars + CA cert, and clears ANTHROPIC_BASE_
     'export HTTP_PROXY=http://127.0.0.1:3456',
     'export https_proxy=http://127.0.0.1:3456',
     'export http_proxy=http://127.0.0.1:3456',
-    'export NO_PROXY=localhost,127.0.0.1,::1',
-    'export no_proxy=localhost,127.0.0.1,::1',
+    `export NO_PROXY=${MITM_NO_PROXY}`,
+    `export no_proxy=${MITM_NO_PROXY}`,
     'export NODE_EXTRA_CA_CERTS=/home/u/.config/teamclaude-ca.pem',
     'unset ANTHROPIC_BASE_URL',
   ]);
+});
+
+test('MITM NO_PROXY bypasses GitHub and keeps the Anthropic upstream interceptable', () => {
+  assert.match(MITM_NO_PROXY, /(?:^|,)github\.com(?:,|$)/);
+  assert.match(MITM_NO_PROXY, /(?:^|,)\.github\.com(?:,|$)/);
+  assert.match(MITM_NO_PROXY, /(?:^|,)localhost(?:,|$)/);
+  assert.doesNotMatch(MITM_NO_PROXY, /api\.anthropic\.com/);
 });
 
 test('MITM mode without a caPath omits NODE_EXTRA_CA_CERTS (never emits an empty value)', () => {

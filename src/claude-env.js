@@ -1,3 +1,23 @@
+// Hosts that must never ride the MITM CONNECT path. `teamclaude run` points
+// HTTPS_PROXY at the local gateway so Claude Code's hardcoded api.anthropic.com
+// calls get token injection — but with proxy.noForwarding the gateway 403s
+// CONNECT to every other host. gh/git/curl inherit that proxy and fail with
+// "403" / "bad credentials" even when `gh auth` is valid. Loopback stays here
+// so the client can still reach the gateway itself; api.anthropic.com must NOT,
+// or MITM stops intercepting. Shared by `teamclaude env` and `teamclaude run`.
+export const MITM_NO_PROXY = [
+  'localhost',
+  '127.0.0.1',
+  '::1',
+  'github.com',
+  '.github.com',
+  'githubusercontent.com',
+  '.githubusercontent.com',
+  'ghcr.io',
+  '.ghcr.io',
+  'downloads.claude.ai',
+].join(',');
+
 // Percent-encode an account name (or key) for a URL, leaving ONLY the unreserved
 // set. encodeURIComponent alone is not enough here: it passes `( ) ' ! *`
 // through untouched, and these lines are emitted as unquoted shell `export`
@@ -42,8 +62,8 @@ export function buildClaudeEnvLines({ port, useMitm = true, caPath = null, holdS
       `export HTTP_PROXY=${proxyUrl}`,
       `export https_proxy=${proxyUrl}`,
       `export http_proxy=${proxyUrl}`,
-      'export NO_PROXY=localhost,127.0.0.1,::1',
-      'export no_proxy=localhost,127.0.0.1,::1',
+      `export NO_PROXY=${MITM_NO_PROXY}`,
+      `export no_proxy=${MITM_NO_PROXY}`,
     );
     if (caPath) lines.push(`export NODE_EXTRA_CA_CERTS=${caPath}`);
     // Clear any stale base-URL so the two modes don't stack in one shell.

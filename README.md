@@ -654,7 +654,7 @@ That launches claude pointed at teamclaude as an **HTTPS forward proxy** (`HTTPS
 - reads `anthropic-ratelimit-*` from responses for quota; and
 - **resends the request on a different account** if one returns a quota `429`, so a "you've reached your limit" is never surfaced while another account has headroom.
 
-Because the request is buffered, the retry is transparent to claude. Remote Control (`/v1/code/*`) and client token refreshes (`/v1/oauth/token`) are passed through with the client's own credential. Any host other than the upstream is blind-tunnelled. The server accepts *both* base-URL and proxy clients at once, so instances launched with and without `--no-mitm` can share one server.
+Because the request is buffered, the retry is transparent to claude. Remote Control (`/v1/code/*`) and client token refreshes (`/v1/oauth/token`) are passed through with the client's own credential. Any host other than the upstream is blind-tunnelled. When `proxy.noForwarding` is enabled, those third-party CONNECTs are refused with 403 instead (closes an open-relay hole). `teamclaude run` / `teamclaude env` therefore set `NO_PROXY` to loopback plus GitHub hosts so `gh`/`git`/`curl` talk to GitHub directly rather than inheriting `HTTPS_PROXY` and getting 403. The server accepts *both* base-URL and proxy clients at once, so instances launched with and without `--no-mitm` can share one server.
 
 Trust model:
 - The CA is generated locally, stored in the config dir, and trusted **only** by the claude process you launch via `teamclaude run` (through `NODE_EXTRA_CA_CERTS`) — it is **never** added to your system trust store. The leaf private key is `0600`; the CA private key is never written to disk.

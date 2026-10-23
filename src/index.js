@@ -20,7 +20,7 @@ import { SxManager } from './sx.js';
 import { autoUpdate, checkForUpdate, currentVersion, runUpdate, installKind, PKG_NAME } from './updater.js';
 import { renderStatus } from './status-renderer.js';
 import { syncAccountsFromDisk, applyTopLevelReload } from './config-reload.js';
-import { buildClaudeEnvLines, encodePinComponent, directLaunchEnvPlan, redactUrlUserinfo } from './claude-env.js';
+import { buildClaudeEnvLines, encodePinComponent, directLaunchEnvPlan, redactUrlUserinfo, MITM_NO_PROXY } from './claude-env.js';
 import { deriveNamespace } from './model-namespace.js';
 import { explainRouting, formatExplain, launchSummary } from './route-explain.js';
 import {
@@ -884,7 +884,7 @@ async function runCommand() {
         : '';
       const proxyUrl = `http://${userinfo}127.0.0.1:${port}`;
       env.HTTPS_PROXY = env.HTTP_PROXY = env.https_proxy = env.http_proxy = proxyUrl;
-      env.NO_PROXY = env.no_proxy = 'localhost,127.0.0.1,::1';
+      env.NO_PROXY = env.no_proxy = MITM_NO_PROXY;
       env.NODE_EXTRA_CA_CERTS = caPath;
       if (tcAcct) {
         const via = accountPinFromFlag ? `--account ${accountPinFromFlag.name} → TC_ACCT` : 'TC_ACCT';
@@ -1060,9 +1060,10 @@ function shellSingleQuote(value) {
 // is argued in model-preflight.js's header).
 //
 // `accountPin` and `routingApplies` are what keep the check honest about WHICH
-// rules govern the launch it is judging. A pinned session bypasses selection
-// entirely, and a proxy-down --auto-fallback launch bypasses teamclaude
-// entirely; in neither case may the unpinned routing table refuse anything.
+// rules govern the launch it is judging. A pinned session bypasses route
+// selection (not `disabled` — that 403s locally), and a proxy-down
+// --auto-fallback launch bypasses teamclaude entirely; in neither case may the
+// unpinned routing table refuse anything.
 //
 // The `--settings` scan is the same read-only discipline one level further out:
 // that flag is a settings tier too, and its availableModels union in, so a

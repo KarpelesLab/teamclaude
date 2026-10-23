@@ -71,6 +71,8 @@ export const PROVENANCE_OUTCOMES = Object.freeze([
   'rejected-blocked',
   'rejected-collision',
   'rejected-pin-unservable',
+  // Operator-disabled account named by /tc-acct or TC_ACCT — local 403, no egress.
+  'rejected-pin-disabled',
   'exhausted-typed-429',
   'pinned-unavailable',
   'upstream-error-relayed',

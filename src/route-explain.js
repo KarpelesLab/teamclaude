@@ -431,7 +431,12 @@ function buildWarnings({ routes, accounts, id, winner, owners, ownershipDecides,
       message: `"${pin.token}" matches no account name or index — the proxy answers 404 "Unknown account pin" locally (server.js:255-259)`,
     });
   }
-  if (pin && pin.resolved && pin.routable === false) {
+  if (pin && pin.resolved && pin.account?.disabled) {
+    out.push({
+      code: 'pin-account-disabled',
+      message: `account "${pin.name}" is disabled — the proxy answers 403 locally and never contacts upstream`,
+    });
+  } else if (pin && pin.resolved && pin.routable === false) {
     out.push({
       code: 'pin-outside-routing',
       message: `account "${pin.name}" is pinned, so it serves this request even though the routing rules would never select it for "${id}" — the pin bypasses selection, not the upstream's own model support`,
@@ -741,6 +746,9 @@ export function launchSummary(config, {
     const pin = pinnedRoutabilityOf(config, model, pinToken);
     const acct = pin.account;
     if (!acct) return `model ${id ?? '(client default)'} → pin "${displayPin}" matches NO account — every request 404s`;
+    if (acct.disabled) {
+      return `${id ? `model ${id}` : 'client default model'} → PINNED account "${acct.name}" (#${acct.index}) is DISABLED — every request 403s locally`;
+    }
     const dest = acct.upstream || 'the Anthropic API';
     const as = pin.mappedTo ? ` as "${pin.mappedTo}"` : '';
     const outside = pin.outsideRouting ? ', outside the routing rules' : '';

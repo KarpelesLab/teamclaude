@@ -64,11 +64,12 @@
 //
 // The one thing this preflight may never do is refuse a launch on rules that
 // will not govern it. Two shapes of that were live and are now closed: a
-// `--account` pin bypasses selection entirely (routes, models[] and `disabled`
-// are never consulted for a pinned request, so they cannot justify a refusal),
-// and a `--auto-fallback` launch with the proxy down never reaches teamclaude at
-// all (so its routing table is not consulted either). Both are threaded in as
-// parameters rather than assumed away.
+// `--account` pin bypasses selection (routes and models[] are never consulted
+// for a pinned request, so they cannot justify a refusal — `disabled` is an
+// operator hard-stop and DOES refuse, with a local 403), and a `--auto-fallback`
+// launch with the proxy down never reaches teamclaude at all (so its routing
+// table is not consulted either). Both are threaded in as parameters rather
+// than assumed away.
 //
 // `--force` bypasses a block for the operator who knows better; `--strict`
 // promotes the client warning to a block for the operator who wants the mirror
@@ -383,15 +384,19 @@ export function preflightModel({
     } else if (pinToken != null) {
       routing = pinnedRoutabilityOf(config, requested, pinToken);
       if (!routing.routable) {
+        const disabledPin = !!routing.account?.disabled;
         findings.push({
           severity: 'error',
-          code: routing.blockedBy ? 'model-blocked' : 'pin-cannot-serve',
+          code: routing.blockedBy ? 'model-blocked' : (disabledPin ? 'pin-account-disabled' : 'pin-cannot-serve'),
           message: `${flag} "${requested}" cannot be served by the pinned account. ${routing.reason}`,
           remedies: routing.blockedBy
             ? [`remove "${routing.blockedBy}" from blockedModels, or ask for a different id`,
               `see the full decision trace: \`teamclaude explain ${requested} --account ${pinToken}\``]
-            : ['teamclaude accounts — the valid names',
-              `see the full decision trace: \`teamclaude explain ${requested} --account ${pinToken}\``],
+            : disabledPin
+              ? [`teamclaude enable ${routing.account.name}`,
+                'or drop --account and let rotation choose']
+              : ['teamclaude accounts — the valid names',
+                `see the full decision trace: \`teamclaude explain ${requested} --account ${pinToken}\``],
         });
       } else {
         for (const f of pinAdvisories(requested, routing, pinToken)) findings.push(f);
@@ -508,10 +513,8 @@ export function preflightModel({
 }
 
 // What a pinned launch can still be told, none of which is a refusal: the pin
-// wins over every one of these, and saying so is the honest report. `disabled`
-// in particular is worth a line — a pin addresses the account by INDEX and
-// never consults availability, so an operator who disabled an account will see
-// it serve this session anyway.
+// wins over route/models[] selection, and saying so is the honest report.
+// `disabled` is NOT an advisory — pinnedRoutabilityOf already refuses it.
 function pinAdvisories(model, routing, pinToken) {
   const out = [];
   const acct = routing.account;
@@ -524,16 +527,6 @@ function pinAdvisories(model, routing, pinToken) {
         + `the id: ${acct.upstream ? `it goes to ${acct.upstream}, whose model map teamclaude cannot see` : 'it goes to the Anthropic API verbatim'}`
         + `${routing.mappedTo ? `, after modelMap rewrites it to "${routing.mappedTo}"` : ''}.`,
       remedies: [`ids that account translates are listed by: \`teamclaude explain ${model} --account ${pinToken}\``],
-    });
-  }
-  if (acct?.disabled) {
-    out.push({
-      severity: 'warn',
-      code: 'pin-account-disabled',
-      message: `account "${acct.name}" is DISABLED, but a /tc-acct pin addresses it by index and bypasses availability `
-        + 'entirely (server.js:536-537), so this session would use it regardless — while the TUI and rotation keep '
-        + 'treating it as out of service.',
-      remedies: [`teamclaude enable ${acct.name}`, 'or drop --account and let rotation choose'],
     });
   }
   return out;

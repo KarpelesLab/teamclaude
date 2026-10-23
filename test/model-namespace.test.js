@@ -312,22 +312,15 @@ test('an empty config and an empty model id are answered, not thrown', () => {
 
 // ── pinned routability (/tc-acct) ─────────────────────────────
 
-test('a pin bypasses route exclusivity, the models[] claim and `disabled` — because the request path does', () => {
+test('a pin bypasses route exclusivity and the models[] claim — because the request path does', () => {
   // forwardRequest indexes accountManager.accounts[ctx.pinnedIndex] directly
-  // (server.js:536-537) and never calls getActiveAccount, so not one of the
-  // eligibility rules is consulted. Every one of these is a launch the unpinned
-  // oracle calls impossible and the proxy serves anyway.
+  // and never calls getActiveAccount, so route/ownership rules are not
+  // consulted. `disabled` is the exception: it is an operator hard-stop.
   const config = liveConfig();
-  config.accounts[5].disabled = true;                    // deepseek-v4-pro, and the catch-all excludes it too
-
-  const unpinned = routabilityOf(config, 'claude-fable-5');
-  assert.ok(!unpinned.candidates.some(c => c.name === 'deepseek-v4-pro' && !c.disabled));
-
   const pinned = pinnedRoutabilityOf(config, 'claude-fable-5', 'deepseek-v4-pro');
   assert.equal(pinned.routable, true);
   assert.equal(pinned.pinned, true);
   assert.equal(pinned.account.name, 'deepseek-v4-pro');
-  assert.equal(pinned.account.disabled, true, 'reported, because the pin serves it regardless');
   assert.equal(pinned.mappedTo, 'deepseek-v4-pro', 'the pinned account\'s own modelMap decides the wire id');
   assert.match(pinned.reason, /bypasses selection/);
 
@@ -335,6 +328,17 @@ test('a pin bypasses route exclusivity, the models[] claim and `disabled` — be
   const outside = pinnedRoutabilityOf(liveConfig(), 'claude-opus-4-8', 'deepseek-v4-pro');
   assert.equal(outside.routable, true);
   assert.equal(outside.outsideRouting, true, 'route "opus" excludes deepseek-v4-pro — the pin is what reaches it');
+});
+
+test('a pin to a disabled account is not routable — the proxy 403s locally', () => {
+  const config = liveConfig();
+  config.accounts[5].disabled = true;                    // deepseek-v4-pro
+  const pinned = pinnedRoutabilityOf(config, 'claude-fable-5', 'deepseek-v4-pro');
+  assert.equal(pinned.routable, false);
+  assert.equal(pinned.account.name, 'deepseek-v4-pro');
+  assert.equal(pinned.account.disabled, true);
+  assert.match(pinned.reason, /disabled/);
+  assert.match(pinned.reason, /403/);
 });
 
 test('a pin is resolved name-first then by index, and an unresolved one is the one thing that always fails', () => {

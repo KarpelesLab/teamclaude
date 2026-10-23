@@ -634,18 +634,19 @@ export function resolveAccountToken(accounts, token) {
  * strictly different question from routabilityOf(), and the reason this function
  * exists rather than a flag on that one.
  *
- * A pinned request skips account selection entirely: forwardRequest indexes
- * `accountManager.accounts[ctx.pinnedIndex]` directly (server.js:536-537) and
- * never calls getActiveAccount, so NONE of _routeAllows, _accountOwnsModel or
- * `disabled` is consulted. Everything routabilityOf() can prove about the
- * unpinned path is therefore irrelevant here, and reusing it — which is what the
- * first cut of the preflight did — refuses launches the pin provably serves.
+ * A pinned request skips account selection: forwardRequest indexes
+ * `accountManager.accounts[ctx.pinnedIndex]` directly and never calls
+ * getActiveAccount, so _routeAllows and _accountOwnsModel are not consulted.
+ * `disabled` IS consulted — a pin names the account, it does not override an
+ * operator hard-stop; the proxy answers 403 locally and never egresses.
  *
  * What survives a pin, and is therefore all this can block on:
- *   * an unresolved pin — the proxy answers 404 locally (server.js:255-259), so
- *     EVERY request of that session fails;
- *   * blockedModels — the blocklist gate runs after the pin prefix is stripped
- *     (server.js:295), so it still rejects with a 400.
+ *   * an unresolved pin — the proxy answers 404 locally, so EVERY request of
+ *     that session fails;
+ *   * a disabled pin — the proxy answers 403 locally, so nothing reaches
+ *     upstream (including quota/429 waits);
+ *   * blockedModels — the blocklist gate runs after the pin prefix is stripped,
+ *     so it still rejects with a 400.
  * Everything else is reported as a warning, because the pinned account's own
  * upstream is the only thing that can answer "does this id work", and teamclaude
  * cannot see past it.
@@ -670,6 +671,15 @@ export function pinnedRoutabilityOf(config, model, pinToken) {
     disabled: account.disabled, upstream: account.upstream,
   };
   const block = typeof model === 'string' && model ? blockedBy(blocked, model) : null;
+  if (account.disabled) {
+    return {
+      ...base,
+      account: view,
+      reason: `pinned account "${account.name}" is disabled, so the proxy answers 403 locally and never contacts `
+        + `upstream. Re-enable with: teamclaude enable ${account.name}`,
+    };
+  }
+
   if (block) {
     return {
       ...base,
@@ -695,8 +705,8 @@ export function pinnedRoutabilityOf(config, model, pinToken) {
   const dest = account.upstream || 'the Anthropic API';
 
   const reason = `pinned to account "${account.name}" (#${account.index}) via /tc-acct, which bypasses selection: the `
-    + 'route table, the per-account models[] claim and the `disabled` flag are all skipped, so nothing in this config '
-    + `can refuse the request. ${mappedTo ? `Its modelMap rewrites the id to "${mappedTo}" before the body leaves` : 'It has no modelMap entry for this id, so the id is forwarded verbatim'}`
+    + 'route table and the per-account models[] claim are skipped (`disabled` is not — a disabled pin 403s locally). '
+    + `${mappedTo ? `Its modelMap rewrites the id to "${mappedTo}" before the body leaves` : 'It has no modelMap entry for this id, so the id is forwarded verbatim'}`
     + ` to ${dest}${account.upstream ? ', whose own model map teamclaude cannot see' : ''}.`;
 
   return { ...base, routable: true, account: view, mappedTo, outsideRouting, reason };

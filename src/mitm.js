@@ -180,8 +180,19 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
     // of the confused-deputy egress hole. Refuse it when hardened, while
     // leaving the MITM/intercept path (the legitimate upstream) untouched.
     if (config.proxy?.noForwarding === true && mode === 'tunnel') {
+      // Refuse the CONNECT rather than becoming an open relay. Clients that
+      // inherited HTTPS_PROXY=:3456 (gh, git, curl) should have this host on
+      // NO_PROXY; the body names the knob so a 403 is not misread as "bad
+      // credentials" when gh auth is actually valid.
+      const msg = `teamclaude noForwarding: refusing CONNECT to ${host} (not ${upstreamHostOf(config)}). Bypass with NO_PROXY or unset HTTPS_PROXY.\r\n`;
       try {
-        clientSocket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
+        clientSocket.write(
+          'HTTP/1.1 403 Forbidden\r\n'
+          + 'Content-Type: text/plain\r\n'
+          + `Content-Length: ${Buffer.byteLength(msg)}\r\n`
+          + 'Connection: close\r\n\r\n'
+          + msg,
+        );
       } catch { /* client already gone */ }
       clientSocket.destroy();
       return;

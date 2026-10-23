@@ -334,10 +334,11 @@ test('the incident still blocks — on the winner being unroutable, which is the
 // ── which rules govern the launch ────────────────────────────────────────────
 
 test('a pinned launch is judged against the PINNED account, not the routing table it bypasses', () => {
-  // The pin indexes accounts directly (server.js:536-537) and never calls
-  // getActiveAccount, so routes, models[] and `disabled` decide nothing. Judging
-  // a pinned launch with the unpinned oracle refused launches the proxy provably
-  // serves — and the tools' own remedy ("run --account X") was one of them.
+  // The pin indexes accounts directly and never calls getActiveAccount, so
+  // routes and models[] decide nothing. `disabled` on the PINNED account is
+  // still a refusal; this test disables a different account (the unpinned
+  // route's only candidate). Judging a pinned launch with the unpinned oracle
+  // refused launches the proxy provably serves.
   const config = fixture();
   config.accounts[0].disabled = true;                    // the only account the route allows
   const d = preflightModel({
@@ -381,7 +382,7 @@ test('an unresolved pin blocks: every request of that session 404s locally', () 
   assert.match(d.findings[0].message, /Unknown account pin/);
 });
 
-test('a pinned but DISABLED account is reported, because the pin serves it anyway', () => {
+test('a pinned but DISABLED account blocks the launch — the proxy would 403 every request', () => {
   const config = fixture();
   config.accounts[1].disabled = true;
   const d = preflightModel({
@@ -389,9 +390,10 @@ test('a pinned but DISABLED account is reported, because the pin serves it anywa
     claudeArgs: ['--model', 'claude-fable-5'],
     accountPin: { token: 'deepseek-v4-pro' },
   });
-  assert.equal(d.blocked, false, 'the pin bypasses availability, so this is a surprise to report, not a refusal');
+  assert.equal(d.blocked, true);
   const f = d.findings.find(x => x.code === 'pin-account-disabled');
-  assert.equal(f.severity, 'warn');
+  assert.equal(f.severity, 'error');
+  assert.match(f.message, /disabled/);
   assert.match(f.remedies.join(' '), /teamclaude enable/);
 });
 

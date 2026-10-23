@@ -9,9 +9,11 @@ import { join } from 'node:path';
 import { ensureCerts, createConnectHandler } from './mitm.js';
 import { patchAccountUuid } from './account-uuid-rewrite.js';
 import { sanitizeToolPairs } from './tool-pair-sanitize.js';
+import { pruneHistoricalMedia } from './media-prune.js';
 import { foldSystemMessages } from './system-message-fold.js';
 import { logBodyShape } from './body-shape-log.js';
 import { normalizeGeminiArgonRequest } from './gemini-argon-compat.js';
+import { argonTextCallTools, repairArgonTextCallBody, ArgonTextCallStream } from './plaintext-toolcall.js';
 import { shouldStripForeignThinking, stripThinkingBlocks } from './thinking-strip.js';
 import { resolveHistoryFamily } from './rotation-ledger.js';
 import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
@@ -36,6 +38,8 @@ registerBuildFeature('rotation-gate');
 registerBuildFeature('ingress-thinking-strip');
 registerBuildFeature('fleet-agent-name');
 registerBuildFeature('custom-advisor');
+registerBuildFeature('plaintext-toolcall');
+registerBuildFeature('media-prune');
 
 /** Path class for T5 last_request / ctx gating. */
 export function classifySessionPath(url) {
@@ -127,6 +131,16 @@ export function safeKeyEqual(a, b) {
 // localhost on both the HTTP and CONNECT paths.
 export function isLoopbackAddr(addr) {
   return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1';
+}
+
+export function isLoopbackUpstreamUrl(url) {
+  if (!url) return false;
+  try {
+    const host = new URL(url).hostname;
+    return host === '127.0.0.1' || host === 'localhost' || host === '::1' || host === '[::1]';
+  } catch {
+    return /127\.0\.0\.1|localhost|::1/.test(String(url));
+  }
 }
 
 export function createProxyServer(accountManager, config, hooks = {}, sx = null) {
@@ -751,6 +765,34 @@ export function createProxyRequestListener({
         }
       }
 
+      // A pin names one account by identity, but `disabled` is an operator
+      // hard-stop: forwarding would still 429/wait on a dead upstream (the
+      // terra → codex-gpt56 [pin] probe). Refuse locally before the body is
+      // buffered so the TUI shows a 403, not a 28s hang.
+      if (pinnedIndex != null) {
+        const pinnedAcct = accountManager.accounts[pinnedIndex];
+        if (pinnedAcct?.disabled) {
+          const reqId = ++counter;
+          const sessionId = req.headers['x-claude-code-session-id'] || null;
+          const fleetAgent = sanitizeFleetAgent(req.headers['x-fleet-agent']);
+          const name = pinnedAcct.name || String(pinnedIndex);
+          if (!hideActivity) hooks.onRequestEnd?.(reqId, {
+            method: req.method, path: req.url,
+            account: `(disabled pin: "${name}")`,
+            status: 403, model: null, sessionId, fleetAgent, pinned: true,
+          });
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            type: 'error',
+            error: {
+              type: 'permission_error',
+              message: `Pinned account "${name}" is disabled; pin refused. Re-enable with: teamclaude enable ${name}`,
+            },
+          }));
+          return;
+        }
+      }
+
       const reqId = ++counter;
       // Composite id for BASE_URL vs CONNECT/MITM correlation (numeric reqId
       // alone collides across the two independent counters).
@@ -915,8 +957,9 @@ export function createProxyRequestListener({
           advisorDegraded = true;
         }
       }
-      // A /tc-acct pin intentionally bypasses route/quota/disabled selection,
-      // but a closed adapter's finite model contract is not a preference. Reject
+      // A /tc-acct pin intentionally bypasses route/quota selection (not
+      // `disabled` — that is refused at pin-resolve, before the body is read).
+      // A closed adapter's finite model contract is not a preference. Reject
       // locally when the EXECUTOR is unservable. An advisor-only miss
       // strip-and-degrades (G9) so the pin still serves the executor turn.
       const pinnedAccount = pinnedIndex != null ? accountManager.accounts[pinnedIndex] : null;
@@ -1315,6 +1358,29 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   const account = ctx.pinnedIndex != null
     ? (ctx.tried.has(ctx.pinnedIndex) ? null : accountManager.accounts[ctx.pinnedIndex])
     : accountManager.getActiveAccount(ctx.tried, ctx.model, ctx.advisorModel, ctx.sessionId);
+  // Backstop: a pin resolved before the operator disabled the account (TUI /
+  // reload / setDisabled) must still not egress. Early pin-resolve already
+  // 403s the common case; this covers disable-during-request and any caller
+  // that built ctx.pinnedIndex itself.
+  if (ctx.pinnedIndex != null && account?.disabled) {
+    ctx.status = 403;
+    ctx.account = account.name;
+    if (!res.headersSent) {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        type: 'error',
+        error: {
+          type: 'permission_error',
+          message: `Pinned account "${account.name}" is disabled; pin refused. Re-enable with: teamclaude enable ${account.name}`,
+        },
+      }));
+    }
+    emitProvenance(ctx, {
+      final: true, outcome: 'rejected-pin-disabled', response_status: 403,
+      account: account.name, account_index: account.index, attempt: ctx.attempt || 0,
+    });
+    return;
+  }
   // D9: capture eligibility skips AT SELECTION TIME (pure read). Pin bypasses
   // selection → leave null (pinned:true already explains). Does not alter pick.
   if (account && ctx.pinnedIndex == null) {
@@ -1560,6 +1626,26 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   }
   let sendBody = sanitizeToolPairs(folded.body, req.url, req.headers['content-type']);
   logBodyShape('after-tool-pair-sanitize', sendBody, shapeMeta);
+  // Custom hops re-inline every image/PDF each turn (no Anthropic prompt
+  // cache), so a long chat with Read-of-PDF / screenshots hits Claude Code's
+  // 32MB body cap and /compact then fails with "attached media exceeds size
+  // limits". Drop older base64 media before egress. Native Anthropic is
+  // left untouched — cache depends on a byte-identical prefix.
+  if (customUpstream) {
+    const pruned = pruneHistoricalMedia(sendBody, req.url, req.headers['content-type']);
+    if (pruned.count > 0) {
+      sendBody = pruned.body;
+      emitProvenance(ctx, {
+        _account: account,
+        final: false,
+        outcome: 'media-pruned',
+        count: pruned.count,
+        bytes: pruned.bytes,
+        attempt: ctx.attempt || 0,
+      });
+    }
+  }
+  logBodyShape('after-media-prune', sendBody, shapeMeta);
   sendBody = normalizeGeminiArgonRequest(sendBody, {
     model: account.modelMap?.[ctx.model] || ctx.model,
     native: !customUpstream,
@@ -2052,6 +2138,17 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
 
     const contentType = upstreamRes.headers.get('content-type') || '';
     const isStreaming = contentType.includes('text/event-stream');
+    // Custom upstreams (OpenRouter-free, Gemini Argon, …) sometimes write a
+    // tool call as TEXT / XML with stop_reason=end_turn. Repair that into a
+    // real tool_use so Claude Code executes it. null for native Anthropic.
+    const argonTools = argonTextCallTools({
+      model: account.modelMap?.[ctx.model] || ctx.model,
+      native: !customUpstream,
+      pathClass: classifySessionPath(req.url),
+      status: upstreamRes.status,
+      requestBody: sendBody,
+      accountName: account.name,
+    });
 
     if (isStreaming) {
       // Stream each chunk straight to the log as it is relayed — never hold the
@@ -2059,11 +2156,18 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       const l = getLog();
       const bw = l ? l.bodyWriter('RESPONSE BODY (streamed)', contentType) : null;
       ctx.attemptRec.stream = true;
+      const argonStream = argonTools
+        ? new ArgonTextCallStream(argonTools, { holdAllText: !!argonTools.holdAllText })
+        : null;
       await streamResponse(upstreamRes.body, res, account.index, accountManager, bw, {
         sessionId: ctx.sessionId,
         model: ctx.model,
         pathClass: ctx.pathClass,
-      }, ctx.attemptRec);
+      }, ctx.attemptRec, argonStream);
+      if (argonStream?.rewrote) {
+        l?.write('\n\n=== PLAINTEXT TOOL CALL REPAIRED: client received a tool_use block ===');
+        console.log(`[TeamClaude] Plaintext tool call repaired into tool_use (stream, account "${account.name}")`);
+      }
       l?.end();
       // R2: sliding-window budget from already-parsed attempt usage (no re-parse).
       accountManager.recordTokenBudget(account.index, ctx.attemptRec.usage);
@@ -2092,9 +2196,17 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         model: ctx.model,
         pathClass: ctx.pathClass,
       }, ctx.attemptRec);
+      const outBuf = argonTools ? repairArgonTextCallBody(buf, argonTools) : buf;
       const l = getLog();
-      if (l) { l.body('RESPONSE BODY', buf, contentType); l.end(); }
-      res.end(buf);
+      if (l) {
+        l.body('RESPONSE BODY', buf, contentType);
+        if (outBuf !== buf) l.write('\n\n=== PLAINTEXT TOOL CALL REPAIRED: client received a tool_use block ===');
+        l.end();
+      }
+      if (outBuf !== buf) {
+        console.log(`[TeamClaude] Plaintext tool call repaired into tool_use (account "${account.name}")`);
+      }
+      res.end(outBuf);
       // R2: sliding-window budget from already-parsed attempt usage (no re-parse).
       accountManager.recordTokenBudget(account.index, ctx.attemptRec.usage);
       emitProvenance(ctx, {
@@ -2154,6 +2266,31 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     const errOutcome = err?.code === 'TEAMCLAUDE_BODY_TIMEOUT'
       ? 'stream-idle-timeout'
       : 'transport-error';
+
+    // Cursor Auto via local CLIProxy can think longer than the remote headers
+    // budget before the first SSE byte. Circuit-opening cursor-pro then failovers
+    // to "none available" and Claude Code retries forever. Do not treat that
+    // hang as a dead adapter.
+    const loopbackSlowFirstByte = isTransient
+      && err?.code === 'TEAMCLAUDE_HEADERS_TIMEOUT'
+      && isLoopbackUpstreamUrl(account.upstream);
+    if (loopbackSlowFirstByte && !res.headersSent && !res.destroyed) {
+      ctx.status = 502;
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        type: 'error',
+        error: { type: 'proxy_error', message: `Upstream error: ${err.message}` },
+      }));
+      emitProvenance(ctx, {
+        _account: account,
+        final: true,
+        outcome: errOutcome,
+        response_status: 502,
+        attempt: ctx.attempt || 0,
+        err_code: err?.code ?? null,
+      });
+      return;
+    }
 
     // A custom loopback/provider adapter is an independent failure domain. A
     // connection error to its own upstream is NOT a poisoned process-wide
@@ -2303,7 +2440,7 @@ export function readWithIdleTimeout(reader, ms) {
  * `sessionCtx` (optional): { sessionId, model, pathClass } for T5 ctx recording.
  * `attemptRec` (optional): mutable T7 attempt record for reported model + usage.
  */
-async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter, sessionCtx = null, attemptRec = null) {
+async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter, sessionCtx = null, attemptRec = null, transform = null) {
   const reader = webStream.getReader();
   const idleMs = resolveBodyIdleTimeout();
   const decoder = new TextDecoder();
@@ -2319,8 +2456,15 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
       // Client disconnected — stop reading from upstream
       if (res.destroyed) break;
 
-      // Forward chunk immediately
-      const ok = res.write(value);
+      // Forward chunk immediately (a plaintext-toolcall transform may hold a
+      // possible text-form / XML tool call until the stream ends; null for
+      // native Anthropic and every other path).
+      let ok = true;
+      if (transform) {
+        for (const piece of transform.push(value)) ok = res.write(piece);
+      } else {
+        ok = res.write(value);
+      }
 
       // Append to the log as it streams (no whole-body buffering)
       if (bodyWriter) bodyWriter.chunk(Buffer.from(value));
@@ -2354,6 +2498,11 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
     // Parse any remaining buffer
     if (sseBuffer.trim()) {
       parseSSEUsage(sseBuffer, accountIndex, accountManager, sessionCtx, attemptRec, usageState);
+    }
+
+    // Release (or rewrite) anything the plaintext-toolcall transform still holds.
+    if (transform && !res.destroyed) {
+      for (const piece of transform.end()) res.write(piece);
     }
   } catch (err) {
     // A mid-stream idle timeout (or any read error) means the upstream went

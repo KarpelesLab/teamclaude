@@ -79,6 +79,35 @@ test('CONNECT to the test host is intercepted and answered locally (proxy + CA p
   }
 });
 
+test('CONNECT to a non-upstream host is 403 when noForwarding is on', async () => {
+  const echo = net.createServer((s) => s.pipe(s));
+  const echoPort = await listen(echo);
+  const am = new AccountManager([{ name: 'k', type: 'apikey', apiKey: 'sk' }], 0.98);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k', noForwarding: true },
+    upstream: 'https://api.anthropic.com',
+  }, {});
+  const port = await listen(proxy);
+  try {
+    const raw = net.connect(port, '127.0.0.1');
+    await once(raw, 'connect');
+    raw.write(`CONNECT 127.0.0.1:${echoPort} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n`);
+    const buf = await new Promise((resolve) => {
+      let acc = '';
+      raw.on('data', (d) => {
+        acc += d.toString('latin1');
+        if (acc.includes('\r\n\r\n')) resolve(acc);
+      });
+      raw.on('close', () => resolve(acc));
+    });
+    assert.match(buf, /^HTTP\/1\.1 403/, buf);
+    assert.match(buf, /noForwarding/, buf);
+  } finally {
+    proxy.close();
+    echo.close();
+  }
+});
+
 test('CONNECT to a non-intercepted host is blind-tunneled', async () => {
   // Echo server stands in for "some other host".
   const echo = net.createServer((s) => s.pipe(s));

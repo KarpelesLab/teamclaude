@@ -126,6 +126,18 @@ test('an unknown pin returns 404 and never reaches upstream', async () => {
   });
 });
 
+test('a pin to a disabled account returns 403 and never reaches upstream', async () => {
+  await withProxy(async ({ proxyPort, seen, am }) => {
+    am.setDisabled(1, true); // beta
+    const res = await post(`http://127.0.0.1:${proxyPort}/tc-acct/beta/v1/messages`);
+    const body = await res.json();
+    assert.equal(res.status, 403);
+    assert.equal(body.error.type, 'permission_error');
+    assert.match(body.error.message, /disabled/);
+    assert.equal(seen.length, 0, 'disabled pin must not probe quota or forward');
+  });
+});
+
 test('pinning overrides rotation even when another account is the active one', async () => {
   await withProxy(async ({ proxyPort, seen, am }) => {
     am.currentIndex = 0; // rotation would pick 'alpha'
