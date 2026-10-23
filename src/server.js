@@ -158,22 +158,54 @@ export function defaultBodyIdleTimeoutMs(url) {
 
 const messagesAbortBySession = new Map();
 
-export function abortPriorMessages(sessionId) {
-  const next = new AbortController();
-  if (sessionId) {
-    const prev = messagesAbortBySession.get(sessionId);
-    if (prev && !prev.signal.aborted) {
-      const err = new Error('superseded by a newer /v1/messages for this session');
-      err.code = 'TEAMCLAUDE_SESSION_SUPERSEDED';
-      prev.abort(err);
-      console.log(`[TeamClaude] aborted prior /v1/messages for session ${String(sessionId).slice(0, 8)}…`);
-    }
-    messagesAbortBySession.set(sessionId, next);
-    next.signal.addEventListener('abort', () => {
-      if (messagesAbortBySession.get(sessionId) === next) messagesAbortBySession.delete(sessionId);
-    }, { once: true });
+export function isCursorConnectModel(model) {
+  return String(model || '').toLowerCase().startsWith('cursor/');
+}
+
+export function isToolResultContinuation(body) {
+  try {
+    const raw = Buffer.isBuffer(body) ? body.toString('utf8') : String(body || '');
+    const msgs = JSON.parse(raw).messages;
+    if (!Array.isArray(msgs) || !msgs.length) return false;
+    const content = msgs[msgs.length - 1]?.content;
+    return Array.isArray(content) && content.some((part) => part && (part.type === 'tool_result' || part.tool_use_id));
+  } catch {
+    return false;
   }
+}
+
+function messagesAbortKey(sessionId, model) {
+  return `${sessionId}\0${model || ''}`;
+}
+
+// Only replace a cursor/auto POST that has not yet seen upstream headers.
+// Aborting a live thinking/tool stream at ~180s is what windows-operator
+// reports as "native tools interrupted". Opus/sonnet advisor+main shares a
+// session id and must never be cancelled this way. A tool_result continuation
+// must keep the parked Cursor H2 alive.
+export function abortPriorMessages(sessionId, model) {
+  const next = new AbortController();
+  if (!sessionId || !isCursorConnectModel(model)) return next;
+  const key = messagesAbortKey(sessionId, model);
+  const prev = messagesAbortBySession.get(key);
+  if (prev && !prev.controller.signal.aborted && !prev.headersSent) {
+    const err = new Error('superseded by a newer /v1/messages for this session');
+    err.code = 'TEAMCLAUDE_SESSION_SUPERSEDED';
+    prev.controller.abort(err);
+    console.log(`[TeamClaude] aborted prior pre-headers /v1/messages for session ${String(sessionId).slice(0, 8)}…`);
+  }
+  messagesAbortBySession.set(key, { controller: next, headersSent: false });
+  next.signal.addEventListener('abort', () => {
+    const cur = messagesAbortBySession.get(key);
+    if (cur && cur.controller === next) messagesAbortBySession.delete(key);
+  }, { once: true });
   return next;
+}
+
+export function markMessagesHeadersSent(sessionId, model) {
+  if (!sessionId) return;
+  const cur = messagesAbortBySession.get(messagesAbortKey(sessionId, model));
+  if (cur) cur.headersSent = true;
 }
 
 export function createProxyServer(accountManager, config, hooks = {}, sx = null) {
@@ -1109,7 +1141,10 @@ export function createProxyRequestListener({
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request. Semantic stamp/hint-clear only for /v1/messages*.
       accountManager.beginSession(sessionId, { semantic, pathClass, model });
-      if (pathClass === 'messages' && sessionId) ctx.sessionAbort = abortPriorMessages(sessionId);
+      if (pathClass === 'messages' && sessionId && isCursorConnectModel(model)
+          && !isToolResultContinuation(body)) {
+        ctx.sessionAbort = abortPriorMessages(sessionId, model);
+      }
       try {
         await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir, sx);
       } catch (err) {
@@ -1822,6 +1857,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         signal: ctx.sessionAbort?.signal,
       }, sx, route);
       ctx.attemptRec.headers_ms = Date.now() - attemptStartedAt;
+      markMessagesHeadersSent(ctx.sessionId, ctx.model);
     } finally {
       accountManager.release(account.index);
     }

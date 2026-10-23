@@ -5,7 +5,7 @@ import { once } from 'node:events';
 import { ReadableStream } from 'node:stream/web';
 import { TextEncoder, TextDecoder } from 'node:util';
 import { defaultHeadersTimeoutMs, upstreamFetch } from '../src/upstream-fetch.js';
-import { isLoopbackUpstreamUrl, defaultBodyIdleTimeoutMs, abortPriorMessages, readWithIdleTimeout } from '../src/server.js';
+import { isLoopbackUpstreamUrl, defaultBodyIdleTimeoutMs, abortPriorMessages, markMessagesHeadersSent, isToolResultContinuation, isCursorConnectModel, readWithIdleTimeout } from '../src/server.js';
 
 test('loopback custom adapters wait longer for first SSE byte than remote Anthropic', () => {
   assert.equal(defaultHeadersTimeoutMs('https://api.anthropic.com/v1/messages'), 120_000);
@@ -20,14 +20,39 @@ test('loopback adapters also get a 600s body-idle budget', () => {
   assert.equal(defaultBodyIdleTimeoutMs('http://127.0.0.1:8318/v1/messages'), 600_000);
 });
 
-test('a newer /v1/messages aborts the prior in-flight for the same session', () => {
-  const first = abortPriorMessages('sess-operator');
-  const second = abortPriorMessages('sess-operator');
+test('a newer cursor/auto POST aborts only a pre-headers in-flight', () => {
+  assert.equal(isCursorConnectModel('cursor/auto'), true);
+  assert.equal(isCursorConnectModel('claude-sonnet-5-5'), false);
+  const first = abortPriorMessages('sess-operator', 'cursor/auto');
+  const second = abortPriorMessages('sess-operator', 'cursor/auto');
   assert.equal(first.signal.aborted, true);
   assert.equal(first.signal.reason?.code, 'TEAMCLAUDE_SESSION_SUPERSEDED');
   assert.equal(second.signal.aborted, false);
-  abortPriorMessages('sess-other');
+});
+
+test('a live cursor/auto thinking stream is not aborted by a later POST', () => {
+  const first = abortPriorMessages('sess-think', 'cursor/auto');
+  markMessagesHeadersSent('sess-think', 'cursor/auto');
+  const second = abortPriorMessages('sess-think', 'cursor/auto');
+  assert.equal(first.signal.aborted, false);
   assert.equal(second.signal.aborted, false);
+});
+
+test('opus/sonnet sessions are not cancelled by a later /v1/messages', () => {
+  const first = abortPriorMessages('sess-frxxz', 'claude-opus-5-5');
+  abortPriorMessages('sess-frxxz', 'claude-opus-5-5');
+  assert.equal(first.signal.aborted, false);
+});
+
+test('tool_result continuations are detected so Cursor H2 park can resume', () => {
+  assert.equal(isToolResultContinuation(JSON.stringify({
+    model: 'cursor/auto',
+    messages: [{ role: 'user', content: [{ type: 'tool_result', tool_use_id: 'x', content: 'ok' }] }],
+  })), true);
+  assert.equal(isToolResultContinuation(JSON.stringify({
+    model: 'cursor/auto',
+    messages: [{ role: 'user', content: 'hello' }],
+  })), false);
 });
 
 // Bring up an HTTP server on an ephemeral port and hand back {server, port}.
