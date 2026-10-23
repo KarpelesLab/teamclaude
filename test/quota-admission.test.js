@@ -117,6 +117,50 @@ test('one-account-serveable → normal forward (no false 429)', async () => {
   }
 });
 
+test('GPT circuit-open retry-after ignores Claude OAuth 5h window (route-excluded)', async () => {
+  const fiveHour = Date.now() + 2_801_000;
+  const circuitUntil = Date.now() + 4_000;
+  const t = await setupProxy(
+    [
+      acct('codex-gpt56', { upstream: 'http://127.0.0.1:9' }),
+      acct('yongbing', { quotaAdmission: 'usage' }),
+    ],
+    {
+      routes: [
+        { name: 'gpt', match: ['*gpt*', '*astra*'], accounts: ['codex-gpt56'] },
+        { name: 'default', match: ['*'], accounts: ['yongbing'] },
+      ],
+    },
+  );
+  try {
+    t.am.accounts[0].upstream = `http://127.0.0.1:9`;
+    t.am.accounts[0].circuitOpenUntil = circuitUntil;
+    t.am.accounts[1].quota.unified5h = 0.99;
+    t.am.accounts[1].quota.unified5hReset = fiveHour;
+
+    const snap = t.am.getServeable('gpt-6-astra');
+    assert.equal(snap.serveable, false);
+    const remaining = Date.parse(snap.soonestResetAt) - Date.now();
+    assert.ok(remaining > 0 && remaining < 15_000,
+      `soonestResetAt must be the GPT circuit (~4s), not Claude 5h; got ${remaining}ms`);
+
+    const res = await fetch(`http://127.0.0.1:${t.port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-6-astra', messages: [] }),
+    });
+    assert.equal(res.status, 429);
+    const retryAfter = Number(res.headers.get('retry-after'));
+    assert.ok(retryAfter > 0 && retryAfter <= 15,
+      `retry-after ${retryAfter}s should be circuit remaining, not ~2801s`);
+    const body = await res.json();
+    assert.match(body.error.message, /circuit-open/);
+    assert.doesNotMatch(body.error.message, /Retry in 28\d\ds/);
+  } finally {
+    await t.close();
+  }
+});
+
 test('config-with-no-matching-account (not quota) keeps existing behavior', async () => {
   // Closed adapter that cannot translate the id → not-accepted for every
   // account. That is a config/capability miss, not quota exhaustion: fall

@@ -1270,8 +1270,18 @@ export class AccountManager {
       Object.assign(row, this._routeTierEvidence(a, model));
       return row;
     });
+    // Retry-After for a model must ignore accounts that cannot serve it even
+    // after their quota window rolls (route-excluded / not-accepted / disabled).
+    // Otherwise a Claude OAuth 5h reset leaks into a GPT 429 as "Retry in 2800s"
+    // while the actual GPT adapter was only circuit-open for a few seconds.
     let soonestMs = Infinity;
     for (const a of this.accounts) {
+      if (!a || a.retired || a.disabled) continue;
+      if (model && !this._routeAllows(a, model)) continue;
+      if (model && !this._acceptsModel(a, model)) continue;
+      if (a.upstream && a.circuitOpenUntil && Date.now() < a.circuitOpenUntil) {
+        if (a.circuitOpenUntil < soonestMs) soonestMs = a.circuitOpenUntil;
+      }
       const ms = this._soonestResetMs(a, model);
       if (ms != null && ms < soonestMs) soonestMs = ms;
     }
