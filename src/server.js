@@ -18,7 +18,8 @@ import { shouldStripForeignThinking, stripThinkingBlocks } from './thinking-stri
 import { resolveHistoryFamily } from './rotation-ledger.js';
 import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
 import { TopLevelFieldFinder, stripAdvisorModelField } from './model.js';
-import { requestModelIds, blockedIdInSet, collisionIdInSet } from './model-namespace.js';
+import { requestModelIds, blockedIdInSet, blockedBy, collisionIdInSet, routeForModel } from './model-namespace.js';
+import { normalizeLadder, nextServeableModel, exclusiveRouteHopAllowed, replaceRequestModel } from './performance-ladder.js';
 import { BodyWriter } from './request-log.js';
 import { upstreamFetch } from './upstream-fetch.js';
 import { tunnelTls } from './sx.js';
@@ -36,6 +37,7 @@ registerBuildFeature('sessions-endpoint');
 registerBuildFeature('provenance-t7');
 registerBuildFeature('rotation-gate');
 registerBuildFeature('ingress-thinking-strip');
+registerBuildFeature('performance-ladder');
 registerBuildFeature('fleet-agent-name');
 registerBuildFeature('custom-advisor');
 registerBuildFeature('plaintext-toolcall');
@@ -672,6 +674,26 @@ function provenanceUpstreamHost(account, defaultUpstream) {
   }
 }
 
+function ladderCanServe(config, accountManager, id) {
+  if (!id || blockedBy(config?.blockedModels, id)) return false;
+  return accountManager.accounts.some(a => accountManager._isAvailable(a, id, null));
+}
+
+/** Next live rung. Null when the id is off the ladder or nothing else can serve. */
+function shiftDownLadder(config, accountManager, model, skip = null) {
+  const next = nextServeableModel(
+    model,
+    normalizeLadder(config?.performanceLadder),
+    (id) => ladderCanServe(config, accountManager, id),
+    { skip },
+  );
+  if (!next) return null;
+  const routeOf = (id) => accountManager._routeForModel(id)?.name
+    || routeForModel(config?.routes, id)?.name
+    || null;
+  return exclusiveRouteHopAllowed(model, next, routeOf) ? next : null;
+}
+
 /** Same lookup rewriteModel uses — never re-parse sendBody. */
 function provenanceMappedModel(account, requested) {
   if (requested == null) return null;
@@ -886,7 +908,7 @@ export function createProxyRequestListener({
       }
       let body = Buffer.concat(bodyChunks);
 
-      const model = modelFinder.done ? modelFinder.value : parseRequestModel(body);
+      let model = modelFinder.done ? modelFinder.value : parseRequestModel(body);
       // An advisor request (Claude Code's advisor tool) carries a SECOND model
       // nested in tools[]; every request-path gate quantifies over the full id
       // set {model, advisorModel} — see requestModelIds in model-namespace.js.
@@ -1046,6 +1068,22 @@ export function createProxyRequestListener({
         advisorDegraded = true;
       }
 
+      // Performance ladder: the requested id is allowed, but no account can
+      // serve it (Max seats disabled, quota, parked pool). Substitute the next
+      // live rung and rewrite the body before admission. Pins do not shift.
+      // Blocked ids never become targets (ladderCanServe).
+      const ladderSeen = new Set();
+      if (pinnedIndex == null && model && accountManager.accounts.length
+          && !accountManager.accounts.some(a => accountManager._isAvailable(a, model, null))) {
+        ladderSeen.add(model);
+        const next = shiftDownLadder(config, accountManager, model, ladderSeen);
+        if (next) {
+          console.log(`[TeamClaude] performance ladder: "${model}" has no serveable account; substituting "${next}"`);
+          body = replaceRequestModel(body, next);
+          model = next;
+        }
+      }
+
       // T4 admission gate — typed quota errors, never 200-with-refusal.
       // Honest boundary: teamclaude can guarantee the TYPED-ERROR property only
       // for exhaustion it KNOWS about (its own quota/circuit/disabled/token
@@ -1136,6 +1174,10 @@ export function createProxyRequestListener({
         // D9: filled at selection; null means absent (pin / non-routed / none skipped).
         selectionSkipped: null,
         selectionSkippedMore: null,
+        performanceLadder: normalizeLadder(config?.performanceLadder),
+        blockedModels: config?.blockedModels,
+        routes: config?.routes,
+        ladderSeen,
       };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
@@ -1539,6 +1581,33 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         type: 'api_error', message: 'Subscription quota unavailable; request not admitted.',
       } }));
       return;
+    }
+
+    // forwardRequest is a module-level export: it must not close over
+    // createProxyServer's `config`. Exclusive-route hops read ctx.routes.
+    if (ctx.performanceLadder && ctx.model && !res.headersSent) {
+      ctx.ladderSeen = ctx.ladderSeen || new Set();
+      ctx.ladderSeen.add(ctx.model);
+      const next = nextServeableModel(
+        ctx.model,
+        ctx.performanceLadder,
+        (id) => {
+          if (!id || blockedBy(ctx.blockedModels, id)) return false;
+          return accountManager.accounts.some(a => accountManager._isAvailable(a, id, null));
+        },
+        { skip: ctx.ladderSeen },
+      );
+      const routeOf = (id) => accountManager._routeForModel(id)?.name
+        || routeForModel(ctx.routes, id)?.name
+        || null;
+      if (next && exclusiveRouteHopAllowed(ctx.model, next, routeOf)) {
+        console.log(`[TeamClaude] performance ladder: "${ctx.model}" exhausted; substituting "${next}"`);
+        ctx.ladderSeen.add(next);
+        ctx.model = next;
+        ctx.tried = new Set();
+        body = replaceRequestModel(body, next);
+        return forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir, sx, useSx);
+      }
     }
 
     if (ctx.transientUpstreamFailure) {

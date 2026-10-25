@@ -60,6 +60,12 @@ export function applyTopLevelReload(diskConfig, memConfig, accountManager) {
     accountManager.distributeSessions = val;
   }
 
+  if (hasOwn(diskConfig, 'performanceLadder')) {
+    memConfig.performanceLadder = Array.isArray(diskConfig.performanceLadder)
+      ? diskConfig.performanceLadder.filter(id => typeof id === 'string' && id)
+      : [];
+  }
+
   if (hasOwn(diskConfig, 'rotationGate')) {
     const disk = (diskConfig.rotationGate && typeof diskConfig.rotationGate === 'object')
       ? diskConfig.rotationGate : {};
