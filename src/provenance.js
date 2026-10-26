@@ -60,6 +60,7 @@ function sanitizeSkipped(v) {
 export const PROVENANCE_OUTCOMES = Object.freeze([
   'ok',
   'failover-upstream-5xx',
+  'context-overflow-relay',
   'quota-429-rotate',
   'rate-429-inline-wait',
   'rate-429-surfaced',

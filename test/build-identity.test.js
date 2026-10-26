@@ -19,13 +19,16 @@ function close(server) {
 
 const EXPECTED_FEATURES = [
   'audit-b1-b6',
+  'context-overflow-relay',
   'custom-advisor',
   'dynamic-routing',
   'dynrank-model-fidelity',
   'fleet-agent-name',
   'ingress-collision-gate',
   'ingress-thinking-strip',
+  'media-prune',
   'model-preflight',
+  'plaintext-toolcall',
   'provenance-t7',
   'quota-admission-gate',
   'rotation-gate',

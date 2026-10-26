@@ -23,6 +23,7 @@ import { BodyWriter } from './request-log.js';
 import { upstreamFetch } from './upstream-fetch.js';
 import { tunnelTls } from './sx.js';
 import { buildIdentity, PROCESS_STARTED_AT, registerBuildFeature } from './build-identity.js';
+import { isContextOverflowError, anthropicPromptTooLongBody } from './context-overflow.js';
 import { ProvenanceBuffer, classifyUpstreamRelayOutcome } from './provenance.js';
 // Ensure the model-preflight layer's tag is registered even when the CLI entry
 // has not been loaded (status via createProxyServer alone).
@@ -40,6 +41,7 @@ registerBuildFeature('fleet-agent-name');
 registerBuildFeature('custom-advisor');
 registerBuildFeature('plaintext-toolcall');
 registerBuildFeature('media-prune');
+registerBuildFeature('context-overflow-relay');
 
 /** Path class for T5 last_request / ctx gating. */
 export function classifySessionPath(url) {
@@ -1920,14 +1922,51 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // the underlying socket returns to the pool cleanly. (A bare 500 used to be
     // scored as provider *health*, which reset consecutiveFailures and pinned
     // the 2s→60s backoff at its floor.)
-    if (account.upstream && upstreamRes.status >= 500) {
+    //
+    // Exception: context overflow wrapped as 5xx. Claude Code 2.1.310 compact-
+    // recovers only from `prompt is too long: N tokens > M maximum`. A 502
+    // here is retried as overloaded then hopped to fallbackModel ("high demand").
+    if (account.upstream && (upstreamRes.status >= 500 || upstreamRes.status === 413)) {
+      let overflowText = '';
+      let peekedBody = false;
+      if (typeof upstreamRes.clone === 'function') {
+        try { overflowText = await upstreamRes.clone().text(); } catch { overflowText = ''; }
+      } else if (typeof upstreamRes.text === 'function'
+          && retryCount < maxRetries && ctx.pinnedIndex == null) {
+        try { overflowText = await upstreamRes.text(); peekedBody = true; } catch { overflowText = ''; }
+      }
+      if (isContextOverflowError(upstreamRes.status, overflowText)
+          && !res.headersSent && !res.destroyed) {
+        if (!peekedBody) await upstreamRes.body?.cancel();
+        accountManager.noteProviderResult(account.index, {
+          ok: true, status: 400, latencyMs: Date.now() - attemptStartedAt,
+        });
+        const payload = anthropicPromptTooLongBody(overflowText);
+        ctx.status = 400;
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(payload));
+        console.log(`[TeamClaude] Context overflow on "${account.name}" — relaying prompt-too-long (no circuit)`);
+        emitProvenance(ctx, {
+          _account: account,
+          final: true,
+          outcome: 'context-overflow-relay',
+          response_status: 400,
+          attempt: ctx.attempt,
+          timings: {
+            admit_ms: admitMs,
+            headers_ms: ctx.attemptRec.headers_ms,
+            total_ms: Date.now() - attemptStartedAt,
+          },
+        });
+        return;
+      }
       accountManager.noteProviderResult(account.index, {
         ok: false, status: upstreamRes.status, latencyMs: Date.now() - attemptStartedAt,
       });
       // D8/D11: a pin bypasses rotation — do not mark tried + recurse (that
       // collapses into a misleading 429 pinned-unavailable). Relay the real 5xx.
       if (retryCount < maxRetries && !res.headersSent && ctx.pinnedIndex == null) {
-        await upstreamRes.body?.cancel();
+        if (!peekedBody) await upstreamRes.body?.cancel();
         console.log(`[TeamClaude] Custom upstream ${upstreamRes.status} on "${account.name}" — circuit open, failing over`);
         emitProvenance(ctx, {
           _account: account,
