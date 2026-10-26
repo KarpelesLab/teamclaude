@@ -129,3 +129,25 @@ test('a balance probe refreshes money without replacing session quota; errors re
   assert.match(am.accounts[0].balanceError, /503/);
   assert.equal(am.accounts[0].quota.balance.balances[0].total, '25.00');
 });
+
+test('codex usageDisplay falls back to unified 5h/7d instead of quota unknown', async () => {
+  const { nativeQuotaSummary, usageFromQuotaState } = await import('../src/usage-display.js');
+  const account = {
+    usageDisplay: 'codex',
+    quota: { unified5h: 0.88, unified7d: 0.25, unified7dReset: 1793599817000 },
+  };
+  assert.match(nativeQuotaSummary(account), /5h 88\.0%/);
+  assert.match(nativeQuotaSummary(account), /7d 25\.0%/);
+  assert.doesNotMatch(nativeQuotaSummary(account), /quota unknown/);
+  const usage = usageFromQuotaState({
+    unified_5h_utilization: 0.88,
+    unified_7d_utilization: 0.25,
+    unified_7d_reset: 1793599817,
+    updated_at: 1793054186,
+  });
+  assert.equal(usage.fiveHour.utilization, 0.88);
+  assert.equal(usage.sevenDay.utilization, 0.25);
+  assert.equal(usage.sevenDay.resetAt, 1793599817000);
+  assert.equal(usage.nativeWindowProvider, 'codex');
+  assert.equal(usage.nativeWindows.length, 2);
+});

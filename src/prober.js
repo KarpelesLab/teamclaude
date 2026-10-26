@@ -8,9 +8,16 @@
 // probe reads a zero-spend endpoint and never consumes message quota.
 
 import { execFile } from 'node:child_process';
+import { readFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
 import { fetchUsage } from './oauth.js';
 import { fetchQuotaFor } from './quota-sources.js';
 import { isSubscriptionSource } from './subscription-quota.js';
+import { usageFromQuotaState } from './usage-display.js';
+
+function resolveQuotaStatePath(p) {
+  return String(p).replace(/^~/, homedir());
+}
 
 export class Prober {
   constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, timeoutMs = 10_000, log = console.log } = {}) {
@@ -125,11 +132,26 @@ export class Prober {
         child.stdout?.resume();
         child.stderr?.resume();
       });
+      await this._applyQuotaStateFile(account);
       const finishedAt = Date.now();
       this._recordAccount(account, { status: 'ok', error: null, startedAt, finishedAt, durationMs: finishedAt - startedAt });
     } catch (err) {
       const finishedAt = Date.now();
       this._recordAccount(account, { status: 'error', error: err?.message || String(err), startedAt, finishedAt, durationMs: finishedAt - startedAt });
+    }
+  }
+
+  /** Ingest probeCommand's quotaStateFile. Fail-safe: missing/malformed files
+   *  leave the account's existing quota untouched. */
+  async _applyQuotaStateFile(account) {
+    const path = (account.quotaStateFile || '').trim();
+    if (!path) return;
+    try {
+      const raw = await readFile(resolveQuotaStatePath(path), 'utf8');
+      const usage = usageFromQuotaState(JSON.parse(raw));
+      if (usage) this.am.applyUsageData(account.index, usage);
+    } catch {
+      // leave existing quota
     }
   }
 

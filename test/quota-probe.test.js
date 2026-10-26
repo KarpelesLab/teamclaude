@@ -1,8 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { normalizeUsageBucket, findScopedWeeklyLimit } from '../src/oauth.js';
 import { AccountManager, isFableModel, parseRequestModel } from '../src/account-manager.js';
 import { Prober } from '../src/prober.js';
+import { nativeQuotaSummary } from '../src/usage-display.js';
 
 function oauth(name, extra = {}) {
   return { name, type: 'oauth', accessToken: 't-' + name, expiresAt: Date.now() + 3600_000, ...extra };
@@ -221,4 +225,46 @@ test('prober refreshes expired token before probing', async () => {
 
   await prober.probeAll();
   assert.equal(token, 'fresh');
+});
+
+test('updateQuota maps Muse/OpenAI x-ratelimit token headers', () => {
+  const am = new AccountManager([{ name: 'muse', type: 'apikey', apiKey: 'k' }]);
+  am.updateQuota(0, {
+    'x-ratelimit-limit-tokens': '4000000',
+    'x-ratelimit-remaining-tokens': '3200000',
+    'x-ratelimit-limit-requests': '3000',
+    'x-ratelimit-remaining-requests': '2999',
+  });
+  const q = am.accounts[0].quota;
+  assert.equal(q.tokensLimit, 4_000_000);
+  assert.equal(q.tokensRemaining, 3_200_000);
+  assert.equal(q.requestsLimit, 3000);
+  assert.equal(q.requestsRemaining, 2999);
+  assert.equal(typeof q.observedAt, 'number');
+});
+
+test('probeCommand applies quotaStateFile into native Codex windows', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'codex-quota-state-'));
+  const file = join(dir, 'codex-gpt56.json');
+  await writeFile(file, JSON.stringify({
+    unified_5h_utilization: 0.88,
+    unified_7d_utilization: 0.25,
+    unified_7d_reset: 1793599817,
+    updated_at: Math.floor(Date.now() / 1000),
+  }));
+  const am = new AccountManager([{
+    name: 'codex-gpt56', type: 'apikey', apiKey: 'k',
+    usageDisplay: 'codex',
+    probeCommand: 'true',
+    quotaStateFile: file,
+  }]);
+  const prober = new Prober(am, { log: () => {} });
+  await prober.probeCommandAccount(am.accounts[0]);
+  const q = am.accounts[0].quota;
+  assert.equal(q.unified5h, 0.88);
+  assert.equal(q.unified7d, 0.25);
+  assert.equal(q.nativeWindowProvider, 'codex');
+  assert.equal(q.nativeWindows.length, 2);
+  assert.match(nativeQuotaSummary(am.accounts[0]), /5h 88\.0%/);
+  await rm(dir, { recursive: true });
 });

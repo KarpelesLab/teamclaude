@@ -1107,7 +1107,7 @@ export class TUI {
       const mode = quotaWindowDisplay(a);
       const matches = a.quota?.subscription?.provider === mode;
       let summary = matches && a.quota?.subscription ? subscriptionSummary(a) : nativeQuotaSummary(a);
-      if (!matches && a.quota?.nativeWindows?.length) {
+      if (!matches && !summary.endsWith('quota unknown')) {
         const observed = a.quota.observedAt;
         if (!Number.isFinite(observed)) summary += ' (? unverified)';
         else if (Date.now() - observed > QUOTA_STALE_MS) summary += ` (~ ${formatAge(Date.now() - observed)} old)`;

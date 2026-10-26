@@ -2142,10 +2142,28 @@ export class AccountManager {
     const u7d = parseFloat(headers['anthropic-ratelimit-unified-7d-utilization']);
     if (!isNaN(u5h)) account.quota.unified5h = u5h;
     if (!isNaN(u7d)) account.quota.unified7d = u7d;
-    // Only a response that actually carried a unified value refreshes the
+    // Standard rate limits (Anthropic API-key accounts, plus OpenAI/Meta
+    // `x-ratelimit-*` aliases — Muse documents remaining token/request quota
+    // that way, and without the alias the TUI stays on Tok/Req "-").
+    const tokensLimit = parseInt(
+      headers['anthropic-ratelimit-tokens-limit'] ?? headers['x-ratelimit-limit-tokens'], 10);
+    const tokensRemaining = parseInt(
+      headers['anthropic-ratelimit-tokens-remaining'] ?? headers['x-ratelimit-remaining-tokens'], 10);
+    const tokensReset = headers['anthropic-ratelimit-tokens-reset']
+      ?? headers['x-ratelimit-reset-tokens'];
+    const requestsLimit = parseInt(
+      headers['anthropic-ratelimit-requests-limit'] ?? headers['x-ratelimit-limit-requests'], 10);
+    const requestsRemaining = parseInt(
+      headers['anthropic-ratelimit-requests-remaining'] ?? headers['x-ratelimit-remaining-requests'], 10);
+    const requestsReset = headers['anthropic-ratelimit-requests-reset']
+      ?? headers['x-ratelimit-reset-requests'];
+
+    // Only a response that actually carried a quota value refreshes the
     // observation time. Stamping on every response would keep `observedAt`
     // permanently current even while the upstream stopped reporting quota.
-    if (!isNaN(u5h) || !isNaN(u7d)) account.quota.observedAt = Date.now();
+    if (!isNaN(u5h) || !isNaN(u7d) || !isNaN(tokensLimit) || !isNaN(requestsLimit)) {
+      account.quota.observedAt = Date.now();
+    }
 
     const r5h = headers['anthropic-ratelimit-unified-5h-reset'];
     const r7d = headers['anthropic-ratelimit-unified-7d-reset'];
@@ -2172,13 +2190,8 @@ export class AccountManager {
     const uStatus = headers['anthropic-ratelimit-unified-status'];
     if (uStatus) account.quota.unifiedStatus = uStatus;
 
-    // Standard rate limits (API key accounts)
-    const tokensLimit = parseInt(headers['anthropic-ratelimit-tokens-limit'], 10);
-    const tokensRemaining = parseInt(headers['anthropic-ratelimit-tokens-remaining'], 10);
-    const tokensReset = headers['anthropic-ratelimit-tokens-reset'];
-    const requestsLimit = parseInt(headers['anthropic-ratelimit-requests-limit'], 10);
-    const requestsRemaining = parseInt(headers['anthropic-ratelimit-requests-remaining'], 10);
-    const requestsReset = headers['anthropic-ratelimit-requests-reset'];
+    // Standard rate limits applied below. Header names resolved above so Muse
+    // `x-ratelimit-*` and Anthropic `anthropic-ratelimit-tokens-*` share a path.
 
     if (!isNaN(tokensLimit)) account.quota.tokensLimit = tokensLimit;
     if (!isNaN(tokensRemaining)) account.quota.tokensRemaining = tokensRemaining;
