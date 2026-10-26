@@ -25,6 +25,27 @@ export function isContextOverflowError(status, bodyText) {
   return code === 400 || code >= 500;
 }
 
+/**
+ * True when a custom-adapter 5xx means the *path* is down (circuit + hop).
+ * A JSON error envelope is an upstream application error: relay it so the
+ * client can retry / fallbackModel. Opening the circuit on that poisons every
+ * model sharing the exclusive account (Astra/Sol/Terra on gpt56).
+ */
+export function isCustomAdapterDown(status, bodyText) {
+  const code = Number(status);
+  if (code < 500) return false;
+  if (isContextOverflowError(code, bodyText)) return false;
+  const text = String(bodyText || '').trim();
+  if (!text) return true;
+  const downish = /unavailable|econnrefused|connect timed out|socket hang up/i;
+  try {
+    const parsed = JSON.parse(text);
+    return downish.test(JSON.stringify(parsed));
+  } catch {
+    return downish.test(text);
+  }
+}
+
 function parseCounts(text) {
   const m = String(text || '').match(COUNTS_RE);
   if (!m) return { input: 0, maximum: 0 };

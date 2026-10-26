@@ -23,7 +23,7 @@ import { BodyWriter } from './request-log.js';
 import { upstreamFetch } from './upstream-fetch.js';
 import { tunnelTls } from './sx.js';
 import { buildIdentity, PROCESS_STARTED_AT, registerBuildFeature } from './build-identity.js';
-import { isContextOverflowError, anthropicPromptTooLongBody } from './context-overflow.js';
+import { isContextOverflowError, isCustomAdapterDown, anthropicPromptTooLongBody } from './context-overflow.js';
 import { ProvenanceBuffer, classifyUpstreamRelayOutcome } from './provenance.js';
 // Ensure the model-preflight layer's tag is registered even when the CLI entry
 // has not been loaded (status via createProxyServer alone).
@@ -656,7 +656,7 @@ export function isNativeAnthropicUpstream(raw) {
 const CONTROL_PLANE_PREFIXES = [
   '/api/claude_cli/',            // bootstrap: org model entitlements
   '/api/claude_code/',           // notification prefs & other client config
-  '/api/oauth/',                 // identity/control plane: profile, usage, validate, …
+      '/api/oauth/',                 // identity/control plane: profile, usage, validate, …
 ];
 const CONTROL_PLANE_EXACT = new Set(['/api/hello']);
 export function isControlPlanePath(url) {
@@ -749,12 +749,39 @@ export function createProxyRequestListener({
       // forwarding (no upstream round-trip, no account/token spent).
       const eventLogging = config?.eventLogging || 'hide';
       const isEventLog = (req.url || '').startsWith('/api/event_logging');
-      if (isEventLog && eventLogging === 'block') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end('{}');
+      const hideActivity = isEventLog && eventLogging !== 'show';
+      if (isEventLog) {
+        // Telemetry is not inference. Rotating it onto a custom adapter
+        // (gpt56) 404s and makes that account look unstable in the TUI.
+        // 'block' answers locally; hide/show relay the client's own
+        // credential to the default Anthropic upstream, never rotation.
+        if (eventLogging === 'block') {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end('{}');
+          return;
+        }
+        const reqId = ++counter;
+        const sessionId = req.headers['x-claude-code-session-id'] || null;
+        const fleetAgent = sanitizeFleetAgent(req.headers['x-fleet-agent']);
+        if (!hideActivity) {
+          hooks.onRequestStart?.(reqId, {
+            method: req.method, path: req.url, sessionId, fleetAgent, pinned: false,
+          });
+        }
+        await new Promise((resolve) => {
+          const done = () => resolve();
+          res.once('finish', done);
+          res.once('close', done);
+          relayStream(req, res, upstream, sx);
+        });
+        if (!hideActivity) {
+          hooks.onRequestEnd?.(reqId, {
+            method: req.method, path: req.url, account: '(event-log)',
+            status: res.statusCode, model: null, sessionId, fleetAgent, pinned: false,
+          });
+        }
         return;
       }
-      const hideActivity = isEventLog && eventLogging !== 'show';
       // Client token refresh: pass through untouched (the proxy manages its own
       // tokens via ensureTokenFresh; rewriting client refreshes would conflict).
       if (req.method === 'POST' && req.url === '/v1/oauth/token') { await relayRaw(req, res, upstream, sx); return; }
@@ -1951,6 +1978,32 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
           final: true,
           outcome: 'context-overflow-relay',
           response_status: 400,
+          attempt: ctx.attempt,
+          timings: {
+            admit_ms: admitMs,
+            headers_ms: ctx.attemptRec.headers_ms,
+            total_ms: Date.now() - attemptStartedAt,
+          },
+        });
+        return;
+      }
+      if (!isCustomAdapterDown(upstreamRes.status, overflowText)
+          && !res.headersSent && !res.destroyed) {
+        if (!peekedBody) await upstreamRes.body?.cancel();
+        accountManager.noteProviderResult(account.index, {
+          ok: true, status: upstreamRes.status, latencyMs: Date.now() - attemptStartedAt,
+        });
+        ctx.status = upstreamRes.status;
+        res.writeHead(upstreamRes.status, {
+          'Content-Type': upstreamRes.headers.get('content-type') || 'application/json',
+        });
+        res.end(overflowText);
+        console.log(`[TeamClaude] Custom upstream ${upstreamRes.status} application error on "${account.name}" — relay, no circuit`);
+        emitProvenance(ctx, {
+          _account: account,
+          final: true,
+          outcome: 'upstream-error-relayed',
+          response_status: upstreamRes.status,
           attempt: ctx.attempt,
           timings: {
             admit_ms: admitMs,

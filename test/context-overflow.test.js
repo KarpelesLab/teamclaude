@@ -5,6 +5,7 @@ import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
 import {
   isContextOverflowError,
+  isCustomAdapterDown,
   anthropicPromptTooLongBody,
   isAnthropicPromptTooLong,
 } from '../src/context-overflow.js';
@@ -69,5 +70,52 @@ test('custom adapter overflow 502 is prompt-too-long 400, not a circuit hop', as
     assert.ok(!am.accounts[0].circuitOpenUntil);
   } finally {
     await close(proxy); await close(overflow); await close(other);
+  }
+});
+
+test('adapter-down classifier: empty 5xx is down, JSON error envelope is not', () => {
+  assert.equal(isCustomAdapterDown(502, ''), true);
+  assert.equal(isCustomAdapterDown(503, '{"error":"adapter unavailable"}'), true);
+  assert.equal(isCustomAdapterDown(500, '{"error":{"message":"Internal server error"}}'), false);
+  assert.equal(isCustomAdapterDown(502, 'econnrefused'), true);
+  assert.equal(isCustomAdapterDown(502, '{"error":"context_length_exceeded"}'), false);
+});
+
+test('JSON 500 on exclusive custom account is relayed without a circuit hop', async () => {
+  let primaryHits = 0;
+  let otherHits = 0;
+  const primary = http.createServer((_req, res) => {
+    primaryHits++;
+    res.writeHead(500, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: 'Internal server error' } }));
+  });
+  const other = http.createServer((_req, res) => {
+    otherHits++;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ id: 'ok', type: 'message', model: 'should-not-hop' }));
+  });
+  const primaryPort = await listen(primary);
+  const otherPort = await listen(other);
+  const am = new AccountManager([
+    { name: 'gpt56', type: 'apikey', apiKey: 'k1', upstream: `http://127.0.0.1:${primaryPort}`, priority: 0 },
+    { name: 'other', type: 'apikey', apiKey: 'k2', upstream: `http://127.0.0.1:${otherPort}`, priority: 1 },
+  ]);
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: 'http://invalid' });
+  const port = await listen(proxy);
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-6-astra', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    const text = await res.text();
+    assert.equal(res.status, 500, text.slice(0, 300));
+    assert.match(text, /Internal server error/);
+    assert.equal(primaryHits, 1);
+    assert.equal(otherHits, 0, 'must not hop; Sol/Terra share this account');
+    assert.equal(am.accounts[0].consecutiveFailures, 0);
+    assert.ok(!am.accounts[0].circuitOpenUntil);
+  } finally {
+    await close(proxy); await close(primary); await close(other);
   }
 });

@@ -355,8 +355,8 @@ test('failover chain emits non-final then final with monotonic attempts', async 
   const upstream = http.createServer((_req, res) => {
     hits++;
     if (hits === 1) {
-      res.writeHead(500, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: 'boom' } }));
+      res.writeHead(500);
+      res.end();
       return;
     }
     res.writeHead(200, { 'content-type': 'application/json' });

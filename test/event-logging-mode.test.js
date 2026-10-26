@@ -77,6 +77,40 @@ test("'show' forwards and displays", async () => {
   } finally { t.close(); }
 });
 
+test('hide does not rotate event_logging onto a custom adapter', async () => {
+  let customHits = 0;
+  let defaultHits = 0;
+  const custom = http.createServer((_req, res) => {
+    customHits += 1;
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end('{"error":"not found"}');
+  });
+  const def = http.createServer((_req, res) => {
+    defaultHits += 1;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}');
+  });
+  const customPort = await listen(custom);
+  const defPort = await listen(def);
+  const am = new AccountManager([
+    { name: 'gpt56', type: 'apikey', apiKey: 'k1', upstream: `http://127.0.0.1:${customPort}`, priority: -30 },
+    { name: 'native', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000, priority: 0 },
+  ]);
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${defPort}`, eventLogging: 'hide' });
+  const proxyPort = await listen(proxy);
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}${EVENT_LOG}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"events":[]}',
+    });
+    await res.text();
+    assert.equal(res.status, 200);
+    assert.equal(customHits, 0, 'must not hit gpt56');
+    assert.equal(defaultHits, 1);
+  } finally {
+    proxy.close(); custom.close(); def.close();
+  }
+});
+
 test('non-telemetry requests are always forwarded and displayed, even in block mode', async () => {
   const t = await setup('block');
   try {

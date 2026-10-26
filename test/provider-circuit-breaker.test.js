@@ -129,15 +129,16 @@ test('custom adapter 400 is relayed and heals transport health; it never fails o
   }
 });
 
-// A custom-upstream 500 is provider failure, not health. Scoring it as ok resets
-// consecutiveFailures and pins the advertised 2s→60s backoff at its 2s floor.
+// An empty custom-upstream 500 is adapter-down (circuit + hop). A JSON error
+// envelope is an application error and must NOT open the circuit — see
+// context-overflow.test.js. Scoring empty 500 as ok would pin backoff at 2s.
 test('custom adapter 500 opens circuit and fails over (never scored as health)', async () => {
   let badHits = 0;
   let goodHits = 0;
   const bad = http.createServer((_req, res) => {
     badHits++;
-    res.writeHead(500, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ error: 'internal' }));
+    res.writeHead(500);
+    res.end();
   });
   const good = http.createServer((_req, res) => {
     goodHits++;
@@ -166,8 +167,8 @@ test('custom adapter 500 opens circuit and fails over (never scored as health)',
 
 test('consecutive custom-upstream 500s escalate openUntil toward the 60s cap', async () => {
   const bad = http.createServer((_req, res) => {
-    res.writeHead(500, { 'content-type': 'application/json' });
-    res.end('{"error":"internal"}');
+    res.writeHead(500);
+    res.end();
   });
   const badPort = await listen(bad);
   const am = new AccountManager([
