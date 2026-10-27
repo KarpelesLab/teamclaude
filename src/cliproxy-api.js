@@ -20,8 +20,13 @@
 //
 // The readings are as fresh as the account manager's: an account in use is
 // read off every response, an idle one by the quota probe (quotaProbeSeconds),
-// which is off by default. An account with no reading yet answers its windows
-// as null, which is how the provider says "no window".
+// which is off by default. Three states are kept apart, because a dashboard
+// reads them differently. A window the plan meters but that has no live
+// reading (it reset, or has not started) is sent as the provider sends one that
+// has not started: 0% with no reset time. A window the plan does not meter is
+// null, which is how the provider says "no such window". And an account this
+// proxy cannot vouch for — never read, or a dead login — answers a non-2xx
+// `status_code`, so the dashboard shows it as unreadable rather than idle.
 
 import { emailOf } from './identity.js';
 import { DEFAULT_PROVIDER, providerOf } from './provider.js';
@@ -100,18 +105,49 @@ function authIndex(account) {
   return account.id || String(account.index);
 }
 
+// CLIProxyAPI's page size when a request pages without naming one.
+const DEFAULT_PAGE_SIZE = 50;
+
+/**
+ * One of auth-files' paging parameters: absent, or a positive whole number.
+ * @param {URLSearchParams} query
+ * @param {string} key
+ * @returns {number|null|undefined}  undefined when absent, null when invalid
+ */
+function pageParam(query, key) {
+  if (!query.has(key)) return undefined;
+  const raw = String(query.get(key)).trim();
+  return /^\d+$/.test(raw) && Number(raw) > 0 ? Number(raw) : null;
+}
+
 /**
  * `GET /v0/management/auth-files`: every subscription account, in the shape
  * CLIProxyAPI lists its credential files. No credential, account id or
  * organization id is in it — the same fields /teamclaude/status already shows
  * any key holder.
+ *
+ * The query is CLIProxyAPI's: `name` (an entry's id or name) and `auth_index`
+ * narrow the list, and `page` / `page_size` page it, adding `total`, `page`,
+ * `page_size` and `has_more`. A paging value that is not a positive whole
+ * number is a 400, as there. The order is the fleet's own, not sorted by name.
  * @param {any} accountManager
+ * @param {URLSearchParams} [query]
+ * @returns {{ status: number, body: Record<string, any> }}
  */
-export function authFiles(accountManager) {
+export function authFiles(accountManager, query = new URLSearchParams()) {
+  const page = pageParam(query, 'page');
+  const pageSize = pageParam(query, 'page_size');
+  if (page === null) return { status: 400, body: { error: 'page must be a positive integer' } };
+  if (pageSize === null) return { status: 400, body: { error: 'page_size must be a positive integer' } };
+  const name = (query.get('name') || '').trim();
+  const index = (query.get('auth_index') || '').trim();
+
   const files = [];
   for (const account of accountManager.accounts) {
     const provider = cliproxyProvider(account);
     if (!provider) continue;
+    if (name && authIndex(account) !== name && account.name !== name) continue;
+    if (index && authIndex(account) !== index) continue;
     const email = emailOf(account);
     const plan = provider === 'codex' && account.quota?.planType;
     files.push({
@@ -129,7 +165,15 @@ export function authFiles(accountManager) {
       ...(plan ? { id_token: { plan_type: plan } } : {}),
     });
   }
-  return { files };
+  const observedAt = new Date().toISOString();
+  if (page === undefined && pageSize === undefined) return { status: 200, body: { observed_at: observedAt, files } };
+  const size = pageSize ?? DEFAULT_PAGE_SIZE;
+  const start = Math.min(((page ?? 1) - 1) * size, files.length);
+  const end = Math.min(start + size, files.length);
+  return {
+    status: 200,
+    body: { observed_at: observedAt, files: files.slice(start, end), total: files.length, page: page ?? 1, page_size: size, has_more: end < files.length },
+  };
 }
 
 /** @param {number} ratio  0-1 */
@@ -142,42 +186,63 @@ function isoOrNull(ms) {
   return typeof ms === 'number' && Number.isFinite(ms) ? new Date(ms).toISOString() : null;
 }
 
+/** @param {unknown} value */
+function isReading(value) {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+/**
+ * Whether this proxy has ever read the account's windows. The `*WindowStated`
+ * flags are set by every reading and persisted, so they still answer after the
+ * readings themselves have been cleared by a reset.
+ * @param {'claude'|'codex'} provider
+ * @param {Record<string, any>} quota
+ */
+function everRead(provider, quota) {
+  const stated = provider === 'claude' ? quota.weeklyWindowStated : quota.sessionWindowStated;
+  return stated != null || isReading(quota.unified5h) || isReading(quota.unified7d);
+}
+
 /**
  * One Anthropic usage window: `utilization` on the endpoint's 0-100 scale (the
  * quota model keeps 0-1, see normalizeUsageBucket) and `resets_at` as ISO-8601.
+ * With no live reading it is the window as the endpoint states one that has
+ * not started, 0 and no reset time (see the Fable cap in quota-probe.test.js).
  * @param {number|null|undefined} ratio
  * @param {number|null|undefined} resetAt
  */
 function claudeWindow(ratio, resetAt) {
-  if (typeof ratio !== 'number' || !Number.isFinite(ratio)) return null;
-  return { utilization: percent(ratio), resets_at: isoOrNull(resetAt) };
+  if (!isReading(ratio)) return { utilization: 0, resets_at: null };
+  return { utilization: percent(/** @type {number} */ (ratio)), resets_at: isoOrNull(resetAt) };
 }
 
 /**
  * An Anthropic account's quota as `GET /api/oauth/usage` would state it.
  *
+ * Every subscription meters the 5-hour window; the weekly one is null only on a
+ * plan known to meter none (a Team seat, `weeklyWindowStated: false`).
+ *
  * The per-model weekly caps go in `limits[]` as `weekly_scoped` entries, which
- * is where the endpoint reports them now. `scopedWeekly` holds every family the
- * probe read, keyed by its lowercased display name; the two families that also
- * have fields of their own, learned from response headers, fill in when the
- * probe has not named them.
+ * is where the endpoint reports them now. The two families with fields of their
+ * own come from those fields first: response headers keep them current, while
+ * `scopedWeekly` moves only when the probe runs, and selection gates on the
+ * fields. `scopedWeekly` supplies every other family the probe read, keyed by
+ * its lowercased display name.
  * @param {Record<string, any>} quota
  */
 export function claudeUsagePayload(quota) {
   /** @type {Map<string, {name: string, utilization: number, resetAt: number|null}>} */
   const families = new Map();
-  for (const [key, bucket] of Object.entries(quota.scopedWeekly || {})) {
-    if (typeof bucket?.utilization !== 'number') continue;
-    families.set(key, { name: key.charAt(0).toUpperCase() + key.slice(1), utilization: bucket.utilization, resetAt: bucket.resetAt ?? null });
-  }
   for (const [key, name, field] of [['fable', 'Fable', 'unified7dFable'], ['sonnet', 'Sonnet', 'unified7dSonnet']]) {
-    if (!families.has(key) && typeof quota[field] === 'number') {
-      families.set(key, { name, utilization: quota[field], resetAt: quota[`${field}Reset`] ?? null });
-    }
+    if (isReading(quota[field])) families.set(key, { name, utilization: quota[field], resetAt: quota[`${field}Reset`] ?? null });
+  }
+  for (const [key, bucket] of Object.entries(quota.scopedWeekly || {})) {
+    if (families.has(key) || !isReading(bucket?.utilization)) continue;
+    families.set(key, { name: key.charAt(0).toUpperCase() + key.slice(1), utilization: bucket.utilization, resetAt: bucket.resetAt ?? null });
   }
   return {
     five_hour: claudeWindow(quota.unified5h, quota.unified5hReset),
-    seven_day: claudeWindow(quota.unified7d, quota.unified7dReset),
+    seven_day: quota.weeklyWindowStated === false ? null : claudeWindow(quota.unified7d, quota.unified7dReset),
     limits: [...families.values()].map(f => ({
       kind: 'weekly_scoped',
       group: 'weekly',
@@ -190,15 +255,16 @@ export function claudeUsagePayload(quota) {
 
 /**
  * One Codex usage window: `used_percent` 0-100, `reset_at` in epoch SECONDS.
+ * With no live reading it is an unused window: 0, and no reset time.
  * @param {number|null|undefined} ratio
  * @param {number|null|undefined} resetAt  ms
  * @param {number} seconds
  */
 function codexWindow(ratio, resetAt, seconds) {
-  if (typeof ratio !== 'number' || !Number.isFinite(ratio)) return null;
+  if (!isReading(ratio)) return { used_percent: 0, reset_at: null, limit_window_seconds: seconds };
   return {
-    used_percent: percent(ratio),
-    reset_at: typeof resetAt === 'number' && Number.isFinite(resetAt) ? Math.floor(resetAt / 1000) : null,
+    used_percent: percent(/** @type {number} */ (ratio)),
+    reset_at: isReading(resetAt) ? Math.floor(/** @type {number} */ (resetAt) / 1000) : null,
     limit_window_seconds: seconds,
   };
 }
@@ -206,12 +272,15 @@ function codexWindow(ratio, resetAt, seconds) {
 /**
  * A Codex account's quota as `GET /wham/usage` would state it. The shorter
  * window goes first, as upstream orders them; a plan that meters no session
- * window has its weekly one as the primary.
+ * window (`sessionWindowStated: false`) has its weekly one as the primary. A
+ * reading from before that flag existed counts the session window only when it
+ * holds a reading of one.
  * @param {Record<string, any>} quota
  */
 export function codexUsagePayload(quota) {
+  const session = quota.sessionWindowStated === true || (quota.sessionWindowStated == null && isReading(quota.unified5h));
   const windows = [
-    codexWindow(quota.unified5h, quota.unified5hReset, FIVE_HOUR_SECONDS),
+    session ? codexWindow(quota.unified5h, quota.unified5hReset, FIVE_HOUR_SECONDS) : null,
     codexWindow(quota.unified7d, quota.unified7dReset, WEEK_SECONDS),
   ].filter(w => w);
   return {
@@ -237,9 +306,10 @@ function comparableUrl(raw) {
 /**
  * `POST /v0/management/api-call`, answered without leaving this process.
  *
- * Returns the HTTP status for the reply and its body: on success the
- * CLIProxyAPI envelope `{ status_code, header, body }`, where `body` is the
- * provider payload as a string; otherwise `{ error }`.
+ * Returns the HTTP status for the reply and its body: for a request it answers,
+ * the CLIProxyAPI envelope `{ status_code, header, body }`, where `body` is the
+ * provider payload as a string and `status_code` what the provider would have
+ * said; for one it refuses, `{ error }`.
  *
  * Codex reset credits are refused with 501 rather than served. Listing them
  * would put a "redeem" control in front of the user that this API cannot
@@ -274,13 +344,36 @@ export function answerApiCall(accountManager, request) {
     return { status: 403, body: { error: `that URL is not a ${cliproxyProvider(account)} usage endpoint` } };
   }
 
+  // An account whose login is dead serves nothing, and its last reading says
+  // nothing about now. Through CLIProxyAPI the relayed call would come back 401
+  // from the provider; the same status here makes a dashboard show the account
+  // as unreadable rather than as healthy with headroom.
+  if (account.status === 'error') {
+    return providerReply(401, { error: 'this account\'s login was rejected; log it in again' });
+  }
+  // Nor can an account be vouched for that has never been read: a payload of
+  // idle windows would claim a reading nobody took. 503, as a provider says it
+  // cannot answer right now; the next response or probe on it fixes this.
+  if (!everRead(provider, account.quota)) {
+    return providerReply(503, { error: 'no usage reading for this account yet' });
+  }
   // A window whose reset has passed is cleared first, so a reading from before
   // it is not reported as current — the same sweep /teamclaude/status runs.
   accountManager.sweepExpiredQuotas();
-  const payload = provider === 'claude' ? claudeUsagePayload(account.quota) : codexUsagePayload(account.quota);
+  return providerReply(200, provider === 'claude' ? claudeUsagePayload(account.quota) : codexUsagePayload(account.quota));
+}
+
+/**
+ * The CLIProxyAPI envelope around what the provider would have answered. The
+ * outer reply is 200 whatever `status_code` says, as CLIProxyAPI's is: the
+ * management call itself succeeded.
+ * @param {number} statusCode
+ * @param {Record<string, any>} payload
+ */
+function providerReply(statusCode, payload) {
   return {
     status: 200,
-    body: { status_code: 200, header: { 'Content-Type': ['application/json'] }, body: JSON.stringify(payload) },
+    body: { status_code: statusCode, header: { 'Content-Type': ['application/json'] }, body: JSON.stringify(payload) },
   };
 }
 
@@ -304,7 +397,9 @@ export async function serveCliproxyApi(req, res, { accountManager, config, path,
   }
   const route = path.slice(CLIPROXY_PREFIX.length).replace(/\/+$/, '');
   if (route === '/auth-files' && req.method === 'GET') {
-    reply(200, authFiles(accountManager));
+    // The route is matched on the classification path, which has no query.
+    const { status, body } = authFiles(accountManager, new URL(req.url || '/', 'http://localhost').searchParams);
+    reply(status, body);
     return;
   }
   if (route === '/api-call' && req.method === 'POST') {

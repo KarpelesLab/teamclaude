@@ -1061,6 +1061,16 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
   // socket has nothing else standing between a bad handshake and that exit.
   server.on('upgrade', (req, socket, head) => {
     try {
+      // The CLIProxyAPI prefix is ours, and no route under it is a WebSocket.
+      // requestHandler answers every request there itself; a handshake would
+      // otherwise be relayed with the client's management key in its headers
+      // (relayUpgrade strips only x-api-key). Refused before the key gate, as
+      // the request path's answer does not depend on the key either.
+      if (isCliproxyPath(classificationPath(req.url || ''))) {
+        try { socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n'); } catch { /* already gone */ }
+        socket.destroy();
+        return;
+      }
       // The upgrade handshake never reaches requestHandler, so it does not
       // inherit the key gate above — it has to ask for itself. Without this a
       // WebSocket handshake is an unauthenticated relay to `upstream`: the

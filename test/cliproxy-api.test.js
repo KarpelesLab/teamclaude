@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import net from 'node:net';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
 import { normalizeUsagePayload } from '../src/oauth.js';
@@ -122,7 +123,10 @@ test('auth-files lists the subscription accounts without a credential or account
     for (const secret of [CLAUDE_TOKEN, CODEX_TOKEN, 'chatgpt-account', 'relay-secret', 'sk-ant-api03-secret']) {
       assert.ok(!text.includes(secret), secret);
     }
-    assert.deepEqual(JSON.parse(text), {
+    const listed = JSON.parse(text);
+    assert.equal(typeof listed.observed_at, 'string');
+    delete listed.observed_at;
+    assert.deepEqual(listed, {
       files: [
         {
           id: 'id-claude', auth_index: 'id-claude', name: 'alice@example.com (Acme)', type: 'claude', provider: 'claude',
@@ -163,8 +167,8 @@ test('a Claude usage call is answered in the endpoint\'s own shape, from the tra
     assert.deepEqual(usage.five_hour, { utilization: 44, resets_at: new Date(fiveHourReset).toISOString() });
     assert.deepEqual(usage.seven_day, { utilization: 18, resets_at: new Date(weekReset).toISOString() });
     assert.deepEqual(usage.limits.map(l => [l.kind, l.scope.model.display_name, l.percent]), [
-      ['weekly_scoped', 'Fable', 95],
       ['weekly_scoped', 'Sonnet', 30],
+      ['weekly_scoped', 'Fable', 95],
     ]);
 
     // The real test of the shape: TeamClaude's own parser for that endpoint
@@ -207,17 +211,159 @@ test('a Codex usage call is answered in /wham/usage shape, from the tracked quot
   });
 });
 
-test('a window whose reset has passed is not reported, and an unread account answers null', async () => {
-  await withServer({ ...KEYED, cliproxyApi: 'read' }, async ({ port, am }) => {
-    Object.assign(am.accounts[0].quota, { unified5h: 0.9, unified5hReset: Date.now() - 1000 });
-    const usage = JSON.parse((await (await apiCall(port, { auth_index: 'id-claude', method: 'GET', url: CLAUDE_USAGE })).json()).body);
-    assert.equal(usage.five_hour, null);
-    assert.equal(usage.seven_day, null);
-    assert.deepEqual(usage.limits, []);
+/** The provider payload and its status_code for one api-call. */
+async function usageOf(port, auth_index, url) {
+  const res = await apiCall(port, { auth_index, method: 'GET', url });
+  assert.equal(res.status, 200, auth_index);
+  const envelope = await res.json();
+  return { statusCode: envelope.status_code, usage: JSON.parse(envelope.body) };
+}
 
-    const codex = JSON.parse((await (await apiCall(port, { auth_index: 'id-codex', method: 'GET', url: CODEX_USAGE })).json()).body);
-    assert.deepEqual(codex.rate_limit, { primary_window: null, secondary_window: null });
+test('the Fable figure is the header-fed reading selection gates on, not an older probe', async () => {
+  await withServer({ ...KEYED, cliproxyApi: 'read' }, async ({ port, am }) => {
+    const weekReset = Date.now() + 3 * 24 * 3600_000;
+    // The probe read Fable at 20% once; Fable traffic since then moved the
+    // header-fed field to 97%, and the probe has not run again.
+    Object.assign(am.accounts[0].quota, {
+      unified5h: 0.1, unified5hReset: Date.now() + 3600_000,
+      scopedWeekly: { fable: { utilization: 0.2, resetAt: weekReset }, opus: { utilization: 0.4, resetAt: weekReset } },
+      unified7dFable: 0.97, unified7dFableReset: weekReset, unified7dFableSeenAt: Date.now(),
+    });
+    const { usage } = await usageOf(port, 'id-claude', CLAUDE_USAGE);
+    assert.deepEqual(usage.limits.map(l => [l.scope.model.display_name, l.percent]), [['Fable', 97], ['Opus', 40]]);
   });
+});
+
+test('a window that reset is sent idle, as the provider sends one that has not started', async () => {
+  await withServer({ ...KEYED, cliproxyApi: 'read' }, async ({ port, am }) => {
+    // Read hours ago; both windows have since reset and been cleared.
+    Object.assign(am.accounts[0].quota, {
+      unified5h: 0.9, unified5hReset: Date.now() - 1000,
+      unified7d: 0.5, unified7dReset: Date.now() - 1000,
+      weeklyWindowStated: true,
+    });
+    const claude = await usageOf(port, 'id-claude', CLAUDE_USAGE);
+    assert.equal(claude.statusCode, 200);
+    assert.deepEqual(claude.usage, { five_hour: { utilization: 0, resets_at: null }, seven_day: { utilization: 0, resets_at: null }, limits: [] });
+    // TeamClaude's own reader takes that as an untouched window, not a missing one.
+    assert.deepEqual(normalizeUsagePayload(claude.usage).fiveHour, { utilization: 0, resetAt: null });
+
+    Object.assign(am.accounts[1].quota, {
+      unified5h: 0.5, unified5hReset: Date.now() - 1000,
+      unified7d: 0.7, unified7dReset: Date.now() - 1000,
+      sessionWindowStated: true,
+    });
+    const codex = await usageOf(port, 'id-codex', CODEX_USAGE);
+    assert.deepEqual(codex.usage.rate_limit, {
+      primary_window: { used_percent: 0, reset_at: null, limit_window_seconds: 18_000 },
+      secondary_window: { used_percent: 0, reset_at: null, limit_window_seconds: 604_800 },
+    });
+  });
+});
+
+test('a window the plan does not meter stays null', async () => {
+  await withServer({ ...KEYED, cliproxyApi: 'read' }, async ({ port, am }) => {
+    // A Team seat: a session window and no shared weekly one.
+    Object.assign(am.accounts[0].quota, { unified5h: 0.2, unified5hReset: Date.now() + 3600_000, weeklyWindowStated: false });
+    const claude = await usageOf(port, 'id-claude', CLAUDE_USAGE);
+    assert.equal(claude.usage.seven_day, null);
+    assert.equal(claude.usage.five_hour.utilization, 20);
+
+    // A Codex plan with no session window: its weekly one is the primary.
+    Object.assign(am.accounts[1].quota, { unified7d: 0.3, unified7dReset: Date.now() + 86400_000, sessionWindowStated: false });
+    const codex = await usageOf(port, 'id-codex', CODEX_USAGE);
+    assert.equal(codex.usage.rate_limit.primary_window.limit_window_seconds, 604_800);
+    assert.equal(codex.usage.rate_limit.secondary_window, null);
+  });
+});
+
+test('an account never read, or with a dead login, answers a non-2xx status_code', async () => {
+  await withServer({ ...KEYED, cliproxyApi: 'read' }, async ({ port, am }) => {
+    // Nothing read yet: idle windows would claim a reading nobody took.
+    for (const [index, url] of [['id-claude', CLAUDE_USAGE], ['id-codex', CODEX_USAGE]]) {
+      const { statusCode, usage } = await usageOf(port, index, url);
+      assert.equal(statusCode, 503, index);
+      assert.equal(typeof usage.error, 'string', index);
+    }
+
+    // A rejected refresh token: the cached reading is from before, and the
+    // account serves nothing now. 401, as the provider answers a dead token.
+    Object.assign(am.accounts[0].quota, { unified5h: 0.1, unified5hReset: Date.now() + 3600_000, weeklyWindowStated: true });
+    am.accounts[0].status = 'error';
+    const dead = await usageOf(port, 'id-claude', CLAUDE_USAGE);
+    assert.equal(dead.statusCode, 401);
+    assert.equal(dead.usage.five_hour, undefined);
+    // auth-files still lists it, saying why.
+    const { files } = await (await authFiles(port)).json();
+    assert.equal(files.find(f => f.auth_index === 'id-claude').status, 'error');
+  });
+});
+
+test('auth-files takes CLIProxyAPI\'s name, auth_index and paging parameters', async () => {
+  await withServer({ ...KEYED, cliproxyApi: 'read' }, async ({ port }) => {
+    const list = async (query) => {
+      const res = await fetch(`http://127.0.0.1:${port}/v0/management/auth-files${query}`, { headers: bearer() });
+      return { status: res.status, body: await res.json() };
+    };
+    const ids = (body) => body.files.map(f => f.auth_index);
+    assert.deepEqual(ids((await list('?auth_index=id-codex')).body), ['id-codex']);
+    assert.deepEqual(ids((await list('?name=alice@example.com%20(Acme)')).body), ['id-claude']);
+    assert.deepEqual(ids((await list('?name=id-claude')).body), ['id-claude']);
+    assert.deepEqual(ids((await list('?auth_index=nope')).body), []);
+    // Unpaged, the reply carries no paging fields.
+    assert.equal((await list('')).body.total, undefined);
+
+    const first = (await list('?page_size=1')).body;
+    assert.deepEqual({ ...first, files: ids(first), observed_at: undefined }, { files: ['id-claude'], total: 2, page: 1, page_size: 1, has_more: true, observed_at: undefined });
+    const second = (await list('?page=2&page_size=1')).body;
+    assert.deepEqual([ids(second), second.has_more], [['id-codex'], false]);
+    const past = (await list('?page=5&page_size=1')).body;
+    assert.deepEqual([ids(past), past.total, past.has_more], [[], 2, false]);
+    assert.equal((await list('?page=1')).body.page_size, 50);
+
+    for (const bad of ['?page=0', '?page=x', '?page_size=-1', '?page_size=1.5']) {
+      const { status, body } = await list(bad);
+      assert.equal(status, 400, bad);
+      assert.match(body.error, /positive integer/, bad);
+    }
+  });
+});
+
+test('a WebSocket handshake under the prefix is refused, never relayed with the key', async () => {
+  let relayed = 0;
+  const open = [];
+  const upstream = http.createServer(() => {});
+  upstream.on('upgrade', (_req, s) => { relayed++; open.push(s); s.destroy(); });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(accounts(), 0.98);
+  const server = createProxyServer(am, { proxy: { ...KEYED, cliproxyApi: 'read' }, upstream: `http://127.0.0.1:${upstreamPort}`, accounts: accounts() });
+  const port = await listen(server);
+  const handshake = (path, extra) => new Promise((resolve) => {
+    const s = net.connect(port, '127.0.0.1', () => {
+      open.push(s);
+      s.write([`GET ${path} HTTP/1.1`, `Host: 127.0.0.1:${port}`, 'Connection: Upgrade', 'Upgrade: websocket',
+        'Sec-WebSocket-Version: 13', 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==', ...extra].join('\r\n') + '\r\n\r\n');
+    });
+    let text = '';
+    s.on('data', (c) => { text += c; });
+    s.on('close', () => resolve(text.split('\r\n')[0]));
+    s.on('error', () => resolve(text.split('\r\n')[0]));
+  });
+  try {
+    for (const [path, extra] of [
+      ['/v0/management/auth-files', [`X-Management-Key: ${PROXY_KEY}`]],
+      ['/v0/management/api-call', [`Authorization: Bearer ${PROXY_KEY}`]],
+      ['/v0/%6danagement/auth-files', [`x-api-key: ${PROXY_KEY}`]],
+    ]) {
+      assert.match(await handshake(path, extra), /^HTTP\/1\.1 404/, path);
+    }
+    assert.equal(relayed, 0);
+  } finally {
+    for (const s of open) s.destroy();
+    server.closeAllConnections();
+    upstream.closeAllConnections();
+    await Promise.all([new Promise(resolve => server.close(resolve)), new Promise(resolve => upstream.close(resolve))]);
+  }
 });
 
 test('api-call answers only the usage URLs, and relays nothing', async () => {
