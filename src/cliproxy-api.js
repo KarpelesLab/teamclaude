@@ -132,7 +132,7 @@ export function authFiles(accountManager) {
   return { files };
 }
 
-/** @param {number|null|undefined} ratio  0-1 */
+/** @param {number} ratio  0-1 */
 function percent(ratio) {
   return Math.round(ratio * 10000) / 100;
 }
