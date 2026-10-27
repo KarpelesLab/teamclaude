@@ -294,6 +294,27 @@ The endpoint is one more `/teamclaude/` route and is gated like the others: the 
 
 It speaks both the stateless 2026-07-28 revision of the protocol and the handshake revisions before it, so a client on either works. Replies are plain JSON, never a stream.
 
+## CLIProxyAPI-compatible usage API
+
+Some usage dashboards read a multi-account fleet through the management API of [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) rather than through each provider. The server can answer the part of that API those dashboards use, so the quota of every account in the pool shows up there. It is off until the config says otherwise:
+
+```json
+{ "proxy": { "cliproxyApi": "read" } }
+```
+
+Point the dashboard's "CLI Proxy" source at the proxy (`http://localhost:3456`) and give it the proxy key as its management key. It sends the key as `Authorization: Bearer <key>` (`X-Management-Key` and `x-api-key` work too); `proxy.apiKey` and every `proxy.clientKeys` key are accepted, since the data is no more than `/teamclaude/status` already shows a key holder.
+
+Two routes are served:
+
+- `GET /v0/management/auth-files` lists the Claude and Codex subscription accounts as `{ "files": [{ id, auth_index, name, provider, email, status, disabled }] }`. `auth_index` is the account's config entry id. API-key and third-party backend accounts have no subscription usage and are not listed.
+- `POST /v0/management/api-call` with `{ "auth_index", "method": "GET", "url" }` answers two URLs: `https://api.anthropic.com/api/oauth/usage` for a Claude account and `https://chatgpt.com/backend-api/wham/usage` for a Codex one. The reply is CLIProxyAPI's envelope, `{ "status_code": 200, "header": {…}, "body": "<json>" }`, with the body in the provider's own shape: `five_hour`, `seven_day` and `weekly_scoped` limits on a 0–100 scale with ISO-8601 reset times for Claude, `rate_limit.primary_window` / `secondary_window` with `used_percent` and epoch-second `reset_at` for Codex.
+
+Unlike CLIProxyAPI, `api-call` relays nothing. The answer is built from the quota the server already tracks; no request goes upstream, no credential is read, and the request's `header` and `data` (including any `$TOKEN$` placeholder) are ignored. Any other URL or method is refused with 403. Codex reset credits are not offered: their list and consume URLs, and `POST /v0/management/reset-quota`, answer 501, because spending a credit is irreversible and is left to the server's own [`autoRedeemResets`](quota.md) policy.
+
+The readings are as fresh as the server's: an account in use is read off every response, an idle one only by the [quota probe](quota.md#quota-probe), which is off by default. Turn the probe on for current numbers on idle accounts; an account with no reading yet reports its windows as `null`.
+
+The gates are the ones every other route passes, plus the MCP endpoint's rule for a config with no proxy key at all: then only callers on the proxy's own machine are served, and everyone else gets 403. Every path under `/v0/management/` is answered by the proxy itself, on or off, and never forwarded upstream.
+
 ## Auto-update
 
 When TeamClaude is installed globally via npm, it self-updates in the background: it checks the npm registry at most once a day, and when a newer version is published it runs `npm install -g @karpeleslab/teamclaude@latest` and applies it on the next launch. The check runs after a `teamclaude run` session ends and when a headless server starts. In a headless server the install runs as a background child process, so the proxy keeps serving requests while npm works (a synchronous install used to stall it for the duration). A git checkout is never touched — update that with `git pull`. Run `teamclaude update` to update on demand.
