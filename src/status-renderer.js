@@ -183,7 +183,8 @@ export function spendLine(account, paint) {
   // The operator's own ceiling (accounts[].maxSpend), drawn beside the upstream
   // figure it is judged against so the two read in one glance: `$14.35 of
   // $10,000.00 used this month, cap $20.00`. Named `cap` like the usage caps on
-  // the bars above — same word, same meaning: at it the account gets nothing.
+  // the bars above: at it the account bills nothing more, and serves only what
+  // its included quota still covers.
   const capMinor = resolveMaxSpendMinor(account?.maxSpend, spend);
   const cap = capMinor == null ? '' : `, cap ${formatMoney({ ...spend, usedMinor: capMinor, limitMinor: null })}`;
   if (spend.enabled) {
