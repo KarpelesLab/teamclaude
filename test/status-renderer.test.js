@@ -563,6 +563,50 @@ test('adaptive diagnostics name the next target, score weight, and family split'
   assert.match(out, /plan 20x/);
 });
 
+// The Adaptive line of the account named `a`, as the status readout prints it.
+function adaptiveLine(out) {
+  const line = out.split('\n').find(l => /^ {2}Adaptive /.test(l));
+  assert.ok(line, 'an Adaptive row is rendered');
+  return line;
+}
+
+// A Codex account is scored on its own Codex weekly window. "opus+" names the
+// shared Claude bucket, so a Codex row must never carry that label.
+const codexRow = (extra = {}) => ({
+  name: 'a', provider: 'codex', bucket: 'unified7d', window: 'unified7d', competing: true,
+  next: true, weight: 0.95, sessions: 0, inFlight: 0, headroom: 0.95, threshold: 1,
+  planWeight: null, concCap: 6, planType: null, ...extra,
+});
+
+test('a Codex adaptive row names its own window, not the Claude opus+ bucket', () => {
+  const s = distributedStatus('adaptive');
+  s.adaptive = [codexRow()];
+  const line = adaptiveLine(renderStatus(s, { color: false, now }));
+  assert.match(line, /weight 95% of codex weekly/);
+  assert.doesNotMatch(line, /opus\+/);
+  assert.match(line, /plan unknown/, 'no plan name stated, so the row says so');
+});
+
+test('a Codex adaptive row shows the ChatGPT plan name, with no numeric weight', () => {
+  const s = distributedStatus('adaptive');
+  s.adaptive = [codexRow({ planType: 'pro' })];
+  const line = adaptiveLine(renderStatus(s, { color: false, now }));
+  assert.match(line, /plan pro {2}·  conc 6\.0$/);
+  assert.doesNotMatch(line, /plan unknown|plan \d+x/);
+});
+
+test('an Anthropic adaptive row renders byte-for-byte as before the Codex label', () => {
+  // Captured from the renderer before rows carried a provider. A row with no
+  // provider, and one stating `anthropic`, must both print this exact line.
+  const expected = '  Adaptive next · weight 36% of opus+  ·  3 sess / 3 inflight  ·  head 36.0% of 98%  ·  plan 20x  ·  conc 6.0';
+  const base = { name: 'a', bucket: 'unified7d', window: 'unified7d', competing: true, next: true, weight: 0.36, sessions: 3, inFlight: 3, headroom: 0.36, threshold: 0.98, planWeight: 20, concCap: 6 };
+  for (const row of [base, { ...base, provider: 'anthropic' }]) {
+    const s = distributedStatus('adaptive');
+    s.adaptive = [row];
+    assert.equal(adaptiveLine(renderStatus(s, { color: false, now })), expected);
+  }
+});
+
 // The adaptive rows come off the wire like everything else. An older server
 // omits fields and a hostile one sends strings where numbers belong; neither
 // may throw inside `teamclaude status` or reach the terminal unstripped.

@@ -2184,11 +2184,18 @@ export class AccountManager {
       return {
         index: a.index,
         name: a.name,
+        // The account's own provider, which decides how its row is labelled:
+        // `bucket` below is a Claude family name, and means nothing for a Codex
+        // account, whose score comes from its own quota windows.
+        provider: providerOf(a),
         // Requested family and the actual quota window supplying the adaptive
         // score. They differ when a family request is constrained by shared
         // weekly quota.
         bucket,
         window: window.bucket,
+        // The ChatGPT plan name a Codex account reported (display only; the
+        // weight above comes from quotaTier, which knows only Claude tiers).
+        planType: a.quota?.planType ?? null,
         competing: inTier.has(a.index),
         sessions: this.sessionTracker.activeCountFor(a.index, now),
         inFlight: a.inFlight || 0,
