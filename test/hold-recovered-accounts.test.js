@@ -9,9 +9,10 @@ import { createProxyServer } from '../src/server.js';
 // each account that had already failed, so an account that recovered during
 // the hold was never selected again.
 //
-// Deterministic: the clock is mocked (Date and the hold's setTimeout), so
-// recovery is driven by ticking time, not by waiting. A hold is observed through
-// its own log line, so no test polls or sleeps.
+// Deterministic: the clock is mocked (Date and the proxy's setTimeout), so
+// recovery is driven by ticking time, not by waiting. The proxy's own log lines
+// announce each hold and each wait, so the test ticks exactly as far as the
+// proxy asked and no test polls or sleeps.
 
 const START = Date.UTC(2026, 9, 28, 12, 0, 0);
 const SEC = 1000;
@@ -46,46 +47,68 @@ function refused(res) {
   res.end(JSON.stringify({ type: 'error', error: { type: 'permission_error', message: 'Request not allowed' } }));
 }
 
-// Counts the hold's log line. console.log is swallowed for the test's duration
-// so the output stays the test's own.
-function holdLog(t) {
-  let count = 0;
-  const waiting = [];
+// The proxy's wait lines: a hold, an absorbed same-account 429, or the inline
+// wait after exhaustion. Each carries the seconds it will sleep.
+const WAIT_LINE = /holding connection, retry in (\d+)s|— waiting (\d+)s/;
+
+// Counts the proxy's holds and reports each wait it announces. console.log is
+// swallowed for the test's duration so the output stays the test's own.
+function proxyLog(t) {
+  let holds = 0;
+  const holdWaiters = [];
+  const waits = [];
+  const waitWaiters = [];
   t.mock.method(console, 'log', (...args) => {
-    if (!String(args[0]).includes('holding connection')) return;
-    count++;
-    for (const w of waiting.splice(0)) w();
+    const line = String(args[0]);
+    if (line.includes('holding connection')) {
+      holds++;
+      for (const w of holdWaiters.splice(0)) w();
+    }
+    const m = WAIT_LINE.exec(line);
+    if (!m) return;
+    const wait = { wait: Number(m[1] ?? m[2]) * SEC };
+    if (waitWaiters.length) waitWaiters.shift()(wait); else waits.push(wait);
   });
   return {
-    next(n) {
-      return new Promise(resolve => {
-        const check = () => (count >= n ? resolve() : waiting.push(check));
-        check();
-      });
+    holds: {
+      next(n) {
+        return new Promise(resolve => {
+          const check = () => (holds >= n ? resolve() : holdWaiters.push(check));
+          check();
+        });
+      },
+    },
+    waits: {
+      next: () => new Promise(resolve => {
+        if (waits.length) resolve(waits.shift()); else waitWaiters.push(resolve);
+      }),
     },
   };
 }
 
 // Mocks the clock before the AccountManager reads it. respond(token, req, res)
-// plays the upstream.
-async function fleet(t, accounts, respond) {
+// plays the upstream. holdSeconds defaults to a budget long enough to outlast
+// every test that does not set its own.
+async function fleet(t, accounts, respond, { holdSeconds = 300 } = {}) {
   t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: START });
-  const holds = holdLog(t);
+  const log = proxyLog(t);
   const seen = [];
+  const times = [];
   const upstream = http.createServer((req, res) => {
     const token = bearer(req);
     seen.push(token);
+    times.push(Date.now() - START);
     respond(token, req, res);
   });
   const upPort = await listen(upstream);
   let refreshes = 0;
   const am = new AccountManager(accounts, 0.98, { refreshFn: async () => { refreshes++; throw new Error('no refresh in this test'); } });
   const proxy = createProxyServer(am, {
-    proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upPort}`, holdSeconds: 300,
+    proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upPort}`, holdSeconds,
   });
   const port = await listen(proxy);
   return {
-    port, seen, holds, refreshes: () => refreshes,
+    port, seen, times, holds: log.holds, waits: log.waits, refreshes: () => refreshes,
     close() { proxy.closeAllConnections(); proxy.close(); upstream.closeAllConnections(); upstream.close(); },
   };
 }
@@ -100,6 +123,17 @@ function post(port) {
     req.once('error', () => resolve('closed'));
     req.end(JSON.stringify({ model: 'x', messages: [] }));
   });
+}
+
+// Plays the clock forward through each wait the proxy announces, ticking exactly
+// as long as it asked, until the request settles. The next attempt can only
+// follow a tick, so the upstream calls are paced by the proxy's own clock.
+async function drive(t, f, outcome) {
+  for (;;) {
+    const r = await Promise.race([outcome, f.waits.next()]);
+    if (r === null || typeof r !== 'object') return r;
+    t.mock.timers.tick(r.wait);
+  }
 }
 
 // The held request's outcome once the clock has moved: its reply, or a second
@@ -169,5 +203,56 @@ test('a held request never sends a token it could not renew, even once another h
     assert.equal(result, 200, `the held request was held again instead of retrying the account that recovered (got ${result})`);
     assert.ok(!f.seen.includes('ta'), 'a token that could not be renewed was sent upstream');
     assert.equal(f.refreshes(), 1, 'the account whose token could not be renewed was selected again, and renewal retried');
+  } finally { await drain(f, outcome); }
+});
+
+// The retry after a hold is answered 429 again, although the account's own state
+// says it has recovered (upstream's window runs a little longer, as in the
+// field). The held request must keep waiting on the proxy's clock and succeed
+// once upstream recovers, not return that 429 with budget left.
+test('a held request whose retry is still limited waits again and succeeds once upstream recovers', async t => {
+  const f = await fleet(t, [oauth('a', 'ta'), oauth('b', 'tb')], (token, req, res) => {
+    if (Date.now() < START + 3 * SEC) return rateLimited(res, Date.now() + SEC);
+    served(res);
+  }, { holdSeconds: 6 });
+  const outcome = post(f.port);
+  try {
+    const result = await drive(t, f, outcome);
+    assert.equal(result, 200, `the held request returned ${result} with budget left, instead of waiting for upstream to recover`);
+    assert.ok(f.seen.length <= 5, `expected at most 5 upstream calls, saw ${f.seen.length}: ${f.seen.join(',')}`);
+    // Every attempt after the first two follows a wait on the clock, never a back-to-back send.
+    for (let i = 2; i < f.times.length; i++) {
+      assert.ok(f.times[i] - f.times[i - 1] >= SEC, `attempt ${i} was sent back-to-back, ${f.times[i] - f.times[i - 1]}ms after the one before`);
+    }
+  } finally { await drain(f, outcome); }
+});
+
+// Upstream never recovers. The held request spends its budget and is answered
+// with the 429 it always was: the budget is what ends the hold.
+test('a held request whose hold budget runs out is answered 429', async t => {
+  const f = await fleet(t, [oauth('a', 'ta'), oauth('b', 'tb')], (token, req, res) => {
+    rateLimited(res, Date.now() + SEC);
+  }, { holdSeconds: 6 });
+  const outcome = post(f.port);
+  try {
+    const result = await drive(t, f, outcome);
+    assert.equal(result, 429, `expected the budget to run out with a 429, got ${result}`);
+    assert.ok(f.seen.length <= 20, `expected a bounded number of upstream calls, saw ${f.seen.length}`);
+  } finally { await drain(f, outcome); }
+});
+
+// No hold configured: the exhausted request takes the inline wait, one short
+// wait sized by the accounts' own reset, then retries. That retry must reach the
+// account that recovered during the wait.
+test('an inline exhausted wait retries an account that recovered during it', async t => {
+  const f = await fleet(t, [oauth('a', 'ta'), oauth('b', 'tb')], (token, req, res) => {
+    if (Date.now() < START + 5 * SEC) return rateLimited(res, START + 5 * SEC);
+    served(res);
+  }, { holdSeconds: 0 });
+  const outcome = post(f.port);
+  try {
+    const result = await drive(t, f, outcome);
+    assert.equal(result, 200, `the inline retry was not sent to the recovered account (got ${result})`);
+    assert.equal(f.seen.length, 3, `expected two failed hops and one retry, saw ${f.seen.join(',')}`);
   } finally { await drain(f, outcome); }
 });
