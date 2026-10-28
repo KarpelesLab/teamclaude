@@ -139,3 +139,38 @@ test('SIGTERM without proxy.drainTimeoutSeconds keeps the existing shutdown: the
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+// The drain window is a ceiling, not a floor: a second signal while the server
+// is waiting on in-flight work goes straight to exit, as the shutdown funnel
+// promises. The window here is far longer than the runner's timeout, so an
+// exit that waited for the deadline would fail the test rather than pass it.
+test('a second SIGTERM during a drain exits at once, without waiting for the deadline', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-drain-twice-'));
+  const up = await holdingUpstream();
+  let server = null;
+  try {
+    server = await startServer(up.url, dir, { drainTimeoutSeconds: 600 });
+    const stream = await openStream(server.port);
+    assert.equal(stream.status, 200);
+
+    const exited = new Promise(resolve => server.child.once('exit', (code, signal) => resolve({ code, signal })));
+    let seen = '';
+    const announced = new Promise(resolve => {
+      server.child.stdout.on('data', chunk => { seen += chunk; if (DRAIN_LINE.test(seen)) resolve(true); });
+    });
+    server.child.kill('SIGTERM');
+    assert.equal(await Promise.race([announced, exited.then(() => false)]), true, 'the first signal starts a drain');
+
+    // The stream is still open and the upstream never ends on its own, so the
+    // only thing that can end the wait is this second signal.
+    server.child.kill('SIGTERM');
+    const { code } = await exited;
+    assert.equal(code, 0, 'the second signal exits cleanly');
+    const text = await readRest(stream).then(t => t, () => '');
+    assert.doesNotMatch(text, /message_stop/, 'the stream was cut by the exit, not completed');
+  } finally {
+    await up.close();
+    if (server) await server.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
