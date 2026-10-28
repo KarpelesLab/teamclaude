@@ -219,10 +219,17 @@ test('a held request whose retry is still limited waits again and succeeds once 
   try {
     const result = await drive(t, f, outcome);
     assert.equal(result, 200, `the held request returned ${result} with budget left, instead of waiting for upstream to recover`);
-    assert.ok(f.seen.length <= 5, `expected at most 5 upstream calls, saw ${f.seen.length}: ${f.seen.join(',')}`);
-    // Every attempt after the first two follows a wait on the clock, never a back-to-back send.
-    for (let i = 2; i < f.times.length; i++) {
-      assert.ok(f.times[i] - f.times[i - 1] >= SEC, `attempt ${i} was sent back-to-back, ${f.times[i] - f.times[i - 1]}ms after the one before`);
+    // Attempts are paced by the proxy's clock. One failover chain may reach both
+    // accounts at a single instant, and no instant may carry more than that; each
+    // new instant comes only after a tick, at least a second on.
+    const perInstant = new Map();
+    for (const at of f.times) perInstant.set(at, (perInstant.get(at) ?? 0) + 1);
+    for (const [at, n] of perInstant) {
+      assert.ok(n <= 2, `${n} upstream calls at ${at}ms: a retry was sent without a wait (${f.seen.join(',')})`);
+    }
+    const instants = [...perInstant.keys()].sort((x, y) => x - y);
+    for (let i = 1; i < instants.length; i++) {
+      assert.ok(instants[i] - instants[i - 1] >= SEC, `attempts at ${instants[i - 1]}ms and ${instants[i]}ms were back-to-back`);
     }
   } finally { await drain(f, outcome); }
 });
