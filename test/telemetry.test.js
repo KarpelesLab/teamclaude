@@ -310,6 +310,7 @@ test('secrecy: no prompt, credential, client key, email, collector token or work
   const telemetry = createTelemetry({
     telemetry: { otlp: { endpoint: col.endpoint, headers: { authorization: `Bearer ${COLLECTOR_TOKEN}` } } },
   }, {});
+  let accountIds = {};
   try {
     await withProxy({
       accounts: [OWNER, 'pool-b'], telemetry,
@@ -322,7 +323,8 @@ test('secrecy: no prompt, credential, client key, email, collector token or work
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(anthropicJson(USAGE));
       },
-    }, async ({ port, whenEnded }) => {
+    }, async ({ port, whenEnded, accountIds: ids }) => {
+      accountIds = ids;
       const res = await postMessages(port, {
         headers: { 'x-api-key': CLIENT_KEY, 'x-teamclaude-workload': WORKLOAD },
       });
