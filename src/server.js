@@ -1795,7 +1795,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // stripOverage and synthesizeQuota are sampled once here, at dispatch:
       // retries and holds of this request keep them, and a reload applies to
       // subsequent requests.
-      const ctx = { account: null, callerRequestId: callerId, status: null, attempt: 0, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, provider, holdBudgetMs: holdMs, pinKey, onMessage, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), synthesizeQuota: shouldSynthesizeQuotaHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
+      const ctx = { account: null, callerRequestId: callerId, status: null, telemetry: hooks.telemetry?.startRequest({ method: req.method, path: classificationPath(req.url), internalId: reqId, callerId, provider, model, client }) ?? null, attempt: 0, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, provider, holdBudgetMs: holdMs, pinKey, onMessage, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), synthesizeQuota: shouldSynthesizeQuotaHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -1847,6 +1847,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         // would reclassify the worst failure as "the user left".
         accountManager.endSession(pinKey,
           !isCompletionPath(classificationPath(req.url)) ? null : (ctx.delivered ? true : (ctx.abandoned ? null : false)));
+        ctx.telemetry?.finish({ status: ctx.status, outcome: ctx.delivered ? 'completed' : (ctx.abandoned ? 'abandoned' : 'failed') });
         // Cleared BEFORE the hook, because the hook can throw: leaving the entry
         // marked open would send the outer catch to call that same throwing hook
         // a second time for one request.
@@ -3500,6 +3501,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // wait is not an attempt, and past every refusal above that sends nothing. A
     // failover, a 429 retry and a stream-failure hop each pass through here again.
     attempt = ctx.attempt = (ctx.attempt || 0) + 1;
+    const telemetryAttempt = ctx.telemetry?.startAttempt(account.name);
     let upstreamRes;
     let admittedLoad = 0;
     try {
@@ -3524,10 +3526,14 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         body: ['GET', 'HEAD'].includes(method) ? undefined : sendBody,
         redirect: 'manual',
       }, sx, route);
+    } catch (err) {
+      telemetryAttempt?.end({ error: err });
+      throw err;
     } finally {
       admittedLoad = accountManager.release(account.index,
         { successful: !!upstreamRes && upstreamRes.status < 400 }) || 0;
     }
+    telemetryAttempt?.end({ status: upstreamRes.status });
 
     // Extract rate limit headers. Anthropic states its quota under
     // `anthropic-ratelimit-*` and Codex under `x-codex-*`; `updateQuota` picks
@@ -4063,13 +4069,15 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       return;
     }
 
+    // The response's final usage, for telemetry. The exporter keeps one per request.
+    const onTelemetryUsage = /** @type {((usage: any, source: string) => void)} */ ((usage, source) => ctx.telemetry?.recordUsage(usage, source));
     if (isStreaming) {
       // Stream each chunk straight to the log as it is relayed — never hold the
       // whole (potentially ~1M-token) SSE body in memory.
       const l = getLog();
       const bw = l ? l.bodyWriter('RESPONSE BODY (streamed)', contentType) : null;
       try {
-        await streamResponse(upstreamBody, res, account.index, accountManager, bw, ctx.onUsage, ctx.pinKey, ctx.model, ctx.onMessage);
+        await streamResponse(upstreamBody, res, account.index, accountManager, bw, ctx.onUsage, ctx.pinKey, ctx.model, ctx.onMessage, onTelemetryUsage);
         // Reached only when the stream completed. A stream that dies upstream
         // throws out of streamResponse, so it never marks itself delivered —
         // which is the failure the token counters cannot see, since a stream
@@ -4084,7 +4092,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       l?.end();
     } else {
       const buf = Buffer.from(await upstreamRes.arrayBuffer());
-      extractUsageFromBody(buf, account.index, accountManager, ctx.onUsage, ctx.pinKey, ctx.model, ctx.onMessage);
+      extractUsageFromBody(buf, account.index, accountManager, ctx.onUsage, ctx.pinKey, ctx.model, ctx.onMessage, onTelemetryUsage);
       const l = getLog();
       if (l) { l.body('RESPONSE BODY', buf, contentType); l.end(); }
       res.end(buf);
@@ -4260,7 +4268,7 @@ export function readWithIdleTimeout(reader, ms) {
 /**
  * Stream an SSE response to the client, parsing usage data along the way.
  */
-export async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter, onUsage = null, pinKey = null, model = null, onMessage = null) {
+export async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter, onUsage = null, pinKey = null, model = null, onMessage = null, onTelemetryUsage = /** @type {((usage: any, source: string) => void)|null} */ (null)) {
   const reader = webStream.getReader();
   // A client that leaves while upstream is silent must not hold the pending
   // read — and with it the upstream socket and its admission permit — until
@@ -4342,6 +4350,7 @@ export async function streamResponse(webStream, res, accountIndex, accountManage
     // and recording those would report an observation that never happened.
     if (Object.keys(merged).length) {
       accountManager.recordTokenUsage(accountIndex, pinKey, model, merged);
+      onTelemetryUsage?.(merged, responsesTurn.settled ? 'openai.responses.normalized' : 'anthropic.messages.original');
     }
     // Cancel upstream reader to stop consuming data nobody needs (and, on the
     // timeout path, to destroy the dead socket so the pool drops it).
@@ -4481,7 +4490,7 @@ function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, me
  * @param {string|null} [model]
  * @param {((messageId: string) => void)|null} [onMessage] told the id of the message the body is
  */
-function extractUsageFromBody(buffer, accountIndex, accountManager, onUsage = null, pinKey = null, model = null, onMessage = null) {
+function extractUsageFromBody(buffer, accountIndex, accountManager, onUsage = null, pinKey = null, model = null, onMessage = null, onTelemetryUsage = /** @type {((usage: any, source: string) => void)|null} */ (null)) {
   try {
     const json = JSON.parse(buffer.toString());
     if (json?.type === 'message' && typeof json.id === 'string') onMessage?.(json.id);
@@ -4494,11 +4503,13 @@ function extractUsageFromBody(buffer, accountIndex, accountManager, onUsage = nu
       // while a body that is one but whose figures do not survive the normaliser
       // (a negative, a NaN, nothing at all) books nothing. Falling back there
       // would book exactly the number the normaliser exists to stop.
-      const usage = isResponsesBody(json) ? normalizeResponsesUsage(json.usage) : json.usage;
+      const responses = isResponsesBody(json);
+      const usage = responses ? normalizeResponsesUsage(json.usage) : json.usage;
       if (!usage) return;
       accountManager.updateUsage(accountIndex, usage.input_tokens, usage.output_tokens);
       onUsage?.(usage.input_tokens || 0, usage.output_tokens || 0);
       accountManager.recordTokenUsage(accountIndex, pinKey, model, usage);
+      onTelemetryUsage?.(usage, responses ? 'openai.responses.normalized' : 'anthropic.messages.original');
     }
   } catch {
     // not JSON or no usage

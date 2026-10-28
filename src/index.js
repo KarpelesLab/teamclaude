@@ -53,6 +53,7 @@ import { parseRoutingUrl, routingToUrl, describeRouting, checkRouting } from './
 import { proxyFetch } from './upstream-fetch.js';
 import { upstreamFor } from './provider.js';
 import { startEventLoopMonitor } from './event-loop-monitor.js';
+import { createTelemetry } from './telemetry.js';
 import { envVar } from './brand.js';
 import { loginCallback, loadCallbackToken, saveCallbackToken, callbackWhoami, logoutCallback, callbackClientId, getCallbackAuthPath } from './callback-auth.js';
 import { CredentialSync, refreshOutsideProxy } from './credential-sync.js';
@@ -823,6 +824,10 @@ async function serverCommand() {
   }
 
   // Expose reload to the proxy's control endpoint (works with or without TUI).
+  // Opt-in OTLP export. Attached after the TUI or headless hooks above are in
+  // place, so both modes share the one exporter.
+  const telemetry = createTelemetry(config);
+  hooks.telemetry = telemetry;
   hooks.reload = reloadAccounts;
   hooks.persistAccounts = () => atomicConfigUpdate(mergeAccountsOnto);
 
@@ -866,6 +871,7 @@ async function serverCommand() {
     clients: clientUsage.export(),
     // Per-dimension usage (proxy.usageDimensions) — empty when unconfigured.
     usageDimensions: dimensionUsage.export(),
+    telemetry: telemetry.getHealth(),
     server: {
       version: serverVersion,
       versionLabel,
@@ -1050,7 +1056,7 @@ async function serverCommand() {
     // short grace period in case anything still hangs.
     setTimeout(() => process.exit(0), 2000).unref?.();
     server.closeAllConnections?.();
-    server.close(() => process.exit(0));
+    server.close(() => { telemetry.shutdown().finally(() => process.exit(0)); });
   }
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
