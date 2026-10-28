@@ -75,6 +75,20 @@ async function withFleet({ accounts, respond, am = null, hooks = {} }, run) {
   }
 }
 
+// Collects what a hook reported. `reached` resolves once `n` calls have arrived.
+// The end hook runs in the server's `finally`, which can land after the client
+// has read the whole response, so a test waits on this rather than reading early.
+function gate(n) {
+  const items = [];
+  let open;
+  const reached = new Promise((resolve) => { open = resolve; });
+  return {
+    items,
+    reached,
+    push(item) { items.push(item); if (items.length === n) open(); },
+  };
+}
+
 const OK = (req, res) => {
   res.writeHead(200, { 'content-type': 'application/json' });
   res.end(JSON.stringify({ type: 'message', role: 'assistant', content: [] }));
@@ -196,10 +210,12 @@ test('the inbound x-request-id is still forwarded upstream as it was sent', asyn
 
 test('a failover is two upstream attempts under one request id; a clean request is one', async () => {
   const routed = [];
-  const ended = [];
+  const endedFirst = gate(1);
+  const endedAll = gate(2);
+  const ended = endedAll.items;
   const hooks = {
     onRequestRouted: (id, info) => routed.push({ id, account: info.account }),
-    onRequestEnd: (id, info) => ended.push({ id, attempts: info.attempts }),
+    onRequestEnd: (id, info) => { endedFirst.push({ id, attempts: info.attempts }); endedAll.push({ id, attempts: info.attempts }); },
   };
   // The dead key is refused with a 401, which fails over to the live account and
   // takes the dead one out of rotation for the next request.
@@ -215,6 +231,7 @@ test('a failover is two upstream attempts under one request id; a clean request 
   await withFleet({ accounts: [apikey('dead'), apikey('live')], respond: answer, hooks }, async ({ port, seen }) => {
     const failed = await send(port, { body });
     assert.equal(failed.status, 200);
+    await endedFirst.reached;
     assert.deepEqual(routed.map(r => r.account), ['dead', 'live'], 'the failover should route twice');
     assert.equal(new Set(routed.map(r => r.id)).size, 1, 'both attempts belong to one request id');
     assert.equal(ended.length, 1);
@@ -223,9 +240,34 @@ test('a failover is two upstream attempts under one request id; a clean request 
 
     const clean = await send(port, { body });
     assert.equal(clean.status, 200);
+    await endedAll.reached;
     assert.equal(ended.length, 2);
     assert.notEqual(ended[1].id, ended[0].id);
     assert.equal(ended[1].attempts, 1, 'a request that goes straight through is one attempt');
     assert.equal(seen.filter(h => h['x-api-key'] === 'dead-key').length, 1, 'the dead key was not retried');
+  });
+});
+
+// ── the caller id is reported with the request's activity ──────────────────
+
+test('the caller id reaches the activity hooks on start and end', async () => {
+  const started = gate(2);
+  const ended = gate(2);
+  const hooks = {
+    onRequestStart: (id, info) => started.push({ id, callerRequestId: info.callerRequestId }),
+    onRequestEnd: (id, info) => ended.push({ id, callerRequestId: info.callerRequestId }),
+  };
+  const body = JSON.stringify({ model: 'claude-opus-5', messages: [] });
+  await withFleet({ accounts: [apikey('a')], respond: OK, hooks }, async ({ port }) => {
+    const valid = await send(port, { headers: { 'x-request-id': 'corr-9' }, body });
+    assert.equal(valid.headers[ECHO], 'corr-9');
+    const invalid = await send(port, { headers: { 'x-request-id': 'bad id' }, body });
+    const generated = invalid.headers[ECHO];
+    assert.match(generated, UUID);
+
+    await Promise.all([started.reached, ended.reached]);
+    assert.deepEqual(started.items.map(s => s.callerRequestId), ['corr-9', generated]);
+    assert.deepEqual(ended.items.map(e => e.callerRequestId), ['corr-9', generated]);
+    assert.notEqual(started.items[0].id, started.items[1].id, 'each request keeps its own internal id');
   });
 });
