@@ -1,6 +1,6 @@
 import http from 'node:http';
 import https from 'node:https';
-import { timingSafeEqual } from 'node:crypto';
+import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { createWriteStream, mkdirSync, writeSync } from 'node:fs';
 import { readdir, stat, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -1460,6 +1460,24 @@ export function clientSessionId(headers) {
  *   onRequestEnd?: (id: number, info: Record<string, any>) => void,
  * } & Record<string, any>} ActivityHooks
  */
+// The header a caller reads its own request id from, and the one the proxy echoes
+// back on every response from the forwarding listener. The echoed value is the
+// caller's when it is a plain token, and a fresh UUID otherwise. It is for
+// correlation only: never identity, never a dedup key, never a routing input.
+export const CORRELATION_HEADER = 'x-teamclaude-request-id';
+const CALLER_REQUEST_ID = /^[A-Za-z0-9._:-]{1,128}$/;
+
+/**
+ * @param {Record<string, any>|null|undefined} headers
+ * @returns {string}
+ */
+export function callerRequestId(headers) {
+  // Node joins a repeated header with ", ", so a duplicate fails the pattern on
+  // its own. The typeof check covers any value that is not a single string.
+  const value = headers?.['x-request-id'];
+  return typeof value === 'string' && CALLER_REQUEST_ID.test(value) ? value : randomUUID();
+}
+
 // Shared by every listener in the process, not kept per listener: the activity
 // hooks key their rows by this id, and the MITM builds one listener per cached
 // (pin, client) server, so a per-listener counter would hand out the same id to
@@ -1483,6 +1501,11 @@ let lastRequestId = 0;
  */
 export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null, egress = null, clientUsage = null, forcedClient = null, dimensionUsage = null }) {
   return async (req, res) => {
+    // Set before anything else, so every response from this listener carries the
+    // id, the refusals below included. setHeader rather than an object in a later
+    // writeHead: Node merges it into that head. A response's own x-request-id is a
+    // different header and is left alone.
+    res.setHeader(CORRELATION_HEADER, callerRequestId(req.headers));
     // The activity entry this request opened, while it is still open. Every
     // consumer holds the row until it is told the request ended, so exactly one
     // path must close it. Each closing site clears this first, which is how the
@@ -2060,6 +2083,7 @@ function relayStream(req, res, upstream, sx, stripOverage = false) {
     const responseHeaders = {};
     for (const [key, value] of Object.entries(upstreamRes.headers)) {
       if (CONNECTION_SPECIFIC_HEADERS.has(key) || key === 'content-encoding' || key === 'content-length') continue;
+      if (key === CORRELATION_HEADER) continue;
       if (stripOverage && isOverageHeader(key)) continue;
       responseHeaders[key] = value;
     }
@@ -2335,6 +2359,7 @@ async function relayRaw(req, res, upstream, sx, maxBodyBytes = DEFAULT_MAX_BODY_
       // a gzip'd upstream response reaches the client mis-framed / truncated.
       if (key === 'transfer-encoding' || key === 'connection' ||
           key === 'content-encoding' || key === 'content-length') continue;
+      if (key === CORRELATION_HEADER) continue;
       if (stripOverage && isOverageHeader(key)) continue;
       responseHeaders[key] = value;
     }
@@ -3988,6 +4013,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     const responseHeaders = {};
     for (const [key, value] of upstreamRes.headers.entries()) {
       if (CONNECTION_SPECIFIC_HEADERS.has(key)) continue;
+      // Ours, set before this head (see the listener): an upstream copy would win the merge.
+      if (key === CORRELATION_HEADER) continue;
       // Strip content-encoding/content-length since fetch may auto-decompress
       if (key === 'content-encoding' || key === 'content-length') continue;
       // Per-org billing state, dropped when stripOverageHeaders is on (see
