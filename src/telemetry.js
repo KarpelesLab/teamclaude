@@ -13,7 +13,7 @@
 // batch the collector refuses or fails to answer in time. Export never throws
 // into the request path and never waits on it.
 
-import { createHash, randomBytes } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import { envVar, LEGACY_NAME } from './brand.js';
 
 export const QUEUE_LIMIT = 512;
@@ -62,7 +62,7 @@ export function telemetryRouteFor(path) {
 
 /**
  * @typedef {object} RequestHandle
- * @property {(account: string|null|undefined) => { end: (result?: { status?: number, error?: unknown }) => void }} startAttempt
+ * @property {(account: {name?: string, id?: string}|null|undefined) => { end: (result?: { status?: number, error?: unknown }) => void }} startAttempt
  * @property {(values: any, source: string) => void} recordUsage
  * @property {(result?: { status?: number, outcome?: string }) => void} finish
  */
@@ -199,7 +199,7 @@ function exporter(url, headers) {
       'teamclaude.route': route,
       'teamclaude.provider': text(provider, 32),
       'teamclaude.model': typeof model === 'string' && MODEL_RE.test(model) ? model : undefined,
-      'teamclaude.client': label(client, 64) ?? 'none',
+      'teamclaude.client': clientLabel(client),
       'http.request.method': text(method, 16),
     };
     let attemptCount = 0;
@@ -207,13 +207,14 @@ function exporter(url, headers) {
     let usage = null;
     let finished = false;
     return {
-      /** @param {string|null|undefined} account */
+      /** @param {{name?: string, id?: string}|null|undefined} account */
       startAttempt(account) {
         attemptCount++;
         const number = attemptCount;
         const attemptSpanId = newId(8);
         const attemptStartNs = nowNs();
-        const accountLabel = label(account, 64);
+        const accountName = label(account?.name, 64);
+        const accountId = text(account?.id, 64);
         let ended = false;
         return {
           /** @param {{ status?: number, error?: unknown }} [result] */
@@ -227,7 +228,8 @@ function exporter(url, headers) {
               startNs: attemptStartNs, endNs: nowNs(), failed,
               attributes: {
                 'teamclaude.attempt.number': number,
-                'teamclaude.account': accountLabel,
+                'teamclaude.account': accountName,
+                'teamclaude.account.id': accountId,
                 'http.response.status_code': Number.isInteger(status) ? status : undefined,
                 'teamclaude.attempt.error': error ? errorLabel(error) : undefined,
               },
@@ -384,10 +386,10 @@ function text(value, max) {
 }
 
 /**
- * A name exported as it is, unless it is an email, in which case a stable
- * domain-separated hash. The check runs on the whole name, before any cut, so a
- * long address cannot hide its '@' past the limit. The hash is a pseudonym, not
- * a secret: anyone who can guess an address can confirm it.
+ * A name exported as it is, unless it contains an '@', in which case it is not
+ * exported at all: an address is neither sent nor hashed, since a hash of a
+ * guessable address can be confirmed. The check runs on the whole name, before
+ * any cut, so a long address cannot hide its '@' past the limit.
  * @param {unknown} name
  * @param {number} max
  * @returns {string|undefined}
@@ -395,9 +397,19 @@ function text(value, max) {
 function label(name, max) {
   if (typeof name !== 'string') return undefined;
   const clean = name.replace(CONTROL_RE, '');
-  if (!clean) return undefined;
-  if (clean.includes('@')) return `sha256:${createHash('sha256').update('teamclaude:label:').update(clean).digest('hex').slice(0, 24)}`;
+  if (!clean || clean.includes('@')) return undefined;
   return clean.slice(0, max);
+}
+
+/**
+ * The client's name, 'none' when there is no client, or 'redacted' when the
+ * name is an address.
+ * @param {unknown} client
+ * @returns {string}
+ */
+function clientLabel(client) {
+  if (typeof client === 'string' && client.includes('@')) return 'redacted';
+  return label(client, 64) ?? 'none';
 }
 
 /**

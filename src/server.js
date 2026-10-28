@@ -3501,7 +3501,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // wait is not an attempt, and past every refusal above that sends nothing. A
     // failover, a 429 retry and a stream-failure hop each pass through here again.
     attempt = ctx.attempt = (ctx.attempt || 0) + 1;
-    const telemetryAttempt = ctx.telemetry?.startAttempt(account.name);
+    const telemetryAttempt = ctx.telemetry?.startAttempt(account);
     let upstreamRes;
     let admittedLoad = 0;
     try {
