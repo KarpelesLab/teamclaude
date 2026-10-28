@@ -1460,6 +1460,12 @@ export function clientSessionId(headers) {
  *   onRequestEnd?: (id: number, info: Record<string, any>) => void,
  * } & Record<string, any>} ActivityHooks
  */
+// Shared by every listener in the process, not kept per listener: the activity
+// hooks key their rows by this id, and the MITM builds one listener per cached
+// (pin, client) server, so a per-listener counter would hand out the same id to
+// two requests that are in flight at once.
+let lastRequestId = 0;
+
 /**
  * @param {Object} opts
  * @param {Object} opts.accountManager
@@ -1476,7 +1482,6 @@ export function clientSessionId(headers) {
  * @param {Object|null} [opts.dimensionUsage]
  */
 export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null, egress = null, clientUsage = null, forcedClient = null, dimensionUsage = null }) {
-  let counter = 0;
   return async (req, res) => {
     // The activity entry this request opened, while it is still open. Every
     // consumer holds the row until it is told the request ended, so exactly one
@@ -1489,7 +1494,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // sees the path upstream will see (see hasDotSegment). Logged like the
       // unknown-pin 404: an operator should see a client probing the boundary.
       if (hasDotSegment(req.url)) {
-        const reqId = ++counter;
+        const reqId = ++lastRequestId;
         const sessionId = req.headers['x-claude-code-session-id'] || null;
         hooks.onRequestEnd?.(reqId, { method: req.method, path: safeLine(req.url), account: '(refused: dot-segment in path)', status: 400, model: null, sessionId, pinned: false });
         res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -1565,7 +1570,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
           // Client-supplied and already percent-decoded, so this is the one
           // value on the path that can carry raw control bytes.
           const shown = safeLine(token ?? raw);
-          const reqId = ++counter;
+          const reqId = ++lastRequestId;
           const sessionId = clientSessionId(req.headers);
           if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(unknown pin: "${shown}")`, status: 404, model: null, sessionId, pinned: false });
           res.writeHead(404, { 'Content-Type': 'application/json' });
@@ -1619,7 +1624,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       if (pinnedIndex == null && forcedPin != null) {
         pinnedIndex = resolveAccountPin(accountManager, forcedPin);
         if (pinnedIndex == null) {
-          const reqId = ++counter;
+          const reqId = ++lastRequestId;
           const sessionId = clientSessionId(req.headers);
           if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(unknown pin: "${safeLine(forcedPin)}")`, status: 404, model: null, sessionId, pinned: false });
           res.writeHead(404, { 'Content-Type': 'application/json' });
@@ -1641,7 +1646,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         if (sessionPin != null) {
           pinnedIndex = resolveAccountPin(accountManager, sessionPin);
           if (pinnedIndex == null) {
-            const reqId = ++counter;
+            const reqId = ++lastRequestId;
             if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(unknown pin: "${safeLine(sessionPin)}")`, status: 404, model: null, sessionId, pinned: false });
             res.writeHead(404, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: `Unknown account pin "${sessionPin}" (session pin; clear it with: teamclaude switch --session --clear)` } }));
@@ -1651,7 +1656,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         }
       }
 
-      const reqId = ++counter;
+      const reqId = ++lastRequestId;
       // Claude Code tags each session's requests with this header (present on
       // /v1/messages and count_tokens). Read from headers up front so it drives
       // session-aware routing (issue #109) and colors the TUI activity stream.
