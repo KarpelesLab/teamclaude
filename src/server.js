@@ -1986,6 +1986,24 @@ function waitForRetry(ms, signal) {
   });
 }
 
+// Before a hold or an inline wait retries the request, forget the failures that
+// waiting can cure (rate limits, exhaustion, transient faults): they put an
+// account in ctx.tried for this request only. An account upstream refused (401,
+// 403) or whose token could not be renewed stays excluded, since waiting
+// changes neither. An account that is still unavailable by its own state is
+// skipped by selection regardless.
+/**
+ * @param {Record<string, any>} ctx
+ * @param {import('./account-manager.js').AccountManager} accountManager
+ */
+function forgetRecoverableFailures(ctx, accountManager) {
+  for (const i of [...ctx.tried]) {
+    const name = accountManager.accounts[i]?.name;
+    if (ctx.credentialRejected?.has(name) || ctx.unrenewed?.has(name)) continue;
+    ctx.tried.delete(i);
+  }
+}
+
 function clientGone(res) {
   return !!res.destroyed || !!res.stream?.destroyed;
 }
@@ -3267,6 +3285,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       console.log(`[TeamClaude] All accounts exhausted — holding connection, retry in ${Math.ceil(waitMs / 1000)}s (${Math.ceil(ctx.holdBudgetMs / 1000)}s budget left)`);
       await waitForRetry(waitMs, ctx.signal);
       if (clientGone(res)) { ctx.abandoned = true; return; }
+      forgetRecoverableFailures(ctx, accountManager);
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
     }
 
@@ -3276,6 +3295,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       console.log(`[TeamClaude] All accounts exhausted — waiting ${retryAfter}s before retry`);
       await waitForRetry(retryAfter * 1000, ctx.signal);
       if (clientGone(res)) { ctx.abandoned = true; return; }
+      forgetRecoverableFailures(ctx, accountManager);
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
     }
     res.writeHead(429, {
