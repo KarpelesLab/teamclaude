@@ -53,9 +53,9 @@ Resource attribute `service.name` is `teamclaude`. The instrumentation scope is 
 | Attribute | Meaning |
 | --- | --- |
 | `teamclaude.request.internal_id` | The proxy's request number. It is unique within one process run, not across restarts. |
-| `teamclaude.request.caller_id` | The `x-request-id` value echoed to the client: the inbound value if it was valid, otherwise a generated one. It is exported as the caller sent it, so callers should send opaque ids. |
+| `teamclaude.request.caller_id` | The `x-request-id` value echoed to the client: the inbound value if it matches `[A-Za-z0-9._:-]{1,128}`, otherwise a generated UUID. The value is exported verbatim and the proxy checks nothing else about it, so callers should send opaque ids, never anything they would not want a collector to hold. |
 | `teamclaude.route`, `teamclaude.provider`, `teamclaude.model` | The API shape, the provider, and the model name. The model is exported only when it is a plain identifier. |
-| `teamclaude.client` | The name of the `proxy.clientKeys` entry that authenticated the request, or `none`. |
+| `teamclaude.client` | The name of the `proxy.clientKeys` entry that authenticated the request, `none` when there is none, or `redacted` when the name contains `@`. |
 | `http.request.method`, `http.response.status_code` | The request method and the final status the client received. |
 | `teamclaude.outcome` | `completed` (answered), `failed` (no answer was delivered) or `abandoned` (the client left). |
 | `teamclaude.attempts` | The number of upstream attempts, including failovers and retries. |
@@ -70,9 +70,12 @@ The span's status is `ERROR` when the outcome is `failed`.
 | Attribute | Meaning |
 | --- | --- |
 | `teamclaude.attempt.number` | 1 for the first upstream send, then 2, 3 and so on. |
-| `teamclaude.account` | The account's name. An account whose name contains `@` is exported as `sha256:` followed by 24 hex characters instead. |
+| `teamclaude.account.id` | The account's opaque id: a random UUID assigned to every account entry, the key a downstream system should join on. |
+| `teamclaude.account` | The account's name, exported only when the name contains no `@`. |
 | `http.response.status_code` | The upstream status, when upstream answered. |
 | `teamclaude.attempt.error` | A short error code such as `ECONNREFUSED` or `timeout`, when no response arrived. |
+
+An attempt names its account by `teamclaude.account.id`, which reveals nothing about the account on its own. An account named with an email address has no name in the export, only the id.
 
 The span covers the upstream request up to the response head. It is `ERROR` on a transport error or a
 5xx status.
@@ -98,13 +101,10 @@ reported usage, and never more than one. A late or repeated `finish` is ignored.
 - Request and response headers, except the status code.
 - Authentication: the presented client key, the upstream credentials, `proxy.apiKey`, and the
   `telemetry.otlp.headers` values.
-- Account emails. An account or client name containing `@` is hashed. The hash is a pseudonym,
-  not a secret: anyone who can guess an address can confirm it.
+- Account and client names that contain `@`. They are dropped (a client is shown as `redacted`), and
+  no hash of such a name is exported either: a hash of a guessable address can be confirmed.
 - The `x-teamclaude-workload` header, and any other caller-supplied header.
 - Span events, links, and free text.
-
-The hash is a SHA-256 over a fixed domain prefix, truncated to 24 hex characters, so it is stable
-across restarts but carries no key.
 
 ## Queueing, timeouts and drops
 
@@ -117,6 +117,9 @@ across restarts but carries no key.
   that is down costs one timeout per flush.
 - Export never delays a request and never throws into the request path.
 - On shutdown the queue gets at most 1.5 seconds to drain. Anything left is counted as dropped.
+  The shutdown path in `index.js` also has a hard exit after 2 seconds, so a flush still running at
+  that point is cut off and its unsent spans are lost. The 2 seconds bounds the whole shutdown, not
+  the export alone.
 
 The queue lives in memory. Spans that have not been accepted by the collector are lost if the proxy
 exits, so this is an observability channel, not a durable ledger.
