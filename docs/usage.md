@@ -241,7 +241,22 @@ Re-running `teamclaude service install` rewrites the unit and restarts the proxy
 
 ## Control routes under a second name
 
-Every `/teamclaude/…` route the server exposes — `status`, `quota`, `reload`, `switch`, `disable`, `priority`, `threshold`, `probe`, `dashboard` and `mcp` — also answers at the same path under `/teamrouter/…`, with the same gates and the same replies. It is the first step of the [rename to TeamRouter](../README.md#renaming-to-teamrouter); scripts and dashboards written against `/teamclaude/…` keep working unchanged.
+Every `/teamclaude/…` route the server exposes — `status`, `quota`, `reload`, `switch`, `disable`, `priority`, `threshold`, `probe`, `drain`, `undrain`, `dashboard` and `mcp` — also answers at the same path under `/teamrouter/…`, with the same gates and the same replies. It is the first step of the [rename to TeamRouter](../README.md#renaming-to-teamrouter); scripts and dashboards written against `/teamclaude/…` keep working unchanged.
+
+## Draining for maintenance
+
+Before a restart, or while you work on the proxy's machine, drain it so the requests in flight finish instead of being cut:
+
+```bash
+curl -X POST http://localhost:3456/teamclaude/drain   -H "x-api-key: $KEY"
+curl -X POST http://localhost:3456/teamclaude/undrain -H "x-api-key: $KEY"
+```
+
+- While draining, a new request to the forwarded API routes gets `503` with a `retry-after` header and `Connection: close`. The body is `{"type":"error","error":{"type":"overloaded_error","message":"…","details":{"error_code":"draining"}}}`, so a client can retry once the proxy is back. Streams already open run to their end.
+- The control routes still answer while draining, so `undrain` works. `GET /teamclaude/status` carries `drain: { draining, since, inFlight }`, where `since` is when the drain began and `inFlight` is the number of requests still running.
+- Drain is runtime state. It is not written to the config, and a restart clears it. Only the shared `proxy.apiKey` and the operator's own loopback calls may drain or undrain; a `proxy.clientKeys` entry gets `403`, scoped or not.
+- The count covers the requests the forwarding listener admits, including ones intercepted in [MITM mode](proxy-modes.md#mitm-proxy-mode-default), until the proxy has finished with each one. It does not cover blind CONNECT tunnels, the WebSocket channel that Remote Control opens, or absolute-form forward-proxy requests. None of those is refused during a drain either, and all of them are cut when the process exits.
+- To have SIGTERM drain as well, set `proxy.drainTimeoutSeconds` (see [Configuration](configuration.md)). It is off by default, and SIGTERM then stops at once as it always has. TeamClaude's service install writes no stop timeout of its own, so the launchd and systemd defaults apply: launchd sends SIGKILL after its exit timeout, and systemd after `TimeoutStopSec`. Keep the drain window under whichever applies to your service.
 
 ## Status dashboard (browser)
 

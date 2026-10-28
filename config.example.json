@@ -12,7 +12,8 @@
       { "name": "ref", "header": "x-teamclaude-ref" }
     ],
     "sessionDetail": false,
-    "mcp": "off"
+    "mcp": "off",
+    "drainTimeoutSeconds": 0
   },
   "upstream": "https://api.anthropic.com",
   "switchThreshold": 0.98,
