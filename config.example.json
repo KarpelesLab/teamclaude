@@ -73,6 +73,12 @@
     }
   ],
   "upstreamProxy": "http://proxy.corp.example:3128",
+  "telemetry": {
+    "otlp": {
+      "endpoint": "",
+      "headers": {}
+    }
+  },
   "egress": {
     "pin": "auto",
     "checkUrl": "https://api.ipify.org",
