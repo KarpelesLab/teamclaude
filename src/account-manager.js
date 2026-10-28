@@ -3936,6 +3936,14 @@ export class AccountManager {
     // request that cannot be sent there settles nothing and leaves the event too.
     const spends = !this.expiryRouting.enabled
       || (scope != null && canRouteTo(this.accounts[this.currentIndex]));
+    // The knob-off scope above drops the provider partition the walk already
+    // applied to its exclusion set. Inside a walk the partition still holds: a
+    // request spends only the events its own provider can act on, and the other
+    // provider's stay pending for its own next request. A poll or a direct caller
+    // has no walk, and keeps the knob-off behaviour it has always had.
+    const partition = !this.expiryRouting?.enabled && this._selectingProvider != null
+      ? this._excludeOtherProviders(null, this._selectingProvider)
+      : null;
     const sessionReset = [];
     for (const account of this.accounts) {
       const r = this._clearExpiredQuotas(account);
@@ -3946,6 +3954,7 @@ export class AccountManager {
       // the flag for one that cannot leaves the next nothing to act on. Read
       // after _clearExpiredQuotas, since before it every account refuses.
       if (scope != null && !canRouteTo(account)) continue;
+      if (partition?.has(account.index)) continue;
       // The flag, not r.session: a status read may have cleared the window
       // seconds earlier, and the rule still has to run. Cleared here rather
       // than where the window is, so that a read cannot swallow the event.
@@ -3959,7 +3968,7 @@ export class AccountManager {
     // model-scoped filter there is a live routing change on the path that
     // promises none.
     if (sessionReset.length) {
-      this._switchOnSessionReset(sessionReset, this.expiryRouting.enabled ? model : null, scope, adv);
+      this._switchOnSessionReset(sessionReset, this.expiryRouting.enabled ? model : null, scope ?? partition, adv);
     }
     return changed;
   }
