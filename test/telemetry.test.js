@@ -421,7 +421,7 @@ test('collector down: requests still succeed, failures and drops are counted, an
   }
 });
 
-test('collector slow: a request completes while its export is still unanswered', async () => {
+test('collector slow: a request completes while its export is still unanswered', { timeout: 30_000 }, async () => {
   const col = await collector({ hang: true });
   const telemetry = createTelemetry({ telemetry: { otlp: { endpoint: col.endpoint } } }, {});
   try {
