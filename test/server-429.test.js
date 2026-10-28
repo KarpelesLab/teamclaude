@@ -298,3 +298,128 @@ test('stale over-threshold quota is re-probed, not refused forever', async () =>
     upstream.close();
   }
 });
+
+// ── the all-exhausted refusal says it is pool exhaustion ──────
+//
+// Both the synthetic refusal and an upstream rate limit reach the client as
+// `rate_limit_error`, so a client that wants to tell them apart has to read the
+// message. `details.error_code` is the machine-readable answer: `pool_exhausted`
+// on the proxy's own refusal, with the retry-after it sent and `resets_at` set
+// only to a real reset clock. A fleet with nothing eligible at all is
+// `no_eligible_account`, a configuration problem rather than exhaustion. The
+// upstream's 429 is relayed without details.
+
+/**
+ * Drive one request through a proxy whose upstream counts its hits and answers
+ * `upstreamStatus`. Returns the response, the account manager, and the bracket
+ * of local time the request was made in.
+ */
+async function requestThroughProxy({ setup, upstreamStatus = 200, upstreamRetryAfter = null }) {
+  let upstreamHits = 0;
+  const upstream = http.createServer((_req, res) => {
+    upstreamHits++;
+    const headers = { 'content-type': 'application/json' };
+    if (upstreamRetryAfter != null) headers['retry-after'] = upstreamRetryAfter;
+    res.writeHead(upstreamStatus, headers);
+    res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error' } }));
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager(
+    [{ name: 'a', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 }],
+    0.98,
+  );
+  setup(am);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const before = Date.now();
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-opus-5', messages: [] }),
+    });
+    const body = await res.json();
+    const after = Date.now();
+    return { res, body, am, before, after, upstreamHits };
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+}
+
+test('an all-exhausted refusal carries error_code pool_exhausted, the retry-after it sent, and the real reset', async () => {
+  const { res, body, am, upstreamHits } = await requestThroughProxy({
+    // Throttled for five minutes: nothing is servable and the proxy refuses
+    // locally, so the upstream must never be reached.
+    setup: m => m.markRateLimited(0, 300),
+  });
+
+  assert.equal(res.status, 429);
+  assert.equal(upstreamHits, 0, 'the refusal is synthetic: no upstream attempt');
+  const details = body.error.details;
+  assert.equal(details.error_code, 'pool_exhausted');
+  assert.ok(Number.isInteger(details.retry_after_seconds) && details.retry_after_seconds > 0);
+  assert.equal(res.headers.get('retry-after'), String(details.retry_after_seconds),
+    'the header and the body name the same wait');
+
+  // resets_at is the account's own reset clock, not a figure derived from the
+  // retry-after: the two match to the millisecond, with no clock tolerance.
+  assert.equal(details.resets_at, new Date(am.accounts[0].rateLimitedUntil).toISOString());
+});
+
+test('the all-exhausted refusal keeps its type and message', async () => {
+  const { body } = await requestThroughProxy({ setup: m => m.markRateLimited(0, 300) });
+
+  assert.equal(body.type, 'error');
+  assert.equal(body.error.type, 'rate_limit_error', 'Claude Code keys its retry behaviour on this');
+  assert.match(body.error.message, /^No account can serve this request for claude-opus-5: all 1 account/);
+  assert.match(body.error.message, /at their quota or rate limit\./);
+});
+
+test('an eligible account with no reset clock is pool_exhausted with resets_at null', async () => {
+  // A dead credential: the wait falls back to the untimed interval, and no
+  // reset exists to name. A downstream system must not read that 60s as a reset.
+  const { res, body, upstreamHits } = await requestThroughProxy({
+    setup: m => { m.accounts[0].status = 'error'; },
+  });
+
+  assert.equal(res.status, 429);
+  assert.equal(upstreamHits, 0);
+  const details = body.error.details;
+  assert.equal(details.error_code, 'pool_exhausted');
+  assert.equal(details.resets_at, null, 'an untimed wait is not a reset');
+  assert.equal(details.retry_after_seconds, Number(res.headers.get('retry-after')));
+});
+
+test('no eligible account is no_eligible_account with resets_at null, since it is a configuration problem', async () => {
+  const { res, body, upstreamHits } = await requestThroughProxy({
+    setup: m => { m.accounts[0].disabled = true; },
+  });
+
+  assert.equal(res.status, 429);
+  assert.equal(upstreamHits, 0);
+  assert.equal(body.error.type, 'rate_limit_error');
+  assert.match(body.error.message, /every account eligible for it is disabled/);
+  const details = body.error.details;
+  assert.equal(details.error_code, 'no_eligible_account');
+  assert.equal(details.resets_at, null, 'nothing will reset');
+  assert.equal(details.retry_after_seconds, Number(res.headers.get('retry-after')));
+});
+
+test('an upstream 429 relayed to the client does not claim pool exhaustion', async () => {
+  const { res, body, upstreamHits } = await requestThroughProxy({
+    setup: () => {},
+    upstreamStatus: 429,
+    upstreamRetryAfter: '300',
+  });
+
+  assert.equal(res.status, 429);
+  assert.equal(upstreamHits, 1, 'a long upstream retry-after is relayed, not retried inline');
+  assert.equal(body.error.type, 'rate_limit_error');
+  assert.equal(body.error.details, undefined, 'only the proxy\'s own refusal carries details');
+});
