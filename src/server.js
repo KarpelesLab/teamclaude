@@ -3286,7 +3286,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       await waitForRetry(waitMs, ctx.signal);
       if (clientGone(res)) { ctx.abandoned = true; return; }
       forgetRecoverableFailures(ctx, accountManager);
-      return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
+      // A hold is a new attempt, not one more failover: the hops spent before
+      // it are not spent on the retry, or a retry still answered 429 would be
+      // returned with the budget unspent. The hold budget bounds the loop.
+      return forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir, sx, route);
     }
 
     const exhaustedRetries = ctx.exhaustedRetries || 0;
