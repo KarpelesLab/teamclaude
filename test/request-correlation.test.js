@@ -52,7 +52,7 @@ async function withRefusingListener(run) {
 // A proxy in front of a fake upstream. `respond(req, res)` answers each upstream
 // request after its body has been read. `seen` collects the headers the upstream
 // received, so a test can check what was forwarded.
-async function withFleet({ accounts, respond, am = null }, run) {
+async function withFleet({ accounts, respond, am = null, hooks = {} }, run) {
   const seen = [];
   const upstream = http.createServer((req, res) => {
     req.resume();
@@ -63,7 +63,7 @@ async function withFleet({ accounts, respond, am = null }, run) {
   });
   const upstreamPort = await listen(upstream);
   const accountManager = am ?? new AccountManager(accounts, 0.98);
-  const proxy = createProxyServer(accountManager, { proxy: {}, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const proxy = createProxyServer(accountManager, { proxy: {}, upstream: `http://127.0.0.1:${upstreamPort}` }, hooks);
   const port = await listen(proxy);
   const origError = console.error;
   console.error = () => {};
@@ -189,5 +189,43 @@ test('the inbound x-request-id is still forwarded upstream as it was sent', asyn
     assert.equal(res.status, 200);
     assert.equal(seen.length, 1);
     assert.equal(seen[0]['x-request-id'], 'forward.me-1');
+  });
+});
+
+// ── one number per upstream attempt ────────────────────────────────────────
+
+test('a failover is two upstream attempts under one request id; a clean request is one', async () => {
+  const routed = [];
+  const ended = [];
+  const hooks = {
+    onRequestRouted: (id, info) => routed.push({ id, account: info.account }),
+    onRequestEnd: (id, info) => ended.push({ id, attempts: info.attempts }),
+  };
+  // The dead key is refused with a 401, which fails over to the live account and
+  // takes the dead one out of rotation for the next request.
+  const answer = (req, res) => {
+    if (req.headers['x-api-key'] === 'dead-key') {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'authentication_error', message: 'invalid' } }));
+      return;
+    }
+    OK(req, res);
+  };
+  const body = JSON.stringify({ model: 'claude-opus-5', messages: [] });
+  await withFleet({ accounts: [apikey('dead'), apikey('live')], respond: answer, hooks }, async ({ port, seen }) => {
+    const failed = await send(port, { body });
+    assert.equal(failed.status, 200);
+    assert.deepEqual(routed.map(r => r.account), ['dead', 'live'], 'the failover should route twice');
+    assert.equal(new Set(routed.map(r => r.id)).size, 1, 'both attempts belong to one request id');
+    assert.equal(ended.length, 1);
+    assert.equal(ended[0].id, routed[0].id);
+    assert.equal(ended[0].attempts, 2);
+
+    const clean = await send(port, { body });
+    assert.equal(clean.status, 200);
+    assert.equal(ended.length, 2);
+    assert.notEqual(ended[1].id, ended[0].id);
+    assert.equal(ended[1].attempts, 1, 'a request that goes straight through is one attempt');
+    assert.equal(seen.filter(h => h['x-api-key'] === 'dead-key').length, 1, 'the dead key was not retried');
   });
 });

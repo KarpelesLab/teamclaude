@@ -1850,7 +1850,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         // marked open would send the outer catch to call that same throwing hook
         // a second time for one request.
         openEntry = null;
-        if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, effort, sessionId, pinned: ctx.pinnedIndex != null, client });
+        if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, effort, sessionId, pinned: ctx.pinnedIndex != null, client, attempts: ctx.attempt || 0 });
       }
     } catch (err) {
       reportFailure('[TeamClaude] Unhandled error:', err);
@@ -3489,6 +3489,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       ctx.tried.add(account.index);
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
     }
+    // One attempt per upstream send, counted here: after admission, so a queued
+    // wait is not an attempt, and past every refusal above that sends nothing. A
+    // failover, a 429 retry and a stream-failure hop each pass through here again.
+    ctx.attempt = (ctx.attempt || 0) + 1;
     let upstreamRes;
     let admittedLoad = 0;
     try {
