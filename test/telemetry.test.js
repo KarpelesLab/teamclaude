@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import { createHash, randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { AccountManager } from '../src/account-manager.js';
@@ -91,9 +92,11 @@ async function withProxy({ provider = 'anthropic', accounts = ['pool-a'], respon
     req.on('end', () => { seen.push(req.headers); respond(req, res, seen); });
   });
   const upstreamPort = await listen(upstream);
+  // Each account carries an opaque id, as loadConfig assigns one, so a test can check what the exporter reads.
+  const accountIds = Object.fromEntries(accounts.map(name => [name, randomUUID()]));
   const make = (name) => provider === 'codex'
-    ? { name: `codex:${name}`, type: 'oauth', provider: 'codex', accountId: `acct-${name}`, accessToken: `t-${name}`, refreshToken: 'r', expiresAt: Date.now() + HOUR, upstream: `http://127.0.0.1:${upstreamPort}` }
-    : { name, type: 'apikey', apiKey: `${ACCOUNT_KEY_PREFIX}${name}`, upstream: `http://127.0.0.1:${upstreamPort}` };
+    ? { id: accountIds[name], name: `codex:${name}`, type: 'oauth', provider: 'codex', accountId: `acct-${name}`, accessToken: `t-${name}`, refreshToken: 'r', expiresAt: Date.now() + HOUR, upstream: `http://127.0.0.1:${upstreamPort}` }
+    : { id: accountIds[name], name, type: 'apikey', apiKey: `${ACCOUNT_KEY_PREFIX}${name}`, upstream: `http://127.0.0.1:${upstreamPort}` };
   const accountManager = new AccountManager(accounts.map(make), 0.98);
   const ends = [];
   const waiters = [];
@@ -112,7 +115,7 @@ async function withProxy({ provider = 'anthropic', accounts = ['pool-a'], respon
   console.log = () => {};
   console.error = () => {};
   try {
-    return await run({ port, seen, whenEnded });
+    return await run({ port, seen, whenEnded, accountIds });
   } finally {
     console.log = origLog;
     console.error = origErr;
@@ -335,17 +338,26 @@ test('secrecy: no prompt, credential, client key, email, collector token or work
     for (const secret of [PROMPT, ACCOUNT_KEY_PREFIX, CLIENT_KEY, COLLECTOR_TOKEN, WORKLOAD, OWNER]) {
       assert.equal(everything.includes(secret), false, `payload must not contain ${secret}`);
     }
-    // No attribute value carries an '@', and the account that is an email is
-    // exported only as a stable hash.
+    // No attribute value carries an '@', and an email is not exported in any form: not
+    // its name, and not a hash of it. Attempts identify each account by its opaque id.
     const spans = col.spans();
     for (const span of spans) {
       for (const value of Object.values(attrs(span))) {
         if (typeof value === 'string') assert.equal(value.includes('@'), false, `attribute value has '@': ${value}`);
       }
     }
-    const accounts = attemptSpans(spans).map(s => attrs(s)['teamclaude.account']);
-    assert.equal(accounts.filter(a => /^sha256:[0-9a-f]{24}$/.test(a)).length, 1, 'the email account is a hash');
-    assert.ok(accounts.includes('pool-b'), 'a plain account name is exported as it is');
+    const emailHashes = [
+      createHash('sha256').update(OWNER).digest('hex'),
+      createHash('sha256').update('teamclaude:label:').update(OWNER).digest('hex'),
+    ];
+    for (const h of emailHashes) {
+      assert.equal(everything.includes(h), false, 'no hash of the email is exported');
+      assert.equal(everything.includes(h.slice(0, 24)), false, 'no truncated hash of the email is exported');
+    }
+    assert.equal(everything.includes('sha256:'), false, 'no sha256 pseudonym is exported');
+    const attempts = attemptSpans(spans);
+    assert.deepEqual(attempts.map(s => attrs(s)['teamclaude.account.id']).sort(), Object.values(accountIds).sort(), 'every attempt carries its account id');
+    assert.deepEqual(attempts.map(s => attrs(s)['teamclaude.account']).filter(n => n !== undefined), ['pool-b'], 'only the name without an @ is exported');
     assert.equal(attrs(requestSpans(spans)[0])['teamclaude.client'], 'ci-runner');
   } finally {
     await telemetry.shutdown();
