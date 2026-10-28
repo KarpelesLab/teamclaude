@@ -4,7 +4,8 @@
     "apiKey": "tc-change-me-to-a-secret",
     "clientKeys": [
       { "name": "laptop", "key": "tc-laptop-own-secret" },
-      { "name": "build-box", "key": "tc-build-box-own-secret" }
+      { "name": "build-box", "key": "tc-build-box-own-secret" },
+      { "name": "ci-agents", "key": "tc-ci-agents-own-secret", "scope": "inference" }
     ],
     "usageDimensions": [
       { "name": "project", "header": "x-teamclaude-project" },

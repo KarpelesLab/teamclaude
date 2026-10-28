@@ -380,6 +380,20 @@ export function keylessMcpRefusal(headers, remoteAddress, proxyConfig, boundHost
 // Config arrays already checked for shape, so the warnings below fire once per
 // loaded list (a reload hands over a new array) rather than once per request.
 const checkedClientKeys = new WeakSet();
+// A clientKeys `scope`: absent (or "full") is every API route; "inference" is
+// the data plane only. Any other value cannot be read as "full", so it is
+// treated as "inference": a typo narrows a key, and the entry stays usable.
+// Dropping it instead would empty the list, and an empty list admits everyone.
+/** @param {unknown} scope */
+function knownClientKeyScope(scope) {
+  return scope === undefined || scope === 'full' || scope === 'inference';
+}
+
+/** @param {unknown} scope */
+function inferenceOnlyScope(scope) {
+  return scope !== undefined && scope !== 'full';
+}
+
 function usableClientKeys(clientKeys) {
   if (!checkedClientKeys.has(clientKeys)) {
     checkedClientKeys.add(clientKeys);
@@ -388,6 +402,8 @@ function usableClientKeys(clientKeys) {
       const name = typeof entry?.name === 'string' ? entry.name.trim() : '';
       if (!name || !entry?.key) {
         console.error('[TeamClaude] proxy.clientKeys: an entry without a name and a key is ignored (usage is attributed by name)');
+      } else if (!knownClientKeyScope(entry.scope)) {
+        console.error(`[TeamClaude] proxy.clientKeys: "${name}" has an unrecognised scope and is treated as inference-only; use "inference", "full", or leave scope out`);
       } else if (seen.has(name)) {
         console.error(`[TeamClaude] proxy.clientKeys: duplicate name "${name}" — its keys share one usage counter`);
       }
@@ -397,12 +413,19 @@ function usableClientKeys(clientKeys) {
   return clientKeys.filter(e => typeof e?.name === 'string' && e.name.trim() && e.key);
 }
 
+/**
+ * The identity a presented key authenticates as. `scope` is present only as
+ * "inference", for a clientKeys entry whose scope is anything other than
+ * absent or "full"; every other success has no scope field, so the result for
+ * existing keys is unchanged.
+ */
 export function resolveClientAuth(proxyConfig, presented) {
   const shared = proxyConfig?.apiKey;
   const clientKeys = Array.isArray(proxyConfig?.clientKeys) ? usableClientKeys(proxyConfig.clientKeys) : [];
   if (!shared && clientKeys.length === 0) return { ok: true, client: null };
   for (const entry of clientKeys) {
     if (safeKeyEqual(presented, entry.key)) {
+      if (inferenceOnlyScope(entry.scope)) return { ok: true, client: entry.name.trim(), scope: 'inference' };
       return { ok: true, client: entry.name.trim() };
     }
   }
@@ -422,6 +445,20 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
   ['/teamclaude/session-pin', 'a client key cannot pin sessions'],
 ]);
 
+// What an inference-scoped key is refused: every route under the control
+// prefixes. The wildcard is what callerView reports for it.
+const INFERENCE_REFUSED_PATHS = ['/teamclaude/*'];
+
+// Whether a classified path belongs to the control plane, under either prefix.
+// Both the 404 catch-all and the inference-scope refusal ask this of
+// classificationPath(req.url), so an encoded spelling or the /teamrouter alias
+// is judged the same way everywhere.
+/** @param {string} path */
+function isControlPath(path) {
+  return path === '/teamclaude' || path.startsWith('/teamclaude/')
+    || path === '/teamrouter' || path.startsWith('/teamrouter/');
+}
+
 /**
  * The caller of /teamclaude/status as the control plane sees it, so the
  * dashboard can hide the controls this key would be refused instead of letting
@@ -429,11 +466,17 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
  * above, so the page and the gate cannot disagree. A key-less loopback caller
  * and the shared proxy.apiKey are the operator; only a client key is refused.
  *
+ * An inference-scoped key is refused every control route, so its `refused` is
+ * the one wildcard entry for the whole /teamclaude/ prefix rather than a list
+ * that could fall behind the routes.
+ *
  * @param {string|null|undefined} client  the client-key name, or null
- * @returns {{ kind: 'operator'|'client', client: string|null, refused: string[] }}
+ * @param {string|null|undefined} [scope]  the key's scope from resolveClientAuth
+ * @returns {{ kind: 'operator'|'client', client: string|null, scope?: 'inference', refused: string[] }}
  */
-export function callerView(client) {
+export function callerView(client, scope) {
   if (!client) return { kind: 'operator', client: null, refused: [] };
+  if (scope === 'inference') return { kind: 'client', client, scope, refused: [...INFERENCE_REFUSED_PATHS] };
   return { kind: 'client', client, refused: [...CLIENT_KEY_REFUSED_PATHS.keys()] };
 }
 
@@ -543,6 +586,18 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         return;
       }
 
+      // An inference-scoped client key (proxy.clientKeys[].scope) is one of the
+      // operator's own agents or machines that should reach the model API and
+      // nothing else, so every control route is refused to it, before anything
+      // runs. Classified like the 404 catch-all below, so an encoded spelling or
+      // the /teamrouter alias is refused too. The dashboard page is served above
+      // the gate, and the data plane is not a control route, so both stay open.
+      if (auth.scope === 'inference' && isControlPath(classificationPath(req.url || ''))) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'a client key scoped to inference cannot reach the control plane' }));
+        return;
+      }
+
       // A client key (proxy.clientKeys) names a tenant of the proxy, not its
       // operator: it may spend quota under its own name, read status and nudge
       // the running fleet (switch, reload — runtime-only and older than client
@@ -611,7 +666,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         res.writeHead(200, { 'Content-Type': 'application/json' });
         // Counters only: how full the upstream admission gate is (see
         // upstream-fetch.js), never which origins or requests.
-        res.end(JSON.stringify({ ...extra, ...status, caller: callerView(req.tcClient), upstreamPool: upstreamPoolStatus() }, null, 2));
+        res.end(JSON.stringify({ ...extra, ...status, caller: callerView(req.tcClient, auth.scope), upstreamPool: upstreamPoolStatus() }, null, 2));
         return;
       }
 
@@ -959,8 +1014,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       const controlPath = classificationPath(req.url);
       // Both prefixes: an encoded spelling of the new one (`/%74eamrouter/`)
       // escapes the rewrite above and must not reach the forwarder either.
-      if (controlPath === '/teamclaude' || controlPath.startsWith('/teamclaude/')
-        || controlPath === '/teamrouter' || controlPath.startsWith('/teamrouter/')) {
+      if (isControlPath(controlPath)) {
         res.writeHead(404, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'unknown teamclaude control route (check the path and the method)' }));
         return;
