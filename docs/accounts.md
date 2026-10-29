@@ -208,7 +208,9 @@ Accounts can also be added, removed and reordered from the TUI settings screen: 
 
 ### Why an account is in `error`
 
-An account leaves rotation as `error` when upstream rejects its refresh token, or answers 401 to a token that has none to refresh with. `teamclaude status` names which, instead of pointing at the logs — `needs a re-login: upstream rejected its refresh token (400) — run: teamclaude login` — and `GET /teamclaude/status` carries the same under `accounts[].errorReason`: `code` (`refresh_rejected` or `credential_rejected`), `detail`, `since` (epoch ms) and `remedy`, the login command that brings it back. It is `null` whenever the account is not in `error`.
+An account leaves rotation as `error` when upstream rejects its refresh token, or answers 401 to a token that has none to refresh with. `teamclaude status` names which, instead of pointing at the logs — `needs a re-login: upstream rejected its refresh token (400) — run: teamclaude login` — and `GET /teamclaude/status` carries the same under `accounts[].errorReason`: `code` (`refresh_rejected` or `credential_rejected`), `detail`, `since` (epoch ms), `remedy`, the login command that brings it back, and `link` (`null` here). It is `null` whenever the account is not in `error`.
+
+It also leaves rotation when upstream refuses the account itself ([account refusals](routing.md#account-refusals)). Then `code` is upstream's error code, such as `verification_required` or `account_on_hold`, `detail` is upstream's message, and `link` is the address in that message when it is on `claude.ai`, `platform.claude.com` or `portal.anthropic.com`. Status reads `refused by upstream: <message> — once resolved, run: teamclaude login`: resolve it at the link, then sign in again to bring the account back. A refused account's refresh token failing afterwards does not replace the refusal, and a refusal replaces a dead-token error, since signing in again alone would not bring the account back.
 
 ### Signing in again from the TUI
 
