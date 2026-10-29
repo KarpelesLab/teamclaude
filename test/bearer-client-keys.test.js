@@ -350,3 +350,30 @@ test('on the allowlisted data routes the Bearer never reaches upstream', async (
     assert.ok(seen.every(s => !JSON.stringify(s).includes(SCOPED_KEY)));
   });
 });
+
+test('a Bearer key never reaches upstream when the client addresses chatgpt.com with an Anthropic-shaped data route', async () => {
+  await withProxy(async ({ port, seen }) => {
+    // The Host header makes clientPassthroughOrigin relay these as the client's own
+    // chatgpt.com traffic, which copies the client's headers: the proxy key the
+    // gate consumed must be gone from them.
+    const routes = [
+      ['POST', '/v1/messages?beta=true'], ['POST', '/v1/messages'], ['POST', '/v1/messages/count_tokens'], ['GET', '/v1/models'],
+    ];
+    for (const [method, path] of routes) {
+      const res = await send(port, { method, path, headers: { host: 'chatgpt.com', ...BEARER_CLIENT }, body: method === 'POST' ? {} : undefined });
+      assert.equal(res.status, 200, `${method} ${path}`);
+    }
+    assert.equal(seen.length, routes.length, 'each request was relayed');
+    assert.ok(seen.every(s => !JSON.stringify(s).includes(SCOPED_KEY)), 'no request carried the client key');
+  });
+});
+
+test('a pin-prefixed path is not a data route for a Bearer: a pinned request needs x-api-key', async () => {
+  await withProxy(async ({ port, seen }) => {
+    const bearerRes = await send(port, { ...MESSAGE, path: '/tc-acct/claude/v1/messages', headers: BEARER_CLIENT });
+    assert.equal(bearerRes.status, 401);
+    const keyRes = await send(port, { ...MESSAGE, path: '/tc-acct/claude/v1/messages', headers: { 'x-api-key': SCOPED_KEY } });
+    assert.equal(keyRes.status, 200);
+    assert.equal(seen.length, 1);
+  });
+});
