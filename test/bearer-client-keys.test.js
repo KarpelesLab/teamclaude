@@ -49,7 +49,7 @@ function send(port, { method = 'GET', path, headers = {}, body } = {}) {
 async function withProxy(fn, overrides = {}) {
   const seen = [];
   const upstream = http.createServer((req, res) => {
-    seen.push({ url: req.url, authorization: req.headers.authorization, apiKey: req.headers['x-api-key'] });
+    seen.push({ method: req.method, url: req.url, authorization: req.headers.authorization, apiKey: req.headers['x-api-key'] });
     req.resume();
     req.on('end', () => {
       res.writeHead(200, { 'content-type': 'application/json' });
@@ -73,11 +73,12 @@ async function withProxy(fn, overrides = {}) {
       ...overrides,
     },
     upstream: upstreamUrl,
+    accounts: [{ name: 'codex', type: 'oauth', provider: 'codex', upstream: upstreamUrl }],
   };
   const proxy = createProxyServer(am, config, { reload: async () => ({ added: 0, removed: 0 }) });
   const port = await listen(proxy);
   try {
-    await fn({ port, seen });
+    await fn({ port, seen, upstreamUrl });
   } finally {
     proxy.closeAllConnections();
     await new Promise(resolve => proxy.close(resolve));
@@ -146,16 +147,25 @@ test('a full-scope Bearer key is attributed to its name', async () => {
   });
 });
 
-test('the shared proxy.apiKey as Bearer behaves exactly as it does in x-api-key', async () => {
+test('the shared proxy.apiKey is not a Bearer credential: it presents no key, as an unknown token does', async () => {
   await withProxy(async ({ port, seen }) => {
-    for (const headers of [bearer(SHARED_KEY), { 'x-api-key': SHARED_KEY }]) {
-      const data = await send(port, { ...MESSAGE, headers });
-      assert.equal(data.status, 200);
-      const status = await send(port, { path: '/teamclaude/status', headers });
-      assert.equal(status.status, 200);
-      assert.equal(JSON.parse(status.text).caller.kind, 'operator');
+    for (const [method, path] of [['POST', '/v1/messages'], ['GET', '/teamclaude/status']]) {
+      const res = await send(port, { method, path, headers: bearer(SHARED_KEY), body: method === 'POST' ? {} : undefined });
+      assert.equal(res.status, 401, path);
     }
-    assert.ok(seen.every(s => !JSON.stringify(s).includes(SHARED_KEY)));
+    // In x-api-key it is the operator's key, as ever.
+    const status = await send(port, { path: '/teamclaude/status', headers: { 'x-api-key': SHARED_KEY } });
+    assert.equal(status.status, 200);
+    assert.equal(JSON.parse(status.text).caller.kind, 'operator');
+    assert.deepEqual(seen, []);
+  });
+});
+
+test('the Bearer scheme is matched case-insensitively', async () => {
+  await withProxy(async ({ port }) => {
+    for (const authorization of [`bearer ${SCOPED_KEY}`, `BEARER ${SCOPED_KEY}`]) {
+      assert.equal((await send(port, { ...MESSAGE, headers: { authorization } })).status, 200, authorization);
+    }
   });
 });
 
@@ -237,4 +247,104 @@ test('CONNECT Proxy-Authorization is unchanged: Authorization is not read, the s
   assert.equal(connect({ 'proxy-authorization': 'Bearer nope' }), false);
   assert.equal(connect({ authorization: `Bearer ${SHARED_KEY}` }), false);
   assert.equal(connect({}), false);
+});
+
+// A Bearer presents a proxy key only on the data-plane routes below. Everywhere
+// else Authorization is the client's own credential (its claude.ai login on the
+// credential paths, its ChatGPT login on chatgpt.com, an arbitrary tool's on a
+// forwarded request): it is neither read as a proxy key nor stripped, so the
+// proxy relays exactly what it relayed before Bearer keys existed.
+
+const BEARER_CLIENT = bearer(SCOPED_KEY);
+
+test('a Bearer equal to a client key is not accepted on the relayed credential paths, and nothing is relayed', async () => {
+  await withProxy(async ({ port, seen }) => {
+    for (const [method, path] of [
+      ['GET', '/v1/code/sessions'],
+      ['GET', '/api/oauth/profile'],
+      ['GET', '/v1/mcp_servers'],
+      ['GET', '/v1/sessions'],
+      ['GET', '/v1/environments/x'],
+      ['GET', '/v1/models/'],
+      ['GET', '/v1/models?x=1/../..'],
+      ['POST', '/v1/messages/'],
+      ['POST', '/%761/messages'],
+    ]) {
+      const res = await send(port, { method, path, headers: BEARER_CLIENT, body: method === 'POST' ? {} : undefined });
+      assert.equal(res.status, 401, `${method} ${path}`);
+    }
+    assert.deepEqual(seen, []);
+  });
+});
+
+test('on a credential path from loopback the client\'s own Authorization reaches upstream untouched, as before', async () => {
+  await withProxy(async ({ port, seen }) => {
+    for (const authorization of [`Bearer ${SCOPED_KEY}`, 'Bearer a-claude-ai-login']) {
+      const res = await send(port, { path: '/v1/code/sessions', headers: { authorization } });
+      assert.equal(res.status, 200);
+      assert.equal(seen.at(-1).authorization, authorization);
+    }
+    assert.equal(seen.length, 2);
+  }, { trustLoopback: true });
+});
+
+test('the chatgpt.com passthrough does not take a Bearer as a proxy key and relays the client\'s login as sent', async () => {
+  await withProxy(async ({ port, seen }) => {
+    const path = '/backend-api/wham/accounts/check';
+    const refused = await send(port, { path, headers: { host: 'chatgpt.com', ...BEARER_CLIENT } });
+    assert.equal(refused.status, 401);
+    assert.deepEqual(seen, []);
+  });
+  await withProxy(async ({ port, seen }) => {
+    const res = await send(port, { path: '/backend-api/wham/accounts/check', headers: { host: 'chatgpt.com', ...BEARER_CLIENT } });
+    assert.equal(res.status, 200);
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].authorization, `Bearer ${SCOPED_KEY}`);
+  }, { trustLoopback: true });
+});
+
+test('a forwarded absolute-form request does not take a Bearer as a proxy key and relays Authorization as sent', async () => {
+  await withProxy(async ({ port, seen, upstreamUrl }) => {
+    const refused = await send(port, { path: `${upstreamUrl}/anything`, headers: BEARER_CLIENT });
+    assert.equal(refused.status, 401);
+    assert.deepEqual(seen, []);
+  });
+  await withProxy(async ({ port, seen, upstreamUrl }) => {
+    const res = await send(port, { path: `${upstreamUrl}/anything`, headers: BEARER_CLIENT });
+    assert.equal(res.status, 200);
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].authorization, `Bearer ${SCOPED_KEY}`);
+  }, { trustLoopback: true });
+});
+
+test('a WebSocket upgrade does not take a Bearer as a proxy key', async () => {
+  await withProxy(async ({ port, seen }) => {
+    const status = await new Promise((resolve, reject) => {
+      const req = http.request({
+        host: '127.0.0.1', port, path: '/v1/code/sessions/x/ws',
+        headers: { connection: 'Upgrade', upgrade: 'websocket', 'sec-websocket-version': '13', 'sec-websocket-key': 'dGhlIHNhbXBsZSBub25jZQ==', ...BEARER_CLIENT },
+      });
+      req.on('upgrade', (res, socket) => { socket.destroy(); resolve(res.statusCode); });
+      req.on('response', (res) => { res.resume(); resolve(res.statusCode); });
+      req.on('error', reject);
+      req.end();
+    });
+    assert.equal(status, 401);
+    assert.deepEqual(seen, []);
+  });
+});
+
+test('on the allowlisted data routes the Bearer never reaches upstream', async () => {
+  await withProxy(async ({ port, seen }) => {
+    const routes = [
+      ['POST', '/v1/messages'], ['POST', '/v1/messages/count_tokens'], ['GET', '/v1/models'],
+      ['POST', '/backend-api/codex/responses'], ['GET', '/backend-api/codex/models'],
+    ];
+    for (const [method, path] of routes) {
+      const res = await send(port, { method, path, headers: BEARER_CLIENT, body: method === 'POST' ? {} : undefined });
+      assert.equal(res.status, 200, `${method} ${path}`);
+    }
+    assert.equal(seen.length, routes.length);
+    assert.ok(seen.every(s => !JSON.stringify(s).includes(SCOPED_KEY)));
+  });
 });
