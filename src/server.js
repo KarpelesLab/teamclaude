@@ -433,6 +433,33 @@ export function resolveClientAuth(proxyConfig, presented) {
   return { ok: false, client: null };
 }
 
+/**
+ * The key a request presents to this proxy: `x-api-key` when sent, otherwise
+ * the credential of a single `Authorization: Bearer <key>` header, which is how
+ * Codex authenticates. x-api-key wins outright when both are present, so a
+ * request that already worked is judged exactly as before. A Bearer is read
+ * only when it is the request's one Authorization header and is a plain token;
+ * anything else (a repeated header, another scheme) presents no key. The value
+ * is a candidate only: resolveClientAuth decides, and the loopback exemption
+ * still applies, so a Codex client's own non-proxy Bearer from loopback passes
+ * unattributed, as it always has. The data path drops `authorization` before
+ * the pool account's credential is applied, so the key never travels upstream.
+ * @param {import('node:http').IncomingMessage} req
+ * @returns {string|string[]|undefined}
+ */
+function presentedProxyKey(req) {
+  const apiKey = req.headers['x-api-key'];
+  if (apiKey !== undefined || req.headers.authorization === undefined) return apiKey;
+  // Node keeps only the first of a repeated Authorization header, so the raw
+  // header list is what shows it was repeated.
+  let seen = 0;
+  for (let i = 0; i < req.rawHeaders.length; i += 2) {
+    if (req.rawHeaders[i].toLowerCase() === 'authorization') seen++;
+  }
+  if (seen !== 1) return undefined;
+  return /^Bearer ([A-Za-z0-9._~+/=-]{1,4096})$/.exec(req.headers.authorization)?.[1];
+}
+
 // Control-plane writes that change the config file, with the refusal a
 // caller holding a client key (rather than the operator's proxy.apiKey) gets.
 // See the check in createProxyServer for why a tenant may not reach these.
@@ -546,7 +573,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // request (not captured at creation) so a reload that edits clientKeys
       // applies to a running server, matching how eventLogging/blockedModels
       // are read live further down the pipeline.
-      const clientKey = req.headers['x-api-key'];
+      const clientKey = presentedProxyKey(req);
       const isLocal = loopbackExempt(req.headers, req.socket.remoteAddress, config.proxy);
       const auth = resolveClientAuth(config.proxy, clientKey);
       if (!auth.ok && !isLocal) {
