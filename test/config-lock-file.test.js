@@ -1,7 +1,8 @@
-import { test } from 'node:test';
+import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises';
+import { unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -173,5 +174,45 @@ test('a lock that stays held past the wait budget is bypassed with one warning, 
     assert.equal(warnings.length, 1, warnings.join('\n'));
     assert.match(warnings[0], /teamclaude\.json\.lock is still held by another process after 200ms/);
     assert.deepEqual(await readJson(lockPath), body, 'the other holder\'s lock was not touched');
+  }, { lockWaitMs: 200 });
+});
+
+test('a waiter that judged a lock stale does not remove the fresh lock a faster waiter has since taken', async () => {
+  // Two waiters find a dead holder's lock. A breaks it and takes the lock; B,
+  // which had already judged the old lock stale, must not then unlink A's. The
+  // interleaving is forced at the one point where B has read the stale lock but
+  // not yet acted: B's liveness probe of the dead pid. There, this test plays
+  // out all of A (break the stale lock, take a fresh one) before B resumes.
+  await withConfigDir(async ({ cfg, lockPath }) => {
+    const dead = await deadPid();
+    writeFileSync(lockPath, JSON.stringify({ pid: dead, at: Date.now() }));
+    // A is a live process that holds the lock and never lets go within the test.
+    const holder = spawn(process.execPath, ['-e', 'process.stdin.resume()'], { stdio: ['pipe', 'ignore', 'inherit'] });
+    const aBody = { pid: holder.pid, at: Date.now() };
+    const realKill = process.kill;
+    let interleaved = false;
+    mock.method(process, 'kill', (pid, signal) => {
+      if (pid === dead && !interleaved) {
+        interleaved = true;
+        unlinkSync(lockPath);
+        writeFileSync(lockPath, JSON.stringify(aBody), { flag: 'wx' });
+      }
+      return realKill(pid, signal);
+    });
+    const { warnings, restore } = captureBypassWarnings();
+    let lockDuringUpdate;
+    try {
+      await cfg.atomicConfigUpdate(async () => {
+        lockDuringUpdate = await readFile(lockPath, 'utf-8').catch(err => err.code);
+      });
+    } finally {
+      restore();
+      mock.restoreAll();
+      holder.kill();
+      await new Promise(resolve => holder.on('exit', resolve));
+    }
+    assert.ok(interleaved, 'the interleaving point was reached');
+    assert.equal(lockDuringUpdate, JSON.stringify(aBody), 'A\'s fresh lock was left standing, not unlinked by B');
+    assert.equal(warnings.length, 1, 'B waited out the live holder and gave up once: ' + warnings.join('\n'));
   }, { lockWaitMs: 200 });
 });
