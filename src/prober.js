@@ -18,6 +18,11 @@ import { fetchCodexUsage } from './codex-usage.js';
 // seconds, so the ceiling lives here where the timer is armed.
 export const MAX_PROBE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
 
+// How often an account's OAuth profile is read again once its plan is known. A
+// plan that lapses shows there (see AccountManager.applyProfileData), and it
+// changes far more rarely than quota does.
+export const PROFILE_RECHECK_MS = 60 * 60 * 1000;
+
 function clampInterval(ms) {
   return ms > 0 ? Math.min(ms, MAX_PROBE_INTERVAL_MS) : 0;
 }
@@ -52,12 +57,15 @@ export class Prober {
   // notices below are produced later still, by a reload that changes the probe
   // interval, so a captured `console.log` would put them on a terminal the
   // alternate screen has already covered.
-  constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, codexProbeFn = fetchCodexUsage, profileFn = null, backendFn = fetchBackendQuota, timeoutMs = 10_000, log = (/** @type {string} */ line) => console.log(line) } = {}) {
+  constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, codexProbeFn = fetchCodexUsage, profileFn = null, profileIntervalMs = PROFILE_RECHECK_MS, backendFn = fetchBackendQuota, timeoutMs = 10_000, log = (/** @type {string} */ line) => console.log(line) } = {}) {
     this.am = accountManager;
     this.intervalMs = clampInterval(intervalMs);
     this.probeFn = probeFn;
     this.codexProbeFn = codexProbeFn;
     this.profileFn = profileFn;
+    this.profileIntervalMs = profileIntervalMs;
+    // By account object: names are not unique.
+    this.profileReadAt = new WeakMap();
     this.backendFn = backendFn;
     this.timeoutMs = timeoutMs;
     this.log = log;
@@ -171,6 +179,8 @@ export class Prober {
       }
 
       if (!usage || usage.error) {
+        // A refused usage read can be the lapsed plan itself; the profile says.
+        if (usage) await this._readProfile(account);
         const finishedAt = Date.now();
         this._recordAccount(account, {
           status: usage?.error ? 'error' : 'timeout',
@@ -183,12 +193,7 @@ export class Prober {
       }
 
       this.am.applyUsageData(account.index, usage);
-      const missingTier = !account.rateLimitTier && !account.seatTier
-        && account.hasClaudeMax == null && account.hasClaudePro == null;
-      if (missingTier && this.profileFn) {
-        const profile = await this._withTimeout(this.profileFn(account.credential, account.routing ?? null));
-        this.am.applyProfileData(account.index, profile);
-      }
+      await this._readProfile(account);
       const finishedAt = Date.now();
       this._recordAccount(account, {
         status: 'ok',
@@ -207,6 +212,18 @@ export class Prober {
         durationMs: finishedAt - startedAt,
       });
     }
+  }
+
+  /** @param {Record<string, any>} account */
+  async _readProfile(account) {
+    if (!this.profileFn) return;
+    const missingTier = !account.rateLimitTier && !account.seatTier
+      && account.hasClaudeMax == null && account.hasClaudePro == null;
+    const now = Date.now();
+    if (!missingTier && now - (this.profileReadAt.get(account) ?? -Infinity) < this.profileIntervalMs) return;
+    this.profileReadAt.set(account, now);
+    const profile = await this._withTimeout(this.profileFn(account.credential, account.routing ?? null));
+    this.am.applyProfileData(account.index, profile);
   }
 
   async _probeCodex(account, startedAt) {

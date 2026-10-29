@@ -210,6 +210,18 @@ Accounts can also be added, removed and reordered from the TUI settings screen: 
 
 An account leaves rotation as `error` when upstream rejects its refresh token, or answers 401 to a token that has none to refresh with. `teamclaude status` names which, instead of pointing at the logs — `needs a re-login: upstream rejected its refresh token (400) — run: teamclaude login` — and `GET /teamclaude/status` carries the same under `accounts[].errorReason`: `code` (`refresh_rejected` or `credential_rejected`), `detail`, `since` (epoch ms) and `remedy`, the login command that brings it back. It is `null` whenever the account is not in `error`.
 
+### When a plan lapses
+
+With the [quota probe](quota.md#quota-probe) on, each Anthropic account's OAuth profile is read again at most once an hour. When an account that showed a Claude Max or Pro plan reads as having neither, `teamclaude status` adds a line under it:
+
+```
+Plan     its OAuth profile no longer shows the Claude Max plan (since 2h ago) — renew the plan or disable the account
+```
+
+`GET /teamclaude/status` carries `accounts[].subscriptionLost`: `plan` (`Max` or `Pro`) and `since` (epoch ms, when it was first seen). It clears when the profile shows a plan again, and it is kept across a restart. A failed profile read changes nothing. A change between plans (Max to Pro, or a different Max tier) is logged.
+
+The account is not taken out of rotation for it. The profile is a second-hand view of the plan, and what the account can still serve is decided by upstream's answers to its requests, which the proxy already acts on. Disable the account if you do not want it tried.
+
 ### Signing in again from the TUI
 
 An OAuth account whose refresh token upstream has rejected — typically because the same account was signed in somewhere else, which rotates the token and kills the copy TeamClaude holds — shows as `error` and stays that way until someone signs in again. Press **`l`** on the dashboard: the picker opens on the first account in `error`, and **Enter** opens the login panel for the account's provider (Claude or Codex). The panel works when the server is on another machine, reached over SSH:
