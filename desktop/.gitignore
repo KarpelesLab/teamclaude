@@ -1,0 +1,7 @@
+node_modules
+out
+dist
+build
+# The root .gitignore drops lockfiles for the zero-dependency CLI; this
+# package has real devDependencies and builds from its lockfile (npm ci).
+!package-lock.json

@@ -1,0 +1,118 @@
+name: Desktop
+
+# TeamClaude Desktop (desktop/): lint, typecheck, unit and integration tests,
+# then unsigned Windows and Linux packages with a secret scan and a smoke test
+# of the packaged app. Artifacts are for review and testing only; they are not
+# releases (see docs/desktop-architecture.md, "Distribution"). Nothing here
+# publishes anything.
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - 'desktop/**'
+      - 'src/**'
+      - 'package.json'
+      - '.github/workflows/desktop.yml'
+  pull_request:
+    branches: [master]
+    paths:
+      - 'desktop/**'
+      - 'src/**'
+      - 'package.json'
+      - '.github/workflows/desktop.yml'
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: desktop
+
+jobs:
+  check:
+    name: lint, typecheck, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      # `--ignore-scripts`: no dependency needs an install script for these
+      # steps (electron-builder fetches Electron itself when packaging), and
+      # not running them denies a compromised package code execution here.
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      # Includes tests/integration: the real backend from ../src with
+      # placeholder accounts and an upstream that never answers.
+      - name: Test
+        run: npm test
+
+  package:
+    name: package ${{ matrix.target }}
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: win
+            os: windows-latest
+          - target: linux
+            os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Build packages
+        run: npm run dist:${{ matrix.target }}
+
+      - name: Check artifacts and scan for secrets
+        run: node scripts/check-dist.mjs ${{ matrix.target }}
+
+      - name: Smoke test the packaged app (Windows)
+        if: matrix.target == 'win'
+        run: node scripts/smoke.mjs win
+
+      - name: Smoke test the packaged app (Linux, X11 via Xvfb)
+        if: matrix.target == 'linux'
+        run: xvfb-run --auto-servernum node scripts/smoke.mjs linux
+
+      # The end-to-end tests run the built app with the electron package's own
+      # binary, which `--ignore-scripts` did not download.
+      - name: Fetch the Electron binary for end-to-end tests
+        run: node node_modules/electron/install.js
+
+      - name: End-to-end tests (Windows)
+        if: matrix.target == 'win'
+        run: npm run test:e2e
+
+      - name: End-to-end tests (Linux, X11 via Xvfb)
+        if: matrix.target == 'linux'
+        run: xvfb-run --auto-servernum npm run test:e2e
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: teamclaude-desktop-${{ matrix.target }}-unsigned
+          path: |
+            desktop/dist/*.exe
+            desktop/dist/*.AppImage
+            desktop/dist/*.deb
+          if-no-files-found: error
+          retention-days: 14

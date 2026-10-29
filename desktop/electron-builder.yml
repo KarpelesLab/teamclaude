@@ -1,0 +1,54 @@
+# Packaging for Windows (NSIS installer + portable) and Linux (AppImage + deb).
+# Builds are unsigned and never published from here (`--publish never`); see
+# docs/desktop-architecture.md, "Distribution", for why.
+appId: com.karpeleslab.teamclaude.desktop
+productName: TeamClaude Desktop
+copyright: Copyright © TeamClaude contributors (MIT License)
+directories:
+  output: dist
+  buildResources: build
+files:
+  - out/**/*
+  - package.json
+# The backend runs as a separate process with Electron's Node runtime, so it
+# lives outside app.asar as plain files.
+extraResources:
+  - from: build/backend
+    to: backend
+  - from: build/icon.png
+    to: icon.png
+asar: true
+publish: null
+# Chromium's own UI strings (context menus, file dialogs) for the languages the
+# app is translated into; any other system language falls back to en-US.
+# Shipping all 55 locales adds about 48 MB unpacked.
+electronLanguages: [en-US, ru, ja]
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+    - target: portable
+      arch: [x64]
+  icon: build/icon.png
+  signAndEditExecutable: true
+nsis:
+  oneClick: false
+  perMachine: false
+  allowElevation: false
+  allowToChangeInstallationDirectory: true
+  # Uninstalling removes the app, never the TeamClaude config or accounts.
+  deleteAppDataOnUninstall: false
+  artifactName: TeamClaude-Desktop-Setup-${version}.${ext}
+portable:
+  artifactName: TeamClaude-Desktop-Portable-${version}.${ext}
+linux:
+  target:
+    - target: AppImage
+      arch: [x64]
+    - target: deb
+      arch: [x64]
+  category: Development
+  icon: build/icon.png
+  maintainer: TeamClaude contributors
+  synopsis: Control panel for the local TeamClaude proxy
+  artifactName: TeamClaude-Desktop-${version}-${arch}.${ext}

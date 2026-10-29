@@ -1,0 +1,50 @@
+{
+  "name": "teamclaude-desktop",
+  "productName": "TeamClaude Desktop",
+  "version": "0.3.1",
+  "private": true,
+  "description": "Desktop control panel for a local TeamClaude proxy (Windows and Linux)",
+  "license": "MIT",
+  "author": "TeamClaude contributors",
+  "homepage": "https://github.com/KarpelesLab/teamclaude",
+  "main": "out/node/main/index.js",
+  "scripts": {
+    "prepare:backend": "node scripts/prepare-backend.mjs",
+    "icon": "node scripts/generate-icon.mjs",
+    "build:main": "tsc -p tsconfig.node.json",
+    "build:renderer": "vite build",
+    "build": "npm run icon && npm run prepare:backend && npm run build:main && npm run build:renderer",
+    "dev": "npm run build && electron .",
+    "start": "electron .",
+    "typecheck": "tsc -p tsconfig.node.json --noEmit && tsc -p tsconfig.web.json --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "test:e2e": "vitest run -c vitest.e2e.config.mts",
+    "dist:win": "npm run build && electron-builder --win --x64 --publish never",
+    "dist:linux": "npm run build && electron-builder --linux --x64 --publish never",
+    "dist:dir": "npm run build && electron-builder --dir --publish never"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.0",
+    "@tailwindcss/vite": "4.3.3",
+    "@types/node": "^22.19.0",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.2",
+    "electron": "44.8.0",
+    "electron-builder": "26.15.3",
+    "eslint": "^9.39.0",
+    "lucide-react": "1.58.0",
+    "playwright-core": "1.63.0",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "tailwindcss": "4.3.3",
+    "typescript": "5.9.2",
+    "typescript-eslint": "8.71.2",
+    "vite": "8.3.4",
+    "vitest": "5.0.5"
+  },
+  "dependencies": {
+    "electron-updater": "6.8.10"
+  }
+}

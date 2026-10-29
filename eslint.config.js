@@ -1,4 +1,5 @@
 export default [
+  { ignores: ['desktop/**'] },
   {
     languageOptions: {
       ecmaVersion: 2022,

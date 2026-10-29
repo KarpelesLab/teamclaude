@@ -1,0 +1,94 @@
+@import "tailwindcss";
+
+/* Colours are CSS variables so the theme switch is one attribute on <html>. */
+@theme inline {
+  --color-bg: var(--tc-bg);
+  --color-panel: var(--tc-panel);
+  --color-panel-2: var(--tc-panel-2);
+  --color-border: var(--tc-border);
+  --color-fg: var(--tc-fg);
+  --color-muted: var(--tc-muted);
+  --color-accent: var(--tc-accent);
+  --color-accent-fg: var(--tc-accent-fg);
+  --color-ok: var(--tc-ok);
+  --color-warn: var(--tc-warn);
+  --color-bad: var(--tc-bad);
+  --color-info: var(--tc-info);
+  --font-sans: "Segoe UI Variable", "Segoe UI", system-ui, -apple-system, "Ubuntu", "Cantarell", "Noto Sans", sans-serif;
+  --font-mono: "Cascadia Mono", "JetBrains Mono", "DejaVu Sans Mono", "Ubuntu Mono", ui-monospace, monospace;
+}
+
+:root,
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --tc-bg: #0b0d12;
+  --tc-panel: #12151c;
+  --tc-panel-2: #1a1e27;
+  --tc-border: #262b36;
+  --tc-fg: #e6e8ee;
+  --tc-muted: #8b93a7;
+  --tc-accent: #d97757;
+  --tc-accent-fg: #160b06;
+  --tc-ok: #3fb97f;
+  --tc-warn: #e0a83a;
+  --tc-bad: #ef5d5d;
+  --tc-info: #6aa6ff;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --tc-bg: #f6f7f9;
+  --tc-panel: #ffffff;
+  --tc-panel-2: #f0f2f5;
+  --tc-border: #dde1e8;
+  --tc-fg: #161a22;
+  --tc-muted: #5d6576;
+  --tc-accent: #c2603f;
+  --tc-accent-fg: #ffffff;
+  --tc-ok: #1f8f5a;
+  --tc-warn: #a86f0a;
+  --tc-bad: #c93636;
+  --tc-info: #2f6fd6;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  /* <main> is the only scroll container; the window itself never scrolls. */
+  overflow: hidden;
+  background: var(--tc-bg);
+  color: var(--tc-fg);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Visible keyboard focus everywhere; mouse clicks do not draw it. */
+:focus-visible {
+  outline: 2px solid var(--tc-accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--tc-accent) 35%, transparent);
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--tc-border) transparent;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

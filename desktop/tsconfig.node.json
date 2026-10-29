@@ -1,0 +1,22 @@
+{
+  // Main process, preload and the services they use. Compiled to CommonJS
+  // with plain tsc: these files depend on Node built-ins and electron only,
+  // so there is nothing for a bundler to resolve.
+  "compilerOptions": {
+    "target": "es2022",
+    "module": "commonjs",
+    "moduleResolution": "node10",
+    "lib": ["es2023"],
+    "types": ["node"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "rootDir": "src",
+    "outDir": "out/node",
+    "sourceMap": false
+  },
+  "include": ["src/main/**/*.ts", "src/preload/**/*.ts", "src/services/**/*.ts", "src/shared/**/*.ts"]
+}

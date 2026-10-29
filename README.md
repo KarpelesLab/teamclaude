@@ -27,6 +27,14 @@ teamclaude run       # in another terminal: Claude Code through the proxy
 
 Already logged into Claude Code? `teamclaude import` takes its credentials instead of a fresh OAuth round. A container image is on GHCR — see [Running in a container](docs/usage.md#running-in-a-container). API keys, and one email holding accounts in several orgs, are covered in [docs/accounts.md](docs/accounts.md).
 
+## Desktop preview
+
+An optional Windows/Linux desktop control panel is proposed in [#582](https://github.com/KarpelesLab/teamclaude/issues/582). It starts or attaches to the local proxy, shows account quotas and manages accounts and routing through the control API and CLI. Build from source or use the review artifacts; this proposal configures no desktop release feed. See [the desktop guide](docs/desktop.md).
+
+![Desktop preview: quotas, service setup, routing and languages](docs/assets/desktop-demo.gif)
+
+The recording uses placeholder accounts, seeded quota readings and a local test API.
+
 ## What it does
 
 - Rotates to the next account when the 5h session or 7d weekly bucket reaches the threshold (98% by default), preferring the account whose weekly quota resets soonest.

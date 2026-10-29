@@ -54,6 +54,7 @@ import { proxyFetch } from './upstream-fetch.js';
 import { upstreamFor } from './provider.js';
 import { startEventLoopMonitor } from './event-loop-monitor.js';
 import { envVar } from './brand.js';
+import { backendAccount } from './backend-account.js';
 import { loginCallback, loadCallbackToken, saveCallbackToken, callbackWhoami, logoutCallback, callbackClientId, getCallbackAuthPath } from './callback-auth.js';
 import { CredentialSync, refreshOutsideProxy } from './credential-sync.js';
 
@@ -176,6 +177,9 @@ const args = process.argv.slice(2);
 const command = args[0];
 
 switch (command) {
+  case 'add-backend':
+    await addBackendCommand();
+    break;
   case 'server':
     await serverCommand();
     break;
@@ -1416,6 +1420,25 @@ async function loginApiCommand() {
     console.log(`A last resort: the key serves only while every account ahead of it is spent, and rotation leaves it as soon as one of them has quota again. \`teamclaude priority ${name} 0\` rotates it like the others.`);
   }
   console.log(`Saved to ${getConfigPath()}`);
+  await notifyRunningServer(config);
+}
+
+async function addBackendCommand() {
+  // Secrets arrive only on stdin, never in process arguments or logs.
+  let text = '';
+  for await (const chunk of process.stdin) {
+    text += chunk;
+    if (text.length > 32_768) throw new Error('Backend settings are too large');
+  }
+  let account;
+  try { account = backendAccount(JSON.parse(text)); }
+  catch { throw new Error('Invalid backend account settings'); }
+  await loadOrCreateConfig();
+  const config = await atomicConfigUpdate((/** @type {Record<string, any>} */ disk) => {
+    if (disk.accounts.some((/** @type {Record<string, any>} */ a) => a.name === account.name)) throw new Error('An account with this name already exists');
+    disk.accounts.push(account);
+  });
+  console.log('Backend account saved.');
   await notifyRunningServer(config);
 }
 
