@@ -145,6 +145,17 @@ export function isOAuthEntitlementDenied(body) {
   }
 }
 
+/** Upstream's own message for a refusal, bounded for the status payload.
+ * @param {Buffer} body */
+function upstreamErrorMessage(body) {
+  try {
+    const message = JSON.parse(Buffer.from(body).toString('utf8'))?.error?.message;
+    return typeof message === 'string' ? safeLine(message, 200) || null : null;
+  } catch {
+    return null;
+  }
+}
+
 // Error payloads are normally tiny, but an alternate upstream is configurable.
 // Bound the diagnostic read so a hostile chunked 403 cannot make the proxy buffer
 // an arbitrary response merely to decide whether it should quarantine an account.
@@ -3461,6 +3472,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     }
     let upstreamRes;
     let admittedLoad = 0;
+    const entitlementEpoch = account.entitlementEpoch;
     try {
       upstreamRes = await upstreamFetch(upstreamUrl, {
         method,
@@ -3862,7 +3874,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         && responseBody != null
         && isOAuthEntitlementDenied(responseBody);
       const deniedUntil = entitlementDenied
-        ? accountManager.markEntitlementDenied(account.index)
+        ? accountManager.markEntitlementDenied(account.index, { detail: upstreamErrorMessage(responseBody), epoch: entitlementEpoch })
         : null;
       // A set, not a name: the no-account branch needs to tell "every account was
       // refused" (fail fast, nothing to wait for) from "this one was, others are
@@ -3871,8 +3883,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       (ctx.rejectedStatus ??= new Map()).set(account.name, 403);
       if (entitlementDenied) (ctx.entitlementDenied ??= new Set()).add(account.name);
       ctx.tried.add(account.index);
+      const denials = account.entitlementDenial?.count || 0;
       const cooldown = deniedUntil
-        ? `; OAuth entitlement cooldown until ${new Date(deniedUntil).toISOString()}`
+        ? `; OAuth entitlement cooldown until ${new Date(deniedUntil).toISOString()}${denials > 1 ? `, ${denials} in a row` : ''}`
         : '';
       console.error(`[TeamClaude] 403 on "${account.name}"; upstream refused the account credential${cooldown}`);
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
@@ -4046,6 +4059,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       if (l) { l.body('RESPONSE BODY', buf, contentType); l.end(); }
       res.end(buf);
       ctx.delivered = deliveredStatus;
+    }
+    // An entitlement denial needs more than a 2xx header: a completion, not a
+    // side endpoint or a redirect, delivered whole.
+    if (ctx.delivered && upstreamRes.status >= 200 && upstreamRes.status < 300
+        && isCompletionPath(classificationPath(req.url))) {
+      accountManager.clearEntitlementDenied(account.index, entitlementEpoch);
     }
   } catch (err) {
     // Two of the things that can throw here are not upstream errors at all:

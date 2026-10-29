@@ -80,6 +80,8 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
     if (egress) lines.push(`  ${egress}`);
     const why = unavailableLine(account, paint);
     if (why) lines.push(`  ${why}`);
+    const denied = entitlementLine(account, now, paint);
+    if (denied) lines.push(`  ${denied}`);
     const spend = spendLine(account, paint);
     if (spend) lines.push(`  ${spend}`);
     const resetCredits = resetCreditLine(account, paint, now);
@@ -411,6 +413,20 @@ export function unavailableLine(account, paint) {
     return `${paint.dim('Blocked'.padEnd(8))} ${paint.yellow(text)} ${paint.red('\u2014 serving on extra usage (paid overage), billing')}`;
   }
   return `${paint.dim('Blocked'.padEnd(8))} ${paint.yellow(text)}`;
+}
+
+// Upstream's refusal outlives its cooldown, so the account reads as denied
+// until it serves again rather than healthy between re-checks.
+/** @param {any} account @param {number} now @param {ReturnType<typeof colors>} paint */
+function entitlementLine(account, now, paint) {
+  const denial = account?.entitlementDenial;
+  if (!denial) return null;
+  const since = formatAgo(denial.since, now);
+  // The payload can come from another process: only a whole number is a count.
+  const count = Number.isSafeInteger(denial.count) ? denial.count : 1;
+  const when = count > 1 ? `${count} in a row, first ${since}` : since;
+  const text = safeLine(denial.detail ?? '', 200) || 'OAuth entitlement denied';
+  return `${paint.dim('Denied'.padEnd(8))} ${paint.yellow(text)} ${paint.dim(`\u2014 ${when}`)}`;
 }
 
 // Compact names for the "switch NN%" line below — short enough that several
