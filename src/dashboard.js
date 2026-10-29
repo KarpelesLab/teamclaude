@@ -692,7 +692,8 @@ export function problems(status) {
   // `throttled`, and none of them wants a person.
   var ATTENTION = { error: 'needs a re-login', disabled: 'is disabled' };
   (s.accounts || []).forEach(function (a) {
-    var why = ATTENTION[a.unavailable];
+    var held = a.unavailable === 'error' && a.errorReason && a.errorReason.code === 'account_on_hold';
+    var why = held ? 'is on hold' : ATTENTION[a.unavailable];
     if (why) out.push({ severity: 'warn', kind: 'account', text: 'Account ' + a.name + ' ' + why + '.' });
   });
 

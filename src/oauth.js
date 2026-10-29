@@ -158,6 +158,25 @@ export function parseRetryAfterMs(value, now = Date.now()) {
   return Number.isFinite(at) ? Math.max(0, at - now) : undefined;
 }
 
+const DEFAULT_APPEAL_URL = 'https://claude.ai/restricted';
+
+/**
+ * The appeal link of a refusal for an account on hold, checked as Claude Code does:
+ * it is shown to the operator, so anything but a plain https Anthropic link becomes the default.
+ * @param {string} text
+ */
+function holdAppealUrl(text) {
+  let body;
+  try { body = JSON.parse(text); } catch { return undefined; }
+  if (!['invalid_grant', 'access_denied'].includes(body?.error) || body.error_description !== 'account_on_hold') return undefined;
+  let url;
+  try { url = new URL(body.error_uri); } catch { return DEFAULT_APPEAL_URL; }
+  const host = url.hostname;
+  const anthropic = ['claude.ai', 'anthropic.com'].some((d) => host === d || host.endsWith(`.${d}`));
+  const plain = url.protocol === 'https:' && !url.username && !url.password && !url.port && !url.hash;
+  return plain && anthropic && url.href.length <= 2048 ? url.href : DEFAULT_APPEAL_URL;
+}
+
 /**
  * Refresh an expired OAuth access token using the refresh token.
  * Retries on 5xx and network errors with exponential backoff.
@@ -224,6 +243,9 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
           const retryAfterMs = parseRetryAfterMs(res.headers.get('retry-after'));
           if (retryAfterMs !== undefined) /** @type {any} */ (err).retryAfterMs = retryAfterMs;
         }
+        // A hold is not a dead token: a re-login does not lift it.
+        const appealUrl = holdAppealUrl(text);
+        if (appealUrl) /** @type {any} */ (err).appealUrl = appealUrl;
         throw err;
       }
 

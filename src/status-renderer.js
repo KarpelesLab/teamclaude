@@ -401,9 +401,12 @@ export function unavailableLine(account, paint) {
   const reason = account?.unavailable;
   if (!reason) return null;
   const err = reason === 'error' ? account.errorReason : null;
-  const text = err
-    ? `needs a re-login: ${safeLine(err.detail, 120)} — run: ${safeLine(err.remedy, 40)}`
-    : UNAVAILABLE_TEXT[reason] || safeLine(reason, 64);
+  // A hold is lifted on appeal, not by a login; the login only replaces the token refused meanwhile.
+  const text = err?.code === 'account_on_hold'
+    ? `${safeLine(err.detail, Infinity)} — once it is lifted, run: ${safeLine(err.remedy, 40)}`
+    : err
+      ? `needs a re-login: ${safeLine(err.detail, 120)} — run: ${safeLine(err.remedy, 40)}`
+      : UNAVAILABLE_TEXT[reason] || safeLine(reason, 64);
   // An account serving as the extra-usage fallback reads as out of quota like
   // any other, yet is taking traffic and billing for it. Say so on the line
   // that would otherwise tell the operator it is idle.

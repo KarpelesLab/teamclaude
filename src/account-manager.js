@@ -2737,7 +2737,7 @@ export class AccountManager {
     // are only consulted once it has actually said no.
     if (!this._isAvailable(account)) {
       if (account.disabled) return { eligible: false, reason: 'disabled' };
-      if (account.status === 'error') return { eligible: false, reason: 'in an error state and needs a re-login' };
+      if (account.status === 'error') return { eligible: false, reason: account.errorReason?.code === 'account_on_hold' ? 'on hold' : 'in an error state and needs a re-login' };
       if (account.status === 'exhausted') return { eligible: false, reason: 'out of quota' };
       if (account.status === 'throttled') return { eligible: false, reason: 'rate-limited' };
       return { eligible: false, reason: 'at or above the switch threshold' };
@@ -4995,7 +4995,9 @@ export class AccountManager {
     // rotating to another account.
     if (account._deadRefreshToken && account._deadRefreshToken === account.refreshToken) {
       if (account.status !== 'error') {
-        this._needsLogin(account, 'refresh_rejected', 'its refresh token was already rejected');
+        // A hold keeps its own reason: the guard is armed by the same refusal that set it.
+        if (account.errorReason?.code === 'account_on_hold') account.status = 'error';
+        else this._needsLogin(account, 'refresh_rejected', 'its refresh token was already rejected');
         console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}" still holds a rejected refresh token — run: teamclaude login`);
       }
       return;
@@ -5109,8 +5111,13 @@ export class AccountManager {
             console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" received new tokens while its old refresh token was being rejected — keeping the new ones`);
             return;
           }
-          this._needsLogin(account, 'refresh_rejected', `upstream rejected its refresh token (${err.status})`);
-          console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}" needs re-login (refresh token rejected) — run: teamclaude login`);
+          if (err.appealUrl) {
+            const { detail } = this._needsLogin(account, 'account_on_hold', `Your account is on hold and can't use Claude Code. View details or appeal: ${err.appealUrl}`);
+            console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}": ${detail}`);
+          } else {
+            this._needsLogin(account, 'refresh_rejected', `upstream rejected its refresh token (${err.status})`);
+            console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}" needs re-login (refresh token rejected) — run: teamclaude login`);
+          }
           this._onAccountError?.(account);
         }
       } finally {
@@ -5195,7 +5202,7 @@ export class AccountManager {
    * `status --json`, a remote client) saw a bare `error` and could not tell a
    * dead refresh token from a 401 on a refresh-less token, nor say when.
    * @param {Record<string, any>} account
-   * @param {'refresh_rejected'|'credential_rejected'} code
+   * @param {'refresh_rejected'|'credential_rejected'|'account_on_hold'} code
    * @param {string} detail  one clause, no credential in it
    */
   _needsLogin(account, code, detail) {
