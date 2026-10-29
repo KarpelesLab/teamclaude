@@ -433,23 +433,40 @@ export function resolveClientAuth(proxyConfig, presented) {
   return { ok: false, client: null };
 }
 
+// The routes where `Authorization: Bearer <client key>` presents a proxy key:
+// the data plane a Codex or Claude client addresses to its base URL. Matched on
+// the raw path, exactly, so no encoded or normalised spelling gets in. Anywhere
+// else Authorization is the client's own credential (its claude.ai login on the
+// credential paths, its ChatGPT login on chatgpt.com, any tool's on a forwarded
+// request): it is not read as a proxy key and not stripped, as before.
+const BEARER_KEY_ROUTES = new Set([
+  'POST /v1/messages',
+  'POST /v1/messages/count_tokens',
+  'GET /v1/models',
+  'POST /backend-api/codex/responses',
+  'GET /backend-api/codex/models',
+]);
+
 /**
- * The key a request presents to this proxy: `x-api-key` when sent, otherwise
- * the credential of a single `Authorization: Bearer <key>` header, which is how
- * Codex authenticates. x-api-key wins outright when both are present, so a
- * request that already worked is judged exactly as before. A Bearer is read
- * only when it is the request's one Authorization header and is a plain token;
- * anything else (a repeated header, another scheme) presents no key. The value
- * is a candidate only: resolveClientAuth decides, and the loopback exemption
- * still applies, so a Codex client's own non-proxy Bearer from loopback passes
- * unattributed, as it always has. The data path drops `authorization` before
- * the pool account's credential is applied, so the key never travels upstream.
+ * The key a request presents to this proxy: `x-api-key` when sent, otherwise,
+ * on a data-plane route (BEARER_KEY_ROUTES), the token of a single
+ * `Authorization: Bearer <key>` header, which is how Codex authenticates. Only
+ * a named `proxy.clientKeys` entry is accepted that way; the shared
+ * `proxy.apiKey` is not a Bearer credential. x-api-key wins outright when both
+ * are present, so a request that already worked is judged exactly as before. A
+ * repeated header, another scheme or an unknown token presents no key. The
+ * value is a candidate only: resolveClientAuth decides, and the loopback
+ * exemption still applies. On these routes the data path drops `authorization`
+ * before the pool account's credential is applied, so the key never travels
+ * upstream.
  * @param {import('node:http').IncomingMessage} req
+ * @param {Record<string, any>|undefined} proxyConfig
  * @returns {string|string[]|undefined}
  */
-function presentedProxyKey(req) {
+function presentedProxyKey(req, proxyConfig) {
   const apiKey = req.headers['x-api-key'];
   if (apiKey !== undefined || req.headers.authorization === undefined) return apiKey;
+  if (!BEARER_KEY_ROUTES.has(`${req.method} ${(req.url || '').split('?')[0]}`)) return undefined;
   // Node keeps only the first of a repeated Authorization header, so the raw
   // header list is what shows it was repeated.
   let seen = 0;
@@ -457,7 +474,8 @@ function presentedProxyKey(req) {
     if (req.rawHeaders[i].toLowerCase() === 'authorization') seen++;
   }
   if (seen !== 1) return undefined;
-  return /^Bearer ([A-Za-z0-9._~+/=-]{1,4096})$/.exec(req.headers.authorization)?.[1];
+  const token = /^Bearer ([A-Za-z0-9._~+/=-]{1,4096})$/i.exec(req.headers.authorization)?.[1];
+  return token !== undefined && resolveClientAuth(proxyConfig, token).client !== null ? token : undefined;
 }
 
 // Control-plane writes that change the config file, with the refusal a
@@ -573,7 +591,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // request (not captured at creation) so a reload that edits clientKeys
       // applies to a running server, matching how eventLogging/blockedModels
       // are read live further down the pipeline.
-      const clientKey = presentedProxyKey(req);
+      const clientKey = presentedProxyKey(req, config.proxy);
       const isLocal = loopbackExempt(req.headers, req.socket.remoteAddress, config.proxy);
       const auth = resolveClientAuth(config.proxy, clientKey);
       if (!auth.ok && !isLocal) {

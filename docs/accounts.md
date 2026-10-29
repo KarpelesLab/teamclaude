@@ -342,6 +342,26 @@ base_url = "http://127.0.0.1:3456/backend-api/codex"
 wire_api = "responses"
 ```
 
+To give Codex a named [`proxy.clientKeys`](configuration.md) key instead of
+relying on the loopback exemption, add `env_key` to the provider and export the
+key under that name:
+
+```toml
+[model_providers.teamclaude]
+# ...as above
+env_key = "TEAMCLAUDE_KEY"
+```
+
+```bash
+export TEAMCLAUDE_KEY=tc-...   # a proxy.clientKeys key, "scope": "inference" is enough
+```
+
+Codex sends the value of `env_key` as `Authorization: Bearer <key>`, which
+TeamClaude accepts on `/backend-api/codex/responses` and `/backend-api/codex/models`
+for a named client key (not the shared `proxy.apiKey`) and does not forward
+upstream. Do not set `supports_websockets` on the provider: a WebSocket
+handshake is authenticated by `x-api-key` only, so use HTTPS.
+
 ### Through the MITM proxy (no Codex config needed)
 
 MITM mode intercepts `chatgpt.com` as well as `api.anthropic.com`, so a Codex CLI

@@ -4,6 +4,7 @@ import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
 import { connectAuthorized } from '../src/mitm.js';
+import { allowLoopbackForward } from '../src/forward-target.js';
 
 // Codex authenticates to its base URL with `Authorization: Bearer <key>`, never
 // x-api-key, so a named proxy.clientKeys key handed to Codex was refused with a
@@ -76,6 +77,7 @@ async function withProxy(fn, overrides = {}) {
     accounts: [{ name: 'codex', type: 'oauth', provider: 'codex', upstream: upstreamUrl }],
   };
   const proxy = createProxyServer(am, config, { reload: async () => ({ added: 0, removed: 0 }) });
+  allowLoopbackForward(proxy); // the forward test's destination is the fake upstream on 127.0.0.1
   const port = await listen(proxy);
   try {
     await fn({ port, seen, upstreamUrl });
@@ -124,26 +126,27 @@ test('the Bearer key never reaches upstream, only the pool account\'s credential
   });
 });
 
-test('an inference-scoped Bearer key is refused every control route with 403', async () => {
+test('a Bearer is not a credential on the control routes: any key sent that way is refused with 401', async () => {
   await withProxy(async ({ port, seen }) => {
-    for (const [method, path] of [
-      ['GET', '/teamclaude/status'],
-      ['POST', '/teamclaude/reload'],
-      ['POST', '/teamclaude/switch'],
-      ['GET', '/teamrouter/status'],
-    ]) {
-      const res = await send(port, { method, path, headers: bearer(SCOPED_KEY), body: method === 'POST' ? {} : undefined });
-      assert.equal(res.status, 403, `${method} ${path}`);
+    for (const key of [SCOPED_KEY, FULL_KEY]) {
+      for (const [method, path] of [
+        ['GET', '/teamclaude/status'],
+        ['POST', '/teamclaude/reload'],
+        ['POST', '/teamclaude/switch'],
+        ['GET', '/teamrouter/status'],
+      ]) {
+        const res = await send(port, { method, path, headers: bearer(key), body: method === 'POST' ? {} : undefined });
+        assert.equal(res.status, 401, `${method} ${path}`);
+      }
     }
     assert.deepEqual(seen, []);
   });
 });
 
-test('a full-scope Bearer key is attributed to its name', async () => {
+test('an inference-scoped key keeps its 403 on the control routes when sent as x-api-key', async () => {
   await withProxy(async ({ port }) => {
-    const res = await send(port, { path: '/teamclaude/status', headers: bearer(FULL_KEY) });
-    assert.equal(res.status, 200);
-    assert.equal(JSON.parse(res.text).caller.client, 'laptop');
+    const res = await send(port, { path: '/teamclaude/status', headers: { 'x-api-key': SCOPED_KEY } });
+    assert.equal(res.status, 403);
   });
 });
 
@@ -213,11 +216,9 @@ test('the loopback exemption is unchanged: a keyless or non-matching Bearer from
       const res = await send(port, { ...MESSAGE, headers });
       assert.equal(res.status, 200);
     }
-    const status = await send(port, { path: '/teamclaude/status', headers: bearer('a-chatgpt-login-token') });
+    // On a control route a Bearer is not read at all, so it is the operator.
+    const status = await send(port, { path: '/teamclaude/status', headers: bearer(FULL_KEY) });
     assert.equal(JSON.parse(status.text).caller.client, null);
-    // A matching Bearer from loopback is attributed to its key.
-    const named = await send(port, { path: '/teamclaude/status', headers: bearer(FULL_KEY) });
-    assert.equal(JSON.parse(named.text).caller.client, 'laptop');
     assert.equal(seen.length, 2);
   }, { trustLoopback: true });
 });
@@ -266,7 +267,6 @@ test('a Bearer equal to a client key is not accepted on the relayed credential p
       ['GET', '/v1/sessions'],
       ['GET', '/v1/environments/x'],
       ['GET', '/v1/models/'],
-      ['GET', '/v1/models?x=1/../..'],
       ['POST', '/v1/messages/'],
       ['POST', '/%761/messages'],
     ]) {
@@ -296,11 +296,12 @@ test('the chatgpt.com passthrough does not take a Bearer as a proxy key and rela
     assert.deepEqual(seen, []);
   });
   await withProxy(async ({ port, seen }) => {
-    const res = await send(port, { path: '/backend-api/wham/accounts/check', headers: { host: 'chatgpt.com', ...BEARER_CLIENT } });
+    // Admitted by the x-api-key, the client's own Authorization rides along.
+    const res = await send(port, { path: '/backend-api/wham/accounts/check', headers: { host: 'chatgpt.com', 'x-api-key': SHARED_KEY, authorization: 'Bearer a-chatgpt-login' } });
     assert.equal(res.status, 200);
     assert.equal(seen.length, 1);
-    assert.equal(seen[0].authorization, `Bearer ${SCOPED_KEY}`);
-  }, { trustLoopback: true });
+    assert.equal(seen[0].authorization, 'Bearer a-chatgpt-login');
+  });
 });
 
 test('a forwarded absolute-form request does not take a Bearer as a proxy key and relays Authorization as sent', async () => {
@@ -310,11 +311,12 @@ test('a forwarded absolute-form request does not take a Bearer as a proxy key an
     assert.deepEqual(seen, []);
   });
   await withProxy(async ({ port, seen, upstreamUrl }) => {
-    const res = await send(port, { path: `${upstreamUrl}/anything`, headers: BEARER_CLIENT });
+    // Admitted by the x-api-key, the client's own Authorization rides along.
+    const res = await send(port, { path: `${upstreamUrl}/anything`, headers: { 'x-api-key': SHARED_KEY, authorization: 'Bearer a-tool-token' } });
     assert.equal(res.status, 200);
     assert.equal(seen.length, 1);
-    assert.equal(seen[0].authorization, `Bearer ${SCOPED_KEY}`);
-  }, { trustLoopback: true });
+    assert.equal(seen[0].authorization, 'Bearer a-tool-token');
+  });
 });
 
 test('a WebSocket upgrade does not take a Bearer as a proxy key', async () => {
