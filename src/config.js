@@ -198,7 +198,12 @@ export async function loadOrCreateConfig() {
 //            and re-checks staleness while holding it, so two waiters that both
 //            judged the old lock stale cannot both unlink (the slower one would
 //            remove the fresh lock the faster one just took). A `.steal` file
-//            older than 10 s is a crashed breaker's and is removed.
+//            older than 10 s is a crashed breaker's and is removed. This
+//            narrows the race, it does not close it: a live holder past 10 s
+//            can release, and a third party can take the lock, between the
+//            re-judge and the unlink; with three or more waiters, removing a
+//            crashed guard races the same way. Only writers that honour the
+//            guard are excluded.
 //   busy     poll every 25 ms for at most 2 s, then write WITHOUT the lock
 //   release  unlink
 //
@@ -251,7 +256,9 @@ async function breakStaleLock(lockPath) {
   try {
     // Re-judge under the guard: the lock we saw may have been replaced since.
     if (!lockIsStale(lockPath)) return false;
-    await unlink(lockPath).catch(() => {});
+    // Retry at once only if the lock is really gone; a stale lock we cannot
+    // remove (EPERM, EBUSY) must fall back to the wait budget, not spin.
+    try { await unlink(lockPath); } catch (err) { return /** @type {NodeJS.ErrnoException} */ (err).code === 'ENOENT'; }
     return true;
   } finally {
     await unlink(guardPath).catch(() => {});
