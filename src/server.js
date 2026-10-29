@@ -606,6 +606,10 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // a valid client key is attributed like any other; loopback without one
       // passed only via the exemption and stays unattributed.
       req.tcClient = auth.ok ? auth.client : null;
+      // A key that arrived as a Bearer is the proxy's own credential: take it out
+      // of the headers for good, so no relay below (the chatgpt.com passthrough
+      // reached through a Host header, for one) can copy it to an upstream.
+      if (clientKey !== undefined && req.headers['x-api-key'] === undefined) delete req.headers.authorization;
 
       // Control-plane mutations are refused when the request was issued by a web
       // page. The gate above exempts loopback from the API key, so without this
