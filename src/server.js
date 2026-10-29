@@ -261,9 +261,62 @@ export function shouldSynthesizeQuotaHeaders(config) {
   return /** @type {{ synthesizeQuotaHeaders?: unknown } | null | undefined} */ (config)?.synthesizeQuotaHeaders === true;
 }
 
+// Claude Code reads the unified quota headers as the state of the user's own
+// plan, and acts on them: past a warning threshold it shows limit warnings,
+// and once the 5-hour window nears its cap (95%, 99% on Max 5x, 99.75% on Max
+// 20x) it tells the model to checkpoint and stop starting long work. Behind a
+// pool those readings describe one account the proxy is about to rotate off,
+// so a session winds itself down while the pool still has quota.
+//
+// With `poolQuotaHeaders: true`, a successful response's client-bound copy
+// states the pool instead, as long as another account could still serve the
+// request: each window the upstream stated carries the lowest reading among
+// the accounts that could serve it, with that account's reset, its status
+// says `allowed`, and the warning-threshold and grace headers are dropped.
+// When the serving account is the last one left (poolQuotaReadings returns
+// null), its own headers pass through and Claude Code warns as it would
+// without the proxy. updateQuota has already run on the upstream headers.
+const POOLED_WINDOWS = /** @type {const} */ (['5h', '7d', '7d_oi']);
+const GRACE_HEADER_PREFIX = 'anthropic-ratelimit-unified-grace-';
+
 /**
- * The client-header flags a reload copies off the disk config, both sampled
- * per request through the two functions above.
+ * @param {Record<string, string>} headers  the client-bound copy, rewritten in place
+ * @param {Record<string, { utilization: number, resetAt: number }>} pool
+ */
+export function poolQuotaHeaders(headers, pool) {
+  const p = 'anthropic-ratelimit-unified-';
+  for (const w of POOLED_WINDOWS) {
+    delete headers[`${p}${w}-surpassed-threshold`];
+    if (headers[`${p}${w}-status`] !== undefined) headers[`${p}${w}-status`] = 'allowed';
+    if (headers[`${p}${w}-utilization`] === undefined) continue;
+    const reading = pool[w];
+    if (reading) {
+      headers[`${p}${w}-utilization`] = String(reading.utilization);
+      headers[`${p}${w}-reset`] = String(Math.floor(reading.resetAt / 1000));
+    } else {
+      // No candidate has read this window yet. Leaving the serving account's
+      // reading would restate the near-cap value this exists to hide.
+      delete headers[`${p}${w}-utilization`];
+      delete headers[`${p}${w}-reset`];
+    }
+  }
+  for (const key of Object.keys(headers)) {
+    if (key.startsWith(GRACE_HEADER_PREFIX)) delete headers[key];
+  }
+  if (headers[`${p}status`] === 'allowed_warning') headers[`${p}status`] = 'allowed';
+}
+
+/**
+ * @param {unknown} config
+ * @returns {boolean}
+ */
+export function shouldPoolQuotaHeaders(config) {
+  return /** @type {{ poolQuotaHeaders?: unknown } | null | undefined} */ (config)?.poolQuotaHeaders === true;
+}
+
+/**
+ * The client-header flags a reload copies off the disk config, each sampled
+ * per request through the functions above.
  *
  * @param {unknown} diskConfig
  */
@@ -271,6 +324,7 @@ export function reloadedHeaderFlags(diskConfig) {
   return {
     stripOverageHeaders: shouldStripOverageHeaders(diskConfig),
     synthesizeQuotaHeaders: shouldSynthesizeQuotaHeaders(diskConfig),
+    poolQuotaHeaders: shouldPoolQuotaHeaders(diskConfig),
   };
 }
 
@@ -1763,10 +1817,10 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // are dropped with the other proxy-control headers.
       const stripHeaders = usageDimensionHeaderNames(config.proxy);
 
-      // stripOverage and synthesizeQuota are sampled once here, at dispatch:
+      // stripOverage, synthesizeQuota and poolQuota are sampled once here, at dispatch:
       // retries and holds of this request keep them, and a reload applies to
       // subsequent requests.
-      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, provider, holdBudgetMs: holdMs, pinKey, onMessage, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), synthesizeQuota: shouldSynthesizeQuotaHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
+      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, provider, holdBudgetMs: holdMs, pinKey, onMessage, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), synthesizeQuota: shouldSynthesizeQuotaHeaders(config), poolQuota: shouldPoolQuotaHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -4002,6 +4056,14 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     if (ctx.synthesizeQuota === true && upstreamRes.status < 400
         && !Object.keys(rateLimitHeaders).some(k => k.startsWith('anthropic-ratelimit-unified-'))) {
       Object.assign(responseHeaders, backendQuotaHeaders(account.quota?.backend?.windows));
+    }
+
+    // The pool's headroom in place of the serving account's (see
+    // poolQuotaHeaders). An error response is left alone: a 429 that reaches
+    // the client is one rotation already failed to avoid.
+    if (ctx.poolQuota === true && upstreamRes.status < 400) {
+      const pool = accountManager.poolQuotaReadings(account, ctx.model, ctx.advisorModel, ctx.provider);
+      if (pool) poolQuotaHeaders(responseHeaders, pool);
     }
 
     res.writeHead(upstreamRes.status, responseHeaders);

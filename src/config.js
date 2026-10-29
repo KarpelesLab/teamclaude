@@ -117,6 +117,7 @@ export function createDefaultConfig() {
     blockedModels: [],
     stripOverageHeaders: false,
     synthesizeQuotaHeaders: false,
+    poolQuotaHeaders: false,
     accounts: [],
   };
 }

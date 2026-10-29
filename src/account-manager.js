@@ -4136,6 +4136,44 @@ export class AccountManager {
   }
 
   /**
+   * The lowest reading each unified window has across the accounts that could
+   * serve this request right now, or null when `account` is the only one left.
+   *
+   * Read by server.js under `poolQuotaHeaders` to tell Claude Code the pool's
+   * headroom instead of the serving account's. Null is the signal that
+   * rotation cannot help any more, so the account's own readings stand. Each
+   * window pairs a reading with that same account's reset, and a window no
+   * candidate has read (or whose reset has passed) is left out.
+   *
+   * @param {Record<string, any>} account  the account that served the response
+   * @param {*} [model]
+   * @param {*} [advisorModel]
+   * @param {string} [provider]
+   * @returns {Record<'5h'|'7d'|'7d_oi', { utilization: number, resetAt: number }>|null}
+   */
+  poolQuotaReadings(account, model = null, advisorModel = null, provider = DEFAULT_PROVIDER) {
+    const foreign = this._excludeOtherProviders(null, provider);
+    const candidates = this.accounts.filter(a => !foreign?.has(a.index) && this._isAvailable(a, model, advisorModel));
+    if (!candidates.some(a => a !== account)) return null;
+    const now = Date.now();
+    /** @type {Record<string, { utilization: number, resetAt: number }>} */
+    const out = {};
+    for (const [name, field, resetField] of /** @type {const} */ ([
+      ['5h', 'unified5h', 'unified5hReset'],
+      ['7d', 'unified7d', 'unified7dReset'],
+      ['7d_oi', 'unified7dFable', 'unified7dFableReset'],
+    ])) {
+      for (const a of candidates) {
+        const utilization = a.quota[field];
+        const resetAt = a.quota[resetField];
+        if (utilization == null || resetAt == null || resetAt <= now) continue;
+        if (!out[name] || utilization < out[name].utilization) out[name] = { utilization, resetAt };
+      }
+    }
+    return out;
+  }
+
+  /**
    * Select the active account up front (e.g. on daemon launch, once persisted
    * quota has been restored) so we start on the highest-priority / soonest-
    * resetting account instead of blindly on index 0. Mirrors rotation order.
