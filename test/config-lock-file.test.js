@@ -2,7 +2,7 @@ import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { mkdtemp, readFile, readdir, writeFile, utimes } from 'node:fs/promises';
-import { unlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -230,4 +230,45 @@ test('a steal guard left by a crashed waiter does not block breaking a stale loc
     assert.deepEqual(await readJson(path), { fresh: true });
     assert.deepEqual(await readdir(dir), ['teamclaude.json'], 'neither lock nor guard remains');
   }, { lockWaitMs: 600_000 });
+});
+
+test('a stale lock that cannot be removed falls back to the wait budget instead of spinning', async () => {
+  // A non-empty directory at the lock path reads as garbled and old (stale) but
+  // unlink refuses it, as it would a stale lock owned by another user in a
+  // sticky directory. The waiter must give up at the budget, not retry forever.
+  await withConfigDir(async ({ cfg, path, lockPath }) => {
+    mkdirSync(lockPath);
+    writeFileSync(join(lockPath, 'keep'), '');
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(lockPath, old, old);
+    const { warnings, restore } = captureBypassWarnings();
+    try { await cfg.saveConfig({ fresh: true }); } finally { restore(); }
+    assert.equal(warnings.length, 1, warnings.join('\n'));
+    assert.deepEqual(await readJson(path), { fresh: true }, 'the write still landed');
+    assert.deepEqual(await readdir(lockPath), ['keep'], 'the unremovable lock was left alone');
+  }, { lockWaitMs: 200 });
+});
+
+test('a waiter does not break a stale lock while another waiter holds the break guard', async () => {
+  // The other breaker appears at the moment this waiter has judged the lock
+  // stale: the guard, not the re-judge, is what must keep this waiter's hands off.
+  await withConfigDir(async ({ cfg, lockPath }) => {
+    const dead = await deadPid();
+    const body = { pid: dead, at: Date.now() };
+    writeFileSync(lockPath, JSON.stringify(body));
+    const realKill = process.kill;
+    let interleaved = false;
+    mock.method(process, 'kill', (pid, signal) => {
+      if (pid === dead && !interleaved) {
+        interleaved = true;
+        writeFileSync(`${lockPath}.steal`, '', { flag: 'wx' });
+      }
+      return realKill(pid, signal);
+    });
+    const { warnings, restore } = captureBypassWarnings();
+    try { await cfg.saveConfig({ fresh: true }); } finally { restore(); mock.restoreAll(); }
+    assert.ok(interleaved, 'the interleaving point was reached');
+    assert.deepEqual(await readJson(lockPath), body, 'the lock was not broken under the other breaker');
+    assert.equal(warnings.length, 1, warnings.join('\n'));
+  }, { lockWaitMs: 200 });
 });
