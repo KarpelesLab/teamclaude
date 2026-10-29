@@ -629,6 +629,8 @@ async function serverCommand() {
     // and this one has to hot-apply in particular: "stop spending credits" must
     // not wait for a restart.
     config.autoRedeemResets = diskConfig.autoRedeemResets === true;
+    // Read by the prober off this object per cycle, like the switch above.
+    config.probeDisabledAccounts = diskConfig.probeDisabledAccounts === true;
     config.blockedModels = Array.isArray(diskConfig.blockedModels) ? diskConfig.blockedModels : [];
     // Sampled off this object when each request is dispatched (server.js
     // shouldStripOverageHeaders / shouldSynthesizeQuotaHeaders), so the reload
@@ -713,6 +715,7 @@ async function serverCommand() {
         // Persist other runtime-tunable settings edited from the TUI.
         if (config.switchThreshold != null) diskConfig.switchThreshold = config.switchThreshold;
         if (config.quotaProbeSeconds != null) diskConfig.quotaProbeSeconds = config.quotaProbeSeconds;
+        if (config.probeDisabledAccounts != null) diskConfig.probeDisabledAccounts = config.probeDisabledAccounts;
         if (config.warmupSeconds != null) diskConfig.warmupSeconds = config.warmupSeconds;
         // The telemetry mode and the model blocklist are edited from the settings
         // screen too; the server reads them live from `config`, but without this
@@ -989,6 +992,7 @@ async function serverCommand() {
   prober = new Prober(accountManager, {
     intervalMs: (config.quotaProbeSeconds || 0) * 1000,
     profileFn: fetchProfile,
+    config,
   });
   // The web dashboard's one-shot probe button uses the same zero-spend action
   // as the TUI's `p` key. Assigned after construction because the hook object

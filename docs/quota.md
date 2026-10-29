@@ -36,6 +36,8 @@ The **Quota probe** row on the TUI settings screen (`g`) does the same thing, an
 
 It reads each OAuth account's utilization from its provider's read-only usage endpoint, which reports quota **without consuming any message quota**. Anthropic accounts use `/api/oauth/usage`; Codex accounts use ChatGPT's internal `/backend-api/wham/usage` endpoint and require their `ChatGPT-Account-Id`. API-key and third-party accounts are skipped. The Codex endpoint is not part of the public OpenAI API and may change without notice. Minimum interval is 30s. Changing it takes effect on a running server immediately.
 
+Disabled accounts are skipped by default. Set [`probeDisabledAccounts`](configuration.md) to `true` (or **g** → Probe disabled in the TUI) to keep their quota fresh too. The probe then refreshes a disabled account's OAuth token when it is due, as it does for any other account.
+
 The probe is also the only source for the **Sonnet 7-day** bucket, when your plan exposes it. The Fable weekly bucket arrives passively in the response headers (`anthropic-ratelimit-unified-7d_oi-*`), so Fable-aware routing works without turning the probe on. Both families are read from the payload's `limits[]`, where upstream enumerates the model-scoped weekly caps an account actually has.
 
 It is likewise the only source for Claude's [banked usage-limit resets](accounts.md#claude-banked-usage-limit-resets), read from the same call.
