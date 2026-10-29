@@ -1,7 +1,7 @@
 import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, writeFile, utimes } from 'node:fs/promises';
 import { unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -215,4 +215,19 @@ test('a waiter that judged a lock stale does not remove the fresh lock a faster 
     assert.equal(lockDuringUpdate, JSON.stringify(aBody), 'A\'s fresh lock was left standing, not unlinked by B');
     assert.equal(warnings.length, 1, 'B waited out the live holder and gave up once: ' + warnings.join('\n'));
   }, { lockWaitMs: 200 });
+});
+
+test('a steal guard left by a crashed waiter does not block breaking a stale lock', async () => {
+  await withConfigDir(async ({ dir, cfg, path, lockPath }) => {
+    writeFileSync(lockPath, JSON.stringify({ pid: await deadPid(), at: Date.now() }));
+    const guardPath = `${lockPath}.steal`;
+    writeFileSync(guardPath, '');
+    const old = new Date(Date.now() - 60_000);
+    await utimes(guardPath, old, old);
+    const { warnings, restore } = captureBypassWarnings();
+    try { await cfg.saveConfig({ fresh: true }); } finally { restore(); }
+    assert.deepEqual(warnings, [], 'recovered without bypassing the lock');
+    assert.deepEqual(await readJson(path), { fresh: true });
+    assert.deepEqual(await readdir(dir), ['teamclaude.json'], 'neither lock nor guard remains');
+  }, { lockWaitMs: 600_000 });
 });
