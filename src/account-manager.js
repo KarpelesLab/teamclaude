@@ -3799,7 +3799,9 @@ export class AccountManager {
    *
    * `sessionWindowStated` is deliberately not touched here: it records whether
    * the subscription meters a session window at all, which an expired window
-   * says nothing about (see noteSessionWindow).
+   * says nothing about (see noteSessionWindow). It is read, though: on a plan
+   * that meters none, a session reading with no reset is cleared, and one that
+   * runs out is no session reset.
    * @returns {{changed: boolean, session: boolean}} what was cleared.
    */
   _clearExpiredQuotas(account) {
@@ -3807,6 +3809,7 @@ export class AccountManager {
     const now = Date.now();
     let changed = false;
     let session = false;
+    const noSessionWindow = q.sessionWindowStated === false;
 
     // Clear expired unified quotas
     if (q.unified5h != null && q.unified5hReset && now >= q.unified5hReset) {
@@ -3819,7 +3822,13 @@ export class AccountManager {
       // dashboard polling every 5s the rule almost never ran (#275). The flag
       // outlives the observation: only refreshExpiredQuotas clears it, and with
       // the feature on only when a request drives that call.
-      account.sessionResetPending = true;
+      // Not on a plan that meters no session window: the reading that ran out
+      // was left from before the change, and no fresh five-hour allowance
+      // follows it for the switch rule to move traffic onto.
+      if (!noSessionWindow) {
+        account.sessionResetPending = true;
+        session = true;
+      }
       q.unified5h = null;
       q.unified5hReset = null;
       q.unified5hSeenAt = null;
@@ -3828,7 +3837,19 @@ export class AccountManager {
       q.unifiedStatus = null;
       q.unifiedStatusSeenAt = null;
       changed = true;
-      session = true;
+    } else if (noSessionWindow && q.unified5h != null && !q.unified5hReset) {
+      // A session reading with no reset on a plan that meters no session
+      // window. An idle metered account reads 0% with no reset (no window
+      // running), and a response after the 5-hour limit is lifted records the
+      // fact but leaves the reading (see noteSessionWindow). With no reset it
+      // would never expire, and with the probe off nothing else clears it, so
+      // a Session row would read 0% for good; a spent one would gate the
+      // account with nothing ever to release it. So it goes. A reading with a
+      // reset still to come is left to that reset: one response is weaker
+      // evidence than the probe.
+      q.unified5h = null;
+      q.unified5hSeenAt = null;
+      changed = true;
     }
     if (q.unified7d != null && q.unified7dReset && now >= q.unified7dReset) {
       console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" weekly quota reset`);

@@ -321,3 +321,76 @@ test('keep-warm skips an account that meters no five-hour window, and takes it b
   await warmer.warmAll();
   assert.ok(calls.some(spec => spec.env.ANTHROPIC_BASE_URL.endsWith('/tc-acct/ultra')));
 });
+
+// ── the expiry sweep ─────────────────────────────────────────────────────────
+
+// An idle metered account reads 0% with no reset today (no window running),
+// so a reading can sit on an account with nothing that would ever expire it.
+// Once a response says the plan meters no session window, that reading cannot
+// gate anything and, with the probe off, nothing else clears it: the Session
+// row would read 0% forever. The sweep clears it. A reading WITH a reset is
+// left to that reset, since header evidence stays weaker than the probe.
+test('the sweep clears a session reading with no reset once the plan meters no five-hour window', () => {
+  const now = Date.now();
+  const am = new AccountManager([oauth('a')], 0.98);
+  const q = am.accounts[0].quota;
+  am.applyUsageData(0, normalizeUsagePayload({ five_hour: { utilization: 0, resets_at: null }, seven_day: week() }));
+  assert.equal(q.unified5h, 0, 'the idle reading lands');
+  assert.equal(q.unified5hReset, null);
+  am.sweepExpiredQuotas();
+  assert.equal(q.unified5h, 0, 'a metered account keeps its idle reading');
+
+  am.updateQuota(0, weeklyOnly(now));
+  assert.equal(q.sessionWindowStated, false);
+  am.sweepExpiredQuotas();
+  assert.equal(q.unified5h, null);
+  assert.equal(q.unified5hSeenAt, null);
+  assert.equal(am.accounts[0].sessionResetPending, undefined, 'no window reset, so no reset event');
+  assert.equal(q.unified7d, 0.4, 'the weekly reading is untouched');
+
+  const output = renderStatus(am.getStatus(), { color: false, now });
+  assert.doesNotMatch(output, /^\s+Session\s/m);
+  const summary = am.getQuotaSummary();
+  assert.equal(summary.accounts[0].buckets.fiveHour, null);
+});
+
+test('the sweep leaves a session reading with a future reset in place on a plan with no five-hour window', () => {
+  const am = new AccountManager([oauth('a')], 0.98);
+  const q = am.accounts[0].quota;
+  const before = staleSession();
+  Object.assign(q, before, { sessionWindowStated: false });
+  am.sweepExpiredQuotas();
+  assert.equal(q.unified5h, before.unified5h);
+  assert.equal(q.unified5hReset, before.unified5hReset);
+  assert.equal(am.unavailableReason(am.accounts[0]), 'quota');
+});
+
+// A reading left from before the change runs out like any other, but on a
+// plan with no session window that is not a session reset: there is no fresh
+// five-hour allowance to move traffic onto.
+test('a session reading expiring on a plan with no five-hour window fires no session-reset switch', () => {
+  const build = (/** @type {boolean} */ stated) => {
+    const am = new AccountManager([oauth('a'), oauth('b')], 0.98);
+    const [a, b] = am.accounts;
+    Object.assign(a.quota, { unified5h: 0.99, unified5hReset: Date.now() - 1000, unified7d: 0.5, unified7dReset: Date.now() + 6 * HOUR, sessionWindowStated: stated });
+    Object.assign(b.quota, { unified5h: 0.2, unified5hReset: Date.now() + 4 * HOUR, unified7d: 0.1, unified7dReset: Date.now() + 58 * HOUR });
+    am.currentIndex = 1;
+    return am;
+  };
+  const log = console.log;
+  console.log = () => {};
+  try {
+    const metered = build(true);
+    metered.refreshExpiredQuotas();
+    assert.equal(metered.currentIndex, 0, 'control: a metered account switches on its session reset');
+
+    const ultra = build(false);
+    ultra.getStatus();
+    assert.equal(ultra.accounts[0].quota.unified5h, null, 'the expired reading is still cleared');
+    assert.notEqual(ultra.accounts[0].sessionResetPending, true);
+    ultra.refreshExpiredQuotas();
+    assert.equal(ultra.currentIndex, 1);
+  } finally {
+    console.log = log;
+  }
+});
