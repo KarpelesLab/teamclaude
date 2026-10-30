@@ -272,10 +272,13 @@ test('an entitlement denial is kept with upstream\'s message until a completion 
     assert.equal(denial.count, 1);
 
     readmit();
+    const sentAt = Date.now();
     assert.equal((await post(proxyPort)).status, 200);
     denial = am.getStatus().accounts[0].entitlementDenial;
     assert.equal(denial.count, 2);
-    assert.ok(am.accounts[0].entitlementDeniedUntil - Date.now() > 5 * 60_000);
+    // The second denial waits the second step (15 minutes) from when it landed,
+    // which is no earlier than when the request was sent.
+    assert.ok(am.accounts[0].entitlementDeniedUntil >= sentAt + 15 * 60_000);
 
     // Neither a redirect nor a served side endpoint shows the organization
     // allows OAuth inference again.

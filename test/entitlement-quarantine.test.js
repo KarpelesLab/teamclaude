@@ -110,10 +110,14 @@ test('an entitlement denial stays in status past its cooldown until a later requ
     count: 1,
   });
 
-  am.clearEntitlementDenied(0, before);
+  am.clearEntitlementDenied(am.accounts[0], before);
   assert.equal(am.getStatus().accounts[0].entitlementDenial.count, 1, 'a request sent before the denial proves nothing');
 
-  am.clearEntitlementDenied(0, am.accounts[0].entitlementEpoch);
+  // An account object no longer at its index (removed meanwhile) clears nothing.
+  am.clearEntitlementDenied({ ...am.accounts[0] }, am.accounts[0].entitlementEpoch);
+  assert.equal(am.getStatus().accounts[0].entitlementDenial.count, 1, 'a stale account object clears nothing');
+
+  am.clearEntitlementDenied(am.accounts[0], am.accounts[0].entitlementEpoch);
   assert.equal(am.getStatus().accounts[0].entitlementDenial, null);
 
   // A 403 still in flight from before the denial lands after the recovery.

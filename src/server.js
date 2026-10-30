@@ -4064,7 +4064,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // side endpoint or a redirect, delivered whole.
     if (ctx.delivered && upstreamRes.status >= 200 && upstreamRes.status < 300
         && isCompletionPath(classificationPath(req.url))) {
-      accountManager.clearEntitlementDenied(account.index, entitlementEpoch);
+      accountManager.clearEntitlementDenied(account, entitlementEpoch);
     }
   } catch (err) {
     // Two of the things that can throw here are not upstream errors at all:

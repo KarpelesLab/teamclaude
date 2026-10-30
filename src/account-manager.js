@@ -1041,11 +1041,13 @@ export class AccountManager {
   /** A completion served for a request sent after the last denial is proof the
    * organization allows OAuth again: lift the cooldown and forget the denials,
    * so the next one starts from the shortest.
-   * @param {number} index
+   * Takes the account the completion was served by, not its index: a removal
+   * while the request was out renumbers the rest.
+   * @param {Record<string, any>} account
    * @param {number} epoch  the entitlementEpoch the served request was sent under */
-  clearEntitlementDenied(index, epoch) {
-    const account = this.accounts[index];
-    if (!account?.entitlementDenial || epoch < account.entitlementEpoch) return;
+  clearEntitlementDenied(account, epoch) {
+    if (this.accounts[account?.index] !== account) return;
+    if (!account.entitlementDenial || epoch < account.entitlementEpoch) return;
     account.entitlementDeniedUntil = null;
     account.entitlementDenial = null;
   }
