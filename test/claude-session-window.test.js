@@ -365,14 +365,17 @@ test('the sweep leaves a session reading with a future reset in place on a plan 
   assert.equal(am.unavailableReason(am.accounts[0]), 'quota');
 });
 
-// A reading left from before the change runs out like any other, but on a
-// plan with no session window that is not a session reset: there is no fresh
-// five-hour allowance to move traffic onto.
-test('a session reading expiring on a plan with no five-hour window fires no session-reset switch', () => {
-  const build = (/** @type {boolean} */ stated) => {
-    const am = new AccountManager([oauth('a'), oauth('b')], 0.98);
+// A reading left from before the change runs out like any other. On a plan
+// with no session window that is a session reset only when the reading was
+// gating the account: its expiry then returns the account to rotation exactly
+// as a reset does, and the switch is what moves traffic onto its sooner-lapsing
+// weekly. A reading below the threshold kept nothing out, so its expiry
+// changes nothing the switch could act on.
+test('a session reading expiring on a plan with no five-hour window fires the switch only when it was gating', () => {
+  const build = (/** @type {boolean} */ stated, /** @type {number} */ used, /** @type {any} */ extra = {}) => {
+    const am = new AccountManager([oauth('a', extra), oauth('b')], 0.98);
     const [a, b] = am.accounts;
-    Object.assign(a.quota, { unified5h: 0.99, unified5hReset: Date.now() - 1000, unified7d: 0.5, unified7dReset: Date.now() + 6 * HOUR, sessionWindowStated: stated });
+    Object.assign(a.quota, { unified5h: used, unified5hReset: Date.now() - 1000, unified7d: 0.5, unified7dReset: Date.now() + 6 * HOUR, sessionWindowStated: stated });
     Object.assign(b.quota, { unified5h: 0.2, unified5hReset: Date.now() + 4 * HOUR, unified7d: 0.1, unified7dReset: Date.now() + 58 * HOUR });
     am.currentIndex = 1;
     return am;
@@ -380,16 +383,30 @@ test('a session reading expiring on a plan with no five-hour window fires no ses
   const log = console.log;
   console.log = () => {};
   try {
-    const metered = build(true);
+    const metered = build(true, 0.5);
     metered.refreshExpiredQuotas();
     assert.equal(metered.currentIndex, 0, 'control: a metered account switches on its session reset');
 
-    const ultra = build(false);
-    ultra.getStatus();
-    assert.equal(ultra.accounts[0].quota.unified5h, null, 'the expired reading is still cleared');
-    assert.notEqual(ultra.accounts[0].sessionResetPending, true);
-    ultra.refreshExpiredQuotas();
-    assert.equal(ultra.currentIndex, 1);
+    // Spent before the change: the reading held the account out of rotation.
+    const gated = build(false, 0.99);
+    gated.getStatus();
+    assert.equal(gated.accounts[0].quota.unified5h, null, 'the expired reading is cleared');
+    assert.equal(gated.accounts[0].sessionResetPending, true, 'a read does not swallow the event');
+    gated.refreshExpiredQuotas();
+    assert.equal(gated.currentIndex, 0, 'the account is back, so the switch runs');
+
+    // A `maxUsage` cap below the threshold gates the same way.
+    const capped = build(false, 0.7, { maxUsage: { unified5h: 0.6 } });
+    capped.refreshExpiredQuotas();
+    assert.equal(capped.currentIndex, 0, 'a capped reading was gating too');
+
+    // Below the threshold: the account was in rotation all along.
+    const idle = build(false, 0.5);
+    idle.getStatus();
+    assert.equal(idle.accounts[0].quota.unified5h, null, 'the expired reading is still cleared');
+    assert.notEqual(idle.accounts[0].sessionResetPending, true);
+    idle.refreshExpiredQuotas();
+    assert.equal(idle.currentIndex, 1);
   } finally {
     console.log = log;
   }

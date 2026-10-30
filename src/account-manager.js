@@ -3801,7 +3801,7 @@ export class AccountManager {
    * the subscription meters a session window at all, which an expired window
    * says nothing about (see noteSessionWindow). It is read, though: on a plan
    * that meters none, a session reading with no reset is cleared, and one that
-   * runs out is no session reset.
+   * runs out is a session reset only if it was gating the account.
    * @returns {{changed: boolean, session: boolean}} what was cleared.
    */
   _clearExpiredQuotas(account) {
@@ -3822,10 +3822,17 @@ export class AccountManager {
       // dashboard polling every 5s the rule almost never ran (#275). The flag
       // outlives the observation: only refreshExpiredQuotas clears it, and with
       // the feature on only when a request drives that call.
-      // Not on a plan that meters no session window: the reading that ran out
-      // was left from before the change, and no fresh five-hour allowance
-      // follows it for the switch rule to move traffic onto.
-      if (!noSessionWindow) {
+      // On a plan that meters no session window the reading that ran out was
+      // left from before the change, and no fresh five-hour allowance follows
+      // it. It is still a reset when that reading was gating the account (at
+      // its threshold or its `maxUsage` cap): the expiry returns the account
+      // to rotation just as a reset does, and the switch rule is what moves
+      // traffic onto a weekly window that lapses sooner. Below both, the
+      // account was in rotation all along and nothing changed for the rule.
+      const cap5h = noSessionWindow ? this.capFor('unified5h', account) : null;
+      const gating = q.unified5h >= this.thresholdFor('unified5h', account)
+        || (cap5h != null && q.unified5h >= cap5h);
+      if (!noSessionWindow || gating) {
         account.sessionResetPending = true;
         session = true;
       }
