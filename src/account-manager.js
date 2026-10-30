@@ -5259,6 +5259,9 @@ export class AccountManager {
     account._minted = false;
     // A failed renewal of the tokens these replace no longer explains anything.
     account._lastRefreshFailure = null;
+    // Nor does a lapsed plan restored from the last run: a sign-in may be on a
+    // renewed one, and the next profile read reports the loss again if not.
+    account.subscriptionLost = null;
     if (account.status === 'error') account.status = 'active';
     console.log(`[TeamClaude] Updated tokens for account "${safeLine(account.name, 64)}"`);
     this._onTokenRefresh?.(accountIndex, {

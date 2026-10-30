@@ -86,6 +86,21 @@ test('the loss is restored after a restart from the saved quota state', () => {
   assert.deepEqual(restarted.getStatus().accounts[0].subscriptionLost, lost);
 });
 
+test('new tokens drop a restored loss until a profile read says it again', () => {
+  const am = new AccountManager([oauth('a', MAX)], 0.98);
+  am.applyProfileData(0, FREE);
+  const restarted = new AccountManager([oauth('a', MAX)], 0.98);
+  restarted.restoreQuotaState(JSON.parse(JSON.stringify(am.exportQuotaState())));
+  assert.ok(restarted.accounts[0].subscriptionLost);
+  // A `teamclaude login` reaches the running proxy by a reload: the plan the
+  // login saw (sync-accounts copies it from the config row), then new tokens.
+  Object.assign(restarted.accounts[0], MAX);
+  restarted.updateAccountTokens(0, { accessToken: 't-new', refreshToken: 'r-new', expiresAt: Date.now() + 3600_000 });
+  assert.equal(restarted.getStatus().accounts[0].subscriptionLost, null);
+  restarted.applyProfileData(0, FREE);
+  assert.equal(restarted.getStatus().accounts[0].subscriptionLost?.plan, 'Max', 'a profile still without the plan reports it again');
+});
+
 test('a profile showing a plan again clears the report', () => {
   const am = new AccountManager([oauth('a', MAX)], 0.98);
   am.applyProfileData(0, FREE);

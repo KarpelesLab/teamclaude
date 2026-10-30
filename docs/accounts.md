@@ -218,7 +218,7 @@ With the [quota probe](quota.md#quota-probe) on, each Anthropic account's OAuth 
 Plan     its OAuth profile no longer shows the Claude Max plan (since 2h ago) — renew the plan or disable the account
 ```
 
-`GET /teamclaude/status` carries `accounts[].subscriptionLost`: `plan` (`Max` or `Pro`) and `since` (epoch ms, when it was first seen). It clears when the profile shows a plan again, and it is kept across a restart. A failed profile read changes nothing. A change between plans (Max to Pro, or a different Max tier) is logged.
+`GET /teamclaude/status` carries `accounts[].subscriptionLost`: `plan` (`Max` or `Pro`) and `since` (epoch ms, when it was first seen). It clears when the profile shows a plan again or the account gets new tokens (a `teamclaude login`; the next profile read reports the loss again if the plan is still gone), and it is kept across a restart. A failed profile read changes nothing. A change between plans (Max to Pro, or a different Max tier) is logged.
 
 The account is not taken out of rotation for it. The profile is a second-hand view of the plan, and what the account can still serve is decided by upstream's answers to its requests, which the proxy already acts on. Disable the account if you do not want it tried.
 
