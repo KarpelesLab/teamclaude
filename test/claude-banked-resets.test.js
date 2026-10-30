@@ -42,10 +42,6 @@ const LIVE_BLOCK = {
 };
 const ENDS = Date.parse('2026-10-22T16:00:00+00:00');
 const grant = over => ({ ...LIVE_BLOCK.grants[0], ...over });
-// The same block for the paths that read the real clock (normalizeUsagePayload
-// and everything built on it pass no `now`). The captured grant lapsed on
-// 2026-10-22, so these tests get one that ends a month from whenever they run.
-const CURRENT_BLOCK = { ...LIVE_BLOCK, grants: [grant({ ends_at: new Date(Date.now() + 30 * DAY).toISOString() })] };
 
 // ── reading the block ───────────────────────────────────────────────────────
 
@@ -54,7 +50,7 @@ test('the live payload reads as one reset, spendable now, with its expiry', () =
 });
 
 test('the probe payload carries the reading beside the quota buckets', () => {
-  const u = normalizeUsagePayload({ five_hour: { utilization: 0 }, seven_day: { utilization: 100 }, cedar_ember: CURRENT_BLOCK });
+  const u = normalizeUsagePayload({ five_hour: { utilization: 0 }, seven_day: { utilization: 100 }, cedar_ember: LIVE_BLOCK }, NOW);
   assert.equal(u.sevenDay.utilization, 1);
   assert.equal(u.resetCredits.available, 1);
 });
@@ -115,9 +111,9 @@ test('the probe asks for the block as a client the endpoint answers', async () =
   const calls = [];
   const fetchImpl = async (/** @type {string} */ url, /** @type {any} */ init) => {
     calls.push({ url, init });
-    return { ok: true, json: async () => ({ cedar_ember: CURRENT_BLOCK }) };
+    return { ok: true, json: async () => ({ cedar_ember: LIVE_BLOCK }) };
   };
-  const u = await fetchUsage('tok', null, { fetchImpl });
+  const u = await fetchUsage('tok', null, { fetchImpl, now: NOW });
   assert.equal(calls.length, 1);
   assert.match(calls[0].url, /\/api\/oauth\/usage\?cedar_ember=1$/);
   // Gated on the User-Agent alone: claude-cli >= 2.1.280 is eligible.
@@ -138,7 +134,7 @@ function manager() {
 
 test('a probe stores the reading stamped, and a silent payload leaves it alone', () => {
   const am = manager();
-  am.applyUsageData(0, normalizeUsagePayload({ cedar_ember: CURRENT_BLOCK }));
+  am.applyUsageData(0, normalizeUsagePayload({ cedar_ember: LIVE_BLOCK }, NOW));
   const held = am.accounts[0].quota.resetCredits;
   assert.equal(held.available, 1);
   assert.ok(Number.isFinite(held.seenAt));
@@ -146,7 +142,7 @@ test('a probe stores the reading stamped, and a silent payload leaves it alone',
   am.applyUsageData(0, normalizeUsagePayload({ five_hour: { utilization: 10 } }));
   assert.equal(am.accounts[0].quota.resetCredits, held);
 
-  am.applyUsageData(0, normalizeUsagePayload({ cedar_ember: { ...CURRENT_BLOCK, grants: [] } }));
+  am.applyUsageData(0, normalizeUsagePayload({ cedar_ember: { ...LIVE_BLOCK, grants: [] } }, NOW));
   assert.equal(am.accounts[0].quota.resetCredits.available, 0);
 });
 
