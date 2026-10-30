@@ -13,6 +13,7 @@ import { BurnRateLearner, ConcurrencyLearner, scoreCandidate } from './adaptive-
 import { OutsideSpendTracker, OUTSIDE_SPEND_STATES, OUTSIDE_SPEND_SETTLE_MS, outsideSpendKey } from './outside-spend.js';
 import { forecastWindow } from './forecast.js';
 import { safeLine } from './safe-text.js';
+import { isRefused } from './account-refusal.js';
 import { parseRoutingUrl, describeRouting, routingToUrl, isRoutingFailure } from './account-routing.js';
 import { isSelfProxy } from './upstream-proxy.js';
 import { envVar } from './brand.js';
@@ -412,7 +413,7 @@ function makeAccount(acct, index, listener = null) {
     status: 'active',
     // Why the account last went to 'error' (see _needsLogin); read only while
     // status is 'error', so a recovery path need not clear it.
-    errorReason: /** @type {{ code: string, detail: string, since: number, remedy: string }|null} */ (null),
+    errorReason: /** @type {{ code: string, detail: string, since: number, remedy: string, link: string|null }|null} */ (null),
     // No quota is known at startup, so start probing: the first response for
     // an account reveals its weekly limit and triggers re-evaluation.
     probing: true,
@@ -2737,7 +2738,7 @@ export class AccountManager {
     // are only consulted once it has actually said no.
     if (!this._isAvailable(account)) {
       if (account.disabled) return { eligible: false, reason: 'disabled' };
-      if (account.status === 'error') return { eligible: false, reason: 'in an error state and needs a re-login' };
+      if (account.status === 'error') return { eligible: false, reason: isRefused(account) ? 'refused by upstream' : 'in an error state and needs a re-login' };
       if (account.status === 'exhausted') return { eligible: false, reason: 'out of quota' };
       if (account.status === 'throttled') return { eligible: false, reason: 'rate-limited' };
       return { eligible: false, reason: 'at or above the switch threshold' };
@@ -4924,6 +4925,9 @@ export class AccountManager {
     // Same guard as pauseAccount: a NaN hold would throttle the account with a
     // rateLimitedUntil that never compares as expired.
     if (!Number.isFinite(retryAfterSeconds) || retryAfterSeconds <= 0) return;
+    // A 429 from a request already in flight must not turn an account in error
+    // into a hold that lapses on its own.
+    if (account.status === 'error') return;
     account.status = 'throttled';
     account.rateLimitedUntil = Date.now() + (retryAfterSeconds * 1000);
     // Marks when the hold was (re-)armed: a revalidation probe is allowed only
@@ -4995,7 +4999,9 @@ export class AccountManager {
     // rotating to another account.
     if (account._deadRefreshToken && account._deadRefreshToken === account.refreshToken) {
       if (account.status !== 'error') {
-        this._needsLogin(account, 'refresh_rejected', 'its refresh token was already rejected');
+        // A hold keeps its own reason: the guard is armed by the same refusal that set it.
+        if (account.errorReason?.code === 'account_on_hold') account.status = 'error';
+        else this._needsLogin(account, 'refresh_rejected', 'its refresh token was already rejected');
         console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}" still holds a rejected refresh token — run: teamclaude login`);
       }
       return;
@@ -5109,8 +5115,15 @@ export class AccountManager {
             console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" received new tokens while its old refresh token was being rejected — keeping the new ones`);
             return;
           }
-          this._needsLogin(account, 'refresh_rejected', `upstream rejected its refresh token (${err.status})`);
-          console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}" needs re-login (refresh token rejected) — run: teamclaude login`);
+          if (err.appealUrl) {
+            const { detail } = this._needsLogin(account, 'account_on_hold', `Your account is on hold and can't use Claude Code. View details or appeal: ${err.appealUrl}`, err.appealUrl);
+            console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}": ${detail}`);
+          } else {
+            this._needsLogin(account, 'refresh_rejected', `upstream rejected its refresh token (${err.status})`);
+            console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}" needs re-login (refresh token rejected) — run: teamclaude login`);
+          }
+          // Unlike markRefused, a hold found on refresh is reported to credential
+          // sync: the refresh token itself was refused, as for a dead one.
           this._onAccountError?.(account);
         }
       } finally {
@@ -5195,18 +5208,39 @@ export class AccountManager {
    * `status --json`, a remote client) saw a bare `error` and could not tell a
    * dead refresh token from a 401 on a refresh-less token, nor say when.
    * @param {Record<string, any>} account
-   * @param {'refresh_rejected'|'credential_rejected'} code
+   * @param {string} code  'refresh_rejected', 'credential_rejected', or an
+   *   ACCOUNT_REFUSAL_CODES value (see markRefused)
    * @param {string} detail  one clause, no credential in it
+   * @param {string|null} [link]  where upstream says to resolve it
    */
-  _needsLogin(account, code, detail) {
+  _needsLogin(account, code, detail, link = null) {
+    // A dead token on a refused account changes nothing the owner must do.
+    if (isRefused(account)) return account.errorReason;
     account.status = 'error';
     account.errorReason = {
       code,
       detail,
       since: Date.now(),
       remedy: providerOf(account) === 'codex' ? 'teamclaude login --codex' : 'teamclaude login',
+      link,
     };
     return account.errorReason;
+  }
+
+  /**
+   * Take an account out of rotation over a refusal upstream gave about the
+   * account itself (see account-refusal.js). Nothing here can repair it: once
+   * the owner has resolved it upstream, a re-login brings the account back.
+   * Takes the account the answer came for, not its index: a removal while the
+   * request was out renumbers the rest.
+   * @param {Record<string, any>} account
+   * @param {{ code: string, message: string, link: string|null }} refusal
+   */
+  markRefused(account, { code, message, link }) {
+    // It replaces a dead-token error: a re-login alone won't fix it.
+    if (this.accounts[account.index] !== account || isRefused(account)) return;
+    const { remedy } = this._needsLogin(account, code, message, link);
+    console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}" taken out of rotation: upstream refused it (${code}): ${safeLine(message, 300)} — once resolved, run: ${remedy}`);
   }
 
   /**

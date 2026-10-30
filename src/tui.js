@@ -11,6 +11,7 @@ import {
 import { configIndexFor, managerAccountFor, markAccountRemoved, markAccountAdded } from './account-pairing.js';
 import { PROVIDERS, providerOf, isSubscriptionAccount, upstreamFor } from './provider.js';
 import { mintAccountId } from './account-id.js';
+import { ACCOUNT_REFUSAL_CODES } from './account-refusal.js';
 import { formatPercent, heldResetCredits, showSessionRow, showWeeklyRow, unavailableLine } from './status-renderer.js';
 import { resolveMaxUsage, resolveMaxSpendMinor, switchThresholdDiffs, modelLabel, EFFORT_SEP } from './model.js';
 import { parseProxyUrl, proxyToUrl, describeProxy, describeSelfProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy, localListener, isSelfProxy } from './upstream-proxy.js';
@@ -455,7 +456,8 @@ export function routingTag(account) {
 
 // The status cell's name for an errorReason code. A code it does not know keeps `error`.
 const errorLabel = (/** @type {unknown} */ code) => code === 'account_on_hold' ? 'on hold'
-  : code === 'refresh_rejected' || code === 'credential_rejected' ? 're-login' : 'error';
+  : code === 'refresh_rejected' || code === 'credential_rejected' ? 're-login'
+  : typeof code === 'string' && ACCOUNT_REFUSAL_CODES.has(code) ? 'refused' : 'error';
 
 /** Fit a line to exactly w columns: truncate if too long, pad if too short.
  *  Truncation drops a wide glyph that would straddle the limit, so the result

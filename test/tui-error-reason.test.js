@@ -79,7 +79,13 @@ test('attach mode reads the code off the status payload: on hold, and an unknown
   remote.applyStatus(status);
   let lines = listed(remote);
   assert.match(lines[0], /on hold/);
-  assert.match(lines[1], /upstream rejected its refresh token \(400\) — run: teamclaude login/);
+  assert.match(lines[1], /refused by upstream: upstream rejected its refresh token \(400\) — once resolved, run: teamclaude login/);
+
+  status.accounts[0].errorReason.code = 'verification_required';
+  remote.applyStatus(status);
+  lines = listed(remote);
+  assert.match(lines[0], /refused/);
+  assert.match(lines[1], /refused by upstream/);
 
   status.accounts[0].errorReason.code = 'toString';
   remote.applyStatus(status);
@@ -99,6 +105,16 @@ test('a malformed reason off the wire neither throws nor reaches the terminal ra
   const [, why] = tui._rowLines(0, L, new Set());
   assert.doesNotMatch(why, /\x1b\[2J/);
   assert.match(strip(why), /run: teamclaude login/);
+});
+
+test('attach mode keeps a refusal\'s whole appeal link', async () => {
+  const status = (await refusedRefresh()).getStatus();
+  const link = `https://claude.ai/restricted?case=${'c'.repeat(300)}`;
+  Object.assign(status.accounts[0].errorReason, { code: 'account_on_hold', detail: `On hold. Appeal: ${link}`, link });
+  const remote = new RemoteAccountManager();
+  remote.applyStatus(status);
+  assert.equal(remote.accounts[0].errorReason.link, link);
+  assert.equal(remote.accounts[0].errorReason.detail, `On hold. Appeal: ${link}`);
 });
 
 test('an error with no reason on it keeps the bare cell and the line status prints for it', () => {

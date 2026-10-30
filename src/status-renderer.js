@@ -1,6 +1,7 @@
 import { formatMoney } from './oauth.js';
 import { findFamilyBlock, modelGlobOverlaps, gatingUtilization, resolveMaxUsage, resolveSwitchThreshold, resolveFleetThreshold, switchThresholdDiffs, resolveMaxSpendMinor, spendCapReached } from './model.js';
-import { safeLine } from './safe-text.js';
+import { safeLine, sanitizeText } from './safe-text.js';
+import { isRefused } from './account-refusal.js';
 import { ROUTE_COLORS } from './config-ops.js';
 import { describeRouting } from './account-routing.js';
 
@@ -397,13 +398,24 @@ export function heldResetCredits(quota, now = Date.now()) {
   return available;
 }
 
+// Upstream refused the account itself: its words, and its link when the
+// shortened words lost it.
+function refusalText(/** @type {Record<string, any>} */ err) {
+  const detail = safeLine(err.detail, 200);
+  const link = err.link && !detail.includes(err.link) ? ` ${sanitizeText(err.link)}` : '';
+  return `refused by upstream: ${detail}${link} — once resolved, run: ${safeLine(err.remedy, 40)}`;
+}
+
 export function unavailableLine(account, paint) {
   const reason = account?.unavailable;
   if (!reason) return null;
+  // A refusal outlasts a cap or a cooldown ranked above it, so it is named
+  // whatever `unavailable` says, short of the operator's own disable.
+  const refused = reason !== 'disabled' && isRefused(account);
   const err = reason === 'error' ? account.errorReason : null;
-  const text = err
-    ? `needs a re-login: ${safeLine(err.detail, 120)} — run: ${safeLine(err.remedy, 40)}`
-    : UNAVAILABLE_TEXT[reason] || safeLine(reason, 64);
+  const text = refused ? refusalText(account.errorReason)
+    : !err ? UNAVAILABLE_TEXT[reason] || safeLine(reason, 64)
+    : `needs a re-login: ${safeLine(err.detail, 120)} — run: ${safeLine(err.remedy, 40)}`;
   // An account serving as the extra-usage fallback reads as out of quota like
   // any other, yet is taking traffic and billing for it. Say so on the line
   // that would otherwise tell the operator it is idle.
