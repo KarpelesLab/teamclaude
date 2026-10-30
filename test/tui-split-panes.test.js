@@ -295,6 +295,30 @@ test('a Claude row whose plan meters no five-hour window draws only the weekly b
   for (const r of accountRows(screen(only, 120).lines)) { assert.doesNotMatch(r, /Ses/); assert.match(r, /Wk /); }
 });
 
+// The row's shape is a fact about the plan, so a weekly reset — which nulls
+// `unified7d` until the next reading — must not bring back an empty Ses cell,
+// on the row or, for a list where no row has a session window, on the list.
+test('a row with no five-hour window keeps its shape across a weekly reset', () => {
+  const weeklyReset = (/** @type {any} */ a) => Object.assign(a.quota, { unified7d: null, unified7dReset: null });
+  for (const [label, accounts, pane] of [
+    ['Claude', [claude('u@x.com'), claude('max@x.com'), codex('k@x.com')], 0],
+    ['Codex', [claude('a@x.com'), codex('u@x.com'), codex('k@x.com')], 1],
+  ]) {
+    const am = fleet(accounts);
+    const i = label === 'Claude' ? 0 : 1;
+    noSessionWindow(am.accounts[i]);
+    weeklyReset(am.accounts[i]);
+    const rows = accountRows(screen(am, 160).lines).map(r => halves(r)[pane]).filter(r => r.trim());
+    assert.match(rows[0], /u@x\.com +active +Wk /, `${label}: ${rows[0]}`);
+    assert.doesNotMatch(rows[0], /Ses/, `${label}: ${rows[0]}`);
+  }
+
+  const only = fleet([claude('u1@x.com'), claude('u2@x.com')]);
+  for (const a of only.accounts) noSessionWindow(a);
+  weeklyReset(only.accounts[0]);
+  for (const r of accountRows(screen(only, 120).lines)) { assert.doesNotMatch(r, /Ses/, r); assert.match(r, /Wk /, r); }
+});
+
 // Below the width for two bars each row draws one, and a mixed list keeps it
 // on the session window for the metered rows. A row with no session window
 // would then draw `Ses` over nothing and leave out its weekly window, the only

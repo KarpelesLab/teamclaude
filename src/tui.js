@@ -2829,9 +2829,11 @@ export class TUI {
       // `unified5h` itself, which the expiry sweep nulls every five hours on a
       // row that does have one). Some Codex plans and Anthropic's Ultra plan
       // meter none. An unreported account keeps the column, and so does a
-      // reading that is still there (showSessionRow).
+      // reading that is still there (showSessionRow). Not keyed on a weekly
+      // reading being present either: a weekly reset nulls `unified7d` until
+      // the next reading, and the column would come back empty meanwhile.
       const shortBar = cat !== 'unified'
-        || members.some(a => showSessionRow(a.quota) || a.quota.unified7d == null);
+        || members.some(a => showSessionRow(a.quota));
       // The family bars are the first thing to go: below the width where they
       // fit even at BAR_MIN they would push the row past the edge, and a row
       // cut mid-bar reads worse than one that simply doesn't draw them (the
@@ -3205,9 +3207,10 @@ export class TUI {
     // the two cells' width (bar + `  Wk ` + bar) so the row still ends where
     // its neighbours do. In single-bar mode (no room for two) it takes the one
     // slot at its own width: the row would otherwise draw `Ses` over nothing
-    // and leave out the weekly window, the only limit it has.
-    const weeklyOnly = !weeklyFirst && category === 'unified'
-      && !showSessionRow(q) && q.unified7d != null;
+    // and leave out the weekly window, the only limit it has. A weekly reset
+    // leaves the shape alone: it nulls `unified7d` until the next reading,
+    // and the row draws an empty weekly bar meanwhile, not an empty Ses cell.
+    const weeklyOnly = !weeklyFirst && category === 'unified' && !showSessionRow(q);
     // The mirror case: a plan with no shared weekly window (a Team seat). Its
     // one slot already holds the session bar, so only two-bar mode changes it.
     const sessionOnly = !weeklyFirst && showBoth && category === 'unified' && !showWeeklyRow(q);
