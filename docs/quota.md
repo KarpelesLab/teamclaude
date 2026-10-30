@@ -286,10 +286,18 @@ Utilization goes past 100% in overage, so `maxUsage` above 1.0 is a spend limit:
 The switch onto the fallback and back off it is logged once each, per model scope (a Fable-only episode is not ended by Opus traffic that still has headroom), and a failover hop onto it is logged once per episode too — the free-quota and the paid step each get their own line. While an account is **billing** — at 100% of a governing bucket, or with its month's spend seen rising — `teamclaude status` marks it:
 
 ```
-  Blocked  local switch threshold reached — serving on extra usage (paid overage), billing
+  Usage    serving on extra usage (paid overage), billing
 ```
 
 and the status payload carries `allowExtraUsage` and `onExtraUsage` per account; `onExtraUsage` is false while the fallback is only serving free quota past a threshold. The opt-in itself is visible before it is ever used: `extra usage allowed` in the account header of `teamclaude status`, an `xu` tag (yellow) at the end of the TUI row that turns into a red `xu!` while billing, and an `extra usage allowed` / `on extra usage — billing` badge on the web dashboard. With the quota probe on, the `Spend` row shows what has been billed this month.
+
+An account past its switch threshold can still have fallback capacity.
+`teamclaude status` reports `Fallback` with either `included quota available
+past switch threshold` or `subscription usage credits available`. The status
+payload includes `fallbackTier: "free"`, `"paid"`, or `null`. This describes
+capacity permitted by the fallback policy; normally eligible accounts still
+serve first. Disabled accounts, billing cooldowns and usage or spend caps
+continue to report `Blocked`.
 
 Edits apply live on config reload — turning it off stops the spending immediately.
 

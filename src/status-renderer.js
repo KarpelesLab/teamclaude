@@ -409,7 +409,13 @@ export function unavailableLine(account, paint) {
   // any other, yet is taking traffic and billing for it. Say so on the line
   // that would otherwise tell the operator it is idle.
   if (account.onExtraUsage) {
-    return `${paint.dim('Blocked'.padEnd(8))} ${paint.yellow(text)} ${paint.red('\u2014 serving on extra usage (paid overage), billing')}`;
+    return `${paint.dim('Usage'.padEnd(8))} ${paint.red('serving on extra usage (paid overage), billing')}`;
+  }
+  if (account.fallbackTier === 'free' || account.fallbackTier === 'paid') {
+    const capacity = account.fallbackTier === 'free'
+      ? 'included quota available past switch threshold'
+      : 'subscription usage credits available';
+    return `${paint.dim('Fallback'.padEnd(8))} ${paint.yellow(capacity)} (fallback after normal rotation)`;
   }
   return `${paint.dim('Blocked'.padEnd(8))} ${paint.yellow(text)}`;
 }
@@ -825,7 +831,8 @@ function modelRoutingLine(account, thresholdFor, blocked, now, paint) {
   const cells = [cell('Opus', 'unified7d', q.unified7dReset)];
   if (metered('Sonnet')) cells.push(cell('Sonnet', 'unified7dSonnet', q.unified7dSonnetReset));
   if (metered('Fable')) cells.push(cell('Fable', 'unified7dFable', q.unified7dFableReset));
-  return `${paint.dim('Models'.padEnd(8))} ${cells.join('   ')}`;
+  const label = account.allowExtraUsage === true ? 'Plan' : 'Models';
+  return `${paint.dim(label.padEnd(8))} ${cells.join('   ')}`;
 }
 
 function quotaLines(account, now, paint) {

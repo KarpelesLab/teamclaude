@@ -1408,6 +1408,10 @@ export class AccountManager {
   _sweepFallback() {
     for (const [scope, e] of [...this._extraUsage.entries()]) {
       if (this.accounts[e.account.index] !== e.account) { this._extraUsage.delete(scope); continue; }
+      if (!this.fallbackTier(e.account, e.model)) {
+        this._endFallback(scope, this._isAvailable(e.account, e.model) ? 'Quota headroom is back' : 'Fallback capacity is unavailable');
+        continue;
+      }
       const partition = this._excludeOtherProviders(null, e.provider);
       if (this.accounts.some(a => !partition?.has(a.index) && this._isAvailable(a, e.model))) {
         this._endFallback(scope, 'Quota headroom is back');
@@ -2625,28 +2629,35 @@ export class AccountManager {
       !rank || p < rank[0] || (p === rank[0] && u < rank[1]);
     for (const account of this.accounts) {
       if (exclude?.has(account.index) || partition?.has(account.index)) continue;
-      const reason = this.unavailableReason(account, model);
-      if (reason !== 'quota' && reason !== 'upstream-rejected') continue;
-      if (model && !this._routeAllows(account, model)) continue;
-      // The executor's caps were read above; the advisor's family is its own.
-      if (this.capBars(account, model, advisorModel)) continue;
+      const tier = this.fallbackTier(account, model, advisorModel);
+      if (!tier) continue;
       const priority = account.priority || 0;
       const usage = this._maxUtilization(account, model);
-      // `quota` is reported ahead of `upstream-rejected`, so a rejected account
-      // can read as `quota` here; the verdict itself decides the tier, because
-      // upstream has said the next request 429s whatever the counters say.
-      const rejected = account.quota.unifiedStatus === 'rejected';
-      if (usage < 1 && !rejected) {
+      if (tier === 'free') {
         if (better(priority, usage, freeRank)) { free = account; freeRank = [priority, usage]; }
         continue;
       }
-      if (!account.allowExtraUsage) continue;
-      const spend = /** @type {{ enabled?: boolean } | null} */ (account.quota.spend);
-      if (spend?.enabled === false) continue;
       if (better(priority, usage, paidRank)) { paid = account; paidRank = [priority, usage]; }
     }
     if (free) return { account: free, paid: false };
     return paid ? { account: paid, paid: true } : null;
+  }
+
+  /** Capacity available to fallback selection after normal rotation fails.
+   * @param {Record<string, any>} account
+   * @param {string|null} [model]
+   * @param {string|null} [advisorModel]
+   * @returns {'free'|'paid'|null} */
+  fallbackTier(account, model = null, advisorModel = null) {
+    if (!this.accounts.some(a => a.allowExtraUsage)) return null;
+    const reason = this.unavailableReason(account, model);
+    if (reason !== 'quota' && reason !== 'upstream-rejected') return null;
+    if (model && !this._routeAllows(account, model)) return null;
+    if (advisorModel && !this._routeAllows(account, advisorModel)) return null;
+    if (this.capBars(account, model, advisorModel)) return null;
+    if (this._maxUtilization(account, model) < 1 && account.quota.unifiedStatus !== 'rejected') return 'free';
+    if (!account.allowExtraUsage || account.quota.spend?.enabled === false) return null;
+    return 'paid';
   }
 
   _isAvailable(account, model = null, advisorModel = null) {
@@ -2944,6 +2955,9 @@ export class AccountManager {
    * and the fleet stays where it is. False for disabled / error / throttled /
    * 5h or shared weekly over threshold, which bar every request and must
    * rotate the fleet as before.
+   * @param {string|null} model
+   * @param {string|null} [advisorModel]
+   * @param {Set<number>|null} [exclude]
    */
   _currentBarredOnlyFor(model, advisorModel = null, exclude = null) {
     const current = this.accounts[this.currentIndex];
@@ -5492,6 +5506,7 @@ export class AccountManager {
         // its quota and billing for it. The one state `unavailable` alone
         // cannot tell apart from an account that is simply out.
         onExtraUsage: this.onExtraUsage(a.index),
+        fallbackTier: this.fallbackTier(a),
         // The account's own egress proxy, password masked (describeRouting):
         // the status payload crosses process boundaries to the attach TUI and
         // `status --json`, and a credential has no business in either.

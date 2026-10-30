@@ -53,6 +53,24 @@ test('with every account spent, the opted-in account serves instead of null', ()
   assert.equal(am.unavailableReason(picked, OPUS), 'quota');
 });
 
+test('strict advisor routes restrict extra-usage capacity and selection', () => {
+  const am = new AccountManager([
+    oauth('subscription', { allowExtraUsage: true }),
+    { name: 'api', type: 'apikey', apiKey: 'api-key', priority: 100 },
+  ], 0.98);
+  setQuota(am.accounts[0], { unified7d: 1 });
+  am._nextProbeAt = Date.now() + 60_000;
+  am.currentIndex = 1;
+  const advisor = 'claude-fable-5';
+  am.setRoutes([{ name: 'fable', match: ['claude-fable-*'], accounts: ['api'] }]);
+
+  const tier = am.fallbackTier(am.accounts[0], OPUS, advisor);
+  const alternate = am.pickAlternate(new Set(), OPUS, advisor);
+  const picked = am.getActiveAccount(null, OPUS, advisor);
+  assert.deepEqual({ tier, alternate: alternate?.name, selected: picked?.name },
+    { tier: null, alternate: 'api', selected: 'api' });
+});
+
 test('without the opt-in the spent fleet still answers null', () => {
   const am = spentFleet([oauth('a'), oauth('b')]);
   assert.equal(am.getActiveAccount(null, OPUS), null);
