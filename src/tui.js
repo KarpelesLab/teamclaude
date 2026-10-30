@@ -2824,13 +2824,14 @@ export class TUI {
       const fixed = 20 + typeCell + NAME_MIN + routeCells + tagW + spendW + creditW + switchW + routeW;
       const span = (/** @type {number} */ n, /** @type {number} */ bar) => fixed + 6 * (n - 1) + n * bar;
       const roomFor = (/** @type {number} */ n) => span(n, BAR_MIN) <= W;
-      // No Ses bar once every Codex account here has said it meters no 5h window
+      // No Ses bar once every account here has said it meters no 5h window
       // (`sessionWindowStated`, the fact a reading leaves behind; not
       // `unified5h` itself, which the expiry sweep nulls every five hours on a
-      // row that does have one); a Claude row or an unreported account keeps it,
-      // and so does a reading that is still there (showSessionRow).
+      // row that does have one). Some Codex plans and Anthropic's Ultra plan
+      // meter none. An unreported account keeps the column, and so does a
+      // reading that is still there (showSessionRow).
       const shortBar = cat !== 'unified'
-        || members.some(a => providerOf(a) !== 'codex' || showSessionRow(a.quota) || a.quota.unified7d == null);
+        || members.some(a => showSessionRow(a.quota) || a.quota.unified7d == null);
       // The family bars are the first thing to go: below the width where they
       // fit even at BAR_MIN they would push the row past the edge, and a row
       // cut mid-bar reads worse than one that simply doesn't draw them (the
@@ -3190,10 +3191,11 @@ export class TUI {
     // A list with no five-hour window to draw (see _listLayout) starts the row
     // at the weekly bar.
     const weeklyFirst = !shortBar && category !== 'metered';
-    // A Codex row whose subscription meters no five-hour window draws only the
-    // weekly bar even while Claude rows on the same list keep Ses/Wk: a `Ses -`
-    // cell there said nothing. Keyed on the fact the reading left behind
-    // (`sessionWindowStated`, see _updateCodexQuota), never on `unified5h`
+    // A row whose subscription meters no five-hour window (a Codex plan, or a
+    // Claude Ultra plan once its 5-hour limit is lifted) draws only the weekly
+    // bar even while other rows on the same list keep Ses/Wk: a `Ses -` cell
+    // there said nothing. Keyed on the fact the reading left behind
+    // (`sessionWindowStated`, see noteSessionWindow), never on `unified5h`
     // being empty: the expiry sweep nulls that every five hours on a row that
     // does have a session window, and the row would swing between the two
     // shapes. An account that has not reported keeps both cells, so the row
@@ -3202,7 +3204,7 @@ export class TUI {
     // holding the account out of rotation. The weekly bar takes the two cells'
     // width (bar + `  Wk ` + bar) so the row still ends where its neighbours do.
     const weeklyOnly = !weeklyFirst && showBoth && category === 'unified'
-      && providerOf(a) === 'codex' && !showSessionRow(q) && q.unified7d != null;
+      && !showSessionRow(q) && q.unified7d != null;
     // The mirror case: a plan with no shared weekly window (a Team seat).
     const sessionOnly = !weeklyFirst && showBoth && category === 'unified' && !showWeeklyRow(q);
     if (weeklyFirst || weeklyOnly) [l1, r1, t1, w1, th1] = [l2, r2, t2, w2, th2];
