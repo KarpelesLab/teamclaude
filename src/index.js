@@ -1068,6 +1068,9 @@ async function serverCommand() {
       server.closeIdleConnections?.();
       const idle = await drain.waitForIdle(drainSeconds * 1000);
       if (!idle) console.log(`[TeamClaude] Drain deadline reached with ${drain.status().inFlight} request(s) still in flight; exiting`);
+      // The requests that finished while draining moved quota and usage
+      // counters after the save above, and the periodic save is already off.
+      await persistQuotaState();
       process.exit(0);
     }
     // Don't linger waiting on keep-alive / streaming connections: actively
