@@ -101,6 +101,42 @@ test('a probe clearing the session reading keeps a rejection a spent window stil
   assert.equal(q.unifiedStatus, 'allowed_warning');
 });
 
+// Whether a weekly window explains the rejection is judged on the payload's
+// own readings: a spent Fable reading the same payload reports as open again
+// explains nothing.
+test('a probe judges the rejection on the family readings it brings, not the ones it replaces', () => {
+  const am = new AccountManager([oauth('a')], 0.98);
+  const q = am.accounts[0].quota;
+  Object.assign(q, staleSession(), {
+    unified7dFable: 1, unified7dFableReset: Date.now() + DAY, unified7dFableSeenAt: Date.now() - 60_000,
+    unifiedStatus: 'rejected', unifiedStatusSeenAt: Date.now() - 60_000,
+  });
+  am.applyUsageData(0, normalizeUsagePayload({
+    five_hour: null,
+    seven_day: week(),
+    limits: [
+      { kind: 'weekly_all', group: 'weekly', percent: 40, resets_at: week().resets_at, scope: null },
+      { kind: 'weekly_scoped', group: 'weekly', percent: 0, resets_at: null, scope: { model: { display_name: 'Fable' } } },
+    ],
+  }));
+  assert.equal(q.unified7dFable, 0);
+  assert.equal(q.unifiedStatus, null);
+  assert.equal(am.unavailableReason(am.accounts[0]), null);
+});
+
+// The probe returning a gated account to rotation is the same event as the
+// gating reading running out (see the expiry tests below), whichever removes it.
+test('a probe clearing a gating session reading raises the session-reset event; a non-gating one does not', () => {
+  for (const [label, unified5h, expected] of [['gating', 0.99, true], ['not gating', 0.5, false]]) {
+    const am = new AccountManager([oauth('a')], 0.98);
+    const account = am.accounts[0];
+    Object.assign(account.quota, staleSession(), { unified5h });
+    am.applyUsageData(0, normalizeUsagePayload({ five_hour: null, seven_day: week() }));
+    assert.equal(account.quota.unified5h, null, label);
+    assert.equal(Boolean(account.sessionResetPending), expected, label);
+  }
+});
+
 // The probe names the session window in two places: `five_hour` and the
 // `limits` list's `session` entry (both in the captured payloads in
 // quota-probe.test.js and scoped-weekly.test.js). Either one naming it without

@@ -4466,7 +4466,8 @@ export class AccountManager {
     // drop the Session row and keep-warm, persisted, until the next response
     // with 5h headers, which on a weekly-exhausted account is days away. So
     // only a response that was served (status < 400, where the caller knows
-    // it) with no window and no overall verdict rejected may say the window
+    // it), that names the weekly window but no 5-hour one, and whose overall,
+    // weekly and Fable statuses are none of them rejected may say the window
     // is gone. A 5-hour reading on any response still says it is there.
     if (account.type === 'oauth' && !account.upstream) {
       const namesSession = Object.keys(headers).some(k => k.startsWith('anthropic-ratelimit-unified-5h-'));
@@ -4861,13 +4862,10 @@ export class AccountManager {
     // or a `session` entry in the `limits` list, is a partial reading, as a
     // 5-hour reset header without its utilization is on the header path, and
     // clearing on it could return a spent account to rotation.
+    // Applied after the family buckets below, so whether a weekly reading
+    // still explains a stored rejection is judged on this payload's readings,
+    // not on the ones it is about to replace.
     const namesSession = usage.fiveHour?.resetAt != null || usage.sessionListed === true;
-    noteSessionWindow(q, {
-      session: usage.fiveHour?.utilization != null,
-      weekly: usage.sevenDay?.utilization != null && !namesSession,
-      clear: true,
-      rejectionExplained: this._weeklyExplainsRejection(account),
-    });
 
     // The family buckets carry a "last confirmed" stamp (see _clearExpiredQuotas).
     // A probe is upstream evidence just like a response header, so it refreshes
@@ -4917,6 +4915,22 @@ export class AccountManager {
         if (bucket?.utilization != null) observed.add(`scoped:${family}`);
       }
     }
+    // A cleared reading that was holding the account out of rotation returns
+    // it just as its expiry would, so it raises the same session-reset event
+    // the expiry sweep raises for it (see _clearExpiredQuotas); otherwise the
+    // outcome would depend on whether the probe or the clock removed it.
+    const cap5h = this.capFor('unified5h', account);
+    const sessionGating = q.unified5h != null && (q.unified5h >= this.thresholdFor('unified5h', account)
+      || (cap5h != null && q.unified5h >= cap5h));
+    noteSessionWindow(q, {
+      session: usage.fiveHour?.utilization != null,
+      weekly: usage.sevenDay?.utilization != null && !namesSession,
+      clear: true,
+      rejectionExplained: this._weeklyExplainsRejection(account),
+    });
+    // Typed loosely as at the sweep's own write: the field is set on the
+    // account object at runtime, not declared on its shape.
+    if (sessionGating && q.unified5h == null) /** @type {any} */ (account).sessionResetPending = true;
     // A probe provides fresh utilization points without spending quota itself.
     // Feed only the windows actually present in this payload.
     this._observeBurnRate(account, observed);
