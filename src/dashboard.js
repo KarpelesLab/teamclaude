@@ -692,8 +692,11 @@ export function problems(status) {
   // `throttled`, and none of them wants a person.
   var ATTENTION = { error: 'needs a re-login', disabled: 'is disabled' };
   (s.accounts || []).forEach(function (a) {
-    var held = a.unavailable === 'error' && a.errorReason && a.errorReason.code === 'account_on_hold';
-    var why = held ? 'is on hold' : ATTENTION[a.unavailable];
+    // A refusal from upstream (account-refusal.js) is not cured by a re-login
+    // alone; any error code other than the two dead-token ones is one.
+    var code = a.errorReason && a.errorReason.code;
+    var refused = a.unavailable === 'error' && code && code !== 'refresh_rejected' && code !== 'credential_rejected';
+    var why = refused ? 'was refused by upstream' : ATTENTION[a.unavailable];
     if (why) out.push({ severity: 'warn', kind: 'account', text: 'Account ' + a.name + ' ' + why + '.' });
   });
 

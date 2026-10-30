@@ -117,10 +117,10 @@ test('status prints a long appeal link whole', async () => {
   assert.ok((unavailableLine(am.getStatus().accounts[0], paint) ?? '').includes(url));
 });
 
-test('the dashboard banner and a switch say the account is on hold', async () => {
+test('the dashboard banner and a switch say upstream refused the account', async () => {
   const am = await heldManager();
-  assert.equal(problems(am.getStatus())[0].text, 'Account a is on hold.');
-  assert.equal(am.eligibility(0).reason, 'on hold');
+  assert.equal(problems(am.getStatus())[0].text, 'Account a was refused by upstream.');
+  assert.equal(am.eligibility(0).reason, 'refused by upstream');
 });
 
 test('a disabled account on hold reads as disabled', async () => {

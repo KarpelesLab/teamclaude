@@ -9,6 +9,7 @@ import { envVar } from './brand.js';
 import { creditCount } from './codex-usage.js';
 import { LOGIN_TIMEOUT_MS, codeRace, openBrowser, pasteFromTerminal } from './login-flow.js';
 import { safeLine } from './safe-text.js';
+import { anthropicLink } from './account-refusal.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 const execFileAsync = promisify(execFile);
@@ -169,12 +170,7 @@ function holdAppealUrl(text) {
   let body;
   try { body = JSON.parse(text); } catch { return undefined; }
   if (!['invalid_grant', 'access_denied'].includes(body?.error) || body.error_description !== 'account_on_hold') return undefined;
-  let url;
-  try { url = new URL(body.error_uri); } catch { return DEFAULT_APPEAL_URL; }
-  const host = url.hostname;
-  const anthropic = ['claude.ai', 'anthropic.com'].some((d) => host === d || host.endsWith(`.${d}`));
-  const plain = url.protocol === 'https:' && !url.username && !url.password && !url.port && !url.hash;
-  return plain && anthropic && url.href.length <= 2048 ? url.href : DEFAULT_APPEAL_URL;
+  return anthropicLink(body.error_uri) ?? DEFAULT_APPEAL_URL;
 }
 
 /**
