@@ -269,6 +269,12 @@ test('a window the plan does not meter stays null', async () => {
     assert.equal(claude.usage.seven_day, null);
     assert.equal(claude.usage.five_hour.utilization, 20);
 
+    // A Claude plan that states no session window: no 5-hour reading at all.
+    Object.assign(am.accounts[0].quota, { unified5h: null, unified5hReset: null, sessionWindowStated: false, weeklyWindowStated: true, unified7d: 0.4, unified7dReset: Date.now() + 86400_000 });
+    const noSession = await usageOf(port, 'id-claude', CLAUDE_USAGE);
+    assert.equal(noSession.usage.five_hour, null);
+    assert.equal(noSession.usage.seven_day.utilization, 40);
+
     // A Codex plan with no session window: its weekly one is the primary.
     Object.assign(am.accounts[1].quota, { unified7d: 0.3, unified7dReset: Date.now() + 86400_000, sessionWindowStated: false });
     const codex = await usageOf(port, 'id-codex', CODEX_USAGE);

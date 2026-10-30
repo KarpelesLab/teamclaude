@@ -219,8 +219,9 @@ function claudeWindow(ratio, resetAt) {
 /**
  * An Anthropic account's quota as `GET /api/oauth/usage` would state it.
  *
- * Every subscription meters the 5-hour window; the weekly one is null only on a
- * plan known to meter none (a Team seat, `weeklyWindowStated: false`).
+ * Each window is null only on a plan known to meter none: the weekly one on a
+ * Team seat (`weeklyWindowStated: false`), the 5-hour one on a plan that states
+ * no session window (`sessionWindowStated: false`).
  *
  * The per-model weekly caps go in `limits[]` as `weekly_scoped` entries, which
  * is where the endpoint reports them now. The two families with fields of their
@@ -241,7 +242,7 @@ export function claudeUsagePayload(quota) {
     families.set(key, { name: key.charAt(0).toUpperCase() + key.slice(1), utilization: bucket.utilization, resetAt: bucket.resetAt ?? null });
   }
   return {
-    five_hour: claudeWindow(quota.unified5h, quota.unified5hReset),
+    five_hour: quota.sessionWindowStated === false ? null : claudeWindow(quota.unified5h, quota.unified5hReset),
     seven_day: quota.weeklyWindowStated === false ? null : claudeWindow(quota.unified7d, quota.unified7dReset),
     limits: [...families.values()].map(f => ({
       kind: 'weekly_scoped',
