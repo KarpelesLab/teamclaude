@@ -193,7 +193,17 @@ export async function loadOrCreateConfig() {
 //
 //   path     <configPath>.lock
 //   acquire  open(O_CREAT|O_EXCL, 0600), then write {"pid":<pid>,"at":<ms epoch>}
-//   stale    `at` older than 10 s, or the pid no longer alive: unlink and retry
+//   stale    `at` older than 10 s, or the pid no longer alive: break it and retry.
+//            Breaking is serialised by a second exclusive file, `<lock>.steal`,
+//            and re-checks staleness while holding it, so two waiters that both
+//            judged the old lock stale cannot both unlink (the slower one would
+//            remove the fresh lock the faster one just took). A `.steal` file
+//            older than 10 s is a crashed breaker's and is removed. This
+//            narrows the race, it does not close it: a live holder past 10 s
+//            can release, and a third party can take the lock, between the
+//            re-judge and the unlink; with three or more waiters, removing a
+//            crashed guard races the same way. Only writers that honour the
+//            guard are excluded.
 //   busy     poll every 25 ms for at most 2 s, then write WITHOUT the lock
 //   release  unlink
 //
@@ -227,6 +237,34 @@ function lockIsStale(lockPath) {
   try { process.kill(pid, 0); return false; } catch (err) { return err.code === 'ESRCH'; }
 }
 
+/** Break a stale lock. True when this caller attempted the break and should
+ * retry the acquire at once; false when another waiter holds the break guard
+ * (or the lock turned out live), so the caller should poll as for a busy lock.
+ * @param {string} lockPath
+ * @returns {Promise<boolean>} */
+async function breakStaleLock(lockPath) {
+  const guardPath = `${lockPath}.steal`;
+  try {
+    closeSync(openSync(guardPath, 'wx', 0o600));
+  } catch (err) {
+    if (/** @type {NodeJS.ErrnoException} */ (err).code === 'EEXIST') {
+      // A breaker holds it for microseconds; one this old crashed holding it.
+      try { if (Date.now() - statSync(guardPath).mtimeMs > LOCK_STALE_MS) await unlink(guardPath); } catch { /* released under us */ }
+    }
+    return false;
+  }
+  try {
+    // Re-judge under the guard: the lock we saw may have been replaced since.
+    if (!lockIsStale(lockPath)) return false;
+    // Retry at once only if the lock is really gone; a stale lock we cannot
+    // remove (EPERM, EBUSY) must fall back to the wait budget, not spin.
+    try { await unlink(lockPath); } catch (err) { return /** @type {NodeJS.ErrnoException} */ (err).code === 'ENOENT'; }
+    return true;
+  } finally {
+    await unlink(guardPath).catch(() => {});
+  }
+}
+
 /** True when the lock is ours; false when we gave up and proceed without it. */
 async function acquireConfigLock(lockPath) {
   const waitMs = lockWaitMs();
@@ -242,10 +280,7 @@ async function acquireConfigLock(lockPath) {
         return false;
       }
     }
-    if (lockIsStale(lockPath)) {
-      await unlink(lockPath).catch(() => {});
-      continue;
-    }
+    if (lockIsStale(lockPath) && await breakStaleLock(lockPath)) continue;
     if (Date.now() >= deadline) {
       console.error(`[TeamClaude] ${lockPath} is still held by another process after ${waitMs}ms; writing the config without it`);
       return false;
