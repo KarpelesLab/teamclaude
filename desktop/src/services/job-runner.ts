@@ -37,8 +37,8 @@ export function importArgs(name?: string): string[] {
   return ['import', ...(name ? ['--name', name] : [])];
 }
 
-export function removeArgs(account: string): string[] {
-  return ['remove', account];
+export function removeArgs(account: string, provider?: string, org?: string): string[] {
+  return ['remove', account, ...(provider ? ['--provider', provider] : []), ...(org ? ['--org', org] : [])];
 }
 
 export function renameArgs(account: string, newName: string): string[] {

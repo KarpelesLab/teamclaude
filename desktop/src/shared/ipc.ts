@@ -40,7 +40,7 @@ export interface Methods {
   'accounts.addBackend': { args: BackendAccountInput; result: JobView };
   'accounts.testBackend': { args: BackendAccountInput & { model: string }; result: { ok: boolean; code: 'ok' | 'http' | 'network' | 'invalid'; status?: number } };
   'accounts.import': { args: { name?: string }; result: JobView };
-  'accounts.remove': { args: { account: string }; result: JobView };
+  'accounts.remove': { args: { account: string; provider: string; org?: string }; result: JobView };
   'accounts.rename': { args: { account: string; newName: string }; result: JobView };
 
   'routing.setThreshold': { args: { percent: number }; result: ActionResult };

@@ -30,6 +30,8 @@ describe('argument builders', () => {
     expect(apiKeyArgs('k', 3)).toEqual(['login', '--api', '--name', 'k', '--priority', '3']);
     expect(importArgs()).toEqual(['import']);
     expect(removeArgs('a b')).toEqual(['remove', 'a b']);
+    expect(removeArgs('same@example.com', 'codex')).toEqual(['remove', 'same@example.com', '--provider', 'codex']);
+    expect(removeArgs('same@example.com', 'anthropic', 'Example Org')).toEqual(['remove', 'same@example.com', '--provider', 'anthropic', '--org', 'Example Org']);
     expect(renameArgs('a', 'b')).toEqual(['rename', 'a', 'b']);
     expect(distributeArgs('adaptive')).toEqual(['distribute', 'adaptive']);
     expect(distributeArgs('load')).toEqual(['distribute', 'load']);

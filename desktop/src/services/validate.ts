@@ -170,7 +170,10 @@ export const VALIDATORS: Record<MethodName, Validator> = {
   'accounts.addBackend': object(['name', 'apiKey', 'upstream', 'auth', 'modelMap'], ['priority'], backendProblem),
   'accounts.testBackend': object(['name', 'apiKey', 'upstream', 'auth', 'modelMap', 'model'], ['priority'], backendProblem),
   'accounts.import': object([], ['name'], optionalName),
-  'accounts.remove': object(['account'], [], v => (isAccountName(v.account) ? null : 'invalid account')),
+  'accounts.remove': object(['account', 'provider'], ['org'], v =>
+    !isAccountName(v.account) ? 'invalid account'
+      : v.provider !== 'anthropic' && v.provider !== 'codex' ? 'invalid provider'
+        : v.org !== undefined && !isAccountName(v.org) ? 'invalid organization' : null),
   'accounts.rename': object(['account', 'newName'], [], v =>
     !isAccountName(v.account) ? 'invalid account' : !isAccountName(v.newName) ? 'invalid new name' : null),
 

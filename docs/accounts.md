@@ -83,6 +83,16 @@ Pass `--org <name|uuid>` to resolve a bare email when it is ambiguous:
 teamclaude remove user@example.com --org Acme
 ```
 
+When Claude and Codex accounts share the same email, select the provider too:
+
+```bash
+teamclaude remove user@example.com --provider codex
+teamclaude remove user@example.com --provider anthropic --org Acme
+```
+
+An omitted provider keeps the existing name/email matching rules; an ambiguous
+selection is refused. The desktop sends the selected card's provider and organization.
+
 ## Managing accounts
 
 ```bash

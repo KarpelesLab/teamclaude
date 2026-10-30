@@ -2621,11 +2621,19 @@ async function removeCommand() {
   const name = args[1];
 
   if (!name) {
-    console.error('Usage: teamclaude remove <account-name|email> [--org <name|uuid>]');
+    console.error('Usage: teamclaude remove <account-name|email> [--provider anthropic|codex] [--org <name|uuid>]');
     process.exit(1);
   }
 
-  const account = resolveAccount(config.accounts, name, argValue('--org'));
+  const provider = argValue('--provider');
+  if (args.includes('--provider') && provider !== 'anthropic' && provider !== 'codex') {
+    console.error('--provider must be anthropic or codex');
+    process.exit(1);
+  }
+  // Filter before resolving the name/email: a Claude and Codex login may use
+  // the same address, and --org alone cannot select the Codex row.
+  const candidates = provider ? config.accounts.filter((/** @type {Record<string, any>} */ a) => providerOf(a) === provider) : config.accounts;
+  const account = resolveAccount(candidates, name, argValue('--org'));
   if (!account) {
     console.error(`Account "${name}" not found`);
     process.exit(1);
@@ -2897,7 +2905,7 @@ Commands:
                       TUI does); with no NAME, list accounts and mark the current
                       --session [ID] moves only that session ($CLAUDE_CODE_SESSION_ID
                       by default); --session --clear drops its pin
-  remove <name>       Remove an account (by name or email; --org to disambiguate)
+  remove <name>       Remove an account (by name or email; --provider and --org to disambiguate)
   disable <name>      Temporarily exclude an account from rotation
   enable <name>       Re-enable a disabled account (also clears a stuck error)
   priority <name> <n> Set rotation priority (lower = preferred; --first/--last)

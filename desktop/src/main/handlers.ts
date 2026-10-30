@@ -247,7 +247,7 @@ export function createHandlers(ctx: HandlerContext): Handlers {
     'accounts.addBackend': input => jobs.run('backend', t('service.addJob', { name: input.name }), ['add-backend'], JSON.stringify(input)),
     'accounts.testBackend': input => testBackend(input),
     'accounts.import': ({ name }) => jobs.run('import', t('j.import'), importArgs(name)),
-    'accounts.remove': ({ account }) => jobs.run('remove', t('j.remove', { name: account }), removeArgs(account)),
+    'accounts.remove': ({ account, provider, org }) => jobs.run('remove', t('j.remove', { name: `${account} (${provider})` }), removeArgs(account, provider, org)),
     'accounts.rename': ({ account, newName }) => jobs.run('rename', t('j.rename', { from: account, to: newName }), renameArgs(account, newName)),
 
     'routing.setThreshold': async ({ percent }) =>

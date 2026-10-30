@@ -12,6 +12,7 @@ import { join, resolve } from 'node:path';
 import electronPath from 'electron';
 import { _electron, type ElectronApplication, type Page } from 'playwright-core';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import type { DesktopApi } from '../../src/shared/ipc';
 
 const desktop = resolve(__dirname, '..', '..');
 const FAKE_KEY = 'test-key-not-real';
@@ -33,7 +34,7 @@ function freePort(): Promise<number> {
 }
 
 interface Status {
-  accounts: Array<{ name: string; disabled: boolean }>;
+  accounts: Array<{ name: string; provider: string; disabled: boolean }>;
   switchThreshold: number;
   sessions: { mode: string };
 }
@@ -185,6 +186,36 @@ describe('TeamClaude Desktop', () => {
     expect(text).not.toContain(FAKE_KEY);
     expect(text).not.toContain('placeholder-a');
     expect(text).not.toContain('placeholder-b');
+  });
+
+  it('removes only the selected provider when Claude and Codex share an email', async () => {
+    const path = join(dir, 'teamclaude.json');
+    const email = 'same@example.com';
+    const addPair = async () => {
+      const config = JSON.parse(readFileSync(path, 'utf8'));
+      config.accounts = config.accounts.filter((a: { name: string }) => a.name !== email);
+      config.accounts.push(
+        { name: email, type: 'apikey', apiKey: `${FAKE_KEY}-claude`, orgName: 'Example Org' },
+        { name: email, type: 'apikey', provider: 'codex', apiKey: `${FAKE_KEY}-codex` },
+      );
+      writeFileSync(path, JSON.stringify(config));
+      await page.evaluate(() => (window as unknown as { teamclaude: DesktopApi }).teamclaude.call('backend.reload'));
+      await eventually(status, s => s.accounts.filter(a => a.name === email).length === 2);
+    };
+    for (const provider of ['codex', 'anthropic']) {
+      await addPair();
+      await nav('Accounts');
+      const group = page.getByRole('region', { name: `${provider} accounts`, exact: true });
+      const card = group.getByRole('article', { name: `Account ${email}`, exact: true });
+      await card.getByRole('button', { name: 'Remove', exact: true }).click();
+      await page.getByRole('dialog').getByRole('button', { name: 'Remove account', exact: true }).click();
+      const s = await eventually(status, s => s.accounts.filter(a => a.name === email).length === 1);
+      expect(s.accounts.find(a => a.name === email)?.provider).toBe(provider === 'codex' ? 'anthropic' : 'codex');
+      const disk = JSON.parse(readFileSync(path, 'utf8'));
+      const survivor = disk.accounts.filter((a: { name: string }) => a.name === email);
+      expect(survivor).toHaveLength(1);
+      expect(survivor[0].apiKey).toBe(`${FAKE_KEY}-${provider === 'codex' ? 'claude' : 'codex'}`);
+    }
   });
 
   it('stops the backend it started when the app quits', async () => {

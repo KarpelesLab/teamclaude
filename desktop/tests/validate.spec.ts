@@ -2,6 +2,11 @@ import { describe, expect, it } from 'vitest';
 import { isAccountName, isApiKey, validateCall, validateSettingsPatch, VALIDATORS } from '../src/services/validate';
 
 describe('validateCall', () => {
+  it('requires a provider for removal and validates the optional organization', () => {
+    expect(validateCall('accounts.remove', { account: 'same@example.com', provider: 'codex' }).ok).toBe(true);
+    expect(validateCall('accounts.remove', { account: 'same@example.com', provider: 'anthropic', org: 'Example Org' }).ok).toBe(true);
+    for (const args of [{ account: 'same@example.com' }, { account: 'same@example.com', provider: 'unknown' }, { account: 'same@example.com', provider: 'codex', org: '--help' }]) expect(validateCall('accounts.remove', args).ok).toBe(false);
+  });
   it('refuses unknown and prototype method names', () => {
     expect(validateCall('shell.exec', undefined)).toEqual({ ok: false, error: 'unknown method' });
     expect(validateCall('__proto__', undefined).ok).toBe(false);

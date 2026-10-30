@@ -139,13 +139,13 @@ function AccountCard({ account, threshold, readOnly }: { account: AccountView; t
 
       <ConfirmDialog
         open={confirmRemove}
-        title={t('account.removeTitle', { name: account.name })}
+        title={t('account.removeTitle', { name: `${account.name} (${account.provider})` })}
         confirmLabel={t('account.removeConfirm')}
         danger
         onCancel={() => setConfirmRemove(false)}
         onConfirm={() => {
           setConfirmRemove(false);
-          void call('accounts.remove', { account: account.name });
+          void call('accounts.remove', { account: account.name, provider: account.provider, ...(account.orgName ? { org: account.orgName } : {}) });
         }}
       >
         {t('account.removeBody')}
