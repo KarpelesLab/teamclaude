@@ -2827,8 +2827,8 @@ export class TUI {
       // No Ses bar once every account here has said it meters no 5h window
       // (`sessionWindowStated`, the fact a reading leaves behind; not
       // `unified5h` itself, which the expiry sweep nulls every five hours on a
-      // row that does have one). Some Codex plans and Anthropic's Ultra plan
-      // meter none. An unreported account keeps the column, and so does a
+      // row that does have one). Some Codex plans meter none, and so does an
+      // Anthropic Ultra account once its 5-hour limit is lifted. An unreported account keeps the column, and so does a
       // reading that is still there (showSessionRow). Not keyed on a weekly
       // reading being present either: a weekly reset nulls `unified7d` until
       // the next reading, and the column would come back empty meanwhile.
