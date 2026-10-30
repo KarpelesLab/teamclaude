@@ -75,6 +75,35 @@ test('a percentage past 100 or below 0 is clamped, and a missing reset drops onl
   });
 });
 
+// The reply newer plans get (#620): the same two windows as CREDIT_LIMIT rows,
+// whose whole-number percentage is coarser than the credits they count.
+test('CREDIT_LIMIT windows are read from their credits', async () => {
+  const credits = { code: 200, success: true, data: { level: 'pro', limits: [
+    { type: 'CREDIT_LIMIT', unit: 3, number: 5, usage: 12000, currentValue: 184, remaining: 11815, percentage: 1, nextResetTime: now + 2 * H + 10 * 60_000 + 30_000 },
+    { type: 'CREDIT_LIMIT', unit: 6, number: 1, usage: 60000, currentValue: 184, remaining: 59815, percentage: 1, nextResetTime: now + 3 * 24 * H + 4 * H + 30_000 },
+  ] } };
+  const r = await fetchBackendQuota({ upstream: ZAI, credential: 'zk' }, { fetchImpl: okFetch(credits) });
+  assert.equal(r.text, '5h 2% (resets 2h10m) · week 0% (resets 3d4h)');
+  assert.equal(r.utilization, 184 / 12000);
+  assert.equal(r.windows.fiveHour.utilization, 184 / 12000);
+  assert.equal(r.windows.weekly.utilization, 184 / 60000);
+});
+
+test('a window answered both ways reads once, at the fuller reading', async () => {
+  const both = { data: { limits: [
+    { type: 'TOKENS_LIMIT', unit: 3, number: 5, percentage: 12 },
+    { type: 'CREDIT_LIMIT', unit: 3, number: 5, usage: 100, currentValue: 40, percentage: 40 },
+    { type: 'CREDIT_LIMIT', unit: 6, number: 1, usage: 100, currentValue: 5, percentage: 5 },
+    { type: 'TOKENS_LIMIT', unit: 6, number: 1, percentage: 9 },
+  ] } };
+  const r = await fetchBackendQuota({ upstream: ZAI, credential: 'zk' }, { fetchImpl: okFetch(both) });
+  assert.equal(r.text, '5h 40% · week 9%');
+  assert.deepEqual(r.windows, {
+    fiveHour: { utilization: 0.4, resetAt: null },
+    weekly: { utilization: 0.09, resetAt: null },
+  });
+});
+
 test('an HTTP failure is reported as such, never as a reading', async () => {
   const r = await fetchBackendQuota({ upstream: ZAI, credential: 'zk' }, { fetchImpl: okFetch({}, 401) });
   assert.deepEqual(r, { error: 'HTTP 401' });

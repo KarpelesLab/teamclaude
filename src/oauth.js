@@ -592,9 +592,10 @@ export function normalizeUsageBucket(bucket) {
  * weekly caps), or { error, status } on failure.
  * @param {string} accessToken
  * @param {import('./account-routing.js').RoutingProxy|null} [routing] - the account's own egress proxy
- * @param {{ fetchImpl?: Function }} [opts]
+ * @param {{ fetchImpl?: Function, now?: number }} [opts] `now` is the clock the
+ *   banked-reset expiry is judged against; tests pin it.
  */
-export async function fetchUsage(accessToken, routing = null, { fetchImpl = proxyFetch } = {}) {
+export async function fetchUsage(accessToken, routing = null, { fetchImpl = proxyFetch, now = Date.now() } = {}) {
   try {
     const res = await fetchImpl(USAGE_URL, {
       headers: {
@@ -617,7 +618,7 @@ export async function fetchUsage(accessToken, routing = null, { fetchImpl = prox
       return { error: `HTTP ${res.status}${detail ? ': ' + detail : ''}`, status: res.status };
     }
 
-    return normalizeUsagePayload(await res.json());
+    return normalizeUsagePayload(await res.json(), now);
   } catch (err) {
     return { error: err.message || String(err), status: null };
   }
@@ -625,9 +626,10 @@ export async function fetchUsage(accessToken, routing = null, { fetchImpl = prox
 
 /**
  * Map a /api/oauth/usage payload to the buckets the quota model tracks. Pure, so
- * the mapping is testable without a network round trip.
+ * the mapping is testable without a network round trip. `now` is the clock
+ * banked-reset expiry is judged against.
  */
-export function normalizeUsagePayload(data) {
+export function normalizeUsagePayload(data, now = Date.now()) {
   // Every model-scoped weekly cap the payload enumerated, keyed by the family
   // name upstream used. The two families with dedicated fields are read from
   // the same enumeration (the legacy seven_day_<model> keys read null on
@@ -654,7 +656,7 @@ export function normalizeUsagePayload(data) {
     // shape the Codex probe reports its free reset credits, so the status
     // line, the TUI tag and the dashboard badge read both without knowing
     // which provider the account is on.
-    resetCredits: bankedResets(data?.cedar_ember),
+    resetCredits: bankedResets(data?.cedar_ember, now),
   };
 }
 
