@@ -1991,6 +1991,24 @@ function waitForRetry(ms, signal) {
   });
 }
 
+// Before a hold or an inline wait retries the request, forget the failures that
+// waiting can cure (rate limits, exhaustion, transient faults): they put an
+// account in ctx.tried for this request only. An account upstream refused (401,
+// 403) or whose token could not be renewed stays excluded, since waiting
+// changes neither. An account that is still unavailable by its own state is
+// skipped by selection regardless.
+/**
+ * @param {Record<string, any>} ctx
+ * @param {import('./account-manager.js').AccountManager} accountManager
+ */
+function forgetRecoverableFailures(ctx, accountManager) {
+  for (const i of [...ctx.tried]) {
+    const name = accountManager.accounts[i]?.name;
+    if (ctx.credentialRejected?.has(name) || ctx.unrenewed?.has(name)) continue;
+    ctx.tried.delete(i);
+  }
+}
+
 function clientGone(res) {
   return !!res.destroyed || !!res.stream?.destroyed;
 }
@@ -2826,6 +2844,36 @@ export function exhaustedMessage(candidates, model, retryAfter) {
   return `No account can serve this request${scope}: ${blockers.join('; ')}; ${rest}.${when}${aside}`;
 }
 
+/**
+ * The machine-readable half of the all-exhausted refusal, read beside
+ * `exhaustedMessage`. Both the refusal and an upstream rate limit reach the
+ * client as `rate_limit_error`, so `error_code` is how a client tells them
+ * apart without parsing the sentence.
+ *
+ * - No account is eligible at all (the branch `exhaustedMessage` words as "No
+ *   account can serve"): `no_eligible_account`, a configuration problem, with
+ *   `resets_at` null.
+ * - Otherwise `pool_exhausted`. `resets_at` is the real reset clock behind the
+ *   retry-after, as `retryWait` reports it, and null when that wait is the
+ *   untimed fallback (a dead credential, an untimed block): no reset is known,
+ *   and naming the fallback would send a reader to a reset that does not exist.
+ *
+ * @param {Record<string, any>[]} candidates
+ * @param {number} retryAfter
+ * @param {number|null} resetAt absolute epoch ms of the real reset, or null
+ * @returns {{ error_code: string, retry_after_seconds: number, resets_at: string | null }}
+ */
+export function exhaustedDetails(candidates, retryAfter, resetAt) {
+  if (!candidates.some(a => !a.disabled)) {
+    return { error_code: 'no_eligible_account', retry_after_seconds: retryAfter, resets_at: null };
+  }
+  return {
+    error_code: 'pool_exhausted',
+    retry_after_seconds: retryAfter,
+    resets_at: resetAt == null ? null : new Date(resetAt).toISOString(),
+  };
+}
+
 // ── A refusal reported inside a 200 stream ───────────────────────────────────
 //
 // Every failover in forwardRequest keys on the upstream status, and the
@@ -3257,7 +3305,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // windows the retry-after is read from have to be the same accounts, or the
     // two halves of one sentence contradict each other.
     const candidates = candidateAccounts(accountManager, ctx.model, ctx.provider);
-    const retryAfter = computeRetryAfter(accountManager, candidates, ctx.model);
+    const wait = retryWait(accountManager, candidates, ctx.model);
+    const retryAfter = wait.seconds;
 
     // Long-hold mode: hold the HTTP connection and poll until an account
     // recovers or the budget (holdSeconds) runs out. Claude Code waits for
@@ -3272,7 +3321,11 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       console.log(`[TeamClaude] All accounts exhausted — holding connection, retry in ${Math.ceil(waitMs / 1000)}s (${Math.ceil(ctx.holdBudgetMs / 1000)}s budget left)`);
       await waitForRetry(waitMs, ctx.signal);
       if (clientGone(res)) { ctx.abandoned = true; return; }
-      return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
+      forgetRecoverableFailures(ctx, accountManager);
+      // A hold is a new attempt, not one more failover: the hops spent before
+      // it are not spent on the retry, or a retry still answered 429 would be
+      // returned with the budget unspent. The hold budget bounds the loop.
+      return forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir, sx, route);
     }
 
     const exhaustedRetries = ctx.exhaustedRetries || 0;
@@ -3281,6 +3334,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       console.log(`[TeamClaude] All accounts exhausted — waiting ${retryAfter}s before retry`);
       await waitForRetry(retryAfter * 1000, ctx.signal);
       if (clientGone(res)) { ctx.abandoned = true; return; }
+      forgetRecoverableFailures(ctx, accountManager);
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
     }
     res.writeHead(429, {
@@ -3292,6 +3346,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       error: {
         type: 'rate_limit_error',
         message: exhaustedMessage(candidates, ctx.model, retryAfter),
+        details: exhaustedDetails(candidates, retryAfter, wait.resetAt),
       },
     }));
     return;
@@ -4812,8 +4867,25 @@ const UNTIMED_RETRY_AFTER_SECONDS = 60;
  * @returns {number}
  */
 export function computeRetryAfter(accountManager, candidates, model = null) {
+  return retryWait(accountManager, candidates, model).seconds;
+}
+
+/**
+ * The wait `computeRetryAfter` answers with, and the real reset clock behind
+ * it. `seconds` is that answer. `resetAt` is the absolute epoch ms at which the
+ * soonest account's own timed block lapses, or null when that soonest wait is
+ * the untimed fallback (or there was no candidate to ask). Both come from one
+ * loop, so the seconds and the clock always name the same account.
+ *
+ * @param {import('./account-manager.js').AccountManager} accountManager
+ * @param {Record<string, any>[]} candidates
+ * @param {string|null|undefined} [model]
+ * @returns {{ seconds: number, resetAt: number | null }}
+ */
+export function retryWait(accountManager, candidates, model = null) {
   const now = Date.now();
   let soonest = Infinity;
+  let soonestResetAt = null;
   for (const acct of candidates) {
     if (acct.disabled || acct.status === 'error') continue;
     let blockedFor = 0;
@@ -4825,10 +4897,13 @@ export function computeRetryAfter(accountManager, candidates, model = null) {
     }
     // No live clock means blocked by something untimed, which is worth a retry
     // at the default interval rather than being silent in the minimum.
-    if (blockedFor <= 0) blockedFor = UNTIMED_RETRY_AFTER_SECONDS * 1000;
-    if (blockedFor < soonest) soonest = blockedFor;
+    const timed = blockedFor > 0;
+    if (!timed) blockedFor = UNTIMED_RETRY_AFTER_SECONDS * 1000;
+    if (blockedFor < soonest) {
+      soonest = blockedFor;
+      soonestResetAt = timed ? now + blockedFor : null;
+    }
   }
-  return soonest === Infinity
-    ? UNTIMED_RETRY_AFTER_SECONDS
-    : Math.max(1, Math.ceil(soonest / 1000));
+  if (soonest === Infinity) return { seconds: UNTIMED_RETRY_AFTER_SECONDS, resetAt: null };
+  return { seconds: Math.max(1, Math.ceil(soonest / 1000)), resetAt: soonestResetAt };
 }
