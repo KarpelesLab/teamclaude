@@ -295,6 +295,33 @@ test('a Claude row whose plan meters no five-hour window draws only the weekly b
   for (const r of accountRows(screen(only, 120).lines)) { assert.doesNotMatch(r, /Ses/); assert.match(r, /Wk /); }
 });
 
+// Below the width for two bars each row draws one, and a mixed list keeps it
+// on the session window for the metered rows. A row with no session window
+// would then draw `Ses` over nothing and leave out its weekly window, the only
+// limit it has; it draws that one in the same single slot instead.
+test('in single-bar mode a row with no five-hour window draws its weekly bar in the one slot', () => {
+  for (const [label, accounts] of [
+    ['Claude', [claude('ultra@x.com'), claude('max@x.com')]],
+    ['Codex', [codex('k1@x.com'), codex('k2@x.com')]],
+  ]) {
+    const am = fleet(accounts);
+    noSessionWindow(am.accounts[0]);
+    const { lines, drawn } = screen(am, 60);
+    const rows = accountRows(lines);
+    assert.equal(rows.length, 2, label);
+    assert.match(rows[0], /Wk /, `${label}: ${rows[0]}`);
+    assert.doesNotMatch(rows[0], /Ses/, `${label}: ${rows[0]}`);
+    // The bar is drawn in colour, so the countdown is what the stripped text
+    // shows of it: the weekly window's (fill() sets it a day out), not `-`.
+    assert.match(rows[0], /Wk .* 1d\b/, `${label}: the weekly reading is drawn: ${rows[0]}`);
+    assert.match(rows[1], /Ses /, `${label}: the metered row keeps its session bar`);
+    assert.doesNotMatch(rows[1], /Wk/, `${label}: one bar per row: ${rows[1]}`);
+    // Not widened: there is no second cell to take over, so both rows end alike.
+    const [u, m] = [drawn.find(r => r.idx === 0), drawn.find(r => r.idx === 1)];
+    assert.equal(u.text.trimEnd().length, m.text.trimEnd().length, `${label}:\n${u.text}\n${m.text}`);
+  }
+});
+
 test('a Claude row reached through the manager keeps Ses while the old reading is there, and drops it once a probe clears it', () => {
   const am = fleet([claude('ultra@x.com'), claude('max@x.com'), codex('k@x.com')]);
   am.updateQuota(0, {
