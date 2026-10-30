@@ -3840,10 +3840,7 @@ export class AccountManager {
       // to rotation just as a reset does, and the switch rule is what moves
       // traffic onto a weekly window that lapses sooner. Below both, the
       // account was in rotation all along and nothing changed for the rule.
-      const cap5h = noSessionWindow ? this.capFor('unified5h', account) : null;
-      const gating = q.unified5h >= this.thresholdFor('unified5h', account)
-        || (cap5h != null && q.unified5h >= cap5h);
-      if (!noSessionWindow || gating) {
+      if (!noSessionWindow || this._sessionReadingGates(account)) {
         account.sessionResetPending = true;
         session = true;
       }
@@ -4917,11 +4914,10 @@ export class AccountManager {
     }
     // A cleared reading that was holding the account out of rotation returns
     // it just as its expiry would, so it raises the same session-reset event
-    // the expiry sweep raises for it (see _clearExpiredQuotas); otherwise the
-    // outcome would depend on whether the probe or the clock removed it.
-    const cap5h = this.capFor('unified5h', account);
-    const sessionGating = q.unified5h != null && (q.unified5h >= this.thresholdFor('unified5h', account)
-      || (cap5h != null && q.unified5h >= cap5h));
+    // the expiry sweep raises when such a reading runs out at its reset (see
+    // _clearExpiredQuotas). Without it, a probe landing before that reset
+    // would bring the account back with no switch rule to move traffic there.
+    const sessionGating = this._sessionReadingGates(account);
     noteSessionWindow(q, {
       session: usage.fiveHour?.utilization != null,
       weekly: usage.sevenDay?.utilization != null && !namesSession,
@@ -5077,6 +5073,21 @@ export class AccountManager {
     const q = account.quota;
     return ['unified7d', 'unified7dSonnet', 'unified7dFable']
       .some(key => q[key] != null && q[key] >= this.thresholdFor(key, account));
+  }
+
+  /**
+   * Whether the account's 5-hour reading is what holds it out of rotation: at
+   * its switch threshold, or at its `maxUsage` cap. A falsy `maxUsage` is no
+   * cap, as in capExceeded, though capFor reads a bare 0 as one. Shared by the
+   * two paths that remove such a reading on a plan with no session window.
+   * @param {any} account
+   */
+  _sessionReadingGates(account) {
+    const u = account.quota.unified5h;
+    if (u == null) return false;
+    if (u >= this.thresholdFor('unified5h', account)) return true;
+    const cap = account.maxUsage ? this.capFor('unified5h', account) : null;
+    return cap != null && u >= cap;
   }
 
   /**
