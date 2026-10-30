@@ -12,9 +12,6 @@ import { resetCreditTag } from '../src/tui.js';
 
 const DAY = 24 * 60 * 60 * 1000;
 const NOW = Date.parse('2026-10-04T00:00:00Z');
-// The tests that read the default clock (normalizeUsagePayload, fetchUsage,
-// applyUsageData) freeze Date at NOW: the recorded grant below expired on
-// 2026-10-22, so against the real clock it reads as no reset at all.
 
 // The `cedar_ember` block taken from /api/oauth/usage?cedar_ember=1 on a live
 // Max account (2026-10-04). Grant `id`s and `next_grant_id` are deliberately
@@ -52,15 +49,13 @@ test('the live payload reads as one reset, spendable now, with its expiry', () =
   assert.deepEqual(bankedResets(LIVE_BLOCK, NOW), { available: 1, applicable: 1, expiresAt: ENDS });
 });
 
-test('the probe payload carries the reading beside the quota buckets', (t) => {
-  t.mock.timers.enable({ apis: ['Date'], now: NOW });
-  const u = normalizeUsagePayload({ five_hour: { utilization: 0 }, seven_day: { utilization: 100 }, cedar_ember: LIVE_BLOCK });
+test('the probe payload carries the reading beside the quota buckets', () => {
+  const u = normalizeUsagePayload({ five_hour: { utilization: 0 }, seven_day: { utilization: 100 }, cedar_ember: LIVE_BLOCK }, NOW);
   assert.equal(u.sevenDay.utilization, 1);
   assert.equal(u.resetCredits.available, 1);
 });
 
-test('the grant ids never leave the parser', (t) => {
-  t.mock.timers.enable({ apis: ['Date'], now: NOW });
+test('the grant ids never leave the parser', () => {
   const text = JSON.stringify(normalizeUsagePayload({ cedar_ember: LIVE_BLOCK }));
   assert.equal(text.includes('grant-handle'), false);
 });
@@ -111,15 +106,14 @@ test('malformed or hostile counts cannot reach the display rows', () => {
 
 // ── asking for it ───────────────────────────────────────────────────────────
 
-test('the probe asks for the block as a client the endpoint answers', async (t) => {
-  t.mock.timers.enable({ apis: ['Date'], now: NOW });
+test('the probe asks for the block as a client the endpoint answers', async () => {
   /** @type {any[]} */
   const calls = [];
   const fetchImpl = async (/** @type {string} */ url, /** @type {any} */ init) => {
     calls.push({ url, init });
     return { ok: true, json: async () => ({ cedar_ember: LIVE_BLOCK }) };
   };
-  const u = await fetchUsage('tok', null, { fetchImpl });
+  const u = await fetchUsage('tok', null, { fetchImpl, now: NOW });
   assert.equal(calls.length, 1);
   assert.match(calls[0].url, /\/api\/oauth\/usage\?cedar_ember=1$/);
   // Gated on the User-Agent alone: claude-cli >= 2.1.280 is eligible.
@@ -138,10 +132,9 @@ function manager() {
   ], 0.98);
 }
 
-test('a probe stores the reading stamped, and a silent payload leaves it alone', (t) => {
-  t.mock.timers.enable({ apis: ['Date'], now: NOW });
+test('a probe stores the reading stamped, and a silent payload leaves it alone', () => {
   const am = manager();
-  am.applyUsageData(0, normalizeUsagePayload({ cedar_ember: LIVE_BLOCK }));
+  am.applyUsageData(0, normalizeUsagePayload({ cedar_ember: LIVE_BLOCK }, NOW));
   const held = am.accounts[0].quota.resetCredits;
   assert.equal(held.available, 1);
   assert.ok(Number.isFinite(held.seenAt));
@@ -149,7 +142,7 @@ test('a probe stores the reading stamped, and a silent payload leaves it alone',
   am.applyUsageData(0, normalizeUsagePayload({ five_hour: { utilization: 10 } }));
   assert.equal(am.accounts[0].quota.resetCredits, held);
 
-  am.applyUsageData(0, normalizeUsagePayload({ cedar_ember: { ...LIVE_BLOCK, grants: [] } }));
+  am.applyUsageData(0, normalizeUsagePayload({ cedar_ember: { ...LIVE_BLOCK, grants: [] } }, NOW));
   assert.equal(am.accounts[0].quota.resetCredits.available, 0);
 });
 
