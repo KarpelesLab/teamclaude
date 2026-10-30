@@ -23,11 +23,14 @@ temporarily in the form and main process for saving or testing a service.
   arguments; connection testing happens only in the main process. The main process reads four proxy
   fields from the config (host, port, `proxy.apiKey`, `trustLoopback`) and the
   number of accounts, and nothing else.
-- **Connection tests are explicit.** A short request is sent to the selected
-  service/model with a 20-second timeout, redirects disabled and a bounded
-  response size. Only a success category or HTTP status returns to the UI,
-  never upstream response text or exceptions that might echo a key. The form
-  says a service may bill the request. Local HTTP services are supported.
+- **Connection tests are explicit.** `GET /v1/models` retrieves OpenAI-compatible
+  model IDs with Bearer authorization, a 20-second timeout, redirects disabled
+  and a bounded response size. Inference is never run for this check. Only
+  validated model identifiers or a status/category cross IPC; response metadata,
+  error bodies and exceptions that could echo a key stay out of the renderer.
+  A successful model list does not imply Claude Messages support. Local HTTP
+  services are supported.
+
 - **Nothing runs on its own until the user turns it on.** Launch at login,
   starting the proxy on launch and restart after a crash are all off by
   default. The app sends no telemetry and starts no quota probes to produce

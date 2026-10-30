@@ -139,17 +139,18 @@ describe('TeamClaude Desktop', () => {
     await page.getByText(/"placeholder-b":/).first().waitFor();
   });
 
-  it('adds a third-party service, tests its model and saves the backend configuration', async () => {
+  it('lists models with URL/key alone, then adds a service without duplicating /v1', async () => {
     let requests = 0;
     const service = http.createServer(async (req, res) => {
       let body = '';
       for await (const chunk of req) body += chunk;
-      expect(req.url).toBe('/anthropic/v1/messages');
-      expect(req.headers['x-api-key']).toBe('demo-service-key');
-      expect(JSON.parse(body)).toMatchObject({ model: 'vendor/sonnet', max_tokens: 1 });
+      expect(req.url).toBe('/anthropic/v1/models');
+      expect(req.method).toBe('GET');
+      expect(req.headers.authorization).toBe('Bearer demo-service-key');
+      expect(body).toBe('');
       requests++;
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ type: 'message', content: [{ type: 'text', text: 'Hi' }] }));
+      res.end(JSON.stringify({ data: [{ id: 'vendor/sonnet' }, { id: 'vendor/opus' }] }));
     });
     await new Promise<void>(done => service.listen(0, '127.0.0.1', done));
     try {
@@ -159,15 +160,19 @@ describe('TeamClaude Desktop', () => {
       const priorityBox = await page.getByLabel(/^Priority/).boundingBox();
       expect(Math.abs(keyBox!.y - priorityBox!.y)).toBeLessThan(1);
       await page.getByRole('button', { name: 'Third-party service', exact: true }).click();
-      await page.getByLabel('Service name', { exact: true }).fill('demo-service');
       const address = service.address() as AddressInfo;
       const upstream = `http://127.0.0.1:${address.port}/anthropic`;
-      await page.getByLabel('API base URL', { exact: true }).fill(upstream);
+      await page.getByLabel('API base URL', { exact: true }).fill(`${upstream}/v1`);
       await page.getByLabel(/^API key/).last().fill('demo-service-key');
-      await page.getByLabel(/^Models/).fill('claude-sonnet-4-6 = vendor/sonnet');
       await page.getByRole('button', { name: 'Test connection', exact: true }).click();
-      await page.getByText('Connection verified: the model answered.', { exact: true }).waitFor();
+      await page.getByText('Connection verified. Models found: 2.', { exact: true }).waitFor();
       expect(requests).toBe(1);
+      await page.getByLabel(/^Available models/).selectOption('vendor/sonnet');
+      await page.getByRole('button', { name: 'Add model', exact: true }).click();
+      expect(await page.getByLabel(/^Models/).inputValue()).toBe('vendor/sonnet');
+      await page.getByLabel('Service name', { exact: true }).fill('demo-service');
+      await page.getByLabel(/^Authentication/).selectOption('x-api-key');
+      await page.getByLabel(/^Models/).fill('claude-sonnet-4-6 = vendor/sonnet');
       await page.getByRole('button', { name: 'Add service', exact: true }).click();
       await eventually(status, s => s.accounts.some(a => a.name === 'demo-service'));
       const config = JSON.parse(readFileSync(join(dir, 'teamclaude.json'), 'utf8'));

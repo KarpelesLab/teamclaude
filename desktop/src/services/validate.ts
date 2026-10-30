@@ -76,7 +76,6 @@ const backendProblem = (v: Record<string, unknown>): string | null => {
   const pairs = Object.entries(v.modelMap);
   const model = (s: unknown) => typeof s === 'string' && s.length > 0 && s.length <= 200 && !/\s/.test(s) && !CONTROL.test(s) && !['__proto__', 'constructor', 'prototype'].includes(s);
   if (!pairs.length || pairs.length > 50 || pairs.some(([a, b]) => !model(a) || !model(b))) return 'invalid model mapping';
-  if (v.model !== undefined && !pairs.some(([, b]) => b === v.model)) return 'invalid test model';
   return null;
 };
 
@@ -168,7 +167,8 @@ export const VALIDATORS: Record<MethodName, Validator> = {
       : v.priority !== undefined && !intIn(v.priority, -1000, 1000) ? 'priority must be an integer from -1000 to 1000'
         : optionalName(v)),
   'accounts.addBackend': object(['name', 'apiKey', 'upstream', 'auth', 'modelMap'], ['priority'], backendProblem),
-  'accounts.testBackend': object(['name', 'apiKey', 'upstream', 'auth', 'modelMap', 'model'], ['priority'], backendProblem),
+  'accounts.testBackend': object(['apiKey', 'upstream'], [], v =>
+    !validBackendUrl(v.upstream) ? 'invalid API base URL' : !isApiKey(v.apiKey) ? 'invalid API key' : null),
   'accounts.import': object([], ['name'], optionalName),
   'accounts.remove': object(['account', 'provider'], ['org'], v =>
     !isAccountName(v.account) ? 'invalid account'

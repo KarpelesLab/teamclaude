@@ -11,6 +11,7 @@ const input = { name: 'demo', upstream: 'https://example.com/anthropic', apiKey:
 test('backend keys use the chosen auth format and default fallback priority', () => {
   assert.equal(backendAccount(input).accessToken, input.apiKey);
   assert.equal(backendAccount(input).type, 'oauth');
+  assert.equal(backendAccount({ ...input, upstream: 'https://example.com/anthropic/v1/' }).upstream, 'https://example.com/anthropic');
   assert.equal(backendAccount(input).priority, 100);
   assert.equal(backendAccount({ ...input, auth: 'x-api-key' }).apiKey, input.apiKey);
   for (const patch of [{ upstream: 'file:///x' }, { upstream: 'https://user:key@example.com' }, { auth: 'none' }, { modelMap: {} }, { priority: NaN }]) assert.throws(() => backendAccount({ ...input, ...patch }));

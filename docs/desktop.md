@@ -17,16 +17,21 @@ readings and a local API fixture. No real account or billable request is used.
 
 In **Accounts → Third-party service**, enter a unique name, the API base URL,
 the key and its authentication method (`x-api-key` or `Bearer`). The service
-must support **Anthropic Messages API**; an OpenAI-only endpoint needs a
-separate protocol adapter. Enter the address before `/v1/messages`, which the
-proxy and connection test append automatically.
+must support **Anthropic Messages API** for Claude Code requests; an OpenAI-only
+endpoint needs a separate protocol adapter. Both the API root and a URL ending
+in `/v1` are accepted; the trailing `/v1` is removed when saving so inference
+requests do not duplicate that path.
+
+**Test connection** needs only the address and key. It sends an OpenAI-compatible
+`GET /v1/models` with Bearer authorization, without running inference. It shows
+available model IDs; choose one and press **Add model** to add it to the form.
+A successful list request verifies access to that endpoint, not Claude Messages
+support. The authentication selector controls subsequent Claude requests and
+is separate from the Bearer-authenticated model-list check.
 
 Enter one model ID per line. If the service uses different IDs, enter
-`Claude Code model ID = service model ID`. Choose the destination model under
-**Model to test**, then press **Test connection**. This sends a short Messages
-request with `max_tokens: 1`; a real service may charge for it. A successful
-test checks that model, not every model in the list. Keys and upstream error
-bodies are not returned in the test result.
+`Claude Code model ID = service model ID`. Keys and upstream error bodies are
+not returned in the test result.
 
 Press **Add service** to save through the backend's config lock and reload the
 running proxy. The default priority is 100 (fallback); lower numbers are

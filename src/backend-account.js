@@ -19,7 +19,7 @@ export function backendAccount(input) {
   const model = (/** @type {unknown} */ v) => typeof v === 'string' && v.length > 0 && v.length <= 200 && !/[\s\x00-\x1f\x7f]/.test(v) && !['__proto__', 'constructor', 'prototype'].includes(v);
   if (!pairs.length || pairs.length > 50 || pairs.some(([a, b]) => !model(a) || !model(b))) fail();
   return {
-    name: name.trim(), priority, upstream: url.href.replace(/\/$/, ''), modelMap,
+    name: name.trim(), priority, upstream: url.href.replace(/\/+$/, '').replace(/\/v1$/, ''), modelMap,
     ...(auth === 'bearer' ? { type: 'oauth', accessToken: apiKey } : { type: 'apikey', apiKey }),
   };
 }

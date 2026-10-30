@@ -65,11 +65,12 @@ async function main() {
     service = http.createServer(async (req, res) => {
       let body = '';
       for await (const chunk of req) body += chunk;
-      assert.equal(req.url, '/anthropic/v1/messages');
-      assert.equal(req.headers['x-api-key'], 'demo-key-not-real-service');
-      assert.equal(JSON.parse(body).model, 'demo/claude-sonnet');
+      assert.equal(req.url, '/anthropic/v1/models');
+      assert.equal(req.method, 'GET');
+      assert.equal(req.headers.authorization, 'Bearer demo-key-not-real-service');
+      assert.equal(body, '');
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ type: 'message', content: [{ type: 'text', text: 'Hi' }] }));
+      res.end(JSON.stringify({ data: [{ id: 'demo/claude-sonnet' }] }));
     });
     await new Promise(done => service.listen(0, '127.0.0.1', done));
     const serviceUrl = `http://127.0.0.1:${service.address().port}/anthropic`;
@@ -181,9 +182,9 @@ async function main() {
         await type(page.getByLabel('API base URL', { exact: true }), serviceUrl);
         await type(page.getByLabel(/^API key/), 'demo-key-not-real-service');
         await type(page.getByLabel(/^Models/), 'claude-sonnet-4-6 = demo/claude-sonnet');
-        await caption('3 · Test a model before saving — local fixture API');
+        await caption('3 · List available models — no generation request');
         await click(page.getByRole('button', { name: 'Test connection', exact: true }));
-        await page.getByText('Connection verified: the model answered.', { exact: true }).waitFor(); await pause(1700);
+        await page.getByText('Connection verified. Models found: 1.', { exact: true }).waitFor(); await pause(1700);
         await click(page.getByRole('button', { name: 'Add service', exact: true }));
         await page.getByRole('heading', { name: 'Local Claude demo', exact: true }).waitFor();
         const account = JSON.parse(readFileSync(configPath, 'utf8')).accounts.find(a => a.name === 'Local Claude demo');
