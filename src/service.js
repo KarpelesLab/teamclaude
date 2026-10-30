@@ -195,7 +195,7 @@ export async function installService({
 } = {}) {
   if (!kind) return { ok: false, error: `No service integration for ${platform}` };
   const logFile = logPath(home, platform);
-  const path = servicePath(exec);
+  const path = servicePath({ ...exec, home });
 
   if (kind === 'launchd') {
     const plist = launchAgentPath(home);
@@ -273,7 +273,7 @@ export async function serviceStatus({
 /** The unit file contents, for `service print` — inspect before installing. */
 export function renderService({ kind = serviceKind(), home = homedir(), platform = process.platform, exec = resolveExec(), configPath = null } = {}) {
   if (!kind) return null;
-  const path = servicePath(exec);
+  const path = servicePath({ ...exec, home });
   return kind === 'launchd'
     ? renderLaunchAgent({ ...exec, log: logPath(home, platform), path, configPath })
     : renderSystemdUnit({ ...exec, path, configPath });
