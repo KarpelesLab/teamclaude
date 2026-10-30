@@ -4060,8 +4060,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
 
     // The pool's headroom in place of the serving account's (see
     // poolQuotaHeaders). An error response is left alone: a 429 that reaches
-    // the client is one rotation already failed to avoid.
-    if (ctx.poolQuota === true && upstreamRes.status < 400) {
+    // the client is one rotation already failed to avoid. A pinned request is
+    // left alone too: rotation cannot move it, so its warnings are real.
+    if (ctx.poolQuota === true && ctx.pinnedIndex == null && upstreamRes.status < 400) {
       const pool = accountManager.poolQuotaReadings(account, ctx.model, ctx.advisorModel, ctx.provider);
       if (pool) poolQuotaHeaders(responseHeaders, pool);
     }

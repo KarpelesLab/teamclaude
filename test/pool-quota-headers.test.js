@@ -85,7 +85,7 @@ async function listen(/** @type {http.Server} */ server) {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(/** @type {any} */ (server.address()).port)));
 }
 
-async function through(/** @type {number} */ accountCount, /** @type {Record<string, any>} */ configExtra) {
+async function through(/** @type {number} */ accountCount, /** @type {Record<string, any>} */ configExtra, path = '/v1/messages') {
   const upstream = http.createServer((req, res) => {
     req.resume();
     req.on('end', () => {
@@ -102,7 +102,7 @@ async function through(/** @type {number} */ accountCount, /** @type {Record<str
   allowLoopbackForward(proxy);
   const proxyPort = await listen(proxy);
   try {
-    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}${path}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ model: 'x', messages: [] }),
@@ -134,6 +134,13 @@ test('enabled on the last account: its own headers pass through', async () => {
 
 test('off by default: the serving account\'s headers pass through', async () => {
   const { res } = await through(2, {});
+  assert.equal(res.headers.get(`${P}status`), 'allowed_warning');
+  assert.equal(res.headers.get(`${P}5h-utilization`), '0.995');
+});
+
+test('enabled on a pinned request: rotation cannot help, so its own headers pass through', async () => {
+  const { res } = await through(2, { poolQuotaHeaders: true }, '/tc-acct/a/v1/messages');
+  assert.equal(res.status, 200);
   assert.equal(res.headers.get(`${P}status`), 'allowed_warning');
   assert.equal(res.headers.get(`${P}5h-utilization`), '0.995');
 });
