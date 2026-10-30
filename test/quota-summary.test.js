@@ -43,6 +43,43 @@ test('quota summary classifies supported subscription and Team seat tiers', () =
   }]);
 });
 
+// Max 20x is now called Ultra, at the same weekly limit (Anthropic, 2026-10-30).
+// The tier string an Ultra account reports has not been seen yet: one that
+// names the plan weighs what Max 20x does, and the 20x strings keep matching.
+test('an Ultra rate-limit tier weighs what Max 20x does', () => {
+  const am = new AccountManager([
+    oauth('ultra', { rateLimitTier: 'default_claude_ultra' }),
+    oauth('ultra-upper', { rateLimitTier: 'DEFAULT_CLAUDE_ULTRA' }),
+    oauth('max-20', { rateLimitTier: 'default_claude_max_20x' }),
+    oauth('max-5', { rateLimitTier: 'default_claude_max_5x' }),
+  ], 0.98);
+  const summary = am.getQuotaSummary();
+  assert.deepEqual(summary.accounts.map(account => [account.name, account.tier.weight]),
+    [['ultra', 20], ['ultra-upper', 20], ['max-20', 20], ['max-5', 5]]);
+  assert.deepEqual(summary.unknownTiers, []);
+});
+
+// An Ultra account whose 5-hour limit is gone has no session reading: it still
+// counts towards the weekly aggregates, and the five-hour one describes only
+// the accounts that meter that window.
+test('an account with no five-hour window joins the weekly aggregates only', () => {
+  const am = new AccountManager([
+    oauth('ultra', { rateLimitTier: 'default_claude_ultra' }),
+    oauth('max-5', { rateLimitTier: 'default_claude_max_5x' }),
+  ], 0.98);
+  const reset = Date.now() + 86_400_000;
+  Object.assign(am.accounts[0].quota, { unified7d: 0.5, unified7dReset: reset, sessionWindowStated: false });
+  Object.assign(am.accounts[1].quota, { unified5h: 0.4, unified5hReset: reset, unified7d: 0.2, unified7dReset: reset });
+
+  const summary = am.getQuotaSummary();
+  assert.equal(summary.accounts[0].buckets.fiveHour, null);
+  assert.equal(summary.aggregate.fiveHour.knownAccounts, 1);
+  assert.equal(summary.aggregate.fiveHour.capacityWeight, 5);
+  assert.equal(summary.aggregate.weeklyShared.knownAccounts, 2);
+  assert.equal(summary.aggregate.weeklyShared.capacityWeight, 25);
+  assert.equal(summary.aggregate.weeklyShared.usedWeight, 11);
+});
+
 test('quota summary returns per-account buckets and tier-weighted fleet totals', () => {
   const am = new AccountManager([
     oauth('pro', { rateLimitTier: 'default_claude_ai' }),

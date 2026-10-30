@@ -6,7 +6,11 @@ export function quotaTier(account) {
   const normalizedSeat = String(seatTier || '').toLowerCase();
 
   let weight = null;
-  if (normalizedRate.includes('20x') || normalizedRate.includes('x20') || normalizedSeat === 'team_tier_2') {
+  // Ultra is the plan Max 20x was renamed to, at the same weekly limit
+  // (Anthropic, 2026-10-30). The tier string an Ultra account reports has not
+  // been seen yet; existing accounts still read `default_claude_max_20x`.
+  if (normalizedRate.includes('20x') || normalizedRate.includes('x20') || normalizedRate.includes('ultra')
+      || normalizedSeat === 'team_tier_2') {
     weight = 20;
   } else if (normalizedRate.includes('5x') || normalizedRate.includes('x5') || normalizedSeat === 'team_tier_1') {
     weight = 5;
