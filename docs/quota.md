@@ -332,6 +332,8 @@ Provider support lives entirely in `src/backend-quota.js`, matched by the host o
 
 By default, when all accounts are exhausted TeamClaude returns a `429` immediately, which causes Claude Code to abort the current task. With `holdSeconds` set, the proxy **holds the HTTP connection open** instead and polls silently every ~60 seconds; the instant any account's quota resets, the request is forwarded and Claude Code resumes — the interruption never happens.
 
+The refusal is still a `rate_limit_error` with the same message and `retry-after` header. Its body also carries `error.details`, so a client or a monitoring system can tell it from an upstream rate limit without reading the sentence. `error_code` is `pool_exhausted` when eligible accounts exist but are blocked, and `no_eligible_account` when none can serve the request at all (a configuration problem, not exhaustion). `retry_after_seconds` matches the header. `resets_at` is the ISO-8601 time the blocking window actually lifts, or `null` when no reset is known: a dead credential, an untimed block, or no eligible account.
+
 Set it in the config file (`~/.config/teamclaude.json`):
 
 ```json
