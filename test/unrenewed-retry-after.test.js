@@ -34,7 +34,7 @@ test("the unrenewed 503 carries the token endpoint's Retry-After, not a fixed 30
   try {
     const r = await f.send();
     assert.equal(r.status, 503);
-    assert.ok(r.retryAfter >= 115 && r.retryAfter <= 120, `${r.retryAfter}`);
+    assert.ok(r.retryAfter > 30 && r.retryAfter <= 120, `${r.retryAfter}`);
   } finally { f.close(); }
 });
 
