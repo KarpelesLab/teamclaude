@@ -80,6 +80,48 @@ test('an account with no five-hour window joins the weekly aggregates only', () 
   assert.equal(summary.aggregate.weeklyShared.usedWeight, 11);
 });
 
+// A status-line client reads this endpoint alone. `fiveHour: null` on an
+// account reads the same whether it meters no session window or has not
+// reported yet, and a fiveHour aggregate over the metered minority reads as
+// the fleet's session quota. Each row says which, and the aggregate counts the
+// capacity it leaves out because the window does not apply to it.
+test('the summary says which accounts meter no five-hour window and how much capacity that leaves out', () => {
+  const am = new AccountManager([
+    oauth('ultra-1', { rateLimitTier: 'default_claude_max_20x' }),
+    oauth('ultra-2', { rateLimitTier: 'default_claude_ultra' }),
+    oauth('pro', { rateLimitTier: 'default_claude_ai' }),
+    oauth('fresh', { rateLimitTier: 'default_claude_max_5x' }),
+    oauth('stale', { rateLimitTier: 'default_claude_max_5x' }),
+  ], 0.98);
+  const reset = Date.now() + 86_400_000;
+  for (const i of [0, 1]) Object.assign(am.accounts[i].quota, { unified7d: 0.3, unified7dReset: reset, sessionWindowStated: false });
+  Object.assign(am.accounts[2].quota, { unified5h: 0.95, unified5hReset: reset, unified7d: 0.5, unified7dReset: reset, sessionWindowStated: true });
+  // Flagged by a response, its reading from before the change still there:
+  // it still gates, so it still counts in the aggregate and is not exempt.
+  Object.assign(am.accounts[4].quota, { unified5h: 0.5, unified5hReset: reset, unified7d: 0.1, unified7dReset: reset, sessionWindowStated: false });
+
+  const summary = am.getQuotaSummary();
+  assert.deepEqual(summary.accounts.map(a => [a.name, a.sessionWindow]),
+    [['ultra-1', false], ['ultra-2', false], ['pro', true], ['fresh', null], ['stale', false]]);
+  const five = summary.aggregate.fiveHour;
+  assert.equal(five.knownAccounts, 2);
+  assert.equal(five.capacityWeight, 6);
+  assert.equal(five.exemptAccounts, 2);
+  assert.equal(five.exemptWeight, 40);
+
+  // The weekly aggregates have no such field: every subscription meters a
+  // weekly window or says nothing.
+  assert.equal('exemptAccounts' in summary.aggregate.weeklyShared, false);
+
+  // With no metered reading at all the aggregate stays null, as it always
+  // was; the rows say why.
+  const only = new AccountManager([oauth('u', { rateLimitTier: 'default_claude_ultra' })], 0.98);
+  Object.assign(only.accounts[0].quota, { unified7d: 0.3, unified7dReset: reset, sessionWindowStated: false });
+  const s = only.getQuotaSummary();
+  assert.equal(s.aggregate.fiveHour, null);
+  assert.equal(s.accounts[0].sessionWindow, false);
+});
+
 test('quota summary returns per-account buckets and tier-weighted fleet totals', () => {
   const am = new AccountManager([
     oauth('pro', { rateLimitTier: 'default_claude_ai' }),
@@ -122,6 +164,8 @@ test('quota summary returns per-account buckets and tier-weighted fleet totals',
     remaining: 0.3,
     knownAccounts: 2,
     nextResetAt: resetPro,
+    exemptAccounts: 0,
+    exemptWeight: 0,
   });
   assert.deepEqual(summary.aggregate.weeklyShared, {
     capacityWeight: 6,
