@@ -884,7 +884,8 @@ export class AccountManager {
    * rather than an old number, and a fresh upstream `rejected` binds too. The
    * one absence that does not bind is a stated one: a plan that meters no
    * weekly window (`weeklyWindowStated === false`, a Team seat) has no weekly
-   * quota to run past. The usage probe's spend record carries no "billing
+   * quota to run past, and one that meters no session window
+   * (`sessionWindowStated === false`) has no 5-hour quota to run past. The usage probe's spend record carries no "billing
    * right now" flag — the overage-status headers are not kept (see server.js)
    * — so the buckets are the only evidence, and utilization reaching 1.0 is
    * what overage looks like in them.
@@ -903,7 +904,7 @@ export class AccountManager {
     this._clearExpiredQuotas(account);
     const q = account.quota;
     if (q.unifiedStatus === 'rejected') return true;
-    if (!underOne(q.unified5h)) return true;
+    if (q.unified5h != null ? !underOne(q.unified5h) : q.sessionWindowStated !== false) return true;
     if (q.unified7d != null ? !underOne(q.unified7d) : q.weeklyWindowStated !== false) return true;
     return this._familySpendCapBinds(account, model);
   }

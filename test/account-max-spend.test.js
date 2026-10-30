@@ -193,6 +193,14 @@ test('a plan that meters no weekly window is judged on its session window alone'
   assert.equal(am.unavailableReason(budget, OPUS), 'spend-capped');
 });
 
+test('a plan that meters no session window is judged on its weekly window alone', () => {
+  const { am, budget } = capped();
+  Object.assign(budget.quota, { unified5h: null, unified5hReset: null, sessionWindowStated: false });
+  assert.equal(am.unavailableReason(budget, OPUS), null);
+  Object.assign(budget.quota, { unified7d: 1.0 });
+  assert.equal(am.unavailableReason(budget, OPUS), 'spend-capped');
+});
+
 test("past the cap, the advisor's family must be free too, unless the advisor is only preferred", () => {
   {
     const { am, budget } = capped();
