@@ -4367,7 +4367,9 @@ export class AccountManager {
     }
   }
 
-  updateQuota(accountIndex, headers, model = null) {
+  // `httpStatus` is the upstream response's status where the caller has one;
+  // only the session-window inference reads it (see noteSessionWindow below).
+  updateQuota(accountIndex, headers, model = null, httpStatus = null) {
     const account = this.accounts[accountIndex];
     if (!account) return;
 
@@ -4420,9 +4422,18 @@ export class AccountManager {
     // status or a reset without its utilization is a partial set, not an
     // absence. And only on an Anthropic subscription: a third-party backend
     // answering in these header names says nothing about an Anthropic plan.
+    // Nor does a refusal: a weekly-rejection 429 on a metered account can
+    // carry the 7d headers alone, and taking that as "no 5-hour window" would
+    // drop the Session row and keep-warm, persisted, until the next response
+    // with 5h headers, which on a weekly-exhausted account is days away. So
+    // only a response that was served (status < 400, where the caller knows
+    // it) with no window and no overall verdict rejected may say the window
+    // is gone. A 5-hour reading on any response still says it is there.
     if (account.type === 'oauth' && !account.upstream) {
       const namesSession = Object.keys(headers).some(k => k.startsWith('anthropic-ratelimit-unified-5h-'));
-      noteSessionWindow(account.quota, { session: !isNaN(u5h), weekly: !isNaN(u7d) && !namesSession });
+      const refused = (typeof httpStatus === 'number' && httpStatus >= 400)
+        || ['status', '7d-status', '7d_oi-status'].some(k => headers[`anthropic-ratelimit-unified-${k}`] === 'rejected');
+      noteSessionWindow(account.quota, { session: !isNaN(u5h), weekly: !isNaN(u7d) && !namesSession && !refused });
     }
 
     // A reset that does not parse is treated as absent, never stored: parseInt

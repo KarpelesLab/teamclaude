@@ -154,6 +154,90 @@ test('a response with no shared weekly reading leaves the fact alone', () => {
   }
 });
 
+// A refusal is no evidence about the plan's shape. A weekly-rejection 429 on a
+// metered account can carry the 7d headers alone (the shape the failover
+// fixtures in extra-usage-fallback and mitm-integration send), and recording
+// `false` from it would drop the Session row and keep-warm for days, persisted,
+// until the next response with 5h headers.
+test('a refused response stating only the weekly window leaves the fact alone', () => {
+  const now = Date.now();
+  const rejection = {
+    'anthropic-ratelimit-unified-status': 'rejected',
+    'anthropic-ratelimit-unified-7d-status': 'rejected',
+    'anthropic-ratelimit-unified-7d-utilization': '1.0',
+    'anthropic-ratelimit-unified-7d-reset': seconds(now + 3 * DAY),
+  };
+  for (const [label, headers, status] of [
+    ['weekly-rejection 429', rejection, 429],
+    ['the same set, status unknown', rejection, undefined],
+    ['verdict rejected on a 200 (served on overage)', { ...weeklyOnly(now), 'anthropic-ratelimit-unified-status': 'rejected' }, 200],
+    ['weekly status rejected alone', { ...weeklyOnly(now), 'anthropic-ratelimit-unified-7d-status': 'rejected' }, undefined],
+    ['a 429 whose window is allowed (a throttle)', weeklyOnly(now), 429],
+    ['a 5xx', weeklyOnly(now), 529],
+  ]) {
+    for (const start of [null, true]) {
+      const am = new AccountManager([oauth('a')], 0.98);
+      am.accounts[0].quota.sessionWindowStated = start;
+      am.updateQuota(0, headers, null, status);
+      assert.equal(am.accounts[0].quota.sessionWindowStated, start, `${label}, from ${start}`);
+    }
+  }
+  // The weekly reading itself still lands: only the shape inference is skipped.
+  const am = new AccountManager([oauth('a')], 0.98);
+  am.updateQuota(0, rejection, null, 429);
+  assert.equal(am.accounts[0].quota.unified7d, 1);
+
+  // And a 5-hour reading on a refusal still says the window is there.
+  const metered = new AccountManager([oauth('a')], 0.98);
+  metered.accounts[0].quota.sessionWindowStated = false;
+  metered.updateQuota(0, { ...rejection, 'anthropic-ratelimit-unified-5h-utilization': '0.3' }, null, 429);
+  assert.equal(metered.accounts[0].quota.sessionWindowStated, true);
+});
+
+// The server hands updateQuota the upstream status, so the rule above sees an
+// error even when its headers carry no rejection.
+test('server: only a served response records the fact from headers', async () => {
+  const { createProxyServer } = await import('../src/server.js');
+  const http = await import('node:http');
+  let answer = 400;
+  const upstream = http.createServer((req, res) => {
+    req.resume();
+    res.writeHead(answer, { 'content-type': 'application/json', ...weeklyOnly() });
+    res.end(answer === 200
+      ? '{"type":"message","content":[]}'
+      : '{"type":"error","error":{"type":"invalid_request_error","message":"bad"}}');
+  });
+  await new Promise(r => upstream.listen(0, '127.0.0.1', r));
+  const am = new AccountManager([oauth('a')], 0.98);
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstream.address().port}` });
+  await new Promise(r => proxy.listen(0, '127.0.0.1', r));
+  const log = console.log;
+  console.log = () => {};
+  const send = async () => {
+    const res = await fetch(`http://127.0.0.1:${proxy.address().port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'k' },
+      body: JSON.stringify({ model: 'claude-opus-5', max_tokens: 1, messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    await res.text();
+    return res.status;
+  };
+  try {
+    assert.equal(await send(), 400);
+    assert.equal(am.accounts[0].quota.unified7d, 0.4, 'the weekly reading still lands');
+    assert.equal(am.accounts[0].quota.sessionWindowStated, null, 'an error says nothing about the plan');
+    answer = 200;
+    assert.equal(await send(), 200);
+    assert.equal(am.accounts[0].quota.sessionWindowStated, false);
+  } finally {
+    console.log = log;
+    proxy.close();
+    proxy.closeAllConnections?.();
+    upstream.close();
+    upstream.closeAllConnections?.();
+  }
+});
+
 test('a five-hour reading coming back flips the fact back, from either path', () => {
   const headers = new AccountManager([oauth('a')], 0.98);
   headers.updateQuota(0, weeklyOnly());
