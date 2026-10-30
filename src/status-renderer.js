@@ -646,6 +646,35 @@ function adaptiveFor(status, name) {
   return rows.find(r => r && typeof r === 'object' && nameText(r.name) === name) || null;
 }
 
+// The Codex quota windows a Codex account's adaptive score can come from. Codex
+// has no Claude family buckets, so its row names the window instead.
+const CODEX_WINDOW_LABELS = /** @type {Record<string, string>} */ ({ unified7d: 'weekly', unified5h: '5h' });
+
+// What an adaptive row says its score is measured against. A Codex row names its
+// own window ("codex weekly"); every other row names the Claude bucket, as it
+// always has. A row with no provider is an Anthropic one, from an older server.
+/** @param {any} a */
+function adaptiveLabel(a) {
+  if (a.provider !== 'codex') return bucketLabel(a.bucket);
+  return `codex ${CODEX_WINDOW_LABELS[a.window] || 'window'}`;
+}
+
+// The plan segment. A Codex account has no Claude multiplier, so its row names
+// the ChatGPT plan it reported, or says the plan is unknown when none was.
+/**
+ * @param {any} a
+ * @param {any} paint
+ */
+function adaptivePlan(a, paint) {
+  if (a.provider === 'codex') {
+    const plan = typeof a.planType === 'string' ? safeLine(a.planType, 32) : '';
+    return plan ? `plan ${plan}` : paint.dim('plan unknown');
+  }
+  return a.planWeight == null
+    ? paint.dim('plan unknown')
+    : `plan ${Number.isFinite(a.planWeight) ? a.planWeight : '?'}x`;
+}
+
 // "next · weight 62%  ·  3 sess / 1 inflight  ·  head 38.0% of 98%  ·  plan 20x
 //  ·  conc 6"
 //
@@ -654,7 +683,7 @@ function adaptiveFor(status, name) {
 // misrepresenting the picker as a weighted random draw.
 function formatAdaptive(a, paint) {
   const parts = [];
-  const family = bucketLabel(a.bucket);
+  const family = adaptiveLabel(a);
   const prefix = a.next ? `${paint.green('next')} ${paint.dim('·')} ` : '';
   parts.push(a.weight == null
     // Every candidate scored zero: the whole tier is inside its reserve, so
@@ -664,9 +693,7 @@ function formatAdaptive(a, paint) {
     : `${prefix}${paint.bold(`weight ${pct(a.weight, 0)} of ${family}`)}`);
   parts.push(`${num(a.sessions)} sess / ${num(a.inFlight)} inflight`);
   parts.push(`head ${pct(a.headroom, 1)} of ${pct(a.threshold, 0)}`);
-  parts.push(a.planWeight == null
-    ? paint.dim('plan unknown')
-    : `plan ${Number.isFinite(a.planWeight) ? a.planWeight : '?'}x`);
+  parts.push(adaptivePlan(a, paint));
   parts.push(`conc ${num(a.concCap, 1)}`);
   const line = parts.join(paint.dim('  ·  '));
   return a.competing ? line : `${paint.dim('(not competing)')} ${line}`;
