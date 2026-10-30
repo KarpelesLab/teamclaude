@@ -4845,10 +4845,15 @@ export class AccountManager {
     // would read once its 5-hour limit is lifted (not yet captured live);
     // today an idle metered account reads 0% with no reset, which is a
     // reading. Only a payload that states the weekly window may say the
-    // session one is gone, so an error-shaped body proves nothing.
+    // session one is gone, so an error-shaped body proves nothing. Nor does
+    // one that still names the window without a reading: a `five_hour` reset,
+    // or a `session` entry in the `limits` list, is a partial reading, as a
+    // 5-hour reset header without its utilization is on the header path, and
+    // clearing on it could return a spent account to rotation.
+    const namesSession = usage.fiveHour?.resetAt != null || usage.sessionListed === true;
     noteSessionWindow(q, {
       session: usage.fiveHour?.utilization != null,
-      weekly: usage.sevenDay?.utilization != null,
+      weekly: usage.sevenDay?.utilization != null && !namesSession,
       clear: true,
     });
 

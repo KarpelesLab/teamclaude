@@ -76,6 +76,47 @@ test('a probe that states a weekly window and no five-hour one records it and cl
   }
 });
 
+// The probe names the session window in two places: `five_hour` and the
+// `limits` list's `session` entry (both in the captured payloads in
+// quota-probe.test.js and scoped-weekly.test.js). Either one naming it without
+// a utilization is a partial reading, the probe's counterpart of a response
+// carrying a 5-hour reset with no utilization, not an absence: clearing on it
+// could put a spent account back in rotation.
+test('a probe that names the five-hour window without a reading concludes nothing', () => {
+  const sessionEntry = { kind: 'session', group: 'session', percent: 99, scope: null };
+  const weeklyEntry = { kind: 'weekly_all', group: 'weekly', percent: 40, scope: null };
+  for (const [label, payload] of [
+    ['five_hour with a reset and no utilization',
+      { five_hour: { utilization: null, resets_at: new Date(Date.now() + HOUR).toISOString() }, seven_day: week() }],
+    ['five_hour null, limits lists a session entry',
+      { five_hour: null, seven_day: week(), limits: [sessionEntry, weeklyEntry] }],
+    ['five_hour omitted, limits lists a session entry without a percent',
+      { seven_day: week(), limits: [{ ...sessionEntry, percent: null }, weeklyEntry] }],
+  ]) {
+    const am = new AccountManager([oauth('a')], 0.98);
+    const q = am.accounts[0].quota;
+    const before = staleSession();
+    Object.assign(q, before);
+    am.applyUsageData(0, normalizeUsagePayload(payload));
+    assert.equal(q.sessionWindowStated, true, label);
+    assert.equal(q.unified5h, before.unified5h, label);
+    assert.equal(q.unified5hSeenAt, before.unified5hSeenAt, label);
+    assert.notEqual(q.unified5hReset, null, label);
+    assert.equal(q.unified7d, 0.4, `${label}: the weekly reading still lands`);
+    assert.equal(am.unavailableReason(am.accounts[0]), 'quota', `${label}: the spent reading still gates`);
+  }
+
+  // A list that names no session entry beside a missing five_hour is the
+  // whole payload agreeing: the window is gone.
+  const am = new AccountManager([oauth('a')], 0.98);
+  const q = am.accounts[0].quota;
+  Object.assign(q, staleSession());
+  am.applyUsageData(0, normalizeUsagePayload({ five_hour: null, seven_day: week(), limits: [weeklyEntry] }));
+  assert.equal(q.sessionWindowStated, false);
+  assert.equal(q.unified5h, null);
+  assert.equal(q.unified5hReset, null);
+});
+
 test('a probe that reads a five-hour window says so, the idle shape included', () => {
   const am = new AccountManager([oauth('a')], 0.98);
   const q = am.accounts[0].quota;

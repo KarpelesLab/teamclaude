@@ -589,7 +589,8 @@ export function normalizeUsageBucket(bucket) {
  * utilization WITHOUT spending message quota, which is what makes it safe to
  * poll. Returns normalized { fiveHour, sevenDay, sevenDaySonnet, sevenDayFable } buckets
  * plus scopedWeeklyListed (whether the payload enumerated its model-scoped
- * weekly caps), or { error, status } on failure.
+ * weekly caps) and sessionListed (whether that enumeration names a session
+ * limit), or { error, status } on failure.
  * @param {string} accessToken
  * @param {import('./account-routing.js').RoutingProxy|null} [routing] - the account's own egress proxy
  * @param {{ fetchImpl?: Function }} [opts]
@@ -650,6 +651,12 @@ export function normalizeUsagePayload(data) {
     // caps and that family was not among them. Without the list, a missing
     // family is our own ignorance and nothing may be concluded from it.
     scopedWeeklyListed: Array.isArray(data?.limits),
+    // Whether the `limits` enumeration names a session (5-hour) limit, beside
+    // `five_hour`. Only presence is read: the captured entries carry a percent
+    // and no reset, and `five_hour` stays the reading. A plan whose 5-hour
+    // window is gone must be absent from both before a probe may say so (see
+    // applyUsageData).
+    sessionListed: Array.isArray(data?.limits) && data.limits.some((/** @type {any} */ l) => l?.kind === 'session'),
     // Banked usage-limit resets (the claude.ai "Resets" offer), in the same
     // shape the Codex probe reports its free reset credits, so the status
     // line, the TUI tag and the dashboard badge read both without knowing
