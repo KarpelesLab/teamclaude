@@ -554,8 +554,18 @@ export function unavailableLine(account, paint) {
   // An account serving as the extra-usage fallback reads as out of quota like
   // any other, yet is taking traffic and billing for it. Say so on the line
   // that would otherwise tell the operator it is idle.
-  if (account.onExtraUsage) {
+  const fallback = account.fallbackTier === 'free' || account.fallbackTier === 'paid';
+  if (account.onExtraUsage && !fallback) {
     return `${paint.dim('Blocked'.padEnd(8))} ${paint.yellow(text)} ${paint.red('\u2014 serving on extra usage (paid overage), billing')}`;
+  }
+  if (account.onExtraUsage) {
+    return `${paint.dim('Usage'.padEnd(8))} ${paint.red('serving on extra usage (paid overage), billing')}`;
+  }
+  if (fallback) {
+    const capacity = account.fallbackTier === 'free'
+      ? 'included quota available past switch threshold'
+      : 'subscription usage credits available';
+    return `${paint.dim('Fallback'.padEnd(8))} ${paint.yellow(capacity)} (fallback after normal rotation)`;
   }
   return `${paint.dim('Blocked'.padEnd(8))} ${paint.yellow(text)}`;
 }
