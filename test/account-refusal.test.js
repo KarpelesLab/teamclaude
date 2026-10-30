@@ -185,7 +185,8 @@ for (const size of [0, 1024 * 1024]) {
 
 test('requests queued on an account fail over once another request finds it refused', async () => {
   const am = new AccountManager(accounts(), 0.98, {
-    ramp: { enabled: true, startConc: 1, stepConc: 1, stepMs: 1000, windowMs: 30_000, pollMs: 5 },
+    // A cap that cannot step during the test, however slow the first request.
+    ramp: { enabled: true, startConc: 1, stepConc: 1, stepMs: 3_600_000, windowMs: 3_600_000, pollMs: 5 },
   });
   am.accounts[0].rampStartedAt = Date.now();
   const body = errorBody('permission_error', KYC_MESSAGE, 'verification_required');
@@ -319,6 +320,14 @@ test('status prints the refusal in upstream\'s words and how to bring the accoun
   assert.ok(line.includes(`refused by upstream: ${HOLD_MESSAGE}`), line);
   assert.match(line, /run: teamclaude login/);
   assert.doesNotMatch(line, /needs a re-login/);
+});
+
+test('switch names the refusal, not a re-login, for a refused account', () => {
+  const am = new AccountManager(accounts(), 0.98);
+  am.markRefused(am.accounts[0], { code: 'account_on_hold', message: HOLD_MESSAGE, link: 'https://claude.ai/restricted' });
+  assert.deepEqual(am.eligibility(0), { eligible: false, reason: 'refused by upstream' });
+  am.accounts[1].status = 'error';
+  assert.deepEqual(am.eligibility(1), { eligible: false, reason: 'in an error state and needs a re-login' });
 });
 
 // A cap or a cooldown can outrank `error` in `unavailable`; the refusal is

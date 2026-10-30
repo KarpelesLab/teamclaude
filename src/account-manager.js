@@ -2738,7 +2738,7 @@ export class AccountManager {
     // are only consulted once it has actually said no.
     if (!this._isAvailable(account)) {
       if (account.disabled) return { eligible: false, reason: 'disabled' };
-      if (account.status === 'error') return { eligible: false, reason: 'in an error state and needs a re-login' };
+      if (account.status === 'error') return { eligible: false, reason: isRefused(account) ? 'refused by upstream' : 'in an error state and needs a re-login' };
       if (account.status === 'exhausted') return { eligible: false, reason: 'out of quota' };
       if (account.status === 'throttled') return { eligible: false, reason: 'rate-limited' };
       return { eligible: false, reason: 'at or above the switch threshold' };
