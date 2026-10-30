@@ -127,8 +127,11 @@ function aggregateBucket(accounts, key) {
 }
 
 // The weighted capacity the fiveHour aggregate leaves out because the window
-// does not apply to it: an account whose plan meters no 5-hour window (an
-// Ultra plan once Anthropic lifts it, some Codex plans) and holds no reading.
+// does not apply to it: an account with a tier weight whose plan meters no
+// 5-hour window (an Ultra plan once Anthropic lifts it) and holds no reading.
+// A Codex plan with no 5-hour window is never counted: a Codex account has no
+// Claude tier, so its weight is null and it is in neither the aggregate nor
+// this count.
 // One still holding a reading from before the change is counted in the
 // aggregate instead, since that reading still gates it. Without this a
 // consumer cannot tell "the fleet's session quota is nearly spent" from "most
