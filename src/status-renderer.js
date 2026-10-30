@@ -156,6 +156,7 @@ export const UNAVAILABLE_TEXT = {
   'advisor-capped': "advisor model's usage cap reached (maxUsage)",
   entitlement: 'upstream refused this account for the organization (cooldown)',
   routing: "the account's routing proxy is unreachable (cooldown)",
+  billing: 'upstream billing refused usage (cooldown); check billing or purchase credits',
   credential: 'upstream rejected its API key with a 401 (cooldown, then retried)',
   route: 'no route allows this account',
   'advisor-quota': "advisor model's weekly bucket spent",
