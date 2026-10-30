@@ -403,10 +403,13 @@ function usableClientKeys(clientKeys) {
       const name = typeof entry?.name === 'string' ? entry.name.trim() : '';
       if (!name || !entry?.key) {
         console.error('[TeamClaude] proxy.clientKeys: an entry without a name and a key is ignored (usage is attributed by name)');
-      } else if (!knownClientKeyScope(entry.scope)) {
-        console.error(`[TeamClaude] proxy.clientKeys: "${name}" has an unrecognised scope and is treated as inference-only; use "inference", "full", or leave scope out`);
-      } else if (seen.has(name)) {
-        console.error(`[TeamClaude] proxy.clientKeys: duplicate name "${name}" — its keys share one usage counter`);
+      } else {
+        if (!knownClientKeyScope(entry.scope)) {
+          console.error(`[TeamClaude] proxy.clientKeys: "${name}" has an unrecognised scope and is treated as inference-only; use "inference", "full", or leave scope out`);
+        }
+        if (seen.has(name)) {
+          console.error(`[TeamClaude] proxy.clientKeys: duplicate name "${name}" — its keys share one usage counter`);
+        }
       }
       seen.add(name);
     }
