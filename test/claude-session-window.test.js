@@ -61,7 +61,9 @@ test('a probe that states a weekly window and no five-hour one records it and cl
   ]) {
     const am = new AccountManager([oauth('a')], 0.98);
     const q = am.accounts[0].quota;
-    Object.assign(q, staleSession());
+    // The spent reading came with upstream's `rejected` verdict, as a 5-hour
+    // rejection does.
+    Object.assign(q, staleSession(), { unifiedStatus: 'rejected', unifiedStatusSeenAt: Date.now() - 60_000 });
     assert.equal(am.unavailableReason(am.accounts[0]), 'quota', `${label}: the old reading gates`);
 
     am.applyUsageData(0, normalizeUsagePayload(payload));
@@ -72,8 +74,31 @@ test('a probe that states a weekly window and no five-hour one records it and cl
     assert.equal(q.unified5hSeenAt, null, `${label}: no reading, no age`);
     assert.equal(q.unified7d, 0.4, label);
     assert.equal(q.weeklyWindowStated, true, label);
+    assert.equal(q.unifiedStatus, null, `${label}: the 5-hour rejection goes with its reading`);
     assert.equal(am.unavailableReason(am.accounts[0]), null, `${label}: nothing is left to gate on`);
   }
+});
+
+// A rejection the weekly window still explains is not the 5-hour reading's,
+// so the probe clearing that reading leaves the verdict for its own expiry.
+test('a probe clearing the session reading keeps a rejection a spent window still explains', () => {
+  for (const [label, seven_day, extra] of [
+    ['shared weekly at its threshold', { ...week(), utilization: 99 }, {}],
+    ['Fable weekly at its threshold', week(), { unified7dFable: 0.99, unified7dFableReset: Date.now() + DAY, unified7dFableSeenAt: Date.now() }],
+  ]) {
+    const am = new AccountManager([oauth('a')], 0.98);
+    const q = am.accounts[0].quota;
+    Object.assign(q, staleSession(), extra, { unifiedStatus: 'rejected', unifiedStatusSeenAt: Date.now() - 60_000 });
+    am.applyUsageData(0, normalizeUsagePayload({ five_hour: null, seven_day }));
+    assert.equal(q.unified5h, null, label);
+    assert.equal(q.unifiedStatus, 'rejected', label);
+  }
+  // A verdict other than `rejected` is never touched.
+  const am = new AccountManager([oauth('a')], 0.98);
+  const q = am.accounts[0].quota;
+  Object.assign(q, staleSession(), { unifiedStatus: 'allowed_warning', unifiedStatusSeenAt: Date.now() - 60_000 });
+  am.applyUsageData(0, normalizeUsagePayload({ five_hour: null, seven_day: week() }));
+  assert.equal(q.unifiedStatus, 'allowed_warning');
 });
 
 // The probe names the session window in two places: `five_hour` and the

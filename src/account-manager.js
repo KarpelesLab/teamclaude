@@ -208,18 +208,29 @@ const CAPPED_FAMILY_HOLD_MS = 7 * 24 * 3600_000;
  * its reset. One response's headers are weaker evidence of absence than the
  * whole usage payload, so the header paths leave the reading alone.
  *
- * @param {{sessionWindowStated: boolean|null, unified5h: number|null, unified5hReset: number|null, unified5hSeenAt: number|null}} q
- * @param {{session: boolean, weekly: boolean, clear?: boolean}} stated
+ * A stored `rejected` verdict goes with a reading cleared that way, unless
+ * `rejectionExplained` says a window still present (a spent weekly) accounts
+ * for it. The verdict describes the shared windows, and once the session one
+ * is gone nothing else would clear it before it went stale: the expiry sweep
+ * that drops it with an expiring reading has no reading left to expire.
+ *
+ * @param {{sessionWindowStated: boolean|null, unified5h: number|null, unified5hReset: number|null, unified5hSeenAt: number|null, unifiedStatus?: string|null, unifiedStatusSeenAt?: number|null}} q
+ * @param {{session: boolean, weekly: boolean, clear?: boolean, rejectionExplained?: boolean}} stated
  */
-function noteSessionWindow(q, { session, weekly, clear = false }) {
+function noteSessionWindow(q, { session, weekly, clear = false, rejectionExplained = false }) {
   if (session) {
     q.sessionWindowStated = true;
   } else if (weekly) {
     q.sessionWindowStated = false;
     if (clear) {
+      const hadReading = q.unified5h != null || q.unified5hReset != null;
       q.unified5h = null;
       q.unified5hReset = null;
       q.unified5hSeenAt = null;
+      if (hadReading && q.unifiedStatus === 'rejected' && !rejectionExplained) {
+        q.unifiedStatus = null;
+        q.unifiedStatusSeenAt = null;
+      }
     }
   }
 }
@@ -4855,6 +4866,7 @@ export class AccountManager {
       session: usage.fiveHour?.utilization != null,
       weekly: usage.sevenDay?.utilization != null && !namesSession,
       clear: true,
+      rejectionExplained: this._weeklyExplainsRejection(account),
     });
 
     // The family buckets carry a "last confirmed" stamp (see _clearExpiredQuotas).
@@ -5037,6 +5049,20 @@ export class AccountManager {
     account.rateLimitedUntil = null;
     account.throttledAt = null;
     console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" revalidated — rate limit no longer applies, back in rotation`);
+  }
+
+  /**
+   * Whether a weekly reading still on the account is at its switch threshold,
+   * and so could be what a stored `rejected` verdict is about: the shared
+   * weekly, or a family bucket (a family-cap 429 that named no shared status
+   * stores `rejected` too). Read when a probe clears a session reading on a
+   * plan with no session window (see noteSessionWindow).
+   * @param {any} account
+   */
+  _weeklyExplainsRejection(account) {
+    const q = account.quota;
+    return ['unified7d', 'unified7dSonnet', 'unified7dFable']
+      .some(key => q[key] != null && q[key] >= this.thresholdFor(key, account));
   }
 
   /**
