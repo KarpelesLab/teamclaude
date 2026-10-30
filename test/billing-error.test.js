@@ -12,7 +12,7 @@ const LOW_CREDIT = {
     message: 'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.',
   },
 };
-const apikey = name => ({ name, type: 'apikey', apiKey: `key-${name}`, priority: 100 });
+const apikey = name => ({ name, type: 'apikey', apiKey: `key-${name}`, priority: -1 });
 const subscription = {
   name: 'subscription', type: 'oauth', accessToken: 'subscription-token',
   expiresAt: Date.now() + 3600_000, allowExtraUsage: true,

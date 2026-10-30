@@ -371,11 +371,6 @@ function makeAccount(acct, index, listener = null) {
     // PREFERENCE like the fleet setting, not the hard cap maxUsage is. See
     // thresholdFor() for the resolution order.
     switchThreshold: accountSwitchThreshold(acct),
-    // Opt-in: this account has Anthropic "extra usage" (paid overage) turned on
-    // upstream, and the operator allows the proxy to lean on it once every
-    // account is past its quota. Strictly `true`, so a stray truthy value in a
-    // hand-edited config cannot start billing, and Anthropic OAuth logins only
-    // (see accountAllowsExtraUsage). See _pickFallback.
     allowExtraUsage: accountAllowsExtraUsage(acct),
     // This account's own egress proxy, parsed (accounts[].routing). Every
     // socket opened for the account tunnels through it — request forwarding,
@@ -915,6 +910,27 @@ export class AccountManager {
     return true;
   }
 
+  /** @param {Set<number>|null} exclude
+   * @param {string|null} model
+   * @param {string|null} advisorModel
+   * @param {string} provider
+   * @returns {Set<number>|null} */
+  _preferredExtraUsage(exclude, model, advisorModel, provider) {
+    const reachable = this.accounts.filter(a => !exclude?.has(a.index) && canServeProvider(a, provider));
+    const pinned = this._pinnedAccountForModel(model, advisorModel);
+    if (pinned && reachable.includes(pinned) && this._isAvailable(pinned, model, advisorModel)) return null;
+    const normal = reachable.filter(a => this._isAvailable(a, model, advisorModel));
+    if (!normal.length || normal.some(isSubscriptionAccount)) return null;
+    const permitted = reachable.filter(a => a.allowExtraUsage && this.fallbackTier(a, model, advisorModel));
+    if (!permitted.length) return null;
+    const free = permitted.filter(a => this.fallbackTier(a, model, advisorModel) === 'free');
+    const candidates = free.length ? free : permitted;
+    const priority = Math.min(...candidates.map(a => a.priority || 0));
+    if (normal.some(a => (a.priority || 0) < priority)) return null;
+    const selected = new Set(candidates.map(a => a.index));
+    return new Set(this.accounts.filter(a => !selected.has(a.index)).map(a => a.index));
+  }
+
   /** Max concurrent upstream requests allowed to `account` right now. Infinity
    * once the ramp window has elapsed (or ramping is off / never started). */
   _rampCap(account, now = Date.now()) {
@@ -1208,7 +1224,10 @@ export class AccountManager {
       // shrink both sets, so its counts describe that request and not the fleet.
       const first = !(/** @type {Set<number>|null} */ (exclude)?.size);
       routedAdvisor = this._advisorForSelection(excluded, model, advisorModel, first);
-      account = this._pickActiveAccount(excluded, model, routedAdvisor, sessionId);
+      const extra = this._preferredExtraUsage(excluded, model, routedAdvisor, provider);
+      account = extra
+        ? this._selectFallback(extra, model, routedAdvisor, true)
+        : this._pickActiveAccount(excluded, model, routedAdvisor, sessionId);
     } finally {
       this._selectingProvider = null;
       this._selectionDecision = null;
@@ -1292,7 +1311,10 @@ export class AccountManager {
     const parked = idx != null ? this.accounts[idx] : null;
     if (!parked || this._isAvailable(parked)) return;
     if (!parked.allowExtraUsage && ![...this._extraUsage.values()].some(e => e.account === parked)) return;
-    const best = /** @type {Record<string, any>|null} */ (this._pickBestAvailable(this._excludeOtherProviders(null, provider), null));
+    const partition = this._excludeOtherProviders(null, provider);
+    const extra = this._preferredExtraUsage(partition, null, null, provider);
+    if (extra && !extra.has(parked.index)) return;
+    const best = /** @type {Record<string, any>|null} */ (this._pickBestAvailable(partition, null));
     if (!best) return;
     // The shared slot is this provider's only when it names one of its own
     // accounts; otherwise the provider's cursor is its own entry, and moving
@@ -1368,6 +1390,10 @@ export class AccountManager {
       console.log(paid
         ? `[TeamClaude] Failover hop onto "${name}" on extra usage (paid overage)${where}`
         : `[TeamClaude] Failover hop onto "${name}" — past its switch threshold, but with free quota left${where}`);
+    } else if (this.accounts.some(a => a.type === 'apikey' && this._isAvailable(a, model))) {
+      console.log(paid
+        ? `[TeamClaude] Routing to "${name}" on extra usage (paid overage)${where}`
+        : `[TeamClaude] Routing to "${name}" on included quota past its switch threshold${where}`);
     } else {
       console.log(paid
         ? `[TeamClaude] No account has quota left${where} — routing to "${name}" on extra usage (paid overage)`
@@ -1397,13 +1423,9 @@ export class AccountManager {
   }
 
   /**
-   * End every episode whose scope no longer needs the fallback: its account
-   * left the fleet, or some account in its partition — the fallback account
-   * itself after its window reset, or any other — can serve the scope's model
-   * under the normal rules again. Run from every status read as well as every
-   * selection: an episode used to end only when a later request for the SAME
-   * scope walked past it, so a paid account whose window had reset kept its
-   * "billing" mark until traffic for that model happened to return.
+   * End episodes when their account loses eligible capacity or normal routing
+   * takes precedence. Status reads run the same check as selection so an idle
+   * account's billing indicator reflects quota recovery and priority changes.
    */
   _sweepFallback() {
     for (const [scope, e] of [...this._extraUsage.entries()]) {
@@ -1413,6 +1435,8 @@ export class AccountManager {
         continue;
       }
       const partition = this._excludeOtherProviders(null, e.provider);
+      const extra = this._preferredExtraUsage(partition, e.model, null, e.provider);
+      if (extra && !extra.has(e.account.index)) continue;
       if (this.accounts.some(a => !partition?.has(a.index) && this._isAvailable(a, e.model))) {
         this._endFallback(scope, 'Quota headroom is back');
       }
@@ -1448,9 +1472,11 @@ export class AccountManager {
     // this one request and not the fleet.
     const reach = advisorModel && this.advisorEligibility === 'prefer'
       ? this._advisorReach(excluded, model, advisorModel) : null;
-    const normal = this._pickBestAvailable(excluded, model, reach && reach.eligible < reach.of ? null : advisorModel);
+    const selectedAdvisor = reach && reach.eligible < reach.of ? null : advisorModel;
+    const extra = this._preferredExtraUsage(excluded, model, selectedAdvisor, provider);
+    const normal = this._pickBestAvailable(extra ?? excluded, model, selectedAdvisor);
     if (normal) return normal;
-    const pick = this._pickFallback(excluded, model, provider, reach && reach.eligible < reach.of ? null : advisorModel);
+    const pick = this._pickFallback(extra ?? excluded, model, provider, selectedAdvisor, !!extra);
     if (!pick) return null;
     // A paid hop must not bill silently, yet it is still a detour: no cursor,
     // no ramp. So it only records the scope's episode — bookkeeping that feeds
@@ -2302,6 +2328,8 @@ export class AccountManager {
    */
   previewRouteIndex(model, provider = DEFAULT_PROVIDER) {
     const excluded = this._excludeOtherProviders(null, provider);
+    const extra = this._preferredExtraUsage(excluded, model, null, provider);
+    if (extra) return this._pickFallback(extra, model, provider, null, true)?.account.index ?? null;
     const allowed = account => account && !excluded?.has(account.index);
     const pinned = this._pinnedAccountForModel(model);
     if (allowed(pinned) && this._isAvailable(pinned, model)) return pinned.index;
@@ -2542,24 +2570,13 @@ export class AccountManager {
   }
 
   /**
-   * The fallback as a selection: pick through _pickFallback, then make it
-   * where the fleet rests, as the probe does, and announce the switch.
-   *
-   * The cursor follows so status and the TUI name the account actually serving;
-   * it cannot trap the fleet there, because an account past its threshold is
-   * never `_isAvailable`, so every later request walks past it and takes any
-   * normal account the moment one has headroom again. Not moved when the
-   * current account is barred for this model only (#276): a spent Fable bucket
-   * should divert Fable onto the fallback account, not the Opus traffic with it.
-   *
-   * Per scope, so a request for a model with headroom elsewhere neither ends
-   * nor restarts this one. A switch within the scope — another account, or the
-   * same one stepping from free quota onto paid — is announced and ramped like
-   * any switch (see _noteFallback).
+   * Select capacity past a switch threshold and record its routing episode.
+   * A model-specific diversion must keep the default route's current account;
+   * other selections update the cursor and start the account's ramp.
    */
-  _selectFallback(exclude = null, model = null, advisorModel = null) {
+  _selectFallback(exclude = null, model = null, advisorModel = null, preferExtraUsage = false) {
     const provider = this._selectingProvider ?? DEFAULT_PROVIDER;
-    const pick = this._pickFallback(exclude, model, provider, advisorModel);
+    const pick = this._pickFallback(exclude, model, provider, advisorModel, preferExtraUsage);
     if (!pick) return null;
     if (!this._currentBarredOnlyFor(model, null, exclude)) this._setCurrent(pick.account);
     if (this._noteFallback(this._cursorKey(model, null, provider), pick, model, false)) this._beginRamp(pick.account);
@@ -2574,52 +2591,20 @@ export class AccountManager {
   }
 
   /**
-   * What serves `model` when nothing can under the normal rules, as
-   * `{ account, paid }`, or null. Moves nothing and logs nothing, so
-   * pickAlternate can share it (#286).
-   *
-   * Two tiers, and free quota strictly first. "Available" means under the
-   * switch threshold, and the threshold is a rotation PREFERENCE — per bucket,
-   * and per account since #409 — so an account between it and 100% is refused
-   * by the walk yet still holds quota the operator already pays for. The best
-   * such account serves before any money moves, opted in or not; a paid pick
-   * happens only once every account that could serve at all is at 100% or
-   * carries upstream's own `rejected` verdict. Gating on availability alone
-   * (as this first did) ran a paid account into overage under a
-   * `unified7d: 0.85` threshold while a free one held 15% unused.
-   *
-   * Gated on the fleet, not the request's `exclude`: it answers only once no
-   * account in the provider's partition is available at all. That matters for
-   * the failover hops: a per-minute 429 pauses an account without making it
-   * unavailable, and a hop off it must wait the pause out as it does today,
-   * not spend quota — free or paid — to save a few seconds. And a fleet with no
-   * opted-in account pays nothing for this feature in either tier: it keeps
-   * answering 429 past the threshold as it always did.
-   *
-   * Only the SOFT refusals are overridden — `quota` (the switch threshold, a
-   * spent family bucket included) and, for the paid tier, `upstream-rejected`
-   * (a remembered verdict) — because those are exactly what free headroom or
-   * overage lets an account serve past. Every hard gate still binds, and
-   * unavailableReason reports those first: disabled, the operator's `maxUsage`
-   * cap, an entitlement cooldown, a live 429 hold (upstream actually refusing,
-   * overage or not), error. Such an account is neither used nor waited for: it
-   * counts as unable to serve, so the tiers are chosen among the rest. Route
-   * ownership is checked separately because unavailableReason reaches it only
-   * after `quota`. A paid candidate whose usage probe has positively said
-   * overage is off (`spend.enabled === false`) is skipped — it would only 429;
-   * unknown spend is left for upstream to decide.
-   *
-   * Within a tier, the same order the probe uses: priority, then the least
-   * utilized — the most free quota left, or the least deep into overage and
-   * the likeliest to be the first back under its limit.
+   * Select capacity past switch thresholds without moving routing cursors.
+   * The exhausted-pool path checks the whole provider partition, including
+   * accounts excluded only from this request. A per-minute pause must not
+   * trigger paid failover while its account remains normally eligible.
+   * `preferExtraUsage` applies only to exclusions from _preferredExtraUsage,
+   * which has already checked subscription capacity and API priorities.
    *
    * @param {Set<number>|null} [exclude]
    * @returns {{ account: Record<string, any>, paid: boolean } | null}
    */
-  _pickFallback(exclude = null, model = null, provider = DEFAULT_PROVIDER, advisorModel = null) {
+  _pickFallback(exclude = null, model = null, provider = DEFAULT_PROVIDER, advisorModel = null, preferExtraUsage = false) {
     if (!this.accounts.some(a => a.allowExtraUsage)) return null;
     const partition = this._excludeOtherProviders(null, provider);
-    if (this.accounts.some(a => !partition?.has(a.index) && this._isAvailable(a, model))) return null;
+    if (this.accounts.some(a => !partition?.has(a.index) && (!preferExtraUsage || !exclude?.has(a.index)) && this._isAvailable(a, model))) return null;
 
     /** @type {Record<string, any>|null} */ let free = null;
     /** @type {Record<string, any>|null} */ let paid = null;
@@ -2643,7 +2628,7 @@ export class AccountManager {
     return paid ? { account: paid, paid: true } : null;
   }
 
-  /** Capacity available to fallback selection after normal rotation fails.
+  /** Capacity available past the account's normal switch threshold.
    * @param {Record<string, any>} account
    * @param {string|null} [model]
    * @param {string|null} [advisorModel]
@@ -2660,6 +2645,9 @@ export class AccountManager {
     return 'paid';
   }
 
+  /** @param {Record<string, any>|undefined} account
+   * @param {string|null} [model]
+   * @param {string|null} [advisorModel] */
   _isAvailable(account, model = null, advisorModel = null) {
     return this.unavailableReason(account, model, advisorModel) === null;
   }
@@ -2674,7 +2662,7 @@ export class AccountManager {
    * Returns one of: 'disabled', 'spend-capped', 'capped', 'throttled', 'error',
    * 'entitlement', 'exhausted', 'upstream-rejected', 'quota', 'route', 'routing',
    * 'credential', 'billing', 'advisor-capped', 'advisor-quota', 'advisor-route'.
-   * @param {Record<string, any>} account
+   * @param {Record<string, any>|undefined} account
    * @param {string|null} [model]
    * @param {string|null} [advisorModel]
    */
@@ -2781,6 +2769,12 @@ export class AccountManager {
     if (!account) return { eligible: false, reason: 'no such account' };
     // _isAvailable also clears an expired throttle, so the specific reasons below
     // are only consulted once it has actually said no.
+    const extra = this._preferredExtraUsage(null, null, null, providerOf(account));
+    if (extra) {
+      const pick = this._pickFallback(extra, null, providerOf(account), null, true);
+      return pick?.account === account ? { eligible: true }
+        : { eligible: false, reason: `outranked by subscription "${pick?.account.name}" with extra usage allowed` };
+    }
     if (!this._isAvailable(account)) {
       if (account.disabled) return { eligible: false, reason: 'disabled' };
       if (account.status === 'error') return { eligible: false, reason: 'in an error state and needs a re-login' };
@@ -3782,7 +3776,9 @@ export class AccountManager {
    * pin wins, else an auto fable/sonnet family pin (only when no configured route
    * covers the model). For an advisor request the executor's pin wins (it is the
    * bulk of the spend); the advisor model's pin applies only when nothing pins
-   * the executor. Returns null when nothing is pinned for this model. */
+   * the executor. Returns null when nothing is pinned for this model.
+   * @param {string|null} model
+   * @param {string|null} [advisorModel] */
   _pinnedAccountForModel(model, advisorModel = null) {
     return this._pinnedFor(model)
       || (advisorModel ? this._pinnedFor(advisorModel) : null);
