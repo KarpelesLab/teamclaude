@@ -36,6 +36,8 @@ The **Quota probe** row on the TUI settings screen (`g`) does the same thing, an
 
 It reads each OAuth account's utilization from its provider's read-only usage endpoint, which reports quota **without consuming any message quota**. Anthropic accounts use `/api/oauth/usage`; Codex accounts use ChatGPT's internal `/backend-api/wham/usage` endpoint and require their `ChatGPT-Account-Id`. API-key and third-party accounts are skipped. The Codex endpoint is not part of the public OpenAI API and may change without notice. Minimum interval is 30s. Changing it takes effect on a running server immediately.
 
+Disabled accounts are skipped by default. Set [`probeDisabledAccounts`](configuration.md) to `true` (or **g** → Probe disabled in the TUI) to keep their quota fresh too. The probe then refreshes a disabled account's OAuth token when it is due, as it does for any other account.
+
 The probe is also the only source for the **Sonnet 7-day** bucket, when your plan exposes it. The Fable weekly bucket arrives passively in the response headers (`anthropic-ratelimit-unified-7d_oi-*`), so Fable-aware routing works without turning the probe on. Both families are read from the payload's `limits[]`, where upstream enumerates the model-scoped weekly caps an account actually has.
 
 It is likewise the only source for Claude's [banked usage-limit resets](accounts.md#claude-banked-usage-limit-resets), read from the same call.
@@ -123,7 +125,7 @@ teamclaude warmup off                                      # disable either mode
 teamclaude warmup                                          # show current setting
 ```
 
-> ⚠️ **This spends a little quota — unlike the passive quota probe.** The 5h timer can't be started by a read-only call, so keep-warm sends a real (minimal) message: for each eligible idle account it spawns a one-shot `claude -p --bare --model haiku --output-format text "hi"` pointed at this proxy, pinned to that account. It only warms accounts whose 5h window is **not already running**, skips disabled/throttled/errored, third-party-backend and Codex accounts, and uses the cheapest model — but it does consume a few tokens and a slice of the 5h/weekly buckets per account per window. Requires the `claude` CLI on `PATH`. Minimum interval 60s; changes apply live. Status shows under `warm` in `teamclaude status --json`.
+> ⚠️ **This spends a little quota — unlike the passive quota probe.** The 5h timer can't be started by a read-only call, so keep-warm sends a real (minimal) message: for each eligible idle account it spawns a one-shot `claude -p --bare --model haiku --output-format text "hi"` pointed at this proxy, pinned to that account. It only warms accounts whose 5h window is **not already running**, skips disabled/throttled/errored, third-party-backend and Codex accounts, and uses the cheapest model — but it does consume a few tokens and a slice of the 5h/weekly buckets per account per window. It looks for the `claude` CLI on `PATH`, then in `~/.local/bin`, which is where the native installer puts it. A proxy already running as a service finds that binary without another `service install`. Minimum interval 60s; changes apply live. Status shows under `warm` in `teamclaude status --json`.
 
 Reset mode stores the target wall time and IANA timezone in the config, then subtracts Anthropic's fixed five-hour window to find each warm-up. It recalculates the next calendar occurrence after startup, config reload, and every run, so daylight-saving changes do not drift the schedule. It follows cron semantics: if TeamClaude was stopped at the scheduled time, that run is skipped and the server waits for the next future occurrence. The CLI confirmation prints the resolved local time, UTC time, timezone offset, and next occurrence.
 
@@ -331,6 +333,8 @@ Provider support lives entirely in `src/backend-quota.js`, matched by the host o
 ## Hold on exhaustion
 
 By default, when all accounts are exhausted TeamClaude returns a `429` immediately, which causes Claude Code to abort the current task. With `holdSeconds` set, the proxy **holds the HTTP connection open** instead and polls silently every ~60 seconds; the instant any account's quota resets, the request is forwarded and Claude Code resumes — the interruption never happens.
+
+The refusal is still a `rate_limit_error` with the same message and `retry-after` header. Its body also carries `error.details`, so a client or a monitoring system can tell it from an upstream rate limit without reading the sentence. `error_code` is `pool_exhausted` when eligible accounts exist but are blocked, and `no_eligible_account` when none can serve the request at all (a configuration problem, not exhaustion). `retry_after_seconds` matches the header. `resets_at` is the ISO-8601 time the blocking window actually lifts, or `null` when no reset is known: a dead credential, an untimed block, or no eligible account.
 
 Set it in the config file (`~/.config/teamclaude.json`):
 
