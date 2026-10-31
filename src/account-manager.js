@@ -81,6 +81,7 @@ const MAX_RECENT_MODELS = 8;
 // members to serve, then re-admit it so an administrator's policy change is
 // discovered without a restart.
 const ENTITLEMENT_DENIAL_COOLDOWN_SECONDS = 5 * 60;
+const BILLING_REJECTION_COOLDOWN_MS = 5 * 60_000;
 // An account whose OWN routing proxy cannot be reached is no use until the
 // proxy answers again, and asking costs up to the 30s connect budget per
 // request when the proxy is black-holed rather than refusing. Short, because
@@ -458,6 +459,7 @@ function makeAccount(acct, index, listener = null) {
     // that is not an error resets it.
     credentialRejectedUntil: /** @type {number|null} */ (null),
     credentialRejections: 0,
+    billingRejectedUntil: /** @type {number|null} */ (null),
     // Storm control (see admit/release): in-flight upstream requests and the
     // time this account last became the current one (starts a ramp window).
     inFlight: 0,
@@ -1198,6 +1200,32 @@ export class AccountManager {
     if (!account) return;
     account.credentialRejectedUntil = null;
     account.credentialRejections = 0;
+  }
+
+  /** Temporarily exclude an account whose upstream billing refused a request.
+   * @param {number} index */
+  markBillingRejected(index) {
+    const account = this.accounts[index];
+    if (!account) return;
+    account.billingRejectedUntil = Date.now() + BILLING_REJECTION_COOLDOWN_MS;
+    console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}": upstream billing refused usage; check billing or purchase credits. Retrying after five minutes.`);
+  }
+
+  /** Allow an account to retry after billing has been repaired.
+   * @param {number} index */
+  clearBillingRejected(index) {
+    const account = this.accounts[index];
+    if (account) account.billingRejectedUntil = null;
+  }
+
+  /** @param {number} index
+   * @param {number} [now] */
+  isBillingRejected(index, now = Date.now()) {
+    const account = this.accounts[index];
+    if (!account?.billingRejectedUntil) return false;
+    if (account.billingRejectedUntil > now) return true;
+    account.billingRejectedUntil = null;
+    return false;
   }
 
   /** True while an account is in its routing-failure cooldown; expiry is
@@ -2431,6 +2459,7 @@ export class AccountManager {
     // unavailable, which is exactly when a held API key would otherwise be
     // asked again on every request — the loop the hold exists to prevent.
     if (this._credentialHeld(account)) return false;
+    if (this.isBillingRejected(account.index)) return false;
     // A 429 hold is respected verbatim at first, but a hold is a snapshot: the
     // 429 that armed it may itself have been transient (e.g. the retry burst
     // after a network flap), and while it lasts NOTHING revalidates it — so a
@@ -2449,7 +2478,9 @@ export class AccountManager {
    * used to pick the least-exhausted probe target. Mirrors _isNearQuota: the
    * shared 5-hour bucket plus the weekly value that gates the model, which is
    * the higher of its family bucket and the shared weekly one. With no model it
-   * falls back to the shared weekly. */
+   * falls back to the shared weekly.
+   * @param {Record<string, any>} account
+   * @param {string|null} [model] */
   _maxUtilization(account, model = null) {
     const q = account.quota;
     let max = 0;
@@ -2737,7 +2768,10 @@ export class AccountManager {
    *
    * Returns one of: 'disabled', 'spend-capped', 'capped', 'throttled', 'error',
    * 'entitlement', 'exhausted', 'upstream-rejected', 'quota', 'route', 'routing',
-   * 'credential', 'advisor-capped', 'advisor-quota', 'advisor-route'.
+   * 'credential', 'billing', 'advisor-capped', 'advisor-quota', 'advisor-route'.
+   * @param {Record<string, any>} account
+   * @param {string|null} [model]
+   * @param {string|null} [advisorModel]
    */
   unavailableReason(account, model = null, advisorModel = null) {
     if (!account) return 'error';
@@ -2771,6 +2805,7 @@ export class AccountManager {
 
     // Upstream answered 401 to this account's API key a moment ago.
     if (this._credentialHeld(account)) return 'credential';
+    if (this.isBillingRejected(account.index)) return 'billing';
 
     // Check rate limit expiry
     if (account.status === 'throttled' && account.rateLimitedUntil) {
@@ -4179,6 +4214,8 @@ export class AccountManager {
     console.log(`[TeamClaude] Account "${best.name}" session quota reset and weekly expires sooner — switching to it`);
   }
 
+  /** @param {Record<string, any>} account
+   * @param {string|null} [model] */
   _isNearQuota(account, model = null) {
     const q = account.quota;
     this._clearExpiredQuotas(account);
@@ -4362,6 +4399,7 @@ export class AccountManager {
       // Nor one sitting out a 401: an old quota window that has since rolled
       // would otherwise name it the soonest to reset and send it the request.
       if (this._credentialHeld(account)) continue;
+      if (this.isBillingRejected(account.index)) continue;
       // A routed/owned model must not fall back to an ineligible account —
       // neither the executor's nor an advisor's.
       if (model && !this._routeAllows(account, model)) continue;
@@ -4881,7 +4919,10 @@ export class AccountManager {
       console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" re-enabled — clearing error state`);
     }
     // The same explicit "try this again" for an API key sitting out a 401.
-    if (!disabled) this.clearCredentialRejected(accountIndex);
+    if (!disabled) {
+      this.clearCredentialRejected(accountIndex);
+      this.clearBillingRejected(accountIndex);
+    }
   }
 
   /**
@@ -5678,6 +5719,9 @@ export class AccountManager {
           : null,
         routingFailedUntil: a.routingFailedUntil && a.routingFailedUntil > Date.now()
           ? new Date(a.routingFailedUntil).toISOString()
+          : null,
+        billingRejectedUntil: a.billingRejectedUntil && a.billingRejectedUntil > Date.now()
+          ? new Date(a.billingRejectedUntil).toISOString()
           : null,
         credentialRejectedUntil: a.credentialRejectedUntil && a.credentialRejectedUntil > Date.now()
           ? new Date(a.credentialRejectedUntil).toISOString()
