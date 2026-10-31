@@ -80,7 +80,17 @@ export const ADAPTIVE_DEFAULTS = {
   // as fast as the taper shrinks and the two cancel, leaving no protection at
   // the wall at all — the cap is what lets the taper win there.
   maxBurnBoost: 4,
+
+  // "burndown" (this file's score, and the default) or "pressure": a new
+  // session's score is P / (1 + load), P being the expiry pressure the band
+  // already computes (room under the account's caps per second to its governing
+  // weekly reset), so sessions land in proportion to how soon each account's
+  // quota expires. Only placement reads it: whether a pinned session moves
+  // stays on burndown. See AccountManager._placementPressure.
+  scoring: 'burndown',
 };
+
+const SCORING_MODES = ['burndown', 'pressure'];
 
 // The fields that are fractions of a window, or EWMA weights: bounded to the
 // unit interval, and the alphas additionally non-zero (an alpha of 0 would
@@ -104,7 +114,7 @@ const POSITIVE_FIELDS = ['maxSampleAgeMs', 'lookaheadMs', 'burnWindowMs', 'initi
 export function validateAdaptiveConfig(raw) {
   if (raw == null) return {};
   if (typeof raw !== 'object' || Array.isArray(raw)) {
-    throw new Error('adaptiveDistribution must be an object of numeric fields');
+    throw new Error('adaptiveDistribution must be an object');
   }
   const shown = v => (typeof v === 'string' ? JSON.stringify(v) : String(v));
   const out = {};
@@ -112,7 +122,11 @@ export function validateAdaptiveConfig(raw) {
     if (!Object.hasOwn(ADAPTIVE_DEFAULTS, field)) {
       throw new Error(`adaptiveDistribution.${field} is not a setting (known fields: ${Object.keys(ADAPTIVE_DEFAULTS).join(', ')})`);
     }
-    if (typeof value !== 'number' || !Number.isFinite(value)) {
+    if (field === 'scoring') {
+      if (!SCORING_MODES.includes(value)) {
+        throw new Error(`adaptiveDistribution.scoring must be ${SCORING_MODES.map(m => `"${m}"`).join(' or ')}, got ${shown(value)}`);
+      }
+    } else if (typeof value !== 'number' || !Number.isFinite(value)) {
       throw new Error(`adaptiveDistribution.${field} must be a finite number, got ${shown(value)}`);
     }
     out[field] = value;
@@ -380,8 +394,21 @@ export class ConcurrencyLearner {
  *   weight or null),
  *   reserve (fraction), load (active sessions + in-flight), concCap,
  *   maxRemaining (the largest `remaining` among the candidates)
+ *   pressure (expiry pressure per second; read only when opts.scoring is
+ *   "pressure", which reads nothing else but load)
  */
 export function scoreCandidate(c, opts = ADAPTIVE_DEFAULTS) {
+  // Pressure: the caller has priced the account's expiring quota (c.pressure),
+  // so the score is that over the load already there. Nothing else enters, and a
+  // pressure that is not a positive number scores 0, so a fleet nothing can be
+  // priced on falls through to the even walk like a fully reserved one.
+  if (opts.scoring === 'pressure') {
+    const { pressure: p, load } = /** @type {{ pressure?: number, load: number }} */ (c);
+    const pressure = p != null && p > 0 && Number.isFinite(p) ? p : 0;
+    const speed = 1 / (1 + Math.max(0, load));
+    return { score: pressure * speed, burn: 1, taper: 1, speed, head: pressure, remaining: pressure };
+  }
+
   // Fractional headroom to the point where this bucket rotates the account out.
   // An unknown utilization is treated as an empty window: an account nothing is
   // known about must not be picked FIRST under a rule that prefers the most

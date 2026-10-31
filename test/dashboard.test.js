@@ -565,6 +565,11 @@ test('only the account states that need a person are reported', () => {
   const off = problems(fleetStatus(am => am.setDisabled(0, true)));
   assert.deepEqual(off.map(p => p.kind), ['account']);
   assert.match(off[0].text, /disabled/);
+  // An account upstream refused is not cured by a re-login alone.
+  const refused = problems(fleetStatus(am => am.markRefused(am.accounts[0], { code: 'account_on_hold', message: 'on hold', link: null })));
+  assert.deepEqual(refused.map(p => p.kind), ['account']);
+  assert.match(refused[0].text, /refused by upstream/);
+  assert.doesNotMatch(refused[0].text, /re-login/);
 });
 
 test('overage spend is not a banner line', () => {

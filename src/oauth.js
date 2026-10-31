@@ -9,6 +9,7 @@ import { envVar } from './brand.js';
 import { creditCount } from './codex-usage.js';
 import { LOGIN_TIMEOUT_MS, codeRace, openBrowser, pasteFromTerminal } from './login-flow.js';
 import { safeLine } from './safe-text.js';
+import { anthropicLink } from './account-refusal.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 const execFileAsync = promisify(execFile);
@@ -158,6 +159,20 @@ export function parseRetryAfterMs(value, now = Date.now()) {
   return Number.isFinite(at) ? Math.max(0, at - now) : undefined;
 }
 
+const DEFAULT_APPEAL_URL = 'https://claude.ai/restricted';
+
+/**
+ * The appeal link of a refusal for an account on hold, checked as Claude Code does:
+ * it is shown to the operator, so anything but a plain https Anthropic link becomes the default.
+ * @param {string} text
+ */
+function holdAppealUrl(text) {
+  let body;
+  try { body = JSON.parse(text); } catch { return undefined; }
+  if (!['invalid_grant', 'access_denied'].includes(body?.error) || body.error_description !== 'account_on_hold') return undefined;
+  return anthropicLink(body.error_uri) ?? DEFAULT_APPEAL_URL;
+}
+
 /**
  * Refresh an expired OAuth access token using the refresh token.
  * Retries on 5xx and network errors with exponential backoff.
@@ -224,6 +239,9 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
           const retryAfterMs = parseRetryAfterMs(res.headers.get('retry-after'));
           if (retryAfterMs !== undefined) /** @type {any} */ (err).retryAfterMs = retryAfterMs;
         }
+        // A hold is not a dead token: a re-login does not lift it.
+        const appealUrl = holdAppealUrl(text);
+        if (appealUrl) /** @type {any} */ (err).appealUrl = appealUrl;
         throw err;
       }
 
@@ -589,7 +607,8 @@ export function normalizeUsageBucket(bucket) {
  * utilization WITHOUT spending message quota, which is what makes it safe to
  * poll. Returns normalized { fiveHour, sevenDay, sevenDaySonnet, sevenDayFable } buckets
  * plus scopedWeeklyListed (whether the payload enumerated its model-scoped
- * weekly caps), or { error, status } on failure.
+ * weekly caps) and sessionListed (whether that enumeration names a session
+ * limit), or { error, status } on failure.
  * @param {string} accessToken
  * @param {import('./account-routing.js').RoutingProxy|null} [routing] - the account's own egress proxy
  * @param {{ fetchImpl?: Function, now?: number }} [opts] `now` is the clock the
@@ -652,6 +671,12 @@ export function normalizeUsagePayload(data, now = Date.now()) {
     // caps and that family was not among them. Without the list, a missing
     // family is our own ignorance and nothing may be concluded from it.
     scopedWeeklyListed: Array.isArray(data?.limits),
+    // Whether the `limits` enumeration names a session (5-hour) limit, beside
+    // `five_hour`. Only presence is read: the captured entries carry a percent
+    // and no reset, and `five_hour` stays the reading. A plan whose 5-hour
+    // window is gone must be absent from both before a probe may say so (see
+    // applyUsageData).
+    sessionListed: Array.isArray(data?.limits) && data.limits.some((/** @type {any} */ l) => l?.kind === 'session'),
     // Banked usage-limit resets (the claude.ai "Resets" offer), in the same
     // shape the Codex probe reports its free reset credits, so the status
     // line, the TUI tag and the dashboard badge read both without knowing
