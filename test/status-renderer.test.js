@@ -80,6 +80,36 @@ test('renderStatus shows an OAuth entitlement cooldown separately from account s
   assert.match(output, /active \/ entitlement cooldown 4m/);
 });
 
+test('renderStatus names an entitlement denial in upstream\'s words, with its count and start', () => {
+  const status = sampleStatus();
+  status.accounts[0].entitlementDenial = {
+    detail: 'OAuth authentication is currently not allowed for this organization.',
+    since: now - 2 * 3_600_000,
+    count: 3,
+  };
+  const output = renderStatus(status, { color: false, now });
+
+  assert.match(output, /Denied\s+OAuth authentication is currently not allowed for this organization\. \u2014 3 in a row, first 2h ago/);
+});
+
+test('renderStatus names an entitlement denial upstream gave no message for', () => {
+  const status = sampleStatus();
+  status.accounts[0].entitlementDenial = { detail: null, since: now - 60_000, count: 1 };
+  const output = renderStatus(status, { color: false, now });
+
+  assert.match(output, /Denied\s+OAuth entitlement denied \u2014 1m ago/);
+  assert.doesNotMatch(output, /null/);
+});
+
+test('renderStatus does not trust an entitlement denial count off the wire', () => {
+  for (const count of ['2\n', { valueOf: 1, toString: 1 }]) {
+    const status = sampleStatus();
+    status.accounts[0].entitlementDenial = { detail: 'denied', since: now - 60_000, count };
+    const output = renderStatus(status, { color: false, now });
+    assert.match(output, /Denied\s+denied \u2014 1m ago\n/);
+  }
+});
+
 test('renderStatus describes a timezone-aware reset warm-up schedule', () => {
   const status = sampleStatus();
   status.warm = {

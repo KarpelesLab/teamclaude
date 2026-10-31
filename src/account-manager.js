@@ -81,8 +81,9 @@ const MAX_RECENT_MODELS = 8;
 // An organization-level OAuth policy denial is not repaired by an immediate
 // retry. Keep the account out of automatic rotation long enough for other
 // members to serve, then re-admit it so an administrator's policy change is
-// discovered without a restart.
-const ENTITLEMENT_DENIAL_COOLDOWN_SECONDS = 5 * 60;
+// discovered without a restart. Indexed by how many denials came in a row, as
+// the 401 hold below is: an organization that keeps refusing is asked hourly.
+const ENTITLEMENT_DENIAL_COOLDOWNS_SECONDS = [5 * 60, 15 * 60, 60 * 60];
 const BILLING_REJECTION_COOLDOWN_MS = 5 * 60_000;
 // An account whose OWN routing proxy cannot be reached is no use until the
 // proxy answers again, and asking costs up to the 30s connect budget per
@@ -506,6 +507,13 @@ function makeAccount(acct, index, listener = null) {
     // valid. This cross-request cooldown is intentionally ephemeral: unlike
     // quota, it is a live routing observation and is re-learned after restart.
     entitlementDeniedUntil: null,
+    // What upstream said, when it first said it and how many times in a row.
+    // Outlives the cooldown: re-admission is not recovery, a served request is.
+    entitlementDenial: /** @type {{ detail: string|null, since: number, count: number }|null} */ (null),
+    // Bumped by each counted denial and never reset. A request carries the
+    // value it was sent under, so an answer to one already in flight when a
+    // denial was counted can neither count again nor clear a newer one.
+    entitlementEpoch: 0,
     // The account's own routing proxy could not be reached (see
     // markRoutingFailed). Ephemeral for the same reason: a live observation.
     routingFailedUntil: /** @type {number|null} */ (null),
@@ -1173,15 +1181,39 @@ export class AccountManager {
 
   /** Keep an OAuth-policy-denied account out of automatic rotation temporarily.
    * Extend an existing cooldown, never shorten it. Returns the expiry timestamp,
-   * or null when the account is missing or the cooldown is disabled. */
-  markEntitlementDenied(index, seconds = ENTITLEMENT_DENIAL_COOLDOWN_SECONDS) {
+   * or null when the account is missing or the cooldown is disabled.
+   * @param {number} index
+   * @param {{ detail?: string|null, epoch?: number, seconds?: number }} [denial]
+   *   upstream's message (already bounded), the entitlementEpoch the refused
+   *   request was sent under, and a length overriding the one the count gives */
+  markEntitlementDenied(index, { detail = null, epoch, seconds } = {}) {
     const account = this.accounts[index];
     if (!account) return null;
-    const duration = Number(seconds);
+    if (epoch != null && epoch < account.entitlementEpoch) return account.entitlementDeniedUntil;
+    const now = Date.now();
+    const prior = account.entitlementDenial;
+    const count = (prior?.count || 0) + 1;
+    const steps = ENTITLEMENT_DENIAL_COOLDOWNS_SECONDS;
+    const duration = Number(seconds ?? steps[Math.min(count, steps.length) - 1]);
     if (!Number.isFinite(duration) || duration <= 0) return null;
-    const until = Date.now() + duration * 1000;
-    account.entitlementDeniedUntil = Math.max(account.entitlementDeniedUntil || 0, until);
+    account.entitlementEpoch++;
+    account.entitlementDenial = { detail: detail || prior?.detail || null, since: prior?.since ?? now, count };
+    account.entitlementDeniedUntil = Math.max(account.entitlementDeniedUntil || 0, now + duration * 1000);
     return account.entitlementDeniedUntil;
+  }
+
+  /** A completion served for a request sent after the last denial is proof the
+   * organization allows OAuth again: lift the cooldown and forget the denials,
+   * so the next one starts from the shortest.
+   * Takes the account the completion was served by, not its index: a removal
+   * while the request was out renumbers the rest.
+   * @param {Record<string, any>} account
+   * @param {number} epoch  the entitlementEpoch the served request was sent under */
+  clearEntitlementDenied(account, epoch) {
+    if (this.accounts[account?.index] !== account) return;
+    if (!account.entitlementDenial || epoch < account.entitlementEpoch) return;
+    account.entitlementDeniedUntil = null;
+    account.entitlementDenial = null;
   }
 
   /** True while an account is in its OAuth entitlement cooldown. Expiry is
@@ -5997,6 +6029,7 @@ export class AccountManager {
         entitlementDeniedUntil: a.entitlementDeniedUntil && a.entitlementDeniedUntil > Date.now()
           ? new Date(a.entitlementDeniedUntil).toISOString()
           : null,
+        entitlementDenial: a.entitlementDenial ? { ...a.entitlementDenial } : null,
         routingFailedUntil: a.routingFailedUntil && a.routingFailedUntil > Date.now()
           ? new Date(a.routingFailedUntil).toISOString()
           : null,

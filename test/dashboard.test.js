@@ -538,6 +538,15 @@ test('without sessionDetail the banner still fires, unnamed', () => {
   assert.equal(problems(am.getStatus({ sessionDetail: true })).length, 1);
 });
 
+test('an account whose organization refused OAuth carries a badge until it serves again', () => {
+  const denied = accountBadges({
+    name: 'a', type: 'oauth', status: 'active',
+    entitlementDenial: { detail: 'OAuth authentication is currently not allowed for this organization.', since: 1, lastAt: 1, count: 3 },
+  }, null, null);
+  assert.deepEqual(denied.find(b => /denied/.test(b.text)), { cls: 'throttled', text: 'OAuth denied \u00d73' });
+  assert.equal(accountBadges({ name: 'a', type: 'oauth', status: 'active' }, null, null).some(b => /denied/.test(b.text)), false);
+});
+
 test('only the account states that need a person are reported', () => {
   // These clear themselves — rotation and back-off working.
   // `status = 'exhausted'` is never assigned anywhere in src/, so a fixture that

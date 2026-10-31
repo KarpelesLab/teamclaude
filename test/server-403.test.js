@@ -3,6 +3,11 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer, oauthVerificationHold } from '../src/server.js';
+import { setUpstreamProxy, resolveUpstreamProxy, resetUpstreamProxy } from '../src/upstream-proxy.js';
+
+// One test below breaks an upstream body off mid-response (see test/README.md).
+test.beforeEach(() => setUpstreamProxy(resolveUpstreamProxy({ upstreamProxy: false }, {})));
+test.afterEach(() => resetUpstreamProxy());
 
 function listen(server) {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
@@ -223,6 +228,91 @@ test('an OAuth entitlement denial quarantines the account across requests', asyn
     const second = await post(proxyPort);
     assert.equal(second.status, 200);
     assert.deepEqual(seen, ['a-token', 'b-token', 'b-token']);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('an entitlement denial is kept with upstream\'s message until a completion is served', async () => {
+  let mode = 'deny';
+  const upstream = http.createServer((req, res) => {
+    const token = (req.headers.authorization || '').replace(/^Bearer /, '');
+    if (token === 'a-token' && mode === 'deny') {
+      res.writeHead(403, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(entitlementError()));
+      return;
+    }
+    if (token === 'a-token' && mode === 'broken') {
+      res.writeHead(200, { 'content-type': 'application/json', 'content-length': '100' });
+      res.write('{"ok"', () => res.destroy());
+      return;
+    }
+    if (token === 'a-token' && mode === 'redirect') {
+      res.writeHead(302, { location: '/login' });
+      res.end();
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(twoAccounts(), 0.98);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+  });
+  const proxyPort = await listen(proxy);
+  const readmit = () => { am.accounts[0].entitlementDeniedUntil = Date.now() - 1; am.currentIndex = 0; };
+
+  try {
+    assert.equal((await post(proxyPort)).status, 200);
+    let denial = am.getStatus().accounts[0].entitlementDenial;
+    assert.equal(denial.detail, 'OAuth authentication is currently not allowed for this organization.');
+    assert.equal(denial.count, 1);
+
+    readmit();
+    const sentAt = Date.now();
+    assert.equal((await post(proxyPort)).status, 200);
+    denial = am.getStatus().accounts[0].entitlementDenial;
+    assert.equal(denial.count, 2);
+    // The second denial waits the second step (15 minutes) from when it landed,
+    // which is no earlier than when the request was sent.
+    assert.ok(am.accounts[0].entitlementDeniedUntil >= sentAt + 15 * 60_000);
+
+    // Neither a redirect nor a served side endpoint shows the organization
+    // allows OAuth inference again.
+    mode = 'redirect';
+    readmit();
+    const redirected = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST', redirect: 'manual',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+    });
+    assert.equal(redirected.status, 302);
+    mode = 'serve';
+    readmit();
+    assert.equal((await post(proxyPort, '/v1/messages/count_tokens')).status, 200);
+    assert.equal(am.getStatus().accounts[0].entitlementDenial.count, 2);
+    // Nor do headers whose body never arrives.
+    mode = 'broken';
+    readmit();
+    await post(proxyPort).catch(() => null);
+    assert.equal(am.getStatus().accounts[0].entitlementDenial.count, 2);
+    mode = 'serve';
+
+    // A completion spelled the way the proxy normalises before sending counts.
+    readmit();
+    const served = await new Promise((resolve, reject) => {
+      const req = http.request({ host: '127.0.0.1', port: proxyPort, method: 'POST', path: '/v1\\messages', headers: { 'content-type': 'application/json' } }, (r) => {
+        r.resume();
+        r.on('end', () => resolve(r.statusCode));
+      });
+      req.on('error', reject);
+      req.end(JSON.stringify({ model: 'x', messages: [] }));
+    });
+    assert.equal(served, 200);
+    assert.equal(am.getStatus().accounts[0].entitlementDenial, null);
   } finally {
     proxy.close();
     upstream.close();

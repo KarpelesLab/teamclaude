@@ -3157,7 +3157,14 @@ export class TUI {
     } else if (typeof barred === 'string' && /capped$/.test(barred)) {
       status = yellow('capped');
     } else switch (a.status) {
-      case 'active':    status = isCur ? green('active') : 'active'; break;
+      case 'active':
+        // Re-admitted after an entitlement cooldown, not yet proven by a served request.
+        if (a.entitlementDenial) {
+          // The count can arrive off the attach payload, and the column is ten wide.
+          const n = Number.isSafeInteger(a.entitlementDenial.count) ? a.entitlementDenial.count : 1;
+          status = yellow(n > 99 ? 'denied 99+' : n > 1 ? `denied \u00d7${n}` : 'denied');
+        } else status = isCur ? green('active') : 'active';
+        break;
       case 'throttled': status = yellow('throttled'); break;
       case 'exhausted': status = red('exhausted'); break;
       case 'error':     status = red(errorLabel(a.errorReason?.code)); break;
