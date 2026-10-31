@@ -186,7 +186,9 @@ for (const size of [0, 1024 * 1024]) {
 test('requests queued on an account fail over once another request finds it refused', async () => {
   const am = new AccountManager(accounts(), 0.98, {
     // A cap that cannot step during the test, however slow the first request.
-    ramp: { enabled: true, startConc: 1, stepConc: 1, stepMs: 3_600_000, windowMs: 3_600_000, pollMs: 5 },
+    // The window stays short: a waiter left in admit() polls until it ends,
+    // and an hour-long one keeps the test process alive past its timeout.
+    ramp: { enabled: true, startConc: 1, stepConc: 1, stepMs: 3_600_000, windowMs: 30_000, pollMs: 5 },
   });
   am.accounts[0].rampStartedAt = Date.now();
   const body = errorBody('permission_error', KYC_MESSAGE, 'verification_required');
