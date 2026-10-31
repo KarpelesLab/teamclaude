@@ -11,7 +11,7 @@ import {
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
   thresholdRequest, thresholdPercentText, thresholdOutcome,
   usageFor, USAGE_VIEWS, backendQuotaRows,
-  callerCan, callerNotice, cardNoteKey, cardNoteFor, CARD_NOTE_MAX_AGE_MS,
+  callerCan, callerNotice, cardNoteKey, cardNoteFor, CARD_NOTE_MAX_AGE_MS, accountGroups,
 } from '../src/dashboard.js';
 import { USAGE_WINDOWS } from '../src/client-usage.js';
 
@@ -673,7 +673,7 @@ test('the page ships the same helper implementations it is tested against', () =
   // The serialization is the contract: if a helper stops being self-contained
   // (closes over module scope), the page would silently ReferenceError.
   const html = renderDashboardHtml();
-  for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, callerCan, callerNotice, cardNoteKey, cardNoteFor]) {
+  for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, callerCan, callerNotice, cardNoteKey, cardNoteFor, accountGroups]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   // cardNoteFor reads it from page scope; without it the first render throws.
@@ -1054,6 +1054,26 @@ test('cardNoteFor shows a result for its own card only, and only while recent', 
   bare['__proto__'] = { kind: 'ok', text: 'x', at };
   assert.equal(cardNoteFor(bare, '__proto__', at).text, 'x');
   assert.equal(cardNoteFor(undefined, 'alice@example.com', at), null);
+});
+
+test('accountGroups puts Claude first and keeps each provider\'s own order', () => {
+  // A Claude account added after the Codex ones still lands with the Claude cards.
+  const groups = accountGroups([
+    { name: 'c1' }, { name: 'x1', provider: 'codex' }, { name: 'c2', provider: 'anthropic' },
+    { name: 'x2', provider: 'codex' }, { name: 'c3' },
+  ]);
+  assert.deepEqual(groups.map(g => [g.provider, g.label, g.accounts.map(a => a.name)]), [
+    ['anthropic', 'Claude', ['c1', 'c2', 'c3']],
+    ['codex', 'Codex', ['x1', 'x2']],
+  ]);
+  // Claude leads even when a Codex account comes first; other providers keep first-seen order.
+  assert.deepEqual(accountGroups([{ name: 'x', provider: 'codex' }, { name: 'z', provider: 'zai' }, { name: 'c' }]).map(g => g.provider),
+    ['anthropic', 'codex', 'zai']);
+  // One provider is one group (drawn without a heading); nothing is no group.
+  assert.equal(accountGroups([{ name: 'a' }, { name: 'b' }]).length, 1);
+  assert.deepEqual(accountGroups(undefined), []);
+  // An account named __proto__ is grouped like any other.
+  assert.deepEqual(accountGroups([{ name: 'a', provider: '__proto__' }]).map(g => g.accounts.length), [1]);
 });
 
 test('cardNoteKey tells apart two cards with one name', () => {
