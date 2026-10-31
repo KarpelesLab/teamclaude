@@ -114,11 +114,11 @@ test('an upstream that states its own unified quota is never overwritten', async
   assert.equal(res.headers.get('anthropic-ratelimit-unified-7d-utilization'), null, 'and nothing is mixed in beside it');
 });
 
-test('a reload copies both client-header flags off the disk config', () => {
-  assert.deepEqual(reloadedHeaderFlags({ synthesizeQuotaHeaders: true }), { stripOverageHeaders: false, synthesizeQuotaHeaders: true });
-  assert.deepEqual(reloadedHeaderFlags({ stripOverageHeaders: true }), { stripOverageHeaders: true, synthesizeQuotaHeaders: false });
-  assert.deepEqual(reloadedHeaderFlags({ synthesizeQuotaHeaders: 'yes' }), { stripOverageHeaders: false, synthesizeQuotaHeaders: false }, 'only a literal true enables');
-  assert.deepEqual(reloadedHeaderFlags({}), { stripOverageHeaders: false, synthesizeQuotaHeaders: false }, 'a removed key turns it off');
+test('a reload copies the client-header flags off the disk config', () => {
+  assert.deepEqual(reloadedHeaderFlags({ synthesizeQuotaHeaders: true }), { stripOverageHeaders: false, synthesizeQuotaHeaders: true, poolQuotaHeaders: false });
+  assert.deepEqual(reloadedHeaderFlags({ stripOverageHeaders: true }), { stripOverageHeaders: true, synthesizeQuotaHeaders: false, poolQuotaHeaders: false });
+  assert.deepEqual(reloadedHeaderFlags({ synthesizeQuotaHeaders: 'yes' }), { stripOverageHeaders: false, synthesizeQuotaHeaders: false, poolQuotaHeaders: false }, 'only a literal true enables');
+  assert.deepEqual(reloadedHeaderFlags({}), { stripOverageHeaders: false, synthesizeQuotaHeaders: false, poolQuotaHeaders: false }, 'a removed key turns it off');
 });
 
 test('an error response carries no synthesized quota: the proxy did not judge it', async () => {

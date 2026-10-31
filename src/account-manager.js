@@ -2232,11 +2232,18 @@ export class AccountManager {
       return {
         index: a.index,
         name: a.name,
+        // The account's own provider, which decides how its row is labelled:
+        // `bucket` below is a Claude family name, and means nothing for a Codex
+        // account, whose score comes from its own quota windows.
+        provider: providerOf(a),
         // Requested family and the actual quota window supplying the adaptive
         // score. They differ when a family request is constrained by shared
         // weekly quota.
         bucket,
         window: window.bucket,
+        // The ChatGPT plan name a Codex account reported (display only; the
+        // weight above comes from quotaTier, which knows only Claude tiers).
+        planType: a.quota?.planType ?? null,
         competing: inTier.has(a.index),
         sessions: this.sessionTracker.activeCountFor(a.index, now),
         inFlight: a.inFlight || 0,
@@ -4009,6 +4016,14 @@ export class AccountManager {
     // request that cannot be sent there settles nothing and leaves the event too.
     const spends = !this.expiryRouting.enabled
       || (scope != null && canRouteTo(this.accounts[this.currentIndex]));
+    // The knob-off scope above drops the provider partition the walk already
+    // applied to its exclusion set. Inside a walk the partition still holds: a
+    // request spends only the events its own provider can act on, and the other
+    // provider's stay pending for its own next request. A poll or a direct caller
+    // has no walk, and keeps the knob-off behaviour it has always had.
+    const partition = !this.expiryRouting?.enabled && this._selectingProvider != null
+      ? this._excludeOtherProviders(null, this._selectingProvider)
+      : null;
     const sessionReset = [];
     for (const account of this.accounts) {
       const r = this._clearExpiredQuotas(account);
@@ -4019,6 +4034,7 @@ export class AccountManager {
       // the flag for one that cannot leaves the next nothing to act on. Read
       // after _clearExpiredQuotas, since before it every account refuses.
       if (scope != null && !canRouteTo(account)) continue;
+      if (partition?.has(account.index)) continue;
       // The flag, not r.session: a status read may have cleared the window
       // seconds earlier, and the rule still has to run. Cleared here rather
       // than where the window is, so that a read cannot swallow the event.
@@ -4032,7 +4048,7 @@ export class AccountManager {
     // model-scoped filter there is a live routing change on the path that
     // promises none.
     if (sessionReset.length) {
-      this._switchOnSessionReset(sessionReset, this.expiryRouting.enabled ? model : null, scope, adv);
+      this._switchOnSessionReset(sessionReset, this.expiryRouting.enabled ? model : null, scope ?? partition, adv);
     }
     return changed;
   }
@@ -4206,6 +4222,44 @@ export class AccountManager {
       }
     });
     return best;
+  }
+
+  /**
+   * The lowest reading each unified window has across the accounts that could
+   * serve this request right now, or null when `account` is the only one left.
+   *
+   * Read by server.js under `poolQuotaHeaders` to tell Claude Code the pool's
+   * headroom instead of the serving account's. Null is the signal that
+   * rotation cannot help any more, so the account's own readings stand. Each
+   * window pairs a reading with that same account's reset, and a window no
+   * candidate has read (or whose reset has passed) is left out.
+   *
+   * @param {Record<string, any>} account  the account that served the response
+   * @param {*} [model]
+   * @param {*} [advisorModel]
+   * @param {string} [provider]
+   * @returns {Record<'5h'|'7d'|'7d_oi', { utilization: number, resetAt: number }>|null}
+   */
+  poolQuotaReadings(account, model = null, advisorModel = null, provider = DEFAULT_PROVIDER) {
+    const foreign = this._excludeOtherProviders(null, provider);
+    const candidates = this.accounts.filter(a => !foreign?.has(a.index) && this._isAvailable(a, model, advisorModel));
+    if (!candidates.some(a => a !== account)) return null;
+    const now = Date.now();
+    /** @type {Record<string, { utilization: number, resetAt: number }>} */
+    const out = {};
+    for (const [name, field, resetField] of /** @type {const} */ ([
+      ['5h', 'unified5h', 'unified5hReset'],
+      ['7d', 'unified7d', 'unified7dReset'],
+      ['7d_oi', 'unified7dFable', 'unified7dFableReset'],
+    ])) {
+      for (const a of candidates) {
+        const utilization = a.quota[field];
+        const resetAt = a.quota[resetField];
+        if (utilization == null || resetAt == null || resetAt <= now) continue;
+        if (!out[name] || utilization < out[name].utilization) out[name] = { utilization, resetAt };
+      }
+    }
+    return out;
   }
 
   /**

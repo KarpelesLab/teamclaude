@@ -52,8 +52,14 @@ export class Prober {
   // notices below are produced later still, by a reload that changes the probe
   // interval, so a captured `console.log` would put them on a terminal the
   // alternate screen has already covered.
-  constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, codexProbeFn = fetchCodexUsage, profileFn = null, backendFn = fetchBackendQuota, timeoutMs = 10_000, log = (/** @type {string} */ line) => console.log(line) } = {}) {
+  //
+  // `config` is the SHARED config object, not a snapshot: `probeDisabledAccounts`
+  // is read off it per cycle, so a TUI toggle or a reload applies on the next
+  // probe without a reschedule.
+  constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, codexProbeFn = fetchCodexUsage, profileFn = null, backendFn = fetchBackendQuota, timeoutMs = 10_000, config = null, log = (/** @type {string} */ line) => console.log(line) } = {}) {
     this.am = accountManager;
+    /** @type {{ probeDisabledAccounts?: boolean } | null} */
+    this.config = config;
     this.intervalMs = clampInterval(intervalMs);
     this.probeFn = probeFn;
     this.codexProbeFn = codexProbeFn;
@@ -147,9 +153,14 @@ export class Prober {
   // once more, and its access token cannot be trusted either. The manager's
   // dead-token guard is keyed on the token value, so a re-login lifts this skip
   // on its own.
+  //
+  // `probeDisabledAccounts` lifts the first skip, and only that one: the
+  // operator asked for a disabled account's quota to stay current while it is
+  // out of rotation, and accepts the refresh that comes with it. A dead token
+  // stays skipped either way.
   _probeable(account) {
     if (!account?.credential) return false;
-    if (account.disabled) return false;
+    if (account.disabled && this.config?.probeDisabledAccounts !== true) return false;
     if (account._deadRefreshToken && account._deadRefreshToken === account.refreshToken) return false;
     return true;
   }
