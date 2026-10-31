@@ -12,6 +12,8 @@ import { decideBand, pressureOf, pressureRank, assertNever, WEEKLY_WINDOW_SECOND
 import { BurnRateLearner, ConcurrencyLearner, scoreCandidate } from './adaptive-distribution.js';
 import { OutsideSpendTracker, OUTSIDE_SPEND_STATES, OUTSIDE_SPEND_SETTLE_MS, outsideSpendKey } from './outside-spend.js';
 import { forecastWindow } from './forecast.js';
+import { forecastFleet } from './fleet-forecast.js';
+import { QuotaSeries } from './quota-series.js';
 import { safeLine } from './safe-text.js';
 import { parseRoutingUrl, describeRouting, routingToUrl, isRoutingFailure } from './account-routing.js';
 import { isSelfProxy } from './upstream-proxy.js';
@@ -80,6 +82,7 @@ const MAX_RECENT_MODELS = 8;
 // members to serve, then re-admit it so an administrator's policy change is
 // discovered without a restart.
 const ENTITLEMENT_DENIAL_COOLDOWN_SECONDS = 5 * 60;
+const BILLING_REJECTION_COOLDOWN_MS = 5 * 60_000;
 // An account whose OWN routing proxy cannot be reached is no use until the
 // proxy answers again, and asking costs up to the 30s connect budget per
 // request when the proxy is black-holed rather than refusing. Short, because
@@ -457,6 +460,7 @@ function makeAccount(acct, index, listener = null) {
     // that is not an error resets it.
     credentialRejectedUntil: /** @type {number|null} */ (null),
     credentialRejections: 0,
+    billingRejectedUntil: /** @type {number|null} */ (null),
     // Storm control (see admit/release): in-flight upstream requests and the
     // time this account last became the current one (starts a ramp window).
     inFlight: 0,
@@ -602,6 +606,13 @@ export class AccountManager {
     // adaptiveDistribution.scoring, fixed at construction like the rest of the
     // block: 'pressure' scores a placement by expiry pressure (_placementPressure).
     this.scoring = this.burnRateLearner.opts.scoring === 'pressure' ? 'pressure' : 'burndown';
+    // The stored quota series behind the fleet forecast (#550). Empty until the
+    // server loads its file (index.js) or samples accumulate; the manager only
+    // samples into it and reads it, the file I/O lives with the caller.
+    /** @type {QuotaSeries} */
+    this.quotaSeries = new QuotaSeries();
+    /** @type {{ series: QuotaSeries, key: string, value: import('./fleet-forecast.js').FleetForecast|null }|null} */
+    this._fleetForecastCache = null;
     // The last adaptiveStats() a status read computed, and when. Time is the
     // only thing that invalidates it (see _adaptiveStatsCached).
     this._adaptiveStatsCache = null;
@@ -1200,6 +1211,32 @@ export class AccountManager {
     if (!account) return;
     account.credentialRejectedUntil = null;
     account.credentialRejections = 0;
+  }
+
+  /** Temporarily exclude an account whose upstream billing refused a request.
+   * @param {number} index */
+  markBillingRejected(index) {
+    const account = this.accounts[index];
+    if (!account) return;
+    account.billingRejectedUntil = Date.now() + BILLING_REJECTION_COOLDOWN_MS;
+    console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}": upstream billing refused usage; check billing or purchase credits. Retrying after five minutes.`);
+  }
+
+  /** Allow an account to retry after billing has been repaired.
+   * @param {number} index */
+  clearBillingRejected(index) {
+    const account = this.accounts[index];
+    if (account) account.billingRejectedUntil = null;
+  }
+
+  /** @param {number} index
+   * @param {number} [now] */
+  isBillingRejected(index, now = Date.now()) {
+    const account = this.accounts[index];
+    if (!account?.billingRejectedUntil) return false;
+    if (account.billingRejectedUntil > now) return true;
+    account.billingRejectedUntil = null;
+    return false;
   }
 
   /** True while an account is in its routing-failure cooldown; expiry is
@@ -2472,6 +2509,7 @@ export class AccountManager {
     // unavailable, which is exactly when a held API key would otherwise be
     // asked again on every request — the loop the hold exists to prevent.
     if (this._credentialHeld(account)) return false;
+    if (this.isBillingRejected(account.index)) return false;
     // A 429 hold is respected verbatim at first, but a hold is a snapshot: the
     // 429 that armed it may itself have been transient (e.g. the retry burst
     // after a network flap), and while it lasts NOTHING revalidates it — so a
@@ -2490,7 +2528,9 @@ export class AccountManager {
    * used to pick the least-exhausted probe target. Mirrors _isNearQuota: the
    * shared 5-hour bucket plus the weekly value that gates the model, which is
    * the higher of its family bucket and the shared weekly one. With no model it
-   * falls back to the shared weekly. */
+   * falls back to the shared weekly.
+   * @param {Record<string, any>} account
+   * @param {string|null} [model] */
   _maxUtilization(account, model = null) {
     const q = account.quota;
     let max = 0;
@@ -2778,7 +2818,10 @@ export class AccountManager {
    *
    * Returns one of: 'disabled', 'spend-capped', 'capped', 'throttled', 'error',
    * 'entitlement', 'exhausted', 'upstream-rejected', 'quota', 'route', 'routing',
-   * 'credential', 'advisor-capped', 'advisor-quota', 'advisor-route'.
+   * 'credential', 'billing', 'advisor-capped', 'advisor-quota', 'advisor-route'.
+   * @param {Record<string, any>} account
+   * @param {string|null} [model]
+   * @param {string|null} [advisorModel]
    */
   unavailableReason(account, model = null, advisorModel = null) {
     if (!account) return 'error';
@@ -2812,6 +2855,7 @@ export class AccountManager {
 
     // Upstream answered 401 to this account's API key a moment ago.
     if (this._credentialHeld(account)) return 'credential';
+    if (this.isBillingRejected(account.index)) return 'billing';
 
     // Check rate limit expiry
     if (account.status === 'throttled' && account.rateLimitedUntil) {
@@ -4264,6 +4308,8 @@ export class AccountManager {
     console.log(`[TeamClaude] Account "${best.name}" session quota reset and weekly expires sooner — switching to it`);
   }
 
+  /** @param {Record<string, any>} account
+   * @param {string|null} [model] */
   _isNearQuota(account, model = null) {
     const q = account.quota;
     this._clearExpiredQuotas(account);
@@ -4447,6 +4493,7 @@ export class AccountManager {
       // Nor one sitting out a 401: an old quota window that has since rolled
       // would otherwise name it the soonest to reset and send it the request.
       if (this._credentialHeld(account)) continue;
+      if (this.isBillingRejected(account.index)) continue;
       // A routed/owned model must not fall back to an ineligible account —
       // neither the executor's nor an advisor's.
       if (model && !this._routeAllows(account, model)) continue;
@@ -4966,7 +5013,10 @@ export class AccountManager {
       console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" re-enabled — clearing error state`);
     }
     // The same explicit "try this again" for an API key sitting out a 401.
-    if (!disabled) this.clearCredentialRejected(accountIndex);
+    if (!disabled) {
+      this.clearCredentialRejected(accountIndex);
+      this.clearBillingRejected(accountIndex);
+    }
   }
 
   /**
@@ -5670,6 +5720,9 @@ export class AccountManager {
       // Empty outside adaptive mode, so the renderer needs no mode check of its
       // own and an older client simply sees nothing extra.
       adaptive: this._adaptiveStatsCached(),
+      // When the whole fleet is out at once, and when the first account is
+      // back (#550). Null until there are 48 hours of samples.
+      fleetForecast: this.fleetForecastStatus(),
       accounts: this.accounts.map(a => ({
         name: a.name,
         type: a.type,
@@ -5740,11 +5793,81 @@ export class AccountManager {
         routingFailedUntil: a.routingFailedUntil && a.routingFailedUntil > Date.now()
           ? new Date(a.routingFailedUntil).toISOString()
           : null,
+        billingRejectedUntil: a.billingRejectedUntil && a.billingRejectedUntil > Date.now()
+          ? new Date(a.billingRejectedUntil).toISOString()
+          : null,
         credentialRejectedUntil: a.credentialRejectedUntil && a.credentialRejectedUntil > Date.now()
           ? new Date(a.credentialRejectedUntil).toISOString()
           : null,
       })),
     };
+  }
+
+  /**
+   * The accounts the fleet forecast covers: Anthropic subscription accounts in
+   * rotation (not disabled) that carry an entry id, which keys their history.
+   * A Codex account is a separate pool, and an API key meters no window.
+   */
+  _fleetForecastAccounts() {
+    return this.accounts.filter(a => providerOf(a) === DEFAULT_PROVIDER && isSubscriptionAccount(a) && !a.disabled && typeof a.id === 'string' && a.id);
+  }
+
+  /**
+   * Take one quota-series sample per forecast account whose last one is at
+   * least SAMPLE_INTERVAL_MS old, from the readings already held — never an
+   * upstream call. An account the proxy has not read in its current windows
+   * gets none. Then prune: samples past their age or cap, and the history of
+   * any account no longer in the manager. Returns whether the series changed,
+   * so the caller knows to write it.
+   * @param {number} [now]
+   */
+  sampleQuotaSeries(now = Date.now()) {
+    // A window whose reset has passed still holds its old reading until a
+    // sweep clears it; sampled as-is, it would read as spend in the new window.
+    this.sweepExpiredQuotas();
+    let changed = false;
+    for (const a of this._fleetForecastAccounts()) {
+      /** @type {Record<string, any>} */
+      const q = a.quota || {};
+      if (q.unified7dSeenAt == null && q.unified5hSeenAt == null) continue;
+      if (this.quotaSeries.record(a.id, {
+        weekly: q.unified7d, weeklyResetAt: q.unified7dReset, fiveHour: q.unified5h, fiveHourResetAt: q.unified5hReset,
+      }, now)) changed = true;
+    }
+    const live = this.accounts.map(a => a.id).filter(id => typeof id === 'string' && id);
+    if (this.quotaSeries.prune(live, now)) changed = true;
+    return changed;
+  }
+
+  /**
+   * `fleetForecast` for status (#550): when every account is out at once and
+   * when the first one is back, from the stored series. Null until the series
+   * spans 48 hours, and when nothing runs out within the forecast horizon.
+   * Cached for a minute per series revision: status is polled every few
+   * seconds, and the answer moves in five-minute steps.
+   * @param {number} [now]
+   */
+  fleetForecastStatus(now = Date.now()) {
+    // The series object is part of the key: the server swaps in the one it
+    // loaded from disk, whose revision can equal the empty one's.
+    const series = this.quotaSeries;
+    const key = `${series.revision}:${Math.floor(now / 60_000)}`;
+    if (this._fleetForecastCache?.series === series && this._fleetForecastCache.key === key) return this._fleetForecastCache.value;
+    const accounts = this._fleetForecastAccounts().filter(a => this.quotaSeries.samples(a.id).length);
+    // No prototype: the keys are entry ids, and `__proto__` is a valid one.
+    /** @type {Record<string, import('./fleet-forecast.js').BucketThresholds>} */
+    const thresholds = Object.create(null);
+    for (const a of accounts) thresholds[a.id] = { weekly: this.thresholdFor('unified7d', a), fiveHour: this.thresholdFor('unified5h', a) };
+    const value = forecastFleet({
+      series: this.quotaSeries.all(),
+      accounts: accounts.map(a => ({
+        id: a.id, weekly: a.quota?.unified7d, weeklyResetAt: a.quota?.unified7dReset, fiveHour: a.quota?.unified5h, fiveHourResetAt: a.quota?.unified5hReset,
+      })),
+      thresholds,
+      now,
+    });
+    this._fleetForecastCache = { series, key, value };
+    return value;
   }
 
   /** Return per-account quota and fleet aggregates for status clients. */
