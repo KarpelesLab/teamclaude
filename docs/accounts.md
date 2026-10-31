@@ -208,11 +208,27 @@ Accounts can also be added, removed and reordered from the TUI settings screen: 
 
 ### Why an account is in `error`
 
-An account leaves rotation as `error` when upstream rejects its refresh token, or answers 401 to a token that has none to refresh with. `teamclaude status` names which, instead of pointing at the logs — `needs a re-login: upstream rejected its refresh token (400) — run: teamclaude login` — and `GET /teamclaude/status` carries the same under `accounts[].errorReason`: `code` (`refresh_rejected` or `credential_rejected`), `detail`, `since` (epoch ms) and `remedy`, the login command that brings it back. It is `null` whenever the account is not in `error`.
+An account leaves rotation as `error` when upstream rejects its refresh token, or answers 401 to a token that has none to refresh with. `teamclaude status` names which, instead of pointing at the logs — `needs a re-login: upstream rejected its refresh token (400) — run: teamclaude login` — and `GET /teamclaude/status` carries the same under `accounts[].errorReason`: `code` (`refresh_rejected` or `credential_rejected`), `detail`, `since` (epoch ms), `remedy`, the login command that brings it back, and `link` (`null` here). It is `null` whenever the account is not in `error`. The TUI names the reason in the status column (`re-login` for those two codes, `on hold` for `account_on_hold`, `refused` for upstream's other account refusals below, `error` for any other) and draws the same line under the account's row.
+
+It also leaves rotation when upstream refuses the account itself ([account refusals](routing.md#account-refusals)). Then `code` is upstream's error code, such as `verification_required` or `account_on_hold`, `detail` is upstream's message, and `link` is the address in that message when it is a plain https link on `claude.ai`, `anthropic.com` (or a subdomain of either) or `platform.claude.com`. Status reads `refused by upstream: <message> — once resolved, run: teamclaude login`: resolve it at the link, then sign in again to bring the account back. A refused account's refresh token failing afterwards does not replace the refusal, and a refusal replaces a dead-token error, since signing in again alone would not bring the account back.
+
+An account Anthropic has put on hold gets its refresh refused with `error_description: "account_on_hold"`. A re-login does not lift that, so it is reported as a refusal like the ones above: `code` is `account_on_hold`, `detail` is Anthropic's own message with the appeal link (`Your account is on hold and can't use Claude Code. View details or appeal: https://claude.ai/restricted`), `link` is that appeal link, and status, the dashboard and `teamclaude switch` say upstream refused the account rather than that it needs a re-login. `remedy` is still `teamclaude login`: the refused token is not sent again, so once the hold is lifted a sign-in puts the account back.
+
+### When a plan lapses
+
+With the [quota probe](quota.md#quota-probe) on, each Anthropic account's OAuth profile is read again at most once an hour. When an account that showed a Claude Max or Pro plan reads as having neither, `teamclaude status` adds a line under it:
+
+```
+Plan     its OAuth profile no longer shows the Claude Max plan (since 2h ago) — renew the plan or disable the account
+```
+
+`GET /teamclaude/status` carries `accounts[].subscriptionLost`: `plan` (`Max` or `Pro`) and `since` (epoch ms, when it was first seen). It clears when the profile shows a plan again or the account gets new tokens (a `teamclaude login`; the next profile read reports the loss again if the plan is still gone), and it is kept across a restart. A failed profile read changes nothing. A change between plans (Max to Pro, or a different Max tier) is logged.
+
+The account is not taken out of rotation for it. The profile is a second-hand view of the plan, and what the account can still serve is decided by upstream's answers to its requests, which the proxy already acts on. Disable the account if you do not want it tried.
 
 ### Signing in again from the TUI
 
-An OAuth account whose refresh token upstream has rejected — typically because the same account was signed in somewhere else, which rotates the token and kills the copy TeamClaude holds — shows as `error` and stays that way until someone signs in again. Press **`l`** on the dashboard: the picker opens on the first account in `error`, and **Enter** opens the login panel for the account's provider (Claude or Codex). The panel works when the server is on another machine, reached over SSH:
+An OAuth account whose refresh token upstream has rejected — typically because the same account was signed in somewhere else, which rotates the token and kills the copy TeamClaude holds — shows as `re-login` and stays that way until someone signs in again. Press **`l`** on the dashboard: the picker opens on the first account in `error`, and **Enter** opens the login panel for the account's provider (Claude or Codex). The panel works when the server is on another machine, reached over SSH:
 
 - **The link.** The full sign-in URL is drawn under the label, wrapped across lines and starting at the left edge, so you can select it by hand in any terminal. It is also an OSC 8 hyperlink: click it in a terminal that supports them.
 - **The clipboard.** The panel sends the link to your clipboard with OSC 52 when it opens, and again on **`c`**. Your terminal must allow OSC 52 (some, iTerm2 among them, have it off by default). `c` is a key only while the paste field is empty.

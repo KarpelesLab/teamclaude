@@ -11,7 +11,8 @@ import {
 import { configIndexFor, managerAccountFor, markAccountRemoved, markAccountAdded } from './account-pairing.js';
 import { PROVIDERS, providerOf, isSubscriptionAccount, upstreamFor } from './provider.js';
 import { mintAccountId } from './account-id.js';
-import { formatPercent, heldResetCredits, showSessionRow, showWeeklyRow } from './status-renderer.js';
+import { ACCOUNT_REFUSAL_CODES } from './account-refusal.js';
+import { formatPercent, heldResetCredits, showSessionRow, showWeeklyRow, unavailableLine } from './status-renderer.js';
 import { resolveMaxUsage, resolveMaxSpendMinor, switchThresholdDiffs, modelLabel, EFFORT_SEP } from './model.js';
 import { parseProxyUrl, proxyToUrl, describeProxy, describeSelfProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy, localListener, isSelfProxy } from './upstream-proxy.js';
 import { describeRouting, parseRoutingUrl, routingToUrl, checkRouting } from './account-routing.js';
@@ -452,6 +453,11 @@ export function routingTag(account) {
   const text = typeof r === 'string' ? r : describeRouting(r);
   return text ? `via ${text}` : '';
 }
+
+// The status cell's name for an errorReason code. A code it does not know keeps `error`.
+const errorLabel = (/** @type {unknown} */ code) => code === 'account_on_hold' ? 'on hold'
+  : code === 'refresh_rejected' || code === 'credential_rejected' ? 're-login'
+  : typeof code === 'string' && ACCOUNT_REFUSAL_CODES.has(code) ? 'refused' : 'error';
 
 /** Fit a line to exactly w columns: truncate if too long, pad if too short.
  *  Truncation drops a wide glyph that would straddle the limit, so the result
@@ -2598,16 +2604,16 @@ export class TUI {
       if (split) {
         const [a, b] = groups;
         lines.push(paneTitle(PROVIDERS[a.provider].label, split.leftW) + dim(PANE_GUTTER) + paneTitle(PROVIDERS[b.provider].label, split.rightW));
-        for (let r = 0; r < Math.max(a.indices.length, b.indices.length); r++) {
-          const left = r < a.indices.length ? this._renderRow(a.indices[r], split.left, current) : '';
-          const right = r < b.indices.length ? this._renderRow(b.indices[r], split.right, current) : '';
-          lines.push(fitLine(left, split.leftW) + dim(PANE_GUTTER) + right);
+        const left = a.indices.flatMap(i => this._rowLines(i, split.left, current));
+        const right = b.indices.flatMap(i => this._rowLines(i, split.right, current));
+        for (let r = 0; r < Math.max(left.length, right.length); r++) {
+          lines.push(fitLine(left[r] ?? '', split.leftW) + dim(PANE_GUTTER) + (right[r] ?? ''));
         }
       } else {
         lines.push('');
         const order = this._displayOrder();
         const layout = this._listLayout(order, W);
-        for (const i of order) lines.push(this._renderRow(i, layout, current));
+        for (const i of order) lines.push(...this._rowLines(i, layout, current));
       }
     }
 
@@ -2846,13 +2852,16 @@ export class TUI {
       const fixed = 20 + typeCell + NAME_MIN + routeCells + tagW + spendW + creditW + switchW + routeW;
       const span = (/** @type {number} */ n, /** @type {number} */ bar) => fixed + 6 * (n - 1) + n * bar;
       const roomFor = (/** @type {number} */ n) => span(n, BAR_MIN) <= W;
-      // No Ses bar once every Codex account here has said it meters no 5h window
+      // No Ses bar once every account here has said it meters no 5h window
       // (`sessionWindowStated`, the fact a reading leaves behind; not
       // `unified5h` itself, which the expiry sweep nulls every five hours on a
-      // row that does have one); a Claude row or an unreported account keeps it,
-      // and so does a reading that is still there (showSessionRow).
+      // row that does have one). Some Codex plans meter none, and so does an
+      // Anthropic Ultra account once its 5-hour limit is lifted. An unreported account keeps the column, and so does a
+      // reading that is still there (showSessionRow). Not keyed on a weekly
+      // reading being present either: a weekly reset nulls `unified7d` until
+      // the next reading, and the column would come back empty meanwhile.
       const shortBar = cat !== 'unified'
-        || members.some(a => providerOf(a) !== 'codex' || showSessionRow(a.quota) || a.quota.unified7d == null);
+        || members.some(a => showSessionRow(a.quota));
       // The family bars are the first thing to go: below the width where they
       // fit even at BAR_MIN they would push the row past the edge, and a row
       // cut mid-bar reads worse than one that simply doesn't draw them (the
@@ -2930,6 +2939,17 @@ export class TUI {
   _renderRow(/** @type {number} */ idx, /** @type {any} */ L, /** @type {Set<number>} */ current) {
     const b = L.budgets.get(rowCategory(this.am.accounts[idx]));
     return this._renderAcct(idx, b.bw, b.showBoth, L.routes, L.genRoutes, L.familyTarget, b.showFamily, L.nameW, { current, compact: L.compact, shortBar: b.shortBar });
+  }
+
+  /** The row, then for an account out of rotation as `error` the line `teamclaude status`
+   *  prints for it, wrapped to the pane so the command at its end is not cut off. */
+  _rowLines(/** @type {number} */ idx, /** @type {any} */ L, /** @type {Set<number>} */ current) {
+    const a = this.am.accounts[idx];
+    const row = this._renderRow(idx, L, current);
+    if (this._unavailable(a) !== 'error') return [row];
+    const plain = (/** @type {string} */ s) => s;
+    const why = unavailableLine({ ...a, unavailable: 'error', onExtraUsage: this._onExtraUsage(a) }, { dim: plain, yellow: plain, red: plain });
+    return [row, ...wrapWords(why ?? '', L.width - 4).map(l => `    ${yellow(l)}`)];
   }
 
   /** The accounts of each provider present, in the order its rows are drawn. */
@@ -3126,9 +3146,7 @@ export class TUI {
     // not in it, and a row reading `active` for an account that receives nothing
     // sent operators looking at the wrong thing (#468). Live, the manager says;
     // in attach mode the status payload carries the same reason.
-    const barred = typeof this.am.unavailableReason === 'function'
-      ? this.am.unavailableReason(a)
-      : (a.unavailable ?? null);
+    const barred = this._unavailable(a);
     let status;
     if (a.disabled) {
       status = gray('disabled');
@@ -3142,7 +3160,7 @@ export class TUI {
       case 'active':    status = isCur ? green('active') : 'active'; break;
       case 'throttled': status = yellow('throttled'); break;
       case 'exhausted': status = red('exhausted'); break;
-      case 'error':     status = red('error'); break;
+      case 'error':     status = red(errorLabel(a.errorReason?.code)); break;
       default:          status = a.status || 'ready';
     }
     status = rpad(status, 10);
@@ -3212,23 +3230,29 @@ export class TUI {
     // A list with no five-hour window to draw (see _listLayout) starts the row
     // at the weekly bar.
     const weeklyFirst = !shortBar && category !== 'metered';
-    // A Codex row whose subscription meters no five-hour window draws only the
-    // weekly bar even while Claude rows on the same list keep Ses/Wk: a `Ses -`
-    // cell there said nothing. Keyed on the fact the reading left behind
-    // (`sessionWindowStated`, see _updateCodexQuota), never on `unified5h`
+    // A row whose subscription meters no five-hour window (a Codex plan, or a
+    // Claude Ultra plan once its 5-hour limit is lifted) draws only the weekly
+    // bar even while other rows on the same list keep Ses/Wk: a `Ses -` cell
+    // there said nothing. Keyed on the fact the reading left behind
+    // (`sessionWindowStated`, see noteSessionWindow), never on `unified5h`
     // being empty: the expiry sweep nulls that every five hours on a row that
     // does have a session window, and the row would swing between the two
     // shapes. An account that has not reported keeps both cells, so the row
     // does not change shape at startup. A reading that is still present keeps
     // its cell whatever the flag says (showSessionRow): it may be the one
-    // holding the account out of rotation. The weekly bar takes the two cells'
-    // width (bar + `  Wk ` + bar) so the row still ends where its neighbours do.
-    const weeklyOnly = !weeklyFirst && showBoth && category === 'unified'
-      && providerOf(a) === 'codex' && !showSessionRow(q) && q.unified7d != null;
-    // The mirror case: a plan with no shared weekly window (a Team seat).
+    // holding the account out of rotation. With two bars the weekly bar takes
+    // the two cells' width (bar + `  Wk ` + bar) so the row still ends where
+    // its neighbours do. In single-bar mode (no room for two) it takes the one
+    // slot at its own width: the row would otherwise draw `Ses` over nothing
+    // and leave out the weekly window, the only limit it has. A weekly reset
+    // leaves the shape alone: it nulls `unified7d` until the next reading,
+    // and the row draws an empty weekly bar meanwhile, not an empty Ses cell.
+    const weeklyOnly = !weeklyFirst && category === 'unified' && !showSessionRow(q);
+    // The mirror case: a plan with no shared weekly window (a Team seat). Its
+    // one slot already holds the session bar, so only two-bar mode changes it.
     const sessionOnly = !weeklyFirst && showBoth && category === 'unified' && !showWeeklyRow(q);
     if (weeklyFirst || weeklyOnly) [l1, r1, t1, w1, th1] = [l2, r2, t2, w2, th2];
-    const bw1 = (weeklyOnly || sessionOnly) ? bw * 2 + 6 : bw;
+    const bw1 = showBoth && (weeklyOnly || sessionOnly) ? bw * 2 + 6 : bw;
 
     // Keep the optional chaining: _renderAcct is called on instances built
     // without a config, and it read none before this line existed.
@@ -3294,6 +3318,12 @@ export class TUI {
    * @param {{ index: number, onExtraUsage?: boolean }} a */
   _onExtraUsage(a) {
     return typeof this.am.onExtraUsage === 'function' ? this.am.onExtraUsage(a.index) : a.onExtraUsage === true;
+  }
+
+  /** Why the account is out of rotation: the manager's verdict live, the payload's attached.
+   * @param {any} a */
+  _unavailable(a) {
+    return typeof this.am.unavailableReason === 'function' ? this.am.unavailableReason(a) : (a.unavailable ?? null);
   }
 
   /**
