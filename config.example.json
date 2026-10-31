@@ -13,6 +13,7 @@
     ],
     "sessionDetail": false,
     "mcp": "off",
+    "drainTimeoutSeconds": 0,
     "cliproxyApi": "off"
   },
   "upstream": "https://api.anthropic.com",
