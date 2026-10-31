@@ -19,6 +19,9 @@
 // exactly the account we want to warm.
 
 import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { posix, win32 } from 'node:path';
 import { encodePinComponent } from './claude-env.js';
 import { providerOf } from './provider.js';
 import {
@@ -28,6 +31,62 @@ import {
 } from './warmup-schedule.js';
 
 const SCHEDULE_TIMER_GRACE_MS = 60_000;
+
+// Names a `claude` binary can have. On Windows the PATH entry is usually
+// npm's `.cmd` shim; the native installer writes `claude.exe`.
+/** @param {string} platform @returns {string[]} */
+function claudeFileNames(platform) {
+  return platform === 'win32' ? ['claude.cmd', 'claude.exe', 'claude'] : ['claude'];
+}
+
+/**
+ * Command the warmer should spawn.
+ *
+ * A service PATH does not include the shell's `~/.local/bin`, so `spawn('claude')`
+ * fails with ENOENT when Claude Code is the native install (#585). Prefer the
+ * bare name when some directory on PATH already has it, so the Windows `.cmd`
+ * shim keeps going through the shell. Otherwise use the native binary by
+ * absolute path. That lookup happens at spawn time, so an agent installed
+ * before `~/.local/bin` was added to the service PATH still finds it.
+ *
+ * @param {{ pathEnv?: string, home?: string, exists?: (p: string) => boolean, platform?: string }} [opts]
+ * @returns {string}
+ */
+export function resolveClaudeCommand({
+  pathEnv = process.env.PATH || '',
+  home = homedir(),
+  exists = existsSync,
+  platform = process.platform,
+} = {}) {
+  const pathMod = platform === 'win32' ? win32 : posix;
+  const sep = platform === 'win32' ? ';' : ':';
+  const names = claudeFileNames(platform);
+  for (const dir of String(pathEnv).split(sep)) {
+    if (!dir) continue;
+    for (const name of names) {
+      if (exists(pathMod.join(dir, name))) return 'claude';
+    }
+  }
+  if (home) {
+    const localBin = pathMod.join(home, '.local', 'bin');
+    for (const name of names) {
+      const candidate = pathMod.join(localBin, name);
+      if (exists(candidate)) return candidate;
+    }
+  }
+  return 'claude';
+}
+
+/** Windows needs a shell for a bare `claude` (the npm `.cmd` shim). An absolute
+ *  path is the executable itself, and a shell would split it on spaces.
+ *  @param {string} command
+ *  @param {string} [platform]
+ *  @returns {boolean}
+ */
+export function claudeSpawnShell(command, platform = process.platform) {
+  const abs = platform === 'win32' ? win32.isAbsolute(command) : posix.isAbsolute(command);
+  return platform === 'win32' && !abs;
+}
 
 // The warm-up is a `claude` run, so only an Anthropic subscription can take
 // it: a third-party backend has no 5-hour window of Anthropic's, and the server
@@ -47,6 +106,7 @@ export class Warmer {
    * @param {string} [opts.model]
    * @param {string} [opts.prompt]
    * @param {Function} [opts.spawnFn]
+   * @param {Function} [opts.commandFn] resolves the `claude` command at spawn time
    * @param {number} [opts.timeoutMs]
    * @param {Function} [opts.log] defaults to a call-time `console.log` — see below
    * @param {Function} [opts.nowFn]
@@ -61,6 +121,7 @@ export class Warmer {
     model = 'haiku',
     prompt = 'hi',
     spawnFn = defaultSpawn,
+    commandFn = () => resolveClaudeCommand(),
     timeoutMs = 120_000,
     // Resolves the console per call rather than capturing it. A default
     // parameter is evaluated when the constructor runs, and the server builds
@@ -83,6 +144,7 @@ export class Warmer {
     this.model = model;
     this.prompt = prompt;
     this.spawnFn = spawnFn;
+    this.commandFn = commandFn;
     this.timeoutMs = timeoutMs;
     this.log = log;
     this.nowFn = nowFn;
@@ -369,7 +431,7 @@ export class Warmer {
     const pin = encodePinComponent(identity);
     const baseUrl = `http://127.0.0.1:${this.port}/tc-acct/${pin}`;
     return {
-      command: 'claude',
+      command: this.commandFn(),
       // `--bare -p`: minimal, non-interactive, auth strictly via ANTHROPIC_API_KEY
       // (which this proxy strips and replaces with the pinned account's token).
       args: ['-p', '--bare', '--model', this.model, '--output-format', 'text', this.prompt],
@@ -429,7 +491,8 @@ function defaultSpawn({ command, args, env, timeoutMs, signal }) {
       // On Windows the `claude` on PATH is npm's .cmd shim, which a shell-less
       // spawn never resolves (it only tries .exe), so warming failed with ENOENT.
       // Same platform guard `teamclaude run` applies to its own spawnSync.
-      child = spawn(command, args, { env, stdio: 'ignore', shell: process.platform === 'win32' });
+      // An absolute path is the native binary, so it must not go through the shell.
+      child = spawn(command, args, { env, stdio: 'ignore', shell: claudeSpawnShell(command) });
     } catch (err) {
       reject(err);
       return;
