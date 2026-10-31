@@ -8,7 +8,7 @@ import { SessionTracker } from './session-tracker.js';
 import { SessionPins } from './session-pins.js';
 import { buildQuotaSummary, quotaTier } from './quota-summary.js';
 import { ROLLOVER_MIN_JUMP_MS, remapHeld, findHeld, dropHeld, newObservation } from './rollover.js';
-import { decideBand, pressureOf, pressureRank, assertNever } from './band-decision.js';
+import { decideBand, pressureOf, pressureRank, assertNever, WEEKLY_WINDOW_SECONDS } from './band-decision.js';
 import { BurnRateLearner, ConcurrencyLearner, scoreCandidate } from './adaptive-distribution.js';
 import { OutsideSpendTracker, OUTSIDE_SPEND_STATES, OUTSIDE_SPEND_SETTLE_MS, outsideSpendKey } from './outside-spend.js';
 import { forecastWindow } from './forecast.js';
@@ -651,6 +651,9 @@ export class AccountManager {
     // Hands out stamps no other reading can equal (see _activityStamp).
     this._busyStamp = 0;
     this.concurrencyLearner = new ConcurrencyLearner(adaptive);
+    // adaptiveDistribution.scoring, fixed at construction like the rest of the
+    // block: 'pressure' scores a placement by expiry pressure (_placementPressure).
+    this.scoring = this.burnRateLearner.opts.scoring === 'pressure' ? 'pressure' : 'burndown';
     // The stored quota series behind the fleet forecast (#550). Empty until the
     // server loads its file (index.js) or samples accumulate; the manager only
     // samples into it and reads it, the file I/O lives with the caller.
@@ -1952,14 +1955,26 @@ export class AccountManager {
       // that pressure picks the destination.
       if (this.expiryRouting.enabled && this.expiryRouting.preempt
           && this._pinRolledOver(sessionId, pinned, model)) {
-        const next = this._pickLeastLoaded(exclude, model, advisorModel);
+        // Whether to move is decided on the burndown score, so the placement
+        // scoring never changes which sessions lose their cache.
+        const next = this._pickLeastLoaded(exclude, model, advisorModel, 'decision');
         if (next && next.index !== idx) {
+          // Decided: under adaptive "pressure" only the destination is open, and
+          // that is a placement among the OTHER accounts, so the score can never
+          // hand the session back. A key inside the adaptiveDistribution block
+          // must not move a session in even or load mode, whose own pick already
+          // named the destination.
+          let dest = next;
+          if (this.distributionMode === 'adaptive' && this.scoring === 'pressure') {
+            const placed = this._pickLeastLoaded(new Set([...(exclude ?? []), idx]), model, advisorModel);
+            if (placed) dest = placed;
+          }
           // A fleet-wide rollover moves every session pinned to that account at
           // once, so the destination gets the same failover burst any other
           // switch would send it — pace it (issue #84).
-          this._beginRamp(next);
-          console.log(`[TeamClaude] Session pin on "${pinned.name}" released — its weekly window rolled over; re-routing to "${next.name}"`);
-          return next;
+          this._beginRamp(dest);
+          console.log(`[TeamClaude] Session pin on "${pinned.name}" released — its weekly window rolled over; re-routing to "${dest.name}"`);
+          return dest;
         }
         // The traffic did not move, so the observation is left where it is and
         // the next request asks again.
@@ -1980,13 +1995,20 @@ export class AccountManager {
   /** Where a new session goes, per the configured distribution mode. Adaptive
    * scores the tier by remaining credit and congestion; even (the original)
    * spreads by active-session count; load spreads by the requests each account
-   * carried in the last LOAD_WINDOW_MS, with the even keys as tie-breaks. */
-  _pickLeastLoaded(exclude = null, model = null, advisorModel = null) {
+   * carried in the last LOAD_WINDOW_MS, with the even keys as tie-breaks.
+   * `purpose` is 'placement' (a new session, or the destination of a move already
+   * decided) or 'decision' (whether a pinned session moves at all).
+   * @param {Set<number>|null} [exclude]
+   * @param {string|null} [model]
+   * @param {string|null} [advisorModel]
+   * @param {'placement'|'decision'} [purpose]
+   * @returns {Record<string, any>|null} */
+  _pickLeastLoaded(exclude = null, model = null, advisorModel = null, purpose = 'placement') {
     if (this.distributionMode === 'load') {
       return this._pickLeastLoadedEven(exclude, model, advisorModel, { byRequests: true });
     }
     if (this.distributionMode === 'adaptive') {
-      const picked = this._pickAdaptive(exclude, model, advisorModel);
+      const picked = this._pickAdaptive(exclude, model, advisorModel, purpose);
       // Adaptive can legitimately score every candidate at zero — the whole
       // tier is inside its reserve — and that is not a reason to refuse a
       // request. Fall through to the even walk, which still returns the least
@@ -2049,8 +2071,19 @@ export class AccountManager {
     return this.sessionTracker.activeCountFor(account.index, now) + (account.inFlight || 0);
   }
 
-  _pickAdaptive(exclude = null, model = null, advisorModel = null) {
+  /**
+   * @param {Set<number>|null} [exclude]
+   * @param {string|null} [model]
+   * @param {string|null} [advisorModel]
+   * @param {'placement'|'decision'} [purpose]
+   * @returns {Record<string, any>|null}
+   */
+  _pickAdaptive(exclude = null, model = null, advisorModel = null, purpose = 'placement') {
     const now = Date.now();
+    const byPressure = this.scoring === 'pressure' && purpose !== 'decision';
+    // Pressure only when this pick is a placement: the decision whether a pinned
+    // session moves is scored on burndown whatever the block says.
+    const scoring = { ...this.burnRateLearner.opts, scoring: byPressure ? 'pressure' : 'burndown' };
     const bucket = this._weeklyBucketFor(model);
 
     // The SAME candidate set the even walk uses, so adaptive cannot quietly
@@ -2096,6 +2129,7 @@ export class AccountManager {
       reserve: this.burnRateLearner.reserve(account.index, windows[i].bucket),
       load: this._adaptiveLoad(account, now),
       concCap: this.concurrencyLearner.cap(account.index),
+      ...(byPressure ? { pressure: this._placementPressure(account, model, now) } : {}),
     }));
     const maxRemaining = Math.max(...candidates.map(c => {
       const u = Number.isFinite(c.utilization) ? c.utilization : 0;
@@ -2109,7 +2143,7 @@ export class AccountManager {
     for (const c of candidates) {
       // The operator's adaptive settings, maxBurnBoost among them; the learner
       // holds them merged over the defaults.
-      const { score } = scoreCandidate({ ...c, maxRemaining }, this.burnRateLearner.opts);
+      const { score } = scoreCandidate({ ...c, maxRemaining }, scoring);
       // Soonest weekly reset breaks a tie, matching the rest of selection: on
       // an idle fleet every candidate scores identically, and without this the
       // winner would be array order.
@@ -2136,7 +2170,12 @@ export class AccountManager {
    * counts left one account carrying a third of a 14-account pool's traffic.
    * Counting what each account actually served places the next session where
    * the least work is, and the session stays pinned there for cache reuse as
-   * in every other mode. */
+   * in every other mode.
+   * @param {Set<number>|null} [exclude]
+   * @param {string|null} [model]
+   * @param {string|null} [advisorModel]
+   * @param {{ byRequests?: boolean }} [options]
+   * @returns {Record<string, any>|null} */
   _pickLeastLoadedEven(exclude = null, model = null, advisorModel = null, { byRequests = false } = {}) {
     const now = Date.now();
     const candidates = this._bandedCandidates(exclude, model, advisorModel);
@@ -2391,6 +2430,8 @@ export class AccountManager {
         planWeight: planWeight ?? null,
         reserve: this.burnRateLearner.reserve(a.index, window.bucket),
         concCap: this.concurrencyLearner.cap(a.index),
+        // What a "pressure" score is taken from. A burndown row grows nothing.
+        ...(this.scoring === 'pressure' ? { scoring: 'pressure', placementPressure: this._placementPressure(a, model, now) } : {}),
         _remaining: (usePlanWeights && planWeight != null ? planWeight : 1) * head,
       };
     });
@@ -2407,7 +2448,8 @@ export class AccountManager {
         load: r.sessions + r.inFlight,
         concCap: r.concCap,
         maxRemaining,
-      }, this.burnRateLearner.opts);
+        pressure: r.placementPressure,
+      }, { ...this.burnRateLearner.opts, scoring: this.scoring });
       r.score = score;
       total += score;
     }
@@ -3255,6 +3297,50 @@ export class AccountManager {
   _pressureVariant(account, model = null, now = Date.now()) {
     const [snapshotAccount] = this._bandSnapshot([account], model, now).accounts;
     return pressureOf(snapshotAccount, now);
+  }
+
+  /**
+   * What the "pressure" scoring prices `account` at, per second: the band's own
+   * pressure (`_pressureVariant`), with the states the band leaves open priced so
+   * that every candidate gets a score.
+   *
+   *   known            the band's figure; a reset that has already passed is a
+   *                    fresh window, and nothing left under the caps is 0
+   *   no reading       a fresh window: the room under the caps (1 with none) over
+   *                    one week. Priced at 0 it would starve the roomiest account
+   *   no reset time    the band's own lower bound
+   *   not a number     0
+   *
+   * @param {Record<string, any>} account
+   * @param {string|null} model
+   * @param {number} now
+   * @returns {number}
+   */
+  _placementPressure(account, model = null, now = Date.now()) {
+    const [snapshotAccount] = this._bandSnapshot([account], model, now).accounts;
+    const pressure = pressureOf(snapshotAccount, now);
+    const fresh = () => this._freshSpendable(account, model) / WEEKLY_WINDOW_SECONDS;
+    switch (pressure.kind) {
+      case 'known': return pressure.value > 0 || snapshotAccount.resetAt > now ? pressure.value : fresh();
+      case 'absent':
+        switch (pressure.reason) {
+          case 'no-utilization': return fresh();
+          case 'no-reset': return pressure.lowerBound ?? 0;
+          default: return 0;
+        }
+      default: return assertNever(pressure, '_placementPressure');
+    }
+  }
+
+  /**
+   * The room a new window offers `account` for `model`: the lowest of its caps on
+   * the shared weekly and the family bucket, and 1. A cap above 1 reads as 1, as
+   * in the band's own pricing.
+   * @param {Record<string, any>} account
+   * @param {string|null} model
+   */
+  _freshSpendable(account, model) {
+    return Math.max(0, Math.min(1, this.capFor('unified7d', account) ?? 1, this.capFor(this._weeklyBucketFor(model), account) ?? 1));
   }
 
   /**
