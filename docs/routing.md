@@ -36,6 +36,23 @@ Reacting the wrong way to either one makes things worse, so they are handled sep
 
 Rotating on a rate-limit 429 would just move the burst to the next account and throw away the first account's prompt cache.
 
+## Billing refusals
+
+An HTTP `400` with Anthropic's `invalid_request_error` message beginning
+`Your credit balance is too low to access the Anthropic API.`, or an HTTP
+`400` or `402` with a structured `billing_error`, excludes that account from
+automatic rotation for five minutes. The request fails over immediately,
+including to [subscription usage credits] when the existing fallback policy
+allows them. Other validation errors pass through unchanged.
+
+Status reports the billing refusal separately from quota exhaustion and
+recommends checking billing or purchasing credits. If every eligible account
+is in this cooldown, the proxy returns `402 billing_error`. The next request
+after the cooldown retries the account. Re-enabling the account or replacing
+its API key also clears the cooldown.
+
+[subscription usage credits]: quota.md#extra-usage-fallback
+
 ## OAuth entitlement denials
 
 A `403` whose structured error code is `error.details.error_code: oauth_not_allowed_for_organization` means the selected account's organization does not permit OAuth authentication. TeamClaude fails the current request over to another account and keeps the denied account out of automatic rotation for five minutes. The cooldown is shared by later requests, is not persisted, and expires automatically so an organization policy change can recover without restarting the proxy. Other `403` responses still fail over for that request but do not quarantine the account.

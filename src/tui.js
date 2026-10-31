@@ -2846,13 +2846,16 @@ export class TUI {
       const fixed = 20 + typeCell + NAME_MIN + routeCells + tagW + spendW + creditW + switchW + routeW;
       const span = (/** @type {number} */ n, /** @type {number} */ bar) => fixed + 6 * (n - 1) + n * bar;
       const roomFor = (/** @type {number} */ n) => span(n, BAR_MIN) <= W;
-      // No Ses bar once every Codex account here has said it meters no 5h window
+      // No Ses bar once every account here has said it meters no 5h window
       // (`sessionWindowStated`, the fact a reading leaves behind; not
       // `unified5h` itself, which the expiry sweep nulls every five hours on a
-      // row that does have one); a Claude row or an unreported account keeps it,
-      // and so does a reading that is still there (showSessionRow).
+      // row that does have one). Some Codex plans meter none, and so does an
+      // Anthropic Ultra account once its 5-hour limit is lifted. An unreported account keeps the column, and so does a
+      // reading that is still there (showSessionRow). Not keyed on a weekly
+      // reading being present either: a weekly reset nulls `unified7d` until
+      // the next reading, and the column would come back empty meanwhile.
       const shortBar = cat !== 'unified'
-        || members.some(a => providerOf(a) !== 'codex' || showSessionRow(a.quota) || a.quota.unified7d == null);
+        || members.some(a => showSessionRow(a.quota));
       // The family bars are the first thing to go: below the width where they
       // fit even at BAR_MIN they would push the row past the edge, and a row
       // cut mid-bar reads worse than one that simply doesn't draw them (the
@@ -3212,23 +3215,29 @@ export class TUI {
     // A list with no five-hour window to draw (see _listLayout) starts the row
     // at the weekly bar.
     const weeklyFirst = !shortBar && category !== 'metered';
-    // A Codex row whose subscription meters no five-hour window draws only the
-    // weekly bar even while Claude rows on the same list keep Ses/Wk: a `Ses -`
-    // cell there said nothing. Keyed on the fact the reading left behind
-    // (`sessionWindowStated`, see _updateCodexQuota), never on `unified5h`
+    // A row whose subscription meters no five-hour window (a Codex plan, or a
+    // Claude Ultra plan once its 5-hour limit is lifted) draws only the weekly
+    // bar even while other rows on the same list keep Ses/Wk: a `Ses -` cell
+    // there said nothing. Keyed on the fact the reading left behind
+    // (`sessionWindowStated`, see noteSessionWindow), never on `unified5h`
     // being empty: the expiry sweep nulls that every five hours on a row that
     // does have a session window, and the row would swing between the two
     // shapes. An account that has not reported keeps both cells, so the row
     // does not change shape at startup. A reading that is still present keeps
     // its cell whatever the flag says (showSessionRow): it may be the one
-    // holding the account out of rotation. The weekly bar takes the two cells'
-    // width (bar + `  Wk ` + bar) so the row still ends where its neighbours do.
-    const weeklyOnly = !weeklyFirst && showBoth && category === 'unified'
-      && providerOf(a) === 'codex' && !showSessionRow(q) && q.unified7d != null;
-    // The mirror case: a plan with no shared weekly window (a Team seat).
+    // holding the account out of rotation. With two bars the weekly bar takes
+    // the two cells' width (bar + `  Wk ` + bar) so the row still ends where
+    // its neighbours do. In single-bar mode (no room for two) it takes the one
+    // slot at its own width: the row would otherwise draw `Ses` over nothing
+    // and leave out the weekly window, the only limit it has. A weekly reset
+    // leaves the shape alone: it nulls `unified7d` until the next reading,
+    // and the row draws an empty weekly bar meanwhile, not an empty Ses cell.
+    const weeklyOnly = !weeklyFirst && category === 'unified' && !showSessionRow(q);
+    // The mirror case: a plan with no shared weekly window (a Team seat). Its
+    // one slot already holds the session bar, so only two-bar mode changes it.
     const sessionOnly = !weeklyFirst && showBoth && category === 'unified' && !showWeeklyRow(q);
     if (weeklyFirst || weeklyOnly) [l1, r1, t1, w1, th1] = [l2, r2, t2, w2, th2];
-    const bw1 = (weeklyOnly || sessionOnly) ? bw * 2 + 6 : bw;
+    const bw1 = showBoth && (weeklyOnly || sessionOnly) ? bw * 2 + 6 : bw;
 
     // Keep the optional chaining: _renderAcct is called on instances built
     // without a config, and it read none before this line existed.
