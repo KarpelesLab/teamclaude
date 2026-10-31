@@ -1,6 +1,6 @@
 import http from 'node:http';
 import https from 'node:https';
-import { timingSafeEqual } from 'node:crypto';
+import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { createWriteStream, mkdirSync, writeSync } from 'node:fs';
 import { readdir, stat, unlink } from 'node:fs/promises';
 import { buffer } from 'node:stream/consumers';
@@ -21,6 +21,7 @@ import { accountRefusal, isRefused } from './account-refusal.js';
 import { applyAuthHeaders, upstreamFor, rewritesBody, defaultHeadersTimeoutFor, providerForPath, providerForHost, interceptHostsFor, providerOf, isSubscriptionAccount, canServeProvider, DEFAULT_PROVIDER, PROVIDERS } from './provider.js';
 import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
+import { createDrainState, DRAIN_RETRY_AFTER_SECONDS } from './drain.js';
 import { isRoutingFailure, describeRouting } from './account-routing.js';
 import { safeLine } from './safe-text.js';
 import { forwardRefusal, guardedLookup, FORBIDDEN_FORWARD } from './forward-target.js';
@@ -568,6 +569,9 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
   // Not a config write, but it names a session and moves it: one tenant must
   // not be able to put another tenant's session on an account of its choosing.
   ['/teamclaude/session-pin', 'a client key cannot pin sessions'],
+  // Drain stops new traffic for the whole proxy, which is the operator's call.
+  ['/teamclaude/drain', 'a client key cannot drain the proxy'],
+  ['/teamclaude/undrain', 'a client key cannot drain the proxy'],
 ]);
 
 // What an inference-scoped key is refused: every route under the control
@@ -612,14 +616,16 @@ export function callerView(client, scope) {
  * @param {any} [sx]
  * @param {any} [clientUsage]
  * @param {any} [dimensionUsage]
- * @param {{ bindHost?: string|null }} [opts]  `bindHost`: the address the caller
+ * @param {{ bindHost?: string|null, drain?: import('./drain.js').DrainState|null }} [opts]  `bindHost`: the address the caller
  *   binds, when it is not `config.proxy.host` (TEAMCLAUDE_HOST overrides it). The
  *   DNS-rebinding Host check accepts that address as naming this machine; given
  *   only the config value, a server bound off-box through the env var refused a
- *   key-less caller naming the very address it listens on (#423).
+ *   key-less caller naming the very address it listens on (#423). `drain`: the drain state the caller
+ *   also holds (drain.js), so a graceful shutdown waits on the same count the listener keeps.
  */
-export function createProxyServer(accountManager, config, hooks = {}, sx = null, clientUsage = null, dimensionUsage = null, { bindHost = null } = {}) {
+export function createProxyServer(accountManager, config, hooks = {}, sx = null, clientUsage = null, dimensionUsage = null, { bindHost = null, drain: sharedDrain = null } = {}) {
   const boundHost = () => bindHost || config.proxy?.host;
+  const drain = sharedDrain ?? createDrainState();
   const upstream = config.upstream || 'https://api.anthropic.com';
   const holdMs = (config.holdSeconds || 0) * 1000;
 
@@ -794,7 +800,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         res.writeHead(200, { 'Content-Type': 'application/json' });
         // Counters only: how full the upstream admission gate is (see
         // upstream-fetch.js), never which origins or requests.
-        res.end(JSON.stringify({ ...extra, ...status, caller: callerView(req.tcClient, auth.scope), upstreamPool: upstreamPoolStatus() }, null, 2));
+        res.end(JSON.stringify({ ...extra, ...status, caller: callerView(req.tcClient, auth.scope), upstreamPool: upstreamPoolStatus(), drain: drain.status() }, null, 2));
         return;
       }
 
@@ -829,6 +835,26 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           res.writeHead(500, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: 'reload failed; see the proxy log' }));
         }
+        return;
+      }
+
+      // Drain for maintenance (drain.js). While draining, the forwarding listener
+      // refuses NEW requests with a 503 and lets the ones in flight finish. The
+      // control plane stays open, so the operator can undrain. Local control only:
+      // the auth and cross-origin gates above apply, and a client key is refused
+      // by CLIENT_KEY_REFUSED_PATHS. Nothing is written to the config.
+      if (req.method === 'POST' && (req.url === '/teamclaude/drain' || req.url === '/teamclaude/undrain')) {
+        const wantDrain = req.url === '/teamclaude/drain';
+        const wasDraining = drain.isDraining();
+        if (wantDrain) drain.start();
+        else drain.stop();
+        if (wantDrain && !wasDraining) {
+          console.log(`[TeamClaude] Draining: new requests get 503 until /teamclaude/undrain (${drain.status().inFlight} in flight)`);
+        } else if (!wantDrain && wasDraining) {
+          console.log('[TeamClaude] Drain lifted: accepting new requests');
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, ...drain.status() }));
         return;
       }
 
@@ -1185,7 +1211,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
   // Opt-in egress pin: null unless config.egress.pin is set, and then shared by
   // the base listener and the MITM one so both honour the same hold.
   const egress = createEgressGuard(config, logLine);
-  const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, egress, clientUsage, dimensionUsage });
+  const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, egress, clientUsage, dimensionUsage, drain });
   const server = http.createServer(requestHandler);
   server.keepAliveTimeout = KEEP_ALIVE_TIMEOUT_MS;
 
@@ -1227,7 +1253,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
     const c = await certsPromise;
     return { key: c.leafKeyPem, cert: c.leafCertPem };
   };
-  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks, log: logLine, sx, egress, clientUsage, dimensionUsage }));
+  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks, log: logLine, sx, egress, clientUsage, dimensionUsage, drain }));
   // Remote Control's real-time channel is a WebSocket, not a request/response
   // call — Node fires 'upgrade' for that handshake, never 'request', so it
   // needs its own listener (base-URL routing path; the MITM path wires the
@@ -1669,6 +1695,24 @@ export function clientSessionId(headers) {
  *   onRequestEnd?: (id: number, info: Record<string, any>) => void,
  * } & Record<string, any>} ActivityHooks
  */
+// The header a caller reads its own request id from, and the one the proxy echoes
+// back on every response from the forwarding listener. The echoed value is the
+// caller's when it is a plain token, and a fresh UUID otherwise. It is for
+// correlation only: never identity, never a dedup key, never a routing input.
+export const CORRELATION_HEADER = 'x-teamclaude-request-id';
+const CALLER_REQUEST_ID = /^[A-Za-z0-9._:-]{1,128}$/;
+
+/**
+ * @param {Record<string, any>|null|undefined} headers
+ * @returns {string}
+ */
+export function callerRequestId(headers) {
+  // Node joins a repeated header with ", ", so a duplicate fails the pattern on
+  // its own. The typeof check covers any value that is not a single string.
+  const value = headers?.['x-request-id'];
+  return typeof value === 'string' && CALLER_REQUEST_ID.test(value) ? value : randomUUID();
+}
+
 // Shared by every listener in the process, not kept per listener: the activity
 // hooks key their rows by this id, and the MITM builds one listener per cached
 // (pin, client) server, so a per-listener counter would hand out the same id to
@@ -1689,15 +1733,25 @@ let lastRequestId = 0;
  * @param {Object|null} [opts.clientUsage]
  * @param {string|null} [opts.forcedClient]
  * @param {Object|null} [opts.dimensionUsage]
+ * @param {import('./drain.js').DrainState|null} [opts.drain]  the shared drain state (drain.js); a listener made without one keeps its own, which never drains
  */
-export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null, egress = null, clientUsage = null, forcedClient = null, dimensionUsage = null }) {
+export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null, egress = null, clientUsage = null, forcedClient = null, dimensionUsage = null, drain = null }) {
+  const drainState = drain ?? createDrainState();
   return async (req, res) => {
+    // Set before anything else, so every response from this listener carries the
+    // id, the refusals below included. setHeader rather than an object in a later
+    // writeHead: Node merges it into that head. A response's own x-request-id is a
+    // different header and is left alone.
+    const callerId = callerRequestId(req.headers);
+    res.setHeader(CORRELATION_HEADER, callerId);
     // The activity entry this request opened, while it is still open. Every
     // consumer holds the row until it is told the request ended, so exactly one
     // path must close it. Each closing site clears this first, which is how the
     // outer catch tells an entry it still has to account for from one that is
     // already closed.
     let openEntry = null;
+    // Set once this request is admitted past the drain gate; released in the finally below.
+    let leaveDrain = null;
     try {
       // Refused before any path-prefix classification below, so each of those
       // sees the path upstream will see (see hasDotSegment). Logged like the
@@ -1705,7 +1759,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       if (hasDotSegment(req.url)) {
         const reqId = ++lastRequestId;
         const sessionId = req.headers['x-claude-code-session-id'] || null;
-        hooks.onRequestEnd?.(reqId, { method: req.method, path: safeLine(req.url), account: '(refused: dot-segment in path)', status: 400, model: null, sessionId, pinned: false });
+        hooks.onRequestEnd?.(reqId, { callerRequestId: callerId, method: req.method, path: safeLine(req.url), account: '(refused: dot-segment in path)', status: 400, model: null, sessionId, pinned: false });
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'Request path must not contain dot-segments' } }));
         recordEarlyOutcome(accountManager, { sessionId }, req.url, true);
@@ -1725,6 +1779,26 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         return;
       }
       const hideActivity = isEventLog && eventLogging !== 'show';
+      // Drain (drain.js). Checked before anything is taken or waited on, so a refused
+      // request costs no account and no egress hold. An admitted request is counted from
+      // here until this listener returns, on every path. The answer carries Connection: close,
+      // except on HTTP/2, which forbids that header.
+      if (drainState.isDraining()) {
+        /** @type {Record<string, string>} */
+        const headers = { 'Content-Type': 'application/json', 'retry-after': String(DRAIN_RETRY_AFTER_SECONDS) };
+        if ((req.httpVersionMajor ?? 1) < 2) headers.connection = 'close';
+        res.writeHead(503, headers);
+        res.end(JSON.stringify({
+          type: 'error',
+          error: {
+            type: 'overloaded_error',
+            message: 'The proxy is draining (shutting down or in maintenance). Retry shortly.',
+            details: { error_code: 'draining' },
+          },
+        }));
+        return;
+      }
+      leaveDrain = drainState.enter();
       // Egress pin (opt-in): with the exit IP off the pinned one — a VPN that
       // dropped — hold rather than send. Upstream answers a request from an
       // unexpected region with a 403 that Claude Code reports as a dead session,
@@ -1781,7 +1855,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
           const shown = safeLine(token ?? raw);
           const reqId = ++lastRequestId;
           const sessionId = clientSessionId(req.headers);
-          if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(unknown pin: "${shown}")`, status: 404, model: null, sessionId, pinned: false });
+          if (!hideActivity) hooks.onRequestEnd?.(reqId, { callerRequestId: callerId, method: req.method, path: req.url, account: `(unknown pin: "${shown}")`, status: 404, model: null, sessionId, pinned: false });
           res.writeHead(404, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: `Unknown account pin "${shown}"` } }));
           recordEarlyOutcome(accountManager, { sessionId }, req.url, true);
@@ -1835,7 +1909,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         if (pinnedIndex == null) {
           const reqId = ++lastRequestId;
           const sessionId = clientSessionId(req.headers);
-          if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(unknown pin: "${safeLine(forcedPin)}")`, status: 404, model: null, sessionId, pinned: false });
+          if (!hideActivity) hooks.onRequestEnd?.(reqId, { callerRequestId: callerId, method: req.method, path: req.url, account: `(unknown pin: "${safeLine(forcedPin)}")`, status: 404, model: null, sessionId, pinned: false });
           res.writeHead(404, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: `Unknown account pin "${forcedPin}" (from TC_ACCT)` } }));
           recordEarlyOutcome(accountManager, { sessionId }, req.url, true);
@@ -1856,7 +1930,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
           pinnedIndex = resolveAccountPin(accountManager, sessionPin);
           if (pinnedIndex == null) {
             const reqId = ++lastRequestId;
-            if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(unknown pin: "${safeLine(sessionPin)}")`, status: 404, model: null, sessionId, pinned: false });
+            if (!hideActivity) hooks.onRequestEnd?.(reqId, { callerRequestId: callerId, method: req.method, path: req.url, account: `(unknown pin: "${safeLine(sessionPin)}")`, status: 404, model: null, sessionId, pinned: false });
             res.writeHead(404, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: `Unknown account pin "${sessionPin}" (session pin; clear it with: teamclaude switch --session --clear)` } }));
             recordEarlyOutcome(accountManager, { sessionId }, req.url, true);
@@ -1877,7 +1951,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         // close. The cost of this order is one spurious close if the hook threw
         // before registering anything, which every consumer already tolerates.
         openEntry = { reqId, sessionId };
-        hooks.onRequestStart?.(reqId, { method: req.method, path: req.url, sessionId, pinned: pinnedIndex != null, client: req.tcClient ?? forcedClient ?? null });
+        hooks.onRequestStart?.(reqId, { callerRequestId: callerId, method: req.method, path: req.url, sessionId, pinned: pinnedIndex != null, client: req.tcClient ?? forcedClient ?? null });
       }
 
       // Buffer request body (needed to resend on a different account after a 429).
@@ -1896,7 +1970,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         if (bodyBytes > maxBodyBytes) {
           await refuseOversizedBody(req, res);
           openEntry = null;   // this path owns the close below; the outer catch must not repeat it
-          if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: '(too large)', status: 413, model: modelFinder.done ? modelFinder.value : null, sessionId, pinned: pinnedIndex != null });
+          if (!hideActivity) hooks.onRequestEnd?.(reqId, { callerRequestId: callerId, method: req.method, path: req.url, account: '(too large)', status: 413, model: modelFinder.done ? modelFinder.value : null, sessionId, pinned: pinnedIndex != null });
           return;
         }
         bodyChunks.push(chunk);
@@ -1952,7 +2026,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         }
         recordEarlyOutcome(accountManager, { pinKey }, req.url, true);
         openEntry = null;   // this path owns the close below; the outer catch must not repeat it
-        hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: '(blocked)', status: 400, model, effort, sessionId });
+        hooks.onRequestEnd?.(reqId, { callerRequestId: callerId, method: req.method, path: req.url, account: '(blocked)', status: 400, model, effort, sessionId });
         return;
       }
 
@@ -1980,7 +2054,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // stripOverage, synthesizeQuota and poolQuota are sampled once here, at dispatch:
       // retries and holds of this request keep them, and a reload applies to
       // subsequent requests.
-      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, provider, holdBudgetMs: holdMs, pinKey, onMessage, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), synthesizeQuota: shouldSynthesizeQuotaHeaders(config), poolQuota: shouldPoolQuotaHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
+      const ctx = { account: null, callerRequestId: callerId, status: null, attempt: 0, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, provider, holdBudgetMs: holdMs, pinKey, onMessage, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), synthesizeQuota: shouldSynthesizeQuotaHeaders(config), poolQuota: shouldPoolQuotaHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -2036,7 +2110,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         // marked open would send the outer catch to call that same throwing hook
         // a second time for one request.
         openEntry = null;
-        if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, effort, sessionId, pinned: ctx.pinnedIndex != null, client });
+        if (!hideActivity) hooks.onRequestEnd?.(reqId, { callerRequestId: callerId, method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, effort, sessionId, pinned: ctx.pinnedIndex != null, client, attempts: ctx.attempt || 0 });
       }
     } catch (err) {
       reportFailure('[TeamClaude] Unhandled error:', err);
@@ -2061,6 +2135,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         // must not cost the socket its answer below either.
         try {
           hooks.onRequestEnd?.(entry.reqId, {
+            callerRequestId: callerId,
             method: req.method, path: req.url, account: null, status,
             model: null, sessionId: entry.sessionId, pinned: false,
           });
@@ -2073,6 +2148,8 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // forwardRequest, and the inner `finally` calls onRequestEnd after the
       // response has streamed.
       answerUnhandled(res);
+    } finally {
+      leaveDrain?.();
     }
   };
 }
@@ -2298,6 +2375,7 @@ function relayStream(req, res, upstream, sx, stripOverage = false) {
     const responseHeaders = {};
     for (const [key, value] of Object.entries(upstreamRes.headers)) {
       if (CONNECTION_SPECIFIC_HEADERS.has(key) || key === 'content-encoding' || key === 'content-length') continue;
+      if (key === CORRELATION_HEADER) continue;
       if (stripOverage && isOverageHeader(key)) continue;
       responseHeaders[key] = value;
     }
@@ -2573,6 +2651,7 @@ async function relayRaw(req, res, upstream, sx, maxBodyBytes = DEFAULT_MAX_BODY_
       // a gzip'd upstream response reaches the client mis-framed / truncated.
       if (key === 'transfer-encoding' || key === 'connection' ||
           key === 'content-encoding' || key === 'content-length') continue;
+      if (key === CORRELATION_HEADER) continue;
       if (stripOverage && isOverageHeader(key)) continue;
       responseHeaders[key] = value;
     }
@@ -3773,6 +3852,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // request head+body are written once, just before the response is logged.
   let log = null;
   let reqLogged = false;
+  // This call's upstream attempt, set where it is sent (see below).
+  let attempt = 0;
   const getLog = () => (logDir && ctx.logLevel !== 'off'
     ? (log ||= openRequestLog(logDir, reqId, { level: ctx.logLevel, maxBodyBytes: ctx.logMaxBodyBytes }))
     : null);
@@ -3783,7 +3864,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     const safeHeaders = { ...headers };
     if (safeHeaders['x-api-key']) safeHeaders['x-api-key'] = String(safeHeaders['x-api-key']).slice(0, 15) + '...';
     if (safeHeaders['authorization']) safeHeaders['authorization'] = String(safeHeaders['authorization']).slice(0, 20) + '...';
-    l.write(`=== REQUEST (account: ${account.name}, retry: ${retryCount}) ===\n${method} ${upstreamUrl}\n${formatHeaders(safeHeaders)}`);
+    // Each attempt writes its own log, so the header is what ties a file to its
+    // request and says which hop of it this was. The caller id is client input.
+    const caller = ctx.callerRequestId ? safeLine(ctx.callerRequestId) : '-';
+    l.write(`=== REQUEST (account: ${account.name}, retry: ${retryCount}, attempt: ${attempt}, request: ${reqId}, caller: ${caller}) ===\n${method} ${upstreamUrl}\n${formatHeaders(safeHeaders)}`);
     // The body that went upstream, not the one the client sent: they differ
     // exactly when the proxy rewrote it (tool-pair sanitising, account_uuid,
     // modelMap, cache_control strip), which is the first thing to check when
@@ -3832,6 +3916,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       ctx.tried.add(account.index);
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
     }
+    // One attempt per upstream send, counted here: after admission, so a queued
+    // wait is not an attempt, and past every refusal above that sends nothing. A
+    // failover, a 429 retry and a stream-failure hop each pass through here again.
+    attempt = ctx.attempt = (ctx.attempt || 0) + 1;
     let upstreamRes;
     let admittedLoad = 0;
     const entitlementEpoch = account.entitlementEpoch;
@@ -4426,6 +4514,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     const responseHeaders = {};
     for (const [key, value] of upstreamRes.headers.entries()) {
       if (CONNECTION_SPECIFIC_HEADERS.has(key)) continue;
+      // Ours, set before this head (see the listener): an upstream copy would win the merge.
+      if (key === CORRELATION_HEADER) continue;
       // Strip content-encoding/content-length since fetch may auto-decompress
       if (key === 'content-encoding' || key === 'content-length') continue;
       // Per-org billing state, dropped when stripOverageHeaders is on (see

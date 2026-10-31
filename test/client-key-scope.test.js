@@ -24,6 +24,8 @@ const CONTROL_ROUTES = [
   ['POST', '/teamclaude/priority', { account: 'acct', place: 'first' }],
   ['POST', '/teamclaude/disable', { account: 'acct', disabled: true }],
   ['POST', '/teamclaude/session-pin', {}],
+  ['POST', '/teamclaude/drain'],
+  ['POST', '/teamclaude/undrain'],
   ['POST', '/teamclaude/mcp', { jsonrpc: '2.0', id: 1, method: 'tools/list' }],
   ['GET', '/teamclaude/mcp'],
   ['POST', '/teamclaude/no-such-route', {}],
