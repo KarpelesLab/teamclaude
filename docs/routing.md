@@ -36,13 +36,34 @@ Reacting the wrong way to either one makes things worse, so they are handled sep
 
 Rotating on a rate-limit 429 would just move the burst to the next account and throw away the first account's prompt cache.
 
+## Billing refusals
+
+An HTTP `400` with Anthropic's `invalid_request_error` message beginning
+`Your credit balance is too low to access the Anthropic API.`, or an HTTP
+`400` or `402` with a structured `billing_error`, excludes that account from
+automatic rotation for five minutes. The request fails over immediately,
+including to [subscription usage credits] when the existing fallback policy
+allows them. Other validation errors pass through unchanged.
+
+Status reports the billing refusal separately from quota exhaustion and
+recommends checking billing or purchasing credits. If every eligible account
+is in this cooldown, the proxy returns `402 billing_error`. The next request
+after the cooldown retries the account. Re-enabling the account or replacing
+its API key also clears the cooldown.
+
+[subscription usage credits]: quota.md#extra-usage-fallback
+
 ## OAuth entitlement denials
 
-A `403` whose structured error code is `error.details.error_code: oauth_not_allowed_for_organization` means the selected account's organization does not permit OAuth authentication. TeamClaude fails the current request over to another account and keeps the denied account out of automatic rotation for five minutes. The cooldown is shared by later requests, is not persisted, and expires automatically so an organization policy change can recover without restarting the proxy. Other `403` responses still fail over for that request but do not quarantine the account.
+A `403` whose structured error code is `error.details.error_code: oauth_not_allowed_for_organization` means the selected account's organization does not permit OAuth authentication. TeamClaude fails the current request over to another account and keeps the denied account out of automatic rotation for five minutes. The cooldown is shared by later requests, is not persisted, and expires automatically so an organization policy change can recover without restarting the proxy. Other `403` responses still fail over for that request but do not quarantine the account, except the account refusals below.
 
 If every configured account returns that exact denial, TeamClaude's terminal `502` says that no account served the request, names the denied accounts and error code, and recommends waiting for automatic re-admission or pinning a different eligible account. It does not recommend `teamclaude login`, which remains the diagnostic for a generic credential refusal.
 
 An explicit [`TC_ACCT` pin](#pin-a-session-to-one-account) continues to target exactly the requested account and never fails over, even while that account is excluded from automatic rotation.
+
+## Account refusals
+
+Some refusals are about the account rather than the request: `error.details.error_code` is `verification_required` (the owner has to verify their identity), `account_on_hold`, `organization_on_hold`, `organization_disabled`, `restricted_regime_endpoint` or `ip_not_in_allowed_range`. Older answers say the same with a `400` and no code: "This organization has been disabled." or "Identity verification is required…". On an OAuth account, any of these in a JSON `400` or a `403` puts the account in `error` with upstream's message (see [Why an account is in `error`](accounts.md#why-an-account-is-in-error)), and the request fails over. Every other `400` goes to the client unchanged. If every account was refused, the terminal `502` quotes upstream's message for each; later requests name the account as refused by upstream and point to `teamclaude status`.
 
 ## Token scope denials
 
@@ -219,13 +240,31 @@ Quota response headers supply utilization and reset time. Burn rate is learned f
 
 The `sess` in both lines is the display's short label and counts **conversations**, not client sessions: `active 3 sess` is three active conversations pinned to that account, which may all belong to one Claude Code session and its subagents. The TUI's session figures count the same thing.
 
-`next` names the account the deterministic picker would choose for the next new conversation. `weight` is that account's score normalized across the competing tier; it explains how strongly the inputs favor an account, but is not a routing probability. `plan` is the subscription multiplier read from the OAuth profile, not inferred from traffic. An unknown future tier is shown as `plan unknown`, and its competing tier falls back to plain utilization fractions rather than guessing. `weight n/a (all reserved)` means every account in the tier is inside its reserve, so the even fallback decides the next target.
+`next` names the account the deterministic picker would choose for the next new conversation. `weight` is that account's score normalized across the competing tier; it explains how strongly the inputs favor an account, but is not a routing probability. `plan` is the subscription multiplier read from the OAuth profile, not inferred from traffic. An unknown future tier is shown as `plan unknown`, and its competing tier falls back to plain utilization fractions rather than guessing. `weight n/a (all reserved)` means every account in the tier is inside its reserve, so the even fallback decides the next target. Under `"scoring": "pressure"` the `head`, `plan` and `conc` fields give way to `P 3.85e-6`, the pressure per second the score was taken from, and `weight n/a (all zero)` means every account scored 0.
 
 A Codex account is scored only against other Codex accounts, on its own quota window, so its row names that window in place of the Claude bucket: `weight 95% of codex weekly`, not `of opus+`. Its `plan` is the ChatGPT plan upstream reported (`plan pro`), with no numeric weight; `plan unknown` appears only until a plan has been reported. The displayed weight and routing are the same as before this label; only the words changed.
 
 **Turning it off drains, it doesn't cut.** The setting is applied live on config reload, and switching it off would otherwise move every distributed conversation to the current account on its *next* request — each one throwing away the prompt cache it built on its old account, and all of them arriving at one account at once. Instead, the conversations running at that moment keep their accounts, and only **new** ones go back to plain quota-driven rotation. Affinity therefore winds down as those conversations finish rather than snapping, and a draining conversation whose account becomes ineligible simply rejoins normal rotation. While this is happening `teamclaude status` reads `draining N` (the TUI header shows `drain N`) instead of `single-account`, and it clears itself once the last of them is done or idles out.
 
 With `expiryRouting.preempt` on, a governing-window **rollover** also ends the drain for the conversation whose account rolled, and it rejoins normal rotation there and then. The drain trades expiring quota for a warm prompt cache, and that trade is priced on the window the account had when the drain started; once that window has gained a full week the account is the one the fleet should be spending last. Nothing else bounds it — a conversation making requests never idles out — so without this a long-lived one rides a rolled-over account for as long as it keeps talking.
+
+#### Scoring by expiry pressure
+
+```json
+"distributeSessions": "adaptive",
+"adaptiveDistribution": { "scoring": "pressure" },
+"expiryRouting": { "enabled": true, "tolerance": 3, "preempt": false }
+```
+
+The default score (`"scoring": "burndown"`, everything above) ranks accounts by the weekly room they have left. With [`expiryRouting`](#expiry-pressure-routing) on, the reset time then only decides who is in the top pressure band, so spreading across expiring windows is all-or-nothing and `tolerance` is the only dial. `"scoring": "pressure"` ranks inside the band by the pressure the band already computes:
+
+```
+score = P ÷ (1 + load)
+```
+
+`P` is the same figure the band uses: the room under the account's [`maxUsage`](quota.md#per-account-usage-caps) caps (the whole window with none) per second until the governing weekly window resets. `load` is active conversations plus requests in flight, as above. New conversations then land in proportion to how soon each account's quota expires, instead of all on the most urgent account or by room left. The burn boost, taper and concurrency cap are not part of this score.
+
+Every candidate needs a score, so the states the band leaves open are priced: a reset that has already passed, or no reading, counts as a fresh window (the cap, or 1, over one week); a reading with no reset time uses the band's own lower bound; and an account with nothing left under its caps scores 0. When every candidate scores 0 the even walk places the conversation, as it does when every account is reserved. Nothing else changes: availability, priority, the band, pins and the decision whether a pinned conversation moves (the `preempt` rollover above) are untouched. When that decision has moved a conversation, `"pressure"` picks the destination among the other accounts. With `expiryRouting` off the band lets every account through and only the score changes. The setting applies to `"adaptive"` only and is read at startup.
 
 ### Load distribution
 

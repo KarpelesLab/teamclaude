@@ -1,6 +1,7 @@
 import { formatMoney } from './oauth.js';
 import { findFamilyBlock, modelGlobOverlaps, gatingUtilization, resolveMaxUsage, resolveSwitchThreshold, resolveFleetThreshold, switchThresholdDiffs, resolveMaxSpendMinor, spendCapReached } from './model.js';
-import { safeLine } from './safe-text.js';
+import { safeLine, sanitizeText } from './safe-text.js';
+import { isRefused } from './account-refusal.js';
 import { ROUTE_COLORS } from './config-ops.js';
 import { describeRouting } from './account-routing.js';
 
@@ -55,6 +56,9 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
   if (status.server?.startedAt || status.server?.uptimeSeconds != null) {
     lines.push(`${paint.dim('Server'.padEnd(12))} ${formatServerSummary(status.server, now)}`);
   }
+  // Only when the fleet runs out within the forecast horizon (#550).
+  const fleetForecast = fleetForecastText(status.fleetForecast, now);
+  if (fleetForecast) lines.push(`${paint.dim('Fleet'.padEnd(12))} ${paint.yellow(fleetForecast)}`);
   lines.push('');
 
   for (const line of routingLines(status.routes, blocked, paint)) lines.push(line);
@@ -158,6 +162,7 @@ export const UNAVAILABLE_TEXT = {
   'advisor-capped': "advisor model's usage cap reached (maxUsage)",
   entitlement: 'upstream refused this account for the organization (cooldown)',
   routing: "the account's routing proxy is unreachable (cooldown)",
+  billing: 'upstream billing refused usage (cooldown); check billing or purchase credits',
   credential: 'upstream rejected its API key with a 401 (cooldown, then retried)',
   route: 'no route allows this account',
   'advisor-quota': "advisor model's weekly bucket spent",
@@ -249,6 +254,41 @@ export function outsideSpendText(outsideSpend) {
     return label + ': not observed (quota probe off?)';
   });
   return parts.join(' \u00b7 ');
+}
+
+/**
+ * The fleet forecast as one line, or null when there is none (#550):
+ *
+ *   "all accounts out in ~31h (weekly), first back 4h later"
+ *   "all accounts out now (5h), first back in 2h"
+ *
+ * Pure and closure-free on purpose, like forecastText: the dashboard
+ * serializes it into its page with toString().
+ *
+ * @param {{allOutAt?: number|null, firstBackAt?: number|null, boundBy?: string|null, ratePerDay?: number|null}|null|undefined} fleet
+ * @param {number} now  ms epoch
+ * @returns {string|null}
+ */
+export function fleetForecastText(fleet, now) {
+  if (!fleet || typeof fleet.allOutAt !== 'number') return null;
+  /** @param {number} ms */
+  var dur = function (ms) {
+    var minutes = Math.max(1, Math.round(ms / 60000));
+    if (minutes < 60) return minutes + 'm';
+    var hours = Math.round(minutes / 60);
+    if (hours < 48) return hours + 'h';
+    var days = Math.floor(hours / 24);
+    var rem = hours % 24;
+    return rem ? days + 'd' + rem + 'h' : days + 'd';
+  };
+  var out = fleet.allOutAt > now;
+  var bucket = fleet.boundBy === '5h' ? '5h' : 'weekly';
+  var text = 'all accounts out ' + (out ? 'in ~' + dur(fleet.allOutAt - now) : 'now') + ' (' + bucket + ')';
+  var back = fleet.firstBackAt;
+  if (typeof back === 'number' && back > now) {
+    text += out ? ', first back ' + dur(back - fleet.allOutAt) + ' later' : ', first back in ' + dur(back - now);
+  }
+  return text;
 }
 
 /**
@@ -400,13 +440,24 @@ export function heldResetCredits(quota, now = Date.now()) {
   return available;
 }
 
+// Upstream refused the account itself: its words, and its link when the
+// shortened words lost it.
+function refusalText(/** @type {Record<string, any>} */ err) {
+  const detail = safeLine(err.detail, 200);
+  const link = err.link && !detail.includes(err.link) ? ` ${sanitizeText(err.link)}` : '';
+  return `refused by upstream: ${detail}${link} — once resolved, run: ${safeLine(err.remedy, 40)}`;
+}
+
 export function unavailableLine(account, paint) {
   const reason = account?.unavailable;
   if (!reason) return null;
+  // A refusal outlasts a cap or a cooldown ranked above it, so it is named
+  // whatever `unavailable` says, short of the operator's own disable.
+  const refused = reason !== 'disabled' && isRefused(account);
   const err = reason === 'error' ? account.errorReason : null;
-  const text = err
-    ? `needs a re-login: ${safeLine(err.detail, 120)} — run: ${safeLine(err.remedy, 40)}`
-    : UNAVAILABLE_TEXT[reason] || safeLine(reason, 64);
+  const text = refused ? refusalText(account.errorReason)
+    : !err ? UNAVAILABLE_TEXT[reason] || safeLine(reason, 64)
+    : `needs a re-login: ${safeLine(err.detail, 120)} — run: ${safeLine(err.remedy, 40)}`;
   // An account serving as the extra-usage fallback reads as out of quota like
   // any other, yet is taking traffic and billing for it. Say so on the line
   // that would otherwise tell the operator it is idle.
@@ -693,7 +744,7 @@ function adaptivePlan(a, paint) {
 }
 
 // "next · weight 62%  ·  3 sess / 1 inflight  ·  head 38.0% of 98%  ·  plan 20x
-//  ·  conc 6"
+//  ·  conc 6"; under scoring "pressure" the last three give way to "P 3.85e-6".
 //
 // `next` is the deterministic routing result. `weight` is the account's score
 // normalized across competitors, useful for explaining why it won without
@@ -706,12 +757,17 @@ function formatAdaptive(a, paint) {
     // Every candidate scored zero: the whole tier is inside its reserve, so
     // there is no weight to report and saying "0%" everywhere would imply the
     // router had stopped, which it has not.
-    ? `${prefix}${paint.yellow(`weight n/a (all reserved, ${family})`)}`
+    ? `${prefix}${paint.yellow(`weight n/a (${a.scoring === 'pressure' ? 'all zero' : 'all reserved'}, ${family})`)}`
     : `${prefix}${paint.bold(`weight ${pct(a.weight, 0)} of ${family}`)}`);
   parts.push(`${num(a.sessions)} sess / ${num(a.inFlight)} inflight`);
-  parts.push(`head ${pct(a.headroom, 1)} of ${pct(a.threshold, 0)}`);
-  parts.push(adaptivePlan(a, paint));
-  parts.push(`conc ${num(a.concCap, 1)}`);
+  if (a.scoring === 'pressure') {
+    // The score is P over load: no head, plan weight or concurrency cap went into it.
+    parts.push(`P ${Number.isFinite(a.placementPressure) ? a.placementPressure.toExponential(2) : '?'}`);
+  } else {
+    parts.push(`head ${pct(a.headroom, 1)} of ${pct(a.threshold, 0)}`);
+    parts.push(adaptivePlan(a, paint));
+    parts.push(`conc ${num(a.concCap, 1)}`);
+  }
   const line = parts.join(paint.dim('  ·  '));
   return a.competing ? line : `${paint.dim('(not competing)')} ${line}`;
 }
