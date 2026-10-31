@@ -233,7 +233,7 @@ teamclaude help              # Show all commands
 
 `teamclaude attach` opens the terminal dashboard itself against a server that is already running, which is how you get interactive control back when the proxy runs as a background service. It polls the same status endpoint every second and can do the two things the remote control exposes: `s` switches account, `R` reloads config. The browser dashboard adds the matching **Reload config** action plus a zero-spend **Probe quotas** action; settings editing and the request activity stream still stay in the server's own TUI because they need state that only that process has. When contact with the server drops, the header marker turns from `▲` to `▼` and what is on screen is the last snapshot, not the current state.
 
-`teamclaude service install` registers the proxy as a user service that starts at login and restarts on its own — a LaunchAgent on macOS, a `systemd --user` unit on Linux (`uninstall`, `status` and `print` round it out; `print` writes the unit to stdout without touching anything). On macOS the LaunchAgent runs with `ProcessType` `Standard`: the `Background` class it used before carried a QoS clamp that starved the proxy under host contention (status timeouts, seconds of event-loop lag). The unit is only written at install time, so an existing install keeps whatever it was installed with until you re-run `teamclaude service install`.
+`teamclaude service install` registers the proxy as a user service that starts at login and restarts on its own — a LaunchAgent on macOS, a `systemd --user` unit on Linux (`uninstall`, `status` and `print` round it out; `print` writes the unit to stdout without touching anything). On macOS the LaunchAgent runs with `ProcessType` `Standard`: the `Background` class it used before carried a QoS clamp that starved the proxy under host contention (status timeouts, seconds of event-loop lag). The unit is only written at install time, so an existing install keeps whatever it was installed with until you re-run `teamclaude service install`. The service `PATH` includes `~/.local/bin` when that directory exists, which is where the native Claude Code installer places `claude`. Keep-warm also checks that directory when `claude` is not on the service `PATH`, so an already-installed service finds the binary without another install.
 
 Re-running `teamclaude service install` rewrites the unit and restarts the proxy on both platforms, so the proxy also picks up an updated install. Requests in flight are dropped.
 
@@ -293,6 +293,31 @@ A client elsewhere on the network presents the proxy key the same way the CLI do
 The endpoint is one more `/teamclaude/` route and is gated like the others: the proxy key or loopback, no cross-origin requests, and, for a caller admitted without a key, a Host header naming this machine. Three things follow from that. Every holder of any proxy key can read through it, but a named `proxy.clientKeys` key is served the `"read"` tools even when the setting is `"full"`: the write tools — removing an account among them — answer only to the shared `proxy.apiKey` and to key-exempt loopback callers, so handing a client its own key never hands it the fleet. With no proxy key configured at all, the endpoint serves only callers on the proxy's own machine (a loopback peer, no `X-Forwarded-For`/`X-Real-IP`/`Forwarded` header, and `proxy.trustLoopback` not set to `false`) and answers 403 to everyone else; set `proxy.apiKey` to reach it over the network. And a browser-based MCP client cannot reach it, because it sends an `Origin` header and is refused as cross-origin; the endpoint is for clients that run as programs. Each write is logged by the server as one line naming the tool and the arguments.
 
 It speaks both the stateless 2026-07-28 revision of the protocol and the handshake revisions before it, so a client on either works. Replies are plain JSON, never a stream.
+
+## CLIProxyAPI-compatible usage API
+
+Some usage dashboards read a multi-account fleet through the management API of [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) rather than through each provider. The server can answer the part of that API those dashboards use, so the quota of every account in the pool shows up there. It is off until the config says otherwise:
+
+```json
+{ "proxy": { "cliproxyApi": "read" } }
+```
+
+Point the dashboard's "CLI Proxy" source at the proxy (`http://localhost:3456`) and give it the proxy key as its management key. It sends the key as `Authorization: Bearer <key>` (`X-Management-Key` and `x-api-key` work too); `proxy.apiKey` and every `proxy.clientKeys` key are accepted, since the data is no more than `/teamclaude/status` already shows a key holder.
+
+Two routes are served:
+
+- `GET /v0/management/auth-files` lists the Claude and Codex subscription accounts as `{ "observed_at", "files": [{ id, auth_index, name, provider, email, status, disabled }] }`, in the fleet's own order. `auth_index` is the account's config entry id, and `status` is `error` for an account whose login was rejected. API-key and third-party backend accounts have no subscription usage and are not listed. CLIProxyAPI's query parameters work as they do there: `name` (an id or a name) and `auth_index` narrow the list, and `page` / `page_size` (default 50) page it, adding `total`, `page`, `page_size` and `has_more`; a paging value that is not a positive whole number is a 400.
+- `POST /v0/management/api-call` with `{ "auth_index", "method": "GET", "url" }` answers two URLs: `https://api.anthropic.com/api/oauth/usage` for a Claude account and `https://chatgpt.com/backend-api/wham/usage` for a Codex one. The reply is CLIProxyAPI's envelope, `{ "status_code": 200, "header": {…}, "body": "<json>" }`, with the body in the provider's own shape: `five_hour`, `seven_day` and `weekly_scoped` limits on a 0–100 scale with ISO-8601 reset times for Claude, `rate_limit.primary_window` / `secondary_window` with `used_percent` and epoch-second `reset_at` for Codex.
+
+Unlike CLIProxyAPI, `api-call` relays nothing. The answer is built from the quota the server already tracks; no request goes upstream, no credential is read, and the request's `header` and `data` (including any `$TOKEN$` placeholder) are ignored. Any other URL or method is refused with 403. Codex reset credits are not offered: their list and consume URLs, and `POST /v0/management/reset-quota`, answer 501, because spending a credit is irreversible and is left to the server's own [`autoRedeemResets`](quota.md) policy.
+
+The readings are as fresh as the server's: an account in use is read off every response, an idle one only by the [quota probe](quota.md#quota-probe), which is off by default. Turn the probe on for current numbers on idle accounts. Three cases are reported the way the provider would report them, so a dashboard can tell them apart:
+
+- A window the plan meters but that has no live reading — it reset since the last reading — is sent as the provider sends a window that has not started: `{ "utilization": 0, "resets_at": null }` for Claude, `used_percent: 0` with `reset_at: null` for Codex. That is what the server itself believes about the account; usage spent outside the proxy since the reset is not seen until the next reading.
+- A window the plan does not meter is `null`: `seven_day` on a Team seat, and the 5-hour window on a Codex plan without one (its weekly window is then the primary).
+- An account the server cannot vouch for answers a non-2xx `status_code` inside a 200 envelope, so the dashboard shows it as unreadable rather than idle: 503 for an account never read yet, 401 for one whose login was rejected (what the provider answers a dead token).
+
+The gates are the ones every other route passes, plus the MCP endpoint's rule for a config with no proxy key at all: then only callers on the proxy's own machine are served, and everyone else gets 403. Every path under `/v0/management/` is answered by the proxy itself, on or off, and never forwarded upstream; a WebSocket handshake there is refused with 404.
 
 ## Auto-update
 
