@@ -12,6 +12,8 @@ import { decideBand, pressureOf, pressureRank, assertNever } from './band-decisi
 import { BurnRateLearner, ConcurrencyLearner, scoreCandidate } from './adaptive-distribution.js';
 import { OutsideSpendTracker, OUTSIDE_SPEND_STATES, OUTSIDE_SPEND_SETTLE_MS, outsideSpendKey } from './outside-spend.js';
 import { forecastWindow } from './forecast.js';
+import { forecastFleet } from './fleet-forecast.js';
+import { QuotaSeries } from './quota-series.js';
 import { safeLine } from './safe-text.js';
 import { parseRoutingUrl, describeRouting, routingToUrl, isRoutingFailure } from './account-routing.js';
 import { isSelfProxy } from './upstream-proxy.js';
@@ -80,6 +82,7 @@ const MAX_RECENT_MODELS = 8;
 // members to serve, then re-admit it so an administrator's policy change is
 // discovered without a restart.
 const ENTITLEMENT_DENIAL_COOLDOWN_SECONDS = 5 * 60;
+const BILLING_REJECTION_COOLDOWN_MS = 5 * 60_000;
 // An account whose OWN routing proxy cannot be reached is no use until the
 // proxy answers again, and asking costs up to the 30s connect budget per
 // request when the proxy is black-holed rather than refusing. Short, because
@@ -170,6 +173,13 @@ const FAMILY_WEEKLY_BUCKETS = [
 // How long a family reading at its account's `maxUsage` cap is kept when no
 // reset time is known for it: one weekly window (see _clearExpiredQuotas).
 const CAPPED_FAMILY_HOLD_MS = 7 * 24 * 3600_000;
+
+/**
+ * Whether a utilization reading proves headroom: known and under 1.0. Null is
+ * unknown, never zero (see gatingUtilization), so it fails.
+ * @param {number|null|undefined} v
+ */
+const underOne = v => v != null && v < 1;
 
 /**
  * The quota fields a Codex account only ever LEARNS — from a `/wham/usage`
@@ -498,6 +508,7 @@ function makeAccount(acct, index, listener = null) {
     // that is not an error resets it.
     credentialRejectedUntil: /** @type {number|null} */ (null),
     credentialRejections: 0,
+    billingRejectedUntil: /** @type {number|null} */ (null),
     // Storm control (see admit/release): in-flight upstream requests and the
     // time this account last became the current one (starts a ramp window).
     inFlight: 0,
@@ -640,6 +651,13 @@ export class AccountManager {
     // Hands out stamps no other reading can equal (see _activityStamp).
     this._busyStamp = 0;
     this.concurrencyLearner = new ConcurrencyLearner(adaptive);
+    // The stored quota series behind the fleet forecast (#550). Empty until the
+    // server loads its file (index.js) or samples accumulate; the manager only
+    // samples into it and reads it, the file I/O lives with the caller.
+    /** @type {QuotaSeries} */
+    this.quotaSeries = new QuotaSeries();
+    /** @type {{ series: QuotaSeries, key: string, value: import('./fleet-forecast.js').FleetForecast|null }|null} */
+    this._fleetForecastCache = null;
     // The last adaptiveStats() a status read computed, and when. Time is the
     // only thing that invalidates it (see _adaptiveStatsCached).
     this._adaptiveStatsCache = null;
@@ -850,14 +868,15 @@ export class AccountManager {
    * @param {string|null} [model]
    */
   capExceeded(account, model = null) {
-    // The money cap first: it is the budget the usage caps exist to protect, and
-    // it is account-wide — no model is exempt from costing money. `spend` is the
-    // upstream month-to-date record, refreshed only by the quota probe
+    // The money cap first: it is the budget the usage caps exist to protect.
+    // Past it the account is held to its included quota, as if every bucket
+    // this request meters had a hard cap of 1.0 — see _spendCapBinds. `spend`
+    // is the upstream month-to-date record, refreshed only by the quota probe
     // (prober.js, on its interval) and the TUI's `p` refresh — a response
     // carries no spend figure — so the cap binds within one probe interval of
     // the figure being reached, and a new month lifts it on the next reading
     // by itself.
-    if (account?.maxSpend != null && spendCapReached(account.maxSpend, account.quota?.spend)) return 'spend';
+    if (this._spendCapBinds(account, model)) return 'spend';
     if (!account?.maxUsage) return null;
     const q = account.quota;
     // Same reason _isNearQuota does this first: a window that has already reset
@@ -896,10 +915,95 @@ export class AccountManager {
     return null;
   }
 
-  /** The family weekly bucket that has reached its cap for `model`, or null.
-   * The advisor check needs this narrower form: the shared buckets were already
-   * decided for the executor model, and only the advisor's own family is new. */
+  /**
+   * Whether this account has spent its money cap (accounts[].maxSpend) this
+   * month. Says nothing about a request: see _spendCapBinds for that.
+   * @param {Record<string, any>} account
+   */
+  _spendCapReached(account) {
+    return account?.maxSpend != null && spendCapReached(account.maxSpend, account.quota?.spend);
+  }
+
+  /**
+   * Whether the money cap bars a request for `model` on `account`.
+   *
+   * The cap is on what the account BILLS, and a request served from included
+   * subscription quota bills nothing. So past the cap the account is held to
+   * that quota for the rest of the month — as if it had a hard `maxUsage` of
+   * 1.0 on every bucket the request meters — and serves only a request that is
+   * provably free: the shared 5-hour and shared weekly readings both known and
+   * under 1.0, plus, for a model with its own family bucket (Fable, Sonnet, or
+   * a route's `bucket`), that bucket under 1.0 too, since family spend meters
+   * into both (#175) — a family bucket the plan does not report leaves the
+   * shared ones to govern (see _familySpendCapBinds). With no model (a status read) only the
+   * shared buckets are judged, as the maxUsage path does.
+   *
+   * Unknown is never proof a request is free, so a missing reading binds:
+   * expired windows are cleared first, so a reading past its reset is unknown
+   * rather than an old number, and a fresh upstream `rejected` binds too. The
+   * one absence that does not bind is a stated one: a plan that meters no
+   * weekly window (`weeklyWindowStated === false`, a Team seat) has no weekly
+   * quota to run past, and one that meters no session window
+   * (`sessionWindowStated === false`) has no 5-hour quota to run past. The usage probe's spend record carries no "billing
+   * right now" flag — the overage-status headers are not kept (see server.js)
+   * — so the buckets are the only evidence, and utilization reaching 1.0 is
+   * what overage looks like in them.
+   *
+   * The margin is 1.0, not the switch threshold: under the threshold is a
+   * rotation preference, under 1.0 is free. The slack is no wider than the
+   * dollar figure's: readings come from responses and the probe, so what can
+   * still bill is a request in flight when a bucket fills, or a reading that
+   * drifted since the last one.
+   *
+   * @param {Record<string, any>} account
+   * @param {string|null} [model]
+   */
+  _spendCapBinds(account, model = null) {
+    if (!this._spendCapReached(account)) return false;
+    this._clearExpiredQuotas(account);
+    const q = account.quota;
+    if (q.unifiedStatus === 'rejected') return true;
+    if (q.unified5h != null ? !underOne(q.unified5h) : q.sessionWindowStated !== false) return true;
+    if (q.unified7d != null ? !underOne(q.unified7d) : q.weeklyWindowStated !== false) return true;
+    return this._familySpendCapBinds(account, model);
+  }
+
+  /** The family half of _spendCapBinds: whether `model`'s own weekly bucket, if
+   * it has one, is spent on an account past its money cap. Callers have already
+   * established the cap is reached and cleared expired windows.
+   *
+   * A null family reading does not bind, unlike a null shared one: most plans
+   * meter no Sonnet (or Fable) bucket at all, and an expired one has reset, so
+   * either way the shared buckets — already required known and under 1.0 —
+   * govern the request, as they do in _isNearQuota. Treating null as spent
+   * would bar a whole family on every plan without its bucket for the month.
+   * The probe that maxSpend requires reads every family bucket the plan has.
+   * A learned scoped weekly bucket for the family counts too, as it does in
+   * _governingWeekly: spent, it is overage like any other.
+   * @param {Record<string, any>} account
+   * @param {string|null} model
+   */
+  _familySpendCapBinds(account, model) {
+    const key = this._weeklyBucketFor(model);
+    const v = account.quota[key];
+    if (key !== 'unified7d' && v != null && v >= 1) return true;
+    const scoped = this._scopedWeekly(account, model)?.utilization;
+    return scoped != null && scoped >= 1;
+  }
+
+  /** The family weekly bucket that has reached its cap for `model`, or null —
+   * or 'spend' when the account is past its money cap and that bucket is not
+   * provably free (see _spendCapBinds). The advisor check needs this narrower
+   * form: the shared buckets were already decided for the executor model, and
+   * only the advisor's own family is new.
+   * @param {Record<string, any>} account
+   * @param {string|null} model
+   */
   _familyCapExceeded(account, model) {
+    if (this._spendCapReached(account)) {
+      this._clearExpiredQuotas(account);
+      if (this._familySpendCapBinds(account, model)) return 'spend';
+    }
     if (!account?.maxUsage) return null;
     const key = this._weeklyBucketFor(model);
     if (key === 'unified7d') return null;
@@ -914,8 +1018,10 @@ export class AccountManager {
    * cap. For the paths that pick an account without unavailableReason — the
    * exhausted-fleet probe, the paid fallback, the all-unavailable revival, a
    * pin, the re-check after admission — so a cap binds on every path a request
-   * can take. Under `advisorEligibility: "prefer"` the advisor is a preference
-   * rather than a requirement, so only the executor's caps apply.
+   * can take. Returns 'spend' when the money cap binds on the executor's
+   * buckets or the advisor's family. Under `advisorEligibility: "prefer"` the
+   * advisor is a preference rather than a requirement, so only the executor's
+   * caps apply.
    *
    * @param {Record<string, any>} account
    * @param {string|null} [model]
@@ -1150,6 +1256,32 @@ export class AccountManager {
     if (!account) return;
     account.credentialRejectedUntil = null;
     account.credentialRejections = 0;
+  }
+
+  /** Temporarily exclude an account whose upstream billing refused a request.
+   * @param {number} index */
+  markBillingRejected(index) {
+    const account = this.accounts[index];
+    if (!account) return;
+    account.billingRejectedUntil = Date.now() + BILLING_REJECTION_COOLDOWN_MS;
+    console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}": upstream billing refused usage; check billing or purchase credits. Retrying after five minutes.`);
+  }
+
+  /** Allow an account to retry after billing has been repaired.
+   * @param {number} index */
+  clearBillingRejected(index) {
+    const account = this.accounts[index];
+    if (account) account.billingRejectedUntil = null;
+  }
+
+  /** @param {number} index
+   * @param {number} [now] */
+  isBillingRejected(index, now = Date.now()) {
+    const account = this.accounts[index];
+    if (!account?.billingRejectedUntil) return false;
+    if (account.billingRejectedUntil > now) return true;
+    account.billingRejectedUntil = null;
+    return false;
   }
 
   /** True while an account is in its routing-failure cooldown; expiry is
@@ -2383,6 +2515,7 @@ export class AccountManager {
     // unavailable, which is exactly when a held API key would otherwise be
     // asked again on every request — the loop the hold exists to prevent.
     if (this._credentialHeld(account)) return false;
+    if (this.isBillingRejected(account.index)) return false;
     // A 429 hold is respected verbatim at first, but a hold is a snapshot: the
     // 429 that armed it may itself have been transient (e.g. the retry burst
     // after a network flap), and while it lasts NOTHING revalidates it — so a
@@ -2401,7 +2534,9 @@ export class AccountManager {
    * used to pick the least-exhausted probe target. Mirrors _isNearQuota: the
    * shared 5-hour bucket plus the weekly value that gates the model, which is
    * the higher of its family bucket and the shared weekly one. With no model it
-   * falls back to the shared weekly. */
+   * falls back to the shared weekly.
+   * @param {Record<string, any>} account
+   * @param {string|null} [model] */
   _maxUtilization(account, model = null) {
     const q = account.quota;
     let max = 0;
@@ -2621,8 +2756,11 @@ export class AccountManager {
    * (a remembered verdict) — because those are exactly what free headroom or
    * overage lets an account serve past. Every hard gate still binds, and
    * unavailableReason reports those first: disabled, the operator's `maxUsage`
-   * cap, an entitlement cooldown, a live 429 hold (upstream actually refusing,
-   * overage or not), error. Such an account is neither used nor waited for: it
+   * cap, the `maxSpend` cap (past it an account may still be the FREE pick,
+   * while every bucket it meters is known and under 1.0, but never the paid
+   * one: a paid pick is at 1.0 or `rejected`, which is exactly what binds the
+   * cap — see _spendCapBinds), an entitlement cooldown, a live 429 hold
+   * (upstream actually refusing, overage or not), error. Such an account is neither used nor waited for: it
    * counts as unable to serve, so the tiers are chosen among the rest. Route
    * ownership is checked separately because unavailableReason reaches it only
    * after `quota`. A paid candidate whose usage probe has positively said
@@ -2686,7 +2824,10 @@ export class AccountManager {
    *
    * Returns one of: 'disabled', 'spend-capped', 'capped', 'throttled', 'error',
    * 'entitlement', 'exhausted', 'upstream-rejected', 'quota', 'route', 'routing',
-   * 'credential', 'advisor-capped', 'advisor-quota', 'advisor-route'.
+   * 'credential', 'billing', 'advisor-capped', 'advisor-quota', 'advisor-route'.
+   * @param {Record<string, any>} account
+   * @param {string|null} [model]
+   * @param {string|null} [advisorModel]
    */
   unavailableReason(account, model = null, advisorModel = null) {
     if (!account) return 'error';
@@ -2696,8 +2837,11 @@ export class AccountManager {
 
     // An operator budget cap. Checked here, above every transient state, because
     // it is a decision rather than an estimate — and unlike the switch threshold
-    // nothing overrides it: _selectProbe skips a capped account too, so an
-    // account at its cap receives no requests at all.
+    // nothing overrides it: _selectProbe and the fallback skip a capped account
+    // too. A usage cap bars every request it covers; the money cap bars only a
+    // request that is not provably on included quota (see _spendCapBinds), so a
+    // spend-capped account still serves while its buckets are under 1.0, and
+    // reads `spend-capped` once they are not or are unknown.
     const cap = this.capExceeded(account, model);
     if (cap === 'spend') return 'spend-capped';
     if (cap) return 'capped';
@@ -2717,6 +2861,7 @@ export class AccountManager {
 
     // Upstream answered 401 to this account's API key a moment ago.
     if (this._credentialHeld(account)) return 'credential';
+    if (this.isBillingRejected(account.index)) return 'billing';
 
     // Check rate limit expiry
     if (account.status === 'throttled' && account.rateLimitedUntil) {
@@ -2752,8 +2897,13 @@ export class AccountManager {
     // model: its family bucket must have headroom (the shared buckets were
     // already checked above for the executor) and any route/ownership rule for
     // it must allow this account.
+    // The money cap on the advisor's family reads as `spend-capped`, not
+    // `advisor-capped`: the reason is the account's bill, whichever model's
+    // bucket showed it, and `advisor-capped` names a maxUsage cap.
     if (advisorModel) {
-      if (this._familyCapExceeded(account, advisorModel)) return 'advisor-capped';
+      const advisorCap = this._familyCapExceeded(account, advisorModel);
+      if (advisorCap === 'spend') return 'spend-capped';
+      if (advisorCap) return 'advisor-capped';
       if (this._modelWeeklyExhausted(account, advisorModel)) return 'advisor-quota';
       if (!this._routeAllows(account, advisorModel)) return 'advisor-route';
     }
@@ -4145,6 +4295,8 @@ export class AccountManager {
     console.log(`[TeamClaude] Account "${best.name}" session quota reset and weekly expires sooner — switching to it`);
   }
 
+  /** @param {Record<string, any>} account
+   * @param {string|null} [model] */
   _isNearQuota(account, model = null) {
     const q = account.quota;
     this._clearExpiredQuotas(account);
@@ -4328,6 +4480,7 @@ export class AccountManager {
       // Nor one sitting out a 401: an old quota window that has since rolled
       // would otherwise name it the soonest to reset and send it the request.
       if (this._credentialHeld(account)) continue;
+      if (this.isBillingRejected(account.index)) continue;
       // A routed/owned model must not fall back to an ineligible account —
       // neither the executor's nor an advisor's.
       if (model && !this._routeAllows(account, model)) continue;
@@ -4867,7 +5020,10 @@ export class AccountManager {
       console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" re-enabled — clearing error state`);
     }
     // The same explicit "try this again" for an API key sitting out a 401.
-    if (!disabled) this.clearCredentialRejected(accountIndex);
+    if (!disabled) {
+      this.clearCredentialRejected(accountIndex);
+      this.clearBillingRejected(accountIndex);
+    }
   }
 
   /**
@@ -5621,6 +5777,9 @@ export class AccountManager {
       // Empty outside adaptive mode, so the renderer needs no mode check of its
       // own and an older client simply sees nothing extra.
       adaptive: this._adaptiveStatsCached(),
+      // When the whole fleet is out at once, and when the first account is
+      // back (#550). Null until there are 48 hours of samples.
+      fleetForecast: this.fleetForecastStatus(),
       accounts: this.accounts.map(a => ({
         name: a.name,
         type: a.type,
@@ -5691,11 +5850,81 @@ export class AccountManager {
         routingFailedUntil: a.routingFailedUntil && a.routingFailedUntil > Date.now()
           ? new Date(a.routingFailedUntil).toISOString()
           : null,
+        billingRejectedUntil: a.billingRejectedUntil && a.billingRejectedUntil > Date.now()
+          ? new Date(a.billingRejectedUntil).toISOString()
+          : null,
         credentialRejectedUntil: a.credentialRejectedUntil && a.credentialRejectedUntil > Date.now()
           ? new Date(a.credentialRejectedUntil).toISOString()
           : null,
       })),
     };
+  }
+
+  /**
+   * The accounts the fleet forecast covers: Anthropic subscription accounts in
+   * rotation (not disabled) that carry an entry id, which keys their history.
+   * A Codex account is a separate pool, and an API key meters no window.
+   */
+  _fleetForecastAccounts() {
+    return this.accounts.filter(a => providerOf(a) === DEFAULT_PROVIDER && isSubscriptionAccount(a) && !a.disabled && typeof a.id === 'string' && a.id);
+  }
+
+  /**
+   * Take one quota-series sample per forecast account whose last one is at
+   * least SAMPLE_INTERVAL_MS old, from the readings already held — never an
+   * upstream call. An account the proxy has not read in its current windows
+   * gets none. Then prune: samples past their age or cap, and the history of
+   * any account no longer in the manager. Returns whether the series changed,
+   * so the caller knows to write it.
+   * @param {number} [now]
+   */
+  sampleQuotaSeries(now = Date.now()) {
+    // A window whose reset has passed still holds its old reading until a
+    // sweep clears it; sampled as-is, it would read as spend in the new window.
+    this.sweepExpiredQuotas();
+    let changed = false;
+    for (const a of this._fleetForecastAccounts()) {
+      /** @type {Record<string, any>} */
+      const q = a.quota || {};
+      if (q.unified7dSeenAt == null && q.unified5hSeenAt == null) continue;
+      if (this.quotaSeries.record(a.id, {
+        weekly: q.unified7d, weeklyResetAt: q.unified7dReset, fiveHour: q.unified5h, fiveHourResetAt: q.unified5hReset,
+      }, now)) changed = true;
+    }
+    const live = this.accounts.map(a => a.id).filter(id => typeof id === 'string' && id);
+    if (this.quotaSeries.prune(live, now)) changed = true;
+    return changed;
+  }
+
+  /**
+   * `fleetForecast` for status (#550): when every account is out at once and
+   * when the first one is back, from the stored series. Null until the series
+   * spans 48 hours, and when nothing runs out within the forecast horizon.
+   * Cached for a minute per series revision: status is polled every few
+   * seconds, and the answer moves in five-minute steps.
+   * @param {number} [now]
+   */
+  fleetForecastStatus(now = Date.now()) {
+    // The series object is part of the key: the server swaps in the one it
+    // loaded from disk, whose revision can equal the empty one's.
+    const series = this.quotaSeries;
+    const key = `${series.revision}:${Math.floor(now / 60_000)}`;
+    if (this._fleetForecastCache?.series === series && this._fleetForecastCache.key === key) return this._fleetForecastCache.value;
+    const accounts = this._fleetForecastAccounts().filter(a => this.quotaSeries.samples(a.id).length);
+    // No prototype: the keys are entry ids, and `__proto__` is a valid one.
+    /** @type {Record<string, import('./fleet-forecast.js').BucketThresholds>} */
+    const thresholds = Object.create(null);
+    for (const a of accounts) thresholds[a.id] = { weekly: this.thresholdFor('unified7d', a), fiveHour: this.thresholdFor('unified5h', a) };
+    const value = forecastFleet({
+      series: this.quotaSeries.all(),
+      accounts: accounts.map(a => ({
+        id: a.id, weekly: a.quota?.unified7d, weeklyResetAt: a.quota?.unified7dReset, fiveHour: a.quota?.unified5h, fiveHourResetAt: a.quota?.unified5hReset,
+      })),
+      thresholds,
+      now,
+    });
+    this._fleetForecastCache = { series, key, value };
+    return value;
   }
 
   /** Return per-account quota and fleet aggregates for status clients. */

@@ -124,6 +124,30 @@ The burn-rate learner behind [adaptive distribution](routing.md#adaptive-distrib
 
 What the rate is. It is the learner's moving average of how fast utilization rose, measured over windows of `burnWindowMs` between readings no more than `maxSampleAgeMs` apart (see [`adaptiveDistribution`](configuration.md)). It counts all spend on the account, the proxy's and [outside spend](#spend-from-outside-the-proxy) alike. Like any moving average it reflects the recent past: a burst that has stopped keeps the forecast short until flat readings bring the rate down, and an account with no fresh readings keeps its last rate. The projection starts when the utilization was read, not at the status read, so an old reading counts down rather than repeating the same distance; once its projected time has passed, the status text drops it. With the [quota probe](#quota-probe) off, an idle account gets no readings, so its forecast is as old as its last traffic.
 
+## Fleet forecast
+
+The burn-rate forecast answers for one account. The fleet forecast ([#550](https://github.com/KarpelesLab/teamclaude/issues/550)) answers for the whole pool: when is every account out at once, and when does the first one come back? `fleetForecast` in `/teamclaude/status`:
+
+```json
+"fleetForecast": { "allOutAt": 1780000000000, "firstBackAt": 1780014400000, "boundBy": "weekly", "ratePerDay": 1.38 }
+```
+
+`allOutAt` is the first moment every account is blocked (the current time when they all already are), and `firstBackAt` the first moment after it that one is usable again; both are ms epoch. `boundBy` is the bucket that blocks most of the fleet at `allOutAt`: `weekly` or `5h`. `ratePerDay` is the fleet's measured weekly spend, in shares of one account's week per day (`1.38` uses 138% of a week per day, spread over the accounts).
+
+`teamclaude status` and the dashboard show it as one line, only when there is a forecast: `all accounts out in ~31h (weekly), first back 4h later`.
+
+It is `null` until the proxy has 48 hours of samples, `null` when the samples cover too little of a rate window to trust (under 6 hours of the weekly window, or under 1 hour of the last 6 hours), and `null` when nothing runs out within 14 days.
+
+How it works. Every 15 minutes the proxy stores one sample per account from the readings it already has: weekly and 5-hour utilization and when each window resets. It makes no extra upstream call, so an account is sampled only once the proxy has read it, from traffic or the [quota probe](#quota-probe). The forecast then simulates the fleet forward from the current readings:
+
+- Each bucket has its own measured rate. The weekly rate is the fleet's summed weekly increase over the last 24 hours, or the last 7 days once the samples cover at least 6 of them, shaped by hour of day (UTC): a flat evening rate carried through the night would call the wall too early. The 5-hour rate is the summed increase over the last 6 hours, flat. Each rate is divided by the time the samples actually cover inside its window, not by the whole window: two samples more than 30 minutes apart are a gap, such as a stopped proxy, and a gap does not count as a quiet fleet.
+- Spend goes to the fullest account still under its [switch thresholds](#switch-threshold), as rotation does, so the order in which accounts fill is the order they would be used.
+- An account is blocked while either bucket is at or over its threshold, and comes back at that bucket's reset. A weekly reset is followed by the next one 7 days later, a 5-hour reset by the next one 5 hours later.
+
+A window reset shows in the samples as a drop, or as an empty reading where the proxy had cleared the window at its reset; a drop is never counted as negative spend, and the first reading of the new window counts in full. The forecast covers Anthropic subscription accounts in rotation. Codex accounts are a separate pool, a disabled account is not in rotation, and an API key meters no window.
+
+The samples are kept in `teamclaude.quota-series.json` next to the config, not in the state file. The file is written atomically, keeps 7 days and at most 800 samples per account, and drops the history of an account at the next sample after it is removed. A missing or corrupt file is empty history, so it is safe to delete; the forecast is `null` again until 48 hours of new samples accumulate.
+
 ## Keep-warm
 
 The rolling **5-hour session window** only starts once an account sends a real message. So when your active account runs out and rotation moves to a cold account, that account's 5h window starts *then* — right when you need its full headroom. Keep-warm ([#76](https://github.com/KarpelesLab/teamclaude/issues/76)) starts the timer on idle accounts ahead of time, so the next account is already partway (or fully) through a fresh window when it's needed.
@@ -260,15 +284,15 @@ A usage cap is about quota. On a seat with **extra usage** enabled the interesti
 { "name": "work@example.com", "type": "oauth", "maxSpend": 20 }
 ```
 
-Written in the account's billing currency (`20` is $20.00), and judged against the month-to-date extra-usage figure the usage endpoint reports — the same figure `teamclaude status` prints as `$14.35 of $10,000.00 used this month`. At the cap the account receives nothing, exactly like a usage cap: rotation skips it, the exhausted-fleet probe skips it, a pin gets the exhausted answer. When upstream's figure resets with the month, the next probe lifts the cap by itself.
+Written in the account's billing currency (`20` is $20.00), and judged against the month-to-date extra-usage figure the usage endpoint reports — the same figure `teamclaude status` prints as `$14.35 of $10,000.00 used this month`. At the cap the account stops **billing**, not serving: for the rest of the month it is held to its included quota, as if every bucket a request meters had a hard `maxUsage` of `1.0`. A request is admitted only when it is provably free — the shared session (5h) and weekly readings both known and under 100%, and for a model with its own weekly bucket (Fable, Sonnet, or a route's `bucket`) that bucket under 100% too, since family usage meters into both. Anything else — a bucket at 100%, a shared reading not yet taken or past its reset, a fresh upstream `rejected` status — bars the request, because an unknown reading is no proof the request is free. A family bucket with no reading is the exception: most plans meter no Sonnet bucket, and a family window past its reset starts again from zero, so the shared buckets govern, as they do everywhere else. A plan that states it meters no weekly window (a Team seat) is judged on its session window alone. A barred request is skipped exactly like a usage cap: rotation skips the account, the exhausted-fleet probe skips it, the [extra-usage fallback](#extra-usage-fallback) never bills it, a pin gets the exhausted answer. So a Fable request can be barred while Opus still runs on the same account. When upstream's figure resets with the month, the next probe lifts the cap by itself.
 
 **`maxSpend` requires the quota probe.** The spend figure comes only from probe readings — a response carries no month-to-date amount — so it is refreshed on the probe's schedule (`quotaProbeSeconds`, or `teamclaude probe N`; see [Quota probe](#quota-probe)) and by the TUI's **`p`** refresh, never by the request in flight. The cap therefore binds within one probe interval of the figure being reached, not on the request that crosses it: what one interval can bill is the slack to budget for, and with the probe off the figure only moves when you press **`p`**, so the cap effectively never binds.
 
 - The cap binds at the level set (`>=`). `0` means "not one cent": an account that has billed nothing is still admitted, the first billed cent bars it.
 - Only an account that **can** bill is judged. With extra usage off upstream no request costs money, and barring the account would only waste the quota it still has.
-- It is a total, not a preference — nothing overrides it. Combine it with `"maxUsage": 1.0` to stop before billing can start, and keep `maxSpend` as the backstop: it bounds the month's total to the cap plus whatever one probe interval can bill, not to the cent.
+- It is a total, not a preference — nothing overrides it. Combine it with `"maxUsage": 1.0` to stop before billing can start, and keep `maxSpend` as the backstop: it bounds the month's total to the cap plus whatever one probe interval can bill, not to the cent. The same slack applies once the cap holds: the bucket readings are refreshed by responses and the probe, so a request in flight when a bucket fills is billed.
 
-The TUI row shows the amount once anything has been billed, and the cap after it: `$14.35/20`. `teamclaude status` prints the same on the account's `Spend` line, and names the reason `extra-usage spend cap reached (maxSpend)` while the cap holds.
+The TUI row shows the amount once anything has been billed, and the cap after it: `$14.35/20`. `teamclaude status` prints the same on the account's `Spend` line, and says `spend cap reached` there once the figure reaches it. The account's unavailable reason reads `extra-usage spend cap reached (maxSpend)` only while the cap bars it, judged on the shared session and weekly buckets; a bar on one model family alone (Fable, say) applies per request and does not show there.
 
 No CLI editor, matching `maxUsage`: hand-edit the config and let a running server pick it up on reload (**`R`** in the TUI, or `POST /teamclaude/reload`).
 
@@ -294,7 +318,7 @@ By default, once every account is past its switch threshold the proxy answers 42
 - **It goes back on its own.** As soon as any account's window resets — the paid one's included — selection returns to normal, and the "billing" mark clears even if no request for that model has come in since.
 - **Only the quota verdicts are overridden** — the switch threshold (a spent Fable bucket included, for Fable requests only) and, for the paid tier, a remembered upstream `rejected` status. Everything else still binds: `disabled`, `maxUsage`, `maxSpend`, a live upstream 429 hold, an entitlement cooldown, an error state, routes and model ownership, and the Claude/Codex partition. An account whose usage probe reports overage switched off upstream is skipped, since it would only 429; with no probe data, upstream decides.
 
-Utilization goes past 100% in overage, so `maxUsage` above 1.0 is a spend limit: `"maxUsage": 1.5` lets an account run to 150% of its plan and then stop, like any other cap. To bound the bill in money instead, set `maxSpend` — see [Per-account spend caps](#per-account-spend-caps) above; the fallback never admits an account at its spend cap.
+Utilization goes past 100% in overage, so `maxUsage` above 1.0 is a spend limit: `"maxUsage": 1.5` lets an account run to 150% of its plan and then stop, like any other cap. To bound the bill in money instead, set `maxSpend` — see [Per-account spend caps](#per-account-spend-caps) above; the fallback never bills an account at its spend cap (it may still use that account's free quota, like any other).
 
 The switch onto the fallback and back off it is logged once each, per model scope (a Fable-only episode is not ended by Opus traffic that still has headroom), and a failover hop onto it is logged once per episode too — the free-quota and the paid step each get their own line. While an account is **billing** — at 100% of a governing bucket, or with its month's spend seen rising — `teamclaude status` marks it:
 

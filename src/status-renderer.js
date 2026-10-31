@@ -55,6 +55,9 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
   if (status.server?.startedAt || status.server?.uptimeSeconds != null) {
     lines.push(`${paint.dim('Server'.padEnd(12))} ${formatServerSummary(status.server, now)}`);
   }
+  // Only when the fleet runs out within the forecast horizon (#550).
+  const fleetForecast = fleetForecastText(status.fleetForecast, now);
+  if (fleetForecast) lines.push(`${paint.dim('Fleet'.padEnd(12))} ${paint.yellow(fleetForecast)}`);
   lines.push('');
 
   for (const line of routingLines(status.routes, blocked, paint)) lines.push(line);
@@ -156,6 +159,7 @@ export const UNAVAILABLE_TEXT = {
   'advisor-capped': "advisor model's usage cap reached (maxUsage)",
   entitlement: 'upstream refused this account for the organization (cooldown)',
   routing: "the account's routing proxy is unreachable (cooldown)",
+  billing: 'upstream billing refused usage (cooldown); check billing or purchase credits',
   credential: 'upstream rejected its API key with a 401 (cooldown, then retried)',
   route: 'no route allows this account',
   'advisor-quota': "advisor model's weekly bucket spent",
@@ -183,7 +187,8 @@ export function spendLine(account, paint) {
   // The operator's own ceiling (accounts[].maxSpend), drawn beside the upstream
   // figure it is judged against so the two read in one glance: `$14.35 of
   // $10,000.00 used this month, cap $20.00`. Named `cap` like the usage caps on
-  // the bars above — same word, same meaning: at it the account gets nothing.
+  // the bars above: at it the account bills nothing more, and serves only what
+  // its included quota still covers.
   const capMinor = resolveMaxSpendMinor(account?.maxSpend, spend);
   const cap = capMinor == null ? '' : `, cap ${formatMoney({ ...spend, usedMinor: capMinor, limitMinor: null })}`;
   if (spend.enabled) {
@@ -246,6 +251,41 @@ export function outsideSpendText(outsideSpend) {
     return label + ': not observed (quota probe off?)';
   });
   return parts.join(' \u00b7 ');
+}
+
+/**
+ * The fleet forecast as one line, or null when there is none (#550):
+ *
+ *   "all accounts out in ~31h (weekly), first back 4h later"
+ *   "all accounts out now (5h), first back in 2h"
+ *
+ * Pure and closure-free on purpose, like forecastText: the dashboard
+ * serializes it into its page with toString().
+ *
+ * @param {{allOutAt?: number|null, firstBackAt?: number|null, boundBy?: string|null, ratePerDay?: number|null}|null|undefined} fleet
+ * @param {number} now  ms epoch
+ * @returns {string|null}
+ */
+export function fleetForecastText(fleet, now) {
+  if (!fleet || typeof fleet.allOutAt !== 'number') return null;
+  /** @param {number} ms */
+  var dur = function (ms) {
+    var minutes = Math.max(1, Math.round(ms / 60000));
+    if (minutes < 60) return minutes + 'm';
+    var hours = Math.round(minutes / 60);
+    if (hours < 48) return hours + 'h';
+    var days = Math.floor(hours / 24);
+    var rem = hours % 24;
+    return rem ? days + 'd' + rem + 'h' : days + 'd';
+  };
+  var out = fleet.allOutAt > now;
+  var bucket = fleet.boundBy === '5h' ? '5h' : 'weekly';
+  var text = 'all accounts out ' + (out ? 'in ~' + dur(fleet.allOutAt - now) : 'now') + ' (' + bucket + ')';
+  var back = fleet.firstBackAt;
+  if (typeof back === 'number' && back > now) {
+    text += out ? ', first back ' + dur(back - fleet.allOutAt) + ' later' : ', first back in ' + dur(back - now);
+  }
+  return text;
 }
 
 /**

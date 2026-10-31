@@ -294,6 +294,31 @@ The endpoint is one more `/teamclaude/` route and is gated like the others: the 
 
 It speaks both the stateless 2026-07-28 revision of the protocol and the handshake revisions before it, so a client on either works. Replies are plain JSON, never a stream.
 
+## CLIProxyAPI-compatible usage API
+
+Some usage dashboards read a multi-account fleet through the management API of [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) rather than through each provider. The server can answer the part of that API those dashboards use, so the quota of every account in the pool shows up there. It is off until the config says otherwise:
+
+```json
+{ "proxy": { "cliproxyApi": "read" } }
+```
+
+Point the dashboard's "CLI Proxy" source at the proxy (`http://localhost:3456`) and give it the proxy key as its management key. It sends the key as `Authorization: Bearer <key>` (`X-Management-Key` and `x-api-key` work too); `proxy.apiKey` and every `proxy.clientKeys` key are accepted, since the data is no more than `/teamclaude/status` already shows a key holder.
+
+Two routes are served:
+
+- `GET /v0/management/auth-files` lists the Claude and Codex subscription accounts as `{ "observed_at", "files": [{ id, auth_index, name, provider, email, status, disabled }] }`, in the fleet's own order. `auth_index` is the account's config entry id, and `status` is `error` for an account whose login was rejected. API-key and third-party backend accounts have no subscription usage and are not listed. CLIProxyAPI's query parameters work as they do there: `name` (an id or a name) and `auth_index` narrow the list, and `page` / `page_size` (default 50) page it, adding `total`, `page`, `page_size` and `has_more`; a paging value that is not a positive whole number is a 400.
+- `POST /v0/management/api-call` with `{ "auth_index", "method": "GET", "url" }` answers two URLs: `https://api.anthropic.com/api/oauth/usage` for a Claude account and `https://chatgpt.com/backend-api/wham/usage` for a Codex one. The reply is CLIProxyAPI's envelope, `{ "status_code": 200, "header": {…}, "body": "<json>" }`, with the body in the provider's own shape: `five_hour`, `seven_day` and `weekly_scoped` limits on a 0–100 scale with ISO-8601 reset times for Claude, `rate_limit.primary_window` / `secondary_window` with `used_percent` and epoch-second `reset_at` for Codex.
+
+Unlike CLIProxyAPI, `api-call` relays nothing. The answer is built from the quota the server already tracks; no request goes upstream, no credential is read, and the request's `header` and `data` (including any `$TOKEN$` placeholder) are ignored. Any other URL or method is refused with 403. Codex reset credits are not offered: their list and consume URLs, and `POST /v0/management/reset-quota`, answer 501, because spending a credit is irreversible and is left to the server's own [`autoRedeemResets`](quota.md) policy.
+
+The readings are as fresh as the server's: an account in use is read off every response, an idle one only by the [quota probe](quota.md#quota-probe), which is off by default. Turn the probe on for current numbers on idle accounts. Three cases are reported the way the provider would report them, so a dashboard can tell them apart:
+
+- A window the plan meters but that has no live reading — it reset since the last reading — is sent as the provider sends a window that has not started: `{ "utilization": 0, "resets_at": null }` for Claude, `used_percent: 0` with `reset_at: null` for Codex. That is what the server itself believes about the account; usage spent outside the proxy since the reset is not seen until the next reading.
+- A window the plan does not meter is `null`: `seven_day` on a Team seat, and the 5-hour window on a Codex plan without one (its weekly window is then the primary).
+- An account the server cannot vouch for answers a non-2xx `status_code` inside a 200 envelope, so the dashboard shows it as unreadable rather than idle: 503 for an account never read yet, 401 for one whose login was rejected (what the provider answers a dead token).
+
+The gates are the ones every other route passes, plus the MCP endpoint's rule for a config with no proxy key at all: then only callers on the proxy's own machine are served, and everyone else gets 403. Every path under `/v0/management/` is answered by the proxy itself, on or off, and never forwarded upstream; a WebSocket handshake there is refused with 404.
+
 ## Auto-update
 
 When TeamClaude is installed globally via npm, it self-updates in the background: it checks the npm registry at most once a day, and when a newer version is published it runs `npm install -g @karpeleslab/teamclaude@latest` and applies it on the next launch. The check runs after a `teamclaude run` session ends and when a headless server starts. In a headless server the install runs as a background child process, so the proxy keeps serving requests while npm works (a synchronous install used to stall it for the duration). A git checkout is never touched — update that with `git pull`. Run `teamclaude update` to update on demand.
