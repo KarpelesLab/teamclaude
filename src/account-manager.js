@@ -8,13 +8,14 @@ import { SessionTracker } from './session-tracker.js';
 import { SessionPins } from './session-pins.js';
 import { buildQuotaSummary, quotaTier } from './quota-summary.js';
 import { ROLLOVER_MIN_JUMP_MS, remapHeld, findHeld, dropHeld, newObservation } from './rollover.js';
-import { decideBand, pressureOf, pressureRank, assertNever } from './band-decision.js';
+import { decideBand, pressureOf, pressureRank, assertNever, WEEKLY_WINDOW_SECONDS } from './band-decision.js';
 import { BurnRateLearner, ConcurrencyLearner, scoreCandidate } from './adaptive-distribution.js';
 import { OutsideSpendTracker, OUTSIDE_SPEND_STATES, OUTSIDE_SPEND_SETTLE_MS, outsideSpendKey } from './outside-spend.js';
 import { forecastWindow } from './forecast.js';
 import { forecastFleet } from './fleet-forecast.js';
 import { QuotaSeries } from './quota-series.js';
 import { safeLine } from './safe-text.js';
+import { isRefused } from './account-refusal.js';
 import { parseRoutingUrl, describeRouting, routingToUrl, isRoutingFailure } from './account-routing.js';
 import { isSelfProxy } from './upstream-proxy.js';
 import { envVar } from './brand.js';
@@ -373,6 +374,10 @@ export function accountRouting(acct, listener = null) {
   }
 }
 
+function planOf(/** @type {Record<string, any>} */ account) {
+  return account.hasClaudeMax === true ? 'Max' : account.hasClaudePro === true ? 'Pro' : null;
+}
+
 // Build a fresh in-memory account record from a config/disk account object.
 // Shared by the constructor and addAccount() so the field set can never drift
 // between startup accounts and runtime-added ones (a divergence here once left
@@ -411,6 +416,8 @@ function makeAccount(acct, index, listener = null) {
     seatTier: acct.seatTier || null,
     hasClaudeMax: acct.hasClaudeMax ?? null,
     hasClaudePro: acct.hasClaudePro ?? null,
+    // Kept across restarts; see applyProfileData.
+    subscriptionLost: /** @type {{ plan: string, since: number }|null} */ (null),
     priority: acct.priority || 0,
     // Where this account sits in the list the TUI draws, arranged by the
     // operator from the settings screen. Presentation only: nothing but
@@ -470,7 +477,7 @@ function makeAccount(acct, index, listener = null) {
     status: 'active',
     // Why the account last went to 'error' (see _needsLogin); read only while
     // status is 'error', so a recovery path need not clear it.
-    errorReason: /** @type {{ code: string, detail: string, since: number, remedy: string }|null} */ (null),
+    errorReason: /** @type {{ code: string, detail: string, since: number, remedy: string, link: string|null }|null} */ (null),
     // No quota is known at startup, so start probing: the first response for
     // an account reveals its weekly limit and triggers re-evaluation.
     probing: true,
@@ -651,6 +658,9 @@ export class AccountManager {
     // Hands out stamps no other reading can equal (see _activityStamp).
     this._busyStamp = 0;
     this.concurrencyLearner = new ConcurrencyLearner(adaptive);
+    // adaptiveDistribution.scoring, fixed at construction like the rest of the
+    // block: 'pressure' scores a placement by expiry pressure (_placementPressure).
+    this.scoring = this.burnRateLearner.opts.scoring === 'pressure' ? 'pressure' : 'burndown';
     // The stored quota series behind the fleet forecast (#550). Empty until the
     // server loads its file (index.js) or samples accumulate; the manager only
     // samples into it and reads it, the file I/O lives with the caller.
@@ -1952,14 +1962,26 @@ export class AccountManager {
       // that pressure picks the destination.
       if (this.expiryRouting.enabled && this.expiryRouting.preempt
           && this._pinRolledOver(sessionId, pinned, model)) {
-        const next = this._pickLeastLoaded(exclude, model, advisorModel);
+        // Whether to move is decided on the burndown score, so the placement
+        // scoring never changes which sessions lose their cache.
+        const next = this._pickLeastLoaded(exclude, model, advisorModel, 'decision');
         if (next && next.index !== idx) {
+          // Decided: under adaptive "pressure" only the destination is open, and
+          // that is a placement among the OTHER accounts, so the score can never
+          // hand the session back. A key inside the adaptiveDistribution block
+          // must not move a session in even or load mode, whose own pick already
+          // named the destination.
+          let dest = next;
+          if (this.distributionMode === 'adaptive' && this.scoring === 'pressure') {
+            const placed = this._pickLeastLoaded(new Set([...(exclude ?? []), idx]), model, advisorModel);
+            if (placed) dest = placed;
+          }
           // A fleet-wide rollover moves every session pinned to that account at
           // once, so the destination gets the same failover burst any other
           // switch would send it — pace it (issue #84).
-          this._beginRamp(next);
-          console.log(`[TeamClaude] Session pin on "${pinned.name}" released — its weekly window rolled over; re-routing to "${next.name}"`);
-          return next;
+          this._beginRamp(dest);
+          console.log(`[TeamClaude] Session pin on "${pinned.name}" released — its weekly window rolled over; re-routing to "${dest.name}"`);
+          return dest;
         }
         // The traffic did not move, so the observation is left where it is and
         // the next request asks again.
@@ -1980,13 +2002,20 @@ export class AccountManager {
   /** Where a new session goes, per the configured distribution mode. Adaptive
    * scores the tier by remaining credit and congestion; even (the original)
    * spreads by active-session count; load spreads by the requests each account
-   * carried in the last LOAD_WINDOW_MS, with the even keys as tie-breaks. */
-  _pickLeastLoaded(exclude = null, model = null, advisorModel = null) {
+   * carried in the last LOAD_WINDOW_MS, with the even keys as tie-breaks.
+   * `purpose` is 'placement' (a new session, or the destination of a move already
+   * decided) or 'decision' (whether a pinned session moves at all).
+   * @param {Set<number>|null} [exclude]
+   * @param {string|null} [model]
+   * @param {string|null} [advisorModel]
+   * @param {'placement'|'decision'} [purpose]
+   * @returns {Record<string, any>|null} */
+  _pickLeastLoaded(exclude = null, model = null, advisorModel = null, purpose = 'placement') {
     if (this.distributionMode === 'load') {
       return this._pickLeastLoadedEven(exclude, model, advisorModel, { byRequests: true });
     }
     if (this.distributionMode === 'adaptive') {
-      const picked = this._pickAdaptive(exclude, model, advisorModel);
+      const picked = this._pickAdaptive(exclude, model, advisorModel, purpose);
       // Adaptive can legitimately score every candidate at zero — the whole
       // tier is inside its reserve — and that is not a reason to refuse a
       // request. Fall through to the even walk, which still returns the least
@@ -2049,8 +2078,19 @@ export class AccountManager {
     return this.sessionTracker.activeCountFor(account.index, now) + (account.inFlight || 0);
   }
 
-  _pickAdaptive(exclude = null, model = null, advisorModel = null) {
+  /**
+   * @param {Set<number>|null} [exclude]
+   * @param {string|null} [model]
+   * @param {string|null} [advisorModel]
+   * @param {'placement'|'decision'} [purpose]
+   * @returns {Record<string, any>|null}
+   */
+  _pickAdaptive(exclude = null, model = null, advisorModel = null, purpose = 'placement') {
     const now = Date.now();
+    const byPressure = this.scoring === 'pressure' && purpose !== 'decision';
+    // Pressure only when this pick is a placement: the decision whether a pinned
+    // session moves is scored on burndown whatever the block says.
+    const scoring = { ...this.burnRateLearner.opts, scoring: byPressure ? 'pressure' : 'burndown' };
     const bucket = this._weeklyBucketFor(model);
 
     // The SAME candidate set the even walk uses, so adaptive cannot quietly
@@ -2096,6 +2136,7 @@ export class AccountManager {
       reserve: this.burnRateLearner.reserve(account.index, windows[i].bucket),
       load: this._adaptiveLoad(account, now),
       concCap: this.concurrencyLearner.cap(account.index),
+      ...(byPressure ? { pressure: this._placementPressure(account, model, now) } : {}),
     }));
     const maxRemaining = Math.max(...candidates.map(c => {
       const u = Number.isFinite(c.utilization) ? c.utilization : 0;
@@ -2109,7 +2150,7 @@ export class AccountManager {
     for (const c of candidates) {
       // The operator's adaptive settings, maxBurnBoost among them; the learner
       // holds them merged over the defaults.
-      const { score } = scoreCandidate({ ...c, maxRemaining }, this.burnRateLearner.opts);
+      const { score } = scoreCandidate({ ...c, maxRemaining }, scoring);
       // Soonest weekly reset breaks a tie, matching the rest of selection: on
       // an idle fleet every candidate scores identically, and without this the
       // winner would be array order.
@@ -2136,7 +2177,12 @@ export class AccountManager {
    * counts left one account carrying a third of a 14-account pool's traffic.
    * Counting what each account actually served places the next session where
    * the least work is, and the session stays pinned there for cache reuse as
-   * in every other mode. */
+   * in every other mode.
+   * @param {Set<number>|null} [exclude]
+   * @param {string|null} [model]
+   * @param {string|null} [advisorModel]
+   * @param {{ byRequests?: boolean }} [options]
+   * @returns {Record<string, any>|null} */
   _pickLeastLoadedEven(exclude = null, model = null, advisorModel = null, { byRequests = false } = {}) {
     const now = Date.now();
     const candidates = this._bandedCandidates(exclude, model, advisorModel);
@@ -2391,6 +2437,8 @@ export class AccountManager {
         planWeight: planWeight ?? null,
         reserve: this.burnRateLearner.reserve(a.index, window.bucket),
         concCap: this.concurrencyLearner.cap(a.index),
+        // What a "pressure" score is taken from. A burndown row grows nothing.
+        ...(this.scoring === 'pressure' ? { scoring: 'pressure', placementPressure: this._placementPressure(a, model, now) } : {}),
         _remaining: (usePlanWeights && planWeight != null ? planWeight : 1) * head,
       };
     });
@@ -2407,7 +2455,8 @@ export class AccountManager {
         load: r.sessions + r.inFlight,
         concCap: r.concCap,
         maxRemaining,
-      }, this.burnRateLearner.opts);
+        pressure: r.placementPressure,
+      }, { ...this.burnRateLearner.opts, scoring: this.scoring });
       r.score = score;
       total += score;
     }
@@ -2942,7 +2991,7 @@ export class AccountManager {
     // are only consulted once it has actually said no.
     if (!this._isAvailable(account)) {
       if (account.disabled) return { eligible: false, reason: 'disabled' };
-      if (account.status === 'error') return { eligible: false, reason: 'in an error state and needs a re-login' };
+      if (account.status === 'error') return { eligible: false, reason: isRefused(account) ? 'refused by upstream' : 'in an error state and needs a re-login' };
       if (account.status === 'exhausted') return { eligible: false, reason: 'out of quota' };
       if (account.status === 'throttled') return { eligible: false, reason: 'rate-limited' };
       return { eligible: false, reason: 'at or above the switch threshold' };
@@ -3255,6 +3304,50 @@ export class AccountManager {
   _pressureVariant(account, model = null, now = Date.now()) {
     const [snapshotAccount] = this._bandSnapshot([account], model, now).accounts;
     return pressureOf(snapshotAccount, now);
+  }
+
+  /**
+   * What the "pressure" scoring prices `account` at, per second: the band's own
+   * pressure (`_pressureVariant`), with the states the band leaves open priced so
+   * that every candidate gets a score.
+   *
+   *   known            the band's figure; a reset that has already passed is a
+   *                    fresh window, and nothing left under the caps is 0
+   *   no reading       a fresh window: the room under the caps (1 with none) over
+   *                    one week. Priced at 0 it would starve the roomiest account
+   *   no reset time    the band's own lower bound
+   *   not a number     0
+   *
+   * @param {Record<string, any>} account
+   * @param {string|null} model
+   * @param {number} now
+   * @returns {number}
+   */
+  _placementPressure(account, model = null, now = Date.now()) {
+    const [snapshotAccount] = this._bandSnapshot([account], model, now).accounts;
+    const pressure = pressureOf(snapshotAccount, now);
+    const fresh = () => this._freshSpendable(account, model) / WEEKLY_WINDOW_SECONDS;
+    switch (pressure.kind) {
+      case 'known': return pressure.value > 0 || snapshotAccount.resetAt > now ? pressure.value : fresh();
+      case 'absent':
+        switch (pressure.reason) {
+          case 'no-utilization': return fresh();
+          case 'no-reset': return pressure.lowerBound ?? 0;
+          default: return 0;
+        }
+      default: return assertNever(pressure, '_placementPressure');
+    }
+  }
+
+  /**
+   * The room a new window offers `account` for `model`: the lowest of its caps on
+   * the shared weekly and the family bucket, and 1. A cap above 1 reads as 1, as
+   * in the band's own pricing.
+   * @param {Record<string, any>} account
+   * @param {string|null} model
+   */
+  _freshSpendable(account, model) {
+    return Math.max(0, Math.min(1, this.capFor('unified7d', account) ?? 1, this.capFor(this._weeklyBucketFor(model), account) ?? 1));
   }
 
   /**
@@ -5219,12 +5312,31 @@ export class AccountManager {
     }
   }
 
-  /** Apply subscription metadata learned from the OAuth profile endpoint. */
+  // Apply subscription metadata from the OAuth profile. A lapsed Max or Pro plan
+  // is only reported (`subscriptionLost`): upstream's answers decide whether the
+  // account still serves.
   applyProfileData(accountIndex, profile) {
     const account = this.accounts[accountIndex];
     if (!account || !profile || profile.error) return;
+    const plan = planOf(account);
+    const tier = account.rateLimitTier;
     for (const field of ['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro']) {
       if (profile[field] != null) account[field] = profile[field];
+    }
+    const name = safeLine(account.name, 64);
+    const now = planOf(account);
+    if (plan && profile.hasClaudeMax === false && profile.hasClaudePro === false) {
+      // A reload puts back the plan the config row was signed in with, so the
+      // same loss can be read again: keep when it was first seen.
+      if (account.subscriptionLost) return;
+      account.subscriptionLost = { plan, since: Date.now() };
+      console.log(`[TeamClaude] Account "${name}": its OAuth profile no longer shows the Claude ${plan} plan — renew the plan or disable the account`);
+    } else if (account.subscriptionLost && (profile.hasClaudeMax === true || profile.hasClaudePro === true)) {
+      account.subscriptionLost = null;
+      console.log(`[TeamClaude] Account "${name}": its OAuth profile shows the Claude ${now} plan again`);
+    } else if (plan && now && (plan !== now || (tier && account.rateLimitTier !== tier))) {
+      const label = (/** @type {string} */ p, /** @type {string|null} */ t) => `Claude ${p}${t ? ` (${safeLine(t, 64)})` : ''}`;
+      console.log(`[TeamClaude] Account "${name}": plan changed from ${label(plan, tier)} to ${label(now, account.rateLimitTier)}`);
     }
   }
 
@@ -5248,6 +5360,9 @@ export class AccountManager {
     // Same guard as pauseAccount: a NaN hold would throttle the account with a
     // rateLimitedUntil that never compares as expired.
     if (!Number.isFinite(retryAfterSeconds) || retryAfterSeconds <= 0) return;
+    // A 429 from a request already in flight must not turn an account in error
+    // into a hold that lapses on its own.
+    if (account.status === 'error') return;
     account.status = 'throttled';
     account.rateLimitedUntil = Date.now() + (retryAfterSeconds * 1000);
     // Marks when the hold was (re-)armed: a revalidation probe is allowed only
@@ -5348,7 +5463,9 @@ export class AccountManager {
     // rotating to another account.
     if (account._deadRefreshToken && account._deadRefreshToken === account.refreshToken) {
       if (account.status !== 'error') {
-        this._needsLogin(account, 'refresh_rejected', 'its refresh token was already rejected');
+        // A hold keeps its own reason: the guard is armed by the same refusal that set it.
+        if (account.errorReason?.code === 'account_on_hold') account.status = 'error';
+        else this._needsLogin(account, 'refresh_rejected', 'its refresh token was already rejected');
         console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}" still holds a rejected refresh token — run: teamclaude login`);
       }
       return;
@@ -5462,8 +5579,15 @@ export class AccountManager {
             console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" received new tokens while its old refresh token was being rejected — keeping the new ones`);
             return;
           }
-          this._needsLogin(account, 'refresh_rejected', `upstream rejected its refresh token (${err.status})`);
-          console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}" needs re-login (refresh token rejected) — run: teamclaude login`);
+          if (err.appealUrl) {
+            const { detail } = this._needsLogin(account, 'account_on_hold', `Your account is on hold and can't use Claude Code. View details or appeal: ${err.appealUrl}`, err.appealUrl);
+            console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}": ${detail}`);
+          } else {
+            this._needsLogin(account, 'refresh_rejected', `upstream rejected its refresh token (${err.status})`);
+            console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}" needs re-login (refresh token rejected) — run: teamclaude login`);
+          }
+          // Unlike markRefused, a hold found on refresh is reported to credential
+          // sync: the refresh token itself was refused, as for a dead one.
           this._onAccountError?.(account);
         }
       } finally {
@@ -5548,18 +5672,39 @@ export class AccountManager {
    * `status --json`, a remote client) saw a bare `error` and could not tell a
    * dead refresh token from a 401 on a refresh-less token, nor say when.
    * @param {Record<string, any>} account
-   * @param {'refresh_rejected'|'credential_rejected'} code
+   * @param {string} code  'refresh_rejected', 'credential_rejected', or an
+   *   ACCOUNT_REFUSAL_CODES value (see markRefused)
    * @param {string} detail  one clause, no credential in it
+   * @param {string|null} [link]  where upstream says to resolve it
    */
-  _needsLogin(account, code, detail) {
+  _needsLogin(account, code, detail, link = null) {
+    // A dead token on a refused account changes nothing the owner must do.
+    if (isRefused(account)) return account.errorReason;
     account.status = 'error';
     account.errorReason = {
       code,
       detail,
       since: Date.now(),
       remedy: providerOf(account) === 'codex' ? 'teamclaude login --codex' : 'teamclaude login',
+      link,
     };
     return account.errorReason;
+  }
+
+  /**
+   * Take an account out of rotation over a refusal upstream gave about the
+   * account itself (see account-refusal.js). Nothing here can repair it: once
+   * the owner has resolved it upstream, a re-login brings the account back.
+   * Takes the account the answer came for, not its index: a removal while the
+   * request was out renumbers the rest.
+   * @param {Record<string, any>} account
+   * @param {{ code: string, message: string, link: string|null }} refusal
+   */
+  markRefused(account, { code, message, link }) {
+    // It replaces a dead-token error: a re-login alone won't fix it.
+    if (this.accounts[account.index] !== account || isRefused(account)) return;
+    const { remedy } = this._needsLogin(account, code, message, link);
+    console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}" taken out of rotation: upstream refused it (${code}): ${safeLine(message, 300)} — once resolved, run: ${remedy}`);
   }
 
   /**
@@ -5578,6 +5723,9 @@ export class AccountManager {
     account._minted = false;
     // A failed renewal of the tokens these replace no longer explains anything.
     account._lastRefreshFailure = null;
+    // Nor does a lapsed plan restored from the last run: a sign-in may be on a
+    // renewed one, and the next profile read reports the loss again if not.
+    account.subscriptionLost = null;
     if (account.status === 'error') account.status = 'active';
     console.log(`[TeamClaude] Updated tokens for account "${safeLine(account.name, 64)}"`);
     this._onTokenRefresh?.(accountIndex, {
@@ -5675,6 +5823,7 @@ export class AccountManager {
         seatTier: a.seatTier,
         hasClaudeMax: a.hasClaudeMax,
         hasClaudePro: a.hasClaudePro,
+        subscriptionLost: a.subscriptionLost,
       };
       const adaptive = {
         burnRate: this.burnRateLearner.export(a.index),
@@ -5702,7 +5851,7 @@ export class AccountManager {
       for (const f of PERSISTED_QUOTA_FIELDS) {
         if (match.quota[f] != null) account.quota[f] = match.quota[f];
       }
-      for (const field of ['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro']) {
+      for (const field of ['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro', 'subscriptionLost']) {
         if (match.profile?.[field] != null) account[field] = match.profile[field];
       }
       this.burnRateLearner.restore(account.index, match.adaptive?.burnRate);
@@ -5814,6 +5963,7 @@ export class AccountManager {
         status: a.status,
         // What put it in 'error' and what brings it back; null in every other state.
         errorReason: a.status === 'error' && a.errorReason ? { ...a.errorReason } : null,
+        subscriptionLost: a.subscriptionLost ? { ...a.subscriptionLost } : null,
         // Why the account is out of rotation right now (null = it can serve).
         // Distinguishes a local threshold decision from an upstream rejection —
         // without it the two are indistinguishable in status output (#166).

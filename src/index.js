@@ -11,6 +11,7 @@ import { installCrashHandlers } from './crash-log.js';
 import { AccountManager, distributionMode, accountRouting } from './account-manager.js';
 import { validateAdaptiveConfig } from './adaptive-distribution.js';
 import { createProxyServer, reloadedHeaderFlags } from './server.js';
+import { createDrainState, resolveDrainTimeoutSeconds } from './drain.js';
 import { importCredentials, loginOAuth, loginOAuthWithPastedCode, startOAuthLogin, fetchProfile, profileForCredentials, refreshAccessToken, isTokenExpired, isTokenExpiringSoon } from './oauth.js';
 import {
   sameIdentity,
@@ -941,7 +942,16 @@ async function serverCommand() {
   if (existsSync(caCertPath()) && !(await isProxyUp(port).catch(() => true))) {
     await ensureCerts(mitmHosts(config)).catch((err) => console.error(`[TeamClaude] Could not renew the MITM certificate: ${err.message}`));
   }
-  const server = createProxyServer(accountManager, config, hooks, sx, clientUsage, dimensionUsage, { bindHost });
+  // Shared with the listener (drain.js): POST /teamclaude/drain flips it, and a graceful
+  // shutdown waits on the same in-flight count.
+  const drain = createDrainState();
+  const server = createProxyServer(accountManager, config, hooks, sx, clientUsage, dimensionUsage, { bindHost, drain });
+  // Said once, at start: a value that is set but cannot turn the drain on would otherwise
+  // leave SIGTERM stopping at once with nothing to say why.
+  const rawDrain = config.proxy?.drainTimeoutSeconds;
+  if (rawDrain != null && Number(rawDrain) !== 0 && resolveDrainTimeoutSeconds(config) === null) {
+    console.error('[TeamClaude] proxy.drainTimeoutSeconds must be a positive number of seconds; it is ignored, and SIGTERM stops at once');
+  }
   // Catch bind-time errors (e.g. EADDRINUSE) only. Once the socket is bound we
   // remove this handler so a later runtime 'error' isn't misreported as a
   // listen failure and exit the whole proxy.
@@ -1068,6 +1078,24 @@ async function serverCommand() {
     if (quotaSaveInterval) clearInterval(quotaSaveInterval);
     if (quotaSeriesInterval) clearInterval(quotaSeriesInterval);
     await persistQuotaState();
+    // Opt-in (proxy.drainTimeoutSeconds): stop taking requests, let the ones in flight
+    // finish, and exit when they have or when the window runs out. A second signal
+    // still goes straight to exit (the check at the top of shutdown). Without the key
+    // this block is skipped and the code below is what has always run. Relays that
+    // are not counted (see drain.js) are cut when the process exits.
+    const drainSeconds = resolveDrainTimeoutSeconds(config);
+    if (drainSeconds !== null) {
+      drain.start();
+      console.log(`[TeamClaude] Draining: refusing new requests, waiting up to ${drainSeconds}s for ${drain.status().inFlight} in-flight request(s); signal again to stop waiting`);
+      server.close();
+      server.closeIdleConnections?.();
+      const idle = await drain.waitForIdle(drainSeconds * 1000);
+      if (!idle) console.log(`[TeamClaude] Drain deadline reached with ${drain.status().inFlight} request(s) still in flight; exiting`);
+      // The requests that finished while draining moved quota and usage
+      // counters after the save above, and the periodic save is already off.
+      await persistQuotaState();
+      process.exit(0);
+    }
     // Don't linger waiting on keep-alive / streaming connections: actively
     // destroy them so server.close() can complete promptly, and hard-exit after a
     // short grace period in case anything still hangs.

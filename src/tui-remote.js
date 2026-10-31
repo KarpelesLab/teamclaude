@@ -260,6 +260,16 @@ export class RemoteAccountManager {
       status: text(a?.status, 16, a?.status == null ? undefined : '?'),
       orgName: a?.orgName == null ? a?.orgName : text(a.orgName, NAME_MAX),
       unavailable: a?.unavailable == null ? a?.unavailable : text(a.unavailable, 64),
+      // Its detail, remedy and link are drawn under the row; anything but an object reads as no reason.
+      // The detail can carry a whole appeal link (up to 2048 characters), so it is not cut short.
+      errorReason: a?.errorReason && typeof a.errorReason === 'object'
+        ? {
+          code: text(a.errorReason.code, 64),
+          detail: text(a.errorReason.detail, 2200),
+          remedy: text(a.errorReason.remedy, 64),
+          link: a.errorReason.link == null ? null : text(a.errorReason.link, 2048),
+        }
+        : null,
       // Booleans that decide a red "billing" tag: anything but a literal true
       // from the other end reads as off, never as a claim that money moves.
       allowExtraUsage: a?.allowExtraUsage === true,

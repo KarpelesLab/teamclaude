@@ -1,6 +1,7 @@
 import { formatMoney } from './oauth.js';
 import { findFamilyBlock, modelGlobOverlaps, gatingUtilization, resolveMaxUsage, resolveSwitchThreshold, resolveFleetThreshold, switchThresholdDiffs, resolveMaxSpendMinor, spendCapReached } from './model.js';
-import { safeLine } from './safe-text.js';
+import { safeLine, sanitizeText } from './safe-text.js';
+import { isRefused } from './account-refusal.js';
 import { ROUTE_COLORS } from './config-ops.js';
 import { describeRouting } from './account-routing.js';
 
@@ -83,6 +84,8 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
     if (egress) lines.push(`  ${egress}`);
     const why = unavailableLine(account, paint);
     if (why) lines.push(`  ${why}`);
+    const plan = subscriptionLostLine(account, paint, now);
+    if (plan) lines.push(`  ${plan}`);
     const spend = spendLine(account, paint);
     if (spend) lines.push(`  ${spend}`);
     const resetCredits = resetCreditLine(account, paint, now);
@@ -437,13 +440,24 @@ export function heldResetCredits(quota, now = Date.now()) {
   return available;
 }
 
+// Upstream refused the account itself: its words, and its link when the
+// shortened words lost it.
+function refusalText(/** @type {Record<string, any>} */ err) {
+  const detail = safeLine(err.detail, 200);
+  const link = err.link && !detail.includes(err.link) ? ` ${sanitizeText(err.link)}` : '';
+  return `refused by upstream: ${detail}${link} — once resolved, run: ${safeLine(err.remedy, 40)}`;
+}
+
 export function unavailableLine(account, paint) {
   const reason = account?.unavailable;
   if (!reason) return null;
+  // A refusal outlasts a cap or a cooldown ranked above it, so it is named
+  // whatever `unavailable` says, short of the operator's own disable.
+  const refused = reason !== 'disabled' && isRefused(account);
   const err = reason === 'error' ? account.errorReason : null;
-  const text = err
-    ? `needs a re-login: ${safeLine(err.detail, 120)} — run: ${safeLine(err.remedy, 40)}`
-    : UNAVAILABLE_TEXT[reason] || safeLine(reason, 64);
+  const text = refused ? refusalText(account.errorReason)
+    : !err ? UNAVAILABLE_TEXT[reason] || safeLine(reason, 64)
+    : `needs a re-login: ${safeLine(err.detail, 120)} — run: ${safeLine(err.remedy, 40)}`;
   // An account serving as the extra-usage fallback reads as out of quota like
   // any other, yet is taking traffic and billing for it. Say so on the line
   // that would otherwise tell the operator it is idle.
@@ -451,6 +465,20 @@ export function unavailableLine(account, paint) {
     return `${paint.dim('Blocked'.padEnd(8))} ${paint.yellow(text)} ${paint.red('\u2014 serving on extra usage (paid overage), billing')}`;
   }
   return `${paint.dim('Blocked'.padEnd(8))} ${paint.yellow(text)}`;
+}
+
+/**
+ * @param {any} account
+ * @param {any} paint
+ * @param {number} [now]
+ */
+export function subscriptionLostLine(account, paint, now = Date.now()) {
+  const lost = account?.subscriptionLost;
+  if (!lost) return null;
+  const since = parseTs(lost.since);
+  const when = since ? ` (since ${formatAgo(Math.min(since, now), now)})` : '';
+  const text = `its OAuth profile no longer shows the Claude ${safeLine(lost.plan, 16)} plan${when}`;
+  return `${paint.dim('Plan'.padEnd(8))} ${paint.yellow(text)} ${paint.gray('\u2014 renew the plan or disable the account')}`;
 }
 
 // Compact names for the "switch NN%" line below — short enough that several
@@ -716,7 +744,7 @@ function adaptivePlan(a, paint) {
 }
 
 // "next · weight 62%  ·  3 sess / 1 inflight  ·  head 38.0% of 98%  ·  plan 20x
-//  ·  conc 6"
+//  ·  conc 6"; under scoring "pressure" the last three give way to "P 3.85e-6".
 //
 // `next` is the deterministic routing result. `weight` is the account's score
 // normalized across competitors, useful for explaining why it won without
@@ -729,12 +757,17 @@ function formatAdaptive(a, paint) {
     // Every candidate scored zero: the whole tier is inside its reserve, so
     // there is no weight to report and saying "0%" everywhere would imply the
     // router had stopped, which it has not.
-    ? `${prefix}${paint.yellow(`weight n/a (all reserved, ${family})`)}`
+    ? `${prefix}${paint.yellow(`weight n/a (${a.scoring === 'pressure' ? 'all zero' : 'all reserved'}, ${family})`)}`
     : `${prefix}${paint.bold(`weight ${pct(a.weight, 0)} of ${family}`)}`);
   parts.push(`${num(a.sessions)} sess / ${num(a.inFlight)} inflight`);
-  parts.push(`head ${pct(a.headroom, 1)} of ${pct(a.threshold, 0)}`);
-  parts.push(adaptivePlan(a, paint));
-  parts.push(`conc ${num(a.concCap, 1)}`);
+  if (a.scoring === 'pressure') {
+    // The score is P over load: no head, plan weight or concurrency cap went into it.
+    parts.push(`P ${Number.isFinite(a.placementPressure) ? a.placementPressure.toExponential(2) : '?'}`);
+  } else {
+    parts.push(`head ${pct(a.headroom, 1)} of ${pct(a.threshold, 0)}`);
+    parts.push(adaptivePlan(a, paint));
+    parts.push(`conc ${num(a.concCap, 1)}`);
+  }
   const line = parts.join(paint.dim('  ·  '));
   return a.competing ? line : `${paint.dim('(not competing)')} ${line}`;
 }

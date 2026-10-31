@@ -245,8 +245,9 @@ export function upgradeUpstreamFor(hostHeader, config, upstream) {
  * @param {Object|null} [opts.egress]
  * @param {Object|null} [opts.clientUsage]
  * @param {Object|null} [opts.dimensionUsage]
+ * @param {import('./drain.js').DrainState|null} [opts.drain]  the shared drain state (drain.js), handed to each MITM listener
  */
-export function createConnectHandler({ config, accountManager, ensureLeaf, logDir = null, hooks = {}, log = () => {}, sx = null, egress = null, clientUsage = null, dimensionUsage = null }) {
+export function createConnectHandler({ config, accountManager, ensureLeaf, logDir = null, hooks = {}, log = () => {}, sx = null, egress = null, clientUsage = null, dimensionUsage = null, drain = null }) {
   const upstream = config.upstream || 'https://api.anthropic.com';
   const holdMs = (config.holdSeconds || 0) * 1000;
 
@@ -304,7 +305,7 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
     // Node 24.6 adds this buffer when an HTTP/1 response finishes, but its
     // HTTP/2 server leaves it undefined; timeout + undefined would be NaN.
     /** @type {any} */ (srv).keepAliveTimeoutBuffer ??= 1_000;
-    srv.on('request', createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, forcedPin: pin || null, egress, clientUsage, forcedClient: client, dimensionUsage }));
+    srv.on('request', createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, forcedPin: pin || null, egress, clientUsage, forcedClient: client, dimensionUsage, drain }));
     // Remote Control's real-time channel is a WebSocket (Upgrade handshake),
     // which never fires 'request' — only 'upgrade', with a raw socket instead
     // of a response object (h1-only; falls back to blind h2 passthrough is not
