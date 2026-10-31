@@ -44,6 +44,10 @@ If every configured account returns that exact denial, TeamClaude's terminal `50
 
 An explicit [`TC_ACCT` pin](#pin-a-session-to-one-account) continues to target exactly the requested account and never fails over, even while that account is excluded from automatic rotation.
 
+## Token scope denials
+
+A `403` with `error.details.error_code: oauth_scope_insufficient` is about the token, not the account. A `claude setup-token` token carries `user:inference` only, so Claude Code's bootstrap, settings and connector-registry calls draw this on every such account. TeamClaude does not fail those over: a `GET` that draws one goes out once more on the client's own bearer, like the [identity plane](proxy-modes.md), over the same upstream proxy, sx route and admission queue as any forwarded request, and rotation stays where it was. Any other method, which includes every completion, a [pinned](#pin-a-session-to-one-account) request, and a client with no bearer of its own get the normal handling.
+
 ## One failover hop on a rate limit
 
 A **quota rejection** (a 429 carrying `...unified-*-status: rejected`) is durable
@@ -216,6 +220,8 @@ Quota response headers supply utilization and reset time. Burn rate is learned f
 The `sess` in both lines is the display's short label and counts **conversations**, not client sessions: `active 3 sess` is three active conversations pinned to that account, which may all belong to one Claude Code session and its subagents. The TUI's session figures count the same thing.
 
 `next` names the account the deterministic picker would choose for the next new conversation. `weight` is that account's score normalized across the competing tier; it explains how strongly the inputs favor an account, but is not a routing probability. `plan` is the subscription multiplier read from the OAuth profile, not inferred from traffic. An unknown future tier is shown as `plan unknown`, and its competing tier falls back to plain utilization fractions rather than guessing. `weight n/a (all reserved)` means every account in the tier is inside its reserve, so the even fallback decides the next target.
+
+A Codex account is scored only against other Codex accounts, on its own quota window, so its row names that window in place of the Claude bucket: `weight 95% of codex weekly`, not `of opus+`. Its `plan` is the ChatGPT plan upstream reported (`plan pro`), with no numeric weight; `plan unknown` appears only until a plan has been reported. The displayed weight and routing are the same as before this label; only the words changed.
 
 **Turning it off drains, it doesn't cut.** The setting is applied live on config reload, and switching it off would otherwise move every distributed conversation to the current account on its *next* request — each one throwing away the prompt cache it built on its old account, and all of them arriving at one account at once. Instead, the conversations running at that moment keep their accounts, and only **new** ones go back to plain quota-driven rotation. Affinity therefore winds down as those conversations finish rather than snapping, and a draining conversation whose account becomes ineligible simply rejoins normal rotation. While this is happening `teamclaude status` reads `draining N` (the TUI header shows `drain N`) instead of `single-account`, and it clears itself once the last of them is done or idles out.
 

@@ -166,6 +166,31 @@ export function providerLabel(provider) {
   return provider || 'Unknown';
 }
 
+/**
+ * The account cards split by provider, for a fleet that mixes them. Claude
+ * accounts come first, then each other provider in the order its first account
+ * appears; within a group the payload's order is kept, since that is the
+ * rotation order. An account with no provider is an Anthropic one, as the
+ * server treats it. A single-provider fleet is one group the page draws without
+ * a heading, so it looks as it did.
+ * @param {Array<Record<string, any>>|null|undefined} accounts
+ * @returns {{ provider: string, label: string, accounts: Array<Record<string, any>> }[]}
+ */
+export function accountGroups(accounts) {
+  /** @type {Record<string, Array<Record<string, any>>>} */
+  var by = Object.create(null);
+  /** @type {string[]} */
+  var order = [];
+  (accounts || []).forEach(function (a) {
+    var p = (a && a.provider) || 'anthropic';
+    if (!by[p]) { by[p] = []; order.push(p); }
+    by[p].push(a);
+  });
+  var first = order.indexOf('anthropic');
+  if (first > 0) { order.splice(first, 1); order.unshift('anthropic'); }
+  return order.map(function (p) { return { provider: p, label: providerLabel(p), accounts: by[p] }; });
+}
+
 // Every bucket switchThreshold can be keyed by, plus the short names the
 // threshold badge shows them under. Mirrors THRESHOLD_BUCKET_KEYS in model.js
 // and THRESHOLD_BUCKET_LABELS in status-renderer.js — duplicated rather than
@@ -732,7 +757,7 @@ export function usageFor(entry, view) {
 export const CARD_NOTE_MAX_AGE_MS = 60 * 1000;
 
 const SHARED_HELPERS = [
-  scopedWeeklyRows, accountTokens, modelLabel, recentModelLabels, providerLabel, thresholdBadgeText, accountBadges, sessionRows, sessionPinsText, filterSessionRows, sortRows, uniqSorted,
+  scopedWeeklyRows, accountTokens, modelLabel, recentModelLabels, providerLabel, accountGroups, thresholdBadgeText, accountBadges, sessionRows, sessionPinsText, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
   outsideSpendText, forecastText, showSessionRow, showWeeklyRow, callerCan, callerNotice, cardNoteKey, cardNoteFor, backendQuotaRows,
 ].map(fn => fn.toString()).join('\n\n');
@@ -863,6 +888,12 @@ const PAGE = `<!doctype html>
   #keybox input { width: 100%; padding: 10px 12px; margin: 12px 0; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; color: var(--text); font: inherit; }
   #keybox button { padding: 8px 20px; background: var(--accent); border: 0; border-radius: 6px; color: var(--panel); font: inherit; font-weight: 600; cursor: pointer; }
   footer { color: var(--dim); font-size: 12px; margin-top: 24px; }
+  /* A mixed Claude/Codex fleet: one framed group per provider, so the cards of
+     one kind read together however the accounts were added. */
+  .acctgroup { border: 1px solid var(--line); border-radius: 10px; padding: 10px 10px 2px; margin-bottom: 14px; }
+  .acctgroup .card { margin-bottom: 8px; }
+  .acctgroup-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin: 0 6px 8px; }
+  .acctgroup-head .name { font-size: 13px; }
 </style>
 <script>
 (function () {
@@ -1414,10 +1445,23 @@ ${SHARED_HELPERS}
     var acc = document.getElementById('accounts');
     acc.textContent = '';
     var now = Date.now();
-    (s.accounts || []).forEach(function (a) {
-      var cn = cardNoteFor(cardNotes, cardNoteKey(a), now);
-      if (cn) acc.appendChild(el('div', 'cardnote ' + cn.kind, cn.text));
-      acc.appendChild(renderAccount(a, s.currentAccount, currentAccounts, s.switchThreshold, s.switchThresholds, s.caller));
+    var groups = accountGroups(s.accounts);
+    groups.forEach(function (g) {
+      var box = acc;
+      if (groups.length > 1) {
+        box = el('section', 'acctgroup');
+        var head = el('div', 'acctgroup-head');
+        head.appendChild(el('span', 'name', g.label));
+        var cur = currentAccounts && currentAccounts[g.provider];
+        head.appendChild(el('span', 'tag', g.accounts.length + (g.accounts.length === 1 ? ' account' : ' accounts') + (cur ? ' · current ' + cur : '')));
+        box.appendChild(head);
+        acc.appendChild(box);
+      }
+      g.accounts.forEach(function (a) {
+        var cn = cardNoteFor(cardNotes, cardNoteKey(a), now);
+        if (cn) box.appendChild(el('div', 'cardnote ' + cn.kind, cn.text));
+        box.appendChild(renderAccount(a, s.currentAccount, currentAccounts, s.switchThreshold, s.switchThresholds, s.caller));
+      });
     });
     renderProblems(s);
     renderRoutes(s);
