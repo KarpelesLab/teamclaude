@@ -76,9 +76,17 @@ export function resolveExec({
  * proxy spawns inherits nothing. Built from the directories that actually
  * matter rather than copying the interactive shell's PATH, which is full of
  * per-session entries that mean nothing to a daemon.
+ *
+ * `~/.local/bin` is the native Claude Code install location. Keep-warm spawns
+ * `claude` by name, and a login shell only has that directory because the
+ * shell rc adds it. Include it when it exists so a freshly installed service
+ * can find the binary. An agent installed before this still works: the warmer
+ * checks the same directory itself at spawn time.
  */
-export function servicePath({ node, entry }) {
+export function servicePath({ node, entry, home = homedir(), exists = existsSync }) {
   const dirs = [dirname(node), dirname(entry), '/usr/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin'];
+  const localBin = home ? join(home, '.local', 'bin') : '';
+  if (localBin && exists(localBin)) dirs.push(localBin);
   return [...new Set(dirs.filter(Boolean))].join(':');
 }
 
@@ -187,7 +195,7 @@ export async function installService({
 } = {}) {
   if (!kind) return { ok: false, error: `No service integration for ${platform}` };
   const logFile = logPath(home, platform);
-  const path = servicePath(exec);
+  const path = servicePath({ ...exec, home });
 
   if (kind === 'launchd') {
     const plist = launchAgentPath(home);
@@ -265,7 +273,7 @@ export async function serviceStatus({
 /** The unit file contents, for `service print` — inspect before installing. */
 export function renderService({ kind = serviceKind(), home = homedir(), platform = process.platform, exec = resolveExec(), configPath = null } = {}) {
   if (!kind) return null;
-  const path = servicePath(exec);
+  const path = servicePath({ ...exec, home });
   return kind === 'launchd'
     ? renderLaunchAgent({ ...exec, log: logPath(home, platform), path, configPath })
     : renderSystemdUnit({ ...exec, path, configPath });
