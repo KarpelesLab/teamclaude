@@ -200,8 +200,8 @@ const guiDomain = (uid = process.getuid?.() ?? 0) => `gui/${uid}`;
 // is not. The default shutdown saves its quota state and exits within a 2 s
 // grace. A proxy draining under proxy.drainTimeoutSeconds can take longer,
 // until launchd sends SIGKILL after its ExitTimeOut: 20 s by default in the
-// last launchd.plist(5) that named a value, "system-defined" in current ones.
-// 30 s outlasts that.
+// launchd.plist(5) of Apple's open-source launchd, "system-defined" in the
+// current man page. 30 s outlasts that.
 export const LAUNCHD_UNLOAD_WAIT_MS = 30_000;
 const LAUNCHD_UNLOAD_POLL_MS = 250;
 // launchctl exits with the errno it reports, so EIO is exit status 5.
