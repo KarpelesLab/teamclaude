@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
-import { createProxyServer } from '../src/server.js';
+import { createProxyServer, oauthVerificationHold } from '../src/server.js';
 
 function listen(server) {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
@@ -433,4 +433,54 @@ test('a caller-pinned request goes to exactly the account it targeted', async ()
     proxy.close();
     upstream.close();
   }
+});
+
+// Upstream's identity-verification hold answers 403 while the token stays valid,
+// and the portal link exists only in that response body. Telling the operator to
+// re-add the account sends them to a remedy that cannot work.
+test('a verification hold reports the portal link instead of a re-login', async () => {
+  const portal = 'https://portal.anthropic.com/verify?org=test-org';
+  const upstream = http.createServer((req, res) => {
+    res.writeHead(403, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      type: 'error',
+      error: {
+        type: 'permission_error',
+        message: "Your account can't receive replies from Claude right now.",
+        details: { error_code: 'verification_required', remediation_url: portal, capability: 'avocado' },
+      },
+      request_id: 'req_test',
+    }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(
+    [{ name: 'a', type: 'oauth', accessToken: 'ta', refreshToken: 'ra', expiresAt: Date.now() + HOUR }],
+    0.98,
+    { refreshFn: async () => { throw new Error('must not refresh on a 403'); } },
+  );
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const { status, body } = await post(proxyPort);
+    assert.equal(status, 502);
+    assert.match(body, /identity verification/);
+    assert.ok(body.includes(portal), 'the portal link has to reach the operator');
+    assert.doesNotMatch(body, /teamclaude login/, 'a re-login cannot clear a verification hold');
+    assert.equal(am.accounts[0].entitlementDeniedUntil, null, 'not an entitlement quarantine');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('a verification hold keeps only an https remediation link', () => {
+  const hold = (/** @type {any} */ url) => oauthVerificationHold(Buffer.from(JSON.stringify({
+    error: { details: { error_code: 'verification_required', remediation_url: url } },
+  })));
+  assert.deepEqual(hold('https://portal.anthropic.com/verify?org=x'), { url: 'https://portal.anthropic.com/verify?org=x' });
+  assert.deepEqual(hold('javascript:alert(1)'), { url: null });
+  assert.deepEqual(hold('http://portal.anthropic.com/verify'), { url: null });
+  assert.deepEqual(hold('not a url\nforged log line'), { url: null });
+  assert.deepEqual(hold(42), { url: null });
 });

@@ -441,6 +441,38 @@ test('prober skips disabled accounts', async () => {
   assert.deepEqual(probed, ['t-b']);
 });
 
+// The operator can opt disabled accounts back in, and the prober reads the
+// switch off the shared config per cycle, so a toggle needs no reschedule.
+test('prober reads disabled accounts while probeDisabledAccounts is on', async () => {
+  const am = new AccountManager([oauth('a'), oauth('b')], 0.98);
+  am.setDisabled(0, true);
+  const config = { probeDisabledAccounts: true };
+  const probed = [];
+  const prober = new Prober(am, { intervalMs: 0, config, probeFn: async cred => { probed.push(cred); return {}; }, log: () => {} });
+  await prober.probeAll();
+  assert.deepEqual(probed.sort(), ['t-a', 't-b']);
+
+  config.probeDisabledAccounts = false;
+  probed.length = 0;
+  await prober.probeAll();
+  assert.deepEqual(probed, ['t-b']);
+});
+
+test('probeDisabledAccounts does not lift the skip for a rejected refresh token', async () => {
+  const am = new AccountManager(
+    [oauth('a', { refreshToken: 'rt-dead', expiresAt: Date.now() - 1000 })],
+    0.98,
+    { refreshFn: async () => { const e = new Error('invalid_grant'); e.status = 400; throw e; } },
+  );
+  am.setDisabled(0, true);
+  let probes = 0;
+  const prober = new Prober(am, { intervalMs: 0, config: { probeDisabledAccounts: true }, probeFn: async () => { probes++; return {}; }, log: () => {} });
+  await prober.probeAll();                 // the refresh is tried once and rejected
+  const probesAfterRejection = probes;
+  await prober.probeAll();
+  assert.equal(probes, probesAfterRejection);
+});
+
 test('prober skips an account holding a rejected refresh token, until a new one arrives', async () => {
   let refreshes = 0;
   const am = new AccountManager(
