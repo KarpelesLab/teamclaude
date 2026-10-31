@@ -5,6 +5,7 @@ import { createWriteStream, mkdirSync, writeSync } from 'node:fs';
 import { readdir, stat, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { ensureCerts, createConnectHandler, mitmHosts } from './mitm.js';
+import { inspectBillingError } from './billing-error.js';
 import { patchAccountUuid } from './account-uuid-rewrite.js';
 import { sanitizeToolPairs } from './tool-pair-sanitize.js';
 import { sanitizeCacheControl, cacheControlSubfieldsToStrip } from './cache-control-sanitize.js';
@@ -27,6 +28,7 @@ import { createUsageRecorder, resolveUsageDimensions, usageDimensionHeaderNames 
 import { responsesEventUsage, isResponsesBody, normalizeResponsesUsage } from './responses-usage.js';
 import { classificationPath } from './classification-path.js';
 import { serveManagementMcp } from './mcp-tools.js';
+import { isCliproxyPath, presentedManagementKey, serveCliproxyApi } from './cliproxy-api.js';
 import { codexSpentWindows, isAccountWideCodexWindow } from './codex-quota.js';
 import { atomicConfigUpdate } from './config.js';
 import { ConfigOpError, setThreshold, thresholdRatio } from './config-ops.js';
@@ -111,6 +113,9 @@ function resolveHeaderless429RetryDelayMs() {
   return env > 0 ? env : DEFAULT_HEADERLESS_429_RETRY_DELAY_MS;
 }
 const OAUTH_ENTITLEMENT_ERROR_CODE = 'oauth_not_allowed_for_organization';
+const OAUTH_VERIFICATION_ERROR_CODE = 'verification_required';
+// A token missing a scope the endpoint needs (see isOAuthScopeInsufficient).
+const OAUTH_SCOPE_ERROR_CODE = 'oauth_scope_insufficient';
 const ERROR_BODY_INSPECTION_LIMIT = 64 * 1024;
 // How long an idle keep-alive connection is held open.
 //
@@ -135,14 +140,54 @@ const RESET_CLEARS = new Set(['quota', 'throttled']);
 // behind upstream's own `rejected` verdict.
 const CLAUDE_RESET_CLEARS = new Set(['quota', 'throttled', 'upstream-rejected']);
 
+/**
+ * The structured `error.details.error_code` of an upstream error body, or null.
+ * @param {Uint8Array} body
+ */
+function upstreamErrorCode(body) {
+  try {
+    return JSON.parse(Buffer.from(body).toString('utf8'))?.error?.details?.error_code ?? null;
+  } catch {
+    return null;
+  }
+}
+
 /** Classify only the structured organization-policy denial observed upstream.
  * Message text and generic permission errors are deliberately not enough. */
 export function isOAuthEntitlementDenied(body) {
+  return upstreamErrorCode(body) === OAUTH_ENTITLEMENT_ERROR_CODE;
+}
+
+/** A 403 about the token's scopes, not the account: a `claude setup-token`
+ * token carries user:inference only, and Claude Code's bootstrap, settings and
+ * connector-registry calls need user:profile, so every such account draws one.
+ * @param {Uint8Array} body */
+export function isOAuthScopeInsufficient(body) {
+  return upstreamErrorCode(body) === OAUTH_SCOPE_ERROR_CODE;
+}
+
+/** The account-level identity-verification hold: a 403 whose token is valid and
+ * which names the portal the operator must visit. `null` for any other 403, so
+ * the generic credential-refusal path keeps its wording.
+ * @param {any} body  the raw 403 body, as readErrorBody returns it
+ * @returns {{ url: string|null }|null}
+ */
+export function oauthVerificationHold(body) {
   try {
-    const parsed = JSON.parse(Buffer.from(body).toString('utf8'));
-    return parsed?.error?.details?.error_code === OAUTH_ENTITLEMENT_ERROR_CODE;
+    const details = JSON.parse(Buffer.from(body).toString('utf8'))?.error?.details;
+    if (details?.error_code !== OAUTH_VERIFICATION_ERROR_CODE) return null;
+    // An alternate upstream is configurable, and this URL reaches the log and
+    // the client's 502: keep it only when it is a well-formed https link.
+    let url = null;
+    if (typeof details.remediation_url === 'string') {
+      try {
+        const parsed = new URL(details.remediation_url);
+        if (parsed.protocol === 'https:') url = parsed.href;
+      } catch { /* not a URL */ }
+    }
+    return { url };
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -262,9 +307,62 @@ export function shouldSynthesizeQuotaHeaders(config) {
   return /** @type {{ synthesizeQuotaHeaders?: unknown } | null | undefined} */ (config)?.synthesizeQuotaHeaders === true;
 }
 
+// Claude Code reads the unified quota headers as the state of the user's own
+// plan, and acts on them: past a warning threshold it shows limit warnings,
+// and once the 5-hour window nears its cap (95%, 99% on Max 5x, 99.75% on Max
+// 20x) it tells the model to checkpoint and stop starting long work. Behind a
+// pool those readings describe one account the proxy is about to rotate off,
+// so a session winds itself down while the pool still has quota.
+//
+// With `poolQuotaHeaders: true`, a successful response's client-bound copy
+// states the pool instead, as long as another account could still serve the
+// request: each window the upstream stated carries the lowest reading among
+// the accounts that could serve it, with that account's reset, its status
+// says `allowed`, and the warning-threshold and grace headers are dropped.
+// When the serving account is the last one left (poolQuotaReadings returns
+// null), its own headers pass through and Claude Code warns as it would
+// without the proxy. updateQuota has already run on the upstream headers.
+const POOLED_WINDOWS = /** @type {const} */ (['5h', '7d', '7d_oi']);
+const GRACE_HEADER_PREFIX = 'anthropic-ratelimit-unified-grace-';
+
 /**
- * The client-header flags a reload copies off the disk config, both sampled
- * per request through the two functions above.
+ * @param {Record<string, string>} headers  the client-bound copy, rewritten in place
+ * @param {Record<string, { utilization: number, resetAt: number }>} pool
+ */
+export function poolQuotaHeaders(headers, pool) {
+  const p = 'anthropic-ratelimit-unified-';
+  for (const w of POOLED_WINDOWS) {
+    delete headers[`${p}${w}-surpassed-threshold`];
+    if (headers[`${p}${w}-status`] !== undefined) headers[`${p}${w}-status`] = 'allowed';
+    if (headers[`${p}${w}-utilization`] === undefined) continue;
+    const reading = pool[w];
+    if (reading) {
+      headers[`${p}${w}-utilization`] = String(reading.utilization);
+      headers[`${p}${w}-reset`] = String(Math.floor(reading.resetAt / 1000));
+    } else {
+      // No candidate has read this window yet. Leaving the serving account's
+      // reading would restate the near-cap value this exists to hide.
+      delete headers[`${p}${w}-utilization`];
+      delete headers[`${p}${w}-reset`];
+    }
+  }
+  for (const key of Object.keys(headers)) {
+    if (key.startsWith(GRACE_HEADER_PREFIX)) delete headers[key];
+  }
+  if (headers[`${p}status`] === 'allowed_warning') headers[`${p}status`] = 'allowed';
+}
+
+/**
+ * @param {unknown} config
+ * @returns {boolean}
+ */
+export function shouldPoolQuotaHeaders(config) {
+  return /** @type {{ poolQuotaHeaders?: unknown } | null | undefined} */ (config)?.poolQuotaHeaders === true;
+}
+
+/**
+ * The client-header flags a reload copies off the disk config, each sampled
+ * per request through the functions above.
  *
  * @param {unknown} diskConfig
  */
@@ -272,6 +370,7 @@ export function reloadedHeaderFlags(diskConfig) {
   return {
     stripOverageHeaders: shouldStripOverageHeaders(diskConfig),
     synthesizeQuotaHeaders: shouldSynthesizeQuotaHeaders(diskConfig),
+    poolQuotaHeaders: shouldPoolQuotaHeaders(diskConfig),
   };
 }
 
@@ -348,12 +447,14 @@ export function loopbackExempt(headers, remoteAddress, proxyConfig) {
  * @param {string|undefined} remoteAddress
  * @param {Record<string, any>|undefined} proxyConfig
  * @param {string|null} [boundHost]  the address the server bound, when it is not `proxyConfig.host`
+ * @param {string} [endpoint]  what the refusal names; the CLIProxyAPI-compatible
+ *   usage API is held to the same rule
  * @returns {string|null}
  */
-export function keylessMcpRefusal(headers, remoteAddress, proxyConfig, boundHost = null) {
+export function keylessMcpRefusal(headers, remoteAddress, proxyConfig, boundHost = null, endpoint = 'the MCP endpoint') {
   if (!resolveClientAuth(proxyConfig, undefined).ok) return null;
   if (!loopbackExempt(headers, remoteAddress, proxyConfig)) {
-    return 'request refused: with no proxy key configured the MCP endpoint serves only this machine; set proxy.apiKey to reach it from elsewhere';
+    return `request refused: with no proxy key configured ${endpoint} serves only this machine; set proxy.apiKey to reach it from elsewhere`;
   }
   // The address actually bound, when the caller knows it (TEAMCLAUDE_HOST can
   // differ from proxy.host — see createProxyServer's `bindHost`).
@@ -555,7 +656,10 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // request (not captured at creation) so a reload that edits clientKeys
       // applies to a running server, matching how eventLogging/blockedModels
       // are read live further down the pipeline.
-      const clientKey = req.headers['x-api-key'];
+      // A CLIProxyAPI client sends its management key as a bearer (see
+      // cliproxy-api.js); on that API's paths alone it is read as the proxy key.
+      const cliproxyPath = isCliproxyPath(classificationPath(req.url));
+      const clientKey = req.headers['x-api-key'] ?? (cliproxyPath ? presentedManagementKey(req.headers) : undefined);
       const isLocal = loopbackExempt(req.headers, req.socket.remoteAddress, config.proxy);
       const auth = resolveClientAuth(config.proxy, clientKey);
       if (!auth.ok && !isLocal) {
@@ -1033,6 +1137,23 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         return;
       }
 
+      // CLIProxyAPI-compatible usage API (cliproxy-api.js), off unless
+      // proxy.cliproxyApi says otherwise. Read-only and served from the quota
+      // already tracked, so a client key may read it as it may read status. A
+      // config with no key admits every caller, so it is held to this machine
+      // the way the MCP endpoint is. Every path under the prefix is answered
+      // here, on or off, so none falls through to the forwarder.
+      if (cliproxyPath) {
+        const refusal = keylessMcpRefusal(req.headers, req.socket.remoteAddress, config.proxy, boundHost(), 'the CLIProxyAPI-compatible usage API');
+        if (refusal) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: refusal }));
+          return;
+        }
+        await serveCliproxyApi(req, res, { accountManager, config, path: classificationPath(req.url), readBody: readControlBody });
+        return;
+      }
+
       // Every control route above matches an exact method and path, so a typo —
       // or just the wrong verb, `GET /teamclaude/reload` — fell through to the
       // forwarder: the request went upstream under a fleet account's credential
@@ -1121,6 +1242,16 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
   // socket has nothing else standing between a bad handshake and that exit.
   server.on('upgrade', (req, socket, head) => {
     try {
+      // The CLIProxyAPI prefix is ours, and no route under it is a WebSocket.
+      // requestHandler answers every request there itself; a handshake would
+      // otherwise be relayed with the client's management key in its headers
+      // (relayUpgrade strips only x-api-key). Refused before the key gate, as
+      // the request path's answer does not depend on the key either.
+      if (isCliproxyPath(classificationPath(req.url || ''))) {
+        try { socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n'); } catch { /* already gone */ }
+        socket.destroy();
+        return;
+      }
       // The upgrade handshake never reaches requestHandler, so it does not
       // inherit the key gate above — it has to ask for itself. Without this a
       // WebSocket handshake is an unauthenticated relay to `upstream`: the
@@ -1875,10 +2006,10 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // are dropped with the other proxy-control headers.
       const stripHeaders = usageDimensionHeaderNames(config.proxy);
 
-      // stripOverage and synthesizeQuota are sampled once here, at dispatch:
+      // stripOverage, synthesizeQuota and poolQuota are sampled once here, at dispatch:
       // retries and holds of this request keep them, and a reload applies to
       // subsequent requests.
-      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, provider, holdBudgetMs: holdMs, pinKey, onMessage, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), synthesizeQuota: shouldSynthesizeQuotaHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
+      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, provider, holdBudgetMs: holdMs, pinKey, onMessage, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), synthesizeQuota: shouldSynthesizeQuotaHeaders(config), poolQuota: shouldPoolQuotaHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -2158,6 +2289,27 @@ function sxAgent(sx, targetHost) {
 }
 
 /**
+ * The client's request headers as they go upstream on its OWN credential.
+ * @param {import('node:http').IncomingHttpHeaders} reqHeaders
+ * @param {Set<string>|null} [strip] further names to drop (usage dimensions)
+ */
+function clientCredentialHeaders(reqHeaders, strip = null) {
+  /** @type {import('node:http').OutgoingHttpHeaders} */
+  const headers = {};
+  for (const [key, value] of Object.entries(reqHeaders)) {
+    const lk = key.toLowerCase();
+    if (lk.startsWith(':') || HOP_BY_HOP_HEADERS.has(lk) || lk === 'accept-encoding') continue;
+    // The client's identity on this path is its bearer; x-api-key is how it
+    // authenticated to THIS proxy, so relaying it would hand the operator's
+    // proxy key to upstream.
+    if (lk === 'x-api-key') continue;
+    if (strip?.has(lk)) continue;
+    headers[key] = value;
+  }
+  return headers;
+}
+
+/**
  * Relay a request to upstream with the client's OWN headers intact (including
  * its authorization) — used for Remote Control (/v1/code/*), whose event
  * stream is a long-poll: the client keeps the request open indefinitely and
@@ -2167,17 +2319,7 @@ function sxAgent(sx, targetHost) {
  */
 function relayStream(req, res, upstream, sx, stripOverage = false) {
   const target = new URL(`${upstream}${req.url}`);
-  /** @type {import('node:http').OutgoingHttpHeaders} */
-  const headers = {};
-  for (const [key, value] of Object.entries(req.headers)) {
-    const lk = key.toLowerCase();
-    if (lk.startsWith(':') || HOP_BY_HOP_HEADERS.has(lk) || lk === 'accept-encoding') continue;
-    // The client's identity on this path is its bearer; x-api-key is how it
-    // authenticated to THIS proxy, so relaying it would hand the operator's
-    // proxy key to upstream.
-    if (lk === 'x-api-key') continue;
-    headers[key] = value;
-  }
+  const headers = clientCredentialHeaders(req.headers);
 
   const useProxy = !!(sx?.useByDefault() && sx.isProvisioned());
   const agent = useProxy ? sxAgent(sx, target.hostname) : undefined;
@@ -3177,9 +3319,18 @@ export async function peekStreamFailure(stream, bounds = {}) {
  * @param {{ accounts: Record<string, any>[] }} accountManager
  * @param {Set<string>} rejected  the refused accounts' names
  * @param {Map<string, number>|undefined} statuses  the status each one got
+ * @param {Map<string, string|null>|undefined} holds  the identity-verification
+ *   portal each held account pointed at
  */
-function refusalMessage(accountManager, rejected, statuses) {
+function refusalMessage(accountManager, rejected, statuses, holds) {
   const parts = [...rejected].map((name) => {
+    // A verification hold is neither a dead credential nor a quota window: the
+    // token is valid, so "re-add it" sends the operator the wrong way, and the
+    // portal link is the only actionable thing upstream tells us.
+    if (holds?.has(name)) {
+      const url = holds.get(name);
+      return `upstream requires identity verification for account "${name}", whose credential itself is valid, so re-adding it will not help${url ? ` — complete it at ${url}` : ''}`;
+    }
     const account = accountManager.accounts.find(a => a.name === name);
     const failure = account?._lastRefreshFailure;
     // A refresh token the endpoint rejected IS fixed by a re-login; say so then.
@@ -3192,8 +3343,9 @@ function refusalMessage(accountManager, rejected, statuses) {
 
 /**
  * The answer when the accounts a request reached all held an expired token that
- * could not be renewed. 503 with a short Retry-After: the renewal may go through
- * on the next request (the lock freed, the token endpoint back). Never a 401 or
+ * could not be renewed. 503 with the Retry-After of the token endpoint's 429 hold
+ * when there is one, else a short one: the renewal may go through on the next
+ * request (the lock freed, the token endpoint back). Never a 401 or
  * a 403 — the client's own credential is fine.
  * @param {import('node:http').ServerResponse} res
  * @param {Record<string, any>} ctx
@@ -3207,14 +3359,69 @@ function respondUnrenewed(res, ctx, accountManager) {
   const reasons = failures.map(f => f.reason);
   // A refresh token the endpoint rejected IS fixed by a re-login; say so then.
   const relogin = failures.some(f => [400, 401, 403].includes(f.status)) ? ' Re-add it with: teamclaude login' : '';
+  // Come back when a renewal may be tried again: the longest 429 hold among these
+  // accounts (the token endpoint's Retry-After), or 30 s when none is held.
+  const now = Date.now();
+  const held = Math.max(0, ...[...ctx.unrenewed].map((/** @type {string} */ n) => (accountManager.accounts.find((a) => a.name === n)?._refreshHeldUntil ?? 0) - now));
+  const retryAfter = held > 0 ? Math.ceil(held / 1000) : 30;
   ctx.status = 503;
   ctx.account = `(${[...ctx.unrenewed].join(', ')} not renewed)`;
   if (!res.headersSent) {
-    res.writeHead(503, { 'Content-Type': 'application/json', 'retry-after': '30' });
+    res.writeHead(503, { 'Content-Type': 'application/json', 'retry-after': String(retryAfter) });
     res.end(JSON.stringify({
       type: 'error',
       error: { type: 'overloaded_error', message: `No account served this request: the token of ${names} has expired and could not be renewed${reasons.length ? ` (${reasons.join('; ')})` : ''}.${relogin || ' Retry shortly.'}` },
     }));
+  }
+}
+
+/**
+ * A GET the pooled token was not scoped for, sent once on the client's own
+ * credential (the scope branch of forwardRequest). It takes the forward path's
+ * transport, not relayStream's: the admission gate, the fleet upstream proxy,
+ * this attempt's sx route and the default headers deadline all apply, since
+ * this is an ordinary request and not a Remote Control long-poll. The body is
+ * buffered the way the forward path buffers a non-streaming answer.
+ * @param {any} req
+ * @param {any} res
+ * @param {string} upstream
+ * @param {any} sx
+ * @param {boolean} route
+ * @param {Record<string, any>} ctx
+ */
+async function relayOnClientCredential(req, res, upstream, sx, route, ctx) {
+  try {
+    const upstreamRes = await upstreamFetch(`${upstream}${req.url}`, {
+      method: 'GET',
+      headers: clientCredentialHeaders(req.headers, ctx.stripHeaders),
+      signal: ctx.signal,
+      redirect: 'manual',
+    }, sx, route);
+    /** @type {Record<string, string>} */
+    const responseHeaders = {};
+    for (const [key, value] of upstreamRes.headers.entries()) {
+      if (CONNECTION_SPECIFIC_HEADERS.has(key) || key === 'content-encoding' || key === 'content-length') continue;
+      if (ctx.stripOverage === true && isOverageHeader(key)) continue;
+      responseHeaders[key] = value;
+    }
+    const buf = Buffer.from(await upstreamRes.arrayBuffer());
+    ctx.status = upstreamRes.status;
+    res.writeHead(upstreamRes.status, responseHeaders);
+    res.end(buf);
+  } catch (err) {
+    const code = /** @type {{ code?: string }|null} */ (err)?.code;
+    if (code === 'TEAMCLAUDE_CLIENT_GONE') { ctx.abandoned = true; ctx.status = 499; return; }
+    const overloaded = code === 'TEAMCLAUDE_UPSTREAM_OVERLOADED';
+    console.error('[TeamClaude] Client-credential relay error:', describeConnectError(err));
+    ctx.status = overloaded ? 503 : 502;
+    if (!res.headersSent && !clientGone(res)) {
+      res.writeHead(ctx.status, overloaded
+        ? { 'Content-Type': 'application/json', 'Retry-After': '1' }
+        : { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(overloaded
+        ? { type: 'error', error: { type: 'overloaded_error', message: 'Proxy upstream queue is full; retry shortly.' } }
+        : { type: 'error', error: { type: 'proxy_error', message: 'Upstream unreachable' } }));
+    }
   }
 }
 
@@ -3307,6 +3514,21 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         && (ctx.pinnedIndex != null || ctx.tried.size === accountManager.accounts.length)) {
       return respondUnrenewed(res, ctx, accountManager);
     }
+    const billingCandidates = (ctx.pinnedIndex != null
+      ? [accountManager.accounts[ctx.pinnedIndex]].filter(Boolean)
+      : candidateAccounts(accountManager, ctx.model, ctx.provider)).filter(a => !a.disabled);
+    if (billingCandidates.length && billingCandidates.every(a => accountManager.unavailableReason(a, ctx.model) === 'billing')) {
+      ctx.status = 402;
+      ctx.account = '(billing unavailable)';
+      if (!res.headersSent && !clientGone(res)) {
+        res.writeHead(402, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ type: 'error', error: {
+          type: 'billing_error',
+          message: 'Upstream billing refused every eligible account. Check billing or purchase credits; TeamClaude retries after the billing cooldown.',
+        } }));
+      }
+      return;
+    }
     // Every candidate was refused by upstream (403). Waiting will not help — the
     // account needs attention, not a retry — so say so plainly rather than
     // reporting a rate limit. Not a 403 either: the client's own credential is
@@ -3333,7 +3555,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       } else if (allEntitlementDenied) {
         message = `No account served this request. Every configured account returned OAuth entitlement denial (${OAUTH_ENTITLEMENT_ERROR_CODE}): ${names}. TeamClaude temporarily removed them from automatic rotation; retry after the cooldown or pin a different eligible account.`;
       } else {
-        message = refusalMessage(accountManager, rejected, ctx.rejectedStatus);
+        message = refusalMessage(accountManager, rejected, ctx.rejectedStatus, ctx.verificationHold);
       }
       ctx.status = 502;
       ctx.account = `(${[...rejected].join(', ')} refused)`;
@@ -3628,6 +3850,11 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       ctx.tried.add(account.index);
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
     }
+    if (ctx.pinnedIndex == null && accountManager.isBillingRejected(account.index)) {
+      accountManager.release(account.index, { successful: false });
+      ctx.tried.add(account.index);
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
+    }
     let upstreamRes;
     let admittedLoad = 0;
     try {
@@ -3655,6 +3882,22 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     } finally {
       admittedLoad = accountManager.release(account.index,
         { successful: !!upstreamRes && upstreamRes.status < 400 }) || 0;
+    }
+
+    let upstreamBody = upstreamRes.body;
+    if ((upstreamRes.status === 400 || upstreamRes.status === 402) && !res.headersSent) {
+      const inspected = await inspectBillingError(upstreamBody);
+      upstreamBody = inspected.body;
+      if (inspected.billingError) {
+        await upstreamBody?.cancel();
+        accountManager.markBillingRejected(account.index);
+        ctx.tried.add(account.index);
+        if (clientGone(res)) { ctx.abandoned = true; return; }
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+      }
+    }
+    if (upstreamRes.status < 400 && isCompletionPath(classificationPath(req.url))) {
+      accountManager.clearBillingRejected(account.index);
     }
 
     // Extract rate limit headers. Anthropic states its quota under
@@ -4027,12 +4270,34 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // account left, the no-account branch reports a proxy error instead.
     if (upstreamRes.status === 403 && !res.headersSent) {
       const responseBody = await readErrorBody(upstreamRes.body);
+      // Except a scope 403: the account is fine, its token just cannot reach
+      // this endpoint. A `claude setup-token` token is inference-only, so
+      // Claude Code's bootstrap, settings and connector-registry calls draw one
+      // on every such account. Failing over walked the whole fleet for each of
+      // them and moved the shared cursor every time, taking running sessions
+      // off the account they were on. Those calls are the client's own, like
+      // the identity plane, so they go out once more on the client's own
+      // credential. GET only: those calls are, and a completion never is, so
+      // the client's login is never spent on inference. A pin keeps its
+      // account for every request, as before.
+      if (req.method === 'GET' && ctx.pinnedIndex == null
+          && account.type === 'oauth' && providerOf(account) === DEFAULT_PROVIDER
+          && responseBody != null && isOAuthScopeInsufficient(responseBody)
+          && /^Bearer \S/i.test(String(req.headers.authorization || ''))) {
+        ctx.account = '(client credential)';
+        await relayOnClientCredential(req, res, upstream, sx, route, ctx);
+        return;
+      }
       const entitlementDenied = account.type === 'oauth'
         && responseBody != null
         && isOAuthEntitlementDenied(responseBody);
       const deniedUntil = entitlementDenied
         ? accountManager.markEntitlementDenied(account.index)
         : null;
+      const verification = account.type === 'oauth' && responseBody != null
+        ? oauthVerificationHold(responseBody)
+        : null;
+      if (verification) (ctx.verificationHold ??= new Map()).set(account.name, verification.url);
       // A set, not a name: the no-account branch needs to tell "every account was
       // refused" (fail fast, nothing to wait for) from "this one was, others are
       // just out of quota" (still worth holding for a reset).
@@ -4043,7 +4308,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       const cooldown = deniedUntil
         ? `; OAuth entitlement cooldown until ${new Date(deniedUntil).toISOString()}`
         : '';
-      console.error(`[TeamClaude] 403 on "${account.name}"; upstream refused the account credential${cooldown}`);
+      console.error(verification
+        ? `[TeamClaude] 403 on "${account.name}"; upstream requires identity verification, so the credential is valid and re-login will not help${verification.url ? ` — complete it at ${verification.url}` : ''}`
+        : `[TeamClaude] 403 on "${account.name}"; upstream refused the account credential${cooldown}`);
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
 
@@ -4102,10 +4369,6 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     const streamAssumed = !contentType && upstreamRes.status < 400 && ctx.streamRequested;
     if (streamAssumed) contentType = 'text/event-stream';
     const isStreaming = contentType.includes('text/event-stream');
-    // The body the relay reads: the upstream's own, or, after a released peek,
-    // the same bytes replayed ahead of the rest of the same stream.
-    let upstreamBody = upstreamRes.body;
-
     // The 5xx hop above never sees "the selected model is at capacity": the
     // Responses API answers it with a 200, opens the stream, and reports the
     // refusal as an event in the body before any output (see peekStreamFailure).
@@ -4173,6 +4436,15 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       Object.assign(responseHeaders, backendQuotaHeaders(account.quota?.backend?.windows));
     }
 
+    // The pool's headroom in place of the serving account's (see
+    // poolQuotaHeaders). An error response is left alone: a 429 that reaches
+    // the client is one rotation already failed to avoid. A pinned request is
+    // left alone too: rotation cannot move it, so its warnings are real.
+    if (ctx.poolQuota === true && ctx.pinnedIndex == null && upstreamRes.status < 400) {
+      const pool = accountManager.poolQuotaReadings(account, ctx.model, ctx.advisorModel, ctx.provider);
+      if (pool) poolQuotaHeaders(responseHeaders, pool);
+    }
+
     res.writeHead(upstreamRes.status, responseHeaders);
 
     // The catch block's retry is guarded by `!res.headersSent`, so a stay
@@ -4209,7 +4481,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       }
       l?.end();
     } else {
-      const buf = Buffer.from(await upstreamRes.arrayBuffer());
+      const buf = Buffer.from(await new globalThis.Response(upstreamBody).arrayBuffer());
       extractUsageFromBody(buf, account.index, accountManager, ctx.onUsage, ctx.pinKey, ctx.model, ctx.onMessage);
       const l = getLog();
       if (l) { l.body('RESPONSE BODY', buf, contentType); l.end(); }
@@ -4876,7 +5148,7 @@ function blockingResets(accountManager, account, model) {
   const q = account.quota || {};
   /** @type {any[]} */
   const resets = [account.rateLimitedUntil, account.entitlementDeniedUntil, account.routingFailedUntil,
-    account.credentialRejectedUntil];
+    account.credentialRejectedUntil, account.billingRejectedUntil];
 
   if (q.unified5h != null && q.unified5h >= accountManager.thresholdFor('unified5h')) {
     resets.push(q.unified5hReset);

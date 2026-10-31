@@ -36,6 +36,23 @@ Reacting the wrong way to either one makes things worse, so they are handled sep
 
 Rotating on a rate-limit 429 would just move the burst to the next account and throw away the first account's prompt cache.
 
+## Billing refusals
+
+An HTTP `400` with Anthropic's `invalid_request_error` message beginning
+`Your credit balance is too low to access the Anthropic API.`, or an HTTP
+`400` or `402` with a structured `billing_error`, excludes that account from
+automatic rotation for five minutes. The request fails over immediately,
+including to [subscription usage credits] when the existing fallback policy
+allows them. Other validation errors pass through unchanged.
+
+Status reports the billing refusal separately from quota exhaustion and
+recommends checking billing or purchasing credits. If every eligible account
+is in this cooldown, the proxy returns `402 billing_error`. The next request
+after the cooldown retries the account. Re-enabling the account or replacing
+its API key also clears the cooldown.
+
+[subscription usage credits]: quota.md#extra-usage-fallback
+
 ## OAuth entitlement denials
 
 A `403` whose structured error code is `error.details.error_code: oauth_not_allowed_for_organization` means the selected account's organization does not permit OAuth authentication. TeamClaude fails the current request over to another account and keeps the denied account out of automatic rotation for five minutes. The cooldown is shared by later requests, is not persisted, and expires automatically so an organization policy change can recover without restarting the proxy. Other `403` responses still fail over for that request but do not quarantine the account.
@@ -43,6 +60,10 @@ A `403` whose structured error code is `error.details.error_code: oauth_not_allo
 If every configured account returns that exact denial, TeamClaude's terminal `502` says that no account served the request, names the denied accounts and error code, and recommends waiting for automatic re-admission or pinning a different eligible account. It does not recommend `teamclaude login`, which remains the diagnostic for a generic credential refusal.
 
 An explicit [`TC_ACCT` pin](#pin-a-session-to-one-account) continues to target exactly the requested account and never fails over, even while that account is excluded from automatic rotation.
+
+## Token scope denials
+
+A `403` with `error.details.error_code: oauth_scope_insufficient` is about the token, not the account. A `claude setup-token` token carries `user:inference` only, so Claude Code's bootstrap, settings and connector-registry calls draw this on every such account. TeamClaude does not fail those over: a `GET` that draws one goes out once more on the client's own bearer, like the [identity plane](proxy-modes.md), over the same upstream proxy, sx route and admission queue as any forwarded request, and rotation stays where it was. Any other method, which includes every completion, a [pinned](#pin-a-session-to-one-account) request, and a client with no bearer of its own get the normal handling.
 
 ## One failover hop on a rate limit
 
