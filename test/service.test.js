@@ -73,10 +73,35 @@ test('resolveExec ignores a PATH node that is a different binary', () => {
 // launchd starts with an empty environment — an inherited-looking PATH is not
 // inherited at all, so the unit has to carry one or self-update can't find npm.
 test('the service PATH covers both binaries and the system directories', () => {
-  const p = servicePath({ node: '/opt/homebrew/bin/node', entry: '/opt/homebrew/bin/teamclaude' });
+  const p = servicePath({
+    node: '/opt/homebrew/bin/node', entry: '/opt/homebrew/bin/teamclaude',
+    home: '/Users/x', exists: () => false,
+  });
   assert.match(p, /^\/opt\/homebrew\/bin:/);
   assert.match(p, /\/usr\/bin/);
   assert.equal(p.split(':').filter(d => d === '/opt/homebrew/bin').length, 1); // deduped
+  assert.equal(p.includes('.local'), false);
+});
+
+// The native Claude Code installer puts `claude` in ~/.local/bin and only the
+// login shell adds that directory. Keep-warm spawns `claude` by name, so the
+// service PATH has to carry it or a freshly installed agent cannot warm.
+test('the service PATH includes ~/.local/bin when that directory exists', () => {
+  const p = servicePath({
+    node: '/opt/homebrew/bin/node', entry: '/opt/homebrew/bin/teamclaude',
+    home: '/Users/x', exists: (d) => d === '/Users/x/.local/bin',
+  });
+  const dirs = p.split(':');
+  assert.equal(dirs.at(-1), '/Users/x/.local/bin');
+  assert.equal(dirs.filter(d => d === '/Users/x/.local/bin').length, 1);
+});
+
+test('the service PATH omits ~/.local/bin when that directory is absent', () => {
+  const p = servicePath({
+    node: '/usr/bin/node', entry: '/usr/bin/teamclaude',
+    home: '/home/x', exists: () => false,
+  });
+  assert.equal(p.includes('.local'), false);
 });
 
 test('the LaunchAgent asks for restart-on-exit and headless mode', () => {

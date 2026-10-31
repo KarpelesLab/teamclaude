@@ -581,6 +581,8 @@ async function serverCommand() {
     // the endpoint to be off as surely as one who deletes the key, and leaving
     // the old mode in memory would keep it served.
     if (config.proxy) config.proxy.mcp = diskConfig.proxy?.mcp;
+    // The CLIProxyAPI-compatible usage API, the same way and for the same reason.
+    if (config.proxy) config.proxy.cliproxyApi = diskConfig.proxy?.cliproxyApi;
     // Pick up route table edits (teamclaude route …, TUI editor, or a hand edit).
     config.routes = diskConfig.routes || [];
     accountManager.setRoutes(config.routes);
@@ -629,6 +631,8 @@ async function serverCommand() {
     // and this one has to hot-apply in particular: "stop spending credits" must
     // not wait for a restart.
     config.autoRedeemResets = diskConfig.autoRedeemResets === true;
+    // Read by the prober off this object per cycle, like the switch above.
+    config.probeDisabledAccounts = diskConfig.probeDisabledAccounts === true;
     config.blockedModels = Array.isArray(diskConfig.blockedModels) ? diskConfig.blockedModels : [];
     // Sampled off this object when each request is dispatched (server.js
     // shouldStripOverageHeaders / shouldSynthesizeQuotaHeaders), so the reload
@@ -713,6 +717,7 @@ async function serverCommand() {
         // Persist other runtime-tunable settings edited from the TUI.
         if (config.switchThreshold != null) diskConfig.switchThreshold = config.switchThreshold;
         if (config.quotaProbeSeconds != null) diskConfig.quotaProbeSeconds = config.quotaProbeSeconds;
+        if (config.probeDisabledAccounts != null) diskConfig.probeDisabledAccounts = config.probeDisabledAccounts;
         if (config.warmupSeconds != null) diskConfig.warmupSeconds = config.warmupSeconds;
         // The telemetry mode and the model blocklist are edited from the settings
         // screen too; the server reads them live from `config`, but without this
@@ -989,6 +994,7 @@ async function serverCommand() {
   prober = new Prober(accountManager, {
     intervalMs: (config.quotaProbeSeconds || 0) * 1000,
     profileFn: fetchProfile,
+    config,
   });
   // The web dashboard's one-shot probe button uses the same zero-spend action
   // as the TUI's `p` key. Assigned after construction because the hook object
@@ -2971,6 +2977,14 @@ Connect Claude Code with:
 Same gates as the other /teamclaude/ routes. A named client key is served
 read-only even in "full" mode: the write tools answer to the shared proxy key
 and to local callers. With no proxy key configured, only local callers are served.
+
+CLIProxyAPI-compatible usage API (off by default). With
+"proxy": { "cliproxyApi": "read" } a usage dashboard that reads CLIProxyAPI's
+management API sees every subscription account: GET /v0/management/auth-files
+lists them, and POST /v0/management/api-call answers the Claude and Codex usage
+URLs from the quota the server already tracks. Nothing is relayed upstream and
+no credential leaves the proxy. The dashboard's management key is the proxy key
+(or a client key), sent as Authorization: Bearer.
 
 Upstream proxy. On a host with no direct route to the internet, set
 "upstreamProxy": "http://user:pass@host:3128" (or just "host:3128") and every
