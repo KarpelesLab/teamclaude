@@ -1310,6 +1310,16 @@ export class TUI {
     });
 
     fields.push({
+      id: 'probeDisabledAccounts',
+      label: 'Probe disabled',
+      hint: '←→ toggle',
+      value: () => (this.config.probeDisabledAccounts === true ? green('on') : gray('off')),
+      left: () => this._toggleProbeDisabledAccounts(),
+      right: () => this._toggleProbeDisabledAccounts(),
+      enter: () => this._toggleProbeDisabledAccounts(),
+    });
+
+    fields.push({
       id: 'quotaBarPercent',
       label: 'Bar percentage',
       hint: '←→ toggle',
@@ -2121,6 +2131,18 @@ export class TUI {
     this.config.autoRedeemResets = next;
     if (!await this._saveSetting('auto-redeem', () => { this.config.autoRedeemResets = prev; })) return;
     this._addLog(`Auto-redeem reset credits (Codex and Claude): ${next ? 'on' : 'off'}`);
+    if (this.running) this.render();
+  }
+
+  async _toggleProbeDisabledAccounts() {
+    // Whether the probe (periodic and `p`) also reads disabled accounts. The
+    // prober reads it off the shared config per cycle, so the assignment is the
+    // whole application and the save is only what survives a restart.
+    const prev = this.config.probeDisabledAccounts;
+    const on = prev !== true;
+    this.config.probeDisabledAccounts = on;
+    if (!await this._saveSetting('probe disabled', () => { this.config.probeDisabledAccounts = prev; })) return;
+    this._addLog(`Probe disabled accounts: ${on ? 'on' : 'off'}`);
     if (this.running) this.render();
   }
 
@@ -3343,6 +3365,8 @@ export class TUI {
     // ── Quota probe
     lines.push(bold('  Quota probe') + dim('  — refresh idle accounts from the usage endpoint'));
     lines.push(row(byId('probe')));
+    lines.push(row(byId('probeDisabledAccounts')));
+    lines.push(dim('  Also refresh accounts you disabled. Refreshes their tokens too.'));
     lines.push('');
     // ── Quota bars
     lines.push(bold('  Quota bars') + dim('  — what the bar on each account row carries'));
