@@ -192,6 +192,12 @@ export function oauthVerificationHold(body) {
   }
 }
 
+/** Whether a response's Content-Type names a JSON body (parameters ignored).
+ * @param {string|null} value */
+function isJsonContentType(value) {
+  return (value || '').split(';')[0].trim().toLowerCase() === 'application/json';
+}
+
 // Error payloads are normally tiny, but an alternate upstream is configurable.
 // Bound the diagnostic read so a hostile chunked 403 cannot make the proxy buffer
 // an arbitrary response merely to decide whether it should quarantine an account.
@@ -3845,7 +3851,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     }
 
     let upstreamBody = upstreamRes.body;
-    if ((upstreamRes.status === 400 || upstreamRes.status === 402) && !res.headersSent) {
+    // Only a JSON error is read ahead: any other 400 or 402 (an event stream, a
+    // proxy's HTML page) is relayed as it arrives, not held until it ends.
+    if ((upstreamRes.status === 400 || upstreamRes.status === 402) && !res.headersSent
+        && isJsonContentType(upstreamRes.headers.get('content-type'))) {
       const inspected = await inspectBillingError(upstreamBody);
       upstreamBody = inspected.body;
       if (inspected.billingError) {
@@ -4231,7 +4240,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // rotation and the request fails over, like the 403 below. Only a JSON
     // body is read, and it is teed, so an ordinary 400 is relayed whole.
     if (upstreamRes.status === 400 && account.type === 'oauth' && upstreamBody && !res.headersSent
-        && (upstreamRes.headers.get('content-type') || '').split(';')[0].trim().toLowerCase() === 'application/json') {
+        && isJsonContentType(upstreamRes.headers.get('content-type'))) {
       const [peek, rest] = upstreamBody.tee();
       upstreamBody = rest;
       const refusal = accountRefusal(400, await readErrorBody(peek));
