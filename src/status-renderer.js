@@ -86,6 +86,8 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
     if (why) lines.push(`  ${why}`);
     const denied = entitlementLine(account, now, paint);
     if (denied) lines.push(`  ${denied}`);
+    const plan = subscriptionLostLine(account, paint, now);
+    if (plan) lines.push(`  ${plan}`);
     const spend = spendLine(account, paint);
     if (spend) lines.push(`  ${spend}`);
     const resetCredits = resetCreditLine(account, paint, now);
@@ -479,6 +481,20 @@ function entitlementLine(account, now, paint) {
   const when = count > 1 ? `${count} in a row, first ${since}` : since;
   const text = safeLine(denial.detail ?? '', 200) || 'OAuth entitlement denied';
   return `${paint.dim('Denied'.padEnd(8))} ${paint.yellow(text)} ${paint.dim(`\u2014 ${when}`)}`;
+}
+
+/**
+ * @param {any} account
+ * @param {any} paint
+ * @param {number} [now]
+ */
+export function subscriptionLostLine(account, paint, now = Date.now()) {
+  const lost = account?.subscriptionLost;
+  if (!lost) return null;
+  const since = parseTs(lost.since);
+  const when = since ? ` (since ${formatAgo(Math.min(since, now), now)})` : '';
+  const text = `its OAuth profile no longer shows the Claude ${safeLine(lost.plan, 16)} plan${when}`;
+  return `${paint.dim('Plan'.padEnd(8))} ${paint.yellow(text)} ${paint.gray('\u2014 renew the plan or disable the account')}`;
 }
 
 // Compact names for the "switch NN%" line below — short enough that several

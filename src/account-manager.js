@@ -375,6 +375,10 @@ export function accountRouting(acct, listener = null) {
   }
 }
 
+function planOf(/** @type {Record<string, any>} */ account) {
+  return account.hasClaudeMax === true ? 'Max' : account.hasClaudePro === true ? 'Pro' : null;
+}
+
 // Build a fresh in-memory account record from a config/disk account object.
 // Shared by the constructor and addAccount() so the field set can never drift
 // between startup accounts and runtime-added ones (a divergence here once left
@@ -413,6 +417,8 @@ function makeAccount(acct, index, listener = null) {
     seatTier: acct.seatTier || null,
     hasClaudeMax: acct.hasClaudeMax ?? null,
     hasClaudePro: acct.hasClaudePro ?? null,
+    // Kept across restarts; see applyProfileData.
+    subscriptionLost: /** @type {{ plan: string, since: number }|null} */ (null),
     priority: acct.priority || 0,
     // Where this account sits in the list the TUI draws, arranged by the
     // operator from the settings screen. Presentation only: nothing but
@@ -5338,12 +5344,31 @@ export class AccountManager {
     }
   }
 
-  /** Apply subscription metadata learned from the OAuth profile endpoint. */
+  // Apply subscription metadata from the OAuth profile. A lapsed Max or Pro plan
+  // is only reported (`subscriptionLost`): upstream's answers decide whether the
+  // account still serves.
   applyProfileData(accountIndex, profile) {
     const account = this.accounts[accountIndex];
     if (!account || !profile || profile.error) return;
+    const plan = planOf(account);
+    const tier = account.rateLimitTier;
     for (const field of ['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro']) {
       if (profile[field] != null) account[field] = profile[field];
+    }
+    const name = safeLine(account.name, 64);
+    const now = planOf(account);
+    if (plan && profile.hasClaudeMax === false && profile.hasClaudePro === false) {
+      // A reload puts back the plan the config row was signed in with, so the
+      // same loss can be read again: keep when it was first seen.
+      if (account.subscriptionLost) return;
+      account.subscriptionLost = { plan, since: Date.now() };
+      console.log(`[TeamClaude] Account "${name}": its OAuth profile no longer shows the Claude ${plan} plan — renew the plan or disable the account`);
+    } else if (account.subscriptionLost && (profile.hasClaudeMax === true || profile.hasClaudePro === true)) {
+      account.subscriptionLost = null;
+      console.log(`[TeamClaude] Account "${name}": its OAuth profile shows the Claude ${now} plan again`);
+    } else if (plan && now && (plan !== now || (tier && account.rateLimitTier !== tier))) {
+      const label = (/** @type {string} */ p, /** @type {string|null} */ t) => `Claude ${p}${t ? ` (${safeLine(t, 64)})` : ''}`;
+      console.log(`[TeamClaude] Account "${name}": plan changed from ${label(plan, tier)} to ${label(now, account.rateLimitTier)}`);
     }
   }
 
@@ -5730,6 +5755,9 @@ export class AccountManager {
     account._minted = false;
     // A failed renewal of the tokens these replace no longer explains anything.
     account._lastRefreshFailure = null;
+    // Nor does a lapsed plan restored from the last run: a sign-in may be on a
+    // renewed one, and the next profile read reports the loss again if not.
+    account.subscriptionLost = null;
     if (account.status === 'error') account.status = 'active';
     console.log(`[TeamClaude] Updated tokens for account "${safeLine(account.name, 64)}"`);
     this._onTokenRefresh?.(accountIndex, {
@@ -5827,6 +5855,7 @@ export class AccountManager {
         seatTier: a.seatTier,
         hasClaudeMax: a.hasClaudeMax,
         hasClaudePro: a.hasClaudePro,
+        subscriptionLost: a.subscriptionLost,
       };
       const adaptive = {
         burnRate: this.burnRateLearner.export(a.index),
@@ -5854,7 +5883,7 @@ export class AccountManager {
       for (const f of PERSISTED_QUOTA_FIELDS) {
         if (match.quota[f] != null) account.quota[f] = match.quota[f];
       }
-      for (const field of ['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro']) {
+      for (const field of ['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro', 'subscriptionLost']) {
         if (match.profile?.[field] != null) account[field] = match.profile[field];
       }
       this.burnRateLearner.restore(account.index, match.adaptive?.burnRate);
@@ -5966,6 +5995,7 @@ export class AccountManager {
         status: a.status,
         // What put it in 'error' and what brings it back; null in every other state.
         errorReason: a.status === 'error' && a.errorReason ? { ...a.errorReason } : null,
+        subscriptionLost: a.subscriptionLost ? { ...a.subscriptionLost } : null,
         // Why the account is out of rotation right now (null = it can serve).
         // Distinguishes a local threshold decision from an upstream rejection —
         // without it the two are indistinguishable in status output (#166).

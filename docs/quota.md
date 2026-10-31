@@ -53,6 +53,8 @@ The probe is also the only source for the **Sonnet 7-day** bucket, when your pla
 
 It is likewise the only source for Claude's [banked usage-limit resets](accounts.md#claude-banked-usage-limit-resets), read from the same call.
 
+For Anthropic accounts the probe also reads the OAuth profile (`/api/oauth/profile`, also zero-spend): on every cycle while the account has no plan or tier on record, then on the first cycle at least an hour after the last read. A profile that stops showing the account's Max or Pro plan is reported in status; see [When a plan lapses](accounts.md#when-a-plan-lapses).
+
 ### Revalidating a spent family bucket
 
 Those `7d_oi` headers ride on **Fable responses only** — no other model's response carries them. That makes a spent Fable (or Sonnet) reading self-sealing: once it reads at or above the switch threshold, rotation stops sending that family to the account, which is also the only thing that could have refreshed the reading ([#167](https://github.com/KarpelesLab/teamclaude/issues/167)).
