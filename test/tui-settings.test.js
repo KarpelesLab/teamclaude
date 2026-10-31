@@ -100,6 +100,20 @@ test('the quota-bar percentage toggles on from a config that never had the key',
   assert.deepEqual(saved, [true, false]);
 });
 
+test('probe-disabled toggles on from a config that never had the key', async () => {
+  const saved = [];
+  const tui = makeTUI();
+  tui.saveConfig = async c => { saved.push(c.probeDisabledAccounts); };
+  const row = tui._settingsFields().find(f => f.id === 'probeDisabledAccounts');
+  assert.equal(stripAnsi(row.value()), 'off');
+
+  await row.right();
+  assert.equal(tui.config.probeDisabledAccounts, true);
+  await row.left();
+  assert.equal(tui.config.probeDisabledAccounts, false);
+  assert.deepEqual(saved, [true, false]);
+});
+
 // A gate that is read live off the shared config (event logging here) must not
 // keep a value disk refused: the running server would act on it while the file,
 // and so the next start, said otherwise, and the row would show the new value

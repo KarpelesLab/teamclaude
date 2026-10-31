@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import {
   approvalUrl, callbackBase, callbackClientId, CALLBACK_CLIENT_ID, loginCallback, refreshCallbackToken,
   getCallbackAuthPath, loadCallbackToken, saveCallbackToken, clearCallbackToken,
-  callbackCall, callbackWhoami, logoutCallback, callbackTokenLapsed,
+  callbackCall, callbackApi, callbackWhoami, logoutCallback, callbackTokenLapsed,
 } from '../src/callback-auth.js';
 
 // Sign-in to callback.net: a poll-token OAuth2 flow. The client asks for a poll
@@ -138,16 +138,14 @@ test('the approval URL is the API\'s own, or a short link only when it looks lik
 });
 
 test('the API origin can only be overridden to https, or to plain http on this machine', () => {
-  const warned = [];
-  const at = (v) => callbackBase(v === undefined ? {} : { TEAMCLAUDE_CALLBACK_API_BASE: v }, (m) => warned.push(m));
+  const at = (v) => callbackBase(v === undefined ? {} : { TEAMCLAUDE_CALLBACK_API_BASE: v });
   assert.equal(at(undefined), 'https://www.callback.net');
   assert.equal(at('https://staging.example.net/'), 'https://staging.example.net');
   assert.equal(at('http://127.0.0.1:8080'), 'http://127.0.0.1:8080');
-  assert.equal(warned.length, 0);
-  assert.equal(at('http://staging.example.net'), 'https://www.callback.net');
-  assert.equal(at('not a url'), 'https://www.callback.net');
-  assert.equal(warned.length, 2);
-  assert.match(warned[0], /must be https/);
+  // An override that is set but not acceptable is refused, never replaced by the
+  // default: that would send this install's token to a host it was not meant for.
+  assert.throws(() => at('http://staging.example.net'), /CALLBACK_API_BASE.*must be https/);
+  assert.throws(() => at('not a url'), /CALLBACK_API_BASE/);
   // The new prefix wins, as for every other variable.
   assert.equal(callbackBase({ TEAMROUTER_CALLBACK_API_BASE: 'https://a.example', TEAMCLAUDE_CALLBACK_API_BASE: 'https://b.example' }), 'https://a.example');
 });
@@ -429,4 +427,22 @@ test('teamclaude callback: login prints the URL and saves the token, status name
   const bad = await runCli(configPath, api.base, ['frobnicate']);
   assert.equal(bad.code, 1);
   assert.match(bad.stderr, /Usage: teamclaude callback login/);
+});
+
+test('a CALLBACK_API_BASE that is set but not acceptable sends nothing, to the default or anywhere', async () => {
+  const before = process.env.TEAMROUTER_CALLBACK_API_BASE;
+  process.env.TEAMROUTER_CALLBACK_API_BASE = 'http://store.example.net';
+  const sent = [];
+  try {
+    const err = await callbackApi('GET', 'User/Credential', null, {
+      accessToken: 'our-token',
+      fetchImpl: async (url) => { sent.push(String(url)); throw new TypeError('fetch failed'); },
+    }).catch((e) => e);
+    assert.ok(err instanceof Error, 'the call is refused');
+    assert.match(err.message, /CALLBACK_API_BASE/);
+    assert.deepEqual(sent, [], 'and the token went nowhere');
+  } finally {
+    if (before === undefined) delete process.env.TEAMROUTER_CALLBACK_API_BASE;
+    else process.env.TEAMROUTER_CALLBACK_API_BASE = before;
+  }
 });
