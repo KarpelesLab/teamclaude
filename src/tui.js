@@ -11,7 +11,8 @@ import {
 import { configIndexFor, managerAccountFor, markAccountRemoved, markAccountAdded } from './account-pairing.js';
 import { PROVIDERS, providerOf, isSubscriptionAccount, upstreamFor } from './provider.js';
 import { mintAccountId } from './account-id.js';
-import { formatPercent, heldResetCredits, showSessionRow, showWeeklyRow } from './status-renderer.js';
+import { ACCOUNT_REFUSAL_CODES } from './account-refusal.js';
+import { formatPercent, heldResetCredits, showSessionRow, showWeeklyRow, unavailableLine } from './status-renderer.js';
 import { resolveMaxUsage, resolveMaxSpendMinor, switchThresholdDiffs, modelLabel, EFFORT_SEP } from './model.js';
 import { parseProxyUrl, proxyToUrl, describeProxy, describeSelfProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy, localListener, isSelfProxy } from './upstream-proxy.js';
 import { describeRouting, parseRoutingUrl, routingToUrl, checkRouting } from './account-routing.js';
@@ -452,6 +453,11 @@ export function routingTag(account) {
   const text = typeof r === 'string' ? r : describeRouting(r);
   return text ? `via ${text}` : '';
 }
+
+// The status cell's name for an errorReason code. A code it does not know keeps `error`.
+const errorLabel = (/** @type {unknown} */ code) => code === 'account_on_hold' ? 'on hold'
+  : code === 'refresh_rejected' || code === 'credential_rejected' ? 're-login'
+  : typeof code === 'string' && ACCOUNT_REFUSAL_CODES.has(code) ? 'refused' : 'error';
 
 /** Fit a line to exactly w columns: truncate if too long, pad if too short.
  *  Truncation drops a wide glyph that would straddle the limit, so the result
@@ -2598,16 +2604,16 @@ export class TUI {
       if (split) {
         const [a, b] = groups;
         lines.push(paneTitle(PROVIDERS[a.provider].label, split.leftW) + dim(PANE_GUTTER) + paneTitle(PROVIDERS[b.provider].label, split.rightW));
-        for (let r = 0; r < Math.max(a.indices.length, b.indices.length); r++) {
-          const left = r < a.indices.length ? this._renderRow(a.indices[r], split.left, current) : '';
-          const right = r < b.indices.length ? this._renderRow(b.indices[r], split.right, current) : '';
-          lines.push(fitLine(left, split.leftW) + dim(PANE_GUTTER) + right);
+        const left = a.indices.flatMap(i => this._rowLines(i, split.left, current));
+        const right = b.indices.flatMap(i => this._rowLines(i, split.right, current));
+        for (let r = 0; r < Math.max(left.length, right.length); r++) {
+          lines.push(fitLine(left[r] ?? '', split.leftW) + dim(PANE_GUTTER) + (right[r] ?? ''));
         }
       } else {
         lines.push('');
         const order = this._displayOrder();
         const layout = this._listLayout(order, W);
-        for (const i of order) lines.push(this._renderRow(i, layout, current));
+        for (const i of order) lines.push(...this._rowLines(i, layout, current));
       }
     }
 
@@ -2935,6 +2941,17 @@ export class TUI {
     return this._renderAcct(idx, b.bw, b.showBoth, L.routes, L.genRoutes, L.familyTarget, b.showFamily, L.nameW, { current, compact: L.compact, shortBar: b.shortBar });
   }
 
+  /** The row, then for an account out of rotation as `error` the line `teamclaude status`
+   *  prints for it, wrapped to the pane so the command at its end is not cut off. */
+  _rowLines(/** @type {number} */ idx, /** @type {any} */ L, /** @type {Set<number>} */ current) {
+    const a = this.am.accounts[idx];
+    const row = this._renderRow(idx, L, current);
+    if (this._unavailable(a) !== 'error') return [row];
+    const plain = (/** @type {string} */ s) => s;
+    const why = unavailableLine({ ...a, unavailable: 'error', onExtraUsage: this._onExtraUsage(a) }, { dim: plain, yellow: plain, red: plain });
+    return [row, ...wrapWords(why ?? '', L.width - 4).map(l => `    ${yellow(l)}`)];
+  }
+
   /** The accounts of each provider present, in the order its rows are drawn. */
   _providerGroups() {
     /** @type {Map<string, number[]>} */
@@ -3129,9 +3146,7 @@ export class TUI {
     // not in it, and a row reading `active` for an account that receives nothing
     // sent operators looking at the wrong thing (#468). Live, the manager says;
     // in attach mode the status payload carries the same reason.
-    const barred = typeof this.am.unavailableReason === 'function'
-      ? this.am.unavailableReason(a)
-      : (a.unavailable ?? null);
+    const barred = this._unavailable(a);
     let status;
     if (a.disabled) {
       status = gray('disabled');
@@ -3145,7 +3160,7 @@ export class TUI {
       case 'active':    status = isCur ? green('active') : 'active'; break;
       case 'throttled': status = yellow('throttled'); break;
       case 'exhausted': status = red('exhausted'); break;
-      case 'error':     status = red('error'); break;
+      case 'error':     status = red(errorLabel(a.errorReason?.code)); break;
       default:          status = a.status || 'ready';
     }
     status = rpad(status, 10);
@@ -3303,6 +3318,12 @@ export class TUI {
    * @param {{ index: number, onExtraUsage?: boolean }} a */
   _onExtraUsage(a) {
     return typeof this.am.onExtraUsage === 'function' ? this.am.onExtraUsage(a.index) : a.onExtraUsage === true;
+  }
+
+  /** Why the account is out of rotation: the manager's verdict live, the payload's attached.
+   * @param {any} a */
+  _unavailable(a) {
+    return typeof this.am.unavailableReason === 'function' ? this.am.unavailableReason(a) : (a.unavailable ?? null);
   }
 
   /**
