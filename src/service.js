@@ -188,10 +188,31 @@ function runCommand(cmd, args) {
 /** `gui/<uid>` — the launchd domain a per-user agent lives in. */
 const guiDomain = (uid = process.getuid?.() ?? 0) => `gui/${uid}`;
 
+// launchd lets go of a booted-out agent on its own schedule: `bootout` can
+// return while the old process is still exiting, and a `bootstrap` sent before
+// launchd is done with the label fails with "Bootstrap failed: 5: Input/output
+// error". By then the old agent is gone and the new one never loaded, so the
+// reinstall stopped the proxy instead of restarting it. The install therefore
+// waits until `launchctl print` no longer finds the label, and retries a
+// bootstrap that still answers EIO.
+//
+// The wait ends as soon as the label is gone, so its cap only matters when it
+// is not. The default shutdown saves its quota state and exits within a 2 s
+// grace. A proxy draining under proxy.drainTimeoutSeconds can take longer,
+// until launchd sends SIGKILL after its ExitTimeOut: 20 s by default in the
+// last launchd.plist(5) that named a value, "system-defined" in current ones.
+// 30 s outlasts that.
+export const LAUNCHD_UNLOAD_WAIT_MS = 30_000;
+const LAUNCHD_UNLOAD_POLL_MS = 250;
+// launchctl exits with the errno it reports, so EIO is exit status 5.
+const BOOTSTRAP_EIO = 5;
+const BOOTSTRAP_RETRY_PAUSES_MS = [1000, 2000];
+
 export async function installService({
   kind = serviceKind(), home = homedir(), platform = process.platform,
   exec = resolveExec(), run = runCommand, configPath = null, log = console.log,
   xdgConfig = process.env.XDG_CONFIG_HOME,
+  sleep = (/** @type {number} */ ms) => new Promise((resolve) => { setTimeout(resolve, ms); }), now = Date.now,
 } = {}) {
   if (!kind) return { ok: false, error: `No service integration for ${platform}` };
   const logFile = logPath(home, platform);
@@ -205,8 +226,31 @@ export async function installService({
     // Replace any previous registration first: bootstrap fails outright when the
     // label is already loaded, and an install that reports success while the old
     // definition keeps running is worse than a loud failure.
-    run('launchctl', ['bootout', `${guiDomain()}/${LABEL}`]);
-    const boot = run('launchctl', ['bootstrap', guiDomain(), plist]);
+    const target = `${guiDomain()}/${LABEL}`;
+    run('launchctl', ['bootout', target]);
+    // Then wait for launchd to let go of it (see LAUNCHD_UNLOAD_WAIT_MS). A
+    // nonzero `print` is what serviceStatus reports as "not loaded"; on a fresh
+    // install it is the first answer, so nothing waits.
+    const deadline = now() + LAUNCHD_UNLOAD_WAIT_MS;
+    while (run('launchctl', ['print', target]).code === 0 && now() < deadline) {
+      await sleep(LAUNCHD_UNLOAD_POLL_MS);
+    }
+    let boot = run('launchctl', ['bootstrap', guiDomain(), plist]);
+    for (const pause of BOOTSTRAP_RETRY_PAUSES_MS) {
+      if (boot.code !== BOOTSTRAP_EIO) break;
+      await sleep(pause);
+      boot = run('launchctl', ['bootstrap', guiDomain(), plist]);
+    }
+    if (boot.code === BOOTSTRAP_EIO) {
+      // The first line is the error; launchctl's hint under it is about getting
+      // richer errors as root, not a way out. Say what is.
+      const said = boot.stderr.trim().split('\n')[0] || 'launchctl bootstrap exited 5 (EIO)';
+      return {
+        ok: false, file: plist,
+        error: `${said} (tried ${BOOTSTRAP_RETRY_PAUSES_MS.length + 1} times). launchd may still be removing the previous service; `
+          + 'once `teamclaude service status` reads "not loaded", run `teamclaude service install` again',
+      };
+    }
     if (boot.code !== 0) return { ok: false, error: boot.stderr.trim() || `launchctl bootstrap exited ${boot.code}`, file: plist };
     log(`[TeamClaude] Service installed: ${plist}`);
     log(`[TeamClaude] Logs: ${logFile}`);
