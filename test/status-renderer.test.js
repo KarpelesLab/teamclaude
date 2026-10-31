@@ -162,6 +162,8 @@ test('renderStatus names the load distribution mode', () => {
   status.sessions = { known: 3, active: 2, perAccount: { 0: 2 }, distribute: true, mode: 'load' };
   const output = renderStatus(status, { color: false, now });
   assert.match(output, /Sessions\s+2 active \/ 3 known · distributing by load/);
+  status.sessions.mode = 'surplus';
+  assert.match(renderStatus(status, { color: false, now }), /Sessions\s+2 active \/ 3 known · distributing by load and surplus/);
 });
 
 test('renderStatus reports a draining distribution toggle instead of single-account', () => {

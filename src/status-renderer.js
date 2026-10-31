@@ -676,6 +676,7 @@ function formatSessions(sessions, paint) {
   // needs to know which rule produced what they are looking at.
   if (sessions.mode === 'adaptive') mode = paint.green('adapting');
   else if (sessions.mode === 'load') mode = paint.green('distributing by load');
+  else if (sessions.mode === 'surplus') mode = paint.green('distributing by load and surplus');
   else if (sessions.distribute) mode = paint.green('distributing');
   else if (draining) mode = paint.yellow(`draining ${draining}`);
   else mode = paint.dim('single-account');

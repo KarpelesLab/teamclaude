@@ -76,6 +76,18 @@ test('distribute adaptive writes and reports the third mode', async () => {
   assert.match(read.stdout, /Session distribution: adaptive/);
 });
 
+test('distribute surplus writes and reports its mode', async () => {
+  const configPath = await writeConfig();
+  const set = await runCli(configPath, ['distribute', 'surplus']);
+  assert.equal(set.code, 0, set.stderr);
+  assert.equal(await readDistribute(configPath), 'surplus');
+  assert.match(set.stdout, /Session distribution by load and surplus/);
+
+  const read = await runCli(configPath, ['distribute']);
+  assert.equal(read.code, 0, read.stderr);
+  assert.match(read.stdout, /Session distribution: surplus/);
+});
+
 test('distribute off says the running sessions drain', async () => {
   const configPath = await writeConfig(true);
   const res = await runCli(configPath, ['distribute', 'off']);

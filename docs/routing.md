@@ -278,6 +278,18 @@ The even mode counts conversations, and conversations are not interchangeable: a
 
 The count is of requests the proxy forwarded, kept in a bounded ring per account and pruned on read, so it needs no probe and no persisted state; switching into `load` from another mode starts from the traffic of the last ten minutes. `teamclaude status` reports it per account as `recentRequests`. Like the even mode, `load` only moves traffic by placing new conversations: an existing skew drains as long-lived conversations end and are replaced.
 
+### Surplus distribution
+
+```json
+"distributeSessions": "surplus"
+```
+
+`load` treats every account's quota as equally cheap. It is not when some accounts have a weekly window and others do not, or when weekly windows run short: a request served from a weekly window that would have expired unused costs nothing, one served from a window that will run dry before its reset is taken from a later peak. `load` spends both alike, so on a pool short of weekly quota the weekly accounts empty early in their week and the peaks after that are refused.
+
+The `surplus` mode is `load` with one key ahead of the request count: an account **ahead of its weekly course** waits behind the accounts that are not. Ahead means a weekly window is spent beyond a straight line from the window's start to its limit: utilization above limit × the share of the window elapsed. The limit is the lower of the request's `switchThreshold` and the room under the account's [`maxUsage`](quota.md#per-account-usage-caps) caps. The governing window and the shared weekly are both read, each on its own clock, since family spend meters into both. Accounts not ahead on any window take new conversations first, by load; an account ahead takes them only when none of those is available. A window with no reading or no future reset is never held back, and neither is an account with no weekly window at all (a seat that reports only a 5h window): it competes on load with the accounts behind their line, while a weekly account that has run ahead waits behind it.
+
+Where no account is ahead the mode places exactly as `load` does. It reads only what the band already reads, and keeps no state. Like `load` it acts on placement: a pinned conversation stays where it is when its account goes ahead of its course, and the term enters a move only where `expiryRouting.preempt` already re-picks at a rollover. Priority, availability, the band and its floor come first, unchanged.
+
 ## Expiry-pressure routing
 
 > **The config key `expiryRouting` is provisional.** [#176](https://github.com/KarpelesLab/teamclaude/issues/176) proposes a `routingStrategy` enum for the adjacent drain-concentration problem, and a strategy value such as `"expiry"` is a plausible home for this behaviour. The mechanism below is settled; only its spelling on disk is open, and it will follow whatever shape that discussion settles on.

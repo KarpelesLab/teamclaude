@@ -150,7 +150,7 @@ const THRESHOLD_USAGE = [
   'server immediately.',
 ].join('\n');
 
-const DISTRIBUTE_USAGE = 'Usage: teamclaude distribute <on|off|adaptive|load>';
+const DISTRIBUTE_USAGE = 'Usage: teamclaude distribute <on|off|adaptive|load|surplus>';
 
 const ROUTING_USAGE = [
   'Usage: teamclaude routing <account-name|email> [--check]      (show the account\'s routing; --check tests it)',
@@ -2444,11 +2444,14 @@ async function distributeCommand() {
 
   if (arg === undefined) {
     console.log(`Session distribution: ${current}`);
-    console.log('Set with: teamclaude distribute <on|off|adaptive>');
+    console.log('Set with: teamclaude distribute <on|off|adaptive|load|surplus>');
     console.log('On: each session stays on its account for cache reuse, and new sessions spread');
     console.log('across equal-priority accounts by load. Off: quota-driven rotation only.');
     console.log('Adaptive: spread by remaining weekly credit and load rather than evenly, so the');
     console.log('most-spent account is finished off first without being run into its threshold.');
+    console.log('Load: to the account that served the fewest requests in the last ten minutes.');
+    console.log('Surplus: by load, but an account spending its weekly quota faster than a');
+    console.log('straight line to its limit waits behind the accounts that are not.');
     return;
   }
 
@@ -2457,6 +2460,7 @@ async function distributeCommand() {
   else if (['off', 'false', 'no', '0'].includes(arg)) next = 'off';
   else if (arg === 'adaptive') next = 'adaptive';
   else if (arg === 'load') next = 'load';
+  else if (arg === 'surplus') next = 'surplus';
   if (!next) {
     console.error(DISTRIBUTE_USAGE);
     process.exit(1);
@@ -2939,12 +2943,13 @@ Commands:
                       user:pass@ auth; 'none' clears it (also: login --routing)
   threshold [pct]     Utilization at which rotation leaves an account (1-100);
                       per bucket with 'unified7d=90', and '=default' drops one
-  distribute [on|off|adaptive|load]
+  distribute [on|off|adaptive|load|surplus]
                       Spread new sessions across equal-priority accounts, each
                       pinned to its own for cache reuse (off by default);
                       'adaptive' spreads by remaining weekly credit and load;
                       'load' places each new session on the account that served
-                      the fewest requests in the last ten minutes
+                      the fewest requests in the last ten minutes; 'surplus' does
+                      the same after the accounts not ahead of their weekly course
   probe [off|secs]    Opt-in background quota refresh for idle accounts
                       (off by default; reads usage endpoint, spends no quota)
   warmup [off|secs]   Opt-in: keep idle accounts' 5h timers running by sending

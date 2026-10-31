@@ -37,6 +37,9 @@ export { isFableModel, parseRequestModel, parseAdvisorModel } from './model.js';
  *   'load'         → 'load'     spread new sessions by the requests each account
  *                               served in the last LOAD_WINDOW_MS, even keys as
  *                               tie-breaks (see SessionTracker.recentRequestsFor)
+ *   'surplus'      → 'surplus'  load, but an account spending a weekly window
+ *                               faster than a straight line to its limit waits
+ *                               behind the rest (see _aheadOfCourse)
  * An unrecognised string is treated as 'even' rather than rejected: it is
  * plainly a request to distribute, and refusing to distribute at all would be
  * the worse reading of a typo. It is still said once, naming the value: an
@@ -51,10 +54,11 @@ export function distributionMode(setting) {
     const value = setting.trim().toLowerCase();
     if (value === 'adaptive') return 'adaptive';
     if (value === 'load') return 'load';
+    if (value === 'surplus') return 'surplus';
     if (['off', 'false', 'no', '0'].includes(value)) return 'off';
     if (!EVEN_SPELLINGS.includes(value) && !warnedDistributeValues.has(value)) {
       warnedDistributeValues.add(value);
-      console.warn(`[TeamClaude] distributeSessions: unrecognised value ${JSON.stringify(setting)}, distributing evenly (valid: true, false, "adaptive", "load")`);
+      console.warn(`[TeamClaude] distributeSessions: unrecognised value ${JSON.stringify(setting)}, distributing evenly (valid: true, false, "adaptive", "load", "surplus")`);
     }
     return 'even';
   }
@@ -652,7 +656,7 @@ export class AccountManager {
     // nothing in selection reads it.
     /** @type {SessionPins} */
     this.sessionPins = new SessionPins();
-    // 'off' | 'even' | 'adaptive' | 'load'. `distributeSessions` stays a boolean beside
+    // 'off' | 'even' | 'adaptive' | 'load' | 'surplus'. `distributeSessions` stays a boolean beside
     // it ("is distribution on at all") because the status readout, the TUI
     // header and the remote dashboard all ask only that question.
     this.distributionMode = distributionMode(distributeSessions);
@@ -2043,8 +2047,9 @@ export class AccountManager {
    * @param {'placement'|'decision'} [purpose]
    * @returns {Record<string, any>|null} */
   _pickLeastLoaded(exclude = null, model = null, advisorModel = null, purpose = 'placement') {
-    if (this.distributionMode === 'load') {
-      return this._pickLeastLoadedEven(exclude, model, advisorModel, { byRequests: true });
+    if (this.distributionMode === 'load' || this.distributionMode === 'surplus') {
+      return this._pickLeastLoadedEven(exclude, model, advisorModel,
+        { byRequests: true, byCourse: this.distributionMode === 'surplus' });
     }
     if (this.distributionMode === 'adaptive') {
       const picked = this._pickAdaptive(exclude, model, advisorModel, purpose);
@@ -2210,12 +2215,16 @@ export class AccountManager {
    * Counting what each account actually served places the next session where
    * the least work is, and the session stays pinned there for cache reuse as
    * in every other mode.
+   *
+   * With `byCourse` as well (the surplus mode) one key goes ahead of that: an
+   * account ahead of its weekly course (see _aheadOfCourse) waits behind the
+   * accounts that are not.
    * @param {Set<number>|null} [exclude]
    * @param {string|null} [model]
    * @param {string|null} [advisorModel]
-   * @param {{ byRequests?: boolean }} [options]
+   * @param {{ byRequests?: boolean, byCourse?: boolean }} [options]
    * @returns {Record<string, any>|null} */
-  _pickLeastLoadedEven(exclude = null, model = null, advisorModel = null, { byRequests = false } = {}) {
+  _pickLeastLoadedEven(exclude = null, model = null, advisorModel = null, { byRequests = false, byCourse = false } = {}) {
     const now = Date.now();
     const candidates = this._bandedCandidates(exclude, model, advisorModel);
     // One clock for every candidate: pressure rises continuously as a window
@@ -2228,6 +2237,7 @@ export class AccountManager {
     let best = null;
     let bestPriority = Infinity;
     let bestSpent = Infinity;
+    let bestAhead = Infinity;
     let bestRequests = Infinity;
     let bestSessions = Infinity;
     let bestInFlight = Infinity;
@@ -2236,6 +2246,7 @@ export class AccountManager {
     candidates.forEach((account, i) => {
       const priority = account.priority || 0;
       const heldOff = spent[i];
+      const ahead = byCourse ? this._aheadOfCourse(account, model, now) : 0;
       const requests = byRequests ? this.sessionTracker.recentRequestsFor(account.index, now) : 0;
       const sessions = this.sessionTracker.activeCountFor(account.index, now);
       const inFlight = account.inFlight || 0;
@@ -2243,10 +2254,12 @@ export class AccountManager {
       const reset = this._rankedReset(account, model);
       const samePriority = priority === bestPriority;
       const sameSpend = samePriority && heldOff === bestSpent;
-      const sameLoad = sameSpend && requests === bestRequests;
+      const sameCourse = sameSpend && ahead === bestAhead;
+      const sameLoad = sameCourse && requests === bestRequests;
       if (priority < bestPriority
         || (samePriority && heldOff < bestSpent)
-        || (sameSpend && requests < bestRequests)
+        || (sameSpend && ahead < bestAhead)
+        || (sameCourse && requests < bestRequests)
         || (sameLoad && sessions < bestSessions)
         || (sameLoad && sessions === bestSessions && inFlight < bestInFlight)
         || (sameLoad && sessions === bestSessions && inFlight === bestInFlight && pressure < bestPressure)
@@ -2254,6 +2267,7 @@ export class AccountManager {
         best = account;
         bestPriority = priority;
         bestSpent = heldOff;
+        bestAhead = ahead;
         bestRequests = requests;
         bestSessions = sessions;
         bestInFlight = inFlight;
@@ -3050,7 +3064,7 @@ export class AccountManager {
   setDistributeSessions(enabled, { drain = true } = {}) {
     const mode = distributionMode(enabled);
     if (mode !== 'off') {
-      // Includes switching BETWEEN 'even', 'adaptive' and 'load'. None drains:
+      // Includes switching BETWEEN 'even', 'adaptive', 'load' and 'surplus'. None drains:
       // each keeps a session pinned to its account, so only the choice made for the
       // NEXT new session changes and no running session loses its prompt cache.
       this.distributionMode = mode;
@@ -3422,6 +3436,36 @@ export class AccountManager {
       : Math.max(...bounds.filter(b => b != null), -Infinity);
     if (!Number.isFinite(floor)) return candidates.map(() => 0);
     return bounds.map(b => (b != null && b < floor ? 1 : 0));
+  }
+
+  /**
+   * 1 when `account` is spending a weekly window `model` meters faster than a
+   * straight line from the window's start to its limit, else 0: the surplus
+   * mode's leading key. At its pace so far such an account runs dry before its
+   * reset, so new sessions go first to the accounts that are not ahead and it
+   * keeps its quota for when none of them is available. Both the governing window and the shared weekly are
+   * read, each on its own clock: family spend meters into both, and a family
+   * window behind its line does not make the shared one so. The limit is the
+   * lower of the requested family's switch threshold and the maxUsage room. A
+   * window with no reading or no future reset is never ahead: holding it back
+   * on a number nobody reported would keep it unmeasured.
+   * @param {Record<string, any>} account
+   * @param {string|null} model
+   * @param {number} now
+   * @returns {0|1}
+   */
+  _aheadOfCourse(account, model, now) {
+    const threshold = this.thresholdFor(this._weeklyBucketFor(model), account);
+    const governing = this._governingWindow(account, model);
+    const windows = governing.window === 'unified7d' ? [governing]
+      : [governing, { window: 'unified7d', utilization: account.quota.unified7d, resetAt: account.quota.unified7dReset }];
+    return windows.some(({ window, utilization, resetAt }) => {
+      if (!Number.isFinite(utilization) || !Number.isFinite(resetAt)) return false;
+      const elapsed = 1 - (resetAt - now) / (WEEKLY_WINDOW_SECONDS * 1000);
+      if (!(elapsed >= 0 && elapsed < 1)) return false;
+      const limit = Math.min(threshold, this._spendLimit(account, window, utilization) ?? 1);
+      return utilization > limit * elapsed;
+    }) ? 1 : 0;
   }
 
   /**

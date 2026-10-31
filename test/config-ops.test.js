@@ -130,8 +130,10 @@ test('distribution stores what the router reads and reports whether it changed',
   assert.equal(setDistribution(config, 'load'), true);
   assert.equal(config.distributeSessions, 'load');
   assert.equal(setDistribution(config, 'load'), false);
+  assert.equal(setDistribution(config, 'surplus'), true);
+  assert.equal(config.distributeSessions, 'surplus');
 
-  refused(() => setDistribution(config, 'sometimes'), /off, even, adaptive or load/);
+  refused(() => setDistribution(config, 'sometimes'), /off, even, adaptive, load or surplus/);
 });
 
 test('a route is added, then replaced in place under the same name', () => {
