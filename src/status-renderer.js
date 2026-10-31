@@ -84,6 +84,8 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
     if (egress) lines.push(`  ${egress}`);
     const why = unavailableLine(account, paint);
     if (why) lines.push(`  ${why}`);
+    const plan = subscriptionLostLine(account, paint, now);
+    if (plan) lines.push(`  ${plan}`);
     const spend = spendLine(account, paint);
     if (spend) lines.push(`  ${spend}`);
     const resetCredits = resetCreditLine(account, paint, now);
@@ -463,6 +465,20 @@ export function unavailableLine(account, paint) {
     return `${paint.dim('Blocked'.padEnd(8))} ${paint.yellow(text)} ${paint.red('\u2014 serving on extra usage (paid overage), billing')}`;
   }
   return `${paint.dim('Blocked'.padEnd(8))} ${paint.yellow(text)}`;
+}
+
+/**
+ * @param {any} account
+ * @param {any} paint
+ * @param {number} [now]
+ */
+export function subscriptionLostLine(account, paint, now = Date.now()) {
+  const lost = account?.subscriptionLost;
+  if (!lost) return null;
+  const since = parseTs(lost.since);
+  const when = since ? ` (since ${formatAgo(Math.min(since, now), now)})` : '';
+  const text = `its OAuth profile no longer shows the Claude ${safeLine(lost.plan, 16)} plan${when}`;
+  return `${paint.dim('Plan'.padEnd(8))} ${paint.yellow(text)} ${paint.gray('\u2014 renew the plan or disable the account')}`;
 }
 
 // Compact names for the "switch NN%" line below — short enough that several
