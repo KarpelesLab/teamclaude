@@ -356,3 +356,13 @@ Bodies are truncated past a size cap, and files older than the retention window 
 `--activity-log FILE` appends the TUI activity lines to a file instead, and works in headless mode too.
 
 Claude Code's telemetry (`/api/event_logging/*`) is high-volume activity-log noise and is hidden from the log by default; see [`eventLogging`](configuration.md#fields) to block or show it instead.
+
+## Request correlation
+
+A caller can name its own requests, so the proxy's log lines and activity can be matched to the caller's records.
+
+- The proxy reads `x-request-id` from the caller. It uses that value when it is one header value of 1 to 128 characters from letters, digits, `.`, `_`, `:` and `-`. Anything else (absent, too long, other characters, or repeated) is replaced by a generated UUID.
+- Every response from the proxy's forwarding listener carries the id as `x-teamclaude-request-id`, including refusals and streamed responses. An upstream's own `x-request-id` (Codex sends one) is passed through unchanged.
+- The id is for correlation only. It is not an identity, it is not used to deduplicate requests, and it never affects which account is chosen. The inbound `x-request-id` is still forwarded upstream as the caller sent it.
+- Each upstream attempt's request-log file starts with a header such as `=== REQUEST (account: live, retry: 1, attempt: 2, request: 1, caller: ticket.42) ===`. `request` is the proxy's number for the request, `attempt` counts the upstream sends for it (a failover, a 429 retry and a stream-failure hop each add one), and `caller` is the caller's id. A hop that is answered with a 401 writes no file of its own, so the files show the attempt that answered.
+- The activity hooks (`onRequestStart`, `onRequestEnd`) carry `callerRequestId`, and `onRequestEnd` also carries `attempts`.
