@@ -108,6 +108,12 @@ const MAX_CODEX_MODEL_BUCKETS = 32;
 // The model-to-limit map is keyed by the model the CLIENT asked for, so it
 // needs the same ceiling for the same reason.
 const MAX_CODEX_MODEL_LIMITS = 32;
+// A ChatGPT plan that does not serve a model refuses it with a 400 (see
+// markModelDenied). Same steps as the entitlement cooldown: a renewed plan is
+// noticed on the next re-check, and one that stays lapsed is asked hourly.
+const MODEL_DENIAL_COOLDOWNS_SECONDS = [5 * 60, 15 * 60, 60 * 60];
+// Also keyed by the model the client asked for.
+const MAX_MODEL_DENIALS = 32;
 
 // An `anthropic-ratelimit-*-reset` header (epoch seconds) as ms, or null when
 // it is not a positive finite number. Never NaN: see updateQuota.
@@ -200,6 +206,29 @@ const underOne = v => v != null && v < 1;
  * @property {Record<string, {name: string, utilization: number, resetAt: number|null, seenAt: number}>} [codexModelBuckets]  model-scoped weekly buckets, keyed by slug
  * @property {Record<string, string>} [codexModelLimits]  which limit each model was last metered on, from `x-codex-active-limit`: a `codexModelBuckets` slug, or the name upstream gives the account-wide limit
  */
+
+/**
+ * One model a Codex account's ChatGPT plan refused (see markModelDenied).
+ *
+ * @typedef {object} ModelDenial
+ * @property {string} model  the lower-cased model the refused request named
+ * @property {number|null} until  the end of the cooldown; null once it lapsed
+ * @property {string|null} detail  upstream's own message, bounded
+ * @property {number} since  when the first denial in this run came
+ * @property {number} count  denials in a row
+ * @property {number} epoch  the modelDenialEpoch this denial was counted at
+ */
+
+// A model name a denial may be stored under, kept exact: no case folding or
+// truncation, so no other string from a client's body can share a model's key.
+const MODEL_DENIAL_KEY = /^[A-Za-z0-9._:-]{1,64}$/;
+
+/** The key a model's denial is stored under: the model exactly as the request
+ * named it, or '' when it is not a plain model name.
+ * @param {string} model */
+function modelDenialKey(model) {
+  return MODEL_DENIAL_KEY.test(model) ? model : '';
+}
 
 /**
  * Record whether a reading says the subscription meters a session (5-hour)
@@ -514,6 +543,13 @@ function makeAccount(acct, index, listener = null) {
     // value it was sent under, so an answer to one already in flight when a
     // denial was counted can neither count again nor clear a newer one.
     entitlementEpoch: 0,
+    // Codex models this account's ChatGPT plan refused, by lower-cased model
+    // (see markModelDenied). Per model, because the plan still serves the
+    // others. Ephemeral like the entitlement cooldown, and for the same reason.
+    modelDenials: /** @type {Map<string, ModelDenial>} */ (new Map()),
+    // Plays entitlementEpoch's part for these denials: bumped by each counted
+    // one, and each entry keeps the value that counted it.
+    modelDenialEpoch: 0,
     // The account's own routing proxy could not be reached (see
     // markRoutingFailed). Ephemeral for the same reason: a live observation.
     routingFailedUntil: /** @type {number|null} */ (null),
@@ -1037,9 +1073,10 @@ export class AccountManager {
    * exhausted-fleet probe, the paid fallback, the all-unavailable revival, a
    * pin, the re-check after admission — so a cap binds on every path a request
    * can take. Returns 'spend' when the money cap binds on the executor's
-   * buckets or the advisor's family. Under `advisorEligibility: "prefer"` the
-   * advisor is a preference rather than a requirement, so only the executor's
-   * caps apply.
+   * buckets or the advisor's family, and 'model-unsupported' while the
+   * account's plan is refusing this model (see markModelDenied). Under
+   * `advisorEligibility: "prefer"` the advisor is a preference rather than a
+   * requirement, so only the executor's caps apply.
    *
    * @param {Record<string, any>} account
    * @param {string|null} [model]
@@ -1047,7 +1084,10 @@ export class AccountManager {
    */
   capBars(account, model = null, advisorModel = null) {
     return this.capExceeded(account, model)
-      || (advisorModel && this.advisorEligibility !== 'prefer' ? this._familyCapExceeded(account, advisorModel) : null);
+      || (advisorModel && this.advisorEligibility !== 'prefer' ? this._familyCapExceeded(account, advisorModel) : null)
+      // Not a cap, but the same kind of bar, needed on the same paths: these
+      // are the paths that skip unavailableReason, which also checks it.
+      || (this._modelDenied(account, model) ? 'model-unsupported' : null);
   }
 
   /** Start (or restart) the ramp window for an account that just became current,
@@ -1230,6 +1270,90 @@ export class AccountManager {
    * in storm-control admission. */
   isEntitlementDenied(index, now = Date.now()) {
     return this._entitlementDenied(this.accounts[index], now);
+  }
+
+  /** Keep a Codex account out of rotation for one model its ChatGPT plan
+   * refused to serve. The plan still serves other models, so only this model
+   * is barred. Extends a cooldown, never shortens it. Returns the expiry
+   * timestamp, or null when there is nothing to hold.
+   * @param {number} index
+   * @param {string|null} model  the model the refused request named
+   * @param {{ detail?: string|null, epoch?: number }} [denial]  upstream's
+   *   message (already bounded), and the modelDenialEpoch the refused request
+   *   was sent under */
+  markModelDenied(index, model, { detail = null, epoch } = {}) {
+    const account = this.accounts[index];
+    const key = model ? modelDenialKey(model) : '';
+    if (!account || !key) return null;
+    const denials = account.modelDenials;
+    const prior = denials.get(key);
+    if (prior && epoch != null && epoch < prior.epoch) return prior.until;
+    const now = Date.now();
+    const count = (prior?.count || 0) + 1;
+    const steps = MODEL_DENIAL_COOLDOWNS_SECONDS;
+    const until = Math.max(prior?.until || 0, now + steps[Math.min(count, steps.length) - 1] * 1000);
+    // Re-inserted so key order is recency, and the oldest makes room.
+    denials.delete(key);
+    for (const oldest of denials.keys()) {
+      if (denials.size < MAX_MODEL_DENIALS) break;
+      denials.delete(oldest);
+    }
+    denials.set(key, {
+      model: key, until, detail: detail || prior?.detail || null, since: prior?.since ?? now, count,
+      epoch: ++account.modelDenialEpoch,
+    });
+    return until;
+  }
+
+  /** A completion of `model` for a request sent after its last denial proves
+   * the plan serves it again: forget the denials, so the next one starts from
+   * the shortest cooldown. Takes the account, as clearEntitlementDenied does.
+   * @param {Record<string, any>} account
+   * @param {string|null} model
+   * @param {number} epoch  the modelDenialEpoch the served request was sent under */
+  clearModelDenied(account, model, epoch) {
+    if (!model || this.accounts[account?.index] !== account) return;
+    const key = modelDenialKey(model);
+    if (!key) return;
+    const entry = account.modelDenials.get(key);
+    if (entry && epoch >= entry.epoch) account.modelDenials.delete(key);
+  }
+
+  /** The denial recorded for `model` on `account`, or null.
+   * @param {Record<string, any>} account
+   * @param {string|null} model
+   * @returns {ModelDenial|null} */
+  modelDenial(account, model) {
+    return (model && account?.modelDenials?.get(modelDenialKey(model))) || null;
+  }
+
+  /** True while `account` sits out `model` (see markModelDenied). Expiry is
+   * consumed lazily, as the entitlement cooldown's is; the entry stays, so a
+   * denial on re-admission lengthens the next cooldown.
+   * @param {Record<string, any>} account
+   * @param {string|null} model
+   * @param {number} [now] */
+  _modelDenied(account, model, now = Date.now()) {
+    const entry = this.modelDenial(account, model);
+    if (!entry?.until) return false;
+    if (now < entry.until) return true;
+    entry.until = null;
+    console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" cooldown for model ${entry.model} expired; the next request re-checks it`);
+    return false;
+  }
+
+  /** Record a Codex plan tier. Which models a plan serves depends on the plan,
+   * so a change forgets every model denial learned under the old one.
+   * @param {Record<string, any>} account
+   * @param {string} plan */
+  _setPlanType(account, plan) {
+    const next = safeLine(plan, 64);
+    const prior = account.quota.planType;
+    account.quota.planType = next;
+    if (prior && prior !== next && account.modelDenials?.size) {
+      console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" plan changed from ${safeLine(prior, 64)} to ${next}; re-admitting the models it refused`);
+      account.modelDenials.clear();
+    }
   }
 
   /** Keep an account whose own routing proxy failed out of automatic rotation
@@ -2904,8 +3028,9 @@ export class AccountManager {
    * the refusal was the proxy's own doing (issue #166).
    *
    * Returns one of: 'disabled', 'spend-capped', 'capped', 'throttled', 'error',
-   * 'entitlement', 'exhausted', 'upstream-rejected', 'quota', 'route', 'routing',
-   * 'credential', 'billing', 'advisor-capped', 'advisor-quota', 'advisor-route'.
+   * 'entitlement', 'model-unsupported', 'exhausted', 'upstream-rejected', 'quota',
+   * 'route', 'routing', 'credential', 'billing', 'advisor-capped', 'advisor-quota',
+   * 'advisor-route'.
    * @param {Record<string, any>} account
    * @param {string|null} [model]
    * @param {string|null} [advisorModel]
@@ -2936,6 +3061,10 @@ export class AccountManager {
     // unavailableLine drop the row — so the one state added to make a refusal
     // explainable was the only one that printed no explanation (#258).
     if (this._entitlementDenied(account)) return 'entitlement';
+
+    // This account's ChatGPT plan refused this model a moment ago. Only this
+    // model: the plan still serves the others.
+    if (this._modelDenied(account, model)) return 'model-unsupported';
 
     // The account's own routing proxy could not be reached a moment ago.
     if (this._routingDown(account)) return 'routing';
@@ -4655,7 +4784,7 @@ export class AccountManager {
     // Header-derived strings are rendered into status and logs, so they are
     // stripped and bounded here rather than trusted from a third-party upstream.
     const plan = parseCodexPlanType(headers);
-    if (plan) account.quota.planType = safeLine(plan, 64);
+    if (plan) this._setPlanType(account, plan);
 
     // Which limit metered this model. The response names it and nothing else
     // does: the buckets say what each limit has left, not which models draw on
@@ -5323,7 +5452,7 @@ export class AccountManager {
     // is no session window clears a reading left from before a plan change
     // (see noteSessionWindow).
     noteSessionWindow(q, { session: !!usage.fiveHour, weekly: !!usage.sevenDay, clear: true });
-    if (usage.planType) q.planType = safeLine(usage.planType, 64);
+    if (usage.planType) this._setPlanType(account, usage.planType);
     // Stamped, because nothing else refreshes it: a payload that mentions no
     // credits leaves the last reading alone rather than blanking it, so the
     // age is the only thing that says how much the number is worth.
@@ -6030,6 +6159,13 @@ export class AccountManager {
           ? new Date(a.entitlementDeniedUntil).toISOString()
           : null,
         entitlementDenial: a.entitlementDenial ? { ...a.entitlementDenial } : null,
+        modelDenials: [...(a.modelDenials?.values() ?? [])].map(d => ({
+          model: d.model,
+          until: d.until && d.until > Date.now() ? new Date(d.until).toISOString() : null,
+          detail: d.detail,
+          since: d.since,
+          count: d.count,
+        })),
         routingFailedUntil: a.routingFailedUntil && a.routingFailedUntil > Date.now()
           ? new Date(a.routingFailedUntil).toISOString()
           : null,

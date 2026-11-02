@@ -86,6 +86,8 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
     if (why) lines.push(`  ${why}`);
     const denied = entitlementLine(account, now, paint);
     if (denied) lines.push(`  ${denied}`);
+    const unserved = modelDenialLine(account, now, paint);
+    if (unserved) lines.push(`  ${unserved}`);
     const plan = subscriptionLostLine(account, paint, now);
     if (plan) lines.push(`  ${plan}`);
     const spend = spendLine(account, paint);
@@ -481,6 +483,23 @@ function entitlementLine(account, now, paint) {
   const when = count > 1 ? `${count} in a row, first ${since}` : since;
   const text = safeLine(denial.detail ?? '', 200) || 'OAuth entitlement denied';
   return `${paint.dim('Denied'.padEnd(8))} ${paint.yellow(text)} ${paint.dim(`\u2014 ${when}`)}`;
+}
+
+// A plan that does not serve a model bars only that model, so the account
+// still reads active above. Like the entitlement line, an entry outlives its
+// cooldown until a later request for the model is served.
+/** @param {any} account @param {number} now @param {ReturnType<typeof colors>} paint */
+function modelDenialLine(account, now, paint) {
+  const denials = Array.isArray(account?.modelDenials) ? account.modelDenials : [];
+  if (!denials.length) return null;
+  const models = denials.map((/** @type {any} */ d) => {
+    const until = parseTs(d?.until);
+    // The payload can come from another process: only a whole number is a count.
+    const count = Number.isSafeInteger(d?.count) ? d.count : 1;
+    const wait = until && until > now ? `retry in ${formatDuration(until - now)}` : 're-admitted';
+    return `${safeLine(d?.model ?? '', 64) || '?'} (${wait}${count > 1 ? `, ${count} in a row` : ''})`;
+  });
+  return `${paint.dim('Models'.padEnd(8))} ${paint.yellow(`plan does not serve ${models.join(', ')}`)}`;
 }
 
 /**
