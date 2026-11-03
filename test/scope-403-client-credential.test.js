@@ -47,7 +47,7 @@ function inferenceOnlyPool() {
   );
 }
 
-async function send(port, { method = 'GET', path = '/api/claude_code_grove', bearer = 'client-token', extra = {} } = {}) {
+async function send(port, { method = 'GET', path = '/api/profile-required', bearer = 'client-token', extra = {} } = {}) {
   const headers = { 'x-api-key': 'k', ...extra };
   if (bearer) headers.authorization = `Bearer ${bearer}`;
   if (method === 'POST') headers['content-type'] = 'application/json';
@@ -138,8 +138,7 @@ test('with no client bearer a scope 403 fails over as before', async () => {
   }
 });
 
-// A pin keeps its account for every request: the pinned GET is answered the
-// way it was before, not on the client's login.
+// The scope-retry fallback must not override a pin on a pooled request.
 test('a pinned GET that draws a scope 403 stays on its account', async () => {
   const { server: upstream, seen } = scopeUpstream();
   const upstreamPort = await listen(upstream);
@@ -148,7 +147,7 @@ test('a pinned GET that draws a scope 403 stays on its account', async () => {
   const proxyPort = await listen(proxy);
 
   try {
-    const { status } = await send(proxyPort, { path: '/tc-acct/b/api/claude_code_grove' });
+    const { status } = await send(proxyPort, { path: '/tc-acct/b/api/profile-required' });
     assert.equal(status, 502);
     assert.deepEqual(seen.map(s => s.token), ['b-token']);
   } finally {

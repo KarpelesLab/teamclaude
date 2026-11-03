@@ -69,7 +69,7 @@ Some refusals are about the account rather than the request: `error.details.erro
 
 ## Token scope denials
 
-A `403` with `error.details.error_code: oauth_scope_insufficient` is about the token, not the account. A `claude setup-token` token carries `user:inference` only, so Claude Code's bootstrap, settings and connector-registry calls draw this on every such account. TeamClaude does not fail those over: a `GET` that draws one goes out once more on the client's own bearer, like the [identity plane](proxy-modes.md), over the same upstream proxy, sx route and admission queue as any forwarded request, and rotation stays where it was. Any other method, which includes every completion, a [pinned](#pin-a-session-to-one-account) request, and a client with no bearer of its own get the normal handling.
+A `403` with `error.details.error_code: oauth_scope_insufficient` is about the token, not the account. A `claude setup-token` token carries `user:inference` only and cannot reach endpoints that require `user:profile`. Known [client control-plane calls](proxy-modes.md#mitm-proxy-mode-default) bypass rotation from the start. For other endpoints, an unpinned `GET` that draws a scope denial goes out once more on the client's own bearer, over the same upstream proxy, sx route and admission queue as any forwarded request, and rotation stays where it was. Any other method, which includes every completion, a [pinned](#pin-a-session-to-one-account) request, and a client with no bearer of its own get the normal handling.
 
 ## One failover hop on a rate limit
 
