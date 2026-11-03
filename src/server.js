@@ -572,6 +572,8 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
   // Drain stops new traffic for the whole proxy, which is the operator's call.
   ['/teamclaude/drain', 'a client key cannot drain the proxy'],
   ['/teamclaude/undrain', 'a client key cannot drain the proxy'],
+  // Spends something scarce and unrecoverable on the operator's own account.
+  ['/teamclaude/redeem', 'a client key cannot spend reset credits'],
 ]);
 
 // What an inference-scoped key is refused: every route under the control
@@ -796,6 +798,16 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // Status endpoint
       if (req.method === 'GET' && req.url === '/teamclaude/status') {
         const status = accountManager.getStatus({ sessionDetail: config.proxy?.sessionDetail === true });
+        // The reset-credit policy's view of each account, beside the row the
+        // manager built for it. Rows are built from `accountManager.accounts`
+        // in order within this same tick, so the two line up by position; a
+        // server built without the hook (every test that is not about
+        // redemption) leaves the rows as they were.
+        if (hooks.describeAutoRedeem) {
+          status.accounts.forEach((/** @type {Record<string, any>} */ row, /** @type {number} */ i) => {
+            row.autoRedeem = hooks.describeAutoRedeem(accountManager.accounts[i]) ?? null;
+          });
+        }
         const extra = hooks.getStatusExtra?.() || {};
         res.writeHead(200, { 'Content-Type': 'application/json' });
         // Counters only: how full the upstream admission gate is (see
@@ -947,6 +959,83 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           res.writeHead(500, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: 'quota probe failed; see the proxy log' }));
         }
+        return;
+      }
+
+      // What the reset-credit policy would do right now — a dry run that
+      // spends nothing and asks upstream nothing (`teamclaude redeem --plan`).
+      if (req.method === 'GET' && req.url === '/teamclaude/redeem/plan') {
+        if (!hooks.planCodexRedeem) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'reset-credit redemption not supported' }));
+          return;
+        }
+        const plan = hooks.planCodexRedeem();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, autoRedeemResets: config.autoRedeemResets === true, ...plan }, null, 2));
+        return;
+      }
+
+      // Spend one Codex rate-limit reset credit on a named account, now —
+      // `teamclaude redeem <name>`. The one control route that spends
+      // something unrecoverable, so it is a POST with the account named in
+      // the body, refused to a client key (CLIENT_KEY_REFUSED_PATHS), and the
+      // redeemer applies its own rules: the weekly window must be spent, and
+      // `force` reaches past the minimum-days floor and nothing else. Body:
+      // {"account": "<name|email|accountUuid|...>", "force": false}.
+      if (req.method === 'POST' && req.url === '/teamclaude/redeem') {
+        if (!hooks.redeemCodexReset) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'reset-credit redemption not supported' }));
+          return;
+        }
+        const names = () => (accountManager.accounts || []).map((/** @type {Record<string, any>} */ a) => a.name);
+        let target;
+        let force;
+        try {
+          const raw = await readControlBody(req);
+          const body = JSON.parse(raw || '{}');
+          target = body?.account;
+          force = body?.force === true;
+        } catch (err) {
+          const tooLarge = /** @type {Error} */ (err).message === 'body too large';
+          res.writeHead(tooLarge ? 413 : 400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: tooLarge ? 'request body too large' : 'invalid request body' }));
+          return;
+        }
+        if (typeof target !== 'string' || !target.trim()) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'missing "account"', accounts: names() }));
+          return;
+        }
+        const index = resolveAccountPin(accountManager, target);
+        if (index == null) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: `no such account "${target}"`, accounts: names() }));
+          return;
+        }
+        const account = accountManager.accounts[index];
+        let result;
+        try {
+          result = await hooks.redeemCodexReset(account, { force });
+        } catch (err) {
+          console.error('[TeamClaude] Manual reset-credit redemption failed:', /** @type {Error} */ (err).message);
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'redemption failed; see the proxy log' }));
+          return;
+        }
+        // A policy "no" is a 200 that says so: the request was understood and
+        // answered, and the answer is the point. Only a route that could not
+        // act at all answers with an error status.
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          ok: true,
+          account: account.name,
+          redeemed: result?.redeemed === true,
+          reason: result?.reason ?? null,
+          code: result?.code ?? null,
+          windowsReset: result?.windowsReset ?? 0,
+        }));
         return;
       }
 

@@ -92,6 +92,8 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
     if (spend) lines.push(`  ${spend}`);
     const resetCredits = resetCreditLine(account, paint, now);
     if (resetCredits) lines.push(`  ${resetCredits}`);
+    const redeem = autoRedeemLine(account, paint);
+    if (redeem) lines.push(`  ${redeem}`);
     const outside = outsideSpendText(account.quota?.outsideSpend);
     if (outside) lines.push(`  ${paint.dim('Outside'.padEnd(8))} ${outside}`);
     const forecast = forecastText(account.quota?.forecast, now);
@@ -409,6 +411,30 @@ export function resetCreditLine(account, paint, now = Date.now()) {
   if (Number.isFinite(credits.seenAt)) notes.push(`as of ${formatAgo(Math.min(credits.seenAt, now), now)}`);
   const note = notes.length ? ` — ${notes.join(', ')}` : '';
   return `${paint.dim('Reset'.padEnd(8))} ${paint.cyan(`${available} ${noun}`)}${paint.gray(note)}`;
+}
+
+/**
+ * The auto-redeem policy's standing on this account: whether the automatic
+ * policy may spend one of its reset credits, why not when it may not, and what
+ * a credit spent now would buy (a Codex reset restarts the 7-day timer, so a
+ * credit is worth the days left to the natural reset over seven).
+ *
+ * Drawn only where the payload carries the block — Codex rows from a server
+ * that computes it — so an older server, or a Claude row, prints nothing.
+ *
+ * @param {Record<string, any>|null|undefined} account  a row of the status payload
+ * @param {ReturnType<typeof colors>} paint
+ */
+export function autoRedeemLine(account, paint) {
+  const view = account?.autoRedeem;
+  if (!view || typeof view !== 'object') return null;
+  const value = Number.isFinite(view.creditValueWeeks)
+    ? `credit worth ${view.creditValueWeeks.toFixed(2)} of a week (${(view.creditValueWeeks * 7).toFixed(1)}d to reset)`
+    : 'credit value unknown (no reset time)';
+  const state = view.armed
+    ? paint.green('armed')
+    : `${paint.yellow('exempt')}${view.exemptReason ? paint.gray(` — ${safeLine(view.exemptReason, 160)}`) : ''}`;
+  return `${paint.dim('Redeem'.padEnd(8))} ${state}${paint.gray(`, ${value}`)}`;
 }
 
 // How long a reset-credit reading is worth showing. Nothing refreshes the count
