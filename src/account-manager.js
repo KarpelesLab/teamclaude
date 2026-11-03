@@ -109,6 +109,10 @@ const MAX_CODEX_MODEL_BUCKETS = 32;
 // needs the same ceiling for the same reason.
 const MAX_CODEX_MODEL_LIMITS = 32;
 
+// How much sooner another account's weekly reset must be before
+// `preferSoonestWeeklyReset` moves traffic to it (see _soonerResetPreemptor).
+const SOONER_RESET_MARGIN_MS = 60_000;
+
 // An `anthropic-ratelimit-*-reset` header (epoch seconds) as ms, or null when
 // it is not a positive finite number. Never NaN: see updateQuota.
 function resetHeaderMs(value) {
@@ -628,7 +632,7 @@ export class AccountManager {
    * @param {string} [opts.advisorEligibility]  'strict' (default) or 'prefer'
    * @param {{ host: string, port: number }|null} [opts.listener]  this server's own address, so an accounts[].routing that points back at it is refused (see accountRouting)
    */
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, refreshCoordinator = (_account, refresh, _info) => refresh(), throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, advisorEligibility, listener = null } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, refreshCoordinator = (_account, refresh, _info) => refresh(), throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, preferSoonestWeeklyReset = false, advisorEligibility, listener = null } = {}) {
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
@@ -724,6 +728,7 @@ export class AccountManager {
     // takes a reading.
     this._obsGen = 0;
     this.setExpiryRouting(expiryRouting);
+    this.setPreferSoonestWeeklyReset(preferSoonestWeeklyReset);
     // The rollover mechanism's whole state for the sticky current account: one
     // observation, { idx, windows: name → reset }, of the account traffic was
     // resting on when a request last arrived to find it there. Null while the
@@ -1875,7 +1880,8 @@ export class AccountManager {
         if (!next || next.index === current.index) this._noteHeldRollover(current, model, advisorModel, exclude);
         if (next) return next;
       }
-      const betterExists = this._preemptedBy(current, model, advisorModel, exclude);
+      const betterExists = this._preemptedBy(current, model, advisorModel, exclude)
+        || this._soonerResetPreemptor(current, model, advisorModel, exclude);
       if (betterExists) return this._selectNext(exclude, model, advisorModel);
       return current;
     }
@@ -3034,6 +3040,10 @@ export class AccountManager {
     if (preemptor) {
       return { eligible: false, reason: `outranked by higher-priority account "${preemptor.name}"` };
     }
+    const sooner = this._soonerResetPreemptor(account);
+    if (sooner) {
+      return { eligible: false, reason: `outranked by "${sooner.name}", whose weekly quota resets sooner (preferSoonestWeeklyReset)` };
+    }
     return { eligible: true };
   }
 
@@ -3240,6 +3250,44 @@ export class AccountManager {
    * `"false"` reads as off. `tolerance` is not coerced, because an explicit 0 is
    * a meaningful setting that clamps to 1, the strictest band.
    */
+  /**
+   * Earliest-deadline-first routing (opt-in, `preferSoonestWeeklyReset`).
+   * Weekly quota that is not spent before its window resets is lost, so with
+   * this on the router keeps traffic on the available account whose governing
+   * weekly window resets soonest, within the top priority tier. Applied live on
+   * config reload.
+   * @param {boolean} enabled
+   */
+  setPreferSoonestWeeklyReset(enabled) {
+    this.preferSoonestWeeklyReset = enabled === true;
+  }
+
+  /**
+   * With `preferSoonestWeeklyReset` on, the available account of the same
+   * priority whose governing weekly window resets soonest, when that is
+   * strictly sooner (by more than a minute, so jitter in reported reset times
+   * cannot flap) than `account`'s own. Null when the knob is off, when
+   * `account`'s reset is unknown, or when nothing resets sooner. An account
+   * whose reset is unknown never preempts: it may well reset later.
+   */
+  _soonerResetPreemptor(account, model = null, advisorModel = null, exclude = null) {
+    if (!this.preferSoonestWeeklyReset || !account) return null;
+    const mine = this._rankingReset(account, model);
+    if (!mine) return null;
+    const now = Date.now();
+    let best = null;
+    let bestReset = mine - SOONER_RESET_MARGIN_MS;
+    for (const a of this.accounts) {
+      if (a === account || exclude?.has(a.index)) continue;
+      if ((a.priority || 0) !== (account.priority || 0)) continue;
+      if (!this._isAvailable(a, model, advisorModel)) continue;
+      const reset = this._rankingReset(a, model);
+      if (!reset || reset <= now) continue;
+      if (reset < bestReset) { best = a; bestReset = reset; }
+    }
+    return best;
+  }
+
   setExpiryRouting(cfg) {
     const c = cfg || {};
     const wasWatching = !!(this.expiryRouting?.enabled && this.expiryRouting?.preempt);
@@ -4489,9 +4537,12 @@ export class AccountManager {
       // refreshes soonest while preserving accounts that reset later for
       // Opus/Sonnet. Unknown reset sorts first so we probe and fill it in.
       const weeklyReset = this._rankedReset(account, model);
-      if (priority < bestPriority
-          || (priority === bestPriority && pressure < bestPressure)
-          || (priority === bestPriority && pressure === bestPressure && weeklyReset < bestReset)) {
+      // With preferSoonestWeeklyReset on, the reset outranks pressure: spend
+      // the window that expires first (earliest deadline first).
+      const better = this.preferSoonestWeeklyReset
+        ? (weeklyReset < bestReset || (weeklyReset === bestReset && pressure < bestPressure))
+        : (pressure < bestPressure || (pressure === bestPressure && weeklyReset < bestReset));
+      if (priority < bestPriority || (priority === bestPriority && better)) {
         bestPriority = priority;
         bestPressure = pressure;
         bestReset = weeklyReset;
