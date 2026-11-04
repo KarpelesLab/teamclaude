@@ -146,6 +146,19 @@ const DEFAULT_TOKEN_ENDPOINT = 'https://platform.claude.com/v1/oauth/token';
 const DEFAULT_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 
 /**
+ * A Retry-After header in milliseconds: delta-seconds or an HTTP date (RFC 9110
+ * §10.2.3). Undefined when absent or unparseable.
+ * @param {string|null|undefined} value
+ * @param {number} [now]
+ */
+export function parseRetryAfterMs(value, now = Date.now()) {
+  if (typeof value !== 'string' || !value.trim()) return undefined;
+  if (/^\d+$/.test(value.trim())) return Number(value.trim()) * 1000;
+  const at = Date.parse(value);
+  return Number.isFinite(at) ? Math.max(0, at - now) : undefined;
+}
+
+/**
  * Refresh an expired OAuth access token using the refresh token.
  * Retries on 5xx and network errors with exponential backoff.
  * `routing` is the account's own egress proxy (account-routing.js); null goes
@@ -205,6 +218,12 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
         // transient server error. 5xx is retried above; reaching here with a 5xx
         // means retries were exhausted, which is still transient, not auth.
         err.status = res.status;
+        // A 429 says how long to stay away; the account holds its refreshes
+        // for that long (AccountManager.ensureTokenFresh).
+        if (res.status === 429) {
+          const retryAfterMs = parseRetryAfterMs(res.headers.get('retry-after'));
+          if (retryAfterMs !== undefined) /** @type {any} */ (err).retryAfterMs = retryAfterMs;
+        }
         throw err;
       }
 
@@ -570,12 +589,14 @@ export function normalizeUsageBucket(bucket) {
  * utilization WITHOUT spending message quota, which is what makes it safe to
  * poll. Returns normalized { fiveHour, sevenDay, sevenDaySonnet, sevenDayFable } buckets
  * plus scopedWeeklyListed (whether the payload enumerated its model-scoped
- * weekly caps), or { error, status } on failure.
+ * weekly caps) and sessionListed (whether that enumeration names a session
+ * limit), or { error, status } on failure.
  * @param {string} accessToken
  * @param {import('./account-routing.js').RoutingProxy|null} [routing] - the account's own egress proxy
- * @param {{ fetchImpl?: Function }} [opts]
+ * @param {{ fetchImpl?: Function, now?: number }} [opts] `now` is the clock the
+ *   banked-reset expiry is judged against; tests pin it.
  */
-export async function fetchUsage(accessToken, routing = null, { fetchImpl = proxyFetch } = {}) {
+export async function fetchUsage(accessToken, routing = null, { fetchImpl = proxyFetch, now = Date.now() } = {}) {
   try {
     const res = await fetchImpl(USAGE_URL, {
       headers: {
@@ -598,7 +619,7 @@ export async function fetchUsage(accessToken, routing = null, { fetchImpl = prox
       return { error: `HTTP ${res.status}${detail ? ': ' + detail : ''}`, status: res.status };
     }
 
-    return normalizeUsagePayload(await res.json());
+    return normalizeUsagePayload(await res.json(), now);
   } catch (err) {
     return { error: err.message || String(err), status: null };
   }
@@ -606,9 +627,10 @@ export async function fetchUsage(accessToken, routing = null, { fetchImpl = prox
 
 /**
  * Map a /api/oauth/usage payload to the buckets the quota model tracks. Pure, so
- * the mapping is testable without a network round trip.
+ * the mapping is testable without a network round trip. `now` is the clock
+ * banked-reset expiry is judged against.
  */
-export function normalizeUsagePayload(data) {
+export function normalizeUsagePayload(data, now = Date.now()) {
   // Every model-scoped weekly cap the payload enumerated, keyed by the family
   // name upstream used. The two families with dedicated fields are read from
   // the same enumeration (the legacy seven_day_<model> keys read null on
@@ -631,11 +653,17 @@ export function normalizeUsagePayload(data) {
     // caps and that family was not among them. Without the list, a missing
     // family is our own ignorance and nothing may be concluded from it.
     scopedWeeklyListed: Array.isArray(data?.limits),
+    // Whether the `limits` enumeration names a session (5-hour) limit, beside
+    // `five_hour`. Only presence is read: the captured entries carry a percent
+    // and no reset, and `five_hour` stays the reading. A plan whose 5-hour
+    // window is gone must be absent from both before a probe may say so (see
+    // applyUsageData).
+    sessionListed: Array.isArray(data?.limits) && data.limits.some((/** @type {any} */ l) => l?.kind === 'session'),
     // Banked usage-limit resets (the claude.ai "Resets" offer), in the same
     // shape the Codex probe reports its free reset credits, so the status
     // line, the TUI tag and the dashboard badge read both without knowing
     // which provider the account is on.
-    resetCredits: bankedResets(data?.cedar_ember),
+    resetCredits: bankedResets(data?.cedar_ember, now),
   };
 }
 

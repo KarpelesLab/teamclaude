@@ -279,6 +279,102 @@ test('a Codex row keeps its Ses cell while a session reading is still present', 
   assert.match(rows[1], /k2@x\.com .*Ses .*Wk /, rows[1]);
 });
 
+// The same fact on a Claude subscription: Anthropic's Ultra plan is losing its
+// 5-hour limit account by account, so one pane holds both shapes.
+test('a Claude row whose plan meters no five-hour window draws only the weekly bar', () => {
+  const am = fleet([claude('ultra@x.com'), claude('max@x.com'), codex('k@x.com')]);
+  noSessionWindow(am.accounts[0]);
+  const rows = accountRows(screen(am, 160).lines).map(r => halves(r)[0]).filter(r => r.trim());
+  assert.match(rows[0], /ultra@x\.com +active +Wk .*F7/, rows[0]);
+  assert.doesNotMatch(rows[0], /Ses/);
+  assert.match(rows[1], /max@x\.com +active +Ses .*Wk .*F7/, 'its neighbour keeps both cells');
+
+  // A Claude-only list where no row has a five-hour window drops the column.
+  const only = fleet([claude('u1@x.com'), claude('u2@x.com')]);
+  for (const a of only.accounts) noSessionWindow(a);
+  for (const r of accountRows(screen(only, 120).lines)) { assert.doesNotMatch(r, /Ses/); assert.match(r, /Wk /); }
+});
+
+// The row's shape is a fact about the plan, so a weekly reset — which nulls
+// `unified7d` until the next reading — must not bring back an empty Ses cell,
+// on the row or, for a list where no row has a session window, on the list.
+test('a row with no five-hour window keeps its shape across a weekly reset', () => {
+  const weeklyReset = (/** @type {any} */ a) => Object.assign(a.quota, { unified7d: null, unified7dReset: null });
+  for (const [label, accounts, pane] of [
+    ['Claude', [claude('u@x.com'), claude('max@x.com'), codex('k@x.com')], 0],
+    ['Codex', [claude('a@x.com'), codex('u@x.com'), codex('k@x.com')], 1],
+  ]) {
+    const am = fleet(accounts);
+    const i = label === 'Claude' ? 0 : 1;
+    noSessionWindow(am.accounts[i]);
+    weeklyReset(am.accounts[i]);
+    const rows = accountRows(screen(am, 160).lines).map(r => halves(r)[pane]).filter(r => r.trim());
+    assert.match(rows[0], /u@x\.com +active +Wk /, `${label}: ${rows[0]}`);
+    assert.doesNotMatch(rows[0], /Ses/, `${label}: ${rows[0]}`);
+  }
+
+  const only = fleet([claude('u1@x.com'), claude('u2@x.com')]);
+  for (const a of only.accounts) noSessionWindow(a);
+  weeklyReset(only.accounts[0]);
+  for (const r of accountRows(screen(only, 120).lines)) { assert.doesNotMatch(r, /Ses/, r); assert.match(r, /Wk /, r); }
+});
+
+// Below the width for two bars each row draws one, and a mixed list keeps it
+// on the session window for the metered rows. A row with no session window
+// would then draw `Ses` over nothing and leave out its weekly window, the only
+// limit it has; it draws that one in the same single slot instead.
+test('in single-bar mode a row with no five-hour window draws its weekly bar in the one slot', () => {
+  for (const [label, accounts] of [
+    ['Claude', [claude('ultra@x.com'), claude('max@x.com')]],
+    ['Codex', [codex('k1@x.com'), codex('k2@x.com')]],
+  ]) {
+    const am = fleet(accounts);
+    noSessionWindow(am.accounts[0]);
+    const { lines, drawn } = screen(am, 60);
+    const rows = accountRows(lines);
+    assert.equal(rows.length, 2, label);
+    assert.match(rows[0], /Wk /, `${label}: ${rows[0]}`);
+    assert.doesNotMatch(rows[0], /Ses/, `${label}: ${rows[0]}`);
+    // The bar is drawn in colour, so the countdown is what the stripped text
+    // shows of it: the weekly window's (fill() sets it a day out), not `-`.
+    assert.match(rows[0], /Wk .* 1d\b/, `${label}: the weekly reading is drawn: ${rows[0]}`);
+    assert.match(rows[1], /Ses /, `${label}: the metered row keeps its session bar`);
+    assert.doesNotMatch(rows[1], /Wk/, `${label}: one bar per row: ${rows[1]}`);
+    // Not widened: there is no second cell to take over, so both rows end alike.
+    const [u, m] = [drawn.find(r => r.idx === 0), drawn.find(r => r.idx === 1)];
+    assert.equal(u.text.trimEnd().length, m.text.trimEnd().length, `${label}:\n${u.text}\n${m.text}`);
+  }
+});
+
+test('a Claude row reached through the manager keeps Ses while the old reading is there, and drops it once a probe clears it', () => {
+  const am = fleet([claude('ultra@x.com'), claude('max@x.com'), codex('k@x.com')]);
+  am.updateQuota(0, {
+    'anthropic-ratelimit-unified-7d-utilization': '0.3',
+    'anthropic-ratelimit-unified-7d-reset': String(Math.floor((Date.now() + 24 * h) / 1000)),
+  });
+  assert.equal(am.accounts[0].quota.sessionWindowStated, false);
+  let row = accountRows(screen(am, 160).lines).map(r => halves(r)[0])[0];
+  assert.match(row, /ultra@x\.com +active +Ses .*Wk /, 'the reading from before is still drawn');
+  am.applyUsageData(0, { fiveHour: null, sevenDay: { utilization: 0.3, resetAt: Date.now() + 24 * h } });
+  row = accountRows(screen(am, 160).lines).map(r => halves(r)[0])[0];
+  assert.match(row, /ultra@x\.com +active +Wk /, row);
+  assert.doesNotMatch(row, /Ses/);
+});
+
+test('a Claude row that reports a five-hour window and no weekly window draws only the Ses bar', () => {
+  const am = fleet([claude('a@x.com'), claude('team@x.com'), claude('idle@x.com'), codex('k@x.com')]);
+  am.accounts[0].quota = { unified5h: 0.1, unified5hReset: Date.now() + h, unified7d: 0.2, unified7dReset: Date.now() + 24 * h, weeklyWindowStated: true };
+  am.accounts[1].quota = { unified5h: 0.38, unified5hReset: Date.now() + h, unified7d: null, weeklyWindowStated: false };
+  // Its session window expired: the row keeps its shape rather than swinging back to Ses/Wk.
+  am.accounts[2].quota = { unified5h: null, unified7d: null, weeklyWindowStated: false };
+  const rows = accountRows(screen(am, 160).lines).map(r => halves(r)[0]).filter(r => r.trim());
+  assert.match(rows[0], /a@x\.com +active +Ses .*Wk /);
+  assert.match(rows[1], /team@x\.com +active +Ses /);
+  assert.doesNotMatch(rows[1], /Wk/);
+  assert.match(rows[2], /idle@x\.com +active +Ses /);
+  assert.doesNotMatch(rows[2], /Wk/);
+});
+
 test('an account that has not reported yet keeps the Ses column, so it does not come and go at startup', () => {
   const am = fleet([claude('a@x.com'), codex('k1@x.com'), codex('k2@x.com')]);
   noSessionWindow(am.accounts[1]);

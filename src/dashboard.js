@@ -15,7 +15,7 @@
 // operator/OAuth-derived, but they still never reach innerHTML.
 
 import { createHash } from 'node:crypto';
-import { UNAVAILABLE_TEXT, RESET_CREDIT_MAX_AGE_MS, outsideSpendText, forecastText, showSessionRow } from './status-renderer.js';
+import { UNAVAILABLE_TEXT, RESET_CREDIT_MAX_AGE_MS, outsideSpendText, forecastText, showSessionRow, showWeeklyRow } from './status-renderer.js';
 import { USAGE_WINDOWS } from './client-usage.js';
 
 export function renderDashboardHtml() {
@@ -351,6 +351,14 @@ export function sessionRows(sessions) {
     row.total = row.cacheRead + row.cacheCreation + row.input + row.output;
     return row;
   });
+}
+
+// "pinned: 3f2a1b9c → api-1, 9d0e4c11 → work" — the sessions an operator held
+// on one account (`teamclaude switch --session`), or '' when there are none.
+/** @param {any} pins */
+export function sessionPinsText(pins) {
+  if (!Array.isArray(pins) || !pins.length) return '';
+  return 'pinned: ' + pins.map(function (p) { return (p && p.session || '?') + ' \u2192 ' + (p && p.account || '?'); }).join(', ');
 }
 
 export function filterSessionRows(rows, filters) {
@@ -724,9 +732,9 @@ export function usageFor(entry, view) {
 export const CARD_NOTE_MAX_AGE_MS = 60 * 1000;
 
 const SHARED_HELPERS = [
-  scopedWeeklyRows, accountTokens, modelLabel, recentModelLabels, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
+  scopedWeeklyRows, accountTokens, modelLabel, recentModelLabels, providerLabel, thresholdBadgeText, accountBadges, sessionRows, sessionPinsText, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
-  outsideSpendText, forecastText, showSessionRow, callerCan, callerNotice, cardNoteKey, cardNoteFor, backendQuotaRows,
+  outsideSpendText, forecastText, showSessionRow, showWeeklyRow, callerCan, callerNotice, cardNoteKey, cardNoteFor, backendQuotaRows,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -1070,7 +1078,7 @@ ${SHARED_HELPERS}
       if (showSessionRow(q)) card.appendChild(quotaRow('Session', q.unified5h, q.unified5hReset));
       if (models) card.appendChild(models);
       models = null;
-      card.appendChild(quotaRow('Weekly', q.unified7d, q.unified7dReset));
+      if (showWeeklyRow(q)) card.appendChild(quotaRow('Weekly', q.unified7d, q.unified7dReset));
       // Model-scoped weekly buckets are learned from the usage endpoint rather
       // than declared, so hard-coding the two families that have dedicated
       // fields drew an incomplete picture the moment upstream metered a third.
@@ -1397,6 +1405,8 @@ ${SHARED_HELPERS}
     // one page saying "sessions" here and "conversations" there would read as
     // two different quantities rather than one counted twice.
     sum.appendChild(el('span', '', ' · ' + (sess.active || 0) + ' active / ' + (sess.known || 0) + ' known conversations' + (up ? ' · ' + up : '')));
+    var pinsText = sessionPinsText(s.sessionPins);
+    if (pinsText) sum.appendChild(el('span', 'pin', ' · ' + pinsText));
     var probe = s.probe || {};
     var probeBtn = document.getElementById('probe');
     probeBtn.textContent = probe.running ? 'Probe running…' : 'Probe quotas';

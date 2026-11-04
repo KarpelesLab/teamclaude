@@ -2,10 +2,10 @@
 
 import { spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import { createWriteStream } from 'node:fs';
+import { createWriteStream, existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
-import net from 'node:net';
-import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, loadState, saveState } from './config.js';
+import { isProxyUp } from './proxy-up.js';
+import { loadOrCreateConfig, loadConfig, loadConfigPersistingIds, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, loadState, saveState } from './config.js';
 import { installCrashHandlers } from './crash-log.js';
 import { AccountManager, distributionMode, accountRouting } from './account-manager.js';
 import { validateAdaptiveConfig } from './adaptive-distribution.js';
@@ -27,9 +27,9 @@ import { isRemoteSession, openBrowser, PANEL_LOGIN_TIMEOUT_MS } from './login-fl
 import { providerOf } from './provider.js';
 import { syncAccountsFromDisk } from './sync-accounts.js';
 import { mergeAccountsForSave, syncRefreshedTokens, removedAccountIds, clearRemovedAccountIds, clearAddedAccountIds, markAccountRemoved, configIndexFor } from './account-pairing.js';
-import { ensureAccountIds } from './account-id.js';
+import { ensureAccountIds, accountIdsComplete } from './account-id.js';
 import * as alias from './alias.js';
-import { ensureCerts, mitmHosts } from './mitm.js';
+import { ensureCerts, mitmHosts, caCertPath } from './mitm.js';
 import { Prober, probeApplicable } from './prober.js';
 import { ResetCreditRedeemer } from './codex-reset-credits.js';
 import { ClaudeResetRedeemer } from './claude-resets.js';
@@ -40,7 +40,7 @@ import { SessionTitles } from './session-titles.js';
 import { captureEarlyConsole } from './early-log.js';
 import { RemoteControl, createAttachSession } from './tui-remote.js';
 import { SxManager } from './sx.js';
-import { autoUpdate, checkForUpdate, currentVersion, resolveVersionLabel, runUpdate, installKind, updateAvailableFromCache, PKG_NAME } from './updater.js';
+import { autoUpdate, checkForUpdate, currentVersion, resolveVersionLabel, runUpdate, installKind, updateAvailableFromCache, updateCommandFor, PKG_NAME } from './updater.js';
 import { renderStatus, formatPercent } from './status-renderer.js';
 import { sanitizeText, safeLine } from './safe-text.js';
 import { modelLabel } from './model.js';
@@ -148,7 +148,7 @@ const THRESHOLD_USAGE = [
   'server immediately.',
 ].join('\n');
 
-const DISTRIBUTE_USAGE = 'Usage: teamclaude distribute <on|off|adaptive>';
+const DISTRIBUTE_USAGE = 'Usage: teamclaude distribute <on|off|adaptive|load>';
 
 const ROUTING_USAGE = [
   'Usage: teamclaude routing <account-name|email> [--check]      (show the account\'s routing; --check tests it)',
@@ -382,7 +382,7 @@ async function serverCommand() {
     console.error(`[TeamClaude] Bad adaptiveDistribution setting in ${getConfigPath()}: ${err.message}`);
     process.exit(1);
   }
-  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp, distributeSessions: config.distributeSessions, expiryRouting: config.expiryRouting, advisorEligibility: config.advisorEligibility, adaptive, listener: localListener(config) });
+  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, clientRoutes: config.clientRoutes, ramp: config.stormRamp, distributeSessions: config.distributeSessions, expiryRouting: config.expiryRouting, advisorEligibility: config.advisorEligibility, adaptive, listener: localListener(config) });
   // Names the activity log's session column from Claude Code's own on-disk
   // session titles. Built whether or not the TUI runs, so a reload has one
   // object to reconfigure.
@@ -493,6 +493,11 @@ async function serverCommand() {
         diskConfig.accounts[cfgIdx].accessToken = newTokens.accessToken;
         diskConfig.accounts[cfgIdx].refreshToken = newTokens.refreshToken;
         diskConfig.accounts[cfgIdx].expiresAt = newTokens.expiresAt;
+      } else {
+        // Said out loud: the account keeps serving on the new token, so nothing
+        // else shows that the file still holds the old one until a restart
+        // fails on it.
+        console.error(`[TeamClaude] Refreshed token for "${safeLine(account.name, 64)}" not saved: no row in ${getConfigPath()} carries its entry id`);
       }
     }).catch(err => console.error(`[TeamClaude] Failed to save refreshed token: ${err.message}`));
     // And to the credential store, when signed in. Not awaited: the disk
@@ -548,7 +553,9 @@ async function serverCommand() {
   // disk and running accounts dropped because their entry is gone. Also picks
   // up a changed probe interval so `teamclaude probe` applies live.
   const doReload = async () => {
-    const diskConfig = await loadConfig();
+    // With any id the file lacked written back: an account picked up here keeps
+    // its entry's id, and its token writes find their row by it (#564).
+    const diskConfig = await loadConfigPersistingIds();
     if (!diskConfig) return { added: 0, removed: 0 };
     const { added, removed } = await syncAccountsFromDisk(diskConfig, config, accountManager);
     // `teamclaude callback login` notifies through a reload, so this is where a
@@ -567,7 +574,15 @@ async function serverCommand() {
       // The shared key is read per request too, so a rotated key on disk
       // takes effect on reload the same way.
       config.proxy.apiKey = diskConfig.proxy.apiKey;
+      // IPM fork (client-routes.js): the fixed-seat switch, read per request.
+      config.proxy.requireClientRoute = diskConfig.proxy.requireClientRoute === true;
     }
+    // And the client routes it gates, in the same synchronous stretch as the
+    // keys and the switch: no await runs between these assignments, so every
+    // request reads the old policy or the new one, never half of each. A
+    // request keeps the binding it read at admission for all its retries.
+    config.clientRoutes = diskConfig.clientRoutes;
+    accountManager.setClientRoutes(config.clientRoutes);
     // The MCP endpoint's mode: read per request, so this is what opens,
     // narrows or closes it without a restart. Outside the guard above on
     // purpose: an operator who deletes the whole `proxy` section has asked for
@@ -804,7 +819,9 @@ async function serverCommand() {
       const model = label ? ` (${label})` : '';
       const sid = info.sessionId ? `${info.sessionId.slice(0, 6)} ` : '';
       const client = (info.client || r?.client) ? `[${info.client || r.client}] ` : '';
-      const pin = (info.pinned || r?.pinned) ? ' [pin]' : '';
+      // A client-route outcome (IPM fork) takes the tag slot, so the line keeps
+      // one bracketed tag: [no-seat], [spent], [admin-pin] and the rest.
+      const pin = info.gate ? ` [${safeLine(info.gate, 32)}]` : (info.pinned || r?.pinned) ? ' [pin]' : '';
       writeActivity(`${client}${sid}${info.method} ${info.path}${model} → ${acct}${pin} (${info.status}, ${dur}s)`);
     };
     // Tee console output to the activity log as well
@@ -903,6 +920,18 @@ async function serverCommand() {
   });
   hooks.getQuotaExtra = () => ({ warmup: resolveWarmupConfig(config) });
 
+  // A stored MITM chain that falls short (a host the accounts now need, or
+  // under 30 days left) is renewed here, before the port opens. From then on
+  // `env` and `run` find a proxy up and keep whatever is on disk (see
+  // ensureCerts), so a renewal left to the first intercepted CONNECT would
+  // land after a client had been launched trusting the CA it replaces. With
+  // no stored chain, no client holds a CA yet, and the chain is still minted
+  // on first use. Skipped when something already listens on the port: this
+  // start is about to fail, and the server holding the port presents the
+  // chain on disk.
+  if (existsSync(caCertPath()) && !(await isProxyUp(port, bindHost).catch(() => true))) {
+    await ensureCerts(mitmHosts(config)).catch((err) => console.error(`[TeamClaude] Could not renew the MITM certificate: ${err.message}`));
+  }
   const server = createProxyServer(accountManager, config, hooks, sx, clientUsage, dimensionUsage, { bindHost });
   // Catch bind-time errors (e.g. EADDRINUSE) only. Once the socket is bound we
   // remove this handler so a later runtime 'error' isn't misreported as a
@@ -1455,9 +1484,14 @@ async function envCommand() {
   }
 
   let caPath = null;
+  let renewal = null;
+  // Probed first: while a proxy runs, the stored chain is the one it presents,
+  // so it is kept even when it falls short (see ensureCerts). A port that is
+  // not a port reads as down here and is refused below.
+  const proxyUp = await isProxyUp(port).catch(() => false);
   // The leaf has to name every host MITM will intercept, or the CONNECT for
   // a second provider fails the handshake instead of being served.
-  if (useMitm) ({ caPath } = await ensureCerts(mitmHosts(config)));
+  if (useMitm) ({ caPath, renewal } = await ensureCerts(mitmHosts(config), { keep: proxyUp }));
 
   // Same pin as `teamclaude run`, so `eval "$(teamclaude env)"` and `run` agree.
   const account = (process.env.TC_ACCT || '').trim();
@@ -1493,7 +1527,10 @@ async function envCommand() {
   // The flag that reproduces this mode whatever the config's default says.
   process.stderr.write(`# apply to this shell:  eval "$(teamclaude env${useMitm ? ' --mitm' : ' --no-mitm'})"\n`);
   process.stderr.write(`# default mode is ${config.defaultClientMode === 'base-url' ? 'base-URL' : 'MITM'} (config defaultClientMode; the TUI settings screen toggles it)\n`);
-  if (!(await isProxyUp(port))) {
+  if (renewal) {
+    process.stderr.write(`# warning: the MITM certificate ${renewal}. The running proxy presents it, so it is kept; restart the proxy to renew it\n`);
+  }
+  if (!proxyUp) {
     process.stderr.write(`# note: proxy not running on port ${port} — start it with: teamclaude server\n`);
   }
   if (config.proxy?.apiKey) {
@@ -1547,7 +1584,10 @@ async function runCommand() {
       // Route ALL of claude's traffic through us as an HTTPS forward proxy, so
       // even hardcoded api.anthropic.com endpoints (e.g. the design MCP) get the
       // real token injected. claude trusts our MITM leaf via NODE_EXTRA_CA_CERTS.
-      const { caPath } = await ensureCerts(mitmHosts(config));
+      // The proxy is up, so the stored chain is the one it presents: kept even
+      // when it falls short, since a new one would come with a new CA.
+      const { caPath, renewal } = await ensureCerts(mitmHosts(config), { keep: true });
+      if (renewal) console.error(`[TeamClaude] The MITM certificate ${renewal}. The running proxy presents it, so it is kept; restart the proxy to renew it.`);
       // The pin rides in the proxy URL's userinfo, which the client forwards as
       // `Proxy-Authorization: Basic <acct>:<key>` on each CONNECT — the only pin
       // channel an HTTPS_PROXY env var can express. The password slot keeps the
@@ -1780,6 +1820,11 @@ async function switchCommand() {
   const headers = { 'x-api-key': config.proxy.apiKey };
   const name = args[1] && !args[1].startsWith('-') ? args[1] : null;
 
+  if (args.includes('--session')) {
+    await switchSessionCommand(port, headers, name);
+    return;
+  }
+
   try {
     if (!name) {
       const res = await fetch(`http://localhost:${port}/teamclaude/status`, { headers });
@@ -1832,11 +1877,80 @@ async function switchCommand() {
     if (data.eligible === false) {
       console.error(`Warning: "${data.account}" is ${data.reason || 'not currently eligible'}, so requests will not route to it until that changes.`);
     }
+    // Run from inside a Claude Code session (a `!` command, a tool), this is
+    // easy to mistake for moving just that session (#543).
+    if (process.env.CLAUDE_CODE_SESSION_ID) {
+      console.log(`This moved every session that is not pinned. To move only this one: teamclaude switch ${/^[\w.@+-]+$/.test(name) ? name : JSON.stringify(name)} --session`);
+    }
   } catch (err) {
     console.error('Cannot connect to proxy at localhost:' + port);
     console.error('Is the server running? Start with: teamclaude server');
     if (err?.message) console.error(`Details: ${err.message}`);
     process.exit(1);
+  }
+}
+
+/**
+ * `teamclaude switch <account> --session [<id>]`: hold one client session on an
+ * account, leaving the rest of the fleet alone (#543). `--clear` drops the pin.
+ * The id defaults to $CLAUDE_CODE_SESSION_ID, which Claude Code exports to the
+ * commands it runs, so from inside a session the flag alone names it.
+ * @param {number} port
+ * @param {Record<string, string>} headers
+ * @param {string|null} name
+ */
+async function switchSessionCommand(port, headers, name) {
+  const at = args.indexOf('--session');
+  const given = args[at + 1] && !args[at + 1].startsWith('-') ? args[at + 1] : null;
+  const sessionId = given || process.env.CLAUDE_CODE_SESSION_ID || null;
+  const clear = args.includes('--clear');
+  if (!sessionId) {
+    console.error('No session to pin: pass --session <id>, or run this from inside a Claude Code session (it reads $CLAUDE_CODE_SESSION_ID).');
+    process.exit(1);
+  }
+  if (!clear && !name) {
+    console.error('Usage: teamclaude switch <account> --session [<id>]   (or: teamclaude switch --session [<id>] --clear)');
+    process.exit(1);
+  }
+  const shown = sessionId.slice(0, 8);
+  let res;
+  try {
+    res = await fetch(`http://localhost:${port}/teamclaude/session-pin`, {
+      method: 'POST',
+      headers: { ...headers, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId, account: clear ? null : name }),
+    });
+  } catch (/** @type {any} */ err) {
+    console.error('Cannot connect to proxy at localhost:' + port);
+    console.error('Is the server running? Start with: teamclaude server');
+    if (err?.message) console.error(`Details: ${err.message}`);
+    process.exit(1);
+  }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const detail = typeof data.error === 'string' ? data.error : null;
+    console.error(detail || `Session pin failed: unexpected reply from localhost:${port} (HTTP ${res.status}).`);
+    if (!detail) console.error('An older server without this endpoint answers this way; restart it to pick up the new version.');
+    if (data.accounts?.length) {
+      console.error('Known accounts:');
+      for (const n of data.accounts) console.error(`  ${n}`);
+    }
+    process.exit(1);
+  }
+  if (clear) {
+    console.log(data.cleared ? `Session ${shown} unpinned; it follows the fleet again.` : `Session ${shown} had no pin.`);
+    return;
+  }
+  console.log(`Session ${shown} pinned to "${data.account}"; other sessions are unchanged.`);
+  if (data.eligible === false) {
+    console.error(`Warning: "${data.account}" is ${data.reason || 'not currently eligible'}, and a pinned session does not rotate away, so its requests will fail until that changes.`);
+  }
+  // A pin on an id no request carries pins nothing. Said rather than left to be
+  // discovered: the id may not be the one this session sends the proxy, or the
+  // session may not go through the proxy at all.
+  if (data.seen === false) {
+    console.error(`Warning: the proxy has not seen a request from session ${shown} in the last hour. The pin applies once one arrives;`
+      + ' if this session does not run through teamclaude, or sends a different session id, it never will.');
   }
 }
 
@@ -2301,6 +2415,7 @@ async function distributeCommand() {
   if (['on', 'true', 'yes', '1'].includes(arg)) next = 'even';
   else if (['off', 'false', 'no', '0'].includes(arg)) next = 'off';
   else if (arg === 'adaptive') next = 'adaptive';
+  else if (arg === 'load') next = 'load';
   if (!next) {
     console.error(DISTRIBUTE_USAGE);
     process.exit(1);
@@ -2437,6 +2552,12 @@ async function updateCommand() {
   const kind = await installKind();
   if (kind === 'git') {
     console.log('This is a git checkout — update it with `git pull`, not npm.');
+    return;
+  }
+  // `npm install -g` would put a second copy in npm's global directory and
+  // leave this one, the one on PATH, as it is.
+  if (kind === 'pnpm') {
+    console.log(`This copy was installed with pnpm, which npm cannot update. Run: ${updateCommandFor(kind)}`);
     return;
   }
 
@@ -2761,6 +2882,8 @@ Commands:
   accounts            List configured accounts
   switch [NAME]       Make the running server prefer one account (as 's' in the
                       TUI does); with no NAME, list accounts and mark the current
+                      --session [ID] moves only that session ($CLAUDE_CODE_SESSION_ID
+                      by default); --session --clear drops its pin
   remove <name>       Remove an account (by name or email; --org to disambiguate)
   disable <name>      Temporarily exclude an account from rotation
   enable <name>       Re-enable a disabled account (also clears a stuck error)
@@ -2775,10 +2898,12 @@ Commands:
                       user:pass@ auth; 'none' clears it (also: login --routing)
   threshold [pct]     Utilization at which rotation leaves an account (1-100);
                       per bucket with 'unified7d=90', and '=default' drops one
-  distribute [on|off|adaptive]
+  distribute [on|off|adaptive|load]
                       Spread new sessions across equal-priority accounts, each
                       pinned to its own for cache reuse (off by default);
-                      'adaptive' spreads by remaining weekly credit and load
+                      'adaptive' spreads by remaining weekly credit and load;
+                      'load' places each new session on the account that served
+                      the fewest requests in the last ten minutes
   probe [off|secs]    Opt-in background quota refresh for idle accounts
                       (off by default; reads usage endpoint, spends no quota)
   warmup [off|secs]   Opt-in: keep idle accounts' 5h timers running by sending
@@ -3086,9 +3211,7 @@ async function persistMintedAccountIds(config) {
   } catch {
     return; // nothing on disk to reconcile with (or unreadable — the next save will tell)
   }
-  const ids = (Array.isArray(raw?.accounts) ? raw.accounts : []).map(a => a?.id);
-  const complete = ids.every(id => typeof id === 'string' && id !== '') && new Set(ids).size === ids.length;
-  if (!complete) await saveConfig(config);
+  if (!accountIdsComplete(raw?.accounts)) await saveConfig(config);
 }
 
 // ── helpers ─────────────────────────────────────────────────
@@ -3186,20 +3309,6 @@ async function notifyRunningServer(config) {
       console.log(`Reloaded running server${parts.length ? ` (${parts.join(', ')})` : ''}.`);
     }
   } catch { /* no server running — nothing to notify */ }
-}
-
-// Quick liveness probe: is something listening on the local proxy port?
-// A successful TCP connect is enough (the proxy is local). Times out fast so a
-// down proxy doesn't add noticeable latency to `claude` launches via the alias.
-function isProxyUp(port, timeout = 600) {
-  return new Promise(resolve => {
-    const socket = net.connect({ host: '127.0.0.1', port });
-    const done = up => { socket.destroy(); resolve(up); };
-    socket.setTimeout(timeout);
-    socket.once('connect', () => done(true));
-    socket.once('timeout', () => done(false));
-    socket.once('error', () => resolve(false));
-  });
 }
 
 function handleServerListenError(err, port) {

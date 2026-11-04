@@ -31,9 +31,15 @@ const SCHEDULE_TIMER_GRACE_MS = 60_000;
 
 // The warm-up is a `claude` run, so only an Anthropic subscription can take
 // it: a third-party backend has no 5-hour window of Anthropic's, and the server
-// refuses a Codex account outright.
+// refuses a Codex account outright. Nor can a subscription whose last reading
+// stated a weekly window and no 5-hour one (an Ultra plan once Anthropic lifts
+// its 5-hour limit): there is no timer to start, and with no reset ever
+// recorded it would be a target on every cycle, spending quota each time. A
+// 5-hour reading coming back sets the fact again (see noteSessionWindow in
+// account-manager.js), and the account is warmed from then on.
 export function warmApplicable(/** @type {any} */ account) {
-  return account.type === 'oauth' && !account.upstream && providerOf(account) === 'anthropic';
+  return account.type === 'oauth' && !account.upstream && providerOf(account) === 'anthropic'
+    && account.quota?.sessionWindowStated !== false;
 }
 
 export class Warmer {
@@ -190,7 +196,8 @@ export class Warmer {
   /**
    * True when `account` is a healthy, idle Anthropic OAuth account whose 5h
    * window is NOT already running. We skip:
-   *  - non-OAuth, third-party-backend and Codex accounts (see warmApplicable);
+   *  - non-OAuth, third-party-backend and Codex accounts, and a subscription
+   *    that meters no 5h window (see warmApplicable);
    *  - disabled / errored / exhausted / throttled accounts — warming them is
    *    pointless or would just 429;
    *  - accounts with a live 5h window — already warm, so warming again only burns

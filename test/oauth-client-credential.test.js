@@ -215,6 +215,7 @@ for (const [path, onWire] of [
   ['/tc-acct/a/v1/code/sessions/abc/worker/events/stream', '/v1/code/sessions/abc/worker/events/stream'],
   ['/tc-acct/a/%61pi/oauth/profile', '/%61pi/oauth/profile'],
   ['/tc-acct/a/api/frame/deploy/direct', '/api/frame/deploy/direct'],
+  ['/tc-acct/a/v1/mcp_servers?limit=1000', '/v1/mcp_servers?limit=1000'],
 ]) {
   test(`${path} keeps the client's own credential`, async () => {
     const { server: upstream, port, seen } = await echoAuthUpstream();

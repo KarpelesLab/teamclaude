@@ -41,9 +41,9 @@ test('tracker aggregates per name and drops unattributed records', () => {
   t.record('', { requests: 1 });                       // ditto
   assert.deepEqual(t.export(), {
     alice: {
-      requests: 1, connections: 0, inputTokens: 7, outputTokens: 3, lastUsed: new Date(1000).toISOString(),
+      requests: 1, connections: 0, inputTokens: 7, outputTokens: 3, cacheReadTokens: 0, cacheCreationTokens: 0, lastUsed: new Date(1000).toISOString(),
       // Recorded at one instant, so every window holds all of it.
-      windows: everyWindow({ requests: 1, connections: 0, inputTokens: 7, outputTokens: 3 }),
+      windows: everyWindow({ requests: 1, connections: 0, inputTokens: 7, outputTokens: 3, cacheReadTokens: 0, cacheCreationTokens: 0 }),
     },
   });
 });
@@ -62,7 +62,7 @@ test('restore is additive and survives malformed entries', () => {
   assert.equal(out.alice.inputTokens, 11);
   // live lastUsed (5000) is newer than the restored one (2000) and must win
   assert.equal(out.alice.lastUsed, new Date(5000).toISOString());
-  assert.deepEqual(out.bob, { requests: 1, connections: 0, inputTokens: 4, outputTokens: 2, lastUsed: null });
+  assert.deepEqual(out.bob, { requests: 1, connections: 0, inputTokens: 4, outputTokens: 2, cacheReadTokens: 0, cacheCreationTokens: 0, lastUsed: null });
   assert.equal(out.mallory, undefined);
   assert.equal(Object.keys(out).length, 2);
 });
@@ -498,7 +498,7 @@ test('a client with traffic in any window carries every window, zeros included',
 
   const windows = t.export().alice.windows;
   assert.deepEqual(Object.keys(windows).sort(), Object.keys(USAGE_WINDOWS).sort(), 'no window is dropped for being empty');
-  assert.deepEqual(windows['5h'], { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0 });
+  assert.deepEqual(windows['5h'], { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 });
   assert.equal(windows['24h'].inputTokens, 5);
 });
 

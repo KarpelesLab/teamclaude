@@ -5,6 +5,8 @@ import { parseCodexQuota, parseCodexPlanType, parseCodexActiveLimit } from './co
 import { sameIdentity } from './identity.js';
 import { weeklyBucketForModel, modelGlobMatches, modelFamily, gatingUtilization, resolveMaxUsage, spendCapReached, resolveSwitchThreshold, sanitizeSwitchThreshold, WEEKLY_BUCKET_KEYS } from './model.js';
 import { SessionTracker } from './session-tracker.js';
+import { SessionPins } from './session-pins.js';
+import { parseClientRoutes, clearSeatRejection } from './client-routes.js';
 import { buildQuotaSummary, quotaTier } from './quota-summary.js';
 import { ROLLOVER_MIN_JUMP_MS, remapHeld, findHeld, dropHeld, newObservation } from './rollover.js';
 import { decideBand, pressureOf, pressureRank, assertNever } from './band-decision.js';
@@ -30,6 +32,9 @@ export { isFableModel, parseRequestModel, parseAdvisorModel } from './model.js';
  *   'adaptive'     → 'adaptive' spend the least-remaining window down first,
  *                               tapering at the threshold and backing off when
  *                               the account is busy (see adaptive-distribution.js)
+ *   'load'         → 'load'     spread new sessions by the requests each account
+ *                               served in the last LOAD_WINDOW_MS, even keys as
+ *                               tie-breaks (see SessionTracker.recentRequestsFor)
  * An unrecognised string is treated as 'even' rather than rejected: it is
  * plainly a request to distribute, and refusing to distribute at all would be
  * the worse reading of a typo. It is still said once, naming the value: an
@@ -43,10 +48,11 @@ export function distributionMode(setting) {
   if (typeof setting === 'string') {
     const value = setting.trim().toLowerCase();
     if (value === 'adaptive') return 'adaptive';
+    if (value === 'load') return 'load';
     if (['off', 'false', 'no', '0'].includes(value)) return 'off';
     if (!EVEN_SPELLINGS.includes(value) && !warnedDistributeValues.has(value)) {
       warnedDistributeValues.add(value);
-      console.warn(`[TeamClaude] distributeSessions: unrecognised value ${JSON.stringify(setting)}, distributing evenly (valid: true, false, "adaptive")`);
+      console.warn(`[TeamClaude] distributeSessions: unrecognised value ${JSON.stringify(setting)}, distributing evenly (valid: true, false, "adaptive", "load")`);
     }
     return 'even';
   }
@@ -64,6 +70,10 @@ const ADAPTIVE_STATS_CACHE_MS = 1000;
 // when the token turned over, short enough that a genuinely bad new token
 // recovers on the next request rather than staying stuck.
 const FORCED_REFRESH_FLOOR_MS = 10_000;
+// How long a token-endpoint 429 holds an account's refreshes when it carries no
+// Retry-After: long enough that the 401 and the retry of the same request do not
+// ask again, short enough that a renewal is not put off for long.
+const REFRESH_429_HOLD_MS = 30_000;
 // How many distinct models an account's recentModels table remembers.
 const MAX_RECENT_MODELS = 8;
 // An organization-level OAuth policy denial is not repaired by an immediate
@@ -137,12 +147,16 @@ const PERSISTED_QUOTA_FIELDS = [
   // pool (claude-resets.js): a bare timestamp, so a restart minutes after a
   // claim that may have landed does not spend a sibling's on top of it.
   'claudeResetHoldUntil',
-  // Whether the last Codex reading stated a 5-hour window at all (see
-  // _updateCodexQuota). A fact about the subscription's shape rather than a
-  // counter, so it holds across a restart: without it a restored Codex row
-  // would draw Ses/Wk until its first reading and then snap to one wide
-  // weekly bar — the startup flicker the TUI rule is written to avoid.
+  // Whether the last reading stated a 5-hour window at all (see
+  // noteSessionWindow), on a Codex or a Claude subscription. A fact about the
+  // subscription's shape rather than a counter, so it holds across a restart:
+  // without it a restored row would draw Ses/Wk until its first reading and
+  // then snap to one wide weekly bar — the startup flicker the TUI rule is
+  // written to avoid — and keep-warm would warm the account once for nothing.
   'sessionWindowStated',
+  // Same reason: a Team seat (no shared weekly window) would draw `Wk ?` until
+  // its first reading.
+  'weeklyWindowStated',
 ];
 
 // The family (Fable/Sonnet) weekly buckets and the field holding when each was
@@ -153,6 +167,10 @@ const FAMILY_WEEKLY_BUCKETS = [
   { key: 'unified7dFable', label: 'Fable', usageKey: 'sevenDayFable' },
   { key: 'unified7dSonnet', label: 'Sonnet', usageKey: 'sevenDaySonnet' },
 ];
+
+// How long a family reading at its account's `maxUsage` cap is kept when no
+// reset time is known for it: one weekly window (see _clearExpiredQuotas).
+const CAPPED_FAMILY_HOLD_MS = 7 * 24 * 3600_000;
 
 /**
  * The quota fields a Codex account only ever LEARNS — from a `/wham/usage`
@@ -170,8 +188,53 @@ const FAMILY_WEEKLY_BUCKETS = [
  * @property {{available: number, applicable: number|null, seenAt: number, expiresAt?: number|null}} [resetCredits]  free rate-limit reset credits (Codex) or banked usage-limit resets (Claude) held, when that was last seen, and when the soonest one lapses where the provider says
  * @property {Record<string, {name: string, utilization: number, resetAt: number|null, seenAt: number}>} [codexModelBuckets]  model-scoped weekly buckets, keyed by slug
  * @property {Record<string, string>} [codexModelLimits]  which limit each model was last metered on, from `x-codex-active-limit`: a `codexModelBuckets` slug, or the name upstream gives the account-wide limit
- * @property {boolean} [sessionWindowStated]  whether the last reading that stated a window stated a 5-hour one; `false` says the subscription meters no session window
  */
+
+/**
+ * Record whether a reading says the subscription meters a session (5-hour)
+ * window at all: `true` when it stated one, `false` when it stated the weekly
+ * window and no 5-hour one beside it, and nothing when it stated neither (a
+ * catalog fetch, a Fable-only or reset-only header set, a failed probe).
+ *
+ * Kept apart from the reading itself: `unified5h` is nulled the moment its
+ * window expires (_clearExpiredQuotas), so a row keyed on the reading alone
+ * would swing between Ses/Wk and one wide weekly bar every five hours. Both
+ * providers have subscriptions that meter no session window — some Codex plans
+ * (see codex-quota.js) and Anthropic's Ultra plan once its 5-hour limit is
+ * lifted — and one rule serves all four paths so they cannot drift apart.
+ *
+ * `clear` is for a usage probe only. The probe reads every limit at once, so
+ * its word that there is no session window is what clears a reading left from
+ * before the plan changed, which would otherwise keep gating selection until
+ * its reset. One response's headers are weaker evidence of absence than the
+ * whole usage payload, so the header paths leave the reading alone.
+ *
+ * A stored `rejected` verdict goes with a reading cleared that way, unless
+ * `rejectionExplained` says a window still present (a spent weekly) accounts
+ * for it. The verdict describes the shared windows, and once the session one
+ * is gone nothing else would clear it before it went stale: the expiry sweep
+ * that drops it with an expiring reading has no reading left to expire.
+ *
+ * @param {{sessionWindowStated: boolean|null, unified5h: number|null, unified5hReset: number|null, unified5hSeenAt: number|null, unifiedStatus?: string|null, unifiedStatusSeenAt?: number|null}} q
+ * @param {{session: boolean, weekly: boolean, clear?: boolean, rejectionExplained?: boolean}} stated
+ */
+function noteSessionWindow(q, { session, weekly, clear = false, rejectionExplained = false }) {
+  if (session) {
+    q.sessionWindowStated = true;
+  } else if (weekly) {
+    q.sessionWindowStated = false;
+    if (clear) {
+      const hadReading = q.unified5h != null || q.unified5hReset != null;
+      q.unified5h = null;
+      q.unified5hReset = null;
+      q.unified5hSeenAt = null;
+      if (hadReading && q.unifiedStatus === 'rejected' && !rejectionExplained) {
+        q.unifiedStatus = null;
+        q.unifiedStatusSeenAt = null;
+      }
+    }
+  }
+}
 
 function emptyQuota() {
   return {
@@ -201,6 +264,10 @@ function emptyQuota() {
     unified7dSonnetSeenAt: null,
     unified7dFableSeenAt: null,
     unifiedStatus: null,        // allowed | allowed_warning | rejected
+    // false: the plan meters no shared weekly window (a Team seat).
+    weeklyWindowStated: /** @type {boolean|null} */ (null),
+    // false: the plan meters no session (5-hour) window (see noteSessionWindow).
+    sessionWindowStated: /** @type {boolean|null} */ (null),
     // Normalized reading from a third-party backend (see backend-quota.js).
     // { label, text, utilization, at, windows? } — nothing here knows which
     // provider. windows feeds the fiveHour/weeklyShared/monthly buckets of
@@ -455,12 +522,19 @@ function makeAccount(acct, index, listener = null) {
     // The refresh token upstream last rejected as invalid, if it is still the
     // one we hold — see the dead-token guard in ensureTokenFresh.
     _deadRefreshToken: null,
+    // Until when (epoch ms) the token endpoint asked, with a 429, not to be
+    // asked again for this account — see ensureTokenFresh.
+    _refreshHeldUntil: /** @type {number|null} */ (null),
     // Whether the token it holds was minted by the token endpoint for this
     // process — a renewal here, not one taken from the store. Only such a token
     // is fresh enough to store on callback.net (credential-sync.js). Never
     // persisted, so false at every launch, and false again whenever tokens
     // arrive from elsewhere (updateAccountTokens).
     _minted: false,
+    // Why the last token refresh failed ({ at, reason, status }), until one
+    // succeeds or tokens arrive from elsewhere: the client is told this when
+    // the account is then refused (server.js refusalMessage). Never persisted.
+    _lastRefreshFailure: /** @type {{ at: number, reason: string, status: any } | null} */ (null),
   };
 }
 
@@ -521,6 +595,7 @@ export class AccountManager {
    * @param {number} [opts.statusStaleMs]
    * @param {number} [opts.forcedRefreshFloorMs]
    * @param {Array<Object>} [opts.routes]
+   * @param {Array<Object>} [opts.clientRoutes]  client routes (IPM fork, client-routes.js)
    * @param {Object} [opts.ramp]
    * @param {boolean|string} [opts.distributeSessions]
    * @param {Object} [opts.adaptive]
@@ -529,7 +604,7 @@ export class AccountManager {
    * @param {string} [opts.advisorEligibility]  'strict' (default) or 'prefer'
    * @param {{ host: string, port: number }|null} [opts.listener]  this server's own address, so an accounts[].routing that points back at it is refused (see accountRouting)
    */
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, refreshCoordinator = (_account, refresh, _info) => refresh(), throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, advisorEligibility, listener = null } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, refreshCoordinator = (_account, refresh, _info) => refresh(), throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, clientRoutes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, advisorEligibility, listener = null } = {}) {
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
@@ -548,7 +623,12 @@ export class AccountManager {
     // accounts by load instead of funnelling them all onto the current one.
     /** @type {SessionTracker} */
     this.sessionTracker = sessionTracker || new SessionTracker();
-    // 'off' | 'even' | 'adaptive'. `distributeSessions` stays a boolean beside
+    // Sessions the operator moved onto a named account (`teamclaude switch
+    // --session`, issue #543). Applied by the request path like a TC_ACCT pin;
+    // nothing in selection reads it.
+    /** @type {SessionPins} */
+    this.sessionPins = new SessionPins();
+    // 'off' | 'even' | 'adaptive' | 'load'. `distributeSessions` stays a boolean beside
     // it ("is distribution on at all") because the status readout, the TUI
     // header and the remote dashboard all ask only that question.
     this.distributionMode = distributionMode(distributeSessions);
@@ -605,6 +685,8 @@ export class AccountManager {
     this._advisorNarrowing = null;
     this._advisorNarrowLogAt = 0;
     this.setRoutes(routes);
+    // Client routes (IPM fork): see client-routes.js. Not model routes.
+    this.setClientRoutes(clientRoutes);
     // Monotonic across every observation, so a stamp read under one move never
     // matches another. Live before the settings, since turning the knob on
     // takes a reading.
@@ -767,6 +849,9 @@ export class AccountManager {
    * The shared buckets (unified5h, unified7d) cap every request; a family bucket
    * caps only the family it meters, so a Fable cap stops Fable and leaves Opus
    * alone. Both apply: a Fable request is capped by whichever binds first.
+   *
+   * @param {Record<string, any>} account
+   * @param {string|null} [model]
    */
   capExceeded(account, model = null) {
     // The money cap first: it is the budget the usage caps exist to protect, and
@@ -825,6 +910,24 @@ export class AccountManager {
     const cap = this.capFor(key, account);
     const val = account.quota[key];
     return cap != null && val != null && val >= cap ? key : null;
+  }
+
+  /**
+   * The cap that bars this request from `account`, or null: the executor's
+   * caps and, when the request declares one, the advisor model's own family
+   * cap. For the paths that pick an account without unavailableReason — the
+   * exhausted-fleet probe, the paid fallback, the all-unavailable revival, a
+   * pin, the re-check after admission — so a cap binds on every path a request
+   * can take. Under `advisorEligibility: "prefer"` the advisor is a preference
+   * rather than a requirement, so only the executor's caps apply.
+   *
+   * @param {Record<string, any>} account
+   * @param {string|null} [model]
+   * @param {string|null} [advisorModel]
+   */
+  capBars(account, model = null, advisorModel = null) {
+    return this.capExceeded(account, model)
+      || (advisorModel && this.advisorEligibility !== 'prefer' ? this._familyCapExceeded(account, advisorModel) : null);
   }
 
   /** Start (or restart) the ramp window for an account that just became current,
@@ -1367,7 +1470,7 @@ export class AccountManager {
       ? this._advisorReach(excluded, model, advisorModel) : null;
     const normal = this._pickBestAvailable(excluded, model, reach && reach.eligible < reach.of ? null : advisorModel);
     if (normal) return normal;
-    const pick = this._pickFallback(excluded, model, provider);
+    const pick = this._pickFallback(excluded, model, provider, reach && reach.eligible < reach.of ? null : advisorModel);
     if (!pick) return null;
     // A paid hop must not bill silently, yet it is still a detour: no cursor,
     // no ramp. So it only records the scope's episode — bookkeeping that feeds
@@ -1626,7 +1729,7 @@ export class AccountManager {
     // Only the final pass: the advisor-constrained one fails soft by design, and
     // spending money to honour an advisor's family is not a trade to make here.
     if (!allowProbe) return null;
-    return this._selectProbe(exclude, model) ?? this._selectFallback(exclude, model);
+    return this._selectProbe(exclude, model, advisorModel) ?? this._selectFallback(exclude, model, advisorModel);
   }
 
   /** Session-affinity selection (opt-in, issue #109). Honor a known session's
@@ -1748,8 +1851,12 @@ export class AccountManager {
 
   /** Where a new session goes, per the configured distribution mode. Adaptive
    * scores the tier by remaining credit and congestion; even (the original)
-   * spreads by active-session count. */
+   * spreads by active-session count; load spreads by the requests each account
+   * carried in the last LOAD_WINDOW_MS, with the even keys as tie-breaks. */
   _pickLeastLoaded(exclude = null, model = null, advisorModel = null) {
+    if (this.distributionMode === 'load') {
+      return this._pickLeastLoadedEven(exclude, model, advisorModel, { byRequests: true });
+    }
     if (this.distributionMode === 'adaptive') {
       const picked = this._pickAdaptive(exclude, model, advisorModel);
       // Adaptive can legitimately score every candidate at zero — the whole
@@ -1872,7 +1979,9 @@ export class AccountManager {
     let bestScore = -Infinity;
     let bestReset = Infinity;
     for (const c of candidates) {
-      const { score } = scoreCandidate({ ...c, maxRemaining });
+      // The operator's adaptive settings, maxBurnBoost among them; the learner
+      // holds them merged over the defaults.
+      const { score } = scoreCandidate({ ...c, maxRemaining }, this.burnRateLearner.opts);
       // Soonest weekly reset breaks a tie, matching the rest of selection: on
       // an idle fleet every candidate scores identically, and without this the
       // winner would be array order.
@@ -1890,8 +1999,17 @@ export class AccountManager {
    * spread across equal-priority accounts instead of funnelling onto one. Order:
    * priority → [top pressure band, when expiry routing is on] → fewest active
    * sessions → fewest in-flight → highest expiry pressure (inert when expiry
-   * routing is off) → soonest weekly reset (the existing tiebreak). */
-  _pickLeastLoadedEven(exclude = null, model = null, advisorModel = null) {
+   * routing is off) → soonest weekly reset (the existing tiebreak).
+   *
+   * With `byRequests` (the load mode) one key goes ahead of the session count:
+   * fewest requests routed to the account in the last LOAD_WINDOW_MS. Sessions
+   * are not interchangeable — a fleet lane in a build loop sends a hundred
+   * requests in the time an interactive session sends five — so equal session
+   * counts left one account carrying a third of a 14-account pool's traffic.
+   * Counting what each account actually served places the next session where
+   * the least work is, and the session stays pinned there for cache reuse as
+   * in every other mode. */
+  _pickLeastLoadedEven(exclude = null, model = null, advisorModel = null, { byRequests = false } = {}) {
     const now = Date.now();
     const candidates = this._bandedCandidates(exclude, model, advisorModel);
     // One clock for every candidate: pressure rises continuously as a window
@@ -1904,6 +2022,7 @@ export class AccountManager {
     let best = null;
     let bestPriority = Infinity;
     let bestSpent = Infinity;
+    let bestRequests = Infinity;
     let bestSessions = Infinity;
     let bestInFlight = Infinity;
     let bestPressure = Infinity;
@@ -1911,21 +2030,25 @@ export class AccountManager {
     candidates.forEach((account, i) => {
       const priority = account.priority || 0;
       const heldOff = spent[i];
+      const requests = byRequests ? this.sessionTracker.recentRequestsFor(account.index, now) : 0;
       const sessions = this.sessionTracker.activeCountFor(account.index, now);
       const inFlight = account.inFlight || 0;
       const pressure = pressures[i];
       const reset = this._rankedReset(account, model);
       const samePriority = priority === bestPriority;
       const sameSpend = samePriority && heldOff === bestSpent;
+      const sameLoad = sameSpend && requests === bestRequests;
       if (priority < bestPriority
         || (samePriority && heldOff < bestSpent)
-        || (sameSpend && sessions < bestSessions)
-        || (sameSpend && sessions === bestSessions && inFlight < bestInFlight)
-        || (sameSpend && sessions === bestSessions && inFlight === bestInFlight && pressure < bestPressure)
-        || (sameSpend && sessions === bestSessions && inFlight === bestInFlight && pressure === bestPressure && reset < bestReset)) {
+        || (sameSpend && requests < bestRequests)
+        || (sameLoad && sessions < bestSessions)
+        || (sameLoad && sessions === bestSessions && inFlight < bestInFlight)
+        || (sameLoad && sessions === bestSessions && inFlight === bestInFlight && pressure < bestPressure)
+        || (sameLoad && sessions === bestSessions && inFlight === bestInFlight && pressure === bestPressure && reset < bestReset)) {
         best = account;
         bestPriority = priority;
         bestSpent = heldOff;
+        bestRequests = requests;
         bestSessions = sessions;
         bestInFlight = inFlight;
         bestPressure = pressure;
@@ -1956,6 +2079,9 @@ export class AccountManager {
     // taken where the evidence is, at the start of the NEXT request from
     // wherever this one left the pin (see _restOn).
     this.sessionTracker.touch(sessionId, accountIndex, bucket);
+    // The load mode's input: one entry per routed request that carries a
+    // session id, in every mode, so switching to load starts from a warm picture.
+    this.sessionTracker.noteRouted(accountIndex);
     // Except the FIRST one, which discards nothing: otherwise a session's
     // opening window is first-sighted a request late (see _firstSightOn).
     if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) return;
@@ -2146,7 +2272,7 @@ export class AccountManager {
         load: r.sessions + r.inFlight,
         concCap: r.concCap,
         maxRemaining,
-      });
+      }, this.burnRateLearner.opts);
       r.score = score;
       total += score;
     }
@@ -2389,7 +2515,7 @@ export class AccountManager {
    * The chosen account is the least-utilized probeable one (most likely to have
    * stale headroom), so the refreshed quota corrects the cache fastest.
    */
-  _selectProbe(exclude = null, model = null) {
+  _selectProbe(exclude = null, model = null, advisorModel = null) {
     const now = Date.now();
     if (now < this._nextProbeAt) return null;
 
@@ -2406,7 +2532,7 @@ export class AccountManager {
       // A cap is the operator's own decision, not a reading that a live request
       // might refresh, so the exhausted-fleet probe does not get to override it.
       // Checked here rather than in _isProbeable because a cap is model-scoped.
-      if (this.capExceeded(account, model)) continue;
+      if (this.capBars(account, model, advisorModel)) continue;
       // Same for routing/ownership: a probe for a routed or owned model must not
       // land on an ineligible account (it would just reject the unknown model id).
       if (model && !this._routeAllows(account, model)) continue;
@@ -2448,9 +2574,9 @@ export class AccountManager {
    * same one stepping from free quota onto paid — is announced and ramped like
    * any switch (see _noteFallback).
    */
-  _selectFallback(exclude = null, model = null) {
+  _selectFallback(exclude = null, model = null, advisorModel = null) {
     const provider = this._selectingProvider ?? DEFAULT_PROVIDER;
-    const pick = this._pickFallback(exclude, model, provider);
+    const pick = this._pickFallback(exclude, model, provider, advisorModel);
     if (!pick) return null;
     if (!this._currentBarredOnlyFor(model, null, exclude)) this._setCurrent(pick.account);
     if (this._noteFallback(this._cursorKey(model, null, provider), pick, model, false)) this._beginRamp(pick.account);
@@ -2507,7 +2633,7 @@ export class AccountManager {
    * @param {Set<number>|null} [exclude]
    * @returns {{ account: Record<string, any>, paid: boolean } | null}
    */
-  _pickFallback(exclude = null, model = null, provider = DEFAULT_PROVIDER) {
+  _pickFallback(exclude = null, model = null, provider = DEFAULT_PROVIDER, advisorModel = null) {
     if (!this.accounts.some(a => a.allowExtraUsage)) return null;
     const partition = this._excludeOtherProviders(null, provider);
     if (this.accounts.some(a => !partition?.has(a.index) && this._isAvailable(a, model))) return null;
@@ -2523,6 +2649,8 @@ export class AccountManager {
       const reason = this.unavailableReason(account, model);
       if (reason !== 'quota' && reason !== 'upstream-rejected') continue;
       if (model && !this._routeAllows(account, model)) continue;
+      // The executor's caps were read above; the advisor's family is its own.
+      if (this.capBars(account, model, advisorModel)) continue;
       const priority = account.priority || 0;
       const usage = this._maxUtilization(account, model);
       // `quota` is reported ahead of `upstream-rejected`, so a rejected account
@@ -2688,8 +2816,8 @@ export class AccountManager {
   setDistributeSessions(enabled, { drain = true } = {}) {
     const mode = distributionMode(enabled);
     if (mode !== 'off') {
-      // Includes switching BETWEEN 'even' and 'adaptive'. Neither drains: both
-      // keep a session pinned to its account, so only the choice made for the
+      // Includes switching BETWEEN 'even', 'adaptive' and 'load'. None drains:
+      // each keeps a session pinned to its account, so only the choice made for the
       // NEXT new session changes and no running session loses its prompt cache.
       this.distributionMode = mode;
       this.distributeSessions = true;
@@ -2799,6 +2927,20 @@ export class AccountManager {
     // nothing resolves to. Clearing them costs one extra best-available walk per
     // route and keeps no state that outlives the table it belonged to.
     this.routeCursors?.clear();
+  }
+
+  /**
+   * Client routes (IPM fork, client-routes.js): which client keys each fixed
+   * seat serves. Stored as account NAMES and resolved per request by the
+   * server, because a reload can renumber accounts. Kept apart from the model
+   * routes above: `this.routes`, getRoutes() and everything that edits them
+   * never see these. Called from the constructor and on config reload; the
+   * parse warnings are logged here, once per load.
+   * @param {unknown} clientRoutes
+   */
+  setClientRoutes(clientRoutes) {
+    this.clientRoutes = parseClientRoutes(clientRoutes);
+    for (const w of this.clientRoutes.warnings) console.log(`[TeamClaude] ${w}`);
   }
 
   /**
@@ -3094,7 +3236,7 @@ export class AccountManager {
       enabled: !!this.expiryRouting.enabled,
       tolerance: this.expiryRouting.tolerance,
       accounts: candidates.map(a => {
-        const { utilization: used, resetAt: reset } = this._governingWindow(a, model);
+        const { window, utilization: used, resetAt: reset } = this._governingWindow(a, model);
         return {
           index: a.index,
           priority: a.priority || 0,
@@ -3103,9 +3245,39 @@ export class AccountManager {
           // as a window nobody has reported yet, which wants a different action.
           utilization: typeof used === 'number' ? used : (used == null ? null : NaN),
           resetAt: typeof reset === 'number' && reset ? reset : null,
+          limit: this._spendLimit(a, window, used),
         };
       }),
     };
+  }
+
+  /**
+   * How far `account`'s governing window may be spent under its `maxUsage`
+   * caps, as a level of that window, or null when nothing caps it. A family
+   * window is bound by its own cap and by the shared weekly's, since family
+   * spend meters into both (see capExceeded): the room is the smaller of the
+   * two, expressed on the family window's scale. Uncapped accounts get null,
+   * so their pressure is unchanged.
+   *
+   * @param {Record<string, any>} account
+   * @param {string} window  the key _governingWindow resolved
+   * @param {unknown} used   that window's utilization
+   * @returns {number|null}
+   */
+  _spendLimit(account, window, used) {
+    if (!account.maxUsage) return null;
+    // A learned scoped bucket stands in for a family the shared weekly meters,
+    // so the shared weekly's cap is the one that applies to it.
+    const key = window.startsWith('scoped:') ? 'unified7d' : window;
+    let limit = this.capFor(key, account);
+    if (key !== 'unified7d' && typeof used === 'number') {
+      const capWeekly = this.capFor('unified7d', account);
+      const weekly = account.quota.unified7d;
+      if (capWeekly != null && typeof weekly === 'number') {
+        limit = Math.min(limit ?? 1, used + Math.max(0, capWeekly - weekly));
+      }
+    }
+    return limit;
   }
 
   /**
@@ -3656,7 +3828,9 @@ export class AccountManager {
    *
    * `sessionWindowStated` is deliberately not touched here: it records whether
    * the subscription meters a session window at all, which an expired window
-   * says nothing about (see _updateCodexQuota).
+   * says nothing about (see noteSessionWindow). It is read, though: on a plan
+   * that meters none, a session reading with no reset is cleared, and one that
+   * runs out is a session reset only if it was gating the account.
    * @returns {{changed: boolean, session: boolean}} what was cleared.
    */
   _clearExpiredQuotas(account) {
@@ -3664,6 +3838,7 @@ export class AccountManager {
     const now = Date.now();
     let changed = false;
     let session = false;
+    const noSessionWindow = q.sessionWindowStated === false;
 
     // Clear expired unified quotas
     if (q.unified5h != null && q.unified5hReset && now >= q.unified5hReset) {
@@ -3676,7 +3851,17 @@ export class AccountManager {
       // dashboard polling every 5s the rule almost never ran (#275). The flag
       // outlives the observation: only refreshExpiredQuotas clears it, and with
       // the feature on only when a request drives that call.
-      account.sessionResetPending = true;
+      // On a plan that meters no session window the reading that ran out was
+      // left from before the change, and no fresh five-hour allowance follows
+      // it. It is still a reset when that reading was gating the account (at
+      // its threshold or its `maxUsage` cap): the expiry returns the account
+      // to rotation just as a reset does, and the switch rule is what moves
+      // traffic onto a weekly window that lapses sooner. Below both, the
+      // account was in rotation all along and nothing changed for the rule.
+      if (!noSessionWindow || this._sessionReadingGates(account)) {
+        account.sessionResetPending = true;
+        session = true;
+      }
       q.unified5h = null;
       q.unified5hReset = null;
       q.unified5hSeenAt = null;
@@ -3685,7 +3870,25 @@ export class AccountManager {
       q.unifiedStatus = null;
       q.unifiedStatusSeenAt = null;
       changed = true;
-      session = true;
+    } else if (noSessionWindow && q.unified5h != null && !q.unified5hReset) {
+      // A session reading with no reset on a plan that meters no session
+      // window. An idle metered account reads 0% with no reset (no window
+      // running), and a response after the 5-hour limit is lifted records the
+      // fact but leaves the reading (see noteSessionWindow). With no reset it
+      // would never expire, and with the probe off nothing else clears it, so
+      // a Session row would read 0% for good; a spent one would gate the
+      // account with nothing ever to release it. So it goes. A reading with a
+      // reset still to come is left to that reset: one response is weaker
+      // evidence than the probe.
+      q.unified5h = null;
+      q.unified5hSeenAt = null;
+      // As in the probe path, a rejection the remaining weekly readings do not
+      // explain belonged to the session window just removed.
+      if (q.unifiedStatus === 'rejected' && !this._weeklyExplainsRejection(account)) {
+        q.unifiedStatus = null;
+        q.unifiedStatusSeenAt = null;
+      }
+      changed = true;
     }
     if (q.unified7d != null && q.unified7dReset && now >= q.unified7dReset) {
       console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" weekly quota reset`);
@@ -3733,6 +3936,14 @@ export class AccountManager {
       // so a reading is never discarded before it has had a window to prove out.
       if (!q[seenField]) { q[seenField] = now; continue; }
       if (now < q[seenField] + this.familyStaleMs) continue;
+      // A reading at the operator's cap is different: the cap is a decision,
+      // not an estimate a fresh request could correct, and usage cannot fall
+      // before the window resets. Revalidating it would send a request past the
+      // cap every staleness period, so it holds until its reset clears it above
+      // — or, with no reset known, for one weekly window after it was seen.
+      const cap = this.capFor(key, account);
+      if (cap != null && q[key] >= cap
+        && (q[`${key}Reset`] || now < q[seenField] + CAPPED_FAMILY_HOLD_MS)) continue;
       console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" ${label} weekly reading is stale — revalidating on the next ${label} request`);
       q[key] = null;
       q[`${key}Reset`] = null;
@@ -4091,6 +4302,10 @@ export class AccountManager {
       // neither the executor's nor an advisor's.
       if (model && !this._routeAllows(account, model)) continue;
       if (advisorModel && !this._routeAllows(account, advisorModel)) continue;
+      // Nor one at its cap (or over its spend cap): a lapsed throttle would
+      // otherwise read as the soonest reset and hand a capped account the
+      // request, clearing its throttle on the way. The probe skips these too.
+      if (this.capBars(account, model, advisorModel)) continue;
       const resetTime = account.rateLimitedUntil
         || account.quota.unified5hReset
         || account.quota.unified7dReset
@@ -4159,16 +4374,12 @@ export class AccountManager {
     if (parsed.unified5hReset != null) account.quota.unified5hReset = parsed.unified5hReset;
     if (parsed.unified7dReset != null) account.quota.unified7dReset = parsed.unified7dReset;
 
-    // Whether this subscription meters a session window at all, kept apart from
-    // the reading itself: `unified5h` is nulled the moment its window expires
-    // (_clearExpiredQuotas), so a TUI row keyed on the reading alone would swing
-    // between Ses/Wk and one wide weekly bar every five hours. Only a response
-    // that stated a window says anything — the catalog fetch carries none — and
-    // a weekly window with no 5-hour one beside it is how a subscription that
-    // meters no session window reads (see codex-quota.js). The usage probe
-    // records the same fact in applyCodexUsageData.
-    if (parsed.unified5h != null) account.quota.sessionWindowStated = true;
-    else if (parsed.unified7d != null) account.quota.sessionWindowStated = false;
+    // Whether this subscription meters a session window at all. Only a
+    // response that stated a window says anything — the catalog fetch carries
+    // none — and a weekly window with no 5-hour one beside it is how a
+    // subscription that meters no session window reads (see codex-quota.js).
+    // The usage probe records the same fact in applyCodexUsageData.
+    noteSessionWindow(account.quota, { session: parsed.unified5h != null, weekly: parsed.unified7d != null });
 
     // A model-scoped weekly bucket is the counterpart of Anthropic's `7d_oi`
     // Fable bucket: it rides only on responses for that model, so stamp when
@@ -4216,7 +4427,9 @@ export class AccountManager {
     }
   }
 
-  updateQuota(accountIndex, headers, model = null) {
+  // `httpStatus` is the upstream response's status where the caller has one;
+  // only the session-window inference reads it (see noteSessionWindow below).
+  updateQuota(accountIndex, headers, model = null, httpStatus = null) {
     const account = this.accounts[accountIndex];
     if (!account) return;
 
@@ -4256,6 +4469,32 @@ export class AccountManager {
       account.quota.unified7d = u7d;
       account.quota.unified7dSeenAt = Date.now();
       observed.add('unified7d');
+    }
+    // Kept apart from the reading, which is nulled at every weekly reset (see
+    // noteSessionWindow). A 5-hour window with no 7-day one is a Team seat.
+    if (!isNaN(u7d)) account.quota.weeklyWindowStated = true;
+    else if (!isNaN(u5h)) account.quota.weeklyWindowStated = false;
+    // And the mirror: a 7-day window with no 5-hour one is how an Ultra plan
+    // would read once Anthropic has lifted its 5-hour limit (announced
+    // 2026-10-30, rolling out per account, so one pool holds both shapes; the
+    // header set after the change has not been captured). Only a response that
+    // names the 5-hour window in no header at all counts as saying so: a
+    // status or a reset without its utilization is a partial set, not an
+    // absence. And only on an Anthropic subscription: a third-party backend
+    // answering in these header names says nothing about an Anthropic plan.
+    // Nor does a refusal: a weekly-rejection 429 on a metered account can
+    // carry the 7d headers alone, and taking that as "no 5-hour window" would
+    // drop the Session row and keep-warm, persisted, until the next response
+    // with 5h headers, which on a weekly-exhausted account is days away. So
+    // only a response that was served (status < 400, where the caller knows
+    // it), that names the weekly window but no 5-hour one, and whose overall,
+    // weekly and Fable statuses are none of them rejected may say the window
+    // is gone. A 5-hour reading on any response still says it is there.
+    if (account.type === 'oauth' && !account.upstream) {
+      const namesSession = Object.keys(headers).some(k => k.startsWith('anthropic-ratelimit-unified-5h-'));
+      const refused = (typeof httpStatus === 'number' && httpStatus >= 400)
+        || ['status', '7d-status', '7d_oi-status'].some(k => headers[`anthropic-ratelimit-unified-${k}`] === 'rejected');
+      noteSessionWindow(account.quota, { session: !isNaN(u5h), weekly: !isNaN(u7d) && !namesSession && !refused });
     }
 
     // A reset that does not parse is treated as absent, never stored: parseInt
@@ -4630,6 +4869,24 @@ export class AccountManager {
       }
       if (usage.sevenDay.resetAt != null) q.unified7dReset = usage.sevenDay.resetAt;
     }
+    // The same facts the header path records, from the whole payload at once.
+    if (usage.sevenDay?.utilization != null) q.weeklyWindowStated = true;
+    else if (usage.fiveHour?.utilization != null) q.weeklyWindowStated = false;
+    // Keyed on the utilization, not on the bucket being there: `five_hour`
+    // with a null utilization normalizes to a bucket object that holds no
+    // reading. A weekly reading beside no 5-hour one is how an Ultra plan
+    // would read once its 5-hour limit is lifted (not yet captured live);
+    // today an idle metered account reads 0% with no reset, which is a
+    // reading. Only a payload that states the weekly window may say the
+    // session one is gone, so an error-shaped body proves nothing. Nor does
+    // one that still names the window without a reading: a `five_hour` reset,
+    // or a `session` entry in the `limits` list, is a partial reading, as a
+    // 5-hour reset header without its utilization is on the header path, and
+    // clearing on it could return a spent account to rotation.
+    // Applied after the family buckets below, so whether a weekly reading
+    // still explains a stored rejection is judged on this payload's readings,
+    // not on the ones it is about to replace.
+    const namesSession = usage.fiveHour?.resetAt != null || usage.sessionListed === true;
 
     // The family buckets carry a "last confirmed" stamp (see _clearExpiredQuotas).
     // A probe is upstream evidence just like a response header, so it refreshes
@@ -4679,6 +4936,21 @@ export class AccountManager {
         if (bucket?.utilization != null) observed.add(`scoped:${family}`);
       }
     }
+    // A cleared reading that was holding the account out of rotation returns
+    // it just as its expiry would, so it raises the same session-reset event
+    // the expiry sweep raises when such a reading runs out at its reset (see
+    // _clearExpiredQuotas). Without it, a probe landing before that reset
+    // would bring the account back with no switch rule to move traffic there.
+    const sessionGating = this._sessionReadingGates(account);
+    noteSessionWindow(q, {
+      session: usage.fiveHour?.utilization != null,
+      weekly: usage.sevenDay?.utilization != null && !namesSession,
+      clear: true,
+      rejectionExplained: this._weeklyExplainsRejection(account),
+    });
+    // Typed loosely as at the sweep's own write: the field is set on the
+    // account object at runtime, not declared on its shape.
+    if (sessionGating && q.unified5h == null) /** @type {any} */ (account).sessionResetPending = true;
     // A probe provides fresh utilization points without spending quota itself.
     // Feed only the windows actually present in this payload.
     this._observeBurnRate(account, observed);
@@ -4736,19 +5008,10 @@ export class AccountManager {
       // A read-only reading, so it can close an idle interval (#475).
       if (q.unified7d != null) this._observeOutsideSpend(account, ['unified7d']);
     }
-    // Same sticky fact the header path records; see _updateCodexQuota.
-    if (usage.fiveHour) q.sessionWindowStated = true;
-    else if (usage.sevenDay) {
-      q.sessionWindowStated = false;
-      // The probe reads every limit at once, so its word that a plan has no
-      // session window is what clears a reading left from before a plan
-      // change, which would otherwise keep gating selection until its reset.
-      // The header path does not clear: one response's headers are weaker
-      // evidence of absence than the whole usage payload.
-      q.unified5h = null;
-      q.unified5hReset = null;
-      q.unified5hSeenAt = null;
-    }
+    // Same sticky fact the header path records, and a probe's word that there
+    // is no session window clears a reading left from before a plan change
+    // (see noteSessionWindow).
+    noteSessionWindow(q, { session: !!usage.fiveHour, weekly: !!usage.sevenDay, clear: true });
     if (usage.planType) q.planType = safeLine(usage.planType, 64);
     // Stamped, because nothing else refreshes it: a payload that mentions no
     // credits leaves the last reading alone rather than blanking it, so the
@@ -4823,6 +5086,35 @@ export class AccountManager {
   }
 
   /**
+   * Whether a weekly reading still on the account is at its switch threshold,
+   * and so could be what a stored `rejected` verdict is about: the shared
+   * weekly, or a family bucket (a family-cap 429 that named no shared status
+   * stores `rejected` too). Read when a probe clears a session reading on a
+   * plan with no session window (see noteSessionWindow).
+   * @param {any} account
+   */
+  _weeklyExplainsRejection(account) {
+    const q = account.quota;
+    return ['unified7d', 'unified7dSonnet', 'unified7dFable']
+      .some(key => q[key] != null && q[key] >= this.thresholdFor(key, account));
+  }
+
+  /**
+   * Whether the account's 5-hour reading is what holds it out of rotation: at
+   * its switch threshold, or at its `maxUsage` cap. A falsy `maxUsage` is no
+   * cap, as in capExceeded, though capFor reads a bare 0 as one. Shared by the
+   * two paths that remove such a reading on a plan with no session window.
+   * @param {any} account
+   */
+  _sessionReadingGates(account) {
+    const u = account.quota.unified5h;
+    if (u == null) return false;
+    if (u >= this.thresholdFor('unified5h', account)) return true;
+    const cap = account.maxUsage ? this.capFor('unified5h', account) : null;
+    return cap != null && u >= cap;
+  }
+
+  /**
    * Drop a stored upstream `rejected` verdict after live proof it no longer
    * binds — a usage-limit reset that landed. A quota re-read does not touch the
    * verdict, so without this the account would read `upstream-rejected` until
@@ -4831,7 +5123,10 @@ export class AccountManager {
    */
   clearUpstreamRejected(accountIndex) {
     const account = this.accounts[accountIndex];
-    if (!account || account.quota.unifiedStatus !== 'rejected') return;
+    if (!account) return;
+    // The spent reading a fixed seat answers from (IPM fork) goes with it.
+    clearSeatRejection(account);
+    if (account.quota.unifiedStatus !== 'rejected') return;
     account.quota.unifiedStatus = null;
     account.quota.unifiedStatusSeenAt = null;
     console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" upstream rejection cleared — it no longer applies`);
@@ -4875,6 +5170,12 @@ export class AccountManager {
       }
       return;
     }
+
+    // The token endpoint answered 429: leave it alone until it said to come back
+    // (or REFRESH_429_HOLD_MS when it did not say), forced or not. Without this a
+    // request with an expired token asks once, its 401 forces another, and its
+    // retry a third — every one of them refused, each one making it worse.
+    if (account._refreshHeldUntil && Date.now() < account._refreshHeldUntil) return;
 
     if (!force && !isTokenExpiringSoon(account.expiresAt)) return;
 
@@ -4939,12 +5240,17 @@ export class AccountManager {
         account.expiresAt = newTokens.expiresAt;
         account._lastRefreshAt = Date.now();
         account._deadRefreshToken = null; // this token works; clear any stale guard
+        account._refreshHeldUntil = null;
+        account._lastRefreshFailure = null;
         // Set before the listener runs: it is what lets the sync store them.
         account._minted = minted;
         console.log(`[TeamClaude] Token refreshed for account "${safeLine(account.name, 64)}"`);
         this._onTokenRefresh?.(accountIndex, newTokens);
       } catch (/** @type {any} */ err) {
         console.error(`[TeamClaude] Token refresh failed for "${safeLine(account.name, 64)}": ${err.message}`);
+        // Why, until a refresh succeeds: what the client is told when this
+        // account then fails its request (the coordinator's reason, a 429).
+        account._lastRefreshFailure = { at: Date.now(), reason: safeLine(String(err?.message || err), 300), status: err?.status };
         // The refresh never reached the token endpoint: the account's own
         // routing proxy is down. The forward that follows would fail the same
         // way, so hold the account out of rotation now rather than after it.
@@ -4955,6 +5261,12 @@ export class AccountManager {
         // transient failure (network, 5xx, timeout) must NOT sideline a healthy
         // account: keep its current token and retry on the next request. This is
         // what kept accounts wrongly "errored" after a momentary refresh blip.
+        if (err.status === 429) {
+          const holdMs = Number.isFinite(err.retryAfterMs) ? err.retryAfterMs : REFRESH_429_HOLD_MS;
+          const until = Date.now() + holdMs;
+          account._refreshHeldUntil = until;
+          console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}": the token endpoint asked to wait (429); no refresh before ${new Date(until).toISOString()}`);
+        }
         const isAuthRejection = err.status === 400 || err.status === 401 || err.status === 403;
         if (isAuthRejection) {
           // Remember WHICH token was rejected so we stop re-sending it (see the
@@ -5081,6 +5393,8 @@ export class AccountManager {
     account.expiresAt = expiresAt;
     // Tokens from elsewhere (the store, a reload from disk) were not minted here.
     account._minted = false;
+    // A failed renewal of the tokens these replace no longer explains anything.
+    account._lastRefreshFailure = null;
     if (account.status === 'error') account.status = 'active';
     console.log(`[TeamClaude] Updated tokens for account "${safeLine(account.name, 64)}"`);
     this._onTokenRefresh?.(accountIndex, {
@@ -5273,6 +5587,10 @@ export class AccountManager {
       advisorNarrowing: this._advisorNarrowing ? { ...this._advisorNarrowing } : null,
       routes: this.getRoutes(),
       sessions: { ...sessions, distribute: this.distributeSessions, mode: this.distributionMode, draining: this.drainingCount() },
+      // Operator session pins, so a session held on one account is never a
+      // mystery. Session ids are shortened unless sessionDetail is on, as the
+      // rest of the session readout withholds them.
+      sessionPins: this.sessionPins.list({ detail: sessionDetail }),
       // Empty outside adaptive mode, so the renderer needs no mode check of its
       // own and an older client simply sees nothing extra.
       adaptive: this._adaptiveStatsCached(),
@@ -5282,6 +5600,10 @@ export class AccountManager {
         provider: providerOf(a),
         orgName: a.orgName || null,
         priority: a.priority || 0,
+        // Requests forwarded to this account in the last LOAD_WINDOW_MS: the
+        // load mode's placement input, reported in every mode so an operator
+        // can see the skew before switching to it.
+        recentRequests: this.sessionTracker.recentRequestsFor(a.index),
         // The attached TUI spreads these fields onto its own account objects
         // and sorts its rows by this one, so without it `teamclaude attach`
         // draws array order beside a server TUI drawing the arrangement.

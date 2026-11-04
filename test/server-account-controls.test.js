@@ -243,7 +243,8 @@ test('status reports the caller, and its refused list is what the gate refuses',
     const client = await status({ 'x-api-key': CLIENT_KEY });
     assert.equal(client.kind, 'client');
     assert.equal(client.client, 'ci');
-    assert.deepEqual([...client.refused].sort(), ['/teamclaude/disable', '/teamclaude/priority', '/teamclaude/threshold']);
+    // /teamclaude/switch is refused to client keys in the IPM fork (client-routes.js).
+    assert.deepEqual([...client.refused].sort(), ['/teamclaude/disable', '/teamclaude/priority', '/teamclaude/session-pin', '/teamclaude/switch', '/teamclaude/threshold']);
     for (const path of client.refused) {
       const res = await post(port, path, {}, { 'x-api-key': CLIENT_KEY });
       assert.equal(res.status, 403, path);

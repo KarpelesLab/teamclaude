@@ -4,7 +4,7 @@ import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { resolveUpstreamProxy, setUpstreamProxy } from './upstream-proxy.js';
-import { ensureAccountIds } from './account-id.js';
+import { ensureAccountIds, accountIdsComplete } from './account-id.js';
 import { envVar, NAME, LEGACY_NAME } from './brand.js';
 
 export function getConfigPath() {
@@ -283,6 +283,8 @@ export function withConfigLock(configPath, fn) {
 
 export async function saveConfig(config) {
   const path = getConfigPath();
+  // Every row leaves with an id; see atomicConfigUpdate.
+  ensureAccountIds(config.accounts);
   // The proxy apiKey and every account's tokens live here: see writeJsonAtomic
   // for why this is not a plain writeFile.
   await withConfigLock(path, () => writeJsonAtomic(path, config));
@@ -300,7 +302,40 @@ export function atomicConfigUpdate(updater) {
   return withConfigLock(path, async () => {
     const config = await loadConfig() || createDefaultConfig();
     await updater(config);
+    // A row the updater added (a login, an API key, an import) is written with
+    // its id, minted here rather than by every reader. A row written without
+    // one is given a fresh id by each read: the running server pairs its token
+    // writes by id, so the id it minted on reload matched no row on disk, and
+    // the account's refreshed tokens were never saved (#564).
+    ensureAccountIds(config.accounts);
     await writeJsonAtomic(path, config);
+    return config;
+  });
+}
+
+/**
+ * loadConfig, with any entry id it had to mint written back to the file before
+ * the config is handed out. null when there is no file.
+ *
+ * For a reader that builds running accounts from what it loads: a running
+ * account keeps its entry's id, and every token write pairs it with its row by
+ * that id. A row the file holds without one (a hand edit, an older CLI) would
+ * get a different id on each read, and the account built from it would find no
+ * row to save to. Under the config lock, so no writer lands between the read
+ * and the write; a file that already carries every id is not rewritten.
+ */
+export function loadConfigPersistingIds() {
+  const path = getConfigPath();
+  return withConfigLock(path, async () => {
+    let raw;
+    try {
+      raw = JSON.parse(await readFile(path, 'utf-8'));
+    } catch (err) {
+      if (/** @type {any} */ (err).code === 'ENOENT') return null;
+      throw err;
+    }
+    const config = await loadConfig();
+    if (config && !accountIdsComplete(raw?.accounts)) await writeJsonAtomic(path, config);
     return config;
   });
 }

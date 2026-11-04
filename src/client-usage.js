@@ -63,7 +63,7 @@ export const USAGE_WINDOWS = { '5h': 5 * 60 * 60 * 1000, '24h': 24 * 60 * 60 * 1
 // a number an operator reads to decide whether they are near a limit.
 const RETAINED_SLOTS = Math.ceil(Math.max(...Object.values(USAGE_WINDOWS)) / USAGE_SLOT_MS) + 1;
 
-/** @typedef {{ requests: number, connections: number, inputTokens: number, outputTokens: number }} UsageCounters */
+/** @typedef {{ requests: number, connections: number, inputTokens: number, outputTokens: number, cacheReadTokens: number, cacheCreationTokens: number }} UsageCounters */
 /** @typedef {UsageCounters & { lastUsed: number | null, slots: Map<number, UsageCounters> }} ClientRecord */
 
 const RESERVED_CUSTOM_HEADER_NAMES = new Set([
@@ -98,20 +98,22 @@ export class ClientUsageTracker {
     let c = this.clients.get(name);
     if (!c) {
       if (this.clients.size >= this.maxKeys && name !== OVERFLOW_KEY) return this._ensure(OVERFLOW_KEY);
-      c = { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0, lastUsed: null, slots: new Map() };
+      c = { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0, lastUsed: null, slots: new Map() };
       this.clients.set(name, c);
     }
     return c;
   }
 
   /** Book usage against a client name. A null/empty name is dropped (unattributed). */
-  record(name, { requests = 0, connections = 0, inputTokens = 0, outputTokens = 0 } = {}) {
+  record(name, { requests = 0, connections = 0, inputTokens = 0, outputTokens = 0, cacheReadTokens = 0, cacheCreationTokens = 0 } = {}) {
     if (!name) return;
     const c = this._ensure(name);
     c.requests += requests;
     c.connections += connections;
     c.inputTokens += inputTokens;
     c.outputTokens += outputTokens;
+    c.cacheReadTokens += cacheReadTokens;
+    c.cacheCreationTokens += cacheCreationTokens;
     c.lastUsed = this._now();
     // Eviction runs only when this write opens a new slot, and against the
     // same clock reading as lastUsed: a second read of the clock could land
@@ -124,6 +126,8 @@ export class ClientUsageTracker {
     slot.connections += connections;
     slot.inputTokens += inputTokens;
     slot.outputTokens += outputTokens;
+    slot.cacheReadTokens += cacheReadTokens;
+    slot.cacheCreationTokens += cacheCreationTokens;
   }
 
   /**
@@ -159,7 +163,7 @@ export class ClientUsageTracker {
    */
   _slotFor(c, slot) {
     let tally = c.slots.get(slot);
-    if (!tally) c.slots.set(slot, tally = { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0 });
+    if (!tally) c.slots.set(slot, tally = { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 });
     return tally;
   }
 
@@ -180,7 +184,7 @@ export class ClientUsageTracker {
     /** @type {Array<[number, UsageCounters]>} */
     const cutoffs = [];
     for (const [label, span] of Object.entries(USAGE_WINDOWS)) {
-      out[label] = { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0 };
+      out[label] = { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 };
       cutoffs.push([Math.floor((now - span) / USAGE_SLOT_MS), out[label]]);
     }
     for (const [slot, t] of c.slots) {
@@ -190,6 +194,8 @@ export class ClientUsageTracker {
         sum.connections += t.connections;
         sum.inputTokens += t.inputTokens;
         sum.outputTokens += t.outputTokens;
+        sum.cacheReadTokens += t.cacheReadTokens;
+        sum.cacheCreationTokens += t.cacheCreationTokens;
       }
     }
     return out;
@@ -213,7 +219,7 @@ export class ClientUsageTracker {
       // branches that are silent for good, and they were the bulk of the
       // payload. A reader that finds no `windows` reads zero for every window,
       // which is what the absence means.
-      return Object.values(windows).some(w => w.requests || w.connections || w.inputTokens || w.outputTokens)
+      return Object.values(windows).some(w => w.requests || w.connections || w.inputTokens || w.outputTokens || w.cacheReadTokens || w.cacheCreationTokens)
         ? { windows }
         : {};
     });
@@ -249,6 +255,8 @@ export class ClientUsageTracker {
         connections: c.connections,
         inputTokens: c.inputTokens,
         outputTokens: c.outputTokens,
+        cacheReadTokens: c.cacheReadTokens,
+        cacheCreationTokens: c.cacheCreationTokens,
         lastUsed: c.lastUsed ? new Date(c.lastUsed).toISOString() : null,
         ...extra(c),
       };
@@ -272,6 +280,8 @@ export class ClientUsageTracker {
       c.connections += Number(s.connections) || 0;
       c.inputTokens += Number(s.inputTokens) || 0;
       c.outputTokens += Number(s.outputTokens) || 0;
+      c.cacheReadTokens += Number(s.cacheReadTokens) || 0;
+      c.cacheCreationTokens += Number(s.cacheCreationTokens) || 0;
       const t = s.lastUsed ? Date.parse(s.lastUsed) : NaN;
       if (!Number.isNaN(t) && (c.lastUsed == null || t > c.lastUsed)) c.lastUsed = t;
       this._restoreSlots(c, s.slots);
@@ -306,6 +316,8 @@ export class ClientUsageTracker {
       tally.connections += Number(t.connections) || 0;
       tally.inputTokens += Number(t.inputTokens) || 0;
       tally.outputTokens += Number(t.outputTokens) || 0;
+      tally.cacheReadTokens += Number(t.cacheReadTokens) || 0;
+      tally.cacheCreationTokens += Number(t.cacheCreationTokens) || 0;
     }
   }
 }
@@ -430,10 +442,11 @@ export function createUsageRecorder({ client, clientUsage, dimensions, dimension
         else target.tracker.record(target.key, { requests: 1 });
       }
     },
-    onUsage(inputTokens, outputTokens) {
+    onUsage(inputTokens, outputTokens, cacheReadTokens = 0, cacheCreationTokens = 0) {
+      const usage = { inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens };
       for (const target of targets) {
-        if (target.dimension) target.tracker.record(target.dimension, target.key, { inputTokens, outputTokens });
-        else target.tracker.record(target.key, { inputTokens, outputTokens });
+        if (target.dimension) target.tracker.record(target.dimension, target.key, usage);
+        else target.tracker.record(target.key, usage);
       }
     },
   };

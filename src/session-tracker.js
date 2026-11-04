@@ -53,6 +53,14 @@ const SWEEP_INTERVAL_MS = 60 * 1000; // bound growth without an external timer
 // bounding: the entries exist to hold a pin and a prompt cache each, and a
 // client with ten thousand live conversations has bigger problems than this map.
 export const MAX_SESSIONS = 10_000;
+// The window `recentRequestsFor` counts over: long enough that a lane's turn
+// cadence (one request every few seconds while it works, none while it thinks)
+// averages out, short enough that a session that went quiet stops weighing on
+// its account's placement score within the time a new session would notice.
+export const LOAD_WINDOW_MS = 10 * 60 * 1000;
+// Bound on the routed-request ring, independent of MAX_SESSIONS: a fleet of
+// 40 lanes at one request every 10 s is 2,400 entries per window.
+export const MAX_ROUTED = 50_000;
 export const MAX_SESSION_ID_LENGTH = 128;
 // The session id, the separator and the digest conversation.js appends. Bounded
 // rather than derived from that module so the tracker's own guard does not
@@ -149,6 +157,16 @@ function setAndReturn(map, key, value) {
  * @property {string|null} provider the fleet whose reading this is
  * @property {Map<string, number>|null} handedBack the account's windows as they stood when a hold handed this reading back, so the roll it was handed back for is not held again; null once the reading moves
  */
+/**
+ * A disclosed, one-shot choice to continue a conversation on a sibling seat.
+ * The exact rejection is part of the scope: a later quota verdict is a new
+ * choice, not permission left over from this one.
+ *
+ * @typedef {Object} SeatContinuation
+ * @property {number} idx the rejected account's position in the account list
+ * @property {number} at when that rejection was recorded
+ * @property {number} resetsAt when its quota window resets
+ */
 export class SessionTracker {
   /**
    * @param {Object} [opts]
@@ -157,6 +175,13 @@ export class SessionTracker {
    * @param {() => number} [opts.now]
    */
   constructor({ knownTtlMs, activeTtlMs, now } = {}) {
+    // Requests routed per account, oldest first: [timestamp, accountIndex],
+    // with a running count per account so a read is O(1) after the prune.
+    // Fed by noteRouted() from recordSession(), read by recentRequestsFor().
+    /** @type {Array<[number, number]>} */
+    this._routed = [];
+    /** @type {Map<number, number>} */
+    this._routedCounts = new Map();
     // id -> { pins: Map<bucketKey, { idx, at }>,
     //         refs: Map<bucketKey, Observation>,
     //         firstSeen, lastSeen, count, inFlight, tokens: Map<bucketKey, ...> }
@@ -421,6 +446,9 @@ export class SessionTracker {
       this._makeRoom(now);
       s = {
         pins: new Map(), refs: new Map(), firstSeen: now, lastSeen: now, count: 0, inFlight: 0,
+        // client + route + bucket -> SeatContinuation. One disclosed choice per
+        // scope; a newer handoff response replaces the older one.
+        seatContinuations: new Map(),
         // bucket -> emptyTokens(). On the session's own record rather than in a
         // map beside it, so there is one lifetime and one eviction policy for
         // everything scoped to a session: a second map keyed by session id would
@@ -503,6 +531,44 @@ export class SessionTracker {
   }
 
   /**
+   * Record that the client was told a fresh session is recommended, but that
+   * another prompt in this conversation confirms a cold-cache continuation.
+   * Never create a session here: a refusal for an unknown conversation has no
+   * pin against which a later request could safely consume the offer.
+   * @param {string|null} sessionId
+   * @param {{client: string, route: string, bucket: string, idx: number, at: number, resetsAt: number}} scope
+   * @param {number} [now]
+   */
+  recordSeatContinuation(sessionId, scope, now = this._now()) {
+    const s = sessionId && this._live(sessionId, now);
+    if (!s || !scope?.client || !scope.route || !scope.bucket
+        || !Number.isInteger(scope.idx) || !Number.isFinite(scope.at) || !Number.isFinite(scope.resetsAt)) return false;
+    const key = `${scope.client.trim().toLowerCase()}\0${scope.route}\0${scope.bucket}`;
+    s.seatContinuations.set(key, { idx: scope.idx, at: scope.at, resetsAt: scope.resetsAt });
+    return true;
+  }
+
+  /**
+   * Take is synchronous and one-shot, so two concurrent continuations cannot
+   * both spend the same disclosure. The caller supplies the live pin/rejection
+   * it validated; any mismatch consumes the stale offer and fails closed.
+   * @param {string|null} sessionId
+   * @param {{client: string, route: string, bucket: string, idx: number, at: number, resetsAt: number}} scope
+   * @param {number} [now]
+   */
+  takeSeatContinuation(sessionId, scope, now = this._now()) {
+    const s = sessionId && this._live(sessionId, now);
+    if (!s || !scope?.client || !scope.route || !scope.bucket) return null;
+    const key = `${scope.client.trim().toLowerCase()}\0${scope.route}\0${scope.bucket}`;
+    const offer = s.seatContinuations.get(key);
+    if (!offer) return null;
+    s.seatContinuations.delete(key);
+    if (offer.resetsAt <= now
+        || offer.idx !== scope.idx || offer.at !== scope.at || offer.resetsAt !== scope.resetsAt) return null;
+    return offer;
+  }
+
+  /**
    * The rollover observation this session holds for `bucket`: the account
    * traffic was last found resting on and what its windows read then. Kept
    * beside the pin rather than on it because it outlives a relocation — a pin
@@ -579,6 +645,11 @@ export class SessionTracker {
         if (moved == null) s.pins.delete(bucket);
         else pin.idx = moved;
       }
+      for (const [key, offer] of [...s.seatContinuations]) {
+        const moved = mapFn(offer.idx);
+        if (moved == null) s.seatContinuations.delete(key);
+        else offer.idx = moved;
+      }
       // An observation names its account by the same position, so it follows the
       // same shift. One naming the account that went away is dropped only if it
       // holds nothing. Left behind it would be read against whatever inherits
@@ -598,6 +669,17 @@ export class SessionTracker {
         ref.unescaped = held;
       }
     }
+    // The routed ring follows the same shift; a removed account's entries go.
+    /** @type {Array<[number, number]>} */
+    const routed = [];
+    this._routedCounts = new Map();
+    for (const [at, idx] of this._routed) {
+      const moved = mapFn(idx);
+      if (moved == null) continue;
+      routed.push([at, moved]);
+      this._routedCounts.set(moved, (this._routedCounts.get(moved) || 0) + 1);
+    }
+    this._routed = routed;
   }
 
   // Does this pin count as load on `accountIndex` right now? A pin outlives the
@@ -628,6 +710,51 @@ export class SessionTracker {
     return out;
   }
 
+  /** Record that a request was routed to an account. One entry per forward
+   * decision, which is what the proxy charges upstream, so the count is in the
+   * unit the account's rate limits are in. Pruned to LOAD_WINDOW_MS on read and
+   * capped at MAX_ROUTED on write (oldest dropped), so the ring is bounded even
+   * when nothing reads it.
+   * @param {number|null|undefined} accountIndex
+   * @param {number} [now] */
+  noteRouted(accountIndex, now = this._now()) {
+    if (accountIndex == null) return;
+    this._routed.push([now, accountIndex]);
+    this._routedCounts.set(accountIndex, (this._routedCounts.get(accountIndex) || 0) + 1);
+    if (this._routed.length > MAX_ROUTED) this._dropRouted(this._routed.length - MAX_ROUTED);
+  }
+
+  /** Requests routed to `accountIndex` within the last LOAD_WINDOW_MS. The
+   * load an account is actually carrying, as opposed to activeCountFor's
+   * session count: a lane that fires a request every ten seconds and a TUI
+   * that fires one a minute are both one session, and the difference between
+   * them is what this measures.
+   * @param {number} accountIndex
+   * @param {number} [now] */
+  recentRequestsFor(accountIndex, now = this._now()) {
+    this._pruneRouted(now);
+    return this._routedCounts.get(accountIndex) || 0;
+  }
+
+  // Drop entries older than the window. Entries are appended in time order,
+  // so the stale ones are a prefix.
+  /** @param {number} now */
+  _pruneRouted(now) {
+    const cutoff = now - LOAD_WINDOW_MS;
+    let i = 0;
+    while (i < this._routed.length && this._routed[i][0] < cutoff) i += 1;
+    if (i > 0) this._dropRouted(i);
+  }
+
+  // Remove the oldest `n` entries, keeping the per-account counts in step.
+  /** @param {number} n */
+  _dropRouted(n) {
+    for (const [, idx] of this._routed.splice(0, n)) {
+      const left = (this._routedCounts.get(idx) || 1) - 1;
+      if (left > 0) this._routedCounts.set(idx, left); else this._routedCounts.delete(idx);
+    }
+  }
+
   // Active sessions currently pinned to `accountIndex` — the load metric used to
   // spread new sessions across accounts. Counts in-flight sessions regardless of
   // how long their request has been streaming. A session spending two accounts
@@ -653,8 +780,39 @@ export class SessionTracker {
     return ids;
   }
 
+  // Whether a client session with this id has made a request within the known
+  // window. Records are keyed by conversation, so it is matched against the
+  // session id each one carries, and against the key for one that names no
+  // conversation. A scan, for the control plane only: never on the request path.
+  /** @param {string|null} sessionId */
+  knowsSession(sessionId, now = this._now()) {
+    if (!sessionId) return false;
+    for (const [id, s] of this.sessions) {
+      if (this._isExpired(s, now)) continue;
+      if (id === sessionId || s.sessionId === sessionId) return true;
+    }
+    return false;
+  }
+
+  // The client keys seen on a client session within the known window (IPM
+  // fork: an operator session pin is bound to one of them, session-pins.js).
+  // A scan, for the control plane only, like knowsSession.
+  /** @param {string|null} sessionId @returns {Set<string>} */
+  clientsOf(sessionId, now = this._now()) {
+    const out = new Set();
+    if (!sessionId) return out;
+    for (const [id, s] of this.sessions) {
+      if (this._isExpired(s, now)) continue;
+      if (id !== sessionId && s.sessionId !== sessionId) continue;
+      if (s.client) out.add(s.client);
+      for (const c of s.clientsSeen || []) out.add(c);
+    }
+    return out;
+  }
+
   // Drop sessions idle longer than the known window (but never one still in flight).
   sweep(now = this._now()) {
+    this._pruneRouted(now);
     this._lastSweep = now;
     for (const [id, s] of this.sessions) {
       if (this._isExpired(s, now)) this.sessions.delete(id);
@@ -784,7 +942,13 @@ function sessionItem(id, s, active) {
 // existing label alone, so a request without the header does not erase it.
 function applyMetadata(s, metadata) {
   if (!metadata || typeof metadata !== 'object') return;
-  if (typeof metadata.client === 'string' && metadata.client) s.client = metadata.client;
+  if (typeof metadata.client === 'string' && metadata.client) {
+    s.client = metadata.client;
+    // Every key seen on the record, not just the last (IPM fork): an operator
+    // session pin is bound to one key, and a session id two keys have sent
+    // must not be bound to whichever spoke last (see clientsOf).
+    (s.clientsSeen ??= new Set()).add(metadata.client);
+  }
   if (typeof metadata.sessionId === 'string' && metadata.sessionId) s.sessionId = metadata.sessionId;
   if (typeof metadata.conversation === 'string' && metadata.conversation) s.conversation = metadata.conversation;
   const dims = metadata.dimensions;

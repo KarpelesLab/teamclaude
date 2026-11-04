@@ -281,6 +281,48 @@ test('remapAccounts renumbers pins above a removal and drops those on it', () =>
   assert.equal(st.pinnedAccount('s2', SHARED, clock.t), null, 'on it, dropped');
 });
 
+test('a seat continuation is scoped, case-insensitive for the client, and consumed once', () => {
+  const { clock, now } = fixedClock();
+  const st = new SessionTracker({ now });
+  const scope = { client: 'Alice', route: 'seat-q', bucket: SHARED, idx: 2, at: 50, resetsAt: clock.t + 1000 };
+  assert.equal(st.recordSeatContinuation('unknown', scope, clock.t), false, 'an unknown session is not resurrected');
+  st.touch('s1', 2, SHARED, clock.t);
+  assert.equal(st.recordSeatContinuation('s1', scope, clock.t), true);
+  assert.equal(st.takeSeatContinuation('s1', { ...scope, client: 'bob' }, clock.t), null, 'another client cannot take it');
+  assert.equal(st.takeSeatContinuation('s1', { ...scope, route: 'other' }, clock.t), null, 'another route cannot take it');
+  assert.equal(st.takeSeatContinuation('s1', { ...scope, bucket: FABLE }, clock.t), null, 'another bucket cannot take it');
+  assert.deepEqual(st.takeSeatContinuation('s1', { ...scope, client: 'ALICE' }, clock.t), { idx: 2, at: 50, resetsAt: clock.t + 1000 });
+  assert.equal(st.takeSeatContinuation('s1', scope, clock.t), null, 'the second take has nothing left');
+});
+
+test('a seat continuation must match the live account and exact rejection', () => {
+  const { clock, now } = fixedClock();
+  const st = new SessionTracker({ now });
+  const scope = { client: 'alice', route: 'seat-q', bucket: SHARED, idx: 2, at: 50, resetsAt: clock.t + 1000 };
+  st.touch('s1', 2, SHARED, clock.t);
+  for (const mismatch of [{ idx: 1 }, { at: 51 }, { resetsAt: scope.resetsAt + 1 }]) {
+    assert.equal(st.recordSeatContinuation('s1', scope, clock.t), true);
+    assert.equal(st.takeSeatContinuation('s1', { ...scope, ...mismatch }, clock.t), null);
+    assert.equal(st.takeSeatContinuation('s1', scope, clock.t), null, 'a mismatch consumes the stale offer');
+  }
+});
+
+test('seat continuations expire and follow account remapping', () => {
+  const { clock, now } = fixedClock();
+  const st = new SessionTracker({ now });
+  const scope = { client: 'alice', route: 'seat-q', bucket: SHARED, idx: 2, at: 50, resetsAt: clock.t + 1000 };
+  st.touch('s1', 2, SHARED, clock.t);
+  st.touch('s2', 1, SHARED, clock.t);
+  st.recordSeatContinuation('s1', scope, clock.t);
+  st.recordSeatContinuation('s2', { ...scope, idx: 1 }, clock.t);
+  st.remapAccounts(idx => (idx === 1 ? null : idx > 1 ? idx - 1 : idx));
+  assert.deepEqual(st.takeSeatContinuation('s1', { ...scope, idx: 1 }, clock.t), { idx: 1, at: 50, resetsAt: scope.resetsAt });
+  assert.equal(st.takeSeatContinuation('s2', { ...scope, idx: 1 }, clock.t), null, 'the removed account drops its offer');
+  st.recordSeatContinuation('s1', scope, clock.t);
+  clock.t = scope.resetsAt;
+  assert.equal(st.takeSeatContinuation('s1', scope, clock.t), null, 'the quota window has reset');
+});
+
 test('stats reports known, active, and per-account active distribution', () => {
   const { clock, now } = fixedClock();
   const st = new SessionTracker({ now });

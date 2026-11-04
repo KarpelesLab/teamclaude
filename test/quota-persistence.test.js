@@ -48,7 +48,7 @@ test('adaptive burn and concurrency learning survive an identity-matched restart
 test('quota survives an export → restore round-trip', () => {
   const am1 = new AccountManager([oauth('a', { accountUuid: 'p1', orgUuid: 'o1' })], 0.98);
   const future = Date.now() + 3600_000;
-  Object.assign(am1.accounts[0].quota, { unified5h: 0.3, unified7d: 0.6, unified7dReset: future });
+  Object.assign(am1.accounts[0].quota, { unified5h: 0.3, unified7d: 0.6, unified7dReset: future, sessionWindowStated: true, weeklyWindowStated: false });
 
   const am2 = new AccountManager([oauth('a', { accountUuid: 'p1', orgUuid: 'o1' })], 0.98);
   am2.restoreQuotaState(am1.exportQuotaState());
@@ -56,6 +56,8 @@ test('quota survives an export → restore round-trip', () => {
   assert.equal(am2.accounts[0].quota.unified5h, 0.3);
   assert.equal(am2.accounts[0].quota.unified7d, 0.6);
   assert.equal(am2.accounts[0].quota.unified7dReset, future);
+  assert.equal(am2.accounts[0].quota.sessionWindowStated, true);
+  assert.equal(am2.accounts[0].quota.weeklyWindowStated, false);
   assert.equal(am2.accounts[0].probing, false); // weekly window known → not probing
 });
 

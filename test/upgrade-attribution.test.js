@@ -84,7 +84,7 @@ test('a handshake authenticated with a client key is booked as that client\'s co
       // Asserted in full rather than skipped: the window must book the
       // handshake exactly as the lifetime counters do — as a connection, and
       // still not as a request.
-      const booked = { requests: 0, connections: 1, inputTokens: 0, outputTokens: 0 };
+      const booked = { requests: 0, connections: 1, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 };
       assert.deepEqual(tracker.export().alice, {
         ...booked,
         lastUsed: tracker.export().alice.lastUsed,

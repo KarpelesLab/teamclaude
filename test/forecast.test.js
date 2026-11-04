@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
 import { BurnRateLearner } from '../src/adaptive-distribution.js';
-import { forecastWindow } from '../src/forecast.js';
+import { forecastWindow, FORECAST_HORIZON_MS } from '../src/forecast.js';
 import { forecastText, renderStatus } from '../src/status-renderer.js';
 import { renderDashboardHtml } from '../src/dashboard.js';
 
@@ -29,8 +29,9 @@ test('at 1% an hour from 50%, a 98% threshold is 48h away', () => {
 });
 
 test('a reach past the reset is still reported; the reader decides it is the good case', () => {
-  const f = forecastWindow({ utilization: 0.5, threshold: 0.98, ratePerMs: 0.001 / HOUR, resetAt: NOW + DAY, now: NOW });
-  assert.ok(f.reachesThresholdAt > NOW + DAY);
+  // 0.48 left at 0.5% an hour: 4 days, past the 1-day reset and inside the horizon.
+  const f = forecastWindow({ utilization: 0.5, threshold: 0.98, ratePerMs: 0.005 / HOUR, resetAt: NOW + DAY, now: NOW });
+  assert.equal(f.reachesThresholdAt, NOW + 4 * DAY);
 });
 
 test('no learned rate: every derived field is null, the threshold and reset stay', () => {
@@ -225,4 +226,31 @@ test('a scoped family with no stamp of its own is anchored at the learner readin
 test('reach and reset that round alike still say the threshold comes first', () => {
   assert.equal(forecastText({ unified7d: { ratePerHour: 0.01, threshold: 0.98, reachesThresholdAt: NOW + 52 * HOUR, resetAt: NOW + 52 * HOUR + 10 * 60_000 } }, NOW),
     'week reaches 98% in ~2d4h, just before it resets');
+});
+
+// The learner's rate decays toward zero on an idle account and never reaches
+// it. Divided into the headroom, such a rate gave a reach time centuries out,
+// or past the largest valid Date (1.6e-89 an hour, seen on a live idle
+// account, gave about 6.5e93 ms, which `new Date()` turns into NaN).
+test('an almost-zero rate reports no reach time, never an invalid date', () => {
+  const f = forecastWindow({ utilization: 0.2, threshold: 0.99, ratePerMs: 1.6e-89 / HOUR, resetAt: NOW + 3 * DAY, now: NOW });
+  assert.equal(f.reachesThresholdAt, null);
+  assert.ok(f.ratePerHour > 0, 'the rate itself is still reported');
+});
+
+test('the horizon: 14 days ahead is reported, a millisecond more is not', () => {
+  const left = 0.99 - 0.2;
+  const atHorizon = forecastWindow({ utilization: 0.2, threshold: 0.99, ratePerMs: left / FORECAST_HORIZON_MS, resetAt: NOW + 3 * DAY, now: NOW });
+  assert.equal(atHorizon.reachesThresholdAt, NOW + FORECAST_HORIZON_MS);
+  const past = forecastWindow({ utilization: 0.2, threshold: 0.99, ratePerMs: left / (FORECAST_HORIZON_MS + 1), resetAt: NOW + 3 * DAY, now: NOW });
+  assert.equal(past.reachesThresholdAt, null);
+  assert.equal(FORECAST_HORIZON_MS, 14 * DAY);
+});
+
+test('the horizon is measured from now, so an old reading is not cut short', () => {
+  // Read 2 days ago; 15 days from the reading is 13 days from now: kept.
+  const left = 0.99 - 0.2;
+  const seenAt = NOW - 2 * DAY;
+  const f = forecastWindow({ utilization: 0.2, threshold: 0.99, ratePerMs: left / (15 * DAY), resetAt: NOW + 3 * DAY, seenAt, now: NOW });
+  assert.equal(f.reachesThresholdAt, seenAt + 15 * DAY);
 });

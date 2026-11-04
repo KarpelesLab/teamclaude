@@ -9,8 +9,13 @@ import { patchAccountUuid } from './account-uuid-rewrite.js';
 import { sanitizeToolPairs } from './tool-pair-sanitize.js';
 import { sanitizeCacheControl, cacheControlSubfieldsToStrip } from './cache-control-sanitize.js';
 import { sanitizeContentBlocks, contentBlockTypesToStrip } from './content-block-sanitize.js';
+import { refusalFromSseEvent, refusalFromBody, reportRefusal } from './refusal-watch.js';
+import { upstreamErrorFromBody, reportUpstreamError } from './upstream-error-tap.js';
+import { stampGatewayUser } from './user-identity.js';
+import { SEAT_REASONS, clientRoutePolicyActive, routeForClient, resolveClientRoute, seatVerdict, combineVerdicts, seatAnswer, verdictReason, recordSeatRejection, clearSeatRejection, clientRoutesStatus, callerSeat, nextInSeatQueue, nextInSeatQueueIndex, parseSeatPolicies } from './client-routes.js';
 import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
-import { TopLevelFieldFinder, modelGlobMatches, parseRequestEffort, parseRequestStream } from './model.js';
+import { isTokenExpired } from './oauth.js';
+import { TopLevelFieldFinder, modelGlobMatches, parseRequestEffort, parseRequestStream, weeklyBucketForModel } from './model.js';
 import { conversationDigest, pinKeyFor } from './conversation.js';
 import { BodyWriter, truncationNote } from './request-log.js';
 import { upstreamFetch, upstreamPoolStatus } from './upstream-fetch.js';
@@ -177,6 +182,11 @@ async function readErrorBody(body, limit = ERROR_BODY_INSPECTION_LIMIT) {
 const CONNECTION_SPECIFIC_HEADERS = new Set([
   'connection', 'keep-alive', 'transfer-encoding', 'upgrade',
   'proxy-connection', 'te', 'trailer',
+]);
+
+const SEAT_INTERNAL_HEADERS = new Set([
+  'x-teamclaude-seat-policy',
+  'x-teamclaude-seat-failover',
 ]);
 
 // Response headers describing the SERVING organization's billing state:
@@ -416,6 +426,13 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
   ['/teamclaude/threshold', 'a client key cannot change settings'],
   ['/teamclaude/priority', 'a client key cannot change accounts'],
   ['/teamclaude/disable', 'a client key cannot change accounts'],
+  // Not a config write, but it names a session and moves it: one tenant must
+  // not be able to put another tenant's session on an account of its choosing.
+  ['/teamclaude/session-pin', 'a client key cannot pin sessions'],
+  // IPM fork (client-routes.js): a key on a fixed seat must not move the
+  // fleet's current account either. With client routes the switch is an
+  // operator act like the session pin.
+  ['/teamclaude/switch', 'a client key cannot switch accounts'],
 ]);
 
 /**
@@ -425,12 +442,16 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
  * above, so the page and the gate cannot disagree. A key-less loopback caller
  * and the shared proxy.apiKey are the operator; only a client key is refused.
  *
+ * `seat` (IPM fork, client-routes.js callerSeat) is the client's fixed seat,
+ * added only when the caller passes one, so `cg status` can show it.
+ *
  * @param {string|null|undefined} client  the client-key name, or null
- * @returns {{ kind: 'operator'|'client', client: string|null, refused: string[] }}
+ * @param {Record<string, any>|null} [seat]
+ * @returns {{ kind: 'operator'|'client', client: string|null, refused: string[], seat?: Record<string, any>|null }}
  */
-export function callerView(client) {
+export function callerView(client, seat) {
   if (!client) return { kind: 'operator', client: null, refused: [] };
-  return { kind: 'client', client, refused: [...CLIENT_KEY_REFUSED_PATHS.keys()] };
+  return { kind: 'client', client, refused: [...CLIENT_KEY_REFUSED_PATHS.keys()], ...(seat !== undefined ? { seat } : {}) };
 }
 
 /**
@@ -563,7 +584,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // Dispatched BEFORE the loopback-only checks below: a page cannot make a
       // browser emit an absolute-form request line, the relay injects no fleet
       // credential, and its Host header names the TARGET, not this proxy.
-      if (/^https?:\/\//i.test(req.url || '')) { relayHttpForward(req, res, shouldStripOverageHeaders(config)); return; }
+      if (/^https?:\/\//i.test(req.url || '')) { relayHttpForward(req, res, shouldStripOverageHeaders(config), config.proxy); return; }
 
       // A request admitted ONLY by the loopback exemption — no valid key — is
       // held to two more conditions. Both target the same actor: a web page in
@@ -607,7 +628,14 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         res.writeHead(200, { 'Content-Type': 'application/json' });
         // Counters only: how full the upstream admission gate is (see
         // upstream-fetch.js), never which origins or requests.
-        res.end(JSON.stringify({ ...extra, ...status, caller: callerView(req.tcClient), upstreamPool: upstreamPoolStatus() }, null, 2));
+        // clientRoutes and requireClientRoute (IPM fork) are always present, so
+        // a reader can tell this build from one without fixed seats.
+        const routing = {
+          clientRoutes: clientRoutesStatus(accountManager, resolveAccountPin),
+          requireClientRoute: config.proxy?.requireClientRoute === true,
+        };
+        const seat = req.tcClient ? callerSeat(accountManager, req.tcClient, resolveAccountPin) : undefined;
+        res.end(JSON.stringify({ ...extra, ...status, ...routing, caller: callerView(req.tcClient, seat), upstreamPool: upstreamPoolStatus() }, null, 2));
         return;
       }
 
@@ -788,6 +816,89 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           + (eligible ? '' : ` — ${reason}, so rotation will not use it`));
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true, account: name, eligible, ...(reason ? { reason } : {}) }));
+        return;
+      }
+
+      // Session pin — move ONE client session onto a named account, leaving the
+      // rest of the fleet where it is (`teamclaude switch <account> --session`,
+      // issue #543). Body: {"sessionId": "<x-claude-code-session-id>",
+      // "account": "<as for /switch>" | null}; null clears the pin. Runtime
+      // only, like /switch: it lives in the manager and dies with the process.
+      // The answer says whether the proxy has seen the session, because a pin on
+      // an id no request carries pins nothing, and the CLI says so.
+      if (req.method === 'POST' && req.url === '/teamclaude/session-pin') {
+        const names = () => (accountManager.accounts || []).map((/** @type {any} */ a) => a.name);
+        let body;
+        try {
+          body = JSON.parse((await readControlBody(req)) || '{}');
+        } catch (/** @type {any} */ err) {
+          const tooLarge = err.message === 'body too large';
+          res.writeHead(tooLarge ? 413 : 400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: tooLarge ? 'request body too large' : 'invalid request body' }));
+          return;
+        }
+        const sessionId = body?.sessionId;
+        if (typeof sessionId !== 'string' || !SESSION_ID_SHAPE.test(sessionId)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'missing or malformed "sessionId"' }));
+          return;
+        }
+        const target = body.account;
+        if (target !== null && (typeof target !== 'string' || !target.trim())) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'missing "account" (null clears the pin)', accounts: names() }));
+          return;
+        }
+        // IPM fork: the pin is bound to the client key whose session it is, so
+        // with client routes in force another key presenting this id does not
+        // ride it. `client` in the body names the key; otherwise the one the
+        // session was seen with, refused when it was seen with several.
+        let pinClient = null;
+        if (body.client !== undefined && body.client !== null) {
+          const names = (Array.isArray(config.proxy?.clientKeys) ? usableClientKeys(config.proxy.clientKeys) : []).map((/** @type {any} */ e) => String(e.name).trim());
+          const wanted = typeof body.client === 'string' ? body.client.trim() : '';
+          pinClient = names.find((/** @type {string} */ n) => n.toLowerCase() === wanted.toLowerCase()) ?? null;
+          if (!pinClient) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: `no client key named "${safeLine(String(body.client), 64)}"` }));
+            return;
+          }
+        } else if (target !== null) {
+          const clients = accountManager.sessionTracker.clientsOf?.(sessionId) ?? new Set();
+          // Only while the policy is in force: with no client routes a pin
+          // applies to every key, as upstream, and a binding changes nothing.
+          if (clients.size > 1 && clientRoutePolicyActive(accountManager.clientRoutes, config.proxy)) {
+            res.writeHead(409, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'this session id was seen with more than one client key; name the one to pin with "client"', clients: [...clients] }));
+            return;
+          }
+          pinClient = clients.size === 1 ? [...clients][0] : null;
+        }
+        const seen = accountManager.sessionTracker.knowsSession(sessionId);
+        const shown = sessionId.slice(0, 8);
+        if (target === null) {
+          const cleared = accountManager.sessionPins.set(sessionId, null);
+          if (cleared) console.log(`[TeamClaude] Session ${shown} unpinned (manual)`);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, sessionId, account: null, cleared, seen }));
+          return;
+        }
+        const index = resolveAccountPin(accountManager, target);
+        if (index == null) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: `no such account "${target}"`, accounts: names() }));
+          return;
+        }
+        // The name, not the index: see session-pins.js.
+        const name = accountManager.accounts[index].name;
+        accountManager.sessionPins.set(sessionId, name);
+        accountManager.sessionPins.bind?.(sessionId, pinClient);
+        const { eligible, reason } = accountManager.eligibility(index);
+        console.log(`[TeamClaude] Session ${shown} pinned to account "${name}" (manual)`
+          + (pinClient ? ` for client "${safeLine(pinClient, 64)}"` : '')
+          + (eligible ? '' : ` — ${reason}, so its requests will fail until that changes`));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, sessionId, account: name, client: pinClient, seen, eligible, ...(reason ? { reason } : {}) }));
         return;
       }
 
@@ -1175,7 +1286,7 @@ export function describeConnectError(err) {
 // client's own headers — no account selection, no token injection,
 // content-encoding passed through (a transparent forward proxy). Anthropic is
 // HTTPS-only, so in practice this only ever sees third-party hosts.
-export function relayHttpForward(req, res, stripOverage = false) {
+export function relayHttpForward(req, res, stripOverage = false, /** @type {Record<string, any>|null} */ proxyConfig = null) {
   let target;
   try { target = new URL(req.url); } catch {
     res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -1206,14 +1317,19 @@ export function relayHttpForward(req, res, stripOverage = false) {
   for (const [key, value] of Object.entries(req.headers)) {
     const lk = key.toLowerCase();
     // Drop hop-by-hop + proxy-control headers; `host` is reset from the target.
-    if (lk.startsWith(':') || HOP_BY_HOP_HEADERS.has(lk) || lk === 'proxy-connection') continue;
+    if (lk.startsWith(':') || HOP_BY_HOP_HEADERS.has(lk) || lk === 'proxy-connection' || SEAT_INTERNAL_HEADERS.has(lk)) continue;
+    // x-api-key may authenticate to this proxy or to the destination API.
+    // Consume our own keys, preserving unrelated application credentials. With
+    // no usable key configured every value "resolves", so that case keeps it.
+    if (lk === 'x-api-key' && !resolveClientAuth(proxyConfig, undefined).ok
+      && resolveClientAuth(proxyConfig, value).ok) continue;
     headers[key] = value;
   }
 
   const upstreamReq = transport.request(target, { method: req.method, headers, lookup: guardedLookup(req.socket) }, (upstreamRes) => {
     const responseHeaders = {};
     for (const [key, value] of Object.entries(upstreamRes.headers)) {
-      if (CONNECTION_SPECIFIC_HEADERS.has(key)) continue;
+      if (CONNECTION_SPECIFIC_HEADERS.has(key) || SEAT_INTERNAL_HEADERS.has(key)) continue;
       if (stripOverage && isOverageHeader(key)) continue;
       responseHeaders[key] = value;
     }
@@ -1246,6 +1362,14 @@ export function relayHttpForward(req, res, stripOverage = false) {
 // by the client's user like the identity plane above; a rotated account's token
 // sees them as not found.
 //
+// The claude.ai connector list (/v1/mcp_servers) is the same plane. Claude Code
+// calls each listed connector on mcp-proxy.anthropic.com, a host this proxy
+// blind-tunnels, so those calls always carry the client's own credential. A
+// list fetched under a rotated account names THAT account's connector ids, and
+// mcp-proxy answers each one "Server not found" under the client's login: the
+// session starts without its claude.ai connectors whenever rotation is off the
+// client's own account.
+//
 // The Remote Control bridge is the same plane under other prefixes. Since
 // Claude Code 2.1.287 `claude remote-control` honours HTTPS_PROXY
 // (anthropics/claude-code#97352), so its control calls arrive here too:
@@ -1270,7 +1394,7 @@ export function relayHttpForward(req, res, stripOverage = false) {
 // does not take `/v1/sessionsX`. The entry without that slash, the collection
 // itself, matches as well, since a session is created with a bare
 // POST /v1/sessions (classificationPath has already dropped any `?beta=true`).
-const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/', '/api/frame/', '/v1/environments/', '/v1/sessions/', '/v2/session_ingress/', '/v2/ccr-sessions/'];
+const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/', '/api/frame/', '/v1/mcp_servers/', '/v1/environments/', '/v1/sessions/', '/v2/session_ingress/', '/v2/ccr-sessions/'];
 
 /**
  * Whether a classified path is on the client's own identity plane: below an
@@ -1502,6 +1626,10 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         }
         req.url = afterPrefix.slice(tokenEnd);
       }
+      // Where the pin came from, for the client-route gate below (IPM fork):
+      // 'path' and 'launch' are the caller's own, 'session' an operator's.
+      /** @type {'path'|'launch'|'session'|null} */
+      let pinSource = pinnedIndex != null ? 'path' : null;
 
       // Remote Control (/v1/code/*) is bound to the session's paired claude.ai
       // identity — forward with the client's OWN credential (streamed), never a
@@ -1553,6 +1681,117 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
           res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: `Unknown account pin "${forcedPin}" (from TC_ACCT)` } }));
           recordEarlyOutcome(accountManager, { sessionId }, req.url, true);
           return;
+        }
+        pinSource = 'launch';
+      }
+
+      // Operator session pin (`teamclaude switch --session`, issue #543): the
+      // same hard pin, set at runtime for one session instead of at launch. A
+      // launch pin above wins, being the more specific choice for this client.
+      // Resolved by name per request for the same reason as TC_ACCT, and an
+      // account that has since gone answers the same honest 404 rather than
+      // quietly routing the session somewhere the operator did not choose.
+      //
+      // IPM fork (client-routes.js): with client routes in force, the pin is
+      // bound to the client key it was set for and applies only to requests
+      // from that key (null = the operator), since a session id is a header
+      // any client can send. For a client key it is checked FIRST, ahead of
+      // the key's own /tc-acct/ or TC_ACCT pin: it is the operator's override,
+      // and it can serve a key that has no seat at all.
+      const requestClient = req.tcClient ?? forcedClient ?? null;
+      const proxyConfig = /** @type {any} */ (config).proxy;
+      const policyActive = clientRoutePolicyActive(/** @type {any} */ (accountManager).clientRoutes, proxyConfig);
+      if (pinnedIndex == null || (policyActive && requestClient)) {
+        const sessionId = clientSessionId(req.headers);
+        const pins = /** @type {any} */ (accountManager).sessionPins;
+        const pinEntry = pins?.entry ? pins.entry(sessionId) : null;
+        const sessionPin = pinEntry ? pinEntry.account : (pins?.get(sessionId) ?? null);
+        const boundTo = pinEntry?.client ?? null;
+        const pinApplies = !policyActive
+          || (boundTo ?? '').toLowerCase() === (requestClient ?? '').trim().toLowerCase();
+        if (sessionPin != null && pinApplies) {
+          pinnedIndex = resolveAccountPin(accountManager, sessionPin);
+          pinSource = 'session';
+          if (pinnedIndex == null) {
+            const reqId = ++counter;
+            if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(unknown pin: "${safeLine(sessionPin)}")`, status: 404, model: null, sessionId, pinned: false });
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: `Unknown account pin "${sessionPin}" (session pin; clear it with: teamclaude switch --session --clear)` } }));
+            recordEarlyOutcome(accountManager, { sessionId }, req.url, true);
+            return;
+          }
+        }
+      }
+
+      // Client-route gate (IPM fork, client-routes.js). Anthropic requests only:
+      // Codex and the other providers keep their own rotation. Here, before the
+      // body is read, because every refusal below is about who is asking and
+      // which account, never about the body. Both entry paths arrive here: a
+      // direct request carries its key as req.tcClient, a MITM tunnel as
+      // forcedClient (fixed at CONNECT), and a request with neither is the
+      // shared proxy key or key-less loopback.
+      /** @type {{ route: string, indices: number[], policies: Map<number, 'force'|'recommend'> }|null} */
+      let bound = null;
+      /** @type {string|null} */
+      let gate = null;
+      /** @type {string|null} */
+      let gateSeat = null;
+      let noAffinity = false;
+      if (policyActive && providerForPath(req.url) === DEFAULT_PROVIDER) {
+        const required = proxyConfig?.requireClientRoute === true;
+        // The model catalog spends no quota, so no key is ever refused it.
+        const catalog = req.method === 'GET' && /^\/v1\/models(?:[/?]|$)/.test(classifiedPath);
+        const refuse = (/** @type {string} */ reason, /** @type {string} */ shownAccount, /** @type {string|null} */ detail = null) => {
+          const answer = seatAnswer(reason, { seat: gateSeat, detail });
+          const rid = ++counter;
+          const sessionId = clientSessionId(req.headers);
+          if (!hideActivity) {
+            logSeatEvent(requestClient, gateSeat, reason, answer.status, detail);
+            // Opened and closed at once, so the line carries a duration like
+            // every served one (the gateway console parses only those).
+            hooks.onRequestStart?.(rid, { method: req.method, path: req.url, sessionId, pinned: false, client: requestClient });
+            hooks.onRequestEnd?.(rid, { method: req.method, path: req.url, account: shownAccount, status: answer.status, model: null, sessionId, pinned: false, client: requestClient, gate: reason, seat: gateSeat });
+          }
+          res.writeHead(answer.status, answer.headers);
+          res.end(answer.body);
+          recordEarlyOutcome(accountManager, { sessionId }, req.url, true);
+        };
+        if (requestClient) {
+          const on = routeForClient(/** @type {any} */ (accountManager).clientRoutes, requestClient);
+          const routed = on && 'route' in on ? on.route : null;
+          if (routed) gateSeat = routed.name;
+          if (pinSource === 'session') {
+            gate = SEAT_REASONS.adminPin;
+          } else if (on && 'ambiguous' in on) {
+            if (!catalog) { refuse(SEAT_REASONS.unavailable, '(seat ambiguous)', `this key is on ${on.ambiguous.length} seats`); return; }
+            pinnedIndex = null;
+            noAffinity = true;
+          } else if (routed) {
+            const r = resolveClientRoute(accountManager, routed, resolveAccountPin);
+            if (pinnedIndex != null && !r.indices.includes(pinnedIndex)) {
+              const foreign = /** @type {any} */ (accountManager).accounts[pinnedIndex]?.name ?? null;
+              if (!catalog) { refuse(SEAT_REASONS.foreignPin, `(foreign pin: ${safeLine(foreign ?? '?', 64)})`, foreign); return; }
+              pinnedIndex = null;
+            }
+            if (!r.resolved) {
+              if (!catalog) { refuse(SEAT_REASONS.unavailable, `(seat ${safeLine(routed.name, 64)} unresolved)`, r.problem); return; }
+              noAffinity = true;
+            } else {
+              bound = { route: routed.name, indices: r.indices, policies: parseSeatPolicies(req.headers['x-teamclaude-seat-policy'], routed, r.indices) };
+              if (r.indices.length === 1) pinnedIndex = r.indices[0];
+            }
+          } else if (required) {
+            if (!catalog) { refuse(SEAT_REASONS.noSeat, '(no seat)'); return; }
+            noAffinity = true;
+          }
+        } else if (required && !catalog) {
+          if (pinnedIndex == null) { refuse(SEAT_REASONS.operatorUnpinned, '(unpinned)'); return; }
+          // The operator's explicit pin is honoured and attributed. The caller
+          // hint is unverified (anyone holding the shared key can send it) and
+          // is only there to make the feed readable.
+          gate = SEAT_REASONS.operatorPin;
+          const hint = String(req.headers['x-tc-caller'] || '').trim().toLowerCase();
+          console.log(`[TeamClaude] Operator inference pinned to "${safeLine(/** @type {any} */ (accountManager).accounts[pinnedIndex]?.name ?? '?', 64)}" (${pinSource} pin, caller hint: ${hint === 'console-probe' || hint === 'warmer' ? hint : 'operator'}, from ${safeLine(req.socket?.remoteAddress || 'unknown', 64)})`);
         }
       }
 
@@ -1666,12 +1905,18 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // traffic for this proxy. Forwarding them would leak an operator's
       // internal project and branch names to Anthropic for no benefit, so they
       // are dropped with the other proxy-control headers.
-      const stripHeaders = usageDimensionHeaderNames(config.proxy);
+      // x-tc-caller is the operator's own attribution hint (see the gate above).
+      const stripHeaders = new Set([...usageDimensionHeaderNames(config.proxy), 'x-tc-caller', 'x-teamclaude-seat-policy']);
 
       // stripOverage and synthesizeQuota are sampled once here, at dispatch:
       // retries and holds of this request keep them, and a reload applies to
       // subsequent requests.
-      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, provider, holdBudgetMs: holdMs, pinKey, onMessage, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), synthesizeQuota: shouldSynthesizeQuotaHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
+      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, provider, holdBudgetMs: holdMs, pinKey, onMessage, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), synthesizeQuota: shouldSynthesizeQuotaHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config),
+        // Client routes (IPM fork): the binding read at admission, kept for every
+        // retry and hop of this request. boundExclude is every other account,
+        // so a multi-account seat hops only inside itself.
+        bound, boundExclude: bound ? new Set(/** @type {any} */ (accountManager).accounts.map((/** @type {any} */ a, /** @type {number} */ i) => i).filter((/** @type {number} */ i) => !bound.indices.includes(i))) : null,
+        noAffinity, gate, seat: gateSeat };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -1727,7 +1972,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         // marked open would send the outer catch to call that same throwing hook
         // a second time for one request.
         openEntry = null;
-        if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, effort, sessionId, pinned: ctx.pinnedIndex != null, client });
+        if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, effort, sessionId, pinned: ctx.pinnedIndex != null, client, gate: ctx.gate, seat: ctx.seat });
       }
     } catch (err) {
       reportFailure('[TeamClaude] Unhandled error:', err);
@@ -1798,8 +2043,9 @@ function reportFailure(...args) {
 
 // A status the client can act on: upstream said something about THIS request.
 // A 4xx IS an answer — it tells the client something true about what it sent,
-// and a session getting legitimate 400s is working, not starving. A 429 is a
-// refusal to answer and a 5xx is a failure to.
+// and a session getting legitimate 400s is working, not starving. An ordinary
+// 429 is a refusal to answer (an explicit x-should-retry: false is handled at
+// the relay), and a 5xx is a failure to.
 function answeredStatus(status) {
   // 401 is excluded on purpose. It is about the credential the PROXY injected,
   // which the client never sees and cannot act on — a fleet whose keys have all
@@ -1943,7 +2189,7 @@ function relayStream(req, res, upstream, sx, stripOverage = false) {
   const headers = {};
   for (const [key, value] of Object.entries(req.headers)) {
     const lk = key.toLowerCase();
-    if (lk.startsWith(':') || HOP_BY_HOP_HEADERS.has(lk) || lk === 'accept-encoding') continue;
+    if (lk.startsWith(':') || HOP_BY_HOP_HEADERS.has(lk) || lk === 'accept-encoding' || SEAT_INTERNAL_HEADERS.has(lk)) continue;
     // The client's identity on this path is its bearer; x-api-key is how it
     // authenticated to THIS proxy, so relaying it would hand the operator's
     // proxy key to upstream.
@@ -1958,7 +2204,7 @@ function relayStream(req, res, upstream, sx, stripOverage = false) {
   const upstreamReq = transport.request(target, { method: req.method, headers, agent }, (upstreamRes) => {
     const responseHeaders = {};
     for (const [key, value] of Object.entries(upstreamRes.headers)) {
-      if (CONNECTION_SPECIFIC_HEADERS.has(key) || key === 'content-encoding' || key === 'content-length') continue;
+      if (CONNECTION_SPECIFIC_HEADERS.has(key) || SEAT_INTERNAL_HEADERS.has(key) || key === 'content-encoding' || key === 'content-length') continue;
       if (stripOverage && isOverageHeader(key)) continue;
       responseHeaders[key] = value;
     }
@@ -2099,7 +2345,7 @@ export function relayUpgrade(req, socket, head, upstream, sx, { client = null, c
     // the handshake. Only 'host' (the client transport reconstructs it from
     // `target`), h2 pseudo-headers and the proxy's own x-api-key (the client's
     // credential to us, not to upstream) are dropped.
-    if (lk.startsWith(':') || lk === 'host' || lk === 'x-api-key') continue;
+    if (lk.startsWith(':') || lk === 'host' || lk === 'x-api-key' || SEAT_INTERNAL_HEADERS.has(lk)) continue;
     headers[key] = value;
   }
 
@@ -2114,7 +2360,7 @@ export function relayUpgrade(req, socket, head, upstream, sx, { client = null, c
 
   upstreamReq.on('upgrade', (upstreamRes, upstreamSocket, upstreamHead) => {
     const headerLines = Object.entries(upstreamRes.headers)
-      .filter(([k]) => !(stripOverage && isOverageHeader(k)))
+      .filter(([k]) => !(stripOverage && isOverageHeader(k)) && !SEAT_INTERNAL_HEADERS.has(k.toLowerCase()))
       .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(', ') : v}`);
     // Lines joined, one terminator: an empty header set must not leave a blank
     // line inside (or an extra CRLF after) the response head.
@@ -2152,7 +2398,7 @@ export function relayUpgrade(req, socket, head, upstream, sx, { client = null, c
     log(`[TeamClaude] ${tag}WebSocket ${path} refused by upstream (${upstreamRes.statusCode})`);
     const headerLines = Object.entries(upstreamRes.headers)
       .filter(([k]) => !CONNECTION_SPECIFIC_HEADERS.has(k.toLowerCase()) && k.toLowerCase() !== 'content-length')
-      .filter(([k]) => !(stripOverage && isOverageHeader(k)))
+      .filter(([k]) => !(stripOverage && isOverageHeader(k)) && !SEAT_INTERNAL_HEADERS.has(k.toLowerCase()))
       .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(', ') : v}`);
     try {
       socket.write([`HTTP/1.1 ${upstreamRes.statusCode} ${upstreamRes.statusMessage}`, ...headerLines, 'Connection: close'].join('\r\n') + '\r\n\r\n');
@@ -2232,7 +2478,7 @@ async function relayRaw(req, res, upstream, sx, maxBodyBytes = DEFAULT_MAX_BODY_
       // `.text()` already decompressed the body, so drop content-encoding and
       // the now-stale content-length (both refer to the compressed bytes) — else
       // a gzip'd upstream response reaches the client mis-framed / truncated.
-      if (key === 'transfer-encoding' || key === 'connection' ||
+      if (key === 'transfer-encoding' || key === 'connection' || SEAT_INTERNAL_HEADERS.has(key) ||
           key === 'content-encoding' || key === 'content-length') continue;
       if (stripOverage && isOverageHeader(key)) continue;
       responseHeaders[key] = value;
@@ -2850,10 +3096,10 @@ export async function peekStreamFailure(stream, bounds = {}) {
   const verdict = { decided: false, failureCode: null };
   const decoder = new TextDecoder();
   const scanner = createSseLineScanner((/** @type {string} */ line) => {
-    if (verdict.decided || !line.startsWith('data: ')) return;
+    if (verdict.decided || !line.startsWith('data:')) return;
     /** @type {any} */
     let data;
-    try { data = JSON.parse(line.slice(6)); } catch { verdict.decided = true; return; }
+    try { data = JSON.parse(line.slice(5)); } catch { verdict.decided = true; return; }
     const type = typeof data?.type === 'string' ? data.type : '';
     if (SSE_UNCOMMITTED_EVENTS.has(type)) return;
     const code = type === 'response.failed' || type === 'error' ? streamFailureCode(data) : null;
@@ -2908,6 +3154,215 @@ export async function peekStreamFailure(stream, bounds = {}) {
   };
 }
 
+/**
+ * Why each refused account failed, for the client. An account whose last token
+ * refresh failed (and none has succeeded since) was refused because its token
+ * could not be renewed, and that reason is named — the coordinator's (the store's
+ * lock denied) or the token endpoint's (a 429). A re-login does not touch either,
+ * so it is advised only when the endpoint rejected the refresh token itself, and
+ * for a refusal with no failed renewal behind it, with the status upstream
+ * actually answered.
+ * @param {{ accounts: Record<string, any>[] }} accountManager
+ * @param {Set<string>} rejected  the refused accounts' names
+ * @param {Map<string, number>|undefined} statuses  the status each one got
+ */
+function refusalMessage(accountManager, rejected, statuses) {
+  const parts = [...rejected].map((name) => {
+    const account = accountManager.accounts.find(a => a.name === name);
+    const failure = account?._lastRefreshFailure;
+    // A refresh token the endpoint rejected IS fixed by a re-login; say so then.
+    if (failure) return `the token of "${name}" could not be renewed: ${failure.reason}${[400, 401, 403].includes(failure.status) ? '. Re-add it with: teamclaude login' : ''}`;
+    return `upstream refused the credential for account "${name}" (${statuses?.get(name) ?? 403}). Check the account, then re-add it with: teamclaude login`;
+  });
+  const text = parts.join('; ');
+  return `${text.charAt(0).toUpperCase()}${text.slice(1)}`;
+}
+
+/**
+ * One activity line per client-route refusal or hard stop (IPM fork), naming
+ * the client, the seat and the reason, beside the request's own line.
+ * @param {string|null} client
+ * @param {string|null} seat
+ * @param {string} reason
+ * @param {number} status
+ * @param {string|null} [detail]
+ */
+function logSeatEvent(client, seat, reason, status, detail = null) {
+  console.log(`[TeamClaude] Seat gate: client ${client ? `"${safeLine(client, 64)}"` : '(operator)'}`
+    + ` seat ${seat ? `"${safeLine(seat, 64)}"` : '(none)'} → ${reason} (${status})`
+    + (detail ? ` — ${safeLine(detail, 160)}` : ''));
+}
+
+/**
+ * The request-local mode for one bound account. Missing or invalid policy data
+ * always means recommend.
+ * @param {Record<string, any>} ctx
+ * @param {number} accountIndex
+ * @returns {'force'|'recommend'}
+ */
+function seatPolicyFor(ctx, accountIndex) {
+  return ctx.bound?.policies.get(accountIndex) ?? 'recommend';
+}
+
+/**
+ * Answer a bound request whose seat cannot serve it (IPM fork). Never another
+ * account: the verdict is the seat's, worded as client-routes.js seatAnswer.
+ * When the request was pinned to one account of a multi-account seat
+ * (ctx.boundPinned) and that account is spent, the answer names the next
+ * servable account in the seat's queue, so the user can hand off to a fresh
+ * session there instead of dragging the whole conversation onto a cold cache.
+ * @param {any} res
+ * @param {Record<string, any>} ctx
+ * @param {import('./client-routes.js').SeatVerdict} verdict
+ * @param {string} shownAccount
+ * @param {any} [accountManager]  with accountIndex, needed for the queue hint
+ * @param {number|null} [accountIndex]  the verdict's account, for the queue hint
+ */
+function respondSeat(res, ctx, verdict, shownAccount, accountManager = null, accountIndex = null) {
+  const reason = verdictReason(verdict);
+  const detail = verdict.kind === 'unavailable' ? verdict.reason : null;
+  const queue = accountManager && accountIndex != null && seatPolicyFor(ctx, accountIndex) === 'recommend'
+    && ctx.boundPinned && verdict.kind === 'spent' && ctx.bound
+    ? { pinned: shownAccount, next: nextInSeatQueue(accountManager, ctx.bound.indices, accountIndex, ctx.model, ctx.advisorModel) }
+    : null;
+  const answer = seatAnswer(reason, { seat: ctx.seat, verdict, detail, queue });
+  ctx.status = answer.status;
+  ctx.account = shownAccount;
+  ctx.gate = reason;
+  // An answer the client can act on, not a starving session.
+  ctx.delivered = true;
+  logSeatEvent(ctx.client, ctx.seat, reason, answer.status, detail);
+  if (!res.headersSent && !clientGone(res)) {
+    res.writeHead(answer.status, answer.headers);
+    res.end(answer.body);
+    if (ctx.boundPinned && verdict.kind === 'spent' && queue?.next
+        && ctx.bound.indices.length > 1 && ctx.pinKey && ctx.client && ctx.seat && accountIndex != null) {
+      const bucket = accountManager._weeklyBucketFor?.(ctx.model) ?? weeklyBucketForModel(ctx.model);
+      accountManager.sessionTracker.recordSeatContinuation(ctx.pinKey, {
+        client: ctx.client,
+        route: ctx.seat,
+        bucket,
+        idx: accountIndex,
+        at: verdict.rejection.at,
+        resetsAt: verdict.rejection.resetsAt,
+      });
+    }
+  }
+}
+
+/**
+ * A force-mode quota hop to another account of the same bound seat. The explicit
+ * hop bypasses offer consumption and keeps the destination's own policy/pin
+ * semantics; the original request body is reused by the caller.
+ * @param {any} accountManager
+ * @param {Record<string, any>} ctx
+ * @param {Record<string, any>} account
+ * @param {Record<string, any>} verdict
+ * @returns {boolean} whether ctx.hopTo now names a servable sibling
+ */
+function hopForcedSeat(accountManager, ctx, account, verdict) {
+  if (!ctx.bound || !ctx.boundPinned || ctx.pinnedIndex != null
+      || verdict.kind !== 'spent' || seatPolicyFor(ctx, account.index) !== 'force') return false;
+  const excluded = new Set([...ctx.tried, ...(ctx.rolledOff ?? [])]);
+  const next = nextInSeatQueueIndex(accountManager, ctx.bound.indices, account.index, ctx.model, ctx.advisorModel, excluded);
+  if (next == null) return false;
+  ctx.tried.add(account.index);
+  ctx.hopTo = next;
+  const destination = accountManager.accounts[next];
+  ctx.seatContinuation = {
+    from: ctx.seatContinuation?.from ?? account.name,
+    to: destination.name,
+    coldCache: true,
+    policy: 'force',
+  };
+  console.log(`[TeamClaude] Seat force continuation "${safeLine(ctx.seat, 64)}": "${safeLine(account.name, 64)}" → "${safeLine(destination.name, 64)}"; full conversation reprocessed with a cold prompt cache`);
+  return true;
+}
+
+/**
+ * The account a request bound to a multi-account seat goes to next (IPM fork).
+ * The seat's accounts are a drain queue in config order. A conversation pinned
+ * to one of them stays on it (ctx.boundPinned): its verdict — spent,
+ * throttled, unavailable — is the request's own answer, never a silent move
+ * onto a sibling, which would re-process the whole conversation there with a
+ * cold cache. A conversation with no pin in the seat — a fresh one, e.g.
+ * after a handoff — takes the first servable account in queue order, so the
+ * seat's quota drains one account at a time instead of spreading across all
+ * of them at once. Null when the seat has nothing left, which the no-account
+ * branch answers from the seat's state.
+ * @param {any} accountManager
+ * @param {Record<string, any>} ctx
+ */
+function pickBoundAccount(accountManager, ctx) {
+  const left = ctx.bound.indices.filter((/** @type {number} */ i) => !ctx.tried.has(i) && !ctx.rolledOff?.has(i));
+  if (!left.length) return null;
+  const bucket = accountManager._weeklyBucketFor?.(ctx.model) ?? weeklyBucketForModel(ctx.model);
+  const pinIdx = ctx.pinKey ? accountManager.sessionTracker.pinnedAccount(ctx.pinKey, bucket) : null;
+  if (pinIdx != null && left.includes(pinIdx)) {
+    ctx.boundPinned = true;
+    const pinned = accountManager.accounts[pinIdx] ?? null;
+    if (!ctx.seatContinuationChecked && pinned && seatPolicyFor(ctx, pinIdx) === 'recommend') {
+      // Only a later top-level request may consume the disclosed continuation.
+      // Recursive selection can retain retryCount 0, so it cannot be the guard.
+      ctx.seatContinuationChecked = true;
+      const verdict = seatVerdict(accountManager, pinned, ctx.model, ctx.advisorModel);
+      if (verdict?.kind === 'spent') {
+        const next = left.find((/** @type {number} */ i) => i !== pinIdx
+          && !seatVerdict(accountManager, accountManager.accounts[i], ctx.model, ctx.advisorModel));
+        if (next != null) {
+          const offer = accountManager.sessionTracker.takeSeatContinuation(ctx.pinKey, {
+            client: ctx.client,
+            route: ctx.seat,
+            bucket,
+            idx: pinIdx,
+            at: verdict.rejection.at,
+            resetsAt: verdict.rejection.resetsAt,
+          });
+          if (offer) {
+            const destination = accountManager.accounts[next];
+            ctx.tried.add(pinIdx);
+            ctx.seatContinuation = { from: pinned.name, to: destination.name, coldCache: true };
+            return destination;
+          }
+        }
+      }
+    }
+    return pinned;
+  }
+  // An unpinned pick, and a verdict retry must be free to advance the queue.
+  ctx.boundPinned = false;
+  const servable = left.find((/** @type {number} */ i) => !seatVerdict(accountManager, accountManager.accounts[i], ctx.model, ctx.advisorModel));
+  return accountManager.accounts[servable ?? left[0]] ?? null;
+}
+
+/**
+ * The answer when the accounts a request reached all held an expired token that
+ * could not be renewed. 503 with a short Retry-After: the renewal may go through
+ * on the next request (the lock freed, the token endpoint back). Never a 401 or
+ * a 403 — the client's own credential is fine.
+ * @param {import('node:http').ServerResponse} res
+ * @param {Record<string, any>} ctx
+ * @param {{ accounts: Record<string, any>[] }} accountManager
+ */
+function respondUnrenewed(res, ctx, accountManager) {
+  const names = [...ctx.unrenewed].map((/** @type {string} */ n) => `"${safeLine(n, 64)}"`).join(', ');
+  // Each renewal's own failure, as refusalMessage names it: the store's lock
+  // denied, or the token endpoint's answer.
+  const failures = [...ctx.unrenewed].map((/** @type {string} */ n) => accountManager.accounts.find((a) => a.name === n)?._lastRefreshFailure).filter(Boolean);
+  const reasons = failures.map(f => f.reason);
+  // A refresh token the endpoint rejected IS fixed by a re-login; say so then.
+  const relogin = failures.some(f => [400, 401, 403].includes(f.status)) ? ' Re-add it with: teamclaude login' : '';
+  ctx.status = 503;
+  ctx.account = `(${[...ctx.unrenewed].join(', ')} not renewed)`;
+  if (!res.headersSent) {
+    res.writeHead(503, { 'Content-Type': 'application/json', 'retry-after': '30' });
+    res.end(JSON.stringify({
+      type: 'error',
+      error: { type: 'overloaded_error', message: `No account served this request: the token of ${names} has expired and could not be renewed${reasons.length ? ` (${reasons.join('; ')})` : ''}.${relogin || ' Retry shortly.'}` },
+    }));
+  }
+}
+
 export async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, useSx) {
   const maxRetries = accountManager.accounts.length;
   // This function is exported, so a caller may hand us a ctx built elsewhere.
@@ -2930,7 +3385,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // is no evidence about a rest either.
   const hopTo = ctx.hopTo ?? null;
   ctx.hopTo = null;
-  const restingGen = ctx.pinnedIndex == null && hopTo == null
+  const restingGen = ctx.pinnedIndex == null && hopTo == null && !ctx.bound
     ? accountManager.observedGeneration(ctx.pinKey, ctx.model)
     : null;
 
@@ -2962,13 +3417,19 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // The hop's destination was picked by pickAlternate against this request's
   // own exclusions, and is taken as-is: re-selecting here would walk the fleet
   // cursor onto it, which is exactly the move a detour must not make (#286).
+  // A request bound to a multi-account seat (IPM fork, client-routes.js) is
+  // chosen inside the seat with the pure picker, never through
+  // getActiveAccount: it must not move the fleet cursor, and the switch
+  // threshold does not apply to it.
   const account = hopTo != null
     ? accountManager.accounts[hopTo]
     : ctx.pinnedIndex != null
-      ? (pinned && !pinnedWrongProvider && !accountManager.capExceeded(pinned, ctx.model) ? pinned : null)
-      : accountManager.getActiveAccount(
-        ctx.tried, ctx.model, ctx.advisorModel, ctx.pinKey, ctx.provider, selection,
-      );
+      ? (pinned && !pinnedWrongProvider && !accountManager.capBars(pinned, ctx.model, ctx.advisorModel) ? pinned : null)
+      : ctx.bound
+        ? pickBoundAccount(accountManager, ctx)
+        : accountManager.getActiveAccount(
+          ctx.tried, ctx.model, ctx.advisorModel, ctx.pinKey, ctx.provider, selection,
+        );
   // Accounts a rollover deliberately routed this request away from. Request-
   // scoped: the decision belongs to the request, not to one attempt of it.
   if (selection.rolledOff) {
@@ -2990,7 +3451,21 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     }));
     return;
   }
+  if (!account && ctx.bound && ctx.pinnedIndex == null) {
+    // A multi-account seat with nothing left to try: the seat's own answer,
+    // never the fleet's hold, retry-after or reset redemption.
+    const verdict = combineVerdicts(ctx.bound.indices.map((/** @type {number} */ i) =>
+      seatVerdict(accountManager, accountManager.accounts[i], ctx.model, ctx.advisorModel)))
+      ?? { kind: 'unavailable', reason: 'already tried' };
+    return respondSeat(res, ctx, verdict, `(seat ${ctx.bound.route} unavailable)`);
+  }
   if (!account) {
+    // Every account this request reached held an expired token that could not be
+    // renewed, and nothing else was tried: say that, not a refusal or a quota.
+    if (ctx.unrenewed?.size && [...ctx.tried].every(i => ctx.unrenewed.has(accountManager.accounts[i]?.name))
+        && (ctx.pinnedIndex != null || ctx.tried.size === accountManager.accounts.length)) {
+      return respondUnrenewed(res, ctx, accountManager);
+    }
     // Every candidate was refused by upstream (403). Waiting will not help — the
     // account needs attention, not a retry — so say so plainly rather than
     // reporting a rate limit. Not a 403 either: the client's own credential is
@@ -3017,7 +3492,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       } else if (allEntitlementDenied) {
         message = `No account served this request. Every configured account returned OAuth entitlement denial (${OAUTH_ENTITLEMENT_ERROR_CODE}): ${names}. TeamClaude temporarily removed them from automatic rotation; retry after the cooldown or pin a different eligible account.`;
       } else {
-        message = `Upstream refused the credential for account ${names} (403). Check the account, then re-add it with: teamclaude login`;
+        message = refusalMessage(accountManager, rejected, ctx.rejectedStatus);
       }
       ctx.status = 502;
       ctx.account = `(${[...rejected].join(', ')} refused)`;
@@ -3032,6 +3507,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     }
     // A pinned request concerns exactly one account: don't compute a fleet-wide
     // retry-after or sleep on other accounts' windows — return immediately.
+    // A bound seat (IPM fork) answers from its own state: spent, throttled,
+    // capped or unavailable, as client-routes.js words it.
+    const boundVerdict = ctx.bound && ctx.pinnedIndex != null
+      ? seatVerdict(accountManager, accountManager.accounts[ctx.pinnedIndex], ctx.model, ctx.advisorModel)
+      : null;
+    if (boundVerdict) return respondSeat(res, ctx, boundVerdict, accountManager.accounts[ctx.pinnedIndex]?.name ?? '(seat unavailable)');
     if (ctx.pinnedIndex != null) {
       ctx.status = 429;
       ctx.account = '(pinned account unavailable)';
@@ -3138,19 +3619,57 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     return;
   }
 
+  // A bound seat that cannot serve answers before anything is sent (IPM fork):
+  // its spent window, its throttle, its cap or its being unavailable is the
+  // request's answer, never another account.
+  if (ctx.bound) {
+    const verdict = seatVerdict(accountManager, account, ctx.model, ctx.advisorModel);
+    if (verdict) {
+      if (retryCount < maxRetries && hopForcedSeat(accountManager, ctx, account, verdict)) {
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
+      }
+      // A pick made from the conversation's pin inside the seat keeps the
+      // pinned account's verdict as the answer (boundPinned): re-selecting
+      // onto a sibling account of the seat would move the whole conversation
+      // to a cold cache with no warning. Only an unpinned pick — a fresh
+      // conversation, which the queue order then advances — re-selects.
+      if (ctx.pinnedIndex == null && !ctx.boundPinned && retryCount < maxRetries) {
+        ctx.tried.add(account.index);
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
+      }
+      return respondSeat(res, ctx, verdict, account.name, accountManager, account.index);
+    }
+  }
+
   // Track which account handles this request
   ctx.account = account.name;
   // Pin this conversation to the serving account for the model's weekly bucket
   // (for affinity) and keep it "active" in the running-sessions readout. Passive
-  // when distribution is off.
-  accountManager.recordSession(ctx.pinKey, account.index, ctx.model);
+  // when distribution is off. Not for a seat-less catalog read under client
+  // routes (IPM fork): it spends no quota and must not steer the session.
+  if (!ctx.noAffinity) accountManager.recordSession(ctx.pinKey, account.index, ctx.model);
   hooks.onRequestRouted?.(reqId, { account: account.name });
 
   // Refresh OAuth token if needed
   await accountManager.ensureTokenFresh(account.index);
   if (account.status === 'error' && retryCount < maxRetries) {
     ctx.tried.add(account.index);
+    if (ctx.boundPinned) return respondSeat(res, ctx, { kind: 'unavailable', reason: 'error' }, account.name, accountManager, account.index);
     return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+  }
+  // The token has expired and the refresh did not replace it: the coordinator
+  // stood down (another install renewing, the store's lock not to be had) or the
+  // token endpoint failed for now. Upstream will not take it, so it is not sent:
+  // its 401 would force a refresh that fails the same way, and the retry would
+  // send it again. The account sits this request out.
+  if (account.type === 'oauth' && account.refreshToken && !account.upstream && isTokenExpired(account.expiresAt)) {
+    (ctx.unrenewed ??= new Set()).add(account.name);
+    ctx.tried.add(account.index);
+    console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}": token expired and not renewed; not sending it upstream`);
+    if (ctx.pinnedIndex == null && !ctx.boundPinned && retryCount < maxRetries) {
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+    }
+    return respondUnrenewed(res, ctx, accountManager);
   }
   // The refresh just found this account's routing proxy down (it arms the
   // cooldown). The forward would leave by the same proxy and fail the same
@@ -3158,6 +3677,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // targets exactly the account it names.
   if (ctx.pinnedIndex == null && retryCount < maxRetries && accountManager.isRoutingDown(account.index)) {
     ctx.tried.add(account.index);
+    if (ctx.boundPinned) return respondSeat(res, ctx, { kind: 'unavailable', reason: 'error' }, account.name, accountManager, account.index);
     return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
   }
 
@@ -3229,6 +3749,17 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // Every rewrite below runs inside rewriteRequestBody (exported for tests);
   // Content-Length is refreshed below because the body can shrink.
   let sendBody = rewriteRequestBody(body, account, req.url, req.headers['content-type']);
+  // End-user identity (IPM fork, user-identity.js): a request carrying a client
+  // key is stamped with the stable hashed user tag in metadata.user_id, so
+  // upstream attributes abuse per person rather than per seat. Inference calls
+  // only (isCompletionPath): count_tokens rejects metadata outright, and a
+  // Codex body has no metadata.user_id. Admin-key and key-less loopback
+  // requests carry no client and go unstamped. The stamp validates its own
+  // splice (full parse + top-level check) and sends the original body on any
+  // doubt.
+  if (ctx.client && ctx.provider === DEFAULT_PROVIDER && isCompletionPath(req.url)) {
+    sendBody = stampGatewayUser(sendBody, ctx.client);
+  }
   // If the body changed length (sanitize, model rewrite, or field strip), update
   // Content-Length so the upstream doesn't receive a mismatched framing and
   // truncate or stall.
@@ -3279,7 +3810,18 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     if (ctx.pinnedIndex == null && retryCount < maxRetries && accountManager.isEntitlementDenied(account.index)) {
       accountManager.release(account.index, { successful: false });
       ctx.tried.add(account.index);
+      if (ctx.boundPinned) return respondSeat(res, ctx, { kind: 'unavailable', reason: 'entitlement' }, account.name, accountManager, account.index);
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+    }
+    // Same for a cap: a reading that arrived while this request waited can have
+    // put the account at its maxUsage, and a cap is zero requests past it. Not
+    // a retry — nothing was sent — so the budget is not spent; `tried` grows by
+    // one account each time, which bounds the re-selection. A pin re-enters
+    // its own check and is refused there.
+    if (accountManager.capBars(account, ctx.model, ctx.advisorModel)) {
+      accountManager.release(account.index, { successful: false });
+      ctx.tried.add(account.index);
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
     }
     let upstreamRes;
     let admittedLoad = 0;
@@ -3321,7 +3863,41 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         rateLimitHeaders[key] = value;
       }
     }
-    accountManager.updateQuota(account.index, rateLimitHeaders, ctx.model);
+    // A spent quota window is still the account's verdict whatever
+    // x-should-retry says: that 429 is the one rotation exists for, so it keeps
+    // the quota path below. Only the windows that path acts on count; an
+    // overage status of `rejected` is the normal state of a subscription
+    // without extra usage and says nothing about this request.
+    const quotaWindowRejected = ['5h', '7d', '7d_oi'].some(w => rateLimitHeaders[`anthropic-ratelimit-unified-${w}-status`] === 'rejected')
+      || codexSpentWindows(rateLimitHeaders).length > 0;
+    const nonRetryable429 = upstreamRes.status === 429 && !quotaWindowRejected
+      && upstreamRes.headers.get('x-should-retry')?.trim().toLowerCase() === 'false';
+    // This refusal is about the request, even if it carries incidental quota
+    // headers. Do not store those headers as an account-wide quota verdict.
+    if (!nonRetryable429) accountManager.updateQuota(account.index, rateLimitHeaders, ctx.model, upstreamRes.status);
+
+    // IPM fork (client-routes.js): a 429 that rejected a quota window is kept,
+    // headers and all, so a request bound to this seat gets upstream's own
+    // answer until the window resets. For a bound request it is the answer now:
+    // a spent seat will not come back inside any wait this proxy could hold.
+    const seatRejection = upstreamRes.status === 429 && providerOf(account) === DEFAULT_PROVIDER
+      ? recordSeatRejection(account, rateLimitHeaders, ctx.model, (/** @type {string|null} */ m) => accountManager._weeklyBucketFor(m))
+      : null;
+    if (seatRejection && ctx.bound) {
+      await upstreamRes.body?.cancel();
+      if (retryCount < maxRetries && hopForcedSeat(accountManager, ctx, account, { kind: 'spent', rejection: seatRejection })) {
+        if (clientGone(res)) { ctx.abandoned = true; return; }
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+      }
+      // A pin inside the seat keeps the hard stop (with the queue hint) rather
+      // than re-selecting onto a sibling — same rule as the pre-send verdict.
+      if (ctx.pinnedIndex == null && !ctx.boundPinned && retryCount < maxRetries) {
+        ctx.tried.add(account.index);
+        if (clientGone(res)) { ctx.abandoned = true; return; }
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+      }
+      return respondSeat(res, ctx, { kind: 'spent', rejection: seatRejection }, account.name, accountManager, account.index);
+    }
 
     // Any response at all came back through the account's routing proxy.
     accountManager.clearRoutingFailed(account.index);
@@ -3335,11 +3911,14 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // this is what lets a revalidation probe (a throttled account selected by
     // _selectProbe) clear its own hold and return the fleet to service.
     if (upstreamRes.status !== 429) accountManager.clearRateLimited(account.index);
+    // And a success is live proof a recorded spent window no longer binds
+    // (IPM fork, client-routes.js): the seat's next request goes upstream.
+    if (upstreamRes.status < 400) clearSeatRejection(account);
 
-    // Two kinds of 429 are handled differently below: a quota rejection rotates
-    // to another account; a transient rate-limit throttle pauses + retries the
-    // same account (never rotates — see #84).
-    if (upstreamRes.status === 429) {
+    // Other 429s retain their established classification: quota rejection
+    // rotates, while a transient throttle pauses and retries.
+    // An explicit no-retry response reaches the normal relay untouched instead.
+    if (upstreamRes.status === 429 && !nonRetryable429) {
       // Clamp Retry-After to a sane window: missing/invalid falls back to 60s,
       // and out-of-range values are bounded to [1, 300]. A negative value would
       // otherwise bypass the wait cap — setTimeout returns immediately and a
@@ -3392,7 +3971,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         || codexAccountSpent;
       const fableRejected = rl['anthropic-ratelimit-unified-7d_oi-status'] === 'rejected' && !generalRejected;
       const codexFamilyRejected = spentCodexWindows.length > 0 && !generalRejected;
-      if ((generalRejected || fableRejected || codexFamilyRejected) && retryCount < maxRetries) {
+      if ((generalRejected || fableRejected || codexFamilyRejected) && !ctx.boundPinned && retryCount < maxRetries) {
         // A Fable-only rejection leaves the account fine for other models, so we
         // do NOT throttle it globally — the recorded Fable utilization makes
         // selection skip it for Fable requests only. A general rejection spends a
@@ -3482,14 +4061,16 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // hop ctx.rateLimitHopped is set, this branch does not run again for this
       // request, and the sx fresh-IP retry and the inline wait take over —
       // which is the right response to an IP-scoped limit.
-      if (!ctx.rateLimitHopped && retryCount < maxRetries) {
+      // Never for a pinned request: a pin names exactly one account, and the
+      // hop's ctx.hopTo would otherwise send it to a sibling nobody chose.
+      if (ctx.pinnedIndex == null && !ctx.boundPinned && !ctx.rateLimitHopped && retryCount < maxRetries) {
         // ctx.rolledOff as well as tried: an account a rollover moved this
         // request off was never sent a request, so it is not in `tried`, and
         // hopping back onto it would reverse that decision one step later.
         // pickAlternate, not getActiveAccount: the hop detours THIS request and
         // must leave the fleet cursor where it is (#286).
         const alt = accountManager.pickAlternate(
-          new Set([...ctx.tried, ...(ctx.rolledOff || []), account.index]),
+          new Set([...ctx.tried, ...(ctx.rolledOff || []), ...(ctx.boundExclude || []), account.index]),
           ctx.model, ctx.advisorModel, ctx.provider,
         );
         if (alt && !accountManager.isPaused(alt.index)) {
@@ -3643,10 +4224,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // overloaded, not the account, and walking the fleet would just spend every
     // account'"'"'s cache discovering that. After the hop the response goes to the
     // client as it does today, with its own retry-after intact.
-    if (upstreamRes.status >= 500 && !res.headersSent && !ctx.serverErrorHopped && retryCount < maxRetries) {
+    // A pinned request takes no hop, as on the 429 path: its 5xx is the pinned
+    // account's own answer and goes to the client.
+    if (ctx.pinnedIndex == null && !ctx.boundPinned && upstreamRes.status >= 500 && !res.headersSent && !ctx.serverErrorHopped && retryCount < maxRetries) {
       // Same exclusion as the 429 hop, and the same cursor-preserving pick.
       const alt = accountManager.pickAlternate(
-        new Set([...ctx.tried, ...(ctx.rolledOff || []), account.index]),
+        new Set([...ctx.tried, ...(ctx.rolledOff || []), ...(ctx.boundExclude || []), account.index]),
         ctx.model, ctx.advisorModel, ctx.provider,
       );
       if (alt && !accountManager.isPaused(alt.index)) {
@@ -3679,12 +4262,14 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // refused" (fail fast, nothing to wait for) from "this one was, others are
       // just out of quota" (still worth holding for a reset).
       (ctx.credentialRejected ??= new Set()).add(account.name);
+      (ctx.rejectedStatus ??= new Map()).set(account.name, 403);
       if (entitlementDenied) (ctx.entitlementDenied ??= new Set()).add(account.name);
       ctx.tried.add(account.index);
       const cooldown = deniedUntil
         ? `; OAuth entitlement cooldown until ${new Date(deniedUntil).toISOString()}`
         : '';
       console.error(`[TeamClaude] 403 on "${account.name}"; upstream refused the account credential${cooldown}`);
+      if (ctx.boundPinned) return respondSeat(res, ctx, { kind: 'unavailable', reason: entitlementDenied ? 'entitlement' : 'error' }, account.name, accountManager, account.index);
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
 
@@ -3723,10 +4308,49 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
           : 'upstream rejected its token (401) and it has no refresh token');
       }
       (ctx.credentialRejected ??= new Set()).add(account.name);
+      (ctx.rejectedStatus ??= new Map()).set(account.name, 401);
       ctx.tried.add(account.index);
-      console.error(`[TeamClaude] 401 on "${safeLine(account.name, 64)}"; failing over to another account`);
+      console.error(`[TeamClaude] 401 on "${safeLine(account.name, 64)}"; ${ctx.boundPinned ? 'bound seat unavailable' : 'failing over to another account'}`);
+      if (ctx.boundPinned) return respondSeat(res, ctx, { kind: 'unavailable', reason: 'error' }, account.name, accountManager, account.index);
       if (clientGone(res)) { ctx.abandoned = true; return; }
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+    }
+
+    // A 400 from a first-party Anthropic upstream is about the request: every
+    // account refuses it identically, so it is relayed and no sibling is spent
+    // on proving that. An account with its own `upstream` breaks the premise —
+    // third-party Anthropic-compatible backends (Kimi, GLM, OpenCode Zen) each
+    // reject shapes the others accept (`context_management`, cache_control
+    // subfields; see rewriteRequestBody), and per-account API versions drift.
+    // Measured on the IPM kimi pool: ten consecutive 400s for one session on
+    // one account while a sibling served it — session affinity then re-sent
+    // every client retry to the refusing account, wedging the session.
+    // One hop, on the 5xx hop's budget and for the same reason: if the sibling
+    // also 400s, the request itself is the problem and its answer is relayed.
+    // The hop re-pins the session on the account that served it (recordSession
+    // runs per attempt), so the wedge does not re-form on the next turn. A
+    // pinned request keeps its account's own answer, as on the 429/5xx paths;
+    // a bound one hops only inside its seat (boundExclude).
+    if (ctx.pinnedIndex == null && !ctx.boundPinned && upstreamRes.status === 400 && account.upstream
+        && !res.headersSent && !ctx.clientErrorHopped && retryCount < maxRetries) {
+      // Same exclusion as the 429/5xx hops, and the same cursor-preserving pick.
+      const alt = accountManager.pickAlternate(
+        new Set([...ctx.tried, ...(ctx.rolledOff || []), ...(ctx.boundExclude || []), account.index]),
+        ctx.model, ctx.advisorModel, ctx.provider,
+      );
+      if (alt && !accountManager.isPaused(alt.index)) {
+        // Read the reason BEFORE the cancel: the hop line carries it, and the
+        // refusing account's log would otherwise record a bare status.
+        const errorBody = await readErrorBody(upstreamRes.body).catch(() => null);
+        ctx.clientErrorHopped = true;
+        ctx.hopTo = alt.index;
+        ctx.tried.add(account.index);
+        const finding = upstreamErrorFromBody(errorBody);
+        const detail = finding?.type ? ` (${safeLine(finding.type, 64)}${finding.message ? `: ${safeLine(finding.message, 240)}` : ''})` : '';
+        console.log(`[TeamClaude] Upstream 400 on "${safeLine(account.name, 64)}"${detail} — failing over once to "${safeLine(alt.name, 64)}"`);
+        if (clientGone(res)) { ctx.abandoned = true; return; }
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+      }
     }
 
     // The ChatGPT backend answers a Codex Responses stream with no Content-Type
@@ -3753,10 +4377,11 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // way is the provider talking, not the account — keyed on the first
     // decisive event instead of the status. The sibling is picked first so a
     // request with nowhere to hop to is never held for nothing.
-    if (isStreaming && upstreamRes.status < 400 && upstreamBody && !res.headersSent
+    // Not for a pinned request, for the same reason as the two hops above.
+    if (ctx.pinnedIndex == null && !ctx.boundPinned && isStreaming && upstreamRes.status < 400 && upstreamBody && !res.headersSent
         && !ctx.streamFailureHopped && retryCount < maxRetries) {
       const alt = accountManager.pickAlternate(
-        new Set([...ctx.tried, ...(ctx.rolledOff || []), account.index]),
+        new Set([...ctx.tried, ...(ctx.rolledOff || []), ...(ctx.boundExclude || []), account.index]),
         ctx.model, ctx.advisorModel, ctx.provider,
       );
       if (alt && !accountManager.isPaused(alt.index)) {
@@ -3782,6 +4407,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     getLog()?.write(`\n\n=== RESPONSE ${upstreamRes.status} ===\n${formatHeaders(upstreamRes.headers)}`);
 
     ctx.status = upstreamRes.status;
+    // A request-specific refusal is an answer, not a starving session.
+    const deliveredStatus = nonRetryable429 || answeredStatus(upstreamRes.status);
 
     // Build response headers (skip hop-by-hop and encoding headers). The
     // connection-specific names are also illegal on an HTTP/2 response — when
@@ -3789,7 +4416,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     /** @type {Record<string, string>} */
     const responseHeaders = {};
     for (const [key, value] of upstreamRes.headers.entries()) {
-      if (CONNECTION_SPECIFIC_HEADERS.has(key)) continue;
+      if (CONNECTION_SPECIFIC_HEADERS.has(key) || SEAT_INTERNAL_HEADERS.has(key)) continue;
       // Strip content-encoding/content-length since fetch may auto-decompress
       if (key === 'content-encoding' || key === 'content-length') continue;
       // Per-org billing state, dropped when stripOverageHeaders is on (see
@@ -3797,6 +4424,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       if (ctx.stripOverage === true && isOverageHeader(key)) continue;
       responseHeaders[key] = value;
     }
+
+    // Internal seat headers are authoritative only when this proxy sets them.
+    delete responseHeaders['x-teamclaude-seat-failover'];
+    delete responseHeaders['x-teamclaude-seat-policy'];
 
     // A headerless stream is told it is one (see `streamAssumed` above).
     if (streamAssumed) responseHeaders['content-type'] = contentType;
@@ -3811,6 +4442,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       Object.assign(responseHeaders, backendQuotaHeaders(account.quota?.backend?.windows));
     }
 
+    if (ctx.seatContinuation?.coldCache === true && upstreamRes.status < 400) {
+      const { from, to } = ctx.seatContinuation;
+      responseHeaders['x-teamclaude-seat-failover'] = `from=${encodeURIComponent(from)};to=${encodeURIComponent(to)};cold-cache=true`;
+      console.log(`[TeamClaude] Seat continuation "${safeLine(ctx.seat, 64)}": "${safeLine(from, 64)}" → "${safeLine(to, 64)}"; full conversation reprocessed with a cold prompt cache`);
+    }
+
     res.writeHead(upstreamRes.status, responseHeaders);
 
     // The catch block's retry is guarded by `!res.headersSent`, so a stay
@@ -3823,7 +4460,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       const l = getLog();
       if (l) { l.body('RESPONSE BODY', null); l.end(); }
       res.end();
-      ctx.delivered = answeredStatus(upstreamRes.status);
+      ctx.delivered = deliveredStatus;
       return;
     }
 
@@ -3833,13 +4470,13 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       const l = getLog();
       const bw = l ? l.bodyWriter('RESPONSE BODY (streamed)', contentType) : null;
       try {
-        await streamResponse(upstreamBody, res, account.index, accountManager, bw, ctx.onUsage, ctx.pinKey, ctx.model, ctx.onMessage);
+        await streamResponse(upstreamBody, res, account.index, accountManager, bw, ctx.onUsage, ctx.pinKey, ctx.model, ctx.onMessage, finding => reportRefusal(account.name, finding));
         // Reached only when the stream completed. A stream that dies upstream
         // throws out of streamResponse, so it never marks itself delivered —
         // which is the failure the token counters cannot see, since a stream
         // that emitted message_start has already recorded a usage report.
         if (clientGone(res)) ctx.abandoned = true;
-        else ctx.delivered = answeredStatus(upstreamRes.status);
+        else ctx.delivered = deliveredStatus;
       } finally {
         // Also on the failure path: without the note a capped body reads as a
         // stream that simply stopped, which is the other thing that happens here.
@@ -3848,11 +4485,19 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       l?.end();
     } else {
       const buf = Buffer.from(await upstreamRes.arrayBuffer());
-      extractUsageFromBody(buf, account.index, accountManager, ctx.onUsage, ctx.pinKey, ctx.model, ctx.onMessage);
+      // The error-body tap (upstream-error-tap.js): a relayed error's reason
+      // lives in the body, and the request log records only the status. One
+      // line per relayed error. The body is already fully buffered here, so
+      // the read costs nothing; an error that arrives as a stream is not
+      // tapped (it would hold the relay hostage mid-flight).
+      if (upstreamRes.status >= 400) {
+        reportUpstreamError(upstreamRes.status, account.name, upstreamErrorFromBody(buf));
+      }
+      extractUsageFromBody(buf, account.index, accountManager, ctx.onUsage, ctx.pinKey, ctx.model, ctx.onMessage, finding => reportRefusal(account.name, finding));
       const l = getLog();
       if (l) { l.body('RESPONSE BODY', buf, contentType); l.end(); }
       res.end(buf);
-      ctx.delivered = answeredStatus(upstreamRes.status);
+      ctx.delivered = deliveredStatus;
     }
   } catch (err) {
     // Two of the things that can throw here are not upstream errors at all:
@@ -3929,7 +4574,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // self-healing: probes from other requests refresh the stale quota.
     const hostOf = (u) => { try { return new URL(u).hostname; } catch { return u; } };
     const thisHost = hostOf(account.upstream || upstream);
-    const otherHostAvailable = ctx.pinnedIndex != null || accountManager.accounts.some(a =>
+    const otherHostAvailable = ctx.pinnedIndex != null || ctx.boundPinned || accountManager.accounts.some(a =>
       a.index !== account.index && !ctx.tried.has(a.index) &&
       hostOf(a.upstream || upstream) !== thisHost &&
       accountManager._isAvailable(a, ctx.model));
@@ -3952,7 +4597,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // *response*, never a throw. So don't sideline the account (that would drop
     // a healthy account from rotation until a credential change). Instead skip
     // it for the rest of THIS request only and fail over to another account.
-    if (retryCount < maxRetries && !res.headersSent) {
+    if (retryCount < maxRetries && !res.headersSent && !ctx.boundPinned) {
       ctx.tried.add(account.index);
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
@@ -4023,8 +4668,9 @@ export function readWithIdleTimeout(reader, ms) {
 
 /**
  * Stream an SSE response to the client, parsing usage data along the way.
+ * @param {((finding: import('./refusal-watch.js').RefusalFinding) => void)|null} [onRefusal] told each refusal the stream reports
  */
-export async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter, onUsage = null, pinKey = null, model = null, onMessage = null) {
+export async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter, onUsage = null, pinKey = null, model = null, onMessage = null, onRefusal = null) {
   const reader = webStream.getReader();
   // A client that leaves while upstream is silent must not hold the pending
   // read — and with it the upstream socket and its admission permit — until
@@ -4044,7 +4690,7 @@ export async function streamResponse(webStream, res, accountIndex, accountManage
   // remembers that it did — the incremental counters would book the turn again
   // if a second terminal event arrived. See parseSSEDataLine.
   const responsesTurn = { settled: false };
-  const usage = createSseLineScanner(line => parseSSEDataLine(line, accountIndex, accountManager, onUsage, merged, responsesTurn, onMessage));
+  const usage = createSseLineScanner(line => parseSSEDataLine(line, accountIndex, accountManager, onUsage, merged, responsesTurn, onMessage, onRefusal));
 
   try {
     while (true) {
@@ -4197,20 +4843,23 @@ export function createSseLineScanner(onLine, maxChars = SSE_MAX_LINE_CHARS) {
  * @param {string} line
  * @param {number} accountIndex
  * @param {any} accountManager
- * @param {((inputTokens: number, outputTokens: number) => void)|null} [onUsage]
+ * @param {((inputTokens: number, outputTokens: number, cacheReadTokens?: number, cacheCreationTokens?: number) => void)|null} [onUsage]
  * @param {Record<string, any>|null} [merged]
  * @param {{settled: boolean}|null} [responsesTurn] this stream's "already booked" flag
  * @param {((messageId: string) => void)|null} [onMessage] told the id `message_start` names
+ * @param {((finding: import('./refusal-watch.js').RefusalFinding) => void)|null} [onRefusal] told each refusal the line reports
  */
-function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, merged = null, responsesTurn = null, onMessage = null) {
-  if (!line.startsWith('data: ')) return;
+function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, merged = null, responsesTurn = null, onMessage = null, onRefusal = null) {
+  if (!line.startsWith('data:')) return;
 
   try {
-    const data = JSON.parse(line.slice(6));
+    const data = JSON.parse(line.slice(5));
+    const refusal = refusalFromSseEvent(data);
+    if (refusal) onRefusal?.(refusal);
     if (data.type === 'message_start' && typeof data.message?.id === 'string') onMessage?.(data.message.id);
     if (data.type === 'message_start' && data.message?.usage) {
       accountManager.updateUsage(accountIndex, data.message.usage.input_tokens, 0);
-      onUsage?.(data.message.usage.input_tokens || 0, 0);
+      onUsage?.(data.message.usage.input_tokens || 0, 0, data.message.usage.cache_read_input_tokens || 0, data.message.usage.cache_creation_input_tokens || 0);
       if (merged) Object.assign(merged, data.message.usage);
     } else if (data.type === 'message_delta' && data.usage) {
       accountManager.updateUsage(accountIndex, 0, data.usage.output_tokens);
@@ -4227,7 +4876,7 @@ function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, me
       if (usage) {
         if (responsesTurn) responsesTurn.settled = true;
         accountManager.updateUsage(accountIndex, usage.input_tokens, usage.output_tokens);
-        onUsage?.(usage.input_tokens, usage.output_tokens);
+        onUsage?.(usage.input_tokens, usage.output_tokens, usage.cache_read_input_tokens || 0, 0);
         if (merged) Object.assign(merged, usage);
       }
     }
@@ -4240,14 +4889,16 @@ function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, me
  * @param {Buffer} buffer
  * @param {number} accountIndex
  * @param {any} accountManager
- * @param {((inputTokens: number, outputTokens: number) => void)|null} [onUsage]
+ * @param {((inputTokens: number, outputTokens: number, cacheReadTokens?: number, cacheCreationTokens?: number) => void)|null} [onUsage]
  * @param {string|null} [pinKey]
  * @param {string|null} [model]
  * @param {((messageId: string) => void)|null} [onMessage] told the id of the message the body is
+ * @param {((finding: import('./refusal-watch.js').RefusalFinding) => void)|null} [onRefusal] told each refusal the body reports
  */
-function extractUsageFromBody(buffer, accountIndex, accountManager, onUsage = null, pinKey = null, model = null, onMessage = null) {
+function extractUsageFromBody(buffer, accountIndex, accountManager, onUsage = null, pinKey = null, model = null, onMessage = null, onRefusal = null) {
   try {
     const json = JSON.parse(buffer.toString());
+    for (const refusal of refusalFromBody(json)) onRefusal?.(refusal);
     if (json?.type === 'message' && typeof json.id === 'string') onMessage?.(json.id);
     if (json.usage) {
       // A buffered Responses body reports under the same two field NAMES with a
@@ -4261,7 +4912,7 @@ function extractUsageFromBody(buffer, accountIndex, accountManager, onUsage = nu
       const usage = isResponsesBody(json) ? normalizeResponsesUsage(json.usage) : json.usage;
       if (!usage) return;
       accountManager.updateUsage(accountIndex, usage.input_tokens, usage.output_tokens);
-      onUsage?.(usage.input_tokens || 0, usage.output_tokens || 0);
+      onUsage?.(usage.input_tokens || 0, usage.output_tokens || 0, usage.cache_read_input_tokens || 0, usage.cache_creation_input_tokens || 0);
       accountManager.recordTokenUsage(accountIndex, pinKey, model, usage);
     }
   } catch {

@@ -209,8 +209,14 @@ export async function installService({
   await mkdir(dirname(unit), { recursive: true });
   await writeFile(unit, renderSystemdUnit({ ...exec, path, configPath }), { mode: 0o644 });
   run('systemctl', ['--user', 'daemon-reload']);
-  const enable = run('systemctl', ['--user', 'enable', '--now', UNIT_NAME]);
+  const enable = run('systemctl', ['--user', 'enable', UNIT_NAME]);
   if (enable.code !== 0) return { ok: false, error: enable.stderr.trim() || `systemctl exited ${enable.code}`, file: unit };
+  // Restart, not `enable --now`: that only starts the unit, and starting a
+  // unit that is already running does nothing, so a reinstall left the old
+  // process on the old ExecStart and Environment while reporting success, the
+  // case the bootout above exists to avoid. `restart` starts a stopped unit too.
+  const restart = run('systemctl', ['--user', 'restart', UNIT_NAME]);
+  if (restart.code !== 0) return { ok: false, error: restart.stderr.trim() || `systemctl restart exited ${restart.code}`, file: unit };
   log(`[TeamClaude] Service installed: ${unit}`);
   log('[TeamClaude] Logs: journalctl --user --unit teamclaude.service --follow');
   // Without lingering the unit dies with the last login session, which is not

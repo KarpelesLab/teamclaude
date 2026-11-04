@@ -42,6 +42,12 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
   if (status.sessions) {
     lines.push(`${paint.dim('Sessions'.padEnd(12))} ${formatSessions(status.sessions, paint)}`);
   }
+  // Sessions the operator held on one account (`switch --session`), so one
+  // that will not follow the fleet is never a mystery. Absent when there are none.
+  const sessionPins = Array.isArray(status.sessionPins) ? status.sessionPins : [];
+  if (sessionPins.length) {
+    lines.push(`${paint.dim('Pinned'.padEnd(12))} ${formatSessionPins(sessionPins, paint)}`);
+  }
   lines.push(`${paint.dim('Probe'.padEnd(12))} ${formatProbeSummary(probe, now, paint)}`);
   if (warm.enabled) {
     lines.push(`${paint.dim('Keep-warm'.padEnd(12))} ${formatProbeSummary(warm, now, paint)}`);
@@ -320,6 +326,17 @@ export function showSessionRow(quota) {
 }
 
 /**
+ * showSessionRow's rule for the shared weekly window, which a Team seat lacks.
+ *
+ * @param {{weeklyWindowStated?: boolean, unified7d?: number|null}|null|undefined} quota
+ * @returns {boolean}
+ */
+export function showWeeklyRow(quota) {
+  var q = quota || {};
+  return q.weeklyWindowStated !== false || q.unified7d != null;
+}
+
+/**
  * The free-reset-credit line, or null when this account holds none.
  *
  * Its own line rather than another bar: every bar above measures an allowance
@@ -555,6 +572,13 @@ function renderAccountHeader(account, currentAccount, paint, now, followSessions
   return `${marker} ${shown} ${paint.dim(`(${safeLine(account.type, 16)}, prio ${account.priority || 0}${xu})`)} ${status}${org}${sess}`;
 }
 
+// "3f2a1b9c → api-1, 9d0e4c11 → work" — each pinned session by the prefix the
+// activity view shows, and the account it is held on.
+/** @param {any[]} pins @param {any} paint */
+export function formatSessionPins(pins, paint) {
+  return pins.map((/** @type {any} */ p) => `${nameText(String(p?.session ?? ''))} → ${paint.cyan(nameText(String(p?.account ?? '')))}`).join(', ');
+}
+
 // "2 active / 3 known · distributing" — the running-sessions readout. While a
 // distribution toggle drains, say so and how many sessions are left to finish,
 // so "single-account" is not claimed before it is actually true.
@@ -567,6 +591,7 @@ function formatSessions(sessions, paint) {
   // different accounts for the same fleet, so an operator reading the line
   // needs to know which rule produced what they are looking at.
   if (sessions.mode === 'adaptive') mode = paint.green('adapting');
+  else if (sessions.mode === 'load') mode = paint.green('distributing by load');
   else if (sessions.distribute) mode = paint.green('distributing');
   else if (draining) mode = paint.yellow(`draining ${draining}`);
   else mode = paint.dim('single-account');
@@ -814,7 +839,9 @@ function quotaLines(account, now, paint) {
     if (showSessionRow(quota)) {
       lines.push(formatQuotaLine('Session', quota.unified5h, quota.unified5hReset, now, paint, cap('unified5h')));
     }
-    lines.push(formatQuotaLine('Weekly', quota.unified7d, quota.unified7dReset, now, paint, cap('unified7d')));
+    if (showWeeklyRow(quota)) {
+      lines.push(formatQuotaLine('Weekly', quota.unified7d, quota.unified7dReset, now, paint, cap('unified7d')));
+    }
     if (quota.unified7dSonnet != null) {
       lines.push(formatQuotaLine('Sonnet', quota.unified7dSonnet, quota.unified7dSonnetReset, now, paint, cap('unified7dSonnet')));
     }

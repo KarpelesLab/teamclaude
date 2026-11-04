@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { renderStatus, showSessionRow } from '../src/status-renderer.js';
+import { renderStatus, showSessionRow, showWeeklyRow } from '../src/status-renderer.js';
 import { renderDashboardHtml } from '../src/dashboard.js';
 
 const now = Date.parse('2026-07-03T12:00:00Z');
@@ -52,6 +52,24 @@ test('renderStatus still draws a Session reading the plan flag says it lacks', (
   status.accounts[0].quota = { unified5h: 0.99, unified5hReset: now + 3_600_000, unified7d: 0.1, unified7dReset: now + 86_400_000, sessionWindowStated: false };
   const output = renderStatus(status, { color: false, now });
   assert.match(output, /Session\s+\[.*\] 99%/);
+});
+
+// A plan that meters no shared weekly window (a Team seat) says so (weeklyWindowStated
+// false); an empty Weekly row would read as "unknown" for something that does
+// not exist.
+test('renderStatus leaves out the Weekly row for a plan with no shared weekly window', () => {
+  const status = sampleStatus();
+  status.accounts[0].quota = { unified5h: 0.38, unified5hReset: now + 3_600_000, unified7d: null, weeklyWindowStated: false };
+  const output = renderStatus(status, { color: false, now });
+  assert.match(output, /Session\s+\[.*\] 38%/);
+  assert.doesNotMatch(output, /Weekly/);
+});
+
+test('renderStatus still draws a Weekly reading the plan flag says it lacks', () => {
+  const status = sampleStatus();
+  status.accounts[0].quota = { unified5h: 0.38, unified5hReset: now + 3_600_000, unified7d: 0.25, unified7dReset: now + 86_400_000, weeklyWindowStated: false };
+  const output = renderStatus(status, { color: false, now });
+  assert.match(output, /Weekly\s+\[.*\] 25%/);
 });
 
 test('renderStatus shows an OAuth entitlement cooldown separately from account status', () => {
@@ -107,6 +125,13 @@ test('renderStatus shows the sessions line and per-account session count when pr
   const output = renderStatus(status, { color: false, now });
   assert.match(output, /Sessions\s+2 active \/ 3 known · distributing/);
   assert.match(output, /a \(oauth, prio 0\).*2 sess/);
+});
+
+test('renderStatus names the load distribution mode', () => {
+  const status = sampleStatus();
+  status.sessions = { known: 3, active: 2, perAccount: { 0: 2 }, distribute: true, mode: 'load' };
+  const output = renderStatus(status, { color: false, now });
+  assert.match(output, /Sessions\s+2 active \/ 3 known · distributing by load/);
 });
 
 test('renderStatus reports a draining distribution toggle instead of single-account', () => {
@@ -626,4 +651,21 @@ test('the dashboard card draws its Session row by the same rule', () => {
   assert.ok(html.includes(showSessionRow.toString()), 'the page carries the shared helper');
   assert.match(html, /if \(showSessionRow\(q\)\) card\.appendChild\(quotaRow\('Session'/);
   assert.doesNotMatch(html, /^\s*card\.appendChild\(quotaRow\('Session'/m, 'no unconditional Session row is left');
+});
+
+test('showWeeklyRow hides the row only for a plan with no shared weekly window and no reading', () => {
+  assert.equal(showWeeklyRow({ weeklyWindowStated: false, unified7d: null }), false);
+  assert.equal(showWeeklyRow({ weeklyWindowStated: false }), false);
+  assert.equal(showWeeklyRow({ weeklyWindowStated: false, unified7d: 0.25 }), true, 'a reading still present is drawn');
+  assert.equal(showWeeklyRow({ weeklyWindowStated: false, unified7d: 0 }), true, 'zero is a reading');
+  assert.equal(showWeeklyRow({ weeklyWindowStated: true, unified7d: null }), true);
+  assert.equal(showWeeklyRow({ unified7d: null }), true, 'an account that has not said keeps the row');
+  assert.equal(showWeeklyRow(null), true);
+});
+
+test('the dashboard card draws its Weekly row by the same rule', () => {
+  const html = renderDashboardHtml();
+  assert.ok(html.includes(showWeeklyRow.toString()), 'the page carries the shared helper');
+  assert.match(html, /if \(showWeeklyRow\(q\)\) card\.appendChild\(quotaRow\('Weekly'/);
+  assert.doesNotMatch(html, /^\s*card\.appendChild\(quotaRow\('Weekly'/m, 'no unconditional Weekly row is left');
 });

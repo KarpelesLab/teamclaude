@@ -61,24 +61,44 @@ async function atomicWrite(path, data, mode) {
 const MIN_CERT_REMAINING_MS = 30 * 24 * 60 * 60 * 1000;
 
 /**
+ * How a stored chain measures up for `hosts` at `now`. `signed` is whether the
+ * leaf is signed by the CA at all; `shortfall` is null when the chain can be
+ * reused as it is, else why it cannot: a host the leaf does not name, or less
+ * than MIN_CERT_REMAINING_MS left on either cert. Exported for tests.
+ * @param {string} caCertPem
+ * @param {string} leafCertPem
+ * @param {string[]} hosts
+ * @returns {{ signed: boolean, shortfall: string|null }}
+ */
+export function chainShortfall(caCertPem, leafCertPem, hosts, now = Date.now()) {
+  try {
+    const ca = new X509Certificate(caCertPem);
+    const leaf = new X509Certificate(leafCertPem);
+    if (!leaf.verify(ca.publicKey)) return { signed: false, shortfall: 'is not signed by the stored CA' };
+    const names = (leaf.subjectAltName || '').split(',').map((s) => s.trim());
+    const missing = hosts.filter((h) => !names.includes(`DNS:${h}`));
+    if (missing.length) return { signed: true, shortfall: `does not name ${missing.join(', ')}` };
+    for (const cert of [ca, leaf]) {
+      const validTo = new Date(cert.validTo).getTime();
+      if (!Number.isFinite(validTo) || validTo - now < MIN_CERT_REMAINING_MS) {
+        const when = Number.isFinite(validTo) ? new Date(validTo).toISOString().slice(0, 10) : 'an unreadable date';
+        return { signed: true, shortfall: `${validTo <= now ? 'expired' : 'expires'} on ${when}` };
+      }
+    }
+    return { signed: true, shortfall: null };
+  } catch {
+    return { signed: false, shortfall: 'cannot be read' };
+  }
+}
+
+/**
  * Is the stored leaf signed by the stored CA, valid for every host in `hosts`,
  * and (both certs) good for at least MIN_CERT_REMAINING_MS past `now`?
  * Exported for tests.
  */
 export function leafCovers(caCertPem, leafCertPem, hosts, now = Date.now()) {
-  try {
-    const ca = new X509Certificate(caCertPem);
-    const leaf = new X509Certificate(leafCertPem);
-    if (!leaf.verify(ca.publicKey)) return false;
-    for (const cert of [ca, leaf]) {
-      const validTo = new Date(cert.validTo).getTime();
-      if (!Number.isFinite(validTo) || validTo - now < MIN_CERT_REMAINING_MS) return false;
-    }
-    const names = (leaf.subjectAltName || '').split(',').map((s) => s.trim());
-    return hosts.every((h) => names.includes(`DNS:${h}`));
-  } catch {
-    return false;
-  }
+  const { signed, shortfall } = chainShortfall(caCertPem, leafCertPem, hosts, now);
+  return signed && !shortfall;
 }
 
 /**
@@ -86,9 +106,22 @@ export function leafCovers(caCertPem, leafCertPem, hosts, now = Date.now()) {
  * if missing/mismatched. The CA *private* key is never persisted — we regenerate
  * the whole chain when needed, so the only on-disk secret is the leaf key (0600),
  * which only authenticates as `host` to a process that already trusts our CA.
- * Returns { caPath, caCertPem, leafCertPem, leafKeyPem }.
+ *
+ * `keep` is for a caller that hands the CA to a client while a proxy is
+ * running (`teamclaude env` and `run`). The running proxy presents the leaf it
+ * read from these files, and a regenerated chain always comes with a new CA,
+ * since the old CA's key is gone. Replacing the files then gave every client
+ * launched afterwards a CA the proxy's leaf is not signed by, and each one
+ * failed its TLS handshake until the proxy restarted. So with `keep` a stored
+ * chain whose leaf the CA signed is reused even when it falls short, and
+ * `renewal` says why it is due; the proxy renews it when it next starts.
+ *
+ * Returns { caPath, caCertPem, leafCertPem, leafKeyPem, renewal }, where
+ * `renewal` is null unless a kept chain falls short.
+ * @param {string|string[]} host
+ * @param {{ keep?: boolean }} [opts]
  */
-export async function ensureCerts(host) {
+export async function ensureCerts(host, { keep = false } = {}) {
   const named = Array.isArray(host) ? host : [host];
   const hosts = [...new Set(named.filter(Boolean))];
   if (!hosts.includes(TEST_HOST)) hosts.push(TEST_HOST);
@@ -96,8 +129,11 @@ export async function ensureCerts(host) {
     readIf(fpath(CA_CERT)), readIf(fpath(LEAF_CERT)), readIf(fpath(LEAF_KEY)),
   ]);
 
-  if (caCertPem && leafCertPem && leafKeyPem && leafCovers(caCertPem, leafCertPem, hosts)) {
-    return { caPath: fpath(CA_CERT), caCertPem, leafCertPem, leafKeyPem };
+  if (caCertPem && leafCertPem && leafKeyPem) {
+    const { signed, shortfall } = chainShortfall(caCertPem, leafCertPem, hosts);
+    if (signed && (!shortfall || keep)) {
+      return { caPath: fpath(CA_CERT), caCertPem, leafCertPem, leafKeyPem, renewal: shortfall };
+    }
   }
 
   const chain = generateCertChain(hosts); // caKeyPem intentionally discarded
@@ -110,6 +146,7 @@ export async function ensureCerts(host) {
     caCertPem: chain.caCertPem,
     leafCertPem: chain.leafCertPem,
     leafKeyPem: chain.leafKeyPem,
+    renewal: null,
   };
 }
 

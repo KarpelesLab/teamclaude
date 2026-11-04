@@ -32,8 +32,12 @@ test('an Anthropic response stamps only the shared windows it stated', (t) => {
   assert.equal(q.unified5hSeenAt, null);
   assert.equal(q.unified7dSeenAt, null);
 
+  // With its reset, as a live response carries it: the weekly-only response
+  // at the end records a plan with no 5-hour window, and the expiry sweep
+  // clears a session reading with no reset on such a plan.
   am.updateQuota(0, {
     'anthropic-ratelimit-unified-5h-utilization': '0.2',
+    'anthropic-ratelimit-unified-5h-reset': String(Math.floor((start + 3 * HOUR) / 1000)),
     'anthropic-ratelimit-unified-7d-utilization': '0.4',
   });
   assert.equal(q.unified5hSeenAt, start);

@@ -21,9 +21,9 @@ const noRouteManager = {
 
 // Absolute-form request through the proxy (`GET http://target/…`), as sent by any
 // tool honoring HTTP_PROXY.
-function proxyRequest({ proxyPort, method = 'GET', absoluteUrl, body }) {
+function proxyRequest({ proxyPort, method = 'GET', absoluteUrl, body, headers = {} }) {
   return new Promise((resolve, reject) => {
-    const req = http.request({ host: '127.0.0.1', port: proxyPort, method, path: absoluteUrl }, (res) => {
+    const req = http.request({ host: '127.0.0.1', port: proxyPort, method, path: absoluteUrl, headers }, (res) => {
       let d = '';
       res.on('data', (c) => { d += c; });
       res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: d }));
@@ -86,6 +86,47 @@ test('returns 502 (not a hang) when the target host is unreachable', async () =>
 
   proxy.close();
 });
+
+// Proxy credentials belong to TeamClaude; an unrelated x-api-key belongs to
+// the application using HTTP_PROXY and must still reach that application's API.
+for (const { name, proxyConfig, presented, expected, status = 200 } of [
+  { name: 'shared proxy key', proxyConfig: { apiKey: 'tc-shared', trustLoopback: false }, presented: 'tc-shared', expected: undefined },
+  { name: 'named client key', proxyConfig: { apiKey: 'tc-shared', clientKeys: [{ name: 'agent', key: 'tc-client' }], trustLoopback: false }, presented: 'tc-client', expected: undefined },
+  { name: 'client key without a shared key', proxyConfig: { clientKeys: [{ name: 'agent', key: 'tc-client' }], trustLoopback: false }, presented: 'tc-client', expected: undefined },
+  { name: 'proxy key on an exempt loopback connection', proxyConfig: { apiKey: 'tc-shared' }, presented: 'tc-shared', expected: undefined },
+  { name: 'destination key on an exempt loopback connection', proxyConfig: { apiKey: 'tc-shared' }, presented: 'destination-key', expected: 'destination-key' },
+  { name: 'destination key with no proxy keys configured', proxyConfig: {}, presented: 'destination-key', expected: 'destination-key' },
+  { name: 'destination key when every client key entry is unusable', proxyConfig: { clientKeys: [{ name: '', key: 'x' }] }, presented: 'destination-key', expected: 'destination-key' },
+  { name: 'no x-api-key', proxyConfig: { apiKey: 'tc-shared' }, presented: undefined, expected: undefined },
+  { name: 'invalid proxy key with loopback exemption disabled', proxyConfig: { apiKey: 'tc-shared', trustLoopback: false }, presented: 'wrong-key', expected: undefined, status: 401 },
+]) {
+  test(`HTTP forwarding keeps credentials scoped correctly: ${name}`, async () => {
+    const seen = [];
+    const target = http.createServer((req, res) => { seen.push(req.headers); res.end('ok'); });
+    const proxy = createProxyServer(noRouteManager, { proxy: proxyConfig });
+    allowLoopbackForward(proxy); // a controlled stand-in for an external API
+    try {
+      const targetPort = await listen(target);
+      const proxyPort = await listen(proxy);
+      const r = await proxyRequest({
+        proxyPort,
+        absoluteUrl: `http://127.0.0.1:${targetPort}/credential-test`,
+        headers: { ...(presented === undefined ? {} : { 'x-api-key': presented }), 'x-application-header': 'preserved' },
+      });
+      assert.equal(r.status, status);
+      if (status === 401) {
+        assert.equal(seen.length, 0, 'unauthorized requests must never reach the destination');
+      } else {
+        assert.equal(seen.length, 1);
+        assert.equal(seen[0]['x-api-key'], expected);
+        assert.equal(seen[0]['x-application-header'], 'preserved');
+      }
+    } finally {
+      proxy.closeAllConnections(); target.closeAllConnections();
+      proxy.close(); target.close();
+    }
+  });
+}
 
 // ── Destination policy ───────────────────────────────────────
 //
