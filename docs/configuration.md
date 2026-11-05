@@ -111,7 +111,7 @@ Every `TEAMCLAUDE_*` variable below is also read under the name `TEAMROUTER_*`, 
 
 | Variable | Effect |
 | --- | --- |
-| `TC_ACCT` | [Pin a session](routing.md#pin-a-session-to-one-account) to **one** account, bypassing rotation. Accepts `accountUuid`, `orgUuid`, `accountUuid/orgUuid`, or a display name/email. Read by `teamclaude run` and `teamclaude env`, then removed from the environment so it never reaches claude |
+| `TC_ACCT` | [Pin a session](routing.md#pin-a-session-to-one-account) to **one** account, bypassing rotation. Accepts `accountUuid`, `orgUuid`, `accountUuid/orgUuid`, or a display name/email. A comma-separated list of API-key accounts moves a request to the next one when upstream billing refuses the account it is on ([details](routing.md#a-list-of-api-key-accounts)). Read by `teamclaude run` and `teamclaude env`, then removed from the environment so it never reaches claude |
 | `TEAMCLAUDE_CONFIG` | Path to the config file (default `~/.config/teamclaude.json`, or `~/.config/teamrouter.json` when that file exists) |
 | `TEAMCLAUDE_HOST` | Override `proxy.host` |
 | `TEAMCLAUDE_DISABLE_AUTOUPDATE` | Set to `1` to skip the background self-update check |

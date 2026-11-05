@@ -1432,6 +1432,74 @@ export function resolveAccountPin(accountManager, token) {
 }
 
 /**
+ * Resolve a pin that may name several accounts, in order, to their indices, or
+ * null when any name matches no account.
+ *
+ * `a,b,c` pins a session to `a` and names where a request goes when upstream
+ * billing refuses the account it is on: the next listed API-key account (see
+ * advancePinPastBilling). The whole string is tried as one name first, so a pin
+ * that resolves today, a display name with a comma in its org included, still
+ * names that one account. Every name of a list has to match, for the reason an
+ * unknown single name is refused: a typo that quietly shortened the list would
+ * end a run the operator gave somewhere to go. A repeated name counts once.
+ *
+ * @param {any} accountManager  an AccountManager, or anything with its `accounts`
+ * @param {string} token
+ * @returns {number[]|null}
+ */
+export function resolvePinList(accountManager, token) {
+  const whole = resolveAccountPin(accountManager, token);
+  if (whole != null) return [whole];
+  const names = String(token ?? '').split(',');
+  if (names.length < 2) return null;
+  /** @type {number[]} */
+  const indices = [];
+  for (const name of names) {
+    const i = resolveAccountPin(accountManager, name);
+    if (i == null) return null;
+    if (!indices.includes(i)) indices.push(i);
+  }
+  return indices;
+}
+
+/**
+ * Move a request pinned to a list (resolvePinList) off an account upstream
+ * billing has refused, to the next account the list names. Called before each
+ * selection: right after a billing refusal the account is in its cooldown and
+ * this request has tried it, and a later request finds it still cooling and
+ * never sends it the refusal again. Once the cooldown is over, one request tries
+ * the account again.
+ *
+ * API-key accounts only, on both sides: a subscription is never left or reached
+ * this way, whatever the list names. The next account is of the same provider,
+ * outside its own billing cooldown and not capped; the ones passed over are
+ * dropped from the list for this request. A pin that names one account never
+ * gets here. Nothing here is rotation: the cursor, session placement and every
+ * other account are untouched, as for any pin.
+ *
+ * @param {Record<string, any>} ctx
+ * @param {import('./account-manager.js').AccountManager} accountManager
+ */
+function advancePinPastBilling(ctx, accountManager) {
+  if (!ctx.pinChain?.length || !accountManager.isBillingRejected(ctx.pinnedIndex)) return;
+  const from = accountManager.accounts[ctx.pinnedIndex];
+  if (from?.type !== 'apikey') return;
+  while (ctx.pinChain.length) {
+    const i = ctx.pinChain.shift();
+    const next = accountManager.accounts[i];
+    if (next?.type !== 'apikey' || providerOf(next) !== providerOf(from)
+        || accountManager.isBillingRejected(i) || accountManager.capBars(next, ctx.model, ctx.advisorModel)) continue;
+    // Named once per refusal, next to markBillingRejected's line; a request that
+    // only passes a cooling account by is not worth a line each.
+    if (ctx.tried.has(ctx.pinnedIndex)) {
+      console.error(`[TeamClaude] Pinned account "${safeLine(from.name, 64)}" refused for billing; this request moves to "${safeLine(next.name, 64)}", the next account its pin names`);
+    }
+    ctx.pinnedIndex = i;
+    return;
+  }
+}
+
+/**
  * What actually went wrong on a failed connect, as a string worth printing.
  *
  * Node's happy-eyeballs dialer (`autoSelectFamily`, on by default across the
@@ -1829,6 +1897,10 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // one account, bypassing rotation. Used by the keep-warm scheduler and for
       // manual per-account testing. The prefix is stripped before forwarding.
       let pinnedIndex = null;
+      // The accounts after the first that a pin naming several lists, in order
+      // (resolvePinList); empty for a pin that names one.
+      /** @type {number[]} */
+      let pinChain = [];
       // DEPRECATED: the path-prefix pin. Superseded by TC_ACCT, which works in
       // MITM mode too (this form cannot — inside a CONNECT tunnel the path is
       // the real upstream one). Kept for the warmer and for direct API callers.
@@ -1848,7 +1920,9 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         const raw = afterPrefix.slice(0, tokenEnd);
         let token = null;
         try { token = decodeURIComponent(raw); } catch { token = null; }
-        pinnedIndex = token == null ? null : resolveAccountPin(accountManager, token);
+        const pins = token == null ? null : resolvePinList(accountManager, token);
+        pinnedIndex = pins?.[0] ?? null;
+        pinChain = pins?.slice(1) ?? [];
         if (pinnedIndex == null) {
           // Client-supplied and already percent-decoded, so this is the one
           // value on the path that can carry raw control bytes.
@@ -1905,7 +1979,9 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // than at CONNECT time: a hot reload can renumber accounts while a tunnel
       // is open, and a name outliving an index is the safer half of that race.
       if (pinnedIndex == null && forcedPin != null) {
-        pinnedIndex = resolveAccountPin(accountManager, forcedPin);
+        const pins = resolvePinList(accountManager, forcedPin);
+        pinnedIndex = pins?.[0] ?? null;
+        pinChain = pins?.slice(1) ?? [];
         if (pinnedIndex == null) {
           const reqId = ++lastRequestId;
           const sessionId = clientSessionId(req.headers);
@@ -2054,7 +2130,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // stripOverage, synthesizeQuota and poolQuota are sampled once here, at dispatch:
       // retries and holds of this request keep them, and a reload applies to
       // subsequent requests.
-      const ctx = { account: null, callerRequestId: callerId, status: null, attempt: 0, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, provider, holdBudgetMs: holdMs, pinKey, onMessage, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), synthesizeQuota: shouldSynthesizeQuotaHeaders(config), poolQuota: shouldPoolQuotaHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
+      const ctx = { account: null, callerRequestId: callerId, status: null, attempt: 0, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, pinChain, provider, holdBudgetMs: holdMs, pinKey, onMessage, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), synthesizeQuota: shouldSynthesizeQuotaHeaders(config), poolQuota: shouldPoolQuotaHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -3515,6 +3591,11 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // pinned request never reaches that walk, and a budget a pin can spend past is
   // not a budget. The request gets the exhausted response, exactly as it would
   // for an already-tried pin — it still never leaks to another account.
+  // A pin that names several accounts is the one exception, and only for
+  // billing: once upstream billing has refused the account it is on (the
+  // billing check below starts its cooldown and comes back here), the request
+  // goes to the next one listed.
+  advancePinPastBilling(ctx, accountManager);
   const pinned = ctx.pinnedIndex != null && !ctx.tried.has(ctx.pinnedIndex)
     ? accountManager.accounts[ctx.pinnedIndex]
     : null;
