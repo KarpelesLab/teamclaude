@@ -291,6 +291,10 @@ export function accountBadges(account, current, currentAccounts, now, fleetThres
   ];
   if (isCurrent) badges.push({ cls: 'current', text: 'current' });
   badges.push({ cls: status, text: status });
+  // Draining: no new conversation goes here while the ones on it stay, with
+  // how many are left — what an operator waits to see reach 0 before a
+  // disable or a removal.
+  if (a.draining === true) badges.push({ cls: 'draining', text: 'draining' + (Number.isFinite(a.drainRemaining) ? ' · ' + a.drainRemaining + ' left' : '') });
   if (recent) badges.push({ cls: 'sessions', text: recent + ' recent' });
   if (known > recent) badges.push({ cls: 'sessions known', text: known + ' known' });
   // Free Codex rate-limit reset credits this account holds — what it could
@@ -485,21 +489,24 @@ export function thresholdOutcome(res) {
  * move, or {disabled} to take an account out of rotation or put it back.
  *
  * @param {any} name
- * @param {{ place?: string, priority?: number, disabled?: boolean }} spec
+ * @param {{ place?: string, priority?: number, disabled?: boolean, draining?: boolean }} spec
  * @param {string|null} key
  */
 export function accountControlRequest(name, spec, key) {
-  var isPriority = spec.disabled === undefined;
-  /** @type {{ account: any, place?: any, priority?: any, disabled?: any }} */
+  var isDrain = spec.draining !== undefined;
+  var isPriority = spec.disabled === undefined && !isDrain;
+  /** @type {{ account: any, place?: any, priority?: any, disabled?: any, draining?: any }} */
   var body = { account: name };
   if (isPriority) {
     if (spec.place) body.place = spec.place;
     else body.priority = spec.priority;
+  } else if (isDrain) {
+    body.draining = spec.draining;
   } else {
     body.disabled = spec.disabled;
   }
   return {
-    url: isPriority ? '/teamclaude/priority' : '/teamclaude/disable',
+    url: isPriority ? '/teamclaude/priority' : isDrain ? '/teamclaude/account-drain' : '/teamclaude/disable',
     init: {
       method: 'POST',
       headers: { 'x-api-key': key || '', 'content-type': 'application/json' },
@@ -514,12 +521,22 @@ export function accountControlRequest(name, spec, key) {
  * 'first' or 'last'.
  *
  * @param {any} res
- * @param {{ place?: string, priority?: number, disabled?: boolean }} spec
+ * @param {{ place?: string, priority?: number, disabled?: boolean, draining?: boolean }} spec
  */
 export function accountControlOutcome(res, spec) {
   if (!res || !res.ok) return { kind: 'error', text: 'change failed' + (res && res.error ? ': ' + res.error : '') };
   if (spec.disabled !== undefined) {
     return { kind: 'ok', text: (res.disabled ? 'disabled ' : 'enabled ') + res.name };
+  }
+  // A drain reports what it leaves running, which is what an operator waits
+  // on, and warns when no other account is left to take new conversations.
+  if (spec.draining !== undefined) {
+    if (!res.draining) return { kind: 'ok', text: 'undrained ' + res.name + ': it takes new conversations again' };
+    var left = Number.isFinite(res.remaining) ? res.remaining : null;
+    var text = 'draining ' + res.name + ': no new conversations'
+      + (left == null ? '' : ', ' + left + ' still on it' + (left === 0 ? ', so disabling or removing it ends nothing running' : ''));
+    if (res.inService === 0) return { kind: 'warn', text: text + '; no other account takes new conversations now' };
+    return { kind: 'ok', text: text };
   }
   return { kind: 'ok', text: res.name + ' priority ' + res.priority };
 }
@@ -829,7 +846,7 @@ const PAGE = `<!doctype html>
   .tag { font-size: 12px; color: var(--dim); }
   .badge { font-size: 12px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--line); }
   .badge.active { color: var(--ok); border-color: var(--ok); }
-  .badge.throttled { color: var(--warn); border-color: var(--warn); }
+  .badge.throttled, .badge.draining { color: var(--warn); border-color: var(--warn); }
   .badge.error, .badge.exhausted { color: var(--bad); border-color: var(--bad); }
   .badge.current { color: var(--accent); border-color: var(--accent); }
   .badge.provider { color: var(--text); }
@@ -1099,7 +1116,20 @@ ${SHARED_HELPERS}
       ctlDisable.addEventListener('click', function () { doControlAccount(a.name, cardNoteKey(a), { disabled: !a.disabled }, ctlDisable); });
       head.appendChild(ctlDisable);
     }
-    if (!a.disabled && callerCan(caller, '/teamclaude/priority')) {
+    // Drain it, or put it back: no new conversation goes to it while the
+    // ones already on it stay, the graceful step before a disable or a
+    // removal. Drawn on a disabled card too, so an enable can bring it back
+    // drained.
+    if (callerCan(caller, '/teamclaude/account-drain')) {
+      var ctlDrain = el('button', 'act', a.draining === true ? 'undrain' : 'drain');
+      ctlDrain.title = a.draining === true ? 'Send new conversations to this account again'
+        : 'Send no new conversations to this account; the ones on it stay until they finish';
+      ctlDrain.addEventListener('click', function () { doControlAccount(a.name, cardNoteKey(a), { draining: !(a.draining === true) }, ctlDrain); });
+      head.appendChild(ctlDrain);
+    }
+    // Not on a draining card either: nothing new goes there, so a move would
+    // read as doing something and would not, until the undrain.
+    if (!a.disabled && a.draining !== true && callerCan(caller, '/teamclaude/priority')) {
       var ctlFirst = el('button', 'act', 'prioritize');
       ctlFirst.addEventListener('click', function () { doControlAccount(a.name, cardNoteKey(a), { place: 'first' }, ctlFirst); });
       head.appendChild(ctlFirst);
@@ -1108,7 +1138,8 @@ ${SHARED_HELPERS}
       head.appendChild(ctlLast);
     }
     card.appendChild(head);
-    if (a.unavailable) card.appendChild(el('div', 'blocked', 'blocked: ' + (UNAVAILABLE_TEXT[a.unavailable] || a.unavailable)));
+    // A drain is the badge's to say: the account still serves what is on it.
+    if (a.unavailable && a.unavailable !== 'draining') card.appendChild(el('div', 'blocked', 'blocked: ' + (UNAVAILABLE_TEXT[a.unavailable] || a.unavailable)));
     if (a.entitlementDenial) card.appendChild(el('div', 'blocked', 'denied: ' + (a.entitlementDenial.detail || 'OAuth entitlement denied') + ' \u00b7 first ' + fmtAgo(a.entitlementDenial.since)));
     var q = a.quota || {};
     var models = modelsRow(a.usage);

@@ -19,6 +19,7 @@ import { BodyWriter, truncationNote } from './request-log.js';
 import { upstreamFetch, upstreamPoolStatus } from './upstream-fetch.js';
 import { accountRefusal, isRefused } from './account-refusal.js';
 import { applyAuthHeaders, upstreamFor, rewritesBody, defaultHeadersTimeoutFor, providerForPath, providerForHost, interceptHostsFor, providerOf, isSubscriptionAccount, canServeProvider, DEFAULT_PROVIDER, PROVIDERS } from './provider.js';
+import { matchAccounts } from './identity.js';
 import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
 import { createDrainState, DRAIN_RETRY_AFTER_SECONDS } from './drain.js';
@@ -566,6 +567,7 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
   ['/teamclaude/threshold', 'a client key cannot change settings'],
   ['/teamclaude/priority', 'a client key cannot change accounts'],
   ['/teamclaude/disable', 'a client key cannot change accounts'],
+  ['/teamclaude/account-drain', 'a client key cannot change accounts'],
   // Not a config write, but it names a session and moves it: one tenant must
   // not be able to put another tenant's session on an account of its choosing.
   ['/teamclaude/session-pin', 'a client key cannot pin sessions'],
@@ -858,18 +860,21 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         return;
       }
 
-      // Account controls — the web equivalent of `teamclaude priority` and
-      // `teamclaude disable` / `enable`. Local control only (no upstream
-      // calls); the auth and cross-origin gates above already apply, and the
-      // hook writes through atomicConfigUpdate so a refusal leaves the file
-      // untouched. Both answer with the account as it now stands, because a
-      // relative move ('first'/'last') picks a number the caller did not send.
-      if (req.method === 'POST' && (req.url === '/teamclaude/priority' || req.url === '/teamclaude/disable')) {
+      // Account controls — the web equivalent of `teamclaude priority`,
+      // `teamclaude disable` / `enable` and `teamclaude drain` / `undrain`.
+      // Local control only (no upstream calls); the auth and cross-origin
+      // gates above already apply, and the hook writes through
+      // atomicConfigUpdate so a refusal leaves the file untouched. Each answers
+      // with the account as it now stands, because a relative move
+      // ('first'/'last') picks a number the caller did not send. The drain is
+      // the account's own, not the whole proxy's drain above.
+      if (req.method === 'POST' && (req.url === '/teamclaude/priority' || req.url === '/teamclaude/disable' || req.url === '/teamclaude/account-drain')) {
         const isPriority = req.url === '/teamclaude/priority';
-        const hook = isPriority ? hooks.setAccountPriority : hooks.setAccountDisabled;
+        const isDrain = req.url === '/teamclaude/account-drain';
+        const hook = isPriority ? hooks.setAccountPriority : isDrain ? hooks.setAccountDraining : hooks.setAccountDisabled;
         if (!hook) {
           res.writeHead(501, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: false, error: `${isPriority ? 'priority' : 'enable/disable'} not supported` }));
+          res.end(JSON.stringify({ ok: false, error: `${isPriority ? 'priority' : isDrain ? 'drain' : 'enable/disable'} not supported` }));
           return;
         }
         // Checked before the write, not after: a change that lands on disk but
@@ -898,7 +903,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         try {
           const result = isPriority
             ? await hook(body.account.trim(), { priority: body.priority, place: body.place, orgFilter: body.org })
-            : await hook(body.account.trim(), body.disabled, { orgFilter: body.org });
+            : await hook(body.account.trim(), isDrain ? body.draining : body.disabled, { orgFilter: body.org });
           // The write is on disk; the reload is what makes it live. Same
           // split as the MCP changeSetting tool: a reload failure is reported
           // as such, not as a refused change, because the file did change.
@@ -915,9 +920,11 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           // happens, and an account leaving rotation should never be silent.
           console.log(`[TeamClaude] ${isPriority
             ? `Set priority of "${result.name}" to ${result.priority}`
-            : `${result.disabled ? 'Disabled' : 'Enabled'} account "${result.name}"`} (control endpoint)`);
+            : isDrain
+              ? `${result.draining ? 'Draining' : 'Undrained'} account "${result.name}"`
+              : `${result.disabled ? 'Disabled' : 'Enabled'} account "${result.name}"`} (control endpoint)`);
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: true, ...result }));
+          res.end(JSON.stringify({ ok: true, ...result, ...(isDrain ? drainAnswer(accountManager, result, body.org) : {}) }));
         } catch (err) {
           // A ConfigOpError is the caller's own input (unknown or ambiguous
           // account, bad priority) and is safe to echo; anything else is ours.
@@ -1051,6 +1058,13 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         }
         // The name, not the index: see session-pins.js.
         const name = accountManager.accounts[index].name;
+        // Pinning a session there is placing new work, which a draining
+        // account takes none of. Pins already in place are left as they are.
+        if (accountManager.accounts[index].draining) {
+          res.writeHead(409, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: `account "${name}" is draining: it takes no new conversations (teamclaude undrain puts it back)` }));
+          return;
+        }
         accountManager.sessionPins.set(sessionId, name);
         const { eligible, reason } = accountManager.eligibility(index);
         console.log(`[TeamClaude] Session ${shown} pinned to account "${name}" (manual)`
@@ -2962,6 +2976,29 @@ export function isTransientUpstreamError(err, { otherHostAvailable = false } = {
 }
 
 /**
+ * What a drain answers besides the account: how many conversations are still
+ * on it (`remaining`; at 0 nothing has run there for an hour and nothing is
+ * open) and how many other accounts of its provider are neither disabled nor
+ * draining (`inService`; at 0 every new conversation for it is refused).
+ * @param {any} accountManager
+ * @param {{ name: string, draining: boolean }} result
+ * @param {unknown} org the request's org filter, if it sent one
+ * @returns {{ remaining?: number, inService?: number }}
+ */
+function drainAnswer(accountManager, result, org) {
+  const accounts = accountManager.accounts || [];
+  // By the name the write resolved, narrowed by the org it was given: one
+  // email can hold accounts in several orgs, and a count of the wrong one
+  // would read as empty while the drained one still serves.
+  const matches = matchAccounts(accounts, result.name, typeof org === 'string' && org ? org : undefined);
+  if (matches.length !== 1) return {};
+  const live = matches[0];
+  const provider = providerOf(live);
+  const inService = accounts.filter((/** @type {Record<string, any>} */ a) => a !== live && canServeProvider(a, provider) && !a.disabled && !a.draining).length;
+  return { ...(result.draining ? { remaining: accountManager.drainRemaining(live.index) } : {}), inService };
+}
+
+/**
  * The accounts this request could ever have landed on, disabled ones included.
  *
  * Both halves of the exhaustion answer — how many accounts ran out, and how long
@@ -2979,8 +3016,9 @@ export function isTransientUpstreamError(err, { otherHostAvailable = false } = {
  * which is the very thing the caller is measuring; folding those in would leave
  * an empty set and nothing to measure.
  *
- * Disabled accounts stay in, because the message counts them separately: they
- * are the aside that says the fleet is smaller than the config looks.
+ * Disabled and draining accounts stay in, because the message counts them
+ * separately: they are the aside that says the fleet is smaller than the
+ * config looks.
  *
  * @param {import('./account-manager.js').AccountManager} accountManager
  * @param {string|null|undefined} model
@@ -3087,8 +3125,11 @@ const EXHAUSTED_MESSAGE_MAX_NAMES = 3;
  * @returns {string}
  */
 export function exhaustedMessage(candidates, model, retryAfter) {
-  const eligible = candidates.filter(a => !a.disabled);
-  const disabled = candidates.length - eligible.length;
+  // A draining account takes no new conversation, so it is set apart like a
+  // disabled one, and counted on its own: an undrain is the way back.
+  const eligible = candidates.filter(a => !a.disabled && !a.draining);
+  const draining = candidates.filter(a => !a.disabled && a.draining).length;
+  const disabled = candidates.length - eligible.length - draining;
 
   const scope = model ? ` for ${model}` : '';
   // No eligible account is not exhaustion. Nothing is going to reset, so a wait
@@ -3098,11 +3139,16 @@ export function exhaustedMessage(candidates, model, retryAfter) {
   // partition, which leaves a route that looks healthy in `teamclaude status`
   // and can serve nothing.
   if (!eligible.length) {
+    if (draining) {
+      return `No account can serve this request${scope}: every account eligible for it is draining (${draining})${disabled ? ` or disabled (${disabled})` : ''}, and a draining account takes no new conversations (teamclaude undrain <account> puts one back).`;
+    }
     return disabled
       ? `No account can serve this request${scope}: every account eligible for it is disabled (${disabled}).`
       : `No account can serve this request${scope}: no configured account is eligible for it — check the model's route and which provider its accounts belong to.`;
   }
-  const aside = disabled ? ` (${disabled} more disabled)` : '';
+  const aside = disabled || draining
+    ? ` (${[disabled ? `${disabled} more disabled` : '', draining ? `${draining} draining` : ''].filter(Boolean).join(', ')})`
+    : '';
   const when = retryAfter > 0
     ? ` Quota resets in ${formatWait(retryAfter)}.`
     : ' Retry shortly.';
@@ -3167,7 +3213,7 @@ export function exhaustedMessage(candidates, model, retryAfter) {
  * @returns {{ error_code: string, retry_after_seconds: number, resets_at: string | null }}
  */
 export function exhaustedDetails(candidates, retryAfter, resetAt) {
-  if (!candidates.some(a => !a.disabled)) {
+  if (!candidates.some(a => !a.disabled && !a.draining)) {
     return { error_code: 'no_eligible_account', retry_after_seconds: retryAfter, resets_at: null };
   }
   return {
@@ -3570,7 +3616,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     }
     const billingCandidates = (ctx.pinnedIndex != null
       ? [accountManager.accounts[ctx.pinnedIndex]].filter(Boolean)
-      : candidateAccounts(accountManager, ctx.model, ctx.provider)).filter(a => !a.disabled);
+      : candidateAccounts(accountManager, ctx.model, ctx.provider)).filter(a => !a.disabled && !a.draining);
     if (billingCandidates.length && billingCandidates.every(a => accountManager.unavailableReason(a, ctx.model) === 'billing')) {
       ctx.status = 402;
       ctx.account = '(billing unavailable)';
@@ -3667,6 +3713,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         // A third-party backend is an Anthropic-shaped account with no Anthropic
         // reset to spend; Codex rows never carry one, so the test is Claude's alone.
         && !(resetProvider === DEFAULT_PROVIDER && a.upstream)
+        // Not a draining account: the reset would buy new work it takes none of.
+        && !a.draining
         && clears.has(accountManager.unavailableReason(a, ctx.model) ?? ''))
       : [];
     if (resettable.length) {
@@ -3689,7 +3737,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // Measured once and used twice: the accounts the message counts and the
     // windows the retry-after is read from have to be the same accounts, or the
     // two halves of one sentence contradict each other.
-    const candidates = candidateAccounts(accountManager, ctx.model, ctx.provider);
+    // A draining account this request's own conversation is kept on can still
+    // serve it, once it can serve at all, so the answer and its wait count it
+    // like any other (drainKeeps).
+    const kept = ctx.pinKey ? accountManager.drainKeeps(ctx.pinKey, ctx.model) : null;
+    const candidates = candidateAccounts(accountManager, ctx.model, ctx.provider)
+      .map((/** @type {Record<string, any>} */ a) => (kept?.has(a.index) ? { ...a, draining: false } : a));
     const wait = retryWait(accountManager, candidates, ctx.model);
     const retryAfter = wait.seconds;
 
@@ -5375,7 +5428,7 @@ export function retryWait(accountManager, candidates, model = null) {
   let soonest = Infinity;
   let soonestResetAt = null;
   for (const acct of candidates) {
-    if (acct.disabled || acct.status === 'error') continue;
+    if (acct.disabled || acct.draining || acct.status === 'error') continue;
     let blockedFor = 0;
     for (const reset of blockingResets(accountManager, acct, model)) {
       const ms = new Date(reset).getTime() - now;

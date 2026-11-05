@@ -428,6 +428,10 @@ function makeAccount(acct, index, listener = null) {
     // placed, which lists after every account that has been.
     displayOrder: Number.isFinite(acct.displayOrder) ? acct.displayOrder : null,
     disabled: acct.disabled || false,
+    // Taken out of service gracefully (accounts[].draining): no new
+    // conversation is placed here, while a conversation already on it keeps
+    // being served there (see unavailableReason and _keepOnDraining).
+    draining: !!acct.draining,
     maxUsage: acct.maxUsage ?? null,
     // Money cap in the account's currency (accounts[].maxSpend). Like maxUsage a
     // total, not a preference: at the cap the account receives nothing.
@@ -1780,6 +1784,16 @@ export class AccountManager {
     // The empty set marks this call as a request's, since a poll hands none.
     // Allocated fresh: a set handed out once is one a later reader could add to.
     this.refreshExpiredQuotas(model, this.expiryRouting.enabled ? (exclude ?? new Set()) : exclude, advisorModel);
+    // A conversation already on a draining account stays there: a drain takes
+    // no new conversation, and keeps what is running. In every distribution
+    // mode, since a pin is recorded in every mode. A manual route pin to
+    // another account still wins, as it does over affinity below; one to the
+    // draining account itself cannot take new work, and keeps what it has.
+    const routePin = sessionId ? this._pinnedAccountForModel(model, advisorModel) : null;
+    if (sessionId && (!routePin || routePin.draining)) {
+      const kept = this._keepOnDraining(sessionId, exclude, model, advisorModel);
+      if (kept) return kept;
+    }
     // Session-affinity distribution (opt-in): keep a conversation on its pinned
     // account for cache reuse, and route a new one to the least-loaded account.
     // The unit is the conversation rather than the client session because one
@@ -2583,8 +2597,9 @@ export class AccountManager {
   _isProbeable(account) {
     if (!account) return false;
     // Never probe an account the operator has taken out of rotation or one
-    // whose token is broken — those are hard states, not stale guesses.
-    if (account.disabled) return false;
+    // whose token is broken — those are hard states, not stale guesses. Nor
+    // one being drained: a probe is a new request placed on it.
+    if (account.disabled || account.draining) return false;
     if (account.status === 'error' || account.status === 'exhausted') return false;
     // A live entitlement cooldown is evidence, not a stale quota estimate. Do
     // not let the all-unavailable probe path defeat it immediately.
@@ -2868,6 +2883,9 @@ export class AccountManager {
       !rank || p < rank[0] || (p === rank[0] && u < rank[1]);
     for (const account of this.accounts) {
       if (exclude?.has(account.index) || partition?.has(account.index)) continue;
+      // `quota` outranks `draining`, so a draining account can read as one
+      // below; the fallback places new work, which it takes none of.
+      if (account.draining) continue;
       const reason = this.unavailableReason(account, model);
       if (reason !== 'quota' && reason !== 'upstream-rejected') continue;
       if (model && !this._routeAllows(account, model)) continue;
@@ -2905,7 +2923,8 @@ export class AccountManager {
    *
    * Returns one of: 'disabled', 'spend-capped', 'capped', 'throttled', 'error',
    * 'entitlement', 'exhausted', 'upstream-rejected', 'quota', 'route', 'routing',
-   * 'credential', 'billing', 'advisor-capped', 'advisor-quota', 'advisor-route'.
+   * 'credential', 'billing', 'advisor-capped', 'advisor-quota', 'advisor-route',
+   * 'draining'.
    * @param {Record<string, any>} account
    * @param {string|null} [model]
    * @param {string|null} [advisorModel]
@@ -2989,6 +3008,13 @@ export class AccountManager {
       if (!this._routeAllows(account, advisorModel)) return 'advisor-route';
     }
 
+    // The operator is draining it (accounts[].draining): no new conversation
+    // goes here. Last, so every other reason outranks it, and `draining` alone
+    // means the account could serve but for the drain: a conversation already
+    // on it is kept there on exactly that answer (_keepOnDraining), while
+    // every placement path reads it as unavailable, as it reads `disabled`.
+    if (account.draining) return 'draining';
+
     return null;
   }
 
@@ -3026,6 +3052,7 @@ export class AccountManager {
       if (account.status === 'error') return { eligible: false, reason: isRefused(account) ? 'refused by upstream' : 'in an error state and needs a re-login' };
       if (account.status === 'exhausted') return { eligible: false, reason: 'out of quota' };
       if (account.status === 'throttled') return { eligible: false, reason: 'rate-limited' };
+      if (this.unavailableReason(account) === 'draining') return { eligible: false, reason: 'draining, so it takes no new conversations' };
       return { eligible: false, reason: 'at or above the switch threshold' };
     }
     // Healthy, but a higher-priority account preempts it on the next selection.
@@ -3128,6 +3155,62 @@ export class AccountManager {
     // let it out of the drain now instead of re-checking a dead pin every request.
     this._dropDraining(sessionId);
     return null;
+  }
+
+  /** Keep a conversation on the draining account its last request was
+   *  served by (accounts[].draining), so draining an account never moves what
+   *  is running there. Only while that account could serve it but for the
+   *  drain (`unavailableReason` says `draining` and nothing else), and only
+   *  where upstream's own movers would not move it anyway: a governing-window
+   *  rollover and a strictly better-priority account, as for the sessions
+   *  _selectDrainingSession keeps. A conversation with no pin on a draining
+   *  account is new to it, and placement reads the account as unavailable.
+   *  @param {string} sessionId @param {Set<number>|null} exclude
+   *  @param {*} model  loosely typed, like the availability checks it feeds
+   *  @param {*} advisorModel */
+  _keepOnDraining(sessionId, exclude, model, advisorModel) {
+    for (const idx of this.drainKeeps(sessionId, model)) {
+      const pinned = this.accounts[idx];
+      if (!pinned || exclude?.has(idx)) continue;
+      if (this.unavailableReason(pinned, model, advisorModel) !== 'draining') continue;
+      if (this.expiryRouting?.enabled && this.expiryRouting?.preempt
+          && this._pinRolledOver(sessionId, pinned, model)) return null;
+      const betterExists = this.accounts.some(a =>
+        this._isAvailable(a, model, advisorModel) && !exclude?.has(a.index) && (a.priority || 0) < (pinned.priority || 0));
+      if (!betterExists) return pinned;
+    }
+    return null;
+  }
+
+  /** The draining accounts a conversation is on, for a request in `model`'s
+   *  family: the account its pin for that family names, when it has one and
+   *  that account is draining, and none when it names a healthy one; with no
+   *  pin for the family, the draining accounts its other families are on. So
+   *  a drain keeps a conversation where it is and never draws it from a
+   *  healthy account to a draining one.
+   *  @param {string} sessionId @param {*} model @returns {Set<number>} */
+  drainKeeps(sessionId, model) {
+    /** @type {Set<number>} */
+    const keeps = new Set();
+    if (!sessionId || !this.accounts.some(a => a.draining)) return keeps;
+    const pinIdx = this.sessionTracker.pinnedAccount(sessionId, this._weeklyBucketFor(model));
+    const pinned = pinIdx != null ? [pinIdx] : this.sessionTracker.pinnedAccounts(sessionId);
+    for (const idx of pinned) if (this.accounts[idx]?.draining) keeps.add(idx);
+    return keeps;
+  }
+
+  /** How many conversations a draining account still has on it: the ones a
+   *  drain keeps there (pinned to it within the session tracker's known
+   *  window, an hour idle), or the requests still open on it, streams
+   *  included, when there are more of those (a request naming no session has
+   *  no pin, and counts only while it is open). 0 means nothing has run there
+   *  for an hour and nothing is open.
+   *  @param {number} index @param {any} [knownPerAccount] stats().knownPerAccount, when the caller already took it */
+  drainRemaining(index, knownPerAccount = null) {
+    const account = this.accounts[index];
+    if (!account) return 0;
+    const known = (knownPerAccount ?? this.sessionTracker.stats().knownPerAccount)[index] || 0;
+    return Math.max(known, account.activityOpen || 0);
   }
 
   /** How many sessions are still draining (0 when not draining). */
@@ -4602,6 +4685,8 @@ export class AccountManager {
       // here would send a live request on an account that must not be used and,
       // below, silently clear its throttle/error state. (Mirrors _isAvailable.)
       if (account.disabled || account.status === 'error') continue;
+      // Nor a draining one: this fallback places a new request.
+      if (account.draining) continue;
       // Nor one sitting out a 401: an old quota window that has since rolled
       // would otherwise name it the soonest to reset and send it the request.
       if (this._credentialHeld(account)) continue;
@@ -5149,6 +5234,18 @@ export class AccountManager {
       this.clearCredentialRejected(accountIndex);
       this.clearBillingRejected(accountIndex);
     }
+  }
+
+  /**
+   * Drain an account or put it back. A draining account takes no new
+   * conversation, while one already on it keeps being served there; an
+   * undrain asks for nothing to be retried, unlike an enable.
+   * @param {number} accountIndex @param {boolean} draining
+   */
+  setDraining(accountIndex, draining) {
+    const account = this.accounts[accountIndex];
+    if (!account) return;
+    account.draining = !!draining;
   }
 
   /**
@@ -5976,6 +6073,10 @@ export class AccountManager {
         // draws array order beside a server TUI drawing the arrangement.
         displayOrder: a.displayOrder ?? null,
         disabled: a.disabled || false,
+        // No new conversations here while those on it run on, and how many
+        // are still on it: empty, and safe to disable or remove, at 0.
+        draining: a.draining === true,
+        ...(a.draining === true ? { drainRemaining: this.drainRemaining(a.index, sessions.knownPerAccount) } : {}),
         maxUsage: a.maxUsage ?? null,
         maxSpend: a.maxSpend ?? null,
         // Raw per-account override (issue #409), same shapes as the fleet-wide

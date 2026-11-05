@@ -384,6 +384,25 @@ export function setAccountPriority(config, query, spec = {}) {
 }
 
 /**
+ * Drain an account, or put it back: a draining account takes no new
+ * conversation, while one already on it keeps being served there.
+ *
+ * Undraining deletes the key, as enabling does: an absent key is the default.
+ *
+ * @param {any} config
+ * @param {string} query
+ * @param {boolean} draining
+ * @param {{ orgFilter?: string }} [spec]
+ */
+export function setAccountDraining(config, query, draining, spec = {}) {
+  if (typeof draining !== 'boolean') throw new ConfigOpError('draining must be true or false');
+  const account = resolveConfiguredAccount(config, query, spec.orgFilter);
+  if (draining) account.draining = true;
+  else delete account.draining;
+  return { name: account.name, draining: !!account.draining };
+}
+
+/**
  * Take an account out of rotation, or put it back.
  *
  * Enabling deletes the key rather than writing `false`, because that is what

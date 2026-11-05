@@ -10,7 +10,7 @@ import { loadQuotaSeries, saveQuotaSeries } from './quota-series.js';
 import { installCrashHandlers } from './crash-log.js';
 import { AccountManager, distributionMode, accountRouting } from './account-manager.js';
 import { validateAdaptiveConfig } from './adaptive-distribution.js';
-import { createProxyServer, reloadedHeaderFlags } from './server.js';
+import { createProxyServer, reloadedHeaderFlags, resolveAccountPin } from './server.js';
 import { createDrainState, resolveDrainTimeoutSeconds } from './drain.js';
 import { importCredentials, loginOAuth, loginOAuthWithPastedCode, startOAuthLogin, fetchProfile, profileForCredentials, refreshAccessToken, isTokenExpired, isTokenExpiringSoon } from './oauth.js';
 import {
@@ -26,7 +26,7 @@ import {
 import { resolveAccounts } from './resolve-accounts.js';
 import { loginCodex, startCodexLogin } from './codex-auth.js';
 import { isRemoteSession, openBrowser, PANEL_LOGIN_TIMEOUT_MS } from './login-flow.js';
-import { providerOf } from './provider.js';
+import { providerOf, canServeProvider } from './provider.js';
 import { syncAccountsFromDisk } from './sync-accounts.js';
 import { mergeAccountsForSave, syncRefreshedTokens, removedAccountIds, clearRemovedAccountIds, clearAddedAccountIds, markAccountRemoved, configIndexFor } from './account-pairing.js';
 import { ensureAccountIds, accountIdsComplete } from './account-id.js';
@@ -119,6 +119,7 @@ import {
   thresholdTable,
   upsertRoute,
   setAccountDisabled,
+  setAccountDraining,
   setAccountPriority,
   renameAccount,
 } from './config-ops.js';
@@ -234,6 +235,14 @@ switch (command) {
     break;
   case 'enable':
     await setDisabledCommand(false);
+    process.exit(0);
+    break;
+  case 'drain':
+    await setDrainingCommand(true);
+    process.exit(0);
+    break;
+  case 'undrain':
+    await setDrainingCommand(false);
     process.exit(0);
     break;
   case 'api':
@@ -862,6 +871,14 @@ async function serverCommand() {
     /** @type {{ name: string, disabled: boolean }|undefined} */
     let result;
     await atomicConfigUpdate((/** @type {any} */ diskConfig) => { result = setAccountDisabled(diskConfig, account, disabled, spec); });
+    return result;
+  };
+  // POST /teamclaude/account-drain, the same way: no new conversation goes to
+  // a draining account, while one already on it keeps being served there.
+  hooks.setAccountDraining = async (/** @type {string} */ account, /** @type {boolean} */ draining, /** @type {any} */ spec) => {
+    /** @type {{ name: string, draining: boolean }|undefined} */
+    let result;
+    await atomicConfigUpdate((/** @type {any} */ diskConfig) => { result = setAccountDraining(diskConfig, account, draining, spec); });
     return result;
   };
 
@@ -1563,6 +1580,8 @@ async function envCommand() {
     // and this command must stay eval-safe.
     if (!(config.accounts || []).some((a, i) => a.name === account || String(i) === account)) {
       process.stderr.write(`# warning: no account named "${account}" in the config — the proxy will refuse this pin\n`);
+    } else if (config.accounts?.[resolveAccountPin({ accounts: config.accounts }, account) ?? -1]?.draining) {
+      process.stderr.write(`# warning: account "${account}" is draining — it takes no new conversations (teamclaude undrain ${account} puts it back)\n`);
     }
   }
   // The flag that reproduces this mode whatever the config's default says.
@@ -1616,6 +1635,15 @@ async function runCommand() {
   // gets inherited by every tool and MCP server claude spawns.
   const tcAcct = (process.env.TC_ACCT || '').trim();
   delete env.TC_ACCT;
+  // A pinned launch is a new conversation on that account, which a draining
+  // account takes none of: refused here, where it would start, while the
+  // sessions already pinned to it keep being served by the proxy.
+  // Resolved the way the proxy resolves the pin, so every spelling it takes
+  // (name, email, uuid) is caught here.
+  if (tcAcct && config.accounts?.[resolveAccountPin({ accounts: config.accounts }, tcAcct) ?? -1]?.draining) {
+    console.error(`[TeamClaude] Account "${tcAcct}" is draining: it takes no new conversations. Pin another account, or run without TC_ACCT, or put it back with: teamclaude undrain ${tcAcct}`);
+    process.exit(1);
+  }
   // Legacy: a caller-supplied ANTHROPIC_BASE_URL of http://<this proxy>/tc-acct/…
   // also pins (shipped in 1.1.10). TC_ACCT is the supported way now — it works in
   // MITM mode too, and keeps the pin out of the API path.
@@ -2810,6 +2838,49 @@ async function setDisabledCommand(disabled) {
   await notifyRunningServer(config);
 }
 
+// ── drain / undrain ─────────────────────────────────────────
+
+/**
+ * `teamclaude drain <name>` / `undrain <name>`: a draining account takes no
+ * new conversation, while one already on it keeps being served there until it
+ * finishes; the step before disabling or removing it. Written the way enable
+ * and disable are, then picked up by a running server's reload.
+ * @param {boolean} draining
+ */
+async function setDrainingCommand(draining) {
+  const config = await loadOrCreateConfig();
+  const name = args[1];
+  const verb = draining ? 'drain' : 'undrain';
+
+  if (!name) {
+    console.error(`Usage: teamclaude ${verb} <account-name|email> [--org <name|uuid>]`);
+    process.exit(1);
+  }
+
+  const account = resolveAccount(config.accounts, name, argValue('--org'));
+  if (!account) {
+    console.error(`Account "${name}" not found`);
+    process.exit(1);
+  }
+
+  if (draining) {
+    account.draining = true;
+  } else {
+    delete account.draining;
+  }
+  await saveConfig(config);
+  console.log(draining
+    ? `Draining account "${account.name}": no new conversations go to it; the ones already on it stay until they finish (teamclaude status shows how many are left)`
+    : `Undrained account "${account.name}": it takes new conversations again`);
+  await notifyRunningServer(config);
+  // Every other account that could take its traffic is disabled or draining
+  // too: say so now, rather than leave it to the next request's refusal.
+  const provider = providerOf(account);
+  if (draining && !(config.accounts || []).some((/** @type {any} */ a) => a !== account && !a.disabled && !a.draining && canServeProvider(a, provider))) {
+    console.log(`No other account takes new ${provider} conversations now: they are refused until one is undrained, enabled or added.`);
+  }
+}
+
 // ── routing ─────────────────────────────────────────────────
 
 async function routingCommand() {
@@ -2928,6 +2999,8 @@ Commands:
   remove <name>       Remove an account (by name or email; --org to disambiguate)
   disable <name>      Temporarily exclude an account from rotation
   enable <name>       Re-enable a disabled account (also clears a stuck error)
+  drain <name>        Send no new conversations to an account; the ones already
+                      on it stay there until they finish (undrain <name> to end)
   priority <name> <n> Set rotation priority (lower = preferred; --first/--last)
   rename <name> <new> Rename an account, updating the routes that list it
   route [list|add|rm] Per-model routing: pin model globs to specific accounts
