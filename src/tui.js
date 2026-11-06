@@ -2892,7 +2892,13 @@ export class TUI {
         const tag = creditTag(c);
         return tag ? Math.max(w, 2 + vw(tag)) : w;
       }, 0);
-      const fixed = 20 + typeCell + NAME_MIN + routeCells + tagW + spendW + creditW + switchW + routeW + prepaidW;
+      // The routing tag is the first to yield when even one bar at BAR_MIN no longer fits beside the rest: the address
+      // is on the status line and the dashboard, while the amount left and the bars are this row's to say. Without
+      // that, a routed credit account reserved 82 columns at W=80 before any bar and fitLine cut the address off
+      // (Copilot's review of #649).
+      const fixedWithRoute = 20 + typeCell + NAME_MIN + routeCells + tagW + spendW + creditW + switchW + routeW + prepaidW;
+      const routeTags = routeW === 0 || fixedWithRoute + BAR_MIN <= W;
+      const fixed = routeTags ? fixedWithRoute : fixedWithRoute - routeW;
       const span = (/** @type {number} */ n, /** @type {number} */ bar) => fixed + 6 * (n - 1) + n * bar;
       const roomFor = (/** @type {number} */ n) => span(n, BAR_MIN) <= W;
       // No Ses bar once every account here has said it meters no 5h window
@@ -2940,7 +2946,7 @@ export class TUI {
       const s2 = Math.max(s1, span(drawn, PANE_BAR_FLOOR) + nameWant);
       const s3 = Math.max(s2, span(drawn, BAR_MAX) + nameWant);
       return {
-        bw, showBoth, showFamily, anyFable, anySonnet, slack, shortBar,
+        bw, showBoth, showFamily, anyFable, anySonnet, slack, shortBar, routeTags,
         complete: showBoth && (families === 0 || showFamily),
         stages: [s1, s2, s3],
       };
@@ -2981,7 +2987,7 @@ export class TUI {
   /** Draw one row against a layout from _listLayout. */
   _renderRow(/** @type {number} */ idx, /** @type {any} */ L, /** @type {Set<number>} */ current) {
     const b = L.budgets.get(rowCategory(this.am.accounts[idx]));
-    return this._renderAcct(idx, b.bw, b.showBoth, L.routes, L.genRoutes, L.familyTarget, b.showFamily, L.nameW, { current, compact: L.compact, shortBar: b.shortBar });
+    return this._renderAcct(idx, b.bw, b.showBoth, L.routes, L.genRoutes, L.familyTarget, b.showFamily, L.nameW, { current, compact: L.compact, shortBar: b.shortBar, routeTags: b.routeTags });
   }
 
   /** The row, then for an account out of rotation as `error` the line `teamclaude status`
@@ -3118,7 +3124,7 @@ export class TUI {
     return rows;
   }
 
-  _renderAcct(idx, bw, showBoth, routes = this.am.getRoutes(), genRoutes = routes.filter(r => routeFamily(r) === null), familyTarget = {}, showFamily = true, nameW = NAME_MIN, { current = this._currentRows(), compact = false, shortBar = true } = {}) {
+  _renderAcct(idx, bw, showBoth, routes = this.am.getRoutes(), genRoutes = routes.filter(r => routeFamily(r) === null), familyTarget = {}, showFamily = true, nameW = NAME_MIN, { current = this._currentRows(), compact = false, shortBar = true, routeTags = true } = {}) {
     const a = this.am.accounts[idx];
     const isCur = current.has(idx);
     const isSel = this.mode === 'select' && idx === this.selIdx;
@@ -3372,7 +3378,8 @@ export class TUI {
     if (switchTag) line += `  ${cyan(switchTag)}`;
     // Routing tag trails even that: where the account's traffic physically
     // leaves the machine, when the operator pinned it to its own proxy.
-    const routeTag = routingTag(a);
+    // Left out when the row's budget had no room for it (`routeTags`, budgetFor).
+    const routeTag = routeTags ? routingTag(a) : '';
     if (routeTag) line += `  ${cyan(routeTag)}`;
     return line;
   }

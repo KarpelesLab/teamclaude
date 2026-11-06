@@ -403,7 +403,10 @@ export function sanitizeCreditView(raw) {
     estimate: raw.estimate === true,
     upperBound: raw.upperBound === true,
     currency: str(raw.currency, 8),
-    exponent: num(raw.exponent),
+    // Prepaid credit is US dollars in cents only, so the payload's own exponent
+    // is never trusted: a negative one passed `num` and made formatMoney throw
+    // a RangeError while the TUI drew the row.
+    exponent: 2,
     amountMinor: num(raw.amountMinor),
     spentMinor: num(raw.spentMinor),
     remainingMinor: num(raw.remainingMinor),

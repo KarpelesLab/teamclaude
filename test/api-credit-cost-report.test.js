@@ -104,6 +104,9 @@ test('other failures say what failed and carry no sum', async () => {
     [row({ amount: null, currency: 'USD' }), 'parse', /unreadable amount/],
     [row({ amount: '10', currency: 'EUR' }), 'parse', /EUR, not USD/],
     [{ body: { nothing: true } }, 'parse', /no data list/],
+    // A bucket whose results are missing or not a list is no reading - never an empty day
+    [{ body: { data: [{ starting_at: new Date(START).toISOString() }], has_more: false } }, 'parse', /without a results list/],
+    [{ body: { data: [{ starting_at: new Date(START).toISOString(), results: { amount: '10' } }], has_more: false } }, 'parse', /without a results list/],
   ];
   for (const [page, kind, message] of cases) {
     const { fetchImpl } = stubFetch([page]);

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
 import { TUI, creditTag } from '../src/tui.js';
 import { RemoteAccountManager } from '../src/tui-remote.js';
-import { CreditMonitor } from '../src/api-credit.js';
+import { CreditMonitor, sanitizeCreditView } from '../src/api-credit.js';
 
 // An API-key row with prepaid credit (accounts[].credit) draws a Cr bar after
 // Tok/Req and a `$X left` tag. Both are width-budgeted (#234): the row must
@@ -27,6 +27,8 @@ async function buildFleet({ oauth = true } = {}) {
     { name: 'credit-unread@example.com', type: 'apikey', apiKey: 'k3', credit: { amount: 100, cycleStart: anchorDate(), adminKey: `${KEY}-b` } },
     { name: 'credit-over@example.com', type: 'apikey', apiKey: 'k4', credit: { amount: 100, cycleStart: anchorDate(), adminKey: `${KEY}-c` } },
     { name: 'plain-key@example.com', type: 'apikey', apiKey: 'k5' },
+    // Copilot's review of #649: $200 of local credit behind its own proxy reserved 82 columns at W=80 before any bar
+    { name: 'credit-routed@example.com', type: 'apikey', apiKey: 'k6', routing: 'http://127.0.0.1:8080', credit: { amount: 200, cycleStart: anchorDate() } },
   ];
   const log = console.log;
   console.log = () => {};
@@ -108,6 +110,11 @@ test('a wide row draws the Cr bar and the amount left; the tag outlives the bar 
   const narrow = renderRows(am, 76);
   assert.doesNotMatch(find(narrow, 'credit-admin@example.com'), /Cr /);
   assert.match(find(narrow, 'credit-admin@example.com'), /\$154\.32 left/);
+  // The routing tag yields before the amount: whole when wide, gone - not cut - when the row cannot hold it
+  assert.match(find(wide, 'credit-routed@example.com'), /~\$200\.00 left +via http:\/\/127\.0\.0\.1:8080/);
+  const tight = find(renderRows(am, 80), 'credit-routed@example.com');
+  assert.match(tight, /~\$200\.00 left/);
+  assert.doesNotMatch(tight, /via /);
 });
 
 test('attach mode draws the same credit off the status payload, and fits', async () => {
@@ -152,4 +159,10 @@ test('creditTag: the source, the shortfall and the failure each show', () => {
   assert.equal(creditTag({ ...base, source: 'admin', remainingMinor: null, error: { kind: 'http' } }), 'cr err');
   assert.equal(creditTag({ ...base, source: 'admin', remainingMinor: null }), 'cr ?');
   assert.equal(creditTag({ ...base, source: 'admin', error: { kind: 'network' } }), '$176.55 left!');
+});
+
+test('an attached payload with a negative exponent cannot crash the row (Copilot on #649)', () => {
+  const view = sanitizeCreditView({ source: 'admin', currency: 'USD', exponent: -1, amountMinor: 20000, spentMinor: 100, remainingMinor: 19900, exceededMinor: 0 });
+  assert.equal(view?.exponent, 2);
+  assert.equal(creditTag(view), '$199.00 left');
 });

@@ -122,8 +122,11 @@ export async function fetchOrgSpend({ adminKey, startMs, endMs = null, routing =
       // the query asked for this range.
       if (Number.isFinite(at) && (at < startMs || (endMs != null && at >= endMs))) continue;
       buckets++;
-      const results = Array.isArray(bucket?.results) ? bucket.results : [];
-      for (const row of results) {
+      // A bucket with no results list is no reading of that day: summed as an
+      // empty day, it would replace the last good reading with zero or a part.
+      // A day that really spent nothing answers `results: []`.
+      if (!Array.isArray(bucket?.results)) return fail('parse', res.status, 'cost report bucket without a results list');
+      for (const row of bucket.results) {
         if (row?.currency != null && row.currency !== 'USD') {
           return fail('parse', res.status, `cost report row in ${safeLine(row.currency, 8)}, not USD`);
         }
