@@ -565,7 +565,8 @@ export function unavailableLine(account, paint) {
     const capacity = account.fallbackTier === 'free'
       ? 'included quota available past switch threshold'
       : 'subscription usage credits available';
-    return `${paint.dim('Fallback'.padEnd(8))} ${paint.yellow(capacity)} (fallback after normal rotation)`;
+    const policy = account.preferExtraUsage === true ? 'extra-usage preference enabled' : 'fallback after normal rotation';
+    return `${paint.dim('Fallback'.padEnd(8))} ${paint.yellow(capacity)} (${policy})`;
   }
   return `${paint.dim('Blocked'.padEnd(8))} ${paint.yellow(text)}`;
 }
