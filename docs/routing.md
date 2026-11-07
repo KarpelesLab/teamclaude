@@ -283,6 +283,14 @@ score = P ÷ (1 + load)
 
 Every candidate needs a score, so the states the band leaves open are priced: a reset that has already passed, or no reading, counts as a fresh window (the cap, or 1, over one week); a reading with no reset time uses the band's own lower bound; and an account with nothing left under its caps scores 0. When every candidate scores 0 the even walk places the conversation, as it does when every account is reserved. Nothing else changes: availability, priority, the band, pins and the decision whether a pinned conversation moves (the `preempt` rollover above) are untouched. When that decision has moved a conversation, `"pressure"` picks the destination among the other accounts. With `expiryRouting` off the band lets every account through and only the score changes. The setting applies to `"adaptive"` only and is read at startup.
 
+With `"pressureFiveHour": true` in `adaptiveDistribution` (off by default, read at startup, and only under `"scoring": "pressure"`), the score also counts the 5-hour window, so an account close to that wall takes fewer new conversations:
+
+```
+score = P × h5 ÷ (1 + load),   h5 = (T5 − 5h use) ÷ T5
+```
+
+`T5` is the lower of the account's own 5-hour cap and switch threshold. `h5` runs from 1 for an untouched window to 0 at `T5`, and a window with no reading, no reset time or a reset already passed counts as 1. It places new conversations only: it can slow how quickly one busy pinned conversation reaches the wall, not stop it, and the decision whether a pinned conversation moves does not read it. `teamclaude status` shows the factor as `5h room`.
+
 ### Load distribution
 
 ```json
