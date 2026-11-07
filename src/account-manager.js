@@ -722,6 +722,8 @@ export class AccountManager {
     this.scoring = this.burnRateLearner.opts.scoring === 'pressure' ? 'pressure' : 'burndown';
     // Read only under "pressure" (see _fiveHourFactor).
     this.pressureFiveHour = this.burnRateLearner.opts.pressureFiveHour === true;
+    // Likewise (see _withoutFiveHourSoft).
+    this.fiveHourSoftMargin = this.burnRateLearner.opts.fiveHourSoftMargin;
     // The stored quota series behind the fleet forecast (#550). Empty until the
     // server loads its file (index.js) or samples accumulate; the manager only
     // samples into it and reads it, the file I/O lives with the caller.
@@ -2237,13 +2239,18 @@ export class AccountManager {
       return this._pickLeastLoadedEven(exclude, model, advisorModel, { byRequests: true });
     }
     if (this.distributionMode === 'adaptive') {
-      const picked = this._pickAdaptive(exclude, model, advisorModel, purpose);
+      // A preference about where new work goes, so whether a pinned session
+      // moves never reads it; the destination of a decided move does. Ahead of
+      // the band, which could otherwise narrow to the account being avoided.
+      const held = purpose === 'placement' ? this._withoutFiveHourSoft(exclude, model, advisorModel) : exclude;
+      const picked = this._pickAdaptive(held, model, advisorModel, purpose);
       // Adaptive can legitimately score every candidate at zero — the whole
       // tier is inside its reserve — and that is not a reason to refuse a
       // request. Fall through to the even walk, which still returns the least
       // loaded of them, and let the switch threshold be what actually takes an
       // account out of rotation.
       if (picked) return picked;
+      return this._pickLeastLoadedEven(held, model, advisorModel);
     }
     return this._pickLeastLoadedEven(exclude, model, advisorModel);
   }
@@ -2608,7 +2615,7 @@ export class AccountManager {
     const bucket = this._weeklyBucketFor(model);
 
     const excluded = this._excludeOtherProviders(null, provider);
-    const eligible = this._bandedCandidates(excluded, model);
+    const eligible = this._bandedCandidates(this._withoutFiveHourSoft(excluded, model), model);
     const topPriority = eligible.length ? Math.min(...eligible.map(a => a.priority || 0)) : 0;
     // Only the accounts actually competing get a weight: an ineligible or
     // outranked account's weight is not "small", it is not in the draw at all.
@@ -3703,6 +3710,38 @@ export class AccountManager {
   _liveFiveHourUse(account, now) {
     const q = account.quota;
     return Number.isFinite(q?.unified5h) && q.unified5hReset > now ? q.unified5h : null;
+  }
+
+  /**
+   * `exclude`, widened by the accounts `adaptiveDistribution.fiveHourSoftMargin`
+   * keeps new sessions off: those in the top priority tier whose live 5-hour use
+   * has reached their own 5-hour cap (or a full window, with no cap) less the
+   * margin. Placement otherwise ignores that window until the account becomes
+   * unavailable, and then every session pinned there moves at once and loses its
+   * cache.
+   *
+   * Only under adaptive "pressure" with a margin set, and only while another
+   * account of that tier can take the session: a preference never refuses a
+   * request, and never sends it to a lower priority, which can be a metered key.
+   *
+   * @param {*} exclude  a set or null, loosely typed like _excludeOtherProviders
+   * @param {*} [model]
+   * @param {*} [advisorModel]
+   * @returns {*}
+   */
+  _withoutFiveHourSoft(exclude, model = null, advisorModel = null) {
+    if (!(this.fiveHourSoftMargin > 0) || this.distributionMode !== 'adaptive' || this.scoring !== 'pressure') return exclude;
+    const now = Date.now();
+    const candidates = this.accounts.filter((/** @type {Record<string, any>} */ a) => !exclude?.has(a.index) && this._isAvailable(a, model, advisorModel));
+    if (!candidates.length) return exclude;
+    const topPriority = Math.min(...candidates.map((/** @type {Record<string, any>} */ a) => a.priority || 0));
+    const tier = candidates.filter((/** @type {Record<string, any>} */ a) => (a.priority || 0) === topPriority);
+    const over = tier.filter((/** @type {Record<string, any>} */ a) => {
+      const use = this._liveFiveHourUse(a, now);
+      return use != null && use >= Math.min(this.capFor('unified5h', a) ?? 1, 1) - this.fiveHourSoftMargin;
+    });
+    if (!over.length || over.length === tier.length) return exclude;
+    return new Set([...(exclude ?? []), ...over.map((/** @type {Record<string, any>} */ a) => a.index)]);
   }
 
   /**

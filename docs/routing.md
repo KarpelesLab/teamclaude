@@ -293,6 +293,8 @@ score = P × h5 ÷ (1 + load),   h5 = (T5 − 5h use) ÷ T5
 
 `T5` is the lower of the account's own 5-hour cap and switch threshold. `h5` runs from 1 for an untouched window to 0 at `T5`, and a window with no reading, no reset time or a reset already passed counts as 1. It places new conversations only: it can slow how quickly one busy pinned conversation reaches the wall, not stop it, and the decision whether a pinned conversation moves does not read it. `teamclaude status` shows the factor as `5h room`.
 
+With `"fiveHourSoftMargin": 0.15` in `adaptiveDistribution` (`0`, off, by default; read at startup, and only under `"scoring": "pressure"`), a new conversation stops going to an account once its live 5-hour use reaches its own 5-hour cap, or a full window with no cap, less the margin: at `0.15`, a `0.7` cap stops at `0.55` and an uncapped account at `0.85`. Otherwise placement ignores that window until the account leaves rotation, and every conversation pinned there then moves at once and loses its cache. It is only a preference: it applies while another account of the same priority can take the conversation, so it never refuses a request or reaches for a lower priority such as a metered key. Conversations already pinned to the account stay, and it shows in `status` as not competing.
+
 ### Load distribution
 
 ```json
