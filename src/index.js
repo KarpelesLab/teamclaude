@@ -1561,7 +1561,9 @@ async function envCommand() {
     process.stderr.write(`# pinned to account "${account}" (TC_ACCT)\n`);
     // Warn, don't fail: the account list can change before the shell is used,
     // and this command must stay eval-safe.
-    if (!(config.accounts || []).some((a, i) => a.name === account || String(i) === account)) {
+    // A comma list (a, b, c) is checked name by name, as the proxy resolves it.
+    const known = (/** @type {string} */ t) => (config.accounts || []).some((/** @type {any} */ a, /** @type {number} */ i) => a.name === t || String(i) === t);
+    if (!known(account) && !account.split(',').every(known)) {
       process.stderr.write(`# warning: no account named "${account}" in the config — the proxy will refuse this pin\n`);
     }
   }
@@ -2992,6 +2994,8 @@ Environment:
                       both modes. Accepts accountUuid, orgUuid,
                       accountUuid/orgUuid, or a display name/email:
                         TC_ACCT=me@example.com teamclaude run
+                      A comma list of API-key accounts (TC_ACCT=a,b,c) moves
+                      along the list when billing refuses the current one.
                       Prefer a UUID for anything scripted: display names are
                       rewritten when an email gains a second org. Read by 'run'
                       and 'env', then removed from the environment so it never
