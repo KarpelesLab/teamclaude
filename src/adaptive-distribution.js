@@ -92,6 +92,11 @@ export const ADAPTIVE_DEFAULTS = {
   // account's 5-hour window, so an account near that wall takes fewer new
   // sessions. See fiveHourHeadroomFraction.
   pressureFiveHour: false,
+  // Under "pressure" only: how far below an account's own 5-hour cap (or below a
+  // full window, with no cap) new sessions stop being placed on it, while
+  // another account of its priority can take them. 0 turns it off. See
+  // AccountManager._withoutFiveHourSoft.
+  fiveHourSoftMargin: 0,
 };
 
 const SCORING_MODES = ['burndown', 'pressure'];
@@ -99,7 +104,7 @@ const SCORING_MODES = ['burndown', 'pressure'];
 // The fields that are fractions of a window, or EWMA weights: bounded to the
 // unit interval, and the alphas additionally non-zero (an alpha of 0 would
 // mean "never learn", which is a request the learner cannot honour).
-const UNIT_FIELDS = ['minReserve', 'maxReserve'];
+const UNIT_FIELDS = ['minReserve', 'maxReserve', 'fiveHourSoftMargin'];
 const ALPHA_FIELDS = ['burnAlpha', 'concBackoff', 'concGrowth', 'concBackoffTo'];
 const POSITIVE_FIELDS = ['maxSampleAgeMs', 'lookaheadMs', 'burnWindowMs', 'initialConcCap', 'minConcCap', 'maxConcCap'];
 
