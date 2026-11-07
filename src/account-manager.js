@@ -3262,6 +3262,11 @@ export class AccountManager {
    * cannot flap) than `account`'s own. Null when the knob is off, when
    * `account`'s reset is unknown, or when nothing resets sooner. An account
    * whose reset is unknown never preempts: it may well reset later.
+   * @param {Record<string, any>|null|undefined} account
+   * @param {string|null} [model]
+   * @param {string|null} [advisorModel]
+   * @param {Set<number>|null} [exclude]
+   * @returns {Record<string, any>|null}
    */
   _soonerResetPreemptor(account, model = null, advisorModel = null, exclude = null) {
     if (!this.preferSoonestWeeklyReset || !account) return null;
