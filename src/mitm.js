@@ -20,7 +20,7 @@ import tls from 'node:tls';
 import http2 from 'node:http2';
 import { getConfigPath } from './config.js';
 import { generateCertChain } from './x509.js';
-import { createProxyRequestListener, resolveClientAuth, loopbackExempt, relayUpgrade, resolveAccountPin, describeConnectError, KEEP_ALIVE_TIMEOUT_MS, shouldStripOverageHeaders } from './server.js';
+import { createProxyRequestListener, resolveClientAuth, loopbackExempt, relayUpgrade, resolvePinList, describeConnectError, KEEP_ALIVE_TIMEOUT_MS, shouldStripOverageHeaders } from './server.js';
 import { interceptHostsFor, isNeverIntercepted, providerForPath, DEFAULT_PROVIDER } from './provider.js';
 import { forwardRefusal, guardedLookup, FORBIDDEN_FORWARD } from './forward-target.js';
 import { safeLine } from './safe-text.js';
@@ -524,7 +524,9 @@ export function connectPinToken(req) {
  *
  * An unrecognized username is an ERROR rather than a silently ignored pin: a
  * typo'd account name that quietly served from the wrong account is exactly the
- * failure mode this feature exists to remove.
+ * failure mode this feature exists to remove. The same holds for every name of
+ * a pin that lists several accounts in order (`a,b`, see resolvePinList); the
+ * pin is passed on as written and resolved again per request.
  *
  * @returns {{pin: string|null, error: string|null}}
  */
@@ -538,7 +540,7 @@ export function resolveConnectPin(req, accountManager, proxyConfig) {
   if (resolveClientAuth(proxy, token).ok && (proxy?.apiKey || proxy?.clientKeys?.length)) {
     return { pin: null, error: null };
   }
-  if (resolveAccountPin(accountManager, token) == null) {
+  if (resolvePinList(accountManager, token) == null) {
     return { pin: null, error: `Unknown account pin ${redactToken(token)}` };
   }
   return { pin: token, error: null };

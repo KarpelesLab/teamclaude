@@ -33,6 +33,7 @@ import { ensureAccountIds, accountIdsComplete } from './account-id.js';
 import * as alias from './alias.js';
 import { ensureCerts, mitmHosts, caCertPath } from './mitm.js';
 import { Prober, probeApplicable } from './prober.js';
+import { CreditMonitor } from './api-credit.js';
 import { ResetCreditRedeemer } from './codex-reset-credits.js';
 import { ClaudeResetRedeemer } from './claude-resets.js';
 import { Warmer, warmApplicable } from './warmer.js';
@@ -530,6 +531,10 @@ async function serverCommand() {
 
   // Opt-in background quota probe (config.quotaProbeSeconds, default 0 = off).
   let prober = null;
+  // The prepaid-credit cost-report reader: reads only accounts that carry
+  // `credit.adminKey`, and nothing at all when none does.
+  /** @type {CreditMonitor|null} */
+  let creditMonitor = null;
   // Opt-in keep-warm scheduler (interval or persisted reset-target schedule).
   let warmer = null;
   const serverStartedAt = Date.now();
@@ -1038,6 +1043,14 @@ async function serverCommand() {
     console.error('[TeamClaude] accounts[].maxSpend is set but the quota probe is off (quotaProbeSeconds = 0) — the spend figure it is judged against is only refreshed by the probe, so the cap only binds after a manual `p` refresh; run `teamclaude probe <seconds>`');
   }
 
+  // Read each account's organization spend for `accounts[].credit` when it
+  // carries an Admin API key (api-credit.js). Opt-in by the key's presence,
+  // zero-spend, and disabled accounts included: it sends no message and
+  // refreshes no token. The check is a minute's tick over the account list;
+  // each account is read on its own `refreshMinutes`.
+  creditMonitor = new CreditMonitor(accountManager);
+  creditMonitor.start();
+
   // Start the opt-in keep-warm scheduler. Interval mode runs relative to server
   // startup; reset-target modes restore their next occurrence from config.
   warmer = new Warmer(accountManager, {
@@ -1074,6 +1087,7 @@ async function serverCommand() {
     stopTitle();
     if (!tui) console.log('\n[TeamClaude] Shutting down...');
     prober?.stop();
+    creditMonitor?.stop();
     warmer?.stop();
     credentialSync.stop();
     eventLoopMonitor.stop();
@@ -1563,7 +1577,9 @@ async function envCommand() {
     process.stderr.write(`# pinned to account "${account}" (TC_ACCT)\n`);
     // Warn, don't fail: the account list can change before the shell is used,
     // and this command must stay eval-safe.
-    if (!(config.accounts || []).some((a, i) => a.name === account || String(i) === account)) {
+    // A comma list (a, b, c) is checked name by name, as the proxy resolves it.
+    const known = (/** @type {string} */ t) => (config.accounts || []).some((/** @type {any} */ a, /** @type {number} */ i) => a.name === t || String(i) === t);
+    if (!known(account) && !account.split(',').every(known)) {
       process.stderr.write(`# warning: no account named "${account}" in the config — the proxy will refuse this pin\n`);
     }
   }
@@ -2994,6 +3010,8 @@ Environment:
                       both modes. Accepts accountUuid, orgUuid,
                       accountUuid/orgUuid, or a display name/email:
                         TC_ACCT=me@example.com teamclaude run
+                      A comma list of API-key accounts (TC_ACCT=a,b,c) moves
+                      along the list when billing refuses the current one.
                       Prefer a UUID for anything scripted: display names are
                       rewritten when an email gains a second org. Read by 'run'
                       and 'env', then removed from the environment so it never
