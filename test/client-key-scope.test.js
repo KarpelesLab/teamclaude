@@ -24,6 +24,7 @@ const CONTROL_ROUTES = [
   ['POST', '/teamclaude/priority', { account: 'acct', place: 'first' }],
   ['POST', '/teamclaude/disable', { account: 'acct', disabled: true }],
   ['POST', '/teamclaude/account-cordon', { account: 'acct', cordoned: true }],
+  ['POST', '/teamclaude/account-release', { account: 'acct' }],
   ['POST', '/teamclaude/session-pin', {}],
   ['POST', '/teamclaude/drain'],
   ['POST', '/teamclaude/undrain'],

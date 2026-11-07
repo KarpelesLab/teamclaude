@@ -595,6 +595,8 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
   ['/teamclaude/priority', 'a client key cannot change accounts'],
   ['/teamclaude/disable', 'a client key cannot change accounts'],
   ['/teamclaude/account-cordon', 'a client key cannot change accounts'],
+  // Not a config write, but it moves every conversation on the account.
+  ['/teamclaude/account-release', 'a client key cannot release pins'],
   // Not a config write, but it names a session and moves it: one tenant must
   // not be able to put another tenant's session on an account of its choosing.
   ['/teamclaude/session-pin', 'a client key cannot pin sessions'],
@@ -1035,6 +1037,37 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           + (eligible ? '' : ` — ${reason}, so rotation will not use it`));
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true, account: name, eligible, ...(reason ? { reason } : {}) }));
+        return;
+      }
+
+      // Release the conversations pinned to one account, leaving the account in
+      // service (`teamclaude release`, #643). Runtime only, like a switch: pins
+      // die with the process, so nothing is written to the config.
+      if (req.method === 'POST' && req.url === '/teamclaude/account-release') {
+        const names = () => (accountManager.accounts || []).map((/** @type {Record<string, any>} */ a) => a.name);
+        let target;
+        try {
+          target = JSON.parse(await readControlBody(req) || '{}')?.account;
+        } catch (/** @type {any} */ err) {
+          const tooLarge = err.message === 'body too large';
+          res.writeHead(tooLarge ? 413 : 400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: tooLarge ? 'request body too large' : 'invalid request body' }));
+          return;
+        }
+        if (typeof target !== 'string' || !target.trim()) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'missing "account"', accounts: names() }));
+          return;
+        }
+        const index = resolveAccountPin(accountManager, target);
+        const result = index == null ? null : accountManager.releasePins(index);
+        if (!result) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: `no such account "${target}"`, accounts: names() }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, account: result.name, released: result.released, stillCurrent: result.stillCurrent }));
         return;
       }
 

@@ -98,3 +98,40 @@ test('a cordon written by the CLI is applied live, keeps the conversation on the
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('teamclaude release empties the running server\'s pins on an account and keeps it in service', { timeout: 120_000 }, async () => {
+  const upstream = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => { res.writeHead(200, { 'content-type': 'application/json' }); res.end('{}'); });
+  });
+  const upstreamPort = await listen(upstream);
+  const server = await spawnServer({
+    config: () => ({
+      proxy: { apiKey: 'tc-test' },
+      upstream: `http://127.0.0.1:${upstreamPort}`,
+      upstreamProxy: false,
+      accounts: [
+        { name: 'work', type: 'apikey', apiKey: 'k-work' },
+        { name: 'personal', type: 'apikey', apiKey: 'k-personal' },
+      ],
+    }),
+  });
+  const env = { ...process.env, TEAMCLAUDE_CONFIG: server.configPath, TEAMCLAUDE_DISABLE_AUTOUPDATE: '1' };
+  for (const key of Object.keys(env)) if (/^(https?|all|no)_proxy$/i.test(key)) delete env[key];
+  const row = async () => (await (await fetch(`http://127.0.0.1:${server.port}/teamclaude/status`, { headers: { 'x-api-key': 'tc-test' } })).json())
+    .accounts.find((/** @type {any} */ a) => a.name === 'work');
+  try {
+    assert.equal(await post(server.port, 'the running one'), 200);
+    assert.equal((await row()).knownSessions, 1);
+
+    const released = await run(process.execPath, [cli, 'release', 'work'], { env, timeout: 30_000 });
+    assert.match(released.stdout, /Released 1 conversation pinned to "work"/);
+    const after = await row();
+    assert.equal(after.knownSessions, 0);
+    assert.equal(after.disabled, false);
+  } finally {
+    await server.stop();
+    upstream.close();
+    await rm(server.dir, { recursive: true, force: true }).catch(() => {});
+  }
+});

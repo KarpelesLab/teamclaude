@@ -94,6 +94,7 @@ test('priority and disable are refused cross-origin, before any hook runs', asyn
       ['/teamclaude/priority', { account: 'bob@example.com', place: 'first' }],
       ['/teamclaude/disable', { account: 'bob@example.com', disabled: true }],
       ['/teamclaude/account-cordon', { account: 'bob@example.com', cordoned: true }],
+      ['/teamclaude/account-release', { account: 'bob@example.com' }],
     ]) {
       const res = await fetch(`http://127.0.0.1:${port}${path}`, {
         method: 'POST',

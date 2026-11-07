@@ -80,7 +80,7 @@ It is a setting, not a nudge: the number is written to the config file (under it
 
 You usually don't need to call it directly. `login`, `import`, `enable`, `disable`, `cordon`, `uncordon`, `priority`, `route`, `threshold`, `distribute`, `probe` and `warmup` notify a running server themselves.
 
-Control-plane **writes** (`reload`, `switch`, `session-pin`, `threshold`, `priority`, `disable`, `account-cordon`) are refused when the request carries a browser `Origin` or a cross-site `Sec-Fetch-Site`. Loopback is exempt from the proxy API key so the CLI needs no configuration, but that exemption also covers any web page you happen to visit: a page can POST to `127.0.0.1` cross-origin without a preflight, and while it cannot read the reply, the write would still land. `curl` and the CLI send neither header and are unaffected. Reads (`status`) are not restricted — the same-origin policy already stops a page from seeing the response.
+Control-plane **writes** (`reload`, `switch`, `session-pin`, `threshold`, `priority`, `disable`, `account-cordon`, `account-release`) are refused when the request carries a browser `Origin` or a cross-site `Sec-Fetch-Site`. Loopback is exempt from the proxy API key so the CLI needs no configuration, but that exemption also covers any web page you happen to visit: a page can POST to `127.0.0.1` cross-origin without a preflight, and while it cannot read the reply, the write would still land. `curl` and the CLI send neither header and are unaffected. Reads (`status`) are not restricted — the same-origin policy already stops a page from seeing the response.
 
 `GET /teamclaude/quota` is the compact read endpoint for status-line integrations. It returns tier-weighted fleet aggregates and the underlying per-account limits; see [Fleet quota endpoint](quota.md#fleet-quota-endpoint).
 
@@ -214,6 +214,7 @@ teamclaude disable <name>    # Temporarily exclude an account from rotation
 teamclaude enable <name>     # Re-enable it (also clears a stuck error state)
 teamclaude cordon <name>      # Send it no new conversations; the ones on it stay
 teamclaude uncordon <name>    # Send it new conversations again
+teamclaude release <name>     # Unpin the conversations on it; each is placed again on its next request
 teamclaude priority <name> 1 # Set rotation priority (lower = preferred)
 teamclaude rename <name> <new> # Rename an account (and the routes that list it)
 teamclaude route list        # Manage per-model routes (add/rm)
@@ -245,7 +246,7 @@ Re-running `teamclaude service install` rewrites the unit and restarts the proxy
 
 ## Control routes under a second name
 
-Every `/teamclaude/…` route the server exposes — `status`, `quota`, `reload`, `switch`, `disable`, `account-cordon`, `priority`, `threshold`, `probe`, `drain`, `undrain`, `dashboard` and `mcp` — also answers at the same path under `/teamrouter/…`, with the same gates and the same replies. It is the first step of the [rename to TeamRouter](../README.md#renaming-to-teamrouter); scripts and dashboards written against `/teamclaude/…` keep working unchanged.
+Every `/teamclaude/…` route the server exposes — `status`, `quota`, `reload`, `switch`, `disable`, `account-cordon`, `account-release`, `priority`, `threshold`, `probe`, `drain`, `undrain`, `dashboard` and `mcp` — also answers at the same path under `/teamrouter/…`, with the same gates and the same replies. It is the first step of the [rename to TeamRouter](../README.md#renaming-to-teamrouter); scripts and dashboards written against `/teamclaude/…` keep working unchanged.
 
 ## Cordoning one account
 
@@ -266,6 +267,12 @@ teamclaude uncordon me@example.com
 - Cordoning and disabling are separate flags: enabling a cordoned account leaves it cordoned.
 
 A cordon is per account. [Draining for maintenance](#draining-for-maintenance) below drains the whole proxy and is runtime state; the two are independent.
+
+## Releasing the conversations on an account
+
+`teamclaude release <name>` (or `POST /teamclaude/account-release` with `{"account": "<name>"}`) deletes the pins on one account while leaving it in service, so each conversation on it is placed again on its next request by the normal ranking, which may put it straight back. It answers how many conversations it released. Use it to send running conversations toward an account whose weekly quota is about to expire without disabling the one they are on, which would take that account away from everyone. On a [cordoned](#cordoning-one-account) account it moves the conversations it would otherwise keep.
+
+It needs a running server and writes nothing to the config, since pins live in the server. A [session pin](routing.md#move-one-running-session) and a [`TC_ACCT`](routing.md#pin-a-session-to-one-account) pin are left alone, and requests in flight finish where they are. With session distribution off, every conversation rests on the current account anyway, so if that is this account traffic stays until you also run `teamclaude switch <other>`; the command says so.
 
 ## Draining for maintenance
 
@@ -320,7 +327,7 @@ The running server can expose its control plane to Claude Code (or any other MCP
 { "proxy": { "mcp": "read" } }
 ```
 
-`"read"` serves `get_status` (the fleet at a glance: server version, current account, and for each account its priority, whether it is disabled, whether it is cordoned and how many conversations are left on it, whether rotation can use it and why not, sessions and known quota windows), `get_quota` and `get_settings`. `"full"` adds everything the CLI's management commands can do: `switch_account`, `reload_config`, `probe_quota`, `set_account_enabled`, `set_account_cordoned`, `set_account_priority`, `set_account_routing`, `remove_account`, `set_threshold`, `set_distribution`, `set_probe_interval`, `set_warmup`, `set_route`, `remove_route`, `set_blocked_models` and `set_client_mode`. There is no tool for adding accounts or handling account credentials, and none for changing `proxy.mcp` itself. `set_account_routing` does take a proxy URL with its password, and the write log prints that URL masked. `reload_config` re-reads the file and reports how many accounts it added and how many it removed: an account whose entry is gone from the file is dropped from the running fleet (see [accounts](accounts.md)). A reload picks the `proxy.mcp` setting up, so the endpoint can be opened, narrowed or closed while the server runs.
+`"read"` serves `get_status` (the fleet at a glance: server version, current account, and for each account its priority, whether it is disabled, whether it is cordoned and how many conversations are left on it, whether rotation can use it and why not, sessions and known quota windows), `get_quota` and `get_settings`. `"full"` adds everything the CLI's management commands can do: `switch_account`, `reload_config`, `probe_quota`, `set_account_enabled`, `set_account_cordoned`, `release_account_pins`, `set_account_priority`, `set_account_routing`, `remove_account`, `set_threshold`, `set_distribution`, `set_probe_interval`, `set_warmup`, `set_route`, `remove_route`, `set_blocked_models` and `set_client_mode`. There is no tool for adding accounts or handling account credentials, and none for changing `proxy.mcp` itself. `set_account_routing` does take a proxy URL with its password, and the write log prints that URL masked. `reload_config` re-reads the file and reports how many accounts it added and how many it removed: an account whose entry is gone from the file is dropped from the running fleet (see [accounts](accounts.md)). A reload picks the `proxy.mcp` setting up, so the endpoint can be opened, narrowed or closed while the server runs.
 
 Point Claude Code at it once; `teamclaude run` and `teamclaude env` already keep loopback out of the proxy variables, so the connection goes straight to the server and is key-exempt like every other loopback caller:
 

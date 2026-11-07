@@ -316,6 +316,16 @@ const WRITE_TOOLS = [
     }).then(outcome => ({ ...outcome, cordoned: args.cordoned })),
   },
   {
+    name: 'release_account_pins',
+    title: 'Release the conversations pinned to an account',
+    description: 'Delete the pins on an account, leaving it in service: each conversation is placed again on its next request by the normal ranking. Not saved: pins live in the running server. A session pin or TC_ACCT pin is left alone.',
+    properties: ACCOUNT_ARGS,
+    required: ['account'],
+    write: true,
+    // accountIndexFor has already refused an account that is not there.
+    run: (args, ctx) => /** @type {Record<string, any>} */ (ctx.accountManager.releasePins(accountIndexFor(ctx, args))),
+  },
+  {
     name: 'set_account_priority',
     title: 'Set account priority',
     description: 'Set an account\'s rotation priority: lower is preferred, default 0, negative allowed. Saved to the config file.',

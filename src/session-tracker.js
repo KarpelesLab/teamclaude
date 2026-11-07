@@ -581,6 +581,26 @@ export class SessionTracker {
     return [...s.pins.values()].sort((a, b) => b.at - a.at).map(p => p.idx);
   }
 
+  // Delete every pin naming this account, on the operator's say-so (`teamclaude
+  // release`): each conversation is placed again on its next request. Answers how
+  // many live conversations held one. Their rollover observations stay, since
+  // those are about the account and not about the pin.
+  /** @param {number} accountIndex */
+  releaseAccount(accountIndex, now = this._now()) {
+    let released = 0;
+    for (const s of this.sessions.values()) {
+      if (this._isExpired(s, now)) continue;
+      let held = false;
+      for (const [bucket, pin] of [...s.pins]) {
+        if (pin.idx !== accountIndex) continue;
+        s.pins.delete(bucket);
+        held = true;
+      }
+      if (held) released++;
+    }
+    return released;
+  }
+
   // Re-point every pin through `mapFn` after the account list is renumbered (see
   // AccountManager.removeAccount). A pin is a bare position in that list, so a
   // removal one slot below silently hands the session to a different account;
