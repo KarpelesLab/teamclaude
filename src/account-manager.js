@@ -3415,6 +3415,28 @@ export class AccountManager {
     return Math.max(known, account.activityOpen || 0);
   }
 
+  /**
+   * Release the conversations pinned to an account, without taking the account
+   * away from anyone: each is placed again on its next request, by the normal
+   * ranking, which may well put it back. Disabling did this only by removing the
+   * account from service; a higher priority elsewhere only for as long as it
+   * lasts. A session pin or a `TC_ACCT` pin is not an affinity and is left alone.
+   *
+   * `stillCurrent` says the release cannot move traffic by itself: with
+   * distribution off every conversation rests on the current account anyway.
+   *
+   * @param {number} accountIndex
+   * @returns {{ name: string, released: number, stillCurrent: boolean }|null}
+   */
+  releasePins(accountIndex) {
+    const account = this.accounts[accountIndex];
+    if (!account) return null;
+    const released = this.sessionTracker.releaseAccount(accountIndex);
+    console.log(`[TeamClaude] Released ${released} conversation${released === 1 ? '' : 's'} pinned to "${safeLine(account.name, 64)}" (manual)`);
+    const stillCurrent = !this.distributeSessions && this._currentIndexForProvider(providerOf(account)) === accountIndex;
+    return { name: account.name, released, stillCurrent };
+  }
+
   /** How many sessions are still draining (0 when not draining). */
   drainingCount() {
     this._pruneDrain();
