@@ -450,6 +450,17 @@ function refusalText(/** @type {Record<string, any>} */ err) {
   return `refused by upstream: ${detail}${link} — once resolved, run: ${safeLine(err.remedy, 40)}`;
 }
 
+/**
+ * `; last good refresh 3d ago` beside a rejected refresh token, when this
+ * process saw one succeed (#629); empty otherwise.
+ * @param {any} account
+ * @param {any} err
+ */
+function lastGoodRefresh(account, err) {
+  if (err?.code !== 'refresh_rejected' || !Number.isFinite(account?.lastRefreshAt)) return '';
+  return `; last good refresh ${formatAgo(account.lastRefreshAt, Date.now())}`;
+}
+
 export function unavailableLine(account, paint) {
   const reason = account?.unavailable;
   if (!reason) return null;
@@ -459,7 +470,7 @@ export function unavailableLine(account, paint) {
   const err = reason === 'error' ? account.errorReason : null;
   const text = refused ? refusalText(account.errorReason)
     : !err ? UNAVAILABLE_TEXT[reason] || safeLine(reason, 64)
-    : `needs a re-login: ${safeLine(err.detail, 120)} — run: ${safeLine(err.remedy, 40)}`;
+    : `needs a re-login: ${safeLine(err.detail, 120)}${lastGoodRefresh(account, err)} — run: ${safeLine(err.remedy, 40)}`;
   // An account serving as the extra-usage fallback reads as out of quota like
   // any other, yet is taking traffic and billing for it. Say so on the line
   // that would otherwise tell the operator it is idle.
