@@ -30,7 +30,8 @@ test('a rejected refresh token reports its code, status, time and remedy', async
   assert.match(row.errorReason.detail, /\(400\)/);
   assert.ok(row.errorReason.since >= before);
   assert.equal(row.errorReason.remedy, 'teamclaude login');
-  assert.doesNotMatch(JSON.stringify(row.errorReason), /\{|secret-value/, 'no upstream body and no token in status');
+  assert.doesNotMatch(row.errorReason.detail, /[{}"]/, 'no upstream body in status');
+  assert.doesNotMatch(JSON.stringify(row.errorReason), /secret-value/, 'no token in status');
 });
 
 test('a 401 on a token with nothing to refresh reports credential_rejected', () => {
