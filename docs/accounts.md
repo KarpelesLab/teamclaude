@@ -512,6 +512,70 @@ held to a 10-second budget, because the waiting client's patience for the
 response head is finite and the retry needs the rest of it. Every attempt and outcome is
 logged.
 
+### The spending strategy
+
+A Codex reset does one more thing than it says: besides clearing the spent
+weekly window it **restarts the 7-day timer from the moment of redemption**
+(verified on a live account; an Anthropic reset leaves the timer where it was).
+That has two consequences the switch above knows nothing about.
+
+- A credit buys the days left to the natural reset, not a week. An account
+  whose reset was T days away gets T days of fresh window and then the reset it
+  would have had anyway: the credit was worth **T/7 of a week**. Spent the day
+  before the natural reset, it bought almost nothing.
+- Redeeming several accounts at once moves all their timers to the same
+  moment. A pool whose resets were spread across the week — what keeps one
+  account available while another is out — collapses into a **sawtooth**: a
+  full pool, then a dry fleet, together, every seven days.
+
+Three keys shape what the switch spends, all off unless set, so a fleet that
+never sets them behaves exactly as before:
+
+- [`autoRedeemMinDaysToReset`](configuration.md) — never auto-redeem an
+  account whose natural reset is closer than this many days. The account is
+  skipped with a line in the log saying what the credit would have bought.
+- [`autoRedeemMaxShare`](configuration.md) — of the armed accounts whose
+  natural resets fall in the same 24-hour cohort, redeem at most this share
+  (rounded up), most-exhausted first, so the rest keep their phase. The cohort
+  is sized as it was before any of it was redeemed this week; otherwise each
+  redemption would shrink it and let the next one through.
+- [`autoRedeemMaxPerDay`](configuration.md) — at most this many automatic
+  redemptions per rolling 24 hours.
+
+Every account the policy passes over is logged once per reason:
+`[TeamClaude] Codex rate-limit reset on "<name>" skipped — <reason>`.
+
+`teamclaude status` prints a `Redeem` line under each Codex account — `armed`
+or `exempt — <reason>`, and what a credit spent now is worth (`credit worth
+0.43 of a week (3.0d to reset)`). The JSON carries the same under
+`accounts[].autoRedeem` (`{ armed, exemptReason, creditValueWeeks }`, `null` on
+a non-Codex row) and the fleet's `redeemPolicy`
+(`{ minDaysToReset, maxShare, maxPerDay, redeemedLast24h }`). `armed` is about
+the policy and the caps, not the moment: an armed account whose weekly window
+is still healthy is armed and simply not exhausted.
+
+### Spending a credit by hand
+
+`teamclaude redeem <name>` spends one credit on a named Codex account now,
+through the same redeemer the switch uses (`POST /teamclaude/redeem` with
+`{"account": "<name>", "force": false}`), so the same cooldowns, idempotency
+key and redemption ledger apply. It is the operator's own action, so the fleet
+switch and the per-account opt-out — both about the *automatic* policy — do not
+gate it, and neither do the share and per-day caps. What does hold is
+everything about the credit itself: the account's **weekly window must be
+spent** (a credit is scarce and unrecoverable, and clearing a healthy window
+wastes it), and the credit must clear `autoRedeemMinDaysToReset` unless
+`--force` says you have weighed that. `--force` reaches past the floor and
+nothing else. After it lands, the pool holds off automatic redemptions for the
+same hours a successful automatic one does. A client key may not call it.
+
+`teamclaude redeem --plan` (`GET /teamclaude/redeem/plan`) prints what the
+policy would do right now — one line per Codex account with its standing, the
+credit's value and the last probed credit count, and which account an
+automatic attempt would reach for first — without spending anything or asking
+upstream anything: it is a dry run of the decision, and the decision's own
+network steps are exactly what it leaves out.
+
 ## Claude banked usage-limit resets
 
 Claude sometimes grants an account a **banked usage-limit reset**, shown under
