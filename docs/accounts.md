@@ -63,6 +63,8 @@ teamclaude login --api
 
 A key is **metered** — every token it serves is billed — while a subscription's quota is paid for whether it is spent or not. So a key is added at `priority: 100`, the fallback tier: rotation reaches it only when every account ahead of it is spent, and leaves it the moment one of them has quota again (a higher-priority account preempts on the next selection, so a reset elsewhere moves traffic back off the key). Pass `--priority <n>` to place it yourself; `--priority 0` puts it level with the subscriptions, which is where an added key sat before 1.1.23. A key already in the config keeps whatever priority it has: `teamclaude priority <name> 100` (or `--last`) moves it to the back.
 
+A key's `Tok`/`Req` bars are per-minute rate-limit headroom, not money. When the key draws on **prepaid credit** — the monthly API credit a Max or Ultra plan grants a linked Console organization, say — `accounts[].credit` shows how much of it is left this cycle, read from the organization's cost report with an Admin API key (zero-spend, so also for a disabled, pin-only key) or estimated from the replies the proxy served. See [Prepaid API credit](quota.md#prepaid-api-credit).
+
 ### When the key is rejected (401)
 
 A 401 on an API-key account never reaches the client. The request fails over to the next account, and the account that answered it is held out of rotation for a cooldown, then tried again. It is not benched for good, because a 401 does not always mean the key is bad: a gateway such as LiteLLM, set as the account's `upstream`, can answer one while its own upstream is unreachable.
