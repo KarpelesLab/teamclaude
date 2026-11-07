@@ -121,6 +121,9 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     // operator decision about a running fleet, and waiting for a restart to
     // honour a budget defeats the budget.
     mgr.maxUsage = diskAcct.maxUsage ?? null;
+    // A cordon applies on reload too: placement reads it at the next request,
+    // and a conversation already on the account is kept there (account-manager.js).
+    accountManager.setCordoned(mgr.index, !!diskAcct.cordoned);
     mgr.maxSpend = diskAcct.maxSpend ?? null;
     // Same for a per-account switch threshold (#409): thresholdFor() reads it
     // straight off the account, so a disk edit takes effect on the very next
@@ -195,6 +198,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       // arrangement every entry carries a value for a hand edit to lose to.
       if (Number.isFinite(diskAcct.displayOrder)) cfgAcct.displayOrder = diskAcct.displayOrder; else delete cfgAcct.displayOrder;
       if (diskAcct.disabled) cfgAcct.disabled = true; else delete cfgAcct.disabled;
+      if (diskAcct.cordoned) cfgAcct.cordoned = true; else delete cfgAcct.cordoned;
       if (diskAcct.allowExtraUsage === true) cfgAcct.allowExtraUsage = true; else delete cfgAcct.allowExtraUsage;
       // Both polarities are mirrored, unlike the flags above: `false` is the
       // side of this key that does something, so a stale mirror of either value

@@ -13,6 +13,7 @@ import { PROVIDERS, providerOf, isSubscriptionAccount, upstreamFor } from './pro
 import { mintAccountId } from './account-id.js';
 import { ACCOUNT_REFUSAL_CODES } from './account-refusal.js';
 import { formatPercent, heldResetCredits, showSessionRow, showWeeklyRow, unavailableLine } from './status-renderer.js';
+import { cacheUsageLabel, cacheUsageState } from './usage-label.js';
 import { resolveMaxUsage, resolveMaxSpendMinor, switchThresholdDiffs, modelLabel, EFFORT_SEP } from './model.js';
 import { parseProxyUrl, proxyToUrl, describeProxy, describeSelfProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy, localListener, isSelfProxy } from './upstream-proxy.js';
 import { describeRouting, parseRoutingUrl, routingToUrl, checkRouting } from './account-routing.js';
@@ -60,6 +61,8 @@ const yellow = s => fg(33, s);
 const red = s => fg(31, s);
 const cyan = s => fg(36, s);
 const gray = s => fg(90, s);
+// The cache figures of a request line, by whether the cache held (#642).
+const CACHE_PAINT = { hit: green, partial: yellow, miss: red, none: dim };
 
 // Named foreground colors selectable per route (config `color`). Bright variants
 // let a user distinguish several routes at a glance.
@@ -1089,7 +1092,9 @@ export class TUI {
     const model = modelParen(modelLabel(info.model, info.effort), info.effort, false); // shown when the request named a model
     const sid = info.sessionId || r?.sessionId || null;
     const pin = (info.pinned || r?.pinned) ? dim(' [pin]') : '';
-    this._addLog(`${this._sessionTag(sid)} ${info.method} ${info.path}${model} → ${acct}${pin} (${info.status}, ${dur}s)`);
+    const cacheLabel = cacheUsageLabel(info.cacheUsage);
+    const cache = cacheLabel && CACHE_PAINT[cacheUsageState(info.cacheUsage)](cacheLabel);
+    this._addLog(`${this._sessionTag(sid)} ${info.method} ${info.path}${model} → ${acct}${pin} (${info.status}, ${dur}s)${cache ? ` ${cache}` : ''}`);
     if (this.active.size === 0) this._retick();   // animating → idle
   }
 
@@ -3209,6 +3214,10 @@ export class TUI {
       status = yellow(left ? `denied ${left}` : 'denied');
     } else if (typeof barred === 'string' && /capped$/.test(barred)) {
       status = yellow('capped');
+    } else if (barred === 'cordoned') {
+      // No new conversations go to it; the ones on it stay. Only when the cordon
+      // is all that keeps it out: a spent or failing account says that instead.
+      status = yellow('cordoned');
     } else switch (a.status) {
       case 'active':
         // Re-admitted after an entitlement cooldown, not yet proven by a served request.
