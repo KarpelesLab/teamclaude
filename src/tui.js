@@ -393,6 +393,39 @@ export function extraUsageTag(allowed, serving) {
   return allowed ? 'xu' : '';
 }
 
+/**
+ * Short row tag for an API-key account's prepaid credit (accounts[].credit):
+ * what is left, `$176.55 left`, or once the spend has gone past the amount, by
+ * how much, `$12.30 over` (nothing is left of the included credit). A `~` in
+ * front marks the local estimate — only traffic through this proxy, so at most
+ * that much is left — a trailing `?` an estimate missing replies it could not
+ * price, and a trailing `!` a cost-report read that is failing while the last
+ * good reading is shown. Before the first reading: `cr ?`, or `cr key!` /
+ * `cr err` when the read is failing (credential / anything else). ASCII, like
+ * spendTag, and short, so the width budget can count it on a narrow row; the
+ * wording in full is on the status line and the dashboard. The days to the
+ * reset ride on the Cr bar's countdown, not here.
+ * @param {any} credit  a creditView (api-credit.js), or null
+ */
+export function creditTag(credit) {
+  if (!credit) return '';
+  if (credit.remainingMinor == null) return credit.error ? (credit.error.kind === 'credential' ? 'cr key!' : 'cr err') : 'cr ?';
+  const money = (/** @type {number} */ minor) => formatMoney({ usedMinor: minor, limitMinor: null, currency: credit.currency, exponent: credit.exponent ?? 2 });
+  const est = credit.source === 'local' ? '~' : '';
+  const flags = `${credit.incomplete ? '?' : ''}${credit.error ? '!' : ''}`;
+  if (credit.exceededMinor > 0) return `${est}${money(credit.exceededMinor)} over${flags}`;
+  return `${est}${money(credit.remainingMinor)} left${flags}`;
+}
+
+/** The tag's color: red once nothing is left or nothing could be read, yellow
+ * while the figure is short of something, cyan otherwise (a reserve, like RC).
+ * @param {any} credit */
+function creditColor(credit) {
+  if (credit.remainingMinor == null) return credit.error ? red : dim;
+  if (credit.remainingMinor <= 0) return red;
+  return credit.error || credit.incomplete ? yellow : cyan;
+}
+
 export function blockedFamilies(quota, threshold) {
   const at = typeof threshold === 'function' ? threshold : () => threshold;
   // A spent shared weekly bars every model, not one family: the router gates
@@ -2814,7 +2847,11 @@ export class TUI {
       const anyFable = members.some(a => a.quota.unified7dFable != null);
       const anySonnet = members.some(a => a.quota.unified7dSonnet != null);
       const anyMonthly = members.some(a => bwLive(a.quota.backend?.windows?.monthly) != null && bwLive(a.quota.backend?.windows?.weekly) != null);
-      const families = (anyFable ? 1 : 0) + (anySonnet ? 1 : 0) + (anyMonthly ? 1 : 0);
+      // A metered row with prepaid credit draws a Cr bar after Tok/Req: one more
+      // bar, budgeted like a family bar, so it is the first to go when narrow.
+      const credits = cat === 'metered' ? members.map(a => this._credit(a)) : [];
+      const anyCredit = credits.some(c => c != null);
+      const families = (anyFable ? 1 : 0) + (anySonnet ? 1 : 0) + (anyMonthly ? 1 : 0) + (anyCredit ? 1 : 0);
       const tagW = members.reduce((w, a) => {
         const names = blockedFamilies(a.quota, key => this.am.thresholdFor(key, a));
         return names.length ? Math.max(w, 4 + vw(names.join(' '))) : w;
@@ -2853,7 +2890,19 @@ export class TUI {
         const tag = routingTag(a);
         return tag ? Math.max(w, 2 + vw(tag)) : w;
       }, 0);
-      const fixed = 20 + typeCell + NAME_MIN + routeCells + tagW + spendW + creditW + switchW + routeW;
+      // And for the prepaid-credit tag (`$176.55 left`), drawn on every width:
+      // the bar may yield, the amount left may not.
+      const prepaidW = credits.reduce((/** @type {number} */ w, /** @type {any} */ c) => {
+        const tag = creditTag(c);
+        return tag ? Math.max(w, 2 + vw(tag)) : w;
+      }, 0);
+      // The routing tag is the first to yield when even one bar at BAR_MIN no longer fits beside the rest: the address
+      // is on the status line and the dashboard, while the amount left and the bars are this row's to say. Without
+      // that, a routed credit account reserved 82 columns at W=80 before any bar and fitLine cut the address off
+      // (Copilot's review of #649).
+      const fixedWithRoute = 20 + typeCell + NAME_MIN + routeCells + tagW + spendW + creditW + switchW + routeW + prepaidW;
+      const routeTags = routeW === 0 || fixedWithRoute + BAR_MIN <= W;
+      const fixed = routeTags ? fixedWithRoute : fixedWithRoute - routeW;
       const span = (/** @type {number} */ n, /** @type {number} */ bar) => fixed + 6 * (n - 1) + n * bar;
       const roomFor = (/** @type {number} */ n) => span(n, BAR_MIN) <= W;
       // No Ses bar once every account here has said it meters no 5h window
@@ -2901,7 +2950,7 @@ export class TUI {
       const s2 = Math.max(s1, span(drawn, PANE_BAR_FLOOR) + nameWant);
       const s3 = Math.max(s2, span(drawn, BAR_MAX) + nameWant);
       return {
-        bw, showBoth, showFamily, anyFable, anySonnet, slack, shortBar,
+        bw, showBoth, showFamily, anyFable, anySonnet, slack, shortBar, routeTags,
         complete: showBoth && (families === 0 || showFamily),
         stages: [s1, s2, s3],
       };
@@ -2942,7 +2991,7 @@ export class TUI {
   /** Draw one row against a layout from _listLayout. */
   _renderRow(/** @type {number} */ idx, /** @type {any} */ L, /** @type {Set<number>} */ current) {
     const b = L.budgets.get(rowCategory(this.am.accounts[idx]));
-    return this._renderAcct(idx, b.bw, b.showBoth, L.routes, L.genRoutes, L.familyTarget, b.showFamily, L.nameW, { current, compact: L.compact, shortBar: b.shortBar });
+    return this._renderAcct(idx, b.bw, b.showBoth, L.routes, L.genRoutes, L.familyTarget, b.showFamily, L.nameW, { current, compact: L.compact, shortBar: b.shortBar, routeTags: b.routeTags });
   }
 
   /** The row, then for an account out of rotation as `error` the line `teamclaude status`
@@ -3079,7 +3128,7 @@ export class TUI {
     return rows;
   }
 
-  _renderAcct(idx, bw, showBoth, routes = this.am.getRoutes(), genRoutes = routes.filter(r => routeFamily(r) === null), familyTarget = {}, showFamily = true, nameW = NAME_MIN, { current = this._currentRows(), compact = false, shortBar = true } = {}) {
+  _renderAcct(idx, bw, showBoth, routes = this.am.getRoutes(), genRoutes = routes.filter(r => routeFamily(r) === null), familyTarget = {}, showFamily = true, nameW = NAME_MIN, { current = this._currentRows(), compact = false, shortBar = true, routeTags = true } = {}) {
     const a = this.am.accounts[idx];
     const isCur = current.has(idx);
     const isSel = this.mode === 'select' && idx === this.selIdx;
@@ -3187,6 +3236,7 @@ export class TUI {
       : undefined;
     let r2BackendMonthly = false;
     const category = rowCategory(a);
+    const credit = category === 'metered' ? this._credit(a) : null;
     if (category !== 'metered') {
       // A third-party backend has no unified readings; its probed windows fill
       // the same slots. No threshold: rotation gates nothing on a backend, so
@@ -3290,6 +3340,16 @@ export class TUI {
       if (showFamily && q.unified7dFable != null) {
         line += `${famLead('fable')}${familyMark('fable')}F7  ${bar(q.unified7dFable, bw, q.unified7dFableReset, SEVEN_DAY_MS, limFor('unified7dFable'), pctInBar)}`;
       }
+      // Prepaid credit used this cycle, paced against the cycle like a weekly
+      // bar, its countdown the days to the renewal. No threshold: rotation
+      // gates nothing on it. Unknown spend (no cost-report reading yet) draws
+      // the empty bar with the countdown.
+      if (showFamily && credit) {
+        const end = Date.parse(credit.cycleEnd);
+        const start = Date.parse(credit.cycleStart);
+        const span = Number.isFinite(end) && Number.isFinite(start) && end > start ? end - start : MONTH_MS;
+        line += `  Cr  ${bar(credit.usedFraction, bw, Number.isFinite(end) ? end : null, span, null, pctInBar)}`;
+      }
     }
     // Explicit "disabled for these models" tag (issue #85): a family the account
     // can't serve even while it is otherwise active. A spent shared 5h blocks
@@ -3301,6 +3361,9 @@ export class TUI {
     // OWN configured threshold.
     const blocked = blockedFamilies(q, limFor);
     if (blocked.length) line += `  ${red('⊘ ' + blocked.join(' '))}`;
+    // What is left of the prepaid credit, beside its bar.
+    const prepaid = creditTag(credit);
+    if (prepaid) line += `  ${creditColor(credit)(prepaid)}`;
     // Money tag last, so it sits at the end of the row where the eye lands after
     // the bars. Red once real money has moved, yellow while it only could.
     const money = spendTag(q, a.maxSpend);
@@ -3323,9 +3386,17 @@ export class TUI {
     if (switchTag) line += `  ${cyan(switchTag)}`;
     // Routing tag trails even that: where the account's traffic physically
     // leaves the machine, when the operator pinned it to its own proxy.
-    const routeTag = routingTag(a);
+    // Left out when the row's budget had no room for it (`routeTags`, budgetFor).
+    const routeTag = routeTags ? routingTag(a) : '';
     if (routeTag) line += `  ${cyan(routeTag)}`;
     return line;
+  }
+
+  /** The account's prepaid-credit view: built by the manager in-process, read
+   * off the status payload attached (where `credit` already is the view).
+   * @param {any} a */
+  _credit(a) {
+    return typeof this.am.creditStatus === 'function' ? this.am.creditStatus(a) : (a.credit ?? null);
   }
 
   /** Whether the account behind this row is serving on extra usage. Asked of

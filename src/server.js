@@ -119,6 +119,12 @@ const OAUTH_ENTITLEMENT_ERROR_CODE = 'oauth_not_allowed_for_organization';
 const OAUTH_VERIFICATION_ERROR_CODE = 'verification_required';
 // A token missing a scope the endpoint needs (see isOAuthScopeInsufficient).
 const OAUTH_SCOPE_ERROR_CODE = 'oauth_scope_insufficient';
+// The Codex backend's whole sentence for a model the account's ChatGPT plan
+// does not serve (see codexUnsupportedModel). Keyed on the sentence, not on the
+// `model_not_found` code, because the `{"detail": ...}` shape carries no code.
+// Anchored, because other 400s can echo the client's own text, and that must
+// not bar a model.
+const CODEX_MODEL_UNSUPPORTED = /^The '([A-Za-z0-9._:-]{1,64})' model is not supported when using Codex with a ChatGPT account\.?$/;
 const ERROR_BODY_INSPECTION_LIMIT = 64 * 1024;
 // How long an idle keep-alive connection is held open.
 //
@@ -194,15 +200,36 @@ export function oauthVerificationHold(body) {
   }
 }
 
-/** Upstream's own message for a refusal, bounded for the status payload.
- * @param {Buffer} body */
-function upstreamErrorMessage(body) {
+/** The message in an upstream error body, unbounded, or null: Anthropic's and
+ * the Codex backend's `error.message`, else the bare `detail` string the Codex
+ * backend has also answered with.
+ * @param {Uint8Array|null} body */
+function upstreamErrorText(body) {
+  if (!body) return null;
   try {
-    const message = JSON.parse(Buffer.from(body).toString('utf8'))?.error?.message;
-    return typeof message === 'string' ? safeLine(message, 200) || null : null;
+    const parsed = JSON.parse(Buffer.from(body).toString('utf8'));
+    const message = parsed?.error?.message ?? parsed?.detail;
+    return typeof message === 'string' ? message : null;
   } catch {
     return null;
   }
+}
+
+/** Upstream's own message for a refusal, bounded for the status payload.
+ * @param {Uint8Array|null} body */
+function upstreamErrorMessage(body) {
+  const message = upstreamErrorText(body);
+  return message == null ? null : safeLine(message, 200) || null;
+}
+
+/** The model a Codex 400 says the account's ChatGPT plan does not serve, or
+ * null. About the account, not the request: another account's plan may serve
+ * the same body. Seen as `{"detail": "..."}` and as `{"error": {"message": "..."}}`.
+ * @param {Uint8Array|null} body
+ * @returns {string|null} */
+export function codexUnsupportedModel(body) {
+  const message = upstreamErrorText(body);
+  return message == null ? null : CODEX_MODEL_UNSUPPORTED.exec(message.trim())?.[1] ?? null;
 }
 
 /** Whether a response's Content-Type names a JSON body (parameters ignored).
@@ -1446,6 +1473,74 @@ export function resolveAccountPin(accountManager, token) {
 }
 
 /**
+ * Resolve a pin that may name several accounts, in order, to their indices, or
+ * null when any name matches no account.
+ *
+ * `a,b,c` pins a session to `a` and names where a request goes when upstream
+ * billing refuses the account it is on: the next listed API-key account (see
+ * advancePinPastBilling). The whole string is tried as one name first, so a pin
+ * that resolves today, a display name with a comma in its org included, still
+ * names that one account. Every name of a list has to match, for the reason an
+ * unknown single name is refused: a typo that quietly shortened the list would
+ * end a run the operator gave somewhere to go. A repeated name counts once.
+ *
+ * @param {any} accountManager  an AccountManager, or anything with its `accounts`
+ * @param {string} token
+ * @returns {number[]|null}
+ */
+export function resolvePinList(accountManager, token) {
+  const whole = resolveAccountPin(accountManager, token);
+  if (whole != null) return [whole];
+  const names = String(token ?? '').split(',');
+  if (names.length < 2) return null;
+  /** @type {number[]} */
+  const indices = [];
+  for (const name of names) {
+    const i = resolveAccountPin(accountManager, name);
+    if (i == null) return null;
+    if (!indices.includes(i)) indices.push(i);
+  }
+  return indices;
+}
+
+/**
+ * Move a request pinned to a list (resolvePinList) off an account upstream
+ * billing has refused, to the next account the list names. Called before each
+ * selection: right after a billing refusal the account is in its cooldown and
+ * this request has tried it, and a later request finds it still cooling and
+ * never sends it the refusal again. Once the cooldown is over, one request tries
+ * the account again.
+ *
+ * API-key accounts only, on both sides: a subscription is never left or reached
+ * this way, whatever the list names. The next account is of the same provider,
+ * outside its own billing cooldown and not capped; the ones passed over are
+ * dropped from the list for this request. A pin that names one account never
+ * gets here. Nothing here is rotation: the cursor, session placement and every
+ * other account are untouched, as for any pin.
+ *
+ * @param {Record<string, any>} ctx
+ * @param {import('./account-manager.js').AccountManager} accountManager
+ */
+function advancePinPastBilling(ctx, accountManager) {
+  if (!ctx.pinChain?.length || !accountManager.isBillingRejected(ctx.pinnedIndex)) return;
+  const from = accountManager.accounts[ctx.pinnedIndex];
+  if (from?.type !== 'apikey') return;
+  while (ctx.pinChain.length) {
+    const i = ctx.pinChain.shift();
+    const next = accountManager.accounts[i];
+    if (next?.type !== 'apikey' || providerOf(next) !== providerOf(from)
+        || accountManager.isBillingRejected(i) || accountManager.capBars(next, ctx.model, ctx.advisorModel)) continue;
+    // Named once per refusal, next to markBillingRejected's line; a request that
+    // only passes a cooling account by is not worth a line each.
+    if (ctx.tried.has(ctx.pinnedIndex)) {
+      console.error(`[TeamClaude] Pinned account "${safeLine(from.name, 64)}" refused for billing; this request moves to "${safeLine(next.name, 64)}", the next account its pin names`);
+    }
+    ctx.pinnedIndex = i;
+    return;
+  }
+}
+
+/**
  * What actually went wrong on a failed connect, as a string worth printing.
  *
  * Node's happy-eyeballs dialer (`autoSelectFamily`, on by default across the
@@ -1592,7 +1687,13 @@ export function relayHttpForward(req, res, stripOverage = false, /** @type {Reco
 // does not take `/v1/sessionsX`. The entry without that slash, the collection
 // itself, matches as well, since a session is created with a bare
 // POST /v1/sessions (classificationPath has already dropped any `?beta=true`).
-const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/', '/api/frame/', '/v1/mcp_servers/', '/v1/environments/', '/v1/sessions/', '/v2/session_ingress/', '/v2/ccr-sessions/'];
+// Bootstrap, policy, feature flags and registry access belong to the client
+// login. Inference-only upstreams do not implement these endpoints.
+const CLIENT_CREDENTIAL_PATHS = [
+  '/v1/code/', '/api/oauth/', '/api/frame/', '/v1/mcp_servers/', '/v1/environments/', '/v1/sessions/', '/v2/session_ingress/', '/v2/ccr-sessions/',
+  '/api/claude_cli/', '/api/claude_code/policy_limits/', '/api/claude_code_grove/', '/api/claude_code_penguin_mode/',
+  '/api/eval/', '/api/eval-authed/', '/mcp-registry/v0/servers/',
+];
 
 /**
  * Whether a classified path is on the client's own identity plane: below an
@@ -1843,6 +1944,10 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // one account, bypassing rotation. Used by the keep-warm scheduler and for
       // manual per-account testing. The prefix is stripped before forwarding.
       let pinnedIndex = null;
+      // The accounts after the first that a pin naming several lists, in order
+      // (resolvePinList); empty for a pin that names one.
+      /** @type {number[]} */
+      let pinChain = [];
       // DEPRECATED: the path-prefix pin. Superseded by TC_ACCT, which works in
       // MITM mode too (this form cannot — inside a CONNECT tunnel the path is
       // the real upstream one). Kept for the warmer and for direct API callers.
@@ -1862,7 +1967,9 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         const raw = afterPrefix.slice(0, tokenEnd);
         let token = null;
         try { token = decodeURIComponent(raw); } catch { token = null; }
-        pinnedIndex = token == null ? null : resolveAccountPin(accountManager, token);
+        const pins = token == null ? null : resolvePinList(accountManager, token);
+        pinnedIndex = pins?.[0] ?? null;
+        pinChain = pins?.slice(1) ?? [];
         if (pinnedIndex == null) {
           // Client-supplied and already percent-decoded, so this is the one
           // value on the path that can carry raw control bytes.
@@ -1919,7 +2026,9 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // than at CONNECT time: a hot reload can renumber accounts while a tunnel
       // is open, and a name outliving an index is the safer half of that race.
       if (pinnedIndex == null && forcedPin != null) {
-        pinnedIndex = resolveAccountPin(accountManager, forcedPin);
+        const pins = resolvePinList(accountManager, forcedPin);
+        pinnedIndex = pins?.[0] ?? null;
+        pinChain = pins?.slice(1) ?? [];
         if (pinnedIndex == null) {
           const reqId = ++lastRequestId;
           const sessionId = clientSessionId(req.headers);
@@ -2068,7 +2177,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // stripOverage, synthesizeQuota and poolQuota are sampled once here, at dispatch:
       // retries and holds of this request keep them, and a reload applies to
       // subsequent requests.
-      const ctx = { account: null, callerRequestId: callerId, status: null, attempt: 0, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, provider, holdBudgetMs: holdMs, pinKey, onMessage, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), synthesizeQuota: shouldSynthesizeQuotaHeaders(config), poolQuota: shouldPoolQuotaHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
+      const ctx = { account: null, callerRequestId: callerId, status: null, attempt: 0, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, pinChain, provider, holdBudgetMs: holdMs, pinKey, onMessage, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), synthesizeQuota: shouldSynthesizeQuotaHeaders(config), poolQuota: shouldPoolQuotaHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -3476,6 +3585,34 @@ function respondUnrenewed(res, ctx, accountManager) {
 }
 
 /**
+ * The answer when no account's ChatGPT plan serves the request's model. A 400,
+ * as upstream gave it: it is final for this model, so a 429 or 5xx would only
+ * have the client retry into the same refusal. Upstream's own body when this
+ * request drew one; otherwise, every account was already sitting the model out,
+ * so the body is rebuilt from the message the last denial kept.
+ * @param {import('node:http').ServerResponse} res
+ * @param {Record<string, any>} ctx
+ * @param {Record<string, any>[]} denied  the accounts refusing this model
+ */
+function respondModelUnsupported(res, ctx, denied) {
+  ctx.status = 400;
+  ctx.delivered = true;   // a 4xx IS an answer — see answeredStatus
+  ctx.account = `(${denied.map(a => a.name).join(', ')} model unsupported)`;
+  if (res.headersSent || clientGone(res)) return;
+  const relayed = ctx.modelUnsupported;
+  if (relayed) {
+    res.writeHead(400, { 'Content-Type': relayed.contentType || 'application/json' });
+    res.end(relayed.body);
+    return;
+  }
+  // Rebuilt from this request's model, not from a stored detail: the denial
+  // came from another request.
+  const message = `The '${safeLine(ctx.model, 64)}' model is not supported when using Codex with a ChatGPT account.`;
+  res.writeHead(400, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ error: { type: 'invalid_request_error', message } }));
+}
+
+/**
  * A GET the pooled token was not scoped for, sent once on the client's own
  * credential (the scope branch of forwardRequest). It takes the forward path's
  * transport, not relayStream's: the admission gate, the fleet upstream proxy,
@@ -3560,7 +3697,14 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // A cap outranks the pin. Rotation checks it through unavailableReason, but a
   // pinned request never reaches that walk, and a budget a pin can spend past is
   // not a budget. The request gets the exhausted response, exactly as it would
-  // for an already-tried pin — it still never leaks to another account.
+  // for an already-tried pin — it still never leaks to another account. So does
+  // a model the account's plan just refused (capBars checks that too), and the
+  // no-account branch answers it with upstream's 400.
+  // A pin that names several accounts is the one exception, and only for
+  // billing: once upstream billing has refused the account it is on (the
+  // billing check below starts its cooldown and comes back here), the request
+  // goes to the next one listed.
+  advancePinPastBilling(ctx, accountManager);
   const pinned = ctx.pinnedIndex != null && !ctx.tried.has(ctx.pinnedIndex)
     ? accountManager.accounts[ctx.pinnedIndex]
     : null;
@@ -3614,10 +3758,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         && (ctx.pinnedIndex != null || ctx.tried.size === accountManager.accounts.length)) {
       return respondUnrenewed(res, ctx, accountManager);
     }
-    const billingCandidates = (ctx.pinnedIndex != null
+    const reachable = (ctx.pinnedIndex != null
       ? [accountManager.accounts[ctx.pinnedIndex]].filter(Boolean)
       : candidateAccounts(accountManager, ctx.model, ctx.provider)).filter(a => !a.disabled && !a.cordoned);
-    if (billingCandidates.length && billingCandidates.every(a => accountManager.unavailableReason(a, ctx.model) === 'billing')) {
+    if (reachable.length && reachable.every(a => accountManager.unavailableReason(a, ctx.model) === 'billing')) {
       ctx.status = 402;
       ctx.account = '(billing unavailable)';
       if (!res.headersSent && !clientGone(res)) {
@@ -3628,6 +3772,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         } }));
       }
       return;
+    }
+    // Every account that could take this request has a ChatGPT plan that does
+    // not serve its model. No reset or wait changes a plan, so the answer is
+    // upstream's own 400, as the client would have had it from one account.
+    if (reachable.length && reachable.every(a => accountManager.unavailableReason(a, ctx.model) === 'model-unsupported')) {
+      return respondModelUnsupported(res, ctx, reachable);
     }
     // Every candidate was refused by upstream (403). Waiting will not help — the
     // account needs attention, not a retry — so say so plainly rather than
@@ -3953,7 +4103,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
     // Same for a cap: a reading that arrived while this request waited can have
-    // put the account at its maxUsage, and a cap is zero requests past it. Not
+    // put the account at its maxUsage, and a cap is zero requests past it, or
+    // another request can have found that its plan does not serve this model. Not
     // a retry — nothing was sent — so the budget is not spent; `tried` grows by
     // one account each time, which bounds the re-selection. A pin re-enters
     // its own check and is refused there. And for an account another request
@@ -3976,6 +4127,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     let upstreamRes;
     let admittedLoad = 0;
     const entitlementEpoch = account.entitlementEpoch;
+    const modelDenialEpoch = account.modelDenialEpoch;
     try {
       upstreamRes = await upstreamFetch(upstreamUrl, {
         method,
@@ -4396,7 +4548,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         && isJsonContentType(upstreamRes.headers.get('content-type'))) {
       const [peek, rest] = upstreamBody.tee();
       upstreamBody = rest;
-      const refusal = accountRefusal(400, await readErrorBody(peek));
+      const peeked = await readErrorBody(peek);
+      const refusal = accountRefusal(400, peeked);
       if (refusal) {
         await rest.cancel();
         accountManager.markRefused(account, refusal);
@@ -4404,6 +4557,22 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         (ctx.rejectedStatus ??= new Map()).set(account.name, 400);
         ctx.tried.add(account.index);
         console.error(`[TeamClaude] 400 on "${safeLine(account.name, 64)}"; upstream refused the account (${refusal.code}), failing over`);
+        if (clientGone(res)) { ctx.abandoned = true; return; }
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+      }
+      // A ChatGPT plan that does not serve this model, such as one lapsed to
+      // free. The account sits this model out and the request fails over; a
+      // model that no account's plan serves gets this 400, kept here, from the
+      // no-account branch. Not by plan type: which plan serves which model
+      // changes upstream, and with the client's version.
+      // Only when the refusal names this request's model, exactly as it was sent.
+      if (providerOf(account) === 'codex' && ctx.model && codexUnsupportedModel(peeked) === ctx.model) {
+        await rest.cancel();
+        const until = accountManager.markModelDenied(account.index, ctx.model,
+          { detail: upstreamErrorMessage(peeked), epoch: modelDenialEpoch });
+        ctx.modelUnsupported = { body: peeked, contentType: upstreamRes.headers.get('content-type') };
+        ctx.tried.add(account.index);
+        console.error(`[TeamClaude] 400 on "${safeLine(account.name, 64)}"; its ChatGPT plan does not serve ${safeLine(ctx.model, 64)}, out of rotation for that model${until ? ` until ${new Date(until).toISOString()}` : ''}, failing over`);
         if (clientGone(res)) { ctx.abandoned = true; return; }
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
       }
@@ -4647,6 +4816,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     if (ctx.delivered && upstreamRes.status >= 200 && upstreamRes.status < 300
         && isCompletionPath(classificationPath(req.url))) {
       accountManager.clearEntitlementDenied(account, entitlementEpoch);
+      accountManager.clearModelDenied(account, ctx.model, modelDenialEpoch);
     }
   } catch (err) {
     // Two of the things that can throw here are not upstream errors at all:

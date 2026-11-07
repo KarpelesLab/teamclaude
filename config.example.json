@@ -70,6 +70,20 @@
       "disabled": false,
       "cordoned": false,
       "apiKey": "sk-ant-api03-your-api-key"
+    },
+    {
+      "name": "api-credit",
+      "type": "apikey",
+      "priority": 100,
+      "disabled": true,
+      "apiKey": "sk-ant-api03-your-credit-org-api-key",
+      "credit": {
+        "amount": 200,
+        "currency": "USD",
+        "cycleStart": "2026-11-02",
+        "adminKey": "sk-ant-admin01-your-admin-key",
+        "refreshMinutes": 15
+      }
     }
   ],
   "routes": [
