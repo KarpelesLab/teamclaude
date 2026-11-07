@@ -5,6 +5,7 @@ import { removedAccountIds, addedAccountIds, configIndexFor } from './account-pa
 import { ensureAccountIds } from './account-id.js';
 import { accountSwitchThreshold, accountAllowsExtraUsage, accountRouting } from './account-manager.js';
 import { localListener } from './upstream-proxy.js';
+import { accountCredit } from './api-credit.js';
 
 /**
  * Sync accounts from disk config: add new accounts and refresh credentials
@@ -142,6 +143,11 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     // one that points back at this server's own listener (memConfig's port is
     // the one the server is bound to; a port edit on disk needs a restart).
     accountManager.setRouting(mgr.index, accountRouting(diskAcct, localListener(memConfig)));
+    // Same for the prepaid-credit setting (api-credit.js), through the
+    // constructor's own validation: an amount or a renewal day corrected on
+    // disk shows on the next status read, and a replaced admin key is read at
+    // once rather than after the old key's backoff.
+    accountManager.setCreditConfig(mgr.index, accountCredit(diskAcct));
     // Read at the moment a refusal asks whether to spend a reset credit, so a
     // disk edit must land here to bind — and an operator who has just exempted
     // an account is doing so precisely because they do not want the next
@@ -183,6 +189,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       if (diskAcct.maxSpend != null) cfgAcct.maxSpend = diskAcct.maxSpend; else delete cfgAcct.maxSpend;
       if (diskAcct.switchThreshold != null) cfgAcct.switchThreshold = diskAcct.switchThreshold; else delete cfgAcct.switchThreshold;
       if (diskAcct.routing) cfgAcct.routing = diskAcct.routing; else delete cfgAcct.routing;
+      if (diskAcct.credit != null) cfgAcct.credit = diskAcct.credit; else delete cfgAcct.credit;
       if (diskAcct.priority != null) cfgAcct.priority = diskAcct.priority; else delete cfgAcct.priority;
       // The TUI's reorder writes this key onto the entry, so after one
       // arrangement every entry carries a value for a hand edit to lose to.
