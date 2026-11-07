@@ -384,6 +384,25 @@ export function setAccountPriority(config, query, spec = {}) {
 }
 
 /**
+ * Cordon an account, or put it back: a cordoned account takes no new
+ * conversation, while one already on it keeps being served there.
+ *
+ * Uncordoning deletes the key, as enabling does: an absent key is the default.
+ *
+ * @param {any} config
+ * @param {string} query
+ * @param {boolean} cordoned
+ * @param {{ orgFilter?: string }} [spec]
+ */
+export function setAccountCordoned(config, query, cordoned, spec = {}) {
+  if (typeof cordoned !== 'boolean') throw new ConfigOpError('cordoned must be true or false');
+  const account = resolveConfiguredAccount(config, query, spec.orgFilter);
+  if (cordoned) account.cordoned = true;
+  else delete account.cordoned;
+  return { name: account.name, cordoned: !!account.cordoned };
+}
+
+/**
  * Take an account out of rotation, or put it back.
  *
  * Enabling deletes the key rather than writing `false`, because that is what

@@ -116,6 +116,10 @@ function fleetStatus({ accountManager, hooks }) {
         provider: a.provider,
         priority: a.priority,
         disabled: a.disabled,
+        // Takes no new conversations while the ones on it stay, and how many
+        // are left (0: nothing has run there for an hour, nothing is open).
+        cordoned: a.cordoned === true,
+        ...(a.cordoned === true ? { cordonRemaining: a.cordonRemaining } : {}),
         status: a.status,
         // Already password-masked by the status payload.
         ...(a.routing ? { routing: a.routing } : {}),
@@ -123,6 +127,9 @@ function fleetStatus({ accountManager, hooks }) {
         ...accountManager.eligibility(index),
         sessions: a.sessions,
         ...(Object.keys(quota).length ? { quota } : {}),
+        // Prepaid API credit (accounts[].credit), as the status payload built
+        // it: amounts, source and as-of, never the admin key behind it.
+        ...(a.credit ? { credit: a.credit } : {}),
         ...(a.rateLimitedUntil ? { rateLimitedUntil: a.rateLimitedUntil } : {}),
         ...(a.pausedUntil ? { pausedUntil: a.pausedUntil } : {}),
       };
@@ -158,13 +165,13 @@ const READ_TOOLS = [
   {
     name: 'get_status',
     title: 'Fleet status',
-    description: 'The running proxy at a glance: server version and uptime, the account in use, and for every account its priority, whether it is disabled, whether rotation can use it right now (and why not), its session count and its known quota windows.',
+    description: 'The running proxy at a glance: server version and uptime, the account in use, and for every account its priority, whether it is disabled, whether rotation can use it right now (and why not), its session count, its known quota windows, and for an API-key account with a credit setting the prepaid credit left this cycle (source "admin" is the organization\'s cost report, "local" an estimate from replies through this proxy).',
     run: (_args, ctx) => fleetStatus(ctx),
   },
   {
     name: 'get_quota',
     title: 'Fleet quota',
-    description: 'Per-account quota utilization and reset times, with tier-weighted fleet aggregates. Reads what the proxy has already observed; it never calls upstream.',
+    description: 'Per-account quota utilization and reset times, with tier-weighted fleet aggregates, and the prepaid credit of any API-key account with a credit setting. Reads what the proxy has already observed; it never calls upstream.',
     run: (_args, { accountManager, hooks }) => ({ ...accountManager.getQuotaSummary(), ...(hooks.getQuotaExtra?.() || {}) }),
   },
   {
@@ -294,6 +301,19 @@ const WRITE_TOOLS = [
       // on-disk entry, and a missing key leaves a stale `disabled: true` standing.
       if (entry) entry.disabled = !args.enabled;
     }).then(outcome => ({ ...outcome, enabled: args.enabled })),
+  },
+  {
+    name: 'set_account_cordoned',
+    title: 'Cordon an account or put it back',
+    description: 'Cordon an account: no new conversation goes to it, while the ones already on it stay until they finish; get_status says how many are left (cordonRemaining). cordoned false puts it back. Saved to the config file.',
+    properties: { ...ACCOUNT_ARGS, cordoned: { type: 'boolean' } },
+    required: ['account', 'cordoned'],
+    write: true,
+    run: (args, ctx) => changeAccount(ctx, args, (index, entry) => {
+      ctx.accountManager.setCordoned(index, args.cordoned);
+      // An explicit boolean, as set_account_enabled writes, for the same reason.
+      if (entry) entry.cordoned = args.cordoned;
+    }).then(outcome => ({ ...outcome, cordoned: args.cordoned })),
   },
   {
     name: 'set_account_priority',

@@ -86,10 +86,17 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
     if (why) lines.push(`  ${why}`);
     const denied = entitlementLine(account, now, paint);
     if (denied) lines.push(`  ${denied}`);
+    const unserved = modelDenialLine(account, now, paint);
+    if (unserved) lines.push(`  ${unserved}`);
     const plan = subscriptionLostLine(account, paint, now);
     if (plan) lines.push(`  ${plan}`);
     const spend = spendLine(account, paint);
     if (spend) lines.push(`  ${spend}`);
+    const credit = creditText(account.credit, now);
+    if (credit) {
+      const short = account.credit?.error || account.credit?.incomplete || account.credit?.remainingMinor === 0;
+      lines.push(`  ${paint.dim('Credit'.padEnd(8))} ${(short ? paint.yellow : (/** @type {string} */ t) => t)(safeLine(credit, 400))}`);
+    }
     const resetCredits = resetCreditLine(account, paint, now);
     if (resetCredits) lines.push(`  ${resetCredits}`);
     const outside = outsideSpendText(account.quota?.outsideSpend);
@@ -169,6 +176,7 @@ export const UNAVAILABLE_TEXT = {
   route: 'no route allows this account',
   'advisor-quota': "advisor model's weekly bucket spent",
   'advisor-route': 'no route allows the advisor model',
+  cordoned: 'cordoned: takes no new conversations',
 };
 
 /**
@@ -255,6 +263,73 @@ export function outsideSpendText(outsideSpend) {
     if (v.state === 'not_measurable') return label + ': not measurable';
     return label + ': not observed (quota probe off?)';
   });
+  return parts.join(' \u00b7 ');
+}
+
+/**
+ * The prepaid-credit read-out for one API-key account (accounts[].credit), or
+ * null when it has none. One phrase per fact, joined with " · ":
+ *
+ *   "$176.55 of $200.00 left ($23.45 spent) · renews in 26d (2026-12-02) · Admin API cost report, read 4m ago"
+ *   "at most $191.20 of $200.00 left ($8.80 spent) · renews in 26d (2026-12-02) · estimate: replies through this proxy only, since 2026-11-02"
+ *
+ * plus "incomplete: …" naming any model the local estimate could not price,
+ * and "cost report failed: …" while the admin read is failing. Never a zero
+ * for a spend that was not read: "spend not read yet" instead.
+ *
+ * Pure and closure-free on purpose, like outsideSpendText: the dashboard
+ * serializes it into its page with toString().
+ *
+ * @param {any} credit  a creditView (api-credit.js)
+ * @param {number} now  ms epoch
+ * @returns {string|null}
+ */
+export function creditText(credit, now) {
+  if (!credit || typeof credit !== 'object') return null;
+  var exp = typeof credit.exponent === 'number' ? credit.exponent : 2;
+  var sym = credit.currency === 'USD' ? '$' : '';
+  var money = function (/** @type {number} */ minor) {
+    var t = (minor / Math.pow(10, exp)).toLocaleString('en-US', { minimumFractionDigits: exp, maximumFractionDigits: exp });
+    return sym ? sym + t : t + (credit.currency ? ' ' + credit.currency : '');
+  };
+  var ago = function (/** @type {unknown} */ stamp) {
+    var t = typeof stamp === 'string' ? Date.parse(stamp) : NaN;
+    if (!isFinite(t)) return null;
+    var m = Math.max(0, Math.round((now - t) / 60000));
+    if (m < 1) return 'just now';
+    if (m < 60) return m + 'm ago';
+    var h = Math.round(m / 60);
+    return h < 48 ? h + 'h ago' : Math.round(h / 24) + 'd ago';
+  };
+  var parts = [];
+  var amount = typeof credit.amountMinor === 'number' ? money(credit.amountMinor) : '?';
+  if (typeof credit.remainingMinor !== 'number') {
+    parts.push(amount + ' credit, spend not read yet');
+  } else {
+    var left = (credit.upperBound ? 'at most ' : '') + money(credit.remainingMinor) + ' of ' + amount + ' left';
+    left += credit.exceededMinor > 0 ? ', exceeded by ' + money(credit.exceededMinor) : ' (' + money(credit.spentMinor || 0) + ' spent)';
+    parts.push(left);
+  }
+  var end = typeof credit.cycleEnd === 'string' ? Date.parse(credit.cycleEnd) : NaN;
+  if (isFinite(end)) {
+    var hours = Math.max(0, Math.floor((end - now) / 3600000));
+    parts.push('renews in ' + (hours >= 48 ? Math.floor(hours / 24) + 'd' : hours + 'h') + ' (' + credit.cycleEnd.slice(0, 10) + ')');
+  }
+  if (credit.source === 'admin') {
+    var read = ago(credit.asOf);
+    parts.push('Admin API cost report' + (read ? ', read ' + read : ''));
+  } else if (credit.source === 'local') {
+    parts.push('estimate: replies through this proxy only' + (typeof credit.trackedSince === 'string' ? ', since ' + credit.trackedSince.slice(0, 10) : ''));
+  }
+  if (credit.incomplete) {
+    var n = credit.incomplete.replies || 0;
+    var names = (credit.incomplete.models || []).map(function (/** @type {any} */ m) { return m.model; }).join(', ');
+    parts.push('incomplete: ' + n + ' unpriced repl' + (n === 1 ? 'y' : 'ies') + (names ? ' (' + names + ')' : ''));
+  }
+  if (credit.error) {
+    var failed = ago(credit.error.at);
+    parts.push('cost report failed: ' + credit.error.message + (failed ? ' (' + failed + ')' : ''));
+  }
   return parts.join(' \u00b7 ');
 }
 
@@ -453,6 +528,11 @@ function refusalText(/** @type {Record<string, any>} */ err) {
 export function unavailableLine(account, paint) {
   const reason = account?.unavailable;
   if (!reason) return null;
+  // Not blocked: it keeps serving the conversations on it, and says how many.
+  if (reason === 'cordoned') {
+    const left = Number.isFinite(account.cordonRemaining) ? `; ${account.cordonRemaining} still on it` : '';
+    return `${paint.dim('Cordoned'.padEnd(8))} ${paint.yellow(`takes no new conversations${left}`)}`;
+  }
   // A refusal outlasts a cap or a cooldown ranked above it, so it is named
   // whatever `unavailable` says, short of the operator's own disable.
   const refused = reason !== 'disabled' && isRefused(account);
@@ -481,6 +561,23 @@ function entitlementLine(account, now, paint) {
   const when = count > 1 ? `${count} in a row, first ${since}` : since;
   const text = safeLine(denial.detail ?? '', 200) || 'OAuth entitlement denied';
   return `${paint.dim('Denied'.padEnd(8))} ${paint.yellow(text)} ${paint.dim(`\u2014 ${when}`)}`;
+}
+
+// A plan that does not serve a model bars only that model, so the account
+// still reads active above. Like the entitlement line, an entry outlives its
+// cooldown until a later request for the model is served.
+/** @param {any} account @param {number} now @param {ReturnType<typeof colors>} paint */
+function modelDenialLine(account, now, paint) {
+  const denials = Array.isArray(account?.modelDenials) ? account.modelDenials : [];
+  if (!denials.length) return null;
+  const models = denials.map((/** @type {any} */ d) => {
+    const until = parseTs(d?.until);
+    // The payload can come from another process: only a whole number is a count.
+    const count = Number.isSafeInteger(d?.count) ? d.count : 1;
+    const wait = until && until > now ? `retry in ${formatDuration(until - now)}` : 're-admitted';
+    return `${safeLine(d?.model ?? '', 64) || '?'} (${wait}${count > 1 ? `, ${count} in a row` : ''})`;
+  });
+  return `${paint.dim('Models'.padEnd(8))} ${paint.yellow(`plan does not serve ${models.join(', ')}`)}`;
 }
 
 /**
@@ -791,6 +888,7 @@ function formatAdaptive(a, paint) {
 function formatAccountStatus(account, now, paint) {
   const parts = [];
   if (account.disabled) parts.push(paint.gray('disabled'));
+  if (account.cordoned === true) parts.push(paint.yellow('cordoned'));
 
   const status = safeLine(account.status || 'unknown', 32) || 'unknown';
   const colored = status === 'active'

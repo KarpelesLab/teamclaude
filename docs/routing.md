@@ -18,7 +18,9 @@ How TeamClaude decides which account serves a request, and what it does when tha
 
 TeamClaude prefers to keep you on one account. It stays on the current one and only rotates when that account nears `switchThreshold` (default `0.98`).
 
-When it does have to pick, ranking is: lowest `priority` number first, then, among accounts of equal priority, the one whose governing weekly bucket resets soonest. Spending the account closest to its refresh preserves the ones whose window resets further out. A model with its own weekly bucket (Fable, Sonnet) is ranked by that bucket rather than the shared one. Set an explicit order with `teamclaude priority <name> <n>`, or `--first` / `--last`. `teamclaude login --api` adds a key at priority 100 — a metered key is a last resort behind the subscriptions unless you say otherwise ([API key](accounts.md#api-key)).
+An account you have [cordoned](usage.md#cordoning-one-account) is never picked for new work, whatever its priority; a conversation already on it stays there.
+
+When it does have to pick, ranking is: lowest `priority` number first, then, among accounts of equal priority, the one whose governing weekly bucket resets soonest. Spending the account closest to its refresh preserves the ones whose window resets further out. A model with its own weekly bucket (Fable, Sonnet) is ranked by that bucket rather than the shared one. To make the soonest reset a standing preference rather than a tiebreak, set `"preferSoonestWeeklyReset": true`. Then, on every request, traffic moves to the available account in the top priority tier whose governing weekly window resets soonest — at least a minute sooner than the current one — and rotation ranks that reset ahead of expiry pressure. This is earliest-deadline-first: weekly quota that would expire unspent is spent first, then the next-soonest, and an account sidelined by its 5-hour window is reclaimed as soon as that window frees up. An account whose weekly reset is unknown never preempts. Hot-applies on config reload. Set an explicit order with `teamclaude priority <name> <n>`, or `--first` / `--last`. `teamclaude login --api` adds a key at priority 100 — a metered key is a last resort behind the subscriptions unless you say otherwise ([API key](accounts.md#api-key)).
 
 ## The two kinds of 429
 
@@ -43,7 +45,10 @@ An HTTP `400` with Anthropic's `invalid_request_error` message beginning
 `400` or `402` with a structured `billing_error`, excludes that account from
 automatic rotation for five minutes. The request fails over immediately,
 including to [subscription usage credits] when the existing fallback policy
-allows them. Other validation errors pass through unchanged.
+allows them. Other validation errors pass through unchanged. A request
+pinned to one account is not moved; one pinned to a
+[list of API-key accounts](#a-list-of-api-key-accounts) moves to the next one
+listed.
 
 Status reports the billing refusal separately from quota exhaustion and
 recommends checking billing or purchasing credits. If every eligible account
@@ -63,13 +68,23 @@ If every configured account returns that exact denial, TeamClaude's terminal `50
 
 An explicit [`TC_ACCT` pin](#pin-a-session-to-one-account) continues to target exactly the requested account and never fails over, even while that account is excluded from automatic rotation.
 
+## Codex models a plan does not serve
+
+Each ChatGPT plan serves its own set of Codex models. A free plan, or a paid plan that lapsed to free, refuses the larger ones with a JSON `400`: "The '<model>' model is not supported when using Codex with a ChatGPT account." TeamClaude reads this from `error.message` or `detail`, and acts only when the message is that whole sentence and names the request's own model, exactly as sent. On a Codex account, this `400` keeps the account out of rotation **for that model only**, and the request fails over at once. The account continues to serve the models its plan has. The cooldown is 5 min, then 15 min, then 1 h for each later denial. A `400` to a request that was sent before the last denial does not count again. None of this is persisted.
+
+TeamClaude does not decide from the plan name which models an account serves. OpenAI changes that list, and the list also depends on the client version. The `400` is the only reliable signal.
+
+A completed response for the model, to a request sent after the last denial, clears that model's entry. A change in the account's reported plan type (for example `free` to `prolite`) clears all of the account's entries, so a renewed plan serves at once. Until then, `teamclaude status` shows a `Models` line, and the status JSON has `modelDenials` (`model`, `until`, `detail`, `since`, `count`).
+
+If no account that can take the request serves the model, the client gets upstream's `400`, not a `429` or a hold, because a quota reset does not change a plan. A [`TC_ACCT` pin](#pin-a-session-to-one-account) to such an account gets the same `400`. If one account refuses the model and another is only out of quota, the request waits for quota as usual.
+
 ## Account refusals
 
-Some refusals are about the account rather than the request: `error.details.error_code` is `verification_required` (the owner has to verify their identity), `account_on_hold`, `organization_on_hold`, `organization_disabled`, `restricted_regime_endpoint` or `ip_not_in_allowed_range`. Older answers say the same with a `400` and no code: "This organization has been disabled." or "Identity verification is required…". On an OAuth account, any of these in a JSON `400` or a `403` puts the account in `error` with upstream's message (see [Why an account is in `error`](accounts.md#why-an-account-is-in-error)), and the request fails over. Every other `400` goes to the client unchanged. If every account was refused, the terminal `502` quotes upstream's message for each; later requests name the account as refused by upstream and point to `teamclaude status`.
+Some refusals are about the account rather than the request: `error.details.error_code` is `verification_required` (the owner has to verify their identity), `account_on_hold`, `organization_on_hold`, `organization_disabled`, `restricted_regime_endpoint` or `ip_not_in_allowed_range`. Older answers say the same with a `400` and no code: "This organization has been disabled." or "Identity verification is required…". On an OAuth account, any of these in a JSON `400` or a `403` puts the account in `error` with upstream's message (see [Why an account is in `error`](accounts.md#why-an-account-is-in-error)), and the request fails over. Every other `400` goes to the client unchanged, except a [Codex model that the plan does not serve](#codex-models-a-plan-does-not-serve). If every account was refused, the terminal `502` quotes upstream's message for each; later requests name the account as refused by upstream and point to `teamclaude status`.
 
 ## Token scope denials
 
-A `403` with `error.details.error_code: oauth_scope_insufficient` is about the token, not the account. A `claude setup-token` token carries `user:inference` only, so Claude Code's bootstrap, settings and connector-registry calls draw this on every such account. TeamClaude does not fail those over: a `GET` that draws one goes out once more on the client's own bearer, like the [identity plane](proxy-modes.md), over the same upstream proxy, sx route and admission queue as any forwarded request, and rotation stays where it was. Any other method, which includes every completion, a [pinned](#pin-a-session-to-one-account) request, and a client with no bearer of its own get the normal handling.
+A `403` with `error.details.error_code: oauth_scope_insufficient` is about the token, not the account. A `claude setup-token` token carries `user:inference` only and cannot reach endpoints that require `user:profile`. Known [client control-plane calls](proxy-modes.md#mitm-proxy-mode-default) bypass rotation from the start. For other endpoints, an unpinned `GET` that draws a scope denial goes out once more on the client's own bearer, over the same upstream proxy, sx route and admission queue as any forwarded request, and rotation stays where it was. Any other method, which includes every completion, a [pinned](#pin-a-session-to-one-account) request, and a client with no bearer of its own get the normal handling.
 
 ## One failover hop on a rate limit
 
@@ -320,7 +335,7 @@ The event stays recorded on the account. The first request that can be sent both
 
 ## Pin a session to one account
 
-`TC_ACCT` forces every request onto **one** account, bypassing rotation (and never failing over to another). It works in **both** modes — MITM (the default) and `--no-mitm`:
+`TC_ACCT` forces every request onto **one** account, bypassing rotation (and never failing over to another, except along a [list of API-key accounts](#a-list-of-api-key-accounts) when billing refuses one). It works in **both** modes — MITM (the default) and `--no-mitm`:
 
 ```bash
 # By email — what you'll normally use
@@ -345,6 +360,22 @@ Prefer the `accountUuid` (printed by `teamclaude accounts`) for anything scripte
 The rotation index is **not** accepted — it is array position, so deleting an account would silently repoint every later pin at a *different* account.
 
 > If you hold the *same* account in two orgs, a bare uuid or email matches the first one. `TC_ACCT=<accountUuid>/<orgUuid>` picks a specific one — rarely needed.
+
+### A list of API-key accounts
+
+`TC_ACCT` may name several API-key accounts, separated by commas, in the order they are to be spent:
+
+```bash
+TC_ACCT=credit-one,credit-two,credit-three teamclaude run
+```
+
+The session is pinned to the first. When upstream billing refuses the account a request is on (no API credit left, see [Billing refusals](#billing-refusals)), that request goes to the next account in the list, and later requests pass over a listed account for as long as its billing cooldown lasts. The refusal arrives before the model runs and before anything reaches the client, so the request runs once, on the account that takes it. A listed account serves while it is disabled, as a pinned one does, so accounts kept out of rotation can be spent this way and no other.
+
+That is the only move. A rate limit, a `5xx`, a credential refusal or any other answer is handled as for a pin to one account; a response that has started reaching the client is never moved; and the list never moves a request to or from a subscription, whatever it names. A listed account at its usage cap, or of another provider, is passed over. When no listed account is left, the request ends as a pin to the last one tried does.
+
+Every name has to match an account, or the pin is refused as an unknown one is. A value that matches as a whole is still that one account, so a display name with a comma in its org keeps working. Under MITM the list travels as the proxy URL's username (`http://credit-one,credit-two:<key>@127.0.0.1:3456`), under `--no-mitm` in the `/tc-acct/` prefix. The [session pin](#move-one-running-session) names one account.
+
+Each account is usually its own organization, and organizations share no prompt cache, so the first request of each conversation after a move writes its cached prefix again on the next account.
 
 ### Move one running session
 
