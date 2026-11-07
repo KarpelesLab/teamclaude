@@ -3110,7 +3110,13 @@ export class AccountManager {
       account.status = 'active';
       account.rateLimitedUntil = null;
       account.throttledAt = null;
-      console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" rate limit expired, marking active`);
+      // A hold is capped at an hour, so it can end while the window that was
+      // spent still bars the account. Say so: "marking active" alone read as an
+      // account back in rotation that the quota gate kept out for hours (#641).
+      const still = this._nearQuotaBucket(account, model);
+      const resetAt = still ? account.quota[`${still}Reset`] : null;
+      const until = Number.isFinite(resetAt) && resetAt > Date.now() ? ` until ${new Date(resetAt).toISOString()}` : '';
+      console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" rate limit expired, marking active${still ? ` (still barred by its ${still} quota${until})` : ''}`);
     }
 
     if (account.status === 'exhausted') return 'exhausted';
