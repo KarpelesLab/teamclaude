@@ -247,6 +247,10 @@ switch (command) {
     await setCordonedCommand(false);
     process.exit(0);
     break;
+  case 'release':
+    await releaseCommand();
+    process.exit(0);
+    break;
   case 'api':
     await apiCommand();
     process.exit(0);
@@ -2901,6 +2905,51 @@ async function setCordonedCommand(cordoned) {
   }
 }
 
+// ── release ─────────────────────────────────────────────────
+
+/**
+ * `teamclaude release <name>`: place the conversations pinned to an account
+ * again on their next request, leaving the account in service (#643). Pins live
+ * in the running server, so it is the only place that can apply this.
+ */
+async function releaseCommand() {
+  const config = await loadOrCreateConfig();
+  const port = config.proxy.port;
+  const name = args[1] && !args[1].startsWith('-') ? args[1] : null;
+  if (!name) {
+    console.error('Usage: teamclaude release <account-name|email>');
+    process.exit(1);
+  }
+  try {
+    const res = await fetch(`http://localhost:${port}/teamclaude/account-release`, {
+      method: 'POST',
+      headers: { 'x-api-key': config.proxy.apiKey, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ account: name }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      // As in switchCommand: only our own errors are strings.
+      const detail = typeof data.error === 'string' ? data.error : null;
+      console.error(detail || `Release failed: unexpected reply from localhost:${port} (HTTP ${res.status}).`);
+      if (!detail) console.error('An older server without this endpoint answers this way; restart it to pick up the new version.');
+      if (data.accounts?.length) {
+        console.error('Known accounts:');
+        for (const n of data.accounts) console.error(`  ${n}`);
+      }
+      process.exit(1);
+    }
+    console.log(`Released ${data.released} conversation${data.released === 1 ? '' : 's'} pinned to "${data.account}": each is placed again on its next request`);
+    if (data.stillCurrent) {
+      console.log(`Session distribution is off and "${data.account}" is the current account, so traffic stays on it until you run: teamclaude switch <other>`);
+    }
+  } catch (/** @type {any} */ err) {
+    console.error('Cannot connect to proxy at localhost:' + port);
+    console.error('Is the server running? Start with: teamclaude server');
+    if (err?.message) console.error(`Details: ${err.message}`);
+    process.exit(1);
+  }
+}
+
 // ── routing ─────────────────────────────────────────────────
 
 async function routingCommand() {
@@ -3021,6 +3070,8 @@ Commands:
   enable <name>       Re-enable a disabled account (also clears a stuck error)
   cordon <name>        Send no new conversations to an account; the ones already
                       on it stay there until they finish (uncordon <name> to end)
+  release <name>      Unpin the conversations on an account, leaving it in service;
+                      each is placed again on its next request
   priority <name> <n> Set rotation priority (lower = preferred; --first/--last)
   rename <name> <new> Rename an account, updating the routes that list it
   route [list|add|rm] Per-model routing: pin model globs to specific accounts
