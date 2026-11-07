@@ -3096,6 +3096,7 @@ export class AccountManager {
     const reason = this.unavailableReason(account, model);
     if (reason !== 'quota' && reason !== 'upstream-rejected') return null;
     if (model && !this._routeAllows(account, model)) return null;
+    if (advisorModel && !this._routeAllows(account, advisorModel)) return null;
     // The executor's caps were read above; the advisor's family is its own.
     if (this.capBars(account, model, advisorModel)) return null;
     // `quota` is reported ahead of `upstream-rejected`, so a rejected account
