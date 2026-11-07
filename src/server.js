@@ -4083,7 +4083,15 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
           // label carries upstream's own text, so it goes through safeLine.
           const spent = spentCodexWindows.length
             ? ` (${safeLine(spentCodexWindows.join(', '), 80)} spent)` : '';
-          console.log(`[TeamClaude] Quota rejection (429) on "${account.name}"${spent} — throttling ${hold}s and switching account`);
+          // The hold is capped at an hour; a spent window that resets later keeps
+          // the account out past it through the quota gate, so name that (#641).
+          const nowS = Date.now() / 1000;
+          const outlasts = [['5h', '5h'], ['weekly', '7d']]
+            .map(([label, key]) => [label, rl[`anthropic-ratelimit-unified-${key}-status`], Number(rl[`anthropic-ratelimit-unified-${key}-reset`])])
+            .filter(([, status, reset]) => status === 'rejected' && Number.isFinite(reset) && reset - nowS > hold + 60)
+            .map(([label, , reset]) => `${label} window resets in ${formatWait(Math.ceil(Number(reset) - nowS))}`);
+          const later = outlasts.length ? ` (${outlasts.join(', ')})` : '';
+          console.log(`[TeamClaude] Quota rejection (429) on "${account.name}"${spent} — throttling ${hold}s${later} and switching account`);
           accountManager.markRateLimited(account.index, hold);
         }
         ctx.tried.add(account.index);
