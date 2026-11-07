@@ -279,8 +279,10 @@ test('the TUI blocked tag follows the gate, not the family bucket', () => {
   tui.mode = 'normal'; tui.selIdx = -1;
   const row = stripAnsi(tui._renderAcct(0, 8, true, am.getRoutes(), [], { fable: null, sonnet: null }));
   assert.equal(am._isAvailable(am.accounts[0], FABLE), false);
-  assert.match(row, /⊘ Fable/,
-    `routing refuses Fable on this account but the TUI shows no blocked tag: ${row}`);
+  // Tagged with the bucket that is spent: the shared weekly bars every model,
+  // so naming Fable would blame the wrong bucket.
+  assert.match(row, /⊘ Wk/,
+    `routing refuses this account but the TUI shows no blocked tag: ${row}`);
 });
 
 test('the TUI blocked tag stays off when the account can still serve the family', () => {
