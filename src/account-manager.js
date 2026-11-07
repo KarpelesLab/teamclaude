@@ -5947,7 +5947,11 @@ export class AccountManager {
             const { detail } = this._needsLogin(account, 'account_on_hold', `Your account is on hold and can't use Claude Code. View details or appeal: ${err.appealUrl}`, err.appealUrl);
             console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}": ${detail}`);
           } else {
-            this._needsLogin(account, 'refresh_rejected', `upstream rejected its refresh token (${err.status})`);
+            // The endpoint's own reason tells an expired token (idle too long)
+            // from a revoked or rotated one (a login elsewhere), which need
+            // different follow-ups (#629). Bounded by oauthErrorSummary.
+            const why = typeof err.oauthError === 'string' ? ` ${safeLine(err.oauthError, 140)}` : '';
+            this._needsLogin(account, 'refresh_rejected', `upstream rejected its refresh token (${err.status}${why})`);
             console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}" needs re-login (refresh token rejected) — run: teamclaude login`);
           }
           // Unlike markRefused, a hold found on refresh is reported to credential
@@ -6335,6 +6339,10 @@ export class AccountManager {
         status: a.status,
         // What put it in 'error' and what brings it back; null in every other state.
         errorReason: a.status === 'error' && a.errorReason ? { ...a.errorReason } : null,
+        // The last refresh that worked, in this process (null until one has):
+        // beside a refresh_rejected error it tells a token that died after
+        // days idle from one rotated away by another client (#629).
+        lastRefreshAt: a._lastRefreshAt ?? null,
         subscriptionLost: a.subscriptionLost ? { ...a.subscriptionLost } : null,
         // Why the account is out of rotation right now (null = it can serve).
         // Distinguishes a local threshold decision from an upstream rejection —

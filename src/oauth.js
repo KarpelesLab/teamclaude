@@ -174,6 +174,23 @@ function holdAppealUrl(text) {
 }
 
 /**
+ * The token endpoint's own reason for a refusal, as `invalid_grant: Refresh
+ * token expired`, or undefined when the body is not an OAuth error. Status
+ * carries it beside a `refresh_rejected` error (#629), so only the two OAuth
+ * fields go there, each bounded: never the rest of the body.
+ * @param {string} text
+ * @returns {string|undefined}
+ */
+export function oauthErrorSummary(text) {
+  let body;
+  try { body = JSON.parse(text); } catch { return undefined; }
+  const code = body?.error;
+  if (typeof code !== 'string' || !/^[A-Za-z0-9_.-]{1,40}$/.test(code)) return undefined;
+  const desc = typeof body.error_description === 'string' ? safeLine(body.error_description, 100) : '';
+  return desc ? `${code}: ${desc}` : code;
+}
+
+/**
  * Refresh an expired OAuth access token using the refresh token.
  * Retries on 5xx and network errors with exponential backoff.
  * `routing` is the account's own egress proxy (account-routing.js); null goes
@@ -242,6 +259,8 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
         // A hold is not a dead token: a re-login does not lift it.
         const appealUrl = holdAppealUrl(text);
         if (appealUrl) /** @type {any} */ (err).appealUrl = appealUrl;
+        const oauthError = oauthErrorSummary(text);
+        if (oauthError) /** @type {any} */ (err).oauthError = oauthError;
         throw err;
       }
 
