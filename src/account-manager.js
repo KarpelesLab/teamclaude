@@ -1960,15 +1960,19 @@ export class AccountManager {
     if (advisorModel) {
       const account = this._select(exclude, model, advisorModel, false);
       if (account) return account;
-      // Throttled so a busy advisor session doesn't flood the activity log.
-      if (Date.now() >= (this._advisorDegradeLogAt || 0)) {
-        this._advisorDegradeLogAt = Date.now() + 60_000;
-        // The model names come out of the client's request body, so they are
-        // stripped before reaching the log (see safe-text.js).
-        console.log(`[TeamClaude] No account eligible for advisor model "${safeLine(advisorModel, 64)}" — routing by request model only`);
-      }
     }
-    return this._select(exclude, model, null, true);
+    const degraded = this._select(exclude, model, null, true);
+    // Said after the walk, so the line can say how it ended: "routing by request
+    // model only" ahead of a walk that finds nobody sends the operator after the
+    // wrong cause of the 429 that follows (#628).
+    // Throttled so a busy advisor session doesn't flood the activity log.
+    if (advisorModel && Date.now() >= (this._advisorDegradeLogAt || 0)) {
+      this._advisorDegradeLogAt = Date.now() + 60_000;
+      // The model names come out of the client's request body, so they are
+      // stripped before reaching the log (see safe-text.js).
+      console.log(`[TeamClaude] No account eligible for advisor model "${safeLine(advisorModel, 64)}" — ${degraded ? 'routing by request model only' : 'and no account is available for the request model either, so no account was selected'}`);
+    }
+    return degraded;
   }
 
   /** The selection walk getActiveAccount runs: manual pin → current account →
