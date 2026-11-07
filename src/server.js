@@ -4173,10 +4173,13 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
           // The hold is capped at an hour; a spent window that resets later keeps
           // the account out past it through the quota gate, so name that (#641).
           const nowS = Date.now() / 1000;
-          const outlasts = [['5h', '5h'], ['weekly', '7d']]
-            .map(([label, key]) => [label, rl[`anthropic-ratelimit-unified-${key}-status`], Number(rl[`anthropic-ratelimit-unified-${key}-reset`])])
-            .filter(([, status, reset]) => status === 'rejected' && Number.isFinite(reset) && reset - nowS > hold + 60)
-            .map(([label, , reset]) => `${label} window resets in ${formatWait(Math.ceil(Number(reset) - nowS))}`);
+          /** @type {string[]} */
+          const outlasts = [];
+          for (const [label, key] of [['5h', '5h'], ['weekly', '7d']]) {
+            const reset = Number(rl[`anthropic-ratelimit-unified-${key}-reset`]);
+            if (rl[`anthropic-ratelimit-unified-${key}-status`] !== 'rejected' || !Number.isFinite(reset)) continue;
+            if (reset - nowS > hold + 60) outlasts.push(`${label} window resets in ${formatWait(Math.ceil(reset - nowS))}`);
+          }
           const later = outlasts.length ? ` (${outlasts.join(', ')})` : '';
           console.log(`[TeamClaude] Quota rejection (429) on "${account.name}"${spent} — throttling ${hold}s${later} and switching account`);
           accountManager.markRateLimited(account.index, hold);
