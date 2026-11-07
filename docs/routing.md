@@ -66,9 +66,19 @@ If every configured account returns that exact denial, TeamClaude's terminal `50
 
 An explicit [`TC_ACCT` pin](#pin-a-session-to-one-account) continues to target exactly the requested account and never fails over, even while that account is excluded from automatic rotation.
 
+## Codex models a plan does not serve
+
+Each ChatGPT plan serves its own set of Codex models. A free plan, or a paid plan that lapsed to free, refuses the larger ones with a JSON `400`: "The '<model>' model is not supported when using Codex with a ChatGPT account." TeamClaude reads this from `error.message` or `detail`, and acts only when the message is that whole sentence and names the request's own model, exactly as sent. On a Codex account, this `400` keeps the account out of rotation **for that model only**, and the request fails over at once. The account continues to serve the models its plan has. The cooldown is 5 min, then 15 min, then 1 h for each later denial. A `400` to a request that was sent before the last denial does not count again. None of this is persisted.
+
+TeamClaude does not decide from the plan name which models an account serves. OpenAI changes that list, and the list also depends on the client version. The `400` is the only reliable signal.
+
+A completed response for the model, to a request sent after the last denial, clears that model's entry. A change in the account's reported plan type (for example `free` to `prolite`) clears all of the account's entries, so a renewed plan serves at once. Until then, `teamclaude status` shows a `Models` line, and the status JSON has `modelDenials` (`model`, `until`, `detail`, `since`, `count`).
+
+If no account that can take the request serves the model, the client gets upstream's `400`, not a `429` or a hold, because a quota reset does not change a plan. A [`TC_ACCT` pin](#pin-a-session-to-one-account) to such an account gets the same `400`. If one account refuses the model and another is only out of quota, the request waits for quota as usual.
+
 ## Account refusals
 
-Some refusals are about the account rather than the request: `error.details.error_code` is `verification_required` (the owner has to verify their identity), `account_on_hold`, `organization_on_hold`, `organization_disabled`, `restricted_regime_endpoint` or `ip_not_in_allowed_range`. Older answers say the same with a `400` and no code: "This organization has been disabled." or "Identity verification is required…". On an OAuth account, any of these in a JSON `400` or a `403` puts the account in `error` with upstream's message (see [Why an account is in `error`](accounts.md#why-an-account-is-in-error)), and the request fails over. Every other `400` goes to the client unchanged. If every account was refused, the terminal `502` quotes upstream's message for each; later requests name the account as refused by upstream and point to `teamclaude status`.
+Some refusals are about the account rather than the request: `error.details.error_code` is `verification_required` (the owner has to verify their identity), `account_on_hold`, `organization_on_hold`, `organization_disabled`, `restricted_regime_endpoint` or `ip_not_in_allowed_range`. Older answers say the same with a `400` and no code: "This organization has been disabled." or "Identity verification is required…". On an OAuth account, any of these in a JSON `400` or a `403` puts the account in `error` with upstream's message (see [Why an account is in `error`](accounts.md#why-an-account-is-in-error)), and the request fails over. Every other `400` goes to the client unchanged, except a [Codex model that the plan does not serve](#codex-models-a-plan-does-not-serve). If every account was refused, the terminal `502` quotes upstream's message for each; later requests name the account as refused by upstream and point to `teamclaude status`.
 
 ## Token scope denials
 
