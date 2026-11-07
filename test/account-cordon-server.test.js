@@ -7,7 +7,7 @@ import { readFile, rm } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { spawnServer } from '../test-helpers/spawn-server.js';
 
-// A drain against the real server: `teamclaude drain` writes the account's
+// A cordon against the real server: `teamclaude cordon` writes the account's
 // row and the running server's reload takes it up, a restart reads it back,
 // and a pinned launch naming the account is refused where it would start.
 
@@ -31,9 +31,9 @@ function post(port, first) {
 }
 
 const status = async port => (await (await fetch(`http://127.0.0.1:${port}/teamclaude/status`, { headers: { 'x-api-key': 'tc-test' } })).json())
-  .accounts.map((/** @type {any} */ a) => [a.name, a.draining, a.drainRemaining]);
+  .accounts.map((/** @type {any} */ a) => [a.name, a.cordoned, a.cordonRemaining]);
 
-test('a drain written by the CLI is applied live, keeps the conversation on the account, and survives a restart', { timeout: 120_000 }, async () => {
+test('a cordon written by the CLI is applied live, keeps the conversation on the account, and survives a restart', { timeout: 120_000 }, async () => {
   const served = [];
   const upstream = http.createServer((req, res) => {
     served.push(req.headers['x-api-key']);
@@ -60,9 +60,9 @@ test('a drain written by the CLI is applied live, keeps the conversation on the 
     assert.equal(await post(server.port, 'the running one'), 200);
     assert.equal(served.at(-1), 'k-work');
 
-    const drained = await run(process.execPath, [cli, 'drain', 'work'], { env, timeout: 30_000 });
-    assert.match(drained.stdout, /Draining account "work": no new conversations go to it/);
-    assert.equal(JSON.parse(await readFile(configPath, 'utf8')).accounts[0].draining, true);
+    const cordoned = await run(process.execPath, [cli, 'cordon', 'work'], { env, timeout: 30_000 });
+    assert.match(cordoned.stdout, /Cordoned account "work": no new conversations go to it/);
+    assert.equal(JSON.parse(await readFile(configPath, 'utf8')).accounts[0].cordoned, true);
     assert.deepEqual(await status(server.port), [['work', true, 1], ['personal', false, undefined]]);
 
     assert.equal(await post(server.port, 'the running one'), 200);
@@ -75,7 +75,7 @@ test('a drain written by the CLI is applied live, keeps the conversation on the 
     for (const pin of ['work', 'WORK']) {
       await assert.rejects(run(process.execPath, [cli, 'run'], { env: { ...env, TC_ACCT: pin }, timeout: 30_000 }), (/** @type {any} */ error) => {
         assert.equal(error.code, 1);
-        assert.match(error.stderr, /is draining: it takes no new conversations/);
+        assert.match(error.stderr, /is cordoned: it takes no new conversations/);
         return true;
       });
     }
@@ -84,14 +84,14 @@ test('a drain written by the CLI is applied live, keeps the conversation on the 
     await server.stop();
     const saved = JSON.parse(await readFile(configPath, 'utf8'));
     server = await spawnServer({ config: () => saved, dir });
-    assert.deepEqual((await status(server.port)).map(([name, draining]) => [name, draining]), [['work', true], ['personal', false]]);
+    assert.deepEqual((await status(server.port)).map(([name, cordoned]) => [name, cordoned]), [['work', true], ['personal', false]]);
     assert.equal(await post(server.port, 'another new one'), 200);
     assert.equal(served.at(-1), 'k-personal');
 
-    const undrained = await run(process.execPath, [cli, 'undrain', 'work'], { env: { ...env, TEAMCLAUDE_CONFIG: server.configPath }, timeout: 30_000 });
-    assert.match(undrained.stdout, /Undrained account "work"/);
-    assert.equal('draining' in JSON.parse(await readFile(configPath, 'utf8')).accounts[0], false);
-    assert.deepEqual((await status(server.port)).map(([name, draining]) => [name, draining]), [['work', false], ['personal', false]]);
+    const uncordoned = await run(process.execPath, [cli, 'uncordon', 'work'], { env: { ...env, TEAMCLAUDE_CONFIG: server.configPath }, timeout: 30_000 });
+    assert.match(uncordoned.stdout, /Uncordoned account "work"/);
+    assert.equal('cordoned' in JSON.parse(await readFile(configPath, 'utf8')).accounts[0], false);
+    assert.deepEqual((await status(server.port)).map(([name, cordoned]) => [name, cordoned]), [['work', false], ['personal', false]]);
   } finally {
     await server.stop();
     upstream.close();

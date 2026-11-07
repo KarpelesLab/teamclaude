@@ -169,7 +169,7 @@ export const UNAVAILABLE_TEXT = {
   route: 'no route allows this account',
   'advisor-quota': "advisor model's weekly bucket spent",
   'advisor-route': 'no route allows the advisor model',
-  draining: 'draining: takes no new conversations',
+  cordoned: 'cordoned: takes no new conversations',
 };
 
 /**
@@ -455,9 +455,9 @@ export function unavailableLine(account, paint) {
   const reason = account?.unavailable;
   if (!reason) return null;
   // Not blocked: it keeps serving the conversations on it, and says how many.
-  if (reason === 'draining') {
-    const left = Number.isFinite(account.drainRemaining) ? `; ${account.drainRemaining} still on it` : '';
-    return `${paint.dim('Draining'.padEnd(8))} ${paint.yellow(`takes no new conversations${left}`)}`;
+  if (reason === 'cordoned') {
+    const left = Number.isFinite(account.cordonRemaining) ? `; ${account.cordonRemaining} still on it` : '';
+    return `${paint.dim('Cordoned'.padEnd(8))} ${paint.yellow(`takes no new conversations${left}`)}`;
   }
   // A refusal outlasts a cap or a cooldown ranked above it, so it is named
   // whatever `unavailable` says, short of the operator's own disable.
@@ -797,7 +797,7 @@ function formatAdaptive(a, paint) {
 function formatAccountStatus(account, now, paint) {
   const parts = [];
   if (account.disabled) parts.push(paint.gray('disabled'));
-  if (account.draining === true) parts.push(paint.yellow('draining'));
+  if (account.cordoned === true) parts.push(paint.yellow('cordoned'));
 
   const status = safeLine(account.status || 'unknown', 32) || 'unknown';
   const colored = status === 'active'

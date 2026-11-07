@@ -262,14 +262,14 @@ export class Warmer {
    *    that meters no 5h window (see warmApplicable);
    *  - disabled / errored / exhausted / throttled accounts — warming them is
    *    pointless or would just 429;
-   *  - draining accounts: a warm-up opens a window for the conversations that
-   *    come next, and a draining account takes none;
+   *  - cordoned accounts: a warm-up opens a window for the conversations that
+   *    come next, and a cordoned account takes none;
    *  - accounts with a live 5h window — already warm, so warming again only burns
    *    quota for nothing.
    */
   _isWarmCandidate(account) {
     if (!warmApplicable(account) || !account.credential) return false;
-    if (account.disabled || account.draining) return false;
+    if (account.disabled || account.cordoned) return false;
     if (account.status === 'error' || account.status === 'exhausted' || account.status === 'throttled') return false;
     return true;
   }

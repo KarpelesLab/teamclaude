@@ -3156,10 +3156,10 @@ export class TUI {
       status = yellow(left ? `denied ${left}` : 'denied');
     } else if (typeof barred === 'string' && /capped$/.test(barred)) {
       status = yellow('capped');
-    } else if (barred === 'draining') {
-      // No new conversations go to it; the ones on it stay. Only when the drain
+    } else if (barred === 'cordoned') {
+      // No new conversations go to it; the ones on it stay. Only when the cordon
       // is all that keeps it out: a spent or failing account says that instead.
-      status = yellow('draining');
+      status = yellow('cordoned');
     } else switch (a.status) {
       case 'active':
         // Re-admitted after an entitlement cooldown, not yet proven by a served request.

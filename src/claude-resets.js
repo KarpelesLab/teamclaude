@@ -269,8 +269,8 @@ export class ClaudeResetRedeemer {
     if (now < this.fleetHoldUntil) return { redeemed: false, reason: 'holding off after a recent Claude reset attempt' };
     const deadline = now + this.timeoutMs;
     const candidates = accounts
-      // Not a draining account: a reset there would buy new work it takes none of.
-      .filter(a => this._isClaude(a) && a.orgUuid && !a.disabled && !a.draining && a.autoRedeemReset !== false)
+      // Not a cordoned account: a reset there would buy new work it takes none of.
+      .filter(a => this._isClaude(a) && a.orgUuid && !a.disabled && !a.cordoned && a.autoRedeemReset !== false)
       .filter(a => a.quota?.resetCredits?.available !== 0)
       .filter(a => now >= this._stateFor(a).cooldownUntil)
       .sort((a, b) => blockedUntil(b, now) - blockedUntil(a, now));

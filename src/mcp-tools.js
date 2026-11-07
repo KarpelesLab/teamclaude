@@ -118,8 +118,8 @@ function fleetStatus({ accountManager, hooks }) {
         disabled: a.disabled,
         // Takes no new conversations while the ones on it stay, and how many
         // are left (0: nothing has run there for an hour, nothing is open).
-        draining: a.draining === true,
-        ...(a.draining === true ? { drainRemaining: a.drainRemaining } : {}),
+        cordoned: a.cordoned === true,
+        ...(a.cordoned === true ? { cordonRemaining: a.cordonRemaining } : {}),
         status: a.status,
         // Already password-masked by the status payload.
         ...(a.routing ? { routing: a.routing } : {}),
@@ -300,17 +300,17 @@ const WRITE_TOOLS = [
     }).then(outcome => ({ ...outcome, enabled: args.enabled })),
   },
   {
-    name: 'set_account_draining',
-    title: 'Drain an account or put it back',
-    description: 'Drain an account: no new conversation goes to it, while the ones already on it stay until they finish; get_status says how many are left (drainRemaining). draining false puts it back. Saved to the config file.',
-    properties: { ...ACCOUNT_ARGS, draining: { type: 'boolean' } },
-    required: ['account', 'draining'],
+    name: 'set_account_cordoned',
+    title: 'Cordon an account or put it back',
+    description: 'Cordon an account: no new conversation goes to it, while the ones already on it stay until they finish; get_status says how many are left (cordonRemaining). cordoned false puts it back. Saved to the config file.',
+    properties: { ...ACCOUNT_ARGS, cordoned: { type: 'boolean' } },
+    required: ['account', 'cordoned'],
     write: true,
     run: (args, ctx) => changeAccount(ctx, args, (index, entry) => {
-      ctx.accountManager.setDraining(index, args.draining);
+      ctx.accountManager.setCordoned(index, args.cordoned);
       // An explicit boolean, as set_account_enabled writes, for the same reason.
-      if (entry) entry.draining = args.draining;
-    }).then(outcome => ({ ...outcome, draining: args.draining })),
+      if (entry) entry.cordoned = args.cordoned;
+    }).then(outcome => ({ ...outcome, cordoned: args.cordoned })),
   },
   {
     name: 'set_account_priority',

@@ -119,7 +119,7 @@ import {
   thresholdTable,
   upsertRoute,
   setAccountDisabled,
-  setAccountDraining,
+  setAccountCordoned,
   setAccountPriority,
   renameAccount,
 } from './config-ops.js';
@@ -237,12 +237,12 @@ switch (command) {
     await setDisabledCommand(false);
     process.exit(0);
     break;
-  case 'drain':
-    await setDrainingCommand(true);
+  case 'cordon':
+    await setCordonedCommand(true);
     process.exit(0);
     break;
-  case 'undrain':
-    await setDrainingCommand(false);
+  case 'uncordon':
+    await setCordonedCommand(false);
     process.exit(0);
     break;
   case 'api':
@@ -873,12 +873,12 @@ async function serverCommand() {
     await atomicConfigUpdate((/** @type {any} */ diskConfig) => { result = setAccountDisabled(diskConfig, account, disabled, spec); });
     return result;
   };
-  // POST /teamclaude/account-drain, the same way: no new conversation goes to
-  // a draining account, while one already on it keeps being served there.
-  hooks.setAccountDraining = async (/** @type {string} */ account, /** @type {boolean} */ draining, /** @type {any} */ spec) => {
-    /** @type {{ name: string, draining: boolean }|undefined} */
+  // POST /teamclaude/account-cordon, the same way: no new conversation goes to
+  // a cordoned account, while one already on it keeps being served there.
+  hooks.setAccountCordoned = async (/** @type {string} */ account, /** @type {boolean} */ cordoned, /** @type {any} */ spec) => {
+    /** @type {{ name: string, cordoned: boolean }|undefined} */
     let result;
-    await atomicConfigUpdate((/** @type {any} */ diskConfig) => { result = setAccountDraining(diskConfig, account, draining, spec); });
+    await atomicConfigUpdate((/** @type {any} */ diskConfig) => { result = setAccountCordoned(diskConfig, account, cordoned, spec); });
     return result;
   };
 
@@ -1580,8 +1580,8 @@ async function envCommand() {
     // and this command must stay eval-safe.
     if (!(config.accounts || []).some((a, i) => a.name === account || String(i) === account)) {
       process.stderr.write(`# warning: no account named "${account}" in the config — the proxy will refuse this pin\n`);
-    } else if (config.accounts?.[resolveAccountPin({ accounts: config.accounts }, account) ?? -1]?.draining) {
-      process.stderr.write(`# warning: account "${account}" is draining — it takes no new conversations (teamclaude undrain ${account} puts it back)\n`);
+    } else if (config.accounts?.[resolveAccountPin({ accounts: config.accounts }, account) ?? -1]?.cordoned) {
+      process.stderr.write(`# warning: account "${account}" is cordoned — it takes no new conversations (teamclaude uncordon ${account} puts it back)\n`);
     }
   }
   // The flag that reproduces this mode whatever the config's default says.
@@ -1635,13 +1635,13 @@ async function runCommand() {
   // gets inherited by every tool and MCP server claude spawns.
   const tcAcct = (process.env.TC_ACCT || '').trim();
   delete env.TC_ACCT;
-  // A pinned launch is a new conversation on that account, which a draining
+  // A pinned launch is a new conversation on that account, which a cordoned
   // account takes none of: refused here, where it would start, while the
   // sessions already pinned to it keep being served by the proxy.
   // Resolved the way the proxy resolves the pin, so every spelling it takes
   // (name, email, uuid) is caught here.
-  if (tcAcct && config.accounts?.[resolveAccountPin({ accounts: config.accounts }, tcAcct) ?? -1]?.draining) {
-    console.error(`[TeamClaude] Account "${tcAcct}" is draining: it takes no new conversations. Pin another account, or run without TC_ACCT, or put it back with: teamclaude undrain ${tcAcct}`);
+  if (tcAcct && config.accounts?.[resolveAccountPin({ accounts: config.accounts }, tcAcct) ?? -1]?.cordoned) {
+    console.error(`[TeamClaude] Account "${tcAcct}" is cordoned: it takes no new conversations. Pin another account, or run without TC_ACCT, or put it back with: teamclaude uncordon ${tcAcct}`);
     process.exit(1);
   }
   // Legacy: a caller-supplied ANTHROPIC_BASE_URL of http://<this proxy>/tc-acct/…
@@ -2838,19 +2838,19 @@ async function setDisabledCommand(disabled) {
   await notifyRunningServer(config);
 }
 
-// ── drain / undrain ─────────────────────────────────────────
+// ── cordon / uncordon ─────────────────────────────────────────
 
 /**
- * `teamclaude drain <name>` / `undrain <name>`: a draining account takes no
+ * `teamclaude cordon <name>` / `uncordon <name>`: a cordoned account takes no
  * new conversation, while one already on it keeps being served there until it
  * finishes; the step before disabling or removing it. Written the way enable
  * and disable are, then picked up by a running server's reload.
- * @param {boolean} draining
+ * @param {boolean} cordoned
  */
-async function setDrainingCommand(draining) {
+async function setCordonedCommand(cordoned) {
   const config = await loadOrCreateConfig();
   const name = args[1];
-  const verb = draining ? 'drain' : 'undrain';
+  const verb = cordoned ? 'cordon' : 'uncordon';
 
   if (!name) {
     console.error(`Usage: teamclaude ${verb} <account-name|email> [--org <name|uuid>]`);
@@ -2863,21 +2863,21 @@ async function setDrainingCommand(draining) {
     process.exit(1);
   }
 
-  if (draining) {
-    account.draining = true;
+  if (cordoned) {
+    account.cordoned = true;
   } else {
-    delete account.draining;
+    delete account.cordoned;
   }
   await saveConfig(config);
-  console.log(draining
-    ? `Draining account "${account.name}": no new conversations go to it; the ones already on it stay until they finish (teamclaude status shows how many are left)`
-    : `Undrained account "${account.name}": it takes new conversations again`);
+  console.log(cordoned
+    ? `Cordoned account "${account.name}": no new conversations go to it; the ones already on it stay until they finish (teamclaude status shows how many are left)`
+    : `Uncordoned account "${account.name}": it takes new conversations again`);
   await notifyRunningServer(config);
-  // Every other account that could take its traffic is disabled or draining
+  // Every other account that could take its traffic is disabled or cordoned
   // too: say so now, rather than leave it to the next request's refusal.
   const provider = providerOf(account);
-  if (draining && !(config.accounts || []).some((/** @type {any} */ a) => a !== account && !a.disabled && !a.draining && canServeProvider(a, provider))) {
-    console.log(`No other account takes new ${provider} conversations now: they are refused until one is undrained, enabled or added.`);
+  if (cordoned && !(config.accounts || []).some((/** @type {any} */ a) => a !== account && !a.disabled && !a.cordoned && canServeProvider(a, provider))) {
+    console.log(`No other account takes new ${provider} conversations now: they are refused until one is uncordoned, enabled or added.`);
   }
 }
 
@@ -2999,8 +2999,8 @@ Commands:
   remove <name>       Remove an account (by name or email; --org to disambiguate)
   disable <name>      Temporarily exclude an account from rotation
   enable <name>       Re-enable a disabled account (also clears a stuck error)
-  drain <name>        Send no new conversations to an account; the ones already
-                      on it stay there until they finish (undrain <name> to end)
+  cordon <name>        Send no new conversations to an account; the ones already
+                      on it stay there until they finish (uncordon <name> to end)
   priority <name> <n> Set rotation priority (lower = preferred; --first/--last)
   rename <name> <new> Rename an account, updating the routes that list it
   route [list|add|rm] Per-model routing: pin model globs to specific accounts
