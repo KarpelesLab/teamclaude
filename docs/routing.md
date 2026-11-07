@@ -163,6 +163,8 @@ The counts are the accounts that can serve the request right now, and how many o
 
 In both modes, no account able to serve the advisor at all means main-model-only routing, as before.
 
+An account's [`maxUsage`](quota.md#per-account-usage-caps) cap on the advisor's family holds in both modes: while another account can serve the request, selection and a failover hop stay off an account whose cap bars that family, since the advisor call would cross it. When no other account can serve the request it is routed by its main model as usual, so a cap on the advisor's family never refuses a request by itself. A `TC_ACCT` or session pin stays where it is pinned.
+
 Unwanted models can be rejected outright with [`blockedModels`](configuration.md#fields) instead of being forwarded — a model no account can serve otherwise gets rate-limited upstream and hangs the pipeline.
 
 ## Model routes

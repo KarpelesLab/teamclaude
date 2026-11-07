@@ -1543,8 +1543,9 @@ export class AccountManager {
       // was routed on. Announced by a first attempt only: a retry's exclusions
       // shrink both sets, so its counts describe that request and not the fleet.
       const first = !(/** @type {Set<number>|null} */ (exclude)?.size);
-      routedAdvisor = this._advisorForSelection(excluded, model, advisorModel, first);
-      account = this._pickActiveAccount(excluded, model, routedAdvisor, sessionId);
+      const uncapped = this._withoutAdvisorCapped(excluded, model, advisorModel);
+      routedAdvisor = this._advisorForSelection(uncapped, model, advisorModel, first);
+      account = this._pickActiveAccount(uncapped, model, routedAdvisor, sessionId);
     } finally {
       this._selectingProvider = null;
       this._selectionDecision = null;
@@ -1764,7 +1765,7 @@ export class AccountManager {
    * provider partition, the expiry band. Returns the account or null.
    */
   pickAlternate(exclude, model = null, advisorModel = null, provider = DEFAULT_PROVIDER) {
-    const excluded = this._excludeOtherProviders(exclude, provider);
+    const excluded = this._withoutAdvisorCapped(this._excludeOtherProviders(exclude, provider), model, advisorModel);
     // The fallback as a last resort, through the same pure picker the
     // selection walk uses: a 429/5xx hop off a probed, spent account would
     // otherwise end the request in a 429 while an account that can still serve
@@ -1896,6 +1897,38 @@ export class AccountManager {
     return { eligible, of };
   }
 
+  /**
+   * `exclude`, widened by the accounts whose cap bars the advisor model's family,
+   * while another account can still serve the request.
+   *
+   * capBars and availability hold the advisor's family cap only on paths that
+   * still carry the advisor, and several set it aside: `advisorEligibility:
+   * "prefer"`, its 429 hop, and the walk by request model alone. The advisor call
+   * then runs on whichever account was chosen and can cross that account's cap,
+   * so selection stays off such an account in either mode (#628).
+   *
+   * A preference, not a refusal: when no other account can serve the request the
+   * set is returned as it came, and the request is routed by its main model as
+   * before. Accounts with no `maxUsage` or `maxSpend`, and requests that declare
+   * no advisor, are untouched.
+   *
+   * @param {Set<number>|null} exclude
+   * @param {*} model  loosely typed, like the availability checks it feeds
+   * @param {*} advisorModel
+   * @returns {*} a set, or null, loosely typed like _excludeOtherProviders
+   */
+  _withoutAdvisorCapped(exclude, model, advisorModel) {
+    if (!advisorModel) return exclude;
+    const capped = [];
+    let another = false;
+    for (const account of this.accounts) {
+      if (exclude?.has(account.index)) continue;
+      if (this._familyCapExceeded(account, advisorModel)) capped.push(account.index);
+      else if (this._isAvailable(account, model, null)) another = true;
+    }
+    return capped.length && another ? new Set([...(exclude ?? []), ...capped]) : exclude;
+  }
+
   /** Apply the `advisorEligibility` setting; safe on every config reload.
    *  @param {unknown} setting */
   setAdvisorEligibility(setting) {
@@ -1962,15 +1995,19 @@ export class AccountManager {
     if (advisorModel) {
       const account = this._select(exclude, model, advisorModel, false);
       if (account) return account;
-      // Throttled so a busy advisor session doesn't flood the activity log.
-      if (Date.now() >= (this._advisorDegradeLogAt || 0)) {
-        this._advisorDegradeLogAt = Date.now() + 60_000;
-        // The model names come out of the client's request body, so they are
-        // stripped before reaching the log (see safe-text.js).
-        console.log(`[TeamClaude] No account eligible for advisor model "${safeLine(advisorModel, 64)}" — routing by request model only`);
-      }
     }
-    return this._select(exclude, model, null, true);
+    const degraded = this._select(exclude, model, null, true);
+    // Said after the walk, so the line can say how it ended: "routing by request
+    // model only" ahead of a walk that finds nobody sends the operator after the
+    // wrong cause of the 429 that follows (#628).
+    // Throttled so a busy advisor session doesn't flood the activity log.
+    if (advisorModel && Date.now() >= (this._advisorDegradeLogAt || 0)) {
+      this._advisorDegradeLogAt = Date.now() + 60_000;
+      // The model names come out of the client's request body, so they are
+      // stripped before reaching the log (see safe-text.js).
+      console.log(`[TeamClaude] No account eligible for advisor model "${safeLine(advisorModel, 64)}" — ${degraded ? 'routing by request model only' : 'and no account is available for the request model either, so no account was selected'}`);
+    }
+    return degraded;
   }
 
   /** The selection walk getActiveAccount runs: manual pin → current account →
