@@ -123,7 +123,7 @@ const OAUTH_SCOPE_ERROR_CODE = 'oauth_scope_insufficient';
 // `model_not_found` code, because the `{"detail": ...}` shape carries no code.
 // Anchored, because other 400s can echo the client's own text, and that must
 // not bar a model.
-const CODEX_MODEL_UNSUPPORTED = /^The '([^']{1,64})' model is not supported when using Codex with a ChatGPT account\.?$/;
+const CODEX_MODEL_UNSUPPORTED = /^The '([A-Za-z0-9._:-]{1,64})' model is not supported when using Codex with a ChatGPT account\.?$/;
 const ERROR_BODY_INSPECTION_LIMIT = 64 * 1024;
 // How long an idle keep-alive connection is held open.
 //

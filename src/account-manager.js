@@ -211,7 +211,7 @@ const underOne = v => v != null && v < 1;
  * One model a Codex account's ChatGPT plan refused (see markModelDenied).
  *
  * @typedef {object} ModelDenial
- * @property {string} model  the lower-cased model the refused request named
+ * @property {string} model  the model the refused request named, exactly as sent
  * @property {number|null} until  the end of the cooldown; null once it lapsed
  * @property {string|null} detail  upstream's own message, bounded
  * @property {number} since  when the first denial in this run came
@@ -543,7 +543,7 @@ function makeAccount(acct, index, listener = null) {
     // value it was sent under, so an answer to one already in flight when a
     // denial was counted can neither count again nor clear a newer one.
     entitlementEpoch: 0,
-    // Codex models this account's ChatGPT plan refused, by lower-cased model
+    // Codex models this account's ChatGPT plan refused, by model exactly as sent
     // (see markModelDenied). Per model, because the plan still serves the
     // others. Ephemeral like the entitlement cooldown, and for the same reason.
     modelDenials: /** @type {Map<string, ModelDenial>} */ (new Map()),
