@@ -43,7 +43,10 @@ An HTTP `400` with Anthropic's `invalid_request_error` message beginning
 `400` or `402` with a structured `billing_error`, excludes that account from
 automatic rotation for five minutes. The request fails over immediately,
 including to [subscription usage credits] when the existing fallback policy
-allows them. Other validation errors pass through unchanged.
+allows them. Other validation errors pass through unchanged. A request
+pinned to one account is not moved; one pinned to a
+[list of API-key accounts](#a-list-of-api-key-accounts) moves to the next one
+listed.
 
 Status reports the billing refusal separately from quota exhaustion and
 recommends checking billing or purchasing credits. If every eligible account
@@ -79,7 +82,7 @@ Some refusals are about the account rather than the request: `error.details.erro
 
 ## Token scope denials
 
-A `403` with `error.details.error_code: oauth_scope_insufficient` is about the token, not the account. A `claude setup-token` token carries `user:inference` only, so Claude Code's bootstrap, settings and connector-registry calls draw this on every such account. TeamClaude does not fail those over: a `GET` that draws one goes out once more on the client's own bearer, like the [identity plane](proxy-modes.md), over the same upstream proxy, sx route and admission queue as any forwarded request, and rotation stays where it was. Any other method, which includes every completion, a [pinned](#pin-a-session-to-one-account) request, and a client with no bearer of its own get the normal handling.
+A `403` with `error.details.error_code: oauth_scope_insufficient` is about the token, not the account. A `claude setup-token` token carries `user:inference` only and cannot reach endpoints that require `user:profile`. Known [client control-plane calls](proxy-modes.md#mitm-proxy-mode-default) bypass rotation from the start. For other endpoints, an unpinned `GET` that draws a scope denial goes out once more on the client's own bearer, over the same upstream proxy, sx route and admission queue as any forwarded request, and rotation stays where it was. Any other method, which includes every completion, a [pinned](#pin-a-session-to-one-account) request, and a client with no bearer of its own get the normal handling.
 
 ## One failover hop on a rate limit
 
@@ -330,7 +333,7 @@ The event stays recorded on the account. The first request that can be sent both
 
 ## Pin a session to one account
 
-`TC_ACCT` forces every request onto **one** account, bypassing rotation (and never failing over to another). It works in **both** modes — MITM (the default) and `--no-mitm`:
+`TC_ACCT` forces every request onto **one** account, bypassing rotation (and never failing over to another, except along a [list of API-key accounts](#a-list-of-api-key-accounts) when billing refuses one). It works in **both** modes — MITM (the default) and `--no-mitm`:
 
 ```bash
 # By email — what you'll normally use
@@ -355,6 +358,22 @@ Prefer the `accountUuid` (printed by `teamclaude accounts`) for anything scripte
 The rotation index is **not** accepted — it is array position, so deleting an account would silently repoint every later pin at a *different* account.
 
 > If you hold the *same* account in two orgs, a bare uuid or email matches the first one. `TC_ACCT=<accountUuid>/<orgUuid>` picks a specific one — rarely needed.
+
+### A list of API-key accounts
+
+`TC_ACCT` may name several API-key accounts, separated by commas, in the order they are to be spent:
+
+```bash
+TC_ACCT=credit-one,credit-two,credit-three teamclaude run
+```
+
+The session is pinned to the first. When upstream billing refuses the account a request is on (no API credit left, see [Billing refusals](#billing-refusals)), that request goes to the next account in the list, and later requests pass over a listed account for as long as its billing cooldown lasts. The refusal arrives before the model runs and before anything reaches the client, so the request runs once, on the account that takes it. A listed account serves while it is disabled, as a pinned one does, so accounts kept out of rotation can be spent this way and no other.
+
+That is the only move. A rate limit, a `5xx`, a credential refusal or any other answer is handled as for a pin to one account; a response that has started reaching the client is never moved; and the list never moves a request to or from a subscription, whatever it names. A listed account at its usage cap, or of another provider, is passed over. When no listed account is left, the request ends as a pin to the last one tried does.
+
+Every name has to match an account, or the pin is refused as an unknown one is. A value that matches as a whole is still that one account, so a display name with a comma in its org keeps working. Under MITM the list travels as the proxy URL's username (`http://credit-one,credit-two:<key>@127.0.0.1:3456`), under `--no-mitm` in the `/tc-acct/` prefix. The [session pin](#move-one-running-session) names one account.
+
+Each account is usually its own organization, and organizations share no prompt cache, so the first request of each conversation after a move writes its cached prefix again on the next account.
 
 ### Move one running session
 

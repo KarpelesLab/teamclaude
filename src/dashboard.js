@@ -15,7 +15,7 @@
 // operator/OAuth-derived, but they still never reach innerHTML.
 
 import { createHash } from 'node:crypto';
-import { UNAVAILABLE_TEXT, RESET_CREDIT_MAX_AGE_MS, outsideSpendText, forecastText, fleetForecastText, showSessionRow, showWeeklyRow } from './status-renderer.js';
+import { UNAVAILABLE_TEXT, RESET_CREDIT_MAX_AGE_MS, outsideSpendText, forecastText, fleetForecastText, showSessionRow, showWeeklyRow, creditText } from './status-renderer.js';
 import { USAGE_WINDOWS } from './client-usage.js';
 
 export function renderDashboardHtml() {
@@ -767,6 +767,7 @@ const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, modelLabel, recentModelLabels, providerLabel, accountGroups, thresholdBadgeText, accountBadges, sessionRows, sessionPinsText, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
   outsideSpendText, forecastText, fleetForecastText, showSessionRow, showWeeklyRow, callerCan, callerNotice, cardNoteKey, cardNoteFor, backendQuotaRows,
+  creditText,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -1132,6 +1133,14 @@ ${SHARED_HELPERS}
       card.appendChild(el('div', 'usage', 'quota unknown (no traffic observed yet)'));
     }
     if (models) card.appendChild(models);
+    // Prepaid API credit (accounts[].credit): the share of it spent this
+    // cycle as a bar, its renewal as the bar's countdown, and the amount left
+    // with where the figure comes from — the same words the status command prints.
+    if (a.credit) {
+      card.appendChild(quotaRow('Credit', a.credit.usedFraction, a.credit.cycleEnd));
+      var creditLine = creditText(a.credit, Date.now());
+      if (creditLine) card.appendChild(el('div', 'usage', 'credit: ' + creditLine));
+    }
     // Spend on this account that did not come through the proxy (#475).
     var outside = outsideSpendText(q.outsideSpend);
     if (outside) card.appendChild(el('div', 'usage', 'outside: ' + outside));
