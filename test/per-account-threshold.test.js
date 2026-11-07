@@ -280,3 +280,19 @@ test('DEFAULT_SWITCH_THRESHOLD still governs an account and fleet with nothing c
   const am = new AccountManager([oauth('a')]);
   assert.equal(am.thresholdFor('unified7d', am.accounts[0]), DEFAULT_SWITCH_THRESHOLD);
 });
+
+test('deleting accounts[].priority on disk returns the running account to priority 0 (#640)', async () => {
+  const mem = [{ name: 'a', type: 'apikey', apiKey: 'k', priority: 1 }, { name: 'b', type: 'apikey', apiKey: 'k2' }];
+  const am = new AccountManager(mem.map(a => ({ ...a })), 0.98);
+  assert.equal(am.accounts[0].priority, 1);
+  const disk = mem.map(a => ({ ...a }));
+  delete disk[0].priority;
+
+  await syncAccountsFromDisk({ accounts: disk }, { accounts: mem }, am);
+  assert.equal(am.accounts[0].priority, 0, 'an absent key means the default, as at startup');
+  assert.equal('priority' in mem[0], false, 'the config entry agrees with the running account');
+
+  disk[0].priority = 3;
+  await syncAccountsFromDisk({ accounts: disk }, { accounts: mem }, am);
+  assert.equal(am.accounts[0].priority, 3);
+});
