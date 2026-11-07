@@ -3269,8 +3269,8 @@ export class AccountManager {
    * `account`'s reset is unknown, or when nothing resets sooner. An account
    * whose reset is unknown never preempts: it may well reset later.
    * @param {Record<string, any>|null|undefined} account
-   * @param {string|null} [model]
-   * @param {string|null} [advisorModel]
+   * @param {any} [model]  as _isAvailable takes it
+   * @param {any} [advisorModel]
    * @param {Set<number>|null} [exclude]
    * @returns {Record<string, any>|null}
    */
