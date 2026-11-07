@@ -420,11 +420,11 @@ export async function fetchBackendQuota(account, { fetchImpl = proxyFetch, timeo
 /**
  * Parse a JSON response body of at most `limit` bytes; `undefined` when it is
  * larger (declared or actual). A response without a readable stream (a test
- * double) falls back to `json()`.
+ * double) falls back to `json()`. Also read by anthropic-cost-report.js.
  * @param {any} res
  * @param {number} limit
  */
-async function readJsonBounded(res, limit) {
+export async function readJsonBounded(res, limit) {
   const declared = Number(res.headers?.get?.('content-length'));
   if (Number.isFinite(declared) && declared > limit) return undefined;
   if (typeof res.body?.getReader !== 'function') return res.json();

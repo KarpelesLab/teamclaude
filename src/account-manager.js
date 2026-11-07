@@ -19,6 +19,7 @@ import { isRefused } from './account-refusal.js';
 import { parseRoutingUrl, describeRouting, routingToUrl, isRoutingFailure } from './account-routing.js';
 import { isSelfProxy } from './upstream-proxy.js';
 import { envVar } from './brand.js';
+import { accountCredit, emptyCreditState, recordCreditUsage, rollCreditCycle, creditView, exportCreditState, restoreCreditState } from './api-credit.js';
 /** @typedef {import('./session-tracker.js').Observation} Observation */
 
 // Re-exported for callers that import these model helpers from here.
@@ -448,6 +449,11 @@ function makeAccount(acct, index, listener = null) {
     // and the fleet upstream proxy for this account. Null goes by the fleet
     // path. See account-routing.js.
     routing: accountRouting(acct, listener),
+    // Prepaid API credit (accounts[].credit, see api-credit.js): the validated
+    // setting, admin key included — it is read from here by the credit monitor
+    // and never copied into a payload — and what has been learned about it.
+    creditConfig: accountCredit(acct),
+    creditState: emptyCreditState(),
     // Whether this account is EXEMPT from spending one of its free Codex
     // rate-limit reset credits (see codex-reset-credits.js). Negative-only, and
     // the polarity is the opposite of what the name suggests: the switch that
@@ -5159,6 +5165,9 @@ export class AccountManager {
         || (account.usage.byBucket[bucket] = { cacheReadTokens: 0, cacheCreationTokens: 0 });
       per.cacheReadTokens += read;
       per.cacheCreationTokens += creation;
+      // The local credit estimate, when the account has a credit setting: the
+      // same one record per message, so a streamed reply is priced once.
+      if (account.creditConfig) recordCreditUsage(account, model, usage);
     }
     // A request with no session id (or one the tracker has forgotten) is still a
     // real spend by the account, so the two scopes are recorded independently.
@@ -5909,7 +5918,10 @@ export class AccountManager {
       // matching the account it was written for. Rows from an older version
       // therefore stop restoring Codex quota, which is re-learned from traffic.
       const outsideSpend = this.outsideSpend.export(a.index);
-      return { accountUuid: a.accountUuid, accountId: a.accountId, userId: a.userId, provider: providerOf(a), orgUuid: a.orgUuid, orgName: a.orgName, name: a.name, profile, quota, adaptive, outsideSpend };
+      // The local credit ledger (api-credit.js), only on an account with a
+      // credit setting: a fleet without one writes the file it always wrote.
+      const credit = exportCreditState(a);
+      return { accountUuid: a.accountUuid, accountId: a.accountId, userId: a.userId, provider: providerOf(a), orgUuid: a.orgUuid, orgName: a.orgName, name: a.name, profile, quota, adaptive, outsideSpend, ...(credit ? { credit } : {}) };
     });
   }
 
@@ -5932,6 +5944,7 @@ export class AccountManager {
       this.burnRateLearner.restore(account.index, match.adaptive?.burnRate);
       this.outsideSpend.restore(account.index, match.outsideSpend);
       this.concurrencyLearner.restore(account.index, match.adaptive?.concCap);
+      restoreCreditState(account, match.credit);
       // We already know this account's weekly window, so it isn't "probing".
       if (account.quota.unified7dReset != null) account.probing = false;
     }
@@ -6086,8 +6099,41 @@ export class AccountManager {
         credentialRejectedUntil: a.credentialRejectedUntil && a.credentialRejectedUntil > Date.now()
           ? new Date(a.credentialRejectedUntil).toISOString()
           : null,
+        // Prepaid API credit, present only with accounts[].credit. Built field
+        // by field (creditView): the admin key behind it never leaves the account.
+        ...(a.creditConfig ? { credit: this.creditStatus(a) } : {}),
       })),
     };
+  }
+
+  /**
+   * The account's prepaid API credit as payloads carry it (see creditView), or
+   * null without a credit setting. Turns the local ledger over to a new cycle
+   * first, so a cycle that ended while nothing was served reads as such.
+   * @param {Record<string, any>} account
+   * @param {number} [now]
+   */
+  creditStatus(account, now = Date.now()) {
+    if (!account?.creditConfig) return null;
+    rollCreditCycle(account, now);
+    return creditView(account, now);
+  }
+
+  /**
+   * Apply a reloaded credit setting. A different admin key drops what the old
+   * one read, its error and its backoff, so the new key is read at once and a
+   * reading from another organization is never shown under it.
+   * @param {number} accountIndex
+   * @param {import('./api-credit.js').CreditConfig|null} credit
+   */
+  setCreditConfig(accountIndex, credit) {
+    const account = this.accounts[accountIndex];
+    if (!account) return;
+    const before = account.creditConfig?.adminKey ?? null;
+    account.creditConfig = credit;
+    if (!account.creditState) account.creditState = emptyCreditState();
+    if ((credit?.adminKey ?? null) !== before) account.creditState.admin = null;
+    if (!credit) account.creditState = emptyCreditState();
   }
 
   /**
@@ -6160,6 +6206,8 @@ export class AccountManager {
   /** Return per-account quota and fleet aggregates for status clients. */
   getQuotaSummary() {
     this.refreshExpiredQuotas();
-    return buildQuotaSummary(this.accounts);
+    const now = Date.now();
+    for (const a of this.accounts) rollCreditCycle(a, now);
+    return buildQuotaSummary(this.accounts, now);
   }
 }
