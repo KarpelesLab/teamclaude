@@ -142,6 +142,16 @@ test('blockedFamilies reports the families barred by their own weekly bucket', (
   assert.deepEqual(blockedFamilies({}, 0.98), []);
 });
 
+test('blockedFamilies names the shared weekly, not a family, when that is what is spent', () => {
+  // The router gates every model on the shared weekly, so `⊘ Fable` there
+  // blamed the family for the Wk bar's limit.
+  assert.deepEqual(blockedFamilies({ unified7d: 1, unified7dFable: 0.83 }, 0.98), ['Wk']);
+  assert.deepEqual(blockedFamilies({ unified7d: 1, unified7dFable: 0.99, unified7dSonnet: 1 }, 0.98), ['Wk']);
+  // A lower family threshold still bars the family on shared spend alone (#175).
+  const th = k => (k === 'unified7dFable' ? 0.8 : 0.98);
+  assert.deepEqual(blockedFamilies({ unified7d: 0.85, unified7dFable: 0.5 }, th), ['Fable']);
+});
+
 // ── switch-threshold tag (#409) ───────────────────────────────
 
 test('switchThresholdTag is silent with no override, or one that matches the fleet', () => {
