@@ -1646,7 +1646,13 @@ export function relayHttpForward(req, res, stripOverage = false, /** @type {Reco
 // does not take `/v1/sessionsX`. The entry without that slash, the collection
 // itself, matches as well, since a session is created with a bare
 // POST /v1/sessions (classificationPath has already dropped any `?beta=true`).
-const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/', '/api/frame/', '/v1/mcp_servers/', '/v1/environments/', '/v1/sessions/', '/v2/session_ingress/', '/v2/ccr-sessions/'];
+// Bootstrap, policy, feature flags and registry access belong to the client
+// login. Inference-only upstreams do not implement these endpoints.
+const CLIENT_CREDENTIAL_PATHS = [
+  '/v1/code/', '/api/oauth/', '/api/frame/', '/v1/mcp_servers/', '/v1/environments/', '/v1/sessions/', '/v2/session_ingress/', '/v2/ccr-sessions/',
+  '/api/claude_cli/', '/api/claude_code/policy_limits/', '/api/claude_code_grove/', '/api/claude_code_penguin_mode/',
+  '/api/eval/', '/api/eval-authed/', '/mcp-registry/v0/servers/',
+];
 
 /**
  * Whether a classified path is on the client's own identity plane: below an

@@ -3,6 +3,7 @@ import { SessionTitles } from './session-titles.js';
 import { modelGlobMatches, resolveSwitchThreshold } from './model.js';
 import { safeLine } from './safe-text.js';
 import { providerOf } from './provider.js';
+import { sanitizeCreditView } from './api-credit.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 // Attach mode — the dashboard against a server running somewhere else (a
@@ -278,6 +279,9 @@ export class RemoteAccountManager {
       // into the frame, so it gets the same scrub as everything else.
       routing: a?.routing == null ? a?.routing : text(a.routing, 128),
       quota: { ...(a?.quota || {}) },
+      // Prepaid credit: its currency, source and error text are drawn into the
+      // row, so the view is rebuilt from known fields rather than spread.
+      credit: sanitizeCreditView(a?.credit),
     }));
     // -1 when the payload names an account that is no longer listed: nothing is
     // marked current, which is the truth, rather than defaulting to the first row.

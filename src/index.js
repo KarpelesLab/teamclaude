@@ -33,6 +33,7 @@ import { ensureAccountIds, accountIdsComplete } from './account-id.js';
 import * as alias from './alias.js';
 import { ensureCerts, mitmHosts, caCertPath } from './mitm.js';
 import { Prober, probeApplicable } from './prober.js';
+import { CreditMonitor } from './api-credit.js';
 import { ResetCreditRedeemer } from './codex-reset-credits.js';
 import { ClaudeResetRedeemer } from './claude-resets.js';
 import { Warmer, warmApplicable } from './warmer.js';
@@ -530,6 +531,10 @@ async function serverCommand() {
 
   // Opt-in background quota probe (config.quotaProbeSeconds, default 0 = off).
   let prober = null;
+  // The prepaid-credit cost-report reader: reads only accounts that carry
+  // `credit.adminKey`, and nothing at all when none does.
+  /** @type {CreditMonitor|null} */
+  let creditMonitor = null;
   // Opt-in keep-warm scheduler (interval or persisted reset-target schedule).
   let warmer = null;
   const serverStartedAt = Date.now();
@@ -1036,6 +1041,14 @@ async function serverCommand() {
     console.error('[TeamClaude] accounts[].maxSpend is set but the quota probe is off (quotaProbeSeconds = 0) — the spend figure it is judged against is only refreshed by the probe, so the cap only binds after a manual `p` refresh; run `teamclaude probe <seconds>`');
   }
 
+  // Read each account's organization spend for `accounts[].credit` when it
+  // carries an Admin API key (api-credit.js). Opt-in by the key's presence,
+  // zero-spend, and disabled accounts included: it sends no message and
+  // refreshes no token. The check is a minute's tick over the account list;
+  // each account is read on its own `refreshMinutes`.
+  creditMonitor = new CreditMonitor(accountManager);
+  creditMonitor.start();
+
   // Start the opt-in keep-warm scheduler. Interval mode runs relative to server
   // startup; reset-target modes restore their next occurrence from config.
   warmer = new Warmer(accountManager, {
@@ -1072,6 +1085,7 @@ async function serverCommand() {
     stopTitle();
     if (!tui) console.log('\n[TeamClaude] Shutting down...');
     prober?.stop();
+    creditMonitor?.stop();
     warmer?.stop();
     credentialSync.stop();
     eventLoopMonitor.stop();
