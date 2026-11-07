@@ -3243,14 +3243,6 @@ export class AccountManager {
   }
 
   /**
-   * The config key is provisional: #176 proposes a `routingStrategy` enum for
-   * the adjacent drain-concentration problem, and a value such as `"expiry"` is
-   * a plausible home for this behaviour. Enabling changes which accounts
-   * selection considers, so only a literal `true` turns it on and a hand-edited
-   * `"false"` reads as off. `tolerance` is not coerced, because an explicit 0 is
-   * a meaningful setting that clamps to 1, the strictest band.
-   */
-  /**
    * Earliest-deadline-first routing (opt-in, `preferSoonestWeeklyReset`).
    * Weekly quota that is not spent before its window resets is lost, so with
    * this on the router keeps traffic on the available account whose governing
@@ -3288,6 +3280,14 @@ export class AccountManager {
     return best;
   }
 
+  /**
+   * The config key is provisional: #176 proposes a `routingStrategy` enum for
+   * the adjacent drain-concentration problem, and a value such as `"expiry"` is
+   * a plausible home for this behaviour. Enabling changes which accounts
+   * selection considers, so only a literal `true` turns it on and a hand-edited
+   * `"false"` reads as off. `tolerance` is not coerced, because an explicit 0 is
+   * a meaningful setting that clamps to 1, the strictest band.
+   */
   setExpiryRouting(cfg) {
     const c = cfg || {};
     const wasWatching = !!(this.expiryRouting?.enabled && this.expiryRouting?.preempt);
