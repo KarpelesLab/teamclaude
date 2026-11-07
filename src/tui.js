@@ -395,6 +395,10 @@ export function extraUsageTag(allowed, serving) {
 
 export function blockedFamilies(quota, threshold) {
   const at = typeof threshold === 'function' ? threshold : () => threshold;
+  // A spent shared weekly bars every model, not one family: the router gates
+  // all traffic on it. Naming a family here blamed the wrong bucket (a row at
+  // Wk 100% / F7 83% read `⊘ Fable`), so the tag names the bucket instead.
+  if (quota.unified7d != null && quota.unified7d >= at('unified7d')) return ['Wk'];
   const out = [];
   for (const [label, key] of [['Sonnet', 'unified7dSonnet'], ['Fable', 'unified7dFable']]) {
     if (quota[key] == null) continue;      // family not metered separately here
