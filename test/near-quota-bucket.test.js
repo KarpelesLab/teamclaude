@@ -28,7 +28,7 @@ test('a governing weekly bucket fires and is named when the 5-hour is fresh', ()
   const a = am.accounts[0];
   setQuota(a, { unified5h: 0.10, unified7d: 0.99 });
   assert.equal(am._nearQuotaBucket(a), 'unified7d');
-  assert.equal(am._isNearQuota(a, null) !== null, true);
+  assert.equal(am._isNearQuota(a), true);
 });
 
 test('a family weekly bucket is named for the model it governs', () => {
