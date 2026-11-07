@@ -887,6 +887,7 @@ function formatAdaptive(a, paint) {
   if (a.scoring === 'pressure') {
     // The score is P over load: no head, plan weight or concurrency cap went into it.
     parts.push(`P ${Number.isFinite(a.placementPressure) ? a.placementPressure.toExponential(2) : '?'}`);
+    if (Number.isFinite(a.fiveHourFactor)) parts.push(`5h room ${pct(a.fiveHourFactor, 0)}`);
   } else {
     parts.push(`head ${pct(a.headroom, 1)} of ${pct(a.threshold, 0)}`);
     parts.push(adaptivePlan(a, paint));

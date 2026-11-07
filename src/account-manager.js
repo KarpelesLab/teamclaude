@@ -9,7 +9,7 @@ import { SessionPins } from './session-pins.js';
 import { buildQuotaSummary, quotaTier } from './quota-summary.js';
 import { ROLLOVER_MIN_JUMP_MS, remapHeld, findHeld, dropHeld, newObservation } from './rollover.js';
 import { decideBand, pressureOf, pressureRank, assertNever, WEEKLY_WINDOW_SECONDS } from './band-decision.js';
-import { BurnRateLearner, ConcurrencyLearner, scoreCandidate } from './adaptive-distribution.js';
+import { BurnRateLearner, ConcurrencyLearner, fiveHourHeadroomFraction, scoreCandidate } from './adaptive-distribution.js';
 import { OutsideSpendTracker, OUTSIDE_SPEND_STATES, OUTSIDE_SPEND_SETTLE_MS, outsideSpendKey } from './outside-spend.js';
 import { forecastWindow } from './forecast.js';
 import { forecastFleet } from './fleet-forecast.js';
@@ -720,6 +720,8 @@ export class AccountManager {
     // adaptiveDistribution.scoring, fixed at construction like the rest of the
     // block: 'pressure' scores a placement by expiry pressure (_placementPressure).
     this.scoring = this.burnRateLearner.opts.scoring === 'pressure' ? 'pressure' : 'burndown';
+    // Read only under "pressure" (see _fiveHourFactor).
+    this.pressureFiveHour = this.burnRateLearner.opts.pressureFiveHour === true;
     // The stored quota series behind the fleet forecast (#550). Empty until the
     // server loads its file (index.js) or samples accumulate; the manager only
     // samples into it and reads it, the file I/O lives with the caller.
@@ -2357,6 +2359,7 @@ export class AccountManager {
       load: this._adaptiveLoad(account, now),
       concCap: this.concurrencyLearner.cap(account.index),
       ...(byPressure ? { pressure: this._placementPressure(account, model, now) } : {}),
+      ...(byPressure && this.pressureFiveHour ? { fiveHourFactor: this._fiveHourFactor(account, now) } : {}),
     }));
     const maxRemaining = Math.max(...candidates.map(c => {
       const u = Number.isFinite(c.utilization) ? c.utilization : 0;
@@ -2659,6 +2662,7 @@ export class AccountManager {
         concCap: this.concurrencyLearner.cap(a.index),
         // What a "pressure" score is taken from. A burndown row grows nothing.
         ...(this.scoring === 'pressure' ? { scoring: 'pressure', placementPressure: this._placementPressure(a, model, now) } : {}),
+        ...(this.scoring === 'pressure' && this.pressureFiveHour ? { fiveHourFactor: this._fiveHourFactor(a, now) } : {}),
         _remaining: (usePlanWeights && planWeight != null ? planWeight : 1) * head,
       };
     });
@@ -2676,6 +2680,7 @@ export class AccountManager {
         concCap: r.concCap,
         maxRemaining,
         pressure: r.placementPressure,
+        fiveHourFactor: r.fiveHourFactor,
       }, { ...this.burnRateLearner.opts, scoring: this.scoring });
       r.score = score;
       total += score;
@@ -3685,6 +3690,33 @@ export class AccountManager {
         }
       default: return assertNever(pressure, '_placementPressure');
     }
+  }
+
+  /**
+   * The 5-hour window's utilization while its reset is still ahead, or null: no
+   * reading, no reset time, or a reset that has passed says nothing about the
+   * window the account is in now.
+   * @param {Record<string, any>} account
+   * @param {number} now
+   * @returns {number|null}
+   */
+  _liveFiveHourUse(account, now) {
+    const q = account.quota;
+    return Number.isFinite(q?.unified5h) && q.unified5hReset > now ? q.unified5h : null;
+  }
+
+  /**
+   * What `adaptiveDistribution.pressureFiveHour` scales a placement's score by:
+   * the share of the account's 5-hour room still free, under the lower of its
+   * own 5-hour cap and switch threshold. No live reading scales nothing.
+   * @param {Record<string, any>} account
+   * @param {number} now
+   * @returns {number}
+   */
+  _fiveHourFactor(account, now) {
+    const use = this._liveFiveHourUse(account, now);
+    if (use == null) return 1;
+    return fiveHourHeadroomFraction(use, Math.min(this.capFor('unified5h', account) ?? Infinity, this.thresholdFor('unified5h', account)));
   }
 
   /**
