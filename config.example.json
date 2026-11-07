@@ -68,6 +68,7 @@
       "type": "apikey",
       "priority": 10,
       "disabled": false,
+      "cordoned": false,
       "apiKey": "sk-ant-api03-your-api-key"
     },
     {

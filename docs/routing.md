@@ -18,7 +18,9 @@ How TeamClaude decides which account serves a request, and what it does when tha
 
 TeamClaude prefers to keep you on one account. It stays on the current one and only rotates when that account nears `switchThreshold` (default `0.98`).
 
-When it does have to pick, ranking is: lowest `priority` number first, then, among accounts of equal priority, the one whose governing weekly bucket resets soonest. Spending the account closest to its refresh preserves the ones whose window resets further out. A model with its own weekly bucket (Fable, Sonnet) is ranked by that bucket rather than the shared one. Set an explicit order with `teamclaude priority <name> <n>`, or `--first` / `--last`. `teamclaude login --api` adds a key at priority 100 — a metered key is a last resort behind the subscriptions unless you say otherwise ([API key](accounts.md#api-key)).
+An account you have [cordoned](usage.md#cordoning-one-account) is never picked for new work, whatever its priority; a conversation already on it stays there.
+
+When it does have to pick, ranking is: lowest `priority` number first, then, among accounts of equal priority, the one whose governing weekly bucket resets soonest. Spending the account closest to its refresh preserves the ones whose window resets further out. A model with its own weekly bucket (Fable, Sonnet) is ranked by that bucket rather than the shared one. To make the soonest reset a standing preference rather than a tiebreak, set `"preferSoonestWeeklyReset": true`. Then, on every request, traffic moves to the available account in the top priority tier whose governing weekly window resets soonest — at least a minute sooner than the current one — and rotation ranks that reset ahead of expiry pressure. This is earliest-deadline-first: weekly quota that would expire unspent is spent first, then the next-soonest, and an account sidelined by its 5-hour window is reclaimed as soon as that window frees up. An account whose weekly reset is unknown never preempts. Hot-applies on config reload. Set an explicit order with `teamclaude priority <name> <n>`, or `--first` / `--last`. `teamclaude login --api` adds a key at priority 100 — a metered key is a last resort behind the subscriptions unless you say otherwise ([API key](accounts.md#api-key)).
 
 ## The two kinds of 429
 
@@ -66,9 +68,19 @@ If every configured account returns that exact denial, TeamClaude's terminal `50
 
 An explicit [`TC_ACCT` pin](#pin-a-session-to-one-account) continues to target exactly the requested account and never fails over, even while that account is excluded from automatic rotation.
 
+## Codex models a plan does not serve
+
+Each ChatGPT plan serves its own set of Codex models. A free plan, or a paid plan that lapsed to free, refuses the larger ones with a JSON `400`: "The '<model>' model is not supported when using Codex with a ChatGPT account." TeamClaude reads this from `error.message` or `detail`, and acts only when the message is that whole sentence and names the request's own model, exactly as sent. On a Codex account, this `400` keeps the account out of rotation **for that model only**, and the request fails over at once. The account continues to serve the models its plan has. The cooldown is 5 min, then 15 min, then 1 h for each later denial. A `400` to a request that was sent before the last denial does not count again. None of this is persisted.
+
+TeamClaude does not decide from the plan name which models an account serves. OpenAI changes that list, and the list also depends on the client version. The `400` is the only reliable signal.
+
+A completed response for the model, to a request sent after the last denial, clears that model's entry. A change in the account's reported plan type (for example `free` to `prolite`) clears all of the account's entries, so a renewed plan serves at once. Until then, `teamclaude status` shows a `Models` line, and the status JSON has `modelDenials` (`model`, `until`, `detail`, `since`, `count`).
+
+If no account that can take the request serves the model, the client gets upstream's `400`, not a `429` or a hold, because a quota reset does not change a plan. A [`TC_ACCT` pin](#pin-a-session-to-one-account) to such an account gets the same `400`. If one account refuses the model and another is only out of quota, the request waits for quota as usual.
+
 ## Account refusals
 
-Some refusals are about the account rather than the request: `error.details.error_code` is `verification_required` (the owner has to verify their identity), `account_on_hold`, `organization_on_hold`, `organization_disabled`, `restricted_regime_endpoint` or `ip_not_in_allowed_range`. Older answers say the same with a `400` and no code: "This organization has been disabled." or "Identity verification is required…". On an OAuth account, any of these in a JSON `400` or a `403` puts the account in `error` with upstream's message (see [Why an account is in `error`](accounts.md#why-an-account-is-in-error)), and the request fails over. Every other `400` goes to the client unchanged. If every account was refused, the terminal `502` quotes upstream's message for each; later requests name the account as refused by upstream and point to `teamclaude status`.
+Some refusals are about the account rather than the request: `error.details.error_code` is `verification_required` (the owner has to verify their identity), `account_on_hold`, `organization_on_hold`, `organization_disabled`, `restricted_regime_endpoint` or `ip_not_in_allowed_range`. Older answers say the same with a `400` and no code: "This organization has been disabled." or "Identity verification is required…". On an OAuth account, any of these in a JSON `400` or a `403` puts the account in `error` with upstream's message (see [Why an account is in `error`](accounts.md#why-an-account-is-in-error)), and the request fails over. Every other `400` goes to the client unchanged, except a [Codex model that the plan does not serve](#codex-models-a-plan-does-not-serve). If every account was refused, the terminal `502` quotes upstream's message for each; later requests name the account as refused by upstream and point to `teamclaude status`.
 
 ## Token scope denials
 
