@@ -178,3 +178,22 @@ test('a Codex account that draws a scope 403 never sends the client bearer', asy
     upstream.close();
   }
 });
+
+// With proxy.controlPlane "pool" bootstrap goes through the pool again, so a
+// setup-token account's scope 403 on it takes the same retry as any other GET.
+test('with proxy.controlPlane "pool", a scope 403 on bootstrap goes out on the client credential', async () => {
+  const { server: upstream, seen } = scopeUpstream();
+  const upstreamPort = await listen(upstream);
+  const am = inferenceOnlyPool();
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k', controlPlane: 'pool' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const { status } = await send(proxyPort, { path: '/api/claude_cli/bootstrap?entrypoint=cli' });
+    assert.equal(status, 200);
+    assert.deepEqual(seen.map(s => s.token), ['a-token', 'client-token']);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});

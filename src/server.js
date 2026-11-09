@@ -1720,21 +1720,30 @@ export function relayHttpForward(req, res, stripOverage = false, /** @type {Reco
 // does not take `/v1/sessionsX`. The entry without that slash, the collection
 // itself, matches as well, since a session is created with a bare
 // POST /v1/sessions (classificationPath has already dropped any `?beta=true`).
-// Bootstrap, policy, feature flags and registry access belong to the client
-// login. Inference-only upstreams do not implement these endpoints.
 const CLIENT_CREDENTIAL_PATHS = [
   '/v1/code/', '/api/oauth/', '/api/frame/', '/v1/mcp_servers/', '/v1/environments/', '/v1/sessions/', '/v2/session_ingress/', '/v2/ccr-sessions/',
+];
+
+// Bootstrap, policy, feature flags and registry access belong to the client
+// login by default. Inference-only upstreams do not implement these endpoints.
+// Their answer describes the credential that asks, so `proxy.controlPlane:
+// "pool"` sends them through account selection instead, for a login on a
+// lighter plan than the pooled accounts.
+const CONTROL_PLANE_PATHS = [
   '/api/claude_cli/', '/api/claude_code/policy_limits/', '/api/claude_code_grove/', '/api/claude_code_penguin_mode/',
   '/api/eval/', '/api/eval-authed/', '/mcp-registry/v0/servers/',
 ];
 
 /**
- * Whether a classified path is on the client's own identity plane: below an
- * entry of CLIENT_CREDENTIAL_PATHS, or the collection that entry names.
+ * Whether a classified path goes out on the client's own credential: below an
+ * entry of CLIENT_CREDENTIAL_PATHS, or of CONTROL_PLANE_PATHS unless
+ * `proxy.controlPlane` is "pool", or the collection that entry names.
  * @param {string} path
+ * @param {Record<string, any>|null|undefined} config  read per request
  */
-function isClientCredentialPath(path) {
-  return CLIENT_CREDENTIAL_PATHS.some((p) => path.startsWith(p) || path === p.slice(0, -1));
+function isClientCredentialPath(path, config) {
+  const under = (/** @type {string[]} */ paths) => paths.some((p) => path.startsWith(p) || path === p.slice(0, -1));
+  return under(CLIENT_CREDENTIAL_PATHS) || (config?.proxy?.controlPlane !== 'pool' && under(CONTROL_PLANE_PATHS));
 }
 
 /**
@@ -2050,7 +2059,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       if (passthrough) { await relayStream(req, res, passthrough, sx, shouldStripOverageHeaders(config)); return; }
 
       const classifiedPath = classificationPath(req.url);
-      if (isClientCredentialPath(classifiedPath)) { await relayStream(req, res, upstream, sx, shouldStripOverageHeaders(config)); return; }
+      if (isClientCredentialPath(classifiedPath, config)) { await relayStream(req, res, upstream, sx, shouldStripOverageHeaders(config)); return; }
 
       // MITM-mode pin. A CONNECT carrying `Proxy-Authorization: Basic <acct>:…`
       // has no URL to hang a `/tc-acct/` prefix on — the path inside the tunnel
