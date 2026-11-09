@@ -15,6 +15,7 @@ import { createConnectHandler } from '../src/mitm.js';
 import { KEEP_ALIVE_TIMEOUT_MS } from '../src/server.js';
 import { allowLoopbackForward } from '../src/forward-target.js';
 import { AccountManager } from '../src/account-manager.js';
+import { closeUsageStore, openUsageStore, USAGE_STORE_AVAILABLE } from '../src/usage/db.js';
 
 // The MITM now TERMINATES the tunnel (real h2/h1 server) and forwards each
 // request with the shared buffering/retrying proxy listener — so these tests
@@ -69,7 +70,7 @@ function makeUpstream(handler) {
 }
 
 // Build the teamclaude proxy (CONNECT → terminate + forward) against `upPort`.
-function makeProxy(am, upPort, { leafCertPem, leafKeyPem }, { logDir = null, hooks = {}, sx = null } = {}) {
+function makeProxy(am, upPort, { leafCertPem, leafKeyPem }, { logDir = null, hooks = {}, sx = null, usageStore = undefined } = {}) {
   const proxy = http.createServer();
   allowLoopbackForward(proxy); // tunnel-mode targets in these tests are on this machine
   proxy.on('connect', createConnectHandler({
@@ -77,13 +78,18 @@ function makeProxy(am, upPort, { leafCertPem, leafKeyPem }, { logDir = null, hoo
     config: { upstream: `http://127.0.0.1:${upPort}` },
     accountManager: am,
     ensureLeaf: async () => ({ key: leafKeyPem, cert: leafCertPem }),
-    logDir, hooks, log: () => {}, sx,
+    logDir, hooks, log: () => {}, sx, usageStore,
   }));
   return proxy;
 }
 
 function oauthAccount(name, token, extra = {}) {
   return { name, type: 'oauth', accessToken: token, refreshToken: 'r', expiresAt: Date.now() + 3600_000, ...extra };
+}
+
+// node:sqlite hands back null-prototype rows; compare against plain object literals.
+function rawRows(store, sql, ...args) {
+  return store.db.prepare(sql).all(...args).map(row => ({ ...row }));
 }
 
 test('MITM h2: authorization injected, x-api-key dropped, quota observed, body relayed', T, async () => {
@@ -565,5 +571,57 @@ test('MITM h1: the terminating server advertises the base idle window and reuses
   } finally {
     agent.destroy();
     tlsSock.destroy(); closeHard(proxy); closeHard(upstream);
+  }
+});
+
+// createConnectHandler threads usageStore into its inner
+// createProxyRequestListener, so a request made over a CONNECT tunnel is
+// recorded like a base-URL one. Drives a real CONNECT + TLS request end to end (same harness as the tests
+// above) against a real in-memory store, then reads the row back with plain SQL.
+test('MITM: a request through the tunnel writes exactly one usage row', { ...T, skip: !USAGE_STORE_AVAILABLE && 'node:sqlite needs Node 22.5+' }, async () => {
+  const { caCertPem, leafCertPem, leafKeyPem } = generateCertChain('localhost');
+  const upstream = makeUpstream(() => ({
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'served-model', usage: { input_tokens: 3, output_tokens: 5 } }),
+  }));
+  const upPort = await listen(upstream);
+
+  const am = new AccountManager([oauthAccount('acct@x', 'REAL-TOKEN')], 0.98);
+  const usageStore = openUsageStore({ path: ':memory:' });
+  const proxy = makeProxy(am, upPort, { caCertPem, leafCertPem, leafKeyPem }, { usageStore });
+  const proxyPort = await listen(proxy);
+
+  const tlsSock = await connectThroughProxy(proxyPort, `127.0.0.1:${upPort}`, caCertPem, ['h2', 'http/1.1']);
+  try {
+    const client = http2.connect('https://localhost', { createConnection: () => tlsSock });
+    const req = client.request({ ':method': 'POST', ':path': '/v1/messages', authorization: 'Bearer FAKE', 'content-type': 'application/json' });
+    let resp; req.on('response', (h) => { resp = h; });
+    req.resume(); req.end('{"model":"x"}');
+    await once(req, 'close');
+    client.close();
+
+    assert.equal(resp[':status'], 200);
+
+    // No config.proxy is set anywhere in this harness, so usageCallerLabel
+    // resolves every caller to '(open)' — the same value the base HTTP path
+    // would use unconfigured. It reaches this row via the SAME
+    // createProxyRequestListener the base listener uses (mitm.js reuses it for
+    // the tunnel's terminating server), through the single recordRequest call
+    // in its outer finally block. The row's model is the REQUESTED model
+    // (ctx.model, from the client's own body — "x" here), not the upstream
+    // response's `model` field, which this fake upstream sets to something
+    // else on purpose to make that distinction observable.
+    const rows = rawRows(usageStore, `
+      SELECT dc.label AS caller, da.label AS account, dm.label AS model,
+             u.status, u.input, u.output
+      FROM usage u
+      JOIN dim dc ON dc.id = u.caller_id  AND dc.kind = 'caller'
+      JOIN dim da ON da.id = u.account_id AND da.kind = 'account'
+      JOIN dim dm ON dm.id = u.model_id   AND dm.kind = 'model'
+    `);
+    assert.deepEqual(rows, [{ caller: '(open)', account: 'acct@x', model: 'x', status: 200, input: 3, output: 5 }]);
+  } finally {
+    tlsSock.destroy(); closeHard(proxy); closeHard(upstream); closeUsageStore(usageStore);
   }
 });
