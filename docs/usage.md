@@ -366,6 +366,20 @@ The readings are as fresh as the server's: an account in use is read off every r
 
 The gates are the ones every other route passes, plus the MCP endpoint's rule for a config with no proxy key at all: then only callers on the proxy's own machine are served, and everyone else gets 403. Every path under `/v0/management/` is answered by the proxy itself, on or off, and never forwarded upstream; a WebSocket handshake there is refused with 404.
 
+## Usage history
+
+`/teamclaude/status` keeps lifetime counters and 5-hour and 24-hour windows per client. For a longer look back, broken down by model and account as well, the server can keep a history in a local SQLite file. It is off until the config says otherwise:
+
+```json
+{ "proxy": { "usageHistory": true } }
+```
+
+Each request forwarded to an account becomes one row: when, which consumer, model and account, the input, cache-read, cache-write and output tokens, and the status. A request the pool could not serve is a row too, with status `429` and the account `(unknown)`. Calls that go straight to the client's own login (its identity and control-plane calls, token refreshes), plain forward-proxy traffic and WebSocket channels are not recorded, and neither are the telemetry batches the activity log hides (`eventLogging`). A `GET` that the [scope-denial retry](routing.md#token-scope-denials) passes on to the client's login is, under the account `(unknown)` with no tokens. A consumer is a `proxy.clientKeys` name, so give each of your machines and integrations its own key to tell them apart. Traffic without a named key is booked as `(shared)` (`proxy.apiKey`), `(local)` (a key-exempt caller on the proxy's own machine) or `(open)` (a proxy with no key at all). Accounts are booked by name. Nothing of a request's content is stored.
+
+`GET /teamclaude/usage?window=5h|7d|30d` answers with `totals` and the same measures per consumer (`callers`), per consumer and model (`callerModels`), per model (`models`) and per account (`accounts`): `requests`, `tokens`, `input`, `cacheRead`, `cacheWrite`, `output`, and `refusals` (requests answered `429`). `5h` is read from the raw rows; `7d` and `30d` from an hourly rollup, snapped to whole hours, with `since` and `until` saying what the window covers. Any other window is a 400. The route sits behind the same gates as `/teamclaude/status`.
+
+The file sits beside the config, named after it: `config.usage.db` for `config.json`, and like the config it is readable by its owner only. Raw rows are kept 90 days and the hourly rollup 400 days, pruned once a day. History never fails or delays a request. A row that cannot be written, a locked file included, is logged and skipped. A file that cannot be opened at start turns history off, says so in the log, and the route then answers `available: false`; a file found corrupt at start is moved aside and a new one started instead. History needs `node:sqlite`: Node 22.13 or later, or 22.5 to 22.12 started with `--experimental-sqlite`. On an older Node the route answers `available: false` the same way.
+
 ## Auto-update
 
 When TeamClaude is installed globally via npm, it self-updates in the background: it checks the npm registry at most once a day, and when a newer version is published it runs `npm install -g @karpeleslab/teamclaude@latest` and applies it on the next launch. The check runs after a `teamclaude run` session ends and when a headless server starts. In a headless server the install runs as a background child process, so the proxy keeps serving requests while npm works (a synchronous install used to stall it for the duration). A git checkout is never touched — update that with `git pull`. Run `teamclaude update` to update on demand.
