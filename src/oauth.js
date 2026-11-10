@@ -723,12 +723,12 @@ export function normalizeUsagePayload(data, now = Date.now()) {
  *    reads `usable_now: false`.
  *  - `expiresAt` is the soonest `ends_at` among the grants counted, so the
  *    displays can say when the reset lapses and drop it once it has.
- *  - `fable` is the part of `available` that is a Fable reset: a grant whose
- *    `clears` names only the Fable weekly (`seven_day_overage_included`) and
- *    neither shared window. Those arrived with the Fable 5.2 launch
- *    (2026-11-09, "New model launch: one Fable reset ..."); the October grants
- *    cleared `five_hour` and `seven_day` too. The displays name the two apart,
- *    since a Fable reset does not put the account's other models back.
+ *  - `fable` is the part of `available` that is a Fable reset (isFableReset):
+ *    a grant that clears the Fable weekly but not the shared one. Those
+ *    arrived with the Fable 5.2 launch (2026-11-09, "New model launch: one
+ *    Fable reset ..."); the October grants cleared `seven_day` too. The
+ *    displays name the two apart, since a Fable reset gives back only what
+ *    Fable used of the shared weekly.
  *
  * An ineligible block is null, not zero. Its reason so far has always been
  * about the caller (`surface`, `cli_version`), not the account, so "none" would
@@ -771,11 +771,18 @@ export function bankedResets(block, now = Date.now()) {
   };
 }
 
-/** @param {unknown} clears  a grant's `clears` list */
-function isFableReset(clears) {
+/**
+ * Whether a grant's `clears` list makes it a Fable reset: it clears the Fable
+ * weekly (`seven_day_overage_included`) and not the shared one (`seven_day`).
+ * Whether it also clears `five_hour` does not decide it: on a Max account it
+ * does not, on a Team Premium seat the same grant does (both read live
+ * 2026-11-10), and neither gives back the shared weekly.
+ *
+ * @param {unknown} clears  a grant's `clears` list
+ */
+export function isFableReset(clears) {
   if (!Array.isArray(clears)) return false;
-  return clears.includes('seven_day_overage_included')
-    && !clears.includes('five_hour') && !clears.includes('seven_day');
+  return clears.includes('seven_day_overage_included') && !clears.includes('seven_day');
 }
 
 // OAuth config (extracted from Claude Code). Client id + token endpoint are

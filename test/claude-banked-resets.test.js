@@ -203,8 +203,12 @@ test('a Fable reset is counted apart from one that clears the shared windows', (
   const r = bankedResets({ ...LIVE_BLOCK, grants: [grant({}), FABLE_GRANT, { ...FABLE_GRANT, label: 'one more' }] }, NOW);
   assert.equal(r.available, 3);
   assert.equal(r.fable, 2);
-  // A grant that clears the Fable weekly AND a shared window is a general one.
+  // A grant that clears the Fable weekly AND the shared weekly is a general one.
   assert.equal(bankedResets(LIVE_BLOCK, NOW).fable, 0);
+  // A Team Premium seat's Fable reset also clears the 5-hour window (read live
+  // 2026-11-10); it gives back no shared weekly, so it is still a Fable reset.
+  const team = { ...FABLE_GRANT, clears: ['five_hour', 'seven_day_overage_included'] };
+  assert.equal(bankedResets({ ...LIVE_BLOCK, grants: [team] }, NOW).fable, 1);
   assert.equal(bankedResets({ ...LIVE_BLOCK, grants: [grant({ clears: 'seven_day_overage_included' })] }, NOW).fable, 0);
 });
 
