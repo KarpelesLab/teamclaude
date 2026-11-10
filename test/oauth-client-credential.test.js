@@ -58,6 +58,7 @@ for (const path of [
   '/api/claude_code_grove',
   '/api/claude_code_penguin_mode',
   '/mcp-registry/v0/servers?limit=100',
+  '/api/web/domain_info?domain=example.com',
 ]) {
   test(`${path} keeps the client's own credential`, async () => {
     const { server: upstream, port, seen } = await echoAuthUpstream();
@@ -125,20 +126,23 @@ test('a preferred inference gateway does not receive client policy requests', as
   }
 });
 
-test('a client policy request without a bearer does not borrow a fleet credential', async () => {
-  const { server: upstream, port, seen } = await echoAuthUpstream();
-  try {
-    const listener = createProxyRequestListener({ accountManager: refusingManager, upstream: `http://127.0.0.1:${port}` });
-    assert.equal((await through(listener, '/api/claude_code/policy_limits')).status, 200);
-    assert.equal(seen.length, 1);
-    assert.equal(seen[0].authorization, null);
-    assert.equal(seen[0].apiKey, null);
-  } finally {
-    upstream.close();
-  }
-});
+for (const path of ['/api/claude_code/policy_limits', '/api/web/domain_info?domain=example.com']) {
+  test(`${path} without a bearer does not borrow a fleet credential`, async () => {
+    const { server: upstream, port, seen } = await echoAuthUpstream();
+    try {
+      const listener = createProxyRequestListener({ accountManager: refusingManager, upstream: `http://127.0.0.1:${port}` });
+      assert.equal((await through(listener, path)).status, 200);
+      assert.equal(seen.length, 1);
+      assert.equal(seen[0].url, path);
+      assert.equal(seen[0].authorization, null);
+      assert.equal(seen[0].apiKey, null);
+    } finally {
+      upstream.close();
+    }
+  });
+}
 
-for (const path of ['/api/eval-other/sdk-test', '/api/claude_code/policy_limits_extra', '/api/claude_code_inference']) {
+for (const path of ['/api/eval-other/sdk-test', '/api/claude_code/policy_limits_extra', '/api/claude_code_inference', '/api/web/domain_info_other']) {
   test(`${path} is outside the client control plane`, async () => {
     const { server: upstream, port, seen } = await echoAuthUpstream();
     try {
@@ -317,6 +321,83 @@ for (const [path, onWire] of [
       assert.equal(seen[0].url, onWire, 'the pin prefix must be stripped and nothing else changed');
     } finally {
       proxy.closeAllConnections?.(); proxy.close();
+      upstream.close();
+    }
+  });
+}
+
+// proxy.controlPlane "pool": the control-plane calls go through account
+// selection again, as they did before #635, so their answer comes from a pooled
+// account. The identity plane stays on the client's own credential either way.
+for (const path of [
+  '/api/claude_cli/bootstrap?entrypoint=cli',
+  '/api/claude_code/policy_limits',
+  '/api/claude_code_grove',
+  '/api/claude_code_penguin_mode',
+  '/api/eval/sdk-test',
+  '/api/eval-authed/sdk-test',
+  '/mcp-registry/v0/servers?limit=100',
+  '/api/web/domain_info?domain=example.com',
+]) {
+  test(`with proxy.controlPlane "pool", ${path} gets the account token`, async () => {
+    const { server: upstream, port, seen } = await echoAuthUpstream();
+    try {
+      const listener = createProxyRequestListener({
+        accountManager: fleetManager(), upstream: `http://127.0.0.1:${port}`, config: { proxy: { controlPlane: 'pool' } },
+      });
+      assert.equal((await through(listener, path, { authorization: 'Bearer client-own-token' })).status, 200);
+      assert.equal(seen.length, 1);
+      assert.equal(seen[0].authorization, 'Bearer fleet-token');
+    } finally {
+      upstream.close();
+    }
+  });
+}
+
+test('with proxy.controlPlane "pool", a POST to /api/eval/ keeps its body and gets the account token', async () => {
+  const { server: upstream, port, seen } = await echoAuthUpstream();
+  const body = JSON.stringify({ attributes: { id: 'test-client' } });
+  try {
+    const listener = createProxyRequestListener({
+      accountManager: fleetManager(), upstream: `http://127.0.0.1:${port}`, config: { proxy: { controlPlane: 'pool' } },
+    });
+    const { status } = await through(listener, '/api/eval/sdk-test',
+      { authorization: 'Bearer client-own-token', 'content-type': 'application/json' },
+      { method: 'POST', body });
+    assert.equal(status, 200);
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].authorization, 'Bearer fleet-token');
+    assert.equal(seen[0].body, body);
+  } finally {
+    upstream.close();
+  }
+});
+
+for (const path of ['/api/oauth/profile', '/v1/code/sessions/abc/worker/events/stream', '/v1/mcp_servers?limit=1000']) {
+  test(`with proxy.controlPlane "pool", ${path} keeps the client's own credential`, async () => {
+    const { server: upstream, port, seen } = await echoAuthUpstream();
+    try {
+      const listener = createProxyRequestListener({
+        accountManager: refusingManager, upstream: `http://127.0.0.1:${port}`, config: { proxy: { controlPlane: 'pool' } },
+      });
+      assert.equal((await through(listener, path, { authorization: 'Bearer client-own-token' })).status, 200);
+      assert.equal(seen[0].authorization, 'Bearer client-own-token');
+    } finally {
+      upstream.close();
+    }
+  });
+}
+
+for (const controlPlane of ['client', 'Pool', true]) {
+  test(`proxy.controlPlane ${JSON.stringify(controlPlane)} keeps bootstrap on the client's own credential`, async () => {
+    const { server: upstream, port, seen } = await echoAuthUpstream();
+    try {
+      const listener = createProxyRequestListener({
+        accountManager: refusingManager, upstream: `http://127.0.0.1:${port}`, config: { proxy: { controlPlane } },
+      });
+      assert.equal((await through(listener, '/api/claude_cli/bootstrap', { authorization: 'Bearer client-own-token' })).status, 200);
+      assert.equal(seen[0].authorization, 'Bearer client-own-token');
+    } finally {
       upstream.close();
     }
   });
