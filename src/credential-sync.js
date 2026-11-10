@@ -121,7 +121,9 @@ function segment(/** @type {unknown} */ v) {
  * @param {Record<string, any>|null|undefined} a
  */
 export function isSyncable(a) {
-  if (!a || a.type !== 'oauth' || a.upstream) return false;
+  // A long-lived token is this install's own: never stored for the others, and
+  // never replaced by a refreshing login stored by another install.
+  if (!a || a.type !== 'oauth' || a.upstream || a.longLived === true) return false;
   return providerOf(a) === 'codex' ? !!a.accountId : !!a.accountUuid;
 }
 

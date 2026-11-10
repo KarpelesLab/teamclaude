@@ -8,7 +8,7 @@ import net from 'node:net';
 import { loadOrCreateConfig, loadConfig, loadConfigPersistingIds, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, getQuotaSeriesPath, loadState, saveState } from './config.js';
 import { loadQuotaSeries, saveQuotaSeries } from './quota-series.js';
 import { installCrashHandlers } from './crash-log.js';
-import { AccountManager, distributionMode, accountRouting } from './account-manager.js';
+import { AccountManager, distributionMode, accountRouting, isLongLived } from './account-manager.js';
 import { validateAdaptiveConfig } from './adaptive-distribution.js';
 import { createProxyServer, reloadedHeaderFlags, resolveAccountPin } from './server.js';
 import { createDrainState, resolveDrainTimeoutSeconds } from './drain.js';
@@ -1418,6 +1418,14 @@ async function upsertCodexAccount(requestedName, creds, routing = null, storeRou
 }
 
 async function loginCommand() {
+  if (args.includes('--long-lived')) {
+    if (['--api', '--codex', '--oauth'].some(f => args.includes(f))) {
+      console.error('--long-lived is a Claude subscription login and cannot be combined with --api, --codex or --oauth');
+      process.exit(1);
+    }
+    await loginOAuthCommand({ pasteOnly: true, longLived: true });
+    return;
+  }
   if (args.includes('--api')) {
     await loginApiCommand();
     return;
@@ -1509,7 +1517,7 @@ async function loginApiCommand() {
   await notifyRunningServer(config);
 }
 
-async function loginOAuthCommand({ pasteOnly = false } = {}) {
+async function loginOAuthCommand({ pasteOnly = false, longLived = false } = {}) {
   const loaded = await loadOrCreateConfig(); // first run: create the file; the save re-reads it
   let name = argValue('--name');
   const { routing, store } = loginRouting(loaded);
@@ -1523,12 +1531,13 @@ async function loginOAuthCommand({ pasteOnly = false } = {}) {
   if (remote) console.log('This looks like a remote session (SSH, or no display): sign in on any device and paste the code back here.\n');
   let creds;
   try {
-    creds = pasteOnly || remote ? await loginOAuthWithPastedCode({ routing }) : await loginOAuth({ routing });
+    creds = pasteOnly || remote ? await loginOAuthWithPastedCode({ routing, longLived }) : await loginOAuth({ routing });
   } catch (err) {
     // sanitizeText: as for Codex, the reason can quote the provider.
     console.error(`OAuth login failed: ${sanitizeText(err?.message || err)}`);
     console.error('');
     console.error('Alternatives:');
+    if (longLived) console.error('  teamclaude login --token An ordinary login, refreshed as it expires');
     console.error('  teamclaude import        Import from existing Claude Code credentials');
     console.error('  teamclaude login --api   Add an API key instead');
     process.exit(1);
@@ -2067,7 +2076,7 @@ async function accountsCommand() {
   // account's own routing when it has one — this is that account's traffic.
   const refreshed = [];
   await Promise.all(config.accounts.map(async (a) => {
-    if (a.type !== 'oauth' || !a.refreshToken) return;
+    if (a.type !== 'oauth' || !a.refreshToken || isLongLived(a)) return;
     if (!isTokenExpiringSoon(a.expiresAt)) return;
     try {
       // Through the callback.net lock when signed in there, as the running
@@ -3032,6 +3041,7 @@ Commands:
   import              Import credentials from Claude Code
   login               OAuth login via browser (over SSH: copy/paste, as --token)
   login --token       OAuth login via copy/paste (no local callback; for headless/remote)
+  login --long-lived  Copy/paste login for a one-year, non-refreshing token
   login --codex       Codex (ChatGPT) login via browser; on a terminal the address
                       the browser lands on can be pasted instead (--no-browser)
   login --api         Add an API key account (a last resort by default:
@@ -3319,6 +3329,7 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
       // re-login updateAccountEntry spreads incoming over prev, so the routing
       // the entry already had survives instead of being silently cleared.
       ...(routing && storeRouting ? { routing: routingToUrl(routing) } : {}),
+      ...(creds.longLived === true && { longLived: true }),
     };
 
     // Deduplicate by account+org identity (same email in a different org is a

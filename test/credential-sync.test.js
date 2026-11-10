@@ -200,6 +200,29 @@ test('a row with no local account becomes one, with its tokens and identity but 
   assert.ok(logs.some((l) => /"b" added from callback.net \(signed in on office\)/.test(l)), logs.join('\n'));
 });
 
+test('a long-lived account near its end takes no refreshing login from the store, healthy or rejected', async () => {
+  const store = makeStore();
+  const a = claude('a', { refreshToken: undefined, longLived: true, expiresAt: T0 + H });
+  const ordinary = { ...a, credential: 'at-a-9', refreshToken: 'rt-a-9', expiresAt: T0 + 20 * H };
+  store.put(syncKeyFor(claude('a')), encodeBlob(ordinary, tokensOf(ordinary), { now: T0 + 12 * H, by: 'office' }));
+  const { sync, am, admitted } = setup([a], { store });
+
+  const r = await sync.sync('start');
+  assert.equal(r.adopted, 0);
+  assert.equal(r.added, 0);
+  assert.deepEqual(admitted, []);
+  assert.equal(am.accounts.length, 1);
+  assert.equal(am.accounts[0].credential, 'at-a-1');
+  assert.equal(am.accounts[0].refreshToken, null);
+  assert.equal(am.accounts[0].longLived, true);
+
+  // A 401 on it does not pull the store's refreshing login in either.
+  am.accounts[0].status = 'error';
+  assert.equal(await sync.onAccountError(am.accounts[0]), false);
+  assert.equal(am.accounts[0].credential, 'at-a-1');
+  assert.equal(am.accounts[0].status, 'error');
+});
+
 test('the newer token wins each way: the store\'s is adopted, this install\'s is stored', async () => {
   const store = makeStore();
   const a = claude('a');

@@ -138,9 +138,16 @@ export function findUpsertTarget(accounts, incoming) {
  * would be dropped instead of persisted. An `incoming` record carrying neither
  * field already leaves both alone; pinning them says so, and keeps saying so if
  * one day it carries them.
+ *
+ * `longLived` describes the incoming token, never the entry, so it is taken from
+ * `incoming` alone. A long-lived login also drops `importFrom`: that file is
+ * read over the saved token on every load.
  */
 export function updateAccountEntry(prev, incoming) {
-  return { ...prev, ...incoming, name: prev.name, id: prev.id };
+  const merged = { ...prev, ...incoming, name: prev.name, id: prev.id };
+  if (incoming.longLived === true) delete merged.importFrom;
+  else delete merged.longLived;
+  return merged;
 }
 
 /** The email portion of a display name, stripping any " (org)" suffix. */
