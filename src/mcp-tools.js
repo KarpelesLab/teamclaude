@@ -256,7 +256,7 @@ const WRITE_TOOLS = [
   {
     name: 'switch_account',
     title: 'Switch account',
-    description: 'Make one account the preferred one for new requests, as the TUI\'s switch key does. Manual choice takes precedence over automatic priority ranking while the account is available. Rotation can still move it, and the answer says whether traffic will follow.',
+    description: 'Make one account the preferred one for new requests, as the TUI\'s switch key does. The choice is not outranked by priority while the account is available; rotation leaves it once it cannot serve, and the answer says whether traffic will follow.',
     properties: ACCOUNT_ARGS,
     required: ['account'],
     write: true,

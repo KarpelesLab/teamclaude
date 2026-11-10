@@ -93,6 +93,13 @@ test('a borrowed provider selection does not erase another provider\'s manual ch
   assert.equal(am.getActiveAccount(null, MODEL).name, 'manual');
 });
 
+test('a walk that lands on the manual account again keeps the choice', () => {
+  const am = manager();
+  am.setCurrentAccount(1);
+  am._setCurrent(am.accounts[1]);
+  assert.equal(am.getActiveAccount(null, MODEL).name, 'manual');
+});
+
 test('learning quota does not undo a healthy manual priority preference', () => {
   const am = manager();
   am.setCurrentAccount(1);

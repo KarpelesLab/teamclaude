@@ -1119,14 +1119,18 @@ export class AccountManager {
   }
 
   /**
-   * Move the cursor, releasing this provider's manual priority preference.
+   * Move the cursor. A move to another account releases this provider's manual
+   * choice (setCurrentAccount): rotation left it, so it no longer outranks
+   * anything. A walk that re-ranks and lands on the same account moved nothing
+   * and releases nothing.
    * A reading is taken where a request finds traffic resting, never where a
    * selection aims it, so no caller of this method owes one. `_firstSightOn`
    * restores a held roll to its own account, and otherwise writes where
    * nothing is lost.
    */
   _setCurrent(account) {
-    if (this._manualAccount && (this._selectingProvider == null || this._selectingProvider === providerOf(this._manualAccount))) this._manualAccount = null;
+    if (this._manualAccount && account !== this._manualAccount
+        && (this._selectingProvider == null || this._selectingProvider === providerOf(this._manualAccount))) this._manualAccount = null;
     this.currentIndex = account.index;
     // A move made by an operator or a poll names the provider cursor of the
     // account it lands on. A move inside a selection walk does not: the walk
@@ -3219,6 +3223,20 @@ export class AccountManager {
   }
 
   /**
+   * Whether `account` is the one the operator switched to (setCurrentAccount)
+   * and rotation has not left since, for traffic of `provider`. Such an account
+   * is not outranked by the automatic rankings (priority, soonest weekly
+   * reset); what makes an account unable to serve still applies to it. The
+   * choice counts only for the provider the account belongs to: a shared API
+   * key picked for Claude traffic says nothing about where Codex traffic goes.
+   * @param {Record<string, any>|null|undefined} account
+   * @param {string} [provider]
+   */
+  _isManualChoice(account, provider = this._selectingProvider ?? providerOf(account)) {
+    return !!account && account === this._manualAccount && provider === providerOf(account);
+  }
+
+  /**
    * The available account that would preempt `account` under the priority rule,
    * or null. A strictly lower priority value wins; within the same tier we stay
    * put, so the common case (every account at the default priority 0) never
@@ -3226,7 +3244,7 @@ export class AccountManager {
    * reports it — one predicate so the answer cannot drift from the behaviour.
    */
   _preemptedBy(account, model = null, advisorModel = null, exclude = null, provider = this._selectingProvider ?? providerOf(account)) {
-    if (account === this._manualAccount && provider === providerOf(account)) return null;
+    if (this._isManualChoice(account, provider)) return null;
     return this.accounts.find(a => this._isAvailable(a, model, advisorModel)
       && !exclude?.has(a.index)
       && (a.priority || 0) < (account.priority || 0)) || null;
@@ -3561,8 +3579,9 @@ export class AccountManager {
    * priority whose governing weekly window resets soonest, when that is
    * strictly sooner (by more than a minute, so jitter in reported reset times
    * cannot flap) than `account`'s own. Null when the knob is off, when
-   * `account`'s reset is unknown, or when nothing resets sooner. An account
-   * whose reset is unknown never preempts: it may well reset later.
+   * `account`'s reset is unknown, when nothing resets sooner, or when `account`
+   * is the operator's manual choice (_isManualChoice). An account whose reset
+   * is unknown never preempts: it may well reset later.
    * @param {Record<string, any>|null|undefined} account
    * @param {any} [model]  as _isAvailable takes it
    * @param {any} [advisorModel]
@@ -3571,6 +3590,7 @@ export class AccountManager {
    */
   _soonerResetPreemptor(account, model = null, advisorModel = null, exclude = null) {
     if (!this.preferSoonestWeeklyReset || !account) return null;
+    if (this._isManualChoice(account)) return null;
     const mine = this._rankingReset(account, model);
     if (!mine) return null;
     const now = Date.now();
