@@ -312,6 +312,8 @@ By default, once every account is past its switch threshold the proxy answers 42
 }
 ```
 
+Without `preferExtraUsage`, automatic selection follows these rules:
+
 - **Rotation is unchanged.** An opted-in account rotates away at `switchThreshold` like any other, and the fallback never runs while any account can serve under the normal rules — a lower-priority one included.
 - **Free quota first.** The switch threshold is a rotation preference, so an account between it and 100% — under a per-bucket `unified7d: 0.85`, that is 15% of the week — still has quota you already pay for. Once nothing is under its threshold, the fallback serves from the best such account, **opted in or not**, chosen by `priority` (lower first) and then the most free quota left. No money moves while any account can still serve for free.
 - **Billing is the last resort.** An opted-in account is billed only when every account that could serve at all is at 100% of a governing bucket or carries upstream's own `rejected` verdict. Among several opted-in accounts: `priority`, then the least deep into overage. An account that cannot serve at all — `disabled`, over its `maxUsage` cap, in an `error` state, under an entitlement cooldown or a live 429 hold — is neither used nor waited for: it does not count as free quota, and the fallback proceeds without it.
@@ -320,9 +322,37 @@ By default, once every account is past its switch threshold the proxy answers 42
 - **It goes back on its own.** As soon as any account's window resets — the paid one's included — selection returns to normal, and the "billing" mark clears even if no request for that model has come in since.
 - **Only the quota verdicts are overridden** — the switch threshold (a spent Fable bucket included, for Fable requests only) and, for the paid tier, a remembered upstream `rejected` status. Everything else still binds: `disabled`, `maxUsage`, `maxSpend`, a live upstream 429 hold, an entitlement cooldown, an error state, routes and model ownership, and the Claude/Codex partition. An account whose usage probe reports overage switched off upstream is skipped, since it would only 429; with no probe data, upstream decides.
 
+A temporary rate-limit throttle prevents requests to a fallback account while the throttle is active. It does not end the existing fallback episode by itself. Status continues to report that episode, and requests resume without a new fallback announcement or ramp once the throttle expires.
+
+To prefer a subscription's capacity before API fallback, also set `accounts[].preferExtraUsage: true`:
+
+```json
+{
+  "name": "team@example.com",
+  "allowExtraUsage": true,
+  "preferExtraUsage": true
+}
+```
+
+Both settings require literal `true`. The preference is off by default, so existing `allowExtraUsage` configurations keep their spending order. Neither setting enables billing upstream, purchases credits or applies to API keys, third-party backends or Codex subscriptions.
+
+Normal subscription selection runs first. When only API accounts or backends have normal capacity, subscriptions with `preferExtraUsage: true` can use their remaining included quota up to 100% before API fallback. Subscriptions without that setting keep their normal switch thresholds and fallback order. Their remaining included quota still prevents preferred paid spending: if only unpreferred subscriptions have included quota past their thresholds, selection follows the default order, using available API capacity before legacy fallback. Within each fallback tier, account priority and then utilisation decide. An API account with a strictly lower priority number still takes precedence over the selected subscription. The hard restrictions described above still apply.
+
+Eligible route pins and explicit API-account choices take precedence over this automatic preference. Manual subscription choices and subscription conversation pins yield to normal subscription capacity, and paid credits yield to eligible remaining included quota. A conversation can therefore move to another subscription and lose its prompt-cache affinity before any paid credits are used. New sessions follow the configured distribution mode within the selected tier. Adaptive placement uses its even fallback once those candidates are past their normal switch thresholds. Existing sessions keep their eligible account within that tier.
+
+With `preferExtraUsage: true`, an explicit `teamclaude switch <account>` can also select that subscription's fallback capacity, subject to the same spending order. Configurations without `preferExtraUsage` keep the existing weak-switch behaviour. The switch does not authorise credit use by itself. Hard limits and the normal account-priority rules still apply.
+
 Utilization goes past 100% in overage, so `maxUsage` above 1.0 is a spend limit: `"maxUsage": 1.5` lets an account run to 150% of its plan and then stop, like any other cap. To bound the bill in money instead, set `maxSpend` — see [Per-account spend caps](#per-account-spend-caps) above; the fallback never bills an account at its spend cap (it may still use that account's free quota, like any other).
 
 The switch onto the fallback and back off it is logged once each, per model scope (a Fable-only episode is not ended by Opus traffic that still has headroom), and a failover hop onto it is logged once per episode too — the free-quota and the paid step each get their own line. While an account is **billing** — at 100% of a governing bucket, or with its month's spend seen rising — `teamclaude status` marks it:
+
+When fallback capacity is available:
+
+```
+  Usage    serving on extra usage (paid overage), billing
+```
+
+If fallback capacity is unavailable during an existing billing episode, status keeps the blocking reason and billing annotation:
 
 ```
   Blocked  local switch threshold reached — serving on extra usage (paid overage), billing
@@ -330,7 +360,11 @@ The switch onto the fallback and back off it is logged once each, per model scop
 
 and the status payload carries `allowExtraUsage` and `onExtraUsage` per account; `onExtraUsage` is false while the fallback is only serving free quota past a threshold. The opt-in itself is visible before it is ever used: `extra usage allowed` in the account header of `teamclaude status`, an `xu` tag (yellow) at the end of the TUI row that turns into a red `xu!` while billing, and an `extra usage allowed` / `on extra usage — billing` badge on the web dashboard. With the quota probe on, the `Spend` row shows what has been billed this month.
 
+An account past its switch threshold can still have fallback capacity. `teamclaude status` reports `Fallback` with either `included quota available past switch threshold` or `subscription usage credits available`. The status payload also includes `preferExtraUsage` and `fallbackTier` (`"free"`, `"paid"`, or `null`). This describes capacity permitted by the fallback policy. The line also states whether `preferExtraUsage` is enabled or capacity remains a fallback after normal rotation. Disabled accounts, billing cooldowns and usage or spend caps continue to report `Blocked`. The `Models` row continues to describe included quota.
+
 Edits apply live on config reload — turning it off stops the spending immediately.
+
+Removing `preferExtraUsage` restores the default fallback-only spending order on config reload.
 
 ## Third-party backend quota
 

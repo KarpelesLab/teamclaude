@@ -58,6 +58,21 @@ test('without the opt-in the spent fleet still answers null', () => {
   assert.equal(am.getActiveAccount(null, OPUS), null);
 });
 
+for (const [owner, expected] of [['api', null], ['subscription', 'subscription']]) {
+  test(`exhausted-fleet failover respects the advisor route owned by ${owner}`, () => {
+    const am = spentFleet([
+      oauth('subscription', { allowExtraUsage: true }),
+      { name: 'api', type: 'apikey', apiKey: 'api-key', disabled: true },
+    ]);
+    am.setRoutes([{ name: 'fable', match: ['claude-fable-*'], accounts: [owner] }]);
+    const tier = am.fallbackTier(am.accounts[0], OPUS, FABLE);
+    const alternate = quietly(() => am.pickAlternate(new Set(), OPUS, FABLE));
+    const initial = quietly(() => am.getActiveAccount(null, OPUS, FABLE));
+    assert.deepEqual({ tier, alternate: alternate?.name ?? null, initial: initial?.name ?? null },
+      { tier: expected ? 'paid' : null, alternate: expected, initial: 'subscription' });
+  });
+}
+
 // ── free quota first ─────────────────────────────────────────
 
 // The switch threshold is a rotation preference: an account between it and

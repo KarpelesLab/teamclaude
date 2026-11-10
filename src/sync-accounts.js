@@ -138,6 +138,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     // (an API key, a third-party backend, a Codex login) stays opted out on
     // reload as it was at startup; the warning was makeAccount's to give.
     mgr.allowExtraUsage = accountAllowsExtraUsage(diskAcct);
+    mgr.preferExtraUsage = mgr.allowExtraUsage && diskAcct.preferExtraUsage === true;
     // Same for a per-account routing proxy: it is read per request off this
     // object (server.js forwardRequest, ensureTokenFresh, the prober), so a
     // disk edit or a `teamclaude routing` change takes effect on the very next
@@ -200,6 +201,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       if (diskAcct.disabled) cfgAcct.disabled = true; else delete cfgAcct.disabled;
       if (diskAcct.cordoned) cfgAcct.cordoned = true; else delete cfgAcct.cordoned;
       if (diskAcct.allowExtraUsage === true) cfgAcct.allowExtraUsage = true; else delete cfgAcct.allowExtraUsage;
+      if (diskAcct.preferExtraUsage === true) cfgAcct.preferExtraUsage = true; else delete cfgAcct.preferExtraUsage;
       // Both polarities are mirrored, unlike the flags above: `false` is the
       // side of this key that does something, so a stale mirror of either value
       // would win the save stencil's spread and undo the disk edit.
