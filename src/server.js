@@ -1759,7 +1759,7 @@ export function relayHttpForward(req, res, stripOverage = false, /** @type {Reco
 const CLIENT_CREDENTIAL_PATHS = [
   '/v1/code/', '/api/oauth/', '/api/frame/', '/v1/mcp_servers/', '/v1/environments/', '/v1/sessions/', '/v2/session_ingress/', '/v2/ccr-sessions/',
   '/api/claude_cli/', '/api/claude_code/policy_limits/', '/api/claude_code_grove/', '/api/claude_code_penguin_mode/',
-  '/api/eval/', '/api/eval-authed/', '/mcp-registry/v0/servers/',
+  '/api/eval/', '/api/eval-authed/', '/mcp-registry/v0/servers/', '/api/web/domain_info/',
 ];
 
 /**
