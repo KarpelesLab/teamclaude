@@ -15,6 +15,7 @@
     "mcp": "off",
     "drainTimeoutSeconds": 0,
     "cliproxyApi": "off",
+    "controlPlane": "client",
     "usageHistory": false
   },
   "upstream": "https://api.anthropic.com",
