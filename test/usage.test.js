@@ -1,17 +1,18 @@
 import { test as nodeTest, describe as nodeDescribe, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { SCHEMA_VERSION, schemaVersion } from '../src/usage/schema.js';
 import {
-  closeUsageStore, guard, openUsageStore, prune, tick, usageStats,
+  closeUsageStore, guard, openUsageStore, prune, tick, usageStats, usageStoreAvailable,
   PRUNE_INTERVAL_MS, RAW_RETENTION_MS, ROLLUP_RETENTION_MS,
 } from '../src/usage/db.js';
 import { MAX_DIMS, MAX_LABEL_LENGTH, dimId, normalizeLabel, recordRequest } from '../src/usage/record.js';
 import { HOURLY_SQL, MEMO_TTL_MS, RAW_SQL, usageSummary, windowBounds } from '../src/usage/query.js';
-import { USAGE_STORE_AVAILABLE } from '../src/usage/db.js';
+
+const USAGE_STORE_AVAILABLE = usageStoreAvailable();
 
 // node:sqlite needs Node 22.5+; on an older Node these skip (the store opens disabled there).
 const test = USAGE_STORE_AVAILABLE ? nodeTest : nodeTest.skip;
@@ -93,6 +94,20 @@ describe('schema', () => {
     assert.deepEqual(indexes, ['usage_group', 'usage_ts']);
   });
 
+  // The file names accounts and client keys, so it is the owner's alone, as the
+  // config beside it is. Windows has no such modes to read back.
+  test('the database file is readable by its owner only, new or already there', { skip: process.platform === 'win32' && 'no POSIX file modes' }, () => {
+    const path = join(tempDir(), 'usage.db');
+    const first = openStore({ path });
+    recordRequest(first, { ts: T0, caller: 'laptop', model: 'opus', account: 'acct-a' });
+    for (const file of [path, `${path}-wal`]) assert.equal(statSync(file).mode & 0o777, 0o600, file);
+    closeUsageStore(first);
+
+    chmodSync(path, 0o644);
+    openStore({ path });
+    assert.equal(statSync(path).mode & 0o777, 0o600);
+  });
+
   test('reopening keeps the rows, the version and the interned labels', () => {
     const path = join(tempDir(), 'usage.db');
     const first = openStore({ path });
@@ -160,6 +175,9 @@ describe('recording', () => {
     recordRequest(store, { ts: T0, caller: 'build-box', model: 'opus', account: 'acct-a', status: 429 });
     assert.deepEqual(raw(store, 'SELECT tokens, status FROM usage'), [{ tokens: 0, status: 429 }]);
     assert.deepEqual(raw(store, 'SELECT req, tokens, refusals FROM usage_hourly'), [{ req: 1, tokens: 0, refusals: 1 }]);
+    // A request that ended with no status at all is not booked as a success.
+    recordRequest(store, { ts: T0 + 1, caller: 'build-box', model: 'opus', account: 'acct-a', status: null });
+    assert.deepEqual(raw(store, 'SELECT status FROM usage ORDER BY ts'), [{ status: 429 }, { status: 0 }]);
   });
 
   test('requests in one hour accumulate into one rollup row', () => {

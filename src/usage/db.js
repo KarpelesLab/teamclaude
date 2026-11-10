@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, renameSync } from 'node:fs';
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, renameSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { applySchema, SchemaTooNewError } from './schema.js';
 
@@ -31,16 +31,25 @@ import { applySchema, SchemaTooNewError } from './schema.js';
  */
 
 // node:sqlite is built in from Node 22.13 (22.5 to 22.12 behind
-// --experimental-sqlite). Loaded at
-// runtime rather than imported, so on an older Node the server still starts
-// and the store opens disabled.
-/** @type {typeof import('node:sqlite')|null} */
-const sqlite = (() => {
-  try { return /** @type {any} */ (process).getBuiltinModule?.('node:sqlite') ?? null; } catch { return null; }
-})();
+// --experimental-sqlite). Loaded at runtime rather than imported, so on an
+// older Node the server still starts and the store opens disabled. And loaded
+// on first use rather than when this module is: every command imports this
+// file through server.js, and on Node 22 loading node:sqlite prints an
+// ExperimentalWarning, which a process that never turned history on (the
+// default) must not print.
+/** @type {typeof import('node:sqlite')|null|undefined} */
+let sqlite;
+function loadSqlite() {
+  if (sqlite === undefined) {
+    try { sqlite = /** @type {any} */ (process).getBuiltinModule?.('node:sqlite') ?? null; } catch { sqlite = null; }
+  }
+  return sqlite ?? null;
+}
 
-/** Whether this Node can open a usage store at all. */
-export const USAGE_STORE_AVAILABLE = sqlite !== null;
+/** Whether this Node can open a usage store at all. Loads node:sqlite to find out. */
+export function usageStoreAvailable() {
+  return loadSqlite() !== null;
+}
 
 export const TICK_MS = 60_000;
 export const PRUNE_INTERVAL_MS = 86_400_000;
@@ -104,7 +113,7 @@ export function openUsageStore({ path, now = Date.now, onError = null }) {
     timer: null,
   };
 
-  if (!sqlite) return fail(store, Object.assign(new Error('node:sqlite needs Node 22.13 or later'), { code: 'sqlite-unavailable' }));
+  if (!loadSqlite()) return fail(store, Object.assign(new Error('node:sqlite needs Node 22.13 or later'), { code: 'sqlite-unavailable' }));
   /** @type {import('node:sqlite').DatabaseSync} */
   let db;
   try {
@@ -135,9 +144,27 @@ function newDim() {
   return { byLabel: new Map(), byId: new Map() };
 }
 
+/**
+ * Create the database file owner-only before SQLite opens it. It holds account
+ * names (usually email addresses) and client-key names, so it gets the mode the
+ * config beside it has; SQLite would create it under the umask, 0644 on most
+ * machines. The -wal and -shm files take the main file's mode. A file that is
+ * already there is tightened too. Best effort: a filesystem without modes is
+ * not a reason to run without history.
+ * @param {string} path
+ */
+function restrictToOwner(path) {
+  if (path === ':memory:') return;
+  try {
+    closeSync(openSync(path, 'a', 0o600));
+    chmodSync(path, 0o600);
+  } catch { /* SQLite reports a path it cannot open */ }
+}
+
 /** @param {string} path */
 function connect(path) {
-  const db = new (/** @type {typeof import('node:sqlite')} */ (sqlite)).DatabaseSync(path);
+  restrictToOwner(path);
+  const db = new (/** @type {typeof import('node:sqlite')} */ (loadSqlite())).DatabaseSync(path);
   try {
     db.exec('PRAGMA journal_mode = WAL');
     db.exec('PRAGMA synchronous = NORMAL');

@@ -15,7 +15,9 @@ import { createConnectHandler } from '../src/mitm.js';
 import { KEEP_ALIVE_TIMEOUT_MS } from '../src/server.js';
 import { allowLoopbackForward } from '../src/forward-target.js';
 import { AccountManager } from '../src/account-manager.js';
-import { closeUsageStore, openUsageStore, USAGE_STORE_AVAILABLE } from '../src/usage/db.js';
+import { closeUsageStore, openUsageStore, usageStoreAvailable } from '../src/usage/db.js';
+
+const USAGE_STORE_AVAILABLE = usageStoreAvailable();
 
 // The MITM now TERMINATES the tunnel (real h2/h1 server) and forwards each
 // request with the shared buffering/retrying proxy listener — so these tests

@@ -2,8 +2,10 @@ import { test as nodeTest } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
-import { openUsageStore, USAGE_STORE_AVAILABLE } from '../src/usage/db.js';
+import { openUsageStore, usageStoreAvailable } from '../src/usage/db.js';
 import { recordRequest } from '../src/usage/record.js';
+
+const USAGE_STORE_AVAILABLE = usageStoreAvailable();
 
 // node:sqlite needs Node 22.5+; on an older Node these skip.
 const test = USAGE_STORE_AVAILABLE ? nodeTest : nodeTest.skip;

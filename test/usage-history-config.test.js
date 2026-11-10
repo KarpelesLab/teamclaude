@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { existsSync } from 'node:fs';
 import { spawnServer } from '../test-helpers/spawn-server.js';
-import { USAGE_STORE_AVAILABLE } from '../src/usage/db.js';
+import { usageStoreAvailable } from '../src/usage/db.js';
+
+const USAGE_STORE_AVAILABLE = usageStoreAvailable();
 
 // proxy.usageHistory is off by default: a server started without it writes no
 // usage.db and its route reports no data. With it on, a proxied request lands

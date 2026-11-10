@@ -59,7 +59,7 @@ export function dimId(store, kind, value) {
  * @property {unknown} [cacheRead]
  * @property {unknown} [cacheWrite]
  * @property {unknown} [output]
- * @property {number} [status]
+ * @property {number|null} [status]  absent or null is booked as 0: no answer was sent, which is not a success
  */
 
 /**
@@ -78,7 +78,7 @@ export function recordRequest(store, entry = {}) {
     const cacheWrite = whole(entry.cacheWrite);
     const output = whole(entry.output);
     const tokens = input + cacheRead + cacheWrite + output;
-    const status = Number.isFinite(entry.status) ? Math.trunc(/** @type {number} */ (entry.status)) : 200;
+    const status = Number.isFinite(entry.status) ? Math.trunc(/** @type {number} */ (entry.status)) : 0;
     const refusal = status === 429 ? 1 : 0;
 
     const callerId = dimId(store, 'caller', entry.caller);

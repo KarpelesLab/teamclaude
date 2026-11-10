@@ -2325,8 +2325,10 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         // after its 200 head (proxyClosed) is a 502 here, not the upstream's 200.
         /** @type {any} */
         const settled = ctx;
+        // A telemetry batch the activity log hides (eventLogging) is not usage
+        // either: it would add a zero-token row under no model for every batch.
         const served = /** @type {any[]} */ (/** @type {any} */ (accountManager).accounts).some(a => a.name === settled.account);
-        recordRequest(usageStore, {
+        if (!hideActivity) recordRequest(usageStore, {
           caller,
           account: served ? settled.account : null,
           model: ctx.model,
