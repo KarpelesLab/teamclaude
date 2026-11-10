@@ -314,7 +314,14 @@ export function accountBadges(account, current, currentAccounts, now, fleetThres
     var expires = Number.isFinite(reading.expiresAt)
       ? ' \u00b7 expires ' + new Date(reading.expiresAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
       : '';
-    badges.push({ cls: 'meta', text: credits + ' reset credit' + (credits === 1 ? '' : 's') + expires });
+    // Fable resets (oauth.js bankedResets) clear the Fable weekly only, so they
+    // are named apart from the resets that put every model back.
+    var fable = Number.isFinite(reading.fable) ? Math.min(Math.max(reading.fable, 0), credits) : 0;
+    var general = credits - fable;
+    var held = [];
+    if (general > 0) held.push(general + ' reset credit' + (general === 1 ? '' : 's'));
+    if (fable > 0) held.push(fable + ' Fable reset' + (fable === 1 ? '' : 's'));
+    badges.push({ cls: 'meta', text: held.join(', ') + expires });
   }
   // Arguments 5/6 are optional (the pre-#409 unit test above omits them): with
   // no account switchThreshold at all — the common case — thresholdBadgeText

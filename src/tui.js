@@ -12,7 +12,7 @@ import { configIndexFor, managerAccountFor, markAccountRemoved, markAccountAdded
 import { PROVIDERS, providerOf, isSubscriptionAccount, upstreamFor } from './provider.js';
 import { mintAccountId } from './account-id.js';
 import { ACCOUNT_REFUSAL_CODES } from './account-refusal.js';
-import { formatPercent, heldResetCredits, showSessionRow, showWeeklyRow, unavailableLine } from './status-renderer.js';
+import { formatPercent, heldFableResets, heldResetCredits, showSessionRow, showWeeklyRow, unavailableLine } from './status-renderer.js';
 import { cacheUsageLabel, cacheUsageState } from './usage-label.js';
 import { resolveMaxUsage, resolveMaxSpendMinor, switchThresholdDiffs, modelLabel, EFFORT_SEP } from './model.js';
 import { parseProxyUrl, proxyToUrl, describeProxy, describeSelfProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy, localListener, isSelfProxy } from './upstream-proxy.js';
@@ -375,12 +375,18 @@ function typeColumn(/** @type {any[]} */ accounts) {
  * room to say how old the count is, so past the point where it stops being
  * worth anything the honest tag is no tag.
  *
+ * Claude Fable resets (heldFableResets) count apart as `FR<n>`: they give back
+ * only what Fable used, so `RC` keeps meaning a reset that puts every model
+ * back. An account holding both reads `RC1 FR2`.
+ *
  * @param {Record<string, any>|null|undefined} quota
  * @param {number} [now]  ms epoch the reading's age is measured from
  */
 export function resetCreditTag(quota, now = Date.now()) {
   const available = heldResetCredits(quota, now);
-  return available ? `RC${available}` : '';
+  const fable = heldFableResets(quota, now);
+  const general = available - fable;
+  return [general ? `RC${general}` : '', fable ? `FR${fable}` : ''].filter(Boolean).join(' ');
 }
 
 /**
@@ -428,6 +434,13 @@ function creditColor(credit) {
   if (credit.remainingMinor <= 0) return red;
   return credit.error || credit.incomplete ? yellow : cyan;
 }
+
+// What a blocked bucket's bar label reads instead of its name: the same width
+// as the label it replaces (`Wk `, `S7`, `F7`), so marking the bar costs the
+// row nothing and the trailing `⊘` tag is only needed for a bar the row does
+// not draw.
+/** @type {Record<string, string>} */
+const BLOCKED_MARKS = { Wk: '⊘Wk', Sonnet: '⊘S', Fable: '⊘F' };
 
 export function blockedFamilies(quota, threshold) {
   const at = typeof threshold === 'function' ? threshold : () => threshold;
@@ -2839,8 +2852,9 @@ export class TUI {
     //   - the route-marker cells, one per general route,
     //   - 6 columns of label for each bar past the first (`  Wk `, ` ►F7  `).
     // The `⊘ Sonnet Fable` tag is reserved for only when some account is
-    // actually blocked; the common case where nothing is spends those columns
-    // on the bars instead of leaving the row short of the edge.
+    // actually blocked and the row does not draw that bucket's bar (a drawn bar
+    // carries the mark on its label, `⊘F`); the common case spends those
+    // columns on the bars instead of leaving the row short of the edge.
     const categoryOf = (/** @type {any} */ a) => rowCategory(a);
     const routeCells = genRoutes.length ? genRoutes.length + 1 : 0;
     // The type cell and the space after it, at the width the row pads it to.
@@ -2858,8 +2872,25 @@ export class TUI {
       const credits = cat === 'metered' ? members.map(a => this._credit(a)) : [];
       const anyCredit = credits.some(c => c != null);
       const families = (anyFable ? 1 : 0) + (anySonnet ? 1 : 0) + (anyMonthly ? 1 : 0) + (anyCredit ? 1 : 0);
-      const tagW = members.reduce((w, a) => {
-        const names = blockedFamilies(a.quota, key => this.am.thresholdFor(key, a));
+      // No Ses bar once every account here has said it meters no 5h window
+      // (`sessionWindowStated`, the fact a reading leaves behind; not
+      // `unified5h` itself, which the expiry sweep nulls every five hours on a
+      // row that does have one). Some Codex plans meter none, and so does an
+      // Anthropic Ultra account once its 5-hour limit is lifted. An unreported account keeps the column, and so does a
+      // reading that is still there (showSessionRow). Not keyed on a weekly
+      // reading being present either: a weekly reset nulls `unified7d` until
+      // the next reading, and the column would come back empty meanwhile.
+      const shortBar = cat !== 'unified'
+        || members.some(a => showSessionRow(a.quota));
+      // The trailing `⊘` tag on the widest row. A blocked bucket is marked on
+      // its own bar (BLOCKED_MARKS), so the tag carries only what the layout
+      // leaves undrawn: nothing when every bar is drawn, the families once
+      // their bars go, and the weekly too on a one-bar row that starts at Ses.
+      // The weekly bar is drawn wherever _renderAcct draws it: first on a list
+      // or row without a session window, else second when two bars fit.
+      const tagWFor = (/** @type {boolean} */ familyBars, /** @type {boolean} */ twoBars) => members.reduce((w, a) => {
+        const names = blockedFamilies(a.quota, key => this.am.thresholdFor(key, a))
+          .filter(n => !(n === 'Wk' ? !shortBar || !showSessionRow(a.quota) || twoBars : familyBars));
         return names.length ? Math.max(w, 4 + vw(names.join(' '))) : w;
       }, 0);
       // Same rule for the money tag (`$`, or the billed amount with its `/cap`):
@@ -2906,21 +2937,21 @@ export class TUI {
       // is on the status line and the dashboard, while the amount left and the bars are this row's to say. Without
       // that, a routed credit account reserved 82 columns at W=80 before any bar and fitLine cut the address off
       // (Copilot's review of #649).
-      const fixedWithRoute = 20 + typeCell + NAME_MIN + routeCells + tagW + spendW + creditW + switchW + routeW + prepaidW;
-      const routeTags = routeW === 0 || fixedWithRoute + BAR_MIN <= W;
-      const fixed = routeTags ? fixedWithRoute : fixedWithRoute - routeW;
+      const layout = (/** @type {number} */ tagW) => {
+        const fixedWithRoute = 20 + typeCell + NAME_MIN + routeCells + tagW + spendW + creditW + switchW + routeW + prepaidW;
+        const routeTags = routeW === 0 || fixedWithRoute + BAR_MIN <= W;
+        return { fixed: routeTags ? fixedWithRoute : fixedWithRoute - routeW, routeTags };
+      };
+      const fits = (/** @type {number} */ fixed, /** @type {number} */ n) => W >= floor && fixed + 6 * (n - 1) + n * BAR_MIN <= W;
+      // Widest layout first. It needs the smallest tag, and a layout that fits
+      // only without the tag must not be ruled out by reserving it.
+      let { fixed, routeTags } = layout(tagWFor(true, true));
+      if (!(families > 0 && fits(fixed, 2 + families))) {
+        ({ fixed, routeTags } = layout(tagWFor(false, true)));
+        if (!fits(fixed, 2)) ({ fixed, routeTags } = layout(tagWFor(false, false)));
+      }
       const span = (/** @type {number} */ n, /** @type {number} */ bar) => fixed + 6 * (n - 1) + n * bar;
       const roomFor = (/** @type {number} */ n) => span(n, BAR_MIN) <= W;
-      // No Ses bar once every account here has said it meters no 5h window
-      // (`sessionWindowStated`, the fact a reading leaves behind; not
-      // `unified5h` itself, which the expiry sweep nulls every five hours on a
-      // row that does have one). Some Codex plans meter none, and so does an
-      // Anthropic Ultra account once its 5-hour limit is lifted. An unreported account keeps the column, and so does a
-      // reading that is still there (showSessionRow). Not keyed on a weekly
-      // reading being present either: a weekly reset nulls `unified7d` until
-      // the next reading, and the column would come back empty meanwhile.
-      const shortBar = cat !== 'unified'
-        || members.some(a => showSessionRow(a.quota));
       // The family bars are the first thing to go: below the width where they
       // fit even at BAR_MIN they would push the row past the edge, and a row
       // cut mid-bar reads worse than one that simply doesn't draw them (the
@@ -3329,9 +3360,29 @@ export class TUI {
     // without a config, and it read none before this line existed.
     const pctInBar = this.config?.quotaBarPercent === true;
 
-    let line = ` ${sel}${cur} ${startSlot}${name} ${type}${status} ${l1} ${bar(r1, bw1, t1, w1, th1, pctInBar)}`;
+    // Explicit "disabled for these models" mark (issue #85): a bucket the
+    // account can't serve from even while it is otherwise active. A spent
+    // shared 5h blocks everything and is already conveyed by the Ses bar +
+    // status, so it's not repeated here.
+    //
+    // limFor, not thresholdFor: it is min(per-bucket threshold, per-account cap),
+    // so the mark covers both ceilings and still judges each family against its
+    // OWN configured threshold.
+    //
+    // The mark replaces the label of the bar it is about (BLOCKED_MARKS); only
+    // a bucket whose bar this row does not draw falls back to the `⊘` tag.
+    const blocked = blockedFamilies(q, limFor);
+    const marked = new Set();
+    const mark = (/** @type {string} */ bucket, /** @type {string} */ label) => {
+      if (!blocked.includes(bucket)) return label;
+      marked.add(bucket);
+      return red(BLOCKED_MARKS[bucket]);
+    };
+    const slotLabel = (/** @type {string} */ label) => (label === 'Wk ' ? mark('Wk', label) : label);
+
+    let line = ` ${sel}${cur} ${startSlot}${name} ${type}${status} ${slotLabel(l1)} ${bar(r1, bw1, t1, w1, th1, pctInBar)}`;
     if (showBoth) {
-      if (!weeklyFirst && !weeklyOnly && !sessionOnly) line += `  ${l2} ${bar(r2, bw, t2, w2, th2, pctInBar)}`;
+      if (!weeklyFirst && !weeklyOnly && !sessionOnly) line += `  ${slotLabel(l2)} ${bar(r2, bw, t2, w2, th2, pctInBar)}`;
       // A backend's monthly window has no unified slot; it draws its own bar
       // and is budgeted as a family column, like S7/F7.
       if (showFamily && backendWindows?.monthly != null && l2 !== 'Mon') {
@@ -3340,11 +3391,11 @@ export class TUI {
       // Sonnet weekly bar — only shown when the usage probe has populated it. A
       // leading ► (in place of a padding space) marks a Sonnet route on this account.
       if (showFamily && q.unified7dSonnet != null) {
-        line += `${famLead('sonnet')}${familyMark('sonnet')}S7  ${bar(q.unified7dSonnet, bw, q.unified7dSonnetReset, SEVEN_DAY_MS, limFor('unified7dSonnet'), pctInBar)}`;
+        line += `${famLead('sonnet')}${familyMark('sonnet')}${mark('Sonnet', 'S7')}  ${bar(q.unified7dSonnet, bw, q.unified7dSonnetReset, SEVEN_DAY_MS, limFor('unified7dSonnet'), pctInBar)}`;
       }
       // Fable weekly bar — only shown when the usage probe has populated it.
       if (showFamily && q.unified7dFable != null) {
-        line += `${famLead('fable')}${familyMark('fable')}F7  ${bar(q.unified7dFable, bw, q.unified7dFableReset, SEVEN_DAY_MS, limFor('unified7dFable'), pctInBar)}`;
+        line += `${famLead('fable')}${familyMark('fable')}${mark('Fable', 'F7')}  ${bar(q.unified7dFable, bw, q.unified7dFableReset, SEVEN_DAY_MS, limFor('unified7dFable'), pctInBar)}`;
       }
       // Prepaid credit used this cycle, paced against the cycle like a weekly
       // bar, its countdown the days to the renewal. No threshold: rotation
@@ -3357,16 +3408,8 @@ export class TUI {
         line += `  Cr  ${bar(credit.usedFraction, bw, Number.isFinite(end) ? end : null, span, null, pctInBar)}`;
       }
     }
-    // Explicit "disabled for these models" tag (issue #85): a family the account
-    // can't serve even while it is otherwise active. A spent shared 5h blocks
-    // everything and is already conveyed by the Ses bar + status, so it's not
-    // repeated here.
-    //
-    // limFor, not thresholdFor: it is min(per-bucket threshold, per-account cap),
-    // so the tag covers both ceilings and still judges each family against its
-    // OWN configured threshold.
-    const blocked = blockedFamilies(q, limFor);
-    if (blocked.length) line += `  ${red('⊘ ' + blocked.join(' '))}`;
+    const untagged = blocked.filter(bucket => !marked.has(bucket));
+    if (untagged.length) line += `  ${red('⊘ ' + untagged.join(' '))}`;
     // What is left of the prepaid credit, beside its bar.
     const prepaid = creditTag(credit);
     if (prepaid) line += `  ${creditColor(credit)(prepaid)}`;

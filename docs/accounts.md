@@ -172,7 +172,7 @@ Besides the CLI there are two more places to set it. In the TUI, **`g`** then **
 
 Routing covers what TeamClaude does with the account's own credential. Two kinds of traffic are outside that, and both keep the fleet path:
 
-- Claude Code's own identity calls (`/api/oauth/*`, `/v1/code/*`, the claude.ai connector list `/v1/mcp_servers`, the Remote Control bridge's `/v1/environments/*`, `/v1/sessions/*`, `/v2/session_ingress/*` and `/v2/ccr-sessions/*`, and its token refresh), along with its [bootstrap, policy, feature, WebFetch and registry calls](proxy-modes.md#mitm-proxy-mode-default), are relayed with the credential of the Claude Code login, never with a pooled account's, so they belong to no account here. That holds even when the login is the same person as a routed account.
+- Claude Code's own identity calls (`/api/oauth/*`, `/v1/code/*`, the claude.ai connector list `/v1/mcp_servers`, the Remote Control bridge's `/v1/environments/*`, `/v1/sessions/*`, `/v2/session_ingress/*` and `/v2/ccr-sessions/*`, and its token refresh), along with its [bootstrap, policy, feature, WebFetch and registry calls](proxy-modes.md#mitm-proxy-mode-default) unless `proxy.controlPlane` is `"pool"`, are relayed with the credential of the Claude Code login, never with a pooled account's, so they belong to no account here. That holds even when the login is the same person as a routed account.
 - A sign-in or import that names no account. Which account it belongs to is only known once the profile has been read, so that lookup cannot use a proxy it has not found yet. Pass `--name` (or `--routing`) and it can.
 
 ### The proxy is tested before anything depends on it
@@ -531,6 +531,21 @@ the same surfaces as the
 (`expires 18d 23h`), and a badge with the date on the dashboard card. A reset
 past its expiry date is dropped from every surface, as is a reading more than
 7 days old.
+
+Since the Fable 5.2 launch (2026-11-09) there is a second kind: a **Fable
+reset** (its grant `clears` only `seven_day_overage_included`, the Fable
+weekly). Fable may use up to half of the shared weekly, and a Fable reset gives
+back only what Fable used: on an account at 80% Opus and 20% Fable it clears
+the Fable weekly and leaves the shared weekly at 80%. It is worth the most on an
+account whose Fable weekly is spent. The usage payload's `weekly_scoped_shares`
+says how much of the weekly Fable has used. The surfaces count the two kinds
+apart: `FR3` on the TUI row (`RC1 FR2` for an account holding both), and
+"Fable resets" on the `Reset` line and the dashboard badge.
+
+A bucket the account cannot serve from right now is marked on its own bar:
+`⊘Wk` in place of `Wk`, `⊘F` in place of `F7`, `⊘S` in place of `S7`. Only a
+bucket whose bar the row does not draw (a terminal too narrow for the family
+bars) falls back to the trailing tag, `⊘ Fable`.
 
 The probe is off by default, so the count is only as fresh as the last probe:
 `p` in the TUI, or `curl -X POST localhost:3456/teamclaude/probe`, refreshes
