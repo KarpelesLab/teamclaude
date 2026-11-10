@@ -477,13 +477,17 @@ export function resetCreditLine(account, paint, now = Date.now()) {
   const credits = account?.quota?.resetCredits;
   const available = heldResetCredits(account?.quota, now);
   if (!available) return null;
-  const noun = `free rate-limit reset ${available === 1 ? 'credit' : 'credits'}`;
+  const fable = heldFableResets(account?.quota, now);
+  const general = available - fable;
+  const held = [];
+  if (general) held.push(`${general} free rate-limit reset ${general === 1 ? 'credit' : 'credits'}`);
+  if (fable) held.push(`${fable} Fable ${fable === 1 ? 'reset' : 'resets'}`);
   const notes = [];
   if (credits.applicable === 0) notes.push('none applicable to a window right now');
   if (Number.isFinite(credits.expiresAt)) notes.push(`expires ${formatDuration(credits.expiresAt - now)}`);
   if (Number.isFinite(credits.seenAt)) notes.push(`as of ${formatAgo(Math.min(credits.seenAt, now), now)}`);
   const note = notes.length ? ` — ${notes.join(', ')}` : '';
-  return `${paint.dim('Reset'.padEnd(8))} ${paint.cyan(`${available} ${noun}`)}${paint.gray(note)}`;
+  return `${paint.dim('Reset'.padEnd(8))} ${paint.cyan(held.join(', '))}${paint.gray(note)}`;
 }
 
 // How long a reset-credit reading is worth showing. Nothing refreshes the count
@@ -534,6 +538,21 @@ function refusalText(/** @type {Record<string, any>} */ err) {
 function lastGoodRefresh(account, err) {
   if (err?.code !== 'refresh_rejected' || !Number.isFinite(account?.lastRefreshAt)) return '';
   return `; last good refresh ${formatAgo(account.lastRefreshAt, Date.now())}`;
+}
+
+/**
+ * How many of the reported resets are Fable resets (see bankedResets in
+ * oauth.js): 0 wherever heldResetCredits reports none, and never more than it
+ * does. A Codex reading carries no `fable` count, so all of its credits stay
+ * general ones.
+ *
+ * @param {Record<string, any>|null|undefined} quota
+ * @param {number} [now]
+ */
+export function heldFableResets(quota, now = Date.now()) {
+  const fable = quota?.resetCredits?.fable;
+  if (!Number.isFinite(fable) || fable <= 0) return 0;
+  return Math.min(fable, heldResetCredits(quota, now));
 }
 
 export function unavailableLine(account, paint) {
