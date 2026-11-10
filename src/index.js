@@ -617,6 +617,8 @@ async function serverCommand() {
     if (config.proxy) config.proxy.mcp = diskConfig.proxy?.mcp;
     // The CLIProxyAPI-compatible usage API, the same way and for the same reason.
     if (config.proxy) config.proxy.cliproxyApi = diskConfig.proxy?.cliproxyApi;
+    // Where Claude Code's bootstrap and feature calls go, the same way.
+    if (config.proxy) config.proxy.controlPlane = diskConfig.proxy?.controlPlane;
     // Pick up route table edits (teamclaude route …, TUI editor, or a hand edit).
     config.routes = diskConfig.routes || [];
     accountManager.setRoutes(config.routes);
