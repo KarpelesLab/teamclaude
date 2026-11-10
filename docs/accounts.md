@@ -532,6 +532,21 @@ the same surfaces as the
 past its expiry date is dropped from every surface, as is a reading more than
 7 days old.
 
+Since the Fable 5.2 launch (2026-11-09) there is a second kind: a **Fable
+reset** (its grant `clears` only `seven_day_overage_included`, the Fable
+weekly). Fable may use up to half of the shared weekly, and a Fable reset gives
+back only what Fable used: on an account at 80% Opus and 20% Fable it clears
+the Fable weekly and leaves the shared weekly at 80%. It is worth the most on an
+account whose Fable weekly is spent. The usage payload's `weekly_scoped_shares`
+says how much of the weekly Fable has used. The surfaces count the two kinds
+apart: `FR3` on the TUI row (`RC1 FR2` for an account holding both), and
+"Fable resets" on the `Reset` line and the dashboard badge.
+
+A bucket the account cannot serve from right now is marked on its own bar:
+`⊘Wk` in place of `Wk`, `⊘F` in place of `F7`, `⊘S` in place of `S7`. Only a
+bucket whose bar the row does not draw (a terminal too narrow for the family
+bars) falls back to the trailing tag, `⊘ Fable`.
+
 The probe is off by default, so the count is only as fresh as the last probe:
 `p` in the TUI, or `curl -X POST localhost:3456/teamclaude/probe`, refreshes
 it once.
