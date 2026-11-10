@@ -691,6 +691,8 @@ export class AccountManager {
     this.listener = listener;
     this.accounts = accounts.map((acct, index) => makeAccount(acct, index, listener));
     this.currentIndex = 0;
+    /** @type {Record<string, any>|null} */
+    this._manualAccount = null;
     // Session awareness (issue #109). The tracker is always on (passive — it just
     // observes the x-claude-code-session-id header for the status readout).
     // `distributeSessions` gates the behavioural change: keep each session on its
@@ -1117,12 +1119,14 @@ export class AccountManager {
   }
 
   /**
-   * Move the cursor, and only the cursor. A reading is taken where a request
-   * finds traffic resting, never where a selection aims it, so no caller of
-   * this method owes one. Its only write is `_firstSightOn`'s: it restores a
-   * held roll to its own account, and otherwise writes where nothing is lost.
+   * Move the cursor, releasing this provider's manual priority preference.
+   * A reading is taken where a request finds traffic resting, never where a
+   * selection aims it, so no caller of this method owes one. `_firstSightOn`
+   * restores a held roll to its own account, and otherwise writes where
+   * nothing is lost.
    */
   _setCurrent(account) {
+    if (this._manualAccount && (this._selectingProvider == null || this._selectingProvider === providerOf(this._manualAccount))) this._manualAccount = null;
     this.currentIndex = account.index;
     // A move made by an operator or a poll names the provider cursor of the
     // account it lands on. A move inside a selection walk does not: the walk
@@ -1142,6 +1146,7 @@ export class AccountManager {
     const account = this.accounts[index];
     if (!account) return false;
     this._setCurrent(account);
+    this._manualAccount = account;
     return true;
   }
 
@@ -2031,7 +2036,7 @@ export class AccountManager {
     // status change — the account stays healthy for the next request.
     // We just learned a probed account's weekly quota — re-evaluate which
     // account is best now that its limit is known.
-    if (current && current.requalify) {
+    if (current && current.requalify && current !== this._manualAccount) {
       // Consume the flag on the final pass; the advisor-constrained pass leaves
       // it set unless it actually switches, so the requalification isn't lost
       // when that pass comes up empty and selection degrades.
@@ -2746,8 +2751,7 @@ export class AccountManager {
     if (current && this._isAvailable(current, model)) {
       // Mirror getActiveAccount's priority preemption: a strictly higher-priority
       // available account wins over a healthy current one; same tier stays put.
-      const better = this.accounts.some(a =>
-        allowed(a) && this._isAvailable(a, model) && (a.priority || 0) < (current.priority || 0));
+      const better = this._preemptedBy(current, model, null, excluded, provider);
       const rolled = this.expiryRouting.enabled && this.expiryRouting.preempt
         && this._currentRolledOver(current, model);
       if (!better && !rolled) return current.index;
@@ -3221,7 +3225,8 @@ export class AccountManager {
    * thrashes. Shared by _select, which enforces it, and eligibility(), which
    * reports it — one predicate so the answer cannot drift from the behaviour.
    */
-  _preemptedBy(account, model = null, advisorModel = null, exclude = null) {
+  _preemptedBy(account, model = null, advisorModel = null, exclude = null, provider = this._selectingProvider ?? providerOf(account)) {
+    if (account === this._manualAccount && provider === providerOf(account)) return null;
     return this.accounts.find(a => this._isAvailable(a, model, advisorModel)
       && !exclude?.has(a.index)
       && (a.priority || 0) < (account.priority || 0)) || null;
@@ -6255,6 +6260,7 @@ export class AccountManager {
     if (index < 0 || index >= this.accounts.length) return;
     const before = this.accounts[this.currentIndex] ?? null;
     const [removed] = this.accounts.splice(index, 1);
+    if (removed === this._manualAccount) this._manualAccount = null;
     this._onAccountRemoved?.(removed);
     this.accounts.forEach((a, i) => a.index = i);
     if (this.currentIndex >= this.accounts.length) {
