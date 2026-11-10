@@ -103,9 +103,10 @@ test('switch_account moves the preference and says whether rotation will follow'
   const { tools, am } = await fixture();
   const result = await ok(tools, 'switch_account', { account: 'bob@example.com', org: 'Globex' });
   assert.equal(result.account, 'bob@example.com (Globex)');
-  assert.equal(result.eligible, false);
-  assert.match(result.reason, /outranked by higher-priority account "alice@example.com"/);
+  assert.equal(result.eligible, true);
+  assert.equal(result.reason, undefined);
   assert.equal(am.currentIndex, 2);
+  assert.equal(am.getActiveAccount().name, 'bob@example.com (Globex)');
 });
 
 test('an account token that fits several accounts is refused with the candidates', async () => {
