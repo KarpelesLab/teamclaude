@@ -46,7 +46,7 @@ const grant = over => ({ ...LIVE_BLOCK.grants[0], ...over });
 // ── reading the block ───────────────────────────────────────────────────────
 
 test('the live payload reads as one reset, spendable now, with its expiry', () => {
-  assert.deepEqual(bankedResets(LIVE_BLOCK, NOW), { available: 1, applicable: 1, expiresAt: ENDS });
+  assert.deepEqual(bankedResets(LIVE_BLOCK, NOW), { available: 1, applicable: 1, expiresAt: ENDS, fable: 0 });
 });
 
 test('the probe payload carries the reading beside the quota buckets', () => {
@@ -72,9 +72,9 @@ test('a block that says nothing usable is no reading, not zero', () => {
 });
 
 test('an eligible block with no live grant is a real zero', () => {
-  assert.deepEqual(bankedResets({ ...LIVE_BLOCK, grants: [] }, NOW), { available: 0, applicable: 0, expiresAt: null });
+  assert.deepEqual(bankedResets({ ...LIVE_BLOCK, grants: [] }, NOW), { available: 0, applicable: 0, expiresAt: null, fable: 0 });
   assert.deepEqual(bankedResets({ ...LIVE_BLOCK, grants: [grant({ resets_left: 0 })] }, NOW),
-    { available: 0, applicable: 0, expiresAt: null });
+    { available: 0, applicable: 0, expiresAt: null, fable: 0 });
 });
 
 test('an expired grant is not counted', () => {
@@ -84,15 +84,15 @@ test('an expired grant is not counted', () => {
 
 test('a grant held but not spendable yet counts as held, not applicable', () => {
   assert.deepEqual(bankedResets({ ...LIVE_BLOCK, grants: [grant({ usable_now: false })] }, NOW),
-    { available: 1, applicable: 0, expiresAt: ENDS });
+    { available: 1, applicable: 0, expiresAt: ENDS, fable: 0 });
   assert.deepEqual(bankedResets({ ...LIVE_BLOCK, grants: [grant({ paused: true })] }, NOW),
-    { available: 1, applicable: 0, expiresAt: ENDS });
+    { available: 1, applicable: 0, expiresAt: ENDS, fable: 0 });
 });
 
 test('several grants sum, and the soonest expiry is the one reported', () => {
   const sooner = '2026-10-10T00:00:00+00:00';
   const r = bankedResets({ ...LIVE_BLOCK, grants: [grant({}), grant({ ends_at: sooner, usable_now: false })] }, NOW);
-  assert.deepEqual(r, { available: 2, applicable: 1, expiresAt: Date.parse(sooner) });
+  assert.deepEqual(r, { available: 2, applicable: 1, expiresAt: Date.parse(sooner), fable: 0 });
 });
 
 test('malformed or hostile counts cannot reach the display rows', () => {
@@ -175,4 +175,50 @@ test('a Codex reading without an expiry reads as it did before', () => {
   assert.equal(/expires/.test(resetCreditLine({ quota: codex }, paint, NOW)), false);
   assert.ok(accountBadges({ name: 'a', provider: 'codex', quota: codex }, 'a', null, NOW)
     .some(b => b.text === '2 reset credits'));
+});
+
+// ── Fable resets ────────────────────────────────────────────────────────────
+
+// The grant shape the Fable 5.2 launch added (read live 2026-11-10, ids
+// dropped): it clears the Fable weekly only, not the shared windows.
+const FABLE_GRANT = {
+  label: 'New model launch: one Fable reset for Max, Team Premium and Enterprise Premium',
+  resets_total: 1,
+  resets_left: 1,
+  starts_at: '2026-11-09T18:00:00+00:00',
+  ends_at: '2027-03-09T07:59:00+00:00',
+  clears: ['seven_day_overage_included'],
+  paused: false,
+  usable_now: true,
+  use_requires_limit: false,
+  percent_used: { seven_day_overage_included: 16, seven_day: 98 },
+  blocking: [],
+  arm: null,
+  type: 'full',
+  unavailable_reason: null,
+  gives_back_weekly: true,
+};
+
+test('a Fable reset is counted apart from one that clears the shared windows', () => {
+  const r = bankedResets({ ...LIVE_BLOCK, grants: [grant({}), FABLE_GRANT, { ...FABLE_GRANT, label: 'one more' }] }, NOW);
+  assert.equal(r.available, 3);
+  assert.equal(r.fable, 2);
+  // A grant that clears the Fable weekly AND a shared window is a general one.
+  assert.equal(bankedResets(LIVE_BLOCK, NOW).fable, 0);
+  assert.equal(bankedResets({ ...LIVE_BLOCK, grants: [grant({ clears: 'seven_day_overage_included' })] }, NOW).fable, 0);
+});
+
+test('every surface names Fable resets as such', () => {
+  const fableOnly = quota({ available: 3, applicable: 3, fable: 3 });
+  const mixed = quota({ available: 3, applicable: 3, fable: 2 });
+  assert.equal(resetCreditTag(fableOnly, NOW), 'FR3');
+  assert.equal(resetCreditTag(mixed, NOW), 'RC1 FR2');
+  assert.match(resetCreditLine({ quota: fableOnly }, paint, NOW), /Reset\s+3 Fable resets — expires 19d/);
+  assert.match(resetCreditLine({ quota: mixed }, paint, NOW), /1 free rate-limit reset credit, 2 Fable resets/);
+  const badges = accountBadges({ name: 'a', provider: 'anthropic', quota: mixed }, 'a', null, NOW);
+  assert.ok(badges.some(b => /^1 reset credit, 2 Fable resets · expires /.test(b.text)));
+  // A count that claims more Fable resets than are held cannot go negative.
+  assert.equal(resetCreditTag(quota({ available: 1, fable: 5 }), NOW), 'FR1');
+  // Gone with the reading, like the rest.
+  assert.equal(resetCreditTag(quota({ fable: 1, expiresAt: NOW - 1 }), NOW), '');
 });

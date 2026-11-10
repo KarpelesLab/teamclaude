@@ -723,6 +723,12 @@ export function normalizeUsagePayload(data, now = Date.now()) {
  *    reads `usable_now: false`.
  *  - `expiresAt` is the soonest `ends_at` among the grants counted, so the
  *    displays can say when the reset lapses and drop it once it has.
+ *  - `fable` is the part of `available` that is a Fable reset: a grant whose
+ *    `clears` names only the Fable weekly (`seven_day_overage_included`) and
+ *    neither shared window. Those arrived with the Fable 5.2 launch
+ *    (2026-11-09, "New model launch: one Fable reset ..."); the October grants
+ *    cleared `five_hour` and `seven_day` too. The displays name the two apart,
+ *    since a Fable reset does not put the account's other models back.
  *
  * An ineligible block is null, not zero. Its reason so far has always been
  * about the caller (`surface`, `cli_version`), not the account, so "none" would
@@ -735,13 +741,14 @@ export function normalizeUsagePayload(data, now = Date.now()) {
  *
  * @param {any} block  the payload's `cedar_ember` object
  * @param {number} [now]  ms epoch a grant's expiry is measured against
- * @returns {{available: number, applicable: number, expiresAt: number|null}|null}
+ * @returns {{available: number, applicable: number, expiresAt: number|null, fable: number}|null}
  */
 export function bankedResets(block, now = Date.now()) {
   if (!block || typeof block !== 'object' || block.eligible !== true) return null;
   if (!Array.isArray(block.grants)) return null;
   let available = 0;
   let applicable = 0;
+  let fable = 0;
   /** @type {number|null} */
   let expiresAt = null;
   for (const grant of block.grants) {
@@ -752,10 +759,23 @@ export function bankedResets(block, now = Date.now()) {
     if (Number.isFinite(ends) && ends <= now) continue;
     available += left;
     if (grant.usable_now === true && grant.paused !== true) applicable += left;
+    if (isFableReset(grant.clears)) fable += left;
     if (Number.isFinite(ends) && (expiresAt == null || ends < expiresAt)) expiresAt = ends;
   }
   // Re-capped after summing, for the same width budget creditCount guards.
-  return { available: creditCount(available) ?? 0, applicable: creditCount(applicable) ?? 0, expiresAt };
+  return {
+    available: creditCount(available) ?? 0,
+    applicable: creditCount(applicable) ?? 0,
+    expiresAt,
+    fable: creditCount(fable) ?? 0,
+  };
+}
+
+/** @param {unknown} clears  a grant's `clears` list */
+function isFableReset(clears) {
+  if (!Array.isArray(clears)) return false;
+  return clears.includes('seven_day_overage_included')
+    && !clears.includes('five_hour') && !clears.includes('seven_day');
 }
 
 // OAuth config (extracted from Claude Code). Client id + token endpoint are
