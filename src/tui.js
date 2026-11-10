@@ -1680,6 +1680,7 @@ export class TUI {
     else if (k === 'enter') {
       if (this.selAction === 'switch') {
         this._doSwitchSelection();
+        return;
       } else if (this.selAction === 'toggle') {
         this._doToggleDisabled(this.selIdx);
       } else if (this.selAction === 'login') {
