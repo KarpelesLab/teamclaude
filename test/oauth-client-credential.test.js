@@ -58,6 +58,7 @@ for (const path of [
   '/api/claude_code_grove',
   '/api/claude_code_penguin_mode',
   '/mcp-registry/v0/servers?limit=100',
+  '/api/web/domain_info?domain=example.com',
 ]) {
   test(`${path} keeps the client's own credential`, async () => {
     const { server: upstream, port, seen } = await echoAuthUpstream();
@@ -125,20 +126,23 @@ test('a preferred inference gateway does not receive client policy requests', as
   }
 });
 
-test('a client policy request without a bearer does not borrow a fleet credential', async () => {
-  const { server: upstream, port, seen } = await echoAuthUpstream();
-  try {
-    const listener = createProxyRequestListener({ accountManager: refusingManager, upstream: `http://127.0.0.1:${port}` });
-    assert.equal((await through(listener, '/api/claude_code/policy_limits')).status, 200);
-    assert.equal(seen.length, 1);
-    assert.equal(seen[0].authorization, null);
-    assert.equal(seen[0].apiKey, null);
-  } finally {
-    upstream.close();
-  }
-});
+for (const path of ['/api/claude_code/policy_limits', '/api/web/domain_info?domain=example.com']) {
+  test(`${path} without a bearer does not borrow a fleet credential`, async () => {
+    const { server: upstream, port, seen } = await echoAuthUpstream();
+    try {
+      const listener = createProxyRequestListener({ accountManager: refusingManager, upstream: `http://127.0.0.1:${port}` });
+      assert.equal((await through(listener, path)).status, 200);
+      assert.equal(seen.length, 1);
+      assert.equal(seen[0].url, path);
+      assert.equal(seen[0].authorization, null);
+      assert.equal(seen[0].apiKey, null);
+    } finally {
+      upstream.close();
+    }
+  });
+}
 
-for (const path of ['/api/eval-other/sdk-test', '/api/claude_code/policy_limits_extra', '/api/claude_code_inference']) {
+for (const path of ['/api/eval-other/sdk-test', '/api/claude_code/policy_limits_extra', '/api/claude_code_inference', '/api/web/domain_info_other']) {
   test(`${path} is outside the client control plane`, async () => {
     const { server: upstream, port, seen } = await echoAuthUpstream();
     try {
@@ -333,6 +337,7 @@ for (const path of [
   '/api/eval/sdk-test',
   '/api/eval-authed/sdk-test',
   '/mcp-registry/v0/servers?limit=100',
+  '/api/web/domain_info?domain=example.com',
 ]) {
   test(`with proxy.controlPlane "pool", ${path} gets the account token`, async () => {
     const { server: upstream, port, seen } = await echoAuthUpstream();

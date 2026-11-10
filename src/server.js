@@ -1731,7 +1731,7 @@ const CLIENT_CREDENTIAL_PATHS = [
 // lighter plan than the pooled accounts.
 const CONTROL_PLANE_PATHS = [
   '/api/claude_cli/', '/api/claude_code/policy_limits/', '/api/claude_code_grove/', '/api/claude_code_penguin_mode/',
-  '/api/eval/', '/api/eval-authed/', '/mcp-registry/v0/servers/',
+  '/api/eval/', '/api/eval-authed/', '/mcp-registry/v0/servers/', '/api/web/domain_info/',
 ];
 
 /**
