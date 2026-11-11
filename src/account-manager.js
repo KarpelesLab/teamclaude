@@ -3245,6 +3245,13 @@ export class AccountManager {
    */
   _preemptedBy(account, model = null, advisorModel = null, exclude = null, provider = this._selectingProvider ?? providerOf(account)) {
     if (this._isManualChoice(account, provider)) return null;
+    return this._outrankedByPriority(account, model, advisorModel, exclude);
+  }
+
+  /** The available account with a strictly lower priority value, whether or not
+   * `account` is the operator's manual choice.
+   * @param {Record<string, any>} account */
+  _outrankedByPriority(account, model = null, advisorModel = null, exclude = null) {
     return this.accounts.find(a => this._isAvailable(a, model, advisorModel)
       && !exclude?.has(a.index)
       && (a.priority || 0) < (account.priority || 0)) || null;
@@ -3259,9 +3266,17 @@ export class AccountManager {
    * available account outranks it on priority. Both are asked here through the
    * same helpers _select uses, so the flag cannot promise more than the selector
    * delivers.
+   *
+   * `manualSwitch` is for the callers that record a manual switch (the switch
+   * endpoint, the switch_account tool): with distributeSessions on, new
+   * conversations never read the manual choice, so it also asks whether a
+   * higher-priority account of the same provider takes them. A status listing or
+   * a session pin, which is routed whatever the priority, does not ask.
+   * @param {number} accountIndex
+   * @param {{manualSwitch?: boolean}} [options]
    * @returns {{eligible: boolean, reason?: string}}
    */
-  eligibility(accountIndex) {
+  eligibility(accountIndex, { manualSwitch = false } = {}) {
     const account = this.accounts[accountIndex];
     if (!account) return { eligible: false, reason: 'no such account' };
     // _isAvailable also clears an expired throttle, so the specific reasons below
@@ -3283,6 +3298,15 @@ export class AccountManager {
     const sooner = this._soonerResetPreemptor(account);
     if (sooner) {
       return { eligible: false, reason: `outranked by "${sooner.name}", whose weekly quota resets sooner (preferSoonestWeeklyReset)` };
+    }
+    // With distributeSessions on, a new conversation is placed within the best
+    // priority tier of its own provider and never reads the manual choice, so
+    // the hold above does not reach it.
+    const placed = manualSwitch && this.distributeSessions
+      ? this._outrankedByPriority(account, null, null, this._excludeOtherProviders(null, providerOf(account)))
+      : null;
+    if (placed) {
+      return { eligible: false, reason: `outranked by higher-priority account "${placed.name}" when distributeSessions places new conversations` };
     }
     return { eligible: true };
   }
