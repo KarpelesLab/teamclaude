@@ -402,6 +402,8 @@ Bodies are truncated past a size cap, and files older than the retention window 
 
 A request line whose response reported token usage ends with its prompt-cache figures: `cache r180k w3k in1k` is tokens read from the cache, written to it, and sent uncached (`k` from 1000 up). By the share read from the cache, r / (r + w + in), the TUI paints it green at 0.90 or more (hit), yellow from 0.50 (partial) and red below (miss), and dims it when the request neither read nor wrote the cache. A miss also ends with ` MISS`, so it can be found with grep in a log file, which has no colour. After a failover or a retry the figures are the last attempt's.
 
+A request line whose response was a JSON error from the upstream names its type after the status: `(404 thread_not_found, 0.3s)`. The name is `error.details.error_code` when the body has one, else `error.type`, kept only if it is a plain identifier (letters, digits, `_`, `.`, `-`) and cut to 32 characters; nothing else from the body is shown. Errors the proxy answers itself, non-JSON errors and bodies over 64 KiB are shown with the status alone.
+
 Claude Code's telemetry (`/api/event_logging/*`) is high-volume activity-log noise and is hidden from the log by default; see [`eventLogging`](configuration.md#fields) to block or show it instead.
 
 ## Request correlation
