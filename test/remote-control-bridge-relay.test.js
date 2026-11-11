@@ -42,9 +42,9 @@ function recordingUpstream() {
   }).then(r => ({ ...r, seen }));
 }
 
-async function through(accountManager, method, path, body) {
+async function through(accountManager, method, path, body, options = {}) {
   const { server: upstream, port, seen } = await recordingUpstream();
-  const listener = createProxyRequestListener({ accountManager, upstream: `http://127.0.0.1:${port}` });
+  const listener = createProxyRequestListener({ ...options, accountManager, upstream: `http://127.0.0.1:${port}` });
   const { server: proxy, port: proxyPort } = await listen(listener);
   try {
     const res = await fetch(`http://127.0.0.1:${proxyPort}${path}`, {
@@ -94,6 +94,28 @@ for (const [method, path] of [
   });
 }
 
+// Claude Code 2.1.322 enrolls a trusted device before opening Remote Control.
+// Enrollment must belong to the same client login as the bridge, even when
+// inference is pinned or the optional control plane uses the account pool.
+for (const path of [
+  '/api/auth/trusted_devices',
+  '/api/auth/trusted_devices?beta=true',
+  '/api/auth/trusted_devices/device_01',
+]) {
+  test(`POST ${path} enrolls under the client login despite pool mode and a pin`, async () => {
+    const body = JSON.stringify({ display_name: 'Claude Code test device' });
+    const { status, seen } = await through(refusingManager, 'POST', path, body, {
+      config: { proxy: { controlPlane: 'pool' } },
+      forcedPin: 'must-not-be-consulted',
+    });
+    assert.equal(status, 200);
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].authorization, 'Bearer client-own-token');
+    assert.equal(seen[0].url, path);
+    assert.equal(seen[0].body, body);
+  });
+}
+
 // The other side of the segment boundary. Each entry ends in '/', and only the
 // collection itself matches without it, so a path that merely shares the
 // letters is not the bridge and is served by the rotated fleet account like any
@@ -105,7 +127,7 @@ function fleetManager() {
   ], 0.98);
 }
 
-for (const path of ['/v1/sessionsX', '/v1/environmentsX/bridge']) {
+for (const path of ['/v1/sessionsX', '/v1/environmentsX/bridge', '/api/auth/trusted_devicesX']) {
   test(`${path} is not the bridge and still rotates`, async () => {
     const { status, seen } = await through(fleetManager(), 'GET', path);
     assert.equal(status, 200);
