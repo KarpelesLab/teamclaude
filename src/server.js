@@ -1754,7 +1754,11 @@ export function relayHttpForward(req, res, stripOverage = false, /** @type {Reco
 // does not take `/v1/sessionsX`. The entry without that slash, the collection
 // itself, matches as well, since a session is created with a bare
 // POST /v1/sessions (classificationPath has already dropped any `?beta=true`).
+// Trusted-device enrollment must use the same login as Remote Control. A
+// pooled token enrolls the device under a different account, so the bridge
+// rejects it even after the client signs in again (observed with CC 2.1.322).
 const CLIENT_CREDENTIAL_PATHS = [
+  '/api/auth/trusted_devices/',
   '/v1/code/', '/api/oauth/', '/api/frame/', '/v1/mcp_servers/', '/v1/environments/', '/v1/sessions/', '/v2/session_ingress/', '/v2/ccr-sessions/',
 ];
 
