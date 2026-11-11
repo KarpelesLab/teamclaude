@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { findFamilyBlock, isFableModel, modelGlobOverlaps, modelLabel, NestedFieldFinder, parseRequestEffort, parseRequestModel, parseRequestStream, TopLevelFieldFinder } from '../src/model.js';
+import { findFamilyBlock, isFableModel, modelGlobOverlaps, modelLabel, NestedFieldFinder, parseAdvisorModel, parseRequestEffort, parseRequestModel, parseRequestStream, TopLevelFieldFinder } from '../src/model.js';
 
 test('isFableModel matches the Fable family only', () => {
   assert.equal(isFableModel('claude-fable-5'), true);
@@ -16,6 +16,16 @@ test('parseRequestModel reads the top-level model', () => {
   assert.equal(parseRequestModel('{"max_tokens":1}'), null);
   assert.equal(parseRequestModel(''), null);
   assert.equal(parseRequestModel(null), null);
+});
+
+test('model finders decode escaped keys and values before routing', () => {
+  const slash = String.fromCharCode(92);
+  const body = JSON.stringify({ model: 'gemini-3-pro' })
+    .replace('model', `mod${slash}u0065l`).replace('gemini-', `gemini${slash}u002d`);
+  const advisor = JSON.stringify({ tools: [{ type: 'advisor_20260301', model: 'gemini-3-pro' }] })
+    .replace('model', `mod${slash}u0065l`).replace('gemini-', `gemini${slash}u002d`);
+  assert.equal(parseRequestModel(body), 'gemini-3-pro');
+  assert.equal(parseAdvisorModel(advisor), 'gemini-3-pro');
 });
 
 test('parseRequestModel ignores a "model" key nested in conversation content', () => {

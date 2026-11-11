@@ -6,8 +6,18 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   compareVersions, installKind, fetchLatestVersion, checkForUpdate, runUpdate, autoUpdate, isReleaseVersion,
-  resolveVersionLabel, updateAvailableFromCache, updateCommandFor, PKG_NAME,
+  resolveVersionLabel, updateAvailableFromCache, updateCommandFor, isForkBuild, PKG_NAME,
 } from '../src/updater.js';
+
+// ── isForkBuild ─────────────────────────────────────────────
+
+test('isForkBuild names only the -ipm. suffixed versions', () => {
+  assert.equal(isForkBuild('1.1.26-ipm.12'), true);
+  assert.equal(isForkBuild('2.0.0-ipm.1'), true);
+  for (const v of ['1.1.26', '1.1.27', '1.1.26-beta.1', null, undefined, 42]) {
+    assert.equal(isForkBuild(v), false, `${v}`);
+  }
+});
 
 // ── compareVersions ─────────────────────────────────────────
 
@@ -191,6 +201,32 @@ test('runUpdate spawns nothing for a version that is not a release version', asy
 function nonGitRoot() {
   return mkdtempSync(join(tmpdir(), 'tc-root-'));
 }
+
+// The registry's `latest` is upstream's: an -ipm. fork build must never be
+// auto-updated onto it, whether or not auto-update is enabled — and the
+// registry is not even consulted.
+test('autoUpdate never replaces a fork build with upstream, and says so once per process', async () => {
+  const root = nonGitRoot();
+  writeFileSync(join(root, 'package.json'), JSON.stringify({ version: '1.1.26-ipm.12' }));
+  const logs = [];
+  let checked = 0;
+  let installed = 0;
+  try {
+    const opts = {
+      root, uid: 1000, log: (m) => logs.push(m),
+      check: async () => { checked++; return { current: '1.1.26-ipm.12', latest: '99.0.0', updateAvailable: true }; },
+      kind: () => 'global',
+      install: () => { installed++; return true; },
+    };
+    assert.equal((await autoUpdate(opts)).skipped, 'fork-build');
+    assert.equal((await autoUpdate({ ...opts, config: { autoUpdate: false } })).skipped, 'fork-build',
+      'an explicit autoUpdate=false must not change the answer');
+    assert.equal(checked, 0, 'the registry is not consulted for a fork build');
+    assert.equal(installed, 0);
+    assert.equal(logs.length, 1, 'the notice prints once per process');
+    assert.match(logs[0], /ipm fork build \(1\.1\.26-ipm\.12\)/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 
 test('autoUpdate skips a malformed registry version with a log line and installs nothing', async () => {
   const root = nonGitRoot();

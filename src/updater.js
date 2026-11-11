@@ -28,6 +28,18 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 // reason a fixed-width caller has no room left.
 const LABEL_MAX = 32;
 
+/**
+ * Whether `version` is an ipm fork build — the `-ipm.` suffix (e.g.
+ * `1.1.26-ipm.12`). Fork builds carry features upstream does not (client
+ * routes, the OpenAI-chat adapter), and the registry's `latest` tag is
+ * upstream's, so neither update path may replace a fork build with it: a fork
+ * updates deliberately, by naming the exact `-ipm.` version to install.
+ * @param {unknown} version
+ */
+export function isForkBuild(version) {
+  return typeof version === 'string' && version.includes('-ipm.');
+}
+
 const pexec = promisify(execFile);
 
 /** Package root = one directory above this file's src/ directory. */
@@ -261,6 +273,8 @@ export function runUpdate(version = 'latest', { spawnImpl = spawn } = {}) {
 // The root warning is printed once per process: autoUpdate runs at startup and
 // again at session end, and a daemon would otherwise say it every day.
 let rootWarned = false;
+// Same for the fork-build notice.
+let forkWarned = false;
 
 /**
  * The automatic path used at startup / session-end. Skips dev checkouts and
@@ -291,6 +305,18 @@ export async function autoUpdate({
   check = checkForUpdate, kind = installKind, install = runUpdate,
 } = {}) {
   if (existsSync(join(root, '.git'))) return { skipped: 'git' }; // dev checkout — never touch
+  // A fork build is never replaced by upstream's `latest`, which lacks the
+  // fork's features — before the opt-out read, so the answer is the same
+  // whether or not auto-update is disabled, and before the registry check,
+  // which has nothing to offer this install.
+  const current = currentVersion(root);
+  if (isForkBuild(current)) {
+    if (!forkWarned) {
+      forkWarned = true;
+      log(`[TeamClaude] This is an ipm fork build (${current}); upstream releases lack fork features, so auto-update leaves it alone. Update deliberately: npm install -g ${PKG_NAME}@<version>-ipm.<n>`);
+    }
+    return { skipped: 'fork-build' };
+  }
   if (envVar('DISABLE_AUTOUPDATE') || config.autoUpdate === false) {
     return { skipped: 'disabled' };
   }

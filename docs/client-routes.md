@@ -56,7 +56,9 @@ tools and `getRoutes()` never see them.
 
 ## End-user identity upstream
 
-Every Anthropic-path request that carries a client key is stamped with a stable per-user tag in
+Every Anthropic inference request (`POST /v1/messages` served by an Anthropic account — not
+`count_tokens`, not `GET /v1/models`, and not an `openai-chat` account) that carries a client key
+is stamped with a stable per-user tag in
 `metadata.user_id` (`gateway_user: "u_<sha256 of the key name, 16 hex>"`), on any pool — routes or
 not. The key name is hashed because user_id must not carry PII, and the name — not the key — is
 what survives a re-mint. Claude Code's own `device_id`, session id and `account_uuid` pass through
@@ -92,7 +94,7 @@ When the seat cannot serve, the answer always comes from the seat itself:
 | Seat state | Answer |
 |---|---|
 | Spent: upstream sent a 429 rejecting a quota window, and that window's reset is still ahead | 429 with upstream's own `anthropic-ratelimit-unified-*` headers and `x-should-retry: false`. The 429 that reports the spend gets this answer at once. Later requests get it with nothing sent upstream. A `7d_oi` rejection covers Fable requests only. |
-| Spent pinned account in a multi-account route, with a servable sibling | `recommend`: the first response is an actionable 429 handoff offer with `x-should-retry: false` and no unified headers, so Claude Code shows the handoff and cold-cache choices instead of its generic plan-limit banner. The next prompt confirms and switches once. `force`: the same request retries immediately on the sibling with its body unchanged. |
+| Spent pinned account in a multi-account route, with a servable sibling | `recommend`: the first response is an actionable 429 handoff offer with `x-should-retry: false` and no unified headers, so Claude Code shows the handoff and cold-cache choices instead of its generic plan-limit banner. Its message names the currently servable sibling first, then gives the reset blocking the pinned account for this request, so the reset does not read as a key-wide outage; the destination is selected again when the next request arrives. The next prompt confirms and switches once. `force`: the same request retries immediately on the sibling with its body unchanged. |
 | Throttled (rate-limit hold) | 429 with `retry-after`. It stays retryable. |
 | Operator budget cap (`maxUsage`, `maxSpend`) | 429 with `x-should-retry: false`. No unified headers are made up. |
 | Disabled, in error, credential or routing failure, route unresolved or ambiguous | 503 with `x-should-retry: false` |

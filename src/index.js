@@ -40,7 +40,7 @@ import { SessionTitles } from './session-titles.js';
 import { captureEarlyConsole } from './early-log.js';
 import { RemoteControl, createAttachSession } from './tui-remote.js';
 import { SxManager } from './sx.js';
-import { autoUpdate, checkForUpdate, currentVersion, resolveVersionLabel, runUpdate, installKind, updateAvailableFromCache, updateCommandFor, PKG_NAME } from './updater.js';
+import { autoUpdate, checkForUpdate, currentVersion, resolveVersionLabel, runUpdate, installKind, isForkBuild, updateAvailableFromCache, updateCommandFor, PKG_NAME } from './updater.js';
 import { renderStatus, formatPercent } from './status-renderer.js';
 import { sanitizeText, safeLine } from './safe-text.js';
 import { modelLabel } from './model.js';
@@ -2552,6 +2552,14 @@ async function updateCommand() {
   const kind = await installKind();
   if (kind === 'git') {
     console.log('This is a git checkout — update it with `git pull`, not npm.');
+    return;
+  }
+  // The registry's `latest` is upstream's, and upstream lacks this fork's
+  // features: an ipm build only ever moves to a fork release named exactly.
+  // Before the pnpm branch too — its message points at the same upstream tag.
+  if (isForkBuild(cur)) {
+    console.log(`This is an ipm fork build (${cur}); upstream releases lack fork features, so this command will not install one over it.`);
+    console.log(`Update deliberately to a fork release: npm install -g ${PKG_NAME}@<version>-ipm.<n>`);
     return;
   }
   // `npm install -g` would put a second copy in npm's global directory and

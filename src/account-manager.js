@@ -16,6 +16,7 @@ import { forecastWindow } from './forecast.js';
 import { safeLine } from './safe-text.js';
 import { parseRoutingUrl, describeRouting, routingToUrl, isRoutingFailure } from './account-routing.js';
 import { isSelfProxy } from './upstream-proxy.js';
+import { accountSupportsModel } from './openai-chat-adapter.js';
 import { envVar } from './brand.js';
 /** @typedef {import('./session-tracker.js').Observation} Observation */
 
@@ -364,6 +365,65 @@ export function accountRouting(acct, listener = null) {
   }
 }
 
+// RFC 7230 token: the only legal HTTP header name. An adapterHeaders entry
+// whose name is not a token, or whose value Node's HTTP client cannot write,
+// would throw inside the request on every call the account serves — or worse,
+// smuggle an extra header line — so it is refused here, once, at account load.
+const HEADER_NAME = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+// Node's own header-value rule (_http_common): a value is tab, visible ASCII,
+// or Latin-1 — nothing else. CR/LF are the smuggle case, but the other control
+// characters and any code point beyond Latin-1 (an emoji, say) throw
+// ERR_INVALID_CHAR just the same, so the check is the whole rule, not CR/LF.
+const HEADER_VALUE = /[^\t\x20-\x7e\x80-\xff]/;
+
+/**
+ * Server-owned headers this account adds to every OpenAI-chat upstream request
+ * (accounts[].adapterHeaders) — e.g. the Gemini admission header the
+ * Antigravity sidecar requires, `x-bridge-client-ip: 127.0.0.1`. Server-owned
+ * means the client's own headers can never replace them: server.js applies
+ * them after the client-header copy, evicting any same-named client header.
+ * Only a plain object of RFC 7230 header names — unique ignoring case — to
+ * string values Node's HTTP client can write is accepted; anything else is
+ * dropped with one line, since one malformed
+ * entry must not take down fleet construction. A copy is returned so a later
+ * edit of the config object cannot mutate the running account. The
+ * constructor and the config reload both come through here so a value refused
+ * at startup is refused on reload too.
+ * @param {Record<string, any>} acct
+ * @returns {Record<string, string>|null}
+ */
+export function accountAdapterHeaders(acct) {
+  const raw = acct?.adapterHeaders;
+  if (raw == null) return null;
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    console.log(`[TeamClaude] Account "${safeLine(acct?.name, 64)}": ignoring adapterHeaders — it must be an object of header names to string values`);
+    return null;
+  }
+  /** @type {Record<string, string>} */
+  const out = {};
+  const seen = new Set();
+  let dropped = 0;
+  for (const [name, value] of Object.entries(raw)) {
+    // Header names are case-insensitive on the wire: a second entry differing
+    // only in case would silently evict the first at send time (server.js
+    // matches case-insensitively), so it is refused here instead.
+    const lower = name.toLowerCase();
+    // `__proto__` is a legal RFC 7230 name but assigning it to a plain object
+    // runs the prototype setter, which ignores a string: the entry would vanish
+    // without a warning. Refuse it like any other malformed name.
+    if (name === '__proto__' || seen.has(lower) || !HEADER_NAME.test(name) || typeof value !== 'string' || HEADER_VALUE.test(value)) {
+      dropped++;
+      continue;
+    }
+    seen.add(lower);
+    out[name] = value;
+  }
+  if (dropped) {
+    console.log(`[TeamClaude] Account "${safeLine(acct?.name, 64)}": ignoring ${dropped} adapterHeaders ${dropped === 1 ? 'entry' : 'entries'} — names must be valid header names, unique ignoring case, and values strings without control characters or code points beyond Latin-1`);
+  }
+  return Object.keys(out).length ? out : null;
+}
+
 // Build a fresh in-memory account record from a config/disk account object.
 // Shared by the constructor and addAccount() so the field set can never drift
 // between startup accounts and runtime-added ones (a divergence here once left
@@ -443,6 +503,16 @@ function makeAccount(acct, index, listener = null) {
     // between providers keeps saying the same thing.
     autoRedeemReset: acct.autoRedeemReset !== false,
     upstream: acct.upstream || null,
+    adapter: acct.adapter ?? null,
+    modelPrefix: acct.modelPrefix ?? null,
+    serverHeader: acct.serverHeader ?? null,
+    // Server-owned headers added to every OpenAI-chat upstream request
+    // (accounts[].adapterHeaders) — the Gemini admission header the sidecar
+    // requires is one. Validated and copied by accountAdapterHeaders; server.js
+    // applies them after the client-header copy, so the client can never
+    // replace them. `null`, not `{}`, for "none": sync-accounts tells a
+    // removal apart from an empty set by the same value the constructor reads.
+    adapterHeaders: accountAdapterHeaders(acct),
     modelMap: acct.modelMap || null,
     // Fields to drop from request bodies for this account (third-party upstreams
     // that reject e.g. `context_management`). See server.js stripBodyFields.
@@ -3677,6 +3747,7 @@ export class AccountManager {
    * route — or a route that lists no accounts — it falls back to the per-account
    * `models` ownership claim (deprecated — use `routes` instead). */
   _routeAllows(account, model) {
+    if (!accountSupportsModel(account, model)) return false;
     const route = this._routeForModel(model);
     if (route && route.accounts.length) {
       return route.accounts.includes(account.name) || route.accounts.includes(String(account.index));
@@ -5265,7 +5336,12 @@ export class AccountManager {
           const holdMs = Number.isFinite(err.retryAfterMs) ? err.retryAfterMs : REFRESH_429_HOLD_MS;
           const until = Date.now() + holdMs;
           account._refreshHeldUntil = until;
-          console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}": the token endpoint asked to wait (429); no refresh before ${new Date(until).toISOString()}`);
+          // An extreme Retry-After overflows Date's range; formatting it would
+          // throw RangeError here and reject the refresh handling even though
+          // the hold above already landed. Log the raw timestamp instead.
+          const untilDate = new Date(until);
+          const untilText = Number.isNaN(untilDate.getTime()) ? `timestamp ${until} ms` : untilDate.toISOString();
+          console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}": the token endpoint asked to wait (429); no refresh before ${untilText}`);
         }
         const isAuthRejection = err.status === 400 || err.status === 401 || err.status === 403;
         if (isAuthRejection) {

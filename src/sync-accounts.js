@@ -3,7 +3,7 @@ import { sameIdentity } from './identity.js';
 import { safeLine } from './safe-text.js';
 import { removedAccountIds, addedAccountIds, configIndexFor } from './account-pairing.js';
 import { ensureAccountIds } from './account-id.js';
-import { accountSwitchThreshold, accountAllowsExtraUsage, accountRouting } from './account-manager.js';
+import { accountSwitchThreshold, accountAllowsExtraUsage, accountRouting, accountAdapterHeaders } from './account-manager.js';
 import { localListener } from './upstream-proxy.js';
 
 /**
@@ -161,6 +161,14 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     if (mgr.upstream !== (diskAcct.upstream || null)
       || mgr.messageThreads !== (diskAcct.messageThreads === true)) mgr.threadRefusalReported = false;
     mgr.upstream = diskAcct.upstream || null;
+    mgr.adapter = diskAcct.adapter ?? null;
+    mgr.modelPrefix = diskAcct.modelPrefix ?? null;
+    mgr.serverHeader = diskAcct.serverHeader ?? null;
+    // Read per request off this object (server.js forwardRequest), so a disk
+    // edit must land here to take effect on reload. Through the constructor's
+    // own normalization, so a malformed value is dropped on reload exactly as
+    // at startup, and a removal reverts the account to no extra headers.
+    mgr.adapterHeaders = accountAdapterHeaders(diskAcct);
     mgr.modelMap = diskAcct.modelMap || null;
     // Read per request like the two above (server.js rewriteRequestBody), and
     // missing from this sync until #374: an edit waited for a restart.
@@ -174,6 +182,10 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     // the same shape a hand edit produces.
     if (cfgAcct) {
       if (diskAcct.upstream) cfgAcct.upstream = diskAcct.upstream; else delete cfgAcct.upstream;
+      if (diskAcct.adapter != null) cfgAcct.adapter = diskAcct.adapter; else delete cfgAcct.adapter;
+      if (diskAcct.modelPrefix != null) cfgAcct.modelPrefix = diskAcct.modelPrefix; else delete cfgAcct.modelPrefix;
+      if (diskAcct.serverHeader != null) cfgAcct.serverHeader = diskAcct.serverHeader; else delete cfgAcct.serverHeader;
+      if (diskAcct.adapterHeaders != null) cfgAcct.adapterHeaders = diskAcct.adapterHeaders; else delete cfgAcct.adapterHeaders;
       if (diskAcct.modelMap) cfgAcct.modelMap = diskAcct.modelMap; else delete cfgAcct.modelMap;
       if (diskAcct.stripRequestFields) cfgAcct.stripRequestFields = diskAcct.stripRequestFields; else delete cfgAcct.stripRequestFields;
       if (diskAcct.messageThreads === true) cfgAcct.messageThreads = true; else delete cfgAcct.messageThreads;

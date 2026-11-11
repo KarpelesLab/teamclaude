@@ -164,6 +164,37 @@ test('AC3: a spent seat answers 429 with upstream\'s unified headers and x-shoul
   });
 });
 
+// A 429 with x-should-retry: false is about the request, not the account — the
+// quota read already ignores it. An overall `rejected` with a future reset but
+// no rejected window must not be recorded as the model bucket being spent:
+// a bound request would get the synthesized `spent` answer instead of
+// upstream's own, and the bucket would stay blocked locally until the reset.
+test('AC3: a non-retryable 429 with an overall rejected status is relayed, not recorded as spent', async () => {
+  const reset = sec(Date.now() + 3 * HOUR);
+  let saHits = 0;
+  const handler = (who, _req, res) => {
+    if (who === 'sa' && saHits++ === 0) {
+      res.writeHead(429, {
+        'content-type': 'application/json',
+        'x-should-retry': 'false',
+        'anthropic-ratelimit-unified-status': 'rejected',
+        'anthropic-ratelimit-unified-reset': reset,
+      });
+      res.end('{"type":"error","error":{"type":"rate_limit_error","message":"fast mode needs credits"}}');
+      return;
+    }
+    ok(res);
+  };
+  await withGateway({ handler }, async ({ send, seen }) => {
+    const first = await send({ key: KEYS.ana });
+    assert.equal(first.status, 429);
+    assert.match(first.json.error.message, /fast mode needs credits/, 'the bound request gets upstream\'s own answer, not a synthesized spent seat');
+    const second = await send({ key: KEYS.ana });
+    assert.equal(second.status, 200, 'the model bucket was not blocked locally');
+    assert.equal(seen.filter((s) => s.who === 'sa').length, 2, 'both requests reached upstream');
+  });
+});
+
 test('AC3: a success on the seat (an operator probe) clears the spent reading', async () => {
   let spentNow = true;
   const handler = (who, _req, res) => {

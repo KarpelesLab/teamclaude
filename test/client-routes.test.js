@@ -215,9 +215,12 @@ test('answers: status codes and the headers Claude Code keys on', () => {
   assert.equal(offered.status, 429);
   assert.equal(offered.headers['x-should-retry'], 'false');
   assert.equal(offered.headers['anthropic-ratelimit-unified-5h-reset'], undefined, 'the offer must not trigger the generic plan-limit banner');
+  assert.ok(offeredMessage.startsWith('You can keep working by moving to another assigned account; "qb" appears available. The account "qa", pinned to this conversation, cannot serve this request because its quota is exhausted until 2030-03-17T17:46:40.000Z.'), offeredMessage);
   assert.match(offeredMessage, /\/ipm:handoff/);
   assert.match(offeredMessage, /start a new conversation/);
-  assert.match(offeredMessage, /reprocess the full conversation/);
+  assert.match(offeredMessage, /next assigned account that appears available, currently "qb"/);
+  assert.match(offeredMessage, /on the next assigned account that appears available at that time/);
+  assert.match(offeredMessage, /reprocess the full conversation at full input-token cost/);
   assert.match(offeredMessage, /cold prompt cache/);
   assert.match(offeredMessage, /next prompt confirms/);
   assert.match(offeredMessage, /No additional confirmation prompt is required/);
@@ -226,6 +229,7 @@ test('answers: status codes and the headers Claude Code keys on', () => {
     seat: 'seat-q', verdict: { kind: 'spent', rejection }, queue: { pinned: 'qa', next: null },
   });
   assert.equal(noSibling.headers['anthropic-ratelimit-unified-5h-reset'], '1900000000', 'no offer keeps the ordinary spent response');
+  assert.equal(JSON.parse(noSibling.body).error.message, 'Your Claude seat "seat-q" is out of quota until 2030-03-17T17:46:40.000Z. This conversation is pinned to "qa", and no other account on this seat can serve now. Use `cg kimi on` to keep working meanwhile.');
 
   const throttled = seatAnswer(SEAT_REASONS.throttled, { verdict: { kind: 'throttled', retryAfter: 12 } });
   assert.equal(throttled.status, 429);

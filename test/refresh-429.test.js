@@ -87,6 +87,28 @@ test('a 429 without Retry-After still holds the refreshes for a while', async ()
   assert.strictEqual(calls, 1);
 });
 
+// An extreme Retry-After lands `until` beyond Date's range: formatting it with
+// toISOString() threw RangeError out of the refresh error handling, even though
+// the hold itself had already been recorded.
+test('an extreme Retry-After still records the hold, logging the raw timestamp', async () => {
+  let calls = 0;
+  const origError = console.error;
+  const lines = [];
+  console.error = (...a) => lines.push(a.join(' '));
+  try {
+    const m = mgr(async () => { calls++; throw rateLimited(9_999_999_999_999_000); });
+    await m.ensureTokenFresh(0);
+    await m.ensureTokenFresh(0, true);
+    assert.strictEqual(calls, 1, 'the hold took effect despite the unformattable date');
+    assert.ok(m.accounts[0]._refreshHeldUntil > Date.now());
+  } finally {
+    console.error = origError;
+  }
+  const line = lines.find((l) => l.includes('asked to wait (429)'));
+  assert.ok(line, 'the hold was announced');
+  assert.match(line, /no refresh before timestamp \d+ ms/, 'an out-of-Date-range hold logs the raw timestamp, not an ISO throw');
+});
+
 test('the hold lifts once the Retry-After has passed, and a success clears it', async () => {
   let calls = 0;
   let fail = true;

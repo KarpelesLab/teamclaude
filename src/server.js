@@ -34,6 +34,7 @@ import { codexSpentWindows, isAccountWideCodexWindow } from './codex-quota.js';
 import { atomicConfigUpdate } from './config.js';
 import { ConfigOpError, setThreshold, thresholdRatio } from './config-ops.js';
 import { envVar, legacyControlUrl } from './brand.js';
+import { accountSupportsModel, createOpenAIChatStream, effectiveRequestModels, isOpenAIChatAccount, rewriteOpenAIChatRequest, translateOpenAIChatResponse } from './openai-chat-adapter.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 
@@ -1837,11 +1838,12 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       }
       const body = Buffer.concat(bodyChunks);
 
-      const model = modelFinder.done ? modelFinder.value : parseRequestModel(body);
+      const parsedModel = modelFinder.done ? modelFinder.value : parseRequestModel(body);
       // An advisor request (Claude Code's advisor tool) carries a SECOND model
       // nested in tools[]; the advisor sub-inference runs on the selected
       // account, so selection must be eligible for it too (issue #98).
-      const advisorModel = parseAdvisorModel(body);
+      const parsedAdvisorModel = parseAdvisorModel(body);
+      const { model, advisorModel } = effectiveRequestModels(body, parsedModel, parsedAdvisorModel);
 
       // What session-aware routing pins on. The session id names the CLIENT
       // session, which is one id for a Claude Code session AND every subagent it
@@ -3363,6 +3365,26 @@ function respondUnrenewed(res, ctx, accountManager) {
   }
 }
 
+/** @param {import('node:http').ServerResponse} res @param {Record<string, any>} ctx @param {string} message */
+function respondInvalidRequest(res, ctx, message) {
+  ctx.status = 400;
+  ctx.delivered = true;
+  if (res.headersSent || clientGone(res)) return;
+  res.writeHead(400, { 'Content-Type': 'application/json', 'x-should-retry': 'false' });
+  res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message } }));
+}
+
+/** @param {Record<string, any>} account @param {string} configuredUpstream */
+function openAIChatUpstreamUrl(account, configuredUpstream) {
+  const url = new URL(upstreamFor(account, configuredUpstream));
+  const base = url.pathname.replace(/\/+$/, '');
+  url.pathname = base.endsWith('/v1/chat/completions') ? base
+    : base.endsWith('/v1') ? `${base}/chat/completions`
+      : `${base}/v1/chat/completions`;
+  url.search = '';
+  return url.toString();
+}
+
 export async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, useSx) {
   const maxRetries = accountManager.accounts.length;
   // This function is exported, so a caller may hand us a ctx built elsewhere.
@@ -3450,6 +3472,16 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       },
     }));
     return;
+  }
+  if (account && !ctx.bound
+      && (!accountSupportsModel(account, ctx.model) || !accountSupportsModel(account, ctx.advisorModel))) {
+    if (ctx.pinnedIndex != null) {
+      return respondInvalidRequest(res, ctx,
+        `Pinned account "${safeLine(account.name, 64)}" with adapter "${safeLine(account.adapter || 'anthropic', 64)}" cannot serve model "${safeLine(ctx.model, 128)}".`);
+    }
+    // A reload can change an account's adapter after an earlier selection picked it.
+    ctx.tried.add(account.index);
+    return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
   }
   if (!account && ctx.bound && ctx.pinnedIndex == null) {
     // A multi-account seat with nothing left to try: the seat's own answer,
@@ -3641,6 +3673,18 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     }
   }
 
+  let openAIChatBody = null;
+  if (isOpenAIChatAccount(account)) {
+    if (req.method !== 'POST' || classificationPath(req.url) !== '/v1/messages') {
+      return respondInvalidRequest(res, ctx, 'openai-chat supports POST /v1/messages only; count_tokens is unavailable.');
+    }
+    try {
+      openAIChatBody = rewriteOpenAIChatRequest(body, account);
+    } catch (err) {
+      return respondInvalidRequest(res, ctx, err instanceof Error ? err.message : String(err));
+    }
+  }
+
   // Track which account handles this request
   ctx.account = account.name;
   // Pin this conversation to the serving account for the model's weekly bucket
@@ -3710,8 +3754,32 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // both use a bearer token, Anthropic API keys use x-api-key, and Codex also
   // needs ChatGPT-Account-Id to scope the token to one account.
   applyAuthHeaders(headers, account);
+  if (isOpenAIChatAccount(account)) {
+    delete headers['x-api-key'];
+    headers.authorization = `Bearer ${account.credential}`;
+    if (account.serverHeader != null) headers.server = String(account.serverHeader);
+    // Server-owned per-account headers (accounts[].adapterHeaders) — the
+    // Gemini admission header the Antigravity sidecar requires is one. Applied
+    // AFTER the client-header copy above, and any client-sent header of the
+    // same name is evicted first (the copy keeps the client's casing, so match
+    // case-insensitively): these belong to the operator, and a client must not
+    // replace or duplicate them. This block runs on every attempt — retries
+    // re-enter forwardRequest and rebuild the header set — so every upstream
+    // try carries them.
+    if (account.adapterHeaders) {
+      for (const [name, value] of Object.entries(account.adapterHeaders)) {
+        const lower = name.toLowerCase();
+        for (const existing of Object.keys(headers)) {
+          if (existing.toLowerCase() === lower) delete headers[existing];
+        }
+        headers[name] = value;
+      }
+    }
+  }
 
-  const upstreamUrl = `${upstreamFor(account, upstream)}${req.url}`;
+  const upstreamUrl = isOpenAIChatAccount(account)
+    ? openAIChatUpstreamUrl(account, upstream)
+    : `${upstreamFor(account, upstream)}${req.url}`;
   const method = req.method;
 
   // An upstream that keeps no thread state would receive only this turn's delta
@@ -3748,7 +3816,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
 
   // Every rewrite below runs inside rewriteRequestBody (exported for tests);
   // Content-Length is refreshed below because the body can shrink.
-  let sendBody = rewriteRequestBody(body, account, req.url, req.headers['content-type']);
+  let sendBody = openAIChatBody || rewriteRequestBody(body, account, req.url, req.headers['content-type']);
   // End-user identity (IPM fork, user-identity.js): a request carrying a client
   // key is stamped with the stable hashed user tag in metadata.user_id, so
   // upstream attributes abuse per person rather than per seat. Inference calls
@@ -3757,7 +3825,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // requests carry no client and go unstamped. The stamp validates its own
   // splice (full parse + top-level check) and sends the original body on any
   // doubt.
-  if (ctx.client && ctx.provider === DEFAULT_PROVIDER && isCompletionPath(req.url)) {
+  if (!isOpenAIChatAccount(account) && ctx.client && ctx.provider === DEFAULT_PROVIDER && isCompletionPath(req.url)) {
     sendBody = stampGatewayUser(sendBody, ctx.client);
   }
   // If the body changed length (sanitize, model rewrite, or field strip), update
@@ -3823,6 +3891,15 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       ctx.tried.add(account.index);
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
     }
+    if (!accountSupportsModel(account, ctx.model) || !accountSupportsModel(account, ctx.advisorModel)) {
+      accountManager.release(account.index, { successful: false });
+      if (ctx.bound) return respondSeat(res, ctx, { kind: 'unavailable', reason: 'model-adapter' }, account.name, accountManager, account.index);
+      if (ctx.pinnedIndex != null) {
+        return respondInvalidRequest(res, ctx, `Pinned account "${safeLine(account.name, 64)}" cannot serve this model after its adapter was reloaded.`);
+      }
+      ctx.tried.add(account.index);
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
+    }
     let upstreamRes;
     let admittedLoad = 0;
     try {
@@ -3880,7 +3957,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // headers and all, so a request bound to this seat gets upstream's own
     // answer until the window resets. For a bound request it is the answer now:
     // a spent seat will not come back inside any wait this proxy could hold.
-    const seatRejection = upstreamRes.status === 429 && providerOf(account) === DEFAULT_PROVIDER
+    // Never for a non-retryable 429: like the quota read above, that refusal is
+    // about the request, and an overall `rejected` with no rejected window
+    // would otherwise mark the model's bucket — a pinned request would get
+    // `spent` instead of upstream's own answer, and later requests would be
+    // blocked locally until the reset.
+    const seatRejection = upstreamRes.status === 429 && !nonRetryable429 && providerOf(account) === DEFAULT_PROVIDER
       ? recordSeatRejection(account, rateLimitHeaders, ctx.model, (/** @type {string|null} */ m) => accountManager._weeklyBucketFor(m))
       : null;
     if (seatRejection && ctx.bound) {
@@ -4470,7 +4552,11 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       const l = getLog();
       const bw = l ? l.bodyWriter('RESPONSE BODY (streamed)', contentType) : null;
       try {
-        await streamResponse(upstreamBody, res, account.index, accountManager, bw, ctx.onUsage, ctx.pinKey, ctx.model, ctx.onMessage, finding => reportRefusal(account.name, finding));
+        if (isOpenAIChatAccount(account) && upstreamRes.status < 400) {
+          await streamOpenAIChatResponse(upstreamBody, res, account.index, accountManager, bw, ctx.onUsage, ctx.pinKey, ctx.model, ctx.onMessage);
+        } else {
+          await streamResponse(upstreamBody, res, account.index, accountManager, bw, ctx.onUsage, ctx.pinKey, ctx.model, ctx.onMessage, finding => reportRefusal(account.name, finding));
+        }
         // Reached only when the stream completed. A stream that dies upstream
         // throws out of streamResponse, so it never marks itself delivered —
         // which is the failure the token counters cannot see, since a stream
@@ -4493,10 +4579,20 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       if (upstreamRes.status >= 400) {
         reportUpstreamError(upstreamRes.status, account.name, upstreamErrorFromBody(buf));
       }
-      extractUsageFromBody(buf, account.index, accountManager, ctx.onUsage, ctx.pinKey, ctx.model, ctx.onMessage, finding => reportRefusal(account.name, finding));
+      let responseBody = buf;
+      if (isOpenAIChatAccount(account) && upstreamRes.status < 400) {
+        const translated = translateOpenAIChatResponse(JSON.parse(buf.toString('utf8')), ctx.model);
+        responseBody = Buffer.from(JSON.stringify(translated), 'utf8');
+        if (translated.id) ctx.onMessage?.(translated.id);
+        if (translated.usage) {
+          settleOpenAIChatUsage(account.index, accountManager, ctx.onUsage, ctx.pinKey, ctx.model, translated.usage);
+        }
+      } else {
+        extractUsageFromBody(buf, account.index, accountManager, ctx.onUsage, ctx.pinKey, ctx.model, ctx.onMessage, finding => reportRefusal(account.name, finding));
+      }
       const l = getLog();
-      if (l) { l.body('RESPONSE BODY', buf, contentType); l.end(); }
-      res.end(buf);
+      if (l) { l.body('RESPONSE BODY', responseBody, contentType); l.end(); }
+      res.end(responseBody);
       ctx.delivered = deliveredStatus;
     }
   } catch (err) {
@@ -4664,6 +4760,65 @@ export function readWithIdleTimeout(reader, ms) {
   // rejection so it can't surface as an unhandledRejection.
   read.catch(() => {});
   return Promise.race([read, timeout]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * @param {number} accountIndex @param {any} accountManager
+ * @param {((inputTokens: number, outputTokens: number, cacheReadTokens?: number, cacheCreationTokens?: number) => void)|null} onUsage
+ * @param {string|null} pinKey @param {string|null} model @param {Record<string, any>} usage
+ */
+function settleOpenAIChatUsage(accountIndex, accountManager, onUsage, pinKey, model, usage) {
+  accountManager.updateUsage(accountIndex, usage.input_tokens, usage.output_tokens);
+  onUsage?.(usage.input_tokens, usage.output_tokens, usage.cache_read_input_tokens || 0, 0);
+  accountManager.recordTokenUsage(accountIndex, pinKey, model, usage);
+}
+
+/** Relay an OpenAI Chat stream as Anthropic SSE and settle its final cumulative usage once.
+ * @param {ReadableStream<Uint8Array>} webStream @param {import('node:http').ServerResponse} res
+ * @param {number} accountIndex @param {any} accountManager @param {any} bodyWriter
+ * @param {((inputTokens: number, outputTokens: number, cacheReadTokens?: number, cacheCreationTokens?: number) => void)|null} [onUsage]
+ * @param {string|null} [pinKey] @param {string|null} [model] @param {((messageId: string) => void)|null} [onMessage]
+ */
+export async function streamOpenAIChatResponse(webStream, res, accountIndex, accountManager, bodyWriter, onUsage = null, pinKey = null, model = null, onMessage = null) {
+  /** @type {Record<string, any>|null} */
+  let finalUsage = null;
+  const translated = createOpenAIChatStream(webStream, /** @type {string} */ (model), {
+    onUsage: usage => { finalUsage = usage; },
+    onMessage: id => onMessage?.(id),
+  });
+  const reader = translated.getReader();
+  const onClose = () => { reader.cancel().catch(() => {}); };
+  res.once?.('close', onClose);
+  if (clientGone(res)) onClose();
+  const idleMs = resolveBodyIdleTimeout();
+  let errored = false;
+  try {
+    for (;;) {
+      const { done, value } = await readWithIdleTimeout(reader, idleMs);
+      if (done) break;
+      if (clientGone(res)) break;
+      const ok = res.write(value);
+      if (bodyWriter) bodyWriter.chunk(Buffer.from(value));
+      const logPending = bodyWriter?.drain?.();
+      if (logPending) await logPending;
+      if (!ok) {
+        await new Promise((/** @type {(value?: void|PromiseLike<void>) => void} */ resolve) => {
+          const done = () => { res.off('drain', done); res.off('close', done); resolve(); };
+          res.once('drain', done);
+          res.once('close', done);
+        });
+        if (clientGone(res)) break;
+      }
+    }
+  } catch (err) {
+    errored = true;
+    throw err;
+  } finally {
+    res.off?.('close', onClose);
+    if (finalUsage) settleOpenAIChatUsage(accountIndex, accountManager, onUsage, pinKey, model, finalUsage);
+    reader.cancel().catch(() => {});
+    if (!errored && !res.writableEnded) res.end();
+  }
 }
 
 /**
@@ -4926,6 +5081,7 @@ function extractUsageFromBody(buffer, accountIndex, accountManager, onUsage = nu
 // Each step is a no-op returning the same Buffer when it has nothing to do,
 // so untouched bodies keep their exact bytes.
 export function rewriteRequestBody(body, account, url, contentType) {
+  if (isOpenAIChatAccount(account)) return rewriteOpenAIChatRequest(body, account);
   let sendBody = body;
   // The rewrites below are Anthropic-shaped and must not touch another
   // provider's payload: a Responses API body has no metadata.user_id to patch

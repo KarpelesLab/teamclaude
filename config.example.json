@@ -62,6 +62,17 @@
       "priority": 10,
       "disabled": false,
       "apiKey": "sk-ant-api03-your-api-key"
+    },
+    {
+      "name": "gemini-final-answer",
+      "type": "apikey",
+      "apiKey": "agy-your-api-key",
+      "adapter": "openai-chat",
+      "upstream": "http://127.0.0.1:8787",
+      "modelPrefix": "",
+      "serverHeader": "agy",
+      "adapterHeaders": { "x-bridge-client-ip": "127.0.0.1" },
+      "disabled": true
     }
   ],
   "routes": [

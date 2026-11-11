@@ -347,6 +347,13 @@ export function findFamilyBlock(patterns, family) {
 // a `"model": "..."` sitting inside conversation text (a message, a tool result)
 // is nested deeper and is never mistaken for the real field. No regex, no
 // whole-body buffering, so the relay can peek just the first frames.
+/** Decode a JSON string's raw contents, preserving malformed input for its existing fallback.
+ * @param {string} raw
+ */
+function decodeJsonString(raw) {
+  try { return JSON.parse(`"${raw}"`); } catch { return raw; }
+}
+
 export class TopLevelFieldFinder {
   constructor(field) {
     this.field = field;               // target key at the root, e.g. 'model'
@@ -395,9 +402,9 @@ export class TopLevelFieldFinder {
       if (b === 0x22) {                                            // closing quote
         this.inStr = false;
         if (this.readingKey) {
-          this.curKey = Buffer.from(this.buf).toString('utf8'); this.buf = []; this.readingKey = false;
+          this.curKey = decodeJsonString(Buffer.from(this.buf).toString('utf8')); this.buf = []; this.readingKey = false;
         } else if (this.readingValue) {
-          this.value = Buffer.from(this.buf).toString('utf8'); this.buf = [];
+          this.value = decodeJsonString(Buffer.from(this.buf).toString('utf8')); this.buf = [];
           this.readingValue = false; this.done = true;             // the one top-level field we want
         }
         return;
@@ -661,7 +668,7 @@ export class AdvisorModelFinder {
       if (b === 0x22) {                                            // closing quote
         this.inStr = false;
         if (this.reading) {
-          const text = Buffer.from(this.buf).toString('utf8');
+          const text = decodeJsonString(Buffer.from(this.buf).toString('utf8'));
           if (this.reading === 'key') this.stack[this.stack.length - 1].key = text;
           else if (this.reading === 'type') this.toolType = text;
           else this.toolModel = text;

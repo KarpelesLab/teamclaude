@@ -28,10 +28,13 @@ const NPM_STUB = [
 
 /**
  * Copy the package to `<tmp>/<pkgDir>` and run `teamclaude update` from it,
- * with `npm root -g` answering `<tmp>/<npmRoot>`.
- * @param {{ pkgDir: string, npmRoot: string }} layout
+ * with `npm root -g` answering `<tmp>/<npmRoot>`. `pkgVersion` overrides the
+ * copied package.json's version (the repo's own is an -ipm. fork build, which
+ * the update command now refuses to replace — the ordinary-version tests need
+ * a plain one).
+ * @param {{ pkgDir: string, npmRoot: string, pkgVersion?: string }} layout
  */
-async function runUpdate({ pkgDir, npmRoot }) {
+async function runUpdate({ pkgDir, npmRoot, pkgVersion }) {
   // The real path: the CLI derives its package root from its own resolved URL.
   const dir = await realpath(await mkdtemp(join(tmpdir(), 'teamclaude-update-')));
   try {
@@ -39,6 +42,11 @@ async function runUpdate({ pkgDir, npmRoot }) {
     await mkdir(root, { recursive: true });
     await cp(join(repoRoot, 'src'), join(root, 'src'), { recursive: true });
     await cp(join(repoRoot, 'package.json'), join(root, 'package.json'));
+    if (pkgVersion) {
+      const pkg = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
+      pkg.version = pkgVersion;
+      await writeFile(join(root, 'package.json'), JSON.stringify(pkg));
+    }
     const bin = join(dir, 'bin');
     await mkdir(bin);
     await writeFile(join(bin, 'npm'), NPM_STUB);
@@ -81,6 +89,7 @@ test('update from a pnpm copy names the pnpm command and never runs npm', { skip
   const result = await runUpdate({
     pkgDir: 'pnpm/global/v11/node_modules/.pnpm/@karpeleslab+teamclaude@1.1.25/node_modules/@karpeleslab/teamclaude',
     npmRoot: 'lib/node_modules',
+    pkgVersion: '1.1.25',
   });
   assert.equal(result.code, 0, result.stderr);
   assert.match(result.stdout, /^This copy was installed with pnpm, which npm cannot update\. Run: pnpm add -g @karpeleslab\/teamclaude@latest$/m);
@@ -94,8 +103,26 @@ test('update from an npm global copy still installs with npm', { skip: process.p
   const result = await runUpdate({
     pkgDir: 'lib/node_modules/@karpeleslab/teamclaude',
     npmRoot: 'lib/node_modules',
+    pkgVersion: '1.1.25',
   });
   assert.equal(result.code, 0, result.stderr);
   assert.match(result.stdout, /^Updated to 999\.0\.0\./m);
   assert.match(result.npmCalls, /^install -g @karpeleslab\/teamclaude@999\.0\.0$/m);
+});
+
+// The registry's `latest` is upstream's, and upstream lacks this fork's
+// features: an -ipm. build must never be replaced through `teamclaude update`
+// (which works even with auto-update disabled — note TEAMCLAUDE_DISABLE_AUTOUPDATE
+// is set in this harness).
+test('update refuses to replace an ipm fork build with upstream', { skip: process.platform === 'win32' }, async () => {
+  const result = await runUpdate({
+    pkgDir: 'lib/node_modules/@karpeleslab/teamclaude',
+    npmRoot: 'lib/node_modules',
+    pkgVersion: '1.1.26-ipm.12',
+  });
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /ipm fork build \(1\.1\.26-ipm\.12\)/);
+  assert.match(result.stdout, /npm install -g @karpeleslab\/teamclaude@<version>-ipm\.<n>/);
+  assert.doesNotMatch(result.stdout, /Updat(?:ing|ed) /);
+  assert.doesNotMatch(result.npmCalls, /install -g/, 'npm was never asked to install (the read-only `root -g` probe is fine)');
 });

@@ -125,11 +125,9 @@ test('a spent pin offers handoff first; the next same-conversation prompt contin
     assert.equal(stopped.status, 429);
     assert.equal(stopped.json?.error?.type, 'rate_limit_error');
     const msg = stopped.json?.error?.message ?? '';
-    assert.ok(msg.includes('out of quota'), msg);
-    assert.ok(msg.includes('pinned to "qa"'), msg);
-    assert.ok(msg.includes('"qb"'), `the queue next is not named: ${msg}`);
+    assert.ok(msg.startsWith('You can keep working by moving to another assigned account; "qb" appears available. The account "qa", pinned to this conversation, cannot serve this request because its quota is exhausted until '), msg);
     assert.ok(msg.includes('/ipm:handoff'), `the handoff is not recommended: ${msg}`);
-    assert.ok(msg.includes('reprocess the full conversation'), `the cold-cache cost is not disclosed: ${msg}`);
+    assert.ok(msg.includes('reprocess the full conversation at full input-token cost'), `the cold-cache cost is not disclosed: ${msg}`);
     assert.ok(msg.includes('next prompt confirms'), `the continuation is not disclosed: ${msg}`);
     assert.equal(stopped.headers.get('anthropic-ratelimit-unified-7d-reset'), null, 'the offer must not become the generic plan-limit banner');
     assert.deepEqual(seen, ['qa', 'qa'], `the first failure leaked to the sibling: ${JSON.stringify(seen)}`);
@@ -201,7 +199,7 @@ test('a quota failure on the continuation destination needs another confirmation
     qbSpent = true;
     const second = await send({ text: 'hello' });
     assert.equal(second.status, 429);
-    assert.match(second.json?.error?.message ?? '', /pinned to "qb"/);
+    assert.match(second.json?.error?.message ?? '', /account "qb", pinned to this conversation/);
     assert.match(second.json?.error?.message ?? '', /currently "qc"/);
     assert.deepEqual(seen, ['qa', 'qa', 'qb'], 'the second quota failure walked silently to qc');
     assert.equal((await send({ text: 'hello' })).status, 200);
@@ -284,7 +282,7 @@ test('mixed policies stop at a recommend destination until its own confirmation'
     qbSpent = true;
     const stopped = await send({ text: 'hello', policy });
     assert.equal(stopped.status, 429);
-    assert.match(stopped.json?.error?.message ?? '', /pinned to "qb"/);
+    assert.match(stopped.json?.error?.message ?? '', /account "qb", pinned to this conversation/);
     assert.match(stopped.json?.error?.message ?? '', /currently "qc"/);
     assert.deepEqual(seen, ['qa', 'qa', 'qb'], 'A force leaked past B recommend to C');
     assert.equal((await send({ text: 'hello', policy })).status, 200);
