@@ -22,8 +22,8 @@ const accounts = () => ([
 
 const tokenOf = (req) => (req.headers.authorization || '').replace(/^Bearer /, '');
 
-async function post(port) {
-  const res = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+async function post(port, path = '/v1/messages') {
+  const res = await fetch(`http://127.0.0.1:${port}${path}`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ model: 'claude-x', messages: [] }),
   });
@@ -217,14 +217,6 @@ test('a rate-limit hop does not land back on the account a rollover moved off', 
 // client asked for, and docs/routing.md promises it never fails over: a rate
 // limit, a 5xx or a stream failure is handled as for any pin to one account. The
 // hops above used to ignore the pin and serve it from the idle sibling.
-async function postTo(port, path) {
-  const res = await fetch(`http://127.0.0.1:${port}${path}`, {
-    method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ model: 'claude-x', messages: [] }),
-  });
-  return { status: res.status, body: await res.text() };
-}
-
 const failA = (status, headers = {}) => (req, res) => {
   if (tokenOf(req) === 't-a') {
     res.writeHead(status, { 'content-type': 'application/json', ...headers });
@@ -243,7 +235,7 @@ for (const [what, status, headers] of [
 ]) {
   test(`a pinned request is never moved to a sibling on ${what}`, async () => {
     await withFleet(failA(status, headers), async ({ proxyPort, seen }) => {
-      const { status: got } = await postTo(proxyPort, '/tc-acct/a/v1/messages');
+      const { status: got } = await post(proxyPort, '/tc-acct/a/v1/messages');
       assert.ok(seen.length > 0 && seen.every(t => t === 't-a'), `only the pinned account is tried, saw ${JSON.stringify(seen)}`);
       assert.equal(got, status, 'the pinned account\'s answer reaches the client');
     });
@@ -252,7 +244,7 @@ for (const [what, status, headers] of [
 
 test('the same 529 on an unpinned request still fails over to the sibling', async () => {
   await withFleet(failA(529), async ({ proxyPort, seen }) => {
-    const { status } = await postTo(proxyPort, '/v1/messages');
+    const { status } = await post(proxyPort, '/v1/messages');
     assert.equal(status, 200);
     assert.deepEqual(seen, ['t-a', 't-b']);
   });
