@@ -14,7 +14,7 @@ const ZERO_USAGE = Object.freeze({
 const REQUEST_FIELDS = new Set([
   'model', 'messages', 'max_tokens', 'stream', 'system', 'temperature',
   'top_p', 'stop_sequences', 'output_config', 'metadata',
-  'tools', 'thinking', 'context_management',
+  'tools', 'thinking', 'context_management', 'safeguards',
 ]);
 const EFFORTS = new Set(['low', 'medium', 'high']);
 
@@ -87,8 +87,8 @@ function validateClaudeCodeEnvelope(request) {
     if (!thinking || typeof thinking !== 'object' || Array.isArray(thinking)
       || thinking.type !== 'adaptive'
       || Object.keys(thinking).some(key => key !== 'type' && key !== 'display')
-      || (thinking.display !== undefined && thinking.display !== 'omitted')) {
-      requestError('thinking supports adaptive with display omitted only');
+      || (thinking.display !== undefined && thinking.display !== 'omitted' && thinking.display !== 'updates')) {
+      requestError('thinking supports adaptive with display omitted or updates only');
     }
   }
   if (request.context_management !== undefined) {
@@ -101,6 +101,14 @@ function validateClaudeCodeEnvelope(request) {
       || Object.keys(edit).some(key => key !== 'type' && key !== 'keep')
       || edit.type !== 'clear_thinking_20251015' || edit.keep !== 'all') {
       requestError('context_management supports only clear_thinking_20251015 with keep all');
+    }
+  }
+  if (request.safeguards !== undefined) {
+    if (!Array.isArray(request.safeguards)
+      || request.safeguards.some(safeguard => !safeguard || safeguard.type !== 'dangerous_tool_use'
+        || !safeguard.classifier_context || typeof safeguard.classifier_context !== 'object'
+        || Array.isArray(safeguard.classifier_context))) {
+      requestError('safeguards supports dangerous_tool_use classifier context only');
     }
   }
 }

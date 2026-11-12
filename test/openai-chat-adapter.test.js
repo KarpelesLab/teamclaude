@@ -124,17 +124,19 @@ test('maps only low/medium/high reasoning effort', () => {
 });
 
 test('accepts and omits Claude Code no-op tools, thinking and context envelopes', () => {
-  for (const thinking of [{ type: 'adaptive', display: 'omitted' }, { type: 'adaptive' }]) {
+  for (const thinking of [{ type: 'adaptive', display: 'omitted' }, { type: 'adaptive', display: 'updates' }, { type: 'adaptive' }]) {
     const out = translated({
       tools: [],
       thinking,
       context_management: { edits: [{ type: 'clear_thinking_20251015', keep: 'all' }] },
+      safeguards: [{ type: 'dangerous_tool_use', classifier_context: { v: 1, permission_mode: 'auto' } }],
       output_config: { effort: 'high' },
       stream: true,
     });
     assert.equal(out.tools, undefined);
     assert.equal(out.thinking, undefined);
     assert.equal(out.context_management, undefined);
+    assert.equal(out.safeguards, undefined);
     assert.equal(out.reasoning_effort, 'high');
     assert.equal(out.stream, true);
     assert.deepEqual(out.stream_options, { include_usage: true });
@@ -159,6 +161,9 @@ test('rejects tools, rich content and unsupported semantics before translation',
     { context_management: { edits: [{ type: 'compact_messages_20260101', keep: 'all' }] } },
     { context_management: { edits: [] } },
     { context_management: { edits: [{ type: 'clear_thinking_20251015', keep: 'all' }], extra: true } },
+    { safeguards: [{ type: 'other_classifier', classifier_context: {} }] },
+    { safeguards: [{ type: 'dangerous_tool_use', classifier_context: null }] },
+    { safeguards: [{ type: 'dangerous_tool_use' }] },
     { messages: [{ role: 'user', content: [{ type: 'image', source: {} }] }] },
     { messages: [{ role: 'assistant', content: [{ type: 'tool_use', id: 'x' }] }] },
     { system: [{ type: 'text', text: 'x', cache_control: { type: 'ephemeral', ttl: '1h' } }] },

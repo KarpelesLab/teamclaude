@@ -162,20 +162,22 @@ for (const stream of [false, true]) {
 test('Claude Code no-op envelopes reach agy without their client-only fields', async () => {
   const ctx = await fixture({ stream: true });
   try {
-    for (const thinking of [{ type: 'adaptive', display: 'omitted' }, { type: 'adaptive' }]) {
+    for (const thinking of [{ type: 'adaptive', display: 'omitted' }, { type: 'adaptive', display: 'updates' }, { type: 'adaptive' }]) {
       const res = await ctx.post(request(true, {
         tools: [],
         thinking,
         context_management: { edits: [{ type: 'clear_thinking_20251015', keep: 'all' }] },
+        safeguards: [{ type: 'dangerous_tool_use', classifier_context: { v: 1, permission_mode: 'auto' } }],
         output_config: { effort: 'high' },
       }));
       assert.equal(res.status, 200, res.body);
     }
-    assert.equal(ctx.agyRequests.length, 2);
+    assert.equal(ctx.agyRequests.length, 3);
     for (const upstream of ctx.agyRequests) {
       assert.equal(upstream.body.tools, undefined);
       assert.equal(upstream.body.thinking, undefined);
       assert.equal(upstream.body.context_management, undefined);
+      assert.equal(upstream.body.safeguards, undefined);
       assert.equal(upstream.body.reasoning_effort, 'high');
       assert.equal(upstream.body.stream, true);
       assert.deepEqual(upstream.body.stream_options, { include_usage: true });
@@ -240,6 +242,7 @@ test('unsupported requests and count_tokens are refused before either upstream',
       request(false, { system: [{ type: 'text', text: 'x', cache_control: { type: 'ephemeral', ttl: '1h' } }] }),
       request(false, { messages: [{ role: 'developer', content: 'x' }] }),
       request(false, { messages: [{ role: 'tool', content: 'x' }] }),
+      request(false, { safeguards: [{ type: 'other_classifier', classifier_context: {} }] }),
     ];
     for (const body of invalid) {
       const res = await ctx.post(body);
@@ -447,8 +450,9 @@ for (const first of [MODEL, CLAUDE_MODEL]) {
               { type: 'text', text: 'system two', cache_control: { type: 'ephemeral' } },
             ],
             tools: [],
-            thinking: { type: 'adaptive', display: 'omitted' },
+            thinking: { type: 'adaptive', display: 'updates' },
             context_management: { edits: [{ type: 'clear_thinking_20251015', keep: 'all' }] },
+            safeguards: [{ type: 'dangerous_tool_use', classifier_context: { v: 1, permission_mode: 'auto' } }],
           } : {}),
         }));
         assert.equal(res.status, 200, res.body);
