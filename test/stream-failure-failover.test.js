@@ -372,3 +372,23 @@ test('a headerless Codex stream is peeked on the same rule the relay uses', asyn
     assert.equal(body, sse(CREATED, DELTA, COMPLETED));
   });
 });
+
+// A pinned request is never moved (docs/routing.md, "Pin a session to one
+// account"): the refusal reaches the client as the pinned account sent it, as
+// for the 5xx and 429 hops (bounded-failover.test.js).
+test('a refusal inside a 200 stream on a pinned request stays on the pinned account', async () => {
+  await withFleet(['one', 'two'], (acct, res) => {
+    sseHead(res);
+    if (acct === 'one') return res.end(sse(CREATED, OVERLOADED, FAILED));
+    res.end(sse(CREATED, IN_PROGRESS, DELTA, COMPLETED));
+  }, async ({ proxyPort, seen }) => {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/tc-acct/${encodeURIComponent('codex:one')}/backend-api/codex/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'session-id': SID },
+      body: JSON.stringify({ model: MODEL, input: [], stream: true }),
+    });
+    const body = await res.text();
+    assert.deepEqual(seen, ['one'], 'only the pinned account is spent');
+    assert.match(body, /server_is_overloaded/, 'the pinned account\'s refusal is relayed, not hidden by a sibling\'s stream');
+  });
+});
