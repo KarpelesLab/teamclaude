@@ -13,7 +13,7 @@
   ],
   "scripts": {
     "start": "node src/index.js",
-    "test": "node --test --test-timeout=120000",
+    "test": "node --test --import ./test-helpers/isolate-env.js --test-timeout=120000",
     "lint": "eslint .",
     "typecheck": "tsc -p tsconfig.json",
     "typecheck:strict": "node scripts/typecheck-strict.mjs"
