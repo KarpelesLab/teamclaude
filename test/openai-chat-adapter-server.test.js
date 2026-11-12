@@ -6,6 +6,7 @@ import { ClientUsageTracker } from '../src/client-usage.js';
 import { createProxyServer } from '../src/server.js';
 
 const MODEL = 'gemini-3-pro-preview';
+const CLAUDE_MODEL = 'claude-haiku-4-5';
 const USAGE = { input_tokens: 11, cache_read_tokens: 7, output_tokens: 5, total_tokens: 16 };
 const SID = 'sess-openai-chat';
 const listen = server => new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
@@ -20,7 +21,7 @@ function completion(stream = false, usage = USAGE) {
   };
 }
 
-async function fixture({ stream = false, agyHandler = null, claudeHandler = null, clientRoutes = null } = {}) {
+async function fixture({ stream = false, agyHandler = null, claudeHandler = null, clientRoutes = null, extraGemini = false } = {}) {
   const agyRequests = [];
   const agy = http.createServer(async (req, res) => {
     const chunks = [];
@@ -56,14 +57,21 @@ async function fixture({ stream = false, agyHandler = null, claudeHandler = null
   });
   const agyPort = await listen(agy);
   const claudePort = await listen(claude);
-  const am = new AccountManager([
+  const accounts = [
     {
       name: 'gemini', type: 'apikey', apiKey: 'gemini-secret', adapter: 'openai-chat',
       upstream: `http://127.0.0.1:${agyPort}/agy`, modelPrefix: 'gemini-', serverHeader: 'agy-test',
       adapterHeaders: { 'x-bridge-client-ip': '127.0.0.1' },
     },
     { name: 'claude', type: 'apikey', apiKey: 'claude-secret', upstream: `http://127.0.0.1:${claudePort}` },
-  ], 0.98, { clientRoutes });
+  ];
+  if (extraGemini) {
+    accounts.push({
+      name: 'gemini-2', type: 'apikey', apiKey: 'gemini-2-secret', adapter: 'openai-chat',
+      upstream: `http://127.0.0.1:${agyPort}/agy`, modelPrefix: 'gemini-', serverHeader: 'agy-test',
+    });
+  }
+  const am = new AccountManager(accounts, 0.98, { clientRoutes });
   const clientUsage = new ClientUsageTracker();
   const proxy = createProxyServer(am, {
     proxy: { apiKey: 'shared', clientKeys: [{ name: 'alice', key: 'alice-key' }] },
@@ -72,12 +80,12 @@ async function fixture({ stream = false, agyHandler = null, claudeHandler = null
   return {
     am, clientUsage, agyRequests, claudeRequests,
     async close() { proxy.close(); agy.close(); claude.close(); },
-    async post(body, { path = '/v1/messages', headers = {}, rawBody = false } = {}) {
+    async post(body, { path = '/v1/messages', headers = {}, rawBody = false, session = SID } = {}) {
       const res = await fetch(`http://127.0.0.1:${port}${path}`, {
         method: 'POST',
         headers: {
           'content-type': 'application/json', 'x-api-key': 'alice-key',
-          'x-claude-code-session-id': SID, ...headers,
+          ...(session ? { 'x-claude-code-session-id': session } : {}), ...headers,
         },
         body: rawBody ? body : JSON.stringify(body),
       });
@@ -345,6 +353,118 @@ test('fixed seats reject an incompatible model in both directions without upstre
     } finally {
       await ctx.close();
     }
+  }
+});
+
+for (const first of [MODEL, CLAUDE_MODEL]) {
+  const second = first === MODEL ? CLAUDE_MODEL : MODEL;
+  test(`a real fixed-seat conversation switches ${first} → ${second} → ${first}`, async () => {
+    const ctx = await fixture({
+      clientRoutes: [{ name: 'fixed', clients: ['alice'], accounts: ['gemini', 'claude'] }],
+    });
+    try {
+      for (const model of [first, second, first]) {
+        const res = await ctx.post(request(false, {
+          model,
+          messages: [{ role: 'user', content: 'one stable conversation opening' }],
+        }));
+        assert.equal(res.status, 200, res.body);
+      }
+      assert.equal(ctx.agyRequests.length, first === MODEL ? 2 : 1);
+      assert.equal(ctx.claudeRequests.length, first === CLAUDE_MODEL ? 2 : 1);
+    } finally {
+      await ctx.close();
+    }
+  });
+}
+
+test('direct mixed-seat requests without a session select either compatible account', async () => {
+  const ctx = await fixture({
+    clientRoutes: [{ name: 'fixed', clients: ['alice'], accounts: ['gemini', 'claude'] }],
+  });
+  try {
+    for (const model of [MODEL, CLAUDE_MODEL, MODEL, CLAUDE_MODEL]) {
+      const res = await ctx.post(request(false, {
+        model,
+        messages: [{ role: 'user', content: 'one stable conversation opening' }],
+      }), { session: null });
+      assert.equal(res.status, 200, res.body);
+    }
+    assert.equal(ctx.agyRequests.length, 2);
+    assert.equal(ctx.claudeRequests.length, 2);
+    assert.equal(ctx.am.sessionTracker.sessions.size, 0);
+  } finally {
+    await ctx.close();
+  }
+});
+
+test('fixed mixed seats check advisor compatibility before a conversation pin', async () => {
+  const ctx = await fixture({
+    clientRoutes: [{ name: 'fixed', clients: ['alice'], accounts: ['gemini', 'claude'] }],
+  });
+  const messages = [{ role: 'user', content: 'one stable advisor conversation' }];
+  const advisor = model => [{ type: 'advisor_20260301', name: 'advisor', model }];
+  try {
+    const initial = await ctx.post(request(false, {
+      model: CLAUDE_MODEL, messages, tools: advisor(CLAUDE_MODEL),
+    }));
+    assert.equal(initial.status, 200, initial.body);
+    assert.equal(ctx.agyRequests.length, 0);
+    assert.equal(ctx.claudeRequests.length, 1);
+
+    const incompatible = await ctx.post(request(false, {
+      model: CLAUDE_MODEL, messages, tools: advisor(MODEL),
+    }));
+    assert.equal(incompatible.status, 503, incompatible.body);
+    assert.equal(ctx.agyRequests.length, 0);
+    assert.equal(ctx.claudeRequests.length, 1);
+  } finally {
+    await ctx.close();
+  }
+});
+
+test('an incompatible pin cannot mask a compatible account throttle', async () => {
+  const ctx = await fixture({
+    clientRoutes: [{ name: 'fixed', clients: ['alice'], accounts: ['gemini', 'claude'] }],
+  });
+  const messages = [{ role: 'user', content: 'one stable throttled conversation' }];
+  try {
+    const initial = await ctx.post(request(false, { model: CLAUDE_MODEL, messages }));
+    assert.equal(initial.status, 200, initial.body);
+    ctx.am.accounts[0].status = 'throttled';
+    ctx.am.accounts[0].rateLimitedUntil = Date.now() + 60_000;
+    ctx.am.accounts[0].throttledAt = Date.now();
+
+    const throttled = await ctx.post(request(false, { model: MODEL, messages }));
+    assert.equal(throttled.status, 429, throttled.body);
+    assert.equal(ctx.agyRequests.length, 0);
+    assert.equal(ctx.claudeRequests.length, 1);
+  } finally {
+    await ctx.close();
+  }
+});
+
+test('a model switch keeps the new conversation pin on upstream failure', async () => {
+  const ctx = await fixture({
+    extraGemini: true,
+    agyHandler: (_req, res) => {
+      res.writeHead(500, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'agy failed' } }));
+    },
+    clientRoutes: [{ name: 'fixed', clients: ['alice'], accounts: ['gemini', 'claude', 'gemini-2'] }],
+  });
+  const messages = [{ role: 'user', content: 'one stable failing conversation' }];
+  try {
+    const initial = await ctx.post(request(false, { model: CLAUDE_MODEL, messages }));
+    assert.equal(initial.status, 200, initial.body);
+
+    const failed = await ctx.post(request(false, { model: MODEL, messages }));
+    assert.equal(failed.status, 500, failed.body);
+    assert.equal(ctx.agyRequests.length, 1, 'the existing conversation silently hopped to a compatible sibling');
+    assert.equal(ctx.agyRequests[0].headers.authorization, 'Bearer gemini-secret');
+    assert.equal(ctx.claudeRequests.length, 1);
+  } finally {
+    await ctx.close();
   }
 });
 

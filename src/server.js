@@ -3387,23 +3387,33 @@ function hopForcedSeat(accountManager, ctx, account, verdict) {
 /**
  * The account a request bound to a multi-account seat goes to next (IPM fork).
  * The seat's accounts are a drain queue in config order. A conversation pinned
- * to one of them stays on it (ctx.boundPinned): its verdict — spent,
- * throttled, unavailable — is the request's own answer, never a silent move
- * onto a sibling, which would re-process the whole conversation there with a
- * cold cache. A conversation with no pin in the seat — a fresh one, e.g.
- * after a handoff — takes the first servable account in queue order, so the
- * seat's quota drains one account at a time instead of spreading across all
- * of them at once. Null when the seat has nothing left, which the no-account
- * branch answers from the seat's state.
+ * to one of them stays on it (ctx.boundPinned) while that account supports the
+ * main and advisor models: its verdict — spent, throttled, unavailable — is the
+ * request's own answer, never a silent move onto a sibling, which would
+ * re-process the whole conversation there with a cold cache. An incompatible
+ * pin is ignored so a model change can select another assigned adapter. A
+ * conversation with no compatible pin in the seat — a fresh one, e.g. after a
+ * handoff — takes the first servable account in queue order, so the seat's
+ * quota drains one account at a time instead of spreading across all of them
+ * at once. Null when the seat has nothing left, which the no-account branch
+ * answers from the seat's state.
  * @param {any} accountManager
  * @param {Record<string, any>} ctx
  */
 function pickBoundAccount(accountManager, ctx) {
   const left = ctx.bound.indices.filter((/** @type {number} */ i) => !ctx.tried.has(i) && !ctx.rolledOff?.has(i));
   if (!left.length) return null;
+  // Model changes within one conversation must not keep it on an incompatible
+  // adapter. With no compatible account, retain left so the seat answers its
+  // own model-adapter verdict rather than leaking to an unassigned account.
+  const compatible = left.filter((/** @type {number} */ i) => {
+    const account = accountManager.accounts[i];
+    return accountSupportsModel(account, ctx.model) && accountSupportsModel(account, ctx.advisorModel);
+  });
+  const candidates = compatible.length ? compatible : left;
   const bucket = accountManager._weeklyBucketFor?.(ctx.model) ?? weeklyBucketForModel(ctx.model);
   const pinIdx = ctx.pinKey ? accountManager.sessionTracker.pinnedAccount(ctx.pinKey, bucket) : null;
-  if (pinIdx != null && left.includes(pinIdx)) {
+  if (pinIdx != null && compatible.includes(pinIdx)) {
     ctx.boundPinned = true;
     const pinned = accountManager.accounts[pinIdx] ?? null;
     if (!ctx.seatContinuationChecked && pinned && seatPolicyFor(ctx, pinIdx) === 'recommend') {
@@ -3412,7 +3422,7 @@ function pickBoundAccount(accountManager, ctx) {
       ctx.seatContinuationChecked = true;
       const verdict = seatVerdict(accountManager, pinned, ctx.model, ctx.advisorModel);
       if (verdict?.kind === 'spent') {
-        const next = left.find((/** @type {number} */ i) => i !== pinIdx
+        const next = candidates.find((/** @type {number} */ i) => i !== pinIdx
           && !seatVerdict(accountManager, accountManager.accounts[i], ctx.model, ctx.advisorModel));
         if (next != null) {
           const offer = accountManager.sessionTracker.takeSeatContinuation(ctx.pinKey, {
@@ -3435,9 +3445,11 @@ function pickBoundAccount(accountManager, ctx) {
     return pinned;
   }
   // An unpinned pick, and a verdict retry must be free to advance the queue.
-  ctx.boundPinned = false;
-  const servable = left.find((/** @type {number} */ i) => !seatVerdict(accountManager, accountManager.accounts[i], ctx.model, ctx.advisorModel));
-  return accountManager.accounts[servable ?? left[0]] ?? null;
+  // A servable destination for an incompatible assigned pin becomes the new
+  // conversation pin before upstream I/O; fresh conversations keep queue retries.
+  const servable = candidates.find((/** @type {number} */ i) => !seatVerdict(accountManager, accountManager.accounts[i], ctx.model, ctx.advisorModel));
+  ctx.boundPinned = servable != null && pinIdx != null && left.includes(pinIdx);
+  return accountManager.accounts[servable ?? candidates[0]] ?? null;
 }
 
 /**
