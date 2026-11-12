@@ -133,3 +133,105 @@ test('the embedded TUI switch survives the next request and routing preview', ()
   assert.equal(am.getActiveAccount(null, MODEL).name, 'manual');
   assert.equal(am.previewRouteIndex(MODEL), 1);
 });
+
+// The session-reset switch - move to an account whose weekly resets sooner when a
+// five-hour window rolls - is one of the automatic rankings a manual choice
+// outranks (docs/usage.md). It runs on a request, and with expiry routing off on
+// every poll too: the TUI repaint, GET /teamclaude/quota, the get_quota tool. It
+// used to move the cursor off the operator's pick, and _setCurrent dropped the
+// choice with it.
+function sessionResetFleet(opts = {}) {
+  const hour = 3600_000;
+  const am = new AccountManager([
+    { name: 'a', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + hour },
+    { name: 'b', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + hour },
+  ], 0.98, opts);
+  const [a, b] = am.accounts;
+  // `a`'s five-hour window has just rolled, and its weekly resets sooner than `b`'s.
+  Object.assign(a.quota, { unified5h: 0.5, unified5hReset: Date.now() - 1000, unified7d: 0.5, unified7dReset: Date.now() + 6 * hour, sessionWindowStated: true });
+  Object.assign(b.quota, { unified5h: 0.2, unified5hReset: Date.now() + 4 * hour, unified7d: 0.1, unified7dReset: Date.now() + 58 * hour });
+  return am;
+}
+
+test('a poll-driven session-reset switch keeps the manual choice', () => {
+  const am = sessionResetFleet();
+  const log = console.log;
+  console.log = () => {};
+  try {
+    assert.equal(am.setCurrentAccount(1), true);
+    am.refreshExpiredQuotas();
+    assert.equal(am.currentIndex, 1, 'the operator picked b, and b is still available');
+    assert.equal(am.getActiveAccount(null, MODEL).name, 'b', 'and the choice still holds for the next request');
+  } finally {
+    console.log = log;
+  }
+});
+
+test('the same poll still switches an automatic placement to the sooner-resetting account', () => {
+  const am = sessionResetFleet();
+  const log = console.log;
+  console.log = () => {};
+  try {
+    am._setCurrent(am.accounts[1]);
+    am.refreshExpiredQuotas();
+    assert.equal(am.currentIndex, 0);
+  } finally {
+    console.log = log;
+  }
+});
+
+// On the request path the same switch runs at the head of selection, and with
+// expiry routing on that is the only place it runs: a poll spends no reset event
+// then. A request after the roll keeps the manual choice either way.
+for (const expiry of [false, true]) {
+  test(`[expiry routing ${expiry ? 'on' : 'off'}] a request after a session reset keeps the manual choice`, () => {
+    const am = sessionResetFleet(expiry ? { expiryRouting: { enabled: true } } : {});
+    const log = console.log;
+    console.log = () => {};
+    try {
+      assert.equal(am.setCurrentAccount(1), true);
+      assert.equal(am.getActiveAccount(new Set(), MODEL).name, 'b', 'the operator picked b, and b is still available');
+      assert.equal(am._isManualChoice(am.accounts[1]), true, 'and the choice is still recorded');
+    } finally {
+      console.log = log;
+    }
+  });
+}
+
+// A poll sees every provider's resets. A manual choice holds the switch for its
+// own provider only: another provider's reset still moves that provider's own
+// cursor - the one its next walk borrows - and the shared cursor stays on the
+// choice.
+test('a poll keeps a Claude manual choice and still moves the Codex cursor on a Codex reset', () => {
+  const hour = 3600_000;
+  const day = 24 * hour;
+  const now = Date.now();
+  const oauth = (name, extra = {}) => ({ name, type: 'oauth', accessToken: 't-' + name, refreshToken: 'r', expiresAt: now + hour, ...extra });
+  const am = new AccountManager([
+    oauth('claude-a1', { accountUuid: 'u1' }),
+    oauth('claude-a2', { accountUuid: 'u2' }),
+    oauth('codex-c1', { provider: 'codex', accountId: 'i1' }),
+    oauth('codex-c2', { provider: 'codex', accountId: 'i2' }),
+  ], 0.98);
+  const by = Object.fromEntries(am.accounts.map(a => [a.name, a]));
+  const set = (name, q) => Object.assign(by[name].quota, q);
+  set('claude-a1', { unified7d: 0.3, unified7dReset: now + 5 * day, unified5h: 0.1, unified5hReset: now + hour });
+  set('claude-a2', { unified7d: 0.1, unified7dReset: now + 6 * day, unified5h: 0.1, unified5hReset: now + hour });
+  set('codex-c1', { unified7d: 0.3, unified7dReset: now + 6 * day, unified5h: 0.1, unified5hReset: now + hour });
+  set('codex-c2', { unified7d: 0.3, unified7dReset: now + 1 * day, unified5h: 0.1, unified5hReset: now + hour });
+  const log = console.log;
+  console.log = () => {};
+  try {
+    am._setCurrent(by['codex-c1']);
+    assert.equal(am.getActiveAccount(null, 'gpt-5', null, null, 'codex').name, 'codex-c1');
+    assert.equal(am.setCurrentAccount(by['claude-a1'].index), true);
+    set('codex-c2', { unified5h: 0.5, unified5hReset: now - 1000 }); // codex-c2's five-hour window rolls
+    am.refreshExpiredQuotas(); // a TUI repaint, GET /teamclaude/quota, get_quota
+    assert.equal(am.accounts[am.currentIndex].name, 'claude-a1', 'the shared cursor stays on the choice');
+    assert.equal(am._isManualChoice(by['claude-a1']), true, 'and the choice is still recorded');
+    assert.equal(am.getActiveAccount(null, 'gpt-5', null, null, 'codex').name, 'codex-c2', 'Codex moved to the sooner-resetting account');
+    assert.equal(am.getActiveAccount(null, MODEL).name, 'claude-a1');
+  } finally {
+    console.log = log;
+  }
+});

@@ -64,7 +64,9 @@ for (const expiry of [false, true]) {
   test(`[${knob}] a Codex 5h rollover does not move a Claude request onto Codex`, () => {
     const { am, byName, now, set } = fleet({ expiry });
     rolled(set, 'codex-c', now, 0.3, now + 1 * DAY);
-    am.setCurrentAccount(am.accounts.indexOf(byName['claude-a1']));
+    // An automatic placement: these tests are about the session-reset switch, and a
+    // manual choice (#668) holds the cursor against it (manual-switch-priority.test.js).
+    am._setCurrent(byName['claude-a1']);
     const writes = recordCursor(am);
 
     const served = am.getActiveAccount(null, MODEL[CLAUDE], null, null, CLAUDE);
@@ -90,7 +92,9 @@ for (const expiry of [false, true]) {
     const { am, byName, now, set } = fleet({ expiry });
     set('codex-c', { w7d: 0.3, reset7d: now + 9 * DAY, h5: 0.5 });
     rolled(set, 'claude-a1', now, 0.3, now + 1 * DAY);
-    am.setCurrentAccount(am.accounts.indexOf(byName['codex-c']));
+    // An automatic placement: these tests are about the session-reset switch, and a
+    // manual choice (#668) holds the cursor against it (manual-switch-priority.test.js).
+    am._setCurrent(byName['codex-c']);
     const writes = recordCursor(am);
 
     const served = am.getActiveAccount(null, MODEL[CODEX], null, null, CODEX);
@@ -128,7 +132,9 @@ for (const expiry of [false, true]) {
           set(name, { w7d: acc.quota.unified7d, reset7d: now + days * DAY });
         }
         for (const name of s.rolled) rolled(set, name, now, byName[name].quota.unified7d, byName[name].quota.unified7dReset);
-        am.setCurrentAccount(am.accounts.indexOf(byName[s.cursor]));
+        // An automatic placement: these tests are about the session-reset switch, and a
+        // manual choice (#668) holds the cursor against it (manual-switch-priority.test.js).
+        am._setCurrent(byName[s.cursor]);
         const start = am.currentIndex;
         const writes = recordCursor(am);
 
