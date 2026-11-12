@@ -171,8 +171,8 @@ export function translateOpenAIChatRequest(request, account = {}) {
     messages.push({ role: 'system', content: textContent(request.system, 'system') });
   }
   for (const [index, message] of request.messages.entries()) {
-    if (!message || (message.role !== 'user' && message.role !== 'assistant')) {
-      requestError(`messages[${index}].role must be user or assistant`);
+    if (!message || (message.role !== 'user' && message.role !== 'assistant' && message.role !== 'system')) {
+      requestError(`messages[${index}].role must be user, assistant or system`);
     }
     messages.push({ role: message.role, content: textContent(message.content, `messages[${index}].content`) });
   }

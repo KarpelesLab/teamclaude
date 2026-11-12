@@ -80,6 +80,27 @@ test('accepts text cache hints in order and omits them from OpenAI messages', ()
   assert.equal(JSON.stringify(out).includes('cache_control'), false);
 });
 
+test('preserves in-array system messages and their position', () => {
+  const out = translated({
+    system: 'top level',
+    messages: [
+      { role: 'user', content: 'first' },
+      { role: 'system', content: [{ type: 'text', text: 'second', cache_control: { type: 'ephemeral' } }] },
+      { role: 'assistant', content: 'third' },
+    ],
+  });
+  assert.deepEqual(out.messages, [
+    { role: 'system', content: 'top level' },
+    { role: 'user', content: 'first' },
+    { role: 'system', content: 'second' },
+    { role: 'assistant', content: 'third' },
+  ]);
+  assert.equal(JSON.stringify(out).includes('cache_control'), false);
+  for (const role of ['developer', 'tool', 'function', 'unknown', null, 1]) {
+    assert.throws(() => translated({ messages: [{ role, content: 'x' }] }), OpenAIChatRequestError);
+  }
+});
+
 test('applies modelMap before modelPrefix exactly once', () => {
   const out = translateOpenAIChatRequest(request(), {
     modelMap: { 'gemini-3-pro-preview': 'gemini-3-pro' },
