@@ -70,3 +70,45 @@ test('ownership guard is inert when no account claims the model', () => {
   const acct = am.getActiveAccount(null, 'claude-sonnet-4-6');
   assert.ok(acct, 'a probe target should still be selectable');
 });
+
+// F1 (cooldowns): nor an account sitting out an entitlement or routing cooldown.
+// unavailableReason reports either before the lines that clear a lapsed 429
+// hold, so a hold that has ended stays on the account and the soonest-reset
+// fallback read it as reset - sending the request to an account upstream had
+// just refused, or whose proxy could not be reached, while the probe skips both.
+// Concurrent requests on one account reach this state: one is answered 429,
+// another 403 or fails to reach the proxy.
+for (const [what, arm, extra] of [
+  ['an entitlement', (am) => am.markEntitlementDenied(0, { seconds: 60 }), {}],
+  ['a routing', (am) => am.markRoutingFailed(0, 60), { routing: 'socks5://127.0.0.1:1' }],
+]) {
+  test(`the soonest-reset fallback never resurrects an account in ${what} cooldown`, () => {
+    const am = new AccountManager([oauth('cooling', extra), oauth('busy')], 0.98);
+    am.markRateLimited(0, 1);
+    am.accounts[0].rateLimitedUntil = Date.now() - 5000; // hold already expired…
+    assert.ok(arm(am) > Date.now(), 'precondition: the cooldown is armed');  // …but cooling down
+    nearQuotaFutureReset(am, 1);
+
+    const acct = am.getActiveAccount();
+    assert.notEqual(acct?.name, 'cooling');
+    assert.equal(am.accounts[0].status, 'throttled');       // NOT flipped to active
+    assert.notEqual(am.accounts[0].rateLimitedUntil, null); // hold NOT cleared
+  });
+
+  // Control: the fallback still does its job once the cooldown is over. An
+  // exhausted account is one nothing but this fallback brings back, and it
+  // flips the status to active on the way - so the pick is the fallback's.
+  test(`the soonest-reset fallback revives an account whose ${what.replace(/^an? /, '')} cooldown has ended`, () => {
+    const am = new AccountManager([oauth('cooling', extra), oauth('busy')], 0.98);
+    am.markRateLimited(0, 1);
+    am.accounts[0].rateLimitedUntil = Date.now() - 5000;
+    am.accounts[0].status = 'exhausted';
+    arm(am);
+    am.accounts[0].entitlementDeniedUntil &&= Date.now() - 1;
+    am.accounts[0].routingFailedUntil &&= Date.now() - 1;
+    nearQuotaFutureReset(am, 1);
+
+    assert.equal(am.getActiveAccount()?.name, 'cooling');
+    assert.equal(am.accounts[0].status, 'active');
+  });
+}

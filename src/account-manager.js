@@ -5086,6 +5086,13 @@ export class AccountManager {
       // would otherwise name it the soonest to reset and send it the request.
       if (this._credentialHeld(account)) continue;
       if (this.isBillingRejected(account.index)) continue;
+      // Nor one sitting out an entitlement or routing cooldown, which the probe
+      // skips too (_isProbeable). unavailableReason reports either before the
+      // lines that clear a lapsed 429 hold, so a hold that has ended stays on
+      // the account and reads here as the soonest reset: the request would go
+      // to an account upstream refused minutes ago, or whose proxy could not be
+      // reached seconds ago - and clear its hold on the way.
+      if (this._entitlementDenied(account) || this._routingDown(account)) continue;
       // A routed/owned model must not fall back to an ineligible account —
       // neither the executor's nor an advisor's.
       if (model && !this._routeAllows(account, model)) continue;
