@@ -10,7 +10,7 @@ import { parseResetStatus, claimableGrant, claimClaudeReset, blockedUntil, Claud
 // spends a real reset on a real account, so every test injects its own fetch.
 
 const H = 3600_000, DAY = 24 * H;
-const oauth = (name, extra = {}) => ({ name, type: 'oauth', accessToken: 't-' + name, refreshToken: 'r', expiresAt: Date.now() + H, orgUuid: 'org-' + name, ...extra });
+const oauth = (name, extra = {}) => ({ id: 'id-' + name, name, type: 'oauth', accessToken: 't-' + name, refreshToken: 'r', expiresAt: Date.now() + H, accountUuid: 'account-' + name, orgUuid: 'org-' + name, ...extra });
 const ARMED = { autoRedeemResets: true };
 
 /** The cedar_ember block of an account at its Fable limit holding one reset. */
@@ -30,17 +30,19 @@ function fableSpent(account, resetIn) {
   return account;
 }
 
-function harness({ accounts = [oauth('a')], status = () => block(), claim = () => ({ result: 'reset', reason: null, resetsLeft: 0, cleared: ['five_hour', 'seven_day', 'seven_day_overage_included'], cooldownUntil: null }), config = { ...ARMED } } = {}) {
+function harness({ accounts = [oauth('a')], status = () => block(), claim = () => ({ result: 'reset', reason: null, resetsLeft: 0, cleared: ['five_hour', 'seven_day', 'seven_day_overage_included'], cooldownUntil: null }), config = { ...ARMED }, pending = null, updateStateFn = null, tokenError = null } = {}) {
   const am = new AccountManager(accounts, 0.98);
   am.accounts.forEach((a, i) => fableSpent(a, (i + 1) * DAY));
-  const calls = { status: 0, claim: [], keys: [] };
+  const calls = { status: 0, claim: [], keys: [], grants: [], states: [] };
+  let saved = { claudeResetPending: pending || {} };
   const redeemer = new ClaudeResetRedeemer(am, {
-    config, log: () => {},
+    config, log: () => {}, pending,
+    updateStateFn: updateStateFn || (async updater => { updater(saved); calls.states.push(JSON.parse(JSON.stringify(saved))); }),
     statusFn: async (account) => { calls.status++; const b = status(account, calls); return { reset: parseResetStatus(b), usage: { fiveHour: { utilization: 0 }, sevenDay: { utilization: 0 }, sevenDayFable: { utilization: 0 } } }; },
-    claimFn: async (account, c) => { calls.claim.push(account.name); calls.keys.push(c.requestId); return claim(calls.claim.length, c); },
+    claimFn: async (account, c) => { calls.claim.push(account.name); calls.keys.push(c.requestId); calls.grants.push(c.grantId); return claim(calls.claim.length, c); },
   });
-  am.ensureTokenFresh = async () => {};
-  return { am, redeemer, calls };
+  am.ensureTokenFresh = async () => { if (tokenError) throw new Error(tokenError); };
+  return { am, redeemer, calls, saved: () => saved };
 }
 
 // ── parsing ─────────────────────────────────────────────────────────────────
@@ -207,6 +209,297 @@ test('a Codex row or a third-party backend is never a Claude candidate', async (
   const { am, redeemer, calls } = harness({ accounts: [oauth('cx', { provider: 'codex', accountId: 'x' }), oauth('nano', { upstream: 'https://api.nano-gpt.com/api' })] });
   assert.equal((await redeemer.maybeRedeemForPool(am.accounts)).redeemed, false);
   assert.equal(calls.status + calls.claim.length, 0);
+});
+
+// ── operator redemption and durable replay ─────────────────────────────────
+
+test('manual redemption ignores automatic policy and permits a usable grant before any limit', async () => {
+  const { am, redeemer, calls } = harness({
+    accounts: [oauth('disabled', { disabled: true, autoRedeemReset: false })],
+    config: createDefaultConfig(),
+    status: () => block({ at_limit: false, exhausted: [] }),
+  });
+  am.accounts[0].quota.resetCredits = { available: 0, applicable: 0, seenAt: Date.now() };
+  const r = await redeemer.redeemAccount(am.accounts[0]);
+  assert.equal(r.outcome, 'redeemed');
+  assert.equal(r.result, 'reset');
+  assert.deepEqual(r.cleared, ['five_hour', 'seven_day', 'seven_day_overage_included']);
+  assert.equal(calls.claim.length, 1);
+  assert.equal(calls.states[0].claudeResetPending['id-disabled'].requestId, calls.keys[0], 'intent is durable before the POST');
+  assert.deepEqual(calls.states.at(-1).claudeResetPending, {}, 'success clears it only with the hold');
+  assert.ok(calls.states.at(-1).quota, 'the fleet hold is persisted in the same update');
+  assert.equal(JSON.stringify(r).includes(calls.keys[0]), false);
+});
+
+test('legacy accounts without accountUuid keep automatic redemption and durable manual replay', async () => {
+  const accounts = [oauth('legacy', { accountUuid: null })];
+  const automatic = harness({ accounts });
+  assert.equal((await automatic.redeemer.maybeRedeemForPool(automatic.am.accounts)).redeemed, true);
+
+  const first = harness({ accounts, claim: () => ({ error: 'timeout' }) });
+  await first.redeemer.redeemAccount(first.am.accounts[0]);
+  const pending = first.redeemer.exportPending();
+  assert.equal(pending['id-legacy'].accountUuid, null);
+  pending['id-legacy'].createdAt -= 31 * 60 * 1000;
+  const second = harness({ accounts, pending, claim: () => ({ result: 'already_used', resetsLeft: 0, cleared: [] }) });
+  assert.equal((await second.redeemer.redeemAccount(second.am.accounts[0])).outcome, 'redeemed');
+  assert.deepEqual(second.calls.keys, first.calls.keys);
+});
+
+test('already_used confirms the earlier redemption rather than reporting a second spend', async () => {
+  const { am, redeemer, calls } = harness({ claim: () => ({ result: 'already_used', resetsLeft: 0, cleared: ['seven_day'] }) });
+  const r = await redeemer.redeemAccount(am.accounts[0]);
+  assert.equal(r.outcome, 'redeemed');
+  assert.equal(r.result, 'already_used');
+  assert.equal(calls.claim.length, 1);
+});
+
+test('manual refusal cases never reach the claim POST', async () => {
+  for (const [name, options, reason] of [
+    ['ineligible', { status: () => block({ eligible: false }) }, 'ineligible'],
+    ['no usable grant', { status: () => block({}, { usable_now: false }) }, 'no_usable_grant'],
+    ['cooldown', { status: () => block({ cooldown_until: new Date(Date.now() + H).toISOString() }) }, 'cooldown'],
+    ['unsupported provider', { accounts: [oauth('cx', { provider: 'codex' })] }, 'unsupported_seat'],
+  ]) {
+    const { am, redeemer, calls } = harness(options);
+    const r = await redeemer.redeemAccount(am.accounts[0]);
+    assert.equal(r.outcome, 'declined', name);
+    assert.equal(r.reason, reason, name);
+    assert.equal(calls.claim.length, 0, name);
+  }
+});
+
+test('token refresh, status and initial persistence failures are pre-claim failures with no POST', async () => {
+  for (const options of [
+    { tokenError: 'expired' },
+    { status: () => { throw new Error('unreachable'); } },
+    { updateStateFn: async () => { throw new Error('read-only state'); } },
+  ]) {
+    const { am, redeemer, calls } = harness(options);
+    const r = await redeemer.redeemAccount(am.accounts[0]);
+    assert.equal(r.outcome, 'pre_claim_failed');
+    assert.equal(calls.claim.length, 0);
+  }
+});
+
+test('a lost or unrecognized verdict is unknown, retains pending and replays identical ids only after the hold', async () => {
+  let verdict = { error: 'socket hang up' };
+  let clock = Date.now();
+  const { am, redeemer, calls } = harness({ claim: () => verdict });
+  redeemer.now = () => clock;
+  const first = await redeemer.redeemAccount(am.accounts[0]);
+  assert.equal(first.outcome, 'unknown');
+  assert.equal(first.mayHaveRedeemed, true);
+  assert.equal(Object.keys(redeemer.exportPending()).length, 1);
+  assert.equal(calls.claim.length, 1);
+  verdict = { result: 'already_used', resetsLeft: 0, cleared: ['seven_day'] };
+  const immediate = await redeemer.redeemAccount(am.accounts[0]);
+  assert.equal(immediate.outcome, 'declined');
+  assert.equal(immediate.reason, 'cooldown');
+  assert.equal(calls.claim.length, 1, 'the hold forbids an immediate replay POST');
+  clock += 31 * 60 * 1000;
+  const second = await redeemer.redeemAccount(am.accounts[0]);
+  assert.equal(second.outcome, 'redeemed');
+  assert.equal(second.result, 'already_used');
+  assert.equal(calls.claim.length, 2);
+  assert.equal(calls.keys[0], calls.keys[1]);
+  assert.equal(calls.grants[0], calls.grants[1]);
+  assert.equal(calls.status, 2, 'one fresh eligibility read and one post-replay quota read; replay itself has no grant gate');
+  assert.deepEqual(redeemer.exportPending(), {});
+});
+
+test('missing and unrecognized 2xx verdicts are unknown and keep the durable claim pending', async () => {
+  for (const verdict of [{ resetsLeft: 1 }, { result: 'mystery', resetsLeft: 1 }]) {
+    const { am, redeemer, calls } = harness({ claim: () => verdict });
+    const r = await redeemer.redeemAccount(am.accounts[0]);
+    assert.equal(r.outcome, 'unknown');
+    assert.equal(r.mayHaveRedeemed, true);
+    assert.equal(calls.claim.length, 1);
+    assert.equal(Object.keys(redeemer.exportPending()).length, 1);
+  }
+});
+
+test('restart with the grant gone honors restored createdAt before replaying identical ids', async () => {
+  let clock = Date.now();
+  const first = harness({ claim: () => ({ error: 'timeout' }) });
+  first.redeemer.now = () => clock;
+  await first.redeemer.redeemAccount(first.am.accounts[0]);
+  const pending = first.redeemer.exportPending();
+  const second = harness({ pending, status: () => block({ next_grant_id: null }), claim: () => ({ result: 'already_used', resetsLeft: 0, cleared: [] }) });
+  second.redeemer.now = () => clock;
+  const immediate = await second.redeemer.redeemAccount(second.am.accounts[0]);
+  assert.equal(immediate.outcome, 'declined');
+  assert.equal(immediate.reason, 'cooldown');
+  assert.equal(second.calls.claim.length, 0, 'restored createdAt supplies the restart-safe hold without restored quota');
+  clock += 31 * 60 * 1000;
+  const r = await second.redeemer.redeemAccount(second.am.accounts[0]);
+  assert.equal(r.outcome, 'redeemed');
+  assert.equal(second.calls.status, 1, 'the only fresh read is quota reapplication after the replay');
+  assert.deepEqual(second.calls.keys, first.calls.keys);
+  assert.deepEqual(second.calls.grants, first.calls.grants);
+});
+
+test('an automatic attempt resolves durable pending work even with an empty candidate list', async () => {
+  const first = harness({ claim: () => ({ error: 'timeout' }) });
+  await first.redeemer.redeemAccount(first.am.accounts[0]);
+  const pending = first.redeemer.exportPending();
+  pending['id-a'].createdAt -= 31 * 60 * 1000;
+  const second = harness({ pending, claim: () => ({ result: 'already_used', resetsLeft: 0, cleared: [] }) });
+  const r = await second.redeemer.maybeRedeemForPool([]);
+  assert.equal(r.redeemed, true);
+  assert.deepEqual(second.calls.keys, first.calls.keys);
+  assert.equal(second.calls.claim.length, 1);
+});
+
+test('a sibling manual attempt resolves the pending account first but does not spend the sibling', async () => {
+  const accounts = [oauth('a'), oauth('b')];
+  const first = harness({ accounts, claim: () => ({ error: 'timeout' }) });
+  await first.redeemer.redeemAccount(first.am.accounts[0]);
+  const pending = first.redeemer.exportPending();
+  pending['id-a'].createdAt -= 31 * 60 * 1000;
+  const second = harness({ accounts, pending, claim: () => ({ result: 'already_used', resetsLeft: 0, cleared: [] }) });
+  const r = await second.redeemer.redeemAccount(second.am.accounts[1]);
+  assert.equal(r.outcome, 'declined');
+  assert.equal(r.reason, 'pending_replay');
+  assert.deepEqual(second.calls.claim, ['a']);
+  assert.equal(second.calls.status, 1, 'the only fresh read is A’s quota reapplication; B never selects a grant');
+});
+
+test('multiple durable pending claims resolve one per confirmation in createdAt order', async () => {
+  const accounts = [oauth('a'), oauth('b')];
+  const record = (account, requestId, createdAt) => ({
+    accountUuid: account.accountUuid, orgUuid: account.orgUuid,
+    grantId: 'grant_1', requestId, createdAt,
+  });
+  const pending = {
+    'id-a': record(accounts[0], 'request-a', 20),
+    'id-b': record(accounts[1], 'request-b', 10),
+  };
+  const { am, redeemer, calls } = harness({ accounts, pending, claim: () => ({ result: 'already_used', resetsLeft: 0, cleared: [] }) });
+  let clock = Date.now();
+  redeemer.now = () => clock;
+  const r = await redeemer.redeemAccount(am.accounts[1]);
+  assert.equal(r.outcome, 'redeemed');
+  assert.deepEqual(calls.claim, ['b']);
+  assert.deepEqual(calls.keys, ['request-b']);
+  clock += 61 * 60 * 1000;
+  const sibling = await redeemer.redeemAccount(am.accounts[1]);
+  assert.equal(sibling.outcome, 'declined');
+  assert.equal(sibling.reason, 'pending_replay');
+  assert.deepEqual(calls.claim, ['b', 'a']);
+  assert.deepEqual(calls.keys, ['request-b', 'request-a']);
+});
+
+test('orphaned and identity-mismatched pending records fail closed without a POST', async () => {
+  const base = harness({ claim: () => ({ error: 'timeout' }) });
+  await base.redeemer.redeemAccount(base.am.accounts[0]);
+  const pending = base.redeemer.exportPending();
+  pending['id-a'].createdAt -= 31 * 60 * 1000;
+  for (const accounts of [[oauth('other')], [oauth('a', { accountUuid: 'changed' })]]) {
+    const { am, redeemer, calls } = harness({ accounts, pending });
+    const r = await redeemer.redeemAccount(am.accounts[0]);
+    assert.equal(r.outcome, 'unknown');
+    assert.equal(r.mayHaveRedeemed, true);
+    assert.equal(calls.claim.length + calls.status, 0);
+  }
+});
+
+test('a success whose hold cannot be persisted stays pending but preserves the known redeemed outcome', async () => {
+  let writes = 0;
+  const { am, redeemer, calls } = harness({
+    updateStateFn: async updater => {
+      writes++;
+      if (writes === 2) throw new Error('disk full');
+      updater({});
+    },
+  });
+  const r = await redeemer.redeemAccount(am.accounts[0]);
+  assert.equal(r.outcome, 'redeemed');
+  assert.equal(r.pending, true);
+  assert.equal(r.mayHaveRedeemed, undefined);
+  assert.equal(Object.keys(redeemer.exportPending()).length, 1);
+  assert.equal(calls.claim.length, 1);
+});
+
+test('manual during manual or automatic attempts declines in_progress without another POST', async () => {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const { am, redeemer, calls } = harness({ claim: async () => { await gate; return { result: 'reset', resetsLeft: 0, cleared: [] }; } });
+  const first = redeemer.redeemAccount(am.accounts[0]);
+  await new Promise(resolve => setImmediate(resolve));
+  const second = await redeemer.redeemAccount(am.accounts[0]);
+  const automatic = await redeemer.maybeRedeemForPool(am.accounts);
+  assert.equal(second.outcome, 'declined');
+  assert.equal(second.reason, 'in_progress');
+  assert.equal(automatic.redeemed, false);
+  assert.equal(automatic.reason, 'in_progress');
+  release();
+  assert.equal((await first).outcome, 'redeemed');
+  assert.equal(calls.claim.length, 1);
+});
+
+test('manual during an automatic attempt declines in_progress while pool calls still join', async () => {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const { am, redeemer, calls } = harness({ claim: async () => { await gate; return { result: 'reset', resetsLeft: 0, cleared: [] }; } });
+  const first = redeemer.maybeRedeemForPool(am.accounts);
+  const joined = redeemer.maybeRedeemForPool(am.accounts);
+  await new Promise(resolve => setImmediate(resolve));
+  const manual = await redeemer.redeemAccount(am.accounts[0]);
+  assert.equal(manual.outcome, 'declined');
+  assert.equal(manual.reason, 'in_progress');
+  release();
+  assert.equal((await first).redeemed, true);
+  assert.equal((await joined).redeemed, true);
+  assert.equal(calls.claim.length, 1);
+});
+
+test('removal after intent persistence but before the POST clears intent and never claims a sibling', async () => {
+  const h = harness({ updateStateFn: async updater => { updater({}); h.am.removeAccount(0); } });
+  const account = h.am.accounts[0];
+  const r = await h.redeemer.redeemAccount(account);
+  assert.equal(r.outcome, 'pre_claim_failed');
+  assert.equal(r.reason, 'account_removed');
+  assert.equal(h.calls.claim.length, 0);
+  assert.deepEqual(h.redeemer.exportPending(), {});
+});
+
+test('removal after a successful POST stays unknown and never reapplies quota to a sibling', async () => {
+  const accounts = [oauth('a'), oauth('b')];
+  const h = harness({ accounts, claim: () => { h.am.removeAccount(0); return { result: 'reset', resetsLeft: 0, cleared: [] }; } });
+  const before = { ...h.am.accounts[1].quota };
+  const r = await h.redeemer.redeemAccount(h.am.accounts[0]);
+  assert.equal(r.outcome, 'unknown');
+  assert.equal(r.mayHaveRedeemed, true);
+  assert.equal(h.calls.claim.length, 1);
+  assert.deepEqual(h.am.accounts[0].quota, before, 'the sibling at the renumbered index is untouched');
+  assert.ok(h.redeemer.exportPending()['id-a'], 'the unresolved original account remains fail-closed');
+});
+
+test('removal during the first manual refresh prevents status and claim without touching a sibling', async () => {
+  const accounts = [oauth('a'), oauth('b')];
+  const h = harness({ accounts });
+  const account = h.am.accounts[0];
+  const before = { ...h.am.accounts[1].quota };
+  h.am.ensureTokenFresh = async () => { h.am.removeAccount(0); };
+  const r = await h.redeemer.redeemAccount(account);
+  assert.equal(r.outcome, 'pre_claim_failed');
+  assert.equal(r.reason, 'account_removed');
+  assert.equal(h.calls.status + h.calls.claim.length, 0);
+  assert.deepEqual(h.am.accounts[0].quota, before);
+});
+
+test('removal during the quota status read cannot apply usage to the replacement index', async () => {
+  const accounts = [oauth('a'), oauth('b')];
+  const h = harness({ accounts, status: (_account, calls) => {
+    if (calls.status === 2) h.am.removeAccount(0);
+    return block();
+  } });
+  const before = { ...h.am.accounts[1].quota };
+  const r = await h.redeemer.redeemAccount(h.am.accounts[0]);
+  assert.equal(r.outcome, 'redeemed');
+  assert.equal(h.calls.status, 2);
+  assert.deepEqual(h.am.accounts[0].quota, before, 'the sibling at the renumbered index is untouched');
 });
 
 // ── through the proxy ───────────────────────────────────────────────────────

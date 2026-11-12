@@ -52,6 +52,35 @@ export async function saveState(state) {
   await writeJsonAtomic(getStatePath(), state);
 }
 
+const stateQueues = new Map();
+
+/**
+ * Re-read, mutate and atomically replace the runtime state. Callers in this
+ * process are serialized per path, so a periodic quota save cannot erase a
+ * pending reset claim written just before an irreversible POST.
+ *
+ * @param {(state: Record<string, any>) => any|Promise<any>} updater
+ */
+export function updateState(updater) {
+  const path = getStatePath();
+  const run = async () => {
+    let state;
+    try {
+      state = JSON.parse(await readFile(path, 'utf-8'));
+    } catch (/** @type {any} */ err) {
+      if (err.code !== 'ENOENT') throw err;
+      state = {};
+    }
+    const next = await updater(state);
+    await writeJsonAtomic(path, next === undefined ? state : next);
+    return next === undefined ? state : next;
+  };
+  const previous = stateQueues.get(path) || Promise.resolve();
+  const result = previous.then(run, run);
+  stateQueues.set(path, result.then(() => {}, () => {}));
+  return result;
+}
+
 /**
  * Write a JSON document so that the file at `path` is, at every instant, either
  * the previous complete document or the new one.

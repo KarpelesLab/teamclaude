@@ -427,6 +427,7 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
   ['/teamclaude/threshold', 'a client key cannot change settings'],
   ['/teamclaude/priority', 'a client key cannot change accounts'],
   ['/teamclaude/disable', 'a client key cannot change accounts'],
+  ['/teamclaude/claude-reset', 'a client key cannot redeem Claude resets'],
   // Not a config write, but it names a session and moves it: one tenant must
   // not be able to put another tenant's session on an account of its choosing.
   ['/teamclaude/session-pin', 'a client key cannot pin sessions'],
@@ -670,6 +671,86 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           console.error('[TeamClaude] Reload failed:', err.message);
           res.writeHead(500, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: 'reload failed; see the proxy log' }));
+        }
+        return;
+      }
+
+      // Irreversible Claude reset redemption. The fork, not the caller, picks
+      // the grant and request id. The response is explicitly whitelisted so
+      // neither identifier can cross the control plane.
+      if (req.method === 'POST' && req.url === '/teamclaude/claude-reset') {
+        const keylessRefusal = keylessMcpRefusal(req.headers, req.socket.remoteAddress, config.proxy, boundHost());
+        if (keylessRefusal) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, outcome: 'declined', reason: 'keyless_remote_refused' }));
+          return;
+        }
+        if (!hooks.redeemClaudeReset) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Claude reset redemption not supported' }));
+          return;
+        }
+        let body;
+        try {
+          body = JSON.parse((await readControlBody(req)) || '{}');
+        } catch (/** @type {any} */ err) {
+          const tooLarge = err.message === 'body too large';
+          res.writeHead(tooLarge ? 413 : 400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: tooLarge ? 'request body too large' : 'invalid request body' }));
+          return;
+        }
+        if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some(key => key !== 'account')) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'only "account" is accepted' }));
+          return;
+        }
+        const target = body.account;
+        if (typeof target !== 'string' || !target.trim()) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'missing "account"' }));
+          return;
+        }
+        const resolved = resolveUniqueAccountPin(accountManager, target);
+        if (resolved.index == null) {
+          res.writeHead(resolved.error === 'ambiguous' ? 409 : 404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, outcome: 'declined', reason: resolved.error === 'ambiguous' ? 'ambiguous_account' : 'unknown_account' }));
+          return;
+        }
+        try {
+          const r = await hooks.redeemClaudeReset(resolved.index);
+          const common = {
+            account: typeof r?.account === 'string' ? safeLine(r.account, 128) : '',
+            outcome: r?.outcome,
+            reason: typeof r?.reason === 'string' ? safeLine(r.reason, 160) : 'reset failed',
+          };
+          if (r?.outcome === 'redeemed' && r.result !== 'reset' && r.result !== 'already_used') {
+            res.writeHead(502, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, ...common, outcome: 'unknown', reason: 'unrecognized redemption verdict', mayHaveRedeemed: true }));
+            return;
+          }
+          if (r?.outcome === 'redeemed') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+              ok: true, ...common,
+              result: r.result === 'already_used' ? 'already_used' : 'reset',
+              resetsLeft: Number.isInteger(r.resetsLeft) ? r.resetsLeft : null,
+              cleared: Array.isArray(r.cleared) ? r.cleared.filter((/** @type {any} */ x) => typeof x === 'string').slice(0, 16) : [],
+              ...(r.pending === true ? { pending: true } : {}),
+            }));
+            return;
+          }
+          const declined = r?.outcome === 'declined';
+          res.writeHead(declined ? 409 : 502, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            ok: false, ...common,
+            outcome: declined ? 'declined' : r?.outcome === 'pre_claim_failed' ? 'pre_claim_failed' : 'unknown',
+            ...(declined && typeof r.result === 'string' ? { result: safeLine(r.result, 32) } : {}),
+            ...(!declined && r?.outcome !== 'pre_claim_failed' ? { mayHaveRedeemed: r?.mayHaveRedeemed === true } : {}),
+          }));
+        } catch {
+          console.error('[TeamClaude] Manual Claude reset failed without a safe upstream verdict');
+          res.writeHead(502, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, outcome: 'unknown', reason: 'reset operation failed', mayHaveRedeemed: true }));
         }
         return;
       }
@@ -1246,6 +1327,28 @@ export function resolveAccountPin(accountManager, token) {
   ]) if (i >= 0) return i;
 
   return null;
+}
+
+/**
+ * The irreversible-control counterpart to resolveAccountPin: first-match is fine
+ * for a routing preference, never for spending a reset. Every alias of every
+ * account is considered and anything but exactly one matching account fails.
+ *
+ * @param {any} accountManager
+ * @param {any} token
+ */
+export function resolveUniqueAccountPin(accountManager, token) {
+  const accounts = accountManager.accounts || [];
+  const norm = (/** @type {any} */ s) => (s || '').trim().toLowerCase();
+  const t = norm(token);
+  if (!t) return { index: null, error: 'not_found' };
+  const matches = accounts.flatMap((/** @type {any} */ a, /** @type {number} */ index) => {
+    const aliases = [a.accountUuid, a.orgUuid, a.name, (a.name || '').split(' (')[0]];
+    if (a.accountUuid && a.orgUuid) aliases.push(`${a.accountUuid}/${a.orgUuid}`);
+    return aliases.some(alias => norm(alias) === t) ? [index] : [];
+  });
+  if (matches.length === 1) return { index: matches[0], error: null };
+  return { index: null, error: matches.length > 1 ? 'ambiguous' : 'not_found' };
 }
 
 /**

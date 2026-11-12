@@ -89,3 +89,40 @@ test('saveConfig follows a symlinked config to its target instead of replacing t
     assert.deepEqual((await readdir(dir)).sort(), ['real.json', 'teamclaude.json']);
   });
 });
+
+test('a failed redemption-facing write cannot delete pending through the next volatile-state merge', async () => {
+  await withConfigDir(async ({ cfg }) => {
+    const statePath = cfg.getStatePath();
+    const pending = { a: { requestId: 'original', createdAt: 1 } };
+    await cfg.saveState({ claudeResetPending: pending });
+    await assert.rejects(cfg.updateState(() => { throw new Error('success-hold write failed'); }));
+    await cfg.updateState(state => {
+      state.quota = { exported: true };
+      state.clients = { ci: 2 };
+      state.usageDimensions = { project: { alpha: 3 } };
+      // Production deliberately does not mirror its in-memory pending map here.
+    });
+    assert.deepEqual(JSON.parse(await readFile(statePath, 'utf-8')).claudeResetPending, pending);
+  });
+});
+
+test('updateState serializes read-modify-write cycles and preserves sibling state', async () => {
+  await withConfigDir(async ({ cfg }) => {
+    const statePath = cfg.getStatePath();
+    await cfg.saveState({ claudeResetPending: { a: { requestId: 'r' } } });
+    const first = cfg.updateState(async state => {
+      state.quota = { hold: 1 };
+      await new Promise(resolve => setTimeout(resolve, 10));
+    });
+    const second = cfg.updateState(state => {
+      assert.deepEqual(state.quota, { hold: 1 }, 'the queued update re-reads after the first write');
+      state.clients = { ci: 2 };
+    });
+    await Promise.all([first, second]);
+    assert.deepEqual(JSON.parse(await readFile(statePath, 'utf-8')), {
+      claudeResetPending: { a: { requestId: 'r' } },
+      quota: { hold: 1 },
+      clients: { ci: 2 },
+    });
+  });
+});

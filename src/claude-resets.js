@@ -26,6 +26,7 @@
 
 import { randomUUID } from 'node:crypto';
 
+import { updateState } from './config.js';
 import { USAGE_URL, OAUTH_USAGE_BETA, USAGE_USER_AGENT, normalizeUsagePayload } from './oauth.js';
 import { providerOf, DEFAULT_PROVIDER } from './provider.js';
 import { safeLine } from './safe-text.js';
@@ -188,13 +189,15 @@ export function blockedUntil(account, now = Date.now()) {
 }
 
 /** @typedef {{ redeemed: boolean, reason: string, account?: string, result?: string|null, resetsLeft?: number|null, cleared?: string[] }} ClaudeRedeemResult */
+/** @typedef {{ outcome: 'redeemed'|'declined'|'pre_claim_failed'|'unknown', reason: string, result?: string|null, resetsLeft?: number|null, cleared?: string[], mayHaveRedeemed?: boolean, pending?: boolean }} ClaudeManualRedeemResult */
+/** @typedef {{ accountUuid: string|null, orgUuid: string, grantId: string, requestId: string, createdAt: number }} PendingClaudeReset */
 
 export class ClaudeResetRedeemer {
   /**
    * @param {any} accountManager
-   * @param {{ config?: Record<string, any>|null, statusFn?: Function, claimFn?: Function, now?: () => number, log?: Function, timeoutMs?: number }} [opts]
+   * @param {{ config?: Record<string, any>|null, statusFn?: Function, claimFn?: Function, now?: () => number, log?: Function, timeoutMs?: number, pending?: Record<string, any>|null, updateStateFn?: Function }} [opts]
    */
-  constructor(accountManager, { config = null, statusFn = fetchClaudeResetStatus, claimFn = claimClaudeReset, now = Date.now, log = console.log, timeoutMs = CLAUDE_REDEEM_BUDGET_MS } = {}) {
+  constructor(accountManager, { config = null, statusFn = fetchClaudeResetStatus, claimFn = claimClaudeReset, now = Date.now, log = console.log, timeoutMs = CLAUDE_REDEEM_BUDGET_MS, pending = null, updateStateFn = updateState } = {}) {
     this.am = accountManager;
     this.config = config;
     this.statusFn = statusFn;
@@ -202,10 +205,48 @@ export class ClaudeResetRedeemer {
     this.now = now;
     this.log = log;
     this.timeoutMs = timeoutMs;
+    this.updateState = /** @type {typeof updateState} */ (updateStateFn);
     /** @type {WeakMap<object, { cooldownUntil: number, requestId: string|null, grantId: string|null }>} */
     this.state = new WeakMap();
+    /** @type {Map<string, PendingClaudeReset|Record<string, any>>} */
+    this.pending = new Map(Object.entries(pending && typeof pending === 'object' && !Array.isArray(pending) ? pending : {}));
     /** @type {Promise<ClaudeRedeemResult>|null} */
     this.inFlight = null;
+    /** @type {Promise<ClaudeManualRedeemResult & { account?: string }>|null} */
+    this.manualInFlight = null;
+  }
+
+  exportPending() {
+    return Object.fromEntries(this.pending);
+  }
+
+  /** @param {Record<string, any>} account */
+  _pendingKey(account) {
+    return typeof account?.id === 'string' && account.id.length > 0 ? account.id : null;
+  }
+
+  // A reload can remove an account and renumber every later index. Resolve the
+  // live row by stable entry id before touching account-manager state.
+  /** @param {Record<string, any>} account */
+  _liveAccount(account) {
+    const live = (this.am.accounts || []).find((/** @type {Record<string, any>} */ a) => a.id === account?.id);
+    return live && live.orgUuid === account.orgUuid && live.accountUuid === account.accountUuid ? live : null;
+  }
+
+  /** @param {string} accountId @param {string} requestId @param {Record<string, any>} record */
+  async _discardPendingBeforeClaim(accountId, requestId, record) {
+    this.pending.delete(accountId);
+    try {
+      await this.updateState(saved => {
+        const pending = { ...(saved.claudeResetPending || {}) };
+        if (pending[accountId]?.requestId === requestId) delete pending[accountId];
+        saved.claudeResetPending = pending;
+      });
+      return true;
+    } catch {
+      this.pending.set(accountId, record);
+      return false;
+    }
   }
 
   /**
@@ -220,6 +261,9 @@ export class ClaudeResetRedeemer {
     for (const account of this.am.accounts || []) {
       const held = account.quota?.claudeResetHoldUntil;
       if (Number.isFinite(held)) until = Math.max(until, held);
+    }
+    for (const record of this.pending.values()) {
+      if (Number.isFinite(record?.createdAt)) until = Math.max(until, record.createdAt + UNKNOWN_HOLD_MS);
     }
     return until;
   }
@@ -256,7 +300,8 @@ export class ClaudeResetRedeemer {
    */
   async maybeRedeemForPool(accounts) {
     if (this.config?.autoRedeemResets !== true) return { redeemed: false, reason: 'auto-redeem is switched off' };
-    if (!accounts?.length) return { redeemed: false, reason: 'no candidate accounts' };
+    if (!accounts?.length && this.pending.size === 0) return { redeemed: false, reason: 'no candidate accounts' };
+    if (this.manualInFlight) return { redeemed: false, reason: 'in_progress' };
     if (this.inFlight) return this.inFlight;
     const attempt = this._attempt(accounts).finally(() => { this.inFlight = null; });
     this.inFlight = attempt;
@@ -266,6 +311,14 @@ export class ClaudeResetRedeemer {
   /** @param {Record<string, any>[]} accounts */
   async _attempt(accounts) {
     const now = this.now();
+    if (this.pending.size > 0) {
+      if (now < this.fleetHoldUntil) return { redeemed: false, reason: 'holding off after a recent Claude reset attempt' };
+      const replay = await this._resolvePending();
+      const redeemed = replay.find(r => r.outcome === 'redeemed');
+      if (redeemed) return { redeemed: true, account: redeemed.account, reason: 'a pending Claude reset was confirmed', result: redeemed.result, resetsLeft: redeemed.resetsLeft, cleared: redeemed.cleared };
+      if (replay.some(r => r.outcome === 'unknown')) return { redeemed: false, reason: 'a pending Claude reset still has no verdict; it may still have gone through' };
+      return { redeemed: false, reason: 'pending Claude reset replay finished; no sibling was claimed' };
+    }
     if (now < this.fleetHoldUntil) return { redeemed: false, reason: 'holding off after a recent Claude reset attempt' };
     const deadline = now + this.timeoutMs;
     const candidates = accounts
@@ -337,31 +390,246 @@ export class ClaudeResetRedeemer {
       state.cooldownUntil = status.cooldownUntil;
       return { redeemed: false, account: name, reason: 'upstream reports a reset cooldown' };
     }
-    if (state.grantId !== grant.id) { state.grantId = grant.id; state.requestId = null; }
-    state.requestId ||= randomUUID();
     this.log(`[TeamClaude] Redeeming a banked Claude usage-limit reset on "${name}" — no Claude account can serve the request`);
-    const r = await this.claimFn(account, { grantId: grant.id, requestId: state.requestId }, { timeoutMs: left() });
+    const r = await this._executeClaim(account, grant, deadline);
+    if (r.outcome === 'unknown') {
+      this.log(`[TeamClaude] Claude reset on "${name}" got no verdict; it may have been spent, so the fleet holds off`);
+      return { redeemed: false, account: name, reason: `reset request failed (${r.reason}); it may still have gone through` };
+    }
+    if (r.outcome === 'pre_claim_failed') return { redeemed: false, account: name, reason: r.reason };
+    if (r.outcome === 'redeemed') {
+      this.log(`[TeamClaude] Redeemed a Claude usage-limit reset on "${name}" — cleared ${(r.cleared || []).join(', ') || 'its limits'}, ${r.resetsLeft ?? '?'} left`);
+      return { redeemed: true, account: name, reason: 'no Claude account could serve the request', result: r.result, resetsLeft: r.resetsLeft, cleared: r.cleared };
+    }
+    this.log(`[TeamClaude] Claude reset on "${name}" declined upstream (${r.result || 'no result'}); nothing was spent`);
+    return { redeemed: false, account: name, reason: `upstream declined (${r.result || r.reason})`, result: r.result };
+  }
 
-    if (r?.error) {
-      // No verdict, over a POST that may have spent the grant: keep the key for
-      // a replay, and stop anything else spending in the meantime.
-      state.cooldownUntil = now + UNKNOWN_HOLD_MS;
-      this._holdFleet(account, now + UNKNOWN_HOLD_MS);
-      this.log(`[TeamClaude] Claude reset on "${name}" got no verdict (${r.error}); it may have been spent, so the fleet holds off`);
-      return { redeemed: false, account: name, reason: `reset request failed (${r.error}); it may still have gone through` };
+  /**
+   * Operator-initiated redemption. Unlike the pool-dry policy this accepts any
+   * currently usable grant, including one with no exhausted window.
+   *
+   * @param {Record<string, any>} account
+   * @returns {Promise<ClaudeManualRedeemResult & { account?: string }>}
+   */
+  redeemAccount(account) {
+    const name = safeLine(account?.name, 64);
+    if (this.inFlight || this.manualInFlight) {
+      return Promise.resolve(/** @type {ClaudeManualRedeemResult & { account?: string }} */ ({ outcome: 'declined', account: name, reason: 'in_progress' }));
+    }
+    const attempt = this._redeemAccount(account).finally(() => { this.manualInFlight = null; });
+    this.manualInFlight = attempt;
+    return attempt;
+  }
+
+  /** @param {Record<string, any>} account @returns {Promise<ClaudeManualRedeemResult & { account?: string }>} */
+  async _redeemAccount(account) {
+    const name = safeLine(account?.name, 64);
+    if (!this._isClaude(account) || !account.orgUuid) {
+      return { outcome: 'declined', account: name, reason: 'unsupported_seat' };
+    }
+    if (this.pending.size > 0 && this.now() < this.fleetHoldUntil) {
+      return { outcome: 'declined', account: name, reason: 'cooldown' };
+    }
+    const key = this._pendingKey(account);
+    const replay = await this._resolvePending();
+    const own = key ? replay.find(r => r.accountId === key) : null;
+    const orphan = replay.find(r => r.outcome === 'unknown' && (r.reason === 'pending_orphan' || r.reason === 'pending_identity_mismatch'));
+    if (orphan) {
+      const { accountId: _id, ...result } = orphan;
+      void _id;
+      return result;
+    }
+    if (own?.outcome === 'redeemed' || own?.outcome === 'unknown') {
+      const { accountId: _id, ...result } = own;
+      void _id;
+      return result;
+    }
+    if (replay.length > 0 || this.pending.size > 0) {
+      return { outcome: 'declined', account: name, reason: 'pending_replay' };
+    }
+    if (this.now() < this.fleetHoldUntil || this.now() < this._stateFor(account).cooldownUntil) {
+      return { outcome: 'declined', account: name, reason: 'cooldown' };
+    }
+    account = this._liveAccount(account);
+    if (!account) return { outcome: 'pre_claim_failed', account: name, reason: 'account_removed' };
+    const deadline = this.now() + this.timeoutMs;
+    try { await this.am.ensureTokenFresh(account.index); } catch (/** @type {any} */ err) {
+      return { outcome: 'pre_claim_failed', account: name, reason: `token refresh failed (${safeLine(err?.message || String(err), 80)})` };
+    }
+    account = this._liveAccount(account);
+    if (!account) return { outcome: 'pre_claim_failed', account: name, reason: 'account_removed' };
+    let read;
+    try { read = await this.statusFn(account, { timeoutMs: Math.max(1, deadline - this.now()) }); } catch (/** @type {any} */ err) {
+      return { outcome: 'pre_claim_failed', account: name, reason: `could not read reset status (${safeLine(err?.message || String(err), 80)})` };
+    }
+    if (read?.error) return { outcome: 'pre_claim_failed', account: name, reason: `could not read reset status (${read.error})` };
+    const status = read.reset;
+    if (!status?.eligible) return { outcome: 'declined', account: name, reason: 'ineligible', result: status?.ineligibleReason ?? null };
+    const grant = claimableGrant(status, this.now());
+    if (!grant) return { outcome: 'declined', account: name, reason: 'no_usable_grant' };
+    if (status.cooldownUntil != null && status.cooldownUntil > this.now()) {
+      return { outcome: 'declined', account: name, reason: 'cooldown' };
+    }
+    const result = await this._executeClaim(account, grant, deadline);
+    return { account: name, ...result };
+  }
+
+  /**
+   * Replay every durable unresolved claim before considering new work. Pending
+   * records deliberately skip the fresh-grant gate: a grant that disappeared is
+   * exactly the restart-after-unknown case the original request id resolves.
+   *
+   * @returns {Promise<(ClaudeManualRedeemResult & { accountId: string, account: string })[]>}
+   */
+  async _resolvePending() {
+    const entries = [...this.pending.entries()].sort(([a, av], [b, bv]) => {
+      const at = Number(av?.createdAt), bt = Number(bv?.createdAt);
+      return (Number.isFinite(at) ? at : 0) - (Number.isFinite(bt) ? bt : 0) || a.localeCompare(b);
+    });
+    /** @type {(ClaudeManualRedeemResult & { accountId: string, account: string })[]} */
+    const results = [];
+    for (const [accountId, record] of entries) {
+      const account = (this.am.accounts || []).find((/** @type {Record<string, any>} */ a) => a.id === accountId);
+      const valid = account && this._isClaude(account)
+        && (typeof record?.accountUuid === 'string' || record?.accountUuid === null) && record.accountUuid === account.accountUuid
+        && typeof record?.orgUuid === 'string' && record.orgUuid === account.orgUuid
+        && typeof record?.grantId === 'string' && GRANT_ID.test(record.grantId)
+        && typeof record?.requestId === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(record.requestId)
+        && Number.isFinite(record?.createdAt);
+      if (!valid) {
+        results.push({ outcome: 'unknown', accountId, account: safeLine(account?.name, 64), reason: account ? 'pending_identity_mismatch' : 'pending_orphan', mayHaveRedeemed: true });
+        break;
+      }
+      try { await this.am.ensureTokenFresh(account.index); } catch {
+        results.push({ outcome: 'unknown', accountId, account: safeLine(account.name, 64), reason: 'pending_token_refresh_failed', mayHaveRedeemed: true });
+        break;
+      }
+      const result = await this._executeClaim(account, { id: record.grantId }, this.now() + this.timeoutMs, record.requestId);
+      results.push({ accountId, account: safeLine(account.name, 64), ...result });
+      break;
+    }
+    return results;
+  }
+
+  /**
+   * The one claim executor shared by automatic and manual redemption. Intent is
+   * durable before the POST. Success clears pending only with its fleet hold;
+   * if that write fails, the known verdict survives with pending replay intent.
+   *
+   * @param {Record<string, any>} account
+   * @param {{ id: string }} grant
+   * @param {number} deadline
+   * @param {string|null} [replayRequestId]
+   * @returns {Promise<ClaudeManualRedeemResult>}
+   */
+  async _executeClaim(account, grant, deadline, replayRequestId = null) {
+    account = this._liveAccount(account);
+    if (!account) return { outcome: replayRequestId ? 'unknown' : 'pre_claim_failed', reason: 'account_removed', ...(replayRequestId ? { mayHaveRedeemed: true } : {}) };
+    let state = this._stateFor(account);
+    const accountId = this._pendingKey(account);
+    if (!accountId || typeof account.orgUuid !== 'string' || !account.orgUuid) {
+      return { outcome: replayRequestId ? 'unknown' : 'pre_claim_failed', reason: 'missing_stable_account_identity', ...(replayRequestId ? { mayHaveRedeemed: true } : {}) };
+    }
+    try { await this.am.ensureTokenFresh(account.index); } catch (/** @type {any} */ err) {
+      return { outcome: replayRequestId ? 'unknown' : 'pre_claim_failed', reason: `token refresh failed (${safeLine(err?.message || String(err), 80)})`, ...(replayRequestId ? { mayHaveRedeemed: true } : {}) };
+    }
+    const existing = this.pending.get(accountId);
+    const requestId = replayRequestId || existing?.requestId || randomUUID();
+    const record = { accountUuid: typeof account.accountUuid === 'string' ? account.accountUuid : null, orgUuid: account.orgUuid, grantId: grant.id, requestId, createdAt: existing?.createdAt || this.now() };
+    if (!replayRequestId) {
+      this.pending.set(accountId, record);
+      try {
+        await this.updateState(saved => {
+          saved.claudeResetPending = { ...(saved.claudeResetPending || {}), [accountId]: record };
+        });
+      } catch (/** @type {any} */ err) {
+        if (existing) this.pending.set(accountId, existing);
+        else this.pending.delete(accountId);
+        return { outcome: 'pre_claim_failed', reason: `could not persist reset intent (${safeLine(err?.message || String(err), 80)})` };
+      }
+    }
+    const current = this._liveAccount(account);
+    if (!current) {
+      if (replayRequestId) return { outcome: 'unknown', reason: 'account_removed', mayHaveRedeemed: true };
+      if (!await this._discardPendingBeforeClaim(accountId, requestId, record)) {
+        return { outcome: 'unknown', reason: 'account removed before claim and pending intent could not be cleared', mayHaveRedeemed: true };
+      }
+      return { outcome: 'pre_claim_failed', reason: 'account_removed' };
+    }
+    account = current;
+    state = this._stateFor(account);
+    try { await this.am.ensureTokenFresh(account.index); } catch (/** @type {any} */ err) {
+      if (replayRequestId) return { outcome: 'unknown', reason: 'pending_token_refresh_failed', mayHaveRedeemed: true };
+      if (!await this._discardPendingBeforeClaim(accountId, requestId, record)) {
+        return { outcome: 'unknown', reason: 'token refresh failed and pending intent could not be cleared', mayHaveRedeemed: true };
+      }
+      return { outcome: 'pre_claim_failed', reason: `token refresh failed (${safeLine(err?.message || String(err), 80)})` };
+    }
+    const beforeClaim = this._liveAccount(account);
+    if (!beforeClaim) {
+      if (replayRequestId) return { outcome: 'unknown', reason: 'account_removed', mayHaveRedeemed: true };
+      if (!await this._discardPendingBeforeClaim(accountId, requestId, record)) {
+        return { outcome: 'unknown', reason: 'account removed before claim and pending intent could not be cleared', mayHaveRedeemed: true };
+      }
+      return { outcome: 'pre_claim_failed', reason: 'account_removed' };
+    }
+    account = beforeClaim;
+    state = this._stateFor(account);
+    state.grantId = grant.id;
+    state.requestId = requestId;
+    const r = await this.claimFn(account, { grantId: grant.id, requestId }, { timeoutMs: Math.max(1, deadline - this.now()) });
+    const knownDecline = ['not_limited', 'cooldown', 'ineligible', 'unavailable'].includes(r?.result);
+    const afterClaim = this._liveAccount(account);
+    if (!knownDecline && !afterClaim) {
+      return { outcome: 'unknown', reason: 'account_removed_after_claim', mayHaveRedeemed: true };
+    }
+    if (afterClaim) {
+      account = afterClaim;
+      state = this._stateFor(account);
+    }
+    if (r?.error || (!['reset', 'already_used'].includes(r?.result) && !knownDecline)) {
+      const until = this.now() + UNKNOWN_HOLD_MS;
+      state.cooldownUntil = until;
+      this._holdFleet(account, until);
+      await this.updateState(saved => { saved.quota = this.am.exportQuotaState(); }).catch(() => {});
+      return { outcome: 'unknown', reason: safeLine(r?.error || 'unrecognized reset verdict', 120), mayHaveRedeemed: true };
+    }
+    if (r.result === 'reset' || r.result === 'already_used') {
+      state.cooldownUntil = this.now() + SUCCESS_HOLD_MS;
+      this._holdFleet(account, state.cooldownUntil);
+      this.pending.delete(accountId);
+      try {
+        await this.updateState(saved => {
+          saved.quota = this.am.exportQuotaState();
+          const pending = { ...(saved.claudeResetPending || {}) };
+          if (pending[accountId]?.requestId === requestId) delete pending[accountId];
+          saved.claudeResetPending = pending;
+        });
+      } catch {
+        this.pending.set(accountId, record);
+        return { outcome: 'redeemed', reason: 'reset verdict received but its fleet hold could not be persisted', result: r.result, resetsLeft: r.resetsLeft, cleared: r.cleared, pending: true };
+      }
+      state.requestId = null;
+      state.grantId = null;
+      await this._reapply(account, deadline);
+      return { outcome: 'redeemed', reason: r.result === 'already_used' ? 'prior redemption confirmed' : 'reset redeemed', result: r.result, resetsLeft: r.resetsLeft, cleared: r.cleared };
+    }
+    state.cooldownUntil = r.result === 'cooldown' && r.cooldownUntil ? r.cooldownUntil : this.now() + DECLINED_COOLDOWN_MS;
+    this.pending.delete(accountId);
+    try {
+      await this.updateState(saved => {
+        const pending = { ...(saved.claudeResetPending || {}) };
+        if (pending[accountId]?.requestId === requestId) delete pending[accountId];
+        saved.claudeResetPending = pending;
+      });
+    } catch {
+      this.pending.set(accountId, record);
+      return { outcome: 'unknown', reason: 'reset refusal received but pending intent could not be cleared', result: r.result, mayHaveRedeemed: true };
     }
     state.requestId = null;
     state.grantId = null;
-    if (r.result === 'reset' || r.result === 'already_used') {
-      state.cooldownUntil = now + SUCCESS_HOLD_MS;
-      this._holdFleet(account, now + SUCCESS_HOLD_MS);
-      this.log(`[TeamClaude] Redeemed a Claude usage-limit reset on "${name}" — cleared ${(r.cleared || []).join(', ') || 'its limits'}, ${r.resetsLeft ?? '?'} left`);
-      await this._reapply(account, deadline);
-      return { redeemed: true, account: name, reason: 'no Claude account could serve the request', result: r.result, resetsLeft: r.resetsLeft, cleared: r.cleared };
-    }
-    state.cooldownUntil = r.result === 'cooldown' && r.cooldownUntil ? r.cooldownUntil : now + DECLINED_COOLDOWN_MS;
-    this.log(`[TeamClaude] Claude reset on "${name}" declined upstream (${r.result || 'no result'}${r.reason ? `: ${r.reason}` : ''}); nothing was spent`);
-    return { redeemed: false, account: name, reason: `upstream declined (${r.result || 'no result'}${r.reason ? `: ${r.reason}` : ''})`, result: r.result };
+    return { outcome: 'declined', reason: r.reason || r.result, result: r.result, resetsLeft: r.resetsLeft, cleared: r.cleared };
   }
 
   /**
@@ -374,9 +642,13 @@ export class ClaudeResetRedeemer {
    * @param {number} deadline
    */
   async _reapply(account, deadline) {
+    account = this._liveAccount(account);
+    if (!account) return;
     try { this.am.clearRateLimited(account.index); } catch { /* not held */ }
     try { this.am.clearUpstreamRejected(account.index); } catch { /* not rejected */ }
     const read = await this.statusFn(account, { timeoutMs: Math.max(1, deadline - this.now()) });
+    account = this._liveAccount(account);
+    if (!account) return;
     if (read?.usage && !read.usage.error) this.am.applyUsageData(account.index, read.usage);
   }
 }

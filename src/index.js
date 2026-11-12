@@ -5,7 +5,7 @@ import { createInterface } from 'node:readline';
 import { createWriteStream, existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { isProxyUp } from './proxy-up.js';
-import { loadOrCreateConfig, loadConfig, loadConfigPersistingIds, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, loadState, saveState } from './config.js';
+import { loadOrCreateConfig, loadConfig, loadConfigPersistingIds, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, loadState, updateState } from './config.js';
 import { installCrashHandlers } from './crash-log.js';
 import { AccountManager, distributionMode, accountRouting } from './account-manager.js';
 import { validateAdaptiveConfig } from './adaptive-distribution.js';
@@ -408,10 +408,15 @@ async function serverCommand() {
   // soonest-resetting weekly window) instead of defaulting to the first one.
   accountManager.selectActiveAccount();
 
-  // Periodically persist quota (and once more on shutdown) to the state file.
+  // Periodically merge volatile state (and once more on shutdown). updateState
+  // re-reads first so these writes cannot erase a pending claim persisted by the
+  // redeemer immediately before its POST.
   const persistQuotaState = () =>
-    saveState({ quota: accountManager.exportQuotaState(), clients: clientUsage.exportState(), usageDimensions: dimensionUsage.exportState() })
-      .catch(err => console.error(`[TeamClaude] Failed to save quota state: ${err.message}`));
+    updateState(state => {
+      state.quota = accountManager.exportQuotaState();
+      state.clients = clientUsage.exportState();
+      state.usageDimensions = dimensionUsage.exportState();
+    }).catch((/** @type {any} */ err) => console.error(`[TeamClaude] Failed to save quota state: ${err.message}`));
   let quotaSaveInterval = null;
 
   // An account admitted from somewhere other than this install's config: the
@@ -864,8 +869,9 @@ async function serverCommand() {
   // binds on the next refusal, not the next restart.
   const redeemer = new ResetCreditRedeemer(accountManager, { config });
   // Banked Claude usage-limit resets, armed by the same switch (autoRedeemResets).
-  const claudeRedeemer = new ClaudeResetRedeemer(accountManager, { config });
+  const claudeRedeemer = new ClaudeResetRedeemer(accountManager, { config, pending: savedState?.claudeResetPending, updateStateFn: updateState });
   hooks.redeemClaudeResetForPool = (/** @type {Record<string, any>[]} */ accounts) => claudeRedeemer.maybeRedeemForPool(accounts);
+  hooks.redeemClaudeReset = (/** @type {number} */ index) => claudeRedeemer.redeemAccount(accountManager.accounts[index]);
   hooks.redeemCodexResetForPool = (/** @type {Record<string, any>[]} */ accounts) => redeemer.maybeRedeemForPool(accounts);
   hooks.getStatusExtra = () => ({
     // Read live from the shared config (not a startup snapshot) so the TUI's
