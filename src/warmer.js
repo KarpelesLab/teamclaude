@@ -276,6 +276,19 @@ export class Warmer {
 
   _isWarmTarget(account, now = this.nowFn()) {
     if (!this._isWarmCandidate(account)) return false;
+    // Nor while the account sits out an entitlement cooldown (an OAuth policy
+    // 403). A warm-up is pinned, so nothing in the listener holds it back, and
+    // its refusal counts as a new denial: warming stepped the very cooldown it
+    // ignored from 5 minutes to 15, then 60. Skipping costs that slot's warm-up
+    // for the account - nothing retries it before the next slot - but a warm-up
+    // the policy refuses warms nothing either. Checked here, when the warm-up
+    // would be sent, not in _isWarmCandidate: a rolling slot still defers the
+    // account past its reset, and the deferred warm-up asks again when it fires.
+    // A routing cooldown is not checked: it lasts 30 seconds, a warm-up through a
+    // proxy that has recovered succeeds, and one through a proxy still down fails
+    // as the request that armed it did, arming it again for 30 seconds.
+    const am = /** @type {import('./account-manager.js').AccountManager} */ (this.am);
+    if (am.isEntitlementDenied(account.index, now)) return false;
     const reset = account.quota?.unified5hReset;
     return !(reset && now < reset); // a future reset ⇒ session already running
   }
