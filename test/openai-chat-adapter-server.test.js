@@ -186,6 +186,27 @@ test('Claude Code no-op envelopes reach agy without their client-only fields', a
   }
 });
 
+test('Claude Code text cache hints preserve plain text and never reach agy', async () => {
+  const ctx = await fixture();
+  try {
+    const res = await ctx.post(request(false, {
+      system: [
+        { type: 'text', text: 'one ' },
+        { type: 'text', text: 'two ', cache_control: { type: 'ephemeral' } },
+        { type: 'text', text: 'three', cache_control: { type: 'ephemeral' } },
+      ],
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hello', cache_control: { type: 'ephemeral' } }] }],
+    }));
+    assert.equal(res.status, 200, res.body);
+    assert.equal(ctx.agyRequests.length, 1);
+    assert.equal(ctx.agyRequests[0].body.messages[0].content, 'one two three');
+    assert.equal(ctx.agyRequests[0].body.messages[1].content, 'hello');
+    assert.equal(JSON.stringify(ctx.agyRequests[0].body).includes('cache_control'), false);
+  } finally {
+    await ctx.close();
+  }
+});
+
 test('unsupported requests and count_tokens are refused before either upstream', async () => {
   const ctx = await fixture();
   try {
@@ -196,6 +217,7 @@ test('unsupported requests and count_tokens are refused before either upstream',
       request(false, { thinking: { type: 'enabled' } }),
       request(false, { thinking: { type: 'adaptive', display: 'visible' } }),
       request(false, { context_management: { edits: [{ type: 'clear_thinking_20251015', keep: 'none' }] } }),
+      request(false, { system: [{ type: 'text', text: 'x', cache_control: { type: 'ephemeral', ttl: '1h' } }] }),
     ];
     for (const body of invalid) {
       const res = await ctx.post(body);
@@ -398,6 +420,10 @@ for (const first of [MODEL, CLAUDE_MODEL]) {
           model,
           messages: [{ role: 'user', content: 'one stable conversation opening' }],
           ...(model === MODEL ? {
+            system: [
+              { type: 'text', text: 'system one ' },
+              { type: 'text', text: 'system two', cache_control: { type: 'ephemeral' } },
+            ],
             tools: [],
             thinking: { type: 'adaptive', display: 'omitted' },
             context_management: { edits: [{ type: 'clear_thinking_20251015', keep: 'all' }] },

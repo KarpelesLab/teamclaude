@@ -112,7 +112,11 @@ function textContent(content, where) {
   let text = '';
   for (const block of content) {
     if (!block || block.type !== 'text' || typeof block.text !== 'string'
-      || Object.keys(block).some(key => key !== 'type' && key !== 'text')) {
+      || Object.keys(block).some(key => key !== 'type' && key !== 'text' && key !== 'cache_control')
+      || (block.cache_control !== undefined && (!block.cache_control || typeof block.cache_control !== 'object'
+        || Array.isArray(block.cache_control)
+        || Object.keys(block.cache_control).some(key => key !== 'type')
+        || block.cache_control.type !== 'ephemeral'))) {
       requestError(`${where} supports plain text blocks only`);
     }
     text += block.text;

@@ -66,6 +66,20 @@ test('translates text messages, system, sampling, stops and native Gemini model 
   });
 });
 
+test('accepts text cache hints in order and omits them from OpenAI messages', () => {
+  const out = translated({
+    system: [
+      { type: 'text', text: 'one ' },
+      { type: 'text', text: 'two ', cache_control: { type: 'ephemeral' } },
+      { type: 'text', text: 'three', cache_control: { type: 'ephemeral' } },
+    ],
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'hello', cache_control: { type: 'ephemeral' } }] }],
+  });
+  assert.equal(out.messages[0].content, 'one two three');
+  assert.equal(out.messages[1].content, 'hello');
+  assert.equal(JSON.stringify(out).includes('cache_control'), false);
+});
+
 test('applies modelMap before modelPrefix exactly once', () => {
   const out = translateOpenAIChatRequest(request(), {
     modelMap: { 'gemini-3-pro-preview': 'gemini-3-pro' },
@@ -126,7 +140,9 @@ test('rejects tools, rich content and unsupported semantics before translation',
     { context_management: { edits: [{ type: 'clear_thinking_20251015', keep: 'all' }], extra: true } },
     { messages: [{ role: 'user', content: [{ type: 'image', source: {} }] }] },
     { messages: [{ role: 'assistant', content: [{ type: 'tool_use', id: 'x' }] }] },
-    { system: [{ type: 'text', text: 'x', cache_control: { type: 'ephemeral' } }] },
+    { system: [{ type: 'text', text: 'x', cache_control: { type: 'ephemeral', ttl: '1h' } }] },
+    { system: [{ type: 'text', text: 'x', cache_control: { type: 'persistent' } }] },
+    { system: [{ type: 'text', text: 'x', cache_control: null }] },
     { model: 'claude-sonnet-4-6' },
   ];
   for (const extra of invalid) assert.throws(() => translated(extra), OpenAIChatRequestError);
