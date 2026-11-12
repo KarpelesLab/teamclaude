@@ -12,7 +12,7 @@ import { sanitizeContentBlocks, contentBlockTypesToStrip } from './content-block
 import { refusalFromSseEvent, refusalFromBody, reportRefusal } from './refusal-watch.js';
 import { upstreamErrorFromBody, reportUpstreamError } from './upstream-error-tap.js';
 import { stampGatewayUser } from './user-identity.js';
-import { SEAT_REASONS, clientRoutePolicyActive, routeForClient, resolveClientRoute, seatVerdict, combineVerdicts, seatAnswer, verdictReason, recordSeatRejection, clearSeatRejection, clientRoutesStatus, callerSeat, nextInSeatQueue, nextInSeatQueueIndex, parseSeatPolicies, keyHashOf, offerKeyRef, matchContinuationPolicy, callerContinuationPolicy, continuationPolicyStatus } from './client-routes.js';
+import { SEAT_REASONS, clientRoutePolicyActive, routeForClient, resolveClientRoute, seatVerdict, combineVerdicts, seatAnswer, verdictReason, recordSeatRejection, clearSeatRejection, clientRoutesStatus, callerSeat, nextInSeatQueue, nextInSeatQueueIndex, parseSeatPolicies, keyHashOf, offerKeyRef, matchContinuationPolicy, callerContinuationPolicy, continuationPolicyStatus, norm } from './client-routes.js';
 import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
 import { isTokenExpired } from './oauth.js';
 import { TopLevelFieldFinder, modelGlobMatches, parseRequestEffort, parseRequestStream, weeklyBucketForModel } from './model.js';
@@ -3501,8 +3501,8 @@ const MAX_CONTINUATION_HOPS = 8;
  */
 function clientKeyStillCurrent(proxyConfig, client, keyHash) {
   const keys = Array.isArray(proxyConfig?.clientKeys) ? usableClientKeys(proxyConfig.clientKeys) : [];
-  const wanted = typeof client === 'string' ? client.trim().toLowerCase() : '';
-  return keys.some((/** @type {any} */ e) => e.name.trim().toLowerCase() === wanted && keyHashOf(e.key) === keyHash);
+  const wanted = norm(client);
+  return keys.some((/** @type {any} */ e) => norm(e.name) === wanted && keyHashOf(e.key) === keyHash);
 }
 
 /**

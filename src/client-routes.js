@@ -50,7 +50,7 @@ export const SEAT_REASONS = Object.freeze({
   operatorPin: 'operator-pin',
 });
 
-const norm = (/** @type {unknown} */ s) => (typeof s === 'string' ? s.trim().toLowerCase() : '');
+export const norm = (/** @type {unknown} */ s) => (typeof s === 'string' ? s.trim().toLowerCase() : '');
 const SEAT_SLUG = /^[a-z0-9][a-z0-9-]{0,39}$/;
 const SEAT_POLICY_MODES = new Set(['force', 'recommend']);
 

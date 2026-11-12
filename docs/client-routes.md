@@ -68,7 +68,7 @@ entirely, so every local and remote worker using the key follows the one owner c
 captures `{ mode, revision }` once at admission; that snapshot governs all its retries and hops.
 
 - A key with no root keeps today's header behavior; the only exceptions are the two bounds below,
-  which apply to every force continuation, header-driven included: the 8-attempt cap and the
+  which apply to every force continuation, header-driven included: the 8-hop cap and the
   mid-request key re-check. An absent `continuationPolicies` key means no roots for everyone.
 - A malformed list (not an array) fails safe: every key recommends and legacy force headers are
   ignored, with `continuationPolicyLoadError: "malformed_list"` in status. An entry with a valid
@@ -79,7 +79,8 @@ captures `{ mode, revision }` once at admission; that snapshot governs all its r
   tracker key, offer record, log line or status). A revision change invalidates older offers: a
   mismatch consumes the offer and fails closed, and an in-flight request admitted under the old
   revision records nothing under the new one.
-- Force continuation is capped at **8 upstream attempts per request**; the next would-be hop gets a
+- Force continuation is capped at **8 automatic continuations (hops) per request** — 9 upstream
+  attempts counting the first; the next would-be hop gets a
   non-unified 429 with `x-should-retry: false`. Before every force hop the presented key is
   re-checked against the current client keys: a key revoked or rotated by a reload mid-request ends
   the request with the same non-unified 429 instead of hopping.
