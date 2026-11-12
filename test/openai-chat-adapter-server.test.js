@@ -248,6 +248,14 @@ test('unsupported requests and count_tokens are refused before either upstream',
       const res = await ctx.post(body);
       assert.equal(res.status, 400, res.body);
     }
+    const diagnostic = await ctx.post(request(false, {
+      system: [{ type: 'text', text: 'secret-system-text', cache_control: { type: 'ephemeral', ttl: '1h' } }],
+    }));
+    assert.equal(diagnostic.status, 400, diagnostic.body);
+    assert.match(diagnostic.body, /index=0/);
+    assert.match(diagnostic.body, /cacheType=ephemeral/);
+    assert.match(diagnostic.body, /cacheKeys=ttl,type/);
+    assert.doesNotMatch(diagnostic.body, /secret-system-text/);
     const count = await ctx.post(request(), { path: '/v1/messages/count_tokens?beta=true' });
     assert.equal(count.status, 400, count.body);
     assert.equal(ctx.agyRequests.length, 0);

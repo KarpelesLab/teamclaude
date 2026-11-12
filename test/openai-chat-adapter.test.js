@@ -174,6 +174,23 @@ test('rejects tools, rich content and unsupported semantics before translation',
   for (const extra of invalid) assert.throws(() => translated(extra), OpenAIChatRequestError);
 });
 
+test('reports safe structure for rejected system blocks without exposing text', () => {
+  assert.throws(() => translated({
+    system: [
+      { type: 'text', text: 'valid' },
+      { type: 'text', text: 'secret-system-text', cache_control: { type: 'ephemeral', ttl: '1h' } },
+    ],
+  }), error => {
+    assert.match(error.message, /index=1/);
+    assert.match(error.message, /type=text/);
+    assert.match(error.message, /keys=cache_control,text,type/);
+    assert.match(error.message, /cacheType=ephemeral/);
+    assert.match(error.message, /cacheKeys=ttl,type/);
+    assert.doesNotMatch(error.message, /secret-system-text/);
+    return true;
+  });
+});
+
 test('translates a final response with exact agy usage and no invented cache creation', () => {
   const out = translateOpenAIChatResponse({
     id: 'chatcmpl-1',

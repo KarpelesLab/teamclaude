@@ -118,14 +118,18 @@ function textContent(content, where) {
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) requestError(`${where} must be a string or text blocks`);
   let text = '';
-  for (const block of content) {
+  for (const [index, block] of content.entries()) {
     if (!block || block.type !== 'text' || typeof block.text !== 'string'
       || Object.keys(block).some(key => key !== 'type' && key !== 'text' && key !== 'cache_control')
       || (block.cache_control !== undefined && (!block.cache_control || typeof block.cache_control !== 'object'
         || Array.isArray(block.cache_control)
         || Object.keys(block.cache_control).some(key => key !== 'type')
         || block.cache_control.type !== 'ephemeral'))) {
-      requestError(`${where} supports plain text blocks only`);
+      const blockKeys = block && typeof block === 'object' && !Array.isArray(block) ? Object.keys(block).sort().join(',') : typeof block;
+      const cacheType = block?.cache_control?.type ?? typeof block?.cache_control;
+      const cacheKeys = block?.cache_control && typeof block.cache_control === 'object' && !Array.isArray(block.cache_control)
+        ? Object.keys(block.cache_control).sort().join(',') : typeof block?.cache_control;
+      requestError(`${where} supports plain text blocks only (index=${index}, type=${block?.type}, keys=${blockKeys}, cacheType=${cacheType}, cacheKeys=${cacheKeys})`);
     }
     text += block.text;
   }
