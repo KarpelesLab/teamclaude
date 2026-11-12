@@ -14,6 +14,7 @@ const ZERO_USAGE = Object.freeze({
 const REQUEST_FIELDS = new Set([
   'model', 'messages', 'max_tokens', 'stream', 'system', 'temperature',
   'top_p', 'stop_sequences', 'output_config', 'metadata',
+  'tools', 'thinking', 'context_management',
 ]);
 const EFFORTS = new Set(['low', 'medium', 'high']);
 
@@ -74,6 +75,36 @@ function requestError(message) {
   throw new OpenAIChatRequestError(message);
 }
 
+/** Accept only Claude Code's no-op final-answer envelope, never real tools or context edits.
+ * @param {AnyRecord} request
+ */
+function validateClaudeCodeEnvelope(request) {
+  if (request.tools !== undefined && (!Array.isArray(request.tools) || request.tools.length !== 0)) {
+    requestError('unsupported request fields: tools');
+  }
+  if (request.thinking !== undefined) {
+    const thinking = request.thinking;
+    if (!thinking || typeof thinking !== 'object' || Array.isArray(thinking)
+      || thinking.type !== 'adaptive'
+      || Object.keys(thinking).some(key => key !== 'type' && key !== 'display')
+      || (thinking.display !== undefined && thinking.display !== 'omitted')) {
+      requestError('thinking supports adaptive with display omitted only');
+    }
+  }
+  if (request.context_management !== undefined) {
+    const context = request.context_management;
+    const edits = context?.edits;
+    const edit = Array.isArray(edits) && edits.length === 1 ? edits[0] : null;
+    if (!context || typeof context !== 'object' || Array.isArray(context)
+      || Object.keys(context).some(key => key !== 'edits')
+      || !edit || typeof edit !== 'object' || Array.isArray(edit)
+      || Object.keys(edit).some(key => key !== 'type' && key !== 'keep')
+      || edit.type !== 'clear_thinking_20251015' || edit.keep !== 'all') {
+      requestError('context_management supports only clear_thinking_20251015 with keep all');
+    }
+  }
+}
+
 /** @param {unknown} content @param {string} where */
 function textContent(content, where) {
   if (typeof content === 'string') return content;
@@ -122,6 +153,7 @@ export function translateOpenAIChatRequest(request, account = {}) {
   }
   const unsupported = Object.keys(request).filter(key => !REQUEST_FIELDS.has(key));
   if (unsupported.length) requestError(`unsupported request fields: ${unsupported.join(', ')}`);
+  validateClaudeCodeEnvelope(request);
   if (!isGeminiModel(request.model)) requestError('openai-chat accounts accept gemini-* models only');
   if (!Array.isArray(request.messages)) requestError('messages must be an array');
   if (request.metadata != null && (typeof request.metadata !== 'object' || Array.isArray(request.metadata)

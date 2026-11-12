@@ -88,6 +88,24 @@ test('maps only low/medium/high reasoning effort', () => {
   assert.throws(() => translated({ output_config: { effort: 'max' } }), OpenAIChatRequestError);
 });
 
+test('accepts and omits Claude Code no-op tools, thinking and context envelopes', () => {
+  for (const thinking of [{ type: 'adaptive', display: 'omitted' }, { type: 'adaptive' }]) {
+    const out = translated({
+      tools: [],
+      thinking,
+      context_management: { edits: [{ type: 'clear_thinking_20251015', keep: 'all' }] },
+      output_config: { effort: 'high' },
+      stream: true,
+    });
+    assert.equal(out.tools, undefined);
+    assert.equal(out.thinking, undefined);
+    assert.equal(out.context_management, undefined);
+    assert.equal(out.reasoning_effort, 'high');
+    assert.equal(out.stream, true);
+    assert.deepEqual(out.stream_options, { include_usage: true });
+  }
+});
+
 test('requests final usage on streams and serializes the rewrite', () => {
   const body = rewriteOpenAIChatRequest(Buffer.from(JSON.stringify(request({ stream: true }))));
   const out = JSON.parse(body.toString());
@@ -100,6 +118,12 @@ test('rejects tools, rich content and unsupported semantics before translation',
     { tools: [{ name: 'lookup' }] },
     { tool_choice: 'auto' },
     { thinking: { type: 'enabled', budget_tokens: 100 } },
+    { thinking: { type: 'adaptive', display: 'visible' } },
+    { thinking: { type: 'adaptive', display: 'omitted', budget_tokens: 100 } },
+    { context_management: { edits: [{ type: 'clear_thinking_20251015', keep: 'none' }] } },
+    { context_management: { edits: [{ type: 'compact_messages_20260101', keep: 'all' }] } },
+    { context_management: { edits: [] } },
+    { context_management: { edits: [{ type: 'clear_thinking_20251015', keep: 'all' }], extra: true } },
     { messages: [{ role: 'user', content: [{ type: 'image', source: {} }] }] },
     { messages: [{ role: 'assistant', content: [{ type: 'tool_use', id: 'x' }] }] },
     { system: [{ type: 'text', text: 'x', cache_control: { type: 'ephemeral' } }] },

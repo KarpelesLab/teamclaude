@@ -159,6 +159,33 @@ for (const stream of [false, true]) {
   });
 }
 
+test('Claude Code no-op envelopes reach agy without their client-only fields', async () => {
+  const ctx = await fixture({ stream: true });
+  try {
+    for (const thinking of [{ type: 'adaptive', display: 'omitted' }, { type: 'adaptive' }]) {
+      const res = await ctx.post(request(true, {
+        tools: [],
+        thinking,
+        context_management: { edits: [{ type: 'clear_thinking_20251015', keep: 'all' }] },
+        output_config: { effort: 'high' },
+      }));
+      assert.equal(res.status, 200, res.body);
+    }
+    assert.equal(ctx.agyRequests.length, 2);
+    for (const upstream of ctx.agyRequests) {
+      assert.equal(upstream.body.tools, undefined);
+      assert.equal(upstream.body.thinking, undefined);
+      assert.equal(upstream.body.context_management, undefined);
+      assert.equal(upstream.body.reasoning_effort, 'high');
+      assert.equal(upstream.body.stream, true);
+      assert.deepEqual(upstream.body.stream_options, { include_usage: true });
+    }
+    assert.equal(ctx.claudeRequests.length, 0);
+  } finally {
+    await ctx.close();
+  }
+});
+
 test('unsupported requests and count_tokens are refused before either upstream', async () => {
   const ctx = await fixture();
   try {
@@ -167,6 +194,8 @@ test('unsupported requests and count_tokens are refused before either upstream',
       request(false, { messages: [{ role: 'user', content: [{ type: 'image', source: {} }] }] }),
       request(false, { output_config: { effort: 'xhigh' } }),
       request(false, { thinking: { type: 'enabled' } }),
+      request(false, { thinking: { type: 'adaptive', display: 'visible' } }),
+      request(false, { context_management: { edits: [{ type: 'clear_thinking_20251015', keep: 'none' }] } }),
     ];
     for (const body of invalid) {
       const res = await ctx.post(body);
@@ -368,6 +397,11 @@ for (const first of [MODEL, CLAUDE_MODEL]) {
         const res = await ctx.post(request(false, {
           model,
           messages: [{ role: 'user', content: 'one stable conversation opening' }],
+          ...(model === MODEL ? {
+            tools: [],
+            thinking: { type: 'adaptive', display: 'omitted' },
+            context_management: { edits: [{ type: 'clear_thinking_20251015', keep: 'all' }] },
+          } : {}),
         }));
         assert.equal(res.status, 200, res.body);
       }
