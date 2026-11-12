@@ -3862,15 +3862,29 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     return;
   }
   if (!account) {
-    // Every account this request reached held an expired token that could not be
-    // renewed, and nothing else was tried: say that, not a refusal or a quota.
-    if (ctx.unrenewed?.size && [...ctx.tried].every(i => ctx.unrenewed.has(accountManager.accounts[i]?.name))
-        && (ctx.pinnedIndex != null || ctx.tried.size === accountManager.accounts.length)) {
-      return respondUnrenewed(res, ctx, accountManager);
-    }
     const reachable = (ctx.pinnedIndex != null
       ? [accountManager.accounts[ctx.pinnedIndex]].filter(Boolean)
       : candidateAccounts(accountManager, ctx.model, ctx.provider)).filter(a => !a.disabled && !a.cordoned);
+    // "Every account" in the unrenewed and refused answers below: each account
+    // a new request could be placed on, and the cordoned account this
+    // conversation is kept on (_keepOnCordoned) - when that is the only one, its
+    // answer is the whole story. Read from the conversation's pin as it stands,
+    // so a conversation this turn moved off its cordoned account no longer
+    // counts it. Counting the whole fleet kept both answers from firing while any
+    // account sat disabled, cordoned, or on another provider or route.
+    const counted = new Set(reachable);
+    if (ctx.pinKey) {
+      for (const i of accountManager.cordonKeeps(ctx.pinKey, ctx.model)) {
+        const kept = accountManager.accounts[i];
+        if (kept && !kept.disabled) counted.add(kept);
+      }
+    }
+    // Every account this request reached held an expired token that could not be
+    // renewed, and nothing else was tried: say that, not a refusal or a quota.
+    if (ctx.unrenewed?.size && [...ctx.tried].every(i => ctx.unrenewed.has(accountManager.accounts[i]?.name))
+        && (ctx.pinnedIndex != null || (counted.size > 0 && [...counted].every(a => ctx.tried.has(a.index))))) {
+      return respondUnrenewed(res, ctx, accountManager);
+    }
     if (reachable.length && reachable.every(a => accountManager.unavailableReason(a, ctx.model) === 'billing')) {
       ctx.status = 402;
       ctx.account = '(billing unavailable)';
@@ -3903,7 +3917,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     const rejected = ctx.credentialRejected;
     const allRefused = rejected?.size > 0 && (ctx.pinnedIndex != null
       ? rejected.has(accountManager.accounts[ctx.pinnedIndex]?.name)
-      : rejected.size === accountManager.accounts.length);
+      : counted.size > 0 && [...counted].every(a => rejected.has(a.name)));
     if (allRefused) {
       const names = [...rejected].map(n => `"${n}"`).join(', ');
       const entitlementDenied = ctx.entitlementDenied;
@@ -3913,7 +3927,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       if (allEntitlementDenied && ctx.pinnedIndex != null) {
         message = `No account served this request. The pinned account ${names} returned OAuth entitlement denial (${OAUTH_ENTITLEMENT_ERROR_CODE}). An explicit pin targets that account exactly; choose a different eligible account or change its organization's OAuth policy.`;
       } else if (allEntitlementDenied) {
-        message = `No account served this request. Every configured account returned OAuth entitlement denial (${OAUTH_ENTITLEMENT_ERROR_CODE}): ${names}. TeamClaude temporarily removed them from automatic rotation; retry after the cooldown or pin a different eligible account.`;
+        message = `No account served this request. Every account this request could use returned OAuth entitlement denial (${OAUTH_ENTITLEMENT_ERROR_CODE}): ${names}. TeamClaude temporarily removed them from automatic rotation; retry after the cooldown or pin a different eligible account.`;
       } else {
         message = refusalMessage(accountManager, rejected, ctx.rejectedStatus, ctx.verificationHold);
       }
