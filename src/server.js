@@ -3444,11 +3444,13 @@ function pickBoundAccount(accountManager, ctx) {
     }
     return pinned;
   }
-  // An unpinned pick, and a verdict retry must be free to advance the queue.
-  // A servable destination for an incompatible assigned pin becomes the new
-  // conversation pin before upstream I/O; fresh conversations keep queue retries.
+  // An incompatible assigned pin moves affinity to the compatible destination
+  // before upstream I/O, even when that destination is spent or throttled.
+  const incompatiblePin = ctx.pinKey
+    ? accountManager.sessionTracker.pinnedAccounts(ctx.pinKey).some((/** @type {number} */ idx) => left.includes(idx) && !compatible.includes(idx))
+    : false;
   const servable = candidates.find((/** @type {number} */ i) => !seatVerdict(accountManager, accountManager.accounts[i], ctx.model, ctx.advisorModel));
-  ctx.boundPinned = servable != null && pinIdx != null && left.includes(pinIdx);
+  ctx.boundPinned = incompatiblePin;
   return accountManager.accounts[servable ?? candidates[0]] ?? null;
 }
 

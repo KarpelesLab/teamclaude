@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
 import { ClientUsageTracker } from '../src/client-usage.js';
+import { recordSeatRejection } from '../src/client-routes.js';
 import { createProxyServer } from '../src/server.js';
 
 const MODEL = 'gemini-3-pro-preview';
@@ -409,15 +410,28 @@ test('fixed mixed seats check advisor compatibility before a conversation pin', 
       model: CLAUDE_MODEL, messages, tools: advisor(CLAUDE_MODEL),
     }));
     assert.equal(initial.status, 200, initial.body);
+
+    const switched = await ctx.post(request(false, {
+      model: MODEL, messages, tools: advisor(MODEL),
+    }));
+    assert.equal(switched.status, 400, switched.body);
+    assert.match(switched.body, /unsupported request fields: tools/);
     assert.equal(ctx.agyRequests.length, 0);
     assert.equal(ctx.claudeRequests.length, 1);
+
+    const switchedBack = await ctx.post(request(false, {
+      model: CLAUDE_MODEL, messages, tools: advisor(CLAUDE_MODEL),
+    }));
+    assert.equal(switchedBack.status, 200, switchedBack.body);
+    assert.equal(ctx.agyRequests.length, 0);
+    assert.equal(ctx.claudeRequests.length, 2);
 
     const incompatible = await ctx.post(request(false, {
       model: CLAUDE_MODEL, messages, tools: advisor(MODEL),
     }));
     assert.equal(incompatible.status, 503, incompatible.body);
     assert.equal(ctx.agyRequests.length, 0);
-    assert.equal(ctx.claudeRequests.length, 1);
+    assert.equal(ctx.claudeRequests.length, 2);
   } finally {
     await ctx.close();
   }
@@ -444,6 +458,28 @@ test('an incompatible pin cannot mask a compatible account throttle', async () =
   }
 });
 
+test('an incompatible pin cannot mask a compatible account spent verdict', async () => {
+  const ctx = await fixture({
+    clientRoutes: [{ name: 'fixed', clients: ['alice'], accounts: ['gemini', 'claude'] }],
+  });
+  const messages = [{ role: 'user', content: 'one stable spent conversation' }];
+  try {
+    const initial = await ctx.post(request(false, { model: CLAUDE_MODEL, messages }));
+    assert.equal(initial.status, 200, initial.body);
+    recordSeatRejection(ctx.am.accounts[0], {
+      'anthropic-ratelimit-unified-7d-status': 'rejected',
+      'anthropic-ratelimit-unified-7d-reset': Math.floor((Date.now() + 60_000) / 1000),
+    }, MODEL);
+
+    const spent = await ctx.post(request(false, { model: MODEL, messages }));
+    assert.equal(spent.status, 429, spent.body);
+    assert.equal(ctx.agyRequests.length, 0);
+    assert.equal(ctx.claudeRequests.length, 1);
+  } finally {
+    await ctx.close();
+  }
+});
+
 test('a model switch keeps the new conversation pin on upstream failure', async () => {
   const ctx = await fixture({
     extraGemini: true,
@@ -457,11 +493,21 @@ test('a model switch keeps the new conversation pin on upstream failure', async 
   try {
     const initial = await ctx.post(request(false, { model: CLAUDE_MODEL, messages }));
     assert.equal(initial.status, 200, initial.body);
+    const pinKey = [...ctx.am.sessionTracker.sessions.keys()][0];
+    const session = ctx.am.sessionTracker.sessions.get(pinKey);
+    const pin = session.pins.get('unified7d');
+    session.pins.delete('unified7d');
+    ctx.am.sessionTracker.touch(pinKey, pin.idx, 'unified7dFable');
+    assert.equal(ctx.am.sessionTracker.pinnedAccount(pinKey, 'unified7d'), null);
 
-    const failed = await ctx.post(request(false, { model: MODEL, messages }));
-    assert.equal(failed.status, 500, failed.body);
-    assert.equal(ctx.agyRequests.length, 1, 'the existing conversation silently hopped to a compatible sibling');
-    assert.equal(ctx.agyRequests[0].headers.authorization, 'Bearer gemini-secret');
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const failed = await ctx.post(request(false, { model: MODEL, messages }));
+      assert.equal(failed.status, 500, failed.body);
+    }
+    assert.equal(ctx.agyRequests.length, 2, 'the existing conversation silently hopped to a compatible sibling');
+    for (const request of ctx.agyRequests) {
+      assert.equal(request.headers.authorization, 'Bearer gemini-secret');
+    }
     assert.equal(ctx.claudeRequests.length, 1);
   } finally {
     await ctx.close();
