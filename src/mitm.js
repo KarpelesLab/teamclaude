@@ -267,8 +267,11 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
   // client), for the same reason. The map is bounded by accounts × client keys,
   // both operator-controlled.
   const serverPromises = new Map();
-  const getServer = (pin = '', client = null) => {
-    const mapKey = `${pin}\u0000${client || ''}`;
+  const getServer = (/** @type {string} */ pin = '', /** @type {string|null} */ client = null, /** @type {string|null} */ keyHash = null) => {
+    // The keyHash (AI-1903, E10) joins the memo key so two keys that share a
+    // client name never share a listener — each tunnel keeps the hash its own
+    // CONNECT authenticated with, and owner-root matching cannot cross keys.
+    const mapKey = `${pin}\u0000${client || ''}\u0000${keyHash || ''}`;
     let p = serverPromises.get(mapKey);
     if (p) return p;
     p = (async () => {
@@ -304,7 +307,7 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
     // Node 24.6 adds this buffer when an HTTP/1 response finishes, but its
     // HTTP/2 server leaves it undefined; timeout + undefined would be NaN.
     /** @type {any} */ (srv).keepAliveTimeoutBuffer ??= 1_000;
-    srv.on('request', createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, forcedPin: pin || null, egress, clientUsage, forcedClient: client, dimensionUsage }));
+    srv.on('request', createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, forcedPin: pin || null, egress, clientUsage, forcedClient: client, forcedKeyHash: keyHash, dimensionUsage }));
     // Remote Control's real-time channel is a WebSocket (Upgrade handshake),
     // which never fires 'request' — only 'upgrade', with a raw socket instead
     // of a response object (h1-only; falls back to blind h2 passthrough is not
@@ -492,7 +495,7 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
       return;
     }
 
-    getServer(pin || '', auth.client).then((srv) => {
+    getServer(pin || '', auth.client, auth.keyHash ?? null).then((srv) => {
       reply200Raw(clientSocket);
       if (head && head.length) clientSocket.unshift(head);
       srv.emit('connection', clientSocket);
@@ -561,13 +564,16 @@ function redactToken(token) {
  * otherwise the proxy apiKey or a clientKeys entry must be presented via
  * `Proxy-Authorization` (Bearer <key>, or Basic where the key is the username
  * or password — so `--proxy http://<key>@host:port` works).
- * Returns { ok, client }.
+ * Returns { ok, client, keyHash }: keyHash is the full SHA-256 of the presented
+ * client key (AI-1903, C9/E10), passed through from resolveClientAuth so a
+ * tunnelled request matches an owner root like a direct one; null for the
+ * shared key, the open gate and the loopback exemption.
  */
 export function resolveConnectAuth(req, socket, proxyConfig) {
   const hasKeys = !!(proxyConfig?.apiKey || (Array.isArray(proxyConfig?.clientKeys) && proxyConfig.clientKeys.length));
-  if (!hasKeys) return { ok: true, client: null };
+  if (!hasKeys) return { ok: true, client: null, keyHash: null };
   const m = /^\s*(basic|bearer)\s+(.+?)\s*$/i.exec(req?.headers?.['proxy-authorization'] || '');
-  let auth = { ok: false, client: null };
+  let auth = /** @type {{ ok: boolean, client: string|null, keyHash: string|null }} */ ({ ok: false, client: null, keyHash: null });
   if (m) {
     let presented = m[2];
     if (m[1].toLowerCase() === 'basic') {
@@ -586,7 +592,7 @@ export function resolveConnectAuth(req, socket, proxyConfig) {
   // still names it (matching the HTTP gate, where a local caller with a client
   // key is attributed like any other). Same exemption as the other two gates,
   // so a forwarded request or `trustLoopback: false` closes it here too.
-  if (!auth.ok && loopbackExempt(req?.headers, socket?.remoteAddress, proxyConfig)) return { ok: true, client: null };
+  if (!auth.ok && loopbackExempt(req?.headers, socket?.remoteAddress, proxyConfig)) return { ok: true, client: null, keyHash: null };
   return auth;
 }
 

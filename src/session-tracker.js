@@ -162,10 +162,17 @@ function setAndReturn(map, key, value) {
  * The exact rejection is part of the scope: a later quota verdict is a new
  * choice, not permission left over from this one.
  *
+ * `revision` and `keyRef` (AI-1903) scope the offer to the owner-root revision
+ * it was disclosed under and to the authenticated key (as the C9 keyRef, never
+ * the keyHash itself). Both are null on a legacy offer, which keeps the record
+ * byte-identical to what predates owner roots.
+ *
  * @typedef {Object} SeatContinuation
  * @property {number} idx the rejected account's position in the account list
  * @property {number} at when that rejection was recorded
  * @property {number} resetsAt when its quota window resets
+ * @property {string|null} [revision] the root revision this offer belongs to
+ * @property {string|null} [keyRef] the offer-scope key reference (C9/E14)
  */
 export class SessionTracker {
   /**
@@ -535,25 +542,39 @@ export class SessionTracker {
    * another prompt in this conversation confirms a cold-cache continuation.
    * Never create a session here: a refusal for an unknown conversation has no
    * pin against which a later request could safely consume the offer.
+   *
+   * The map key stays `${client}\0${route}\0${bucket}` for every caller; the
+   * root revision and keyRef ride on the record and are compared on take, so a
+   * legacy offer keeps its pre-AI-1903 shape exactly.
    * @param {string|null} sessionId
-   * @param {{client: string, route: string, bucket: string, idx: number, at: number, resetsAt: number}} scope
+   * @param {{client: string, route: string, bucket: string, idx: number, at: number, resetsAt: number, revision?: string|null, keyRef?: string|null}} scope
    * @param {number} [now]
    */
   recordSeatContinuation(sessionId, scope, now = this._now()) {
     const s = sessionId && this._live(sessionId, now);
     if (!s || !scope?.client || !scope.route || !scope.bucket
         || !Number.isInteger(scope.idx) || !Number.isFinite(scope.at) || !Number.isFinite(scope.resetsAt)) return false;
+    const revision = scope.revision ?? null;
+    const keyRef = scope.keyRef ?? null;
+    if (revision != null && typeof revision !== 'string') return false;
+    if (keyRef != null && typeof keyRef !== 'string') return false;
     const key = `${scope.client.trim().toLowerCase()}\0${scope.route}\0${scope.bucket}`;
-    s.seatContinuations.set(key, { idx: scope.idx, at: scope.at, resetsAt: scope.resetsAt });
+    const record = revision == null && keyRef == null
+      ? { idx: scope.idx, at: scope.at, resetsAt: scope.resetsAt }
+      : { idx: scope.idx, at: scope.at, resetsAt: scope.resetsAt, revision, keyRef };
+    s.seatContinuations.set(key, record);
     return true;
   }
 
   /**
    * Take is synchronous and one-shot, so two concurrent continuations cannot
    * both spend the same disclosure. The caller supplies the live pin/rejection
-   * it validated; any mismatch consumes the stale offer and fails closed.
+   * it validated; any mismatch consumes the stale offer and fails closed. The
+   * root revision and keyRef fail closed the same way: an offer disclosed under
+   * one root revision, or under another key sharing the client name, cannot
+   * authorize this continuation.
    * @param {string|null} sessionId
-   * @param {{client: string, route: string, bucket: string, idx: number, at: number, resetsAt: number}} scope
+   * @param {{client: string, route: string, bucket: string, idx: number, at: number, resetsAt: number, revision?: string|null, keyRef?: string|null}} scope
    * @param {number} [now]
    */
   takeSeatContinuation(sessionId, scope, now = this._now()) {
@@ -564,7 +585,9 @@ export class SessionTracker {
     if (!offer) return null;
     s.seatContinuations.delete(key);
     if (offer.resetsAt <= now
-        || offer.idx !== scope.idx || offer.at !== scope.at || offer.resetsAt !== scope.resetsAt) return null;
+        || offer.idx !== scope.idx || offer.at !== scope.at || offer.resetsAt !== scope.resetsAt
+        || (offer.revision ?? null) !== (scope.revision ?? null)
+        || (offer.keyRef ?? null) !== (scope.keyRef ?? null)) return null;
     return offer;
   }
 

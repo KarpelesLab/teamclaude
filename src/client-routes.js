@@ -31,6 +31,7 @@
 // Nothing here invents a reset time; with no such reading the request goes to
 // the seat and upstream answers it.
 
+import { createHash } from 'node:crypto';
 import { safeLine } from './safe-text.js';
 import { DEFAULT_PROVIDER, providerOf, isSubscriptionAccount } from './provider.js';
 import { weeklyBucketForModel } from './model.js';
@@ -159,6 +160,161 @@ export function parseClientRoutes(raw) {
 /** @returns {ClientRouteTable} */
 export function emptyClientRoutes() {
   return { routes: [], byClient: new Map(), ambiguous: new Map(), warnings: [] };
+}
+
+// ── owner-root continuation policies (AI-1903) ─────────────────────────────
+//
+// `continuationPolicies` is the durable, owner-controlled seat-continuation
+// policy the gateway renders into the devs config. A root matches an
+// authenticated client key by its normalized name plus the full SHA-256 of the
+// key itself, and overrides the per-request `x-teamclaude-seat-policy` header
+// for every account of the key's route. The keyHash never leaves this module:
+// not in logs, not in status, not in a tracker or offer key.
+
+const KEY_HASH = /^[0-9a-f]{64}$/;
+const POLICY_REVISION = /^[A-Za-z0-9_-]{1,128}$/;
+
+/**
+ * The full lowercase-hex SHA-256 of a client key (C1). Never logged, never in
+ * status, never part of a tracker or offer key.
+ * @param {string} key
+ * @returns {string}
+ */
+export function keyHashOf(key) {
+  return createHash('sha256').update(key).digest('hex');
+}
+
+/**
+ * The offer-scope key reference (C9/E14): sha256("teamclaude-offer-v1" NUL
+ * keyHash), first 32 hex chars. Offers are scoped by this so the full keyHash
+ * never enters a tracker/session key, an offer key or a log line.
+ * @param {string} keyHash
+ * @returns {string}
+ */
+export function offerKeyRef(keyHash) {
+  return createHash('sha256').update(`teamclaude-offer-v1\0${keyHash}`).digest('hex').slice(0, 32);
+}
+
+/**
+ * @typedef {{ client: string, keyHash: string, mode: 'force'|'recommend', revision: string|null, quarantine: boolean }} ContinuationPolicy
+ * @typedef {{ client: string, reason: string, carriedForward: boolean }} ContinuationPolicyError
+ * @typedef {{
+ *   policies: ContinuationPolicy[],
+ *   errors: ContinuationPolicyError[],
+ *   loadError: string|null,
+ *   byKey: Map<string, ContinuationPolicy>,
+ *   failSafeAll: boolean,
+ * }} ContinuationPolicyTable
+ */
+
+/**
+ * Parse the rendered `continuationPolicies` (and the renderer's own
+ * `continuationPolicyErrors`) from the config. Never throws, like
+ * parseClientRoutes — a malformed list must not take the pool down; it fails
+ * safe instead:
+ *
+ * - absent key: no roots, legacy header behavior for everyone;
+ * - present but not a list: `failSafeAll` — EVERY client key recommends and a
+ *   legacy force header is ignored, with loadError 'malformed_list';
+ * - an entry with a valid client+keyHash but a bad mode or revision: that key
+ *   recommends (legacy force never revives), loadError 'malformed_entries';
+ * - an entry whose client or keyHash is itself invalid: dropped — it names no
+ *   current key.
+ *
+ * @param {unknown} raw
+ * @param {unknown} rawErrors
+ * @returns {ContinuationPolicyTable}
+ */
+export function parseContinuationPolicies(raw, rawErrors) {
+  /** @type {ContinuationPolicyError[]} */
+  const errors = [];
+  if (Array.isArray(rawErrors)) {
+    for (const e of rawErrors) {
+      const entry = /** @type {Record<string, unknown>|null} */ (e && typeof e === 'object' ? e : null);
+      if (entry && typeof entry.client === 'string' && typeof entry.reason === 'string') {
+        errors.push({ client: entry.client, reason: entry.reason, carriedForward: entry.carriedForward === true });
+      }
+    }
+  }
+  /** @type {ContinuationPolicy[]} */
+  const policies = [];
+  /** @type {Map<string, ContinuationPolicy>} */
+  const byKey = new Map();
+  if (raw == null) return { policies, errors, loadError: null, byKey, failSafeAll: false };
+  if (!Array.isArray(raw)) return { policies, errors, loadError: 'malformed_list', byKey, failSafeAll: true };
+  /** @type {string|null} */
+  let loadError = null;
+  for (const rawEntry of raw) {
+    const entry = /** @type {Record<string, unknown>|null} */ (rawEntry && typeof rawEntry === 'object' ? rawEntry : null);
+    const client = typeof entry?.client === 'string' ? entry.client.trim() : '';
+    const keyHash = typeof entry?.keyHash === 'string' ? entry.keyHash : '';
+    if (!client || !KEY_HASH.test(keyHash)) continue;
+    const mode = entry?.mode;
+    const revision = entry?.revision;
+    /** @type {ContinuationPolicy} */
+    let policy;
+    if (typeof mode !== 'string' || !SEAT_POLICY_MODES.has(mode)
+        || typeof revision !== 'string' || !POLICY_REVISION.test(revision)) {
+      policy = { client, keyHash, mode: 'recommend', revision: null, quarantine: false };
+      loadError = 'malformed_entries';
+    } else {
+      policy = { client, keyHash, mode: /** @type {'force'|'recommend'} */ (mode), revision, quarantine: entry?.quarantine === true };
+    }
+    const mapKey = `${norm(client)}\0${keyHash}`;
+    if (byKey.has(mapKey)) continue; // a duplicate record keeps the first
+    byKey.set(mapKey, policy);
+    policies.push(policy);
+  }
+  return { policies, errors, loadError, byKey, failSafeAll: false };
+}
+
+/** The implicit root every client key gets while the rendered list is unreadable. */
+const FAILSAFE_ROOT = /** @type {ContinuationPolicy} */ (Object.freeze({ client: '', keyHash: '', mode: 'recommend', revision: null, quarantine: false }));
+
+/**
+ * The owner root governing this caller, or null for the legacy header
+ * behavior. Matched by the client name normalized like routeForClient plus the
+ * full keyHash (C1); a caller with neither (shared key, key-less loopback) is
+ * never governed by a root. While the list is malformed every client key fails
+ * safe to recommend.
+ * @param {ContinuationPolicyTable|null|undefined} table
+ * @param {string|null|undefined} client
+ * @param {string|null|undefined} keyHash
+ * @returns {ContinuationPolicy|null}
+ */
+export function matchContinuationPolicy(table, client, keyHash) {
+  if (!table || !client || !keyHash) return null;
+  if (table.failSafeAll) return FAILSAFE_ROOT;
+  return table.byKey.get(`${norm(client)}\0${keyHash}`) ?? null;
+}
+
+/**
+ * The operator's status view of the parsed policies (C5): every field but the
+ * keyHash, which never appears in status.
+ * @param {ContinuationPolicyTable|null|undefined} table
+ * @returns {{ policies: { client: string, mode: 'force'|'recommend', revision: string|null, quarantine: boolean }[], errors: ContinuationPolicyError[], loadError: string|null }}
+ */
+export function continuationPolicyStatus(table) {
+  return {
+    policies: (table?.policies ?? []).map((p) => ({ client: p.client, mode: p.mode, revision: p.revision, quarantine: p.quarantine })),
+    errors: (table?.errors ?? []).map((e) => ({ client: e.client, reason: e.reason, carriedForward: e.carriedForward })),
+    loadError: table?.loadError ?? null,
+  };
+}
+
+/**
+ * `caller.continuationPolicy` for a client-key status caller (C5): its own
+ * root, or the legacy source when no root governs its key.
+ * @param {ContinuationPolicyTable|null|undefined} table
+ * @param {string|null|undefined} client
+ * @param {string|null|undefined} keyHash
+ * @returns {{ source: 'root'|'legacy', mode: 'force'|'recommend'|null, revision: string|null }}
+ */
+export function callerContinuationPolicy(table, client, keyHash) {
+  const root = matchContinuationPolicy(table, client, keyHash);
+  return root
+    ? { source: 'root', mode: root.mode, revision: root.revision }
+    : { source: 'legacy', mode: null, revision: null };
 }
 
 /**
@@ -369,6 +525,14 @@ export function combineVerdicts(verdicts) {
 const KIMI_HINT = 'Use `cg kimi on` to keep working meanwhile.';
 
 /**
+ * The owner-wide continuation paragraph (C7, verbatim), appended to the
+ * actionable multi-seat 429 only when the request carries
+ * `x-teamclaude-cg-contract: root-v1` (E7): an older cg answers
+ * `cg seat-policy force` on a multi-seat key with a usage error.
+ */
+export const CG_SEAT_POLICY_ROOT_PARAGRAPH = 'To make all local and remote workers using this key continue automatically on every assigned seat, run `cg seat-policy force`. This durable owner-wide policy takes effect on the next request; run `cg seat-policy recommend` to restore confirmations.';
+
+/**
  * The next account in a seat's queue that can serve now, in config order,
  * skipping the conversation's pinned (spent) one — the account a fresh,
  * handoff-ed conversation would land on. Queue order, not least-loaded: the
@@ -413,13 +577,16 @@ export function nextInSeatQueue(accountManager, indices, currentIdx, model = nul
  * retries; a 503 with `x-should-retry: false` stops at once.
  *
  * @param {string} reason  one of SEAT_REASONS
- * @param {{ seat?: string|null, verdict?: SeatVerdict|null, detail?: string|null, queue?: { pinned: string, next: string|null }|null }} [info]
+ * @param {{ seat?: string|null, verdict?: SeatVerdict|null, detail?: string|null, queue?: { pinned: string, next: string|null }|null, ownerRoot?: boolean }} [info]
  *   queue is set only for a conversation pinned inside a multi-account seat
  *   whose pinned account is spent: pinned names that account, next the seat
- *   queue's next servable account (null when none serves).
+ *   queue's next servable account (null when none serves). ownerRoot (the
+ *   request carried `x-teamclaude-cg-contract: root-v1`) appends the C7
+ *   owner-root paragraph to the actionable continuation message only — the
+ *   single-seat and no-candidate variants structurally cannot carry it.
  * @returns {{ status: number, headers: Record<string, string>, body: string }}
  */
-export function seatAnswer(reason, { seat = null, verdict = null, detail = null, queue = null } = {}) {
+export function seatAnswer(reason, { seat = null, verdict = null, detail = null, queue = null, ownerRoot = false } = {}) {
   const shown = seat ? `"${safeLine(seat, 64)}"` : '';
   const json = { 'Content-Type': 'application/json' };
   const err = (/** @type {string} */ type, /** @type {string} */ message) => JSON.stringify({ type: 'error', error: { type, message } });
@@ -437,7 +604,7 @@ export function seatAnswer(reason, { seat = null, verdict = null, detail = null,
       // the next account would serve, at one full-price cold-cache turn, and
       // a handoff is the cheaper way to get there.
       const continuationMessage = queue && queue.next
-        ? `You can keep working by moving to another assigned account; "${safeLine(queue.next, 64)}" appears available. The account "${safeLine(queue.pinned, 64)}", pinned to this conversation, cannot serve this request because its quota is exhausted${when ? ` until ${when}` : ''}. Recommended: run /ipm:handoff and start a new conversation; it will use the next assigned account that appears available, currently "${safeLine(queue.next, 64)}", with a compact summary. If you retry or continue THIS conversation instead, your next prompt confirms that TeamClaude will reprocess the full conversation at full input-token cost on the next assigned account that appears available at that time, using a cold prompt cache, and pin the conversation there. No additional confirmation prompt is required. ${KIMI_HINT}`
+        ? `You can keep working by moving to another assigned account; "${safeLine(queue.next, 64)}" appears available. The account "${safeLine(queue.pinned, 64)}", pinned to this conversation, cannot serve this request because its quota is exhausted${when ? ` until ${when}` : ''}. Recommended: run /ipm:handoff and start a new conversation; it will use the next assigned account that appears available, currently "${safeLine(queue.next, 64)}", with a compact summary. If you retry or continue THIS conversation instead, your next prompt confirms that TeamClaude will reprocess the full conversation at full input-token cost on the next assigned account that appears available at that time, using a cold prompt cache, and pin the conversation there. No additional confirmation prompt is required. ${KIMI_HINT}${ownerRoot ? ` ${CG_SEAT_POLICY_ROOT_PARAGRAPH}` : ''}`
         : null;
       const queueHint = queue && !queue.next
         ? ` This conversation is pinned to "${safeLine(queue.pinned, 64)}", and no other account on this seat can serve now.`

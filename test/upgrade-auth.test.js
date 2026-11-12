@@ -1,4 +1,5 @@
 import { test } from 'node:test';
+import { createHash } from 'node:crypto';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import net from 'node:net';
@@ -12,20 +13,22 @@ import { createProxyServer, resolveUpgradeAuth } from '../src/server.js';
 // the client's own headers), but the operator's host and address do.
 
 const PROXY = { apiKey: 'shared-key', clientKeys: [{ name: 'alice', key: 'alice-key' }] };
+// AI-1903: the auth resolvers also carry the presented client key's hash.
+const ALICE_HASH = createHash('sha256').update('alice-key').digest('hex');
 const sock = (remoteAddress) => ({ remoteAddress });
 const listen = (s) => new Promise(r => s.listen(0, '127.0.0.1', () => r(s.address().port)));
 
 test('the upgrade gate answers like the other two', () => {
   const remote = sock('203.0.113.7');
-  assert.deepEqual(resolveUpgradeAuth({ headers: {} }, remote, PROXY), { ok: false, client: null });
-  assert.deepEqual(resolveUpgradeAuth({ headers: { 'x-api-key': 'shared-key' } }, remote, PROXY), { ok: true, client: null });
-  assert.deepEqual(resolveUpgradeAuth({ headers: { 'x-api-key': 'alice-key' } }, remote, PROXY), { ok: true, client: 'alice' });
-  assert.deepEqual(resolveUpgradeAuth({ headers: { 'x-api-key': 'wrong' } }, remote, PROXY), { ok: false, client: null });
+  assert.deepEqual(resolveUpgradeAuth({ headers: {} }, remote, PROXY), { ok: false, client: null, keyHash: null });
+  assert.deepEqual(resolveUpgradeAuth({ headers: { 'x-api-key': 'shared-key' } }, remote, PROXY), { ok: true, client: null, keyHash: null });
+  assert.deepEqual(resolveUpgradeAuth({ headers: { 'x-api-key': 'alice-key' } }, remote, PROXY), { ok: true, client: 'alice', keyHash: ALICE_HASH });
+  assert.deepEqual(resolveUpgradeAuth({ headers: { 'x-api-key': 'wrong' } }, remote, PROXY), { ok: false, client: null, keyHash: null });
   // Loopback is exempt, as it is on the HTTP and CONNECT gates, so a local
   // `teamclaude attach` keeps working with no key.
-  assert.deepEqual(resolveUpgradeAuth({ headers: {} }, sock('127.0.0.1'), PROXY), { ok: true, client: null });
+  assert.deepEqual(resolveUpgradeAuth({ headers: {} }, sock('127.0.0.1'), PROXY), { ok: true, client: null, keyHash: null });
   // A deployment with no keys configured is open by choice, unchanged.
-  assert.deepEqual(resolveUpgradeAuth({ headers: {} }, remote, {}), { ok: true, client: null });
+  assert.deepEqual(resolveUpgradeAuth({ headers: {} }, remote, {}), { ok: true, client: null, keyHash: null });
 });
 
 test('the loopback exemption is refused to a web page: foreign Origin or Host', () => {
@@ -35,8 +38,8 @@ test('the loopback exemption is refused to a web page: foreign Origin or Host', 
   // the attacker. Same two checks the request path applies to key-less
   // loopback callers.
   const local = sock('127.0.0.1');
-  const refused = { ok: false, client: null };
-  const exempt = { ok: true, client: null };
+  const refused = { ok: false, client: null, keyHash: null };
+  const exempt = { ok: true, client: null, keyHash: null };
   assert.deepEqual(resolveUpgradeAuth({ headers: { host: '127.0.0.1:3456', origin: 'https://attacker.example' } }, local, PROXY), refused);
   assert.deepEqual(resolveUpgradeAuth({ headers: { host: 'attacker.example:3456' } }, local, PROXY), refused);
   assert.deepEqual(resolveUpgradeAuth({ headers: { host: '127.0.0.1:3456', origin: 'http://localhost:3456' } }, local, PROXY), exempt);
@@ -45,7 +48,7 @@ test('the loopback exemption is refused to a web page: foreign Origin or Host', 
   // A malformed Origin cannot be trusted either way; refuse.
   assert.deepEqual(resolveUpgradeAuth({ headers: { host: '127.0.0.1:3456', origin: 'not a url' } }, local, PROXY), refused);
   // A valid key passes regardless of Origin or Host, and a bound LAN host is local.
-  assert.deepEqual(resolveUpgradeAuth({ headers: { host: 'attacker.example', origin: 'https://attacker.example', 'x-api-key': 'alice-key' } }, local, PROXY), { ok: true, client: 'alice' });
+  assert.deepEqual(resolveUpgradeAuth({ headers: { host: 'attacker.example', origin: 'https://attacker.example', 'x-api-key': 'alice-key' } }, local, PROXY), { ok: true, client: 'alice', keyHash: ALICE_HASH });
   assert.deepEqual(resolveUpgradeAuth({ headers: { host: '192.168.1.5:3456' } }, local, { ...PROXY, host: '192.168.1.5' }), exempt);
 });
 
@@ -59,10 +62,10 @@ test('a key offered in Sec-WebSocket-Protocol is NOT accepted', () => {
   const remote = sock('203.0.113.7');
   assert.deepEqual(
     resolveUpgradeAuth({ headers: { 'sec-websocket-protocol': 'teamclaude, alice-key' } }, remote, PROXY),
-    { ok: false, client: null });
+    { ok: false, client: null, keyHash: null });
   assert.deepEqual(
     resolveUpgradeAuth({ headers: { 'sec-websocket-protocol': 'alice-key' } }, remote, PROXY),
-    { ok: false, client: null });
+    { ok: false, client: null, keyHash: null });
 });
 
 // The unit test above cannot show the handler is WIRED. Drive a real socket:

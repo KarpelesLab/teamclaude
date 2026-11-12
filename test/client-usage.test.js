@@ -1,4 +1,5 @@
 import { test } from 'node:test';
+import { createHash } from 'node:crypto';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
@@ -69,22 +70,24 @@ test('restore is additive and survives malformed entries', () => {
 
 // ── resolveClientAuth (HTTP gate) ───────────────────────────
 
+const keyHash = (k) => createHash('sha256').update(k).digest('hex');
+
 test('resolveClientAuth maps keys to identities', () => {
-  assert.deepEqual(resolveClientAuth(PROXY, 'alice-key'), { ok: true, client: 'alice' });
-  assert.deepEqual(resolveClientAuth(PROXY, 'shared-key'), { ok: true, client: null });
-  assert.deepEqual(resolveClientAuth(PROXY, 'wrong'), { ok: false, client: null });
-  assert.deepEqual(resolveClientAuth(PROXY, undefined), { ok: false, client: null });
+  assert.deepEqual(resolveClientAuth(PROXY, 'alice-key'), { ok: true, client: 'alice', keyHash: keyHash('alice-key') });
+  assert.deepEqual(resolveClientAuth(PROXY, 'shared-key'), { ok: true, client: null, keyHash: null });
+  assert.deepEqual(resolveClientAuth(PROXY, 'wrong'), { ok: false, client: null, keyHash: null });
+  assert.deepEqual(resolveClientAuth(PROXY, undefined), { ok: false, client: null, keyHash: null });
   // no keys configured at all → open (unchanged pre-clientKeys behavior)
-  assert.deepEqual(resolveClientAuth({}, undefined), { ok: true, client: null });
-  assert.deepEqual(resolveClientAuth(undefined, 'anything'), { ok: true, client: null });
+  assert.deepEqual(resolveClientAuth({}, undefined), { ok: true, client: null, keyHash: null });
+  assert.deepEqual(resolveClientAuth(undefined, 'anything'), { ok: true, client: null, keyHash: null });
   // clientKeys-only config (no shared key) still gates
   assert.equal(resolveClientAuth({ clientKeys: PROXY.clientKeys }, 'nope').ok, false);
-  assert.deepEqual(resolveClientAuth({ clientKeys: PROXY.clientKeys }, 'bob-key'), { ok: true, client: 'bob' });
+  assert.deepEqual(resolveClientAuth({ clientKeys: PROXY.clientKeys }, 'bob-key'), { ok: true, client: 'bob', keyHash: keyHash('bob-key') });
 });
 
 test('a clientKeys entry duplicating the shared key still yields its name', () => {
   const cfg = { apiKey: 'k', clientKeys: [{ name: 'carol', key: 'k' }] };
-  assert.deepEqual(resolveClientAuth(cfg, 'k'), { ok: true, client: 'carol' });
+  assert.deepEqual(resolveClientAuth(cfg, 'k'), { ok: true, client: 'carol', keyHash: keyHash('k') });
 });
 
 // ── resolveConnectAuth (CONNECT gate) ───────────────────────
@@ -94,17 +97,17 @@ const remote = { remoteAddress: '203.0.113.7' };
 const local = { remoteAddress: '127.0.0.1' };
 
 test('resolveConnectAuth resolves client keys in either Basic slot and Bearer', () => {
-  assert.deepEqual(resolveConnectAuth(basic('alice-key', ''), remote, PROXY), { ok: true, client: 'alice' });
-  assert.deepEqual(resolveConnectAuth(basic('x', 'alice-key'), remote, PROXY), { ok: true, client: 'alice' });
-  assert.deepEqual(resolveConnectAuth({ headers: { 'proxy-authorization': 'Bearer bob-key' } }, remote, PROXY), { ok: true, client: 'bob' });
-  assert.deepEqual(resolveConnectAuth(basic('shared-key', ''), remote, PROXY), { ok: true, client: null });
+  assert.deepEqual(resolveConnectAuth(basic('alice-key', ''), remote, PROXY), { ok: true, client: 'alice', keyHash: keyHash('alice-key') });
+  assert.deepEqual(resolveConnectAuth(basic('x', 'alice-key'), remote, PROXY), { ok: true, client: 'alice', keyHash: keyHash('alice-key') });
+  assert.deepEqual(resolveConnectAuth({ headers: { 'proxy-authorization': 'Bearer bob-key' } }, remote, PROXY), { ok: true, client: 'bob', keyHash: keyHash('bob-key') });
+  assert.deepEqual(resolveConnectAuth(basic('shared-key', ''), remote, PROXY), { ok: true, client: null, keyHash: null });
   assert.equal(resolveConnectAuth(basic('wrong', ''), remote, PROXY).ok, false);
   assert.equal(resolveConnectAuth({ headers: {} }, remote, PROXY).ok, false);
 });
 
 test('resolveConnectAuth: loopback is exempt but a valid key still names it', () => {
-  assert.deepEqual(resolveConnectAuth({ headers: {} }, local, PROXY), { ok: true, client: null });
-  assert.deepEqual(resolveConnectAuth(basic('alice-key', ''), local, PROXY), { ok: true, client: 'alice' });
+  assert.deepEqual(resolveConnectAuth({ headers: {} }, local, PROXY), { ok: true, client: null, keyHash: null });
+  assert.deepEqual(resolveConnectAuth(basic('alice-key', ''), local, PROXY), { ok: true, client: 'alice', keyHash: keyHash('alice-key') });
 });
 
 // ── resolveConnectPin back-compat + clientKeys awareness ────
@@ -200,9 +203,9 @@ test('resolveClientAuth ignores nameless or keyless entries and keeps the rest',
   const errors = [];
   const orig = console.error; console.error = (...a) => errors.push(a.join(' '));
   try {
-    assert.deepEqual(resolveClientAuth(cfg, 'nameless'), { ok: false, client: null });
-    assert.deepEqual(resolveClientAuth(cfg, 'k-ok'), { ok: true, client: 'ok' });
-    assert.deepEqual(resolveClientAuth(cfg, 'k-ok2'), { ok: true, client: 'ok' });
+    assert.deepEqual(resolveClientAuth(cfg, 'nameless'), { ok: false, client: null, keyHash: null });
+    assert.deepEqual(resolveClientAuth(cfg, 'k-ok'), { ok: true, client: 'ok', keyHash: keyHash('k-ok') });
+    assert.deepEqual(resolveClientAuth(cfg, 'k-ok2'), { ok: true, client: 'ok', keyHash: keyHash('k-ok2') });
     resolveClientAuth(cfg, 'k-ok'); // same array: no second round of warnings
   } finally { console.error = orig; }
   assert.equal(errors.filter(e => /without a name and a key/.test(e)).length, 1);

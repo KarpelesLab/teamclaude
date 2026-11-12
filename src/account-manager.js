@@ -6,7 +6,7 @@ import { sameIdentity } from './identity.js';
 import { weeklyBucketForModel, modelGlobMatches, modelFamily, gatingUtilization, resolveMaxUsage, spendCapReached, resolveSwitchThreshold, sanitizeSwitchThreshold, WEEKLY_BUCKET_KEYS } from './model.js';
 import { SessionTracker } from './session-tracker.js';
 import { SessionPins } from './session-pins.js';
-import { parseClientRoutes, clearSeatRejection } from './client-routes.js';
+import { parseClientRoutes, parseContinuationPolicies, clearSeatRejection } from './client-routes.js';
 import { buildQuotaSummary, quotaTier } from './quota-summary.js';
 import { ROLLOVER_MIN_JUMP_MS, remapHeld, findHeld, dropHeld, newObservation } from './rollover.js';
 import { decideBand, pressureOf, pressureRank, assertNever } from './band-decision.js';
@@ -666,6 +666,8 @@ export class AccountManager {
    * @param {number} [opts.forcedRefreshFloorMs]
    * @param {Array<Object>} [opts.routes]
    * @param {Array<Object>} [opts.clientRoutes]  client routes (IPM fork, client-routes.js)
+   * @param {unknown} [opts.continuationPolicies]  owner-root continuation policies (IPM fork, AI-1903)
+   * @param {unknown} [opts.continuationPolicyErrors]  the renderer's policy errors, surfaced in status
    * @param {Object} [opts.ramp]
    * @param {boolean|string} [opts.distributeSessions]
    * @param {Object} [opts.adaptive]
@@ -674,7 +676,7 @@ export class AccountManager {
    * @param {string} [opts.advisorEligibility]  'strict' (default) or 'prefer'
    * @param {{ host: string, port: number }|null} [opts.listener]  this server's own address, so an accounts[].routing that points back at it is refused (see accountRouting)
    */
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, refreshCoordinator = (_account, refresh, _info) => refresh(), throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, clientRoutes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, advisorEligibility, listener = null } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, refreshCoordinator = (_account, refresh, _info) => refresh(), throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, clientRoutes, continuationPolicies, continuationPolicyErrors, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, advisorEligibility, listener = null } = {}) {
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
@@ -757,6 +759,9 @@ export class AccountManager {
     this.setRoutes(routes);
     // Client routes (IPM fork): see client-routes.js. Not model routes.
     this.setClientRoutes(clientRoutes);
+    // Owner-root continuation policies (IPM fork, AI-1903): the durable per-key
+    // seat-continuation mode, matched at admission beside the route binding.
+    this.setContinuationPolicies(continuationPolicies, continuationPolicyErrors);
     // Monotonic across every observation, so a stamp read under one move never
     // matches another. Live before the settings, since turning the knob on
     // takes a reading.
@@ -3011,6 +3016,24 @@ export class AccountManager {
   setClientRoutes(clientRoutes) {
     this.clientRoutes = parseClientRoutes(clientRoutes);
     for (const w of this.clientRoutes.warnings) console.log(`[TeamClaude] ${w}`);
+  }
+
+  /**
+   * Owner-root continuation policies (IPM fork, AI-1903): the durable per-key
+   * seat-continuation mode the gateway renders, matched at admission by client
+   * name + full key hash. Stored parsed, with the same live-swap semantics as
+   * clientRoutes: called from the constructor and on config reload, and the
+   * parse never throws — a malformed list fails safe to recommend and is
+   * reported through status (`continuationPolicyLoadError`), never by refusing
+   * traffic.
+   * @param {unknown} continuationPolicies
+   * @param {unknown} [continuationPolicyErrors]
+   */
+  setContinuationPolicies(continuationPolicies, continuationPolicyErrors) {
+    this.continuationPolicies = parseContinuationPolicies(continuationPolicies, continuationPolicyErrors);
+    if (this.continuationPolicies.loadError) {
+      console.log(`[TeamClaude] continuationPolicies: ${this.continuationPolicies.loadError}; affected keys fail safe to recommend and legacy force headers are ignored`);
+    }
   }
 
   /**

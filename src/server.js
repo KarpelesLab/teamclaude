@@ -12,7 +12,7 @@ import { sanitizeContentBlocks, contentBlockTypesToStrip } from './content-block
 import { refusalFromSseEvent, refusalFromBody, reportRefusal } from './refusal-watch.js';
 import { upstreamErrorFromBody, reportUpstreamError } from './upstream-error-tap.js';
 import { stampGatewayUser } from './user-identity.js';
-import { SEAT_REASONS, clientRoutePolicyActive, routeForClient, resolveClientRoute, seatVerdict, combineVerdicts, seatAnswer, verdictReason, recordSeatRejection, clearSeatRejection, clientRoutesStatus, callerSeat, nextInSeatQueue, nextInSeatQueueIndex, parseSeatPolicies } from './client-routes.js';
+import { SEAT_REASONS, clientRoutePolicyActive, routeForClient, resolveClientRoute, seatVerdict, combineVerdicts, seatAnswer, verdictReason, recordSeatRejection, clearSeatRejection, clientRoutesStatus, callerSeat, nextInSeatQueue, nextInSeatQueueIndex, parseSeatPolicies, keyHashOf, offerKeyRef, matchContinuationPolicy, callerContinuationPolicy, continuationPolicyStatus } from './client-routes.js';
 import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
 import { isTokenExpired } from './oauth.js';
 import { TopLevelFieldFinder, modelGlobMatches, parseRequestEffort, parseRequestStream, weeklyBucketForModel } from './model.js';
@@ -188,6 +188,9 @@ const CONNECTION_SPECIFIC_HEADERS = new Set([
 const SEAT_INTERNAL_HEADERS = new Set([
   'x-teamclaude-seat-policy',
   'x-teamclaude-seat-failover',
+  // AI-1903 (C7/E7): the cg contract version header gates the owner-root 429
+  // paragraph; it is ours, never upstream's, on every path.
+  'x-teamclaude-cg-contract',
 ]);
 
 // Response headers describing the SERVING organization's billing state:
@@ -376,11 +379,14 @@ export function keylessMcpRefusal(headers, remoteAddress, proxyConfig, boundHost
  * Which identity a presented key authenticates as, checked against the shared
  * `proxy.apiKey` and every `proxy.clientKeys` entry ({ name, key }).
  *
- * Returns { ok, client }: ok=false → reject; `client` is the matching entry's
- * name (per-client usage is booked against it), or null for the shared key —
- * the shared key predates client identities and stays unattributed rather than
- * inventing one. With no keys configured at all the gate is open (unchanged
- * behavior), also unattributed.
+ * Returns { ok, client, keyHash }: ok=false → reject; `client` is the matching
+ * entry's name (per-client usage is booked against it), or null for the shared
+ * key — the shared key predates client identities and stays unattributed rather
+ * than inventing one. With no keys configured at all the gate is open
+ * (unchanged behavior), also unattributed. `keyHash` (AI-1903, C1) is the full
+ * lowercase-hex SHA-256 of the presented key, set only on a clientKeys match
+ * (null for the shared key and the open gate) — owner-root continuation
+ * policies match on it, and it is never logged or returned to anyone.
  *
  * Client keys are checked first so a clientKeys entry that duplicates the
  * shared key still yields its name. Every candidate uses the constant-time
@@ -410,14 +416,14 @@ function usableClientKeys(clientKeys) {
 export function resolveClientAuth(proxyConfig, presented) {
   const shared = proxyConfig?.apiKey;
   const clientKeys = Array.isArray(proxyConfig?.clientKeys) ? usableClientKeys(proxyConfig.clientKeys) : [];
-  if (!shared && clientKeys.length === 0) return { ok: true, client: null };
+  if (!shared && clientKeys.length === 0) return { ok: true, client: null, keyHash: null };
   for (const entry of clientKeys) {
     if (safeKeyEqual(presented, entry.key)) {
-      return { ok: true, client: entry.name.trim() };
+      return { ok: true, client: entry.name.trim(), keyHash: keyHashOf(entry.key) };
     }
   }
-  if (shared && safeKeyEqual(presented, shared)) return { ok: true, client: null };
-  return { ok: false, client: null };
+  if (shared && safeKeyEqual(presented, shared)) return { ok: true, client: null, keyHash: null };
+  return { ok: false, client: null, keyHash: null };
 }
 
 // Control-plane writes that change the config file, with the refusal a
@@ -447,13 +453,18 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
  * `seat` (IPM fork, client-routes.js callerSeat) is the client's fixed seat,
  * added only when the caller passes one, so `cg status` can show it.
  *
+ * `continuationPolicy` (AI-1903, C5) is the caller's own owner-root snapshot
+ * ({ source, mode, revision }), added only when passed: a client key reads its
+ * own policy, never the admin list, and never a keyHash.
+ *
  * @param {string|null|undefined} client  the client-key name, or null
  * @param {Record<string, any>|null} [seat]
- * @returns {{ kind: 'operator'|'client', client: string|null, refused: string[], seat?: Record<string, any>|null }}
+ * @param {{ source: 'root'|'legacy', mode: 'force'|'recommend'|null, revision: string|null }} [continuationPolicy]
+ * @returns {{ kind: 'operator'|'client', client: string|null, refused: string[], seat?: Record<string, any>|null, continuationPolicy?: { source: 'root'|'legacy', mode: 'force'|'recommend'|null, revision: string|null } }}
  */
-export function callerView(client, seat) {
+export function callerView(client, seat, continuationPolicy) {
   if (!client) return { kind: 'operator', client: null, refused: [] };
-  return { kind: 'client', client, refused: [...CLIENT_KEY_REFUSED_PATHS.keys()], ...(seat !== undefined ? { seat } : {}) };
+  return { kind: 'client', client, refused: [...CLIENT_KEY_REFUSED_PATHS.keys()], ...(seat !== undefined ? { seat } : {}), ...(continuationPolicy !== undefined ? { continuationPolicy } : {}) };
 }
 
 /**
@@ -535,8 +546,11 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       }
       // Client identity for per-client usage. A loopback caller that presented
       // a valid client key is attributed like any other; loopback without one
-      // passed only via the exemption and stays unattributed.
+      // passed only via the exemption and stays unattributed. The keyHash rides
+      // beside it (AI-1903): owner-root continuation policies match on it, and
+      // it stays inside the request path — never logged, never in status.
       req.tcClient = auth.ok ? auth.client : null;
+      req.tcKeyHash = auth.ok ? (auth.keyHash ?? null) : null;
 
       // Control-plane mutations are refused when the request was issued by a web
       // page. The gate above exempts loopback from the API key, so without this
@@ -637,7 +651,25 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           requireClientRoute: config.proxy?.requireClientRoute === true,
         };
         const seat = req.tcClient ? callerSeat(accountManager, req.tcClient, resolveAccountPin) : undefined;
-        res.end(JSON.stringify({ ...extra, ...status, ...routing, caller: callerView(req.tcClient, seat), upstreamPool: upstreamPoolStatus() }, null, 2));
+        // AI-1903 (C5): capabilities are always advertised. The operator
+        // (no client key) additionally reads the admin view of the rendered
+        // policies — client, mode, revision, quarantine, never a keyHash —
+        // while a client key reads only its own caller.continuationPolicy.
+        const policyTable = /** @type {any} */ (accountManager).continuationPolicies ?? null;
+        const policyStatus = continuationPolicyStatus(policyTable);
+        const adminPolicies = req.tcClient ? {} : {
+          continuationPolicies: policyStatus.policies,
+          continuationPolicyErrors: policyStatus.errors,
+          continuationPolicyLoadError: policyStatus.loadError,
+        };
+        const callerPolicy = req.tcClient ? callerContinuationPolicy(policyTable, req.tcClient, req.tcKeyHash ?? null) : undefined;
+        res.end(JSON.stringify({
+          ...extra, ...status, ...routing,
+          capabilities: { continuationPolicies: 1, workerIdentity: false },
+          ...adminPolicies,
+          caller: callerView(req.tcClient, seat, callerPolicy),
+          upstreamPool: upstreamPoolStatus(),
+        }, null, 2));
         return;
       }
 
@@ -1628,9 +1660,10 @@ export function clientSessionId(headers) {
  * @param {Object|null} [opts.egress]
  * @param {Object|null} [opts.clientUsage]
  * @param {string|null} [opts.forcedClient]
+ * @param {string|null} [opts.forcedKeyHash]  the CONNECT-time key hash (AI-1903, E10): tunnelled requests never re-authenticate, so the MITM listener carries it for owner-root matching
  * @param {Object|null} [opts.dimensionUsage]
  */
-export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null, egress = null, clientUsage = null, forcedClient = null, dimensionUsage = null }) {
+export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null, egress = null, clientUsage = null, forcedClient = null, forcedKeyHash = null, dimensionUsage = null }) {
   let counter = 0;
   return async (req, res) => {
     // The activity entry this request opened, while it is still open. Every
@@ -1803,6 +1836,9 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // the key's own /tc-acct/ or TC_ACCT pin: it is the operator's override,
       // and it can serve a key that has no seat at all.
       const requestClient = req.tcClient ?? forcedClient ?? null;
+      // AI-1903 (C9/E10): the presented key's hash, direct (req.tcKeyHash) or
+      // fixed at CONNECT time (forcedKeyHash) — owner roots match on it.
+      const requestKeyHash = req.tcKeyHash ?? forcedKeyHash ?? null;
       const proxyConfig = /** @type {any} */ (config).proxy;
       const policyActive = clientRoutePolicyActive(/** @type {any} */ (accountManager).clientRoutes, proxyConfig);
       if (pinnedIndex == null || (policyActive && requestClient)) {
@@ -1840,6 +1876,10 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       let gate = null;
       /** @type {string|null} */
       let gateSeat = null;
+      // AI-1903: the continuation-policy snapshot taken at admission. Governs
+      // the whole request, retries and hops included; null when no seat binds.
+      /** @type {{ source: 'root'|'legacy', mode: 'force'|'recommend'|null, revision: string|null }|null} */
+      let continuationPolicy = null;
       let noAffinity = false;
       if (policyActive && providerForPath(req.url) === DEFAULT_PROVIDER) {
         const required = proxyConfig?.requireClientRoute === true;
@@ -1881,7 +1921,22 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
               if (!catalog) { refuse(SEAT_REASONS.unavailable, `(seat ${safeLine(routed.name, 64)} unresolved)`, r.problem); return; }
               noAffinity = true;
             } else {
-              bound = { route: routed.name, indices: r.indices, policies: parseSeatPolicies(req.headers['x-teamclaude-seat-policy'], routed, r.indices) };
+              // AI-1903: an owner root for this exact client+key overrides the
+              // legacy per-request header on every account of the route; the
+              // header is ignored entirely (a malformed rendered list matches
+              // as the fail-safe recommend root, so legacy force never
+              // revives). With no root, today's header parse runs unchanged.
+              const root = matchContinuationPolicy(/** @type {any} */ (accountManager).continuationPolicies, requestClient, requestKeyHash);
+              continuationPolicy = root
+                ? { source: 'root', mode: root.mode, revision: root.revision ?? null }
+                : { source: 'legacy', mode: null, revision: null };
+              bound = {
+                route: routed.name,
+                indices: r.indices,
+                policies: root
+                  ? new Map(r.indices.map((/** @type {number} */ i) => [i, root.mode]))
+                  : parseSeatPolicies(req.headers['x-teamclaude-seat-policy'], routed, r.indices),
+              };
               if (r.indices.length === 1) pinnedIndex = r.indices[0];
             }
           } else if (required) {
@@ -2011,7 +2066,9 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // internal project and branch names to Anthropic for no benefit, so they
       // are dropped with the other proxy-control headers.
       // x-tc-caller is the operator's own attribution hint (see the gate above).
-      const stripHeaders = new Set([...usageDimensionHeaderNames(config.proxy), 'x-tc-caller', 'x-teamclaude-seat-policy']);
+      // x-teamclaude-cg-contract (AI-1903, C7) gates the owner-root 429 copy;
+      // it is a proxy-control header and never travels upstream.
+      const stripHeaders = new Set([...usageDimensionHeaderNames(config.proxy), 'x-tc-caller', 'x-teamclaude-seat-policy', 'x-teamclaude-cg-contract']);
 
       // stripOverage and synthesizeQuota are sampled once here, at dispatch:
       // retries and holds of this request keep them, and a reload applies to
@@ -2021,7 +2078,16 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         // retry and hop of this request. boundExclude is every other account,
         // so a multi-account seat hops only inside itself.
         bound, boundExclude: bound ? new Set(/** @type {any} */ (accountManager).accounts.map((/** @type {any} */ a, /** @type {number} */ i) => i).filter((/** @type {number} */ i) => !bound.indices.includes(i))) : null,
-        noAffinity, gate, seat: gateSeat };
+        noAffinity, gate, seat: gateSeat,
+        // Owner-root continuation (AI-1903): the admission snapshot of the
+        // governing policy, the key hash it matched (never logged), the C9
+        // offer-scope reference derived from it, the cg contract gate for the
+        // 429 copy, the live proxy config for the per-hop key re-check (E11),
+        // and the armed force-hop count (capped at MAX_CONTINUATION_HOPS).
+        continuationPolicy, keyHash: requestKeyHash,
+        keyRef: continuationPolicy?.source === 'root' && requestKeyHash ? offerKeyRef(requestKeyHash) : null,
+        cgContractRoot: req.headers['x-teamclaude-cg-contract'] === 'root-v1',
+        proxyConfig, continuationHops: 0 };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -2383,7 +2449,7 @@ export function resolveUpgradeAuth(req, socket, proxyConfig, boundHost = null) {
     if (!isLocalHostHeader(originHost, bindHost)) return auth;
   }
   if (!isLocalHostHeader(req?.headers?.host, bindHost)) return auth;
-  return { ok: true, client: null };
+  return { ok: true, client: null, keyHash: null };
 }
 
 /**
@@ -2428,7 +2494,7 @@ export function upgradeTarget(upstream, url) {
   return target;
 }
 
-export function relayUpgrade(req, socket, head, upstream, sx, { client = null, clientUsage = null, log = console.log, stripOverage = false } = {}) {
+export function relayUpgrade(req, socket, head, upstream, sx, { client = /** @type {string|null} */ (null), clientUsage = null, log = console.log, stripOverage = false } = {}) {
   const target = upgradeTarget(upstream, req.url);
   if (!target) {
     log(`[TeamClaude] WebSocket upgrade refused: request target ${JSON.stringify(safeLine(req.url, 128))} is not a path on the upstream`);
@@ -3330,7 +3396,9 @@ function respondSeat(res, ctx, verdict, shownAccount, accountManager = null, acc
     && ctx.boundPinned && verdict.kind === 'spent' && ctx.bound
     ? { pinned: shownAccount, next: nextInSeatQueue(accountManager, ctx.bound.indices, accountIndex, ctx.model, ctx.advisorModel) }
     : null;
-  const answer = seatAnswer(reason, { seat: ctx.seat, verdict, detail, queue });
+  // The C7 owner-root paragraph rides the actionable multi-seat answer only,
+  // and only for a caller whose cg advertised the root-v1 contract (E7).
+  const answer = seatAnswer(reason, { seat: ctx.seat, verdict, detail, queue, ownerRoot: ctx.cgContractRoot === true });
   ctx.status = answer.status;
   ctx.account = shownAccount;
   ctx.gate = reason;
@@ -3343,14 +3411,25 @@ function respondSeat(res, ctx, verdict, shownAccount, accountManager = null, acc
     if (ctx.boundPinned && verdict.kind === 'spent' && queue?.next
         && ctx.bound.indices.length > 1 && ctx.pinKey && ctx.client && ctx.seat && accountIndex != null) {
       const bucket = accountManager._weeklyBucketFor?.(ctx.model) ?? weeklyBucketForModel(ctx.model);
-      accountManager.sessionTracker.recordSeatContinuation(ctx.pinKey, {
-        client: ctx.client,
-        route: ctx.seat,
-        bucket,
-        idx: accountIndex,
-        at: verdict.rejection.at,
-        resetsAt: verdict.rejection.resetsAt,
-      });
+      // E13: an in-flight request admitted under one root revision must not
+      // record an offer under another. The snapshot governs: when the key's
+      // currently loaded root revision differs from the admitted one (a reload
+      // landed mid-request), the record is a no-op. A legacy request (null
+      // revision) records only while no root governs the key.
+      const snapshotRevision = ctx.continuationPolicy?.revision ?? null;
+      const currentRevision = matchContinuationPolicy(accountManager.continuationPolicies, ctx.client, ctx.keyHash ?? null)?.revision ?? null;
+      if (snapshotRevision === currentRevision) {
+        accountManager.sessionTracker.recordSeatContinuation(ctx.pinKey, {
+          client: ctx.client,
+          route: ctx.seat,
+          bucket,
+          idx: accountIndex,
+          at: verdict.rejection.at,
+          resetsAt: verdict.rejection.resetsAt,
+          revision: snapshotRevision,
+          keyRef: ctx.keyRef ?? null,
+        });
+      }
     }
   }
 }
@@ -3359,6 +3438,15 @@ function respondSeat(res, ctx, verdict, shownAccount, accountManager = null, acc
  * A force-mode quota hop to another account of the same bound seat. The explicit
  * hop bypasses offer consumption and keeps the destination's own policy/pin
  * semantics; the original request body is reused by the caller.
+ *
+ * AI-1903 bounds and fences the hop before arming it:
+ * - E11: the presented key is re-checked against the CURRENT client keys — a
+ *   key revoked or rotated by a reload mid-request ends the request instead of
+ *   hopping (ctx.continuationStopped = 'key-revoked');
+ * - arch plan 9: at most MAX_CONTINUATION_HOPS armed hops per admitted request
+ *   (each armed hop is exactly one continuation upstream attempt), then the
+ *   request ends (ctx.continuationStopped = 'cap').
+ *
  * @param {any} accountManager
  * @param {Record<string, any>} ctx
  * @param {Record<string, any>} account
@@ -3368,9 +3456,18 @@ function respondSeat(res, ctx, verdict, shownAccount, accountManager = null, acc
 function hopForcedSeat(accountManager, ctx, account, verdict) {
   if (!ctx.bound || !ctx.boundPinned || ctx.pinnedIndex != null
       || verdict.kind !== 'spent' || seatPolicyFor(ctx, account.index) !== 'force') return false;
+  if (ctx.keyHash && !clientKeyStillCurrent(ctx.proxyConfig, ctx.client, ctx.keyHash)) {
+    ctx.continuationStopped = 'key-revoked';
+    return false;
+  }
+  if ((ctx.continuationHops ?? 0) >= MAX_CONTINUATION_HOPS) {
+    ctx.continuationStopped = 'cap';
+    return false;
+  }
   const excluded = new Set([...ctx.tried, ...(ctx.rolledOff ?? [])]);
   const next = nextInSeatQueueIndex(accountManager, ctx.bound.indices, account.index, ctx.model, ctx.advisorModel, excluded);
   if (next == null) return false;
+  ctx.continuationHops = (ctx.continuationHops ?? 0) + 1;
   ctx.tried.add(account.index);
   ctx.hopTo = next;
   const destination = accountManager.accounts[next];
@@ -3382,6 +3479,56 @@ function hopForcedSeat(accountManager, ctx, account, verdict) {
   };
   console.log(`[TeamClaude] Seat force continuation "${safeLine(ctx.seat, 64)}": "${safeLine(account.name, 64)}" → "${safeLine(destination.name, 64)}"; full conversation reprocessed with a cold prompt cache`);
   return true;
+}
+
+/**
+ * Hard cap on armed force continuation hops per admitted request (arch plan
+ * 9): each armed hop sends the full conversation to one more upstream account,
+ * so the cap bounds what one admitted request can spend under an owner-wide
+ * force root. The cap counts hops, not the initial attempt.
+ */
+const MAX_CONTINUATION_HOPS = 8;
+
+/**
+ * E11 re-check: is the key this request was admitted with still a current
+ * client key under the same name? `proxyConfig` is the live shared object — a
+ * reload mutates it in place, so this sees revocations and rotations. The raw
+ * key is never stored on ctx; the comparison is hash against hash.
+ * @param {any} proxyConfig
+ * @param {string|null} client
+ * @param {string} keyHash
+ * @returns {boolean}
+ */
+function clientKeyStillCurrent(proxyConfig, client, keyHash) {
+  const keys = Array.isArray(proxyConfig?.clientKeys) ? usableClientKeys(proxyConfig.clientKeys) : [];
+  const wanted = typeof client === 'string' ? client.trim().toLowerCase() : '';
+  return keys.some((/** @type {any} */ e) => e.name.trim().toLowerCase() === wanted && keyHashOf(e.key) === keyHash);
+}
+
+/**
+ * The non-unified 429 a force continuation ends with when the per-request hop
+ * cap is reached or the key was revoked mid-request (AI-1903, arch plan 9 /
+ * E11). No unified headers (it is not an upstream window verdict), no C7
+ * paragraph, and `x-should-retry: false` so the client stops.
+ * @param {any} res
+ * @param {Record<string, any>} ctx
+ * @param {string} shownAccount
+ */
+function respondContinuationStopped(res, ctx, shownAccount) {
+  const detail = ctx.continuationStopped === 'key-revoked'
+    ? 'the client key was revoked or rotated while this request was in flight'
+    : `it reached the limit of ${MAX_CONTINUATION_HOPS} automatic continuations for one request`;
+  ctx.status = 429;
+  ctx.account = shownAccount;
+  ctx.gate = SEAT_REASONS.spent;
+  ctx.delivered = true;
+  logSeatEvent(ctx.client, ctx.seat, SEAT_REASONS.spent, 429, detail);
+  if (res.headersSent || clientGone(res)) return;
+  res.writeHead(429, { 'Content-Type': 'application/json', 'x-should-retry': 'false' });
+  res.end(JSON.stringify({
+    type: 'error',
+    error: { type: 'rate_limit_error', message: `Your Claude seat${ctx.seat ? ` "${safeLine(ctx.seat, 64)}"` : ''} stopped continuing this conversation automatically: ${detail}. Start a new conversation on another assigned account, or retry later.` },
+  }));
 }
 
 /**
@@ -3432,6 +3579,10 @@ function pickBoundAccount(accountManager, ctx) {
             idx: pinIdx,
             at: verdict.rejection.at,
             resetsAt: verdict.rejection.resetsAt,
+            // AI-1903: the offer must belong to this request's admitted root
+            // revision and key; a mismatch consumes it and fails closed.
+            revision: ctx.continuationPolicy?.revision ?? null,
+            keyRef: ctx.keyRef ?? null,
           });
           if (offer) {
             const destination = accountManager.accounts[next];
@@ -3777,6 +3928,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       if (retryCount < maxRetries && hopForcedSeat(accountManager, ctx, account, verdict)) {
         return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
       }
+      // The hop cap or a mid-request key revocation ends the continuation with
+      // its own non-unified 429 rather than the seat's spent answer (AI-1903).
+      if (ctx.continuationStopped) return respondContinuationStopped(res, ctx, account.name);
       // A pick made from the conversation's pin inside the seat keeps the
       // pinned account's verdict as the answer (boundPinned): re-selecting
       // onto a sibling account of the seat would move the whole conversation
@@ -4088,6 +4242,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         if (clientGone(res)) { ctx.abandoned = true; return; }
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
       }
+      // The hop cap or a mid-request key revocation (AI-1903) gets its own
+      // non-unified 429, never the seat's spent answer.
+      if (ctx.continuationStopped) return respondContinuationStopped(res, ctx, account.name);
       // A pin inside the seat keeps the hard stop (with the queue hint) rather
       // than re-selecting onto a sibling — same rule as the pre-send verdict.
       if (ctx.pinnedIndex == null && !ctx.boundPinned && retryCount < maxRetries) {

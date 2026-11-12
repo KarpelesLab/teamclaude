@@ -382,7 +382,7 @@ async function serverCommand() {
     console.error(`[TeamClaude] Bad adaptiveDistribution setting in ${getConfigPath()}: ${err.message}`);
     process.exit(1);
   }
-  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, clientRoutes: config.clientRoutes, ramp: config.stormRamp, distributeSessions: config.distributeSessions, expiryRouting: config.expiryRouting, advisorEligibility: config.advisorEligibility, adaptive, listener: localListener(config) });
+  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, clientRoutes: config.clientRoutes, continuationPolicies: config.continuationPolicies, continuationPolicyErrors: config.continuationPolicyErrors, ramp: config.stormRamp, distributeSessions: config.distributeSessions, expiryRouting: config.expiryRouting, advisorEligibility: config.advisorEligibility, adaptive, listener: localListener(config) });
   // Names the activity log's session column from Claude Code's own on-disk
   // session titles. Built whether or not the TUI runs, so a reload has one
   // object to reconfigure.
@@ -588,6 +588,12 @@ async function serverCommand() {
     // request keeps the binding it read at admission for all its retries.
     config.clientRoutes = diskConfig.clientRoutes;
     accountManager.setClientRoutes(config.clientRoutes);
+    // And the owner-root continuation policies with them (IPM fork, AI-1903),
+    // in the same synchronous, await-free stretch: every request reads the old
+    // keys/routes/policies or the new ones, never half of each.
+    config.continuationPolicies = diskConfig.continuationPolicies;
+    config.continuationPolicyErrors = diskConfig.continuationPolicyErrors;
+    accountManager.setContinuationPolicies(config.continuationPolicies, config.continuationPolicyErrors);
     // The MCP endpoint's mode: read per request, so this is what opens,
     // narrows or closes it without a restart. Outside the guard above on
     // purpose: an operator who deletes the whole `proxy` section has asked for

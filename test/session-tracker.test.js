@@ -323,6 +323,38 @@ test('seat continuations expire and follow account remapping', () => {
   assert.equal(st.takeSeatContinuation('s1', scope, clock.t), null, 'the quota window has reset');
 });
 
+// AI-1903: an offer disclosed under one owner-root revision or key cannot
+// authorize a continuation under another; a mismatch consumes it and fails
+// closed. Legacy (null/null) offers keep their exact pre-root shape.
+test('a seat continuation is fenced by the root revision and keyRef', () => {
+  const { clock, now } = fixedClock();
+  const st = new SessionTracker({ now });
+  const scope = { client: 'alice', route: 'seat-q', bucket: SHARED, idx: 2, at: 50, resetsAt: clock.t + 1000, revision: 'r_one', keyRef: 'a'.repeat(32) };
+  st.touch('s1', 2, SHARED, clock.t);
+  assert.equal(st.recordSeatContinuation('s1', scope, clock.t), true);
+  assert.equal(st.takeSeatContinuation('s1', { ...scope, revision: 'r_two' }, clock.t), null, 'another revision cannot take it');
+  assert.equal(st.takeSeatContinuation('s1', scope, clock.t), null, 'the mismatch consumed it (fail closed)');
+
+  assert.equal(st.recordSeatContinuation('s1', scope, clock.t), true);
+  assert.equal(st.takeSeatContinuation('s1', { ...scope, keyRef: 'b'.repeat(32) }, clock.t), null, 'another key on the same client name cannot take it');
+  assert.equal(st.takeSeatContinuation('s1', scope, clock.t), null);
+
+  assert.equal(st.recordSeatContinuation('s1', scope, clock.t), true);
+  assert.deepEqual(st.takeSeatContinuation('s1', scope, clock.t), { idx: 2, at: 50, resetsAt: scope.resetsAt, revision: 'r_one', keyRef: 'a'.repeat(32) }, 'a full match takes it');
+
+  // A legacy (scope-less) offer and a root-scoped take never mix, either way.
+  const legacy = { client: 'alice', route: 'seat-q', bucket: SHARED, idx: 2, at: 50, resetsAt: clock.t + 1000 };
+  assert.equal(st.recordSeatContinuation('s1', legacy, clock.t), true);
+  assert.equal(st.takeSeatContinuation('s1', scope, clock.t), null, 'a root-scoped take cannot spend a legacy offer');
+  assert.equal(st.recordSeatContinuation('s1', scope, clock.t), true);
+  assert.equal(st.takeSeatContinuation('s1', legacy, clock.t), null, 'a legacy take cannot spend a root-scoped offer');
+
+  // Garbage scope fields are refused, never stored.
+  assert.equal(st.recordSeatContinuation('s1', { ...scope, revision: 42 }, clock.t), false);
+  assert.equal(st.recordSeatContinuation('s1', { ...scope, keyRef: {} }, clock.t), false);
+  assert.equal(st.takeSeatContinuation('s1', legacy, clock.t), null, 'the refused records left nothing behind');
+});
+
 test('stats reports known, active, and per-account active distribution', () => {
   const { clock, now } = fixedClock();
   const st = new SessionTracker({ now });

@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import { createHash } from 'node:crypto';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer, loopbackExempt, isForwardedRequest, resolveUpgradeAuth } from '../src/server.js';
 import { resolveConnectAuth } from '../src/mitm.js';
@@ -47,17 +48,18 @@ test('isForwardedRequest: an empty header value is not a forwarding mark', () =>
 
 test('the WebSocket and CONNECT gates refuse the same requests', () => {
   const sock = { remoteAddress: local };
-  const refused = { ok: false, client: null };
-  const exempt = { ok: true, client: null };
+  const refused = { ok: false, client: null, keyHash: null };
+  const exempt = { ok: true, client: null, keyHash: null };
+  const aliceKeyHash = createHash('sha256').update('alice-key').digest('hex');
   assert.deepEqual(resolveUpgradeAuth({ headers: { host: 'localhost:8484' } }, sock, PROXY), exempt);
   assert.deepEqual(resolveUpgradeAuth({ headers: { host: 'localhost:8484', 'x-forwarded-for': '203.0.113.7' } }, sock, PROXY), refused);
   assert.deepEqual(resolveUpgradeAuth({ headers: { host: 'localhost:8484' } }, sock, { ...PROXY, trustLoopback: false }), refused);
-  assert.deepEqual(resolveUpgradeAuth({ headers: { host: 'localhost:8484', 'x-forwarded-for': '203.0.113.7', 'x-api-key': 'alice-key' } }, sock, PROXY), { ok: true, client: 'alice' });
+  assert.deepEqual(resolveUpgradeAuth({ headers: { host: 'localhost:8484', 'x-forwarded-for': '203.0.113.7', 'x-api-key': 'alice-key' } }, sock, PROXY), { ok: true, client: 'alice', keyHash: aliceKeyHash });
 
   assert.deepEqual(resolveConnectAuth({ headers: {} }, sock, PROXY), exempt);
   assert.deepEqual(resolveConnectAuth({ headers: { 'x-forwarded-for': '203.0.113.7' } }, sock, PROXY), refused);
   assert.deepEqual(resolveConnectAuth({ headers: {} }, sock, { ...PROXY, trustLoopback: false }), refused);
-  assert.deepEqual(resolveConnectAuth({ headers: { 'proxy-authorization': 'Bearer alice-key' } }, sock, { ...PROXY, trustLoopback: false }), { ok: true, client: 'alice' });
+  assert.deepEqual(resolveConnectAuth({ headers: { 'proxy-authorization': 'Bearer alice-key' } }, sock, { ...PROXY, trustLoopback: false }), { ok: true, client: 'alice', keyHash: aliceKeyHash });
 });
 
 // The reproduction from the report: a server configured WITH a key, a keyless

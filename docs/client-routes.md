@@ -48,6 +48,46 @@ Only Anthropic requests are routed this way. Codex and other providers keep thei
   foreign slugs, or slug/account-length mismatches disable force for the whole request. The header
   is a preference, never routing authority, and is stripped before the request reaches Anthropic.
 
+### Owner-root continuation policies (AI-1903)
+
+`continuationPolicies` is the durable, owner-controlled form of the per-seat choice, rendered by
+the gateway (never hand-edited):
+
+```json
+"continuationPolicies": [
+  { "client": "pedro", "keyHash": "<64-hex sha256 of the client key>", "mode": "force", "revision": "r_…", "quarantine": false }
+],
+"continuationPolicyErrors": []
+```
+
+A root matches a request by its authenticated client name (trimmed, lowercased — the same
+normalization as the route gate) plus the full SHA-256 of the presented key, on the direct HTTP
+path and inside MITM CONNECT tunnels alike. When a root exists for the key, its mode applies to
+**every account of the key's route** and the legacy `x-teamclaude-seat-policy` header is ignored
+entirely, so every local and remote worker using the key follows the one owner choice. A request
+captures `{ mode, revision }` once at admission; that snapshot governs all its retries and hops.
+
+- A key with no root keeps today's header behavior, byte-identical. An absent
+  `continuationPolicies` key means exactly that for everyone.
+- A malformed list (not an array) fails safe: every key recommends and legacy force headers are
+  ignored, with `continuationPolicyLoadError: "malformed_list"` in status. An entry with a valid
+  client and keyHash but a bad mode or revision fails that key safe to recommend
+  (`"malformed_entries"`). An entry whose client or keyHash is invalid is dropped.
+- Continuation offers are scoped by the root **revision** and a key reference
+  (`sha256("teamclaude-offer-v1" NUL keyHash)`, first 32 hex — the full keyHash never enters a
+  tracker key, offer record, log line or status). A revision change invalidates older offers: a
+  mismatch consumes the offer and fails closed, and an in-flight request admitted under the old
+  revision records nothing under the new one.
+- Force continuation is capped at **8 upstream attempts per request**; the next would-be hop gets a
+  non-unified 429 with `x-should-retry: false`. Before every force hop the presented key is
+  re-checked against the current client keys: a key revoked or rotated by a reload mid-request ends
+  the request with the same non-unified 429 instead of hopping.
+- The actionable multi-seat 429 (a pinned conversation whose seat has a servable sibling) appends
+  the owner-wide `cg seat-policy force` paragraph only when the request carries
+  `x-teamclaude-cg-contract: root-v1` — older cg builds answer that command with a usage error on
+  multi-seat keys. Single-seat and no-candidate variants never carry it. The header is stripped
+  before any upstream on every path.
+
 `POST /teamclaude/reload` applies both keys with no restart, in the same step as `proxy.clientKeys`.
 A request keeps the binding it read at admission for all its retries.
 
@@ -134,8 +174,15 @@ A client key cannot POST `/teamclaude/switch` (or `/teamclaude/session-pin`). Bo
 - `clientRoutes`: `[{ name, clients, accounts, resolved, problem? }]`, an empty list when none are
   configured;
 - `requireClientRoute`: `true` or `false`;
+- `capabilities`: `{ continuationPolicies: 1, workerIdentity: false }` — whether this build speaks
+  owner-root continuation policies (worker identity is a phase-2 item and stays `false`);
 - `caller.seat` for a client-key caller: `{ name, accounts, resolved, state, windows, resetsAt }`, or
-  `null` when the key has no seat. The admin-key poll never carries it.
+  `null` when the key has no seat. The admin-key poll never carries it;
+- `caller.continuationPolicy` for a client-key caller: its own `{ source: "root" | "legacy", mode,
+  revision }` (`mode`/`revision` are `null` under `legacy`). The operator poll carries the admin
+  view instead: `continuationPolicies` (`[{ client, mode, revision, quarantine }]`), the renderer's
+  `continuationPolicyErrors`, and `continuationPolicyLoadError` (a short fixed reason or `null`).
+  No keyHash ever appears in status.
 
 ## Activity log
 
