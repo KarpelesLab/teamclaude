@@ -112,7 +112,7 @@ test('a tunnelled request matches the force root with no legacy header', T, asyn
     const forced = await viaTunnel('tun-1');
     assert.equal(forced.status, 200, 'the root force-hopped inside the tunnel without any legacy header');
     assert.deepEqual(seen, ['sa', 'sa', 'sc']);
-    assert.ok(contractHeaders.every((v) => v === undefined), 'the contract header reached upstream');
+    assert.ok(contractHeaders.every((v) => v === undefined), 'the contract header must not reach upstream');
   } finally {
     console.log = quietLog;
     closeHard(mitm);
@@ -195,7 +195,7 @@ test('two keys sharing a client name get separate tunnel listeners and separate 
     // The rooted key force-hops on the same seat, with no header at all. sa's
     // rejection is already recorded (the alt key's 429), so the hop is armed
     // pre-send and sa is not touched again.
-    assert.equal(await viaTunnel('root-1', 'ana-key'), 200, 'the root did not force the hop');
+    assert.equal(await viaTunnel('root-1', 'ana-key'), 200, 'the root must force the hop');
     assert.deepEqual(seen, ['sa', 'sa', 'sa', 'sc']);
   } finally {
     console.log = quietLog;

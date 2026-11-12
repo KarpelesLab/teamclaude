@@ -67,8 +67,9 @@ path and inside MITM CONNECT tunnels alike. When a root exists for the key, its 
 entirely, so every local and remote worker using the key follows the one owner choice. A request
 captures `{ mode, revision }` once at admission; that snapshot governs all its retries and hops.
 
-- A key with no root keeps today's header behavior, byte-identical. An absent
-  `continuationPolicies` key means exactly that for everyone.
+- A key with no root keeps today's header behavior; the only exceptions are the two bounds below,
+  which apply to every force continuation, header-driven included: the 8-attempt cap and the
+  mid-request key re-check. An absent `continuationPolicies` key means no roots for everyone.
 - A malformed list (not an array) fails safe: every key recommends and legacy force headers are
   ignored, with `continuationPolicyLoadError: "malformed_list"` in status. An entry with a valid
   client and keyHash but a bad mode or revision fails that key safe to recommend

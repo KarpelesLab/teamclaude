@@ -167,8 +167,8 @@ test('a force root hops on every assigned account and ignores the legacy recomme
     assert.equal(forced.headers.get('x-teamclaude-cg-contract'), null, 'an upstream-spoofed contract header is discarded');
     assert.deepEqual(seen, ['qa', 'qa', 'qb']);
     for (const a of attempts) {
-      assert.equal(a.headers['x-teamclaude-seat-policy'], undefined, 'the legacy header reached upstream');
-      assert.equal(a.headers['x-teamclaude-cg-contract'], undefined, 'the contract header reached upstream');
+      assert.equal(a.headers['x-teamclaude-seat-policy'], undefined, 'the legacy header must not reach upstream');
+      assert.equal(a.headers['x-teamclaude-cg-contract'], undefined, 'the contract header must not reach upstream');
     }
     const status = (await control('/teamclaude/status')).json;
     assert.deepEqual(status.continuationPolicies, [{ client: 'amy', mode: 'force', revision: 'r_one', quarantine: false }], 'status reports revision r_one');
@@ -198,7 +198,7 @@ test('a malformed policy list fails safe to recommend and never revives legacy f
     const stopped = await send({ text: 'hello', policy: '*=force' });
     assert.equal(stopped.status, 429);
     assert.match(stopped.json?.error?.message ?? '', /next prompt confirms/);
-    assert.deepEqual(seen, ['qa', 'qa'], 'a hop happened under the malformed list');
+    assert.deepEqual(seen, ['qa', 'qa'], 'no hop may happen under the malformed list');
     const status = (await control('/teamclaude/status')).json;
     assert.equal(status.continuationPolicyLoadError, 'malformed_list');
     const amy = (await control('/teamclaude/status', KEYS.amy)).json;
@@ -239,6 +239,27 @@ test('force continuation is capped at 8 upstream attempts, then a non-unified 42
     const msg = r.json?.error?.message ?? '';
     assert.match(msg, /limit of 8 automatic continuations/, msg);
     assert.ok(!msg.includes('cg seat-policy force'), 'the cap answer never carries the C7 paragraph');
+    assert.equal(seen.length, 10, `1 initial + 1 first turn + 8 hops: ${JSON.stringify(seen)}`);
+    assert.deepEqual(seen.slice(1), names.slice(0, 9), 'c9 was never attempted');
+  });
+});
+
+test('the 8-hop cap and per-hop key re-check also bind a rootless legacy force request', async () => {
+  const names = ['c0', 'c1', 'c2', 'c3', 'c4', 'c5', 'c6', 'c7', 'c8', 'c9'];
+  const routes = [{ name: 's1+s2+s3+s4+s5+s6+s7+s8+s9+s10', clients: ['amy'], accounts: names }];
+  let allSpent = false;
+  await withGateway({
+    routes,
+    accounts: names.map(oauth),
+    handler: (_who, _req, res) => (allSpent ? spent(res) : ok(res)),
+  }, async ({ send, seen }) => {
+    assert.equal((await send({ session: 'cap-legacy', text: 'cap' })).status, 200);
+    allSpent = true;
+    const r = await send({ session: 'cap-legacy', text: 'cap', policy: '*=force' });
+    assert.equal(r.status, 429);
+    assert.equal(r.headers.get('x-should-retry'), 'false');
+    assert.equal(r.headers.get('anthropic-ratelimit-unified-7d-reset'), null, 'no unified headers on the cap answer');
+    assert.match(r.json?.error?.message ?? '', /limit of 8 automatic continuations/);
     assert.equal(seen.length, 10, `1 initial + 1 first turn + 8 hops: ${JSON.stringify(seen)}`);
     assert.deepEqual(seen.slice(1), names.slice(0, 9), 'c9 was never attempted');
   });
@@ -345,6 +366,7 @@ test('the C7 paragraph rides the actionable multi-seat 429 only with the contrac
     // Two conversations, both pinned on qa before it spends out.
     assert.equal((await send({ text: 'hello', session: 's-plain' })).status, 200);
     assert.equal((await send({ text: 'hello', session: 's-gated' })).status, 200);
+    assert.equal((await send({ text: 'hello', session: 's-v2' })).status, 200);
     qaSpent = true;
     const plain = await send({ text: 'hello', session: 's-plain' });
     assert.equal(plain.status, 429);
@@ -355,6 +377,10 @@ test('the C7 paragraph rides the actionable multi-seat 429 only with the contrac
     const msg = gated.json?.error?.message ?? '';
     assert.ok(msg.includes(CG_SEAT_POLICY_ROOT_PARAGRAPH), `the verbatim paragraph is missing: ${msg}`);
     assert.ok(msg.includes('next prompt confirms'), 'the paragraph extends the existing offer');
+
+    const other = await send({ text: 'hello', session: 's-v2', contract: 'root-v2' });
+    assert.equal(other.status, 429);
+    assert.ok(!(other.json?.error?.message ?? '').includes('cg seat-policy force'), 'an unknown contract version must not unlock the paragraph');
   });
 });
 
