@@ -3475,6 +3475,14 @@ const SSE_UNCOMMITTED_EVENTS = new Set(['response.created', 'response.queued', '
  */
 export const STREAM_FAILURE_CODES = new Set(['server_is_overloaded', 'server_error', 'rate_limit_exceeded', 'overloaded_error']);
 
+// The in-band failures that would have been a 5xx or a 429 as a status - the
+// provider's, not the request's - so a stream that reports one delivered
+// nothing (see the relay). Wider than the hop set above, which decides routing
+// and stays as it is: Anthropic also reports `api_error` (500),
+// `timeout_error` (504) and `rate_limit_error` (429) inside a stream that has
+// opened.
+const PROVIDER_FAILURE_CODES = new Set([...STREAM_FAILURE_CODES, 'api_error', 'timeout_error', 'rate_limit_error']);
+
 // How much of a stream the peek may hold before releasing it undecided. The
 // Codex lifecycle envelopes echo the whole request back, instructions included,
 // so `response.created` alone can run to tens of KiB.
@@ -4482,7 +4490,13 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // hop ctx.rateLimitHopped is set, this branch does not run again for this
       // request, and the sx fresh-IP retry and the inline wait take over —
       // which is the right response to an IP-scoped limit.
-      if (!ctx.rateLimitHopped && retryCount < maxRetries) {
+      //
+      // Never for a pinned request (TC_ACCT, /tc-acct/, a session pin): a pin
+      // names the one account the client asked for, and docs/routing.md
+      // promises it never fails over - a rate limit is handled as for any pin
+      // to one account, below. The billing walk along a pin's list is separate
+      // (advancePinPastBilling) and unaffected.
+      if (ctx.pinnedIndex == null && !ctx.rateLimitHopped && retryCount < maxRetries) {
         // ctx.rolledOff as well as tried: an account a rollover moved this
         // request off was never sent a request, so it is not in `tried`, and
         // hopping back onto it would reverse that decision one step later.
@@ -4643,7 +4657,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // overloaded, not the account, and walking the fleet would just spend every
     // account'"'"'s cache discovering that. After the hop the response goes to the
     // client as it does today, with its own retry-after intact.
-    if (upstreamRes.status >= 500 && !res.headersSent && !ctx.serverErrorHopped && retryCount < maxRetries) {
+    // Never for a pinned request, as for the 429 hop above.
+    if (ctx.pinnedIndex == null && upstreamRes.status >= 500 && !res.headersSent && !ctx.serverErrorHopped && retryCount < maxRetries) {
       // Same exclusion as the 429 hop, and the same cursor-preserving pick.
       const alt = accountManager.pickAlternate(
         new Set([...ctx.tried, ...(ctx.rolledOff || []), account.index]),
@@ -4821,8 +4836,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // Same hop, same budget, same reason — a second account refusing the same
     // way is the provider talking, not the account — keyed on the first
     // decisive event instead of the status. The sibling is picked first so a
-    // request with nowhere to hop to is never held for nothing.
-    if (isStreaming && upstreamRes.status < 400 && upstreamBody && !res.headersSent
+    // request with nowhere to hop to is never held for nothing. Never for a
+    // pinned request, as for the 429 hop above.
+    if (ctx.pinnedIndex == null && isStreaming && upstreamRes.status < 400 && upstreamBody && !res.headersSent
         && !ctx.streamFailureHopped && retryCount < maxRetries) {
       const alt = accountManager.pickAlternate(
         new Set([...ctx.tried, ...(ctx.rolledOff || []), account.index]),
@@ -4909,19 +4925,27 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       return;
     }
 
+    // A 200 stream that reported its own failure (streamResponse): relayed
+    // whole, but not a completion.
+    /** @type {string|null} */
+    let streamFailed = null;
     if (isStreaming) {
       // Stream each chunk straight to the log as it is relayed — never hold the
       // whole (potentially ~1M-token) SSE body in memory.
       const l = getLog();
       const bw = l ? l.bodyWriter('RESPONSE BODY (streamed)', contentType) : null;
       try {
-        await streamResponse(upstreamBody, res, account.index, accountManager, bw, ctx.onUsage, ctx.pinKey, ctx.model, ctx.onMessage, (/** @type {Record<string, any>} */ u) => { ctx.cacheUsage = u; bookUsageTotals(ctx.usage, u); });
+        ({ failed: streamFailed } = await streamResponse(upstreamBody, res, account.index, accountManager, bw, ctx.onUsage, ctx.pinKey, ctx.model, ctx.onMessage, (/** @type {Record<string, any>} */ u) => { ctx.cacheUsage = u; bookUsageTotals(ctx.usage, u); }));
         // Reached only when the stream completed. A stream that dies upstream
         // throws out of streamResponse, so it never marks itself delivered —
         // which is the failure the token counters cannot see, since a stream
         // that emitted message_start has already recorded a usage report.
         if (clientGone(res)) ctx.abandoned = true;
-        else ctx.delivered = deliveredStatus;
+        // A provider-side failure the stream reported (PROVIDER_FAILURE_CODES) is
+        // the 5xx or 429 it would have been as a status (answeredStatus): nothing
+        // came back, and the session tracker counts it so. A request fault the
+        // stream reported is still an answer, as a 4xx is.
+        else ctx.delivered = deliveredStatus && !(streamFailed != null && PROVIDER_FAILURE_CODES.has(streamFailed));
       } finally {
         // Also on the failure path: without the note a capped body reads as a
         // stream that simply stopped, which is the other thing that happens here.
@@ -4937,8 +4961,16 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       ctx.delivered = deliveredStatus;
     }
     // An entitlement denial needs more than a 2xx header: a completion, not a
-    // side endpoint or a redirect, delivered whole.
-    if (ctx.delivered && upstreamRes.status >= 200 && upstreamRes.status < 300
+    // side endpoint or a redirect, delivered whole - and not a stream that
+    // reported its own failure, of any kind. Such a stream reaches the relay
+    // whenever the peek above does not hop on it, among them: a pin (the peek
+    // is skipped), no sibling, a code not worth a hop, a failure after the
+    // first event, the stream relayed after the one hop, a peek bound running
+    // out. Short of the pin, which hopped before this change, each of those
+    // used to clear the denial: a pinned account's live cooldown, and for any
+    // request the escalation count of a cooldown that had run out. Counted
+    // conservatively, even after output: the cooldown then ends on its own step.
+    if (ctx.delivered && streamFailed == null && upstreamRes.status >= 200 && upstreamRes.status < 300
         && isCompletionPath(classificationPath(req.url))) {
       accountManager.clearEntitlementDenied(account, entitlementEpoch);
       accountManager.clearModelDenied(account, ctx.model, modelDenialEpoch);
@@ -5128,6 +5160,13 @@ export function bookUsageTotals(totals, usage) {
 /**
  * Stream an SSE response to the client, parsing usage data along the way.
  * `onTotals` is told the usage that was booked, once the stream ends.
+ *
+ * Resolves to what the stream said about itself: `failed` names the first
+ * `error` or `response.failed` event it carried (its code, or the event type
+ * when it names none), and is null for a stream that reported no failure. A
+ * 200 whose body reports its own failure was relayed whole but completed
+ * nothing, and the caller's success bookkeeping needs to know the difference.
+ * @returns {Promise<{ failed: string|null }>}
  */
 export async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter, onUsage = null, pinKey = null, model = null, onMessage = null, /** @type {((usage: Record<string, any>) => void)|null} */ onTotals = null) {
   const reader = webStream.getReader();
@@ -5150,7 +5189,9 @@ export async function streamResponse(webStream, res, accountIndex, accountManage
   // remembers that it did — the incremental counters would book the turn again
   // if a second terminal event arrived. See parseSSEDataLine.
   const responsesTurn = { settled: false };
-  const usage = createSseLineScanner(line => parseSSEDataLine(line, accountIndex, accountManager, onUsage, merged, responsesTurn, onMessage));
+  /** @type {{ failed: string|null }} */
+  const outcome = { failed: null };
+  const usage = createSseLineScanner(line => parseSSEDataLine(line, accountIndex, accountManager, onUsage, merged, responsesTurn, onMessage, outcome));
 
   try {
     while (true) {
@@ -5219,6 +5260,7 @@ export async function streamResponse(webStream, res, accountIndex, accountManage
     reader.cancel().catch(() => {});
     if (!errored && !res.writableEnded) res.end();
   }
+  return outcome;
 }
 
 // The longest line the usage scanner will hold while waiting for its newline.
@@ -5308,12 +5350,19 @@ export function createSseLineScanner(onLine, maxChars = SSE_MAX_LINE_CHARS) {
  * @param {Record<string, any>|null} [merged]
  * @param {{settled: boolean}|null} [responsesTurn] this stream's "already booked" flag
  * @param {((messageId: string) => void)|null} [onMessage] told the id `message_start` names
+ * @param {{failed: string|null}|null} [outcome] this stream's first reported failure, set once
  */
-function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, merged = null, responsesTurn = null, onMessage = null) {
+function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, merged = null, responsesTurn = null, onMessage = null, outcome = null) {
   if (!line.startsWith('data: ')) return;
 
   try {
     const data = JSON.parse(line.slice(6));
+    // Either dialect's own failure report, kept apart from the hop decision
+    // (peekStreamFailure): any failure counts here, not only the codes worth a
+    // hop, and wherever in the stream it arrives.
+    if (outcome && outcome.failed == null && (data.type === 'error' || data.type === 'response.failed')) {
+      outcome.failed = streamFailureCode(data) ?? data.type;
+    }
     if (data.type === 'message_start' && typeof data.message?.id === 'string') onMessage?.(data.message.id);
     if (data.type === 'message_start' && data.message?.usage) {
       accountManager.updateUsage(accountIndex, data.message.usage.input_tokens, 0);
