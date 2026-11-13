@@ -4,6 +4,7 @@ import { claudeGrantKind } from './claude-resets.js';
 import { weeklyExhausted } from './codex-reset-credits.js';
 import { DEFAULT_PROVIDER, providerOf } from './provider.js';
 import { safeLine } from './safe-text.js';
+import { rememberResetReading, resetReading, RESET_READ_FLOOR_MS } from './reset-readings.js';
 
 /**
  * @typedef {Object} ResetGrant
@@ -22,7 +23,10 @@ import { safeLine } from './safe-text.js';
 /**
  * @typedef {Object} ResetDetails
  * @property {'claude'|'codex'} provider
- * @property {string|null} error  A failed read always has an empty grants list.
+ * @property {string|null} error  A failed panel read can retain cached grants.
+ * @property {number|null} seenAt  Last successful reading, in epoch milliseconds.
+ * @property {boolean} stale  The latest read failed; grants are from an older read.
+ * @property {number|null} retryAt  Upstream Retry-After, in epoch milliseconds.
  * @property {string|null} ineligibleReason
  * @property {boolean|null} atLimit
  * @property {string[]} exhausted
@@ -93,13 +97,15 @@ export function createResetActions({ accountManager, claudeRedeemer, codexRedeem
   }
 
   /**
-   * Always fetch detail rows, never the auto path's cached Codex list. The
-   * caller refreshes the token first, so redemption can use this exact read.
+   * Derive time-sensitive blocks and fleet warnings at display time, even
+   * when the underlying provider reading came from the cache.
    * @param {Record<string, any>} account
-   * @returns {Promise<ResetDetails>}
+   * @param {any} read
+   * @param {number|null} seenAt
+   * @returns {ResetDetails}
    */
-  async function readFresh(account) {
-    let at = now();
+  function detailsFor(account, read, seenAt) {
+    const at = now();
     const codex = providerOf(account) === 'codex';
     const redeemer = redeemerFor(account);
     const fleetHoldUntil = holdUntilFor(account);
@@ -107,17 +113,15 @@ export function createResetActions({ accountManager, claudeRedeemer, codexRedeem
     const details = {
       provider: codex ? 'codex' : 'claude', error: null, ineligibleReason: null,
       atLimit: null, exhausted: [], cooldownUntil: null, weeklyResetsAt: null,
-      fleetHoldUntil, grants: [],
+      fleetHoldUntil, grants: [], seenAt, stale: false, retryAt: null,
     };
     if (!oauthAccount(account)) return { ...details, error: accountBlock(account) };
     try {
       const blocked = accountBlock(account);
       const held = holdWarning(redeemer, fleetHoldUntil, at);
       if (codex) {
-        const read = await codexRedeemer.detailsFn(account);
         if (read?.error) return { ...details, error: safeLine(read.error, 120) };
         if (!Array.isArray(read?.credits)) return { ...details, error: 'could not read reset credits' };
-        at = now();
         const spent = weeklyExhausted(account, at);
         details.atLimit = spent;
         details.exhausted = spent ? ['weekly'] : [];
@@ -131,12 +135,10 @@ export function createResetActions({ accountManager, claudeRedeemer, codexRedeem
           warnings: [...(!spent ? ['weekly window is not exhausted'] : []), ...held],
         }));
       } else {
-        const read = await claudeRedeemer.statusFn(account);
         if (read?.error) return { ...details, error: safeLine(read.error, 120) };
         /** @type {import('./claude-resets.js').ResetStatus|null} */
         const status = read?.reset;
         if (!status) return { ...details, error: 'could not read reset status' };
-        at = now();
         details.ineligibleReason = status.eligible ? null : status.ineligibleReason;
         details.atLimit = status.atLimit;
         details.exhausted = status.exhausted;
@@ -168,19 +170,53 @@ export function createResetActions({ accountManager, claudeRedeemer, codexRedeem
     }
   }
 
-  /** @param {Record<string, any>} account @returns {Promise<ResetDetails>} */
+  /** Cached provider data, with current local blocks and warnings.
+   * @param {Record<string, any>} account
+   * @returns {ResetDetails|null}
+   */
+  function cached(account) {
+    const reading = resetReading(account);
+    if (!reading) return null;
+    const details = detailsFor(account, { reset: reading.reset, credits: reading.credits }, reading.seenAt);
+    return { ...details, error: reading.error, stale: reading.error != null && reading.seenAt != null, retryAt: reading.retryAt };
+  }
+
+  /** @param {Record<string, any>} account */
+  function readWindow(account) {
+    const reading = resetReading(account);
+    return {
+      readAt: reading?.readAt ?? null,
+      until: Math.max(reading?.readAt == null ? 0 : reading.readAt + RESET_READ_FLOOR_MS, reading?.retryAt ?? 0),
+    };
+  }
+
+  /** Never use a cached reading to validate an irreversible claim.
+   * @param {Record<string, any>} account
+   * @returns {Promise<ResetDetails>}
+   */
+  async function readFresh(account) {
+    if (!oauthAccount(account)) return detailsFor(account, null, null);
+    const read = providerOf(account) === 'codex'
+      ? await codexRedeemer.readDetails(account)
+      : await claudeRedeemer.readStatus(account);
+    return detailsFor(account, read, read?.error ? null : resetReading(account)?.seenAt ?? null);
+  }
+
+  /** A panel read is fresh, but a failure retains the last successful grants.
+   * @param {Record<string, any>} account
+   * @returns {Promise<ResetDetails>}
+   */
   async function read(account) {
     if (oauthAccount(account)) {
       try { await accountManager.ensureTokenFresh(account.index); } catch (/** @type {any} */ err) {
-        return {
-          provider: providerOf(account) === 'codex' ? 'codex' : 'claude',
+        rememberResetReading(account, providerOf(account) === 'codex' ? 'codex' : 'claude', {
           error: `token refresh failed (${safeLine(err?.message || String(err), 80)})`,
-          ineligibleReason: null, atLimit: null, exhausted: [], cooldownUntil: null,
-          weeklyResetsAt: null, fleetHoldUntil: holdUntilFor(account), grants: [],
-        };
+        }, now());
+        return /** @type {ResetDetails} */ (cached(account));
       }
     }
-    return readFresh(account);
+    const details = await readFresh(account);
+    return cached(account) ?? details;
   }
 
   /**
@@ -226,5 +262,5 @@ export function createResetActions({ accountManager, claudeRedeemer, codexRedeem
     }
   }
 
-  return { read, redeem };
+  return { read, cached, readWindow, redeem };
 }

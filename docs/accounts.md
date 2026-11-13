@@ -562,7 +562,7 @@ it once.
 ### Reading and spending a reset by hand
 
 Press **r** from the local TUI's main screen, choose an OAuth Claude or Codex
-account, and press **Enter** to read its fresh reset details. The picker starts
+account, and press **Enter** to show its reset details. The picker starts
 on the first account with a banked reset. The panel lists only grants you
 still hold: weekly, Fable and session resets, or Codex reset credits. Spent
 grants are not shown. Each row shows the kind in bold, the number left, the
@@ -582,7 +582,18 @@ upstream names as next. **Enter** asks for confirmation; **y** or **Y** spends
 one reset. Any other key cancels that confirmation. Blocked grants cannot
 reach confirmation.
 
-Within the panel, **r** reads the details again; **Esc** or **q** closes it.
+Opening the panel uses a reading no more than five minutes old, with no
+request. Claude readings also come from the quota probe's existing usage
+request; Codex detail rows come from reset-detail reads. The header shows the
+reading's age (`as of 1m ago`). Reset grant ids and detail rows stay in memory
+only and are never saved to config or quota files.
+
+Within the panel, **r** reads again only after two minutes since the last
+reading; otherwise it shows `read 40s ago — wait 80s` without a request. A 429
+starts that two-minute wait again. An upstream `Retry-After` can extend it.
+If a read fails, the last grants stay visible, marked `stale`, with their
+original age and the error. An upstream retry delay shows as `retry in 90s`.
+Without an earlier reading, only the error is shown. **Esc** or **q** closes it.
 Closing while a spend is in progress does not cancel that spend. The result
 is logged, and a successful or uncertain spend refreshes the panel if it is
 still open. Attach mode does not offer this action.

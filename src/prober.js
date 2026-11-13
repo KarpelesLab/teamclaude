@@ -8,6 +8,8 @@
 // probe reads a zero-spend endpoint and never consumes message quota.
 
 import { fetchUsage } from './oauth.js';
+import { parseResetStatus } from './claude-resets.js';
+import { rememberResetReading } from './reset-readings.js';
 import { fetchBackendQuota, hasBackendQuota } from './backend-quota.js';
 import { providerOf } from './provider.js';
 import { fetchCodexUsage } from './codex-usage.js';
@@ -182,14 +184,18 @@ export class Prober {
     if (this._isCodexProbeTarget(account)) return this._probeCodex(account, startedAt);
     try {
       await this.am.ensureTokenFresh(account.index);
-      let usage = await this._withTimeout(this.probeFn(account.credential, account.routing ?? null));
+      const readOptions = {
+        onPayload: (/** @type {any} */ data) => rememberResetReading(account, 'claude', { reset: parseResetStatus(data?.cedar_ember) }),
+      };
+      let usage = await this._withTimeout(this.probeFn(account.credential, account.routing ?? null, readOptions));
       if (usage?.status === 401) {
         // Token rejected: force refresh and retry once.
         await this.am.ensureTokenFresh(account.index, true);
-        usage = await this._withTimeout(this.probeFn(account.credential, account.routing ?? null));
+        usage = await this._withTimeout(this.probeFn(account.credential, account.routing ?? null, readOptions));
       }
 
       if (!usage || usage.error) {
+        rememberResetReading(account, 'claude', usage ?? { error: 'probe timed out' });
         // A refused usage read can be the lapsed plan itself; the profile says.
         if (usage) await this._readProfile(account);
         const finishedAt = Date.now();

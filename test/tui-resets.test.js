@@ -1,6 +1,10 @@
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { TUI, displayWidth } from '../src/tui.js';
+import { ClaudeResetRedeemer, parseResetStatus } from '../src/claude-resets.js';
+import { ResetCreditRedeemer } from '../src/codex-reset-credits.js';
+import { createResetActions } from '../src/reset-actions.js';
+import { rememberResetReading } from '../src/reset-readings.js';
 
 const NOW = Date.parse('2026-11-13T12:00:00Z');
 const DAY = 86400_000;
@@ -525,4 +529,117 @@ test('resets: r and its footer hint are available only locally with actions and 
     assert.equal(tui.mode, 'normal');
     assert.doesNotMatch(stripAnsi(tui._renderFooter()), /r resets/);
   }
+});
+
+
+// Use the real actions and cache for the panel's request policy tests.
+function cachedPanel(provider = 'claude') {
+  let at = NOW;
+  let failure = null;
+  let reads = 0;
+  const account = { index: 0, name: 'cached', type: 'oauth', credential: 'fake', orgUuid: 'org',
+    ...(provider === 'codex' ? { provider, accountId: 'acct' } : {}), quota: {} };
+  const am = { accounts: [account], ensureTokenFresh: async () => {} };
+  const now = () => at;
+  const reset = parseResetStatus({ eligible: true, at_limit: true, exhausted: ['seven_day'],
+    grants: [{ id: 'cached-grant', label: 'Cached grant', resets_left: 1, usable_now: true, clears: ['seven_day'] }] });
+  const credits = [{ id: 'cached-grant', title: 'Cached grant', status: 'available', supportedByPlan: true, expiresAt: null }];
+  const payload = provider === 'claude' ? { reset } : { credits };
+  const read = async () => { reads++; return failure ? { error: failure, status: 429, retryAt: at + 90_000 } : payload; };
+  const resetActions = createResetActions({ accountManager: am, now,
+    claudeRedeemer: new ClaudeResetRedeemer(am, { statusFn: read, now }),
+    codexRedeemer: new ResetCreditRedeemer(am, { detailsFn: read, now }),
+  });
+  const tui = makeTUI({ accounts: [account], resetActions, resetNow: now });
+  return { tui, resetActions, account,
+    seed: seenAt => rememberResetReading(account, provider, payload, seenAt),
+    advance: ms => { at += ms; }, fail: () => { failure = 'HTTP 429'; }, reads: () => reads,
+    text: () => tui._resetsLines(160).map(stripAnsi).join('\n'),
+  };
+}
+
+test('resets: both providers open from a cache up to five minutes old, else read', async () => {
+  for (const provider of ['claude', 'codex']) {
+    for (const age of [60_000, 300_000, 300_001]) {
+      const h = cachedPanel(provider);
+      h.seed(NOW - age);
+      h.tui._openResets(0);
+      await flush();
+      assert.equal(h.reads(), age > 300_000 ? 1 : 0, `${provider}: ${age}`);
+      assert.match(h.text(), /Cached grant/);
+      assert.match(h.text(), /as of/);
+      if (age === 60_000) assert.match(h.text(), /as of 1m ago/);
+    }
+  }
+});
+
+test('resets: r uses the per-account two-minute floor, then permits a real read', async () => {
+  for (const provider of ['claude', 'codex']) {
+    const h = cachedPanel(provider);
+    h.seed(NOW - 40_000);
+    h.tui._openResets(0);
+    await flush();
+    h.tui._key('r');
+    await flush();
+    assert.equal(h.reads(), 0);
+    assert.match(h.text(), /read 40s ago — wait 80s/);
+    h.advance(80_000);
+    h.tui._key('r');
+    await flush();
+    assert.equal(h.reads(), 1);
+    assert.doesNotMatch(h.text(), /wait/);
+  }
+});
+
+test('resets: 429 retains cached grants with their age and retry delay; r cannot hammer', async () => {
+  for (const provider of ['claude', 'codex']) {
+    const h = cachedPanel(provider);
+    h.seed(NOW - 240_000);
+    h.fail();
+    h.tui._openResets(0);
+    await flush();
+    h.tui._key('r');
+    await flush();
+    assert.equal(h.reads(), 1);
+    assert.match(h.text(), /stale · as of 4m ago · HTTP 429/);
+    assert.match(h.text(), /retry in 90s/);
+    assert.match(h.text(), /Cached grant/);
+    h.tui._key('r');
+    await flush();
+    assert.equal(h.reads(), 1);
+    assert.match(h.text(), /read 0s ago — wait 120s/);
+    h.tui._closeResets();
+    h.tui._openResets(0);
+    await flush();
+    assert.equal(h.reads(), 1);
+  }
+});
+
+test('resets: 429 without a cache shows the error, not an unknown limit state', async () => {
+  for (const provider of ['claude', 'codex']) {
+    const h = cachedPanel(provider);
+    h.fail();
+    h.tui._openResets(0);
+    await flush();
+    assert.match(h.text(), /HTTP 429/);
+    assert.match(h.text(), /retry in 90s/);
+    assert.doesNotMatch(h.text(), /limit state unknown|Cached grant|stale|as of/);
+    h.tui._key('r');
+    await flush();
+    assert.equal(h.reads(), 1);
+    assert.match(h.text(), /wait 120s/);
+  }
+});
+
+test('resets: an upstream retry delay longer than the floor prevents an early reread', async () => {
+  const h = cachedPanel();
+  h.seed(NOW - 360_000);
+  rememberResetReading(h.account, 'claude', { error: 'HTTP 429', status: 429, retryAt: NOW + 180_000 }, NOW);
+  h.advance(120_000);
+  h.tui._openResets(0);
+  await flush();
+  h.tui._key('r');
+  await flush();
+  assert.equal(h.reads(), 0);
+  assert.match(h.text(), /wait 60s/);
 });

@@ -9,6 +9,7 @@ import { envVar } from './brand.js';
 import { creditCount } from './codex-usage.js';
 import { LOGIN_TIMEOUT_MS, codeRace, openBrowser, pasteFromTerminal } from './login-flow.js';
 import { safeLine } from './safe-text.js';
+import { resetRetryAt } from './reset-readings.js';
 import { anthropicLink } from './account-refusal.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
@@ -630,10 +631,10 @@ export function normalizeUsageBucket(bucket) {
  * limit), or { error, status } on failure.
  * @param {string} accessToken
  * @param {import('./account-routing.js').RoutingProxy|null} [routing] - the account's own egress proxy
- * @param {{ fetchImpl?: Function, now?: number }} [opts] `now` is the clock the
+ * @param {{ fetchImpl?: Function, now?: number, onPayload?: (data: any) => void }} [opts] `now` is the clock the
  *   banked-reset expiry is judged against; tests pin it.
  */
-export async function fetchUsage(accessToken, routing = null, { fetchImpl = proxyFetch, now = Date.now() } = {}) {
+export async function fetchUsage(accessToken, routing = null, { fetchImpl = proxyFetch, now = Date.now(), onPayload } = {}) {
   try {
     const res = await fetchImpl(USAGE_URL, {
       headers: {
@@ -653,10 +654,14 @@ export async function fetchUsage(accessToken, routing = null, { fetchImpl = prox
       } catch {
         detail = await res.text().catch(() => '');
       }
-      return { error: `HTTP ${res.status}${detail ? ': ' + detail : ''}`, status: res.status };
+      return { error: `HTTP ${res.status}${detail ? ': ' + detail : ''}`, status: res.status, retryAt: resetRetryAt(res) };
     }
 
-    return normalizeUsagePayload(await res.json(), now);
+    const data = await res.json();
+    // The probe captures spend handles out of band, before normalization. They
+    // must never enter the usage object that flows to saved quota.
+    onPayload?.(data);
+    return normalizeUsagePayload(data, now);
   } catch (err) {
     return { error: err.message || String(err), status: null };
   }

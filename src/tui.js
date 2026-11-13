@@ -1,4 +1,5 @@
 import { createWriteStream } from 'node:fs';
+import { RESET_OPEN_TTL_MS } from './reset-readings.js';
 import { gatingUtilization } from './model.js';
 import { importCredentials, fetchProfile, formatMoney } from './oauth.js';
 import {
@@ -792,7 +793,7 @@ function tailText(s, w) {
  */
 
 /**
- * An on-demand reset read. Closing or re-reading invalidates the sequence;
+ * A cached or on-demand reset read. Closing or re-reading invalidates the sequence;
  * spending consumes a confirmation before the first await.
  * @typedef {object} ResetsPanel
  * @property {Record<string, any>} account
@@ -2064,7 +2065,7 @@ export class TUI {
     }
     this.resetsPanel = { account, loading: true, details: null, error: null, idx: 0, confirming: false, busy: false, seq: 0 };
     this.mode = 'resets';
-    void this._readResets(this.resetsPanel);
+    void this._readResets(this.resetsPanel, { open: true });
   }
 
   _closeResets() {
@@ -2073,15 +2074,25 @@ export class TUI {
     if (this.mode === 'resets') this.mode = 'normal';
   }
 
-  /** @param {ResetsPanel} panel */
-  async _readResets(panel) {
+  /** @param {ResetsPanel} panel
+   * @param {{ open?: boolean, afterSpend?: boolean }} [opts]
+   */
+  async _readResets(panel, { open = false, afterSpend = false } = {}) {
     if (!this.resetActions || this.resetsPanel !== panel || panel.busy) return;
     const seq = ++panel.seq;
     panel.loading = true;
     panel.confirming = false;
     panel.error = null;
     try {
-      const details = await this.resetActions.read(panel.account);
+      const cached = this.resetActions.cached?.(panel.account);
+      const now = this.resetNow();
+      const window = this.resetActions.readWindow?.(panel.account);
+      const reuse = !afterSpend && ((open && cached?.seenAt != null && now - cached.seenAt <= RESET_OPEN_TTL_MS)
+        || (window != null && now < window.until));
+      const details = reuse && cached ? cached : await this.resetActions.read(panel.account);
+      if (reuse && !open && window?.readAt != null) {
+        panel.error = `read ${Math.max(0, Math.floor((now - window.readAt) / 1000))}s ago — wait ${Math.ceil((window.until - now) / 1000)}s`;
+      }
       if (this.resetsPanel !== panel || panel.seq !== seq) return;
       // Keep one visible list for rendering, movement, confirmation and spending.
       panel.details = { ...details, grants: details.grants.filter(grant => grant.resetsLeft >= 1) };
@@ -2133,7 +2144,7 @@ export class TUI {
       this._addLog(result.message);
       if (this.resetsPanel !== panel) return;
       panel.busy = false;
-      if (result.redeemed || result.uncertain) await this._readResets(panel);
+      if (result.redeemed || result.uncertain) await this._readResets(panel, { afterSpend: true });
       else panel.error = result.message;
     } catch (/** @type {any} */ error) {
       const message = `Manual reset failed on "${safeLine(panel.account.name, 64)}": ${safeLine(error?.message || String(error), 240)}`;
@@ -2988,7 +2999,12 @@ export class TUI {
     if (!panel) return [];
     const details = panel.details;
     const brand = (details?.provider || (providerOf(panel.account) === 'codex' ? 'codex' : 'claude')) === 'codex' ? 'Codex' : 'Claude';
-    const lines = ['', ` ${bold(`Resets — ${safeLine(panel.account.name, 64)}`)}${dim(` · ${brand}`)}`, ''];
+    const now = this.resetNow();
+    const ageSeconds = details?.seenAt == null ? null : Math.max(0, Math.floor((now - details.seenAt) / 1000));
+    const age = ageSeconds == null ? '' : ` · as of ${ageSeconds < 60 ? `${ageSeconds}s` : `${Math.floor(ageSeconds / 60)}m`} ago`;
+    const stale = details?.stale ? ' · stale' : '';
+    const failure = details?.stale && details.error ? ` · ${details.error}` : '';
+    const lines = ['', truncate(` ${bold(`Resets — ${safeLine(panel.account.name, 64)}`)}${dim(` · ${brand}${stale}${age}${failure}`)}`, Math.max(0, W - 1)), ''];
     const prose = (/** @type {string} */ text, paint = (/** @type {string} */ s) => s) => {
       for (const line of wrapWords(sanitizeText(text), W - 4)) lines.push(`   ${paint(line)}`);
     };
@@ -2997,7 +3013,13 @@ export class TUI {
       return lines;
     }
     if (details) {
-      const now = this.resetNow();
+      if (details.error && details.seenAt == null) {
+        prose(details.error, red);
+        if (details.retryAt != null && details.retryAt > now) prose(`retry in ${Math.ceil((details.retryAt - now) / 1000)}s`, yellow);
+        if (panel.error) prose(panel.error, yellow);
+        return lines;
+      }
+      if (details.retryAt != null && details.retryAt > now) prose(`retry in ${Math.ceil((details.retryAt - now) / 1000)}s`, yellow);
       const limit = details.atLimit === true ? `at a limit: ${details.exhausted.map(limit => RESET_LIMIT_LABEL[limit] || limit).join(' + ')}`
         : details.atLimit === false ? 'not at a limit' : 'limit state unknown';
       prose(`${limit}${details.weeklyResetsAt == null ? '' : ` · week resets ${resetLocalTime(details.weeklyResetsAt, now, true)}`}`);
@@ -3006,7 +3028,7 @@ export class TUI {
       }
       if (details.fleetHoldUntil != null) prose(`fleet hold until ${resetLocalTime(details.fleetHoldUntil, now)}`, yellow);
       if (details.ineligibleReason) prose(`ineligible: ${details.ineligibleReason}`, red);
-      if (details.error) prose(details.error, red);
+      if (details.error && !details.stale) prose(details.error, red);
       lines.push('');
       const kindWidth = Math.max(0, ...details.grants.map(grant => RESET_KIND_LABEL[grant.kind].length));
       const detail = (/** @type {string} */ text, paint = dim) => lines.push(`   ${paint(truncate(sanitizeText(text), Math.max(0, W - 4)))}`);

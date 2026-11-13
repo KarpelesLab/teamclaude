@@ -224,13 +224,15 @@ test('manual claims refresh details instead of trusting the previous read', asyn
   assert.deepEqual(h.calls.tokens, [0, 0]);
 });
 
-test('missing grants and failed reads spend nothing, and failed reads return an empty list', async () => {
+test('missing grants and failed reads spend nothing, while the panel retains cached grants', async () => {
   const h = harness();
   assert.match((await h.actions.redeem(h.account, 'missing')).message, /no longer listed/);
   h.claudeRedeemer.statusFn = async () => ({ error: 'HTTP 503' });
   const details = await h.actions.read(h.account);
   assert.equal(details.error, 'HTTP 503');
-  assert.deepEqual(details.grants, []);
+  assert.equal(details.stale, true);
+  assert.equal(details.seenAt, NOW);
+  assert.equal(details.grants[0].id, 'weekly');
   assert.match((await h.actions.redeem(h.account, 'weekly')).message, /HTTP 503/);
   assert.equal(h.calls.claims.length, 0);
 });
@@ -423,4 +425,64 @@ test('claim exceptions are uncertain, while refresh exceptions after success kee
     }
     assert.equal((await h.actions.redeem(h.account, id)).redeemed, true);
   }
+});
+
+
+test('every real redeemer read fills the panel cache, including auto and Claude post-spend', async () => {
+  for (const provider of ['claude', 'codex']) {
+    const h = harness({ provider, armed: true, status: n => block({ grants: [rawGrant({ resets_left: n === 1 ? 1 : 0 })] }) });
+    const redeemer = provider === 'claude' ? h.claudeRedeemer : h.codexRedeemer;
+    assert.equal(h.actions.cached(h.account), null);
+    await redeemer.maybeRedeemForPool([h.account]);
+    const cached = h.actions.cached(h.account);
+    assert.equal(cached.seenAt, NOW);
+    assert.equal(cached.stale, false);
+    assert.equal(cached.grants[0].resetsLeft, provider === 'claude' ? 0 : 1);
+  }
+});
+
+test('cached readings follow account identity and recalculate expiry and account blocks', async () => {
+  const h = harness();
+  await h.actions.read(h.account);
+  assert.equal(h.actions.cached({ ...h.account }), null);
+  h.account.disabled = true;
+  assert.match(h.actions.cached(h.account).grants[0].blocked, /disabled/);
+  h.account.disabled = false;
+  h.clock.at += 25 * HOUR;
+  assert.match(h.actions.cached(h.account).grants[0].blocked, /expired/);
+});
+
+test('429 reads preserve the successful timestamp and start a new panel read floor', async () => {
+  for (const provider of ['claude', 'codex']) {
+    const h = harness({ provider });
+    await h.actions.read(h.account);
+    h.clock.at += 4 * 60_000;
+    const failure = async () => ({ error: 'HTTP 429', status: 429, retryAt: h.clock.at + 90_000 });
+    if (provider === 'claude') h.claudeRedeemer.statusFn = failure;
+    else h.codexRedeemer.detailsFn = failure;
+    const failed = await h.actions.read(h.account);
+    assert.equal(failed.seenAt, NOW);
+    assert.equal(failed.stale, true);
+    assert.equal(failed.grants.length > 0, true);
+    assert.deepEqual(h.actions.readWindow(h.account), { readAt: h.clock.at, until: h.clock.at + 120_000 });
+    assert.equal(failed.retryAt, h.clock.at + 90_000);
+    h.clock.at += 120_000;
+    if (provider === 'claude') h.claudeRedeemer.statusFn = async () => ({ reset: parseResetStatus(block()) });
+    else h.codexRedeemer.detailsFn = async () => ({ credits: [credit()] });
+    const recovered = await h.actions.read(h.account);
+    assert.equal(recovered.stale, false);
+    assert.equal(recovered.error, null);
+    assert.equal(recovered.retryAt, null);
+    assert.equal(recovered.seenAt, h.clock.at);
+  }
+});
+
+
+test('manual Codex validation ignores a fresh panel cache when the credit was already spent', async () => {
+  const h = harness({ provider: 'codex', credits: n => [credit({ status: n === 1 ? 'available' : 'redeemed' })] });
+  assert.equal((await h.actions.read(h.account)).grants[0].blocked, null);
+  assert.equal(h.actions.cached(h.account).seenAt, NOW);
+  assert.match((await h.actions.redeem(h.account, 'credit-1')).message, /redeemed/);
+  assert.equal(h.calls.details, 2);
+  assert.equal(h.calls.consumes.length, 0);
 });

@@ -38,6 +38,7 @@ import { randomUUID } from 'node:crypto';
 import { fetchCodexUsage } from './codex-usage.js';
 import { providerOf } from './provider.js';
 import { safeLine } from './safe-text.js';
+import { rememberResetReading, resetRetryAt } from './reset-readings.js';
 import { proxyFetch } from './upstream-fetch.js';
 
 export const CODEX_RESET_CREDITS_URL = 'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits';
@@ -142,7 +143,7 @@ export async function fetchResetCreditDetails(account, { fetchImpl = proxyFetch,
       headers: codexHeaders(account),
       signal: AbortSignal.timeout(timeoutMs),
     });
-    if (!res.ok) return { error: `HTTP ${res.status}`, status: res.status };
+    if (!res.ok) return { error: `HTTP ${res.status}`, status: res.status, retryAt: resetRetryAt(res) };
     const data = await res.json();
     /** @type {ResetCredit[]} */
     const credits = Array.isArray(data?.credits)
@@ -475,6 +476,19 @@ export class ResetCreditRedeemer {
     this.fleetCooldownUntil = 0;
   }
 
+  /** Record real detail reads, not the auto policy's six-hour cache hits.
+   * @param {Record<string, any>} account
+   * @param {{ timeoutMs?: number }} [opts]
+   */
+  async readDetails(account, opts = {}) {
+    let read;
+    try { read = await this.detailsFn(account, opts); } catch (/** @type {any} */ error) {
+      read = { error: error?.message || String(error) };
+    }
+    rememberResetReading(account, 'codex', read, this.now());
+    return read;
+  }
+
   /**
    * @param {object} account
    * @returns {RedeemState}
@@ -705,7 +719,7 @@ export class ResetCreditRedeemer {
     if (!fresh.ok) return { error: fresh.error };
     const timeoutMs = this._timeLeft(deadline);
     if (timeoutMs <= 0) return { error: 'ran out of the redeem budget before reading the credit rows' };
-    const result = await this.detailsFn(account, { timeoutMs });
+    const result = await this.readDetails(account, { timeoutMs });
     if (result?.error) return { error: result.error };
     const credits = result?.credits || [];
     state.credits = credits;
