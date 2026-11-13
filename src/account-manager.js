@@ -4766,9 +4766,19 @@ export class AccountManager {
    * Given accounts whose session quota just reset, switch to the one whose
    * weekly limit expires soonest — but only if that is sooner than the current
    * account's weekly limit and the account still has weekly quota to spend.
+   *
+   * `incumbent` is set only by the manual-choice branch below: the account
+   * another provider's cursor rests on, which that provider's candidates are
+   * weighed against, and whose cursor - not the shared one - the switch moves.
+   * That branch hands no model, advisor model or exclusion set with it.
+   * @param {any[]} candidates
+   * @param {*} [model]
+   * @param {*} [exclude]
+   * @param {*} [advisorModel]
+   * @param {*} [incumbent]
    */
-  _switchOnSessionReset(candidates, model = null, exclude = null, advisorModel = null) {
-    const current = this.accounts[this.currentIndex];
+  _switchOnSessionReset(candidates, model = null, exclude = null, advisorModel = null, incumbent = null) {
+    const current = incumbent ?? this.accounts[this.currentIndex];
     // A manual choice outranks the automatic rankings for its own provider's
     // traffic (docs/usage.md), and moving onto a sooner-resetting account is one
     // of them - the line _preemptedBy draws for priority; like it, this one
@@ -4777,10 +4787,35 @@ export class AccountManager {
     // candidate of the choice's provider and never moves the shared cursor.
     // Without that it moved the cursor off the operator's pick, and _setCurrent
     // dropped the choice with it: on a request, and with expiry routing off on
-    // every poll too (the TUI repaint, GET /teamclaude/quota, get_quota). A poll
-    // sees every provider's resets, and another provider's still moves that
-    // provider's own cursor - the one its next walk borrows.
-    const held = this._isManualChoice(current) ? providerOf(current) : null;
+    // every poll too (the TUI repaint, GET /teamclaude/quota, get_quota).
+    // A poll sees every provider's resets, and another provider's still moves
+    // that provider's own cursor - the one its next walk borrows. Each such
+    // provider is weighed against its OWN incumbent, the account that cursor
+    // rests on: its reset, priority and rank are what a candidate has to beat,
+    // never the choice's, which belongs to a different fleet. A provider with
+    // no cursor of its own (none yet, or one left on another provider's
+    // account) has no incumbent to compare against and is left to its walk,
+    // as an unknown reset below leaves the current account alone.
+    // Handed no model, advisor model or exclusion set: that cursor serves
+    // every request of its provider behind this one, so moving it is a
+    // decision for the whole cursor, never narrowed by one request's model or
+    // attempt: a model-agnostic view, the shared weekly window and no route,
+    // as the switch takes with expiry routing off. A request can get here - a
+    // shared API key tagged for Codex passes a Claude request's partition and
+    // brings its reset along - and that request's model would draw the Codex
+    // band over the accounts a Claude route admits. (Its exclusion set changes
+    // nothing: the candidates it brings were already filtered by its exclusion
+    // set and model.)
+    if (!incumbent && current && this._isManualChoice(current)) {
+      const held = providerOf(current);
+      for (const provider of new Set(candidates.map(providerOf))) {
+        if (provider === held) continue;
+        const own = this.accounts[this.providerCursors.get(provider) ?? -1];
+        if (!own || providerOf(own) !== provider) continue;
+        this._switchOnSessionReset(candidates.filter(acc => providerOf(acc) === provider), null, null, null, own);
+      }
+      return;
+    }
     // Need a known weekly reset on the current account to compare against;
     // if it is unknown we are still probing it, so leave it alone. Read through
     // the ranking so the account is compared on the window that governs THIS
@@ -4794,8 +4829,7 @@ export class AccountManager {
     // moving the trigger.
     const eligible = [];
     for (const acc of candidates) {
-      if (acc.index === this.currentIndex) continue;
-      if (held != null && providerOf(acc) === held) continue;
+      if (acc.index === current.index) continue;
       // An account this request cannot be sent to decides nothing about where it
       // goes. Kept here as well as in refreshExpiredQuotas, so a caller that does
       // not filter first gets the same answer.
@@ -4837,11 +4871,15 @@ export class AccountManager {
     // TWO guards, different properties, neither implying the other, and NOT
     // drawn over the same fleet. The rank comparison weighs `best` against the
     // account the cursor is on, both of which THIS REQUEST reached, so it is
-    // measured on what this request can be sent to; and it says this switch
-    // leaves no strictly better account behind, which membership does not claim
-    // once a lower tier passes through unbanded. Band membership says the
-    // account is worth spending at all, and the only thing the answer does here
-    // is move the CURSOR, which serves every request behind this one. So it is
+    // measured on what this request can be sent to - except in another
+    // provider's run (`incumbent`), where both ends are that provider's cursor
+    // fleet, compared with no model: `best` is still one this request could
+    // reach (the caller passes only those), the cursor's account need not be.
+    // And it says this switch leaves no strictly better account behind, which
+    // membership does not claim once a lower tier passes through unbanded.
+    // Band membership says the account is worth spending at all, and the only
+    // thing the answer does here is move the CURSOR, which serves every
+    // request behind this one. So it is
     // drawn over the fleet that cursor serves: the request's provider partition,
     // narrowed by the model filter _bandedCandidates already applies, and never
     // by the accounts this one attempt has tried. An account a 429 pushed this
@@ -4852,8 +4890,10 @@ export class AccountManager {
     // The provider comes from the walk in progress, as it does in _cursorKey; a
     // direct caller has none and means the default fleet. Kept inside the `&&`
     // rather than hoisted, so the knob-off path evaluates none of it.
+    // Another provider's cursor serves that provider's fleet, so its band is
+    // drawn over that partition.
     if (this.expiryRouting.enabled && !this._bandedCandidates(
-      this._excludeOtherProviders(null, this._selectingProvider || DEFAULT_PROVIDER),
+      this._excludeOtherProviders(null, incumbent ? providerOf(incumbent) : (this._selectingProvider || DEFAULT_PROVIDER)),
       model, advisorModel).includes(best)) return;
     // Strictly worse than what we are on: stay. Equal keeps the reset tiebreak
     // that got us here, and with expiry routing off every rank is absent and
@@ -4861,7 +4901,7 @@ export class AccountManager {
     if (rankOf.get(best.index) > rankOf.get(current.index)) return;
     // Another provider's account while the cursor holds a manual choice: move
     // only that provider's cursor, so its next walk starts there.
-    if (held != null) {
+    if (incumbent) {
       this.providerCursors.set(providerOf(best), best.index);
       this._beginRamp(best);
       console.log(`[TeamClaude] Account "${best.name}" session quota reset and weekly expires sooner — its provider's traffic switches to it`);

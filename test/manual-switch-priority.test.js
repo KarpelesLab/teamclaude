@@ -161,6 +161,7 @@ test('a poll-driven session-reset switch keeps the manual choice', () => {
     assert.equal(am.setCurrentAccount(1), true);
     am.refreshExpiredQuotas();
     assert.equal(am.currentIndex, 1, 'the operator picked b, and b is still available');
+    assert.equal(am.providerCursors.get('anthropic'), 1, 'and so does its provider cursor, which _currentIndexForProvider reads for status, the TUI, previewRouteIndex, releasePins and _unstrandCursor');
     assert.equal(am.getActiveAccount(null, MODEL).name, 'b', 'and the choice still holds for the next request');
   } finally {
     console.log = log;
@@ -234,4 +235,150 @@ test('a poll keeps a Claude manual choice and still moves the Codex cursor on a 
   } finally {
     console.log = log;
   }
+});
+
+// Claude a1/a2 and Codex c1/c2 on one proxy, for the switch's cross-provider
+// runs. `days` gives each account's weekly reset in days (null: never
+// reported), `extra` per-account config such as a priority.
+function twoProviderFleet(days, extra = {}) {
+  const hour = 3600_000;
+  const now = Date.now();
+  const oauth = (name, fields) => ({ name, type: 'oauth', accessToken: 't-' + name, refreshToken: 'r', expiresAt: now + hour, ...fields, ...extra[name] });
+  const am = new AccountManager([
+    oauth('claude-a1', { accountUuid: 'u1' }),
+    oauth('claude-a2', { accountUuid: 'u2' }),
+    oauth('codex-c1', { provider: 'codex', accountId: 'i1' }),
+    oauth('codex-c2', { provider: 'codex', accountId: 'i2' }),
+  ], 0.98);
+  const by = Object.fromEntries(am.accounts.map(a => [a.name, a]));
+  for (const [name, d] of Object.entries(days)) {
+    Object.assign(by[name].quota, { unified7d: 0.3, unified7dReset: d == null ? null : now + d * 24 * hour, unified5h: 0.1, unified5hReset: now + hour });
+  }
+  return {
+    am, by,
+    // `name`'s five-hour window rolls.
+    roll: name => Object.assign(by[name].quota, { unified5h: 0.5, unified5hReset: now - 1000 }),
+    // Where the next Codex request lands.
+    nextCodex: () => am.getActiveAccount(null, 'gpt-5', null, null, 'codex').name,
+  };
+}
+
+// The Codex candidate has to beat the Codex incumbent - the account the Codex
+// cursor rests on - never the Claude choice, which belongs to a different
+// fleet. Both orderings: a Claude choice resetting later than the Codex
+// incumbent must not let a poll move Codex onto a later-resetting account, and
+// one resetting sooner must not block a move onto a sooner one.
+for (const [choiceDays, incumbentDays, expected] of [[5, 1, 'codex-c1'], [1, 5, 'codex-c2']]) {
+  test(`a Codex reset is weighed against the Codex cursor, not a Claude choice resetting in ${choiceDays}d (Codex cursor ${incumbentDays}d, candidate 2d)`, t => {
+    t.mock.method(console, 'log', () => {});
+    const { am, by, roll, nextCodex } = twoProviderFleet({ 'claude-a1': choiceDays, 'claude-a2': 6, 'codex-c1': incumbentDays, 'codex-c2': 2 });
+    am._setCurrent(by['codex-c1']);
+    assert.equal(nextCodex(), 'codex-c1');
+    assert.equal(am.setCurrentAccount(by['claude-a1'].index), true);
+    roll('codex-c2');
+    am.refreshExpiredQuotas();
+    assert.equal(am.accounts[am.currentIndex].name, 'claude-a1', 'the shared cursor stays on the choice');
+    assert.equal(nextCodex(), expected);
+  });
+}
+
+// The priority check too: c2 shares the Codex cursor's tier, so moving onto it
+// demotes nothing, however the Claude choice is ranked.
+test('a move within the Codex cursor tier is not blocked by a Claude choice of higher priority', t => {
+  t.mock.method(console, 'log', () => {});
+  const { am, by, roll, nextCodex } = twoProviderFleet(
+    { 'claude-a1': 6, 'claude-a2': 6, 'codex-c1': 5, 'codex-c2': 2 },
+    { 'claude-a1': { priority: 0 }, 'codex-c1': { priority: 5 }, 'codex-c2': { priority: 5 } });
+  am._setCurrent(by['codex-c1']);
+  assert.equal(nextCodex(), 'codex-c1');
+  assert.equal(am.setCurrentAccount(by['claude-a1'].index), true);
+  roll('codex-c2');
+  am.refreshExpiredQuotas();
+  assert.equal(am.accounts[am.currentIndex].name, 'claude-a1', 'the shared cursor stays on the choice');
+  assert.equal(nextCodex(), 'codex-c2', 'Codex moved to the sooner-resetting account in its own tier');
+});
+
+// Each provider's run sees only its own candidates: a Claude roll in the same
+// poll is the choice's to ignore, and must not reach the Codex run, where it
+// would move the Claude cursor that status and the TUI read.
+test('one poll that rolls a Claude and a Codex account moves the Codex cursor only', t => {
+  t.mock.method(console, 'log', () => {});
+  const { am, by, roll, nextCodex } = twoProviderFleet({ 'claude-a1': 6, 'claude-a2': 2, 'codex-c1': 5, 'codex-c2': 3 });
+  am._setCurrent(by['codex-c1']);
+  assert.equal(nextCodex(), 'codex-c1');
+  assert.equal(am.setCurrentAccount(by['claude-a1'].index), true);
+  roll('claude-a2');
+  roll('codex-c2');
+  am.refreshExpiredQuotas();
+  assert.equal(am.accounts[am.currentIndex].name, 'claude-a1', 'the shared cursor stays on the choice');
+  assert.equal(am.accounts[am.currentIndexFor('anthropic')].name, 'claude-a1', 'and so does the Claude cursor');
+  assert.equal(am.accounts[am.currentIndexFor('codex')].name, 'codex-c2', 'Codex moved to the sooner-resetting account');
+  assert.equal(nextCodex(), 'codex-c2');
+  assert.equal(am.getActiveAccount(null, MODEL).name, 'claude-a1');
+});
+
+// With no Codex cursor yet there is no incumbent to weigh a Codex roll
+// against, so the poll leaves it to the next Codex walk, which picks on merit -
+// the account resetting soonest - and not the rolled one. Both index orders,
+// so the walk cannot be passing on position alone.
+for (const [rolled, merit] of [['codex-c2', 'codex-c1'], ['codex-c1', 'codex-c2']]) {
+  test(`with no Codex cursor yet a poll leaves a Codex roll to the walk (${rolled} rolls)`, t => {
+    t.mock.method(console, 'log', () => {});
+    const { am, by, roll, nextCodex } = twoProviderFleet({ 'claude-a1': 5, 'claude-a2': 6, [merit]: 1, [rolled]: 2 });
+    assert.equal(am.setCurrentAccount(by['claude-a1'].index), true);
+    assert.equal(am.providerCursors.get('codex'), undefined, 'no Codex request yet');
+    roll(rolled);
+    am.refreshExpiredQuotas();
+    assert.equal(am.providerCursors.get('codex'), undefined, 'the poll set no Codex cursor');
+    assert.equal(nextCodex(), merit);
+  });
+}
+
+// The choice's own weekly reset is a Claude clock: unknown, it is still being
+// probed, and that leaves the choice alone - it says nothing about Codex.
+test('a Claude choice whose weekly reset is unknown does not hold a Codex move', t => {
+  t.mock.method(console, 'log', () => {});
+  const { am, by, roll, nextCodex } = twoProviderFleet({ 'claude-a1': null, 'claude-a2': 6, 'codex-c1': 5, 'codex-c2': 2 });
+  am._setCurrent(by['codex-c1']);
+  assert.equal(nextCodex(), 'codex-c1');
+  assert.equal(am.setCurrentAccount(by['claude-a1'].index), true);
+  roll('codex-c2');
+  am.refreshExpiredQuotas();
+  assert.equal(am.accounts[am.currentIndex].name, 'claude-a1', 'the shared cursor stays on the choice');
+  assert.equal(nextCodex(), 'codex-c2', 'Codex moved to the sooner-resetting account');
+});
+
+// A request reaches the Codex run too: an API key tagged for Codex passes a
+// Claude request's provider partition, and its roll comes along. Moving the
+// Codex cursor serves every Codex request behind this one, so the Claude
+// request's model must not narrow it: here a Claude route admits no Codex
+// account but the key, and drawn over that, the Codex band would hold the key
+// alone; drawn over the Codex fleet it holds codex-c3, so the key does not take
+// the Codex cursor.
+test('a Claude request that brings a Codex roll leaves the Codex cursor to the Codex fleet', t => {
+  t.mock.method(console, 'log', () => {});
+  const hour = 3600_000;
+  const now = Date.now();
+  const oauth = (name, fields) => ({ name, type: 'oauth', accessToken: 't-' + name, refreshToken: 'r', expiresAt: now + hour, ...fields });
+  const am = new AccountManager([
+    oauth('claude-a1', { accountUuid: 'u1' }),
+    oauth('codex-c1', { provider: 'codex', accountId: 'i1' }),
+    oauth('codex-c3', { provider: 'codex', accountId: 'i3' }),
+    { name: 'codex-key', type: 'apikey', apiKey: 'k', provider: 'codex' },
+  ], 0.98, { expiryRouting: { enabled: true }, routes: [{ name: 'opus', match: ['claude-opus*'], accounts: ['claude-a1', 'codex-key'] }] });
+  const by = Object.fromEntries(am.accounts.map(a => [a.name, a]));
+  const set = (name, used, days) => Object.assign(by[name].quota, { unified7d: used, unified7dReset: now + days * 24 * hour, unified5h: 0.1, unified5hReset: now + hour });
+  set('claude-a1', 0.3, 5);
+  set('codex-c1', 0.3, 5);
+  set('codex-c3', 0, 1); // the Codex fleet's most pressing account
+  set('codex-key', 0.3, 2);
+  am._setCurrent(by['codex-c1']);
+  assert.equal(am.getActiveAccount(null, 'gpt-5', null, null, 'codex').name, 'codex-c1');
+  assert.equal(am.setCurrentAccount(by['claude-a1'].index), true);
+  Object.assign(by['codex-key'].quota, { unified5h: 0.5, unified5hReset: now - 1000, sessionWindowStated: true }); // the key's five-hour window rolls
+  am.sweepExpiredQuotas(); // a status read: the window clears and the reset waits for a request
+  assert.equal(by['codex-key'].sessionResetPending, true);
+  assert.equal(am.getActiveAccount(new Set(), MODEL).name, 'claude-a1');
+  assert.equal(by['codex-key'].sessionResetPending, false, 'the Claude request spent the key\'s reset');
+  assert.equal(am.accounts[am.providerCursors.get('codex')].name, 'codex-c1');
 });
