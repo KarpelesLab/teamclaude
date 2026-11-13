@@ -4122,7 +4122,7 @@ export class TUI {
       case 'normal':
         return this.remote
           ? ` ${bold('s')}witch  ${bold('R')}eload  ${bold('q')}uit`
-          : ` ${bold('s')}witch  ${bold('d')}isable  ${this.loginAccount ? `${bold('l')}ogin  ` : ''}${this.resetActions && this.am.accounts.length > 0 ? `${bold('r')} resets  ` : ''}${bold('p')}robe quota  ${bold('R')}eload  ${bold('g')} settings  ${bold('q')}uit`;
+          : ` ${bold('s')}witch  ${bold('d')}isable  ${this.loginAccount ? `${bold('l')}ogin  ` : ''}${this.resetActions && this.am.accounts.length > 0 ? `${bold('r')}esets  ` : ''}${bold('p')}robe quota  ${bold('R')}eload  ${bold('g')} settings  ${bold('q')}uit`;
       case 'settings':
         return ` ${dim('↑↓')} navigate  ${dim('←→')} change  ${bold('Enter')} edit  ${bold('Esc')} back`;
       case 'routes':
