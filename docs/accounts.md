@@ -563,12 +563,24 @@ it once.
 
 Press **r** from the local TUI's main screen, choose an OAuth Claude or Codex
 account, and press **Enter** to read its fresh reset details. The picker starts
-on the first account with a banked reset. The panel lists weekly, Fable and
-session resets, or Codex reset credits, with each grant's label, remaining
-count, expiry and availability. Use **↑**/**↓** or **j**/**k** to choose any
-usable grant, not only the one upstream names as next. **Enter** shows the
-warnings and asks for confirmation; **y** or **Y** spends one reset. Any other
-key cancels that confirmation. A blocked grant shows why it cannot be spent.
+on the first account with a banked reset. The panel lists only grants you
+still hold: weekly, Fable and session resets, or Codex reset credits. Spent
+grants are not shown. Each row shows the kind in bold, the number left, the
+limits it clears, its expiry and whether it is next. A held but blocked grant
+stays listed, dimmed, with its reason on the same line. With no held grants,
+the panel says `no banked resets`.
+
+The selected grant's upstream label is dimmed below its row, with its warnings
+in yellow. Other rows show no label or warnings. Expiry is a local date more
+than a day away, with the year only if it is not the current year; within a
+day it is a countdown. The header shows the limit state and local weekly
+reset time. Cooldown and fleet-hold times are local too, with the day when it
+is not today.
+
+Use **↑**/**↓** or **j**/**k** to choose any held grant, not only the one
+upstream names as next. **Enter** asks for confirmation; **y** or **Y** spends
+one reset. Any other key cancels that confirmation. Blocked grants cannot
+reach confirmation.
 
 Within the panel, **r** reads the details again; **Esc** or **q** closes it.
 Closing while a spend is in progress does not cancel that spend. The result

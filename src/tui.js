@@ -532,9 +532,9 @@ function paneTitle(/** @type {string} */ label, /** @type {number} */ w) {
   return fitLine(` ${bold(label)} ${dim('─'.repeat(Math.max(1, w - vw(label) - 2)))}`, w);
 }
 
-function formatReset(resetTs) {
+function formatReset(resetTs, now = Date.now()) {
   if (!resetTs) return '';
-  const ms = resetTs - Date.now();
+  const ms = resetTs - now;
   if (ms <= 0) return '';
   const mins = Math.ceil(ms / 60000);
   if (mins < 60) return `${mins}m`;
@@ -799,7 +799,7 @@ function tailText(s, w) {
  * @property {boolean} loading
  * @property {import('./reset-actions.js').ResetDetails | null} details
  * @property {string | null} error  a read failure or the last spend's status
- * @property {number} idx
+ * @property {number} idx  cursor position among held grants only
  * @property {boolean} confirming
  * @property {boolean} busy
  * @property {number} seq
@@ -812,12 +812,38 @@ const RESET_KIND_LABEL = {
 /** @type {Record<string, string>} */
 const RESET_LIMIT_LABEL = { five_hour: '5h', seven_day: 'week', seven_day_overage_included: 'Fable week' };
 
+/** Local calendar dates, with a year only when it differs from today's.
+ * @param {number} at @param {number} now @param {boolean} [withTime]
+ */
+function resetLocalDate(at, now, withTime = false) {
+  const date = new Date(at);
+  return new Intl.DateTimeFormat('en-GB', {
+    day: 'numeric', month: 'short',
+    year: date.getFullYear() === new Date(now).getFullYear() ? undefined : 'numeric',
+    ...(withTime ? { weekday: 'short', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' } : {}),
+  }).format(date).replaceAll(',', '');
+}
+
+/** @param {number} at @param {number} now @param {boolean} [withDay] */
+function resetLocalTime(at, now, withDay = false) {
+  if (withDay || new Date(at).toDateString() !== new Date(now).toDateString()) return resetLocalDate(at, now, true);
+  return new Intl.DateTimeFormat('en-GB', { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(at);
+}
+
+/** @param {number} at @param {number} now */
+function resetExpiry(at, now) {
+  if (at <= now) return 'expired';
+  return at - now > 86400_000 ? `expires ${resetLocalDate(at, now)}` : `expires in ${formatReset(at, now)}`;
+}
+
 // ── TUI class ────────────────────────────────────────────────
 
 export class TUI {
   constructor({ accountManager, config, saveConfig, syncAccounts, onQuit, sx = null, probeQuota = null, resetActions = /** @type {ReturnType<typeof import('./reset-actions.js').createResetActions>|null} */ (null),
     // Cast so the destructured binding is the callback type, not `null`: index.js passes a function here.
     loginAccount = /** @type {LoginAccount | null} */ (null),
+    // The reset panel reads one clock value per frame; tests can fix it.
+    resetNow = Date.now,
     activityLogPath = null,
     // Attach mode: the accounts belong to a server in another process, reached
     // over its control plane. Everything that would mutate local state is off,
@@ -840,6 +866,7 @@ export class TUI {
     env = /** @type {Record<string, string | undefined>} */ (process.env) }) {
     this.am = accountManager;
     this.resetActions = resetActions ?? null;
+    this.resetNow = resetNow;
     this.remote = remote;
     this.applySwitch = applySwitch;
     this.config = config;
@@ -2056,8 +2083,9 @@ export class TUI {
     try {
       const details = await this.resetActions.read(panel.account);
       if (this.resetsPanel !== panel || panel.seq !== seq) return;
-      panel.details = details;
-      panel.idx = Math.max(0, Math.min(panel.idx, details.grants.length - 1));
+      // Keep one visible list for rendering, movement, confirmation and spending.
+      panel.details = { ...details, grants: details.grants.filter(grant => grant.resetsLeft >= 1) };
+      panel.idx = Math.max(0, Math.min(panel.idx, panel.details.grants.length - 1));
     } catch (/** @type {any} */ error) {
       if (this.resetsPanel !== panel || panel.seq !== seq) return;
       panel.details = null;
@@ -2969,26 +2997,31 @@ export class TUI {
       return lines;
     }
     if (details) {
-      prose(details.atLimit === true ? `at a limit: ${details.exhausted.join(', ')}`
-        : details.atLimit === false ? 'not at a limit' : 'limit state unknown');
-      if (details.cooldownUntil != null && details.cooldownUntil > Date.now()) {
-        prose(`upstream cooldown until ${new Date(details.cooldownUntil).toISOString()} (${formatReset(details.cooldownUntil)})`, yellow);
+      const now = this.resetNow();
+      const limit = details.atLimit === true ? `at a limit: ${details.exhausted.map(limit => RESET_LIMIT_LABEL[limit] || limit).join(' + ')}`
+        : details.atLimit === false ? 'not at a limit' : 'limit state unknown';
+      prose(`${limit}${details.weeklyResetsAt == null ? '' : ` · week resets ${resetLocalTime(details.weeklyResetsAt, now, true)}`}`);
+      if (details.cooldownUntil != null && details.cooldownUntil > now) {
+        prose(`upstream cooldown until ${resetLocalTime(details.cooldownUntil, now)}`, yellow);
       }
-      if (details.weeklyResetsAt != null) prose(`weekly window resets at ${new Date(details.weeklyResetsAt).toISOString()}`, dim);
-      if (details.fleetHoldUntil != null) prose(`fleet hold until ${new Date(details.fleetHoldUntil).toISOString()}`, yellow);
+      if (details.fleetHoldUntil != null) prose(`fleet hold until ${resetLocalTime(details.fleetHoldUntil, now)}`, yellow);
       if (details.ineligibleReason) prose(`ineligible: ${details.ineligibleReason}`, red);
       if (details.error) prose(details.error, red);
       lines.push('');
+      const kindWidth = Math.max(0, ...details.grants.map(grant => RESET_KIND_LABEL[grant.kind].length));
+      const detail = (/** @type {string} */ text, paint = dim) => lines.push(`   ${paint(truncate(sanitizeText(text), Math.max(0, W - 4)))}`);
       details.grants.forEach((grant, idx) => {
         const selected = idx === panel.idx;
-        const count = `${grant.resetsLeft}/${grant.resetsTotal ?? '?'}`;
-        const clears = grant.clears.map(limit => RESET_LIMIT_LABEL[limit] || limit).join(', ') || '—';
-        const expiry = grant.endsAt == null ? '' : ` · ${grant.endsAt <= Date.now() ? 'expired' : `expires ${formatReset(grant.endsAt)}`}`;
-        const text = `${RESET_KIND_LABEL[grant.kind]}${grant.label ? ` · ${grant.label}` : ''} ${count} · clears: ${clears}${expiry}${grant.next ? ' · next' : ''}`;
-        const paint = grant.blocked ? dim : selected ? bold : (/** @type {string} */ s) => s;
-        lines.push(` ${selected ? cyan('▸') : ' '} ${paint(sanitizeText(text))}`);
-        if (grant.blocked) prose(`blocked: ${grant.blocked}`, dim);
-        else for (const warning of grant.warnings) prose(warning, yellow);
+        const kind = RESET_KIND_LABEL[grant.kind];
+        const clears = grant.clears.map(limit => sanitizeText(RESET_LIMIT_LABEL[limit] || limit)).join(' + ') || '-';
+        const expiry = grant.endsAt == null ? '' : `  ${resetExpiry(grant.endsAt, now)}`;
+        const rest = `${' '.repeat(kindWidth - kind.length)}  ${grant.resetsLeft} left  clears ${clears}${expiry}${grant.next ? '  (next)' : ''}${grant.blocked ? ` · ${sanitizeText(grant.blocked)}` : ''}`;
+        const text = grant.blocked ? dim(bold(kind)) + dim(rest) : bold(kind) + rest;
+        lines.push(truncate(` ${selected ? cyan('▸') : ' '} ${text}`, Math.max(0, W - 1)));
+        if (selected) {
+          if (grant.label) detail(grant.label);
+          if (grant.warnings.length) detail(grant.warnings.join(' · '), yellow);
+        }
       });
       if (!details.grants.length && !details.error) prose('no banked resets', dim);
     }

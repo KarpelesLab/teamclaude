@@ -1,6 +1,15 @@
-import { test } from 'node:test';
+import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { TUI, displayWidth } from '../src/tui.js';
+
+const NOW = Date.parse('2026-11-13T12:00:00Z');
+const DAY = 86400_000;
+const originalTZ = process.env.TZ;
+process.env.TZ = 'Europe/London';
+after(() => {
+  if (originalTZ === undefined) delete process.env.TZ;
+  else process.env.TZ = originalTZ;
+});
 
 const stripAnsi = s => s.replace(/\x1b\[[0-9;]*m/g, '');
 const flush = () => new Promise(resolve => setImmediate(resolve));
@@ -13,29 +22,32 @@ const deferred = () => {
 };
 
 function details(overrides = {}) {
-  const now = Date.now();
+  const now = NOW;
   const grant = {
     id: 'weekly-1', kind: 'weekly', label: 'Full reset', resetsLeft: 1, resetsTotal: 2,
-    clears: ['five_hour', 'seven_day'], endsAt: now + 18 * 86400_000,
+    clears: ['five_hour', 'seven_day'], endsAt: now + 10 * DAY,
     next: true, blocked: null, warnings: [],
   };
   return {
     provider: 'claude', error: null, ineligibleReason: null,
     atLimit: true, exhausted: ['seven_day', 'seven_day_overage_included'],
-    cooldownUntil: now + 3600_000, weeklyResetsAt: now + 2 * 86400_000,
+    cooldownUntil: now + 3600_000, weeklyResetsAt: Date.parse('2026-11-14T21:00:00Z'),
     fleetHoldUntil: now + 7200_000,
     grants: [
+      { ...grant, id: 'weekly-spent', label: 'Spent weekly gift', resetsLeft: 0, blocked: 'no resets left' },
       grant,
+      { ...grant, id: 'fable-spent-1', kind: 'fable', label: 'Spent Fable gift 1', resetsLeft: 0, blocked: 'no resets left' },
+      { ...grant, id: 'fable-spent-2', kind: 'fable', label: 'Spent Fable gift 2', resetsLeft: 0, blocked: 'no resets left' },
       { ...grant, id: 'fable-1', kind: 'fable', label: 'Launch gift', resetsLeft: 3, resetsTotal: 3,
         clears: ['seven_day_overage_included'], next: false, warnings: ['does not clear seven_day', 'a reset recently landed'] },
-      { ...grant, id: 'session-1', kind: 'session', label: null, resetsLeft: 0, resetsTotal: 1,
-        clears: ['five_hour'], next: false, blocked: 'no resets left' },
+      { ...grant, id: 'session-1', kind: 'session', label: 'Paused gift', resetsLeft: 1, resetsTotal: 1,
+        clears: ['five_hour'], next: false, blocked: 'reset is paused' },
     ],
     ...overrides,
   };
 }
 
-function makeTUI({ resetActions, remote = false, accounts } = {}) {
+function makeTUI({ resetActions, remote = false, accounts, resetNow = () => NOW } = {}) {
   const now = Date.now();
   const am = {
     accounts: accounts ?? [
@@ -50,7 +62,7 @@ function makeTUI({ resetActions, remote = false, accounts } = {}) {
     thresholdFor() { return 0.98; },
   };
   const tui = new TUI({
-    accountManager: am, config: { proxy: { port: 1 }, accounts: [], routes: [] }, resetActions, remote,
+    accountManager: am, config: { proxy: { port: 1 }, accounts: [], routes: [] }, resetActions, remote, resetNow,
     saveConfig: async () => {}, syncAccounts: async () => 0, onQuit: () => {},
   });
   tui.render = () => {};
@@ -130,29 +142,81 @@ test('resets: unsupported accounts stay in the picker with a reason; Codex opens
   assert.match(frame(tui).map(stripAnsi).join('\n'), /Codex/);
 });
 
-test('resets: the panel shows wall state, grants, warnings, blocks and its keys within the frame width', async () => {
+test('resets: the panel shows held grants with bold kinds, local wall state and inline blocks within the frame width', async () => {
   const tui = makeTUI({ resetActions: actions() });
   openPanel(tui);
   await flush();
   const rows = frame(tui);
   const text = rows.map(stripAnsi).join('\n');
   assert.match(text, /Resets — banked.*Claude/);
-  assert.match(text, /at a limit: seven_day, seven_day_overage_included/);
-  assert.match(text, /upstream cooldown until/);
-  assert.match(text, /weekly window resets at/);
-  assert.match(text, /fleet hold until/);
-  assert.match(text, /Weekly reset.*Full reset.*1\/2.*clears: 5h, week.*expires.*next/);
-  assert.match(text, /Fable reset.*Launch gift.*3\/3.*clears: Fable week/);
-  assert.match(text, /Session reset.*0\/1.*clears: 5h/);
-  assert.match(text, /blocked: no resets left/);
-  assert.match(text, /does not clear seven_day/);
+  assert.match(text, /at a limit: week \+ Fable week · week resets Sat 14 Nov 21:00/);
+  assert.match(text, /upstream cooldown until 13:00/);
+  assert.match(text, /fleet hold until 14:00/);
+  assert.match(text, /Weekly reset +1 left  clears 5h \+ week  expires 23 Nov  \(next\)/);
+  assert.match(text, /Fable reset +3 left  clears Fable week  expires 23 Nov/);
+  assert.match(text, /Session reset +1 left  clears 5h  expires 23 Nov · reset is paused/);
+  assert.match(rows.find(row => stripAnsi(row).includes('Full reset')), /\x1b\[2mFull reset/);
+  assert.doesNotMatch(text, /Spent weekly gift|Spent Fable gift|no resets left/);
+  assert.doesNotMatch(text, /Launch gift|does not clear seven_day|a reset recently landed/);
+  assert.doesNotMatch(text, /\d{4}-\d{2}-\d{2}T/);
+  for (const kind of ['Weekly reset', 'Fable reset', 'Session reset']) {
+    assert.ok(rows.some(row => row.includes(`\x1b[1m${kind}\x1b[0m`)), `${kind} is bold`);
+  }
   assert.match(text, /↑↓ move.*Enter spend.*r re-read.*Esc close/);
   for (const width of [40, 60, 80, 120]) {
     for (const row of frame(tui, { columns: width })) assert.equal(displayWidth(row), width);
+    for (const row of tui._resetsLines(width)) assert.ok(displayWidth(row) < width);
   }
 });
 
-test('resets: arrow and vi keys move, but a blocked grant cannot reach confirmation', async () => {
+test('resets: the agreed mixed-grant panel shows details only for the selected held grant', async () => {
+  const read = details({ atLimit: false, exhausted: [], cooldownUntil: null, fleetHoldUntil: null });
+  read.grants[1].label = 'One full limit reset (November 2026)';
+  read.grants[1].clears = ['seven_day', 'seven_day_overage_included'];
+  read.grants[1].warnings = ['no weekly limit is exhausted'];
+  const tui = makeTUI({ resetActions: actions(async () => read) });
+  openPanel(tui);
+  await flush();
+  const panel = tui._resetsLines(120).map(stripAnsi);
+  assert.deepEqual(panel, [
+    '', ' Resets — banked · Claude', '',
+    '   not at a limit · week resets Sat 14 Nov 21:00', '',
+    ' ▸ Weekly reset   1 left  clears week + Fable week  expires 23 Nov  (next)',
+    '   One full limit reset (November 2026)',
+    '   no weekly limit is exhausted',
+    '   Fable reset    3 left  clears Fable week  expires 23 Nov',
+    '   Session reset  1 left  clears 5h  expires 23 Nov · reset is paused',
+  ]);
+  const warning = tui._resetsLines(120).find(row => stripAnsi(row).includes('no weekly limit is exhausted'));
+  assert.match(warning, /\x1b\[33m/);
+  tui._key('down');
+  const selected = tui._resetsLines(120);
+  const text = selected.map(stripAnsi).join('\n');
+  assert.match(text, /▸ Fable reset/);
+  assert.match(text, /Launch gift\n.*does not clear seven_day · a reset recently landed/);
+  assert.doesNotMatch(text, /One full limit reset|no weekly limit is exhausted/);
+  assert.match(selected.find(row => stripAnsi(row).includes('does not clear')), /\x1b\[33m/);
+});
+
+test('resets: Enter after down spends the second held id, skipping interleaved spent grants', async () => {
+  const calls = [];
+  const tui = makeTUI({ resetActions: actions(undefined, async (_account, id) => {
+    calls.push(id);
+    return { redeemed: false, uncertain: false, message: 'test spend' };
+  }) });
+  openPanel(tui);
+  await flush();
+  assert.deepEqual(tui.resetsPanel.details.grants.map(grant => grant.id), ['weekly-1', 'fable-1', 'session-1']);
+  tui._key('down');
+  assert.match(tui._resetsLines(120).map(stripAnsi).join('\n'), /▸ Fable reset/);
+  tui._key('enter');
+  assert.match(stripAnsi(tui._renderFooter()), /Spend 1 fable reset/);
+  tui._key('y');
+  await flush();
+  assert.deepEqual(calls, ['fable-1']);
+});
+
+test('resets: arrow and vi keys move, but a dimmed blocked held grant cannot reach confirmation', async () => {
   let spends = 0;
   const tui = makeTUI({ resetActions: actions(undefined, async () => { spends++; return {}; }) });
   openPanel(tui);
@@ -160,6 +224,9 @@ test('resets: arrow and vi keys move, but a blocked grant cannot reach confirmat
   tui._key('down');
   tui._key('j');
   assert.equal(tui.resetsPanel.idx, 2);
+  const blocked = tui._resetsLines(120).find(row => stripAnsi(row).includes('▸ Session reset'));
+  assert.match(blocked, /\x1b\[2m\x1b\[1mSession reset/);
+  assert.match(blocked, /\x1b\[2m[^\x1b]+ · reset is paused/);
   tui._key('enter');
   assert.equal(tui.resetsPanel.confirming, false);
   tui._key('y');
@@ -167,6 +234,96 @@ test('resets: arrow and vi keys move, but a blocked grant cannot reach confirmat
   tui._key('up');
   tui._key('k');
   assert.equal(tui.resetsPanel.idx, 0);
+});
+
+test('resets: expiry dates use the local year and switch to a countdown within one day', async () => {
+  let now = NOW;
+  const read = details();
+  read.grants[4].endsAt = NOW + 5 * 3600_000;
+  read.grants[5].endsAt = Date.parse('2027-03-08T12:00:00Z');
+  const tui = makeTUI({ resetActions: actions(async () => read), resetNow: () => now });
+  openPanel(tui);
+  await flush();
+  const text = frame(tui).map(stripAnsi).join('\n');
+  assert.match(text, /Weekly reset[^\n]*expires 23 Nov  \(next\)/);
+  assert.match(text, /Fable reset[^\n]*expires in 5h/);
+  assert.match(text, /Session reset[^\n]*expires 8 Mar 2027/);
+  assert.doesNotMatch(text, /expires 23 Nov 2026|\d{4}-\d{2}-\d{2}T/);
+  now += 3600_000;
+  assert.match(tui._resetsLines(120).map(stripAnsi).join('\n'), /Fable reset[^\n]*expires in 4h/);
+});
+
+test('resets: local dates and cooldown times include the day only when needed', async t => {
+  process.env.TZ = 'America/New_York';
+  t.after(() => { process.env.TZ = 'Europe/London'; });
+  const now = Date.parse('2026-07-01T23:00:00Z'); // 19:00 local, during daylight saving time.
+  const read = details({
+    cooldownUntil: Date.parse('2026-07-02T01:45:00Z'), // Still today locally.
+    fleetHoldUntil: Date.parse('2026-07-02T14:45:00Z'),
+    weeklyResetsAt: Date.parse('2026-07-03T01:00:00Z'),
+  });
+  read.grants[1].endsAt = Date.parse('2026-07-12T01:00:00Z');
+  const tui = makeTUI({ resetActions: actions(async () => read), resetNow: () => now });
+  openPanel(tui);
+  await flush();
+  const text = frame(tui).map(stripAnsi).join('\n');
+  assert.match(text, /week resets Thu 2 Jul 21:00/);
+  assert.match(text, /upstream cooldown until 21:45/);
+  assert.match(text, /fleet hold until Thu 2 Jul 10:45/);
+  assert.match(text, /Weekly reset[^\n]*expires 11 Jul/);
+  assert.doesNotMatch(text, /\d{4}-\d{2}-\d{2}T/);
+});
+
+test('resets: a spent-only read is empty and cannot confirm or spend', async () => {
+  const read = details();
+  read.grants = read.grants.filter(grant => grant.resetsLeft < 1);
+  const calls = [];
+  const tui = makeTUI({ resetActions: actions(async () => read, async (_account, id) => { calls.push(id); }) });
+  openPanel(tui);
+  await flush();
+  assert.match(frame(tui).map(stripAnsi).join('\n'), /no banked resets/);
+  assert.equal(tui.resetsPanel.details.grants.length, 0);
+  tui._key('down');
+  tui._key('enter');
+  tui._key('y');
+  assert.equal(tui.resetsPanel.idx, 0);
+  assert.equal(tui.resetsPanel.confirming, false);
+  assert.deepEqual(calls, []);
+});
+
+test('resets: re-reading clamps the cursor to the remaining held grants', async () => {
+  let read = details();
+  const tui = makeTUI({ resetActions: actions(async () => read) });
+  openPanel(tui);
+  await flush();
+  tui._key('down');
+  tui._key('down');
+  assert.equal(tui.resetsPanel.idx, 2);
+  read = details();
+  read.grants[4].resetsLeft = 0;
+  read.grants[5].resetsLeft = 0;
+  tui._key('r');
+  await flush();
+  assert.equal(tui.resetsPanel.idx, 0);
+  assert.match(tui._resetsLines(120).map(stripAnsi).join('\n'), /▸ Weekly reset/);
+  tui._key('enter');
+  assert.match(stripAnsi(tui._renderFooter()), /Spend 1 weekly reset/);
+});
+
+test('resets: selected labels and warnings stay on single truncated lines', async () => {
+  const read = details();
+  read.grants[1].label = 'Long upstream title '.repeat(15);
+  read.grants[1].warnings = ['First warning '.repeat(15), 'Second warning'];
+  const tui = makeTUI({ resetActions: actions(async () => read) });
+  openPanel(tui);
+  await flush();
+  for (const width of [40, 60, 80]) {
+    const panel = tui._resetsLines(width);
+    const text = panel.map(stripAnsi);
+    assert.equal(text.filter(row => row.includes('Long upstream title')).length, 1);
+    assert.equal(text.filter(row => row.includes('First warning')).length, 1);
+    for (const row of panel) assert.ok(displayWidth(row) < width);
+  }
 });
 
 test('resets: confirmation shows warnings; y spends the chosen id only once and logs the exact result', async () => {
@@ -348,7 +505,9 @@ test('resets: a Codex credit with no total or expiry is selectable on a short sc
   openPanel(tui);
   await flush();
   const full = frame(tui).map(stripAnsi).join('\n');
-  assert.match(full, /Codex reset credit.*Plan credit.*1\/\?/);
+  assert.match(full, /Codex reset credit +1 left  clears -/);
+  assert.match(full, /\n +Plan credit/);
+  assert.ok(frame(tui).some(row => row.includes('\x1b[1mCodex reset credit\x1b[0m')));
   tui._key('enter');
   const rows = frame(tui, { columns: 80, rows: 8 }).map(stripAnsi);
   assert.ok(rows.some(row => row.includes('▸ Codex reset credit')));

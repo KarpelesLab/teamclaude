@@ -131,7 +131,7 @@ curl -X POST http://localhost:3456/teamclaude/account-cordon \
 
 In selection mode, use `j`/`k` or the arrow keys to navigate, `Enter` to confirm, `Esc` to cancel.
 
-In the Resets panel, `↑`/`↓` or `j`/`k` choose a grant, `Enter` shows the spend confirmation and warnings, and `y`/`Y` spends it. Any other key cancels the confirmation. Blocked grants cannot be spent; warnings do not block a manual spend. `r` reads fresh details; `Esc`/`q` closes the panel. Spending cannot be undone or cancelled once it starts.
+In the Resets panel, only held grants are listed; spent grants are hidden. Each row shows the kind in bold, the number left, the limits it clears and its expiry. A held but blocked grant is dimmed, with its reason on the same line. The selected grant alone shows its upstream label below the row, dimmed, and its warnings in yellow. Dates and times are local; expiry is a date more than a day away (with the year only if it differs from this year), or a countdown within a day. An empty list says `no banked resets`. `↑`/`↓` or `j`/`k` choose a held grant, `Enter` shows the spend confirmation and warnings, and `y`/`Y` spends it. Any other key cancels the confirmation. Blocked grants cannot be spent; warnings do not block a manual spend. `r` reads fresh details; `Esc`/`q` closes the panel. Spending cannot be undone or cancelled once it starts.
 
 The settings screen is a list, not a set of letter shortcuts: `↑`/`↓` move between rows, `←`/`→` change the value in place (threshold by 1%, probe by 30s, modes cycle), `Enter` opens a row that needs typing or a sub-screen, `Esc` goes back.
 
