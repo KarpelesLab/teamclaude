@@ -794,7 +794,7 @@ function tailText(s, w) {
 // ── TUI class ────────────────────────────────────────────────
 
 export class TUI {
-  constructor({ accountManager, config, saveConfig, syncAccounts, onQuit, sx = null, probeQuota = null,
+  constructor({ accountManager, config, saveConfig, syncAccounts, onQuit, sx = null, probeQuota = null, resetActions = /** @type {ReturnType<typeof import('./reset-actions.js').createResetActions>|null} */ (null),
     // Cast so the destructured binding is the callback type, not `null`: index.js passes a function here.
     loginAccount = /** @type {LoginAccount | null} */ (null),
     activityLogPath = null,
@@ -818,6 +818,7 @@ export class TUI {
     // tmux wrapping can be exercised without running inside tmux.
     env = /** @type {Record<string, string | undefined>} */ (process.env) }) {
     this.am = accountManager;
+    this.resetActions = resetActions ?? null;
     this.remote = remote;
     this.applySwitch = applySwitch;
     this.config = config;

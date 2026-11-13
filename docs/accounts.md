@@ -456,18 +456,25 @@ same `/wham/usage` payload the quota reading does — and shows up as `RC1` on t
 TUI row, a `Reset` line in `teamclaude status`, and a badge on the dashboard
 card. It survives a restart, which matters because the probe is off by default.
 
-Only the probe refreshes the count, so a reading can outlive the credit it
-describes — redeemed in the Codex CLI, or expired. The `status` line therefore
+The probe and a quota re-read after a reset refresh the count, so a reading can
+outlive the credit it describes — redeemed in the Codex CLI, or expired. The `status` line therefore
 says how old the reading is (`as of 3h ago`), and every surface drops it once it
 is more than 7 days old.
 
 The count is what the account **holds**. Whether a particular credit can be
 spent is a separate question — the payload's `applicable_available_count` is
 upstream's own view of how many would reset a window right now, and is named on
-the `status` line when it is zero — and spending one is a manual action in the
-Codex CLI unless you arm the switch below.
+the `status` line when it is zero.
 
-Spending one is **opt-in**, and the switch is fleet-wide: set
+To read fresh credit details and spend a chosen credit by hand, select the
+account in the local TUI and press **r**. The panel shows each credit's label,
+expiry and availability before confirmation. A manual spend does not need the
+auto-redeem switch. A weekly window that is not exhausted and a recent fleet
+hold are warnings, not blocks. Disabled or non-OAuth accounts, unavailable or
+expired credits, and credits the plan cannot use are blocked. Attach mode does
+not offer this action.
+
+**Automatic** spending is opt-in, and the switch is fleet-wide: set
 [`autoRedeemResets`](configuration.md) to `true`, or toggle it from the TUI
 settings screen (**g** → **Auto-redeem**). It is `false` by default, and stays
 that way until you say otherwise: a redemption cannot be undone and the credits
@@ -478,7 +485,8 @@ and it applies live, so it can be armed or killed without a restart.
 
 One account can be exempted with `accounts[].autoRedeemReset: false`, and that
 is **all** that key can do. A per-account `true` arms nothing on its own: with
-`autoRedeemResets` off, no account spends anything.
+`autoRedeemResets` off, no account spends anything **automatically**. The opt-out
+does not prevent a manual spend.
 
 A redemption is considered at the moment a spent weekly window turns a request
 away with nothing chosen to serve it: every Codex account the request is
@@ -518,8 +526,8 @@ logged.
 
 Claude sometimes grants an account a **banked usage-limit reset**, shown under
 **Resets** on the claude.ai usage page (for example "Full reset — Expires
-Oct 23"). Spending one clears the account's 5-hour and 7-day windows ahead of
-their own reset, whenever you choose.
+Oct 23"). Spending one clears the windows named by that grant ahead of their
+own reset, whenever you choose.
 
 The [quota probe](quota.md#quota-probe) reads the count from the same
 zero-spend `/api/oauth/usage` call it already makes. It asks with
@@ -551,6 +559,30 @@ The probe is off by default, so the count is only as fresh as the last probe:
 `p` in the TUI, or `curl -X POST localhost:3456/teamclaude/probe`, refreshes
 it once.
 
+### Reading and spending a reset by hand
+
+Select the Claude account in the local TUI and press **r** to read its fresh
+reset details. The panel lists weekly, Fable and session resets, with each
+grant's label, remaining count, expiry and availability. You can choose any
+usable grant, not only the one upstream names as next, and confirm the spend.
+Attach mode does not offer this action.
+
+Manual spending is your decision. It ignores `autoRedeemResets`, the account's
+`autoRedeemReset: false` opt-out, and the fleet hold. The panel warns when no
+weekly limit is exhausted, when the grant does not clear an exhausted limit,
+when upstream reports a cooldown, or when a reset recently landed or may have
+landed. If the grant requires a limit and the account is not at one, it warns
+that upstream will probably decline without spending anything. A disabled or
+non-OAuth account, missing organization id, ineligible status, or an empty,
+paused, unusable or expired grant is a hard block.
+
+The token and details are refreshed again before the claim. Manual and
+automatic claims cannot run together for the same provider, and only one
+manual claim can run at a time. Manual claims share the automatic path's
+request-id replay and set its fleet hold after success or an unread verdict.
+A failed claim may have spent the reset; the next attempt on that grant reuses
+the same request id. A refusal with a verdict spends nothing.
+
 ### Spending a Claude reset automatically
 
 With [`autoRedeemResets`](configuration.md) on — the same switch, and the same
@@ -568,8 +600,8 @@ selected again against the account it cleared.
   grant clears every limit the account is at, since a reset that would leave it
   blocked buys the request nothing. While upstream reports a reset cooldown,
   nothing is claimed.
-- Only the grant upstream names as next (`next_grant_id`), exactly as
-  `/limit-reset` in Claude Code does.
+- Only the grant upstream names as next (`next_grant_id`). Manual selection
+  can choose another usable grant; the automatic policy does not.
 - `accounts[].autoRedeemReset: false` exempts an account, as it does for Codex;
   so does being disabled, having no organization id, or last reading zero held
   resets.
@@ -588,7 +620,8 @@ It is not a documented API, so it is worth watching the activity log the first
 time it fires. A fleet that already turned `autoRedeemResets` on for Codex
 credits now spends Claude resets too; exempt an account with
 `autoRedeemReset: false` if that is not wanted. With the switch off — the default — a Claude reset is still
-yours to spend, on the claude.ai usage page or with `/limit-reset`.
+yours to spend with **r** in the local TUI, on the claude.ai usage page, or with
+`/limit-reset`.
 
 ## Third-party backend accounts
 

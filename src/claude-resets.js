@@ -1,7 +1,7 @@
-// Banked Claude usage-limit resets: reading the grant a spent account holds, and
-// spending one at the pool-dry refusal when the operator has armed
-// `autoRedeemResets` — the same switch, the same moment and the same
-// per-account exemption as the Codex reset credits.
+// Banked Claude usage-limit resets: read the grants, spend a chosen one by
+// hand, or spend one at the pool-dry refusal when the operator has armed
+// `autoRedeemResets` — the same switch, moment and per-account exemption as
+// the Codex reset credits.
 //
 // The Codex counterpart is codex-reset-credits.js. Anthropic's version differs
 // in ways that matter for a call that cannot be undone:
@@ -10,8 +10,8 @@
 //    filled in for a caller that asks with `?cedar_ember=1` and identifies as
 //    Claude Code; anything else reads `eligible: false, ineligible_reason:
 //    "surface"`, a statement about the caller and not the account.
-//  - Spending names a grant, and only the payload's `next_grant_id` may be
-//    spent; the endpoint is organization-scoped
+//  - Spending names any usable grant; auto-redeem keeps using `next_grant_id`.
+//    The endpoint is organization-scoped
 //    (POST /api/organizations/<orgUuid>/reset_rate_limits), and the body is
 //    `{ program: "cedar_ember", grant_id, request_id }`.
 //  - The verdict is in the body's `result`: `reset` (spent, windows cleared),
@@ -26,7 +26,7 @@
 
 import { randomUUID } from 'node:crypto';
 
-import { USAGE_URL, OAUTH_USAGE_BETA, USAGE_USER_AGENT, normalizeUsagePayload } from './oauth.js';
+import { USAGE_URL, OAUTH_USAGE_BETA, USAGE_USER_AGENT, normalizeUsagePayload, isFableReset } from './oauth.js';
 import { providerOf, DEFAULT_PROVIDER } from './provider.js';
 import { safeLine } from './safe-text.js';
 import { proxyFetch } from './upstream-fetch.js';
@@ -66,6 +66,21 @@ const isoMs = v => {
 /** @param {unknown} v */
 const names = v => (Array.isArray(v) ? v.filter(x => typeof x === 'string' && x.length <= 64) : []);
 
+/** @param {unknown} value */
+function percentUsed(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  return Object.fromEntries(Object.entries(value).filter(([key, n]) => key.length <= 64 && Number.isInteger(n) && n >= 0 && n <= 100));
+}
+
+/**
+ * @param {{ clears?: unknown, type?: unknown }} grant
+ * @returns {'fable'|'weekly'|'session'}
+ */
+export function claudeGrantKind(grant) {
+  if (isFableReset(grant?.clears)) return 'fable';
+  return grant?.type === 'session' ? 'session' : 'weekly';
+}
+
 /**
  * The `cedar_ember` block as the redeemer reasons about it, or null when the
  * payload says nothing usable. Unlike oauth.js's `bankedResets`, this keeps the
@@ -80,11 +95,20 @@ export function parseResetStatus(block) {
     const left = Number(g.resets_left);
     return [{
       id: g.id,
+      label: typeof g.label === 'string' ? safeLine(g.label, 64) : null,
       resetsLeft: Number.isInteger(left) && left > 0 ? left : 0,
+      resetsTotal: Number.isInteger(g.resets_total) && g.resets_total >= 0 ? g.resets_total : null,
       clears: names(g.clears),
       usableNow: g.usable_now === true,
       paused: g.paused === true,
+      startsAt: isoMs(g.starts_at),
       endsAt: isoMs(g.ends_at),
+      type: ['session', 'weekly', 'full'].includes(g.type) ? g.type : null,
+      givesBackWeekly: g.gives_back_weekly === true,
+      useRequiresLimit: typeof g.use_requires_limit === 'boolean' ? g.use_requires_limit : null,
+      percentUsed: percentUsed(g.percent_used),
+      blocking: names(g.blocking),
+      unavailableReason: typeof g.unavailable_reason === 'string' ? safeLine(g.unavailable_reason, 32) : null,
     }];
   });
   const next = typeof block.next_grant_id === 'string' && grants.some((/** @type {{ id: string }} */ g) => g.id === block.next_grant_id) ? block.next_grant_id : null;
@@ -95,6 +119,7 @@ export function parseResetStatus(block) {
     exhausted: names(block.exhausted),
     nextGrantId: next,
     cooldownUntil: isoMs(block.cooldown_until),
+    weeklyResetsAt: isoMs(block.weekly_resets_at),
     grants,
   };
 }
@@ -164,6 +189,7 @@ export async function claimClaudeReset(account, { grantId, requestId }, { fetchI
       resetsLeft: Number.isInteger(left) ? left : null,
       cleared: names(data?.cleared),
       cooldownUntil: isoMs(data?.cooldown_until),
+      weeklyResetsAt: isoMs(data?.weekly_resets_at),
     };
   } catch (/** @type {any} */ err) {
     return { error: safeLine(err?.message || String(err), 120), status: null };
@@ -187,7 +213,7 @@ export function blockedUntil(account, now = Date.now()) {
   return until;
 }
 
-/** @typedef {{ redeemed: boolean, reason: string, account?: string, result?: string|null, resetsLeft?: number|null, cleared?: string[] }} ClaudeRedeemResult */
+/** @typedef {{ redeemed: boolean, reason: string, uncertain?: boolean, account?: string, result?: string|null, resetsLeft?: number|null, cleared?: string[] }} ClaudeRedeemResult */
 
 export class ClaudeResetRedeemer {
   /**
@@ -202,10 +228,14 @@ export class ClaudeResetRedeemer {
     this.now = now;
     this.log = log;
     this.timeoutMs = timeoutMs;
-    /** @type {WeakMap<object, { cooldownUntil: number, requestId: string|null, grantId: string|null }>} */
+    /** @type {WeakMap<object, { cooldownUntil: number, requestIds: Map<string, string> }>} */
     this.state = new WeakMap();
     /** @type {Promise<ClaudeRedeemResult>|null} */
     this.inFlight = null;
+    // reset-actions holds this across the fresh read and the manual claim.
+    this.manualInFlight = false;
+    /** @type {number|null} */
+    this.fleetHoldStartedAt = null;
   }
 
   /**
@@ -229,14 +259,16 @@ export class ClaudeResetRedeemer {
    * @param {number} until
    */
   _holdFleet(account, until) {
+    account.quota ??= {};
     const held = account.quota.claudeResetHoldUntil;
+    if (!Number.isFinite(held) || until >= held) this.fleetHoldStartedAt = this.now();
     account.quota.claudeResetHoldUntil = Number.isFinite(held) ? Math.max(held, until) : until;
   }
 
   /** @param {object} account */
   _stateFor(account) {
     let s = this.state.get(account);
-    if (!s) { s = { cooldownUntil: 0, requestId: null, grantId: null }; this.state.set(account, s); }
+    if (!s) { s = { cooldownUntil: 0, requestIds: new Map() }; this.state.set(account, s); }
     return s;
   }
 
@@ -257,6 +289,7 @@ export class ClaudeResetRedeemer {
   async maybeRedeemForPool(accounts) {
     if (this.config?.autoRedeemResets !== true) return { redeemed: false, reason: 'auto-redeem is switched off' };
     if (!accounts?.length) return { redeemed: false, reason: 'no candidate accounts' };
+    if (this.manualInFlight) return { redeemed: false, reason: 'a manual reset is in progress' };
     if (this.inFlight) return this.inFlight;
     const attempt = this._attempt(accounts).finally(() => { this.inFlight = null; });
     this.inFlight = attempt;
@@ -338,31 +371,58 @@ export class ClaudeResetRedeemer {
       state.cooldownUntil = status.cooldownUntil;
       return { redeemed: false, account: name, reason: 'upstream reports a reset cooldown' };
     }
-    if (state.grantId !== grant.id) { state.grantId = grant.id; state.requestId = null; }
-    state.requestId ||= randomUUID();
-    this.log(`[TeamClaude] Redeeming a banked Claude usage-limit reset on "${name}" — no Claude account can serve the request`);
-    const r = await this.claimFn(account, { grantId: grant.id, requestId: state.requestId }, { timeoutMs: left() });
+    return this.redeemGrant(account, grant.id, { deadline });
+  }
+
+  /**
+   * Shared claim execution. Manual callers validate a fresh detail read in
+   * reset-actions first; auto callers keep all policy checks in _redeem.
+   * Unread claims keep a separate replay key for each chosen grant.
+   *
+   * @param {Record<string, any>} account
+   * @param {string} grantId
+   * @param {{ manual?: boolean, deadline?: number }} [opts]
+   * @returns {Promise<ClaudeRedeemResult>}
+   */
+  async redeemGrant(account, grantId, { manual = false, deadline = this.now() + this.timeoutMs } = {}) {
+    if (manual && this.inFlight) return { redeemed: false, reason: 'an automatic reset is in progress' };
+    const name = safeLine(account.name, 64);
+    const state = this._stateFor(account);
+    const now = this.now();
+    const requestId = state.requestIds.get(grantId) || randomUUID();
+    state.requestIds.set(grantId, requestId);
+    const action = manual ? 'Manual Claude reset' : 'Claude reset';
+    this.log(manual
+      ? `[TeamClaude] Manually redeeming a banked Claude reset on "${name}"`
+      : `[TeamClaude] Redeeming a banked Claude usage-limit reset on "${name}" — no Claude account can serve the request`);
+    let r;
+    try {
+      r = await this.claimFn(account, { grantId, requestId }, { timeoutMs: Math.max(1, deadline - this.now()) });
+    } catch (/** @type {any} */ err) {
+      r = { error: safeLine(err?.message || String(err), 120) };
+    }
 
     if (r?.error) {
       // No verdict, over a POST that may have spent the grant: keep the key for
       // a replay, and stop anything else spending in the meantime.
       state.cooldownUntil = now + UNKNOWN_HOLD_MS;
       this._holdFleet(account, now + UNKNOWN_HOLD_MS);
-      this.log(`[TeamClaude] Claude reset on "${name}" got no verdict (${r.error}); it may have been spent, so the fleet holds off`);
-      return { redeemed: false, account: name, reason: `reset request failed (${r.error}); it may still have gone through` };
+      this.log(`[TeamClaude] ${action} on "${name}" got no verdict (${r.error}); it may have been spent, so the fleet holds off`);
+      return { redeemed: false, uncertain: true, account: name, reason: `reset request failed (${r.error}); it may still have gone through` };
     }
-    state.requestId = null;
-    state.grantId = null;
-    if (r.result === 'reset' || r.result === 'already_used') {
+    state.requestIds.delete(grantId);
+    if (r?.result === 'reset' || r?.result === 'already_used') {
       state.cooldownUntil = now + SUCCESS_HOLD_MS;
       this._holdFleet(account, now + SUCCESS_HOLD_MS);
-      this.log(`[TeamClaude] Redeemed a Claude usage-limit reset on "${name}" — cleared ${(r.cleared || []).join(', ') || 'its limits'}, ${r.resetsLeft ?? '?'} left`);
-      await this._reapply(account, deadline);
-      return { redeemed: true, account: name, reason: 'no Claude account could serve the request', result: r.result, resetsLeft: r.resetsLeft, cleared: r.cleared };
+      this.log(`[TeamClaude] ${manual ? 'Manually redeemed' : 'Redeemed'} a Claude usage-limit reset on "${name}" — cleared ${(r.cleared || []).join(', ') || 'its limits'}, ${r.resetsLeft ?? '?'} left`);
+      try { await this._reapply(account, deadline); } catch {
+        this.log(`[TeamClaude] Could not re-read Claude quota for "${name}" after the reset — it will be re-learned from traffic`);
+      }
+      return { redeemed: true, account: name, reason: manual ? 'manual redeem' : 'no Claude account could serve the request', result: r.result, resetsLeft: r.resetsLeft, cleared: r.cleared };
     }
-    state.cooldownUntil = r.result === 'cooldown' && r.cooldownUntil ? r.cooldownUntil : now + DECLINED_COOLDOWN_MS;
-    this.log(`[TeamClaude] Claude reset on "${name}" declined upstream (${r.result || 'no result'}${r.reason ? `: ${r.reason}` : ''}); nothing was spent`);
-    return { redeemed: false, account: name, reason: `upstream declined (${r.result || 'no result'}${r.reason ? `: ${r.reason}` : ''})`, result: r.result };
+    state.cooldownUntil = r?.result === 'cooldown' && r.cooldownUntil ? r.cooldownUntil : now + DECLINED_COOLDOWN_MS;
+    this.log(`[TeamClaude] ${action} on "${name}" declined upstream (${r?.result || 'no result'}${r?.reason ? `: ${r.reason}` : ''}); nothing was spent`);
+    return { redeemed: false, account: name, reason: `upstream declined (${r?.result || 'no result'}${r?.reason ? `: ${r.reason}` : ''})`, result: r?.result };
   }
 
   /**
