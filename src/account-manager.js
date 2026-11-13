@@ -1516,10 +1516,14 @@ export class AccountManager {
     // one provider that is a single slot for several fleets, so a request whose
     // provider does not own it borrows the slot for the walk and hands it back.
     //
-    // With one provider `borrowed` is always false, so the `providerCursors`
-    // entry this method writes has no reader at all. Its one reader is the
-    // `providerCursors.get(provider)` inside `if (borrowed)`, which only a
-    // borrowed walk reaches.
+    // When every request's provider owns the slot, `borrowed` is always false,
+    // the re-seed below never runs, and nothing reads the `providerCursors`
+    // entry this method writes. For a provider that does not own the slot the
+    // entry is read twice over: by the re-seed, and by
+    // `_currentIndexForProvider`, which status's `currentAccounts`,
+    // `currentIndexes` and route targets, the TUI's ► in a mixed fleet,
+    // `releasePins` and `_unstrandCursor` go by. It names an account by
+    // position, so removeAccount renumbers it.
     const owner = providerOf(this.accounts[this.currentIndex]);
     const borrowed = !!this.accounts.length && owner !== provider;
     const saved = this.currentIndex;
@@ -2777,11 +2781,21 @@ export class AccountManager {
     return this._currentIndexForProvider(provider);
   }
 
-  /** The cursor owned by one provider, falling back to the account that its
-   * next request would start from before that provider has seen traffic. */
+  /** The shared slot for the provider that owns it, else the cursor owned by
+   * one provider, falling back to the account that its next request would
+   * start from before that provider has seen traffic. */
   _currentIndexForProvider(provider) {
     const excluded = this._excludeOtherProviders(null, provider);
     const allowed = index => index != null && this.accounts[index] && !excluded?.has(index);
+    // The provider that owns the shared slot walks from the slot, not from its
+    // cursor: getActiveAccount borrows the slot only for the others. So the
+    // slot is its answer, as it is currentAccount's; where preemption then
+    // lands that walk is defaultTargets' to say. Asked of the cursor first,
+    // status named an account the provider's walk no longer starts from: one it
+    // had rested on before a removal handed it the slot, or before another
+    // provider's walk parked the slot on a shared API key, which reads as this
+    // provider's.
+    if (allowed(this.currentIndex) && providerOf(this.accounts[this.currentIndex]) === provider) return this.currentIndex;
     const own = this.providerCursors.get(provider);
     if (allowed(own)) return own;
     if (allowed(this.currentIndex)) return this.currentIndex;
@@ -6299,6 +6313,19 @@ export class AccountManager {
     for (const [name, idx] of [...this.routeCursors.entries()]) {
       if (idx === index) this.routeCursors.delete(name);
       else if (idx > index) this.routeCursors.set(name, idx - 1);
+    }
+    // And each provider's cursor. Left at its old number, one above the removed
+    // account names the account above it: the next walk of a provider that does
+    // not hold currentIndex re-seeds from there (see getActiveAccount), so its
+    // traffic moved accounts on a removal that had nothing to do with it, and
+    // status and the TUI named that account as its current one meanwhile. One on
+    // the removed account is dropped, as a route's is, rather than handed to
+    // whichever account slid into its slot: a provider without the shared slot
+    // then re-picks on merit, and one that holds it goes by currentIndex, which
+    // the neighbor rule above has placed.
+    for (const [provider, idx] of [...this.providerCursors.entries()]) {
+      if (idx === index) this.providerCursors.delete(provider);
+      else if (idx > index) this.providerCursors.set(provider, idx - 1);
     }
     // Session pins are positions in the same list and shift the same way, and so
     // are the rollover observations hanging off them and off the current account.
