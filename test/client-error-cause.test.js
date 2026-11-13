@@ -95,6 +95,32 @@ test('an unrenewable token is still named when a disabled account sits in the fl
   } finally { proxy.close(); upstream.close(); }
 });
 
+// The renewal failure quoted is the unrenewed account's own (recordRefusal), not
+// that of the first account of its name: here a disabled one, listed first, with
+// no failed renewal behind it.
+test('an unrenewable token is quoted from its own account beside a same-named disabled one', async () => {
+  const upstream = http.createServer((req, res) => {
+    req.resume();
+    res.writeHead(401, { 'content-type': 'application/json' });
+    res.end('{"type":"error","error":{"type":"authentication_error"}}');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([{ name: 'a', type: 'oauth', accessToken: 't-off', refreshToken: 'rt-off', expiresAt: Date.now() + H, disabled: true }, expired], 0.98, {});
+  for (const account of am.accounts) account.probing = false;
+  am.setRefreshCoordinator(async () => { throw Object.assign(new Error(`not renewed without the callback.net lock: ${notOwner}`), { code: 'CALLBACK_LOCK_UNAVAILABLE' }); });
+  am.selectActiveAccount();
+  const proxy = createProxyServer(am, { upstream: `http://127.0.0.1:${upstreamPort}` });
+  const port = await listen(proxy);
+  try {
+    const r = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: 'claude-sonnet-4-5', messages: [] }),
+    });
+    const message = (await r.json()).error?.message || '';
+    assert.equal(r.status, 503, message);
+    assert.ok(message.includes('this install may not renew this account right now'), message);
+  } finally { proxy.close(); upstream.close(); }
+});
+
 // Control: "nothing else was tried" still means every account the request could
 // reach. Beside an unrenewable token, an account whose five-hour window is spent
 // will serve this request once it resets, so the client is told to wait - the
