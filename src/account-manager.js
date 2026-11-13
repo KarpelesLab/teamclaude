@@ -676,10 +676,11 @@ export class AccountManager {
    * @param {Object} [opts.sessionTracker]
    * @param {Object} [opts.expiryRouting]
    * @param {boolean} [opts.preferSoonestWeeklyReset]  earliest-deadline-first rotation (see setPreferSoonestWeeklyReset)
+   * @param {boolean} [opts.switchOnSessionReset]  move to an account whose 5h window just reset (see setSwitchOnSessionReset)
    * @param {string} [opts.advisorEligibility]  'strict' (default) or 'prefer'
    * @param {{ host: string, port: number }|null} [opts.listener]  this server's own address, so an accounts[].routing that points back at it is refused (see accountRouting)
    */
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, refreshCoordinator = (_account, refresh, _info) => refresh(), throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, preferSoonestWeeklyReset = false, advisorEligibility, listener = null } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, refreshCoordinator = (_account, refresh, _info) => refresh(), throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, preferSoonestWeeklyReset = false, switchOnSessionReset = true, advisorEligibility, listener = null } = {}) {
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
@@ -782,6 +783,7 @@ export class AccountManager {
     this._obsGen = 0;
     this.setExpiryRouting(expiryRouting);
     this.setPreferSoonestWeeklyReset(preferSoonestWeeklyReset);
+    this.setSwitchOnSessionReset(switchOnSessionReset);
     // The rollover mechanism's whole state for the sticky current account: one
     // observation, { idx, windows: name → reset }, of the account traffic was
     // resting on when a request last arrived to find it there. Null while the
@@ -3575,6 +3577,21 @@ export class AccountManager {
   }
 
   /**
+   * The session-reset switch (_switchOnSessionReset), on by default. When an
+   * account's 5-hour window resets and its weekly window lapses sooner than the
+   * current account's, the cursor moves to it even though the current account
+   * is healthy, and every conversation behind the cursor loses its prompt
+   * cache. Off, the reset only returns the account to rotation: traffic stays
+   * where it is until rotation has to pick. Only a literal `false` turns it off,
+   * so a hand-edited `"false"` keeps today's behaviour. Applied live on config
+   * reload.
+   * @param {boolean} enabled
+   */
+  setSwitchOnSessionReset(enabled) {
+    this.switchOnSessionReset = enabled !== false;
+  }
+
+  /**
    * With `preferSoonestWeeklyReset` on, the available account of the same
    * priority whose governing weekly window resets soonest, when that is
    * strictly sooner (by more than a minute, so jitter in reported reset times
@@ -4756,7 +4773,7 @@ export class AccountManager {
     // the switch runs the same `_isAvailable(acc)` the knob-off path runs; a
     // model-scoped filter there is a live routing change on the path that
     // promises none.
-    if (sessionReset.length) {
+    if (sessionReset.length && this.switchOnSessionReset) {
       this._switchOnSessionReset(sessionReset, this.expiryRouting.enabled ? model : null, scope ?? partition, adv);
     }
     return changed;
