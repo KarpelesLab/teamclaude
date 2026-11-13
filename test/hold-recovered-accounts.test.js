@@ -186,6 +186,31 @@ test('a held request never retries an account upstream refused, even once anothe
   } finally { await drain(f, outcome); }
 });
 
+// The same fleet with one name for both accounts (names are not unique;
+// account-id.test.js keeps two entries of one name). A refusal recorded by
+// name also marked the same-named account that was only out of quota: the
+// request got the 502 instead of the hold, and after a hold that account was
+// never retried.
+test('a held request retries a same-named account that recovered beside a refused one', async t => {
+  let bRecovered = false;
+  const f = await fleet(t, [oauth('a', 'tb'), oauth('a', 'ta')], (token, req, res) => {
+    if (token === 'ta') return refused(res);
+    if (bRecovered) return served(res);
+    rateLimited(res, START + 90 * SEC);
+  });
+  const outcome = post(f.port);
+  try {
+    const first = await Promise.race([f.holds.next(1).then(() => 'held'), outcome]);
+    assert.equal(first, 'held', `the request was answered ${first} instead of held for the reset`);
+    bRecovered = true;
+    t.mock.timers.tick(90 * SEC);
+    const result = await reply(outcome, f);
+    assert.equal(result, 200, `the held request did not retry the same-named account that recovered (got ${result})`);
+    assert.equal(f.seen.filter(x => x === 'ta').length, 1, 'the refused credential was sent again');
+    assert.equal(f.seen.at(-1), 'tb', 'the retry goes to the account that recovered');
+  } finally { await drain(f, outcome); }
+});
+
 test('a held request never sends a token it could not renew, even once another has recovered', async t => {
   let bRecovered = false;
   // a's token expired an hour before the clock started and its refresh fails.
@@ -203,6 +228,45 @@ test('a held request never sends a token it could not renew, even once another h
     assert.equal(result, 200, `the held request was held again instead of retrying the account that recovered (got ${result})`);
     assert.ok(!f.seen.includes('ta'), 'a token that could not be renewed was sent upstream');
     assert.equal(f.refreshes(), 1, 'the account whose token could not be renewed was selected again, and renewal retried');
+  } finally { await drain(f, outcome); }
+});
+
+// A token that could not be renewed is recorded by account too, since names are
+// not unique. With one name for both accounts, the merely-exhausted one read as
+// unrenewed as well: the request was told at once that no token could be
+// renewed, instead of held for the reset that will serve it.
+test('an unrenewable token beside a same-named, merely-exhausted account is held, not answered at once', async t => {
+  const f = await fleet(t, [oauth('a', 'tb'), oauth('a', 'ta', START - HOUR)], (token, req, res) => {
+    rateLimited(res, START + 90 * SEC);
+  });
+  const outcome = post(f.port);
+  try {
+    const first = await Promise.race([f.holds.next(1).then(() => 'held'), outcome]);
+    assert.equal(first, 'held', `the request was answered ${first} instead of held for the reset`);
+    assert.deepEqual(f.seen, ['tb'], 'only the exhausted account is sent the request');
+  } finally { await drain(f, outcome); }
+});
+
+// One step later: a third account keeps the request from being answered at
+// once, so it is held, and after the hold the same-named account whose window
+// reset is retried. Excluded by name with the unrenewable one, it was not, and
+// the request was held again.
+test('a held request retries a same-named account that recovered beside an unrenewable one', async t => {
+  let bRecovered = false;
+  const f = await fleet(t, [oauth('a', 'tb'), oauth('a', 'ta', START - HOUR), oauth('c', 'tc')], (token, req, res) => {
+    if (token === 'tb' && bRecovered) return served(res);
+    rateLimited(res, token === 'tb' ? START + 90 * SEC : START + HOUR);
+  });
+  const outcome = post(f.port);
+  try {
+    const first = await Promise.race([f.holds.next(1).then(() => 'held'), outcome]);
+    assert.equal(first, 'held', `the request was answered ${first} instead of held for the reset`);
+    bRecovered = true;
+    t.mock.timers.tick(90 * SEC);
+    const result = await reply(outcome, f);
+    assert.equal(result, 200, `the held request did not retry the same-named account that recovered (got ${result}; saw ${f.seen.join(',')})`);
+    assert.ok(!f.seen.includes('ta'), 'a token that could not be renewed was sent upstream');
+    assert.equal(f.seen.at(-1), 'tb', 'the retry goes to the account that recovered');
   } finally { await drain(f, outcome); }
 });
 
