@@ -55,7 +55,9 @@ teamclaude alias --install   # make plain `claude` go through the proxy
 teamclaude help              # everything else
 ```
 
-Full reference: [docs/usage.md](docs/usage.md).
+In the local TUI, **r** opens the account picker and its **Resets** panel. Choose a banked Claude reset or Codex reset credit, press **Enter** to review the warnings, then **y** to spend it. **r** reads fresh details; **Esc** closes the panel. A spend cannot be undone.
+
+Full reference, including [TUI keys](docs/usage.md#tui-keyboard-shortcuts): [docs/usage.md](docs/usage.md).
 
 ## Configuration
 

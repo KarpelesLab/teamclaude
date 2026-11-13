@@ -561,11 +561,19 @@ it once.
 
 ### Reading and spending a reset by hand
 
-Select the Claude account in the local TUI and press **r** to read its fresh
-reset details. The panel lists weekly, Fable and session resets, with each
-grant's label, remaining count, expiry and availability. You can choose any
-usable grant, not only the one upstream names as next, and confirm the spend.
-Attach mode does not offer this action.
+Press **r** from the local TUI's main screen, choose an OAuth Claude or Codex
+account, and press **Enter** to read its fresh reset details. The picker starts
+on the first account with a banked reset. The panel lists weekly, Fable and
+session resets, or Codex reset credits, with each grant's label, remaining
+count, expiry and availability. Use **↑**/**↓** or **j**/**k** to choose any
+usable grant, not only the one upstream names as next. **Enter** shows the
+warnings and asks for confirmation; **y** or **Y** spends one reset. Any other
+key cancels that confirmation. A blocked grant shows why it cannot be spent.
+
+Within the panel, **r** reads the details again; **Esc** or **q** closes it.
+Closing while a spend is in progress does not cancel that spend. The result
+is logged, and a successful or uncertain spend refreshes the panel if it is
+still open. Attach mode does not offer this action.
 
 Manual spending is your decision. It ignores `autoRedeemResets`, the account's
 `autoRedeemReset: false` opt-out, and the fleet hold. The panel warns when no
