@@ -358,8 +358,9 @@ test('resets: confirmation shows warnings; y spends the chosen id only once and 
   spend.resolve({ redeemed: true, uncertain: false, message });
   await flush();
   assert.deepEqual(logged(tui), [message]);
-  assert.equal(reads, 2);
+  assert.equal(reads, 1);
   assert.equal(tui.resetsPanel.busy, false);
+  assert.ok(tui._resetsLines(160).map(stripAnsi).join('\n').includes(message));
 });
 
 test('resets: any key except y or Y cancels confirmation without spending', async () => {
@@ -642,4 +643,75 @@ test('resets: an upstream retry delay longer than the floor prevents an early re
   await flush();
   assert.equal(h.reads(), 0);
   assert.match(h.text(), /wait 60s/);
+});
+
+test('resets: a successful claim uses the post-claim cache, keeps its verdict after 429 and preserves the read floor', async () => {
+  for (const failReapply of [false, true]) {
+    let at = NOW;
+    let reads = 0;
+    let claims = 0;
+    const account = { index: 0, name: 'banked', type: 'oauth', credential: 'fake', orgUuid: 'org', quota: {} };
+    const cleared = [];
+    const am = { accounts: [account], ensureTokenFresh: async () => {},
+      clearRateLimited: () => cleared.push('hold'), clearUpstreamRejected: () => cleared.push('rejected') };
+    const status = left => parseResetStatus({ eligible: true, at_limit: left > 0,
+      exhausted: left > 0 ? ['seven_day_overage_included'] : [],
+      grants: [{ id: 'fable', resets_left: left, usable_now: true, clears: ['seven_day_overage_included'] }] });
+    const now = () => at;
+    const claudeRedeemer = new ClaudeResetRedeemer(am, { now, log: () => {},
+      statusFn: async () => {
+        reads++;
+        if (claims) {
+          assert.deepEqual(cleared, ['hold', 'rejected']);
+          if (failReapply) return { error: 'HTTP 429', status: 429, retryAt: at + 90_000 };
+        }
+        return { reset: status(claims ? 0 : 1) };
+      },
+      claimFn: async (_account, attempt) => {
+        claims++;
+        assert.equal(attempt.grantId, 'fable');
+        return { result: 'reset', resetsLeft: 0, cleared: ['seven_day_overage_included'] };
+      },
+    });
+    const resetActions = createResetActions({ accountManager: am, claudeRedeemer,
+      codexRedeemer: new ResetCreditRedeemer(am), now });
+    rememberResetReading(account, 'claude', { reset: status(1) }, NOW - 180_000);
+    const tui = makeTUI({ accounts: [account], resetActions, resetNow: now });
+    tui._openResets(0);
+    await flush();
+    tui._key('enter');
+    tui._key('y');
+    await flush();
+    assert.equal(claims, 1);
+    assert.equal(reads, 2, 'only the fresh validation and the redeemer post-claim read');
+    assert.equal(tui.resetsPanel.error, null);
+    assert.equal(tui.resetsPanel.details.stale, failReapply);
+    assert.equal(tui.resetsPanel.details.grants.length, failReapply ? 1 : 0);
+    const text = tui._resetsLines(160).map(stripAnsi).join('\n');
+    assert.match(text, /Manually redeemed.*\(reset\).*0 left.*cleared Fable week/);
+    assert.match(tui._resetsLines(160).join('\n'), /\x1b\[32m.*Manually redeemed/);
+    tui._key('r');
+    await flush();
+    assert.equal(reads, 2, 'a spend does not bypass the two-minute floor');
+    assert.match(tui._resetsLines(160).map(stripAnsi).join('\n'), /wait 120s/);
+    at += 120_000;
+    tui._key('r');
+    await flush();
+    assert.equal(reads, 3);
+  }
+});
+
+test('resets: a successful Codex spend still refreshes its separate credit-detail rows', async () => {
+  let reads = 0;
+  const tui = makeTUI({ resetActions: actions(async () => {
+    reads++;
+    return details({ provider: 'codex', ...(reads > 1 ? { grants: [] } : {}) });
+  }) });
+  openPanel(tui);
+  await flush();
+  tui._key('enter');
+  tui._key('y');
+  await flush();
+  assert.equal(reads, 2);
+  assert.deepEqual(tui.resetsPanel.details.grants, []);
 });

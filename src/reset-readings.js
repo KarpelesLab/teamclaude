@@ -3,6 +3,7 @@
 import { safeLine } from './safe-text.js';
 
 export const RESET_OPEN_TTL_MS = 5 * 60_000;
+export const RESET_CLAIM_TTL_MS = 15 * 60_000;
 export const RESET_READ_FLOOR_MS = 2 * 60_000;
 
 /**

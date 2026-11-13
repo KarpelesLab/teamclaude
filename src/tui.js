@@ -799,7 +799,8 @@ function tailText(s, w) {
  * @property {Record<string, any>} account
  * @property {boolean} loading
  * @property {import('./reset-actions.js').ResetDetails | null} details
- * @property {string | null} error  a read failure or the last spend's status
+ * @property {string | null} error  a read failure or a declined spend
+ * @property {string | null} notice  the claim verdict, separate from quota-read errors
  * @property {number} idx  cursor position among held grants only
  * @property {boolean} confirming
  * @property {boolean} busy
@@ -2063,7 +2064,7 @@ export class TUI {
       this._addLog(`"${safeLine(account.name, 64)}" is not an OAuth Claude or Codex account`);
       return;
     }
-    this.resetsPanel = { account, loading: true, details: null, error: null, idx: 0, confirming: false, busy: false, seq: 0 };
+    this.resetsPanel = { account, loading: true, details: null, error: null, notice: null, idx: 0, confirming: false, busy: false, seq: 0 };
     this.mode = 'resets';
     void this._readResets(this.resetsPanel, { open: true });
   }
@@ -2075,21 +2076,26 @@ export class TUI {
   }
 
   /** @param {ResetsPanel} panel
-   * @param {{ open?: boolean, afterSpend?: boolean }} [opts]
+   * @param {{ open?: boolean, afterSpend?: boolean, cachedOnly?: boolean }} [opts]
    */
-  async _readResets(panel, { open = false, afterSpend = false } = {}) {
+  async _readResets(panel, { open = false, afterSpend = false, cachedOnly = false } = {}) {
     if (!this.resetActions || this.resetsPanel !== panel || panel.busy) return;
     const seq = ++panel.seq;
     panel.loading = true;
     panel.confirming = false;
     panel.error = null;
+    if (!afterSpend) panel.notice = null;
     try {
       const cached = this.resetActions.cached?.(panel.account);
       const now = this.resetNow();
       const window = this.resetActions.readWindow?.(panel.account);
       const reuse = !afterSpend && ((open && cached?.seenAt != null && now - cached.seenAt <= RESET_OPEN_TTL_MS)
         || (window != null && now < window.until));
-      const details = reuse && cached ? cached : await this.resetActions.read(panel.account);
+      // The Claude redeemer already read quota after success. Do not add
+      // another usage request, especially after a 429. Keep stale details when
+      // that read failed; the claim verdict remains a separate success notice.
+      const details = cachedOnly ? cached ?? panel.details : reuse && cached ? cached : await this.resetActions.read(panel.account);
+      if (!details) return;
       if (reuse && !open && window?.readAt != null) {
         panel.error = `read ${Math.max(0, Math.floor((now - window.readAt) / 1000))}s ago — wait ${Math.ceil((window.until - now) / 1000)}s`;
       }
@@ -2139,13 +2145,20 @@ export class TUI {
     panel.confirming = false;
     panel.busy = true;
     panel.error = null;
+    panel.notice = null;
     try {
       const result = await this.resetActions.redeem(panel.account, grant.id);
       this._addLog(result.message);
       if (this.resetsPanel !== panel) return;
       panel.busy = false;
-      if (result.redeemed || result.uncertain) await this._readResets(panel, { afterSpend: true });
-      else panel.error = result.message;
+      if (result.redeemed) {
+        const left = result.resetsLeft == null ? '' : ` · ${result.resetsLeft} left`;
+        const cleared = result.cleared?.length ? ` · cleared ${result.cleared.map(limit => RESET_LIMIT_LABEL[limit] || limit).join(' + ')}` : '';
+        panel.notice = `${result.message}${left}${cleared}`;
+      }
+      if (result.redeemed || result.uncertain) {
+        await this._readResets(panel, { afterSpend: true, cachedOnly: result.redeemed && panel.details?.provider === 'claude' });
+      } else panel.error = result.message;
     } catch (/** @type {any} */ error) {
       const message = `Manual reset failed on "${safeLine(panel.account.name, 64)}": ${safeLine(error?.message || String(error), 240)}`;
       this._addLog(message);
@@ -3012,6 +3025,7 @@ export class TUI {
       prose('Reading reset details...', dim);
       return lines;
     }
+    if (panel.notice) { prose(panel.notice, green); lines.push(''); }
     if (details) {
       if (details.error && details.seenAt == null) {
         prose(details.error, red);

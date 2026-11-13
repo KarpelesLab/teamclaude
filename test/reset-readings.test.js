@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { AccountManager } from '../src/account-manager.js';
 import { ClaudeResetRedeemer, fetchClaudeResetStatus } from '../src/claude-resets.js';
 import { ResetCreditRedeemer, fetchResetCreditDetails } from '../src/codex-reset-credits.js';
-import { fetchUsage } from '../src/oauth.js';
+import { fetchUsage, normalizeUsagePayload } from '../src/oauth.js';
 import { Prober } from '../src/prober.js';
 import { createResetActions } from '../src/reset-actions.js';
 import { resetReading } from '../src/reset-readings.js';
@@ -60,6 +60,49 @@ test('the probe caches raw reset details from its one usage fetch, outside the r
     if (previous === undefined) delete process.env.TEAMROUTER_CONFIG;
     else process.env.TEAMROUTER_CONFIG = previous;
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('reset-status reads skip spend, while the quota probe still requests the full payload', async () => {
+  const urls = [];
+  const fetchImpl = async url => { urls.push(url); return { ok: true, json: async () => payload() }; };
+  await fetchClaudeResetStatus({ credential: 'fake' }, { fetchImpl });
+  await fetchUsage('fake', null, { fetchImpl });
+  assert.deepEqual(urls, [
+    'https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1',
+    'https://api.anthropic.com/api/oauth/usage?cedar_ember=1',
+  ]);
+});
+
+test('post-claim skip_spend usage keeps stored spend and extra-usage serving state through the real apply path', async () => {
+  for (const partial of [{}, { extra_usage: { is_enabled: false } },
+    { spend: { used: { amount_minor: 0, currency: 'USD', exponent: 2 } } }]) {
+    const am = new AccountManager([{ name: 'test', type: 'oauth', accessToken: 'fake', orgUuid: 'org',
+      allowExtraUsage: true, maxSpend: 100, expiresAt: Date.now() + 3600_000 }], 0.98);
+    am.ensureTokenFresh = async () => {};
+    const account = am.accounts[0];
+    am.applyUsageData(0, normalizeUsagePayload({
+      seven_day: { utilization: 100 },
+      extra_usage: { is_enabled: true, user_disabled: false, disabled_reason: null },
+      spend: { used: { amount_minor: 2300, currency: 'GBP', exponent: 2 },
+        limit: { amount_minor: 5000, currency: 'GBP', exponent: 2 } },
+    }));
+    const before = { ...account.quota.spend };
+    const redeemer = new ClaudeResetRedeemer(am, { log: () => {},
+      statusFn: acct => fetchClaudeResetStatus(acct, { fetchImpl: async () => ({ ok: true, json: async () => ({
+        ...payload(), seven_day: { utilization: 100 }, ...partial,
+      }) }) }),
+      claimFn: async () => ({ result: 'reset', resetsLeft: 0, cleared: ['five_hour'] }),
+    });
+    const actions = createResetActions({ accountManager: am, claudeRedeemer: redeemer,
+      codexRedeemer: new ResetCreditRedeemer(am) });
+    assert.equal(am._pickFallback()?.paid, true);
+    assert.equal((await actions.redeem(account, GRANT_ID)).redeemed, true);
+    assert.deepEqual(account.quota.spend, before);
+    assert.equal(account.allowExtraUsage, true);
+    assert.equal(account.maxSpend, 100);
+    assert.equal(account.quota.unified7d, 1);
+    assert.equal(am._pickFallback()?.paid, true, 'a partial spend block must not disable paid serving');
   }
 });
 

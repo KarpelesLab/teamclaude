@@ -224,7 +224,7 @@ test('manual claims refresh details instead of trusting the previous read', asyn
   assert.deepEqual(h.calls.tokens, [0, 0]);
 });
 
-test('missing grants and failed reads spend nothing, while the panel retains cached grants', async () => {
+test('missing grants spend nothing, while failed panel reads retain cached grants', async () => {
   const h = harness();
   assert.match((await h.actions.redeem(h.account, 'missing')).message, /no longer listed/);
   h.claudeRedeemer.statusFn = async () => ({ error: 'HTTP 503' });
@@ -233,8 +233,110 @@ test('missing grants and failed reads spend nothing, while the panel retains cac
   assert.equal(details.stale, true);
   assert.equal(details.seenAt, NOW);
   assert.equal(details.grants[0].id, 'weekly');
-  assert.match((await h.actions.redeem(h.account, 'weekly')).message, /HTTP 503/);
   assert.equal(h.calls.claims.length, 0);
+});
+
+test('manual Claude claims a chosen held grant on a reading up to 15 minutes old after a 429', async () => {
+  for (const age of [3 * 60_000, 15 * 60_000]) {
+    let body;
+    const h = harness({ claim: (account, attempt) => claimClaudeReset(account, attempt, {
+      fetchImpl: async (_url, opts) => { body = JSON.parse(opts.body); return { ok: true, json: async () => ({
+        result: 'reset', resets_left: 0, cleared: ['seven_day_overage_included'],
+      }) }; },
+    }) });
+    await h.actions.read(h.account);
+    h.clock.at += age;
+    h.claudeRedeemer.statusFn = async () => ({ error: 'HTTP 429', status: 429 });
+    const result = await h.actions.redeem(h.account, 'fable');
+    assert.equal(result.redeemed, true);
+    assert.equal(body.grant_id, 'fable');
+    assert.equal(result.resetsLeft, 0);
+    assert.deepEqual(result.cleared, ['seven_day_overage_included']);
+    assert.equal(h.calls.logs.filter(line => line.includes('fresh reset read failed')).length, 1);
+    assert.ok(h.calls.logs.some(line => line.includes(`fresh reset read failed (HTTP 429); claiming on the reading from ${age / 60_000}m ago — upstream checks the claim`)));
+    assert.deepEqual(h.calls.clear, [0]);
+    assert.deepEqual(h.calls.rejected, [0]);
+  }
+});
+
+test('manual Claude fallback also handles other status errors and thrown reads', async () => {
+  for (const failure of [async () => ({ error: 'HTTP 503' }), async () => { throw new Error('connection lost'); }]) {
+    const h = harness();
+    await h.actions.read(h.account);
+    h.claudeRedeemer.statusFn = failure;
+    assert.equal((await h.actions.redeem(h.account, 'weekly')).redeemed, true);
+    assert.equal(h.calls.claims.length, 1);
+  }
+});
+
+test('a missing or old manual Claude fallback declines and names the retry wait', async () => {
+  for (const age of [null, 15 * 60_000 + 1, 20 * 60_000]) {
+    for (const retryMs of [null, 90_000, 180_000]) {
+      const h = harness();
+      if (age != null) { await h.actions.read(h.account); h.clock.at += age; }
+      h.claudeRedeemer.statusFn = async () => ({ error: 'HTTP 429', status: 429,
+        retryAt: retryMs == null ? null : h.clock.at + retryMs });
+      const result = await h.actions.redeem(h.account, 'weekly');
+      assert.equal(result.redeemed, false);
+      assert.equal(result.uncertain, false);
+      assert.ok(result.message.includes(`could not read reset status (HTTP 429) and no recent reading to fall back on — try again in ${(retryMs ?? 120_000) / 1000}s`));
+      assert.equal(h.calls.claims.length, 0);
+    }
+  }
+});
+
+test('manual Claude fallback requires the chosen grant to be held and unblocked now', async () => {
+  for (const grants of [[], [rawGrant({ id: 'another' })], [rawGrant({ resets_left: 0 })],
+    [rawGrant({ paused: true })], [rawGrant({ usable_now: false })], [rawGrant({ ends_at: iso(NOW + 60_000) })]]) {
+    const h = harness({ status: block({ grants }) });
+    await h.actions.read(h.account);
+    h.clock.at += 3 * 60_000;
+    h.claudeRedeemer.statusFn = async () => ({ error: 'HTTP 429', status: 429 });
+    assert.match((await h.actions.redeem(h.account, 'weekly')).message, /no recent reading to fall back on/);
+    assert.equal(h.calls.claims.length, 0);
+  }
+});
+
+test('a successful fresh read with a missing grant never falls back to an earlier held grant', async () => {
+  const h = harness({ status: n => block({ grants: n === 1 ? [rawGrant()] : [] }) });
+  await h.actions.read(h.account);
+  assert.match((await h.actions.redeem(h.account, 'weekly')).message, /no longer listed/);
+  assert.equal(h.calls.claims.length, 0);
+});
+
+test('Codex and automatic Claude redemption keep requiring a successful fresh read', async () => {
+  for (const provider of ['claude', 'codex']) {
+    const h = harness({ provider, armed: true });
+    await h.actions.read(h.account);
+    if (provider === 'claude') {
+      h.claudeRedeemer.statusFn = async () => ({ error: 'HTTP 429', status: 429 });
+      assert.equal((await h.claudeRedeemer.maybeRedeemForPool([h.account])).redeemed, false);
+    } else {
+      h.codexRedeemer.detailsFn = async () => ({ error: 'HTTP 429', status: 429 });
+      assert.equal((await h.actions.redeem(h.account, 'credit-1')).redeemed, false);
+    }
+    assert.equal(h.calls.claims.length + h.calls.consumes.length, 0);
+  }
+});
+
+test('manual and automatic Claude success keep the claim verdict when the quota re-read returns 429', async () => {
+  for (const manual of [false, true]) {
+    const h = harness({ armed: true });
+    h.claudeRedeemer.statusFn = async () => {
+      h.calls.statuses++;
+      if (h.calls.statuses === 1) return { reset: parseResetStatus(block()) };
+      assert.deepEqual(h.calls.clear, [0], 'clear the rate-limit hold before reading');
+      assert.deepEqual(h.calls.rejected, [0], 'clear the upstream rejection before reading');
+      return { error: 'HTTP 429', status: 429 };
+    };
+    const result = await (manual ? h.actions.redeem(h.account, 'weekly') : h.claudeRedeemer.maybeRedeemForPool([h.account]));
+    assert.equal(result.redeemed, true);
+    assert.equal(result.result, 'reset');
+    assert.equal(result.resetsLeft, 0);
+    assert.deepEqual(result.cleared, ['seven_day']);
+    assert.equal(h.calls.usage.length, 0);
+    assert.equal(h.actions.cached(h.account).stale, true);
+  }
 });
 
 test('failed token refresh and thrown detail reads are reported without spending', async () => {

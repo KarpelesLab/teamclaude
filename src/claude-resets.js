@@ -10,6 +10,10 @@
 //    filled in for a caller that asks with `?cedar_ember=1` and identifies as
 //    Claude Code; anything else reads `eligible: false, ineligible_reason:
 //    "surface"`, a statement about the caller and not the account.
+//  - Status-only reads add `&skip_spend=1`, as Claude Code does. Manual claims
+//    try a fresh read, but may use a held, unblocked grant from a reading no
+//    more than 15 minutes old if that read fails. Upstream validates the claim;
+//    a successful fresh read that removes or blocks a grant is authoritative.
 //  - Spending names any usable grant; auto-redeem keeps using `next_grant_id`.
 //    The endpoint is organization-scoped
 //    (POST /api/organizations/<orgUuid>/reset_rate_limits), and the body is
@@ -143,8 +147,10 @@ export function claimableGrant(status, now = Date.now()) {
 }
 
 /**
- * Read one account's reset status (and, from the same payload, its usage — so
- * the caller can re-apply quota after a reset without a second request).
+ * Read one account's reset status and quota, without spend. Claude Code uses
+ * `skip_spend=1` for these reads. Its payload may omit any spend/extra-usage
+ * fields, so never apply its spend portion, even when it returns a partial one.
+ * The full quota probe remains the authority on paid-overage readings.
  *
  * @param {Record<string, any>} account
  * @param {{ fetchImpl?: Function, timeoutMs?: number }} [opts]
@@ -152,10 +158,10 @@ export function claimableGrant(status, now = Date.now()) {
 export async function fetchClaudeResetStatus(account, { fetchImpl = proxyFetch, timeoutMs = 10_000 } = {}) {
   if (!account?.credential) return { error: 'no credential' };
   try {
-    const res = await fetchImpl(USAGE_URL, { headers: headers(account), signal: AbortSignal.timeout(timeoutMs), routing: account.routing ?? null });
+    const res = await fetchImpl(`${USAGE_URL}&skip_spend=1`, { headers: headers(account), signal: AbortSignal.timeout(timeoutMs), routing: account.routing ?? null });
     if (!res.ok) return { error: `HTTP ${res.status}`, status: res.status, retryAt: resetRetryAt(res) };
     const data = await res.json();
-    return { reset: parseResetStatus(data?.cedar_ember), usage: normalizeUsagePayload(data) };
+    return { reset: parseResetStatus(data?.cedar_ember), usage: { ...normalizeUsagePayload(data), spend: null } };
   } catch (/** @type {any} */ err) {
     return { error: safeLine(err?.message || String(err), 120), status: null };
   }
@@ -389,8 +395,9 @@ export class ClaudeResetRedeemer {
   }
 
   /**
-   * Shared claim execution. Manual callers validate a fresh detail read in
-   * reset-actions first; auto callers keep all policy checks in _redeem.
+   * Shared claim execution. Manual callers validate fresh details, or recent
+   * cached details if the fresh Claude read failed, in reset-actions first;
+   * auto callers keep all policy checks in _redeem.
    * Unread claims keep a separate replay key for each chosen grant.
    *
    * @param {Record<string, any>} account

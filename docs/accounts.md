@@ -595,8 +595,13 @@ If a read fails, the last grants stay visible, marked `stale`, with their
 original age and the error. An upstream retry delay shows as `retry in 90s`.
 Without an earlier reading, only the error is shown. **Esc** or **q** closes it.
 Closing while a spend is in progress does not cancel that spend. The result
-is logged, and a successful or uncertain spend refreshes the panel if it is
-still open. Attach mode does not offer this action.
+is logged, and the panel updates if it is still open. A successful Claude
+claim already re-reads quota once, so the panel uses that cached reading
+without another request. If that read fails, the panel keeps the stale details
+and shows the claim's own result, number left and cleared limits as a success,
+not a failed claim. **r** still obeys the two-minute read floor. An uncertain
+Claude claim still re-reads details to learn whether it was spent. Codex also
+keeps its separate detail refresh. Attach mode does not offer this action.
 
 Manual spending is your decision. It ignores `autoRedeemResets`, the account's
 `autoRedeemReset: false` opt-out, and the fleet hold. The panel warns when no
@@ -607,9 +612,23 @@ that upstream will probably decline without spending anything. A disabled or
 non-OAuth account, missing organization id, ineligible status, or an empty,
 paused, unusable or expired grant is a hard block.
 
-The token and details are refreshed again before the claim. Manual and
-automatic claims cannot run together for the same provider, and only one
-manual claim can run at a time. Manual claims share the automatic path's
+The token and details are refreshed again before the claim. Claude status-only
+reads use `?cedar_ember=1&skip_spend=1`, as Claude Code does. These reads update
+quota but never replace stored spend or extra-usage readings with missing or
+partial fields; the quota probe still reads the full payload.
+
+If the fresh Claude read fails, including HTTP 429, a manual claim can use the
+same account's in-memory reading up to 15 minutes old, but only if it still
+holds the chosen grant and that grant has no hard block. The fallback is
+logged with the read error and the reading's age. Upstream validates the claim
+and spends nothing on a refusal. A successful fresh read that says the grant
+is gone or blocked always stops the claim. Without a usable recent reading,
+the action declines and names the retry wait, using `Retry-After` when known.
+Codex manual claims and automatic Claude claims still require a successful
+fresh read.
+
+Manual and automatic claims cannot run together for the same provider, and
+only one manual claim can run at a time. Manual claims share the automatic path's
 request-id replay and set its fleet hold after success or an unread verdict.
 A failed claim may have spent the reset; the next attempt on that grant reuses
 the same request id. A refusal with a verdict spends nothing.

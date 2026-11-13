@@ -4,7 +4,7 @@ import { claudeGrantKind } from './claude-resets.js';
 import { weeklyExhausted } from './codex-reset-credits.js';
 import { DEFAULT_PROVIDER, providerOf } from './provider.js';
 import { safeLine } from './safe-text.js';
-import { rememberResetReading, resetReading, RESET_READ_FLOOR_MS } from './reset-readings.js';
+import { rememberResetReading, resetReading, RESET_CLAIM_TTL_MS, RESET_READ_FLOOR_MS } from './reset-readings.js';
 
 /**
  * @typedef {Object} ResetGrant
@@ -190,7 +190,7 @@ export function createResetActions({ accountManager, claudeRedeemer, codexRedeem
     };
   }
 
-  /** Never use a cached reading to validate an irreversible claim.
+  /** Attempt a fresh read; manual Claude claims may fall back only on failure.
    * @param {Record<string, any>} account
    * @returns {Promise<ResetDetails>}
    */
@@ -239,7 +239,21 @@ export function createResetActions({ accountManager, claudeRedeemer, codexRedeem
       try { await accountManager.ensureTokenFresh(account.index); } catch (/** @type {any} */ err) {
         return decline(`token refresh failed (${safeLine(err?.message || String(err), 80)})`);
       }
-      const details = await readFresh(account);
+      let details = await readFresh(account);
+      if (details.error && providerOf(account) === DEFAULT_PROVIDER) {
+        const fallback = cached(account);
+        const at = now();
+        const age = fallback?.seenAt == null ? null : at - fallback.seenAt;
+        const held = fallback?.grants.find(g => g.id === grantId && g.resetsLeft > 0 && !g.blocked);
+        if (!fallback || age == null || age < 0 || age > RESET_CLAIM_TTL_MS || !held) {
+          const retryAt = fallback?.retryAt;
+          const until = retryAt != null && retryAt > at ? retryAt : Math.max(at + RESET_READ_FLOOR_MS, readWindow(account).until);
+          return decline(`could not read reset status (${details.error}) and no recent reading to fall back on — try again in ${Math.ceil((until - at) / 1000)}s`);
+        }
+        const ago = age < 60_000 ? `${Math.floor(age / 1000)}s` : `${Math.floor(age / 60_000)}m`;
+        claudeRedeemer.log(`[TeamClaude] Manual reset on "${name}": fresh reset read failed (${details.error}); claiming on the reading from ${ago} ago — upstream checks the claim`);
+        details = { ...fallback, error: null };
+      }
       if (details.error) return decline(details.error);
       const grant = details.grants.find(g => g.id === grantId);
       if (!grant) return decline('chosen reset is no longer listed');
