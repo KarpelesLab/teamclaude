@@ -389,6 +389,138 @@ test('a refusal inside a 200 stream on a pinned request stays on the pinned acco
     });
     const body = await res.text();
     assert.deepEqual(seen, ['one'], 'only the pinned account is spent');
-    assert.match(body, /server_is_overloaded/, 'the pinned account\'s refusal is relayed, not hidden by a sibling\'s stream');
+    // The whole stream, not a match on the code: CREATED's instructions carry
+    // the same string as a decoy, so a match would pass with the refusal gone.
+    assert.equal(body, sse(CREATED, OVERLOADED, FAILED), 'the pinned account\'s refusal is relayed intact');
   });
 });
+
+// A stream that reports its own failure is relayed whole but completed
+// nothing, so it is no proof the organization allows OAuth again: the
+// entitlement cooldown stays. Both cases are pinned, so the peek is skipped
+// whatever the fleet size; the fleet of one is the case master already
+// relayed without a hop. The completed stream is the control that the
+// cooldown can still be lifted.
+for (const [names, answer, kept] of [
+  [['one', 'two'], 'refused', true],
+  [['one'], 'refused', true],
+  [['one', 'two'], 'completed', false],
+]) {
+  test(`a pinned stream that ${answer} ${kept ? 'keeps' : 'lifts'} the entitlement cooldown (fleet of ${names.length})`, async () => {
+    const OVERLOADED_ERROR = { type: 'error', error: { type: 'overloaded_error', message: 'Overloaded' } };
+    await withFleet(names, (acct, res) => {
+      sseHead(res);
+      if (acct === 'one' && answer === 'refused') return res.end(sse(OVERLOADED_ERROR));
+      res.end(sse(MESSAGE_START, TEXT_DELTA, MESSAGE_STOP));
+    }, async ({ am, proxyPort, seen }) => {
+      am.markEntitlementDenied(0, { seconds: 600 });
+      const res = await fetch(`http://127.0.0.1:${proxyPort}/tc-acct/${encodeURIComponent('claude:one')}/v1/messages`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'claude-x', messages: [], stream: true }),
+      });
+      assert.equal(res.status, 200);
+      await res.text();
+      await sleep(60);
+      assert.deepEqual(seen, ['one'], 'only the pinned account is spent');
+      if (kept) assert.ok(am.accounts[0].entitlementDeniedUntil > Date.now(), 'a refused stream left the cooldown in place');
+      else assert.equal(am.accounts[0].entitlementDeniedUntil, null, 'a completed stream lifted the cooldown');
+    }, { provider: 'anthropic' });
+  });
+}
+
+// The rule the relay applies, shape by shape: any failure the stream reports
+// (not only the codes worth a hop), wherever it arrives, in either dialect,
+// with or without a code - and for the model denial as for the entitlement
+// one. Each runs pinned, so the stream reaches the relay as sent.
+async function pinnedStream(provider, events, prep, check) {
+  await withFleet(['one', 'two'], (acct, res) => {
+    sseHead(res);
+    res.end(sse(...events));
+  }, async ({ am, proxyPort }) => {
+    prep(am);
+    const codex = provider === 'codex';
+    const path = codex ? '/backend-api/codex/responses' : '/v1/messages';
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/tc-acct/${encodeURIComponent(`${codex ? 'codex' : 'claude'}:one`)}${path}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', [codex ? 'session-id' : 'x-claude-code-session-id']: SID },
+      body: JSON.stringify(codex ? { model: MODEL, input: [], stream: true } : { model: 'claude-x', messages: [], stream: true }),
+    });
+    assert.equal(res.status, 200);
+    await res.text();
+    await sleep(60);
+    check(am);
+  }, { provider: provider === 'codex' ? 'codex' : 'anthropic' });
+}
+const liveCooldown = (am) => am.markEntitlementDenied(0, { seconds: 600 });
+const cooldownKept = (am) => assert.ok(am.accounts[0].entitlementDeniedUntil > Date.now(), 'a refused stream left the cooldown in place');
+// A model denial whose cooldown has run out keeps its record - and with it the
+// next cooldown's length - until a completion forgets it.
+const expiredModelDenial = (am) => { am.markModelDenied(0, MODEL); am.accounts[0].modelDenials.get(MODEL).until = Date.now() - 1; };
+const ANTHROPIC_INVALID = { type: 'error', error: { type: 'invalid_request_error', message: 'bad' } };
+const BARE_ERROR = { type: 'error' };
+
+for (const [what, provider, events] of [
+  ['a refusal after output', 'anthropic', [MESSAGE_START, TEXT_DELTA, { type: 'error', error: { type: 'overloaded_error', message: 'Overloaded' } }]],
+  ['a request-fault error, not worth a hop', 'anthropic', [ANTHROPIC_INVALID]],
+  ['a code-less error event', 'anthropic', [BARE_ERROR]],
+  ['a Responses response.failed with no error event', 'codex', [CREATED, INVALID]],
+]) {
+  test(`${what} keeps the entitlement cooldown`, () => pinnedStream(provider, events, liveCooldown, cooldownKept));
+}
+
+test('a refused stream keeps an expired model denial\'s record', () =>
+  pinnedStream('codex', [CREATED, INVALID], expiredModelDenial, (am) => assert.ok(am.modelDenial(am.accounts[0], MODEL), 'the model denial was forgotten')));
+
+test('a completed stream forgets an expired model denial (control)', () =>
+  pinnedStream('codex', [CREATED, DELTA, COMPLETED], expiredModelDenial, (am) => assert.equal(am.modelDenial(am.accounts[0], MODEL), null)));
+
+// Unpinned, with no sibling to hop to: the refused stream reaches the relay
+// too. A live cooldown keeps such a request off the account, but one that has
+// run out keeps its escalation count, so the next denial is not the shortest.
+// Both kinds of refusal: an overload is also not delivered (below), so only
+// the request fault depends on the failure check alone.
+for (const [what, refusal] of [
+  ['an overload', { type: 'error', error: { type: 'overloaded_error', message: 'Overloaded' } }],
+  ['a request fault', ANTHROPIC_INVALID],
+]) {
+  test(`an unpinned stream refused with ${what} keeps an expired cooldown's escalation count`, async () => {
+    await withFleet(['one'], (acct, res) => {
+      sseHead(res);
+      res.end(sse(refusal));
+    }, async ({ am, proxyPort, seen }) => {
+      am.markEntitlementDenied(0, { seconds: 600 });
+      am.accounts[0].entitlementDeniedUntil = Date.now() - 1;
+      const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'claude-x', messages: [], stream: true }),
+      });
+      await res.text();
+      await sleep(60);
+      assert.deepEqual(seen, ['one']);
+      assert.equal(am.accounts[0].entitlementDenial?.count, 1, 'the refused stream reset the escalation count');
+    }, { provider: 'anthropic' });
+  });
+}
+
+// The session tracker's verdict: a provider-side failure inside a 200 is the
+// 5xx or 429 it would have been as a status - nothing came back - while a
+// request fault is an answer, as a 4xx is. Both dialects: Anthropic reports
+// `overloaded_error`, `api_error` and `rate_limit_error` in-band too.
+const anthropicError = (type) => ({ type: 'error', error: { type, message: type } });
+for (const [what, provider, events, usable] of [
+  ['an in-band overload', 'codex', [CREATED, OVERLOADED, FAILED], false],
+  ['an in-band request fault', 'codex', [CREATED, INVALID], true],
+  ['a completed stream', 'codex', [CREATED, DELTA, COMPLETED], true],
+  ['an Anthropic in-band overload', 'anthropic', [MESSAGE_START, anthropicError('overloaded_error')], false],
+  ['an Anthropic in-band api_error', 'anthropic', [MESSAGE_START, anthropicError('api_error')], false],
+  ['an Anthropic in-band rate_limit_error', 'anthropic', [MESSAGE_START, anthropicError('rate_limit_error')], false],
+  ['an Anthropic in-band request fault', 'anthropic', [MESSAGE_START, anthropicError('invalid_request_error')], true],
+]) {
+  test(`a pinned stream with ${what} ends its session as ${usable ? 'usable' : 'nothing back'}`, () => {
+    const outcomes = [];
+    return pinnedStream(provider, events, (am) => {
+      const end = am.endSession.bind(am);
+      am.endSession = (key, ok) => { outcomes.push(ok); return end(key, ok); };
+    }, () => assert.deepEqual(outcomes, [usable]));
+  });
+}
