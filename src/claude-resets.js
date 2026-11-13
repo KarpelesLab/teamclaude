@@ -14,7 +14,8 @@
 //    try a fresh read, but may use a held, unblocked grant from a reading no
 //    more than 15 minutes old if that read fails. Upstream validates the claim;
 //    a successful fresh read that removes or blocks a grant is authoritative.
-//  - Spending names any usable grant; auto-redeem keeps using `next_grant_id`.
+//  - Spending names any usable grant; auto-redeem picks the cheapest kind that
+//    clears every exhausted limit, then the soonest expiry and `next_grant_id`.
 //    The endpoint is organization-scoped
 //    (POST /api/organizations/<orgUuid>/reset_rate_limits), and the body is
 //    `{ program: "cedar_ember", grant_id, request_id }`.
@@ -130,20 +131,33 @@ export function parseResetStatus(block) {
 }
 
 /** @typedef {NonNullable<ReturnType<typeof parseResetStatus>>} ResetStatus */
+/** @typedef {ResetStatus['grants'][number]} ResetGrant */
 
 /**
- * The grant a claim would spend: only `next_grant_id`, and only while it can be
- * used. Null when there is none.
+ * @param {ResetGrant} grant
+ * @param {number} now
+ */
+function usableGrant(grant, now) {
+  return grant.resetsLeft >= 1 && grant.usableNow && !grant.paused
+    && (grant.endsAt == null || grant.endsAt > now);
+}
+
+/**
+ * The cheapest usable grant that clears every exhausted limit. Keep broader
+ * resets for walls that need them; within a kind, spend the soonest expiry
+ * (no expiry last), then prefer upstream's `next_grant_id`.
  *
  * @param {ResetStatus|null} status
  * @param {number} [now]
  */
-export function claimableGrant(status, now = Date.now()) {
-  if (!status?.eligible || !status.nextGrantId) return null;
-  const g = status.grants.find((/** @type {{ id: string }} */ x) => x.id === status.nextGrantId);
-  if (!g || g.resetsLeft < 1 || !g.usableNow || g.paused) return null;
-  if (g.endsAt != null && g.endsAt <= now) return null;
-  return g;
+export function chooseAutoGrant(status, now = Date.now()) {
+  if (!status?.eligible) return null;
+  const cost = { fable: 0, session: 1, weekly: 2 };
+  return status.grants
+    .filter((/** @type {ResetGrant} */ grant) => usableGrant(grant, now) && status.exhausted.every((/** @type {string} */ limit) => grant.clears.includes(limit)))
+    .sort((/** @type {ResetGrant} */ a, /** @type {ResetGrant} */ b) => cost[claudeGrantKind(a)] - cost[claudeGrantKind(b)]
+      || (a.endsAt ?? Infinity) - (b.endsAt ?? Infinity)
+      || Number(b.id === status.nextGrantId) - Number(a.id === status.nextGrantId))[0] ?? null;
 }
 
 /**
@@ -361,8 +375,8 @@ export class ClaudeResetRedeemer {
       state.cooldownUntil = now + NOTHING_COOLDOWN_MS;
       return { redeemed: false, account: name, reason: `not eligible for resets${status?.ineligibleReason ? ` (${status.ineligibleReason})` : ''}` };
     }
-    const grant = claimableGrant(status, now);
-    if (!grant) {
+    const grant = chooseAutoGrant(status, now);
+    if (!grant && !status.grants.some((/** @type {ResetGrant} */ g) => usableGrant(g, now))) {
       state.cooldownUntil = now + NOTHING_COOLDOWN_MS;
       return { redeemed: false, account: name, reason: 'holds no usable reset' };
     }
@@ -380,10 +394,12 @@ export class ClaudeResetRedeemer {
       }
       // Spent on an account it would not return to service, a reset buys this
       // request nothing — and the grant is gone.
-      const uncovered = status.exhausted.filter((/** @type {string} */ limit) => !grant.clears.includes(limit));
-      if (uncovered.length) {
+      if (!grant) {
+        // No usable grant covers the whole wall. Name the limits none clears,
+        // or the whole wall when separate grants only cover parts of it.
+        const uncovered = status.exhausted.filter((/** @type {string} */ limit) => !status.grants.some((/** @type {ResetGrant} */ g) => usableGrant(g, now) && g.clears.includes(limit)));
         state.cooldownUntil = now + DECLINED_COOLDOWN_MS;
-        return { redeemed: false, account: name, reason: `its reset does not clear ${uncovered.join(', ')}` };
+        return { redeemed: false, account: name, reason: `its reset does not clear ${(uncovered.length ? uncovered : status.exhausted).join(', ')}` };
       }
     }
     // Upstream already says a claim now would answer `cooldown`: save the POST.
@@ -391,7 +407,7 @@ export class ClaudeResetRedeemer {
       state.cooldownUntil = status.cooldownUntil;
       return { redeemed: false, account: name, reason: 'upstream reports a reset cooldown' };
     }
-    return this.redeemGrant(account, grant.id, { deadline });
+    return this.redeemGrant(account, grant.id, { deadline, kind: claudeGrantKind(grant) });
   }
 
   /**
@@ -402,10 +418,10 @@ export class ClaudeResetRedeemer {
    *
    * @param {Record<string, any>} account
    * @param {string} grantId
-   * @param {{ manual?: boolean, deadline?: number }} [opts]
+   * @param {{ manual?: boolean, deadline?: number, kind?: ReturnType<typeof claudeGrantKind> }} [opts]
    * @returns {Promise<ClaudeRedeemResult>}
    */
-  async redeemGrant(account, grantId, { manual = false, deadline = this.now() + this.timeoutMs } = {}) {
+  async redeemGrant(account, grantId, { manual = false, deadline = this.now() + this.timeoutMs, kind } = {}) {
     if (manual && this.inFlight) return { redeemed: false, reason: 'an automatic reset is in progress' };
     const name = safeLine(account.name, 64);
     const state = this._stateFor(account);
@@ -415,7 +431,7 @@ export class ClaudeResetRedeemer {
     const action = manual ? 'Manual Claude reset' : 'Claude reset';
     this.log(manual
       ? `[TeamClaude] Manually redeeming a banked Claude reset on "${name}"`
-      : `[TeamClaude] Redeeming a banked Claude usage-limit reset on "${name}" — no Claude account can serve the request`);
+      : `[TeamClaude] Redeeming a banked Claude ${kind === 'fable' ? 'Fable' : kind ?? 'usage-limit'} reset on "${name}" — no Claude account can serve the request`);
     let r;
     try {
       r = await this.claimFn(account, { grantId, requestId }, { timeoutMs: Math.max(1, deadline - this.now()) });

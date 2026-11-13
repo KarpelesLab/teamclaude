@@ -650,8 +650,13 @@ selected again against the account it cleared.
   grant clears every limit the account is at, since a reset that would leave it
   blocked buys the request nothing. While upstream reports a reset cooldown,
   nothing is claimed.
-- Only the grant upstream names as next (`next_grant_id`). Manual selection
-  can choose another usable grant; the automatic policy does not.
+- Among usable, unpaused, unexpired grants that clear every exhausted limit,
+  it spends the cheapest kind: **Fable**, then **session**, then **weekly**.
+  Within the same kind it spends the soonest-expiring grant (no expiry comes
+  last), then prefers upstream's `next_grant_id` if the expiry also ties. A
+  Fable-only wall therefore spends a Fable reset rather than a weekly reset,
+  even when upstream names the weekly reset as next. No grant is spent when
+  none clears the whole wall. Manual selection still chooses any usable grant.
 - `accounts[].autoRedeemReset: false` exempts an account, as it does for Codex;
   so does being disabled, having no organization id, or last reading zero held
   resets.
