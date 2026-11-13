@@ -146,17 +146,27 @@ export const USAGE_USER_AGENT = 'claude-cli/2.1.288 (external, cli)';
 const DEFAULT_TOKEN_ENDPOINT = 'https://platform.claude.com/v1/oauth/token';
 const DEFAULT_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 
+// The longest wait a Retry-After is taken at. It is upstream's number, and the
+// account holds its refreshes for it (AccountManager.ensureTokenFresh), in
+// memory, past a re-login and a re-enable: unbounded, one `Retry-After:
+// 99999999999` stopped an account's renewals for about 3,169 years, or until a
+// restart, and one past about 8.6 trillion seconds made the hold an invalid
+// Date whose log line threw out of ensureTokenFresh. A far-future HTTP date
+// cannot throw, but held as long. An hour is the cap server.js puts on the
+// longest 429 hold it arms, the one for a quota rejection.
+const RETRY_AFTER_MAX_MS = 60 * 60_000;
+
 /**
  * A Retry-After header in milliseconds: delta-seconds or an HTTP date (RFC 9110
- * §10.2.3). Undefined when absent or unparseable.
+ * §10.2.3), at most RETRY_AFTER_MAX_MS. Undefined when absent or unparseable.
  * @param {string|null|undefined} value
  * @param {number} [now]
  */
 export function parseRetryAfterMs(value, now = Date.now()) {
   if (typeof value !== 'string' || !value.trim()) return undefined;
-  if (/^\d+$/.test(value.trim())) return Number(value.trim()) * 1000;
+  if (/^\d+$/.test(value.trim())) return Math.min(Number(value.trim()) * 1000, RETRY_AFTER_MAX_MS);
   const at = Date.parse(value);
-  return Number.isFinite(at) ? Math.max(0, at - now) : undefined;
+  return Number.isFinite(at) ? Math.min(Math.max(0, at - now), RETRY_AFTER_MAX_MS) : undefined;
 }
 
 const DEFAULT_APPEAL_URL = 'https://claude.ai/restricted';
