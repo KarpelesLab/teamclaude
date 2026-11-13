@@ -584,13 +584,23 @@ export function normalizeSpend(data) {
  */
 export function formatMoney(spend) {
   if (!spend) return 'unknown';
+  // The exponent is upstream's (normalizeSpend keeps any finite number), and
+  // toLocaleString throws a RangeError for fraction digits outside 0-100: one
+  // usage payload with an exponent of -1 threw out of the status line, the TUI
+  // row and the probe's "started spending" log. An amount in no currency's
+  // minor unit is not rendered as one. The bound is resolveMaxSpendMinor's
+  // (model.js), which refuses the same exponents for the money cap; checked
+  // here rather than in normalizeSpend so that it still sees them and sets no
+  // cap rather than a wrong one.
+  const exponent = spend.exponent ?? 2;
+  if (!Number.isInteger(exponent) || exponent < 0 || exponent > 6) return 'unknown';
   const sym = { USD: '$', EUR: '\u20ac', GBP: '\u00a3', JPY: '\u00a5' }[spend.currency] || '';
   const unit = (minor) => {
     if (minor == null) return null;
-    const v = minor / (10 ** (spend.exponent ?? 2));
+    const v = minor / (10 ** exponent);
     const text = v.toLocaleString('en-US', {
-      minimumFractionDigits: spend.exponent ?? 2,
-      maximumFractionDigits: spend.exponent ?? 2,
+      minimumFractionDigits: exponent,
+      maximumFractionDigits: exponent,
     });
     // Suffix the code when there is no symbol for it, so an unfamiliar currency
     // is still identifiable rather than rendering as a bare number.
