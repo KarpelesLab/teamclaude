@@ -128,6 +128,19 @@ function resetHeaderMs(value) {
   return Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : null;
 }
 
+// Whether a tokens or requests `limit` can be stored: a positive finite number.
+// It is the divisor of every standard-quota reading (1 - remaining / limit: the
+// cap, the switch threshold, probe ranking, status, the dashboard, the TUI). A
+// limit of 0 made that NaN or -Infinity, and every comparison against NaN is
+// false, so a tripped cap let go and the account never read as near its quota.
+// A negative one read as over 100% used. A digit string past the largest
+// double parses to Infinity: no double holds that number, and Infinity /
+// Infinity is NaN. quota-summary.js already reads a limit <= 0 as no reading.
+/** @param {unknown} value @returns {value is number} */
+function isPositiveLimit(value) {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0;
+}
+
 // An RFC 3339 reset header, stripped and bounded, or null when it does not
 // name a moment in time.
 function resetTimestamp(value) {
@@ -5348,15 +5361,31 @@ export class AccountManager {
     const requestsRemaining = parseInt(headers['anthropic-ratelimit-requests-remaining'], 10);
     const requestsReset = headers['anthropic-ratelimit-requests-reset'];
 
-    if (!isNaN(tokensLimit)) account.quota.tokensLimit = tokensLimit;
-    if (!isNaN(tokensRemaining)) account.quota.tokensRemaining = tokensRemaining;
-    if (!isNaN(requestsLimit)) account.quota.requestsLimit = requestsLimit;
-    if (!isNaN(requestsRemaining)) account.quota.requestsRemaining = requestsRemaining;
+    // A limit header that is not a positive number (isPositiveLimit), one that
+    // does not parse included, makes the response no reading for that
+    // dimension: neither the limit, nor the remaining, nor the reset sent with
+    // it is stored, so the pair already held stays whole and its own reset
+    // does not move the clock. Read against the limit already held, the new
+    // remaining could lift a cap that had tripped: 900 of 1,000 used, then
+    // "limit 0, remaining 950", read as 5%; and its reset could end the pair
+    // early (a time already past) or keep it, persisted, until the year 9999.
+    // `resetsAt` is shared, so a valid reading of the other dimension in the
+    // same response still sets it, as a response without this dimension's
+    // headers always could. A response with no limit header updates its
+    // remaining and reset as before.
+    const tokensRead = headers['anthropic-ratelimit-tokens-limit'] == null || isPositiveLimit(tokensLimit);
+    const requestsRead = headers['anthropic-ratelimit-requests-limit'] == null || isPositiveLimit(requestsLimit);
+    if (isPositiveLimit(tokensLimit)) account.quota.tokensLimit = tokensLimit;
+    if (tokensRead && !isNaN(tokensRemaining)) account.quota.tokensRemaining = tokensRemaining;
+    if (isPositiveLimit(requestsLimit)) account.quota.requestsLimit = requestsLimit;
+    if (requestsRead && !isNaN(requestsRemaining)) account.quota.requestsRemaining = requestsRemaining;
 
     // Kept as the RFC 3339 string upstream sent (status renders it), but only
     // one that parses: _clearExpiredQuotas compares `new Date(resetsAt)`, and an
     // unparseable value would never compare true and never clear.
-    const resetsAt = resetTimestamp(tokensReset) ?? resetTimestamp(requestsReset);
+    // A refused dimension's reset is skipped too (see tokensRead above).
+    const resetsAt = (tokensRead ? resetTimestamp(tokensReset) : null)
+      ?? (requestsRead ? resetTimestamp(requestsReset) : null);
     if (resetsAt != null) account.quota.resetsAt = resetsAt;
 
     this._observeBurnRate(account, observed);
@@ -6383,6 +6412,19 @@ export class AccountManager {
       if (!match || !match.quota) continue;
       for (const f of PERSISTED_QUOTA_FIELDS) {
         if (match.quota[f] != null) account.quota[f] = match.quota[f];
+      }
+      // A state file written before updateQuota refused a limit that is not a
+      // positive number can still hold one, and restoring it would hand the
+      // NaN back to every reader. Such a pair was one refused reading, so it
+      // is dropped whole, as updateQuota now drops one; the shared resetsAt
+      // saved beside it is kept.
+      if (account.quota.tokensLimit != null && !isPositiveLimit(account.quota.tokensLimit)) {
+        account.quota.tokensLimit = null;
+        account.quota.tokensRemaining = null;
+      }
+      if (account.quota.requestsLimit != null && !isPositiveLimit(account.quota.requestsLimit)) {
+        account.quota.requestsLimit = null;
+        account.quota.requestsRemaining = null;
       }
       for (const field of ['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro', 'subscriptionLost']) {
         if (match.profile?.[field] != null) account[field] = match.profile[field];
