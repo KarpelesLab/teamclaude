@@ -195,6 +195,28 @@ function claimDiskRows(configAccounts, diskAccounts, removedIds) {
   return rowFor;
 }
 
+/** Adopt repaired disk IDs without losing the old config-to-manager pairing.
+ * @param {any[]} configAccounts @param {any[]} managerAccounts
+ * @param {any[]} diskAccounts @param {Set<string>} [removedIds]
+ * @returns {number[]} manager indexes whose automatic pins must be released
+ */
+export function reconcileAccountIds(configAccounts, managerAccounts, diskAccounts, removedIds = new Set()) {
+  const claims = claimDiskRows(configAccounts, diskAccounts || [], removedIds);
+  const managers = configAccounts.map(a => managerAccountFor(managerAccounts, a));
+  const changed = [];
+  for (const [i, d] of claims) {
+    const id = diskAccounts[d]?.id;
+    if (typeof id !== 'string' || !id || configAccounts[i].id === id) continue;
+    configAccounts[i].id = id;
+    const manager = managers[i];
+    if (manager && manager.id !== id) {
+      manager.id = id;
+      changed.push(managerAccounts.indexOf(manager));
+    }
+  }
+  return changed;
+}
+
 /**
  * The account list to write to disk: in-memory config entries carrying live
  * credentials from the account each was built into, merged over the on-disk

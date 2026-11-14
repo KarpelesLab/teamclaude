@@ -146,7 +146,7 @@ for (const mode of ['raw', 'filtered', 'save', 'atomic']) {
       let config = { proxy: { apiKey: 'test-key' }, upstreamProxy: false, autoUpdate: false,
         persistSessionAffinity: true, accounts: mode === 'filtered' ? [original, copy, accounts[0]] : [copy, original, accounts[0]] };
       const saved = seeded();
-      saved.affinity.sessions[0].threads.push('msg_original');
+      Object.assign(saved.affinity.sessions[0], { sessionId: 'client', conversation: 'opening', threads: ['msg_original'] });
       saved.affinity.sessions.push({ ...saved.affinity.sessions[0], key: 'stable', threads: [],
         pins: [{ ...saved.affinity.sessions[0].pins[0], account: { id: 'a', provider: 'anthropic' } }] });
       await writeFile(statePath(dir), JSON.stringify(saved));
@@ -173,6 +173,69 @@ for (const mode of ['raw', 'filtered', 'save', 'atomic']) {
       assert.equal(restored.find(s => s.key === 'stable').pins[0].account.id, 'a');
     } finally {
       await srv?.stop();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+// Exercise the three live consumers through the real CLI before any restart.
+for (const mode of ['reload', 'token', 'account']) {
+  test(`live ID repair during ${mode} preserves pairing and fresh affinity`, async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'tc-affinity-live-'));
+    let srv;
+    const upstream = http.createServer((req, res) => { req.resume(); res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ key: req.headers.authorization || req.headers['x-api-key'] })); });
+    try {
+      await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
+      const original = { id: 'b', name: 'original', type: 'oauth', accessToken: 'synthetic-original', refreshToken: 'synthetic-refresh', expiresAt: Date.now() + 3_600_000 };
+      const config = { proxy: { apiKey: 'test-key', mcp: 'full' }, upstreamProxy: false, autoUpdate: false, persistSessionAffinity: true,
+        upstream: `http://127.0.0.1:${upstream.address().port}`, distributeSessions: true,
+        accounts: [{ id: 'empty', name: 'tokenless', type: 'oauth' }, accounts[0], original] };
+      const saved = seeded();
+      Object.assign(saved.affinity.sessions[0], { sessionId: 'client', conversation: 'opening', threads: ['msg_original'] });
+      saved.affinity.sessions.push({ ...saved.affinity.sessions[0], key: 'stable', pins: [{ bucket: 'unified7d', account: { id: 'a', provider: 'anthropic' }, at: saved.affinity.sessions[0].lastSeen }], threads: [] });
+      await writeFile(statePath(dir), JSON.stringify(saved));
+      // Only synthetic input is injected; index.js owns the actual token-save callback.
+      const preload = join(dir, 'refresh.mjs');
+      await writeFile(preload, `import { AccountManager } from ${JSON.stringify(new URL('../src/account-manager.js', import.meta.url).href)};
+import fs from 'node:fs/promises'; import { syncBuiltinESMExports } from 'node:module';
+const rename = fs.rename; fs.rename = async (...args) => { await rename(...args); if (args[1] === process.env.TEAMROUTER_CONFIG) console.log('fixture-token-written'); }; syncBuiltinESMExports();
+const onRefresh = AccountManager.prototype.onTokenRefresh;
+AccountManager.prototype.onTokenRefresh = function(cb) { onRefresh.call(this, cb); process.on('SIGUSR2', () => this.updateAccountTokens(this.accounts.findIndex(a => a.name === 'original'), { accessToken: 'synthetic-fresh', refreshToken: 'synthetic-fresh-refresh', expiresAt: Date.now() + 7_200_000 })); };`);
+      srv = await spawnServer({ dir, env: { ...envFor(dir), NODE_OPTIONS: `--import=${preload}` }, config: () => config });
+      const disk = JSON.parse(await readFile(srv.configPath, 'utf8'));
+      disk.accounts.unshift({ ...original, name: 'copy', accessToken: 'synthetic-copy' });
+      await writeFile(srv.configPath, JSON.stringify(disk));
+      if (mode === 'token') {
+        const written = new Promise(resolve => srv.child.stdout.on('data', chunk => { if (chunk.includes('fixture-token-written')) resolve(); }));
+        srv.child.kill('SIGUSR2');
+        await written;
+      } else {
+        const res = await fetch(`http://127.0.0.1:${srv.port}/teamclaude/${mode === 'reload' ? 'reload' : 'mcp'}`, {
+          method: 'POST', headers: { 'x-api-key': 'test-key', 'content-type': 'application/json' },
+          ...(mode === 'account' ? { body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'set_account_priority', arguments: { account: 'original', priority: 0 } } }) } : {}),
+        });
+        assert.equal(res.status, 200);
+        assert.notEqual((await res.json()).result?.isError, true);
+      }
+      const repaired = JSON.parse(await readFile(srv.configPath, 'utf8')).accounts;
+      assert.ok(repaired.every(a => a.id !== 'b'), 'live save must not reintroduce a retired ID');
+      const owner = repaired.find(a => a.name === 'original');
+      assert.equal(owner.accessToken, mode === 'token' ? 'synthetic-fresh' : 'synthetic-original');
+      assert.equal(repaired.find(a => a.name === 'copy').accessToken, 'synthetic-copy');
+      assert.equal(repaired.find(a => a.id === 'empty').accessToken, undefined);
+      const expected = mode === 'token' ? 'Bearer synthetic-fresh' : 'Bearer synthetic-original';
+      assert.equal((await post(srv.port, 'fresh-after-repair', '/tc-acct/original/v1/messages')).key, expected);
+      await srv.stop();
+      const final = JSON.parse(await readFile(statePath(dir), 'utf8')).affinity.sessions;
+      assert.deepEqual(final.find(s => s.key === 'seed').pins, []);
+      assert.deepEqual(final.find(s => s.key === 'seed').threads, ['msg_original']);
+      assert.equal(final.find(s => s.key === 'stable').pins[0].account.id, 'a');
+      srv = await spawnServer({ dir, env: envFor(dir), config: () => ({ ...config, accounts: repaired }) });
+      assert.equal((await post(srv.port, 'fresh-after-repair')).key, expected);
+    } finally {
+      await srv?.stop();
+      upstream.closeAllConnections();
+      await new Promise(resolve => upstream.close(resolve));
       await rm(dir, { recursive: true, force: true });
     }
   });

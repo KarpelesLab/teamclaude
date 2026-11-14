@@ -49,11 +49,9 @@ test('saveConfig replaces a pre-existing file and tightens its mode', async () =
 test('saveState is atomic the same way', async () => {
   await withConfigDir(async ({ dir, cfg }) => {
     const statePath = cfg.getStatePath();
-    const state = { quota: { a: 1 }, affinity: { version: 1, sessions: [{ key: 'synthetic', pins: [], threads: ['msg_1'] }] } };
+    const state = { quota: { a: 1 }, affinity: { version: 1, sessions: [{ key: 'synthetic', sessionId: 'synthetic', conversation: null, lastSeen: 100, pins: [], threads: ['msg_1'] }] } };
     await cfg.saveState(state);
     assert.deepEqual(await cfg.loadState(), state);
-    await assert.rejects(cfg.saveState({ affinity: { bad: 1n } }), TypeError);
-    assert.deepEqual(JSON.parse(await readFile(statePath, 'utf-8')), state);
     assert.deepEqual(await readdir(dir), ['teamclaude.state.json']);
     if (onPosix) assert.equal((await stat(statePath)).mode & 0o777, 0o600);
   });

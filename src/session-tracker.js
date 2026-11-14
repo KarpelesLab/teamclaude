@@ -164,12 +164,12 @@ function setAndReturn(map, key, value) {
 const boundedString = (value, limit) => typeof value === 'string' && value.length > 0 && value.length <= limit;
 /** @param {unknown} value @param {number} now @returns {value is number} */
 const affinityTime = (value, now) => typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= now;
-/** @param {any} row @param {number} now @param {number} ttl @returns {row is AffinitySession} */
-function affinityRow(row, now, ttl) {
+/** @param {any} row @returns {row is AffinitySession} */
+function affinityRow(row) {
   return row != null && boundedString(row.key, MAX_KEY_LENGTH)
     && (row.sessionId === null || boundedString(row.sessionId, MAX_SESSION_ID_LENGTH))
     && (row.conversation === null || boundedString(row.conversation, 22))
-    && affinityTime(row.lastSeen, now) && now - row.lastSeen <= ttl
+    && affinityTime(row.lastSeen, Infinity)
     && Array.isArray(row.pins) && Array.isArray(row.threads);
 }
 /** @param {any} ref @returns {ref is AffinityAccount} */
@@ -210,6 +210,7 @@ export class SessionTracker {
     /** @type {AffinitySession[]} */
     const sessions = [];
     for (const [key, s] of this.sessions) {
+      if (this._isExpired(s, now)) continue;
       const pins = [];
       for (const [bucket, pin] of s.pins) {
         const account = identifyAccount(pin.idx);
@@ -218,8 +219,8 @@ export class SessionTracker {
         }
       }
       const threads = [...s.threads];
-      const row = { key, sessionId: s.sessionId, conversation: s.conversation, lastSeen: s.lastSeen, pins, threads };
-      if ((pins.length || threads.length) && affinityRow(row, now, this.knownTtlMs)) sessions.push(row);
+      const row = { key, sessionId: s.sessionId, conversation: s.conversation, lastSeen: s.inFlight > 0 ? Math.max(s.lastSeen, now) : s.lastSeen, pins, threads };
+      if ((pins.length || threads.length) && affinityRow(row)) sessions.push(row);
     }
     sessions.sort((a, b) => b.lastSeen - a.lastSeen);
     return { version: 1, sessions: sessions.slice(0, MAX_SESSIONS) };
@@ -230,7 +231,7 @@ export class SessionTracker {
   /** @param {any} snapshot @param {(account: AffinityAccount) => number|null} resolveAccount @param {number} [now] */
   restoreAffinity(snapshot, resolveAccount, now = this._now()) {
     if (snapshot?.version !== 1 || !Array.isArray(snapshot.sessions)) return;
-    const rows = snapshot.sessions.filter((/** @type {any} */ row) => affinityRow(row, now, this.knownTtlMs));
+    const rows = snapshot.sessions.filter((/** @type {any} */ row) => affinityRow(row) && !this._isExpired({ lastSeen: row.lastSeen, inFlight: 0 }, now));
     rows.sort((/** @type {AffinitySession} */ a, /** @type {AffinitySession} */ b) => b.lastSeen - a.lastSeen);
     for (const row of rows) {
       if (this.sessions.size >= MAX_SESSIONS) break;

@@ -1,7 +1,7 @@
 import { importCredentials } from './oauth.js';
 import { sameIdentity } from './identity.js';
 import { safeLine } from './safe-text.js';
-import { removedAccountIds, addedAccountIds, configIndexFor } from './account-pairing.js';
+import { removedAccountIds, addedAccountIds, configIndexFor, reconcileAccountIds } from './account-pairing.js';
 import { ensureAccountIds } from './account-id.js';
 import { accountSwitchThreshold, accountAllowsExtraUsage, accountRouting } from './account-manager.js';
 import { localListener } from './upstream-proxy.js';
@@ -17,6 +17,11 @@ import { accountCredit } from './api-credit.js';
  * @param {import('./account-manager.js').AccountManager} accountManager
  */
 export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
+  if (memConfig.persistSessionAffinity === true) {
+    for (const idx of reconcileAccountIds(memConfig.accounts, accountManager.accounts, diskConfig.accounts, removedAccountIds(memConfig))) {
+      accountManager.sessionTracker.releaseAccount(idx);
+    }
+  }
   let added = 0;
   // Greedy 1:1 pairing of disk entries to in-memory accounts, account+org aware.
   // Each disk entry claims at most one unclaimed manager account, so multiple

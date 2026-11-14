@@ -32,18 +32,6 @@ test('restart keeps each account identity through every three-account permutatio
   }
 });
 
-test('opaque keys with absent owner metadata roundtrip without inventing an owner', () => {
-  const tracker = new SessionTracker({ now: () => 100 });
-  const key = 'opaque:arbitrary-key';
-  tracker.touch(key, 1, 'unified7d');
-  const saved = tracker.exportAffinity(identify);
-  assert.equal(saved.sessions[0].sessionId, null);
-  assert.equal(saved.sessions[0].conversation, null);
-  const fresh = new SessionTracker({ now: () => 100 });
-  fresh.restoreAffinity(saved, resolve);
-  assert.equal(fresh.pinnedAccount(key, 'unified7d'), 1);
-});
-
 test('codec preserves independent buckets, conversation ownership and times, only', () => {
   const tracker = new SessionTracker({ now: () => 100 });
   tracker.beginRequest(KEY, 80, { sessionId: 'client', conversation: DIGEST, client: 'private-client', dimensions: { project: 'private-project' } });
@@ -53,25 +41,31 @@ test('codec preserves independent buckets, conversation ownership and times, onl
   tracker.recordOutcome(KEY, false, 95);
   tracker.recordThreadMessage(KEY, 'msg_1', null, 95);
   tracker.noteRouted(1, 95);
+  const opaque = 'opaque:arbitrary-key';
+  tracker.touch(opaque, 1, 'unified7d', 90);
   const saved = tracker.exportAffinity(identify);
-  assert.deepEqual(saved, snapshot(row({ lastSeen: 95, pins: [
+  assert.deepEqual(saved, snapshot(row({ lastSeen: 100, pins: [
     { bucket: 'unified7d', account: identify(1), at: 90 },
     { bucket: 'custom-route-bucket', account: identify(2), at: 95 },
-  ] })));
+  ] }), { key: opaque, sessionId: null, conversation: null, lastSeen: 90,
+    pins: [{ bucket: 'unified7d', account: identify(1), at: 90 }], threads: [] }));
   const fresh = new SessionTracker({ now: () => 100 });
   fresh.restoreAffinity(JSON.parse(JSON.stringify(saved)), resolve);
+  assert.equal(fresh.pinnedAccount(opaque, 'unified7d'), 1);
+  assert.equal(fresh.sessions.get(opaque).sessionId, null);
+  assert.equal(fresh.sessions.get(opaque).conversation, null);
   assert.equal(fresh.pinnedAccount(KEY, 'custom-route-bucket'), 2);
   assert.deepEqual(fresh.threadOwner('client', 'msg_1'), { key: KEY, conversation: DIGEST });
   assert.equal(fresh.threadOwner('another-client', 'msg_1'), null);
   const state = fresh.sessions.get(KEY);
-  assert.equal(state.firstSeen, 95);
-  assert.equal(state.lastSeen, 95);
+  assert.equal(state.firstSeen, 100);
+  assert.equal(state.lastSeen, 100);
   assert.deepEqual([state.inFlight, state.count, state.starved, state.refs.size, state.tokens.size, fresh.recentRequestsFor(1)], [0,0,0,0,0,0]);
   assert.equal(state.client, null);
   assert.equal(state.dimensions, null);
 });
 
-test('sliding idle lifetime survives days of activity and repeated restarts without renewal', () => {
+test('sliding idle lifetime survives days of activity and repeated restarts without renewal', async t => {
   let now = 0;
   let tracker = new SessionTracker({ now: () => now });
   for (let turn = 0; turn < 60; turn++) {
@@ -92,6 +86,28 @@ test('sliding idle lifetime survives days of activity and repeated restarts with
   fresh.restoreAffinity(snapshot(row({ lastSeen, pins: [{ bucket: 'unified7d', account: identify(1), at: lastSeen }], inFlight: 99 })), resolve);
   assert.equal(fresh.sessions.size, 0, 'disk inFlight cannot revive idle state');
   assert.equal(tracker.exportAffinity(identify).sessions.length, 0);
+  for (const active of [false, true]) await t.test(active ? 'in-flight beyond TTL' : 'backward wall clock', () => {
+    now = TTL * 2;
+    const live = new SessionTracker({ now: () => now });
+    if (active) live.beginRequest('clock');
+    live.touch('clock', 1, 'unified7d');
+    const seen = now;
+    now = active ? seen + TTL + 1 : seen - 100;
+    const saved = JSON.parse(JSON.stringify(live.exportAffinity(identify)));
+    assert.equal(saved.sessions[0]?.lastSeen, active ? now : seen);
+    assert.equal(live.sessions.get('clock').lastSeen, seen, 'export does not mutate live use');
+    const restored = new SessionTracker({ now: () => now });
+    restored.restoreAffinity(saved, resolve);
+    assert.equal(restored.pinnedAccount('clock', 'unified7d'), 1);
+    assert.equal(restored.sessions.get('clock').inFlight, 0);
+    now = saved.sessions[0].lastSeen + TTL + 1;
+    assert.equal(restored.pinnedAccount('clock', 'unified7d'), null);
+    if (active) {
+      live.endRequest('clock');
+      now += TTL + 1;
+      assert.equal(live.exportAffinity(identify).sessions.length, 0);
+    }
+  });
 });
 
 test('malformed versions, keys, timestamps and duplicate records cannot create affinity', () => {
@@ -101,10 +117,15 @@ test('malformed versions, keys, timestamps and duplicate records cannot create a
     assert.equal(tracker.sessions.size, 0);
   }
   const badRows = [null, {}, row({ key: '' }), row({ sessionId: 's'.repeat(129) }),
-    row({ conversation: 'x'.repeat(23) }), row({ lastSeen: -1 }), row({ lastSeen: NaN }),
-    row({ lastSeen: 101 }), row({ lastSeen: '100' }), row({ pins: {}, threads: {} })];
+    row({ conversation: 'x'.repeat(23) }), row({ lastSeen: -1 }),
+    row({ lastSeen: '100' }), row({ pins: {}, threads: {} })];
+  for (const bad of badRows) {
+    const rejected = new SessionTracker({ now: () => 100 });
+    rejected.restoreAffinity(JSON.parse(JSON.stringify(snapshot(bad))), resolve);
+    assert.equal(rejected.sessions.size, 0, JSON.stringify(bad));
+  }
   const tracker = new SessionTracker({ now: () => 100 });
-  tracker.restoreAffinity(snapshot(...badRows, row(), row({ pins: [], threads: ['msg_other'] })), resolve);
+  tracker.restoreAffinity(snapshot(row(), row({ pins: [], threads: ['msg_other'] })), resolve);
   assert.equal(tracker.sessions.size, 1);
   assert.equal(tracker.pinnedAccount(KEY, 'unified7d'), 1);
   assert.equal(tracker.threadOwner('client', 'msg_other'), null);

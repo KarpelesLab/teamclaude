@@ -29,7 +29,7 @@ import { loginCodex, startCodexLogin } from './codex-auth.js';
 import { isRemoteSession, openBrowser, PANEL_LOGIN_TIMEOUT_MS } from './login-flow.js';
 import { providerOf, canServeProvider } from './provider.js';
 import { syncAccountsFromDisk } from './sync-accounts.js';
-import { mergeAccountsForSave, syncRefreshedTokens, removedAccountIds, clearRemovedAccountIds, clearAddedAccountIds, markAccountRemoved, configIndexFor } from './account-pairing.js';
+import { mergeAccountsForSave, syncRefreshedTokens, removedAccountIds, clearRemovedAccountIds, clearAddedAccountIds, markAccountRemoved, configIndexFor, reconcileAccountIds } from './account-pairing.js';
 import { ensureAccountIds, accountIdsComplete } from './account-id.js';
 import * as alias from './alias.js';
 import { ensureCerts, mitmHosts, caCertPath } from './mitm.js';
@@ -507,6 +507,14 @@ async function serverCommand() {
   // An account in error looks in the store for a token another install holds.
   accountManager.onAccountError((account) => { credentialSync.onAccountError(account).catch(() => {}); });
 
+  // Disk ID repair can be observed by a save before the next reload.
+  const reconcileIds = (/** @type {Record<string, any>} */ diskConfig) => {
+    if (!persistSessionAffinity) return;
+    for (const idx of reconcileAccountIds(config.accounts, accountManager.accounts, diskConfig.accounts, removedAccountIds(config))) {
+      accountManager.sessionTracker.releaseAccount(idx);
+    }
+  };
+
   // Persist refreshed tokens back to config (re-read from disk to avoid clobbering
   // accounts added externally, e.g. by `teamclaude import` while server is running)
   accountManager.onTokenRefresh((idx, newTokens) => {
@@ -518,6 +526,8 @@ async function serverCommand() {
     // resolves its own row through findConfigAccount rather than this pairing.
     syncRefreshedTokens(config.accounts, accountManager.accounts, idx, newTokens);
     atomicConfigUpdate(diskConfig => {
+      reconcileIds(diskConfig);
+      syncRefreshedTokens(config.accounts, accountManager.accounts, idx, newTokens);
       // Pick up any new accounts from disk so the running fleet serves them
       // (only add, don't refresh credentials — we're about to write the authoritative tokens)
       const removed = removedAccountIds(config);
@@ -747,6 +757,7 @@ async function serverCommand() {
   // too would pin this server's resolved defaults into a file that never
   // spelled them out.
   const mergeAccountsOnto = (/** @type {Record<string, any>} */ diskConfig) => {
+    reconcileIds(diskConfig);
     diskConfig.accounts = mergeAccountsForSave(
       config.accounts, accountManager.accounts, diskConfig.accounts, removedAccountIds(config),
     );

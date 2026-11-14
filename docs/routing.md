@@ -260,6 +260,9 @@ entry IDs keep their identity. Current model, provider, route, quota and hard-pi
 checks still govern every request. Thread ownership can survive a dropped pin,
 but does not make another account capable of continuing the upstream thread.
 
+While a request is in flight, a snapshot observes its current use without storing request counters or resuming the stream. Idle timestamps remain unchanged across saves and restarts; expiry follows the tracker’s existing wall clock behavior, including backward clock adjustments.
+When duplicate IDs are repaired during a live reload or account/token save, matched running entries adopt the repaired IDs and release their old automatic pins. Thread ownership and unrelated pins remain available.
+
 State is saved on the existing minute tick and on graceful shutdown, including
 once more after an enabled drain completes. Abrupt termination can lose up to a
 minute of routing updates. Missing, corrupt or unrecognized affinity snapshots
