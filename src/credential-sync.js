@@ -53,8 +53,11 @@
 // later, then at each pass, until it lands; a sign-out in between does not end
 // it (made while signed out, a removal records nothing at all). Until then it
 // also wins over a sign-in made on another install meanwhile. A pass deletes a
-// tombstone older than a week, by which time every install that was going to
-// see it has.
+// tombstone older than a week. Nothing checks that every install has seen it by
+// then: one that ran no pass in that week and still holds the account, with a
+// refresh token that still renews, stores it again (at its first pass after
+// signing back in to callback.net if it renewed the token while signed out, at
+// its next renewal if it was switched off), and the others add it back.
 //
 // An account IN ERROR (upstream rejected its token; it needs a re-login) is
 // never written to the store: what it holds is dead, and stored it would
@@ -116,7 +119,7 @@ const MAX_LOCK_ROUNDS = 3;
 export const SYNC_INTERVAL_MS = 24 * 3600 * 1000;
 const PAGE_SIZE = 100;
 const MAX_PAGES = 50;
-/** A tombstone this old has been seen by every install that still runs, and goes. */
+/** A tombstone this old is deleted; an install that ran no pass in that time never saw it. */
 export const TOMBSTONE_TTL_MS = 7 * 24 * 3600 * 1000;
 
 /**
