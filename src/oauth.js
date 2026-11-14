@@ -192,12 +192,17 @@ export function oauthErrorSummary(text) {
 
 /**
  * Refresh an expired OAuth access token using the refresh token.
- * Retries on 5xx and network errors with exponential backoff.
+ * Retries a 5xx and a network failure, with exponential backoff: on the direct
+ * path any `fetch failed`, through a routing or upstream proxy only a timeout
+ * or a reset or refused connection (the codes in the catch below).
  * `routing` is the account's own egress proxy (account-routing.js); null goes
  * by the fleet path (upstream proxy when configured, direct otherwise).
  * `budgetMs` bounds the whole call, retries included: no attempt goes out once
  * it is spent, and none outlives it — the time a lock held for this renewal
- * has left (credential-sync.js).
+ * has left (credential-sync.js). A backoff pause can still end the call up to
+ * 1s past it, which credential-sync's STORE_RESERVE_MS absorbs. Without a
+ * budget, each attempt has the REFRESH_TIMEOUT_MS bound of its own, so three
+ * timed-out attempts and their backoff take about 91.5s at the default.
  * @param {string} refreshToken
  * @param {string} [endpoint]
  * @param {import('./account-routing.js').RoutingProxy|null} [routing]

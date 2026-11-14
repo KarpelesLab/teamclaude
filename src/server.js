@@ -432,7 +432,11 @@ export function reloadedHeaderFlags(diskConfig) {
 }
 
 // Constant-time proxy-API-key comparison (both the HTTP gate and the CONNECT
-// gate use it). Returns false on any type/length mismatch without leaking timing.
+// gate use it). Returns false on any type or length mismatch. Two keys of equal
+// length are compared in constant time; a length mismatch returns at once, so
+// the timing can reveal a key's length, never its content. A generated key
+// (`tc-` and 32 characters, config.js) has a fixed, published length anyway;
+// a key written by hand (an apiKey set by hand, a clientKeys entry) does not.
 export function safeKeyEqual(a, b) {
   if (typeof a !== 'string' || typeof b !== 'string') return false;
   const ba = Buffer.from(a);
@@ -1486,8 +1490,9 @@ export function isLocalHostHeader(host, bindHost = null) {
   return bound != null && !WILDCARD_BINDS.has(bound) && bound === name;
 }
 
-// Read a control-endpoint body as text. Capped, unlike the proxied request path:
-// these endpoints carry a couple of fields, so anything larger is a mistake or an
+// Read a control-endpoint body as text. Capped far below the proxied request
+// path (64 KiB here; 64 MiB there by default, see resolveMaxBodyBytes): these
+// endpoints carry a couple of fields, so anything larger is a mistake or an
 // attack and buffering it whole would be the wrong answer either way.
 async function readControlBody(req, limit = 64 * 1024) {
   const chunks = [];
@@ -4620,28 +4625,16 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       return;
     }
 
-    // A 401 means the credential we injected was rejected. For an OAuth account
-    // that usually means the access token was revoked BEFORE its clock expiry —
-    // something else refreshed the same token family, so upstream reports it
-    // revoked while it still looks fresh locally. ensureTokenFresh's expiry
-    // check cannot see that (it only compares the clock), so the account would
-    // otherwise keep serving a dead token until the token aged out, and every
-    // request in between would surface a 401 to the client with no recovery.
-    // Force one refresh and retry. If the refresh is itself rejected the refresh
-    // token is dead too: ensureTokenFresh marks the account errored, and the
-    // retry's status check rotates to another account. Bounded to one re-auth
-    // per account per request, so a genuinely dead credential surfaces the 401
-    // instead of looping.
     // Upstream 5xx — 529 "Overloaded" above all (#156). This is the provider
-    // saying it cannot serve right now, not anything about this account'"'"'s quota,
+    // saying it cannot serve right now, not anything about this account's quota,
     // so surfacing it to the client turns a provider-side transient into a
-    // client-visible failure — and Claude Code'"'"'s own retry loop then re-piles the
+    // client-visible failure — and Claude Code's own retry loop then re-piles the
     // same load onto the same account.
     //
     // One hop, on the same budget and for the same reason as the 429 path above:
     // if a second account is overloaded too, it is the provider that is
     // overloaded, not the account, and walking the fleet would just spend every
-    // account'"'"'s cache discovering that. After the hop the response goes to the
+    // account's cache discovering that. After the hop the response goes to the
     // client as it does today, with its own retry-after intact.
     if (upstreamRes.status >= 500 && !res.headersSent && !ctx.serverErrorHopped && retryCount < maxRetries) {
       // Same exclusion as the 429 hop, and the same cursor-preserving pick.
@@ -4759,6 +4752,18 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
 
+    // A 401 means the credential we injected was rejected. For an OAuth account
+    // that usually means the access token was revoked BEFORE its clock expiry —
+    // something else refreshed the same token family, so upstream reports it
+    // revoked while it still looks fresh locally. ensureTokenFresh's expiry
+    // check cannot see that (it only compares the clock), so the account would
+    // otherwise keep its dead token until the token aged out, and every request
+    // in between would only fail over (the branch below), never repairing it.
+    // Force one refresh and retry. If the refresh is itself rejected the refresh
+    // token is dead too: ensureTokenFresh marks the account errored, and the
+    // retry's status check rotates to another account. Bounded to one re-auth
+    // per account per request, so a genuinely dead credential does not loop: a
+    // 401 that comes back goes to the branch below.
     if (upstreamRes.status === 401 && account.type === 'oauth' && account.refreshToken
         && retryCount < maxRetries && !ctx.reauthed.has(account.index)) {
       ctx.reauthed.add(account.index);
@@ -5708,9 +5713,9 @@ const UNTIMED_RETRY_AFTER_SECONDS = 60;
  * account spent for three days beside a healthy one that just dropped a
  * connection told the client to come back in three days, where it used to say a
  * minute. Only accounts that will not come back on their own are left out: the
- * disabled, and those in an error state waiting on a re-login. (An entitlement
- * quarantine always has a clock, so it answers with that.) With nobody left to
- * ask, the answer is still 60s.
+ * disabled, the cordoned, and those in an error state waiting on a re-login.
+ * (An entitlement quarantine always has a clock, so it answers with that.) With
+ * nobody left to ask, the answer is still 60s.
  *
  * Deliberately uncapped: the truthful value is the whole point, and a ceiling
  * would rebuild the silent loop at whatever interval the ceiling was. Nothing
