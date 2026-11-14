@@ -127,7 +127,7 @@ TeamClaude does not strip or rewrite thinking blocks, so nothing is lost for goo
 
 When you run many agents at once and the active account runs out, every in-flight request fails over to the next account **at the same instant** — a thundering herd that can spend a big chunk of the fresh account's quota (large contexts) and instantly throttle it, cascading down the fleet ([#84](https://github.com/KarpelesLab/teamclaude/issues/84)).
 
-To prevent this, requests onto a **just-switched-to account** are paced: concurrency starts at 1 and the cap ramps up over a few seconds, then lifts. The first request or two reveal whether the new account is also near-exhausted **before** the whole herd commits to it, so a cascade is broken up hop by hop. The gate is **fail-open** — a request never blocks longer than the ramp window, and a client that disconnects while waiting just drops out — and the slot is held only until response headers arrive, so streaming replies don't tie up concurrency.
+To prevent this, requests onto a **just-switched-to account** are paced: concurrency starts at 1 and the cap ramps up step by step, then lifts once the ramp window (`windowMs`, 30 seconds by default) has passed. The first request or two reveal whether the new account is also near-exhausted **before** the whole herd commits to it, so a cascade is broken up hop by hop. The gate is **fail-open**: a request waits at most the ramp window, except on an account in a rate-limit pause, where it first waits out the pause and the window starts when the pause ends. A client that disconnects while waiting just drops out, and the slot is held only until response headers arrive, so streaming replies don't tie up concurrency. A 429 that pauses the account (see [the two kinds of 429](#the-two-kinds-of-429)) does so for at most `TEAMCLAUDE_RATE_LIMIT_ABSORB_MAX_SECONDS` (60 by default), and a further one extends the pause and restarts the ramp.
 
 On by default. Tune or disable via `stormRamp` in the config:
 
@@ -140,7 +140,7 @@ On by default. Tune or disable via `stormRamp` in the config:
 - **`windowMs`** — after this long, pacing stops entirely (default 30s).
 - **`enabled: false`** — turn storm control off (send the full burst immediately, pre-#84 behavior).
 
-The same gate handles rate-limit 429s: TeamClaude pauses the account for the `retry-after` window so new queries wait instead of piling on, then releases the held queries through a fresh ramp (staggered, not all at once).
+The same gate handles rate-limit 429s: TeamClaude pauses the account for the `retry-after` window, at most `TEAMCLAUDE_RATE_LIMIT_ABSORB_MAX_SECONDS` (60 by default), so new queries wait instead of piling on, then releases the held queries through a fresh ramp (staggered, not all at once).
 
 ## Model-aware routing
 
