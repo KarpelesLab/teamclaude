@@ -1,17 +1,19 @@
 import { test } from 'node:test';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { on } from 'node:events';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnServer } from '../test-helpers/spawn-server.js';
+import { affinityAccounts } from '../test-helpers/affinity-fixtures.js';
 import { createDefaultConfig } from '../src/config.js';
 
 // Real startup/shutdown, explicit synthetic configuration and native-agent homes.
 const envFor = dir => ({ HOME: dir, XDG_CONFIG_HOME: dir, CODEX_HOME: undefined, CLAUDE_CONFIG_DIR: undefined, PI_CODING_AGENT_DIR: undefined, OMP_CONFIG_DIR: undefined, TEAMROUTER_CONFIG: join(dir, 'config.json'), TEAMCLAUDE_DISABLE_AUTOUPDATE: '1' });
-const accounts = ['a', 'b', 'c'].map(id => ({ id, name: id, type: 'apikey', apiKey: `synthetic-${id}` }));
+const accounts = affinityAccounts();
 const statePath = dir => join(dir, 'config.state.json');
 const seeded = () => {
   const now = Date.now();
@@ -25,6 +27,88 @@ async function post(port, opening, path = '/v1/messages', thread = null) {
   });
   assert.equal(res.status, 200);
   return res.json();
+}
+
+async function outputMarker(child, marker, signal) {
+  let output = '';
+  for await (const [chunk] of on(child.stdout, 'data', { signal })) {
+    output += chunk;
+    if (output.includes(marker)) return;
+  }
+}
+
+for (const enabled of [false, true]) {
+  test(`queued refresh follows its account through removal (persistence ${enabled})`, { timeout: 20_000 }, async t => {
+    const dir = await mkdtemp(join(tmpdir(), 'tc-affinity-queued-'));
+    let srv, releaseGate, removing;
+    const pending = new AbortController();
+    const upstream = http.createServer((req, res) => { req.resume(); res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ key: req.headers.authorization || req.headers['x-api-key'] })); });
+    try {
+      await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
+      const preload = join(dir, 'queued-refresh.mjs');
+      await writeFile(preload, `import { AccountManager } from ${JSON.stringify(new URL('../src/account-manager.js', import.meta.url).href)};
+import { withConfigLock } from ${JSON.stringify(new URL('../src/config.js', import.meta.url).href)};
+let release;
+const onRefresh = AccountManager.prototype.onTokenRefresh;
+AccountManager.prototype.onTokenRefresh = function(cb) {
+  onRefresh.call(this, cb);
+  process.on('SIGUSR1', () => { void withConfigLock(process.env.TEAMROUTER_CONFIG, async () => {
+    console.log('fixture-lock-held'); await new Promise(resolve => { release = resolve; });
+  }); });
+  process.on('SIGUSR2', () => { this.updateAccountTokens(this.accounts.findIndex(a => a.id === 'a'), {
+    accessToken: 'synthetic-fresh', refreshToken: 'synthetic-refresh', expiresAt: Date.now() + 7_200_000,
+  }); console.log('fixture-refresh-queued'); });
+  process.on('SIGCONT', () => release?.());
+};
+const remove = AccountManager.prototype.removeAccount;
+AccountManager.prototype.removeAccount = function(index) { remove.call(this, index); console.log('fixture-account-removed'); };`);
+      const config = { proxy: { apiKey: 'test-key', mcp: 'full' }, upstreamProxy: false, autoUpdate: false, quotaProbeSeconds: 0,
+        upstream: `http://127.0.0.1:${upstream.address().port}`, persistSessionAffinity: enabled,
+        accounts: [{ id: 'dummy', name: 'dummy', type: 'apikey', apiKey: 'synthetic-dummy' },
+          { id: 'a', name: 'a', type: 'oauth', accessToken: 'synthetic-old', refreshToken: 'synthetic-refresh', expiresAt: Date.now() + 3_600_000 }, accounts[1]] };
+      srv = await spawnServer({ dir, env: { ...envFor(dir), NODE_OPTIONS: `--import=${preload}` }, config: () => config });
+      const locked = outputMarker(srv.child, 'fixture-lock-held', t.signal);
+      releaseGate = () => srv.child.kill('SIGCONT');
+      srv.child.kill('SIGUSR1');
+      await locked;
+      const queued = outputMarker(srv.child, 'fixture-refresh-queued', t.signal);
+      srv.child.kill('SIGUSR2');
+      await queued;
+      const removed = outputMarker(srv.child, 'fixture-account-removed', t.signal);
+      removing = fetch(`http://127.0.0.1:${srv.port}/teamclaude/mcp`, {
+        method: 'POST', headers: { 'x-api-key': 'test-key', 'content-type': 'application/json' }, signal: pending.signal,
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'remove_account', arguments: { account: 'dummy' } } }),
+      });
+      await removed;
+      releaseGate();
+      releaseGate = null;
+      const removal = await removing;
+      assert.equal(removal.status, 200);
+      assert.notEqual((await removal.json()).result?.isError, true);
+      assert.equal((await post(srv.port, 'before-restart', '/tc-acct/b/v1/messages')).key, 'synthetic-b');
+      await srv.stop();
+      const saved = JSON.parse(await readFile(srv.configPath, 'utf8'));
+      assert.equal(saved.accounts.some(a => a.id === 'dummy'), false);
+      const owner = saved.accounts.find(a => a.id === 'a');
+      assert.equal(owner.accessToken, 'synthetic-fresh');
+      assert.equal(owner.refreshToken, 'synthetic-refresh');
+      assert.ok(owner.expiresAt > config.accounts[1].expiresAt);
+      const survivor = saved.accounts.find(a => a.id === 'b');
+      assert.equal(survivor.apiKey, 'synthetic-b');
+      assert.deepEqual([survivor.accessToken, survivor.refreshToken, survivor.expiresAt], [undefined, undefined, undefined]);
+      srv = await spawnServer({ dir, env: envFor(dir), config: () => saved });
+      assert.equal((await post(srv.port, 'after-restart', '/tc-acct/b/v1/messages')).key, 'synthetic-b');
+      assert.equal((await post(srv.port, 'refreshed-owner', '/tc-acct/a/v1/messages')).key, 'Bearer synthetic-fresh');
+    } finally {
+      releaseGate?.();
+      pending.abort();
+      await removing?.catch(() => {});
+      await srv?.stop();
+      upstream.closeAllConnections();
+      await new Promise(resolve => upstream.close(resolve));
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 }
 
 test('opt-in real restart retains placement; operator and launch pins still win', async () => {

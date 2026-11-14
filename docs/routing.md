@@ -264,8 +264,8 @@ While a request is in flight, a snapshot observes its current use without storin
 When duplicate IDs are repaired during a live reload or account/token save, the server keeps its startup ID policy despite later flag edits; matched running entries adopt the repaired IDs and release their old automatic pins. Thread ownership and unrelated pins remain available.
 
 State is saved on the existing minute tick and on graceful shutdown, including
-once more after an enabled drain completes. Abrupt termination can lose up to a
-minute of routing updates. Missing, corrupt or unrecognized affinity snapshots
+once more after an enabled drain completes. Abrupt termination can lose routing
+updates since the last completed save. Missing, corrupt or unrecognized affinity snapshots
 start empty. This retains routing knowledge; it cannot restore an expired
 upstream cache or resume an interrupted stream.
 

@@ -3,11 +3,12 @@ import assert from 'node:assert/strict';
 import { SessionTracker, SESSION_KNOWN_TTL_MS as TTL, MAX_SESSIONS } from '../src/session-tracker.js';
 import { AccountManager } from '../src/account-manager.js';
 import * as config from '../src/config.js';
+import { affinityAccounts } from '../test-helpers/affinity-fixtures.js';
 
 const OPUS = 'claude-opus-5';
 const DIGEST = 'abcdefghijklmnopqrstuv';
 const KEY = `client/${DIGEST}`;
-const accounts = ['a', 'b', 'c'].map(id => ({ id, name: id, type: 'apikey', apiKey: `synthetic-${id}` }));
+const accounts = affinityAccounts();
 const manager = (rows = accounts, opts = {}) => new AccountManager(rows, 0.98, { distributeSessions: true, ...opts });
 const identify = idx => ({ id: `id-${idx}`, provider: 'anthropic' });
 const resolve = ref => /^id-\d+$/.test(ref.id) ? Number(ref.id.slice(3)) : null;

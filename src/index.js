@@ -528,7 +528,6 @@ async function serverCommand() {
     syncRefreshedTokens(config.accounts, accountManager.accounts, idx, newTokens);
     atomicConfigUpdate(diskConfig => {
       reconcileIds(diskConfig);
-      syncRefreshedTokens(config.accounts, accountManager.accounts, idx, newTokens);
       // Pick up any new accounts from disk so the running fleet serves them
       // (only add, don't refresh credentials — we're about to write the authoritative tokens)
       const removed = removedAccountIds(config);
