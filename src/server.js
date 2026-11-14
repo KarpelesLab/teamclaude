@@ -1,6 +1,7 @@
 import http from 'node:http';
 import https from 'node:https';
-import { randomUUID, timingSafeEqual } from 'node:crypto';
+import { isUtf8 } from 'node:buffer';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { createWriteStream, mkdirSync, writeSync } from 'node:fs';
 import { readdir, stat, unlink } from 'node:fs/promises';
 import { buffer } from 'node:stream/consumers';
@@ -1861,6 +1862,26 @@ export function clientSessionId(headers) {
 }
 
 /**
+ * Opaque affinity for a decoded Codex cache key, without retaining the raw key.
+ * Route and header-presence precedence are enforced by the ingress call site.
+ * @param {Buffer|null|undefined} body
+ * @returns {string|null}
+ */
+export function codexPromptCachePinKey(body) {
+  if (!body || !isUtf8(body)) return null;
+  let parsed;
+  try { parsed = JSON.parse(body.toString('utf8')); } catch { return null; }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  const value = Object.hasOwn(parsed, 'prompt_cache_key') ? parsed.prompt_cache_key
+    : Object.hasOwn(parsed, 'promptCacheKey') ? parsed.promptCacheKey : null;
+  if (typeof value !== 'string' || !value.length || value.length > 128
+      || Buffer.byteLength(value, 'utf8') > 128) return null;
+  // Serializing the string preserves distinct lone surrogates as distinct hash
+  // inputs, unlike encoding those raw strings directly as UTF-8.
+  return 'codex:prompt-cache:' + createHash('sha256').update(JSON.stringify(value), 'utf8').digest('hex');
+}
+
+/**
  * Build the core proxy request listener — buffer the body, then forward with
  * account selection + retry (forwardRequest). Shared by the base HTTP server and
  * the MITM's terminating h2/h1 server, so both get identical buffering, model-
@@ -2194,16 +2215,17 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // kept beside it, unnarrowed, for everything that reports rather than
       // routes: the activity log, the TUI's session column, the per-session
       // readout. Degrades to the session id when the body names no conversation.
-      // Only when there is a session to narrow: with no session id there is no
-      // pin either way, and digesting would walk a body for an answer nobody reads.
-      // And only for an Anthropic request: the path already says which provider
-      // this is, and a Codex Responses body carries `input`/`instructions` and
-      // no `messages`, so the walk could only ever come back empty-handed — after
-      // reading as far into a multi-megabyte body as its bound allows.
+      // Only Anthropic sessions need conversation narrowing. Headerless Codex
+      // Responses may instead supply an opaque body key for ordinary affinity;
+      // even a malformed supported header suppresses that fallback.
       const provider = providerForPath(req.url);
       const { conversation, pinKey, onMessage } = sessionId && provider === DEFAULT_PROVIDER
         ? placeConversation(accountManager, body, sessionId)
-        : { conversation: null, pinKey: pinKeyFor(sessionId, null), onMessage: null };
+        : { conversation: null, pinKey: pinKeyFor(sessionId, null) ?? (
+          req.method === 'POST' && classifiedPath === '/backend-api/codex/responses'
+            && !Object.hasOwn(req.headers, 'x-claude-code-session-id') && !Object.hasOwn(req.headers, 'session-id')
+            ? codexPromptCachePinKey(body) : null
+        ), onMessage: null };
 
       // The reasoning effort the client asked for, for the activity view only:
       // nothing routes on it. Read from the whole body rather than peeked from
