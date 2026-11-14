@@ -33,10 +33,31 @@
 // backend credential is not ours to renew.
 //
 // Removal travels too. An account removed on one install leaves a TOMBSTONE in
-// its row (`{"_deleted": "<time>"}`); every other install's next pass removes
-// the account, a refresh never writes over a tombstone, and only an explicit
-// sign-in (`login`, `import`) does. A pass deletes a tombstone older than a
-// week, by which time every install that was going to see it has.
+// its row (`{"_deleted": "<time>"}`), written under the row's lock so that a
+// renewal another install is making under it stores its token first. Every
+// other install's next pass removes the account. An explicit sign-in (`login`,
+// `import`) replaces the tombstone and brings the account back everywhere; the
+// other ways it can come back follow.
+//
+// A refresh does not write over a tombstone it reads. One made under the lock
+// does not meet a removal in between, as long as its write lands within the
+// lease (one that outlasts the lease reads the row again first, and can still
+// meet one between that read and its write). A token written without the lock
+// (a pass pushing a renewal, or one stored after a renewal made outside the
+// lock) still can, in the moment between its read and its write. A removal of
+// an account the store holds no row for records nothing, so an install that
+// still holds it and stores it later brings it back. A removal the store does
+// not take at once (out of reach, or the lock held throughout) stays pending on
+// the install that made it, in memory: no pass there adds the account back from
+// its row, and the tombstone is tried again a minute, five and fifteen minutes
+// later, then at each pass, until it lands; a sign-out in between does not end
+// it (made while signed out, a removal records nothing at all). Until then it
+// also wins over a sign-in made on another install meanwhile. A pass deletes a
+// tombstone older than a week. Nothing checks that every install has seen it by
+// then: one that ran no pass in that week and still holds the account, with a
+// refresh token that still renews, stores it again (at its first pass after
+// signing back in to callback.net if it renewed the token while signed out, at
+// its next renewal if it was switched off), and the others add it back.
 //
 // An account IN ERROR (upstream rejected its token; it needs a re-login) is
 // never written to the store: what it holds is dead, and stored it would
@@ -89,12 +110,16 @@ const MIN_REFRESH_BUDGET_MS = 5_000;
 /** Lock refused: re-read this often, for this long, before trying the lock again. */
 const LOCKED_RECHECK_MS = 5_000;
 const LOCKED_WAIT_MS = 30_000;
+/** A removal waits this long for a held lock: one whole lease, and a re-check past it. */
+const REMOVAL_LOCK_WAIT_MS = LOCK_TIMEOUT_S * 1000 + LOCKED_RECHECK_MS;
+/** A removal the store did not take: tried again after each pause, then by each pass. */
+const REMOVAL_RETRY_MS = [60_000, 5 * 60_000, 15 * 60_000];
 /** Rounds of lock-or-wait before this refresh gives up (the next request asks again). */
 const MAX_LOCK_ROUNDS = 3;
 export const SYNC_INTERVAL_MS = 24 * 3600 * 1000;
 const PAGE_SIZE = 100;
 const MAX_PAGES = 50;
-/** A tombstone this old has been seen by every install that still runs, and goes. */
+/** A tombstone this old is deleted; an install that ran no pass in that time never saw it. */
 export const TOMBSTONE_TTL_MS = 7 * 24 * 3600 * 1000;
 
 /**
@@ -332,6 +357,21 @@ export class CredentialSync {
     this.by = by;
     /** What the store holds, as last seen: key → row. */
     this.rows = new Map();
+    /**
+     * Removals made here whose tombstone is not written yet: key → the account.
+     * Marked before anything is awaited, so a pass running meanwhile does not
+     * add the account back from its row, and each pass tries to write it
+     * again. In memory only: a restart forgets it, and the next start's pass
+     * adds the account back from its row.
+     * @type {Map<string, Record<string, any>>}
+     */
+    this.pendingRemovals = new Map();
+    /**
+     * Accounts a pass is evicting for a tombstone (evictAccount): their removal
+     * is in the store already, so it is neither written nor pending.
+     * @type {WeakSet<Record<string, any>>}
+     */
+    this._evicting = new WeakSet();
     /** @type {Promise<any>|null} */
     this._syncing = null;
     /** @type {NodeJS.Timeout|null} */
@@ -432,6 +472,7 @@ export class CredentialSync {
           // Removed on another install. A sign-in since would have replaced the
           // tombstone (storeSignIn), so the account here is a copy to drop.
           this.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" was removed on another install (${new Date(row.deletedAt).toISOString()}); removing it here`);
+          this._evicting.add(account);
           this.evictAccount(account);
           result.evicted++;
           continue;
@@ -462,11 +503,18 @@ export class CredentialSync {
         // Matched above by identity, so a row left over names an account this
         // install does not have.
         if (this.am.accounts.some((a) => sameIdentity(a, row.blob))) continue;
+        // Removed here, its tombstone not written yet: not an account to add.
+        if (this._isPendingRemoval(row)) continue;
         const entry = entryFromBlob(row.blob);
         const idx = this.addAccount(entry);
         if (idx == null) continue;
         result.added++;
         this.log(`[TeamClaude] Account "${safeLine(entry.name, 64)}" added from callback.net (signed in on ${safeLine(row.blob.by, 48)})`);
+      }
+      // A removal made here that the store did not take: written now, once,
+      // without waiting on a held lock (the next pass tries again).
+      for (const account of [...this.pendingRemovals.values()]) {
+        if (await this._recordRemoval(account, 0)) this.log(`[TeamClaude] Account "${safeLine(account.name, 64)}": its removal here is now recorded on callback.net`);
       }
       this.lastSyncAt = this.now();
       this.lastError = null;
@@ -510,6 +558,32 @@ export class CredentialSync {
     if (byKey) return byKey;
     for (const row of this.rows.values()) if (row.blob && sameIdentity(row.blob, account)) return row;
     return null;
+  }
+
+  /**
+   * The row for an account, as last seen, else from a fresh list: a row
+   * another install created since the last pass is not in what was last
+   * seen, and "no row" read from that alone would be wrong. Null when the
+   * store has none. Throws when the store cannot be read.
+   * @param {Record<string, any>} account
+   * @returns {Promise<Row|null>}
+   */
+  async _findRow(account) {
+    const seen = this._rowFor(account);
+    if (seen) return seen;
+    this.rows = await this._list();
+    return this._rowFor(account);
+  }
+
+  /**
+   * Whether a row names an account removed here whose tombstone is not
+   * written yet (see pendingRemovals): by key, or by the identity it carries.
+   * @param {Row} row
+   */
+  _isPendingRemoval(row) {
+    if (this.pendingRemovals.has(row.key)) return true;
+    for (const a of this.pendingRemovals.values()) if (row.blob && sameIdentity(a, row.blob)) return true;
+    return false;
   }
 
   /** Install a row's tokens on an account. The echo guard keeps this from being pushed back. */
@@ -583,8 +657,7 @@ export class CredentialSync {
   async onAccountError(account) {
     if (!syncKeyFor(account) || !await this.isSignedIn()) return false;
     try {
-      if (!this.rows.size) this.rows = await this._list();
-      let row = this._rowFor(account);
+      let row = await this._findRow(account);
       if (!row) return false;
       row = rowOf(await this.api('GET', `User/Credential/${row.id}`));
       this.rows.set(row.key, row);
@@ -653,28 +726,108 @@ export class CredentialSync {
 
   /**
    * An account left this install: its row becomes a tombstone, which the other
-   * installs act on at their next pass. Re-read before writing, so a removal
-   * another install already recorded (or a sign-in since) is left as it is.
+   * installs act on at their next pass. Written under the row's lock: a
+   * renewal another install is making under it stores its token when it is
+   * done, and without the lock that write would land on the tombstone and
+   * undo the removal everywhere. A held lock is waited for, at most one lease
+   * and a re-check past it (REMOVAL_LOCK_WAIT_MS). Until the tombstone is
+   * written the removal is pending (see pendingRemovals), and it is tried
+   * again after each of REMOVAL_RETRY_MS, then by each pass. `wait: false`,
+   * for a CLI command that must not hang, makes one attempt: no wait for the
+   * lock and no retry here. Signed out of callback.net at the removal,
+   * nothing is recorded; a sign-out after it does not end it. An account a
+   * pass evicts for a
+   * tombstone is removed in the store already, and nothing is written.
    * Resolves with whether a tombstone was written.
    * @param {Record<string, any>} account
+   * @param {{ wait?: boolean }} [opts]
    * @returns {Promise<boolean>}
    */
-  async onAccountRemoved(account) {
-    if (!syncKeyFor(account) || !await this.isSignedIn()) return false;
+  async onAccountRemoved(account, { wait = true } = {}) {
+    const key = syncKeyFor(account);
+    if (!key || this._evicting.delete(account)) return false;
+    // Before anything is awaited: a pass running meanwhile must not add the
+    // account back from its row.
+    this.pendingRemovals.set(key, account);
+    if (!await this.isSignedIn()) {
+      this._settleRemoval(key, account);
+      return false;
+    }
+    if (!wait) return this._recordRemoval(account, 0);
+    for (const pause of [...REMOVAL_RETRY_MS, null]) {
+      if (await this._recordRemoval(account, REMOVAL_LOCK_WAIT_MS)) return true;
+      // Settled without a write, or out of retries: the passes take it on.
+      if (pause == null || this.pendingRemovals.get(key) !== account) return false;
+      await this.sleep(pause);
+    }
+    return false;
+  }
+
+  /**
+   * Whether a removed account is back on this install: one the sync carries,
+   * by key or by identity. A namesake it does not carry (an API-key account,
+   * say) is not it, though sameIdentity falls back to the name.
+   * @param {string} key
+   * @param {Record<string, any>} account
+   */
+  _backHere(key, account) {
+    return this.am.accounts.some((a) => {
+      const k = syncKeyFor(a);
+      return !!k && (k === key || sameIdentity(a, account));
+    });
+  }
+
+  /** A pending removal is done with, unless a newer removal of the same account replaced it. */
+  _settleRemoval(/** @type {string} */ key, /** @type {Record<string, any>} */ account) {
+    if (this.pendingRemovals.get(key) === account) this.pendingRemovals.delete(key);
+  }
+
+  /**
+   * Write a pending removal's tombstone. Settled once it is written, and when
+   * there is nothing to write: no row (or the row gone since it was read), a
+   * tombstone there already, a sign-in here since (storeSignIn), or the
+   * account back on this install. Left pending, to be tried again, when
+   * signed out of callback.net, when the store cannot be reached, or when the
+   * lock is not had within `waitMs`.
+   * @param {Record<string, any>} account
+   * @param {number} waitMs  how long a held lock is waited for
+   * @returns {Promise<boolean>} whether a tombstone was written
+   */
+  async _recordRemoval(account, waitMs) {
+    const key = /** @type {string} */ (syncKeyFor(account));
+    const name = safeLine(account.name, 64);
+    const settle = () => { this._settleRemoval(key, account); return false; };
+    // Settled meanwhile (written by a pass, dropped by a sign-in here): done.
+    if (this.pendingRemovals.get(key) !== account) return false;
     try {
-      if (!this.rows.size) this.rows = await this._list();
-      let row = this._rowFor(account);
-      if (!row) return false;
-      row = rowOf(await this.api('GET', `User/Credential/${row.id}`));
-      this.rows.set(row.key, row);
-      if (row.deletedAt != null) return false;
-      const stone = tombstone(this.now());
-      const r = await this.api('PATCH', `User/Credential/${row.id}`, { Data: JSON.stringify(stone) });
-      const fresh = rowOf({ ...r, Data: JSON.stringify(stone) });
-      this.rows.set(fresh.key, fresh);
-      return true;
+      // Signed out since the removal: kept, for the first pass after signing
+      // back in. (Signed out at the removal, nothing is recorded at all.)
+      if (!await this.isSignedIn()) return false;
+      const row = await this._findRow(account);
+      if (!row) return settle();
+      const lease = await this._lockWaiting(row, waitMs, () => this.pendingRemovals.get(key) === account);
+      if (!lease && this.pendingRemovals.get(key) !== account) return false; // settled while it waited
+      if (!lease) {
+        this.log(`[TeamClaude] callback.net: could not record the removal of "${name}" yet: its lock is held; it is tried again later`);
+        return false;
+      }
+      try {
+        const current = rowOf({ ...lease.locked, Data: lease.locked?.Data ?? '' });
+        this.rows.set(current.key, current);
+        if (current.deletedAt != null || this.pendingRemovals.get(key) !== account || this._backHere(key, account)) return settle();
+        const stone = tombstone(this.now());
+        const r = await this.api('PATCH', `User/Credential/${row.id}`, { Data: JSON.stringify(stone) });
+        const fresh = rowOf({ ...r, Data: JSON.stringify(stone) });
+        this.rows.set(fresh.key, fresh);
+        settle();
+        return true;
+      } finally {
+        await this._unlock(row, lease.leaseEnd);
+      }
     } catch (/** @type {any} */ err) {
-      this.log(`[TeamClaude] callback.net: could not record the removal of "${safeLine(account.name, 64)}": ${safeLine(err?.message || String(err), 160)}`);
+      // The row is gone (an expired tombstone, deleted, say): nothing to record.
+      if (err?.token === 'error_not_found') return settle();
+      this.log(`[TeamClaude] callback.net: could not record the removal of "${name}" yet; it is tried again later: ${safeLine(err?.message || String(err), 160)}`);
       return false;
     }
   }
@@ -688,7 +841,12 @@ export class CredentialSync {
    */
   async storeSignIn(entry) {
     const account = { ...entry, credential: entry.accessToken, index: -1 };
-    if (!syncKeyFor(account) || !await this.isSignedIn()) return false;
+    const key = syncKeyFor(account);
+    if (!key) return false;
+    // Newer than a removal of the same account still pending here, which is
+    // dropped: the next pass would write its tombstone over this sign-in.
+    for (const [k, a] of this.pendingRemovals) if (k === key || sameIdentity(a, account)) this.pendingRemovals.delete(k);
+    if (!await this.isSignedIn()) return false;
     const tokens = this._tokens(account);
     if (!tokens.accessToken || !tokens.refreshToken) return false;
     this.rows = await this._list();
@@ -795,17 +953,28 @@ export class CredentialSync {
       }
       try {
         const tokens = await refresh({ budgetMs });
-        if (this.now() > leaseEnd) this.log(`[TeamClaude] Account "${name}": the renewal outlasted the callback.net lock (${LOCK_TIMEOUT_S}s)`);
-        if (current.deletedAt != null) {
-          // Removed on another install since the last pass. This request still
-          // gets its token, renewed under the lock and never written over the
-          // tombstone; the pass that follows takes the account out.
+        let stored = current;
+        if (this.now() > leaseEnd) {
+          this.log(`[TeamClaude] Account "${name}": the renewal outlasted the callback.net lock (${LOCK_TIMEOUT_S}s)`);
+          // The lock may be another install's by now, and a removal takes it
+          // to write its tombstone: read the row again, so this renewal does
+          // not land on one. Unreadable, it is written as before.
+          try {
+            stored = rowOf(await this.api('GET', `User/Credential/${row.id}`));
+            this.rows.set(stored.key, stored);
+          } catch { /* written over the row the lock returned */ }
+        }
+        if (stored.deletedAt != null) {
+          // Removed on another install, since the last pass or while this
+          // renewal ran past its lease. This request still gets its token,
+          // never written over the tombstone; the pass that follows takes the
+          // account out.
           this.log(`[TeamClaude] Account "${name}" was removed on another install; renewed this once, removing it here`);
           this.sync('tombstone').catch(() => {});
           return tokens;
         }
         try {
-          await this._patch(current, account, tokens);
+          await this._patch(stored, account, tokens);
         } catch (/** @type {any} */ err) {
           this.log(`[TeamClaude] callback.net: could not store the renewed token for "${name}": ${safeLine(err?.message || String(err), 120)}`);
         }
@@ -881,6 +1050,34 @@ export class CredentialSync {
     }
     this.log(`[TeamClaude] Account "${name}": not renewing, ${why}; it waits for the lock (\`teamclaude callback logout\` renews without one)`);
     throw Object.assign(new Error(`not renewed without the callback.net lock: ${why}`), { code: 'CALLBACK_LOCK_UNAVAILABLE' });
+  }
+
+  /**
+   * Take a row's lock, trying again every LOCKED_RECHECK_MS while it is held
+   * (by another install, or by this one), for up to `waitMs`, and only while
+   * `wanted()` holds. Resolves with the row as the lock returned it and the
+   * end of the lease, or null when the lock stayed held or is no longer
+   * wanted. Any other failure throws.
+   * @param {Row} row
+   * @param {number} waitMs
+   * @param {() => boolean} [wanted]
+   * @returns {Promise<{ locked: any, leaseEnd: number }|null>}
+   */
+  async _lockWaiting(row, waitMs, wanted = () => true) {
+    const until = this.now() + waitMs;
+    for (;;) {
+      if (!wanted()) return null;
+      // Taken before the call goes out, as in coordinateRefresh.
+      const leaseStart = this.now();
+      try {
+        const locked = await this.api('POST', `User/Credential/${row.id}:lock`, { timeout: LOCK_TIMEOUT_S });
+        return { locked, leaseEnd: leaseStart + LOCK_TIMEOUT_S * 1000 - LEASE_SAFETY_MS };
+      } catch (/** @type {any} */ err) {
+        if (err?.token !== 'error_credential_locked') throw err;
+        if (this.now() >= until) return null;
+        await this.sleep(LOCKED_RECHECK_MS);
+      }
+    }
   }
 
   /** Release the lock, unless the lease has run out: then it may be someone else's. */
