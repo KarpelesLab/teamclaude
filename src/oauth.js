@@ -192,12 +192,30 @@ export function oauthErrorSummary(text) {
 
 /**
  * Refresh an expired OAuth access token using the refresh token.
- * Retries on 5xx and network errors with exponential backoff.
+ * Retries a 5xx and a network failure, with exponential backoff. The catch
+ * below reads the error's own name, message and code, never its `cause`:
+ * - direct: any `fetch failed`, and a timeout;
+ * - through the fleet's upstream proxy: a refused or reset connection, and a
+ *   timeout once the tunnel is open; a CONNECT the proxy refuses or never
+ *   answers, and a TLS handshake over it that times out (sx.js), are not;
+ * - through an account's routing proxy: a reset or a timeout once the tunnel
+ *   is open. A tunnel it fails to open arrives wrapped as ROUTING_FAILED
+ *   (account-routing.js) and is not retried; the proxy's own refresh path
+ *   then holds that account out of rotation (markRoutingFailed).
  * `routing` is the account's own egress proxy (account-routing.js); null goes
  * by the fleet path (upstream proxy when configured, direct otherwise).
- * `budgetMs` bounds the whole call, retries included: no attempt goes out once
- * it is spent, and none outlives it — the time a lock held for this renewal
- * has left (credential-sync.js).
+ * `budgetMs`, the time a lock held for this renewal has left
+ * (credential-sync.js), bounds the whole call, retries included: no attempt
+ * goes out once it is spent, and none outlives it once its connection is open.
+ * Opening a tunnel through a proxy has timeouts of its own, for the CONNECT and
+ * for the TLS handshake over it (20s each through a routing proxy, 30s each
+ * through the upstream proxy), and an attempt still opening one can run past
+ * both the budget and REFRESH_TIMEOUT_MS. A backoff pause can still end the
+ * call up to 1s past the budget, which credential-sync's STORE_RESERVE_MS
+ * absorbs. Without a budget, each attempt has the REFRESH_TIMEOUT_MS bound of
+ * its own, so three timed-out attempts and their backoff take about 91.5s at
+ * the default; through a proxy, a tunnel still opening can hold each attempt
+ * longer.
  * @param {string} refreshToken
  * @param {string} [endpoint]
  * @param {import('./account-routing.js').RoutingProxy|null} [routing]
