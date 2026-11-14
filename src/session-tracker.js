@@ -157,6 +157,27 @@ function setAndReturn(map, key, value) {
  * @property {string|null} provider the fleet whose reading this is
  * @property {Map<string, number>|null} handedBack the account's windows as they stood when a hold handed this reading back, so the roll it was handed back for is not held again; null once the reading moves
  */
+/** @typedef {{id: string, provider: string}} AffinityAccount */
+/** @typedef {{bucket: string, account: AffinityAccount, at: number}} AffinityPin */
+/** @typedef {{key: string, sessionId: string|null, conversation: string|null, lastSeen: number, pins: AffinityPin[], threads: string[]}} AffinitySession */
+/** @param {unknown} value @param {number} limit @returns {value is string} */
+const boundedString = (value, limit) => typeof value === 'string' && value.length > 0 && value.length <= limit;
+/** @param {unknown} value @param {number} now @returns {value is number} */
+const affinityTime = (value, now) => typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= now;
+/** @param {any} row @param {number} now @param {number} ttl @returns {row is AffinitySession} */
+function affinityRow(row, now, ttl) {
+  return row != null && boundedString(row.key, MAX_KEY_LENGTH)
+    && (row.sessionId === null || boundedString(row.sessionId, MAX_SESSION_ID_LENGTH))
+    && (row.conversation === null || boundedString(row.conversation, 22))
+    && affinityTime(row.lastSeen, now) && now - row.lastSeen <= ttl
+    && Array.isArray(row.pins) && Array.isArray(row.threads);
+}
+/** @param {any} ref @returns {ref is AffinityAccount} */
+function affinityAccount(ref) {
+  return ref != null && typeof ref.id === 'string' && !!ref.id
+    && typeof ref.provider === 'string' && !!ref.provider;
+}
+
 export class SessionTracker {
   /**
    * @param {Object} [opts]
@@ -180,6 +201,56 @@ export class SessionTracker {
     this.activeTtlMs = activeTtlMs ?? SESSION_ACTIVE_TTL_MS;
     this._now = now || (() => Date.now());
     this._lastSweep = 0;
+  }
+
+  // Explicit allowlist: routing knowledge only. Neither live requests nor their
+  // labels, spend and rollover observations belong in a restart snapshot.
+  /** @param {(index: number) => AffinityAccount|null} identifyAccount @param {number} [now] */
+  exportAffinity(identifyAccount, now = this._now()) {
+    /** @type {AffinitySession[]} */
+    const sessions = [];
+    for (const [key, s] of this.sessions) {
+      const pins = [];
+      for (const [bucket, pin] of s.pins) {
+        const account = identifyAccount(pin.idx);
+        if (affinityAccount(account) && typeof bucket === 'string' && bucket && affinityTime(pin.at, s.lastSeen)) {
+          pins.push({ bucket, account: { id: account.id, provider: account.provider }, at: pin.at });
+        }
+      }
+      const threads = [...s.threads].filter(isMessageId).slice(-MAX_THREAD_MESSAGES);
+      const row = { key, sessionId: s.sessionId, conversation: s.conversation, lastSeen: s.lastSeen, pins, threads };
+      if ((pins.length || threads.length) && affinityRow(row, now, this.knownTtlMs)) sessions.push(row);
+    }
+    sessions.sort((a, b) => b.lastSeen - a.lastSeen);
+    return { version: 1, sessions: sessions.slice(0, MAX_SESSIONS) };
+  }
+
+  // Keys are opaque, as on ingress. Owner metadata is independent: some keys
+  // carry no client session or conversation, and must still retain their pins.
+  /** @param {any} snapshot @param {(account: AffinityAccount) => number|null} resolveAccount @param {number} [now] */
+  restoreAffinity(snapshot, resolveAccount, now = this._now()) {
+    if (snapshot?.version !== 1 || !Array.isArray(snapshot.sessions)) return;
+    const rows = snapshot.sessions.filter((/** @type {any} */ row) => affinityRow(row, now, this.knownTtlMs));
+    rows.sort((/** @type {AffinitySession} */ a, /** @type {AffinitySession} */ b) => b.lastSeen - a.lastSeen);
+    for (const row of rows) {
+      if (this.sessions.size >= MAX_SESSIONS) break;
+      if (this.sessions.has(row.key)) continue;
+      const pins = new Map();
+      for (const pin of row.pins) {
+        if (!pin || typeof pin.bucket !== 'string' || !pin.bucket || pins.has(pin.bucket)
+            || !affinityAccount(pin.account) || !affinityTime(pin.at, row.lastSeen)) continue;
+        const idx = resolveAccount(pin.account);
+        if (idx != null && Number.isInteger(idx) && idx >= 0) pins.set(pin.bucket, { idx, at: pin.at });
+      }
+      const threads = new Set(row.threads.filter(isMessageId));
+      while (threads.size > MAX_THREAD_MESSAGES) threads.delete(threads.values().next().value);
+      if (!pins.size && !threads.size) continue;
+      const s = this._ensure(row.key, row.lastSeen);
+      s.sessionId = row.sessionId;
+      s.conversation = row.conversation;
+      s.pins = pins;
+      s.threads = threads;
+    }
   }
 
   // Record that `sessionId` made a request served by `accountIndex`, spending

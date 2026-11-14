@@ -72,6 +72,48 @@ export async function saveState(state) {
 }
 
 /**
+ * One writer and at most one pending snapshot, read only when its write starts.
+ * Each caller waits for the batch containing its request, including final saves.
+ * @param {() => any} readState
+ * @param {{save?: (state: any) => Promise<void>, onError?: (err: any) => void}} [opts]
+ */
+export function createStatePersister(readState, { save = saveState, onError = () => {} } = {}) {
+  /** @typedef {{promise: Promise<void>, resolve: () => void}} Batch */
+  /** @type {Batch|null} */
+  let active = null;
+  /** @type {Batch|null} */
+  let pending = null;
+  /** @returns {Batch} */
+  const batch = () => {
+    let resolve = () => {};
+    /** @type {Promise<void>} */
+    const promise = new Promise(done => { resolve = done; });
+    return { promise, resolve };
+  };
+  /** @param {Batch} current */
+  const start = async current => {
+    active = current;
+    try { await save(readState()); }
+    catch (err) { onError(err); }
+    finally {
+      active = null;
+      current.resolve();
+      if (pending) {
+        const next = pending;
+        pending = null;
+        void start(next);
+      }
+    }
+  };
+  return () => {
+    if (active) return (pending ??= batch()).promise;
+    const current = batch();
+    void start(current);
+    return current.promise;
+  };
+}
+
+/**
  * Write a JSON document so that the file at `path` is, at every instant, either
  * the previous complete document or the new one.
  *
@@ -128,6 +170,7 @@ export function createDefaultConfig() {
     switchThreshold: 0.98,
     holdSeconds: 0,
     distributeSessions: false,
+    persistSessionAffinity: false,
     sessionTitles: { enabled: false, width: 18 },
     quotaBarPercent: false,
     probeDisabledAccounts: false,

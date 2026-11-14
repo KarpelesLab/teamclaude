@@ -24,6 +24,7 @@
   "synthesizeQuotaHeaders": false,
   "poolQuotaHeaders": false,
   "distributeSessions": false,
+  "persistSessionAffinity": false,
   "adaptiveDistribution": {
     "scoring": "burndown"
   },

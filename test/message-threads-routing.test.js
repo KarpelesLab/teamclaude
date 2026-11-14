@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
+import { setUpstreamProxy, resolveUpstreamProxy, resetUpstreamProxy } from '../src/upstream-proxy.js';
 import { createProxyServer, requestThread } from '../src/server.js';
 
 // A message-thread continue carries only the turn's delta, and Anthropic keeps
@@ -11,6 +12,9 @@ import { createProxyServer, requestThread } from '../src/server.js';
 // body's first message, which for a continue is the delta rather than the
 // conversation's opening, so every continue looked like a new conversation and
 // session-aware routing sent it wherever a new one would go.
+
+test.beforeEach(() => setUpstreamProxy(resolveUpstreamProxy({ upstreamProxy: false }, {})));
+test.afterEach(() => resetUpstreamProxy());
 
 const SESSION = '0f6b7f2a-1c3d-4e5f-8a9b-0c1d2e3f4a5b';
 
@@ -181,3 +185,38 @@ test('requestThread names the message a continue follows', () => {
   assert.equal(requestThread(Buffer.from('{"thread":"continue"')), null);
   assert.equal(requestThread(null), null);
 });
+
+for (const stream of [false, true]) {
+  test(`restart keeps delta-only thread ownership (${stream ? 'streamed' : 'buffered'})`, async () => {
+    const { server: upstream, served } = threadKeepingUpstream({ stream });
+    let proxy;
+    try {
+      const port = await listen(upstream);
+      const accounts = [0, 1, 2].map(i => ({ id: `id-${i}`, name: `a${i}`, type: 'apikey', apiKey: `k${i}` }));
+      const config = { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${port}`, messageThreads: true };
+      const am = new AccountManager(accounts, 0.98, { distributeSessions: true });
+      proxy = createProxyServer(am, config);
+      const firstPort = await listen(proxy);
+      const alpha = await create(firstPort, 'task alpha');
+      await create(firstPort, 'task beta');
+      const alphaConversation = am.sessionTracker.threadOwner(SESSION, alpha.id).conversation;
+      const saved = JSON.parse(JSON.stringify(am.exportAffinityState()));
+      proxy.closeAllConnections();
+      await new Promise(resolve => proxy.close(resolve));
+      const fresh = new AccountManager([accounts[2], accounts[1], accounts[0]], 0.98, { distributeSessions: true });
+      fresh.restoreAffinityState(saved);
+      proxy = createProxyServer(fresh, config);
+      const secondPort = await listen(proxy);
+      const result = await cont(secondPort, alpha.id);
+      assert.equal(result.status, 200);
+      assert.equal(served[2].key, 'k0');
+      assert.deepEqual(fresh.sessionTracker.threadOwner(SESSION, result.id), { key: `${SESSION}/${alphaConversation}`, conversation: alphaConversation });
+      assert.equal(fresh.sessionTracker.threadOwner('other-client', result.id), null);
+    } finally {
+      proxy?.closeAllConnections();
+      if (proxy?.listening) await new Promise(resolve => proxy.close(resolve));
+      upstream.closeAllConnections();
+      await new Promise(resolve => upstream.close(resolve));
+    }
+  });
+}
