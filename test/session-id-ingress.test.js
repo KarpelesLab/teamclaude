@@ -49,14 +49,7 @@ async function withProxy(fn, opts = {}) {
 // http.request: fetch validates header values against a narrower grammar than
 // Node's server accepts, and the point is what the server does with the rest.
 function post(port, sessionId) {
-  return new Promise((resolve, reject) => {
-    const req = http.request({
-      host: '127.0.0.1', port, method: 'POST', path: '/v1/messages',
-      headers: { 'content-type': 'application/json', 'x-api-key': 'k', 'x-claude-code-session-id': sessionId },
-    }, (res) => { res.resume(); res.on('end', () => resolve(res.statusCode)); });
-    req.on('error', reject);
-    req.end(JSON.stringify({ model: 'claude-sonnet-4-6', messages: [] }));
-  });
+  return postWithHeaders(port, { 'x-claude-code-session-id': sessionId });
 }
 
 test('a UUID and a plain non-UUID tag are both tracked; malformed ones are not', async () => {
@@ -92,14 +85,14 @@ test('clientSessionId: shape', () => {
 });
 
 // http.request again, so the header name is sent verbatim.
-function postWithHeaders(port, extra) {
+function postWithHeaders(port, extra, { path = '/v1/messages', method = 'POST', body = Buffer.from(JSON.stringify({ model: 'claude-sonnet-4-6', messages: [] })) } = {}) {
   return new Promise((resolve, reject) => {
     const req = http.request({
-      host: '127.0.0.1', port, method: 'POST', path: '/v1/messages',
-      headers: { 'content-type': 'application/json', 'x-api-key': 'k', ...extra },
+      host: '127.0.0.1', port, method, path,
+      headers: { 'content-type': 'application/json', 'content-length': body.length, 'x-api-key': 'k', ...extra },
     }, (res) => { res.resume(); res.on('end', () => resolve(res.statusCode)); });
     req.on('error', reject);
-    req.end(JSON.stringify({ model: 'claude-sonnet-4-6', messages: [] }));
+    req.end(body);
   });
 }
 
@@ -130,28 +123,19 @@ const CODEX_PATH = '/backend-api/codex/responses';
 const codexOpts = { distributeSessions: true, accounts: ['a', 'b'].map(name => ({ name, type: 'apikey', provider: 'codex', apiKey: `key-${name}` })) };
 // Deliberately keep wire formatting and escapes: no parsed object may be sent upstream.
 const codexBody = (key = 'alpha') => Buffer.from(`{ "model": "${CODEX_MODEL}", "input": "hi\\n", "prompt_cache_key": "${key}", "previous_response_id": "prev", "store": false }`);
-function codexPost(port, body, { path = CODEX_PATH, method = 'POST', headers = {} } = {}) {
-  return new Promise((resolve, reject) => {
-    const req = http.request({ host: '127.0.0.1', port, method, path,
-      headers: { 'content-type': 'application/json', 'content-length': body.length, 'x-api-key': 'k', ...headers },
-    }, res => { res.resume(); res.on('end', () => resolve(res.statusCode)); });
-    req.on('error', reject);
-    req.end(body);
-  });
-}
 
 test('body-only Codex turns retain an eligible placement', async t => {
   for (const distributeSessions of [true, false]) await t.test(`distribution ${distributeSessions}`, async () => {
     await withProxy(async (port, started, am, received) => {
       const alpha = codexBody();
       const beta = codexBody('beta');
-      assert.equal(await codexPost(port, alpha), 200);
+      assert.equal(await postWithHeaders(port, {}, { body: alpha, path: CODEX_PATH }), 200);
       am.recordSession('fixture-load', 0, CODEX_MODEL);
-      assert.equal(await codexPost(port, alpha), 200);
-      assert.equal(await codexPost(port, beta), 200);
+      assert.equal(await postWithHeaders(port, {}, { body: alpha, path: CODEX_PATH }), 200);
+      assert.equal(await postWithHeaders(port, {}, { body: beta, path: CODEX_PATH }), 200);
       assert.deepEqual(received.map(r => r.account), ['Bearer key-a', 'Bearer key-a', distributeSessions ? 'Bearer key-b' : 'Bearer key-a']);
       am.setDisabled(0, true);
-      assert.equal(await codexPost(port, alpha), 200);
+      assert.equal(await postWithHeaders(port, {}, { body: alpha, path: CODEX_PATH }), 200);
       assert.equal(received[3].account, 'Bearer key-b');
       assert.deepEqual(started, [null, null, null, null]);
       assert.deepEqual(received.map(r => r.body), [alpha, alpha, beta, alpha]);
@@ -178,7 +162,10 @@ test('Codex body keys validate the complete decoded JSON and retain full opaque 
   assert.ok(key('é'.repeat(64)));
   assert.ok(key('😀'.repeat(32)));
   assert.equal(key('😀'.repeat(32) + 'a'), null);
-  assert.equal(codexPromptCachePinKey(Buffer.concat([Buffer.from('{"prompt_cache_key":"'), Buffer.from([0xff]), Buffer.from('"}')])), key('\ufffd'));
+  for (const bytes of [[0xff], [0xfe], [0xc0, 0xaf], [0xe2, 0x82], [0xed, 0xa0, 0x80]]) {
+    assert.equal(codexPromptCachePinKey(Buffer.concat([Buffer.from('{"prompt_cache_key":"'), Buffer.from(bytes), Buffer.from('"}')])), null);
+  }
+  assert.ok(key('\ufffd'));
   assert.ok(key(' '));
   assert.equal(wireKey('{"promptCacheKey":"alpha"}'), key('alpha'));
   assert.equal(wireKey('{"prompt_cache_key":"alpha","promptCacheKey":"beta"}'), key('alpha'));
@@ -208,7 +195,7 @@ test('supported header presence suppresses body affinity, preserving current hea
   for (const [headers, expected] of cases) await t.test(JSON.stringify(headers) + String(expected), async () => {
     await withProxy(async (port, started, am, received) => {
       const body = codexBody();
-      assert.equal(await codexPost(port, body, { headers }), 200);
+      assert.equal(await postWithHeaders(port, headers, { body, path: CODEX_PATH }), 200);
       assert.deepEqual(started, [expected]);
       assert.deepEqual(sessionIds(am), expected ? [expected] : []);
       assert.deepEqual(received.map(r => r.body), [body]);
@@ -226,7 +213,7 @@ test('body affinity is confined to classified POST Codex Responses after pin str
   ]) await t.test(method + ' ' + path, async () => {
     await withProxy(async (port, started, am, received) => {
       const body = Buffer.from(JSON.stringify({ model: CODEX_MODEL, input: 'x'.repeat(256 * 1024), prompt_cache_key: 'alpha' }));
-      assert.equal(await codexPost(port, body, { method, path }), 200);
+      assert.equal(await postWithHeaders(port, {}, { body, method, path }), 200);
       assert.deepEqual(sessionIds(am), accepted ? [key('alpha')] : []);
       assert.deepEqual(started, [null]);
       assert.deepEqual(received.map(r => r.body), [body]);
@@ -238,10 +225,10 @@ test('body affinity is confined to classified POST Codex Responses after pin str
 test('body, header and Anthropic conversation identities stay separate on shared API-key capacity', async () => {
   await withProxy(async (port, _started, am, received) => {
     const body = codexBody();
-    assert.equal(await codexPost(port, body), 200);
-    assert.equal(await codexPost(port, body, { headers: { 'session-id': 'alpha' } }), 200);
+    assert.equal(await postWithHeaders(port, {}, { body, path: CODEX_PATH }), 200);
+    assert.equal(await postWithHeaders(port, { 'session-id': 'alpha' }, { body, path: CODEX_PATH }), 200);
     const anthropic = Buffer.from(JSON.stringify({ model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: 'hi' }], prompt_cache_key: 'alpha' }));
-    assert.equal(await codexPost(port, anthropic, { path: '/v1/messages', headers: { 'session-id': 'alpha' } }), 200);
+    assert.equal(await postWithHeaders(port, { 'session-id': 'alpha' }, { body: anthropic }), 200);
     const ids = sessionIds(am);
     assert.equal(ids.length, 3);
     assert.ok(ids.includes('alpha'));
@@ -267,7 +254,7 @@ test('body affinity preserves hard pins and model route eligibility', async t =>
       }
       if (pin === 'model') am.setRoutes([{ name: 'codex', match: [CODEX_MODEL], accounts: ['b'] }]);
       if (pin === 'body-is-not-session') am.sessionPins.set(key('alpha'), 'b');
-      assert.equal(await codexPost(port, body, { path, headers }), 200);
+      assert.equal(await postWithHeaders(port, headers, { body, path }), 200);
       assert.equal(received[0].account, pin === 'body-is-not-session' ? 'Bearer key-a' : 'Bearer key-b');
       assert.deepEqual(received[0].body, body);
     }, { ...codexOpts, ...(pin === 'forced' ? { forcedPin: 'b' } : {}) });
@@ -277,10 +264,10 @@ test('body affinity preserves hard pins and model route eligibility', async t =>
 test('body affinity follows quota retry and retains exact bytes on every attempt', async () => {
   await withProxy(async (port, started, am, received) => {
     const body = codexBody();
-    assert.equal(await codexPost(port, body), 200);
+    assert.equal(await postWithHeaders(port, {}, { body, path: CODEX_PATH }), 200);
     // A is still held, so routing alone cannot prove the retry recorded B.
     assert.deepEqual(am.sessionTracker.pinnedAccounts(key('alpha')), [1]);
-    assert.equal(await codexPost(port, body), 200);
+    assert.equal(await postWithHeaders(port, {}, { body, path: CODEX_PATH }), 200);
     assert.deepEqual(received.map(r => r.account), ['Bearer key-a', 'Bearer key-b', 'Bearer key-b']);
     assert.deepEqual(received.map(r => r.body), [body, body, body]);
     assert.deepEqual(started, [null, null]);
@@ -294,12 +281,21 @@ test('body affinity follows quota retry and retains exact bytes on every attempt
 
 test('invalid body keys do not reject or rewrite the HTTP request', async () => {
   await withProxy(async (port, started, am, received) => {
+    const malformed = [0xff, 0xfe].map(byte => Buffer.concat([
+      Buffer.from('{"model":"gpt-5.6-sol","prompt_cache_key":"'), Buffer.from([byte]), Buffer.from('"}'),
+    ]));
+    for (const body of malformed) assert.equal(await postWithHeaders(port, {}, { body, path: CODEX_PATH }), 400);
+    assert.deepEqual(sessionIds(am), [], 'invalid UTF-8 must not seed a replacement-character affinity');
+    am.recordSession('fixture-load', 0, CODEX_MODEL);
+    const control = codexBody('\ufffd');
+    assert.equal(await postWithHeaders(port, {}, { body: control, path: CODEX_PATH }), 200);
+    assert.equal(received[2].account, 'Bearer key-b', 'valid U+FFFD must receive fresh placement');
     const bodies = ['{"model":"gpt-5.6-sol","prompt_cache_key":"alpha"} trailing',
       '{"model":"gpt-5.6-sol","prompt_cache_key":null,"promptCacheKey":"alpha"}',
       '{"model":"gpt-5.6-sol","prompt_cache_key":""}'].map(s => Buffer.from(s));
-    for (const body of bodies) assert.equal(await codexPost(port, body), 200);
-    assert.deepEqual(sessionIds(am), []);
-    assert.deepEqual(started, [null, null, null]);
-    assert.deepEqual(received.map(r => r.body), bodies);
-  }, codexOpts);
+    for (const body of bodies) assert.equal(await postWithHeaders(port, {}, { body, path: CODEX_PATH }), 200);
+    assert.deepEqual(sessionIds(am).filter(id => id.startsWith('codex:')), [key('\ufffd')]);
+    assert.deepEqual(started, Array(6).fill(null));
+    assert.deepEqual(received.map(r => r.body), [...malformed, control, ...bodies]);
+  }, { ...codexOpts, respond: (_entry, attempt) => attempt <= 2 ? { status: 400 } : null });
 });

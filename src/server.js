@@ -1,5 +1,6 @@
 import http from 'node:http';
 import https from 'node:https';
+import { isUtf8 } from 'node:buffer';
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { createWriteStream, mkdirSync, writeSync } from 'node:fs';
 import { readdir, stat, unlink } from 'node:fs/promises';
@@ -1867,7 +1868,7 @@ export function clientSessionId(headers) {
  * @returns {string|null}
  */
 export function codexPromptCachePinKey(body) {
-  if (!body) return null;
+  if (!body || !isUtf8(body)) return null;
   let parsed;
   try { parsed = JSON.parse(body.toString('utf8')); } catch { return null; }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
@@ -2221,7 +2222,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       const { conversation, pinKey, onMessage } = sessionId && provider === DEFAULT_PROVIDER
         ? placeConversation(accountManager, body, sessionId)
         : { conversation: null, pinKey: pinKeyFor(sessionId, null) ?? (
-          provider === 'codex' && req.method === 'POST' && classifiedPath === '/backend-api/codex/responses'
+          req.method === 'POST' && classifiedPath === '/backend-api/codex/responses'
             && !Object.hasOwn(req.headers, 'x-claude-code-session-id') && !Object.hasOwn(req.headers, 'session-id')
             ? codexPromptCachePinKey(body) : null
         ), onMessage: null };
