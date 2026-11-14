@@ -174,7 +174,7 @@ export function clearAddedAccountIds(config) {
  * which names the file an entry reads its credential from at the next start, so
  * the survivor was left pointing at the deleted account's credentials (#329).
  */
-function claimDiskRows(configAccounts, diskAccounts, removedIds) {
+export function claimDiskRows(configAccounts, diskAccounts, removedIds, exactIds = false) {
   const rowFor = new Map();
   const taken = new Set();
   for (const [d, diskAcct] of diskAccounts.entries()) {
@@ -189,32 +189,12 @@ function claimDiskRows(configAccounts, diskAccounts, removedIds) {
     }
   };
   configAccounts.forEach((a, i) => { if (a?.id) claim(i, d => d?.id === a.id); });
+  // Retired IDs cannot gain credential ownership from names or profile UUIDs.
+  if (exactIds) return rowFor;
   configAccounts.forEach((a, i) => { if (!rowFor.has(i) && a?.accountUuid) claim(i, d => d?.accountUuid === a.accountUuid && sameOrg(d, a) === true); });
   configAccounts.forEach((a, i) => { if (!rowFor.has(i) && a?.accountUuid) claim(i, d => d?.accountUuid && sameIdentity(d, a)); });
   configAccounts.forEach((a, i) => { if (!rowFor.has(i)) claim(i, d => sameIdentity(d, a)); });
   return rowFor;
-}
-
-/** Adopt repaired disk IDs without losing the old config-to-manager pairing.
- * @param {any[]} configAccounts @param {any[]} managerAccounts
- * @param {any[]} diskAccounts @param {Set<string>} [removedIds]
- * @returns {number[]} manager indexes whose automatic pins must be released
- */
-export function reconcileAccountIds(configAccounts, managerAccounts, diskAccounts, removedIds = new Set()) {
-  const claims = claimDiskRows(configAccounts, diskAccounts || [], removedIds);
-  const managers = configAccounts.map(a => managerAccountFor(managerAccounts, a));
-  const changed = [];
-  for (const [i, d] of claims) {
-    const id = diskAccounts[d]?.id;
-    if (typeof id !== 'string' || !id || configAccounts[i].id === id) continue;
-    configAccounts[i].id = id;
-    const manager = managers[i];
-    if (manager && manager.id !== id) {
-      manager.id = id;
-      changed.push(managerAccounts.indexOf(manager));
-    }
-  }
-  return changed;
 }
 
 /**
@@ -225,14 +205,18 @@ export function reconcileAccountIds(configAccounts, managerAccounts, diskAccount
  *
  * The config-to-disk lookup is a different axis from the config-to-manager one,
  * and claimDiskRows is where it is decided: one row per entry, one entry per row.
+ * @param {{exactIds?: boolean, addedIds?: Set<string>}} [options]
  */
-export function mergeAccountsForSave(configAccounts, managerAccounts, diskAccounts, removedIds = new Set()) {
+export function mergeAccountsForSave(configAccounts, managerAccounts, diskAccounts, removedIds = new Set(), options = {}) {
+  const { exactIds = false, addedIds = new Set() } = options;
   // loadConfig normalises a missing list, but this is the function that threw
   // on one (#330), so it holds its own contract too: no rows is an empty list.
   if (!Array.isArray(diskAccounts)) diskAccounts = [];
-  const rowFor = claimDiskRows(configAccounts, diskAccounts, removedIds);
+  const rowFor = claimDiskRows(configAccounts, diskAccounts, removedIds, exactIds);
 
-  const merged = configAccounts.map((a, i) => {
+  const merged = configAccounts.flatMap((a, i) => {
+    // Only a recorded pending addition may be saved without its own disk row.
+    if (exactIds && !rowFor.has(i) && !addedIds.has(a?.id)) return [];
     const am = managerAccountFor(managerAccounts, a);
     const live = am && ownsInlineToken(a) ? {
       ...a,
@@ -241,7 +225,7 @@ export function mergeAccountsForSave(configAccounts, managerAccounts, diskAccoun
       expiresAt: am.expiresAt,
     } : a;
     const diskAcct = diskAccounts[rowFor.get(i)];
-    return diskAcct ? { ...diskAcct, ...live } : live;
+    return [diskAcct ? { ...diskAcct, ...live } : live];
   });
 
   // Carry over rows that exist on disk and not in memory. The list used to be

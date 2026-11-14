@@ -263,8 +263,8 @@ for (const mode of ['raw', 'filtered', 'save', 'atomic']) {
 }
 
 // Exercise the live consumers through the real CLI before any restart.
-for (const [enabled, diskFlag] of [[true, true], [true, false], [false, true]]) for (const mode of ['reload', 'token', 'account', 'setting']) {
-  test(`live ID repair during ${mode} (startup ${enabled}, disk ${diskFlag}) preserves pairing and fresh affinity`, async () => {
+for (const [enabled, diskFlag] of [[true, true], [true, false], [false, true]]) for (const renamed of enabled ? [false, true] : [false]) for (const mode of ['reload', 'token', 'account', 'setting']) {
+  test(`live ID repair during ${mode} (startup ${enabled}, disk ${diskFlag}, renamed ${renamed}) preserves entry credentials`, async () => {
     const dir = await mkdtemp(join(tmpdir(), 'tc-affinity-live-'));
     let srv;
     const upstream = http.createServer((req, res) => { req.resume(); res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ key: req.headers.authorization || req.headers['x-api-key'] })); });
@@ -288,7 +288,9 @@ AccountManager.prototype.onTokenRefresh = function(cb) { onRefresh.call(this, cb
       srv = await spawnServer({ dir, env: { ...envFor(dir), NODE_OPTIONS: `--import=${preload}` }, config: () => config });
       const disk = JSON.parse(await readFile(srv.configPath, 'utf8'));
       disk.persistSessionAffinity = diskFlag;
-      disk.accounts[enabled ? 'unshift' : 'push']({ ...original, name: 'copy', accessToken: 'synthetic-copy' });
+      const ownerName = renamed ? 'renamed-original' : 'original', copyName = renamed ? 'original' : 'copy';
+      if (renamed) disk.accounts.find(a => a.id === 'b').name = ownerName;
+      disk.accounts[enabled ? 'unshift' : 'push']({ ...original, name: copyName, accessToken: 'synthetic-copy', refreshToken: 'synthetic-copy-refresh' });
       await writeFile(srv.configPath, JSON.stringify(disk));
       if (mode === 'token') {
         const written = new Promise(resolve => srv.child.stdout.on('data', chunk => { if (chunk.includes('fixture-token-written')) resolve(); }));
@@ -304,12 +306,23 @@ AccountManager.prototype.onTokenRefresh = function(cb) { onRefresh.call(this, cb
       }
       const repaired = JSON.parse(await readFile(srv.configPath, 'utf8')).accounts;
       assert.equal(repaired.some(a => a.id === 'b'), !enabled, 'normalization follows startup policy');
-      const owner = repaired.find(a => a.name === 'original');
-      assert.equal(owner.accessToken, mode === 'token' ? 'synthetic-fresh' : 'synthetic-original');
-      assert.equal(repaired.find(a => a.name === 'copy').accessToken, 'synthetic-copy');
+      const persisted = !enabled && mode === 'token' ? 'synthetic-fresh' : 'synthetic-original';
+      assert.equal(repaired.filter(a => a.name === ownerName || a.name === copyName).length, 2, 'both disk claimants survive');
+      const owner = repaired.find(a => a.name === ownerName), copy = repaired.find(a => a.name === copyName);
+      assert.equal(owner.accessToken, persisted);
+      assert.equal(owner.refreshToken, !enabled && mode === 'token' ? 'synthetic-fresh-refresh' : 'synthetic-refresh');
+      assert.deepEqual([copy.accessToken, copy.refreshToken], ['synthetic-copy', 'synthetic-copy-refresh']);
       assert.equal(repaired.find(a => a.id === 'empty').accessToken, undefined);
-      const expected = mode === 'token' ? 'Bearer synthetic-fresh' : 'Bearer synthetic-original';
-      assert.equal((await post(srv.port, 'fresh-after-repair', '/tc-acct/original/v1/messages')).key, expected);
+      const live = mode === 'token' ? 'Bearer synthetic-fresh' : 'Bearer synthetic-original';
+      assert.equal((await post(srv.port, 'fresh-after-repair', `/tc-acct/${mode === 'reload' || mode === 'setting' ? ownerName : 'original'}/v1/messages`)).key, live);
+      if (enabled) {
+        if (mode === 'token') assert.match(srv.output(), /not saved: no row .* carries its entry id/);
+        const res = await fetch(`http://127.0.0.1:${srv.port}/teamclaude/reload`, { method: 'POST', headers: { 'x-api-key': 'test-key' } });
+        assert.equal(res.status, 200);
+        await res.json();
+        assert.equal((await post(srv.port, 'copied-entry', `/tc-acct/${copyName}/v1/messages`)).key, 'Bearer synthetic-copy');
+        assert.equal((await post(srv.port, 'fresh-after-repair', `/tc-acct/${ownerName}/v1/messages`)).key, `Bearer ${persisted}`);
+      }
       await srv.stop();
       const final = JSON.parse(await readFile(statePath(dir), 'utf8')).affinity?.sessions;
       if (enabled) {
@@ -318,8 +331,8 @@ AccountManager.prototype.onTokenRefresh = function(cb) { onRefresh.call(this, cb
         assert.equal(final.find(s => s.key === 'stable').pins[0].account.id, 'a');
       } else assert.equal(final, undefined, 'disk enable cannot activate the writer');
       srv = await spawnServer({ dir, env: envFor(dir), config: () => ({ ...config, persistSessionAffinity: true, accounts: repaired }) });
-      if (enabled) assert.equal((await post(srv.port, 'fresh-after-repair')).key, expected);
-      else assert.equal((await post(srv.port, 'fresh-after-repair', '/tc-acct/original/v1/messages')).key, expected);
+      if (enabled) assert.equal((await post(srv.port, 'fresh-after-repair')).key, `Bearer ${persisted}`);
+      else assert.equal((await post(srv.port, 'fresh-after-repair', '/tc-acct/original/v1/messages')).key, live);
       await srv.stop();
       assert.ok(JSON.parse(await readFile(statePath(dir), 'utf8')).affinity?.sessions.length, 'enable takes effect on restart');
     } finally {

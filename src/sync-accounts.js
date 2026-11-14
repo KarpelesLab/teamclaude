@@ -1,7 +1,7 @@
 import { importCredentials } from './oauth.js';
 import { sameIdentity } from './identity.js';
 import { safeLine } from './safe-text.js';
-import { removedAccountIds, addedAccountIds, configIndexFor, reconcileAccountIds } from './account-pairing.js';
+import { removedAccountIds, addedAccountIds, configIndexFor, claimDiskRows } from './account-pairing.js';
 import { ensureAccountIds } from './account-id.js';
 import { accountSwitchThreshold, accountAllowsExtraUsage, accountRouting } from './account-manager.js';
 import { localListener } from './upstream-proxy.js';
@@ -17,11 +17,13 @@ import { accountCredit } from './api-credit.js';
  * @param {import('./account-manager.js').AccountManager} accountManager
  */
 export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
-  if (memConfig.persistSessionAffinity === true) {
-    for (const idx of reconcileAccountIds(memConfig.accounts, accountManager.accounts, diskConfig.accounts, removedAccountIds(memConfig))) {
-      accountManager.sessionTracker.releaseAccount(idx);
-    }
-  }
+  const exactIds = memConfig.persistSessionAffinity === true;
+  const removed = removedAccountIds(memConfig);
+  // Capture exact claims before additions mutate either list; default pairing stays below.
+  const managerRows = exactIds ? new Map(Array.from(claimDiskRows(accountManager.accounts, diskConfig.accounts, removed, true),
+    ([i, d]) => [diskConfig.accounts[d], i])) : null;
+  const configRows = exactIds ? new Map(Array.from(claimDiskRows(memConfig.accounts, diskConfig.accounts, removed, true),
+    ([i, d]) => [diskConfig.accounts[d], memConfig.accounts[i]])) : null;
   let added = 0;
   // Greedy 1:1 pairing of disk entries to in-memory accounts, account+org aware.
   // Each disk entry claims at most one unclaimed manager account, so multiple
@@ -60,13 +62,13 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
   // save writes it back too. The ids are recorded for exactly that window
   // (cleared once the save lands), so a row naming one is the removal itself,
   // not a new account (#422).
-  const removed = removedAccountIds(memConfig);
   for (const diskAcct of diskConfig.accounts) {
     if (diskAcct?.id && removed.has(diskAcct.id)) continue;
-    const mgrIdx = claim(diskAcct);
+    const mgrIdx = exactIds ? managerRows?.get(diskAcct) ?? -1 : claim(diskAcct);
+    if (mgrIdx >= 0) claimed.add(mgrIdx);
     // Claimed once per disk entry and reused below. Calling claimConfig twice
     // for one entry would consume two different config rows.
-    const cfgAcct = claimConfig(diskAcct);
+    const cfgAcct = exactIds ? configRows?.get(diskAcct) : claimConfig(diskAcct);
 
     if (mgrIdx < 0) {
       // No manager account — which is NOT the same as "not yet known".
