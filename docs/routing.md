@@ -261,7 +261,7 @@ checks still govern every request. Thread ownership can survive a dropped pin,
 but does not make another account capable of continuing the upstream thread.
 
 While a request is in flight, a snapshot observes its current use without storing request counters or resuming the stream. Idle timestamps remain unchanged across saves and restarts; expiry follows the tracker’s existing wall clock behavior, including backward clock adjustments. Pin timestamps retain their original values even when another family was last used after the clock moved backward.
-With persistence enabled at startup, live reads and writes require exact entry IDs despite later flag edits. A retired ID cannot borrow a copy's credentials: its token save is skipped, and reload replaces it with the repaired disk entries. Old automatic pins are dropped; thread ownership and unrelated pins remain available.
+With persistence enabled at startup, live reads and writes require exact entry IDs with compatible provider/account scope despite later flag edits. A retired ID cannot borrow a copy's credentials: its token save is skipped, and reload replaces it with the repaired disk entries. Old automatic pins are dropped; thread ownership and unrelated pins remain available.
 
 State is saved on the existing minute tick and on graceful shutdown, including
 once more after an enabled drain completes. Abrupt termination can lose routing

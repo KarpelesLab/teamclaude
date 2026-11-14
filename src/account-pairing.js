@@ -14,7 +14,7 @@
 // evidence and admits no ambiguity: it survives the refresh that rewrites the
 // credential, and it separates two entries that agree on everything else.
 
-import { sameIdentity, sameOrg } from './identity.js';
+import { distinctAccounts, sameIdentity, sameOrg } from './identity.js';
 
 /**
  * The manager account built from config entry `acct`, or null if it has none.
@@ -164,8 +164,8 @@ export function clearAddedAccountIds(config) {
  * the next start. findUpsertTarget in identity.js puts the same questions in
  * this order for the login axis.
  *
- * Ids can disagree with disk — a file written before the field existed, or
- * re-minted by another process — which is why they cannot be the only pass.
+ * Defaults allow fallback when disk IDs are absent or re-minted by another process.
+ * Affinity mode requires compatible exact IDs, without identity or name fallback.
  *
  * A row the operator removed is claimed by nobody. Removal consults `removedIds`
  * where rows are carried over, so the removed row is not appended as its own
@@ -188,7 +188,7 @@ export function claimDiskRows(configAccounts, diskAccounts, removedIds, exactIds
       return;
     }
   };
-  configAccounts.forEach((a, i) => { if (a?.id) claim(i, d => d?.id === a.id); });
+  configAccounts.forEach((a, i) => { if (a?.id) claim(i, d => d?.id === a.id && (!exactIds || !distinctAccounts(a, d))); });
   // Retired IDs cannot gain credential ownership from names or profile UUIDs.
   if (exactIds) return rowFor;
   configAccounts.forEach((a, i) => { if (!rowFor.has(i) && a?.accountUuid) claim(i, d => d?.accountUuid === a.accountUuid && sameOrg(d, a) === true); });

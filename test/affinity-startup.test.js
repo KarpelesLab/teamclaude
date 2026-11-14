@@ -299,10 +299,12 @@ AccountManager.prototype.onTokenRefresh = function(cb) { onRefresh.call(this, cb
       } else {
         const res = await fetch(`http://127.0.0.1:${srv.port}/teamclaude/${mode === 'reload' ? 'reload' : 'mcp'}`, {
           method: 'POST', headers: { 'x-api-key': 'test-key', 'content-type': 'application/json' },
-          ...(mode !== 'reload' ? { body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: mode === 'setting' ? { name: 'set_distribution', arguments: { mode: 'even' } } : { name: 'set_account_priority', arguments: { account: 'original', priority: 0 } } }) } : {}),
+          ...(mode !== 'reload' ? { body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: mode === 'setting' ? { name: 'set_distribution', arguments: { mode: 'even' } } : { name: 'set_account_priority', arguments: { account: 'original', priority: 3 } } }) } : {}),
         });
         assert.equal(res.status, 200);
-        assert.notEqual((await res.json()).result?.isError, true);
+        const result = await res.json();
+        assert.notEqual(result.result?.isError, true);
+        if (mode === 'account') assert.equal(result.result.structuredContent.persisted, !enabled, 'report whether the edited entry survived the actual save');
       }
       const repaired = JSON.parse(await readFile(srv.configPath, 'utf8')).accounts;
       assert.equal(repaired.some(a => a.id === 'b'), !enabled, 'normalization follows startup policy');
@@ -316,7 +318,7 @@ AccountManager.prototype.onTokenRefresh = function(cb) { onRefresh.call(this, cb
       const live = mode === 'token' ? 'Bearer synthetic-fresh' : 'Bearer synthetic-original';
       assert.equal((await post(srv.port, 'fresh-after-repair', `/tc-acct/${mode === 'reload' || mode === 'setting' ? ownerName : 'original'}/v1/messages`)).key, live);
       if (enabled) {
-        if (mode === 'token') assert.match(srv.output(), /not saved: no row .* carries its entry id/);
+        if (mode === 'token') assert.match(srv.output(), /not saved: no compatible row .* carries its entry id/);
         const res = await fetch(`http://127.0.0.1:${srv.port}/teamclaude/reload`, { method: 'POST', headers: { 'x-api-key': 'test-key' } });
         assert.equal(res.status, 200);
         await res.json();
@@ -335,6 +337,52 @@ AccountManager.prototype.onTokenRefresh = function(cb) { onRefresh.call(this, cb
       else assert.equal((await post(srv.port, 'fresh-after-repair', '/tc-acct/original/v1/messages')).key, live);
       await srv.stop();
       assert.ok(JSON.parse(await readFile(statePath(dir), 'utf8')).affinity?.sessions.length, 'enable takes effect on restart');
+    } finally {
+      await srv?.stop();
+      upstream.closeAllConnections();
+      await new Promise(resolve => upstream.close(resolve));
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const phase of ['reload', 'token']) {
+  test(`same-ID provider replacement cannot cross credentials during ${phase}`, async t => {
+    const dir = await mkdtemp(join(tmpdir(), 'tc-affinity-provider-'));
+    let srv;
+    const upstream = http.createServer((req, res) => { req.resume(); res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ key: req.headers.authorization || req.headers['x-api-key'] })); });
+    try {
+      await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
+      const original = { id: 'b', name: 'original', type: 'oauth', accessToken: 'synthetic-claude', expiresAt: Date.now() + 3_600_000 };
+      const config = { proxy: { apiKey: 'test-key' }, upstreamProxy: false, autoUpdate: false, quotaProbeSeconds: 0,
+        upstream: `http://127.0.0.1:${upstream.address().port}`, persistSessionAffinity: true, distributeSessions: 'adaptive', accounts: [accounts[0], original] };
+      const preload = join(dir, 'provider-refresh.mjs');
+      await writeFile(preload, `import { AccountManager } from ${JSON.stringify(new URL('../src/account-manager.js', import.meta.url).href)};
+import fs from 'node:fs/promises'; import { syncBuiltinESMExports } from 'node:module';
+const rename = fs.rename; fs.rename = async (...args) => { await rename(...args); if (args[1] === process.env.TEAMROUTER_CONFIG) console.log('fixture-provider-written'); }; syncBuiltinESMExports();
+const onRefresh = AccountManager.prototype.onTokenRefresh;
+AccountManager.prototype.onTokenRefresh = function(cb) { onRefresh.call(this, cb); process.on('SIGUSR2', () => this.updateAccountTokens(this.accounts.findIndex(a => a.id === 'b'), { accessToken: 'synthetic-claude-fresh', expiresAt: Date.now() + 7_200_000 })); };`);
+      srv = await spawnServer({ dir, env: { ...envFor(dir), NODE_OPTIONS: `--import=${preload}` }, config: () => config });
+      assert.equal((await post(srv.port, 'provider-opening', '/tc-acct/original/v1/messages')).key, 'Bearer synthetic-claude');
+      const disk = JSON.parse(await readFile(srv.configPath, 'utf8'));
+      Object.assign(disk.accounts[1], { provider: 'codex', accountId: 'workspace', accessToken: 'synthetic-codex', expiresAt: Date.now() + 7_200_000 });
+      await writeFile(srv.configPath, JSON.stringify(disk));
+      if (phase === 'token') {
+        const written = outputMarker(srv.child, 'fixture-provider-written', t.signal);
+        srv.child.kill('SIGUSR2');
+        await written;
+        assert.equal(JSON.parse(await readFile(srv.configPath, 'utf8')).accounts[1].accessToken, 'synthetic-codex');
+        assert.match(srv.output(), /not saved: no compatible row .* carries its entry id/);
+      }
+      const res = await fetch(`http://127.0.0.1:${srv.port}/teamclaude/reload`, { method: 'POST', headers: { 'x-api-key': 'test-key' } });
+      assert.equal(res.status, 200);
+      await res.json();
+      assert.equal((await post(srv.port, 'provider-opening')).key, 'synthetic-a', 'Claude must never forward the Codex replacement token');
+      await srv.stop();
+      const saved = JSON.parse(await readFile(srv.configPath, 'utf8'));
+      assert.deepEqual(saved.accounts.map(a => a.id), ['a', 'b']);
+      srv = await spawnServer({ dir, env: envFor(dir), config: () => saved });
+      assert.equal((await post(srv.port, 'provider-opening')).key, 'synthetic-a');
     } finally {
       await srv?.stop();
       upstream.closeAllConnections();

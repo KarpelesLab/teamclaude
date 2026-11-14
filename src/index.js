@@ -29,7 +29,7 @@ import { loginCodex, startCodexLogin } from './codex-auth.js';
 import { isRemoteSession, openBrowser, PANEL_LOGIN_TIMEOUT_MS } from './login-flow.js';
 import { providerOf, canServeProvider } from './provider.js';
 import { syncAccountsFromDisk } from './sync-accounts.js';
-import { mergeAccountsForSave, syncRefreshedTokens, removedAccountIds, addedAccountIds, clearRemovedAccountIds, clearAddedAccountIds, markAccountRemoved, configIndexFor } from './account-pairing.js';
+import { claimDiskRows, mergeAccountsForSave, syncRefreshedTokens, removedAccountIds, addedAccountIds, clearRemovedAccountIds, clearAddedAccountIds, markAccountRemoved, configIndexFor } from './account-pairing.js';
 import { ensureAccountIds, accountIdsComplete } from './account-id.js';
 import * as alias from './alias.js';
 import { ensureCerts, mitmHosts, caCertPath } from './mitm.js';
@@ -516,7 +516,7 @@ async function serverCommand() {
     // Keep config.accounts in sync so the TUI save does not clobber fresh tokens.
     // A -1 means no config entry pairs with this account and the in-memory copy
     // keeps what it had; the disk write below is unaffected either way, since it
-    // resolves its own row through findConfigAccount rather than this pairing.
+    // resolves its own disk row rather than relying on this memory pairing.
     syncRefreshedTokens(config.accounts, accountManager.accounts, idx, newTokens);
     atomicConfigUpdate(diskConfig => {
       // Pick up any new accounts from disk so the running fleet serves them
@@ -535,9 +535,9 @@ async function serverCommand() {
           accountManager.addAccount(diskAcct);
         }
       }
-      // By entry id only — the index may have shifted, and identity is not
-      // one-to-one (see findConfigAccount). No row: nothing is written.
-      const cfgIdx = findConfigAccount(diskConfig, account);
+      // The captured entry ID survives index shifts; affinity mode also checks
+      // compatible scope through shared claims. No compatible row: no write.
+      const cfgIdx = persistSessionAffinity ? claimDiskRows([account], diskConfig.accounts, removed, true).get(0) ?? -1 : findConfigAccount(diskConfig, account);
       if (cfgIdx >= 0) {
         diskConfig.accounts[cfgIdx].accessToken = newTokens.accessToken;
         diskConfig.accounts[cfgIdx].refreshToken = newTokens.refreshToken;
@@ -546,7 +546,7 @@ async function serverCommand() {
         // Said out loud: the account keeps serving on the new token, so nothing
         // else shows that the file still holds the old one until a restart
         // fails on it.
-        console.error(`[TeamClaude] Refreshed token for "${safeLine(account.name, 64)}" not saved: no row in ${getConfigPath()} carries its entry id`);
+        console.error(`[TeamClaude] Refreshed token for "${safeLine(account.name, 64)}" not saved: no compatible row in ${getConfigPath()} carries its entry id`);
       }
     }).catch(err => console.error(`[TeamClaude] Failed to save refreshed token: ${err.message}`));
     // And to the credential store, when signed in. Not awaited: the disk
