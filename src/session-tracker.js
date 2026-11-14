@@ -162,14 +162,14 @@ function setAndReturn(map, key, value) {
 /** @typedef {{key: string, sessionId: string|null, conversation: string|null, lastSeen: number, pins: AffinityPin[], threads: string[]}} AffinitySession */
 /** @param {unknown} value @param {number} limit @returns {value is string} */
 const boundedString = (value, limit) => typeof value === 'string' && value.length > 0 && value.length <= limit;
-/** @param {unknown} value @param {number} now @returns {value is number} */
-const affinityTime = (value, now) => typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= now;
+/** @param {unknown} value @returns {value is number} */
+const affinityTime = value => typeof value === 'number' && Number.isFinite(value) && value >= 0;
 /** @param {any} row @returns {row is AffinitySession} */
 function affinityRow(row) {
   return row != null && boundedString(row.key, MAX_KEY_LENGTH)
     && (row.sessionId === null || boundedString(row.sessionId, MAX_SESSION_ID_LENGTH))
     && (row.conversation === null || boundedString(row.conversation, 22))
-    && affinityTime(row.lastSeen, Infinity)
+    && affinityTime(row.lastSeen)
     && Array.isArray(row.pins) && Array.isArray(row.threads);
 }
 /** @param {any} ref @returns {ref is AffinityAccount} */
@@ -214,7 +214,7 @@ export class SessionTracker {
       const pins = [];
       for (const [bucket, pin] of s.pins) {
         const account = identifyAccount(pin.idx);
-        if (affinityAccount(account) && typeof bucket === 'string' && bucket && affinityTime(pin.at, s.lastSeen)) {
+        if (affinityAccount(account) && typeof bucket === 'string' && bucket && affinityTime(pin.at)) {
           pins.push({ bucket, account: { id: account.id, provider: account.provider }, at: pin.at });
         }
       }
@@ -239,7 +239,7 @@ export class SessionTracker {
       const pins = new Map();
       for (const pin of row.pins) {
         if (!pin || typeof pin.bucket !== 'string' || !pin.bucket || pins.has(pin.bucket)
-            || !affinityAccount(pin.account) || !affinityTime(pin.at, row.lastSeen)) continue;
+            || !affinityAccount(pin.account) || !affinityTime(pin.at)) continue;
         const idx = resolveAccount(pin.account);
         if (idx != null && Number.isInteger(idx) && idx >= 0) pins.set(pin.bucket, { idx, at: pin.at });
       }

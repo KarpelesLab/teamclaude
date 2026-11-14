@@ -178,16 +178,16 @@ for (const mode of ['raw', 'filtered', 'save', 'atomic']) {
   });
 }
 
-// Exercise the three live consumers through the real CLI before any restart.
-for (const mode of ['reload', 'token', 'account']) {
-  test(`live ID repair during ${mode} preserves pairing and fresh affinity`, async () => {
+// Exercise the live consumers through the real CLI before any restart.
+for (const [enabled, diskFlag] of [[true, true], [true, false], [false, true]]) for (const mode of ['reload', 'token', 'account', 'setting']) {
+  test(`live ID repair during ${mode} (startup ${enabled}, disk ${diskFlag}) preserves pairing and fresh affinity`, async () => {
     const dir = await mkdtemp(join(tmpdir(), 'tc-affinity-live-'));
     let srv;
     const upstream = http.createServer((req, res) => { req.resume(); res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ key: req.headers.authorization || req.headers['x-api-key'] })); });
     try {
       await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
       const original = { id: 'b', name: 'original', type: 'oauth', accessToken: 'synthetic-original', refreshToken: 'synthetic-refresh', expiresAt: Date.now() + 3_600_000 };
-      const config = { proxy: { apiKey: 'test-key', mcp: 'full' }, upstreamProxy: false, autoUpdate: false, persistSessionAffinity: true,
+      const config = { proxy: { apiKey: 'test-key', mcp: 'full' }, upstreamProxy: false, autoUpdate: false, persistSessionAffinity: enabled,
         upstream: `http://127.0.0.1:${upstream.address().port}`, distributeSessions: true,
         accounts: [{ id: 'empty', name: 'tokenless', type: 'oauth' }, accounts[0], original] };
       const saved = seeded();
@@ -203,7 +203,8 @@ const onRefresh = AccountManager.prototype.onTokenRefresh;
 AccountManager.prototype.onTokenRefresh = function(cb) { onRefresh.call(this, cb); process.on('SIGUSR2', () => this.updateAccountTokens(this.accounts.findIndex(a => a.name === 'original'), { accessToken: 'synthetic-fresh', refreshToken: 'synthetic-fresh-refresh', expiresAt: Date.now() + 7_200_000 })); };`);
       srv = await spawnServer({ dir, env: { ...envFor(dir), NODE_OPTIONS: `--import=${preload}` }, config: () => config });
       const disk = JSON.parse(await readFile(srv.configPath, 'utf8'));
-      disk.accounts.unshift({ ...original, name: 'copy', accessToken: 'synthetic-copy' });
+      disk.persistSessionAffinity = diskFlag;
+      disk.accounts[enabled ? 'unshift' : 'push']({ ...original, name: 'copy', accessToken: 'synthetic-copy' });
       await writeFile(srv.configPath, JSON.stringify(disk));
       if (mode === 'token') {
         const written = new Promise(resolve => srv.child.stdout.on('data', chunk => { if (chunk.includes('fixture-token-written')) resolve(); }));
@@ -212,13 +213,13 @@ AccountManager.prototype.onTokenRefresh = function(cb) { onRefresh.call(this, cb
       } else {
         const res = await fetch(`http://127.0.0.1:${srv.port}/teamclaude/${mode === 'reload' ? 'reload' : 'mcp'}`, {
           method: 'POST', headers: { 'x-api-key': 'test-key', 'content-type': 'application/json' },
-          ...(mode === 'account' ? { body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'set_account_priority', arguments: { account: 'original', priority: 0 } } }) } : {}),
+          ...(mode !== 'reload' ? { body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: mode === 'setting' ? { name: 'set_distribution', arguments: { mode: 'even' } } : { name: 'set_account_priority', arguments: { account: 'original', priority: 0 } } }) } : {}),
         });
         assert.equal(res.status, 200);
         assert.notEqual((await res.json()).result?.isError, true);
       }
       const repaired = JSON.parse(await readFile(srv.configPath, 'utf8')).accounts;
-      assert.ok(repaired.every(a => a.id !== 'b'), 'live save must not reintroduce a retired ID');
+      assert.equal(repaired.some(a => a.id === 'b'), !enabled, 'normalization follows startup policy');
       const owner = repaired.find(a => a.name === 'original');
       assert.equal(owner.accessToken, mode === 'token' ? 'synthetic-fresh' : 'synthetic-original');
       assert.equal(repaired.find(a => a.name === 'copy').accessToken, 'synthetic-copy');
@@ -226,12 +227,17 @@ AccountManager.prototype.onTokenRefresh = function(cb) { onRefresh.call(this, cb
       const expected = mode === 'token' ? 'Bearer synthetic-fresh' : 'Bearer synthetic-original';
       assert.equal((await post(srv.port, 'fresh-after-repair', '/tc-acct/original/v1/messages')).key, expected);
       await srv.stop();
-      const final = JSON.parse(await readFile(statePath(dir), 'utf8')).affinity.sessions;
-      assert.deepEqual(final.find(s => s.key === 'seed').pins, []);
-      assert.deepEqual(final.find(s => s.key === 'seed').threads, ['msg_original']);
-      assert.equal(final.find(s => s.key === 'stable').pins[0].account.id, 'a');
-      srv = await spawnServer({ dir, env: envFor(dir), config: () => ({ ...config, accounts: repaired }) });
-      assert.equal((await post(srv.port, 'fresh-after-repair')).key, expected);
+      const final = JSON.parse(await readFile(statePath(dir), 'utf8')).affinity?.sessions;
+      if (enabled) {
+        assert.deepEqual(final.find(s => s.key === 'seed').pins, []);
+        assert.deepEqual(final.find(s => s.key === 'seed').threads, ['msg_original']);
+        assert.equal(final.find(s => s.key === 'stable').pins[0].account.id, 'a');
+      } else assert.equal(final, undefined, 'disk enable cannot activate the writer');
+      srv = await spawnServer({ dir, env: envFor(dir), config: () => ({ ...config, persistSessionAffinity: true, accounts: repaired }) });
+      if (enabled) assert.equal((await post(srv.port, 'fresh-after-repair')).key, expected);
+      else assert.equal((await post(srv.port, 'fresh-after-repair', '/tc-acct/original/v1/messages')).key, expected);
+      await srv.stop();
+      assert.ok(JSON.parse(await readFile(statePath(dir), 'utf8')).affinity?.sessions.length, 'enable takes effect on restart');
     } finally {
       await srv?.stop();
       upstream.closeAllConnections();

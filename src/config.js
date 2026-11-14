@@ -189,6 +189,16 @@ export function createDefaultConfig() {
   };
 }
 
+// Only server startup sets this; standalone commands follow their loaded flag.
+/** @type {boolean|undefined} */
+let serverRetireDuplicateIds;
+/** @param {boolean} enabled */
+export function setServerAccountIdPolicy(enabled) {
+  serverRetireDuplicateIds = enabled;
+}
+/** @param {{persistSessionAffinity?: unknown}} config */
+const retireDuplicateIds = config => serverRetireDuplicateIds ?? config.persistSessionAffinity === true;
+
 export async function loadConfig() {
   const path = getConfigPath();
   try {
@@ -202,7 +212,7 @@ export async function loadConfig() {
     // Everything downstream pairs config entries to running accounts by entry id,
     // so a config written before the field existed — or edited by hand — is given
     // ids here, before anything can read one. The next save persists them.
-    ensureAccountIds(config.accounts, { retireDuplicates: config.persistSessionAffinity === true });
+    ensureAccountIds(config.accounts, { retireDuplicates: retireDuplicateIds(config) });
     applyUpstreamProxy(config);
     return config;
   } catch (err) {
@@ -387,7 +397,7 @@ export function withConfigLock(configPath, fn) {
 export async function saveConfig(config) {
   const path = getConfigPath();
   // Every row leaves with an id; see atomicConfigUpdate.
-  ensureAccountIds(config.accounts, { retireDuplicates: config.persistSessionAffinity === true });
+  ensureAccountIds(config.accounts, { retireDuplicates: retireDuplicateIds(config) });
   // The proxy apiKey and every account's tokens live here: see writeJsonAtomic
   // for why this is not a plain writeFile.
   await withConfigLock(path, () => writeJsonAtomic(path, config));
@@ -410,7 +420,7 @@ export function atomicConfigUpdate(updater) {
     // one is given a fresh id by each read: the running server pairs its token
     // writes by id, so the id it minted on reload matched no row on disk, and
     // the account's refreshed tokens were never saved (#564).
-    ensureAccountIds(config.accounts, { retireDuplicates: config.persistSessionAffinity === true });
+    ensureAccountIds(config.accounts, { retireDuplicates: retireDuplicateIds(config) });
     await writeJsonAtomic(path, config);
     return config;
   });

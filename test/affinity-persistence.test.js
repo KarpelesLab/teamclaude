@@ -93,12 +93,24 @@ test('sliding idle lifetime survives days of activity and repeated restarts with
     live.touch('clock', 1, 'unified7d');
     const seen = now;
     now = active ? seen + TTL + 1 : seen - 100;
+    if (!active) {
+      const idle = new SessionTracker({ now: () => now });
+      const beforeUse = JSON.parse(JSON.stringify(live.exportAffinity(identify)));
+      idle.restoreAffinity(beforeUse, resolve);
+      assert.equal(idle.sessions.get('clock')?.lastSeen, seen, 'idle rollback does not renew use');
+      assert.equal(idle.pinnedAccount('clock', 'unified7d'), 1);
+      live.beginRequest('clock');
+      live.touch('clock', 2, 'sibling');
+      assert.equal(live.pinnedAccount('clock', 'unified7d'), 1, 'untouched family remains live');
+    }
     const saved = JSON.parse(JSON.stringify(live.exportAffinity(identify)));
-    assert.equal(saved.sessions[0]?.lastSeen, active ? now : seen);
-    assert.equal(live.sessions.get('clock').lastSeen, seen, 'export does not mutate live use');
+    assert.equal(saved.sessions[0]?.lastSeen, now);
+    assert.equal(live.sessions.get('clock').lastSeen, active ? seen : now, 'export does not mutate live use');
+    assert.equal(saved.sessions[0].pins.find(p => p.bucket === 'unified7d')?.at, seen, 'pin timestamp is preserved');
     const restored = new SessionTracker({ now: () => now });
     restored.restoreAffinity(saved, resolve);
     assert.equal(restored.pinnedAccount('clock', 'unified7d'), 1);
+    if (!active) assert.equal(restored.pinnedAccount('clock', 'sibling'), 2);
     assert.equal(restored.sessions.get('clock').inFlight, 0);
     now = saved.sessions[0].lastSeen + TTL + 1;
     assert.equal(restored.pinnedAccount('clock', 'unified7d'), null);
@@ -130,12 +142,14 @@ test('malformed versions, keys, timestamps and duplicate records cannot create a
   assert.equal(tracker.pinnedAccount(KEY, 'unified7d'), 1);
   assert.equal(tracker.threadOwner('client', 'msg_other'), null);
   const invalidPins = [null, {}, { bucket: '', account: identify(1), at: 90 },
-    { bucket: 'future', account: identify(1), at: 101 }, { bucket: 'late', account: identify(1), at: 99 },
+    { bucket: 'string-time', account: identify(1), at: '90' }, { bucket: 'null-time', account: identify(1), at: null },
     { bucket: 'negative', account: identify(1), at: -1 }, { bucket: 'missing', account: {}, at: 90 }];
-  const clean = new SessionTracker({ now: () => 100 });
-  clean.restoreAffinity(snapshot(row({ lastSeen: 95, pins: invalidPins, threads: ['msg_1', '', 123, 'x'.repeat(129)] })), resolve);
-  assert.equal(clean.pinnedAccounts(KEY).length, 0);
-  assert.deepEqual(clean.exportAffinity(identify).sessions[0].threads, ['msg_1']);
+  for (const pin of invalidPins) {
+    const clean = new SessionTracker({ now: () => 100 });
+    clean.restoreAffinity(JSON.parse(JSON.stringify(snapshot(row({ lastSeen: 95, pins: [pin], threads: ['msg_1', '', 123, 'x'.repeat(129)] })))), resolve);
+    assert.equal(clean.pinnedAccounts(KEY).length, 0, JSON.stringify(pin));
+    assert.deepEqual(clean.exportAffinity(identify).sessions[0].threads, ['msg_1']);
+  }
 });
 
 test('restore bounds conversations and newest thread IDs, retaining thread-only records', () => {

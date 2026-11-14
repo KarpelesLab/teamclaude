@@ -5,7 +5,7 @@ import { createInterface } from 'node:readline';
 import { createWriteStream, existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import net from 'node:net';
-import { loadOrCreateConfig, loadConfig, loadConfigPersistingIds, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, getQuotaSeriesPath, getUsageDbPath, loadState, createStatePersister } from './config.js';
+import { loadOrCreateConfig, setServerAccountIdPolicy, loadConfig, loadConfigPersistingIds, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, getQuotaSeriesPath, getUsageDbPath, loadState, createStatePersister } from './config.js';
 import { loadQuotaSeries, saveQuotaSeries } from './quota-series.js';
 import { installCrashHandlers } from './crash-log.js';
 import { AccountManager, distributionMode, accountRouting } from './account-manager.js';
@@ -343,6 +343,8 @@ async function serverCommand() {
   const earlyConsole = tuiExpected ? captureEarlyConsole() : null;
 
   const config = await loadOrCreateConfig();
+  const persistSessionAffinity = config.persistSessionAffinity === true;
+  setServerAccountIdPolicy(persistSessionAffinity);
   // Token writes below pair rows by entry id against a re-read of the file, so
   // the ids have to be on disk before the first refresh, not just in memory.
   await persistMintedAccountIds(config);
@@ -416,7 +418,6 @@ async function serverCommand() {
   });
   if (savedState?.quota) accountManager.restoreQuotaState(savedState.quota);
   // Startup-only opt-in: reload cannot reimport an older affinity snapshot.
-  const persistSessionAffinity = config.persistSessionAffinity === true;
   if (persistSessionAffinity) accountManager.restoreAffinityState(savedState?.affinity);
 
   // Per-client usage (proxy.clientKeys). Restored alongside quota so the
