@@ -99,7 +99,7 @@ for (const [kind, before, after, replace] of [
   ['rename', {}, { name: 'renamed' }, false],
   ['profile backfill', { accountUuid: 'person' }, { orgUuid: 'known' }, false],
 ]) {
-  test(`exact-ID reload handles ${kind} without identity churn or stale affinity`, async () => {
+  test(`exact-ID reload handles ${kind} without identity churn or stale affinity`, async t => {
     const original = { id: 'b', name: 'original', type: 'oauth', accessToken: 'synthetic-old', expiresAt: Date.now() + 3_600_000, ...before };
     const stable = { id: 'a', name: 'stable', type: 'apikey', apiKey: 'synthetic-stable' };
     const mem = { persistSessionAffinity: true, accounts: [original, stable] };
@@ -112,7 +112,11 @@ for (const [kind, before, after, replace] of [
     am.recordSession('unrelated', 1, 'claude-opus-5');
     const disk = { accounts: [{ ...stable }, { ...original, ...after, accessToken: 'synthetic-new', expiresAt: Date.now() + 7_200_000 }] };
     const unchangedDisk = JSON.stringify(disk);
+    const logs = [];
+    t.mock.method(console, 'log', line => logs.push(line));
     assert.deepEqual(await syncAccountsFromDisk(disk, mem, am), { added: replace ? 1 : 0, removed: replace ? 1 : 0 });
+    assert.equal(logs.some(line => line === '[TeamClaude] Replaced account "original": its disk entry now names a different provider/account scope'), replace);
+    assert.equal(logs.some(line => line.includes('Picked up new account')), false, 'existing entries are not fresh admissions');
     const current = am.accounts.find(a => a.id === 'b');
     assert.equal(current === old, !replace);
     for (const [field, value] of Object.entries(after)) assert.equal(current[field], value);
@@ -131,5 +135,8 @@ for (const [kind, before, after, replace] of [
     assert.equal(restarted.accounts[restarted.sessionTracker.pinnedAccount('fresh', 'unified7d')].id, 'b');
     assert.equal(restarted.accounts[restarted.sessionTracker.pinnedAccount('unrelated', 'unified7d')].id, 'a');
     assert.deepEqual(restarted.threadOwner('client', 'msg_owned'), { key: 'owned', conversation: 'opening' });
+    logs.length = 0;
+    await syncAccountsFromDisk({ accounts: [...disk.accounts, { ...stable, id: 'c', name: 'new' }] }, mem, am);
+    assert.deepEqual(logs, ['[TeamClaude] Picked up new account "new" from config'], 'a fresh admission stays distinct from replacement');
   });
 }

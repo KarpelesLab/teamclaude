@@ -92,7 +92,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       accountManager.addAccount(diskAcct);
       claimed.add(exactIds ? accountManager.accounts.at(-1) : accountManager.accounts.length - 1);
       added++;
-      console.log(cfgAcct
+      console.log(replaced >= 0 ? `[TeamClaude] Replaced account "${safeLine(diskAcct.name, 64)}": its disk entry now names a different provider/account scope` : cfgAcct
         ? `[TeamClaude] Re-admitting known account "${diskAcct.name}" from config`
         : `[TeamClaude] Picked up new account "${diskAcct.name}" from config`);
       continue;
