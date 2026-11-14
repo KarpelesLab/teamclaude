@@ -1,0 +1,393 @@
+import { test } from 'node:test';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { on } from 'node:events';
+import assert from 'node:assert/strict';
+import http from 'node:http';
+import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { spawnServer } from '../test-helpers/spawn-server.js';
+import { affinityAccounts } from '../test-helpers/affinity-fixtures.js';
+import { createDefaultConfig } from '../src/config.js';
+
+// Real startup/shutdown, explicit synthetic configuration and native-agent homes.
+const envFor = dir => ({ HOME: dir, XDG_CONFIG_HOME: dir, CODEX_HOME: undefined, CLAUDE_CONFIG_DIR: undefined, PI_CODING_AGENT_DIR: undefined, OMP_CONFIG_DIR: undefined, TEAMROUTER_CONFIG: join(dir, 'config.json'), TEAMCLAUDE_DISABLE_AUTOUPDATE: '1' });
+const accounts = affinityAccounts();
+const statePath = dir => join(dir, 'config.state.json');
+const seeded = () => {
+  const now = Date.now();
+  return { quota: {}, affinity: { version: 1, sessions: [{ key: 'seed', sessionId: null, conversation: null, lastSeen: now, pins: [{ bucket: 'unified7d', account: { id: 'b', provider: 'anthropic' }, at: now - 1 }], threads: [] }] } };
+};
+
+async function post(port, opening, path = '/v1/messages', thread = null) {
+  const res = await fetch(`http://127.0.0.1:${port}${path}`, {
+    method: 'POST', headers: { 'x-api-key': 'test-key', 'content-type': 'application/json', 'x-claude-code-session-id': 'client' },
+    body: JSON.stringify({ model: 'claude-opus-5', messages: [{ role: 'user', content: opening }], max_tokens: 1, ...(thread ? { thread } : {}) }),
+  });
+  assert.equal(res.status, 200);
+  return res.json();
+}
+
+async function outputMarker(child, marker, signal) {
+  let output = '';
+  for await (const [chunk] of on(child.stdout, 'data', { signal })) {
+    output += chunk;
+    if (output.includes(marker)) return;
+  }
+}
+
+for (const enabled of [false, true]) {
+  test(`queued refresh follows its account through removal (persistence ${enabled})`, { timeout: 20_000 }, async t => {
+    const dir = await mkdtemp(join(tmpdir(), 'tc-affinity-queued-'));
+    let srv, releaseGate, removing;
+    const pending = new AbortController();
+    const upstream = http.createServer((req, res) => { req.resume(); res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ key: req.headers.authorization || req.headers['x-api-key'] })); });
+    try {
+      await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
+      const preload = join(dir, 'queued-refresh.mjs');
+      await writeFile(preload, `import { AccountManager } from ${JSON.stringify(new URL('../src/account-manager.js', import.meta.url).href)};
+import { withConfigLock } from ${JSON.stringify(new URL('../src/config.js', import.meta.url).href)};
+let release;
+const onRefresh = AccountManager.prototype.onTokenRefresh;
+AccountManager.prototype.onTokenRefresh = function(cb) {
+  onRefresh.call(this, cb);
+  process.on('SIGUSR1', () => { void withConfigLock(process.env.TEAMROUTER_CONFIG, async () => {
+    console.log('fixture-lock-held'); await new Promise(resolve => { release = resolve; });
+  }); });
+  process.on('SIGUSR2', () => { this.updateAccountTokens(this.accounts.findIndex(a => a.id === 'a'), {
+    accessToken: 'synthetic-fresh', refreshToken: 'synthetic-refresh', expiresAt: Date.now() + 7_200_000,
+  }); console.log('fixture-refresh-queued'); });
+  process.on('SIGCONT', () => release?.());
+};
+const remove = AccountManager.prototype.removeAccount;
+AccountManager.prototype.removeAccount = function(index) { remove.call(this, index); console.log('fixture-account-removed'); };`);
+      const config = { proxy: { apiKey: 'test-key', mcp: 'full' }, upstreamProxy: false, autoUpdate: false, quotaProbeSeconds: 0,
+        upstream: `http://127.0.0.1:${upstream.address().port}`, persistSessionAffinity: enabled,
+        accounts: [{ id: 'dummy', name: 'dummy', type: 'apikey', apiKey: 'synthetic-dummy' },
+          { id: 'a', name: 'a', type: 'oauth', accessToken: 'synthetic-old', refreshToken: 'synthetic-refresh', expiresAt: Date.now() + 3_600_000 }, accounts[1]] };
+      srv = await spawnServer({ dir, env: { ...envFor(dir), NODE_OPTIONS: `--import=${preload}` }, config: () => config });
+      const locked = outputMarker(srv.child, 'fixture-lock-held', t.signal);
+      releaseGate = () => srv.child.kill('SIGCONT');
+      srv.child.kill('SIGUSR1');
+      await locked;
+      const queued = outputMarker(srv.child, 'fixture-refresh-queued', t.signal);
+      srv.child.kill('SIGUSR2');
+      await queued;
+      const removed = outputMarker(srv.child, 'fixture-account-removed', t.signal);
+      removing = fetch(`http://127.0.0.1:${srv.port}/teamclaude/mcp`, {
+        method: 'POST', headers: { 'x-api-key': 'test-key', 'content-type': 'application/json' }, signal: pending.signal,
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'remove_account', arguments: { account: 'dummy' } } }),
+      });
+      await removed;
+      releaseGate();
+      releaseGate = null;
+      const removal = await removing;
+      assert.equal(removal.status, 200);
+      assert.notEqual((await removal.json()).result?.isError, true);
+      assert.equal((await post(srv.port, 'before-restart', '/tc-acct/b/v1/messages')).key, 'synthetic-b');
+      await srv.stop();
+      const saved = JSON.parse(await readFile(srv.configPath, 'utf8'));
+      assert.equal(saved.accounts.some(a => a.id === 'dummy'), false);
+      const owner = saved.accounts.find(a => a.id === 'a');
+      assert.equal(owner.accessToken, 'synthetic-fresh');
+      assert.equal(owner.refreshToken, 'synthetic-refresh');
+      assert.ok(owner.expiresAt > config.accounts[1].expiresAt);
+      const survivor = saved.accounts.find(a => a.id === 'b');
+      assert.equal(survivor.apiKey, 'synthetic-b');
+      assert.deepEqual([survivor.accessToken, survivor.refreshToken, survivor.expiresAt], [undefined, undefined, undefined]);
+      srv = await spawnServer({ dir, env: envFor(dir), config: () => saved });
+      assert.equal((await post(srv.port, 'after-restart', '/tc-acct/b/v1/messages')).key, 'synthetic-b');
+      assert.equal((await post(srv.port, 'refreshed-owner', '/tc-acct/a/v1/messages')).key, 'Bearer synthetic-fresh');
+    } finally {
+      releaseGate?.();
+      pending.abort();
+      await removing?.catch(() => {});
+      await srv?.stop();
+      upstream.closeAllConnections();
+      await new Promise(resolve => upstream.close(resolve));
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+test('opt-in real restart retains placement; operator and launch pins still win', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'tc-affinity-'));
+  let hold = null, arrived = null;
+  const upstream = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', async () => {
+      arrived?.();
+      if (hold) await hold;
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ id: 'msg_synthetic', type: 'message', role: 'assistant', content: [], key: req.headers['x-api-key'] }));
+    });
+  });
+  let srv;
+  try {
+    await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
+    const config = { proxy: { apiKey: 'test-key', drainTimeoutSeconds: 30 }, upstream: `http://127.0.0.1:${upstream.address().port}`, upstreamProxy: false, messageThreads: true, persistSessionAffinity: true, distributeSessions: true, quotaProbeSeconds: 0, accounts };
+    const start = () => spawnServer({ dir, env: envFor(dir), config: () => config });
+    srv = await start();
+    assert.equal((await post(srv.port, 'beta')).key, 'synthetic-a');
+    assert.equal((await post(srv.port, 'alpha')).key, 'synthetic-b');
+    await srv.stop();
+    const saved = JSON.parse(await readFile(statePath(dir), 'utf8'));
+    assert.equal(saved.affinity.sessions.length, 2);
+    config.accounts = [accounts[0], accounts[2], accounts[1]];
+    srv = await start();
+    assert.equal((await post(srv.port, 'alpha')).key, 'synthetic-b');
+    const pin = await fetch(`http://127.0.0.1:${srv.port}/teamclaude/session-pin`, { method: 'POST', headers: { 'x-api-key': 'test-key', 'content-type': 'application/json' }, body: JSON.stringify({ sessionId: 'client', account: 'a' }) });
+    assert.equal(pin.status, 200);
+    await pin.arrayBuffer();
+    assert.equal((await post(srv.port, 'alpha')).key, 'synthetic-a');
+    assert.equal((await post(srv.port, 'alpha', '/tc-acct/c/v1/messages')).key, 'synthetic-c');
+    // Reload cannot toggle the startup-only opt-in. The late thread reply is
+    // learned after shutdown's first save, so only the post-drain save has it.
+    await writeFile(srv.configPath, JSON.stringify({ ...config, persistSessionAffinity: false }));
+    const reload = await fetch(`http://127.0.0.1:${srv.port}/teamclaude/reload`, { method: 'POST', headers: { 'x-api-key': 'test-key' } });
+    assert.equal(reload.status, 200);
+    await reload.arrayBuffer();
+    let finish;
+    hold = new Promise(resolve => { finish = resolve; });
+    const received = new Promise(resolve => { arrived = resolve; });
+    const reply = post(srv.port, 'late-thread', '/v1/messages', { type: 'create' });
+    try {
+      await received;
+      const exited = new Promise(resolve => srv.child.once('exit', resolve));
+      let output = '';
+      const draining = new Promise(resolve => srv.child.stdout.on('data', chunk => {
+        output += chunk;
+        if (output.includes('[TeamClaude] Draining:')) resolve();
+      }));
+      srv.child.kill('SIGTERM');
+      await Promise.race([draining, exited.then(() => { throw new Error('exited before drain'); })]);
+      const early = JSON.parse(await readFile(statePath(dir), 'utf8'));
+      assert.ok(early.affinity.sessions.every(s => s.threads.length === 0));
+      finish();
+      await reply;
+      await exited;
+      const final = JSON.parse(await readFile(statePath(dir), 'utf8'));
+      assert.ok(final.affinity.sessions.some(s => s.threads.includes('msg_synthetic')));
+    } finally {
+      finish();
+      await reply.catch(() => {});
+    }
+  } finally {
+    await srv?.stop();
+    upstream.closeAllConnections();
+    await new Promise(resolve => upstream.close(resolve));
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('default/off/nonliteral flags ignore disk affinity and ordinary shutdown removes it', async () => {
+  assert.equal(createDefaultConfig().persistSessionAffinity, false);
+  for (const flag of [undefined, false, 'true']) {
+    const dir = await mkdtemp(join(tmpdir(), 'tc-affinity-off-'));
+    let srv;
+    try {
+      await writeFile(statePath(dir), JSON.stringify(seeded()));
+      srv = await spawnServer({ dir, env: envFor(dir), config: () => ({ proxy: { apiKey: 'test-key' }, upstreamProxy: false, accounts: [{ ...accounts[0], id: 'b' }, accounts[1]], persistSessionAffinity: flag }) });
+      const status = await (await fetch(`http://127.0.0.1:${srv.port}/teamclaude/status`)).json();
+      assert.equal(status.sessions.known, 0);
+      const repaired = JSON.parse(await readFile(srv.configPath, 'utf8')).accounts;
+      assert.equal(repaired[0].id, 'b', 'off/nonliteral keeps the first claimant as before');
+      assert.notEqual(repaired[1].id, 'b');
+      await srv.stop();
+      assert.equal(Object.hasOwn(JSON.parse(await readFile(statePath(dir), 'utf8')), 'affinity'), false);
+    } finally {
+      await srv?.stop();
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test('missing, corrupt and unknown-version state are nonfatal with opt-in enabled', async () => {
+  for (const contents of [null, '{broken', JSON.stringify({ affinity: { version: 9, sessions: [] } })]) {
+    const dir = await mkdtemp(join(tmpdir(), 'tc-affinity-bad-'));
+    let srv;
+    try {
+      if (contents !== null) await writeFile(statePath(dir), contents);
+      srv = await spawnServer({ dir, env: envFor(dir), config: () => ({ proxy: { apiKey: 'test-key' }, upstreamProxy: false, accounts, persistSessionAffinity: true }) });
+      await srv.stop();
+      assert.deepEqual(JSON.parse(await readFile(statePath(dir), 'utf8')).affinity, { version: 1, sessions: [] });
+    } finally {
+      await srv?.stop();
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+// Load/save/update all normalize IDs before a manager sees account filtering.
+for (const mode of ['raw', 'filtered', 'save', 'atomic']) {
+  test(`startup excludes ambiguous disk IDs (${mode}) without losing threads or stable pins`, async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'tc-affinity-duplicate-'));
+    let srv;
+    try {
+      const original = { id: 'b', name: 'original', type: 'apikey', apiKey: 'synthetic-original' };
+      const copy = { id: 'b', name: 'copy', type: 'apikey', ...(mode === 'filtered' ? {} : { apiKey: 'synthetic-copy' }) };
+      let config = { proxy: { apiKey: 'test-key' }, upstreamProxy: false, autoUpdate: false,
+        persistSessionAffinity: true, accounts: mode === 'filtered' ? [original, copy, accounts[0]] : [copy, original, accounts[0]] };
+      const saved = seeded();
+      Object.assign(saved.affinity.sessions[0], { sessionId: 'client', conversation: 'opening', threads: ['msg_original'] });
+      saved.affinity.sessions.push({ ...saved.affinity.sessions[0], key: 'stable', threads: [],
+        pins: [{ ...saved.affinity.sessions[0].pins[0], account: { id: 'a', provider: 'anthropic' } }] });
+      await writeFile(statePath(dir), JSON.stringify(saved));
+      if (mode === 'save' || mode === 'atomic') {
+        const path = join(dir, 'config.json');
+        await writeFile(path, JSON.stringify(mode === 'atomic' ? { ...config, accounts: [original, accounts[0]] } : config));
+        // A real config-writing child: no parent environment mutation. In the
+        // atomic case the duplicate is introduced by the updater, after load.
+        const code = mode === 'save'
+          ? "await saveConfig(JSON.parse(await readFile(process.env.TEAMROUTER_CONFIG, 'utf8')));"
+          : `await atomicConfigUpdate(c => c.accounts.unshift(${JSON.stringify(copy)}));`;
+        await promisify(execFile)(process.execPath, ['--input-type=module', '-e',
+          "import { readFile } from 'node:fs/promises'; import { saveConfig, atomicConfigUpdate } from './src/config.js'; " + code],
+        { cwd: new URL('..', import.meta.url), env: { ...process.env, ...envFor(dir) } });
+        config = JSON.parse(await readFile(path, 'utf8'));
+      }
+      srv = await spawnServer({ dir, env: envFor(dir), config: () => config });
+      const repaired = JSON.parse(await readFile(srv.configPath, 'utf8')).accounts;
+      assert.ok(repaired.every(a => a.id !== 'b'), 'no claimant retains the ambiguous persisted ID');
+      await srv.stop();
+      const restored = JSON.parse(await readFile(statePath(dir), 'utf8')).affinity.sessions;
+      assert.deepEqual(restored.find(s => s.key === 'seed').pins, []);
+      assert.deepEqual(restored.find(s => s.key === 'seed').threads, ['msg_original']);
+      assert.equal(restored.find(s => s.key === 'stable').pins[0].account.id, 'a');
+    } finally {
+      await srv?.stop();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+// Exercise the live consumers through the real CLI before any restart.
+for (const [enabled, diskFlag] of [[true, true], [true, false], [false, true]]) for (const renamed of enabled ? [false, true] : [false]) for (const mode of ['reload', 'token', 'account', 'setting']) {
+  test(`live ID repair during ${mode} (startup ${enabled}, disk ${diskFlag}, renamed ${renamed}) preserves entry credentials`, async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'tc-affinity-live-'));
+    let srv;
+    const upstream = http.createServer((req, res) => { req.resume(); res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ key: req.headers.authorization || req.headers['x-api-key'] })); });
+    try {
+      await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
+      const original = { id: 'b', name: 'original', type: 'oauth', accessToken: 'synthetic-original', refreshToken: 'synthetic-refresh', expiresAt: Date.now() + 3_600_000 };
+      const config = { proxy: { apiKey: 'test-key', mcp: 'full' }, upstreamProxy: false, autoUpdate: false, persistSessionAffinity: enabled,
+        upstream: `http://127.0.0.1:${upstream.address().port}`, distributeSessions: true,
+        accounts: [{ id: 'empty', name: 'tokenless', type: 'oauth' }, accounts[0], original] };
+      const saved = seeded();
+      Object.assign(saved.affinity.sessions[0], { sessionId: 'client', conversation: 'opening', threads: ['msg_original'] });
+      saved.affinity.sessions.push({ ...saved.affinity.sessions[0], key: 'stable', pins: [{ bucket: 'unified7d', account: { id: 'a', provider: 'anthropic' }, at: saved.affinity.sessions[0].lastSeen }], threads: [] });
+      await writeFile(statePath(dir), JSON.stringify(saved));
+      // Only synthetic input is injected; index.js owns the actual token-save callback.
+      const preload = join(dir, 'refresh.mjs');
+      await writeFile(preload, `import { AccountManager } from ${JSON.stringify(new URL('../src/account-manager.js', import.meta.url).href)};
+import fs from 'node:fs/promises'; import { syncBuiltinESMExports } from 'node:module';
+const rename = fs.rename; fs.rename = async (...args) => { await rename(...args); if (args[1] === process.env.TEAMROUTER_CONFIG) console.log('fixture-token-written'); }; syncBuiltinESMExports();
+const onRefresh = AccountManager.prototype.onTokenRefresh;
+AccountManager.prototype.onTokenRefresh = function(cb) { onRefresh.call(this, cb); process.on('SIGUSR2', () => this.updateAccountTokens(this.accounts.findIndex(a => a.name === 'original'), { accessToken: 'synthetic-fresh', refreshToken: 'synthetic-fresh-refresh', expiresAt: Date.now() + 7_200_000 })); };`);
+      srv = await spawnServer({ dir, env: { ...envFor(dir), NODE_OPTIONS: `--import=${preload}` }, config: () => config });
+      const disk = JSON.parse(await readFile(srv.configPath, 'utf8'));
+      disk.persistSessionAffinity = diskFlag;
+      const ownerName = renamed ? 'renamed-original' : 'original', copyName = renamed ? 'original' : 'copy';
+      if (renamed) disk.accounts.find(a => a.id === 'b').name = ownerName;
+      disk.accounts[enabled ? 'unshift' : 'push']({ ...original, name: copyName, accessToken: 'synthetic-copy', refreshToken: 'synthetic-copy-refresh' });
+      await writeFile(srv.configPath, JSON.stringify(disk));
+      if (mode === 'token') {
+        const written = new Promise(resolve => srv.child.stdout.on('data', chunk => { if (chunk.includes('fixture-token-written')) resolve(); }));
+        srv.child.kill('SIGUSR2');
+        await written;
+      } else {
+        const res = await fetch(`http://127.0.0.1:${srv.port}/teamclaude/${mode === 'reload' ? 'reload' : 'mcp'}`, {
+          method: 'POST', headers: { 'x-api-key': 'test-key', 'content-type': 'application/json' },
+          ...(mode !== 'reload' ? { body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: mode === 'setting' ? { name: 'set_distribution', arguments: { mode: 'even' } } : { name: 'set_account_priority', arguments: { account: 'original', priority: 3 } } }) } : {}),
+        });
+        assert.equal(res.status, 200);
+        const result = await res.json();
+        assert.notEqual(result.result?.isError, true);
+        if (mode === 'account') assert.equal(result.result.structuredContent.persisted, !enabled, 'report whether the edited entry survived the actual save');
+      }
+      const repaired = JSON.parse(await readFile(srv.configPath, 'utf8')).accounts;
+      assert.equal(repaired.some(a => a.id === 'b'), !enabled, 'normalization follows startup policy');
+      const persisted = !enabled && mode === 'token' ? 'synthetic-fresh' : 'synthetic-original';
+      assert.equal(repaired.filter(a => a.name === ownerName || a.name === copyName).length, 2, 'both disk claimants survive');
+      const owner = repaired.find(a => a.name === ownerName), copy = repaired.find(a => a.name === copyName);
+      assert.equal(owner.accessToken, persisted);
+      assert.equal(owner.refreshToken, !enabled && mode === 'token' ? 'synthetic-fresh-refresh' : 'synthetic-refresh');
+      assert.deepEqual([copy.accessToken, copy.refreshToken], ['synthetic-copy', 'synthetic-copy-refresh']);
+      assert.equal(repaired.find(a => a.id === 'empty').accessToken, undefined);
+      const live = mode === 'token' ? 'Bearer synthetic-fresh' : 'Bearer synthetic-original';
+      assert.equal((await post(srv.port, 'fresh-after-repair', `/tc-acct/${mode === 'reload' || mode === 'setting' ? ownerName : 'original'}/v1/messages`)).key, live);
+      if (enabled) {
+        if (mode === 'token') assert.match(srv.output(), /not saved: no compatible row .* carries its entry id/);
+        const res = await fetch(`http://127.0.0.1:${srv.port}/teamclaude/reload`, { method: 'POST', headers: { 'x-api-key': 'test-key' } });
+        assert.equal(res.status, 200);
+        await res.json();
+        assert.equal((await post(srv.port, 'copied-entry', `/tc-acct/${copyName}/v1/messages`)).key, 'Bearer synthetic-copy');
+        assert.equal((await post(srv.port, 'fresh-after-repair', `/tc-acct/${ownerName}/v1/messages`)).key, `Bearer ${persisted}`);
+      }
+      await srv.stop();
+      const final = JSON.parse(await readFile(statePath(dir), 'utf8')).affinity?.sessions;
+      if (enabled) {
+        assert.deepEqual(final.find(s => s.key === 'seed').pins, []);
+        assert.deepEqual(final.find(s => s.key === 'seed').threads, ['msg_original']);
+        assert.equal(final.find(s => s.key === 'stable').pins[0].account.id, 'a');
+      } else assert.equal(final, undefined, 'disk enable cannot activate the writer');
+      srv = await spawnServer({ dir, env: envFor(dir), config: () => ({ ...config, persistSessionAffinity: true, accounts: repaired }) });
+      if (enabled) assert.equal((await post(srv.port, 'fresh-after-repair')).key, `Bearer ${persisted}`);
+      else assert.equal((await post(srv.port, 'fresh-after-repair', '/tc-acct/original/v1/messages')).key, live);
+      await srv.stop();
+      assert.ok(JSON.parse(await readFile(statePath(dir), 'utf8')).affinity?.sessions.length, 'enable takes effect on restart');
+    } finally {
+      await srv?.stop();
+      upstream.closeAllConnections();
+      await new Promise(resolve => upstream.close(resolve));
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const phase of ['reload', 'token']) {
+  test(`same-ID provider replacement cannot cross credentials during ${phase}`, async t => {
+    const dir = await mkdtemp(join(tmpdir(), 'tc-affinity-provider-'));
+    let srv;
+    const upstream = http.createServer((req, res) => { req.resume(); res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ key: req.headers.authorization || req.headers['x-api-key'] })); });
+    try {
+      await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
+      const original = { id: 'b', name: 'original', type: 'oauth', accessToken: 'synthetic-claude', expiresAt: Date.now() + 3_600_000 };
+      const config = { proxy: { apiKey: 'test-key' }, upstreamProxy: false, autoUpdate: false, quotaProbeSeconds: 0,
+        upstream: `http://127.0.0.1:${upstream.address().port}`, persistSessionAffinity: true, distributeSessions: 'adaptive', accounts: [accounts[0], original] };
+      const preload = join(dir, 'provider-refresh.mjs');
+      await writeFile(preload, `import { AccountManager } from ${JSON.stringify(new URL('../src/account-manager.js', import.meta.url).href)};
+import fs from 'node:fs/promises'; import { syncBuiltinESMExports } from 'node:module';
+const rename = fs.rename; fs.rename = async (...args) => { await rename(...args); if (args[1] === process.env.TEAMROUTER_CONFIG) console.log('fixture-provider-written'); }; syncBuiltinESMExports();
+const onRefresh = AccountManager.prototype.onTokenRefresh;
+AccountManager.prototype.onTokenRefresh = function(cb) { onRefresh.call(this, cb); process.on('SIGUSR2', () => this.updateAccountTokens(this.accounts.findIndex(a => a.id === 'b'), { accessToken: 'synthetic-claude-fresh', expiresAt: Date.now() + 7_200_000 })); };`);
+      srv = await spawnServer({ dir, env: { ...envFor(dir), NODE_OPTIONS: `--import=${preload}` }, config: () => config });
+      assert.equal((await post(srv.port, 'provider-opening', '/tc-acct/original/v1/messages')).key, 'Bearer synthetic-claude');
+      const disk = JSON.parse(await readFile(srv.configPath, 'utf8'));
+      Object.assign(disk.accounts[1], { provider: 'codex', accountId: 'workspace', accessToken: 'synthetic-codex', expiresAt: Date.now() + 7_200_000 });
+      await writeFile(srv.configPath, JSON.stringify(disk));
+      if (phase === 'token') {
+        const written = outputMarker(srv.child, 'fixture-provider-written', t.signal);
+        srv.child.kill('SIGUSR2');
+        await written;
+        assert.equal(JSON.parse(await readFile(srv.configPath, 'utf8')).accounts[1].accessToken, 'synthetic-codex');
+        assert.match(srv.output(), /not saved: no compatible row .* carries its entry id/);
+      }
+      const res = await fetch(`http://127.0.0.1:${srv.port}/teamclaude/reload`, { method: 'POST', headers: { 'x-api-key': 'test-key' } });
+      assert.equal(res.status, 200);
+      await res.json();
+      assert.equal((await post(srv.port, 'provider-opening')).key, 'synthetic-a', 'Claude must never forward the Codex replacement token');
+      await srv.stop();
+      const saved = JSON.parse(await readFile(srv.configPath, 'utf8'));
+      assert.deepEqual(saved.accounts.map(a => a.id), ['a', 'b']);
+      srv = await spawnServer({ dir, env: envFor(dir), config: () => saved });
+      assert.equal((await post(srv.port, 'provider-opening')).key, 'synthetic-a');
+    } finally {
+      await srv?.stop();
+      upstream.closeAllConnections();
+      await new Promise(resolve => upstream.close(resolve));
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+}

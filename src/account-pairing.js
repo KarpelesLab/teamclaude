@@ -14,7 +14,7 @@
 // evidence and admits no ambiguity: it survives the refresh that rewrites the
 // credential, and it separates two entries that agree on everything else.
 
-import { sameIdentity, sameOrg } from './identity.js';
+import { distinctAccounts, sameIdentity, sameOrg } from './identity.js';
 
 /**
  * The manager account built from config entry `acct`, or null if it has none.
@@ -164,8 +164,8 @@ export function clearAddedAccountIds(config) {
  * the next start. findUpsertTarget in identity.js puts the same questions in
  * this order for the login axis.
  *
- * Ids can disagree with disk — a file written before the field existed, or
- * re-minted by another process — which is why they cannot be the only pass.
+ * Defaults allow fallback when disk IDs are absent or re-minted by another process.
+ * Affinity mode requires compatible exact IDs, without identity or name fallback.
  *
  * A row the operator removed is claimed by nobody. Removal consults `removedIds`
  * where rows are carried over, so the removed row is not appended as its own
@@ -174,7 +174,7 @@ export function clearAddedAccountIds(config) {
  * which names the file an entry reads its credential from at the next start, so
  * the survivor was left pointing at the deleted account's credentials (#329).
  */
-function claimDiskRows(configAccounts, diskAccounts, removedIds) {
+export function claimDiskRows(configAccounts, diskAccounts, removedIds, exactIds = false) {
   const rowFor = new Map();
   const taken = new Set();
   for (const [d, diskAcct] of diskAccounts.entries()) {
@@ -188,7 +188,9 @@ function claimDiskRows(configAccounts, diskAccounts, removedIds) {
       return;
     }
   };
-  configAccounts.forEach((a, i) => { if (a?.id) claim(i, d => d?.id === a.id); });
+  configAccounts.forEach((a, i) => { if (a?.id) claim(i, d => d?.id === a.id && (!exactIds || !distinctAccounts(a, d))); });
+  // Retired IDs cannot gain credential ownership from names or profile UUIDs.
+  if (exactIds) return rowFor;
   configAccounts.forEach((a, i) => { if (!rowFor.has(i) && a?.accountUuid) claim(i, d => d?.accountUuid === a.accountUuid && sameOrg(d, a) === true); });
   configAccounts.forEach((a, i) => { if (!rowFor.has(i) && a?.accountUuid) claim(i, d => d?.accountUuid && sameIdentity(d, a)); });
   configAccounts.forEach((a, i) => { if (!rowFor.has(i)) claim(i, d => sameIdentity(d, a)); });
@@ -203,14 +205,18 @@ function claimDiskRows(configAccounts, diskAccounts, removedIds) {
  *
  * The config-to-disk lookup is a different axis from the config-to-manager one,
  * and claimDiskRows is where it is decided: one row per entry, one entry per row.
+ * @param {{exactIds?: boolean, addedIds?: Set<string>}} [options]
  */
-export function mergeAccountsForSave(configAccounts, managerAccounts, diskAccounts, removedIds = new Set()) {
+export function mergeAccountsForSave(configAccounts, managerAccounts, diskAccounts, removedIds = new Set(), options = {}) {
+  const { exactIds = false, addedIds = new Set() } = options;
   // loadConfig normalises a missing list, but this is the function that threw
   // on one (#330), so it holds its own contract too: no rows is an empty list.
   if (!Array.isArray(diskAccounts)) diskAccounts = [];
-  const rowFor = claimDiskRows(configAccounts, diskAccounts, removedIds);
+  const rowFor = claimDiskRows(configAccounts, diskAccounts, removedIds, exactIds);
 
-  const merged = configAccounts.map((a, i) => {
+  const merged = configAccounts.flatMap((a, i) => {
+    // Only a recorded pending addition may be saved without its own disk row.
+    if (exactIds && !rowFor.has(i) && !addedIds.has(a?.id)) return [];
     const am = managerAccountFor(managerAccounts, a);
     const live = am && ownsInlineToken(a) ? {
       ...a,
@@ -219,7 +225,7 @@ export function mergeAccountsForSave(configAccounts, managerAccounts, diskAccoun
       expiresAt: am.expiresAt,
     } : a;
     const diskAcct = diskAccounts[rowFor.get(i)];
-    return diskAcct ? { ...diskAcct, ...live } : live;
+    return [diskAcct ? { ...diskAcct, ...live } : live];
   });
 
   // Carry over rows that exist on disk and not in memory. The list used to be

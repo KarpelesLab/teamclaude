@@ -5,7 +5,7 @@ import { createInterface } from 'node:readline';
 import { createWriteStream, existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import net from 'node:net';
-import { loadOrCreateConfig, loadConfig, loadConfigPersistingIds, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, getQuotaSeriesPath, getUsageDbPath, loadState, saveState } from './config.js';
+import { loadOrCreateConfig, setServerAccountIdPolicy, loadConfig, loadConfigPersistingIds, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, getQuotaSeriesPath, getUsageDbPath, loadState, createStatePersister } from './config.js';
 import { loadQuotaSeries, saveQuotaSeries } from './quota-series.js';
 import { installCrashHandlers } from './crash-log.js';
 import { AccountManager, distributionMode, accountRouting } from './account-manager.js';
@@ -29,7 +29,7 @@ import { loginCodex, startCodexLogin } from './codex-auth.js';
 import { isRemoteSession, openBrowser, PANEL_LOGIN_TIMEOUT_MS } from './login-flow.js';
 import { providerOf, canServeProvider } from './provider.js';
 import { syncAccountsFromDisk } from './sync-accounts.js';
-import { mergeAccountsForSave, syncRefreshedTokens, removedAccountIds, clearRemovedAccountIds, clearAddedAccountIds, markAccountRemoved, configIndexFor } from './account-pairing.js';
+import { claimDiskRows, mergeAccountsForSave, syncRefreshedTokens, removedAccountIds, addedAccountIds, clearRemovedAccountIds, clearAddedAccountIds, markAccountRemoved, configIndexFor } from './account-pairing.js';
 import { ensureAccountIds, accountIdsComplete } from './account-id.js';
 import * as alias from './alias.js';
 import { ensureCerts, mitmHosts, caCertPath } from './mitm.js';
@@ -343,6 +343,8 @@ async function serverCommand() {
   const earlyConsole = tuiExpected ? captureEarlyConsole() : null;
 
   const config = await loadOrCreateConfig();
+  const persistSessionAffinity = config.persistSessionAffinity === true;
+  setServerAccountIdPolicy(persistSessionAffinity);
   // Token writes below pair rows by entry id against a re-read of the file, so
   // the ids have to be on disk before the first refresh, not just in memory.
   await persistMintedAccountIds(config);
@@ -415,6 +417,8 @@ async function serverCommand() {
     return null;
   });
   if (savedState?.quota) accountManager.restoreQuotaState(savedState.quota);
+  // Startup-only opt-in: reload cannot reimport an older affinity snapshot.
+  if (persistSessionAffinity) accountManager.restoreAffinityState(savedState?.affinity);
 
   // Per-client usage (proxy.clientKeys). Restored alongside quota so the
   // per-client counters survive a restart the same way rotation state does.
@@ -444,9 +448,10 @@ async function serverCommand() {
   accountManager.selectActiveAccount();
 
   // Periodically persist quota (and once more on shutdown) to the state file.
-  const persistQuotaState = () =>
-    saveState({ quota: accountManager.exportQuotaState(), clients: clientUsage.exportState(), usageDimensions: dimensionUsage.exportState() })
-      .catch(err => console.error(`[TeamClaude] Failed to save quota state: ${err.message}`));
+  const persistQuotaState = createStatePersister(() => ({
+    quota: accountManager.exportQuotaState(), clients: clientUsage.exportState(), usageDimensions: dimensionUsage.exportState(),
+    ...(persistSessionAffinity ? { affinity: accountManager.exportAffinityState() } : {}),
+  }), { onError: err => console.error(`[TeamClaude] Failed to save quota state: ${err.message}`) });
   let quotaSaveInterval = null;
   // Sampled on the same minute tick, but only written when a sample was taken
   // or something was pruned: about once per SAMPLE_INTERVAL_MS.
@@ -511,7 +516,7 @@ async function serverCommand() {
     // Keep config.accounts in sync so the TUI save does not clobber fresh tokens.
     // A -1 means no config entry pairs with this account and the in-memory copy
     // keeps what it had; the disk write below is unaffected either way, since it
-    // resolves its own row through findConfigAccount rather than this pairing.
+    // resolves its own disk row rather than relying on this memory pairing.
     syncRefreshedTokens(config.accounts, accountManager.accounts, idx, newTokens);
     atomicConfigUpdate(diskConfig => {
       // Pick up any new accounts from disk so the running fleet serves them
@@ -520,7 +525,7 @@ async function serverCommand() {
       for (const diskAcct of diskConfig.accounts) {
         // A row the TUI is in the middle of removing is not a new account (#422).
         if (diskAcct?.id && removed.has(diskAcct.id)) continue;
-        const known = config.accounts.some(a => sameIdentity(a, diskAcct));
+        const known = config.accounts.some(a => persistSessionAffinity ? a?.id === diskAcct.id : sameIdentity(a, diskAcct));
         if (!known) {
           // Same object into both lists, so the account carries its entry's id;
           // ensureAccountIds first, in case the entry brought in one this list
@@ -530,9 +535,9 @@ async function serverCommand() {
           accountManager.addAccount(diskAcct);
         }
       }
-      // By entry id only — the index may have shifted, and identity is not
-      // one-to-one (see findConfigAccount). No row: nothing is written.
-      const cfgIdx = findConfigAccount(diskConfig, account);
+      // The captured entry ID survives index shifts; affinity mode also checks
+      // compatible scope through shared claims. No compatible row: no write.
+      const cfgIdx = persistSessionAffinity ? claimDiskRows([account], diskConfig.accounts, removed, true).get(0) ?? -1 : findConfigAccount(diskConfig, account);
       if (cfgIdx >= 0) {
         diskConfig.accounts[cfgIdx].accessToken = newTokens.accessToken;
         diskConfig.accounts[cfgIdx].refreshToken = newTokens.refreshToken;
@@ -541,7 +546,7 @@ async function serverCommand() {
         // Said out loud: the account keeps serving on the new token, so nothing
         // else shows that the file still holds the old one until a restart
         // fails on it.
-        console.error(`[TeamClaude] Refreshed token for "${safeLine(account.name, 64)}" not saved: no row in ${getConfigPath()} carries its entry id`);
+        console.error(`[TeamClaude] Refreshed token for "${safeLine(account.name, 64)}" not saved: no compatible row in ${getConfigPath()} carries its entry id`);
       }
     }).catch(err => console.error(`[TeamClaude] Failed to save refreshed token: ${err.message}`));
     // And to the credential store, when signed in. Not awaited: the disk
@@ -745,6 +750,7 @@ async function serverCommand() {
   const mergeAccountsOnto = (/** @type {Record<string, any>} */ diskConfig) => {
     diskConfig.accounts = mergeAccountsForSave(
       config.accounts, accountManager.accounts, diskConfig.accounts, removedAccountIds(config),
+      { exactIds: persistSessionAffinity, addedIds: addedAccountIds(config) },
     );
     // The written list omits them, so they are gone from disk too and there
     // is nothing left to re-adopt. Holding the ids any longer would only

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, readdir, writeFile, stat, chmod } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, writeFile, stat, chmod, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -19,6 +19,7 @@ async function withConfigDir(fn) {
   } finally {
     if (prev === undefined) delete process.env.TEAMCLAUDE_CONFIG;
     else process.env.TEAMCLAUDE_CONFIG = prev;
+    await rm(dir, { recursive: true, force: true });
   }
 }
 
@@ -48,8 +49,9 @@ test('saveConfig replaces a pre-existing file and tightens its mode', async () =
 test('saveState is atomic the same way', async () => {
   await withConfigDir(async ({ dir, cfg }) => {
     const statePath = cfg.getStatePath();
-    await cfg.saveState({ quota: { a: 1 } });
-    assert.deepEqual(JSON.parse(await readFile(statePath, 'utf-8')), { quota: { a: 1 } });
+    const state = { quota: { a: 1 }, affinity: { version: 1, sessions: [{ key: 'synthetic', sessionId: 'synthetic', conversation: null, lastSeen: 100, pins: [], threads: ['msg_1'] }] } };
+    await cfg.saveState(state);
+    assert.deepEqual(await cfg.loadState(), state);
     assert.deepEqual(await readdir(dir), ['teamclaude.state.json']);
     if (onPosix) assert.equal((await stat(statePath)).mode & 0o777, 0o600);
   });

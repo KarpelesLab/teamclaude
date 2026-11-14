@@ -238,3 +238,23 @@ test('an entry whose account is gone keeps its own credential on a save', async 
   assert.equal(saved[0].accessToken, 't-a', 'no live credential to write, so the entry keeps its own');
   assert.equal(saved[1].accessToken, 't-b', 'and the surviving account still writes to its own entry');
 });
+
+test('exact entry saves refuse name and UUID rebinding but retain stable and pending entries', () => {
+  const config = [{ id: 'old', name: 'shared', type: 'oauth', accountUuid: 'person', accessToken: 'original' },
+    { id: 'stable', name: 'shared', type: 'oauth' }, { id: 'pending', name: 'pending', type: 'oauth' }];
+  const manager = [{ id: 'stable', credential: 'stable-fresh' }, { id: 'old', credential: 'original-fresh' },
+    { id: 'pending', credential: 'pending-fresh' }];
+  const disk = [{ id: 'stable', name: 'renamed', accessToken: 'stable-old', upstream: 'https://example.test' },
+    { id: 'removed', name: 'shared', accessToken: 'removed' },
+    { id: 'new', name: 'shared', accountUuid: 'person', accessToken: 'copy' },
+    { id: 'external', name: 'external', accessToken: 'external' }];
+  const saved = mergeAccountsForSave(config, manager, disk, new Set(['removed']), {
+    exactIds: true, addedIds: new Set(['pending']),
+  });
+  assert.deepEqual(saved.map(a => a.id), ['stable', 'pending', 'new', 'external']);
+  assert.deepEqual(saved.map(a => a.accessToken), ['stable-fresh', 'pending-fresh', 'copy', 'external']);
+  assert.equal(saved[0].upstream, 'https://example.test');
+  assert.deepEqual(config.map(a => a.id), ['old', 'stable', 'pending']);
+  assert.deepEqual(manager.map(a => a.id), ['stable', 'old', 'pending']);
+  assert.deepEqual(mergeAccountsForSave(config, manager, [], new Set(), { exactIds: true }), []);
+});

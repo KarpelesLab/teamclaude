@@ -216,7 +216,7 @@ When on, TeamClaude routes each **new** conversation to the least-loaded eligibl
 
 The exception proves the rule rather than breaking it. A subagent **forked** from its parent's context is sent with the parent's messages ahead of its own task, so its opening *is* the parent's opening: it keys the same and stays on the account already holding the cache it inherited. That is the right answer for those agents — they genuinely share a prefix, so co-locating them is what preserves it — but it does mean a fan-out of forks concentrates where a fan-out of fresh subagents spreads.
 
-**A message-thread continue is filed under the conversation it continues.** Once Claude Code runs a [message thread](accounts.md#message-threads), every turn after the first sends only its delta, so the body's first message is no longer the conversation's opening. The proxy remembers which conversation produced each threaded reply, and a `continue` naming that reply is placed with it: on the same pin, and so on the account that holds the thread, which is the only one that can continue it (any other answers `404 thread_not_found`, and the client then resends the whole conversation). A continue the proxy cannot trace, because it was restarted or the conversation was forgotten, names no conversation and pins by session alone.
+**A message-thread continue is filed under the conversation it continues.** Once Claude Code runs a [message thread](accounts.md#message-threads), every turn after the first sends only its delta, so the body's first message is no longer the conversation's opening. The proxy remembers which conversation produced each threaded reply, and a `continue` naming that reply is placed with it: on the same pin, and so on the account that holds the thread, which is the only one that can continue it (any other answers `404 thread_not_found`, and the client then resends the whole conversation). A continue the proxy cannot trace, because persistence was off at restart or the conversation was forgotten, names no conversation and pins by session alone.
 
 **What changes for a fleet upgrading to this.** Three things are counted or named differently than they were when the unit was the client session:
 
@@ -227,6 +227,47 @@ The exception proves the rule rather than breaking it. A subagent **forked** fro
 More precisely, a conversation holds **one pin per weekly quota bucket**, not one overall, because eligibility is decided per bucket: an account whose Fable weekly is spent still serves Opus. So a Fable request that has to divert elsewhere leaves the conversation's Opus pin where it is, and each family with its **own** bucket keeps its own cache affinity. The consequence is that a conversation using two families commonly sits on two accounts, and the per-account counts in `teamclaude status` can therefore add up to more than the number of active conversations.
 
 **Families that share a bucket share a pin, including when only one of them is separately metered.** Upstream can report a *learned* weekly bucket scoped to a family the static table has no entry for; routing then meters that family on its own window (see [Expiry-pressure routing](#expiry-pressure-routing)) while affinity still keys on the shared bucket the family falls under. Such a family has its own quota clock and not its own pin, so anything that moves the pin moves both — a known limitation of pinning by bucket rather than by governing window, and the reason the cost bound below is stated per pin rather than per family.
+
+### Affinity across restarts
+
+To retain automatic affinity for your own pooled accounts across proxy restarts:
+
+```json
+"distributeSessions": "adaptive",
+"persistSessionAffinity": true
+```
+
+`persistSessionAffinity` is off by default; only literal `true` enables it.
+The setting is read once at startup, so changing it requires a restart.
+Reload does not import an older snapshot. When off, startup ignores saved
+affinity and the next ordinary state save removes that section.
+
+The existing atomic, owner-only (`0600`) state file holds a versioned affinity
+section: opaque conversation keys, optional client-session/conversation ownership,
+last-use times, bucket pins naming stable account entry IDs and providers, and
+up to the newest 32 threaded-message IDs per conversation. At most 10,000
+conversations survive. No prompts, credentials, client/project labels, usage,
+open requests, counters or rollover observations enter this section. Operator
+`switch --session` pins remain runtime-only.
+
+The same one-hour **sliding idle lifetime** applies across restarts. Restoring
+never refreshes it: a conversation active for days can survive, while one idle
+for more than an hour is forgotten. Removed, disabled, ambiguous or changed-provider
+accounts lose their saved pins. With persistence enabled, a duplicated config
+entry ID is retired on **every** claimant during config reads and writes; neither
+the first copy nor the original can inherit that ID's old saved pins. Unrelated
+entry IDs keep their identity. Current model, provider, route, quota and hard-pin
+checks still govern every request. Thread ownership can survive a dropped pin,
+but does not make another account capable of continuing the upstream thread.
+
+While a request is in flight, a snapshot observes its current use without storing request counters or resuming the stream. Idle timestamps remain unchanged across saves and restarts; expiry follows the tracker’s existing wall clock behavior, including backward clock adjustments. Pin timestamps retain their original values even when another family was last used after the clock moved backward.
+With persistence enabled at startup, live reads and writes require exact entry IDs with compatible provider/account scope despite later flag edits. A retired ID cannot borrow a copy's credentials: its token save is skipped, and reload replaces it with the repaired disk entries. Old automatic pins are dropped; thread ownership and unrelated pins remain available.
+
+State is saved on the existing minute tick and on graceful shutdown, including
+once more after an enabled drain completes. Abrupt termination can lose routing
+updates since the last completed save. Missing, corrupt or unrecognized affinity snapshots
+start empty. This retains routing knowledge; it cannot restore an expired
+upstream cache or resume an interrupted stream.
 
 ### Adaptive distribution
 

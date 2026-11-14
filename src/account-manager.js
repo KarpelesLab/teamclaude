@@ -1142,6 +1142,39 @@ export class AccountManager {
     this._firstSightOn(this._currentObs ??= newObservation(), account);
   }
 
+  // Entry IDs, never credentials, names or positions. Ambiguous IDs are not
+  // identities even if only one of the duplicate entries is currently enabled.
+  exportAffinityState() {
+    const identities = this._affinityAccounts();
+    return this.sessionTracker.exportAffinity(index => {
+      const account = this.accounts[index];
+      return account && identities.get(account.id) === account
+        ? { id: account.id, provider: providerOf(account) } : null;
+    });
+  }
+
+  /** @param {unknown} snapshot */
+  restoreAffinityState(snapshot) {
+    const identities = this._affinityAccounts();
+    this.sessionTracker.restoreAffinity(snapshot, ref => {
+      const account = identities.get(ref.id);
+      return account && providerOf(account) === ref.provider ? account.index : null;
+    });
+  }
+
+  _affinityAccounts() {
+    /** @type {Map<string, any>} */
+    const identities = new Map();
+    const seen = new Set();
+    for (const account of this.accounts) {
+      if (typeof account.id !== 'string' || !account.id) continue;
+      if (seen.has(account.id)) { identities.delete(account.id); continue; }
+      seen.add(account.id);
+      if (!account.disabled) identities.set(account.id, account);
+    }
+    return identities;
+  }
+
   /**
    * Make the account at `index` current on an operator's say-so: the TUI's 's'
    * and the /teamclaude/switch endpoint are the same act by two routes.

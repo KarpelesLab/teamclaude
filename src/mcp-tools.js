@@ -16,7 +16,7 @@ import {
   setWarmupSeconds,
   upsertRoute,
 } from './config-ops.js';
-import { matchAccounts } from './identity.js';
+import { distinctAccounts, matchAccounts } from './identity.js';
 import { McpError, serveMcp } from './mcp.js';
 import { WEEKLY_BUCKET_KEYS } from './model.js';
 import { sanitizeText } from './safe-text.js';
@@ -213,19 +213,19 @@ async function changeAccount(ctx, args, mutate) {
     throw new ToolFailure('this server cannot save account changes; edit the config file and reload_config instead');
   }
   const index = accountIndexFor(ctx, args);
-  const name = accountManager.accounts[index].name;
+  const account = accountManager.accounts[index];
   // Resolved before the change: a removal splices the manager's list.
   const entryIndex = configIndexFor(config.accounts, accountManager.accounts, index);
   mutate(index, entryIndex >= 0 ? config.accounts[entryIndex] : null, entryIndex);
   try {
-    await hooks.persistAccounts();
+    const saved = await hooks.persistAccounts();
+    return { account: account.name, persisted: entryIndex >= 0 && (!saved?.accounts || saved.accounts.some((/** @type {Record<string, any>} */ a) => a.id === account.id && !distinctAccounts(a, account)) === config.accounts.some((/** @type {Record<string, any>} */ a) => a.id === account.id)) };
   } catch (err) {
     // The fleet has already changed; a plain "failed" would send the caller
     // away believing nothing happened, and the next restart would prove it wrong.
     console.error('[TeamClaude] MCP: saving an account change failed:', err instanceof Error ? err.message : err);
-    throw new ToolFailure(`${name}: changed in the running server, but the config file could not be saved; see the proxy log`);
+    throw new ToolFailure(`${account.name}: changed in the running server, but the config file could not be saved; see the proxy log`);
   }
-  return { account: name, persisted: entryIndex >= 0 };
 }
 
 /**

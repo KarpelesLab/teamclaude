@@ -72,6 +72,48 @@ export async function saveState(state) {
 }
 
 /**
+ * One writer and at most one pending snapshot, read only when its write starts.
+ * Each caller waits for the batch containing its request, including final saves.
+ * @param {() => any} readState
+ * @param {{save?: (state: any) => Promise<void>, onError?: (err: any) => void}} [opts]
+ */
+export function createStatePersister(readState, { save = saveState, onError = () => {} } = {}) {
+  /** @typedef {{promise: Promise<void>, resolve: () => void}} Batch */
+  /** @type {Batch|null} */
+  let active = null;
+  /** @type {Batch|null} */
+  let pending = null;
+  /** @returns {Batch} */
+  const batch = () => {
+    let resolve = () => {};
+    /** @type {Promise<void>} */
+    const promise = new Promise(done => { resolve = done; });
+    return { promise, resolve };
+  };
+  /** @param {Batch} current */
+  const start = async current => {
+    active = current;
+    try { await save(readState()); }
+    catch (err) { onError(err); }
+    finally {
+      active = null;
+      current.resolve();
+      if (pending) {
+        const next = pending;
+        pending = null;
+        void start(next);
+      }
+    }
+  };
+  return () => {
+    if (active) return (pending ??= batch()).promise;
+    const current = batch();
+    void start(current);
+    return current.promise;
+  };
+}
+
+/**
  * Write a JSON document so that the file at `path` is, at every instant, either
  * the previous complete document or the new one.
  *
@@ -128,6 +170,7 @@ export function createDefaultConfig() {
     switchThreshold: 0.98,
     holdSeconds: 0,
     distributeSessions: false,
+    persistSessionAffinity: false,
     sessionTitles: { enabled: false, width: 18 },
     quotaBarPercent: false,
     probeDisabledAccounts: false,
@@ -146,6 +189,16 @@ export function createDefaultConfig() {
   };
 }
 
+// Only server startup sets this; standalone commands follow their loaded flag.
+/** @type {boolean|undefined} */
+let serverRetireDuplicateIds;
+/** @param {boolean} enabled */
+export function setServerAccountIdPolicy(enabled) {
+  serverRetireDuplicateIds = enabled;
+}
+/** @param {{persistSessionAffinity?: unknown}} config */
+const retireDuplicateIds = config => serverRetireDuplicateIds ?? config.persistSessionAffinity === true;
+
 export async function loadConfig() {
   const path = getConfigPath();
   try {
@@ -159,7 +212,7 @@ export async function loadConfig() {
     // Everything downstream pairs config entries to running accounts by entry id,
     // so a config written before the field existed — or edited by hand — is given
     // ids here, before anything can read one. The next save persists them.
-    ensureAccountIds(config.accounts);
+    ensureAccountIds(config.accounts, { retireDuplicates: retireDuplicateIds(config) });
     applyUpstreamProxy(config);
     return config;
   } catch (err) {
@@ -344,7 +397,7 @@ export function withConfigLock(configPath, fn) {
 export async function saveConfig(config) {
   const path = getConfigPath();
   // Every row leaves with an id; see atomicConfigUpdate.
-  ensureAccountIds(config.accounts);
+  ensureAccountIds(config.accounts, { retireDuplicates: retireDuplicateIds(config) });
   // The proxy apiKey and every account's tokens live here: see writeJsonAtomic
   // for why this is not a plain writeFile.
   await withConfigLock(path, () => writeJsonAtomic(path, config));
@@ -367,7 +420,7 @@ export function atomicConfigUpdate(updater) {
     // one is given a fresh id by each read: the running server pairs its token
     // writes by id, so the id it minted on reload matched no row on disk, and
     // the account's refreshed tokens were never saved (#564).
-    ensureAccountIds(config.accounts);
+    ensureAccountIds(config.accounts, { retireDuplicates: retireDuplicateIds(config) });
     await writeJsonAtomic(path, config);
     return config;
   });
