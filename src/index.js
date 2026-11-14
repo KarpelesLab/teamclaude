@@ -88,12 +88,17 @@ async function recordSignInWithCallback(entry) {
 
 /**
  * An account removed by hand (`remove`): leave the tombstone the other
- * installs act on, when this install is signed in to callback.net.
+ * installs act on, when this install is signed in to callback.net. One
+ * attempt, with no wait for a held lock, so the command does not hang: a
+ * running proxy, told to reload next, drops the account too and records the
+ * removal with its own wait and retries.
  * @param {Record<string, any>} entry
  */
 async function recordRemovalWithCallback(entry) {
   try {
-    if (await standaloneCredentialSync().onAccountRemoved({ ...entry, credential: entry.accessToken })) console.log('Recorded on callback.net: your other installs will remove it too.');
+    const sync = standaloneCredentialSync();
+    if (await sync.onAccountRemoved({ ...entry, credential: entry.accessToken }, { wait: false })) console.log('Recorded on callback.net: your other installs will remove it too.');
+    else if (sync.pendingRemovals.size) console.log('Not recorded on callback.net yet (its lock is held, or it could not be reached). A running proxy records it once told of the removal; with none running, the next start adds the account back, so remove it again then.');
   } catch (/** @type {any} */ err) {
     console.error(`Could not record the removal on callback.net: ${err?.message || err}`);
   }
@@ -2735,7 +2740,8 @@ async function removeCommand() {
   await saveConfig(config);
   console.log(`Removed account "${account.name}"`);
   // The tombstone first, then the server: told of the removal, it finds the
-  // tombstone already there and leaves it alone.
+  // tombstone already there and leaves it alone, or, when that one attempt
+  // did not land, records it with its own wait and retries.
   await recordRemovalWithCallback(account);
   await notifyRunningServer(config);
 }
