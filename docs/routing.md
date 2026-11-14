@@ -253,7 +253,10 @@ open requests, counters or rollover observations enter this section. Operator
 The same one-hour **sliding idle lifetime** applies across restarts. Restoring
 never refreshes it: a conversation active for days can survive, while one idle
 for more than an hour is forgotten. Removed, disabled, ambiguous or changed-provider
-accounts lose their saved pins; current model, provider, route, quota and hard-pin
+accounts lose their saved pins. With persistence enabled, a duplicated config
+entry ID is retired on **every** claimant during config reads and writes; neither
+the first copy nor the original can inherit that ID's old saved pins. Unrelated
+entry IDs keep their identity. Current model, provider, route, quota and hard-pin
 checks still govern every request. Thread ownership can survive a dropped pin,
 but does not make another account capable of continuing the upstream thread.
 

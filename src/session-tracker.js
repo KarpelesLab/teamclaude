@@ -217,7 +217,7 @@ export class SessionTracker {
           pins.push({ bucket, account: { id: account.id, provider: account.provider }, at: pin.at });
         }
       }
-      const threads = [...s.threads].filter(isMessageId).slice(-MAX_THREAD_MESSAGES);
+      const threads = [...s.threads];
       const row = { key, sessionId: s.sessionId, conversation: s.conversation, lastSeen: s.lastSeen, pins, threads };
       if ((pins.length || threads.length) && affinityRow(row, now, this.knownTtlMs)) sessions.push(row);
     }

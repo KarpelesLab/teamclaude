@@ -37,6 +37,17 @@ test('a duplicated id is re-minted on the later entry, not the first', () => {
   assert.notEqual(accounts[1].id, 'shared');
 });
 
+test('affinity opt-in retires every claimant of a duplicated ID and keeps unrelated IDs', () => {
+  const accounts = [{ id: 'shared' }, { id: 'stable' }, { id: 'shared' }, { id: 'shared' }];
+  ensureAccountIds(accounts, { retireDuplicates: true });
+  assert.ok(accounts.every(a => a.id !== 'shared'));
+  assert.equal(accounts[1].id, 'stable');
+  assert.equal(new Set(accounts.map(a => a.id)).size, 4);
+  const settled = accounts.map(a => a.id);
+  ensureAccountIds(accounts, { retireDuplicates: true });
+  assert.deepEqual(accounts.map(a => a.id), settled, 'once unique, IDs remain stable');
+});
+
 test('an id that is not a usable string is replaced', () => {
   const accounts = [
     { id: '', name: 'a', type: 'apikey', apiKey: 'k' },

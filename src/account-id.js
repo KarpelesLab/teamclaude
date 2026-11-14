@@ -40,13 +40,25 @@ export function mintAccountId() {
  * copies its id along with it, and two entries answering to one id collapse
  * onto whichever comes first — the later one would be handed the earlier one's
  * credential, which is the crossing this field exists to prevent.
+ * With affinity persistence enabled, no claimant may inherit a duplicated ID:
+ * every occurrence is retired before normalization can hide the ambiguity.
  * @param {Array<Record<string, any>>} accounts
+ * @param {{retireDuplicates?: boolean}} [opts]
  */
-export function ensureAccountIds(accounts) {
+export function ensureAccountIds(accounts, { retireDuplicates = false } = {}) {
   const seen = new Set();
+  const duplicated = new Set();
+  if (retireDuplicates) {
+    for (const acct of accounts || []) {
+      if (typeof acct?.id !== 'string' || !acct.id) continue;
+      if (seen.has(acct.id)) duplicated.add(acct.id);
+      seen.add(acct.id);
+    }
+    seen.clear();
+  }
   for (const acct of accounts || []) {
     if (!acct) continue;
-    if (typeof acct.id !== 'string' || acct.id === '' || seen.has(acct.id)) acct.id = mintAccountId();
+    if (typeof acct.id !== 'string' || acct.id === '' || seen.has(acct.id) || duplicated.has(acct.id)) acct.id = mintAccountId();
     seen.add(acct.id);
   }
   return accounts;

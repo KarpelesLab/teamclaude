@@ -1,4 +1,6 @@
 import { test } from 'node:test';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
@@ -99,9 +101,12 @@ test('default/off/nonliteral flags ignore disk affinity and ordinary shutdown re
     let srv;
     try {
       await writeFile(statePath(dir), JSON.stringify(seeded()));
-      srv = await spawnServer({ dir, env: envFor(dir), config: () => ({ proxy: { apiKey: 'test-key' }, upstreamProxy: false, accounts, persistSessionAffinity: flag }) });
+      srv = await spawnServer({ dir, env: envFor(dir), config: () => ({ proxy: { apiKey: 'test-key' }, upstreamProxy: false, accounts: [{ ...accounts[0], id: 'b' }, accounts[1]], persistSessionAffinity: flag }) });
       const status = await (await fetch(`http://127.0.0.1:${srv.port}/teamclaude/status`)).json();
       assert.equal(status.sessions.known, 0);
+      const repaired = JSON.parse(await readFile(srv.configPath, 'utf8')).accounts;
+      assert.equal(repaired[0].id, 'b', 'off/nonliteral keeps the first claimant as before');
+      assert.notEqual(repaired[1].id, 'b');
       await srv.stop();
       assert.equal(Object.hasOwn(JSON.parse(await readFile(statePath(dir), 'utf8')), 'affinity'), false);
     } finally {
@@ -126,3 +131,46 @@ test('missing, corrupt and unknown-version state are nonfatal with opt-in enable
     }
   }
 });
+
+// Load/save/update all normalize IDs before a manager sees account filtering.
+for (const mode of ['raw', 'filtered', 'save', 'atomic']) {
+  test(`startup excludes ambiguous disk IDs (${mode}) without losing threads or stable pins`, async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'tc-affinity-duplicate-'));
+    let srv;
+    try {
+      const original = { id: 'b', name: 'original', type: 'apikey', apiKey: 'synthetic-original' };
+      const copy = { id: 'b', name: 'copy', type: 'apikey', ...(mode === 'filtered' ? {} : { apiKey: 'synthetic-copy' }) };
+      let config = { proxy: { apiKey: 'test-key' }, upstreamProxy: false, autoUpdate: false,
+        persistSessionAffinity: true, accounts: mode === 'filtered' ? [original, copy, accounts[0]] : [copy, original, accounts[0]] };
+      const saved = seeded();
+      saved.affinity.sessions[0].threads.push('msg_original');
+      saved.affinity.sessions.push({ ...saved.affinity.sessions[0], key: 'stable', threads: [],
+        pins: [{ ...saved.affinity.sessions[0].pins[0], account: { id: 'a', provider: 'anthropic' } }] });
+      await writeFile(statePath(dir), JSON.stringify(saved));
+      if (mode === 'save' || mode === 'atomic') {
+        const path = join(dir, 'config.json');
+        await writeFile(path, JSON.stringify(mode === 'atomic' ? { ...config, accounts: [original, accounts[0]] } : config));
+        // A real config-writing child: no parent environment mutation. In the
+        // atomic case the duplicate is introduced by the updater, after load.
+        const code = mode === 'save'
+          ? "await saveConfig(JSON.parse(await readFile(process.env.TEAMROUTER_CONFIG, 'utf8')));"
+          : `await atomicConfigUpdate(c => c.accounts.unshift(${JSON.stringify(copy)}));`;
+        await promisify(execFile)(process.execPath, ['--input-type=module', '-e',
+          "import { readFile } from 'node:fs/promises'; import { saveConfig, atomicConfigUpdate } from './src/config.js'; " + code],
+        { cwd: new URL('..', import.meta.url), env: { ...process.env, ...envFor(dir) } });
+        config = JSON.parse(await readFile(path, 'utf8'));
+      }
+      srv = await spawnServer({ dir, env: envFor(dir), config: () => config });
+      const repaired = JSON.parse(await readFile(srv.configPath, 'utf8')).accounts;
+      assert.ok(repaired.every(a => a.id !== 'b'), 'no claimant retains the ambiguous persisted ID');
+      await srv.stop();
+      const restored = JSON.parse(await readFile(statePath(dir), 'utf8')).affinity.sessions;
+      assert.deepEqual(restored.find(s => s.key === 'seed').pins, []);
+      assert.deepEqual(restored.find(s => s.key === 'seed').threads, ['msg_original']);
+      assert.equal(restored.find(s => s.key === 'stable').pins[0].account.id, 'a');
+    } finally {
+      await srv?.stop();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+}
