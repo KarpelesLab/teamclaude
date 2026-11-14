@@ -13,7 +13,10 @@ import { createDefaultConfig } from '../src/config.js';
 const envFor = dir => ({ HOME: dir, XDG_CONFIG_HOME: dir, CODEX_HOME: undefined, CLAUDE_CONFIG_DIR: undefined, PI_CODING_AGENT_DIR: undefined, OMP_CONFIG_DIR: undefined, TEAMROUTER_CONFIG: join(dir, 'config.json'), TEAMCLAUDE_DISABLE_AUTOUPDATE: '1' });
 const accounts = ['a', 'b', 'c'].map(id => ({ id, name: id, type: 'apikey', apiKey: `synthetic-${id}` }));
 const statePath = dir => join(dir, 'config.state.json');
-const seeded = () => ({ quota: {}, affinity: { version: 1, sessions: [{ key: 'seed', sessionId: null, conversation: null, lastSeen: Date.now(), pins: [{ bucket: 'unified7d', account: { id: 'b', provider: 'anthropic' }, at: Date.now() - 1 }], threads: [] }] } });
+const seeded = () => {
+  const now = Date.now();
+  return { quota: {}, affinity: { version: 1, sessions: [{ key: 'seed', sessionId: null, conversation: null, lastSeen: now, pins: [{ bucket: 'unified7d', account: { id: 'b', provider: 'anthropic' }, at: now - 1 }], threads: [] }] } };
+};
 
 async function post(port, opening, path = '/v1/messages', thread = null) {
   const res = await fetch(`http://127.0.0.1:${port}${path}`, {
