@@ -4,12 +4,13 @@ import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
 import { refreshAccessToken } from '../src/oauth.js';
 import { refreshCodexToken } from '../src/codex-auth.js';
+import { ROUTING_FAILED } from '../src/account-routing.js';
 
 // An account whose token is already expiring, so ensureTokenFresh always tries.
-function mgr(refreshFn) {
+function mgr(refreshFn, extra = {}) {
   return new AccountManager([{
     name: 'a', type: 'oauth',
-    accessToken: 'at-old', refreshToken: 'rt-dead', expiresAt: Date.now() - 1000,
+    accessToken: 'at-old', refreshToken: 'rt-dead', expiresAt: Date.now() - 1000, ...extra,
   }], 0.98, { refreshFn });
 }
 
@@ -163,6 +164,85 @@ test('a successful refresh of the OLD token does not overwrite tokens imported m
   assert.strictEqual(a.expiresAt, 4_000_000_000_000);
   assert.strictEqual(persisted, persistedByImport, 'nothing stale is persisted to config');
   assert.strictEqual(a._refreshPromise, null, 'the coalescing slot is released');
+});
+
+// The renewal's failure belongs to the token that was sent, as above: what a
+// client of the imported token is told must not be the old token's reason.
+for (const [label, error] of [['rejected', () => authError(400)], ['failing for now', () => Object.assign(new Error('socket hang up'), { status: 500 })]]) {
+  test(`a refresh of the OLD token ${label} leaves no failure on tokens imported mid-refresh`, async () => {
+    const d = deferred();
+    const m = mgr(async () => d.promise);
+    const inflight = m.ensureTokenFresh(0);
+    m.updateAccountTokens(0, { accessToken: 'at-imported', refreshToken: 'rt-imported', expiresAt: Date.now() + 3600_000 });
+    d.reject(error());
+    await inflight;
+    assert.strictEqual(m.accounts[0]._lastRefreshFailure, null, 'the reason a client of the imported token would be given');
+  });
+}
+
+// A failure that leaves a hold is the exception: the hold governs the imported
+// tokens too, so the reason for that is the failure's.
+test('a 429 on the OLD token\'s refresh is kept as the reason for tokens imported mid-refresh, which it holds too', async () => {
+  const d = deferred();
+  let calls = 0;
+  const m = mgr(async () => { calls++; return d.promise; });
+  const inflight = m.ensureTokenFresh(0);
+  m.updateAccountTokens(0, { accessToken: 'at-imported', refreshToken: 'rt-imported', expiresAt: Date.now() - 1000 });
+  d.reject(Object.assign(new Error('Token refresh failed (429)'), { status: 429, retryAfterMs: 60_000 }));
+  await inflight;
+  await m.ensureTokenFresh(0);
+  assert.strictEqual(calls, 1, 'the imported token waits out the hold');
+  assert.strictEqual(m.accounts[0]._lastRefreshFailure?.status, 429);
+});
+
+test('a routing failure of the OLD token\'s refresh is kept as the reason for tokens imported mid-refresh, which its cooldown holds too', async () => {
+  const d = deferred();
+  const m = mgr(async () => d.promise, { routing: 'http://127.0.0.1:9' });
+  const inflight = m.ensureTokenFresh(0);
+  m.updateAccountTokens(0, { accessToken: 'at-imported', refreshToken: 'rt-imported', expiresAt: Date.now() - 1000 });
+  d.reject(Object.assign(new Error('routing proxy down'), { code: ROUTING_FAILED }));
+  await inflight;
+  assert.strictEqual(m.isRoutingDown(0), true, 'the account sits out its cooldown');
+  assert.match(m.accounts[0]._lastRefreshFailure?.reason ?? '', /routing proxy down/);
+});
+
+test('new tokens clear the reason a renewal of the old ones failed', async () => {
+  const m = mgr(async () => { const e = new Error('socket hang up'); e.status = 500; throw e; });
+  await m.ensureTokenFresh(0);
+  assert.ok(m.accounts[0]._lastRefreshFailure);
+  m.updateAccountTokens(0, { accessToken: 'at-imported', refreshToken: 'rt-imported', expiresAt: Date.now() + 3600_000 });
+  assert.strictEqual(m.accounts[0]._lastRefreshFailure, null);
+});
+
+test('a refresh failure of the token the account still holds is kept as the reason', async () => {
+  const m = mgr(async () => { const e = new Error('socket hang up'); e.status = 500; throw e; });
+  await m.ensureTokenFresh(0);
+  assert.match(m.accounts[0]._lastRefreshFailure?.reason ?? '', /socket hang up/);
+});
+
+// No caller leaves out the access token today, but the signature allows it,
+// and the listener writes what it is handed onto the account's config row.
+test('a token update writes what it carries: a field left out keeps the account\'s own', () => {
+  const m = new AccountManager([{ name: 'a', type: 'oauth', accessToken: 'at-1', refreshToken: 'rt-1', expiresAt: 4_000_000_000_000 }], 0.98);
+  const written = [];
+  m.onTokenRefresh((_i, tokens) => written.push(tokens));
+  const a = m.accounts[0];
+  m.updateAccountTokens(0, { refreshToken: 'rt-2' });
+  assert.strictEqual(a.credential, 'at-1');
+  assert.strictEqual(a.refreshToken, 'rt-2');
+  assert.strictEqual(a.expiresAt, 4_000_000_000_000);
+  assert.deepStrictEqual(written.at(-1), { accessToken: 'at-1', refreshToken: 'rt-2', expiresAt: 4_000_000_000_000 });
+  m.updateAccountTokens(0, { expiresAt: 4_100_000_000_000 });
+  assert.strictEqual(a.credential, 'at-1');
+  assert.strictEqual(a.expiresAt, 4_100_000_000_000, 'an expiry alone moves the expiry');
+  m.updateAccountTokens(0, { expiresAt: 0 });
+  assert.strictEqual(a.expiresAt, 4_100_000_000_000, 'an expiry of 0 is none, as makeAccount reads it, and alone carries nothing');
+  // A new access token with no expiry has none known, never the one it replaces.
+  m.updateAccountTokens(0, { accessToken: 'at-3' });
+  assert.strictEqual(a.credential, 'at-3');
+  assert.ok(!a.expiresAt, `kept the replaced token's expiry: ${a.expiresAt}`);
+  assert.strictEqual(a.refreshToken, 'rt-2');
+  assert.deepStrictEqual(written.at(-1), { accessToken: 'at-3', refreshToken: 'rt-2', expiresAt: undefined });
 });
 
 test('an unchanged token is refreshed normally (the guard only fires on a swap)', async () => {
