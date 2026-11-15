@@ -145,6 +145,7 @@ test('ensureCerts still accepts a single host', async () => {
 // Each row carries an entry id, as every row loadConfig hands out does: a reload
 // pairs rows by it, and drops the running account whose row is gone.
 const keyed = (name, provider) => ({ id: `id-${name}`, name, type: 'apikey', apiKey: `k-${name}`, ...(provider ? { provider } : {}) });
+const subscription = (name, provider) => ({ ...claude(name), id: `id-${name}`, ...(provider ? { provider } : {}) });
 const anthropicOnly = () => [keyed('claude-a')];
 const withCodex = () => [keyed('claude-a'), keyed('codex-c', 'codex')];
 const fleet = (accounts) => ({ proxy: {}, upstream: 'https://api.anthropic.com', accounts });
@@ -386,27 +387,39 @@ test('a host a reload adds is intercepted when the first leaf is minted after it
 });
 
 // A pin asks for accounts of the pool. A tunnel would serve the client on its
-// own login and drop the pin without a word, so a CONNECT pinned to a Codex
-// account, to a host the presented leaf does not name, is refused. A pin naming
-// Claude accounts only governs nothing there (TC_ACCT rides HTTPS_PROXY into
-// whatever a session starts), and is tunnelled as it was before the Codex
-// account was added. An unknown pin keeps its 407.
-test('a pinned CONNECT to a host the leaf does not name is refused only when the pin names that host\'s provider', async () => {
+// own login and drop the pin without a word, so a CONNECT to a host the
+// presented leaf does not name is refused when its pin names an account of
+// that host's provider (a Codex key or subscription, a disabled one too: a pin
+// is served from a disabled account) or an API key with an upstream of its
+// own (a gateway), or a list naming any of those. Any other pin is tunnelled,
+// as it was before the Codex account was added, because the pool does not
+// serve that pin on this host: a Claude subscription, among them a third-party
+// backend with no provider field (`oauth` with an upstream), or a plain API
+// key with no upstream of its own. TC_ACCT rides HTTPS_PROXY into whatever a
+// session starts. An unknown pin keeps its 407.
+test('a pinned CONNECT to a host the leaf does not name is refused only when its pin names any account the pool could serve there', async () => {
   await withServerScene(['chatgpt.com'], async (lines) => {
     const real = await standIn('chatgpt.com', 'the real host');
-    const config = fleet(anthropicOnly());
+    const gateway = { ...keyed('gw'), upstream: 'https://gateway.test' };
+    const backend = { id: 'id-backend', name: 'backend', type: 'oauth', accessToken: 't', upstream: 'https://backend.test' };
+    const config = fleet([...anthropicOnly(), subscription('claude-o'), gateway, backend]);
     await ensureCerts(mitmHosts(config));
     const s = await startProxy(config);
     try {
-      await reloadWith(config, s.am, withCodex());
-      const pinned = await handshake(s.port, 'chatgpt.com', real.port, real.caCertPem, 'codex-c');
-      assert.equal(pinned.status, 'HTTP/1.1 503 Service Unavailable');
+      await reloadWith(config, s.am, [...withCodex(), subscription('claude-o'), gateway, backend, subscription('codex-o', 'codex'), { ...subscription('codex-x', 'codex'), disabled: true }]);
+      const refused = ['codex-c', 'codex-o', 'codex-x', 'gw', 'codex-c,claude-o', 'claude-a,gw'];
+      for (const pin of refused) {
+        const pinned = await handshake(s.port, 'chatgpt.com', real.port, real.caCertPem, pin);
+        assert.equal(pinned.status, 'HTTP/1.1 503 Service Unavailable', `pin ${pin}`);
+      }
       const unknown = await handshake(s.port, 'chatgpt.com', real.port, real.caCertPem, 'no-such-account');
       assert.equal(unknown.status, 'HTTP/1.1 407 Proxy Authentication Required');
-      const claude = await handshake(s.port, 'chatgpt.com', real.port, real.caCertPem, 'claude-a');
-      assert.equal(claude.status, 'HTTP/1.1 200 Connection Established');
-      assert.deepEqual(claude.names, ['DNS:chatgpt.com']);
-      assert.equal(lines.filter((l) => l.includes('refused for pin')).length, 1, JSON.stringify(lines));
+      for (const pin of ['claude-o', 'claude-a', 'backend']) {
+        const tunnelled = await handshake(s.port, 'chatgpt.com', real.port, real.caCertPem, pin);
+        assert.equal(tunnelled.status, 'HTTP/1.1 200 Connection Established', `pin ${pin}`);
+        assert.deepEqual(tunnelled.names, ['DNS:chatgpt.com'], `pin ${pin}`);
+      }
+      assert.equal(lines.filter((l) => l.includes('refused for pin')).length, refused.length, JSON.stringify(lines));
     } finally {
       s.close();
       real.server.close();

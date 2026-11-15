@@ -21,7 +21,7 @@ import http2 from 'node:http2';
 import { getConfigPath } from './config.js';
 import { generateCertChain } from './x509.js';
 import { createProxyRequestListener, resolveClientAuth, loopbackExempt, relayUpgrade, resolvePinList, describeConnectError, KEEP_ALIVE_TIMEOUT_MS, shouldStripOverageHeaders } from './server.js';
-import { interceptHostsFor, isNeverIntercepted, providerForPath, providerForHost, providerOf, DEFAULT_PROVIDER } from './provider.js';
+import { interceptHostsFor, isNeverIntercepted, providerForPath, providerForHost, providerOf, isSubscriptionAccount, DEFAULT_PROVIDER } from './provider.js';
 import { forwardRefusal, guardedLookup, FORBIDDEN_FORWARD } from './forward-target.js';
 import { safeLine } from './safe-text.js';
 import { usageDimensionHeaderNames } from './client-usage.js';
@@ -255,7 +255,8 @@ export function upgradeUpstreamFor(hostHeader, config, upstream) {
  * @param {string[]|null} [opts.leafHosts]  hosts the leaf is known to name; a host hostMode
  *   would intercept that is not among them is terminated only if the leaf `ensureLeaf`
  *   returns (the one every terminating server presents) names it, and otherwise tunnelled,
- *   or refused when pinned (null: no check)
+ *   or refused when its pin names an account of the host's provider or an API key with an
+ *   upstream of its own (null: no check)
  * @param {string|null} [opts.logDir]
  * @param {Object} [opts.hooks]
  * @param {(line: string) => void} [opts.log]
@@ -543,12 +544,15 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, leafH
     // fail on the name. If it does not, or the leaf cannot be loaded at all,
     // an unpinned CONNECT is tunnelled until a restart renews the chain, or,
     // when the leaf could not be loaded, until it can be; the client runs on
-    // its own login, with nothing pooled or booked. A CONNECT pinned to an
-    // account of the host's provider is refused, with 503 since this proxy
-    // cannot serve it until then: that pin asks for accounts of the pool, and
-    // a tunnel would drop it unsaid. A pin naming none governs nothing on this
-    // host (TC_ACCT rides HTTPS_PROXY into whatever a session starts), so it
-    // is tunnelled as it was before the account was added. Decided before a
+    // its own login, with nothing pooled or booked. A CONNECT whose pin names
+    // an account of the host's provider, or an API key with an upstream of its
+    // own, is refused, with 503 since this proxy cannot serve it until then:
+    // that pin asks for accounts of the pool, and a tunnel would drop it
+    // unsaid. Any other pin is tunnelled, as it was before the account was
+    // added, because the pool does not serve that pin on this host: another
+    // provider's subscription, or a plain API key (no upstream of its own),
+    // such as the one `teamclaude login --api` writes. TC_ACCT rides
+    // HTTPS_PROXY into whatever a session starts. Decided before a
     // terminating server is built, so a refusal builds none.
     if (leafHosts && !leafHosts.includes(host)) {
       ensureLeaf()
@@ -557,7 +561,10 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, leafH
         .then(({ named, until, why }) => {
           if (named) return intercept();
           const provider = providerForHost(host);
-          if (pin && (resolvePinList(accountManager, pin) || []).some((i) => providerOf(accountManager.accounts[i]) === provider)) {
+          if (pin && (resolvePinList(accountManager, pin) || []).some((i) => {
+            const account = accountManager.accounts[i];
+            return providerOf(account) === provider || (!isSubscriptionAccount(account) && !!account?.upstream);
+          })) {
             log(`[TeamClaude] CONNECT ${host} refused for pin ${redactToken(pin)}: an account added since the proxy started needs that host, and ${why}; a tunnel would serve the pin outside the pool`);
             refuseRaw(clientSocket, '503 Service Unavailable');
             return;
