@@ -114,7 +114,7 @@ test('fetchResetCreditDetails reports a non-2xx rather than inventing an empty l
   const result = await fetchResetCreditDetails({ credential: 's', accountId: 'a' }, {
     fetchImpl: async () => ({ ok: false, status: 401 }),
   });
-  assert.deepEqual(result, { error: 'HTTP 401', status: 401 });
+  assert.deepEqual(result, { error: 'HTTP 401', status: 401, retryAt: null });
 });
 
 // ── consuming ───────────────────────────────────────────────────────────────

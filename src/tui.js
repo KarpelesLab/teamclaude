@@ -1,4 +1,5 @@
 import { createWriteStream } from 'node:fs';
+import { RESET_OPEN_TTL_MS } from './reset-readings.js';
 import { gatingUtilization } from './model.js';
 import { importCredentials, fetchProfile, formatMoney } from './oauth.js';
 import {
@@ -14,10 +15,12 @@ import { mintAccountId } from './account-id.js';
 import { ACCOUNT_REFUSAL_CODES } from './account-refusal.js';
 import { formatPercent, heldFableResets, heldResetCredits, showSessionRow, showWeeklyRow, unavailableLine } from './status-renderer.js';
 import { cacheUsageLabel, cacheUsageState } from './usage-label.js';
+import { statusLabel } from './error-type.js';
 import { resolveMaxUsage, resolveMaxSpendMinor, switchThresholdDiffs, modelLabel, EFFORT_SEP } from './model.js';
 import { parseProxyUrl, proxyToUrl, describeProxy, describeSelfProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy, localListener, isSelfProxy } from './upstream-proxy.js';
 import { describeRouting, parseRoutingUrl, routingToUrl, checkRouting } from './account-routing.js';
 import { sanitizeText, safeLine } from './safe-text.js';
+import { refreshTokenExpiryWarning, knownRefreshTokenExpiry, setRefreshTokenExpiry } from './refresh-token-expiry.js';
 // The setting rules live in one module; the CLI, the MCP tools and this screen
 // all read them from there, so they cannot drift apart (#426).
 import { MAX_PROBE_SECONDS, ROUTE_COLORS } from './config-ops.js';
@@ -507,6 +510,25 @@ export function routingTag(account) {
   return text ? `via ${text}` : '';
 }
 
+/**
+ * "ends 6d" — how long until the end time the operator set for the account
+ * (accounts[].endsAt), "ended" once it has passed, or '' when it has none.
+ * The countdown rather than the date: the row has a few columns to spare, and
+ * how soon is what explains why this account is being spent first.
+ * `teamclaude status` prints the date.
+ * @param {any} account
+ * @param {number} [now]
+ */
+export function endsTag(account, now = Date.now()) {
+  const endsAt = account?.endsAt;
+  if (typeof endsAt !== 'number' || !Number.isFinite(endsAt) || endsAt <= 0) return '';
+  const left = endsAt - now;
+  if (left <= 0) return 'ended';
+  if (left >= 86400000) return `ends ${Math.floor(left / 86400000)}d`;
+  if (left >= 3600000) return `ends ${Math.floor(left / 3600000)}h`;
+  return `ends ${Math.max(1, Math.floor(left / 60000))}m`;
+}
+
 // The status cell's name for an errorReason code. A code it does not know keeps `error`.
 const errorLabel = (/** @type {unknown} */ code) => code === 'account_on_hold' ? 'on hold'
   : code === 'refresh_rejected' || code === 'credential_rejected' ? 're-login'
@@ -532,9 +554,9 @@ function paneTitle(/** @type {string} */ label, /** @type {number} */ w) {
   return fitLine(` ${bold(label)} ${dim('─'.repeat(Math.max(1, w - vw(label) - 2)))}`, w);
 }
 
-function formatReset(resetTs) {
+function formatReset(resetTs, now = Date.now()) {
   if (!resetTs) return '';
-  const ms = resetTs - Date.now();
+  const ms = resetTs - now;
   if (ms <= 0) return '';
   const mins = Math.ceil(ms / 60000);
   if (mins < 60) return `${mins}m`;
@@ -791,12 +813,60 @@ function tailText(s, w) {
  * @property {string} linkId  joins the pieces of a wrapped URL into one link
  */
 
+/**
+ * A cached or on-demand reset read. Closing or re-reading invalidates the sequence;
+ * spending consumes a confirmation before the first await.
+ * @typedef {object} ResetsPanel
+ * @property {Record<string, any>} account
+ * @property {boolean} loading
+ * @property {import('./reset-actions.js').ResetDetails | null} details
+ * @property {string | null} error  a read failure or a declined spend
+ * @property {string | null} notice  the claim verdict, separate from quota-read errors
+ * @property {number} idx  cursor position among held grants only
+ * @property {boolean} confirming
+ * @property {boolean} busy
+ * @property {number} seq
+ */
+
+/** @type {Record<import('./reset-actions.js').ResetGrant['kind'], string>} */
+const RESET_KIND_LABEL = {
+  weekly: 'Weekly reset', fable: 'Fable reset', session: 'Session reset', codex: 'Codex reset credit',
+};
+/** @type {Record<string, string>} */
+const RESET_LIMIT_LABEL = { five_hour: '5h', seven_day: 'week', seven_day_overage_included: 'Fable week' };
+
+/** Local calendar dates, with a year only when it differs from today's.
+ * @param {number} at @param {number} now @param {boolean} [withTime]
+ */
+function resetLocalDate(at, now, withTime = false) {
+  const date = new Date(at);
+  return new Intl.DateTimeFormat('en-GB', {
+    day: 'numeric', month: 'short',
+    year: date.getFullYear() === new Date(now).getFullYear() ? undefined : 'numeric',
+    ...(withTime ? { weekday: 'short', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' } : {}),
+  }).format(date).replaceAll(',', '');
+}
+
+/** @param {number} at @param {number} now @param {boolean} [withDay] */
+function resetLocalTime(at, now, withDay = false) {
+  if (withDay || new Date(at).toDateString() !== new Date(now).toDateString()) return resetLocalDate(at, now, true);
+  return new Intl.DateTimeFormat('en-GB', { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(at);
+}
+
+/** @param {number} at @param {number} now */
+function resetExpiry(at, now) {
+  if (at <= now) return 'expired';
+  return at - now > 86400_000 ? `expires ${resetLocalDate(at, now)}` : `expires in ${formatReset(at, now)}`;
+}
+
 // ── TUI class ────────────────────────────────────────────────
 
 export class TUI {
-  constructor({ accountManager, config, saveConfig, syncAccounts, onQuit, sx = null, probeQuota = null,
+  constructor({ accountManager, config, saveConfig, syncAccounts, onQuit, sx = null, probeQuota = null, resetActions = /** @type {ReturnType<typeof import('./reset-actions.js').createResetActions>|null} */ (null),
     // Cast so the destructured binding is the callback type, not `null`: index.js passes a function here.
     loginAccount = /** @type {LoginAccount | null} */ (null),
+    // The reset panel reads one clock value per frame; tests can fix it.
+    resetNow = Date.now,
     activityLogPath = null,
     // Attach mode: the accounts belong to a server in another process, reached
     // over its control plane. Everything that would mutate local state is off,
@@ -818,6 +888,8 @@ export class TUI {
     // tmux wrapping can be exercised without running inside tmux.
     env = /** @type {Record<string, string | undefined>} */ (process.env) }) {
     this.am = accountManager;
+    this.resetActions = resetActions ?? null;
+    this.resetNow = resetNow;
     this.remote = remote;
     this.applySwitch = applySwitch;
     this.config = config;
@@ -841,10 +913,10 @@ export class TUI {
 
     this.log = [];           // completed activity entries
     this.active = new Map(); // in-flight requests
-    this.mode = 'normal';    // normal | select | add | input | settings | pick | login
+    this.mode = 'normal';    // normal | select | add | input | settings | pick | login | resets
     this.pick = null;        // active list picker (routes editor accounts/bucket/color)
     this.pickReturn = 'routes'; // mode to fall back to when the picker closes
-    this.selAction = null;   // switch | remove | toggle | reorder | routing
+    this.selAction = null;   // switch | remove | toggle | reorder | routing | login | resets
     this.selIdx = 0;
     this.selRoute = null;    // in switch mode: null = global default, else a getRoutes() entry to pin
     this.selReturn = 'normal'; // mode to fall back to when select mode closes
@@ -874,6 +946,8 @@ export class TUI {
     /** @type {LoginPanel | null} */
     this.login = null;
     this._loginSeq = 0;   // numbers each panel's link id, so two logins' links are never one
+    /** @type {ResetsPanel | null} */
+    this.resetsPanel = null;
   }
 
   // ── lifecycle ──────────────────────────────────────
@@ -1019,6 +1093,7 @@ export class TUI {
     if (this.login) this._loginTimerOff(this.login);
     this.login?.controller.abort();
     this.login = null;
+    this._closeResets();
     this.running = false;
     if (this.timer) { clearTimeout(this.timer); this.timer = null; }
     // Written now rather than dropped: quitting inside the debounce window
@@ -1107,7 +1182,7 @@ export class TUI {
     const pin = (info.pinned || r?.pinned) ? dim(' [pin]') : '';
     const cacheLabel = cacheUsageLabel(info.cacheUsage);
     const cache = cacheLabel && CACHE_PAINT[cacheUsageState(info.cacheUsage)](cacheLabel);
-    this._addLog(`${this._sessionTag(sid)} ${info.method} ${info.path}${model} → ${acct}${pin} (${info.status}, ${dur}s)${cache ? ` ${cache}` : ''}`);
+    this._addLog(`${this._sessionTag(sid)} ${info.method} ${info.path}${model} → ${acct}${pin} (${statusLabel(info.status, info.errorType)}, ${dur}s)${cache ? ` ${cache}` : ''}`);
     if (this.active.size === 0) this._retick();   // animating → idle
   }
 
@@ -1284,6 +1359,7 @@ export class TUI {
       case 'pick': this._keyPick(k); break;
       case 'blocklist': this._keyBlocklist(k); break;
       case 'login': this._keyLogin(k); break;
+      case 'resets': this._keyResets(k); break;
     }
     this.render();
   }
@@ -1312,6 +1388,12 @@ export class TUI {
       const broken = order.find((/** @type {number} */ i) => this.am.accounts[i]?.status === 'error');
       this.mode = 'select'; this.selAction = 'login'; this.selReturn = 'normal';
       this.selIdx = broken ?? order[0] ?? 0;
+    }
+    else if (k === 'r' && this.resetActions && this.am.accounts.length > 0) {
+      const order = this._displayOrder();
+      const banked = order.find((/** @type {number} */ i) => heldResetCredits(this.am.accounts[i]?.quota) > 0);
+      this.mode = 'select'; this.selAction = 'resets'; this.selReturn = 'normal';
+      this.selIdx = banked ?? order[0] ?? 0;
     }
     else if (k === 'g') { this.mode = 'settings'; this.setIdx = 0; this._loadSxBalance(); }
   }
@@ -1696,6 +1778,11 @@ export class TUI {
         return;
       } else if (this.selAction === 'toggle') {
         this._doToggleDisabled(this.selIdx);
+      } else if (this.selAction === 'resets') {
+        // A non-OAuth row has nothing to read. Keep the picker open so another
+        // account can be chosen instead of falling through to remove/close.
+        this._openResets(this.selIdx);
+        return;
       } else if (this.selAction === 'login') {
         this._doLogin(this.selIdx);
       } else if (this.selAction === 'reorder') {
@@ -1987,6 +2074,122 @@ export class TUI {
     if (!this.running || this._stdoutDead) return false;
     try { process.stdout.write(seq); } catch { return false; }
     return true;
+  }
+
+  /** @param {number} idx */
+  _openResets(idx) {
+    if (this.remote || !this.resetActions) return;
+    const account = this.am.accounts[idx];
+    if (!account) { this._addLog('That account is no longer listed'); return; }
+    if (account.type !== 'oauth' || (providerOf(account) !== 'codex' && account.upstream)) {
+      this._addLog(`"${safeLine(account.name, 64)}" is not an OAuth Claude or Codex account`);
+      return;
+    }
+    this.resetsPanel = { account, loading: true, details: null, error: null, notice: null, idx: 0, confirming: false, busy: false, seq: 0 };
+    this.mode = 'resets';
+    void this._readResets(this.resetsPanel, { open: true });
+  }
+
+  _closeResets() {
+    if (this.resetsPanel) this.resetsPanel.seq++;
+    this.resetsPanel = null;
+    if (this.mode === 'resets') this.mode = 'normal';
+  }
+
+  /** @param {ResetsPanel} panel
+   * @param {{ open?: boolean, afterSpend?: boolean, cachedOnly?: boolean }} [opts]
+   */
+  async _readResets(panel, { open = false, afterSpend = false, cachedOnly = false } = {}) {
+    if (!this.resetActions || this.resetsPanel !== panel || panel.busy) return;
+    const seq = ++panel.seq;
+    panel.loading = true;
+    panel.confirming = false;
+    panel.error = null;
+    if (!afterSpend) panel.notice = null;
+    try {
+      const cached = this.resetActions.cached?.(panel.account);
+      const now = this.resetNow();
+      const window = this.resetActions.readWindow?.(panel.account);
+      const reuse = !afterSpend && ((open && cached?.seenAt != null && now - cached.seenAt <= RESET_OPEN_TTL_MS)
+        || (window != null && now < window.until));
+      // The Claude redeemer already read quota after success. Do not add
+      // another usage request, especially after a 429. Keep stale details when
+      // that read failed; the claim verdict remains a separate success notice.
+      const details = cachedOnly ? cached ?? panel.details : reuse && cached ? cached : await this.resetActions.read(panel.account);
+      if (!details) return;
+      if (reuse && !open && window?.readAt != null) {
+        panel.error = `read ${Math.max(0, Math.floor((now - window.readAt) / 1000))}s ago — wait ${Math.ceil((window.until - now) / 1000)}s`;
+      }
+      if (this.resetsPanel !== panel || panel.seq !== seq) return;
+      // Keep one visible list for rendering, movement, confirmation and spending.
+      panel.details = { ...details, grants: details.grants.filter(grant => grant.resetsLeft >= 1) };
+      panel.idx = Math.max(0, Math.min(panel.idx, panel.details.grants.length - 1));
+    } catch (/** @type {any} */ error) {
+      if (this.resetsPanel !== panel || panel.seq !== seq) return;
+      panel.details = null;
+      panel.error = `Reset read failed: ${safeLine(error?.message || String(error), 240)}`;
+    } finally {
+      if (this.resetsPanel === panel && panel.seq === seq) {
+        panel.loading = false;
+        if (this.running) this.render();
+      }
+    }
+  }
+
+  /** @param {string} k */
+  _keyResets(k) {
+    const panel = this.resetsPanel;
+    if (!panel) return;
+    if (panel.confirming) {
+      if (k === 'y' || k === 'Y') void this._spendReset(panel);
+      else panel.confirming = false;
+      return;
+    }
+    if (k === 'esc' || k === 'q') { this._closeResets(); return; }
+    // A claim cannot be cancelled. Keep its grant fixed until it settles;
+    // closing the panel only stops displaying it, not the upstream request.
+    if (panel.busy) return;
+    // One read at a time: the read floor only arms once a read has landed, so
+    // a held `r` would otherwise send a usage request per key repeat.
+    if (panel.loading) return;
+    if (k === 'r') { void this._readResets(panel); return; }
+    const grants = panel.details?.grants || [];
+    if (k === 'up' || k === 'k') panel.idx = Math.max(0, panel.idx - 1);
+    else if (k === 'down' || k === 'j') panel.idx = Math.max(0, Math.min(grants.length - 1, panel.idx + 1));
+    else if (k === 'enter' && grants[panel.idx] && !grants[panel.idx].blocked) panel.confirming = true;
+  }
+
+  /** @param {ResetsPanel} panel */
+  async _spendReset(panel) {
+    const grant = panel.details?.grants[panel.idx];
+    if (!this.resetActions || this.resetsPanel !== panel || !panel.confirming || panel.loading || panel.busy || !grant || grant.blocked) return;
+    // Consume this confirmation synchronously. Repeated y/Enter cannot make a
+    // second irreversible call while the first promise is still pending.
+    panel.confirming = false;
+    panel.busy = true;
+    panel.error = null;
+    panel.notice = null;
+    try {
+      const result = await this.resetActions.redeem(panel.account, grant.id);
+      this._addLog(result.message);
+      if (this.resetsPanel !== panel) return;
+      panel.busy = false;
+      if (result.redeemed) {
+        const left = result.resetsLeft == null ? '' : ` · ${result.resetsLeft} left`;
+        const cleared = result.cleared?.length ? ` · cleared ${result.cleared.map(limit => RESET_LIMIT_LABEL[limit] || limit).join(' + ')}` : '';
+        panel.notice = `${result.message}${left}${cleared}`;
+      }
+      if (result.redeemed || result.uncertain) {
+        await this._readResets(panel, { afterSpend: true, cachedOnly: result.redeemed && panel.details?.provider === 'claude' });
+      } else panel.error = result.message;
+    } catch (/** @type {any} */ error) {
+      const message = `Manual reset failed on "${safeLine(panel.account.name, 64)}": ${safeLine(error?.message || String(error), 240)}`;
+      this._addLog(message);
+      if (this.resetsPanel === panel) panel.error = message;
+    } finally {
+      panel.busy = false;
+      if (this.resetsPanel === panel && this.running) this.render();
+    }
   }
 
   async _doSync() {
@@ -2307,6 +2510,8 @@ export class TUI {
         refreshToken: creds.refreshToken,
         expiresAt: creds.expiresAt,
       };
+      // When the refresh token lapses, where the credential file says.
+      setRefreshTokenExpiry(entry, creds.refreshTokenExpiresAt);
 
       // Same rule as the login path: a name match counts only where it is not
       // standing in for a different account+org. Both organizations of one person
@@ -2317,6 +2522,8 @@ export class TUI {
       if (idx >= 0) {
         const prev = this.config.accounts[idx];
         this.config.accounts[idx] = updateAccountEntry(prev, entry);
+        // A new refresh token: the date the row held was about the old one.
+        setRefreshTokenExpiry(this.config.accounts[idx], creds.refreshTokenExpiresAt);
         // The account to update is the one built from this entry. Identity cannot
         // answer that: the entry may have matched on a bare name while carrying no
         // UUID, and then no account matches the freshly profiled identity at all.
@@ -2330,6 +2537,7 @@ export class TUI {
           amAcct.credential = creds.accessToken;
           amAcct.refreshToken = creds.refreshToken;
           amAcct.expiresAt = creds.expiresAt;
+          amAcct.refreshTokenExpiresAt = knownRefreshTokenExpiry(creds.refreshTokenExpiresAt);
           if (entry.accountUuid) amAcct.accountUuid = entry.accountUuid;
           if (entry.orgUuid) amAcct.orgUuid = entry.orgUuid;
           if (entry.orgName) amAcct.orgName = entry.orgName;
@@ -2638,12 +2846,14 @@ export class TUI {
     } else if (view === 'blocklist') {
       this._renderBlocklist(lines);
     } else {
-    // ── Accounts, or the login panel in their place. The activity pane stays
-    // under the panel: the sign-in's own progress lines land there.
+    // ── Accounts, or the login/reset panel in their place. The activity pane
+    // stays under the panel so action results remain on screen.
     if (view === 'login') {
       const panel = this._loginLines(W);
       lines.push(...panel.lines);
       links = panel.links;
+    } else if (view === 'resets') {
+      lines.push(...this._resetsLines(W));
     } else if (this.am.accounts.length === 0) {
       lines.push('');
       // Attach mode cannot add an account, and pointing at a key that does
@@ -2824,6 +3034,65 @@ export class TUI {
     return { lines, links };
   }
 
+  /** @param {number} W @returns {string[]} */
+  _resetsLines(W) {
+    const panel = this.resetsPanel;
+    if (!panel) return [];
+    const details = panel.details;
+    const brand = (details?.provider || (providerOf(panel.account) === 'codex' ? 'codex' : 'claude')) === 'codex' ? 'Codex' : 'Claude';
+    const now = this.resetNow();
+    const ageSeconds = details?.seenAt == null ? null : Math.max(0, Math.floor((now - details.seenAt) / 1000));
+    const age = ageSeconds == null ? '' : ` · as of ${ageSeconds < 60 ? `${ageSeconds}s` : `${Math.floor(ageSeconds / 60)}m`} ago`;
+    const stale = details?.stale ? ' · stale' : '';
+    const failure = details?.stale && details.error ? ` · ${details.error}` : '';
+    const lines = ['', truncate(` ${bold(`Resets — ${safeLine(panel.account.name, 64)}`)}${dim(` · ${brand}${stale}${age}${failure}`)}`, Math.max(0, W - 1)), ''];
+    const prose = (/** @type {string} */ text, paint = (/** @type {string} */ s) => s) => {
+      for (const line of wrapWords(sanitizeText(text), W - 4)) lines.push(`   ${paint(line)}`);
+    };
+    if (panel.loading) {
+      prose('Reading reset details...', dim);
+      return lines;
+    }
+    if (panel.notice) { prose(panel.notice, green); lines.push(''); }
+    if (details) {
+      if (details.error && details.seenAt == null) {
+        prose(details.error, red);
+        if (details.retryAt != null && details.retryAt > now) prose(`retry in ${Math.ceil((details.retryAt - now) / 1000)}s`, yellow);
+        if (panel.error) prose(panel.error, yellow);
+        return lines;
+      }
+      if (details.retryAt != null && details.retryAt > now) prose(`retry in ${Math.ceil((details.retryAt - now) / 1000)}s`, yellow);
+      const limit = details.atLimit === true ? `at a limit: ${details.exhausted.map(limit => RESET_LIMIT_LABEL[limit] || limit).join(' + ')}`
+        : details.atLimit === false ? 'not at a limit' : 'limit state unknown';
+      prose(`${limit}${details.weeklyResetsAt == null ? '' : ` · week resets ${resetLocalTime(details.weeklyResetsAt, now, true)}`}`);
+      if (details.cooldownUntil != null && details.cooldownUntil > now) {
+        prose(`upstream cooldown until ${resetLocalTime(details.cooldownUntil, now)}`, yellow);
+      }
+      if (details.fleetHoldUntil != null) prose(`fleet hold until ${resetLocalTime(details.fleetHoldUntil, now)}`, yellow);
+      if (details.ineligibleReason) prose(`ineligible: ${details.ineligibleReason}`, red);
+      if (details.error && !details.stale) prose(details.error, red);
+      lines.push('');
+      const kindWidth = Math.max(0, ...details.grants.map(grant => RESET_KIND_LABEL[grant.kind].length));
+      const detail = (/** @type {string} */ text, paint = dim) => lines.push(`   ${paint(truncate(sanitizeText(text), Math.max(0, W - 4)))}`);
+      details.grants.forEach((grant, idx) => {
+        const selected = idx === panel.idx;
+        const kind = RESET_KIND_LABEL[grant.kind];
+        const clears = grant.clears.map(limit => sanitizeText(RESET_LIMIT_LABEL[limit] || limit)).join(' + ') || '-';
+        const expiry = grant.endsAt == null ? '' : `  ${resetExpiry(grant.endsAt, now)}`;
+        const rest = `${' '.repeat(kindWidth - kind.length)}  ${grant.resetsLeft} left  clears ${clears}${expiry}${grant.next ? '  (next)' : ''}${grant.blocked ? ` · ${sanitizeText(grant.blocked)}` : ''}`;
+        const text = grant.blocked ? dim(bold(kind)) + dim(rest) : bold(kind) + rest;
+        lines.push(truncate(` ${selected ? cyan('▸') : ' '} ${text}`, Math.max(0, W - 1)));
+        if (selected) {
+          if (grant.label) detail(grant.label);
+          if (grant.warnings.length) detail(grant.warnings.join(' · '), yellow);
+        }
+      });
+      if (!details.grants.length && !details.error) prose('no banked resets', dim);
+    }
+    if (panel.error) prose(panel.error, yellow);
+    return lines;
+  }
+
   /** Width budget for a list `W` wide, per row category, as one provider's pane when
    *  `pane` is set; `stages` are the widths at which bars, names, then caps fit. */
   _listLayout(/** @type {number[]} */ indices, /** @type {number} */ W, { pane = /** @type {string|null} */ (null), measure = false } = {}) {
@@ -2921,6 +3190,12 @@ export class TUI {
         const tag = switchThresholdTag(a, key => this.am.thresholdFor(key));
         return tag ? Math.max(w, 2 + vw(tag)) : w;
       }, 0);
+      // Same rule again for the end-time tag: silent for every account that
+      // has none.
+      const endsW = members.reduce((/** @type {number} */ w, /** @type {any} */ a) => {
+        const tag = endsTag(a);
+        return tag ? Math.max(w, 2 + vw(tag)) : w;
+      }, 0);
       // Same rule again for the routing tag: silent for every account on the
       // fleet path, so it costs the budget nothing there.
       const routeW = members.reduce((/** @type {number} */ w, /** @type {any} */ a) => {
@@ -2938,7 +3213,7 @@ export class TUI {
       // that, a routed credit account reserved 82 columns at W=80 before any bar and fitLine cut the address off
       // (Copilot's review of #649).
       const layout = (/** @type {number} */ tagW) => {
-        const fixedWithRoute = 20 + typeCell + NAME_MIN + routeCells + tagW + spendW + creditW + switchW + routeW + prepaidW;
+        const fixedWithRoute = 20 + typeCell + NAME_MIN + routeCells + tagW + spendW + creditW + switchW + endsW + routeW + prepaidW;
         const routeTags = routeW === 0 || fixedWithRoute + BAR_MIN <= W;
         return { fixed: routeTags ? fixedWithRoute : fixedWithRoute - routeW, routeTags };
       };
@@ -3036,7 +3311,13 @@ export class TUI {
   _rowLines(/** @type {number} */ idx, /** @type {any} */ L, /** @type {Set<number>} */ current) {
     const a = this.am.accounts[idx];
     const row = this._renderRow(idx, L, current);
-    if (this._unavailable(a) !== 'error') return [row];
+    if (this._unavailable(a) !== 'error') {
+      // A known refresh-token expiry gets a line only once it is close (or
+      // past): on every row it would double the list for a date weeks away,
+      // which `teamclaude status` shows.
+      const soon = refreshTokenExpiryWarning(a);
+      return soon ? [row, ...wrapWords(soon, L.width - 4).map(l => `    ${yellow(l)}`)] : [row];
+    }
     const plain = (/** @type {string} */ s) => s;
     const why = unavailableLine({ ...a, unavailable: 'error', onExtraUsage: this._onExtraUsage(a) }, { dim: plain, yellow: plain, red: plain });
     return [row, ...wrapWords(why ?? '', L.width - 4).map(l => `    ${yellow(l)}`)];
@@ -3433,6 +3714,10 @@ export class TUI {
     // the fleet's own numbers) — see switchThresholdTag.
     const switchTag = switchThresholdTag(a, key => this.am.thresholdFor(key));
     if (switchTag) line += `  ${cyan(switchTag)}`;
+    // The end time the operator set, as a countdown: yellow while it is ahead
+    // and moving traffic here, dim once it has passed.
+    const ends = endsTag(a);
+    if (ends) line += `  ${(ends === 'ended' ? dim : yellow)(ends)}`;
     // Routing tag trails even that: where the account's traffic physically
     // leaves the machine, when the operator pinned it to its own proxy.
     // Left out when the row's budget had no room for it (`routeTags`, budgetFor).
@@ -3895,7 +4180,7 @@ export class TUI {
       case 'normal':
         return this.remote
           ? ` ${bold('s')}witch  ${bold('R')}eload  ${bold('q')}uit`
-          : ` ${bold('s')}witch  ${bold('d')}isable  ${this.loginAccount ? `${bold('l')}ogin  ` : ''}${bold('p')}robe quota  ${bold('R')}eload  ${bold('g')} settings  ${bold('q')}uit`;
+          : ` ${bold('s')}witch  ${bold('d')}isable  ${this.loginAccount ? `${bold('l')}ogin  ` : ''}${this.resetActions && this.am.accounts.length > 0 ? `${bold('r')}esets  ` : ''}${bold('p')}robe quota  ${bold('R')}eload  ${bold('g')} settings  ${bold('q')}uit`;
       case 'settings':
         return ` ${dim('↑↓')} navigate  ${dim('←→')} change  ${bold('Enter')} edit  ${bold('Esc')} back`;
       case 'routes':
@@ -3923,6 +4208,9 @@ export class TUI {
         if (this.selAction === 'reorder') {
           return ` ${dim('↑↓')} select  ${dim('←→')} move  ${bold('Enter')}/${bold('Esc')} done`;
         }
+        if (this.selAction === 'resets') {
+          return ` ${dim('↑↓')} select  ${bold('Enter')} resets  ${bold('Esc')} cancel`;
+        }
         if (this.selAction === 'login') {
           return ` ${dim('↑↓')} select  ${bold('Enter')} sign in via browser  ${bold('Esc')} cancel`;
         }
@@ -3934,6 +4222,20 @@ export class TUI {
         return ` ${bold('i')}mport Claude Code  ${bold('k')} API key  ${bold('Esc')} cancel`;
       case 'input':
         return ` ${this.inputPrompt}: ${this.inputSecret ? '*'.repeat(this.inputBuf.length) : this.inputBuf}█`;
+      case 'resets': {
+        const panel = this.resetsPanel;
+        if (panel?.busy) return yellow(bold(' spending…'));
+        const grant = panel?.details?.grants[panel.idx];
+        if (panel?.confirming && grant) {
+          const W = process.stdout.columns || 80;
+          const prefix = `Spend 1 ${RESET_KIND_LABEL[grant.kind].toLowerCase()} on "`;
+          const suffix = '"? y/N';
+          const name = strip(truncate(safeLine(panel.account.name, 64), Math.max(0, W - vw(prefix + suffix) - 1)));
+          const warnings = grant.warnings.length ? ` · ${grant.warnings.map(w => sanitizeText(w)).join(' · ')}` : '';
+          return yellow(bold(truncate(` ${prefix}${name}${suffix}${warnings}`, W)));
+        }
+        return ` ${dim('↑↓')} move  ${bold('Enter')} spend  ${bold('r')} re-read  ${bold('Esc')} close`;
+      }
       case 'login': {
         // `c` is only a key while the field is empty (see _keyLogin), so it
         // is only offered then.

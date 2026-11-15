@@ -48,9 +48,8 @@ test('the config row dropped is the one the account was built from, not the one 
 // then a save. A reload that reads the file before the save lands sees a
 // running account with no row, which without the record would read as a
 // removal — of the account the operator just added.
-for (const persistSessionAffinity of [false, true]) {
-test(`an account added before its save survives reload (affinity ${persistSessionAffinity})`, async () => {
-  const mem = { persistSessionAffinity, accounts: [acct('a@x.com', 'id-a')] };
+test("an account added in memory whose save has not landed survives a reload that reads the file first", async () => {
+  const mem = { accounts: [acct('a@x.com', 'id-a')] };
   const am = new AccountManager(mem.accounts.map(a => ({ ...a })), 0.98, { refreshFn: async () => { throw new Error('no refresh'); } });
   // The TUI added b@x.com: one object into both lists, and its id recorded.
   const fresh = acct('b@x.com', 'id-b');
@@ -62,7 +61,6 @@ test(`an account added before its save survives reload (affinity ${persistSessio
   assert.deepEqual(am.accounts.map(a => a.name), ['a@x.com', 'b@x.com']);
   assert.deepEqual(mem.accounts.map(a => a.name), ['a@x.com', 'b@x.com']);
 });
-}
 
 test('nothing is dropped when disk and memory agree, and an addition is still reported', async () => {
   const mem = { accounts: [acct('a@x.com', 'id-a')] };

@@ -2,7 +2,6 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
-import { setUpstreamProxy, resolveUpstreamProxy, resetUpstreamProxy } from '../src/upstream-proxy.js';
 import { createProxyServer, requestThread } from '../src/server.js';
 
 // A message-thread continue carries only the turn's delta, and Anthropic keeps
@@ -12,9 +11,6 @@ import { createProxyServer, requestThread } from '../src/server.js';
 // body's first message, which for a continue is the delta rather than the
 // conversation's opening, so every continue looked like a new conversation and
 // session-aware routing sent it wherever a new one would go.
-
-test.beforeEach(() => setUpstreamProxy(resolveUpstreamProxy({ upstreamProxy: false }, {})));
-test.afterEach(() => resetUpstreamProxy());
 
 const SESSION = '0f6b7f2a-1c3d-4e5f-8a9b-0c1d2e3f4a5b';
 

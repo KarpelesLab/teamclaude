@@ -20,7 +20,32 @@ TeamClaude prefers to keep you on one account. It stays on the current one and o
 
 An account you have [cordoned](usage.md#cordoning-one-account) is never picked for new work, whatever its priority; a conversation already on it stays there.
 
-When it does have to pick, ranking is: lowest `priority` number first, then, among accounts of equal priority, the one whose governing weekly bucket resets soonest. Spending the account closest to its refresh preserves the ones whose window resets further out. A model with its own weekly bucket (Fable, Sonnet) is ranked by that bucket rather than the shared one. To make the soonest reset a standing preference rather than a tiebreak, set `"preferSoonestWeeklyReset": true`. Then, on every request, traffic moves to the available account in the top priority tier whose governing weekly window resets soonest — at least a minute sooner than the current one — and rotation ranks that reset ahead of expiry pressure. This is earliest-deadline-first: weekly quota that would expire unspent is spent first, then the next-soonest, and an account sidelined by its 5-hour window is reclaimed as soon as that window frees up. An account whose weekly reset is unknown never preempts. Hot-applies on config reload. Set an explicit order with `teamclaude priority <name> <n>`, or `--first` / `--last`. `teamclaude login --api` adds a key at priority 100 — a metered key is a last resort behind the subscriptions unless you say otherwise ([API key](accounts.md#api-key)).
+When it does have to pick, ranking is: lowest `priority` number first, then, among accounts of equal priority, the one whose governing weekly bucket resets soonest. Spending the account closest to its refresh preserves the ones whose window resets further out. A model with its own weekly bucket (Fable, Sonnet) is ranked by that bucket rather than the shared one. To make the soonest reset a standing preference rather than a tiebreak, set `"preferSoonestWeeklyReset": true`. Then, on every request, traffic moves to the available account in the top priority tier whose governing weekly window resets soonest — at least a minute sooner than the current one — and rotation ranks that reset ahead of expiry pressure. This is earliest-deadline-first: weekly quota that would expire unspent is spent first, then the next-soonest, and an account sidelined by its 5-hour window is reclaimed as soon as that window frees up. An account whose weekly reset is unknown never preempts. Hot-applies on config reload.
+
+Separately, and on by default, an account whose 5-hour window resets takes the traffic straight away when its weekly window lapses sooner than the current account's, even though the current account is healthy (the log says `session quota reset and weekly expires sooner — switching to it`). Each such move costs the conversations on the old account their prompt cache, and with [keep-warm](quota.md#keep-warm) running every idle account's window resets every five hours. Set `"switchOnSessionReset": false` to keep traffic on a working account. The reset account still rejoins rotation and wins it on its sooner weekly when rotation next has to pick. Set an explicit order with `teamclaude priority <name> <n>`, or `--first` / `--last`. `teamclaude login --api` adds a key at priority 100 — a metered key is a last resort behind the subscriptions unless you say otherwise ([API key](accounts.md#api-key)).
+
+### An account with an end date
+
+Some accounts stop being usable at a time no usage response reports: a subscription you cancelled that runs to the end of its paid month, a trial. Whatever weekly quota such an account holds at that moment is lost, the same way quota is lost at a weekly reset. Tell the proxy when:
+
+```bash
+teamclaude ends me@example.com 2026-12-01            # start of that day, local time
+teamclaude ends me@example.com 2026-12-01T09:00:00Z  # an exact instant
+teamclaude ends me@example.com --clear
+```
+
+This writes `"endsAt"` on the account's entry (an ISO 8601 string or epoch milliseconds; `ends` also takes epoch milliseconds) and reloads a running server. From then on the account's **deadline** is the earlier of its governing weekly reset and its end time, and everything that ranks accounts by how soon their quota expires reads the deadline in place of the weekly reset:
+
+- the equal-priority tiebreak above (soonest first),
+- `preferSoonestWeeklyReset`, which moves traffic to the account with the soonest deadline,
+- the session-reset switch, which moves to an account whose 5-hour window came back when its deadline is sooner than the current account's,
+- [expiry pressure](#expiry-pressure-routing) and the adaptive `"scoring": "pressure"` placement, where the time left to spend the headroom is the time to the deadline, so the account's pressure rises as its end approaches.
+
+An account with no weekly reading yet has its end time as its deadline, and a fresh window on it is priced over the time left rather than a full week.
+
+It only ranks. `priority` still comes first, so an ending account in a lower tier is not pulled ahead of a preferred one: give it the same or a lower priority number if you want it drained. Thresholds, caps, cordons, pins and routes are untouched, and no account becomes available or unavailable because of an end time. Once the time has passed it has no effect at all: the account is not disabled, and what the ended subscription does is reported by upstream and handled as it is for any account ([billing refusals](#billing-refusals), a plan that left the OAuth profile). `teamclaude status` shows the date on the account (`Ends     2026-12-01 (in 6 days)`), the TUI row carries an `ends 6d` tag, and each account in `status --json` and `GET /teamclaude/status` carries `endsAt` as epoch milliseconds (`null` when unset).
+
+Without `preferSoonestWeeklyReset` or `expiryRouting` the deadline is consulted only when selection has to pick, as the weekly reset is: an account being spent is left until it reaches `switchThreshold`.
 
 ## The two kinds of 429
 
@@ -127,7 +152,7 @@ TeamClaude does not strip or rewrite thinking blocks, so nothing is lost for goo
 
 When you run many agents at once and the active account runs out, every in-flight request fails over to the next account **at the same instant** — a thundering herd that can spend a big chunk of the fresh account's quota (large contexts) and instantly throttle it, cascading down the fleet ([#84](https://github.com/KarpelesLab/teamclaude/issues/84)).
 
-To prevent this, requests onto a **just-switched-to account** are paced: concurrency starts at 1 and the cap ramps up over a few seconds, then lifts. The first request or two reveal whether the new account is also near-exhausted **before** the whole herd commits to it, so a cascade is broken up hop by hop. The gate is **fail-open** — a request never blocks longer than the ramp window, and a client that disconnects while waiting just drops out — and the slot is held only until response headers arrive, so streaming replies don't tie up concurrency.
+To prevent this, requests onto a **just-switched-to account** are paced: concurrency starts at 1 and the cap ramps up step by step, then lifts once the ramp window (`windowMs`, 30 seconds by default) has passed. The first request or two reveal whether the new account is also near-exhausted **before** the whole herd commits to it, so a cascade is broken up hop by hop. The gate is **fail-open**: a request waits at most the ramp window, except on an account in a rate-limit pause, where it first waits out the pause and the window starts when the pause ends. A client that disconnects while waiting just drops out, and the slot is held only until response headers arrive, so streaming replies don't tie up concurrency. A 429 that pauses the account (see [the two kinds of 429](#the-two-kinds-of-429)) does so for at most `TEAMCLAUDE_RATE_LIMIT_ABSORB_MAX_SECONDS` (60 by default), and a further one extends the pause and restarts the ramp.
 
 On by default. Tune or disable via `stormRamp` in the config:
 
@@ -140,7 +165,9 @@ On by default. Tune or disable via `stormRamp` in the config:
 - **`windowMs`** — after this long, pacing stops entirely (default 30s).
 - **`enabled: false`** — turn storm control off (send the full burst immediately, pre-#84 behavior).
 
-The same gate handles rate-limit 429s: TeamClaude pauses the account for the `retry-after` window so new queries wait instead of piling on, then releases the held queries through a fresh ramp (staggered, not all at once).
+Each number has to be a finite number above 0, written without quotes, and `pollMs` (how often a waiting query re-checks the cap, default 50) a whole number of milliseconds from 5 to 536870911. A value that is not — `"1"`, `0`, a negative number, a field name the ramp does not know — is ignored with one line in the log, and that field keeps its default. `enabled` takes `true` or `false`; any other value is read for its truth, so `0`, `null` and `""` turn storm control off, and is named in the log. The block is read at startup; a reload does not apply a change to it.
+
+The same gate handles rate-limit 429s: TeamClaude pauses the account for the `retry-after` window, at most `TEAMCLAUDE_RATE_LIMIT_ABSORB_MAX_SECONDS` (60 by default), so new queries wait instead of piling on, then releases the held queries through a fresh ramp (staggered, not all at once).
 
 ## Model-aware routing
 
@@ -253,15 +280,11 @@ open requests, counters or rollover observations enter this section. Operator
 The same one-hour **sliding idle lifetime** applies across restarts. Restoring
 never refreshes it: a conversation active for days can survive, while one idle
 for more than an hour is forgotten. Removed, disabled, ambiguous or changed-provider
-accounts lose their saved pins. With persistence enabled, a duplicated config
-entry ID is retired on **every** claimant during config reads and writes; neither
-the first copy nor the original can inherit that ID's old saved pins. Unrelated
-entry IDs keep their identity. Current model, provider, route, quota and hard-pin
+accounts lose their saved pins. Current model, provider, route, quota and hard-pin
 checks still govern every request. Thread ownership can survive a dropped pin,
 but does not make another account capable of continuing the upstream thread.
 
 While a request is in flight, a snapshot observes its current use without storing request counters or resuming the stream. Idle timestamps remain unchanged across saves and restarts; expiry follows the tracker’s existing wall clock behavior, including backward clock adjustments. Pin timestamps retain their original values even when another family was last used after the clock moved backward.
-With persistence enabled at startup, live reads and writes require exact entry IDs with compatible provider/account scope despite later flag edits. A retired ID cannot borrow a copy's credentials: its token save is skipped, and reload replaces it with the repaired disk entries. Old automatic pins are dropped; thread ownership and unrelated pins remain available.
 
 State is saved on the existing minute tick and on graceful shutdown, including
 once more after an enabled drain completes. Abrupt termination can lose routing

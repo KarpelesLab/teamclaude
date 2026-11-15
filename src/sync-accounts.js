@@ -1,9 +1,9 @@
 import { importCredentials } from './oauth.js';
 import { sameIdentity } from './identity.js';
 import { safeLine } from './safe-text.js';
-import { removedAccountIds, addedAccountIds, configIndexFor, claimDiskRows } from './account-pairing.js';
+import { removedAccountIds, addedAccountIds, configIndexFor } from './account-pairing.js';
 import { ensureAccountIds } from './account-id.js';
-import { accountSwitchThreshold, accountAllowsExtraUsage, accountRouting } from './account-manager.js';
+import { accountSwitchThreshold, accountAllowsExtraUsage, accountRouting, accountEndsAt } from './account-manager.js';
 import { localListener } from './upstream-proxy.js';
 import { accountCredit } from './api-credit.js';
 
@@ -17,19 +17,21 @@ import { accountCredit } from './api-credit.js';
  * @param {import('./account-manager.js').AccountManager} accountManager
  */
 export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
-  const exactIds = memConfig.persistSessionAffinity === true;
-  const removed = removedAccountIds(memConfig);
-  // Capture exact claims before additions mutate either list; default pairing stays below.
-  const managerRows = exactIds ? new Map(Array.from(claimDiskRows(accountManager.accounts, diskConfig.accounts, removed, true),
-    ([i, d]) => [diskConfig.accounts[d], accountManager.accounts[i]])) : null;
-  let added = 0, dropped = 0;
+  let added = 0;
   // Greedy 1:1 pairing of disk entries to in-memory accounts, account+org aware.
   // Each disk entry claims at most one unclaimed manager account, so multiple
   // same-person/different-org entries pair correctly instead of all matching the
   // first one with that accountUuid.
   const claimed = new Set();
-  const claim = (/** @type {Record<string, any>} */ diskAcct) =>
-    accountManager.accounts.findIndex((a, i) => !claimed.has(i) && sameIdentity(a, diskAcct));
+  const claim = (/** @type {Record<string, any>} */ diskAcct) => {
+    for (let i = 0; i < accountManager.accounts.length; i++) {
+      if (!claimed.has(i) && sameIdentity(accountManager.accounts[i], diskAcct)) {
+        claimed.add(i);
+        return i;
+      }
+    }
+    return -1;
+  };
 
   // The memConfig list needs the same greedy 1:1 pairing, for the same reason
   // and then some: it is not index-aligned with the manager (resolveAccounts
@@ -39,8 +41,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
   const cfgClaimed = new Set();
   const claimConfig = (/** @type {Record<string, any>} */ diskAcct) => {
     for (let i = 0; i < memConfig.accounts.length; i++) {
-      if (!cfgClaimed.has(i) && (exactIds
-        ? claimDiskRows([memConfig.accounts[i]], [diskAcct], removed, true).has(0) : sameIdentity(memConfig.accounts[i], diskAcct))) {
+      if (!cfgClaimed.has(i) && sameIdentity(memConfig.accounts[i], diskAcct)) {
         cfgClaimed.add(i);
         return memConfig.accounts[i];
       }
@@ -54,19 +55,15 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
   // save writes it back too. The ids are recorded for exactly that window
   // (cleared once the save lands), so a row naming one is the removal itself,
   // not a new account (#422).
+  const removed = removedAccountIds(memConfig);
   for (const diskAcct of diskConfig.accounts) {
     if (diskAcct?.id && removed.has(diskAcct.id)) continue;
-    const mgrIdx = exactIds ? managerRows?.get(diskAcct)?.index ?? -1 : claim(diskAcct);
-    if (mgrIdx >= 0) claimed.add(exactIds ? accountManager.accounts[mgrIdx] : mgrIdx);
+    const mgrIdx = claim(diskAcct);
     // Claimed once per disk entry and reused below. Calling claimConfig twice
     // for one entry would consume two different config rows.
     const cfgAcct = claimConfig(diskAcct);
 
     if (mgrIdx < 0) {
-      const replaced = exactIds ? accountManager.accounts.findIndex(a => a.id === diskAcct.id) : -1;
-      if (replaced >= 0) { accountManager.removeAccount(replaced); dropped++; }
-      const slot = exactIds ? memConfig.accounts.findIndex((/** @type {Record<string, any>} */ a) => a.id === diskAcct.id) : -1;
-      if (slot >= 0 && !cfgAcct) memConfig.accounts[slot] = diskAcct;
       // No manager account — which is NOT the same as "not yet known".
       // resolveAccounts drops every entry without a usable credential (an oauth
       // entry with no token, or an importFrom whose file has gone away — what
@@ -79,7 +76,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       // The account is still added, so an entry whose credential reappears heals
       // on the next reload rather than needing a restart. Only the duplicate
       // config row is suppressed.
-      if (!cfgAcct && slot < 0) {
+      if (!cfgAcct) {
         // Genuinely new. Both lists take the same object, so the account is
         // built carrying its entry's id and the two pair from the moment they
         // exist. ensureAccountIds runs between the two: a hand-copied section
@@ -90,9 +87,9 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
         cfgClaimed.add(memConfig.accounts.length - 1);
       }
       accountManager.addAccount(diskAcct);
-      claimed.add(exactIds ? accountManager.accounts.at(-1) : accountManager.accounts.length - 1);
+      claimed.add(accountManager.accounts.length - 1);
       added++;
-      console.log(replaced >= 0 ? `[TeamClaude] Replaced account "${safeLine(diskAcct.name, 64)}": its disk entry now names a different provider/account scope` : cfgAcct
+      console.log(cfgAcct
         ? `[TeamClaude] Re-admitting known account "${diskAcct.name}" from config`
         : `[TeamClaude] Picked up new account "${diskAcct.name}" from config`);
       continue;
@@ -127,6 +124,10 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     // A cordon applies on reload too: placement reads it at the next request,
     // and a conversation already on the account is kept there (account-manager.js).
     accountManager.setCordoned(mgr.index, !!diskAcct.cordoned);
+    // An end time set, moved or cleared on disk (`teamclaude ends`) is read by
+    // the very next selection. Through the constructor's own parse, so a value
+    // refused at startup is refused here, and a removed key clears it.
+    mgr.endsAt = accountEndsAt(diskAcct);
     mgr.maxSpend = diskAcct.maxSpend ?? null;
     // Same for a per-account switch threshold (#409): thresholdFor() reads it
     // straight off the account, so a disk edit takes effect on the very next
@@ -202,6 +203,8 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       if (Number.isFinite(diskAcct.displayOrder)) cfgAcct.displayOrder = diskAcct.displayOrder; else delete cfgAcct.displayOrder;
       if (diskAcct.disabled) cfgAcct.disabled = true; else delete cfgAcct.disabled;
       if (diskAcct.cordoned) cfgAcct.cordoned = true; else delete cfgAcct.cordoned;
+      // As written, not as parsed: the entry keeps the operator's own text.
+      if (diskAcct.endsAt != null) cfgAcct.endsAt = diskAcct.endsAt; else delete cfgAcct.endsAt;
       if (diskAcct.allowExtraUsage === true) cfgAcct.allowExtraUsage = true; else delete cfgAcct.allowExtraUsage;
       // Both polarities are mirrored, unlike the flags above: `false` is the
       // side of this key that does something, so a stale mirror of either value
@@ -214,17 +217,20 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     if (mgr.disabled !== wantDisabled) accountManager.setDisabled(mgr.index, wantDisabled);
 
     // Existing account — resolve fresh credentials from disk
-    /** @type {{ accessToken?: string, refreshToken?: string, expiresAt?: number, apiKey?: string }|null} */
+    /** @type {{ accessToken?: string, refreshToken?: string, expiresAt?: number, refreshTokenExpiresAt?: number, apiKey?: string }|null} */
     let freshCred = null;
     if (diskAcct.type === 'oauth' && diskAcct.importFrom) {
       try {
         const creds = await importCredentials(diskAcct.importFrom);
-        freshCred = { accessToken: creds.accessToken, refreshToken: creds.refreshToken, expiresAt: creds.expiresAt };
+        // The refresh token's own expiry rides with the token it describes, here
+        // and below: a newer sign-in on disk brings its date (or none), and a
+        // staler copy never gets as far as updateAccountTokens.
+        freshCred = { accessToken: creds.accessToken, refreshToken: creds.refreshToken, expiresAt: creds.expiresAt, refreshTokenExpiresAt: creds.refreshTokenExpiresAt };
       } catch (/** @type {any} */ err) {
         console.error(`[TeamClaude] Re-import failed for "${safeLine(diskAcct.name, 64)}": ${err.message}`);
       }
     } else if (diskAcct.type === 'oauth' && diskAcct.accessToken) {
-      freshCred = { accessToken: diskAcct.accessToken, refreshToken: diskAcct.refreshToken, expiresAt: diskAcct.expiresAt };
+      freshCred = { accessToken: diskAcct.accessToken, refreshToken: diskAcct.refreshToken, expiresAt: diskAcct.expiresAt, refreshTokenExpiresAt: diskAcct.refreshTokenExpiresAt };
     } else if (diskAcct.type === 'apikey' && diskAcct.apiKey) {
       freshCred = { apiKey: diskAcct.apiKey };
     }
@@ -273,9 +279,10 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
   // lists are not positionally aligned, and resolveAccounts may have dropped a
   // credential-less entry that agrees with this account on everything else.
   const pendingAdds = addedAccountIds(memConfig);
+  let dropped = 0;
   for (let i = accountManager.accounts.length - 1; i >= 0; i--) {
     const gone = accountManager.accounts[i];
-    if (claimed.has(exactIds ? gone : i) || pendingAdds.has(gone.id)) continue;
+    if (claimed.has(i) || pendingAdds.has(gone.id)) continue;
     const cfgIdx = configIndexFor(memConfig.accounts, accountManager.accounts, i);
     console.log(`[TeamClaude] Removed account "${safeLine(gone.name, 64)}": its config entry is gone from disk`);
     accountManager.removeAccount(i);
