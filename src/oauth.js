@@ -146,17 +146,27 @@ export const USAGE_USER_AGENT = 'claude-cli/2.1.288 (external, cli)';
 const DEFAULT_TOKEN_ENDPOINT = 'https://platform.claude.com/v1/oauth/token';
 const DEFAULT_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 
+// The longest wait a Retry-After is taken at. It is upstream's number, and the
+// account holds its refreshes for it (AccountManager.ensureTokenFresh), in
+// memory, past a re-login and a re-enable: unbounded, one `Retry-After:
+// 99999999999` stopped an account's renewals for about 3,169 years, or until a
+// restart, and one past about 8.6 trillion seconds made the hold an invalid
+// Date whose log line threw out of ensureTokenFresh. A far-future HTTP date
+// cannot throw, but held as long. An hour is the cap server.js puts on the
+// longest 429 hold it arms, the one for a quota rejection.
+const RETRY_AFTER_MAX_MS = 60 * 60_000;
+
 /**
  * A Retry-After header in milliseconds: delta-seconds or an HTTP date (RFC 9110
- * §10.2.3). Undefined when absent or unparseable.
+ * §10.2.3), at most RETRY_AFTER_MAX_MS. Undefined when absent or unparseable.
  * @param {string|null|undefined} value
  * @param {number} [now]
  */
 export function parseRetryAfterMs(value, now = Date.now()) {
   if (typeof value !== 'string' || !value.trim()) return undefined;
-  if (/^\d+$/.test(value.trim())) return Number(value.trim()) * 1000;
+  if (/^\d+$/.test(value.trim())) return Math.min(Number(value.trim()) * 1000, RETRY_AFTER_MAX_MS);
   const at = Date.parse(value);
-  return Number.isFinite(at) ? Math.max(0, at - now) : undefined;
+  return Number.isFinite(at) ? Math.min(Math.max(0, at - now), RETRY_AFTER_MAX_MS) : undefined;
 }
 
 const DEFAULT_APPEAL_URL = 'https://claude.ai/restricted';
@@ -192,12 +202,30 @@ export function oauthErrorSummary(text) {
 
 /**
  * Refresh an expired OAuth access token using the refresh token.
- * Retries on 5xx and network errors with exponential backoff.
+ * Retries a 5xx and a network failure, with exponential backoff. The catch
+ * below reads the error's own name, message and code, never its `cause`:
+ * - direct: any `fetch failed`, and a timeout;
+ * - through the fleet's upstream proxy: a refused or reset connection, and a
+ *   timeout once the tunnel is open; a CONNECT the proxy refuses or never
+ *   answers, and a TLS handshake over it that times out (sx.js), are not;
+ * - through an account's routing proxy: a reset or a timeout once the tunnel
+ *   is open. A tunnel it fails to open arrives wrapped as ROUTING_FAILED
+ *   (account-routing.js) and is not retried; the proxy's own refresh path
+ *   then holds that account out of rotation (markRoutingFailed).
  * `routing` is the account's own egress proxy (account-routing.js); null goes
  * by the fleet path (upstream proxy when configured, direct otherwise).
- * `budgetMs` bounds the whole call, retries included: no attempt goes out once
- * it is spent, and none outlives it — the time a lock held for this renewal
- * has left (credential-sync.js).
+ * `budgetMs`, the time a lock held for this renewal has left
+ * (credential-sync.js), bounds the whole call, retries included: no attempt
+ * goes out once it is spent, and none outlives it once its connection is open.
+ * Opening a tunnel through a proxy has timeouts of its own, for the CONNECT and
+ * for the TLS handshake over it (20s each through a routing proxy, 30s each
+ * through the upstream proxy), and an attempt still opening one can run past
+ * both the budget and REFRESH_TIMEOUT_MS. A backoff pause can still end the
+ * call up to 1s past the budget, which credential-sync's STORE_RESERVE_MS
+ * absorbs. Without a budget, each attempt has the REFRESH_TIMEOUT_MS bound of
+ * its own, so three timed-out attempts and their backoff take about 91.5s at
+ * the default; through a proxy, a tunnel still opening can hold each attempt
+ * longer.
  * @param {string} refreshToken
  * @param {string} [endpoint]
  * @param {import('./account-routing.js').RoutingProxy|null} [routing]
@@ -574,13 +602,23 @@ export function normalizeSpend(data) {
  */
 export function formatMoney(spend) {
   if (!spend) return 'unknown';
+  // The exponent is upstream's (normalizeSpend keeps any finite number), and
+  // toLocaleString throws a RangeError for fraction digits outside 0-100: one
+  // usage payload with an exponent of -1 threw out of the status line, the TUI
+  // row and the probe's "started spending" log. An amount in no currency's
+  // minor unit is not rendered as one. The bound is resolveMaxSpendMinor's
+  // (model.js), which refuses the same exponents for the money cap; checked
+  // here rather than in normalizeSpend so that it still sees them and sets no
+  // cap rather than a wrong one.
+  const exponent = spend.exponent ?? 2;
+  if (!Number.isInteger(exponent) || exponent < 0 || exponent > 6) return 'unknown';
   const sym = { USD: '$', EUR: '\u20ac', GBP: '\u00a3', JPY: '\u00a5' }[spend.currency] || '';
   const unit = (minor) => {
     if (minor == null) return null;
-    const v = minor / (10 ** (spend.exponent ?? 2));
+    const v = minor / (10 ** exponent);
     const text = v.toLocaleString('en-US', {
-      minimumFractionDigits: spend.exponent ?? 2,
-      maximumFractionDigits: spend.exponent ?? 2,
+      minimumFractionDigits: exponent,
+      maximumFractionDigits: exponent,
     });
     // Suffix the code when there is no symbol for it, so an unfamiliar currency
     // is still identifiable rather than rendering as a bare number.
