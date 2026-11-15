@@ -6,6 +6,7 @@ import { sameIdentity, sameOrg } from './identity.js';
 import { weeklyBucketForModel, modelGlobMatches, modelFamily, gatingUtilization, resolveMaxUsage, spendCapReached, resolveSwitchThreshold, sanitizeSwitchThreshold, WEEKLY_BUCKET_KEYS } from './model.js';
 import { SessionTracker } from './session-tracker.js';
 import { SessionPins } from './session-pins.js';
+import { CompactAsks } from './compact-before-switch.js';
 import { buildQuotaSummary, quotaTier } from './quota-summary.js';
 import { ROLLOVER_MIN_JUMP_MS, remapHeld, findHeld, dropHeld, newObservation } from './rollover.js';
 import { decideBand, pressureOf, pressureRank, assertNever, WEEKLY_WINDOW_SECONDS } from './band-decision.js';
@@ -18,6 +19,7 @@ import { safeLine } from './safe-text.js';
 import { parseEndsAt } from './ends-at.js';
 import { isRefused } from './account-refusal.js';
 import { knownRefreshTokenExpiry, setRefreshTokenExpiry, withFamilyExpiry, expiryAfterReplacement, loginCommandFor } from './refresh-token-expiry.js';
+import { isLongLived } from './long-lived.js';
 import { parseRoutingUrl, describeRouting, routingToUrl, isRoutingFailure } from './account-routing.js';
 import { isSelfProxy } from './upstream-proxy.js';
 import { envVar } from './brand.js';
@@ -523,6 +525,9 @@ function planOf(/** @type {Record<string, any>} */ account) {
   return account.hasClaudeMax === true ? 'Max' : account.hasClaudePro === true ? 'Pro' : null;
 }
 
+// Whether an entry holds a `login --long-lived` token; see long-lived.js.
+export { isLongLived };
+
 // Build a fresh in-memory account record from a config/disk account object.
 // Shared by the constructor and addAccount() so the field set can never drift
 // between startup accounts and runtime-added ones (a divergence here once left
@@ -633,13 +638,18 @@ function makeAccount(acct, index, listener = null) {
     // state, so the line is printed once rather than per refusal.
     threadRefusalReported: false,
     models: acct.models || null,
+    // A `login --long-lived` token (long-lived.js): inference only, never
+    // refreshed. It holds no refresh token whatever its entry carries, so every
+    // gate that asks "can this account be refreshed" answers no.
+    longLived: isLongLived(acct),
     credential: acct.accessToken || acct.apiKey,
-    refreshToken: acct.refreshToken || null,
+    refreshToken: isLongLived(acct) ? null : acct.refreshToken || null,
     expiresAt: acct.expiresAt || null,
     // When the refresh token itself lapses (epoch ms), where the provider or
     // the imported credential file said; null when nobody did. See
-    // refresh-token-expiry.js.
-    refreshTokenExpiresAt: knownRefreshTokenExpiry(acct.refreshTokenExpiresAt),
+    // refresh-token-expiry.js. A long-lived account has no refresh token for
+    // a date to describe.
+    refreshTokenExpiresAt: isLongLived(acct) ? null : knownRefreshTokenExpiry(acct.refreshTokenExpiresAt),
     status: 'active',
     // Why the account last went to 'error' (see _needsLogin); read only while
     // status is 'error', so a recovery path need not clear it.
@@ -828,6 +838,12 @@ export class AccountManager {
     // nothing in selection reads it.
     /** @type {SessionPins} */
     this.sessionPins = new SessionPins();
+    // Which conversations were already asked to compact ahead of a switch
+    // (`compactBeforeSwitch`, issue #709). Kept here because this object is the
+    // one thing the base listener and every MITM tunnel listener share, so
+    // there is one record per fleet. Empty and unread unless the setting is on.
+    /** @type {CompactAsks} */
+    this.compactAsks = new CompactAsks();
     // 'off' | 'even' | 'adaptive' | 'load'. `distributeSessions` stays a boolean beside
     // it ("is distribution on at all") because the status readout, the TUI
     // header and the remote dashboard all ask only that question.
@@ -3273,6 +3289,81 @@ export class AccountManager {
     }
     const best = this._pickBestAvailable(excluded, model);
     return best ? best.index : null;
+  }
+
+  /**
+   * Read-only, for `compactBeforeSwitch` (issue #709): the account that holds
+   * this conversation and that a request for `model` would be served by right
+   * now, or null when there is no such account.
+   *
+   * "Holds" is the tracker's pin for the request's weekly bucket, which
+   * recordSession writes in every distribution mode: the account this
+   * conversation's last request for that bucket was sent to. A conversation
+   * with no pin has no request on record, so nothing says which account has
+   * its cache, and the answer is null.
+   *
+   * "Would be served by" is asked without running selection, because selection
+   * moves cursors, takes rollover readings and paces ramps:
+   *   - where the session walk decides (distribution on, or this conversation
+   *     still draining after it was turned off, and no route pin), the pin
+   *     serves while it is available and no available account outranks it by
+   *     priority, as in _selectForSession;
+   *   - otherwise the quota-driven walk decides, and previewRouteIndex says
+   *     where that lands. With distribution off this is the provider's current
+   *     account, so a conversation whose pin names an account the fleet has
+   *     already left gets null: its cache is behind it already.
+   * A pin whose governing window rolled over (expiry routing) may be moved by
+   * selection where this says it stays. Such an account has just reset, so it
+   * is nowhere near a threshold and the caller's margin test fails anyway.
+   *
+   * A cordoned account reads as unavailable here, so a conversation kept on
+   * one (_keepOnCordoned) gets null. That errs toward forwarding.
+   *
+   * Nothing is written: no pin, no cursor, no reading, no load count. Expired
+   * quota readings are cleared on the way, as any poll does.
+   *
+   * @param {string|null} sessionId  a pin key, as throughout this class
+   * @param {*} [model]  loosely typed, like the availability checks it feeds
+   * @param {*} [advisorModel]
+   * @param {string} [provider]
+   * @returns {Record<string, any>|null}
+   */
+  conversationHost(sessionId, model = null, advisorModel = null, provider = DEFAULT_PROVIDER) {
+    if (!sessionId) return null;
+    const idx = this.sessionTracker.pinnedAccount(sessionId, this._weeklyBucketFor(model));
+    const account = idx == null ? null : this.accounts[idx];
+    if (!account || !canServeProvider(account, provider)) return null;
+    if (!this._isAvailable(account, model, advisorModel)) return null;
+    // Read off the set rather than through _isDrainingSession, which prunes it.
+    const sessionWalk = (this.distributeSessions || !!this._drainingSessions?.has(sessionId))
+      && !this._pinnedAccountForModel(model, advisorModel);
+    if (sessionWalk) {
+      const outranked = this.accounts.some(a =>
+        this._isAvailable(a, model, advisorModel) && (a.priority || 0) < (account.priority || 0));
+      return outranked ? null : account;
+    }
+    return this.previewRouteIndex(model, provider) === idx ? account : null;
+  }
+
+  /**
+   * The two switch decisions that gate a subscription request for `model` on
+   * `account`, each as its reading and the threshold it is held to: the shared
+   * 5-hour window, and the weekly window that governs the model. These are the
+   * comparisons _nearQuotaBucket makes for those two buckets (per-account
+   * `switchThreshold` overrides and per-model weekly buckets included), handed
+   * out as numbers so a caller can ask how close the account is rather than
+   * only whether it is over. A reading upstream has not reported is null.
+   *
+   * @param {Record<string, any>} account
+   * @param {string|null} [model]
+   * @returns {import('./compact-before-switch.js').SwitchWindow[]}
+   */
+  switchWindows(account, model = null) {
+    const weekly = this._weeklyBucketFor(model);
+    return [
+      { bucket: 'unified5h', utilization: account.quota.unified5h ?? null, threshold: this.thresholdFor('unified5h', account) },
+      { bucket: weekly, utilization: this._governingWeekly(account, model), threshold: this.thresholdFor(weekly, account) },
+    ];
   }
 
   /** One provider's current account index, as `currentAccounts` names it in
@@ -7141,7 +7232,10 @@ export class AccountManager {
     const account = this.accounts[accountIndex];
     if (!account || account.type !== 'oauth') return;
 
-    account.refreshTokenExpiresAt = expiryAfterReplacement(account, { refreshToken, refreshTokenExpiresAt });
+    // A long-lived account holds no refresh token, whatever arrives with the
+    // access token, and so no date for one either.
+    if (account.longLived) { refreshToken = undefined; account.refreshTokenExpiresAt = null; }
+    else account.refreshTokenExpiresAt = expiryAfterReplacement(account, { refreshToken, refreshTokenExpiresAt });
     if (accessToken) account.credential = accessToken;
     if (refreshToken) account.refreshToken = refreshToken;
     // An expiry describes the access token it comes with: given an access
@@ -7457,6 +7551,11 @@ export class AccountManager {
         // When the refresh token lapses (epoch ms). Present only when the
         // provider or the imported credential file stated it (#674).
         ...(a.refreshTokenExpiresAt != null ? { refreshTokenExpiresAt: a.refreshTokenExpiresAt } : {}),
+        // A `login --long-lived` account, with when its token lapses (epoch
+        // ms, null when the entry states none). Present only on such an
+        // account: it is why the row has no plan, no probe and no usage read,
+        // and the date is what status counts down to the yearly re-login.
+        ...(a.longLived === true ? { longLived: true, expiresAt: a.expiresAt ?? null } : {}),
         subscriptionLost: a.subscriptionLost ? { ...a.subscriptionLost } : null,
         // Why the account is out of rotation right now (null = it can serve).
         // Distinguishes a local threshold decision from an upstream rejection —

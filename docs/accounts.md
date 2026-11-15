@@ -20,6 +20,32 @@ account. Retry after confirming the credential is valid, or pass
 credential the upstream rejects with 401 (and that cannot be refreshed) is
 refused regardless of `--name` — log in again to get a fresh one.
 
+## Long-lived login
+
+```bash
+teamclaude login --long-lived --name work
+```
+
+Signs an account in with a token that lasts a year and is never refreshed. It makes the request `claude setup-token` makes: the usual sign-in flow, on the same client id and addresses, asking for the scope `user:inference` alone, with `expires_in` set to one year when the code is exchanged. The flow is the copy/paste one of `login --token`. The entry is saved with `"longLived": true` and no refresh token.
+
+Use it for an account that only has to serve completions through the proxy, where you would rather renew one login a year than depend on every refresh succeeding. For everything else, the ordinary `teamclaude login` is the better choice, because an inference-only token leaves out the following.
+
+- **`--name` is required.** The token cannot read the account's profile, so the proxy has no email, plan or organization to name it by, and the login stops before the sign-in link is shown when `--name` is missing. The account is known by that name only. Giving the name of an existing account replaces that account's token and keeps what an earlier full login recorded about it (its ids, organization and plan).
+- **No usage reads.** The quota probe, the profile re-check and `teamclaude accounts` skip the account, because the usage and profile endpoints answer such a token with `403 oauth_scope_insufficient`. Its quota is what the responses to its own requests state in their headers. Until it has served a request, its bars are empty, and what only the usage read reports (extra-usage spend, banked resets) is not shown.
+- **No resets.** Automatic and manual reset redemption leave the account out.
+- **Re-login once a year.** Nothing renews the token. `teamclaude status` shows `Login    long-lived token expires in 200 days (2027-06-04)`. From 14 days out the row turns yellow and names the command, the TUI draws the same line under the account's row, and the server logs one line per account per day. After the date, the first request the token is refused for takes the account out of rotation as `error`, with `teamclaude login --long-lived` as the remedy. Renew it with the same `--name`.
+- **Not synced.** With [callback.net sync](#syncing-accounts-across-machines-callbacknet), the token is never stored for your other installs, and a refreshing login stored by another install never replaces it.
+
+`teamclaude status` marks the account with a `Token` row saying so, and its `Probe` row reads `not applicable`. `GET /teamclaude/status` carries `accounts[].longLived: true` and `accounts[].expiresAt` (epoch ms) for such an account, and neither key for any other.
+
+The login fails, and saves nothing, when the token endpoint grants a lifetime more than a day short of the year. `--long-lived` cannot be combined with `--api`, `--codex` or `--oauth`.
+
+Claude Code's own identity and control-plane calls go out on its own login (see [MITM mode](proxy-modes.md#mitm-proxy-mode-default)), so they do not depend on this token. Any other `GET` that the token is refused for takes the [scope-denial retry](routing.md#token-scope-denials) on the client's login.
+
+An ordinary `login` or `import` of the same account removes the mark, and the account is refreshed again. A long-lived login onto an entry that names an `importFrom` file removes that delegation, since the file would be read over the saved token on every load. On an entry that still names `importFrom`, the mark is ignored: that file is a refreshing login.
+
+A token you already have from `claude setup-token` can be used without this command: add an entry by hand with `"type": "oauth"`, `"longLived": true` and the token as `"accessToken"` (see `config.example.json`). Without an `"expiresAt"` (epoch ms) on the entry, the proxy does not know when the token ends and cannot warn ahead of it.
+
 ## Import from Claude Code
 
 If you already have Claude Code set up, import its credentials directly:

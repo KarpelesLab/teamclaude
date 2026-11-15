@@ -94,6 +94,8 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
     if (unserved) lines.push(`  ${unserved}`);
     const login = loginExpiryLine(account, paint, now);
     if (login) lines.push(`  ${login}`);
+    const token = longLivedLine(account, paint);
+    if (token) lines.push(`  ${token}`);
     const plan = subscriptionLostLine(account, paint, now);
     if (plan) lines.push(`  ${plan}`);
     const spend = spendLine(account, paint);
@@ -634,7 +636,8 @@ export function unavailableLine(account, paint) {
  * When the account's refresh token lapses and a new sign-in is due — only for
  * an account whose provider or imported credential file stated the date
  * (#674); most rows have none and get no line. Yellow, with the command, once
- * it is within the warning window or past.
+ * it is within the warning window or past. A long-lived account gets the same
+ * row for the token itself, which lapses a year after its login.
  * @param {any} account
  * @param {ReturnType<typeof colors>} paint
  * @param {number} [now]
@@ -645,6 +648,18 @@ export function loginExpiryLine(account, paint, now = Date.now()) {
   const label = paint.dim('Login'.padEnd(8));
   if (!view.warn) return `${label} ${view.text}`;
   return `${label} ${paint.yellow(view.text)} ${paint.gray(`\u2014 run: ${loginCommandFor(account)}`)}`;
+}
+
+/**
+ * Why a `login --long-lived` account shows less than its neighbours: its token
+ * serves inference only, so no plan, usage read or probe stands behind the
+ * row, and its quota bars stay empty until a response of its own states them.
+ * @param {any} account
+ * @param {ReturnType<typeof colors>} paint
+ */
+export function longLivedLine(account, paint) {
+  if (account?.longLived !== true) return null;
+  return `${paint.dim('Token'.padEnd(8))} long-lived, inference only: plan and usage are not read, quota is taken from response headers`;
 }
 
 // Upstream's refusal outlives its cooldown, so the account reads as denied
