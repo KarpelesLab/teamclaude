@@ -77,6 +77,30 @@ test('errored and exhausted accounts are skipped', async () => {
   assert.equal(spawn.calls.length, 0);
 });
 
+// A warm-up is pinned to its account, so nothing downstream holds it back, and an
+// account sitting out an entitlement cooldown would be refused again - a refusal
+// that counts as a new denial and lengthens the cooldown.
+test('an account in its entitlement cooldown is not warmed', async () => {
+  const am = new AccountManager([oauth('denied'), oauth('ok')], 0.98);
+  am.markEntitlementDenied(0, { seconds: 300 });
+  const spawn = fakeSpawner();
+  await makeWarmer(am, spawn).warmAll();
+  assert.equal(spawn.calls.length, 1, 'only the account with no cooldown is warmed');
+  assert.match(spawn.calls[0].env.ANTHROPIC_BASE_URL, /\/tc-acct\/ok$/);
+});
+
+// Control: the cooldown over, the account is warmed again.
+test('an account whose entitlement cooldown has ended is warmed again', async () => {
+  const am = new AccountManager([oauth('denied')], 0.98);
+  am.markEntitlementDenied(0, { seconds: 300 });
+  am.accounts[0].entitlementDeniedUntil = Date.now() - 1;
+  const spawn = fakeSpawner();
+  const log = console.log;
+  console.log = () => {};
+  try { await makeWarmer(am, spawn).warmAll(); } finally { console.log = log; }
+  assert.equal(spawn.calls.length, 1);
+});
+
 // ── spawn spec ───────────────────────────────────────────────────────────────
 
 test('the spawn invocation is a minimal non-interactive claude pinned to the account', async () => {
@@ -367,6 +391,45 @@ test('a rolling slot defers an account until just after its near-future reset', 
   assert.match(spawn.calls[1].env.ANTHROPIC_BASE_URL, /\/near$/);
   assert.equal(warmer.getStatus().nextWarmupAt, '2030-09-01T12:30:00.000Z');
 });
+
+// The cooldown is asked about when the warm-up would be sent, not when the slot
+// is scheduled: a rolling slot still defers an account in a cooldown, and the
+// deferred warm-up asks again when it fires.
+for (const [what, cooldownMs, warmed] of [
+  ['has ended', 20_000, true],
+  ['is still running', 10 * 60_000, false],
+]) {
+  test(`a rolling slot defers an account in its entitlement cooldown, and warms it only if the cooldown ${what}`, async () => {
+    const am = new AccountManager([oauth('near'), oauth('idle')], 0.98);
+    let now = Date.parse('2030-09-01T07:29:00.000Z');
+    am.accounts[0].quota.unified5hReset = Date.parse('2030-09-01T07:31:00.001Z');
+    const spawn = fakeSpawner();
+    const timers = [];
+    const warmer = makeWarmer(am, spawn, {
+      schedule: { mode: 'rolling', resetTime: '15:30', timezone: 'Europe/Moscow', anchorResetAt: '2030-09-01T12:30:00.000Z' },
+      nowFn: () => now,
+      setTimeoutFn: (fn, delay) => {
+        const timer = { fn, delay, unref() {} };
+        timers.push(timer);
+        return timer;
+      },
+      clearTimeoutFn: () => {},
+    });
+    warmer.start();
+
+    now = Date.parse('2030-09-01T07:30:00.001Z');
+    am.accounts[0].entitlementDeniedUntil = now + cooldownMs; // on the warmer's clock
+    await timers[0].fn();
+    const deferred = timers.find(timer => timer.delay === 70_000);
+    assert.ok(deferred, 'the near-reset account is still deferred until reset + 10s');
+
+    now = Date.parse('2030-09-01T07:31:10.001Z');
+    const log = console.log;
+    console.log = () => {};
+    try { await deferred.fn(); } finally { console.log = log; }
+    assert.equal(spawn.calls.some(call => /\/near$/.test(call.env.ANTHROPIC_BASE_URL)), warmed);
+  });
+}
 
 test('a rolling slot does not defer an account beyond the two-minute tolerance', async () => {
   const am = new AccountManager([oauth('outside')], 0.98);
