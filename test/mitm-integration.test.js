@@ -197,6 +197,70 @@ test('MITM h2: a token refresh is answered without the upstream\'s connection-sp
   }
 });
 
+// HTTP2-Settings is one more name the h2 server's writeHead throws on, and it
+// was in no path's filter: an upstream answer carrying it took the daemon down
+// from each of the four paths behind the MITM that copy the upstream's
+// headers, by an uncaught exception from relayStream and an unhandled
+// rejection from the other three. One case per path: the forward path,
+// relayRaw, relayStream (a client-credential path) and relayOnClientCredential
+// (a GET the pooled token draws a scope 403 on, sent again on the client's
+// own).
+const HTTP2_SETTINGS_CASES = [
+  { label: '/v1/messages', method: 'POST', path: '/v1/messages' },
+  { label: '/v1/oauth/token', method: 'POST', path: '/v1/oauth/token' },
+  { label: '/api/oauth/profile', method: 'GET', path: '/api/oauth/profile' },
+  { label: 'a scope-403 retry', method: 'GET', path: '/api/profile-required' },
+];
+for (const { label, method, path } of HTTP2_SETTINGS_CASES) {
+  test(`MITM h2: an upstream answer to ${label} carrying HTTP2-Settings is relayed without it`, T, async () => {
+    const { caCertPem, leafCertPem, leafKeyPem } = generateCertChain('localhost');
+    const seen = [];
+    const upstream = makeUpstream((req) => {
+      seen.push(req.headers.authorization);
+      // The pooled token is refused for the profile scope; the client's own is served.
+      if (req.url === '/api/profile-required' && req.headers.authorization !== 'Bearer client-own-token') {
+        return {
+          status: 403,
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ type: 'error', error: { type: 'permission_error', message: 'OAuth token does not meet scope requirement user:profile', details: { error_code: 'oauth_scope_insufficient', required_scopes: ['user:profile'], match: 'any' } } }),
+        };
+      }
+      return { status: 200, headers: { 'content-type': 'application/json', 'http2-settings': 'AAMAAABkAAQAoAAAAAIAAAAA', 'x-saw-path': req.url }, body: '{"ok":true}' };
+    });
+    const upPort = await listen(upstream);
+    const am = new AccountManager([oauthAccount('acct@x', 'REAL-TOKEN')], 0.98);
+    const proxy = makeProxy(am, upPort, { caCertPem, leafCertPem, leafKeyPem });
+    const proxyPort = await listen(proxy);
+
+    const tlsSock = await connectThroughProxy(proxyPort, `127.0.0.1:${upPort}`, caCertPem, ['h2']);
+    try {
+      assert.equal(tlsSock.alpnProtocol, 'h2');
+      const client = http2.connect('https://localhost', { createConnection: () => tlsSock });
+      const req = client.request({ ':method': method, ':path': path, 'content-type': 'application/json', authorization: 'Bearer client-own-token' });
+      let resp, body = '';
+      req.on('response', (h) => { resp = h; });
+      req.setEncoding('utf8'); req.on('data', (d) => { body += d; });
+      req.end(method === 'POST' ? '{"model":"x","messages":[]}' : undefined);
+      // Bounded, as in the token-refresh test above: the failure leaves the stream unanswered.
+      const answered = await new Promise((resolve) => {
+        const deadline = setTimeout(() => resolve(false), 5000);
+        req.once('close', () => { clearTimeout(deadline); resolve(true); });
+      });
+
+      assert.ok(answered, `${label} got no answer`);
+      assert.equal(resp?.[':status'], 200);
+      assert.equal(body, '{"ok":true}');
+      assert.equal(resp['x-saw-path'], path);
+      assert.equal(resp['http2-settings'], undefined);
+      // The scope case reached its retry: the pooled token first, then the client's own.
+      if (path === '/api/profile-required') assert.deepEqual(seen, ['Bearer REAL-TOKEN', 'Bearer client-own-token']);
+      client.close();
+    } finally {
+      tlsSock.destroy(); closeHard(proxy); closeHard(upstream);
+    }
+  });
+}
+
 test('MITM h1: over http/1.1, authorization is injected and the body relayed', T, async () => {
   const { caCertPem, leafCertPem, leafKeyPem } = generateCertChain('localhost');
   const upstream = makeUpstream((req, body) => ({

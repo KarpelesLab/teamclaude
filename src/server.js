@@ -275,12 +275,23 @@ async function readErrorBody(body, limit = ERROR_BODY_INSPECTION_LIMIT) {
   }
 }
 
-// Response header names that are connection-specific and thus illegal on an
-// HTTP/2 response (Node's Http2ServerResponse.writeHead rejects them). Also
-// hop-by-hop on h1, so stripping them is correct on both paths.
+// Response header names that are connection-specific, dropped from the
+// upstream's response on every path that copies its headers to the client
+// (relayUpgrade's 101 head aside, where connection and upgrade are the
+// answer). They describe the hop to the upstream, not the one to the client,
+// and most of them also make the client response's writeHead throw.
+// Measured on Node 24: Http2ServerResponse.writeHead (the MITM's h2 server)
+// throws on keep-alive, transfer-encoding, upgrade, proxy-connection and
+// http2-settings, on te with any value but "trailers", and on connection:
+// trailers; any other connection value it drops itself, with a warning. The
+// h1 writeHead throws on trailer for any answer it does not send chunked (one
+// with no body: a 204, a 304, an answer to HEAD; one with a Content-Length;
+// any answer to an HTTP/1.0 client), so trailer is load-bearing on h1 too.
+// Only te: trailers is dropped for hygiene alone, as HOP_BY_HOP_HEADERS drops
+// te on the request side.
 const CONNECTION_SPECIFIC_HEADERS = new Set([
   'connection', 'keep-alive', 'transfer-encoding', 'upgrade',
-  'proxy-connection', 'te', 'trailer',
+  'proxy-connection', 'te', 'trailer', 'http2-settings',
 ]);
 
 // Response headers describing the SERVING organization's billing state:
@@ -4884,9 +4895,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // A request-specific refusal is an answer, not a starving session.
     const deliveredStatus = nonRetryable429 || answeredStatus(upstreamRes.status);
 
-    // Build response headers (skip hop-by-hop and encoding headers). The
-    // connection-specific names are also illegal on an HTTP/2 response — when
-    // this runs behind the MITM's h2 server, writeHead would otherwise throw.
+    // Build response headers (skip the connection-specific and encoding
+    // headers). Most connection-specific names would make writeHead throw,
+    // behind the MITM's h2 server above all (see CONNECTION_SPECIFIC_HEADERS).
     /** @type {Record<string, string>} */
     const responseHeaders = {};
     for (const [key, value] of upstreamRes.headers.entries()) {
