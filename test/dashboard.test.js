@@ -1357,28 +1357,26 @@ test('the Insights hero table follows the view, and says not recorded and not pr
   const page = bootPage();
   await page.answer(200, { accounts: [{ name: 'g', provider: 'grok' }] });
   page.click('Insights');
-  const unpriced = {
+  // Claude priced, Grok not, and the first day from before recording began.
+  const partly = {
     ...INSIGHTS, since: 1, sinceDay: '2026-01-02',
-    totals: { requests: 1, input: 5, output: 0, cacheRead: 0, cacheWrite: 0 },
-    kinds: { cacheRead: [0, 0], cacheWrite: [0, 0], input: [0, 5], output: [0, 0] },
-    cost: { total: 0, values: [0, 0], previous: null, unpricedTokens: 5 },
-    providers: [{ provider: 'grok', tokens: 5, cost: 0, requests: 1, values: [0, 5], requestValues: [0, 1], costValues: [0, 0] }],
+    totals: { requests: 2, input: 15, output: 0, cacheRead: 0, cacheWrite: 0 },
+    kinds: { cacheRead: [0, 0], cacheWrite: [0, 0], input: [0, 15], output: [0, 0] },
+    cost: { total: 2, values: [0, 2], previous: null, unpricedTokens: 5 },
+    providers: [
+      { provider: 'anthropic', tokens: 10, cost: 2, requests: 1, values: [0, 10], requestValues: [0, 1], costValues: [0, 2] },
+      { provider: 'grok', tokens: 5, cost: 0, requests: 1, values: [0, 5], requestValues: [0, 1], costValues: [0, 0] },
+    ],
     accounts: [{ provider: 'grok', account: 'g', tokens: 5, cost: 0, requests: 1, values: [0, 5], requestValues: [0, 1], costValues: [0, 0] }],
-    models: [{ provider: 'grok', model: 'grok-4', tokens: 5, requests: 1, cost: null }],
+    models: [{ provider: 'anthropic', model: 'claude-opus-5-5', tokens: 10, requests: 1, cost: 2 }, { provider: 'grok', model: 'grok-4', tokens: 5, requests: 1, cost: null }],
   };
-  await page.answer(200, unpriced);
-  // Table and legend cells; the headline's own $0 is the priced total, with
-  // the tokens it could not price named under it.
+  await page.answer(200, partly);
   const zeroCells = (/** @type {number} */ since) => page.built.slice(since).filter(e => e.className === 'num' && e.textContent === '$0').length;
-  let at = page.built.length;
+  const at = page.built.length;
   page.click('Table');
   assert.ok(page.labelled('not recorded') >= 1, 'the day before recording began');
   assert.ok(page.labelled('not priced') >= 1, 'Grok by provider');
   assert.equal(zeroCells(at), 0, 'no $0 for a cost with no price');
-  at = page.built.length;
-  page.click('Token type');
-  assert.ok(page.labelled('not priced') >= 1, 'one total of nothing priced');
-  assert.equal(zeroCells(at), 0);
 
   const priced = bootPage();
   await priced.answer(200, { accounts: [{ name: 'a', provider: 'anthropic' }] });
@@ -1395,6 +1393,69 @@ test('the Insights hero table follows the view, and says not recorded and not pr
   assert.ok(priced.labelled('$3.00') >= 1, 'running total: both days');
   assert.equal(priced.labelled('$2.00'), 0, 'no day-by-day figure under a running total');
   assert.ok(priced.labelled('Est. API cost (running total)') >= 1, 'the column says which');
+});
+
+// A range where nothing had a list price has no cost estimate at all: the
+// page draws the tokens, the cost headline says "not priced" and is no tab,
+// and no table (the chart's, the calendar's, the months', the list's)
+// prints a $0 for it.
+test('the Insights page with nothing priced draws the tokens and never prints $0 for the cost', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [{ name: 'g', provider: 'grok' }] });
+  page.click('Insights');
+  const n = 30;
+  const days = Array.from({ length: n }, (_, i) => '2026-10-' + String(i + 1).padStart(2, '0'));
+  const zeros = days.map(() => 0);
+  const per = days.map(() => 100);
+  await page.answer(200, {
+    range: '30d', unit: 'day', buckets: days, since: 1, sinceDay: '2026-01-01',
+    totals: { requests: n, input: 100 * n, output: 0, cacheRead: 0, cacheWrite: 0 }, previous: null, requests: days.map(() => 1),
+    kinds: { cacheRead: zeros, cacheWrite: zeros, input: per, output: zeros },
+    cost: { total: 0, values: zeros, previous: null, unpricedTokens: 100 * n },
+    providers: [{ provider: 'grok', tokens: 100 * n, cost: 0, requests: n, values: per, requestValues: days.map(() => 1), costValues: zeros }],
+    accounts: [{ provider: 'grok', account: 'g', tokens: 100 * n, cost: 0, requests: n, values: per, requestValues: days.map(() => 1), costValues: zeros }],
+    models: [{ provider: 'grok', model: 'grok-4', tokens: 100 * n, requests: n, cost: null }],
+  });
+  const heads = page.built.filter(e => typeof e.className === 'string' && /^inshead( sel)?$/.test(e.className));
+  assert.deepEqual(heads.slice(-2).map(e => e.className), ['inshead', 'inshead sel'], 'the tokens are drawn');
+  assert.ok(page.built.some(e => e.textContent === 'not priced'), 'the cost headline');
+  assert.ok(page.built.some(e => e.textContent === '3.0k tokens, none at a known list price'));
+  const dollars = () => page.built.filter(e => typeof e.textContent === 'string' && /^(≈ )?\$0(\.00)?$/.test(e.textContent)).length;
+  assert.equal(dollars(), 0, 'no $0 anywhere on the page');
+  // Each card's table in turn: the chart's, the calendar's, the months', the list's.
+  for (let k = 0; k < 4; k++) {
+    const tables = page.built.filter(e => e.textContent === 'Table' && e.listens('click'));
+    tables[tables.length - (4 - k)].fire('click');
+  }
+  assert.ok(page.built.filter(e => e.textContent === 'Chart').length >= 4, 'all four tables open');
+  assert.equal(dollars(), 0, 'no $0 in any table');
+});
+
+// The minute's refresh usually brings back what is on screen: it is not
+// drawn again, which would drop a tooltip being read. A changed reply is.
+test('the Insights page does not redraw for a refresh identical to what it shows', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [{ name: 'a', provider: 'anthropic' }] });
+  page.click('Insights');
+  await page.answer(200, INSIGHTS);
+  const realNow = Date.now;
+  try {
+    let skew = 0;
+    Date.now = () => realNow() + skew;
+    const refresh = async (/** @type {any} */ reply) => {
+      skew += 61_000;
+      page.poll();
+      await page.answer(200, { accounts: [{ name: 'a', provider: 'anthropic' }] });
+      assert.deepEqual(page.requests.map(r => r.url), ['/teamclaude/insights?range=30d'], 'a minute on, it asks again');
+      const before = page.built.length;
+      await page.answer(200, reply);
+      return page.built.length - before;
+    };
+    assert.equal(await refresh(JSON.parse(JSON.stringify(INSIGHTS))), 0, 'the same reply builds nothing');
+    assert.ok(await refresh({ ...INSIGHTS, requests: [1, 2] }) > 0, 'a changed reply is drawn');
+  } finally {
+    Date.now = realNow;
+  }
 });
 
 // A failed read is throttled like a successful one: a proxy answering 404 or

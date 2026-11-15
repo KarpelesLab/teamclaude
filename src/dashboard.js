@@ -2401,21 +2401,27 @@ export function stackSeries(series, n) {
 // bucket and its latest. The latest is the bucket still filling (this hour,
 // today), which is why the page heads that column "Now".
 //
-// `from` is the first bucket recording covers (recordedFrom): a 30-day range
-// on a history three days old averages three days, not thirty.
+// The average is of full buckets: from `from`, the first bucket recording
+// covers (recordedFrom), so a 30-day range on a history three days old
+// averages three days, not thirty; and without the bucket still filling,
+// which would pull it down, so it is the same figure the chart's line names.
+// With no full bucket yet it is the one there is.
 /** @param {number[]|null|undefined} values @param {number} [from] */
 export function seriesStats(values, from) {
   var v = values || [];
   var start = Math.min(Math.max(0, from || 0), v.length);
   var total = 0;
   var max = 0;
+  var full = 0;
   for (var i = 0; i < v.length; i++) {
     var x = Number(v[i]) || 0;
     total += x;
     if (x > max) max = x;
+    if (i >= start && i < v.length - 1) full += x;
   }
-  var n = v.length - start;
-  return { total: total, avg: n > 0 ? total / n : 0, max: max, last: v.length ? Number(v[v.length - 1]) || 0 : 0 };
+  var n = v.length - 1 - start;
+  var last = v.length ? Number(v[v.length - 1]) || 0 : 0;
+  return { total: total, avg: n > 0 ? full / n : start < v.length ? last : 0, max: max, last: last };
 }
 
 // The first bucket of a reply that recording covers: the one holding
@@ -2578,9 +2584,19 @@ export function topModels(models, limit) {
     .slice(0, limit || 6);
 }
 
+// Whether the reply has a cost estimate to show at all: a proxy too old to
+// estimate it sends none, and a range whose every token was on a model with
+// no list price comes to $0, which is not the same as costing nothing. Either
+// way the page treats the cost as absent rather than draw it as $0.
+/** @param {any} data  a GET /teamclaude/insights reply */
+export function costEstimated(data) {
+  var c = data && data.cost;
+  return !!c && !(!(c.total > 0) && c.unpricedTokens > 0);
+}
+
 // The two numbers the page is built around, per bucket: every token (cache
 // included, as the history counts them) or the estimated API cost. Null for
-// cost from a proxy too old to estimate it, so "no estimate" never reads as $0.
+// cost with no estimate (costEstimated), so "no estimate" never reads as $0.
 /**
  * @param {any} data  a GET /teamclaude/insights reply
  * @param {string} metric  'tokens' | 'cost'
@@ -2592,7 +2608,7 @@ export function insightsTotals(data, metric) {
   /** @type {number[]} */
   var out = [];
   if (metric === 'cost') {
-    if (!d.cost || !Array.isArray(d.cost.values)) return null;
+    if (!costEstimated(d) || !Array.isArray(d.cost.values)) return null;
     for (var i = 0; i < n; i++) out.push(Number(d.cost.values[i]) || 0);
     return out;
   }
@@ -2686,6 +2702,16 @@ export function calendarNote(data) {
   return null;
 }
 
+// The day "All" counts from, with its year when that is not the year of the
+// latest bucket (today, by the proxy's clock).
+/** @param {string} day  YYYY-MM-DD @param {string} today  the latest bucket */
+export function sinceText(day, today) {
+  var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(day);
+  if (!m) return day;
+  var dt = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  return dt.toLocaleDateString([], m[1] === today.slice(0, 4) ? { weekday: 'short', month: 'short', day: 'numeric' } : { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' });
+}
+
 // One of the hero's two headlines: the range's estimated API cost or its
 // tokens, against the period before. The cost one says what it left out
 // (tokens on models with no list price), since its figure does not include
@@ -2707,11 +2733,13 @@ export function insightsHeadline(data, metric) {
   var range = d.range || '30d';
   var span = 'the previous ' + (range === '24h' ? '24 hours' : parseInt(range, 10) + ' days');
   var empty = d.since == null ? 'nothing recorded yet'
-    : range === 'all' ? 'since ' + insightsBucketLabel(d.sinceDay || insightsDayKey(d.since), 'day', true)
+    : range === 'all' ? 'since ' + sinceText(d.sinceDay || insightsDayKey(d.since), String((d.buckets || [])[(d.buckets || []).length - 1] || ''))
       : 'no earlier period on record';
   if (metric === 'cost') {
     var c = d.cost;
     if (!c) return { label: 'Est. API cost', value: null, text: '—', change: null, vs: 'this proxy is too old to estimate it', note: '' };
+    // Tokens, none of them on a model with a list price: no estimate, not $0.
+    if (!costEstimated(d)) return { label: 'Est. API cost', value: null, text: 'not priced', change: null, vs: fmtTokens(c.unpricedTokens) + ' tokens, none at a known list price', note: '' };
     var cc = p == null ? null : insightsChange(c.total, c.previous, range);
     return { label: 'Est. API cost', value: c.total, text: fmtUsd(c.total), change: cc ? cc.pill : null,
       vs: cc ? cc.vs : p == null ? empty : c.previous == null ? 'no estimate for ' + span : 'no priced cost in ' + span,
@@ -2734,7 +2762,12 @@ export function insightsHeadline(data, metric) {
 // it is never one of the full days, and the rest of it is not projected: the
 // figure leans low rather than high. On hours it is the busiest hour instead,
 // since a day of hours projects nothing a person would plan by. Null with no
-// full day (or no hour with usage) to go on.
+// full day (or no hour with usage) to go on, and for a cost with no estimate.
+//
+// A projection is not good to the cent, so the figure is whole dollars (or
+// tokens to the precision fmtTokens would print the figure at). It is built
+// from the parts the sum on screen prints, each rounded the same way, so the
+// sum adds up to it exactly: "$97 so far + $205 for the 20 days left" is $302.
 /**
  * @param {any} data  a GET /teamclaude/insights reply
  * @param {string} metric  'tokens' | 'cost'
@@ -2747,14 +2780,15 @@ export function insightsPace(data, metric, days) {
   var b = d.buckets || [];
   var n = b.length;
   if (!v || !n || d.since == null) return null;
-  var fmt = metric === 'cost' ? fmtUsd : fmtTokens;
+  var cost = metric === 'cost';
+  var fmt = cost ? fmtUsd : fmtTokens;
   var from = recordedFrom(d);
   if (d.unit === 'hour') {
     var peak = peakBucket(v, from);
     if (!peak) return null;
     return { kind: 'peak', label: 'Busiest hour', value: peak.value, text: fmt(peak.value),
-      sub: insightsBucketLabel(b[peak.index], 'hour', true) + (peak.ratio ? ' · ' + peak.ratio.toFixed(1) + '× the average hour' : ''),
-      how: 'The hour with the most, against the average recorded hour.', rate: null, soFar: null, left: null, month: null, against: null };
+      sub: insightsBucketLabel(b[peak.index], 'hour', true) + (peak.ratio ? ' · ' + peak.ratio.toFixed(1) + '× the average full hour' : ''),
+      how: 'The hour with the most, against the average full hour.', rate: null, soFar: null, left: null, month: null, against: null };
   }
   var want = days || 7;
   /** @type {number[]} */
@@ -2762,15 +2796,23 @@ export function insightsPace(data, metric, days) {
   for (var i = Math.max(from, n - 1 - want); i < n - 1; i++) full.push(v[i]);
   if (!full.length) return null;
   var span = full.length === 1 ? 'the last full day' : 'the last ' + full.length + ' full days';
-  // A projection is not good to the cent, so the figure is whole dollars (or
-  // fmtTokens' three figures), and the parts the sum shows are rounded first
-  // so the sum on screen adds up to the figure.
-  var cost = metric === 'cost';
+  var rate = full.reduce(function (x, y) { return x + y; }, 0) / full.length;
+  // The unit the projection is printed in: whole dollars, or fmtTokens' unit
+  // and decimals for a figure the size of `x`.
   /** @param {number} x */
-  var part = function (x) { return !cost ? x : x >= 1000 ? Math.round(x) : Math.round(x * 100) / 100; };
-  /** @param {number} x */
-  var whole = function (x) { return cost ? '$' + Math.round(x).toLocaleString('en-US') : fmtTokens(x); };
-  var rate = part(full.reduce(function (x, y) { return x + y; }, 0) / full.length);
+  var unitFor = function (x) {
+    if (cost) return { scale: 1, dec: 0, pre: '$', suf: '' };
+    var a = Math.abs(x);
+    if (a >= 1e12) return { scale: 1e12, dec: 2, pre: '', suf: 'T' };
+    if (a >= 1e9) return { scale: 1e9, dec: a >= 1e11 ? 0 : a >= 1e10 ? 1 : 2, pre: '', suf: 'B' };
+    if (a >= 1e6) return { scale: 1e6, dec: a >= 1e8 ? 0 : a >= 1e7 ? 1 : 2, pre: '', suf: 'M' };
+    if (a >= 1e3) return { scale: 1e3, dec: a >= 1e5 ? 0 : 1, pre: '', suf: 'k' };
+    return { scale: 1, dec: 0, pre: '', suf: '' };
+  };
+  /** @param {number} x @param {{ scale: number, dec: number }} u  x in the unit, rounded as printed */
+  var inUnit = function (x, u) { return Number((x / u.scale).toFixed(u.dec)); };
+  /** @param {number} x  a count of units @param {{ dec: number, pre: string, suf: string }} u */
+  var show = function (x, u) { return u.pre + (u.dec ? x.toFixed(u.dec) : Math.round(x).toLocaleString('en-US')) + u.suf; };
   var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(b[n - 1]));
   if (m) {
     var first = m[1] + '-' + m[2] + '-01';
@@ -2784,39 +2826,46 @@ export function insightsPace(data, metric, days) {
     if (start >= 0) {
       var soFar = 0;
       for (var j = start; j < n; j++) soFar += v[j];
-      soFar = part(soFar);
       var dayOf = Number(m[3]);
       var left = new Date(Number(m[1]), Number(m[2]), 0).getDate() - dayOf;
       var month = new Date(Number(m[1]), Number(m[2]) - 1, 1).toLocaleDateString([], { month: 'long' });
-      // Against last month's same full days: this month up to yesterday,
-      // and last month's first that many days, only when every day of last
-      // month is in the reply and on record (part of a month is not its
-      // total, and a shorter range is not asked again for it). Today is
-      // still filling, so on the 1st there is nothing to compare yet.
+      var u = unitFor(soFar + rate * left);
+      var partSoFar = inUnit(soFar, u);
+      var partLeft = inUnit(rate * left, u);
+      var sum = Number((partSoFar + partLeft).toFixed(u.dec));
+      // This month's first full days against the same days of last month,
+      // only when every day of last month is in the reply and on record (part
+      // of a month is not its total, and a shorter range is not asked again
+      // for it). Today is still filling, so it is in neither, and on the 1st
+      // there is nothing to compare yet. A month shorter than today's date
+      // caps both sides at its length, so the two windows are always alike.
       var prevStart = new Date(Number(m[1]), Number(m[2]) - 2, 1);
       var prevKey = insightsDayKey(prevStart.getTime()).slice(0, 7);
       var prevDays = new Date(Number(m[1]), Number(m[2]) - 1, 0).getDate();
-      var byDay = Math.min(dayOf - 1, prevDays);
+      var alike = Math.min(dayOf - 1, prevDays);
       var prevAt = b.indexOf(prevKey + '-01');
       /** @type {string|null} */
       var against = null;
-      if (began === false && byDay > 0 && prevAt >= from && prevAt >= 0 && prevAt + prevDays <= n) {
-        var thisFull = 0;
-        for (var t = start; t < n - 1; t++) thisFull += v[t];
-        var sameDays = 0;
-        for (var k = prevAt; k < prevAt + byDay; k++) sameDays += v[k];
-        var ch = insightsChange(thisFull, sameDays, '30d');
-        var prevName = prevStart.toLocaleDateString([], { month: 'long' });
-        if (ch) against = ch.pill + ' against ' + (byDay === 1 ? prevName + '’s first day' : prevName + '’s first ' + byDay + ' days') + ' (' + fmt(sameDays) + ')';
+      if (began === false && alike > 0 && prevAt >= from && prevAt >= 0 && prevAt + prevDays <= n) {
+        var these = 0;
+        for (var t = start; t < start + alike; t++) these += v[t];
+        var those = 0;
+        for (var k = prevAt; k < prevAt + alike; k++) those += v[k];
+        var ch = insightsChange(these, those, '30d');
+        if (ch) {
+          against = (alike === 1 ? 'First day ' : 'First ' + alike + ' days ') + ch.pill + ' against '
+            + prevStart.toLocaleDateString([], { month: 'long' }) + '’s (' + fmt(those) + ')';
+        }
       }
-      var value = soFar + rate * left;
-      return { kind: 'month', label: 'On pace for', value: value, text: whole(value),
-        sub: month + ': ' + fmt(soFar) + ' so far' + (left > 0 ? ' + ' + fmt(rate) + '/day × ' + left + (left === 1 ? ' day' : ' days') : ', its last day'),
+      return { kind: 'month', label: 'On pace for', value: sum * u.scale, text: show(sum, u),
+        sub: month + ': ' + show(partSoFar, u) + ' so far' + (left > 0 ? ' + ' + show(partLeft, u) + ' for the ' + (left === 1 ? 'day' : left + ' days') + ' left (' + fmt(rate) + '/day)' : ', its last day'),
         how: 'Projected: ' + month + ' so far' + (began ? ' (recorded from ' + insightsBucketLabel(sinceDay, 'day', false) + ')' : '') + ', plus the average of ' + span + ' for each day after today.',
         rate: rate, soFar: soFar, left: left, month: month, against: against };
     }
   }
-  return { kind: 'run', label: '30-day pace', value: rate * 30, text: whole(rate * 30), sub: fmt(rate) + '/day, the average of ' + span,
+  var ru = unitFor(rate * 30);
+  var run = inUnit(rate * 30, ru);
+  return { kind: 'run', label: '30-day pace', value: run * ru.scale, text: show(run, ru), sub: '30 days at ' + fmt(rate) + '/day, the average of ' + span,
     how: 'Projected: the average of ' + span + ', times 30.', rate: rate, soFar: null, left: null, month: null, against: null };
 }
 
@@ -2853,6 +2902,9 @@ export function monthTotals(data, metric) {
   }
   if (out.length) {
     var last = out[out.length - 1];
+    // A month from an earlier year carries it ("Nov '25"), so a year-long
+    // range never shows two bars both named "Nov".
+    out.forEach(function (row) { if (row.key.slice(0, 4) !== last.key.slice(0, 4)) row.label += ' ’' + row.key.slice(2, 4); });
     last.current = true;
     var pace = insightsPace(d, metric);
     if (pace && pace.kind === 'month') { last.projected = pace.value; last.projectedText = pace.text; }
@@ -3022,7 +3074,7 @@ const SHARED_HELPERS = [
   peerLinkRequest, peerLinkOutcome, peerTestOutcome, linkSelfOptions, linkBackNotice, instanceLink, parseInstanceLink, linkAddMissing,
   accountSyncRequest, accountSyncUser, accountSyncOwnMode, accountSyncMembers, accountSyncLine, peerSyncCell, accountSyncApprovalHref, accountSyncSignInOutcome, accountSyncCancelOutcome, accountSyncOutcome,
   fmtTokens, fmtUsd, fmtUsdShort, niceCeil, insightsRangeText, insightsChange, insightsBucketLabel, insightsSeries, stackSeries, seriesStats, recordedFrom, insightsDayKey, bucketAt, labelStep, pricedRequests, cacheHitRate, peakBucket, providerRows, topModels, fleetMissingText,
-  insightsTotals, runningTotals, rollingAverage, insightsTrend, calendarNote, insightsHeadline, insightsPace, monthTotals, calendarGrid, breakdownRows,
+  costEstimated, sinceText, insightsTotals, runningTotals, rollingAverage, insightsTrend, calendarNote, insightsHeadline, insightsPace, monthTotals, calendarGrid, breakdownRows,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -3470,6 +3522,11 @@ const PAGE = `<!doctype html>
     .inslegt .opt { display: none; }
     .insrank { grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: 'n v' 'b b'; }
     .insrank .a { display: none; }
+    /* A row with no price has no bar to draw: its token count takes the line
+       instead, so "not priced" never stands alone. */
+    .insrank.np { grid-template-areas: 'n v' 'a a'; }
+    .insrank.np .t { display: none; }
+    .insrank.np .a { display: block; text-align: left; }
   }
   @media (max-width: 1080px) {
     .arow { grid-template-columns: repeat(3, minmax(0, 1fr)); }
@@ -5688,15 +5745,17 @@ ${SHARED_HELPERS}
   // Rows "Where it went" draws; the Table view has every one.
   var INS_BY_ROWS = 8;
   var INSIGHTS_REFRESH_MS = 60 * 1000;
-  var ins = { charts: [], hidden: Object.create(null), range: '30d', split: 'provider', scope: localStorage.getItem(INS_SCOPE_KEY) === 'local' ? 'local' : 'all', metric: localStorage.getItem(INS_METRIC_KEY) === 'tokens' ? 'tokens' : 'cost', view: 'daily', by: 'model', focus: null, focusables: Object.create(null), linked: 0, asked: '', data: null, error: null, missing: false, pending: false, at: 0, inFlight: false, tables: Object.create(null), chips: [], drawn: '' };
+  var ins = { charts: [], hidden: Object.create(null), range: '30d', split: 'provider', scope: localStorage.getItem(INS_SCOPE_KEY) === 'local' ? 'local' : 'all', metric: localStorage.getItem(INS_METRIC_KEY) === 'tokens' ? 'tokens' : 'cost', view: 'daily', by: 'model', focus: null, focusables: Object.create(null), dataText: '', linked: 0, asked: '', data: null, error: null, missing: false, pending: false, at: 0, inFlight: false, tables: Object.create(null), chips: [], drawn: '' };
 
   // The scope the page draws: "all" needs this machine to have linked instances.
   function insightsScope() {
     return ins.scope === 'all' && ins.linked > 0 ? 'all' : 'local';
   }
-  // The metric the page draws: the cost needs a proxy that estimates it.
+  // The metric the page draws: the cost needs an estimate (costEstimated):
+  // a proxy too old to make one, or a range where nothing had a list price,
+  // draws the tokens.
   function insightsMetric(d) {
-    return ins.metric === 'cost' && d && d.cost ? 'cost' : 'tokens';
+    return ins.metric === 'cost' && costEstimated(d) ? 'cost' : 'tokens';
   }
   var SVGNS = 'http://www.w3.org/2000/svg';
   var insTip = null;
@@ -5807,6 +5866,11 @@ ${SHARED_HELPERS}
           // A reply for a range or scope the page has since left is not
           // drawn; the finally below asks for the one it is on now.
           if (d.range !== ins.range || (d.scope === 'all') !== (insightsScope() === 'all')) return;
+          // The minute's refresh usually brings back what is on screen; a
+          // redraw then would only drop the tooltip being read.
+          var text = JSON.stringify(d);
+          if (text === ins.dataText && !ins.pending && !ins.missing && !ins.error) return;
+          ins.dataText = text;
           ins.data = d;
           ins.missing = false;
           ins.pending = false;
@@ -5907,6 +5971,7 @@ ${SHARED_HELPERS}
       var btn = el('button', 'inslegb');
       btn.type = 'button';
       btn.setAttribute('data-key', sr.key);
+      ins.focusables['legend:' + sr.key] = btn;
       var sw = el('i', 'insl');
       sw.style.background = sr.color;
       btn.appendChild(sw);
@@ -5927,10 +5992,9 @@ ${SHARED_HELPERS}
         tr.addEventListener('click', function () {
           if (!off && shown <= 1) return;
           ins.hidden[sr.key] = !off;
+          // The table is rebuilt: keep a keyboard user on the row they toggled.
+          ins.focus = 'legend:' + sr.key;
           renderInsights();
-          // The table was rebuilt: keep a keyboard user on the row they toggled.
-          var again = document.querySelectorAll ? document.querySelectorAll('.inslegb') : [];
-          for (var j = 0; j < again.length; j++) if (again[j].getAttribute('data-key') === sr.key) { again[j].focus(); break; }
         });
       } else {
         btn.disabled = true;
@@ -6094,11 +6158,17 @@ ${SHARED_HELPERS}
       var title = insightsBucketLabel(d.buckets[i], d.unit, true) + (i === n - 1 ? ' (so far)' : '');
       if (i < (o.from || 0)) { showInsightsTip(e, title, [{ why: 'Before recording began: not idle, not recorded.' }]); return; }
       var none = shown.every(function (sr) { return sr.unpriced; });
-      var rows = shown.slice().reverse().map(function (sr) { return { label: sr.label, value: sr.unpriced ? 'not priced' : o.fmt(sr.values[i] || 0), color: sr.color }; });
+      // The rows read like the marks under the pointer: each series' own
+      // stack, which as a running total is its sum so far, then the total.
+      var rows = shown.map(function (sr, k) { return { label: sr.label, value: sr.unpriced ? 'not priced' : o.fmt(drawn[k].values[i] || 0), color: sr.color }; }).reverse();
       var sum = shown.reduce(function (x, sr) { return x + (sr.values[i] || 0); }, 0);
-      if (shown.length > 1) rows.push({ label: 'Total', value: none ? 'not priced' : o.fmt(sum), strong: true });
-      if (total) rows.push({ label: 'Running total', value: none ? 'not priced' : o.fmt(cols[i].length ? cols[i][cols[i].length - 1][1] : 0), strong: true });
-      if (o.other) rows.push({ label: o.otherName, value: o.otherFmt(o.other[i] || 0) });
+      if (total) {
+        rows.push({ label: 'Running total', value: none ? 'not priced' : o.fmt(cols[i].length ? cols[i][cols[i].length - 1][1] : 0), strong: true });
+        rows.push({ label: 'This ' + (d.unit === 'hour' ? 'hour' : 'day'), value: none ? 'not priced' : o.fmt(sum) });
+      } else if (shown.length > 1) {
+        rows.push({ label: 'Total', value: none ? 'not priced' : o.fmt(sum), strong: true });
+      }
+      if (o.other) rows.push({ label: o.otherName + (total ? ' this ' + (d.unit === 'hour' ? 'hour' : 'day') : ''), value: o.otherFmt(o.other[i] || 0) });
       showInsightsTip(e, title, rows);
     }, function () { insightsCursor(null); });
   }
@@ -6134,18 +6204,27 @@ ${SHARED_HELPERS}
     // clear of the idle squares' colour.
     var shades = ['var(--ish1)', 'var(--ish2)', 'var(--ish3)', '1'];
     var pos = [];
-    var lastLabel = -99;
+    // A month's name over the week that holds its 1st (and over the first
+    // week drawn, for the month it starts in). They are placed from the latest
+    // back, the last one held inside the edge, so on a narrow card the recent
+    // months keep their names and an older one gives way when two would touch.
+    var marks = [];
+    shown.forEach(function (week, wi) {
+      var firstOf = week.filter(function (c) { return c && (wi === 0 || c.key.slice(8) === '01'); })[0];
+      if (firstOf) marks.push({ x: lw + wi * stepx, key: firstOf.key });
+    });
+    // The right edge the next label must end before, with its 4px of space.
+    var room0 = W + 4;
+    marks.reverse().forEach(function (mk, k) {
+      var name = new Date(Number(mk.key.slice(0, 4)), Number(mk.key.slice(5, 7)) - 1, 1).toLocaleDateString([], { month: 'short' });
+      var wide = name.length * 6.5;
+      var x = k === 0 ? Math.min(mk.x, W - wide) : mk.x;
+      if (x + wide + 4 > room0 || x < 0) return;
+      svgEl('text', { x: x, y: 10 }, s).textContent = name;
+      room0 = x;
+    });
     shown.forEach(function (week, wi) {
       var x = lw + wi * stepx;
-      // A month's name over the first week that holds its 1st, or over the
-      // first week drawn when the next month's 1st is not about to take the room.
-      var opens = function (w) { return !!w && w.some(function (c) { return c && c.key.slice(8) === '01'; }); };
-      var lead = wi === 0 && !shown.some(function (w, k) { return k > 0 && k * stepx < 30 && opens(w); });
-      var firstOf = week.filter(function (c) { return c && (lead || c.key.slice(8) === '01'); })[0];
-      if (firstOf && x - lastLabel >= 30 && x + 24 <= W) {
-        svgEl('text', { x: x, y: 10 }, s).textContent = new Date(Number(firstOf.key.slice(0, 4)), Number(firstOf.key.slice(5, 7)) - 1, 1).toLocaleDateString([], { month: 'short' });
-        lastLabel = x;
-      }
       week.forEach(function (c, r) {
         if (!c) return;
         var y = mt0 + r * stepx;
@@ -6225,6 +6304,8 @@ ${SHARED_HELPERS}
     var band = (W - m.l - m.r) / Math.max(1, n);
     var bw = Math.max(4, Math.min(64, band * 0.62));
     var max = months.reduce(function (x, mo) { return Math.max(x, mo.total, mo.projected || 0); }, 0);
+    var widest = months.reduce(function (x, mo) { return Math.max(x, mo.label.length * 6.5 + 8); }, 0);
+    var every = Math.max(1, Math.ceil(widest / band));
     var ph = H - m.t - m.b;
     var Y = function (v) { return m.t + ph - (max > 0 ? v / max * ph : 0); };
     var s = svgEl('svg', { class: 'inschart', width: W, height: H, viewBox: '0 0 ' + W + ' ' + H, role: 'img', 'aria-label': 'By month' }, host);
@@ -6247,7 +6328,9 @@ ${SHARED_HELPERS}
         lab.textContent = mo.projectedText != null ? '≈ ' + mo.projectedText : mt.axis(mo.total);
         if (mo.projected == null) lab.style.fill = 'var(--text)';
       }
-      svgEl('text', { x: cx, y: H - 18, 'text-anchor': 'middle' }, s).textContent = mo.label;
+      // A name every few months (every), counted back from the latest, so on a
+      // narrow card a year of them thins out instead of running together.
+      if ((n - 1 - i) % every === 0) svgEl('text', { x: cx, y: H - 18, 'text-anchor': 'middle' }, s).textContent = mo.label;
       var note = mo.current ? (mo.projected != null ? 'so far' : 'to date') : mo.from ? 'from ' + Number(mo.from.slice(8)) : '';
       if (note && band >= 34) svgEl('text', { x: cx, y: H - 5, 'text-anchor': 'middle', class: 'insref' }, s).textContent = note;
     });
@@ -6299,12 +6382,15 @@ ${SHARED_HELPERS}
         if (i != null) column.setAttribute('x', i * band);
       },
     });
+    var from = recordedFrom(d);
     var move = function (e) {
       // The row under it has its own tooltip; this one is the bucket's.
       e.stopPropagation();
       var i = bucketAt(e.clientX - s.getBoundingClientRect().left, band, n);
       insightsCursor(i);
-      showInsightsTip(e, insightsBucketLabel(d.buckets[i], d.unit, true) + (i === n - 1 ? ' (so far)' : ''), [{ label: r.label, value: fmt(r.values[i] || 0), color: r.color }]);
+      showInsightsTip(e, insightsBucketLabel(d.buckets[i], d.unit, true) + (i === n - 1 ? ' (so far)' : ''), i < from
+        ? [{ why: 'Before recording began: not idle, not recorded.' }]
+        : [{ label: r.label, value: fmt(r.values[i] || 0), color: r.color }]);
     };
     s.addEventListener('pointermove', move);
     s.addEventListener('pointerdown', move);
@@ -6437,8 +6523,8 @@ ${SHARED_HELPERS}
     ['cost', 'tokens'].forEach(function (k) {
       var h = insightsHeadline(d, k);
       var mt = INS_METRICS[k];
-      // A proxy too old to estimate the cost has no cost tab to pick.
-      var can = k === 'tokens' || !!d.cost;
+      // A cost with no estimate (costEstimated) has no tab to pick.
+      var can = k === 'tokens' || costEstimated(d);
       var b = el(can ? 'button' : 'div', 'inshead' + (k === metric ? ' sel' : ''));
       b.style.cssText = '--hc: ' + mt.color;
       if (can) {
@@ -6495,6 +6581,10 @@ ${SHARED_HELPERS}
   // pressed (ins.focus, a key in ins.focusables) is focused again afterwards,
   // as the legend rows already are.
   function renderInsights() {
+    // A redraw nobody asked for (a resize, the minute's refresh, a status
+    // change) keeps the focus where it was, if it was on one of these controls.
+    var active = typeof document !== 'undefined' ? document.activeElement : null;
+    if (!ins.focus && active) for (var k in ins.focusables) if (ins.focusables[k] === active) { ins.focus = k; break; }
     ins.focusables = Object.create(null);
     drawInsights();
     var again = ins.focus ? ins.focusables[ins.focus] : null;
@@ -6558,8 +6648,6 @@ ${SHARED_HELPERS}
       insightsSeries(d, splitKey, accounts).forEach(function (sr) { tokenTotals[sr.key] = sr.total; });
       series.forEach(function (sr) { sr.unpriced = !(sr.total > 0) && tokenTotals[sr.key] > 0; });
     }
-    // One total of nothing priced, with tokens the estimate left out: not $0 either.
-    if (metric === 'cost' && oneTotal && !(series[0].total > 0) && d.cost && d.cost.unpricedTokens > 0) series[0].unpriced = true;
     var running = ins.view === 'total';
     var heroTitle = running ? 'Running total of the ' + (metric === 'cost' ? 'estimated API cost' : 'tokens')
       : (metric === 'cost' ? 'Estimated API cost ' : 'Tokens ') + perBucket;

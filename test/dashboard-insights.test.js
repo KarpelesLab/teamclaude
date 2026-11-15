@@ -11,7 +11,7 @@ import {
   insightsSeries, stackSeries, topModels, fmtUsd, fmtUsdShort, fleetMissingText,
   seriesStats, cacheHitRate, peakBucket, providerRows,
   recordedFrom, insightsDayKey, bucketAt, labelStep, pricedRequests,
-  insightsTotals, runningTotals, rollingAverage, insightsTrend, calendarNote, insightsHeadline, insightsPace, monthTotals, calendarGrid, breakdownRows,
+  costEstimated, sinceText, insightsTotals, runningTotals, rollingAverage, insightsTrend, calendarNote, insightsHeadline, insightsPace, monthTotals, calendarGrid, breakdownRows,
 } from '../src/dashboard.js';
 
 test('the page ships every Insights helper it is tested against', () => {
@@ -19,7 +19,7 @@ test('the page ships every Insights helper it is tested against', () => {
   for (const fn of [fmtTokens, niceCeil, insightsRangeText, insightsChange, insightsBucketLabel, insightsSeries, stackSeries, topModels, fmtUsd, fmtUsdShort, fleetMissingText,
     seriesStats, cacheHitRate, peakBucket, providerRows,
     recordedFrom, insightsDayKey, bucketAt, labelStep, pricedRequests,
-    insightsTotals, runningTotals, rollingAverage, insightsTrend, calendarNote, insightsHeadline, insightsPace, monthTotals, calendarGrid, breakdownRows]) {
+    costEstimated, sinceText, insightsTotals, runningTotals, rollingAverage, insightsTrend, calendarNote, insightsHeadline, insightsPace, monthTotals, calendarGrid, breakdownRows]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   assert.ok(html.includes('id="page-insights"'), 'the page section');
@@ -152,7 +152,9 @@ test('models are ranked by the name a person reads, dated snapshots together', (
 });
 
 test('legend statistics: total, average bucket, peak and the bucket still filling', () => {
-  assert.deepEqual(seriesStats([2, 6, 1]), { total: 9, avg: 3, max: 6, last: 1 });
+  // The average is of full buckets: the last, still filling, is not one.
+  assert.deepEqual(seriesStats([2, 6, 1]), { total: 9, avg: 4, max: 6, last: 1 });
+  assert.deepEqual(seriesStats([5]), { total: 5, avg: 5, max: 5, last: 5 }, 'no full bucket yet: the one there is');
   assert.deepEqual(seriesStats([]), { total: 0, avg: 0, max: 0, last: 0 });
   assert.deepEqual(seriesStats(null), { total: 0, avg: 0, max: 0, last: 0 });
 });
@@ -262,8 +264,8 @@ test('averages and peaks count from the first bucket recorded', () => {
   assert.equal(recordedFrom({ unit: 'day', buckets: days, since }), 5);
   assert.equal(recordedFrom({ unit: 'day', buckets: days, since: null }), 7);
   assert.equal(insightsDayKey(since), '2026-10-06');
-  assert.deepEqual(seriesStats([0, 0, 0, 0, 0, 4, 6], 5), { total: 10, avg: 5, max: 6, last: 6 });
-  assert.equal(peakBucket([0, 0, 0, 0, 0, 4, 6], 5)?.ratio, 1.2);
+  assert.deepEqual(seriesStats([0, 0, 0, 0, 0, 4, 6], 5), { total: 10, avg: 4, max: 6, last: 6 });
+  assert.equal(peakBucket([0, 0, 0, 0, 0, 4, 6], 5)?.ratio, 1.5, 'against the average full day');
   // Hours: the bucket holding `since` is the first.
   const h0 = Math.floor(since / 3600000) * 3600000;
   assert.equal(recordedFrom({ unit: 'hour', buckets: [h0 - 3600000, h0, h0 + 3600000], since }), 1);
@@ -395,7 +397,12 @@ test('the headlines: cost and tokens against the period before, and what the cos
   const old = insightsHeadline(data, 'cost');
   assert.deepEqual([old.value, old.text, old.vs], [null, '—', 'this proxy is too old to estimate it']);
   assert.equal(insightsHeadline({ ...data, previous: null }, 'tokens').vs, 'no earlier period on record');
-  assert.equal(insightsHeadline({ ...data, previous: null, range: 'all', sinceDay: '2026-10-06' }, 'tokens').vs, 'since ' + insightsBucketLabel('2026-10-06', 'day', true));
+  const all = { ...data, previous: null, range: 'all', sinceDay: '2026-10-06', buckets: dayRun('2026-10-06', 2) };
+  assert.equal(insightsHeadline(all, 'tokens').vs, 'since ' + insightsBucketLabel('2026-10-06', 'day', true));
+  // A history from an earlier year says which.
+  const older = { ...all, sinceDay: '2025-11-16', buckets: ['2025-11-16', '2026-11-15'] };
+  assert.equal(insightsHeadline(older, 'tokens').vs, 'since ' + new Date(2025, 10, 16).toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' }));
+  assert.equal(sinceText('2026-10-06', '2026-11-15'), insightsBucketLabel('2026-10-06', 'day', true));
   assert.equal(insightsHeadline({ ...data, since: null, previous: null }, 'tokens').vs, 'nothing recorded yet');
 });
 
@@ -434,7 +441,7 @@ test('the pace: the month so far plus the last seven full days\' average for eac
   assert.deepEqual([pace.soFar, pace.rate, pace.left, pace.value], [94, 10, 20, 294]);
   // A projection is whole dollars, and the sum shown adds up to it.
   assert.equal(pace.text, '$294');
-  assert.equal(pace.sub, monthName(10) + ': $94.00 so far + $10.00/day × 20 days');
+  assert.equal(pace.sub, monthName(10) + ': $94 so far + $200 for the 20 days left ($10.00/day)');
   assert.match(pace.how, /^Projected: /);
   // Today is never a full day: a quiet morning does not drag the rate down.
   assert.equal(/** @type {any} */ (insightsPace(costReply([10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 0]), 'cost')).rate, 10);
@@ -467,7 +474,7 @@ test('the pace: a range that misses the 1st is a 30-day run rate, hours are the 
   week.buckets = dayRun('2026-11-03', 14);
   const run = /** @type {any} */ (insightsPace(week, 'cost'));
   assert.deepEqual([run.kind, run.label, run.value, run.text], ['run', '30-day pace', 150, '$150']);
-  assert.equal(run.sub, '$5.00/day, the average of the last 7 full days');
+  assert.equal(run.sub, '30 days at $5.00/day, the average of the last 7 full days');
   const hours = { ...week, unit: 'hour', buckets: week.buckets.map((_, i) => i * 3600000) };
   const peak = /** @type {any} */ (insightsPace(hours, 'cost'));
   assert.equal(peak.kind, 'peak');
@@ -607,11 +614,11 @@ test('the pace: against last month by the same day, only when all of last month 
   reply.buckets = dayRun('2026-10-01', values.length);
   const pace = /** @type {any} */ (insightsPace(reply, 'cost'));
   // Full days only: November 1 to 9 is $90, October's first 9 days were $45.
-  assert.equal(pace.against, '▲ 100% against ' + monthName(9) + '\u2019s first 9 days ($45.00)');
+  assert.equal(pace.against, 'First 9 days ▲ 100% against ' + monthName(9) + '\u2019s ($45.00)');
   // Flat usage early in the month is level with last month, whatever today has so far.
   const flat = costReply([...Array(31).fill(10), 10, 3]);
   flat.buckets = dayRun('2026-10-01', 33);
-  assert.equal(/** @type {any} */ (insightsPace(flat, 'cost')).against, '0% against ' + monthName(9) + '\u2019s first day ($10.00)');
+  assert.equal(/** @type {any} */ (insightsPace(flat, 'cost')).against, 'First day 0% against ' + monthName(9) + '\u2019s ($10.00)');
   // On the 1st there is no full day of this month to compare yet.
   const first = costReply([...Array(31).fill(10), 3]);
   first.buckets = dayRun('2026-10-01', 32);
@@ -625,4 +632,65 @@ test('the pace: against last month by the same day, only when all of last month 
   const late = costReply([...Array(4).fill(0), ...values.slice(4)], { sinceDay: '2026-10-05' });
   late.buckets = reply.buckets;
   assert.equal(/** @type {any} */ (insightsPace(late, 'cost')).against, null);
+});
+
+test('the pace against last month: the same days on both sides when last month is the shorter', () => {
+  /** @param {string} first @param {number} days  a reply of $10 full days and $3 so far today */
+  const flatFrom = (first, days) => {
+    const r = costReply([...Array(days - 1).fill(10), 3]);
+    r.buckets = dayRun(first, days);
+    return /** @type {any} */ (insightsPace(r, 'cost')).against;
+  };
+  // March 30 and 31, 2026: February had 28 days, so both sides are 28.
+  assert.equal(flatFrom('2026-02-01', 28 + 30), 'First 28 days 0% against ' + monthName(1) + '’s ($280.00)');
+  assert.equal(flatFrom('2026-02-01', 28 + 31), 'First 28 days 0% against ' + monthName(1) + '’s ($280.00)');
+  // A leap year's February has 29.
+  assert.equal(flatFrom('2028-02-01', 29 + 31), 'First 29 days 0% against ' + monthName(1) + '’s ($290.00)');
+});
+
+test('the pace adds up: the figure is the sum of the parts as printed', () => {
+  // Oct 28 to Nov 10: $10.25 every full day, $4.59 so far today, so $96.84 for November so far.
+  const reply = costReply([...Array(13).fill(10.25), 4.59]);
+  const pace = /** @type {any} */ (insightsPace(reply, 'cost'));
+  assert.equal(pace.sub, monthName(10) + ': $97 so far + $205 for the 20 days left ($10.25/day)');
+  assert.equal(pace.text, '$302');
+  assert.equal(pace.value, 302);
+  // The 30-day pace prints one term, so it cannot disagree with itself.
+  const week = costReply([...Array(13).fill(10.25), 1]);
+  week.buckets = dayRun('2026-11-03', 14);
+  const run = /** @type {any} */ (insightsPace(week, 'cost'));
+  assert.equal(run.sub, '30 days at $10.25/day, the average of the last 7 full days');
+  assert.equal(run.text, '$308');
+  // Tokens: both parts at the figure's precision, so 2.59M + 5.75M is 8.34M,
+  // where the unrounded 8,333,150 would print as 8.33M.
+  const tokens = /** @type {any} */ (insightsPace(costReply([...Array(13).fill(287.35), 0]), 'tokens'));
+  assert.equal(tokens.sub, monthName(10) + ': 2.59M so far + 5.75M for the 20 days left (287k/day)');
+  assert.equal(tokens.text, '8.34M');
+  assert.equal(fmtTokens(2586150 + 287350 * 20), '8.33M');
+});
+
+test('nothing priced: the cost has no estimate anywhere, not $0', () => {
+  const values = [...Array(13).fill(10), 4];
+  const reply = { ...costReply(values), cost: { total: 0, values: values.map(() => 0), previous: null, unpricedTokens: 500 } };
+  assert.equal(costEstimated(reply), false);
+  assert.equal(costEstimated(costReply(values)), true);
+  assert.equal(costEstimated(data), false, 'a proxy too old to estimate it');
+  assert.equal(costEstimated({ cost: { total: 0, values: [0], previous: null, unpricedTokens: 0 } }), true, 'nothing spent is $0');
+  assert.equal(insightsTotals(reply, 'cost'), null);
+  assert.equal(insightsPace(reply, 'cost'), null);
+  assert.deepEqual(monthTotals(reply, 'cost'), []);
+  const head = insightsHeadline(reply, 'cost');
+  assert.deepEqual([head.value, head.text, head.change, head.vs], [null, 'not priced', null, '500 tokens, none at a known list price']);
+  // The tokens are all there.
+  assert.equal(/** @type {any} */ (insightsPace(reply, 'tokens')).kind, 'month');
+  assert.equal(monthTotals(reply, 'tokens').length, 2);
+});
+
+test('months from an earlier year carry it', () => {
+  const months = monthTotals(costReply([10, 10, 10, 10, 4], { sinceDay: '2025-01-01' }), 'cost');
+  assert.deepEqual(months.map(m => m.key), ['2026-10', '2026-11']);
+  const spanning = costReply([10, 10, 10, 4], { sinceDay: '2025-01-01' });
+  spanning.buckets = dayRun('2025-12-30', 4);
+  const across = monthTotals(spanning, 'cost');
+  assert.deepEqual(across.map(m => m.label), [new Date(2025, 11, 1).toLocaleDateString([], { month: 'short' }) + ' ’25', new Date(2026, 0, 1).toLocaleDateString([], { month: 'short' })]);
 });
