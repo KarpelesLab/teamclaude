@@ -1003,7 +1003,10 @@ export class CredentialSync {
     // so it keeps that token's expiry unless the response states an earlier
     // one — before it is stored, so the row carries the date with the token.
     const renew = refresh;
-    refresh = async (opts) => withFamilyExpiry(account, await renew(opts));
+    // Read before the call: a sign-in installed while the grant is in flight
+    // brings another token's date, which is not this rotation's to carry.
+    const held = { refreshTokenExpiresAt: account.refreshTokenExpiresAt };
+    refresh = async (opts) => withFamilyExpiry(held, await renew(opts));
     if (!await this.isSignedIn()) return refresh();
     const name = safeLine(account.name, 64);
     let row;

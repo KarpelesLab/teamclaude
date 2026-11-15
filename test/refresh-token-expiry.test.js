@@ -16,7 +16,7 @@ import { TUI } from '../src/tui.js';
 import {
   REFRESH_TOKEN_WARN_DAYS, refreshTokenExpiryFromResponse, earlierRefreshTokenExpiry, withFamilyExpiry,
   expiryAfterReplacement, setRefreshTokenExpiry, refreshTokenExpiryView, accountRefreshTokenExpiry,
-  refreshTokenExpiryWarning, createRefreshTokenExpiryWarner, localDate,
+  refreshTokenExpiryWarning, createRefreshTokenExpiryWarner, localDate, knownRefreshTokenExpiry,
 } from '../src/refresh-token-expiry.js';
 
 const NOW = 1_700_000_000_000;
@@ -97,7 +97,7 @@ test('a refresh keeps the earlier of the held date and the stated one', () => {
   assert.equal(earlierRefreshTokenExpiry(null, 'soon'), null);
 
   const tokens = { accessToken: 'at', refreshToken: 'rt-2', expiresAt: NOW + H };
-  assert.deepEqual(withFamilyExpiry({ refreshTokenExpiresAt: NOW + 5 * DAY }, tokens), { ...tokens, refreshTokenExpiresAt: NOW + 5 * DAY });
+  assert.deepEqual(withFamilyExpiry({ refreshTokenExpiresAt: NOW + 5 * DAY }, tokens, NOW), { ...tokens, refreshTokenExpiresAt: NOW + 5 * DAY });
   assert.deepEqual(withFamilyExpiry({}, tokens), tokens, 'no date anywhere: no key');
   assert.equal('refreshTokenExpiresAt' in tokens, false, 'the response object is not written to');
 });
@@ -283,9 +283,11 @@ test('the date travels in the blob with the token it describes, and only as a da
 });
 
 test('a renewal outside the proxy keeps the earlier date too', async () => {
-  const entry = { name: 'a', type: 'oauth', accessToken: 'at-1', refreshToken: 'rt-1', expiresAt: NOW - 1000, refreshTokenExpiresAt: NOW + 6 * DAY };
-  const renewed = await refreshOutsideProxy(entry, async () => ({ accessToken: 'at-2', refreshToken: 'rt-2', expiresAt: NOW + 8 * H, refreshTokenExpiresAt: NOW + 30 * DAY }), { isSignedIn: async () => false });
-  assert.equal(renewed?.refreshTokenExpiresAt, NOW + 6 * DAY);
+  // This path reads the real clock, and a held date that has passed is dropped.
+  const at = Date.now();
+  const entry = { name: 'a', type: 'oauth', accessToken: 'at-1', refreshToken: 'rt-1', expiresAt: at - 1000, refreshTokenExpiresAt: at + 6 * DAY };
+  const renewed = await refreshOutsideProxy(entry, async () => ({ accessToken: 'at-2', refreshToken: 'rt-2', expiresAt: at + 8 * H, refreshTokenExpiresAt: at + 30 * DAY }), { isSignedIn: async () => false });
+  assert.equal(renewed?.refreshTokenExpiresAt, at + 6 * DAY);
 });
 
 // ── showing it ──────────────────────────────────────────────────────────────
@@ -467,4 +469,19 @@ test('the log line follows the account: a new sign-in ends it, a name cannot bre
   clock += DAY;
   assert.deepEqual(warn([{ ...account, refreshTokenExpiresAt: NOW + 30 * DAY }]), []);
   assert.deepEqual(warn([{ ...account, refreshTokenExpiresAt: null }]), []);
+});
+
+test('a refresh that succeeds after the held date drops that date', () => {
+  const now = Date.UTC(2026, 10, 16);
+  const day = 24 * 3600_000;
+  const tokens = { accessToken: 'a', refreshToken: 'r2', expiresAt: now + 3600_000 };
+  assert.equal(withFamilyExpiry({ refreshTokenExpiresAt: now - day }, tokens, now).refreshTokenExpiresAt, undefined);
+  assert.equal(withFamilyExpiry({ refreshTokenExpiresAt: now - day }, { ...tokens, refreshTokenExpiresAt: now + 30 * day }, now).refreshTokenExpiresAt, now + 30 * day);
+  // A date still ahead is kept against a later one, as before.
+  assert.equal(withFamilyExpiry({ refreshTokenExpiresAt: now + day }, { ...tokens, refreshTokenExpiresAt: now + 30 * day }, now).refreshTokenExpiresAt, now + day);
+});
+
+test('a stored value that is not epoch milliseconds is not a date', () => {
+  for (const bad of [1796083200, 1e300, 8.64e15 + 1, -1, NaN, '1796083200000']) assert.equal(knownRefreshTokenExpiry(bad), null, String(bad));
+  assert.equal(knownRefreshTokenExpiry(1796083200000), 1796083200000);
 });

@@ -31,7 +31,10 @@ const MAX_PAST_MS = DAY_MS;
  * @returns {number|null}
  */
 export function knownRefreshTokenExpiry(value) {
-  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null;
+  // Epoch milliseconds only: below 1e11 is epoch seconds (or a count of
+  // something), which would read as 1973 and warn "expired" for ever, and
+  // above 8.64e15 is no date at all.
+  return typeof value === 'number' && value >= 1e11 && value <= 8.64e15 ? value : null;
 }
 
 /** @param {unknown} v @returns {number|null} a finite number from a number or a numeric string */
@@ -116,11 +119,20 @@ export function setRefreshTokenExpiry(record, value) {
  * leaves the held one standing.
  * @template {Record<string, any>} T
  * @param {{ refreshTokenExpiresAt?: unknown }|null|undefined} held  what was refreshed
+ *
+ * A held date that has already passed is the exception: the refresh that just
+ * succeeded disproved it (the lifetime slid, or the date meant something
+ * else), so it is dropped for whatever the response states, or for none.
+ * Without that a wrong date would warn "expired" on a working account until
+ * the next sign-in.
  * @param {T} tokens  what the token endpoint answered
+ * @param {number} [now]
  * @returns {T}
  */
-export function withFamilyExpiry(held, tokens) {
-  return setRefreshTokenExpiry({ ...tokens }, earlierRefreshTokenExpiry(held?.refreshTokenExpiresAt, tokens?.refreshTokenExpiresAt));
+export function withFamilyExpiry(held, tokens, now = Date.now()) {
+  const kept = knownRefreshTokenExpiry(held?.refreshTokenExpiresAt);
+  const disproved = kept != null && kept <= now;
+  return setRefreshTokenExpiry({ ...tokens }, earlierRefreshTokenExpiry(disproved ? null : kept, tokens?.refreshTokenExpiresAt));
 }
 
 /**

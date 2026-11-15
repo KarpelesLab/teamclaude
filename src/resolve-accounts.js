@@ -1,3 +1,4 @@
+import { setRefreshTokenExpiry } from './refresh-token-expiry.js';
 import { importCredentials } from './oauth.js';
 import { importCodexCredentials, DEFAULT_CODEX_CREDENTIALS_PATH } from './codex-auth.js';
 import { providerOf } from './provider.js';
@@ -37,7 +38,12 @@ export async function resolveAccounts(config) {
             console.error(`No token in ${from} for "${acct.name}", skipping`);
             continue;
           }
-          accounts.push({ ...acct, ...creds });
+          // The file's tokens win, so the date is the file's too: one the
+          // entry kept from an earlier token says nothing about these.
+          /** @type {any} */
+          const row = { ...acct, ...creds };
+          setRefreshTokenExpiry(row, /** @type {Record<string, any>} */ (creds).refreshTokenExpiresAt);
+          accounts.push(row);
           console.log(`Imported "${acct.name}" from ${from}`);
         } catch (/** @type {any} */ err) {
           console.error(`Failed to import "${acct.name}": ${err.message}`);
