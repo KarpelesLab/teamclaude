@@ -315,6 +315,22 @@ test('with every account refused the client reads upstream\'s reason, not a re-l
   });
 });
 
+// A refusal can come as a 400 too (a disabled organization). It is recorded as
+// a refusal there as well, so a fleet refused that way gets the same 502, not
+// the quota answer.
+test('with every account refused by a 400 the client reads upstream\'s reason, not a quota wait', async () => {
+  const am = new AccountManager([accounts()[0]], 0.98);
+  const body = errorBody('invalid_request_error', 'This organization has been disabled.', 'organization_disabled');
+  await withProxy({ status: 400, body }, am, async (port, seen) => {
+    const res = await post(port);
+    assert.equal(res.status, 502, res.body.slice(0, 160));
+    const { message } = JSON.parse(res.body).error;
+    assert.match(message, /"a"/);
+    assert.ok(message.includes('This organization has been disabled.'), message);
+    assert.deepEqual(seen, ['a-token']);
+  });
+});
+
 test('status prints the refusal in upstream\'s words and how to bring the account back', () => {
   const am = new AccountManager(accounts(), 0.98);
   am.markRefused(am.accounts[0], { code: 'account_on_hold', message: HOLD_MESSAGE, link: 'https://claude.ai/restricted' });
