@@ -66,6 +66,25 @@ test('an expiry that is present but unusable counts as reached; a missing one as
   assert.equal(isTokenExpired(Date.now() - 60_000), true);
 });
 
+// 0 is no expiry, not one long past: the callback.net store writes 0 for an
+// expiry it was never given (its rows need a number), and makeAccount reads it
+// back as null. Read as reached, a token signed in with no expiry would be
+// renewed at once on every install that adopted it from the store or reloaded
+// it from disk, and on none that loaded it at startup.
+test('an expiry of 0 or an empty string is unknown; one that does not read as a positive finite number is reached', () => {
+  for (const v of [0, '']) {
+    assert.equal(isTokenExpired(v), false, JSON.stringify(v));
+    assert.equal(isTokenExpiringSoon(v), false, JSON.stringify(v));
+  }
+  for (const v of ['0', -1, Infinity]) {
+    assert.equal(isTokenExpired(v), true, String(v));
+    assert.equal(isTokenExpiringSoon(v), true, String(v));
+  }
+  // A numeric string is the time it spells.
+  assert.equal(isTokenExpired(String(Date.now() + 3_600_000)), false);
+  assert.equal(isTokenExpiringSoon(String(Date.now() + 3_600_000)), false);
+});
+
 test('a Codex token response is checked the same way', () => {
   assert.throws(() => credentialsFromTokenResponse({ refresh_token: 'rt' }), /no access_token/);
   const creds = credentialsFromTokenResponse({ access_token: 'at', refresh_token: 'rt', expires_in: 'bogus' });

@@ -387,9 +387,15 @@ export function normalizeExpiresAt(expiresAt) {
  * Check if an OAuth token is expiring within the given threshold.
  *
  * No expiry at all means unknown, and the token is used until upstream says
- * otherwise. An expiry that is present but not a number is treated as already
- * reached: it cannot be trusted to lie in the future, and refreshing replaces
- * it with one that can be compared.
+ * otherwise. That is any falsy value: absent, null, an empty string, and 0,
+ * which is how the callback.net store writes an expiry it was never given
+ * (credential-sync.js, whose rows need a number) and which makeAccount reads
+ * back as null; a token from a sign-in that carried no expiry reads the same
+ * on every install. Any other value that does not read as a positive finite
+ * number (`'0'`, `'soon'`, `-1`, `Infinity`) is present but unusable, and is
+ * treated as already reached: it cannot be trusted to lie in the future, and
+ * refreshing replaces it with one that can be compared. A numeric string is
+ * read as the time it spells.
  */
 export function isTokenExpiringSoon(expiresAt, thresholdMs = 5 * 60 * 1000) {
   if (!expiresAt) return false;
