@@ -41,7 +41,11 @@ placeholder account. Pass `--name <name>` to explicitly import without profile
 detection. An expired access token is refreshed on import when the file carries
 a refresh token; a credential the upstream rejects with 401 (and that cannot be
 refreshed) is refused regardless of `--name` — run `claude /login` and import
-again, or `teamclaude login`.
+again, or `teamclaude login`. For a credential with a refresh token, only the
+token endpoint's own refusal counts as "cannot be refreshed" (see
+[Why an account is in `error`](#why-an-account-is-in-error)): a refresh that
+fails otherwise, as on a page from a firewall in front of the endpoint, leaves
+the credential importable with `--name`.
 
 ## Delegating credentials to a file (`importFrom`)
 

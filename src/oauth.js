@@ -484,13 +484,14 @@ export async function fetchProfile(accessToken, routing = null) {
  * is what identity.js isTokenRejection keys on:
  *   - 401 when the credential is dead: the profile endpoint rejected the access
  *     token and there was no refresh token to renew it with, or the token
- *     endpoint rejected the refresh (400/401/403, read on the status alone: an
- *     import refused over a page from something in front of the endpoint can
- *     be run again, so this does not ask isRefreshRejection, which the account
- *     manager does, since there the reading also retires the token);
+ *     endpoint refused the refresh token itself (isRefreshRejection, the same
+ *     reading account-manager gives a refresh that needs a re-login);
  *   - the token endpoint's status, or null, when the refresh failed for a
- *     reason that says nothing about the token (network, 5xx after retries):
- *     the credential is unreachable, not refused, and stays importable by name.
+ *     reason that says nothing about the token (network, 5xx after retries, a
+ *     400/401/403 that was not the endpoint's refusal, such as a page from a
+ *     firewall in front of it): the credential is unreachable, not refused,
+ *     and stays importable by name. A 401 among those is carried as null,
+ *     since isTokenRejection would read it as the upstream's verdict.
  * A 403 is neither refreshed nor a rejection: the upstream answers 403 to a
  * valid token from an unexpected region (see egress-guard.js) and under an org
  * policy, and a new token would meet the same answer.
@@ -528,14 +529,15 @@ export async function profileForCredentials(creds, routing = null, { renew = (c)
     profile ??= await fetchProfile(creds.accessToken, routing);
     if (profile.status !== 401) return { creds, profile };
     const e = /** @type {CodedError} */ (err);
-    const rejected = e.status === 400 || e.status === 401 || e.status === 403;
+    const rejected = isRefreshRejection(e);
     return {
       creds,
       profile: rejected
         ? { ...profile, error: `${profile.error}; token refresh rejected: ${e.message}` }
         // Not a verdict: the refresh token may well be good, so this is the
-        // unreachable shape, carrying the token endpoint's status if it gave one.
-        : { error: `${profile.error}; token refresh failed: ${e.message}`, status: e.status ?? null },
+        // unreachable shape, carrying the token endpoint's status if it gave
+        // one, but a 401 as none: that one isTokenRejection takes for a verdict.
+        : { error: `${profile.error}; token refresh failed: ${e.message}`, status: e.status === 401 ? null : e.status ?? null },
     };
   }
 
