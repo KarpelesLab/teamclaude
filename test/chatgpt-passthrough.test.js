@@ -107,6 +107,29 @@ test('a Codex client\'s workspace check on chatgpt.com reaches chatgpt.com with 
   }
 });
 
+// The client's own login goes through; the operator's usage-dimension labels
+// do not, on this path as on the forward path. They label traffic for this
+// proxy and are no business of chatgpt.com's.
+test('the passthrough drops usage-dimension headers and keeps the rest', async () => {
+  const seen = [];
+  const up = http.createServer((req, res) => { seen.push(req.headers); res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"ok":true}'); });
+  const upPort = await listen(up);
+  const codexAccount = { ...codex('c', { upstream: `http://127.0.0.1:${upPort}` }), index: 0, provider: 'codex' };
+  const config = { upstream: 'https://api.anthropic.invalid', accounts: [claude('a'), codex('c')], proxy: { usageDimensions: [{ name: 'project', header: 'x-tc-project' }] } };
+  const proxy = http.createServer(createProxyRequestListener({ accountManager: refusing([codexAccount]), upstream: config.upstream, config }));
+  const port = await listen(proxy);
+  try {
+    const res = await request(port, { path: '/backend-api/wham/accounts/check', host: 'chatgpt.com', headers: { authorization: 'Bearer client-own-token', 'x-tc-project': 'private/repo', 'x-tc-other': 'kept' } });
+    assert.equal(res.status, 200);
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].authorization, 'Bearer client-own-token');
+    assert.equal(seen[0]['x-tc-project'], undefined, 'the dimension header must not be relayed');
+    assert.equal(seen[0]['x-tc-other'], 'kept');
+  } finally {
+    closeHard(proxy); closeHard(up);
+  }
+});
+
 test('Codex inference on the same host is still served by the pool', async () => {
   const up = await recordingUpstream();
   const am = new AccountManager([claude('a'), codex('c', { upstream: `http://127.0.0.1:${up.port}` })], 0.98);

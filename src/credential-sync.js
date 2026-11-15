@@ -199,6 +199,34 @@ export function encodeBlob(a, tokens, { now = Date.now(), by = hostname() } = {}
 }
 
 /**
+ * What a write over a row the store already holds encodes (see encodeBlob),
+ * other than a sign-in's (see _patch): the account, with what the row says
+ * about it kept wherever the account says nothing; where the two differ, the
+ * one that carries the identity decides.
+ * An account that carries none was matched to the row by its refresh token
+ * alone (`teamclaude import` renewing an expired token before it has read the
+ * profile, or an account added without one), and written as it stands it
+ * would strip the row of the identity the other installs match it by and add
+ * the account with, and rename it after this install's name for it ("imported
+ * account", for that import): the row keeps its identity and its name. An
+ * account of another identity takes nothing from the row.
+ * @param {Blob|null} blob  the row's contents
+ * @param {Record<string, any>} account
+ * @returns {Record<string, any>}
+ */
+function overRow(blob, account) {
+  if (!blob) return account;
+  const known = isSyncable(account);
+  if (known && !sameIdentity(blob, account)) return account;
+  /** @type {Record<string, any>[]} */
+  const [first, then] = known ? [account, blob] : [blob, account];
+  /** @type {Record<string, any>} */
+  const merged = { ...account, name: first.name };
+  for (const f of IDENTITY_FIELDS) merged[f] = first[f] ?? then[f];
+  return merged;
+}
+
+/**
  * The contents of a row made only to be locked: the identity, and no token. It
  * reads as no blob (decodeBlob), so nothing adopts it, adds an account from it
  * or counts it as needing a sign-in; a lock on it answers with nothing to take,
@@ -639,8 +667,17 @@ export class CredentialSync {
     return row;
   }
 
-  async _patch(/** @type {Row} */ row, /** @type {Record<string, any>} */ account, /** @type {Tokens} */ tokens) {
-    const blob = encodeBlob(account, tokens, { now: this.now(), by: this.by });
+  /**
+   * Write tokens over a row. A renewal, the pass storing one, or an emptying
+   * keeps what the row says where the account says nothing (overRow). A
+   * sign-in (`signIn`) is written as its entry stands, as before. That entry
+   * is what the sign-in read, with the previous value of an identity field
+   * its profile omits: a plan field the sign-in no longer reads goes from the
+   * row too, as do the plan fields of a re-import whose profile could not be
+   * read.
+   */
+  async _patch(/** @type {Row} */ row, /** @type {Record<string, any>} */ account, /** @type {Tokens} */ tokens, /** @type {{ signIn?: boolean }} */ { signIn = false } = {}) {
+    const blob = encodeBlob(signIn ? account : overRow(row.blob, account), tokens, { now: this.now(), by: this.by });
     const r = await this.api('PATCH', `User/Credential/${row.id}`, { Data: JSON.stringify(blob) });
     const fresh = rowOf({ ...r, Data: JSON.stringify(blob) });
     this.rows.set(fresh.key, fresh);
@@ -921,7 +958,7 @@ export class CredentialSync {
     if (!tokens.accessToken || !tokens.refreshToken) return false;
     this.rows = await this._list();
     const row = this._rowFor(account);
-    if (row) await this._patch(row, account, tokens);
+    if (row) await this._patch(row, account, tokens, { signIn: true });
     else await this._create(account, tokens);
     return true;
   }
