@@ -4,6 +4,7 @@ import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
 import { refreshAccessToken } from '../src/oauth.js';
+import { PROVIDERS } from '../src/provider.js';
 
 // What the client is told when no account served it has to name the real cause.
 // It said «Upstream refused the credential for account … (403). Check the
@@ -142,6 +143,117 @@ test('a renewal the token endpoint refused on the last retry: the client is told
     assert.equal(am.accounts[1]._deadRefreshToken, 'rt-a');
     assert.match(message, /token of "a" has expired and could not be renewed.*invalid_grant.*Re-add it with: teamclaude login/, message);
   } finally { proxy.close(); upstream.close(); refusing.close(); }
+});
+
+// A hold arms the same guard, but a re-login does not lift it (docs/accounts.md):
+// the hold's own words, in status, say what to do. So no advice to sign in again.
+test('a renewal refused for a hold on the last retry: the client is not told to re-login', async () => {
+  const holding = await tokenEndpoint(400, JSON.stringify({ error: 'invalid_grant', error_description: 'account_on_hold', error_uri: 'https://claude.ai/restricted' }));
+  const upstream = http.createServer((req, res) => {
+    req.resume();
+    const token = String(req.headers.authorization || '').replace(/^Bearer /, '');
+    res.writeHead(token === 'old-b' ? 401 : 529, { 'content-type': 'application/json' });
+    res.end(`{"type":"error","error":{"type":"${token === 'old-b' ? 'authentication_error' : 'overloaded_error'}"}}`);
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([
+    { name: 'b', type: 'oauth', accessToken: 'old-b', refreshToken: 'rt-b', expiresAt: Date.now() + 8 * H },
+    { name: 'a', type: 'oauth', accessToken: 'dead-a', refreshToken: 'rt-a', expiresAt: Date.now() - H },
+  ], 0.98, {});
+  am.accounts.forEach((a) => { a.probing = false; });
+  am.setRefreshCoordinator(async (account) => (account.name === 'b'
+    ? { accessToken: 'new-b', refreshToken: 'rt-b2', expiresAt: Date.now() + 8 * H }
+    : holding.renew(account.refreshToken)));
+  am.selectActiveAccount();
+  const proxy = createProxyServer(am, { upstream: `http://127.0.0.1:${upstreamPort}` });
+  const port = await listen(proxy);
+  try {
+    const r = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: 'claude-sonnet-4-5', messages: [] }),
+    });
+    const message = (await r.json()).error?.message || '';
+    assert.equal(am.accounts[1].errorReason?.code, 'account_on_hold');
+    assert.match(message, /token of "a" has expired and could not be renewed.*account_on_hold/, message);
+    assert.doesNotMatch(message, /teamclaude login/, message);
+  } finally { proxy.close(); upstream.close(); holding.close(); }
+});
+
+// The advice names the account's own login command (its errorReason.remedy):
+// a Codex account signs in again with `teamclaude login --codex`. The same last
+// retry as above, through the Codex path, with the Codex backend pointed at a
+// local server for the test.
+test('a Codex renewal refused on the last retry: the client is told the Codex login', async () => {
+  const upstream = http.createServer((req, res) => {
+    req.resume();
+    const token = String(req.headers.authorization || '').replace(/^Bearer /, '');
+    res.writeHead(token === 'old-b' ? 401 : 529, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: token === 'old-b' ? 'unauthorized' : 'overloaded' } }));
+  });
+  const upstreamPort = await listen(upstream);
+  const backend = PROVIDERS.codex.upstream;
+  PROVIDERS.codex.upstream = `http://127.0.0.1:${upstreamPort}`;
+  const codex = (/** @type {string} */ name, /** @type {Record<string, any>} */ extra) => ({ name, type: 'oauth', provider: 'codex', accountId: `acct-${name}`, refreshToken: `rt-${name}`, ...extra });
+  const am = new AccountManager([
+    codex('b', { accessToken: 'old-b', expiresAt: Date.now() + 8 * H }),
+    codex('a', { accessToken: 'dead-a', expiresAt: Date.now() - H }),
+  ], 0.98, {
+    codexRefreshFn: async (/** @type {string} */ rt) => {
+      if (rt === 'rt-b') return { accessToken: 'new-b', refreshToken: 'rt-b2', expiresAt: Date.now() + 8 * H };
+      throw Object.assign(new Error('Codex token refresh failed (401): {}'), { status: 401 });
+    },
+  });
+  am.accounts.forEach((a) => { a.probing = false; });
+  am.selectActiveAccount();
+  const proxy = createProxyServer(am, {});
+  const port = await listen(proxy);
+  try {
+    const r = await fetch(`http://127.0.0.1:${port}/backend-api/codex/responses`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: 'gpt-6-luna', input: [] }),
+    });
+    const message = (await r.json()).error?.message || '';
+    assert.equal(am.accounts[1]._deadRefreshToken, 'rt-a');
+    assert.match(message, /token of "a" has expired and could not be renewed.*Re-add it with: teamclaude login --codex/, message);
+  } finally { PROVIDERS.codex.upstream = backend; proxy.close(); upstream.close(); }
+});
+
+// The other advice site, refusalMessage: a Codex account refused (403) while a
+// renewal of its token was being refused (a refresh from another request, or
+// the probe), so it holds a dead refresh token and a failure when the 403 lands.
+test('a Codex account refused while its renewal is refused: the client is told the Codex login', async () => {
+  /** @type {() => void} */
+  let release = () => {};
+  const answered = new Promise((resolve) => { release = resolve; });
+  /** @type {() => void} */
+  let arrived = () => {};
+  const forwarded = new Promise((resolve) => { arrived = resolve; });
+  const upstream = http.createServer(async (req, res) => {
+    req.resume();
+    arrived();
+    await answered;
+    res.writeHead(403, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: 'forbidden' } }));
+  });
+  const upstreamPort = await listen(upstream);
+  const backend = PROVIDERS.codex.upstream;
+  PROVIDERS.codex.upstream = `http://127.0.0.1:${upstreamPort}`;
+  const am = new AccountManager([
+    { name: 'a', type: 'oauth', provider: 'codex', accountId: 'acct-a', accessToken: 'live-a', refreshToken: 'rt-a', expiresAt: Date.now() + 8 * H },
+  ], 0.98, { codexRefreshFn: async () => { throw Object.assign(new Error('Codex token refresh failed (401): {}'), { status: 401 }); } });
+  am.accounts[0].probing = false;
+  am.selectActiveAccount();
+  const proxy = createProxyServer(am, {});
+  const port = await listen(proxy);
+  try {
+    const sent = fetch(`http://127.0.0.1:${port}/backend-api/codex/responses`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: 'gpt-6-luna', input: [] }),
+    });
+    await forwarded;
+    await am.ensureTokenFresh(0, true);
+    assert.equal(am.accounts[0]._deadRefreshToken, 'rt-a');
+    release();
+    const message = (await (await sent).json()).error?.message || '';
+    assert.match(message, /token of "a" could not be renewed.*Re-add it with: teamclaude login --codex/, message);
+  } finally { PROVIDERS.codex.upstream = backend; release(); proxy.close(); upstream.close(); }
 });
 
 // The advice follows the refresh token the account holds: one refused while
