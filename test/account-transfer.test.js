@@ -235,3 +235,68 @@ test('a setting with the wrong shape refuses the file; fields this version does 
   mergeImportedAccounts(config, [{ ...claude(), someFutureField: 1 }]);
   assert.equal('someFutureField' in config.accounts[0], false);
 });
+
+const DAY = 24 * 3600_000;
+const credit = { amount: 200, currency: 'USD', cycleStart: '2026-11-02' };
+
+test('an end time, a cordon, a credit and the refresh-token expiry travel to a new machine', async () => {
+  const lapses = Date.now() + 20 * DAY;
+  const { accounts, skipped } = await collectExportAccounts([
+    claude({ endsAt: '2026-12-01', cordoned: true, refreshTokenExpiresAt: lapses }),
+    apikey({ endsAt: Date.now() + 9 * DAY, credit }),
+  ]);
+  assert.deepEqual(skipped, []);
+  const config = { accounts: [] };
+  mergeImportedAccounts(config, accounts);
+  const [a, k] = config.accounts;
+  assert.equal(a.endsAt, '2026-12-01');
+  assert.equal(a.cordoned, true);
+  assert.equal(a.refreshTokenExpiresAt, lapses);
+  assert.equal(typeof k.endsAt, 'number');
+  assert.deepEqual(k.credit, credit);
+});
+
+test('a replacement login takes its own refresh-token expiry, or none, and leaves this machine\'s settings', () => {
+  const held = Date.now() + 2 * DAY;
+  const here = () => claude({ id: 'local', expiresAt: 2000, refreshTokenExpiresAt: held, endsAt: '2027-01-01', cordoned: true });
+  const config = { accounts: [here()] };
+  mergeImportedAccounts(config, [claude({ expiresAt: 9000, accessToken: 'new', refreshToken: 'new-rt', endsAt: '2026-12-01', cordoned: false })]);
+  const a = config.accounts[0];
+  assert.equal(a.refreshToken, 'new-rt');
+  assert.equal('refreshTokenExpiresAt' in a, false, 'the old token\'s expiry is not carried onto the new one');
+  assert.equal(a.endsAt, '2027-01-01');
+  assert.equal(a.cordoned, true);
+
+  const stated = Date.now() + 28 * DAY;
+  const again = { accounts: [here()] };
+  mergeImportedAccounts(again, [claude({ expiresAt: 9000, accessToken: 'new', refreshToken: 'new-rt', refreshTokenExpiresAt: stated })]);
+  assert.equal(again.accounts[0].refreshTokenExpiresAt, stated);
+});
+
+test('a file-backed export takes the refresh-token expiry from the file, not the entry', async () => {
+  const stale = Date.now() + 1 * DAY;
+  const fromFile = Date.now() + 25 * DAY;
+  const row = { name: 'from-file', type: 'oauth', importFrom: '~/.claude/.credentials.json', refreshTokenExpiresAt: stale };
+  const without = await collectExportAccounts([row], { readClaude: async () => ({ accessToken: 'file-at', refreshToken: 'file-rt', expiresAt: 5000 }) });
+  assert.equal('refreshTokenExpiresAt' in without.accounts[0], false);
+  const withDate = await collectExportAccounts([row], { readClaude: async () => ({ accessToken: 'file-at', refreshToken: 'file-rt', expiresAt: 5000, refreshTokenExpiresAt: fromFile }) });
+  assert.equal(withDate.accounts[0].refreshTokenExpiresAt, fromFile);
+});
+
+test('the new fields are shape-checked like the others', () => {
+  assert.match(String(invalidAccount(claude({ endsAt: { at: 1 } }))), /endsAt/);
+  assert.match(String(invalidAccount(claude({ cordoned: 'yes' }))), /cordoned/);
+  assert.match(String(invalidAccount(apikey({ credit: 200 }))), /credit/);
+  assert.match(String(invalidAccount(claude({ refreshTokenExpiresAt: 'soon' }))), /refreshTokenExpiresAt/);
+});
+
+test('a newer access token on the same refresh token keeps the earlier known expiry', () => {
+  const held = Date.now() + 2 * DAY;
+  const here = () => claude({ id: 'local', expiresAt: 2000, refreshTokenExpiresAt: held });
+  const omitted = { accounts: [here()] };
+  mergeImportedAccounts(omitted, [claude({ expiresAt: 9000, accessToken: 'new' })]);
+  assert.equal(omitted.accounts[0].refreshTokenExpiresAt, held, 'a bundle that states no date does not clear it');
+  const later = { accounts: [here()] };
+  mergeImportedAccounts(later, [claude({ expiresAt: 9000, accessToken: 'new', refreshTokenExpiresAt: held + 20 * DAY })]);
+  assert.equal(later.accounts[0].refreshTokenExpiresAt, held, 'a later date for the same token does not extend it');
+});

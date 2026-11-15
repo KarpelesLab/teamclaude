@@ -526,6 +526,24 @@ test('adaptiveStats excludes subscriptions owned by another provider', () => {
   assert.equal(rows.find(r => r.name === 'codex').weight, 0);
 });
 
+test('adaptiveStats rows carry their provider, window and the Codex plan the account reports', () => {
+  const am = new AccountManager([
+    oauth('claude', { rateLimitTier: 'default_claude_ai' }),
+    oauth('codex', { provider: 'codex' }),
+  ], 0.98, { distributeSessions: 'adaptive' });
+  weekly(am, 0, 0.4);
+  weekly(am, 1, 0.5);
+  am.accounts[1].quota.planType = 'pro';
+  const rows = am.adaptiveStats();
+  const claude = rows.find(r => r.name === 'claude');
+  const codex = rows.find(r => r.name === 'codex');
+  assert.equal(claude.provider, 'anthropic');
+  assert.equal(claude.planType, null, 'an Anthropic row reports no Codex plan');
+  assert.equal(codex.provider, 'codex');
+  assert.equal(codex.window, 'unified7d', 'a Codex score comes from its account-wide weekly window');
+  assert.equal(codex.planType, 'pro');
+});
+
 test('adaptiveStats reports each provider against its own draw', () => {
   // A Codex subscription can only be spent by Codex, so it competes with the
   // other Codex accounts — not as a permanent bystander to the Anthropic draw.

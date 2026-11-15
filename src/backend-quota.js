@@ -41,9 +41,12 @@ const RESPONSE_LIMIT = 64 * 1024;
 // Z.ai publishes the coding plan's windows at /api/monitor/usage/quota/limit:
 // `{ code, data: { level, limits: [...] } }`, where each TOKENS_LIMIT row is one
 // window — `unit: 3, number: 5` the five-hour one, `unit: 6, number: 1` the
-// weekly one — carrying `percentage` (0-100, used) and `nextResetTime` (ms). A
-// TIME_LIMIT row is the monthly MCP-tool allowance and is not a token quota,
-// so it is left out. Both windows go into one reading: the bar is the fuller
+// weekly one — carrying `percentage` (0-100, used) and `nextResetTime` (ms).
+// Newer plans answer the same windows as CREDIT_LIMIT rows, which also carry
+// `currentValue` of `usage` credits: their `percentage` is a whole number
+// (1 for 184 of 12000), so the ratio is the finer reading. Should a reply
+// carry both kinds for one window, the fuller one stands. A TIME_LIMIT row is
+// the monthly MCP-tool allowance and is not a token quota, so it is left out. Both windows go into one reading: the bar is the fuller
 // of the two — the one that decides whether the account can serve — and the
 // text names each with its reset.
 const ZAI = {
@@ -55,15 +58,26 @@ const ZAI = {
     /** @type {Array<{ name: string, used: number, resetAt: number|null }>} */
     const windows = [];
     for (const row of limits) {
-      if (row?.type !== 'TOKENS_LIMIT') continue;
-      const pct = Number(row.percentage);
-      if (!Number.isFinite(pct)) continue;
+      if (row?.type !== 'TOKENS_LIMIT' && row?.type !== 'CREDIT_LIMIT') continue;
+      const spent = Number(row.currentValue);
+      const allowance = Number(row.usage);
+      const fraction = row.type === 'CREDIT_LIMIT' && Number.isFinite(spent) && Number.isFinite(allowance) && allowance > 0
+        ? spent / allowance
+        : Number(row.percentage) / 100;
+      if (!Number.isFinite(fraction)) continue;
       const name = row.unit === 3 && row.number === 5 ? '5h'
         : row.unit === 6 && row.number === 1 ? 'week'
         : null;
       if (!name) continue;
       const reset = Number(row.nextResetTime);
-      windows.push({ name, used: Math.min(1, Math.max(0, pct / 100)), resetAt: Number.isFinite(reset) && reset > 0 ? reset : null });
+      const used = Math.min(1, Math.max(0, fraction));
+      const resetAt = Number.isFinite(reset) && reset > 0 ? reset : null;
+      const prev = windows.find(w => w.name === name);
+      if (prev) {
+        if (used > prev.used) Object.assign(prev, { used, resetAt });
+        continue;
+      }
+      windows.push({ name, used, resetAt });
     }
     if (!windows.length) return null;
     const text = windows.map(w => {
@@ -406,11 +420,11 @@ export async function fetchBackendQuota(account, { fetchImpl = proxyFetch, timeo
 /**
  * Parse a JSON response body of at most `limit` bytes; `undefined` when it is
  * larger (declared or actual). A response without a readable stream (a test
- * double) falls back to `json()`.
+ * double) falls back to `json()`. Also read by anthropic-cost-report.js.
  * @param {any} res
  * @param {number} limit
  */
-async function readJsonBounded(res, limit) {
+export async function readJsonBounded(res, limit) {
   const declared = Number(res.headers?.get?.('content-length'));
   if (Number.isFinite(declared) && declared > limit) return undefined;
   if (typeof res.body?.getReader !== 'function') return res.json();

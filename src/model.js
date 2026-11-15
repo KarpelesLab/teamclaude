@@ -71,6 +71,9 @@ export function resolveMaxSpendMinor(maxSpend, spend) {
 // "nothing at all" — an account that has billed nothing is still under it.
 // Only an account that CAN bill is judged: with extra usage off upstream no
 // request costs money, and barring it would only waste the quota it still has.
+// Reaching the cap does not bar the account outright, for the same reason: a
+// request served from included quota costs nothing, so AccountManager holds a
+// capped account to that quota (_spendCapBinds) rather than to zero requests.
 /**
  * @param {unknown} maxSpend
  * @param {{ enabled?: boolean, usedMinor?: number | null, exponent?: number } | null | undefined} spend

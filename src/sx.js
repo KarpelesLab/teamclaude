@@ -21,23 +21,21 @@ const CONNECT_TIMEOUT_MS = 30000; // residential exits can be slow to establish
 //
 // The API key travels as a query parameter (the provider's design), so the base
 // URL decides whether it crosses the network in the clear. An override must be
-// https:, or plain http: to this machine only (a test mock): anything else is
-// reported once and the default is used, rather than sending the key to whatever
-// an inherited environment variable happens to name.
+// https:, or plain http: to this machine only (a test mock), so an inherited
+// environment variable cannot point the key at a cleartext or arbitrary host.
+//
+// An override that is SET but not acceptable throws: it is never replaced by the
+// default. Whoever set it meant another endpoint, and falling back would send the
+// key to api.sx.org instead — a typo turned into a call nobody asked for.
 const DEFAULT_SX_BASE = 'https://api.sx.org';
-let warnedBase = null;
-export function sxBase(env = process.env, warn = (m) => console.error(m)) {
+export function sxBase(env = process.env) {
   const raw = env.SX_API_BASE;
   if (!raw) return DEFAULT_SX_BASE;
   let u = null;
-  try { u = new URL(raw); } catch { /* reported below */ }
+  try { u = new URL(raw); } catch { /* refused below */ }
   const loopback = u && /^(localhost|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|\[::1\])$/.test(u.hostname);
   if (u && (u.protocol === 'https:' || (u.protocol === 'http:' && loopback))) return raw.replace(/\/$/, '');
-  if (warnedBase !== raw) {
-    warnedBase = raw;
-    warn(`[TeamClaude] ignoring SX_API_BASE=${JSON.stringify(raw)}: the sx.org API key rides in the URL, so the base must be https:// (plain http:// is allowed for loopback only); using ${DEFAULT_SX_BASE}`);
-  }
-  return DEFAULT_SX_BASE;
+  throw new Error(`refusing to call sx.org: SX_API_BASE=${JSON.stringify(raw)} must be https:// (plain http:// is allowed for loopback only), since the API key rides in the URL. Fix or unset it; it is not replaced by ${DEFAULT_SX_BASE}`);
 }
 
 // ── sx.org REST (apiKey is a query param; these hit api.sx.org directly, never

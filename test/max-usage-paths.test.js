@@ -159,6 +159,46 @@ test("capBars names the advisor's family cap, except under advisorEligibility pr
   assert.equal(prefer.capBars(prefer.accounts[0], FABLE), 'unified7dFable');
 });
 
+// #628: the advisor's family cap holds on the paths that set the advisor aside.
+// Fable is capped at 0.7, the shared weekly is free, and the requests are Opus
+// with a Fable advisor.
+function advisorFleet(advisorEligibility, cappedNames) {
+  const caps = { maxUsage: { unified7dFable: 0.7 } };
+  const am = new AccountManager([oauth('a', caps), oauth('b', caps)], 0.98, { advisorEligibility });
+  for (const account of am.accounts) {
+    Object.assign(account.quota, { unified7d: 0.2, unified7dReset: Date.now() + 48 * H });
+    const fable = cappedNames.includes(account.name) ? 0.75 : 0.1;
+    Object.assign(account.quota, { unified7dFable: fable, unified7dFableReset: Date.now() + 48 * H });
+  }
+  return am;
+}
+
+test("selection stays off an account capped on the advisor's family, in both modes", () => {
+  for (const mode of ['strict', 'prefer']) {
+    const am = advisorFleet(mode, ['a']);
+    assert.equal(am.getActiveAccount(null, OPUS, FABLE).name, 'b', mode);
+    // Without an advisor the Fable cap says nothing about an Opus request.
+    assert.equal(advisorFleet(mode, ['a']).getActiveAccount(null, OPUS).name, 'a', mode);
+  }
+});
+
+test("a 429 hop under prefer stays off an account capped on the advisor's family", () => {
+  const caps = { maxUsage: { unified7dFable: 0.7 } };
+  const am = new AccountManager([oauth('tried', caps), oauth('capped', caps), oauth('free', caps)], 0.98, { advisorEligibility: 'prefer' });
+  for (const account of am.accounts) {
+    Object.assign(account.quota, { unified7d: 0.2, unified7dReset: Date.now() + 48 * H, unified7dFable: 0.1, unified7dFableReset: Date.now() + 48 * H });
+  }
+  am.accounts[1].quota.unified7dFable = 0.75;
+  assert.equal(am.pickAlternate(new Set([0]), OPUS, FABLE).name, 'free');
+});
+
+test('with every account capped on the advisor family, the request is routed by its main model', () => {
+  for (const mode of ['strict', 'prefer']) {
+    const am = advisorFleet(mode, ['a', 'b']);
+    assert.ok(am.getActiveAccount(null, OPUS, FABLE), mode);
+  }
+});
+
 // ── Expiry pressure under a cap ─────────────────────────────
 
 test('expiry pressure is the room under the cap, not under 100%', () => {

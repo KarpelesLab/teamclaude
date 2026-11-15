@@ -983,6 +983,15 @@ test('without sessionDetail the banner still fires, unnamed', () => {
   assert.equal(problems(am.getStatus({ sessionDetail: true })).length, 1);
 });
 
+test('an account whose organization refused OAuth carries a badge until it serves again', () => {
+  const denied = accountBadges({
+    name: 'a', type: 'oauth', status: 'active',
+    entitlementDenial: { detail: 'OAuth authentication is currently not allowed for this organization.', since: 1, lastAt: 1, count: 3 },
+  }, null, null);
+  assert.deepEqual(denied.find(b => /denied/.test(b.text)), { cls: 'throttled', text: 'OAuth denied \u00d73' });
+  assert.equal(accountBadges({ name: 'a', type: 'oauth', status: 'active' }, null, null).some(b => /denied/.test(b.text)), false);
+});
+
 test('only the account states that need a person are reported', () => {
   // These clear themselves — rotation and back-off working.
   // `status = 'exhausted'` is never assigned anywhere in src/, so a fixture that
@@ -1001,6 +1010,11 @@ test('only the account states that need a person are reported', () => {
   const off = problems(fleetStatus(am => am.setDisabled(0, true)));
   assert.deepEqual(off.map(p => p.kind), ['account']);
   assert.match(off[0].text, /disabled/);
+  // An account upstream refused is not cured by a re-login alone.
+  const refused = problems(fleetStatus(am => am.markRefused(am.accounts[0], { code: 'account_on_hold', message: 'on hold', link: null })));
+  assert.deepEqual(refused.map(p => p.kind), ['account']);
+  assert.match(refused[0].text, /refused by upstream/);
+  assert.doesNotMatch(refused[0].text, /re-login/);
 });
 
 test('overage spend is not a banner line', () => {
@@ -1667,6 +1681,23 @@ test('a disabled account offers only Enable: no Switch to on its row or in the A
   assert.equal(page.labelled('Enable'), 1);
 });
 
+test('a cordoned account\'s status badge in the Accounts table is short, with the reason on hover', async () => {
+  const page = bootPage();
+  await page.answer(200, {
+    currentAccounts: { anthropic: 'a' },
+    accounts: [
+      { name: 'a', provider: 'anthropic', quota: { unified7d: 0.1 } },
+      { name: 'b', provider: 'anthropic', status: 'active', cordoned: true, cordonRemaining: 1, unavailable: 'cordoned', quota: { unified7d: 0.1 } },
+    ],
+  });
+  // The long reason widened the Status column until the row's controls no longer fit the card.
+  assert.equal(page.labelled('cordoned: takes no new conversations'), 0);
+  const badge = page.built.filter(e => e.textContent === 'cordoned').at(-1);
+  assert.ok(badge, 'the table badge reads cordoned');
+  assert.equal(badge.title, 'cordoned: takes no new conversations');
+  assert.match(badge.className, /\bcordoned\b/);
+});
+
 test('drain mode\'s queue shows on the rows and the card when the server reports it', async () => {
   const page = bootPage();
   await page.answer(200, {
@@ -1931,7 +1962,7 @@ test('selecting a window relabels every table it governs', async () => {
 const CLIENT_CALLER = {
   kind: 'client',
   client: 'ci',
-  refused: ['/teamclaude/threshold', '/teamclaude/priority', '/teamclaude/disable'],
+  refused: ['/teamclaude/threshold', '/teamclaude/priority', '/teamclaude/disable', '/teamclaude/account-cordon'],
 };
 
 test('callerCan hides exactly the refused controls', () => {

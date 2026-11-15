@@ -1,8 +1,11 @@
 import { formatMoney } from './oauth.js';
 import { findFamilyBlock, modelGlobOverlaps, gatingUtilization, resolveMaxUsage, resolveSwitchThreshold, resolveFleetThreshold, switchThresholdDiffs, resolveMaxSpendMinor, spendCapReached } from './model.js';
-import { safeLine } from './safe-text.js';
+import { safeLine, sanitizeText } from './safe-text.js';
+import { isRefused } from './account-refusal.js';
 import { ROUTE_COLORS } from './config-ops.js';
 import { describeRouting } from './account-routing.js';
+import { describeEndsAt } from './ends-at.js';
+import { accountRefreshTokenExpiry, loginCommandFor } from './refresh-token-expiry.js';
 
 const ESC = '\x1b[';
 const RESET = `${ESC}0m`;
@@ -55,6 +58,9 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
   if (status.server?.startedAt || status.server?.uptimeSeconds != null) {
     lines.push(`${paint.dim('Server'.padEnd(12))} ${formatServerSummary(status.server, now)}`);
   }
+  // Only when the fleet runs out within the forecast horizon (#550).
+  const fleetForecast = fleetForecastText(status.fleetForecast, now);
+  if (fleetForecast) lines.push(`${paint.dim('Fleet'.padEnd(12))} ${paint.yellow(fleetForecast)}`);
   lines.push('');
 
   for (const line of routingLines(status.routes, blocked, paint)) lines.push(line);
@@ -78,12 +84,29 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
     if (threshold) lines.push(`  ${threshold}`);
     const egress = egressProxyLine(account, paint);
     if (egress) lines.push(`  ${egress}`);
+    const ends = endsAtLine(account, now, paint);
+    if (ends) lines.push(`  ${ends}`);
     const why = unavailableLine(account, paint);
     if (why) lines.push(`  ${why}`);
+    const denied = entitlementLine(account, now, paint);
+    if (denied) lines.push(`  ${denied}`);
+    const unserved = modelDenialLine(account, now, paint);
+    if (unserved) lines.push(`  ${unserved}`);
+    const login = loginExpiryLine(account, paint, now);
+    if (login) lines.push(`  ${login}`);
+    const plan = subscriptionLostLine(account, paint, now);
+    if (plan) lines.push(`  ${plan}`);
     const spend = spendLine(account, paint);
     if (spend) lines.push(`  ${spend}`);
+    const credit = creditText(account.credit, now);
+    if (credit) {
+      const short = account.credit?.error || account.credit?.incomplete || account.credit?.remainingMinor === 0;
+      lines.push(`  ${paint.dim('Credit'.padEnd(8))} ${(short ? paint.yellow : (/** @type {string} */ t) => t)(safeLine(credit, 400))}`);
+    }
     const resetCredits = resetCreditLine(account, paint, now);
     if (resetCredits) lines.push(`  ${resetCredits}`);
+    const redeem = autoRedeemLine(account, paint);
+    if (redeem) lines.push(`  ${redeem}`);
     const outside = outsideSpendText(account.quota?.outsideSpend, status.outsideSpendHidePercent, account.quota?.planPeriod);
     if (outside) lines.push(`  ${paint.dim('Outside'.padEnd(8))} ${outside}`);
     const forecast = forecastText(account.quota?.forecast, now, account.quota?.planPeriod);
@@ -156,10 +179,12 @@ export const UNAVAILABLE_TEXT = {
   'advisor-capped': "advisor model's usage cap reached (maxUsage)",
   entitlement: 'upstream refused this account for the organization (cooldown)',
   routing: "the account's routing proxy is unreachable (cooldown)",
+  billing: 'upstream billing refused usage (cooldown); check billing or purchase credits',
   credential: 'upstream rejected its API key with a 401 (cooldown, then retried)',
   route: 'no route allows this account',
   'advisor-quota': "advisor model's weekly bucket spent",
   'advisor-route': 'no route allows the advisor model',
+  cordoned: 'cordoned: takes no new conversations',
 };
 
 /**
@@ -183,7 +208,8 @@ export function spendLine(account, paint) {
   // The operator's own ceiling (accounts[].maxSpend), drawn beside the upstream
   // figure it is judged against so the two read in one glance: `$14.35 of
   // $10,000.00 used this month, cap $20.00`. Named `cap` like the usage caps on
-  // the bars above — same word, same meaning: at it the account gets nothing.
+  // the bars above: at it the account bills nothing more, and serves only what
+  // its included quota still covers.
   const capMinor = resolveMaxSpendMinor(account?.maxSpend, spend);
   const cap = capMinor == null ? '' : `, cap ${formatMoney({ ...spend, usedMinor: capMinor, limitMinor: null })}`;
   if (spend.enabled) {
@@ -264,6 +290,108 @@ export function outsideSpendText(outsideSpend, hidePercent, planPeriod) {
     return label + ': not observed (quota probe off?)';
   });
   return parts.join(' \u00b7 ');
+}
+
+/**
+ * The prepaid-credit read-out for one API-key account (accounts[].credit), or
+ * null when it has none. One phrase per fact, joined with " · ":
+ *
+ *   "$176.55 of $200.00 left ($23.45 spent) · renews in 26d (2026-12-02) · Admin API cost report, read 4m ago"
+ *   "at most $191.20 of $200.00 left ($8.80 spent) · renews in 26d (2026-12-02) · estimate: replies through this proxy only, since 2026-11-02"
+ *
+ * plus "incomplete: …" naming any model the local estimate could not price,
+ * and "cost report failed: …" while the admin read is failing. Never a zero
+ * for a spend that was not read: "spend not read yet" instead.
+ *
+ * Pure and closure-free on purpose, like outsideSpendText: the dashboard
+ * serializes it into its page with toString().
+ *
+ * @param {any} credit  a creditView (api-credit.js)
+ * @param {number} now  ms epoch
+ * @returns {string|null}
+ */
+export function creditText(credit, now) {
+  if (!credit || typeof credit !== 'object') return null;
+  var exp = typeof credit.exponent === 'number' ? credit.exponent : 2;
+  var sym = credit.currency === 'USD' ? '$' : '';
+  var money = function (/** @type {number} */ minor) {
+    var t = (minor / Math.pow(10, exp)).toLocaleString('en-US', { minimumFractionDigits: exp, maximumFractionDigits: exp });
+    return sym ? sym + t : t + (credit.currency ? ' ' + credit.currency : '');
+  };
+  var ago = function (/** @type {unknown} */ stamp) {
+    var t = typeof stamp === 'string' ? Date.parse(stamp) : NaN;
+    if (!isFinite(t)) return null;
+    var m = Math.max(0, Math.round((now - t) / 60000));
+    if (m < 1) return 'just now';
+    if (m < 60) return m + 'm ago';
+    var h = Math.round(m / 60);
+    return h < 48 ? h + 'h ago' : Math.round(h / 24) + 'd ago';
+  };
+  var parts = [];
+  var amount = typeof credit.amountMinor === 'number' ? money(credit.amountMinor) : '?';
+  if (typeof credit.remainingMinor !== 'number') {
+    parts.push(amount + ' credit, spend not read yet');
+  } else {
+    var left = (credit.upperBound ? 'at most ' : '') + money(credit.remainingMinor) + ' of ' + amount + ' left';
+    left += credit.exceededMinor > 0 ? ', exceeded by ' + money(credit.exceededMinor) : ' (' + money(credit.spentMinor || 0) + ' spent)';
+    parts.push(left);
+  }
+  var end = typeof credit.cycleEnd === 'string' ? Date.parse(credit.cycleEnd) : NaN;
+  if (isFinite(end)) {
+    var hours = Math.max(0, Math.floor((end - now) / 3600000));
+    parts.push('renews in ' + (hours >= 48 ? Math.floor(hours / 24) + 'd' : hours + 'h') + ' (' + credit.cycleEnd.slice(0, 10) + ')');
+  }
+  if (credit.source === 'admin') {
+    var read = ago(credit.asOf);
+    parts.push('Admin API cost report' + (read ? ', read ' + read : ''));
+  } else if (credit.source === 'local') {
+    parts.push('estimate: replies through this proxy only' + (typeof credit.trackedSince === 'string' ? ', since ' + credit.trackedSince.slice(0, 10) : ''));
+  }
+  if (credit.incomplete) {
+    var n = credit.incomplete.replies || 0;
+    var names = (credit.incomplete.models || []).map(function (/** @type {any} */ m) { return m.model; }).join(', ');
+    parts.push('incomplete: ' + n + ' unpriced repl' + (n === 1 ? 'y' : 'ies') + (names ? ' (' + names + ')' : ''));
+  }
+  if (credit.error) {
+    var failed = ago(credit.error.at);
+    parts.push('cost report failed: ' + credit.error.message + (failed ? ' (' + failed + ')' : ''));
+  }
+  return parts.join(' \u00b7 ');
+}
+
+/**
+ * The fleet forecast as one line, or null when there is none (#550):
+ *
+ *   "all accounts out in ~31h (weekly), first back 4h later"
+ *   "all accounts out now (5h), first back in 2h"
+ *
+ * Pure and closure-free on purpose, like forecastText: the dashboard
+ * serializes it into its page with toString().
+ *
+ * @param {{allOutAt?: number|null, firstBackAt?: number|null, boundBy?: string|null, ratePerDay?: number|null}|null|undefined} fleet
+ * @param {number} now  ms epoch
+ * @returns {string|null}
+ */
+export function fleetForecastText(fleet, now) {
+  if (!fleet || typeof fleet.allOutAt !== 'number') return null;
+  /** @param {number} ms */
+  var dur = function (ms) {
+    var minutes = Math.max(1, Math.round(ms / 60000));
+    if (minutes < 60) return minutes + 'm';
+    var hours = Math.round(minutes / 60);
+    if (hours < 48) return hours + 'h';
+    var days = Math.floor(hours / 24);
+    var rem = hours % 24;
+    return rem ? days + 'd' + rem + 'h' : days + 'd';
+  };
+  var out = fleet.allOutAt > now;
+  var bucket = fleet.boundBy === '5h' ? '5h' : 'weekly';
+  var text = 'all accounts out ' + (out ? 'in ~' + dur(fleet.allOutAt - now) : 'now') + ' (' + bucket + ')';
+  var back = fleet.firstBackAt;
+  if (typeof back === 'number' && back > now) {
+    text += out ? ', first back ' + dur(back - fleet.allOutAt) + ' later' : ', first back in ' + dur(back - now);
+  }
+  return text;
 }
 
 /**
@@ -376,13 +504,41 @@ export function resetCreditLine(account, paint, now = Date.now()) {
   const credits = account?.quota?.resetCredits;
   const available = heldResetCredits(account?.quota, now);
   if (!available) return null;
-  const noun = `free rate-limit reset ${available === 1 ? 'credit' : 'credits'}`;
+  const fable = heldFableResets(account?.quota, now);
+  const general = available - fable;
+  const held = [];
+  if (general) held.push(`${general} free rate-limit reset ${general === 1 ? 'credit' : 'credits'}`);
+  if (fable) held.push(`${fable} Fable ${fable === 1 ? 'reset' : 'resets'}`);
   const notes = [];
   if (credits.applicable === 0) notes.push('none applicable to a window right now');
   if (Number.isFinite(credits.expiresAt)) notes.push(`expires ${formatDuration(credits.expiresAt - now)}`);
   if (Number.isFinite(credits.seenAt)) notes.push(`as of ${formatAgo(Math.min(credits.seenAt, now), now)}`);
   const note = notes.length ? ` — ${notes.join(', ')}` : '';
-  return `${paint.dim('Reset'.padEnd(8))} ${paint.cyan(`${available} ${noun}`)}${paint.gray(note)}`;
+  return `${paint.dim('Reset'.padEnd(8))} ${paint.cyan(held.join(', '))}${paint.gray(note)}`;
+}
+
+/**
+ * The auto-redeem policy's standing on this account: whether the automatic
+ * policy may spend one of its reset credits, why not when it may not, and what
+ * a credit spent now would buy (a Codex reset restarts the 7-day timer, so a
+ * credit is worth the days left to the natural reset over seven).
+ *
+ * Drawn only where the payload carries the block — Codex rows from a server
+ * that computes it — so an older server, or a Claude row, prints nothing.
+ *
+ * @param {Record<string, any>|null|undefined} account  a row of the status payload
+ * @param {ReturnType<typeof colors>} paint
+ */
+export function autoRedeemLine(account, paint) {
+  const view = account?.autoRedeem;
+  if (!view || typeof view !== 'object') return null;
+  const value = Number.isFinite(view.creditValueWeeks)
+    ? `credit worth ${view.creditValueWeeks.toFixed(2)} of a week (${(view.creditValueWeeks * 7).toFixed(1)}d to reset)`
+    : 'credit value unknown (no reset time)';
+  const state = view.armed
+    ? paint.green('armed')
+    : `${paint.yellow('exempt')}${view.exemptReason ? paint.gray(` — ${safeLine(view.exemptReason, 160)}`) : ''}`;
+  return `${paint.dim('Redeem'.padEnd(8))} ${state}${paint.gray(`, ${value}`)}`;
 }
 
 // How long a reset-credit reading is worth showing. Nothing refreshes the count
@@ -416,13 +572,55 @@ export function heldResetCredits(quota, now = Date.now()) {
   return available;
 }
 
+// Upstream refused the account itself: its words, and its link when the
+// shortened words lost it.
+function refusalText(/** @type {Record<string, any>} */ err) {
+  const detail = safeLine(err.detail, 200);
+  const link = err.link && !detail.includes(err.link) ? ` ${sanitizeText(err.link)}` : '';
+  return `refused by upstream: ${detail}${link} — once resolved, run: ${safeLine(err.remedy, 40)}`;
+}
+
+/**
+ * `; last good refresh 3d ago` beside a rejected refresh token, when this
+ * process saw one succeed (#629); empty otherwise.
+ * @param {any} account
+ * @param {any} err
+ */
+function lastGoodRefresh(account, err) {
+  if (err?.code !== 'refresh_rejected' || !Number.isFinite(account?.lastRefreshAt)) return '';
+  return `; last good refresh ${formatAgo(account.lastRefreshAt, Date.now())}`;
+}
+
+/**
+ * How many of the reported resets are Fable resets (see bankedResets in
+ * oauth.js): 0 wherever heldResetCredits reports none, and never more than it
+ * does. A Codex reading carries no `fable` count, so all of its credits stay
+ * general ones.
+ *
+ * @param {Record<string, any>|null|undefined} quota
+ * @param {number} [now]
+ */
+export function heldFableResets(quota, now = Date.now()) {
+  const fable = quota?.resetCredits?.fable;
+  if (!Number.isFinite(fable) || fable <= 0) return 0;
+  return Math.min(fable, heldResetCredits(quota, now));
+}
+
 export function unavailableLine(account, paint) {
   const reason = account?.unavailable;
   if (!reason) return null;
+  // Not blocked: it keeps serving the conversations on it, and says how many.
+  if (reason === 'cordoned') {
+    const left = Number.isFinite(account.cordonRemaining) ? `; ${account.cordonRemaining} still on it` : '';
+    return `${paint.dim('Cordoned'.padEnd(8))} ${paint.yellow(`takes no new conversations${left}`)}`;
+  }
+  // A refusal outlasts a cap or a cooldown ranked above it, so it is named
+  // whatever `unavailable` says, short of the operator's own disable.
+  const refused = reason !== 'disabled' && isRefused(account);
   const err = reason === 'error' ? account.errorReason : null;
-  const text = err
-    ? `needs a re-login: ${safeLine(err.detail, 120)} — run: ${safeLine(err.remedy, 40)}`
-    : UNAVAILABLE_TEXT[reason] || safeLine(reason, 64);
+  const text = refused ? refusalText(account.errorReason)
+    : !err ? UNAVAILABLE_TEXT[reason] || safeLine(reason, 64)
+    : `needs a re-login: ${safeLine(err.detail, 120)}${lastGoodRefresh(account, err)} — run: ${safeLine(err.remedy, 40)}`;
   // An account serving as the extra-usage fallback reads as out of quota like
   // any other, yet is taking traffic and billing for it. Say so on the line
   // that would otherwise tell the operator it is idle.
@@ -430,6 +628,68 @@ export function unavailableLine(account, paint) {
     return `${paint.dim('Blocked'.padEnd(8))} ${paint.yellow(text)} ${paint.red('\u2014 serving on extra usage (paid overage), billing')}`;
   }
   return `${paint.dim('Blocked'.padEnd(8))} ${paint.yellow(text)}`;
+}
+
+/**
+ * When the account's refresh token lapses and a new sign-in is due — only for
+ * an account whose provider or imported credential file stated the date
+ * (#674); most rows have none and get no line. Yellow, with the command, once
+ * it is within the warning window or past.
+ * @param {any} account
+ * @param {ReturnType<typeof colors>} paint
+ * @param {number} [now]
+ */
+export function loginExpiryLine(account, paint, now = Date.now()) {
+  const view = accountRefreshTokenExpiry(account, now);
+  if (!view) return null;
+  const label = paint.dim('Login'.padEnd(8));
+  if (!view.warn) return `${label} ${view.text}`;
+  return `${label} ${paint.yellow(view.text)} ${paint.gray(`\u2014 run: ${loginCommandFor(account)}`)}`;
+}
+
+// Upstream's refusal outlives its cooldown, so the account reads as denied
+// until it serves again rather than healthy between re-checks.
+/** @param {any} account @param {number} now @param {ReturnType<typeof colors>} paint */
+function entitlementLine(account, now, paint) {
+  const denial = account?.entitlementDenial;
+  if (!denial) return null;
+  const since = formatAgo(denial.since, now);
+  // The payload can come from another process: only a whole number is a count.
+  const count = Number.isSafeInteger(denial.count) ? denial.count : 1;
+  const when = count > 1 ? `${count} in a row, first ${since}` : since;
+  const text = safeLine(denial.detail ?? '', 200) || 'OAuth entitlement denied';
+  return `${paint.dim('Denied'.padEnd(8))} ${paint.yellow(text)} ${paint.dim(`\u2014 ${when}`)}`;
+}
+
+// A plan that does not serve a model bars only that model, so the account
+// still reads active above. Like the entitlement line, an entry outlives its
+// cooldown until a later request for the model is served.
+/** @param {any} account @param {number} now @param {ReturnType<typeof colors>} paint */
+function modelDenialLine(account, now, paint) {
+  const denials = Array.isArray(account?.modelDenials) ? account.modelDenials : [];
+  if (!denials.length) return null;
+  const models = denials.map((/** @type {any} */ d) => {
+    const until = parseTs(d?.until);
+    // The payload can come from another process: only a whole number is a count.
+    const count = Number.isSafeInteger(d?.count) ? d.count : 1;
+    const wait = until && until > now ? `retry in ${formatDuration(until - now)}` : 're-admitted';
+    return `${safeLine(d?.model ?? '', 64) || '?'} (${wait}${count > 1 ? `, ${count} in a row` : ''})`;
+  });
+  return `${paint.dim('Models'.padEnd(8))} ${paint.yellow(`plan does not serve ${models.join(', ')}`)}`;
+}
+
+/**
+ * @param {any} account
+ * @param {any} paint
+ * @param {number} [now]
+ */
+export function subscriptionLostLine(account, paint, now = Date.now()) {
+  const lost = account?.subscriptionLost;
+  if (!lost) return null;
+  const since = parseTs(lost.since);
+  const when = since ? ` (since ${formatAgo(Math.min(since, now), now)})` : '';
+  const text = `its OAuth profile no longer shows the Claude ${safeLine(lost.plan, 16)} plan${when}`;
+  return `${paint.dim('Plan'.padEnd(8))} ${paint.yellow(text)} ${paint.gray('\u2014 renew the plan or disable the account')}`;
 }
 
 // Compact names for the "switch NN%" line below — short enough that several
@@ -483,6 +743,22 @@ export function egressProxyLine(account, paint) {
   const text = typeof r === 'string' ? r : describeRouting(r);
   if (!text) return null;
   return `${paint.dim('Egress'.padEnd(8))} ${paint.cyan(`via ${text}`)}`;
+}
+
+/**
+ * "Ends     2026-12-01 (in 6 days)" — the end time the operator set for the
+ * account (accounts[].endsAt), or null when it has none. Yellow while it is
+ * ahead, since that is when it moves traffic; gray once passed, when it is
+ * only a record.
+ * @param {any} account
+ * @param {number} now
+ * @param {any} paint
+ */
+export function endsAtLine(account, now, paint) {
+  const endsAt = account?.endsAt;
+  // The payload can come from another process: only a real instant is drawn.
+  if (typeof endsAt !== 'number' || !Number.isFinite(endsAt) || endsAt <= 0) return null;
+  return `${paint.dim('Ends'.padEnd(8))} ${(endsAt > now ? paint.yellow : paint.gray)(describeEndsAt(endsAt, now))}`;
 }
 
 function colors(enabled) {
@@ -668,28 +944,61 @@ function adaptiveFor(status, name) {
   return rows.find(r => r && typeof r === 'object' && nameText(r.name) === name) || null;
 }
 
+// The Codex quota windows a Codex account's adaptive score can come from. Codex
+// has no Claude family buckets, so its row names the window instead.
+const CODEX_WINDOW_LABELS = /** @type {Record<string, string>} */ ({ unified7d: 'weekly', unified5h: '5h' });
+
+// What an adaptive row says its score is measured against. A Codex row names its
+// own window ("codex weekly"); every other row names the Claude bucket, as it
+// always has. A row with no provider is an Anthropic one, from an older server.
+/** @param {any} a */
+function adaptiveLabel(a) {
+  if (a.provider !== 'codex') return bucketLabel(a.bucket);
+  return `codex ${CODEX_WINDOW_LABELS[a.window] || 'window'}`;
+}
+
+// The plan segment. A Codex account has no Claude multiplier, so its row names
+// the ChatGPT plan it reported, or says the plan is unknown when none was.
+/**
+ * @param {any} a
+ * @param {any} paint
+ */
+function adaptivePlan(a, paint) {
+  if (a.provider === 'codex') {
+    const plan = typeof a.planType === 'string' ? safeLine(a.planType, 32) : '';
+    return plan ? `plan ${plan}` : paint.dim('plan unknown');
+  }
+  return a.planWeight == null
+    ? paint.dim('plan unknown')
+    : `plan ${Number.isFinite(a.planWeight) ? a.planWeight : '?'}x`;
+}
+
 // "next · weight 62%  ·  3 sess / 1 inflight  ·  head 38.0% of 98%  ·  plan 20x
-//  ·  conc 6"
+//  ·  conc 6"; under scoring "pressure" the last three give way to "P 3.85e-6".
 //
 // `next` is the deterministic routing result. `weight` is the account's score
 // normalized across competitors, useful for explaining why it won without
 // misrepresenting the picker as a weighted random draw.
 function formatAdaptive(a, paint) {
   const parts = [];
-  const family = bucketLabel(a.bucket);
+  const family = adaptiveLabel(a);
   const prefix = a.next ? `${paint.green('next')} ${paint.dim('·')} ` : '';
   parts.push(a.weight == null
     // Every candidate scored zero: the whole tier is inside its reserve, so
     // there is no weight to report and saying "0%" everywhere would imply the
     // router had stopped, which it has not.
-    ? `${prefix}${paint.yellow(`weight n/a (all reserved, ${family})`)}`
+    ? `${prefix}${paint.yellow(`weight n/a (${a.scoring === 'pressure' ? 'all zero' : 'all reserved'}, ${family})`)}`
     : `${prefix}${paint.bold(`weight ${pct(a.weight, 0)} of ${family}`)}`);
   parts.push(`${num(a.sessions)} sess / ${num(a.inFlight)} inflight`);
-  parts.push(`head ${pct(a.headroom, 1)} of ${pct(a.threshold, 0)}`);
-  parts.push(a.planWeight == null
-    ? paint.dim('plan unknown')
-    : `plan ${Number.isFinite(a.planWeight) ? a.planWeight : '?'}x`);
-  parts.push(`conc ${num(a.concCap, 1)}`);
+  if (a.scoring === 'pressure') {
+    // The score is P over load: no head, plan weight or concurrency cap went into it.
+    parts.push(`P ${Number.isFinite(a.placementPressure) ? a.placementPressure.toExponential(2) : '?'}`);
+    if (Number.isFinite(a.fiveHourFactor)) parts.push(`5h room ${pct(a.fiveHourFactor, 0)}`);
+  } else {
+    parts.push(`head ${pct(a.headroom, 1)} of ${pct(a.threshold, 0)}`);
+    parts.push(adaptivePlan(a, paint));
+    parts.push(`conc ${num(a.concCap, 1)}`);
+  }
   const line = parts.join(paint.dim('  ·  '));
   return a.competing ? line : `${paint.dim('(not competing)')} ${line}`;
 }
@@ -697,6 +1006,7 @@ function formatAdaptive(a, paint) {
 function formatAccountStatus(account, now, paint) {
   const parts = [];
   if (account.disabled) parts.push(paint.gray('disabled'));
+  if (account.cordoned === true) parts.push(paint.yellow('cordoned'));
 
   const status = safeLine(account.status || 'unknown', 32) || 'unknown';
   const colored = status === 'active'

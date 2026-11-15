@@ -80,6 +80,36 @@ test('renderStatus shows an OAuth entitlement cooldown separately from account s
   assert.match(output, /active \/ entitlement cooldown 4m/);
 });
 
+test('renderStatus names an entitlement denial in upstream\'s words, with its count and start', () => {
+  const status = sampleStatus();
+  status.accounts[0].entitlementDenial = {
+    detail: 'OAuth authentication is currently not allowed for this organization.',
+    since: now - 2 * 3_600_000,
+    count: 3,
+  };
+  const output = renderStatus(status, { color: false, now });
+
+  assert.match(output, /Denied\s+OAuth authentication is currently not allowed for this organization\. \u2014 3 in a row, first 2h ago/);
+});
+
+test('renderStatus names an entitlement denial upstream gave no message for', () => {
+  const status = sampleStatus();
+  status.accounts[0].entitlementDenial = { detail: null, since: now - 60_000, count: 1 };
+  const output = renderStatus(status, { color: false, now });
+
+  assert.match(output, /Denied\s+OAuth entitlement denied \u2014 1m ago/);
+  assert.doesNotMatch(output, /null/);
+});
+
+test('renderStatus does not trust an entitlement denial count off the wire', () => {
+  for (const count of ['2\n', { valueOf: 1, toString: 1 }]) {
+    const status = sampleStatus();
+    status.accounts[0].entitlementDenial = { detail: 'denied', since: now - 60_000, count };
+    const output = renderStatus(status, { color: false, now });
+    assert.match(output, /Denied\s+denied \u2014 1m ago\n/);
+  }
+});
+
 test('renderStatus describes a timezone-aware reset warm-up schedule', () => {
   const status = sampleStatus();
   status.warm = {
@@ -571,6 +601,50 @@ test('adaptive diagnostics name the next target, score weight, and family split'
   assert.match(out, /plan 20x/);
 });
 
+// The Adaptive line of the account named `a`, as the status readout prints it.
+function adaptiveLine(out) {
+  const line = out.split('\n').find(l => /^ {2}Adaptive /.test(l));
+  assert.ok(line, 'an Adaptive row is rendered');
+  return line;
+}
+
+// A Codex account is scored on its own Codex weekly window. "opus+" names the
+// shared Claude bucket, so a Codex row must never carry that label.
+const codexRow = (extra = {}) => ({
+  name: 'a', provider: 'codex', bucket: 'unified7d', window: 'unified7d', competing: true,
+  next: true, weight: 0.95, sessions: 0, inFlight: 0, headroom: 0.95, threshold: 1,
+  planWeight: null, concCap: 6, planType: null, ...extra,
+});
+
+test('a Codex adaptive row names its own window, not the Claude opus+ bucket', () => {
+  const s = distributedStatus('adaptive');
+  s.adaptive = [codexRow()];
+  const line = adaptiveLine(renderStatus(s, { color: false, now }));
+  assert.match(line, /weight 95% of codex weekly/);
+  assert.doesNotMatch(line, /opus\+/);
+  assert.match(line, /plan unknown/, 'no plan name stated, so the row says so');
+});
+
+test('a Codex adaptive row shows the ChatGPT plan name, with no numeric weight', () => {
+  const s = distributedStatus('adaptive');
+  s.adaptive = [codexRow({ planType: 'pro' })];
+  const line = adaptiveLine(renderStatus(s, { color: false, now }));
+  assert.match(line, /plan pro {2}·  conc 6\.0$/);
+  assert.doesNotMatch(line, /plan unknown|plan \d+x/);
+});
+
+test('an Anthropic adaptive row renders byte-for-byte as before the Codex label', () => {
+  // Captured from the renderer before rows carried a provider. A row with no
+  // provider, and one stating `anthropic`, must both print this exact line.
+  const expected = '  Adaptive next · weight 36% of opus+  ·  3 sess / 3 inflight  ·  head 36.0% of 98%  ·  plan 20x  ·  conc 6.0';
+  const base = { name: 'a', bucket: 'unified7d', window: 'unified7d', competing: true, next: true, weight: 0.36, sessions: 3, inFlight: 3, headroom: 0.36, threshold: 0.98, planWeight: 20, concCap: 6 };
+  for (const row of [base, { ...base, provider: 'anthropic' }]) {
+    const s = distributedStatus('adaptive');
+    s.adaptive = [row];
+    assert.equal(adaptiveLine(renderStatus(s, { color: false, now })), expected);
+  }
+});
+
 // The adaptive rows come off the wire like everything else. An older server
 // omits fields and a hostile one sends strings where numbers belong; neither
 // may throw inside `teamclaude status` or reach the terminal unstripped.
@@ -685,4 +759,17 @@ test('the dashboard card draws its Weekly row by the same rule', () => {
   const quota = { unified5h: 0.3, unified7d: null, weeklyWindowStated: false };
   assert.equal(accountMeters({ provider: 'anthropic', quota }).slots[2], null);
   assert.ok(accountMeters({ provider: 'anthropic', quota: { ...quota, weeklyWindowStated: true } }).slots[2]);
+});
+
+
+test('an API-key account with prepaid credit gets a credit column beside its tokens', () => {
+  const credit = { usedFraction: 0.25, cycleEnd: '2026-08-01T00:00:00.000Z', remainingMinor: 7500, amountMinor: 10000, currency: 'USD' };
+  const quota = { tokensLimit: 1000, tokensRemaining: 600 };
+  const m = accountMeters({ provider: 'anthropic', type: 'apikey', quota, credit });
+  assert.equal(m.slots[0].label, 'Tokens');
+  assert.equal(m.slots[1].label, 'Prepaid credit');
+  assert.equal(m.slots[1].used, 0.25);
+  assert.equal(accountMeters({ provider: 'anthropic', type: 'apikey', quota }).slots[1], null, 'no credit configured, no column');
+  // A key kept disabled for pinned jobs has no rate-limit reading; the credit still shows.
+  assert.equal(accountMeters({ provider: 'anthropic', type: 'apikey', quota: {}, credit }).slots[0].label, 'Prepaid credit');
 });

@@ -182,3 +182,121 @@ test('addAccount initializes storm-control fields so a runtime-added account can
   am.release(idx);
   assert.equal(acct.inFlight, 0, 'release frees the slot on a runtime-added account');
 });
+
+// ── stormRamp values the ramp cannot pace by ─────────────────────────────────
+// `stormRamp` comes from the config file as written. A value nothing refused
+// used to misbehave quietly: a quoted number concatenated, a 0 stalled or spun.
+
+/** Construct with console.log captured; returns the manager and the lines. */
+function withRamp(ramp) {
+  const lines = [];
+  const original = console.log;
+  console.log = (...a) => { lines.push(a.join(' ')); };
+  try {
+    return { am: new AccountManager([oauth('a')], 0.98, ramp === undefined ? {} : { ramp }), lines };
+  } finally {
+    console.log = original;
+  }
+}
+const DEFAULT_RAMP = { enabled: true, startConc: 1, stepConc: 1, stepMs: 250, windowMs: 30_000, pollMs: 50 };
+
+test('a stormRamp value the ramp cannot use falls back to its default, with one line naming it', () => {
+  const { am, lines } = withRamp({
+    startConc: '1', stepConc: 0, stepMs: -250, windowMs: JSON.parse('1e999'), pollMs: null, enabled: 'false', startconc: 2,
+  });
+  assert.deepEqual(am.ramp, DEFAULT_RAMP);
+  assert.equal(lines.length, 1, lines.join('\n'));
+  for (const named of ['startConc "1"', 'stepConc 0', 'stepMs -250', 'windowMs Infinity', 'pollMs null', 'enabled "false" is not true or false, so it is read as true', 'startconc (not a setting)']) {
+    assert.ok(lines[0].includes(named), `${named} in: ${lines[0]}`);
+  }
+});
+
+test('usable stormRamp values are kept as written, and no line is logged', () => {
+  const set = { enabled: false, startConc: 0.5, stepConc: 2, stepMs: 100, windowMs: 1000, pollMs: 5 };
+  const { am, lines } = withRamp(set);
+  assert.deepEqual(am.ramp, set);
+  assert.deepEqual(withRamp(undefined).am.ramp, DEFAULT_RAMP, 'no stormRamp: the defaults');
+  assert.deepEqual(withRamp(null).am.ramp, DEFAULT_RAMP, 'null: the defaults');
+  assert.deepEqual(lines, []);
+  assert.deepEqual(withRamp(undefined).lines, [], 'nothing configured, nothing said');
+});
+
+test('a stormRamp that is not an object is reported, and storm control keeps its defaults', () => {
+  for (const bad of [false, 'off', [1, 2]]) {
+    const { am, lines } = withRamp(bad);
+    assert.deepEqual(am.ramp, DEFAULT_RAMP, JSON.stringify(bad));
+    assert.equal(lines.length, 1, `${JSON.stringify(bad)}: ${lines.join('\n')}`);
+    assert.match(lines[0], /stormRamp: ignoring .* it must be an object/);
+  }
+});
+
+test('a quoted startConc does not loosen the ramp: one request at the instant of a switch', async () => {
+  const { am } = withRamp({ startConc: '1', stepMs: 10_000, pollMs: 5 });
+  const acct = am.accounts[0];
+  am._beginRamp(acct);
+  assert.equal(am._rampCap(acct, acct.rampStartedAt), 1);
+  let admitted = 0;
+  let gone = false;
+  const waits = Array.from({ length: 5 }, () => am.admit(0, () => gone).then(ok => { if (ok) admitted++; }));
+  // The slot that is free is taken without a timer; the other four are polling.
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(admitted, 1, 'the cap is 1 at the switch, not "10"');
+  gone = true;
+  await Promise.all(waits);
+});
+
+test('a startConc and stepConc of 0 do not hold an idle account\'s first request for the window', async () => {
+  const { am } = withRamp({ startConc: 0, stepConc: 0, windowMs: 2000, pollMs: 5 });
+  const acct = am.accounts[0];
+  am._beginRamp(acct);
+  // A cap of 0 that cannot grow would park the request until the window ran
+  // out; the cap is what says it will not, whatever the clock does.
+  assert.equal(am._rampCap(acct, acct.rampStartedAt), 1);
+  assert.equal(await am.admit(0), true);
+});
+
+test('a window of 1e999 with a cap that cannot grow does not hold an idle account for good', async () => {
+  const { am } = withRamp({ startConc: 0, stepConc: 0, windowMs: JSON.parse('1e999'), pollMs: 5 });
+  const acct = am.accounts[0];
+  am._beginRamp(acct);
+  assert.equal(am.ramp.windowMs, 30_000, 'a window that never ends is not kept');
+  assert.equal(am._rampCap(acct, acct.rampStartedAt), 1);
+  assert.equal(await am.admit(0), true);
+});
+
+// A value that is not a number is named as it was written in the config.
+test('a stormRamp value that is an array or an object is named as written', () => {
+  const { lines } = withRamp({ startConc: [1], stepConc: ['2'], stepMs: {} });
+  assert.equal(lines.length, 1);
+  for (const named of ['startConc [1]', 'stepConc ["2"]', 'stepMs {}']) assert.ok(lines[0].includes(named), `${named} in: ${lines[0]}`);
+  assert.match(withRamp([]).lines[0], /stormRamp: ignoring \[\] — it must be an object/);
+});
+
+// A timer waits whole milliseconds, never less than 1, and holds no more than
+// 2147483647 (admit() waits pollMs * 4 during a pause).
+test('a pollMs a timer cannot keep falls back to its default, with a line naming it', () => {
+  for (const pollMs of [0.001, 1, 4, 2.5, 7.5, 536_870_912, 3e9]) {
+    const { am, lines } = withRamp({ pollMs });
+    assert.equal(am.ramp.pollMs, 50, String(pollMs));
+    assert.equal(lines.length, 1, String(pollMs));
+    assert.ok(lines[0].includes(`pollMs ${pollMs}`), lines[0]);
+  }
+  for (const pollMs of [5, 536_870_911]) {
+    const { am, lines } = withRamp({ pollMs });
+    assert.equal(am.ramp.pollMs, pollMs);
+    assert.deepEqual(lines, []);
+  }
+});
+
+// `enabled` was read for its truth before it was checked, so a 0, a null or an
+// empty string turned storm control off; they still do, and say so.
+test('an enabled of 0, null or "" keeps storm control off, as it always did, and is named', () => {
+  for (const enabled of [0, null, '']) {
+    const { am, lines } = withRamp({ enabled });
+    assert.equal(am.ramp.enabled, false, JSON.stringify(enabled));
+    am._beginRamp(am.accounts[0]);
+    assert.equal(am._rampCap(am.accounts[0]), Infinity, 'no ramp');
+    assert.equal(lines.length, 1, JSON.stringify(enabled));
+    assert.ok(lines[0].includes(`enabled ${enabled === '' ? '""' : enabled} is not true or false, so it is read as false`), lines[0]);
+  }
+});

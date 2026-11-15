@@ -11,7 +11,7 @@
 // true pressure: it can only turn out to be worth more, never less, so it can
 // never be preferred over a measured account on a number nobody reported. Not a
 // tuning constant, but the definition of the window.
-const WEEKLY_WINDOW_SECONDS = 7 * 24 * 3600;
+export const WEEKLY_WINDOW_SECONDS = 7 * 24 * 3600;
 
 /**
  * Why an account has no comparable pressure. Each names an upstream state

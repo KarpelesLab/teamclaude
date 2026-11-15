@@ -23,7 +23,9 @@
 // so on export and offers --disable-source; the import side never refreshes,
 // fetches a profile or touches callback.net, so importing spends nothing and
 // rotates nothing. A token this machine already holds is replaced only by a
-// newer one (later `expiresAt`, the rule credential-sync.js uses too).
+// newer one (later `expiresAt`, the rule credential-sync.js uses too). The
+// refresh token's own expiry goes wherever that token goes: a new refresh
+// token brings its own date or none, and the same one keeps the earlier date.
 
 import { scrypt, randomBytes, createCipheriv, createDecipheriv } from 'node:crypto';
 import { open, rename, unlink } from 'node:fs/promises';
@@ -32,6 +34,7 @@ import { importCredentials } from './oauth.js';
 import { importCodexCredentials, DEFAULT_CODEX_CREDENTIALS_PATH } from './codex-auth.js';
 import { providerOf } from './provider.js';
 import { accountLimitReached } from './account-limit.js';
+import { setRefreshTokenExpiry, expiryAfterReplacement } from './refresh-token-expiry.js';
 
 export const BUNDLE_FORMAT = 'teamrouter-accounts';
 export const BUNDLE_VERSION = 1;
@@ -57,6 +60,8 @@ const isPlainObject = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
 const isNumberOrTable = (v) => isNumber(v) || (isPlainObject(v) && Object.values(v).every(isNumber));
 /** @param {any} v */
 const isStringList = (v) => Array.isArray(v) && v.every(isString);
+/** An epoch time or a date string (`endsAt`, read by parseEndsAt). @param {any} v */
+const isTime = (v) => isNumber(v) || isString(v);
 /** @param {any} v */
 const isStringMap = (v) => isPlainObject(v) && Object.values(v).every(isString);
 
@@ -71,13 +76,13 @@ const isStringMap = (v) => isPlainObject(v) && Object.values(v).every(isString);
  */
 const PORTABLE = {
   name: isString, type: isString, provider: isString, upstream: isString,
-  accessToken: isString, refreshToken: isString, expiresAt: isNumber, apiKey: isString,
+  accessToken: isString, refreshToken: isString, expiresAt: isNumber, refreshTokenExpiresAt: isNumber, apiKey: isString,
   accountUuid: isString, orgUuid: isString, orgName: isString, email: isString,
   accountId: isString, userId: isString, organizationType: isString,
   rateLimitTier: isString, seatTier: isString, hasClaudeMax: isBool, hasClaudePro: isBool,
-  priority: isNumber, disabled: isBool, displayOrder: isNumber,
+  priority: isNumber, disabled: isBool, cordoned: isBool, displayOrder: isNumber, endsAt: isTime,
   switchThreshold: isNumberOrTable, maxUsage: isNumberOrTable, maxSpend: isNumber,
-  allowExtraUsage: isBool, autoRedeemReset: isBool, messageThreads: isBool,
+  credit: isPlainObject, allowExtraUsage: isBool, autoRedeemReset: isBool, messageThreads: isBool,
   modelMap: isStringMap, models: isStringList, stripRequestFields: isStringList,
 };
 
@@ -140,6 +145,7 @@ export async function collectExportAccounts(accounts, { readClaude = importCrede
         const creds = isCodex ? await readCodex(from) : await readClaude(from);
         if (!creds?.accessToken) throw new Error(`no token in ${from}`);
         for (const [k, v] of Object.entries(portableFields(creds))) entry[k] = v;
+        setRefreshTokenExpiry(entry, /** @type {Record<string, any>} */ (creds).refreshTokenExpiresAt);
         fileBacked.push(acct.name);
       } catch (/** @type {any} */ err) {
         skipped.push({ name: acct.name, reason: `could not read ${from}: ${err?.message || err}` });
@@ -436,7 +442,7 @@ export function mergeImportedAccounts(config, incoming, { force = false } = {}) 
     /** @type {Record<string, any>} */
     const fields = {};
     for (const k of [...CREDENTIAL_FIELDS, ...IDENTITY_FIELDS]) if (acct[k] !== undefined) fields[k] = acct[k];
-    config.accounts[idx] = updateAccountEntry(prev, fields);
+    config.accounts[idx] = setRefreshTokenExpiry(updateAccountEntry(prev, fields), expiryAfterReplacement(prev, acct));
     updated.push(prev.name);
   }
   return { added, updated, skipped };

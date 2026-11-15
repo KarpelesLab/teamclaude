@@ -204,6 +204,31 @@ test('a pinned conversation is not moved by a weekly rollover', () => {
   assert.equal(am.getActiveAccount(null, OPUS, null, 'sess-1').name, first.name);
 });
 
+test('a cordoned pin stays put when a higher-priority account becomes available', () => {
+  const am = mgr([oauth('a', { priority: 1 }), oauth('b', { priority: 1 })]);
+  session(am, 0, 0.70, 180); weekly(am, 0, 0.30);
+  session(am, 1, 0.20, 180); weekly(am, 1, 0.30);
+  const first = am.getActiveAccount(null, OPUS, null, 'sess-1');
+  assert.equal(first.name, 'a');
+  am.recordSession('sess-1', first.index, OPUS);
+  am.setCordoned(0, true);
+  am.accounts[1].priority = 0;
+  assert.equal(am.getActiveAccount(null, OPUS, null, 'sess-1').name, 'a');
+  assert.equal(am.getActiveAccount(null, OPUS, null, 'sess-2').name, 'b');
+});
+
+test('a cordoned pin is not moved by a weekly rollover', () => {
+  const am = mgr(['a', 'b'], { expiryRouting: { enabled: true, preempt: true } });
+  session(am, 0, 0.20, 180); weekly(am, 0, 0.60, 2);
+  session(am, 1, 0.20, 180); weekly(am, 1, 0.30, 100);
+  const first = am.getActiveAccount(null, OPUS, null, 'sess-1');
+  am.recordSession('sess-1', first.index, OPUS);
+  assert.equal(am.getActiveAccount(null, OPUS, null, 'sess-1').name, first.name);
+  am.setCordoned(first.index, true);
+  weekly(am, first.index, 0.01, 168);
+  assert.equal(am.getActiveAccount(null, OPUS, null, 'sess-1').name, first.name);
+});
+
 test('the pin breaks when the account is out of usage, re-pins, and never moves back', () => {
   const am = mgr(['a', 'b']);
   session(am, 0, 0.70, 180); weekly(am, 0, 0.30);
