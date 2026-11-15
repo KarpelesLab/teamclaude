@@ -5105,6 +5105,45 @@ export class AccountManager {
   }
 
   /**
+   * The readings that hold `account` out of rotation for `model`, when the
+   * switch threshold on a WEEKLY reading is what holds it. Null when it is
+   * serving, when something other than the threshold bars it (disabled, a cap,
+   * a hold, an error: whatever unavailableReason reports ahead of `quota`), or
+   * when only its 5-hour, token or request reading is over.
+   *
+   * For the reset redeemer (#685): selection stops using an account at its
+   * threshold, so a busy fleet parks every account just short of upstream's own
+   * limit, and upstream never reports the wall the redeemer was waiting for.
+   * This is the comparison _nearQuotaBucket makes — the family bucket and the
+   * shared weekly, each against the threshold of the bucket that governs the
+   * model — but it names every reading that is over rather than the first,
+   * because a reset has to clear all of them to return the account to service.
+   * A 5-hour reading that is over as well is listed last; a learned scoped
+   * bucket is listed as `scopedWeekly`.
+   *
+   * @param {Record<string, any>} account
+   * @param {string|null} [model]
+   * @returns {string[]|null}
+   */
+  weeklyParkedBuckets(account, model = null) {
+    if (this.unavailableReason(account, model) !== 'quota') return null;
+    const q = account.quota;
+    const key = this._weeklyBucketFor(model);
+    const threshold = this.thresholdFor(key, account);
+    const over = (/** @type {unknown} */ v) => typeof v === 'number' && v >= threshold;
+    /** @type {string[]} */
+    const buckets = [];
+    if (over(q.unified7d)) buckets.push('unified7d');
+    // As in _governingWeekly: a dedicated family bucket gates beside the shared
+    // weekly; without one, a learned scoped bucket for the family does.
+    if (key !== 'unified7d') { if (over(q[key])) buckets.push(key); }
+    else if (over(this._scopedWeekly(account, model)?.utilization)) buckets.push('scopedWeekly');
+    if (!buckets.length) return null;
+    if (q.unified5h != null && q.unified5h >= this.thresholdFor('unified5h', account)) buckets.push('unified5h');
+    return buckets;
+  }
+
+  /**
    * One bucket's utilization as a rounded percent, or null when unknown —
    * the number a log line names next to the bucket _isNearQuota returned.
    * The weekly case re-reads the governing value (the tighter of a family

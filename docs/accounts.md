@@ -676,12 +676,35 @@ selected again against the account it cleared.
 
 - It spends on the account that would otherwise wait longest for its own
   windows to reset, since that is where a reset buys the most.
-- Only on an account upstream itself reports **at** a limit, and only when a
-  **weekly** limit (the all-models week or a model family's) is among them — a
-  5-hour wall lifts on its own and is never worth a grant — and only when the
-  grant clears every limit the account is at, since a reset that would leave it
-  blocked buys the request nothing. While upstream reports a reset cooldown,
-  nothing is claimed.
+- It fires when the pool is dry and the account is in one of two states:
+  upstream itself reports it **at** a limit, or the proxy is holding it out of
+  rotation because a **weekly** reading is at or past the
+  [`switchThreshold`](configuration.md) that applies to it (the fleet's, a
+  per-bucket one, or the account's own). The second state matters on a busy
+  fleet: rotation stops using an account at its threshold, so every account
+  parks a little short of upstream's limit and upstream never reports a wall.
+  The account's quota is re-read first, and the threshold is judged on that
+  reading.
+- **What the second state gives up:** the reset is spent while the account
+  still has the last part of its week below upstream's limit — 2% at the
+  default threshold of `0.98`, more with a lower one. That remainder goes with
+  the reset. Rotation was not going to use it either while the threshold stood.
+- Either way a **weekly** limit (the all-models week or a model family's) has
+  to be what bars the account — a 5-hour wall lifts on its own and is never
+  worth a grant, so an account parked only by its 5-hour window is passed over
+  — and the grant has to clear every limit the account is at, since a reset
+  that would leave it blocked buys the request nothing. For a parked account
+  those limits are the ones behind the readings that parked it for the
+  refused request's model: the all-models weekly (`seven_day`), the Fable
+  weekly (`seven_day_overage_included`), and the 5-hour window too if that is
+  over its threshold as well. An account parked on a reading with no known
+  upstream limit name (the Sonnet weekly, a learned scoped bucket) is passed
+  over, as is one out for any other reason (disabled, cordoned, capped by
+  `maxUsage` or `maxSpend`, throttled, in error). While upstream reports a
+  reset cooldown, nothing is claimed.
+- An account that holds a usable reset and is passed over is named in the
+  log with the reason (`Account "x": banked reset not redeemed: …`), once per
+  account per cooldown (30 minutes) rather than once per refused request.
 - Among usable, unpaused, unexpired grants that clear every exhausted limit,
   it spends the cheapest kind: **Fable**, then **session**, then **weekly**.
   Within the same kind it spends the soonest-expiring grant (no expiry comes

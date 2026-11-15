@@ -16,6 +16,9 @@
 //    a successful fresh read that removes or blocks a grant is authoritative.
 //  - Spending names any usable grant; auto-redeem picks the cheapest kind that
 //    clears every exhausted limit, then the soonest expiry and `next_grant_id`.
+//    "Exhausted" is what upstream reports at its own limit, or — for an account
+//    the proxy parked at its weekly switch threshold before upstream's limit
+//    was ever reached (#685) — the limits behind the readings that parked it.
 //    The endpoint is organization-scoped
 //    (POST /api/organizations/<orgUuid>/reset_rate_limits), and the body is
 //    `{ program: "cedar_ember", grant_id, request_id }`.
@@ -51,6 +54,15 @@ const DECLINED_COOLDOWN_MS = 30 * 60 * 1000;
 // After an account turned out to hold nothing usable.
 const NOTHING_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 export const CLAUDE_REDEEM_BUDGET_MS = 15_000;
+
+// The upstream limit behind each quota reading, in the names a grant's `clears`
+// uses, where a live redemption has shown it: #677 measured a grant that
+// clears `seven_day_overage_included` taking the Fable weekly from 100% to 0
+// while `seven_day` was not cleared. A reading with no entry here (the Sonnet
+// weekly, a learned scoped bucket) has no established name, so no grant can be
+// shown to clear it and none is spent for it.
+/** @type {Record<string, string>} */
+const LIMIT_FOR_BUCKET = { unified5h: 'five_hour', unified7d: 'seven_day', unified7dFable: 'seven_day_overage_included' };
 
 /** @param {Record<string, any>} account */
 function headers(account) {
@@ -317,21 +329,28 @@ export class ClaudeResetRedeemer {
    * switch as the Codex redeemer (`autoRedeemResets`), read off the shared
    * config per refusal so a toggle applies at once.
    *
+   * `model` is the refused request's: it decides which weekly bucket governs,
+   * and so whether the switch threshold is what parked an account.
+   *
    * @param {Record<string, any>[]} accounts
+   * @param {{ model?: string|null }} [opts]
    * @returns {Promise<ClaudeRedeemResult>}
    */
-  async maybeRedeemForPool(accounts) {
+  async maybeRedeemForPool(accounts, { model = null } = {}) {
     if (this.config?.autoRedeemResets !== true) return { redeemed: false, reason: 'auto-redeem is switched off' };
     if (!accounts?.length) return { redeemed: false, reason: 'no candidate accounts' };
     if (this.manualInFlight) return { redeemed: false, reason: 'a manual reset is in progress' };
     if (this.inFlight) return this.inFlight;
-    const attempt = this._attempt(accounts).finally(() => { this.inFlight = null; });
+    const attempt = this._attempt(accounts, model).finally(() => { this.inFlight = null; });
     this.inFlight = attempt;
     return attempt;
   }
 
-  /** @param {Record<string, any>[]} accounts */
-  async _attempt(accounts) {
+  /**
+   * @param {Record<string, any>[]} accounts
+   * @param {string|null} model
+   */
+  async _attempt(accounts, model) {
     const now = this.now();
     if (now < this.fleetHoldUntil) return { redeemed: false, reason: 'holding off after a recent Claude reset attempt' };
     const deadline = now + this.timeoutMs;
@@ -344,7 +363,7 @@ export class ClaudeResetRedeemer {
     let reason = 'no Claude account holds a usable reset';
     for (const account of candidates) {
       if (this.now() >= deadline) { reason = 'ran out of the redeem budget'; break; }
-      const r = await this._redeem(account, deadline);
+      const r = await this._redeem(account, deadline, model);
       if (r.redeemed) return r;
       reason = r.reason;
       if (this.now() < this.fleetHoldUntil) break;
@@ -353,11 +372,53 @@ export class ClaudeResetRedeemer {
   }
 
   /**
+   * Pass over an account that holds a usable reset, and say so. The cooldown
+   * set here is also what rate-limits the line: the walk skips the account
+   * until it ends, so a dry pool being polled logs one line per account per
+   * cooldown, not one per refusal.
+   *
+   * @param {Record<string, any>} account
+   * @param {number} until  when this account may be asked again
+   * @param {string} reason
+   * @returns {ClaudeRedeemResult}
+   */
+  _decline(account, until, reason) {
+    const name = safeLine(account.name, 64);
+    this._stateFor(account).cooldownUntil = until;
+    this.log(`[TeamClaude] Account "${name}": banked reset not redeemed: ${safeLine(reason, 160)}`);
+    return { redeemed: false, account: name, reason };
+  }
+
+  /**
+   * The upstream limits a reset must clear on an account the proxy itself holds
+   * out of rotation at its weekly switch threshold, though upstream does not
+   * report it at a limit. The manager decides whether it is parked and by which
+   * readings, with the thresholds that apply to this account and model. Null
+   * when it is not parked on a weekly reading (below its threshold, parked by
+   * the 5-hour window alone, or barred for another reason); `unknown` names a
+   * parking reading no grant can be shown to clear.
+   *
+   * @param {Record<string, any>} account
+   * @param {string|null} model
+   * @returns {{ limits: string[], unknown: string|null }|null}
+   */
+  _parkedLimits(account, model) {
+    /** @type {string[]|null|undefined} */
+    const buckets = this.am.weeklyParkedBuckets?.(account, model);
+    if (!buckets?.length) return null;
+    return {
+      limits: buckets.flatMap(b => LIMIT_FOR_BUCKET[b] ?? []),
+      unknown: buckets.find(b => !LIMIT_FOR_BUCKET[b]) ?? null,
+    };
+  }
+
+  /**
    * @param {Record<string, any>} account
    * @param {number} deadline
+   * @param {string|null} [model]
    * @returns {Promise<ClaudeRedeemResult>}
    */
-  async _redeem(account, deadline) {
+  async _redeem(account, deadline, model = null) {
     const name = safeLine(account.name, 64);
     const state = this._stateFor(account);
     const now = this.now();
@@ -375,37 +436,49 @@ export class ClaudeResetRedeemer {
       state.cooldownUntil = now + NOTHING_COOLDOWN_MS;
       return { redeemed: false, account: name, reason: `not eligible for resets${status?.ineligibleReason ? ` (${status.ineligibleReason})` : ''}` };
     }
-    const grant = chooseAutoGrant(status, now);
-    if (!grant && !status.grants.some((/** @type {ResetGrant} */ g) => usableGrant(g, now))) {
+    if (!status.grants.some((/** @type {ResetGrant} */ g) => usableGrant(g, now))) {
       state.cooldownUntil = now + NOTHING_COOLDOWN_MS;
       return { redeemed: false, account: name, reason: 'holds no usable reset' };
     }
-    {
-      if (!status.atLimit || !status.exhausted.length) {
-        state.cooldownUntil = now + DECLINED_COOLDOWN_MS;
-        return { redeemed: false, account: name, reason: 'not at a usage limit' };
+    // What a grant has to clear, and the grants that may be spent on it.
+    /** @type {ResetStatus} */
+    let wall = status;
+    if (!status.atLimit || !status.exhausted.length) {
+      // Upstream reports no wall. Selection stops using an account at its
+      // switch threshold, so a busy fleet never reaches one: every account
+      // parks a little short, and the pool is dry with resets banked (#685).
+      // Upstream accepts a claim there, so an account parked by a WEEKLY
+      // threshold counts as walled by the limits behind that reading. The
+      // status read carries the account's quota as of now, so the manager
+      // judges on that and not on a reading that may have gone stale.
+      if (read.usage && !read.usage.error) this.am.applyUsageData?.(account.index, read.usage);
+      const parked = this._parkedLimits(account, model);
+      if (!parked) return this._decline(account, now + DECLINED_COOLDOWN_MS, 'not at a usage limit, nor held out of rotation by its weekly switch threshold');
+      if (parked.unknown) return this._decline(account, now + DECLINED_COOLDOWN_MS, `no reset is known to clear its ${parked.unknown} reading`);
+      // A grant that says it needs the limit reached would answer `not_limited`.
+      const grants = status.grants.filter((/** @type {ResetGrant} */ g) => g.useRequiresLimit !== true);
+      if (!grants.some((/** @type {ResetGrant} */ g) => usableGrant(g, now))) {
+        return this._decline(account, now + DECLINED_COOLDOWN_MS, 'its reset can only be used at the upstream limit');
       }
+      wall = { ...status, grants, exhausted: [...new Set([...parked.limits, ...status.exhausted])] };
+    } else if (!status.exhausted.some((/** @type {string} */ limit) => limit.startsWith('seven_day'))) {
       // A grant is scarce and a 5-hour wall lifts on its own within hours: spend
       // one only where a weekly limit (the all-models week or a family's,
       // `seven_day*`) is what turns the account away.
-      if (!status.exhausted.some((/** @type {string} */ limit) => limit.startsWith('seven_day'))) {
-        state.cooldownUntil = now + DECLINED_COOLDOWN_MS;
-        return { redeemed: false, account: name, reason: 'no weekly limit is exhausted' };
-      }
-      // Spent on an account it would not return to service, a reset buys this
-      // request nothing — and the grant is gone.
-      if (!grant) {
-        // No usable grant covers the whole wall. Name the limits none clears,
-        // or the whole wall when separate grants only cover parts of it.
-        const uncovered = status.exhausted.filter((/** @type {string} */ limit) => !status.grants.some((/** @type {ResetGrant} */ g) => usableGrant(g, now) && g.clears.includes(limit)));
-        state.cooldownUntil = now + DECLINED_COOLDOWN_MS;
-        return { redeemed: false, account: name, reason: `its reset does not clear ${(uncovered.length ? uncovered : status.exhausted).join(', ')}` };
-      }
+      return this._decline(account, now + DECLINED_COOLDOWN_MS, 'no weekly limit is exhausted');
+    }
+    // Spent on an account it would not return to service, a reset buys this
+    // request nothing — and the grant is gone.
+    const grant = chooseAutoGrant(wall, now);
+    if (!grant) {
+      // No usable grant covers the whole wall. Name the limits none clears,
+      // or the whole wall when separate grants only cover parts of it.
+      const uncovered = wall.exhausted.filter((/** @type {string} */ limit) => !wall.grants.some((/** @type {ResetGrant} */ g) => usableGrant(g, now) && g.clears.includes(limit)));
+      return this._decline(account, now + DECLINED_COOLDOWN_MS, `its reset does not clear ${(uncovered.length ? uncovered : wall.exhausted).join(', ')}`);
     }
     // Upstream already says a claim now would answer `cooldown`: save the POST.
     if (status.cooldownUntil != null && status.cooldownUntil > now) {
-      state.cooldownUntil = status.cooldownUntil;
-      return { redeemed: false, account: name, reason: 'upstream reports a reset cooldown' };
+      return this._decline(account, status.cooldownUntil, 'upstream reports a reset cooldown');
     }
     return this.redeemGrant(account, grant.id, { deadline, kind: claudeGrantKind(grant) });
   }
