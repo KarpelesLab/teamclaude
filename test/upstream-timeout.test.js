@@ -388,6 +388,24 @@ test('a held answer that goes quiet is cut at its idle deadline, as a quiet stre
   });
 });
 
+// The same hold under a head deadline longer than the body-idle one, 600 ms
+// against 300, set as above once the upstream has the request. The upstream
+// never speaks again, so only the hold's deadline can end the request, and the
+// line names the one that did: the head deadline, which a hold timed by the
+// body-idle deadline alone (as the two passthroughs' are) never waits for.
+test('a forwarded answer held whole waits out a head deadline longer than the body-idle one', async (t) => {
+  const HEAD = 'TEAMCLAUDE_UPSTREAM_HEADERS_TIMEOUT_MS';
+  await withEnv({ TEAMCLAUDE_UPSTREAM_BODY_TIMEOUT_MS: 300, [HEAD]: null }, async () => {
+    const { port, errors } = await quietProxy(t, quietUpstream(() => { process.env[HEAD] = '600'; }), (upstreamPort) => ({
+      accounts: [{ name: 'backend', type: 'apikey', apiKey: 'k1', upstream: `http://127.0.0.1:${upstreamPort}` }],
+      upstream: 'http://127.0.0.1:9',
+    }));
+    const got = await postQuiet(port, '/v1/messages');
+    assert.equal(got.ended, false, 'the connection closed, with no clean end');
+    assert.ok(errors.some(l => /Upstream error \(account "backend"\).*idle for 600ms/.test(l)), `the head deadline is what ended it: ${errors.join(' | ')}`);
+  });
+});
+
 test('the token-refresh passthrough answers 502 when its upstream goes quiet', async (t) => {
   await withEnv({ TEAMCLAUDE_UPSTREAM_BODY_TIMEOUT_MS: 300 }, async () => {
     const { port, errors } = await quietProxy(t, quietUpstream(), (upstreamPort) => ({
