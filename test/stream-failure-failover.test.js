@@ -90,9 +90,17 @@ async function withFleet(names, handler, fn, { provider = 'codex' } = {}) {
   const upstreamPort = await listen(upstream);
   const make = provider === 'codex' ? codexAccount : claudeAccount;
   const am = new AccountManager(names.map(n => make(n, upstreamPort)), 0.98);
+  // `ended()` resolves once the proxy has finished the next request: endSession
+  // runs in the listener's finally, after all of forwardRequest's bookkeeping
+  // (which outlives the client's last byte). Ask for it before sending, and
+  // await it before reading what the request left behind.
+  let onEnd = () => {};
+  const endSession = am.endSession.bind(am);
+  am.endSession = (key, ok) => { const v = endSession(key, ok); onEnd(); return v; };
+  const ended = () => new Promise(resolve => { onEnd = () => resolve(undefined); });
   const proxy = createProxyServer(am, { proxy: {} });
   const proxyPort = await listen(proxy);
-  try { await fn({ am, proxyPort, seen }); } finally { proxy.close(); upstream.close(); }
+  try { await fn({ am, proxyPort, seen, ended }); } finally { proxy.close(); upstream.close(); }
 }
 
 async function codexPost(port) {
@@ -412,15 +420,16 @@ for (const [names, answer, kept] of [
       sseHead(res);
       if (acct === 'one' && answer === 'refused') return res.end(sse(OVERLOADED_ERROR));
       res.end(sse(MESSAGE_START, TEXT_DELTA, MESSAGE_STOP));
-    }, async ({ am, proxyPort, seen }) => {
+    }, async ({ am, proxyPort, seen, ended }) => {
       am.markEntitlementDenied(0, { seconds: 600 });
+      const done = ended();
       const res = await fetch(`http://127.0.0.1:${proxyPort}/tc-acct/${encodeURIComponent('claude:one')}/v1/messages`, {
         method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ model: 'claude-x', messages: [], stream: true }),
       });
       assert.equal(res.status, 200);
       await res.text();
-      await sleep(60);
+      await done;
       assert.deepEqual(seen, ['one'], 'only the pinned account is spent');
       if (kept) assert.ok(am.accounts[0].entitlementDeniedUntil > Date.now(), 'a refused stream left the cooldown in place');
       else assert.equal(am.accounts[0].entitlementDeniedUntil, null, 'a completed stream lifted the cooldown');
@@ -436,8 +445,9 @@ async function pinnedStream(provider, events, prep, check) {
   await withFleet(['one', 'two'], (acct, res) => {
     sseHead(res);
     res.end(sse(...events));
-  }, async ({ am, proxyPort }) => {
+  }, async ({ am, proxyPort, ended }) => {
     prep(am);
+    const done = ended();
     const codex = provider === 'codex';
     const path = codex ? '/backend-api/codex/responses' : '/v1/messages';
     const res = await fetch(`http://127.0.0.1:${proxyPort}/tc-acct/${encodeURIComponent(`${codex ? 'codex' : 'claude'}:one`)}${path}`, {
@@ -447,7 +457,7 @@ async function pinnedStream(provider, events, prep, check) {
     });
     assert.equal(res.status, 200);
     await res.text();
-    await sleep(60);
+    await done;
     check(am);
   }, { provider: provider === 'codex' ? 'codex' : 'anthropic' });
 }
@@ -487,15 +497,16 @@ for (const [what, refusal] of [
     await withFleet(['one'], (acct, res) => {
       sseHead(res);
       res.end(sse(refusal));
-    }, async ({ am, proxyPort, seen }) => {
+    }, async ({ am, proxyPort, seen, ended }) => {
       am.markEntitlementDenied(0, { seconds: 600 });
       am.accounts[0].entitlementDeniedUntil = Date.now() - 1;
+      const done = ended();
       const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
         method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ model: 'claude-x', messages: [], stream: true }),
       });
       await res.text();
-      await sleep(60);
+      await done;
       assert.deepEqual(seen, ['one']);
       assert.equal(am.accounts[0].entitlementDenial?.count, 1, 'the refused stream reset the escalation count');
     }, { provider: 'anthropic' });
