@@ -197,6 +197,8 @@ teamclaude threshold unified7d=default  # drop it again
 
 A running server picks the change up on the reload the command sends it. This is the only way to edit a per-bucket table in place: the TUI shows it read-only, and the single-number form there would flatten it.
 
+A switch moves a conversation to an account that has none of it cached. The opt-in `compactBeforeSwitch` has Claude Code compact a long conversation shortly before its account reaches this threshold; see [Compact before a switch](routing.md#compact-before-a-switch) for what it changes in what the client receives.
+
 ### Per-account thresholds
 
 The fleet-wide setting above is one number (or one table) for every account, which doesn't fit a mixed fleet: one account with extra usage bought and one without, or a Max 20x account next to a Pro one that should rotate off much sooner ([#409](https://github.com/KarpelesLab/teamclaude/issues/409)). `accounts[].switchThreshold` overrides it per account, same two shapes:
