@@ -510,6 +510,25 @@ export function routingTag(account) {
   return text ? `via ${text}` : '';
 }
 
+/**
+ * "ends 6d" — how long until the end time the operator set for the account
+ * (accounts[].endsAt), "ended" once it has passed, or '' when it has none.
+ * The countdown rather than the date: the row has a few columns to spare, and
+ * how soon is what explains why this account is being spent first.
+ * `teamclaude status` prints the date.
+ * @param {any} account
+ * @param {number} [now]
+ */
+export function endsTag(account, now = Date.now()) {
+  const endsAt = account?.endsAt;
+  if (typeof endsAt !== 'number' || !Number.isFinite(endsAt) || endsAt <= 0) return '';
+  const left = endsAt - now;
+  if (left <= 0) return 'ended';
+  if (left >= 86400000) return `ends ${Math.floor(left / 86400000)}d`;
+  if (left >= 3600000) return `ends ${Math.floor(left / 3600000)}h`;
+  return `ends ${Math.max(1, Math.floor(left / 60000))}m`;
+}
+
 // The status cell's name for an errorReason code. A code it does not know keeps `error`.
 const errorLabel = (/** @type {unknown} */ code) => code === 'account_on_hold' ? 'on hold'
   : code === 'refresh_rejected' || code === 'credential_rejected' ? 're-login'
@@ -3171,6 +3190,12 @@ export class TUI {
         const tag = switchThresholdTag(a, key => this.am.thresholdFor(key));
         return tag ? Math.max(w, 2 + vw(tag)) : w;
       }, 0);
+      // Same rule again for the end-time tag: silent for every account that
+      // has none.
+      const endsW = members.reduce((/** @type {number} */ w, /** @type {any} */ a) => {
+        const tag = endsTag(a);
+        return tag ? Math.max(w, 2 + vw(tag)) : w;
+      }, 0);
       // Same rule again for the routing tag: silent for every account on the
       // fleet path, so it costs the budget nothing there.
       const routeW = members.reduce((/** @type {number} */ w, /** @type {any} */ a) => {
@@ -3188,7 +3213,7 @@ export class TUI {
       // that, a routed credit account reserved 82 columns at W=80 before any bar and fitLine cut the address off
       // (Copilot's review of #649).
       const layout = (/** @type {number} */ tagW) => {
-        const fixedWithRoute = 20 + typeCell + NAME_MIN + routeCells + tagW + spendW + creditW + switchW + routeW + prepaidW;
+        const fixedWithRoute = 20 + typeCell + NAME_MIN + routeCells + tagW + spendW + creditW + switchW + endsW + routeW + prepaidW;
         const routeTags = routeW === 0 || fixedWithRoute + BAR_MIN <= W;
         return { fixed: routeTags ? fixedWithRoute : fixedWithRoute - routeW, routeTags };
       };
@@ -3689,6 +3714,10 @@ export class TUI {
     // the fleet's own numbers) — see switchThresholdTag.
     const switchTag = switchThresholdTag(a, key => this.am.thresholdFor(key));
     if (switchTag) line += `  ${cyan(switchTag)}`;
+    // The end time the operator set, as a countdown: yellow while it is ahead
+    // and moving traffic here, dim once it has passed.
+    const ends = endsTag(a);
+    if (ends) line += `  ${(ends === 'ended' ? dim : yellow)(ends)}`;
     // Routing tag trails even that: where the account's traffic physically
     // leaves the machine, when the operator pinned it to its own proxy.
     // Left out when the row's budget had no room for it (`routeTags`, budgetFor).
