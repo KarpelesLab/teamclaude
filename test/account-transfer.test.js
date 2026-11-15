@@ -289,3 +289,14 @@ test('the new fields are shape-checked like the others', () => {
   assert.match(String(invalidAccount(apikey({ credit: 200 }))), /credit/);
   assert.match(String(invalidAccount(claude({ refreshTokenExpiresAt: 'soon' }))), /refreshTokenExpiresAt/);
 });
+
+test('a newer access token on the same refresh token keeps the earlier known expiry', () => {
+  const held = Date.now() + 2 * DAY;
+  const here = () => claude({ id: 'local', expiresAt: 2000, refreshTokenExpiresAt: held });
+  const omitted = { accounts: [here()] };
+  mergeImportedAccounts(omitted, [claude({ expiresAt: 9000, accessToken: 'new' })]);
+  assert.equal(omitted.accounts[0].refreshTokenExpiresAt, held, 'a bundle that states no date does not clear it');
+  const later = { accounts: [here()] };
+  mergeImportedAccounts(later, [claude({ expiresAt: 9000, accessToken: 'new', refreshTokenExpiresAt: held + 20 * DAY })]);
+  assert.equal(later.accounts[0].refreshTokenExpiresAt, held, 'a later date for the same token does not extend it');
+});

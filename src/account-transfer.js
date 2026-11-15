@@ -24,8 +24,8 @@
 // fetches a profile or touches callback.net, so importing spends nothing and
 // rotates nothing. A token this machine already holds is replaced only by a
 // newer one (later `expiresAt`, the rule credential-sync.js uses too). The
-// refresh token's own expiry goes wherever that token goes, and is dropped
-// when a token that states none replaces it.
+// refresh token's own expiry goes wherever that token goes: a new refresh
+// token brings its own date or none, and the same one keeps the earlier date.
 
 import { scrypt, randomBytes, createCipheriv, createDecipheriv } from 'node:crypto';
 import { open, rename, unlink } from 'node:fs/promises';
@@ -34,7 +34,7 @@ import { importCredentials } from './oauth.js';
 import { importCodexCredentials, DEFAULT_CODEX_CREDENTIALS_PATH } from './codex-auth.js';
 import { providerOf } from './provider.js';
 import { accountLimitReached } from './account-limit.js';
-import { setRefreshTokenExpiry } from './refresh-token-expiry.js';
+import { setRefreshTokenExpiry, expiryAfterReplacement } from './refresh-token-expiry.js';
 
 export const BUNDLE_FORMAT = 'teamrouter-accounts';
 export const BUNDLE_VERSION = 1;
@@ -442,7 +442,7 @@ export function mergeImportedAccounts(config, incoming, { force = false } = {}) 
     /** @type {Record<string, any>} */
     const fields = {};
     for (const k of [...CREDENTIAL_FIELDS, ...IDENTITY_FIELDS]) if (acct[k] !== undefined) fields[k] = acct[k];
-    config.accounts[idx] = setRefreshTokenExpiry(updateAccountEntry(prev, fields), acct.refreshTokenExpiresAt);
+    config.accounts[idx] = setRefreshTokenExpiry(updateAccountEntry(prev, fields), expiryAfterReplacement(prev, acct));
     updated.push(prev.name);
   }
   return { added, updated, skipped };
