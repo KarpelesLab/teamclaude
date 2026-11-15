@@ -4087,7 +4087,12 @@ export class AccountManager {
   _deadline(account, weeklyReset, now = Date.now()) {
     const endsAt = account.endsAt;
     if (typeof endsAt !== 'number' || !(endsAt > now)) return weeklyReset ?? null;
-    return weeklyReset ? Math.min(weeklyReset, endsAt) : endsAt;
+    if (weeklyReset) return Math.min(weeklyReset, endsAt);
+    // No weekly reset known: it is at most a week away, so an end time beyond
+    // that says nothing sooner, and taking it would rank the account behind
+    // every one with a real reset and price its room over a longer span than
+    // the window can last.
+    return endsAt < now + WEEKLY_WINDOW_SECONDS * 1000 ? endsAt : null;
   }
 
   /**

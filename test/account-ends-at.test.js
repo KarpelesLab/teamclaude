@@ -429,3 +429,16 @@ test('the TUI row tag counts down to the end time', () => {
   assert.equal(endsTag({ endsAt: START }, START), 'ended');
   assert.equal(endsTag({ endsAt: START - DAY }, START), 'ended');
 });
+
+test('with no weekly reset known, an end time more than a week out is not a deadline', () => {
+  const am = new AccountManager([oauth('unread', { endsAt: START + 30 * DAY }), oauth('soon', { endsAt: START + 2 * DAY })], 0.98);
+  assert.equal(am._deadline(am.accounts[0], null, START), null, 'an unknown reset is at most a week away');
+  assert.equal(am._deadline(am.accounts[1], null, START), START + 2 * DAY);
+  assert.equal(am._deadline(am.accounts[0], START + 3 * DAY, START), START + 3 * DAY, 'a known reset still stands');
+});
+
+test('a number no date can hold is not an end time', () => {
+  assert.equal(parseEndsAt(1e300), null);
+  assert.equal(parseEndsAt(Infinity), null);
+  assert.equal(parseEndsAt(8.64e15), 8.64e15);
+});

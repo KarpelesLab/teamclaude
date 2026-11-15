@@ -28,7 +28,8 @@ const EPOCH_MS = /^\d{1,16}$/;
  * @returns {number|null}
  */
 export function parseEndsAt(value) {
-  if (typeof value === 'number') return Number.isFinite(value) && value > 0 ? Math.trunc(value) : null;
+  // 8.64e15 is the last instant a Date can hold.
+  if (typeof value === 'number') return value > 0 && value <= 8.64e15 ? Math.trunc(value) : null;
   if (typeof value !== 'string') return null;
   const text = value.trim();
   if (EPOCH_MS.test(text)) {
