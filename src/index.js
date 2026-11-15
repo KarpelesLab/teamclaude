@@ -49,6 +49,7 @@ import { renderStatus, formatPercent } from './status-renderer.js';
 import { sanitizeText, safeLine } from './safe-text.js';
 import { modelLabel } from './model.js';
 import { cacheUsageLabel } from './usage-label.js';
+import { statusLabel } from './error-type.js';
 import { ClientUsageTracker, UsageDimensionTracker } from './client-usage.js';
 import { buildClaudeEnvLines, bypassesAllHosts, clearSelfProxyEnvLines, encodePinComponent, LOCAL_LOGIN_HINT_WINDOW_MS, localLoginHint, mergeNoProxy, resolveClientMode } from './claude-env.js';
 import { serviceKind, installService, uninstallService, serviceStatus, renderService, logPath } from './service.js';
@@ -401,7 +402,7 @@ async function serverCommand() {
     console.error(`[TeamClaude] Bad adaptiveDistribution setting in ${getConfigPath()}: ${err.message}`);
     process.exit(1);
   }
-  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp, distributeSessions: config.distributeSessions, expiryRouting: config.expiryRouting, preferSoonestWeeklyReset: config.preferSoonestWeeklyReset, advisorEligibility: config.advisorEligibility, adaptive, listener: localListener(config) });
+  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp, distributeSessions: config.distributeSessions, expiryRouting: config.expiryRouting, preferSoonestWeeklyReset: config.preferSoonestWeeklyReset, switchOnSessionReset: config.switchOnSessionReset, advisorEligibility: config.advisorEligibility, adaptive, listener: localListener(config) });
   // Names the activity log's session column from Claude Code's own on-disk
   // session titles. Built whether or not the TUI runs, so a reload has one
   // object to reconfigure.
@@ -655,6 +656,8 @@ async function serverCommand() {
     accountManager.setExpiryRouting(config.expiryRouting);
     config.preferSoonestWeeklyReset = diskConfig.preferSoonestWeeklyReset;
     accountManager.setPreferSoonestWeeklyReset(config.preferSoonestWeeklyReset);
+    config.switchOnSessionReset = diskConfig.switchOnSessionReset;
+    accountManager.setSwitchOnSessionReset(config.switchOnSessionReset);
     // And the advisor mode: read off the manager on every selection, so the
     // setter is the whole application. Absent on disk means 'strict' again.
     config.advisorEligibility = diskConfig.advisorEligibility;
@@ -870,7 +873,7 @@ async function serverCommand() {
       const client = (info.client || r?.client) ? `[${info.client || r.client}] ` : '';
       const pin = (info.pinned || r?.pinned) ? ' [pin]' : '';
       const cache = cacheUsageLabel(info.cacheUsage);
-      writeActivity(`${client}${sid}${info.method} ${info.path}${model} → ${acct}${pin} (${info.status}, ${dur}s)${cache ? ` ${cache}` : ''}`);
+      writeActivity(`${client}${sid}${info.method} ${info.path}${model} → ${acct}${pin} (${statusLabel(info.status, info.errorType)}, ${dur}s)${cache ? ` ${cache}` : ''}`);
     };
     // Tee console output to the activity log as well
     const origLog = console.log;
@@ -2373,12 +2376,11 @@ async function probeCommand() {
     }
   }
 
-  applyOrExit(() => setProbeSeconds(config, seconds));
-  await saveConfig(config);
+  const { config: saved } = await updateConfigOrExit(disk => setProbeSeconds(disk, seconds));
   console.log(seconds > 0
     ? `Quota probe set to every ${seconds}s (reads /api/oauth/usage; does not spend quota).`
     : 'Quota probe disabled (passive only).');
-  await notifyRunningServer(config);
+  await notifyRunningServer(saved);
 }
 
 // ── warmup ──────────────────────────────────────────────────
@@ -2410,10 +2412,9 @@ async function warmupCommand() {
       console.error(`Usage: teamclaude warmup ${arg} HH:MM --timezone Area/City`);
       process.exit(1);
     }
-    applyOrExit(() => setWarmupSchedule(config, arg, { resetTime, timezone }));
-    await saveConfig(config);
-    console.log(formatWarmupScheduleConfirmation(config.warmupSchedule));
-    await notifyRunningServer(config);
+    const { config: saved } = await updateConfigOrExit(disk => setWarmupSchedule(disk, arg, { resetTime, timezone }));
+    console.log(formatWarmupScheduleConfirmation(saved.warmupSchedule));
+    await notifyRunningServer(saved);
     return;
   }
 
@@ -2428,12 +2429,11 @@ async function warmupCommand() {
     }
   }
 
-  applyOrExit(() => setWarmupSeconds(config, seconds));
-  await saveConfig(config);
+  const { config: saved } = await updateConfigOrExit(disk => setWarmupSeconds(disk, seconds));
   console.log(seconds > 0
     ? `Keep-warm set to every ${seconds}s (spawns a minimal \`claude\` per idle account; spends a little quota).`
     : 'Keep-warm disabled.');
-  await notifyRunningServer(config);
+  await notifyRunningServer(saved);
 }
 
 // ── threshold ───────────────────────────────────────────────
@@ -2476,13 +2476,14 @@ async function thresholdCommand() {
       console.error(THRESHOLD_USAGE);
       process.exit(1);
     }
-    const { dropped } = applyOrExit(() => setThreshold(config, rest[0]));
-    await saveConfig(config);
+    // What it dropped is read off the file as it is now, not off the copy
+    // loaded above: a table set since then is dropped too, and named.
+    const { config: saved, result: { dropped } } = await updateConfigOrExit(disk => setThreshold(disk, rest[0]));
     if (dropped.length) {
       console.log(`Dropped the per-bucket thresholds (${dropped.join(', ')}) — one number governs every bucket.`);
     }
-    console.log(`Switch threshold set to ${formatPercent(config.switchThreshold)}.`);
-    await notifyRunningServer(config);
+    console.log(`Switch threshold set to ${formatPercent(saved.switchThreshold)}.`);
+    await notifyRunningServer(saved);
     return;
   }
 
@@ -2498,10 +2499,9 @@ async function thresholdCommand() {
     console.error(THRESHOLD_USAGE);
     process.exit(1);
   }
-  applyOrExit(() => setBucketThresholds(config, pairs));
-  await saveConfig(config);
-  printThresholds(config.switchThreshold);
-  await notifyRunningServer(config);
+  const { config: saved } = await updateConfigOrExit(disk => setBucketThresholds(disk, pairs));
+  printThresholds(saved.switchThreshold);
+  await notifyRunningServer(saved);
 }
 
 // ── distribute ──────────────────────────────────────────────
@@ -2537,9 +2537,21 @@ async function distributeCommand() {
   // An unchanged setting is not rewritten — the config file is a
   // read-modify-write shared with the running server — but the server is still
   // notified, so a config that already says `on` can be made to take effect.
-  if (setDistribution(config, next)) await saveConfig(config);
+  // Whether it is unchanged is judged on the file as it is under the lock, and
+  // the updater throwing is what leaves that file alone.
+  const unchanged = new Error('unchanged');
+  /** @type {any} */
+  let saved = config;
+  try {
+    await atomicConfigUpdate((/** @type {any} */ disk) => {
+      saved = disk;
+      if (!setDistribution(disk, next)) throw unchanged;
+    });
+  } catch (err) {
+    if (err !== unchanged) throw err;
+  }
   console.log(DISTRIBUTE_MODES[next].said);
-  await notifyRunningServer(config);
+  await notifyRunningServer(saved);
 }
 
 // ── update ──────────────────────────────────────────────────
@@ -2716,8 +2728,27 @@ function resolveAccount(accounts, query, orgFilter) {
   process.exit(1);
 }
 
+/**
+ * resolveAccount for use inside a config update: the same two refusals, in the
+ * same words, thrown rather than printed. Exiting there would leave the config
+ * lock behind for the next writer to wait out; thrown, the update is abandoned
+ * with the file untouched and updateConfigOrExit prints the message.
+ * @param {any[]} accounts
+ * @param {string} query
+ * @param {string|null} orgFilter
+ */
+function requireAccount(accounts, query, orgFilter) {
+  const matches = matchAccounts(accounts, query, orgFilter);
+  if (matches.length === 1) return matches[0];
+  if (matches.length === 0) throw new ConfigOpError(`Account "${query}" not found`);
+  throw new ConfigOpError([
+    `"${query}" matches ${matches.length} accounts — disambiguate with --org <name|uuid>:`,
+    ...matches.map((/** @type {any} */ a) => `  - ${a.name}${a.orgName ? `  (org: ${a.orgName})` : ''}`),
+  ].join('\n'));
+}
+
 async function removeCommand() {
-  const config = await loadOrCreateConfig();
+  await loadOrCreateConfig();
   const name = args[1];
 
   if (!name) {
@@ -2725,14 +2756,15 @@ async function removeCommand() {
     process.exit(1);
   }
 
-  const account = resolveAccount(config.accounts, name, argValue('--org'));
-  if (!account) {
-    console.error(`Account "${name}" not found`);
-    process.exit(1);
-  }
-
-  config.accounts.splice(config.accounts.indexOf(account), 1);
-  await saveConfig(config);
+  // The row is found in, and taken out of, the file as it is under the lock.
+  // Saving the copy loaded at the start of the command would also put back
+  // every other row as it was then, undoing a refresh token the running server
+  // rotated in between (#675).
+  const { config, result: account } = await updateConfigOrExit(disk => {
+    const found = requireAccount(disk.accounts, name, argValue('--org'));
+    disk.accounts.splice(disk.accounts.indexOf(found), 1);
+    return found;
+  });
   console.log(`Removed account "${account.name}"`);
   // The tombstone first, then the server: told of the removal, it finds the
   // tombstone already there and leaves it alone.
@@ -2773,19 +2805,17 @@ async function routeCommand() {
       console.error(ROUTE_USAGE);
       process.exit(1);
     }
-    const { route, updated, unknownAccounts } = applyOrExit(() => upsertRoute(config, { name, match, accounts, bucket, color }));
+    const { config: saved, result: { route, updated, unknownAccounts } } = await updateConfigOrExit(disk => upsertRoute(disk, { name, match, accounts, bucket, color }));
     for (const a of unknownAccounts) console.error(`Warning: no account named "${a}" (yet)`);
     console.log(`${updated ? 'Updated' : 'Added'} route "${route.name}"`);
-    await saveConfig(config);
-    await notifyRunningServer(config);
+    await notifyRunningServer(saved);
     return;
   }
 
   if (sub === 'rm' || sub === 'remove' || sub === 'delete') {
     const name = args[2];
-    applyOrExit(() => removeRoute(config, name));
-    await saveConfig(config);
-    await notifyRunningServer(config);
+    const { config: saved } = await updateConfigOrExit(disk => removeRoute(disk, name));
+    await notifyRunningServer(saved);
     console.log(`Removed route "${name}"`);
     return;
   }
@@ -2797,7 +2827,7 @@ async function routeCommand() {
 // ── priority ────────────────────────────────────────────────
 
 async function priorityCommand() {
-  const config = await loadOrCreateConfig();
+  await loadOrCreateConfig();
   const name = args[1];
 
   if (!name) {
@@ -2807,38 +2837,40 @@ async function priorityCommand() {
     process.exit(1);
   }
 
-  const account = resolveAccount(config.accounts, name, argValue('--org'));
-  if (!account) {
-    console.error(`Account "${name}" not found`);
-    process.exit(1);
-  }
-
-  const priorities = config.accounts.map(a => a.priority || 0);
-  let priority;
+  const orgFilter = argValue('--org');
+  /** @type {{ priority?: number, place?: 'first'|'last', orgFilter?: string }} */
+  const spec = { orgFilter: orgFilter ?? undefined };
   if (args.includes('--first')) {
-    priority = Math.min(0, ...priorities) - 1;
+    spec.place = 'first';
   } else if (args.includes('--last')) {
-    priority = Math.max(0, ...priorities) + 1;
+    spec.place = 'last';
   } else {
     // Accept the integer in any position (e.g. after --org) — first int-looking token.
     const numTok = args.slice(2).find(t => /^-?\d+$/.test(t));
-    priority = numTok != null ? parseInt(numTok, 10) : NaN;
-    if (Number.isNaN(priority)) {
-      console.error('Provide an integer priority, or --first / --last.');
-      process.exit(1);
-    }
+    if (numTok != null) spec.priority = parseInt(numTok, 10);
   }
 
-  account.priority = priority;
-  await saveConfig(config);
-  console.log(`Set priority of "${account.name}" to ${priority} (lower = preferred)`);
+  // Applied to the file as it is under the config lock, the way the dashboard's
+  // POST /teamclaude/priority does it. Saving the copy loaded at the start of
+  // the command put every other field back as it was then, and a refresh token
+  // the running server rotated in between was lost with them (#691). --first
+  // and --last are worked out from that same fresh read.
+  const { config, result } = await updateConfigOrExit(disk => {
+    // An unknown account is reported before a missing number, as it always was.
+    requireAccount(disk.accounts, name, orgFilter);
+    if (!spec.place && spec.priority === undefined) {
+      throw new ConfigOpError('Provide an integer priority, or --first / --last.');
+    }
+    return setAccountPriority(disk, name, spec);
+  });
+  console.log(`Set priority of "${result.name}" to ${result.priority} (lower = preferred)`);
   await notifyRunningServer(config);
 }
 
 // ── rename ──────────────────────────────────────────────────
 
 async function renameCommand() {
-  const config = await loadOrCreateConfig();
+  await loadOrCreateConfig();
   const name = args[1];
   const newName = args[2];
 
@@ -2847,8 +2879,7 @@ async function renameCommand() {
     process.exit(1);
   }
 
-  const renamed = applyOrExit(() => renameAccount(config, name, newName, { orgFilter: argValue('--org') ?? undefined }));
-  await saveConfig(config);
+  const { config, result: renamed } = await updateConfigOrExit(disk => renameAccount(disk, name, newName, { orgFilter: argValue('--org') ?? undefined }));
   const routes = renamed.routes.length ? ` (updated route${renamed.routes.length > 1 ? 's' : ''}: ${renamed.routes.join(', ')})` : '';
   console.log(`Renamed "${renamed.from}" to "${renamed.name}"${routes}`);
   await notifyRunningServer(config);
@@ -2857,7 +2888,7 @@ async function renameCommand() {
 // ── enable / disable ────────────────────────────────────────
 
 async function setDisabledCommand(disabled) {
-  const config = await loadOrCreateConfig();
+  await loadOrCreateConfig();
   const name = args[1];
   const verb = disabled ? 'disable' : 'enable';
 
@@ -2866,18 +2897,11 @@ async function setDisabledCommand(disabled) {
     process.exit(1);
   }
 
-  const account = resolveAccount(config.accounts, name, argValue('--org'));
-  if (!account) {
-    console.error(`Account "${name}" not found`);
-    process.exit(1);
-  }
-
-  if (disabled) {
-    account.disabled = true;
-  } else {
-    delete account.disabled;
-  }
-  await saveConfig(config);
+  const orgFilter = argValue('--org');
+  const { config, result: account } = await updateConfigOrExit(disk => {
+    requireAccount(disk.accounts, name, orgFilter);
+    return setAccountDisabled(disk, name, disabled, { orgFilter: orgFilter ?? undefined });
+  });
   console.log(`${disabled ? 'Disabled' : 'Enabled'} account "${account.name}"`);
   await notifyRunningServer(config);
 }
@@ -2892,7 +2916,7 @@ async function setDisabledCommand(disabled) {
  * @param {boolean} cordoned
  */
 async function setCordonedCommand(cordoned) {
-  const config = await loadOrCreateConfig();
+  await loadOrCreateConfig();
   const name = args[1];
   const verb = cordoned ? 'cordon' : 'uncordon';
 
@@ -2901,18 +2925,14 @@ async function setCordonedCommand(cordoned) {
     process.exit(1);
   }
 
-  const account = resolveAccount(config.accounts, name, argValue('--org'));
-  if (!account) {
-    console.error(`Account "${name}" not found`);
-    process.exit(1);
-  }
-
-  if (cordoned) {
-    account.cordoned = true;
-  } else {
-    delete account.cordoned;
-  }
-  await saveConfig(config);
+  const orgFilter = argValue('--org');
+  // The row itself is handed back, not just its name: the check below asks
+  // which of the accounts that were written could still take its traffic.
+  const { config, result: account } = await updateConfigOrExit(disk => {
+    const found = requireAccount(disk.accounts, name, orgFilter);
+    setAccountCordoned(disk, name, cordoned, { orgFilter: orgFilter ?? undefined });
+    return found;
+  });
   console.log(cordoned
     ? `Cordoned account "${account.name}": no new conversations go to it; the ones already on it stay until they finish (teamclaude status shows how many are left)`
     : `Uncordoned account "${account.name}": it takes new conversations again`);
@@ -3012,10 +3032,13 @@ async function routingCommand() {
   }
 
   if (/^(none|off|-)$/i.test(value)) {
-    delete account.routing;
-    await saveConfig(config);
-    console.log(`Cleared routing for "${account.name}" — it now uses the fleet egress`);
-    await notifyRunningServer(config);
+    const { config: saved, result: cleared } = await updateConfigOrExit(disk => {
+      const found = requireAccount(disk.accounts, name, argValue('--org'));
+      delete found.routing;
+      return found;
+    });
+    console.log(`Cleared routing for "${cleared.name}" — it now uses the fleet egress`);
+    await notifyRunningServer(saved);
     return;
   }
 
@@ -3033,11 +3056,17 @@ async function routingCommand() {
   // Before the save, not after: on a running server the change is live at
   // once, and a mistyped password would take a working account out of rotation.
   await requireWorkingRouting(routing, upstreamUrl);
-  // Canonical form on disk: defaults spelled out, credentials percent-encoded.
-  account.routing = routingToUrl(routing);
-  await saveConfig(config);
-  console.log(`Routing "${account.name}" via ${describeRouting(routing)} — all of its traffic now tunnels through this proxy`);
-  await notifyRunningServer(config);
+  // The proxy check above can take seconds, and the running server may rotate a
+  // refresh token meanwhile, so the account is looked up again in a fresh read
+  // of the file and only its routing is set there.
+  const { config: saved, result: routed } = await updateConfigOrExit(disk => {
+    const found = requireAccount(disk.accounts, name, argValue('--org'));
+    // Canonical form on disk: defaults spelled out, credentials percent-encoded.
+    found.routing = routingToUrl(routing);
+    return found;
+  });
+  console.log(`Routing "${routed.name}" via ${describeRouting(routing)} — all of its traffic now tunnels through this proxy`);
+  await notifyRunningServer(saved);
 }
 
 // ── help ────────────────────────────────────────────────────
@@ -3452,14 +3481,27 @@ function argValue(flag) {
 }
 
 /**
- * Apply a settings change, exiting with its message when the change is refused.
+ * Apply a settings change to the config as it is on disk now, and save it.
+ *
+ * The change runs inside atomicConfigUpdate, on a fresh read taken under the
+ * config lock. A command that changed the copy it loaded at its start and saved
+ * that replaced the whole file with it, and a refresh token the running server
+ * had rotated in between went back to its old, dead value: the account failed
+ * with invalid_grant at the next restart (#675, #691).
+ *
+ * A refused change exits with its message. The updater throwing is what leaves
+ * the file unwritten, and the lock is released before the exit; so `change`
+ * must throw a ConfigOpError rather than exit itself.
  * @template T
- * @param {() => T} change
- * @returns {T}
+ * @param {(disk: any) => T} change
+ * @returns {Promise<{ config: any, result: T }>} the config as written, and what `change` returned
  */
-function applyOrExit(change) {
+async function updateConfigOrExit(change) {
+  /** @type {any} */
+  let result;
   try {
-    return change();
+    const config = await atomicConfigUpdate((/** @type {any} */ disk) => { result = change(disk); });
+    return { config, result };
   } catch (err) {
     if (!(err instanceof ConfigOpError)) throw err;
     console.error(err.message);

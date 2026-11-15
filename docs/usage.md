@@ -160,7 +160,7 @@ Arguments after `--` go to `claude`:
 teamclaude run -- --model opus
 ```
 
-**Claude Code still needs a login of its own.** In both modes the client checks its local login (`~/.claude/.credentials.json`, or the Keychain on macOS) before it sends anything, and the proxy only sees a request once that check passes. The pool's accounts do not stand in for it: they are what the proxy uses upstream, and the two expire independently. So a `claude` that exits at once with `Failed to authenticate: OAuth session expired and could not be refreshed` is reporting its own login, not the pool — run `claude auth login` and launch again. `run` prints a hint to that effect when `claude` dies within seconds of launch and the local login is missing or past its expiry.
+**Claude Code still needs a login of its own.** In both modes the client checks its local login (`~/.claude/.credentials.json`, or the Keychain on macOS) before it sends anything, and the proxy only sees a request once that check passes. The pool's accounts do not stand in for it: they are what the proxy uses upstream, and the two expire independently. The exception is a pool account holding this same login, imported with `teamclaude import` or read through `importFrom`: the two then share it, and whichever renews first ends the other's copy (see [Import from Claude Code](accounts.md#import-from-claude-code)). So a `claude` that exits at once with `Failed to authenticate: OAuth session expired and could not be refreshed` is reporting its own login, not the pool — run `claude auth login` and launch again. `run` prints a hint to that effect when `claude` dies within seconds of launch and the local login is missing or past its expiry.
 
 ### Setting the environment yourself
 
@@ -401,6 +401,8 @@ Bodies are truncated past a size cap, and files older than the retention window 
 `--activity-log FILE` appends the TUI activity lines to a file instead, and works in headless mode too.
 
 A request line whose response reported token usage ends with its prompt-cache figures: `cache r180k w3k in1k` is tokens read from the cache, written to it, and sent uncached (`k` from 1000 up). By the share read from the cache, r / (r + w + in), the TUI paints it green at 0.90 or more (hit), yellow from 0.50 (partial) and red below (miss), and dims it when the request neither read nor wrote the cache. A miss also ends with ` MISS`, so it can be found with grep in a log file, which has no colour. After a failover or a retry the figures are the last attempt's.
+
+A request line whose response was a JSON error from the upstream names its type after the status: `(404 thread_not_found, 0.3s)`. The name is `error.details.error_code` when the body has one, else `error.type`, kept only if it is a plain identifier (letters, digits, `_`, `.`, `-`) and cut to 32 characters; nothing else from the body is shown. Errors the proxy answers itself, non-JSON errors and bodies over 64 KiB are shown with the status alone.
 
 Claude Code's telemetry (`/api/event_logging/*`) is high-volume activity-log noise and is hidden from the log by default; see [`eventLogging`](configuration.md#fields) to block or show it instead.
 
