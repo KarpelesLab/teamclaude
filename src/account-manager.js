@@ -2,7 +2,7 @@ import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired, isRefreshRejec
 import { providerOf, DEFAULT_PROVIDER, isSubscriptionAccount, canServeProvider } from './provider.js';
 import { refreshCodexToken } from './codex-auth.js';
 import { parseCodexQuota, parseCodexPlanType, parseCodexActiveLimit } from './codex-quota.js';
-import { sameIdentity } from './identity.js';
+import { sameIdentity, sameOrg } from './identity.js';
 import { weeklyBucketForModel, modelGlobMatches, modelFamily, gatingUtilization, resolveMaxUsage, spendCapReached, resolveSwitchThreshold, sanitizeSwitchThreshold, WEEKLY_BUCKET_KEYS } from './model.js';
 import { SessionTracker } from './session-tracker.js';
 import { SessionPins } from './session-pins.js';
@@ -1259,6 +1259,45 @@ export class AccountManager {
     if (this._selectingProvider == null) this.providerCursors.set(providerOf(account), account.index);
     if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) return;
     this._firstSightOn(this._currentObs ??= newObservation(), account);
+  }
+
+  // Entry IDs, never credentials, names or positions. Ambiguous IDs are not
+  // identities even if only one of the duplicate entries is currently enabled.
+  //
+  // A disabled account is still an identity. Disabling one leaves the pins on
+  // it in place while the server runs (every placement path skips an account
+  // that is not available and writes nothing), so a pin saved or restored while
+  // its account is disabled is the same dormant pin, and is there again when
+  // the account is enabled.
+  exportAffinityState() {
+    const identities = this._affinityAccounts();
+    return this.sessionTracker.exportAffinity(index => {
+      const account = this.accounts[index];
+      return account && identities.get(account.id) === account
+        ? { id: account.id, provider: providerOf(account) } : null;
+    });
+  }
+
+  /** @param {unknown} snapshot */
+  restoreAffinityState(snapshot) {
+    const identities = this._affinityAccounts();
+    this.sessionTracker.restoreAffinity(snapshot, ref => {
+      const account = identities.get(ref.id);
+      return account && providerOf(account) === ref.provider ? account.index : null;
+    });
+  }
+
+  _affinityAccounts() {
+    /** @type {Map<string, any>} */
+    const identities = new Map();
+    const seen = new Set();
+    for (const account of this.accounts) {
+      if (typeof account.id !== 'string' || !account.id) continue;
+      if (seen.has(account.id)) { identities.delete(account.id); continue; }
+      seen.add(account.id);
+      identities.set(account.id, account);
+    }
+    return identities;
   }
 
   /**
@@ -2553,7 +2592,8 @@ export class AccountManager {
       // Rollover preemption (expiry routing): this candidate rolled over its
       // governing window, so staying would burn the week it just gained while
       // sooner-expiring quota goes unspent — the only pressure-driven force on a
-      // pin, at one cache miss per pinned session per rollover. Asked of every
+      // pin unless a reclaim window is set (below), at one cache miss per pinned
+      // session per rollover. Asked of every
       // candidate rather than the bucket's pin alone, since a session sitting on
       // another family's account is just as stuck, and a rollover re-ranks so
       // that pressure picks the destination.
@@ -2597,16 +2637,98 @@ export class AccountManager {
         // subscriptions a move per turn flipped `current` on every request
         // and released the operator's manual switch each time. Nor does it
         // ramp, since no traffic moved onto the account.
+        // The reclaim window below is not asked of such a pin: it is for a pin
+        // on an account that can serve normally.
         if (fallback) {
           this._noteFallback(this._cursorKey(model, null, this._selectingProvider ?? DEFAULT_PROVIDER),
             { account: pinned, paid: fallback === 'paid' }, model, false, advisorModel, true);
+          return pinned;
         }
-        return pinned;
+        // The reclaim window (expiryRouting.reclaimHours, off by default): the
+        // one case where pressure moves a pin that has not rolled. Asked last,
+        // of a pin every other rule would keep, so it never overrides one.
+        const reclaim = this._reclaimDestination(pinned, exclude, model, advisorModel);
+        if (!reclaim) return pinned;
+        // Paced like the rollover move above: every conversation pinned outside
+        // the band moves on its next request.
+        this._beginRamp(reclaim.account);
+        console.log(`[TeamClaude] Session pin on "${safeLine(pinned.name, 64)}" released — reclaim: the weekly quota of "${safeLine(reclaim.account.name, 64)}" expires in ${(reclaim.msLeft / 3600_000).toFixed(1)}h (expiryRouting.reclaimHours); re-routing to "${safeLine(reclaim.account.name, 64)}"`);
+        return reclaim.account;
       }
     }
     // No pin was usable, so this is a placement. Placing is aiming: it takes no
     // reading, and the next request to find the pin here takes it.
     return allowPlacement ? this._pickLeastLoaded(exclude, model, advisorModel) : null;
+  }
+
+  /**
+   * The reclaim window (expiryRouting.reclaimHours, #643): where a conversation
+   * resting on `pinned` should move so that weekly quota about to expire is
+   * spent, or null to leave it where it is. Null whenever the setting is off,
+   * which leaves the pin path exactly as it was.
+   *
+   * Expiry pressure places new conversations on the account about to lose its
+   * week and otherwise leaves a pinned one alone, so one long conversation
+   * elsewhere can let most of that week expire. Inside the window the operator
+   * names, such a pin becomes movable to an account A when all of these hold:
+   *
+   *   - `pinned` is outside the top pressure band for this request, so it is
+   *     measured as not worth spending now. Inside the band it stays, which is
+   *     also what holds a moved conversation on A.
+   *   - A is in that band on a measured pressure, at the priority of `pinned`.
+   *     The band only admits accounts available for this request (thresholds,
+   *     caps, routes, cordon, provider), and an account admitted for discovery,
+   *     with no reading, is not a reason to give up a cache.
+   *   - A's deadline (its governing weekly reset, or its end time when sooner:
+   *     the clock its pressure is priced on) is ahead, and within the window.
+   *   - A's deadline is sooner than the one `pinned` has ahead of it. A move is
+   *     therefore always toward the earlier deadline, and two accounts inside
+   *     the window cannot hand a conversation back and forth as each is drained
+   *     past the other, which a tolerance of 1 would otherwise allow.
+   *   - A and `pinned` are known to be one organization, unless
+   *     reclaimAcrossOrganizations is set: across organizations the move costs
+   *     the prompt cache and the thinking blocks, and unknown is not the same.
+   *   - fiveHourSoftMargin is not keeping new conversations off A.
+   *
+   * Among several such accounts the destination is the one placement would
+   * give a new conversation, were they the whole fleet.
+   *
+   * Reads only; the caller moves the conversation by returning the account,
+   * and the pin follows when the request is routed (recordSession), as for
+   * any other move.
+   *
+   * @param {Record<string, any>} pinned  available, and not outranked on priority
+   * @param {Set<number>|null} exclude
+   * @param {*} model  loosely typed, like the availability checks it feeds
+   * @param {*} advisorModel
+   * @returns {{ account: Record<string, any>, msLeft: number }|null}
+   */
+  _reclaimDestination(pinned, exclude, model, advisorModel) {
+    const routing = this.expiryRouting;
+    if (!routing?.enabled || !(routing.reclaimHours > 0)) return null;
+    const band = this._bandedCandidates(exclude, model, advisorModel);
+    // Also the answer when nothing was banded: a lone candidate, or no measured
+    // pressure anywhere, hands every candidate back, `pinned` among them.
+    if (band.includes(pinned)) return null;
+    const now = Date.now();
+    const windowMs = routing.reclaimHours * 3600_000;
+    const ownDeadline = this._rankingReset(pinned, model, now);
+    const soft = this._withoutFiveHourSoft(exclude, model, advisorModel);
+    const movable = band.filter(a => {
+      if ((a.priority || 0) !== (pinned.priority || 0) || soft?.has(a.index)) return false;
+      if (this._pressureVariant(a, model, now).kind !== 'known') return false;
+      const deadline = this._rankingReset(a, model, now);
+      if (!deadline || deadline <= now || deadline - now > windowMs) return false;
+      if (ownDeadline && ownDeadline > now && ownDeadline <= deadline) return false;
+      return routing.reclaimAcrossOrganizations || sameOrg(a, pinned) === true;
+    });
+    if (!movable.length) return null;
+    const others = this.accounts.filter(a => !movable.includes(a)).map(a => a.index);
+    const account = movable.length === 1
+      ? movable[0]
+      : this._pickLeastLoaded(new Set([...(exclude ?? []), ...others]), model, advisorModel);
+    if (!account || !movable.includes(account)) return null;
+    return { account, msLeft: /** @type {number} */ (this._rankingReset(account, model, now)) - now };
   }
 
   /** Where a new session goes, per the configured distribution mode. Adaptive
@@ -4173,6 +4295,13 @@ export class AccountManager {
         ? Math.max(1, c.tolerance)
         : 1.5,
       preempt: typeof c.preempt === 'boolean' ? c.preempt : true,
+      // The reclaim window (see _reclaimDestination). Read on every selection,
+      // so storing it is the whole of applying it. Anything but a positive
+      // finite number of hours is off.
+      reclaimHours: typeof c.reclaimHours === 'number' && Number.isFinite(c.reclaimHours) && c.reclaimHours > 0
+        ? c.reclaimHours
+        : 0,
+      reclaimAcrossOrganizations: c.reclaimAcrossOrganizations === true,
     };
     // Nothing survives the knob being off: every observation is dropped when
     // preemption stops and none is written while it is off, so no mechanism

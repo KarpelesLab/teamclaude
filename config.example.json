@@ -24,6 +24,7 @@
   "synthesizeQuotaHeaders": false,
   "poolQuotaHeaders": false,
   "distributeSessions": false,
+  "persistSessionAffinity": false,
   "switchOnSessionReset": true,
   "adaptiveDistribution": {
     "scoring": "burndown"
@@ -35,7 +36,9 @@
   "expiryRouting": {
     "enabled": false,
     "tolerance": 1.5,
-    "preempt": true
+    "preempt": true,
+    "reclaimHours": 0,
+    "reclaimAcrossOrganizations": false
   },
   "accounts": [
     {
