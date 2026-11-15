@@ -25,6 +25,7 @@
   "poolQuotaHeaders": false,
   "distributeSessions": false,
   "compactBeforeSwitch": false,
+  "persistSessionAffinity": false,
   "switchOnSessionReset": true,
   "adaptiveDistribution": {
     "scoring": "burndown"
@@ -33,10 +34,15 @@
   "quotaProbeSeconds": 0,
   "autoUpdate": true,
   "autoRedeemResets": false,
+  "autoRedeemMinDaysToReset": 0,
+  "autoRedeemMaxShare": 1,
+  "autoRedeemMaxPerDay": 0,
   "expiryRouting": {
     "enabled": false,
     "tolerance": 1.5,
-    "preempt": true
+    "preempt": true,
+    "reclaimHours": 0,
+    "reclaimAcrossOrganizations": false
   },
   "accounts": [
     {
