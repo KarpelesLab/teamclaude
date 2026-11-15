@@ -106,6 +106,32 @@ test('a restored window whose reset already passed is cleared on first use', () 
   assert.equal(am.accounts[0].quota.unified7d, null); // ...then cleared as stale
 });
 
+test('a limit of 0 in a state file is not restored, nor its remaining; a positive pair is', () => {
+  // Written by a version that stored any limit upstream sent: restored as-is, it
+  // handed 1 - 0/0 = NaN back to every standard-quota reader.
+  const am = new AccountManager([oauth('a', { accountUuid: 'p1' }), oauth('b', { accountUuid: 'p2' }), oauth('c', { accountUuid: 'p3' })], 0.98);
+  const resetsAt = new Date(Date.now() + 3600_000).toISOString();
+  am.restoreQuotaState([
+    { accountUuid: 'p1', quota: { tokensLimit: 0, tokensRemaining: 0, requestsLimit: 0, requestsRemaining: 0, resetsAt } },
+    { accountUuid: 'p2', quota: { tokensLimit: 1000, tokensRemaining: 100, requestsLimit: 50, requestsRemaining: 5, resetsAt } },
+    { accountUuid: 'p3', quota: { tokensRemaining: 7, requestsRemaining: 3, resetsAt } },
+  ]);
+  const [a, b, c] = am.accounts;
+  assert.equal(am._maxUtilization(a), 0);
+  assert.equal(a.quota.tokensLimit, null);
+  assert.equal(a.quota.requestsLimit, null);
+  assert.equal(a.quota.tokensRemaining, null, 'a refused pair is dropped whole');
+  assert.equal(a.quota.requestsRemaining, null, 'a refused pair is dropped whole');
+  assert.equal(a.quota.resetsAt, resetsAt, 'the rest of the entry is restored as before');
+  assert.equal(b.quota.tokensLimit, 1000);
+  assert.equal(b.quota.requestsLimit, 50);
+  assert.equal(b.quota.tokensRemaining, 100);
+  assert.equal(b.quota.requestsRemaining, 5);
+  assert.equal(am._maxUtilization(b), 0.9);
+  assert.equal(c.quota.tokensRemaining, 7, 'a remaining saved without a limit is restored as before');
+  assert.equal(c.quota.requestsRemaining, 3, 'a remaining saved without a limit is restored as before');
+});
+
 test('restoreQuotaState ignores a non-array / missing payload', () => {
   const am = new AccountManager([oauth('a', { accountUuid: 'p1' })], 0.98);
   am.restoreQuotaState(undefined);
