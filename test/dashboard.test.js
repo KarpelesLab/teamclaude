@@ -1681,6 +1681,23 @@ test('a disabled account offers only Enable: no Switch to on its row or in the A
   assert.equal(page.labelled('Enable'), 1);
 });
 
+test('a cordoned account\'s status badge in the Accounts table is short, with the reason on hover', async () => {
+  const page = bootPage();
+  await page.answer(200, {
+    currentAccounts: { anthropic: 'a' },
+    accounts: [
+      { name: 'a', provider: 'anthropic', quota: { unified7d: 0.1 } },
+      { name: 'b', provider: 'anthropic', status: 'active', cordoned: true, cordonRemaining: 1, unavailable: 'cordoned', quota: { unified7d: 0.1 } },
+    ],
+  });
+  // The long reason widened the Status column until the row's controls no longer fit the card.
+  assert.equal(page.labelled('cordoned: takes no new conversations'), 0);
+  const badge = page.built.filter(e => e.textContent === 'cordoned').at(-1);
+  assert.ok(badge, 'the table badge reads cordoned');
+  assert.equal(badge.title, 'cordoned: takes no new conversations');
+  assert.match(badge.className, /\bcordoned\b/);
+});
+
 test('drain mode\'s queue shows on the rows and the card when the server reports it', async () => {
   const page = bootPage();
   await page.answer(200, {

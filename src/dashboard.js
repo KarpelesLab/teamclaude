@@ -3884,7 +3884,12 @@ ${SHARED_HELPERS}
     tr.appendChild(name);
     tr.appendChild(el('td', '', a.plan || a.type || '—'));
     var st = el('td');
-    st.appendChild(el('span', 'badge ' + (a.disabled ? 'disabled' : (a.status || '')), statusText(a)));
+    // A cordon is a routine state, so its badge stays one word: the full reason
+    // would widen the Status column until the row's controls overflow the card.
+    var cordonBadge = !a.disabled && a.unavailable === 'cordoned';
+    var badge = el('span', 'badge ' + (a.disabled ? 'disabled' : cordonBadge ? 'cordoned' : (a.status || '')), cordonBadge ? 'cordoned' : statusText(a));
+    if (cordonBadge) badge.title = statusText(a);
+    st.appendChild(badge);
     if (isCurrentAccount(a, s)) { st.appendChild(el('span', '', ' ')); st.appendChild(el('span', 'badge current', 'current')); }
     tr.appendChild(st);
     tr.appendChild(el('td', 'num', String(a.priority || 0)));
