@@ -2239,9 +2239,10 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       let bodyBytes = 0;
       for await (const chunk of req) {
         bodyBytes += chunk.length;
-        // Buffering is what makes retry possible, and also what lets one client
-        // hold as much memory as it cares to send. Past the cap, stop reading
-        // and say so; the request is torn down once the answer is out.
+        // Buffering is what makes retry possible, and also what lets one request
+        // hold as much memory as its client cares to send. Past the cap (per
+        // request; see DEFAULT_MAX_BODY_BYTES), stop reading and say so; the
+        // request is torn down once the answer is out.
         if (bodyBytes > maxBodyBytes) {
           await refuseOversizedBody(req, res);
           openEntry = null;   // this path owns the close below; the outer catch must not repeat it
@@ -3015,11 +3016,21 @@ export function resolveLogMaxBodyBytes(config) {
 }
 
 // Cap on a buffered request body. The forward path buffers the whole body so
-// it can be resent on another account after a 429; without a cap, one client
-// holds as much of the proxy's memory as it cares to send. 64 MiB sits
-// comfortably above the largest legitimate request — a 1M-token context is a
-// few MiB of text, and the API bounds inline images and PDFs well below this —
-// so nothing real is refused. `proxy.maxBodyBytes` overrides it; 0 opts out.
+// it can be resent on another account after a 429; without a cap, one request
+// holds as much of the proxy's memory as its client cares to send. 64 MiB sits
+// well above a Claude Code request (a 1M-token context is a few MiB of text)
+// but below what the API itself accepts: its documented request limits are 128
+// MB for Messages and Token Counting, 256 MB for Message Batches and 500 MB for
+// the Files API, so a request between 64 MiB and those (a large inline PDF, a
+// big batch, a file upload) is refused here with a 413 that upstream would have
+// taken. `proxy.maxBodyBytes` overrides it; 0 opts out.
+//
+// The cap is per request, not per client or for the process: each body is kept
+// until its answer has been relayed (a retry may need it), so the requests in
+// flight together hold up to this many bytes each, and nothing bounds the sum.
+// Each holds more than its body, too: a body rewritten for the account serving
+// it (rewriteRequestBody) is a second copy held beside it for the attempt, and
+// the answer may be held as well (BUFFERED_RESPONSE_LIMIT).
 export const DEFAULT_MAX_BODY_BYTES = 64 * 1024 * 1024;
 
 export function resolveMaxBodyBytes(config) {
