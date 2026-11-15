@@ -13,6 +13,7 @@ import { validateAdaptiveConfig } from './adaptive-distribution.js';
 import { createProxyServer, NO_USAGE_STORE, reloadedHeaderFlags, resolveAccountPin } from './server.js';
 import { openUsageStore, startTicks, closeUsageStore } from './usage/db.js';
 import { createDrainState, resolveDrainTimeoutSeconds } from './drain.js';
+import { compactBeforeSwitchStatus } from './compact-before-switch.js';
 import { importCredentials, loginOAuth, loginOAuthWithPastedCode, startOAuthLogin, fetchProfile, profileForCredentials, refreshAccessToken, isTokenExpired, isTokenExpiringSoon } from './oauth.js';
 import {
   sameIdentity,
@@ -708,6 +709,9 @@ async function serverCommand() {
     // Read by the prober off this object per cycle, like the switch above.
     config.probeDisabledAccounts = diskConfig.probeDisabledAccounts === true;
     config.blockedModels = Array.isArray(diskConfig.blockedModels) ? diskConfig.blockedModels : [];
+    // Resolved off this object per request (server.js compactAskFor), so the
+    // assignment is the whole application, and removing the key turns it off.
+    config.compactBeforeSwitch = diskConfig.compactBeforeSwitch;
     // Sampled off this object when each request is dispatched (server.js
     // shouldStripOverageHeaders / shouldSynthesizeQuotaHeaders), so the reload
     // applies to subsequent requests.
@@ -952,6 +956,9 @@ async function serverCommand() {
     // blocklist editor shows up in `status` immediately, the same way the
     // per-request gate in server.js picks it up.
     blockedModels: [...(config.blockedModels || [])],
+    // `compactBeforeSwitch` as the request path resolves it, read off the same
+    // live object, with the count of requests it has answered since start.
+    compactBeforeSwitch: compactBeforeSwitchStatus(config.compactBeforeSwitch, accountManager.compactAsks),
     // Per-client usage (proxy.clientKeys) — empty object when unconfigured.
     clients: clientUsage.export(),
     // Per-dimension usage (proxy.usageDimensions) — empty when unconfigured.
