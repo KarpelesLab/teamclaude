@@ -1035,6 +1035,22 @@ test('an account that goes into error takes a token another install stored since
   assert.equal(am.accounts[0].status, 'error');
 });
 
+// The remedy for a refusal is a sign-in, and one made on another install
+// reaches this one through the store.
+test('a sign-in on another install brings an account upstream refused here back at the next pass', async () => {
+  const store = makeStore();
+  const home = setup([claude('a')], { store });
+  await home.sync.sync();
+  home.am.markRefused(home.am.accounts[0], { code: 'account_on_hold', message: 'on hold', link: null });
+  await home.sync.sync();
+  assert.equal(home.am.accounts[0].status, 'error', 'nothing new in the store');
+  const office = setup([], { store });
+  await office.sync.storeSignIn({ ...claude('a'), accessToken: 'at-a-login', refreshToken: 'rt-a-login', expiresAt: T0 + 8 * H });
+  await home.sync.sync();
+  assert.equal(home.am.accounts[0].status, 'active');
+  assert.equal(home.am.accounts[0].credential, 'at-a-login');
+});
+
 test('two installs renewing one account at once: one renews, the other adopts', async () => {
   // Both fleets share one store; the "office" install holds the lock while it
   // renews, and the "home" install, refused, waits and takes the result.
