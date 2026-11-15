@@ -5,7 +5,7 @@ import { createInterface } from 'node:readline';
 import { createWriteStream, existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import net from 'node:net';
-import { loadOrCreateConfig, loadConfig, loadConfigPersistingIds, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, getQuotaSeriesPath, getUsageDbPath, loadState, saveState } from './config.js';
+import { loadOrCreateConfig, loadConfig, loadConfigPersistingIds, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, getQuotaSeriesPath, getUsageDbPath, loadState, createStatePersister } from './config.js';
 import { loadQuotaSeries, saveQuotaSeries } from './quota-series.js';
 import { installCrashHandlers } from './crash-log.js';
 import { AccountManager, distributionMode, accountRouting } from './account-manager.js';
@@ -357,6 +357,7 @@ async function serverCommand() {
   const earlyConsole = tuiExpected ? captureEarlyConsole() : null;
 
   const config = await loadOrCreateConfig();
+  const persistSessionAffinity = config.persistSessionAffinity === true;
   // Token writes below pair rows by entry id against a re-read of the file, so
   // the ids have to be on disk before the first refresh, not just in memory.
   await persistMintedAccountIds(config);
@@ -429,6 +430,8 @@ async function serverCommand() {
     return null;
   });
   if (savedState?.quota) accountManager.restoreQuotaState(savedState.quota);
+  // Startup-only opt-in: reload cannot reimport an older affinity snapshot.
+  if (persistSessionAffinity) accountManager.restoreAffinityState(savedState?.affinity);
 
   // Per-client usage (proxy.clientKeys). Restored alongside quota so the
   // per-client counters survive a restart the same way rotation state does.
@@ -458,9 +461,10 @@ async function serverCommand() {
   accountManager.selectActiveAccount();
 
   // Periodically persist quota (and once more on shutdown) to the state file.
-  const persistQuotaState = () =>
-    saveState({ quota: accountManager.exportQuotaState(), clients: clientUsage.exportState(), usageDimensions: dimensionUsage.exportState() })
-      .catch(err => console.error(`[TeamClaude] Failed to save quota state: ${err.message}`));
+  const persistQuotaState = createStatePersister(() => ({
+    quota: accountManager.exportQuotaState(), clients: clientUsage.exportState(), usageDimensions: dimensionUsage.exportState(),
+    ...(persistSessionAffinity ? { affinity: accountManager.exportAffinityState() } : {}),
+  }), { onError: err => console.error(`[TeamClaude] Failed to save quota state: ${err.message}`) });
   let quotaSaveInterval = null;
   // Sampled on the same minute tick, but only written when a sample was taken
   // or something was pruned: about once per SAMPLE_INTERVAL_MS.

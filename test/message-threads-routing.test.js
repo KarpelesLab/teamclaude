@@ -54,16 +54,27 @@ function threadKeepingUpstream({ stream }) {
 async function withProxy({ stream = false, distributeSessions = true } = {}, fn) {
   const { server: upstream, served } = threadKeepingUpstream({ stream });
   const upstreamPort = await listen(upstream);
-  const accounts = Array.from({ length: 3 }, (_, i) => ({ name: `a${i}`, type: 'apikey', apiKey: `k${i}` }));
+  const accounts = Array.from({ length: 3 }, (_, i) => ({ id: `id-${i}`, name: `a${i}`, type: 'apikey', apiKey: `k${i}` }));
   const am = new AccountManager(accounts, 0.98, { distributeSessions });
   // The mock upstream keeps thread state, which is what `messageThreads` declares.
-  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}`, messageThreads: true });
+  const config = { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}`, messageThreads: true };
+  let proxy = createProxyServer(am, config);
   const port = await listen(proxy);
   try {
-    await fn({ port, served, am });
+    await fn({ port, served, am, restart: async () => {
+      const saved = JSON.parse(JSON.stringify(am.exportAffinityState()));
+      proxy.closeAllConnections();
+      await new Promise(resolve => proxy.close(resolve));
+      const fresh = new AccountManager([...accounts].reverse(), 0.98, { distributeSessions });
+      fresh.restoreAffinityState(saved);
+      proxy = createProxyServer(fresh, config);
+      return { port: await listen(proxy), am: fresh };
+    } });
   } finally {
-    proxy.close();
-    upstream.close();
+    proxy.closeAllConnections();
+    await new Promise(resolve => proxy.close(resolve));
+    upstream.closeAllConnections();
+    await new Promise(resolve => upstream.close(resolve));
   }
 }
 
@@ -104,7 +115,7 @@ const cont = (port, previous, session = SESSION) => post(port, {
 
 for (const stream of [false, true]) {
   test(`a continue reaches the account holding its thread (${stream ? 'streamed' : 'buffered'})`, async () => {
-    await withProxy({ stream }, async ({ port, served }) => {
+    await withProxy({ stream }, async ({ port, served, am, restart }) => {
       // Two agents, so the fleet has a busy account besides alpha's and a
       // continue routed as a new conversation lands on neither.
       const alpha = await create(port, 'task alpha');
@@ -113,6 +124,7 @@ for (const stream of [false, true]) {
       assert.equal(beta.status, 200);
       const alphaKey = served[0].key;
 
+      const owner = am.sessionTracker.threadOwner(SESSION, alpha.id);
       let previous = alpha.id;
       for (let turn = 0; turn < 3; turn++) {
         const before = served.length;
@@ -121,6 +133,13 @@ for (const stream of [false, true]) {
         assert.equal(served[before].key, alphaKey);
         previous = r.id;
       }
+      const fresh = await restart();
+      const before = served.length;
+      const continued = await cont(fresh.port, previous);
+      assert.equal(continued.status, 200);
+      assert.equal(served[before].key, alphaKey);
+      assert.deepEqual(fresh.am.sessionTracker.threadOwner(SESSION, continued.id), owner);
+      assert.equal(fresh.am.sessionTracker.threadOwner('other-client', continued.id), null);
     });
   });
 }
