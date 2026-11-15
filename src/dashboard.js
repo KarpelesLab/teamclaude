@@ -2167,14 +2167,14 @@ export function usageFor(entry, view) {
 
 // ---- Insights page ---------------------------------------------------------
 //
-// The page draws GET /teamclaude/insights (usage-history.js). What follows is
-// its arithmetic: number formats, axis tops, the series each "split by" choice
-// stacks, the legend's statistics, the rates and the headline tiles. The
-// drawing itself is in the page script, which only turns these numbers into
-// SVG, laid out the way monitoring dashboards (Grafana, Zabbix, Datadog) lay
-// out time series: thin lines over light fills, one time axis shared by every
-// panel, and a legend that is a table of each series' total, average, peak
-// and latest value.
+// The page draws GET /teamclaude/insights (usage-history.js). It is built
+// around the two numbers a person reads it for, the estimated API cost and
+// the tokens: two headlines that pick which one every chart draws, the pace
+// it is on, then that number per day, by calendar day, by month and by where
+// it went. What follows is its arithmetic: number formats, axis tops, the
+// series each "split by" choice stacks, the legend's statistics, the
+// headlines, the projection, the calendar and the ranked list. The drawing
+// itself is in the page script, which only turns these numbers into SVG.
 
 // Token counts as the page prints them: 4.48B, 340M, 12.3k. Three significant
 // figures at most, since the axis and the tiles are read at a glance and the
@@ -2201,6 +2201,17 @@ export function fmtUsd(n) {
   return '$' + v.toFixed(2);
 }
 
+// A dollar figure for an axis or over a bar, where cents are noise and room
+// is short: $0.50, $14, $1.2k. The tooltips and tables keep fmtUsd's cents.
+/** @param {unknown} n */
+export function fmtUsdShort(n) {
+  var v = Number(n) || 0;
+  if (v <= 0) return '$0';
+  if (v >= 1000) return '$' + fmtTokens(v);
+  if (v >= 10) return '$' + Math.round(v);
+  return fmtUsd(v);
+}
+
 // The top of a value axis: the first 1, 2, 2.5 or 5 times a power of ten at or
 // above `v`, so the four gridlines under it land on round numbers.
 /** @param {number} v */
@@ -2209,19 +2220,6 @@ export function niceCeil(v) {
   var p = Math.pow(10, Math.floor(Math.log10(v)));
   var f = v / p;
   return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 2.5 ? 2.5 : f <= 5 ? 5 : 10) * p;
-}
-
-// The gap between gridlines on an axis that counts things (requests): a whole
-// number, so none of the four lines lands on 62.5 of something that comes in
-// ones. The first 1, 2, 3, 4, 5, 6 or 8 times a power of ten at or above `v`.
-/** @param {number} v */
-export function niceStep(v) {
-  if (!(v > 1)) return 1;
-  var p = Math.pow(10, Math.floor(Math.log10(v)));
-  var f = v / p;
-  var steps = [1, 2, 3, 4, 5, 6, 8, 10];
-  for (var i = 0; i < steps.length; i++) if (f <= steps[i]) return steps[i] * p;
-  return 10 * p;
 }
 
 // The range as a phrase: "last 30 days", "all time".
@@ -2233,21 +2231,22 @@ export function insightsRangeText(range) {
   return n > 0 ? 'last ' + n + ' days' : String(range);
 }
 
-// "▲ 12% vs the previous 30 days" under a tile, or null when there is nothing
-// to compare with: no earlier period on record, or one that spent nothing (a
-// percentage of zero is not a number anyone can read). The arrow and the words
-// carry the direction; neither is coloured, since more usage is not good or
-// bad in itself.
+// A headline against the period before it, as the hero prints it: a pill
+// ("▲ 12%") and the words after it ("vs the previous 30 days"). Null when
+// there is nothing to compare with: no earlier period on record, or one that
+// spent nothing (a percentage of zero is not a number anyone can read). The
+// arrow carries the direction and is not coloured, since more usage is not
+// good or bad in itself.
 /**
  * @param {number} cur
  * @param {number|null|undefined} prev
  * @param {string} range
  */
-export function insightsDelta(cur, prev, range) {
+export function insightsChange(cur, prev, range) {
   if (prev == null || !(prev > 0)) return null;
   var pct = Math.round((cur / prev - 1) * 100);
   var span = range === '24h' ? '24 hours' : parseInt(range, 10) + ' days';
-  return (pct > 0 ? '▲ ' : pct < 0 ? '▼ ' : '') + Math.abs(pct) + '% vs the previous ' + span;
+  return { pill: (pct > 0 ? '▲ ' : pct < 0 ? '▼ ' : '') + Math.abs(pct) + '%', vs: 'vs the previous ' + span };
 }
 
 // A day bucket ("2026-10-29") or an hour bucket (epoch ms) as an axis label,
@@ -2490,20 +2489,6 @@ export function cacheHitRate(t) {
   return prompt > 0 ? (x.cacheRead || 0) / prompt : null;
 }
 
-// The cache hit rate of each bucket, null where a bucket had no prompt tokens:
-// an idle hour has no rate, and drawing it as 0% would read as a cold cache.
-/** @param {any} kinds  insights.kinds */
-export function cacheHitSeries(kinds) {
-  var k = kinds || {};
-  var n = (k.input || []).length;
-  /** @type {(number|null)[]} */
-  var out = [];
-  for (var i = 0; i < n; i++) {
-    out.push(cacheHitRate({ input: (k.input || [])[i], cacheRead: (k.cacheRead || [])[i], cacheWrite: (k.cacheWrite || [])[i] }));
-  }
-  return out;
-}
-
 // The busiest bucket: which one, its value, and how many average buckets it
 // is worth. Null when the range spent nothing.
 /** @param {number[]|null|undefined} values @param {number} [from]  see seriesStats */
@@ -2560,35 +2545,6 @@ export function providerRows(data) {
   });
 }
 
-// The Grok panel: Grok's share of the range from the usage history, its
-// models, and each Grok account's plan as the last quota reading left it.
-// Grok states its quota only when asked (grok-usage.js), so the reading is
-// as old as the last refresh, and this never asks. Null with no Grok at all.
-/**
- * @param {any} data  a GET /teamclaude/insights reply
- * @param {any[]} accounts  status.accounts
- * @param {number} [now]
- */
-export function grokSummary(data, accounts, now) {
-  var d = data || {};
-  var n = (d.buckets || []).length;
-  var history = providerRows(d).filter(function (r) { return r.key === 'grok'; })[0] || null;
-  /** @type {number[]} */
-  var values = [];
-  for (var i = 0; i < n; i++) values.push(0);
-  (d.providers || []).forEach(function (/** @type {any} */ p) {
-    if (providerTone(p.provider) !== 'grok') return;
-    for (var j = 0; j < n; j++) values[j] += (p.values || [])[j] || 0;
-  });
-  var models = topModels((d.models || []).filter(function (/** @type {any} */ m) { return providerTone(m.provider) === 'grok'; }), 8);
-  var plans = (accounts || []).filter(function (a) { return a.provider === 'grok'; }).map(function (a) {
-    var m = accountMeters(a, undefined, now);
-    return { name: a.name, plan: a.plan || (a.quota && a.quota.planType) || null, disabled: !!a.disabled, meters: m.slots.concat(m.extra).filter(Boolean), text: m.text };
-  });
-  if (!history && !plans.length) return null;
-  return { history: history, values: values, models: models, accounts: plans };
-}
-
 // The ranked model list: dated snapshots of one model ("…-20251001") are one
 // model to a reader, so models are grouped by the name modelLabel gives them,
 // per provider, before ranking.
@@ -2620,44 +2576,268 @@ export function topModels(models, limit) {
     .slice(0, limit || 6);
 }
 
-// The headline tiles, six of a kind: tokens, estimated cost and requests for
-// the range (each against the period before it), the prompt cache's hit rate,
-// the cost of a request, and the busiest bucket against the average one.
-/** @param {any} data  a GET /teamclaude/insights reply */
-export function insightsKpis(data) {
-  var t = (data && data.totals) || { requests: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
-  var tokens = t.input + t.output + t.cacheRead + t.cacheWrite;
-  var p = data && data.previous;
-  var range = data ? data.range : '30d';
-  var cost = data && data.cost;
-  var costSub = !cost ? 'this proxy is too old to estimate it'
-    : insightsDelta(cost.total, cost.previous, range) || 'at API list prices';
-  if (cost && cost.unpricedTokens > 0) costSub += ' · ' + fmtTokens(cost.unpricedTokens) + ' tokens unpriced';
-  var hit = cacheHitRate(t);
-  var prevHit = p ? cacheHitRate(p) : null;
-  var hitSub = hit == null ? 'no prompt tokens yet'
-    : prevHit == null || Math.abs(hit - prevHit) < 0.0005 ? 'of prompt tokens were cache reads'
-      : (hit > prevHit ? '▲ ' : '▼ ') + Math.abs((hit - prevHit) * 100).toFixed(1) + ' pts vs the previous period';
-  var priced = pricedRequests(data && data.models).all;
-  var perReq = cost && priced > 0 ? cost.total / priced : null;
-  var tokensPer = (data && data.kinds && data.kinds.input || []).map(function (/** @type {number} */ _, /** @type {number} */ i) {
-    var k = data.kinds;
-    return (k.input[i] || 0) + (k.output[i] || 0) + (k.cacheRead[i] || 0) + (k.cacheWrite[i] || 0);
+// The two numbers the page is built around, per bucket: every token (cache
+// included, as the history counts them) or the estimated API cost. Null for
+// cost from a proxy too old to estimate it, so "no estimate" never reads as $0.
+/**
+ * @param {any} data  a GET /teamclaude/insights reply
+ * @param {string} metric  'tokens' | 'cost'
+ * @returns {number[]|null}
+ */
+export function insightsTotals(data, metric) {
+  var d = data || {};
+  var n = (d.buckets || []).length;
+  /** @type {number[]} */
+  var out = [];
+  if (metric === 'cost') {
+    if (!d.cost || !Array.isArray(d.cost.values)) return null;
+    for (var i = 0; i < n; i++) out.push(Number(d.cost.values[i]) || 0);
+    return out;
+  }
+  var k = d.kinds || {};
+  for (var j = 0; j < n; j++) {
+    out.push(((k.input || [])[j] || 0) + ((k.output || [])[j] || 0) + ((k.cacheRead || [])[j] || 0) + ((k.cacheWrite || [])[j] || 0));
+  }
+  return out;
+}
+
+// Each bucket's total since the start of the range: what the "Running total"
+// view draws, so its last point is the headline figure.
+/** @param {(number|null|undefined)[]|null|undefined} values */
+export function runningTotals(values) {
+  var acc = 0;
+  return (values || []).map(function (v) { acc += Number(v) || 0; return acc; });
+}
+
+// One of the hero's two headlines: the range's estimated API cost or its
+// tokens, against the period before. The cost one says what it left out
+// (tokens on models with no list price), since its figure does not include
+// them; the tokens one carries the request count the old tiles had.
+/**
+ * @param {any} data  a GET /teamclaude/insights reply
+ * @param {string} metric  'tokens' | 'cost'
+ * @returns {{ label: string, value: number|null, text: string, change: string|null, vs: string, note: string }}
+ */
+export function insightsHeadline(data, metric) {
+  var d = data || {};
+  var t = d.totals || {};
+  var p = d.previous;
+  var range = d.range || '30d';
+  var empty = d.since == null ? 'nothing recorded yet'
+    : range === 'all' ? 'since ' + insightsBucketLabel(d.sinceDay || insightsDayKey(d.since), 'day', true)
+      : 'no earlier period on record';
+  if (metric === 'cost') {
+    var c = d.cost;
+    if (!c) return { label: 'Est. API cost', value: null, text: '—', change: null, vs: 'this proxy is too old to estimate it', note: '' };
+    var cc = insightsChange(c.total, c.previous, range);
+    return { label: 'Est. API cost', value: c.total, text: fmtUsd(c.total), change: cc ? cc.pill : null, vs: cc ? cc.vs : empty,
+      note: c.unpricedTokens > 0 ? fmtTokens(c.unpricedTokens) + ' tokens not priced' : 'at API list prices' };
+  }
+  var tokens = (t.input || 0) + (t.output || 0) + (t.cacheRead || 0) + (t.cacheWrite || 0);
+  var prev = p ? (p.input || 0) + (p.output || 0) + (p.cacheRead || 0) + (p.cacheWrite || 0) : null;
+  var tc = insightsChange(tokens, prev, range);
+  var reqs = t.requests || 0;
+  return { label: 'Tokens', value: tokens, text: fmtTokens(tokens), change: tc ? tc.pill : null, vs: tc ? tc.vs : empty,
+    note: reqs.toLocaleString('en-US') + (reqs === 1 ? ' request' : ' requests') };
+}
+
+// The hero's third figure: where the chosen metric is heading. On days, when
+// the range reaches the 1st of this month (or the day recording began, if
+// that was this month), it is the month projected: the month so far, plus
+// the average of the last seven full days for each day after today.
+// Otherwise it is that daily average over 30 days. Today is still filling, so
+// it is never one of the full days, and the rest of it is not projected: the
+// figure leans low rather than high. On hours it is the busiest hour instead,
+// since a day of hours projects nothing a person would plan by. Null with no
+// full day (or no hour with usage) to go on.
+/**
+ * @param {any} data  a GET /teamclaude/insights reply
+ * @param {string} metric  'tokens' | 'cost'
+ * @param {number} [days]  how many recent full days set the pace (7)
+ * @returns {{ kind: 'month'|'run'|'peak', label: string, value: number, text: string, sub: string, how: string, rate: number|null, soFar: number|null, left: number|null, month: string|null }|null}
+ */
+export function insightsPace(data, metric, days) {
+  var d = data || {};
+  var v = insightsTotals(d, metric);
+  var b = d.buckets || [];
+  var n = b.length;
+  if (!v || !n || d.since == null) return null;
+  var fmt = metric === 'cost' ? fmtUsd : fmtTokens;
+  var from = recordedFrom(d);
+  if (d.unit === 'hour') {
+    var peak = peakBucket(v, from);
+    if (!peak) return null;
+    return { kind: 'peak', label: 'Busiest hour', value: peak.value, text: fmt(peak.value),
+      sub: insightsBucketLabel(b[peak.index], 'hour', true) + (peak.ratio ? ' · ' + peak.ratio.toFixed(1) + '× the average hour' : ''),
+      how: 'The hour with the most, against the average recorded hour.', rate: null, soFar: null, left: null, month: null };
+  }
+  var want = days || 7;
+  /** @type {number[]} */
+  var full = [];
+  for (var i = Math.max(from, n - 1 - want); i < n - 1; i++) full.push(v[i]);
+  if (!full.length) return null;
+  var rate = full.reduce(function (x, y) { return x + y; }, 0) / full.length;
+  var span = full.length === 1 ? 'the last full day' : 'the last ' + full.length + ' full days';
+  var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(b[n - 1]));
+  if (m) {
+    var first = m[1] + '-' + m[2] + '-01';
+    var sinceDay = d.sinceDay || insightsDayKey(d.since);
+    var start = b.indexOf(first);
+    // Recording that began after the 1st saw only part of the month: it is
+    // counted from that day and says so. When the range itself starts after
+    // the 1st, the month is covered only if recording began inside it.
+    var began = from < n && String(b[from]) > first && (start >= 0 ? from > start : sinceDay >= String(b[0]));
+    if (began) start = from;
+    if (start >= 0) {
+      var soFar = 0;
+      for (var j = start; j < n; j++) soFar += v[j];
+      var left = new Date(Number(m[1]), Number(m[2]), 0).getDate() - Number(m[3]);
+      var month = new Date(Number(m[1]), Number(m[2]) - 1, 1).toLocaleDateString([], { month: 'long' });
+      return { kind: 'month', label: 'On pace for', value: soFar + rate * left, text: fmt(soFar + rate * left),
+        sub: month + ': ' + fmt(soFar) + ' so far' + (left > 0 ? ' + ' + fmt(rate) + '/day × ' + left + (left === 1 ? ' day' : ' days') : ', its last day'),
+        how: 'Projected: ' + month + ' so far' + (began ? ' (recorded from ' + insightsBucketLabel(sinceDay, 'day', false) + ')' : '') + ', plus the average of ' + span + ' for each day after today.',
+        rate: rate, soFar: soFar, left: left, month: month };
+    }
+  }
+  return { kind: 'run', label: '30-day pace', value: rate * 30, text: fmt(rate * 30), sub: fmt(rate) + '/day, the average of ' + span,
+    how: 'Projected: the average of ' + span + ', times 30.', rate: rate, soFar: null, left: null, month: null };
+}
+
+// The range's days summed by calendar month, oldest first, for the By month
+// card. A month the range (or recording) starts part-way through says the
+// day it is counted from, so a short bar does not read as a quiet month. The
+// month still running carries the pace's projection when there is one.
+/**
+ * @param {any} data  a GET /teamclaude/insights reply
+ * @param {string} metric  'tokens' | 'cost'
+ * @returns {{ key: string, label: string, long: string, total: number, days: number, from: string|null, current: boolean, projected: number|null }[]}
+ */
+export function monthTotals(data, metric) {
+  var d = data || {};
+  if (d.unit !== 'day' || d.since == null) return [];
+  var v = insightsTotals(d, metric);
+  if (!v) return [];
+  var b = d.buckets || [];
+  /** @type {{ key: string, label: string, long: string, total: number, days: number, from: string|null, current: boolean, projected: number|null }[]} */
+  var out = [];
+  for (var i = recordedFrom(d); i < b.length; i++) {
+    var day = String(b[i]);
+    var key = day.slice(0, 7);
+    var row = out.length ? out[out.length - 1] : null;
+    if (!row || row.key !== key) {
+      var start = new Date(Number(key.slice(0, 4)), Number(key.slice(5, 7)) - 1, 1);
+      row = { key: key, label: start.toLocaleDateString([], { month: 'short' }), long: start.toLocaleDateString([], { month: 'long', year: 'numeric' }),
+        total: 0, days: 0, from: day.slice(8) === '01' ? null : day, current: false, projected: null };
+      out.push(row);
+    }
+    row.total += v[i];
+    row.days++;
+  }
+  if (out.length) {
+    var last = out[out.length - 1];
+    last.current = true;
+    var pace = insightsPace(d, metric);
+    if (pace && pace.kind === 'month') last.projected = pace.value;
+  }
+  return out;
+}
+
+// The range's days as a calendar, a column a week from Monday, the way GitHub
+// draws contributions. Each day is shaded by the quarter of the range's
+// active days it falls in rather than by its share of the biggest, so one
+// huge day does not wash the rest out. A day before recording began is
+// marked as not recorded (level -1), apart from an idle day (level 0). Beside
+// it, each weekday's average full day: today is still filling, and would pull
+// its weekday down.
+/**
+ * @param {any} data  a GET /teamclaude/insights reply
+ * @param {number[]} values  one per bucket (insightsTotals)
+ */
+export function calendarGrid(data, values) {
+  var d = data || {};
+  var b = d.unit === 'day' ? (d.buckets || []) : [];
+  var v = values || [];
+  var from = recordedFrom(d);
+  /** @type {number[]} */
+  var active = [];
+  for (var i = from; i < b.length; i++) if ((v[i] || 0) > 0) active.push(v[i]);
+  active.sort(function (x, y) { return x - y; });
+  var q = function (/** @type {number} */ f) { return active.length ? active[Math.floor(f * (active.length - 1))] : 0; };
+  var cuts = [q(0.25), q(0.5), q(0.75)];
+  var level = function (/** @type {number} */ x) { return !(x > 0) ? 0 : x <= cuts[0] ? 1 : x <= cuts[1] ? 2 : x <= cuts[2] ? 3 : 4; };
+  /** @type {({ i: number, key: string, value: number, level: number, today: boolean }|null)[][]} */
+  var weeks = [];
+  /** @type {({ i: number, key: string, value: number, level: number, today: boolean }|null)[]|null} */
+  var week = null;
+  /** @type {{ label: string, total: number, days: number, avg: number|null }[]} */
+  var weekdays = [];
+  for (var w = 0; w < 7; w++) weekdays.push({ label: new Date(2024, 0, 1 + w).toLocaleDateString([], { weekday: 'short' }), total: 0, days: 0, avg: null });
+  for (var j = 0; j < b.length; j++) {
+    var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(b[j]));
+    if (!m) continue;
+    var wd = (new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])).getDay() + 6) % 7;
+    if (!week || wd === 0) { week = [null, null, null, null, null, null, null]; weeks.push(week); }
+    var x = Number(v[j]) || 0;
+    week[wd] = { i: j, key: String(b[j]), value: x, level: j < from ? -1 : level(x), today: j === b.length - 1 };
+    if (j >= from && j < b.length - 1) { weekdays[wd].total += x; weekdays[wd].days++; }
+  }
+  weekdays.forEach(function (wk) { wk.avg = wk.days ? wk.total / wk.days : null; });
+  return { weeks: weeks, weekdays: weekdays, cuts: cuts };
+}
+
+// The "Where it went" list: one row per model, account, provider or (every
+// machine at once) machine, ranked by the hero's metric, with what each one's
+// tokens cost per million at list price. A row that cannot be priced (a
+// third-party backend, a model the price table does not know) has a null cost
+// and, ranked by cost, comes after every priced row rather than reading as a
+// free $0.
+/**
+ * @param {any} data  a GET /teamclaude/insights reply
+ * @param {string} by  'model' | 'account' | 'provider' | 'machine'
+ * @param {string} metric  'tokens' | 'cost'
+ * @returns {{ key: string, label: string, group: string, color: string, tokens: number, requests: number, cost: number|null, perMillion: number|null, share: number|null, hit: number|null }[]}
+ */
+export function breakdownRows(data, by, metric) {
+  var d = data || {};
+  /** @param {any} x */
+  var priced = function (x) { return typeof x === 'number' ? x : null; };
+  /** @type {{ key: string, label: string, group: string, color: string, tokens: number, requests: number, cost: number|null, perMillion: number|null, share: number|null, hit: number|null }[]} */
+  var rows = [];
+  /**
+   * @param {string} key @param {string} label @param {string} group @param {string} color
+   * @param {any} x  its tokens, requests and token kinds
+   * @param {number|null} cost
+   */
+  var add = function (key, label, group, color, x, cost) {
+    var tokens = Number(x.tokens) || 0;
+    rows.push({ key: key, label: label, group: group, color: color, tokens: tokens, requests: Number(x.requests) || 0, cost: cost,
+      perMillion: cost != null && tokens > 0 ? cost / tokens * 1e6 : null, share: null, hit: typeof x.cacheRead === 'number' ? cacheHitRate(x) : null });
+  };
+  if (by === 'model') {
+    topModels(d.models, 1000).forEach(function (m) { add(m.provider + '/' + m.label, m.label, groupLabel(m.provider), 'var(--ip-' + providerTone(m.provider) + ')', m, m.cost); });
+  } else if (by === 'account') {
+    (d.accounts || []).forEach(function (/** @type {any} */ a) {
+      var tone = providerTone(a.provider);
+      add(a.provider + '/' + a.account, a.account, groupLabel(a.provider), 'var(--ip-' + tone + ')', a, tone === 'backend' ? null : priced(a.cost));
+    });
+  } else if (by === 'machine') {
+    (d.instances || []).forEach(function (/** @type {any} */ m, /** @type {number} */ i) {
+      if (m.state !== 'ok') return;
+      add('instance/' + m.name, m.name + (m.self ? ' (this one)' : ''), '', i < 8 ? 'var(--is' + (i + 1) + ')' : 'var(--dim)', m, priced(m.cost));
+    });
+  } else {
+    providerRows(d).forEach(function (p) { add(p.key, p.label, p.accounts + (p.accounts === 1 ? ' account' : ' accounts'), p.color, p, p.key === 'backend' ? null : p.cost); });
+  }
+  var byCost = metric === 'cost';
+  var sum = rows.reduce(function (s, r) { return s + (byCost ? r.cost || 0 : r.tokens); }, 0);
+  rows.forEach(function (r) {
+    var x = byCost ? r.cost : r.tokens;
+    r.share = x == null || !(sum > 0) ? null : x / sum;
   });
-  var peak = peakBucket(tokensPer, recordedFrom(data));
-  var unit = data && data.unit === 'hour' ? 'hour' : 'day';
-  return [
-    { key: 'tokens', label: 'Tokens', value: fmtTokens(tokens),
-      sub: insightsDelta(tokens, p ? p.input + p.output + p.cacheRead + p.cacheWrite : null, range) || (data && data.since == null ? 'nothing recorded yet' : 'no earlier period on record') },
-    { key: 'cost', label: 'Est. API cost', value: cost ? fmtUsd(cost.total) : '—', sub: costSub },
-    { key: 'requests', label: 'Requests', value: t.requests.toLocaleString(),
-      sub: insightsDelta(t.requests, p ? p.requests : null, range) || 'responses that reported usage' },
-    { key: 'cache', label: 'Cache hit rate', value: hit == null ? '—' : (hit * 100).toFixed(1) + '%', sub: hitSub },
-    { key: 'perRequest', label: 'Per request', value: perReq == null ? '—' : fmtUsd(perReq),
-      sub: t.requests > 0 ? fmtTokens(tokens / t.requests) + ' tokens · ' + fmtTokens(t.output / t.requests) + ' output' : 'no requests yet' },
-    { key: 'peak', label: 'Busiest ' + unit, value: peak ? fmtTokens(peak.value) : '—',
-      sub: peak ? insightsBucketLabel(data.buckets[peak.index], unit, true) + (peak.ratio ? ' · ' + peak.ratio.toFixed(1) + '× the average' : '') : 'nothing spent yet' },
-  ];
+  return rows.sort(function (x, y) {
+    if (byCost && (x.cost == null) !== (y.cost == null)) return x.cost == null ? 1 : -1;
+    return byCost && x.cost != null && y.cost != null && x.cost !== y.cost ? y.cost - x.cost : y.tokens - x.tokens;
+  });
 }
 
 // The linked machines an "All machines" reply could not count, as a sentence
@@ -2696,7 +2876,8 @@ const SHARED_HELPERS = [
   connectRequest, connectRowView, connectOutcome,
   peerLinkRequest, peerLinkOutcome, peerTestOutcome, linkSelfOptions, linkBackNotice, instanceLink, parseInstanceLink, linkAddMissing,
   accountSyncRequest, accountSyncUser, accountSyncOwnMode, accountSyncMembers, accountSyncLine, peerSyncCell, accountSyncApprovalHref, accountSyncSignInOutcome, accountSyncCancelOutcome, accountSyncOutcome,
-  fmtTokens, fmtUsd, niceCeil, niceStep, insightsRangeText, insightsDelta, insightsBucketLabel, insightsSeries, stackSeries, seriesStats, recordedFrom, insightsDayKey, bucketAt, labelStep, pricedRequests, cacheHitRate, cacheHitSeries, peakBucket, providerRows, grokSummary, topModels, insightsKpis, fleetMissingText,
+  fmtTokens, fmtUsd, fmtUsdShort, niceCeil, insightsRangeText, insightsChange, insightsBucketLabel, insightsSeries, stackSeries, seriesStats, recordedFrom, insightsDayKey, bucketAt, labelStep, pricedRequests, cacheHitRate, peakBucket, providerRows, topModels, fleetMissingText,
+  insightsTotals, runningTotals, insightsHeadline, insightsPace, monthTotals, calendarGrid, breakdownRows,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -3023,31 +3204,53 @@ const PAGE = `<!doctype html>
   .insbar { display: flex; gap: 8px 14px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
   .insbar .lbl { color: var(--dim); font-size: 12px; }
   .insbar .insscope { display: flex; gap: 8px 14px; align-items: center; }
-  /* Insights, laid out like a monitoring dashboard: an even row of stat
-     tiles, then panels that share one time axis. */
-  .inskpis { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 12px; margin-bottom: 12px; }
-  .inskpi { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 16px 10px; min-width: 0; }
-  .inskpi .l { color: var(--dim); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .inskpi .v { font-size: 24px; font-weight: 650; letter-spacing: -.01em; line-height: 1.3; font-variant-numeric: tabular-nums; }
-  .inskpi .d { color: var(--dim); font-size: 11.5px; min-height: 2.8em; }
-  .inskpi svg { display: block; margin-top: 6px; }
-  .insgrid { display: grid; gap: 12px; margin-bottom: 12px; }
-  .insgrid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-  .insgrid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .insgrid .card, #insBody > .card { margin-bottom: 0; min-width: 0; }
-  #insBody > .card { margin-bottom: 12px; }
+  /* Insights is built around two numbers, the estimated API cost and the
+     tokens: a hero card whose headlines are also the tabs that pick which of
+     the two every chart on the page draws, then the same number by calendar
+     day, by month and by where it went. A dashed edge means projected
+     throughout, on the pace headline and on the month bars alike. */
+  #insBody { display: flex; flex-direction: column; gap: 12px; margin-bottom: 12px; }
+  #insBody .card { margin-bottom: 0; min-width: 0; }
+  #insBody > .sub { margin: -4px 0 0; }
+  .insgrid { display: grid; gap: 12px; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); }
+  .insgrid.one { grid-template-columns: minmax(0, 1fr); }
+  .inshero { padding: 0; overflow: hidden; }
+  .insheads { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border-bottom: 1px solid var(--line); }
+  .inshead { position: relative; display: flex; flex-direction: column; align-items: flex-start; gap: 3px; min-width: 0; text-align: left; padding: 16px 20px 14px; border: 0; border-right: 1px solid var(--line); background: transparent; color: var(--text); font: inherit; }
+  .inshead:last-child { border-right: 0; }
+  button.inshead { cursor: pointer; }
+  button.inshead:hover { background: var(--panel2); }
+  button.inshead:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  /* The chosen headline: a bar in its metric's colour along the top, and a
+     wash of it fading down, so the tab and the chart under it read as one. */
+  .inshead::before, .inshead::after { content: ''; position: absolute; left: 0; right: 0; top: 0; pointer-events: none; opacity: 0; background: var(--hc, var(--accent)); }
+  .inshead::before { height: 3px; }
+  .inshead::after { bottom: 0; background: linear-gradient(180deg, var(--hc, var(--accent)), transparent 75%); }
+  .inshead.sel::before { opacity: 1; }
+  .inshead.sel::after { opacity: .09; }
+  .inshead .l { display: flex; align-items: center; gap: 6px; color: var(--dim); font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .07em; }
+  .inshead .l i { width: 8px; height: 8px; border-radius: 2px; background: var(--hc, var(--dim)); }
+  .inshead .v { font-size: 38px; font-weight: 700; letter-spacing: -.03em; line-height: 1.1; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .inshead .d { color: var(--dim); font-size: 12px; }
+  .inshead .n { color: var(--dim); font-size: 11.5px; opacity: .85; }
+  .inspill { display: inline-block; font-weight: 650; color: var(--text); background: var(--panel2); border: 1px solid var(--line); border-radius: 999px; padding: 0 7px; margin-right: 6px; font-size: 11.5px; font-variant-numeric: tabular-nums; }
+  .insproj { font-size: 10px; font-weight: 500; letter-spacing: .03em; text-transform: none; border: 1px dashed var(--dim); border-radius: 999px; padding: 0 6px; }
+  .inspace .v { color: var(--dim); }
+  .insherob { padding: 14px 16px 10px; }
   .insh { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; margin-bottom: 8px; }
   .insh b { font-size: 13.5px; }
   .insh .s { display: block; color: var(--dim); font-size: 12px; }
+  .instools { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+  .inseg { display: inline-flex; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; background: var(--panel2); }
+  .inseg button { border: 0; background: transparent; color: var(--dim); font-size: 12px; padding: 3px 10px; cursor: pointer; white-space: nowrap; }
+  .inseg button + button { border-left: 1px solid var(--line); }
+  .inseg button.sel { background: var(--accent-bg); color: var(--text); }
+  .inseg button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
   svg.inschart { display: block; overflow: visible; touch-action: pan-y; }
   svg.inschart text { fill: var(--dim); font-size: 11px; font-variant-numeric: tabular-nums; }
-  /* An area's fill is light so the line on its top edge, and the grid under
-     it, carry the reading; a little more in the dark, where it recedes. */
-  .insfill { fill-opacity: .22; }
-  :root[data-theme="dark"] .insfill { fill-opacity: .3; }
-  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .insfill { fill-opacity: .3; } }
-  .inslegend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--dim); margin-top: 6px; }
-  .inslegend b { color: var(--text); font-weight: 600; margin-left: 4px; }
+  /* A reference line's label sits on the bars it crosses: a halo in the card's colour keeps it legible. */
+  svg.inschart text.insref { font-size: 10.5px; paint-order: stroke; stroke: var(--panel); stroke-width: 3px; stroke-linejoin: round; }
+  .insnow { opacity: .5; }
   .insw { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
   .insl { display: inline-block; width: 14px; height: 3px; border-radius: 2px; margin-right: 8px; vertical-align: 3px; }
   .inslegw { overflow-x: auto; margin-top: 8px; }
@@ -3061,50 +3264,56 @@ const PAGE = `<!doctype html>
   .inslegb:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
   .inslegt tr.off td { opacity: .45; }
   .inslegt tr.off .insl { background: var(--dim) !important; }
-  .inscomp { display: flex; gap: 2px; height: 14px; border-radius: 4px; overflow: hidden; margin: 4px 0 12px; background: var(--track); }
-  .inscomp i { display: block; min-width: 2px; }
-  .insrows { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px; }
-  .insrows .insrow { display: flex; justify-content: space-between; gap: 10px; white-space: nowrap; }
-  .insrows .insrow span:last-child { font-variant-numeric: tabular-nums; }
-  .insnote { margin-top: 10px; font-size: 12px; }
-  .instab { width: 100%; border-collapse: collapse; font-size: 12.5px; margin-top: 12px; }
-  .instab th { color: var(--dim); font-weight: 500; font-size: 11.5px; text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
-  .instab td { padding: 5px 8px; border-bottom: 1px solid var(--igrid); white-space: nowrap; }
-  .instab .num { text-align: right; font-variant-numeric: tabular-nums; }
-  .ihb { display: grid; grid-template-columns: minmax(64px, 34%) minmax(0, 1fr) auto; gap: 10px; align-items: center; font-size: 12.5px; padding: 5px 0; }
-  .ihb .n { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .ihb .t { height: 6px; background: var(--track); border-radius: 3px; overflow: hidden; }
-  .ihb .f { height: 100%; border-radius: 0 3px 3px 0; }
-  .ihb .v { font-variant-numeric: tabular-nums; white-space: nowrap; }
-  .insgrok { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); gap: 16px; }
-  .insgrok .gstats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px 12px; align-content: start; }
-  .insgrok .gstat .l { color: var(--dim); font-size: 12px; }
-  .insgrok .gstat .v { font-size: 18px; font-weight: 650; font-variant-numeric: tabular-nums; }
-  .insgrok .gspark { grid-column: 1 / -1; }
-  .insgrok .gplans { display: flex; flex-direction: column; gap: 10px; }
-  .insgrok .gplan { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr); gap: 4px 12px; align-items: center; }
-  .insgrok .gwho { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; min-width: 0; }
-  .insgrok .gwho .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
-  .insgrok .gplan .meter { min-width: 0; }
-  .gmodels { margin-top: 12px; border-top: 1px solid var(--igrid); padding-top: 8px; }
-  .instip { position: fixed; z-index: 50; pointer-events: none; background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; font-size: 12px; box-shadow: 0 6px 20px rgba(0,0,0,.25); min-width: 150px; }
+  /* The calendar: the grid, and each weekday's average full day beside it. */
+  .inscal { display: flex; gap: 14px 22px; flex-wrap: wrap; align-items: flex-start; }
+  .inscal svg rect.day { cursor: default; }
+  .inswk { display: grid; grid-template-columns: auto minmax(60px, 1fr) auto; gap: 3px 8px; align-items: center; font-size: 11.5px; flex: 1 1 180px; min-width: 0; max-width: 300px; }
+  .inswk .k { color: var(--dim); }
+  .inswk .t { height: 8px; background: var(--track); border-radius: 4px; overflow: hidden; }
+  .inswk .t i { display: block; height: 100%; border-radius: 4px; }
+  .inswk .x { text-align: right; font-variant-numeric: tabular-nums; }
+  .inswk .h { grid-column: 1 / -1; color: var(--dim); font-size: 11px; margin-bottom: 2px; }
+  .inskey { display: flex; align-items: center; gap: 3px; color: var(--dim); font-size: 11px; margin-top: 8px; flex-wrap: wrap; }
+  .inskey i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; }
+  .inskey i.nr { border: 1px dashed var(--iaxis); }
+  .inskey span { margin: 0 4px; }
+  /* Where it went: a ranked row per model, account, provider or machine. */
+  .insrank { display: grid; grid-template-columns: minmax(110px, 26%) minmax(0, 1fr) 84px minmax(0, 170px); grid-template-areas: 'n b v a'; gap: 3px 12px; align-items: center; padding: 6px 2px; border-bottom: 1px solid var(--igrid); font-size: 12.5px; }
+  .insrank:last-child { border-bottom: 0; }
+  .insrank .n { grid-area: n; min-width: 0; display: flex; align-items: center; gap: 8px; }
+  .insrank .n > span { min-width: 0; }
+  .insrank .n b { display: block; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .insrank .n small { display: block; color: var(--dim); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .insrank .n i { flex: none; width: 4px; align-self: stretch; border-radius: 2px; }
+  .insrank .t { grid-area: b; height: 10px; background: var(--track); border-radius: 5px; overflow: hidden; }
+  .insrank .t i { display: block; height: 100%; border-radius: 5px; }
+  .insrank .v { grid-area: v; text-align: right; font-weight: 650; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .insrank .a { grid-area: a; text-align: right; color: var(--dim); font-size: 11.5px; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .insrank.np .v { color: var(--dim); font-weight: 500; }
+  .instip { position: fixed; z-index: 50; pointer-events: none; background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; font-size: 12px; box-shadow: 0 6px 20px rgba(0,0,0,.25); min-width: 150px; max-width: 300px; }
   .instip .tt { font-weight: 600; margin-bottom: 4px; }
   .instip .insrow { display: flex; justify-content: space-between; gap: 14px; font-variant-numeric: tabular-nums; }
   .instip .insrow span:first-child { color: var(--dim); }
   .instip .insrow.sum { border-top: 1px solid var(--line); margin-top: 3px; padding-top: 3px; font-weight: 600; }
+  .instip .insrow.why { display: block; color: var(--dim); font-size: 11px; margin-top: 4px; white-space: normal; }
   .instv { max-height: 320px; overflow: auto; }
-  @media (max-width: 1240px) {
-    .inskpis { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-  }
   @media (max-width: 1080px) {
-    .insgrid.three, .insgrid.two, .insgrok { grid-template-columns: 1fr; }
+    .insgrid { grid-template-columns: minmax(0, 1fr); }
+  }
+  @media (max-width: 760px) {
+    .insheads { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .inshead:nth-child(2) { border-right: 0; }
+    .inspace { grid-column: 1 / -1; border-top: 1px solid var(--line); }
+    .inshead .v { font-size: 30px; }
   }
   @media (max-width: 560px) {
-    .inskpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-    .inskpi .v { font-size: 20px; }
-    .inslegt .opt, .instab .opt { display: none; }
-    .insgrok .gstats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-    .insgrok .gplan { grid-template-columns: 1fr; }
+    .inshead { padding: 12px 14px 10px; }
+    .inshead .v { font-size: 25px; }
+    .insherob { padding: 12px 12px 8px; }
+    .insh { flex-wrap: wrap; }
+    .inslegt .opt { display: none; }
+    .insrank { grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: 'n v' 'b b'; }
+    .insrank .a { display: none; }
   }
   @media (max-width: 1080px) {
     .arow { grid-template-columns: repeat(3, minmax(0, 1fr)); }
@@ -3232,7 +3441,7 @@ const PAGE = `<!doctype html>
       </div>
       <p class="sub" id="insNote" style="display:none"></p>
       <div id="insBody"></div>
-      <p class="hint">Tokens include cache reads and writes. Days follow each proxy's clock; a year of days and the last 48 hours are kept in its state file. The API cost is an estimate: what these tokens would cost at the providers' list prices, with cache writes at the 5-minute rate. Third-party backends and unknown models are not priced.</p>
+      <p class="hint">The API cost is an estimate: what these tokens would cost at the providers' list prices, with cache writes at the 5-minute rate. Third-party backends and unknown models are not priced. Anything marked projected, or drawn with a dashed edge, is a projection from recent full days, not a measurement. Tokens include cache reads and writes. Days follow each proxy's clock; a year of days and the last 48 hours are kept in its state file.</p>
     </section>
 
     <section id="page-accounts" style="display:none">
@@ -5311,15 +5520,31 @@ ${SHARED_HELPERS}
   // the rest. Offered only while it has linked instances, and the default then.
   var INS_SCOPES = [{ key: 'all', label: 'All' }, { key: 'local', label: 'This one' }];
   var INS_SCOPE_KEY = 'teamclaude-insights-scope';
+  // The page is built around two numbers. The headline picked is the one
+  // every chart draws, and is remembered: someone who reads the page for the
+  // cost should not have to pick it again on every visit.
+  var INS_METRIC_KEY = 'teamclaude-insights-metric';
+  var INS_METRICS = {
+    cost: { name: 'Est. API cost', color: 'var(--is4)', fmt: fmtUsd, axis: fmtUsdShort },
+    tokens: { name: 'Tokens', color: 'var(--is1)', fmt: fmtTokens, axis: fmtTokens },
+  };
+  var INS_BY = [{ key: 'model', label: 'Models' }, { key: 'account', label: 'Accounts' }, { key: 'provider', label: 'Providers' }, { key: 'machine', label: 'Machines', fleet: true }];
+  // Rows "Where it went" draws; the Table view has every one.
+  var INS_BY_ROWS = 8;
   var INSIGHTS_REFRESH_MS = 60 * 1000;
-  var ins = { charts: [], hidden: Object.create(null), range: '30d', split: 'provider', scope: localStorage.getItem(INS_SCOPE_KEY) === 'local' ? 'local' : 'all', linked: 0, asked: '', data: null, error: null, missing: false, pending: false, at: 0, inFlight: false, tables: Object.create(null), chips: [], drawn: '' };
+  var ins = { charts: [], hidden: Object.create(null), range: '30d', split: 'provider', scope: localStorage.getItem(INS_SCOPE_KEY) === 'local' ? 'local' : 'all', metric: localStorage.getItem(INS_METRIC_KEY) === 'tokens' ? 'tokens' : 'cost', view: 'daily', by: 'model', linked: 0, asked: '', data: null, error: null, missing: false, pending: false, at: 0, inFlight: false, tables: Object.create(null), chips: [], drawn: '' };
 
   // The scope the page draws: "all" needs this machine to have linked instances.
   function insightsScope() {
     return ins.scope === 'all' && ins.linked > 0 ? 'all' : 'local';
   }
+  // The metric the page draws: the cost needs a proxy that estimates it.
+  function insightsMetric(d) {
+    return ins.metric === 'cost' && d && d.cost ? 'cost' : 'tokens';
+  }
   var SVGNS = 'http://www.w3.org/2000/svg';
   var insTip = null;
+  var insGrad = 0;
 
   function buildInsightsControls() {
 
@@ -5364,7 +5589,7 @@ ${SHARED_HELPERS}
       window.addEventListener('pointerdown', function (e) {
         if (e.pointerType !== 'touch') return;
         var at = e.target;
-        if (at && at.closest && (at.closest('svg.inschart:not(.insspark)') || at.closest('.ihb'))) return;
+        if (at && at.closest && (at.closest('svg.inschart') || at.closest('.insrank'))) return;
         insightsCursor(null);
         hideInsightsTip();
       });
@@ -5453,11 +5678,26 @@ ${SHARED_HELPERS}
     return n;
   }
 
+  // A vertical gradient in a series' colour, from opacity top at its top
+  // edge to bottom at its foot, as a fill reference. A stop-color attribute
+  // does not resolve a CSS variable either, so the stops are styled too.
+  function gradient(defs, color, top, bottom) {
+    var id = 'insg' + (++insGrad);
+    var g = svgEl('linearGradient', { id: id, x1: 0, y1: 0, x2: 0, y2: 1 }, defs);
+    [[0, top], [1, bottom]].forEach(function (st) {
+      var stop = svgEl('stop', { offset: st[0] }, g);
+      stop.style.stopColor = color;
+      stop.style.stopOpacity = String(st[1]);
+    });
+    return 'url(#' + id + ')';
+  }
+
   function showInsightsTip(e, title, rows) {
     if (!insTip) { insTip = el('div', 'instip'); document.body.appendChild(insTip); }
     insTip.textContent = '';
     insTip.appendChild(el('div', 'tt', title));
     rows.forEach(function (r) {
+      if (r.why) { insTip.appendChild(el('div', 'insrow why', r.why)); return; }
       var row = el('div', 'insrow' + (r.strong ? ' sum' : ''));
       var l = el('span');
       if (r.color) { var sw = el('i', 'insw'); sw.style.background = r.color; l.appendChild(sw); }
@@ -5477,11 +5717,19 @@ ${SHARED_HELPERS}
 
   function hideInsightsTip() { if (insTip) insTip.style.display = 'none'; }
 
-  // Every time panel shares one cursor, as Grafana's shared crosshair does:
-  // hovering (or tapping) a bucket on any of them marks that bucket on all
-  // of them, and the tooltip opens on the one under the pointer.
+  // One cursor across the page: hovering (or tapping) a day on the hero
+  // chart marks it on the calendar, and a day on the calendar marks it on the
+  // chart, so a dark square can be read against its stack and back.
   function insightsCursor(i) {
     ins.charts.forEach(function (c) { c.mark(i); });
+  }
+
+  // The tooltip handlers every drawn thing shares: a pointer over it shows its
+  // reading, a finger lifting keeps it until a tap elsewhere.
+  function tipOn(node, show, leave) {
+    node.addEventListener('pointermove', show);
+    node.addEventListener('pointerdown', show);
+    node.addEventListener('pointerleave', function (e) { if (e.pointerType === 'touch') return; if (leave) leave(); hideInsightsTip(); });
   }
 
   // The legend as a table, the way monitoring tools draw it: each series with
@@ -5509,7 +5757,8 @@ ${SHARED_HELPERS}
       btn.appendChild(el('span', '', sr.label));
       name.appendChild(btn);
       tr.appendChild(name);
-      [st.total, st.avg, st.max, st.last].forEach(function (v, i) { tr.appendChild(el('td', 'num' + (i === 1 || i === 3 ? ' opt' : ''), fmt(v))); });
+      // A series with tokens but no price is not a free one: it says so rather than $0.
+      [st.total, st.avg, st.max, st.last].forEach(function (v, i) { tr.appendChild(el('td', 'num' + (i === 1 || i === 3 ? ' opt' : ''), sr.unpriced ? (i ? '—' : 'not priced') : fmt(v))); });
       if (series.length > 1) {
         tr.className += ' tog';
         btn.setAttribute('aria-pressed', off ? 'false' : 'true');
@@ -5537,33 +5786,18 @@ ${SHARED_HELPERS}
     host.appendChild(wrap);
   }
 
-  // A compact legend for a small panel: the series are the ones the table
-  // under "Tokens over time" names, in the same colours.
-  function insightsLegend(host, series, fmt) {
-    var box = el('div', 'inslegend');
-    series.forEach(function (sr) {
-      if (ins.hidden[sr.key]) return;
-      var item = el('span');
-      var sw = el('i', 'insl');
-      sw.style.background = sr.color;
-      item.appendChild(sw);
-      item.appendChild(el('span', '', sr.label));
-      item.appendChild(el('b', '', fmt(sr.total)));
-      box.appendChild(item);
-    });
-    host.appendChild(box);
-  }
+  var INS_M = { l: 54, r: 12, t: 16, b: 22 };
 
-  var INS_M = { l: 52, r: 10, t: 12, b: 22 };
-
-  // One time panel. Every panel puts bucket i at the same x (the middle of
-  // its band), so the shared cursor lines up from one to the next.
-  //   type 'area'  stacked areas: a light fill under a 1.5px line per series
-  //   type 'bars'  stacked bars, square-ended, a 1px surface gap between them
-  //   type 'line'  one unstacked line that breaks where a bucket has no value
-  // o.top fixes the axis (a rate's 100%); o.count keeps it on whole steps;
-  // o.avg draws the series' average as a dashed reference line.
-  function drawTimeSeries(host, d, series, o) {
+  // The hero chart: the chosen metric per hour or day, stacked by the split,
+  // or (o.view 'total') each series' running total stacked, so its right
+  // edge lands on the headline. Bars carry a gradient that fades toward the
+  // axis; the bucket still filling (this hour, today) is drawn faded, since
+  // it is not a full one. Per bucket, a dashed line marks the average; as a
+  // running total, it marks what the whole period before came to, so the
+  // line crossing it is the moment this period overtook the last.
+  //   o: { view, height, fmt, axis, avg, ref: { value, label }|null,
+  //        other: number[]|null, otherName, otherFmt, name }
+  function drawHero(host, d, series, o) {
     var W = Math.max(260, host.clientWidth || 600);
     var H = o.height;
     var m = INS_M;
@@ -5574,20 +5808,23 @@ ${SHARED_HELPERS}
     var X = function (i) { return m.l + (i + 0.5) * band; };
     var shown = series.filter(function (sr) { return !ins.hidden[sr.key]; });
     if (!shown.length) shown = series;
-    var cols = o.type === 'line' ? null : stackSeries(shown, n);
+    var total = o.view === 'total';
+    var drawn = total ? shown.map(function (sr) { return { key: sr.key, label: sr.label, color: sr.color, values: runningTotals(sr.values) }; }) : shown;
+    var cols = stackSeries(drawn, n);
     var max = 0;
-    if (cols) cols.forEach(function (c) { if (c.length) max = Math.max(max, c[c.length - 1][1]); });
-    else shown.forEach(function (sr) { sr.values.forEach(function (v) { if (v != null && v > max) max = v; }); });
+    cols.forEach(function (c) { if (c.length) max = Math.max(max, c[c.length - 1][1]); });
+    if (total && o.ref && o.ref.value > max) max = o.ref.value;
     // A range that spent nothing still gets four distinct gridline labels.
-    var top = o.top || (!(max > 0) ? 4 : o.count ? 4 * niceStep(max / 4) : niceCeil(max));
+    var top = !(max > 0) ? 4 : niceCeil(max);
     var Y = function (v) { return m.t + ph - Math.min(v, top) / top * ph; };
     var s = svgEl('svg', { class: 'inschart', width: W, height: H, viewBox: '0 0 ' + W + ' ' + H, role: 'img', 'aria-label': o.name }, host);
+    var defs = svgEl('defs', {}, s);
     // Four bands of grid: dashed and faint, with a solid baseline.
     for (var g = 0; g <= 4; g++) {
       var gy = m.t + ph - ph * g / 4;
       var line = paint(svgEl('line', { x1: m.l, x2: W - m.r, y1: gy, y2: gy, 'stroke-width': 1 }, s), null, g ? 'var(--igrid)' : 'var(--iaxis)');
       if (g) line.setAttribute('stroke-dasharray', '3 3');
-      svgEl('text', { x: m.l - 8, y: gy + 4, 'text-anchor': 'end' }, s).textContent = g ? o.fmt(top * g / 4) : '0';
+      svgEl('text', { x: m.l - 8, y: gy + 4, 'text-anchor': 'end' }, s).textContent = g ? o.axis(top * g / 4) : '0';
     }
     // Labels anchored on the latest bucket and stepped back from it, as far
     // apart as the widest label needs.
@@ -5599,88 +5836,65 @@ ${SHARED_HELPERS}
       if (lx - half < 2 || lx + half > W - 2) continue;
       svgEl('text', { x: lx, y: H - 6, 'text-anchor': 'middle' }, s).textContent = insightsBucketLabel(d.buckets[li], d.unit, false);
     }
-    if (o.type === 'bars') {
-      var gap = band >= 6 ? Math.min(6, band * 0.25) : 0;
+    // The cursor's column, behind the marks.
+    var hl = svgEl('rect', { y: m.t, height: ph, width: Math.max(1, band), rx: 3 }, s);
+    paint(hl, 'var(--text)');
+    hl.style.opacity = '0.07';
+    hl.style.display = 'none';
+    var fills = drawn.map(function (sr) { return total ? gradient(defs, sr.color, 0.55, 0.04) : gradient(defs, sr.color, 1, 0.5); });
+    if (!total || n === 1) {
+      var gap = band >= 6 ? Math.min(8, band * 0.28) : band >= 3 ? 1 : 0;
       // Under a pixel a bucket, a bar is its band: a year on a phone.
       var bw = band >= 1 ? Math.max(1, band - gap) : band;
       for (var bi = 0; bi < n; bi++) {
-        shown.forEach(function (sr, si) {
+        var into = bi === n - 1 ? svgEl('g', { class: 'insnow' }, s) : s;
+        for (var si = 0; si < drawn.length; si++) {
           var lo = cols[bi][si][0];
           var hi = cols[bi][si][1];
-          if (!(hi > lo)) return;
+          if (!(hi > lo)) continue;
           var y0 = Y(hi);
-          var h = Math.max(1, Y(lo) - y0 - (si ? 1 : 0));
-          paint(svgEl('rect', { x: m.l + bi * band + gap / 2, y: y0, width: bw, height: h }, s), sr.color);
-        });
-      }
-    } else if (o.type === 'area') {
-      shown.forEach(function (sr, si) {
-        if (n === 1) {
-          var lo = cols[0][si][0];
-          var hi = cols[0][si][1];
-          // One bucket (All, on the day recording began) is a band drawn
-          // like the areas: the light fill, and the line on its top.
-          if (!(hi > lo)) return;
-          var bx = m.l + band * 0.1;
-          var bwid = band * 0.8;
-          paint(svgEl('rect', { x: bx, y: Y(hi), width: bwid, height: Math.max(1, Y(lo) - Y(hi)), class: 'insfill' }, s), sr.color);
-          paint(svgEl('path', { d: 'M' + bx + ',' + Y(hi) + 'h' + bwid, 'stroke-width': 1.5 }, s), null, sr.color);
-          return;
+          svgEl('rect', { x: m.l + bi * band + gap / 2, y: y0, width: bw, height: Math.max(1, Y(lo) - y0 - (si ? 1 : 0)), fill: fills[si] }, into);
         }
+      }
+    } else {
+      drawn.forEach(function (sr, k) {
         var up = '';
         var down = '';
         for (var i = 0; i < n; i++) {
-          up += (i ? 'L' : 'M') + X(i).toFixed(1) + ',' + Y(cols[i][si][1]).toFixed(1);
-          down = 'L' + X(i).toFixed(1) + ',' + Y(cols[i][si][0]).toFixed(1) + down;
+          up += (i ? 'L' : 'M') + X(i).toFixed(1) + ',' + Y(cols[i][k][1]).toFixed(1);
+          down = 'L' + X(i).toFixed(1) + ',' + Y(cols[i][k][0]).toFixed(1) + down;
         }
-        paint(svgEl('path', { d: up + down + 'Z', class: 'insfill' }, s), sr.color);
-        paint(svgEl('path', { d: up, fill: 'none', 'stroke-width': 1.5, 'stroke-linejoin': 'round' }, s), null, sr.color);
+        svgEl('path', { d: up + down + 'Z', fill: fills[k] }, s);
+        paint(svgEl('path', { d: up, fill: 'none', 'stroke-width': 2, 'stroke-linejoin': 'round' }, s), null, sr.color);
       });
-    } else {
-      shown.forEach(function (sr) {
-        var dpath = '';
-        var pen = false;
-        sr.values.forEach(function (v, i) {
-          if (v == null) { pen = false; return; }
-          dpath += (pen ? 'L' : 'M') + X(i).toFixed(1) + ',' + Y(v).toFixed(1);
-          pen = true;
-        });
-        // A bucket with neighbours on neither side would be a path of one
-        // point, which draws nothing: give it a dot.
-        sr.values.forEach(function (v, i) {
-          if (v != null && sr.values[i - 1] == null && sr.values[i + 1] == null) paint(svgEl('circle', { cx: X(i), cy: Y(v), r: 2 }, s), sr.color);
-        });
-        paint(svgEl('path', { d: dpath, fill: 'none', 'stroke-width': 1.5, 'stroke-linejoin': 'round' }, s), null, sr.color);
-      });
+      var last = cols[n - 1];
+      if (last.length) paint(svgEl('circle', { cx: X(n - 1), cy: Y(last[last.length - 1][1]), r: 3.5, 'stroke-width': 2 }, s), drawn[drawn.length - 1].color, 'var(--panel)');
     }
-    if (o.avg != null) {
-      var ay = Y(o.avg);
-      var avgLine = paint(svgEl('line', { x1: m.l, x2: W - m.r, y1: ay, y2: ay, 'stroke-width': 1, 'stroke-dasharray': '6 4' }, s), null, 'var(--dim)');
-      avgLine.style.opacity = '0.7';
-      svgEl('text', { x: W - m.r, y: ay - 4, 'text-anchor': 'end' }, s).textContent = 'avg ' + o.fmt(o.avg);
-    }
-    // The shared cursor: a hairline, and a dot where it crosses each line.
-    var cur = svgEl('g', { class: 'inscur' }, s);
-    cur.style.display = 'none';
-    paint(svgEl('line', { y1: m.t, y2: m.t + ph, 'stroke-width': 1 }, cur), null, 'var(--dim)');
-    var dots = o.type === 'bars' ? [] : shown.map(function (sr) {
-      var c = svgEl('circle', { r: 3, 'stroke-width': 2 }, cur);
+    var refLine = function (v, text, left) {
+      var y = Y(v);
+      var ln = paint(svgEl('line', { x1: m.l, x2: W - m.r, y1: y, y2: y, 'stroke-width': 1.25, 'stroke-dasharray': '6 4' }, s), null, 'var(--text)');
+      ln.style.opacity = '0.55';
+      var tx = svgEl('text', { x: left ? m.l + 6 : W - m.r, y: y - 5, 'text-anchor': left ? 'start' : 'end', class: 'insref' }, s);
+      tx.textContent = text;
+    };
+    if (!total && o.avg > 0) refLine(o.avg, o.avgText, false);
+    if (total && o.ref) refLine(o.ref.value, o.ref.label, true);
+    // The shared cursor in the running total: a dot where it crosses each line.
+    var dots = total ? drawn.map(function (sr) {
+      var c = svgEl('circle', { r: 3, 'stroke-width': 2 }, s);
       paint(c, sr.color, 'var(--panel)');
+      c.style.display = 'none';
       return c;
-    });
+    }) : [];
     ins.charts.push({
       mark: function (i) {
-        if (i == null || i >= n) { cur.style.display = 'none'; return; }
-        cur.style.display = '';
-        var x = X(i);
-        cur.firstChild.setAttribute('x1', x);
-        cur.firstChild.setAttribute('x2', x);
-        shown.forEach(function (sr, si) {
-          if (!dots[si]) return;
-          var v = cols ? cols[i][si][1] : sr.values[i];
-          dots[si].style.display = v == null ? 'none' : '';
-          if (v != null) { dots[si].setAttribute('cx', x); dots[si].setAttribute('cy', Y(v)); }
+        var off = i == null || i >= n;
+        hl.style.display = off ? 'none' : '';
+        dots.forEach(function (c, k) {
+          c.style.display = off ? 'none' : '';
+          if (!off) { c.setAttribute('cx', X(i)); c.setAttribute('cy', Y(cols[i][k][1])); }
         });
+        if (!off) hl.setAttribute('x', m.l + i * band);
       },
     });
     var hit = svgEl('rect', { x: m.l, y: m.t, width: pw, height: ph, fill: 'transparent' }, s);
@@ -5688,51 +5902,163 @@ ${SHARED_HELPERS}
       var box = s.getBoundingClientRect();
       return bucketAt(e.clientX - box.left - m.l, band, n);
     };
-    var move = function (e) {
+    tipOn(hit, function (e) {
       var i = at(e);
       insightsCursor(i);
-      var rows = o.tip ? o.tip(i) : shown.slice().reverse().map(function (sr) { return { label: sr.label, value: o.fmtTip(sr.values[i] || 0), color: sr.color }; });
-      if (!o.tip && shown.length > 1) rows.push({ label: 'Total', value: o.fmtTip(cols[i].length ? cols[i][cols[i].length - 1][1] : 0), strong: true });
-      showInsightsTip(e, insightsBucketLabel(d.buckets[i], d.unit, true), rows);
-    };
-    hit.addEventListener('pointermove', move);
-    hit.addEventListener('pointerdown', move);
-    // A finger lifting is a pointerleave too: a tap keeps its reading until
-    // the next tap elsewhere (buildInsightsControls).
-    hit.addEventListener('pointerleave', function (e) { if (e.pointerType === 'touch') return; insightsCursor(null); hideInsightsTip(); });
+      var rows = shown.slice().reverse().map(function (sr) { return { label: sr.label, value: sr.unpriced ? 'not priced' : o.fmt(sr.values[i] || 0), color: sr.color }; });
+      var sum = shown.reduce(function (x, sr) { return x + (sr.values[i] || 0); }, 0);
+      if (shown.length > 1) rows.push({ label: 'Total', value: o.fmt(sum), strong: true });
+      if (total) rows.push({ label: 'Running total', value: o.fmt(cols[i].length ? cols[i][cols[i].length - 1][1] : 0), strong: true });
+      if (o.other) rows.push({ label: o.otherName, value: o.otherFmt(o.other[i] || 0) });
+      showInsightsTip(e, insightsBucketLabel(d.buckets[i], d.unit, true) + (i === n - 1 ? ' (so far)' : ''), rows);
+    }, function () { insightsCursor(null); });
   }
 
-  // A part of a whole as one 100% bar, then a row per part with its share.
-  // Monitoring tools draw composition this way rather than as a pie: a slice
-  // of 1% is still a sliver you can find, and the numbers sit beside it.
-  function compositionBar(host, items, fmt) {
-    var total = items.reduce(function (x, it) { return x + it.value; }, 0);
-    var bar = el('div', 'inscomp');
-    items.forEach(function (it) {
-      if (!(it.value > 0)) return;
-      var seg = el('i');
-      seg.style.background = it.color;
-      seg.style.flexGrow = String(it.value);
-      seg.title = it.label;
-      bar.appendChild(seg);
+  // The range's days as a calendar (calendarGrid), each square in the
+  // metric's colour at one of four strengths, with each weekday's average
+  // full day beside it. The squares are sized to the card, so a year fits a
+  // phone and a week does not sprawl across a monitor.
+  function drawCalendar(host, d, values, mt) {
+    var cal = calendarGrid(d, values);
+    var weeks = Math.max(1, cal.weeks.length);
+    var wrap = el('div', 'inscal');
+    host.appendChild(wrap);
+    var room = Math.max(160, host.clientWidth || 600);
+    var side = room >= 560 ? 220 : 0;
+    var lw = 30;
+    var cell = Math.max(5, Math.min(18, Math.floor((room - side - lw) / weeks) - 3));
+    var gap = cell >= 10 ? 3 : 2;
+    var stepx = cell + gap;
+    var mt0 = 16;
+    var W = lw + weeks * stepx;
+    var H = mt0 + 7 * stepx;
+    var s = svgEl('svg', { class: 'inschart', width: W, height: H, viewBox: '0 0 ' + W + ' ' + H, role: 'img', 'aria-label': 'By day' }, wrap);
+    [0, 2, 4].forEach(function (r) {
+      svgEl('text', { x: 0, y: mt0 + r * stepx + cell - 1 }, s).textContent = cal.weekdays[r].label;
     });
-    host.appendChild(bar);
-    var rows = el('div', 'insrows');
-    items.forEach(function (it) {
-      var row = el('div', 'insrow');
-      var l = el('span');
-      var sw = el('i', 'insw');
-      sw.style.background = it.color;
-      l.appendChild(sw);
-      l.appendChild(el('span', '', it.label));
-      row.appendChild(l);
-      var r = el('span');
-      r.appendChild(el('b', '', total > 0 ? pctOf(it.value / total) : '—'));
-      r.appendChild(el('span', 'hint', ' ' + fmt(it.value)));
-      row.appendChild(r);
-      rows.appendChild(row);
+    var shades = [0.22, 0.45, 0.7, 1];
+    var pos = [];
+    var lastLabel = -99;
+    cal.weeks.forEach(function (week, wi) {
+      var x = lw + wi * stepx;
+      // A month's name over the first week that holds its 1st, or over the
+      // first week drawn when the next month's 1st is not about to take the room.
+      var opens = function (w) { return !!w && w.some(function (c) { return c && c.key.slice(8) === '01'; }); };
+      var lead = wi === 0 && !cal.weeks.some(function (w, k) { return k > 0 && k * stepx < 30 && opens(w); });
+      var firstOf = week.filter(function (c) { return c && (lead || c.key.slice(8) === '01'); })[0];
+      if (firstOf && x - lastLabel >= 30 && x + 24 <= W) {
+        svgEl('text', { x: x, y: 10 }, s).textContent = new Date(Number(firstOf.key.slice(0, 4)), Number(firstOf.key.slice(5, 7)) - 1, 1).toLocaleDateString([], { month: 'short' });
+        lastLabel = x;
+      }
+      week.forEach(function (c, r) {
+        if (!c) return;
+        var y = mt0 + r * stepx;
+        var sq = svgEl('rect', { class: 'day', x: x, y: y, width: cell, height: cell, rx: Math.min(3, cell / 4) }, s);
+        if (c.level < 0) {
+          paint(sq, 'transparent', 'var(--iaxis)');
+          sq.setAttribute('stroke-dasharray', '2 2');
+        } else if (c.level === 0) {
+          paint(sq, 'var(--track)');
+        } else {
+          paint(sq, mt.color);
+          sq.style.fillOpacity = String(shades[c.level - 1]);
+        }
+        if (c.today) { sq.style.stroke = 'var(--text)'; sq.setAttribute('stroke-width', 1); sq.style.strokeDasharray = '2 1.5'; }
+        pos[c.i] = { x: x, y: y };
+        tipOn(sq, function (e) {
+          insightsCursor(c.i);
+          showInsightsTip(e, insightsBucketLabel(c.key, 'day', true) + (c.today ? ' (so far)' : ''), c.level < 0
+            ? [{ why: 'Before recording began: not idle, not recorded.' }]
+            : [{ label: mt.name, value: mt.fmt(c.value), color: mt.color }]);
+        }, function () { insightsCursor(null); });
+      });
     });
-    host.appendChild(rows);
+    var ring = svgEl('rect', { width: cell + 2, height: cell + 2, rx: Math.min(4, cell / 3), fill: 'none', 'stroke-width': 1.5 }, s);
+    paint(ring, null, 'var(--text)');
+    ring.style.display = 'none';
+    ring.style.pointerEvents = 'none';
+    ins.charts.push({
+      mark: function (i) {
+        var p = i == null ? null : pos[i];
+        ring.style.display = p ? '' : 'none';
+        if (p) { ring.setAttribute('x', p.x - 1); ring.setAttribute('y', p.y - 1); }
+      },
+    });
+    var wk = el('div', 'inswk');
+    wk.appendChild(el('div', 'h', 'Average full day'));
+    var top = cal.weekdays.reduce(function (x, w) { return Math.max(x, w.avg || 0); }, 0);
+    cal.weekdays.forEach(function (w) {
+      wk.appendChild(el('span', 'k', w.label));
+      var t = el('div', 't');
+      var f = el('i');
+      f.style.width = (top > 0 && w.avg ? Math.max(1, w.avg / top * 100) : 0) + '%';
+      f.style.background = mt.color;
+      t.appendChild(f);
+      wk.appendChild(t);
+      wk.appendChild(el('span', 'x', w.avg == null ? '—' : mt.fmt(w.avg)));
+    });
+    wrap.appendChild(wk);
+    var key = el('div', 'inskey');
+    key.appendChild(el('span', '', 'Less'));
+    var zero = el('i');
+    zero.style.background = 'var(--track)';
+    key.appendChild(zero);
+    shades.forEach(function (op) {
+      var sw = el('i');
+      sw.style.background = mt.color;
+      sw.style.opacity = String(op);
+      key.appendChild(sw);
+    });
+    key.appendChild(el('span', '', 'More'));
+    var nr = el('i', 'nr');
+    key.appendChild(nr);
+    key.appendChild(el('span', '', 'not recorded'));
+    host.appendChild(key);
+  }
+
+  // Calendar months as bars (monthTotals): what each came to, and for the
+  // month still running, a dashed extension up to where it is on pace to end.
+  // A month the range or recording starts part-way through says from when.
+  function drawMonths(host, months, mt) {
+    var W = Math.max(220, host.clientWidth || 400);
+    var H = 190;
+    var m = { l: 6, r: 6, t: 22, b: 34 };
+    var n = months.length;
+    var band = (W - m.l - m.r) / Math.max(1, n);
+    var bw = Math.max(4, Math.min(64, band * 0.62));
+    var max = months.reduce(function (x, mo) { return Math.max(x, mo.total, mo.projected || 0); }, 0);
+    var ph = H - m.t - m.b;
+    var Y = function (v) { return m.t + ph - (max > 0 ? v / max * ph : 0); };
+    var s = svgEl('svg', { class: 'inschart', width: W, height: H, viewBox: '0 0 ' + W + ' ' + H, role: 'img', 'aria-label': 'By month' }, host);
+    var defs = svgEl('defs', {}, s);
+    var fill = gradient(defs, mt.color, 1, 0.55);
+    paint(svgEl('line', { x1: m.l, x2: W - m.r, y1: m.t + ph, y2: m.t + ph, 'stroke-width': 1 }, s), null, 'var(--iaxis)');
+    months.forEach(function (mo, i) {
+      var cx = m.l + (i + 0.5) * band;
+      var x = cx - bw / 2;
+      var hl = svgEl('rect', { x: m.l + i * band + 1, y: m.t - 18, width: Math.max(1, band - 2), height: ph + 18, rx: 4, fill: 'transparent' }, s);
+      if (mo.projected != null && mo.projected > mo.total) {
+        var pr = svgEl('rect', { x: x + 0.5, y: Y(mo.projected), width: bw - 1, height: Math.max(1, Y(mo.total) - Y(mo.projected)), rx: 3, 'stroke-width': 1.25, 'stroke-dasharray': '4 3' }, s);
+        paint(pr, mt.color, mt.color);
+        pr.style.fillOpacity = '0.12';
+      }
+      if (mo.total > 0) svgEl('rect', { x: x, y: Y(mo.total), width: bw, height: Math.max(1, Y(0) - Y(mo.total)), rx: 3, fill: fill, class: mo.from ? 'insnow' : '' }, s);
+      // Values over the bars where they fit; the tooltip has every one.
+      if (band >= 40 || i === n - 1) {
+        var lab = svgEl('text', { x: cx, y: Y(Math.max(mo.total, mo.projected || 0)) - 6, 'text-anchor': 'middle' }, s);
+        lab.textContent = (mo.projected != null ? '≈ ' : '') + mt.axis(mo.projected != null ? mo.projected : mo.total);
+        if (mo.projected == null) lab.style.fill = 'var(--text)';
+      }
+      svgEl('text', { x: cx, y: H - 18, 'text-anchor': 'middle' }, s).textContent = mo.label;
+      var note = mo.current ? (mo.projected != null ? 'so far' : 'to date') : mo.from ? 'from ' + Number(mo.from.slice(8)) : '';
+      if (note && band >= 34) svgEl('text', { x: cx, y: H - 5, 'text-anchor': 'middle', class: 'insref' }, s).textContent = note;
+      tipOn(hl, function (e) {
+        var rows = [{ label: mo.current ? 'So far' : 'Total', value: mt.fmt(mo.total), color: mt.color }, { label: 'Days counted', value: String(mo.days) }];
+        if (mo.projected != null) rows.push({ label: 'On pace for', value: mt.fmt(mo.projected), strong: true }, { why: 'Projected from the last full days; not a measurement.' });
+        if (mo.from && !mo.current) rows.push({ why: 'Counted from ' + insightsBucketLabel(mo.from, 'day', false) + ': the range or the history starts there.' });
+        showInsightsTip(e, mo.long, rows);
+      });
+    });
   }
 
   // A share as it reads at a glance: one decimal under 10%, whole above.
@@ -5741,72 +6067,82 @@ ${SHARED_HELPERS}
     return (p > 0 && p < 10 ? p.toFixed(1) : Math.round(p)) + '%';
   }
 
-  function drawRanked(host, items) {
-    var max = items.reduce(function (x, it) { return Math.max(x, it.value); }, 0);
-    items.forEach(function (it) {
-      var row = el('div', 'ihb');
-      var name = el('span', 'n', it.label);
-      name.title = it.label;
+  // "Where it went": the top rows of breakdownRows as ranked bars of the
+  // chosen metric, each with the other metric and the cost of a million of
+  // its tokens beside it. Hovering a row shows everything known about it.
+  function drawBreakdown(host, rows, metric) {
+    var byCost = metric === 'cost';
+    var max = rows.reduce(function (x, r) { return Math.max(x, byCost ? r.cost || 0 : r.tokens); }, 0);
+    if (!rows.length) host.appendChild(el('p', 'hint', 'Nothing in this range.'));
+    rows.slice(0, INS_BY_ROWS).forEach(function (r) {
+      var value = byCost ? r.cost : r.tokens;
+      var row = el('div', 'insrank' + (value == null ? ' np' : ''));
+      var name = el('div', 'n');
+      var sw = el('i');
+      sw.style.background = r.color;
+      name.appendChild(sw);
+      var who = el('span');
+      var b = el('b', '', r.label);
+      b.title = r.label;
+      who.appendChild(b);
+      if (r.group) who.appendChild(el('small', '', r.group));
+      name.appendChild(who);
       row.appendChild(name);
-      var track = el('div', 't');
-      var fill = el('div', 'f');
-      fill.style.width = (max > 0 ? Math.max(0.5, it.value / max * 100) : 0) + '%';
-      fill.style.background = it.color;
-      track.appendChild(fill);
-      row.appendChild(track);
-      row.appendChild(el('span', 'v', it.text != null ? it.text : fmtTokens(it.value)));
-      row.addEventListener('pointermove', function (e) { showInsightsTip(e, it.label, it.tip); });
-      row.addEventListener('pointerdown', function (e) { showInsightsTip(e, it.label, it.tip); });
-      row.addEventListener('pointerleave', function (e) { if (e.pointerType !== 'touch') hideInsightsTip(); });
+      var t = el('div', 't');
+      var f = el('i');
+      f.style.width = (value != null && max > 0 ? Math.max(0.5, value / max * 100) : 0) + '%';
+      f.style.background = r.color;
+      t.appendChild(f);
+      row.appendChild(t);
+      row.appendChild(el('span', 'v', byCost ? (r.cost == null ? 'not priced' : fmtUsd(r.cost)) : fmtTokens(r.tokens)));
+      var aux = byCost
+        ? fmtTokens(r.tokens) + ' tokens' + (r.perMillion != null ? ' · ' + fmtUsd(r.perMillion) + '/M' : '')
+        : (r.share != null ? pctOf(r.share) + ' · ' : '') + (r.cost == null ? 'not priced' : fmtUsd(r.cost));
+      row.appendChild(el('span', 'a', aux));
+      tipOn(row, function (e) {
+        var tip = [
+          { label: 'Est. API cost', value: r.cost == null ? 'not priced' : fmtUsd(r.cost) },
+          { label: 'Tokens', value: fmtTokens(r.tokens) },
+          { label: 'Requests', value: Math.round(r.requests).toLocaleString() },
+          { label: 'Per million tokens', value: r.perMillion == null ? '—' : fmtUsd(r.perMillion) },
+        ];
+        if (r.hit != null) tip.push({ label: 'Cache hit', value: (r.hit * 100).toFixed(1) + '%' });
+        if (r.share != null) tip.push({ label: 'Share of the ' + (byCost ? 'cost' : 'tokens'), value: pctOf(r.share), strong: true });
+        showInsightsTip(e, r.label + (r.group ? ' · ' + r.group : ''), tip);
+      });
       host.appendChild(row);
     });
+    if (rows.length > INS_BY_ROWS) host.appendChild(el('p', 'hint insmore', (rows.length - INS_BY_ROWS) + ' more in the Table view.'));
   }
 
-  // A tile's sparkline, drawn at the width its box has (less pad, the
-  // box's own padding) rather than stretched to it, with a dot on the latest
-  // bucket. A null is a gap: an idle hour has no cache hit rate, and drawing
-  // it as 0% would read as a cold cache.
-  function sparkline(parent, values, color, pad) {
-    var W = Math.max(60, (parent.clientWidth || 212) - (pad == null ? 32 : pad));
-    var H = 26;
-    var n = values.length;
-    var max = Math.max.apply(null, values.map(function (v) { return v || 0; }).concat([0])) || 1;
-    // insspark: a tap here is not a tap on a chart (it has no crosshair).
-    var s = svgEl('svg', { class: 'inschart insspark', width: W, height: H, viewBox: '0 0 ' + W + ' ' + H, 'aria-hidden': 'true' }, parent);
-    var px = function (i) { return n === 1 ? W / 2 : 2 + i * (W - 4) / (n - 1); };
-    var py = function (v) { return H - 3 - (v || 0) / max * (H - 7); };
-    // One run of buckets with values at a time: its line, and the fill under it.
-    var run = [];
-    var flush = function () {
-      if (!run.length) return;
-      // A bucket with no neighbours is a dot, as on the cache chart.
-      if (run.length === 1) { paint(svgEl('circle', { cx: px(run[0]), cy: py(values[run[0]]), r: 2 }, s), color); run = []; return; }
-      var d = run.map(function (i, k) { return (k ? 'L' : 'M') + px(i).toFixed(1) + ',' + py(values[i]).toFixed(1); }).join('');
-      paint(svgEl('path', { d: d + 'L' + px(run[run.length - 1]).toFixed(1) + ',' + H + 'L' + px(run[0]).toFixed(1) + ',' + H + 'Z', class: 'insfill' }, s), color);
-      paint(svgEl('path', { d: d, fill: 'none', 'stroke-width': 1.5, 'stroke-linejoin': 'round' }, s), null, color);
-      run = [];
-    };
-    var last = -1;
-    values.forEach(function (v, i) {
-      if (v == null) { flush(); return; }
-      run.push(i);
-      last = i;
+  // A row of mutually exclusive buttons inside a card's header.
+  function segmented(host, options, current, pick) {
+    var seg = el('div', 'inseg');
+    options.forEach(function (o) {
+      var b = button(o.key === current ? 'sel' : '', o.label, function () { if (o.key !== current) pick(o.key); });
+      b.setAttribute('aria-pressed', o.key === current ? 'true' : 'false');
+      seg.appendChild(b);
     });
-    flush();
-    if (last >= 0) paint(svgEl('circle', { cx: px(last), cy: py(values[last]), r: 2.5 }, s), color);
+    host.appendChild(seg);
   }
 
   // A chart card with a Table button: every chart can be read as numbers too,
-  // which is also what a reader who cannot tell the colours apart falls back on.
-  function insightsCard(parent, key, title, sub, draw, table) {
-    var card = el('div', 'card');
+  // which is also what a reader who cannot tell the colours apart falls back
+  // on. o.tools adds controls beside the button; o.bare draws into
+  // parent without a card of its own (the hero is already one).
+  function insightsCard(parent, key, title, sub, draw, table, o) {
+    o = o || {};
+    var card = el('div', o.bare ? '' : 'card');
     parent.appendChild(card);
     var head = el('div', 'insh');
     var t = el('div');
     t.appendChild(el('b', '', title));
     t.appendChild(el('span', 's', sub));
     head.appendChild(t);
-    if (table) head.appendChild(button('btn', ins.tables[key] ? 'Chart' : 'Table', function () { ins.tables[key] = !ins.tables[key]; renderInsights(); }));
+    var tools = el('div', 'instools');
+    if (o.tools) o.tools(tools);
+    if (table) tools.appendChild(button('btn', ins.tables[key] ? 'Chart' : 'Table', function () { ins.tables[key] = !ins.tables[key]; renderInsights(); }));
+    head.appendChild(tools);
     card.appendChild(head);
     var body = el('div');
     card.appendChild(body);
@@ -5827,16 +6163,62 @@ ${SHARED_HELPERS}
     return card;
   }
 
+  // The hero's headlines: the estimated cost and the tokens, each a tab
+  // that picks the metric every chart draws, and the pace of the one picked.
+  function heroHeads(card, d, metric) {
+    var heads = el('div', 'insheads');
+    ['cost', 'tokens'].forEach(function (k) {
+      var h = insightsHeadline(d, k);
+      var mt = INS_METRICS[k];
+      // A proxy too old to estimate the cost has no cost tab to pick.
+      var can = k === 'tokens' || !!d.cost;
+      var b = el(can ? 'button' : 'div', 'inshead' + (k === metric ? ' sel' : ''));
+      b.style.cssText = '--hc: ' + mt.color;
+      if (can) {
+        b.type = 'button';
+        b.setAttribute('aria-pressed', k === metric ? 'true' : 'false');
+        b.title = 'Draw the ' + (k === 'cost' ? 'estimated API cost' : 'tokens') + ' on every chart';
+        b.addEventListener('click', function () {
+          if (ins.metric === k) return;
+          ins.metric = k;
+          localStorage.setItem(INS_METRIC_KEY, k);
+          renderInsights();
+        });
+      }
+      var l = el('span', 'l');
+      l.appendChild(el('i'));
+      l.appendChild(el('span', '', h.label));
+      b.appendChild(l);
+      b.appendChild(el('span', 'v', h.text));
+      var dl = el('span', 'd');
+      if (h.change) dl.appendChild(el('span', 'inspill', h.change));
+      dl.appendChild(el('span', '', h.vs));
+      b.appendChild(dl);
+      if (h.note) b.appendChild(el('span', 'n', h.note));
+      heads.appendChild(b);
+    });
+    var pace = insightsPace(d, metric);
+    var pc = el('div', 'inshead inspace');
+    pc.style.cssText = '--hc: ' + INS_METRICS[metric].color;
+    var pl = el('span', 'l');
+    pl.appendChild(el('span', '', pace ? pace.label : 'Pace'));
+    if (pace && pace.kind !== 'peak') pl.appendChild(el('span', 'insproj', 'projected'));
+    pc.appendChild(pl);
+    pc.appendChild(el('span', 'v', pace ? pace.text : '—'));
+    pc.appendChild(el('span', 'd', pace ? pace.sub : d.unit === 'hour' ? 'nothing spent in these hours' : 'needs a full day on record'));
+    if (pace) pc.appendChild(el('span', 'n', pace.how));
+    heads.appendChild(pc);
+    card.appendChild(heads);
+  }
+
   // What the page was last drawn against: whether it could measure itself, and
-  // the accounts the panels name. The status poll redraws when either changes,
-  // rather than on every poll, which would drop a tooltip being read.
+  // the accounts the account split colours by. The status poll redraws when
+  // either changes, rather than on every poll, which would drop a tooltip
+  // being read.
   function insightsDrawnKey() {
     var body = document.getElementById('insBody');
     var accounts = (lastStatus && lastStatus.accounts) || [];
-    return (body.clientWidth > 0 ? 'w' : '-') + '|' + accounts.map(function (a) {
-      var q = a.quota || {};
-      return accountGroup(a) + '/' + a.name + (a.disabled ? '!' : '') + (a.provider === 'grok' ? '@' + JSON.stringify([q.unified5h, q.unified5hReset, q.unified7d, q.unified7dReset, q.planPeriod, a.plan || q.planType]) : '');
-    }).join('\\n');
+    return (body.clientWidth > 0 ? 'w' : '-') + '|' + accounts.map(function (a) { return accountGroup(a) + '/' + a.name; }).join('|');
   }
 
   function renderInsights() {
@@ -5855,229 +6237,119 @@ ${SHARED_HELPERS}
     note.style.display = msg ? '' : 'none';
     body.textContent = '';
     body.style.opacity = ins.pending ? '0.55' : '';
-    if (!d || ins.missing) return;
+    if (!d || ins.missing || d.since == null) return;
     var accounts = (lastStatus && lastStatus.accounts) || [];
+    var metric = insightsMetric(d);
+    var mt = INS_METRICS[metric];
+    var other = metric === 'cost' ? 'tokens' : 'cost';
+    var ot = INS_METRICS[other];
     var when = function (b) { return insightsBucketLabel(b, d.unit, true); };
     var num = function (v) { return Math.round(v).toLocaleString(); };
-    var count = function (v) { return Math.round(v).toLocaleString(); };
     var rangeText = insightsRangeText(d.range);
-    var perBucket = d.unit === 'hour' ? 'per hour' : 'per day';
-    var tokensPer = d.buckets.map(function (_, i) { return d.kinds.cacheRead[i] + d.kinds.cacheWrite[i] + d.kinds.input[i] + d.kinds.output[i]; });
-    var usd = function (v) { return v == null ? '—' : fmtUsd(v); };
-    var pct = function (v) { return v == null ? '—' : (v * 100).toFixed(1) + '%'; };
-    var cost = d.cost || null;
+    var hourly = d.unit === 'hour';
+    var perBucket = hourly ? 'per hour' : 'per day';
+    var values = insightsTotals(d, metric) || [];
+    var otherValues = insightsTotals(d, other);
     var fleet = d.scope === 'all';
-    var hits = cacheHitSeries(d.kinds);
-
-    var tiles = el('div', 'inskpis');
-    // On the page before the sparklines go in: they measure the tile.
-    body.appendChild(tiles);
-    insightsKpis(d).forEach(function (k) {
-      var c = el('div', 'inskpi');
-      c.appendChild(el('div', 'l', k.label));
-      c.appendChild(el('div', 'v', k.value));
-      c.appendChild(el('div', 'd', k.sub));
-      tiles.appendChild(c);
-      if (tokensPer.length < 2) return;
-      if (k.key === 'tokens') sparkline(c, tokensPer, 'var(--is1)');
-      if (k.key === 'cost' && cost) sparkline(c, cost.values, 'var(--is7)');
-      if (k.key === 'requests') sparkline(c, d.requests, 'var(--is4)');
-      if (k.key === 'cache') sparkline(c, hits, 'var(--ik-cacheRead)');
-    });
-    var missed = fleet ? fleetMissingText(d) : null;
-    if (missed) body.appendChild(el('p', 'sub', missed));
-    // Grok: what it spent in the range, its models, and each account's plan
-    // as the last quota reading left it. Shown whenever Grok is in the pool
-    // or in the history.
-    var renderGrok = function () {
-      var grok = grokSummary(d, accounts);
-      if (grok) {
-        var gh = grok.history;
-        insightsCard(body, 'grok', 'Grok', 'usage ' + rangeText + ' · plans as last read on this machine', function (host) {
-          var wrap = el('div', 'insgrok');
-          var left = el('div', 'gstats');
-          [['Tokens', gh ? fmtTokens(gh.tokens) : '0'], ['Requests', gh ? num(gh.requests) : '0'], ['Est. API cost', gh ? usd(gh.cost) : '$0'], ['Cache hit', gh ? pct(gh.hit) : '—']].forEach(function (kv) {
-            var st = el('div', 'gstat');
-            st.appendChild(el('div', 'l', kv[0]));
-            st.appendChild(el('div', 'v', kv[1]));
-            left.appendChild(st);
-          });
-          var spark = el('div', 'gspark');
-          left.appendChild(spark);
-          wrap.appendChild(left);
-          var right = el('div', 'gplans');
-          if (!grok.accounts.length) right.appendChild(el('p', 'hint', 'No Grok account on this machine; the usage here is from the history.'));
-          grok.accounts.forEach(function (a) {
-            var row = el('div', 'gplan');
-            var who = el('div', 'gwho');
-            who.appendChild(el('span', 'name', a.name));
-            if (a.plan) who.appendChild(el('span', 'badge plan', a.plan));
-            if (a.disabled) who.appendChild(el('span', 'badge', 'disabled'));
-            row.appendChild(who);
-            if (a.meters.length) a.meters.forEach(function (mt) { row.appendChild(meterEl(mt)); });
-            else row.appendChild(el('p', 'hint', a.text || 'quota unknown'));
-            right.appendChild(row);
-          });
-          wrap.appendChild(right);
-          host.appendChild(wrap);
-          if (grok.values.length > 1 && gh) sparkline(spark, grok.values, 'var(--ip-grok)', 0);
-          if (grok.models.length) {
-            var mlist = el('div', 'gmodels');
-            drawRanked(mlist, grok.models.map(function (mo) {
-              return { label: mo.label, value: mo.tokens, text: fmtTokens(mo.tokens) + ' · ' + usd(mo.cost), color: 'var(--ip-grok)',
-                tip: [{ label: 'Tokens', value: fmtTokens(mo.tokens) }, { label: 'Requests', value: num(mo.requests) }, { label: 'Est. API cost', value: usd(mo.cost) }, { label: 'Cache hit', value: pct(cacheHitRate(mo)) }] };
-            }));
-            host.appendChild(mlist);
-          }
-        }, function () {
-          return { cols: ['Model', 'Requests', 'Input', 'Output', 'Cache read', 'Cache write', 'Est. API cost'],
-            rows: grok.models.map(function (mo) { return [mo.label, num(mo.requests), num(mo.input), num(mo.output), num(mo.cacheRead), num(mo.cacheWrite), mo.cost == null ? 'not priced' : fmtUsd(mo.cost)]; }) };
-        });
-      }
-    };
-
-    // Nothing recorded yet: a Grok account's plan is still worth showing.
-    if (d.since == null) { renderGrok(); return; }
     var from = recordedFrom(d);
 
+    // The hero: the two headlines, then the chosen one over time.
+    var hero = el('div', 'card inshero');
+    body.appendChild(hero);
+    heroHeads(hero, d, metric);
+    var hb = el('div', 'insherob');
+    hero.appendChild(hb);
     var splitKey = insightsSplit();
     var split = INS_SPLITS.filter(function (o) { return o.key === splitKey; })[0];
-    var series = insightsSeries(d, splitKey, accounts);
+    var series = insightsSeries(d, splitKey, accounts, metric);
+    // Token types and machines have no cost of their own per bucket, nor
+    // does a proxy too old to send it: those draw the total in one colour.
+    var oneTotal = !series.length;
+    if (oneTotal) series = [{ key: metric, label: mt.name, color: mt.color, values: values, total: values.reduce(function (x, y) { return x + y; }, 0) }];
     // Only the series this split and range have can be hidden, and never all
     // of them: the chart, its legend and the panels under it agree on which.
     var keys = series.map(function (sr) { return sr.key; });
     Object.keys(ins.hidden).forEach(function (k) { if (keys.indexOf(k) < 0) delete ins.hidden[k]; });
     if (keys.length && keys.every(function (k) { return ins.hidden[k]; })) ins.hidden = Object.create(null);
-    insightsCard(body, 'timeline', 'Tokens over time', perBucket + ', stacked by ' + split.text + (series.length > 1 ? ' · click a row to hide it' : ''), function (host) {
-      drawTimeSeries(host, d, series, { type: 'area', height: 220, name: 'Tokens over time', fmt: fmtTokens, fmtTip: fmtTokens });
-      legendTable(host, series, fmtTokens, from);
+    var anyHidden = keys.some(function (k) { return ins.hidden[k]; });
+    if (metric === 'cost' && !oneTotal) {
+      var tokenTotals = Object.create(null);
+      insightsSeries(d, splitKey, accounts).forEach(function (sr) { tokenTotals[sr.key] = sr.total; });
+      series.forEach(function (sr) { sr.unpriced = !(sr.total > 0) && tokenTotals[sr.key] > 0; });
+    }
+    var running = ins.view === 'total';
+    var heroTitle = running ? 'Running total of the ' + (metric === 'cost' ? 'estimated API cost' : 'tokens')
+      : (metric === 'cost' ? 'Estimated API cost ' : 'Tokens ') + perBucket;
+    var heroSub = (oneTotal ? (splitKey === 'provider' || splitKey === 'account' ? 'one total' : 'one total: ' + split.text + 's have no cost of their own')
+      : 'stacked by ' + split.text + (series.length > 1 ? ' · click a row to hide it' : '')) + ' · ' + rangeText;
+    var prevTotal = metric === 'cost' ? (d.cost ? d.cost.previous : null)
+      : d.previous ? d.previous.input + d.previous.output + d.previous.cacheRead + d.previous.cacheWrite : null;
+    var shownSum = values.map(function (_, i) { return series.reduce(function (x, sr) { return x + (ins.hidden[sr.key] ? 0 : sr.values[i] || 0); }, 0); });
+    var avg = seriesStats(shownSum, from).avg;
+    insightsCard(hb, 'hero', heroTitle, heroSub, function (host) {
+      var narrow = (host.clientWidth || 600) < 520;
+      drawHero(host, d, series, {
+        view: running ? 'total' : 'daily', height: narrow ? 210 : 280, name: heroTitle, fmt: mt.fmt, axis: mt.axis,
+        avg: avg, avgText: 'avg ' + mt.fmt(avg) + (hourly ? '/hour' : '/day'),
+        // The period before, as one figure: only against everything, not a part of it.
+        ref: prevTotal != null && prevTotal > 0 && !anyHidden ? { value: prevTotal, label: 'previous ' + (hourly ? '24 hours' : parseInt(d.range, 10) + ' days') + ': ' + mt.fmt(prevTotal) } : null,
+        other: otherValues, otherName: ot.name, otherFmt: ot.fmt,
+      });
+      legendTable(host, series, mt.fmt, from);
     }, function () {
       return {
-        cols: ['When'].concat(series.map(function (sr) { return sr.label; }), ['Total']),
-        rows: d.buckets.map(function (b, i) { return [when(b)].concat(series.map(function (sr) { return num(sr.values[i] || 0); }), [num(tokensPer[i])]); }).reverse(),
+        cols: ['When'].concat(series.length > 1 ? series.map(function (sr) { return sr.label; }) : [], [mt.name], otherValues ? [ot.name] : []),
+        rows: d.buckets.map(function (b, i) {
+          return [when(b)].concat(series.length > 1 ? series.map(function (sr) { return mt.fmt(sr.values[i] || 0); }) : [], [mt.fmt(values[i])], otherValues ? [ot.fmt(otherValues[i])] : []);
+        }).reverse(),
       };
-    });
+    }, { bare: true, tools: function (tools) {
+      segmented(tools, [{ key: 'daily', label: hourly ? 'Per hour' : 'Per day' }, { key: 'total', label: 'Running total' }], running ? 'total' : 'daily', function (k) { ins.view = k; renderInsights(); });
+    } });
 
-    // Requests, cost and the cache hit rate under it, on the same time axis.
-    // Requests and cost stack by the same split when they can; token types
-    // and machines have no requests or cost of their own, so those draw the
-    // total in one colour.
-    var three = el('div', 'insgrid three');
-    body.appendChild(three);
-    var reqSeries = insightsSeries(d, splitKey, accounts, 'requests');
-    if (!reqSeries.length) reqSeries = [{ key: 'requests', label: 'Requests', color: 'var(--is4)', values: d.requests, total: d.totals.requests }];
-    insightsCard(three, 'requests', 'Requests', perBucket + (reqSeries.length > 1 ? ', by ' + split.text : ''), function (host) {
-      drawTimeSeries(host, d, reqSeries, { type: 'bars', height: 150, name: 'Requests', count: true, fmt: fmtTokens, fmtTip: count });
-      if (reqSeries.length > 1) insightsLegend(host, reqSeries, count);
-    }, function () {
-      // The same columns as the chart's stack, then the total.
-      var many = reqSeries.length > 1;
-      return { cols: ['When'].concat(many ? reqSeries.map(function (sr) { return sr.label; }) : [], ['Requests']),
-        rows: d.buckets.map(function (b, i) { return [when(b)].concat(many ? reqSeries.map(function (sr) { return num(sr.values[i] || 0); }) : [], [num(d.requests[i])]); }).reverse() };
-    });
-    if (cost) {
-      var costSeries = insightsSeries(d, splitKey, accounts, 'cost');
-      if (!costSeries.length) costSeries = [{ key: 'cost', label: 'Est. API cost', color: 'var(--is7)', values: cost.values, total: cost.total }];
-      insightsCard(three, 'cost', 'Estimated API cost', perBucket + ', at API list prices', function (host) {
-        drawTimeSeries(host, d, costSeries, { type: 'area', height: 150, name: 'Estimated API cost', fmt: fmtUsd, fmtTip: fmtUsd });
-        if (costSeries.length > 1) insightsLegend(host, costSeries, fmtUsd);
-      }, function () {
-        var many = costSeries.length > 1;
-        return { cols: ['When'].concat(many ? costSeries.map(function (sr) { return sr.label; }) : [], ['Est. API cost']),
-          rows: d.buckets.map(function (b, i) { return [when(b)].concat(many ? costSeries.map(function (sr) { return fmtUsd(sr.values[i] || 0); }) : [], [fmtUsd(cost.values[i])]); }).reverse() };
-      });
-    }
-    var hitAll = cacheHitRate(d.totals);
-    insightsCard(three, 'cache', 'Cache hit rate', 'cache reads ÷ prompt tokens, ' + perBucket, function (host) {
-      drawTimeSeries(host, d, [{ key: 'hit', label: 'Cache hit rate', color: 'var(--ik-cacheRead)', values: hits.map(function (h) { return h == null ? null : h * 100; }), total: 0 }],
-        { type: 'line', height: 150, name: 'Cache hit rate', top: 100, avg: hitAll == null ? null : hitAll * 100, fmt: function (v) { return Math.round(v) + '%'; },
-          tip: function (i) { return [{ label: 'Hit rate', value: pct(hits[i]), color: 'var(--ik-cacheRead)' }, { label: 'Cache reads', value: fmtTokens(d.kinds.cacheRead[i]) }, { label: 'Prompt tokens', value: fmtTokens(d.kinds.input[i] + d.kinds.cacheRead[i] + d.kinds.cacheWrite[i]) }]; } });
-    }, function () {
-      return { cols: ['When', 'Hit rate', 'Cache reads', 'Prompt tokens'], rows: d.buckets.map(function (b, i) { return [when(b), pct(hits[i]), num(d.kinds.cacheRead[i]), num(d.kinds.input[i] + d.kinds.cacheRead[i] + d.kinds.cacheWrite[i])]; }).reverse() };
-    });
+    var missed = fleet ? fleetMissingText(d) : null;
+    if (missed) body.appendChild(el('p', 'sub', missed));
 
-    // Every machine at once: what each one spent, across the page, since it
-    // is what that view is for.
-    if (fleet) {
-      var machines = (d.instances || []).filter(function (m) { return m.state === 'ok'; });
-      insightsCard(body, 'machines', 'By machine', machines.length + ' of ' + (d.instances || []).length + ' counted · tokens and estimated API cost, ' + rangeText, function (host) {
-        var colors = insightsSeries(d, 'instance', accounts);
-        drawRanked(host, machines.map(function (m, i) {
-          return { label: m.name + (m.self ? ' (this one)' : ''), value: m.tokens, text: fmtTokens(m.tokens) + ' · ' + usd(m.cost), color: colors[i] ? colors[i].color : 'var(--dim)',
-            tip: [{ label: 'Tokens', value: fmtTokens(m.tokens) }, { label: 'Requests', value: num(m.requests) }, { label: 'Est. API cost', value: usd(m.cost) }] };
-        }));
+    // By day and by month: patterns and pace. Hours have neither.
+    if (!hourly) {
+      var months = monthTotals(d, metric);
+      var showMonths = months.length > 1 || (months.length === 1 && months[0].projected != null);
+      var row = el('div', 'insgrid' + (showMonths ? '' : ' one'));
+      body.appendChild(row);
+      insightsCard(row, 'calendar', 'By day', (metric === 'cost' ? 'estimated API cost' : 'tokens') + ' each day, ' + rangeText + ' · shaded by quarter of active days', function (host) {
+        drawCalendar(host, d, values, mt);
       }, function () {
-        return { cols: ['Machine', 'Requests', 'Tokens', 'Est. API cost'], rows: machines.map(function (m) { return [m.name, num(m.requests), num(m.tokens), usd(m.cost)]; }) };
+        return { cols: ['Day', mt.name].concat(otherValues ? [ot.name] : []),
+          rows: d.buckets.map(function (b, i) { return [when(b), i < from ? 'not recorded' : mt.fmt(values[i])].concat(otherValues ? [i < from ? '' : ot.fmt(otherValues[i])] : []); }).reverse() };
       });
+      if (showMonths) {
+        insightsCard(row, 'months', 'By month', 'calendar months in the range' + (months[months.length - 1].projected != null ? ' · dashed: projected' : ''), function (host) {
+          drawMonths(host, months, mt);
+        }, function () {
+          return { cols: ['Month', mt.name, 'Days counted', 'On pace for'],
+            rows: months.slice().reverse().map(function (mo) {
+              return [mo.long + (mo.from && !mo.current ? ' (from ' + insightsBucketLabel(mo.from, 'day', false) + ')' : ''), mt.fmt(mo.total), String(mo.days), mo.projected == null ? '' : mt.fmt(mo.projected) + ' (projected)'];
+            }) };
+        });
+      }
     }
 
-    var two = el('div', 'insgrid two');
-    body.appendChild(two);
-    var provs = providerRows(d);
-    insightsCard(two, 'providers', 'Providers', 'share of tokens, ' + rangeText, function (host) {
-      compositionBar(host, provs.map(function (p) { return { label: p.label, value: p.tokens, color: p.color }; }), fmtTokens);
-      var tbl = el('table', 'instab');
-      var hr = el('tr');
-      // Accounts and the per-request cost give way first on a phone.
-      ['Provider', 'Accounts', 'Requests', 'Est. cost', 'Per request', 'Cache hit'].forEach(function (h, i) { hr.appendChild(el('th', i ? 'num' + (i === 1 || i === 4 ? ' opt' : '') : '', h)); });
-      tbl.appendChild(hr);
-      provs.forEach(function (p) {
-        var tr = el('tr');
-        var nm = el('td');
-        var sw = el('i', 'insw');
-        sw.style.background = p.color;
-        nm.appendChild(sw);
-        nm.appendChild(el('span', '', p.label));
-        tr.appendChild(nm);
-        [String(p.accounts), num(p.requests), usd(p.cost), usd(p.perRequest), pct(p.hit)].forEach(function (v, i) { tr.appendChild(el('td', 'num' + (i === 0 || i === 3 ? ' opt' : ''), v)); });
-        tbl.appendChild(tr);
-      });
-      var wrap = el('div', 'instv');
-      wrap.appendChild(tbl);
-      host.appendChild(wrap);
+    // Where it went: by model, account, provider or machine.
+    var byOpts = INS_BY.filter(function (o) { return !o.fleet || fleet; });
+    var by = byOpts.some(function (o) { return o.key === ins.by; }) ? ins.by : 'model';
+    var rows = breakdownRows(d, by, metric);
+    var unpriced = d.cost && d.cost.unpricedTokens > 0 ? ' · ' + fmtTokens(d.cost.unpricedTokens) + ' tokens not priced' : '';
+    insightsCard(body, 'by', 'Where it went', (metric === 'cost' ? 'estimated API cost' : 'tokens') + ', ' + rangeText + (metric === 'cost' ? unpriced : ''), function (host) {
+      drawBreakdown(host, rows, metric);
     }, function () {
-      return { cols: ['Provider', 'Accounts', 'Requests', 'Tokens', 'Share', 'Est. cost', 'Per request', 'Cache hit', 'Input', 'Output', 'Cache read', 'Cache write'],
-        rows: provs.map(function (p) { return [p.label, String(p.accounts), num(p.requests), num(p.tokens), pctOf(p.share), usd(p.cost), usd(p.perRequest), pct(p.hit), num(p.input), num(p.output), num(p.cacheRead), num(p.cacheWrite)]; }) };
-    });
-    var t = d.totals;
-    var kinds = insightsSeries(d, 'kind', accounts).map(function (k) { return { label: k.label, value: k.total, color: k.color }; });
-    insightsCard(two, 'mix', 'Token mix', 'what the ' + fmtTokens(t.input + t.output + t.cacheRead + t.cacheWrite) + ' tokens were', function (host) {
-      compositionBar(host, kinds, fmtTokens);
-      var ratio = el('p', 'hint insnote');
-      var prompt = t.input + t.cacheRead + t.cacheWrite;
-      ratio.textContent = prompt > 0 ? 'Output is ' + pctOf(t.output / prompt) + ' of prompt tokens; ' + pctOf((t.cacheRead) / prompt) + ' of the prompt came from the cache.' : '';
-      host.appendChild(ratio);
-    }, function () {
-      var tokens = t.input + t.output + t.cacheRead + t.cacheWrite;
-      return { cols: ['Type', 'Tokens', 'Share'], rows: kinds.map(function (k) { return [k.label, num(k.value), tokens > 0 ? (k.value / tokens * 100).toFixed(1) + '%' : '—']; }) };
-    });
-
-    renderGrok();
-
-    var lists = el('div', 'insgrid two');
-    body.appendChild(lists);
-    var models = topModels(d.models, 8);
-    var allTokens = t.input + t.output + t.cacheRead + t.cacheWrite;
-    insightsCard(lists, 'models', 'Models', 'tokens and estimated API cost, ' + rangeText + (cost && cost.unpricedTokens > 0 ? ' · ' + fmtTokens(cost.unpricedTokens) + ' tokens unpriced' : ''), function (host) {
-      drawRanked(host, models.map(function (mo) {
-        return { label: mo.label, value: mo.tokens, text: fmtTokens(mo.tokens) + ' · ' + usd(mo.cost), color: 'var(--ip-' + providerTone(mo.provider) + ')',
-          tip: [{ label: 'Tokens', value: fmtTokens(mo.tokens) }, { label: 'Requests', value: num(mo.requests) }, { label: 'Est. API cost', value: usd(mo.cost) },
-            { label: 'Cache hit', value: pct(cacheHitRate(mo)) }, { label: 'Provider', value: groupLabel(mo.provider) }] };
-      }));
-    }, function () {
-      return { cols: ['Model', 'Provider', 'Requests', 'Input', 'Output', 'Cache read', 'Cache write', 'Est. API cost'],
-        rows: topModels(d.models, 1000).map(function (mo) {
-          return [mo.label, groupLabel(mo.provider), num(mo.requests), num(mo.input), num(mo.output), num(mo.cacheRead), num(mo.cacheWrite), mo.cost == null ? 'not priced' : fmtUsd(mo.cost)];
+      return { cols: [byOpts.filter(function (o) { return o.key === by; })[0].label.replace(/s$/, ''), 'Requests', 'Tokens', 'Est. API cost', 'Per million', 'Cache hit', 'Share'],
+        rows: rows.map(function (r) {
+          return [r.label + (r.group ? ' (' + r.group + ')' : ''), num(r.requests), num(r.tokens), r.cost == null ? 'not priced' : fmtUsd(r.cost),
+            r.perMillion == null ? '—' : fmtUsd(r.perMillion), r.hit == null ? '—' : (r.hit * 100).toFixed(1) + '%', r.share == null ? '—' : pctOf(r.share)];
         }) };
-    });
-    insightsCard(lists, 'accounts', 'Accounts', 'tokens and share of the range', function (host) {
-      drawRanked(host, d.accounts.map(function (a) {
-        return { label: a.account, value: a.tokens, text: fmtTokens(a.tokens) + ' · ' + (allTokens > 0 ? pctOf(a.tokens / allTokens) : '—'), color: 'var(--ip-' + providerTone(a.provider) + ')',
-          tip: [{ label: 'Tokens', value: fmtTokens(a.tokens) }, { label: 'Requests', value: num(a.requests) }, { label: 'Est. API cost', value: usd(a.cost) }, { label: 'Provider', value: groupLabel(a.provider) }] };
-      }));
-    }, function () {
-      return { cols: ['Account', 'Provider', 'Requests', 'Tokens', 'Est. API cost'], rows: d.accounts.map(function (a) { return [a.account, groupLabel(a.provider), num(a.requests), num(a.tokens), usd(a.cost)]; }) };
-    });
+    }, { tools: function (tools) {
+      segmented(tools, byOpts, by, function (k) { ins.by = k; renderInsights(); });
+    } });
   }
 
   function render(s) {

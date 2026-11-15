@@ -1312,6 +1312,42 @@ test('the Insights page asks for history only while open, once per range, and sa
   assert.match(page.byId('insNote').textContent, /older proxy that keeps no usage history/);
 });
 
+// The headlines pick what every chart draws, and the pick is remembered; the
+// hero's view and the "Where it went" tabs redraw without asking again. A
+// reply from a proxy too old to estimate the cost draws the tokens.
+test('the Insights headlines pick the metric and remember it; the views redraw without a fetch', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [{ name: 'a', provider: 'anthropic' }] });
+  page.click('Insights');
+  const priced = {
+    ...INSIGHTS,
+    cost: { total: 2, values: [1, 1], previous: null, unpricedTokens: 0 },
+    providers: [{ provider: 'anthropic', tokens: 10, cost: 2, requests: 2, values: [5, 5], requestValues: [1, 1], costValues: [1, 1] }],
+    accounts: [{ provider: 'anthropic', account: 'a', tokens: 10, cost: 2, requests: 2, values: [5, 5], requestValues: [1, 1], costValues: [1, 1] }],
+    models: [{ provider: 'anthropic', model: 'claude-opus-5-5', tokens: 10, requests: 2, cost: 2 }],
+  };
+  await page.answer(200, priced);
+  assert.equal(page.byId('insNote').style.display, 'none');
+  const heads = () => page.built.filter(e => typeof e.className === 'string' && /^inshead( sel)?$/.test(e.className));
+  assert.equal(heads().slice(-2)[0].className, 'inshead sel', 'the cost is drawn first');
+  heads().slice(-1)[0].fire('click');
+  assert.equal(page.store.get('teamclaude-insights-metric'), 'tokens');
+  assert.equal(heads().slice(-1)[0].className, 'inshead sel', 'the tokens headline is now the one drawn');
+  page.click('Running total');
+  page.click('Accounts');
+  page.click('Providers');
+  assert.deepEqual(page.requests, [], 'a view or a tab is drawn from the copy in hand');
+
+  // A reply with no cost estimate draws the tokens, whatever was picked.
+  const old = bootPage();
+  await old.answer(200, { accounts: [] });
+  old.click('Insights');
+  await old.answer(200, INSIGHTS);
+  assert.equal(old.byId('insNote').style.display, 'none');
+  const oldHeads = old.built.filter(e => typeof e.className === 'string' && /^inshead( sel)?$/.test(e.className));
+  assert.deepEqual(oldHeads.map(e => e.className), ['inshead', 'inshead sel'], 'no cost to draw: the tokens are');
+});
+
 // A failed read is throttled like a successful one: a proxy answering 404 or
 // 500 must not be asked again on every five-second status poll.
 for (const status of [404, 500]) {
