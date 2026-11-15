@@ -143,7 +143,15 @@ While signed in, every **OAuth** account (Claude and Codex) is kept as one row o
 - **An unreachable store stops renewals.** When callback.net cannot be reached, or refuses this install's session, a refresh does not wait: nothing renews a token the store holds without the lock, so a token that is still good is kept and the next request asks again, and one that has expired, or that upstream just rejected, fails that refresh at once. While the store is out of reach no OAuth account is renewed at all: each serves until its token expires, and then its refreshes fail until the store answers. `teamclaude callback logout` stops the sync, and the next refresh goes without the lock. While signed in, the only renewal made without the lock is when a read of the store finds neither a row for the account nor one holding its token, and the account is one the store cannot carry (no identity to key a row on) or one in error, which no other install can hold.
 - **A sign-in** (`login`, `import`) is stored right away, over whatever the row held.
 - **An account in error never writes.** Once upstream has rejected an account's token (status `error`, "needs re-login"), what this install holds is dead, so it is never stored — not by a pass, not as a token change — however late its `expiresAt`. It only reads: the moment it goes into error, and at every pass after, a row holding a different token (another install renewed it, or you signed in there) is adopted whatever its expiry, and the account is back in rotation. If instead the row still holds the very refresh token that was rejected, the row is emptied: under its lock, and only if it is unchanged once locked, its refresh token becomes `""`. An empty refresh token means "needs a sign-in": no install adopts it or adds an account from it, and the first install with a working token for that account overwrites it, whatever the expiry.
-- **Removal travels.** `teamclaude remove` (or the TUI, or the MCP endpoint) writes a tombstone into the account's row — `{"_deleted": "<time>"}` — and every other install removes the account at its next pass. A token refresh on an install that has not yet seen the tombstone still goes through, but never writes over it; only an explicit sign-in (`login`, `import`) does, which is how a removed account comes back everywhere. A tombstone older than a week is deleted by whichever pass sees it.
+- **Removal travels.** `teamclaude remove` (or the TUI, or the MCP endpoint) writes a tombstone into the account's row — `{"_deleted": "<time>"}` — and every other install removes the account at its next pass.
+  - **Under the lock.** The tombstone is written under the row's lock, so a renewal another install has in progress stores its token first and the tombstone lands after it.
+  - **A sign-in brings it back.** An explicit sign-in (`login`, `import`) replaces the tombstone, which is how a removed account comes back everywhere.
+  - **A refresh does not.** A token refresh on an install that has not yet seen the tombstone still goes through and does not write over it, with two exceptions: a renewal whose write lands after its lock's lease ran out, and a token written without the lock (a pass pushing a renewal, or one stored after a renewal made outside the lock), in the moment between its read and its write.
+  - **No row, nothing recorded.** A removal of an account the store holds no row for records nothing, so an install that still holds it and stores it later brings it back.
+  - **A removal the store cannot take at once** (out of reach, or its lock held throughout) is tried again a minute, five and fifteen minutes later, then at each pass, until it lands. Until then this install does not add the account back from its row, and a sign-in made on another install meanwhile is removed again when it lands.
+  - **For one hour at most.** A removal still not recorded an hour after it was made is given up on, so that it cannot land days later on a sign-in made elsewhere since. So is one this install finds itself signed out of callback.net for (a removal made while signed out records nothing at all). The log says the removal was not recorded for the other installs, and the next pass adds the account back from its row: remove it again then. A restart forgets a pending removal the same way, and the next start adds the account back from its row.
+  - **From the command line.** `teamclaude remove` tries once, without waiting for the lock, and says so when that did not land. A running proxy, which it then tells to reload, records the removal with those retries. With no proxy running the next start adds the account back, so remove it again then.
+  - **A tombstone lasts a week.** A tombstone older than a week is deleted by whichever pass sees it. An install that ran no pass in that week (switched off, or signed out of callback.net) never saw it. If it still holds the account and its refresh token still renews, it stores it again (at its first pass after signing back in, if it renewed the token while signed out, or at its next renewal) and the other installs add it back, so remove it there too.
 
 `teamclaude status --json` carries the sync's state under `callbackSync`: the last pass, its error if it failed, how many accounts the store holds, how many tombstones, and how many rows are emptied and waiting for a sign-in (`signInNeeded`).
 
@@ -482,18 +490,25 @@ same `/wham/usage` payload the quota reading does — and shows up as `RC1` on t
 TUI row, a `Reset` line in `teamclaude status`, and a badge on the dashboard
 card. It survives a restart, which matters because the probe is off by default.
 
-Only the probe refreshes the count, so a reading can outlive the credit it
-describes — redeemed in the Codex CLI, or expired. The `status` line therefore
+The probe and a quota re-read after a reset refresh the count, so a reading can
+outlive the credit it describes — redeemed in the Codex CLI, or expired. The `status` line therefore
 says how old the reading is (`as of 3h ago`), and every surface drops it once it
 is more than 7 days old.
 
 The count is what the account **holds**. Whether a particular credit can be
 spent is a separate question — the payload's `applicable_available_count` is
 upstream's own view of how many would reset a window right now, and is named on
-the `status` line when it is zero — and spending one is a manual action in the
-Codex CLI unless you arm the switch below.
+the `status` line when it is zero.
 
-Spending one is **opt-in**, and the switch is fleet-wide: set
+To read fresh credit details and spend a chosen credit by hand, select the
+account in the local TUI and press **r**. The panel shows each credit's label,
+expiry and availability before confirmation. A manual spend does not need the
+auto-redeem switch. A weekly window that is not exhausted and a recent fleet
+hold are warnings, not blocks. Disabled or non-OAuth accounts, unavailable or
+expired credits, and credits the plan cannot use are blocked. Attach mode does
+not offer this action.
+
+**Automatic** spending is opt-in, and the switch is fleet-wide: set
 [`autoRedeemResets`](configuration.md) to `true`, or toggle it from the TUI
 settings screen (**g** → **Auto-redeem**). It is `false` by default, and stays
 that way until you say otherwise: a redemption cannot be undone and the credits
@@ -504,7 +519,8 @@ and it applies live, so it can be armed or killed without a restart.
 
 One account can be exempted with `accounts[].autoRedeemReset: false`, and that
 is **all** that key can do. A per-account `true` arms nothing on its own: with
-`autoRedeemResets` off, no account spends anything.
+`autoRedeemResets` off, no account spends anything **automatically**. The opt-out
+does not prevent a manual spend.
 
 A redemption is considered at the moment a spent weekly window turns a request
 away with nothing chosen to serve it: every Codex account the request is
@@ -544,8 +560,8 @@ logged.
 
 Claude sometimes grants an account a **banked usage-limit reset**, shown under
 **Resets** on the claude.ai usage page (for example "Full reset — Expires
-Oct 23"). Spending one clears the account's 5-hour and 7-day windows ahead of
-their own reset, whenever you choose.
+Oct 23"). Spending one clears the windows named by that grant ahead of their
+own reset, whenever you choose.
 
 The [quota probe](quota.md#quota-probe) reads the count from the same
 zero-spend `/api/oauth/usage` call it already makes. It asks with
@@ -577,6 +593,80 @@ The probe is off by default, so the count is only as fresh as the last probe:
 `p` in the TUI, or `curl -X POST localhost:3456/teamclaude/probe`, refreshes
 it once.
 
+### Reading and spending a reset by hand
+
+Press **r** from the local TUI's main screen, choose an OAuth Claude or Codex
+account, and press **Enter** to show its reset details. The picker starts
+on the first account with a banked reset. The panel lists only grants you
+still hold: weekly, Fable and session resets, or Codex reset credits. Spent
+grants are not shown. Each row shows the kind in bold, the number left, the
+limits it clears, its expiry and whether it is next. A held but blocked grant
+stays listed, dimmed, with its reason on the same line. With no held grants,
+the panel says `no banked resets`.
+
+The selected grant's upstream label is dimmed below its row, with its warnings
+in yellow. Other rows show no label or warnings. Expiry is a local date more
+than a day away, with the year only if it is not the current year; within a
+day it is a countdown. The header shows the limit state and local weekly
+reset time. Cooldown and fleet-hold times are local too, with the day when it
+is not today.
+
+Use **↑**/**↓** or **j**/**k** to choose any held grant, not only the one
+upstream names as next. **Enter** asks for confirmation; **y** or **Y** spends
+one reset. Any other key cancels that confirmation. Blocked grants cannot
+reach confirmation.
+
+Opening the panel uses a reading no more than five minutes old, with no
+request. Claude readings also come from the quota probe's existing usage
+request; Codex detail rows come from reset-detail reads. The header shows the
+reading's age (`as of 1m ago`). Reset grant ids and detail rows stay in memory
+only and are never saved to config or quota files.
+
+Within the panel, **r** reads again only after two minutes since the last
+reading; otherwise it shows `read 40s ago — wait 80s` without a request. A 429
+starts that two-minute wait again. An upstream `Retry-After` can extend it.
+If a read fails, the last grants stay visible, marked `stale`, with their
+original age and the error. An upstream retry delay shows as `retry in 90s`.
+Without an earlier reading, only the error is shown. **Esc** or **q** closes it.
+Closing while a spend is in progress does not cancel that spend. The result
+is logged, and the panel updates if it is still open. A successful Claude
+claim already re-reads quota once, so the panel uses that cached reading
+without another request. If that read fails, the panel keeps the stale details
+and shows the claim's own result, number left and cleared limits as a success,
+not a failed claim. **r** still obeys the two-minute read floor. An uncertain
+Claude claim still re-reads details to learn whether it was spent. Codex also
+keeps its separate detail refresh. Attach mode does not offer this action.
+
+Manual spending is your decision. It ignores `autoRedeemResets`, the account's
+`autoRedeemReset: false` opt-out, and the fleet hold. The panel warns when no
+weekly limit is exhausted, when the grant does not clear an exhausted limit,
+when upstream reports a cooldown, or when a reset recently landed or may have
+landed. If the grant requires a limit and the account is not at one, it warns
+that upstream may still accept the claim, in which case the reset is spent. A disabled or
+non-OAuth account, missing organization id, ineligible status, or an empty,
+paused, unusable or expired grant is a hard block.
+
+The token and details are refreshed again before the claim. Claude status-only
+reads use `?cedar_ember=1&skip_spend=1`, as Claude Code does. These reads update
+quota but never replace stored spend or extra-usage readings with missing or
+partial fields; the quota probe still reads the full payload.
+
+If the fresh Claude read fails, including HTTP 429, a manual claim can use the
+same account's in-memory reading up to 15 minutes old, but only if it still
+holds the chosen grant and that grant has no hard block. The fallback is
+logged with the read error and the reading's age. Upstream validates the claim
+and spends nothing on a refusal. A successful fresh read that says the grant
+is gone or blocked always stops the claim. Without a usable recent reading,
+the action declines and names the retry wait, using `Retry-After` when known.
+Codex manual claims and automatic Claude claims still require a successful
+fresh read.
+
+Manual and automatic claims cannot run together for the same provider, and
+only one manual claim can run at a time. Manual claims share the automatic path's
+request-id replay and set its fleet hold after success or an unread verdict.
+A failed claim may have spent the reset; the next attempt on that grant reuses
+the same request id. A refusal with a verdict spends nothing.
+
 ### Spending a Claude reset automatically
 
 With [`autoRedeemResets`](configuration.md) on — the same switch, and the same
@@ -594,8 +684,13 @@ selected again against the account it cleared.
   grant clears every limit the account is at, since a reset that would leave it
   blocked buys the request nothing. While upstream reports a reset cooldown,
   nothing is claimed.
-- Only the grant upstream names as next (`next_grant_id`), exactly as
-  `/limit-reset` in Claude Code does.
+- Among usable, unpaused, unexpired grants that clear every exhausted limit,
+  it spends the cheapest kind: **Fable**, then **session**, then **weekly**.
+  Within the same kind it spends the soonest-expiring grant (no expiry comes
+  last), then prefers upstream's `next_grant_id` if the expiry also ties. A
+  Fable-only wall therefore spends a Fable reset rather than a weekly reset,
+  even when upstream names the weekly reset as next. No grant is spent when
+  none clears the whole wall. Manual selection still chooses any usable grant.
 - `accounts[].autoRedeemReset: false` exempts an account, as it does for Codex;
   so does being disabled, having no organization id, or last reading zero held
   resets.
@@ -614,7 +709,8 @@ It is not a documented API, so it is worth watching the activity log the first
 time it fires. A fleet that already turned `autoRedeemResets` on for Codex
 credits now spends Claude resets too; exempt an account with
 `autoRedeemReset: false` if that is not wanted. With the switch off — the default — a Claude reset is still
-yours to spend, on the claude.ai usage page or with `/limit-reset`.
+yours to spend with **r** in the local TUI, on the claude.ai usage page, or with
+`/limit-reset`.
 
 ## Third-party backend accounts
 

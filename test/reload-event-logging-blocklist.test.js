@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import { randomUUID } from 'node:crypto';
 import { writeFile, readFile } from 'node:fs/promises';
 import { spawnServer } from '../test-helpers/spawn-server.js';
 
@@ -18,13 +19,22 @@ function listen(server) {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
 }
 
-// A recording stand-in for the upstream API: every request it sees is a hit.
+// Every request this file sends carries the marker, and the proxy relays it
+// with the rest of the client's headers. The stub counts only those: its port
+// is an ephemeral one that another test file's "dead upstream" may have held a
+// moment ago, and a request from that file's proxy is not one of the two gates
+// letting something through (seen on CI as 2 hits where 0 were sent).
+const MARKER = 'x-reload-test-run';
+const RUN = randomUUID();
+
+// A recording stand-in for the upstream API: every request of this run that it
+// sees is a hit.
 function startStubUpstream(hits) {
   return http.createServer((req, res) => {
     const chunks = [];
     req.on('data', c => chunks.push(c));
     req.on('end', () => {
-      hits.push({ url: req.url, body: Buffer.concat(chunks).toString('utf8') });
+      if (req.headers[MARKER] === RUN) hits.push({ url: req.url, body: Buffer.concat(chunks).toString('utf8') });
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ id: 'msg_1', type: 'message', role: 'assistant', content: [], usage: { input_tokens: 1, output_tokens: 1 } }));
     });
@@ -81,9 +91,8 @@ async function statusOf(proxyPort) {
 async function post(proxyPort, path, body) {
   const res = await fetch(`http://127.0.0.1:${proxyPort}${path}`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', [MARKER]: RUN },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(10_000),
   });
   const text = await res.text();
   return { status: res.status, body: text ? JSON.parse(text) : null };
@@ -144,7 +153,7 @@ test('reload restores the defaults when both keys are removed from disk', async 
     await postEventLog(proxyPort);
     let res = await sendMessage(proxyPort, 'claude-zz-blocked');
     assert.equal(res.status, 400, 'setup: the blocklist is engaged');
-    assert.equal(hits.length, 0, 'setup: both gates answer locally');
+    assert.deepEqual(hits.map(h => h.url), [], 'setup: both gates answer locally');
 
     // A hand-trimmed config has neither key; the running server must fall back
     // to the defaults (hide, nothing blocked) rather than keep the old values.

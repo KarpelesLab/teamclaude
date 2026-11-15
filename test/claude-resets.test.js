@@ -4,7 +4,7 @@ import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
 import { createDefaultConfig } from '../src/config.js';
-import { parseResetStatus, claimableGrant, claimClaudeReset, blockedUntil, ClaudeResetRedeemer } from '../src/claude-resets.js';
+import { parseResetStatus, chooseAutoGrant, claimClaudeReset, blockedUntil, ClaudeResetRedeemer } from '../src/claude-resets.js';
 
 // Banked Claude usage-limit resets. Nothing here reaches the network: the claim
 // spends a real reset on a real account, so every test injects its own fetch.
@@ -25,6 +25,14 @@ function block(extra = {}, grant = {}) {
   };
 }
 
+function grantBlock(grants, extra = {}) {
+  const base = block().grants[0];
+  return block({ next_grant_id: 'weekly', grants: grants.map(g => ({ ...base, ...g })), ...extra });
+}
+
+const weeklyGrant = { id: 'weekly', type: 'weekly', clears: ['five_hour', 'seven_day', 'seven_day_overage_included'] };
+const fableGrant = { id: 'fable', type: 'full', clears: ['seven_day_overage_included'] };
+
 function fableSpent(account, resetIn) {
   Object.assign(account.quota, { unified5h: 0.1, unified7d: 0.5, unified7dFable: 1, unified7dFableReset: Date.now() + resetIn });
   return account;
@@ -33,11 +41,11 @@ function fableSpent(account, resetIn) {
 function harness({ accounts = [oauth('a')], status = () => block(), claim = () => ({ result: 'reset', reason: null, resetsLeft: 0, cleared: ['five_hour', 'seven_day', 'seven_day_overage_included'], cooldownUntil: null }), config = { ...ARMED } } = {}) {
   const am = new AccountManager(accounts, 0.98);
   am.accounts.forEach((a, i) => fableSpent(a, (i + 1) * DAY));
-  const calls = { status: 0, claim: [], keys: [] };
+  const calls = { status: 0, claim: [], grants: [], keys: [], logs: [] };
   const redeemer = new ClaudeResetRedeemer(am, {
-    config, log: () => {},
+    config, log: line => calls.logs.push(line),
     statusFn: async (account) => { calls.status++; const b = status(account, calls); return { reset: parseResetStatus(b), usage: { fiveHour: { utilization: 0 }, sevenDay: { utilization: 0 }, sevenDayFable: { utilization: 0 } } }; },
-    claimFn: async (account, c) => { calls.claim.push(account.name); calls.keys.push(c.requestId); return claim(calls.claim.length, c); },
+    claimFn: async (account, c) => { calls.claim.push(account.name); calls.grants.push(c.grantId); calls.keys.push(c.requestId); return claim(calls.claim.length, c); },
   });
   am.ensureTokenFresh = async () => {};
   return { am, redeemer, calls };
@@ -45,18 +53,60 @@ function harness({ accounts = [oauth('a')], status = () => block(), claim = () =
 
 // ── parsing ─────────────────────────────────────────────────────────────────
 
-test('the block parses, and only next_grant_id is claimable', () => {
+test('the reset block parses and validates the next grant id', () => {
   const s = parseResetStatus(block());
   assert.equal(s.eligible, true); assert.equal(s.atLimit, true);
   assert.deepEqual(s.exhausted, ['seven_day_overage_included']);
-  assert.equal(claimableGrant(s).id, 'opus55-launch-promax-20260921');
-  assert.equal(claimableGrant(parseResetStatus(block({ next_grant_id: null }))), null);
-  assert.equal(claimableGrant(parseResetStatus(block({ next_grant_id: 'someone-else' }))), null, 'a next id naming no listed grant is not trusted');
-  for (const g of [{ resets_left: 0 }, { usable_now: false }, { paused: true }, { ends_at: new Date(Date.now() - 1000).toISOString() }]) {
-    assert.equal(claimableGrant(parseResetStatus(block({}, g))), null, JSON.stringify(g));
-  }
+  assert.equal(s.nextGrantId, 'opus55-launch-promax-20260921');
+  assert.equal(parseResetStatus(block({ next_grant_id: null })).nextGrantId, null);
+  assert.equal(parseResetStatus(block({ next_grant_id: 'someone-else' })).nextGrantId, null, 'a next id naming no listed grant is not trusted');
   assert.equal(parseResetStatus(null), null);
   assert.equal(parseResetStatus({ eligible: 'yes' }), null);
+});
+
+test('auto choice ranks Fable before session before weekly, without changing the status', () => {
+  const s = parseResetStatus(grantBlock([
+    weeklyGrant,
+    { id: 'session', type: 'session', clears: ['five_hour'] },
+    { ...fableGrant, clears: ['five_hour', 'seven_day_overage_included'] },
+  ], { exhausted: ['five_hour'] }));
+  const before = JSON.parse(JSON.stringify(s));
+  assert.equal(chooseAutoGrant(s).id, 'fable');
+  assert.deepEqual(s, before);
+  assert.equal(chooseAutoGrant({ ...s, grants: s.grants.filter(g => g.id !== 'fable') }).id, 'session');
+});
+
+test('auto choice requires one grant to cover every exhausted limit', () => {
+  assert.equal(chooseAutoGrant(parseResetStatus(grantBlock([fableGrant], { exhausted: ['seven_day'] }))), null);
+  assert.equal(chooseAutoGrant(parseResetStatus(grantBlock([fableGrant, weeklyGrant], { exhausted: ['seven_day', 'seven_day_overage_included'] }))).id, 'weekly');
+  const separate = grantBlock([fableGrant, { id: 'sonnet', clears: ['seven_day_sonnet'] }], { exhausted: ['seven_day_overage_included', 'seven_day_sonnet'] });
+  assert.equal(chooseAutoGrant(parseResetStatus(separate)), null, 'two partial grants cannot cover the wall together');
+});
+
+test('auto choice spends the sooner-expiring grant before next_grant_id, with no expiry last', () => {
+  const now = Date.now();
+  const soon = { ...fableGrant, id: 'soon', ends_at: new Date(now + H).toISOString() };
+  const later = { ...fableGrant, id: 'later', ends_at: new Date(now + DAY).toISOString() };
+  const noExpiry = { ...fableGrant, id: 'no-expiry', ends_at: null };
+  for (const next of ['later', 'no-expiry']) {
+    assert.equal(chooseAutoGrant(parseResetStatus(grantBlock([noExpiry, later, soon], { next_grant_id: next })), now).id, 'soon');
+  }
+  assert.equal(chooseAutoGrant(parseResetStatus(grantBlock([noExpiry, later], { next_grant_id: 'no-expiry' })), now).id, 'later');
+  for (const ends_at of [null, new Date(now + H).toISOString()]) {
+    const tied = grantBlock([{ ...fableGrant, id: 'first', ends_at }, { ...fableGrant, id: 'next', ends_at }], { next_grant_id: 'next' });
+    assert.equal(chooseAutoGrant(parseResetStatus(tied), now).id, 'next');
+  }
+});
+
+test('auto choice needs no next grant id, but needs eligible status and a usable unexpired grant', () => {
+  const now = Date.now();
+  assert.equal(chooseAutoGrant(null, now), null);
+  assert.equal(chooseAutoGrant(parseResetStatus(block({ eligible: false })), now), null);
+  assert.equal(chooseAutoGrant(parseResetStatus(block({ grants: [] })), now), null);
+  assert.equal(chooseAutoGrant(parseResetStatus(grantBlock([fableGrant], { next_grant_id: null })), now).id, 'fable');
+  for (const g of [{ resets_left: 0 }, { usable_now: false }, { paused: true }, { ends_at: new Date(now).toISOString() }]) {
+    assert.equal(chooseAutoGrant(parseResetStatus(block({}, g)), now), null, JSON.stringify(g));
+  }
 });
 
 test('the claim posts the org-scoped body Claude Code sends, and reads the verdict from the body', async () => {
@@ -101,6 +151,45 @@ test('armed: one reset is spent on the account that would otherwise wait longest
   assert.deepEqual(calls.claim, ['mid']);
   assert.equal(am.accounts[2].quota.unified7dFable, 0, 'the quota was re-applied from the fresh read');
   assert.ok(blockedUntil(am.accounts[0]) > 0);
+});
+
+test('a Fable-only wall spends a held Fable grant even when next is weekly', async () => {
+  const { am, redeemer, calls } = harness({ status: () => grantBlock([weeklyGrant, fableGrant]) });
+  assert.equal((await redeemer.maybeRedeemForPool(am.accounts)).redeemed, true);
+  assert.deepEqual(calls.grants, ['fable']);
+  assert.match(calls.logs[0], /Redeeming a banked Claude Fable reset on "a"/);
+});
+
+test('a weekly wall with only a Fable grant declines because it does not cover the wall', async () => {
+  const { am, redeemer, calls } = harness({ status: () => grantBlock([fableGrant], { next_grant_id: 'fable', exhausted: ['seven_day'] }) });
+  const r = await redeemer.maybeRedeemForPool(am.accounts);
+  assert.equal(r.redeemed, false);
+  assert.equal(r.reason, 'its reset does not clear seven_day');
+  assert.equal(calls.claim.length, 0);
+});
+
+test('a weekly wall spends the weekly grant, not a cheaper Fable grant', async () => {
+  const { am, redeemer, calls } = harness({ status: () => grantBlock([fableGrant, weeklyGrant], { next_grant_id: 'fable', exhausted: ['seven_day'] }) });
+  assert.equal((await redeemer.maybeRedeemForPool(am.accounts)).redeemed, true);
+  assert.deepEqual(calls.grants, ['weekly']);
+  assert.match(calls.logs[0], /Redeeming a banked Claude weekly reset/);
+});
+
+test('two Fable grants spend the sooner-expiring one', async () => {
+  const { am, redeemer, calls } = harness({ status: () => grantBlock([
+    { ...fableGrant, id: 'later', ends_at: new Date(Date.now() + DAY).toISOString() },
+    { ...fableGrant, id: 'soon', ends_at: new Date(Date.now() + H).toISOString() },
+  ], { next_grant_id: 'later' }) });
+  assert.equal((await redeemer.maybeRedeemForPool(am.accounts)).redeemed, true);
+  assert.deepEqual(calls.grants, ['soon']);
+});
+
+test('a paused, unusable, spent or expired cheaper grant is skipped for a covering weekly grant', async () => {
+  for (const blocked of [{ paused: true }, { usable_now: false }, { resets_left: 0 }, { ends_at: new Date(Date.now() - H).toISOString() }]) {
+    const { am, redeemer, calls } = harness({ status: () => grantBlock([{ ...fableGrant, ...blocked }, weeklyGrant], { next_grant_id: 'fable' }) });
+    assert.equal((await redeemer.maybeRedeemForPool(am.accounts)).redeemed, true, JSON.stringify(blocked));
+    assert.deepEqual(calls.grants, ['weekly']);
+  }
 });
 
 test('one dry pool costs one reset: a second refusal right after holds off', async () => {

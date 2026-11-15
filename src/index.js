@@ -37,6 +37,7 @@ import { Prober, probeApplicable } from './prober.js';
 import { CreditMonitor } from './api-credit.js';
 import { ResetCreditRedeemer } from './codex-reset-credits.js';
 import { ClaudeResetRedeemer } from './claude-resets.js';
+import { createResetActions } from './reset-actions.js';
 import { Warmer, warmApplicable } from './warmer.js';
 import { formatWarmupScheduleConfirmation, resolveWarmupConfig } from './warmup-schedule.js';
 import { TUI, ACCOUNT_SORTS } from './tui.js';
@@ -90,12 +91,17 @@ async function recordSignInWithCallback(entry) {
 
 /**
  * An account removed by hand (`remove`): leave the tombstone the other
- * installs act on, when this install is signed in to callback.net.
+ * installs act on, when this install is signed in to callback.net. One
+ * attempt, with no wait for a held lock, so the command does not hang: a
+ * running proxy, told to reload next, drops the account too and records the
+ * removal with its own wait and retries.
  * @param {Record<string, any>} entry
  */
 async function recordRemovalWithCallback(entry) {
   try {
-    if (await standaloneCredentialSync().onAccountRemoved({ ...entry, credential: entry.accessToken })) console.log('Recorded on callback.net: your other installs will remove it too.');
+    const sync = standaloneCredentialSync();
+    if (await sync.onAccountRemoved({ ...entry, credential: entry.accessToken }, { wait: false })) console.log('Recorded on callback.net: your other installs will remove it too.');
+    else if (sync.pendingRemovals.size) console.log('Not recorded on callback.net yet (its lock is held, or it could not be reached). A running proxy records it once told of the removal; with none running, the next start adds the account back, so remove it again then.');
   } catch (/** @type {any} */ err) {
     console.error(`Could not record the removal on callback.net: ${err?.message || err}`);
   }
@@ -765,13 +771,17 @@ async function serverCommand() {
     clearAddedAccountIds(config);
   };
 
+  const redeemer = new ResetCreditRedeemer(accountManager, { config });
+  const claudeRedeemer = new ClaudeResetRedeemer(accountManager, { config });
+  const resetActions = createResetActions({ accountManager, claudeRedeemer, codexRedeemer: redeemer });
+
   let tui = null;
   /** @type {Record<string, any>} */
   let hooks = {};
 
   if (useTUI) {
     tui = new TUI({
-      accountManager, config, sx, activityLogPath, sessionTitles, versionLabel, updateAvailable,
+      accountManager, config, sx, activityLogPath, sessionTitles, versionLabel, updateAvailable, resetActions,
       saveConfig: () => atomicConfigUpdate(async diskConfig => {
         mergeAccountsOnto(diskConfig);
         // Persist sx.org settings (set/cleared from the TUI settings screen).
@@ -928,9 +938,7 @@ async function serverCommand() {
   // is not about redemption) simply refuses as before. The shared config, so the
   // fleet switch (`autoRedeemResets`) is read live — a TUI toggle or a reload
   // binds on the next refusal, not the next restart.
-  const redeemer = new ResetCreditRedeemer(accountManager, { config });
-  // Banked Claude usage-limit resets, armed by the same switch (autoRedeemResets).
-  const claudeRedeemer = new ClaudeResetRedeemer(accountManager, { config });
+  // Banked Claude usage-limit resets are armed by the same switch.
   hooks.redeemClaudeResetForPool = (/** @type {Record<string, any>[]} */ accounts) => claudeRedeemer.maybeRedeemForPool(accounts);
   hooks.redeemCodexResetForPool = (/** @type {Record<string, any>[]} */ accounts) => redeemer.maybeRedeemForPool(accounts);
   hooks.getStatusExtra = () => ({
@@ -2789,7 +2797,8 @@ async function removeCommand() {
   });
   console.log(`Removed account "${account.name}"`);
   // The tombstone first, then the server: told of the removal, it finds the
-  // tombstone already there and leaves it alone.
+  // tombstone already there and leaves it alone, or, when that one attempt
+  // did not land, records it with its own wait and retries.
   await recordRemovalWithCallback(account);
   await notifyRunningServer(config);
 }
