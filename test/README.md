@@ -41,11 +41,22 @@ variable names (`TEAMCLAUDE_CONFIG`, `TEAMCLAUDE_DISABLE_AUTOUPDATE`, ...), and
 `TEAMROUTER_CONFIG` exported for their own install had the CLI tests write test
 accounts into that real config. `npm test` loads `test-helpers/isolate-env.js`
 first, which drops every `TEAMROUTER_*` variable; running one file directly,
-pass the same flag:
+pass the same flag, and the runner's timeout `npm test` sets:
 
 ```sh
-node --test --import ./test-helpers/isolate-env.js test/cli-rename.test.js
+node --test --import ./test-helpers/isolate-env.js --test-timeout=120000 test/cli-rename.test.js
 ```
+
+The timeout is how a test that waits on the mechanism it checks, rather than
+on the clock (see CONTRIBUTING.md), reports that mechanism broken: the test
+hangs, and the timeout fails it (Node 20 and 22 fail its whole file at it; see
+"Clean up in `finally`" below). `node --test` has none of its own. When nothing
+else keeps the event loop alive, Node 20 and 22 still fail such a test
+("Promise resolution is still pending but the event loop has already
+resolved"; Node 20 read from its source), and Node 24 and later do not; a test
+that holds a server or a socket open while it waits, as the end-to-end tests
+here do, keeps the loop alive on any of them, and without the flag never
+reports at all.
 
 ## Spawn the real server through `test-helpers/spawn-server.js`
 
@@ -66,10 +77,27 @@ The helper lives outside `test/` because node's default test glob is
 ## Clean up in `finally`
 
 A failed assertion must not leave a server listening. A leaked handle keeps the
-child's event loop alive and hangs the whole `node --test` run, not just the
-file that leaked it — so one broken test costs the entire suite rather than one
-red line. `remote-control-relay.test.js` has the pattern, including
+child's event loop alive, and on Node 24 and later that hangs the whole
+`node --test` run, even under `npm test`'s `--test-timeout`, not just the file
+that leaked it — so one broken test costs the entire suite rather than one red
+line (Node 20 and 22 kill the file at that timeout instead: one red line for
+the file). `remote-control-relay.test.js` has the pattern, including
 `closeAllConnections()` for a server whose response deliberately never ends.
+
+A `finally` runs only once the wait above it settles. When the failure under
+test leaves that wait pending (a request never answered, say), node:test fails
+the test, on the error that escaped or on its timeout, but does not unwind it,
+and the `finally` never runs. On Node 24 and later the servers the test opened
+then keep the file from ever exiting. Node 20 and 22 also apply the runner's
+timeout (see above) to each file as a whole and kill the file at it instead: a
+test that fails sooner, on an escaped error or a shorter timeout of its own, is
+named and the tests after it run, but nothing after a test stuck until the
+runner's timeout reports. Ending the wait is what lets the `finally` run:
+listen on `t.signal`, which node:test aborts once the test has ended however it
+ended, and destroy the socket the wait is on or pass the signal to `fetch`, as
+the relayRaw tests in `overage-headers.test.js` do. A cleanup with no wait of
+its own to end can be registered with `t.after`, which runs at that point too,
+as `withFleet` in `stream-failure-failover.test.js` does.
 
 ## Do not pin a date that will pass
 
