@@ -1061,7 +1061,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         // request, so a bare "ok" would be a lie for a disabled or spent target.
         // The switch still happens (that is the TUI's behaviour) and the answer
         // says whether traffic will follow it.
-        const { eligible, reason } = accountManager.eligibility(index);
+        const { eligible, reason } = accountManager.eligibility(index, { manualSwitch: true });
         // Leave a trace where every other account change already leaves one: the
         // TUI swaps console.log for its activity pane and headless mode tees it
         // to the activity log, so this one line covers both. Without it a manual
