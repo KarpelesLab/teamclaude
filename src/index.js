@@ -709,6 +709,13 @@ async function serverCommand() {
     // and this one has to hot-apply in particular: "stop spending credits" must
     // not wait for a restart.
     config.autoRedeemResets = diskConfig.autoRedeemResets === true;
+    // The spending strategy beside the switch (codex-reset-policy.js), read
+    // off this object per refusal the same way. Copied raw: the redeemer
+    // normalises each knob as it reads it, so a bad value here is "off" there
+    // rather than a reload that fails.
+    config.autoRedeemMinDaysToReset = diskConfig.autoRedeemMinDaysToReset;
+    config.autoRedeemMaxShare = diskConfig.autoRedeemMaxShare;
+    config.autoRedeemMaxPerDay = diskConfig.autoRedeemMaxPerDay;
     // Read by the prober off this object per cycle, like the switch above.
     config.probeDisabledAccounts = diskConfig.probeDisabledAccounts === true;
     config.blockedModels = Array.isArray(diskConfig.blockedModels) ? diskConfig.blockedModels : [];
@@ -951,7 +958,13 @@ async function serverCommand() {
   // Banked Claude usage-limit resets are armed by the same switch.
   hooks.redeemClaudeResetForPool = (/** @type {Record<string, any>[]} */ accounts, /** @type {{ model?: string|null }} */ opts) => claudeRedeemer.maybeRedeemForPool(accounts, opts);
   hooks.redeemCodexResetForPool = (/** @type {Record<string, any>[]} */ accounts) => redeemer.maybeRedeemForPool(accounts);
+  // The spending strategy's view of each Codex account, for the status payload.
+  // Read-only: nothing reached through it spends a credit.
+  hooks.describeAutoRedeem = (/** @type {Record<string, any>} */ account) => redeemer.describe(account);
   hooks.getStatusExtra = () => ({
+    // The reset-credit spending strategy as it stands, read live like the
+    // switch it qualifies (codex-reset-policy.js).
+    redeemPolicy: redeemer.policyStatus(),
     // Read live from the shared config (not a startup snapshot) so the TUI's
     // blocklist editor shows up in `status` immediately, the same way the
     // per-request gate in server.js picks it up.

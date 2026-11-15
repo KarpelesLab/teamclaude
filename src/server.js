@@ -990,6 +990,16 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // Status endpoint
       if (req.method === 'GET' && req.url === '/teamclaude/status') {
         const status = accountManager.getStatus({ sessionDetail: config.proxy?.sessionDetail === true });
+        // The reset-credit policy's view of each account, beside the row the
+        // manager built for it. Rows are built from `accountManager.accounts`
+        // in order within this same tick, so the two line up by position; a
+        // server built without the hook (every test that is not about
+        // redemption) leaves the rows as they were.
+        if (hooks.describeAutoRedeem) {
+          status.accounts.forEach((/** @type {Record<string, any>} */ row, /** @type {number} */ i) => {
+            row.autoRedeem = hooks.describeAutoRedeem(accountManager.accounts[i]) ?? null;
+          });
+        }
         const extra = hooks.getStatusExtra?.() || {};
         res.writeHead(200, { 'Content-Type': 'application/json' });
         // Counters only: how full the upstream admission gate is (see
