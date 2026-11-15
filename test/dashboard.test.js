@@ -1328,6 +1328,8 @@ test('the Insights headlines pick the metric and remember it; the views redraw w
   };
   await page.answer(200, priced);
   assert.equal(page.byId('insNote').style.display, 'none');
+  // Two days are too few for a calendar or months: one line says what they need.
+  assert.ok(page.built.some(e => /need a range of 30 days or more/.test(String(e.textContent))), 'the short-range line');
   const heads = () => page.built.filter(e => typeof e.className === 'string' && /^inshead( sel)?$/.test(e.className));
   assert.equal(heads().slice(-2)[0].className, 'inshead sel', 'the cost is drawn first');
   heads().slice(-1)[0].fire('click');

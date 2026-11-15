@@ -11,7 +11,7 @@ import {
   insightsSeries, stackSeries, topModels, fmtUsd, fmtUsdShort, fleetMissingText,
   seriesStats, cacheHitRate, peakBucket, providerRows,
   recordedFrom, insightsDayKey, bucketAt, labelStep, pricedRequests,
-  insightsTotals, runningTotals, insightsHeadline, insightsPace, monthTotals, calendarGrid, breakdownRows,
+  insightsTotals, runningTotals, rollingAverage, insightsTrend, insightsHeadline, insightsPace, monthTotals, calendarGrid, breakdownRows,
 } from '../src/dashboard.js';
 
 test('the page ships every Insights helper it is tested against', () => {
@@ -19,7 +19,7 @@ test('the page ships every Insights helper it is tested against', () => {
   for (const fn of [fmtTokens, niceCeil, insightsRangeText, insightsChange, insightsBucketLabel, insightsSeries, stackSeries, topModels, fmtUsd, fmtUsdShort, fleetMissingText,
     seriesStats, cacheHitRate, peakBucket, providerRows,
     recordedFrom, insightsDayKey, bucketAt, labelStep, pricedRequests,
-    insightsTotals, runningTotals, insightsHeadline, insightsPace, monthTotals, calendarGrid, breakdownRows]) {
+    insightsTotals, runningTotals, rollingAverage, insightsTrend, insightsHeadline, insightsPace, monthTotals, calendarGrid, breakdownRows]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   assert.ok(html.includes('id="page-insights"'), 'the page section');
@@ -363,11 +363,15 @@ const costReply = (cost, extra = {}) => {
 };
 const monthName = (/** @type {number} */ m) => new Date(2026, m, 1).toLocaleDateString([], { month: 'long' });
 
-test('dollars on an axis or a bar: no cents once they are noise', () => {
+test('dollars on an axis or a bar: whole from $100, cents below unless the figure is whole', () => {
   assert.equal(fmtUsdShort(0), '$0');
   assert.equal(fmtUsdShort(0.5), '$0.50');
   assert.equal(fmtUsdShort(9.99), '$9.99');
-  assert.equal(fmtUsdShort(14.42), '$14');
+  // Axis steps of $6.25 must not read as $13 and $19.
+  assert.equal(fmtUsdShort(12.5), '$12.50');
+  assert.equal(fmtUsdShort(18.75), '$18.75');
+  assert.equal(fmtUsdShort(25), '$25');
+  assert.equal(fmtUsdShort(193.4), '$193');
   assert.equal(fmtUsdShort(1500), '$1.5k');
   assert.equal(fmtUsdShort(null), '$0');
 });
@@ -507,4 +511,71 @@ test('where it went: ranked by the metric, unpriced rows after the priced ones, 
   assert.deepEqual(breakdownRows(detailed, 'provider', 'cost').map(r => [r.label, r.group, r.cost]), [['Claude', '1 account', 3], ['Grok', '1 account', 0.5]]);
   assert.deepEqual(breakdownRows(fleet, 'machine', 'cost').map(r => [r.label, r.cost, r.color]), [['desk (this one)', 5, 'var(--is1)'], ['server', 2, 'var(--is3)']]);
   assert.deepEqual(breakdownRows(null, 'model', 'cost'), []);
+});
+
+test('where it went: a Grok account or provider whose every model is unpriced is not priced, not $0', () => {
+  // The server sums an account's cost from its rows, so an account with only
+  // unpriced models arrives as 0, like Grok on a model xAI no longer lists.
+  const reply = {
+    ...detailed,
+    providers: [detailed.providers[0], { ...detailed.providers[1], cost: 0, costValues: [0, 0] }],
+    accounts: [detailed.accounts[0], { ...detailed.accounts[1], cost: 0, costValues: [0, 0] }],
+    models: [{ provider: 'grok', model: 'grok-4', tokens: 300, requests: 1, cost: null }, detailed.models[1]],
+  };
+  const accounts = breakdownRows(reply, 'account', 'cost');
+  assert.deepEqual(accounts.map(r => [r.label, r.cost, r.perMillion, r.share]), [['a', 3, 3 / 700 * 1e6, 1], ['g', null, null, null]]);
+  const providers = breakdownRows(reply, 'provider', 'cost');
+  assert.deepEqual(providers.map(r => [r.label, r.cost, r.share]), [['Claude', 3, 1], ['Grok', null, null]]);
+  // An account with no tokens is not "unpriced": it spent nothing.
+  const idle = breakdownRows({ ...reply, accounts: [{ provider: 'anthropic', account: 'z', tokens: 0, requests: 0, cost: 0, values: [0, 0], costValues: [0, 0] }] }, 'account', 'cost');
+  assert.equal(idle[0].cost, 0);
+  // Even when its total came to a number, no priced model on its provider means no price.
+  const summed = breakdownRows({ ...reply, accounts: [{ ...detailed.accounts[1], cost: 0.01 }] }, 'account', 'cost');
+  assert.equal(summed[0].cost, null);
+});
+
+test('where it went: an account row carries its own values per bucket, in the metric drawn', () => {
+  assert.deepEqual(breakdownRows(detailed, 'account', 'tokens').map(r => [r.label, r.values]), [['a', [300, 400]], ['g', [100, 200]]]);
+  assert.deepEqual(breakdownRows(detailed, 'account', 'cost').map(r => [r.label, r.values]), [['a', [1, 2]], ['g', [0, 0.5]]]);
+  assert.deepEqual(breakdownRows({ ...detailed, splitDetail: false }, 'account', 'cost').map(r => r.values), [null, null], 'a fleet sum missing a machine\'s per-bucket cost');
+  assert.equal(breakdownRows(detailed, 'model', 'cost')[0].values, null, 'only accounts have them');
+});
+
+test('a rolling average over full, recorded buckets only', () => {
+  assert.deepEqual(rollingAverage([2, 4, 6, 8], 2), [2, 3, 5, 7]);
+  // Before recording began and the bucket still filling are left out, and the
+  // window starts no earlier than the history does.
+  assert.deepEqual(rollingAverage([9, 9, 2, 4, 6, 1], 3, 2, 5), [null, null, 2, 3, 4, null]);
+  assert.deepEqual(rollingAverage(null, 7), []);
+});
+
+test('the trend: a 7-day rolling average on days, one flat average of full hours on hours', () => {
+  const days = insightsTrend([7, 7, 7, 7, 7, 7, 14, 14, 1], 'day', 0);
+  assert.deepEqual(days?.values, [7, 7, 7, 7, 7, 7, 8, 9, null]);
+  assert.equal(days?.label, '7-day average');
+  assert.equal(days?.last, 9);
+  const hours = insightsTrend([0, 0, 4, 8, 3], 'hour', 2);
+  assert.deepEqual(hours?.values, [null, null, 6, 6, null], 'the hour still filling is not one of them');
+  assert.equal(hours?.label, 'average full hour');
+  assert.equal(insightsTrend([5], 'day', 0), null, 'no full day yet');
+  assert.equal(insightsTrend([0, 0, 5], 'day', 2), null, 'nothing recorded but today');
+});
+
+test('the pace: against last month by the same day, only when all of last month is on record', () => {
+  // Oct 1 to Nov 10: $5 every October day, $10 every full November day, $4 so far today.
+  const values = [...Array(31).fill(5), ...Array(9).fill(10), 4];
+  const reply = costReply(values);
+  reply.buckets = dayRun('2026-10-01', values.length);
+  const pace = /** @type {any} */ (insightsPace(reply, 'cost'));
+  // November so far is $94; October by its day 10 was $50.
+  assert.equal(pace.against, '▲ 88% against ' + monthName(9) + ' by its day 10 ($50.00)');
+  // A range that starts on Oct 2 does not have all of October.
+  const cut = (/** @type {number[]} */ a) => a.slice(1);
+  const short = { ...reply, buckets: dayRun('2026-10-02', values.length - 1), cost: { ...reply.cost, values: cut(values) },
+    kinds: { input: cut(reply.kinds.input), output: cut(reply.kinds.output), cacheRead: cut(reply.kinds.cacheRead), cacheWrite: cut(reply.kinds.cacheWrite) } };
+  assert.equal(/** @type {any} */ (insightsPace(short, 'cost')).against, null);
+  // Nor does a history that began part-way through it.
+  const late = costReply([...Array(4).fill(0), ...values.slice(4)], { sinceDay: '2026-10-05' });
+  late.buckets = reply.buckets;
+  assert.equal(/** @type {any} */ (insightsPace(late, 'cost')).against, null);
 });
