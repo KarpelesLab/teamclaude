@@ -1,11 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import { EventEmitter } from 'node:events';
+import { ReadableStream } from 'node:stream/web';
+import { TextEncoder } from 'node:util';
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AccountManager } from '../src/account-manager.js';
-import { createProxyServer, resolveLogLevel, resolveLogMaxBodyBytes } from '../src/server.js';
+import { createProxyServer, resolveLogLevel, resolveLogMaxBodyBytes, streamResponse } from '../src/server.js';
 
 function listen(server) {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
@@ -321,4 +324,107 @@ test('logMaxBodyBytes truncates the request body and still forwards it whole', {
   } finally {
     proxy.close(); upstream.close(); rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// A relay waits on the client's socket and on the log's file in turn, and
+// 'drain' fires once. With the client's wait armed only after the log's, a
+// drain that fired while the relay waited on the log was lost, and nothing woke
+// the relay again: with a log on it stopped for good at the first chunk that
+// filled the client's socket (on acaa750, a 2 MiB event stream sent in 64 KiB
+// chunks stopped at 64 KiB). The client here reads as fast as it can.
+/**
+ * `promise`'s value, or `fallback` once `ms` pass, with the timer cleared
+ * either way: a pending one would hold the test process open for its full
+ * length after every passing run.
+ * @param {Promise<any>} promise
+ * @param {number} ms
+ * @param {any} fallback
+ */
+async function orAfter(promise, ms, fallback) {
+  /** @type {ReturnType<typeof setTimeout>|undefined} */
+  let timer;
+  try {
+    return await Promise.race([promise, new Promise((resolve) => { timer = setTimeout(() => resolve(fallback), ms); })]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function relayWithLog(contentType, total, { holdLastUntilFirstByte = false } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'tc-logdrain-'));
+  const CHUNK = 64 * 1024;
+  const chunk = Buffer.alloc(CHUNK, 0x61);
+  let clientHasBytes = () => {};
+  const firstByte = new Promise((resolve) => { clientHasBytes = () => resolve(undefined); });
+  let upstreamEnded = false;
+  const upstream = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', async () => {
+      res.writeHead(200, { 'content-type': contentType });
+      for (let sent = 0; sent < total - CHUNK; sent += CHUNK) {
+        if (!res.write(chunk)) await new Promise(r => res.once('drain', r));
+      }
+      if (holdLastUntilFirstByte) await orAfter(firstByte, 3000, undefined);
+      upstreamEnded = true;
+      res.end(chunk);
+    });
+  });
+  const upPort = await listen(upstream);
+  const am = new AccountManager([{ name: 'backend', type: 'apikey', apiKey: 'k1', upstream: `http://127.0.0.1:${upPort}` }], 0.98);
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: 'http://127.0.0.1:9', logDir: dir });
+  const proxyPort = await listen(proxy);
+  const log = console.log;
+  console.log = () => {};
+  try {
+    return await orAfter(
+      new Promise((resolve, reject) => {
+        const req = http.request({ host: '127.0.0.1', port: proxyPort, method: 'POST', path: '/v1/messages', headers: { 'content-type': 'application/json', 'x-api-key': 'k' } }, (res) => {
+          let received = 0;
+          /** @type {boolean|null} */
+          let endedFirst = null;
+          res.on('data', (c) => {
+            if (endedFirst === null) { endedFirst = upstreamEnded; clientHasBytes(); }
+            received += c.length;
+          });
+          res.on('end', () => resolve({ received, endedFirst }));
+          res.on('error', reject);
+        });
+        req.on('error', reject);
+        req.end('{"model":"m","messages":[],"stream":true}');
+      }),
+      10_000, 'still waiting after 10 s');
+  } finally {
+    console.log = log;
+    // A relay that stopped holds its sockets open; drop them, so a failing run
+    // ends instead of keeping the test process alive.
+    proxy.closeAllConnections(); upstream.closeAllConnections();
+    proxy.close(); upstream.close(); rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// Each drain wait listens for 'drain' and for 'close', and removes both when
+// either fires: the 'close' one left behind would add one listener per
+// backpressure cycle for as long as a stream runs to a slow client. Here every
+// write is queued and drains a tick later, for 50 cycles.
+test('a relay through many backpressure cycles keeps its close listeners bounded', async () => {
+  const res = new class extends EventEmitter {
+    destroyed = false; writableEnded = false; headersSent = true; maxClose = 0;
+    write() { this.maxClose = Math.max(this.maxClose, this.listenerCount('close')); setImmediate(() => this.emit('drain')); return false; }
+    end() { this.writableEnded = true; }
+  }();
+  let n = 0;
+  const stream = new ReadableStream({
+    pull(controller) { if (n < 50) controller.enqueue(new TextEncoder().encode(`event: ping\ndata: {"n":${n++}}\n\n`)); else controller.close(); },
+  });
+  await streamResponse(stream, res, 0, { recordTokenUsage() {} }, null);
+  assert.equal(n, 50);
+  assert.equal(res.writableEnded, true);
+  assert.ok(res.maxClose <= 2, `at most the relay's own close listener and one drain wait's, saw ${res.maxClose}`);
+});
+
+test('an event stream relayed with a request log on reaches the client whole', { timeout: 30000 }, async () => {
+  const total = 2 * 1024 * 1024;
+  const got = await relayWithLog('text/event-stream', total);
+  assert.notEqual(got, 'still waiting after 10 s', 'the relay did not stop');
+  assert.equal(got.received, total, 'every byte reached the client');
 });

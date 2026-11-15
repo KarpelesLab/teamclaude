@@ -5162,6 +5162,18 @@ export async function streamResponse(webStream, res, accountIndex, accountManage
 
       // Forward chunk immediately
       const ok = res.write(value);
+      // A write the client's socket had to queue is waited out below, but the
+      // wait is armed here, before the log's: 'drain' fires once, and one that
+      // fired while the relay waited on the log left nothing to wake it, so with
+      // a request log on the relay stopped for good at the first chunk that
+      // filled the socket. Both listeners go when either fires: otherwise the
+      // un-fired one (usually 'close') stays attached and accumulates one leaked
+      // listener per backpressure cycle over a long SSE stream to a slow client.
+      const clientDrained = ok ? null : new Promise(resolve => {
+        const done = () => { res.off('drain', done); res.off('close', done); resolve(undefined); };
+        res.once('drain', done);
+        res.once('close', done);
+      });
 
       // Append to the log as it streams (no whole-body buffering)
       if (bodyWriter) bodyWriter.chunk(Buffer.from(value));
@@ -5178,15 +5190,8 @@ export async function streamResponse(webStream, res, accountIndex, accountManage
 
       // Handle backpressure — also bail out if client disconnects,
       // because 'drain' will never fire on a destroyed socket
-      if (!ok) {
-        await new Promise(resolve => {
-          // Remove BOTH listeners when either fires: otherwise the un-fired one
-          // (usually 'close') stays attached and accumulates one leaked listener
-          // per backpressure cycle over a long SSE stream to a slow client.
-          const done = () => { res.off('drain', done); res.off('close', done); resolve(); };
-          res.once('drain', done);
-          res.once('close', done);
-        });
+      if (clientDrained) {
+        await clientDrained;
         if (clientGone(res)) break;
       }
     }
