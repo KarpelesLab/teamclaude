@@ -76,7 +76,8 @@ const ADAPTIVE_STATS_CACHE_MS = 1000;
 // recovers on the next request rather than staying stuck.
 const FORCED_REFRESH_FLOOR_MS = 10_000;
 // How long a token-endpoint 429 holds an account's refreshes when it carries no
-// Retry-After: long enough that the 401 and the retry of the same request do not
+// Retry-After, and a kept 400/401/403 the renewal of the refresh token it
+// answered: long enough that the 401 and the retry of the same request do not
 // ask again, short enough that a renewal is not put off for long.
 const REFRESH_429_HOLD_MS = 30_000;
 // How many distinct models an account's recentModels table remembers.
@@ -519,6 +520,25 @@ export function accountEndsAt(acct) {
   return endsAt;
 }
 
+/**
+ * Until when (epoch ms) a renewal of the refresh token the account holds now
+ * is held: 0 when no hold applies to that token, and a time already past once
+ * its hold has lapsed, until a renewal succeeds or another hold replaces it, so
+ * a caller compares it with the clock. A 429's hold covers whatever token the
+ * account holds; a kept 400/401/403's covers only the token it was sent with,
+ * so a different one (a sign-in, an import, a token another install renewed
+ * that a sync pass took) is not held by it. Read at the top of
+ * ensureTokenFresh, before anything is renewed, and by the unrenewed answer
+ * for its Retry-After (server.js respondUnrenewed).
+ * @param {Record<string, any>} account
+ */
+export function refreshHeldUntil(account) {
+  const until = account?._refreshHeldUntil;
+  if (!until) return 0;
+  if (account._refreshHeldToken != null && account._refreshHeldToken !== account.refreshToken) return 0;
+  return until;
+}
+
 function planOf(/** @type {Record<string, any>} */ account) {
   return account.hasClaudeMax === true ? 'Max' : account.hasClaudePro === true ? 'Pro' : null;
 }
@@ -715,9 +735,15 @@ function makeAccount(acct, index, listener = null) {
     // The refresh token upstream last rejected as invalid, if it is still the
     // one we hold — see the dead-token guard in ensureTokenFresh.
     _deadRefreshToken: null,
-    // Until when (epoch ms) the token endpoint asked, with a 429, not to be
-    // asked again for this account — see ensureTokenFresh.
+    // Until when (epoch ms) this account's refreshes are held: every refresh
+    // token's, when the token endpoint asked with a 429 not to be asked again,
+    // or only _refreshHeldToken's, after a 400/401/403 that kept it — see
+    // ensureTokenFresh and refreshHeldUntil.
     _refreshHeldUntil: /** @type {number|null} */ (null),
+    // The refresh token a kept 400/401/403 holds, compared by value as the
+    // dead-token guard is, so a different one is tried at once; null while the
+    // hold is a 429's, which holds them all.
+    _refreshHeldToken: /** @type {string|null} */ (null),
     // Whether the token it holds was minted by the token endpoint for this
     // process — a renewal here, not one taken from the store. Only such a token
     // is fresh enough to store on callback.net (credential-sync.js). Never
@@ -6342,7 +6368,9 @@ export class AccountManager {
     // (or REFRESH_429_HOLD_MS when it did not say), forced or not. Without this a
     // request with an expired token asks once, its 401 forces another, and its
     // retry a third — every one of them refused, each one making it worse.
-    if (account._refreshHeldUntil && Date.now() < account._refreshHeldUntil) return;
+    // A kept 400/401/403 holds the token it was sent with in the same way, and
+    // no other (see refreshHeldUntil).
+    if (Date.now() < refreshHeldUntil(account)) return;
 
     if (!force && !isTokenExpiringSoon(account.expiresAt)) return;
 
@@ -6425,6 +6453,7 @@ export class AccountManager {
         account._lastRefreshAt = Date.now();
         account._deadRefreshToken = null; // this token works; clear any stale guard
         account._refreshHeldUntil = null;
+        account._refreshHeldToken = null;
         account._lastRefreshFailure = null;
         // Set before the listener runs: it is what lets the sync store them.
         account._minted = minted;
@@ -6462,6 +6491,8 @@ export class AccountManager {
           const holdMs = Number.isFinite(err.retryAfterMs) ? err.retryAfterMs : REFRESH_429_HOLD_MS;
           const until = Date.now() + holdMs;
           account._refreshHeldUntil = until;
+          // Every token's, whatever an earlier kept 4xx held.
+          account._refreshHeldToken = null;
           console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}": the token endpoint asked to wait (429); no refresh before ${new Date(until).toISOString()}`);
         }
         const isAuthRejection = isRefreshRejection(err);
@@ -6469,10 +6500,17 @@ export class AccountManager {
         // endpoint's refusal) used to end in 'error', so it was asked once. Kept,
         // it would be asked again by every request and every probe that selects
         // the account, each one re-sending the refresh token to whatever is
-        // answering. Give it the same short hold as a 429 with no Retry-After.
+        // answering. Give it the same short hold as a 429 with no Retry-After,
+        // but for the token that was SENT alone, keyed as the dead-token guard
+        // below is: a different one, installed while this call was out or during
+        // the hold (a sign-in, an import, a token another install renewed that
+        // a sync pass took), is tried at once, and held in its turn if it is
+        // kept too: an account has one kept hold at a time, so that one
+        // replaces this one.
         if (!isAuthRejection && (err.status === 400 || err.status === 401 || err.status === 403)) {
           account._refreshHeldUntil = Date.now() + REFRESH_429_HOLD_MS;
-          console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}": the refresh was refused (${err.status}) without naming the token; keeping the token, no refresh for ${REFRESH_429_HOLD_MS / 1000}s`);
+          account._refreshHeldToken = sent;
+          console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}": the refresh was refused (${err.status}) without naming the token, which is not taken for dead; not sending it again for ${REFRESH_429_HOLD_MS / 1000}s`);
         }
         if (isAuthRejection) {
           // Remember WHICH token was rejected so we stop re-sending it (see the

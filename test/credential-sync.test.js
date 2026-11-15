@@ -1149,6 +1149,33 @@ test('a lock refused every round: the refresh gives up rather than renewing with
   assert.ok(logs.some((l) => /not renewing, the callback\.net lock was not to be had in 3 rounds/.test(l)), logs.join('\n'));
 });
 
+// A page in front of this install's token endpoint (a 403 that is not its
+// refusal) keeps the token and holds its renewal for a short while. The hold
+// is that refresh token's: a renewal another install stored, adopted by a
+// pass meanwhile, is renewed under the lock when it needs renewing in turn.
+test('a token adopted from the store inside a kept 403\'s hold is renewed under the lock, not held', async () => {
+  const { sync, am, store, refreshed } = setup([claude('a', { expiresAt: Date.now() - 60_000 })], {
+    refresh: (rt) => {
+      if (rt === 'rt-a-1') throw Object.assign(new Error('Token refresh failed (403): <html>Access denied</html>'), { status: 403, grantRefused: false });
+      return { accessToken: `${rt}-renewed-at`, refreshToken: `${rt}-renewed-rt`, expiresAt: Date.now() + 8 * H };
+    },
+  });
+  await sync.sync();
+  await am.ensureTokenFresh(0);
+  assert.deepEqual(refreshed, ['rt-a-1']);
+  assert.equal(am.accounts[0].status, 'active', 'kept');
+  // Another install renewed and stored; its access token expires within the renewal window.
+  const row = store.byKey(syncKeyFor(am.accounts[0]));
+  const renewed = { ...am.accounts[0], credential: 'at-a-office', refreshToken: 'rt-a-office', expiresAt: Date.now() + 60_000 };
+  row.Data = JSON.stringify(encodeBlob(renewed, tokensOf(renewed), { now: store.now(), by: 'office' }));
+  await sync.sync();
+  assert.equal(am.accounts[0].refreshToken, 'rt-a-office', 'adopted');
+  await am.ensureTokenFresh(0);
+  assert.deepEqual(refreshed, ['rt-a-1', 'rt-a-office']);
+  assert.equal(am.accounts[0].credential, 'rt-a-office-renewed-at');
+  assert.equal(store.blob(syncKeyFor(am.accounts[0])).refreshToken, 'rt-a-office-renewed-rt');
+});
+
 test('an account the store has never seen gets its row first, and is renewed under that row\'s lock', async () => {
   const { am, store, refreshed, sent } = setup([claude('a')]);
   // No pass has run: the row does not exist.
