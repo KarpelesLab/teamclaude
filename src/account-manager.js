@@ -3448,8 +3448,40 @@ export class AccountManager {
         { byRequests: this.distributionMode === 'load', candidates: freePool.length ? freePool : paidPool });
       return account ? { account, paid: !freePool.length } : null;
     }
+    if (preferExtraUsage) {
+      // Sticky within the tier. The preferred pool serves for as long as API
+      // capacity stays up, which is from the switch threshold to 100% and
+      // beyond, and "least utilized" changes hands every time the serving
+      // account's usage passes its sibling's: the fleet then alternated
+      // between two subscriptions request by request, a prompt-cache miss on
+      // each. So the account this scope is already served by keeps it while
+      // it is still in the chosen tier and no candidate outranks it on
+      // priority. The exhausted-fleet fallback below is not preferred and
+      // ranks as it always did.
+      const best = free ?? paid;
+      const serving = this._servingFallback(freePool.length ? freePool : paidPool, model, advisorModel, provider);
+      if (best && serving && (serving.priority || 0) === (best.priority || 0)) return { account: serving, paid: !freePool.length };
+    }
     if (free) return { account: free, paid: false };
     return paid ? { account: paid, paid: true } : null;
+  }
+
+  /**
+   * The account in `pool` that requests of this scope are already served by,
+   * or null: the one the scope's route cursor names (every selection records
+   * it, a model-scoped diversion included), else the one the provider's
+   * cursor rests on. Reads only; see the sticky pick in _pickFallback.
+   * @param {Array<Record<string, any>>} pool
+   * @param {string|null} model
+   * @param {string|null} advisorModel
+   * @param {string} provider
+   * @returns {Record<string, any>|null} */
+  _servingFallback(pool, model, advisorModel, provider) {
+    for (const index of [this.routeCursors.get(this._cursorKey(model, advisorModel, provider)), this._currentIndexForProvider(provider)]) {
+      const account = index != null ? this.accounts[index] : null;
+      if (account && pool.includes(account)) return account;
+    }
+    return null;
   }
 
   /** Capacity available past the account's normal switch threshold.

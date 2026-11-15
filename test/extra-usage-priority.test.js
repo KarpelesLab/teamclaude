@@ -466,6 +466,35 @@ test('turns pinned to two preferred subscriptions leave the cursor and a manual 
   assert.equal(am.getActiveAccount(null, OPUS, null, 'three')?.name, 's1');
 });
 
+// Least-utilized changes hands each time the serving account passes its
+// sibling, so without stickiness the fleet alternated between the two from the
+// switch threshold to 100%, a prompt-cache miss on every change.
+test('with distribution off, the preferred subscription already serving keeps the traffic within its tier', t => {
+  t.mock.method(console, 'log', () => {});
+  const am = new AccountManager([
+    oauth('s1', { allowExtraUsage: true, preferExtraUsage: true }),
+    oauth('s2', { allowExtraUsage: true, preferExtraUsage: true }),
+    { name: 'api', type: 'apikey', apiKey: 'api-key', priority: 100 },
+  ], 0.98);
+  am._nextProbeAt = Date.now() + 60_000;
+  am.currentIndex = 2;
+  am.accounts[0].quota.unified7d = 0.985;
+  am.accounts[1].quota.unified7d = 0.99;
+  const selected = [am.getActiveAccount(null, OPUS)?.name];
+  // s1 is now the more utilized of the two, and stays.
+  am.accounts[0].quota.unified7d = 0.995;
+  selected.push(am.getActiveAccount(null, OPUS)?.name, am.getActiveAccount(null, OPUS)?.name);
+  const preview = am.previewRouteIndex(OPUS);
+  // Out of included quota while s2 has some: free quota still goes first.
+  am.accounts[0].quota.unified7d = 1;
+  selected.push(am.getActiveAccount(null, OPUS)?.name);
+  // Both on paid credits now, level: the one serving keeps it.
+  am.accounts[1].quota.unified7d = 1;
+  selected.push(am.getActiveAccount(null, OPUS)?.name);
+  assert.deepEqual({ selected, preview, billing: am.getStatus().accounts.map(a => a.onExtraUsage) },
+    { selected: ['s1', 's1', 's1', 's2', 's2'], preview: 0, billing: [false, true, false] });
+});
+
 test('removing the preference restores single-account legacy billing episodes', async t => {
   t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
   const config = { accounts: [
