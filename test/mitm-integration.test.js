@@ -148,7 +148,7 @@ test('MITM h2: authorization injected, x-api-key dropped, quota observed, body r
 // trailer, which h2 accepts, is checked for that reason alone. connection is
 // sent as "trailers", the one value writeHead throws on rather than dropping
 // itself, so the drop relayRaw already made stays tested.
-test('MITM h2: a token refresh is answered without the upstream\'s connection-specific headers', T, async () => {
+test('MITM h2: a token refresh is answered without the upstream\'s connection-specific headers', T, async (t) => {
   const { caCertPem, leafCertPem, leafKeyPem } = generateCertChain('localhost');
   const upstream = makeUpstream((req) => ({
     status: 200,
@@ -177,8 +177,14 @@ test('MITM h2: a token refresh is answered without the upstream\'s connection-sp
     let resp, body = '';
     req.on('response', (h) => { resp = h; });
     req.setEncoding('utf8'); req.on('data', (d) => { body += d; }); req.end('{"grant_type":"refresh_token"}');
-    // The failure this guards leaves the stream unanswered; the test's own
-    // timeout is the bound on that, not a deadline here.
+    // The failure this guards leaves the stream unanswered, and this wait has
+    // no deadline: the test fails on the error that escapes the proxy, or else
+    // on its timeout. Neither ends the wait, so the tunnel is destroyed once
+    // the test has ended (node:test aborts t.signal then), which closes the
+    // stream and lets the finally below run. Without it the servers would hold
+    // the file open: on Node 24 and later for good, on Node 20 and 22 until the
+    // runner's timeout, which they apply to the whole file too, kills it.
+    t.signal.addEventListener('abort', () => tlsSock.destroy(), { once: true });
     await new Promise((resolve) => req.once('close', resolve));
 
     assert.equal(resp?.[':status'], 200);
@@ -208,7 +214,7 @@ const HTTP2_SETTINGS_CASES = [
   { label: 'a scope-403 retry', method: 'GET', path: '/api/profile-required' },
 ];
 for (const { label, method, path } of HTTP2_SETTINGS_CASES) {
-  test(`MITM h2: an upstream answer to ${label} carrying HTTP2-Settings is relayed without it`, T, async () => {
+  test(`MITM h2: an upstream answer to ${label} carrying HTTP2-Settings is relayed without it`, T, async (t) => {
     const { caCertPem, leafCertPem, leafKeyPem } = generateCertChain('localhost');
     const seen = [];
     const upstream = makeUpstream((req) => {
@@ -237,7 +243,9 @@ for (const { label, method, path } of HTTP2_SETTINGS_CASES) {
       req.on('response', (h) => { resp = h; });
       req.setEncoding('utf8'); req.on('data', (d) => { body += d; });
       req.end(method === 'POST' ? '{"model":"x","messages":[]}' : undefined);
-      // As in the token-refresh test above: the failure leaves the stream unanswered.
+      // As in the token-refresh test above: the failure leaves the stream
+      // unanswered, and the tunnel is destroyed once the test has ended.
+      t.signal.addEventListener('abort', () => tlsSock.destroy(), { once: true });
       await new Promise((resolve) => req.once('close', resolve));
 
       assert.equal(resp?.[':status'], 200);
