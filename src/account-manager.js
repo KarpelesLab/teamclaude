@@ -6095,6 +6095,15 @@ export class AccountManager {
           console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}": the token endpoint asked to wait (429); no refresh before ${new Date(until).toISOString()}`);
         }
         const isAuthRejection = isRefreshRejection(err);
+        // A 400/401/403 that keeps the token (a firewall's page, not the token
+        // endpoint's refusal) used to end in 'error', so it was asked once. Kept,
+        // it would be asked again by every request and every probe that selects
+        // the account, each one re-sending the refresh token to whatever is
+        // answering. Give it the same short hold as a 429 with no Retry-After.
+        if (!isAuthRejection && (err.status === 400 || err.status === 401 || err.status === 403)) {
+          account._refreshHeldUntil = Date.now() + REFRESH_429_HOLD_MS;
+          console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}": the refresh was refused (${err.status}) without naming the token; keeping the token, no refresh for ${REFRESH_429_HOLD_MS / 1000}s`);
+        }
         if (isAuthRejection) {
           // Remember WHICH token was rejected so we stop re-sending it (see the
           // dead-token guard above). A transient failure deliberately does not

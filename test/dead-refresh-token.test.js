@@ -212,21 +212,27 @@ async function refreshAgainst([status, body, type = 'application/json'], { provi
   }], 0.98, { refreshFn: via(refreshAccessToken), codexRefreshFn: via(refreshCodexToken) });
   let errors = 0;
   m.onAccountError(() => { errors++; });
+  let heldUntil = null;
   try {
     await m.ensureTokenFresh(0);
+    // A kept 4xx leaves a short hold (as a 429 does). It is noted and lapsed
+    // here, so the second call shows whether the token itself is sent again.
+    heldUntil = m.accounts[0]._refreshHeldUntil;
+    m.accounts[0]._refreshHeldUntil = null;
     await m.ensureTokenFresh(0);
   } finally {
     endpoint.close();
   }
-  return { account: m.accounts[0], calls, errors };
+  return { account: m.accounts[0], calls, errors, heldUntil };
 }
 
-function assertKept({ account, calls, errors }, status, what) {
+function assertKept({ account, calls, errors, heldUntil }, status, what) {
   assert.strictEqual(account.status, 'active', what);
   assert.strictEqual(account._deadRefreshToken, null, what);
   assert.strictEqual(account.refreshToken, 'rt-a', what);
   assert.strictEqual(errors, 0, `credential sync is not told the token is dead: ${what}`);
-  assert.strictEqual(calls, 2, `the token is tried again on the next call: ${what}`);
+  assert.ok(heldUntil > Date.now(), `the endpoint is not asked again at once: ${what}`);
+  assert.strictEqual(calls, 2, `the token is tried again once that hold has passed: ${what}`);
   assert.strictEqual(account._lastRefreshFailure?.status, status, `the failure is kept as the reason: ${what}`);
 }
 
