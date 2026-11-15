@@ -397,7 +397,8 @@ test('one manual redeem at a time, and auto cannot race its fresh read', async (
   await ready;
   assert.match((await h.actions.redeem(h.account, 'fable')).message, /manual reset is in progress/);
   assert.match((await h.claudeRedeemer.maybeRedeemForPool([h.account])).reason, /manual reset is in progress/);
-  const codex = { ...h.account, provider: 'codex', accountId: 'codex' };
+  const codex = { ...h.account, index: 1, provider: 'codex', accountId: 'codex' };
+  h.am.accounts.push(codex);
   assert.match((await h.actions.redeem(codex, 'credit-1')).message, /manual reset is in progress/);
   release();
   assert.equal((await first).redeemed, true);
