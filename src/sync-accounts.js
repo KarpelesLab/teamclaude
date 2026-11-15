@@ -8,11 +8,13 @@ import { localListener } from './upstream-proxy.js';
 import { accountCredit } from './api-credit.js';
 
 // A long-lived login sets `longLived` and drops `importFrom` on disk; a config
-// row still holding the old pair would write it back on the next save.
+// row still holding the old pair would write it back on the next save. Only
+// that login's removal of `importFrom` is mirrored: on a row that is not
+// long-lived the key is left as a reload has always left it.
 /** @param {Record<string, any>} cfgAcct @param {Record<string, any>} diskAcct */
 function mirrorCredentialSource(cfgAcct, diskAcct) {
   if (diskAcct.longLived === true) cfgAcct.longLived = true; else delete cfgAcct.longLived;
-  if (diskAcct.importFrom) cfgAcct.importFrom = diskAcct.importFrom; else delete cfgAcct.importFrom;
+  if (diskAcct.longLived === true && !diskAcct.importFrom) delete cfgAcct.importFrom;
 }
 
 /**
