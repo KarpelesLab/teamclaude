@@ -62,6 +62,7 @@ import { startEventLoopMonitor } from './event-loop-monitor.js';
 import { envVar } from './brand.js';
 import { loginCallback, loadCallbackToken, saveCallbackToken, callbackWhoami, logoutCallback, callbackClientId, getCallbackAuthPath } from './callback-auth.js';
 import { CredentialSync, refreshOutsideProxy } from './credential-sync.js';
+import { setRefreshTokenExpiry, createRefreshTokenExpiryWarner } from './refresh-token-expiry.js';
 
 // The server's credential sync, once it runs; a CLI command that changes an
 // account on disk talks to the store through a sync of its own instead.
@@ -458,6 +459,9 @@ async function serverCommand() {
   };
   /** @type {ReturnType<typeof setInterval>|null} */
   let quotaSeriesInterval = null;
+  // On that minute tick too: one line a day for an account whose refresh token
+  // is known to lapse within days, so the re-login is planned, not discovered.
+  const warnRefreshTokenExpiry = createRefreshTokenExpiryWarner();
 
   // An account admitted from somewhere other than this install's config: the
   // callback.net credential store (credential-sync.js). Same three lists the
@@ -538,6 +542,9 @@ async function serverCommand() {
         diskConfig.accounts[cfgIdx].accessToken = newTokens.accessToken;
         diskConfig.accounts[cfgIdx].refreshToken = newTokens.refreshToken;
         diskConfig.accounts[cfgIdx].expiresAt = newTokens.expiresAt;
+        // With the token it describes: the date the manager settled on for this
+        // refresh token, or no key when it knows none.
+        setRefreshTokenExpiry(diskConfig.accounts[cfgIdx], newTokens.refreshTokenExpiresAt);
       } else {
         // Said out loud: the account keeps serving on the new token, so nothing
         // else shows that the file still holds the old one until a restart
@@ -1060,7 +1067,11 @@ async function serverCommand() {
   // Persist quota every minute; unref so it never keeps the process alive.
   quotaSaveInterval = setInterval(persistQuotaState, 60_000);
   quotaSaveInterval.unref?.();
-  quotaSeriesInterval = setInterval(sampleQuotaSeries, 60_000);
+  warnRefreshTokenExpiry(accountManager.accounts);
+  quotaSeriesInterval = setInterval(() => {
+    sampleQuotaSeries();
+    warnRefreshTokenExpiry(accountManager.accounts);
+  }, 60_000);
   quotaSeriesInterval.unref?.();
   // WAL checkpoint + retention sweep; a no-op timer when the store is disabled.
   startTicks(usageStore);
@@ -1201,6 +1212,8 @@ async function importCommand() {
         accessToken: data.accessToken,
         refreshToken: data.refreshToken,
         expiresAt: data.expiresAt,
+        // As importCredentials does for a file: only when the source states it.
+        ...(data.refreshTokenExpiresAt != null && { refreshTokenExpiresAt: data.refreshTokenExpiresAt }),
       };
     } catch (err) {
       console.error(`Failed to parse --json: ${err.message}`);
@@ -1413,6 +1426,8 @@ async function upsertCodexAccount(requestedName, creds, routing = null, storeRou
       // had, instead of silently clearing it.
       ...(routing && storeRouting ? { routing: routingToUrl(routing) } : {}),
     };
+    // When the refresh token lapses, if these credentials came with it.
+    setRefreshTokenExpiry(account, creds.refreshTokenExpiresAt);
 
     // Identity for a Codex account is its ChatGPT account id and user id; fall
     // back to the display name when upstream did not supply one.
@@ -1422,6 +1437,9 @@ async function upsertCodexAccount(requestedName, creds, routing = null, storeRou
     if (idx >= 0) {
       const prev = config.accounts[idx];
       config.accounts[idx] = { ...prev, ...account, name: prev.name };
+      // A new sign-in is a new refresh token: the date the row held was about
+      // the old one, so it is replaced by what this response stated, or dropped.
+      setRefreshTokenExpiry(config.accounts[idx], creds.refreshTokenExpiresAt);
       outcome = { action: 'updated', name: prev.name };
       if (storeRouting && !routing) delete config.accounts[idx].routing; // --routing none
       console.log(`Updated account "${prev.name}"`);
@@ -2100,6 +2118,9 @@ async function accountsCommand() {
       a.accessToken = newTokens.accessToken;
       a.refreshToken = newTokens.refreshToken;
       a.expiresAt = newTokens.expiresAt;
+      // refreshOutsideProxy hands back the date this token now goes by (the
+      // earlier one after a rotation; another install's own after an adoption).
+      setRefreshTokenExpiry(a, newTokens.refreshTokenExpiresAt);
       refreshed.push(a);
     } catch {
       // refresh failed — fetchProfile will report the specific error
@@ -2117,6 +2138,7 @@ async function accountsCommand() {
         disk.accounts[i].accessToken = a.accessToken;
         disk.accounts[i].refreshToken = a.refreshToken;
         disk.accounts[i].expiresAt = a.expiresAt;
+        setRefreshTokenExpiry(disk.accounts[i], a.refreshTokenExpiresAt);
       }
     });
   }
@@ -3274,7 +3296,7 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
   // signed in there: the token being imported may be one the store holds, and
   // so one other installs hold too.
   const identified = await profileForCredentials(creds, routing, {
-    renew: (c) => refreshOutsideProxy({ name: name || 'imported account', type: 'oauth', accessToken: c.accessToken, refreshToken: c.refreshToken, expiresAt: c.expiresAt }, (o) => refreshAccessToken(c.refreshToken, undefined, routing, o), { force: true })
+    renew: (c) => refreshOutsideProxy({ name: name || 'imported account', type: 'oauth', accessToken: c.accessToken, refreshToken: c.refreshToken, expiresAt: c.expiresAt, refreshTokenExpiresAt: c.refreshTokenExpiresAt }, (o) => refreshAccessToken(c.refreshToken, undefined, routing, o), { force: true })
       .then((t) => t ?? Promise.reject(new Error('token not renewed'))),
   });
   creds = identified.creds;
@@ -3341,6 +3363,8 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
       // the entry already had survives instead of being silently cleared.
       ...(routing && storeRouting ? { routing: routingToUrl(routing) } : {}),
     };
+    // When the refresh token lapses, if these credentials came with it.
+    setRefreshTokenExpiry(account, creds.refreshTokenExpiresAt);
 
     // Deduplicate by account+org identity (same email in a different org is a
     // distinct account), then by name — but only where the name is not standing in
@@ -3352,6 +3376,10 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
       // display name, entry id, and any disk-only fields (e.g. importFrom).
       const prev = config.accounts[idx];
       config.accounts[idx] = updateAccountEntry(prev, account);
+      // A sign-in or an import is a new refresh token: the date the row held
+      // was about the old one, so it is replaced by the one these credentials
+      // came with (the login response, the credential file), or dropped.
+      setRefreshTokenExpiry(config.accounts[idx], creds.refreshTokenExpiresAt);
       outcome = { action: 'updated', name: prev.name };
       if (storeRouting && !routing) delete config.accounts[idx].routing; // --routing none
       console.log(`Updated account "${prev.name}"`);

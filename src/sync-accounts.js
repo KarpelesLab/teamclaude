@@ -211,17 +211,20 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     if (mgr.disabled !== wantDisabled) accountManager.setDisabled(mgr.index, wantDisabled);
 
     // Existing account — resolve fresh credentials from disk
-    /** @type {{ accessToken?: string, refreshToken?: string, expiresAt?: number, apiKey?: string }|null} */
+    /** @type {{ accessToken?: string, refreshToken?: string, expiresAt?: number, refreshTokenExpiresAt?: number, apiKey?: string }|null} */
     let freshCred = null;
     if (diskAcct.type === 'oauth' && diskAcct.importFrom) {
       try {
         const creds = await importCredentials(diskAcct.importFrom);
-        freshCred = { accessToken: creds.accessToken, refreshToken: creds.refreshToken, expiresAt: creds.expiresAt };
+        // The refresh token's own expiry rides with the token it describes, here
+        // and below: a newer sign-in on disk brings its date (or none), and a
+        // staler copy never gets as far as updateAccountTokens.
+        freshCred = { accessToken: creds.accessToken, refreshToken: creds.refreshToken, expiresAt: creds.expiresAt, refreshTokenExpiresAt: creds.refreshTokenExpiresAt };
       } catch (/** @type {any} */ err) {
         console.error(`[TeamClaude] Re-import failed for "${safeLine(diskAcct.name, 64)}": ${err.message}`);
       }
     } else if (diskAcct.type === 'oauth' && diskAcct.accessToken) {
-      freshCred = { accessToken: diskAcct.accessToken, refreshToken: diskAcct.refreshToken, expiresAt: diskAcct.expiresAt };
+      freshCred = { accessToken: diskAcct.accessToken, refreshToken: diskAcct.refreshToken, expiresAt: diskAcct.expiresAt, refreshTokenExpiresAt: diskAcct.refreshTokenExpiresAt };
     } else if (diskAcct.type === 'apikey' && diskAcct.apiKey) {
       freshCred = { apiKey: diskAcct.apiKey };
     }
