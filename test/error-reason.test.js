@@ -90,6 +90,20 @@ test('the token endpoint reason is kept beside a rejected refresh token, bounded
   assert.doesNotMatch(unavailableLine(row, paint) ?? '', /last good refresh/);
 });
 
+// The same reason nested as an Anthropic API error (oauth.js oauthErrorOf):
+// the code from error.type, the description from error_description, inside or
+// beside it, else the nested message. Bounded and shape-checked the same way.
+test('the token endpoint reason nested as an Anthropic API error is kept too', () => {
+  assert.equal(oauthErrorSummary('{"type":"error","error":{"type":"invalid_grant","message":"Refresh token expired"}}'), 'invalid_grant: Refresh token expired');
+  assert.equal(oauthErrorSummary('{"type":"error","error":{"type":"invalid_grant","error_description":"Refresh token expired","message":"other"}}'), 'invalid_grant: Refresh token expired');
+  assert.equal(oauthErrorSummary('{"type":"error","error":{"type":"invalid_grant"},"error_description":"Refresh token expired"}'), 'invalid_grant: Refresh token expired');
+  assert.equal(oauthErrorSummary('{"type":"error","error":{"type":"invalid_grant","error_description":"inside"},"error_description":"beside"}'), 'invalid_grant: inside', 'inside wins');
+  assert.equal(oauthErrorSummary('{"type":"error","error":{"type":"invalid_grant"}}'), 'invalid_grant');
+  assert.equal(oauthErrorSummary('{"type":"error","error":{"type":"<script>"}}'), undefined, 'only an OAuth error code shape');
+  assert.equal(oauthErrorSummary('{"type":"error","error":{"message":"no type"}}'), undefined);
+  assert.ok(oauthErrorSummary(`{"type":"error","error":{"type":"invalid_grant","message":"${'x'.repeat(500)}"}}`).length < 130);
+});
+
 test('status names the last good refresh beside a rejected refresh token', async () => {
   let calls = 0;
   const am = new AccountManager([expiring()], 0.98, {

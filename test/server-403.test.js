@@ -165,6 +165,150 @@ test('with every account refused the error names all of them', async () => {
   }
 });
 
+// "Every account refused" is about the accounts this request could be placed on
+// or tried. A disabled or cordoned account takes no new request, so counting it
+// against the whole fleet kept the refusal from ever being the whole story: the
+// client was told every account is at its quota or rate limit, with a retry,
+// instead of the 502.
+for (const [what, third] of [
+  ['a disabled', { disabled: true }],
+  ['a cordoned', { cordoned: true }],
+]) {
+  test(`with every reachable account refused, ${what} third account does not turn the 502 into a quota wait`, async () => {
+    const { server: upstream } = forbiddingUpstream(new Set());
+    const upstreamPort = await listen(upstream);
+
+    const am = new AccountManager(
+      [
+        { name: 'a', type: 'oauth', accessToken: 'ta', refreshToken: 'ra', expiresAt: Date.now() + HOUR },
+        { name: 'b', type: 'oauth', accessToken: 'tb', refreshToken: 'rb', expiresAt: Date.now() + HOUR },
+        { name: 'c', type: 'oauth', accessToken: 'tc', refreshToken: 'rc', expiresAt: Date.now() + HOUR, ...third },
+      ],
+      0.98,
+      { refreshFn: async () => { throw new Error('must not refresh on a 403'); } },
+    );
+    const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+    const proxyPort = await listen(proxy);
+
+    try {
+      const { status, body } = await post(proxyPort);
+      assert.equal(status, 502, `got ${status}: ${body.slice(0, 160)}`);
+      assert.match(body, /\\"a\\"/);
+      assert.match(body, /\\"b\\"/);
+    } finally {
+      proxy.close();
+      upstream.close();
+    }
+  });
+}
+
+// A cordoned account takes no new conversation but keeps the one already on it
+// (_keepOnCordoned), so a request can still be sent to it - and when it is the
+// only account, its refusal is the whole story: the 502, not a quota wait.
+test('a conversation kept on a cordoned account still gets the 502 when it is refused', async () => {
+  let refuse = false;
+  const upstream = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      if (refuse) {
+        res.writeHead(403, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ type: 'error', error: { type: 'permission_error', message: 'Request not allowed' } }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{}');
+    });
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(
+    [{ name: 'solo', type: 'oauth', accessToken: 'ts', refreshToken: 'rs', expiresAt: Date.now() + HOUR }],
+    0.98,
+    { refreshFn: async () => { throw new Error('must not refresh on a 403'); } },
+  );
+  am.accounts[0].probing = false;
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const proxyPort = await listen(proxy);
+  const turn = (messages) => fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-api-key': 'k', 'x-claude-code-session-id': 'kept' },
+    body: JSON.stringify({ model: 'claude-opus-5', messages }),
+  });
+
+  try {
+    assert.equal((await turn([{ role: 'user', content: 'start' }])).status, 200);
+    am.setCordoned(0, true);
+    refuse = true;
+    const r = await turn([
+      { role: 'user', content: 'start' }, { role: 'assistant', content: 'ok' }, { role: 'user', content: 'next' },
+    ]);
+    const body = await r.text();
+    assert.equal(r.status, 502, `got ${r.status}: ${body.slice(0, 160)}`);
+    assert.match(body, /\\"solo\\"/);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+// A conversation that this turn moved off its cordoned account - the account hit
+// its quota - is no longer kept there (its pin moved with it), so that account will
+// not serve it again: the refusal of the account it moved to is the whole story, on
+// this turn as on the retry. Counting the account this turn merely tried answered
+// 429 here and 502 on the retry.
+test('a conversation moved off its cordoned account gets the 502 on the turn that moved it', async () => {
+  let phase = 'start';
+  const upstream = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      const token = (req.headers.authorization || '').replace(/^Bearer /, '');
+      if (phase === 'start') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end('{}');
+      } else if (token === 'ts') {
+        res.writeHead(429, {
+          'content-type': 'application/json', 'retry-after': '3600', 'anthropic-ratelimit-unified-status': 'rejected',
+          'anthropic-ratelimit-unified-5h-utilization': '1', 'anthropic-ratelimit-unified-5h-reset': String(Math.floor((Date.now() + HOUR) / 1000)),
+        });
+        res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'limit' } }));
+      } else {
+        res.writeHead(403, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ type: 'error', error: { type: 'permission_error', message: 'Request not allowed' } }));
+      }
+    });
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([
+    { name: 'solo', type: 'oauth', accessToken: 'ts', refreshToken: 'rs', expiresAt: Date.now() + HOUR },
+    { name: 'a', type: 'oauth', accessToken: 'ta', refreshToken: 'ra', expiresAt: Date.now() + HOUR },
+  ], 0.98, { refreshFn: async () => { throw new Error('must not refresh'); } });
+  for (const account of am.accounts) account.probing = false;
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const proxyPort = await listen(proxy);
+  const turn = (messages) => fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-api-key': 'k', 'x-claude-code-session-id': 'moved' },
+    body: JSON.stringify({ model: 'claude-opus-5', messages }),
+  });
+  const log = console.log;
+  console.log = () => {};
+  try {
+    am.setCurrentAccount(0);
+    assert.equal((await turn([{ role: 'user', content: 'start' }])).status, 200);
+    phase = 'next';
+    am.setCordoned(0, true);
+    const r = await turn([
+      { role: 'user', content: 'start' }, { role: 'assistant', content: 'ok' }, { role: 'user', content: 'next' },
+    ]);
+    const body = await r.text();
+    assert.equal(r.status, 502, `got ${r.status}: ${body.slice(0, 160)}`);
+    assert.match(body, /\\"a\\"/);
+  } finally {
+    console.log = log;
+    proxy.close();
+    upstream.close();
+  }
+});
+
 // The mixed fleet: one credential is refused, the other account is merely out of
 // quota. A reset will still serve this request, so the refusal must not short —
 // circuit the exhaustion path — otherwise one bad credential turns every
@@ -202,6 +346,81 @@ test('a refusal alongside a merely-exhausted account still reports exhaustion', 
     const { status, body } = await post(proxyPort);
     assert.equal(status, 429, 'quota exhaustion, not a hard credential error');
     assert.match(body, /rate_limit_error/);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+// The same fleet with one name for both accounts: names are not unique
+// (account-id.test.js keeps two entries of one name), so a refusal recorded by
+// name would also count the same-named account that is merely out of quota as
+// refused - and the request would get the 502 instead of the wait.
+test('a refusal beside a same-named, merely-exhausted account still reports exhaustion', async () => {
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    seen.push((req.headers.authorization || '').replace(/^Bearer /, ''));
+    if (req.headers.authorization === 'Bearer ta') {
+      res.writeHead(403, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'permission_error', message: 'Request not allowed' } }));
+      return;
+    }
+    res.writeHead(429, {
+      'retry-after': '300',
+      'anthropic-ratelimit-unified-5h-status': 'rejected',
+      'content-type': 'application/json',
+    });
+    res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error' } }));
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager(
+    [
+      { name: 'a', type: 'oauth', accessToken: 'ta', refreshToken: 'ra', expiresAt: Date.now() + HOUR },
+      { name: 'a', type: 'oauth', accessToken: 'tb', refreshToken: 'rb', expiresAt: Date.now() + HOUR },
+    ],
+    0.98,
+    { refreshFn: async () => { throw new Error('must not refresh on a 403'); } },
+  );
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const { status, body } = await post(proxyPort);
+    assert.equal(status, 429, `quota exhaustion, not a hard credential error - got ${status}: ${body.slice(0, 160)}`);
+    assert.match(body, /rate_limit_error/);
+    assert.deepEqual(seen, ['ta', 'tb'], 'both accounts are tried');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+// And when both of them are refused, that is the whole story: the 502, as for
+// two names. Comparing the number of refused names with the number of accounts
+// counted one name for two accounts, and answered with a quota wait.
+test('with every account refused, two accounts of one name still get the 502', async () => {
+  const { server: upstream, seen } = forbiddingUpstream(new Set());
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager(
+    [
+      { name: 'a', type: 'oauth', accessToken: 'ta', refreshToken: 'ra', expiresAt: Date.now() + HOUR },
+      { name: 'a', type: 'oauth', accessToken: 'tb', refreshToken: 'rb', expiresAt: Date.now() + HOUR },
+    ],
+    0.98,
+    { refreshFn: async () => { throw new Error('must not refresh on a 403'); } },
+  );
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const { status, body } = await post(proxyPort);
+    assert.equal(status, 502, `got ${status}: ${body.slice(0, 160)}`);
+    assert.match(body, /\\"a\\"/);
+    // Two accounts with the same story are told once.
+    assert.equal(JSON.parse(body).error.message.match(/refused the credential/g)?.length, 1, body);
+    assert.deepEqual(seen, ['ta', 'tb']);
   } finally {
     proxy.close();
     upstream.close();
@@ -425,6 +644,33 @@ test('a fully cooling fleet reports the entitlement re-admission time', async ()
   }
 });
 
+// The same answer when a configured account is disabled: it could not have been
+// used, so "every account this request could use" is still the whole story.
+test('an all-entitlement-denied 502 holds with a disabled account in the fleet', async () => {
+  const upstream = http.createServer((req, res) => {
+    res.writeHead(403, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(entitlementError()));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([
+    ...twoAccounts(),
+    { name: 'off', type: 'oauth', accessToken: 'off-token', refreshToken: 'r', expiresAt: Date.now() + HOUR, disabled: true },
+  ], 0.98);
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const result = await post(proxyPort);
+    assert.equal(result.status, 502, result.body.slice(0, 160));
+    const message = JSON.parse(result.body).error.message;
+    assert.match(message, /Every account this request could use returned OAuth entitlement denial/);
+    assert.doesNotMatch(message, /"off"/);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
 test('an all-entitlement-denied 502 diagnoses policy instead of recommending login', async () => {
   const seen = [];
   const upstream = http.createServer((req, res) => {
@@ -445,12 +691,46 @@ test('an all-entitlement-denied 502 diagnoses policy instead of recommending log
     assert.equal(result.status, 502);
     const message = JSON.parse(result.body).error.message;
     assert.match(message, /No account served this request/);
-    assert.match(message, /Every configured account returned OAuth entitlement denial/);
+    assert.match(message, /Every account this request could use returned OAuth entitlement denial/);
     assert.match(message, /oauth_not_allowed_for_organization/);
     assert.match(message, /"a account"/);
     assert.match(message, /"b account"/);
     assert.doesNotMatch(message, /teamclaude login/);
     assert.deepEqual(seen, ['a-token', 'b-token']);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+// One entitlement denial and one plain refusal is not "every account returned
+// OAuth entitlement denial", whatever the two accounts are called: with one
+// name for both, comparing names counted the plain refusal as a denial too.
+test('an entitlement denial beside a same-named plain refusal gets the refusal message', async () => {
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    const token = (req.headers.authorization || '').replace(/^Bearer /, '');
+    seen.push(token);
+    res.writeHead(403, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(token === 'ta'
+      ? entitlementError()
+      : { type: 'error', error: { type: 'permission_error', message: 'Request not allowed' } }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([
+    { name: 'a', type: 'oauth', accessToken: 'ta', refreshToken: 'ra', expiresAt: Date.now() + HOUR },
+    { name: 'a', type: 'oauth', accessToken: 'tb', refreshToken: 'rb', expiresAt: Date.now() + HOUR },
+  ], 0.98);
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const result = await post(proxyPort);
+    assert.equal(result.status, 502, result.body.slice(0, 160));
+    const message = JSON.parse(result.body).error.message;
+    assert.doesNotMatch(message, /OAuth entitlement denial/);
+    assert.match(message, /refused the credential for account "a" \(403\)/);
+    assert.deepEqual(seen, ['ta', 'tb']);
   } finally {
     proxy.close();
     upstream.close();
@@ -558,6 +838,123 @@ test('a verification hold reports the portal link instead of a re-login', async 
     assert.ok(body.includes(portal), 'the portal link has to reach the operator');
     assert.doesNotMatch(body, /teamclaude login/, 'a re-login cannot clear a verification hold');
     assert.equal(am.accounts[0].entitlementDeniedUntil, null, 'not an entitlement quarantine');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+// The 502 describes each refused account by its own record (recordRefusal), not
+// by the first account of its name: a disabled account of the same name that
+// upstream refused earlier is not the account this request was refused on.
+test('the refusal message describes the refused account, not an earlier-refused one of the same name', async () => {
+  const { server: upstream, seen } = forbiddingUpstream(new Set());
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(
+    [
+      { name: 'a', type: 'oauth', accessToken: 'off', refreshToken: 'roff', expiresAt: Date.now() + HOUR, disabled: true },
+      { name: 'a', type: 'oauth', accessToken: 'tb', refreshToken: 'rb', expiresAt: Date.now() + HOUR },
+    ],
+    0.98,
+    { refreshFn: async () => { throw new Error('must not refresh on a 403'); } },
+  );
+  am.markRefused(am.accounts[0], { code: 'account_on_hold', message: 'An earlier hold on the disabled account.', link: 'https://claude.ai/restricted' });
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const { status, body } = await post(proxyPort);
+    assert.equal(status, 502, `got ${status}: ${body.slice(0, 160)}`);
+    const message = JSON.parse(body).error.message;
+    assert.match(message, /refused the credential for account "a" \(403\)\. Check the account, then re-add it with: teamclaude login/);
+    assert.doesNotMatch(message, /earlier hold/);
+    assert.deepEqual(seen, ['tb']);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+// Two accounts of one name, one held for identity verification and one plainly
+// refused: the message tells both, each from its own account.
+test('a verification hold and a plain refusal on two accounts of one name both reach the message', async () => {
+  const portal = 'https://portal.anthropic.com/verify?org=test-org';
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    const token = (req.headers.authorization || '').replace(/^Bearer /, '');
+    seen.push(token);
+    res.writeHead(403, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(token === 'ta'
+      ? {
+        type: 'error',
+        error: {
+          type: 'permission_error',
+          message: "Your account can't receive replies from Claude right now.",
+          details: { error_code: 'verification_required', remediation_url: portal, capability: 'avocado' },
+        },
+        request_id: 'req_test',
+      }
+      : { type: 'error', error: { type: 'permission_error', message: 'Request not allowed' } }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(
+    [
+      { name: 'a', type: 'oauth', accessToken: 'ta', refreshToken: 'ra', expiresAt: Date.now() + HOUR },
+      { name: 'a', type: 'oauth', accessToken: 'tb', refreshToken: 'rb', expiresAt: Date.now() + HOUR },
+    ],
+    0.98,
+    { refreshFn: async () => { throw new Error('must not refresh on a 403'); } },
+  );
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const { status, body } = await post(proxyPort);
+    assert.equal(status, 502, `got ${status}: ${body.slice(0, 160)}`);
+    const message = JSON.parse(body).error.message;
+    assert.match(message, /identity verification for account "a"/);
+    assert.ok(message.includes(portal), message);
+    assert.match(message, /refused the credential for account "a" \(403\)/);
+    assert.deepEqual(seen, ['ta', 'tb']);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+// Each refused account prints the status it got itself: a 401 on one account and
+// a 403 on another of the same name are two refusals, not one 403.
+test('a 401 and a 403 on two accounts of one name each print their own status', async () => {
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    const token = (req.headers.authorization || '').replace(/^Bearer /, '');
+    seen.push(token);
+    const status = token === 'ta' ? 401 : 403;
+    res.writeHead(status, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(status === 401
+      ? { type: 'error', error: { type: 'authentication_error', message: 'invalid token' } }
+      : { type: 'error', error: { type: 'permission_error', message: 'Request not allowed' } }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(
+    [
+      // No refresh token: the 401 is not retried after a refresh, so it is a refusal.
+      { name: 'a', type: 'oauth', accessToken: 'ta', expiresAt: Date.now() + HOUR },
+      { name: 'a', type: 'oauth', accessToken: 'tb', refreshToken: 'rb', expiresAt: Date.now() + HOUR },
+    ],
+    0.98,
+    { refreshFn: async () => { throw new Error('must not refresh'); } },
+  );
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const { status, body } = await post(proxyPort);
+    assert.equal(status, 502, `got ${status}: ${body.slice(0, 160)}`);
+    const message = JSON.parse(body).error.message;
+    assert.match(message, /refused the credential for account "a" \(401\)/);
+    assert.match(message, /refused the credential for account "a" \(403\)/);
+    assert.deepEqual(seen, ['ta', 'tb']);
   } finally {
     proxy.close();
     upstream.close();

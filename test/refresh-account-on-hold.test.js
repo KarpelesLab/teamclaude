@@ -59,6 +59,27 @@ test('the hold is recognised under access_denied and a 403 as well', async () =>
   assert.equal(err.appealUrl, 'https://claude.ai/restricted');
 });
 
+// Through ensureTokenFresh with the real refresh: the answer is read for whether
+// it refuses the refresh token itself (see isRefreshRejection), and a hold does,
+// under either code and status, as invalid_grant does.
+test('a hold the token endpoint answers ends in the hold and a refresh token that is not sent again', async () => {
+  for (const [status, body] of [[400, HOLD], [403, { ...HOLD, error: 'access_denied' }]]) {
+    const { srv, endpoint } = await tokenServer(status, body);
+    let calls = 0;
+    try {
+      const am = await heldManager((rt, _e, routing, opts) => { calls++; return refreshAccessToken(rt, endpoint, routing, opts); });
+      await am.ensureTokenFresh(0, true);
+      const row = am.getStatus().accounts[0];
+      assert.equal(row.status, 'error', JSON.stringify(body));
+      assert.equal(row.errorReason.code, 'account_on_hold', JSON.stringify(body));
+      assert.equal(am.accounts[0]._deadRefreshToken, 'rt-a', JSON.stringify(body));
+      assert.equal(calls, 1, `the refused token is not sent again: ${JSON.stringify(body)}`);
+    } finally {
+      srv.close();
+    }
+  }
+});
+
 test('an appeal link off claude.ai or anthropic.com is replaced by the default one', async () => {
   for (const uri of [
     undefined, 'http://claude.ai/restricted', 'https://claude.ai.example.com/x', 'https://user@claude.ai/x',
@@ -75,9 +96,40 @@ test('an ordinary invalid_grant is not a hold', async () => {
   for (const [status, body] of [
     [400, { error: 'invalid_grant', error_description: 'Refresh token not found or invalid' }],
     [400, { error: 'invalid_request', error_description: 'account_on_hold' }],
+    // Nested: the code and the OAuth description count, not the message.
+    [400, { type: 'error', error: { type: 'invalid_grant', message: 'account_on_hold' } }],
+    [400, { type: 'error', error: { type: 'invalid_request', error_description: 'account_on_hold' } }],
   ]) {
     const err = await refreshError(status, body);
     assert.equal(err.appealUrl, undefined, JSON.stringify(body));
+  }
+});
+
+// Nested as an Anthropic API error (oauth.js oauthErrorOf), with the OAuth
+// description and link inside the error object or beside it, under either code
+// and status; with no link, the default one. Which shape upstream sends is not
+// verified.
+test('a hold nested as an Anthropic API error ends in the hold too', async () => {
+  for (const [status, body, link] of [
+    [400, { type: 'error', error: { type: 'invalid_grant', error_description: 'account_on_hold', error_uri: 'https://support.anthropic.com/appeal' } }, 'https://support.anthropic.com/appeal'],
+    [403, { type: 'error', error: { type: 'access_denied' }, error_description: 'account_on_hold', error_uri: 'https://support.anthropic.com/beside' }, 'https://support.anthropic.com/beside'],
+    [401, { type: 'error', error: { type: 'invalid_grant', error_description: 'account_on_hold' } }, 'https://claude.ai/restricted'],
+    // Both: the one inside the error object wins.
+    [400, { type: 'error', error: { type: 'invalid_grant', error_description: 'account_on_hold', error_uri: 'https://support.anthropic.com/inside' }, error_description: 'other', error_uri: 'https://support.anthropic.com/beside' }, 'https://support.anthropic.com/inside'],
+  ]) {
+    const { srv, endpoint } = await tokenServer(status, body);
+    let calls = 0;
+    try {
+      const am = await heldManager((rt, _e, routing, opts) => { calls++; return refreshAccessToken(rt, endpoint, routing, opts); });
+      await am.ensureTokenFresh(0, true);
+      const row = am.getStatus().accounts[0];
+      assert.equal(row.errorReason.code, 'account_on_hold', JSON.stringify(body));
+      assert.equal(row.errorReason.link, link, JSON.stringify(body));
+      assert.equal(am.accounts[0]._deadRefreshToken, 'rt-a', JSON.stringify(body));
+      assert.equal(calls, 1, `the refused token is not sent again: ${JSON.stringify(body)}`);
+    } finally {
+      srv.close();
+    }
   }
 });
 
