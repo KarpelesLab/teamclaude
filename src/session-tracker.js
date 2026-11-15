@@ -262,8 +262,8 @@ export class SessionTracker {
         const idx = resolveAccount(pin.account);
         if (idx != null && Number.isInteger(idx) && idx >= 0) pins.set(pin.bucket, { idx, at: Math.min(pin.at, now) });
       }
-      const threads = new Set(row.threads.filter(isMessageId));
-      while (threads.size > MAX_THREAD_MESSAGES) threads.delete(threads.values().next().value);
+      // The newest ids are last, as recordThreadMessage leaves them.
+      const threads = new Set(row.threads.filter(isMessageId).slice(-MAX_THREAD_MESSAGES));
       if (!pins.size && !threads.size) continue;
       const s = this._ensure(row.key, lastSeen);
       s.sessionId = row.sessionId;
